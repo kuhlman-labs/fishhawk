@@ -325,12 +325,20 @@ type FetchPromptArgs struct {
 // invocation; 0 means the backend could not resolve a spec-governed timeout
 // and the runner should fall back to its own constant.
 type FetchedPrompt struct {
-	StageID              string `json:"stage_id"`
-	StageType            string `json:"stage_type"`
-	Prompt               string `json:"prompt"`
-	PromptHash           string `json:"prompt_hash"`
-	AgentTimeoutSeconds  int    `json:"agent_timeout_seconds"`
-	DecomposedFromRunID  string `json:"decomposed_from_run_id,omitempty"`
+	StageID             string `json:"stage_id"`
+	StageType           string `json:"stage_type"`
+	Prompt              string `json:"prompt"`
+	PromptHash          string `json:"prompt_hash"`
+	AgentTimeoutSeconds int    `json:"agent_timeout_seconds"`
+	DecomposedFromRunID string `json:"decomposed_from_run_id,omitempty"`
+	// SliceIndex is the decomposed child's 0-based sub_plan position
+	// (E24.1 / #1141 / ADR-041), echoed by the backend only for
+	// decomposed children. The runner routes the child onto its own
+	// sole-writer slice branch fishhawk/run-<parent>/slice-<n>.
+	// omitempty drops a 0 value: the runner reads it only when
+	// DecomposedFromRunID is set, defaulting to 0 — the correct value
+	// for slice 0.
+	SliceIndex           int    `json:"slice_index,omitempty"`
 	VerifyCommand        string `json:"verify_command,omitempty"`
 	VerifyTimeoutSeconds int    `json:"verify_timeout_seconds,omitempty"`
 	// VerifyMaxIterations is the verify-fix loop budget from

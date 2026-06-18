@@ -267,10 +267,17 @@ type Run struct {
 	// mid-run can't change an in-flight run's advancement behavior.
 	// Defaults to false for legacy rows (migration 0031). Persisted
 	// but not yet consumed; the drive engine lands in a sibling slice.
-	Drive     bool
-	State     State
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	Drive bool
+	// SliceIndex is the decomposed child's 0-based sub_plan position
+	// (E24.1 / #1141 / ADR-041). Set by orchestrator fanout when this
+	// run is minted as a decomposition child; nil for non-decomposed
+	// runs (standalone parents and ordinary runs). The runner reads it
+	// back off the prompt-fetch response to route the child onto its
+	// own sole-writer slice branch fishhawk/run-<parent>/slice-<n>.
+	SliceIndex *int
+	State      State
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // IssueContext is the cached payload from `gh issue view --json

@@ -147,6 +147,17 @@ func parseSemver(v string) []int {
 	return result
 }
 
+// runSliceIndex holds the decomposed child's 0-based sub_plan position
+// (E24.1 / #1141 / ADR-041), set at runtime from the fetched prompt's
+// slice_index. It names the per-child sole-writer slice branch
+// fishhawk/run-<parent>/slice-<runSliceIndex>. The runner handles one run
+// per process and sets this once during run() startup before any reader
+// executes, so package-level storage carries it to the helper functions
+// (resolvePolicyBaseRef, resolveImplementBranchRouting) that only receive
+// config by value. Defaults to 0, the correct value for slice 0. Only read
+// when decomposedFromRunID is non-empty.
+var runSliceIndex int
+
 // run is split out so tests can drive it without exiting the test
 // process. Returns the intended process exit code.
 //
@@ -293,7 +304,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -310,6 +321,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 		cfg.promptFile = path
 		cfg.decomposedFromRunID = decomposedFromRunID
+		runSliceIndex = sliceIndex
 		cfg.scopeFiles = scopeFiles
 		cfg.commitAuthorName = commitAuthorName
 		cfg.commitAuthorEmail = commitAuthorEmail
@@ -802,29 +814,25 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		})
 	}
 
-	// Subsequent-child base establishment (#1036): once a prior sibling has
-	// pushed the shared parent branch, a decomposed child's declared policy
-	// base is that branch (#765) — but the agent ran against the operator's
-	// incidental checkout (typically main), so a slice depending on a prior
-	// sibling's code saw a tree without its dependency and could not compile.
-	// Before invoking the agent, fetch + checkout the shared branch so the
-	// working tree IS the declared base, mirroring the fix-up flow's #967
-	// discipline above. The first child legitimately runs against the base
-	// branch (no shared branch on the remote yet), so the block no-ops when
-	// remoteBranchExists is false; a sibling push landing between this read
-	// and the push-time routing read is exactly the pre-fix shape, handled by
-	// the unchanged stash-transplant + #989 conflict machinery. In the common
-	// case that machinery's stash is now cut from and reapplied onto the same
-	// tip — a content no-op. The restore defer fires BEFORE the #953
-	// stage-wide net (LIFO), whose moved-HEAD guard then sees HEAD already
-	// restored and no-ops — the same double-fire-safe construction as the
-	// fixup block above.
+	// Child base establishment (#1036): pre-ADR-041 a subsequent child's
+	// declared policy base was the prior sibling's shared-branch tip (#765),
+	// so this block fetched + checked it out before invoking the agent. Under
+	// ADR-041 (#1141) each child cuts its OWN sole-writer slice branch
+	// (childSliceBranch) fresh from base, which is minted once and so never
+	// pre-exists on the remote: remoteBranchExists is always false here and
+	// this block correctly no-ops — independent slices run against the base,
+	// not a prior sibling's tree (fan-in is E24.2). The block is retained
+	// (keyed on the slice branch) so the behavior is explicit rather than
+	// silently dropped, and so a future shared-checkout variant re-enables it
+	// by construction. The restore defer fires BEFORE the #953 stage-wide net
+	// (LIFO), whose moved-HEAD guard then sees HEAD already restored and
+	// no-ops — the same double-fire-safe construction as the fixup block above.
 	if stageType == "implement" && cfg.decomposedFromRunID != "" && !cfg.fixup {
 		repoDir := cfg.workingDir
 		if repoDir == "" {
 			repoDir = "."
 		}
-		sharedBranch := "fishhawk/run-" + shortID(cfg.decomposedFromRunID)
+		sharedBranch := childSliceBranch(cfg.decomposedFromRunID, runSliceIndex)
 		if remoteBranchExists(ctx, repoDir, sharedBranch) {
 			childCheckoutMoved := false
 			if preAgentCaptured {
@@ -1795,13 +1803,13 @@ func reissueSigningKeyForTerminalUpload(ctx context.Context, client uploadClient
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, fetchErr
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -1809,20 +1817,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -1929,15 +1937,22 @@ func resolvePolicyBaseRef(ctx context.Context, cfg config, logSink io.Writer) st
 	if cfg.decomposedFromRunID == "" {
 		return cfg.checkBaseRef
 	}
-	// Same shared-branch derivation and predicate the upload-phase
-	// isSubsequent routing uses (see the branch-routing block).
-	sharedBranch := "fishhawk/run-" + shortID(cfg.decomposedFromRunID)
+	// Same slice-branch derivation and predicate the upload-phase routing
+	// uses (see the branch-routing block). Under ADR-041 (#1141) each child
+	// owns a sole-writer slice branch minted once, so it never pre-exists on
+	// the remote: remoteBranchExists is always false and this returns
+	// cfg.checkBaseRef — each child's policy diff is bounded against base,
+	// the correct behavior for an independent slice cut fresh from base
+	// (the pre-ADR-041 origin/<shared-branch> cumulative-diff base belonged
+	// to the shared-branch model; fan-in is E24.2).
+	sharedBranch := childSliceBranch(cfg.decomposedFromRunID, runSliceIndex)
 	repoDir := cfg.workingDir
 	if repoDir == "" {
 		repoDir = "."
 	}
 	if !remoteBranchExists(ctx, repoDir, sharedBranch) {
-		// First child: shared branch not yet on the remote, HEAD == main.
+		// Slice branch not on the remote (always, for a sole-writer slice):
+		// HEAD == base, so the policy base is cfg.checkBaseRef.
 		return cfg.checkBaseRef
 	}
 	baseRef := "origin/" + sharedBranch
@@ -3972,7 +3987,12 @@ type implementBranchRouting struct {
 	freshFetchBase string
 }
 
-func resolveImplementBranchRouting(ctx context.Context, cfg config, repoDir, baseRef string) (implementBranchRouting, error) {
+// The ctx/repoDir params are unused under ADR-041 (#1141): routing no longer
+// consults remoteBranchExists for a decomposed child (each child cuts a fresh
+// sole-writer slice branch). They are retained — passed by every caller and
+// named `_` — so a future fan-in variant (E24.2) that needs the remote read
+// can re-enable it without a signature/call-site change.
+func resolveImplementBranchRouting(_ context.Context, cfg config, _, baseRef string) (implementBranchRouting, error) {
 	var r implementBranchRouting
 	switch {
 	case cfg.fixup:
@@ -3985,17 +4005,20 @@ func resolveImplementBranchRouting(ctx context.Context, cfg config, repoDir, bas
 		r.branch = cfg.fixupBranch
 		r.isSubsequent = true
 	case cfg.decomposedFromRunID != "":
+		// Per-child sole-writer slice branch (E24.1 / #1141 / ADR-041
+		// point 1): each child pushes onto its own
+		// fishhawk/run-<parent>/slice-<n>, replacing the pre-ADR-041
+		// shared fishhawk/run-<parent> branch every sibling force-pushed.
+		// isDecomposed stays true so the scope-gate exemptions and the
+		// child_pushed audit/report path (both keyed on it) are preserved;
+		// only the push MECHANICS decouple. A sole-writer slice branch is
+		// minted once and so never pre-exists on the remote — cut it fresh
+		// from the freshly-fetched authoritative base (ADR-035 prevention,
+		// #861/#865) and leave isSubsequent false so RebaseFromRemote is
+		// false (no prior sibling commit to rebase onto; fan-in is E24.2).
 		r.isDecomposed = true
-		r.branch = "fishhawk/run-" + shortID(cfg.decomposedFromRunID)
-		r.isSubsequent = remoteBranchExists(ctx, repoDir, r.branch)
-		if !r.isSubsequent {
-			// First child creates the shared decomposition branch: cut it from
-			// the freshly-fetched authoritative base so a foreign ambient-HEAD
-			// commit (#797) can't become the recorded fork point (ADR-035
-			// prevention, #865). Subsequent children leave this empty and rebase
-			// the existing shared branch from the remote instead.
-			r.freshFetchBase = baseRef
-		}
+		r.branch = childSliceBranch(cfg.decomposedFromRunID, runSliceIndex)
+		r.freshFetchBase = baseRef
 	default:
 		r.branch = fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(cfg.runID), shortID(cfg.stageID))
 		// Standalone single-writer run: cut the branch from the freshly-
@@ -4419,8 +4442,14 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// where the auth pre-step's token (set by actions/checkout)
 		// has expired by the time the agent finishes. See the
 		// FetchInstallationToken call above.
-		PushToken:        token,
-		ForceWithLease:   isDecomposed,
+		PushToken: token,
+		// ADR-041 (#1141): a decomposed child now owns a sole-writer slice
+		// branch cut fresh from base, so no path force-pushes a shared branch.
+		// ForceWithLease is false for every routing case (the fix-up path
+		// updates its PR branch via RebaseFromRemote; standalone and slice
+		// both cut a fresh sole-writer branch). The shared-branch
+		// force-with-lease coupling that #767 needed is dropped.
+		ForceWithLease:   false,
 		RebaseFromRemote: isSubsequent,
 		// Cut a standalone run branch from a freshly-fetched authoritative
 		// base (origin/<baseRef>) rather than the ambient local HEAD, so a
@@ -4431,14 +4460,12 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// machinery (RebaseFromRemote / checkout -b from a controlled base).
 		// Empty for those callers keeps the unchanged checkout -b path.
 		FreshFetchBase: freshFetchBase,
-		// Materialize refs/remotes/origin/<shared-branch> to the pushed HEAD
-		// after a decomposed-child URL push (#770). Only decomposed children
-		// share a branch across runs in one clone, so scope it to them; this
-		// keeps remoteBranchExists's routing read and resolvePolicyBaseRef's
-		// diff base (#765) observing the branch as present, and keeps the
-		// bare --force-with-lease's compared ref in sync with origin so the
-		// next child's lease holds instead of rejecting (stale info) (#767).
-		UpdateTrackingRef: isDecomposed,
+		// ADR-041 (#1141): a sole-writer slice branch is pushed once by one
+		// child and never re-read by a sibling's routing or lease, so there is
+		// nothing to keep in sync — the pre-ADR-041 shared-branch tracking-ref
+		// materialization (#770/#767) is no longer needed and is dropped for
+		// every routing case.
+		UpdateTrackingRef: false,
 		// Scope-bounded commit (#581): stage exactly the approved
 		// plan's declared paths, excluding stray dirty files. Empty
 		// (plan_missing_for_implement) falls back to `git add -A`.
@@ -4630,14 +4657,15 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		return nil
 	}
 
-	// Decomposed children only push their commit onto the shared parent
-	// branch (one commit per sub-plan, in dependency order); they never
-	// open a PR or ship a pull_request artifact. Per ADR-032 (#719) the
-	// parent run opens ONE consolidated PR for the whole decomposition
-	// after all children settle — so suppress OpenPR + ShipPullRequest
-	// for every decomposed child, first and subsequent alike. (Before
-	// #714 only the subsequent children skipped, and the first child
-	// opened a child-owned PR the parent never tracked.)
+	// Decomposed children only push their commit onto their own sole-writer
+	// slice branch fishhawk/run-<parent>/slice-<n> (E24.1 / #1141 / ADR-041;
+	// one branch per sub-plan); they never open a PR or ship a pull_request
+	// artifact. Per ADR-032 (#719) the parent run opens ONE consolidated PR
+	// for the whole decomposition after all children settle — so suppress
+	// OpenPR + ShipPullRequest for every decomposed child. The
+	// implement_child_pushed event's is_subsequent field is now always false
+	// for children (each slice is cut fresh from base; fan-in is E24.2), and
+	// its shared_branch field carries the per-child slice branch.
 	if isDecomposed {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"implement_child_pushed","run_id":%q,"stage_id":%q,"shared_branch":%q,"head_sha":%q,"is_subsequent":%t,"verified_tree_sha":%q,"tree_sha":%q}`+"\n",
@@ -4782,6 +4810,18 @@ func shortID(id string) string {
 		return id
 	}
 	return id[:8]
+}
+
+// childSliceBranch is the per-child sole-writer branch name a decomposed
+// child pushes onto (E24.1 / #1141 / ADR-041 point 1):
+// fishhawk/run-<short-parent>/slice-<sliceIndex>. Each slice index is
+// minted once by orchestrator fanout, so each child owns a distinct
+// branch cut fresh from the declared base — replacing the pre-ADR-041
+// shared fishhawk/run-<parent> branch every sibling force-pushed onto.
+// Fan-in onto the consolidated branch is ADR-041 / E24.2, out of scope
+// here.
+func childSliceBranch(decomposedFromRunID string, sliceIndex int) string {
+	return fmt.Sprintf("fishhawk/run-%s/slice-%d", shortID(decomposedFromRunID), sliceIndex)
 }
 
 // scopeHandoffPath mirrors the /tmp/fishhawk-pr.md handoff: the runner

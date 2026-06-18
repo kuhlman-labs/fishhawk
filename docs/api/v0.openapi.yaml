@@ -3124,7 +3124,10 @@ paths:
                   decomposed_from_run_id:
                     type: string
                     format: uuid
-                    description: Parent run ID when this run is a decomposed child. Absent for standalone runs. Runners use this to route onto a shared parent branch.
+                    description: Parent run ID when this run is a decomposed child. Absent for standalone runs. Runners use this with slice_index to route the child onto its own sole-writer slice branch fishhawk/run-<parent>/slice-<n> (ADR-041).
+                  slice_index:
+                    type: integer
+                    description: Decomposed child's 0-based sub_plan position (ADR-041 / #1141), present only for decomposed children. The runner routes the child onto fishhawk/run-<shortID(decomposed_from_run_id)>/slice-<slice_index>. Omitted (treated as 0) for standalone runs and for slice 0.
                   verify_command:
                     type: string
                     description: Shell command for the verify gate; omitted when the spec declares none.
@@ -3274,6 +3277,9 @@ paths:
                     type: string
                     format: uuid
                     description: Parent run ID when this run is a decomposed child. Absent for standalone runs.
+                  slice_index:
+                    type: integer
+                    description: Decomposed child's 0-based sub_plan position (ADR-041 / #1141), present only for decomposed children. The runner routes the child onto fishhawk/run-<shortID(decomposed_from_run_id)>/slice-<slice_index>. Omitted (treated as 0) for standalone runs and for slice 0.
                   verify_command:
                     type: string
                     description: Shell command for the verify gate; omitted when the spec declares none.

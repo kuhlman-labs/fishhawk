@@ -3,12 +3,14 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -1452,5 +1454,70 @@ func TestAdvance_NoConsolidatedReview_WhenNoPR(t *testing.T) {
 	}
 	if len(rec.calls) != 0 {
 		t.Errorf("DispatchConsolidatedReview calls = %d, want 0 (no PR present)", len(rec.calls))
+	}
+}
+
+// sliceCapturingRuns wraps fanoutRunsRepo (defined in fanout_test.go) to record
+// the SliceIndex passed to each CreateRun. It records the param directly so the
+// orchestrator-mint half of the slice_index contract (E24.1 / #1141) can be
+// asserted without changing the shared fanout fixture's stub.
+type sliceCapturingRuns struct {
+	*fanoutRunsRepo
+	mintedSliceIndexes []*int
+}
+
+func (r *sliceCapturingRuns) CreateRun(ctx context.Context, p run.CreateRunParams) (*run.Run, error) {
+	r.mintedSliceIndexes = append(r.mintedSliceIndexes, p.SliceIndex)
+	return r.fanoutRunsRepo.CreateRun(ctx, p)
+}
+
+// TestAdvance_FanoutAssignsSliceIndexInOrder is the orchestrator-mint end of the
+// slice_index contract (E24.1 / #1141): each child minted from an N-element
+// decomposition.sub_plans is assigned SliceIndex 0..N-1 in sub_plan order, which
+// the runner reads back to route the child onto fishhawk/run-<parent>/slice-<n>.
+func TestAdvance_FanoutAssignsSliceIndexInOrder(t *testing.T) {
+	base := newFanoutRunsRepo()
+	rs := &sliceCapturingRuns{fanoutRunsRepo: base}
+	parent, stages := base.seed(t, "example/repo", nil, []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, ExecutorRef: "human", State: run.StageStatePending},
+	})
+	planStage := stages[0]
+
+	planBytes := decomposedPlanBytes(t, []string{"Part A", "Part B", "Part C"})
+	schemaV := "standard_v1"
+	arts := &fakeArtifacts{
+		byStage: map[uuid.UUID][]*artifact.Artifact{
+			planStage.ID: {{
+				ID:            uuid.New(),
+				StageID:       planStage.ID,
+				Kind:          artifact.KindPlan,
+				SchemaVersion: &schemaV,
+				Content:       planBytes,
+				CreatedAt:     time.Now().UTC(),
+			}},
+		},
+	}
+
+	o := &Orchestrator{Runs: rs, Logger: slog.Default(), Artifacts: arts, Audit: &recordingAudit{}}
+	out, err := o.Advance(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out != OutcomeDecomposed {
+		t.Fatalf("Advance outcome = %q, want %q", out, OutcomeDecomposed)
+	}
+
+	want := []int{0, 1, 2}
+	if len(rs.mintedSliceIndexes) != len(want) {
+		t.Fatalf("minted %d children, want %d (one per sub_plan)", len(rs.mintedSliceIndexes), len(want))
+	}
+	for i, got := range rs.mintedSliceIndexes {
+		if got == nil {
+			t.Errorf("child %d SliceIndex = nil, want %d", i, want[i])
+		} else if *got != want[i] {
+			t.Errorf("child %d SliceIndex = %d, want %d", i, *got, want[i])
+		}
 	}
 }

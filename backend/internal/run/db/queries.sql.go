@@ -20,7 +20,7 @@ UPDATE runs
            ELSE resolved_model
        END
  WHERE id = $3
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index
 `
 
 type AddRunCostParams struct {
@@ -63,15 +63,16 @@ func (q *Queries) AddRunCost(ctx context.Context, arg AddRunCostParams) (Run, er
 		&i.CostUsdTotal,
 		&i.ResolvedModel,
 		&i.Drive,
+		&i.SliceIndex,
 	)
 	return i, err
 }
 
 const createRun = `-- name: CreateRun :one
 
-INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, idempotency_key, parent_run_id, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, drive)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive
+INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, idempotency_key, parent_run_id, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, drive, slice_index)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index
 `
 
 type CreateRunParams struct {
@@ -93,6 +94,7 @@ type CreateRunParams struct {
 	IssueContext           []byte     `json:"issue_context"`
 	DecomposedFrom         *uuid.UUID `json:"decomposed_from"`
 	Drive                  bool       `json:"drive"`
+	SliceIndex             *int32     `json:"slice_index"`
 }
 
 // Run / stage queries consumed by the postgres adapter for the
@@ -118,6 +120,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		arg.IssueContext,
 		arg.DecomposedFrom,
 		arg.Drive,
+		arg.SliceIndex,
 	)
 	var i Run
 	err := row.Scan(
@@ -144,6 +147,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.CostUsdTotal,
 		&i.ResolvedModel,
 		&i.Drive,
+		&i.SliceIndex,
 	)
 	return i, err
 }
@@ -211,7 +215,7 @@ func (q *Queries) CreateStage(ctx context.Context, arg CreateStageParams) (Stage
 }
 
 const getRun = `-- name: GetRun :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive FROM runs WHERE id = $1
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index FROM runs WHERE id = $1
 `
 
 func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
@@ -241,12 +245,13 @@ func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.CostUsdTotal,
 		&i.ResolvedModel,
 		&i.Drive,
+		&i.SliceIndex,
 	)
 	return i, err
 }
 
 const getRunByIdempotencyKey = `-- name: GetRunByIdempotencyKey :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive FROM runs
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index FROM runs
  WHERE repo = $1
    AND idempotency_key = $2
 `
@@ -286,6 +291,7 @@ func (q *Queries) GetRunByIdempotencyKey(ctx context.Context, arg GetRunByIdempo
 		&i.CostUsdTotal,
 		&i.ResolvedModel,
 		&i.Drive,
+		&i.SliceIndex,
 	)
 	return i, err
 }
@@ -320,8 +326,61 @@ func (q *Queries) GetStage(ctx context.Context, id uuid.UUID) (Stage, error) {
 	return i, err
 }
 
+const listReviewStagesAwaitingApproval = `-- name: ListReviewStagesAwaitingApproval :many
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count FROM stages
+ WHERE state = 'awaiting_approval'
+   AND stage_type = 'review'
+ ORDER BY updated_at ASC
+`
+
+// The merge reconciler's candidate listing — every review stage parked
+// in awaiting_approval, SLA-independent BY DESIGN. Unlike the adjacent
+// ListStagesAwaitingApproval (which the SLA ticker keeps using with its
+// `gate_sla IS NOT NULL` filter), this query must NOT filter on gate_sla:
+// the feature_change review gate has no sla, so an SLA filter would hide
+// every feature_change merge from the reconciler and park those runs at
+// review awaiting_approval forever (#725). Ordered updated_at ASC.
+func (q *Queries) ListReviewStagesAwaitingApproval(ctx context.Context) ([]Stage, error) {
+	rows, err := q.db.Query(ctx, listReviewStagesAwaitingApproval)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Stage
+	for rows.Next() {
+		var i Stage
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Sequence,
+			&i.StageType,
+			&i.ExecutorKind,
+			&i.ExecutorRef,
+			&i.State,
+			&i.StartedAt,
+			&i.EndedAt,
+			&i.FailureCategory,
+			&i.FailureReason,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.GateSla,
+			&i.RequiresApproval,
+			&i.GateType,
+			&i.GateApprovers,
+			&i.SelfRetryCount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRuns = `-- name: ListRuns :many
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive FROM runs
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index FROM runs
  WHERE ($1::text = '' OR repo = $1)
    AND ($2::text = '' OR workflow_id = $2)
    AND ($3::text = '' OR state = $3)
@@ -396,6 +455,7 @@ func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, erro
 			&i.CostUsdTotal,
 			&i.ResolvedModel,
 			&i.Drive,
+			&i.SliceIndex,
 		); err != nil {
 			return nil, err
 		}
@@ -422,59 +482,6 @@ SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, sta
 // first row hasn't elapsed (when the parsed durations are uniform).
 func (q *Queries) ListStagesAwaitingApproval(ctx context.Context) ([]Stage, error) {
 	rows, err := q.db.Query(ctx, listStagesAwaitingApproval)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []Stage
-	for rows.Next() {
-		var i Stage
-		if err := rows.Scan(
-			&i.ID,
-			&i.RunID,
-			&i.Sequence,
-			&i.StageType,
-			&i.ExecutorKind,
-			&i.ExecutorRef,
-			&i.State,
-			&i.StartedAt,
-			&i.EndedAt,
-			&i.FailureCategory,
-			&i.FailureReason,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.GateSla,
-			&i.RequiresApproval,
-			&i.GateType,
-			&i.GateApprovers,
-			&i.SelfRetryCount,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listReviewStagesAwaitingApproval = `-- name: ListReviewStagesAwaitingApproval :many
-SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count FROM stages
- WHERE state = 'awaiting_approval'
-   AND stage_type = 'review'
- ORDER BY updated_at ASC
-`
-
-// The merge reconciler's candidate listing — every review stage parked
-// in awaiting_approval, SLA-independent BY DESIGN. Unlike the adjacent
-// ListStagesAwaitingApproval (which the SLA ticker keeps using with its
-// `gate_sla IS NOT NULL` filter), this query must NOT filter on gate_sla:
-// the feature_change review gate has no sla, so an SLA filter would hide
-// every feature_change merge from the reconciler and park those runs at
-// review awaiting_approval forever (#725). Ordered updated_at ASC.
-func (q *Queries) ListReviewStagesAwaitingApproval(ctx context.Context) ([]Stage, error) {
-	rows, err := q.db.Query(ctx, listReviewStagesAwaitingApproval)
 	if err != nil {
 		return nil, err
 	}
@@ -654,7 +661,7 @@ func (q *Queries) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]Stag
 }
 
 const lockRunForUpdate = `-- name: LockRunForUpdate :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive FROM runs WHERE id = $1 FOR UPDATE
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index FROM runs WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockRunForUpdate(ctx context.Context, id uuid.UUID) (Run, error) {
@@ -684,6 +691,7 @@ func (q *Queries) LockRunForUpdate(ctx context.Context, id uuid.UUID) (Run, erro
 		&i.CostUsdTotal,
 		&i.ResolvedModel,
 		&i.Drive,
+		&i.SliceIndex,
 	)
 	return i, err
 }
@@ -767,7 +775,7 @@ const setRunPullRequestURL = `-- name: SetRunPullRequestURL :one
 UPDATE runs
    SET pull_request_url = $2
  WHERE id = $1
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index
 `
 
 type SetRunPullRequestURLParams struct {
@@ -806,6 +814,7 @@ func (q *Queries) SetRunPullRequestURL(ctx context.Context, arg SetRunPullReques
 		&i.CostUsdTotal,
 		&i.ResolvedModel,
 		&i.Drive,
+		&i.SliceIndex,
 	)
 	return i, err
 }
@@ -848,7 +857,7 @@ const updateRunState = `-- name: UpdateRunState :one
 UPDATE runs
    SET state = $2
  WHERE id = $1
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index
 `
 
 type UpdateRunStateParams struct {
@@ -883,6 +892,7 @@ func (q *Queries) UpdateRunState(ctx context.Context, arg UpdateRunStateParams) 
 		&i.CostUsdTotal,
 		&i.ResolvedModel,
 		&i.Drive,
+		&i.SliceIndex,
 	)
 	return i, err
 }

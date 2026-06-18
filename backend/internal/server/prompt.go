@@ -45,7 +45,15 @@ type promptResponse struct {
 	// DecomposedFromRunID is the parent run's ID when this run is a
 	// decomposed child. Absent for standalone runs. Runners use this to
 	// route decomposed children onto a shared parent branch.
-	DecomposedFromRunID  string `json:"decomposed_from_run_id,omitempty"`
+	DecomposedFromRunID string `json:"decomposed_from_run_id,omitempty"`
+	// SliceIndex is the decomposed child's 0-based sub_plan position
+	// (E24.1 / #1141 / ADR-041), consumed by the runner to route the
+	// child onto its own sole-writer slice branch
+	// fishhawk/run-<parent>/slice-<n>. omitempty drops a 0 value: only
+	// decomposed children carry it, and the runner reads it only when
+	// decomposed_from_run_id is set, defaulting to 0 — the correct
+	// value for slice 0.
+	SliceIndex           int    `json:"slice_index,omitempty"`
 	VerifyCommand        string `json:"verify_command,omitempty"`
 	VerifyTimeoutSeconds int    `json:"verify_timeout_seconds,omitempty"`
 	// VerifyMaxIterations is the verify-fix loop budget from
@@ -921,6 +929,9 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
+		if runRow.SliceIndex != nil {
+			resp.SliceIndex = *runRow.SliceIndex
+		}
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
@@ -1189,6 +1200,9 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
+		if runRow.SliceIndex != nil {
+			resp.SliceIndex = *runRow.SliceIndex
+		}
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }

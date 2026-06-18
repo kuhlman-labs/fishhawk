@@ -64,6 +64,23 @@ type McpToken struct {
 	Scopes     []string           `json:"scopes"`
 }
 
+type ReviewConcern struct {
+	ID                   uuid.UUID          `json:"id"`
+	RunID                uuid.UUID          `json:"run_id"`
+	StageID              uuid.UUID          `json:"stage_id"`
+	StageKind            string             `json:"stage_kind"`
+	OriginReviewSequence int64              `json:"origin_review_sequence"`
+	ReviewerModel        *string            `json:"reviewer_model"`
+	Severity             string             `json:"severity"`
+	Category             string             `json:"category"`
+	Note                 string             `json:"note"`
+	State                string             `json:"state"`
+	StateReason          string             `json:"state_reason"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	SuggestedPatch       string             `json:"suggested_patch"`
+}
+
 type Run struct {
 	ID                     uuid.UUID          `json:"id"`
 	Repo                   string             `json:"repo"`
@@ -88,6 +105,20 @@ type Run struct {
 	CostUsdTotal           float64            `json:"cost_usd_total"`
 	ResolvedModel          string             `json:"resolved_model"`
 	Drive                  bool               `json:"drive"`
+	SliceIndex             *int32             `json:"slice_index"`
+}
+
+type ScopeAmendment struct {
+	ID             uuid.UUID          `json:"id"`
+	RunID          uuid.UUID          `json:"run_id"`
+	StageID        uuid.UUID          `json:"stage_id"`
+	Paths          []byte             `json:"paths"`
+	Reason         string             `json:"reason"`
+	Status         string             `json:"status"`
+	DecisionReason *string            `json:"decision_reason"`
+	DecidedBy      *string            `json:"decided_by"`
+	RequestedAt    pgtype.Timestamptz `json:"requested_at"`
+	DecidedAt      pgtype.Timestamptz `json:"decided_at"`
 }
 
 type Session struct {

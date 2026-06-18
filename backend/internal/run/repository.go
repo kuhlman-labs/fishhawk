@@ -79,6 +79,12 @@ type CreateRunParams struct {
 	// an in-flight run's advancement behavior. False means
 	// operator-driven (the default at every layer).
 	Drive bool
+	// SliceIndex is the decomposed child's 0-based sub_plan position
+	// (E24.1 / #1141 / ADR-041). Set by orchestrator fanout for each
+	// minted decomposition child; nil for non-decomposed creates. The
+	// runner reads it back off the prompt-fetch response to route the
+	// child onto its own sole-writer slice branch.
+	SliceIndex *int
 }
 
 // CreateStageParams are the inputs needed to insert a new stage.

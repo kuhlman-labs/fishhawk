@@ -1194,12 +1194,14 @@ func TestGetStagePrompt_DecomposedFromRunID_Present(t *testing.T) {
 	stageID := uuid.New()
 	priv, _ := sf.issue(t, runID)
 
+	sliceIdx := 2
 	rr.runRow = &run.Run{
 		ID:             runID,
 		Repo:           "x/y",
 		WorkflowID:     "feature_change",
 		TriggerSource:  run.TriggerCLI,
 		DecomposedFrom: &parentRunID,
+		SliceIndex:     &sliceIdx,
 	}
 	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
 
@@ -1213,6 +1215,50 @@ func TestGetStagePrompt_DecomposedFromRunID_Present(t *testing.T) {
 	}
 	if resp.DecomposedFromRunID != parentRunID.String() {
 		t.Errorf("DecomposedFromRunID = %q, want %q", resp.DecomposedFromRunID, parentRunID.String())
+	}
+	// The persisted slice_index is surfaced so the runner can route the
+	// child onto fishhawk/run-<parent>/slice-<n> (E24.1 / #1141).
+	if resp.SliceIndex != 2 {
+		t.Errorf("SliceIndex = %d, want 2", resp.SliceIndex)
+	}
+}
+
+// TestGetStagePrompt_SliceIndex_Zero_ForSliceZeroChild covers the
+// omitempty-drops-0 case: a decomposed child at slice 0 carries a non-nil
+// *0 SliceIndex on the row; the response field is dropped on the wire by
+// omitempty but the runner reads it as the zero value — the correct value
+// for slice 0 (it only reads slice_index when decomposed_from_run_id is set).
+func TestGetStagePrompt_SliceIndex_Zero_ForSliceZeroChild(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID := uuid.New()
+	parentRunID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	zero := 0
+	rr.runRow = &run.Run{
+		ID:             runID,
+		Repo:           "x/y",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerCLI,
+		DecomposedFrom: &parentRunID,
+		SliceIndex:     &zero,
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "slice_index") {
+		t.Errorf("response body unexpectedly carries slice_index for slice 0 (omitempty should drop it):\n%s", w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.SliceIndex != 0 {
+		t.Errorf("SliceIndex = %d, want 0", resp.SliceIndex)
 	}
 }
 
@@ -1241,6 +1287,14 @@ func TestGetStagePrompt_DecomposedFromRunID_Absent_ForStandaloneRun(t *testing.T
 	}
 	if resp.DecomposedFromRunID != "" {
 		t.Errorf("DecomposedFromRunID = %q, want empty for standalone run", resp.DecomposedFromRunID)
+	}
+	// A standalone run has nil SliceIndex; the field is omitted on the wire
+	// and decodes to 0 (the runner never reads it without decomposed_from).
+	if strings.Contains(w.Body.String(), "slice_index") {
+		t.Errorf("response body unexpectedly carries slice_index for standalone run:\n%s", w.Body.String())
+	}
+	if resp.SliceIndex != 0 {
+		t.Errorf("SliceIndex = %d, want 0 for standalone run", resp.SliceIndex)
 	}
 }
 

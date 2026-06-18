@@ -97,6 +97,7 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		IssueContext:           issueContextBytes,
 		DecomposedFrom:         p.DecomposedFrom,
 		Drive:                  p.Drive,
+		SliceIndex:             intPtrToInt32Ptr(p.SliceIndex),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
@@ -657,7 +658,29 @@ func rowToRun(r rundb.Run) *Run {
 	out.CostUSDTotal = r.CostUsdTotal
 	out.ResolvedModel = r.ResolvedModel
 	out.Drive = r.Drive
+	out.SliceIndex = int32PtrToIntPtr(r.SliceIndex)
 	return out
+}
+
+// intPtrToInt32Ptr / int32PtrToIntPtr bridge the run domain's *int
+// SliceIndex (E24.1 / #1141) and the sqlc-generated *int32 column. nil
+// (non-decomposed run) round-trips to nil; a value round-trips
+// unchanged — a slice index never approaches int32 range, so the
+// narrowing conversion is lossless in practice.
+func intPtrToInt32Ptr(v *int) *int32 {
+	if v == nil {
+		return nil
+	}
+	n := int32(*v)
+	return &n
+}
+
+func int32PtrToIntPtr(v *int32) *int {
+	if v == nil {
+		return nil
+	}
+	n := int(*v)
+	return &n
 }
 
 func rowToStage(s rundb.Stage) *Stage {
