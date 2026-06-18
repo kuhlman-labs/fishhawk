@@ -2389,6 +2389,7 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	origChildCheckout := checkoutChildBase
 	origRunBranch := checkoutRunBranch
 	origDirty, origClean, origResPres := dirtyPaths, cleanDriftPaths, restoreHeadPreserving
+	origApply, origReset, origGate := applyFixupPatch, resetFixupWorktree, fixupVerifyGate
 	newPusher = func() pusher { return fp }
 	newPROpener = func(token string) prOpener {
 		fpr.gotToken = token
@@ -2429,6 +2430,17 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	dirtyPaths = func(_ context.Context, _ string) ([]string, error) { return nil, nil }
 	cleanDriftPaths = func(_ context.Context, _ string, _ []string) error { return nil }
 	restoreHeadPreserving = func(_ context.Context, _, _ string, _ []string) error { return nil }
+	// Stub the #1165 deterministic fix-up apply seam to safe no-ops so a
+	// fake-pusher run() test never applies patches to or resets the runner's
+	// own source repo. These only fire when the fetched prompt carries a
+	// non-empty apply-list AND a verify command, which the default fixture does
+	// not — but stub them defensively. Tests exercising the apply path swap in
+	// recording fakes AFTER this.
+	applyFixupPatch = func(_ context.Context, _, _ string) error { return nil }
+	resetFixupWorktree = func(_ context.Context, _, _ string) error { return nil }
+	fixupVerifyGate = func(_ context.Context, _ config, _ io.Writer) ([]agent.Event, string, error) {
+		return nil, "", nil
+	}
 	t.Cleanup(func() {
 		newPusher = origP
 		newPROpener = origO
@@ -2440,6 +2452,9 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 		dirtyPaths = origDirty
 		cleanDriftPaths = origClean
 		restoreHeadPreserving = origResPres
+		applyFixupPatch = origApply
+		resetFixupWorktree = origReset
+		fixupVerifyGate = origGate
 	})
 }
 
@@ -10339,4 +10354,223 @@ func TestMissingScopeFilesMessage(t *testing.T) {
 	if !strings.Contains(bare, "unknown.go") {
 		t.Errorf("message %q must still name the unmatched missing path", bare)
 	}
+}
+
+// --- #1165 near-deterministic fix-up apply path ---------------------------
+
+// fixupApplyTestSeams swaps the #1165 apply seams with recording fakes and
+// restores them on cleanup. applyErr controls the apply outcome; gate{Tree,Err}
+// control the verify-gate outcome. resetCalls counts fail-safe resets.
+type fixupApplyTestSeams struct {
+	applyCalls int
+	resetCalls int
+	gateCalls  int
+}
+
+func swapFixupApplySeams(t *testing.T, applyErr error, gateTree string, gateErr error) *fixupApplyTestSeams {
+	t.Helper()
+	s := &fixupApplyTestSeams{}
+	origApply, origReset, origGate := applyFixupPatch, resetFixupWorktree, fixupVerifyGate
+	applyFixupPatch = func(_ context.Context, _, _ string) error {
+		s.applyCalls++
+		return applyErr
+	}
+	resetFixupWorktree = func(_ context.Context, _, _ string) error {
+		s.resetCalls++
+		return nil
+	}
+	fixupVerifyGate = func(_ context.Context, _ config, _ io.Writer) ([]agent.Event, string, error) {
+		s.gateCalls++
+		return []agent.Event{{Kind: "verify_run"}}, gateTree, gateErr
+	}
+	t.Cleanup(func() {
+		applyFixupPatch = origApply
+		resetFixupWorktree = origReset
+		fixupVerifyGate = origGate
+	})
+	return s
+}
+
+// TestAttemptDeterministicFixup_Applied is the happy path: every patch applies
+// and the verify gate passes, so the apply is adopted (no agent spawn) and the
+// provenance is "applied".
+func TestAttemptDeterministicFixup_Applied(t *testing.T) {
+	seams := swapFixupApplySeams(t, nil, "tree-abc", nil)
+	cfg := config{runID: "r", stageID: "s", workingDir: t.TempDir()}
+	patches := []upload.FixupApplyPatch{{Patch: "diff1"}, {Patch: "diff2"}}
+	var log bytes.Buffer
+
+	applied, tree, evs, ap := attemptDeterministicFixup(context.Background(), cfg, patches, "tip-sha", &log)
+
+	if !applied {
+		t.Fatalf("applied = false, want true on clean apply + passing gate")
+	}
+	if tree != "tree-abc" {
+		t.Errorf("verifiedTreeSHA = %q, want the gate's tree", tree)
+	}
+	if ap != "applied" {
+		t.Errorf("applyPath = %q, want applied", ap)
+	}
+	if seams.applyCalls != 2 {
+		t.Errorf("applyCalls = %d, want 2 (one per patch)", seams.applyCalls)
+	}
+	if seams.resetCalls != 0 {
+		t.Errorf("resetCalls = %d, want 0 on the success path", seams.resetCalls)
+	}
+	if len(evs) == 0 {
+		t.Error("expected the verify-gate events to ride the returned trace")
+	}
+	if !strings.Contains(log.String(), "fixup_apply_verified") {
+		t.Errorf("expected a fixup_apply_verified log line, got %q", log.String())
+	}
+}
+
+// TestAttemptDeterministicFixup_PatchDidNotApply covers failure mode (a): a
+// patch does not apply cleanly, so the worktree is reset and the run falls
+// through to the agent with apply_failed_fellback provenance. The verify gate
+// must NOT run once an apply has failed.
+func TestAttemptDeterministicFixup_PatchDidNotApply(t *testing.T) {
+	seams := swapFixupApplySeams(t, errors.New("hunk #1 FAILED"), "unused", nil)
+	cfg := config{runID: "r", stageID: "s", workingDir: t.TempDir()}
+	patches := []upload.FixupApplyPatch{{Patch: "bad"}}
+	var log bytes.Buffer
+
+	applied, tree, _, ap := attemptDeterministicFixup(context.Background(), cfg, patches, "tip-sha", &log)
+
+	if applied {
+		t.Fatal("applied = true, want false when a patch does not apply")
+	}
+	if tree != "" {
+		t.Errorf("verifiedTreeSHA = %q, want empty on fallback", tree)
+	}
+	if ap != "apply_failed_fellback" {
+		t.Errorf("applyPath = %q, want apply_failed_fellback", ap)
+	}
+	if seams.resetCalls != 1 {
+		t.Errorf("resetCalls = %d, want exactly 1 fail-safe reset", seams.resetCalls)
+	}
+	if seams.gateCalls != 0 {
+		t.Errorf("gateCalls = %d, want 0 — the gate must not run after an apply failure", seams.gateCalls)
+	}
+	if !strings.Contains(log.String(), "patch_did_not_apply") {
+		t.Errorf("expected a patch_did_not_apply fallback log, got %q", log.String())
+	}
+}
+
+// TestAttemptDeterministicFixup_VerifyGateFailed covers failure mode (c): the
+// patches apply but the post-apply committed-tree verify gate fails, so the
+// worktree is reset and the run falls through to the agent.
+func TestAttemptDeterministicFixup_VerifyGateFailed(t *testing.T) {
+	seams := swapFixupApplySeams(t, nil, "", errors.New("committed tests failed"))
+	cfg := config{runID: "r", stageID: "s", workingDir: t.TempDir()}
+	patches := []upload.FixupApplyPatch{{Patch: "ok"}}
+	var log bytes.Buffer
+
+	applied, _, evs, ap := attemptDeterministicFixup(context.Background(), cfg, patches, "tip-sha", &log)
+
+	if applied {
+		t.Fatal("applied = true, want false when the verify gate fails")
+	}
+	if ap != "apply_failed_fellback" {
+		t.Errorf("applyPath = %q, want apply_failed_fellback", ap)
+	}
+	if seams.resetCalls != 1 {
+		t.Errorf("resetCalls = %d, want exactly 1 fail-safe reset", seams.resetCalls)
+	}
+	if len(evs) == 0 {
+		t.Error("expected the failing verify-gate events to ride the returned trace")
+	}
+	if !strings.Contains(log.String(), "verify_gate_failed") {
+		t.Errorf("expected a verify_gate_failed fallback log, got %q", log.String())
+	}
+}
+
+// TestAttemptDeterministicFixup_NoVerifiableTree covers the gate-skip arm: the
+// patches apply but the committed-tree gate produced no verifiable tree (e.g.
+// no scope-only change to gate), so the apply is NOT adopted — an unverified
+// apply must never ship; it resets and falls through to the agent.
+func TestAttemptDeterministicFixup_NoVerifiableTree(t *testing.T) {
+	seams := swapFixupApplySeams(t, nil, "", nil)
+	cfg := config{runID: "r", stageID: "s", workingDir: t.TempDir()}
+	patches := []upload.FixupApplyPatch{{Patch: "ok"}}
+	var log bytes.Buffer
+
+	applied, _, _, ap := attemptDeterministicFixup(context.Background(), cfg, patches, "tip-sha", &log)
+
+	if applied {
+		t.Fatal("applied = true, want false when the gate produced no verifiable tree")
+	}
+	if ap != "apply_failed_fellback" {
+		t.Errorf("applyPath = %q, want apply_failed_fellback", ap)
+	}
+	if seams.resetCalls != 1 {
+		t.Errorf("resetCalls = %d, want exactly 1 fail-safe reset", seams.resetCalls)
+	}
+	if !strings.Contains(log.String(), "verify_gate_no_tree") {
+		t.Errorf("expected a verify_gate_no_tree fallback log, got %q", log.String())
+	}
+}
+
+// TestGitApply3WayAndResetRoundTrip exercises the real exec-based apply + reset
+// helpers against a throwaway git repo: a unified diff applies to the working
+// tree, and gitResetHardClean restores it (discarding both the tracked edit and
+// an untracked CREATE) to the committed tip.
+func TestGitApply3WayAndResetRoundTrip(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null",
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s", args, out)
+		}
+	}
+	run("init", "-q")
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "f.txt")
+	run("-c", "commit.gpgsign=false", "commit", "-q", "-m", "base")
+	tip := strings.TrimSpace(mustOutput(t, dir, "rev-parse", "HEAD"))
+
+	patch := "diff --git a/f.txt b/f.txt\n" +
+		"index 0000000..1111111 100644\n" +
+		"--- a/f.txt\n+++ b/f.txt\n" +
+		"@@ -1 +1 @@\n-hello\n+goodbye\n"
+	if err := gitApply3Way(context.Background(), dir, patch); err != nil {
+		t.Fatalf("gitApply3Way: %v", err)
+	}
+	got, _ := os.ReadFile(filepath.Join(dir, "f.txt"))
+	if string(got) != "goodbye\n" {
+		t.Fatalf("after apply f.txt = %q, want goodbye", got)
+	}
+	// Leave an untracked CREATE behind to prove clean -fd removes it.
+	if err := os.WriteFile(filepath.Join(dir, "new.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := gitResetHardClean(context.Background(), dir, tip); err != nil {
+		t.Fatalf("gitResetHardClean: %v", err)
+	}
+	got, _ = os.ReadFile(filepath.Join(dir, "f.txt"))
+	if string(got) != "hello\n" {
+		t.Errorf("after reset f.txt = %q, want the committed hello", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "new.txt")); !os.IsNotExist(err) {
+		t.Error("reset --hard + clean -fd must remove the untracked CREATE")
+	}
+}
+
+func mustOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).Output()
+	if err != nil {
+		t.Fatalf("git %v: %v", args, err)
+	}
+	return string(out)
 }

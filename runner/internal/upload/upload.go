@@ -398,6 +398,28 @@ type FetchedPrompt struct {
 	// (older backend, or backend-side resolution failure) means the runner
 	// skips the comparison and proceeds with checkout only.
 	FixupExpectedHeadSHA string `json:"fixup_expected_head_sha,omitempty"`
+	// FixupApplyPatches is the near-deterministic apply-list (#1165): one
+	// reviewer-emitted unified diff per routed concern, in routing order.
+	// Non-empty ONLY on a fix-up dispatch whose routed concerns EVERY carry a
+	// suggested_patch (the backend's all-or-nothing eligibility gate). The
+	// runner then attempts `git apply --3way` of each patch against the
+	// already-checked-out PR branch and, on a clean apply that passes the
+	// committed-tree verify gate, commits/pushes via the existing fixup_pushed
+	// path WITHOUT spawning the agent. ANY apply or verify failure, or an empty
+	// list (a routed concern lacked a patch), sends the runner down the
+	// unchanged agent fix-up path. Empty on a normal implement dispatch and on
+	// a non-eligible fix-up — byte-identical to today. The wire tag
+	// (fixup_apply_patches / patch) matches the backend's fixupApplyPatch shape.
+	FixupApplyPatches []FixupApplyPatch `json:"fixup_apply_patches,omitempty"`
+}
+
+// FixupApplyPatch is one entry in FetchedPrompt.FixupApplyPatches: a single
+// routed concern's reviewer-emitted unified diff (#1165). The patch carries its
+// own file paths in the diff headers. The json tag (patch) is byte-identical to
+// the backend's fixupApplyPatch struct, the runner↔backend wire contract for
+// the deterministic apply-list.
+type FixupApplyPatch struct {
+	Patch string `json:"patch"`
 }
 
 // ScopeFile is one entry in FetchedPrompt.ScopeFiles: a declared path

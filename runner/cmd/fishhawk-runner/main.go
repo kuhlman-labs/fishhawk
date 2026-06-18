@@ -263,6 +263,16 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// run().
 	var bindingAssertions []upload.BindingAssertion
 
+	// fixupApplyPatches is the fetched prompt's fixup_apply_patches (#1165):
+	// the routed concerns' reviewer-emitted unified diffs, non-empty ONLY when
+	// every routed concern carries a suggested_patch. The pre-invoke
+	// deterministic-apply block below attempts `git apply --3way` of each patch
+	// and, on a clean apply that passes the committed-tree verify gate, skips
+	// the agent spawn entirely. Empty (non-eligible fix-up, older backend, or
+	// no --fetch-prompt) leaves the unchanged agent fix-up path in force.
+	// Function-scoped like fixupExpectedHeadSHA: produced and consumed in run().
+	var fixupApplyPatches []upload.FixupApplyPatch
+
 	// If --fetch-prompt is set and no --prompt-file was supplied,
 	// pull the constructed prompt from the backend and write it to
 	// a temp file. Sets cfg.promptFile so the rest of the path is
@@ -283,7 +293,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -306,6 +316,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		cfg.fixup = fixup
 		cfg.fixupBranch = fixupBranch
 		fixupExpectedHeadSHA = expectedHeadSHA
+		fixupApplyPatches = applyPatches
 		bindingAssertions = promptBindingAssertions
 		stageType = sType
 		// Hand the resolved scope.files to the out-of-process CLI
@@ -512,6 +523,23 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// handleShipPlan accept-and-reject path own the running->failed(B)
 		// transition (#613).
 		planValidationFailed bool
+		// appliedFixup records that the near-deterministic fix-up apply path
+		// (#1165) resolved this dispatch: every routed concern's suggested_patch
+		// applied cleanly and the committed-tree verify gate passed, so the agent
+		// invocation and the downstream verify gates are SKIPPED and the applied
+		// working tree flows straight into openPRAndShipArtifact's fix-up push.
+		appliedFixup bool
+		// verifiedTreeSHA is the tree object hash the committed-tree gates passed
+		// against (#960), threaded into openPRAndShipArtifact's pre-push
+		// invariant. Hoisted here (was a gate-region local) so the #1165 apply
+		// block, which runs its verify gate before the agent loop, can set it.
+		verifiedTreeSHA string
+		// fixupApplyEvents carries the #1165 deterministic-apply trace (apply +
+		// verify-gate events, plus the scope-only git_diff on a clean apply).
+		// Collected before the agent loop but appended to res.Events AFTER it,
+		// because the agent loop reassigns res wholesale — on the fallback path
+		// that would otherwise discard the apply-attempt trace.
+		fixupApplyEvents []agent.Event
 	)
 
 	// Capture the operator's HEAD ref BEFORE the agent is invoked (#941).
@@ -681,6 +709,54 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"fixup_base_established","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"original_ref":%q}`+"\n",
 			cfg.runID, cfg.stageID, cfg.fixupBranch, tipSHA, preAgentRef)
+
+		// Near-deterministic fix-up apply (#1165): when the backend served an
+		// apply-list (every routed concern carried a suggested_patch) AND a
+		// committed-tree verify gate is configured, try git-applying the patches
+		// onto the freshly-checked-out PR branch instead of spawning the agent.
+		// On a clean apply that passes the gate, the agent invocation and the
+		// downstream verify gates are skipped and the applied tree flows into the
+		// existing fix-up commit/push path. On ANY apply/verify failure the
+		// worktree is reset to the branch tip (tipSHA) and the unchanged agent
+		// path runs. The default "agent" stands when no apply-list was served (a
+		// non-mechanical / mixed fix-up) or no verify gate is configured (we
+		// cannot confirm the apply, so we conservatively re-derive with the
+		// agent). Provenance is recorded in the trace bundle below.
+		applyPath := "agent"
+		if len(fixupApplyPatches) > 0 && cfg.verifyCmd != "" && !cfg.noPR {
+			ok, tree, evs, ap := attemptDeterministicFixup(ctx, cfg, fixupApplyPatches, tipSHA, logSink)
+			fixupApplyEvents = evs
+			applyPath = ap
+			if ok {
+				appliedFixup = true
+				verifiedTreeSHA = tree
+				res.OK = true
+				// Emit the reconciled scope-only diff so the implement re-review
+				// and policy re-eval see the applied change — the agent path emits
+				// this from inside the invoke loop, which the apply path skips.
+				// Gated on checkBaseRef like the agent path's git_diff emission.
+				if cfg.checkBaseRef != "" {
+					fixupApplyEvents = append(fixupApplyEvents, reemitScopedGitDiff(cfg, logSink)...)
+				}
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"fixup_applied_deterministically","run_id":%q,"stage_id":%q,"patch_count":%d,"verified_tree_sha":%q}`+"\n",
+					cfg.runID, cfg.stageID, len(fixupApplyPatches), tree)
+			}
+		}
+		// Record the fix-up apply provenance (#1165) in the trace bundle for every
+		// fix-up dispatch — "applied" (deterministic git-apply, no agent), "agent"
+		// (no apply-list served, the agent re-derived), or "apply_failed_fellback"
+		// (an apply-list was served but reset + the agent ran). The runtime value
+		// is deliberately NOT sent on the fixup_pushed report: the backend's
+		// /pull-request handler uses DisallowUnknownFields, so an unknown body
+		// field would 400 and break the report. Persisting this discriminator onto
+		// the fixup_pushed AUDIT entry is a follow-up gated on succeedFixupPushStage
+		// (backend/internal/server/pullrequest.go), out of this slice's scope; the
+		// trace bundle is the durable in-scope provenance until then.
+		fixupApplyEvents = append(fixupApplyEvents, agent.Event{
+			Kind:    "fixup_apply_path",
+			Payload: agent.MakePayload(map[string]any{"apply_path": applyPath}),
+		})
 	}
 
 	// Subsequent-child base establishment (#1036): once a prior sibling has
@@ -756,7 +832,13 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	}()
 
 	invokeStart := time.Now()
-	for {
+	// When appliedFixup is set, the near-deterministic fix-up apply (#1165)
+	// already produced the change and passed the committed-tree verify gate
+	// (res.OK was set true above), so the agent invocation and its self-retry
+	// loop are skipped entirely — the applied working tree flows straight into
+	// the fix-up push. appliedFixup never changes inside the loop, so guarding
+	// the loop condition is equivalent to an early break on the first iteration.
+	for !appliedFixup {
 		res, invokeErr = invoker.Invoke(ctx, inv)
 
 		// Plan validation runs only if the agent itself succeeded —
@@ -907,6 +989,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	stopWatch()
 	watchWG.Wait()
 
+	// Fold the #1165 deterministic-apply trace into the bundle. Appended here
+	// (not before the loop) because the agent loop reassigns res wholesale, so
+	// on the fallback path an earlier append would be discarded; on the applied
+	// path the loop broke without touching res, so these are the only stage
+	// events. No-op (nil) on every non-apply dispatch.
+	if len(fixupApplyEvents) > 0 {
+		res.Events = append(res.Events, fixupApplyEvents...)
+	}
+
 	// Mid-stage scope-amendment refresh (E22.X / #961). Immediately before
 	// the commit phase — and crucially BEFORE the committed-tree verify
 	// gates and every StageScoped call below — fetch the run's scope
@@ -937,11 +1028,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// compounding (DECISION c2). It is placed BEFORE EmitStage so the span's
 	// token/model counts include the fix-loop invocations' cost (ADR-030).
 	reinvoked := false
-	// verifiedTreeSHA is the tree object hash the committed-tree gates passed
-	// against (#960), threaded into openPRAndShipArtifact's pre-push invariant.
-	// Empty when no gate ran (plan stage, --no-pr, verifyCmd unset, skip).
-	verifiedTreeSHA := ""
-	if res.OK && stageType == "implement" && !cfg.noPR &&
+	// verifiedTreeSHA is declared in the function-scope var block above (hoisted
+	// for the #1165 apply block). The #960 contract is unchanged: empty when no
+	// gate ran (plan stage, --no-pr, verifyCmd unset, skip). The deterministic
+	// apply path (appliedFixup) already ran its gate and set it, so the two
+	// committed-tree gates below are skipped for that path.
+	if res.OK && !appliedFixup && stageType == "implement" && !cfg.noPR &&
 		cfg.verifyCmd != "" && cfg.verifyMaxIterations > 0 {
 		// A POST-commit reset failure (#816) is fatal: the throwaway commit is
 		// still on HEAD, so the stage must NOT proceed to the real push. Demote
@@ -987,7 +1079,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// cfg.verifyCmd!="" space with no overlap: working-tree in-loop gate =
 	// (plan || --no-pr); this committed single-shot gate = implement &&
 	// !noPR && maxIter==0; fix loop = implement && !noPR && maxIter>0.
-	if res.OK && stageType == "implement" && !cfg.noPR &&
+	if res.OK && !appliedFixup && stageType == "implement" && !cfg.noPR &&
 		cfg.verifyCmd != "" && cfg.verifyMaxIterations == 0 {
 		evs, tree, demote := runVerifyGateCommitted(ctx, cfg, logSink)
 		res.Events = append(res.Events, evs...)
@@ -1602,13 +1694,13 @@ func reissueSigningKeyForTerminalUpload(ctx context.Context, client uploadClient
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, fetchErr
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -1616,20 +1708,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -3138,6 +3230,95 @@ func gitResetSoftHEAD1(ctx context.Context, repoDir string) error {
 	return nil
 }
 
+// gitApply3Way applies a single unified-diff patch to repoDir's working tree
+// via `git apply --3way`, reading the patch from stdin (#1165). --3way falls
+// back to a 3-way merge using the blob index when straight application fails,
+// and exits non-zero — leaving the tree unmodified for a non-applying hunk —
+// when a hunk cannot be reconciled, which is the apply-failure fallback signal
+// the deterministic fix-up path treats as "re-derive with the agent instead".
+func gitApply3Way(ctx context.Context, repoDir, patch string) error {
+	cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "apply", "--3way", "-")
+	cmd.Stdin = strings.NewReader(patch)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git apply --3way: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// gitResetHardClean restores repoDir's working tree to ref with `git reset
+// --hard <ref>` followed by `git clean -fd` (#1165), discarding any
+// half-applied patch — both tracked edits AND the untracked new files a CREATE
+// patch left behind. It is the fail-safe reset the deterministic fix-up path
+// runs before falling through to the agent, so the agent never inherits a
+// partially-applied tree.
+func gitResetHardClean(ctx context.Context, repoDir, ref string) error {
+	if out, err := exec.CommandContext(ctx, "git", "-C", repoDir, "reset", "--hard", ref).CombinedOutput(); err != nil {
+		return fmt.Errorf("git reset --hard %s: %s", ref, strings.TrimSpace(string(out)))
+	}
+	if out, err := exec.CommandContext(ctx, "git", "-C", repoDir, "clean", "-fd").CombinedOutput(); err != nil {
+		return fmt.Errorf("git clean -fd: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// attemptDeterministicFixup runs the near-deterministic fix-up apply path
+// (#1165). For each routed concern's suggested_patch it runs `git apply --3way`
+// against the already-checked-out PR branch (working tree at baseTipSHA); on a
+// clean apply of EVERY patch it runs the committed-tree verify gate. It returns
+// applied=true with the verified tree SHA ONLY when every patch applied AND the
+// gate passed — the caller then skips the agent spawn and commits/pushes the
+// applied tree via the existing fixup_pushed path. On ANY failure mode (a patch
+// did not apply cleanly, the post-apply verify gate failed, or the gate
+// produced no verifiable tree) it resets the worktree to baseTipSHA and returns
+// applied=false so the caller falls through to the unchanged agent fix-up path
+// — never a half-applied tree. The returned events carry the apply/verify
+// trace; applyPath is "applied" on success or "apply_failed_fellback" on every
+// fallback.
+func attemptDeterministicFixup(ctx context.Context, cfg config, patches []upload.FixupApplyPatch, baseTipSHA string, logSink io.Writer) (applied bool, verifiedTreeSHA string, evs []agent.Event, applyPath string) {
+	repoDir := cfg.workingDir
+	if repoDir == "" {
+		repoDir = "."
+	}
+	fallback := func(reason, detail string) (bool, string, []agent.Event, string) {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"fixup_apply_fallback","run_id":%q,"stage_id":%q,"reason":%q,"detail":%q}`+"\n",
+			cfg.runID, cfg.stageID, reason, detail)
+		if rerr := resetFixupWorktree(ctx, repoDir, baseTipSHA); rerr != nil {
+			// A failed reset may leave a half-applied tree; surface it. The caller
+			// still falls through to the agent, whose own pre-commit gates
+			// (#728/#800/#802) re-verify the committed scope-only tree, so a stuck
+			// reset cannot silently ship a bad apply.
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"fixup_apply_reset_failed","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+				cfg.runID, cfg.stageID, rerr.Error())
+		}
+		return false, "", evs, "apply_failed_fellback"
+	}
+	for i, p := range patches {
+		if err := applyFixupPatch(ctx, repoDir, p.Patch); err != nil {
+			return fallback("patch_did_not_apply", fmt.Sprintf("patch %d/%d: %v", i+1, len(patches), err))
+		}
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"fixup_patches_applied","run_id":%q,"stage_id":%q,"patch_count":%d}`+"\n",
+		cfg.runID, cfg.stageID, len(patches))
+	gateEvs, tree, demote := fixupVerifyGate(ctx, cfg, logSink)
+	evs = append(evs, gateEvs...)
+	if demote != nil {
+		return fallback("verify_gate_failed", demote.Error())
+	}
+	if tree == "" {
+		// The gate skipped (no scope-only change to verify) — the apply produced
+		// nothing the committed-tree gate could confirm. Don't ship an unverified
+		// apply; reset and let the agent re-derive.
+		return fallback("verify_gate_no_tree", "committed-tree verify gate produced no verifiable tree")
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"fixup_apply_verified","run_id":%q,"stage_id":%q,"verified_tree_sha":%q}`+"\n",
+		cfg.runID, cfg.stageID, tree)
+	return true, tree, evs, "applied"
+}
+
 // emitEvents writes one JSON object per line. This is the
 // placeholder transport — E5.3 / #30 replaced it with the
 // JSONL.gz bundle format when --bundle-out is set; E5.6 / #32
@@ -3259,6 +3440,19 @@ var (
 	// reason as restoreHead: the fake-pusher run() tests default repoDir to
 	// "." and must never force-checkout the runner's own source repo.
 	checkoutRunBranch = gitops.RestoreHead
+
+	// applyFixupPatch / resetFixupWorktree / fixupVerifyGate are the
+	// near-deterministic fix-up apply seam (#1165). Production wires them to the
+	// real exec-based git helpers and the committed-tree verify gate;
+	// attemptDeterministicFixup calls them through these vars so a unit test can
+	// drive each enumerated failure mode (patch-did-not-apply, verify-gate-fail,
+	// no-verifiable-tree, happy apply) without a live git repo or verify command.
+	// Package-level vars for the same reason as checkoutFixupBase: the
+	// fake-pusher run() tests default repoDir to "." and must never apply
+	// patches to or reset the runner's own source repo.
+	applyFixupPatch    = gitApply3Way
+	resetFixupWorktree = gitResetHardClean
+	fixupVerifyGate    = runVerifyGateCommitted
 )
 
 // compileDiagnosticMarkers are substrings that positively identify a
