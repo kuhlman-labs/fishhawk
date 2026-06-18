@@ -1754,3 +1754,33 @@ func TestFixupStage_ConcernIDs_CarriesSuggestedPatch(t *testing.T) {
 		t.Error("apply_eligible = false, want true for a single patched concern")
 	}
 }
+
+// TestNormalizeFixupApplyPath pins the #1165/#1213 apply-provenance normalizer:
+// each of the four recognized discriminators round-trips, while an unknown string
+// and the empty string both collapse to "" (the caller's signal to omit the
+// apply_path key from the fixup_pushed audit entry).
+func TestNormalizeFixupApplyPath(t *testing.T) {
+	for _, valid := range []string{
+		fixupApplyPathApplied,
+		fixupApplyPathAgent,
+		fixupApplyPathFailedFellback,
+		fixupApplyPathFailedResetFailed,
+	} {
+		if got := normalizeFixupApplyPath(valid); got != valid {
+			t.Errorf("normalizeFixupApplyPath(%q) = %q, want it preserved", valid, got)
+		}
+	}
+	// Literal values guard against an accidental rename drifting from the wire
+	// contract the runner ships.
+	if fixupApplyPathApplied != "applied" ||
+		fixupApplyPathAgent != "agent" ||
+		fixupApplyPathFailedFellback != "apply_failed_fellback" ||
+		fixupApplyPathFailedResetFailed != "apply_failed_reset_failed" {
+		t.Fatal("apply_path constant values drifted from the runner wire contract")
+	}
+	for _, bad := range []string{"", "applied ", "APPLIED", "bogus", "fellback"} {
+		if got := normalizeFixupApplyPath(bad); got != "" {
+			t.Errorf("normalizeFixupApplyPath(%q) = %q, want \"\" (unrecognized → omit)", bad, got)
+		}
+	}
+}

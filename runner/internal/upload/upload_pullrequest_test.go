@@ -278,3 +278,63 @@ func TestShipPullRequest_ChildPushOutcome_MarshalsPushBody(t *testing.T) {
 		t.Error("signature must cover the child-push body bytes")
 	}
 }
+
+// TestShipPullRequest_FixupPushedOutcome_MarshalsApplyPath asserts the #1165/#1213
+// apply provenance wire field: a fixup_pushed report with ApplyPath set carries
+// apply_path in the marshalled body, while a "pushed" child-push that shares the
+// same pullRequestChildPushBody but leaves ApplyPath unset omits the key entirely
+// (omitempty) — keeping the child-push body byte-identical to its pre-#1213 shape.
+func TestShipPullRequest_FixupPushedOutcome_MarshalsApplyPath(t *testing.T) {
+	priv := makePRKey(t)
+
+	// fixup_pushed with ApplyPath set: the key is present and carries the value.
+	pf, srv := newPRFakeBackend(t)
+	pf.status = http.StatusOK
+	pf.body = `{"stage_id":"stage-bbb","outcome":"fixup_pushed","branch":"fishhawk/run-aaa","head_sha":"head-abc"}`
+	c := quickPRClient(srv)
+	if _, err := c.ShipPullRequest(context.Background(), ShipPullRequestArgs{
+		RunID:             "run-aaa",
+		StageID:           "stage-bbb",
+		PrivateKey:        priv,
+		Outcome:           "fixup_pushed",
+		Branch:            "fishhawk/run-aaa",
+		HeadSHA:           "head-abc",
+		BaseSHA:           "base-def",
+		FilesChangedCount: 2,
+		ApplyPath:         "applied",
+	}); err != nil {
+		t.Fatalf("ShipPullRequest (fixup_pushed): %v", err)
+	}
+	if !strings.Contains(string(pf.receivedBody), `"apply_path":"applied"`) {
+		t.Errorf("fixup_pushed body must carry apply_path: %s", pf.receivedBody)
+	}
+	var sent pullRequestChildPushBody
+	if err := json.Unmarshal(pf.receivedBody, &sent); err != nil {
+		t.Fatalf("unmarshal fixup_pushed body: %v", err)
+	}
+	if sent.ApplyPath != "applied" {
+		t.Errorf("decoded ApplyPath = %q, want applied", sent.ApplyPath)
+	}
+
+	// A "pushed" child-push with no ApplyPath: omitempty drops the key, so the
+	// body stays byte-identical to the pre-#1213 child-push shape.
+	pf2, srv2 := newPRFakeBackend(t)
+	pf2.status = http.StatusOK
+	pf2.body = `{"stage_id":"stage-bbb","outcome":"pushed","branch":"fishhawk/run-aaa","head_sha":"head-abc"}`
+	c2 := quickPRClient(srv2)
+	if _, err := c2.ShipPullRequest(context.Background(), ShipPullRequestArgs{
+		RunID:             "run-aaa",
+		StageID:           "stage-bbb",
+		PrivateKey:        priv,
+		Outcome:           "pushed",
+		Branch:            "fishhawk/run-aaa",
+		HeadSHA:           "head-abc",
+		BaseSHA:           "base-def",
+		FilesChangedCount: 3,
+	}); err != nil {
+		t.Fatalf("ShipPullRequest (pushed): %v", err)
+	}
+	if strings.Contains(string(pf2.receivedBody), "apply_path") {
+		t.Errorf("child-push body must omit apply_path when unset (omitempty): %s", pf2.receivedBody)
+	}
+}

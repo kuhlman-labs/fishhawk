@@ -802,8 +802,10 @@ func TestE2E_Fixup_PushFixupForwardGateDrivesTerminal(t *testing.T) {
 	}
 
 	// 4. The /pull-request {fixup_pushed} report drives the deferred terminal
-	// transition. RequiresApproval=false → succeeded.
-	succeedFixupPushViaBackend(t, ctx, fx, impl.ID)
+	// transition. RequiresApproval=false → succeeded. The report carries the
+	// #1165/#1213 deterministic-apply provenance, crossing the runner-wire →
+	// backend decode → audit-persist boundary the per-layer units cannot.
+	succeedFixupPushViaBackend(t, ctx, fx, impl.ID, "applied")
 
 	curImpl, err = fx.runRepo.GetStage(ctx, impl.ID)
 	if err != nil {
@@ -813,13 +815,21 @@ func TestE2E_Fixup_PushFixupForwardGateDrivesTerminal(t *testing.T) {
 		t.Errorf("implement state after fixup_pushed = %q, want succeeded (report drives the gated terminal transition)", curImpl.State)
 	}
 
-	// 5. A fixup_pushed audit entry landed pinning the pushed commit.
+	// 5. A fixup_pushed audit entry landed pinning the pushed commit AND carrying
+	// the apply_path provenance the report threaded end to end.
 	pushed, err := auditRepo.ListForRunByCategory(ctx, fx.runID, "fixup_pushed")
 	if err != nil {
 		t.Fatalf("ListForRunByCategory(fixup_pushed): %v", err)
 	}
 	if len(pushed) != 1 {
 		t.Fatalf("fixup_pushed entries = %d, want 1", len(pushed))
+	}
+	var pushedPayload map[string]any
+	if err := json.Unmarshal(pushed[0].Payload, &pushedPayload); err != nil {
+		t.Fatalf("unmarshal fixup_pushed payload: %v", err)
+	}
+	if pushedPayload["apply_path"] != "applied" {
+		t.Errorf("fixup_pushed apply_path = %v, want applied (provenance must survive wire → decode → persist)", pushedPayload["apply_path"])
 	}
 }
 
@@ -917,8 +927,10 @@ func shipPushFixupTraceViaBackend(t *testing.T, ctx context.Context, fx *e2eFixt
 
 // succeedFixupPushViaBackend POSTs a /pull-request {outcome:"fixup_pushed"}
 // report for the implement stage, signed with the run's signing key. Mirrors
-// failPushPRViaBackend's server wiring.
-func succeedFixupPushViaBackend(t *testing.T, ctx context.Context, fx *e2eFixture, stageID uuid.UUID) {
+// failPushPRViaBackend's server wiring. An optional applyPath (#1165/#1213) is
+// threaded onto the report body when non-empty, crossing the runner-wire →
+// backend DisallowUnknownFields decode → fixup_pushed audit persist boundary.
+func succeedFixupPushViaBackend(t *testing.T, ctx context.Context, fx *e2eFixture, stageID uuid.UUID, applyPath ...string) {
 	t.Helper()
 	s := server.New(server.Config{
 		Addr:         "127.0.0.1:0",
@@ -930,7 +942,20 @@ func succeedFixupPushViaBackend(t *testing.T, ctx context.Context, fx *e2eFixtur
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 
-	body := []byte(`{"outcome":"fixup_pushed","branch":"fishhawk/fixup-branch","head_sha":"head-abc","base_sha":"base-def","files_changed_count":2}`)
+	bodyFields := map[string]any{
+		"outcome":             "fixup_pushed",
+		"branch":              "fishhawk/fixup-branch",
+		"head_sha":            "head-abc",
+		"base_sha":            "base-def",
+		"files_changed_count": 2,
+	}
+	if len(applyPath) > 0 && applyPath[0] != "" {
+		bodyFields["apply_path"] = applyPath[0]
+	}
+	body, err := json.Marshal(bodyFields)
+	if err != nil {
+		t.Fatalf("marshal fixup_pushed body: %v", err)
+	}
 	digest := sha256.Sum256(body)
 	signature := ed25519.Sign(fx.signingPriv, digest[:])
 	url := srv.URL + "/v0/runs/" + fx.runID.String() + "/pull-request?stage_id=" + stageID.String()

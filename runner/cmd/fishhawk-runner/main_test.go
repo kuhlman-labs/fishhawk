@@ -4196,6 +4196,130 @@ func TestRun_ImplementStage_Fixup_CommitsToExistingBranch(t *testing.T) {
 	}
 }
 
+// TestRun_Fixup_AppliedDeterministically_SkipsAgentAndGates is the #1165/#1213
+// happy-path wiring assertion: when the prompt carries an apply-list and a verify
+// command and the deterministic apply succeeds (every patch applies, the gate
+// passes), run() must (a) NOT invoke the agent, (b) skip the two downstream
+// committed-tree gates (so the apply block's verified tree, not a re-run gate's,
+// flows to the push), and (c) ship a fixup_pushed report carrying the apply
+// provenance "applied" and the apply block's verified_tree_sha.
+func TestRun_Fixup_AppliedDeterministically_SkipsAgentAndGates(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	inv := &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(_ int, _ agent.Invocation) {
+			t.Error("agent invoked despite a clean deterministic apply — the agent loop must be skipped")
+		},
+	}
+	withFakeInvoker(t, inv)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:              "22222222-3333-4444-5555-666666666666",
+		StageType:            "implement",
+		Prompt:               "implement",
+		PromptHash:           "h",
+		Fixup:                true,
+		FixupBranch:          "fishhawk/run-11111111/stage-22222222",
+		FixupExpectedHeadSHA: "fixup-branch-tip-sha",
+		VerifyCommand:        "true",
+		FixupApplyPatches:    []upload.FixupApplyPatch{{Patch: "diff1"}, {Patch: "diff2"}},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+	// Override the apply seams (withFakeGitOps stubbed them as a no-op gate that
+	// yields no tree → fallback): make every patch apply cleanly and the gate
+	// pass with a concrete verified tree, so attemptDeterministicFixup adopts it.
+	seams := swapFixupApplySeams(t, nil, "tree-applied", nil, nil)
+
+	var stderr strings.Builder
+	if got := runFixupStage(t, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	if inv.gotInv != nil {
+		t.Error("agent was invoked — a clean deterministic apply must skip the agent loop entirely")
+	}
+	if seams.applyCalls != 2 {
+		t.Errorf("applyCalls = %d, want 2 (one per apply-list patch)", seams.applyCalls)
+	}
+	// The apply block runs its OWN gate exactly once; the two downstream
+	// committed-tree gates (guarded by !appliedFixup) must NOT run again.
+	if seams.gateCalls != 1 {
+		t.Errorf("gateCalls = %d, want exactly 1 — the downstream committed-tree gates must be skipped for the apply path", seams.gateCalls)
+	}
+	// A fix-up updates the open PR; it must not open a new one.
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR called for a deterministic fix-up — should be skipped (PR already exists)")
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (fixup_pushed report) not called after a deterministic apply")
+	}
+	if fu.gotPRArgs.Outcome != "fixup_pushed" {
+		t.Errorf("report outcome = %q, want fixup_pushed", fu.gotPRArgs.Outcome)
+	}
+	if fu.gotPRArgs.ApplyPath != "applied" {
+		t.Errorf("report ApplyPath = %q, want applied (deterministic apply provenance)", fu.gotPRArgs.ApplyPath)
+	}
+	// The fix-up push carries the apply block's verified tree, proving the
+	// downstream gates did not re-derive a different verifiedTreeSHA.
+	if !strings.Contains(stderr.String(), `"event":"fixup_applied_deterministically"`) {
+		t.Errorf("missing fixup_applied_deterministically log line:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"verified_tree_sha":"tree-applied"`) {
+		t.Errorf("implement_fixup_pushed must carry the apply block's verified tree (tree-applied):\n%s", stderr.String())
+	}
+}
+
+// TestRun_Fixup_ResetFailed_FailsWithoutAgent is the #1165/#1213 fail-safe
+// assertion: when the deterministic apply fails AND the post-failure worktree
+// reset also fails, the tree may be half-applied, so run() must fail the stage
+// loud (exitFailure) WITHOUT ever invoking the agent — running the agent on a
+// possibly-corrupted tree would commit and push it.
+func TestRun_Fixup_ResetFailed_FailsWithoutAgent(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	inv := &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(_ int, _ agent.Invocation) {
+			t.Error("agent invoked after a failed apply+reset — must never run on a possibly half-applied tree")
+		},
+	}
+	withFakeInvoker(t, inv)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:              "22222222-3333-4444-5555-666666666666",
+		StageType:            "implement",
+		Prompt:               "implement",
+		PromptHash:           "h",
+		Fixup:                true,
+		FixupBranch:          "fishhawk/run-11111111/stage-22222222",
+		FixupExpectedHeadSHA: "fixup-branch-tip-sha",
+		VerifyCommand:        "true",
+		FixupApplyPatches:    []upload.FixupApplyPatch{{Patch: "diff1"}},
+	}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+	// Apply fails AND the fail-safe reset fails: the apply_failed_reset_failed
+	// branch.
+	swapFixupApplySeams(t, errors.New("hunk #1 FAILED"), "", nil, errors.New("reset --hard refused"))
+
+	var stderr strings.Builder
+	if got := runFixupStage(t, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure on a failed apply+reset:\n%s", got, stderr.String())
+	}
+	if inv.gotInv != nil {
+		t.Error("agent was invoked — a failed apply+reset must fail the stage BEFORE the agent loop")
+	}
+	if fu.gotPRArgs != nil {
+		t.Errorf("ShipPullRequest must not be called — no push on the half-applied-tree fail-safe path; got %+v", fu.gotPRArgs)
+	}
+	if !strings.Contains(stderr.String(), `"event":"runner_failed"`) ||
+		!strings.Contains(stderr.String(), `"reason":"fixup_apply_reset_failed"`) {
+		t.Errorf("missing runner_failed reason=fixup_apply_reset_failed:\n%s", stderr.String())
+	}
+}
+
 // fixupPromptResp builds the fix-up prompt response the #967 base-
 // establishment tests dispatch against.
 func fixupPromptResp(expectedHeadSHA string) *upload.FetchedPrompt {
@@ -9389,7 +9513,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_FailedReverifyBlocksPush(t *
 
 	// The re-verify command fails → the push must be blocked.
 	var logSink strings.Builder
-	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, nil)
+	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil)
 	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 		t.Fatalf("err = %v, want ErrPushedTreeNotVerified", err)
 	}
@@ -9433,7 +9557,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_PassingReverifyPushes(t *tes
 	moveBareMain(t, bare)
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil); err != nil {
 		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
 	}
 	logs := logSink.String()
@@ -9506,7 +9630,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMatch_NoReverify(t *testing.T) {
 	}
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, countCmd), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, countCmd), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil); err != nil {
 		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
 	}
 	if lines := countLines(t, counter); lines != 1 {
@@ -9539,7 +9663,7 @@ func TestOpenPRAndShipArtifact_EmptyVerifiedTree_NoOp(t *testing.T) {
 	moveBareMain(t, bare)
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, "", nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, "", "", nil); err != nil {
 		t.Fatalf("empty verifiedTreeSHA must disable the check, got: %v\n%s", err, logSink.String())
 	}
 	for _, ev := range []string{"verified_tree_match", "verified_tree_mismatch", "pushed_tree_reverified", "verify_run"} {
@@ -9656,7 +9780,7 @@ exit 0
 	}
 
 	var logSink strings.Builder
-	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, nil)
+	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil)
 	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 		t.Fatalf("err = %v, want ErrPushedTreeNotVerified\n%s", err, logSink.String())
 	}
@@ -10367,7 +10491,7 @@ type fixupApplyTestSeams struct {
 	gateCalls  int
 }
 
-func swapFixupApplySeams(t *testing.T, applyErr error, gateTree string, gateErr error) *fixupApplyTestSeams {
+func swapFixupApplySeams(t *testing.T, applyErr error, gateTree string, gateErr error, resetErr error) *fixupApplyTestSeams {
 	t.Helper()
 	s := &fixupApplyTestSeams{}
 	origApply, origReset, origGate := applyFixupPatch, resetFixupWorktree, fixupVerifyGate
@@ -10377,7 +10501,7 @@ func swapFixupApplySeams(t *testing.T, applyErr error, gateTree string, gateErr 
 	}
 	resetFixupWorktree = func(_ context.Context, _, _ string) error {
 		s.resetCalls++
-		return nil
+		return resetErr
 	}
 	fixupVerifyGate = func(_ context.Context, _ config, _ io.Writer) ([]agent.Event, string, error) {
 		s.gateCalls++
@@ -10395,7 +10519,7 @@ func swapFixupApplySeams(t *testing.T, applyErr error, gateTree string, gateErr 
 // and the verify gate passes, so the apply is adopted (no agent spawn) and the
 // provenance is "applied".
 func TestAttemptDeterministicFixup_Applied(t *testing.T) {
-	seams := swapFixupApplySeams(t, nil, "tree-abc", nil)
+	seams := swapFixupApplySeams(t, nil, "tree-abc", nil, nil)
 	cfg := config{runID: "r", stageID: "s", workingDir: t.TempDir()}
 	patches := []upload.FixupApplyPatch{{Patch: "diff1"}, {Patch: "diff2"}}
 	var log bytes.Buffer
@@ -10430,7 +10554,7 @@ func TestAttemptDeterministicFixup_Applied(t *testing.T) {
 // through to the agent with apply_failed_fellback provenance. The verify gate
 // must NOT run once an apply has failed.
 func TestAttemptDeterministicFixup_PatchDidNotApply(t *testing.T) {
-	seams := swapFixupApplySeams(t, errors.New("hunk #1 FAILED"), "unused", nil)
+	seams := swapFixupApplySeams(t, errors.New("hunk #1 FAILED"), "unused", nil, nil)
 	cfg := config{runID: "r", stageID: "s", workingDir: t.TempDir()}
 	patches := []upload.FixupApplyPatch{{Patch: "bad"}}
 	var log bytes.Buffer
@@ -10461,7 +10585,7 @@ func TestAttemptDeterministicFixup_PatchDidNotApply(t *testing.T) {
 // patches apply but the post-apply committed-tree verify gate fails, so the
 // worktree is reset and the run falls through to the agent.
 func TestAttemptDeterministicFixup_VerifyGateFailed(t *testing.T) {
-	seams := swapFixupApplySeams(t, nil, "", errors.New("committed tests failed"))
+	seams := swapFixupApplySeams(t, nil, "", errors.New("committed tests failed"), nil)
 	cfg := config{runID: "r", stageID: "s", workingDir: t.TempDir()}
 	patches := []upload.FixupApplyPatch{{Patch: "ok"}}
 	var log bytes.Buffer
@@ -10490,7 +10614,7 @@ func TestAttemptDeterministicFixup_VerifyGateFailed(t *testing.T) {
 // no scope-only change to gate), so the apply is NOT adopted — an unverified
 // apply must never ship; it resets and falls through to the agent.
 func TestAttemptDeterministicFixup_NoVerifiableTree(t *testing.T) {
-	seams := swapFixupApplySeams(t, nil, "", nil)
+	seams := swapFixupApplySeams(t, nil, "", nil, nil)
 	cfg := config{runID: "r", stageID: "s", workingDir: t.TempDir()}
 	patches := []upload.FixupApplyPatch{{Patch: "ok"}}
 	var log bytes.Buffer
@@ -10508,6 +10632,40 @@ func TestAttemptDeterministicFixup_NoVerifiableTree(t *testing.T) {
 	}
 	if !strings.Contains(log.String(), "verify_gate_no_tree") {
 		t.Errorf("expected a verify_gate_no_tree fallback log, got %q", log.String())
+	}
+}
+
+// TestAttemptDeterministicFixup_ResetFailed covers the fail-safe escalation arm:
+// a patch fails to apply AND the post-failure worktree reset itself fails, so the
+// tree may be half-applied. attemptDeterministicFixup must NOT report a clean
+// fallback — it returns the apply_failed_reset_failed sentinel so the caller fails
+// the stage loud rather than run the agent on a corrupted tree. The verify gate
+// must not run (the apply already failed), and exactly one reset is attempted.
+func TestAttemptDeterministicFixup_ResetFailed(t *testing.T) {
+	seams := swapFixupApplySeams(t, errors.New("hunk #1 FAILED"), "unused", nil, errors.New("reset --hard refused"))
+	cfg := config{runID: "r", stageID: "s", workingDir: t.TempDir()}
+	patches := []upload.FixupApplyPatch{{Patch: "bad"}}
+	var log bytes.Buffer
+
+	applied, tree, _, ap := attemptDeterministicFixup(context.Background(), cfg, patches, "tip-sha", &log)
+
+	if applied {
+		t.Fatal("applied = true, want false when the post-failure reset fails")
+	}
+	if tree != "" {
+		t.Errorf("verifiedTreeSHA = %q, want empty on the reset-failure path", tree)
+	}
+	if ap != "apply_failed_reset_failed" {
+		t.Errorf("applyPath = %q, want apply_failed_reset_failed", ap)
+	}
+	if seams.resetCalls != 1 {
+		t.Errorf("resetCalls = %d, want exactly 1 reset attempt", seams.resetCalls)
+	}
+	if seams.gateCalls != 0 {
+		t.Errorf("gateCalls = %d, want 0 — the gate must not run after an apply failure", seams.gateCalls)
+	}
+	if !strings.Contains(log.String(), "fixup_apply_reset_failed") {
+		t.Errorf("expected a fixup_apply_reset_failed log line, got %q", log.String())
 	}
 }
 

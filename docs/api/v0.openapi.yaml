@@ -1011,7 +1011,10 @@ components:
           its push_fixup trace gate left in `running`, without creating a PR
           artifact — so a fix-up whose push/compile-gate step failed (reported
           via `outcome: failed`) never reaches terminal succeeded with the
-          implement re-review approving an unlanded diff.
+          implement re-review approving an unlanded diff. The optional
+          `apply_path` field (#1165/#1213) records whether the fix-up collapsed
+          to a deterministic git-apply of the routed concerns' suggested
+          patches or fell back to the agent.
       required: [pr_number, pr_url, branch, head_sha, base_sha, title, files_changed_count]
       properties:
         pr_number:
@@ -1067,6 +1070,20 @@ components:
         reason:
           type: string
           description: Human-readable failure reason (failure variant only).
+        apply_path:
+          type: string
+          enum: [applied, agent, apply_failed_fellback, apply_failed_reset_failed]
+          description: |
+            Present only on the `fixup_pushed` variant (#1165/#1213). Records
+            whether the near-deterministic fix-up apply path resolved the
+            fix-up or it fell back to the agent: `applied` (every routed
+            concern's suggested patch git-applied cleanly and the committed-tree
+            verify gate passed, no agent), `agent` (no apply-list served / the
+            agent re-derived), `apply_failed_fellback` (an apply-list was served
+            but the apply or its verify gate failed, the worktree reset cleanly,
+            and the agent re-derived), `apply_failed_reset_failed` (an apply
+            failed AND the post-failure reset also failed). Persisted onto the
+            fixup_pushed audit entry.
 
     PullRequestUploadResponse:
       type: object

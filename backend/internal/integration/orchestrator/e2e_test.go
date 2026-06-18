@@ -445,6 +445,36 @@ func TestDecomposition_E2E_HappyPath(t *testing.T) {
 	if parent.State != runpkg.StateSucceeded {
 		t.Errorf("parent run state = %q, want succeeded", parent.State)
 	}
+
+	// (i) apply_path scoping (#1165/#1213): the deterministic fix-up apply
+	// provenance is a fixup_pushed-only audit field. A non-fix-up run — here a
+	// decomposition fan-out — must never emit it on ANY audit entry (parent or
+	// child). Asserting its absence across the whole run guards against a future
+	// refactor threading the field onto a non-fix-up audit surface, the inverse
+	// of the mcp fixup_pushed persist test. Crosses the orchestrator → audit
+	// persist boundary this harness already exercises.
+	allRuns := []uuid.UUID{parentID}
+	for _, c := range children {
+		allRuns = append(allRuns, c.ID)
+	}
+	for _, rid := range allRuns {
+		entries, err := auditRepo.ListForRun(ctx, rid)
+		if err != nil {
+			t.Fatalf("ListForRun(%s): %v", rid, err)
+		}
+		for _, e := range entries {
+			if len(e.Payload) == 0 {
+				continue
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(e.Payload, &payload); err != nil {
+				continue // non-object payloads carry no keys to leak
+			}
+			if _, leaked := payload["apply_path"]; leaked {
+				t.Errorf("audit entry category %q on non-fix-up run %s carries apply_path; the field must be fixup_pushed-only", e.Category, rid)
+			}
+		}
+	}
 }
 
 // TestDecomposition_E2E_OneChildFails verifies the failure mode:

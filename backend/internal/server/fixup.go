@@ -849,6 +849,43 @@ func fixupApplyEligible(selected []planreview.Concern) bool {
 	return true
 }
 
+// Fix-up apply provenance values (#1165/#1213). The runner reports one of
+// these on the fixup_pushed report's apply_path field to record whether the
+// near-deterministic apply path resolved the fix-up or it fell back to the
+// agent. They are the runtime sibling of fixupApplyEligible (the eligibility
+// half of the same provenance): eligibility is decided at prompt-serve time,
+// the realized path is reported at push time.
+const (
+	// fixupApplyPathApplied: every routed concern's suggested_patch git-applied
+	// cleanly and the committed-tree verify gate passed; the agent was skipped.
+	fixupApplyPathApplied = "applied"
+	// fixupApplyPathAgent: no apply-list was served (a non-mechanical / mixed
+	// fix-up) or no verify gate was configured, so the agent re-derived the change.
+	fixupApplyPathAgent = "agent"
+	// fixupApplyPathFailedFellback: an apply-list was served but the apply or its
+	// verify gate failed; the worktree reset cleanly and the agent re-derived.
+	fixupApplyPathFailedFellback = "apply_failed_fellback"
+	// fixupApplyPathFailedResetFailed: an apply failed AND the post-failure
+	// worktree reset also failed; the runner failed the stage loud rather than
+	// run the agent on a possibly half-applied tree (so this value normally
+	// never reaches a fixup_pushed report, but is recognized for completeness).
+	fixupApplyPathFailedResetFailed = "apply_failed_reset_failed"
+)
+
+// normalizeFixupApplyPath returns the reported fix-up apply provenance value
+// when it is one of the four recognized discriminators, else "" (which the
+// caller treats as "omit the apply_path key"). It guards the fixup_pushed audit
+// entry from persisting an absent or runner-bug value as if it were meaningful.
+func normalizeFixupApplyPath(s string) string {
+	switch s {
+	case fixupApplyPathApplied, fixupApplyPathAgent,
+		fixupApplyPathFailedFellback, fixupApplyPathFailedResetFailed:
+		return s
+	default:
+		return ""
+	}
+}
+
 // fixupScopeUsed returns the scope string that authorized the fix-up
 // for the admissibility_reason receipt field.
 func fixupScopeUsed(id Identity) string {

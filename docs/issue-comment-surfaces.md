@@ -470,6 +470,12 @@ Notes:
   re-dispatch reports `{outcome:"fixup_pushed"}` after committing onto the EXISTING
   PR branch, with a `system` (or operator, on the bearer path) actor and payload
   `{run_id, stage_id, branch, head_sha, base_sha, files_changed_count, auth_method}`.
+  Since #1165/#1213 the payload additionally carries an optional `apply_path` field
+  — one of `applied` | `agent` | `apply_failed_fellback` | `apply_failed_reset_failed`
+  — present **only on the `fixup_pushed` variant** and only when the runner reports a
+  recognized value (an absent or unknown value omits the key). It records whether the
+  fix-up collapsed to a deterministic git-apply of the routed concerns' suggested
+  patches or fell back to the agent.
   It is the durable record of which commit the fix-up landed onto the open PR; it
   drives the fix-up stage's terminal transition but posts nothing to the issue
   thread (the existing PR's sticky status comment is refreshed via the separate

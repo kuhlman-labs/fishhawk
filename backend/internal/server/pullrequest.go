@@ -76,6 +76,19 @@ type pullRequestBody struct {
 	Outcome  string `json:"outcome,omitempty"`
 	Category string `json:"category,omitempty"`
 	Reason   string `json:"reason,omitempty"`
+
+	// ApplyPath is the near-deterministic fix-up apply provenance (#1165/#1213),
+	// present only on the Outcome=="fixup_pushed" report: "applied" (a clean
+	// git-apply of every routed concern's suggested_patch, no agent), "agent"
+	// (no apply-list served / agent re-derived), "apply_failed_fellback" (an
+	// apply-list was served, the apply or its verify gate failed, the worktree
+	// reset cleanly, and the agent re-derived). succeedFixupPushStage records it
+	// onto the fixup_pushed audit entry so an operator can see whether the fix-up
+	// collapsed to deterministic apply or fell back to the agent. Declared here
+	// (with omitempty) so the DisallowUnknownFields decoder accepts the
+	// fixup_pushed body that carries it; the runner omits it on every other
+	// variant, so the field stays absent there.
+	ApplyPath string `json:"apply_path,omitempty"`
 }
 
 // validate returns a human-readable error if any required field is
@@ -724,7 +737,7 @@ func (s *Server) succeedFixupPushStage(w http.ResponseWriter, r *http.Request, r
 		s.advanceImplementStageAfterPR(r, runID, stage)
 	}
 
-	auditPayload, _ := json.Marshal(map[string]any{
+	auditFields := map[string]any{
 		"run_id":              runID.String(),
 		"stage_id":            stageID.String(),
 		"branch":              pr.Branch,
@@ -732,7 +745,16 @@ func (s *Server) succeedFixupPushStage(w http.ResponseWriter, r *http.Request, r
 		"base_sha":            pr.BaseSHA,
 		"files_changed_count": pr.FilesChangedCount,
 		"auth_method":         authMethod,
-	})
+	}
+	// Near-deterministic fix-up apply provenance (#1165/#1213): record whether the
+	// fix-up collapsed to a deterministic git-apply or fell back to the agent.
+	// Only the fixup_pushed variant carries it, and only when the runner reports a
+	// recognized value — an absent or unknown apply_path leaves the key off the
+	// entry rather than persisting a bogus discriminator.
+	if ap := normalizeFixupApplyPath(pr.ApplyPath); ap != "" {
+		auditFields["apply_path"] = ap
+	}
+	auditPayload, _ := json.Marshal(auditFields)
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:        runID,
 		StageID:      &stageID,
