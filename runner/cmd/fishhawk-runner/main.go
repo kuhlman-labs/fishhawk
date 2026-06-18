@@ -727,6 +727,19 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			ok, tree, evs, ap := attemptDeterministicFixup(ctx, cfg, fixupApplyPatches, tipSHA, logSink)
 			fixupApplyEvents = evs
 			applyPath = ap
+			if ap == "apply_failed_reset_failed" {
+				// The post-failure worktree reset failed, so the tree may be
+				// half-applied. Falling through to the agent here would commit and
+				// push a corrupted tree — fail the stage loud instead (the binding
+				// condition: never ship a half-applied tree). The fixup-checkout
+				// restore defer above still puts the operator back on their original
+				// ref via a forced checkout on the way out. The specific reset error
+				// is already on the trace as fixup_apply_reset_failed.
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"runner_failed","reason":"fixup_apply_reset_failed","detail":%q}`+"\n",
+					"worktree reset after a failed deterministic apply did not succeed; refusing to run the agent on a possibly half-applied tree")
+				return exitFailure
+			}
 			if ok {
 				appliedFixup = true
 				verifiedTreeSHA = tree
@@ -3272,8 +3285,16 @@ func gitResetHardClean(ctx context.Context, repoDir, ref string) error {
 // produced no verifiable tree) it resets the worktree to baseTipSHA and returns
 // applied=false so the caller falls through to the unchanged agent fix-up path
 // — never a half-applied tree. The returned events carry the apply/verify
-// trace; applyPath is "applied" on success or "apply_failed_fellback" on every
-// fallback.
+// trace; applyPath is "applied" on success or "apply_failed_fellback" on a
+// fallback whose reset succeeded.
+//
+// applyPath is also the fail-safe escalation channel: if the post-failure
+// worktree reset itself fails, the tree may be HALF-APPLIED and the caller must
+// NOT continue into the agent path (which would run, commit, and push against a
+// corrupted tree). On a reset failure attemptDeterministicFixup returns
+// applyPath "apply_failed_reset_failed" (applied=false) and the caller fails the
+// stage loud — the only way to honour "never ship a half-applied tree" when the
+// reset that would have made the fall-through safe did not happen.
 func attemptDeterministicFixup(ctx context.Context, cfg config, patches []upload.FixupApplyPatch, baseTipSHA string, logSink io.Writer) (applied bool, verifiedTreeSHA string, evs []agent.Event, applyPath string) {
 	repoDir := cfg.workingDir
 	if repoDir == "" {
@@ -3284,13 +3305,15 @@ func attemptDeterministicFixup(ctx context.Context, cfg config, patches []upload
 			`{"event":"fixup_apply_fallback","run_id":%q,"stage_id":%q,"reason":%q,"detail":%q}`+"\n",
 			cfg.runID, cfg.stageID, reason, detail)
 		if rerr := resetFixupWorktree(ctx, repoDir, baseTipSHA); rerr != nil {
-			// A failed reset may leave a half-applied tree; surface it. The caller
-			// still falls through to the agent, whose own pre-commit gates
-			// (#728/#800/#802) re-verify the committed scope-only tree, so a stuck
-			// reset cannot silently ship a bad apply.
+			// A failed reset may leave a half-applied tree. This is the one edge
+			// where falling through to the agent is UNSAFE — the agent would run,
+			// commit, and push against a corrupted tree. Signal the caller via the
+			// distinct applyPath sentinel so it fails the stage loud rather than
+			// continuing.
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"fixup_apply_reset_failed","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
 				cfg.runID, cfg.stageID, rerr.Error())
+			return false, "", evs, "apply_failed_reset_failed"
 		}
 		return false, "", evs, "apply_failed_fellback"
 	}
