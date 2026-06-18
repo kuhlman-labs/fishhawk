@@ -1938,6 +1938,143 @@ func TestGetStagePrompt_Implement_FixupConcerns_NarrowsScope(t *testing.T) {
 	}
 }
 
+// TestGetStagePrompt_Implement_FixupConcerns_FoldsCoupledTestSibling is the
+// done-means test for #1214: a fix-up whose routed concern names ONLY a
+// production .go file must land the agent's coupled *_test.go sibling in the
+// same commit instead of having it stripped as scope_drift. It drives a real
+// fix-up prompt dispatch and asserts the effective scope.files contains BOTH the
+// concern-named production file AND its <stem>_test.go sibling as
+// operation=modify (behavioral, not presence-based). The subtests cover the
+// branches the fold touches: (a) a production-file concern folds the sibling;
+// (b) a concern naming ONLY a *_test.go file folds nothing extra
+// (coupledTestSiblings skips _test.go inputs). The empty-narrow fail-safe (no
+// sibling fold of an empty set) is covered by
+// TestGetStagePrompt_Implement_FixupConcerns_EmptyConcernSurface.
+func TestGetStagePrompt_Implement_FixupConcerns_FoldsCoupledTestSibling(t *testing.T) {
+	// dispatchFixup builds a fix-up prompt dispatch whose routed concern carries
+	// concernNote and whose plan scope is planScopePath, returning the
+	// effective scope.files from the prompt response.
+	dispatchFixup := func(t *testing.T, planScopePath, concernNote string) []scopeFile {
+		t.Helper()
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+
+		runID := uuid.New()
+		planStageID := uuid.New()
+		implStageID := uuid.New()
+
+		p := &plan.Plan{
+			PlanVersion:  "standard_v1",
+			Summary:      "scoped plan",
+			Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+			Scope: plan.Scope{
+				Files: []plan.ScopeFile{
+					{Path: planScopePath, Operation: plan.FileOpModify},
+				},
+			},
+		}
+		planBytes, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal plan: %v", err)
+		}
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{
+			StageID:       planStageID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &sv,
+			Content:       planBytes,
+		}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+			runID: {
+				{ID: planStageID, RunID: runID, Type: run.StageTypePlan},
+				{ID: implStageID, RunID: runID, Type: run.StageTypeImplement},
+			},
+		}
+		rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+		rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+		concerns := []planreview.Concern{
+			{Severity: planreview.SeverityHigh, Category: "coverage", Note: concernNote},
+		}
+		auditByRun := map[uuid.UUID][]*audit.Entry{
+			runID: {makeFixupEntry(runID, implStageID, concerns)},
+		}
+
+		priv, _ := sf.issue(t, runID)
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			RunRepo:      rr,
+			SigningRepo:  sf,
+			ArtifactRepo: art,
+			AuditRepo:    &feedbackAuditRepo{byRunID: auditByRun},
+		})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+
+		w := promptRequest(t, s, runID, implStageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if !resp.Fixup {
+			t.Fatalf("fixup = false, want true (an unconsumed stage_fixup_triggered entry)")
+		}
+		return resp.ScopeFiles
+	}
+
+	t.Run("production-file concern folds the coupled test sibling", func(t *testing.T) {
+		// Reproduces run-0e598c63: the concern names only main.go; main_test.go
+		// must be auto-folded into the narrowed scope as operation=modify so the
+		// agent's coupled test edit is committed, not stripped as scope_drift.
+		got := dispatchFixup(t,
+			"backend/internal/server/prompt.go",
+			"fix the off-by-one in runner/cmd/fishhawk-runner/main.go")
+
+		op := map[string]string{}
+		for _, f := range got {
+			op[f.Path] = f.Operation
+		}
+		if op["runner/cmd/fishhawk-runner/main.go"] != "modify" {
+			t.Errorf("concern-named production file missing or not modify: %+v", got)
+		}
+		if op["runner/cmd/fishhawk-runner/main_test.go"] != "modify" {
+			t.Errorf("coupled <stem>_test.go sibling must be folded as operation=modify: %+v", got)
+		}
+		// The plan-only file no concern names stays absent (narrowing intact).
+		if _, ok := op["backend/internal/server/prompt.go"]; ok {
+			t.Errorf("plan-only file not named by any concern must stay absent: %+v", got)
+		}
+		if len(got) != 2 {
+			t.Errorf("narrowed scope must be exactly {production, sibling test}, got %+v", got)
+		}
+	})
+
+	t.Run("test-only concern folds no extra sibling", func(t *testing.T) {
+		// coupledTestSiblings skips *_test.go inputs, so a concern naming only a
+		// test file does not spuriously derive a second sibling.
+		got := dispatchFixup(t,
+			"backend/internal/server/prompt.go",
+			"strengthen the assertion in backend/internal/run/fixup_test.go")
+
+		op := map[string]string{}
+		for _, f := range got {
+			op[f.Path] = f.Operation
+		}
+		if op["backend/internal/run/fixup_test.go"] != "modify" {
+			t.Errorf("concern-named test file missing from scope: %+v", got)
+		}
+		if len(got) != 1 {
+			t.Errorf("a test-only concern must not fold a second sibling, got %+v", got)
+		}
+	})
+}
+
 // TestGetStagePrompt_Implement_FixupConcerns_EmptyConcernSurface covers the
 // empty-narrow fail-safe (#1162): a fix-up whose concern Note names NO parseable
 // repo-relative path and declares no allow_create / approved amendments narrows
@@ -2244,14 +2381,21 @@ func TestGetStagePrompt_Implement_FixupConcerns_AmendmentIncluded(t *testing.T) 
 	if !paths["backend/internal/server/amended.go"] {
 		t.Errorf("approved scope-amendment path missing from scope_files: %+v", resp.ScopeFiles)
 	}
+	// The amendment's source file is a production .go, so the coupled-test-sibling
+	// fold (#1214) also pulls in its <stem>_test.go — the fold operates on the
+	// entire narrowed set (concern + allow_create + amendment), so an
+	// amendment-declared source file lands its sibling test in the same commit too.
+	if !paths["backend/internal/server/amended_test.go"] {
+		t.Errorf("coupled <stem>_test.go sibling of the amendment source must be folded: %+v", resp.ScopeFiles)
+	}
 	// The plan-only file named by neither the concern nor the amendment is
 	// ABSENT from the narrowed scope (#1162) — narrowing bounds the fix-up to the
 	// concern surface plus the operator-approved widening.
 	if paths["backend/internal/server/prompt.go"] {
 		t.Errorf("plan-only file must be ABSENT from the narrowed scope_files: %+v", resp.ScopeFiles)
 	}
-	if len(resp.ScopeFiles) != 2 {
-		t.Errorf("narrowed scope_files must contain the concern path plus the approved amendment (2 files), got %+v", resp.ScopeFiles)
+	if len(resp.ScopeFiles) != 3 {
+		t.Errorf("narrowed scope_files must contain the concern path, the approved amendment, and the amendment's coupled test sibling (3 files), got %+v", resp.ScopeFiles)
 	}
 }
 
