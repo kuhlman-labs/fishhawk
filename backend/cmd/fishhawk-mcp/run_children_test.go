@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -247,6 +248,149 @@ func TestRunChildren_AwaitsAllNoSiblingCancel(t *testing.T) {
 	}
 	if fail.Outcome != "failed" {
 		t.Errorf("failing child outcome = %q, want failed", fail.Outcome)
+	}
+}
+
+// --- spawnErr branch: a failed-to-start spawn is a per-child warning, not a
+// tool error, and does NOT cancel siblings ---
+
+// TestRunChildren_SpawnErrIsDataNoSiblingCancel exercises the spawnErr branch of
+// the dispatch loop (run_children.go: spawnRunnerStageFn returning a non-nil
+// err — spawnRunnerStage failing to START, or returning a non-ExitError wait
+// failure). That path is distinct from a non-zero runner exit (which carries a
+// nil err): it must convert the failure into a per-child "spawn failed" warning,
+// leave Outcome empty, and still return no tool error / no sibling-cancel.
+func TestRunChildren_SpawnErrIsDataNoSiblingCancel(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	spawnErrID := uuid.New()
+	okID1 := uuid.New()
+	okID2 := uuid.New()
+	for _, c := range []uuid.UUID{spawnErrID, okID1, okID2} {
+		seedChildRun(fb, c, "pending")
+	}
+	seedPlanDecomposed(fb, parent, []string{spawnErrID.String(), okID1.String(), okID2.String()}, 0)
+
+	var completed int32
+	withFakeSpawn(t, func(_ context.Context, _ string, argv, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		atomic.AddInt32(&completed, 1)
+		// One child's spawn fails to start (non-nil err, no events, no exit
+		// code) — the spawnErr branch. The others spawn cleanly.
+		if strings.Contains(strings.Join(argv, " "), spawnErrID.String()) {
+			return nil, nil, 0, errors.New("fork/exec: no such file or directory")
+		}
+		return completedEvents("ok"), nil, 0, nil
+	})
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	// A spawn failure must NOT surface as a Go tool error.
+	if err != nil {
+		t.Fatalf("runChildren returned an error for a spawn failure: %v", err)
+	}
+	// ALL three children were awaited (the spawnErr did not cancel siblings).
+	if got := atomic.LoadInt32(&completed); got != 3 {
+		t.Errorf("spawned %d children, want all 3 awaited despite the spawnErr", got)
+	}
+	if len(out.Children) != 3 {
+		t.Fatalf("children = %d, want 3", len(out.Children))
+	}
+	byID := map[string]ChildResult{}
+	for _, c := range out.Children {
+		byID[c.RunID] = c
+	}
+	// The spawn-failed child is reported as DATA: dispatched, no terminal
+	// outcome, and a "spawn failed" warning.
+	failed := byID[spawnErrID.String()]
+	if !failed.Dispatched {
+		t.Errorf("spawn-failed child not marked dispatched: %+v", failed)
+	}
+	if failed.Outcome != "" {
+		t.Errorf("spawn-failed child outcome = %q, want empty (no terminal runner_completed)", failed.Outcome)
+	}
+	var sawSpawnWarning bool
+	for _, w := range failed.Warnings {
+		if strings.Contains(w, "spawn failed") {
+			sawSpawnWarning = true
+		}
+	}
+	if !sawSpawnWarning {
+		t.Errorf("spawn-failed child warnings = %v, want one containing 'spawn failed'", failed.Warnings)
+	}
+	// The siblings still distilled a clean outcome — no sibling-cancel.
+	for _, ok := range []uuid.UUID{okID1, okID2} {
+		if c := byID[ok.String()]; c.Outcome != "ok" {
+			t.Errorf("sibling %s outcome = %q, want ok (spawnErr must not cancel it)", ok, c.Outcome)
+		}
+	}
+}
+
+// --- concurrent invocations: the MCP-layer partition seam under a race ---
+
+// TestRunChildren_ConcurrentInvocationsNoToolError exercises the seam the
+// low/correctness coverage note flagged: two overlapping run_children calls on
+// the same parent. The single-call partition (pending vs in-flight vs terminal)
+// is covered by TestRunChildren_PartitionsPendingOnly; here we prove that the
+// MCP layer ITSELF tolerates concurrent invocations — neither call returns a
+// tool error and each independently observes the pending child and dispatches
+// it. A benign one-slot overshoot (both calls reading pending and both spawning)
+// is the documented, acceptable outcome at this layer; double-run is prevented
+// DOWNSTREAM by the runner's per-child lineage lock (run-<child>.lock), which is
+// covered by the runner-side lock tests, not here.
+func TestRunChildren_ConcurrentInvocationsNoToolError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	childID := uuid.New()
+	seedChildRun(fb, childID, "pending")
+	seedPlanDecomposed(fb, parent, []string{childID.String()}, 0)
+
+	var spawns int32
+	withFakeSpawn(t, func(_ context.Context, _ string, _, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		atomic.AddInt32(&spawns, 1)
+		time.Sleep(10 * time.Millisecond) // widen the race window
+		return completedEvents("ok"), nil, 0, nil
+	})
+
+	const callers = 2
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	dispatched := make([]int, callers)
+	for i := 0; i < callers; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+				RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+			})
+			errs[i] = err
+			dispatched[i] = out.DispatchedCount
+		}()
+	}
+	wg.Wait()
+
+	// Neither concurrent invocation returns a tool error.
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("concurrent runChildren[%d] returned an error: %v", i, err)
+		}
+	}
+	// Each call independently saw the pending child and dispatched it. Both
+	// spawning is the acknowledged benign overshoot — the assertion is that the
+	// MCP layer never errors and never silently drops the dispatch, NOT that the
+	// two calls coordinate (that guard lives in the runner lineage lock).
+	for i, d := range dispatched {
+		if d != 1 {
+			t.Errorf("concurrent runChildren[%d] dispatched_count = %d, want 1", i, d)
+		}
+	}
+	if got := atomic.LoadInt32(&spawns); got < 1 {
+		t.Errorf("total spawns = %d, want >= 1", got)
 	}
 }
 
