@@ -1,6 +1,7 @@
 package planreview
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -68,6 +69,45 @@ func TestDecodeVerdict_WellFormedRoundTrips(t *testing.T) {
 	want := "line1\nsay \"hi\" path C:\\dir doné"
 	if verdict.FreeForm != want {
 		t.Errorf("FreeForm = %q, want %q (escapes must round-trip uncorrupted)", verdict.FreeForm, want)
+	}
+}
+
+// TestDecodeVerdict_SuggestedPatch covers the additive #1165 field: a verdict
+// whose concern carries a suggested_patch decodes it onto
+// Concern.SuggestedPatch verbatim, AND a verdict WITHOUT the field still
+// decodes with SuggestedPatch empty — so reviewer output predating the field
+// (the common case) is unchanged.
+func TestDecodeVerdict_SuggestedPatch(t *testing.T) {
+	const patch = "--- a/foo.go\n+++ b/foo.go\n@@ -1 +1 @@\n-x\n+y\n"
+	rawPatch, err := json.Marshal(patch)
+	if err != nil {
+		t.Fatalf("marshal patch: %v", err)
+	}
+	withPatch := []byte(`{"verdict":"approve_with_concerns","concerns":[{"severity":"low","category":"correctness","note":"typo","suggested_patch":` + string(rawPatch) + `}]}`)
+
+	verdict, err := DecodeVerdict(withPatch)
+	if err != nil {
+		t.Fatalf("DecodeVerdict (with patch): %v", err)
+	}
+	if len(verdict.Concerns) != 1 {
+		t.Fatalf("len(Concerns) = %d, want 1", len(verdict.Concerns))
+	}
+	if verdict.Concerns[0].SuggestedPatch != patch {
+		t.Errorf("SuggestedPatch = %q, want %q verbatim", verdict.Concerns[0].SuggestedPatch, patch)
+	}
+
+	// Additive/optional: a concern with the field ABSENT still decodes, with
+	// SuggestedPatch empty — pre-#1165 reviewer output stays valid.
+	withoutPatch := []byte(`{"verdict":"approve_with_concerns","concerns":[{"severity":"low","category":"correctness","note":"typo"}]}`)
+	verdict, err = DecodeVerdict(withoutPatch)
+	if err != nil {
+		t.Fatalf("DecodeVerdict (without patch): %v", err)
+	}
+	if len(verdict.Concerns) != 1 {
+		t.Fatalf("len(Concerns) = %d, want 1", len(verdict.Concerns))
+	}
+	if verdict.Concerns[0].SuggestedPatch != "" {
+		t.Errorf("SuggestedPatch = %q, want empty when absent", verdict.Concerns[0].SuggestedPatch)
 	}
 }
 

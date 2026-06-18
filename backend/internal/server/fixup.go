@@ -505,6 +505,14 @@ func (s *Server) resolveConcernsByID(ctx context.Context, runID, stageID uuid.UU
 			Severity: planreview.ConcernSeverity(c.Severity),
 			Category: c.Category,
 			Note:     c.Note,
+			// Carry the reviewer-emitted suggested_patch (#1165 slice 1) through
+			// to the routed concern set so the trigger audit's `concerns` field
+			// retains it. The prompt-serve path (resolveFixupApplyPatches) reads
+			// it back and, when EVERY routed concern carries one, serves the
+			// deterministic apply-list to the runner; without this copy the
+			// store's patch would be dropped here and the apply path could never
+			// engage for concern_ids-addressed fix-ups.
+			SuggestedPatch: c.SuggestedPatch,
 		})
 	}
 	return out, nil
@@ -635,6 +643,15 @@ func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, select
 	for _, id := range concernIDs {
 		routedIDs = append(routedIDs, id.String())
 	}
+	// Apply-eligibility provenance (#1165 slice 2): a fix-up is eligible for the
+	// near-deterministic apply path ONLY when it routed at least one concern AND
+	// every routed concern carries a non-empty suggested_patch. Recorded on the
+	// trigger entry so an operator can see — at trigger time, before the runner
+	// dispatch — whether this pass COULD collapse to a git-apply. The RUNTIME
+	// outcome (applied | agent | apply_failed_fellback) rides the runner's
+	// fixup_pushed report and lands on that entry (succeedFixupPushStage); this
+	// boolean is the server-side eligibility half of the same provenance.
+	applyEligible := fixupApplyEligible(selected)
 	fields := map[string]any{
 		"stage_id":             dec.Stage.ID.String(),
 		"prior_state":          string(dec.PriorState),
@@ -650,6 +667,7 @@ func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, select
 		"refunded_passes":      refundedPasses,
 		"forced":               dec.Forced,
 		"admissibility_reason": admissibilityReason,
+		"apply_eligible":       applyEligible,
 	}
 	// push_and_open_pr flow (#780): record the review stage re-parked
 	// alongside the implement re-open, so the audit trail captures the
@@ -810,6 +828,25 @@ func (s *Server) writeFixupRecoveredAudit(ctx context.Context, runID uuid.UUID, 
 			slog.String("stage_id", rec.Stage.ID.String()),
 			slog.String("error", err.Error()))
 	}
+}
+
+// fixupApplyEligible reports whether a routed concern set qualifies for the
+// near-deterministic apply path (#1165): at least one concern AND every routed
+// concern carries a non-empty suggested_patch. A single patch-less concern
+// (non-mechanical, or a reviewer that declined to emit a diff) makes the whole
+// pass ineligible — the runner must re-derive the mixed change with the agent,
+// so a partial apply is never attempted. Mirrors resolveFixupApplyPatches's
+// all-or-nothing gate on the prompt-serve side.
+func fixupApplyEligible(selected []planreview.Concern) bool {
+	if len(selected) == 0 {
+		return false
+	}
+	for _, c := range selected {
+		if strings.TrimSpace(c.SuggestedPatch) == "" {
+			return false
+		}
+	}
+	return true
 }
 
 // fixupScopeUsed returns the scope string that authorized the fix-up

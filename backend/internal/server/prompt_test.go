@@ -5106,3 +5106,96 @@ func TestResolveApprovalBindingAssertions_ParentRunIDFallback(t *testing.T) {
 		}
 	})
 }
+
+// seedFixupPromptServer wires a prompt server with one implement stage carrying
+// a stage_fixup_triggered entry whose concerns are exactly `concerns`. Returns
+// the decoded prompt response for the implement stage. Shared by the #1165
+// apply-list serve tests.
+func seedFixupPromptServer(t *testing.T, concerns []planreview.Concern) promptResponse {
+	t.Helper()
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{Files: []plan.ScopeFile{
+			{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify},
+		}},
+	}
+	planBytes, _ := json.Marshal(p)
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID: planStageID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {
+			{ID: planStageID, RunID: runID, Type: run.StageTypePlan},
+			{ID: implStageID, RunID: runID, Type: run.StageTypeImplement},
+		},
+	}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+	auditByRun := map[uuid.UUID][]*audit.Entry{
+		runID: {makeFixupEntry(runID, implStageID, concerns)},
+	}
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, ArtifactRepo: art,
+		AuditRepo: &feedbackAuditRepo{byRunID: auditByRun},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, runID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return resp
+}
+
+// TestGetStagePrompt_FixupApplyPatches_ServedWhenAllPatched is the
+// server-serves end of the #1165 seam: when EVERY routed concern carries a
+// suggested_patch, the prompt response carries the apply-list in routing order.
+func TestGetStagePrompt_FixupApplyPatches_ServedWhenAllPatched(t *testing.T) {
+	resp := seedFixupPromptServer(t, []planreview.Concern{
+		{Severity: planreview.SeverityMedium, Category: "scope", Note: "fix one", SuggestedPatch: "diff-one"},
+		{Severity: planreview.SeverityLow, Category: "style", Note: "fix two", SuggestedPatch: "diff-two"},
+	})
+	if !resp.Fixup {
+		t.Fatal("fixup = false, want true")
+	}
+	if len(resp.FixupApplyPatches) != 2 {
+		t.Fatalf("FixupApplyPatches len = %d, want 2:\n%+v", len(resp.FixupApplyPatches), resp.FixupApplyPatches)
+	}
+	if resp.FixupApplyPatches[0].Patch != "diff-one" || resp.FixupApplyPatches[1].Patch != "diff-two" {
+		t.Errorf("apply-list = %+v, want the two diffs in routing order", resp.FixupApplyPatches)
+	}
+}
+
+// TestGetStagePrompt_FixupApplyPatches_OmittedWhenAnyMissing covers failure
+// mode (d): a single patch-less routed concern makes the whole pass ineligible,
+// so the apply-list is omitted and the runner takes the agent path.
+func TestGetStagePrompt_FixupApplyPatches_OmittedWhenAnyMissing(t *testing.T) {
+	resp := seedFixupPromptServer(t, []planreview.Concern{
+		{Severity: planreview.SeverityMedium, Category: "scope", Note: "patched", SuggestedPatch: "diff-one"},
+		{Severity: planreview.SeverityHigh, Category: "correctness", Note: "no patch"},
+	})
+	if !resp.Fixup {
+		t.Fatal("fixup = false, want true (the trigger still routes concerns)")
+	}
+	if len(resp.FixupApplyPatches) != 0 {
+		t.Errorf("FixupApplyPatches = %+v, want empty when a concern lacks a patch", resp.FixupApplyPatches)
+	}
+}

@@ -116,6 +116,27 @@ type promptResponse struct {
 	// when resolution fails (WARN-and-proceed) — the runner then skips the
 	// SHA comparison rather than blocking the pass.
 	FixupExpectedHeadSHA string `json:"fixup_expected_head_sha,omitempty"`
+	// FixupApplyPatches is the near-deterministic apply-list (#1165): one
+	// reviewer-emitted unified diff per routed concern, in routing order.
+	// Populated ONLY when Fixup is true AND every routed concern carries a
+	// non-empty suggested_patch (the all-or-nothing eligibility gate). The
+	// runner then attempts `git apply --3way` of each patch against the
+	// already-checked-out PR branch and, on a clean apply that passes the
+	// committed-tree verify gate, commits/pushes via the existing fixup_pushed
+	// path WITHOUT spawning the agent. ANY apply failure, verify-gate failure,
+	// or an absent field (a routed concern lacked a patch) sends the runner
+	// down the unchanged agent fix-up path. Omitted on a normal implement
+	// dispatch and on a non-eligible fix-up — byte-identical to today.
+	FixupApplyPatches []fixupApplyPatch `json:"fixup_apply_patches,omitempty"`
+}
+
+// fixupApplyPatch is one entry in promptResponse.FixupApplyPatches: a single
+// routed concern's reviewer-emitted unified diff (#1165). The patch carries its
+// own file paths in the diff headers, so no separate path field is needed; the
+// runner extracts the touched paths for provenance. The wire tag (patch) is
+// byte-identical to the runner's upload.FixupApplyPatch decoder.
+type fixupApplyPatch struct {
+	Patch string `json:"patch"`
 }
 
 // shortID returns the first 8 characters of a UUID's string form, mirroring
@@ -688,6 +709,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	var fixup bool
 	var fixupBranch string
 	var fixupExpectedHeadSHA string
+	var fixupApplyPatches []fixupApplyPatch
 	if stage.Type == run.StageTypeImplement {
 		approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), runRow.ID)
 		if err != nil {
@@ -788,6 +810,11 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			// Advertise the run's recorded head so the runner can verify the
 			// fetched PR-branch tip before invoking the agent (#967).
 			fixupExpectedHeadSHA = s.resolveFixupExpectedHeadSHA(r.Context(), runRow.ID, stage.ID)
+			// Near-deterministic apply-list (#1165): serve the routed concerns'
+			// suggested_patches ONLY when every routed concern carries one, so the
+			// runner can git-apply them instead of spawning the agent. nil (the
+			// agent path) when any concern lacks a patch.
+			fixupApplyPatches = s.resolveFixupApplyPatches(r.Context(), runRow.ID, stage.ID)
 		}
 	}
 
@@ -866,6 +893,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		Fixup:                fixup,
 		FixupBranch:          fixupBranch,
 		FixupExpectedHeadSHA: fixupExpectedHeadSHA,
+		FixupApplyPatches:    fixupApplyPatches,
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
@@ -949,6 +977,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	var fixup bool
 	var fixupBranch string
 	var fixupExpectedHeadSHA string
+	var fixupApplyPatches []fixupApplyPatch
 	if stage.Type == run.StageTypeImplement {
 		approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), runRow.ID)
 		if err != nil {
@@ -1044,6 +1073,11 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			fixup = true
 			fixupBranch = s.fixupBranchForRun(r.Context(), runRow, stage)
 			fixupExpectedHeadSHA = s.resolveFixupExpectedHeadSHA(r.Context(), runRow.ID, stage.ID)
+			// Near-deterministic apply-list (#1165): serve the routed concerns'
+			// suggested_patches ONLY when every routed concern carries one, so the
+			// runner can git-apply them instead of spawning the agent. nil (the
+			// agent path) when any concern lacks a patch.
+			fixupApplyPatches = s.resolveFixupApplyPatches(r.Context(), runRow.ID, stage.ID)
 		}
 	}
 
@@ -1122,6 +1156,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		Fixup:                fixup,
 		FixupBranch:          fixupBranch,
 		FixupExpectedHeadSHA: fixupExpectedHeadSHA,
+		FixupApplyPatches:    fixupApplyPatches,
 	}
 	if runRow.DecomposedFrom != nil {
 		resp.DecomposedFromRunID = runRow.DecomposedFrom.String()
@@ -2003,6 +2038,75 @@ func (s *Server) resolveFixupConcerns(ctx context.Context, runID, stageID uuid.U
 		return rendered, strings.Join(notes, "\n")
 	}
 	return nil, ""
+}
+
+// resolveFixupApplyPatches returns the near-deterministic apply-list (#1165) for
+// a fix-up dispatch: one reviewer-emitted unified diff per routed concern, in
+// routing order — but ONLY when EVERY routed concern carries a non-empty
+// suggested_patch. A single patch-less concern (non-mechanical, or a reviewer
+// that declined a diff) makes the whole pass ineligible and returns nil, so the
+// runner takes the unchanged agent fix-up path; a partial apply is never
+// served. This is the all-or-nothing gate that mirrors fixupApplyEligible on
+// the trigger-audit side.
+//
+// It scans the SAME newest stage_fixup_triggered entry resolveFixupConcerns
+// selects (newest-first, first stage-bound entry with a non-empty concern set)
+// so the served patches correspond exactly to the rendered fix-up concerns.
+// Returns nil when the AuditRepo is unconfigured, the stage carries no fix-up
+// trigger, any routed concern lacks a patch, or on any error — best-effort,
+// WARN-and-proceed like the other fix-up resolvers; a nil return only means the
+// runner re-derives the change with the agent, never a wrong fix.
+func (s *Server) resolveFixupApplyPatches(ctx context.Context, runID, stageID uuid.UUID) []fixupApplyPatch {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageFixupTriggered)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list stage_fixup_triggered audit for apply patches failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var payload struct {
+			Concerns []planreview.Concern `json:"concerns"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			// Same tolerance as resolveFixupConcerns: skip a malformed entry.
+			continue
+		}
+		if len(payload.Concerns) == 0 {
+			continue
+		}
+		patches := make([]fixupApplyPatch, 0, len(payload.Concerns))
+		for _, c := range payload.Concerns {
+			if strings.TrimSpace(c.SuggestedPatch) == "" {
+				// Not every routed concern carries a patch → ineligible. Bail to
+				// the agent path rather than serve a partial apply-list.
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+					"prompt: fix-up not apply-eligible (a routed concern lacks a suggested_patch); agent path",
+					slog.String("run_id", runID.String()),
+					slog.String("stage_id", stageID.String()),
+				)
+				return nil
+			}
+			patches = append(patches, fixupApplyPatch{Patch: c.SuggestedPatch})
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"prompt: serving near-deterministic fix-up apply-list",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.Int("patch_count", len(patches)),
+		)
+		return patches
+	}
+	return nil
 }
 
 // resolveFixupPriorDiff returns the prior implement commit's diff for a fix-up

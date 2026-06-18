@@ -2786,9 +2786,10 @@ func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.
 	raised := make([]concern.RaisedConcern, 0, len(concerns))
 	for _, c := range concerns {
 		raised = append(raised, concern.RaisedConcern{
-			Severity: string(c.Severity),
-			Category: c.Category,
-			Note:     c.Note,
+			Severity:       string(c.Severity),
+			Category:       c.Category,
+			Note:           c.Note,
+			SuggestedPatch: c.SuggestedPatch,
 		})
 	}
 	if _, err := s.cfg.ConcernRepo.InsertRaised(ctx, concern.InsertRaisedParams{

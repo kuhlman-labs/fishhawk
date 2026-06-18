@@ -1127,6 +1127,7 @@ func (f *fakeConcernRepo) InsertRaised(_ context.Context, p concern.InsertRaised
 			Severity:             c.Severity,
 			Category:             c.Category,
 			Note:                 c.Note,
+			SuggestedPatch:       c.SuggestedPatch,
 			State:                concern.StateRaised,
 		}
 		f.rows = append(f.rows, row)
@@ -1661,5 +1662,95 @@ func TestFixupStage_OperatorAgentActorAttribution(t *testing.T) {
 	}
 	if entry.ActorSubject == nil || *entry.ActorSubject != operatorAgentSubject {
 		t.Errorf("ActorSubject = %v, want %q", entry.ActorSubject, operatorAgentSubject)
+	}
+}
+
+// TestFixupStage_ApplyEligibleRecorded_PositionalPath asserts the #1165
+// apply-eligibility provenance lands on the stage_fixup_triggered audit entry:
+// true when EVERY routed concern carries a suggested_patch, and the patch
+// rides the embedded concern copy so the prompt-serve resolver can read it back.
+func TestFixupStage_ApplyEligibleRecorded_PositionalPath(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "fix import", SuggestedPatch: "diff-a"},
+		planreview.Concern{Severity: planreview.SeverityLow, Category: "style", Note: "rename", SuggestedPatch: "diff-b"},
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0, 1}, Reason: "mechanical"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(au.appended))
+	}
+	var payload struct {
+		ApplyEligible bool                 `json:"apply_eligible"`
+		Concerns      []planreview.Concern `json:"concerns"`
+	}
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	if !payload.ApplyEligible {
+		t.Error("apply_eligible = false, want true when every routed concern carries a patch")
+	}
+	if len(payload.Concerns) != 2 || payload.Concerns[0].SuggestedPatch != "diff-a" || payload.Concerns[1].SuggestedPatch != "diff-b" {
+		t.Errorf("embedded concerns must retain their suggested_patch, got %+v", payload.Concerns)
+	}
+}
+
+// TestFixupStage_ApplyIneligibleWhenAPatchIsMissing covers the mixed /
+// non-mechanical case (failure mode d): a single patch-less routed concern
+// makes the whole pass apply-INELIGIBLE, so the runner must re-derive with the
+// agent. apply_eligible is recorded false.
+func TestFixupStage_ApplyIneligibleWhenAPatchIsMissing(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "has a patch", SuggestedPatch: "diff-a"},
+		planreview.Concern{Severity: planreview.SeverityHigh, Category: "correctness", Note: "needs judgment"}, // no patch
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0, 1}, Reason: "mixed"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var payload struct {
+		ApplyEligible bool `json:"apply_eligible"`
+	}
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	if payload.ApplyEligible {
+		t.Error("apply_eligible = true, want false when a routed concern lacks a patch")
+	}
+}
+
+// TestFixupStage_ConcernIDs_CarriesSuggestedPatch pins the fixup.go
+// resolveConcernsByID change: a stored concern's suggested_patch must flow onto
+// the embedded concern copy in the trigger audit, otherwise the prompt-serve
+// resolver could never engage the apply path for concern_ids-addressed fix-ups.
+func TestFixupStage_ConcernIDs_CarriesSuggestedPatch(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	c := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 101, "mechanical fix")
+	c.SuggestedPatch = "diff-xyz"
+
+	w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{c.ID.String()}, Reason: "apply it"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var payload struct {
+		ApplyEligible bool                 `json:"apply_eligible"`
+		Concerns      []planreview.Concern `json:"concerns"`
+	}
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	if len(payload.Concerns) != 1 || payload.Concerns[0].SuggestedPatch != "diff-xyz" {
+		t.Fatalf("embedded concern must carry the store's suggested_patch, got %+v", payload.Concerns)
+	}
+	if !payload.ApplyEligible {
+		t.Error("apply_eligible = false, want true for a single patched concern")
 	}
 }

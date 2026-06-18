@@ -142,6 +142,11 @@ type runConcernPayload struct {
 	Severity  string    `json:"severity"`
 	Category  string    `json:"category"`
 	State     string    `json:"state"`
+	// HasSuggestedPatch reports whether the reviewer attached a mechanical
+	// suggested_patch to this concern (#1165). Only the boolean is
+	// surfaced — the diff text stays elided like the note, keeping the
+	// payload bounded; the fix-up apply path reads the patch server-side.
+	HasSuggestedPatch bool `json:"has_suggested_patch"`
 }
 
 // runDelegationPayload is the operator_agent delegation surface on the
@@ -882,11 +887,12 @@ func buildRunConcernsPayload(open []*concern.Concern) *runConcernsPayload {
 	for _, c := range open {
 		out.ByState[string(c.State)]++
 		out.Items = append(out.Items, runConcernPayload{
-			ID:        c.ID,
-			StageKind: c.StageKind,
-			Severity:  c.Severity,
-			Category:  c.Category,
-			State:     string(c.State),
+			ID:                c.ID,
+			StageKind:         c.StageKind,
+			Severity:          c.Severity,
+			Category:          c.Category,
+			State:             string(c.State),
+			HasSuggestedPatch: c.SuggestedPatch != "",
 		})
 	}
 	return out

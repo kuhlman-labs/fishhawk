@@ -751,6 +751,58 @@ func TestFetchPrompt_FixupOmittedWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestFetchPrompt_DecodesApplyPatches asserts the runner consumes the #1165
+// fixup_apply_patches apply-list — the consume end of the server-serves ->
+// runner-applies seam.
+func TestFetchPrompt_DecodesApplyPatches(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "implement",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"fixup": true,
+		"fixup_branch": "fishhawk/run-aaaaaaaa",
+		"fixup_apply_patches": [{"patch": "diff-one"}, {"patch": "diff-two"}]
+	}`
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if len(got.FixupApplyPatches) != 2 {
+		t.Fatalf("FixupApplyPatches len = %d, want 2", len(got.FixupApplyPatches))
+	}
+	if got.FixupApplyPatches[0].Patch != "diff-one" || got.FixupApplyPatches[1].Patch != "diff-two" {
+		t.Errorf("FixupApplyPatches = %+v, want the two diffs verbatim", got.FixupApplyPatches)
+	}
+}
+
+// TestFetchPrompt_ApplyPatchesOmittedWhenAbsent confirms a non-eligible fix-up
+// (or older backend) leaves the apply-list empty, so the runner takes the agent
+// path — byte-identical to pre-#1165.
+func TestFetchPrompt_ApplyPatchesOmittedWhenAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{"stage_id":"stage-abc","stage_type":"implement","prompt":"p","prompt_hash":"h","fixup":true,"fixup_branch":"b"}`
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID: "stage-abc", PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if len(got.FixupApplyPatches) != 0 {
+		t.Errorf("FixupApplyPatches = %+v, want empty when absent", got.FixupApplyPatches)
+	}
+}
+
 func TestFetchPrompt_SignatureRejected(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	priv, _ := makeKey(t, fb)

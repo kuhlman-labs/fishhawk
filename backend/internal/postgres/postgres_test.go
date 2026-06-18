@@ -205,13 +205,23 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0032 (#1057) widened
-	// stages_state_check to admit 'awaiting_input'; its down migration
-	// narrows the constraint back. Confirm: the widened constraint no
-	// longer admits 'awaiting_input', but every prior migration's effect
-	// is still present (runs.drive from 0031, review_concerns from 0030,
-	// scope_amendments from 0029, cost_usd_total + resolved_model from
-	// 0028, etc.).
+	// MigrateDown rolls back one step. 0033 (#1165) added the
+	// review_concerns.suggested_patch column; its down migration drops
+	// it. Confirm: the column is gone, but every prior migration's effect
+	// is still present — notably 0032's (#1057) widened stages_state_check
+	// still admits 'awaiting_input' (only 0033 rolled back), plus runs.drive
+	// from 0031, review_concerns from 0030, scope_amendments from 0029,
+	// cost_usd_total + resolved_model from 0028, etc.
+	var suggestedPatchCol int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'review_concerns' AND column_name = 'suggested_patch'`,
+	).Scan(&suggestedPatchCol); err != nil {
+		t.Fatalf("query review_concerns.suggested_patch column: %v", err)
+	}
+	if suggestedPatchCol != 0 {
+		t.Errorf("review_concerns.suggested_patch count after MigrateDown = %d, want 0 (0033 down should have dropped it)", suggestedPatchCol)
+	}
 	var stageStateCheckDef string
 	if err := pool.QueryRow(context.Background(),
 		`SELECT pg_get_constraintdef(oid) FROM pg_constraint
@@ -219,11 +229,11 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&stageStateCheckDef); err != nil {
 		t.Fatalf("query stages_state_check constraint def: %v", err)
 	}
-	if strings.Contains(stageStateCheckDef, "awaiting_input") {
-		t.Errorf("stages_state_check after MigrateDown still admits 'awaiting_input' (0032 down should have narrowed it): %s", stageStateCheckDef)
+	if !strings.Contains(stageStateCheckDef, "awaiting_input") {
+		t.Errorf("stages_state_check after MigrateDown dropped 'awaiting_input' (0032 still applied; only 0033 should roll back): %s", stageStateCheckDef)
 	}
 	if !strings.Contains(stageStateCheckDef, "awaiting_children") {
-		t.Errorf("stages_state_check after MigrateDown dropped 'awaiting_children' (only 0032 should roll back): %s", stageStateCheckDef)
+		t.Errorf("stages_state_check after MigrateDown dropped 'awaiting_children': %s", stageStateCheckDef)
 	}
 	var driveCol int
 	if err := pool.QueryRow(context.Background(),
@@ -233,7 +243,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query runs.drive column: %v", err)
 	}
 	if driveCol != 1 {
-		t.Errorf("runs.drive column count after MigrateDown = %d, want 1 (0031 still applied; only 0032 rolled back)", driveCol)
+		t.Errorf("runs.drive column count after MigrateDown = %d, want 1 (0031 still applied; only 0033 rolled back)", driveCol)
 	}
 	var reviewConcernsTable int
 	if err := pool.QueryRow(context.Background(),
@@ -243,7 +253,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query review_concerns table: %v", err)
 	}
 	if reviewConcernsTable != 1 {
-		t.Errorf("review_concerns table count after MigrateDown = %d, want 1 (0030 still applied; only 0031 rolled back)", reviewConcernsTable)
+		t.Errorf("review_concerns table count after MigrateDown = %d, want 1 (0030 still applied; only 0033 rolled back)", reviewConcernsTable)
 	}
 	var scopeAmendmentsTable int
 	if err := pool.QueryRow(context.Background(),

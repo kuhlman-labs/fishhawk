@@ -361,6 +361,55 @@ func TestGetRun_SurfacesOpenConcerns(t *testing.T) {
 	}
 }
 
+// TestGetRun_SurfacesHasSuggestedPatch (#1165): the concerns block flags
+// per item whether the reviewer attached a mechanical suggested_patch —
+// true for a concern carrying one, false otherwise — without exposing the
+// diff text itself.
+func TestGetRun_SurfacesHasSuggestedPatch(t *testing.T) {
+	repo := newFakeRepo()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, ConcernRepo: cr})
+
+	got, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI,
+	})
+	implStageID := uuid.New()
+	withPatch := seedConcernRow(t, cr, got.ID, implStageID, "implement", 10, "mechanical typo")
+	// Stamp the stored row with a suggested_patch directly (the fix-up bundle
+	// path that delivers it is a separate slice; here we assert the surface).
+	withPatch.SuggestedPatch = "--- a/x.go\n+++ b/x.go\n@@ -1 +1 @@\n-a\n+b\n"
+	withoutPatch := seedConcernRow(t, cr, got.ID, implStageID, "implement", 11, "needs judgement")
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", got.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Concerns == nil {
+		t.Fatalf("concerns block missing:\n%s", w.Body.String())
+	}
+	flags := map[uuid.UUID]bool{}
+	for _, item := range resp.Concerns.Items {
+		flags[item.ID] = item.HasSuggestedPatch
+	}
+	if !flags[withPatch.ID] {
+		t.Errorf("has_suggested_patch = false for the concern carrying a patch, want true")
+	}
+	if flags[withoutPatch.ID] {
+		t.Errorf("has_suggested_patch = true for the patch-less concern, want false")
+	}
+	// The diff text itself must never appear on the wire (only the boolean).
+	if strings.Contains(w.Body.String(), "+++ b/x.go") {
+		t.Errorf("suggested_patch diff text leaked onto the concerns block:\n%s", w.Body.String())
+	}
+}
+
 // TestGetRun_NoConcernsOmitsBlock: a run with nothing open carries no
 // concerns key at all (omitempty), and a nil ConcernRepo behaves the same.
 func TestGetRun_NoConcernsOmitsBlock(t *testing.T) {
