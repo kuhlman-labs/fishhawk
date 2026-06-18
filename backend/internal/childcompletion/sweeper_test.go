@@ -2,6 +2,7 @@ package childcompletion
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"sync"
@@ -417,6 +418,173 @@ func TestTick_NoChildren_NoOp(t *testing.T) {
 	defer rs.mu.Unlock()
 	if len(rs.transitions) != 0 {
 		t.Errorf("transitions = %d, want 0 (no children yet)", len(rs.transitions))
+	}
+}
+
+// recordingIntegrator stubs childcompletion.Integrator: it records the
+// parent ids it was asked to integrate and returns a programmed conflict
+// / error.
+type recordingIntegrator struct {
+	mu        sync.Mutex
+	called    []uuid.UUID
+	conflict  *SliceConflict
+	returnErr error
+}
+
+func (i *recordingIntegrator) IntegrateSlices(_ context.Context, parentRunID uuid.UUID) (*SliceConflict, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.called = append(i.called, parentRunID)
+	return i.conflict, i.returnErr
+}
+
+func TestTick_Integrate_CleanIntegrationResolvesSucceeded(t *testing.T) {
+	parentRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{
+			parentRun: {mkChild(uuid.New(), run.StateSucceeded), mkChild(uuid.New(), run.StateSucceeded)},
+		},
+	}
+	au := &fakeAudit{}
+	ad := &recordingAdvancer{}
+	integ := &recordingIntegrator{} // nil conflict, nil err → clean
+	s := &Sweeper{Runs: rs, Audit: au, Advance: ad, Integrate: integ, Logger: slog.Default()}
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	integ.mu.Lock()
+	if len(integ.called) != 1 || integ.called[0] != parentRun {
+		t.Errorf("IntegrateSlices called = %v, want [%s]", integ.called, parentRun)
+	}
+	integ.mu.Unlock()
+
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.transitions) != 1 || rs.transitions[0].To != run.StageStateSucceeded {
+		t.Fatalf("transitions = %v, want one to succeeded", rs.transitions)
+	}
+	if len(ad.advanced) != 1 || ad.advanced[0] != parentRun {
+		t.Errorf("Advance calls = %v, want [%s] after clean integration", ad.advanced, parentRun)
+	}
+}
+
+func TestTick_Integrate_ConflictFailsParentBNoAdvance(t *testing.T) {
+	parentRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	conflictChild := uuid.New()
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{
+			parentRun: {mkChild(uuid.New(), run.StateSucceeded)},
+		},
+	}
+	au := &fakeAudit{}
+	ad := &recordingAdvancer{}
+	integ := &recordingIntegrator{
+		conflict: &SliceConflict{SliceIndex: 2, ChildRunID: conflictChild, Detail: "slice integration conflict: slice 2"},
+	}
+	s := &Sweeper{Runs: rs, Audit: au, Advance: ad, Integrate: integ, Logger: slog.Default()}
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	rs.mu.Lock()
+	if len(rs.transitions) != 1 || rs.transitions[0].To != run.StageStateFailed {
+		t.Fatalf("transitions = %v, want one to failed", rs.transitions)
+	}
+	if rs.transitions[0].Failure == nil || *rs.transitions[0].Failure != run.FailureB {
+		t.Errorf("FailureCategory = %v, want B", rs.transitions[0].Failure)
+	}
+	rs.mu.Unlock()
+
+	// No Advance on a conflict — the parent stays failed-B (recoverable).
+	if len(ad.advanced) != 0 {
+		t.Errorf("Advance calls = %v, want none on conflict", ad.advanced)
+	}
+
+	// slice_integration_conflict carries the structured provenance.
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var found *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "slice_integration_conflict" {
+			found = &au.appended[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("no slice_integration_conflict audit; have %v", au.appended)
+	}
+	var p map[string]any
+	if err := json.Unmarshal(found.Payload, &p); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if got, _ := p["conflicting_slice_index"].(float64); int(got) != 2 {
+		t.Errorf("conflicting_slice_index = %v, want 2", p["conflicting_slice_index"])
+	}
+	if p["conflicting_child_run_id"] != conflictChild.String() {
+		t.Errorf("conflicting_child_run_id = %v, want %q", p["conflicting_child_run_id"], conflictChild.String())
+	}
+}
+
+func TestTick_Integrate_ErrorParksParentNoTransition(t *testing.T) {
+	// A non-conflict integration error must leave the stage parked (it
+	// surfaces as a tick error) — never resolve the parent succeeded.
+	parentRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{
+			parentRun: {mkChild(uuid.New(), run.StateSucceeded)},
+		},
+	}
+	ad := &recordingAdvancer{}
+	integ := &recordingIntegrator{returnErr: errors.New("github down")}
+	s := &Sweeper{Runs: rs, Audit: &fakeAudit{}, Advance: ad, Integrate: integ, Logger: slog.Default()}
+
+	// Tick swallows per-parent resolve errors (logged), so Tick returns nil
+	// but the stage must NOT have transitioned and Advance must NOT fire.
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.transitions) != 0 {
+		t.Errorf("transitions = %v, want none on integration error (parent parked)", rs.transitions)
+	}
+	if len(ad.advanced) != 0 {
+		t.Errorf("Advance calls = %v, want none on integration error", ad.advanced)
+	}
+}
+
+func TestTick_NilIntegrate_PreservesPreFanInBehavior(t *testing.T) {
+	// A nil Integrate (dev posture / pre-#1142) skips integration entirely:
+	// all-succeeded children resolve the parent succeeded exactly as before.
+	parentRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{
+			parentRun: {mkChild(uuid.New(), run.StateSucceeded)},
+		},
+	}
+	ad := &recordingAdvancer{}
+	s := &Sweeper{Runs: rs, Audit: &fakeAudit{}, Advance: ad, Logger: slog.Default()} // Integrate nil
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.transitions) != 1 || rs.transitions[0].To != run.StageStateSucceeded {
+		t.Errorf("transitions = %v, want one to succeeded with nil Integrate", rs.transitions)
+	}
+	if len(ad.advanced) != 1 {
+		t.Errorf("Advance calls = %v, want one with nil Integrate", ad.advanced)
 	}
 }
 

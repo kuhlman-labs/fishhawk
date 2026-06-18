@@ -338,6 +338,28 @@ Notes:
   one PR." Best-effort: a nil `Audit` or an append failure logs at WARN and never
   unwinds the settle. Listed here only so a future reader grepping the audit
   categories doesn't mistake it for a comment surface.
+- The slice-integration audit kinds — `slices_integrated` and
+  `slice_integration_conflict` (ADR-041 / #1142) — are **internal,
+  system-actor audit kinds, not issue-comment surfaces**. Nothing in
+  `issuecomment` posts them to the issue thread; neither has a Notifier
+  method. The fan-in step (`orchestrator.go::integrateSlices`, invoked from
+  BOTH settle paths — `maybeAdvanceDecomposedParent` and
+  `childcompletion.resolveParent`) writes one of them when a decomposed
+  parent's children have all succeeded and their per-slice branches are
+  merged onto the consolidated branch in ascending slice-index order.
+  `slices_integrated` (payload `{child_run_ids, consolidated_branch,
+  slice_count}`) records a clean fan-in — every slice merged — and is
+  consumed by E24.7. `slice_integration_conflict` (payload
+  `{parent_stage_id, conflicting_slice_index, conflicting_child_run_id}`)
+  records a merge conflict (HTTP 409) that failed the parent implement
+  (awaiting_children) stage category-B RECOVERABLE; its STRUCTURED payload
+  is the machine resume target the `next_actions`
+  `slices_integration_conflict` arm reads back (the
+  `conflicting_child_run_id`), never parsing the stage's free-form failure
+  reason. Both follow the `children_settled` / `consolidated_pr_opened`
+  precedent: best-effort (a nil `Audit` or append failure logs at WARN and
+  never unwinds the settle). Listed here only so a future reader grepping
+  the audit categories doesn't mistake them for comment surfaces.
 - The fan-out re-drive action audit kind — `child_redriven` (#698) — is an
   **internal, user-actor audit kind, not an issue-comment surface**. Nothing in
   `issuecomment` posts it to the issue thread; it has no Notifier method. The

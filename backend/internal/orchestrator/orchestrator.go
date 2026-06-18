@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -58,6 +59,23 @@ type GitHubAPI interface {
 	// returns ErrPullRequestExists (#714).
 	ListOpenPullRequestsByHead(ctx context.Context, installationID int64,
 		repo githubclient.RepoRef, headBranch, base string) ([]githubclient.PullRequest, error)
+	// GetBranchSHA resolves a branch ref to its tip SHA, reporting
+	// absence as (_, false, nil). Used by the fan-in step (ADR-041 /
+	// #1142) to read the base ref and probe the consolidated branch.
+	GetBranchSHA(ctx context.Context, installationID int64,
+		repo githubclient.RepoRef, branch string) (string, bool, error)
+	// CreateRef creates a branch ref at sha (idempotent on a 422
+	// "already exists"). The fan-in step creates the consolidated branch
+	// from the run's base ref when it does not yet exist (ADR-041 /
+	// #1142 — under E24.1 nobody else creates it).
+	CreateRef(ctx context.Context, installationID int64,
+		repo githubclient.RepoRef, branch, sha string) error
+	// MergeBranch performs a server-side merge of head into base,
+	// returning ErrMergeConflict on a 409. The fan-in step merges each
+	// succeeded slice branch onto the consolidated branch in slice order
+	// (ADR-041 / #1142).
+	MergeBranch(ctx context.Context, installationID int64,
+		repo githubclient.RepoRef, base, head, commitMessage string) error
 }
 
 // ConsolidatedReviewDispatcher dispatches the gating agent implement
@@ -556,6 +574,278 @@ func (o *Orchestrator) emitConsolidatedPROpened(ctx context.Context, runID, stag
 	}
 }
 
+// SliceConflict carries the structured provenance of a slice-branch
+// merge conflict during fan-in (ADR-041 / #1142). integrateSlices
+// returns it (non-nil) instead of string-parsing the free-form failure
+// reason: the conflicting slice's index AND its owning child run id are
+// the machine resume target the next_actions arm reads back from the
+// slice_integration_conflict audit payload. Detail is the human-display
+// message (stable "slice integration conflict: ..." prefix); the resume
+// target is the structured fields, never parsed from Detail.
+type SliceConflict struct {
+	SliceIndex int
+	ChildRunID uuid.UUID
+	Detail     string
+}
+
+// integrateSlicesPageSize bounds each ListRuns page the fan-in
+// children-listing walk fetches. Decompositions are small (a handful of
+// slices), so this is far above any realistic child count — but the walk
+// PAGINATES TO COMPLETION (#1142 partial-integration safety) so a future
+// large fan-out can never silently integrate only the first page. A var
+// (not a const) only so the pagination test can shrink it to exercise the
+// multi-page walk without seeding 100+ child rows.
+var integrateSlicesPageSize = 100
+
+// IntegrateSlices is the exported wrapper the child-completion sweeper's
+// adapter calls: it loads the parent run then delegates to integrateSlices
+// (ADR-041 / #1142). A non-nil *SliceConflict means a slice branch failed
+// to merge (the parent must fail recoverable); a nil conflict + nil error
+// means a clean integration (or a graceful skip).
+func (o *Orchestrator) IntegrateSlices(ctx context.Context, parentRunID uuid.UUID) (*SliceConflict, error) {
+	if o.Runs == nil {
+		return nil, errors.New("orchestrator: Runs is nil")
+	}
+	r, err := o.Runs.GetRun(ctx, parentRunID)
+	if err != nil {
+		return nil, fmt.Errorf("get parent run: %w", err)
+	}
+	return o.integrateSlices(ctx, r)
+}
+
+// integrateSlices is the fan-in step (ADR-041 / E24.2 / #1142): once every
+// decomposed child has succeeded, it sequentially merges each succeeded
+// slice branch fishhawk/run-<parent>/slice-<n> onto the consolidated
+// branch fishhawk/run-<parent> in ascending slice-index order via
+// server-side git merges, creating the consolidated branch from the run's
+// base ref first (under E24.1/#1141 nobody else creates it). A merge
+// conflict returns a non-nil *SliceConflict (the caller fails the parent
+// implement stage category-B recoverable); a clean run emits a
+// slices_integrated audit and returns (nil, nil).
+//
+// Graceful-skip (nil, nil — same posture as maybeOpenConsolidatedPR /
+// fireDispatch) when GitHub/installation isn't wired or there are zero
+// succeeded children: the CLI/dev posture must never regress.
+func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*SliceConflict, error) {
+	// Graceful-skip when GitHub can't be reached (no client / no
+	// installation) — the consolidated branch is simply not produced, the
+	// same posture maybeOpenConsolidatedPR takes.
+	if o.GitHub == nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: GitHub not configured; skipping slice integration",
+			slog.String("run_id", parent.ID.String()))
+		return nil, nil
+	}
+	if parent.InstallationID == nil || *parent.InstallationID == 0 {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: run has no installation_id; skipping slice integration",
+			slog.String("run_id", parent.ID.String()))
+		return nil, nil
+	}
+
+	children, err := o.listAllDecomposedChildren(ctx, parent.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list decomposed children: %w", err)
+	}
+
+	// Keep succeeded children with a slice index, ascending by index. A
+	// succeeded child missing SliceIndex is a defensive skip (it has no
+	// derivable slice branch) — WARN rather than guess a branch name.
+	succeeded := make([]*run.Run, 0, len(children))
+	for _, c := range children {
+		if c.State != run.StateSucceeded {
+			continue
+		}
+		if c.SliceIndex == nil {
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: succeeded decomposed child missing slice_index; skipping integration of it",
+				slog.String("parent_run_id", parent.ID.String()),
+				slog.String("child_run_id", c.ID.String()))
+			continue
+		}
+		succeeded = append(succeeded, c)
+	}
+	if len(succeeded) == 0 {
+		// Zero children to integrate — an ordinary non-decomposed run, or a
+		// decomposition whose children all lack a slice branch. Same skip
+		// posture as maybeOpenConsolidatedPR's zero-children branch.
+		return nil, nil
+	}
+	sort.SliceStable(succeeded, func(i, j int) bool {
+		return *succeeded[i].SliceIndex < *succeeded[j].SliceIndex
+	})
+
+	repo, err := parseRepo(parent.Repo)
+	if err != nil {
+		return nil, fmt.Errorf("parse repo %q: %w", parent.Repo, err)
+	}
+
+	base := o.DefaultRef
+	if base == "" {
+		base = "main"
+	}
+	baseSHA, exists, err := o.GitHub.GetBranchSHA(ctx, *parent.InstallationID, repo, base)
+	if err != nil {
+		return nil, fmt.Errorf("resolve base ref %q: %w", base, err)
+	}
+	if !exists {
+		return nil, fmt.Errorf("base ref %q does not exist on %s", base, repo)
+	}
+
+	// Ensure the consolidated branch exists, creating it from the base sha
+	// when absent. CreateRef's 422 "already exists" no-op makes a
+	// re-entrant settle (sweeper + event-driven race) safe.
+	consolidated := consolidatedBranch(parent.ID)
+	if _, cexists, err := o.GitHub.GetBranchSHA(ctx, *parent.InstallationID, repo, consolidated); err != nil {
+		return nil, fmt.Errorf("resolve consolidated branch %q: %w", consolidated, err)
+	} else if !cexists {
+		if err := o.GitHub.CreateRef(ctx, *parent.InstallationID, repo, consolidated, baseSHA); err != nil {
+			return nil, fmt.Errorf("create consolidated branch %q: %w", consolidated, err)
+		}
+	}
+
+	// Merge each succeeded slice in ascending order. A 204 (already merged)
+	// is an idempotent no-op so a resumed pass is clean.
+	childIDs := make([]string, 0, len(succeeded))
+	for _, c := range succeeded {
+		head := sliceBranch(parent.ID, *c.SliceIndex)
+		msg := fmt.Sprintf("Integrate slice %d (run %s) into %s", *c.SliceIndex, shortRunID(c.ID), consolidated)
+		err := o.GitHub.MergeBranch(ctx, *parent.InstallationID, repo, consolidated, head, msg)
+		switch {
+		case err == nil:
+			childIDs = append(childIDs, c.ID.String())
+		case errors.Is(err, githubclient.ErrMergeConflict):
+			detail := fmt.Sprintf("slice integration conflict: slice %d (child run %s) could not merge onto %s",
+				*c.SliceIndex, c.ID, consolidated)
+			o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator: slice integration conflict",
+				slog.String("parent_run_id", parent.ID.String()),
+				slog.String("conflicting_child_run_id", c.ID.String()),
+				slog.Int("conflicting_slice_index", *c.SliceIndex))
+			return &SliceConflict{SliceIndex: *c.SliceIndex, ChildRunID: c.ID, Detail: detail}, nil
+		default:
+			return nil, fmt.Errorf("merge slice %d (child %s) onto %s: %w", *c.SliceIndex, c.ID, consolidated, err)
+		}
+	}
+
+	o.emitSlicesIntegrated(ctx, parent.ID, childIDs, consolidated)
+	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator integrated decomposed slices",
+		slog.String("parent_run_id", parent.ID.String()),
+		slog.String("consolidated_branch", consolidated),
+		slog.Int("slice_count", len(childIDs)))
+	return nil, nil
+}
+
+// listAllDecomposedChildren pages ListRuns(DecomposedFrom=parent) to
+// COMPLETION (#1142 partial-integration safety): a full page is NOT
+// silently treated as the whole set — the walk advances the offset until
+// a short page proves the listing is exhausted. Never integrating only
+// the first page is the fail-closed requirement; without it a fan-out
+// exceeding one page would consolidate a PR silently missing later slices.
+func (o *Orchestrator) listAllDecomposedChildren(ctx context.Context, parentID uuid.UUID) ([]*run.Run, error) {
+	var out []*run.Run
+	offset := 0
+	for {
+		page, err := o.Runs.ListRuns(ctx, run.ListRunsFilter{
+			DecomposedFrom: &parentID,
+			Limit:          integrateSlicesPageSize,
+			Offset:         offset,
+		})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, page...)
+		if len(page) < integrateSlicesPageSize {
+			break
+		}
+		offset += len(page)
+	}
+	return out, nil
+}
+
+// sliceBranch is the sole-writer slice branch the decomposed child at
+// sliceIndex pushed to (E24.1 / #1141 / ADR-041):
+// fishhawk/run-<shortParent>/slice-<n>. It MUST stay in sync with the
+// runner's childSliceBranch (runner/cmd/fishhawk-runner/main.go), which
+// derives the same name; a divergence orphans a slice's commits from the
+// fan-in merge (surfaces as a 404 ErrNotFound on MergeBranch).
+func sliceBranch(parentID uuid.UUID, sliceIndex int) string {
+	return consolidatedBranch(parentID) + "/slice-" + strconv.Itoa(sliceIndex)
+}
+
+// emitSlicesIntegrated writes a slices_integrated audit entry (system
+// actor) once every succeeded slice merged cleanly onto the consolidated
+// branch (#1142). Consumed by E24.7. Best-effort, mirroring
+// emitChildrenSettled: nil-Audit guard, WARN-on-error, never unwinds the
+// settle.
+func (o *Orchestrator) emitSlicesIntegrated(ctx context.Context, parentRunID uuid.UUID, childIDs []string, consolidatedBranch string) {
+	if o.Audit == nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping slices_integrated entry",
+			slog.String("parent_run_id", parentRunID.String()))
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"child_run_ids":       childIDs,
+		"consolidated_branch": consolidatedBranch,
+		"slice_count":         len(childIDs),
+	})
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal slices_integrated payload failed",
+			slog.String("error", err.Error()))
+		return
+	}
+	systemKind := audit.ActorSystem
+	if _, err := o.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     parentRunID,
+		Timestamp: time.Now().UTC(),
+		Category:  "slices_integrated",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append slices_integrated failed",
+			slog.String("error", err.Error()))
+	}
+}
+
+// emitSliceIntegrationConflict writes a slice_integration_conflict audit
+// entry (system actor) when a slice branch fails to merge during fan-in
+// (#1142). The payload carries the STRUCTURED conflict provenance —
+// conflicting_slice_index + conflicting_child_run_id — so the next_actions
+// arm sources the resume target from this entry rather than parsing the
+// stage's free-form failure reason. Best-effort.
+func (o *Orchestrator) emitSliceIntegrationConflict(ctx context.Context, parentRunID, stageID uuid.UUID, conflict *SliceConflict) {
+	if o.Audit == nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping slice_integration_conflict entry",
+			slog.String("parent_run_id", parentRunID.String()))
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"parent_stage_id":          stageID.String(),
+		"conflicting_slice_index":  conflict.SliceIndex,
+		"conflicting_child_run_id": conflict.ChildRunID.String(),
+	})
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal slice_integration_conflict payload failed",
+			slog.String("error", err.Error()))
+		return
+	}
+	systemKind := audit.ActorSystem
+	if _, err := o.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     parentRunID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "slice_integration_conflict",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append slice_integration_conflict failed",
+			slog.String("error", err.Error()))
+	}
+}
+
+// sliceIntegrationConflictReasonPrefix is the STABLE prefix the fan-in
+// conflict stamps on the parent implement stage's failure reason for human
+// display. The next_actions arm keys on it to recognize the conflict
+// state, but the machine resume target is sourced from the structured
+// slice_integration_conflict audit payload, never parsed from this string.
+const sliceIntegrationConflictReasonPrefix = "slice integration conflict"
+
 // fanoutIfDecomposed inspects the run's approved plan for a
 // decomposition.sub_plans block. When present, it mints one child
 // run per sub_plan (inheriting parent's workflow + trigger +
@@ -899,6 +1189,42 @@ func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentR
 		completion = &run.StageCompletion{
 			FailureCategory: &cat,
 			FailureReason:   &reason,
+		}
+	}
+
+	// Fan-in (ADR-041 / #1142): on the happy path (all children succeeded),
+	// integrate each succeeded slice branch onto the consolidated branch
+	// BEFORE stamping the awaiting_children stage succeeded, so a merge
+	// conflict can fail the parent implement stage recoverable (category-B)
+	// — the issue's requirement. A non-conflict error leaves the stage
+	// parked (next tick/retry re-enters; merges are idempotent). On success
+	// we fall through to the existing succeeded transition + Advance, which
+	// opens the consolidated PR from the now-integrated branch.
+	if !anyFailed {
+		conflict, err := o.IntegrateSlices(ctx, parentRunID)
+		switch {
+		case err != nil:
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: slice integration error; leaving parent parked",
+				slog.String("parent_run_id", parentRunID.String()),
+				slog.String("error", err.Error()),
+			)
+			return
+		case conflict != nil:
+			cat := run.FailureB
+			reason := conflict.Detail
+			if _, terr := o.Runs.TransitionStage(ctx, awaitingStage.ID, run.StageStateFailed, &run.StageCompletion{
+				FailureCategory: &cat,
+				FailureReason:   &reason,
+			}); terr != nil {
+				o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: transition awaiting_children to failed-B on slice conflict failed",
+					slog.String("parent_run_id", parentRunID.String()),
+					slog.String("stage_id", awaitingStage.ID.String()),
+					slog.String("error", terr.Error()),
+				)
+				return
+			}
+			o.emitSliceIntegrationConflict(ctx, parentRunID, awaitingStage.ID, conflict)
+			return
 		}
 	}
 

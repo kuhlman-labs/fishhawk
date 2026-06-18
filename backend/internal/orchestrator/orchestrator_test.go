@@ -2,8 +2,10 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -177,7 +179,7 @@ func (s *stubRuns) RetryRun(_ context.Context, id uuid.UUID, to run.State) (*run
 	return r, nil
 }
 
-func (s *stubRuns) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, _ *run.StageCompletion) (*run.Stage, error) {
+func (s *stubRuns) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, completion *run.StageCompletion) (*run.Stage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.transitionErr != nil {
@@ -192,6 +194,13 @@ func (s *stubRuns) TransitionStage(_ context.Context, id uuid.UUID, to run.Stage
 					}
 				}
 				st.State = to
+				// Record failure metadata so tests can assert the category/
+				// reason a failing transition carried (the slice-integration
+				// conflict path stamps failed-B with a stable reason).
+				if completion != nil {
+					st.FailureCategory = completion.FailureCategory
+					st.FailureReason = completion.FailureReason
+				}
 				s.stageTransitions = append(s.stageTransitions, stageTransition{StageID: id, To: to})
 				return st, nil
 			}
@@ -228,6 +237,33 @@ func (s *stubRuns) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run
 		if r.DecomposedFrom != nil && *r.DecomposedFrom == *f.DecomposedFrom {
 			out = append(out, r)
 		}
+	}
+	// Deterministic order so pagination (Offset/Limit) windows are stable
+	// across calls: ascending by SliceIndex (nil last), then by id.
+	sort.SliceStable(out, func(i, j int) bool {
+		si, sj := out[i].SliceIndex, out[j].SliceIndex
+		switch {
+		case si == nil && sj == nil:
+			return out[i].ID.String() < out[j].ID.String()
+		case si == nil:
+			return false
+		case sj == nil:
+			return true
+		case *si != *sj:
+			return *si < *sj
+		default:
+			return out[i].ID.String() < out[j].ID.String()
+		}
+	})
+	// Honor Offset/Limit so the fan-in pagination walk (#1142) is exercised.
+	if f.Offset > 0 {
+		if f.Offset >= len(out) {
+			return nil, nil
+		}
+		out = out[f.Offset:]
+	}
+	if f.Limit > 0 && len(out) > f.Limit {
+		out = out[:f.Limit]
 	}
 	return out, nil
 }
@@ -271,6 +307,28 @@ type stubGitHub struct {
 	listByHeadResult []githubclient.PullRequest
 	listByHeadErr    error
 	listByHeadCalls  int
+
+	// Fan-in (#1142) recording + programming. branchSHAs maps an existing
+	// branch to its tip sha (absence => GetBranchSHA reports not-found).
+	branchSHAs      map[string]string
+	getBranchSHAErr error
+	createRefErr    error
+	createRefCalls  []createRefCall
+	// mergeErrByHead programs a per-head-branch MergeBranch error (e.g.
+	// githubclient.ErrMergeConflict on a specific slice branch).
+	mergeErrByHead map[string]error
+	mergeCalls     []mergeBranchCall
+}
+
+type createRefCall struct {
+	Branch string
+	SHA    string
+}
+
+type mergeBranchCall struct {
+	Base string
+	Head string
+	Msg  string
 }
 
 type createPRCall struct {
@@ -352,6 +410,46 @@ func (g *stubGitHub) ListOpenPullRequestsByHead(_ context.Context, _ int64,
 		return nil, g.listByHeadErr
 	}
 	return g.listByHeadResult, nil
+}
+
+func (g *stubGitHub) GetBranchSHA(_ context.Context, _ int64,
+	_ githubclient.RepoRef, branch string) (string, bool, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.getBranchSHAErr != nil {
+		return "", false, g.getBranchSHAErr
+	}
+	sha, ok := g.branchSHAs[branch]
+	if !ok {
+		return "", false, nil
+	}
+	return sha, true, nil
+}
+
+func (g *stubGitHub) CreateRef(_ context.Context, _ int64,
+	_ githubclient.RepoRef, branch, sha string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.createRefCalls = append(g.createRefCalls, createRefCall{Branch: branch, SHA: sha})
+	if g.createRefErr != nil {
+		return g.createRefErr
+	}
+	if g.branchSHAs == nil {
+		g.branchSHAs = map[string]string{}
+	}
+	g.branchSHAs[branch] = sha
+	return nil
+}
+
+func (g *stubGitHub) MergeBranch(_ context.Context, _ int64,
+	_ githubclient.RepoRef, base, head, msg string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.mergeCalls = append(g.mergeCalls, mergeBranchCall{Base: base, Head: head, Msg: msg})
+	if err, ok := g.mergeErrByHead[head]; ok {
+		return err
+	}
+	return nil
 }
 
 func newOrchestrator(t *testing.T) (*Orchestrator, *stubRuns, *stubGitHub) {
@@ -1519,5 +1617,305 @@ func TestAdvance_FanoutAssignsSliceIndexInOrder(t *testing.T) {
 		} else if *got != want[i] {
 			t.Errorf("child %d SliceIndex = %d, want %d", i, *got, want[i])
 		}
+	}
+}
+
+// seedFanInParent seeds a decomposed parent parked in awaiting_children
+// (implement awaiting_children, review pending). The caller adds children.
+func seedFanInParent(t *testing.T, rs *stubRuns, installationID *int64) (*run.Run, []*run.Stage) {
+	t.Helper()
+	return rs.seed(t, "kuhlman-labs/fishhawk", installationID, []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateAwaitingChildren},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, ExecutorRef: "human", State: run.StageStatePending},
+	})
+}
+
+// seedSucceededSlice seeds one succeeded decomposed child with the given
+// slice index.
+func seedSucceededSlice(t *testing.T, rs *stubRuns, parentID uuid.UUID, installationID *int64, sliceIdx int) *run.Run {
+	t.Helper()
+	child, _ := rs.seed(t, "kuhlman-labs/fishhawk", installationID, nil)
+	child.DecomposedFrom = &parentID
+	child.State = run.StateSucceeded
+	idx := sliceIdx
+	child.SliceIndex = &idx
+	return child
+}
+
+// auditPayload returns the decoded payload of the most recent audit entry
+// of the given category, failing the test when none was recorded.
+func auditPayload(t *testing.T, a *recordingAudit, category string) map[string]any {
+	t.Helper()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i := len(a.appended) - 1; i >= 0; i-- {
+		if a.appended[i].Category != category {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal(a.appended[i].Payload, &m); err != nil {
+			t.Fatalf("decode %s payload: %v", category, err)
+		}
+		return m
+	}
+	t.Fatalf("no audit entry of category %q (have %v)", category, a.appended)
+	return nil
+}
+
+func TestIntegrateSlices_Success_MergesInSliceOrder(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	au := &recordingAudit{}
+	o.Audit = au
+	gh.branchSHAs = map[string]string{"main": "basesha"} // consolidated branch absent
+
+	parent, stages := seedFanInParent(t, rs, int64Ptr(55))
+	parent.IssueContext = &run.IssueContext{Title: "Add widget", Number: 1142}
+	// Seed slice 1 BEFORE slice 0 to prove the ascending-index sort.
+	child1 := seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+	child0 := seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	_ = child0
+
+	o.maybeAdvanceDecomposedParent(context.Background(), parent.ID)
+
+	// The consolidated branch was absent, so it must be created from the
+	// base sha (BRANCH-CREATE path).
+	if len(gh.createRefCalls) != 1 {
+		t.Fatalf("CreateRef calls = %d, want 1", len(gh.createRefCalls))
+	}
+	consolidated := consolidatedBranch(parent.ID)
+	if gh.createRefCalls[0].Branch != consolidated || gh.createRefCalls[0].SHA != "basesha" {
+		t.Errorf("CreateRef = %+v, want branch=%q sha=basesha", gh.createRefCalls[0], consolidated)
+	}
+
+	// Merges happen in ascending slice-index order: slice-0 then slice-1.
+	if len(gh.mergeCalls) != 2 {
+		t.Fatalf("MergeBranch calls = %d, want 2", len(gh.mergeCalls))
+	}
+	wantHead0 := consolidated + "/slice-0"
+	wantHead1 := consolidated + "/slice-1"
+	if gh.mergeCalls[0].Head != wantHead0 || gh.mergeCalls[1].Head != wantHead1 {
+		t.Errorf("merge order heads = [%q, %q], want [%q, %q]",
+			gh.mergeCalls[0].Head, gh.mergeCalls[1].Head, wantHead0, wantHead1)
+	}
+	if gh.mergeCalls[0].Base != consolidated {
+		t.Errorf("merge base = %q, want %q", gh.mergeCalls[0].Base, consolidated)
+	}
+
+	// The awaiting_children stage resolved succeeded and the review
+	// dispatched (human → awaiting_approval), opening the consolidated PR.
+	if stages[0].State != run.StageStateSucceeded {
+		t.Errorf("implement stage = %q, want succeeded", stages[0].State)
+	}
+	if stages[1].State != run.StageStateAwaitingApproval {
+		t.Errorf("review stage = %q, want awaiting_approval", stages[1].State)
+	}
+	if len(gh.createPRCalls) != 1 {
+		t.Errorf("CreatePullRequest calls = %d, want 1 (consolidated PR off the integrated branch)", len(gh.createPRCalls))
+	}
+
+	// slices_integrated emitted with both children and the slice count.
+	p := auditPayload(t, au, "slices_integrated")
+	if got, _ := p["slice_count"].(float64); int(got) != 2 {
+		t.Errorf("slices_integrated slice_count = %v, want 2", p["slice_count"])
+	}
+	if p["consolidated_branch"] != consolidated {
+		t.Errorf("slices_integrated consolidated_branch = %v, want %q", p["consolidated_branch"], consolidated)
+	}
+	_ = child1
+}
+
+func TestIntegrateSlices_Conflict_FailsParentRecoverable(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	au := &recordingAudit{}
+	o.Audit = au
+	gh.branchSHAs = map[string]string{"main": "basesha"}
+
+	parent, stages := seedFanInParent(t, rs, int64Ptr(55))
+	_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	child1 := seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+
+	// Slice-1's branch fails to merge (a conflict).
+	consolidated := consolidatedBranch(parent.ID)
+	gh.mergeErrByHead = map[string]error{
+		consolidated + "/slice-1": githubclient.ErrMergeConflict,
+	}
+
+	o.maybeAdvanceDecomposedParent(context.Background(), parent.ID)
+
+	// The awaiting_children stage failed category-B with the stable reason.
+	if stages[0].State != run.StageStateFailed {
+		t.Fatalf("implement stage = %q, want failed", stages[0].State)
+	}
+	if stages[0].FailureCategory == nil || *stages[0].FailureCategory != run.FailureB {
+		t.Errorf("failure category = %v, want B", stages[0].FailureCategory)
+	}
+	if stages[0].FailureReason == nil || (*stages[0].FailureReason)[:len(sliceIntegrationConflictReasonPrefix)] != sliceIntegrationConflictReasonPrefix {
+		t.Errorf("failure reason = %v, want %q prefix", stages[0].FailureReason, sliceIntegrationConflictReasonPrefix)
+	}
+
+	// No consolidated PR — review never dispatched.
+	if len(gh.createPRCalls) != 0 {
+		t.Errorf("CreatePullRequest calls = %d, want 0 on conflict", len(gh.createPRCalls))
+	}
+
+	// slice_integration_conflict carries the STRUCTURED provenance: the
+	// conflicting slice index AND child run id (sourced from data, not the
+	// reason string).
+	p := auditPayload(t, au, "slice_integration_conflict")
+	if got, _ := p["conflicting_slice_index"].(float64); int(got) != 1 {
+		t.Errorf("conflicting_slice_index = %v, want 1", p["conflicting_slice_index"])
+	}
+	if p["conflicting_child_run_id"] != child1.ID.String() {
+		t.Errorf("conflicting_child_run_id = %v, want %q", p["conflicting_child_run_id"], child1.ID.String())
+	}
+}
+
+func TestIntegrateSlices_Idempotent_ExistingBranchAndMergedSlices(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	au := &recordingAudit{}
+	o.Audit = au
+
+	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+	_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	// Both base AND the consolidated branch already exist (a prior pass
+	// created it); merges return nil (204 "already merged" / clean re-merge).
+	consolidated := consolidatedBranch(parent.ID)
+	gh.branchSHAs = map[string]string{"main": "basesha", consolidated: "consha"}
+
+	conflict, err := o.IntegrateSlices(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("IntegrateSlices: %v", err)
+	}
+	if conflict != nil {
+		t.Fatalf("conflict = %+v, want nil on a clean re-run", conflict)
+	}
+	// The consolidated branch already existed → CreateRef must NOT fire.
+	if len(gh.createRefCalls) != 0 {
+		t.Errorf("CreateRef calls = %d, want 0 (branch already exists)", len(gh.createRefCalls))
+	}
+	if !auditHasCategory(au, "slices_integrated") {
+		t.Errorf("want slices_integrated audit on clean re-run")
+	}
+}
+
+func TestIntegrateSlices_PaginatesToCompletion(t *testing.T) {
+	// #1142 partial-integration safety: the children listing must paginate
+	// to completion, never silently integrate only the first page. Shrink
+	// the page size and seed children spanning more than one page; ALL
+	// slices must integrate in order.
+	saved := integrateSlicesPageSize
+	integrateSlicesPageSize = 2
+	t.Cleanup(func() { integrateSlicesPageSize = saved })
+
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	au := &recordingAudit{}
+	o.Audit = au
+	gh.branchSHAs = map[string]string{"main": "basesha"}
+
+	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+	for i := 0; i < 3; i++ { // 3 children across 2 pages of size 2
+		_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), i)
+	}
+
+	conflict, err := o.IntegrateSlices(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("IntegrateSlices: %v", err)
+	}
+	if conflict != nil {
+		t.Fatalf("conflict = %+v, want nil", conflict)
+	}
+	if len(gh.mergeCalls) != 3 {
+		t.Fatalf("MergeBranch calls = %d, want 3 (all pages integrated)", len(gh.mergeCalls))
+	}
+	consolidated := consolidatedBranch(parent.ID)
+	for i := 0; i < 3; i++ {
+		want := consolidated + "/slice-" + string(rune('0'+i))
+		if gh.mergeCalls[i].Head != want {
+			t.Errorf("merge[%d] head = %q, want %q", i, gh.mergeCalls[i].Head, want)
+		}
+	}
+	p := auditPayload(t, au, "slices_integrated")
+	if got, _ := p["slice_count"].(float64); int(got) != 3 {
+		t.Errorf("slice_count = %v, want 3", p["slice_count"])
+	}
+}
+
+func TestIntegrateSlices_SkipsChildMissingSliceIndex(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	gh.branchSHAs = map[string]string{"main": "basesha"}
+
+	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+	_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	// A succeeded child with NO slice index has no derivable branch — it is
+	// a defensive skip, not a guessed merge.
+	orphan, _ := rs.seed(t, "kuhlman-labs/fishhawk", int64Ptr(55), nil)
+	orphan.DecomposedFrom = &parent.ID
+	orphan.State = run.StateSucceeded
+
+	if _, err := o.IntegrateSlices(context.Background(), parent.ID); err != nil {
+		t.Fatalf("IntegrateSlices: %v", err)
+	}
+	if len(gh.mergeCalls) != 1 {
+		t.Errorf("MergeBranch calls = %d, want 1 (orphan child skipped)", len(gh.mergeCalls))
+	}
+}
+
+func TestIntegrateSlices_GracefulSkip(t *testing.T) {
+	t.Run("github nil", func(t *testing.T) {
+		rs := newStubRuns()
+		o := &Orchestrator{Runs: rs} // no GitHub
+		parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+		_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
+		conflict, err := o.IntegrateSlices(context.Background(), parent.ID)
+		if err != nil || conflict != nil {
+			t.Errorf("got (%v, %v), want (nil, nil) when GitHub unwired", conflict, err)
+		}
+	})
+	t.Run("nil installation id", func(t *testing.T) {
+		o, rs, gh := newOrchestrator(t)
+		parent, _ := seedFanInParent(t, rs, nil) // nil installation
+		_ = seedSucceededSlice(t, rs, parent.ID, nil, 0)
+		conflict, err := o.IntegrateSlices(context.Background(), parent.ID)
+		if err != nil || conflict != nil {
+			t.Errorf("got (%v, %v), want (nil, nil) when installation_id nil", conflict, err)
+		}
+		if len(gh.mergeCalls) != 0 || len(gh.createRefCalls) != 0 {
+			t.Errorf("no GitHub writes expected on skip; merges=%d createRefs=%d", len(gh.mergeCalls), len(gh.createRefCalls))
+		}
+	})
+	t.Run("zero children", func(t *testing.T) {
+		o, rs, gh := newOrchestrator(t)
+		parent, _ := seedFanInParent(t, rs, int64Ptr(55)) // no children seeded
+		conflict, err := o.IntegrateSlices(context.Background(), parent.ID)
+		if err != nil || conflict != nil {
+			t.Errorf("got (%v, %v), want (nil, nil) with zero children", conflict, err)
+		}
+		if len(gh.mergeCalls) != 0 {
+			t.Errorf("merges = %d, want 0 with zero children", len(gh.mergeCalls))
+		}
+	})
+}
+
+func TestIntegrateSlices_BaseRefMissing_Errors(t *testing.T) {
+	// A non-conflict error (the base ref does not resolve) must NOT mark
+	// the parent succeeded — it surfaces so the next settle retries.
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	gh.branchSHAs = map[string]string{} // base "main" absent
+
+	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+	_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
+
+	conflict, err := o.IntegrateSlices(context.Background(), parent.ID)
+	if err == nil {
+		t.Fatal("want an error when the base ref is absent")
+	}
+	if conflict != nil {
+		t.Errorf("conflict = %+v, want nil (absent base is an error, not a conflict)", conflict)
 	}
 }

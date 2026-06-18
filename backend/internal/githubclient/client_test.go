@@ -2421,3 +2421,236 @@ func TestComparePatch_Validation(t *testing.T) {
 		t.Error("empty repo: want error")
 	}
 }
+
+// fanInClient wires a Client to a one-off httptest server that serves the
+// three fan-in primitives (GetBranchSHA / CreateRef / MergeBranch) with
+// per-route programmable status + body, recording the last request seen
+// on each route. The single mux lets one test exercise the create-then-
+// merge sequence while asserting the exact paths/bodies.
+func fanInClient(t *testing.T) (*Client, *fanInCapture) {
+	t.Helper()
+	cap := &fanInCapture{
+		getRefStatus: http.StatusOK,
+		createStatus: http.StatusCreated,
+		mergeStatus:  http.StatusCreated,
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/git/ref/heads/{branch...}",
+		func(w http.ResponseWriter, r *http.Request) {
+			cap.getRefPath = r.URL.Path
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(cap.getRefStatus)
+			_, _ = io.WriteString(w, cap.getRefBody)
+		})
+	mux.HandleFunc("POST /repos/{owner}/{repo}/git/refs",
+		func(w http.ResponseWriter, r *http.Request) {
+			raw, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(raw, &cap.createBody)
+			cap.createCalls++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(cap.createStatus)
+			_, _ = io.WriteString(w, cap.createRespBody)
+		})
+	mux.HandleFunc("POST /repos/{owner}/{repo}/merges",
+		func(w http.ResponseWriter, r *http.Request) {
+			raw, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(raw, &cap.mergeBody)
+			cap.mergeCalls++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(cap.mergeStatus)
+			_, _ = io.WriteString(w, cap.mergeRespBody)
+		})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{
+		BaseURL: srv.URL,
+		Tokens:  &stubTokens{token: "ghs_canned_token"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+	}
+	return c, cap
+}
+
+type fanInCapture struct {
+	getRefStatus int
+	getRefBody   string
+	getRefPath   string
+
+	createStatus   int
+	createRespBody string
+	createCalls    int
+	createBody     struct {
+		Ref string `json:"ref"`
+		SHA string `json:"sha"`
+	}
+
+	mergeStatus   int
+	mergeRespBody string
+	mergeCalls    int
+	mergeBody     struct {
+		Base          string `json:"base"`
+		Head          string `json:"head"`
+		CommitMessage string `json:"commit_message"`
+	}
+}
+
+func TestGetBranchSHA_Found(t *testing.T) {
+	c, cap := fanInClient(t)
+	cap.getRefStatus = http.StatusOK
+	cap.getRefBody = `{"ref":"refs/heads/fishhawk/run-abc","object":{"sha":"sha123"}}`
+
+	sha, exists, err := c.GetBranchSHA(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "fishhawk/run-abc")
+	if err != nil {
+		t.Fatalf("GetBranchSHA: %v", err)
+	}
+	if !exists {
+		t.Fatal("exists = false, want true")
+	}
+	if sha != "sha123" {
+		t.Errorf("sha = %q, want sha123", sha)
+	}
+	if want := "/repos/x/y/git/ref/heads/fishhawk/run-abc"; cap.getRefPath != want {
+		t.Errorf("path = %q, want %q", cap.getRefPath, want)
+	}
+}
+
+func TestGetBranchSHA_Absent(t *testing.T) {
+	c, cap := fanInClient(t)
+	cap.getRefStatus = http.StatusNotFound
+	cap.getRefBody = `{"message":"Not Found"}`
+
+	sha, exists, err := c.GetBranchSHA(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "missing")
+	if err != nil {
+		t.Fatalf("GetBranchSHA on 404 should not error, got %v", err)
+	}
+	if exists {
+		t.Error("exists = true, want false on 404")
+	}
+	if sha != "" {
+		t.Errorf("sha = %q, want empty on 404", sha)
+	}
+}
+
+func TestGetBranchSHA_Forbidden(t *testing.T) {
+	c, cap := fanInClient(t)
+	cap.getRefStatus = http.StatusForbidden
+	cap.getRefBody = `{"message":"Forbidden"}`
+
+	_, _, err := c.GetBranchSHA(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "b")
+	if err == nil || !errors.Is(err, ErrForbidden) {
+		t.Errorf("err = %v, want ErrForbidden", err)
+	}
+}
+
+func TestCreateRef_Created(t *testing.T) {
+	c, cap := fanInClient(t)
+	cap.createStatus = http.StatusCreated
+	cap.createRespBody = `{"ref":"refs/heads/fishhawk/run-abc"}`
+
+	err := c.CreateRef(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "fishhawk/run-abc", "basesha")
+	if err != nil {
+		t.Fatalf("CreateRef: %v", err)
+	}
+	if cap.createBody.Ref != "refs/heads/fishhawk/run-abc" {
+		t.Errorf("ref = %q, want refs/heads/fishhawk/run-abc", cap.createBody.Ref)
+	}
+	if cap.createBody.SHA != "basesha" {
+		t.Errorf("sha = %q, want basesha", cap.createBody.SHA)
+	}
+}
+
+func TestCreateRef_AlreadyExistsIsNoOp(t *testing.T) {
+	c, cap := fanInClient(t)
+	cap.createStatus = http.StatusUnprocessableEntity
+	cap.createRespBody = `{"message":"Reference already exists"}`
+
+	// A re-entrant fan-in pass that finds the consolidated branch already
+	// created must treat the 422 as a benign no-op, not a failure.
+	err := c.CreateRef(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "fishhawk/run-abc", "basesha")
+	if err != nil {
+		t.Fatalf("CreateRef on 'already exists' should be a no-op, got %v", err)
+	}
+}
+
+func TestCreateRef_OtherValidationError(t *testing.T) {
+	c, cap := fanInClient(t)
+	cap.createStatus = http.StatusUnprocessableEntity
+	cap.createRespBody = `{"message":"Invalid request: sha is not a valid object"}`
+
+	err := c.CreateRef(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "fishhawk/run-abc", "bad")
+	if err == nil || !errors.Is(err, ErrValidation) {
+		t.Errorf("err = %v, want ErrValidation for a non-duplicate 422", err)
+	}
+}
+
+func TestMergeBranch_Merged(t *testing.T) {
+	c, cap := fanInClient(t)
+	cap.mergeStatus = http.StatusCreated
+	cap.mergeRespBody = `{"sha":"mergecommit"}`
+
+	err := c.MergeBranch(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "fishhawk/run-abc", "fishhawk/run-abc/slice-0", "Integrate slice 0")
+	if err != nil {
+		t.Fatalf("MergeBranch: %v", err)
+	}
+	if cap.mergeBody.Base != "fishhawk/run-abc" || cap.mergeBody.Head != "fishhawk/run-abc/slice-0" {
+		t.Errorf("merge body base/head = %q/%q", cap.mergeBody.Base, cap.mergeBody.Head)
+	}
+	if cap.mergeBody.CommitMessage != "Integrate slice 0" {
+		t.Errorf("commit_message = %q", cap.mergeBody.CommitMessage)
+	}
+}
+
+func TestMergeBranch_NothingToMerge(t *testing.T) {
+	c, cap := fanInClient(t)
+	cap.mergeStatus = http.StatusNoContent
+
+	// 204 = base already contains head — idempotent success for a
+	// re-entrant fan-in pass over an already-integrated slice.
+	err := c.MergeBranch(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "base", "head", "msg")
+	if err != nil {
+		t.Fatalf("MergeBranch 204 should be nil, got %v", err)
+	}
+}
+
+func TestMergeBranch_Conflict(t *testing.T) {
+	c, cap := fanInClient(t)
+	cap.mergeStatus = http.StatusConflict
+	cap.mergeRespBody = `{"message":"Merge conflict"}`
+
+	err := c.MergeBranch(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "base", "head", "msg")
+	if err == nil || !errors.Is(err, ErrMergeConflict) {
+		t.Errorf("err = %v, want ErrMergeConflict on 409", err)
+	}
+}
+
+func TestMergeBranch_NotFound(t *testing.T) {
+	c, cap := fanInClient(t)
+	cap.mergeStatus = http.StatusNotFound
+	cap.mergeRespBody = `{"message":"Not Found"}`
+
+	err := c.MergeBranch(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "base", "missing", "msg")
+	if err == nil || !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound on 404", err)
+	}
+}
+
+func TestMergeBranch_Validation(t *testing.T) {
+	c, cap := fanInClient(t)
+	cap.mergeStatus = http.StatusUnprocessableEntity
+	cap.mergeRespBody = `{"message":"Validation Failed"}`
+
+	err := c.MergeBranch(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "base", "head", "msg")
+	if err == nil || !errors.Is(err, ErrValidation) {
+		t.Errorf("err = %v, want ErrValidation on 422", err)
+	}
+}

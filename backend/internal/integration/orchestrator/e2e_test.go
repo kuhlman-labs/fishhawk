@@ -62,6 +62,21 @@ func (a advancerAdapter) Advance(ctx context.Context, runID uuid.UUID) error {
 	return err
 }
 
+// IntegrateSlices widens advancerAdapter to childcompletion.Integrator
+// (ADR-041 / #1142), converting the orchestrator's *SliceConflict to
+// childcompletion's identical type — mirrors the serve.go adapter.
+func (a advancerAdapter) IntegrateSlices(ctx context.Context, parentRunID uuid.UUID) (*childcompletion.SliceConflict, error) {
+	conflict, err := a.o.IntegrateSlices(ctx, parentRunID)
+	if err != nil || conflict == nil {
+		return nil, err
+	}
+	return &childcompletion.SliceConflict{
+		SliceIndex: conflict.SliceIndex,
+		ChildRunID: conflict.ChildRunID,
+		Detail:     conflict.Detail,
+	}, nil
+}
+
 // startPostgres spins up a postgres:16-alpine container via
 // testcontainers-go, applies all migrations, opens a pool, and
 // registers t.Cleanup for both. Skips the test when Docker is
@@ -641,6 +656,12 @@ type recordingGitHub struct {
 		Base string
 	}
 	prURL string
+
+	// Fan-in (#1142) recording + programming.
+	branchSHAs     map[string]string
+	createRefCalls []string
+	mergeCalls     []string
+	mergeErrByHead map[string]error
 }
 
 func (g *recordingGitHub) DispatchWorkflow(context.Context, int64,
@@ -669,6 +690,34 @@ func (g *recordingGitHub) CreatePullRequest(_ context.Context, _ int64,
 func (g *recordingGitHub) ListOpenPullRequestsByHead(context.Context, int64,
 	githubclient.RepoRef, string, string) ([]githubclient.PullRequest, error) {
 	return nil, nil
+}
+
+func (g *recordingGitHub) GetBranchSHA(_ context.Context, _ int64,
+	_ githubclient.RepoRef, branch string) (string, bool, error) {
+	sha, ok := g.branchSHAs[branch]
+	if !ok {
+		return "", false, nil
+	}
+	return sha, true, nil
+}
+
+func (g *recordingGitHub) CreateRef(_ context.Context, _ int64,
+	_ githubclient.RepoRef, branch, sha string) error {
+	g.createRefCalls = append(g.createRefCalls, branch)
+	if g.branchSHAs == nil {
+		g.branchSHAs = map[string]string{}
+	}
+	g.branchSHAs[branch] = sha
+	return nil
+}
+
+func (g *recordingGitHub) MergeBranch(_ context.Context, _ int64,
+	_ githubclient.RepoRef, base, head, _ string) error {
+	g.mergeCalls = append(g.mergeCalls, head)
+	if err, ok := g.mergeErrByHead[head]; ok {
+		return err
+	}
+	return nil
 }
 
 // TestDecomposition_E2E_ConsolidatedPR exercises the #714 / ADR-032 seam
@@ -789,6 +838,195 @@ func TestDecomposition_E2E_ConsolidatedPR(t *testing.T) {
 	}
 	if len(opened) != 1 {
 		t.Errorf("consolidated_pr_opened entries = %d, want 1", len(opened))
+	}
+}
+
+// TestDecomposition_E2E_FanInHappyPath exercises the ADR-041 / #1142 fan-in
+// seam end-to-end (real Postgres): a decomposed parent with TWO disjoint
+// succeeded slices fans in to ONE consolidated branch containing both
+// slices' merges, then opens a single consolidated PR off that branch —
+// the cross-boundary path (settle → orchestrator.IntegrateSlices →
+// githubclient merges → consolidated PR → review dispatch) the per-layer
+// units can't give.
+func TestDecomposition_E2E_FanInHappyPath(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+
+	runRepo := runpkg.NewPostgresRepository(pool)
+	artifactRepo := artifact.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	gh := &recordingGitHub{branchSHAs: map[string]string{"main": "basesha"}}
+
+	o := &orchestrator.Orchestrator{
+		Runs:       runRepo,
+		Artifacts:  artifactRepo,
+		Audit:      auditRepo,
+		GitHub:     gh,
+		DefaultRef: "main",
+		Logger:     slog.Default(),
+	}
+	sw := &childcompletion.Sweeper{
+		Runs:      runRepo,
+		Audit:     auditRepo,
+		Advance:   advancerAdapter{o: o},
+		Integrate: advancerAdapter{o: o},
+		Logger:    slog.Default(),
+	}
+
+	installID := int64(4242)
+	fx := seedParentRun(t, ctx, runRepo, artifactRepo, decomposedPlanContent(t), &installID, runpkg.ExecutorHuman, nil)
+	parentID := fx.runID
+
+	if _, err := o.Advance(ctx, parentID); err != nil {
+		t.Fatalf("Advance (fanout): %v", err)
+	}
+	children, err := runRepo.ListRuns(ctx, runpkg.ListRunsFilter{DecomposedFrom: &parentID, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListRuns children: %v", err)
+	}
+	if len(children) != 2 {
+		t.Fatalf("children = %d, want 2", len(children))
+	}
+	for _, child := range children {
+		if _, err := runRepo.TransitionRun(ctx, child.ID, runpkg.StateRunning); err != nil {
+			t.Fatalf("TransitionRun child running: %v", err)
+		}
+		if _, err := runRepo.TransitionRun(ctx, child.ID, runpkg.StateSucceeded); err != nil {
+			t.Fatalf("TransitionRun child succeeded: %v", err)
+		}
+	}
+
+	if err := sw.Tick(ctx); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	consolidated := "fishhawk/run-" + parentID.String()[:8]
+	// The consolidated branch was created from the base, and BOTH slice
+	// branches merged onto it (done-means: one consolidated branch holding
+	// both slices).
+	if len(gh.createRefCalls) != 1 || gh.createRefCalls[0] != consolidated {
+		t.Fatalf("CreateRef calls = %v, want [%s]", gh.createRefCalls, consolidated)
+	}
+	wantMerges := map[string]bool{consolidated + "/slice-0": false, consolidated + "/slice-1": false}
+	if len(gh.mergeCalls) != 2 {
+		t.Fatalf("MergeBranch calls = %v, want 2 slice merges", gh.mergeCalls)
+	}
+	for _, h := range gh.mergeCalls {
+		if _, ok := wantMerges[h]; !ok {
+			t.Errorf("unexpected merge head %q", h)
+		}
+		wantMerges[h] = true
+	}
+	for h, seen := range wantMerges {
+		if !seen {
+			t.Errorf("slice branch %q was not merged", h)
+		}
+	}
+
+	// One consolidated PR off the now-integrated branch + the slices_integrated audit.
+	if len(gh.createCalls) != 1 || gh.createCalls[0].Head != consolidated {
+		t.Fatalf("CreatePullRequest calls = %v, want one with head %s", gh.createCalls, consolidated)
+	}
+	integrated, err := auditRepo.ListForRunByCategory(ctx, parentID, "slices_integrated")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory slices_integrated: %v", err)
+	}
+	if len(integrated) != 1 {
+		t.Errorf("slices_integrated entries = %d, want 1", len(integrated))
+	}
+}
+
+// TestDecomposition_E2E_FanInConflict exercises the conflict branch: a
+// slice whose merge 409s fails the parent implement stage recoverable
+// (category-B) with the slice_integration_conflict audit present, and
+// opens NO consolidated PR.
+func TestDecomposition_E2E_FanInConflict(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+
+	runRepo := runpkg.NewPostgresRepository(pool)
+	artifactRepo := artifact.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	gh := &recordingGitHub{branchSHAs: map[string]string{"main": "basesha"}}
+
+	o := &orchestrator.Orchestrator{
+		Runs:       runRepo,
+		Artifacts:  artifactRepo,
+		Audit:      auditRepo,
+		GitHub:     gh,
+		DefaultRef: "main",
+		Logger:     slog.Default(),
+	}
+	sw := &childcompletion.Sweeper{
+		Runs:      runRepo,
+		Audit:     auditRepo,
+		Advance:   advancerAdapter{o: o},
+		Integrate: advancerAdapter{o: o},
+		Logger:    slog.Default(),
+	}
+
+	installID := int64(4242)
+	fx := seedParentRun(t, ctx, runRepo, artifactRepo, decomposedPlanContent(t), &installID, runpkg.ExecutorHuman, nil)
+	parentID := fx.runID
+
+	if _, err := o.Advance(ctx, parentID); err != nil {
+		t.Fatalf("Advance (fanout): %v", err)
+	}
+	children, err := runRepo.ListRuns(ctx, runpkg.ListRunsFilter{DecomposedFrom: &parentID, Limit: 100})
+	if err != nil {
+		t.Fatalf("ListRuns children: %v", err)
+	}
+	for _, child := range children {
+		if _, err := runRepo.TransitionRun(ctx, child.ID, runpkg.StateRunning); err != nil {
+			t.Fatalf("TransitionRun child running: %v", err)
+		}
+		if _, err := runRepo.TransitionRun(ctx, child.ID, runpkg.StateSucceeded); err != nil {
+			t.Fatalf("TransitionRun child succeeded: %v", err)
+		}
+	}
+
+	// Slice-1's branch fails to merge (an overlapping change).
+	consolidated := "fishhawk/run-" + parentID.String()[:8]
+	gh.mergeErrByHead = map[string]error{consolidated + "/slice-1": githubclient.ErrMergeConflict}
+
+	if err := sw.Tick(ctx); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	// The parent implement stage failed recoverable (category-B).
+	stages, err := runRepo.ListStagesForRun(ctx, parentID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun: %v", err)
+	}
+	var implStage *runpkg.Stage
+	for _, s := range stages {
+		if s.Type == runpkg.StageTypeImplement {
+			implStage = s
+			break
+		}
+	}
+	if implStage == nil {
+		t.Fatal("implement stage not found")
+	}
+	if implStage.State != runpkg.StageStateFailed {
+		t.Fatalf("implement stage = %q, want failed", implStage.State)
+	}
+	if implStage.FailureCategory == nil || *implStage.FailureCategory != runpkg.FailureB {
+		t.Errorf("failure category = %v, want B (recoverable)", implStage.FailureCategory)
+	}
+
+	// No consolidated PR opened on a conflict.
+	if len(gh.createCalls) != 0 {
+		t.Errorf("CreatePullRequest calls = %d, want 0 on conflict", len(gh.createCalls))
+	}
+
+	// slice_integration_conflict audit present.
+	conflicts, err := auditRepo.ListForRunByCategory(ctx, parentID, "slice_integration_conflict")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory slice_integration_conflict: %v", err)
+	}
+	if len(conflicts) != 1 {
+		t.Errorf("slice_integration_conflict entries = %d, want 1", len(conflicts))
 	}
 }
 

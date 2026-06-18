@@ -993,11 +993,12 @@ func runServe(args []string, logSink io.Writer) int {
 			logger.Warn("--enable-child-completion-sweeper set but Orchestrator unconfigured; sweeper not started")
 		default:
 			sweeper := &childcompletion.Sweeper{
-				Runs:     cfg.RunRepo,
-				Audit:    cfg.AuditRepo,
-				Advance:  childCompletionAdvancer{cfg.Orchestrator},
-				Logger:   logger,
-				Interval: *childCompletionInterval,
+				Runs:      cfg.RunRepo,
+				Audit:     cfg.AuditRepo,
+				Advance:   childCompletionAdvancer{cfg.Orchestrator},
+				Integrate: childCompletionAdvancer{cfg.Orchestrator},
+				Logger:    logger,
+				Interval:  *childCompletionInterval,
 			}
 			go func() {
 				if err := sweeper.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -1129,6 +1130,25 @@ func (a childCompletionAdvancer) Advance(ctx context.Context, runID uuid.UUID) e
 	}
 	_, err := a.o.Advance(ctx, runID)
 	return err
+}
+
+// IntegrateSlices satisfies childcompletion.Integrator by delegating to
+// the orchestrator's fan-in step (ADR-041 / #1142) and converting the
+// orchestrator's *SliceConflict to childcompletion's identical type — the
+// bridge that keeps childcompletion's import graph free of orchestrator.
+func (a childCompletionAdvancer) IntegrateSlices(ctx context.Context, parentRunID uuid.UUID) (*childcompletion.SliceConflict, error) {
+	if a.o == nil {
+		return nil, nil
+	}
+	conflict, err := a.o.IntegrateSlices(ctx, parentRunID)
+	if err != nil || conflict == nil {
+		return nil, err
+	}
+	return &childcompletion.SliceConflict{
+		SliceIndex: conflict.SliceIndex,
+		ChildRunID: conflict.ChildRunID,
+		Detail:     conflict.Detail,
+	}, nil
 }
 
 // advanceFuncFor wraps the orchestrator's Advance method as a plain

@@ -63,6 +63,14 @@ var (
 	// settle. Distinct from ErrValidation so the caller can switch on
 	// it without re-parsing the 422 body.
 	ErrPullRequestExists = errors.New("githubclient: pull request already exists for head/base")
+	// ErrMergeConflict means MergeBranch hit a 409 — the head branch
+	// could not be merged into the base because of a merge conflict.
+	// The fan-in integration step (ADR-041 / #1142) switches on this to
+	// fail the decomposed parent's implement stage category-B RECOVERABLE
+	// (a dedicated slice_integration_conflict audit + next_action) rather
+	// than treating it as an opaque error. Distinct from ErrValidation so
+	// the caller distinguishes a genuine conflict from a malformed request.
+	ErrMergeConflict = errors.New("githubclient: merge conflict")
 )
 
 // RepoRef identifies a GitHub repository by owner + name.
@@ -1093,6 +1101,192 @@ func (c *Client) ForceUpdateRef(ctx context.Context, installationID int64,
 	}
 	defer func() { _ = resp.Body.Close() }()
 	return classifyStatus("force-update ref", resp)
+}
+
+// GetBranchSHA resolves a branch ref to its tip commit SHA (ADR-041 /
+// #1142). It is the fan-in step's existence probe: the orchestrator reads
+// the run's base ref to seed the consolidated branch, and probes the
+// consolidated branch itself to decide whether to create it.
+//
+//	GET /repos/{owner}/{repo}/git/ref/heads/{branch}
+//
+// Returns (sha, true, nil) when the branch exists, ("", false, nil) on a
+// 404 (the branch is absent — callers branch on absence rather than
+// treating it as a hard error), and a typed error (ErrForbidden /
+// ErrValidation) on other non-2xx responses.
+func (c *Client) GetBranchSHA(ctx context.Context, installationID int64,
+	repo RepoRef, branch string) (string, bool, error) {
+	if c.Tokens == nil {
+		return "", false, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return "", false, errors.New("githubclient: repo owner and name required")
+	}
+	if branch == "" {
+		return "", false, errors.New("githubclient: branch is required")
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/git/ref/heads/" + escapePath(branch))
+	req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+	if err != nil {
+		return "", false, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", false, fmt.Errorf("githubclient: get branch sha: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("get branch sha", resp); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+
+	var body struct {
+		Object struct {
+			SHA string `json:"sha"`
+		} `json:"object"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return "", false, fmt.Errorf("githubclient: decode branch ref: %w", err)
+	}
+	if body.Object.SHA == "" {
+		return "", false, fmt.Errorf("githubclient: branch ref response missing object.sha")
+	}
+	return body.Object.SHA, true, nil
+}
+
+// CreateRef creates a new branch ref pointing at sha (ADR-041 / #1142).
+// The fan-in step calls it to create the consolidated branch
+// fishhawk/run-<parent> from the run's base ref when it does not yet
+// exist (under E24.1 / #1141 NOBODY creates that branch — each child
+// pushes only its own slice branch).
+//
+//	POST /repos/{owner}/{repo}/git/refs
+//	{ "ref": "refs/heads/<branch>", "sha": "<sha>" }
+//
+// A 422 whose body indicates the reference already exists is treated as a
+// benign idempotent no-op (returns nil): a re-entrant settle (the sweeper
+// + event-driven race, or a retry after a non-conflict error) must not
+// fail because a prior fan-in pass already created the branch. Returns
+// ErrNotFound when the repo isn't visible, ErrForbidden on auth issues,
+// ErrValidation for other 422s.
+func (c *Client) CreateRef(ctx context.Context, installationID int64,
+	repo RepoRef, branch, sha string) error {
+	if c.Tokens == nil {
+		return errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return errors.New("githubclient: repo owner and name required")
+	}
+	if branch == "" {
+		return errors.New("githubclient: branch is required")
+	}
+	if sha == "" {
+		return errors.New("githubclient: sha is required")
+	}
+
+	raw, err := json.Marshal(map[string]string{
+		"ref": "refs/heads/" + branch,
+		"sha": sha,
+	})
+	if err != nil {
+		return fmt.Errorf("githubclient: marshal create ref: %w", err)
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) + "/git/refs")
+	req, err := c.buildRequest(ctx, http.MethodPost, endpoint, bytes.NewReader(raw), installationID)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("githubclient: create ref: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Body-sniff the 422 "Reference already exists" case BEFORE
+	// classifyStatus consumes the body: a re-entrant fan-in pass that
+	// finds the consolidated branch already created is a no-op, not a
+	// failure.
+	if resp.StatusCode == http.StatusUnprocessableEntity {
+		brief := readBriefBody(resp.Body)
+		if strings.Contains(strings.ToLower(brief), "already exists") {
+			return nil
+		}
+		return fmt.Errorf("%w: create ref: %s", ErrValidation, brief)
+	}
+	return classifyStatus("create ref", resp)
+}
+
+// MergeBranch performs a server-side git merge of head into base
+// (ADR-041 / #1142). It is the fan-in step's per-slice integration
+// primitive: each succeeded slice branch is merged onto the consolidated
+// branch in ascending slice-index order without a local working tree.
+//
+//	POST /repos/{owner}/{repo}/merges
+//	{ "base": "<base>", "head": "<head>", "commit_message": "<msg>" }
+//
+// Status mapping (GitHub REST "Merge a branch"): 201 = merged (nil),
+// 204 = nothing to merge / base already contains head (nil, idempotent),
+// 409 = ErrMergeConflict, 404 = ErrNotFound (base or head missing),
+// 422 = ErrValidation. The 204 case makes a re-entrant settle a clean
+// no-op once a slice is already integrated.
+func (c *Client) MergeBranch(ctx context.Context, installationID int64,
+	repo RepoRef, base, head, commitMessage string) error {
+	if c.Tokens == nil {
+		return errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return errors.New("githubclient: repo owner and name required")
+	}
+	if base == "" || head == "" {
+		return errors.New("githubclient: merge base and head required")
+	}
+
+	body := map[string]string{"base": base, "head": head}
+	if commitMessage != "" {
+		body["commit_message"] = commitMessage
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("githubclient: marshal merge branch: %w", err)
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) + "/merges")
+	req, err := c.buildRequest(ctx, http.MethodPost, endpoint, bytes.NewReader(raw), installationID)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("githubclient: merge branch: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// 409 is a genuine merge conflict — the fan-in caller switches on the
+	// dedicated sentinel to fail the parent recoverable. Mapped here
+	// before classifyStatus (which has no 409 case).
+	if resp.StatusCode == http.StatusConflict {
+		brief := readBriefBody(resp.Body)
+		return fmt.Errorf("%w: merge %s into %s: %s", ErrMergeConflict, head, base, brief)
+	}
+	// 204 = base already contains head (nothing to merge) — idempotent
+	// success for a re-entrant fan-in pass.
+	if resp.StatusCode == http.StatusNoContent {
+		return nil
+	}
+	return classifyStatus("merge branch", resp)
 }
 
 // CreatePullRequest opens a pull request from head into base (#714 /

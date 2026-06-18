@@ -36,6 +36,28 @@ type Advancer interface {
 	Advance(ctx context.Context, runID uuid.UUID) error
 }
 
+// SliceConflict carries the structured provenance of a slice-branch
+// merge conflict surfaced by the Integrator (ADR-041 / #1142). It mirrors
+// orchestrator.SliceConflict; the serve.go adapter converts between the
+// two so childcompletion need not import orchestrator. The resume target
+// is the structured fields (persisted in the slice_integration_conflict
+// audit payload), never parsed from Detail.
+type SliceConflict struct {
+	SliceIndex int
+	ChildRunID uuid.UUID
+	Detail     string
+}
+
+// Integrator is the slice of orchestrator.Orchestrator the sweeper calls
+// to fan a decomposed parent's succeeded slice branches into its
+// consolidated branch (ADR-041 / E24.2 / #1142) before resolving the
+// awaiting_children stage succeeded. A non-nil *SliceConflict means a
+// slice failed to merge (the parent must fail recoverable). Extracted as
+// an interface for the same import-graph reason as Advancer.
+type Integrator interface {
+	IntegrateSlices(ctx context.Context, parentRunID uuid.UUID) (*SliceConflict, error)
+}
+
 // Sweeper periodically resolves awaiting_children parent stages.
 // All dependencies are required; a nil Repository, Audit, or
 // Advancer is a configuration error rather than a graceful skip
@@ -47,6 +69,13 @@ type Sweeper struct {
 	Advance  Advancer
 	Logger   *slog.Logger
 	Interval time.Duration
+
+	// Integrate fans a decomposed parent's succeeded slice branches into
+	// its consolidated branch before the awaiting_children stage resolves
+	// succeeded (ADR-041 / #1142). Nil-safe: a nil Integrate skips
+	// integration entirely, preserving the pre-#1142 resolve behavior for
+	// dev posture and existing tests.
+	Integrate Integrator
 }
 
 // Run blocks until ctx is cancelled, ticking every Interval to
@@ -183,6 +212,37 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 		target = run.StageStateSucceeded
 	}
 
+	// Fan-in (ADR-041 / #1142): on the all-succeeded path, integrate the
+	// slice branches onto the consolidated branch BEFORE resolving the
+	// stage succeeded — so a merge conflict fails the parent implement
+	// stage recoverable (category-B) rather than silently dropping a
+	// slice. A non-conflict error leaves the stage parked (the next tick
+	// re-enters; merges are idempotent). Nil Integrate skips this entirely
+	// (pre-#1142 behavior).
+	if !anyFailed && s.Integrate != nil {
+		conflict, err := s.Integrate.IntegrateSlices(ctx, parentRunID)
+		switch {
+		case err != nil:
+			return fmt.Errorf("integrate slices: %w", err)
+		case conflict != nil:
+			cat := run.FailureB
+			reason := conflict.Detail
+			if _, terr := s.Runs.TransitionStage(ctx, parentStage.ID, run.StageStateFailed, &run.StageCompletion{
+				FailureCategory: &cat,
+				FailureReason:   &reason,
+			}); terr != nil {
+				return fmt.Errorf("transition parent stage to failed-B on slice conflict: %w", terr)
+			}
+			s.emitSliceIntegrationConflict(ctx, parentRunID, parentStage.ID, conflict)
+			s.logger().LogAttrs(ctx, slog.LevelInfo, "childcompletion: parent failed on slice integration conflict",
+				slog.String("parent_run_id", parentRunID.String()),
+				slog.String("parent_stage_id", parentStage.ID.String()),
+				slog.String("conflicting_child_run_id", conflict.ChildRunID.String()),
+			)
+			return nil
+		}
+	}
+
 	if _, err := s.Runs.TransitionStage(ctx, parentStage.ID, target, completion); err != nil {
 		return fmt.Errorf("transition parent stage to %s: %w", target, err)
 	}
@@ -258,6 +318,38 @@ func (s *Sweeper) emitChildrenSettled(ctx context.Context, parentRunID, parentSt
 		Payload:   payload,
 	}); err != nil {
 		s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: append children_settled",
+			slog.String("error", err.Error()))
+	}
+}
+
+// emitSliceIntegrationConflict writes a slice_integration_conflict audit
+// entry (system actor) when a slice branch fails to merge during fan-in
+// (#1142). The payload carries the STRUCTURED conflict provenance —
+// conflicting_slice_index + conflicting_child_run_id — so the next_actions
+// arm sources the resume target from this entry rather than parsing the
+// stage's free-form failure reason. Best-effort, mirroring
+// emitChildrenSettled.
+func (s *Sweeper) emitSliceIntegrationConflict(ctx context.Context, parentRunID, parentStageID uuid.UUID, conflict *SliceConflict) {
+	payload, err := json.Marshal(map[string]any{
+		"parent_stage_id":          parentStageID.String(),
+		"conflicting_slice_index":  conflict.SliceIndex,
+		"conflicting_child_run_id": conflict.ChildRunID.String(),
+	})
+	if err != nil {
+		s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: marshal slice_integration_conflict payload",
+			slog.String("error", err.Error()))
+		return
+	}
+	systemKind := audit.ActorSystem
+	if _, err := s.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     parentRunID,
+		StageID:   &parentStageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "slice_integration_conflict",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: append slice_integration_conflict",
 			slog.String("error", err.Error()))
 	}
 }
