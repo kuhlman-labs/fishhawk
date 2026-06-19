@@ -244,6 +244,17 @@ type fakeBackend struct {
 	decideAmendmentErr   string
 	decideCalledByID     map[uuid.UUID]int
 
+	// #1231 fixtures: POST /v0/runs/{id}/scope-completeness/decision.
+	// decideScopeCompletenessResp seeds the decided park record keyed by
+	// run id; decideScopeCompletenessBody captures the last decoded body;
+	// *Status / *ErrBody drive the error paths; decideScopeCompletenessCalled
+	// counts decisions per run id.
+	decideScopeCompletenessResp   map[uuid.UUID]ScopeCompletenessDecisionResult
+	decideScopeCompletenessBody   scopeCompletenessDecisionRequest
+	decideScopeCompletenessStatus int
+	decideScopeCompletenessErr    string
+	decideScopeCompletenessCalled map[uuid.UUID]int
+
 	// E22.4 fixtures: POST /v0/stages/{id}/approvals.
 	// approvalsBody captures the last decoded body so tests can
 	// assert decision + comment threading.
@@ -285,61 +296,64 @@ type fakeBackend struct {
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 	t.Helper()
 	fb := &fakeBackend{
-		listStatus:               http.StatusOK,
-		getStatus:                http.StatusOK,
-		stagesStatus:             http.StatusOK,
-		artifactsStatus:          http.StatusOK,
-		auditStatus:              http.StatusOK,
-		perRunAuditStatus:        http.StatusOK,
-		listByQuery:              map[string]listRunsResult{},
-		getRunByID:               map[uuid.UUID]Run{},
-		getRunExtraByID:          map[uuid.UUID]map[string]any{},
-		getStatusByID:            map[uuid.UUID]int{},
-		stagesByRun:              map[uuid.UUID][]Stage{},
-		artifactsByStage:         map[uuid.UUID][]Artifact{},
-		stagesCalledByID:         map[uuid.UUID]int{},
-		artifactsCalledID:        map[uuid.UUID]int{},
-		auditByRun:               map[uuid.UUID][]AuditEntry{},
-		auditCalledByID:          map[uuid.UUID]int{},
-		perRunAuditByRun:         map[uuid.UUID][]AuditEntry{},
-		perRunAuditNextByRun:     map[uuid.UUID]string{},
-		perRunAuditLastQueryByID: map[uuid.UUID]string{},
-		perRunAuditCategoryReads: map[string]int{},
-		createRunStatus:          http.StatusCreated,
-		recoverStatus:            http.StatusCreated,
-		cancelResp:               map[uuid.UUID]Run{},
-		cancelStatus:             http.StatusOK,
-		cancelCalledByID:         map[uuid.UUID]int{},
-		retryResp:                map[uuid.UUID]Stage{},
-		retryStatus:              http.StatusOK,
-		retryCalledByID:          map[uuid.UUID]int{},
-		fixupResp:                map[uuid.UUID]Stage{},
-		fixupStatus:              http.StatusOK,
-		fixupCalledByID:          map[uuid.UUID]int{},
-		clarificationResp:        map[uuid.UUID]Stage{},
-		clarificationStatus:      http.StatusOK,
-		clarificationCalledByID:  map[uuid.UUID]int{},
-		reviseResp:               map[uuid.UUID]Stage{},
-		reviseStatus:             http.StatusOK,
-		reviseCalledByID:         map[uuid.UUID]int{},
-		waiveResp:                map[uuid.UUID]WaivedConcern{},
-		waiveStatus:              http.StatusOK,
-		waiveCalledByID:          map[uuid.UUID]int{},
-		deferResp:                map[uuid.UUID]DeferredConcernResult{},
-		deferStatus:              http.StatusOK,
-		deferCalledByID:          map[uuid.UUID]int{},
-		amendmentsByRun:          map[uuid.UUID][]ScopeAmendmentItem{},
-		amendmentsStatus:         http.StatusOK,
-		decideAmendmentResp:      map[uuid.UUID]ScopeAmendmentItem{},
-		decideAmendmentState:     http.StatusOK,
-		decideCalledByID:         map[uuid.UUID]int{},
-		approvalsResp:            map[uuid.UUID]Stage{},
-		approvalsStatus:          http.StatusOK,
-		approvalsCalledByID:      map[uuid.UUID]int{},
-		calibrationStatus:        http.StatusOK,
-		budgetByRun:              map[uuid.UUID]BudgetStatus{},
-		budgetStatus:             http.StatusOK,
-		budgetCalledByID:         map[uuid.UUID]int{},
+		listStatus:                    http.StatusOK,
+		getStatus:                     http.StatusOK,
+		stagesStatus:                  http.StatusOK,
+		artifactsStatus:               http.StatusOK,
+		auditStatus:                   http.StatusOK,
+		perRunAuditStatus:             http.StatusOK,
+		listByQuery:                   map[string]listRunsResult{},
+		getRunByID:                    map[uuid.UUID]Run{},
+		getRunExtraByID:               map[uuid.UUID]map[string]any{},
+		getStatusByID:                 map[uuid.UUID]int{},
+		stagesByRun:                   map[uuid.UUID][]Stage{},
+		artifactsByStage:              map[uuid.UUID][]Artifact{},
+		stagesCalledByID:              map[uuid.UUID]int{},
+		artifactsCalledID:             map[uuid.UUID]int{},
+		auditByRun:                    map[uuid.UUID][]AuditEntry{},
+		auditCalledByID:               map[uuid.UUID]int{},
+		perRunAuditByRun:              map[uuid.UUID][]AuditEntry{},
+		perRunAuditNextByRun:          map[uuid.UUID]string{},
+		perRunAuditLastQueryByID:      map[uuid.UUID]string{},
+		perRunAuditCategoryReads:      map[string]int{},
+		createRunStatus:               http.StatusCreated,
+		recoverStatus:                 http.StatusCreated,
+		cancelResp:                    map[uuid.UUID]Run{},
+		cancelStatus:                  http.StatusOK,
+		cancelCalledByID:              map[uuid.UUID]int{},
+		retryResp:                     map[uuid.UUID]Stage{},
+		retryStatus:                   http.StatusOK,
+		retryCalledByID:               map[uuid.UUID]int{},
+		fixupResp:                     map[uuid.UUID]Stage{},
+		fixupStatus:                   http.StatusOK,
+		fixupCalledByID:               map[uuid.UUID]int{},
+		clarificationResp:             map[uuid.UUID]Stage{},
+		clarificationStatus:           http.StatusOK,
+		clarificationCalledByID:       map[uuid.UUID]int{},
+		reviseResp:                    map[uuid.UUID]Stage{},
+		reviseStatus:                  http.StatusOK,
+		reviseCalledByID:              map[uuid.UUID]int{},
+		waiveResp:                     map[uuid.UUID]WaivedConcern{},
+		waiveStatus:                   http.StatusOK,
+		waiveCalledByID:               map[uuid.UUID]int{},
+		deferResp:                     map[uuid.UUID]DeferredConcernResult{},
+		deferStatus:                   http.StatusOK,
+		deferCalledByID:               map[uuid.UUID]int{},
+		amendmentsByRun:               map[uuid.UUID][]ScopeAmendmentItem{},
+		amendmentsStatus:              http.StatusOK,
+		decideAmendmentResp:           map[uuid.UUID]ScopeAmendmentItem{},
+		decideAmendmentState:          http.StatusOK,
+		decideCalledByID:              map[uuid.UUID]int{},
+		decideScopeCompletenessResp:   map[uuid.UUID]ScopeCompletenessDecisionResult{},
+		decideScopeCompletenessStatus: http.StatusOK,
+		decideScopeCompletenessCalled: map[uuid.UUID]int{},
+		approvalsResp:                 map[uuid.UUID]Stage{},
+		approvalsStatus:               http.StatusOK,
+		approvalsCalledByID:           map[uuid.UUID]int{},
+		calibrationStatus:             http.StatusOK,
+		budgetByRun:                   map[uuid.UUID]BudgetStatus{},
+		budgetStatus:                  http.StatusOK,
+		budgetCalledByID:              map[uuid.UUID]int{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v0/stages/{stage_id}/approvals", func(w http.ResponseWriter, r *http.Request) {
@@ -582,6 +596,33 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		if !ok {
 			resp = ScopeAmendmentItem{ID: amendmentID.String(), Status: "approved"}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	mux.HandleFunc("POST /v0/runs/{run_id}/scope-completeness/decision", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		runID, perr := uuid.Parse(r.PathValue("run_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var body scopeCompletenessDecisionRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fb.mu.Lock()
+		fb.decideScopeCompletenessCalled[runID]++
+		fb.decideScopeCompletenessBody = body
+		status := fb.decideScopeCompletenessStatus
+		errBody := fb.decideScopeCompletenessErr
+		resp, ok := fb.decideScopeCompletenessResp[runID]
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if !ok {
+			resp = ScopeCompletenessDecisionResult{RunID: runID.String(), Decision: body.Decision}
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -1182,7 +1223,7 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	const minDescriptionLen = 80
 	// The registered tool set is the fishhawk_* tools swept in #778. Bump
 	// this and give the new tool a conformant description when adding one.
-	const wantToolCount = 30
+	const wantToolCount = 31
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

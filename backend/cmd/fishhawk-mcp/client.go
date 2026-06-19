@@ -760,6 +760,63 @@ func (c *apiClient) ConsolidateRun(ctx context.Context, id uuid.UUID) (*Consolid
 	return &res, nil
 }
 
+// ScopeCompletenessDecisionResult mirrors the backend's scope-completeness
+// decision 200 body (`backend/internal/server/scope_completeness.go` — SLICE
+// 1, #1231): the resolved park record. State is the implement stage's
+// resulting state (running/succeeded on exempt as the held commit's PR opens,
+// failed on a category-B fail). HeldCommitSHA is the exact gate-verified
+// commit the runner pushed to the run branch at park time; PullRequestURL is
+// set only on exempt, when the backend opens the PR from that held commit
+// with NO agent re-invocation. MissingPaths echoes the declared scope paths
+// the #1151 shortfall gate flagged. Repeated here rather than imported — the
+// MCP server's apiClient is deliberately a thin local copy (import direction
+// is `cli → backend`, not the reverse). MUST stay byte-identical with the
+// backend handler's response shape.
+type ScopeCompletenessDecisionResult struct {
+	RunID          string   `json:"run_id"`
+	StageID        string   `json:"stage_id"`
+	Decision       string   `json:"decision"`
+	State          string   `json:"state"`
+	HeldCommitSHA  string   `json:"held_commit_sha"`
+	RunBranch      string   `json:"run_branch,omitempty"`
+	MissingPaths   []string `json:"missing_paths,omitempty"`
+	PullRequestURL string   `json:"pull_request_url,omitempty"`
+}
+
+// scopeCompletenessDecisionRequest mirrors the backend's decision body
+// (`backend/internal/server/scope_completeness.go::scopeCompletenessDecisionRequest`
+// — SLICE 1, #1231). Both fields are required: the backend rejects a decision
+// other than exempt/fail and an empty reason with 400.
+type scopeCompletenessDecisionRequest struct {
+	Decision string `json:"decision"`
+	Reason   string `json:"reason"`
+}
+
+// DecideScopeCompleteness resolves an implement stage parked in
+// awaiting_scope_decision via
+// `POST /v0/runs/{run_id}/scope-completeness/decision` (#1231). decision is
+// "exempt" (open the PR from the held commit with NO agent re-run) or "fail"
+// (fall through to category-B); reason is required. Operator-token-only
+// (write:stages); the backend rejects run-bound agent tokens
+// (run_token_forbidden). 4xx surfaces:
+//   - 400 validation_failed (decision not exempt/fail, empty reason)
+//   - 403 run_token_forbidden (a run-bound agent token attempted the decision)
+//   - 403 insufficient_scope (token lacks write:stages)
+//   - 404 run_not_found
+//   - 409 scope_completeness_not_parked (the stage is not parked in
+//     awaiting_scope_decision)
+func (c *apiClient) DecideScopeCompleteness(ctx context.Context, runID uuid.UUID, decision, reason string) (*ScopeCompletenessDecisionResult, error) {
+	body, err := json.Marshal(scopeCompletenessDecisionRequest{Decision: decision, Reason: reason})
+	if err != nil {
+		return nil, fmt.Errorf("marshal scope-completeness decision: %w", err)
+	}
+	var res ScopeCompletenessDecisionResult
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/scope-completeness/decision", body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // CancelRun transitions a run to the cancelled state via
 // `POST /v0/runs/{run_id}/cancel`. Idempotent: cancelling an already-
 // cancelled run returns 200 with the same body. 4xx surfaces:
