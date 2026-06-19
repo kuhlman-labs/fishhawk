@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -292,15 +294,26 @@ func TestDispatchStage_InvalidUUIDsErrorBeforeSpawn(t *testing.T) {
 // --- no-pipe-deadlock: high-output detached runner ---
 
 // TestDispatchStage_HighOutputDoesNotBlock asserts the redirect-to-file
-// decision: a fake runner emitting far more than a pipe's kernel buffer
-// (~64KiB) still lets the handler return promptly, because the detached child's
-// stdout/stderr go to a log FILE, not an unread pipe that would block the
-// writer once full.
+// decision is load-bearing: a fake runner emitting far more than a pipe's
+// kernel buffer (~64KiB) (a) lets the handler return promptly AND (b) actually
+// FINISHES writing ALL of its output. The second assertion is what makes the
+// test non-vacuous: an implementation that attached stdout/stderr to an UNREAD
+// pipe would also let cmd.Start and the handler return promptly, but the child
+// would block forever once the ~64KiB pipe buffer filled and would never write
+// the full ~203KiB. By waiting for the log file to reach the complete output
+// size we prove the writer got past the pipe-buffer block point — i.e. the
+// no-pipe-deadlock mitigation, not merely a prompt return.
 func TestDispatchStage_HighOutputDoesNotBlock(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
-	// Emit ~200KiB of output (well over a 64KiB pipe buffer) then exit. A pipe
-	// with no reader would block the writer; a file does not.
+	// 3200 lines of 64 'x' + newline = 65 bytes each = 208000 bytes (~203KiB),
+	// well over a 64KiB pipe buffer. A pipe with no reader would block the writer
+	// at ~64KiB; a file does not, so the full byte count must eventually land.
+	const (
+		lineBytes  = 65
+		lineCount  = 3200
+		wantOutput = lineBytes * lineCount
+	)
 	withFakeRunner(t, `i=0; while [ $i -lt 3200 ]; do printf '%s\n' 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; i=$((i+1)); done`)
 
 	runID := uuid.New()
@@ -322,8 +335,102 @@ func TestDispatchStage_HighOutputDoesNotBlock(t *testing.T) {
 		t.Errorf("dispatch took %v with a high-output runner; the redirect-to-file must not block", elapsed)
 	}
 	if out.LogPath == "" {
-		t.Error("LogPath should be set")
+		t.Fatal("LogPath should be set")
 	}
+
+	// The detached child writes asynchronously; poll the log until it reaches the
+	// full output size. If output went to an unread pipe the writer would deadlock
+	// at the kernel buffer (~64KiB) and the file would never reach wantOutput.
+	deadline := time.Now().Add(5 * time.Second)
+	var size int64
+	for time.Now().Before(deadline) {
+		fi, statErr := os.Stat(out.LogPath)
+		if statErr == nil {
+			size = fi.Size()
+			if size >= wantOutput {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if size < wantOutput {
+		t.Errorf("log reached only %d bytes, want >= %d: the high-output writer did not finish, "+
+			"i.e. it blocked on a full pipe instead of redirecting to a file", size, wantOutput)
+	}
+}
+
+// --- repo soft-fail: github_repo empty + origin auto-detect fails ---
+
+// TestDispatchStage_RepoDetectSoftFail exercises the empty-github_repo branch
+// that mirrors run_stage's soft-fail rule: when origin auto-detect fails,
+// push_and_open_pr=true is a hard error (a PR needs a repo) while
+// push_and_open_pr=false appends a warning and proceeds to spawn. The other
+// dispatch tests all set github_repo:"x/y", so this is the only case that runs
+// runStageDetectGitHubRepo.
+func TestDispatchStage_RepoDetectSoftFail(t *testing.T) {
+	t.Run("push true is a hard error", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		withFakeRunner(t, "exit 0")
+		// Detector fails (no github origin). A spawn here would be the bug.
+		withFakeGitRemote(t, "", errors.New("no origin"))
+		spawned := false
+		origCmd := runStageCommand
+		runStageCommand = func(_ string, _ ...string) *exec.Cmd {
+			spawned = true
+			return exec.Command("sh", "-c", "exit 0")
+		}
+		t.Cleanup(func() { runStageCommand = origCmd })
+
+		// Seed a stage so stage resolution (step 2) succeeds and execution reaches
+		// the repo-detect branch (step 4) — the path under test.
+		runID := uuid.New()
+		stageID := uuid.New()
+		seedStageOfType(fb, runID, stageID, "implement", "pending")
+
+		_, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+			RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+			PushAndOpenPR: boolPtr(true),
+		})
+		if err == nil || !strings.Contains(err.Error(), "could not detect from origin") {
+			t.Fatalf("expected a hard repo-detect error when push_and_open_pr=true, got %v", err)
+		}
+		if spawned {
+			t.Error("the runner must not be spawned when repo detection fails under push_and_open_pr=true")
+		}
+	})
+
+	t.Run("push false warns and proceeds", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		withFakeRunner(t, "exit 0")
+		withFakeGitRemote(t, "", errors.New("no origin"))
+
+		runID := uuid.New()
+		stageID := uuid.New()
+		seedStageOfType(fb, runID, stageID, "implement", "running")
+
+		_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+			RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+			PushAndOpenPR: boolPtr(false),
+		})
+		if err != nil {
+			t.Fatalf("dispatchStage should soft-fail (warn + proceed) when push_and_open_pr=false: %v", err)
+		}
+		if out.StageID != stageID.String() {
+			t.Errorf("StageID = %q, want %q (the handle is still returned)", out.StageID, stageID.String())
+		}
+		found := false
+		for _, w := range out.Warnings {
+			if strings.Contains(w, "origin auto-detect failed") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected an origin-auto-detect-failed warning, got %v", out.Warnings)
+		}
+	})
 }
 
 // --- MCP CallTool round-trip (schema binding, approval condition 2) ---

@@ -718,7 +718,11 @@ func spawnRunnerStageDetached(binary string, argv, env []string, runID, stageID 
 
 	logPath := filepath.Join(os.TempDir(),
 		fmt.Sprintf("fishhawk-runner-%s-%s-%d.log", runID, stageID, time.Now().UnixNano()))
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	// 0o600 (owner-only): the runner's raw stdout/stderr can carry repo content
+	// and is NOT redacted on this stream (only the trace-bundle variant is), so a
+	// world-readable file under a shared /tmp would let other local users read an
+	// unredacted diagnostic. No token is written (FISHHAWK_API_TOKEN rides in env).
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("open detached runner log %s: %w", logPath, err)
 	}
