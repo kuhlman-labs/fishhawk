@@ -40,6 +40,37 @@ func startedEntry(seq int64, stageType string) *audit.Entry {
 	return &audit.Entry{Sequence: seq, Category: stageType + "_review_started", Timestamp: time.Unix(seq, 0).UTC()}
 }
 
+// TestRenderAnchorBody_SliceIntegrationTimeline pins #1147: the fan-in
+// outcome audit kinds surface in the living-anchor timeline (which reuses
+// pickActivity + renderActivityLine), so a decomposed parent's clean
+// integration / conflict shows up in the anchor.
+func TestRenderAnchorBody_SliceIntegrationTimeline(t *testing.T) {
+	cases := []struct {
+		category string
+		want     string
+	}{
+		{"slices_integrated", "Slices integrated"},
+		{"slice_integration_conflict", "Slice integration conflict"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.category, func(t *testing.T) {
+			entries := []*audit.Entry{
+				{Sequence: 5, Category: tc.category, Timestamp: time.Unix(5, 0).UTC()},
+			}
+			body := RenderAnchorBody(AnchorInput{
+				Run:         anchorRun(),
+				Stages:      []*run.Stage{{Type: run.StageTypeImplement, State: run.StageStateRunning}},
+				Audit:       entries,
+				ExternalURL: "https://app.example",
+				Now:         time.Unix(1000, 0).UTC(),
+			})
+			if !strings.Contains(body, tc.want) {
+				t.Errorf("anchor timeline missing %q:\n%s", tc.want, body)
+			}
+		})
+	}
+}
+
 func TestRenderAnchorBody_HeaderAndWhatNow(t *testing.T) {
 	body := RenderAnchorBody(AnchorInput{
 		Run:         anchorRun(),

@@ -906,6 +906,16 @@ type GetRunStatusOutput struct {
 	// gates the run. For drive-enabled runs the drive next_action is
 	// folded in as the first entry so the two surfaces agree.
 	NextActions *NextActions `json:"next_actions,omitempty" jsonschema:"server-suggested next actions (#1024): the classified run lifecycle state plus the legal next moves — each entry names the tool to call (with key params), its precondition, what it consumes (none, fixup_budget, retry_budget, approval_slot, new_run), and a one-line reason. Every non-terminal run carries at least one action; terminal runs carry the state with no actions. Display-only — never gates the run"`
+	// ChildrenStatus is the decomposed-parent per-child + integration-phase
+	// view (#1147): each child's live lifecycle state in slice-index order
+	// plus the fan-in phase classified from the slices_integrated /
+	// slice_integration_conflict audit kinds. Best-effort — a per-child read
+	// failure degrades that child to state="unknown" rather than failing the
+	// snapshot. Cost-gated: fetched only for a decomposed parent (no
+	// parent_run_id, plus an awaiting_children implement stage or a
+	// decomposition audit marker in the recent window), so ordinary runs pay
+	// nothing. Omitted for non-decomposed runs.
+	ChildrenStatus *ChildrenStatus `json:"children_status,omitempty" jsonschema:"decomposed-parent per-child status + fan-in phase (#1147): children[] lists each child's live state (pending/running/succeeded/failed/unknown) in slice-index order; integration_phase is running_children, ready_to_integrate, integrated, or integration_conflict; consolidated_branch / conflicting_child_run_id surface the fan-in outcome. Best-effort (a child read failure yields state=unknown, never fails the snapshot). Omitted for non-decomposed runs"`
 }
 
 // registerGetRunStatus wires the fishhawk_get_run_status tool. The
@@ -1002,6 +1012,18 @@ category, review pending, open concerns, the merge ritual, the
 concern state, so the two surfaces cannot disagree. On drive-enabled
 runs the drive next_action folds in as the first entry. Display-only —
 never gates the run.
+
+Also returns children_status for a DECOMPOSED PARENT (#1147): children[]
+lists each child's live lifecycle state (pending/running/succeeded/failed,
+or unknown when a per-child read failed) in slice-index order, and
+integration_phase classifies the fan-in — running_children (a child is
+still in flight), ready_to_integrate (all children succeeded, no fan-in
+yet), integrated (a slices_integrated audit recorded a clean fan-in, with
+consolidated_branch), or integration_conflict (a slice_integration_conflict
+audit recorded a merge conflict, with conflicting_child_run_id). Cost-gated:
+fetched only for a decomposed parent (an awaiting_children implement stage
+or a decomposition audit marker), so ordinary runs make zero extra calls.
+Best-effort — never gates the run; omitted for non-decomposed runs.
 `),
 	}, resolver.getRunStatus)
 }
@@ -1078,6 +1100,16 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	// round-trip, never fails the snapshot.
 	nextActions := nextActionsFor(runRow, stages, planReviewStatus, implementReviewStatus, reviewActionHint, view.driveStatus())
 
+	// Best-effort decomposed-parent children status (#1147). Cost-gated so an
+	// ordinary run pays nothing: only a decomposed parent (no parent_run_id,
+	// plus an awaiting_children implement stage OR a decomposition marker in
+	// the recent-audit window) triggers the bounded per-child fetch. On a
+	// fetch error the field stays nil — never fails the snapshot.
+	var childrenStatus *ChildrenStatus
+	if shouldFetchChildrenStatus(runRow, stages, recent) {
+		childrenStatus, _ = r.childrenStatusFor(ctx, runID, recent)
+	}
+
 	return nil, GetRunStatusOutput{
 		Run:                      *runRow,
 		Stages:                   stages,
@@ -1092,7 +1124,37 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 		ImplementReviewMergeHint: implementReviewMergeHint(implementReviewStatus),
 		DriveStatus:              view.driveStatus(),
 		NextActions:              nextActions,
+		ChildrenStatus:           childrenStatus,
 	}, nil
+}
+
+// decompositionAuditCategories are the recent-audit markers that, present on a
+// top-level run, signal it is a decomposed parent whose children-status block
+// is worth the bounded per-child fetch (#1147).
+var decompositionAuditCategories = map[string]struct{}{
+	"plan_decomposed":            {},
+	"slices_integrated":          {},
+	"slice_integration_conflict": {},
+}
+
+// shouldFetchChildrenStatus is the cost gate for the decomposed-parent
+// children-status block (#1147). It returns true only for a top-level run
+// (no parent_run_id) whose implement stage is awaiting_children OR whose
+// recent-audit window carries a decomposition marker. A non-decomposed run
+// returns false, so it makes zero extra calls (no LatestPlanDecomposed read).
+func shouldFetchChildrenStatus(run *Run, stages []Stage, recent []AuditEntry) bool {
+	if run == nil || (run.ParentRunID != nil && *run.ParentRunID != "") {
+		return false
+	}
+	if impl := stageByType(stages, "implement"); impl != nil && impl.State == "awaiting_children" {
+		return true
+	}
+	for i := range recent {
+		if _, ok := decompositionAuditCategories[recent[i].Category]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // stageIDOfType returns the UUID of the first stage of the given type in the

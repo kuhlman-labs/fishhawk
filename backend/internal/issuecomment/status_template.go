@@ -131,6 +131,12 @@ var activityCategories = map[string]struct{}{
 	"pr_merged":                   {},
 	"pr_closed_without_merge":     {},
 	"stage_retried":               {},
+	// Fan-in outcome of a decomposed parent (E24.7 / #1147). These are
+	// system-actor audit kinds (ADR-041 / #1142) with no dedicated Notifier
+	// method; they render data-drivenly through this activity set so the
+	// living-anchor timeline reflects whether the slices integrated cleanly.
+	"slices_integrated":          {},
+	"slice_integration_conflict": {},
 }
 
 // renderActivityLine returns a user-readable verb-phrase for an
@@ -165,6 +171,10 @@ func renderActivityLine(e *audit.Entry) string {
 		return fmt.Sprintf("%s closed the PR without merging", actor)
 	case "stage_retried":
 		return "Stage retried"
+	case "slices_integrated":
+		return "Slices integrated"
+	case "slice_integration_conflict":
+		return "Slice integration conflict"
 	default:
 		if actor == "" {
 			return e.Category

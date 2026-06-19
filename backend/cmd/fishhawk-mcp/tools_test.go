@@ -48,6 +48,11 @@ type fakeBackend struct {
 	// runDriveView decodes from the same body.
 	getRunExtraByID map[uuid.UUID]map[string]any
 
+	// getStatusByID overrides the GET /v0/runs/{id} status for a single
+	// id (#1147), so a children-status best-effort test can fail ONE
+	// child's GetRun (404) while its siblings resolve.
+	getStatusByID map[uuid.UUID]int
+
 	// Per-call response overrides keyed by query string for tests
 	// that exercise multiple resolution paths in one server.
 	listByQuery map[string]listRunsResult
@@ -78,6 +83,11 @@ type fakeBackend struct {
 	perRunAuditNextByRun     map[uuid.UUID]string
 	perRunAuditStatus        int
 	perRunAuditLastQueryByID map[uuid.UUID]string
+
+	// #1147: counts per-run audit reads by category so the children-status
+	// cost-gate test can assert a non-decomposed run issues no
+	// plan_decomposed read.
+	perRunAuditCategoryReads map[string]int
 
 	// reviewFlip, when non-nil, is invoked under fb.mu on every per-run
 	// audit request with the requested category. The fishhawk_await_review
@@ -278,6 +288,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		listByQuery:              map[string]listRunsResult{},
 		getRunByID:               map[uuid.UUID]Run{},
 		getRunExtraByID:          map[uuid.UUID]map[string]any{},
+		getStatusByID:            map[uuid.UUID]int{},
 		stagesByRun:              map[uuid.UUID][]Stage{},
 		artifactsByStage:         map[uuid.UUID][]Artifact{},
 		stagesCalledByID:         map[uuid.UUID]int{},
@@ -287,6 +298,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		perRunAuditByRun:         map[uuid.UUID][]AuditEntry{},
 		perRunAuditNextByRun:     map[uuid.UUID]string{},
 		perRunAuditLastQueryByID: map[uuid.UUID]string{},
+		perRunAuditCategoryReads: map[string]int{},
 		createRunStatus:          http.StatusCreated,
 		recoverStatus:            http.StatusCreated,
 		cancelResp:               map[uuid.UUID]Run{},
@@ -677,8 +689,17 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.mu.Lock()
 		row, ok := fb.getRunByID[id]
 		extra := fb.getRunExtraByID[id]
+		status := fb.getStatus
+		if override, has := fb.getStatusByID[id]; has {
+			status = override
+		}
 		fb.mu.Unlock()
-		w.WriteHeader(fb.getStatus)
+		if status >= 400 {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"code":"run_not_found","message":"not found"}`))
+			return
+		}
+		w.WriteHeader(status)
 		if ok {
 			if len(extra) > 0 {
 				// Overlay the extra top-level fields the typed Run
@@ -720,6 +741,9 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		fb.mu.Lock()
 		fb.perRunAuditLastQueryByID[id] = r.URL.RawQuery
+		if cat := r.URL.Query().Get("category"); cat != "" {
+			fb.perRunAuditCategoryReads[cat]++
+		}
 		if fb.reviewFlip != nil {
 			fb.reviewFlip(r.URL.Query().Get("category"))
 		}
@@ -4884,5 +4908,145 @@ func TestGetPlan_ScopePrecheck_OlderBackendWithoutCapDecodes(t *testing.T) {
 	}
 	if out.ScopePrecheck.MaxFilesChanged != 0 {
 		t.Errorf("MaxFilesChanged = %d, want 0 for an older-backend payload", out.ScopePrecheck.MaxFilesChanged)
+	}
+}
+
+// TestGetRunStatus_ChildrenStatus_DecomposedParent drives the full
+// get_run_status handler against a decomposed parent parked at
+// awaiting_children (#1147): the cost gate fires off the awaiting_children
+// implement stage, the per-child GetRun fan-out resolves each slice, and the
+// snapshot carries a children_status block with the phase + per-child state.
+func TestGetRunStatus_ChildrenStatus_DecomposedParent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	parent := uuid.New()
+	fb.getRunByID[parent] = Run{ID: parent.String(), Repo: "x/y", State: "running"}
+	fb.stagesByRun[parent] = []Stage{
+		{ID: uuid.NewString(), RunID: parent.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: parent.String(), Sequence: 2, Type: "implement", State: "awaiting_children"},
+	}
+	c0, c1 := uuid.New(), uuid.New()
+	seedChildRun(fb, c0, "succeeded")
+	seedChildRun(fb, c1, "running")
+	seedPlanDecomposed(fb, parent, []string{c0.String(), c1.String()}, 2)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: parent.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.ChildrenStatus == nil {
+		t.Fatal("ChildrenStatus is nil, want the decomposed-parent block")
+	}
+	if out.ChildrenStatus.IntegrationPhase != "running_children" {
+		t.Errorf("phase = %q, want running_children", out.ChildrenStatus.IntegrationPhase)
+	}
+	if out.ChildrenStatus.Total != 2 || out.ChildrenStatus.Succeeded != 1 || out.ChildrenStatus.Running != 1 {
+		t.Errorf("counts total=%d succeeded=%d running=%d, want 2/1/1",
+			out.ChildrenStatus.Total, out.ChildrenStatus.Succeeded, out.ChildrenStatus.Running)
+	}
+	if out.ChildrenStatus.Children[0].SliceIndex != 0 || out.ChildrenStatus.Children[1].SliceIndex != 1 {
+		t.Errorf("slice indices = [%d %d], want [0 1]",
+			out.ChildrenStatus.Children[0].SliceIndex, out.ChildrenStatus.Children[1].SliceIndex)
+	}
+	// next_actions surfaces the dedicated implement_awaiting_children arm.
+	if out.NextActions == nil || out.NextActions.State != "implement_awaiting_children" {
+		t.Fatalf("next_actions state = %+v, want implement_awaiting_children", out.NextActions)
+	}
+}
+
+// TestGetRunStatus_ChildrenStatus_NonDecomposed_NoRead asserts the cost gate:
+// an ordinary run carries no children_status AND triggers no plan_decomposed
+// audit read (#1147).
+func TestGetRunStatus_ChildrenStatus_NonDecomposed_NoRead(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "running"},
+	}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.ChildrenStatus != nil {
+		t.Errorf("ChildrenStatus = %+v, want nil for a non-decomposed run", out.ChildrenStatus)
+	}
+	fb.mu.Lock()
+	reads := fb.perRunAuditCategoryReads["plan_decomposed"]
+	fb.mu.Unlock()
+	if reads != 0 {
+		t.Errorf("plan_decomposed audit reads = %d, want 0 (cost gate must not read it for a non-decomposed run)", reads)
+	}
+}
+
+// TestGetRunStatus_ChildrenStatus_IntegratedAfterAwaitingChildren asserts the
+// integrated phase is still detected after a clean fan-in moved the parent's
+// implement stage OUT of awaiting_children: the gate keys additionally on the
+// slices_integrated marker in the recent-audit window (#1147).
+func TestGetRunStatus_ChildrenStatus_IntegratedAfterAwaitingChildren(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	parent := uuid.New()
+	fb.getRunByID[parent] = Run{ID: parent.String(), Repo: "x/y", State: "running"}
+	fb.stagesByRun[parent] = []Stage{
+		{ID: uuid.NewString(), RunID: parent.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: parent.String(), Sequence: 2, Type: "implement", State: "succeeded"},
+	}
+	c0, c1 := uuid.New(), uuid.New()
+	seedChildRun(fb, c0, "succeeded")
+	seedChildRun(fb, c1, "succeeded")
+	childIDs := []string{c0.String(), c1.String()}
+	seedPlanDecomposed(fb, parent, childIDs, 2)
+	// The slices_integrated marker lands in the cross-chain recent-audit feed.
+	fb.auditByRun[parent] = []AuditEntry{slicesIntegratedEntry(parent, "fishhawk/consolidated-x", childIDs)}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: parent.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.ChildrenStatus == nil {
+		t.Fatal("ChildrenStatus is nil, want it surfaced from the slices_integrated marker")
+	}
+	if out.ChildrenStatus.IntegrationPhase != "integrated" {
+		t.Errorf("phase = %q, want integrated", out.ChildrenStatus.IntegrationPhase)
+	}
+	if out.ChildrenStatus.ConsolidatedBranch != "fishhawk/consolidated-x" {
+		t.Errorf("consolidated_branch = %q, want fishhawk/consolidated-x", out.ChildrenStatus.ConsolidatedBranch)
+	}
+}
+
+// TestGetRunStatus_ChildrenStatus_DecodeError_StillSnapshots asserts the
+// best-effort swallow (#1147): when childrenStatusFor errors (a corrupt
+// plan_decomposed payload), get_run_status leaves children_status nil and
+// still returns the snapshot rather than failing.
+func TestGetRunStatus_ChildrenStatus_DecodeError_StillSnapshots(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	parent := uuid.New()
+	fb.getRunByID[parent] = Run{ID: parent.String(), Repo: "x/y", State: "running"}
+	fb.stagesByRun[parent] = []Stage{
+		{ID: uuid.NewString(), RunID: parent.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: parent.String(), Sequence: 2, Type: "implement", State: "awaiting_children"},
+	}
+	// A plan_decomposed entry with a nil payload → LatestPlanDecomposed errors.
+	fb.mu.Lock()
+	fb.perRunAuditByRun[parent] = []AuditEntry{{
+		ID: uuid.NewString(), Sequence: 1, RunID: parent.String(), Category: "plan_decomposed",
+	}}
+	fb.mu.Unlock()
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: parent.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus must not fail when childrenStatusFor errors: %v", err)
+	}
+	if out.ChildrenStatus != nil {
+		t.Errorf("ChildrenStatus = %+v, want nil on a decode error", out.ChildrenStatus)
+	}
+	// The rest of the snapshot still landed.
+	if out.Run.ID != parent.String() {
+		t.Errorf("Run.ID = %s, want %s", out.Run.ID, parent)
 	}
 }
