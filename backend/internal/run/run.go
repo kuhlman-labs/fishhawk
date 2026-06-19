@@ -51,21 +51,29 @@ func (s State) IsTerminal() bool {
 // blocking on human action. `awaiting_input` means the stage parked
 // for operator direction — the planner emitted a clarification_request
 // (#1057) and the run resumes in place once the answers arrive; it is a
-// parked judgment, not a failure.
+// parked judgment, not a failure. `awaiting_scope_decision` means the
+// implement stage parked for an operator exempt-or-fail decision: its
+// ONLY committed-tree gate failure was the scope-completeness "missing
+// declared scope file(s)" check (#1151), the verified commit is already
+// held on the run branch, and the operator decides in-band whether to
+// accept the already-committed tree (exempt, zero agent re-run) or fail
+// it (category-B) per #1231. Like awaiting_input it is a parked judgment,
+// not a failure.
 type StageState string
 
 // Stage states. Terminal states (Succeeded, Failed, Cancelled) admit
 // no further transitions; see transition.go for the table.
 const (
-	StageStatePending          StageState = "pending"
-	StageStateDispatched       StageState = "dispatched"
-	StageStateRunning          StageState = "running"
-	StageStateAwaitingApproval StageState = "awaiting_approval"
-	StageStateAwaitingChildren StageState = "awaiting_children"
-	StageStateAwaitingInput    StageState = "awaiting_input"
-	StageStateSucceeded        StageState = "succeeded"
-	StageStateFailed           StageState = "failed"
-	StageStateCancelled        StageState = "cancelled"
+	StageStatePending               StageState = "pending"
+	StageStateDispatched            StageState = "dispatched"
+	StageStateRunning               StageState = "running"
+	StageStateAwaitingApproval      StageState = "awaiting_approval"
+	StageStateAwaitingChildren      StageState = "awaiting_children"
+	StageStateAwaitingInput         StageState = "awaiting_input"
+	StageStateAwaitingScopeDecision StageState = "awaiting_scope_decision"
+	StageStateSucceeded             StageState = "succeeded"
+	StageStateFailed                StageState = "failed"
+	StageStateCancelled             StageState = "cancelled"
 )
 
 // IsTerminal reports whether the state admits no further transitions.
@@ -390,8 +398,47 @@ type Stage struct {
 	// Used as retry_ordinal in the stage_retried audit receipt.
 	SelfRetryCount int
 
+	// ScopeCompletenessPark carries the held-commit coordinates when an
+	// implement stage parks in awaiting_scope_decision (#1231): the
+	// missing-declared-scope-file-only gate outcome pushed its verified
+	// commit to the run branch (no PR) and is waiting for an operator
+	// exempt-or-fail decision. Nil for every stage not currently parked
+	// for a scope-completeness decision (the column is NULL). Persisted
+	// to stages.scope_completeness_park JSONB per migration 0035.
+	ScopeCompletenessPark *ScopeCompletenessPark
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// ScopeCompletenessPark is the durable payload an implement stage carries
+// while parked in awaiting_scope_decision (#1231). It pins exactly what
+// the runner held when the scope-completeness "missing declared scope
+// file(s)" check was the SOLE committed-tree gate failure: the verified
+// commit already pushed to the run branch, the tree it verified, and the
+// declared scope.files that the agent never touched. The operator's
+// exempt decision opens the PR from HeldCommitSHA with no agent re-run;
+// the fail decision drops to today's category-B.
+//
+// The JSON tags are the byte-identical cross-module wire contract with
+// the runner's park-report upload struct (runner/internal/upload —
+// sibling slice), following the established ScopeExemption duplication
+// pattern rather than a shared module. Keep the two in lockstep.
+type ScopeCompletenessPark struct {
+	// HeldCommitSHA is the gate-verified commit the runner already pushed
+	// to RunBranch (no PR). The exempt resolution opens the PR from this
+	// exact SHA — byte-identical tree, zero agent re-run.
+	HeldCommitSHA string `json:"held_commit_sha"`
+	// RunBranch is the run's own sole-writer branch the held commit was
+	// pushed to (ADR-035): the resolution opens the PR from this branch.
+	RunBranch string `json:"run_branch"`
+	// VerifiedTreeSHA is the tree object the committed-tree verify gate
+	// passed on. Recorded so the resolution can assert the opened PR head
+	// reflects the identical tree.
+	VerifiedTreeSHA string `json:"verified_tree_sha"`
+	// MissingPaths are the declared scope.files the agent never touched —
+	// the sole gate shortfall that triggered the park. Repo-relative.
+	MissingPaths []string `json:"missing_paths"`
 }
 
 // GateKind names the two flavors of gate the workflow spec admits:

@@ -43,6 +43,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/runs/{run_id}/scope-amendments", s.handleRequestScopeAmendment)
 	mux.HandleFunc("GET /v0/runs/{run_id}/scope-amendments", s.handleListScopeAmendments)
 	mux.HandleFunc("POST /v0/runs/{run_id}/scope-amendments/{amendment_id}/decision", s.handleDecideScopeAmendment)
+	mux.HandleFunc("POST /v0/runs/{run_id}/scope-completeness/decision", s.handleDecideScopeCompleteness)
 	mux.HandleFunc("GET /v0/stages/{stage_id}", s.handleGetStage)
 	mux.HandleFunc("GET /v0/stages/{stage_id}/artifacts", s.handleListStageArtifacts)
 	mux.HandleFunc("GET /v0/stages/{stage_id}/prompt", s.handleGetStagePrompt)

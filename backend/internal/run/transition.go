@@ -83,6 +83,20 @@ func ValidRunRetryTransition(from, to State) bool {
 //
 //	(a D-category judgment, not an agent failure).
 //
+// Running → AwaitingScopeDecision: the implement stage's ONLY committed-
+//
+//	tree gate failure was the scope-completeness missing-declared-file
+//	check; the verified commit is held on the run branch and the run
+//	parks for an operator exempt-or-fail decision (#1231).
+//
+// AwaitingScopeDecision → Running: operator exempted; the stage resumes to
+//
+//	open the PR from the held commit with NO agent re-run.
+//
+// AwaitingScopeDecision → Failed: operator failed it — today's category-B
+//
+//	restore path.
+//
 // Cancelled is reachable from any non-terminal state via manual halt.
 var stageTransitions = map[StageState]map[StageState]struct{}{
 	StageStatePending: {
@@ -97,11 +111,12 @@ var stageTransitions = map[StageState]map[StageState]struct{}{
 		StageStateCancelled: {},
 	},
 	StageStateRunning: {
-		StageStateAwaitingApproval: {},
-		StageStateAwaitingInput:    {},
-		StageStateSucceeded:        {},
-		StageStateFailed:           {},
-		StageStateCancelled:        {},
+		StageStateAwaitingApproval:      {},
+		StageStateAwaitingInput:         {},
+		StageStateAwaitingScopeDecision: {},
+		StageStateSucceeded:             {},
+		StageStateFailed:                {},
+		StageStateCancelled:             {},
 	},
 	StageStateAwaitingApproval: {
 		StageStateSucceeded: {},
@@ -117,6 +132,11 @@ var stageTransitions = map[StageState]map[StageState]struct{}{
 		StageStatePending:   {}, // operator answered → resume in place
 		StageStateSucceeded: {},
 		StageStateFailed:    {},
+		StageStateCancelled: {},
+	},
+	StageStateAwaitingScopeDecision: {
+		StageStateRunning:   {}, // operator exempted → resume to open the PR from the held commit (no agent re-run, #1231)
+		StageStateFailed:    {}, // operator failed it → category-B, today's restore path
 		StageStateCancelled: {},
 	},
 }

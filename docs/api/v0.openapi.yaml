@@ -1046,7 +1046,7 @@ components:
           example: 3
         outcome:
           type: string
-          enum: [failed, pushed, fixup_pushed, fixup_no_changes]
+          enum: [failed, pushed, fixup_pushed, fixup_no_changes, scope_park]
           description: |
             Present only on the non-success variants. `failed` (#742)
             reports a commit/push/PR-open failure (PR fields absent;
@@ -1060,6 +1060,12 @@ components:
             reports a fix-up re-dispatch that produced NO changes (no new commit
             landed; `branch` + `base_sha` required, `head_sha` omitted because
             the branch tip is unchanged, `pr_number`/`pr_url`/`title` absent).
+            `scope_park` (#1231) reports a missing-declared-scope-file-ONLY gate
+            outcome: the runner pushed its verified commit to the run branch and
+            parks the implement stage in `awaiting_scope_decision` (no PR;
+            `branch` + `head_sha` + `base_sha` + `verified_tree_sha` +
+            non-empty `missing_paths` required, `pr_number`/`pr_url`/`title`
+            absent).
         category:
           type: string
           enum: [B, C]
@@ -1070,6 +1076,19 @@ components:
         reason:
           type: string
           description: Human-readable failure reason (failure variant only).
+        verified_tree_sha:
+          type: string
+          description: |
+            Present only on the `scope_park` variant (#1231). The tree object
+            the committed-tree verify gate passed on; recorded so the exempt
+            resolution can assert the opened PR head reflects the identical tree.
+        missing_paths:
+          type: array
+          items: { type: string }
+          description: |
+            Present only on the `scope_park` variant (#1231). The declared
+            `scope.files` the agent never touched — the sole gate shortfall that
+            triggered the park. Repo-relative; must be non-empty.
         apply_path:
           type: string
           enum: [applied, agent, apply_failed_fellback, apply_failed_reset_failed]
@@ -1157,6 +1176,23 @@ components:
         stage_id: { $ref: '#/components/schemas/UUID' }
         outcome: { type: string, enum: [fixup_no_changes] }
         branch: { type: string }
+
+    PullRequestScopeParkResponse:
+      type: object
+      description: |
+        Echoed by `POST /v0/runs/{run_id}/pull-request` for the
+        scope-completeness park variant (`outcome: scope_park`, #1231): the
+        implement stage's ONLY committed-tree gate failure was the
+        missing-declared-scope-file check, so the runner pushed its verified
+        commit to the run branch (no PR) and the stage parked in
+        `awaiting_scope_decision` for an operator exempt-or-fail decision.
+        `head_sha` echoes the held commit.
+      required: [stage_id, outcome, branch, head_sha]
+      properties:
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        outcome: { type: string, enum: [scope_park] }
+        branch: { type: string }
+        head_sha: { type: string }
 
     PlanUploadResponse:
       type: object
@@ -5147,7 +5183,11 @@ paths:
               (#794), or
             - the fix-up no-changes variant (`outcome: fixup_no_changes`) was
               accepted and the fix-up implement stage was transitioned
-              terminally, re-parking the review gate (#856).
+              terminally, re-parking the review gate (#856), or
+            - the scope-completeness park variant (`outcome: scope_park`) was
+              accepted and the implement stage was parked in
+              `awaiting_scope_decision` for an operator exempt-or-fail
+              decision (#1231).
           content:
             application/json:
               schema:
@@ -5157,6 +5197,7 @@ paths:
                   - $ref: '#/components/schemas/PullRequestChildPushResponse'
                   - $ref: '#/components/schemas/PullRequestFixupPushResponse'
                   - $ref: '#/components/schemas/PullRequestFixupNoChangesResponse'
+                  - $ref: '#/components/schemas/PullRequestScopeParkResponse'
         '400':
           description: |
             Body missing required fields (`code: pull_request_invalid`)
@@ -5650,6 +5691,107 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: Scope-amendment repositories not wired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/scope-completeness/decision:
+    post:
+      operationId: decideScopeCompleteness
+      summary: Exempt or fail a parked scope-completeness shortfall (operator)
+      description: |
+        Records the operator's exempt-or-fail decision on an implement
+        stage parked in `awaiting_scope_decision` (#1231): the stage's
+        ONLY committed-tree gate failure was the scope-completeness
+        "missing declared scope file(s)" check, and the runner already
+        pushed its gate-verified commit to the run branch (no PR).
+
+        **Auth: operator bearer/session ONLY** — bearer tokens require
+        `write:stages`. Run-bound `fhm_` tokens are rejected outright
+        (403 `self_decision`): the implement agent that produced the
+        parked commit must never decide its own exemption.
+
+        On `exempt` the stage resumes `running` so the held commit's PR
+        is opened with NO agent re-run (a `push_and_open_pr` dispatch
+        opens the PR from the held commit), and a
+        `scope_completeness_exempted` audit entry is appended. On `fail`
+        the stage fails category-B (today's restore path) and a
+        `scope_completeness_failed` entry is appended. A stage not
+        currently parked returns 409 (`stage_not_parked`).
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision, reason]
+              properties:
+                decision:
+                  type: string
+                  enum: [exempt, fail]
+                reason:
+                  type: string
+                  description: |
+                    Operator note explaining the exemption or failure;
+                    recorded on the audit entry. Required and non-empty.
+      responses:
+        '200':
+          description: |
+            The resolved decision. On `exempt`, `held_commit_sha` /
+            `run_branch` name the commit the PR is opened from.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [stage_id, decision, state]
+                properties:
+                  stage_id: { $ref: '#/components/schemas/UUID' }
+                  decision:
+                    type: string
+                    enum: [exempt, fail]
+                  state:
+                    type: string
+                    description: The implement stage's resulting state.
+                  held_commit_sha:
+                    type: string
+                    description: Present on `exempt` — the held commit the PR opens from.
+                  run_branch:
+                    type: string
+                    description: Present on `exempt` — the run branch the held commit sits on.
+        '400':
+          description: Malformed run_id, decision not exempt/fail, or empty reason.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: No authenticated token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: |
+            `self_decision` (run-bound agent token) or
+            `insufficient_scope` (token lacks `write:stages`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found` — unknown run id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `stage_not_parked` — the implement stage is not parked
+            awaiting a scope-completeness decision.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: Run/audit repositories not wired.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

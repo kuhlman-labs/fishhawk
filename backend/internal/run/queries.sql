@@ -159,6 +159,19 @@ UPDATE stages
  WHERE id = $1
 RETURNING *;
 
+-- name: ParkScopeCompleteness :one
+-- Atomically sets the stage's state and its scope_completeness_park
+-- payload (#1231). Used by ParkScopeCompletenessAndAppend inside a
+-- transaction that first locks the row and validates the running →
+-- awaiting_scope_decision transition; the JSONB payload pins the held
+-- commit the runner already pushed to the run branch so the operator's
+-- exempt decision can open the PR from it with no agent re-run.
+UPDATE stages
+   SET state                   = $2,
+       scope_completeness_park = $3
+ WHERE id = $1
+RETURNING *;
+
 -- name: RetryStageState :one
 -- Clears failure metadata + ended_at and increments self_retry_count
 -- atomically. Used by the retry handler's explicit out-of-terminal

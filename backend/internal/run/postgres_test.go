@@ -1283,3 +1283,148 @@ func TestPostgres_ResumeAwaitingInputAndAppend_MissingStage(t *testing.T) {
 		t.Error("won = true for a missing stage, want false")
 	}
 }
+
+// scopeCompletenessParker is the optional combined-commit capability the
+// pull-request park handler type-asserts on the concrete postgres repo
+// (#1231). Like resumeAppender it is not part of run.Repository, so the
+// test asserts it the same way the handler does.
+type scopeCompletenessParker interface {
+	ParkScopeCompletenessAndAppend(ctx context.Context, stageID uuid.UUID, park run.ScopeCompletenessPark, p audit.ChainAppendParams) (*run.Stage, bool, error)
+}
+
+// seedRunningImplementStage creates a run + implement stage and walks it
+// pending → dispatched → running, the state a missing-declared-scope-file
+// park fires from.
+func seedRunningImplementStage(t *testing.T, repo run.Repository) (*run.Run, *run.Stage) {
+	t.Helper()
+	ctx := context.Background()
+	r := makeRun(t, repo)
+	s, err := repo.CreateStage(ctx, run.CreateStageParams{
+		RunID:        r.ID,
+		Sequence:     0,
+		Type:         run.StageTypeImplement,
+		ExecutorKind: run.ExecutorAgent,
+		ExecutorRef:  "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("create implement stage: %v", err)
+	}
+	for _, to := range []run.StageState{run.StageStateDispatched, run.StageStateRunning} {
+		if _, err := repo.TransitionStage(ctx, s.ID, to, nil); err != nil {
+			t.Fatalf("transition to %s: %v", to, err)
+		}
+	}
+	running, err := repo.GetStage(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	return r, running
+}
+
+// parkParams builds a scope_completeness_parked ChainAppendParams.
+func parkParams(runID, stageID uuid.UUID, payload []byte) audit.ChainAppendParams {
+	sid := stageID
+	subject := "system"
+	kind := audit.ActorKind("system")
+	return audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      &sid,
+		Timestamp:    time.Now().UTC(),
+		Category:     "scope_completeness_parked",
+		ActorKind:    &kind,
+		ActorSubject: &subject,
+		Payload:      payload,
+	}
+}
+
+func TestPostgres_ParkScopeCompletenessAndAppend_RoundTrip(t *testing.T) {
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+	pk, ok := repo.(scopeCompletenessParker)
+	if !ok {
+		t.Fatal("postgres repo does not implement ParkScopeCompletenessAndAppend")
+	}
+	auditRepo := audit.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r, running := seedRunningImplementStage(t, repo)
+	park := run.ScopeCompletenessPark{
+		HeldCommitSHA:   "1111111111111111111111111111111111111111",
+		RunBranch:       "fishhawk/run-aaa/slice-0",
+		VerifiedTreeSHA: "2222222222222222222222222222222222222222",
+		MissingPaths:    []string{"backend/internal/foo/foo_test.go", "docs/foo.md"},
+	}
+
+	stage, won, err := pk.ParkScopeCompletenessAndAppend(ctx, running.ID, park, parkParams(r.ID, running.ID, []byte(`{"k":"v"}`)))
+	if err != nil {
+		t.Fatalf("ParkScopeCompletenessAndAppend: %v", err)
+	}
+	if !won {
+		t.Fatal("won = false, want true for the single parking caller")
+	}
+	if stage.State != run.StageStateAwaitingScopeDecision {
+		t.Errorf("stage state = %q, want awaiting_scope_decision", stage.State)
+	}
+
+	// The park payload round-trips through the JSONB column on a fresh read.
+	got, err := repo.GetStage(ctx, running.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateAwaitingScopeDecision {
+		t.Errorf("persisted stage state = %q, want awaiting_scope_decision", got.State)
+	}
+	if got.ScopeCompletenessPark == nil {
+		t.Fatal("persisted ScopeCompletenessPark = nil, want round-tripped payload")
+	}
+	if got.ScopeCompletenessPark.HeldCommitSHA != park.HeldCommitSHA ||
+		got.ScopeCompletenessPark.RunBranch != park.RunBranch ||
+		got.ScopeCompletenessPark.VerifiedTreeSHA != park.VerifiedTreeSHA ||
+		len(got.ScopeCompletenessPark.MissingPaths) != 2 {
+		t.Errorf("ScopeCompletenessPark = %+v, want %+v", got.ScopeCompletenessPark, park)
+	}
+
+	// Exactly one scope_completeness_parked entry persisted in the same tx.
+	entries, err := auditRepo.ListForRunByCategory(ctx, r.ID, "scope_completeness_parked")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("scope_completeness_parked entries = %d, want 1", len(entries))
+	}
+}
+
+func TestPostgres_ParkScopeCompletenessAndAppend_LoserCAS(t *testing.T) {
+	pool := startPostgres(t)
+	repo := run.NewPostgresRepository(pool)
+	pk := repo.(scopeCompletenessParker)
+	auditRepo := audit.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r, running := seedRunningImplementStage(t, repo)
+	park := run.ScopeCompletenessPark{HeldCommitSHA: "abc", RunBranch: "b", VerifiedTreeSHA: "t", MissingPaths: []string{"x"}}
+
+	// First caller wins.
+	if _, won, err := pk.ParkScopeCompletenessAndAppend(ctx, running.ID, park, parkParams(r.ID, running.ID, []byte(`{}`))); err != nil || !won {
+		t.Fatalf("first park: won=%v err=%v, want won=true nil", won, err)
+	}
+	// Second caller observes the stage already left running → no-op, won=false,
+	// and must NOT append a second audit entry.
+	stage, won, err := pk.ParkScopeCompletenessAndAppend(ctx, running.ID, park, parkParams(r.ID, running.ID, []byte(`{}`)))
+	if err != nil {
+		t.Fatalf("second park err = %v, want nil", err)
+	}
+	if won {
+		t.Error("won = true for the losing caller, want false")
+	}
+	if stage == nil || stage.State != run.StageStateAwaitingScopeDecision {
+		t.Errorf("loser stage = %+v, want awaiting_scope_decision row", stage)
+	}
+	entries, err := auditRepo.ListForRunByCategory(ctx, r.ID, "scope_completeness_parked")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("scope_completeness_parked entries = %d, want 1 (loser must not append)", len(entries))
+	}
+}
