@@ -23,6 +23,7 @@ E19.2 / #342 shipped scaffolding + handshake. E19.3–E19.6 landed the v0 tool s
 - `fishhawk_file_issue` ([#1005](https://github.com/kuhlman-labs/fishhawk/issues/1005)) — file a work item (issue, bug, chore, ADR) through the repo's work-management conventions. The consistent cross-repo/cross-platform filing surface and the operator-agent follow-up-filing path ([ADR-040](https://github.com/kuhlman-labs/fishhawk/issues/1004)). See [Work-item filing](#work-item-filing-fishhawk_file_issue-1005).
 - `fishhawk_report_product_issue` ([#1006](https://github.com/kuhlman-labs/fishhawk/issues/1006)) — file an upstream Fishhawk **product** bug/feature carrying an auto-collected, redacted, fingerprint-deduped diagnostic bundle. The first **write** tool that drives an egress on the run's chain. See [Product feedback](#product-feedback-fishhawk_report_product_issue-1006).
 - `fishhawk_consolidate_slices` ([E24.2 / ADR-041 / #1238](https://github.com/kuhlman-labs/fishhawk/issues/1238)) — run the decomposed-parent fan-in on demand when a parent is stuck in `awaiting_children` after its children all succeeded on the **local** runner (the 60s sweeper backstop is off by default there). See [Local decomposition fan-in](#local-decomposition-fan-in-fishhawk_consolidate_slices-1238).
+- `fishhawk_decide_scope_completeness` ([E22.X / #1231](https://github.com/kuhlman-labs/fishhawk/issues/1231)) — resolve an implement stage parked in `awaiting_scope_decision`: **exempt** the already-committed tree (open the PR from the held commit with **no agent re-run**) or **fail** it to category-B. The zero-re-run recovery for a missing-declared-scope-file-only gate failure. See [Scope-completeness park](#scope-completeness-park-fishhawk_decide_scope_completeness-1231).
 
 E19.7 / #347 wires the binary into the release pipeline next.
 
@@ -399,6 +400,23 @@ E22.X / [#961](https://github.com/kuhlman-labs/fishhawk/issues/961) adds the **m
 **Auth.** The decision is operator-only (`write:stages`); the backend rejects run-bound agent tokens outright (`self_decision`), so the requesting agent can never approve its own request. The agent-side POST requires the implement-stage token's `write:scope-amendments` scope (granted unconditionally at token issue for implement stages); the GET admits the run-bound token (`mcp:read`, own run only — cross-run is 403) or any operator bearer/session.
 
 **Activation.** Approved paths fold into the effective scope at BOTH ends: the backend prompt fetch (`source "scope-amendment"`, so a stage restart or fix-up carries the amended scope) and the runner's pre-commit refresh, which re-reads the GET with the same run-bound token and folds approved paths BEFORE the committed-tree verify gates and `StageScoped` — preserving the #960 invariant that the gates verify the same folded tree that is pushed. Anything NOT requested still fails loud. Both `scope_amendment_requested` and `scope_amendment_decided` are internal audit kinds, not issue-comment surfaces.
+
+## Scope-completeness park (`fishhawk_decide_scope_completeness`)
+
+E22.X / [#1231](https://github.com/kuhlman-labs/fishhawk/issues/1231) adds a **zero-re-run** recovery for the case the [#1229](https://github.com/kuhlman-labs/fishhawk/issues/1229) one-re-run exempt lever otherwise served: an implement stage whose **only** committed-tree gate failure is the [#1151](https://github.com/kuhlman-labs/fishhawk/issues/1151) scope-completeness "missing declared scope file(s)" check, while the committed tree otherwise passed verify (created-out-of-scope, binding-assertion, compile/test, and verified-tree gates all green).
+
+**Park, not category-B.** Instead of fail-and-restore, the runner pushes the **gate-verified commit** to the run branch (no PR opened — ADR-035 sole-writer preserved: the run writes its own branch) and PARKS the implement stage in a new `awaiting_scope_decision` state, carrying the held commit SHA, run branch, verified tree SHA, and the missing declared paths. The park leaves the gate waiting for an in-band operator decision over the [#1232](https://github.com/kuhlman-labs/fishhawk/issues/1232)/[#1235](https://github.com/kuhlman-labs/fishhawk/issues/1235) non-blocking dispatch substrate. Any compound failure (missing **plus** another gate) keeps today's category-B unchanged.
+
+**Operator loop:**
+
+1. Observe the park: `fishhawk_get_run_status` surfaces the `implement_awaiting_scope_decision` next action; `fishhawk_list_audit` on category `scope_completeness_parked` carries the missing paths + held SHA.
+2. Decide: `fishhawk_decide_scope_completeness {run_id, decision: exempt|fail, reason}`.
+   - `exempt` — the backend opens the PR from the **exact held commit** with **NO agent re-invocation** (the already-committed tree is accepted as-is; the implement-review gate proceeds). Appends `scope_completeness_exempted`.
+   - `fail` — the stage falls through to today's category-B fail-and-restore. Appends `scope_completeness_failed`.
+
+**Auth.** Operator-only (`write:stages`); the backend rejects run-bound agent tokens (`run_token_forbidden`), so the agent whose stage parked can never decide its own park (mirrors `fishhawk_decide_scope_amendment`). `reason` is required and non-empty; an invalid `decision` (anything but `exempt`/`fail`) or empty `reason` is caught before the HTTP hop. The endpoint returns 409 (`scope_completeness_not_parked`) when the stage is not parked in `awaiting_scope_decision`. It wraps `POST /v0/runs/{run_id}/scope-completeness/decision`.
+
+`scope_completeness_parked`, `scope_completeness_exempted`, and `scope_completeness_failed` are internal audit kinds, not issue-comment surfaces.
 
 ## Category-B recovery (`fishhawk_resume_run`)
 
