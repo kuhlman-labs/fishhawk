@@ -9847,12 +9847,16 @@ func TestOpenPRAndShipArtifact_ScopeExemption_AllExemptedPasses(t *testing.T) {
 	}
 }
 
-// TestOpenPRAndShipArtifact_ScopeExemption_PartialStillFails (strategy test 7):
-// two declared paths are missing but only one is exempted → the gate still
-// FAILS ErrScopeFilesMissing, the message lists only the unexempted remainder,
-// the scope_files_missing log carries the exempted subset, and origin is
-// untouched.
-func TestOpenPRAndShipArtifact_ScopeExemption_PartialStillFails(t *testing.T) {
+// TestOpenPRAndShipArtifact_ScopeExemption_PartialParks (strategy test 7,
+// updated for #1231): two declared paths are missing but only one is exempted →
+// missing-scope is still the SOLE gate failure (the unexempted c.txt), so the
+// stage PARKS rather than failing category-B. The gate-verified commit is
+// pushed to the run branch, NO PR is opened, and a scope_completeness_parked
+// report carries c.txt as the missing path; the scope_files_missing log still
+// records the exempted subset b.txt. (Pre-#1231 this returned category-B
+// ErrScopeFilesMissing; the park is now the unified disposition for every
+// missing-declared-scope-file-ONLY shortfall, exempted-or-not.)
+func TestOpenPRAndShipArtifact_ScopeExemption_PartialParks(t *testing.T) {
 	repo, bare, branch := verifiedTreeRepo(t)
 	fpr := withFakePROpenerOnly(t)
 	fu := newFakeUploader(t)
@@ -9865,17 +9869,36 @@ func TestOpenPRAndShipArtifact_ScopeExemption_PartialStillFails(t *testing.T) {
 		upload.ScopeFile{Path: "b.txt", Operation: "modify"},
 		upload.ScopeFile{Path: "c.txt", Operation: "modify"})
 
+	// Run the committed-tree gate so the verified-tree invariant is green for
+	// the park (the park requires every OTHER gate to pass).
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+
 	exemptions := []scopeExemption{{Path: "b.txt", Reason: "already correct"}}
 	var logSink strings.Builder
-	err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", nil, exemptions)
-	if !errors.Is(err, gitops.ErrScopeFilesMissing) {
-		t.Fatalf("partial exemption must still fail ErrScopeFilesMissing, got: %v", err)
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, exemptions); err != nil {
+		t.Fatalf("partial-exemption missing-scope-only must PARK (nil error), got: %v\n%s", err, logSink.String())
 	}
-	if !strings.Contains(err.Error(), "c.txt") {
-		t.Errorf("message must name the unexempted remainder c.txt: %v", err)
+	// Park reports scope_completeness_parked carrying the unexempted remainder;
+	// it does NOT open a PR.
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not run on the scope-completeness park")
 	}
-	if strings.Contains(err.Error(), "missing: b.txt") {
-		t.Errorf("message must not list the exempted b.txt in the missing set: %v", err)
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "scope_park" {
+		t.Fatalf("park must report scope_completeness_parked, got: %+v", fu.gotPRArgs)
+	}
+	if got := fu.gotPRArgs.MissingPaths; len(got) != 1 || got[0] != "c.txt" {
+		t.Errorf("park report must carry the unexempted remainder [c.txt], got: %v", got)
+	}
+	if fu.gotPRArgs.Branch != branch || fu.gotPRArgs.HeadSHA == "" || fu.gotPRArgs.TreeSHA != verifiedTree {
+		t.Errorf("park report must pin branch/head/verified-tree: %+v (want branch %s tree %s)", fu.gotPRArgs, branch, verifiedTree)
+	}
+	// The verified commit IS pushed to the run branch so an exempt resolution can
+	// open the PR from this exact held commit.
+	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr != nil {
+		t.Errorf("park must push the verified commit to the run branch %s: %v", branch, rerr)
 	}
 	missingLine := ""
 	for _, line := range strings.Split(logSink.String(), "\n") {
@@ -9886,11 +9909,164 @@ func TestOpenPRAndShipArtifact_ScopeExemption_PartialStillFails(t *testing.T) {
 	if missingLine == "" || !strings.Contains(missingLine, `"exempted":["b.txt"]`) {
 		t.Errorf("scope_files_missing log must carry the exempted subset:\n%s", logSink.String())
 	}
+}
+
+// TestOpenPRAndShipArtifact_MissingScopeOnly_Parks is the #1231 core: an
+// implement stage whose ONLY committed-tree gate failure is the
+// missing-declared-scope-file shortfall (b.txt declared but untouched; verify
+// green; no created-out-of-scope, no binding, no exemptions) PARKS rather than
+// failing category-B. The gate-verified commit is pushed to the run branch, NO
+// PR is opened, and a scope_completeness_parked report carries the missing path.
+func TestOpenPRAndShipArtifact_MissingScopeOnly_Parks(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	// b.txt is declared but never edited → the SOLE shortfall.
+	cfg.scopeFiles = append(cfg.scopeFiles, upload.ScopeFile{Path: "b.txt", Operation: "modify"})
+
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil); err != nil {
+		t.Fatalf("missing-scope-only must PARK (nil error), got: %v\n%s", err, logSink.String())
+	}
 	if fpr.gotArgs != nil {
-		t.Error("OpenPR must not run after a blocked shortfall push")
+		t.Error("OpenPR must not run on the scope-completeness park")
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "scope_park" {
+		t.Fatalf("park must report scope_completeness_parked, got: %+v", fu.gotPRArgs)
+	}
+	if got := fu.gotPRArgs.MissingPaths; len(got) != 1 || got[0] != "b.txt" {
+		t.Errorf("park report missing paths = %v, want [b.txt]", got)
+	}
+	if fu.gotPRArgs.TreeSHA != verifiedTree {
+		t.Errorf("park report tree = %q, want verified tree %q", fu.gotPRArgs.TreeSHA, verifiedTree)
+	}
+	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr != nil {
+		t.Errorf("park must push the held commit to the run branch %s: %v", branch, rerr)
+	}
+	if !strings.Contains(logSink.String(), `"event":"scope_completeness_park_reported"`) {
+		t.Errorf("expected a scope_completeness_park_reported log line:\n%s", logSink.String())
+	}
+}
+
+// TestOpenPRAndShipArtifact_MissingScopePlusBinding_StaysCategoryB is the
+// co-occurring-gate guard (#1231 approval condition): when the missing-scope
+// shortfall is accompanied by ANOTHER gate failure (here an unsatisfied binding
+// assertion), the compound is NOT a missing-scope-ONLY situation, so the stage
+// keeps today's category-B abort — the other gate's error is returned BEFORE the
+// push, origin is untouched, and no park is reported.
+func TestOpenPRAndShipArtifact_MissingScopePlusBinding_StaysCategoryB(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	cfg.scopeFiles = append(cfg.scopeFiles, upload.ScopeFile{Path: "b.txt", Operation: "modify"})
+	// a.txt IS touched but does not contain the declared literal → the binding
+	// assertion is unsatisfied, co-occurring with the b.txt shortfall.
+	bindings := []upload.BindingAssertion{{Type: "file_contains", Path: "a.txt", Literal: "NOT-PRESENT-LITERAL"}}
+
+	var logSink strings.Builder
+	err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", bindings, nil)
+	if !errors.Is(err, gitops.ErrBindingAssertionUnsatisfied) {
+		t.Fatalf("a compound (missing + binding) failure must stay category-B, got: %v", err)
+	}
+	if fu.gotPRArgs != nil && fu.gotPRArgs.Outcome == "scope_park" {
+		t.Error("a compound failure must NOT report a park")
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not run on a category-B abort")
 	}
 	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr == nil {
-		t.Errorf("run branch %s reached the bare remote despite the blocked push", branch)
+		t.Errorf("origin must be untouched on the category-B abort, but branch %s exists", branch)
+	}
+}
+
+// TestOpenHeldCommitPR_OpensFromHeldCommit_NoAgent is the zero-re-run exempt
+// path (#1231): the gate-verified commit is already on the run branch, so the
+// operator EXEMPT resolution opens the PR from that exact held commit with NO
+// CommitAndPush and NO agent invocation. Asserts OpenPR is called with the held
+// branch as head, the shipped artifact carries the held commit SHA, and the exit
+// is OK.
+func TestOpenHeldCommitPR_OpensFromHeldCommit_NoAgent(t *testing.T) {
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config{
+		runID:      verifiedTreeRunID,
+		stageID:    verifiedTreeStageID,
+		githubRepo: "test-owner/test-repo",
+		baseBranch: "main",
+		backendURL: "https://api.fishhawk.test",
+	}
+	var logSink strings.Builder
+	if code := openHeldCommitPR(context.Background(), cfg, "deadbeefcafef00d", "fishhawk/run-abc/stage-xyz", &logSink, fu, issued); code != exitOK {
+		t.Fatalf("openHeldCommitPR exit = %d, want exitOK\n%s", code, logSink.String())
+	}
+	if fpr.gotArgs == nil {
+		t.Fatal("openHeldCommitPR must open a PR from the held commit")
+	}
+	if fpr.gotArgs.Head != "fishhawk/run-abc/stage-xyz" || fpr.gotArgs.Base != "main" {
+		t.Errorf("OpenPR head/base = %q/%q, want held branch / main", fpr.gotArgs.Head, fpr.gotArgs.Base)
+	}
+	// The shipped artifact head is the held commit SHA (opened-PR head == held).
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "" {
+		t.Fatalf("exempt path must ship the success PR artifact (empty outcome), got: %+v", fu.gotPRArgs)
+	}
+	var artifact struct {
+		HeadSHA string `json:"head_sha"`
+		Branch  string `json:"branch"`
+	}
+	if uerr := json.Unmarshal(fu.gotPRArgs.Body, &artifact); uerr != nil {
+		t.Fatalf("decode artifact body: %v", uerr)
+	}
+	if artifact.HeadSHA != "deadbeefcafef00d" {
+		t.Errorf("opened-PR artifact head = %q, want the held commit SHA", artifact.HeadSHA)
+	}
+}
+
+// TestOpenHeldCommitPR_MissingHeldFields_ReportsFailure pins the fail-closed
+// guard (#1231): if the backend advertised the exempt resolution without the
+// held branch/SHA, openHeldCommitPR reports a failure (so the dispatched stage
+// lands failed rather than hanging) and never opens a PR.
+func TestOpenHeldCommitPR_MissingHeldFields_ReportsFailure(t *testing.T) {
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config{
+		runID:      verifiedTreeRunID,
+		stageID:    verifiedTreeStageID,
+		githubRepo: "test-owner/test-repo",
+		backendURL: "https://api.fishhawk.test",
+	}
+	var logSink strings.Builder
+	// held SHA / branch deliberately empty → fail-closed.
+	if code := openHeldCommitPR(context.Background(), cfg, "", "", &logSink, fu, issued); code != exitFailure {
+		t.Fatalf("missing held fields must fail, exit = %d", code)
+	}
+	if fpr.gotArgs != nil {
+		t.Error("no PR may be opened when the held commit fields are absent")
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "failed" {
+		t.Errorf("must report a failed outcome so the stage lands failed, got: %+v", fu.gotPRArgs)
 	}
 }
 
