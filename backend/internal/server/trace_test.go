@@ -2496,6 +2496,50 @@ func TestFailStageCategoryC_DuplicateReport_DoesNotAdvanceRun(t *testing.T) {
 // prompt.GateDriftPath verbatim, and a nil categorized slice stays nil
 // (the older-bundle tolerance the render's byte-identity contract
 // relies on).
+// TestAmendedScopeFilesForReview_DoesNotSurfaceReasonProse is the #1225
+// review-side regression guard. amendedScopeFilesForReview is the source for the
+// implement-review prompt's "Scope amended at approval" section; it must derive
+// the amended scope ONLY from the structured #824 add_scope_files fold, never
+// from a repo-relative path scraped out of the operator's free-text approve
+// comment (the removed #730 prose fold). This keeps the review side in lockstep
+// with the stage side (#829): both now scope solely from the structured source,
+// so a comment-named committed path is no longer flagged as scope drift by the
+// reviewer while the stage no longer scopes it. The structured path IS still
+// surfaced (proving only the prose source was removed), and the raw plan scope
+// file is excluded (already rendered by writePlanForReview).
+func TestAmendedScopeFilesForReview_DoesNotSurfaceReasonProse(t *testing.T) {
+	runID := uuid.New()
+	const plannedFile = "backend/internal/server/prompt.go"
+	const structuredPath = "docs/api/v0.md"
+	const reasonPath = "backend/go.mod"
+	comment := "Approved. No edit to `" + reasonPath + "` is needed — it is already correct."
+
+	s := New(Config{
+		Addr: "127.0.0.1:0",
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {makeApproveWithCommentAndScopeFilesEntry(runID, comment, []string{structuredPath})},
+		}},
+	})
+	approvedPlan := &plan.Plan{
+		Scope: plan.Scope{Files: []plan.ScopeFile{{Path: plannedFile, Operation: plan.FileOpModify}}},
+	}
+
+	got := s.amendedScopeFilesForReview(context.Background(), &run.Run{ID: runID}, approvedPlan)
+	set := make(map[string]bool, len(got))
+	for _, p := range got {
+		set[p] = true
+	}
+	if !set[structuredPath] {
+		t.Errorf("structured add_scope_files path %q must be surfaced as amended scope; got %#v", structuredPath, got)
+	}
+	if set[reasonPath] {
+		t.Errorf("reason-prose path %q must NOT be surfaced as amended scope (#1225); got %#v", reasonPath, got)
+	}
+	if set[plannedFile] {
+		t.Errorf("raw plan scope file %q must be excluded from amended scope; got %#v", plannedFile, got)
+	}
+}
+
 func TestGateEvidenceForReview_MapsUndeclaredCategorized(t *testing.T) {
 	staged := 2
 	ev := bundle.GateEvidence{
