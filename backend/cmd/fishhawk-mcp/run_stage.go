@@ -393,42 +393,13 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		}
 	}
 
-	// (4) Build the runner argv. Mirrors
-	// cli/cmd/fishhawk/runner.go::runRunnerStart — keep in sync.
-	argv := []string{
-		"--run-id", in.RunID,
-		"--backend-url", r.api.baseURL,
-		"--workflow", in.Workflow,
-		"--stage", in.Stage,
-		"--stage-id", resolvedStageID,
-		"--working-dir", workingDir,
-		"--fetch-prompt",
-		"--upload-trace",
-	}
-	if in.Stage == "plan" {
-		argv = append(argv, "--plan-out", "/tmp/fishhawk-plan.json")
-	}
-	if repo != "" {
-		argv = append(argv, "--github-repo", repo)
-	}
+	// (4) Build the runner argv via the shared composer so this path and
+	// the detached fishhawk_dispatch_stage verb (#1232) cannot drift.
 	baseBranch := in.BaseBranch
 	if baseBranch == "" {
 		baseBranch = "main"
 	}
-	argv = append(argv, "--base-branch", baseBranch)
-	// Only implement stages produce a diff to enforce. Passing
-	// --check-base-ref makes the runner run computeAndEmitDiff, which
-	// emits the git_diff event the backend needs to re-evaluate policy
-	// (policy_evaluated) and run implement-review (#561/#585). Plan and
-	// review stages legitimately produce no diff, so they omit it.
-	// Mirrors the runner's own gate (computeAndEmitDiff runs iff
-	// cfg.checkBaseRef != "").
-	if in.Stage == "implement" {
-		argv = append(argv, "--check-base-ref", baseBranch)
-	}
-	if !pushAndOpenPR {
-		argv = append(argv, "--no-pr")
-	}
+	argv := r.composeRunnerArgv(in, resolvedStageID, repo, baseBranch, pushAndOpenPR)
 
 	env := append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
 
@@ -659,6 +630,119 @@ func resolveRunnerBinary(input string, getenv func(string) string) (string, erro
 		binary = resolved
 	}
 	return binary, nil
+}
+
+// composeRunnerArgv builds the fishhawk-runner argv shared by the synchronous
+// fishhawk_run_stage handler and the detached fishhawk_dispatch_stage verb
+// (#1232). Extracting it makes the two paths compose BYTE-IDENTICAL argv: the
+// dispatch verb assembles a RunStageInput from its own input and calls this so
+// the only difference between the two surfaces is blocking-vs-detached spawn,
+// never the runner arguments. Mirrors cli/cmd/fishhawk/runner.go::runRunnerStart
+// — keep in sync.
+//
+// baseBranch and repo are passed already-resolved (the caller defaults
+// baseBranch to "main" and resolves repo from input/origin); pushAndOpenPR is
+// the caller's resolved *bool default. workingDir is defaulted here from
+// in.WorkingDir so both callers share the same "." fallback.
+func (r *runResolver) composeRunnerArgv(in RunStageInput, resolvedStageID, repo, baseBranch string, pushAndOpenPR bool) []string {
+	workingDir := in.WorkingDir
+	if workingDir == "" {
+		workingDir = "."
+	}
+	argv := []string{
+		"--run-id", in.RunID,
+		"--backend-url", r.api.baseURL,
+		"--workflow", in.Workflow,
+		"--stage", in.Stage,
+		"--stage-id", resolvedStageID,
+		"--working-dir", workingDir,
+		"--fetch-prompt",
+		"--upload-trace",
+	}
+	if in.Stage == "plan" {
+		argv = append(argv, "--plan-out", "/tmp/fishhawk-plan.json")
+	}
+	if repo != "" {
+		argv = append(argv, "--github-repo", repo)
+	}
+	argv = append(argv, "--base-branch", baseBranch)
+	// Only implement stages produce a diff to enforce. Passing
+	// --check-base-ref makes the runner run computeAndEmitDiff, which
+	// emits the git_diff event the backend needs to re-evaluate policy
+	// (policy_evaluated) and run implement-review (#561/#585). Plan and
+	// review stages legitimately produce no diff, so they omit it.
+	// Mirrors the runner's own gate (computeAndEmitDiff runs iff
+	// cfg.checkBaseRef != "").
+	if in.Stage == "implement" {
+		argv = append(argv, "--check-base-ref", baseBranch)
+	}
+	if !pushAndOpenPR {
+		argv = append(argv, "--no-pr")
+	}
+	return argv
+}
+
+// spawnRunnerStageDetached spawns fishhawk-runner DETACHED for the non-blocking
+// fishhawk_dispatch_stage verb (#1232): it starts the subprocess and returns
+// immediately rather than blocking to terminal like spawnRunnerStage. The
+// runner is meant to outlive the tool call so a single MCP session can poll the
+// (run_id, stage_id) handle to terminal AND decide a mid-stage scope amendment
+// in-band between polls (ADR-037 poll-to-terminal half; the #1189 timeout).
+//
+// Three properties are load-bearing and differ deliberately from
+// spawnRunnerStage:
+//
+//   - Own process group (runStageSetProcessGroup / Setpgid): a SIGINT/SIGTERM
+//     delivered to the MCP server's foreground process group is NOT forwarded
+//     to the detached runner. There is NO SIGTERM→grace→SIGKILL watcher —
+//     detachment is the point; the runner is reaped by its own SLA ticker or
+//     the operator.
+//   - Output → a per-invocation LOG FILE under os.TempDir(), never a pipe. An
+//     os.Pipe whose reader is never drained fills its fixed kernel buffer and
+//     blocks the writer once full (the #446 reason spawnRunnerStage reads its
+//     pipe to EOF in a goroutine); the detached path has no such reader, so it
+//     must redirect to a file. The runner ships its trace via --upload-trace
+//     and its state to the backend, so the local log is a diagnostic only.
+//   - A detached reaper goroutine `go func(){ _ = cmd.Wait() }()` collects the
+//     child's exit so it never becomes a zombie while the tool returns
+//     (os/exec Cmd.Wait releases the Cmd's resources).
+//
+// Returns the log path (always set when spawn succeeded) and any spawn error.
+func spawnRunnerStageDetached(binary string, argv, env []string, runID, stageID string) (string, error) {
+	cmd := runStageCommand(binary, argv...)
+	cmd.Env = env
+
+	// Own process group so a signal to the MCP server's group is not
+	// forwarded to the detached runner (see the doc comment).
+	runStageSetProcessGroup(cmd)
+
+	logPath := filepath.Join(os.TempDir(),
+		fmt.Sprintf("fishhawk-runner-%s-%s-%d.log", runID, stageID, time.Now().UnixNano()))
+	// 0o600 (owner-only): the runner's raw stdout/stderr can carry repo content
+	// and is NOT redacted on this stream (only the trace-bundle variant is), so a
+	// world-readable file under a shared /tmp would let other local users read an
+	// unredacted diagnostic. No token is written (FISHHAWK_API_TOKEN rides in env).
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("open detached runner log %s: %w", logPath, err)
+	}
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		return "", fmt.Errorf("spawn fishhawk-runner: %w", err)
+	}
+	// The child inherited its own fd for the log at fork; the parent's
+	// handle can close so the long-lived MCP server doesn't leak an fd
+	// per dispatch.
+	_ = logFile.Close()
+
+	// Detached reaper: collect the exit so the child never zombies while
+	// the tool call returns. No ctx watch — the runner outlives the call.
+	go func() { _ = cmd.Wait() }()
+
+	return logPath, nil
 }
 
 // spawnRunnerStage is the single source of truth for the process-group
