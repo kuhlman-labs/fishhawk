@@ -284,6 +284,18 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// Function-scoped like fixupExpectedHeadSHA: produced and consumed in run().
 	var fixupApplyPatches []upload.FixupApplyPatch
 
+	// operatorExemptions is the operator-declared exempt_scope_files set (#1229)
+	// delivered via the prompt-response scope_exemptions field. Declared up here
+	// (alongside bindingAssertions) because it is set from the prompt at fetch
+	// time below, BEFORE the agent loop's var block. It is set ONCE and is NEVER
+	// cleared by loadScopeExemptions — unlike validatedExemptions (the agent's
+	// consumable #1153 sidecar self-exemptions), so an operator exemption
+	// survives the base-rebase re-invoke reset. Merged with validatedExemptions
+	// (mergeExemptions) at each openPRAndShipArtifact gate call so the #1151
+	// shortfall subtracts the agent∪operator union. Empty on every non-recovery
+	// run, keeping the strict gate byte-identical.
+	var operatorExemptions []scopeExemption
+
 	// If --fetch-prompt is set and no --prompt-file was supplied,
 	// pull the constructed prompt from the backend and write it to
 	// a temp file. Sets cfg.promptFile so the rest of the path is
@@ -304,7 +316,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -330,6 +342,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		fixupExpectedHeadSHA = expectedHeadSHA
 		fixupApplyPatches = applyPatches
 		bindingAssertions = promptBindingAssertions
+		// Operator scope exemptions (#1229) arrive in the prompt-response, NOT
+		// the consumable #1153 sidecar, so they are captured ONCE here and held
+		// in operatorExemptions for the whole stage. They MUST survive the
+		// base-rebase re-invoke reset (run() ~line 1522) that reloads the
+		// agent's self-exemptions from the swept sidecar — hence a separate var
+		// re-merged at each openPRAndShipArtifact gate call, never cleared by
+		// loadScopeExemptions.
+		operatorExemptions = toScopeExemptions(promptScopeExemptions)
 		stageType = sType
 		// Hand the resolved scope.files to the out-of-process CLI
 		// auto-PR path (#581) the same way the PR description is
@@ -1184,8 +1204,16 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// children). loadScopeExemptions consumes (deletes) the sidecar.
 	if res.OK && stageType == "implement" && !cfg.noPR && cfg.decomposedFromRunID == "" && !cfg.fixup {
 		validatedExemptions = loadScopeExemptions(cfg, scopePaths(cfg.scopeFiles), logSink)
-		if len(validatedExemptions) > 0 {
-			res.Events = append(res.Events, scopeFilesExemptedEvent(cfg, validatedExemptions))
+		// Surface BOTH the agent's self-exemptions (#1153) and the operator's
+		// exempt_scope_files exemptions (#1229) through the single
+		// scope_files_exempted event so gate_evidence/the review see the full
+		// agent∪operator set the gate will subtract. operatorExemptions came
+		// from the prompt at fetch time. Emitted EXACTLY ONCE here (binding
+		// condition 1) — the gate site never re-emits, and the base-rebase
+		// re-invoke reuses the already-shipped event.
+		emitExemptions := mergeExemptions(validatedExemptions, operatorExemptions)
+		if len(emitExemptions) > 0 {
+			res.Events = append(res.Events, scopeFilesExemptedEvent(cfg, emitExemptions))
 		}
 	}
 
@@ -1483,7 +1511,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// category-B (we shipped the wrong shape); everything else
 		// is category-C (network, git, GitHub API).
 		if res.OK && stageType == "implement" {
-			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, validatedExemptions)
+			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, mergeExemptions(validatedExemptions, operatorExemptions))
 			// Bounded base-rebase-conflict re-invoke (#989): a stash-reapply
 			// conflict means the base moved under the agent (a sibling's
 			// shared-branch commit, or an advanced origin/<base>) — often a
@@ -1521,7 +1549,13 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 					if willOpenPR {
 						validatedExemptions = loadScopeExemptions(cfg, scopePaths(cfg.scopeFiles), logSink)
 					}
-					prErr = openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, validatedExemptions)
+					// Re-merge operatorExemptions (#1229): the line above reset
+					// validatedExemptions to whatever the re-invoked agent wrote to
+					// the swept sidecar (nil if it justified nothing), but the
+					// operator's exempt_scope_files exemptions came from the prompt
+					// and MUST persist across the re-invoke. mergeExemptions unions
+					// them so the second gate call still subtracts the operator set.
+					prErr = openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, mergeExemptions(validatedExemptions, operatorExemptions))
 				} else {
 					// Re-invoke infra exhaustion (or checkout failure): log and
 					// fall through to the unchanged category-B failure path
@@ -1803,13 +1837,13 @@ func reissueSigningKeyForTerminalUpload(ctx context.Context, client uploadClient
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, fetchErr
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -1817,20 +1851,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -5185,6 +5219,52 @@ func partitionExemptedMissing(missing []string, exemptions []scopeExemption) (ex
 		}
 	}
 	return exempted, remaining
+}
+
+// toScopeExemptions maps the prompt-response wire type (upload.ScopeExemption)
+// to the runner's internal scopeExemption (#1229). The operator's
+// exempt_scope_files exemptions arrive on the implement prompt rather than the
+// agent's #1153 sidecar; this is the single conversion at the fetch site. nil
+// in (no exemptions delivered) returns nil — the strict gate default.
+func toScopeExemptions(in []upload.ScopeExemption) []scopeExemption {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]scopeExemption, 0, len(in))
+	for _, e := range in {
+		out = append(out, scopeExemption{Path: e.Path, Reason: e.Reason})
+	}
+	return out
+}
+
+// mergeExemptions unions two scope-exemption sets by Path (#1229),
+// deduplicating so the agent's self-exemptions (#1153) and the operator's
+// exempt_scope_files exemptions both subtract from the #1151 shortfall without
+// double-counting. The first occurrence of a path wins (`a` before `b`), which
+// only affects the surfaced reason — partitionExemptedMissing keys on Path
+// alone. Order-preserving: all of `a`, then `b`'s new paths. Returns nil when
+// both are empty so the strict gate stays byte-identical.
+func mergeExemptions(a, b []scopeExemption) []scopeExemption {
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(a)+len(b))
+	out := make([]scopeExemption, 0, len(a)+len(b))
+	for _, e := range a {
+		if seen[e.Path] {
+			continue
+		}
+		seen[e.Path] = true
+		out = append(out, e)
+	}
+	for _, e := range b {
+		if seen[e.Path] {
+			continue
+		}
+		seen[e.Path] = true
+		out = append(out, e)
+	}
+	return out
 }
 
 // scopeFilesExemptedEvent builds the scope_files_exempted trace event (#1153)
