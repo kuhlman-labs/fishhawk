@@ -22,6 +22,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/runs/{run_id}/recover", s.handleRecoverRun)
 	mux.HandleFunc("POST /v0/runs/{run_id}/redrive", s.handleRedriveChild)
 	mux.HandleFunc("POST /v0/runs/{run_id}/reset-branch", s.handleResetRunBranch)
+	mux.HandleFunc("POST /v0/runs/{run_id}/consolidate", s.handleConsolidateRun)
 	mux.HandleFunc("POST /v0/runs/{run_id}/vouch-commit", s.handleVouchCommit)
 	mux.HandleFunc("GET /v0/runs/{run_id}/stages", s.handleListRunStages)
 	mux.HandleFunc("GET /v0/runs/{run_id}/audit", s.handleListRunAudit)

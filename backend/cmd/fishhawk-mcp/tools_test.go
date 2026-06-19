@@ -1182,11 +1182,25 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	const minDescriptionLen = 80
 	// The registered tool set is the fishhawk_* tools swept in #778. Bump
 	// this and give the new tool a conformant description when adding one.
-	const wantToolCount = 29
+	const wantToolCount = 30
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
 			len(res.Tools), wantToolCount)
+	}
+
+	// fishhawk_consolidate_slices (#1238) must be wire-visible — a registration
+	// regression would otherwise drop it from the tool list without failing the
+	// count if another tool were added in the same change.
+	var sawConsolidate bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_consolidate_slices" {
+			sawConsolidate = true
+			break
+		}
+	}
+	if !sawConsolidate {
+		t.Error("fishhawk_consolidate_slices is not registered/visible over ListTools")
 	}
 
 	for _, tool := range res.Tools {

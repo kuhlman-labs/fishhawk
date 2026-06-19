@@ -274,6 +274,17 @@ else
   fail "cmd_up should exit 1 on readiness-gate failure"
 fi
 
+# 9a. cmd_up serve launch re-enables the child-completion sweeper (#1238): the
+# fan-in backstop is off by default in fishhawkd, so the local serve must pass
+# --enable-child-completion-sweeper or a settled decomposed parent stays parked
+# in awaiting_children with no consolidated branch/PR. Body-grep so a future
+# edit that drops the flag fails here.
+if print -r -- "$up_body" | grep -q -- '--enable-child-completion-sweeper'; then
+  pass "cmd_up serve enables the child-completion sweeper (local fan-in backstop)"
+else
+  fail "cmd_up serve should pass --enable-child-completion-sweeper so local decompositions fan in"
+fi
+
 # 9b. cmd_k8s_up readiness gate: like cmd_up, the body must poll _await_healthz,
 # tail the pod logs, and exit 1 on failure so a future edit can't silently drop
 # the fail-loud guarantee of the Docker-Desktop bring-up.
