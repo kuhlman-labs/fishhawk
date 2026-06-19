@@ -672,6 +672,63 @@ func TestFetchPrompt_BindingAssertionsOmittedWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestFetchPrompt_DecodesScopeExemptions confirms the client decodes the
+// backend's scope_exemptions response field (#1229) into
+// FetchedPrompt.ScopeExemptions, preserving path/reason order.
+func TestFetchPrompt_DecodesScopeExemptions(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "implement",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"scope_exemptions": [
+			{"path": "backend/internal/server/recover.go", "reason": "interface unchanged, no edit needed"},
+			{"path": "docs/api/v0.md", "reason": "prose already current"}
+		]
+	}`
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if len(got.ScopeExemptions) != 2 {
+		t.Fatalf("ScopeExemptions len = %d, want 2: %+v", len(got.ScopeExemptions), got.ScopeExemptions)
+	}
+	if got.ScopeExemptions[0] != (ScopeExemption{Path: "backend/internal/server/recover.go", Reason: "interface unchanged, no edit needed"}) {
+		t.Errorf("ScopeExemptions[0] = %+v", got.ScopeExemptions[0])
+	}
+	if got.ScopeExemptions[1] != (ScopeExemption{Path: "docs/api/v0.md", Reason: "prose already current"}) {
+		t.Errorf("ScopeExemptions[1] = %+v", got.ScopeExemptions[1])
+	}
+}
+
+// TestFetchPrompt_ScopeExemptionsOmittedWhenAbsent confirms ScopeExemptions
+// decodes to nil when the backend omits the field (every non-recovery run), so
+// the runner's scope-completeness gate keeps the strict #1151 default —
+// byte-identical to behavior before #1229.
+func TestFetchPrompt_ScopeExemptionsOmittedWhenAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.ScopeExemptions != nil {
+		t.Errorf("ScopeExemptions = %+v, want nil when absent", got.ScopeExemptions)
+	}
+}
+
 // TestBindingAssertions_BackendEmitRunnerDecodeRoundTrip pins the backend
 // prompt-response binding_assertions JSON serialization against this package's
 // FetchedPrompt decoder (#1171 approval condition 1), the binding-assertion

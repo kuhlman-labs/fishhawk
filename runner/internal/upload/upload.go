@@ -376,6 +376,23 @@ type FetchedPrompt struct {
 	// round-trips approve-request → audit payload → prompt-response →
 	// this decoder unchanged.
 	BindingAssertions []BindingAssertion `json:"binding_assertions,omitempty"`
+	// ScopeExemptions is the operator-declared exempt_scope_files list
+	// (#1229), echoed by the backend on implement stages only when the run's
+	// recovery (resume_run exempt_scope_files) recorded operator-justified
+	// exemptions on its plan_reused_from provenance. Each entry marks a
+	// declared scope.files path the operator justified as unchanged, so the
+	// runner SUBTRACTS it from the #1151 scope-completeness shortfall exactly
+	// like a #1153 agent self-exemption — it does NOT widen scope (no
+	// scope-amendment row). Empty (the byte-identical default) on every
+	// non-recovery run — the gate is the strict #1151 default. The json tags
+	// (scope_exemptions/path/reason) are byte-identical to the backend's
+	// promptResponse.ScopeExemptions / scopeExemption prompt-response struct,
+	// the runner↔backend wire contract for the exemption round-trip (the same
+	// cross-module convention as BindingAssertions/#1171 and add_scope_files/
+	// #824). CRITICAL: these arrive in the prompt, not the consumable #1153
+	// sidecar, so the runner holds them in a separate var that survives the
+	// base-rebase re-invoke reset.
+	ScopeExemptions []ScopeExemption `json:"scope_exemptions,omitempty"`
 	// CommitAuthorName / CommitAuthorEmail are the GitHub App bot
 	// account's git commit identity, resolved backend-side from the App
 	// (slug + bot user-id) so App-backed commits attribute to the App's
@@ -451,6 +468,20 @@ type BindingAssertion struct {
 	Type    string `json:"type"`
 	Path    string `json:"path"`
 	Literal string `json:"literal"`
+}
+
+// ScopeExemption is one entry in FetchedPrompt.ScopeExemptions: an
+// operator-justified declared-scope.files path the runner subtracts from the
+// #1151 scope-completeness shortfall (#1229). The json tags (path/reason) are
+// byte-identical to the backend's scopeExemption struct, the runner↔backend
+// wire contract for the exempt_scope_files round-trip (approve-request →
+// plan_reused_from audit payload → prompt-response → this decoder). This
+// mirrors the BindingAssertion (#1171) and ScopeFile (#824) cross-module
+// convention: each module defines its own struct agreeing by json tag, so a
+// tag drift surfaces in review against this documented counterpart.
+type ScopeExemption struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
 }
 
 // FetchPrompt calls GET /v0/stages/{stage_id}/prompt with an
