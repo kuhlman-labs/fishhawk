@@ -2131,6 +2131,117 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /v0/runs/{run_id}/consolidate:
+    post:
+      operationId: consolidateRun
+      summary: Run the decomposed-parent fan-in (E24.2) on demand
+      description: |
+        Operator-drivable, error-SURFACING fan-in trigger (E24.2 / ADR-041 /
+        #1238) for a decomposed PARENT run parked in `awaiting_children`. The
+        60s child-completion sweeper is the automatic backstop that normally
+        runs the fan-in, but it is OFF by default in the local dev `fishhawkd`
+        ("dev-loop posture"), so on the local runner a parent whose children
+        have all settled stays parked with no consolidated branch/PR. This
+        endpoint runs the same fan-in on demand AND surfaces why it failed:
+        where the event-driven path WARN-swallows a non-conflict
+        `IntegrateSlices` error (leaving a silent stuck parent), this returns
+        it (502 `slice_integration_error`).
+
+        Mechanism: composes the existing orchestrator primitives
+        (`IntegrateSlices` → `TransitionStage` → `Advance`), mirroring the
+        sweeper's `resolveParent`, WITHOUT touching the hot event-driven /
+        sweeper paths. On a clean integration the parent implement stage
+        resolves `succeeded`, a `children_settled` audit entry is appended
+        (payload byte-identical to the sweeper's), the consolidated PR opens,
+        and the parent review gate dispatches. On a slice merge conflict the
+        parent implement stage fails recoverable (category `B`) and a
+        `slice_integration_conflict` audit entry records the conflicting slice
+        — the E24.2 contract, preserved.
+
+        **Preconditions** (each a refusal): the run is a decomposed parent
+        (`decomposed_from` null AND it has ≥1 decomposed child, else 400
+        `not_a_decomposed_parent`); its implement stage is parked in
+        `awaiting_children` (else 409 `not_awaiting_children` — already
+        resolved or not a decomposition); EVERY child is terminal (else 409
+        `children_in_flight`) AND every terminal child `succeeded` (else 409
+        `children_failed` — resolve/re-drive the failed child rather than
+        consolidating a partial set).
+
+        Idempotent-friendly: a second call after a successful consolidate (or
+        after the sweeper won the race) finds no `awaiting_children` stage and
+        returns 409 `not_awaiting_children`; `IntegrateSlices`' own merges are
+        idempotent no-ops, so a retry after a surfaced error re-enters cleanly.
+
+        **Authorization.** Requires `write:runs`. A run-bound MCP token
+        (subject `mcp:run:<uuid>`) is refused 403 (`agent_token_forbidden`) —
+        consolidation is an operator action, not one the implement agent
+        self-drives.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: |
+            Fan-in ran. `outcome` is `integrated` (every slice merged; parent
+            implement `succeeded`; `consolidated_branch` + `pull_request_url`
+            set) or `slice_conflict` (a slice failed to merge; parent implement
+            failed recoverable category `B`; `conflicting_slice_index` +
+            `conflicting_child_run_id` set).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  outcome:
+                    type: string
+                    enum: [integrated, slice_conflict]
+                    description: 'integrated = clean fan-in; slice_conflict = a slice failed to merge (parent failed recoverable).'
+                  resolved_to_state:
+                    type: string
+                    description: 'The parent implement stage state after the fan-in: succeeded (integrated) or failed (slice_conflict).'
+                  consolidated_branch: { type: string, description: 'The consolidated branch name; set on the integrated outcome.' }
+                  pull_request_url: { type: string, description: 'The consolidated PR URL; set on the integrated outcome.' }
+                  conflicting_slice_index: { type: integer, description: 'The slice index that failed to merge; set on the slice_conflict outcome.' }
+                  conflicting_child_run_id: { type: string, description: 'The child run id owning the conflicting slice; set on the slice_conflict outcome.' }
+                  detail: { type: string, description: 'Human-readable conflict detail; set on the slice_conflict outcome.' }
+        '400':
+          description: |
+            The run is not a decomposed parent (a child, or has no children).
+            Body's `error` is `not_a_decomposed_parent`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            One of two cases: (1) bearer token lacks `write:runs` scope — body
+            `error` is `insufficient_scope`; (2) a run-bound MCP token attempted
+            the fan-in — body `error` is `agent_token_forbidden`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            Fan-in not runnable. One of: `not_awaiting_children` (no implement
+            stage parked in awaiting_children), `children_in_flight` (a child is
+            still non-terminal; `details.non_terminal_child_run_ids` names
+            them), or `children_failed` (a child failed;
+            `details.failed_child_run_ids` names them).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: |
+            The slice integration failed with a non-conflict error (e.g. a base
+            ref or branch-create failure). Body's `error` is
+            `slice_integration_error` and `details.error` carries the cause. The
+            parent implement stage is left `awaiting_children` for retry.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/runs/{run_id}/recover:
     post:
       operationId: recoverRun

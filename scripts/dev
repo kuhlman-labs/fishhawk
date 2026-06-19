@@ -694,7 +694,13 @@ cmd_up() {
   local start_nonce
   start_nonce="$(_generate_start_nonce)"
   print "$start_nonce" > "$NONCE_FILE"
-  FISHHAWKD_START_NONCE="$start_nonce" "${BIN}" serve >> "$LOG_FILE" 2>&1 &
+  # --enable-child-completion-sweeper (#1238): the 60s fan-in backstop is OFF
+  # by default in fishhawkd ("dev-loop posture"), so on the local stack a
+  # decomposed parent whose children all settle would stay parked in
+  # awaiting_children with no consolidated branch/PR. Re-enable it here so the
+  # local runner completes decompositions automatically; scripts/test-dev
+  # body-greps for this flag so a future edit can't silently drop it.
+  FISHHAWKD_START_NONCE="$start_nonce" "${BIN}" serve --enable-child-completion-sweeper >> "$LOG_FILE" 2>&1 &
   local pid=$!
   disown
   print "$pid" > "$PID_FILE"

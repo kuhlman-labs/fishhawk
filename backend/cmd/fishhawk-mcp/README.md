@@ -22,6 +22,7 @@ E19.2 / #342 shipped scaffolding + handshake. E19.3–E19.6 landed the v0 tool s
 - `fishhawk_list_runs` (E22.5 / #394) — the "what runs do I have" enumeration: filter by `repo` / `workflow_id` / `state`, walk pages via the opaque `cursor`. Mirrors the CLI's `fishhawk run list`. **Compact by default (#1098):** each run's `issue_context` (issue body + every comment) is omitted from the list response so a single `list_runs` over issues with large bodies/comment threads stays within the tool-result token cap — the overflow that forced a `curl`+`jq` fallback when enumerating child run IDs during decomposition fan-out. Pass `include_issue_context: true` to re-include the full payload when it is actually needed. (`fishhawk_get_active_run` / `fishhawk_get_run_status` resolve a single run and are unaffected.)
 - `fishhawk_file_issue` ([#1005](https://github.com/kuhlman-labs/fishhawk/issues/1005)) — file a work item (issue, bug, chore, ADR) through the repo's work-management conventions. The consistent cross-repo/cross-platform filing surface and the operator-agent follow-up-filing path ([ADR-040](https://github.com/kuhlman-labs/fishhawk/issues/1004)). See [Work-item filing](#work-item-filing-fishhawk_file_issue-1005).
 - `fishhawk_report_product_issue` ([#1006](https://github.com/kuhlman-labs/fishhawk/issues/1006)) — file an upstream Fishhawk **product** bug/feature carrying an auto-collected, redacted, fingerprint-deduped diagnostic bundle. The first **write** tool that drives an egress on the run's chain. See [Product feedback](#product-feedback-fishhawk_report_product_issue-1006).
+- `fishhawk_consolidate_slices` ([E24.2 / ADR-041 / #1238](https://github.com/kuhlman-labs/fishhawk/issues/1238)) — run the decomposed-parent fan-in on demand when a parent is stuck in `awaiting_children` after its children all succeeded on the **local** runner (the 60s sweeper backstop is off by default there). See [Local decomposition fan-in](#local-decomposition-fan-in-fishhawk_consolidate_slices-1238).
 
 E19.7 / #347 wires the binary into the release pipeline next.
 
@@ -319,6 +320,27 @@ Safety (all server-enforced):
 - **Operator-gated + audited.** Requires `write:runs`; a run-bound token may reset only **its own** run's branch (`cross_run_reset`, 403). Every rewind writes a `branch_reset` audit entry; the dropped commit stays recoverable from the remote reflog / the foreign pusher's own branch (recorded in `recovery_note`).
 
 Returns the rewind summary (`dropped_offending_sha`, `reset_to_sha`, `prior_head_sha`, `recovery_note`) on success.
+
+## Local decomposition fan-in (`fishhawk_consolidate_slices`)
+
+`fishhawk_consolidate_slices` ([E24.2 / ADR-041](https://github.com/kuhlman-labs/fishhawk/issues/857) / [#1238](https://github.com/kuhlman-labs/fishhawk/issues/1238)) runs the **decomposed-parent fan-in** on demand. After a decomposition's children all reach terminal-`succeeded`, the parent implement stage is parked in `awaiting_children` until the fan-in merges every slice branch onto the consolidated branch and opens the consolidated PR. That fan-in normally runs from the 60s **child-completion sweeper** — but the sweeper is **off by default in the local dev `fishhawkd`** ("dev-loop posture"), so on the local runner a settled parent stays parked with no consolidated branch/PR. This verb runs the same fan-in on demand, and (unlike the silent event-driven path) **surfaces** a non-conflict integration error so you can diagnose a stuck local fan-in. It wraps `POST /v0/runs/{run_id}/consolidate`.
+
+> The local dev stack (`scripts/dev up`) now also passes `--enable-child-completion-sweeper`, so the sweeper backstop runs locally too; this verb is the explicit, error-surfacing operator path when you want to drive (or diagnose) the fan-in directly.
+
+Inputs:
+
+| Field | Required | Notes |
+|---|---|---|
+| `run_id` | **yes** | The decomposed **parent** run whose children's slices should be fanned in. |
+
+Preconditions (each a clean tool error): the run is a decomposed parent (not a child, and it has children — `not_a_decomposed_parent`, 400); its implement stage is parked in `awaiting_children` (`not_awaiting_children`, 409); every child is terminal (`children_in_flight`, 409) and every one succeeded (`children_failed`, 409). Auth is operator `write:runs`; a run-bound token is refused (`agent_token_forbidden`, 403).
+
+Outcomes (200):
+
+- `integrated` — every slice merged cleanly; the parent implement stage resolved `succeeded` and the consolidated PR opened. Carries `consolidated_branch` + `pull_request_url`.
+- `slice_conflict` — a slice branch failed to merge; the parent implement stage failed recoverable (category `B`), preserving the E24.2 contract. Carries `conflicting_slice_index` + `conflicting_child_run_id`.
+
+A non-conflict failure returns `slice_integration_error` (502) with the cause in `details.error` — the diagnosability the event-driven fan-in path lacks.
 
 ## Run-branch vouch (`fishhawk_vouch_commit`)
 

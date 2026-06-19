@@ -45,6 +45,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerStartRun(srv, resolver)
 	registerResumeRun(srv, resolver)
 	registerCancelRun(srv, resolver)
+	registerConsolidateSlices(srv, resolver)
 	registerResetRunBranch(srv, resolver)
 	registerRetryStage(srv, resolver)
 	registerFileIssue(srv, resolver)
@@ -1705,6 +1706,83 @@ func (r *runResolver) cancelRun(ctx context.Context, _ *mcp.CallToolRequest, in 
 		return nil, CancelRunOutput{}, fmt.Errorf("cancel run: %w", err)
 	}
 	return nil, CancelRunOutput{Run: *cancelled}, nil
+}
+
+// ConsolidateSlicesInput is the fishhawk_consolidate_slices tool's input
+// schema (E24.2 / ADR-041 / #1238). Mirrors
+// `POST /v0/runs/{run_id}/consolidate`.
+type ConsolidateSlicesInput struct {
+	RunID string `json:"run_id" jsonschema:"the Fishhawk run UUID of the decomposed PARENT whose children's slice branches should be fanned in; resolved like the other run-keyed verbs"`
+}
+
+// ConsolidateSlicesOutput surfaces the fan-in outcome: integrated (with the
+// consolidated branch + PR URL) or a recoverable slice conflict (with the
+// conflicting slice index + child run id).
+type ConsolidateSlicesOutput struct {
+	Result ConsolidateResult `json:"result"`
+}
+
+// registerConsolidateSlices wires the fishhawk_consolidate_slices tool (E24.2
+// / ADR-041 / #1238).
+//
+// Auth: write tool. Operator-side fhk_* tokens with `write:runs` scope
+// succeed; a run-bound MCP token is rejected (consolidation is an operator
+// action, not one the implement agent self-drives).
+func registerConsolidateSlices(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_consolidate_slices",
+		Description: strings.TrimSpace(`
+Use this when a decomposed parent run is stuck in awaiting_children after all
+its children have finished on the LOCAL runner — run the E24.2 fan-in on
+demand to merge the slice branches into the consolidated branch and open the
+consolidated PR. The 60s child-completion sweeper is the automatic backstop
+that normally does this, but it is OFF by default in the local dev stack, so
+locally a settled parent stays parked until you call this verb.
+
+Distinct from fishhawk_cancel_run (abandon a run) and fishhawk_retry_stage
+(re-run one failed stage): this resolves a HEALTHY parent whose children all
+succeeded.
+
+Preconditions (else a clean tool error):
+  - the run is a decomposed parent (not a child, and it has children);
+  - its implement stage is parked in awaiting_children;
+  - every child reached a terminal state AND every one succeeded.
+
+Outcomes:
+  - integrated      : every slice merged cleanly; the parent implement stage
+                      resolved succeeded and the consolidated PR opened. The
+                      result carries consolidated_branch + pull_request_url.
+  - slice_conflict  : a slice branch failed to merge; the parent implement
+                      stage failed recoverable (category-B), preserving the
+                      E24.2 contract. The result carries
+                      conflicting_slice_index + conflicting_child_run_id.
+
+Unlike the event-driven path, which silently WARN-swallows a non-conflict
+integration error, this SURFACES it (slice_integration_error) so you can
+diagnose a stuck local fan-in. Returns a tool error on:
+  - invalid UUID (caught before the HTTP hop)
+  - not_a_decomposed_parent (400)
+  - not_awaiting_children (409 — already resolved or not a decomposition)
+  - children_in_flight (409 — a child is still non-terminal)
+  - children_failed (409 — a child failed; resolve it first)
+  - slice_integration_error (502 — the fan-in failed; the cause is surfaced)
+`),
+	}, resolver.consolidateSlices)
+}
+
+// consolidateSlices is the tool handler. All precondition checks, the fan-in
+// composition, and the E24.2 contract live server-side in
+// server/consolidate.go.
+func (r *runResolver) consolidateSlices(ctx context.Context, _ *mcp.CallToolRequest, in ConsolidateSlicesInput) (*mcp.CallToolResult, ConsolidateSlicesOutput, error) {
+	runID, err := uuid.Parse(in.RunID)
+	if err != nil {
+		return nil, ConsolidateSlicesOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
+	}
+	res, err := r.api.ConsolidateRun(ctx, runID)
+	if err != nil {
+		return nil, ConsolidateSlicesOutput{}, fmt.Errorf("consolidate slices: %w", err)
+	}
+	return nil, ConsolidateSlicesOutput{Result: *res}, nil
 }
 
 // ResetRunBranchInput is the fishhawk_reset_run_branch tool's input

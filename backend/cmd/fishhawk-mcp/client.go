@@ -721,6 +721,45 @@ func (c *apiClient) VouchCommit(ctx context.Context, runID uuid.UUID, sha, reaso
 	return &res, nil
 }
 
+// ConsolidateResult mirrors the backend's consolidate 200 body (E24.2 /
+// #1238): the outcome of running the decomposed-parent fan-in on demand.
+// Outcome is "integrated" (every slice merged, parent implement succeeded,
+// consolidated PR opened) or "slice_conflict" (a slice failed to merge, parent
+// implement failed recoverable category-B). The conflict fields are set only
+// on the slice_conflict outcome.
+type ConsolidateResult struct {
+	RunID                 string `json:"run_id"`
+	Outcome               string `json:"outcome"`
+	ResolvedToState       string `json:"resolved_to_state"`
+	ConsolidatedBranch    string `json:"consolidated_branch,omitempty"`
+	PullRequestURL        string `json:"pull_request_url,omitempty"`
+	ConflictingSliceIndex *int   `json:"conflicting_slice_index,omitempty"`
+	ConflictingChildRunID string `json:"conflicting_child_run_id,omitempty"`
+	Detail                string `json:"detail,omitempty"`
+}
+
+// ConsolidateRun runs the E24.2 fan-in for a decomposed parent on demand via
+// `POST /v0/runs/{run_id}/consolidate` (#1238) — the operator path to
+// complete a local decomposition where the 60s child-completion sweeper
+// backstop is off. It returns the integrated/conflict outcome on 200, and
+// SURFACES a fan-in failure the event-driven path would WARN-swallow. 4xx/5xx
+// surfaces:
+//   - 400 not_a_decomposed_parent (the run is a child, or has no children)
+//   - 403 agent_token_forbidden (a run-bound agent token attempted it)
+//   - 403 insufficient_scope (token lacks write:runs)
+//   - 404 run_not_found
+//   - 409 not_awaiting_children (already resolved, or not a decomposition)
+//   - 409 children_in_flight (a child is still non-terminal)
+//   - 409 children_failed (a child failed; resolve it before consolidating)
+//   - 502 slice_integration_error (the fan-in failed; the error is surfaced)
+func (c *apiClient) ConsolidateRun(ctx context.Context, id uuid.UUID) (*ConsolidateResult, error) {
+	var res ConsolidateResult
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+id.String()+"/consolidate", nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // CancelRun transitions a run to the cancelled state via
 // `POST /v0/runs/{run_id}/cancel`. Idempotent: cancelling an already-
 // cancelled run returns 200 with the same body. 4xx surfaces:
