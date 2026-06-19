@@ -10862,6 +10862,131 @@ func TestPartitionExemptedMissing(t *testing.T) {
 	}
 }
 
+// TestToScopeExemptions covers the prompt-wire → internal mapping (#1229): a
+// populated upload.ScopeExemption slice maps path/reason 1:1, and a nil/empty
+// input returns nil (the strict gate default — no operator exemptions
+// delivered).
+func TestToScopeExemptions(t *testing.T) {
+	if got := toScopeExemptions(nil); got != nil {
+		t.Errorf("nil input: got %v, want nil", got)
+	}
+	if got := toScopeExemptions([]upload.ScopeExemption{}); got != nil {
+		t.Errorf("empty input: got %v, want nil", got)
+	}
+	got := toScopeExemptions([]upload.ScopeExemption{
+		{Path: "a.go", Reason: "operator-justified unchanged"},
+		{Path: "b.go", Reason: "interface unchanged"},
+	})
+	want := []scopeExemption{
+		{Path: "a.go", Reason: "operator-justified unchanged"},
+		{Path: "b.go", Reason: "interface unchanged"},
+	}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("toScopeExemptions = %+v, want %+v", got, want)
+	}
+}
+
+// TestMergeExemptions covers the agent∪operator union (#1229): the merge
+// deduplicates by Path (the first occurrence's reason wins), preserves order
+// (all of a, then b's new paths), and returns nil when both sets are empty so
+// the strict gate stays byte-identical.
+func TestMergeExemptions(t *testing.T) {
+	if got := mergeExemptions(nil, nil); got != nil {
+		t.Errorf("both-empty: got %v, want nil", got)
+	}
+
+	// Union of agent self-exemptions and operator exemptions, no overlap.
+	self := []scopeExemption{{Path: "self.go", Reason: "agent left unchanged"}}
+	op := []scopeExemption{{Path: "op.go", Reason: "operator-justified"}}
+	got := mergeExemptions(self, op)
+	if len(got) != 2 || got[0].Path != "self.go" || got[1].Path != "op.go" {
+		t.Fatalf("union: got %+v, want [self.go op.go]", got)
+	}
+
+	// Overlapping path is deduplicated; the first (a) occurrence's reason wins.
+	gotDup := mergeExemptions(
+		[]scopeExemption{{Path: "x.go", Reason: "agent reason"}},
+		[]scopeExemption{{Path: "x.go", Reason: "operator reason"}, {Path: "y.go", Reason: "op only"}},
+	)
+	if len(gotDup) != 2 {
+		t.Fatalf("dedup: got %+v, want 2 entries", gotDup)
+	}
+	if gotDup[0].Path != "x.go" || gotDup[0].Reason != "agent reason" {
+		t.Errorf("dedup: first-occurrence reason must win, got %+v", gotDup[0])
+	}
+	if gotDup[1].Path != "y.go" {
+		t.Errorf("dedup: b's new path must follow, got %+v", gotDup[1])
+	}
+}
+
+// TestOperatorExemption_GateSubtraction covers the #1229 operator path through
+// the gate's subtraction (mirroring the #1153 self-exemption assertions):
+// an operator-exempted missing path is subtracted (gate passes), while an
+// un-exempted missing path still fails (remainder non-empty). Operator
+// exemptions reach the gate as the b-side of mergeExemptions with no agent
+// self-exemptions (the common recovery case).
+func TestOperatorExemption_GateSubtraction(t *testing.T) {
+	op := []scopeExemption{{Path: "op.go", Reason: "operator-justified unchanged"}}
+	combined := mergeExemptions(nil, op)
+
+	// Operator-exempted missing path subtracted → gate passes.
+	exempted, remaining := partitionExemptedMissing([]string{"op.go"}, combined)
+	if len(remaining) != 0 || len(exempted) != 1 || exempted[0] != "op.go" {
+		t.Errorf("operator-exempted: exempted=%v remaining=%v", exempted, remaining)
+	}
+
+	// An un-exempted missing path still fails the gate.
+	exempted, remaining = partitionExemptedMissing([]string{"op.go", "other.go"}, combined)
+	if len(remaining) != 1 || remaining[0] != "other.go" || len(exempted) != 1 || exempted[0] != "op.go" {
+		t.Errorf("partial: exempted=%v remaining=%v", exempted, remaining)
+	}
+}
+
+// TestReinvokePersistence_OperatorExemptionSurvivesSidecarReset is the
+// CRITICAL #1229 re-invoke-persistence case. It models run()'s base-rebase
+// re-invoke: the FIRST gate call sees both the agent's in-band self-exemption
+// and the operator's prompt-delivered exemption; the re-invoke then resets
+// validatedExemptions to nil (the re-invoked agent justified nothing, so the
+// swept sidecar reload returns nil) while operatorExemptions — held in a
+// SEPARATE var, never cleared — persists. On the SECOND gate call the operator
+// exemption still subtracts, but the stale self-exemption does NOT.
+func TestReinvokePersistence_OperatorExemptionSurvivesSidecarReset(t *testing.T) {
+	cfg := exemptCfg()
+	dir := t.TempDir()
+	orig := scopeJustificationDir
+	scopeJustificationDir = dir
+	t.Cleanup(func() { scopeJustificationDir = orig })
+
+	operatorExemptions := []scopeExemption{{Path: "op.go", Reason: "operator-justified unchanged"}}
+
+	// Attempt 1: agent self-exempted self.go in-band; operator exempted op.go.
+	validatedExemptions := []scopeExemption{{Path: "self.go", Reason: "agent left unchanged"}}
+	combined1 := mergeExemptions(validatedExemptions, operatorExemptions)
+	_, remaining1 := partitionExemptedMissing([]string{"op.go", "self.go"}, combined1)
+	if len(remaining1) != 0 {
+		t.Fatalf("attempt 1: both exempted, want empty remainder, got %v", remaining1)
+	}
+
+	// Base-rebase re-invoke: the second agent justified nothing, so there is no
+	// sidecar and the real loadScopeExemptions reload resets validatedExemptions
+	// to nil. operatorExemptions is held in a SEPARATE var and is NOT cleared.
+	var logSink strings.Builder
+	validatedExemptions = loadScopeExemptions(cfg, []string{"self.go", "op.go"}, &logSink)
+	if validatedExemptions != nil {
+		t.Fatalf("re-invoke reset: absent sidecar must yield nil, got %v", validatedExemptions)
+	}
+	combined2 := mergeExemptions(validatedExemptions, operatorExemptions)
+	exempted2, remaining2 := partitionExemptedMissing([]string{"op.go", "self.go"}, combined2)
+	// Operator exemption survives the reset and still subtracts.
+	if len(exempted2) != 1 || exempted2[0] != "op.go" {
+		t.Errorf("attempt 2: operator exemption must survive the reset, exempted=%v", exempted2)
+	}
+	// The stale self-exemption does NOT survive — it failed to re-justify.
+	if len(remaining2) != 1 || remaining2[0] != "self.go" {
+		t.Errorf("attempt 2: stale self-exemption must NOT survive, remaining=%v", remaining2)
+	}
+}
+
 // TestSweepStaleScopeJustification covers the pre-invoke freshness sweep
 // (binding condition / strategy test 8): a pre-existing keyed sidecar is removed
 // and scope_justification_swept logged; an absent one is a silent no-op.

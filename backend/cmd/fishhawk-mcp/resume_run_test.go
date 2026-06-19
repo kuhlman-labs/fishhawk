@@ -52,6 +52,31 @@ func TestResumeRun_HappyPath_PostsBodyReturnsRun(t *testing.T) {
 	}
 }
 
+// TestResumeRun_ExemptScopeFiles_RoundTrips pins the #1229 exempt_scope_files
+// lever: the MCP input's ExemptScopeFiles reaches the backend recover request
+// body byte-for-byte (path + reason), alongside add_scope_files.
+func TestResumeRun_ExemptScopeFiles_RoundTrips(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parentID := uuid.New()
+	_, _, err := r.resumeRun(context.Background(), nil, ResumeRunInput{
+		ParentRunID: parentID.String(),
+		ExemptScopeFiles: []RecoverExemptPath{
+			{Path: "backend/internal/server/handlers.go", Reason: "no change needed on this slice"},
+		},
+		Reason: "recover with the declared file left unchanged",
+	})
+	if err != nil {
+		t.Fatalf("resumeRun: %v", err)
+	}
+	if len(fb.recoverBody.ExemptScopeFiles) != 1 ||
+		fb.recoverBody.ExemptScopeFiles[0].Path != "backend/internal/server/handlers.go" ||
+		fb.recoverBody.ExemptScopeFiles[0].Reason != "no change needed on this slice" {
+		t.Errorf("backend got ExemptScopeFiles = %+v", fb.recoverBody.ExemptScopeFiles)
+	}
+}
+
 func TestResumeRun_InvalidUUID_FailsLocally(t *testing.T) {
 	_, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)

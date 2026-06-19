@@ -19,7 +19,14 @@ type ResumeRunInput struct {
 	// AddScopeFiles are operator-named paths folded into the recovery
 	// run's effective scope as a pre-approved scope amendment.
 	AddScopeFiles []RecoverScopePath `json:"add_scope_files,omitempty" jsonschema:"paths to fold into the recovery run's effective scope; each entry is {path, operation} with operation 'modify' (default) or 'create' for net-new files the #818 gate would otherwise fail"`
-	Reason        string             `json:"reason,omitempty" jsonschema:"why the recovery (and each added path) is needed; recorded on the amendment row and the plan_reused_from audit entry"`
+	// ExemptScopeFiles are operator-justified-unchanged paths — the inverse
+	// of AddScopeFiles. Each marks a DECLARED scope.files path the runner's
+	// #1151 shortfall gate should subtract, so a category-B run that failed
+	// SOLELY on a declared-but-unchanged file recovers in ONE resume call
+	// with no replan. Unlike AddScopeFiles, an exemption does NOT widen
+	// scope (no amendment row) — it subtracts from the gate.
+	ExemptScopeFiles []RecoverExemptPath `json:"exempt_scope_files,omitempty" jsonschema:"DECLARED scope.files paths to mark operator-justified-unchanged so the runner's shortfall gate subtracts them; each entry is {path, reason} and both are required. The inverse of add_scope_files: it subtracts from the gate, it does NOT widen scope"`
+	Reason           string              `json:"reason,omitempty" jsonschema:"why the recovery (and each added path) is needed; recorded on the amendment row and the plan_reused_from audit entry, and injected into the recovery agent's binding conditions"`
 	// BudgetOverride forces the recovery past a blocking periodic cost
 	// budget that is over its limit for the current period.
 	BudgetOverride bool   `json:"budget_override,omitempty" jsonschema:"force the recovery past a blocking periodic cost budget that is over its limit; ignored when no blocking budget is over"`
@@ -87,11 +94,12 @@ func (r *runResolver) resumeRun(ctx context.Context, _ *mcp.CallToolRequest, in 
 	}
 
 	created, idempotent, err := r.api.RecoverRun(ctx, RecoverRunParams{
-		ParentRunID:    parentID,
-		AddScopeFiles:  in.AddScopeFiles,
-		Reason:         in.Reason,
-		BudgetOverride: in.BudgetOverride,
-		IdempotencyKey: in.IdempotencyKey,
+		ParentRunID:      parentID,
+		AddScopeFiles:    in.AddScopeFiles,
+		ExemptScopeFiles: in.ExemptScopeFiles,
+		Reason:           in.Reason,
+		BudgetOverride:   in.BudgetOverride,
+		IdempotencyKey:   in.IdempotencyKey,
 	})
 	if err != nil {
 		// Map the backend's gate codes onto operator-actionable tool
