@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -178,6 +179,70 @@ func consolidateAuditCount(t *testing.T, au *auditCompleteAuditFake, runID uuid.
 	return len(entries)
 }
 
+// consolidateAuditPayload fetches the single audit entry of the given category
+// and returns its decoded JSON payload, so a test can assert the structured
+// payload shape (not just that an entry exists). Fails if there isn't exactly
+// one entry of that category.
+func consolidateAuditPayload(t *testing.T, au *auditCompleteAuditFake, runID uuid.UUID, category string) map[string]any {
+	t.Helper()
+	entries, err := au.ListForRunByCategory(context.Background(), runID, category)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(%s): %v", category, err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("%s entries = %d, want exactly 1 to inspect payload", category, len(entries))
+	}
+	var m map[string]any
+	if err := json.Unmarshal(entries[0].Payload, &m); err != nil {
+		t.Fatalf("unmarshal %s payload: %v\npayload: %s", category, err, entries[0].Payload)
+	}
+	return m
+}
+
+// pagingRunRepo wraps the shared orchestratorRepo fake to honor ListRunsFilter
+// Limit/Offset (the base fake ignores both and returns every match). It sorts
+// deterministically — by SliceIndex for decomposed children, ID as a fallback
+// — so Offset paging is stable across the multiple ListRuns calls the
+// consolidate handler's listAllDecomposedChildren helper makes (the base fake
+// iterates its map in random order). This is what lets the >100-child
+// pagination boundary be exercised: without it the base fake returns all
+// children on the first page and a single Limit-capped query would look
+// complete.
+type pagingRunRepo struct {
+	*orchestratorRepo
+}
+
+func (p *pagingRunRepo) ListRuns(ctx context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
+	all, err := p.orchestratorRepo.ListRuns(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(all, func(i, j int) bool {
+		si, sj := all[i].SliceIndex, all[j].SliceIndex
+		switch {
+		case si != nil && sj != nil && *si != *sj:
+			return *si < *sj
+		case si != nil && sj == nil:
+			return true
+		case si == nil && sj != nil:
+			return false
+		default:
+			return all[i].ID.String() < all[j].ID.String()
+		}
+	})
+	if f.Limit <= 0 {
+		return all, nil
+	}
+	start, end := f.Offset, f.Offset+f.Limit
+	if start > len(all) {
+		start = len(all)
+	}
+	if end > len(all) {
+		end = len(all)
+	}
+	return all[start:end], nil
+}
+
 func decodeConsolidate(t *testing.T, w *httptest.ResponseRecorder) consolidateResponse {
 	t.Helper()
 	var resp consolidateResponse
@@ -253,6 +318,28 @@ func TestConsolidateRun_CleanFanIn(t *testing.T) {
 		t.Errorf("children_settled entries = %d, want 1", n)
 	}
 
+	// The children_settled payload is byte-identical to the sweeper's so the
+	// children_status classifier reports correctly — assert its structured
+	// shape, not just that an entry exists: child_run_ids = the actual child
+	// run ids, parent_stage_id = the implement stage, resolved_to_state =
+	// succeeded.
+	settled := consolidateAuditPayload(t, f.au, f.parent.ID, "children_settled")
+	if got, want := settled["parent_stage_id"], f.impl.ID.String(); got != want {
+		t.Errorf("children_settled parent_stage_id = %v, want %q", got, want)
+	}
+	if got := settled["resolved_to_state"]; got != string(run.StageStateSucceeded) {
+		t.Errorf("children_settled resolved_to_state = %v, want succeeded", got)
+	}
+	gotChildIDs := stringSetFromAny(t, settled["child_run_ids"])
+	wantChildIDs := map[string]bool{}
+	kids, _ := f.rr.ListRuns(context.Background(), run.ListRunsFilter{DecomposedFrom: &f.parent.ID})
+	for _, k := range kids {
+		wantChildIDs[k.ID.String()] = true
+	}
+	if len(gotChildIDs) != len(wantChildIDs) || !subsetOf(gotChildIDs, wantChildIDs) {
+		t.Errorf("children_settled child_run_ids = %v, want set %v", gotChildIDs, wantChildIDs)
+	}
+
 	// Parent implement stage resolved succeeded.
 	if f.impl.State != run.StageStateSucceeded {
 		t.Errorf("parent implement state = %q, want succeeded", f.impl.State)
@@ -325,6 +412,21 @@ func TestConsolidateRun_SliceConflict(t *testing.T) {
 	}
 	if n := consolidateAuditCount(t, f.au, f.parent.ID, "children_settled"); n != 0 {
 		t.Errorf("children_settled entries = %d, want 0 on a conflict", n)
+	}
+
+	// The slice_integration_conflict payload carries the machine-readable
+	// resume target the next_actions arm reads back — assert the structured
+	// shape, not just that an entry exists. conflicting_slice_index is decoded
+	// as a float64 through map[string]any.
+	conflictAudit := consolidateAuditPayload(t, f.au, f.parent.ID, "slice_integration_conflict")
+	if got, want := conflictAudit["parent_stage_id"], f.impl.ID.String(); got != want {
+		t.Errorf("conflict parent_stage_id = %v, want %q", got, want)
+	}
+	if got, ok := conflictAudit["conflicting_slice_index"].(float64); !ok || int(got) != 1 {
+		t.Errorf("conflict conflicting_slice_index = %v, want 1", conflictAudit["conflicting_slice_index"])
+	}
+	if got, want := conflictAudit["conflicting_child_run_id"], resp.ConflictingChildRunID; got != want {
+		t.Errorf("conflict conflicting_child_run_id = %v, want %q (the response's conflicting child)", got, want)
 	}
 }
 
@@ -440,6 +542,122 @@ func TestConsolidateRun_NotAwaitingChildren(t *testing.T) {
 	}
 	if code := decodeError(t, w); code != "not_awaiting_children" {
 		t.Errorf("error = %q, want not_awaiting_children", code)
+	}
+}
+
+// stringSetFromAny turns a JSON array decoded into []any (of strings) into a
+// set, failing the test if any element is not a string.
+func stringSetFromAny(t *testing.T, v any) map[string]bool {
+	t.Helper()
+	arr, ok := v.([]any)
+	if !ok {
+		t.Fatalf("value %v is not a JSON array", v)
+	}
+	out := make(map[string]bool, len(arr))
+	for _, e := range arr {
+		s, ok := e.(string)
+		if !ok {
+			t.Fatalf("array element %v is not a string", e)
+		}
+		out[s] = true
+	}
+	return out
+}
+
+// subsetOf reports whether every key of a is present in b.
+func subsetOf(a, b map[string]bool) bool {
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestConsolidateRun_InFlightChildBeyondFirstPage is the >100-child pagination
+// boundary (high/correctness). A fan-out exceeding one page must not be
+// inspected partially: a single Limit-capped ListRuns would see only the first
+// page and miss a later in-flight child, then wrongly transition the parent and
+// Advance early. Here slice 100 (on page 2) is still running while every other
+// child has succeeded; the handler must page past the first 100 and return 409
+// children_in_flight naming that child — NOT proceed to integration.
+func TestConsolidateRun_InFlightChildBeyondFirstPage(t *testing.T) {
+	gh := newConsolidateGitHub()
+	const total = 101 // 0..100 — slice 100 lands on the second page
+	children := make([]childSpec, total)
+	for i := 0; i < total; i++ {
+		st := run.StateSucceeded
+		if i == total-1 {
+			st = run.StateRunning // the lone in-flight child, on page 2
+		}
+		children[i] = childSpec{sliceIndex: i, state: st}
+	}
+	f := seedConsolidateFixture(t, gh, true, children)
+	f.s.cfg.RunRepo = &pagingRunRepo{f.rr} // honor Limit/Offset so paging is exercised
+
+	w := postConsolidate(t, f.s, f.parent.ID, withAuth)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (in-flight child beyond first page must be seen):\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "children_in_flight" {
+		t.Errorf("error = %q, want children_in_flight", code)
+	}
+	// Premature integration must NOT have run.
+	if gh.mergeCount() != 0 {
+		t.Errorf("merges = %d, want 0 (no fan-in while a page-2 child is in flight)", gh.mergeCount())
+	}
+	if f.impl.State != run.StageStateAwaitingChildren {
+		t.Errorf("parent implement state = %q, want awaiting_children (unchanged)", f.impl.State)
+	}
+}
+
+// TestConsolidateRun_ChildrenSettledAuditPagesAllChildren asserts the
+// children_settled audit payload accounts for EVERY child when the fan-out
+// exceeds one page — the second half of the pagination concern. It drives the
+// emitter directly (rather than a full 101-slice integration) so the test is
+// fast and isolated to the paginated child enumeration: with 101 succeeded
+// children, child_run_ids must carry all 101 ids, not just the first page.
+func TestConsolidateRun_ChildrenSettledAuditPagesAllChildren(t *testing.T) {
+	gh := newConsolidateGitHub()
+	const total = 101
+	children := make([]childSpec, total)
+	for i := 0; i < total; i++ {
+		children[i] = childSpec{sliceIndex: i, state: run.StateSucceeded}
+	}
+	f := seedConsolidateFixture(t, gh, true, children)
+	f.s.cfg.RunRepo = &pagingRunRepo{f.rr}
+
+	f.s.emitChildrenSettled(context.Background(), f.parent.ID, f.impl.ID)
+
+	settled := consolidateAuditPayload(t, f.au, f.parent.ID, "children_settled")
+	gotIDs := stringSetFromAny(t, settled["child_run_ids"])
+	if len(gotIDs) != total {
+		t.Errorf("children_settled child_run_ids = %d ids, want %d (every child across both pages)", len(gotIDs), total)
+	}
+}
+
+// TestConsolidateRun_InsufficientScope asserts a non-run-bound operator-agent
+// token lacking write:runs is rejected 403 insufficient_scope — the authz
+// branch that would otherwise pass CI as a silent scope regression.
+func TestConsolidateRun_InsufficientScope(t *testing.T) {
+	gh := newConsolidateGitHub()
+	f := seedConsolidateFixture(t, gh, true, []childSpec{{sliceIndex: 0, state: run.StateSucceeded}})
+
+	withScopeless := func(req *http.Request) *http.Request {
+		id := Identity{
+			Subject: "github:operator-agent", // NOT run-bound (no mcp:run: prefix)
+			TokenID: "tok-scopeless",
+			Scopes:  nil, // missing write:runs
+		}
+		return req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
+	}
+
+	w := postConsolidate(t, f.s, f.parent.ID, withScopeless)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "insufficient_scope" {
+		t.Errorf("error = %q, want insufficient_scope", code)
 	}
 }
 

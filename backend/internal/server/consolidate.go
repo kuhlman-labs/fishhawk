@@ -115,10 +115,7 @@ func (s *Server) handleConsolidateRun(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"decomposed_from": runRow.DecomposedFrom.String()})
 		return
 	}
-	children, err := s.cfg.RunRepo.ListRuns(r.Context(), run.ListRunsFilter{
-		DecomposedFrom: &runID,
-		Limit:          100,
-	})
+	children, err := s.listAllDecomposedChildren(r.Context(), runID)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"list decomposed children failed", map[string]any{"error": err.Error()})
@@ -187,6 +184,33 @@ func (s *Server) handleConsolidateRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.runConsolidation(w, r, runID, parentStage)
+}
+
+// listAllDecomposedChildren returns EVERY decomposed child of parentRunID,
+// paging past the per-query cap. A single Limit-capped ListRuns silently drops
+// children beyond the first page; the approved plan (E24.2 / #1238) forbids a
+// PARTIAL fan-in, so a fan-out exceeding one page must not let a later
+// in-flight or failed child slip past the precondition gate — nor leave it out
+// of the children_settled audit payload the children_status classifier reads.
+// It pages by Offset until a short page (< pageSize) signals the end.
+func (s *Server) listAllDecomposedChildren(ctx context.Context, parentRunID uuid.UUID) ([]*run.Run, error) {
+	const pageSize = 100
+	var all []*run.Run
+	for offset := 0; ; offset += pageSize {
+		page, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
+			DecomposedFrom: &parentRunID,
+			Limit:          pageSize,
+			Offset:         offset,
+		})
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if len(page) < pageSize {
+			break
+		}
+	}
+	return all, nil
 }
 
 // runConsolidation runs the fan-in by composing the exported orchestrator
@@ -275,10 +299,7 @@ func (s *Server) runConsolidation(w http.ResponseWriter, r *http.Request, runID 
 // response. The all-succeeded arm of this verb only ever resolves the stage
 // to succeeded, so resolved_to_state is always "succeeded" here.
 func (s *Server) emitChildrenSettled(ctx context.Context, parentRunID, parentStageID uuid.UUID) {
-	children, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
-		DecomposedFrom: &parentRunID,
-		Limit:          100,
-	})
+	children, err := s.listAllDecomposedChildren(ctx, parentRunID)
 	if err != nil {
 		s.logConsolidateWarn(ctx, "list children for children_settled audit failed", parentRunID, err)
 		return
