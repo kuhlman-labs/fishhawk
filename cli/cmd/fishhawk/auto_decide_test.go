@@ -100,6 +100,8 @@ type autoDecideFake struct {
 	decisionPosts  []uuid.UUID
 	decisionStatus int // 0 → 200; >=400 → error envelope
 
+	stagesStatus int // 0 → 200; >=400 → error envelope (scope-resolution failure)
+
 	terminalAfterDecision bool
 
 	getRunCount int
@@ -129,6 +131,14 @@ func newAutoDecideFake(t *testing.T) (*autoDecideFake, *httptest.Server) {
 		writeJSON(w, http.StatusOK, httpclient.Run{ID: fb.runID, State: state})
 	})
 	mux.HandleFunc("GET /v0/runs/{run_id}/stages", func(w http.ResponseWriter, r *http.Request) {
+		fb.mu.Lock()
+		status := fb.stagesStatus
+		fb.mu.Unlock()
+		if status >= 400 {
+			writeJSON(w, status, map[string]any{"error": map[string]any{
+				"code": "internal", "message": "stage listing failed"}})
+			return
+		}
 		writeJSON(w, http.StatusOK, httpclient.ListStagesResult{Items: []httpclient.Stage{
 			{ID: fb.planStageID, RunID: fb.runID, Sequence: 1, Type: "plan", State: "succeeded"},
 			{ID: uuid.New(), RunID: fb.runID, Sequence: 2, Type: "implement", State: "running"},
@@ -395,6 +405,159 @@ func TestRunAutoDecide_EndToEnd_ApprovesCoupledTest(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "auto-approved amendment "+amendID.String()) {
 		t.Errorf("stdout missing approval line: %s", stdout.String())
+	}
+}
+
+// fetchInScopeFiles is the security-load-bearing input to the matcher:
+// its result gates every auto-approve. A resolution failure (plan
+// artifact missing, malformed, inaccessible, or a backend transport
+// error) MUST yield an empty in-scope set so no amendment can be
+// auto-approved (fail-closed). This asserts that invariant directly.
+func TestFetchInScopeFiles_ResolutionError_EmptySet(t *testing.T) {
+	fb, srv := newAutoDecideFake(t)
+	fb.stagesStatus = http.StatusInternalServerError // scope resolution fails
+
+	c := httpclient.New(srv.URL, "op-tok")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var stderr strings.Builder
+	inScope := fetchInScopeFiles(ctx, c, fb.runID, &stderr)
+	if len(inScope) != 0 {
+		t.Fatalf("inScope = %v, want empty set on resolution failure", inScope)
+	}
+	if !strings.Contains(stderr.String(), "no amendment will auto-approve") {
+		t.Errorf("stderr missing fail-closed warning: %s", stderr.String())
+	}
+}
+
+// End-to-end fail-closed: when scope.files cannot be resolved (backend
+// error), an amendment that WOULD be allowlisted given a readable scope
+// is left undecided — no decision POST — because the in-scope set is
+// empty. This locks the central safety property end-to-end through the
+// command dispatcher and transport.
+func TestRunAutoDecide_EndToEnd_ScopeResolutionFails_NoApprove(t *testing.T) {
+	fb, srv := newAutoDecideFake(t)
+	fb.stagesStatus = http.StatusInternalServerError
+	// A coupled test sibling that would be auto-approved if scope.files
+	// resolved to include pkg/foo.go; with resolution failing it must not.
+	fb.addAmendment(httpclient.ScopeAmendmentPath{Path: "pkg/foo_test.go", Operation: "create"})
+
+	t.Setenv("FISHHAWK_BACKEND_URL", srv.URL)
+	t.Setenv("FISHHAWK_TOKEN", "op-tok")
+
+	var stdout strings.Builder
+	// --max-duration keeps the deadline short so the loop exits after
+	// declining the (now out-of-scope) amendment.
+	rc := run([]string{"run", "auto-decide", "--poll", "1", "--max-duration", "250ms", fb.runID.String()}, &stdout, io.Discard)
+	if rc != exitOK {
+		t.Fatalf("rc = %d, want exitOK", rc)
+	}
+	if posts := fb.posts(); len(posts) != 0 {
+		t.Fatalf("decision posts = %v, want none (scope unresolved → fail-closed)", posts)
+	}
+}
+
+// fetchInScopeFiles walks to the parent run when the current run has no
+// usable plan artifact (a decomposed child / implement-only run). This
+// drives the r.ParentRunID hop: the child has no plan stage, the parent
+// carries the standard_v1 plan, and the resolved set is the parent's
+// scope.files.
+func TestFetchInScopeFiles_ParentWalk(t *testing.T) {
+	childID := uuid.New()
+	parentID := uuid.New()
+	parentPlanStage := uuid.New()
+	schema := "standard_v1"
+
+	writeJSON := func(w http.ResponseWriter, status int, v any) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(v)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
+		id, _ := uuid.Parse(r.PathValue("run_id"))
+		if id == childID {
+			writeJSON(w, http.StatusOK, httpclient.Run{ID: childID, State: "running", ParentRunID: &parentID})
+			return
+		}
+		writeJSON(w, http.StatusOK, httpclient.Run{ID: parentID, State: "running"})
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}/stages", func(w http.ResponseWriter, r *http.Request) {
+		id, _ := uuid.Parse(r.PathValue("run_id"))
+		if id == childID {
+			// Implement-only child: no plan stage → walk to parent.
+			writeJSON(w, http.StatusOK, httpclient.ListStagesResult{Items: []httpclient.Stage{
+				{ID: uuid.New(), RunID: childID, Sequence: 1, Type: "implement", State: "running"},
+			}})
+			return
+		}
+		writeJSON(w, http.StatusOK, httpclient.ListStagesResult{Items: []httpclient.Stage{
+			{ID: parentPlanStage, RunID: parentID, Sequence: 1, Type: "plan", State: "succeeded"},
+		}})
+	})
+	mux.HandleFunc("GET /v0/stages/{stage_id}/artifacts", func(w http.ResponseWriter, r *http.Request) {
+		content := struct {
+			Scope struct {
+				Files []struct {
+					Path string `json:"path"`
+				} `json:"files"`
+			} `json:"scope"`
+		}{}
+		content.Scope.Files = append(content.Scope.Files, struct {
+			Path string `json:"path"`
+		}{Path: "pkg/foo.go"})
+		raw, _ := json.Marshal(content)
+		writeJSON(w, http.StatusOK, map[string]any{"items": []httpclient.Artifact{
+			{ID: uuid.New(), StageID: parentPlanStage, Kind: "plan", SchemaVersion: &schema, Content: raw},
+		}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := httpclient.New(srv.URL, "op-tok")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	inScope := fetchInScopeFiles(ctx, c, childID, io.Discard)
+	if !inScope["pkg/foo.go"] {
+		t.Fatalf("inScope = %v, want parent scope.files pkg/foo.go resolved via ParentRunID hop", inScope)
+	}
+}
+
+// fetchInScopeFiles bounds the parent walk: a chain of plan-less runs
+// that never terminates must exit after the depth cap with an empty
+// in-scope set (fail-closed), not loop forever. Every run reports no plan
+// stage and a fresh ParentRunID, so the walk is exhausted by the cap.
+func TestFetchInScopeFiles_ParentWalk_DepthExceeded_EmptySet(t *testing.T) {
+	writeJSON := func(w http.ResponseWriter, status int, v any) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(v)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
+		id, _ := uuid.Parse(r.PathValue("run_id"))
+		next := uuid.New() // always another parent → never resolves
+		writeJSON(w, http.StatusOK, httpclient.Run{ID: id, State: "running", ParentRunID: &next})
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}/stages", func(w http.ResponseWriter, r *http.Request) {
+		// No plan stage on any run → always walk to the parent.
+		writeJSON(w, http.StatusOK, httpclient.ListStagesResult{Items: []httpclient.Stage{
+			{ID: uuid.New(), Sequence: 1, Type: "implement", State: "running"},
+		}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := httpclient.New(srv.URL, "op-tok")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var stderr strings.Builder
+	inScope := fetchInScopeFiles(ctx, c, uuid.New(), &stderr)
+	if len(inScope) != 0 {
+		t.Fatalf("inScope = %v, want empty set when the parent walk exceeds depth", inScope)
+	}
+	if !strings.Contains(stderr.String(), "exceeded depth") {
+		t.Errorf("stderr missing depth-exceeded warning: %s", stderr.String())
 	}
 }
 
