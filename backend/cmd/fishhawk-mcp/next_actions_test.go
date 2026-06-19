@@ -165,6 +165,16 @@ func TestNextActions_StateTable(t *testing.T) {
 			wantConsumes: []string{consumesNone},
 		},
 		{
+			// #1147: a decomposed parent parked at awaiting_children gets the
+			// dedicated fan-out arm — run_children then poll children_status.
+			name:         "implement_awaiting_children_fan_out",
+			run:          naRun("running"),
+			stages:       []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_children")},
+			wantState:    "implement_awaiting_children",
+			wantActions:  []string{"fishhawk_run_children", "fishhawk_get_run_status"},
+			wantConsumes: []string{consumesNone, consumesNone},
+		},
+		{
 			name:         "d_category_b_with_succeeded_plan_resume_run",
 			run:          naRun("failed"),
 			stages:       []Stage{naStage("plan", "succeeded"), naFailedImplement("B", "scope drift")},
@@ -410,6 +420,28 @@ func TestNextActions_StateTable(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestNextActions_AwaitingChildren_FanOutArm pins the #1147 arm: a decomposed
+// parent at awaiting_children offers fishhawk_run_children (carrying run_id +
+// workflow) plus a poll whose reason points the operator at the children_status
+// block for the per-child state and fan-in phase.
+func TestNextActions_AwaitingChildren_FanOutArm(t *testing.T) {
+	run := naRun("running")
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_children")}
+
+	na := nextActionsFor(run, stages, nil, nil, nil, nil)
+	if na == nil || na.State != "implement_awaiting_children" {
+		t.Fatalf("state = %+v, want implement_awaiting_children", na)
+	}
+	rc := findAction(t, na, "fishhawk_run_children")
+	if rc.Params["run_id"] != run.ID || rc.Params["workflow"] != run.WorkflowID {
+		t.Errorf("run_children params = %v, want run_id=%s workflow=%s", rc.Params, run.ID, run.WorkflowID)
+	}
+	poll := findAction(t, na, "fishhawk_get_run_status")
+	if !strings.Contains(poll.Reason, "children_status") {
+		t.Errorf("poll reason should point at the children_status block; got %q", poll.Reason)
 	}
 }
 

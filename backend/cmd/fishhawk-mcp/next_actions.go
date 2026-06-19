@@ -274,8 +274,16 @@ func planStageNextActions(run *Run, plan *Stage, planReviewStatus *ReviewStatus)
 // the unclassified fallback).
 func implementStageNextActions(run *Run, impl *Stage, implementReviewStatus *ReviewStatus, hint *ReviewActionHint) *NextActions {
 	switch impl.State {
-	case "pending", "dispatched", "awaiting_children":
+	case "pending", "dispatched":
 		return &NextActions{State: "implement_pending", Actions: dispatchOrPollActions(run, "implement")}
+	case "awaiting_children":
+		// A DECOMPOSED PARENT parked at awaiting_children (#1147): the legal
+		// next move is to fan out the still-pending children, and the
+		// children_status block on this same snapshot carries each child's
+		// live state + the fan-in/integration phase. Dedicated arm so the
+		// operator is pointed at fishhawk_run_children + children_status
+		// instead of the generic dispatch-or-poll for a single stage.
+		return &NextActions{State: "implement_awaiting_children", Actions: awaitingChildrenActions(run)}
 	case "running":
 		return &NextActions{
 			State: "implement_running",
@@ -312,6 +320,24 @@ func implementStageNextActions(run *Run, impl *Stage, implementReviewStatus *Rev
 		return &NextActions{State: "implement_gate_settled", Actions: mergeRitualActions(run, "the implement review is settled with no open concerns")}
 	default:
 		return nil
+	}
+}
+
+// awaitingChildrenActions is the decomposed-parent fan-out arm (#1147): drive
+// the still-pending children with fishhawk_run_children, then re-poll — the
+// children_status block on the same get_run_status snapshot carries each
+// child's live state and the fan-in/integration phase.
+func awaitingChildrenActions(run *Run) []SuggestedAction {
+	return []SuggestedAction{
+		{
+			Action:       "fishhawk_run_children",
+			Params:       map[string]string{"run_id": run.ID, "workflow": run.WorkflowID},
+			Precondition: "the decomposed plan is approved and the parent implement stage is awaiting_children; the children are discovered from the parent's plan_decomposed audit entry",
+			Consumes:     consumesNone,
+			Reason:       "fan out ALL still-pending decomposed children concurrently (idempotent: in-flight and terminal children are left untouched); a child failure is data, not an error",
+		},
+		pollAction(run, suggestedStageWaitPollIntervalSeconds,
+			"the parent is awaiting_children — re-poll and read the children_status block for each child's live state and the fan-in/integration phase (running_children, ready_to_integrate, integrated, or integration_conflict)"),
 	}
 }
 

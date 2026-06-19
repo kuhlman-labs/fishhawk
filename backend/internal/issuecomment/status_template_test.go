@@ -188,6 +188,33 @@ func TestRenderStatusBody_FiltersNoisyAuditCategories(t *testing.T) {
 	}
 }
 
+// TestRenderStatusBody_SliceIntegrationActivity pins #1147: the fan-in
+// outcome audit kinds are admitted by pickActivity and rendered with their
+// verb phrases in the Latest activity section.
+func TestRenderStatusBody_SliceIntegrationActivity(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	cases := []struct {
+		category string
+		want     string
+	}{
+		{"slices_integrated", "Slices integrated"},
+		{"slice_integration_conflict", "Slice integration conflict"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.category, func(t *testing.T) {
+			entries := []*audit.Entry{
+				auditEntry(runID, 1, tc.category, "system", now.Add(-1*time.Minute), nil),
+			}
+			body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+			if !strings.Contains(body, tc.want) {
+				t.Errorf("expected %q in the activity section\n---\n%s", tc.want, body)
+			}
+		})
+	}
+}
+
 func TestRenderStatusBody_NoActivity_OmitsLatestSection(t *testing.T) {
 	r, stages := statusRun(t, uuid.New())
 	body := issuecomment.RenderStatusBody(r, stages, nil, "https://x", time.Now())

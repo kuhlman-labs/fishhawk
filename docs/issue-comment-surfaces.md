@@ -339,10 +339,15 @@ Notes:
   unwinds the settle. Listed here only so a future reader grepping the audit
   categories doesn't mistake it for a comment surface.
 - The slice-integration audit kinds — `slices_integrated` and
-  `slice_integration_conflict` (ADR-041 / #1142) — are **internal,
-  system-actor audit kinds, not issue-comment surfaces**. Nothing in
-  `issuecomment` posts them to the issue thread; neither has a Notifier
-  method. The fan-in step (`orchestrator.go::integrateSlices`, invoked from
+  `slice_integration_conflict` (ADR-041 / #1142) — are **system-actor audit
+  kinds with no dedicated Notifier method**, but as of E24.7 (#1147) both ALSO
+  appear in the living-anchor timeline (the `status_comment_posted` surface).
+  They are not posted by a dedicated Notifier method or `issuecomment` call;
+  instead they render **data-drivenly** through the `activityCategories` set in
+  `status_template.go` (rendered as "Slices integrated" / "Slice integration
+  conflict"), which both `RenderStatusBody` and `renderAnchorTimeline` consume —
+  so the fan-in outcome surfaces in the living anchor with no per-kind Notifier
+  code. The fan-in step (`orchestrator.go::integrateSlices`, invoked from
   BOTH settle paths — `maybeAdvanceDecomposedParent` and
   `childcompletion.resolveParent`) writes one of them when a decomposed
   parent's children have all succeeded and their per-slice branches are
@@ -358,8 +363,11 @@ Notes:
   `conflicting_child_run_id`), never parsing the stage's free-form failure
   reason. Both follow the `children_settled` / `consolidated_pr_opened`
   precedent: best-effort (a nil `Audit` or append failure logs at WARN and
-  never unwinds the settle). Listed here only so a future reader grepping
-  the audit categories doesn't mistake them for comment surfaces.
+  never unwinds the settle). The MCP `fishhawk_get_run_status`
+  `children_status` block (#1147) also reads these kinds to classify the
+  decomposed parent's integration phase (`integrated` /
+  `integration_conflict`) and surface `consolidated_branch` /
+  `conflicting_child_run_id`.
 - The fan-out re-drive action audit kind — `child_redriven` (#698) — is an
   **internal, user-actor audit kind, not an issue-comment surface**. Nothing in
   `issuecomment` posts it to the issue thread; it has no Notifier method. The
