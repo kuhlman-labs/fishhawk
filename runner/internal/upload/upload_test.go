@@ -1285,3 +1285,124 @@ func TestRunLineageComplete_RejectsEmptyRunID(t *testing.T) {
 		t.Errorf("want error on empty run id")
 	}
 }
+
+// TestShipPullRequest_ScopeCompletenessPark pins the #1231 park-report wire
+// shape: Outcome=="scope_completeness_parked" signs and ships the held commit's
+// branch/SHAs + the gate-verified tree + the missing declared paths so the
+// backend can record the park payload and transition the implement stage to
+// awaiting_scope_decision. Asserts the field-for-field body the runner owns and
+// that the signature verifies against exactly those bytes.
+func TestShipPullRequest_ScopeCompletenessPark(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	var receivedSig string
+	var receivedBody []byte
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/pull-request", func(w http.ResponseWriter, r *http.Request) {
+		receivedSig = r.Header.Get("X-Fishhawk-Signature")
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(ShipPullRequestResult{ID: "art-1", StageID: r.URL.Query().Get("stage_id")})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	_, err := c.ShipPullRequest(context.Background(), ShipPullRequestArgs{
+		RunID:        "run-abc",
+		StageID:      "stage-xyz",
+		PrivateKey:   priv,
+		Outcome:      "scope_park",
+		Branch:       "fishhawk/run-abc/stage-xyz",
+		HeadSHA:      "deadbeef",
+		BaseSHA:      "feedface",
+		TreeSHA:      "treesha1",
+		MissingPaths: []string{"backend/internal/run/run.go", "docs/api/v0.md"},
+	})
+	if err != nil {
+		t.Fatalf("ShipPullRequest park: %v", err)
+	}
+	var got pullRequestScopeParkBody
+	if uerr := json.Unmarshal(receivedBody, &got); uerr != nil {
+		t.Fatalf("decode park body: %v", uerr)
+	}
+	want := pullRequestScopeParkBody{
+		Outcome:      "scope_park",
+		Branch:       "fishhawk/run-abc/stage-xyz",
+		HeadSHA:      "deadbeef",
+		BaseSHA:      "feedface",
+		TreeSHA:      "treesha1",
+		MissingPaths: []string{"backend/internal/run/run.go", "docs/api/v0.md"},
+	}
+	if got.Outcome != want.Outcome || got.Branch != want.Branch || got.HeadSHA != want.HeadSHA ||
+		got.BaseSHA != want.BaseSHA || got.TreeSHA != want.TreeSHA ||
+		len(got.MissingPaths) != 2 || got.MissingPaths[0] != want.MissingPaths[0] || got.MissingPaths[1] != want.MissingPaths[1] {
+		t.Errorf("park body = %+v, want %+v", got, want)
+	}
+	// Lock the parity-critical raw wire keys against the backend's scope_park
+	// decode (slice 1): the outcome discriminator and the verified_tree_sha tag.
+	// A drift to a different outcome string or to "tree_sha" would silently fail
+	// the backend's park-report parse — exactly what per-side decode tests with a
+	// shared struct miss.
+	raw := string(receivedBody)
+	if !strings.Contains(raw, `"outcome":"scope_park"`) {
+		t.Errorf("wire body must carry outcome=scope_park: %s", raw)
+	}
+	if !strings.Contains(raw, `"verified_tree_sha":"treesha1"`) || strings.Contains(raw, `"tree_sha":`) {
+		t.Errorf("wire body must carry verified_tree_sha (not tree_sha): %s", raw)
+	}
+	// The signature verifies against exactly the bytes the server received.
+	sigBytes, decErr := hex.DecodeString(receivedSig)
+	if decErr != nil {
+		t.Fatal(decErr)
+	}
+	digest := sha256.Sum256(receivedBody)
+	if !ed25519.Verify(pub, digest[:], sigBytes) {
+		t.Error("signature does not verify against received park body digest")
+	}
+}
+
+// TestFetchPrompt_DecodesOpenPRFromHeldCommit confirms the client decodes the
+// backend's exempt-resolution fields (#1231) into the FetchedPrompt zero-re-run
+// signal. The runner keys its agent-skip + open-PR-from-held-commit branch off
+// these, so a tag drift across the module boundary must fail here.
+func TestFetchPrompt_DecodesOpenPRFromHeldCommit(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "implement",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"open_pr_from_held_commit": true,
+		"held_commit_sha": "deadbeef",
+		"held_commit_branch": "fishhawk/run-abc/stage-xyz"
+	}`
+	c := quickClient(srv)
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{StageID: "stage-abc", PrivateKey: priv})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if !got.OpenPRFromHeldCommit || got.HeldCommitSHA != "deadbeef" || got.HeldCommitBranch != "fishhawk/run-abc/stage-xyz" {
+		t.Errorf("held-commit fields = %t/%q/%q, want true/deadbeef/fishhawk/run-abc/stage-xyz",
+			got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch)
+	}
+}
+
+// TestFetchPrompt_OpenPRFromHeldCommitOmittedWhenAbsent confirms the exempt
+// fields default to false/empty on every non-exempt dispatch (byte-identical to
+// pre-#1231 behavior), so the runner never mistakes an ordinary implement
+// dispatch for the zero-re-run path.
+func TestFetchPrompt_OpenPRFromHeldCommitOmittedWhenAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	c := quickClient(srv)
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{StageID: "stage-abc", PrivateKey: priv})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.OpenPRFromHeldCommit || got.HeldCommitSHA != "" || got.HeldCommitBranch != "" {
+		t.Errorf("exempt fields must default false/empty, got %t/%q/%q",
+			got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch)
+	}
+}
