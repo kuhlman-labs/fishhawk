@@ -356,8 +356,11 @@ type Server struct {
 	p95Cache   map[string]p95CacheEntry
 
 	// nowFunc is the clock the p95 cache uses to age out entries against
-	// implementP95CacheTTL. Defaults to time.Now; tests inject a fake to
-	// drive TTL expiry without sleeping.
+	// implementP95CacheTTL. It ALSO drives the spend-alert hour bucketing in
+	// the spend path: the spendalert.Evaluate reference time and the
+	// cost_recorded timestamp both read it so a test can pin evaluation and
+	// seeding to one controlled instant. Defaults to time.Now; tests inject a
+	// fake to drive TTL expiry without sleeping or to fix the spend-alert hour.
 	nowFunc func() time.Time
 
 	// appBotIdentity{Mu,Resolved,Name,Email} memoize the GitHub App bot
