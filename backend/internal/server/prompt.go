@@ -136,6 +136,35 @@ type promptResponse struct {
 	// down the unchanged agent fix-up path. Omitted on a normal implement
 	// dispatch and on a non-eligible fix-up — byte-identical to today.
 	FixupApplyPatches []fixupApplyPatch `json:"fixup_apply_patches,omitempty"`
+	// ScopeExemptions is the operator's exempt_scope_files list (#1229) echoed
+	// on a recovery run's implement stage so the runner's #1151 MissingScopeFiles
+	// shortfall gate subtracts each operator-justified-unchanged declared path —
+	// the inverse of add_scope_files (it subtracts from the gate, it does not
+	// widen scope). Resolved from the run's OWN plan_reused_from audit entry, so
+	// it is empty/omitted on every non-recovery run — byte-identical to today.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags (scope_exemptions/path/reason)
+	// MUST stay byte-identical to the runner's upload.FetchedPrompt.ScopeExemptions
+	// decoder (runner/internal/upload/upload.go), the counterpart of this field —
+	// the same independent-struct-by-tag convention as BindingAssertions (#1171)
+	// and add_scope_files (#824). A tag drift here breaks the runner gate silently.
+	ScopeExemptions []scopeExemption `json:"scope_exemptions,omitempty"`
+}
+
+// scopeExemption is one operator scope exemption: a DECLARED scope.files path
+// marked operator-justified-unchanged so the runner's #1151 shortfall gate
+// subtracts it (#1229). {path, reason}, both required at the recover endpoint.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags (path/reason) MUST stay
+// byte-identical to the runner's upload.ScopeExemption decoder
+// (runner/internal/upload/upload.go), the counterpart of this struct. Same
+// independent-struct-by-tag convention as bindingAssertion (#1171) and the
+// add_scope_files (#824) cross-module pair. This single server-package type
+// is shared by recoverRunRequest.ExemptScopeFiles (the request + validation),
+// the plan_reused_from exempted_paths persistence, and this response field.
+type scopeExemption struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
 }
 
 // fixupApplyPatch is one entry in promptResponse.FixupApplyPatches: a single
@@ -619,6 +648,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	// the audit log captures the gap.
 	var scopeFiles []scopeFile
 	var bindingAssertions []bindingAssertion
+	var scopeExemptions []scopeExemption
 	var fixup bool
 	var fixupBranch string
 	var fixupExpectedHeadSHA string
@@ -658,6 +688,13 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		}
 		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow, approvedPlan)
 		trigger.ApprovalConditions = s.resolveApprovalConditions(r.Context(), runRow)
+		// Part D (#1229): a recovery run's resume_run reason rides the existing
+		// #558 binding-conditions channel so the operator's steer at recovery
+		// reaches the agent. No-op (byte-identical conditions) on every
+		// non-recovery run — loadRecoveryResumeReason returns nil without a
+		// plan_reused_from entry.
+		trigger.ApprovalConditions = appendRecoveryResumeReason(
+			trigger.ApprovalConditions, s.loadRecoveryResumeReason(r.Context(), runRow.ID))
 		// Binding-assertion declaration (#1171): echo the operator's declared
 		// assertions on the implement prompt-response so the runner can decode
 		// and evaluate them post-implement (slice 2). Only when an approved
@@ -667,6 +704,11 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// add_scope_files / ApprovalConditions.
 		if approvedPlan != nil {
 			bindingAssertions = s.resolveApprovalBindingAssertions(r.Context(), runRow)
+			// Operator scope exemptions (#1229): echo the recovery run's
+			// exempt_scope_files so the runner's #1151 shortfall gate subtracts
+			// each operator-justified-unchanged declared path. Read from the
+			// run's OWN plan_reused_from entry — nil on every non-recovery run.
+			scopeExemptions = s.resolveRecoveryScopeExemptions(r.Context(), runRow.ID)
 		}
 		// Fold the authoritative add_scope_files paths a reviewer named at
 		// approval time into the effective scope set (#824). This structured
@@ -791,6 +833,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		RetryAttempt:         runRow.RetryAttempt,
 		ScopeFiles:           scopeFiles,
 		BindingAssertions:    bindingAssertions,
+		ScopeExemptions:      scopeExemptions,
 		CommitAuthorName:     commitAuthorName,
 		CommitAuthorEmail:    commitAuthorEmail,
 		Fixup:                fixup,
@@ -880,6 +923,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	// the audit log captures the gap.
 	var scopeFiles []scopeFile
 	var bindingAssertions []bindingAssertion
+	var scopeExemptions []scopeExemption
 	var fixup bool
 	var fixupBranch string
 	var fixupExpectedHeadSHA string
@@ -919,6 +963,13 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		}
 		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow, approvedPlan)
 		trigger.ApprovalConditions = s.resolveApprovalConditions(r.Context(), runRow)
+		// Part D (#1229): a recovery run's resume_run reason rides the existing
+		// #558 binding-conditions channel so the operator's steer at recovery
+		// reaches the agent. No-op (byte-identical conditions) on every
+		// non-recovery run — loadRecoveryResumeReason returns nil without a
+		// plan_reused_from entry.
+		trigger.ApprovalConditions = appendRecoveryResumeReason(
+			trigger.ApprovalConditions, s.loadRecoveryResumeReason(r.Context(), runRow.ID))
 		// Binding-assertion declaration (#1171): echo the operator's declared
 		// assertions on the implement prompt-response so the runner can decode
 		// and evaluate them post-implement (slice 2). Only when an approved
@@ -928,6 +979,11 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// add_scope_files / ApprovalConditions.
 		if approvedPlan != nil {
 			bindingAssertions = s.resolveApprovalBindingAssertions(r.Context(), runRow)
+			// Operator scope exemptions (#1229): echo the recovery run's
+			// exempt_scope_files so the runner's #1151 shortfall gate subtracts
+			// each operator-justified-unchanged declared path. Read from the
+			// run's OWN plan_reused_from entry — nil on every non-recovery run.
+			scopeExemptions = s.resolveRecoveryScopeExemptions(r.Context(), runRow.ID)
 		}
 		// Fold the authoritative add_scope_files paths a reviewer named at
 		// approval time into the effective scope set (#824). This structured
@@ -1043,6 +1099,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		RetryAttempt:         runRow.RetryAttempt,
 		ScopeFiles:           scopeFiles,
 		BindingAssertions:    bindingAssertions,
+		ScopeExemptions:      scopeExemptions,
 		CommitAuthorName:     commitAuthorName,
 		CommitAuthorEmail:    commitAuthorEmail,
 		Fixup:                fixup,
@@ -2523,6 +2580,108 @@ func (s *Server) resolveApprovalConditions(ctx context.Context, runRow *run.Run)
 		)
 	}
 	return cond
+}
+
+// resolveRecoveryScopeExemptions returns the operator scope exemptions for an
+// implement-stage prompt, read from the run's OWN plan_reused_from audit entry
+// (#1229). A recovery run — the new-child mint OR the in-place re-driven
+// decomposition child (same id) — records exempted_paths on its own
+// plan_reused_from entry, so NO fan-out parent fallback is needed (unlike
+// resolveApprovalConditions): the exemptions belong to the run executing the
+// implement stage. Returns nil on every non-recovery run (no plan_reused_from),
+// keeping the response byte-identical to today. Best-effort: WARN-logs and
+// returns nil on any error.
+func (s *Server) resolveRecoveryScopeExemptions(ctx context.Context, runID uuid.UUID) []scopeExemption {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryPlanReusedFrom)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list plan_reused_from for scope exemptions failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		var payload struct {
+			ExemptedPaths []scopeExemption `json:"exempted_paths"`
+		}
+		if err := json.Unmarshal(entries[i].Payload, &payload); err != nil {
+			continue
+		}
+		if len(payload.ExemptedPaths) > 0 {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"prompt: loaded operator scope exemptions into implement prompt-response",
+				slog.String("run_id", runID.String()),
+				slog.Int("count", len(payload.ExemptedPaths)),
+			)
+			return payload.ExemptedPaths
+		}
+	}
+	return nil
+}
+
+// loadRecoveryResumeReason returns the operator's resume_run reason recorded on
+// the run's OWN plan_reused_from audit entry (#1229, Part D), capped at 4000
+// bytes. nil when no plan_reused_from entry exists (every non-recovery run) or
+// its reason is empty/whitespace — so normal prompts are byte-identical.
+// Best-effort: WARN-logs and returns nil on any error. The caller appends this
+// to trigger.ApprovalConditions so the recovery directive rides the existing
+// #558 binding-conditions channel, mirroring approve_plan note delivery.
+func (s *Server) loadRecoveryResumeReason(ctx context.Context, runID uuid.UUID) *string {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryPlanReusedFrom)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list plan_reused_from for resume reason failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		var payload struct {
+			Reason string `json:"reason"`
+		}
+		if err := json.Unmarshal(entries[i].Payload, &payload); err != nil {
+			continue
+		}
+		if strings.TrimSpace(payload.Reason) != "" {
+			c := payload.Reason
+			const maxConditionBytes = 4000
+			if len(c) > maxConditionBytes {
+				c = c[:maxConditionBytes] + "...[truncated]"
+			}
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"prompt: loaded recovery resume reason into implement prompt conditions",
+				slog.String("run_id", runID.String()),
+				slog.Int("reason_bytes", len(payload.Reason)),
+			)
+			return &c
+		}
+	}
+	return nil
+}
+
+// appendRecoveryResumeReason folds the recovery run's resume_run reason
+// (#1229, Part D) into the implement prompt's binding conditions so the
+// operator's steer at recovery reaches the agent through the existing #558
+// "Approval conditions" channel. The reason is appended under a labeled
+// marker so the agent can tell it apart from inherited approve-with-conditions
+// text. When recoveryReason is nil the conditions are returned unchanged
+// (every non-recovery run), keeping normal prompts byte-identical.
+func appendRecoveryResumeReason(conditions, recoveryReason *string) *string {
+	if recoveryReason == nil {
+		return conditions
+	}
+	labeled := "Recovery directive (resume_run reason): " + *recoveryReason
+	if conditions == nil {
+		return &labeled
+	}
+	combined := *conditions + "\n\n" + labeled
+	return &combined
 }
 
 // loadApprovalAddScopeFiles scans the run's approval_submitted audit entries

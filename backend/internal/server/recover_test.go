@@ -630,6 +630,154 @@ func TestRecoverRun_DecompositionChildInPlace(t *testing.T) {
 	}
 }
 
+// decodeExemptedPaths reads the run's plan_reused_from exempted_paths from the
+// recorded audit appends.
+func decodeExemptedPaths(t *testing.T, au *recoverAuditRepo, runID uuid.UUID) []scopeExemption {
+	t.Helper()
+	for i := range au.appended {
+		if au.appended[i].Category != CategoryPlanReusedFrom || au.appended[i].RunID != runID {
+			continue
+		}
+		var payload struct {
+			ExemptedPaths []scopeExemption `json:"exempted_paths"`
+		}
+		if err := json.Unmarshal(au.appended[i].Payload, &payload); err != nil {
+			t.Fatalf("decode plan_reused_from payload: %v", err)
+		}
+		return payload.ExemptedPaths
+	}
+	t.Fatalf("no plan_reused_from audit entry for run %s", runID)
+	return nil
+}
+
+// TestRecoverRun_ExemptScopeFiles_NewChild pins the #1229 lever on the
+// new-child mint branch: exempt_scope_files is validated, persisted as
+// exempted_paths on the child's plan_reused_from provenance, and (critically)
+// does NOT mint a scope-amendment row (it subtracts from the runner gate, it
+// does not widen scope).
+func TestRecoverRun_ExemptScopeFiles_NewChild(t *testing.T) {
+	s, rr, sa, au := newRecoverServer(t)
+	parent, _, _ := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+
+	w := postRecover(t, s, parent.ID.String(),
+		`{"exempt_scope_files":[{"path":"backend/internal/server/handlers.go","reason":"no change needed on this slice"}],"reason":"recover, leaving the declared file unchanged"}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var resp runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// Exemptions never mint a scope-amendment row.
+	amendments, err := sa.ListByRun(context.Background(), resp.ID)
+	if err != nil {
+		t.Fatalf("list amendments: %v", err)
+	}
+	if len(amendments) != 0 {
+		t.Errorf("amendments = %d, want 0 (an exemption subtracts from the gate, it does not widen scope)", len(amendments))
+	}
+
+	exempted := decodeExemptedPaths(t, au, resp.ID)
+	if len(exempted) != 1 || exempted[0].Path != "backend/internal/server/handlers.go" ||
+		exempted[0].Reason != "no change needed on this slice" {
+		t.Errorf("exempted_paths = %+v, want the one operator exemption", exempted)
+	}
+}
+
+// TestRecoverRun_ExemptScopeFiles_DecompositionChild pins the #1229 lever on
+// the in-place decomposition-child re-drive branch: exempted_paths are
+// persisted on the re-opened child's plan_reused_from, again with no amendment
+// row.
+func TestRecoverRun_ExemptScopeFiles_DecompositionChild(t *testing.T) {
+	s, rr, sa, au, art := newDecompositionRecoverServer(t)
+	child, _ := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
+
+	w := postRecover(t, s, child.ID.String(),
+		`{"exempt_scope_files":[{"path":"backend/internal/server/handlers.go","reason":"declared but unchanged on this slice"}],"reason":"re-drive in place, file unchanged"}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	amendments, err := sa.ListByRun(context.Background(), child.ID)
+	if err != nil {
+		t.Fatalf("list amendments: %v", err)
+	}
+	if len(amendments) != 0 {
+		t.Errorf("amendments = %d, want 0 (exemptions subtract, they do not widen scope)", len(amendments))
+	}
+
+	exempted := decodeExemptedPaths(t, au, child.ID)
+	if len(exempted) != 1 || exempted[0].Path != "backend/internal/server/handlers.go" ||
+		exempted[0].Reason != "declared but unchanged on this slice" {
+		t.Errorf("exempted_paths = %+v, want the one operator exemption", exempted)
+	}
+}
+
+// TestRecoverRun_ExemptScopeFiles_FailModes asserts BOTH validation fail-modes
+// (bad repo-relative path; empty/whitespace reason) return 400
+// validation_failed field=exempt_scope_files on BOTH recover branches (the
+// new-child mint AND the in-place decomposition re-drive), and that the failure
+// mints/re-drives nothing — validation runs before the run is touched.
+func TestRecoverRun_ExemptScopeFiles_FailModes(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"absolute path", `{"exempt_scope_files":[{"path":"/etc/passwd","reason":"r"}]}`},
+		{"dotdot path", `{"exempt_scope_files":[{"path":"../escape.go","reason":"r"}]}`},
+		{"empty path", `{"exempt_scope_files":[{"path":"  ","reason":"r"}]}`},
+		{"empty reason", `{"exempt_scope_files":[{"path":"backend/a.go","reason":""}]}`},
+		{"whitespace reason", `{"exempt_scope_files":[{"path":"backend/a.go","reason":"   "}]}`},
+	}
+
+	t.Run("new-child branch", func(t *testing.T) {
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				s, rr, _, _ := newRecoverServer(t)
+				parent, _, _ := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+				w := postRecover(t, s, parent.ID.String(), tc.body, nil)
+				if w.Code != http.StatusBadRequest {
+					t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+				}
+				assertErrorCode(t, w, "validation_failed")
+				assertErrorField(t, w, "exempt_scope_files")
+				assertNoRunMinted(t, rr)
+			})
+		}
+	})
+
+	t.Run("decomposition-child branch", func(t *testing.T) {
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				s, rr, _, _, art := newDecompositionRecoverServer(t)
+				child, implStage := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
+				w := postRecover(t, s, child.ID.String(), tc.body, nil)
+				if w.Code != http.StatusBadRequest {
+					t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+				}
+				assertErrorCode(t, w, "validation_failed")
+				assertErrorField(t, w, "exempt_scope_files")
+				// The child was NOT re-driven — validation precedes RedriveChild.
+				reopened, err := rr.GetRun(context.Background(), child.ID)
+				if err != nil {
+					t.Fatalf("get child: %v", err)
+				}
+				if reopened.State != run.StateFailed {
+					t.Errorf("child state = %q, want failed (validation must precede the re-drive)", reopened.State)
+				}
+				stage, err := rr.GetStage(context.Background(), implStage.ID)
+				if err != nil {
+					t.Fatalf("get implement stage: %v", err)
+				}
+				if stage.State != run.StageStateFailed {
+					t.Errorf("implement stage state = %q, want failed (no re-drive on validation failure)", stage.State)
+				}
+			})
+		}
+	})
+}
+
 // TestRecoverRun_DecompositionChildNoAmendment confirms the branch
 // recovers with an empty body (no add_scope_files) — the amendment is
 // optional; the re-drive against the parent-walked plan is the point.
@@ -1204,5 +1352,24 @@ func assertErrorCode(t *testing.T, w *httptest.ResponseRecorder, want string) {
 	}
 	if env.Error.Code != want {
 		t.Errorf("error code = %q, want %q\n%s", env.Error.Code, want, w.Body.String())
+	}
+}
+
+// assertErrorField decodes the error envelope and asserts the details.field
+// value — the precise field name a validation_failed names.
+func assertErrorField(t *testing.T, w *httptest.ResponseRecorder, want string) {
+	t.Helper()
+	var env struct {
+		Error struct {
+			Details struct {
+				Field string `json:"field"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v\n%s", err, w.Body.String())
+	}
+	if env.Error.Details.Field != want {
+		t.Errorf("error details.field = %q, want %q\n%s", env.Error.Details.Field, want, w.Body.String())
 	}
 }

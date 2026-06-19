@@ -2184,12 +2184,28 @@ paths:
         `git add -A` guard) — category-B failures presuppose a
         declared scope, so this is a documented edge, not a refusal.
 
+        **Scope exemptions.** Optional `exempt_scope_files` is the
+        inverse of `add_scope_files` (#1229): each `{path, reason}` marks
+        a DECLARED `scope.files` path operator-justified-unchanged so the
+        runner's `MissingScopeFiles` shortfall gate subtracts it — a
+        category-B run that failed SOLELY on a declared-but-unchanged file
+        recovers in one call with no replan. Unlike `add_scope_files`, an
+        exemption does NOT mint a scope-amendment row (it subtracts from
+        the gate, it does not widen scope). Each path must be clean
+        repo-relative AND carry a non-empty reason; either failure is
+        refused 400 `validation_failed` with `field=exempt_scope_files`.
+        Exemptions are recorded as `exempted_paths` on the
+        `plan_reused_from` provenance and delivered to the runner via the
+        implement prompt's `scope_exemptions` field.
+
         **Provenance.** A `plan_reused_from` audit entry is appended
         on the child with
-        `{parent_run_id, parent_failure_category, added_paths, source,
-        reason}`; `source` is `operator_recovery` for a top-level
-        target and `decomposition_child_recovery` for an in-place
-        child re-drive. The approved amendment row is the second surface.
+        `{parent_run_id, parent_failure_category, added_paths,
+        exempted_paths, source, reason}`; `source` is `operator_recovery`
+        for a top-level target and `decomposition_child_recovery` for an
+        in-place child re-drive. The approved amendment row is the second
+        surface. The `reason` is additionally injected into the recovery
+        agent's binding conditions (Part D, #1229).
 
         No `workflow_dispatch` is fired — identical to `POST /v0/runs`:
         local-runner runs sit pending for the local loop to drive. The
@@ -2250,12 +2266,35 @@ paths:
                         type: string
                         enum: [modify, create]
                         default: modify
+                exempt_scope_files:
+                  type: array
+                  description: |
+                    DECLARED `scope.files` paths to mark
+                    operator-justified-unchanged so the runner's shortfall
+                    gate subtracts them (#1229) — the inverse of
+                    `add_scope_files`: it subtracts from the gate, it does
+                    NOT widen scope (no amendment row). Each entry requires
+                    a clean repo-relative `path` AND a non-empty `reason`;
+                    either failure is refused 400 `validation_failed` with
+                    `field=exempt_scope_files`.
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [path, reason]
+                    properties:
+                      path:
+                        type: string
+                        example: backend/internal/server/handlers.go
+                      reason:
+                        type: string
+                        example: the declared file needs no change on this slice
                 reason:
                   type: string
                   description: |
                     Why the recovery (and each added path) is needed;
                     recorded on the amendment row and the
-                    `plan_reused_from` audit entry.
+                    `plan_reused_from` audit entry, and injected into the
+                    recovery agent's binding conditions (Part D).
                 budget_override:
                   type: boolean
                   description: |
@@ -3162,6 +3201,27 @@ paths:
                           type: string
                           enum: [create, modify, delete]
                           description: Per-file intent from the standard_v1 plan scope.files entry.
+                  scope_exemptions:
+                    type: array
+                    description: |
+                      Operator `exempt_scope_files` for a recovery run
+                      (#1229), echoed on the implement stage so the runner's
+                      `MissingScopeFiles` shortfall gate subtracts each
+                      operator-justified-unchanged declared path — the inverse
+                      of `add_scope_files` (it subtracts from the gate, it does
+                      not widen scope). Resolved from the run's own
+                      `plan_reused_from` provenance; absent on every
+                      non-recovery run.
+                    items:
+                      type: object
+                      required: [path, reason]
+                      properties:
+                        path:
+                          type: string
+                          description: Repo-relative declared scope.files path marked operator-justified-unchanged.
+                        reason:
+                          type: string
+                          description: Operator justification for leaving the declared path unchanged.
                   commit_author_name:
                     type: string
                     description: |
@@ -3310,6 +3370,27 @@ paths:
                           type: string
                           enum: [create, modify, delete]
                           description: Per-file intent from the standard_v1 plan scope.files entry.
+                  scope_exemptions:
+                    type: array
+                    description: |
+                      Operator `exempt_scope_files` for a recovery run
+                      (#1229), echoed on the implement stage so the runner's
+                      `MissingScopeFiles` shortfall gate subtracts each
+                      operator-justified-unchanged declared path — the inverse
+                      of `add_scope_files` (it subtracts from the gate, it does
+                      not widen scope). Resolved from the run's own
+                      `plan_reused_from` provenance; absent on every
+                      non-recovery run.
+                    items:
+                      type: object
+                      required: [path, reason]
+                      properties:
+                        path:
+                          type: string
+                          description: Repo-relative declared scope.files path marked operator-justified-unchanged.
+                        reason:
+                          type: string
+                          description: Operator justification for leaving the declared path unchanged.
                   commit_author_name:
                     type: string
                     description: GitHub App bot account's git author name (`<app-slug>[bot]`), resolved backend-side (#722). Absent when unresolvable; the runner falls back to its default.

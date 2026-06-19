@@ -780,22 +780,35 @@ type RecoverScopePath struct {
 	Operation string `json:"operation,omitempty"`
 }
 
+// RecoverExemptPath is one operator-justified-unchanged path on a recovery
+// request (#1229): a DECLARED scope.files path the runner's #1151 shortfall
+// gate subtracts. The inverse of RecoverScopePath — it carries a required
+// {path, reason} and subtracts from the gate rather than widening scope.
+// Exported (like RecoverScopePath) so the MCP tool's input schema can reuse
+// the same shape the wire body carries.
+type RecoverExemptPath struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
+}
+
 // recoverRunRequest mirrors `server/recover.go::recoverRunRequest`.
 type recoverRunRequest struct {
-	AddScopeFiles  []RecoverScopePath `json:"add_scope_files,omitempty"`
-	Reason         string             `json:"reason,omitempty"`
-	BudgetOverride bool               `json:"budget_override,omitempty"`
+	AddScopeFiles    []RecoverScopePath  `json:"add_scope_files,omitempty"`
+	ExemptScopeFiles []RecoverExemptPath `json:"exempt_scope_files,omitempty"`
+	Reason           string              `json:"reason,omitempty"`
+	BudgetOverride   bool                `json:"budget_override,omitempty"`
 }
 
 // RecoverRunParams bundles the inputs to RecoverRun. IdempotencyKey
 // travels in the HTTP header per the backend's E8.2 contract, same
 // keyspace as StartRun.
 type RecoverRunParams struct {
-	ParentRunID    uuid.UUID
-	AddScopeFiles  []RecoverScopePath
-	Reason         string
-	BudgetOverride bool
-	IdempotencyKey string
+	ParentRunID      uuid.UUID
+	AddScopeFiles    []RecoverScopePath
+	ExemptScopeFiles []RecoverExemptPath
+	Reason           string
+	BudgetOverride   bool
+	IdempotencyKey   string
 }
 
 // RecoverRun mints a category-B recovery run via
@@ -808,9 +821,10 @@ type RecoverRunParams struct {
 //   - 422 recovery_unsupported (no cached workflow spec)
 func (c *apiClient) RecoverRun(ctx context.Context, p RecoverRunParams) (*Run, bool, error) {
 	body, err := json.Marshal(recoverRunRequest{
-		AddScopeFiles:  p.AddScopeFiles,
-		Reason:         p.Reason,
-		BudgetOverride: p.BudgetOverride,
+		AddScopeFiles:    p.AddScopeFiles,
+		ExemptScopeFiles: p.ExemptScopeFiles,
+		Reason:           p.Reason,
+		BudgetOverride:   p.BudgetOverride,
 	})
 	if err != nil {
 		return nil, false, fmt.Errorf("marshal recover_run: %w", err)
