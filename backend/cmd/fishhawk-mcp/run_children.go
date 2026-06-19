@@ -116,13 +116,36 @@ host, exactly like fishhawk_run_stage.
 }
 
 // childDispatch is one discovered child's pre-dispatch handle: its run id, the
-// resolved implement stage id, and whether it was pending at discovery.
+// resolved implement stage id, that stage's state, and whether the stage was
+// dispatchable (awaiting a host-side spawn) at discovery. The partition keys on
+// the IMPLEMENT STAGE state, not the run-level state (#1237): a local
+// decomposed child parked by RuleChildrenDispatch has run state 'running' while
+// its implement stage sits at pending/dispatched awaiting this fan-out.
 type childDispatch struct {
-	runID      string
-	stageID    string
-	state      string
+	runID   string
+	stageID string
+	// state is the implement STAGE state read at discovery (pending |
+	// dispatched | running | terminal), surfaced to the caller as stage_state.
+	state string
+	// pending is true when the stage was dispatchable (pending|dispatched) at
+	// discovery — i.e. awaiting a host spawn, so this call dispatches it.
 	pending    bool
 	stateKnown bool
+}
+
+// implementStageDispatchable reports whether an implement stage in the given
+// state is awaiting a host-side runner spawn and so should be dispatched by
+// fishhawk_run_children. Only {pending, dispatched} qualify: a local decomposed
+// child parked by RuleChildrenDispatch (#1143) has its RUN advanced to
+// 'running' but its implement STAGE left at pending/dispatched for host
+// dispatch, so keying on the run state skipped every such child as in-flight
+// (#1237). running / terminal stages are genuinely executing or done and are
+// left untouched. This mirrors the next_actions implement_pending arm
+// (next_actions.go:277, which routes pending|dispatched to dispatch-or-poll);
+// raw string literals match that file's convention (the mcp package does not
+// import the run.StageState* constants).
+func implementStageDispatchable(state string) bool {
+	return state == "pending" || state == "dispatched"
 }
 
 // runChildren is the tool handler.
@@ -180,10 +203,13 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 		repo = detected
 	}
 
-	// (b) Partition children by their freshly-read state: dispatch only
-	// State==pending; report in-flight and terminal children as-is. Reading
-	// state fresh per call (not from the audit snapshot) is what makes
-	// re-invocation idempotent.
+	// (b) Partition children by their freshly-read IMPLEMENT STAGE state:
+	// dispatch only the stages awaiting a host spawn (pending|dispatched);
+	// report in-flight (running) and terminal children as-is. Keying on the
+	// stage state — not the run state — is what makes a local decomposed child
+	// (run='running', stage=pending/dispatched after RuleChildrenDispatch)
+	// dispatchable here (#1237). Reading state fresh per call (not from the
+	// audit snapshot) is what makes re-invocation idempotent.
 	dispatches := make([]childDispatch, 0, len(pd.ChildRunIDs))
 	for _, childID := range pd.ChildRunIDs {
 		d := childDispatch{runID: childID}
@@ -194,22 +220,16 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 			dispatches = append(dispatches, d)
 			continue
 		}
-		runRow, gerr := r.api.GetRun(ctx, childUUID)
-		if gerr != nil {
-			warnings = append(warnings, fmt.Sprintf("child %s: get run failed (%v); skipped", childID, gerr))
-			dispatches = append(dispatches, d)
-			continue
-		}
-		stageID, serr := r.resolveStageID(ctx, childUUID, "implement", "")
+		stage, serr := r.resolveStage(ctx, childUUID, "implement", "")
 		if serr != nil {
 			warnings = append(warnings, fmt.Sprintf("child %s: resolve implement stage failed (%v); skipped", childID, serr))
 			dispatches = append(dispatches, d)
 			continue
 		}
-		d.stageID = stageID
-		d.state = runRow.State
+		d.stageID = stage.ID
+		d.state = stage.State
 		d.stateKnown = true
-		d.pending = runRow.State == "pending"
+		d.pending = implementStageDispatchable(stage.State)
 		dispatches = append(dispatches, d)
 	}
 

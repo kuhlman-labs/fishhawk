@@ -80,13 +80,22 @@ func seedPlanDecomposed(fb *fakeBackend, parent uuid.UUID, childIDs []string, ef
 }
 
 // seedChildRun seeds a child run row at the given state plus its implement
-// stage so GetRun + resolveStageID succeed during discovery.
+// stage at the SAME state, so the run-level and stage-level states agree —
+// the shape the original partition tests rely on.
 func seedChildRun(fb *fakeBackend, childID uuid.UUID, state string) {
+	seedChildRunStage(fb, childID, state, state)
+}
+
+// seedChildRunStage seeds a child run row at runState plus its implement stage
+// at a DISTINCT stageState. It reproduces a local decomposed child parked by
+// RuleChildrenDispatch (#1143): the RUN is advanced to 'running' while the
+// implement STAGE stays at pending/dispatched awaiting a host spawn (#1237).
+func seedChildRunStage(fb *fakeBackend, childID uuid.UUID, runState, stageState string) {
 	stageID := uuid.New()
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
-	fb.getRunByID[childID] = Run{ID: childID.String(), State: state, Repo: "x/y"}
-	fb.stagesByRun[childID] = []Stage{{ID: stageID.String(), RunID: childID.String(), Type: "implement", State: state}}
+	fb.getRunByID[childID] = Run{ID: childID.String(), State: runState, Repo: "x/y"}
+	fb.stagesByRun[childID] = []Stage{{ID: stageID.String(), RunID: childID.String(), Type: "implement", State: stageState}}
 }
 
 // --- concurrency: peak in-flight never exceeds the cap ---
@@ -465,6 +474,95 @@ func TestRunChildren_PartitionsPendingOnly(t *testing.T) {
 	}
 	if c := byID[pendingID.String()]; !c.Dispatched {
 		t.Errorf("pending child not dispatched: %+v", c)
+	}
+}
+
+// --- predicate: dispatchable keys on the implement STAGE state (#1237) ---
+
+func TestImplementStageDispatchable(t *testing.T) {
+	cases := []struct {
+		state string
+		want  bool
+	}{
+		{"pending", true},
+		{"dispatched", true},
+		{"running", false},
+		{"awaiting_approval", false},
+		{"succeeded", false},
+		{"failed", false},
+		{"cancelled", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := implementStageDispatchable(c.state); got != c.want {
+			t.Errorf("implementStageDispatchable(%q) = %v, want %v", c.state, got, c.want)
+		}
+	}
+}
+
+// TestRunChildren_LocalParkedChildrenDispatch is the behavioral done-means
+// test for #1237: a decomposed parent whose children are at RUN state 'running'
+// but implement STAGE state pending/dispatched (the RuleChildrenDispatch-parked
+// shape from run 9b4e5654) must dispatch BOTH. Under the old run-state
+// predicate this dispatched ZERO (run=='running' classified as in-flight); it
+// passes only with the stage-state fix. A third child that is GENUINELY
+// executing (implement stage 'running') is still skipped as in-flight.
+func TestRunChildren_LocalParkedChildrenDispatch(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	dispatchedID := uuid.New() // run='running', stage='dispatched' => dispatch
+	pendingID := uuid.New()    // run='running', stage='pending'    => dispatch
+	executingID := uuid.New()  // run='running', stage='running'    => skip
+	seedChildRunStage(fb, dispatchedID, "running", "dispatched")
+	seedChildRunStage(fb, pendingID, "running", "pending")
+	seedChildRunStage(fb, executingID, "running", "running")
+	seedPlanDecomposed(fb, parent, []string{dispatchedID.String(), pendingID.String(), executingID.String()}, 0)
+
+	var argvSeen []string
+	var mu sync.Mutex
+	withFakeSpawn(t, func(_ context.Context, _ string, argv, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		mu.Lock()
+		argvSeen = append(argvSeen, strings.Join(argv, " "))
+		mu.Unlock()
+		return completedEvents("ok"), nil, 0, nil
+	})
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if out.DispatchedCount != 2 {
+		t.Fatalf("dispatched_count = %d, want 2 (the run='running' + stage=pending/dispatched children)", out.DispatchedCount)
+	}
+	mu.Lock()
+	if len(argvSeen) != 2 {
+		t.Errorf("spawned %d children, want 2: %v", len(argvSeen), argvSeen)
+	}
+	for _, argv := range argvSeen {
+		if !strings.Contains(argv, "--parallel-isolate") {
+			t.Errorf("dispatch argv missing --parallel-isolate: %s", argv)
+		}
+	}
+	mu.Unlock()
+
+	byID := map[string]ChildResult{}
+	for _, c := range out.Children {
+		byID[c.RunID] = c
+	}
+	if c := byID[dispatchedID.String()]; !c.Dispatched {
+		t.Errorf("stage='dispatched' child not dispatched: %+v", c)
+	}
+	if c := byID[pendingID.String()]; !c.Dispatched {
+		t.Errorf("stage='pending' child not dispatched: %+v", c)
+	}
+	// The genuinely-executing child (implement stage 'running') is in-flight:
+	// not re-spawned, and its stage_state reported as the stage state.
+	if c := byID[executingID.String()]; c.Dispatched || c.StageState != "running" {
+		t.Errorf("executing child = %+v, want not dispatched + stage_state running", c)
 	}
 }
 
