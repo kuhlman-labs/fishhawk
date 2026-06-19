@@ -2560,14 +2560,18 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 
 // amendedScopeFilesForReview computes the approval-time scope folds that the
 // implement-review prompt must treat as in-scope rather than as scope drift
-// (#829). It reuses the same resolvers handleGetStagePrompt applies to the
-// implement-stage prompt — resolveApprovalAddScopeFiles (#824 structured fold)
-// and resolveApprovalConditions + extractScopePathsFromConditions (#730 prose
-// fold) — so the review-side and stage-side folds stay in lockstep (single
-// source of truth). It returns the union of both fold sources, deduped and
-// EXCLUDING any path already present in the raw plan scope.files (those are
-// already rendered by writePlanForReview, so naming them again would only
-// restate the existing scope).
+// (#829). It reuses the SAME single fold source handleGetStagePrompt applies to
+// the implement-stage prompt — resolveApprovalAddScopeFiles (#824 structured
+// add_scope_files) — so the review-side and stage-side folds stay in lockstep
+// (single source of truth). The #730 approve-reason prose fold
+// (extractScopePathsFromConditions over resolveApprovalConditions) was removed
+// from BOTH sides in #1225: a repo-relative token scraped out of the operator's
+// free-text reason no longer mutates scope, so the review side must no longer
+// surface one either, or it would flag a prose-named committed path as scope
+// drift while the stage no longer scopes it. It returns the structured fold
+// paths, deduped and EXCLUDING any path already present in the raw plan
+// scope.files (those are already rendered by writePlanForReview, so naming them
+// again would only restate the existing scope).
 //
 // It mirrors the merge helpers' empty-scope philosophy: when the plan declares
 // no scope.files the reviewer has no baseline to drift against, so there is
@@ -2598,9 +2602,6 @@ func (s *Server) amendedScopeFilesForReview(ctx context.Context, runRow *run.Run
 	}
 
 	add(s.resolveApprovalAddScopeFiles(ctx, runRow))
-	if conds := s.resolveApprovalConditions(ctx, runRow); conds != nil {
-		add(extractScopePathsFromConditions(*conds))
-	}
 	return amended
 }
 

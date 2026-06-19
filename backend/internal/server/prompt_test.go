@@ -230,16 +230,6 @@ type stubIssueGetter struct {
 	commentsGotInst int64
 	commentsGotRepo githubclient.RepoRef
 	commentsGotNum  int
-
-	// GetFile seam for the approval-condition existence check (#1191).
-	// notFoundPaths marks specific repo-relative paths as 404 → ErrNotFound;
-	// getFileErr forces a blanket non-not-found error (fail-open assertion).
-	// Every other path defaults to EXISTS so existing fold tests stay green.
-	// getFileCalledPaths records each requested path for assertion.
-	notFoundPaths      map[string]bool
-	getFileErr         error
-	getFileCalledPaths []string
-	getFileGotRef      string
 }
 
 func (s *stubIssueGetter) GetIssue(_ context.Context, installationID int64, repo githubclient.RepoRef, number int) (*githubclient.Issue, error) {
@@ -251,24 +241,6 @@ func (s *stubIssueGetter) GetIssue(_ context.Context, installationID int64, repo
 		return nil, s.getErr
 	}
 	return s.issue, nil
-}
-
-// GetFile satisfies issueGetter for the approval-condition existence check
-// (#1191). It defaults to reporting EXISTS (non-nil FileContent, nil error) so
-// handler-level fold tests that fold a real file stay green; a test opts a
-// specific path into not-found via notFoundPaths, or forces an ambiguous
-// (non-not-found) failure via getFileErr. Records every requested path and the
-// ref it was asked at.
-func (s *stubIssueGetter) GetFile(_ context.Context, installationID int64, repo githubclient.RepoRef, path, ref string) (*githubclient.FileContent, error) {
-	s.getFileCalledPaths = append(s.getFileCalledPaths, path)
-	s.getFileGotRef = ref
-	if s.getFileErr != nil {
-		return nil, s.getFileErr
-	}
-	if s.notFoundPaths[path] {
-		return nil, githubclient.ErrNotFound
-	}
-	return &githubclient.FileContent{Path: path}, nil
 }
 
 func (s *stubIssueGetter) ListIssueComments(_ context.Context, installationID int64, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error) {
@@ -3929,483 +3901,6 @@ func TestExtractScopePathsFromConditions(t *testing.T) {
 	}
 }
 
-// TestMergeApprovalConditionScopeFiles is the done-means test for the #1191
-// existence-checked prose fold: a conditions string naming one EXISTING path
-// (folded as modify) and one NON-EXISTENT path (DROPPED, absent from result),
-// plus the MANDATORY fail-open guards (binding condition 2) where every
-// ambiguous resolution KEEPS the token: nil github, nil installation id, empty
-// repo ref, unresolved base ref, and a non-not-found GetFile error. It fails on
-// the pre-change code (which folds the non-existent token) and passes only when
-// the drop ships.
-func TestMergeApprovalConditionScopeFiles(t *testing.T) {
-	s := New(Config{Addr: "127.0.0.1:0"})
-	strptr := func(v string) *string { return &v }
-	inst := int64(7)
-	repo := githubclient.RepoRef{Owner: "o", Name: "r"}
-	// One declared file, plus an approve reason naming an existing and a
-	// non-existent repo-relative token.
-	base := []scopeFile{{Path: "a/b.go", Operation: "modify"}}
-	const existPath = "pkg/real/exists.go"
-	const ghostPath = "pkg/ghost/missing.go"
-	conds := strptr("Also edit `" + existPath + "` and `" + ghostPath + "` per review.")
-
-	pathsOf := func(files []scopeFile) map[string]bool {
-		out := make(map[string]bool, len(files))
-		for _, f := range files {
-			out[f.Path] = true
-		}
-		return out
-	}
-
-	t.Run("existing path folded, non-existent path dropped", func(t *testing.T) {
-		gh := &stubIssueGetter{notFoundPaths: map[string]bool{ghostPath: true}}
-		got := s.mergeApprovalConditionScopeFiles(context.Background(), gh, &inst, repo, "", true, base, conds)
-		p := pathsOf(got)
-		if !p["a/b.go"] || !p[existPath] {
-			t.Errorf("declared + existing path must be present, got %#v", got)
-		}
-		if p[ghostPath] {
-			t.Errorf("non-existent path %q must be DROPPED, got %#v", ghostPath, got)
-		}
-	})
-
-	t.Run("nil github fails open (keeps both)", func(t *testing.T) {
-		got := s.mergeApprovalConditionScopeFiles(context.Background(), nil, &inst, repo, "", true, base, conds)
-		p := pathsOf(got)
-		if !p[existPath] || !p[ghostPath] {
-			t.Errorf("nil github must keep both paths (fail open), got %#v", got)
-		}
-	})
-
-	t.Run("nil installation id fails open (keeps both)", func(t *testing.T) {
-		gh := &stubIssueGetter{notFoundPaths: map[string]bool{ghostPath: true}}
-		got := s.mergeApprovalConditionScopeFiles(context.Background(), gh, nil, repo, "", true, base, conds)
-		p := pathsOf(got)
-		if !p[existPath] || !p[ghostPath] {
-			t.Errorf("nil installation id must keep both paths (fail open), got %#v", got)
-		}
-		if len(gh.getFileCalledPaths) != 0 {
-			t.Errorf("nil installation id must not call GetFile, got %v", gh.getFileCalledPaths)
-		}
-	})
-
-	t.Run("empty repo ref fails open (keeps both)", func(t *testing.T) {
-		gh := &stubIssueGetter{notFoundPaths: map[string]bool{ghostPath: true}}
-		got := s.mergeApprovalConditionScopeFiles(context.Background(), gh, &inst, githubclient.RepoRef{}, "", true, base, conds)
-		p := pathsOf(got)
-		if !p[existPath] || !p[ghostPath] {
-			t.Errorf("empty repo ref must keep both paths (fail open), got %#v", got)
-		}
-	})
-
-	t.Run("unresolved base ref fails open (keeps both)", func(t *testing.T) {
-		gh := &stubIssueGetter{notFoundPaths: map[string]bool{ghostPath: true}}
-		got := s.mergeApprovalConditionScopeFiles(context.Background(), gh, &inst, repo, "", false, base, conds)
-		p := pathsOf(got)
-		if !p[existPath] || !p[ghostPath] {
-			t.Errorf("unresolved base ref must keep both paths (fail open), got %#v", got)
-		}
-	})
-
-	t.Run("non-not-found GetFile error fails open (keeps both)", func(t *testing.T) {
-		gh := &stubIssueGetter{getFileErr: githubclient.ErrForbidden}
-		got := s.mergeApprovalConditionScopeFiles(context.Background(), gh, &inst, repo, "", true, base, conds)
-		p := pathsOf(got)
-		if !p[existPath] || !p[ghostPath] {
-			t.Errorf("non-not-found error must keep both paths (fail open), got %#v", got)
-		}
-	})
-
-	t.Run("non-default base ref is passed to the existence check", func(t *testing.T) {
-		gh := &stubIssueGetter{}
-		_ = s.mergeApprovalConditionScopeFiles(context.Background(), gh, &inst, repo, "release/v2", true, base, conds)
-		if gh.getFileGotRef != "release/v2" {
-			t.Errorf("existence check ref = %q, want %q", gh.getFileGotRef, "release/v2")
-		}
-	})
-}
-
-// TestResolveImplementBaseRef directly exercises resolveImplementBaseRef
-// (prompt.go:390), the PR-base-resolution branch shipped in #1191/PR#1196. The
-// existing scope-fold tests inject the ref straight into
-// mergeApprovalConditionScopeFiles, so this is the only coverage of the live
-// GetPullRequest resolution and each of its fail-open arms (#1197). It uses a
-// real githubclient.Client pointed at an httptest server — the concrete
-// s.cfg.GitHub seam, NOT the issueGetter interface — reusing
-// newLineageGitHubClient from lineage_test.go (same package).
-func TestResolveImplementBaseRef(t *testing.T) {
-	repo := githubclient.RepoRef{Owner: "o", Name: "r"}
-	prURL := "https://github.com/o/r/pull/42"
-	newRun := func() *run.Run {
-		return &run.Run{
-			ID:             uuid.New(),
-			Repo:           "o/r",
-			InstallationID: instID(99),
-			PullRequestURL: &prURL,
-		}
-	}
-
-	t.Run("PR base ref resolved (success arm)", func(t *testing.T) {
-		stub := &lineageGitHub{baseRef: "release/v2"}
-		s := New(Config{Addr: "127.0.0.1:0", GitHub: newLineageGitHubClient(t, stub)})
-		ref, resolved := s.resolveImplementBaseRef(context.Background(), newRun(), instID(99), repo)
-		if ref != "release/v2" || !resolved {
-			t.Errorf("got (%q, %v), want (%q, true)", ref, resolved, "release/v2")
-		}
-		if !stub.prCalled {
-			t.Errorf("GetPullRequest must be consulted to prove the non-default ref came from the PR base")
-		}
-	})
-
-	t.Run("no PR yet → default-branch check (empty ref, resolved)", func(t *testing.T) {
-		stub := &lineageGitHub{baseRef: "release/v2"}
-		s := New(Config{Addr: "127.0.0.1:0", GitHub: newLineageGitHubClient(t, stub)})
-		runRow := newRun()
-		runRow.PullRequestURL = nil
-		ref, resolved := s.resolveImplementBaseRef(context.Background(), runRow, instID(99), repo)
-		if ref != "" || !resolved {
-			t.Errorf("got (%q, %v), want (\"\", true) for the no-PR default-branch path", ref, resolved)
-		}
-		if stub.prCalled {
-			t.Errorf("no-PR path must not consult GetPullRequest")
-		}
-	})
-
-	t.Run("GetPullRequest error fails open", func(t *testing.T) {
-		stub := &lineageGitHub{baseRef: "release/v2", prStatus: http.StatusInternalServerError}
-		s := New(Config{Addr: "127.0.0.1:0", GitHub: newLineageGitHubClient(t, stub)})
-		ref, resolved := s.resolveImplementBaseRef(context.Background(), newRun(), instID(99), repo)
-		if ref != "" || resolved {
-			t.Errorf("got (%q, %v), want (\"\", false) on GetPullRequest error", ref, resolved)
-		}
-	})
-
-	t.Run("empty PR base ref fails open", func(t *testing.T) {
-		stub := &lineageGitHub{baseRef: ""} // 200 response with empty base.ref
-		s := New(Config{Addr: "127.0.0.1:0", GitHub: newLineageGitHubClient(t, stub)})
-		ref, resolved := s.resolveImplementBaseRef(context.Background(), newRun(), instID(99), repo)
-		if ref != "" || resolved {
-			t.Errorf("got (%q, %v), want (\"\", false) on empty base ref", ref, resolved)
-		}
-		if !stub.prCalled {
-			t.Errorf("empty-base-ref arm must have consulted GetPullRequest")
-		}
-	})
-
-	t.Run("nil GitHub client fails open (no panic)", func(t *testing.T) {
-		s := New(Config{Addr: "127.0.0.1:0"}) // s.cfg.GitHub == nil
-		ref, resolved := s.resolveImplementBaseRef(context.Background(), newRun(), instID(99), repo)
-		if ref != "" || resolved {
-			t.Errorf("got (%q, %v), want (\"\", false) with nil GitHub client", ref, resolved)
-		}
-	})
-
-	t.Run("nil installation id fails open", func(t *testing.T) {
-		stub := &lineageGitHub{baseRef: "release/v2"}
-		s := New(Config{Addr: "127.0.0.1:0", GitHub: newLineageGitHubClient(t, stub)})
-		ref, resolved := s.resolveImplementBaseRef(context.Background(), newRun(), nil, repo)
-		if ref != "" || resolved {
-			t.Errorf("got (%q, %v), want (\"\", false) with nil installation id", ref, resolved)
-		}
-		if stub.prCalled {
-			t.Errorf("nil installation id must short-circuit before GetPullRequest")
-		}
-	})
-
-	t.Run("empty repo ref fails open", func(t *testing.T) {
-		stub := &lineageGitHub{baseRef: "release/v2"}
-		s := New(Config{Addr: "127.0.0.1:0", GitHub: newLineageGitHubClient(t, stub)})
-		ref, resolved := s.resolveImplementBaseRef(context.Background(), newRun(), instID(99), githubclient.RepoRef{})
-		if ref != "" || resolved {
-			t.Errorf("got (%q, %v), want (\"\", false) with empty repo ref", ref, resolved)
-		}
-		if stub.prCalled {
-			t.Errorf("empty repo ref must short-circuit before GetPullRequest")
-		}
-	})
-
-	t.Run("unparseable PR URL → no-PR default-branch path", func(t *testing.T) {
-		stub := &lineageGitHub{baseRef: "release/v2"}
-		s := New(Config{Addr: "127.0.0.1:0", GitHub: newLineageGitHubClient(t, stub)})
-		runRow := newRun()
-		bad := "not-a-pr-url"
-		runRow.PullRequestURL = &bad
-		ref, resolved := s.resolveImplementBaseRef(context.Background(), runRow, instID(99), repo)
-		if ref != "" || !resolved {
-			t.Errorf("got (%q, %v), want (\"\", true) when the PR URL yields no PR number", ref, resolved)
-		}
-		if stub.prCalled {
-			t.Errorf("unparseable PR URL must take the no-PR path, not call GetPullRequest")
-		}
-	})
-
-	// Forwarding subtest (binding condition 2 / done-means a): the resolved
-	// non-default PR base ref must be the ref handed to the existence check, and
-	// a path that EXISTS on that base must be KEPT, not dropped. Wires the real
-	// cfg.GitHub (httptest, base release/v2) for resolveImplementBaseRef together
-	// with a stubIssueGetter existence seam, then feeds the resolved ref straight
-	// into mergeApprovalConditionScopeFiles.
-	t.Run("resolved ref forwarded to existence check; existing path kept", func(t *testing.T) {
-		stub := &lineageGitHub{baseRef: "release/v2"}
-		s := New(Config{Addr: "127.0.0.1:0", GitHub: newLineageGitHubClient(t, stub)})
-		gh := &stubIssueGetter{} // defaults every path to EXISTS, records getFileGotRef
-		const onBasePath = "pkg/onbase/exists.go"
-		base := []scopeFile{{Path: "a/b.go", Operation: "modify"}}
-		conds := func(v string) *string { return &v }("Also edit `" + onBasePath + "` per review.")
-
-		ref, resolved := s.resolveImplementBaseRef(context.Background(), newRun(), instID(99), repo)
-		if ref != "release/v2" || !resolved {
-			t.Fatalf("resolveImplementBaseRef got (%q, %v), want (%q, true)", ref, resolved, "release/v2")
-		}
-		got := s.mergeApprovalConditionScopeFiles(context.Background(), gh, instID(99), repo, ref, resolved, base, conds)
-
-		if gh.getFileGotRef != "release/v2" {
-			t.Errorf("existence check ref = %q, want the resolved PR base %q", gh.getFileGotRef, "release/v2")
-		}
-		kept := false
-		for _, f := range got {
-			if f.Path == onBasePath {
-				kept = true
-			}
-		}
-		if !kept {
-			t.Errorf("path existing on the resolved base %q must be KEPT, got %#v", onBasePath, got)
-		}
-	})
-}
-
-// TestGetStagePrompt_Implement_ConditionFileFoldedIntoScope crosses the full
-// audit-load -> resolveApprovalConditions -> mergeApprovalConditionScopeFiles ->
-// promptResponse.ScopeFiles seam (#730): an approved plan declares one scope
-// file, the binding approve-with-conditions comment names a SECOND file, and
-// the rendered implement-prompt's scope_files must carry BOTH — proving a
-// condition-authorized edit ships as a declared path rather than benign
-// scope_drift. The negative guard asserts a plan-missing (empty scope) run is
-// NOT augmented, preserving the runner's git add -A fallback.
-func TestGetStagePrompt_Implement_ConditionFileFoldedIntoScope(t *testing.T) {
-	const plannedFile = "backend/internal/server/prompt.go"
-	const conditionFile = "backend/internal/server/runs_fake_test.go"
-
-	t.Run("condition file folded into declared scope", func(t *testing.T) {
-		rr := newPromptRunRepo()
-		sf := newSigningFake()
-		art := newFakeArtifactRepo()
-
-		runID := uuid.New()
-		planStageID := uuid.New()
-		implStageID := uuid.New()
-
-		p := &plan.Plan{
-			PlanVersion:  "standard_v1",
-			Summary:      "scoped plan",
-			Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
-			Scope: plan.Scope{
-				Files: []plan.ScopeFile{
-					{Path: plannedFile, Operation: plan.FileOpModify},
-				},
-			},
-		}
-		planBytes, err := json.Marshal(p)
-		if err != nil {
-			t.Fatalf("marshal plan: %v", err)
-		}
-		sv := "standard_v1"
-		if _, err := art.Create(context.Background(), artifact.CreateParams{
-			StageID:       planStageID,
-			Kind:          artifact.KindPlan,
-			SchemaVersion: &sv,
-			Content:       planBytes,
-		}); err != nil {
-			t.Fatalf("seed plan artifact: %v", err)
-		}
-
-		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
-			runID: {{ID: planStageID, RunID: runID, Type: run.StageTypePlan}},
-		}
-		rr.getRuns[runID] = &run.Run{
-			ID:            runID,
-			Repo:          "o/r",
-			WorkflowID:    "feature_change",
-			TriggerSource: run.TriggerCLI,
-		}
-		rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
-
-		condition := "Also update `" + conditionFile + "` to seed the audit entry."
-		priv, _ := sf.issue(t, runID)
-		s := New(Config{
-			Addr:         "127.0.0.1:0",
-			RunRepo:      rr,
-			SigningRepo:  sf,
-			ArtifactRepo: art,
-			AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
-				runID: {makeApproveWithCommentEntry(runID, condition)},
-			}},
-		})
-		s.promptIssueGetterOverride = &stubIssueGetter{}
-
-		w := promptRequest(t, s, runID, implStageID, priv, "")
-		if w.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
-		}
-		var resp promptResponse
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		got := make(map[string]bool, len(resp.ScopeFiles))
-		for _, f := range resp.ScopeFiles {
-			got[f.Path] = true
-		}
-		for _, want := range []string{plannedFile, conditionFile} {
-			if !got[want] {
-				t.Errorf("resp.ScopeFiles missing %q; got %#v", want, resp.ScopeFiles)
-			}
-		}
-	})
-
-	t.Run("plan-missing run is not augmented", func(t *testing.T) {
-		rr := newPromptRunRepo()
-		sf := newSigningFake()
-		art := newFakeArtifactRepo()
-
-		runID := uuid.New()
-		implStageID := uuid.New()
-
-		// No plan artifact seeded → empty scope (plan_missing_for_implement).
-		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {}}
-		rr.getRuns[runID] = &run.Run{
-			ID:            runID,
-			Repo:          "o/r",
-			WorkflowID:    "feature_change",
-			TriggerSource: run.TriggerCLI,
-		}
-		rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
-
-		condition := "Also update `" + conditionFile + "` to seed the audit entry."
-		priv, _ := sf.issue(t, runID)
-		s := New(Config{
-			Addr:         "127.0.0.1:0",
-			RunRepo:      rr,
-			SigningRepo:  sf,
-			ArtifactRepo: art,
-			AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
-				runID: {makeApproveWithCommentEntry(runID, condition)},
-			}},
-		})
-		s.promptIssueGetterOverride = &stubIssueGetter{}
-
-		w := promptRequest(t, s, runID, implStageID, priv, "")
-		if w.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
-		}
-		var resp promptResponse
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if resp.ScopeFiles != nil {
-			t.Errorf("plan-missing run must keep empty scope (git add -A fallback), got %#v", resp.ScopeFiles)
-		}
-	})
-}
-
-// TestGetStagePrompt_Implement_NonexistentConditionPathDropped crosses the same
-// audit-load -> resolveApprovalConditions -> mergeApprovalConditionScopeFiles ->
-// promptResponse.ScopeFiles seam as the #730 fold test, but reproduces run
-// 6b12fcb6 / #1183: the approve-with-conditions comment names a third
-// path-SHAPED token that does NOT exist in the repo. The rendered implement
-// prompt's scope_files must carry ONLY the two real planned files — the bogus
-// token dropped — proving the guaranteed category-B subset-PR failure is
-// averted (#1191). The two real files come straight from the plan scope, so
-// only the bogus condition token is routed through the existence check.
-func TestGetStagePrompt_Implement_NonexistentConditionPathDropped(t *testing.T) {
-	const realFileA = "backend/internal/server/prompt.go"
-	const realFileB = "backend/internal/server/runs.go"
-	// An illustrative, non-repo-relative-looking-but-shaped token of exactly
-	// the kind that wedged run 6b12fcb6 (#1183).
-	const bogusFile = "runResponse/handleGetRun-in-runs.go"
-
-	rr := newPromptRunRepo()
-	sf := newSigningFake()
-	art := newFakeArtifactRepo()
-
-	runID := uuid.New()
-	planStageID := uuid.New()
-	implStageID := uuid.New()
-
-	p := &plan.Plan{
-		PlanVersion:  "standard_v1",
-		Summary:      "scoped plan",
-		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
-		Scope: plan.Scope{
-			Files: []plan.ScopeFile{
-				{Path: realFileA, Operation: plan.FileOpModify},
-				{Path: realFileB, Operation: plan.FileOpModify},
-			},
-		},
-	}
-	planBytes, err := json.Marshal(p)
-	if err != nil {
-		t.Fatalf("marshal plan: %v", err)
-	}
-	sv := "standard_v1"
-	if _, err := art.Create(context.Background(), artifact.CreateParams{
-		StageID:       planStageID,
-		Kind:          artifact.KindPlan,
-		SchemaVersion: &sv,
-		Content:       planBytes,
-	}); err != nil {
-		t.Fatalf("seed plan artifact: %v", err)
-	}
-
-	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
-		runID: {{ID: planStageID, RunID: runID, Type: run.StageTypePlan}},
-	}
-	inst := int64(99)
-	rr.getRuns[runID] = &run.Run{
-		ID:             runID,
-		Repo:           "o/r",
-		WorkflowID:     "feature_change",
-		TriggerSource:  run.TriggerGitHubIssue,
-		InstallationID: &inst,
-	}
-	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
-
-	condition := "Refine `" + realFileA + "` and verify the `" + bogusFile + "` shape (illustrative)."
-	priv, _ := sf.issue(t, runID)
-	s := New(Config{
-		Addr:         "127.0.0.1:0",
-		RunRepo:      rr,
-		SigningRepo:  sf,
-		ArtifactRepo: art,
-		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
-			runID: {makeApproveWithCommentEntry(runID, condition)},
-		}},
-	})
-	// The bogus token reports not-found; everything else (the existence check
-	// never sees the real planned files — they're already in scope) exists.
-	s.promptIssueGetterOverride = &stubIssueGetter{notFoundPaths: map[string]bool{bogusFile: true}}
-
-	w := promptRequest(t, s, runID, implStageID, priv, "")
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
-	}
-	var resp promptResponse
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	got := make(map[string]bool, len(resp.ScopeFiles))
-	for _, f := range resp.ScopeFiles {
-		got[f.Path] = true
-	}
-	for _, want := range []string{realFileA, realFileB} {
-		if !got[want] {
-			t.Errorf("resp.ScopeFiles missing real file %q; got %#v", want, resp.ScopeFiles)
-		}
-	}
-	if got[bogusFile] {
-		t.Errorf("non-existent condition token %q must be DROPPED from scope_files; got %#v", bogusFile, resp.ScopeFiles)
-	}
-}
-
 // makeStageRetriedEntry builds a stage_retried audit entry (#1176 fixture)
 // recording that the run's implement stage was re-dispatched in place. It does
 // not feed the prompt renderer — loadApprovalConditions reads only the
@@ -4764,6 +4259,120 @@ func TestGetStagePrompt_Implement_AddScopeFilesFoldedIntoScope(t *testing.T) {
 			}
 		}
 	})
+}
+
+// makeApproveWithCommentAndScopeFilesEntry builds an approval_submitted audit
+// entry carrying BOTH a free-text operator comment (the #558 binding-conditions
+// reason) AND the structured add_scope_files slice (#824). It lets the #1225
+// regression test prove the two channels diverge: the comment prose is NOT
+// folded into scope while the structured slice still is.
+func makeApproveWithCommentAndScopeFilesEntry(runID uuid.UUID, comment string, addScopeFiles []string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"decision":        "approve",
+		"comment":         comment,
+		"add_scope_files": addScopeFiles,
+	})
+	rid := runID
+	return &audit.Entry{ID: uuid.New(), Category: "approval_submitted", RunID: &rid, Payload: payload}
+}
+
+// TestGetStagePrompt_Implement_ReasonPathNotFoldedIntoScope is the #1225
+// regression guard for the removed #730 approve-reason prose fold. It crosses
+// the full audit-load -> handler -> promptResponse.ScopeFiles seam: an approved
+// plan declares one scope file, the binding approve-with-conditions COMMENT
+// names a repo-relative path (backend/go.mod — the exact E24.4/#1144 token an
+// operator wrote into the reason to EXPLAIN no go.mod edit was needed), and the
+// structured add_scope_files names a DIFFERENT path. The rendered implement
+// prompt's scope_files must carry the plan file and the structured path but
+// MUST NOT carry the comment-named path — proving reason prose no longer mutates
+// scope (so it can never be folded as an unsatisfiable required-to-touch entry)
+// while the structured fold still works. It fails on the pre-#1225 code (which
+// scraped backend/go.mod out of the comment and folded it).
+func TestGetStagePrompt_Implement_ReasonPathNotFoldedIntoScope(t *testing.T) {
+	const plannedFile = "backend/internal/server/prompt.go"
+	const reasonPath = "backend/go.mod"
+	const structuredPath = "docs/api/v0.md"
+	const comment = "Approved. No edit to `backend/go.mod` is needed — it is already correct."
+
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{{Path: plannedFile, Operation: plan.FileOpModify}},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {{ID: planStageID, RunID: runID, Type: run.StageTypePlan}},
+	}
+	rr.getRuns[runID] = &run.Run{
+		ID:            runID,
+		Repo:          "o/r",
+		WorkflowID:    "feature_change",
+		TriggerSource: run.TriggerCLI,
+	}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		SigningRepo:  sf,
+		ArtifactRepo: art,
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {makeApproveWithCommentAndScopeFilesEntry(runID, comment, []string{structuredPath})},
+		}},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, runID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got := make(map[string]bool, len(resp.ScopeFiles))
+	for _, f := range resp.ScopeFiles {
+		got[f.Path] = true
+	}
+	// The plan file and the STRUCTURED add_scope_files path are in scope.
+	for _, want := range []string{plannedFile, structuredPath} {
+		if !got[want] {
+			t.Errorf("resp.ScopeFiles missing %q; got %#v", want, resp.ScopeFiles)
+		}
+	}
+	// The path named ONLY in the approval reason/comment must NOT be folded.
+	if got[reasonPath] {
+		t.Errorf("reason-prose path %q must NOT be folded into scope_files (#1225); got %#v", reasonPath, resp.ScopeFiles)
+	}
+	// The binding comment must still reach the agent as #558 conditions.
+	if !strings.Contains(resp.Prompt, comment) {
+		t.Errorf("approval comment must still be injected as binding conditions (#558); prompt missing %q", comment)
+	}
 }
 
 // TestAddScopeFiles_DoesNotBypassForbiddenPathsGate is the #824 security
