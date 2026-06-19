@@ -368,6 +368,20 @@ Notes:
   decomposed parent's integration phase (`integrated` /
   `integration_conflict`) and surface `consolidated_branch` /
   `conflicting_child_run_id`.
+- The bounded-retry give-up audit kind — `slice_integration_failed` (#1243) —
+  is a **system-actor audit kind with no dedicated Notifier method and is NOT
+  an issue-comment surface**. The child-completion sweeper
+  (`childcompletion.resolveParent`) retries a non-conflict `IntegrateSlices`
+  error every tick; to avoid log-spamming a deterministically-failing
+  integration forever, it counts CONSECUTIVE non-conflict errors per parent
+  and, on the `maxIntegrationAttempts`-th (5th) failing tick, fails the parent
+  implement (awaiting_children) stage category-B RECOVERABLE and writes this
+  entry. It is the bounded-retry give-up TERMINAL event, distinct from
+  `slice_integration_conflict` (a 409 merge conflict, which fails on the first
+  tick). Payload `{parent_stage_id, attempts, error}` records the attempt count
+  and the persistent error string. Best-effort: a nil `Audit` or append failure
+  logs at WARN and never unwinds the give-up. Listed here only so a future
+  reader grepping the audit categories doesn't mistake it for a comment surface.
 - The fan-out re-drive action audit kind — `child_redriven` (#698) — is an
   **internal, user-actor audit kind, not an issue-comment surface**. Nothing in
   `issuecomment` posts it to the issue thread; it has no Notifier method. The

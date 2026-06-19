@@ -532,8 +532,9 @@ func TestTick_Integrate_ConflictFailsParentBNoAdvance(t *testing.T) {
 }
 
 func TestTick_Integrate_ErrorParksParentNoTransition(t *testing.T) {
-	// A non-conflict integration error must leave the stage parked (it
-	// surfaces as a tick error) — never resolve the parent succeeded.
+	// #1243 under-cap branch: a single non-conflict integration error must
+	// leave the stage parked (no transition, WARN-logged) — never resolve
+	// the parent succeeded and never give up before maxIntegrationAttempts.
 	parentRun := uuid.New()
 	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
 	rs := &fakeRunRepo{
@@ -558,6 +559,139 @@ func TestTick_Integrate_ErrorParksParentNoTransition(t *testing.T) {
 	}
 	if len(ad.advanced) != 0 {
 		t.Errorf("Advance calls = %v, want none on integration error", ad.advanced)
+	}
+}
+
+func TestTick_Integrate_BoundedRetryGivesUpAtCap(t *testing.T) {
+	// #1243 give-up branch: a deterministically-failing IntegrateSlices
+	// leaves the parent parked for the first maxIntegrationAttempts-1 ticks
+	// (no transition) and, on the maxIntegrationAttempts-th failing tick,
+	// fails the parent implement stage category-B and emits a
+	// slice_integration_failed audit. Reuses one Sweeper so the per-parent
+	// counter persists across ticks.
+	parentRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{
+			parentRun: {mkChild(uuid.New(), run.StateSucceeded)},
+		},
+	}
+	au := &fakeAudit{}
+	ad := &recordingAdvancer{}
+	integ := &recordingIntegrator{returnErr: errors.New("consolidated branch D/F conflict")}
+	s := &Sweeper{Runs: rs, Audit: au, Advance: ad, Integrate: integ, Logger: slog.Default()}
+
+	// Ticks 1..maxIntegrationAttempts-1: parent parked, NO transition.
+	for i := 1; i < maxIntegrationAttempts; i++ {
+		if err := s.Tick(context.Background()); err != nil {
+			t.Fatalf("Tick %d: %v", i, err)
+		}
+		rs.mu.Lock()
+		n := len(rs.transitions)
+		rs.mu.Unlock()
+		if n != 0 {
+			t.Fatalf("after tick %d: transitions = %d, want 0 (parent parked under cap)", i, n)
+		}
+	}
+
+	// The maxIntegrationAttempts-th failing tick fails the parent category-B.
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("give-up Tick: %v", err)
+	}
+	rs.mu.Lock()
+	if len(rs.transitions) != 1 || rs.transitions[0].To != run.StageStateFailed {
+		t.Fatalf("transitions = %v, want one to failed on the %dth tick", rs.transitions, maxIntegrationAttempts)
+	}
+	if rs.transitions[0].Failure == nil || *rs.transitions[0].Failure != run.FailureB {
+		t.Errorf("FailureCategory = %v, want B (recoverable)", rs.transitions[0].Failure)
+	}
+	rs.mu.Unlock()
+
+	// No Advance on give-up — the parent stays failed-B for operator re-drive.
+	if len(ad.advanced) != 0 {
+		t.Errorf("Advance calls = %v, want none on give-up", ad.advanced)
+	}
+
+	// slice_integration_failed audit emitted with the attempt count + error.
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var found *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "slice_integration_failed" {
+			found = &au.appended[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("no slice_integration_failed audit; have %v", au.appended)
+	}
+	var p map[string]any
+	if err := json.Unmarshal(found.Payload, &p); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if got, _ := p["attempts"].(float64); int(got) != maxIntegrationAttempts {
+		t.Errorf("attempts = %v, want %d", p["attempts"], maxIntegrationAttempts)
+	}
+	if got, _ := p["error"].(string); got == "" {
+		t.Errorf("error payload = %v, want non-empty", p["error"])
+	}
+}
+
+func TestTick_Integrate_CleanIntegrationResetsErrorCounter(t *testing.T) {
+	// #1243 counter-reset branch: a clean integration after prior error
+	// ticks resets the consecutive-error counter, so a subsequent error must
+	// again take the full maxIntegrationAttempts ticks to give up — never a
+	// premature transition carried over from the earlier errors.
+	parentRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{
+			parentRun: {mkChild(uuid.New(), run.StateSucceeded)},
+		},
+	}
+	au := &fakeAudit{}
+	ad := &recordingAdvancer{}
+	integ := &recordingIntegrator{returnErr: errors.New("transient github error")}
+	s := &Sweeper{Runs: rs, Audit: au, Advance: ad, Integrate: integ, Logger: slog.Default()}
+
+	// maxIntegrationAttempts-1 failing ticks accumulate without giving up.
+	for i := 1; i < maxIntegrationAttempts; i++ {
+		if err := s.Tick(context.Background()); err != nil {
+			t.Fatalf("Tick %d: %v", i, err)
+		}
+	}
+	rs.mu.Lock()
+	if len(rs.transitions) != 0 {
+		t.Fatalf("transitions before clean = %v, want 0", rs.transitions)
+	}
+	rs.mu.Unlock()
+
+	// A clean integration resolves the parent succeeded AND resets the counter.
+	integ.mu.Lock()
+	integ.returnErr = nil
+	integ.mu.Unlock()
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("clean Tick: %v", err)
+	}
+	rs.mu.Lock()
+	if len(rs.transitions) != 1 || rs.transitions[0].To != run.StageStateSucceeded {
+		t.Fatalf("transitions after clean = %v, want one to succeeded", rs.transitions)
+	}
+	rs.mu.Unlock()
+
+	// Error again: the counter restarted, so a single error tick must NOT
+	// give up (it would transition if the pre-clean count had carried over).
+	integ.mu.Lock()
+	integ.returnErr = errors.New("error again")
+	integ.mu.Unlock()
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("post-clean error Tick: %v", err)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.transitions) != 1 {
+		t.Errorf("transitions after one post-clean error = %v, want still 1 (counter reset, no give-up)", rs.transitions)
 	}
 }
 

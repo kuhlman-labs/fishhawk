@@ -791,7 +791,7 @@ func TestDecomposition_E2E_ConsolidatedPR(t *testing.T) {
 	if len(gh.createCalls) != 1 {
 		t.Fatalf("CreatePullRequest calls = %d, want 1", len(gh.createCalls))
 	}
-	wantHead := "fishhawk/run-" + parentID.String()[:8]
+	wantHead := "fishhawk/run-" + parentID.String()[:8] + "-consolidated"
 	if gh.createCalls[0].Head != wantHead {
 		t.Errorf("PR head = %q, want %q", gh.createCalls[0].Head, wantHead)
 	}
@@ -900,14 +900,16 @@ func TestDecomposition_E2E_FanInHappyPath(t *testing.T) {
 		t.Fatalf("Tick: %v", err)
 	}
 
-	consolidated := "fishhawk/run-" + parentID.String()[:8]
+	prefix := "fishhawk/run-" + parentID.String()[:8]
+	consolidated := prefix + "-consolidated"
 	// The consolidated branch was created from the base, and BOTH slice
 	// branches merged onto it (done-means: one consolidated branch holding
-	// both slices).
+	// both slices). The consolidated name is the non-nesting -consolidated
+	// sibling, NOT a parent directory of the prefix/slice-<n> refs (#1243).
 	if len(gh.createRefCalls) != 1 || gh.createRefCalls[0] != consolidated {
 		t.Fatalf("CreateRef calls = %v, want [%s]", gh.createRefCalls, consolidated)
 	}
-	wantMerges := map[string]bool{consolidated + "/slice-0": false, consolidated + "/slice-1": false}
+	wantMerges := map[string]bool{prefix + "/slice-0": false, prefix + "/slice-1": false}
 	if len(gh.mergeCalls) != 2 {
 		t.Fatalf("MergeBranch calls = %v, want 2 slice merges", gh.mergeCalls)
 	}
@@ -985,9 +987,11 @@ func TestDecomposition_E2E_FanInConflict(t *testing.T) {
 		}
 	}
 
-	// Slice-1's branch fails to merge (an overlapping change).
-	consolidated := "fishhawk/run-" + parentID.String()[:8]
-	gh.mergeErrByHead = map[string]error{consolidated + "/slice-1": githubclient.ErrMergeConflict}
+	// Slice-1's branch fails to merge (an overlapping change). The slice
+	// branch nests under the run prefix; the consolidated branch is the
+	// non-nesting -consolidated sibling (#1243).
+	prefix := "fishhawk/run-" + parentID.String()[:8]
+	gh.mergeErrByHead = map[string]error{prefix + "/slice-1": githubclient.ErrMergeConflict}
 
 	if err := sw.Tick(ctx); err != nil {
 		t.Fatalf("Tick: %v", err)

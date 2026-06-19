@@ -529,13 +529,13 @@ func (o *Orchestrator) maybeOpenConsolidatedPR(ctx context.Context, r *run.Run, 
 
 // shortRunID returns the first 8 characters of a run UUID's string
 // form. It MUST stay in sync with the runner's shortID helper
-// (runner/cmd/fishhawk-runner/main.go): the runner names the shared
-// branch the decomposed children push to as
-// "fishhawk/run-<shortID(parentRunID)>", and the orchestrator names that
-// same ref as the consolidated PR's head. A divergence would orphan the
-// children's commits from the PR. TestConsolidatedBranch_MatchesRunner
-// asserts the exact string for a known UUID so a drift fails the unit
-// suite, not only the Docker e2e.
+// (runner/cmd/fishhawk-runner/main.go): the runner names each decomposed
+// child's sole-writer slice branch under
+// "fishhawk/run-<shortID(parentRunID)>/slice-<n>", and the orchestrator's
+// sliceBranch must produce the byte-identical name. A divergence would
+// orphan the children's commits from the fan-in merge. The branch-name
+// unit test asserts the exact strings for a known UUID so a drift fails
+// the unit suite, not only the Docker e2e.
 func shortRunID(id uuid.UUID) string {
 	s := id.String()
 	if len(s) < 8 {
@@ -544,11 +544,27 @@ func shortRunID(id uuid.UUID) string {
 	return s[:8]
 }
 
-// consolidatedBranch is the shared-branch name the decomposed children
-// pushed to and the consolidated PR's head. See shortRunID for the
-// runner-side cross-reference.
-func consolidatedBranch(parentID uuid.UUID) string {
+// runBranchPrefix is the stable per-run branch namespace
+// "fishhawk/run-<short>". The slice branches nest UNDER it
+// (runBranchPrefix+"/slice-<n>") while the consolidated branch is a
+// NON-NESTING sibling (runBranchPrefix+"-consolidated"). These two MUST
+// NOT nest: git stores refs as a filesystem-like hierarchy under
+// .git/refs/heads, so a ref whose full path is a strict prefix of an
+// existing ref's path (refs/heads/<prefix> vs refs/heads/<prefix>/slice-0)
+// cannot be created — the directory/file (D/F) conflict that 422'd fan-in
+// 100% in production (#1243). Keeping the consolidated name a sibling of,
+// rather than a parent directory of, the slice refs eliminates it.
+func runBranchPrefix(parentID uuid.UUID) string {
 	return "fishhawk/run-" + shortRunID(parentID)
+}
+
+// consolidatedBranch is the consolidated branch and the consolidated PR's
+// head: the branch each slice merges onto during fan-in. It is a
+// non-nesting sibling of the slice branches (see runBranchPrefix for the
+// D/F-conflict rationale) — the children push to their slice branches, NOT
+// to this one.
+func consolidatedBranch(parentID uuid.UUID) string {
+	return runBranchPrefix(parentID) + "-consolidated"
 }
 
 // consolidatedPRTitleBody derives the PR title + body from the parent
@@ -784,12 +800,15 @@ func (o *Orchestrator) listAllDecomposedChildren(ctx context.Context, parentID u
 
 // sliceBranch is the sole-writer slice branch the decomposed child at
 // sliceIndex pushed to (E24.1 / #1141 / ADR-041):
-// fishhawk/run-<shortParent>/slice-<n>. It MUST stay in sync with the
-// runner's childSliceBranch (runner/cmd/fishhawk-runner/main.go), which
-// derives the same name; a divergence orphans a slice's commits from the
-// fan-in merge (surfaces as a 404 ErrNotFound on MergeBranch).
+// fishhawk/run-<shortParent>/slice-<n>. It derives from runBranchPrefix
+// (NOT consolidatedBranch — the consolidated branch is the non-nesting
+// "-consolidated" sibling, see runBranchPrefix's D/F-conflict note) and
+// MUST stay byte-identical to the runner's childSliceBranch
+// (runner/cmd/fishhawk-runner/main.go), which derives the same name; a
+// divergence orphans a slice's commits from the fan-in merge (surfaces as
+// a 404 ErrNotFound on MergeBranch).
 func sliceBranch(parentID uuid.UUID, sliceIndex int) string {
-	return consolidatedBranch(parentID) + "/slice-" + strconv.Itoa(sliceIndex)
+	return runBranchPrefix(parentID) + "/slice-" + strconv.Itoa(sliceIndex)
 }
 
 // emitSlicesIntegrated writes a slices_integrated audit entry (system

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1224,16 +1225,43 @@ func seedDecomposedParent(t *testing.T, rs *stubRuns, installationID *int64, rev
 	return parent, stages
 }
 
-func TestConsolidatedBranch_MatchesRunner(t *testing.T) {
-	// Contract assertion: the orchestrator's branch helper MUST yield
-	// exactly fishhawk/run-<first8(parentID)> — the same string the
-	// runner's shortID convention produces for the shared branch the
-	// children push to. A divergence orphans the children's commits
-	// from the consolidated PR; this catches it in the unit suite, not
-	// only the Docker e2e.
+func TestBranchNames_NoDFConflict(t *testing.T) {
+	// Contract assertion #1243: the slice-branch name MUST stay
+	// byte-identical to the runner's childSliceBranch convention
+	// (fishhawk/run-<first8>/slice-<n>), while the consolidated branch is
+	// renamed to the non-nesting sibling fishhawk/run-<first8>-consolidated.
+	// The two MUST NOT share a path prefix or git's ref store rejects the
+	// create-ref with a directory/file (D/F) conflict — the 422 that broke
+	// fan-in 100% in production. This catches a regression in the unit
+	// suite, not only the Docker e2e.
 	id := uuid.MustParse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
-	if got := consolidatedBranch(id); got != "fishhawk/run-aaaaaaaa" {
-		t.Errorf("consolidatedBranch = %q, want fishhawk/run-aaaaaaaa", got)
+
+	// (i) consolidated branch is the -consolidated sibling.
+	if got := consolidatedBranch(id); got != "fishhawk/run-aaaaaaaa-consolidated" {
+		t.Errorf("consolidatedBranch = %q, want fishhawk/run-aaaaaaaa-consolidated", got)
+	}
+
+	// (ii) slice branch unchanged — byte-identical to the runner's name.
+	if got := sliceBranch(id, 0); got != "fishhawk/run-aaaaaaaa/slice-0" {
+		t.Errorf("sliceBranch(id,0) = %q, want fishhawk/run-aaaaaaaa/slice-0", got)
+	}
+
+	// (iii) D/F regression guard: the consolidated name is never a path
+	// prefix of any slice name, and vice-versa. A path prefix means one ref
+	// nests under the other, which is the D/F conflict.
+	cons := consolidatedBranch(id)
+	for n := 0; n < 4; n++ {
+		slice := sliceBranch(id, n)
+		if strings.HasPrefix(slice, cons+"/") {
+			t.Errorf("slice %q nests under consolidated %q (D/F conflict)", slice, cons)
+		}
+		if strings.HasPrefix(cons, slice+"/") {
+			t.Errorf("consolidated %q nests under slice %q (D/F conflict)", cons, slice)
+		}
+		// Exact-equality would also be a collision.
+		if slice == cons {
+			t.Errorf("slice %q equals consolidated %q", slice, cons)
+		}
 	}
 }
 
@@ -1259,7 +1287,7 @@ func TestAdvance_DecomposedParent_OpensConsolidatedPR(t *testing.T) {
 		t.Fatalf("CreatePullRequest calls = %d, want 1", len(gh.createPRCalls))
 	}
 	call := gh.createPRCalls[0]
-	wantHead := "fishhawk/run-" + parent.ID.String()[:8]
+	wantHead := consolidatedBranch(parent.ID)
 	if call.Head != wantHead {
 		t.Errorf("head = %q, want %q", call.Head, wantHead)
 	}
@@ -1692,8 +1720,8 @@ func TestIntegrateSlices_Success_MergesInSliceOrder(t *testing.T) {
 	if len(gh.mergeCalls) != 2 {
 		t.Fatalf("MergeBranch calls = %d, want 2", len(gh.mergeCalls))
 	}
-	wantHead0 := consolidated + "/slice-0"
-	wantHead1 := consolidated + "/slice-1"
+	wantHead0 := sliceBranch(parent.ID, 0)
+	wantHead1 := sliceBranch(parent.ID, 1)
 	if gh.mergeCalls[0].Head != wantHead0 || gh.mergeCalls[1].Head != wantHead1 {
 		t.Errorf("merge order heads = [%q, %q], want [%q, %q]",
 			gh.mergeCalls[0].Head, gh.mergeCalls[1].Head, wantHead0, wantHead1)
@@ -1725,6 +1753,81 @@ func TestIntegrateSlices_Success_MergesInSliceOrder(t *testing.T) {
 	_ = child1
 }
 
+// TestIntegrateSlices_CreatesConsolidatedRef_WithPrefixSharingSlices is the
+// #1243 D/F-conflict CI guard: it exercises the exact create-consolidated-ref
+// step that 422'd in production, with the REAL prefix-sharing slice branches
+// already present in the ref store (fishhawk/run-<short>/slice-<n>). The
+// consolidated branch is absent (cexists=false) so CreateRef is invoked; the
+// assertion is that it is created under the NON-NESTING -consolidated name and
+// never under a name that nests within (or contains) the slice path.
+func TestIntegrateSlices_CreatesConsolidatedRef_WithPrefixSharingSlices(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	au := &recordingAudit{}
+	o.Audit = au
+
+	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+	child0 := seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	child1 := seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+	_, _ = child0, child1
+
+	// Seed the base ref AND the real prefix-sharing slice branches as
+	// existing refs — but NOT the consolidated branch, so CreateRef fires.
+	// This reproduces the production state where the slice refs already
+	// occupy fishhawk/run-<short>/slice-<n> when create-consolidated-ref runs.
+	slice0 := sliceBranch(parent.ID, 0)
+	slice1 := sliceBranch(parent.ID, 1)
+	gh.branchSHAs = map[string]string{
+		"main": "basesha",
+		slice0: "slice0sha",
+		slice1: "slice1sha",
+	}
+
+	conflict, err := o.IntegrateSlices(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("IntegrateSlices: %v", err)
+	}
+	if conflict != nil {
+		t.Fatalf("conflict = %+v, want nil", conflict)
+	}
+
+	// CreateRef fired exactly once, under the -consolidated name.
+	if len(gh.createRefCalls) != 1 {
+		t.Fatalf("CreateRef calls = %d, want 1", len(gh.createRefCalls))
+	}
+	consolidated := consolidatedBranch(parent.ID)
+	created := gh.createRefCalls[0].Branch
+	if created != consolidated {
+		t.Errorf("CreateRef branch = %q, want %q", created, consolidated)
+	}
+	// The created consolidated ref must NOT nest under, equal, or be a
+	// parent directory of any slice ref — the D/F conflict that 422'd.
+	for _, slice := range []string{slice0, slice1} {
+		if created == slice {
+			t.Errorf("consolidated ref %q equals slice ref %q (D/F collision)", created, slice)
+		}
+		if strings.HasPrefix(created, slice+"/") {
+			t.Errorf("consolidated ref %q nests under slice ref %q (D/F conflict)", created, slice)
+		}
+		if strings.HasPrefix(slice, created+"/") {
+			t.Errorf("slice ref %q nests under consolidated ref %q (D/F conflict)", slice, created)
+		}
+	}
+
+	// Each slice merges onto the -consolidated branch (never the reverse).
+	if len(gh.mergeCalls) != 2 {
+		t.Fatalf("MergeBranch calls = %d, want 2", len(gh.mergeCalls))
+	}
+	for i, m := range gh.mergeCalls {
+		if m.Base != consolidated {
+			t.Errorf("merge[%d] base = %q, want %q", i, m.Base, consolidated)
+		}
+		if m.Head != sliceBranch(parent.ID, i) {
+			t.Errorf("merge[%d] head = %q, want %q", i, m.Head, sliceBranch(parent.ID, i))
+		}
+	}
+}
+
 func TestIntegrateSlices_Conflict_FailsParentRecoverable(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
 	o.DefaultRef = "main"
@@ -1737,9 +1840,8 @@ func TestIntegrateSlices_Conflict_FailsParentRecoverable(t *testing.T) {
 	child1 := seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
 
 	// Slice-1's branch fails to merge (a conflict).
-	consolidated := consolidatedBranch(parent.ID)
 	gh.mergeErrByHead = map[string]error{
-		consolidated + "/slice-1": githubclient.ErrMergeConflict,
+		sliceBranch(parent.ID, 1): githubclient.ErrMergeConflict,
 	}
 
 	o.maybeAdvanceDecomposedParent(context.Background(), parent.ID)
@@ -1831,9 +1933,8 @@ func TestIntegrateSlices_PaginatesToCompletion(t *testing.T) {
 	if len(gh.mergeCalls) != 3 {
 		t.Fatalf("MergeBranch calls = %d, want 3 (all pages integrated)", len(gh.mergeCalls))
 	}
-	consolidated := consolidatedBranch(parent.ID)
 	for i := 0; i < 3; i++ {
-		want := consolidated + "/slice-" + string(rune('0'+i))
+		want := sliceBranch(parent.ID, i)
 		if gh.mergeCalls[i].Head != want {
 			t.Errorf("merge[%d] head = %q, want %q", i, gh.mergeCalls[i].Head, want)
 		}

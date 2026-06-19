@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -96,7 +97,32 @@ type Sweeper struct {
 	// one tick. Nil-safe: a nil Dispatch disables the backstop, preserving
 	// the pre-#1143 posture for dev and existing tests.
 	Dispatch ChildDispatcher
+
+	// mu guards integrationErrs. Tick runs serially from a single Run
+	// goroutine, but the exported Tick is also called directly (and
+	// concurrently) by tests, so the counter map is mutex-guarded to stay
+	// race-safe under `go test -race`.
+	mu sync.Mutex
+	// integrationErrs counts CONSECUTIVE non-conflict IntegrateSlices errors
+	// per parent run for the bounded-retry give-up (#1243). A clean
+	// integration or a slice conflict (both terminal for the epoch) deletes
+	// the entry so a later re-drive starts fresh. In-memory only: a process
+	// restart resets the count, which is acceptable — it retries
+	// maxIntegrationAttempts more times then gives up again, still bounding
+	// steady-state log spam.
+	integrationErrs map[uuid.UUID]int
 }
+
+// maxIntegrationAttempts bounds how many CONSECUTIVE non-conflict
+// IntegrateSlices errors the sweeper tolerates for one parent before
+// failing the parent implement stage category-B (#1243). A
+// deterministically-failing integration (e.g. the pre-#1243 consolidated-
+// branch D/F conflict) would otherwise be retried every tick forever. The
+// give-up fires ON the maxIntegrationAttempts-th failing tick: ticks
+// 1..maxIntegrationAttempts-1 leave the parent parked (no transition), and
+// the maxIntegrationAttempts-th failing tick transitions the parent and
+// emits the slice_integration_failed audit.
+const maxIntegrationAttempts = 5
 
 // Run blocks until ctx is cancelled, ticking every Interval to
 // resolve parent stages whose children have all reached terminal
@@ -258,8 +284,47 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 		conflict, err := s.Integrate.IntegrateSlices(ctx, parentRunID)
 		switch {
 		case err != nil:
-			return fmt.Errorf("integrate slices: %w", err)
+			// Bounded-retry give-up (#1243): a deterministically-failing
+			// IntegrateSlices would otherwise be retried every tick forever,
+			// log-spamming an unfixable error. Increment the per-parent
+			// consecutive-error counter, THEN fail the parent implement stage
+			// category-B (recoverable) when the counter reaches
+			// maxIntegrationAttempts. Ticks 1..maxIntegrationAttempts-1 leave
+			// the parent parked (return nil — the next tick re-enters; merges
+			// are idempotent), logging ONE WARN per tick with the attempt
+			// count so total spam is bounded to maxIntegrationAttempts lines.
+			attempts := s.recordIntegrationError(parentRunID)
+			if attempts >= maxIntegrationAttempts {
+				cat := run.FailureB
+				reason := fmt.Sprintf("slice integration failed after %d attempts: %v", attempts, err)
+				if _, terr := s.Runs.TransitionStage(ctx, parentStage.ID, run.StageStateFailed, &run.StageCompletion{
+					FailureCategory: &cat,
+					FailureReason:   &reason,
+				}); terr != nil {
+					return fmt.Errorf("transition parent stage to failed-B on integration give-up: %w", terr)
+				}
+				s.emitSliceIntegrationFailed(ctx, parentRunID, parentStage.ID, attempts, err)
+				s.clearIntegrationError(parentRunID)
+				s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: parent failed after bounded slice-integration retries",
+					slog.String("parent_run_id", parentRunID.String()),
+					slog.String("parent_stage_id", parentStage.ID.String()),
+					slog.Int("attempts", attempts),
+					slog.String("error", err.Error()),
+				)
+				return nil
+			}
+			s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: slice integration error; parent parked, will retry",
+				slog.String("parent_run_id", parentRunID.String()),
+				slog.String("parent_stage_id", parentStage.ID.String()),
+				slog.Int("attempt", attempts),
+				slog.Int("max_attempts", maxIntegrationAttempts),
+				slog.String("error", err.Error()),
+			)
+			return nil
 		case conflict != nil:
+			// A slice conflict is terminal for this epoch — reset the
+			// non-conflict-error counter so a later re-drive starts fresh.
+			s.clearIntegrationError(parentRunID)
 			cat := run.FailureB
 			reason := conflict.Detail
 			if _, terr := s.Runs.TransitionStage(ctx, parentStage.ID, run.StageStateFailed, &run.StageCompletion{
@@ -276,6 +341,8 @@ func (s *Sweeper) resolveParent(ctx context.Context, parentStage *run.Stage) err
 			)
 			return nil
 		}
+		// Clean integration — reset the counter so a future epoch starts fresh.
+		s.clearIntegrationError(parentRunID)
 	}
 
 	if _, err := s.Runs.TransitionStage(ctx, parentStage.ID, target, completion); err != nil {
@@ -385,6 +452,60 @@ func (s *Sweeper) emitSliceIntegrationConflict(ctx context.Context, parentRunID,
 		Payload:   payload,
 	}); err != nil {
 		s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: append slice_integration_conflict",
+			slog.String("error", err.Error()))
+	}
+}
+
+// recordIntegrationError increments and returns the parent's consecutive
+// non-conflict integration-error count (#1243), lazily initializing the
+// map. Mutex-guarded for race-safety under concurrent Tick.
+func (s *Sweeper) recordIntegrationError(parentRunID uuid.UUID) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.integrationErrs == nil {
+		s.integrationErrs = make(map[uuid.UUID]int)
+	}
+	s.integrationErrs[parentRunID]++
+	return s.integrationErrs[parentRunID]
+}
+
+// clearIntegrationError drops the parent's consecutive-error count so the
+// next integration epoch starts fresh (#1243). Called on a clean
+// integration, a slice conflict, and after the bounded-retry give-up.
+func (s *Sweeper) clearIntegrationError(parentRunID uuid.UUID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.integrationErrs, parentRunID)
+}
+
+// emitSliceIntegrationFailed writes a slice_integration_failed audit entry
+// (system actor) when the bounded-retry give-up fires (#1243): the parent
+// implement stage is failed category-B after maxIntegrationAttempts
+// consecutive non-conflict integration errors. The payload carries the
+// parent stage id, the attempt count, and the persistent error string.
+// Best-effort, mirroring emitSliceIntegrationConflict: nil marshal guard,
+// WARN-on-error, never unwinds the give-up.
+func (s *Sweeper) emitSliceIntegrationFailed(ctx context.Context, parentRunID, parentStageID uuid.UUID, attempts int, integErr error) {
+	payload, err := json.Marshal(map[string]any{
+		"parent_stage_id": parentStageID.String(),
+		"attempts":        attempts,
+		"error":           integErr.Error(),
+	})
+	if err != nil {
+		s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: marshal slice_integration_failed payload",
+			slog.String("error", err.Error()))
+		return
+	}
+	systemKind := audit.ActorSystem
+	if _, err := s.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     parentRunID,
+		StageID:   &parentStageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "slice_integration_failed",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.logger().LogAttrs(ctx, slog.LevelWarn, "childcompletion: append slice_integration_failed",
 			slog.String("error", err.Error()))
 	}
 }
