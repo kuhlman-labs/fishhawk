@@ -59,17 +59,25 @@ type ChildrenStatus struct {
 	ConflictingChildRunID string `json:"conflicting_child_run_id,omitempty" jsonschema:"the child run whose slice branch failed to merge during fan-in; from the slice_integration_conflict audit payload, present only in the integration_conflict phase"`
 }
 
-// classifyIntegrationPhase is the pure phase classifier (#1147). hasIntegrated
-// / hasConflict are the presence of the slices_integrated /
-// slice_integration_conflict fan-in audit kinds. A conflict with no clean
-// integration wins; a clean integration is terminal; otherwise the phase is
-// derived from the children's states (all-succeeded vs still-in-flight). No
-// I/O so every branch is exhaustively unit-testable.
-func classifyIntegrationPhase(children []ChildStatus, hasIntegrated, hasConflict bool) string {
-	if hasConflict && !hasIntegrated {
+// classifyIntegrationPhase is the pure phase classifier (#1147).
+// integratedSeq / conflictSeq are the highest audit Sequence among the
+// slices_integrated / slice_integration_conflict fan-in audit kinds (-1 when
+// that kind is absent). Ordering is significant: a slice_integration_conflict
+// yields integration_conflict UNLESS a strictly later slices_integrated event
+// recorded a clean re-integration that superseded it — so an older
+// slices_integrated entry can never mask a newer conflict. A clean integration
+// (with no later conflict) is terminal; otherwise the phase is derived from the
+// children's states (all-succeeded vs still-in-flight). No I/O so every branch
+// is exhaustively unit-testable.
+func classifyIntegrationPhase(children []ChildStatus, integratedSeq, conflictSeq int64) string {
+	// A conflict wins unless a strictly later clean integration superseded it.
+	// Sequences are strictly increasing per run, so equality is impossible and
+	// the -1 absent sentinel makes a lone conflict (conflictSeq >= 0) win over an
+	// absent integration (integratedSeq == -1).
+	if conflictSeq >= 0 && conflictSeq > integratedSeq {
 		return integrationPhaseConflict
 	}
-	if hasIntegrated {
+	if integratedSeq >= 0 {
 		return integrationPhaseIntegrated
 	}
 	if len(children) > 0 {
@@ -131,28 +139,32 @@ func (r *runResolver) childrenStatusFor(ctx context.Context, parentID uuid.UUID,
 		cs.Children = append(cs.Children, child)
 	}
 
-	// Scan the recent-audit window for the fan-in outcome. The cost gate in
-	// getRunStatus only calls this when recentAudit carries a decomposition
-	// marker (or the implement stage is awaiting_children), so the markers
-	// land here when present.
-	hasIntegrated, hasConflict := false, false
+	// Scan the recent-audit window for the fan-in outcome, tracking the HIGHEST
+	// Sequence per kind so the classifier can honour ordering (a later clean
+	// integration supersedes an earlier conflict, and vice-versa). recentAudit
+	// is time-descending but we do not rely on its order: we keep the
+	// max-sequence entry for each kind and decode the surfaced branch / child
+	// from that same latest entry. The cost gate in getRunStatus only calls this
+	// when recentAudit carries a decomposition marker (or the implement stage is
+	// awaiting_children), so the markers land here when present.
+	var integratedSeq, conflictSeq int64 = -1, -1
 	for i := range recentAudit {
 		e := &recentAudit[i]
 		switch e.Category {
 		case "slices_integrated":
-			hasIntegrated = true
-			if branch := decodeConsolidatedBranch(e.Payload); branch != "" {
-				cs.ConsolidatedBranch = branch
+			if e.Sequence > integratedSeq {
+				integratedSeq = e.Sequence
+				cs.ConsolidatedBranch = decodeConsolidatedBranch(e.Payload)
 			}
 		case "slice_integration_conflict":
-			hasConflict = true
-			if child := decodeConflictingChildRunID(e.Payload); child != "" {
-				cs.ConflictingChildRunID = child
+			if e.Sequence > conflictSeq {
+				conflictSeq = e.Sequence
+				cs.ConflictingChildRunID = decodeConflictingChildRunID(e.Payload)
 			}
 		}
 	}
 
-	cs.IntegrationPhase = classifyIntegrationPhase(cs.Children, hasIntegrated, hasConflict)
+	cs.IntegrationPhase = classifyIntegrationPhase(cs.Children, integratedSeq, conflictSeq)
 	return cs, nil
 }
 

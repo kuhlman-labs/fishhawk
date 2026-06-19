@@ -91,25 +91,30 @@ func TestClassifyIntegrationPhase(t *testing.T) {
 	succeeded := []ChildStatus{{State: "succeeded"}, {State: "succeeded"}}
 	inFlight := []ChildStatus{{State: "succeeded"}, {State: "running"}}
 
+	// integratedSeq / conflictSeq are the highest audit Sequence of each fan-in
+	// kind, or -1 when absent. The both-present cases assert the ORDERING
+	// semantics (the relative sequences decide), not mere presence.
+	const absent = int64(-1)
 	cases := []struct {
 		name          string
 		children      []ChildStatus
-		hasIntegrated bool
-		hasConflict   bool
+		integratedSeq int64
+		conflictSeq   int64
 		want          string
 	}{
-		{"a child still in flight, no fan-in", inFlight, false, false, integrationPhaseRunningChildren},
-		{"all succeeded, no fan-in audit yet", succeeded, false, false, integrationPhaseReadyToIntegrate},
-		{"slices_integrated present", succeeded, true, false, integrationPhaseIntegrated},
-		{"slice_integration_conflict present", succeeded, false, true, integrationPhaseConflict},
-		{"conflict superseded by a later clean integration", succeeded, true, true, integrationPhaseIntegrated},
-		{"no children at all classifies running_children", nil, false, false, integrationPhaseRunningChildren},
+		{"a child still in flight, no fan-in", inFlight, absent, absent, integrationPhaseRunningChildren},
+		{"all succeeded, no fan-in audit yet", succeeded, absent, absent, integrationPhaseReadyToIntegrate},
+		{"slices_integrated present", succeeded, 10, absent, integrationPhaseIntegrated},
+		{"slice_integration_conflict present", succeeded, absent, 10, integrationPhaseConflict},
+		{"conflict superseded by a later clean integration", succeeded, 11, 7, integrationPhaseIntegrated},
+		{"older integration masked by a NEWER conflict stays conflict", succeeded, 7, 11, integrationPhaseConflict},
+		{"no children at all classifies running_children", nil, absent, absent, integrationPhaseRunningChildren},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := classifyIntegrationPhase(c.children, c.hasIntegrated, c.hasConflict); got != c.want {
-				t.Errorf("classifyIntegrationPhase(%+v, integrated=%v, conflict=%v) = %q, want %q",
-					c.children, c.hasIntegrated, c.hasConflict, got, c.want)
+			if got := classifyIntegrationPhase(c.children, c.integratedSeq, c.conflictSeq); got != c.want {
+				t.Errorf("classifyIntegrationPhase(%+v, integratedSeq=%d, conflictSeq=%d) = %q, want %q",
+					c.children, c.integratedSeq, c.conflictSeq, got, c.want)
 			}
 		})
 	}
@@ -118,9 +123,10 @@ func TestClassifyIntegrationPhase(t *testing.T) {
 // seedSlicesIntegrated / seedSliceConflict build the fan-in audit entries the
 // resolver scans in its recent-audit window. They return the entry rather than
 // seeding the backend because childrenStatusFor takes recentAudit directly.
-func slicesIntegratedEntry(parent uuid.UUID, consolidatedBranch string, childIDs []string) AuditEntry {
+func slicesIntegratedEntry(parent uuid.UUID, seq int64, consolidatedBranch string, childIDs []string) AuditEntry {
 	return AuditEntry{
 		ID:       uuid.NewString(),
+		Sequence: seq,
 		RunID:    parent.String(),
 		Category: "slices_integrated",
 		Payload: map[string]any{
@@ -131,9 +137,10 @@ func slicesIntegratedEntry(parent uuid.UUID, consolidatedBranch string, childIDs
 	}
 }
 
-func sliceConflictEntry(parent uuid.UUID, conflictingChild string, sliceIndex int) AuditEntry {
+func sliceConflictEntry(parent uuid.UUID, seq int64, conflictingChild string, sliceIndex int) AuditEntry {
 	return AuditEntry{
 		ID:       uuid.NewString(),
+		Sequence: seq,
 		RunID:    parent.String(),
 		Category: "slice_integration_conflict",
 		Payload: map[string]any{
@@ -216,7 +223,7 @@ func TestChildrenStatusFor_Integrated(t *testing.T) {
 	// The slices_integrated marker fires the integrated phase even though the
 	// parent implement stage is no longer awaiting_children (the gate in
 	// getRunStatus also keys on the audit marker for exactly this reason).
-	recent := []AuditEntry{slicesIntegratedEntry(parent, "fishhawk/consolidated-x", childIDs)}
+	recent := []AuditEntry{slicesIntegratedEntry(parent, 5, "fishhawk/consolidated-x", childIDs)}
 	cs, err := r.childrenStatusFor(context.Background(), parent, recent)
 	if err != nil {
 		t.Fatalf("childrenStatusFor: %v", err)
@@ -226,6 +233,71 @@ func TestChildrenStatusFor_Integrated(t *testing.T) {
 	}
 	if cs.ConsolidatedBranch != "fishhawk/consolidated-x" {
 		t.Errorf("consolidated_branch = %q, want fishhawk/consolidated-x", cs.ConsolidatedBranch)
+	}
+}
+
+// TestChildrenStatusFor_ConflictNewerThanIntegration is the non-vacuous
+// ordering assertion the reviewer asked for: BOTH fan-in kinds are present in
+// the recent-audit window, but the slice_integration_conflict has a higher
+// Sequence than the slices_integrated, so the latest outcome is a conflict and
+// the phase must stay integration_conflict — an older clean integration must
+// not mask it. The entries are presented time-descending (item 0 newest) to
+// match the real recent_audit ordering.
+func TestChildrenStatusFor_ConflictNewerThanIntegration(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	c0, c1 := uuid.New(), uuid.New()
+	seedChildRun(fb, c0, "succeeded")
+	seedChildRun(fb, c1, "succeeded")
+	childIDs := []string{c0.String(), c1.String()}
+	seedPlanDecomposed(fb, parent, childIDs, 2)
+
+	// Newer conflict (seq 9) over an older clean integration (seq 4).
+	recent := []AuditEntry{
+		sliceConflictEntry(parent, 9, c1.String(), 1),
+		slicesIntegratedEntry(parent, 4, "fishhawk/consolidated-x", childIDs),
+	}
+	cs, err := r.childrenStatusFor(context.Background(), parent, recent)
+	if err != nil {
+		t.Fatalf("childrenStatusFor: %v", err)
+	}
+	if cs.IntegrationPhase != integrationPhaseConflict {
+		t.Errorf("phase = %q, want integration_conflict (newer conflict masks older integration)", cs.IntegrationPhase)
+	}
+	if cs.ConflictingChildRunID != c1.String() {
+		t.Errorf("conflicting_child_run_id = %q, want %s", cs.ConflictingChildRunID, c1)
+	}
+}
+
+// TestChildrenStatusFor_IntegrationNewerThanConflict is the mirror case: an
+// earlier conflict was superseded by a later clean re-integration (higher
+// Sequence), so the phase resolves to integrated.
+func TestChildrenStatusFor_IntegrationNewerThanConflict(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	c0, c1 := uuid.New(), uuid.New()
+	seedChildRun(fb, c0, "succeeded")
+	seedChildRun(fb, c1, "succeeded")
+	childIDs := []string{c0.String(), c1.String()}
+	seedPlanDecomposed(fb, parent, childIDs, 2)
+
+	recent := []AuditEntry{
+		slicesIntegratedEntry(parent, 12, "fishhawk/consolidated-y", childIDs),
+		sliceConflictEntry(parent, 6, c1.String(), 1),
+	}
+	cs, err := r.childrenStatusFor(context.Background(), parent, recent)
+	if err != nil {
+		t.Fatalf("childrenStatusFor: %v", err)
+	}
+	if cs.IntegrationPhase != integrationPhaseIntegrated {
+		t.Errorf("phase = %q, want integrated (later clean integration supersedes the conflict)", cs.IntegrationPhase)
+	}
+	if cs.ConsolidatedBranch != "fishhawk/consolidated-y" {
+		t.Errorf("consolidated_branch = %q, want fishhawk/consolidated-y", cs.ConsolidatedBranch)
 	}
 }
 
@@ -239,7 +311,7 @@ func TestChildrenStatusFor_IntegrationConflict(t *testing.T) {
 	seedChildRun(fb, c1, "succeeded")
 	seedPlanDecomposed(fb, parent, []string{c0.String(), c1.String()}, 2)
 
-	recent := []AuditEntry{sliceConflictEntry(parent, c1.String(), 1)}
+	recent := []AuditEntry{sliceConflictEntry(parent, 5, c1.String(), 1)}
 	cs, err := r.childrenStatusFor(context.Background(), parent, recent)
 	if err != nil {
 		t.Fatalf("childrenStatusFor: %v", err)

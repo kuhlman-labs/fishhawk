@@ -5000,7 +5000,7 @@ func TestGetRunStatus_ChildrenStatus_IntegratedAfterAwaitingChildren(t *testing.
 	childIDs := []string{c0.String(), c1.String()}
 	seedPlanDecomposed(fb, parent, childIDs, 2)
 	// The slices_integrated marker lands in the cross-chain recent-audit feed.
-	fb.auditByRun[parent] = []AuditEntry{slicesIntegratedEntry(parent, "fishhawk/consolidated-x", childIDs)}
+	fb.auditByRun[parent] = []AuditEntry{slicesIntegratedEntry(parent, 5, "fishhawk/consolidated-x", childIDs)}
 
 	r := newResolver(srv, nil)
 	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: parent.String()})
