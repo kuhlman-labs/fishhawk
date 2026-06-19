@@ -846,29 +846,43 @@ func spawnRunnerStage(ctx context.Context, binary string, argv []string, env []s
 //
 // Uses a bounded context mirroring the post-run stage fetch.
 func (r *runResolver) resolveStageID(ctx context.Context, runUUID uuid.UUID, stageType, explicitStageID string) (string, error) {
+	stage, err := r.resolveStage(ctx, runUUID, stageType, explicitStageID)
+	if err != nil {
+		return "", err
+	}
+	return stage.ID, nil
+}
+
+// resolveStage is resolveStageID's underlying matcher: it returns the FULL
+// matched Stage (id + state + type) so callers that need the stage's state —
+// e.g. fishhawk_run_children's pending-vs-in-flight partition (#1237) — can
+// read it without a second round-trip. resolveStageID delegates here and
+// projects out the ID, so every error path (zero / ambiguous / explicit
+// disagree) is byte-identical between the two.
+func (r *runResolver) resolveStage(ctx context.Context, runUUID uuid.UUID, stageType, explicitStageID string) (Stage, error) {
 	fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	stages, err := r.api.ListRunStages(fetchCtx, runUUID)
 	if err != nil {
-		return "", fmt.Errorf("resolve stage_id: list stages for run %s: %w", runUUID, err)
+		return Stage{}, fmt.Errorf("resolve stage_id: list stages for run %s: %w", runUUID, err)
 	}
 
-	var matches []string
+	var matches []Stage
 	available := make([]string, 0, len(stages))
 	for _, s := range stages {
 		available = append(available, s.Type)
 		if s.Type == stageType {
-			matches = append(matches, s.ID)
+			matches = append(matches, s)
 		}
 	}
 
 	if explicitStageID != "" {
-		for _, id := range matches {
-			if id == explicitStageID {
-				return explicitStageID, nil
+		for _, s := range matches {
+			if s.ID == explicitStageID {
+				return s, nil
 			}
 		}
-		return "", fmt.Errorf(
+		return Stage{}, fmt.Errorf(
 			"stage_id %s does not match a %q stage in run %s; available stage types: %v",
 			explicitStageID, stageType, runUUID, available)
 	}
@@ -877,13 +891,17 @@ func (r *runResolver) resolveStageID(ctx context.Context, runUUID uuid.UUID, sta
 	case 1:
 		return matches[0], nil
 	case 0:
-		return "", fmt.Errorf(
+		return Stage{}, fmt.Errorf(
 			"stage type %q not found in run %s; available: %v",
 			stageType, runUUID, available)
 	default:
-		return "", fmt.Errorf(
+		ids := make([]string, len(matches))
+		for i, s := range matches {
+			ids[i] = s.ID
+		}
+		return Stage{}, fmt.Errorf(
 			"stage type %q is ambiguous in run %s (matched %d stages: %s); pass stage_id explicitly",
-			stageType, runUUID, len(matches), strings.Join(matches, ", "))
+			stageType, runUUID, len(matches), strings.Join(ids, ", "))
 	}
 }
 
