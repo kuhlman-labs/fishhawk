@@ -567,6 +567,18 @@ func consolidatedBranch(parentID uuid.UUID) string {
 	return runBranchPrefix(parentID) + "-consolidated"
 }
 
+// ConsolidatedBranch is the canonical, exported derivation of the
+// consolidated PR head / decomposed-parent fix-up branch. It delegates to
+// the single unexported consolidatedBranch formula so there is exactly one
+// source of truth for the name. Out-of-package consumers (e.g.
+// server.fixupBranchForRun) MUST call this rather than re-hardcoding the
+// "fishhawk/run-<short>-consolidated" literal — a duplicated reconstruction
+// silently diverged on the #1243 rename and orphaned parent fix-up commits
+// (#1245).
+func ConsolidatedBranch(parentID uuid.UUID) string {
+	return consolidatedBranch(parentID)
+}
+
 // consolidatedPRTitleBody derives the PR title + body from the parent
 // run's cached issue context. Falls back to a run-id-stamped title when
 // no issue context is present (webhook runs that left it nil are fetched

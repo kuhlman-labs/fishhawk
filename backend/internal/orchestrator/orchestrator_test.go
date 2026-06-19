@@ -1241,6 +1241,15 @@ func TestBranchNames_NoDFConflict(t *testing.T) {
 		t.Errorf("consolidatedBranch = %q, want fishhawk/run-aaaaaaaa-consolidated", got)
 	}
 
+	// (i.a) The exported wrapper used by out-of-package consumers
+	// (server.fixupBranchForRun, #1245) MUST emit the byte-identical name.
+	// Locking the exported symbol + its output here means the wrapper cannot
+	// be removed or renamed — or desync from the unexported formula — without
+	// failing this unit suite.
+	if got := ConsolidatedBranch(id); got != "fishhawk/run-aaaaaaaa-consolidated" {
+		t.Errorf("ConsolidatedBranch = %q, want fishhawk/run-aaaaaaaa-consolidated", got)
+	}
+
 	// (ii) slice branch unchanged — byte-identical to the runner's name.
 	if got := sliceBranch(id, 0); got != "fishhawk/run-aaaaaaaa/slice-0" {
 		t.Errorf("sliceBranch(id,0) = %q, want fishhawk/run-aaaaaaaa/slice-0", got)
