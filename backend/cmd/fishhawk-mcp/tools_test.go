@@ -60,9 +60,15 @@ type fakeBackend struct {
 	// E19.4 fixtures: stages keyed by run id, artifacts keyed by
 	// stage id. Empty map → 200 with empty items list (mirrors the
 	// backend's behavior for runs that haven't created stages yet).
-	stagesByRun       map[uuid.UUID][]Stage
-	artifactsByStage  map[uuid.UUID][]Artifact
-	stagesStatus      int
+	stagesByRun      map[uuid.UUID][]Stage
+	artifactsByStage map[uuid.UUID][]Artifact
+	stagesStatus     int
+	// stagesFailOnCall, when > 0, makes the Nth (1-based, per run_id)
+	// GET /v0/runs/{run_id}/stages call return 500 while every other call
+	// uses stagesStatus. Used by the dispatch post-dispatch-fetch-failure
+	// test to fail the SECOND stages read (the wait-status classify) while
+	// the FIRST (stage-id resolution) succeeds. Defaults to 0 (disabled).
+	stagesFailOnCall  int
 	artifactsStatus   int
 	stagesCalledByID  map[uuid.UUID]int
 	artifactsCalledID map[uuid.UUID]int
@@ -727,9 +733,14 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		fb.mu.Lock()
 		fb.stagesCalledByID[id]++
+		callNum := fb.stagesCalledByID[id]
 		items := fb.stagesByRun[id]
+		status := fb.stagesStatus
+		if fb.stagesFailOnCall > 0 && callNum == fb.stagesFailOnCall {
+			status = http.StatusInternalServerError
+		}
 		fb.mu.Unlock()
-		w.WriteHeader(fb.stagesStatus)
+		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(listStagesResult{Items: items})
 	})
 	mux.HandleFunc("GET /v0/runs/{run_id}/audit", func(w http.ResponseWriter, r *http.Request) {
@@ -1171,7 +1182,7 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	const minDescriptionLen = 80
 	// The registered tool set is the fishhawk_* tools swept in #778. Bump
 	// this and give the new tool a conformant description when adding one.
-	const wantToolCount = 28
+	const wantToolCount = 29
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

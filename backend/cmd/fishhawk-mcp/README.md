@@ -106,7 +106,8 @@ The durable `(run_id, stage_id)` handle is the unit of waiting on a stage's exec
 
 - **Poll the handle (primary, authoritative).** Re-polling `fishhawk_get_run_status` is the blessed way to await a stage's terminal status. While the status is non-terminal (`pending`/`running`) the `StageWaitStatus` carries a server-suggested `poll_interval_seconds` of **30s** — coarser than reviews' 15s because stages run minutes, not seconds. Re-call on that cadence until the status goes terminal. The interval is dropped once the run itself is terminal (ADR-036 [#874](https://github.com/kuhlman-labs/fishhawk/issues/874) backstop), so a stage that can no longer progress never advertises an unbounded poll.
 - **Synchronous-with-progress `fishhawk_run_stage` (negotiated fallback).** The synchronous call runs the stage to completion and returns the terminal outcome (also surfacing `stage_wait_status` on the handle — normally already terminal, so the interval is omitted). It is the fallback for clients that prefer to block or for short stages; it is not the primary mechanism. Its run-terminal result also carries the `next_actions` block (#1024) so the operator gets the legal next move directly — see [Server-suggested next actions](#server-suggested-next-actions-next_actions-1024).
-- **Native MCP Tasks (`invocationMode: async`) — deferred.** A future mode that lets `fishhawk_run_stage` return a handle immediately and poll to terminal is **not built** here: it is gated on [ADR-033](https://github.com/kuhlman-labs/fishhawk/issues/843) transport plus MCP Tasks leaving experimental (ADR-037 two-phase delivery). This surface ships only the near-term contract half.
+- **Non-blocking `fishhawk_dispatch_stage` ([#1232](https://github.com/kuhlman-labs/fishhawk/issues/1232)).** The SDK-independent dispatch verb spawns the runner **detached** and returns the `(run_id, stage_id)` handle plus a non-terminal `stage_wait_status` **immediately**, so a **single** MCP session can poll `fishhawk_get_run_status` to terminal AND decide a mid-stage scope amendment in-band between polls (`fishhawk_decide_scope_amendment`) — the durable fix for the [#1189](https://github.com/kuhlman-labs/fishhawk/issues/1189) amendment timeout. It ships the poll-to-terminal UX today and **supersedes the interim `fishhawk run auto-decide` second channel** ([#1233](https://github.com/kuhlman-labs/fishhawk/issues/1233)/[#1234](https://github.com/kuhlman-labs/fishhawk/issues/1234)) for in-band mid-stage amendment decisions. See [Non-blocking dispatch](#non-blocking-dispatch-fishhawk_dispatch_stage-1232) below.
+- **Native MCP Tasks (`invocationMode: async`) — deferred.** A future mode that lets `fishhawk_run_stage` return a handle immediately and poll to terminal is **not built** here: it is gated on [ADR-033](https://github.com/kuhlman-labs/fishhawk/issues/843) transport plus MCP Tasks leaving experimental (ADR-037 two-phase delivery). It would be a later transport refinement layering onto the same `(run_id, stage_id)` handle that `fishhawk_dispatch_stage` already returns.
 
 ## Progress notifications (`fishhawk_run_stage`)
 
@@ -129,6 +130,26 @@ The final tool result is **compact by default**: the routine `stage_progress` he
 | `turns` / `elapsed_seconds` / `last_event_kind` | the last `stage_progress` heartbeat |
 
 This roughly halves the driving agent's per-stage context cost without losing any durable signal — the audit log and signed trace bundle are unchanged. Pass `verbose: true` on the input to restore the full event list including every heartbeat (e.g. a driver that wants to inspect per-heartbeat progression).
+
+## Non-blocking dispatch (`fishhawk_dispatch_stage`, [#1232](https://github.com/kuhlman-labs/fishhawk/issues/1232))
+
+`fishhawk_dispatch_stage` is the **non-blocking sibling** of `fishhawk_run_stage`. Where `run_stage` blocks to terminal and returns the full event list, `dispatch_stage` spawns the same `fishhawk-runner` subprocess **detached** and returns the durable `(run_id, stage_id)` handle plus a (normally non-terminal) `stage_wait_status` **immediately**. It reuses `run_stage`'s input validation, stage-id resolution, runner-binary resolution, repo detection, and argv composition (the shared `composeRunnerArgv`, so the spawned argv is byte-identical) — the only difference is the spawn mode.
+
+The flow it enables (the [#1189](https://github.com/kuhlman-labs/fishhawk/issues/1189) in-band amendment fix, ADR-037 poll-to-terminal half):
+
+1. `fishhawk_dispatch_stage --stage implement …` — returns the handle now.
+2. Poll `fishhawk_get_run_status` on the advertised `poll_interval_seconds` (30s) until the stage's `*_stage_wait_status` goes terminal.
+3. **Between polls**, when a `scope_amendment_pending` surfaces, call `fishhawk_decide_scope_amendment` — so the runner's amendment `?wait` poll resolves **before its window elapses**, with no failed-stage retry.
+
+This is what a **single** MCP session needs: a blocking `fishhawk_run_stage` call cannot decide an amendment the same agent's runner files mid-stage. `fishhawk_dispatch_stage` **supersedes the interim `fishhawk run auto-decide` second channel** ([#1233](https://github.com/kuhlman-labs/fishhawk/issues/1233)/[#1234](https://github.com/kuhlman-labs/fishhawk/issues/1234)) for that decision.
+
+Detached-spawn properties (differ deliberately from the synchronous `spawnRunnerStage`):
+
+- **Own process group** (`Setpgid`): a `SIGINT`/`SIGTERM` to the MCP server's foreground group is **not** forwarded to the runner — it is meant to outlive the tool call. There is **no** SIGTERM→grace→SIGKILL watcher.
+- **Output → a per-invocation log file** under `os.TempDir()` (`fishhawk-runner-<run>-<stage>-<unixnano>.log`), **never a pipe**: an unread pipe fills its kernel buffer and blocks the writer once full (#446). The runner ships its trace via `--upload-trace` and its state to the backend, so the local log is a diagnostic only. `log_path` is returned for that diagnostic.
+- **A reaper goroutine** (`go func(){ _ = cmd.Wait() }()`) collects the child's exit so it never zombies while the tool returns.
+
+Restarting the MCP server (`scripts/dev reload`) while a detached stage is in flight **orphans** the runner (reparented to init) but it continues to terminal and stays pollable via `fishhawk_get_run_status` — the intended durability of the `(run_id, stage_id)` handle (ADR-037), not a regression. Requires the `fishhawk-runner` binary to resolve on the MCP host, exactly like `fishhawk_run_stage`.
 
 ## Parallel decomposed children (`fishhawk_run_children`, [#1144](https://github.com/kuhlman-labs/fishhawk/issues/1144))
 
