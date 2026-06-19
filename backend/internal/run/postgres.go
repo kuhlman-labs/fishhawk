@@ -572,6 +572,82 @@ func (r *postgresRepo) ResumeAwaitingInputAndAppend(ctx context.Context, stageID
 	return result, won, nil
 }
 
+// ParkScopeCompletenessAndAppend atomically parks an implement stage for
+// an operator scope-completeness decision (#1231): it transitions the
+// stage running → awaiting_scope_decision, writes the held-commit
+// ScopeCompletenessPark payload, AND appends the scope_completeness_parked
+// audit entry in ONE pgx transaction. If the audit append fails the
+// closure returns an error so BeginFunc rolls the whole transaction back
+// and the stage stays running (the runner's report can be retried),
+// mirroring ResumeAwaitingInputAndAppend's append-after-transition gap
+// close (#1090).
+//
+// The compare-and-set under the stage row lock is the single-winner gate
+// for a duplicate runner delivery: a caller that arrives after the stage
+// already left running observes current.State != running, gets won=false
+// (nil error), and never appends an orphaned audit entry. The winning
+// caller gets won=true and the parked stage.
+//
+// This is an OPTIONAL capability on the concrete postgres repo (not on
+// the Repository interface): the pull-request park handler type-asserts
+// it and falls back to a two-step path for in-memory fakes.
+func (r *postgresRepo) ParkScopeCompletenessAndAppend(ctx context.Context, stageID uuid.UUID, park ScopeCompletenessPark, p audit.ChainAppendParams) (*Stage, bool, error) {
+	payload, err := json.Marshal(park)
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal scope completeness park: %w", err)
+	}
+	var result *Stage
+	won := false
+	err = pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := rundb.New(tx)
+		current, err := q.LockStageForUpdate(ctx, stageID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock stage: %w", err)
+		}
+		from := StageState(current.State)
+		// Compare-and-set: only the caller that observes the stage still
+		// running parks it. A loser of a duplicate delivery commits a
+		// no-op (won stays false) and writes no audit entry.
+		if from != StageStateRunning {
+			result = rowToStage(current)
+			return nil
+		}
+		if !ValidStageTransition(from, StageStateAwaitingScopeDecision) {
+			return InvalidTransitionError{Kind: "stage", From: string(from), To: string(StageStateAwaitingScopeDecision)}
+		}
+
+		// awaiting_scope_decision is non-terminal and not Running, so
+		// neither started_at nor ended_at is stamped — mirrors
+		// TransitionStage's handling of a non-terminal target.
+		updated, err := q.ParkScopeCompleteness(ctx, rundb.ParkScopeCompletenessParams{
+			ID:                    stageID,
+			State:                 string(StageStateAwaitingScopeDecision),
+			ScopeCompletenessPark: payload,
+		})
+		if err != nil {
+			return fmt.Errorf("park scope completeness: %w", err)
+		}
+
+		// Append the scope_completeness_parked entry in the SAME tx. Any
+		// error here aborts the closure so BeginFunc rolls back the park
+		// too — the stage stays running.
+		if _, err := audit.AppendChainedTx(ctx, tx, p); err != nil {
+			return err
+		}
+
+		result = rowToStage(updated)
+		won = true
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return result, won, nil
+}
+
 // RetryStage is the explicit override out of a terminal state. The
 // failure_category, failure_reason, and ended_at fields are
 // cleared; the updated_at trigger fires on the row update so any
@@ -731,6 +807,17 @@ func rowToStage(s rundb.Stage) *Stage {
 			}
 		}
 		out.Gate = gate
+	}
+	// JSONB → struct. Empty bytes means the column is NULL — the stage is
+	// not parked for a scope-completeness decision (#1231). Same tolerance
+	// posture as the gate/snapshot reads above: drop a corrupt blob rather
+	// than 500 the read path; the audit log is the source of truth on what
+	// was parked.
+	if len(s.ScopeCompletenessPark) > 0 {
+		var park ScopeCompletenessPark
+		if err := json.Unmarshal(s.ScopeCompletenessPark, &park); err == nil {
+			out.ScopeCompletenessPark = &park
+		}
 	}
 	return out
 }

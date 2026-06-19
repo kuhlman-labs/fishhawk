@@ -436,6 +436,30 @@ type FetchedPrompt struct {
 	// a non-eligible fix-up — byte-identical to today. The wire tag
 	// (fixup_apply_patches / patch) matches the backend's fixupApplyPatch shape.
 	FixupApplyPatches []FixupApplyPatch `json:"fixup_apply_patches,omitempty"`
+	// OpenPRFromHeldCommit is true on an operator EXEMPT resolution of a
+	// scope-completeness park (#1231): the implement stage previously parked
+	// because the missing-declared-scope-file gate was its sole failure, and the
+	// runner pushed the gate-verified commit to the run branch WITHOUT opening a
+	// PR. The operator decided exempt, so the backend dispatches THIS stage to
+	// open the PR from that exact held commit with NO agent re-invocation
+	// (zero-re-run). The runner skips the agent, the gates, and CommitAndPush
+	// entirely (the commit already exists on the branch) and opens the PR from
+	// HeldCommitBranch at HeldCommitSHA. Both false/empty on every other
+	// dispatch. The wire tags (open_pr_from_held_commit / held_commit_sha /
+	// held_commit_branch) are byte-identical to the backend's prompt-response
+	// scope-completeness exempt fields, the runner↔backend wire contract for the
+	// exempt resolution (the same cross-module convention as ScopeExemption /
+	// #1229 and BindingAssertions / #1171).
+	OpenPRFromHeldCommit bool `json:"open_pr_from_held_commit,omitempty"`
+	// HeldCommitSHA is the head commit the scope-completeness park pushed to the
+	// run branch (#1231). Non-empty only when OpenPRFromHeldCommit is true. The
+	// runner asserts the branch tip equals this SHA before opening the PR so the
+	// opened PR head is byte-identical to the gate-verified held tree (ADR-035).
+	HeldCommitSHA string `json:"held_commit_sha,omitempty"`
+	// HeldCommitBranch is the run branch the held commit was pushed to (#1231).
+	// Non-empty only when OpenPRFromHeldCommit is true. The runner opens the PR
+	// with this branch as head.
+	HeldCommitBranch string `json:"held_commit_branch,omitempty"`
 }
 
 // FixupApplyPatch is one entry in FetchedPrompt.FixupApplyPatches: a single
@@ -764,6 +788,21 @@ type ShipPullRequestArgs struct {
 	// the backend drives the fix-up stage's terminal transition and re-parks the
 	// review gate, instead of hanging until the SLA watchdog reaps it.
 	//
+	// When Outcome is "scope_park", this is a missing-declared-scope-file-ONLY
+	// park report (#1231): the implement stage's sole committed-tree gate failure
+	// was the #1151 scope-completeness shortfall, so the runner pushed the
+	// gate-verified commit to the run branch WITHOUT opening a PR. ShipPullRequest
+	// signs and ships
+	// {"outcome":"scope_park","branch":...,"head_sha":...,"base_sha":...,
+	// "verified_tree_sha":...,"missing_paths":[...]} so the backend records the
+	// park payload, transitions the implement stage to awaiting_scope_decision (a
+	// parked judgment, NOT a category-B failure), and surfaces an in-band operator
+	// exempt/fail decision — instead of the trace gate leaving the stage hung in
+	// `running` until the SLA watchdog reaps it. TreeSHA pins the gate-verified
+	// tree (wire tag verified_tree_sha); MissingPaths names the declared paths the
+	// commit did not touch. The outcome string + tags are byte-identical to the
+	// backend's scope_park pullRequestBody decode (slice 1).
+	//
 	// When Outcome is empty the success Body path (a real PR artifact) is
 	// used unchanged.
 	Outcome  string
@@ -778,6 +817,14 @@ type ShipPullRequestArgs struct {
 	HeadSHA           string
 	BaseSHA           string
 	FilesChangedCount int
+
+	// TreeSHA and MissingPaths carry the scope-completeness park payload for the
+	// Outcome=="scope_completeness_parked" report (#1231). TreeSHA is the
+	// gate-verified tree object hash of the held commit; MissingPaths is the
+	// order-preserving list of concrete declared scope.files the commit did not
+	// touch. Unused (and dropped via omitempty below) for every other outcome.
+	TreeSHA      string
+	MissingPaths []string
 
 	// ApplyPath carries the near-deterministic fix-up apply provenance (#1165)
 	// for the Outcome=="fixup_pushed" report: "applied" (a clean git-apply of
@@ -817,6 +864,26 @@ type pullRequestChildPushBody struct {
 	// "fixup_pushed" report. omitempty keeps the "pushed" child-push and
 	// "fixup_no_changes" bodies byte-identical when it is unset.
 	ApplyPath string `json:"apply_path,omitempty"`
+}
+
+// pullRequestScopeParkBody is the scope-completeness park-report wire shape
+// ShipPullRequest marshals when Args.Outcome == "scope_park" (#1231). The held
+// commit is already pushed to the run branch, so the body carries the held
+// commit's branch + SHAs + the gate-verified tree + the missing declared paths
+// rather than a PR number/URL. The json tags
+// (branch/head_sha/base_sha/verified_tree_sha/missing_paths) are byte-identical
+// to the backend's scope_park pullRequestBody decode struct (which maps 1:1 into
+// run.ScopeCompletenessPark, slice 1), the runner↔backend wire contract for the
+// park round-trip (the same cross-module convention as pullRequestChildPushBody
+// / #771 and ScopeExemption / #1229). Kept here so the runner owns the bytes it
+// signs.
+type pullRequestScopeParkBody struct {
+	Outcome      string   `json:"outcome"`
+	Branch       string   `json:"branch"`
+	HeadSHA      string   `json:"head_sha"`
+	BaseSHA      string   `json:"base_sha"`
+	TreeSHA      string   `json:"verified_tree_sha"`
+	MissingPaths []string `json:"missing_paths"`
 }
 
 // ShipPullRequestResult is what the backend echoes back. Idempotent
@@ -878,6 +945,24 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 		})
 		if err != nil {
 			return nil, fmt.Errorf("upload: marshal pull-request push body: %w", err)
+		}
+		body = marshalled
+	case "scope_park":
+		// Scope-completeness park report (#1231): no PR was opened (the
+		// gate-verified commit landed on the run branch only), so build the park
+		// body from the held commit details + the missing declared paths rather
+		// than the (absent) PR artifact. The backend records the park payload and
+		// transitions the implement stage to awaiting_scope_decision.
+		marshalled, err := json.Marshal(pullRequestScopeParkBody{
+			Outcome:      args.Outcome,
+			Branch:       args.Branch,
+			HeadSHA:      args.HeadSHA,
+			BaseSHA:      args.BaseSHA,
+			TreeSHA:      args.TreeSHA,
+			MissingPaths: args.MissingPaths,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("upload: marshal pull-request scope-park body: %w", err)
 		}
 		body = marshalled
 	}

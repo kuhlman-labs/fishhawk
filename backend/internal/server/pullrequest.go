@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -77,6 +78,24 @@ type pullRequestBody struct {
 	Category string `json:"category,omitempty"`
 	Reason   string `json:"reason,omitempty"`
 
+	// VerifiedTreeSHA and MissingPaths form the scope-completeness park
+	// report variant (#1231), present only when Outcome=="scope_park".
+	// The runner's committed-tree gate's ONLY failure was the
+	// scope-completeness "missing declared scope file(s)" check; it
+	// pushed the gate-verified commit to the run branch (branch/head_sha,
+	// no PR) and reports the tree it verified plus the declared scope.files
+	// the agent never touched. The handler records a ScopeCompletenessPark
+	// and parks the implement stage in awaiting_scope_decision for an
+	// operator exempt-or-fail decision — no PR artifact.
+	//
+	// These mirror run.ScopeCompletenessPark's wire tags byte-for-byte and
+	// the runner's park-report upload struct (runner/internal/upload —
+	// sibling slice), the established ScopeExemption duplication pattern.
+	// The runner omits them on every other variant, so they stay absent
+	// there under the DisallowUnknownFields decoder.
+	VerifiedTreeSHA string   `json:"verified_tree_sha,omitempty"`
+	MissingPaths    []string `json:"missing_paths,omitempty"`
+
 	// ApplyPath is the near-deterministic fix-up apply provenance (#1165/#1213),
 	// present only on the Outcome=="fixup_pushed" report: "applied" (a clean
 	// git-apply of every routed concern's suggested_patch, no agent), "agent"
@@ -152,8 +171,28 @@ func (p *pullRequestBody) validate() error {
 		}
 		return nil
 	}
+	// Scope-completeness park variant (#1231): the implement stage's ONLY
+	// committed-tree gate failure was the missing-declared-scope-file
+	// check. The runner pushed the verified commit to the run branch (no
+	// PR); require the commit coordinates, the verified tree, and at least
+	// one missing path so the park payload pins exactly what is held.
+	if p.Outcome == "scope_park" {
+		switch {
+		case p.Branch == "":
+			return errors.New("branch is required for a scope_park outcome")
+		case p.HeadSHA == "":
+			return errors.New("head_sha is required for a scope_park outcome")
+		case p.BaseSHA == "":
+			return errors.New("base_sha is required for a scope_park outcome")
+		case p.VerifiedTreeSHA == "":
+			return errors.New("verified_tree_sha is required for a scope_park outcome")
+		case len(p.MissingPaths) == 0:
+			return errors.New("missing_paths must be non-empty for a scope_park outcome")
+		}
+		return nil
+	}
 	if p.Outcome != "" {
-		return fmt.Errorf("outcome must be \"failed\", \"pushed\", \"fixup_pushed\", or \"fixup_no_changes\" when set, got %q", p.Outcome)
+		return fmt.Errorf("outcome must be \"failed\", \"pushed\", \"fixup_pushed\", \"fixup_no_changes\", or \"scope_park\" when set, got %q", p.Outcome)
 	}
 	switch {
 	case p.PRNumber <= 0:
@@ -341,6 +380,18 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 	// branch tip is unchanged.
 	if pr.Outcome == "fixup_no_changes" {
 		s.succeedFixupNoChangesStage(w, r, runID, stage, &pr, authMethod, actorKind, actorSubject)
+		return
+	}
+
+	// Scope-completeness park variant (#1231): the implement stage's ONLY
+	// committed-tree gate failure was the missing-declared-scope-file
+	// check, and the runner pushed its verified commit to the run branch
+	// (no PR). Record the held-commit park payload, transition the
+	// implement stage to awaiting_scope_decision, and write a
+	// scope_completeness_parked audit entry — leaving the run parked for an
+	// in-band operator exempt-or-fail decision. No PR artifact.
+	if pr.Outcome == "scope_park" {
+		s.parkScopeCompletenessStage(w, r, runID, stage, &pr, authMethod, actorKind, actorSubject)
 		return
 	}
 
@@ -868,6 +919,117 @@ func (s *Server) succeedFixupNoChangesStage(w http.ResponseWriter, r *http.Reque
 		StageID: stageID,
 		Outcome: "fixup_no_changes",
 		Branch:  pr.Branch,
+	})
+}
+
+// pullRequestScopeParkResponse is the 200 body for the scope-completeness
+// park variant (#1231): the implement stage parked in
+// awaiting_scope_decision with its verified commit held on the run branch.
+// HeadSHA echoes the held commit; the operator decides exempt-or-fail.
+type pullRequestScopeParkResponse struct {
+	StageID uuid.UUID `json:"stage_id"`
+	Outcome string    `json:"outcome"`
+	Branch  string    `json:"branch"`
+	HeadSHA string    `json:"head_sha"`
+}
+
+// scopeCompletenessParker is the OPTIONAL concrete-repo capability the
+// park handler type-asserts (postgresRepo.ParkScopeCompletenessAndAppend):
+// it atomically transitions the implement stage running →
+// awaiting_scope_decision, writes the held-commit park payload, and
+// appends the scope_completeness_parked audit entry in one transaction.
+// In-memory fakes that don't implement it fall back to the two-step path.
+type scopeCompletenessParker interface {
+	ParkScopeCompletenessAndAppend(ctx context.Context, stageID uuid.UUID, park run.ScopeCompletenessPark, p audit.ChainAppendParams) (*run.Stage, bool, error)
+}
+
+// parkScopeCompletenessStage handles the scope-completeness park variant
+// (#1231): the runner reports {outcome:"scope_park"} after its committed-
+// tree gate failed ONLY on the missing-declared-scope-file check and it
+// pushed the gate-verified commit to the run branch (no PR). It records
+// the held-commit ScopeCompletenessPark payload, transitions the implement
+// stage running → awaiting_scope_decision, and appends a
+// scope_completeness_parked audit entry — leaving the run parked for an
+// in-band operator exempt-or-fail decision (no PR artifact, no
+// pull_request_url backfill — there is no PR).
+//
+// Atomicity + idempotency live in the parker capability's compare-and-set:
+// a duplicate runner delivery that arrives after the stage already left
+// running observes won=false and is a clean idempotent no-op. A repo that
+// doesn't implement the capability (in-memory fakes) degrades to a two-
+// step transition + best-effort audit append.
+func (s *Server) parkScopeCompletenessStage(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
+	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
+	stageID := stage.ID
+	park := run.ScopeCompletenessPark{
+		HeldCommitSHA:   pr.HeadSHA,
+		RunBranch:       pr.Branch,
+		VerifiedTreeSHA: pr.VerifiedTreeSHA,
+		MissingPaths:    pr.MissingPaths,
+	}
+
+	auditPayload, _ := json.Marshal(map[string]any{
+		"run_id":            runID.String(),
+		"stage_id":          stageID.String(),
+		"branch":            pr.Branch,
+		"head_sha":          pr.HeadSHA,
+		"base_sha":          pr.BaseSHA,
+		"verified_tree_sha": pr.VerifiedTreeSHA,
+		"missing_paths":     pr.MissingPaths,
+		"auth_method":       authMethod,
+	})
+	appendParams := audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      &stageID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryScopeCompletenessParked,
+		ActorKind:    &actorKind,
+		ActorSubject: actorSubject,
+		Payload:      auditPayload,
+	}
+
+	if parker, ok := s.cfg.RunRepo.(scopeCompletenessParker); ok {
+		if _, _, err := parker.ParkScopeCompletenessAndAppend(r.Context(), stageID, park, appendParams); err != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"scope-completeness park report: park stage failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", err.Error()))
+		}
+		s.notifyStatusUpdate(r.Context(), runID, "scope_parked")
+		s.writeJSON(w, r, http.StatusOK, pullRequestScopeParkResponse{
+			StageID: stageID,
+			Outcome: "scope_park",
+			Branch:  pr.Branch,
+			HeadSHA: pr.HeadSHA,
+		})
+		return
+	}
+
+	// Fallback (in-memory fakes): two-step transition + best-effort audit.
+	if stage.Type == run.StageTypeImplement && stage.State == run.StageStateRunning {
+		if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stageID, run.StageStateAwaitingScopeDecision, nil); err != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"scope-completeness park report: transition to awaiting_scope_decision failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", err.Error()))
+		}
+	}
+	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), appendParams); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"scope-completeness park report: append audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
+
+	s.notifyStatusUpdate(r.Context(), runID, "scope_parked")
+	s.writeJSON(w, r, http.StatusOK, pullRequestScopeParkResponse{
+		StageID: stageID,
+		Outcome: "scope_park",
+		Branch:  pr.Branch,
+		HeadSHA: pr.HeadSHA,
 	})
 }
 

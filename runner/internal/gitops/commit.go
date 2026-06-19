@@ -103,6 +103,45 @@ var ErrCommitOutOfScope = errors.New("gitops: commit contains out-of-scope paths
 // (narrowed slice scope on a shared branch) are excluded.
 var ErrScopeFilesMissing = errors.New("gitops: commit did not touch every declared scope file")
 
+// ScopeFilesMissingError is the typed form of ErrScopeFilesMissing (#1231). It
+// carries the concrete declared scope.files paths the commit did NOT touch so
+// the runner's scope-completeness park can record them without recomputing the
+// shortfall. Unwrap returns the ErrScopeFilesMissing sentinel, so every
+// existing errors.Is(err, ErrScopeFilesMissing) classification — including the
+// runner's category-B mapping — keeps working unchanged.
+//
+// The runner returns it from the verifyCommit closure ONLY after every OTHER
+// committed-tree gate (created-out-of-scope, binding-assertion, compile/test,
+// verified-tree) has already passed, so when CommitAndPush sees it with
+// ParkOnScopeShortfall set it is provably the SOLE gate failure — the
+// missing-declared-scope-file-ONLY class (#1148/#1225). That class PARKS for an
+// operator exempt/fail decision rather than failing category-B: CommitAndPush
+// pushes the verified commit to the run branch anyway (so the held commit
+// survives the runner exit and a later exempt resolution can open the PR from
+// it, ADR-035) and surfaces ScopeShortfall instead of aborting. Any compound
+// failure (missing + another gate) never reaches this type because the other
+// gate returns its own non-parkable error first, keeping today's category-B.
+type ScopeFilesMissingError struct {
+	// Missing is the order-preserving list of concrete declared scope.files
+	// paths the committed tree did not touch (the unexempted shortfall).
+	Missing []string
+	// Message is the full human-readable gate message (the "%w: declared N,
+	// committed M" preamble). Error returns it verbatim so the runner's
+	// failure-report narrative is byte-identical to the pre-#1231 wrap.
+	Message string
+}
+
+func (e *ScopeFilesMissingError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return ErrScopeFilesMissing.Error()
+}
+
+// Unwrap returns the ErrScopeFilesMissing sentinel so
+// errors.Is(err, ErrScopeFilesMissing) holds for the typed error.
+func (*ScopeFilesMissingError) Unwrap() error { return ErrScopeFilesMissing }
+
 // ErrCommittedTestsFailed is the test-gate analogue of
 // ErrCommitWouldNotCompile (#800): the scope-only committed tree COMPILES
 // (go vet passes) but a touched package's tests fail because a build- or
@@ -309,6 +348,21 @@ type CommitAndPushArgs struct {
 	// behavior). Paths are repo-relative, matching scope.files entries.
 	ScopeFiles []string
 
+	// ParkOnScopeShortfall, when true, changes the disposition of a
+	// missing-declared-scope-file-ONLY gate failure (#1231): when VerifyCommit
+	// returns a *ScopeFilesMissingError — which the runner emits ONLY after
+	// every other committed-tree gate has passed, so it is the SOLE failure —
+	// CommitAndPush PUSHES the verified commit to the run branch anyway and
+	// reports the shortfall via CommitAndPushResult.ScopeShortfall instead of
+	// aborting the push. The held commit must survive the runner exit so a
+	// later operator exempt resolution can open the PR from that exact head
+	// (ADR-035: the same run writing its own branch, no re-commit). Any OTHER
+	// VerifyCommit error (including a plain ErrScopeFilesMissing wrap that is
+	// not the typed *ScopeFilesMissingError) still aborts the push BEFORE origin
+	// is touched, unchanged. Set only on the standalone open-PR implement push;
+	// false everywhere else keeps the strict #1151 category-B gate byte-identical.
+	ParkOnScopeShortfall bool
+
 	// VerifyCommit, when non-nil, is invoked AFTER the scope-only commit
 	// is created and BEFORE the push, with the new HEAD SHA and the scope
 	// drift (dirty-but-undeclared paths excluded from the commit). A
@@ -354,6 +408,15 @@ type CommitAndPushResult struct {
 	// scope-drift treatment, ADR-027). Always empty when ScopeFiles
 	// was empty (the `git add -A` fallback path).
 	ScopeDrift []string
+
+	// ScopeShortfall lists the concrete declared scope.files paths the pushed
+	// commit did NOT touch (#1231). Non-empty ONLY when ParkOnScopeShortfall was
+	// set AND the missing-declared-scope-file gate was the sole committed-tree
+	// failure: the verified commit WAS pushed to the run branch (HeadSHA/TreeSHA
+	// are populated) but NO PR is implied — the caller reports a
+	// scope-completeness park carrying these paths instead of opening a PR.
+	// Always empty otherwise, so the existing success path is byte-identical.
+	ScopeShortfall []string
 }
 
 // CommitAndPush configures a bot author, creates Branch, stages
@@ -547,9 +610,24 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	// gate failure leaves origin untouched. scopeDrift names the files the
 	// commit excluded — the candidate build-required set the callback
 	// reports in its error.
+	var scopeShortfall []string
 	if args.VerifyCommit != nil {
 		if err := args.VerifyCommit(ctx, headSHA, scopeDrift); err != nil {
-			return nil, err
+			// Scope-completeness park (#1231): a *ScopeFilesMissingError is the
+			// runner's signal that the missing-declared-scope-file gate was the
+			// SOLE committed-tree failure (the closure runs every other gate
+			// first). When the caller opted into ParkOnScopeShortfall, DON'T
+			// abort — fall through to the push so the verified commit lands on
+			// the run branch, and surface the missing paths so the caller reports
+			// a scope-completeness park rather than opening a PR. Any other error
+			// (including a plain ErrScopeFilesMissing wrap that is NOT the typed
+			// value) still aborts before origin is touched.
+			var smErr *ScopeFilesMissingError
+			if args.ParkOnScopeShortfall && errors.As(err, &smErr) {
+				scopeShortfall = smErr.Missing
+			} else {
+				return nil, err
+			}
 		}
 	}
 
@@ -603,10 +681,11 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	}
 
 	return &CommitAndPushResult{
-		HeadSHA:    headSHA,
-		TreeSHA:    treeSHA,
-		BaseSHA:    baseSHA,
-		ScopeDrift: scopeDrift,
+		HeadSHA:        headSHA,
+		TreeSHA:        treeSHA,
+		BaseSHA:        baseSHA,
+		ScopeDrift:     scopeDrift,
+		ScopeShortfall: scopeShortfall,
 	}, nil
 }
 

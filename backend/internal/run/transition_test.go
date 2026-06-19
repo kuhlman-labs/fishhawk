@@ -84,9 +84,10 @@ func TestStageTransitions_AllowedAndForbidden(t *testing.T) {
 		{StageStateDispatched, StageStateFailed, true},
 		{StageStateDispatched, StageStateCancelled, true},
 		{StageStateDispatched, StageStateAwaitingApproval, false},
-		// running → awaiting_approval | awaiting_input | succeeded | failed | cancelled
+		// running → awaiting_approval | awaiting_input | awaiting_scope_decision | succeeded | failed | cancelled
 		{StageStateRunning, StageStateAwaitingApproval, true},
 		{StageStateRunning, StageStateAwaitingInput, true},
+		{StageStateRunning, StageStateAwaitingScopeDecision, true},
 		{StageStateRunning, StageStateSucceeded, true},
 		{StageStateRunning, StageStateFailed, true},
 		{StageStateRunning, StageStateCancelled, true},
@@ -102,6 +103,13 @@ func TestStageTransitions_AllowedAndForbidden(t *testing.T) {
 		{StageStateAwaitingInput, StageStateFailed, true},
 		{StageStateAwaitingInput, StageStateCancelled, true},
 		{StageStateAwaitingInput, StageStateDispatched, false}, // resume routes through pending
+		// awaiting_scope_decision → running (exempt resume) | failed (category-B) | cancelled (#1231)
+		{StageStateAwaitingScopeDecision, StageStateRunning, true},    // operator exempted → resume to open the PR from the held commit
+		{StageStateAwaitingScopeDecision, StageStateFailed, true},     // operator failed it → category-B
+		{StageStateAwaitingScopeDecision, StageStateCancelled, true},  // manual halt
+		{StageStateAwaitingScopeDecision, StageStatePending, false},   // never rewinds to a fresh dispatch
+		{StageStateAwaitingScopeDecision, StageStateSucceeded, false}, // success only via the runner's PR-open, not the decision
+		{StageStateAwaitingScopeDecision, StageStateDispatched, false},
 		// terminal idempotency + lockdown
 		{StageStateSucceeded, StageStateSucceeded, true},
 		{StageStateSucceeded, StageStateRunning, false},
@@ -237,14 +245,15 @@ func TestStateIsTerminal(t *testing.T) {
 
 func TestStageStateIsTerminal(t *testing.T) {
 	cases := map[StageState]bool{
-		StageStatePending:          false,
-		StageStateDispatched:       false,
-		StageStateRunning:          false,
-		StageStateAwaitingApproval: false,
-		StageStateAwaitingInput:    false,
-		StageStateSucceeded:        true,
-		StageStateFailed:           true,
-		StageStateCancelled:        true,
+		StageStatePending:               false,
+		StageStateDispatched:            false,
+		StageStateRunning:               false,
+		StageStateAwaitingApproval:      false,
+		StageStateAwaitingInput:         false,
+		StageStateAwaitingScopeDecision: false,
+		StageStateSucceeded:             true,
+		StageStateFailed:                true,
+		StageStateCancelled:             true,
 	}
 	for s, want := range cases {
 		if got := s.IsTerminal(); got != want {

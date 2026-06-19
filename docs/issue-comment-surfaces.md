@@ -538,6 +538,29 @@ Notes:
   anchor (#977); delivery to the agent is poll-based (the agent polls the GET
   endpoint), so no comment surface is involved. Listed here only so a future reader
   grepping the audit categories doesn't mistake them for comment surfaces.
+- The scope-completeness park/decision audit kinds — `scope_completeness_parked`,
+  `scope_completeness_exempted`, and `scope_completeness_failed` (#1231) — are
+  **internal audit kinds, not issue-comment surfaces**. Nothing in `issuecomment`
+  posts them; they have no Notifier methods.
+  `server/pullrequest.go::parkScopeCompletenessStage` writes the parked entry
+  (system actor, or operator on the bearer path; payload `{run_id, stage_id,
+  branch, head_sha, base_sha, verified_tree_sha, missing_paths, auth_method}`)
+  when the runner reports `{outcome:"scope_park"}` — the implement stage's ONLY
+  committed-tree gate failure was the missing-declared-scope-file check and it
+  pushed the verified commit to the run branch (no PR), parking in
+  `awaiting_scope_decision`. `server/scope_completeness.go::handleDecideScopeCompleteness`
+  writes the exempted entry (user actor; payload `{run_id, stage_id, decision,
+  reason, decided_by, held_commit_sha, run_branch, verified_tree_sha,
+  missing_paths, gate_evidence}`) when an operator accepts the already-committed
+  tree — the held commit's PR is then opened with no agent re-run — and the failed
+  entry (user actor; payload `{run_id, stage_id, decision, reason, decided_by,
+  missing_paths}`) when an operator rejects the exemption and the stage drops to
+  category-B. The `gate_evidence` field on the exempted entry reuses the #1153
+  channel so a downstream implement-review gate reads the shortfall as
+  operator-exempted rather than re-failing on it. Delivery to the operator is
+  poll-based via `fishhawk_get_run_status` / `next_actions` (sibling slice); no
+  comment surface is involved. Listed here only so a future reader grepping the
+  audit categories doesn't mistake them for comment surfaces.
 - The operator-vouch audit kind — `operator_commit_vouched` (ADR-035, #1044) — is an
   **internal, user-actor audit kind, NOT an issue-comment surface**. Nothing in
   `issuecomment` posts it; it has no Notifier method. `server/vouch.go::handleVouchCommit`

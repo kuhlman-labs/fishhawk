@@ -177,6 +177,30 @@ func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
 		t.Errorf("'runs' table count after MigrateUp = %d, want 1", n)
 	}
 
+	// 0035 (#1231) widened stages_state_check to admit
+	// 'awaiting_scope_decision' and added the scope_completeness_park
+	// column. Confirm both are present after a full MigrateUp.
+	var stageStateCheckDef string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		 WHERE conname = 'stages_state_check'`,
+	).Scan(&stageStateCheckDef); err != nil {
+		t.Fatalf("query stages_state_check constraint def: %v", err)
+	}
+	if !strings.Contains(stageStateCheckDef, "awaiting_scope_decision") {
+		t.Errorf("stages_state_check after MigrateUp does not admit 'awaiting_scope_decision': %s", stageStateCheckDef)
+	}
+	var scopeParkCol int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'stages' AND column_name = 'scope_completeness_park'`,
+	).Scan(&scopeParkCol); err != nil {
+		t.Fatalf("query stages.scope_completeness_park column: %v", err)
+	}
+	if scopeParkCol != 1 {
+		t.Errorf("stages.scope_completeness_park count after MigrateUp = %d, want 1", scopeParkCol)
+	}
+
 	// Second application is a no-op.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Errorf("second MigrateUp returned %v, want nil (idempotent)", err)
@@ -205,14 +229,24 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0034 (#1141) added the
-	// runs.slice_index column; its down migration drops it. Confirm: the
-	// column is gone, but every prior migration's effect is still present —
-	// notably 0033's (#1165) review_concerns.suggested_patch column (only
-	// 0034 rolled back), 0032's (#1057) widened stages_state_check still
-	// admits 'awaiting_input', plus runs.drive from 0031, review_concerns
-	// from 0030, scope_amendments from 0029, cost_usd_total + resolved_model
-	// from 0028, etc.
+	// MigrateDown rolls back one step. 0035 (#1231) added the
+	// stages.scope_completeness_park column and widened stages_state_check
+	// to admit 'awaiting_scope_decision'; its down migration drops the
+	// column and narrows the check back. Confirm: the column is gone and the
+	// check no longer admits 'awaiting_scope_decision', but every PRIOR
+	// migration's effect is still present — notably 0034's (#1141)
+	// runs.slice_index column (only 0035 rolled back), 0032's (#1057)
+	// widened check still admits 'awaiting_input', etc.
+	var scopeParkCol int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'stages' AND column_name = 'scope_completeness_park'`,
+	).Scan(&scopeParkCol); err != nil {
+		t.Fatalf("query stages.scope_completeness_park column: %v", err)
+	}
+	if scopeParkCol != 0 {
+		t.Errorf("stages.scope_completeness_park count after MigrateDown = %d, want 0 (0035 down should have dropped it)", scopeParkCol)
+	}
 	var sliceIndexCol int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
@@ -220,8 +254,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&sliceIndexCol); err != nil {
 		t.Fatalf("query runs.slice_index column: %v", err)
 	}
-	if sliceIndexCol != 0 {
-		t.Errorf("runs.slice_index count after MigrateDown = %d, want 0 (0034 down should have dropped it)", sliceIndexCol)
+	if sliceIndexCol != 1 {
+		t.Errorf("runs.slice_index count after MigrateDown = %d, want 1 (0034 still applied; only 0035 rolled back)", sliceIndexCol)
 	}
 	var suggestedPatchCol int
 	if err := pool.QueryRow(context.Background(),
@@ -231,7 +265,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query review_concerns.suggested_patch column: %v", err)
 	}
 	if suggestedPatchCol != 1 {
-		t.Errorf("review_concerns.suggested_patch count after MigrateDown = %d, want 1 (0033 still applied; only 0034 rolled back)", suggestedPatchCol)
+		t.Errorf("review_concerns.suggested_patch count after MigrateDown = %d, want 1 (0033 still applied; only 0035 rolled back)", suggestedPatchCol)
 	}
 	var stageStateCheckDef string
 	if err := pool.QueryRow(context.Background(),
@@ -240,8 +274,11 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&stageStateCheckDef); err != nil {
 		t.Fatalf("query stages_state_check constraint def: %v", err)
 	}
+	if strings.Contains(stageStateCheckDef, "awaiting_scope_decision") {
+		t.Errorf("stages_state_check after MigrateDown still admits 'awaiting_scope_decision' (0035 down should have narrowed it): %s", stageStateCheckDef)
+	}
 	if !strings.Contains(stageStateCheckDef, "awaiting_input") {
-		t.Errorf("stages_state_check after MigrateDown dropped 'awaiting_input' (0032 still applied; only 0033 should roll back): %s", stageStateCheckDef)
+		t.Errorf("stages_state_check after MigrateDown dropped 'awaiting_input' (0032 still applied; only 0035 should roll back): %s", stageStateCheckDef)
 	}
 	if !strings.Contains(stageStateCheckDef, "awaiting_children") {
 		t.Errorf("stages_state_check after MigrateDown dropped 'awaiting_children': %s", stageStateCheckDef)

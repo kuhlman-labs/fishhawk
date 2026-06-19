@@ -1269,6 +1269,138 @@ func TestCommitAndPush_VerifyCommit_AbortsBeforePush(t *testing.T) {
 	}
 }
 
+// scopeParkRepo sets up a working repo + bare remote with one in-scope dirty
+// file, returning both paths. Mirrors the inline setup the other VerifyCommit
+// tests use, factored for the #1231 scope-completeness park trio.
+func scopeParkRepo(t *testing.T) (repo, bare string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	repo = filepath.Join(dir, "src")
+	bare = filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return repo, bare
+}
+
+// TestCommitAndPush_ParkOnScopeShortfall_PushesAndReportsShortfall pins the
+// #1231 park mechanism: when VerifyCommit returns a *ScopeFilesMissingError —
+// the runner's signal that missing-declared-scope-file was the SOLE gate failure
+// — AND ParkOnScopeShortfall is set, CommitAndPush PUSHES the verified commit to
+// the run branch anyway (so the held commit survives for an exempt resolution)
+// and surfaces the missing paths via ScopeShortfall instead of aborting.
+func TestCommitAndPush_ParkOnScopeShortfall_PushesAndReportsShortfall(t *testing.T) {
+	repo, bare := scopeParkRepo(t)
+	p := &Pusher{}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:              repo,
+		Branch:               "fishhawk/park/branch",
+		CommitMessage:        "Scoped commit",
+		RemoteURL:            bare,
+		ScopeFiles:           []string{"README.md"},
+		ParkOnScopeShortfall: true,
+		VerifyCommit: func(_ context.Context, headSHA string, _ []string) error {
+			if headSHA == "" {
+				t.Error("VerifyCommit got empty headSHA")
+			}
+			return &ScopeFilesMissingError{Missing: []string{"b.txt", "c.txt"}, Message: "gitops: commit did not touch every declared scope file: detail"}
+		},
+	})
+	if err != nil {
+		t.Fatalf("park must NOT return an error (it pushes + reports the shortfall), got: %v", err)
+	}
+	if len(res.ScopeShortfall) != 2 || res.ScopeShortfall[0] != "b.txt" || res.ScopeShortfall[1] != "c.txt" {
+		t.Errorf("ScopeShortfall = %v, want [b.txt c.txt]", res.ScopeShortfall)
+	}
+	if res.HeadSHA == "" || res.TreeSHA == "" {
+		t.Errorf("park must populate HeadSHA/TreeSHA for the held commit, got %+v", res)
+	}
+	// The verified commit reached the bare remote (held for an exempt resolution).
+	out, gerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "fishhawk/park/branch").Output()
+	if gerr != nil {
+		t.Fatalf("park must push the held commit to the run branch: %v", gerr)
+	}
+	if strings.TrimSpace(string(out)) != res.HeadSHA {
+		t.Errorf("pushed branch sha = %q, want held HeadSHA %q", strings.TrimSpace(string(out)), res.HeadSHA)
+	}
+}
+
+// TestCommitAndPush_ParkOnScopeShortfall_FalseAborts pins that the SAME typed
+// *ScopeFilesMissingError aborts the push (category-B, origin untouched) when
+// ParkOnScopeShortfall is NOT set — the strict #1151 behavior for fix-ups and
+// decomposed children stays byte-identical, and the error still unwraps to the
+// ErrScopeFilesMissing sentinel the runner classifies category-B.
+func TestCommitAndPush_ParkOnScopeShortfall_FalseAborts(t *testing.T) {
+	repo, bare := scopeParkRepo(t)
+	p := &Pusher{}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:       repo,
+		Branch:        "fishhawk/park/noflag",
+		CommitMessage: "Scoped commit",
+		RemoteURL:     bare,
+		ScopeFiles:    []string{"README.md"},
+		// ParkOnScopeShortfall deliberately false.
+		VerifyCommit: func(_ context.Context, _ string, _ []string) error {
+			return &ScopeFilesMissingError{Missing: []string{"b.txt"}, Message: "shortfall"}
+		},
+	})
+	if !errors.Is(err, ErrScopeFilesMissing) {
+		t.Fatalf("without ParkOnScopeShortfall the typed error must abort category-B, got: %v", err)
+	}
+	if res != nil {
+		t.Errorf("aborted push must return a nil result, got %+v", res)
+	}
+	if out, gerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "fishhawk/park/noflag").CombinedOutput(); gerr == nil {
+		t.Errorf("origin must be untouched on the aborted push, but the branch exists: %s", out)
+	}
+}
+
+// TestCommitAndPush_ParkOnScopeShortfall_NonScopeErrorAborts pins that a NON
+// missing-scope VerifyCommit error still aborts the push even with
+// ParkOnScopeShortfall set: the park is reserved for the typed
+// *ScopeFilesMissingError, so a compile-gate (or any other) failure keeps its
+// category-B abort, and no shortfall is surfaced.
+func TestCommitAndPush_ParkOnScopeShortfall_NonScopeErrorAborts(t *testing.T) {
+	repo, bare := scopeParkRepo(t)
+	p := &Pusher{}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:              repo,
+		Branch:               "fishhawk/park/compile",
+		CommitMessage:        "Scoped commit",
+		RemoteURL:            bare,
+		ScopeFiles:           []string{"README.md"},
+		ParkOnScopeShortfall: true,
+		VerifyCommit: func(_ context.Context, _ string, _ []string) error {
+			return ErrCommitWouldNotCompile
+		},
+	})
+	if !errors.Is(err, ErrCommitWouldNotCompile) {
+		t.Fatalf("a non-scope error must abort even with ParkOnScopeShortfall, got: %v", err)
+	}
+	if res != nil {
+		t.Errorf("aborted push must return a nil result, got %+v", res)
+	}
+	if out, gerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "fishhawk/park/compile").CombinedOutput(); gerr == nil {
+		t.Errorf("origin must be untouched on the aborted compile-gate push: %s", out)
+	}
+}
+
 // TestCommitAndPush_VerifyCommit_PassThroughPushes confirms the happy
 // path: a VerifyCommit that returns nil does not block the push.
 func TestCommitAndPush_VerifyCommit_PassThroughPushes(t *testing.T) {

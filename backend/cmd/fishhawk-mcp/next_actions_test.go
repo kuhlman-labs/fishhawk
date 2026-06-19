@@ -175,6 +175,16 @@ func TestNextActions_StateTable(t *testing.T) {
 			wantConsumes: []string{consumesNone, consumesNone},
 		},
 		{
+			// #1231: an implement stage parked at awaiting_scope_decision gets
+			// the in-band exempt-or-fail decision arm.
+			name:         "implement_awaiting_scope_decision",
+			run:          naRun("running"),
+			stages:       []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_scope_decision")},
+			wantState:    "implement_awaiting_scope_decision",
+			wantActions:  []string{"fishhawk_decide_scope_completeness"},
+			wantConsumes: []string{consumesNone},
+		},
+		{
 			name:         "d_category_b_with_succeeded_plan_resume_run",
 			run:          naRun("failed"),
 			stages:       []Stage{naStage("plan", "succeeded"), naFailedImplement("B", "scope drift")},
@@ -442,6 +452,30 @@ func TestNextActions_AwaitingChildren_FanOutArm(t *testing.T) {
 	poll := findAction(t, na, "fishhawk_get_run_status")
 	if !strings.Contains(poll.Reason, "children_status") {
 		t.Errorf("poll reason should point at the children_status block; got %q", poll.Reason)
+	}
+}
+
+// TestNextActions_AwaitingScopeDecision_DecideArm pins the #1231 arm: an
+// implement stage parked at awaiting_scope_decision offers
+// fishhawk_decide_scope_completeness carrying run_id + the exempt|fail
+// decision hint, and the reason names the zero-re-run exempt semantics.
+func TestNextActions_AwaitingScopeDecision_DecideArm(t *testing.T) {
+	run := naRun("running")
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_scope_decision")}
+
+	na := nextActionsFor(run, stages, nil, nil, nil, nil)
+	if na == nil || na.State != "implement_awaiting_scope_decision" {
+		t.Fatalf("state = %+v, want implement_awaiting_scope_decision", na)
+	}
+	dec := findAction(t, na, "fishhawk_decide_scope_completeness")
+	if dec.Params["run_id"] != run.ID {
+		t.Errorf("decide params = %v, want run_id=%s", dec.Params, run.ID)
+	}
+	if dec.Params["decision"] != "exempt|fail" {
+		t.Errorf("decide params = %v, want the exempt|fail decision hint", dec.Params)
+	}
+	if !strings.Contains(dec.Reason, "no agent re-run") && !strings.Contains(dec.Reason, "NO agent re-run") {
+		t.Errorf("decide reason should name the zero-re-run exempt semantics; got %q", dec.Reason)
 	}
 }
 

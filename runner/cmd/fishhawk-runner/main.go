@@ -263,6 +263,19 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// entirely within run().
 	var fixupExpectedHeadSHA string
 
+	// exemptOpenPR / exemptHeldSHA / exemptHeldBranch carry the operator EXEMPT
+	// resolution of a scope-completeness park (#1231) from the fetched prompt to
+	// the early zero-re-run branch below. When exemptOpenPR is true the stage's
+	// gate-verified commit already sits on exemptHeldBranch at exemptHeldSHA (the
+	// park pushed it), so the runner skips the agent, the gates, and CommitAndPush
+	// and opens the PR from that exact held commit. Function-scoped like
+	// fixupExpectedHeadSHA: produced and consumed entirely within run().
+	var (
+		exemptOpenPR     bool
+		exemptHeldSHA    string
+		exemptHeldBranch string
+	)
+
 	// bindingAssertions is the fetched prompt's binding_assertions (#1171):
 	// the operator-declared deterministic substring checks the runner
 	// evaluates against the committed scope-only tree. It is surfaced in the
@@ -316,7 +329,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -339,6 +352,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		cfg.commitAuthorEmail = commitAuthorEmail
 		cfg.fixup = fixup
 		cfg.fixupBranch = fixupBranch
+		exemptOpenPR = openPRFromHeldCommit
+		exemptHeldSHA = heldCommitSHA
+		exemptHeldBranch = heldCommitBranch
 		fixupExpectedHeadSHA = expectedHeadSHA
 		fixupApplyPatches = applyPatches
 		bindingAssertions = promptBindingAssertions
@@ -436,6 +452,19 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 		defer release()
 		cfg.workingDir = wt
+	}
+
+	// Operator EXEMPT resolution of a scope-completeness park (#1231): the
+	// stage's gate-verified commit already sits on its run branch (the park
+	// pushed it; ADR-035 sole-writer), so open the PR from that exact held
+	// commit with ZERO agent re-invocation. Handled HERE — before the prompt
+	// file is read and the agent.Invocation is wired below — so the agent
+	// invoker is provably never spawned on the exempt path (the e2e asserts
+	// invoker-called-exactly-once across the park+exempt sequence). No
+	// CommitAndPush, no gates, no trace bundle: the commit and its verified
+	// tree are unchanged from the park.
+	if exemptOpenPR {
+		return openHeldCommitPR(ctx, cfg, exemptHeldSHA, exemptHeldBranch, logSink, client, issuedKey)
 	}
 
 	if cfg.promptFile == "" {
@@ -1837,13 +1866,13 @@ func reissueSigningKeyForTerminalUpload(ctx context.Context, client uploadClient
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, fetchErr
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -1851,20 +1880,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -4066,6 +4095,149 @@ func resolveImplementBranchRouting(_ context.Context, cfg config, _, baseRef str
 	return r, nil
 }
 
+// mintImplementToken resolves the push/PR-create credential for an implement
+// stage. It always mints a fresh App installation token (App tokens are
+// ~1-hour TTL and a long agent run can outlive the auth pre-step's token);
+// when no App installation is attributed to the run (a local / MCP run on a
+// repo with no App) it falls back to the operator's local `gh` CLI token
+// (#713) — a user OAuth token authenticates both `git push` over HTTPS and the
+// REST PR-create call. Shared by the open-PR push path (openPRAndShipArtifact)
+// and the zero-re-run exempt resolution (openHeldCommitPR, #1231) so both
+// resolve the credential identically.
+func mintImplementToken(ctx context.Context, cfg config, client uploadClient, issued *upload.IssuedKey, logSink io.Writer) (string, error) {
+	tokenRes, err := client.FetchInstallationToken(ctx, upload.FetchInstallationTokenArgs{
+		RunID:      cfg.runID,
+		StageID:    cfg.stageID,
+		PrivateKey: issued.PrivateKey,
+	})
+	switch {
+	case err == nil:
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"installation_token_received","run_id":%q,"stage_id":%q,"source":"backend"}`+"\n",
+			cfg.runID, cfg.stageID,
+		)
+		return tokenRes.Token, nil
+	case errors.Is(err, upload.ErrNoInstallation):
+		ghTok, ghErr := ghAuthToken(ctx)
+		if ghErr != nil {
+			repoHint := cfg.githubRepo
+			if repoHint == "" {
+				repoHint = os.Getenv("GITHUB_REPOSITORY")
+			}
+			if repoHint == "" {
+				repoHint = "the target repo"
+			}
+			return "", fmt.Errorf("this run has no GitHub App installation and no `gh` CLI token is available for the push + PR fallback; "+
+				"either install the Fishhawk GitHub App on %s, or run `gh auth login` so the runner can use your local token: %w",
+				repoHint, ghErr)
+		}
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"installation_token_received","run_id":%q,"stage_id":%q,"source":"gh_cli"}`+"\n",
+			cfg.runID, cfg.stageID,
+		)
+		return ghTok, nil
+	default:
+		return "", fmt.Errorf("fetch installation token: %w", err)
+	}
+}
+
+// openHeldCommitPR resolves an operator EXEMPT decision on a scope-completeness
+// park (#1231) with ZERO agent re-invocation. The implement stage previously
+// parked because the missing-declared-scope-file gate was its sole failure, and
+// the runner pushed the gate-verified commit to heldBranch at heldSHA WITHOUT
+// opening a PR. The operator decided exempt, so this opens the PR from that
+// exact held commit and ships the pull_request artifact — no agent, no gates, no
+// CommitAndPush (the commit and its tree are unchanged from the park). ADR-035
+// sole-writer holds: the same run that wrote the branch opens its PR, and the
+// opened-PR head is byte-identical to the held tree.
+//
+// Returns a process exit code (exitOK / exitFailure). A push/PR/report failure
+// reports a "failed" outcome to /pull-request so the dispatched stage the trace
+// gate left in `running` lands `failed` rather than hanging — symmetric with
+// openPRAndShipArtifact's failure path, minus the (absent) commit.
+func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch string, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) int {
+	fail := func(category, reason string) int {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"runner_failed","reason":"scope_exempt_open_pr","detail":%q}`+"\n", reason)
+		reportPullRequestFailure(ctx, cfg, logSink, client, issued, category, reason)
+		return exitFailure
+	}
+	if cfg.runID == "" || cfg.stageID == "" {
+		return fail("C", "exempt open-PR requires --run-id and --stage-id")
+	}
+	if issued == nil {
+		return fail("C", "exempt open-PR: signing key not issued")
+	}
+	if heldBranch == "" || heldSHA == "" {
+		return fail("C", "exempt open-PR: backend did not advertise held_commit_branch/held_commit_sha")
+	}
+	if client == nil {
+		client = newUploadClient(cfg.backendURL)
+	}
+
+	repoSlug := cfg.githubRepo
+	if repoSlug == "" {
+		repoSlug = os.Getenv("GITHUB_REPOSITORY")
+	}
+	owner, repoName, ok := strings.Cut(repoSlug, "/")
+	if !ok || owner == "" || repoName == "" {
+		return fail("C", fmt.Sprintf("exempt open-PR: github repo %q is not owner/name", repoSlug))
+	}
+	baseRef := resolveImplementBaseRef(cfg)
+	branch := heldBranch
+
+	token, err := mintImplementToken(ctx, cfg, client, issued, logSink)
+	if err != nil {
+		return fail("C", err.Error())
+	}
+
+	title, body := prTitleAndBody(cfg, branch, logSink)
+	prRes, err := newPROpener(token).OpenPR(ctx, gitops.OpenPRArgs{
+		Owner: owner,
+		Repo:  repoName,
+		Head:  branch,
+		Base:  baseRef,
+		Title: title,
+		Body:  body,
+	})
+	if err != nil {
+		return fail("C", fmt.Sprintf("open PR from held commit: %v", err))
+	}
+	// The opened PR head is the held commit (#1231): the branch tip is heldSHA,
+	// unchanged since the park pushed it (ADR-035 sole-writer — no other writer
+	// touches the run branch). Stamp it so the audit chain proves
+	// opened-PR-head == held-commit without re-resolving the remote tip.
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"scope_completeness_pr_opened","run_id":%q,"stage_id":%q,"pr_number":%d,"pr_url":%q,"head_sha":%q,"branch":%q}`+"\n",
+		cfg.runID, cfg.stageID, prRes.PRNumber, prRes.PRURL, heldSHA, branch)
+
+	artifactBody, _ := json.Marshal(map[string]any{
+		"pr_number": prRes.PRNumber,
+		"pr_url":    prRes.PRURL,
+		"branch":    branch,
+		"head_sha":  heldSHA,
+		"title":     title,
+		"body":      body,
+	})
+	shipRes, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
+		RunID:      cfg.runID,
+		StageID:    cfg.stageID,
+		Body:       artifactBody,
+		PrivateKey: issued.PrivateKey,
+	})
+	if err != nil {
+		category := "C"
+		if errors.Is(err, upload.ErrPullRequestInvalid) {
+			category = "B"
+		}
+		return fail(category, fmt.Sprintf("ship pull-request from held commit: %v", err))
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"pull_request_uploaded","run_id":%q,"stage_id":%q,"artifact_id":%q,"content_hash":%q,"idempotent":%t}`+"\n",
+		cfg.runID, cfg.stageID, shipRes.ID, shipRes.ContentHash, shipRes.Idempotent)
+	return exitOK
+}
+
 // openPRAndShipArtifact is the implement-stage post-processing
 // chain. It commits the agent's edits, pushes a fresh branch via
 // HTTPS, opens a PR via the GitHub REST API, and ships a
@@ -4119,45 +4291,9 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// actions/checkout) and the Ed25519 one here (used by push +
 	// PR). Both attribute to the App; auth_method on each entry
 	// identifies which path served. (#201.)
-	var token string
-	tokenRes, err := client.FetchInstallationToken(ctx, upload.FetchInstallationTokenArgs{
-		RunID:      cfg.runID,
-		StageID:    cfg.stageID,
-		PrivateKey: issued.PrivateKey,
-	})
-	switch {
-	case err == nil:
-		token = tokenRes.Token
-		_, _ = fmt.Fprintf(logSink,
-			`{"event":"installation_token_received","run_id":%q,"stage_id":%q,"source":"backend"}`+"\n",
-			cfg.runID, cfg.stageID,
-		)
-	case errors.Is(err, upload.ErrNoInstallation):
-		// No App installation attributed to this run (a local / MCP run
-		// on a repo with no App). Fall back to the operator's local `gh`
-		// CLI token so the push + PR still work without an operator hand-
-		// push (#713). A user OAuth token authenticates both `git push`
-		// over HTTPS and the REST PR-create call.
-		ghTok, ghErr := ghAuthToken(ctx)
-		if ghErr != nil {
-			repoHint := cfg.githubRepo
-			if repoHint == "" {
-				repoHint = os.Getenv("GITHUB_REPOSITORY")
-			}
-			if repoHint == "" {
-				repoHint = "the target repo"
-			}
-			return fmt.Errorf("this run has no GitHub App installation and no `gh` CLI token is available for the push + PR fallback; "+
-				"either install the Fishhawk GitHub App on %s, or run `gh auth login` so the runner can use your local token: %w",
-				repoHint, ghErr)
-		}
-		token = ghTok
-		_, _ = fmt.Fprintf(logSink,
-			`{"event":"installation_token_received","run_id":%q,"stage_id":%q,"source":"gh_cli"}`+"\n",
-			cfg.runID, cfg.stageID,
-		)
-	default:
-		return fmt.Errorf("fetch installation token: %w", err)
+	token, err := mintImplementToken(ctx, cfg, client, issued, logSink)
+	if err != nil {
+		return err
 	}
 
 	// Repo: --github-repo flag > GITHUB_REPOSITORY env. The flag
@@ -4255,6 +4391,24 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// the push, so a failure leaves origin untouched.
 	gateScopeFiles := scopePaths(cfg.scopeFiles)
 	verifyCommit := func(ctx context.Context, headSHA string, drift []string) error {
+		// Scope-completeness park deferral (#1231). The missing-declared-scope-file
+		// gate is checked at its usual position below but RECORDS rather than
+		// returns, so the remaining gates (binding-assertion, compile/test,
+		// verified-tree) all run afterward. The park is signaled — via the typed
+		// *gitops.ScopeFilesMissingError that CommitAndPush recognizes — ONLY at a
+		// terminal pass point, i.e. when every OTHER gate is green: that proves
+		// missing-scope is the SOLE failure (any compound failure returns the other
+		// gate's error first, keeping today's category-B). created-out-of-scope
+		// runs BEFORE the recording point and returns on failure, so it too is
+		// covered by the sole-failure guarantee.
+		var parkMissing []string
+		var parkMessage string
+		scopeParkResult := func() error {
+			if len(parkMissing) > 0 {
+				return &gitops.ScopeFilesMissingError{Missing: parkMissing, Message: parkMessage}
+			}
+			return nil
+		}
 		// Created-out-of-scope gate (#818, generalized to the open-PR path by
 		// #825). A net-new (untracked) out-of-scope file is silently stripped
 		// from the scope-only commit by StageScoped (#581) while in-scope edits
@@ -4331,7 +4485,13 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"scope_files_missing","run_id":%q,"stage_id":%q,"head_sha":%q,"declared":%s,"committed":%s,"missing":%s,"exempted":%s}`+"\n",
 					cfg.runID, cfg.stageID, headSHA, declaredJSON, committedJSON, remainingJSON, exemptedJSON)
-				return fmt.Errorf("%w: %s", gitops.ErrScopeFilesMissing,
+				// Record the shortfall but DON'T return (#1231): the remaining gates
+				// must run first so the park is signaled only when missing-scope is the
+				// SOLE failure. The terminal scopeParkResult() converts this into the
+				// typed *gitops.ScopeFilesMissingError. Message preserves the pre-#1231
+				// "%w: declared N, committed M" narrative byte-for-byte.
+				parkMissing = remaining
+				parkMessage = fmt.Sprintf("%s: %s", gitops.ErrScopeFilesMissing.Error(),
 					missingScopeFilesMessage(cfg.scopeFiles, remaining, exempted, len(gateScopeFiles), len(committed)))
 			}
 		}
@@ -4389,7 +4549,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// returns ErrPushedTreeNotVerified BEFORE the push (origin untouched,
 		// category-B). Empty verifiedTreeSHA = no gate ran = no-op.
 		if verifiedTreeSHA == "" {
-			return nil
+			return scopeParkResult()
 		}
 		realTree, terr := gitRevParseTreeOf(ctx, repoDir, headSHA)
 		if terr != nil {
@@ -4403,7 +4563,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"verified_tree_match","run_id":%q,"stage_id":%q,"head_sha":%q,"tree_sha":%q}`+"\n",
 				cfg.runID, cfg.stageID, headSHA, realTree)
-			return nil
+			return scopeParkResult()
 		}
 		driftJSON, _ := json.Marshal(drift)
 		_, _ = fmt.Fprintf(logSink,
@@ -4456,7 +4616,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// unconditionally — the audit trail's equality claim holds on the
 		// reverify-pass path too (#969).
 		verifiedTreeSHA = realTree
-		return nil
+		return scopeParkResult()
 	}
 
 	cap, err := newPusher().CommitAndPush(ctx, gitops.CommitAndPushArgs{
@@ -4504,6 +4664,13 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// plan's declared paths, excluding stray dirty files. Empty
 		// (plan_missing_for_implement) falls back to `git add -A`.
 		ScopeFiles: scopePaths(cfg.scopeFiles),
+		// Scope-completeness park (#1231): on the standalone open-PR push ONLY
+		// (the same guard the missing-scope gate runs under), a
+		// missing-declared-scope-file-ONLY failure pushes the gate-verified
+		// commit and surfaces ScopeShortfall instead of aborting category-B, so
+		// the caller can report a park. False for fix-ups and decomposed children
+		// keeps their strict category-B behavior byte-identical.
+		ParkOnScopeShortfall: !isFixup && !isDecomposed,
 		// Compile-gate the committed tree before push (#728). Always wired,
 		// including the decomposed-child path (#766, see above) — the gate
 		// runs on every implement push.
@@ -4745,6 +4912,42 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			`{"event":"implement_child_push_reported","run_id":%q,"stage_id":%q,"shared_branch":%q,"head_sha":%q}`+"\n",
 			cfg.runID, cfg.stageID, branch, cap.HeadSHA,
 		)
+		return nil
+	}
+
+	// Scope-completeness park (#1231): the missing-declared-scope-file gate was
+	// this standalone implement stage's SOLE committed-tree failure, so
+	// CommitAndPush pushed the gate-verified commit to the run branch but
+	// surfaced ScopeShortfall instead of failing category-B. Report the park to
+	// the backend INSTEAD of opening a PR — the backend records the held-commit
+	// payload, transitions the implement stage to awaiting_scope_decision (a
+	// parked judgment, not a category-B failure), and surfaces an in-band
+	// operator exempt/fail decision. The held commit (cap.HeadSHA on `branch`)
+	// survives the runner exit so an exempt resolution opens the PR from this
+	// exact head with no agent re-run (ADR-035 sole-writer). A report error is
+	// category-C (network) and is surfaced like the OpenPR/ship errors so the
+	// failure path reports it.
+	if len(cap.ScopeShortfall) > 0 {
+		missingJSON, _ := json.Marshal(cap.ScopeShortfall)
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"scope_completeness_parked","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"base_sha":%q,"verified_tree_sha":%q,"tree_sha":%q,"missing_paths":%s}`+"\n",
+			cfg.runID, cfg.stageID, branch, cap.HeadSHA, cap.BaseSHA, verifiedTreeSHA, cap.TreeSHA, missingJSON)
+		if _, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
+			RunID:        cfg.runID,
+			StageID:      cfg.stageID,
+			PrivateKey:   issued.PrivateKey,
+			Outcome:      "scope_park",
+			Branch:       branch,
+			HeadSHA:      cap.HeadSHA,
+			BaseSHA:      cap.BaseSHA,
+			TreeSHA:      verifiedTreeSHA,
+			MissingPaths: cap.ScopeShortfall,
+		}); err != nil {
+			return fmt.Errorf("report scope-completeness park: %w", err)
+		}
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"scope_completeness_park_reported","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q}`+"\n",
+			cfg.runID, cfg.stageID, branch, cap.HeadSHA)
 		return nil
 	}
 

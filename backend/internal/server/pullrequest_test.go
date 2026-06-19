@@ -1013,3 +1013,170 @@ func TestShipPullRequest_BearerActorKindClosedSet(t *testing.T) {
 		})
 	}
 }
+
+// parkRecordingRepo embeds the orchestratorRepo and additionally implements
+// the scopeCompletenessParker capability (#1231) so the park handler takes
+// its production type-asserted path. It records the park struct + audit
+// params it was handed and drives the real running → awaiting_scope_decision
+// transition, so the test can assert the cross-module wire fields mapped
+// correctly into run.ScopeCompletenessPark.
+type parkRecordingRepo struct {
+	*orchestratorRepo
+	parkCalls []parkRecord
+}
+
+type parkRecord struct {
+	stageID uuid.UUID
+	park    run.ScopeCompletenessPark
+	append  audit.ChainAppendParams
+}
+
+func (r *parkRecordingRepo) ParkScopeCompletenessAndAppend(ctx context.Context, stageID uuid.UUID, park run.ScopeCompletenessPark, p audit.ChainAppendParams) (*run.Stage, bool, error) {
+	r.parkCalls = append(r.parkCalls, parkRecord{stageID: stageID, park: park, append: p})
+	st, err := r.TransitionStage(ctx, stageID, run.StageStateAwaitingScopeDecision, nil)
+	return st, true, err
+}
+
+// TestShipPullRequest_ScopeParkOutcome_ParksStage pins the #1231 backend
+// park-report branch on the production (parker-capable) path: a
+// {outcome:"scope_park"} report records the held-commit ScopeCompletenessPark
+// payload, parks the implement stage in awaiting_scope_decision, opens no PR
+// artifact, and the wire fields map byte-for-byte into the park struct.
+func TestShipPullRequest_ScopeParkOutcome_ParksStage(t *testing.T) {
+	sf := newSigningFake()
+	ar := newFakeArtifactRepo()
+	au := newAuditFake()
+	rr := &parkRecordingRepo{orchestratorRepo: newOrchestratorRepo()}
+	s := New(Config{
+		Addr: "127.0.0.1:0", SigningRepo: sf, ArtifactRepo: ar, AuditRepo: au, RunRepo: rr,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body, err := json.Marshal(map[string]any{
+		"outcome":           "scope_park",
+		"branch":            "fishhawk/run-aaaaaaaa/slice-0",
+		"head_sha":          "1111111111111111111111111111111111111111",
+		"base_sha":          "2222222222222222222222222222222222222222",
+		"verified_tree_sha": "3333333333333333333333333333333333333333",
+		"missing_paths":     []string{"backend/internal/foo/foo_test.go", "docs/foo.md"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateAwaitingScopeDecision {
+		t.Errorf("stage.State = %q, want awaiting_scope_decision", got.State)
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("artifacts = %d, want 0 (no PR artifact for a scope-park report)", len(ar.all))
+	}
+	if len(rr.parkCalls) != 1 {
+		t.Fatalf("park calls = %d, want 1", len(rr.parkCalls))
+	}
+	pc := rr.parkCalls[0]
+	if pc.park.HeldCommitSHA != "1111111111111111111111111111111111111111" ||
+		pc.park.RunBranch != "fishhawk/run-aaaaaaaa/slice-0" ||
+		pc.park.VerifiedTreeSHA != "3333333333333333333333333333333333333333" ||
+		len(pc.park.MissingPaths) != 2 {
+		t.Errorf("recorded park = %+v, want the wire fields mapped 1:1", pc.park)
+	}
+	if pc.append.Category != CategoryScopeCompletenessParked {
+		t.Errorf("park audit category = %q, want %q", pc.append.Category, CategoryScopeCompletenessParked)
+	}
+}
+
+// TestShipPullRequest_ScopeParkOutcome_FallbackTransitions pins the degraded
+// (non-parker repo) path: a repo that does NOT implement the parker still
+// transitions the stage to awaiting_scope_decision and best-effort appends
+// the scope_completeness_parked audit entry (#1231).
+func TestShipPullRequest_ScopeParkOutcome_FallbackTransitions(t *testing.T) {
+	s, sf, ar, au, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body, err := json.Marshal(map[string]any{
+		"outcome":           "scope_park",
+		"branch":            "fishhawk/run-aaaaaaaa/slice-0",
+		"head_sha":          "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		"base_sha":          "cafecafecafecafecafecafecafecafecafecafe",
+		"verified_tree_sha": "f00df00df00df00df00df00df00df00df00df00d",
+		"missing_paths":     []string{"backend/internal/foo/foo.go"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateAwaitingScopeDecision {
+		t.Errorf("stage.State = %q, want awaiting_scope_decision (fallback must still park)", got.State)
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("artifacts = %d, want 0", len(ar.all))
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var found bool
+	var missingInPayload bool
+	for _, e := range au.appended {
+		if e.Category == CategoryScopeCompletenessParked {
+			found = true
+			if strings.Contains(string(e.Payload), "foo.go") {
+				missingInPayload = true
+			}
+		}
+	}
+	if !found {
+		t.Error("no scope_completeness_parked audit entry recorded on the fallback path")
+	}
+	if !missingInPayload {
+		t.Error("scope_completeness_parked payload missing the missing_paths content")
+	}
+}
+
+// TestShipPullRequest_ScopeParkOutcome_RejectsMissingCoords pins the #1231
+// validation: the scope_park variant requires branch + head_sha + base_sha +
+// verified_tree_sha + a non-empty missing_paths.
+func TestShipPullRequest_ScopeParkOutcome_RejectsMissingCoords(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, _, _ := newPRServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	for _, body := range []string{
+		`{"outcome":"scope_park","head_sha":"h","base_sha":"b","verified_tree_sha":"t","missing_paths":["x"]}`,            // missing branch
+		`{"outcome":"scope_park","branch":"br","base_sha":"b","verified_tree_sha":"t","missing_paths":["x"]}`,             // missing head_sha
+		`{"outcome":"scope_park","branch":"br","head_sha":"h","verified_tree_sha":"t","missing_paths":["x"]}`,             // missing base_sha
+		`{"outcome":"scope_park","branch":"br","head_sha":"h","base_sha":"b","missing_paths":["x"]}`,                      // missing verified_tree_sha
+		`{"outcome":"scope_park","branch":"br","head_sha":"h","base_sha":"b","verified_tree_sha":"t"}`,                    // missing missing_paths
+		`{"outcome":"scope_park","branch":"br","head_sha":"h","base_sha":"b","verified_tree_sha":"t","missing_paths":[]}`, // empty missing_paths
+	} {
+		w := shipPRRequest(t, s, runID, stageID, priv, []byte(body), "")
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("body %s: status = %d, want 400:\n%s", body, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "pull_request_invalid") {
+			t.Errorf("body %s: missing pull_request_invalid:\n%s", body, w.Body.String())
+		}
+	}
+}

@@ -54,6 +54,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerDeferConcern(srv, resolver)
 	registerListScopeAmendments(srv, resolver)
 	registerDecideScopeAmendment(srv, resolver)
+	registerDecideScopeCompleteness(srv, resolver)
 	registerApprovePlan(srv, resolver)
 	registerRejectPlan(srv, resolver)
 	registerRevisePlan(srv, resolver)
