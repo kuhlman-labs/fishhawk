@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
@@ -201,14 +202,18 @@ func fixupBranchFor(runRow *run.Run, stage *run.Stage) string {
 // fixupBranchFor to handle the decomposed-PARENT case (#1063). A decomposed
 // parent has DecomposedFrom == nil, so fixupBranchFor would return a per-stage
 // branch — but a parent fix-up's commit must land on the consolidated PR head,
-// the shared branch `fishhawk/run-<shortID(runID)>` (byte-matching
-// orchestrator.consolidatedBranch). When the run is a parent (DecomposedFrom ==
-// nil) WITH minted children, return that shared branch; otherwise delegate to
-// fixupBranchFor. On a probe error, fall back to fixupBranchFor — never widen
-// an ordinary run onto a shared branch.
+// the shared branch `fishhawk/run-<shortID(runID)>-consolidated`,
+// byte-matching orchestrator.ConsolidatedBranch. We delegate to that exported
+// helper rather than re-hardcoding the literal: a second, duplicated
+// reconstruction here returned the pre-#1243 `fishhawk/run-<short>` form and
+// diverged from the renamed consolidated branch, orphaning the parent fix-up
+// commit (#1245). When the run is a parent (DecomposedFrom == nil) WITH minted
+// children, return that shared branch; otherwise delegate to fixupBranchFor. On
+// a probe error, fall back to fixupBranchFor — never widen an ordinary run onto
+// a shared branch.
 func (s *Server) fixupBranchForRun(ctx context.Context, runRow *run.Run, stage *run.Stage) string {
 	if runRow.DecomposedFrom == nil && s.hasDecomposedChildren(ctx, runRow.ID) {
-		return "fishhawk/run-" + shortID(runRow.ID)
+		return orchestrator.ConsolidatedBranch(runRow.ID)
 	}
 	return fixupBranchFor(runRow, stage)
 }

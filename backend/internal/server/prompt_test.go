@@ -23,6 +23,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
@@ -2733,7 +2734,12 @@ func TestGetStagePrompt_Implement_FixupDecomposedParent_SharedBranch(t *testing.
 	if !resp.Fixup {
 		t.Fatalf("fixup = false, want true")
 	}
-	wantBranch := "fishhawk/run-" + parentRunID.String()[:8]
+	// Cross-package byte-match pin: assert against the SAME exported source of
+	// truth production uses (orchestrator.ConsolidatedBranch), not a local
+	// literal. A stale literal here is exactly what masked the #1245
+	// divergence; this fails if fixupBranchForRun ever desyncs from the
+	// orchestrator's consolidated-branch derivation on a future rename.
+	wantBranch := orchestrator.ConsolidatedBranch(parentRunID)
 	if resp.FixupBranch != wantBranch {
 		t.Errorf("fixup_branch = %q, want shared consolidated branch %q", resp.FixupBranch, wantBranch)
 	}
