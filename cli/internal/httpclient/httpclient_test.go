@@ -579,3 +579,134 @@ func TestAPIError_Error(t *testing.T) {
 		})
 	}
 }
+
+// --- scope amendments (#1233 interim auto-decider) ---
+
+func TestListScopeAmendments_WaitForwardedAndEnvelopeDecoded(t *testing.T) {
+	runID := uuid.New()
+	amendID := uuid.New()
+	var gotQuery string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/runs/{run_id}/scope-amendments", func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(scopeAmendmentListResult{Items: []ScopeAmendment{
+			{
+				ID: amendID, RunID: runID, StageID: uuid.New(), Status: "pending",
+				Paths:  []ScopeAmendmentPath{{Path: "a/b_test.go", Operation: "create"}},
+				Reason: "coupled test",
+			},
+		}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "op-tok")
+	items, err := c.ListScopeAmendments(context.Background(), runID, 25)
+	if err != nil {
+		t.Fatalf("ListScopeAmendments: %v", err)
+	}
+	if !strings.Contains(gotQuery, "wait=25") {
+		t.Errorf("query missing wait=25: %q", gotQuery)
+	}
+	if len(items) != 1 || items[0].ID != amendID {
+		t.Fatalf("decode mismatch: %+v", items)
+	}
+	if items[0].Paths[0].Path != "a/b_test.go" || items[0].Paths[0].Operation != "create" {
+		t.Errorf("path entry decode mismatch: %+v", items[0].Paths)
+	}
+}
+
+func TestListScopeAmendments_WaitOmittedWhenNonPositive(t *testing.T) {
+	var gotQuery string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/runs/{run_id}/scope-amendments", func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(scopeAmendmentListResult{Items: nil})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "")
+	if _, err := c.ListScopeAmendments(context.Background(), uuid.New(), 0); err != nil {
+		t.Fatalf("ListScopeAmendments: %v", err)
+	}
+	if strings.Contains(gotQuery, "wait") {
+		t.Errorf("wait should be omitted for <=0: %q", gotQuery)
+	}
+}
+
+func TestDecideScopeAmendment_RequestBodyShape(t *testing.T) {
+	runID := uuid.New()
+	amendID := uuid.New()
+	var gotBody []byte
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/scope-amendments/{amendment_id}/decision", func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ScopeAmendment{ID: amendID, RunID: runID, Status: "approved"})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "op-tok")
+	got, err := c.DecideScopeAmendment(context.Background(), runID, amendID, "approve", "because")
+	if err != nil {
+		t.Fatalf("DecideScopeAmendment: %v", err)
+	}
+	if !strings.Contains(string(gotBody), `"decision":"approve"`) || !strings.Contains(string(gotBody), `"reason":"because"`) {
+		t.Errorf("body shape mismatch: %s", gotBody)
+	}
+	if got.Status != "approved" {
+		t.Errorf("status = %q, want approved", got.Status)
+	}
+}
+
+func TestDecideScopeAmendment_AlreadyDecidedMapsToAPIError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/scope-amendments/{amendment_id}/decision", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"error":{"code":"amendment_already_decided","message":"already decided"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "op-tok")
+	_, err := c.DecideScopeAmendment(context.Background(), uuid.New(), uuid.New(), "approve", "")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v, want *APIError", err)
+	}
+	if apiErr.StatusCode != http.StatusConflict || apiErr.Code != "amendment_already_decided" {
+		t.Errorf("APIError = %+v, want 409 amendment_already_decided", apiErr)
+	}
+}
+
+func TestListStageArtifacts_EnvelopeDecoded(t *testing.T) {
+	stageID := uuid.New()
+	schema := "standard_v1"
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/stages/{stage_id}/artifacts", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(listArtifactsResult{Items: []Artifact{
+			{ID: uuid.New(), StageID: stageID, Kind: "plan", SchemaVersion: &schema,
+				Content: json.RawMessage(`{"scope":{"files":[{"path":"a/b.go"}]}}`)},
+		}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "op-tok")
+	arts, err := c.ListStageArtifacts(context.Background(), stageID)
+	if err != nil {
+		t.Fatalf("ListStageArtifacts: %v", err)
+	}
+	if len(arts) != 1 || arts[0].Kind != "plan" || arts[0].SchemaVersion == nil || *arts[0].SchemaVersion != "standard_v1" {
+		t.Fatalf("decode mismatch: %+v", arts)
+	}
+	if !strings.Contains(string(arts[0].Content), "a/b.go") {
+		t.Errorf("content decode mismatch: %s", arts[0].Content)
+	}
+}

@@ -653,6 +653,20 @@ func TestRun_UnknownRunSubcommand(t *testing.T) {
 	}
 }
 
+// TestRun_NoSubcommand_ListsAutoDecide asserts the interim auto-decide
+// subcommand (#1233) is discoverable in the `run` usage string and is a
+// recognized dispatcher arm (not 'unknown subcommand'). An empty `run`
+// prints the subcommand list to stderr.
+func TestRun_NoSubcommand_ListsAutoDecide(t *testing.T) {
+	var stderr strings.Builder
+	if got := run([]string{"run"}, io.Discard, &stderr); got != exitUsage {
+		t.Fatalf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "auto-decide") {
+		t.Errorf("run usage missing auto-decide: %s", stderr.String())
+	}
+}
+
 // --- audit list (E18.4 / #335) ---
 
 func auditEntryFixture(seq int64, runID uuid.UUID, category, actor string, payload map[string]any) httpclient.AuditEntry {
