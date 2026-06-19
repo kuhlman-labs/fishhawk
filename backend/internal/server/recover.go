@@ -23,7 +23,8 @@ import (
 // CategoryPlanReusedFrom is the audit-log category for the provenance
 // entry the recovery handler appends on the NEW run (E22.X / #978).
 // Payload carries {parent_run_id, parent_failure_category, added_paths,
-// source, reason}. Internal audit kind — NOT an issue-comment surface.
+// exempted_paths, source, reason}. Internal audit kind — NOT an
+// issue-comment surface.
 const CategoryPlanReusedFrom = "plan_reused_from"
 
 // recoverRunRequest is the JSON body of POST /v0/runs/{run_id}/recover.
@@ -34,8 +35,17 @@ type recoverRunRequest struct {
 	// recovery run's effective scope via a pre-approved #961 scope
 	// amendment row. Operation defaults to modify when omitted.
 	AddScopeFiles []scopeamendment.PathEntry `json:"add_scope_files,omitempty"`
+	// ExemptScopeFiles are the operator-justified-unchanged DECLARED
+	// scope.files paths the runner's #1151 shortfall gate subtracts
+	// (#1229) — the inverse of AddScopeFiles. Each {path, reason} is
+	// validated (clean repo-relative path + non-empty reason) and
+	// persisted on the plan_reused_from provenance as exempted_paths; it
+	// does NOT mint a scope-amendment row (it subtracts from the gate, it
+	// does not widen scope). scopeExemption is defined in prompt.go.
+	ExemptScopeFiles []scopeExemption `json:"exempt_scope_files,omitempty"`
 	// Reason rides on both the amendment row and the plan_reused_from
-	// provenance entry.
+	// provenance entry, and is injected into the recovery agent's binding
+	// conditions (Part D, #1229).
 	Reason string `json:"reason,omitempty"`
 	// BudgetOverride forces the recovery past a blocking periodic
 	// budget that is over its limit, mirroring POST /v0/runs (#688).
@@ -118,6 +128,18 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Validate + normalize the operator's exempt_scope_files up front (#1229).
+	// Each path must be clean repo-relative AND carry a non-empty reason — a
+	// 400 on either failure, before the run is minted. Exemptions do NOT mint
+	// a scope-amendment row; they ride the plan_reused_from provenance and the
+	// runner subtracts them from the #1151 shortfall gate.
+	exemptPaths, err := validateExemptScopeFiles(req.ExemptScopeFiles)
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			err.Error(), map[string]any{"field": "exempt_scope_files"})
+		return
+	}
+
 	parent, err := s.cfg.RunRepo.GetRun(r.Context(), parentID)
 	if err != nil {
 		if errors.Is(err, run.ErrNotFound) {
@@ -140,7 +162,7 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 	// a second DecomposedFrom row would double-count in
 	// childcompletion.resolveParent's consolidation counters.
 	if parent.DecomposedFrom != nil {
-		s.handleRecoverDecompositionChild(w, r, parent, amendPaths, req.Reason)
+		s.handleRecoverDecompositionChild(w, r, parent, amendPaths, exemptPaths, req.Reason)
 		return
 	}
 
@@ -325,7 +347,7 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 	// child's ParentRunID and the approved amendment row are the
 	// durable records; a failed append warn-logs rather than
 	// unwinding the created run.
-	s.writePlanReusedFromAudit(r, child.ID, parent.ID.String(), "operator_recovery", amendPaths, req.Reason, id.Subject)
+	s.writePlanReusedFromAudit(r, child.ID, parent.ID.String(), "operator_recovery", amendPaths, exemptPaths, req.Reason, id.Subject)
 
 	s.writeJSON(w, r, http.StatusCreated, toRunResponse(child))
 }
@@ -397,7 +419,7 @@ func (s *Server) createApprovedScopeAmendment(ctx context.Context, runID, stageI
 // the identical contract. (Runner-side fhm_ tokens carry only mcp:read
 // and so can't clear write:runs to reach this branch in practice — but
 // the authz posture must be consistent by construction, not by accident.)
-func (s *Server) handleRecoverDecompositionChild(w http.ResponseWriter, r *http.Request, child *run.Run, amendPaths []scopeamendment.PathEntry, reason string) {
+func (s *Server) handleRecoverDecompositionChild(w http.ResponseWriter, r *http.Request, child *run.Run, amendPaths []scopeamendment.PathEntry, exemptPaths []scopeExemption, reason string) {
 	id := IdentityFrom(r.Context())
 	if strings.HasPrefix(id.Subject, "mcp:run:") {
 		s.writeError(w, r, http.StatusForbidden, "agent_token_forbidden",
@@ -495,7 +517,7 @@ func (s *Server) handleRecoverDecompositionChild(w http.ResponseWriter, r *http.
 	// the approved amendment row and the re-driven stage are the durable
 	// records.
 	s.writePlanReusedFromAudit(r, child.ID, child.DecomposedFrom.String(),
-		"decomposition_child_recovery", amendPaths, reason, id.Subject)
+		"decomposition_child_recovery", amendPaths, exemptPaths, reason, id.Subject)
 
 	// Un-terminal-ing the run let Advance act (it no-ops on terminal
 	// runs); walk the re-opened pending implement stage → dispatched.
@@ -520,17 +542,49 @@ func (s *Server) handleRecoverDecompositionChild(w http.ResponseWriter, r *http.
 	s.writeJSON(w, r, http.StatusCreated, toRunResponse(updated))
 }
 
+// validateExemptScopeFiles normalizes and validates the operator's
+// exempt_scope_files (#1229). Each entry must name a clean repo-relative path
+// (non-empty after trim; not absolute; no ".." traversal — the same
+// containment contract isRepoRelativePath enforces for the #1151 shortfall
+// gate) AND carry a non-empty reason. Returns the trimmed entries or an error
+// describing the first bad entry; nil input yields nil with no error (an
+// exemption-less recovery is valid).
+func validateExemptScopeFiles(in []scopeExemption) ([]scopeExemption, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := make([]scopeExemption, 0, len(in))
+	for _, e := range in {
+		p := strings.TrimSpace(e.Path)
+		if p == "" {
+			return nil, errors.New("exempt_scope_files entries must name a non-empty repo-relative path")
+		}
+		if !isRepoRelativePath(p) {
+			return nil, fmt.Errorf("exempt_scope_files path %q must be repo-relative (no leading '/' or '..')", p)
+		}
+		reason := strings.TrimSpace(e.Reason)
+		if reason == "" {
+			return nil, fmt.Errorf("exempt_scope_files path %q must carry a non-empty reason", p)
+		}
+		out = append(out, scopeExemption{Path: p, Reason: reason})
+	}
+	return out, nil
+}
+
 // writePlanReusedFromAudit appends the plan_reused_from chain entry on
 // the recovery run (childID). source distinguishes the new-child mint
 // (operator_recovery) from the in-place decomposition re-drive
 // (decomposition_child_recovery); parentRunID is the run whose approved
-// plan was reused.
-func (s *Server) writePlanReusedFromAudit(r *http.Request, childID uuid.UUID, parentRunID, source string, addedPaths []scopeamendment.PathEntry, reason, subject string) {
+// plan was reused. exemptedPaths records the operator's exempt_scope_files
+// (#1229) — the durable record the prompt builder reads back to deliver
+// scope_exemptions to the runner gate.
+func (s *Server) writePlanReusedFromAudit(r *http.Request, childID uuid.UUID, parentRunID, source string, addedPaths []scopeamendment.PathEntry, exemptedPaths []scopeExemption, reason, subject string) {
 	actorKind := audit.ActorUser
 	payload, _ := json.Marshal(map[string]any{
 		"parent_run_id":           parentRunID,
 		"parent_failure_category": string(run.FailureB),
 		"added_paths":             addedPaths,
+		"exempted_paths":          exemptedPaths,
 		"source":                  source,
 		"reason":                  reason,
 	})

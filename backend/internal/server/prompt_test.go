@@ -3637,6 +3637,237 @@ func makeApproveWithCommentEntry(runID uuid.UUID, comment string) *audit.Entry {
 	return &audit.Entry{ID: uuid.New(), Category: "approval_submitted", RunID: &rid, Payload: payload}
 }
 
+// makePlanReusedFromEntry builds a plan_reused_from audit entry carrying the
+// #1229 exempted_paths + resume reason — the durable record the recovery
+// prompt builder reads back.
+func makePlanReusedFromEntry(runID uuid.UUID, exempted []scopeExemption, reason string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"parent_run_id":           uuid.New().String(),
+		"parent_failure_category": "B",
+		"source":                  "operator_recovery",
+		"exempted_paths":          exempted,
+		"reason":                  reason,
+	})
+	rid := runID
+	return &audit.Entry{ID: uuid.New(), Category: CategoryPlanReusedFrom, RunID: &rid, Payload: payload}
+}
+
+func TestResolveRecoveryScopeExemptions(t *testing.T) {
+	runID := uuid.New()
+	want := []scopeExemption{{Path: "backend/a.go", Reason: "unchanged on this slice"}}
+
+	t.Run("returns the run's exempted_paths", func(t *testing.T) {
+		s := newFeedbackServer(t, nil, map[uuid.UUID][]*audit.Entry{
+			runID: {makePlanReusedFromEntry(runID, want, "recover")},
+		})
+		got := s.resolveRecoveryScopeExemptions(context.Background(), runID)
+		if len(got) != 1 || got[0] != want[0] {
+			t.Errorf("got %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("absent plan_reused_from returns nil", func(t *testing.T) {
+		s := newFeedbackServer(t, nil, nil)
+		if got := s.resolveRecoveryScopeExemptions(context.Background(), runID); got != nil {
+			t.Errorf("got %+v, want nil (no plan_reused_from)", got)
+		}
+	})
+
+	t.Run("plan_reused_from with no exemptions returns nil", func(t *testing.T) {
+		s := newFeedbackServer(t, nil, map[uuid.UUID][]*audit.Entry{
+			runID: {makePlanReusedFromEntry(runID, nil, "recover")},
+		})
+		if got := s.resolveRecoveryScopeExemptions(context.Background(), runID); got != nil {
+			t.Errorf("got %+v, want nil (no exempted_paths)", got)
+		}
+	})
+}
+
+func TestLoadRecoveryResumeReason(t *testing.T) {
+	runID := uuid.New()
+
+	t.Run("returns the resume reason", func(t *testing.T) {
+		s := newFeedbackServer(t, nil, map[uuid.UUID][]*audit.Entry{
+			runID: {makePlanReusedFromEntry(runID, nil, "steer the recovery here")},
+		})
+		got := s.loadRecoveryResumeReason(context.Background(), runID)
+		if got == nil || *got != "steer the recovery here" {
+			t.Errorf("got %v, want the resume reason", got)
+		}
+	})
+
+	t.Run("absent plan_reused_from returns nil", func(t *testing.T) {
+		s := newFeedbackServer(t, nil, nil)
+		if got := s.loadRecoveryResumeReason(context.Background(), runID); got != nil {
+			t.Errorf("got %q, want nil", *got)
+		}
+	})
+
+	t.Run("empty/whitespace reason returns nil", func(t *testing.T) {
+		s := newFeedbackServer(t, nil, map[uuid.UUID][]*audit.Entry{
+			runID: {makePlanReusedFromEntry(runID, nil, "   ")},
+		})
+		if got := s.loadRecoveryResumeReason(context.Background(), runID); got != nil {
+			t.Errorf("got %q, want nil (whitespace reason)", *got)
+		}
+	})
+}
+
+func TestAppendRecoveryResumeReason(t *testing.T) {
+	conditions := "Inherited approve-with-conditions text."
+	reason := "Recover with the declared file unchanged."
+
+	t.Run("nil reason leaves conditions unchanged", func(t *testing.T) {
+		got := appendRecoveryResumeReason(&conditions, nil)
+		if got != &conditions {
+			t.Errorf("got %v, want the original conditions pointer unchanged", got)
+		}
+	})
+
+	t.Run("nil conditions yields the labeled reason", func(t *testing.T) {
+		got := appendRecoveryResumeReason(nil, &reason)
+		if got == nil || *got != "Recovery directive (resume_run reason): "+reason {
+			t.Errorf("got %v, want the labeled reason", got)
+		}
+	})
+
+	t.Run("both combine conditions then reason", func(t *testing.T) {
+		got := appendRecoveryResumeReason(&conditions, &reason)
+		want := conditions + "\n\nRecovery directive (resume_run reason): " + reason
+		if got == nil || *got != want {
+			t.Errorf("got %v, want %q", got, want)
+		}
+	})
+}
+
+// TestGetStagePrompt_Implement_RecoveryScopeExemptionsAndReason crosses the
+// plan_reused_from audit → implement prompt-response path (#1229) on BOTH
+// build paths (the signed /prompt and the SPA /prompt-render): the recovery
+// run's exempt_scope_files surface in resp.ScopeExemptions and the resume
+// reason renders into the binding "Approval conditions" block (Part D). A
+// control run with no plan_reused_from leaves both empty/absent.
+func TestGetStagePrompt_Implement_RecoveryScopeExemptionsAndReason(t *testing.T) {
+	const exemptPath = "backend/internal/server/handlers.go"
+	const resumeReason = "Recover leaving the declared file unchanged on this slice."
+
+	buildServer := func(t *testing.T, withReuse bool) (*Server, *promptRunRepo, *signingFake, uuid.UUID, uuid.UUID) {
+		t.Helper()
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+
+		runID := uuid.New()
+		planStageID := uuid.New()
+		implStageID := uuid.New()
+
+		p := &plan.Plan{
+			PlanVersion:  "standard_v1",
+			Summary:      "recoverable plan",
+			Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+			Scope: plan.Scope{
+				Files: []plan.ScopeFile{{Path: exemptPath, Operation: plan.FileOpModify}},
+			},
+		}
+		planBytes, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal plan: %v", err)
+		}
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{
+			StageID:       planStageID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &sv,
+			Content:       planBytes,
+		}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+			runID: {
+				{ID: planStageID, RunID: runID, Type: run.StageTypePlan},
+				{ID: implStageID, RunID: runID, Type: run.StageTypeImplement},
+			},
+		}
+		rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+		rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+		auditByRun := map[uuid.UUID][]*audit.Entry{}
+		if withReuse {
+			auditByRun[runID] = []*audit.Entry{
+				makePlanReusedFromEntry(runID,
+					[]scopeExemption{{Path: exemptPath, Reason: "declared but unchanged"}}, resumeReason),
+			}
+		}
+
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			RunRepo:      rr,
+			SigningRepo:  sf,
+			ArtifactRepo: art,
+			AuditRepo:    &feedbackAuditRepo{byRunID: auditByRun},
+		})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+		return s, rr, sf, runID, implStageID
+	}
+
+	decode := func(t *testing.T, w *httptest.ResponseRecorder) promptResponse {
+		t.Helper()
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode prompt: %v", err)
+		}
+		return resp
+	}
+
+	renderRequest := func(t *testing.T, s *Server, stageID uuid.UUID) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet,
+			fmt.Sprintf("/v0/stages/%s/prompt-render", stageID), nil)
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, req)
+		return w
+	}
+
+	t.Run("recovery run carries exemptions + reason on /prompt", func(t *testing.T) {
+		s, _, sf, runID, implStageID := buildServer(t, true)
+		priv, _ := sf.issue(t, runID)
+		resp := decode(t, promptRequest(t, s, runID, implStageID, priv, ""))
+		if len(resp.ScopeExemptions) != 1 || resp.ScopeExemptions[0].Path != exemptPath ||
+			resp.ScopeExemptions[0].Reason != "declared but unchanged" {
+			t.Errorf("ScopeExemptions = %+v, want the one operator exemption", resp.ScopeExemptions)
+		}
+		if !strings.Contains(resp.Prompt, resumeReason) {
+			t.Errorf("prompt missing the Part D resume reason %q\n---\n%s", resumeReason, resp.Prompt)
+		}
+	})
+
+	t.Run("recovery run carries exemptions + reason on /prompt-render", func(t *testing.T) {
+		s, _, _, _, implStageID := buildServer(t, true)
+		resp := decode(t, renderRequest(t, s, implStageID))
+		if len(resp.ScopeExemptions) != 1 || resp.ScopeExemptions[0].Path != exemptPath {
+			t.Errorf("ScopeExemptions = %+v, want the one operator exemption", resp.ScopeExemptions)
+		}
+		if !strings.Contains(resp.Prompt, resumeReason) {
+			t.Errorf("prompt-render missing the Part D resume reason %q\n---\n%s", resumeReason, resp.Prompt)
+		}
+	})
+
+	t.Run("non-recovery run has empty ScopeExemptions + no reason", func(t *testing.T) {
+		s, _, sf, runID, implStageID := buildServer(t, false)
+		priv, _ := sf.issue(t, runID)
+		resp := decode(t, promptRequest(t, s, runID, implStageID, priv, ""))
+		if len(resp.ScopeExemptions) != 0 {
+			t.Errorf("ScopeExemptions = %+v, want empty (no plan_reused_from)", resp.ScopeExemptions)
+		}
+		if strings.Contains(resp.Prompt, resumeReason) {
+			t.Errorf("non-recovery prompt unexpectedly contains the resume reason\n---\n%s", resp.Prompt)
+		}
+	})
+}
+
 // TestGetStagePrompt_ApprovalConditions_DecompositionFallback is the
 // integration test for #677: it crosses the audit-load -> handler ->
 // rendered-prompt-text path and asserts the parent plan-gate's binding

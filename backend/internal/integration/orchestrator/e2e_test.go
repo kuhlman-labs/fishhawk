@@ -1383,6 +1383,10 @@ func TestDecomposition_E2E_CategoryBChildRecoverInPlace(t *testing.T) {
 		ScopeAmendmentRepo: scopeRepo,
 		APITokenRepo:       apiRepo,
 		Orchestrator:       o,
+		// A real (never-called) client satisfies the prompt-render handler's
+		// issueGetter guard; the recovery run carries no InstallationID, so no
+		// GitHub request is made when its implement prompt is rendered (#1229).
+		GitHub: githubclient.New(nil),
 	})
 	httpSrv := httptest.NewServer(srv.Handler())
 	t.Cleanup(httpSrv.Close)
@@ -1460,9 +1464,15 @@ func TestDecomposition_E2E_CategoryBChildRecoverInPlace(t *testing.T) {
 		t.Fatalf("Issue token: %v", err)
 	}
 	const recoveredFile = "backend/internal/server/recover.go"
+	// x.go is the plan's declared scope.files path (decomposedPlanContent);
+	// exempt it so the runner gate would subtract it (#1229).
+	const exemptedFile = "x.go"
+	const exemptReason = "declared but unchanged on this recovery slice"
+	const resumeReason = "fold the dropped file and re-drive the child in place"
 	recoverBody, _ := json.Marshal(map[string]any{
-		"add_scope_files": []map[string]string{{"path": recoveredFile, "operation": "modify"}},
-		"reason":          "fold the dropped file and re-drive the child in place",
+		"add_scope_files":    []map[string]string{{"path": recoveredFile, "operation": "modify"}},
+		"exempt_scope_files": []map[string]string{{"path": exemptedFile, "reason": exemptReason}},
+		"reason":             resumeReason,
 	})
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
 		fmt.Sprintf("%s/v0/runs/%s/recover", httpSrv.URL, failing.ID), bytes.NewReader(recoverBody))
@@ -1542,13 +1552,55 @@ func TestDecomposition_E2E_CategoryBChildRecoverInPlace(t *testing.T) {
 		t.Fatalf("plan_reused_from entries = %d, want 1", len(reused))
 	}
 	var reusedPayload struct {
-		Source string `json:"source"`
+		Source        string `json:"source"`
+		ExemptedPaths []struct {
+			Path   string `json:"path"`
+			Reason string `json:"reason"`
+		} `json:"exempted_paths"`
 	}
 	if err := json.Unmarshal(reused[0].Payload, &reusedPayload); err != nil {
 		t.Fatalf("decode plan_reused_from payload: %v", err)
 	}
 	if reusedPayload.Source != "decomposition_child_recovery" {
 		t.Errorf("plan_reused_from source = %q, want decomposition_child_recovery", reusedPayload.Source)
+	}
+	// (#1229) The operator's exempt_scope_files persisted on the provenance.
+	if len(reusedPayload.ExemptedPaths) != 1 ||
+		reusedPayload.ExemptedPaths[0].Path != exemptedFile ||
+		reusedPayload.ExemptedPaths[0].Reason != exemptReason {
+		t.Errorf("plan_reused_from exempted_paths = %+v, want the one operator exemption", reusedPayload.ExemptedPaths)
+	}
+
+	// (#1229) Cross-boundary delivery: the re-driven child's implement
+	// prompt-response carries scope_exemptions AND the resume reason renders
+	// into the binding conditions (Part D) — the seam no per-layer unit covers.
+	promptReq, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+		fmt.Sprintf("%s/v0/stages/%s/prompt-render", httpSrv.URL, reImpl.ID), nil)
+	promptResp, err := http.DefaultClient.Do(promptReq)
+	if err != nil {
+		t.Fatalf("prompt-render request: %v", err)
+	}
+	defer func() { _ = promptResp.Body.Close() }()
+	if promptResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(promptResp.Body)
+		t.Fatalf("prompt-render status = %d, want 200: %s", promptResp.StatusCode, b)
+	}
+	var prompt struct {
+		Prompt          string `json:"prompt"`
+		ScopeExemptions []struct {
+			Path   string `json:"path"`
+			Reason string `json:"reason"`
+		} `json:"scope_exemptions"`
+	}
+	if err := json.NewDecoder(promptResp.Body).Decode(&prompt); err != nil {
+		t.Fatalf("decode prompt-render: %v", err)
+	}
+	if len(prompt.ScopeExemptions) != 1 || prompt.ScopeExemptions[0].Path != exemptedFile ||
+		prompt.ScopeExemptions[0].Reason != exemptReason {
+		t.Errorf("prompt scope_exemptions = %+v, want the one operator exemption (cross-boundary delivery broke)", prompt.ScopeExemptions)
+	}
+	if !strings.Contains(prompt.Prompt, resumeReason) {
+		t.Errorf("implement prompt missing the Part D resume reason %q (reason→binding-conditions broke)", resumeReason)
 	}
 
 	// (e) The re-driven child succeeds; the sweeper then resolves the parent's
