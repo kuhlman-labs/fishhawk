@@ -137,12 +137,16 @@ func TestNextActions_StateTable(t *testing.T) {
 			wantConsumes: []string{consumesApprovalSlot, consumesApprovalSlot, consumesApprovalSlot},
 		},
 		{
+			// #1247: a parked LOCAL implement stage defaults to the
+			// non-blocking fishhawk_dispatch_stage (so the session stays free to
+			// decide a mid-stage amendment in-band) with fishhawk_run_stage
+			// retained as the explicit blocking opt-in, in that order.
 			name:         "amended_implement_pending_local_dispatch",
 			run:          naRun("running"),
 			stages:       []Stage{naStage("plan", "succeeded"), naStage("implement", "pending")},
 			wantState:    "implement_pending",
-			wantActions:  []string{"fishhawk_run_stage"},
-			wantConsumes: []string{consumesNone},
+			wantActions:  []string{"fishhawk_dispatch_stage", "fishhawk_run_stage"},
+			wantConsumes: []string{consumesNone, consumesNone},
 		},
 		{
 			name: "amended_implement_pending_github_actions_autodispatch",
@@ -430,6 +434,47 @@ func TestNextActions_StateTable(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestNextActions_ImplementLocalDispatchDefault pins the #1247 default: a
+// parked LOCAL implement stage leads with fishhawk_dispatch_stage (carrying
+// run_id + stage=implement) and its Precondition NAMES the in-band-amendment
+// rationale (#1189) — so a regression that strips the why, or that demotes
+// dispatch below run_stage, fails here. fishhawk_run_stage is retained as the
+// explicit opt-in second entry.
+func TestNextActions_ImplementLocalDispatchDefault(t *testing.T) {
+	run := naRun("running")
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "pending")}
+
+	na := nextActionsFor(run, stages, nil, nil, nil, nil)
+	if na == nil || na.State != "implement_pending" {
+		t.Fatalf("state = %+v, want implement_pending", na)
+	}
+	if len(na.Actions) == 0 || na.Actions[0].Action != "fishhawk_dispatch_stage" {
+		t.Fatalf("actions[0] = %v, want fishhawk_dispatch_stage as the default first entry", actionNames(na))
+	}
+	dispatch := na.Actions[0]
+	if dispatch.Params["run_id"] != run.ID || dispatch.Params["stage"] != "implement" {
+		t.Errorf("dispatch params = %v, want run_id=%s stage=implement", dispatch.Params, run.ID)
+	}
+	if !strings.Contains(dispatch.Precondition, "#1189") || !strings.Contains(dispatch.Precondition, "amendment") {
+		t.Errorf("dispatch precondition must name the in-band-amendment rationale (#1189); got %q", dispatch.Precondition)
+	}
+	// run_stage is retained as the explicit opt-in, not removed.
+	findAction(t, na, "fishhawk_run_stage")
+}
+
+// TestNextActions_PlanLocalDispatchUnchanged pins condition (1): the
+// plan-local branch is byte-unchanged — a parked LOCAL plan stage still
+// offers the single fishhawk_run_stage action and never dispatch_stage.
+func TestNextActions_PlanLocalDispatchUnchanged(t *testing.T) {
+	run := naRun("pending")
+	stages := []Stage{naStage("plan", "pending")}
+
+	na := nextActionsFor(run, stages, nil, nil, nil, nil)
+	if got := actionNames(na); len(got) != 1 || got[0] != "fishhawk_run_stage" {
+		t.Fatalf("plan-local actions = %v, want exactly [fishhawk_run_stage]", got)
 	}
 }
 

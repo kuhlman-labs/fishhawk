@@ -235,6 +235,14 @@ agent-driven local-runner loop:
   3. fishhawk_approve_plan ...
   4. fishhawk_run_stage --stage implement ...
 
+This is the blocking default for plan/review stages. When you drive the
+IMPLEMENT stage, prefer fishhawk_dispatch_stage instead (#1247): the implement
+stage can file a mid-stage scope amendment, and dispatch returns the durable
+handle immediately so the single session stays free to decide it in-band —
+whereas this blocking call holds the session. Reach for run_stage on an
+implement stage only as the compact one-shot when a mid-stage amendment is
+impossible.
+
 Runner output streams as MCP progress notifications ONLY when the
 client supplies a progressToken on the call (opt-in per the MCP
 spec).

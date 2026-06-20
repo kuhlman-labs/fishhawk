@@ -75,10 +75,14 @@ Workflow after dispatch:
      fishhawk_decide_scope_amendment — so the runner's amendment poll resolves
      before its window elapses, with no failed-stage retry.
 
-Contrast with fishhawk_run_stage, the synchronous-with-progress DEFAULT/FALLBACK
-that blocks to terminal and returns the full events list, diff_summary, and
-next_actions. Reach for dispatch only when in-band amendment decisions matter;
-otherwise prefer run_stage.
+This is the DEFAULT verb for a local IMPLEMENT stage (#1247): the implement
+stage is the one stage type that can file a mid-stage scope amendment, and a
+blocking fishhawk_run_stage holds the session so the amendment cannot be
+decided in-band. When you drive an implement stage, reach for dispatch first.
+fishhawk_run_stage is the synchronous-with-progress opt-in — the right verb for
+plan/review stages, or the compact one-shot for an implement stage when a
+mid-stage amendment is impossible — and it blocks to terminal returning the
+full events list, diff_summary, and next_actions in one call.
 
 Requires the fishhawk-runner binary to resolve on the MCP server's host,
 exactly like fishhawk_run_stage (this tool is local-only by design, ADR-024 Q5).

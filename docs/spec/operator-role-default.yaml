@@ -25,6 +25,11 @@ gate_procedures:
     - >-
       amendments: binding approval conditions name files as paths or use
       add_scope_files; vague prose silently misses
+    - >-
+      after approval, drive the implement stage via fishhawk_dispatch_stage by
+      default (#1247): non-blocking, it keeps the in-band scope-amendment channel
+      open (fishhawk_decide_scope_amendment between polls); fishhawk_run_stage is
+      the blocking opt-in for plan/review or when an amendment is impossible
   implement_review_gate:
     - >-
       await all verdicts; route concerns by ID via fixup (checkout the run
