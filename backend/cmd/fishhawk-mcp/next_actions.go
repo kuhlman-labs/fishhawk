@@ -555,19 +555,42 @@ func ciFailedNextActions(run *Run, stages []Stage, hint *ReviewActionHint) *Next
 
 // dispatchOrPollActions returns the next move for a stage that exists
 // but has not started: on runner_kind local the OPERATOR HOST dispatches
-// stages, so the action is fishhawk_run_stage; on github_actions the
-// backend auto-dispatches and the legal move is to re-poll.
+// stages; on github_actions the backend auto-dispatches and the legal
+// move is to re-poll. For a local IMPLEMENT stage the DEFAULT is the
+// non-blocking fishhawk_dispatch_stage (with fishhawk_run_stage retained
+// as an explicit opt-in): the implement stage is the one stage type that
+// can file a mid-stage scope amendment (#1189), and a blocking run_stage
+// holds the MCP session so the amendment cannot be decided in-band. A
+// non-blocking dispatch that never sees an amendment polls to terminal
+// identically (ADR-037), so defaulting implement to dispatch has no
+// downside (#1247). The plan stage (no amendments) keeps the single
+// run_stage action unchanged.
 func dispatchOrPollActions(run *Run, stageType string) []SuggestedAction {
 	if run.RunnerKind == "github_actions" {
 		return []SuggestedAction{pollAction(run,
 			suggestedStageWaitPollIntervalSeconds,
 			fmt.Sprintf("runner_kind github_actions auto-dispatches the %s stage — nothing to run from the operator host; re-poll until it starts", stageType))}
 	}
+	if stageType == "implement" {
+		return []SuggestedAction{
+			{
+				Action:       "fishhawk_dispatch_stage",
+				Params:       map[string]string{"run_id": run.ID, "stage": "implement"},
+				Precondition: "the plan gate is approved and the working tree on the operator host is clean (git status first); the implement stage can file a mid-stage scope amendment that a blocking fishhawk_run_stage cannot decide in-band (#1189), so dispatch is the default",
+				Consumes:     consumesNone,
+				Reason:       "dispatch returns the durable (run_id, stage_id) handle immediately so the SINGLE MCP session stays free to fishhawk_decide_scope_amendment between polls; poll fishhawk_get_run_status to terminal (a dispatch that never sees an amendment behaves identically to blocking, ADR-037)",
+			},
+			{
+				Action:       "fishhawk_run_stage",
+				Params:       map[string]string{"run_id": run.ID, "stage": "implement"},
+				Precondition: "the plan gate is approved and the working tree is clean; explicit opt-in to BLOCK to terminal — the compact one-shot for when a mid-stage amendment is impossible",
+				Consumes:     consumesNone,
+				Reason:       "blocks to terminal and returns the full events list, diff_summary, and next_actions in one call — choose this only when no in-band amendment decision is needed",
+			},
+		}
+	}
 	reason := fmt.Sprintf("the %s stage is waiting for the operator host to dispatch it (runner_kind local)", stageType)
 	precondition := "the run's runner_kind is local and the stage has not started"
-	if stageType == "implement" {
-		precondition = "the plan gate is approved and the working tree on the operator host is clean (git status before every run_stage)"
-	}
 	return []SuggestedAction{{
 		Action:       "fishhawk_run_stage",
 		Params:       map[string]string{"run_id": run.ID, "stage": stageType},
