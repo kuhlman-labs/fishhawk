@@ -575,6 +575,29 @@ Notes:
   poll-based via `fishhawk_get_run_status` / `next_actions` (sibling slice); no
   comment surface is involved. Listed here only so a future reader grepping the
   audit categories doesn't mistake them for comment surfaces.
+- The supplemental scope-exemption audit kind — `scope_files_exempted` (#1218) —
+  is an **internal, audit-only kind, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it; it has no Notifier method. It is the **supplemental
+  post-seal audit row** (NOT an issue comment) the success pull-request handler
+  (`server/pullrequest.go::handleShipPullRequest`) writes via
+  `AuditRepo.AppendChained` — best-effort (a nil `AuditRepo` or append failure
+  WARNs and never unwinds the upload) — ONLY when a success ship carries
+  `supplemental_scope_exemptions`, i.e. after a base-rebase re-invoke. On that
+  path the runner reloads the re-invoked agent's freshly-validated scope
+  self-exemptions AFTER the trace bundle (which folds the FIRST attempt's
+  exemptions into its own bundle-sealed `scope_files_exempted` gate_evidence
+  event) already sealed and shipped under #742 forward gating, so this row
+  re-surfaces the re-invoke exemption delta the sealed bundle could not carry.
+  The actor is the request's `actorKind`/`actorSubject` (`system`, or operator on
+  the bearer path) and the payload is `{run_id, stage_id, exemptions:[{path,
+  reason}], origin:"base_rebase_reinvoke", auth_method}` — the `origin` marker
+  distinguishes this re-invoke re-emission from the bundle-sealed first-attempt
+  event. The implement-review gate_evidence does NOT also receive this delta: the
+  review is dispatched at trace-upload time, strictly BEFORE the re-invoke, so
+  re-feeding it would require re-dispatching the review or re-sealing the bundle —
+  both precluded by #742 forward gating (the gate_evidence half is deferred to
+  #1250). Listed here only so a future reader grepping the audit categories
+  doesn't mistake it for a comment surface.
 - The operator-vouch audit kind — `operator_commit_vouched` (ADR-035, #1044) — is an
   **internal, user-actor audit kind, NOT an issue-comment surface**. Nothing in
   `issuecomment` posts it; it has no Notifier method. `server/vouch.go::handleVouchCommit`
