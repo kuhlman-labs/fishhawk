@@ -195,6 +195,11 @@
               "minLength": 1,
               "description": "Agent identifier. v0 ships with claude-code; v0.x adds cursor and copilot."
             },
+            "model": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Optional model override for this stage's agent invocation (#1013). One rung of the implement-model resolution ladder: deployment default < this executor.model < plan model_recommendation < operator gate decision. Empty/absent falls through to the next-lower rung (ultimately the deployment default spawn). The resolved model is validated against the deployment's per-adapter allowed-model set at the approval gate. Additive optional field within workflow-v0.x — accepted at every advertised version."
+            },
             "timeout": {
               "type": "string",
               "pattern": "^([0-9]+(ns|us|ms|s|m|h))+$",

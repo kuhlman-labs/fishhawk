@@ -35,7 +35,39 @@ type Plan struct {
 	PredictedRuntimeMinutes    int               `json:"predicted_runtime_minutes"`
 	PredictedRuntimeConfidence RuntimeConfidence `json:"predicted_runtime_confidence"`
 	Decomposition              *Decomposition    `json:"decomposition,omitempty"`
+	// ModelRecommendation is the agent's optional complexity-informed
+	// recommendation for which model executes the implement stage (#1013).
+	// Advisory: the operator ratifies or overrides it at the plan gate, and
+	// the resolved model is validated against the deployment's per-adapter
+	// allowed-model set. Nil means no recommendation — the implement-model
+	// resolver falls through to the spec executor.model, then the
+	// deployment default.
+	ModelRecommendation *ModelRecommendation `json:"model_recommendation,omitempty"`
 }
+
+// ModelRecommendation is the agent's optional recommendation for the
+// implement-stage model, keyed to its complexity assessment (#1013). It
+// is one rung of the implement-model resolution ladder (deployment
+// default < spec executor.model < plan model_recommendation < operator
+// gate decision); the operator ratifies or overrides it at the approval
+// gate. JSON tags mirror the model-recommendation $def in the schema.
+type ModelRecommendation struct {
+	ImplementModel     string     `json:"implement_model"`
+	Rationale          string     `json:"rationale"`
+	ComplexityAssessed Complexity `json:"complexity_assessed"`
+}
+
+// Complexity is the agent's assessment of a change's complexity, drawn
+// from a closed set. It informs the model recommendation and is stamped
+// onto calibration history.
+type Complexity string
+
+// Complexity levels per the schema.
+const (
+	ComplexityLow    Complexity = "low"
+	ComplexityMedium Complexity = "medium"
+	ComplexityHigh   Complexity = "high"
+)
 
 // KindClarificationRequest is the top-level discriminator value carried
 // by a clarification_request artifact. A plan artifact has no "kind"
@@ -99,6 +131,11 @@ type SubPlanSummary struct {
 	Scope                      *Scope            `json:"scope,omitempty"`
 	PredictedRuntimeMinutes    int               `json:"predicted_runtime_minutes"`
 	PredictedRuntimeConfidence RuntimeConfidence `json:"predicted_runtime_confidence"`
+	// ModelRecommendation is this sub-plan's optional per-child model
+	// recommendation (#1013). When set, the decomposition child minted for
+	// this sub-plan resolves it through the same chokepoint as a top-level
+	// recommendation. Nil means the child has no per-slice recommendation.
+	ModelRecommendation *ModelRecommendation `json:"model_recommendation,omitempty"`
 }
 
 // Decomposition holds the rationale and sub-plan summaries when

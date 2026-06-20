@@ -298,6 +298,22 @@ type Config struct {
 	// orchestrator, which resolves and surfaces the effective cap;
 	// concurrency enforcement that consumes it lands in E24.3 (#1143).
 	MaxParallelChildren int
+
+	// ImplementModelDefault is the deployment-configured default implement
+	// model — the lowest rung of the implement-model resolution ladder
+	// (resolveImplementModel). Empty (the default) means "no deployment
+	// default": with no spec executor.model, no plan model_recommendation, and
+	// no operator override, the resolved model is empty and the runner spawns
+	// the implement agent on the adapter's built-in default exactly as today
+	// (byte-for-byte). Wired from FISHHAWKD_IMPLEMENT_MODEL_DEFAULT in serve.go.
+	ImplementModelDefault string
+
+	// ImplementAllowedModels is the per-adapter allowed-model policy
+	// (AllowedModels) the approval gate validates the RESOLVED implement model
+	// against (#1013). A nil/empty policy — or an adapter with no configured
+	// set — fails OPEN (any model accepted, byte-identical to today). Wired
+	// from FISHHAWKD_IMPLEMENT_ALLOWED_MODELS in serve.go via ParseAllowedModels.
+	ImplementAllowedModels AllowedModels
 }
 
 // Server wraps an http.Server with the routes and middleware stack

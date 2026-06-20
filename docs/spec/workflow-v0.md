@@ -42,6 +42,7 @@ Identifiers (`<role_id>`, `<workflow_id>`, stage `id`s) are `snake_case` — `^[
   type: plan | implement | review # closed set; no custom types
   executor: # exactly one of agent or human
     agent: claude-code        # any string; v0 ships claude-code
+    model: claude-opus-4-8    # optional; per-stage model override (see ### Executor model override)
     timeout: 10m              # optional; stage-level override for agent timeout
     verify:                   # optional; in-band test gate (see ### Verify gate)
       command: 'scripts/test'
@@ -95,6 +96,21 @@ executor:
 
 - **Only valid on agent-executed stages.** Declaring `agent_self_retry` on a `human: true` executor is a schema error — the field lives in the agent branch of the executor `oneOf`, so `unevaluatedProperties: false` rejects it on the human branch.
 - **Backend plumbing and runner detection** are handled by separate follow-up tickets. This field documents the authoring surface and is parsed by both the backend and CLI validators; runner behavior is not yet wired.
+
+### Executor model override
+
+An optional per-stage model override (#1013). One rung of the implement-model resolution ladder.
+
+```yaml
+executor:
+  agent: claude-code
+  model: claude-opus-4-8  # optional; falls through to the next-lower rung when empty
+```
+
+- **Resolution ladder** (lowest to highest precedence): deployment default < `executor.model` < plan `model_recommendation.implement_model` < operator gate decision. The highest non-empty rung wins; an empty resolved model spawns the agent on the deployment default — byte-identical to today's behavior.
+- **Gate-time validation.** The resolved model is validated against the deployment's per-adapter allowed-model set at the approval gate; an unknown model is rejected there, naming its source.
+- **Only valid on agent-executed stages.** Declaring `model` on a `human: true` executor is a schema error — the field lives in the agent branch of the executor `oneOf`, so `unevaluatedProperties: false` rejects it on the human branch.
+- **Additive within `workflow-v0.x`** — accepted at every advertised version; a spec that omits it parses unchanged.
 
 ### Plan reviewers
 
@@ -450,6 +466,7 @@ workflows:
 | Member refs                 | `^@[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?$`                                    | GitHub user or team                                                                                 |
 | Stage `type`                | `plan` \| `implement` \| `review`                                            | closed set                                                                                          |
 | Executor                    | `agent: <string>` xor `human: true`                                          | mutually exclusive                                                                                  |
+| `executor.model`            | non-empty string (optional)                                                  | per-stage model override (#1013); agent branch only, schema error on human executor; additive at every version |
 | `executor.agent_self_retry` | `true` \| `false` (default `false`)                                          | agent branch only; schema error on human executor                                                   |
 | `reviewers.agent`           | integer `>= 0` (default `0`)                                                 | absent block → nil → backend defaults to `{human:1}`; superseded by a non-empty `reviewers.agents` |
 | `reviewers.agents`          | array of `{provider, model?}`, `minItems: 1`                                 | heterogeneous reviewers (#955); when present, effective agent count = `len(agents)`                |

@@ -409,6 +409,130 @@ func TestParse_SubPlanWithoutScope_StillValidates(t *testing.T) {
 	}
 }
 
+// --- model_recommendation (#1013) ---
+
+// TestParse_ModelRecommendation_RoundTrips covers the additive top-level
+// model_recommendation: a plan carrying it validates and decodes all three
+// fields into the typed Plan.ModelRecommendation.
+func TestParse_ModelRecommendation_RoundTrips(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["model_recommendation"] = map[string]any{
+			"implement_model":     "claude-opus-4-8",
+			"rationale":           "cross-layer change with non-trivial seams",
+			"complexity_assessed": "high",
+		}
+	})
+	p, err := plan.Parse(marshalFixture(t, m))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.ModelRecommendation == nil {
+		t.Fatal("ModelRecommendation should be non-nil")
+	}
+	if got, want := p.ModelRecommendation.ImplementModel, "claude-opus-4-8"; got != want {
+		t.Errorf("ImplementModel = %q, want %q", got, want)
+	}
+	if got, want := p.ModelRecommendation.Rationale, "cross-layer change with non-trivial seams"; got != want {
+		t.Errorf("Rationale = %q, want %q", got, want)
+	}
+	if got, want := p.ModelRecommendation.ComplexityAssessed, plan.ComplexityHigh; got != want {
+		t.Errorf("ComplexityAssessed = %q, want %q", got, want)
+	}
+}
+
+// TestParse_WithoutModelRecommendation_StillValidates confirms the field is
+// additive-optional: the minimal valid plan (no recommendation) parses and the
+// typed field is nil. Failure here would indicate an accidental required
+// promotion.
+func TestParse_WithoutModelRecommendation_StillValidates(t *testing.T) {
+	p, err := plan.Parse(marshalFixture(t, planfixture.Valid()))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.ModelRecommendation != nil {
+		t.Errorf("ModelRecommendation = %+v, want nil (field omitted)", p.ModelRecommendation)
+	}
+}
+
+// TestParse_SubPlanModelRecommendation_RoundTrips covers the per-child
+// recommendation: a sub-plan carrying model_recommendation decodes into the
+// typed SubPlanSummary.ModelRecommendation, while a sibling without it decodes
+// to nil (additive-optional, per-slice).
+func TestParse_SubPlanModelRecommendation_RoundTrips(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["decomposition"] = map[string]any{
+			"rationale": "split by layer",
+			"sub_plans": []any{
+				map[string]any{
+					"title": "Part A", "scope_hint": "first slice",
+					"predicted_runtime_minutes": 10, "predicted_runtime_confidence": "high",
+					"model_recommendation": map[string]any{
+						"implement_model":     "claude-sonnet-4-6",
+						"rationale":           "mechanical slice",
+						"complexity_assessed": "low",
+					},
+				},
+				map[string]any{
+					"title": "Part B", "scope_hint": "second slice",
+					"predicted_runtime_minutes": 15, "predicted_runtime_confidence": "medium",
+				},
+			},
+		}
+	})
+	p, err := plan.Parse(marshalFixture(t, m))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	subs := p.Decomposition.SubPlans
+	if subs[0].ModelRecommendation == nil {
+		t.Fatal("sub_plans[0].ModelRecommendation should be non-nil")
+	}
+	if got, want := subs[0].ModelRecommendation.ImplementModel, "claude-sonnet-4-6"; got != want {
+		t.Errorf("sub_plans[0].ModelRecommendation.ImplementModel = %q, want %q", got, want)
+	}
+	if got, want := subs[0].ModelRecommendation.ComplexityAssessed, plan.ComplexityLow; got != want {
+		t.Errorf("sub_plans[0].ModelRecommendation.ComplexityAssessed = %q, want %q", got, want)
+	}
+	if subs[1].ModelRecommendation != nil {
+		t.Errorf("sub_plans[1].ModelRecommendation = %+v, want nil (field omitted)", subs[1].ModelRecommendation)
+	}
+}
+
+// TestParse_ModelRecommendation_BadComplexity_IsSchemaError locks the closed
+// complexity_assessed enum: an out-of-set value is rejected structurally.
+func TestParse_ModelRecommendation_BadComplexity_IsSchemaError(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["model_recommendation"] = map[string]any{
+			"implement_model":     "claude-opus-4-8",
+			"rationale":           "x",
+			"complexity_assessed": "extreme",
+		}
+	})
+	_, err := plan.Parse(marshalFixture(t, m))
+	var se *plan.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
+// TestParse_ModelRecommendation_MissingImplementModel_IsSchemaError confirms
+// the three fields are required WHEN the object is present (additive at the
+// top level, complete within): a recommendation without its load-bearing
+// implement_model is rejected.
+func TestParse_ModelRecommendation_MissingImplementModel_IsSchemaError(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["model_recommendation"] = map[string]any{
+			"rationale":           "x",
+			"complexity_assessed": "low",
+		}
+	})
+	_, err := plan.Parse(marshalFixture(t, m))
+	var se *plan.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
 // --- decomposition semantic errors ---
 
 func TestParse_DecompositionDuplicateTitles_IsSemanticError(t *testing.T) {
@@ -831,13 +955,16 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 	}
 }
 
-// TestPlanSchemaFrozen locks the parent-plan invariant: slice 1 must NOT
-// mutate the frozen plan-standard-v1 schema. The embedded copy's sha256 is
-// pinned; any byte change (here or via a drifted docs/spec sync) fails this
-// test deliberately. A standard_v1 plan must also still validate unchanged
-// through the plan-only Validate entry point.
+// TestPlanSchemaFrozen pins the embedded plan-standard-v1 schema's sha256
+// as a drift guard: any byte change (an unintended edit, or a docs/spec
+// sync that did not land in the embedded copy) fails this test deliberately.
+// The hash is re-pinned only for a sanctioned additive-optional change within
+// standard_v1.x — most recently the #1013 model_recommendation field. A
+// standard_v1 plan that omits the new optional fields must still validate
+// unchanged through the plan-only Validate entry point (asserted below),
+// which is the proof the change did not break the schema in place.
 func TestPlanSchemaFrozen(t *testing.T) {
-	const wantHash = "56f840126fde20d8051a9551af9d2528d7d7c32e4f5b6de4ba7216486d0aa555"
+	const wantHash = "38b5362c45f4a84189500edecfea3e0616a3dd7b2468cb42acacd6da8c678933"
 	b, err := os.ReadFile("schemas/plan-standard-v1.schema.json")
 	if err != nil {
 		t.Fatalf("read embedded plan schema: %v", err)

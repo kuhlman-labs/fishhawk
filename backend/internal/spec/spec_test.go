@@ -378,6 +378,64 @@ workflows:
 	}
 }
 
+// --- Executor model override (#1013) ---
+
+func TestParse_ExecutorModel(t *testing.T) {
+	// `executor.model` is an optional per-stage model override in the agent
+	// branch. Absent decodes to the empty string (one rung of the
+	// implement-model ladder; empty falls through to the next-lower rung).
+	const tmpl = `
+version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+%s`
+	cases := []struct {
+		name  string
+		model string // injected executor line; "" = absent
+		want  string
+	}{
+		{name: "absent_defaults_empty", model: "", want: ""},
+		{name: "explicit_model", model: "          model: claude-opus-4-8\n", want: "claude-opus-4-8"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := spec.ParseBytes([]byte(strings.ReplaceAll(tmpl, "%s", tc.model)))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if got := s.Workflows["feature_change"].Stages[0].Executor.Model; got != tc.want {
+				t.Errorf("Executor.Model = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParse_ExecutorModel_OnHuman_Rejected confirms model lives in the agent
+// branch of the executor oneOf only: declaring it on a human executor trips
+// unevaluatedProperties.
+func TestParse_ExecutorModel_OnHuman_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+          model: claude-opus-4-8
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
 // --- YAML errors ---
 
 func TestParse_EmptyDocument(t *testing.T) {

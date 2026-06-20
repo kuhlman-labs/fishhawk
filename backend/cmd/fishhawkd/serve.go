@@ -436,6 +436,18 @@ func runServe(args []string, logSink io.Writer) int {
 			"single run (E24.6 / #1146). The per-workflow decomposition.max_parallel knob overrides "+
 			"it when set. 0 (the default) = unlimited. This resolves and surfaces the cap; concurrency "+
 			"enforcement that consumes it lands in E24.3 (#1143)")
+	implementModelDefault := fs.String("implement-model-default",
+		envOr("FISHHAWKD_IMPLEMENT_MODEL_DEFAULT", ""),
+		"deployment default implement model — the lowest rung of the implement-model resolution "+
+			"ladder (#1013). Empty (the default) means no deployment default: with no spec executor.model, "+
+			"no plan model_recommendation, and no operator override, the resolved model is empty and the "+
+			"runner spawns the implement agent on the adapter's built-in default exactly as today")
+	implementAllowedModels := fs.String("implement-allowed-models",
+		envOr("FISHHAWKD_IMPLEMENT_ALLOWED_MODELS", ""),
+		"per-adapter allowed-model policy the approval gate validates the RESOLVED implement model "+
+			"against (#1013). Format: `adapter=model1,model2;adapter2=model3`, e.g. "+
+			"`claudecode=claude-opus-4-8,claude-sonnet-4-6;codex=gpt-5.5`. Empty (the default) or an "+
+			"adapter with no configured set fails OPEN — any model accepted, byte-identical to today")
 	budgetTimezone := fs.String("budget-timezone",
 		envOr("FISHHAWKD_BUDGET_TIMEZONE", "UTC"),
 		"IANA timezone (e.g. America/New_York) the advisory periodic-budget evaluator (#688) "+
@@ -478,7 +490,7 @@ func runServe(args []string, logSink io.Writer) int {
 		slog.Duration("cap", reviewBudget.Cap),
 		slog.String("ref", "#747"))
 
-	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren}
+	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels)}
 
 	// Plan-review agent wiring. Resolved by a pure helper so the selection seam
 	// (which adapters the flags configure) is unit-testable without booting a

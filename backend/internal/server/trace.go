@@ -1215,14 +1215,23 @@ func (s *Server) emitRuntimeObserved(ctx context.Context, runID, stageID uuid.UU
 	predictedMinutes := float64(planArtifact.PredictedRuntimeMinutes)
 	deltaMinutes := actualMinutes - predictedMinutes
 
+	// Stamp the resolved implement model {value, source} (#1013) onto the
+	// EXISTING runtime_observed kind so per-model-per-complexity calibration
+	// history accumulates without a new audit surface. Empty value/source means
+	// today's default spawn — the keys are still emitted (omitempty-free) so the
+	// calibration reader can distinguish "default spawn" from a missing field.
+	rm := s.resolvedImplementModelForRunID(ctx, runID)
+
 	payload, _ := json.Marshal(map[string]any{
-		"stage_type":        string(stage.Type),
-		"predicted_minutes": predictedMinutes,
-		"confidence":        string(planArtifact.PredictedRuntimeConfidence),
-		"actual_seconds":    actualSeconds,
-		"actual_minutes":    actualMinutes,
-		"delta_minutes":     deltaMinutes,
-		"outcome":           outcome,
+		"stage_type":            string(stage.Type),
+		"predicted_minutes":     predictedMinutes,
+		"confidence":            string(planArtifact.PredictedRuntimeConfidence),
+		"actual_seconds":        actualSeconds,
+		"actual_minutes":        actualMinutes,
+		"delta_minutes":         deltaMinutes,
+		"outcome":               outcome,
+		"resolved_model":        rm.Value,
+		"resolved_model_source": string(rm.Source),
 	})
 
 	systemKind := audit.ActorKind("system")
@@ -1308,15 +1317,24 @@ func (s *Server) recordCost(ctx context.Context, runID, stageID uuid.UUID, bundl
 		rec.USD = 0
 	}
 
+	// Stamp the resolved implement model {value, source} (#1013) alongside the
+	// agent-reported `model` (rec.Model) on the EXISTING cost_recorded kind, so
+	// per-model spend calibration can attribute cost to the rung that chose the
+	// model. Kept under distinct `resolved_model*` keys so it never clobbers the
+	// agent-reported `model`. Empty value/source means today's default spawn.
+	rm := s.resolvedImplementModelForRunID(ctx, runID)
+
 	payload, _ := json.Marshal(map[string]any{
-		"model":         rec.Model,
-		"input_tokens":  rec.InputTokens,
-		"output_tokens": rec.OutputTokens,
-		"usd":           rec.USD,
-		"known_model":   rec.KnownModel,
-		"known_usage":   knownUsage,
-		"pricing_as_of": rec.PricingAsOf,
-		"estimated":     true,
+		"model":                 rec.Model,
+		"input_tokens":          rec.InputTokens,
+		"output_tokens":         rec.OutputTokens,
+		"usd":                   rec.USD,
+		"known_model":           rec.KnownModel,
+		"known_usage":           knownUsage,
+		"pricing_as_of":         rec.PricingAsOf,
+		"estimated":             true,
+		"resolved_model":        rm.Value,
+		"resolved_model_source": string(rm.Source),
 	})
 	systemKind := audit.ActorKind("system")
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
