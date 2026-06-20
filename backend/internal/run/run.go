@@ -86,6 +86,29 @@ func (s StageState) IsTerminal() bool {
 	}
 }
 
+// IsSettled reports whether the stage has stopped making forward
+// progress on its own — it is either terminal (succeeded, failed,
+// cancelled) or parked awaiting an operator action (awaiting_approval,
+// awaiting_children, awaiting_input, awaiting_scope_decision). The
+// in-flight states (pending, dispatched, running) are NOT settled.
+//
+// This is a strictly wider classifier than IsTerminal, used by the
+// stage terminal-wait long-poll (GET /v0/runs/{run_id}/stages/{stage_id}
+// ?wait, #1252) to decide when to stop blocking: a detached watcher
+// wants to release the moment the stage needs operator attention, not
+// only when the run is fully done. IsTerminal is left untouched for its
+// narrower callers (transition tables, run-reduction).
+func (s StageState) IsSettled() bool {
+	switch s {
+	case StageStateSucceeded, StageStateFailed, StageStateCancelled,
+		StageStateAwaitingApproval, StageStateAwaitingChildren,
+		StageStateAwaitingInput, StageStateAwaitingScopeDecision:
+		return true
+	default:
+		return false
+	}
+}
+
 // StageType is one of the three stage kinds permitted in v0.
 type StageType string
 
