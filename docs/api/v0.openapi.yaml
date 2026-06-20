@@ -1103,6 +1103,29 @@ components:
             and the agent re-derived), `apply_failed_reset_failed` (an apply
             failed AND the post-failure reset also failed). Persisted onto the
             fixup_pushed audit entry.
+        supplemental_scope_exemptions:
+          type: array
+          items:
+            type: object
+            required: [path, reason]
+            properties:
+              path:
+                type: string
+                description: A declared `scope.files` path left unchanged.
+              reason:
+                type: string
+                description: Why the path correctly needs no change.
+          description: |
+            Present only on a success ship that followed a base-rebase
+            re-invoke (#1218). The re-invoke exemption delta: the scope
+            self-exemptions the final scope-completeness gate honored that the
+            already-sealed trace bundle's `scope_files_exempted` gate_evidence
+            event did NOT carry (the bundle ships at push time, before the
+            re-invoke reloads the re-invoked agent's exemptions, under #742
+            forward gating). The backend re-emits these as a supplemental
+            `scope_files_exempted` audit entry (origin `base_rebase_reinvoke`)
+            so the re-invoke exemptions are queryable via the audit endpoint.
+            Omitted on the first ship and every non-re-invoke ship.
 
     PullRequestUploadResponse:
       type: object

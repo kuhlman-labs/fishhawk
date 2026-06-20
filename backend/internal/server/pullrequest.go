@@ -26,6 +26,19 @@ import (
 // 64 MiB cap.
 const maxPullRequestBundleBytes = 32 * 1024
 
+// CategoryScopeFilesExempted is the supplemental post-seal audit row the
+// success pull-request handler writes on a base-rebase re-invoke ship (#1218):
+// the re-invoked agent's freshly-validated scope self-exemptions were reloaded
+// AFTER the trace bundle (which folds the FIRST attempt's exemptions into its
+// own scope_files_exempted gate_evidence event) already sealed and shipped under
+// #742 forward gating, so this row re-surfaces the re-invoke exemption delta the
+// sealed bundle could not carry. Payload carries {run_id, stage_id,
+// exemptions:[{path, reason}], origin:"base_rebase_reinvoke", auth_method} — the
+// origin marker distinguishes it from the bundle-sealed first-attempt event. NOT
+// an issue-comment surface: it has no Notifier method and nothing in
+// `issuecomment` posts it; see docs/issue-comment-surfaces.md.
+const CategoryScopeFilesExempted = "scope_files_exempted"
+
 // pullRequestBody is the wire shape the runner POSTs. Required
 // fields are validated structurally below — there's no JSON Schema
 // for v0; v1+ can graduate this to `pull_request_v1.schema.json`.
@@ -108,6 +121,22 @@ type pullRequestBody struct {
 	// fixup_pushed body that carries it; the runner omits it on every other
 	// variant, so the field stays absent there.
 	ApplyPath string `json:"apply_path,omitempty"`
+
+	// SupplementalScopeExemptions is the base-rebase re-invoke exemption delta
+	// (#1218), present ONLY on a success ship that followed a base-rebase
+	// re-invoke. On that path the runner reloads the re-invoked agent's
+	// freshly-validated scope self-exemptions AFTER the trace bundle (and its
+	// scope_files_exempted gate_evidence event) already sealed and shipped under
+	// #742 forward gating, so any exemption the final scope-completeness gate
+	// honored that the sealed event did not carry is invisible to the audit/
+	// review. The runner computes that delta and rides it here; the success
+	// handler re-emits it as a supplemental scope_files_exempted audit row (the
+	// visibility surface for the re-invoke branch). Optional + omitempty: absent
+	// on the first ship and every non-re-invoke ship, so the
+	// DisallowUnknownFields decoder accepts those byte-identical bodies. The json
+	// tags (path/reason) on scopeExemption match the runner's
+	// scopeExemptionEvidence marshal — the cross-boundary seam.
+	SupplementalScopeExemptions []scopeExemption `json:"supplemental_scope_exemptions,omitempty"`
 }
 
 // validate returns a human-readable error if any required field is
@@ -458,6 +487,55 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"append audit entry failed", map[string]any{"error": err.Error()})
 		return
+	}
+
+	// Supplemental scope-files-exempted audit row (#1218). On a base-rebase
+	// re-invoke ship the runner reloads the re-invoked agent's freshly-validated
+	// scope self-exemptions AFTER the trace bundle already sealed and shipped
+	// (#742 forward gating), so the delta the final scope-completeness gate
+	// honored that the bundle's scope_files_exempted gate_evidence event did NOT
+	// carry is invisible to the audit/review. The runner rides that delta in
+	// SupplementalScopeExemptions; re-emit it here as a standalone
+	// scope_files_exempted audit row with an origin marker so it is queryable via
+	// the audit endpoint — the visibility surface for the re-invoke branch.
+	//
+	// This row exists because the sealed bundle (#742) cannot carry the
+	// re-invoke's exemptions: the bundle ships at push time, before the runner
+	// re-invokes the agent on the fresh base (runner main.go base-rebase block).
+	// The implement-review gate_evidence canNOT be re-fed the same delta either:
+	// the review is dispatched at trace-upload time (trace.go runImplementReviews),
+	// strictly BEFORE the re-invoke, so feeding it would require re-dispatching the
+	// review or re-sealing the bundle — both precluded by #742 forward gating and
+	// the #1153 review-on-raw-bundle ordering. The gate_evidence half is deferred
+	// to #1250; this PR delivers the audit-log surface only.
+	//
+	// Best-effort: a nil AuditRepo or an append error WARN-logs and does NOT
+	// unwind the upload — the pull_request_opened row + PR artifact are the
+	// authoritative record of the terminal transition, so an observability row
+	// must never wedge the forward-gated stage.
+	if len(pr.SupplementalScopeExemptions) > 0 {
+		supPayload, _ := json.Marshal(map[string]any{
+			"run_id":      runID.String(),
+			"stage_id":    stageID.String(),
+			"exemptions":  pr.SupplementalScopeExemptions,
+			"origin":      "base_rebase_reinvoke",
+			"auth_method": authMethod,
+		})
+		if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+			RunID:        runID,
+			StageID:      &stageID,
+			Timestamp:    time.Now().UTC(),
+			Category:     CategoryScopeFilesExempted,
+			ActorKind:    &actorKind,
+			ActorSubject: actorSubject,
+			Payload:      supPayload,
+		}); err != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"pull-request upload: append supplemental scope_files_exempted audit entry failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", err.Error()))
+		}
 	}
 
 	// Backfill the run's pull_request_url so the threaded-runs view

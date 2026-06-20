@@ -1180,3 +1180,176 @@ func TestShipPullRequest_ScopeParkOutcome_RejectsMissingCoords(t *testing.T) {
 		}
 	}
 }
+
+// successPRBytesWithSupplemental returns a complete success pullRequestBody
+// payload that also carries the base-rebase re-invoke exemption delta (#1218):
+// the supplemental_scope_exemptions array the runner ships on a post-re-invoke
+// success ship.
+func successPRBytesWithSupplemental(t *testing.T, exemptions []scopeExemption) []byte {
+	t.Helper()
+	body, err := json.Marshal(pullRequestBody{
+		PRNumber:                    42,
+		PRURL:                       "https://github.com/kuhlman-labs/fishhawk/pull/42",
+		Branch:                      "fishhawk/run-aaa/stage-bbb",
+		HeadSHA:                     "1111111111111111111111111111111111111111",
+		BaseSHA:                     "2222222222222222222222222222222222222222",
+		Title:                       "Add a make target.",
+		Body:                        "Opened by Fishhawk on behalf of @octocat.",
+		FilesChangedCount:           3,
+		SupplementalScopeExemptions: exemptions,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+// findAuditByCategory returns the single appended entry of the given category,
+// or nil if none. Fails the test if more than one is present.
+func findAuditByCategory(t *testing.T, au *auditFake, category string) *audit.ChainAppendParams {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var got *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == category {
+			if got != nil {
+				t.Fatalf("more than one %q audit entry", category)
+			}
+			e := au.appended[i]
+			got = &e
+		}
+	}
+	return got
+}
+
+// TestShipPullRequest_SupplementalScopeExemptions_EmitsAuditRow pins the DELTA
+// PRESENT branch (#1218): a success ship carrying supplemental_scope_exemptions
+// (the base-rebase re-invoke exemption delta) emits exactly one supplemental
+// scope_files_exempted audit row whose payload carries origin
+// "base_rebase_reinvoke" and the supplied path+reason entries — the observable
+// shipped behavior, an audit-log row queryable via the audit endpoint.
+func TestShipPullRequest_SupplementalScopeExemptions_EmitsAuditRow(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newPRServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	body := successPRBytesWithSupplemental(t, []scopeExemption{
+		{Path: "backend/internal/foo/foo_test.go", Reason: "coupled test already correct after re-invoke"},
+	})
+
+	w := shipPRRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// pull_request_opened must still land, plus exactly one supplemental row.
+	if got := findAuditByCategory(t, au, "pull_request_opened"); got == nil {
+		t.Fatal("no pull_request_opened audit entry recorded")
+	}
+	sup := findAuditByCategory(t, au, CategoryScopeFilesExempted)
+	if sup == nil {
+		t.Fatalf("no %q audit entry recorded for the supplemental delta", CategoryScopeFilesExempted)
+	}
+
+	var payload struct {
+		RunID      string           `json:"run_id"`
+		StageID    string           `json:"stage_id"`
+		Origin     string           `json:"origin"`
+		Exemptions []scopeExemption `json:"exemptions"`
+	}
+	if err := json.Unmarshal(sup.Payload, &payload); err != nil {
+		t.Fatalf("decode supplemental payload: %v", err)
+	}
+	if payload.Origin != "base_rebase_reinvoke" {
+		t.Errorf("payload origin = %q, want base_rebase_reinvoke", payload.Origin)
+	}
+	if payload.RunID != runID.String() || payload.StageID != stageID.String() {
+		t.Errorf("payload run/stage = %q/%q, want %q/%q", payload.RunID, payload.StageID, runID, stageID)
+	}
+	if len(payload.Exemptions) != 1 ||
+		payload.Exemptions[0].Path != "backend/internal/foo/foo_test.go" ||
+		payload.Exemptions[0].Reason != "coupled test already correct after re-invoke" {
+		t.Errorf("payload exemptions = %+v, want the supplied path+reason", payload.Exemptions)
+	}
+}
+
+// TestShipPullRequest_NoSupplementalScopeExemptions_NoAuditRow pins the DELTA
+// EMPTY/ABSENT branch (#1218): a success ship WITHOUT
+// supplemental_scope_exemptions (every non-re-invoke ship, the byte-identical
+// pre-change path) emits only the pull_request_opened row and NO
+// scope_files_exempted row.
+func TestShipPullRequest_NoSupplementalScopeExemptions_NoAuditRow(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newPRServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	body := validPRBytes(t) // no supplemental_scope_exemptions field
+
+	w := shipPRRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := findAuditByCategory(t, au, "pull_request_opened"); got == nil {
+		t.Fatal("no pull_request_opened audit entry recorded")
+	}
+	if sup := findAuditByCategory(t, au, CategoryScopeFilesExempted); sup != nil {
+		t.Errorf("unexpected %q audit entry on a non-re-invoke ship: %s", CategoryScopeFilesExempted, string(sup.Payload))
+	}
+}
+
+// categoryFailAuditRepo wraps an auditFake and fails AppendChained ONLY for a
+// chosen category, delegating every other category (and all other methods) to
+// the embedded fake. It lets a test fail the best-effort supplemental
+// scope_files_exempted append WITHOUT failing the authoritative
+// pull_request_opened append that precedes it.
+type categoryFailAuditRepo struct {
+	*auditFake
+	failCategory string
+}
+
+func (a *categoryFailAuditRepo) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if p.Category == a.failCategory {
+		return nil, fmt.Errorf("audit append forced failure for %q", p.Category)
+	}
+	return a.auditFake.AppendChained(ctx, p)
+}
+
+// TestShipPullRequest_SupplementalScopeExemptions_BestEffortOnAuditError pins
+// the BEST-EFFORT FAILURE branch (#1218): when the supplemental
+// scope_files_exempted append errors, the handler still returns success and
+// persists the PR artifact — the observability row must never wedge the
+// forward-gated terminal transition.
+func TestShipPullRequest_SupplementalScopeExemptions_BestEffortOnAuditError(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	sf := newSigningFake()
+	ar := newFakeArtifactRepo()
+	au := newAuditFake()
+	rr := newPromptRunRepo()
+	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		ArtifactRepo: ar,
+		AuditRepo:    &categoryFailAuditRepo{auditFake: au, failCategory: CategoryScopeFilesExempted},
+		RunRepo:      rr,
+	})
+	priv, _ := sf.issue(t, runID)
+	body := successPRBytesWithSupplemental(t, []scopeExemption{
+		{Path: "backend/internal/foo/foo_test.go", Reason: "re-invoke justified"},
+	})
+
+	w := shipPRRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (a failed observability append must not wedge the stage):\n%s", w.Code, w.Body.String())
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1 (the PR artifact must still persist)", len(ar.all))
+	}
+	// pull_request_opened landed (it precedes the forced-fail supplemental); the
+	// supplemental row did not (its append errored and was swallowed).
+	if got := findAuditByCategory(t, au, "pull_request_opened"); got == nil {
+		t.Error("no pull_request_opened audit entry recorded")
+	}
+	if sup := findAuditByCategory(t, au, CategoryScopeFilesExempted); sup != nil {
+		t.Errorf("supplemental row unexpectedly recorded despite forced append error: %s", string(sup.Payload))
+	}
+}

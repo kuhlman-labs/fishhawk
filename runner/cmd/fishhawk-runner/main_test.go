@@ -9641,7 +9641,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_FailedReverifyBlocksPush(t *
 
 	// The re-verify command fails → the push must be blocked.
 	var logSink strings.Builder
-	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil)
+	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil)
 	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 		t.Fatalf("err = %v, want ErrPushedTreeNotVerified", err)
 	}
@@ -9685,7 +9685,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_PassingReverifyPushes(t *tes
 	moveBareMain(t, bare)
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil); err != nil {
 		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
 	}
 	logs := logSink.String()
@@ -9758,7 +9758,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMatch_NoReverify(t *testing.T) {
 	}
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, countCmd), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, countCmd), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil); err != nil {
 		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
 	}
 	if lines := countLines(t, counter); lines != 1 {
@@ -9791,7 +9791,7 @@ func TestOpenPRAndShipArtifact_EmptyVerifiedTree_NoOp(t *testing.T) {
 	moveBareMain(t, bare)
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil); err != nil {
 		t.Fatalf("empty verifiedTreeSHA must disable the check, got: %v\n%s", err, logSink.String())
 	}
 	for _, ev := range []string{"verified_tree_match", "verified_tree_mismatch", "pushed_tree_reverified", "verify_run"} {
@@ -9830,7 +9830,7 @@ func TestOpenPRAndShipArtifact_ScopeExemption_AllExemptedPasses(t *testing.T) {
 
 	exemptions := []scopeExemption{{Path: "b.txt", Reason: "already correct, no change needed"}}
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, exemptions); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, exemptions, nil); err != nil {
 		t.Fatalf("all-exempted shortfall must pass the gate, got: %v\n%s", err, logSink.String())
 	}
 	if strings.Contains(logSink.String(), `"event":"scope_files_missing"`) {
@@ -9844,6 +9844,167 @@ func TestOpenPRAndShipArtifact_ScopeExemption_AllExemptedPasses(t *testing.T) {
 	}
 	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr != nil {
 		t.Errorf("run branch %s missing from the bare remote after the exempted-gate push: %v", branch, rerr)
+	}
+}
+
+// backendSupplementalDecode mirrors the backend's pullRequestBody decode of the
+// re-invoke exemption delta (#1218): the json tags (supplemental_scope_exemptions
+// → [{path, reason}]) MUST stay byte-identical to
+// server.pullRequestBody.SupplementalScopeExemptions / server.scopeExemption.
+// The cross-boundary seam test below decodes the runner's marshaled artifact
+// body into this struct; a tag drift on either wire end fails the round-trip.
+type backendSupplementalDecode struct {
+	SupplementalScopeExemptions []struct {
+		Path   string `json:"path"`
+		Reason string `json:"reason"`
+	} `json:"supplemental_scope_exemptions"`
+}
+
+// TestOpenPRAndShipArtifact_SupplementalExemptions_SerializedForBackendDecode is
+// the #1218 cross-boundary seam (runner verification (b)): a re-invoke success
+// ship carries the supplemental exemption delta in the artifact body with the
+// lowercase path/reason keys the backend pullRequestBody decoder expects. It
+// asserts the runner-marshaled body round-trips into the backend-mirroring
+// decode struct AND that the keys are the tagged lowercase form (not the tagless
+// internal scopeExemption's Path/Reason) — pinning the runner↔backend wire seam.
+func TestOpenPRAndShipArtifact_SupplementalExemptions_SerializedForBackendDecode(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+
+	supplemental := []scopeExemption{
+		{Path: "backend/internal/foo/foo_test.go", Reason: "coupled test already correct after re-invoke"},
+	}
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, supplemental); err != nil {
+		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest was not called")
+	}
+
+	// The marshaled body must round-trip into the backend decode struct.
+	var decoded backendSupplementalDecode
+	if err := json.Unmarshal(fu.gotPRArgs.Body, &decoded); err != nil {
+		t.Fatalf("backend-mirroring decode of shipped body failed: %v\nbody=%s", err, fu.gotPRArgs.Body)
+	}
+	if len(decoded.SupplementalScopeExemptions) != 1 ||
+		decoded.SupplementalScopeExemptions[0].Path != "backend/internal/foo/foo_test.go" ||
+		decoded.SupplementalScopeExemptions[0].Reason != "coupled test already correct after re-invoke" {
+		t.Errorf("backend decode = %+v, want the supplied path+reason", decoded.SupplementalScopeExemptions)
+	}
+	// Guard the exact wire keys: lowercase path/reason (the scopeExemptionEvidence
+	// tags), NOT the tagless internal scopeExemption's Path/Reason. A regression to
+	// marshaling the internal type directly would emit "Path"/"Reason" and silently
+	// break the backend decode. Inspect the EXTRACTED key's raw JSON (not the whole
+	// body — the body embeds the free-text PR description, which can itself mention
+	// the field name).
+	raw := topLevelKeyRaw(t, fu.gotPRArgs.Body, "supplemental_scope_exemptions")
+	if raw == "" {
+		t.Fatalf("body missing the supplemental_scope_exemptions key:\n%s", fu.gotPRArgs.Body)
+	}
+	if !strings.Contains(raw, `"path"`) || !strings.Contains(raw, `"reason"`) {
+		t.Errorf("supplemental value missing the lowercase wire keys: %s", raw)
+	}
+	if strings.Contains(raw, `"Path"`) || strings.Contains(raw, `"Reason"`) {
+		t.Errorf("supplemental value marshaled the tagless internal scopeExemption (uppercase keys): %s", raw)
+	}
+}
+
+// topLevelKeyRaw returns the raw JSON of a top-level object key in body, or ""
+// if absent. It decodes structurally so a key NAME appearing inside another
+// field's string value (e.g. the free-text PR description in the `body` field)
+// never produces a false match.
+func topLevelKeyRaw(t *testing.T, body []byte, key string) string {
+	t.Helper()
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatalf("decode artifact body into map: %v\nbody=%s", err, body)
+	}
+	raw, ok := m[key]
+	if !ok {
+		return ""
+	}
+	return string(raw)
+}
+
+// TestOpenPRAndShipArtifact_NoSupplemental_OmitsKey is the #1218 byte-identity
+// guard (runner verification (c)): a non-re-invoke / first-attempt ship (nil
+// supplemental) omits the supplemental_scope_exemptions key entirely, so every
+// non-re-invoke artifact body stays byte-identical to the pre-change shape.
+func TestOpenPRAndShipArtifact_NoSupplemental_OmitsKey(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil); err != nil {
+		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest was not called")
+	}
+	// Inspect the top-level key structurally — the body embeds the free-text PR
+	// description, which can mention the field name, so a naive substring check
+	// over the whole body would false-positive.
+	if raw := topLevelKeyRaw(t, fu.gotPRArgs.Body, "supplemental_scope_exemptions"); raw != "" {
+		t.Errorf("non-re-invoke ship must omit supplemental_scope_exemptions, got: %s", raw)
+	}
+}
+
+// TestDiffExemptions covers the base-rebase re-invoke exemption-delta helper
+// (#1218): it returns the Path-keyed entries in `honored` absent from
+// `alreadySealed`, and nil when `honored` is a subset of `alreadySealed`.
+func TestDiffExemptions(t *testing.T) {
+	// Empty honored → nil (the common base-rebase case: nothing newly justified).
+	if got := diffExemptions(nil, []scopeExemption{{Path: "a.go", Reason: "sealed"}}); got != nil {
+		t.Errorf("empty honored: got %v, want nil", got)
+	}
+
+	// honored fully covered by alreadySealed → nil (no new exemption).
+	subset := diffExemptions(
+		[]scopeExemption{{Path: "a.go", Reason: "re-justified"}},
+		[]scopeExemption{{Path: "a.go", Reason: "sealed"}, {Path: "b.go", Reason: "sealed"}},
+	)
+	if subset != nil {
+		t.Errorf("subset honored: got %+v, want nil", subset)
+	}
+
+	// A fresh path the sealed set never carried → returned (the re-invoke delta).
+	delta := diffExemptions(
+		[]scopeExemption{{Path: "a.go", Reason: "sealed-dup"}, {Path: "new.go", Reason: "re-invoke justified"}},
+		[]scopeExemption{{Path: "a.go", Reason: "sealed"}},
+	)
+	if len(delta) != 1 || delta[0].Path != "new.go" || delta[0].Reason != "re-invoke justified" {
+		t.Errorf("delta: got %+v, want only new.go", delta)
+	}
+
+	// Zero-exemption first attempt → every honored entry is delta (the #1153
+	// review-9a1f3bb6 case: first attempt validated nothing, re-invoke justifies).
+	allNew := diffExemptions(
+		[]scopeExemption{{Path: "x.go", Reason: "r1"}, {Path: "y.go", Reason: "r2"}},
+		nil,
+	)
+	if len(allNew) != 2 || allNew[0].Path != "x.go" || allNew[1].Path != "y.go" {
+		t.Errorf("zero-sealed: got %+v, want both honored entries", allNew)
 	}
 }
 
@@ -9878,7 +10039,7 @@ func TestOpenPRAndShipArtifact_ScopeExemption_PartialParks(t *testing.T) {
 
 	exemptions := []scopeExemption{{Path: "b.txt", Reason: "already correct"}}
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, exemptions); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, exemptions, nil); err != nil {
 		t.Fatalf("partial-exemption missing-scope-only must PARK (nil error), got: %v\n%s", err, logSink.String())
 	}
 	// Park reports scope_completeness_parked carrying the unexempted remainder;
@@ -9935,7 +10096,7 @@ func TestOpenPRAndShipArtifact_MissingScopeOnly_Parks(t *testing.T) {
 	}
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil); err != nil {
 		t.Fatalf("missing-scope-only must PARK (nil error), got: %v\n%s", err, logSink.String())
 	}
 	if fpr.gotArgs != nil {
@@ -9979,7 +10140,7 @@ func TestOpenPRAndShipArtifact_MissingScopePlusBinding_StaysCategoryB(t *testing
 	bindings := []upload.BindingAssertion{{Type: "file_contains", Path: "a.txt", Literal: "NOT-PRESENT-LITERAL"}}
 
 	var logSink strings.Builder
-	err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", bindings, nil)
+	err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", bindings, nil, nil)
 	if !errors.Is(err, gitops.ErrBindingAssertionUnsatisfied) {
 		t.Fatalf("a compound (missing + binding) failure must stay category-B, got: %v", err)
 	}
@@ -10174,7 +10335,7 @@ exit 0
 	}
 
 	var logSink strings.Builder
-	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil)
+	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil)
 	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 		t.Fatalf("err = %v, want ErrPushedTreeNotVerified\n%s", err, logSink.String())
 	}

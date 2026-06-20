@@ -618,6 +618,13 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// them from its missing set. Empty on every non-standalone-implement path
 		// (the gate is inert there), keeping the strict gate byte-identical.
 		validatedExemptions []scopeExemption
+		// sealedExemptions is the agent∪operator exemption set folded into the
+		// trace bundle's scope_files_exempted gate_evidence event (#1153/#1218),
+		// captured at the single emit site below so it survives the base-rebase
+		// re-invoke reset of validatedExemptions. On a re-invoke the reloaded set
+		// minus this sealed set is the supplemental delta the post-seal audit row
+		// re-surfaces (the bundle already shipped, #742 forward gating).
+		sealedExemptions []scopeExemption
 	)
 
 	// Capture the operator's HEAD ref BEFORE the agent is invoked (#941).
@@ -1241,6 +1248,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// condition 1) — the gate site never re-emits, and the base-rebase
 		// re-invoke reuses the already-shipped event.
 		emitExemptions := mergeExemptions(validatedExemptions, operatorExemptions)
+		// Capture the bundle-sealed set so the base-rebase re-invoke (#1218) can
+		// compute the delta the sealed scope_files_exempted event did NOT carry.
+		// Set unconditionally (even when empty) so a re-invoke that newly justifies
+		// a path against a zero-exemption first attempt surfaces the full delta.
+		sealedExemptions = emitExemptions
 		if len(emitExemptions) > 0 {
 			res.Events = append(res.Events, scopeFilesExemptedEvent(cfg, emitExemptions))
 		}
@@ -1540,7 +1552,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// category-B (we shipped the wrong shape); everything else
 		// is category-C (network, git, GitHub API).
 		if res.OK && stageType == "implement" {
-			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, mergeExemptions(validatedExemptions, operatorExemptions))
+			// First (pre-re-invoke) ship: nil supplemental — these exemptions are
+			// already in the sealed bundle's scope_files_exempted gate_evidence event.
+			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, mergeExemptions(validatedExemptions, operatorExemptions), nil)
 			// Bounded base-rebase-conflict re-invoke (#989): a stash-reapply
 			// conflict means the base moved under the agent (a sibling's
 			// shared-branch commit, or an advanced origin/<base>) — often a
@@ -1584,7 +1598,19 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 					// operator's exempt_scope_files exemptions came from the prompt
 					// and MUST persist across the re-invoke. mergeExemptions unions
 					// them so the second gate call still subtracts the operator set.
-					prErr = openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, mergeExemptions(validatedExemptions, operatorExemptions))
+					reinvokeExemptions := mergeExemptions(validatedExemptions, operatorExemptions)
+					// Supplemental re-invoke delta (#1218): the trace bundle (and its
+					// scope_files_exempted gate_evidence fold) already shipped above
+					// under #742 forward gating, BEFORE this re-invoke reloaded the
+					// agent's freshly-validated exemptions. So any exemption the final
+					// gate now honors that the sealed event did NOT carry is invisible
+					// to the audit/review. Pass that delta into the post-re-invoke ship
+					// so the backend re-emits it as a supplemental scope_files_exempted
+					// audit row — the visibility surface for the re-invoke branch. The
+					// review's gate_evidence can NOT be re-fed: it is dispatched at
+					// trace-upload time, strictly before this re-invoke (#1153).
+					supplemental := diffExemptions(reinvokeExemptions, sealedExemptions)
+					prErr = openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, reinvokeExemptions, supplemental)
 				} else {
 					// Re-invoke infra exhaustion (or checkout failure): log and
 					// fall through to the unchanged category-B failure path
@@ -4254,7 +4280,15 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch strin
 // enforces the verified-SHA invariant (#960) against it — see the closure
 // below. Empty disables the check (no committed-tree gate ran: plan stage,
 // --no-pr, verifyCmd unset, or gate skipped).
-func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, preAgentRef string, preAgentDetached bool, preAgentCaptured bool, preAgentDirty []string, preAgentDirtyCaptured bool, verifiedTreeSHA string, applyPath string, bindingAssertions []upload.BindingAssertion, scopeExemptions []scopeExemption) error {
+// supplementalExemptions, when non-empty, is the base-rebase re-invoke exemption
+// delta (#1218): exemptions the final scope-completeness gate honored that the
+// already-sealed trace bundle's scope_files_exempted event did not carry (the
+// bundle ships before the re-invoke under #742 forward gating). It rides inside
+// the success artifact body so the backend re-emits a supplemental
+// scope_files_exempted audit row — the visibility surface for the re-invoke
+// branch. nil on the first (pre-re-invoke) ship and every non-re-invoke ship, so
+// the artifact body stays byte-identical there.
+func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, preAgentRef string, preAgentDetached bool, preAgentCaptured bool, preAgentDirty []string, preAgentDirtyCaptured bool, verifiedTreeSHA string, applyPath string, bindingAssertions []upload.BindingAssertion, scopeExemptions []scopeExemption, supplementalExemptions []scopeExemption) error {
 	if cfg.runID == "" || cfg.stageID == "" {
 		return errors.New("upload: --run-id and --stage-id required for implement stage")
 	}
@@ -4979,7 +5013,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		filesChanged = len(d.ChangedFiles)
 	}
 
-	artifactBody, _ := json.Marshal(map[string]any{
+	artifactFields := map[string]any{
 		"pr_number":           prRes.PRNumber,
 		"pr_url":              prRes.PRURL,
 		"branch":              branch,
@@ -4988,7 +5022,25 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		"title":               title,
 		"body":                body,
 		"files_changed_count": filesChanged,
-	})
+	}
+	// Base-rebase re-invoke exemption delta (#1218): include the supplemental set
+	// ONLY when the re-invoke produced one, so every non-re-invoke ship omits the
+	// key entirely and stays byte-identical. The backend decodes it off
+	// pullRequestBody.SupplementalScopeExemptions and re-emits a supplemental
+	// scope_files_exempted audit row — the trace bundle that would normally carry
+	// these already shipped before the re-invoke ran (#742 forward gating).
+	// Marshal through scopeExemptionEvidence (NOT the tagless internal
+	// scopeExemption) so the wire keys are the lowercase path/reason the backend's
+	// pullRequestBody.SupplementalScopeExemptions decoder expects — the
+	// cross-boundary seam pinned by the runner+backend tests.
+	if len(supplementalExemptions) > 0 {
+		wire := make([]scopeExemptionEvidence, 0, len(supplementalExemptions))
+		for _, e := range supplementalExemptions {
+			wire = append(wire, scopeExemptionEvidence(e))
+		}
+		artifactFields["supplemental_scope_exemptions"] = wire
+	}
+	artifactBody, _ := json.Marshal(artifactFields)
 
 	shipRes, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
 		RunID:      cfg.runID,
@@ -5465,6 +5517,33 @@ func mergeExemptions(a, b []scopeExemption) []scopeExemption {
 			continue
 		}
 		seen[e.Path] = true
+		out = append(out, e)
+	}
+	return out
+}
+
+// diffExemptions returns the entries in `honored` (keyed by Path) absent from
+// `alreadySealed` — the base-rebase re-invoke exemption delta (#1218): what the
+// final scope-completeness gate honored that the trace bundle's already-sealed
+// scope_files_exempted event did NOT carry. The bundle ships at push time under
+// #742 forward gating, BEFORE the re-invoke reloads the re-invoked agent's fresh
+// sidecar, so this delta is the set the audit/review never saw. Order-preserving
+// over `honored`; returns nil when `honored` is a subset of `alreadySealed` (no
+// new exemption — the common base-rebase case), keeping the non-re-invoke ship
+// byte-identical.
+func diffExemptions(honored, alreadySealed []scopeExemption) []scopeExemption {
+	if len(honored) == 0 {
+		return nil
+	}
+	sealed := make(map[string]bool, len(alreadySealed))
+	for _, e := range alreadySealed {
+		sealed[e.Path] = true
+	}
+	var out []scopeExemption
+	for _, e := range honored {
+		if sealed[e.Path] {
+			continue
+		}
 		out = append(out, e)
 	}
 	return out
