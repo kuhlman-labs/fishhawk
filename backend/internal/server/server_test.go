@@ -62,6 +62,27 @@ func TestServer_FullStack(t *testing.T) {
 // TestServer_MethodMismatch confirms the Go 1.22 ServeMux's
 // method-aware routing returns 405 for the wrong verb on a registered
 // path, rather than 404.
+// TestServer_WiresImplementModelConfig asserts the implement-model deployment
+// config (#1013) is threaded from Config onto the Server: the default rung and
+// the per-adapter allowed-model policy are reachable for the prompt resolver
+// and the approval gate respectively.
+func TestServer_WiresImplementModelConfig(t *testing.T) {
+	policy := ParseAllowedModels("claudecode=claude-opus-4-8")
+	s := New(Config{
+		ImplementModelDefault:  "claude-sonnet-4-6",
+		ImplementAllowedModels: policy,
+	})
+	if s.cfg.ImplementModelDefault != "claude-sonnet-4-6" {
+		t.Errorf("ImplementModelDefault = %q, want claude-sonnet-4-6", s.cfg.ImplementModelDefault)
+	}
+	if !s.cfg.ImplementAllowedModels.IsAllowed("claudecode", "claude-opus-4-8") {
+		t.Error("allowed-model policy not threaded onto the server")
+	}
+	if s.cfg.ImplementAllowedModels.IsAllowed("claudecode", "gpt-5.5") {
+		t.Error("threaded policy should still reject an unlisted model")
+	}
+}
+
 func TestServer_MethodMismatch(t *testing.T) {
 	s := New(Config{})
 	ts := httptest.NewServer(s.Handler())

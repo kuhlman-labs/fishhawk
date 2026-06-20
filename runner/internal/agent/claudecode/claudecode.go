@@ -282,6 +282,14 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	for _, dir := range allowedExtraDirs {
 		args = append(args, "--add-dir", dir)
 	}
+	// --model: pin the agent to the backend-resolved implement model (#1013)
+	// when one was resolved. An empty inv.Model (no plan recommendation, no
+	// spec executor.model, no operator override, no deployment default) appends
+	// NO flag, so the spawn is byte-identical to today and Claude Code uses its
+	// built-in default model.
+	if inv.Model != "" {
+		args = append(args, "--model", inv.Model)
+	}
 	args = append(args, "-p", inv.Prompt)
 	cmd := cmdFn(ctx, binary, args...)
 	cmd.Dir = inv.WorkingDir

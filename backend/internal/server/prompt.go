@@ -150,6 +150,21 @@ type promptResponse struct {
 	// the same independent-struct-by-tag convention as BindingAssertions (#1171)
 	// and add_scope_files (#824). A tag drift here breaks the runner gate silently.
 	ScopeExemptions []scopeExemption `json:"scope_exemptions,omitempty"`
+	// ImplementModel is the backend-resolved implement model id (#1013),
+	// carried on an implement-stage prompt so the runner pins the agent spawn
+	// to it (`--model <ImplementModel>`). Resolved through the
+	// implement-model ladder (resolveImplementModelForRun): operator gate
+	// decision > plan model_recommendation.implement_model > spec
+	// executor.model > deployment default. EMPTY/omitted (the common case)
+	// means no rung supplied a model, and the runner spawns the agent on the
+	// adapter's built-in default exactly as today, byte-for-byte.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (`implement_model`) MUST stay
+	// byte-identical to the runner's upload.FetchedPrompt.ImplementModel
+	// decoder (runner/internal/upload/upload.go) — the same independent-struct-
+	// by-tag convention as ScopeExemptions/BindingAssertions. A tag drift here
+	// silently drops the model and the runner falls back to today's spawn.
+	ImplementModel string `json:"implement_model,omitempty"`
 }
 
 // scopeExemption is one operator scope exemption: a DECLARED scope.files path
@@ -852,6 +867,11 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			resp.SliceIndex = *runRow.SliceIndex
 		}
 	}
+	if stage.Type == run.StageTypeImplement {
+		rm := s.resolveImplementModelForRun(r.Context(), runRow)
+		resp.ImplementModel = rm.Value
+		s.logModelResolution(r.Context(), runRow.ID, rm)
+	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
@@ -1117,6 +1137,10 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		if runRow.SliceIndex != nil {
 			resp.SliceIndex = *runRow.SliceIndex
 		}
+	}
+	if stage.Type == run.StageTypeImplement {
+		rm := s.resolveImplementModelForRun(r.Context(), runRow)
+		resp.ImplementModel = rm.Value
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }

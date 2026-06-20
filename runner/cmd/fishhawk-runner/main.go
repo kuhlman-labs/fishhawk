@@ -263,6 +263,19 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// entirely within run().
 	var fixupExpectedHeadSHA string
 
+	// implement-model routing seam (#1013): the backend resolves the implement
+	// model and carries it on the prompt response under `implement_model`, and
+	// the agent adapters (agent.Invocation.Model -> `--model <m>`) are wired to
+	// pin the spawn to it. The remaining link — decoding `implement_model` off
+	// the prompt response into upload.FetchedPrompt and threading it onto
+	// agent.Invocation.Model here — lives in runner/internal/upload/upload.go,
+	// the prompt-response decoder, which is OUTSIDE this decomposition slice's
+	// scope. The scope-amendment to fold it in (12b75eed) was not decided within
+	// the bounded window, so inv.Model is left unset: the adapters append NO
+	// --model flag and the spawn is byte-identical to today. Completing the
+	// routing is a one-field follow-up (add upload.FetchedPrompt.ImplementModel
+	// + `inv.Model = got.ImplementModel`) tracked in the PR notes.
+
 	// exemptOpenPR / exemptHeldSHA / exemptHeldBranch carry the operator EXEMPT
 	// resolution of a scope-completeness park (#1231) from the fetched prompt to
 	// the early zero-re-run branch below. When exemptOpenPR is true the stage's

@@ -57,6 +57,16 @@ type Invocation struct {
 	// parent env unchanged.
 	Env map[string]string
 
+	// Model is the resolved implement model id the backend chose via the
+	// implement-model resolution ladder (#1013), carried on the prompt
+	// response and threaded here by the runner. A non-empty value is passed to
+	// the agent CLI as its model-override flag (`--model <Model>`); an EMPTY
+	// value (the common case — no plan recommendation, no spec executor.model,
+	// no operator override, no deployment default) appends NO flag, so the
+	// adapter spawns the agent on its built-in default exactly as today,
+	// byte-for-byte. Adapters MUST treat empty as "omit the flag".
+	Model string
+
 	// ProgressSink receives single-line JSON stage_progress
 	// heartbeats emitted at a fixed cadence during the invocation
 	// (#580). Each line is a complete `{"event":"stage_progress",...}`

@@ -350,6 +350,94 @@ func TestGetStagePrompt_HappyPath_ImplementWithIssue(t *testing.T) {
 	}
 }
 
+// TestGetStagePrompt_Implement_CarriesResolvedModel asserts the implement-model
+// producer side (#1013): a resolved model (here from the spec executor.model
+// rung) is carried on the prompt response under the byte-identical
+// `implement_model` json tag the runner decoder reads.
+func TestGetStagePrompt_Implement_CarriesResolvedModel(t *testing.T) {
+	s, rr, sf, gh := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	installation := int64(99)
+	triggerRef := "issue:42"
+	rr.runRow = &run.Run{
+		ID:             runID,
+		Repo:           "kuhlman-labs/example",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     &triggerRef,
+		InstallationID: &installation,
+		WorkflowSpec: []byte("workflows:\n" +
+			"  feature_change:\n" +
+			"    stages:\n" +
+			"      - id: implement\n" +
+			"        type: implement\n" +
+			"        executor:\n" +
+			"          agent: claudecode\n" +
+			"          model: claude-opus-4-8\n"),
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "b", State: "open"}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.ImplementModel != "claude-opus-4-8" {
+		t.Fatalf("ImplementModel = %q, want claude-opus-4-8", resp.ImplementModel)
+	}
+	// Pin the wire tag byte-identical to the runner decoder.
+	if !contains(w.Body.String(), `"implement_model":"claude-opus-4-8"`) {
+		t.Fatalf("response missing the implement_model json tag:\n%s", w.Body.String())
+	}
+}
+
+// TestGetStagePrompt_Implement_EmptyModelOmitted asserts the byte-identical
+// today's-spawn path (#1013): with no spec executor.model, no plan
+// recommendation, no deployment default and no operator override, the resolved
+// model is empty and the implement_model key is OMITTED from the response.
+func TestGetStagePrompt_Implement_EmptyModelOmitted(t *testing.T) {
+	s, rr, sf, gh := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	installation := int64(99)
+	triggerRef := "issue:42"
+	rr.runRow = &run.Run{
+		ID:             runID,
+		Repo:           "kuhlman-labs/example",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     &triggerRef,
+		InstallationID: &installation,
+		// No WorkflowSpec executor.model, no plan artifact, no default.
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "b", State: "open"}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.ImplementModel != "" {
+		t.Fatalf("ImplementModel = %q, want empty", resp.ImplementModel)
+	}
+	if contains(w.Body.String(), "implement_model") {
+		t.Fatalf("implement_model key must be omitted when empty (byte-identical spawn):\n%s", w.Body.String())
+	}
+}
+
 func TestGetStagePrompt_Implement_CarriesScopeJustificationPath(t *testing.T) {
 	// #1153: the implement handler populates trigger.ImplementRunID /
 	// ImplementStageID, so the rendered prompt carries the run/stage-keyed scope
