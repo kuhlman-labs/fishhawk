@@ -72,7 +72,8 @@
           "description": "Ordered list of sub-plans. At least two required when decomposition is present."
         }
       }
-    }
+    },
+    "model_recommendation": { "$ref": "#/$defs/model-recommendation" }
   },
 
   "$defs": {
@@ -232,6 +233,34 @@
           "type": "string",
           "enum": ["low", "medium", "high"],
           "description": "Agent's confidence in this sub-plan's predicted_runtime_minutes."
+        },
+        "model_recommendation": {
+          "$ref": "#/$defs/model-recommendation",
+          "description": "Optional. The model recommendation for THIS sub-plan's decomposition child. Resolved through the same chokepoint as the top-level model_recommendation, so a decomposed child ratifies its own slice's recommendation at its plan gate. Omitted means the child has no per-slice recommendation."
+        }
+      }
+    },
+
+    "model-recommendation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["implement_model", "rationale", "complexity_assessed"],
+      "description": "Optional. The agent's complexity-informed recommendation for which model should execute the implement stage (#1013). Advisory: the operator ratifies or overrides it at the plan-approval gate, and the resolved model is validated against the deployment's per-adapter allowed-model set. Omitted means no recommendation — the implement-model resolver falls through to the workflow spec's executor.model, then the deployment default.",
+      "properties": {
+        "implement_model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Model identifier the agent recommends for the implement stage (e.g. claude-opus-4-8). Routed to the runner adapter as the model override when this rung wins the resolution ladder (deployment default < spec executor.model < plan model_recommendation < operator gate decision)."
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why this model fits the assessed complexity. Rendered alongside the recommendation in the plan-review surface."
+        },
+        "complexity_assessed": {
+          "type": "string",
+          "enum": ["low", "medium", "high"],
+          "description": "The agent's assessment of the change's complexity, informing the recommendation. Stamped onto calibration history so per-model-per-complexity outcomes accumulate."
         }
       }
     }

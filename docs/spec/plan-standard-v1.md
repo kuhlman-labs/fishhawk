@@ -62,7 +62,8 @@ Any property whose `$ref` (or array `items.$ref`) points to an annotated `$defs`
   "predicted_runtime_confidence": "medium",
 
   "risks_and_assumptions": ["..."],
-  "decomposition": { "rationale": "...", "sub_plans": [...] }
+  "decomposition": { "rationale": "...", "sub_plans": [...] },
+  "model_recommendation": { "implement_model": "...", "rationale": "...", "complexity_assessed": "low|medium|high" }
 }
 ```
 
@@ -226,12 +227,35 @@ Required array with at least two entries. Each entry is a `SubPlanSummary`:
 | `scope` | `{ "files": [...] }` object | no | The files THIS slice will touch. Same shape as the top-level `scope`. |
 | `predicted_runtime_minutes` | integer ≥ 1 | yes | Estimate for this sub-plan's implement stage |
 | `predicted_runtime_confidence` | `"low"` / `"medium"` / `"high"` | yes | Confidence in the sub-plan estimate |
+| `model_recommendation` | `{ implement_model, rationale, complexity_assessed }` object | no | This slice's per-child model recommendation. Same shape as the top-level `model_recommendation`; resolved through the same chokepoint at the child's plan gate. |
 
 When `scope` is present, the decomposition fan-out child minted for this sub-plan uses the sub-plan's `scope.files` — rather than the parent plan's full `scope.files` — for its implement-stage `scope_handoff` (commit bounding) and scope-drift detection. This keeps each child bounded to its own slice instead of the whole parent change. When `scope` is omitted, the child falls back to the parent plan's full `scope.files` (the pre-existing behavior).
 
 **Runtime-sum invariant**: the validator warns (but does not reject) when the sum of `sub_plans[*].predicted_runtime_minutes` is less than the parent `predicted_runtime_minutes`. The agent may legitimately compress work when breaking it into smaller pieces; the soft warning surfaces the gap for human review.
 
 **Lifecycle**: as of ADR-025 D4 (#455), `decomposition` is acted upon by the orchestrator. After plan approval, when the orchestrator's `Advance` would dispatch the parent's implement stage, it checks the approved plan: if `decomposition.sub_plans` is populated, the orchestrator mints one child run per sub-plan (each carrying `parent_run_id = parent.id` and `decomposed_from = parent.id`, with an issue_context built from the parent's title plus the sub-plan's `scope_hint`), parks the parent's implement stage in `awaiting_children`, and emits a `plan_decomposed` audit entry listing the child IDs. The child-completion sweeper (`backend/internal/childcompletion/`) transitions the parent stage to `succeeded` once every child reaches a terminal state successfully, or to `failed-C` if any child failed. Child runs themselves skip the fanout check (their `decomposed_from` is non-nil), so recursion is bounded at one level.
+
+### `model_recommendation`
+
+The agent's optional, complexity-informed recommendation for which model should execute the implement stage (#1013). Advisory — the operator ratifies or overrides it at the plan-approval gate, and the resolved model is validated against the deployment's per-adapter allowed-model set.
+
+```json
+{
+  "model_recommendation": {
+    "implement_model": "claude-opus-4-8",
+    "rationale": "Cross-layer change threading a field through wire, domain, persistence, and render; non-trivial seams warrant the stronger model.",
+    "complexity_assessed": "high"
+  }
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `implement_model` | string (≥ 1 char) | yes (when the object is present) | Model identifier recommended for the implement stage (e.g. `claude-opus-4-8`). |
+| `rationale` | string (≥ 1 char) | yes (when the object is present) | Why this model fits the assessed complexity. Rendered alongside the recommendation in the plan-review surface. |
+| `complexity_assessed` | `"low"` / `"medium"` / `"high"` | yes (when the object is present) | The agent's complexity assessment, informing the recommendation; stamped onto calibration history. |
+
+`model_recommendation` is one rung of the implement-model resolution ladder: deployment default < workflow-spec `executor.model` < plan `model_recommendation.implement_model` < operator gate decision. When omitted, resolution falls through to the next-lower rung (ultimately the deployment default spawn — byte-identical to today's behavior). The whole object is additive-optional within `standard_v1.x`; a plan that omits it validates unchanged. A decomposed sub-plan may carry its own `model_recommendation` (see the sub-plan table above), resolved through the same chokepoint at the child's plan gate.
 
 ## Validation rules beyond the schema
 

@@ -377,7 +377,14 @@ const (
 // Executor describes what runs the stage. Exactly one of Agent or
 // Human is set. The schema enforces the mutual exclusion.
 type Executor struct {
-	Agent          string        `json:"agent,omitempty" yaml:"agent,omitempty"`
+	Agent string `json:"agent,omitempty" yaml:"agent,omitempty"`
+	// Model is the optional per-stage model override (#1013). One rung of
+	// the implement-model resolution ladder: deployment default < this
+	// executor.model < plan model_recommendation < operator gate decision.
+	// Empty falls through to the next-lower rung (ultimately the deployment
+	// default spawn). Declared in the agent branch of the executor oneOf;
+	// the schema rejects it on a human executor.
+	Model          string        `json:"model,omitempty" yaml:"model,omitempty"`
 	Human          bool          `json:"human,omitempty" yaml:"human,omitempty"`
 	Timeout        Duration      `json:"timeout,omitempty" yaml:"timeout,omitempty"`
 	Verify         *VerifyConfig `json:"verify,omitempty" yaml:"verify,omitempty"`
