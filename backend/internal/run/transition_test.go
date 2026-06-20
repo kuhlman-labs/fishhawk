@@ -125,6 +125,45 @@ func TestStageTransitions_AllowedAndForbidden(t *testing.T) {
 	}
 }
 
+// TestStageState_IsSettled pins the settled classification (#1252)
+// across ALL ten StageState constants: the three terminal states and
+// the four parked states are settled; the three in-flight states are
+// not. This is the load-bearing behavioral assertion for the stage
+// terminal-wait long-poll — its correctness is not enforced by
+// compilation, so every constant is enumerated explicitly. Keep
+// IsTerminal's narrower three-state semantics distinct (asserted by the
+// transition tables above).
+func TestStageState_IsSettled(t *testing.T) {
+	cases := []struct {
+		state StageState
+		want  bool
+	}{
+		// Terminal: settled.
+		{StageStateSucceeded, true},
+		{StageStateFailed, true},
+		{StageStateCancelled, true},
+		// Parked awaiting operator action: settled.
+		{StageStateAwaitingApproval, true},
+		{StageStateAwaitingChildren, true},
+		{StageStateAwaitingInput, true},
+		{StageStateAwaitingScopeDecision, true},
+		// In-flight: not settled.
+		{StageStatePending, false},
+		{StageStateDispatched, false},
+		{StageStateRunning, false},
+	}
+	if len(cases) != 10 {
+		t.Fatalf("expected all ten StageState constants enumerated, got %d", len(cases))
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.state), func(t *testing.T) {
+			if got := tc.state.IsSettled(); got != tc.want {
+				t.Errorf("StageState(%q).IsSettled() = %v, want %v", tc.state, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestStageFixupRecoveryTransitions table-tests the narrow fix-up
 // recovery override (#788). Exactly three edges are valid; everything
 // else — including unrelated edges through the recovery validator — is

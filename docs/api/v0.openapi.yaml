@@ -2825,6 +2825,128 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /v0/runs/{run_id}/stages/{stage_id}:
+    get:
+      operationId: getRunStage
+      summary: Read one stage by its (run, stage) handle, with optional terminal-wait long-poll
+      description: |
+        Resolves a stage by the durable ADR-037 `(run_id, stage_id)`
+        handle and returns the canonical `Stage` shape plus a small
+        wait envelope (`state`, `terminal`, optional `next_action`). It
+        is the SDK-independent REST analogue of the scope-amendment
+        `?wait` long-poll (#1252), giving a detached operator-side
+        watcher (a backgrounded shell poll) ONE authoritative signal
+        for stage settledness. Companion to the `dispatch_stage`
+        non-blocking dispatch work (#1232).
+
+        **Auth** mirrors `GET /v0/runs/{run_id}/scope-amendments`:
+        anonymous callers get 401; a run-bound `fhm_` bearer must carry
+        `mcp:read` (else 403 `insufficient_scope`) AND match the path
+        `run_id` (else 403 `cross_run_stage`); operator bearers/sessions
+        (not run-bound) pass. The `(run_id, stage_id)` handle must be
+        consistent — a stage whose `run_id` differs from the path is
+        404 `stage_not_found` (it does not exist at this path).
+
+        **`terminal`** is true when the stage has *settled*: a terminal
+        state (`succeeded`, `failed`, `cancelled`) OR a parked state
+        awaiting operator action (`awaiting_approval`,
+        `awaiting_children`, `awaiting_input`, `awaiting_scope_decision`).
+        The in-flight states (`pending`, `dispatched`, `running`) are
+        not settled. This is wider than run/stage terminality — a
+        detached watcher releases the moment the stage needs attention.
+
+        **Optional `?wait=<seconds>` long-poll.** When `wait` is a
+        positive integer and the stage is not yet settled, the server
+        holds the connection — re-reading the stage internally — and
+        returns the moment the stage settles, at the wait cap (returning
+        the still-unsettled stage so the client re-issues), or on client
+        disconnect. `wait` is clamped to `0..30`; `0`, absent, or a
+        non-positive/non-integer value is the unchanged immediate read.
+        An already-settled stage returns immediately regardless of
+        `wait`. On a transient re-read error the server returns the
+        last-good stage at 200 (never regressing the wait to a 500); no
+        new error codes.
+
+        **`next_action`** reuses the same `run_auto_advanced` drive
+        distillation as `GET /v0/runs/{run_id}`: best-effort, omitted on
+        non-drive runs, terminal runs, and any read failure — never
+        fabricated.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - name: wait
+          in: query
+          required: false
+          description: |
+            Optional server-side long-poll in seconds (#1252). `0` or
+            absent = no wait (immediate read). When positive and the
+            stage is not yet settled, holds until the stage settles
+            (terminal OR parked) or the wait elapses; the client
+            re-issues to extend. Clamped to `0..30`.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 30
+            default: 0
+      responses:
+        '200':
+          description: The stage, with the terminal-wait envelope.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Stage'
+                  - type: object
+                    required: [state, terminal]
+                    properties:
+                      state:
+                        type: string
+                        description: The stage state, echoed at the top level.
+                      terminal:
+                        type: boolean
+                        description: |
+                          True when the stage has settled — terminal OR
+                          parked awaiting operator action.
+                      next_action:
+                        $ref: '#/components/schemas/RunNextAction'
+                        description: |
+                          Distilled operator next step, reusing the
+                          `GET /v0/runs/{run_id}` drive distillation.
+                          Omitted on non-drive runs, terminal runs, and
+                          on any read failure.
+        '400':
+          description: run_id or stage_id is malformed (`validation_failed`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: No authenticated token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: |
+            `insufficient_scope` (run-bound token lacks `mcp:read`)
+            or `cross_run_stage` (run-bound token reading another run's
+            stage).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `stage_not_found` — no stage with that id, or the stage's
+            `run_id` does not match the path `run_id` (inconsistent
+            handle).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: Run repository not wired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/runs/{run_id}/audit:
     get:
       operationId: listRunAudit
