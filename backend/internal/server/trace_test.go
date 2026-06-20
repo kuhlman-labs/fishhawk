@@ -1002,6 +1002,93 @@ func TestShipTrace_EmitRuntimeObserved_ImplementStage(t *testing.T) {
 	}
 }
 
+// TestShipTrace_StampsResolvedModel asserts the calibration-stamp side of the
+// implement-model feature (#1013): the resolved model {value, source} is
+// stamped onto the EXISTING runtime_observed AND cost_recorded kinds, and NO
+// new audit kind (model_resolved) is emitted from this slice — the surface
+// sweep stays clean. The resolved model here comes from the spec executor.model
+// rung.
+func TestShipTrace_StampsResolvedModel(t *testing.T) {
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = []byte("workflows:\n" +
+		"  feature_change:\n" +
+		"    stages:\n" +
+		"      - id: implement\n" +
+		"        type: implement\n" +
+		"        executor:\n" +
+		"          model: claude-opus-4-8\n")
+
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	seedPlanArtifactForRun(t, art, planStage.ID, 15)
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateDispatched)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = false
+
+	priv, _ := sf.issue(t, runRow.ID)
+	t0 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(12 * time.Minute)
+	bundleBytes := makeTimedBundle(t, t0, t1)
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		TraceStore:   ts,
+		AuditRepo:    au,
+		RunRepo:      rr,
+		ArtifactRepo: art,
+	})
+
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var sawRO, sawCost bool
+	for i := range au.appended {
+		cat := au.appended[i].Category
+		if cat == "model_resolved" {
+			t.Fatalf("this slice must NOT emit the model_resolved kind (surface sweep must stay clean)")
+		}
+		var p map[string]any
+		if err := json.Unmarshal(au.appended[i].Payload, &p); err != nil {
+			continue
+		}
+		switch cat {
+		case "runtime_observed":
+			sawRO = true
+			if p["resolved_model"] != "claude-opus-4-8" {
+				t.Errorf("runtime_observed resolved_model = %v, want claude-opus-4-8", p["resolved_model"])
+			}
+			if p["resolved_model_source"] != "spec" {
+				t.Errorf("runtime_observed resolved_model_source = %v, want spec", p["resolved_model_source"])
+			}
+		case "cost_recorded":
+			sawCost = true
+			if p["resolved_model"] != "claude-opus-4-8" {
+				t.Errorf("cost_recorded resolved_model = %v, want claude-opus-4-8", p["resolved_model"])
+			}
+			if p["resolved_model_source"] != "spec" {
+				t.Errorf("cost_recorded resolved_model_source = %v, want spec", p["resolved_model_source"])
+			}
+		}
+	}
+	if !sawRO {
+		t.Fatal("no runtime_observed audit entry emitted")
+	}
+	if !sawCost {
+		t.Fatal("no cost_recorded audit entry emitted")
+	}
+}
+
 // TestShipTrace_EmitRuntimeObserved_PlanStage verifies that uploading a
 // trace for a plan stage does NOT emit a runtime_observed entry.
 func TestShipTrace_EmitRuntimeObserved_PlanStage(t *testing.T) {

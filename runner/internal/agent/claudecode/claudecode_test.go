@@ -186,6 +186,65 @@ func helperCommandWithEnv(mode string, extra ...string) func(ctx context.Context
 	}
 }
 
+// capturingHelperCommand wraps the "happy" helper process but records the
+// argv it was built with into *captured, so a test can assert the presence or
+// absence of the --model flag (#1013).
+func capturingHelperCommand(captured *[]string) func(ctx context.Context, name string, args ...string) *exec.Cmd {
+	return func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		*captured = append([]string(nil), args...)
+		c := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess")
+		c.Env = append(os.Environ(),
+			"GO_HELPER_PROCESS=1",
+			"HELPER_MODE=happy",
+		)
+		return c
+	}
+}
+
+func argsHaveFlagValue(args []string, flag, value string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag && args[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+func argsHaveFlag(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}
+
+// TestInvoke_ModelFlag asserts the implement-model routing (#1013): a non-empty
+// Invocation.Model appends `--model <m>`; an empty Model appends NO --model flag
+// (byte-identical to today's spawn).
+func TestInvoke_ModelFlag(t *testing.T) {
+	t.Run("non-empty model appends --model", func(t *testing.T) {
+		var captured []string
+		inv := &Invoker{Cmd: capturingHelperCommand(&captured), Now: frozenNow()}
+		if _, err := inv.Invoke(context.Background(), agent.Invocation{Prompt: "p", Model: "claude-opus-4-8"}); err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		if !argsHaveFlagValue(captured, "--model", "claude-opus-4-8") {
+			t.Fatalf("expected --model claude-opus-4-8 in args, got %v", captured)
+		}
+	})
+	t.Run("empty model omits --model (byte-identical spawn)", func(t *testing.T) {
+		var captured []string
+		inv := &Invoker{Cmd: capturingHelperCommand(&captured), Now: frozenNow()}
+		if _, err := inv.Invoke(context.Background(), agent.Invocation{Prompt: "p"}); err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		if argsHaveFlag(captured, "--model") {
+			t.Fatalf("expected NO --model flag for empty model, got %v", captured)
+		}
+	})
+}
+
 // frozenNow returns a Now() that ticks deterministically so tests
 // can assert event ordering without fighting wall-clock jitter.
 func frozenNow() func() time.Time {

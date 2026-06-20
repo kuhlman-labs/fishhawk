@@ -156,8 +156,16 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 		"exec", "--json",
 		"--dangerously-bypass-approvals-and-sandbox",
 		"--skip-git-repo-check",
-		inv.Prompt,
 	}
+	// --model: pin Codex to the backend-resolved implement model (#1013) when
+	// one was resolved. An empty inv.Model (no plan recommendation, no spec
+	// executor.model, no operator override, no deployment default) appends NO
+	// flag, so the spawn is byte-identical to today and Codex inherits its host
+	// ~/.codex default model. Placed before the trailing positional prompt.
+	if inv.Model != "" {
+		args = append(args, "--model", inv.Model)
+	}
+	args = append(args, inv.Prompt)
 	cmd := cmdFn(ctx, binary, args...)
 	cmd.Dir = inv.WorkingDir
 

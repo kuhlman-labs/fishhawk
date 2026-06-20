@@ -28,6 +28,65 @@ func resolveMaxParallelChildren(t *testing.T, args []string) int {
 	return *v
 }
 
+// resolveImplementModelConfig mirrors runServe's --implement-model-default and
+// --implement-allowed-models flag wiring (#1013) so the env > flag resolution
+// and the ParseAllowedModels handoff are unit-testable without booting the
+// server. Same shape as the live fs.String(... envOr(...) ...) calls.
+func resolveImplementModelConfig(t *testing.T, args []string) (string, server.AllowedModels) {
+	t.Helper()
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	deflt := fs.String("implement-model-default",
+		envOr("FISHHAWKD_IMPLEMENT_MODEL_DEFAULT", ""), "test")
+	allowed := fs.String("implement-allowed-models",
+		envOr("FISHHAWKD_IMPLEMENT_ALLOWED_MODELS", ""), "test")
+	if err := fs.Parse(args); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	return *deflt, server.ParseAllowedModels(*allowed)
+}
+
+// TestResolveImplementModelConfig covers the implement-model deployment config
+// resolution (#1013): the default model env/flag and the per-adapter
+// allowed-model policy parse, plus the empty/fail-open default.
+func TestResolveImplementModelConfig(t *testing.T) {
+	t.Run("unset yields empty default and fail-open policy", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_IMPLEMENT_MODEL_DEFAULT", "")
+		t.Setenv("FISHHAWKD_IMPLEMENT_ALLOWED_MODELS", "")
+		deflt, policy := resolveImplementModelConfig(t, nil)
+		if deflt != "" {
+			t.Errorf("default = %q, want empty", deflt)
+		}
+		if !policy.IsAllowed("claudecode", "anything") {
+			t.Error("empty policy must fail open")
+		}
+	})
+	t.Run("env values parse into default and policy", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_IMPLEMENT_MODEL_DEFAULT", "claude-sonnet-4-6")
+		t.Setenv("FISHHAWKD_IMPLEMENT_ALLOWED_MODELS", "claudecode=claude-opus-4-8;codex=gpt-5.5")
+		deflt, policy := resolveImplementModelConfig(t, nil)
+		if deflt != "claude-sonnet-4-6" {
+			t.Errorf("default = %q, want claude-sonnet-4-6", deflt)
+		}
+		if !policy.IsAllowed("claudecode", "claude-opus-4-8") {
+			t.Error("claudecode opus should be allowed")
+		}
+		if policy.IsAllowed("claudecode", "gpt-5.5") {
+			t.Error("claudecode should reject a codex-only model")
+		}
+		if !policy.IsAllowed("codex", "gpt-5.5") {
+			t.Error("codex gpt-5.5 should be allowed")
+		}
+	})
+	t.Run("flag arg wins over env for the default", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_IMPLEMENT_MODEL_DEFAULT", "claude-sonnet-4-6")
+		deflt, _ := resolveImplementModelConfig(t, []string{"--implement-model-default", "claude-opus-4-8"})
+		if deflt != "claude-opus-4-8" {
+			t.Errorf("default = %q, want claude-opus-4-8 (flag wins)", deflt)
+		}
+	})
+}
+
 // TestResolveMaxParallelChildren covers the FISHHAWKD_MAX_PARALLEL_CHILDREN
 // resolution branches: the default applies when unset, the env value wins
 // over the default, an explicit env 0 is honored as the unlimited semantic
