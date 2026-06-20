@@ -1887,6 +1887,15 @@ func TestShipTrace_RecordsCost_NoUsageKnownUsageFalse(t *testing.T) {
 	}
 }
 
+// spendTestNow is the fixed, wall-clock-independent instant the three
+// rolling-hour spend tests pin s.nowFunc to. It is anchored mid-hour (:30) so
+// the current-hour cluster (:30, :29, :28) and the exact -N-hour priors all
+// truncate into clean, distinct hour buckets — never straddling a real hour
+// edge regardless of when the suite runs. (A time.Time can't be a Go const, so
+// this is a package-level var; it is the single shared instant reused by all
+// three tests.)
+var spendTestNow = time.Date(2026, 1, 2, 15, 30, 0, 0, time.UTC)
+
 // seedCostEntry builds a cost_recorded audit entry at the given time
 // carrying a usd figure — the history the spend-alert check reads to
 // build its rolling baseline.
@@ -1918,7 +1927,11 @@ func TestShipTrace_SpendAlertTrips(t *testing.T) {
 		t.Fatalf("pricing.Cost(%q) ok=%v usd=%v — fixture model must be priced", model, ok, wantUSD)
 	}
 
-	now := time.Now().UTC()
+	// Pin the spend-alert clock to one fixed mid-hour instant so the seeded
+	// priors and the recordCost-stamped current-hour sample share one
+	// controlled now that never straddles a real hour edge.
+	s.nowFunc = func() time.Time { return spendTestNow }
+	now := spendTestNow
 	au.seeded = []*audit.Entry{
 		seedCostEntry(t, now.Add(-3*time.Hour), 0.01),
 		seedCostEntry(t, now.Add(-2*time.Hour), 0.01),
@@ -1995,7 +2008,11 @@ func TestShipTrace_NoSpendAlertUnderSteadySpend(t *testing.T) {
 		t.Fatalf("pricing.Cost(%q) ok=false — fixture model must be priced", model)
 	}
 
-	now := time.Now().UTC()
+	// Pin the spend-alert clock to one fixed mid-hour instant so the seeded
+	// priors and the recordCost-stamped current-hour sample share one
+	// controlled now that never straddles a real hour edge.
+	s.nowFunc = func() time.Time { return spendTestNow }
+	now := spendTestNow
 	au.seeded = []*audit.Entry{
 		seedCostEntry(t, now.Add(-3*time.Hour), wantUSD),
 		seedCostEntry(t, now.Add(-2*time.Hour), wantUSD),
@@ -3278,7 +3295,9 @@ func TestCheckSpendAlert_FamilyFanOutAggregates(t *testing.T) {
 	c2 := rr.seedRun()
 	c2.DecomposedFrom = &parent.ID
 
-	now := time.Now().UTC()
+	// Seed and evaluate against one fixed mid-hour instant (no real wall clock)
+	// so the rolling-hour buckets are deterministic at any suite run time.
+	now := spendTestNow
 	// Three prior hours of low baseline spend.
 	seeded := []*audit.Entry{
 		seedCostEntry(t, now.Add(-3*time.Hour), 0.01),
@@ -3296,6 +3315,7 @@ func TestCheckSpendAlert_FamilyFanOutAggregates(t *testing.T) {
 	au.seeded = seeded
 
 	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, RunRepo: rr})
+	s.nowFunc = func() time.Time { return spendTestNow }
 
 	s.checkSpendAlert(t.Context(), c1.ID, uuid.New(), "claude-opus-4-8")
 

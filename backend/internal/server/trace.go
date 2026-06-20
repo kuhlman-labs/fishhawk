@@ -1322,7 +1322,7 @@ func (s *Server) recordCost(ctx context.Context, runID, stageID uuid.UUID, bundl
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:     runID,
 		StageID:   &stageID,
-		Timestamp: time.Now().UTC(),
+		Timestamp: s.nowFunc().UTC(),
 		Category:  "cost_recorded",
 		ActorKind: &systemKind,
 		Payload:   payload,
@@ -1553,7 +1553,7 @@ func (s *Server) checkSpendAlert(ctx context.Context, runID, stageID uuid.UUID, 
 		samples = append(samples, spendalert.Sample{Time: e.Timestamp, USD: p.USD})
 	}
 
-	d := spendalert.Evaluate(samples, time.Now().UTC(), s.cfg.SpendAlertMultiple)
+	d := spendalert.Evaluate(samples, s.nowFunc().UTC(), s.cfg.SpendAlertMultiple)
 	if !d.Tripped {
 		return
 	}
