@@ -298,6 +298,40 @@ func TestFileWorkItem_NumberedType_AllocatesAndDispatches(t *testing.T) {
 	}
 }
 
+// TestFileWorkItem_NumberedType_EmptyExistingNumbers_Unprocessable is the
+// #1265 cross-layer done-means: an adr filing with existing_numbers omitted
+// returns 422 work_item_invalid (surfacing the numbered-type cause in
+// details) instead of silently filing ADR-001. It exercises the full
+// wire -> workItemRequest -> FilingRequest -> Apply -> allocateNumber ->
+// work_item_invalid mapping; the provider is never dispatched.
+func TestFileWorkItem_NumberedType_EmptyExistingNumbers_Unprocessable(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:    "kuhlman-labs/fishhawk",
+		Type:    "adr",
+		Summary: "Record the provider boundary",
+		// existing_numbers omitted on purpose
+	}, "github:operator")
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error.Code != "work_item_invalid" {
+		t.Errorf("code = %q, want work_item_invalid", env.Error.Code)
+	}
+	if env.Error.Details["existing_numbers_required"] != true {
+		t.Errorf("details.existing_numbers_required = %v, want true", env.Error.Details["existing_numbers_required"])
+	}
+	if fp.called {
+		t.Error("provider dispatched despite a fail-closed numbered allocate")
+	}
+}
+
 // TestFileWorkItem_UnimplementedProvider_FailsClosed asserts an
 // unregistered/unimplemented provider id returns a typed 501 naming the
 // missing provider rather than panicking. jira is now a real provider, so

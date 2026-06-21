@@ -41,7 +41,11 @@ type FilingRequest struct {
 	Relations Relations
 	// ExistingNumbers are the sequential numbers already in use for a
 	// numbered type (e.g. existing ADR numbers parsed from the board),
-	// supplied so Apply can allocate the next one. Ignored for
+	// supplied so Apply can allocate the next one. For a numbered type this
+	// is MANDATORY: an empty list fails the apply closed rather than
+	// allocating 1, so a numbered filing can never ship a silently-wrong
+	// number (#1265). A genuinely-first numbered item is filed with a
+	// non-empty seed whose max is 0 (existing_numbers:[0] -> 1). Ignored for
 	// non-numbered types.
 	ExistingNumbers []int
 }
@@ -140,9 +144,17 @@ func resolveComplexity(override, typeDefault string, levels map[string]string) (
 }
 
 // allocateNumber returns the next sequential number for a numbered type
-// (max(existing)+1, or 1 when none exist), or 0 for an unnumbered type.
-// Only the "sequential" scheme is supported in v0; any other scheme fails
-// closed.
+// (max(existing)+1), or 0 for an unnumbered type. Only the "sequential"
+// scheme is supported in v0; any other scheme fails closed.
+//
+// For a numbered type the caller MUST supply the numbers already in use
+// via ExistingNumbers: an empty list fails closed with a *SemanticError
+// rather than defaulting to 1, so a numbered filing can never silently
+// ship a wrong number (#1265). The empty case is keyed on len(existing)==0
+// because the MCP->backend hop's `omitempty` tag makes an omitted and an
+// explicit-empty list indistinguishable at the backend. To file a
+// genuinely-first numbered item, seed a non-empty list whose max is 0 —
+// existing_numbers:[0] yields 1 and survives the omitempty hop.
 func allocateNumber(itemType ItemType, existing []int) (int, error) {
 	if itemType.Numbering == nil {
 		return 0, nil
@@ -150,6 +162,20 @@ func allocateNumber(itemType ItemType, existing []int) (int, error) {
 	if itemType.Numbering.Scheme != "sequential" {
 		return 0, &SemanticError{Msg: fmt.Sprintf(
 			"unsupported numbering scheme %q (only \"sequential\" is supported)", itemType.Numbering.Scheme)}
+	}
+	if len(existing) == 0 {
+		// Carry structured Details so the handler surfaces the cause in the
+		// 422 response (mirroring the renderTitle missing_placeholders
+		// precedent above). The Msg states how to supply it.
+		return 0, &SemanticError{
+			Msg: fmt.Sprintf(
+				"existing_numbers is required for the numbered type %q: pass the numbers already in use so the next sequential number can be allocated; for a genuinely-first numbered item pass a seed such as existing_numbers:[0] (which yields 1)",
+				itemType.Numbering.Prefix),
+			Details: map[string]any{
+				"numbered_type":             itemType.Numbering.Prefix,
+				"existing_numbers_required": true,
+			},
+		}
 	}
 	max := 0
 	for _, n := range existing {

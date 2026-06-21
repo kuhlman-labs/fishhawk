@@ -36,7 +36,7 @@ type FileIssueInput struct {
 	Complexity      string              `json:"complexity,omitempty" jsonschema:"overrides the type's default complexity; must be a declared level (e.g. low, medium, high)"`
 	Status          string              `json:"status,omitempty" jsonschema:"overrides the type's default board status/column"`
 	Relations       *FileIssueRelations `json:"relations,omitempty" jsonschema:"provider-neutral relations: parent epic, supersedes, companion, evidence runs"`
-	ExistingNumbers []int               `json:"existing_numbers,omitempty" jsonschema:"numbers already in use for a numbered type (e.g. adr), so the next sequential number can be allocated"`
+	ExistingNumbers []int               `json:"existing_numbers,omitempty" jsonschema:"REQUIRED for a numbered type (e.g. adr): the numbers already in use, so the next sequential number can be allocated. Obtain them by scanning the tracker's existing numbered titles. Omission now fails work_item_invalid (no silent ADR-001); file a genuinely-first numbered item by seeding existing_numbers:[0] (which yields 1)"`
 	RunID           string              `json:"run_id,omitempty" jsonschema:"optional in-flight run UUID; when set and non-terminal a work_item_filed audit entry is appended to it. Falls back to FISHHAWK_RUN_ID env when omitted"`
 }
 
@@ -78,6 +78,13 @@ companion, and evidence-run links. For a child type whose title_format is
 [E{epic}.{n}], the {epic} placeholder is auto-derived from the parent_epic
 relation, so title_vars need only supply {n}; a 422 work_item_invalid lists
 the still-missing placeholders in details.missing_placeholders.
+
+For a numbered type (e.g. adr) existing_numbers is REQUIRED: pass the numbers
+already in use (scan the tracker's existing numbered titles) so the next
+sequential number can be allocated. Omitting it now fails work_item_invalid
+rather than silently allocating ADR-001; file a genuinely-first numbered item
+by seeding existing_numbers:[0] (which yields 1). Server-side discovery of the
+existing numbers is a deferred follow-up.
 
 When run_id names an in-flight, non-terminal run a best-effort
 work_item_filed audit entry is appended to it; filing still succeeds with no
