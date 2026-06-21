@@ -350,6 +350,112 @@ func TestGetStagePrompt_HappyPath_ImplementWithIssue(t *testing.T) {
 	}
 }
 
+// makeFixupEntryWithModel builds a stage_fixup_triggered audit entry carrying
+// the routed concerns AND (when includeModel) the #1164 pinned fix-up model, so
+// the prompt-fetch read-back (fixupResolvedModelFromAudit) is exercisable. With
+// includeModel=false the fixup_model key is ABSENT — the pre-#1164 entry shape.
+func makeFixupEntryWithModel(runID, stageID uuid.UUID, concerns []planreview.Concern, model, source string, includeModel bool) *audit.Entry {
+	fields := map[string]any{
+		"stage_id":     stageID.String(),
+		"concerns":     concerns,
+		"pass_ordinal": 1,
+	}
+	if includeModel {
+		fields["fixup_model"] = model
+		fields["fixup_model_source"] = source
+	}
+	payload, _ := json.Marshal(fields)
+	rid := runID
+	sid := stageID
+	return &audit.Entry{ID: uuid.New(), Category: CategoryStageFixupTriggered, RunID: &rid, StageID: &sid, Payload: payload}
+}
+
+// TestGetStagePrompt_Implement_FixupModelPin covers binding conditions 1 & 2
+// (#1164): a fix-up dispatch honors the model PINNED on the newest
+// stage_fixup_triggered entry at BOTH /prompt and /prompt-render —
+//   - a present non-empty pin wins over the run's live spec resolution;
+//   - a PRESENT-BUT-EMPTY pin yields an EMPTY implement_model (ok=true), DISTINCT
+//     from the no-pin fall-through (which would surface the live spec model);
+//   - a no-pin (pre-#1164) fix-up and a non-fix-up dispatch are byte-identical to
+//     the live resolveImplementModelForRun result.
+func TestGetStagePrompt_Implement_FixupModelPin(t *testing.T) {
+	const liveModel = "claude-sonnet-4-6" // the run's live spec executor.model (Y)
+	specYAML := []byte("workflows:\n" +
+		"  feature_change:\n" +
+		"    stages:\n" +
+		"      - id: implement\n" +
+		"        type: implement\n" +
+		"        executor:\n" +
+		"          agent: claudecode\n" +
+		"          model: " + liveModel + "\n")
+	concerns := []planreview.Concern{{Severity: planreview.SeverityLow, Category: "style", Note: "nit"}}
+
+	// run both endpoints, returning the implement_model each carried.
+	run2 := func(t *testing.T, entriesFor func(runID, stageID uuid.UUID) []*audit.Entry) (string, string) {
+		t.Helper()
+		s, rr, sf, _ := newPromptServer(t)
+		runID := uuid.New()
+		stageID := uuid.New()
+		priv, _ := sf.issue(t, runID)
+		rr.runRow = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI, WorkflowSpec: specYAML}
+		rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+		s.cfg.AuditRepo = &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{runID: entriesFor(runID, stageID)}}
+
+		w := promptRequest(t, s, runID, stageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("/prompt status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var signed promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &signed); err != nil {
+			t.Fatalf("decode /prompt: %v", err)
+		}
+		rreq := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+		rw := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rw, rreq)
+		if rw.Code != http.StatusOK {
+			t.Fatalf("/prompt-render status = %d, want 200:\n%s", rw.Code, rw.Body.String())
+		}
+		var rendered promptResponse
+		if err := json.Unmarshal(rw.Body.Bytes(), &rendered); err != nil {
+			t.Fatalf("decode /prompt-render: %v", err)
+		}
+		return signed.ImplementModel, rendered.ImplementModel
+	}
+
+	t.Run("non-empty pin wins over live spec model", func(t *testing.T) {
+		signed, rendered := run2(t, func(runID, stageID uuid.UUID) []*audit.Entry {
+			return []*audit.Entry{makeFixupEntryWithModel(runID, stageID, concerns, "claude-haiku-4-5-20251001", "operator", true)}
+		})
+		if signed != "claude-haiku-4-5-20251001" || rendered != "claude-haiku-4-5-20251001" {
+			t.Fatalf("implement_model = (/prompt %q, /prompt-render %q), want the pinned claude-haiku-4-5-20251001 on both", signed, rendered)
+		}
+	})
+	t.Run("present-but-empty pin yields empty (distinct from fall-through)", func(t *testing.T) {
+		signed, rendered := run2(t, func(runID, stageID uuid.UUID) []*audit.Entry {
+			return []*audit.Entry{makeFixupEntryWithModel(runID, stageID, concerns, "", "", true)}
+		})
+		if signed != "" || rendered != "" {
+			t.Fatalf("implement_model = (/prompt %q, /prompt-render %q), want EMPTY on both (present-but-empty pin honored, not the live %q)", signed, rendered, liveModel)
+		}
+	})
+	t.Run("no-pin fix-up falls through to live resolution", func(t *testing.T) {
+		signed, rendered := run2(t, func(runID, stageID uuid.UUID) []*audit.Entry {
+			return []*audit.Entry{makeFixupEntryWithModel(runID, stageID, concerns, "", "", false)}
+		})
+		if signed != liveModel || rendered != liveModel {
+			t.Fatalf("implement_model = (/prompt %q, /prompt-render %q), want the live %q on both (no-pin fall-through)", signed, rendered, liveModel)
+		}
+	})
+	t.Run("non-fix-up dispatch uses live resolution", func(t *testing.T) {
+		signed, rendered := run2(t, func(runID, stageID uuid.UUID) []*audit.Entry {
+			return nil // no stage_fixup_triggered entry → not a fix-up
+		})
+		if signed != liveModel || rendered != liveModel {
+			t.Fatalf("implement_model = (/prompt %q, /prompt-render %q), want the live %q on both (non-fix-up)", signed, rendered, liveModel)
+		}
+	})
+}
+
 // TestGetStagePrompt_Implement_CarriesResolvedModel asserts the implement-model
 // producer side (#1013): a resolved model (here from the spec executor.model
 // rung) is carried on the prompt response under the byte-identical

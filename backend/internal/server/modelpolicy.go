@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"sort"
 	"strings"
 
@@ -184,6 +186,107 @@ func (s *Server) resolveImplementModelForRun(ctx context.Context, runRow *run.Ru
 	specModel := specImplementExecutorModel(runRow.WorkflowSpec, runRow.WorkflowID)
 	planModel := s.planImplementModelRecommendation(ctx, runRow.ID)
 	return resolveImplementModel(deflt, specModel, planModel, "")
+}
+
+// resolveFixupImplementModel resolves the model a fix-up pass will run under
+// (#1164). When the operator supplied a (trimmed-non-empty) override on the
+// fixup dispatch it wins as the operator rung — {override, ModelSourceOperator}.
+// Otherwise the fix-up inherits the run's already-resolved implement model
+// (resolveImplementModelForRun, which itself reads the gate's authoritative
+// model_resolved entry when present), preserving the BYTE-IDENTICAL default:
+// a fix-up with no override spawns under exactly the model the original
+// implement pass did. The returned ResolvedModel is pinned on the
+// stage_fixup_triggered audit entry at trigger time so the prompt-fetch
+// read-back (fixupResolvedModelFromAudit) is deterministic regardless of any
+// later config change.
+func (s *Server) resolveFixupImplementModel(ctx context.Context, runRow *run.Run, operatorOverride string) ResolvedModel {
+	if ov := strings.TrimSpace(operatorOverride); ov != "" {
+		return ResolvedModel{Value: ov, Source: ModelSourceOperator}
+	}
+	return s.resolveImplementModelForRun(ctx, runRow)
+}
+
+// checkFixupModelAllowed is the fix-up model gate (#1164). It validates an
+// ALREADY-RESOLVED fix-up model (resolveFixupImplementModel's output) against
+// the run adapter's allow-list, mirroring approvals.go:checkPlanModelAllowed —
+// one model policy across the plan gate and the fix-up. Returns true to proceed.
+// Returns false after writing a 422 fixup_invalid_model (naming the resolved
+// SOURCE, mirroring plan_invalid_model) when the resolved value is non-empty and
+// the adapter's configured allow-set omits it.
+//
+// Fail-OPEN, matching the plan gate: an empty resolved model (ModelSourceNone,
+// today's default spawn) skips the check; an empty/unconfigured allow-list — or
+// an adapter with no set — accepts any model via IsAllowed (byte-identical to
+// today).
+func (s *Server) checkFixupModelAllowed(w http.ResponseWriter, r *http.Request, stage *run.Stage, runRow *run.Run, resolved ResolvedModel) bool {
+	if resolved.Value == "" {
+		// Empty resolution: today's default spawn. Nothing to validate.
+		return true
+	}
+	adapter := adapterForImplementAgent(specImplementExecutorAgent(runRow.WorkflowSpec, runRow.WorkflowID))
+	if s.cfg.ImplementAllowedModels.IsAllowed(adapter, resolved.Value) {
+		return true
+	}
+	s.writeError(w, r, http.StatusUnprocessableEntity, "fixup_invalid_model",
+		fmt.Sprintf("resolved fix-up implement model %q (source %s) is not in the configured allow-list for adapter %q; choose an allowed model via the implement_model fix-up override, or widen the deployment allow-list",
+			resolved.Value, resolved.Source, adapter),
+		map[string]any{
+			"stage_id":     stage.ID.String(),
+			"model":        resolved.Value,
+			"model_source": string(resolved.Source),
+			"adapter":      adapter,
+		})
+	return false
+}
+
+// fixupResolvedModelFromAudit reads the model a fix-up pass was PINNED to at
+// trigger time (#1164) from the newest stage_fixup_triggered audit entry for the
+// stage. The trigger handler always writes the fixup_model / fixup_model_source
+// keys (resolveFixupImplementModel's resolution), so the prompt-fetch path reads
+// the pin back deterministically — the model survives any later config change.
+//
+// It distinguishes "pinned" (ok=true) from "no pin" (ok=false) by KEY PRESENCE,
+// not non-emptiness: a present-but-empty fixup_model (the empty-ladder default
+// spawn the trigger deliberately pinned) returns {Value:"", ...}, true so the
+// caller honors the empty pin rather than re-deriving a non-empty rung. ok=false
+// — fall through to live resolution — only when the AuditRepo is unconfigured,
+// the lookup fails, no triggered entry exists for the stage, the payload is
+// undecodable, or the entry predates #1164 (no fixup_model key written).
+func (s *Server) fixupResolvedModelFromAudit(ctx context.Context, runID, stageID uuid.UUID) (ResolvedModel, bool) {
+	if s.cfg.AuditRepo == nil {
+		return ResolvedModel{}, false
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageFixupTriggered)
+	if err != nil {
+		return ResolvedModel{}, false
+	}
+	// Newest wins: ListForRunByCategory returns append (sequence-ascending)
+	// order, so the LAST entry for the stage is the most-recent fix-up pass —
+	// same selection as maybeRecoverFixupFailure's reader of this category.
+	var newest []byte
+	for _, e := range entries {
+		if e.StageID != nil && *e.StageID == stageID {
+			newest = e.Payload
+		}
+	}
+	if newest == nil {
+		return ResolvedModel{}, false
+	}
+	var probe struct {
+		// Pointer so a PRESENT-but-empty pin (ok=true, Value="") is
+		// distinguishable from an ABSENT key (pre-#1164 entry → ok=false).
+		FixupModel       *string `json:"fixup_model"`
+		FixupModelSource string  `json:"fixup_model_source"`
+	}
+	if err := json.Unmarshal(newest, &probe); err != nil {
+		return ResolvedModel{}, false
+	}
+	if probe.FixupModel == nil {
+		// Pre-#1164 fix-up entry carried no pin — fall through to live
+		// resolution so old runs stay byte-identical.
+		return ResolvedModel{}, false
+	}
+	return ResolvedModel{Value: *probe.FixupModel, Source: ModelSource(probe.FixupModelSource)}, true
 }
 
 // gateResolveImplementModel resolves the implement-model ladder AT THE

@@ -145,6 +145,162 @@ func TestFixupStage_HappyPath(t *testing.T) {
 	}
 }
 
+// latestFixupTriggeredPayload decodes the newest stage_fixup_triggered audit
+// payload appended during a test, failing when none exists.
+func latestFixupTriggeredPayload(t *testing.T, au *auditFake) map[string]any {
+	t.Helper()
+	var raw []byte
+	for _, e := range au.appended {
+		if e.Category == CategoryStageFixupTriggered {
+			raw = e.Payload
+		}
+	}
+	if raw == nil {
+		t.Fatal("no stage_fixup_triggered entry appended")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	return payload
+}
+
+// TestFixupStage_ImplementModelOverrideAllowed covers the #1164 fix-up model
+// gate happy path: an allow-listed implement_model override is accepted (200)
+// and pinned on the stage_fixup_triggered payload as fixup_model=override with
+// fixup_model_source=operator.
+func TestFixupStage_ImplementModelOverrideAllowed(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	s.cfg.ImplementAllowedModels = AllowedModels{"claudecode": {"claude-haiku-4-5-20251001": true}}
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityLow, Category: "style", Note: "naming nit"},
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ImplementModel: "claude-haiku-4-5-20251001"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := latestFixupTriggeredPayload(t, au)
+	if payload["fixup_model"] != "claude-haiku-4-5-20251001" {
+		t.Errorf("fixup_model = %v, want the override", payload["fixup_model"])
+	}
+	if payload["fixup_model_source"] != string(ModelSourceOperator) {
+		t.Errorf("fixup_model_source = %v, want operator", payload["fixup_model_source"])
+	}
+}
+
+// TestFixupStage_ImplementModelOverrideDisallowed covers the #1164 reject
+// branch: a model absent from a configured ImplementAllowedModels set returns
+// 422 fixup_invalid_model with NO stage transition and NO audit entry.
+func TestFixupStage_ImplementModelOverrideDisallowed(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	s.cfg.ImplementAllowedModels = AllowedModels{"claudecode": {"claude-opus-4-8": true}}
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityLow, Category: "style", Note: "naming nit"},
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ImplementModel: "some-unlisted-model"})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "fixup_invalid_model") {
+		t.Errorf("body missing fixup_invalid_model code: %s", w.Body.String())
+	}
+	// No transition: the stage must still be parked at the gate.
+	got, err := repo.GetStage(context.Background(), stage.ID)
+	if err != nil {
+		t.Fatalf("get stage: %v", err)
+	}
+	if got.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (no transition on reject)", got.State)
+	}
+	// No audit entry was written.
+	for _, e := range au.appended {
+		if e.Category == CategoryStageFixupTriggered {
+			t.Errorf("stage_fixup_triggered appended despite the 422 reject")
+		}
+	}
+}
+
+// TestFixupStage_ImplementModelFailOpenAllowList covers the IsAllowed fail-open
+// contract (#1164): with NO configured allow-list, any override model is
+// accepted (byte-identical to today's no-allow-list deployments).
+func TestFixupStage_ImplementModelFailOpenAllowList(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	// Default fixupServer leaves ImplementAllowedModels nil/empty → fail-open.
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityLow, Category: "style", Note: "naming nit"},
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ImplementModel: "any-model-at-all"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (fail-open allow-list):\n%s", w.Code, w.Body.String())
+	}
+	payload := latestFixupTriggeredPayload(t, au)
+	if payload["fixup_model"] != "any-model-at-all" {
+		t.Errorf("fixup_model = %v, want the override accepted fail-open", payload["fixup_model"])
+	}
+}
+
+// TestFixupStage_ImplementModelDefaultInherited covers the byte-identical
+// default path (#1164): with no implement_model supplied the fix-up inherits
+// the run's resolved implement model (here the deployment default) and pins it
+// with the inherited source.
+func TestFixupStage_ImplementModelDefaultInherited(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	s.cfg.ImplementModelDefault = "claude-opus-4-8"
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityLow, Category: "style", Note: "naming nit"},
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := latestFixupTriggeredPayload(t, au)
+	if payload["fixup_model"] != "claude-opus-4-8" {
+		t.Errorf("fixup_model = %v, want the inherited deployment default", payload["fixup_model"])
+	}
+	if payload["fixup_model_source"] != string(ModelSourceDefault) {
+		t.Errorf("fixup_model_source = %v, want default", payload["fixup_model_source"])
+	}
+}
+
+// TestFixupStage_ImplementModelEmptyLadderPinned covers the empty-ladder
+// default spawn (#1164): no override and a ModelSourceNone resolution (no
+// deployment default, no spec/plan model) pins an EMPTY fixup_model with an
+// empty source — a deliberate "use the adapter default spawn" pin.
+func TestFixupStage_ImplementModelEmptyLadderPinned(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	// No ImplementModelDefault, empty spec → resolveImplementModelForRun
+	// returns ModelSourceNone.
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityLow, Category: "style", Note: "naming nit"},
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := latestFixupTriggeredPayload(t, au)
+	// The keys are PRESENT (so the read-back honors the empty pin) but empty.
+	v, ok := payload["fixup_model"]
+	if !ok {
+		t.Fatal("fixup_model key absent; the empty-ladder pin must still be present")
+	}
+	if v != "" {
+		t.Errorf("fixup_model = %v, want empty (empty-ladder default spawn)", v)
+	}
+	if payload["fixup_model_source"] != string(ModelSourceNone) {
+		t.Errorf("fixup_model_source = %v, want empty (none)", payload["fixup_model_source"])
+	}
+}
+
 // TestFixupStage_AllowCreatePersisted asserts the validated allow_create
 // paths land on the stage_fixup_triggered audit payload (#823) so the
 // prompt renderer can fold them into the effective scope.files.

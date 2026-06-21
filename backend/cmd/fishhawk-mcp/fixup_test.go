@@ -109,6 +109,35 @@ func TestFixupStage_ForceAdditionalPass_ThreadsIntoBody(t *testing.T) {
 	}
 }
 
+func TestFixupStage_ImplementModel_ThreadsIntoBody(t *testing.T) {
+	// implement_model (#1164) must reach the backend request body verbatim so
+	// the operator/driver model override is resolved + allow-list-validated
+	// server-side for the pass.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID := uuid.New()
+	runID := uuid.New()
+	fb.fixupResp[stageID] = Stage{
+		ID:    stageID.String(),
+		RunID: runID.String(),
+		Type:  "implement",
+		State: "pending",
+	}
+
+	_, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID:        stageID.String(),
+		Concerns:       []int{0},
+		Reason:         "route to the cheaper model",
+		ImplementModel: "claude-haiku-4-5-20251001",
+	})
+	if err != nil {
+		t.Fatalf("fixupStage: %v", err)
+	}
+	if fb.fixupBody.ImplementModel != "claude-haiku-4-5-20251001" {
+		t.Errorf("body implement_model = %q, want the threaded override", fb.fixupBody.ImplementModel)
+	}
+}
+
 func TestFixupStage_CeilingReached_PropagatesAs422(t *testing.T) {
 	// At the hard ceiling the backend returns 422 with the DISTINCT code
 	// fixup_ceiling_reached (#860). The MCP tool propagates it as a tool

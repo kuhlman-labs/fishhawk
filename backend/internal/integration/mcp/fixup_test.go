@@ -75,13 +75,19 @@ func TestE2E_Fixup_ConcernRoutedBackAndBounded(t *testing.T) {
 	// apitoken rows (same pool), so it works against this server too.
 	auditRepo := audit.NewPostgresRepository(fx.pool)
 	signingRepo := signing.NewPostgresRepository(fx.pool)
+	// Configure the per-adapter allow-list (#1164) so the operator's
+	// implement_model fix-up override is validated, not merely fail-open
+	// accepted. The fixture run carries no WorkflowSpec, so the implement
+	// adapter resolves to "claudecode" (the default spawn's adapter).
+	const fixupModelOverride = "claude-haiku-4-5-20251001"
 	srv := server.New(server.Config{
-		Addr:         "127.0.0.1:0",
-		RunRepo:      fx.runRepo,
-		AuditRepo:    auditRepo,
-		SigningRepo:  signingRepo,
-		APITokenRepo: fx.apitokenRepo,
-		GitHub:       githubclient.New(nil),
+		Addr:                   "127.0.0.1:0",
+		RunRepo:                fx.runRepo,
+		AuditRepo:              auditRepo,
+		SigningRepo:            signingRepo,
+		APITokenRepo:           fx.apitokenRepo,
+		GitHub:                 githubclient.New(nil),
+		ImplementAllowedModels: server.AllowedModels{"claudecode": {fixupModelOverride: true}},
 	})
 	httpSrv := httptest.NewServer(srv.Handler())
 	t.Cleanup(httpSrv.Close)
@@ -125,9 +131,10 @@ func TestE2E_Fixup_ConcernRoutedBackAndBounded(t *testing.T) {
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "fishhawk_fixup_stage",
 		Arguments: map[string]any{
-			"stage_id": stage.ID.String(),
-			"concerns": []int{0},
-			"reason":   "address the scope concern on the existing branch",
+			"stage_id":        stage.ID.String(),
+			"concerns":        []int{0},
+			"reason":          "address the scope concern on the existing branch",
+			"implement_model": fixupModelOverride,
 		},
 	})
 	if err != nil {
@@ -166,9 +173,11 @@ func TestE2E_Fixup_ConcernRoutedBackAndBounded(t *testing.T) {
 		t.Fatalf("stage_fixup_triggered entries = %d, want 1", len(entries))
 	}
 	var triggered struct {
-		PassOrdinal     int                  `json:"pass_ordinal"`
-		RemainingBudget int                  `json:"remaining_budget"`
-		Concerns        []planreview.Concern `json:"concerns"`
+		PassOrdinal      int                  `json:"pass_ordinal"`
+		RemainingBudget  int                  `json:"remaining_budget"`
+		Concerns         []planreview.Concern `json:"concerns"`
+		FixupModel       string               `json:"fixup_model"`
+		FixupModelSource string               `json:"fixup_model_source"`
 	}
 	if err := json.Unmarshal(entries[0].Payload, &triggered); err != nil {
 		t.Fatalf("unmarshal stage_fixup_triggered payload: %v", err)
@@ -181,6 +190,15 @@ func TestE2E_Fixup_ConcernRoutedBackAndBounded(t *testing.T) {
 	}
 	if len(triggered.Concerns) != 1 || triggered.Concerns[0].Category != "scope" {
 		t.Fatalf("persisted concerns = %+v, want the single scope concern", triggered.Concerns)
+	}
+	// #1164: the operator's allow-listed implement_model override is pinned on
+	// the stage_fixup_triggered entry at trigger time (the persist leg of the
+	// seam).
+	if triggered.FixupModel != fixupModelOverride {
+		t.Errorf("fixup_model = %q, want the operator override %q", triggered.FixupModel, fixupModelOverride)
+	}
+	if triggered.FixupModelSource != "operator" {
+		t.Errorf("fixup_model_source = %q, want operator", triggered.FixupModelSource)
 	}
 
 	// 5. The deterministic prompt now renders the selected concern as a
@@ -199,6 +217,35 @@ func TestE2E_Fixup_ConcernRoutedBackAndBounded(t *testing.T) {
 	}
 	if strings.Contains(rendered, styleConcern.Note) {
 		t.Errorf("rendered prompt leaked the UNSELECTED concern note %q", styleConcern.Note)
+	}
+
+	// 5b. #1164: the fix-up prompt response carries the pinned model on the
+	// implement_model wire field — the read-back leg of the seam (the runner
+	// threads this to --model). Read back via the prompt-render JSON so the
+	// model survives audit-persist → prompt-fetch.
+	var promptResp struct {
+		ImplementModel string `json:"implement_model"`
+	}
+	getPromptRenderJSON(t, ctx, httpSrv.URL, stage.ID, &promptResp)
+	if promptResp.ImplementModel != fixupModelOverride {
+		t.Errorf("prompt implement_model = %q, want the pinned override %q", promptResp.ImplementModel, fixupModelOverride)
+	}
+
+	// 5c. #1164: GET /v0/runs/{id} distills the run's fix-up model into the
+	// fixup_model status field — the run-status leg of the seam.
+	var runResp struct {
+		FixupModel *struct {
+			Model       string `json:"model"`
+			Source      string `json:"source"`
+			PassOrdinal int    `json:"pass_ordinal"`
+		} `json:"fixup_model"`
+	}
+	getRunJSON(t, ctx, httpSrv.URL, fx.operatorTok, fx.runID, &runResp)
+	if runResp.FixupModel == nil {
+		t.Fatalf("run-status fixup_model absent; want the surfaced pin")
+	}
+	if runResp.FixupModel.Model != fixupModelOverride || runResp.FixupModel.Source != "operator" || runResp.FixupModel.PassOrdinal != 1 {
+		t.Errorf("run-status fixup_model = %+v, want {model:%q source:operator pass_ordinal:1}", *runResp.FixupModel, fixupModelOverride)
 	}
 
 	// 6. The bound: a second fix-up is refused. Re-park the stage at the
@@ -1174,6 +1221,31 @@ func getPromptRenderJSON(t *testing.T, ctx context.Context, baseURL string, stag
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		t.Fatalf("decode prompt-render response: %v", err)
+	}
+}
+
+// getRunJSON GETs /v0/runs/{id} with the operator bearer token and decodes the
+// run-status response into out — the run-status leg of the #1164 fix-up model
+// seam assertion.
+func getRunJSON(t *testing.T, ctx context.Context, baseURL, token string, runID uuid.UUID, out any) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		baseURL+"/v0/runs/"+runID.String(), nil)
+	if err != nil {
+		t.Fatalf("build run-status request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("run-status request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("run-status status %d: %s", resp.StatusCode, raw)
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		t.Fatalf("decode run-status response: %v", err)
 	}
 }
 

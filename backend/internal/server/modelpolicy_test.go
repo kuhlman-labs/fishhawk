@@ -92,6 +92,137 @@ func TestGateResolvedModel(t *testing.T) {
 	})
 }
 
+// fixupTriggerAuditFake returns canned stage_fixup_triggered entries (or an
+// error) so fixupResolvedModelFromAudit's branches are unit-testable.
+type fixupTriggerAuditFake struct {
+	audit.BaseFake
+	entries []*audit.Entry
+	err     error
+}
+
+func (f *fixupTriggerAuditFake) ListForRunByCategory(_ context.Context, _ uuid.UUID, category string) ([]*audit.Entry, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	if category != CategoryStageFixupTriggered {
+		return nil, nil
+	}
+	return f.entries, nil
+}
+
+// stageEntry builds a stage_fixup_triggered entry for a given stage with a raw
+// JSON payload, so the StageID filter in fixupResolvedModelFromAudit applies.
+func stageEntry(stageID uuid.UUID, payload string) *audit.Entry {
+	sid := stageID
+	return &audit.Entry{StageID: &sid, Payload: []byte(payload)}
+}
+
+// TestResolveFixupImplementModel covers the #1164 fix-up model resolution:
+// a non-empty operator override wins as the operator rung; an empty override
+// inherits the run's resolved implement model (here the deployment default,
+// and the empty-ladder none).
+func TestResolveFixupImplementModel(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("operator override wins", func(t *testing.T) {
+		s := New(Config{})
+		rm := s.resolveFixupImplementModel(ctx, &run.Run{}, "  claude-haiku-4-5-20251001 ")
+		if rm.Value != "claude-haiku-4-5-20251001" || rm.Source != ModelSourceOperator {
+			t.Fatalf("got {%q,%q}, want {claude-haiku-4-5-20251001,operator}", rm.Value, rm.Source)
+		}
+	})
+	t.Run("empty override inherits deployment default", func(t *testing.T) {
+		s := New(Config{ImplementModelDefault: "claude-opus-4-8"})
+		rm := s.resolveFixupImplementModel(ctx, &run.Run{}, "")
+		if rm.Value != "claude-opus-4-8" || rm.Source != ModelSourceDefault {
+			t.Fatalf("got {%q,%q}, want {claude-opus-4-8,default}", rm.Value, rm.Source)
+		}
+	})
+	t.Run("empty override and empty ladder yields none", func(t *testing.T) {
+		s := New(Config{})
+		rm := s.resolveFixupImplementModel(ctx, &run.Run{}, "   ")
+		if rm.Value != "" || rm.Source != ModelSourceNone {
+			t.Fatalf("got {%q,%q}, want {\"\",none}", rm.Value, rm.Source)
+		}
+	})
+}
+
+// TestFixupResolvedModelFromAudit covers the #1164 read-back, including binding
+// condition 1: a PRESENT-but-empty fixup_model returns ok=true (Value=""), an
+// ABSENT key (pre-#1164 entry) returns ok=false, and the defensive branches
+// (nil repo, list error, no entry, malformed) all return ok=false.
+func TestFixupResolvedModelFromAudit(t *testing.T) {
+	ctx := context.Background()
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	t.Run("nil AuditRepo returns not-ok", func(t *testing.T) {
+		s := New(Config{})
+		if _, ok := s.fixupResolvedModelFromAudit(ctx, runID, stageID); ok {
+			t.Fatal("expected not-ok with a nil AuditRepo")
+		}
+	})
+	t.Run("list error returns not-ok", func(t *testing.T) {
+		s := New(Config{AuditRepo: &fixupTriggerAuditFake{err: errors.New("boom")}})
+		if _, ok := s.fixupResolvedModelFromAudit(ctx, runID, stageID); ok {
+			t.Fatal("expected not-ok on a list error")
+		}
+	})
+	t.Run("no entry for stage returns not-ok", func(t *testing.T) {
+		s := New(Config{AuditRepo: &fixupTriggerAuditFake{entries: []*audit.Entry{
+			stageEntry(uuid.New(), `{"fixup_model":"x","fixup_model_source":"operator"}`),
+		}}})
+		if _, ok := s.fixupResolvedModelFromAudit(ctx, runID, stageID); ok {
+			t.Fatal("expected not-ok when no entry matches the stage")
+		}
+	})
+	t.Run("malformed payload returns not-ok", func(t *testing.T) {
+		s := New(Config{AuditRepo: &fixupTriggerAuditFake{entries: []*audit.Entry{
+			stageEntry(stageID, "{not json"),
+		}}})
+		if _, ok := s.fixupResolvedModelFromAudit(ctx, runID, stageID); ok {
+			t.Fatal("expected not-ok on a malformed payload")
+		}
+	})
+	t.Run("pre-#1164 entry (no fixup_model key) returns not-ok", func(t *testing.T) {
+		s := New(Config{AuditRepo: &fixupTriggerAuditFake{entries: []*audit.Entry{
+			stageEntry(stageID, `{"pass_ordinal":1}`),
+		}}})
+		if _, ok := s.fixupResolvedModelFromAudit(ctx, runID, stageID); ok {
+			t.Fatal("expected not-ok (fall through to live resolution) on a pre-#1164 entry")
+		}
+	})
+	t.Run("present non-empty pin returns the source-tagged model", func(t *testing.T) {
+		s := New(Config{AuditRepo: &fixupTriggerAuditFake{entries: []*audit.Entry{
+			stageEntry(stageID, `{"fixup_model":"claude-haiku-4-5-20251001","fixup_model_source":"operator"}`),
+		}}})
+		rm, ok := s.fixupResolvedModelFromAudit(ctx, runID, stageID)
+		if !ok || rm.Value != "claude-haiku-4-5-20251001" || rm.Source != ModelSourceOperator {
+			t.Fatalf("got {%q,%q} ok=%v, want {claude-haiku-4-5-20251001,operator} ok=true", rm.Value, rm.Source, ok)
+		}
+	})
+	t.Run("present-but-empty pin returns ok with empty value", func(t *testing.T) {
+		s := New(Config{AuditRepo: &fixupTriggerAuditFake{entries: []*audit.Entry{
+			stageEntry(stageID, `{"fixup_model":"","fixup_model_source":""}`),
+		}}})
+		rm, ok := s.fixupResolvedModelFromAudit(ctx, runID, stageID)
+		if !ok || rm.Value != "" || rm.Source != ModelSourceNone {
+			t.Fatalf("got {%q,%q} ok=%v, want {\"\",none} ok=true (present-but-empty pin honored)", rm.Value, rm.Source, ok)
+		}
+	})
+	t.Run("newest entry for stage wins", func(t *testing.T) {
+		s := New(Config{AuditRepo: &fixupTriggerAuditFake{entries: []*audit.Entry{
+			stageEntry(stageID, `{"fixup_model":"old-model","fixup_model_source":"operator"}`),
+			stageEntry(uuid.New(), `{"fixup_model":"other-stage","fixup_model_source":"operator"}`),
+			stageEntry(stageID, `{"fixup_model":"new-model","fixup_model_source":"operator"}`),
+		}}})
+		rm, ok := s.fixupResolvedModelFromAudit(ctx, runID, stageID)
+		if !ok || rm.Value != "new-model" {
+			t.Fatalf("got {%q} ok=%v, want the newest stage entry {new-model}", rm.Value, ok)
+		}
+	})
+}
+
 // TestResolvedImplementModelForRunID_NilRunRepo covers the by-id stamp helper's
 // fail-soft branch: a nil RunRepo yields the empty (none) ResolvedModel rather
 // than panicking the best-effort trace handler.

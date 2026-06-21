@@ -27,6 +27,9 @@ type FixupStageInput struct {
 	AllowCreate []string `json:"allow_create,omitempty" jsonschema:"optional repo-relative paths the fix-up will CREATE; folded into the effective scope.files for THIS pass only (bounded, explicit, operator-authorized) so the runner stages them instead of failing category-B created-out-of-scope. Any created file NOT declared here still fails category-B."`
 	// ForceAdditionalPass is the bounded operator override (#860).
 	ForceAdditionalPass bool `json:"force_additional_pass,omitempty" jsonschema:"bounded operator override: set true to grant ONE fix-up pass BEYOND the normal budget when it is already spent (you got fixup_budget_exhausted) but a concern still needs the agent. Hard-capped at 3 total passes per stage; the forced pass is audited (forced flag + your reason). At the ceiling the tool returns fixup_ceiling_reached and the override no longer helps. Default false."`
+	// ImplementModel is the optional operator/driver model override for this
+	// fix-up pass (#1164).
+	ImplementModel string `json:"implement_model,omitempty" jsonschema:"optional operator/driver model override for THIS fix-up pass; default (empty) inherits the run's resolved implement model. Validated against the deployment per-adapter allow-list — a disallowed value returns fixup_invalid_model (422)."`
 }
 
 // FixupStageOutput surfaces the re-opened Stage row. A successful fix-up
@@ -116,6 +119,13 @@ Inputs:
     budget. Hard-capped at 3 total passes per stage; the forced pass is
     audited (a 'forced' flag plus your reason on the stage_fixup_triggered
     entry). Default false.
+  - implement_model : optional operator/driver model override for THIS
+    fix-up pass (#1164). Default (empty) inherits the run's already-resolved
+    implement model — byte-identical to today. A non-empty value is
+    validated against the deployment's per-adapter allow-list; a disallowed
+    model returns fixup_invalid_model (422). The effective model is recorded
+    on the stage_fixup_triggered audit entry and surfaced on the run's
+    fixup_model status field.
 
 Bounded + operator-gated: the NORMAL bound defaults to ONE pass per stage.
 The budget is the number of remaining passes (max − fix-ups already
@@ -150,6 +160,9 @@ Returns a tool error on:
   - fixup_ceiling_reached (the hard ceiling of 3 total passes is reached,
     422; a hard stop — the override cannot push past it. File a follow-up
     and merge, or start a fresh run)
+  - fixup_invalid_model (the resolved implement_model override is not in the
+    deployment's per-adapter allow-list, 422; choose an allowed model or
+    widen the allow-list)
 `),
 	}, resolver.fixupStage)
 }
@@ -168,7 +181,7 @@ func (r *runResolver) fixupStage(ctx context.Context, _ *mcp.CallToolRequest, in
 	if len(in.ConcernIDs) == 0 && len(in.Concerns) == 0 {
 		return nil, FixupStageOutput{}, fmt.Errorf("concern_ids must select at least one recorded implement-review concern (stable UUIDs from fishhawk_get_run_status's run.concerns block; the positional concerns field is a deprecated fallback)")
 	}
-	fixed, err := r.api.FixupStage(ctx, stageID, in.ConcernIDs, in.Concerns, in.Reason, in.AllowCreate, in.ForceAdditionalPass)
+	fixed, err := r.api.FixupStage(ctx, stageID, in.ConcernIDs, in.Concerns, in.Reason, in.AllowCreate, in.ForceAdditionalPass, in.ImplementModel)
 	if err != nil {
 		return nil, FixupStageOutput{}, fmt.Errorf("fixup stage: %w", err)
 	}

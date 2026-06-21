@@ -92,6 +92,16 @@ type fixupRequest struct {
 	// `delegated: "<rule>"` on the stage_fixup_triggered payload when
 	// met. Absent → behavior byte-identical to today.
 	Delegated bool `json:"delegated"`
+	// ImplementModel is the optional operator/driver model override for
+	// THIS fix-up pass (#1164, the #1013 operator rung applied to the
+	// fix-up path). Empty == today's behavior: the fix-up inherits the
+	// run's already-resolved implement model (byte-identical default).
+	// A non-empty value is validated against the deployment's per-adapter
+	// allow-list exactly as the plan gate validates it (422
+	// fixup_invalid_model on reject). The effective model — override or
+	// inherited — is pinned on the stage_fixup_triggered audit entry at
+	// trigger time and read back when the runner fetches the fix-up prompt.
+	ImplementModel string `json:"implement_model"`
 }
 
 // validateAllowCreate normalizes and validates the fix-up allow-create
@@ -348,6 +358,33 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 		refundedPasses = priorPasses
 	}
 
+	// Fix-up model resolution + gate (#1164). Resolve the model this pass
+	// will run under — the operator's implement_model override when supplied,
+	// else the run's already-resolved implement model (byte-identical default)
+	// — and validate it against the run adapter's allow-list BEFORE the
+	// transition, so a disallowed override is refused (422 fixup_invalid_model)
+	// with NO state change and NO audit entry. The resolved model is pinned on
+	// the stage_fixup_triggered entry below so the prompt-fetch read-back rides
+	// the live #1013 implement_model wire channel. Fail-OPEN on a run read
+	// failure, mirroring checkPlanModelAllowed: pin the operator override (if
+	// any) so the audit still records intent, but skip allow-list validation
+	// (no adapter without the run) and let the transition below own the
+	// applicability verdict.
+	var resolvedModel ResolvedModel
+	if runRow, runErr := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID); runErr == nil {
+		resolvedModel = s.resolveFixupImplementModel(r.Context(), runRow, reqBody.ImplementModel)
+		if !s.checkFixupModelAllowed(w, r, stage, runRow, resolvedModel) {
+			return
+		}
+	} else {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "fixup model gate: get run failed; proceeding fail-open",
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", runErr.Error()))
+		if ov := strings.TrimSpace(reqBody.ImplementModel); ov != "" {
+			resolvedModel = ResolvedModel{Value: ov, Source: ModelSourceOperator}
+		}
+	}
+
 	dec, err := run.FixupStage(r.Context(), s.cfg.RunRepo, stageID, run.FixupOptions{
 		PriorPassCount:      priorPasses,
 		MaxPasses:           defaultMaxFixupPasses + refundedPasses,
@@ -384,7 +421,7 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 	// Audit first so the fix-up intent (and the selected concerns the
 	// prompt renderer reads back) is recorded even if the orchestrator
 	// handoff below fails. Same posture as the retry handler.
-	s.writeFixupAudit(r, dec, selected, concernIDs, reqBody.Concerns, reqBody.Reason, allowCreate, priorPasses, refundedPasses, delegatedRule)
+	s.writeFixupAudit(r, dec, selected, concernIDs, reqBody.Concerns, reqBody.Reason, allowCreate, priorPasses, refundedPasses, delegatedRule, resolvedModel)
 
 	// Mark the routed concerns addressed_pending in the durable store
 	// (#964), recording the operator's reason. AFTER the audit append so
@@ -616,11 +653,13 @@ func selectConcerns(all []planreview.Concern, indices []int) ([]planreview.Conce
 // prompt renderer delivers them as binding instructions), the operator
 // reason, the declared allow-create paths (#823, folded into the
 // effective scope.files for the fix-up dispatch), and the bounded-pass
-// receipt fields. When delegatedRule is non-empty the fix-up landed via
-// the ADR-040 delegated path (#1026) and the payload records
-// `delegated: "<rule>"`. Best-effort: the transition is already
+// receipt fields. It also pins the resolved fix-up model (#1164) as
+// fixup_model / fixup_model_source so the prompt-fetch read-back rides the
+// #1013 implement_model wire deterministically. When delegatedRule is
+// non-empty the fix-up landed via the ADR-040 delegated path (#1026) and
+// the payload records `delegated: "<rule>"`. Best-effort: the transition is already
 // committed, so a failure here logs but doesn't unwind.
-func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string) {
+func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string, resolvedModel ResolvedModel) {
 	id := IdentityFrom(r.Context())
 	subject := id.Subject
 	if subject == "" {
@@ -668,6 +707,13 @@ func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, select
 		"forced":               dec.Forced,
 		"admissibility_reason": admissibilityReason,
 		"apply_eligible":       applyEligible,
+		// Fix-up model pin (#1164): the source-tagged model this pass will
+		// run under (operator override or the run's inherited resolution).
+		// ALWAYS present on a fix-up trigger — fixupResolvedModelFromAudit
+		// reads it back at prompt-fetch by key PRESENCE, so an empty value
+		// (the empty-ladder default spawn) is a deliberate pin, not "absent".
+		"fixup_model":        resolvedModel.Value,
+		"fixup_model_source": string(resolvedModel.Source),
 	}
 	// push_and_open_pr flow (#780): record the review stage re-parked
 	// alongside the implement re-open, so the audit trail captures the

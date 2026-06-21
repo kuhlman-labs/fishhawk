@@ -102,6 +102,24 @@ type runResponse struct {
 	// the graph can't be read (no run repo / read failure), while still
 	// distinguishing a computed false from absent.
 	LineageComplete *bool `json:"lineage_complete,omitempty"`
+	// FixupModel is the model the run's most-recent fix-up pass ran under
+	// (#1164), distilled from the newest stage_fixup_triggered audit entry's
+	// pinned fixup_model / fixup_model_source / pass_ordinal. Populated by
+	// handleGetRun ONLY (a single audit read, same posture as Concerns) —
+	// toRunResponse never sets it, so the list endpoint stays free of the
+	// extra read. Omitted when the run has had no fix-up (or the pin predates
+	// #1164).
+	FixupModel *runFixupModelPayload `json:"fixup_model,omitempty"`
+}
+
+// runFixupModelPayload is the model a fix-up pass ran under on the wire
+// (#1164): the source-tagged model plus the 1-based pass ordinal it was
+// pinned on. Distinct from the audit payload shape so an audit-trail change
+// can't silently leak through the API surface.
+type runFixupModelPayload struct {
+	Model       string `json:"model"`
+	Source      string `json:"source"`
+	PassOrdinal int    `json:"pass_ordinal"`
 }
 
 // runNextActionPayload mirrors drive.NextAction on the wire. Kept
@@ -755,7 +773,50 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// same posture as Concerns. Omitted (nil) when no run repo is wired
 	// or the child-graph read fails (best-effort).
 	resp.LineageComplete = s.lineageComplete(r.Context(), got)
+	// Fix-up model surface (#1164): single-run read ONLY (same posture as
+	// Concerns — no per-row audit query on the list endpoint). Distilled from
+	// the run's newest stage_fixup_triggered entry's pinned model; nil (field
+	// omitted) when the run has had no fix-up or the pin predates #1164.
+	resp.FixupModel = s.fixupModelForRun(r.Context(), runID)
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// fixupModelForRun distills the run's most-recent fix-up model pin (#1164)
+// from the newest stage_fixup_triggered audit entry. Returns nil — the
+// fixup_model field is omitted — when the AuditRepo is unconfigured, the
+// lookup fails, the run has had no fix-up, the payload is undecodable, or the
+// entry predates #1164 (no fixup_model key written). Distinguishes a
+// present-but-empty pin (surfaced verbatim) from an absent key (nil) by key
+// presence, matching fixupResolvedModelFromAudit.
+func (s *Server) fixupModelForRun(ctx context.Context, runID uuid.UUID) *runFixupModelPayload {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageFixupTriggered)
+	if err != nil || len(entries) == 0 {
+		return nil
+	}
+	// Newest wins: ListForRunByCategory returns sequence-ascending order, so
+	// the last entry is the most-recent fix-up pass across the run.
+	newest := entries[len(entries)-1]
+	var probe struct {
+		// Pointer so a present-but-empty pin is distinguishable from a
+		// pre-#1164 entry that carried no fixup_model key.
+		FixupModel       *string `json:"fixup_model"`
+		FixupModelSource string  `json:"fixup_model_source"`
+		PassOrdinal      int     `json:"pass_ordinal"`
+	}
+	if err := json.Unmarshal(newest.Payload, &probe); err != nil {
+		return nil
+	}
+	if probe.FixupModel == nil {
+		return nil
+	}
+	return &runFixupModelPayload{
+		Model:       *probe.FixupModel,
+		Source:      probe.FixupModelSource,
+		PassOrdinal: probe.PassOrdinal,
+	}
 }
 
 // buildDelegationPayload evaluates the run's operator_agent delegation

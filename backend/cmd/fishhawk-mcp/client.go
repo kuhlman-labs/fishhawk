@@ -429,6 +429,10 @@ type fixupRequest struct {
 	// fix-up pass beyond the normal budget, hard-capped at 3 total passes.
 	// omitempty: the common fix-up omits it and stays on the default budget.
 	ForceAdditionalPass bool `json:"force_additional_pass,omitempty"`
+	// ImplementModel is the optional operator/driver model override for this
+	// fix-up pass (#1164). omitempty: the common fix-up omits it and inherits
+	// the run's already-resolved implement model (byte-identical default).
+	ImplementModel string `json:"implement_model,omitempty"`
 }
 
 // FixupStage routes one or more advisory implement-review concerns back
@@ -455,14 +459,20 @@ type fixupRequest struct {
 //   - 422 fixup_ceiling_reached (the hard ceiling of 3 total passes is
 //     reached; the override cannot push past it — merge-with-follow-up or a
 //     fresh run; details carry ceiling + used)
+//   - 422 fixup_invalid_model (the resolved implement_model override is not in
+//     the deployment's per-adapter allow-list; details carry the resolved
+//     model, source, and adapter)
 //
 // allowCreate declares net-new files this pass will create (#823), folded
 // into the effective scope.files for that dispatch only; an invalid entry
 // (absolute / containing "..") surfaces 400 validation_failed.
 // forceAdditionalPass is the bounded operator override (#860): grant ONE
 // pass beyond the normal budget, hard-capped at 3 total passes.
-func (c *apiClient) FixupStage(ctx context.Context, id uuid.UUID, concernIDs []string, concerns []int, reason string, allowCreate []string, forceAdditionalPass bool) (*Stage, error) {
-	body, err := json.Marshal(fixupRequest{ConcernIDs: concernIDs, Concerns: concerns, Reason: reason, AllowCreate: allowCreate, ForceAdditionalPass: forceAdditionalPass})
+// implementModel is the optional operator/driver model override for this pass
+// (#1164), validated server-side against the deployment allow-list (422
+// fixup_invalid_model on reject); empty inherits the run's implement model.
+func (c *apiClient) FixupStage(ctx context.Context, id uuid.UUID, concernIDs []string, concerns []int, reason string, allowCreate []string, forceAdditionalPass bool, implementModel string) (*Stage, error) {
+	body, err := json.Marshal(fixupRequest{ConcernIDs: concernIDs, Concerns: concerns, Reason: reason, AllowCreate: allowCreate, ForceAdditionalPass: forceAdditionalPass, ImplementModel: implementModel})
 	if err != nil {
 		return nil, fmt.Errorf("marshal fixup: %w", err)
 	}
