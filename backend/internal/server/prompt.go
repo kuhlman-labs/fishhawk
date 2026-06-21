@@ -868,7 +868,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if stage.Type == run.StageTypeImplement {
-		rm := s.resolveImplementModelForRun(r.Context(), runRow)
+		rm := s.resolveImplementDispatchModel(r.Context(), runRow, stage, fixup)
 		resp.ImplementModel = rm.Value
 		s.logModelResolution(r.Context(), runRow.ID, rm)
 	}
@@ -1139,10 +1139,29 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	if stage.Type == run.StageTypeImplement {
-		rm := s.resolveImplementModelForRun(r.Context(), runRow)
+		rm := s.resolveImplementDispatchModel(r.Context(), runRow, stage, fixup)
 		resp.ImplementModel = rm.Value
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// resolveImplementDispatchModel returns the implement model an implement-stage
+// prompt fetch should carry to the runner's --model (#1164). For a fix-up
+// dispatch it honors the model PINNED on the stage_fixup_triggered audit entry
+// at trigger time (fixupResolvedModelFromAudit): when that read returns ok the
+// pin wins EVEN IF its value is empty (a deliberately-pinned empty-ladder spawn
+// stays empty regardless of any later config change) — the whole point of
+// pinning at trigger time. The function falls through to live resolution
+// (resolveImplementModelForRun) ONLY when fixup is false (a normal implement
+// dispatch) or the read returns ok=false (no pin written: a pre-#1164 fix-up),
+// keeping those paths byte-identical to today.
+func (s *Server) resolveImplementDispatchModel(ctx context.Context, runRow *run.Run, stage *run.Stage, fixup bool) ResolvedModel {
+	if fixup {
+		if pinned, ok := s.fixupResolvedModelFromAudit(ctx, runRow.ID, stage.ID); ok {
+			return pinned
+		}
+	}
+	return s.resolveImplementModelForRun(ctx, runRow)
 }
 
 // verifyPromptSignature reads the X-Fishhawk-Signature header and

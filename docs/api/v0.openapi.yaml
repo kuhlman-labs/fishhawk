@@ -540,12 +540,45 @@ components:
             single-read posture as `concerns`); omitted on the list
             endpoint and whenever the graph can't be read (no run repo /
             read failure).
+        fixup_model:
+          $ref: '#/components/schemas/RunFixupModel'
+          description: |
+            The model the run's most-recent fix-up pass ran under (#1164),
+            distilled from the newest `stage_fixup_triggered` audit entry's
+            pinned model. Emitted by `GET /v0/runs/{run_id}` ONLY (a single
+            audit read, same single-read posture as `concerns`); omitted on
+            the list endpoint and when the run has had no fix-up (or the pin
+            predates #1164).
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
+
+    RunFixupModel:
+      type: object
+      description: |
+        The model a fix-up pass ran under (#1164): the source-tagged model
+        plus the 1-based pass ordinal it was pinned on. Surfaced on
+        `GET /v0/runs/{run_id}` only.
+      required: [model, source, pass_ordinal]
+      properties:
+        model:
+          type: string
+          description: |
+            The resolved fix-up model id. Empty string when the pass ran on
+            the adapter's built-in default spawn (the empty-ladder pin).
+        source:
+          type: string
+          description: |
+            Which rung supplied the model: `operator` for an `implement_model`
+            override, else the inherited source (`default` / `spec` / `plan`),
+            or empty for the default spawn.
+        pass_ordinal:
+          type: integer
+          minimum: 1
+          description: The 1-based fix-up pass ordinal this model was pinned on.
 
     RunConcerns:
       type: object
@@ -4718,6 +4751,23 @@ paths:
                     the `stage_fixup_triggered` payload records
                     `delegated: "convergent_concerns"`. Omitted →
                     behavior byte-identical to today.
+                implement_model:
+                  type: string
+                  description: |
+                    Optional operator/driver model override for THIS fix-up
+                    pass (#1164). Empty (omitted) inherits the run's
+                    already-resolved implement model — byte-identical to
+                    today. A non-empty value is validated against the
+                    deployment's per-adapter allowed-model set exactly as the
+                    plan gate validates it: a model outside the run adapter's
+                    configured allow-list is rejected (422
+                    `fixup_invalid_model`); an empty/unconfigured allow-list
+                    fails open (any model accepted). The effective model —
+                    override or inherited — is pinned on the
+                    `stage_fixup_triggered` audit entry at trigger time
+                    (`fixup_model` / `fixup_model_source`) and read back when
+                    the runner fetches the fix-up prompt, and is surfaced on
+                    the run's `fixup_model` status field.
       responses:
         '200':
           description: Stage re-opened for the fix-up pass; refreshed Stage row in body.
@@ -4760,8 +4810,11 @@ paths:
             one more pass is available via `force_additional_pass: true`); or
             the hard ceiling of 3 total passes is reached and the override can
             no longer help (`fixup_ceiling_reached`, distinct from
-            `fixup_budget_exhausted`). Body's `message` explains the specific
-            reason.
+            `fixup_budget_exhausted`); or the resolved `implement_model`
+            override is not in the deployment's per-adapter allow-list
+            (`fixup_invalid_model`, #1164 — `details` carry the resolved
+            `model`, `model_source`, and `adapter`). Body's `message` explains
+            the specific reason.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
