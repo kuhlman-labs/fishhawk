@@ -82,6 +82,15 @@ revise_ceiling_reached error (the override no longer helps — reject and
 start a fresh run). A run-bound token may revise only its own run's
 stages.
 
+Scope-regression refund: a revise regenerates the WHOLE plan, so a
+narrowly-scoped constraint can silently DROP files the prior plan scoped.
+The advisory plan_scope_regression gate diffs the new plan's scoped paths
+(top-level + decomposition sub-plan scopes) against the revision base and
+surfaces any dropped files to the reviewers and the plan gate. A revise
+pass that drops files does NOT consume the normal revise budget — the
+operator gets a free recovery pass to put them back — while the hard
+ceiling still counts every pass, so total work stays bounded.
+
 Inputs:
   - run_id     : the run whose plan stage to revise.
   - constraint : REQUIRED binding design constraint to revise the plan

@@ -176,6 +176,21 @@ func (s *Server) handleRevisePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Discount the NORMAL revise budget by the number of prior passes that
+	// dropped previously-scoped files (#1257): a regressing revise pass
+	// refunds the budget so the operator gets a free recovery pass, while
+	// PriorPassCount keeps the hard ceiling counting all passes (bounded).
+	regressedPasses, err := s.countRegressedRevisePasses(r.Context(), stage.RunID, stageID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"count regressed revise passes failed", map[string]any{"error": err.Error()})
+		return
+	}
+	budgetPasses := priorPasses - regressedPasses
+	if budgetPasses < 0 {
+		budgetPasses = 0
+	}
+
 	// Record the plan_revised audit entry (carrying the binding constraint
 	// the plan prompt renderer reads back) via the OnAdmit hook, which fires
 	// after the gate + budget decision but BEFORE the stage is re-opened.
@@ -186,6 +201,7 @@ func (s *Server) handleRevisePlan(w http.ResponseWriter, r *http.Request) {
 	// stage left at its approval gate (errReviseAuditAppendFailed → 500).
 	dec, err := run.RevisePlanStage(r.Context(), s.cfg.RunRepo, stageID, run.ReviseOptions{
 		PriorPassCount:      priorPasses,
+		BudgetPassCount:     budgetPasses,
 		MaxPasses:           defaultMaxRevisePasses,
 		ForceAdditionalPass: reqBody.ForceAdditionalPass,
 		HardCeiling:         defaultReviseCeiling,
@@ -312,6 +328,34 @@ func (s *Server) countRevisePasses(ctx context.Context, runID, stageID uuid.UUID
 	n := 0
 	for _, e := range entries {
 		if e.StageID != nil && *e.StageID == stageID {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// countRegressedRevisePasses returns the number of prior plan_scope_regression
+// audit entries for the stage whose Regressed flag is true — the count of
+// revise passes that DROPPED previously-scoped files (#1257). The revise
+// handler subtracts this from the prior-pass count to discount the NORMAL
+// budget (a regressing pass refunds the budget), while the hard ceiling
+// keeps counting all passes via PriorPassCount. Mirrors countRevisePasses'
+// stage-filtered shape; a malformed payload is skipped (not counted).
+func (s *Server) countRegressedRevisePasses(ctx context.Context, runID, stageID uuid.UUID) (int, error) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, categoryPlanScopeRegression)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, e := range entries {
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var p ScopeRegressionPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			continue
+		}
+		if p.Regressed {
 			n++
 		}
 	}

@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
@@ -1256,6 +1257,73 @@ func TestShipPlan_ReviewAgents_GateEvidenceReachesReviewPrompt(t *testing.T) {
 	}
 }
 
+// TestShipPlan_ReviewAgents_ScopeRegressionReachesReviewPrompt is the #1257
+// handler-level seam check: when a REVISE pass (a prior plan_revised entry
+// exists) ships a plan that DROPS a file the revision-base plan scoped,
+// handleShipPlan captures the base BEFORE ArtifactRepo.Create, runs the
+// scope-regression gate, and threads the dropped file into the plan-review
+// prompt's gate-evidence section — proving base-capture-before-Create +
+// planGateEvidence wiring end to end without a DB.
+func TestShipPlan_ReviewAgents_ScopeRegressionReachesReviewPrompt(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, sf, ar, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewersWithConstraints)
+	priv, _ := sf.issue(t, runID)
+
+	// The plan stage must be discoverable by loadApprovedPlanForRun's stage
+	// walk (tryLoadPlanForRun → ListStagesForRun), typed plan.
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {{ID: stageID, RunID: runID, Type: run.StageTypePlan}},
+	}
+
+	// Seed the revision-base plan artifact (scope {a,b}) on the plan stage,
+	// and a prior plan_revised entry so handleShipPlan treats this ship as a
+	// revise pass and captures the base.
+	baseBody := scopePlanBody(t, []plan.ScopeFile{
+		{Path: "backend/internal/server/a.go", Operation: plan.FileOpModify},
+		{Path: "backend/internal/server/b.go", Operation: plan.FileOpModify},
+	})
+	schema := "standard_v1"
+	if _, err := ar.Create(context.Background(), artifact.CreateParams{
+		StageID:       stageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &schema,
+		Content:       baseBody,
+		ContentHash:   "basehash",
+	}); err != nil {
+		t.Fatalf("seed base plan artifact: %v", err)
+	}
+	seedPlanRevised(au, runID, stageID)
+
+	// Ship a NEW plan dropping b.go (scope {a}).
+	newBody := scopePlanBody(t, []plan.ScopeFile{
+		{Path: "backend/internal/server/a.go", Operation: plan.FileOpModify},
+	})
+	w := shipPlanRequest(t, s, runID, stageID, priv, newBody, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer calls = %d, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	wants := []string{
+		"Scope regression (files dropped vs the revision base — HIGH severity):",
+		"backend/internal/server/b.go",
+	}
+	for _, want := range wants {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan-review prompt missing scope-regression element %q — base-capture/wiring seam broken:\n%s", want, got)
+		}
+	}
+}
+
 // TestShipPlan_ReviewAgents_BudgetEvidenceReachesReviewPrompt is the #994
 // seam check: the resolved implement budget runPlanReviews computes via
 // planBudgetEvidence must flow through the trigger mapping into the
@@ -1740,7 +1808,7 @@ func TestShipPlan_ReviewAgents_Advisory_ContextDetached(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	// Advisory → dispatches a detached goroutine and returns false.
-	if s.runPlanReviews(ctx, runID, stageID, body, nil, nil, nil) {
+	if s.runPlanReviews(ctx, runID, stageID, body, nil, nil, nil, nil) {
 		t.Fatal("advisory runPlanReviews returned true (advisory must never gate)")
 	}
 

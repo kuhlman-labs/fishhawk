@@ -71,11 +71,13 @@ func TestRevisePlanStage_RefusesWrongState(t *testing.T) {
 func TestRevisePlanStage_RefusesWhenBudgetExhausted(t *testing.T) {
 	repo, stage := planStageAtGate(run.StageStateAwaitingApproval)
 
-	// One pass already consumed against a default bound of 1.
+	// One pass already consumed against a default bound of 1, none of which
+	// regressed (BudgetPassCount == PriorPassCount).
 	_, err := run.RevisePlanStage(context.Background(), repo, stage.ID, run.ReviseOptions{
-		PriorPassCount: 1,
-		MaxPasses:      1,
-		HardCeiling:    3,
+		PriorPassCount:  1,
+		BudgetPassCount: 1,
+		MaxPasses:       1,
+		HardCeiling:     3,
 	})
 	if !errors.Is(err, run.ErrReviseBudgetExhausted) {
 		t.Fatalf("err = %v, want ErrReviseBudgetExhausted", err)
@@ -92,9 +94,10 @@ func TestRevisePlanStage_RemainingBudgetWithHigherBound(t *testing.T) {
 	repo, stage := planStageAtGate(run.StageStateAwaitingApproval)
 
 	dec, err := run.RevisePlanStage(context.Background(), repo, stage.ID, run.ReviseOptions{
-		PriorPassCount: 1,
-		MaxPasses:      3,
-		HardCeiling:    3,
+		PriorPassCount:  1,
+		BudgetPassCount: 1,
+		MaxPasses:       3,
+		HardCeiling:     3,
 	})
 	if err != nil {
 		t.Fatalf("RevisePlanStage: %v", err)
@@ -111,6 +114,7 @@ func TestRevisePlanStage_ForceAdditionalPassGrantsPassPastBudget(t *testing.T) {
 
 	dec, err := run.RevisePlanStage(context.Background(), repo, stage.ID, run.ReviseOptions{
 		PriorPassCount:      1,
+		BudgetPassCount:     1,
 		MaxPasses:           1,
 		HardCeiling:         3,
 		ForceAdditionalPass: true,
@@ -126,6 +130,61 @@ func TestRevisePlanStage_ForceAdditionalPassGrantsPassPastBudget(t *testing.T) {
 	}
 	if dec.RemainingBudget != 0 {
 		t.Errorf("RemainingBudget = %d, want 0 (forced pass past the normal budget)", dec.RemainingBudget)
+	}
+}
+
+func TestRevisePlanStage_BudgetRefundAdmitsWherePriorWouldExhaust(t *testing.T) {
+	// #1257: one prior pass was consumed but it REGRESSED (dropped scoped
+	// files), so the handler discounts it — BudgetPassCount=0 while
+	// PriorPassCount=1. The pass is admitted (the operator's free recovery
+	// pass) where keying the budget on PriorPassCount alone would have
+	// returned ErrReviseBudgetExhausted. remaining/forced derive from
+	// BudgetPassCount, not PriorPassCount.
+	repo, stage := planStageAtGate(run.StageStateAwaitingApproval)
+
+	dec, err := run.RevisePlanStage(context.Background(), repo, stage.ID, run.ReviseOptions{
+		PriorPassCount:  1,
+		BudgetPassCount: 0,
+		MaxPasses:       1,
+		HardCeiling:     3,
+	})
+	if err != nil {
+		t.Fatalf("RevisePlanStage (discounted budget): %v", err)
+	}
+	if dec.Stage.State != run.StageStatePending {
+		t.Errorf("post-revise state = %q, want pending (refunded pass admitted)", dec.Stage.State)
+	}
+	if dec.Forced {
+		t.Errorf("Forced = true, want false (BudgetPassCount 0 < MaxPasses, not an override)")
+	}
+	if dec.RemainingBudget != 0 {
+		t.Errorf("RemainingBudget = %d, want 0 (MaxPasses 1 - (BudgetPassCount 0 + 1))", dec.RemainingBudget)
+	}
+}
+
+func TestRevisePlanStage_CeilingWinsOverDiscountedBudget(t *testing.T) {
+	// #1257: the hard ceiling counts EVERY pass via PriorPassCount, so even
+	// when the discounted budget (BudgetPassCount) has headroom — every prior
+	// pass regressed — a stage at the ceiling is still refused with the
+	// distinct ErrReviseCeilingReached. This is what bounds total work
+	// despite the refund.
+	repo, stage := planStageAtGate(run.StageStateAwaitingApproval)
+
+	_, err := run.RevisePlanStage(context.Background(), repo, stage.ID, run.ReviseOptions{
+		PriorPassCount:  3,
+		BudgetPassCount: 0,
+		MaxPasses:       1,
+		HardCeiling:     3,
+	})
+	if !errors.Is(err, run.ErrReviseCeilingReached) {
+		t.Fatalf("err = %v, want ErrReviseCeilingReached (ceiling counts all passes)", err)
+	}
+	if errors.Is(err, run.ErrReviseBudgetExhausted) {
+		t.Errorf("err = %v, want the distinct ceiling error, not budget_exhausted", err)
+	}
+	cur, _ := repo.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateAwaitingApproval {
+		t.Errorf("state = %q, want unchanged (awaiting_approval)", cur.State)
 	}
 }
 

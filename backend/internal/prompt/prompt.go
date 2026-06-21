@@ -490,10 +490,24 @@ type GatePolicyViolation struct {
 // only the available subsections render; all nil is equivalent to a nil
 // PlanGateEvidence (section omitted).
 type PlanGateEvidence struct {
-	ScopePrecheck *ScopePrecheckEvidence
-	SurfaceSweep  *SurfaceSweepEvidence
-	TestSweep     *TestSweepEvidence
-	BudgetCheck   *BudgetCheckEvidence
+	ScopePrecheck   *ScopePrecheckEvidence
+	SurfaceSweep    *SurfaceSweepEvidence
+	TestSweep       *TestSweepEvidence
+	BudgetCheck     *BudgetCheckEvidence
+	ScopeRegression *ScopeRegressionEvidence
+}
+
+// ScopeRegressionEvidence is the plan_scope_regression result (#1257): on a
+// revise pass, the files the new plan's scope DROPPED relative to the
+// revision-base plan (RemovedFiles) and added (AddedFiles), plus the count
+// of the new plan's scoped paths. Non-empty RemovedFiles is a HIGH-severity
+// signal — a revision narrowed scope, which the runner would then
+// scope_drift-exclude. The render omits the block entirely when the gate did
+// not run (nil) or found no drop (empty RemovedFiles).
+type ScopeRegressionEvidence struct {
+	RemovedFiles []string
+	AddedFiles   []string
+	ScannedFiles int
 }
 
 // BudgetCheckEvidence is the approval-time budget gate's resolved input
@@ -1509,7 +1523,14 @@ func subPlanPrefix(title string) string {
 // own text-level findings. Writes nothing when no gate produced a result,
 // so the no-evidence prompt stays byte-identical to the pre-#963 output.
 func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
-	if ev == nil || (ev.ScopePrecheck == nil && ev.SurfaceSweep == nil && ev.TestSweep == nil && ev.BudgetCheck == nil) {
+	if ev == nil {
+		return
+	}
+	// The scope-regression block renders ONLY when it found a drop, so a
+	// clean (or absent) regression result must not, on its own, trigger the
+	// section header.
+	regressionHasDrops := ev.ScopeRegression != nil && len(ev.ScopeRegression.RemovedFiles) > 0
+	if ev.ScopePrecheck == nil && ev.SurfaceSweep == nil && ev.TestSweep == nil && ev.BudgetCheck == nil && !regressionHasDrops {
 		return
 	}
 	b.WriteString("### Gate evidence (machine-verified — outranks text-level findings)\n\n")
@@ -1518,6 +1539,21 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 		"high-severity concern and named FIRST among your concerns — it outranks any stylistic or " +
 		"text-level finding, and once recorded you may shortcut the remaining review criteria. " +
 		"A clean result does NOT certify plan quality: every review criterion below still applies.\n\n")
+
+	if reg := ev.ScopeRegression; reg != nil && len(reg.RemovedFiles) > 0 {
+		b.WriteString("Scope regression (files dropped vs the revision base — HIGH severity):\n\n")
+		fmt.Fprintf(b, "- files scanned: %d\n", reg.ScannedFiles)
+		fmt.Fprintf(b, "- DROPPED FILES (present in the plan being revised, absent from this revision's scope): %s\n",
+			strings.Join(reg.RemovedFiles, ", "))
+		if len(reg.AddedFiles) > 0 {
+			fmt.Fprintf(b, "- added files (for context): %s\n", strings.Join(reg.AddedFiles, ", "))
+		}
+		b.WriteString("This revision NARROWED scope: the listed files were in the plan being revised but are gone now " +
+			"(the union of top-level scope.files and every decomposition sub-plan scope was diffed). If the revision " +
+			"constraint did not intend to drop them, this is a scope regression — the runner will scope_drift-exclude " +
+			"any edits to these files. Record it as a high-severity concern naming the dropped files.\n")
+		b.WriteString("\n")
+	}
 
 	if pc := ev.ScopePrecheck; pc != nil {
 		b.WriteString("Scope pre-check (scope.files evaluated against the implement stage's path constraints):\n\n")

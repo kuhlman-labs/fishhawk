@@ -2146,6 +2146,69 @@ func TestBuild_PlanReview_GateEvidence_TestSweepRenders(t *testing.T) {
 	}
 }
 
+// TestBuild_PlanReview_GateEvidence_ScopeRegressionRenders pins the #1257
+// block: when ScopeRegression has dropped files, the HIGH-severity block
+// lists RemovedFiles (and AddedFiles for context) with the scope_drift
+// guidance.
+func TestBuild_PlanReview_GateEvidence_ScopeRegressionRenders(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			ScopeRegression: &ScopeRegressionEvidence{
+				ScannedFiles: 2,
+				RemovedFiles: []string{"backend/internal/server/dropped.go"},
+				AddedFiles:   []string{"backend/internal/server/added.go"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Gate evidence (machine-verified — outranks text-level findings)",
+		"Scope regression (files dropped vs the revision base — HIGH severity):",
+		"- files scanned: 2",
+		"DROPPED FILES (present in the plan being revised, absent from this revision's scope): backend/internal/server/dropped.go",
+		"- added files (for context): backend/internal/server/added.go",
+		"the runner will scope_drift-exclude",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing scope-regression element %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_PlanReview_GateEvidence_ScopeRegressionOmittedWhenClean confirms
+// the #1257 block is omitted when the gate ran but found no drop — a non-nil
+// ScopeRegression with empty RemovedFiles must NOT, on its own, render the
+// section (and must not falsely accuse).
+func TestBuild_PlanReview_GateEvidence_ScopeRegressionOmittedWhenClean(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			ScopeRegression: &ScopeRegressionEvidence{
+				ScannedFiles: 2,
+				RemovedFiles: nil,
+				AddedFiles:   []string{"backend/internal/server/added.go"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "Scope regression") {
+		t.Errorf("scope-regression block must be omitted on a clean (no-drop) result:\n%s", got)
+	}
+	// A clean regression result that is the ONLY evidence must omit the whole
+	// gate-evidence section (byte-identical to no evidence).
+	if strings.Contains(got, "### Gate evidence") {
+		t.Errorf("gate-evidence section must be omitted when the only result is a clean regression:\n%s", got)
+	}
+}
+
 // TestBuild_PlanReview_GateEvidence_SubPlanPrefixRenders covers #1077: a
 // finding attributed to a decomposition sub-plan (SubPlanTitle set) renders
 // with the "(sub-plan: <title>) " prefix on both the surface-sweep and

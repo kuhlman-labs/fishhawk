@@ -45,12 +45,23 @@ type ReviseOptions struct {
 	// PriorPassCount is how many revise passes the plan stage has already
 	// consumed. The handler derives this by counting the stage's prior
 	// plan_revised audit entries (the durable record — there is no
-	// dedicated column), so the bound holds across restarts.
+	// dedicated column), so the bound holds across restarts. It governs the
+	// HARD CEILING only: the ceiling counts EVERY pass (including regressing
+	// ones) so a budget refund cannot create an unbounded revise loop.
 	PriorPassCount int
+
+	// BudgetPassCount is the regression-discounted pass count used for the
+	// NORMAL-budget comparison (#1257). The handler derives it as
+	// PriorPassCount minus the number of prior passes that DROPPED
+	// previously-scoped files (a scope regression), floored at 0, so a
+	// regressing revise pass refunds the normal budget — the operator gets a
+	// free recovery pass — while PriorPassCount keeps the hard ceiling
+	// counting all passes. Equal to PriorPassCount when no pass regressed.
+	BudgetPassCount int
 
 	// MaxPasses is the configured NORMAL upper bound on revise passes for
 	// the stage (default 1). RevisePlanStage refuses with
-	// ErrReviseBudgetExhausted when PriorPassCount >= MaxPasses and the
+	// ErrReviseBudgetExhausted when BudgetPassCount >= MaxPasses and the
 	// operator has not set ForceAdditionalPass.
 	MaxPasses int
 
@@ -129,12 +140,16 @@ type ReviseDecision struct {
 // never an unbounded auto-loop) is, in order:
 //
 //   - PriorPassCount >= HardCeiling -> ErrReviseCeilingReached. The hard
-//     stop ALWAYS wins, even when ForceAdditionalPass is set.
-//   - else PriorPassCount >= MaxPasses && !ForceAdditionalPass ->
-//     ErrReviseBudgetExhausted. The normal budget is spent and no override
-//     was requested.
+//     stop ALWAYS wins, even when ForceAdditionalPass is set. The ceiling
+//     counts EVERY pass (including regressing ones) so a budget refund
+//     cannot create an unbounded revise loop — total work stays bounded.
+//   - else BudgetPassCount >= MaxPasses && !ForceAdditionalPass ->
+//     ErrReviseBudgetExhausted. The normal (regression-discounted) budget
+//     is spent and no override was requested. A regressing pass refunds the
+//     normal budget (BudgetPassCount < PriorPassCount) so the operator gets
+//     a free recovery pass.
 //   - otherwise admit, marking the decision Forced when the override
-//     carried it past the normal budget (PriorPassCount >= MaxPasses).
+//     carried it past the normal budget (BudgetPassCount >= MaxPasses).
 //
 // On success the plan stage moves to pending via the existing
 // TransitionStage repo verb (the revise edge is admitted by
@@ -173,19 +188,21 @@ func RevisePlanStage(ctx context.Context, repo Repository, stageID uuid.UUID, op
 		return nil, fmt.Errorf("%w: %d of %d revise passes already used (hard ceiling)",
 			ErrReviseCeilingReached, opts.PriorPassCount, opts.HardCeiling)
 	}
-	// The normal budget is spent and no override was requested.
-	if opts.PriorPassCount >= opts.MaxPasses && !opts.ForceAdditionalPass {
+	// The normal (regression-discounted) budget is spent and no override was
+	// requested. A regressing pass refunds the budget via BudgetPassCount, so
+	// the comparison uses it rather than PriorPassCount.
+	if opts.BudgetPassCount >= opts.MaxPasses && !opts.ForceAdditionalPass {
 		return nil, fmt.Errorf("%w: %d of %d revise passes already used",
-			ErrReviseBudgetExhausted, opts.PriorPassCount, opts.MaxPasses)
+			ErrReviseBudgetExhausted, opts.BudgetPassCount, opts.MaxPasses)
 	}
 	// Admitted. The pass is forced only when the override carried it past
 	// the normal budget (the ceiling check above already guaranteed
 	// headroom).
-	forced := opts.PriorPassCount >= opts.MaxPasses
+	forced := opts.BudgetPassCount >= opts.MaxPasses
 
 	priorState := stage.State
 
-	remaining := opts.MaxPasses - (opts.PriorPassCount + 1)
+	remaining := opts.MaxPasses - (opts.BudgetPassCount + 1)
 	if remaining < 0 {
 		remaining = 0
 	}

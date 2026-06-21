@@ -47,6 +47,26 @@ func seedPlanRevised(au *auditFake, runID, stageID uuid.UUID) {
 	})
 }
 
+// seedPlanScopeRegression adds a plan_scope_regression audit entry for the
+// stage with the given regressed flag, so budget-refund tests can simulate a
+// prior revise pass that dropped (or did not drop) scoped files (#1257).
+func seedPlanScopeRegression(au *auditFake, runID, stageID uuid.UUID, regressed bool) {
+	rid := runID
+	sid := stageID
+	payload, _ := json.Marshal(ScopeRegressionPayload{
+		RemovedFiles: []string{"backend/internal/server/dropped.go"},
+		AddedFiles:   []string{},
+		ScannedFiles: 1,
+		Regressed:    regressed,
+	})
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &rid,
+		StageID:  &sid,
+		Category: categoryPlanScopeRegression,
+		Payload:  payload,
+	})
+}
+
 // revisePlan posts a revise body to the handler with an authenticated
 // session identity (bypasses the scope guard like the approval tests).
 func revisePlan(t *testing.T, s *Server, stageID uuid.UUID, body string) *httptest.ResponseRecorder {
@@ -144,6 +164,45 @@ func TestRevisePlan_BudgetExhausted_409(t *testing.T) {
 
 	w := revisePlan(t, s, stageID, `{"constraint":"another tweak"}`)
 	assertScopeError(t, w, http.StatusConflict, "revise_budget_exhausted")
+}
+
+// TestRevisePlan_RegressingPassRefundsBudget is the #1257 mode-B test: one
+// prior revise pass was consumed but it REGRESSED (dropped scoped files), so
+// the handler discounts it — a second revise WITHOUT force is admitted (the
+// operator's free recovery pass) where TestRevisePlan_BudgetExhausted_409
+// (same prior count, no regression) returns 409.
+func TestRevisePlan_RegressingPassRefundsBudget(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, rr, au := newReviseServer(t, runID, stageID, run.StageStateAwaitingApproval, run.StageTypePlan)
+	// One prior revise pass, and that pass regressed → budget refunded.
+	seedPlanRevised(au, runID, stageID)
+	seedPlanScopeRegression(au, runID, stageID, true)
+
+	w := revisePlan(t, s, stageID, `{"constraint":"put the dropped file back"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (regressing pass refunds the budget):\n%s", w.Code, w.Body.String())
+	}
+	// The stage was re-opened to pending.
+	if got := rr.getStages[stageID].State; got != run.StageStatePending {
+		t.Errorf("stage state = %q, want pending (refunded pass admitted)", got)
+	}
+}
+
+// TestRevisePlan_CeilingWinsOverRefund is the #1257 mode-C test: three prior
+// passes (one regressed) is at the hard ceiling. Even though the discounted
+// budget has headroom, the ceiling counts ALL passes via PriorPassCount, so
+// the revise is refused with the distinct revise_ceiling_reached — proving
+// the refund cannot create an unbounded revise loop.
+func TestRevisePlan_CeilingWinsOverRefund(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, au := newReviseServer(t, runID, stageID, run.StageStateAwaitingApproval, run.StageTypePlan)
+	seedPlanRevised(au, runID, stageID)
+	seedPlanRevised(au, runID, stageID)
+	seedPlanRevised(au, runID, stageID)
+	seedPlanScopeRegression(au, runID, stageID, true)
+
+	w := revisePlan(t, s, stageID, `{"constraint":"past the ceiling even with a refund"}`)
+	assertScopeError(t, w, http.StatusConflict, "revise_ceiling_reached")
 }
 
 func TestRevisePlan_ForceGrantsPassPastBudget(t *testing.T) {
