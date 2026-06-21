@@ -186,6 +186,149 @@ func (s *Server) handleConsolidateRun(w http.ResponseWriter, r *http.Request) {
 	s.runConsolidation(w, r, runID, parentStage)
 }
 
+// integrateWaveResponse is the JSON body POST /v0/runs/{run_id}/integrate-wave
+// returns on a 200. Outcome is "integrated" (the succeeded slices so far merged
+// cleanly onto the consolidated branch) or "slice_conflict" (a slice branch
+// failed to merge). UNLIKE consolidateResponse there is NO resolved_to_state:
+// integrate-wave is the NON-settling per-wave fan-in (#1278 slice B) — it
+// merges the slices succeeded so far WITHOUT requiring all children terminal,
+// WITHOUT transitioning the parent stage, and WITHOUT advancing/opening the PR,
+// so the parent stage state is unchanged before and after. The conflict fields
+// are populated only on the slice_conflict outcome.
+type integrateWaveResponse struct {
+	RunID                 string `json:"run_id"`
+	Outcome               string `json:"outcome"`
+	ConsolidatedBranch    string `json:"consolidated_branch,omitempty"`
+	ConflictingSliceIndex *int   `json:"conflicting_slice_index,omitempty"`
+	ConflictingChildRunID string `json:"conflicting_child_run_id,omitempty"`
+	Detail                string `json:"detail,omitempty"`
+}
+
+// handleIntegrateWave implements POST /v0/runs/{run_id}/integrate-wave.
+//
+// It is the NON-settling per-wave fan-in (#1278 slice B / ADR-041) the
+// topological-wave run_children dispatch calls BETWEEN waves: it merges the
+// slices succeeded so far onto the consolidated branch so a later wave's
+// dependent slices can cut their branch from a tree that already contains the
+// predecessors' merged symbols. It reuses the EXACT same exported
+// orchestrator.IntegrateSlices primitive /consolidate uses — no new git-merge
+// code — which already filters to State==StateSucceeded slices ascending and is
+// idempotent (MergeBranch 204 / CreateRef 422 no-ops).
+//
+// It shares handleConsolidateRun's auth + decomposed-parent precondition
+// posture verbatim, but DELIBERATELY DIVERGES afterward: it does NOT require
+// all children terminal, does NOT locate/transition the awaiting_children
+// stage, and does NOT call Advance. The parent stage state is identical before
+// and after — the per-wave fan-in is intermediate; the final terminal fan-in
+// (stage resolution / PR open) stays driven by /consolidate after the last
+// wave's children settle.
+//
+// Auth: operator/operator-agent write:runs token. A run-bound fhm_ agent token
+// is rejected (403) — the fan-in is an operator action.
+func (s *Server) handleIntegrateWave(w http.ResponseWriter, r *http.Request) {
+	id := IdentityFrom(r.Context())
+	if id.IsAnonymous() {
+		s.writeError(w, r, http.StatusUnauthorized, "authentication_required",
+			"an authenticated token is required", nil)
+		return
+	}
+	if _, runBound := runBoundTokenRunID(id); runBound {
+		s.writeError(w, r, http.StatusForbidden, "agent_token_forbidden",
+			"a run-bound agent token may not integrate a decomposition wave; the fan-in is an operator action",
+			nil)
+		return
+	}
+	if id.TokenID != "" && !hasScope(id, "write:runs") {
+		s.writeError(w, r, http.StatusForbidden, "insufficient_scope",
+			"token is missing required scope: write:runs",
+			map[string]any{"required_scope": "write:runs"})
+		return
+	}
+
+	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil || s.cfg.Orchestrator == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "consolidate_unconfigured",
+			"integrate-wave endpoint requires run + audit repositories and an orchestrator", nil)
+		return
+	}
+
+	runID, err := uuid.Parse(r.PathValue("run_id"))
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"run_id must be a valid UUID",
+			map[string]any{"field": "run_id", "got": r.PathValue("run_id")})
+		return
+	}
+
+	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), runID)
+	if err != nil {
+		if errors.Is(err, run.ErrNotFound) {
+			s.writeError(w, r, http.StatusNotFound, "run_not_found",
+				"no run with that id", map[string]any{"run_id": runID.String()})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get run failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Require a decomposed PARENT: not itself a child AND it has at least one
+	// decomposed child — same gate as /consolidate.
+	if runRow.DecomposedFrom != nil {
+		s.writeError(w, r, http.StatusBadRequest, "not_a_decomposed_parent",
+			"run is itself a decomposed child, not a parent; only a decomposed parent can be integrated",
+			map[string]any{"decomposed_from": runRow.DecomposedFrom.String()})
+		return
+	}
+	children, err := s.listAllDecomposedChildren(r.Context(), runID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"list decomposed children failed", map[string]any{"error": err.Error()})
+		return
+	}
+	if len(children) == 0 {
+		s.writeError(w, r, http.StatusBadRequest, "not_a_decomposed_parent",
+			"run has no decomposed children; there is nothing to integrate", nil)
+		return
+	}
+
+	// The NON-settling fan-in: merge the succeeded slices so far. NO terminal-
+	// children precondition, NO stage location/transition, NO Advance.
+	conflict, err := s.cfg.Orchestrator.IntegrateSlices(r.Context(), runID)
+	switch {
+	case err != nil:
+		// Surface the error (parent untouched) so the driver can diagnose it —
+		// the per-wave loop stops on this and reports it. IntegrateSlices is
+		// idempotent, so a retry after the cause is fixed re-enters cleanly.
+		s.writeError(w, r, http.StatusBadGateway, "slice_integration_error",
+			"slice integration failed; the parent stage is left unchanged for retry",
+			map[string]any{"error": err.Error()})
+		return
+	case conflict != nil:
+		// A slice failed to merge. UNLIKE /consolidate this does NOT transition
+		// the parent stage (the per-wave fan-in must not fail the parent stage;
+		// the driver decides) — return the structured conflict so the wave loop
+		// stops and surfaces it.
+		idx := conflict.SliceIndex
+		s.writeJSON(w, r, http.StatusOK, integrateWaveResponse{
+			RunID:                 runID.String(),
+			Outcome:               "slice_conflict",
+			ConflictingSliceIndex: &idx,
+			ConflictingChildRunID: conflict.ChildRunID.String(),
+			Detail:                conflict.Detail,
+		})
+		return
+	}
+
+	// Clean integration: the succeeded slices merged. Source the consolidated
+	// branch from the slices_integrated audit IntegrateSlices emitted (no
+	// formula duplication). No stage transition, no Advance.
+	s.writeJSON(w, r, http.StatusOK, integrateWaveResponse{
+		RunID:              runID.String(),
+		Outcome:            "integrated",
+		ConsolidatedBranch: s.consolidatedBranchFromAudit(r.Context(), runID),
+	})
+}
+
 // listAllDecomposedChildren returns EVERY decomposed child of parentRunID,
 // paging past the per-query cap. A single Limit-capped ListRuns silently drops
 // children beyond the first page; the approved plan (E24.2 / #1238) forbids a

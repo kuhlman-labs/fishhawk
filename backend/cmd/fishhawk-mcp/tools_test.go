@@ -291,6 +291,17 @@ type fakeBackend struct {
 	budgetByRun      map[uuid.UUID]BudgetStatus
 	budgetStatus     int
 	budgetCalledByID map[uuid.UUID]int
+
+	// integrate-wave fixtures: POST /v0/runs/{run_id}/integrate-wave (#1278
+	// slice B). The run_children wave loop calls this between waves; the tests
+	// drive its response and assert the call counter. integrateWaveResp is the
+	// per-run response (a default integrated response is returned when unkeyed);
+	// integrateWaveStatus drives the status code (default 200);
+	// integrateWaveCalledByID counts calls per parent run id so the back-compat
+	// "never integrate-waves a single wave" test can assert == 0.
+	integrateWaveResp     map[uuid.UUID]IntegrateWaveResult
+	integrateWaveStatus   int
+	integrateWaveCalledBy map[uuid.UUID]int
 }
 
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
@@ -354,6 +365,9 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		budgetByRun:                   map[uuid.UUID]BudgetStatus{},
 		budgetStatus:                  http.StatusOK,
 		budgetCalledByID:              map[uuid.UUID]int{},
+		integrateWaveResp:             map[uuid.UUID]IntegrateWaveResult{},
+		integrateWaveStatus:           http.StatusOK,
+		integrateWaveCalledBy:         map[uuid.UUID]int{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v0/stages/{stage_id}/approvals", func(w http.ResponseWriter, r *http.Request) {
@@ -388,6 +402,29 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 				defaultState = "failed"
 			}
 			resp = Stage{ID: id.String(), Type: "plan", State: defaultState}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("POST /v0/runs/{run_id}/integrate-wave", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("run_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		fb.integrateWaveCalledBy[id]++
+		status := fb.integrateWaveStatus
+		resp, ok := fb.integrateWaveResp[id]
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if !ok {
+			// Default: a clean integration onto a per-run consolidated branch.
+			resp = IntegrateWaveResult{
+				RunID:              id.String(),
+				Outcome:            "integrated",
+				ConsolidatedBranch: "fishhawk/run-" + id.String()[:8] + "-consolidated",
+			}
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})

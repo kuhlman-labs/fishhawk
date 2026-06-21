@@ -545,6 +545,189 @@ func TestConsolidateRun_NotAwaitingChildren(t *testing.T) {
 	}
 }
 
+// postIntegrateWave drives POST /v0/runs/{run_id}/integrate-wave with the given
+// identity mutator.
+func postIntegrateWave(t *testing.T, s *Server, runID uuid.UUID, withID func(*http.Request) *http.Request) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+runID.String()+"/integrate-wave", nil)
+	req.SetPathValue("run_id", runID.String())
+	if withID != nil {
+		req = withID(req)
+	}
+	w := httptest.NewRecorder()
+	s.handleIntegrateWave(w, req)
+	return w
+}
+
+func decodeIntegrateWave(t *testing.T, w *httptest.ResponseRecorder) integrateWaveResponse {
+	t.Helper()
+	var resp integrateWaveResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v\nbody: %s", err, w.Body.String())
+	}
+	return resp
+}
+
+// TestIntegrateWave_NonSettling is the binding non-settling per-wave fan-in
+// (condition #2): integrate-wave merges the slices succeeded SO FAR — without
+// requiring every child terminal — returns the consolidated branch, and leaves
+// the parent implement stage UNCHANGED (awaiting_children before AND after, no
+// transition, no Advance). Here slice 0 has succeeded while slice 1 is still
+// running; the fan-in integrates slice 0 only and the parent stays parked.
+func TestIntegrateWave_NonSettling(t *testing.T) {
+	gh := newConsolidateGitHub()
+	f := seedConsolidateFixture(t, gh, true, []childSpec{
+		{sliceIndex: 0, state: run.StateSucceeded},
+		{sliceIndex: 1, state: run.StateRunning}, // NOT terminal — must not block
+	})
+
+	stateBefore := f.impl.State
+	if stateBefore != run.StageStateAwaitingChildren {
+		t.Fatalf("precondition: parent implement state = %q, want awaiting_children", stateBefore)
+	}
+
+	w := postIntegrateWave(t, f.s, f.parent.ID, withAuth)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	resp := decodeIntegrateWave(t, w)
+	if resp.Outcome != "integrated" {
+		t.Errorf("outcome = %q, want integrated", resp.Outcome)
+	}
+	if !strings.HasPrefix(resp.ConsolidatedBranch, "fishhawk/run-") {
+		t.Errorf("consolidated_branch = %q, want a fishhawk/run- branch", resp.ConsolidatedBranch)
+	}
+
+	// Only the succeeded slice merged (the in-flight slice 1 was filtered out) —
+	// proving the fan-in does NOT require all children terminal.
+	gh.mu.Lock()
+	mergeHeads := append([]string(nil), gh.mergeHeads...)
+	gh.mu.Unlock()
+	if len(mergeHeads) != 1 || !strings.HasSuffix(mergeHeads[0], "/slice-0") {
+		t.Errorf("mergeHeads = %v, want exactly [slice-0]", mergeHeads)
+	}
+
+	// The parent implement stage is UNCHANGED — no transition, no Advance.
+	if f.impl.State != stateBefore {
+		t.Errorf("parent implement state = %q, want unchanged %q", f.impl.State, stateBefore)
+	}
+	// And it carries NO consolidated PR (Advance was not called).
+	updated, _ := f.rr.GetRun(context.Background(), f.parent.ID)
+	if updated.PullRequestURL != nil && *updated.PullRequestURL != "" {
+		t.Errorf("parent pull_request_url = %v, want none (integrate-wave does not open the PR)", *updated.PullRequestURL)
+	}
+}
+
+// TestIntegrateWave_SliceConflict asserts a slice merge conflict surfaces
+// outcome=slice_conflict + conflicting_slice_index with NO parent stage
+// transition (condition #2: integrate-wave must not fail the parent stage).
+func TestIntegrateWave_SliceConflict(t *testing.T) {
+	gh := newConsolidateGitHub()
+	gh.conflictOnHeadSuffix = "/slice-0"
+	f := seedConsolidateFixture(t, gh, true, []childSpec{
+		{sliceIndex: 0, state: run.StateSucceeded},
+		{sliceIndex: 1, state: run.StateSucceeded},
+	})
+
+	stateBefore := f.impl.State
+	w := postIntegrateWave(t, f.s, f.parent.ID, withAuth)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	resp := decodeIntegrateWave(t, w)
+	if resp.Outcome != "slice_conflict" {
+		t.Errorf("outcome = %q, want slice_conflict", resp.Outcome)
+	}
+	if resp.ConflictingSliceIndex == nil || *resp.ConflictingSliceIndex != 0 {
+		t.Errorf("conflicting_slice_index = %v, want 0", resp.ConflictingSliceIndex)
+	}
+	if resp.ConflictingChildRunID == "" {
+		t.Error("conflicting_child_run_id is empty, want the conflicting child's run id")
+	}
+	// NO stage transition on a conflict — the per-wave fan-in must not fail the
+	// parent stage; the driver decides.
+	if f.impl.State != stateBefore {
+		t.Errorf("parent implement state = %q, want unchanged %q (no transition on conflict)", f.impl.State, stateBefore)
+	}
+	// No conflict audit is written by integrate-wave (it does not settle).
+	if n := consolidateAuditCount(t, f.au, f.parent.ID, "slice_integration_conflict"); n != 0 {
+		t.Errorf("slice_integration_conflict entries = %d, want 0 (integrate-wave does not settle)", n)
+	}
+}
+
+// TestIntegrateWave_IntegrationError asserts a non-conflict IntegrateSlices
+// error returns 502 with the parent stage left unchanged.
+func TestIntegrateWave_IntegrationError(t *testing.T) {
+	gh := newConsolidateGitHub()
+	gh.mergeErr = githubclient.ErrNotFound
+	f := seedConsolidateFixture(t, gh, true, []childSpec{{sliceIndex: 0, state: run.StateSucceeded}})
+
+	stateBefore := f.impl.State
+	w := postIntegrateWave(t, f.s, f.parent.ID, withAuth)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "slice_integration_error" {
+		t.Errorf("error = %q, want slice_integration_error", code)
+	}
+	if f.impl.State != stateBefore {
+		t.Errorf("parent implement state = %q, want unchanged %q", f.impl.State, stateBefore)
+	}
+}
+
+// TestIntegrateWave_NotAParent asserts the 400 when the run has no decomposed
+// children (it is not a parent).
+func TestIntegrateWave_NotAParent(t *testing.T) {
+	gh := newConsolidateGitHub()
+	f := seedConsolidateFixture(t, gh, true, nil)
+
+	w := postIntegrateWave(t, f.s, f.parent.ID, withAuth)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "not_a_decomposed_parent" {
+		t.Errorf("error = %q, want not_a_decomposed_parent", code)
+	}
+}
+
+// TestIntegrateWave_InsufficientScope asserts a non-run-bound operator-agent
+// token lacking write:runs is rejected 403.
+func TestIntegrateWave_InsufficientScope(t *testing.T) {
+	gh := newConsolidateGitHub()
+	f := seedConsolidateFixture(t, gh, true, []childSpec{{sliceIndex: 0, state: run.StateSucceeded}})
+
+	withScopeless := func(req *http.Request) *http.Request {
+		id := Identity{Subject: "github:operator-agent", TokenID: "tok-scopeless", Scopes: nil}
+		return req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
+	}
+	w := postIntegrateWave(t, f.s, f.parent.ID, withScopeless)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "insufficient_scope" {
+		t.Errorf("error = %q, want insufficient_scope", code)
+	}
+}
+
+// TestIntegrateWave_RunBoundTokenForbidden asserts a run-bound fhm_ agent token
+// is rejected 403 — the fan-in is an operator action.
+func TestIntegrateWave_RunBoundTokenForbidden(t *testing.T) {
+	gh := newConsolidateGitHub()
+	f := seedConsolidateFixture(t, gh, true, []childSpec{{sliceIndex: 0, state: run.StateSucceeded}})
+
+	withRunBound := func(req *http.Request) *http.Request {
+		id := Identity{Subject: "mcp:run:" + f.parent.ID.String(), TokenID: "fhm-token", Scopes: []string{"write:runs"}}
+		return req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
+	}
+	w := postIntegrateWave(t, f.s, f.parent.ID, withRunBound)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if code := decodeError(t, w); code != "agent_token_forbidden" {
+		t.Errorf("error = %q, want agent_token_forbidden", code)
+	}
+}
+
 // stringSetFromAny turns a JSON array decoded into []any (of strings) into a
 // set, failing the test if any element is not a string.
 func stringSetFromAny(t *testing.T, v any) map[string]bool {

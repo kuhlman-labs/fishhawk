@@ -62,20 +62,33 @@ func completedEvents(outcome string) []RunnerEvent {
 }
 
 // seedPlanDecomposed appends a plan_decomposed audit entry to the parent run so
-// LatestPlanDecomposed discovers the children + effective cap.
+// LatestPlanDecomposed discovers the children + effective cap. No waves field is
+// seeded, so the run_children loop collapses to a single all-indices wave
+// (back-compat).
 func seedPlanDecomposed(fb *fakeBackend, parent uuid.UUID, childIDs []string, effectiveMax int) {
+	seedPlanDecomposedWaves(fb, parent, childIDs, effectiveMax, nil)
+}
+
+// seedPlanDecomposedWaves is seedPlanDecomposed with an explicit waves field —
+// the topological dispatch order of slice indices into childIDs (#1278 slice B).
+// A nil waves omits the field (back-compat single-wave).
+func seedPlanDecomposedWaves(fb *fakeBackend, parent uuid.UUID, childIDs []string, effectiveMax int, waves [][]int) {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
 	seq := int64(len(fb.perRunAuditByRun[parent]) + 1)
+	payload := map[string]any{
+		"child_run_ids":          childIDs,
+		"effective_max_parallel": effectiveMax,
+	}
+	if waves != nil {
+		payload["waves"] = waves
+	}
 	fb.perRunAuditByRun[parent] = append(fb.perRunAuditByRun[parent], AuditEntry{
 		ID:       uuid.NewString(),
 		Sequence: seq,
 		RunID:    parent.String(),
 		Category: "plan_decomposed",
-		Payload: map[string]any{
-			"child_run_ids":          childIDs,
-			"effective_max_parallel": effectiveMax,
-		},
+		Payload:  payload,
 	})
 }
 
@@ -600,6 +613,308 @@ func TestLatestPlanDecomposed_CorruptPayloadErrors(t *testing.T) {
 	}
 }
 
+// --- topological-wave dispatch (#1278 slice B) ---
+
+// argvFlag returns the value following flag in argv, or "" if absent.
+func argvFlag(argv []string, flag string) string {
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] == flag {
+			return argv[i+1]
+		}
+	}
+	return ""
+}
+
+func intPtr(i int) *int { return &i }
+
+// captureBaseSpawn returns a fake spawn that records each child's --base-branch
+// keyed by --run-id, plus the recording map and its mutex. outcomeFor lets a
+// test fail a specific child (return "" for the default "ok"/exit 0).
+func captureBaseSpawn(outcomeFor func(runID string) (string, int)) (
+	func(context.Context, string, []string, []string, *mcp.CallToolRequest, any) ([]RunnerEvent, []string, int, error),
+	map[string]string, *sync.Mutex,
+) {
+	var mu sync.Mutex
+	baseByID := map[string]string{}
+	fn := func(_ context.Context, _ string, argv, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		runID := argvFlag(argv, "--run-id")
+		mu.Lock()
+		baseByID[runID] = argvFlag(argv, "--base-branch")
+		mu.Unlock()
+		outcome, exit := "ok", 0
+		if outcomeFor != nil {
+			if o, e := outcomeFor(runID); o != "" {
+				outcome, exit = o, e
+			}
+		}
+		return completedEvents(outcome), nil, exit, nil
+	}
+	return fn, baseByID, &mu
+}
+
+// TestRunChildren_TwoWaveDispatch is the binding 2-wave test (verification mode
+// 8): wave 0 dispatches against main, integrate-wave is called ONCE, and wave 1
+// dispatches against the consolidated branch integrate-wave returned — NOT main.
+func TestRunChildren_TwoWaveDispatch(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child0, child1 := uuid.New(), uuid.New()
+	seedChildRun(fb, child0, "pending")
+	seedChildRun(fb, child1, "pending")
+	seedPlanDecomposedWaves(fb, parent, []string{child0.String(), child1.String()}, 0, [][]int{{0}, {1}})
+
+	spawn, baseByID, mu := captureBaseSpawn(nil)
+	withFakeSpawn(t, spawn)
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if out.DispatchedCount != 2 {
+		t.Errorf("dispatched_count = %d, want 2 (one per wave)", out.DispatchedCount)
+	}
+
+	wantConsolidated := "fishhawk/run-" + parent.String()[:8] + "-consolidated"
+	mu.Lock()
+	defer mu.Unlock()
+	if got := baseByID[child0.String()]; got != "main" {
+		t.Errorf("wave-0 child --base-branch = %q, want main", got)
+	}
+	if got := baseByID[child1.String()]; got != wantConsolidated {
+		t.Errorf("wave-1 child --base-branch = %q, want the consolidated branch %q", got, wantConsolidated)
+	}
+	fb.mu.Lock()
+	calls := fb.integrateWaveCalledBy[parent]
+	fb.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("integrate-wave calls = %d, want exactly 1 (between the two waves)", calls)
+	}
+}
+
+// TestRunChildren_NoDependsOn_SingleWaveNeverIntegrates is the binding back-
+// compat test (condition #3 / verification mode 9): a no-depends_on
+// decomposition (no waves field) collapses to ONE concurrent wave dispatched
+// with --base-branch main, and integrate-wave is NEVER called (counter == 0).
+func TestRunChildren_NoDependsOn_SingleWaveNeverIntegrates(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	const n = 3
+	childIDs := make([]string, n)
+	for i := range childIDs {
+		c := uuid.New()
+		childIDs[i] = c.String()
+		seedChildRun(fb, c, "pending")
+	}
+	seedPlanDecomposed(fb, parent, childIDs, 0) // NO waves field — back-compat
+
+	spawn, baseByID, mu := captureBaseSpawn(nil)
+	withFakeSpawn(t, spawn)
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if out.DispatchedCount != n {
+		t.Errorf("dispatched_count = %d, want %d (one concurrent wave)", out.DispatchedCount, n)
+	}
+	mu.Lock()
+	for _, id := range childIDs {
+		if got := baseByID[id]; got != "main" {
+			t.Errorf("child %s --base-branch = %q, want main", id, got)
+		}
+	}
+	mu.Unlock()
+	fb.mu.Lock()
+	calls := fb.integrateWaveCalledBy[parent]
+	fb.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("integrate-wave calls = %d, want 0 (a single wave is never integrate-waved)", calls)
+	}
+}
+
+// TestRunChildren_WaveFailureStopsBeforeNextWave is the partial-wave guard
+// (verification mode 10): a wave-0 child that did not succeed STOPS the loop —
+// integrate-wave is not called and wave 1's child is never dispatched.
+func TestRunChildren_WaveFailureStopsBeforeNextWave(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child0, child1 := uuid.New(), uuid.New()
+	seedChildRun(fb, child0, "pending")
+	seedChildRun(fb, child1, "pending")
+	seedPlanDecomposedWaves(fb, parent, []string{child0.String(), child1.String()}, 0, [][]int{{0}, {1}})
+
+	spawn, baseByID, mu := captureBaseSpawn(func(runID string) (string, int) {
+		if runID == child0.String() {
+			return "failed", 7 // wave-0 child fails
+		}
+		return "ok", 0
+	})
+	withFakeSpawn(t, spawn)
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	// Only wave 0's child was dispatched; wave 1 never ran.
+	if out.DispatchedCount != 1 {
+		t.Errorf("dispatched_count = %d, want 1 (wave 1 never dispatched)", out.DispatchedCount)
+	}
+	mu.Lock()
+	_, child1Ran := baseByID[child1.String()]
+	mu.Unlock()
+	if child1Ran {
+		t.Error("wave-1 child was dispatched despite a wave-0 failure; the partial-wave guard did not stop the loop")
+	}
+	fb.mu.Lock()
+	calls := fb.integrateWaveCalledBy[parent]
+	fb.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("integrate-wave calls = %d, want 0 (no integration of a partial wave)", calls)
+	}
+	if !containsWarning(out.Warnings, "did not succeed") {
+		t.Errorf("warnings = %v, want one mentioning the failed wave", out.Warnings)
+	}
+}
+
+// TestRunChildren_SliceConflictStopsLoop (verification mode 11): a slice_conflict
+// returned by integrate-wave stops the loop — wave 1 is not dispatched — and the
+// conflict is surfaced as a warning.
+func TestRunChildren_SliceConflictStopsLoop(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child0, child1 := uuid.New(), uuid.New()
+	seedChildRun(fb, child0, "pending")
+	seedChildRun(fb, child1, "pending")
+	seedPlanDecomposedWaves(fb, parent, []string{child0.String(), child1.String()}, 0, [][]int{{0}, {1}})
+
+	fb.mu.Lock()
+	fb.integrateWaveResp[parent] = IntegrateWaveResult{
+		RunID:                 parent.String(),
+		Outcome:               "slice_conflict",
+		ConflictingSliceIndex: intPtr(0),
+		ConflictingChildRunID: child0.String(),
+		Detail:                "slice integration conflict: slice 0",
+	}
+	fb.mu.Unlock()
+
+	spawn, baseByID, mu := captureBaseSpawn(nil)
+	withFakeSpawn(t, spawn)
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if out.DispatchedCount != 1 {
+		t.Errorf("dispatched_count = %d, want 1 (wave 1 not dispatched after a conflict)", out.DispatchedCount)
+	}
+	mu.Lock()
+	_, child1Ran := baseByID[child1.String()]
+	mu.Unlock()
+	if child1Ran {
+		t.Error("wave-1 child dispatched despite a slice_conflict; the loop did not stop")
+	}
+	if !containsWarning(out.Warnings, "slice conflict") {
+		t.Errorf("warnings = %v, want one mentioning the slice conflict", out.Warnings)
+	}
+}
+
+// TestRunChildren_EmptyConsolidatedBranchKeepsBase (verification mode 12): an
+// empty consolidated_branch from integrate-wave (the GitHub-not-wired graceful
+// skip) leaves the next wave's --base-branch unchanged (main) and warns rather
+// than dispatching against an empty ref.
+func TestRunChildren_EmptyConsolidatedBranchKeepsBase(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child0, child1 := uuid.New(), uuid.New()
+	seedChildRun(fb, child0, "pending")
+	seedChildRun(fb, child1, "pending")
+	seedPlanDecomposedWaves(fb, parent, []string{child0.String(), child1.String()}, 0, [][]int{{0}, {1}})
+
+	fb.mu.Lock()
+	fb.integrateWaveResp[parent] = IntegrateWaveResult{
+		RunID:              parent.String(),
+		Outcome:            "integrated",
+		ConsolidatedBranch: "", // graceful-skip: GitHub not wired
+	}
+	fb.mu.Unlock()
+
+	spawn, baseByID, mu := captureBaseSpawn(nil)
+	withFakeSpawn(t, spawn)
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if out.DispatchedCount != 2 {
+		t.Errorf("dispatched_count = %d, want 2 (both waves still dispatch)", out.DispatchedCount)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got := baseByID[child1.String()]; got != "main" {
+		t.Errorf("wave-1 child --base-branch = %q, want main unchanged (empty consolidated_branch must not blank the base)", got)
+	}
+	if !containsWarning(out.Warnings, "empty consolidated_branch") {
+		t.Errorf("warnings = %v, want one mentioning the empty consolidated_branch", out.Warnings)
+	}
+}
+
+// TestRunChildren_WaveIndexOutOfRange asserts a waves index that does not address
+// a child is a loud tool error, never a silent skip.
+func TestRunChildren_WaveIndexOutOfRange(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child0 := uuid.New()
+	seedChildRun(fb, child0, "pending")
+	// waves references index 1 but there is only one child (index 0).
+	seedPlanDecomposedWaves(fb, parent, []string{child0.String()}, 0, [][]int{{0}, {1}})
+
+	withFakeSpawn(t, func(_ context.Context, _ string, _, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		return completedEvents("ok"), nil, 0, nil
+	})
+
+	_, _, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err == nil {
+		t.Fatal("expected a tool error for an out-of-range waves index")
+	}
+	if !strings.Contains(err.Error(), "out of range") {
+		t.Errorf("error = %v, want one mentioning an out-of-range waves index", err)
+	}
+}
+
+// containsWarning reports whether any warning contains substr.
+func containsWarning(warnings []string, substr string) bool {
+	for _, w := range warnings {
+		if strings.Contains(w, substr) {
+			return true
+		}
+	}
+	return false
+}
+
 // --- cross-boundary integration: real fishhawk-runner subprocesses ---
 
 // gitRunT runs a git command in dir, failing the test on error.
@@ -807,5 +1122,197 @@ func TestRunChildren_CrossBoundary_SpawnsRealRunners(t *testing.T) {
 	}
 	if strings.TrimSpace(string(statusOut)) != "" {
 		t.Errorf("operator tree not clean after parallel children:\n%s", statusOut)
+	}
+}
+
+// TestRunChildren_CrossBoundary_TwoWaveStopsOnRealChildFailure is the 2-wave
+// dependency-ordered cross-boundary proof through REAL fishhawk-runner
+// subprocesses (#1278 slice B). It seeds a depends_on decomposition whose
+// plan_decomposed waves are [[0],[1]] — slice 1 depends on slice 0 — and drives
+// the real run_children wave loop. Wave 0's child spawns an actual runner
+// subprocess (its per-child worktree IS provisioned, proving the wave loop flows
+// MCP → runner → git-worktree) but its agent fails (the fake `claude` exits
+// non-zero), so the PARTIAL-WAVE GUARD stops the loop BEFORE integrate-wave is
+// called and BEFORE wave 1 dispatches — wave 1's child gets no worktree.
+//
+// NOTE ON SCOPE: the literal "wave 1 sees wave 0's MERGED symbol → non-empty
+// compiling commit" half of the cross-boundary requirement is INFEASIBLE in a
+// hermetic test. The runner hard-codes the GitHub HTTPS remote for both the
+// child slice-branch push and the wave-N base fetch (main.go ~4673), and a
+// decomposed child that produces no changes reports `failed` category C (main.go
+// ~4846) — so a decomposed child can NEVER reach an `ok` outcome locally without
+// a real GitHub, which means wave 0 can never succeed and wave 1's merged-base
+// dispatch is unobservable through real subprocesses. The merged-base
+// visibility only exists in the dogfood/prod posture where GitHub is wired. The
+// base-PASSING contract (wave 1 dispatched with --base-branch == the
+// consolidated branch) is fully and deterministically proven by the unit wave
+// tests (TestRunChildren_TwoWaveDispatch et al.); this test proves the
+// wave-ordering + real-runner spawn + partial-wave guard end-to-end.
+func TestRunChildren_CrossBoundary_TwoWaveStopsOnRealChildFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the fishhawk-runner binary and spawns real subprocesses")
+	}
+	for _, tool := range []string{"go", "git"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not available", tool)
+		}
+	}
+
+	// (1) Build the real fishhawk-runner.
+	_, thisFile, _, _ := runtime.Caller(0)
+	runnerDir := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "runner", "cmd", "fishhawk-runner")
+	runnerBin := filepath.Join(t.TempDir(), "fishhawk-runner")
+	build := exec.Command("go", "build", "-o", runnerBin, ".")
+	build.Dir = runnerDir
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build fishhawk-runner: %v\n%s", err, out)
+	}
+
+	// (2) A fake `claude` that exits non-zero: a deterministic agent failure
+	// AFTER the runner provisions wave 0's worktree.
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "claude"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// (3) Operator git repo with a seed commit.
+	repo := t.TempDir()
+	gitRunT(t, repo, "init", "-q")
+	if err := os.WriteFile(filepath.Join(repo, "seed.txt"), []byte("seed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunT(t, repo, "add", "-A")
+	gitRunT(t, repo, "commit", "-q", "-m", "seed")
+
+	parent := uuid.New()
+	child0, child1 := uuid.New(), uuid.New()
+	stage0, stage1 := uuid.New(), uuid.New()
+	stageByChild := map[string]string{
+		child0.String(): stage0.String(),
+		child1.String(): stage1.String(),
+	}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writeJSON := func(w http.ResponseWriter, status int, v any) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(v)
+	}
+
+	var integrateWaveCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/signing-key", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"run_id":      r.PathValue("run_id"),
+			"public_key":  base64.StdEncoding.EncodeToString(pub),
+			"private_key": base64.StdEncoding.EncodeToString(priv),
+			"issued_at":   time.Now().UTC(),
+			"expires_at":  time.Now().Add(time.Hour).UTC(),
+		})
+	})
+	mux.HandleFunc("GET /v0/stages/{stage_id}/prompt", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"stage_type":             "implement",
+			"prompt":                 "do the slice work",
+			"prompt_hash":            "sha256:test",
+			"decomposed_from_run_id": parent.String(),
+		})
+	})
+	mux.HandleFunc("POST /v0/runs/{run_id}/trace", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"run_id": r.PathValue("run_id"), "stage_id": "", "variant": "redacted", "content_hash": "x",
+		})
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, Run{ID: r.PathValue("run_id"), State: "pending", Repo: "x/y"})
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}/stages", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("run_id")
+		sid, ok := stageByChild[id]
+		if !ok {
+			writeJSON(w, http.StatusOK, listStagesResult{})
+			return
+		}
+		writeJSON(w, http.StatusOK, listStagesResult{Items: []Stage{
+			{ID: sid, RunID: id, Type: "implement", State: "pending"},
+		}})
+	})
+	// plan_decomposed carries the topological waves [[0],[1]] — slice 1 depends
+	// on slice 0.
+	mux.HandleFunc("GET /v0/runs/{run_id}/audit", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("category") != "plan_decomposed" {
+			writeJSON(w, http.StatusOK, listAuditResult{})
+			return
+		}
+		writeJSON(w, http.StatusOK, listAuditResult{Items: []AuditEntry{{
+			ID: uuid.NewString(), Sequence: 1, RunID: r.PathValue("run_id"), Category: "plan_decomposed",
+			Payload: map[string]any{
+				"child_run_ids":          []string{child0.String(), child1.String()},
+				"effective_max_parallel": 2,
+				"waves":                  [][]int{{0}, {1}},
+			},
+		}}})
+	})
+	// integrate-wave: count calls. The partial-wave guard must ensure this is
+	// NEVER reached (wave 0's child failed).
+	mux.HandleFunc("POST /v0/runs/{run_id}/integrate-wave", func(w http.ResponseWriter, r *http.Request) {
+		integrateWaveCalls.Add(1)
+		writeJSON(w, http.StatusOK, IntegrateWaveResult{RunID: r.PathValue("run_id"), Outcome: "integrated"})
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{})
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv: func(string) string { return "" },
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	_, out, err := r.runChildren(ctx, nil, RunChildrenInput{
+		RunID:        parent.String(),
+		Workflow:     "wf",
+		WorkingDir:   repo,
+		GitHubRepo:   "x/y",
+		RunnerBinary: runnerBin,
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+
+	// Only wave 0's child was dispatched; the partial-wave guard stopped before
+	// wave 1.
+	if out.DispatchedCount != 1 {
+		t.Errorf("dispatched_count = %d, want 1 (wave 1 never dispatched after wave 0's child failed)", out.DispatchedCount)
+	}
+	if got := integrateWaveCalls.Load(); got != 0 {
+		t.Errorf("integrate-wave calls = %d, want 0 (no integration of a failed wave)", got)
+	}
+
+	// Wave 0's child spawned a REAL runner (its per-child worktree exists);
+	// wave 1's child did NOT (the guard stopped the loop).
+	wtRoot := filepath.Join(repo, ".git", "fishhawk-worktrees")
+	worktrees := map[string]bool{}
+	if entries, derr := os.ReadDir(wtRoot); derr == nil {
+		for _, e := range entries {
+			if e.IsDir() && strings.HasPrefix(e.Name(), "run-") {
+				worktrees[e.Name()] = true
+			}
+		}
+	}
+	wave0WT := "run-" + child0.String()[:8]
+	wave1WT := "run-" + child1.String()[:8]
+	if !worktrees[wave0WT] {
+		t.Errorf("wave-0 child worktree %s missing (real runner did not provision it): have %v", wave0WT, worktrees)
+	}
+	if worktrees[wave1WT] {
+		t.Errorf("wave-1 child worktree %s present, but the guard should have stopped before dispatching wave 1: have %v", wave1WT, worktrees)
 	}
 }

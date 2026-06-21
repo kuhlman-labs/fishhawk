@@ -338,6 +338,152 @@ func TestAdvance_FanoutDecomposedPlan(t *testing.T) {
 	}
 }
 
+// subPlanSpec is a sub_plan title plus its depends_on edges, used by
+// decomposedPlanBytesWithDeps to build a dependency-bearing decomposition.
+type subPlanSpec struct {
+	title     string
+	dependsOn []int
+}
+
+// decomposedPlanBytesWithDeps mirrors decomposedPlanBytes but threads a
+// depends_on array onto each sub_plan so the orchestrator's plan.Waves call
+// produces multi-index waves (#1258 slice B).
+func decomposedPlanBytesWithDeps(t *testing.T, specs []subPlanSpec) []byte {
+	t.Helper()
+	subs := make([]map[string]any, 0, len(specs))
+	for _, sp := range specs {
+		m := map[string]any{
+			"title":                        sp.title,
+			"scope_hint":                   "scope hint for " + sp.title,
+			"predicted_runtime_minutes":    10,
+			"predicted_runtime_confidence": "high",
+		}
+		if len(sp.dependsOn) > 0 {
+			m["depends_on"] = sp.dependsOn
+		}
+		subs = append(subs, m)
+	}
+	body := map[string]any{
+		"plan_version": "standard_v1",
+		"ticket_reference": map[string]any{
+			"type": "github_issue",
+			"url":  "https://github.com/example/repo/issues/1",
+			"id":   "example/repo#1",
+		},
+		"generated_by": map[string]any{
+			"agent":     "claude-code",
+			"model":     "claude-opus-4-7",
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		},
+		"summary": "test plan with dependency-ordered decomposition",
+		"scope": map[string]any{
+			"files": []map[string]any{{"path": "x.go", "operation": "create"}},
+		},
+		"approach":                     []map[string]any{{"step": 1, "description": "do it"}},
+		"verification":                 map[string]any{"test_strategy": "run tests", "rollback_plan": "revert"},
+		"predicted_runtime_minutes":    100,
+		"predicted_runtime_confidence": "medium",
+		"decomposition": map[string]any{
+			"rationale": "test decomposition rationale",
+			"sub_plans": subs,
+		},
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	return b
+}
+
+// decodePlanDecomposedWaves runs a fanout from the given plan bytes and returns
+// the waves field of the emitted plan_decomposed audit payload.
+func decodePlanDecomposedWaves(t *testing.T, planBytes []byte) [][]int {
+	t.Helper()
+	rs := newFanoutRunsRepo()
+	parent, stages := rs.seed(t, "example/repo", nil, []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, ExecutorRef: "human", State: run.StageStatePending},
+	})
+	planStage := stages[0]
+	schemaV := "standard_v1"
+	arts := &fakeArtifacts{
+		byStage: map[uuid.UUID][]*artifact.Artifact{
+			planStage.ID: {{
+				ID:            uuid.New(),
+				StageID:       planStage.ID,
+				Kind:          artifact.KindPlan,
+				SchemaVersion: &schemaV,
+				Content:       planBytes,
+				CreatedAt:     time.Now().UTC(),
+			}},
+		},
+	}
+	au := &recordingAudit{}
+	o := &Orchestrator{Runs: rs, Logger: slog.Default(), Artifacts: arts, Audit: au}
+	if _, err := o.Advance(context.Background(), parent.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	if len(au.appended) != 1 || au.appended[0].Category != "plan_decomposed" {
+		t.Fatalf("want 1 plan_decomposed entry, got %+v", au.appended)
+	}
+	var payload struct {
+		Waves [][]int `json:"waves"`
+	}
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal plan_decomposed payload: %v", err)
+	}
+	return payload.Waves
+}
+
+// TestAdvance_FanoutPlanDecomposedWaves_DependsOn asserts a depends_on
+// decomposition's plan_decomposed payload carries the ordered topological
+// waves: A (no deps) in wave 0, B and C (both depend on A) in wave 1.
+func TestAdvance_FanoutPlanDecomposedWaves_DependsOn(t *testing.T) {
+	planBytes := decomposedPlanBytesWithDeps(t, []subPlanSpec{
+		{title: "Part A"},
+		{title: "Part B", dependsOn: []int{0}},
+		{title: "Part C", dependsOn: []int{0}},
+	})
+	waves := decodePlanDecomposedWaves(t, planBytes)
+	want := [][]int{{0}, {1, 2}}
+	if !equalIntWaves(waves, want) {
+		t.Errorf("waves = %v, want %v", waves, want)
+	}
+}
+
+// TestAdvance_FanoutPlanDecomposedWaves_NoDependsOn asserts a no-depends_on
+// decomposition's plan_decomposed payload carries a single all-indices wave —
+// the back-compat collapse that the run_children loop dispatches as one
+// concurrent wave and never integrate-waves.
+func TestAdvance_FanoutPlanDecomposedWaves_NoDependsOn(t *testing.T) {
+	planBytes := decomposedPlanBytes(t, []string{"Part A", "Part B", "Part C"})
+	waves := decodePlanDecomposedWaves(t, planBytes)
+	want := [][]int{{0, 1, 2}}
+	if !equalIntWaves(waves, want) {
+		t.Errorf("waves = %v, want %v", waves, want)
+	}
+}
+
+func equalIntWaves(a, b [][]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if len(a[i]) != len(b[i]) {
+			return false
+		}
+		for j := range a[i] {
+			if a[i][j] != b[i][j] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func TestAdvance_FanoutSkippedWhenChildrenExist(t *testing.T) {
 	// #1063: a fix-up on a decomposed parent re-opens its implement stage to
 	// pending. Re-entering Advance must NOT re-mint a fresh fan-out — the
