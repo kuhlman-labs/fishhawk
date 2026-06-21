@@ -82,6 +82,24 @@ func seedPushOpenPRStages(repo *approvalRunRepo, reviewState run.StageState) (*r
 	return impl, review
 }
 
+// failNextRunRepo wraps approvalRunRepo to fail the next N GetRun calls
+// (then fall through to the embedded repo), so a test can simulate a
+// TRANSIENT run-read failure on the fix-up model gate's GetRun (#1164)
+// while FixupStage's own subsequent GetRun succeeds. Kept here in the
+// fix-up test scope rather than on the shared approvalRunRepo.
+type failNextRunRepo struct {
+	*approvalRunRepo
+	getRunFailNext int
+}
+
+func (r *failNextRunRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	if r.getRunFailNext > 0 {
+		r.getRunFailNext--
+		return nil, errors.New("transient get-run failure")
+	}
+	return r.approvalRunRepo.GetRun(ctx, id)
+}
+
 func postFixup(t *testing.T, s *Server, stageID uuid.UUID, body fixupRequest) *httptest.ResponseRecorder {
 	t.Helper()
 	raw, _ := json.Marshal(body)
@@ -298,6 +316,82 @@ func TestFixupStage_ImplementModelEmptyLadderPinned(t *testing.T) {
 	}
 	if payload["fixup_model_source"] != string(ModelSourceNone) {
 		t.Errorf("fixup_model_source = %v, want empty (none)", payload["fixup_model_source"])
+	}
+}
+
+// TestFixupStage_ImplementModelGetRunFailOpenNoOverride covers the #1164
+// run-read-failure fail-open path with NO operator override: when the model
+// gate's GetRun fails transiently and no implement_model was supplied, the
+// fix-up must NOT pin an empty model. Pinning an empty value would be honored
+// by the presence-based read-back (fixupResolvedModelFromAudit) as a deliberate
+// empty-ladder pin and force the fix-up to spawn with an EMPTY model instead of
+// the run's already-resolved implement model. So the fixup_model / source keys
+// must be ABSENT — the read-back then returns ok=false and falls through to
+// live resolution. The transition still lands (the gate is best-effort).
+func TestFixupStage_ImplementModelGetRunFailOpenNoOverride(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	s.cfg.ImplementModelDefault = "claude-opus-4-8"
+	// Fail ONLY the model gate's GetRun; FixupStage's own subsequent GetRun
+	// succeeds so the transition still commits.
+	fr := &failNextRunRepo{approvalRunRepo: repo, getRunFailNext: 1}
+	s.cfg.RunRepo = fr
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityLow, Category: "style", Note: "naming nit"},
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (fail-open):\n%s", w.Code, w.Body.String())
+	}
+	// The transition still landed despite the model-gate read failure.
+	var body stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.State != string(run.StageStatePending) {
+		t.Errorf("body.State = %q, want pending", body.State)
+	}
+	payload := latestFixupTriggeredPayload(t, au)
+	// No pin: the keys must be ABSENT so the read-back falls through to live
+	// resolution rather than honoring a present-but-empty empty-ladder pin.
+	if _, ok := payload["fixup_model"]; ok {
+		t.Errorf("fixup_model key present (=%v); want absent on the no-override run-read-failure path", payload["fixup_model"])
+	}
+	if _, ok := payload["fixup_model_source"]; ok {
+		t.Errorf("fixup_model_source key present (=%v); want absent on the no-override run-read-failure path", payload["fixup_model_source"])
+	}
+}
+
+// TestFixupStage_ImplementModelGetRunFailOpenWithOverride covers the #1164
+// run-read-failure fail-open path WITH an operator override: the gate cannot
+// validate against the allow-list (no run → no adapter), so it skips
+// checkFixupModelAllowed and pins the override verbatim as {value, operator}.
+// This is the one place a normally-rejected model slips through — an override
+// absent from the configured allow-list is NOT 422-rejected here. Assert the
+// pin records the operator intent so the prompt-fetch read-back honors it.
+func TestFixupStage_ImplementModelGetRunFailOpenWithOverride(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	// A configured allow-list that OMITS the override — on the normal path
+	// this is the 422 reject covered by TestFixupStage_ImplementModelOverrideDisallowed.
+	s.cfg.ImplementAllowedModels = AllowedModels{"claudecode": {"claude-opus-4-8": true}}
+	fr := &failNextRunRepo{approvalRunRepo: repo, getRunFailNext: 1}
+	s.cfg.RunRepo = fr
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityLow, Category: "style", Note: "naming nit"},
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ImplementModel: "some-unlisted-model"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (fail-open skips allow-list validation):\n%s", w.Code, w.Body.String())
+	}
+	payload := latestFixupTriggeredPayload(t, au)
+	if payload["fixup_model"] != "some-unlisted-model" {
+		t.Errorf("fixup_model = %v, want the override pinned verbatim (validation skipped)", payload["fixup_model"])
+	}
+	if payload["fixup_model_source"] != string(ModelSourceOperator) {
+		t.Errorf("fixup_model_source = %v, want operator", payload["fixup_model_source"])
 	}
 }
 
