@@ -4058,14 +4058,124 @@ func TestRun_ImplementStage_DecomposedChild_NoChanges_ReportsFailedCategoryC(t *
 	if !strings.Contains(fu.gotPRArgs.Reason, "child_no_changes") {
 		t.Errorf("report reason = %q, want it to name child_no_changes", fu.gotPRArgs.Reason)
 	}
+	// slice 0 keeps the genuine-no-op / planning-decomposition-error framing
+	// (condition 3); it must NOT emit the dependent-slice recovery.
+	if !strings.Contains(fu.gotPRArgs.Reason, "planning/decomposition error") {
+		t.Errorf("report reason = %q, want the planning/decomposition-error framing for slice 0", fu.gotPRArgs.Reason)
+	}
+	if strings.Contains(fu.gotPRArgs.Reason, "fishhawk_consolidate_slices") {
+		t.Errorf("report reason = %q, slice 0 must not name the dependent-slice consolidate recovery", fu.gotPRArgs.Reason)
+	}
 	for _, want := range []string{
 		`"event":"implement_child_no_changes"`,
 		`"shared_branch":"fishhawk/run-aaaaaaaa/slice-0"`,
 		`"base_sha":"base"`,
+		`"slice_index":0`,
 		`"event":"pull_request_failure_reported"`,
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Errorf("missing %s in child no-changes emission:\n%s", want, stderr.String())
+		}
+	}
+}
+
+// TestRun_ImplementStage_DecomposedChild_NoChanges_DependentSlice_ReportsActionableC
+// drives the same no-changes decomposed-child path with runSliceIndex=2 (a
+// dependent slice). The terminalization contract is unchanged (outcome failed,
+// category C, literal child_no_changes token), but the reason is now the
+// position-aware dependent-slice diagnostic: it must convey the FULL predecessor
+// set (slices 0..1) and name the fishhawk_consolidate_slices recovery (#1258
+// slice C / #1279, condition 1). The log event carries the additive
+// "slice_index":2 field.
+func TestRun_ImplementStage_DecomposedChild_NoChanges_DependentSlice_ReportsActionableC(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	withFakeRemoteBranchExists(t, false)
+	fu := newFakeUploader(t)
+	// run() sets runSliceIndex from the fetched prompt's slice_index, so the
+	// dependent-slice position is driven through the prompt, not the package var.
+	prompt := decomposedChildPromptResp()
+	prompt.SliceIndex = 2
+	fu.promptResp = prompt
+	withFakeUploader(t, fu)
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base"}}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+	t.Cleanup(func() { runSliceIndex = 0 })
+
+	var stderr strings.Builder
+	if got := runDecomposedChildStage(t, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest (failed report) must be called for a no-changes dependent-slice child (#1036)")
+	}
+	if fu.gotPRArgs.Outcome != "failed" {
+		t.Errorf("report outcome = %q, want %q", fu.gotPRArgs.Outcome, "failed")
+	}
+	if fu.gotPRArgs.Category != "C" {
+		t.Errorf("report category = %q, want %q (retryable)", fu.gotPRArgs.Category, "C")
+	}
+	// The literal token + category C are load-bearing on BOTH branches
+	// (condition 2). The dependent-slice reason additionally conveys the FULL
+	// predecessor SET (slices 0 and 1, i.e. 0..1) and the consolidate recovery.
+	for _, want := range []string{
+		"child_no_changes",
+		"0..1",
+		"fishhawk_consolidate_slices",
+	} {
+		if !strings.Contains(fu.gotPRArgs.Reason, want) {
+			t.Errorf("report reason = %q, want it to contain %q (full predecessor set + recovery)", fu.gotPRArgs.Reason, want)
+		}
+	}
+	for _, want := range []string{
+		`"event":"implement_child_no_changes"`,
+		`"shared_branch":"fishhawk/run-aaaaaaaa/slice-2"`,
+		`"slice_index":2`,
+		`"event":"pull_request_failure_reported"`,
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("missing %s in dependent-slice no-changes emission:\n%s", want, stderr.String())
+		}
+	}
+}
+
+// TestChildNoChangesReason is a focused unit table over the pure helper,
+// isolating each branch's distinct text from the stage-driving harness (#1258
+// slice C / #1279). Every index keeps the always-present child_no_changes token
+// (condition 2); slice 0 keeps the planning/decomposition-error framing
+// (condition 3); slices >0 convey the full predecessor set 0..N-1 and the
+// consolidate recovery (condition 1).
+func TestChildNoChangesReason(t *testing.T) {
+	for _, tc := range []struct {
+		sliceIndex int
+		dependent  bool   // expect the dependent-slice framing
+		predSet    string // the explicit predecessor-set phrasing for dependent slices
+	}{
+		{sliceIndex: 0, dependent: false},
+		{sliceIndex: 1, dependent: true, predSet: "0..0"},
+		{sliceIndex: 2, dependent: true, predSet: "0..1"},
+	} {
+		reason := childNoChangesReason(tc.sliceIndex)
+		if !strings.Contains(reason, "child_no_changes") {
+			t.Errorf("index %d: reason = %q, want the always-present child_no_changes token", tc.sliceIndex, reason)
+		}
+		if tc.dependent {
+			for _, want := range []string{tc.predSet, "fishhawk_consolidate_slices"} {
+				if !strings.Contains(reason, want) {
+					t.Errorf("index %d: reason = %q, want dependent-slice framing to contain %q", tc.sliceIndex, reason, want)
+				}
+			}
+			if strings.Contains(reason, "planning/decomposition error") {
+				t.Errorf("index %d: reason = %q, dependent slice must not use the planning-error framing", tc.sliceIndex, reason)
+			}
+		} else {
+			if !strings.Contains(reason, "planning/decomposition error") {
+				t.Errorf("index %d: reason = %q, want the slice-0 planning/decomposition-error framing", tc.sliceIndex, reason)
+			}
+			if strings.Contains(reason, "fishhawk_consolidate_slices") {
+				t.Errorf("index %d: reason = %q, slice 0 must not name the dependent-slice recovery", tc.sliceIndex, reason)
+			}
 		}
 	}
 }
