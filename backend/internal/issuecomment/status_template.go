@@ -137,6 +137,11 @@ var activityCategories = map[string]struct{}{
 	// living-anchor timeline reflects whether the slices integrated cleanly.
 	"slices_integrated":          {},
 	"slice_integration_conflict": {},
+	// Implement-model resolution at the plan gate (#1013). The operator-gate
+	// slice emits this when a plan-stage approve resolves the implement model;
+	// surfacing it lets the issue thread show which model (and which rung)
+	// will drive the implement stage.
+	"model_resolved": {},
 }
 
 // renderActivityLine returns a user-readable verb-phrase for an
@@ -175,6 +180,8 @@ func renderActivityLine(e *audit.Entry) string {
 		return "Slices integrated"
 	case "slice_integration_conflict":
 		return "Slice integration conflict"
+	case "model_resolved":
+		return renderModelResolvedLine(e.Payload)
 	default:
 		if actor == "" {
 			return e.Category
@@ -265,6 +272,39 @@ func approvalDecisionVerb(payload json.RawMessage) string {
 		return "rejected"
 	}
 	return "acted on"
+}
+
+// renderModelResolvedLine renders a model_resolved activity row (#1013):
+// "Implement model resolved: `<model>` (source: <rung>)". An empty model is
+// the deliberate default spawn — rendered as "(adapter default)" so the
+// timeline reads honestly rather than showing an empty code span. Falls back
+// to a bare verb on an unparseable payload.
+func renderModelResolvedLine(payload json.RawMessage) string {
+	model, source := decodeModelResolved(payload)
+	if model == "" {
+		return "Implement model resolved: adapter default"
+	}
+	if source == "" {
+		return fmt.Sprintf("Implement model resolved: `%s`", model)
+	}
+	return fmt.Sprintf("Implement model resolved: `%s` (source: %s)", model, source)
+}
+
+// decodeModelResolved reads the {model, model_source} payload the approval
+// gate stamps on a model_resolved entry (ResolvedModel's json tags). Returns
+// ("", "") on any decode failure.
+func decodeModelResolved(payload json.RawMessage) (model, source string) {
+	if len(payload) == 0 {
+		return "", ""
+	}
+	var p struct {
+		Model       string `json:"model"`
+		ModelSource string `json:"model_source"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return "", ""
+	}
+	return p.Model, p.ModelSource
 }
 
 func retryAttemptSuffix(payload json.RawMessage) string {

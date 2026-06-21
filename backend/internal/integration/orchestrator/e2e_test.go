@@ -38,6 +38,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/childcompletion"
@@ -1640,4 +1641,229 @@ func TestDecomposition_E2E_CategoryBChildRecoverInPlace(t *testing.T) {
 	if reviewStage.State == runpkg.StageStatePending {
 		t.Errorf("parent review stage = pending, want advanced (dispatched) — parent did not progress toward consolidation after re-drive")
 	}
+}
+
+// modelLadderWorkflowSpec declares workflow "feature_change" with plan +
+// implement stages whose implement executor uses agent claude-code (mapping to
+// the claudecode allow-list adapter). Used by the #1013 cross-boundary test.
+var modelLadderWorkflowSpec = []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`)
+
+// planWithModelRecommendation builds a small (under-budget) standard_v1 plan
+// JSON, optionally carrying model_recommendation.implement_model.
+func planWithModelRecommendation(t *testing.T, implementModel string) []byte {
+	t.Helper()
+	body := map[string]any{
+		"plan_version": "standard_v1",
+		"ticket_reference": map[string]any{
+			"type": "github_issue",
+			"url":  "https://github.com/example/repo/issues/1",
+			"id":   "example/repo#1",
+		},
+		"generated_by": map[string]any{
+			"agent":     "claude-code",
+			"model":     "claude-opus-4-7",
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		},
+		"summary": "model-ladder cross-boundary test plan",
+		"scope": map[string]any{
+			"files": []map[string]any{{"path": "x.go", "operation": "create"}},
+		},
+		"approach":                     []map[string]any{{"step": 1, "description": "do it"}},
+		"verification":                 map[string]any{"test_strategy": "run tests", "rollback_plan": "revert"},
+		"predicted_runtime_minutes":    5,
+		"predicted_runtime_confidence": "high",
+	}
+	if implementModel != "" {
+		body["model_recommendation"] = map[string]any{
+			"implement_model":     implementModel,
+			"rationale":           "complexity-informed",
+			"complexity_assessed": "high",
+		}
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	return b
+}
+
+// seedApprovablePlanRun creates a run carrying modelLadderWorkflowSpec with a
+// plan stage parked at awaiting_approval and the given plan artifact attached,
+// plus an implement stage. Returns the run id and plan stage id.
+func seedApprovablePlanRun(t *testing.T, ctx context.Context, runRepo runpkg.Repository, artifactRepo artifact.Repository, planBytes []byte) (uuid.UUID, uuid.UUID) {
+	t.Helper()
+	r, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: runpkg.TriggerCLI,
+		WorkflowSpec:  modelLadderWorkflowSpec,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	planStage, err := runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            r.ID,
+		Sequence:         0,
+		Type:             runpkg.StageTypePlan,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "claude-code",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage plan: %v", err)
+	}
+	if _, err = runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:        r.ID,
+		Sequence:     1,
+		Type:         runpkg.StageTypeImplement,
+		ExecutorKind: runpkg.ExecutorAgent,
+		ExecutorRef:  "claude-code",
+	}); err != nil {
+		t.Fatalf("CreateStage implement: %v", err)
+	}
+	// Drive the plan stage to awaiting_approval so the approve transitions it.
+	for _, to := range []runpkg.StageState{
+		runpkg.StageStateDispatched,
+		runpkg.StageStateRunning,
+		runpkg.StageStateAwaitingApproval,
+	} {
+		if _, err := runRepo.TransitionStage(ctx, planStage.ID, to, nil); err != nil {
+			t.Fatalf("TransitionStage plan to %s: %v", to, err)
+		}
+	}
+	sum := sha256.Sum256(planBytes)
+	contentHash := hex.EncodeToString(sum[:])
+	schemaV := "standard_v1"
+	if _, err := artifactRepo.Create(ctx, artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &schemaV,
+		Content:       planBytes,
+		ContentHash:   contentHash,
+	}); err != nil {
+		t.Fatalf("Create artifact: %v", err)
+	}
+	return r.ID, planStage.ID
+}
+
+// TestModelGate_E2E_CrossBoundary drives the #1013 cross-boundary seam against
+// a real Postgres backend: an approval-request wire (POST /v0/stages/{id}/
+// approvals carrying implement_model) -> the server gate/resolver (ladder
+// resolution + allow-list validation) -> audit persistence (the model_resolved
+// entry) -> the runner-spawn routing contract (the {model, model_source} json
+// the slice-1 reader gateResolvedModel consumes to set the runner --model).
+//
+// It asserts: (a) an operator implement_model override over a plan
+// recommendation resolves to source=operator and persists the byte-identical
+// model_resolved payload the runner spawn routes through; (b) absence of any
+// recommendation/override yields the byte-identical empty baseline
+// (model_source=none, empty model -> no --model, today's spawn).
+func TestModelGate_E2E_CrossBoundary(t *testing.T) {
+	pool := startPostgres(t)
+	ctx := context.Background()
+
+	runRepo := runpkg.NewPostgresRepository(pool)
+	artifactRepo := artifact.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	approvalRepo := approval.NewPostgresRepository(pool)
+	apiRepo := apitoken.NewPostgresRepository(pool)
+
+	tok, err := apiRepo.Issue(ctx, "brett@e2e-test", []string{"read:runs", "read:audit", "write:approvals", "write:stages"})
+	if err != nil {
+		t.Fatalf("Issue operator token: %v", err)
+	}
+
+	srv := server.New(server.Config{
+		Addr:                   "127.0.0.1:0",
+		RunRepo:                runRepo,
+		ArtifactRepo:           artifactRepo,
+		AuditRepo:              auditRepo,
+		ApprovalRepo:           approvalRepo,
+		APITokenRepo:           apiRepo,
+		ImplementAllowedModels: server.AllowedModels{"claudecode": {"claude-opus-4-8": true}},
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	postApprove := func(t *testing.T, stageID uuid.UUID, bodyJSON string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost,
+			httpSrv.URL+"/v0/stages/"+stageID.String()+"/approvals",
+			bytes.NewReader([]byte(bodyJSON)))
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+tok.PlainText)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST approvals: %v", err)
+		}
+		return resp
+	}
+
+	readResolved := func(t *testing.T, runID uuid.UUID) (string, string) {
+		t.Helper()
+		entries, err := auditRepo.ListForRunByCategory(ctx, runID, "model_resolved")
+		if err != nil {
+			t.Fatalf("ListForRunByCategory model_resolved: %v", err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("model_resolved entries = %d, want exactly 1", len(entries))
+		}
+		var p struct {
+			Model       string `json:"model"`
+			ModelSource string `json:"model_source"`
+		}
+		if err := json.Unmarshal(entries[0].Payload, &p); err != nil {
+			t.Fatalf("unmarshal model_resolved payload: %v", err)
+		}
+		return p.Model, p.ModelSource
+	}
+
+	// (a) Operator override over a (different) plan recommendation: resolves to
+	// source=operator with the allow-listed value; persisted byte-identically.
+	t.Run("operator override routes to the runner spawn", func(t *testing.T) {
+		runID, planStageID := seedApprovablePlanRun(t, ctx, runRepo, artifactRepo,
+			planWithModelRecommendation(t, "claude-sonnet-4-6"))
+		resp := postApprove(t, planStageID, `{"decision":"approve","implement_model":"claude-opus-4-8"}`)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status = %d, want 200:\n%s", resp.StatusCode, string(b))
+		}
+		model, source := readResolved(t, runID)
+		if model != "claude-opus-4-8" || source != "operator" {
+			t.Fatalf("model_resolved = {%q,%q}, want {claude-opus-4-8,operator}", model, source)
+		}
+	})
+
+	// (b) No recommendation, no override: byte-identical empty baseline.
+	t.Run("no recommendation yields empty baseline (no --model)", func(t *testing.T) {
+		runID, planStageID := seedApprovablePlanRun(t, ctx, runRepo, artifactRepo,
+			planWithModelRecommendation(t, ""))
+		resp := postApprove(t, planStageID, `{"decision":"approve"}`)
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status = %d, want 200:\n%s", resp.StatusCode, string(b))
+		}
+		model, source := readResolved(t, runID)
+		if model != "" || source != "" {
+			t.Fatalf("model_resolved = {%q,%q}, want {\"\",\"\"} (empty baseline -> no --model)", model, source)
+		}
+	})
 }

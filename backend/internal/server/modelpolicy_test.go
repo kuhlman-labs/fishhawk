@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 // gateAuditFake returns canned model_resolved entries (or an error) so the
@@ -280,6 +281,141 @@ func TestPlanModelRecommendationFromBytes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := planModelRecommendationFromBytes([]byte(tt.content)); got != tt.want {
 				t.Fatalf("planModelRecommendationFromBytes() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGateResolveImplementModel_OperatorPrecedence(t *testing.T) {
+	specWithModel := []byte(`
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          model: spec-model
+`)
+	tests := []struct {
+		name       string
+		deflt      string
+		spec       []byte
+		operator   string
+		wantValue  string
+		wantSource ModelSource
+	}{
+		{
+			name: "operator override wins over spec",
+			spec: specWithModel, operator: "operator-model",
+			wantValue: "operator-model", wantSource: ModelSourceOperator,
+		},
+		{
+			name: "spec wins when no operator",
+			spec: specWithModel, operator: "",
+			wantValue: "spec-model", wantSource: ModelSourceSpec,
+		},
+		{
+			name:  "deployment default wins when only rung",
+			deflt: "default-model", spec: nil, operator: "",
+			wantValue: "default-model", wantSource: ModelSourceDefault,
+		},
+		{
+			name:  "operator wins over default with no spec",
+			deflt: "default-model", spec: nil, operator: "  operator-model  ",
+			wantValue: "operator-model", wantSource: ModelSourceOperator,
+		},
+		{
+			name:  "all empty yields none (today's spawn)",
+			deflt: "", spec: nil, operator: "",
+			wantValue: "", wantSource: ModelSourceNone,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := New(Config{ImplementModelDefault: tt.deflt})
+			runRow := &run.Run{WorkflowID: "feature_change", WorkflowSpec: tt.spec}
+			// ArtifactRepo is nil → planImplementModelRecommendation yields "".
+			got := s.gateResolveImplementModel(context.Background(), runRow, tt.operator)
+			if got.Value != tt.wantValue || got.Source != tt.wantSource {
+				t.Fatalf("gateResolveImplementModel = {%q,%q}, want {%q,%q}",
+					got.Value, got.Source, tt.wantValue, tt.wantSource)
+			}
+		})
+	}
+}
+
+func TestAdapterForImplementAgent(t *testing.T) {
+	tests := []struct {
+		agent string
+		want  string
+	}{
+		{"", "claudecode"},
+		{"claude-code", "claudecode"},
+		{"claudecode", "claudecode"},
+		{"  claude-code  ", "claudecode"},
+		{"codex", "codex"},
+		{"anthropic", "anthropic"},
+		{"future-agent", "future-agent"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.agent, func(t *testing.T) {
+			if got := adapterForImplementAgent(tt.agent); got != tt.want {
+				t.Fatalf("adapterForImplementAgent(%q) = %q, want %q", tt.agent, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSpecImplementExecutorAgent(t *testing.T) {
+	specByID := []byte(`
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: planner
+      - id: implement
+        type: implement
+        executor:
+          agent: codex
+`)
+	specByType := []byte(`
+workflows:
+  feature_change:
+    stages:
+      - id: impl-stage
+        type: implement
+        executor:
+          agent: claude-code
+`)
+	specNoAgent := []byte(`
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          model: x
+`)
+	tests := []struct {
+		name       string
+		spec       []byte
+		workflowID string
+		want       string
+	}{
+		{"matched by stage id", specByID, "feature_change", "codex"},
+		{"matched by stage type when id differs", specByType, "feature_change", "claude-code"},
+		{"implement stage declares no agent", specNoAgent, "feature_change", ""},
+		{"unknown workflow id", specByID, "nonexistent", ""},
+		{"empty spec bytes", nil, "feature_change", ""},
+		{"malformed yaml degrades to empty", []byte("\t\tnot: [valid"), "feature_change", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := specImplementExecutorAgent(tt.spec, tt.workflowID); got != tt.want {
+				t.Fatalf("specImplementExecutorAgent() = %q, want %q", got, tt.want)
 			}
 		})
 	}

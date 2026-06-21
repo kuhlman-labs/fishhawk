@@ -368,6 +368,29 @@ Notes:
   decomposed parent's integration phase (`integrated` /
   `integration_conflict`) and surface `consolidated_branch` /
   `conflicting_child_run_id`.
+- The implement-model resolution audit kind — `model_resolved` (#1013) — is
+  **INTRODUCED by the operator-gate slice** as the source-tagged record of the
+  implement model the plan gate resolved, and it ALSO appears in the
+  living-anchor / status-comment surfaces. The approval handler
+  (`server/approvals.go::handleSubmitApproval` → `writeModelResolvedAudit`) is
+  the SOLE writer: on a valid plan-stage approve it resolves the ladder
+  (deployment default < spec `executor.model` < plan `model_recommendation` <
+  the `implement_model` operator override), validates the resolved value against
+  the deployment allow-list (rejecting `422 plan_invalid_model` pre-Submit on an
+  unknown model), and writes ONE entry with payload `{model, model_source}`
+  (`ResolvedModel`'s json tags; `model_source` ∈ default|spec|plan|operator, or
+  empty for the deliberate default spawn). The slice-1 reader
+  (`modelpolicy.go::gateResolvedModel`) consumes the most-recent entry to route
+  the runner spawn's `--model`; the trace/calibration path deliberately never
+  emits it (trace surface-sweep guard). On the issue thread it renders
+  **data-drivenly** through the `activityCategories` set in `status_template.go`
+  ("Implement model resolved: `<model>` (source: `<rung>`)", or "adapter
+  default" for an empty resolution), which both `RenderStatusBody` and
+  `renderAnchorTimeline` consume; the anchor additionally renders a dedicated
+  "**Implement model**" block (`anchor_template.go::renderResolvedModel`) and the
+  plan's `model_recommendation` (implement_model + rationale) under the plan
+  section. Best-effort: a nil `Audit` or append failure logs and never unwinds
+  the approval the gate already recorded.
 - The bounded-retry give-up audit kind — `slice_integration_failed` (#1243) —
   is a **system-actor audit kind with no dedicated Notifier method and is NOT
   an issue-comment surface**. The child-completion sweeper

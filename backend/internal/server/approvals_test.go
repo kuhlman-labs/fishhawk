@@ -1450,6 +1450,242 @@ func TestSubmitApproval_BudgetCheck_OverBudgetNoDecompNoOverride_Returns422(t *t
 	}
 }
 
+// --- Model gate (#1013) -------------------------------------------------
+
+// specImplementAgentModel builds a workflow "w" spec whose implement stage
+// declares the given executor.agent and (optionally) executor.model. Mirrors
+// the orchestratorRepo.seedRun WorkflowID "w".
+func specImplementAgentModel(agent, model string) []byte {
+	var modelLine string
+	if model != "" {
+		modelLine = "\n          model: " + model
+	}
+	return []byte(`version: "0.3"
+workflows:
+  w:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+      - id: implement
+        type: implement
+        executor:
+          agent: ` + agent + modelLine + `
+`)
+}
+
+// newModelGateServer mirrors newBudgetCheckServer but wires an allow-list and
+// deployment default so the model gate (#1013) is exercisable end to end.
+func newModelGateServer(t *testing.T, art artifact.Repository, allow AllowedModels, deflt string) (*Server, *orchestratorRepo, *approvalAuditFake, *fakeApprovalRepo) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	app := newFakeApprovalRepo()
+	au := newApprovalAuditFake()
+	o := &orchestrator.Orchestrator{Runs: rr}
+	s := New(Config{
+		Addr:                   "127.0.0.1:0",
+		ApprovalRepo:           app,
+		RunRepo:                rr,
+		AuditRepo:              au,
+		Orchestrator:           o,
+		ArtifactRepo:           art,
+		ImplementAllowedModels: allow,
+		ImplementModelDefault:  deflt,
+	})
+	return s, rr, au, app
+}
+
+// planWithRecommendation returns a small (under-budget) standard_v1 plan whose
+// model_recommendation.implement_model is the given model (omitted when empty).
+func planWithRecommendation(implementModel string) *plan.Plan {
+	p := &plan.Plan{
+		PlanVersion:             "standard_v1",
+		PredictedRuntimeMinutes: 5, // under the 15m default budget
+	}
+	if implementModel != "" {
+		p.ModelRecommendation = &plan.ModelRecommendation{
+			ImplementModel:     implementModel,
+			Rationale:          "complexity-informed",
+			ComplexityAssessed: plan.ComplexityHigh,
+		}
+	}
+	return p
+}
+
+// findModelResolvedPayload returns the decoded ResolvedModel from the single
+// model_resolved audit entry, failing when zero or more than one exists.
+func findModelResolvedPayload(t *testing.T, appended []audit.ChainAppendParams) ResolvedModel {
+	t.Helper()
+	var found *ResolvedModel
+	for _, e := range appended {
+		if e.Category != CategoryModelResolved {
+			continue
+		}
+		if found != nil {
+			t.Fatalf("expected exactly one model_resolved entry, got more than one")
+		}
+		var rm ResolvedModel
+		if err := json.Unmarshal(e.Payload, &rm); err != nil {
+			t.Fatalf("unmarshal model_resolved payload: %v", err)
+		}
+		found = &rm
+	}
+	if found == nil {
+		t.Fatalf("expected a model_resolved audit entry, got %+v", appended)
+	}
+	return *found
+}
+
+// TestSubmitApproval_ModelGate_RejectedSources covers binding condition 1: an
+// unknown RESOLVED model is rejected 422 plan_invalid_model at the gate, with
+// the message naming the resolved source — for EACH of the four rungs
+// (default, spec, plan, operator), not just the operator field. A 422 must
+// insert no approval row and emit no model_resolved audit.
+func TestSubmitApproval_ModelGate_RejectedSources(t *testing.T) {
+	allow := AllowedModels{"claudecode": {"good-model": true}}
+	tests := []struct {
+		name       string
+		deflt      string
+		specModel  string
+		planModel  string
+		operator   string
+		wantSource string
+	}{
+		{name: "operator source rejected", operator: "bad-op", wantSource: "operator"},
+		{name: "plan source rejected", planModel: "bad-plan", wantSource: "plan"},
+		{name: "spec source rejected", specModel: "bad-spec", wantSource: "spec"},
+		{name: "default source rejected", deflt: "bad-default", wantSource: "default"},
+		{
+			// Operator override wins even over a plan recommendation, so an
+			// invalid operator value is the rejected source despite a (valid)
+			// plan rung below it.
+			name:      "operator override rejected over a valid plan rung",
+			planModel: "good-model", operator: "bad-op", wantSource: "operator",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			art := newFakeArtifactRepo()
+			s, rr, au, app := newModelGateServer(t, art, allow, tt.deflt)
+			r, stage := seedBudgetRun(t, rr, art, planWithRecommendation(tt.planModel))
+			r.WorkflowSpec = specImplementAgentModel("claude-code", tt.specModel)
+
+			body := `{"decision":"approve"}`
+			if tt.operator != "" {
+				body = fmt.Sprintf(`{"decision":"approve","implement_model":%q}`, tt.operator)
+			}
+			w := submitApproval(t, s, stage.ID, body)
+			if w.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), `"plan_invalid_model"`) {
+				t.Errorf("body missing plan_invalid_model: %s", w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), `"model_source":"`+tt.wantSource+`"`) {
+				t.Errorf("body missing model_source=%s: %s", tt.wantSource, w.Body.String())
+			}
+			// PRE-Submit: no approval row, stage unchanged.
+			if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+				t.Errorf("approval rows after 422 = %d (err=%v), want 0", len(rows), err)
+			}
+			if stage.State != run.StageStateAwaitingApproval {
+				t.Errorf("stage.State = %q, want awaiting_approval", stage.State)
+			}
+			for _, e := range au.appended {
+				if e.Category == CategoryModelResolved || e.Category == "approval_submitted" {
+					t.Errorf("unexpected %s audit entry after a 422", e.Category)
+				}
+			}
+		})
+	}
+}
+
+// TestSubmitApproval_ModelGate_AcceptedSources covers the audit-payload
+// assertion for ALL FOUR sources: an allowed RESOLVED model approves (200) and
+// the emitted model_resolved entry carries the correct {value, source}.
+func TestSubmitApproval_ModelGate_AcceptedSources(t *testing.T) {
+	allow := AllowedModels{"claudecode": {
+		"m-default": true, "m-spec": true, "m-plan": true, "m-operator": true,
+	}}
+	tests := []struct {
+		name       string
+		deflt      string
+		specModel  string
+		planModel  string
+		operator   string
+		wantValue  string
+		wantSource ModelSource
+	}{
+		{name: "default source", deflt: "m-default", wantValue: "m-default", wantSource: ModelSourceDefault},
+		{name: "spec source", specModel: "m-spec", wantValue: "m-spec", wantSource: ModelSourceSpec},
+		{name: "plan source", planModel: "m-plan", wantValue: "m-plan", wantSource: ModelSourcePlan},
+		{name: "operator source", operator: "m-operator", wantValue: "m-operator", wantSource: ModelSourceOperator},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			art := newFakeArtifactRepo()
+			s, rr, au, _ := newModelGateServer(t, art, allow, tt.deflt)
+			r, stage := seedBudgetRun(t, rr, art, planWithRecommendation(tt.planModel))
+			r.WorkflowSpec = specImplementAgentModel("claude-code", tt.specModel)
+
+			body := `{"decision":"approve"}`
+			if tt.operator != "" {
+				body = fmt.Sprintf(`{"decision":"approve","implement_model":%q}`, tt.operator)
+			}
+			w := submitApproval(t, s, stage.ID, body)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			if stage.State != run.StageStateSucceeded {
+				t.Errorf("stage.State = %q, want succeeded", stage.State)
+			}
+			rm := findModelResolvedPayload(t, au.appended)
+			if rm.Value != tt.wantValue || rm.Source != tt.wantSource {
+				t.Errorf("model_resolved = {%q,%q}, want {%q,%q}", rm.Value, rm.Source, tt.wantValue, tt.wantSource)
+			}
+		})
+	}
+}
+
+// TestSubmitApproval_ModelGate_FailOpenEmptyAllowlist covers binding condition
+// 2: an empty/unconfigured allow-list accepts ANY model (byte-identical to
+// today). The override still resolves + records as model_resolved.
+func TestSubmitApproval_ModelGate_FailOpenEmptyAllowlist(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newModelGateServer(t, art, nil, "") // nil allow-list
+	_, st := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+
+	w := submitApproval(t, s, st.ID, `{"decision":"approve","implement_model":"any-unlisted-model"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (fail-open empty allow-list):\n%s", w.Code, w.Body.String())
+	}
+	rm := findModelResolvedPayload(t, au.appended)
+	if rm.Value != "any-unlisted-model" || rm.Source != ModelSourceOperator {
+		t.Errorf("model_resolved = {%q,%q}, want {any-unlisted-model,operator}", rm.Value, rm.Source)
+	}
+}
+
+// TestSubmitApproval_ModelGate_EmptyResolutionStillEmits covers binding
+// condition 4: with no default, spec model, plan recommendation, or operator
+// override, the resolution is empty (ModelSourceNone) and STILL emits a
+// model_resolved entry recording the deliberate default spawn — byte-identical
+// to today's no-`--model` spawn (the slice-1 reader returns it as none/ok).
+func TestSubmitApproval_ModelGate_EmptyResolutionStillEmits(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newModelGateServer(t, art, nil, "")
+	_, stage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	rm := findModelResolvedPayload(t, au.appended)
+	if rm.Value != "" || rm.Source != ModelSourceNone {
+		t.Errorf("model_resolved = {%q,%q}, want {\"\",none}", rm.Value, rm.Source)
+	}
+}
+
 func TestSubmitApproval_BudgetCheck_OverBudgetWithDecomp_Proceeds(t *testing.T) {
 	// Plan is over-budget but includes a decomposition block → proceed (200).
 	art := newFakeArtifactRepo()

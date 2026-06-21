@@ -71,6 +71,54 @@ func TestRenderAnchorBody_SliceIntegrationTimeline(t *testing.T) {
 	}
 }
 
+// TestRenderAnchorBody_ModelRecommendationAndResolved pins #1013: the anchor
+// renders the plan's model_recommendation (implement_model + rationale) under
+// the plan, and the gate's resolved model_resolved {value, source} as a
+// dedicated block.
+func TestRenderAnchorBody_ModelRecommendationAndResolved(t *testing.T) {
+	resolved, _ := json.Marshal(map[string]any{"model": "claude-opus-4-8", "model_source": "operator"})
+	body := RenderAnchorBody(AnchorInput{
+		Run:    anchorRun(),
+		Stages: []*run.Stage{{Type: run.StageTypePlan, State: run.StageStateSucceeded}},
+		CurrentPlan: &AnchorPlanView{
+			Summary:                 "Resolve the implement model at the gate.",
+			RecommendedModel:        "claude-sonnet-4-6",
+			RecommendationRationale: "medium complexity",
+		},
+		Audit: []*audit.Entry{
+			{Sequence: 9, Category: "model_resolved", Payload: resolved, Timestamp: time.Unix(9, 0).UTC()},
+		},
+		ExternalURL: "https://app.example",
+		Now:         time.Unix(1000, 0).UTC(),
+	})
+	if !strings.Contains(body, "Model recommendation: `claude-sonnet-4-6`") {
+		t.Errorf("anchor should render the plan model recommendation: %q", body)
+	}
+	if !strings.Contains(body, "medium complexity") {
+		t.Errorf("anchor should render the recommendation rationale: %q", body)
+	}
+	if !strings.Contains(body, "**Implement model** — `claude-opus-4-8` (source: operator)") {
+		t.Errorf("anchor should render the resolved model block: %q", body)
+	}
+}
+
+// TestRenderAnchorBody_ModelResolvedEmptyDefaultSpawn covers the empty
+// resolution: the gate recorded a model_resolved with no model (the deliberate
+// default spawn), and the anchor states it honestly rather than omitting it.
+func TestRenderAnchorBody_ModelResolvedEmptyDefaultSpawn(t *testing.T) {
+	resolved, _ := json.Marshal(map[string]any{"model": "", "model_source": ""})
+	body := RenderAnchorBody(AnchorInput{
+		Run:         anchorRun(),
+		Stages:      []*run.Stage{{Type: run.StageTypeImplement, State: run.StageStateRunning}},
+		Audit:       []*audit.Entry{{Sequence: 3, Category: "model_resolved", Payload: resolved, Timestamp: time.Unix(3, 0).UTC()}},
+		ExternalURL: "https://app.example",
+		Now:         time.Unix(1000, 0).UTC(),
+	})
+	if !strings.Contains(body, "**Implement model** — adapter default") {
+		t.Errorf("anchor should render the empty resolution as adapter default: %q", body)
+	}
+}
+
 func TestRenderAnchorBody_HeaderAndWhatNow(t *testing.T) {
 	body := RenderAnchorBody(AnchorInput{
 		Run:         anchorRun(),
