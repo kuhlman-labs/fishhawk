@@ -225,11 +225,14 @@ Required array with at least two entries. Each entry is a `SubPlanSummary`:
 | `title` | string (1–200 chars) | yes | Must be unique within the array |
 | `scope_hint` | string | yes | What this sub-plan covers |
 | `scope` | `{ "files": [...] }` object | no | The files THIS slice will touch. Same shape as the top-level `scope`. |
+| `depends_on` | array of integers ≥ 0 | no | 0-based indices of sibling `sub_plans` this slice depends on. Omitted/empty = no dependency (first wave). |
 | `predicted_runtime_minutes` | integer ≥ 1 | yes | Estimate for this sub-plan's implement stage |
 | `predicted_runtime_confidence` | `"low"` / `"medium"` / `"high"` | yes | Confidence in the sub-plan estimate |
 | `model_recommendation` | `{ implement_model, rationale, complexity_assessed }` object | no | This slice's per-child model recommendation. Same shape as the top-level `model_recommendation`; resolved through the same chokepoint at the child's plan gate. |
 
 When `scope` is present, the decomposition fan-out child minted for this sub-plan uses the sub-plan's `scope.files` — rather than the parent plan's full `scope.files` — for its implement-stage `scope_handoff` (commit bounding) and scope-drift detection. This keeps each child bounded to its own slice instead of the whole parent change. When `scope` is omitted, the child falls back to the parent plan's full `scope.files` (the pre-existing behavior).
+
+**`depends_on` and dispatch waves (#1258).** Each sub-plan may declare `depends_on`: a list of 0-based indices into the same `sub_plans` array naming the sibling slices it must run after. The plan package derives the dispatch order with `plan.Waves`, a deterministic Kahn topological sort: wave 0 holds every slice with no unsatisfied dependency, and each subsequent wave holds the slices whose dependencies all landed in an earlier wave. Within a wave, indices are ordered ascending. A decomposition that declares no `depends_on` anywhere collapses to a single wave containing every slice (back-compat: today's parallel fan-out). A `depends_on` index that is out of range (`< 0` or `≥ len(sub_plans)`), self-referential (a slice depending on its own index), or part of a dependency cycle is rejected at the plan gate as a `*SemanticError`. No downstream dispatch consumes the waves yet — wave-ordered `run_children` dispatch lands separately (slice B, #1278).
 
 **Runtime-sum invariant**: the validator warns (but does not reject) when the sum of `sub_plans[*].predicted_runtime_minutes` is less than the parent `predicted_runtime_minutes`. The agent may legitimately compress work when breaking it into smaller pieces; the soft warning surfaces the gap for human review.
 
@@ -266,6 +269,7 @@ JSON Schema enforces structure. The validator (E1.5 / #20) layers on:
 - `generated_by.agent` matches the workflow spec's `executor.agent` for the active stage.
 - `decomposition.sub_plans[*].title` must be unique within the array (semantic check in the plan package; returns `*SemanticError` on violation).
 - A file path may appear in at most one sub-plan's `scope.files` within a decomposition. A path scoped by two or more slices returns `*SemanticError` (semantic check in the plan package), because the orchestrator partitions per-slice `scope.files` for commit bounding and scope-drift detection — the non-owning slice's edit to a shared file would be drift-excluded and silently shipped inert (#1062). The planner must re-slice so all edits to one file live in a single slice. Only sub-plans that declare a `scope` are checked; an omitted sub-plan `scope` inherits the parent's full `scope.files` and cannot partition unsoundly.
+- `decomposition.sub_plans[*].depends_on` must form a valid DAG: every index in `[0, len(sub_plans))`, never self-referential, and free of cycles. `plan.Waves` validates this and returns `*SemanticError` on violation (#1258). The waves it derives are not yet consumed by dispatch (slice B, #1278).
 
 These cross-references aren't expressible in JSON Schema cleanly.
 

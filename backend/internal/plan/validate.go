@@ -262,7 +262,19 @@ func semanticCheck(p *Plan) error {
 		}
 		seen[sp.Title] = struct{}{}
 	}
-	return checkCrossSliceSharedFiles(p.Decomposition)
+	if err := checkCrossSliceSharedFiles(p.Decomposition); err != nil {
+		return err
+	}
+	// Reject a malformed depends_on DAG (out-of-range/negative/self index or a
+	// dependency cycle) at the plan gate (#1258). Waves is pure and lives in
+	// this package, so call it directly; a non-decomposed plan never reaches
+	// here (guarded above).
+	if _, err := Waves(p.Decomposition); err != nil {
+		return &SemanticError{
+			Message: fmt.Sprintf("decomposition.sub_plans: invalid depends_on: %v", err),
+		}
+	}
+	return nil
 }
 
 // checkCrossSliceSharedFiles rejects a decomposition whose sub-plans

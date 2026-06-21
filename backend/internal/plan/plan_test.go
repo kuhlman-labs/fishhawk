@@ -648,6 +648,194 @@ func TestParse_DecompositionSingleSliceRepeatedPath_Succeeds(t *testing.T) {
 	}
 }
 
+// --- depends_on / plan.Waves (#1258) ---
+
+// subPlanDep builds a minimal sub_plans entry with an optional depends_on.
+// A nil deps slice omits the field entirely (additive-optional path).
+func subPlanDep(title string, deps []int) map[string]any {
+	sp := map[string]any{
+		"title": title, "scope_hint": title,
+		"predicted_runtime_minutes": 5, "predicted_runtime_confidence": "low",
+	}
+	if deps != nil {
+		anyDeps := make([]any, len(deps))
+		for i, d := range deps {
+			anyDeps[i] = d
+		}
+		sp["depends_on"] = anyDeps
+	}
+	return sp
+}
+
+// decompositionWith wraps the given sub_plans entries in a plan fixture.
+func decompositionWith(subPlans ...map[string]any) []byte {
+	entries := make([]any, len(subPlans))
+	for i, sp := range subPlans {
+		entries[i] = sp
+	}
+	m := planfixture.Valid(func(m map[string]any) {
+		m["decomposition"] = map[string]any{
+			"rationale": "split with dependencies",
+			"sub_plans": entries,
+		}
+	})
+	b, _ := json.Marshal(m)
+	return b
+}
+
+// TestParse_DependsOn_RoundTrips covers the additive depends_on field: a
+// decomposition whose sub_plans carry depends_on validates and decodes into
+// the typed SubPlanSummary.DependsOn, while a sibling that omits it decodes to
+// a nil slice (additive-optional).
+func TestParse_DependsOn_RoundTrips(t *testing.T) {
+	data := decompositionWith(
+		subPlanDep("A", nil),
+		subPlanDep("B", nil),
+		subPlanDep("C", []int{0, 1}),
+	)
+	p, err := plan.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	subs := p.Decomposition.SubPlans
+	if subs[0].DependsOn != nil {
+		t.Errorf("sub_plans[0].DependsOn = %v, want nil (field omitted)", subs[0].DependsOn)
+	}
+	if got, want := subs[2].DependsOn, []int{0, 1}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("sub_plans[2].DependsOn = %v, want %v", got, want)
+	}
+}
+
+// TestWaves_BackCompat_SingleWave covers the back-compat collapse: a
+// decomposition with no depends_on anywhere yields a single wave containing
+// every index in ascending order.
+func TestWaves_BackCompat_SingleWave(t *testing.T) {
+	d := &plan.Decomposition{SubPlans: []plan.SubPlanSummary{
+		{Title: "A"}, {Title: "B"}, {Title: "C"},
+	}}
+	waves, err := plan.Waves(d)
+	if err != nil {
+		t.Fatalf("Waves: %v", err)
+	}
+	if got, want := waves, [][]int{{0, 1, 2}}; !equalWaves(got, want) {
+		t.Errorf("Waves = %v, want %v", got, want)
+	}
+}
+
+// TestWaves_MultiWaveDAG covers the happy multi-wave path: independent 0 and 1,
+// 2 depends on 0, and 3 depends on 1 and 2 layers into [[0,1],[2],[3]].
+func TestWaves_MultiWaveDAG(t *testing.T) {
+	d := &plan.Decomposition{SubPlans: []plan.SubPlanSummary{
+		{Title: "A"},
+		{Title: "B"},
+		{Title: "C", DependsOn: []int{0}},
+		{Title: "D", DependsOn: []int{1, 2}},
+	}}
+	waves, err := plan.Waves(d)
+	if err != nil {
+		t.Fatalf("Waves: %v", err)
+	}
+	if got, want := waves, [][]int{{0, 1}, {2}, {3}}; !equalWaves(got, want) {
+		t.Errorf("Waves = %v, want %v", got, want)
+	}
+}
+
+// TestWaves_NilAndEmpty covers the defensive guard: a nil decomposition and an
+// empty sub_plans list both return (nil, nil).
+func TestWaves_NilAndEmpty(t *testing.T) {
+	if waves, err := plan.Waves(nil); err != nil || waves != nil {
+		t.Errorf("Waves(nil) = (%v, %v), want (nil, nil)", waves, err)
+	}
+	if waves, err := plan.Waves(&plan.Decomposition{}); err != nil || waves != nil {
+		t.Errorf("Waves(empty) = (%v, %v), want (nil, nil)", waves, err)
+	}
+}
+
+// TestParse_DependsOn_Cycle_IsSemanticError covers cycle detection: 0 depends
+// on 1 and 1 depends on 0 is rejected as a *SemanticError naming the cyclic
+// indices.
+func TestParse_DependsOn_Cycle_IsSemanticError(t *testing.T) {
+	data := decompositionWith(
+		subPlanDep("A", []int{1}),
+		subPlanDep("B", []int{0}),
+	)
+	_, err := plan.Parse(data)
+	var se *plan.SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SemanticError", err)
+	}
+	if !strings.Contains(se.Error(), "cycle") {
+		t.Errorf("SemanticError message should mention a cycle, got %q", se.Error())
+	}
+}
+
+// TestParse_DependsOn_OutOfRange_IsSemanticError covers the out-of-range guard:
+// a depends_on index >= len(sub_plans) is rejected as a *SemanticError.
+func TestParse_DependsOn_OutOfRange_IsSemanticError(t *testing.T) {
+	data := decompositionWith(
+		subPlanDep("A", nil),
+		subPlanDep("B", []int{99}),
+	)
+	_, err := plan.Parse(data)
+	var se *plan.SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SemanticError", err)
+	}
+	if !strings.Contains(se.Error(), "out of range") {
+		t.Errorf("SemanticError message should mention out of range, got %q", se.Error())
+	}
+}
+
+// TestParse_DependsOn_SelfIndex_IsSemanticError covers the self-dependency
+// guard: a node depending on its own index is rejected as a *SemanticError.
+func TestParse_DependsOn_SelfIndex_IsSemanticError(t *testing.T) {
+	data := decompositionWith(
+		subPlanDep("A", []int{0}),
+		subPlanDep("B", nil),
+	)
+	_, err := plan.Parse(data)
+	var se *plan.SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SemanticError", err)
+	}
+	if !strings.Contains(se.Error(), "itself") {
+		t.Errorf("SemanticError message should mention self-dependency, got %q", se.Error())
+	}
+}
+
+// TestParse_DependsOn_NegativeIndex_IsSchemaError confirms a negative index is
+// caught structurally by the schema (items minimum 0), surfacing as a
+// *SchemaError rather than reaching the semantic Waves check.
+func TestParse_DependsOn_NegativeIndex_IsSchemaError(t *testing.T) {
+	data := decompositionWith(
+		subPlanDep("A", nil),
+		subPlanDep("B", []int{-1}),
+	)
+	_, err := plan.Parse(data)
+	var se *plan.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
+// equalWaves reports whether two wave slices are element-wise equal.
+func equalWaves(a, b [][]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if len(a[i]) != len(b[i]) {
+			return false
+		}
+		for j := range a[i] {
+			if a[i][j] != b[i][j] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // --- Warnings ---
 
 func TestWarnings_SubPlanSumLessThanParent_Explicit(t *testing.T) {
@@ -964,7 +1152,7 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // unchanged through the plan-only Validate entry point (asserted below),
 // which is the proof the change did not break the schema in place.
 func TestPlanSchemaFrozen(t *testing.T) {
-	const wantHash = "38b5362c45f4a84189500edecfea3e0616a3dd7b2468cb42acacd6da8c678933"
+	const wantHash = "ec31a64b33bd131bb8bc9cea4175bccf2ff9ac57f722d7baf88fd496dba2f9e3"
 	b, err := os.ReadFile("schemas/plan-standard-v1.schema.json")
 	if err != nil {
 		t.Fatalf("read embedded plan schema: %v", err)

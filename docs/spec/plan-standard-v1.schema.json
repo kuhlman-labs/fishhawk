@@ -224,6 +224,11 @@
           "$ref": "#/$defs/scope",
           "description": "Optional. The files THIS sub-plan's slice will touch. When present, the decomposition fan-out child for this sub-plan narrows its run scope (scope_handoff commit bounding and scope-drift detection) to these files instead of inheriting the parent plan's full scope.files. Omitted means the child inherits the parent's full scope."
         },
+        "depends_on": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 },
+          "description": "0-based indices of sibling sub_plans this slice depends on; run_children dispatches in topological waves (omitted/empty = no dependency, first wave)."
+        },
         "predicted_runtime_minutes": {
           "type": "integer",
           "minimum": 1,
