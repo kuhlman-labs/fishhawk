@@ -64,6 +64,19 @@ type approvalRequest struct {
 	// pre-Submit via validateBindingAssertions — no enforcement happens at
 	// approve time, only declaration validation.
 	BindingAssertions []bindingAssertion `json:"binding_assertions,omitempty"`
+	// ImplementModel is the OPTIONAL operator override for the implement
+	// stage's model (#1013) — the highest rung of the implement-model
+	// resolution ladder (deployment default < spec executor.model < plan
+	// model_recommendation < this operator override). On a plan-stage
+	// approve the gate resolves the full ladder with this as the operator
+	// rung, validates the RESOLVED non-empty value against
+	// ImplementAllowedModels.IsAllowed for the run's adapter (rejecting 422
+	// plan_invalid_model, naming the resolved source, on an unknown model),
+	// and emits the source-tagged model_resolved audit the runner spawn
+	// routes through. Empty (the default) leaves resolution to the lower
+	// rungs and stays byte-identical to today. Declared here so the
+	// DisallowUnknownFields decode accepts it; callers omit it (omitempty).
+	ImplementModel string `json:"implement_model,omitempty"`
 	// Delegated opts the submission into the ADR-040 delegated-action
 	// path (#1026): the operator agent asserts it acts under the
 	// workflow's operator_agent.may_approve knob. The server NEVER
@@ -260,6 +273,16 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// normally through Submit → advanceStage. A post-Submit gate would
 	// strand the stage on the idempotent-first-wins retry (Submit would
 	// return Inserted=false and skip the advance block).
+	//
+	// resolvedModel, when non-nil, carries the source-tagged implement
+	// model the model gate resolved on this plan-stage approve. It is
+	// emitted as the model_resolved audit AFTER Submit+advance succeed
+	// (the slice-1 reader routes it to the runner spawn). nil means no
+	// emission — either a non-plan/reject path, or the gate read the run
+	// row failed (fail-open: proceed, but emit nothing so the prompt path
+	// falls through to live resolution rather than a shadowing empty
+	// audit).
+	var resolvedModel *ResolvedModel
 	if decision == approval.DecisionApprove && stage.Type == run.StageTypePlan {
 		if !s.checkPlanReviewSettled(w, r, stage) {
 			return
@@ -286,6 +309,18 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		if !s.checkPlanBudget(w, r, stage, req.Comment) {
 			return
 		}
+		// Model gate (#1013): resolve the implement-model ladder with the
+		// operator override as the highest rung, then validate the RESOLVED
+		// non-empty value against the per-adapter allow-list. PRE-Submit for
+		// the same ADR-036 reason as its siblings: a 422 must insert no row
+		// so a corrected re-approval flows normally. Fail-OPEN: an
+		// empty/unconfigured allow-list accepts any model (IsAllowed). On a
+		// pass, rm carries the resolution to emit post-advance.
+		rm, ok := s.checkPlanModelAllowed(w, r, stage, req.ImplementModel)
+		if !ok {
+			return
+		}
+		resolvedModel = rm
 	}
 
 	// ADR-017 (#249, #253): the approval handler no longer gates on
@@ -334,6 +369,19 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeApprovalAudit(r, stage, res.Approval, req.Comment, req.ApproverGithubLogin, req.AddScopeFiles, req.BindingAssertions, delegatedRule)
+
+	// Model resolution (#1013): emit the source-tagged model_resolved audit
+	// the gate computed on this plan-stage approve — the INTRODUCTION of the
+	// model_resolved kind (CategoryModelResolved). The slice-1 reader
+	// (gateResolvedModel) consumes the most-recent entry to route the runner
+	// spawn's --model. Emitted even when the resolution is empty
+	// (ModelSourceNone): the reader returns it as a deliberate "use the
+	// default spawn" decision, byte-identical to today's no---model spawn.
+	// Best-effort like writeApprovalAudit — a logged failure never unwinds
+	// the approval.
+	if resolvedModel != nil {
+		s.writeModelResolvedAudit(r, stage, res.Approval, *resolvedModel)
+	}
 
 	// Hand off to the orchestrator on both approve AND reject
 	// — approve dispatches the next stage; reject walks the
@@ -683,6 +731,85 @@ func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *appr
 		Payload:      payload,
 	}); err != nil {
 		s.cfg.Logger.Error("audit append failed for approval",
+			"run_id", stage.RunID,
+			"stage_id", stage.ID,
+			"error", err.Error(),
+		)
+	}
+}
+
+// checkPlanModelAllowed is the plan-stage model gate (#1013). It resolves the
+// implement-model ladder with req.ImplementModel as the operator rung, then
+// validates the RESOLVED non-empty value against the run adapter's allow-list.
+// Returns (*ResolvedModel, true) to proceed — the pointer is the resolution to
+// emit as model_resolved after Submit+advance. Returns (nil, false) after
+// writing a 422 plan_invalid_model when the resolved model is non-empty and the
+// adapter's configured allow-set omits it; the message names the resolved
+// SOURCE (default|spec|plan|operator), so an unknown plan- or spec-recommended
+// model — not just the operator field — is caught here rather than at runner
+// spawn. A deployment default outside its own allow-list is likewise a config
+// error surfaced as 422 source=default (the gate validates the resolved value
+// regardless of which rung supplied it).
+//
+// Fail-OPEN, matching the sibling plan gates:
+//   - GetRun failure returns (nil, true): proceed, but emit NOTHING (a nil
+//     pointer), so the prompt path falls through to live resolution rather
+//     than a shadowing empty model_resolved audit.
+//   - An empty/unconfigured allow-list (or an adapter with no set) accepts any
+//     model via IsAllowed — byte-identical to today.
+//   - An empty resolved model (ModelSourceNone) skips the allow-list check and
+//     proceeds; the emitted entry records the deliberate default spawn.
+func (s *Server) checkPlanModelAllowed(w http.ResponseWriter, r *http.Request, stage *run.Stage, operatorModel string) (*ResolvedModel, bool) {
+	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "model gate: get run failed",
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil, true
+	}
+	rm := s.gateResolveImplementModel(r.Context(), runRow, operatorModel)
+	if rm.Value == "" {
+		// Empty resolution: today's default spawn. Nothing to validate.
+		return &rm, true
+	}
+	adapter := adapterForImplementAgent(specImplementExecutorAgent(runRow.WorkflowSpec, runRow.WorkflowID))
+	if s.cfg.ImplementAllowedModels.IsAllowed(adapter, rm.Value) {
+		return &rm, true
+	}
+	s.writeError(w, r, http.StatusUnprocessableEntity, "plan_invalid_model",
+		fmt.Sprintf("resolved implement model %q (source %s) is not in the configured allow-list for adapter %q; choose an allowed model via the spec executor.model, the plan model_recommendation, or the implement_model approval override, or widen the deployment allow-list",
+			rm.Value, rm.Source, adapter),
+		map[string]any{
+			"stage_id":     stage.ID.String(),
+			"model":        rm.Value,
+			"model_source": string(rm.Source),
+			"adapter":      adapter,
+		})
+	return nil, false
+}
+
+// writeModelResolvedAudit emits the source-tagged model_resolved audit entry
+// (CategoryModelResolved, #1013) recording the implement model the gate
+// resolved on a valid plan-stage approve. The payload is the ResolvedModel's
+// {model, model_source} json shape the slice-1 reader (gateResolvedModel)
+// consumes to route the runner spawn. Actor attribution mirrors
+// writeApprovalAudit (the acting subject selects agent vs user). Best-effort: a
+// logged append failure never unwinds the approval the gate already recorded.
+func (s *Server) writeModelResolvedAudit(r *http.Request, stage *run.Stage, app *approval.Approval, rm ResolvedModel) {
+	actorKind := actorKindForSubject(app.ApproverSubject)
+	approver := app.ApproverSubject
+	payload, _ := json.Marshal(rm)
+	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+		RunID:        stage.RunID,
+		StageID:      &stage.ID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryModelResolved,
+		ActorKind:    &actorKind,
+		ActorSubject: &approver,
+		Payload:      payload,
+	}); err != nil {
+		s.cfg.Logger.Error("audit append failed for model_resolved",
 			"run_id", stage.RunID,
 			"stage_id", stage.ID,
 			"error", err.Error(),

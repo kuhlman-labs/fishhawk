@@ -39,6 +39,14 @@ type AnchorPlanView struct {
 	// RejectionReason, when non-empty, marks this as a superseded plan
 	// version and is rendered alongside the superseded label.
 	RejectionReason string
+	// RecommendedModel is the plan's model_recommendation.implement_model
+	// (#1013) — the planner's complexity-informed implement-model
+	// suggestion the operator ratifies or overrides at the gate. Empty when
+	// the plan made no recommendation.
+	RecommendedModel string
+	// RecommendationRationale is the rationale paired with RecommendedModel
+	// (model_recommendation.rationale). Empty when absent.
+	RecommendationRationale string
 }
 
 // AnchorInput bundles everything RenderAnchorBody projects. CurrentPlan
@@ -67,6 +75,7 @@ type anchorSections struct {
 	timeline        string
 	reviews         string
 	currentPlan     string
+	modelResolved   string
 	supersededPlans string
 	footer          string
 }
@@ -91,6 +100,7 @@ func RenderAnchorBody(in AnchorInput) string {
 		timeline:        renderAnchorTimeline(in.Audit, in.Now),
 		reviews:         renderAnchorReviews(in.Stages, in.Audit),
 		currentPlan:     renderCurrentPlan(in.CurrentPlan),
+		modelResolved:   renderResolvedModel(in.Audit),
 		supersededPlans: renderSupersededPlans(in.SupersededPlans),
 		footer:          renderAnchorFooter(in.Run, runURL),
 	}
@@ -127,6 +137,9 @@ func assembleAnchor(s anchorSections, level int) string {
 	}
 	if s.currentPlan != "" {
 		parts = append(parts, s.currentPlan)
+	}
+	if s.modelResolved != "" {
+		parts = append(parts, s.modelResolved)
 	}
 	if level < 2 && s.supersededPlans != "" {
 		parts = append(parts, s.supersededPlans)
@@ -355,12 +368,52 @@ func renderCurrentPlan(p *AnchorPlanView) string {
 	} else {
 		b.WriteString("_No summary provided._\n")
 	}
+	if p.RecommendedModel != "" {
+		// The planner's complexity-informed implement-model recommendation
+		// (#1013), visible alongside the summary so the operator sees the
+		// suggestion the gate will ratify or override.
+		if p.RecommendationRationale != "" {
+			fmt.Fprintf(&b, "\n_Model recommendation: `%s` — %s_\n", p.RecommendedModel, oneLine(p.RecommendationRationale))
+		} else {
+			fmt.Fprintf(&b, "\n_Model recommendation: `%s`_\n", p.RecommendedModel)
+		}
+	}
 	if detail := renderPlanScopeApproach(p); detail != "" {
 		b.WriteString("\n<details><summary>Plan details</summary>\n\n")
 		b.WriteString(detail)
 		b.WriteString("\n</details>")
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// renderResolvedModel renders the gate's resolved implement model (#1013) as a
+// compact block under the plan: "**Implement model** — `<model>` (source:
+// <rung>)". It reads the most-recent model_resolved audit entry (the gate is
+// the sole writer; newest by Sequence wins). Empty when no model_resolved entry
+// exists yet (pre-approval). An entry recording an EMPTY model — the deliberate
+// default spawn — renders "**Implement model** — adapter default" so the anchor
+// states the resolution honestly rather than omitting it.
+func renderResolvedModel(entries []*audit.Entry) string {
+	var latest *audit.Entry
+	for _, e := range entries {
+		if e.Category != "model_resolved" {
+			continue
+		}
+		if latest == nil || e.Sequence > latest.Sequence {
+			latest = e
+		}
+	}
+	if latest == nil {
+		return ""
+	}
+	model, source := decodeModelResolved(latest.Payload)
+	if model == "" {
+		return "**Implement model** — adapter default"
+	}
+	if source == "" {
+		return fmt.Sprintf("**Implement model** — `%s`", model)
+	}
+	return fmt.Sprintf("**Implement model** — `%s` (source: %s)", model, source)
 }
 
 func renderSupersededPlans(plans []AnchorPlanView) string {

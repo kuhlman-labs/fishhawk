@@ -4015,6 +4015,27 @@ paths:
                     rejected `400 validation_failed` before any approval row
                     is recorded. Honored only on `approve`; ignored on
                     `reject`. Omitting the field is byte-identical to today.
+                implement_model:
+                  type: string
+                  description: |
+                    Optional operator override for the implement-stage model
+                    (#1013) — the top rung of the resolution ladder
+                    (deployment default < spec `executor.model` < plan
+                    `model_recommendation` < this override). On a plan-stage
+                    approve the gate resolves the full ladder with this as the
+                    operator rung, validates the RESOLVED non-empty value
+                    against the deployment's per-adapter allow-list, and emits a
+                    `model_resolved` audit entry (`{model, model_source}`) the
+                    runner spawn routes to the agent `--model`. An unknown
+                    resolved model — from ANY rung, not just this field — is
+                    rejected `422 plan_invalid_model` (details carry `model`,
+                    `model_source`, `adapter`) PRE-Submit, so a retry with an
+                    allowed model flows normally. An empty/unconfigured
+                    allow-list fails OPEN (any model accepted, byte-identical to
+                    today). Honored only on `approve`; ignored on `reject`.
+                    Omitting the field leaves the model to the lower rungs; an
+                    empty resolution still records `model_resolved` and spawns
+                    with no `--model`, exactly as today.
                 delegated:
                   type: boolean
                   default: false
@@ -4187,6 +4208,19 @@ paths:
               scope is an upper bound on the eventual diff, so the
               override exists for legitimately-forced cases (e.g. the
               cap itself is about to change).
+            - `plan_invalid_model` — #1013: the RESOLVED implement model
+              (the ladder of deployment default < spec `executor.model` <
+              plan `model_recommendation` < the `implement_model` override)
+              is non-empty and not in the deployment's per-adapter
+              allow-list for the run's implement adapter. Validated regardless
+              of which rung supplied the value, so an unknown plan- or
+              spec-recommended model — not just an operator override — is
+              caught here rather than at runner spawn. `details` includes
+              `model`, `model_source` (`default`|`spec`|`plan`|`operator`),
+              and `adapter`. Refused BEFORE any approval row is recorded, so a
+              retry with an allowed `implement_model` (or after widening the
+              allow-list) flows normally. An empty/unconfigured allow-list
+              fails OPEN — any model is accepted, byte-identical to today.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

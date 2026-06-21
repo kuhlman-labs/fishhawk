@@ -1963,6 +1963,14 @@ type ApprovePlanInput struct {
 	// assertion fails the implement stage category-B (park for re-scope/
 	// re-plan). Deterministic substring matching only — never parses prose.
 	BindingAssertions []BindingAssertion `json:"binding_assertions,omitempty" jsonschema:"optional list of deterministic binding-assertion checks the operator declares so an explicit approval condition becomes machine-checkable post-implement. Each check has type ('file_contains' or 'test_asserts'), path (repo-relative; must end in _test.go for test_asserts), and literal (a substring that must appear in the committed file). Evaluated by the runner against the committed scope-only tree; any unsatisfied assertion fails the implement stage category-B. Substring matching only — choose a literal specific enough to be meaningful"`
+	// ImplementModel is the optional operator override for the implement-stage
+	// model (#1013) — the top rung of the resolution ladder. The backend
+	// resolves the full ladder at the gate, validates the resolved value
+	// against the deployment allow-list (422 plan_invalid_model on an unknown
+	// model), and records the model_resolved audit the runner spawn routes
+	// through. Omit to leave the model to the lower rungs (spec / plan
+	// recommendation / deployment default).
+	ImplementModel string `json:"implement_model,omitempty" jsonschema:"optional operator override for the implement-stage model (#1013): the top rung of the resolution ladder (deployment default < spec executor.model < plan model_recommendation < this override). The backend validates the resolved model against the deployment's per-adapter allow-list and rejects an unknown one 422 plan_invalid_model. Omit to ratify the plan's model_recommendation or fall through to the spec/deployment default"`
 }
 
 // BindingAssertion is one operator-declared binding-assertion check passed to
@@ -2062,6 +2070,15 @@ contain literal Y" so the condition is enforced rather than merely
 restated. A malformed declaration (unknown type, empty literal, a
 test_asserts path not ending in _test.go) is rejected 400
 validation_failed before any approval row is recorded.
+
+implement_model (#1013, optional): override the implement-stage model.
+The backend resolves the ladder deployment-default < spec executor.model
+< plan model_recommendation < this override, validates the resolved
+value against the deployment's per-adapter allow-list, and records the
+choice as the model_resolved audit the runner spawn routes through. An
+unknown resolved model is rejected 422 plan_invalid_model (pre-insert —
+retry with an allowed model). Omit to ratify the plan's
+model_recommendation or fall through to the spec/deployment default.
 `),
 	}, resolver.approvePlan)
 }
@@ -2105,7 +2122,7 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 	// warning on the tool result and an empty login — never a blocked
 	// approval.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles, in.BindingAssertions)
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles, in.BindingAssertions, in.ImplementModel)
 	if err != nil {
 		// ADR-036 (#875): the backend refuses the approve while a
 		// configured agent plan review is still in-flight. Surface this
@@ -2155,7 +2172,7 @@ func (r *runResolver) rejectPlan(ctx context.Context, _ *mcp.CallToolRequest, in
 	// Resolve the operator's real GitHub login best-effort (#751); see
 	// approvePlan for the rationale. Empty on gh failure, never fatal.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil)
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, "")
 	if err != nil {
 		return nil, RejectPlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}

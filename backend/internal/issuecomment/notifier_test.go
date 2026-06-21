@@ -1289,6 +1289,64 @@ func planArtifactJSON(t *testing.T, summary string, files ...string) json.RawMes
 	return b
 }
 
+// TestNotifyStatusUpdateForRun_ModelRecommendationAndResolved drives the
+// #1013 render seam end to end: a plan artifact carrying a model_recommendation
+// plus a gate model_resolved audit entry → the anchor comment shows both the
+// recommendation (implement_model + rationale) and the resolved {model,
+// source} block.
+func TestNotifyStatusUpdateForRun_ModelRecommendationAndResolved(t *testing.T) {
+	runID := uuid.New()
+	planStageID := uuid.New()
+	triggerRef := "issue:42"
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "x/y", WorkflowID: "feature_change", State: run.StateRunning,
+			TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef, InstallationID: int64Ptr(99),
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateSucceeded},
+		}},
+	}
+	gh := &fakeGitHub{}
+	au := &fakeAudit{}
+	au.preSeedWithStage(runID, planStageID, "approval_submitted", map[string]any{"decision": "approve"})
+	au.preSeedWithStage(runID, planStageID, "model_resolved", map[string]any{
+		"model": "claude-opus-4-8", "model_source": "operator",
+	})
+
+	p := plan.Plan{
+		Summary: "Resolve the model at the gate.",
+		ModelRecommendation: &plan.ModelRecommendation{
+			ImplementModel: "claude-sonnet-4-6", Rationale: "medium complexity", ComplexityAssessed: plan.ComplexityMedium,
+		},
+	}
+	content, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		planStageID: {{ID: uuid.New(), StageID: planStageID, Kind: artifact.KindPlan, Content: content, CreatedAt: time.Unix(100, 0)}},
+	}}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: repoRuns, Audit: au, Artifacts: arts,
+		ExternalURL: "https://app.example",
+		Now:         func() time.Time { return time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC) },
+	})
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyStatusUpdateForRun: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 create call; got %d", len(gh.calls))
+	}
+	body := gh.calls[0].body
+	if !strings.Contains(body, "Model recommendation: `claude-sonnet-4-6` — medium complexity") {
+		t.Errorf("anchor missing model recommendation:\n%s", body)
+	}
+	if !strings.Contains(body, "**Implement model** — `claude-opus-4-8` (source: operator)") {
+		t.Errorf("anchor missing resolved model block:\n%s", body)
+	}
+}
+
 // TestNotifyStatusUpdateForRun_AnchorEndToEnd drives a feature_change
 // shape across the full audit-chain → anchor-projection → GitHub-I/O
 // seam (#1054): a first plan version rejected (with a reason) and

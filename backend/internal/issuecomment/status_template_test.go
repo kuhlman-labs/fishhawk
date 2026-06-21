@@ -215,6 +215,43 @@ func TestRenderStatusBody_SliceIntegrationActivity(t *testing.T) {
 	}
 }
 
+// TestRenderStatusBody_ModelResolvedActivity pins #1013: a model_resolved
+// audit entry is admitted by pickActivity and rendered with the model + source
+// in the Latest activity section. The empty-model case reads as the deliberate
+// adapter default rather than an empty code span.
+func TestRenderStatusBody_ModelResolvedActivity(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	cases := []struct {
+		name    string
+		payload map[string]any
+		want    string
+	}{
+		{
+			name:    "resolved model and source",
+			payload: map[string]any{"model": "claude-opus-4-8", "model_source": "operator"},
+			want:    "Implement model resolved: `claude-opus-4-8` (source: operator)",
+		},
+		{
+			name:    "empty model is the adapter default",
+			payload: map[string]any{"model": "", "model_source": ""},
+			want:    "Implement model resolved: adapter default",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := []*audit.Entry{
+				auditEntry(runID, 1, "model_resolved", "brett@local-mcp", now.Add(-1*time.Minute), tc.payload),
+			}
+			body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+			if !strings.Contains(body, tc.want) {
+				t.Errorf("expected %q in the activity section\n---\n%s", tc.want, body)
+			}
+		})
+	}
+}
+
 func TestRenderStatusBody_NoActivity_OmitsLatestSection(t *testing.T) {
 	r, stages := statusRun(t, uuid.New())
 	body := issuecomment.RenderStatusBody(r, stages, nil, "https://x", time.Now())

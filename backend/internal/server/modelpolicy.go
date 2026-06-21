@@ -41,6 +41,16 @@ type ResolvedModel struct {
 	Source ModelSource `json:"model_source"`
 }
 
+// CategoryModelResolved is the audit-kind the approval gate emits once, on a
+// valid plan-stage approve, recording the source-tagged implement model the
+// gate resolved (the {model, model_source} payload — ResolvedModel's json
+// tags). It is INTRODUCED by the operator-gate slice (#1013): the gate is the
+// sole writer, and gateResolvedModel is the sole reader (the read-only bridge
+// that routes the resolution to the runner spawn). The trace/calibration path
+// deliberately never emits it (trace_test.go's surface-sweep guard), so the
+// gate's emission is the single source of the run's authoritative resolution.
+const CategoryModelResolved = "model_resolved"
+
 // resolveImplementModel applies the 4-rung implement-model ladder, lowest to
 // highest precedence:
 //
@@ -176,6 +186,87 @@ func (s *Server) resolveImplementModelForRun(ctx context.Context, runRow *run.Ru
 	return resolveImplementModel(deflt, specModel, planModel, "")
 }
 
+// gateResolveImplementModel resolves the implement-model ladder AT THE
+// APPROVAL GATE, with the operator override as the highest rung. Unlike
+// resolveImplementModelForRun, it does NOT consult gateResolvedModel: the gate
+// is the WRITER of the model_resolved audit, not a re-reader of its own past
+// resolution, so re-reading it would let a prior approve's resolution shadow a
+// re-approval's fresh operator override. It reads the same visible rungs
+// (deployment default, spec executor.model, plan model_recommendation) and
+// folds in the operator string supplied at approve time. Pure resolution
+// through resolveImplementModel; an all-empty ladder yields ModelSourceNone
+// (today's empty spawn). The caller validates the RESOLVED value against the
+// allow-list and emits the model_resolved audit from the returned value.
+func (s *Server) gateResolveImplementModel(ctx context.Context, runRow *run.Run, operator string) ResolvedModel {
+	deflt := s.cfg.ImplementModelDefault
+	specModel := specImplementExecutorModel(runRow.WorkflowSpec, runRow.WorkflowID)
+	planModel := s.planImplementModelRecommendation(ctx, runRow.ID)
+	return resolveImplementModel(deflt, specModel, planModel, strings.TrimSpace(operator))
+}
+
+// adapterForImplementAgent maps an implement stage's executor.agent id to the
+// AllowedModels adapter key the gate validates against. The workflow spec's
+// implement executor names the agent id ("claude-code" | "codex"; runner
+// --agent default is "claude-code"), while the allow-list — and the reviewer
+// `provider` vocabulary — key on the adapter name ("claudecode" | "codex" |
+// "anthropic"). An empty/absent agent therefore maps to "claudecode" (the
+// default spawn's adapter); an unrecognized id passes through verbatim so a
+// future agent keys its own configured set rather than silently failing open
+// under a mismatched key. This is the deterministic bridge that keeps the gate
+// validating against the operator's configured set for the run's real adapter.
+func adapterForImplementAgent(agent string) string {
+	switch strings.TrimSpace(agent) {
+	case "", "claude-code", "claudecode":
+		return "claudecode"
+	case "codex":
+		return "codex"
+	default:
+		return strings.TrimSpace(agent)
+	}
+}
+
+// specImplementExecutorAgent reads executor.agent on the implement stage of the
+// given workflow from raw workflow-spec bytes via a local YAML probe, returning
+// "" when the spec is empty, malformed, or declares no executor.agent. Mirrors
+// specImplementExecutorModel's stage-lookup (prefer id=="implement", else the
+// first stage whose type=="implement") and stays free of a static dependency on
+// the spec.Executor.Agent field. The gate maps the returned id to the
+// allow-list adapter key via adapterForImplementAgent.
+func specImplementExecutorAgent(specBytes []byte, workflowID string) string {
+	if len(specBytes) == 0 {
+		return ""
+	}
+	var probe struct {
+		Workflows map[string]struct {
+			Stages []struct {
+				ID       string `yaml:"id"`
+				Type     string `yaml:"type"`
+				Executor struct {
+					Agent string `yaml:"agent"`
+				} `yaml:"executor"`
+			} `yaml:"stages"`
+		} `yaml:"workflows"`
+	}
+	if err := yaml.Unmarshal(specBytes, &probe); err != nil {
+		return ""
+	}
+	wf, ok := probe.Workflows[workflowID]
+	if !ok {
+		return ""
+	}
+	for _, st := range wf.Stages {
+		if st.ID == "implement" {
+			return strings.TrimSpace(st.Executor.Agent)
+		}
+	}
+	for _, st := range wf.Stages {
+		if st.Type == "implement" {
+			return strings.TrimSpace(st.Executor.Agent)
+		}
+	}
+	return ""
+}
+
 // resolvedImplementModelForRunID is the by-id convenience over
 // resolveImplementModelForRun used by the calibration-stamp path (trace.go),
 // which holds a run id rather than the loaded run. Loads the run and resolves;
@@ -210,7 +301,7 @@ func (s *Server) gateResolvedModel(ctx context.Context, runID uuid.UUID) (Resolv
 	if s.cfg.AuditRepo == nil {
 		return ResolvedModel{}, false
 	}
-	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "model_resolved")
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryModelResolved)
 	if err != nil || len(entries) == 0 {
 		return ResolvedModel{}, false
 	}

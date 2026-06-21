@@ -265,6 +265,14 @@ type approvalRequest struct {
 	// payload. The DisallowUnknownFields decoder requires the field be declared
 	// here too; reject and assertion-less approve callers pass nil (omitempty).
 	BindingAssertions []BindingAssertion `json:"binding_assertions,omitempty"`
+	// ImplementModel is the optional operator override for the implement-stage
+	// model (#1013) — the highest rung of the resolution ladder. The backend
+	// resolves the full ladder at the plan gate, validates the resolved value
+	// against the allow-list (422 plan_invalid_model on an unknown model), and
+	// records it as the model_resolved audit. The DisallowUnknownFields decoder
+	// requires the field be declared here too; reject and override-less approve
+	// callers pass "" (omitempty) and stay byte-identical to today.
+	ImplementModel string `json:"implement_model,omitempty"`
 }
 
 // approvalResult is the decoded 200 body of POST /v0/stages/{id}/
@@ -317,13 +325,20 @@ type approvalResult struct {
 //     max_files_changed; re-scope the plan or include
 //     --override-scope-cap in the comment. Also pre-insert and
 //     override-retryable, same as plan_violates_budget)
-func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles []string, bindingAssertions []BindingAssertion) (*approvalResult, error) {
+//   - 422 plan_invalid_model (#1013: the RESOLVED implement model — the
+//     ladder of deployment default < spec executor.model < plan
+//     model_recommendation < implement_model override — is not in the
+//     deployment's per-adapter allow-list; details carry model,
+//     model_source, and adapter. Pre-insert: retry with an allowed
+//     implement_model, or widen the allow-list)
+func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles []string, bindingAssertions []BindingAssertion, implementModel string) (*approvalResult, error) {
 	body, err := json.Marshal(approvalRequest{
 		Decision:            decision,
 		Comment:             comment,
 		ApproverGithubLogin: approverGithubLogin,
 		AddScopeFiles:       addScopeFiles,
 		BindingAssertions:   bindingAssertions,
+		ImplementModel:      implementModel,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal approval: %w", err)

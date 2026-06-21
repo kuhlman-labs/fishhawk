@@ -861,14 +861,18 @@ func (n *Notifier) loadAnchorPlans(ctx context.Context, stages []*run.Stage, ent
 			if json.Unmarshal(a.Content, &p) != nil {
 				continue
 			}
-			views = append(views, dated{
-				view: AnchorPlanView{
-					Summary:  p.Summary,
-					Files:    p.Scope.Files,
-					Approach: p.Approach,
-				},
-				at: a.CreatedAt,
-			})
+			av := AnchorPlanView{
+				Summary:  p.Summary,
+				Files:    p.Scope.Files,
+				Approach: p.Approach,
+			}
+			// Surface the planner's implement-model recommendation (#1013)
+			// so the anchor shows the suggestion the gate ratifies/overrides.
+			if p.ModelRecommendation != nil {
+				av.RecommendedModel = p.ModelRecommendation.ImplementModel
+				av.RecommendationRationale = p.ModelRecommendation.Rationale
+			}
+			views = append(views, dated{view: av, at: a.CreatedAt})
 		}
 	}
 	if len(views) == 0 {

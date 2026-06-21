@@ -4046,6 +4046,51 @@ func TestApprovePlan_AddScopeFiles_PlumbedToSubmitApproval(t *testing.T) {
 	}
 }
 
+// TestApprovePlan_ImplementModel_PlumbedToSubmitApproval pins the #1013 wire
+// seam: ApprovePlanInput.ImplementModel must reach the approvals request body
+// the backend decodes (MCP input -> client approvalRequest -> HTTP body).
+func TestApprovePlan_ImplementModel_PlumbedToSubmitApproval(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:          runID.String(),
+		Reason:         "use opus for this hard change",
+		ImplementModel: "claude-opus-4-8",
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if fb.approvalsBody.ImplementModel != "claude-opus-4-8" {
+		t.Errorf("implement_model = %q, want claude-opus-4-8", fb.approvalsBody.ImplementModel)
+	}
+}
+
+// TestApprovePlan_NoImplementModel_OmitsFieldOnTheWire confirms the
+// byte-identical no-override path: an approve without implement_model leaves
+// the field empty on the request body the backend decodes (omitempty).
+func TestApprovePlan_NoImplementModel_OmitsFieldOnTheWire(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:  runID.String(),
+		Reason: "looks good",
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if fb.approvalsBody.ImplementModel != "" {
+		t.Errorf("implement_model = %q, want empty when no override declared", fb.approvalsBody.ImplementModel)
+	}
+}
+
 // TestApprovePlan_BindingAssertions_PlumbedToSubmitApproval pins the #1171
 // wire seam: ApprovePlanInput.BindingAssertions must reach the approvals
 // request body the backend decodes (MCP input -> client approvalRequest ->
