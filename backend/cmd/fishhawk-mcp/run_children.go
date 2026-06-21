@@ -242,66 +242,171 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 		progToken = req.Params.GetProgressToken()
 	}
 
-	// (d) Concurrent dispatch under an errgroup bounded by the cap. SetLimit
-	// is skipped for cap<=0 (unlimited) — SetLimit(n<=0) is rejected by
-	// errgroup. Each child ALWAYS returns nil so a failure never cancels
-	// siblings (await-all, no-sibling-cancel); the failure is recorded as data.
-	g, gctx := errgroup.WithContext(ctx)
-	if concurrencyCap > 0 {
-		g.SetLimit(concurrencyCap)
+	// (d) Topological-wave dispatch (#1258 slice B). The plan_decomposed payload
+	// carries waves of SLICE INDICES into ChildRunIDs (ChildRunIDs[i] is the
+	// child minted for slice i, and dispatches was built in that same order, so
+	// wave index idx maps to dispatches[idx]). Each wave's pending children
+	// dispatch concurrently under the cap against currentBase; between waves the
+	// loop integrates the succeeded slices so far and re-bases the next wave's
+	// children on the consolidated branch so dependent slices see predecessors'
+	// merged symbols.
+	//
+	// Back-compat is load-bearing: a nil/empty waves (an old plan_decomposed
+	// entry, or a no-depends_on decomposition) collapses to a single all-indices
+	// wave — one concurrent wave dispatched with --base-branch main, and
+	// integrate-wave is NEVER called (a single wave is also the last wave). This
+	// reduces to the pre-#1278 single-errgroup behavior byte-for-byte.
+	waves := pd.Waves
+	if len(waves) == 0 {
+		all := make([]int, len(dispatches))
+		for i := range all {
+			all[i] = i
+		}
+		waves = [][]int{all}
 	}
+
 	var (
 		mu         sync.Mutex
 		dispatched = map[string]*ChildResult{}
 	)
 	dispatchedCount := 0
-	for _, d := range dispatches {
-		if !d.pending {
-			continue
+	currentBase := baseBranch
+
+	for wi, wave := range waves {
+		// Map this wave's slice indices to the partitioned child dispatches. An
+		// index out of range is a loud tool error, never a silent skip — it
+		// means the waves payload and child_run_ids disagree.
+		waveDispatches := make([]childDispatch, 0, len(wave))
+		for _, idx := range wave {
+			if idx < 0 || idx >= len(dispatches) {
+				return nil, RunChildrenOutput{}, fmt.Errorf(
+					"plan_decomposed waves index %d out of range [0,%d) for run %s", idx, len(dispatches), in.RunID)
+			}
+			waveDispatches = append(waveDispatches, dispatches[idx])
 		}
-		d := d
-		dispatchedCount++
-		g.Go(func() error {
-			argv := []string{
-				"--run-id", d.runID,
-				"--backend-url", r.api.baseURL,
-				"--workflow", in.Workflow,
-				"--stage", "implement",
-				"--stage-id", d.stageID,
-				"--working-dir", workingDir,
-				"--fetch-prompt",
-				"--upload-trace",
-				"--github-repo", repo,
-				"--base-branch", baseBranch,
-				"--check-base-ref", baseBranch,
-				// The load-bearing flag: each concurrent child keys its worktree
-				// on its OWN run id (run-<child>) instead of the shared parent
-				// root, so siblings get isolated checkouts (E24.4 / #1144).
-				"--parallel-isolate",
+
+		// Concurrent dispatch of THIS wave's pending children under an errgroup
+		// bounded by the cap. SetLimit is skipped for cap<=0 (unlimited) —
+		// SetLimit(n<=0) is rejected by errgroup. Each child ALWAYS returns nil
+		// so a failure never cancels siblings (await-all, no-sibling-cancel);
+		// the failure is recorded as data. Children already in-flight/terminal
+		// at discovery stay partitioned out (idempotent re-invocation).
+		g, gctx := errgroup.WithContext(ctx)
+		if concurrencyCap > 0 {
+			g.SetLimit(concurrencyCap)
+		}
+		waveDispatchedIDs := make([]string, 0, len(waveDispatches))
+		for _, d := range waveDispatches {
+			if !d.pending {
+				continue
 			}
-			events, spawnWarnings, exitCode, spawnErr := spawnRunnerStageFn(gctx, binary, argv, env, req, progToken)
-			res := &ChildResult{
-				RunID:      d.runID,
-				StageID:    d.stageID,
-				Dispatched: true,
-				ExitCode:   exitCode,
-				Warnings:   spawnWarnings,
+			d := d
+			dispatchedCount++
+			waveDispatchedIDs = append(waveDispatchedIDs, d.runID)
+			waveBase := currentBase
+			g.Go(func() error {
+				argv := []string{
+					"--run-id", d.runID,
+					"--backend-url", r.api.baseURL,
+					"--workflow", in.Workflow,
+					"--stage", "implement",
+					"--stage-id", d.stageID,
+					"--working-dir", workingDir,
+					"--fetch-prompt",
+					"--upload-trace",
+					"--github-repo", repo,
+					// wave N's children cut their slice branch from the prior
+					// wave's merged tree via the runner's freshFetchBase routing.
+					"--base-branch", waveBase,
+					"--check-base-ref", waveBase,
+					// The load-bearing flag: each concurrent child keys its worktree
+					// on its OWN run id (run-<child>) instead of the shared parent
+					// root, so siblings get isolated checkouts (E24.4 / #1144).
+					"--parallel-isolate",
+				}
+				events, spawnWarnings, exitCode, spawnErr := spawnRunnerStageFn(gctx, binary, argv, env, req, progToken)
+				res := &ChildResult{
+					RunID:      d.runID,
+					StageID:    d.stageID,
+					Dispatched: true,
+					ExitCode:   exitCode,
+					Warnings:   spawnWarnings,
+				}
+				if spawnErr != nil {
+					res.Warnings = append(res.Warnings, fmt.Sprintf("spawn failed: %v", spawnErr))
+				} else {
+					summary, _ := summarizeRunStageEvents(events)
+					res.Outcome = summary.Outcome
+				}
+				mu.Lock()
+				dispatched[d.runID] = res
+				mu.Unlock()
+				return nil
+			})
+		}
+		// Await ALL of this wave — g.Wait never returns a sibling-cancel error
+		// because every g.Go returned nil.
+		_ = g.Wait()
+
+		// Partial-wave guard: if any DISPATCHED child in this wave did not
+		// succeed (non-ok outcome or non-zero exit), STOP — do NOT integrate a
+		// partial wave and do NOT dispatch a dependent wave against an
+		// incomplete base. The failure is already recorded as data in children[].
+		waveFailed := false
+		mu.Lock()
+		for _, cid := range waveDispatchedIDs {
+			res := dispatched[cid]
+			if res == nil || res.Outcome != "ok" || res.ExitCode != 0 {
+				waveFailed = true
+				break
 			}
-			if spawnErr != nil {
-				res.Warnings = append(res.Warnings, fmt.Sprintf("spawn failed: %v", spawnErr))
-			} else {
-				summary, _ := summarizeRunStageEvents(events)
-				res.Outcome = summary.Outcome
+		}
+		mu.Unlock()
+		if waveFailed {
+			warnings = append(warnings, fmt.Sprintf(
+				"wave %d had a child that did not succeed; stopping before integrating or dispatching further waves", wi))
+			break
+		}
+
+		// The last wave needs no integrate-wave: the final terminal fan-in
+		// (stage resolution + consolidated PR) stays driven by /consolidate
+		// after every child settles. A single (back-compat) wave is also the
+		// last wave, so integrate-wave is NEVER called for a no-depends_on
+		// decomposition.
+		if wi == len(waves)-1 {
+			break
+		}
+
+		// Between waves: the NON-settling per-wave fan-in merges the slices
+		// succeeded so far onto the consolidated branch. On a transport error or
+		// a slice conflict, STOP and surface it rather than dispatching the next
+		// wave against a stale base.
+		iw, ierr := r.api.IntegrateWave(ctx, parentUUID)
+		if ierr != nil {
+			warnings = append(warnings, fmt.Sprintf("integrate-wave after wave %d failed: %v; stopping before the next wave", wi, ierr))
+			break
+		}
+		if iw.Outcome == "slice_conflict" {
+			conflictSlice := -1
+			if iw.ConflictingSliceIndex != nil {
+				conflictSlice = *iw.ConflictingSliceIndex
 			}
-			mu.Lock()
-			dispatched[d.runID] = res
-			mu.Unlock()
-			return nil
-		})
+			warnings = append(warnings, fmt.Sprintf(
+				"integrate-wave after wave %d hit a slice conflict (slice %d, child %s): %s; stopping before the next wave",
+				wi, conflictSlice, iw.ConflictingChildRunID, iw.Detail))
+			break
+		}
+		// Integrated. Re-base the next wave's children on the consolidated
+		// branch. DEFENSIVELY: an empty consolidated_branch (the GitHub-not-
+		// wired graceful-skip) keeps currentBase unchanged + warns rather than
+		// dispatching the next wave against an empty ref.
+		if iw.ConsolidatedBranch != "" {
+			currentBase = iw.ConsolidatedBranch
+		} else {
+			warnings = append(warnings, fmt.Sprintf(
+				"integrate-wave after wave %d returned an empty consolidated_branch; keeping base %q for the next wave", wi, currentBase))
+		}
 	}
-	// Await ALL — g.Wait never returns a sibling-cancel error because every
-	// g.Go returned nil.
-	_ = g.Wait()
 
 	// (e) Best-effort post-run stage_state for each dispatched child.
 	for id, res := range dispatched {

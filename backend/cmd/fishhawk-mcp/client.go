@@ -785,6 +785,42 @@ func (c *apiClient) ConsolidateRun(ctx context.Context, id uuid.UUID) (*Consolid
 	return &res, nil
 }
 
+// IntegrateWaveResult mirrors the backend's integrate-wave 200 body (#1278
+// slice B): the outcome of the NON-settling per-wave fan-in the topological-
+// wave run_children dispatch runs BETWEEN waves. Outcome is "integrated" (the
+// succeeded slices so far merged onto the consolidated branch) or
+// "slice_conflict" (a slice failed to merge). UNLIKE ConsolidateResult there
+// is NO resolved_to_state — integrate-wave does not transition the parent
+// stage. The conflict fields are set only on the slice_conflict outcome.
+type IntegrateWaveResult struct {
+	RunID                 string `json:"run_id"`
+	Outcome               string `json:"outcome"`
+	ConsolidatedBranch    string `json:"consolidated_branch,omitempty"`
+	ConflictingSliceIndex *int   `json:"conflicting_slice_index,omitempty"`
+	ConflictingChildRunID string `json:"conflicting_child_run_id,omitempty"`
+	Detail                string `json:"detail,omitempty"`
+}
+
+// IntegrateWave runs the NON-settling per-wave fan-in for a decomposed parent
+// via `POST /v0/runs/{run_id}/integrate-wave` (#1278 slice B) — the run_children
+// wave loop calls it BETWEEN waves to merge the slices succeeded so far onto the
+// consolidated branch so the next wave's dependent slices cut their branch from
+// a tree carrying the predecessors' merged symbols. It does NOT require all
+// children terminal, does NOT transition the parent stage, and does NOT
+// advance/open the PR. 4xx/5xx surfaces:
+//   - 400 not_a_decomposed_parent (the run is a child, or has no children)
+//   - 403 agent_token_forbidden (a run-bound agent token attempted it)
+//   - 403 insufficient_scope (token lacks write:runs)
+//   - 404 run_not_found
+//   - 502 slice_integration_error (the fan-in failed; the error is surfaced)
+func (c *apiClient) IntegrateWave(ctx context.Context, id uuid.UUID) (*IntegrateWaveResult, error) {
+	var res IntegrateWaveResult
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+id.String()+"/integrate-wave", nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // ScopeCompletenessDecisionResult mirrors the backend's scope-completeness
 // decision 200 body (`backend/internal/server/scope_completeness.go` — SLICE
 // 1, #1231): the resolved park record. State is the implement stage's
@@ -1361,6 +1397,14 @@ func (c *apiClient) ListRecentRunAudit(ctx context.Context, runID uuid.UUID, lim
 type PlanDecomposed struct {
 	ChildRunIDs          []string `json:"child_run_ids"`
 	EffectiveMaxParallel int      `json:"effective_max_parallel"`
+	// Waves carries the topological dispatch order (#1258 slice B) as ordered
+	// waves of slice indices into ChildRunIDs (ChildRunIDs[i] is the child
+	// minted for slice i). The run_children wave loop dispatches each wave
+	// concurrently and integrates between waves. omitempty + nil-decodes
+	// back-compat: an old plan_decomposed entry (or a no-depends_on
+	// decomposition) carries no waves, which the loop collapses to a single
+	// all-indices wave.
+	Waves [][]int `json:"waves,omitempty"`
 }
 
 // LatestPlanDecomposed returns the decoded payload of the run's most-recent

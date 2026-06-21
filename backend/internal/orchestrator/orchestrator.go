@@ -1022,7 +1022,25 @@ func (o *Orchestrator) fanoutIfDecomposed(ctx context.Context, parent *run.Run, 
 	// minting — every child above was already created.
 	effectiveMaxParallel := o.resolveEffectiveMaxParallel(ctx, parent)
 
-	o.emitPlanDecomposed(ctx, parent.ID, planStageID, childIDs, approvedPlan.Decomposition.Rationale, effectiveMaxParallel)
+	// Topological dispatch order (#1258 slice B): plan.Waves derives the
+	// dependency-ordered waves of sub-plan indices from the depends_on edges.
+	// The indices are POSITIONAL into childIDs (childIDs[i] is the child minted
+	// for sub_plan i — both are built in sub_plan order), so the MCP can map a
+	// wave's indices back to child run ids. Waves() is pure and was wired into
+	// the plan semantic check in slice A, so an error here is should-be-
+	// impossible post-validation — fall back to a single all-indices wave
+	// (back-compat: one concurrent wave) with a WARN rather than dropping the
+	// payload.
+	waves, werr := plan.Waves(approvedPlan.Decomposition)
+	if werr != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: plan.Waves failed post-validation; falling back to a single all-indices wave",
+			slog.String("parent_run_id", parent.ID.String()),
+			slog.String("error", werr.Error()),
+		)
+		waves = singleAllIndicesWave(len(childIDs))
+	}
+
+	o.emitPlanDecomposed(ctx, parent.ID, planStageID, childIDs, approvedPlan.Decomposition.Rationale, effectiveMaxParallel, waves)
 	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator parent parked awaiting children",
 		slog.String("parent_run_id", parent.ID.String()),
 		slog.String("parent_stage_id", parentImplement.ID.String()),
@@ -1284,12 +1302,27 @@ func childIssueContextFromSubPlan(parent *run.Run, sub plan.SubPlanSummary) *run
 	return &out
 }
 
+// singleAllIndicesWave returns a single wave [[0,1,...,n-1]] — the back-compat
+// collapse a no-depends_on decomposition layers to, and the should-be-
+// impossible plan.Waves error fallback. Returns nil for n<=0 so the
+// plan_decomposed payload carries no waves rather than an empty wave.
+func singleAllIndicesWave(n int) [][]int {
+	if n <= 0 {
+		return nil
+	}
+	wave := make([]int, n)
+	for i := range wave {
+		wave[i] = i
+	}
+	return [][]int{wave}
+}
+
 // emitPlanDecomposed writes a plan_decomposed audit entry naming the
 // child run IDs, the rationale string, and the resolved
 // effective_max_parallel concurrency cap (E24.6 / #1146 — 0 = unlimited).
 // Best-effort: a failure here logs and returns; the fanout has already
 // taken effect at the data layer.
-func (o *Orchestrator) emitPlanDecomposed(ctx context.Context, parentRunID, parentStageID uuid.UUID, childIDs []string, rationale string, effectiveMaxParallel int) {
+func (o *Orchestrator) emitPlanDecomposed(ctx context.Context, parentRunID, parentStageID uuid.UUID, childIDs []string, rationale string, effectiveMaxParallel int, waves [][]int) {
 	if o.Audit == nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping plan_decomposed entry",
 			slog.String("parent_run_id", parentRunID.String()))
@@ -1300,6 +1333,12 @@ func (o *Orchestrator) emitPlanDecomposed(ctx context.Context, parentRunID, pare
 		"rationale":              rationale,
 		"parent_stage_id":        parentStageID.String(),
 		"effective_max_parallel": effectiveMaxParallel,
+		// waves carries the topological dispatch order as ordered waves of
+		// slice indices into child_run_ids (#1258 slice B). The MCP wave loop
+		// maps each wave's indices back to child run ids and integrates between
+		// waves. A nil/absent waves decodes back-compat as a single all-indices
+		// wave on the consumer side.
+		"waves": waves,
 	})
 	if err != nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal plan_decomposed payload failed",

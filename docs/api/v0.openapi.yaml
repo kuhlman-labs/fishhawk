@@ -2337,6 +2337,95 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/runs/{run_id}/integrate-wave:
+    post:
+      operationId: integrateWave
+      summary: Non-settling per-wave fan-in of a decomposed parent (E24.X / #1278)
+      description: |
+        The NON-settling per-wave fan-in (#1278 slice B / ADR-041) the
+        topological-wave `fishhawk_run_children` dispatch calls BETWEEN waves.
+        It merges the slices SUCCEEDED SO FAR onto the consolidated branch so a
+        later wave's dependent slices cut their branch from a tree that already
+        contains the predecessors' merged symbols.
+
+        Mechanism: reuses the EXACT same exported `IntegrateSlices` primitive
+        `POST /consolidate` uses — no new git-merge code — which filters to
+        succeeded slices ascending and is idempotent (already-merged 204 /
+        branch-exists 422 no-ops).
+
+        **How it DIFFERS from `/consolidate` (the terminal fan-in).** Unlike
+        `/consolidate`, integrate-wave is intermediate and deliberately does
+        NOT settle the parent:
+        - it does NOT require all children terminal (it merges whatever has
+          succeeded so far);
+        - it does NOT transition the parent implement stage (the stage state is
+          identical before and after — on BOTH the integrated and the
+          slice_conflict outcome; the driver decides what to do on a conflict);
+        - it does NOT advance the run or open the consolidated PR.
+        The final terminal fan-in (stage resolution + consolidated PR) stays
+        driven by `/consolidate` after the LAST wave's children settle.
+
+        **Preconditions** (each a refusal): the run is a decomposed parent
+        (`decomposed_from` null AND it has ≥1 decomposed child, else 400
+        `not_a_decomposed_parent`). There is intentionally NO
+        terminal-children / awaiting_children precondition — that is the whole
+        point of the per-wave fan-in.
+
+        **Authorization.** Requires `write:runs`. A run-bound MCP token
+        (subject `mcp:run:<uuid>`) is refused 403 (`agent_token_forbidden`) —
+        the fan-in is an operator action.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: |
+            The per-wave fan-in ran. `outcome` is `integrated` (the succeeded
+            slices so far merged; `consolidated_branch` set) or `slice_conflict`
+            (a slice failed to merge; `conflicting_slice_index` +
+            `conflicting_child_run_id` set). The parent stage is UNCHANGED on
+            both outcomes — there is no `resolved_to_state`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  outcome:
+                    type: string
+                    enum: [integrated, slice_conflict]
+                    description: 'integrated = the succeeded slices merged onto the consolidated branch; slice_conflict = a slice failed to merge (parent stage left unchanged).'
+                  consolidated_branch: { type: string, description: 'The consolidated branch name; set on the integrated outcome.' }
+                  conflicting_slice_index: { type: integer, description: 'The slice index that failed to merge; set on the slice_conflict outcome.' }
+                  conflicting_child_run_id: { type: string, description: 'The child run id owning the conflicting slice; set on the slice_conflict outcome.' }
+                  detail: { type: string, description: 'Human-readable conflict detail; set on the slice_conflict outcome.' }
+        '400':
+          description: |
+            The run is not a decomposed parent (a child, or has no children).
+            Body's `error` is `not_a_decomposed_parent`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            One of two cases: (1) bearer token lacks `write:runs` scope — body
+            `error` is `insufficient_scope`; (2) a run-bound MCP token attempted
+            the fan-in — body `error` is `agent_token_forbidden`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '502':
+          description: |
+            The slice integration failed with a non-conflict error (e.g. a base
+            ref or branch-create failure). Body's `error` is
+            `slice_integration_error` and `details.error` carries the cause. The
+            parent stage is left unchanged for retry.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/runs/{run_id}/recover:
     post:
       operationId: recoverRun
