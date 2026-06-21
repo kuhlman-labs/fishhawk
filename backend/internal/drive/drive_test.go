@@ -51,6 +51,7 @@ func (a *auditStub) ListForRunByCategory(_ context.Context, runID uuid.UUID, cat
 func TestMechanical_RuleTable(t *testing.T) {
 	for _, rule := range []Rule{
 		RulePlanApprovedDispatch,
+		RuleReviseReplan,
 		RuleReviewsSettledGate,
 		RuleFixupRereviewRepark,
 		RuleChecksGreenAwaitingMerge,
@@ -90,6 +91,26 @@ func TestEvaluatePlanApproved_Local_ParksWithNextAction(t *testing.T) {
 	}
 	if out.NextAction == nil || out.NextAction.Action != "run_implement_stage" {
 		t.Fatalf("NextAction = %+v, want action run_implement_stage", out.NextAction)
+	}
+}
+
+func TestEvaluateReviseReplan_GitHubActions_Advances(t *testing.T) {
+	out := EvaluateReviseReplan(run.RunnerKindGitHubActions)
+	if !out.Advance {
+		t.Fatal("Advance = false, want true for runner_kind github_actions (workflow_dispatch is the re-run)")
+	}
+	if out.NextAction != nil {
+		t.Errorf("NextAction = %+v, want nil (nothing for the operator to do)", out.NextAction)
+	}
+}
+
+func TestEvaluateReviseReplan_Local_ParksWithNextAction(t *testing.T) {
+	out := EvaluateReviseReplan(run.RunnerKindLocal)
+	if out.Advance {
+		t.Fatal("Advance = true, want false: the backend cannot spawn the host-side runner (ADR-024)")
+	}
+	if out.NextAction == nil || out.NextAction.Action != "run_plan_stage" {
+		t.Fatalf("NextAction = %+v, want action run_plan_stage", out.NextAction)
 	}
 }
 

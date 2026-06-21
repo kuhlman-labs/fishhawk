@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -245,6 +246,18 @@ func (s *Server) handleRevisePlan(w http.ResponseWriter, r *http.Request) {
 		if updated, err := s.cfg.RunRepo.GetStage(r.Context(), dec.Stage.ID); err == nil {
 			dec.Stage = updated
 		}
+		// Drive (#1256): the revise re-open is the revise_replan transition
+		// point — the orchestrator handoff above IS the auto-advance
+		// (workflow_dispatch for runner_kind github_actions), so stamp the
+		// run_auto_advanced entry that surfaces the required next action on
+		// the authoritative REST run resource; runner_kind local parks with a
+		// host-side run_plan_stage next action instead (ADR-024: the runner
+		// is host-spawned, the backend has no execution channel to it).
+		// Mirrors recordDrivePlanApproved on the approve path; placed after
+		// the Advance attempt so the entry documents an advance actually
+		// attempted, and the re-open-to-pending guard ensures it fires only
+		// when the revise genuinely re-opened the stage.
+		s.recordDriveReviseReplan(r.Context(), dec.Stage)
 	}
 
 	// Sticky status comment (E20.4 / #330): a revise flips the plan stage
@@ -252,6 +265,40 @@ func (s *Server) handleRevisePlan(w http.ResponseWriter, r *http.Request) {
 	s.notifyStatusUpdate(r.Context(), dec.Stage.RunID, "plan_revised")
 
 	s.writeJSON(w, r, http.StatusOK, toStageResponse(dec.Stage))
+}
+
+// recordDriveReviseReplan stamps the drive engine's revise_replan rule
+// (#1256) after a plan-gate revise re-opens the plan stage. No-ops for
+// non-drive runs, when no engine is wired, or on a run read failure
+// (best-effort: the revise already landed; a missing stamp degrades
+// attribution, never the run). For runner_kind github_actions the entry
+// records the advance the orchestrator's workflow_dispatch fired; for
+// runner_kind local it records the park (Parked=true) with the
+// run_plan_stage next action that surfaces on the REST run resource and
+// MCP get_run_status. The entry is keyed to the re-opened plan stage.
+func (s *Server) recordDriveReviseReplan(ctx context.Context, stage *run.Stage) {
+	if s.drive == nil || s.cfg.RunRepo == nil {
+		return
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
+	if err != nil || !runRow.Drive {
+		return
+	}
+	out := drive.EvaluateReviseReplan(runRow.RunnerKind)
+	adv := drive.Advance{
+		Rule: drive.RuleReviseReplan,
+		From: "plan:revised",
+	}
+	if out.Advance {
+		adv.To = "plan:dispatched"
+		adv.Event = "plan gate revised; orchestrator re-dispatched the plan stage via workflow_dispatch"
+	} else {
+		adv.To = "plan:ready"
+		adv.Event = "plan gate revised; runner_kind local parks for a host-side re-dispatch"
+		adv.Parked = true
+		adv.NextAction = out.NextAction
+	}
+	s.drive.Record(ctx, stage.RunID, &stage.ID, adv)
 }
 
 // countRevisePasses returns the number of prior plan_revised audit

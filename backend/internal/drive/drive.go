@@ -43,6 +43,16 @@ const (
 	// where the runner is host-spawned per ADR-024 and the backend has
 	// no execution channel to it).
 	RulePlanApprovedDispatch Rule = "plan_approved_dispatch"
+	// RuleReviseReplan covers the plan-gate revise verdict re-opening the
+	// plan stage (awaiting_approval → pending) for a re-plan in place. Like
+	// RulePlanApprovedDispatch it is mechanical: the operator already
+	// expressed intent by calling revise_plan with a binding constraint, so
+	// the re-dispatch is a mechanical transition, not a judgment point. For
+	// runner_kind github_actions the orchestrator's workflow_dispatch edge
+	// is the re-run (auto-advance); local parks with a host-side
+	// run_plan_stage next action, because the runner is host-spawned per
+	// ADR-024 and the backend has no execution channel to it.
+	RuleReviseReplan Rule = "revise_replan"
 	// RuleReviewsSettledGate covers every configured agent review for
 	// a stage reaching a terminal state, so the gate evaluation
 	// proceeds without an operator await/poll.
@@ -95,6 +105,7 @@ const (
 // auto-advance under drive; false rules always park for the operator.
 var mechanical = map[Rule]bool{
 	RulePlanApprovedDispatch:     true,
+	RuleReviseReplan:             true,
 	RuleReviewsSettledGate:       true,
 	RuleFixupRereviewRepark:      true,
 	RuleChecksGreenAwaitingMerge: true,
@@ -142,6 +153,27 @@ func EvaluatePlanApproved(runnerKind string) Outcome {
 			NextAction: &NextAction{
 				Action: "run_implement_stage",
 				Detail: "runner_kind local: dispatch the implement stage from the operator host (fishhawk_run_stage implement)",
+			},
+		}
+	}
+	return Outcome{Advance: true}
+}
+
+// EvaluateReviseReplan classifies the plan-gate revise re-plan
+// transition (awaiting_approval → pending → dispatched) for the run's
+// runner kind, mirroring EvaluatePlanApproved (the dispatch primitive
+// is the same runner-kind-aware Advance edge). github_actions
+// auto-advances (the orchestrator's existing workflow_dispatch edge is
+// the re-run); local parks with a ready-to-run next action because the
+// runner is a host-spawned subprocess (ADR-024) the backend cannot
+// start.
+func EvaluateReviseReplan(runnerKind string) Outcome {
+	if runnerKind == run.RunnerKindLocal {
+		return Outcome{
+			Advance: false,
+			NextAction: &NextAction{
+				Action: "run_plan_stage",
+				Detail: "runner_kind local: dispatch the re-planned plan stage from the operator host (fishhawk_run_stage plan)",
 			},
 		}
 	}
