@@ -97,18 +97,50 @@ func TestApply_ADRZeroPadsViaDefault(t *testing.T) {
 	}
 }
 
-func TestApply_ADRFirstNumberIsOne(t *testing.T) {
+// TestApply_ADREmptyExistingNumbersFailsClosed is the #1265 done-means: a
+// numbered type (adr) filed with omitted/nil existing_numbers must fail loud
+// with a *SemanticError carrying the numbered-type cause, rendering NO item,
+// rather than silently allocating ADR-001.
+func TestApply_ADREmptyExistingNumbersFailsClosed(t *testing.T) {
 	conv := testConventions(t)
-	_, num, err := Apply(FilingRequest{
+	item, num, err := Apply(FilingRequest{
 		Type:    "adr",
 		Summary: "first decision",
 		Body:    "## Context\n\n…\n",
+	}, conv)
+	var se *SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("want *SemanticError, got err=%v num=%d", err, num)
+	}
+	if !strings.Contains(se.Error(), "existing_numbers is required") {
+		t.Errorf("Msg = %q, want the existing_numbers-required message", se.Error())
+	}
+	if se.Details["existing_numbers_required"] != true {
+		t.Errorf("Details.existing_numbers_required = %v, want true", se.Details["existing_numbers_required"])
+	}
+	if item.Title != "" {
+		t.Errorf("rendered a title %q despite the fail-closed allocate", item.Title)
+	}
+}
+
+// TestApply_ADRSeedZeroYieldsOne pins the documented explicit-first escape:
+// a non-empty seed existing_numbers:[0] (max 0 -> 1) still files [ADR-001].
+func TestApply_ADRSeedZeroYieldsOne(t *testing.T) {
+	conv := testConventions(t)
+	item, num, err := Apply(FilingRequest{
+		Type:            "adr",
+		Summary:         "first decision",
+		Body:            "## Context\n\n…\n",
+		ExistingNumbers: []int{0},
 	}, conv)
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	if num != 1 {
-		t.Errorf("first ADR number = %d, want 1", num)
+		t.Errorf("seeded-first ADR number = %d, want 1", num)
+	}
+	if want := "[ADR-001] first decision"; item.Title != want {
+		t.Errorf("title = %q, want %q", item.Title, want)
 	}
 }
 
@@ -194,11 +226,14 @@ func TestApply_EpicLinkRequiredEnforced(t *testing.T) {
 
 func TestApply_EpicLinkNoneRejectsEpic(t *testing.T) {
 	conv := testConventions(t)
-	// adr declares epic_link: none.
+	// adr declares epic_link: none. Seed existing_numbers so allocation
+	// succeeds and the apply reaches the relations check (#1265 makes
+	// existing_numbers mandatory for the numbered adr type).
 	_, _, err := Apply(FilingRequest{
-		Type:      "adr",
-		Summary:   "x",
-		Relations: Relations{ParentEpic: "#1"},
+		Type:            "adr",
+		Summary:         "x",
+		Relations:       Relations{ParentEpic: "#1"},
+		ExistingNumbers: []int{1},
 	}, conv)
 	if err == nil || !strings.Contains(err.Error(), "does not take a parent epic") {
 		t.Fatalf("want epic-none error, got %v", err)
