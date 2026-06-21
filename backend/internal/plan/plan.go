@@ -18,7 +18,10 @@
 // available.
 package plan
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Plan is a parsed and schema-validated plan_version: standard_v1
 // artifact. JSON tags mirror the schema; the canonical wire format
@@ -136,6 +139,14 @@ type SubPlanSummary struct {
 	// this sub-plan resolves it through the same chokepoint as a top-level
 	// recommendation. Nil means the child has no per-slice recommendation.
 	ModelRecommendation *ModelRecommendation `json:"model_recommendation,omitempty"`
+	// DependsOn lists the 0-based indices of sibling sub_plans this slice
+	// depends on within the same Decomposition (#1258). Waves consumes it to
+	// derive the topological dispatch order: a slice runs only after every
+	// slice it depends on has completed. Omitted/empty means no dependency —
+	// the slice is eligible in the first wave. Validated by Waves (wired into
+	// semanticCheck): out-of-range, negative, self, or cyclic indices are
+	// rejected at the plan gate.
+	DependsOn []int `json:"depends_on,omitempty"`
 }
 
 // Decomposition holds the rationale and sub-plan summaries when
@@ -144,6 +155,84 @@ type SubPlanSummary struct {
 type Decomposition struct {
 	Rationale string           `json:"rationale"`
 	SubPlans  []SubPlanSummary `json:"sub_plans"`
+}
+
+// Waves derives the topological dispatch order for a decomposition's
+// sub_plans from their depends_on edges (#1258), returning ordered waves of
+// 0-based sub-plan indices. Wave 0 holds every slice with no unsatisfied
+// dependency; each subsequent wave holds the slices whose dependencies all
+// appeared in an earlier wave. Within a wave, indices are emitted in
+// ascending order for deterministic output. A decomposition with no
+// depends_on anywhere collapses to a single wave [[0,1,...,n-1]]
+// (back-compat). It is a pure Kahn topological sort with no side effects;
+// no downstream dispatch consumes the result yet (slice B, #1278).
+//
+// Waves fails loud rather than silently dropping a slice:
+//   - a depends_on index outside [0, len(sub_plans)) (out-of-range or negative);
+//   - a slice depending on itself (self-dependency);
+//   - a dependency cycle that leaves some slices unplaceable.
+//
+// A nil decomposition or one with no sub_plans returns (nil, nil).
+func Waves(d *Decomposition) ([][]int, error) {
+	if d == nil || len(d.SubPlans) == 0 {
+		return nil, nil
+	}
+	n := len(d.SubPlans)
+
+	// Validate every edge before layering so a malformed index is reported
+	// as such rather than masquerading as a cycle.
+	for i, sp := range d.SubPlans {
+		for _, dep := range sp.DependsOn {
+			if dep < 0 || dep >= n {
+				return nil, fmt.Errorf("sub_plan %d depends_on index %d out of range [0,%d)", i, dep, n)
+			}
+			if dep == i {
+				return nil, fmt.Errorf("sub_plan %d depends_on itself (index %d)", i, dep)
+			}
+		}
+	}
+
+	// Kahn layering: a node joins a wave once every node it depends on has
+	// been placed in an earlier wave. Iterating i ascending keeps each wave
+	// (and the cycle report below) in ascending index order.
+	placed := make([]bool, n)
+	remaining := n
+	var waves [][]int
+	for remaining > 0 {
+		var wave []int
+		for i := 0; i < n; i++ {
+			if placed[i] {
+				continue
+			}
+			ready := true
+			for _, dep := range d.SubPlans[i].DependsOn {
+				if !placed[dep] {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				wave = append(wave, i)
+			}
+		}
+		if len(wave) == 0 {
+			// No node became ready this pass: every unplaced node sits on a
+			// dependency cycle.
+			var stuck []int
+			for i := 0; i < n; i++ {
+				if !placed[i] {
+					stuck = append(stuck, i)
+				}
+			}
+			return nil, fmt.Errorf("dependency cycle among sub_plans %v", stuck)
+		}
+		for _, i := range wave {
+			placed[i] = true
+		}
+		remaining -= len(wave)
+		waves = append(waves, wave)
+	}
+	return waves, nil
 }
 
 // TicketReference identifies the originating ticket. v0 closed set:
