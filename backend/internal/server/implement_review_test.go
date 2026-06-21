@@ -34,7 +34,7 @@ func (s *Server) runImplementReviewLoop(ctx context.Context, runID, stageID uuid
 	for i := range invocations {
 		invocations[i] = reviewerInvocation{reviewer: s.defaultPlanReviewer()}
 	}
-	return s.runImplementReviewInvocations(ctx, runID, stageID, invocations, authority, promptText, authorModel)
+	return s.runImplementReviewInvocations(ctx, runID, stageID, invocations, authority, promptText, authorModel, "", "")
 }
 
 // Implement-stage workflow specs with reviewers config. The implement
@@ -1398,7 +1398,7 @@ func TestImplementReviewLoop_PersistsConcernsWithOriginSequence(t *testing.T) {
 
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
 		[]reviewerInvocation{{reviewer: rev1}, {reviewer: rev2}},
-		planreview.AuthorityAdvisory, "prompt", "author-model")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "")
 
 	reviewed := au.entriesByCategory("implement_reviewed")
 	if len(reviewed) != 2 {
@@ -1463,7 +1463,7 @@ func TestImplementReviewLoop_FailedAppendSkipsConcernPersistence(t *testing.T) {
 		model: "claude-opus-4-8",
 	}
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author")
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "")
 
 	rows, _ := cr.ListByRun(context.Background(), runID)
 	if len(rows) != 0 {
@@ -1489,7 +1489,7 @@ func TestImplementReviewLoop_ConcernInsertFailureDoesNotFailLoop(t *testing.T) {
 		model: "claude-opus-4-8",
 	}
 	hasRejection := s.runImplementReviewInvocations(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author")
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "")
 
 	if !hasRejection {
 		t.Error("hasRejection = false, want true (insert failure must not mask the verdict)")
@@ -1529,7 +1529,7 @@ func TestImplementReviewLoop_ConfirmedResolutionTransitionsToAddressed(t *testin
 		model: "claude-opus-4-8",
 	}
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author")
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "")
 
 	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
 	if rows[0].State != concern.StateAddressed {
@@ -1595,7 +1595,7 @@ func TestImplementReviewLoop_ReopenWinsBothOrders(t *testing.T) {
 			}
 			s.runImplementReviewInvocations(context.Background(), runID, stageID,
 				[]reviewerInvocation{{reviewer: revA}, {reviewer: revB}},
-				planreview.AuthorityAdvisory, "prompt", "author")
+				planreview.AuthorityAdvisory, "prompt", "author", "", "")
 
 			rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
 			if rows[0].State != concern.StateReopened {
@@ -1636,7 +1636,7 @@ func TestImplementReviewLoop_SloppyResolutionsWarnSkip(t *testing.T) {
 		model: "claude-opus-4-8",
 	}
 	hasRejection := s.runImplementReviewInvocations(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author")
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "")
 	if hasRejection {
 		t.Error("hasRejection = true, want false (sloppy resolutions must not affect the verdict)")
 	}

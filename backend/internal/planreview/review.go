@@ -299,4 +299,27 @@ type ImplementReviewedPayload struct {
 	// Usage contract (#1010).
 	InputTokens  int `json:"input_tokens,omitempty"`
 	OutputTokens int `json:"output_tokens,omitempty"`
+
+	// Origin marks a non-first-review provenance for the verdict (#1250).
+	// Empty on the first review and the parent-decomposition consolidated
+	// review (byte-identical). The base-rebase re-invoke supplemental pass
+	// sets Origin="base_rebase_reinvoke" so this additive verdict is
+	// labelable and so the pre-dispatch idempotency dedup can key on
+	// (stage_id, Origin, HeadSHA). omitempty keeps origin-free payloads
+	// byte-identical to pre-#1250 entries.
+	Origin string `json:"origin,omitempty"`
+
+	// HeadSHA is the re-landed head SHA the supplemental verdict is anchored
+	// to (#1250): the pushed tree the base-rebase re-invoke produced. Paired
+	// with Origin it forms the (stage_id, Origin, HeadSHA) idempotency key
+	// that dedups a retried PR-upload. Empty on every non-supplemental
+	// review; omitempty keeps those payloads byte-identical.
+	HeadSHA string `json:"head_sha,omitempty"`
 }
+
+// OriginBaseRebaseReinvoke is the ImplementReviewedPayload.Origin marker
+// for the base-rebase re-invoke supplemental implement-review pass (#1250).
+// The first review and the parent-decomposition consolidated review leave
+// Origin empty; only runSupplementalReinvokeReview stamps this value, which
+// the pre-dispatch idempotency dedup keys on together with HeadSHA.
+const OriginBaseRebaseReinvoke = "base_rebase_reinvoke"

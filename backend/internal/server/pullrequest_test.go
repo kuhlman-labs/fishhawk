@@ -11,11 +11,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
@@ -1351,5 +1354,237 @@ func TestShipPullRequest_SupplementalScopeExemptions_BestEffortOnAuditError(t *t
 	}
 	if sup := findAuditByCategory(t, au, CategoryScopeFilesExempted); sup != nil {
 		t.Errorf("supplemental row unexpectedly recorded despite forced append error: %s", string(sup.Payload))
+	}
+}
+
+// --- Supplemental base-rebase re-invoke REVIEW dispatch (#1250 / ADR-042) ---
+
+// newSupplementalReviewPRServer wires a reviewer-configured implement-review
+// server (orchestratorRepo + plan artifact + reviewer set, via
+// newImplementReviewServer) and flips the implement stage to `running` so the
+// #742 terminal-drive branch of handleShipPullRequest fires and dispatches the
+// #1250 supplemental review. Returns the server, signing fake, audit fake, run
+// repo, run row, and the running implement stage.
+func newSupplementalReviewPRServer(t *testing.T, reviewer PlanReviewer, spec []byte) (
+	*Server, *signingFake, *auditFake, *orchestratorRepo, *run.Run, *run.Stage,
+) {
+	t.Helper()
+	s, sf, au, rr, runRow, implStage := newImplementReviewServer(t, reviewer, spec)
+	implStage.State = run.StageStateRunning
+	return s, sf, au, rr, runRow, implStage
+}
+
+// runnerShapedSupplementalPRBody returns a realistic runner-shaped success
+// pull-request body whose supplemental_scope_exemptions use the runner's
+// lowercase {path,reason} wire keys (matching scopeExemptionEvidence) — the
+// cross-boundary seam the integration test drives end-to-end.
+func runnerShapedSupplementalPRBody(t *testing.T, headSHA, path, reason string) []byte {
+	t.Helper()
+	body := fmt.Sprintf(`{
+		"pr_number": 42,
+		"pr_url": "https://github.com/kuhlman-labs/example/pull/42",
+		"branch": "fishhawk/run-aaa/stage-bbb",
+		"head_sha": %q,
+		"base_sha": "2222222222222222222222222222222222222222",
+		"title": "Add foo helper",
+		"body": "Opened by Fishhawk.",
+		"files_changed_count": 2,
+		"supplemental_scope_exemptions": [{"path": %q, "reason": %q}]
+	}`, headSHA, path, reason)
+	return []byte(body)
+}
+
+// TestShipPullRequest_SupplementalReinvokeReview_CrossBoundary is the
+// cross-boundary integration test (#1250): a runner-shaped success body whose
+// supplemental_scope_exemptions use the runner's lowercase {path,reason} wire
+// keys flows through handleShipPullRequest's decode → the terminal-drive
+// dispatch → runSupplementalReinvokeReview, and the captured reviewer prompt's
+// gate_evidence section contains the supplied exemption path+reason plus the
+// supplemental framing. This crosses payload-decode, dispatch, and
+// prompt-render layers (cf. #618) — a per-layer unit would pass while the seam
+// breaks. It also asserts the #1218 audit row lands complementarily.
+func TestShipPullRequest_SupplementalReinvokeReview_CrossBoundary(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, au, _, runRow, implStage := newSupplementalReviewPRServer(t, reviewer, specImplementAdvisoryReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	const reHead = "abc123abc123abc123abc123abc123abc123abcd"
+	const exPath = "backend/internal/foo/foo.go"
+	const exReason = "already correct after the base rebase"
+	body := runnerShapedSupplementalPRBody(t, reHead, exPath, exReason)
+
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// Advisory dispatch is detached — drain before asserting on the prompt.
+	s.waitBackgroundReviews()
+
+	reviewer.mu.Lock()
+	calls := append([]string(nil), reviewer.calls...)
+	reviewer.mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(calls))
+	}
+	got := calls[0]
+	for _, want := range []string{
+		// The supplemental framing.
+		"Supplemental review: base-rebase re-invoke scope exemptions",
+		"SUPPLEMENTAL, bounded review pass — NOT a full re-review",
+		// The exemption delta rendered in the gate_evidence section — the seam
+		// from the runner's lowercase wire keys to the reviewer-visible prompt.
+		"Self-exempted declared scope files (agent justified leaving these unchanged):",
+		"- " + exPath + " — " + exReason,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("supplemental reviewer prompt missing %q:\n%s", want, got)
+		}
+	}
+	// No diff section in the supplemental pass.
+	if strings.Contains(got, "### Diff under review") {
+		t.Errorf("supplemental prompt must not render a diff section:\n%s", got)
+	}
+
+	// The verdict is recorded with the re-invoke provenance.
+	sup := findSupplementalImplementReviewed(t, au, implStage.ID)
+	if sup == nil {
+		t.Fatal("no supplemental implement_reviewed entry recorded")
+	}
+	if sup.HeadSHA != reHead {
+		t.Errorf("supplemental HeadSHA = %q, want %q", sup.HeadSHA, reHead)
+	}
+	// The #1218 audit row is complementary and still lands.
+	if findAuditByCategory(t, au, CategoryScopeFilesExempted) == nil {
+		t.Error("complementary #1218 scope_files_exempted audit row missing")
+	}
+}
+
+// TestShipPullRequest_SupplementalReinvokeReview_EmptyDelta_NoDispatch pins the
+// EMPTY-delta branch at the HTTP boundary (#1250 failure-mode 4): an ordinary
+// non-re-invoke success ship (no supplemental_scope_exemptions) dispatches NO
+// supplemental review and advances the stage normally — byte-identical to the
+// pre-#1250 path.
+func TestShipPullRequest_SupplementalReinvokeReview_EmptyDelta_NoDispatch(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, au, rr, runRow, implStage := newSupplementalReviewPRServer(t, reviewer, specImplementAdvisoryReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, validPRBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+
+	reviewer.mu.Lock()
+	calls := len(reviewer.calls)
+	reviewer.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("reviewer invoked %d times on an empty-delta ship, want 0", calls)
+	}
+	if n := countAuditCategory(au, "implement_reviewed"); n != 0 {
+		t.Errorf("implement_reviewed = %d on an empty-delta ship, want 0", n)
+	}
+	// The stage advanced normally (running → awaiting_approval, it requires
+	// approval) — the empty-delta path is the unchanged terminal drive.
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (unchanged terminal drive)", got.State)
+	}
+}
+
+// TestShipPullRequest_SupplementalReinvokeReview_GatingApprove_Advances pins
+// failure-mode (3) at the HTTP boundary: a gating-authority supplemental
+// APPROVE advances the stage normally and records the additive verdict.
+func TestShipPullRequest_SupplementalReinvokeReview_GatingApprove_Advances(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "gpt-5.5",
+	}
+	s, sf, au, rr, runRow, implStage := newSupplementalReviewPRServer(t, reviewer, specImplementGatingReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+
+	body := runnerShapedSupplementalPRBody(t, "feed00dfeed00dfeed00dfeed00dfeed00dfeed0",
+		"backend/internal/foo/foo.go", "unchanged after rebase")
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (gating approve advances)", got.State)
+	}
+	if findSupplementalImplementReviewed(t, au, implStage.ID) == nil {
+		t.Error("no supplemental implement_reviewed entry recorded on gating approve")
+	}
+}
+
+// TestShipPullRequest_SupplementalReinvokeReview_GatingReject_FailsAndClosesPR
+// pins failure-mode (2) at the HTTP boundary: a gating-authority supplemental
+// REJECT fails the implement stage category-B with implementReviewGatingRejectReason
+// and closes the dangling PR via the #877 helper. Wires a GitHub fake +
+// InstallationID so the close actually fires and is audited.
+func TestShipPullRequest_SupplementalReinvokeReview_GatingReject_FailsAndClosesPR(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+		model:   "gpt-5.5",
+	}
+	s, sf, au, rr, runRow, implStage := newSupplementalReviewPRServer(t, reviewer, specImplementGatingReviewers)
+
+	// Wire a GitHub fake so closePRAfterGatingReject actually closes + audits.
+	rec := &closeRecorder{}
+	ghSrv := rec.server(t)
+	s.cfg.GitHub = &githubclient.Client{
+		BaseURL: ghSrv.URL,
+		Tokens:  &ghTokensStub{tok: "ghs_test"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "gha_app_jwt_test", nil },
+	}
+	inst := int64(12345)
+	runRow.InstallationID = &inst
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body := runnerShapedSupplementalPRBody(t, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		"backend/internal/foo/foo.go", "hollow reason the reviewer rejects")
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateFailed {
+		t.Fatalf("stage state = %q, want failed (gating reject)", got.State)
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != run.FailureB {
+		t.Errorf("failure category = %v, want B", got.FailureCategory)
+	}
+	if got.FailureReason == nil || !strings.HasPrefix(*got.FailureReason, implementReviewGatingRejectPrefix) {
+		t.Errorf("failure reason = %v, want the gating-reject prefix", got.FailureReason)
+	}
+	// The dangling PR was closed and audited (#877 helper reused).
+	rec.mu.Lock()
+	closeCalls := rec.closeCalls
+	rec.mu.Unlock()
+	if closeCalls != 1 {
+		t.Errorf("PR close calls = %d, want 1 (closePRAfterGatingReject)", closeCalls)
+	}
+	if n := auditCategoryCount(au, "pull_request_closed_after_review_reject"); n != 1 {
+		t.Errorf("pull_request_closed_after_review_reject audit entries = %d, want 1", n)
 	}
 }

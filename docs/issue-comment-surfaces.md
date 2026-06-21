@@ -47,6 +47,20 @@ Notes:
   dispatch boundary, mirroring `decodeReviewVerdicts`' `sinceSeq` floor in
   `fishhawk-mcp/review.go`), so a stale prior-round verdict never reads as the
   current round's state.
+- **Base-rebase re-invoke supplemental verdict (ADR-042 / #1250).** On a
+  base-rebase re-invoke ship the backend dispatches an ADDITIONAL, bounded
+  `implement_reviewed` verdict (`origin=base_rebase_reinvoke`) judging the
+  extra scope exemptions the re-invoke honored after the first review. It is
+  ADDITIVE, not a replacement: `runSupplementalReinvokeReview` deliberately
+  does NOT emit a fresh `implement_review_started`, so the verdict-counting
+  floor above stays at the first review's dispatch and the supplemental verdict
+  counts ABOVE it — the anchor surfaces the first review's N verdict(s) PLUS
+  the supplemental one(s) in the same round (an honest higher count the
+  additive floor logic already handles, no anchor code change). This is a
+  VERDICT surface (an additional `implement_reviewed` row, rendered by the
+  existing anchor/`get_run_status` machinery), NOT a new issue-comment kind;
+  the `origin`/`head_sha` provenance fields are retained for idempotency dedup,
+  not for a new rendering surface in this slice.
 - **Gate-decision timeline projection (#1070).** The anchor timeline renders
   each `approval_submitted` row as a first-class gate-decision entry instead
   of a bare activity line: the approver identity (#1053), a precise decision
