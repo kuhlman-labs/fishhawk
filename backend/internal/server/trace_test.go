@@ -3434,3 +3434,232 @@ func TestCheckSpendAlert_FamilyFanOutAggregates(t *testing.T) {
 		t.Errorf("prior_hours = %d, want 3", ap.PriorHours)
 	}
 }
+
+// --- Supplemental base-rebase re-invoke review (#1250) ---
+
+// supplementalExemptions is the standard delta the #1250 tests dispatch with.
+func supplementalExemptions() []prompt.GateScopeExemption {
+	return []prompt.GateScopeExemption{
+		{Path: "backend/internal/foo/foo.go", Reason: "already correct after the rebase"},
+	}
+}
+
+// findSupplementalImplementReviewed returns the single implement_reviewed
+// audit entry carrying Origin=base_rebase_reinvoke for the stage, or nil.
+func findSupplementalImplementReviewed(t *testing.T, au *auditFake, stageID uuid.UUID) *planreview.ImplementReviewedPayload {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var got *planreview.ImplementReviewedPayload
+	for i := range au.appended {
+		ap := au.appended[i]
+		if ap.Category != "implement_reviewed" || ap.StageID == nil || *ap.StageID != stageID {
+			continue
+		}
+		var p planreview.ImplementReviewedPayload
+		if err := json.Unmarshal(ap.Payload, &p); err != nil {
+			t.Fatalf("decode implement_reviewed payload: %v", err)
+		}
+		if p.Origin != planreview.OriginBaseRebaseReinvoke {
+			continue
+		}
+		if got != nil {
+			t.Fatalf("more than one supplemental implement_reviewed entry for stage %s", stageID)
+		}
+		cp := p
+		got = &cp
+	}
+	return got
+}
+
+// seedFirstReviewRound appends a first-review round (one implement_review_started
+// + one origin-less implement_reviewed) for the stage so a test can assert the
+// supplemental verdict counts ADDITIVELY without burying it (condition 2).
+func seedFirstReviewRound(t *testing.T, au *auditFake, runID, stageID uuid.UUID) {
+	t.Helper()
+	system := audit.ActorKind("system")
+	startedPayload, _ := json.Marshal(planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityAdvisory})
+	if _, err := au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: runID, StageID: &stageID, Category: "implement_review_started", ActorKind: &system, Payload: startedPayload,
+	}); err != nil {
+		t.Fatalf("seed implement_review_started: %v", err)
+	}
+	reviewedPayload, _ := json.Marshal(planreview.ImplementReviewedPayload{
+		ReviewerKind: "agent", Authority: planreview.AuthorityAdvisory, Verdict: planreview.VerdictApprove,
+	})
+	if _, err := au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: runID, StageID: &stageID, Category: "implement_reviewed", ActorKind: &system, Payload: reviewedPayload,
+	}); err != nil {
+		t.Fatalf("seed implement_reviewed: %v", err)
+	}
+}
+
+// TestRunSupplementalReinvokeReview_AdvisoryAdditive_NoStarted is failure-mode
+// (1) + binding condition 2: an advisory-authority supplemental review records
+// exactly one ADDITIVE implement_reviewed (Origin=base_rebase_reinvoke + the
+// re-landed head_sha), emits NO new implement_review_started (so the anchor
+// floor stays at the first review and the first review's verdict is still
+// counted), and returns false (advisory never gates).
+func TestRunSupplementalReinvokeReview_AdvisoryAdditive_NoStarted(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+
+	// A first review round already landed; the supplemental must not bury it.
+	seedFirstReviewRound(t, au, runRow.ID, implStage.ID)
+
+	const reHead = "abc123abc123abc123abc123abc123abc123abcd"
+	reject := s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, reHead, supplementalExemptions())
+	if reject {
+		t.Fatal("advisory supplemental review must return false (never gates)")
+	}
+	s.waitBackgroundReviews()
+
+	// The floor is unchanged: still exactly one implement_review_started, so the
+	// first review's verdict is still counted alongside the supplemental one.
+	if n := countAuditCategory(au, "implement_review_started"); n != 1 {
+		t.Errorf("implement_review_started = %d, want 1 (supplemental must NOT emit a fresh started — it would advance the anchor floor and bury the first review)", n)
+	}
+	// Two verdicts now: the first review's + the additive supplemental one.
+	if n := countAuditCategory(au, "implement_reviewed"); n != 2 {
+		t.Errorf("implement_reviewed = %d, want 2 (first review + additive supplemental)", n)
+	}
+	sup := findSupplementalImplementReviewed(t, au, implStage.ID)
+	if sup == nil {
+		t.Fatal("no supplemental implement_reviewed entry (Origin=base_rebase_reinvoke)")
+	}
+	if sup.HeadSHA != reHead {
+		t.Errorf("supplemental HeadSHA = %q, want %q", sup.HeadSHA, reHead)
+	}
+}
+
+// TestRunSupplementalReinvokeReview_GatingReject_ReturnsTrue is failure-mode
+// (2): a gating-authority reject returns true (the caller fails the stage
+// category-B), records the supplemental verdict with both provenance fields,
+// and still emits NO implement_review_started.
+func TestRunSupplementalReinvokeReview_GatingReject_ReturnsTrue(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+		model:   "gpt-5.5",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	const reHead = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+	reject := s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, reHead, supplementalExemptions())
+	if !reject {
+		t.Fatal("gating supplemental reject must return true")
+	}
+	if n := countAuditCategory(au, "implement_review_started"); n != 0 {
+		t.Errorf("implement_review_started = %d, want 0 (supplemental never emits started)", n)
+	}
+	sup := findSupplementalImplementReviewed(t, au, implStage.ID)
+	if sup == nil {
+		t.Fatal("no supplemental implement_reviewed entry")
+	}
+	if sup.Verdict != planreview.VerdictReject || sup.HeadSHA != reHead {
+		t.Errorf("supplemental verdict=%q head=%q, want reject + %q", sup.Verdict, sup.HeadSHA, reHead)
+	}
+}
+
+// TestRunSupplementalReinvokeReview_GatingApprove_ReturnsFalse is failure-mode
+// (3): a gating-authority approve returns false (the caller advances the stage)
+// and still records the additive supplemental verdict.
+func TestRunSupplementalReinvokeReview_GatingApprove_ReturnsFalse(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "gpt-5.5",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	if reject := s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, "feed00dfeed00dfeed00dfeed00dfeed00dfeed0", supplementalExemptions()); reject {
+		t.Fatal("gating supplemental approve must return false")
+	}
+	if findSupplementalImplementReviewed(t, au, implStage.ID) == nil {
+		t.Fatal("no supplemental implement_reviewed entry recorded on approve")
+	}
+}
+
+// TestRunSupplementalReinvokeReview_EmptyDelta_NoDispatch is failure-mode (4):
+// an empty exemption delta dispatches NO review (the reviewer is never called
+// and no implement_reviewed lands), returning false.
+func TestRunSupplementalReinvokeReview_EmptyDelta_NoDispatch(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+
+	if reject := s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, "headsha", nil); reject {
+		t.Fatal("empty delta must return false")
+	}
+	s.waitBackgroundReviews()
+	reviewer.mu.Lock()
+	calls := len(reviewer.calls)
+	reviewer.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("reviewer invoked %d times on an empty delta, want 0", calls)
+	}
+	if n := countAuditCategory(au, "implement_reviewed"); n != 0 {
+		t.Errorf("implement_reviewed = %d on an empty delta, want 0", n)
+	}
+}
+
+// TestRunSupplementalReinvokeReview_Idempotent_SerialRetry is failure-mode (5):
+// a retried PR-upload with the SAME re-landed head_sha does NOT dispatch a
+// second supplemental review — the (stage_id, Origin, head_sha) dedup finds the
+// existing entry and skips. The dedup is best-effort for the detached advisory
+// path, exercised here as the serial retry the runner actually performs (it
+// drives a stage's PR-uploads serially), not a concurrency guarantee.
+func TestRunSupplementalReinvokeReview_Idempotent_SerialRetry(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+
+	const reHead = "1111111111111111111111111111111111111111"
+	// First dispatch lands the supplemental verdict.
+	s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, reHead, supplementalExemptions())
+	s.waitBackgroundReviews()
+	if n := countAuditCategory(au, "implement_reviewed"); n != 1 {
+		t.Fatalf("after first dispatch implement_reviewed = %d, want 1", n)
+	}
+
+	// Serial retry with the SAME head_sha must be a no-op.
+	s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, reHead, supplementalExemptions())
+	s.waitBackgroundReviews()
+	if n := countAuditCategory(au, "implement_reviewed"); n != 1 {
+		t.Errorf("after serial retry implement_reviewed = %d, want 1 (dedup on stage_id+origin+head_sha)", n)
+	}
+
+	// A DIFFERENT re-landed head_sha is NOT deduped — it is a genuine new
+	// re-invoke and dispatches its own supplemental review.
+	s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, "2222222222222222222222222222222222222222", supplementalExemptions())
+	s.waitBackgroundReviews()
+	if n := countAuditCategory(au, "implement_reviewed"); n != 2 {
+		t.Errorf("after new-head dispatch implement_reviewed = %d, want 2", n)
+	}
+}
+
+// TestRunSupplementalReinvokeReview_NoReviewerBackend_Skips covers the
+// defaultPlanReviewer()==nil degradation guard: the spec declares an agent
+// reviewer (so the AgentCount()>0 guard passes) but no reviewer backend is
+// wired, so the dispatch is skipped quietly — no implement_reviewed lands and
+// no review_skipped is double-recorded (the first-review path already emitted
+// it). Returns false. This mirrors the first-review path's no-backend skip,
+// which uses the same defaultPlanReviewer() helper.
+func TestRunSupplementalReinvokeReview_NoReviewerBackend_Skips(t *testing.T) {
+	// singleReviewerSet with a nil reviewer: Default() returns nil, so
+	// defaultPlanReviewer() returns nil — the no-backend degradation.
+	s, _, au, _, runRow, implStage := newImplementReviewServerWithSet(t, singleReviewerSet{nil}, specImplementAdvisoryReviewers)
+
+	if reject := s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, "3333333333333333333333333333333333333333", supplementalExemptions()); reject {
+		t.Fatal("no reviewer backend must return false (skip, never gate)")
+	}
+	s.waitBackgroundReviews()
+	if n := countAuditCategory(au, "implement_reviewed"); n != 0 {
+		t.Errorf("implement_reviewed = %d with no reviewer backend, want 0 (dispatch skipped)", n)
+	}
+}

@@ -2566,14 +2566,14 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		s.bgReviews.Add(1)
 		go func() {
 			defer s.bgReviews.Done()
-			s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel)
+			s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "")
 		}()
 		return false
 	}
 
 	// Gating: run synchronously so the caller can fail the stage as
 	// category-B before the terminal transition.
-	return s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel)
+	return s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "")
 }
 
 // amendedScopeFilesForReview computes the approval-time scope folds that the
@@ -2631,7 +2631,14 @@ func (s *Server) amendedScopeFilesForReview(ctx context.Context, runRow *run.Run
 // is reject. It performs no stage transition — the gating caller owns the
 // failed-B transition so the advance-blocking edge stays on the
 // synchronous path only.
-func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel string) bool {
+//
+// origin and headSHA stamp the verdict's provenance (#1250): the first-review
+// and parent-decomposition callers pass "" for both, keeping their
+// implement_reviewed payloads byte-identical; the base-rebase re-invoke
+// supplemental caller passes Origin="base_rebase_reinvoke" + the re-landed
+// head SHA so the additive verdict is labelable and the dispatch idempotent
+// on (stage_id, Origin, HeadSHA).
+func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel, origin, headSHA string) bool {
 	systemKind := audit.ActorKind("system")
 	hasRejection := false
 	budget := s.cfg.ReviewBudget.Budget(len(promptText))
@@ -2705,6 +2712,11 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			// Per-invocation token usage on the review surface (#995).
 			InputTokens:  verdict.Usage.InputTokens,
 			OutputTokens: verdict.Usage.OutputTokens,
+			// Provenance markers (#1250): empty for the first review and the
+			// parent-decomposition consolidated review (byte-identical via
+			// omitempty); set for the base-rebase re-invoke supplemental pass.
+			Origin:  origin,
+			HeadSHA: headSHA,
 		}
 		payloadBytes, _ := json.Marshal(payload)
 		entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -2752,6 +2764,188 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 	s.recomputeAndPublishAuditComplete(ctx, runID)
 
 	return hasRejection
+}
+
+// runSupplementalReinvokeReview dispatches the bounded, ADDITIVE supplemental
+// implement-review pass for a base-rebase re-invoke ship (#1250). When a
+// re-invoke ship carries a non-empty supplemental scope-exemption delta — the
+// extra declared-scope-file exemptions the final scope-completeness gate
+// honored AFTER the first review's sealed bundle shipped under #742 forward
+// gating — this dispatches a second, exemption-scoped review against the
+// PUSHED re-landed tree so the delta reaches the implement-review surface, not
+// only the #1218 audit row.
+//
+// It reuses the lower-level implement-review machinery: resolveStageReviewers
+// + ResolveAuthority (skip when no agent reviewers), the wired-reviewer check
+// (skip when none), loadApprovedPlanForRun (skip on nil — nothing to judge
+// soundness against), resolveReviewerInvocations, and
+// runImplementReviewInvocations, stamping Origin=base_rebase_reinvoke +
+// headSHA so the verdict is labelable and the dispatch idempotent.
+//
+// CRITICAL — it does NOT call emitReviewStarted. The anchor floors
+// verdict-counting at the latest implement_review_started Sequence
+// (anchor_template.go), so emitting a fresh started would advance the floor
+// and BURY the first review's verdict. Skipping it keeps the floor at the
+// first review and lets this implement_reviewed entry count ADDITIVELY above
+// it.
+//
+// Returns true ONLY on a gating-authority reject (the caller fails the stage
+// category-B). Advisory dispatch is detached and returns false. A skipped
+// dispatch (no reviewers, no backend, no plan, or an idempotent duplicate)
+// returns false.
+func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stageID uuid.UUID, headSHA string, exemptions []prompt.GateScopeExemption) bool {
+	if s.cfg.RunRepo == nil || len(exemptions) == 0 {
+		return false
+	}
+
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "supplemental reinvoke review: get run failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+
+	reviewersCfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement)
+	if reviewersCfg == nil || reviewersCfg.AgentCount() == 0 {
+		return false
+	}
+	authority := planreview.ResolveAuthority(*reviewersCfg)
+
+	// No reviewer backend wired: nothing can run. The first-review path
+	// already emitted implement_review_skipped for this stage, so re-emitting
+	// here would only double-record the same degradation; skip quietly.
+	if s.defaultPlanReviewer() == nil {
+		return false
+	}
+
+	// Load the approved plan: the supplemental prompt judges exemption
+	// soundness against the plan's scope/approach (and the self-review guard
+	// needs GeneratedBy.Model). No plan → nothing to measure against → skip.
+	approvedPlan, err := s.loadApprovedPlanForRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "supplemental reinvoke review: load plan failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+	if approvedPlan == nil {
+		return false
+	}
+
+	// Idempotency (#1250): a retried PR-upload with the SAME re-landed head SHA
+	// must not dispatch a second supplemental review. Dedup on
+	// (stage_id, Origin=base_rebase_reinvoke, head_sha). Best-effort and
+	// non-atomic — acceptable because the runner drives a stage's PR-uploads
+	// serially, so there is no concurrent second dispatch to race; a list
+	// error WARN-logs and falls through to dispatch (fail-open, never suppress
+	// a review on a read failure). An empty headSHA cannot be deduped, but the
+	// caller only invokes this on a success ship that carries pr.HeadSHA.
+	if headSHA != "" && s.cfg.AuditRepo != nil {
+		reviewed, lerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "implement_reviewed")
+		if lerr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "supplemental reinvoke review: list implement_reviewed failed — proceeding with dispatch",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", lerr.Error()),
+			)
+		} else if supplementalReinvokeReviewAlreadyRecorded(reviewed, stageID, headSHA) {
+			return false
+		}
+	}
+
+	trig := prompt.Trigger{
+		Repo:                 runRow.Repo,
+		ApprovedPlan:         approvedPlan,
+		SupplementalReinvoke: true,
+		// The additional exemption delta is the entire subject of this pass;
+		// it rides in GateEvidence so buildImplementReview's supplemental
+		// branch renders it via the shared ScopeExemptions section.
+		GateEvidence: &prompt.GateEvidence{ScopeExemptions: exemptions},
+		// The operator's binding approve-with-conditions text (#1021): an
+		// exemption may be sound only in light of a condition, so the
+		// supplemental reviewer must see the same conditions the first review
+		// saw. Same resolver runImplementReviews uses.
+		ApprovalConditions: s.resolveApprovalConditions(ctx, runRow),
+	}
+	if runRow.IssueContext != nil {
+		trig.IssueTitle = runRow.IssueContext.Title
+		trig.IssueBody = runRow.IssueContext.Body
+		for _, c := range runRow.IssueContext.Comments {
+			trig.IssueComments = append(trig.IssueComments, prompt.IssueComment{
+				Author:    c.Author,
+				Body:      c.Body,
+				CreatedAt: c.CreatedAt,
+			})
+		}
+	}
+	if runRow.TriggerRef != nil {
+		if n, ok := parseIssueRef(*runRow.TriggerRef); ok {
+			trig.IssueNumber = n
+		}
+	}
+	promptText, err := prompt.Build("implement_review", trig)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "supplemental reinvoke review: build prompt failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+
+	invocations := s.resolveReviewerInvocations(reviewersCfg)
+	authorModel := approvedPlan.GeneratedBy.Model
+	reviewCtx := context.WithoutCancel(ctx)
+
+	// Advisory: dispatch detached so the PR-upload response is not blocked on
+	// the reviewer. Stamp the provenance markers so the additive verdict is
+	// labelable and idempotent. Deliberately no emitReviewStarted (see the
+	// function doc): the first review's started entry remains the anchor floor.
+	if authority != planreview.AuthorityGating {
+		s.bgReviews.Add(1)
+		go func() {
+			defer s.bgReviews.Done()
+			s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA)
+		}()
+		return false
+	}
+
+	// Gating: run synchronously so the caller can fail the stage category-B
+	// before responding. Same no-started-emission discipline.
+	return s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA)
+}
+
+// supplementalReinvokeReviewAlreadyRecorded reports whether a base-rebase
+// re-invoke supplemental implement_reviewed entry for the given stage with the
+// same re-landed head SHA already exists (#1250), so a retried PR-upload is
+// deduped before re-dispatching. It mirrors implementReviewAlreadyStarted: the
+// entries are sequence-ascending, nil/mismatched StageIDs are skipped, and the
+// key is (stage_id, Origin=base_rebase_reinvoke, head_sha) — only the
+// supplemental verdict carries Origin, so the first review's origin-less
+// entries never match. Fail-open on an empty headSHA (returns false), though
+// the caller always supplies pr.HeadSHA.
+func supplementalReinvokeReviewAlreadyRecorded(entries []*audit.Entry, stageID uuid.UUID, headSHA string) bool {
+	if headSHA == "" {
+		return false
+	}
+	for _, e := range entries {
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var payload struct {
+			Origin  string `json:"origin"`
+			HeadSHA string `json:"head_sha"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			continue
+		}
+		if payload.Origin == planreview.OriginBaseRebaseReinvoke && payload.HeadSHA == headSHA {
+			return true
+		}
+	}
+	return false
 }
 
 // priorConcernsForReview gathers the stage's previously recorded

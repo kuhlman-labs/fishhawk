@@ -333,6 +333,72 @@ func TestImplementReviewedPayload_NoResolutions_OmittedFromWire(t *testing.T) {
 	}
 }
 
+// TestImplementReviewedPayload_OriginHeadSHA_OmittedFromWire pins the #1250
+// additive-field contract: an Origin/HeadSHA-free payload (the first review
+// and the parent-decomposition consolidated review) marshals WITHOUT either
+// key (byte-identical to pre-#1250 entries), and an old stored payload (no
+// keys) decodes with both fields empty.
+func TestImplementReviewedPayload_OriginHeadSHA_OmittedFromWire(t *testing.T) {
+	p := planreview.ImplementReviewedPayload{
+		ReviewerKind: "agent",
+		Authority:    planreview.AuthorityAdvisory,
+		Verdict:      planreview.VerdictApprove,
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(b), "origin") {
+		t.Errorf("origin-free payload must omit the key (omitempty): %s", b)
+	}
+	if strings.Contains(string(b), "head_sha") {
+		t.Errorf("head_sha-free payload must omit the key (omitempty): %s", b)
+	}
+
+	var got planreview.ImplementReviewedPayload
+	if err := json.Unmarshal([]byte(`{"reviewer_kind":"agent","authority":"advisory","verdict":"approve"}`), &got); err != nil {
+		t.Fatalf("Unmarshal pre-#1250 payload: %v", err)
+	}
+	if got.Origin != "" || got.HeadSHA != "" {
+		t.Errorf("Origin=%q HeadSHA=%q, want both empty decoding a pre-#1250 payload", got.Origin, got.HeadSHA)
+	}
+}
+
+// TestImplementReviewedPayload_SupplementalProvenance_RoundTrips pins that the
+// base-rebase re-invoke supplemental verdict (#1250) carries BOTH provenance
+// fields on the wire and round-trips — the binding-condition-1 idempotency key
+// (stage_id, Origin, HeadSHA) depends on both surviving marshal/unmarshal.
+func TestImplementReviewedPayload_SupplementalProvenance_RoundTrips(t *testing.T) {
+	p := planreview.ImplementReviewedPayload{
+		ReviewerKind: "agent",
+		Authority:    planreview.AuthorityAdvisory,
+		Verdict:      planreview.VerdictApprove,
+		Origin:       planreview.OriginBaseRebaseReinvoke,
+		HeadSHA:      "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"origin":"base_rebase_reinvoke"`) {
+		t.Errorf("supplemental payload must carry origin: %s", b)
+	}
+	if !strings.Contains(string(b), `"head_sha":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"`) {
+		t.Errorf("supplemental payload must carry head_sha: %s", b)
+	}
+
+	var got planreview.ImplementReviewedPayload
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got.Origin != planreview.OriginBaseRebaseReinvoke {
+		t.Errorf("Origin = %q, want %q", got.Origin, planreview.OriginBaseRebaseReinvoke)
+	}
+	if got.HeadSHA != p.HeadSHA {
+		t.Errorf("HeadSHA = %q, want %q", got.HeadSHA, p.HeadSHA)
+	}
+}
+
 // TestSettled pins the N-of-N verdicts-settled detection (#1023) for
 // the configurations the dogfood loop runs: 1-of-1 (single reviewer)
 // and 2-of-2 (heterogeneous dual review, live since 2026-06-09).

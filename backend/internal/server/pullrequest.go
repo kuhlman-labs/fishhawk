@@ -16,6 +16,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
@@ -502,12 +503,15 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 	// This row exists because the sealed bundle (#742) cannot carry the
 	// re-invoke's exemptions: the bundle ships at push time, before the runner
 	// re-invokes the agent on the fresh base (runner main.go base-rebase block).
-	// The implement-review gate_evidence canNOT be re-fed the same delta either:
-	// the review is dispatched at trace-upload time (trace.go runImplementReviews),
-	// strictly BEFORE the re-invoke, so feeding it would require re-dispatching the
-	// review or re-sealing the bundle — both precluded by #742 forward gating and
-	// the #1153 review-on-raw-bundle ordering. The gate_evidence half is deferred
-	// to #1250; this PR delivers the audit-log surface only.
+	// The first implement review is dispatched at trace-upload time (trace.go
+	// runImplementReviews), strictly BEFORE the re-invoke, so its gate_evidence
+	// could not carry the delta either. #1250 closes that gate_evidence half
+	// WITHOUT re-sealing the bundle or re-running the first review: the
+	// terminal-drive branch below (option (b), ADR-042) dispatches a bounded,
+	// ADDITIVE supplemental implement-review pass anchored to this PR-upload —
+	// the exact point the re-landed tree becomes durable. This audit row and
+	// that supplemental review verdict are COMPLEMENTARY surfaces; both ride the
+	// same SupplementalScopeExemptions delta.
 	//
 	// Best-effort: a nil AuditRepo or an append error WARN-logs and does NOT
 	// unwind the upload — the pull_request_opened row + PR artifact are the
@@ -612,6 +616,49 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 	// where the trace handler transitioned it), it isn't in `running` and
 	// the helper is a no-op — byte-identical to the prior behavior.
 	if stage.Type == run.StageTypeImplement && stage.State == run.StageStateRunning {
+		// Supplemental base-rebase re-invoke review (#1250, option (b) / ADR-042).
+		// When this success ship carries the re-invoke exemption delta, dispatch
+		// a bounded, additive supplemental implement-review against the PUSHED
+		// re-landed tree BEFORE advancing — this is the durable-tree anchor point
+		// (#742) and the only place the honored delta is known. A gating reject
+		// fails the stage category-B (reusing trace.go's exact path) and closes
+		// the dangling PR (reusing the #877 helper), then responds 201 WITHOUT
+		// advancing — mirroring the already-failed gating-reject block above.
+		// An empty delta (every non-re-invoke ship) skips this entirely and the
+		// response is byte-identical.
+		if len(pr.SupplementalScopeExemptions) > 0 {
+			exemptions := make([]prompt.GateScopeExemption, 0, len(pr.SupplementalScopeExemptions))
+			for _, ex := range pr.SupplementalScopeExemptions {
+				exemptions = append(exemptions, prompt.GateScopeExemption{Path: ex.Path, Reason: ex.Reason})
+			}
+			if s.runSupplementalReinvokeReview(r.Context(), runID, stageID, pr.HeadSHA, exemptions) {
+				if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, run.FailureB, implementReviewGatingRejectReason); ferr != nil {
+					s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+						"pull-request upload: transition to failed-B after supplemental reinvoke review gating reject failed",
+						slog.String("run_id", runID.String()),
+						slog.String("stage_id", stageID.String()),
+						slog.String("error", ferr.Error()),
+					)
+				} else {
+					// Reload so the failure-state fields the close helper reads
+					// reflect the transition just applied.
+					if failed, gerr := s.cfg.RunRepo.GetStage(r.Context(), stageID); gerr == nil {
+						stage = failed
+					}
+					s.closePRAfterGatingReject(r, runID, stage, &pr, created.ID)
+				}
+				s.writeJSON(w, r, http.StatusCreated, pullRequestResponse{
+					ID:          created.ID,
+					StageID:     created.StageID,
+					ContentHash: created.ContentHash,
+					PRNumber:    pr.PRNumber,
+					PRURL:       pr.PRURL,
+					HeadSHA:     pr.HeadSHA,
+					Idempotent:  false,
+				})
+				return
+			}
+		}
 		s.advanceImplementStageAfterPR(r, runID, stage)
 	}
 

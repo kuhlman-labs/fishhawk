@@ -2870,6 +2870,85 @@ func TestBuild_ImplementReview_FullContext(t *testing.T) {
 	}
 }
 
+func TestBuild_ImplementReview_SupplementalReinvoke_RendersFramingAndExemptions(t *testing.T) {
+	// #1250: with SupplementalReinvoke=true the prompt renders the bounded
+	// supplemental framing AND the exemption delta in the gate_evidence section,
+	// renders NO diff (the "### Diff under review" section is absent — an
+	// exempted path is unchanged by definition), and instructs the reviewer to
+	// judge ONLY whether each additional exemption is sound.
+	got, err := Build("implement_review", Trigger{
+		Repo:                 "kuhlman-labs/example",
+		IssueNumber:          42,
+		IssueTitle:           "Add foo",
+		ApprovedPlan:         fixturePlan(),
+		SupplementalReinvoke: true,
+		GateEvidence: &GateEvidence{
+			ScopeExemptions: []GateScopeExemption{
+				{Path: "pkg/foo/foo.go", Reason: "already correct after the rebase"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		// Supplemental framing.
+		"Supplemental review: base-rebase re-invoke scope exemptions",
+		"SUPPLEMENTAL, bounded review pass — NOT a full re-review",
+		"judge whether each of those ADDITIONAL exemptions is sound",
+		// The exemption delta via the shared gate-evidence renderer.
+		"Self-exempted declared scope files (agent justified leaving these unchanged):",
+		"- pkg/foo/foo.go — already correct after the rebase",
+		// Still a JSON verdict in the closed set.
+		"\"approve\" | \"approve_with_concerns\" | \"reject\"",
+		// Plan + issue context for soundness judgment.
+		"### Plan artifact",
+		"Issue: #42 · Add foo",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("supplemental implement_review prompt missing %q:\n%s", w, got)
+		}
+	}
+	// No diff section: the exempted paths are unchanged, so no diff is shown.
+	if strings.Contains(got, ImplementReviewSplitMarker) {
+		t.Errorf("supplemental prompt must NOT render the diff section:\n%s", got)
+	}
+	if strings.Contains(got, "### Diff under review") {
+		t.Errorf("supplemental prompt must NOT render the diff-under-review header:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementReview_SupplementalReinvoke_FalseRendersDiffNotFraming(t *testing.T) {
+	// #1250 byte-identical-when-false property: with SupplementalReinvoke unset
+	// (the default — every first review and consolidated review) the prompt
+	// renders the ordinary diff section and NEVER the supplemental framing, so
+	// the false path is unchanged from the pre-#1250 output.
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	}
+	gotDefault, err := Build("implement_review", base)
+	if err != nil {
+		t.Fatalf("Build default: %v", err)
+	}
+	withFalse := base
+	withFalse.SupplementalReinvoke = false
+	gotFalse, err := Build("implement_review", withFalse)
+	if err != nil {
+		t.Fatalf("Build false: %v", err)
+	}
+	if gotDefault != gotFalse {
+		t.Errorf("explicit SupplementalReinvoke=false must be byte-identical to the default (omitted)")
+	}
+	if !strings.Contains(gotFalse, ImplementReviewSplitMarker) {
+		t.Errorf("false path must render the diff section:\n%s", gotFalse)
+	}
+	if strings.Contains(gotFalse, "Supplemental review: base-rebase re-invoke scope exemptions") {
+		t.Errorf("false path must NOT render the supplemental framing:\n%s", gotFalse)
+	}
+}
+
 func TestBuild_ImplementReview_GroundsRuleCitationsAndScopesStyle(t *testing.T) {
 	// #595: on run 112743b1 the implement-review raised {category:scope}
 	// concerns asserting a CLAUDE.md comment-length rule that does not exist

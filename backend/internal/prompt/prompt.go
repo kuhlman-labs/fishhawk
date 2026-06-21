@@ -373,6 +373,17 @@ type Trigger struct {
 	// non-plan-review build) omits the "### Gate evidence" section and
 	// keeps the prompt byte-identical to the pre-#963 output.
 	PlanGateEvidence *PlanGateEvidence
+
+	// SupplementalReinvoke flags the implement-review prompt as the bounded,
+	// additive base-rebase re-invoke supplemental pass (#1250). When true,
+	// buildImplementReview renders a focused framing that judges ONLY whether
+	// the additional scope exemptions a base-rebase re-invoke honored after
+	// the first review are sound — no diff is rendered (the exempted path is
+	// unchanged by definition, so exemption soundness is a plan-vs-reason
+	// judgment), and the delta rides in GateEvidence.ScopeExemptions. False
+	// (the default, every first review and consolidated review) keeps the
+	// implement-review prompt byte-identical to the pre-#1250 output.
+	SupplementalReinvoke bool
 }
 
 // GateEvidence is the prompt-side mirror of bundle.GateEvidence (#963):
@@ -1696,6 +1707,24 @@ func buildImplementReview(t Trigger) string {
 		"The JSON must be syntactically valid: comma-separate every member and use no trailing commas. " +
 		"A response that contains anything other than the JSON object will be rejected.\n\n")
 
+	// Supplemental base-rebase re-invoke framing (#1250). This pass is NOT a
+	// full re-review: the first review already covered the full diff against
+	// the sealed tree. It judges ONLY the ADDITIONAL scope exemptions a
+	// base-rebase re-invoke honored after that first review — exemptions the
+	// sealed gate_evidence event could not carry because the re-invoke
+	// happens after the bundle ships (#742 forward gating). No diff is
+	// rendered: an exempted path is unchanged by definition, so its soundness
+	// is a plan-vs-reason judgment (exactly the lens the first review applies
+	// to exemptions), and the delta rides in GateEvidence.ScopeExemptions
+	// below. Returning early keeps the supplemental prompt minimal — plan,
+	// approval conditions, issue context, and the verdict schema still
+	// follow — and leaves the false-branch (every first/consolidated review)
+	// byte-identical to the pre-#1250 output.
+	if t.SupplementalReinvoke {
+		writeSupplementalReinvokeReview(&b, t)
+		return b.String()
+	}
+
 	// Diff under review — the primary input. The split marker leads this
 	// section so caching adapters can split the stable preamble from the
 	// variable diff/plan/issue content.
@@ -1961,6 +1990,91 @@ func buildImplementReview(t Trigger) string {
 
 	b.WriteString("Emit your verdict now. Remember: JSON only, no surrounding prose.\n")
 	return b.String()
+}
+
+// writeSupplementalReinvokeReview renders the body of the bounded, additive
+// base-rebase re-invoke supplemental implement-review prompt (#1250). It is
+// called by buildImplementReview when Trigger.SupplementalReinvoke is set,
+// AFTER the shared header + ROLE CONSTRAINT block, and it owns the rest of
+// the prompt: a focused framing, the exemption delta (reusing
+// writeGateEvidence's ScopeExemptions section), the approval conditions and
+// approved plan to judge soundness against, issue context, and the verdict
+// schema. No diff is rendered — the exempted paths are unchanged by
+// definition, so the judgment is plan-vs-reason, exactly the lens the
+// first-attempt review applies to exemptions.
+func writeSupplementalReinvokeReview(b *strings.Builder, t Trigger) {
+	b.WriteString("### Supplemental review: base-rebase re-invoke scope exemptions\n\n")
+	b.WriteString("This is a SUPPLEMENTAL, bounded review pass — NOT a full re-review. The first review of this " +
+		"stage already covered the full diff against the sealed tree and recorded its verdict; that verdict still " +
+		"stands and you must not re-litigate it. After that first review, a base-rebase re-invoke re-ran the " +
+		"implement agent on a freshly-rebased base and honored ADDITIONAL declared-scope-file exemptions that the " +
+		"first review never saw (they were validated after the trace bundle sealed). Your ONLY task here is to " +
+		"judge whether each of those ADDITIONAL exemptions is sound: a path that genuinely needed an edit but was " +
+		"exempted with a hollow or incorrect reason is a concern — name it. Judge soundness against the approved " +
+		"plan's scope and approach below and the exemption's stated reason; there is no diff to read because an " +
+		"exempted path is unchanged by definition.\n\n")
+
+	// The additional exemption delta, rendered by the shared gate-evidence
+	// renderer's ScopeExemptions section. GateEvidence carries ONLY
+	// ScopeExemptions on this path, so writeGateEvidence emits its header +
+	// binding preamble and the self-exempted-files block, and nothing else.
+	if t.GateEvidence != nil {
+		writeGateEvidence(b, t.GateEvidence)
+	}
+
+	// Approval conditions amend the plan (#558/#1021); an exemption may be
+	// sound only in light of a condition, so the reviewer must see them.
+	if t.ApprovalConditions != nil {
+		ac := *t.ApprovalConditions
+		const maxConditionBytes = 4000
+		if len(ac) > maxConditionBytes {
+			ac = ac[:maxConditionBytes] + "...[truncated]"
+		}
+		b.WriteString("### Approval conditions (binding — AMEND the plan, win on conflict)\n\n")
+		b.WriteString("The operator approved the plan with the conditions below. They AMEND the plan and WIN on " +
+			"conflict with the plan text — judge each exemption's soundness against the amended plan.\n\n")
+		b.WriteString(ac)
+		b.WriteString("\n\n")
+	}
+
+	// Approved plan — the scope/approach an exemption's soundness is measured
+	// against.
+	if t.ApprovedPlan != nil {
+		writePlanForReview(b, t.ApprovedPlan)
+	} else {
+		b.WriteString("### Plan artifact\n\n")
+		b.WriteString("(no approved plan available — judge each exemption reason on its own terms)\n\n")
+	}
+
+	// Issue context: the originating motivation.
+	writeReviewIssueContext(b, t)
+
+	// Verdict schema — same closed shape as the full implement review. No
+	// concern_resolutions member: the supplemental pass threads no prior
+	// concerns, it judges the exemption delta directly.
+	b.WriteString("### Verdict schema\n\n")
+	b.WriteString("Emit exactly this JSON shape. All fields shown; omit `concerns` and `free_form` when empty:\n\n")
+	b.WriteString("{\n")
+	b.WriteString("  \"verdict\": \"approve\" | \"approve_with_concerns\" | \"reject\",\n")
+	b.WriteString("  \"concerns\": [\n")
+	b.WriteString("    {\n")
+	b.WriteString("      \"severity\": \"high\" | \"medium\" | \"low\",\n")
+	b.WriteString("      \"category\": \"<short classifier, e.g. scope | correctness>\",\n")
+	b.WriteString("      \"note\": \"<free-form explanation of the concern>\"\n")
+	b.WriteString("    }\n")
+	b.WriteString("  ],\n")
+	b.WriteString("  \"free_form\": \"<optional overall commentary>\"\n")
+	b.WriteString("}\n\n")
+
+	b.WriteString("### Verdict decision rule\n\n")
+	b.WriteString("- `approve`: every additional exemption is sound — each exempted path genuinely needed no edit " +
+		"and the stated reason holds.\n")
+	b.WriteString("- `approve_with_concerns`: an exemption's reason is weak or unverifiable but not clearly wrong; " +
+		"record each as a concern.\n")
+	b.WriteString("- `reject`: one or more exempted paths genuinely needed an edit and were exempted with a hollow " +
+		"or incorrect reason; record each as a `high`-severity `{category: \"scope\"}` concern.\n\n")
+
+	b.WriteString("Emit your verdict now. Remember: JSON only, no surrounding prose.\n")
 }
 
 // writeGateEvidence renders the "### Gate evidence" section of the
