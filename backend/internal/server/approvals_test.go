@@ -1686,6 +1686,42 @@ func TestSubmitApproval_ModelGate_EmptyResolutionStillEmits(t *testing.T) {
 	}
 }
 
+// TestSubmitApproval_ModelGate_GetRunError_FailsOpen pins checkPlanModelAllowed's
+// fail-OPEN branch on a RunRepo.GetRun read failure (approvals.go:763-770, the
+// PR #1261 review gap tracked by #1262). GetRun is the function's FIRST statement,
+// so when the run row is gone the gate returns (nil, true) BEFORE any resolution
+// or allow-list logic: the approve proceeds (200, stage succeeded) and — because
+// the branch returns a nil ResolvedModel rather than an empty one — NO
+// model_resolved audit is emitted, leaving the prompt path to fall through to
+// live resolution instead of a shadowing empty audit. Mirrors the sibling
+// TestSubmitApproval_PlanReviewGate_GetRunError_FailsOpen. The non-empty
+// allow-list + default is deliberate: it proves the branch short-circuits before
+// the resolve+validate path, not because the allow-list is empty.
+func TestSubmitApproval_ModelGate_GetRunError_FailsOpen(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newModelGateServer(t, art, AllowedModels{"claudecode": {"m-default": true}}, "m-default")
+	_, stage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+
+	rr.mu.Lock()
+	delete(rr.runs, stage.RunID) // GetRun now returns run.ErrNotFound
+	rr.mu.Unlock()
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","implement_model":"m-default"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (GetRun failure fails open):\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded", stage.State)
+	}
+	// 'Emit nothing on read-failure': the fail-open branch returns a nil
+	// ResolvedModel, so NO model_resolved audit may appear.
+	for _, e := range au.appended {
+		if e.Category == CategoryModelResolved {
+			t.Errorf("unexpected model_resolved audit entry on the GetRun fail-open path: %+v", e)
+		}
+	}
+}
+
 func TestSubmitApproval_BudgetCheck_OverBudgetWithDecomp_Proceeds(t *testing.T) {
 	// Plan is over-budget but includes a decomposition block → proceed (200).
 	art := newFakeArtifactRepo()
