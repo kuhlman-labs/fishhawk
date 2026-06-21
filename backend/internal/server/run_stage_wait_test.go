@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"sync"
 	"testing"
@@ -475,5 +476,46 @@ func TestGetRunStage_NilRunRepo503(t *testing.T) {
 	}
 	if code := decodeErrCode(t, w); code != "run_repo_unconfigured" {
 		t.Errorf("code = %q, want run_repo_unconfigured", code)
+	}
+}
+
+// --- ?wait query-param parser boundary contract ---
+
+// TestParseRunStageWaitSeconds pins the per-branch boundary behavior of
+// parseRunStageWaitSeconds: a missing, non-integer, or non-positive value
+// reads as 0 (no wait), values above maxRunStageWaitSeconds clamp to the
+// cap, the cap boundary itself is unclamped, ordinary positive values pass
+// through, and surrounding whitespace is trimmed. Each row pins one parser
+// branch so a regression to the clamp/zero logic fails the committed-tree
+// verify. The clamp expectations reference maxRunStageWaitSeconds so the
+// test tracks the constant rather than a hardcoded 30.
+func TestParseRunStageWaitSeconds(t *testing.T) {
+	cases := []struct {
+		name    string
+		present bool   // false => the ?wait param is absent entirely
+		raw     string // the raw (pre-encoding) param value when present
+		want    int
+	}{
+		{name: "absent => 0 (early return)", present: false, want: 0},
+		{name: "non-integer => 0 (Atoi error)", present: true, raw: "abc", want: 0},
+		{name: "negative => 0 (n<=0)", present: true, raw: "-1", want: 0},
+		{name: "zero => 0 (n<=0)", present: true, raw: "0", want: 0},
+		{name: "above cap => clamp", present: true, raw: "31", want: maxRunStageWaitSeconds},
+		{name: "cap boundary => unclamped", present: true, raw: strconv.Itoa(maxRunStageWaitSeconds), want: maxRunStageWaitSeconds},
+		{name: "ordinary => passthrough", present: true, raw: "15", want: 15},
+		{name: "surrounding whitespace => trimmed", present: true, raw: " 7 ", want: 7},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := "/"
+			if tc.present {
+				target = "/?" + url.Values{"wait": {tc.raw}}.Encode()
+			}
+			req := httptest.NewRequest(http.MethodGet, target, nil)
+			if got := parseRunStageWaitSeconds(req); got != tc.want {
+				t.Errorf("parseRunStageWaitSeconds(wait=%q present=%v) = %d, want %d",
+					tc.raw, tc.present, got, tc.want)
+			}
+		})
 	}
 }
