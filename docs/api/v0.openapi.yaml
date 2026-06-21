@@ -664,8 +664,10 @@ components:
           description: |
             Machine-readable next step. Current values:
             `run_implement_stage` (runner_kind `local` — dispatch the
-            implement stage from the operator host) and `merge_pr`
-            (all gates resolved, required checks green).
+            implement stage from the operator host), `run_plan_stage`
+            (runner_kind `local` after a plan-gate revise re-opened the
+            plan stage — re-dispatch it from the operator host, #1256),
+            and `merge_pr` (all gates resolved, required checks green).
           example: merge_pr
         detail:
           type: string
@@ -682,7 +684,8 @@ components:
         `run_auto_advanced` audit entry: the named rule that fired and
         the from/to edge it stamps. Rule names are a closed set
         (`backend/internal/drive`): `plan_approved_dispatch`,
-        `reviews_settled_gate`, `fixup_rereview_repark`,
+        `revise_replan` (a plan-gate revise re-opened the plan stage,
+        #1256), `reviews_settled_gate`, `fixup_rereview_repark`,
         `checks_green_awaiting_merge`, `ci_failed` (the negative mirror
         of `checks_green_awaiting_merge`: a required PR check concluded
         red).

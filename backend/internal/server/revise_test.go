@@ -13,6 +13,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -302,6 +304,146 @@ func TestRevisePlan_CrossRun_403(t *testing.T) {
 	// The cross-run refusal fires before any state change.
 	if got := rr.getStages[stageID].State; got != run.StageStateAwaitingApproval {
 		t.Errorf("stage state = %q, want awaiting_approval (no state change on a cross-run refusal)", got)
+	}
+}
+
+// newDriveReviseServer wires RunRepo + AuditRepo + a real (minimal)
+// orchestrator for the revise handler, seeding a plan stage parked at
+// awaiting_approval on a drive-enabled run with the given runner kind.
+// The orchestrator is non-nil so the revise handler's pending-handoff
+// block (where recordDriveReviseReplan fires, #1256) executes; its
+// Advance harmlessly errors on the unseeded stage list (logged,
+// non-fatal) and leaves the re-opened stage in pending.
+func newDriveReviseServer(t *testing.T, runID, stageID uuid.UUID, runnerKind string, driveEnabled bool) (*Server, *promptRunRepo, *auditFake) {
+	t.Helper()
+	rr := newPromptRunRepo()
+	au := newAuditFake()
+	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}
+	rr.getRuns[runID] = &run.Run{
+		ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change",
+		State: run.StateRunning, Drive: driveEnabled, RunnerKind: runnerKind,
+	}
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+	return s, rr, au
+}
+
+// reviseDriveAdvances decodes every run_auto_advanced (drive.Category)
+// entry appended to the audit fake, so a cross-layer test can assert the
+// drive payload shape the revise handler stamped (#1256).
+func reviseDriveAdvances(t *testing.T, au *auditFake) []drive.Advance {
+	t.Helper()
+	var out []drive.Advance
+	for _, e := range au.appended {
+		if e.Category != drive.Category {
+			continue
+		}
+		var adv drive.Advance
+		if err := json.Unmarshal(e.Payload, &adv); err != nil {
+			t.Fatalf("decode drive advance: %v", err)
+		}
+		out = append(out, adv)
+	}
+	return out
+}
+
+// TestRevisePlan_Drive_Local_ParksWithNextAction is the #1256 done-means
+// cross-layer test: a revise on a drive-mode LOCAL run records a
+// run_auto_advanced entry with parked=true + next_action.action=
+// "run_plan_stage", AND a subsequent GET /v0/runs/{id} surfaces that same
+// next_action on the authoritative REST run resource — proving the
+// required next action reaches the run resource, not only MCP synthesis.
+func TestRevisePlan_Drive_Local_ParksWithNextAction(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, au := newDriveReviseServer(t, runID, stageID, run.RunnerKindLocal, true)
+
+	w := revisePlan(t, s, stageID, `{"constraint":"keep the change additive"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("revise status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	advances := reviseDriveAdvances(t, au)
+	if len(advances) != 1 {
+		t.Fatalf("run_auto_advanced entries = %+v, want exactly 1", advances)
+	}
+	adv := advances[0]
+	if adv.Rule != drive.RuleReviseReplan {
+		t.Errorf("rule = %q, want revise_replan", adv.Rule)
+	}
+	if !adv.Parked {
+		t.Error("parked = false, want true (local runner cannot be backend-dispatched, ADR-024)")
+	}
+	if adv.To != "plan:ready" {
+		t.Errorf("to = %q, want plan:ready", adv.To)
+	}
+	if adv.NextAction == nil || adv.NextAction.Action != "run_plan_stage" {
+		t.Fatalf("next_action = %+v, want action run_plan_stage", adv.NextAction)
+	}
+
+	// Authoritative REST run resource surfaces the same next_action.
+	gw := httptest.NewRecorder()
+	greq := httptest.NewRequest(http.MethodGet, "/v0/runs/"+runID.String(), nil)
+	s.Handler().ServeHTTP(gw, greq)
+	if gw.Code != http.StatusOK {
+		t.Fatalf("GET run status = %d, want 200:\n%s", gw.Code, gw.Body.String())
+	}
+	var resp runResponse
+	if err := json.Unmarshal(gw.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode run response: %v", err)
+	}
+	if resp.NextAction == nil || resp.NextAction.Action != "run_plan_stage" {
+		t.Fatalf("GET /v0/runs/{id} next_action = %+v, want action run_plan_stage", resp.NextAction)
+	}
+}
+
+// TestRevisePlan_Drive_GitHubActions_Advances asserts the advancing arm:
+// a revise on a drive-mode github_actions run records an advanced (not
+// parked) run_auto_advanced entry to plan:dispatched — the orchestrator's
+// workflow_dispatch edge IS the re-run, so no operator next action.
+func TestRevisePlan_Drive_GitHubActions_Advances(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, au := newDriveReviseServer(t, runID, stageID, run.RunnerKindGitHubActions, true)
+
+	w := revisePlan(t, s, stageID, `{"constraint":"keep the change additive"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("revise status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	advances := reviseDriveAdvances(t, au)
+	if len(advances) != 1 {
+		t.Fatalf("run_auto_advanced entries = %+v, want exactly 1", advances)
+	}
+	adv := advances[0]
+	if adv.Rule != drive.RuleReviseReplan {
+		t.Errorf("rule = %q, want revise_replan", adv.Rule)
+	}
+	if adv.Parked {
+		t.Error("parked = true, want false (github_actions auto-advances via workflow_dispatch)")
+	}
+	if adv.To != "plan:dispatched" {
+		t.Errorf("to = %q, want plan:dispatched", adv.To)
+	}
+	if adv.NextAction != nil {
+		t.Errorf("next_action = %+v, want nil (nothing for the operator to do)", adv.NextAction)
+	}
+}
+
+// TestRevisePlan_NonDrive_RecordsNoDriveEntry exercises the guard branch:
+// a revise on a NON-drive run records no run_auto_advanced entry
+// (recordDriveReviseReplan no-ops on !runRow.Drive), leaving only the
+// plan_revised entry the handler always writes.
+func TestRevisePlan_NonDrive_RecordsNoDriveEntry(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, au := newDriveReviseServer(t, runID, stageID, run.RunnerKindLocal, false)
+
+	w := revisePlan(t, s, stageID, `{"constraint":"keep the change additive"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("revise status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if advances := reviseDriveAdvances(t, au); len(advances) != 0 {
+		t.Errorf("run_auto_advanced entries = %+v, want none on a non-drive run", advances)
 	}
 }
 
