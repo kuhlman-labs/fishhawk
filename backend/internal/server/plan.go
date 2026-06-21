@@ -366,6 +366,22 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Plan-gate scope-regression base capture (#1257): a revise pass
+	// regenerates the WHOLE plan, so a narrowly-scoped revision constraint
+	// can silently drop files the immediately-prior plan scoped. Capture
+	// that prior plan as the revision base BEFORE ArtifactRepo.Create —
+	// loadApprovedPlanForRun picks the newest plan artifact, which Create is
+	// about to become (an after-Create capture would diff the new plan
+	// against itself and report no regression). Only a revise ship has a
+	// base: guard on a prior plan_revised audit entry (the same durable
+	// revise-pass record countRevisePasses enforces the bound against). A
+	// non-revise ship leaves regressionBase nil → the gate skips and writes
+	// nothing. Best-effort: a count/load error leaves base nil (fail-open).
+	var regressionBase *plan.Plan
+	if priorRevises, _ := s.countRevisePasses(r.Context(), runID, stageID); priorRevises > 0 {
+		regressionBase, _ = s.loadApprovedPlanForRun(r.Context(), runID)
+	}
+
 	schemaVersion := "standard_v1"
 	created, err := s.cfg.ArtifactRepo.Create(r.Context(), artifact.CreateParams{
 		StageID:       stageID,
@@ -440,6 +456,19 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// plan-review prompt's gate-evidence section like the gates above.
 	testSweep := s.runTestSweep(r.Context(), runID, stageID, body)
 
+	// Plan-gate scope-regression sweep (#1257): on a revise pass, diff the
+	// new plan's scoped paths (top-level scope.files UNION every
+	// decomposition sub-plan's scope.files) against the revision-base plan
+	// captured above and record an advisory plan_scope_regression audit
+	// entry flagging files the revision DROPPED. A 'keep everything else'
+	// revision constraint can silently narrow scope (the observed bug
+	// class); surfacing the drop lets the operator catch it before
+	// approving, and the revise handler refunds the normal revise budget for
+	// a regressing pass. Advisory + fail-open; nil on a non-revise ship (no
+	// base). Like the gates above, the returned result feeds the plan-review
+	// prompt's gate-evidence section.
+	regression := s.runScopeRegression(r.Context(), runID, stageID, regressionBase, body)
+
 	// Plan review: invoke configured review agents after the artifact
 	// is stored and audited, before advancing the stage. The gate
 	// results computed above ride along so the review prompt carries
@@ -447,7 +476,7 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// is gating and at least one verdict is reject; in that case the
 	// stage has been transitioned to failed-B and stage advancement is
 	// blocked.
-	gatingRejected := s.runPlanReviews(r.Context(), runID, stageID, body, precheck, sweep, testSweep)
+	gatingRejected := s.runPlanReviews(r.Context(), runID, stageID, body, precheck, sweep, testSweep, regression)
 
 	// Plan-stage terminal advancement (#603). With a valid plan artifact
 	// now stored, this handler is the authoritative driver of the plan
@@ -833,12 +862,12 @@ func deref(s *string) string {
 // reviewer failure doesn't fail the upload response — the plan artifact
 // is already durably stored.
 //
-// precheck, sweep, and testSweep are the plan-gate results
+// precheck, sweep, testSweep, and regression are the plan-gate results
 // handleShipPlan's synchronous checks computed (nil when a gate failed
-// open); they are threaded into the plan-review prompt's gate-evidence
-// section (#963) and never alter dispatch, authority, or verdict
-// handling.
-func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, planBody []byte, precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload, testSweep *TestSweepPayload) bool {
+// open or did not run); they are threaded into the plan-review prompt's
+// gate-evidence section (#963, #1257) and never alter dispatch, authority,
+// or verdict handling.
+func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, planBody []byte, precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload, testSweep *TestSweepPayload, regression *ScopeRegressionPayload) bool {
 	// RunRepo is required to resolve the workflow spec; without it we
 	// can't tell whether agent review was even requested.
 	if s.cfg.RunRepo == nil {
@@ -911,7 +940,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	// machinery as the agent prompt handler. The gate evidence carries
 	// the resolved budget the approval gate will enforce (#994) so the
 	// reviewer cites the same number checkPlanBudget compares against.
-	gateEv := planGateEvidence(precheck, sweep, testSweep)
+	gateEv := planGateEvidence(precheck, sweep, testSweep, regression)
 	if bc := s.planBudgetEvidence(ctx, runRow, parsedPlan); bc != nil {
 		if gateEv == nil {
 			gateEv = &prompt.PlanGateEvidence{}
@@ -1019,8 +1048,8 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 // bundle structs into prompt fields. Returns nil when no gate produced a
 // result (all failed open) so the plan-review prompt stays byte-identical
 // to the pre-#963 output.
-func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload, testSweep *TestSweepPayload) *prompt.PlanGateEvidence {
-	if precheck == nil && sweep == nil && testSweep == nil {
+func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload, testSweep *TestSweepPayload, regression *ScopeRegressionPayload) *prompt.PlanGateEvidence {
+	if precheck == nil && sweep == nil && testSweep == nil && regression == nil {
 		return nil
 	}
 	ev := &prompt.PlanGateEvidence{}
@@ -1076,6 +1105,13 @@ func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload
 			})
 		}
 		ev.TestSweep = ts
+	}
+	if regression != nil {
+		ev.ScopeRegression = &prompt.ScopeRegressionEvidence{
+			RemovedFiles: regression.RemovedFiles,
+			AddedFiles:   regression.AddedFiles,
+			ScannedFiles: regression.ScannedFiles,
+		}
 	}
 	return ev
 }

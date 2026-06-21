@@ -1,8 +1,12 @@
 package mcpe2e_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"encoding/hex"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -230,5 +234,182 @@ func TestE2E_Revise_ConstraintInjectedAndPlanRebound(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Errorf("plan_revised entries after approve = %d, want 1", len(entries))
+	}
+}
+
+// regressionPlanJSON builds a schema-valid standard_v1 plan body with the
+// given summary and top-level scope files (all modify).
+func regressionPlanJSON(summary string, scopeFiles []string) []byte {
+	files := make([]map[string]any, 0, len(scopeFiles))
+	for _, f := range scopeFiles {
+		files = append(files, map[string]any{"path": f, "operation": "modify"})
+	}
+	body, _ := json.Marshal(map[string]any{
+		"plan_version":                 "standard_v1",
+		"ticket_reference":             map[string]any{"type": "github_issue", "url": "https://github.com/x/y/issues/1", "id": "x/y#1"},
+		"generated_by":                 map[string]any{"agent": "claude-code", "model": "claude-opus-4-8", "timestamp": "2026-06-15T00:00:00Z"},
+		"summary":                      summary,
+		"scope":                        map[string]any{"files": files},
+		"approach":                     []map[string]any{{"step": 1, "description": "Do the thing."}},
+		"verification":                 map[string]any{"test_strategy": "Run the tests.", "rollback_plan": "Revert the PR."},
+		"predicted_runtime_minutes":    20,
+		"predicted_runtime_confidence": "high",
+	})
+	return body
+}
+
+// shipPlanSigned POSTs a plan body to /v0/runs/{id}/plan?stage_id=, signed
+// with the run's per-run Ed25519 key (the runner's production shape).
+func shipPlanSigned(t *testing.T, ctx context.Context, baseURL string, runID, stageID interface{ String() string }, priv ed25519.PrivateKey, body []byte) *http.Response {
+	t.Helper()
+	url := baseURL + "/v0/runs/" + runID.String() + "/plan?stage_id=" + stageID.String()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("build ship-plan request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	sig := ed25519.Sign(priv, signing.ComputeMessage(body))
+	req.Header.Set("X-Fishhawk-Signature", hex.EncodeToString(sig))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("ship-plan request: %v", err)
+	}
+	return resp
+}
+
+// TestE2E_Revise_ScopeRegressionFlaggedAndBudgetRefunded is the #1257
+// cross-component done-means test: it drives the seam the per-layer unit
+// tests cannot cover together — a revise pass shipping a plan that DROPS a
+// previously-scoped file through the REAL backend HTTP plan-ship path →
+// handleShipPlan capturing the revision base before ArtifactRepo.Create →
+// the scope-regression gate writing a plan_scope_regression audit entry in
+// Postgres naming the dropped file → the revise handler reading that entry
+// back to REFUND the normal revise budget so a subsequent
+// fishhawk_revise_plan is admitted rather than 409 budget_exhausted. It
+// proves the gate output and the budget-refund seam agree end to end.
+func TestE2E_Revise_ScopeRegressionFlaggedAndBudgetRefunded(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+	artifactRepo := artifact.NewPostgresRepository(fx.pool)
+	approvalRepo := approval.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		ArtifactRepo: artifactRepo,
+		ApprovalRepo: approvalRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	// 1. Plan stage parked at the approval gate.
+	planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypePlan,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(plan): %v", err)
+	}
+
+	// 2. Seed the revision-base plan artifact scoping TWO files.
+	const droppedFile = "backend/internal/webhook/helper.go"
+	schema := "standard_v1"
+	baseBody := regressionPlanJSON("base plan scoping two files",
+		[]string{"backend/internal/webhook/dispatcher.go", droppedFile})
+	if _, err := artifactRepo.Create(ctx, artifact.CreateParams{
+		StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &schema,
+		Content: baseBody, ContentHash: "basehash1257",
+	}); err != nil {
+		t.Fatalf("seed base plan artifact: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, planStage.ID)
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+
+	// 3. Revise pass 1 — re-opens the plan stage to pending (no orchestrator
+	// wired, so it stays pending).
+	reviseResult, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_revise_plan",
+		Arguments: map[string]any{
+			"run_id":     fx.runID.String(),
+			"constraint": "narrow the scope; keep everything else",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool revise pass 1: %v", err)
+	}
+	if reviseResult.IsError {
+		t.Fatalf("revise pass 1 returned error: %s", toolContentString(t, reviseResult))
+	}
+
+	// 4. Ship a NEW plan dropping helper.go (scope narrows to one file). This
+	// is a revise pass (a prior plan_revised entry exists), so the
+	// scope-regression gate runs against the base captured before Create.
+	newBody := regressionPlanJSON("revised plan narrowed to one file",
+		[]string{"backend/internal/webhook/dispatcher.go"})
+	resp := shipPlanSigned(t, ctx, httpSrv.URL, fx.runID, planStage.ID, fx.signingPriv, newBody)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("ship revised plan status = %d, want 201", resp.StatusCode)
+	}
+
+	// 5. The plan_scope_regression entry landed naming the dropped file.
+	regEntries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, "plan_scope_regression")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(plan_scope_regression): %v", err)
+	}
+	if len(regEntries) != 1 {
+		t.Fatalf("plan_scope_regression entries = %d, want 1", len(regEntries))
+	}
+	var reg struct {
+		RemovedFiles []string `json:"removed_files"`
+		Regressed    bool     `json:"regressed"`
+	}
+	if err := json.Unmarshal(regEntries[0].Payload, &reg); err != nil {
+		t.Fatalf("unmarshal plan_scope_regression payload: %v", err)
+	}
+	if !reg.Regressed {
+		t.Errorf("regressed = false, want true")
+	}
+	if len(reg.RemovedFiles) != 1 || reg.RemovedFiles[0] != droppedFile {
+		t.Errorf("removed_files = %v, want [%s]", reg.RemovedFiles, droppedFile)
+	}
+
+	// 6. A subsequent revise is ADMITTED (budget refunded by the regression)
+	// where the spent normal budget would otherwise 409 budget_exhausted.
+	// The ship's terminal advance already parked the stage back at
+	// awaiting_approval (RequiresApproval), so it is a revise candidate.
+	revise2, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_revise_plan",
+		Arguments: map[string]any{
+			"run_id":     fx.runID.String(),
+			"constraint": "put the dropped file back into scope",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool revise pass 2: %v", err)
+	}
+	if revise2.IsError {
+		t.Fatalf("revise pass 2 returned error (budget refund seam broken): %s", toolContentString(t, revise2))
+	}
+	var revise2Out struct {
+		Stage struct {
+			State string `json:"state"`
+		} `json:"stage"`
+	}
+	decodeStructured(t, revise2, &revise2Out)
+	if revise2Out.Stage.State != string(runpkg.StageStatePending) {
+		t.Errorf("revise pass 2 stage state = %q, want pending (admitted)", revise2Out.Stage.State)
 	}
 }
