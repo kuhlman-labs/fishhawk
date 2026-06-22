@@ -3,81 +3,22 @@ package webhook_test
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
-
-// startContainer spins up a throwaway Postgres 16 container and
-// returns its connection URL. Skips the test if Docker isn't
-// reachable so devs without Docker still pass `go test`.
-//
-// Mirror of the helper in postgres_test.go; webhook is a separate
-// package and we don't want to widen postgres_test.go's API
-// surface just to share it.
-func startContainer(t *testing.T) string {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	c, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
-		tcpostgres.WithDatabase("fishhawk"),
-		tcpostgres.WithUsername("fishhawk"),
-		tcpostgres.WithPassword("fishhawk"),
-		testcontainers.WithWaitStrategy(
-			wait.ForAll(
-				wait.ForLog("database system is ready to accept connections").
-					WithOccurrence(2).
-					WithStartupTimeout(60*time.Second),
-				wait.ForListeningPort("5432/tcp"),
-			),
-		),
-	)
-	if err != nil {
-		if isDockerUnavailable(err) {
-			t.Skipf("Docker not available; skipping integration test: %v", err)
-		}
-		t.Fatalf("start postgres: %v", err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = c.Terminate(ctx)
-	})
-
-	url, err := c.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("connection string: %v", err)
-	}
-	return url
-}
-
-func isDockerUnavailable(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "Cannot connect to the Docker daemon") ||
-		strings.Contains(msg, "docker not available") ||
-		strings.Contains(msg, "no such file or directory") &&
-			strings.Contains(msg, "docker.sock")
-}
 
 // newStore returns a PostgresStore wired to a fresh container with
 // migrations applied. The pool's lifetime is bound to the test via
 // t.Cleanup.
 func newStore(t *testing.T) *webhook.PostgresStore {
 	t.Helper()
-	url := startContainer(t)
+	url := pgtest.NewURL(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}

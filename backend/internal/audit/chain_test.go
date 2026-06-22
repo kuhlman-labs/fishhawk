@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 )
 
 // --- ComputeEntryHash: pure unit tests, no DB ---
@@ -90,7 +91,7 @@ func TestComputeEntryHash_DiffersWhenAnyFieldChanges(t *testing.T) {
 //     Postgres helper from postgres_test.go ---
 
 func TestPostgres_AppendChained_FirstEntryHasNilPrevHash(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -113,7 +114,7 @@ func TestPostgres_AppendChained_FirstEntryHasNilPrevHash(t *testing.T) {
 }
 
 func TestPostgres_AppendChained_LinksToPriorEntry(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -147,7 +148,7 @@ func TestPostgres_AppendChained_LinksToPriorEntry(t *testing.T) {
 func TestPostgres_AppendChained_HashMatchesComputeEntryHash(t *testing.T) {
 	// Round-trip: an externally computed ComputeEntryHash on the
 	// same inputs must equal the hash AppendChained committed.
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -184,7 +185,7 @@ func TestPostgres_AppendChained_AllOptionalFields(t *testing.T) {
 	// happy-path tests above leave them nil. Confirms the typed
 	// fields round-trip through the chain hash and through the
 	// nullable-column handling.
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -240,7 +241,7 @@ func TestPostgres_AppendChained_AllOptionalFields(t *testing.T) {
 }
 
 func TestPostgres_AppendChained_RunNotFound(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 
 	_, err := repo.AppendChained(context.Background(), audit.ChainAppendParams{
@@ -263,7 +264,7 @@ func TestPostgres_AppendChained_RunNotFound(t *testing.T) {
 // would fail intermittently as two writers observe the same
 // last-entry hash.
 func TestPostgres_AppendChained_ConcurrentChainStaysLinear(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -325,7 +326,7 @@ func TestPostgres_AppendChained_ParallelRunsDoNotBlockEachOther(t *testing.T) {
 	// on each other's locks. We measure end-to-end: serial would
 	// roughly double the wall-clock time since each AppendChained
 	// holds the run row across the read+write+commit path.
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runA := makeRun(t, pool)
 	runB := makeRun(t, pool)

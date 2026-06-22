@@ -3,123 +3,16 @@ package run_test
 import (
 	"context"
 	"errors"
-	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
-
-// startPostgres spins up a throwaway Postgres container, applies the
-// embedded migrations, and returns a pgxpool.Pool. Skips the test if
-// Docker isn't reachable (so devs without Docker still pass `go test`
-// for the rest of the suite).
-func startPostgres(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	c, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
-		tcpostgres.WithDatabase("fishhawk"),
-		tcpostgres.WithUsername("fishhawk"),
-		tcpostgres.WithPassword("fishhawk"),
-		testcontainers.WithWaitStrategy(
-			wait.ForAll(
-				wait.ForLog("database system is ready to accept connections").
-					WithOccurrence(2).
-					WithStartupTimeout(60*time.Second),
-				wait.ForListeningPort("5432/tcp"),
-			),
-		),
-	)
-	if err != nil {
-		if isDockerUnavailable(err) {
-			t.Skipf("Docker not available; skipping integration test: %v", err)
-		}
-		t.Fatalf("start postgres: %v", err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = c.Terminate(ctx)
-	})
-
-	url, err := c.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("conn string: %v", err)
-	}
-
-	if err := postgres.MigrateUp(url); err != nil {
-		t.Fatalf("migrate up: %v", err)
-	}
-
-	pool, err := postgres.Connect(ctx, url)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(pool.Close)
-
-	return pool
-}
-
-// isDockerUnavailable returns true when the testcontainers error is
-// a missing docker daemon. Lets local dev runs without Docker skip
-// rather than fail.
-func isDockerUnavailable(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	for _, marker := range []string{
-		"Cannot connect to the Docker daemon",
-		"docker: not found",
-		"executable file not found",
-		"dial unix /var/run/docker.sock",
-	} {
-		if containsIgnoreCase(msg, marker) {
-			return true
-		}
-	}
-	// Honor an explicit opt-out for CI configs that don't have Docker.
-	return os.Getenv("FISHHAWK_SKIP_INTEGRATION") != ""
-}
-
-func containsIgnoreCase(haystack, needle string) bool {
-	if len(needle) > len(haystack) {
-		return false
-	}
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		match := true
-		for j := 0; j < len(needle); j++ {
-			h := haystack[i+j]
-			n := needle[j]
-			if h >= 'A' && h <= 'Z' {
-				h += 'a' - 'A'
-			}
-			if n >= 'A' && n <= 'Z' {
-				n += 'a' - 'A'
-			}
-			if h != n {
-				match = false
-				break
-			}
-		}
-		if match {
-			return true
-		}
-	}
-	return false
-}
 
 // makeRun is a small helper that creates a run with sensible defaults.
 func makeRun(t *testing.T, repo run.Repository) *run.Run {
@@ -152,7 +45,7 @@ func makeStage(t *testing.T, repo run.Repository, runID uuid.UUID, seq int) *run
 }
 
 func TestPostgres_CreateAndGetRun(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	created := makeRun(t, repo)
@@ -176,7 +69,7 @@ func TestPostgres_CreateAndGetRun(t *testing.T) {
 // with Drive=true reads back true, and the default path (params zero
 // value) reads back false — the legacy-row semantics.
 func TestPostgres_Drive_RoundTrip(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	driven, err := repo.CreateRun(context.Background(), run.CreateRunParams{
@@ -211,7 +104,7 @@ func TestPostgres_Drive_RoundTrip(t *testing.T) {
 // 0-based sub_plan position, while a run created without a SliceIndex
 // round-trips as nil (the non-decomposed default).
 func TestPostgres_SliceIndex_RoundTrip(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	idx := 2
@@ -269,7 +162,7 @@ func TestPostgres_SliceIndex_RoundTrip(t *testing.T) {
 }
 
 func TestPostgres_GetRun_NotFound(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	_, err := repo.GetRun(context.Background(), uuid.New())
@@ -279,7 +172,7 @@ func TestPostgres_GetRun_NotFound(t *testing.T) {
 }
 
 func TestPostgres_GetRunByIdempotencyKey_HappyPath(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	key := "abc123"
@@ -306,7 +199,7 @@ func TestPostgres_GetRunByIdempotencyKey_HappyPath(t *testing.T) {
 }
 
 func TestPostgres_GetRunByIdempotencyKey_NotFound(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 	_, err := repo.GetRunByIdempotencyKey(context.Background(), "x/y", "nope")
 	if !errors.Is(err, run.ErrNotFound) {
@@ -320,7 +213,7 @@ func TestPostgres_DuplicateIdempotencyKey_ConflictsAtDB(t *testing.T) {
 	// the existing row before insert; this test pins the DB-level
 	// guarantee that a race between two callers can't both
 	// insert.
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	key := "shared"
@@ -348,7 +241,7 @@ func TestPostgres_DuplicateIdempotencyKey_ConflictsAtDB(t *testing.T) {
 func TestPostgres_NullIdempotencyKey_DoesNotCollide(t *testing.T) {
 	// Two runs with no idempotency_key (nil) should both succeed —
 	// the partial index excludes NULLs so they don't conflict.
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 	for i := 0; i < 2; i++ {
 		if _, err := repo.CreateRun(context.Background(), run.CreateRunParams{
@@ -363,7 +256,7 @@ func TestPostgres_NullIdempotencyKey_DoesNotCollide(t *testing.T) {
 }
 
 func TestPostgres_ListRuns(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	// Three runs across two repos and two states.
@@ -457,7 +350,7 @@ func TestPostgres_ListRuns(t *testing.T) {
 }
 
 func TestPostgres_TransitionRun_HappyPath(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	r := makeRun(t, repo)
@@ -484,7 +377,7 @@ func TestPostgres_TransitionRun_HappyPath(t *testing.T) {
 // column is left intact (RetryRun reuses UpdateRunState; runs carry no
 // failure metadata to clear).
 func TestPostgres_RetryRun_ReopensFailed(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	r := makeRun(t, repo)
@@ -519,7 +412,7 @@ func TestPostgres_RetryRun_ReopensFailed(t *testing.T) {
 // table: only failed → running is permitted. A running run cannot be
 // "reopened".
 func TestPostgres_RetryRun_RejectsNonFailed(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	r := makeRun(t, repo) // pending
@@ -531,7 +424,7 @@ func TestPostgres_RetryRun_RejectsNonFailed(t *testing.T) {
 }
 
 func TestPostgres_TransitionRun_Idempotent(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	r := makeRun(t, repo)
@@ -549,7 +442,7 @@ func TestPostgres_TransitionRun_Idempotent(t *testing.T) {
 }
 
 func TestPostgres_TransitionRun_InvalidRejected(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	r := makeRun(t, repo)
@@ -564,7 +457,7 @@ func TestPostgres_TransitionRun_InvalidRejected(t *testing.T) {
 }
 
 func TestPostgres_TransitionRun_AfterTerminal(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	r := makeRun(t, repo)
@@ -582,7 +475,7 @@ func TestPostgres_TransitionRun_AfterTerminal(t *testing.T) {
 }
 
 func TestPostgres_ConcurrentTransition_ExactlyOneWins(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	r := makeRun(t, repo)
@@ -622,7 +515,7 @@ func TestPostgres_ConcurrentTransition_ExactlyOneWins(t *testing.T) {
 }
 
 func TestPostgres_ConcurrentDifferentTargets_ExactlyOneWins(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	r := makeRun(t, repo)
@@ -673,7 +566,7 @@ func TestPostgres_ConcurrentDifferentTargets_ExactlyOneWins(t *testing.T) {
 }
 
 func TestPostgres_StageLifecycle(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	r := makeRun(t, repo)
@@ -712,7 +605,7 @@ func TestPostgres_StageLifecycle(t *testing.T) {
 }
 
 func TestPostgres_StageFailureRequiresCompletion(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	r := makeRun(t, repo)
@@ -749,7 +642,7 @@ func TestPostgres_StageFailureRequiresCompletion(t *testing.T) {
 }
 
 func TestPostgres_ListStagesForRun_OrderedBySequence(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	r := makeRun(t, repo)
@@ -778,7 +671,7 @@ func TestPostgres_StageGate_RoundTripPreservesShape(t *testing.T) {
 	// without re-parsing the spec. Round-trip a populated Gate
 	// (kind + blocking_checks + approvers) through CreateStage +
 	// GetStage + ListStagesForRun and assert nothing's dropped.
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 	r := makeRun(t, repo)
 
@@ -838,7 +731,7 @@ func TestPostgres_ListReviewStagesAwaitingApproval_IncludesSLALess(t *testing.T)
 	// The Go fake ignores gate_sla entirely, so only this real-SQL test
 	// proves the WHERE clause is right (cf. #618: per-layer units pass
 	// while the seam breaks).
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 	ctx := context.Background()
 
@@ -909,7 +802,7 @@ func TestPostgres_StageGate_NilWhenSpecHasNoGate(t *testing.T) {
 	// implement). The persisted row's Gate must come back nil too,
 	// otherwise the UI would mis-render an "approval coming" panel
 	// for a stage that's never going to need one.
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 	r := makeRun(t, repo)
 
@@ -941,7 +834,7 @@ func TestPostgres_TransitionStage_SameState_NoOp(t *testing.T) {
 	// Repository.TransitionStage: when the stage is already in the
 	// target state, the call must return the unchanged stage (nil
 	// error) without bumping updated_at.
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 
 	r := makeRun(t, repo)
@@ -977,7 +870,7 @@ func TestPostgres_StageGate_CheckGateHasNoApprovers(t *testing.T) {
 	// gate (no approvers; just blocking_checks). The persisted Gate
 	// must reflect Kind=check and Approvers=nil so the UI can
 	// suppress the approval panel.
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 	r := makeRun(t, repo)
 
@@ -1012,7 +905,7 @@ type costRepo interface {
 }
 
 func TestPostgres_SumWorkflowCostInRange(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 	cr, ok := repo.(costRepo)
 	if !ok {
@@ -1139,7 +1032,7 @@ func clarificationParams(runID, stageID uuid.UUID, payload []byte) audit.ChainAp
 }
 
 func TestPostgres_ResumeAwaitingInputAndAppend_HappyPath(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 	ra, ok := repo.(resumeAppender)
 	if !ok {
@@ -1182,7 +1075,7 @@ func TestPostgres_ResumeAwaitingInputAndAppend_HappyPath(t *testing.T) {
 }
 
 func TestPostgres_ResumeAwaitingInputAndAppend_AppendFailureRollsBack(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 	ra, ok := repo.(resumeAppender)
 	if !ok {
@@ -1228,7 +1121,7 @@ func TestPostgres_ResumeAwaitingInputAndAppend_AppendFailureRollsBack(t *testing
 }
 
 func TestPostgres_ResumeAwaitingInputAndAppend_LoserCAS(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 	ra, ok := repo.(resumeAppender)
 	if !ok {
@@ -1267,7 +1160,7 @@ func TestPostgres_ResumeAwaitingInputAndAppend_LoserCAS(t *testing.T) {
 }
 
 func TestPostgres_ResumeAwaitingInputAndAppend_MissingStage(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 	ra, ok := repo.(resumeAppender)
 	if !ok {
@@ -1338,7 +1231,7 @@ func parkParams(runID, stageID uuid.UUID, payload []byte) audit.ChainAppendParam
 }
 
 func TestPostgres_ParkScopeCompletenessAndAppend_RoundTrip(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 	pk, ok := repo.(scopeCompletenessParker)
 	if !ok {
@@ -1395,7 +1288,7 @@ func TestPostgres_ParkScopeCompletenessAndAppend_RoundTrip(t *testing.T) {
 }
 
 func TestPostgres_ParkScopeCompletenessAndAppend_LoserCAS(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
 	pk := repo.(scopeCompletenessParker)
 	auditRepo := audit.NewPostgresRepository(pool)

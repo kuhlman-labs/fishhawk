@@ -3,18 +3,12 @@ package tokenmigrate
 import (
 	"bytes"
 	"context"
-	"os"
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 )
 
 // --- unit tests (no DB) ---
@@ -72,73 +66,6 @@ func TestMissingScopes_EmptyHave(t *testing.T) {
 		t.Errorf("missing from empty = %d, want %d", len(got), len(defaults))
 	}
 }
-
-// --- integration tests (testcontainers) ---
-
-func startContainer(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	c, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
-		tcpostgres.WithDatabase("fishhawk"),
-		tcpostgres.WithUsername("fishhawk"),
-		tcpostgres.WithPassword("fishhawk"),
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(60*time.Second),
-		),
-	)
-	if err != nil {
-		if isDockerUnavailable(err) {
-			t.Skipf("Docker not available; skipping integration test: %v", err)
-		}
-		t.Fatalf("start postgres: %v", err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = c.Terminate(ctx)
-	})
-
-	url, err := c.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("conn string: %v", err)
-	}
-	if err := postgres.MigrateUp(url); err != nil {
-		t.Fatalf("migrate up: %v", err)
-	}
-	pool, err := postgres.Connect(ctx, url)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
-}
-
-func isDockerUnavailable(err error) bool {
-	if err == nil {
-		return false
-	}
-	if os.Getenv("FISHHAWK_SKIP_INTEGRATION") != "" {
-		return true
-	}
-	msg := strings.ToLower(err.Error())
-	for _, marker := range []string{
-		"cannot connect to the docker daemon",
-		"docker: not found",
-		"executable file not found",
-		"dial unix /var/run/docker.sock",
-	} {
-		if strings.Contains(msg, marker) {
-			return true
-		}
-	}
-	return false
-}
-
 func seedToken(t *testing.T, pool *pgxpool.Pool, subject string, scopes []string) string {
 	t.Helper()
 	id := uuid.New().String()
@@ -166,7 +93,7 @@ func queryScopes(t *testing.T, pool *pgxpool.Pool, id string) []string {
 var testDefaults = []string{"read:runs", "read:audit", "write:runs", "write:approvals", "write:stages"}
 
 func TestMigrateScopes_Integration(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 
 	// Token A: full default set — should be skipped.
 	idA := seedToken(t, pool, "operator:full", testDefaults)

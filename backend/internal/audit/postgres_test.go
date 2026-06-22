@@ -7,88 +7,17 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
-
-func startContainer(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	c, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
-		tcpostgres.WithDatabase("fishhawk"),
-		tcpostgres.WithUsername("fishhawk"),
-		tcpostgres.WithPassword("fishhawk"),
-		testcontainers.WithWaitStrategy(
-			wait.ForAll(
-				wait.ForLog("database system is ready to accept connections").
-					WithOccurrence(2).
-					WithStartupTimeout(60*time.Second),
-				wait.ForListeningPort("5432/tcp"),
-			),
-		),
-	)
-	if err != nil {
-		if isDockerUnavailable(err) {
-			t.Skipf("Docker not available; skipping integration test: %v", err)
-		}
-		t.Fatalf("start postgres: %v", err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = c.Terminate(ctx)
-	})
-
-	url, err := c.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("conn string: %v", err)
-	}
-	if err := postgres.MigrateUp(url); err != nil {
-		t.Fatalf("migrate up: %v", err)
-	}
-	pool, err := postgres.Connect(ctx, url)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
-}
-
-func isDockerUnavailable(err error) bool {
-	if err == nil {
-		return false
-	}
-	if os.Getenv("FISHHAWK_SKIP_INTEGRATION") != "" {
-		return true
-	}
-	msg := strings.ToLower(err.Error())
-	for _, marker := range []string{
-		"cannot connect to the docker daemon",
-		"docker: not found",
-		"executable file not found",
-		"dial unix /var/run/docker.sock",
-	} {
-		if strings.Contains(msg, marker) {
-			return true
-		}
-	}
-	return false
-}
 
 // makeRun creates a parent run that the audit-entry tests can attach
 // to (audit_entries has a non-nullable run_id FK).
@@ -151,7 +80,7 @@ func appendEntry(t *testing.T, repo audit.Repository, runID uuid.UUID, category 
 }
 
 func TestPostgres_AppendAndGet(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -173,7 +102,7 @@ func TestPostgres_AppendAndGet(t *testing.T) {
 }
 
 func TestPostgres_Get_NotFound(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 
 	_, err := repo.Get(context.Background(), uuid.New())
@@ -183,7 +112,7 @@ func TestPostgres_Get_NotFound(t *testing.T) {
 }
 
 func TestPostgres_ListForRun_OrderedBySequence(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -209,7 +138,7 @@ func TestPostgres_ListForRun_OrderedBySequence(t *testing.T) {
 }
 
 func TestPostgres_LastForRun(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -231,7 +160,7 @@ func TestPostgres_LastForRun(t *testing.T) {
 }
 
 func TestPostgres_ListForRunByCategory(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -258,7 +187,7 @@ func TestPostgres_ListForRunByCategory(t *testing.T) {
 // fields that the simpler appendEntry helper leaves nil. Confirms
 // they round-trip through the column NULL handling cleanly.
 func TestPostgres_AppendWithActor(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -296,7 +225,7 @@ func TestPostgres_AppendWithActor(t *testing.T) {
 // doesn't expose Update; this test goes around the API directly to
 // the database to confirm the trigger fires regardless.
 func TestPostgres_TriggerBlocksUpdate(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 	e := appendEntry(t, repo, runID, "x", nil)
@@ -314,7 +243,7 @@ func TestPostgres_TriggerBlocksUpdate(t *testing.T) {
 // TestPostgres_TriggerBlocksDelete pairs with the UPDATE test —
 // neither mutation is permitted on the audit log.
 func TestPostgres_TriggerBlocksDelete(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 	e := appendEntry(t, repo, runID, "x", nil)
@@ -345,7 +274,7 @@ func TestPostgres_TriggerBlocksDelete(t *testing.T) {
 // (UTC, microsecond-truncated). This test exercises the full
 // integration boundary the in-memory fakes don't reach.
 func TestPostgres_AppendChained_HashRoundTripsThroughDB(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -400,7 +329,7 @@ func TestPostgres_AppendChained_HashRoundTripsThroughDB(t *testing.T) {
 // to canonicalize the payload inside ComputeEntryHash so both sides
 // converge on the same bytes.
 func TestPostgres_AppendChained_HashRoundTripsWithMultiKeyPayload(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -596,7 +525,7 @@ func TestComputeEntryHash_PayloadPreservesIntPrecision(t *testing.T) {
 }
 
 func TestPostgres_AppendGlobalChained_FirstEntryHasNilPrevHash(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 
 	subj := "github:42"
@@ -627,7 +556,7 @@ func TestPostgres_AppendGlobalChained_FirstEntryHasNilPrevHash(t *testing.T) {
 }
 
 func TestPostgres_AppendGlobalChained_LinksToPriorEntry(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 
 	first, err := repo.AppendGlobalChained(context.Background(), audit.GlobalChainAppendParams{
@@ -653,7 +582,7 @@ func TestPostgres_AppendGlobalChained_LinksToPriorEntry(t *testing.T) {
 }
 
 func TestPostgres_GlobalAndPerRunChainsAreIndependent(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -691,7 +620,7 @@ func TestPostgres_GlobalAndPerRunChainsAreIndependent(t *testing.T) {
 }
 
 func TestPostgres_ListGlobal_ReturnsOnlyGlobalEntries(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -737,7 +666,7 @@ func TestPostgres_ListGlobal_ReturnsOnlyGlobalEntries(t *testing.T) {
 }
 
 func TestPostgres_ListAll_MixesBothChainsTimeDesc(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -782,7 +711,7 @@ func TestPostgres_ListAll_MixesBothChainsTimeDesc(t *testing.T) {
 }
 
 func TestPostgres_ListAll_FiltersByCategory(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -818,7 +747,7 @@ func TestPostgres_ListAll_FiltersByCategory(t *testing.T) {
 }
 
 func TestPostgres_ListAll_FiltersByRunID(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 	runIDA := makeRun(t, pool)
 	runIDB := makeRun(t, pool)

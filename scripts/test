@@ -31,44 +31,60 @@ cd "$ROOT"
 export GIT_CONFIG_GLOBAL=/dev/null
 export GIT_CONFIG_SYSTEM=/dev/null
 
-# Disable the testcontainers ryuk reaper (#972 cascade). Each postgres_test.go
-# already tears its container down via t.Cleanup -> Container.Terminate, so the
-# ryuk reaper is a redundant backstop — but it is a SHARED, single-point-of-
-# failure container: under Docker-daemon load the reaper itself times out
-# starting ("reaper: new reaper: run container: ... context deadline exceeded"),
-# and every package that then tries to register with the dead reaper fails
-# ("No such container: <reaper-id>"), cascading one flake into a whole-suite
-# red. Disabling ryuk removes that shared dependency so a slow container start
-# can at worst flake ONE package (which the runner's verify gate absorbs),
-# never the cascade. Safe here: tests Terminate their own containers, and both
-# CI runners and `scripts/dev` are ephemeral / pruned, so orphan reaping is not
-# relied upon. Covers the runner's `scripts/test verify` too, since it sources
-# this script.
+# Disable the testcontainers ryuk reaper (#972 cascade). It is a SHARED, single-
+# point-of-failure container: under Docker-daemon load the reaper itself times
+# out starting ("reaper: new reaper: run container: ... context deadline
+# exceeded"), and every package that then tries to register with the dead reaper
+# fails ("No such container: <reaper-id>"), cascading one flake into a whole-
+# suite red. Disabling ryuk removes that shared dependency so a slow container
+# start can at worst flake ONE package (which the runner's verify gate absorbs),
+# never the cascade. Disabling ryuk is also what lets the single shared
+# fishhawk-test-postgres container (internal/pgtest, #1174) PERSIST across the
+# per-package test processes that reuse it — it is reaped by the EXIT trap below
+# instead of by ryuk. (The exempt internal/postgres MigrateUp/MigrateDown tests
+# still Terminate their own random-named throwaway containers via t.Cleanup.)
+# Both CI runners and `scripts/dev` are ephemeral / pruned, so orphan reaping is
+# not relied upon. Covers the runner's `scripts/test verify` too, since it
+# sources this script.
 export TESTCONTAINERS_RYUK_DISABLED=true
+
+# Best-effort teardown of the shared testcontainers Postgres (#1174). internal/
+# pgtest deliberately does NOT Terminate fishhawk-test-postgres (it is reused
+# across every package's test process while ryuk is disabled above), so reap it
+# here once the run is done. The test/coverage paths register this as an EXIT
+# trap so it also fires on a fail-fast exit. Guarded to be a no-op when Docker
+# is absent and to never fail the run.
+_reap_shared_container() {
+  command -v docker >/dev/null 2>&1 || return 0
+  docker rm -f fishhawk-test-postgres >/dev/null 2>&1 || true
+}
 
 modules() {
   go work edit -json | jq -r '.Use[].DiskPath'
 }
 
-# Full-suite runs bound test-binary parallelism (#972): ~16 backend packages
-# start a testcontainers Postgres each, and at the default -p (~GOMAXPROCS) a
-# developer-Mac Docker daemon intermittently times out starting one
-# ("context deadline exceeded" after 9 retries against docker.sock), failing
-# the suite on load contention rather than a real bug. `go test -p n` caps how
-# many test binaries run concurrently (tests within one binary are serial
-# unless they call t.Parallel()), so this caps concurrent container starts.
-# Modules run sequentially below, making the bound effectively global.
+# Full-suite test-binary parallelism (#972, #1174). Historically every backend
+# package started its OWN testcontainers Postgres, so at the default -p
+# (~GOMAXPROCS) a developer-Mac Docker daemon intermittently timed out starting
+# one ("context deadline exceeded" after 9 retries against docker.sock) — pure
+# load contention, not a real bug — and the bound was lowered 4 -> 2 to halve
+# concurrent container starts.
 #
-# Lowered 4 -> 2 (#972): at -p 4 the daemon still single-flaked a container
-# start (observed cascading a whole verify red before the ryuk-disable above;
-# now at worst one package). Halving concurrent container starts cuts the base
-# contention flake rate. The runner's verify gate still absorbs one residual
-# flake. Wall-clock cost: more serialization on high-core machines — raise it
-# back with FISHHAWK_TEST_P (e.g. FISHHAWK_TEST_P=4). `single` runs are
-# unbounded.
-TEST_P="${FISHHAWK_TEST_P:-2}"
+# As of #1174 the backend integration tests share a SINGLE Postgres container
+# (internal/pgtest): the first package to need it starts fishhawk-test-postgres,
+# every other package attaches to it by name (testcontainers WithReuseByName),
+# and each test gets a cheap per-test database cloned from a migrated template.
+# There is no longer a container start per package, so the start-contention that
+# forced -p 2 is gone — concurrent first-starts converge to the one shared
+# container via pgtest's bounded attach-retry on the docker name conflict.
+# Restored 2 -> 4 (#1174), proven by a full -p 4 run showing exactly one
+# fishhawk-test-postgres via `docker ps`. `go test -p n` still caps concurrent
+# test binaries; lower it on a constrained daemon with FISHHAWK_TEST_P (e.g.
+# FISHHAWK_TEST_P=2). `single` runs are unbounded.
+TEST_P="${FISHHAWK_TEST_P:-4}"
 
 cmd_test() {
+  trap _reap_shared_container EXIT
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"
     (cd "$m" && go test -race -p "$TEST_P" ./...)
@@ -76,6 +92,7 @@ cmd_test() {
 }
 
 cmd_coverage() {
+  trap _reap_shared_container EXIT
   local profiles=()
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"

@@ -24,13 +24,11 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -115,39 +113,14 @@ func newLocalRunnerFixtureWithTokenProvider(t *testing.T, withTokenProvider bool
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	// 1. Spin up Postgres in a throwaway container.
-	c, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
-		tcpostgres.WithDatabase("fishhawk"),
-		tcpostgres.WithUsername("fishhawk"),
-		tcpostgres.WithPassword("fishhawk"),
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(60*time.Second),
-		),
-	)
-	if err != nil {
-		if isDockerUnavailable(err) {
-			t.Skipf("Docker not available; skipping local-runner E2E: %v", err)
-		}
-		t.Fatalf("start postgres: %v", err)
-	}
-	t.Cleanup(func() {
-		shutCtx, shutCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer shutCancel()
-		_ = c.Terminate(shutCtx)
-	})
-	pgURL, err := c.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("postgres connection string: %v", err)
-	}
+	// 1. Get a freshly-migrated per-test database on the single
+	// shared Postgres container (pgtest starts one container for the
+	// whole run and clones a per-test DB from the migrated template;
+	// #1174). Skips when Docker is unavailable.
+	pgURL := pgtest.NewURL(t)
 
-	// 2. Apply migrations + open pool.
-	if err := postgres.MigrateUp(pgURL); err != nil {
-		t.Fatalf("MigrateUp: %v", err)
-	}
-	pool, err := pgxpool.New(ctx, pgURL)
+	// 2. Open the pool — pgtest already migrated the per-test DB.
+	pool, err := postgres.Connect(ctx, pgURL)
 	if err != nil {
 		t.Fatalf("pool: %v", err)
 	}
@@ -1197,28 +1170,4 @@ func implementTimeoutPlanJSON(t *testing.T, predictedMinutes int) []byte {
 		t.Fatalf("marshal plan: %v", err)
 	}
 	return b
-}
-
-// isDockerUnavailable matches the guard pattern from
-// backend/internal/integration/mcp/e2e_test.go. FISHHAWK_SKIP_INTEGRATION
-// provides an explicit escape hatch for CI environments without Docker.
-func isDockerUnavailable(err error) bool {
-	if err == nil {
-		return false
-	}
-	if os.Getenv("FISHHAWK_SKIP_INTEGRATION") != "" {
-		return true
-	}
-	msg := strings.ToLower(err.Error())
-	for _, marker := range []string{
-		"cannot connect to the docker daemon",
-		"docker: not found",
-		"executable file not found",
-		"dial unix /var/run/docker.sock",
-	} {
-		if strings.Contains(msg, strings.ToLower(marker)) {
-			return true
-		}
-	}
-	return errors.Is(err, exec.ErrNotFound)
 }
