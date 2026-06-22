@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -679,6 +680,191 @@ func TestRetryStage_BOverrideFalseStill422(t *testing.T) {
 
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Errorf("status = %d, want 422", w.Code)
+	}
+}
+
+// --- Drive next_action recording (#1271) -----------------------------------
+
+// newDriveRetryServer wires orchestratorRepo + the richer auditFake (which
+// serves ListForRunByCategory over appended entries, so GET /v0/runs/{id}
+// surfaces the drive next_action) + a real orchestrator, seeding a failed
+// stage of the given type/category on a run with the given drive flag and
+// runner kind. The run is seeded StateRunning so the retry handler's
+// failed→running reopen is inert and GET /v0/runs/{id} sees a non-terminal
+// run (applyDriveSurfaces suppresses next_action on terminal runs).
+func newDriveRetryServer(t *testing.T, driveEnabled bool, runnerKind string, stageType run.StageType, cat run.FailureCategory, reason string) (*Server, *orchestratorRepo, *auditFake, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	r := rr.seedRun()
+	r.Drive = driveEnabled
+	r.RunnerKind = runnerKind
+	stage := rr.seedStage(r.ID, 0, run.StageStateFailed)
+	stage.Type = stageType
+	c := cat
+	rs := reason
+	stage.FailureCategory = &c
+	stage.FailureReason = &rs
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+	return s, rr, au, r.ID, stage.ID
+}
+
+// getRunNextAction performs GET /v0/runs/{id} on the server and returns the
+// decoded run resource so a cross-layer test can assert the authoritative
+// REST run resource surfaces the drive next_action.
+func getRunNextAction(t *testing.T, s *Server, runID uuid.UUID) runResponse {
+	t.Helper()
+	gw := httptest.NewRecorder()
+	greq := httptest.NewRequest(http.MethodGet, "/v0/runs/"+runID.String(), nil)
+	s.Handler().ServeHTTP(gw, greq)
+	if gw.Code != http.StatusOK {
+		t.Fatalf("GET run status = %d, want 200:\n%s", gw.Code, gw.Body.String())
+	}
+	var resp runResponse
+	if err := json.Unmarshal(gw.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode run response: %v", err)
+	}
+	return resp
+}
+
+// TestRetryStage_Drive_LocalImplement_ParksWithNextAction is the #1271
+// done-means cross-layer test for the retry path: a category-A retry of an
+// implement stage on a drive-mode LOCAL run records a run_auto_advanced
+// entry with parked=true + next_action.action=run_implement_stage, AND GET
+// /v0/runs/{id} surfaces that same next_action on the authoritative REST
+// run resource.
+func TestRetryStage_Drive_LocalImplement_ParksWithNextAction(t *testing.T) {
+	s, _, au, runID, stageID := newDriveRetryServer(t, true, run.RunnerKindLocal,
+		run.StageTypeImplement, run.FailureA, "agent crashed: SIGSEGV")
+
+	w := postRetry(t, s, stageID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	advances := reviseDriveAdvances(t, au)
+	if len(advances) != 1 {
+		t.Fatalf("run_auto_advanced entries = %+v, want exactly 1", advances)
+	}
+	adv := advances[0]
+	if adv.Rule != drive.RuleRetryReopen {
+		t.Errorf("rule = %q, want retry_reopen", adv.Rule)
+	}
+	if !adv.Parked {
+		t.Error("parked = false, want true (local runner cannot be backend-dispatched, ADR-024)")
+	}
+	if adv.To != "implement:pending" {
+		t.Errorf("to = %q, want implement:pending", adv.To)
+	}
+	if adv.NextAction == nil || adv.NextAction.Action != "run_implement_stage" {
+		t.Fatalf("next_action = %+v, want action run_implement_stage", adv.NextAction)
+	}
+
+	if resp := getRunNextAction(t, s, runID); resp.NextAction == nil || resp.NextAction.Action != "run_implement_stage" {
+		t.Fatalf("GET /v0/runs/{id} next_action = %+v, want action run_implement_stage", resp.NextAction)
+	}
+}
+
+// TestRetryStage_Drive_LocalPlan_ParksWithNextAction covers the plan-stage
+// branch: a category-A retry of a PLAN stage on a drive-mode local run parks
+// with next_action.action=run_plan_stage, surfaced on the run resource.
+func TestRetryStage_Drive_LocalPlan_ParksWithNextAction(t *testing.T) {
+	s, _, au, runID, stageID := newDriveRetryServer(t, true, run.RunnerKindLocal,
+		run.StageTypePlan, run.FailureA, "agent crashed: SIGSEGV")
+
+	w := postRetry(t, s, stageID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	advances := reviseDriveAdvances(t, au)
+	if len(advances) != 1 {
+		t.Fatalf("run_auto_advanced entries = %+v, want exactly 1", advances)
+	}
+	adv := advances[0]
+	if adv.Rule != drive.RuleRetryReopen {
+		t.Errorf("rule = %q, want retry_reopen", adv.Rule)
+	}
+	if !adv.Parked || adv.To != "plan:pending" {
+		t.Errorf("parked/to = %v/%q, want true/plan:pending", adv.Parked, adv.To)
+	}
+	if adv.NextAction == nil || adv.NextAction.Action != "run_plan_stage" {
+		t.Fatalf("next_action = %+v, want action run_plan_stage", adv.NextAction)
+	}
+
+	if resp := getRunNextAction(t, s, runID); resp.NextAction == nil || resp.NextAction.Action != "run_plan_stage" {
+		t.Fatalf("GET /v0/runs/{id} next_action = %+v, want action run_plan_stage", resp.NextAction)
+	}
+}
+
+// TestRetryStage_Drive_GitHubActions_Advances asserts the advancing arm: a
+// retry on a drive-mode github_actions run records an advanced (not parked)
+// run_auto_advanced entry to implement:dispatched — the orchestrator's
+// workflow_dispatch edge IS the re-run, so no operator next action.
+func TestRetryStage_Drive_GitHubActions_Advances(t *testing.T) {
+	s, _, au, _, stageID := newDriveRetryServer(t, true, run.RunnerKindGitHubActions,
+		run.StageTypeImplement, run.FailureA, "agent crashed: SIGSEGV")
+
+	w := postRetry(t, s, stageID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	advances := reviseDriveAdvances(t, au)
+	if len(advances) != 1 {
+		t.Fatalf("run_auto_advanced entries = %+v, want exactly 1", advances)
+	}
+	adv := advances[0]
+	if adv.Rule != drive.RuleRetryReopen {
+		t.Errorf("rule = %q, want retry_reopen", adv.Rule)
+	}
+	if adv.Parked {
+		t.Error("parked = true, want false (github_actions auto-advances via workflow_dispatch)")
+	}
+	if adv.To != "implement:dispatched" {
+		t.Errorf("to = %q, want implement:dispatched", adv.To)
+	}
+	if adv.NextAction != nil {
+		t.Errorf("next_action = %+v, want nil (nothing for the operator to do)", adv.NextAction)
+	}
+}
+
+// TestRetryStage_NonDrive_RecordsNoDriveEntry exercises the guard branch: a
+// retry on a NON-drive run records no run_auto_advanced entry
+// (recordDriveRetryStage no-ops on !runRow.Drive), leaving only the
+// stage_retried entry the handler always writes.
+func TestRetryStage_NonDrive_RecordsNoDriveEntry(t *testing.T) {
+	s, _, au, _, stageID := newDriveRetryServer(t, false, run.RunnerKindLocal,
+		run.StageTypeImplement, run.FailureA, "agent crashed: SIGSEGV")
+
+	w := postRetry(t, s, stageID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if advances := reviseDriveAdvances(t, au); len(advances) != 0 {
+		t.Errorf("run_auto_advanced entries = %+v, want none on a non-drive run", advances)
+	}
+}
+
+// TestRetryStage_Drive_DTimeoutAwaitingApproval_RecordsNoDriveEntry pins the
+// reopened-to-pending guard: a D-timeout retry re-opens the stage to
+// awaiting_approval (not pending), so recordDriveRetryStage must not fire —
+// zero run_auto_advanced entries even on a drive-mode local run.
+func TestRetryStage_Drive_DTimeoutAwaitingApproval_RecordsNoDriveEntry(t *testing.T) {
+	s, _, au, _, stageID := newDriveRetryServer(t, true, run.RunnerKindLocal,
+		run.StageTypeReview, run.FailureD, "sla_timeout: 5h elapsed (deadline 4h)")
+
+	w := postRetry(t, s, stageID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if advances := reviseDriveAdvances(t, au); len(advances) != 0 {
+		t.Errorf("run_auto_advanced entries = %+v, want none on a D-timeout awaiting_approval re-open", advances)
 	}
 }
 

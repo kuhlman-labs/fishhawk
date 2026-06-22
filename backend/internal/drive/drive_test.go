@@ -52,6 +52,8 @@ func TestMechanical_RuleTable(t *testing.T) {
 	for _, rule := range []Rule{
 		RulePlanApprovedDispatch,
 		RuleReviseReplan,
+		RuleRetryReopen,
+		RuleRecoverRedispatch,
 		RuleReviewsSettledGate,
 		RuleFixupRereviewRepark,
 		RuleChecksGreenAwaitingMerge,
@@ -111,6 +113,72 @@ func TestEvaluateReviseReplan_Local_ParksWithNextAction(t *testing.T) {
 	}
 	if out.NextAction == nil || out.NextAction.Action != "run_plan_stage" {
 		t.Fatalf("NextAction = %+v, want action run_plan_stage", out.NextAction)
+	}
+}
+
+func TestEvaluateRetryReopen_Local_ParksPerStageType(t *testing.T) {
+	cases := []struct {
+		name       string
+		stageType  run.StageType
+		wantAction string // "" means no next action (defensive nil arm)
+	}{
+		{"plan retried parks run_plan_stage", run.StageTypePlan, "run_plan_stage"},
+		{"implement retried parks run_implement_stage", run.StageTypeImplement, "run_implement_stage"},
+		// A review stage never re-opens to pending (D-timeout/review retries
+		// land at awaiting_approval), so the defensive arm emits no action.
+		{"review retried yields no next action", run.StageTypeReview, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := EvaluateRetryReopen(run.RunnerKindLocal, tc.stageType)
+			if out.Advance {
+				t.Fatal("Advance = true, want false: the backend cannot spawn the host-side runner (ADR-024)")
+			}
+			if tc.wantAction == "" {
+				if out.NextAction != nil {
+					t.Fatalf("NextAction = %+v, want nil for stage type %q", out.NextAction, tc.stageType)
+				}
+				return
+			}
+			if out.NextAction == nil || out.NextAction.Action != tc.wantAction {
+				t.Fatalf("NextAction = %+v, want action %q", out.NextAction, tc.wantAction)
+			}
+		})
+	}
+}
+
+func TestEvaluateRetryReopen_GitHubActions_Advances(t *testing.T) {
+	// github_actions advances regardless of stage type (the
+	// workflow_dispatch edge is the re-run); only the reopened-to-pending
+	// plan/implement paths reach this in practice.
+	for _, st := range []run.StageType{run.StageTypePlan, run.StageTypeImplement} {
+		out := EvaluateRetryReopen(run.RunnerKindGitHubActions, st)
+		if !out.Advance {
+			t.Fatalf("Advance = false for stage type %q, want true for runner_kind github_actions", st)
+		}
+		if out.NextAction != nil {
+			t.Errorf("NextAction = %+v, want nil (nothing for the operator to do)", out.NextAction)
+		}
+	}
+}
+
+func TestEvaluateRecoverRedispatch_Local_ParksWithNextAction(t *testing.T) {
+	out := EvaluateRecoverRedispatch(run.RunnerKindLocal)
+	if out.Advance {
+		t.Fatal("Advance = true, want false: the backend cannot spawn the host-side runner (ADR-024)")
+	}
+	if out.NextAction == nil || out.NextAction.Action != "run_implement_stage" {
+		t.Fatalf("NextAction = %+v, want action run_implement_stage", out.NextAction)
+	}
+}
+
+func TestEvaluateRecoverRedispatch_GitHubActions_Advances(t *testing.T) {
+	out := EvaluateRecoverRedispatch(run.RunnerKindGitHubActions)
+	if !out.Advance {
+		t.Fatal("Advance = false, want true for runner_kind github_actions (workflow_dispatch is the re-run)")
+	}
+	if out.NextAction != nil {
+		t.Errorf("NextAction = %+v, want nil (nothing for the operator to do)", out.NextAction)
 	}
 }
 

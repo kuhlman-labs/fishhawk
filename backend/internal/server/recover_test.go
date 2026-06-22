@@ -16,6 +16,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -1371,5 +1372,117 @@ func assertErrorField(t *testing.T, w *httptest.ResponseRecorder, want string) {
 	}
 	if env.Error.Details.Field != want {
 		t.Errorf("error details.field = %q, want %q\n%s", env.Error.Details.Field, want, w.Body.String())
+	}
+}
+
+// --- Drive next_action recording on the in-place recover path (#1271) -------
+
+// newDriveDecompositionRecoverServer wires recoverRepo + the richer
+// auditFake (which serves ListForRunByCategory over appended entries, so GET
+// /v0/runs/{id} surfaces the drive next_action) + a real orchestrator + an
+// artifact repo (loadApprovedPlanForRun's plan source), then seeds a failed
+// category-B decomposition child with the given drive flag + runner kind.
+func newDriveDecompositionRecoverServer(t *testing.T, driveEnabled bool, runnerKind string) (*Server, *recoverRepo, *auditFake, *run.Run, *run.Stage) {
+	t.Helper()
+	rr := newRecoverRepo()
+	sa := newFakeScopeAmendmentRepo()
+	au := newAuditFake()
+	art := newFakeArtifactRepo()
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		ScopeAmendmentRepo: sa,
+		AuditRepo:          au,
+		ArtifactRepo:       art,
+		Orchestrator:       &orchestrator.Orchestrator{Runs: rr},
+	})
+	child, implStage := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
+	child.Drive = driveEnabled
+	child.RunnerKind = runnerKind
+	return s, rr, au, child, implStage
+}
+
+// TestRecoverRun_Drive_LocalChild_ParksWithNextAction is the #1271 done-means
+// cross-layer test for the in-place decomposition-child recover path: a
+// recover of a drive-mode LOCAL child records a run_auto_advanced entry with
+// rule recover_redispatch, parked=true, next_action.action=run_implement_stage,
+// AND GET /v0/runs/{id} surfaces that same next_action on the authoritative
+// REST run resource.
+func TestRecoverRun_Drive_LocalChild_ParksWithNextAction(t *testing.T) {
+	s, _, au, child, _ := newDriveDecompositionRecoverServer(t, true, run.RunnerKindLocal)
+
+	w := postRecover(t, s, child.ID.String(), `{}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("recover status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	advances := reviseDriveAdvances(t, au)
+	if len(advances) != 1 {
+		t.Fatalf("run_auto_advanced entries = %+v, want exactly 1", advances)
+	}
+	adv := advances[0]
+	if adv.Rule != drive.RuleRecoverRedispatch {
+		t.Errorf("rule = %q, want recover_redispatch", adv.Rule)
+	}
+	if !adv.Parked {
+		t.Error("parked = false, want true (local runner cannot be backend-dispatched, ADR-024)")
+	}
+	if adv.To != "implement:pending" {
+		t.Errorf("to = %q, want implement:pending", adv.To)
+	}
+	if adv.NextAction == nil || adv.NextAction.Action != "run_implement_stage" {
+		t.Fatalf("next_action = %+v, want action run_implement_stage", adv.NextAction)
+	}
+
+	if resp := getRunNextAction(t, s, child.ID); resp.NextAction == nil || resp.NextAction.Action != "run_implement_stage" {
+		t.Fatalf("GET /v0/runs/{id} next_action = %+v, want action run_implement_stage", resp.NextAction)
+	}
+}
+
+// TestRecoverRun_Drive_GitHubActionsChild_Advances asserts the advancing arm:
+// a recover of a drive-mode github_actions child records an advanced (not
+// parked) run_auto_advanced entry to implement:dispatched — the
+// orchestrator's workflow_dispatch edge IS the re-run, so no operator next
+// action.
+func TestRecoverRun_Drive_GitHubActionsChild_Advances(t *testing.T) {
+	s, _, au, child, _ := newDriveDecompositionRecoverServer(t, true, run.RunnerKindGitHubActions)
+
+	w := postRecover(t, s, child.ID.String(), `{}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("recover status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	advances := reviseDriveAdvances(t, au)
+	if len(advances) != 1 {
+		t.Fatalf("run_auto_advanced entries = %+v, want exactly 1", advances)
+	}
+	adv := advances[0]
+	if adv.Rule != drive.RuleRecoverRedispatch {
+		t.Errorf("rule = %q, want recover_redispatch", adv.Rule)
+	}
+	if adv.Parked {
+		t.Error("parked = true, want false (github_actions auto-advances via workflow_dispatch)")
+	}
+	if adv.To != "implement:dispatched" {
+		t.Errorf("to = %q, want implement:dispatched", adv.To)
+	}
+	if adv.NextAction != nil {
+		t.Errorf("next_action = %+v, want nil (nothing for the operator to do)", adv.NextAction)
+	}
+}
+
+// TestRecoverRun_NonDriveChild_RecordsNoDriveEntry exercises the guard
+// branch: a recover of a NON-drive decomposition child records no
+// run_auto_advanced entry (recordDriveDecompositionChildRecovery no-ops on
+// !child.Drive).
+func TestRecoverRun_NonDriveChild_RecordsNoDriveEntry(t *testing.T) {
+	s, _, au, child, _ := newDriveDecompositionRecoverServer(t, false, run.RunnerKindLocal)
+
+	w := postRecover(t, s, child.ID.String(), `{}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("recover status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if advances := reviseDriveAdvances(t, au); len(advances) != 0 {
+		t.Errorf("run_auto_advanced entries = %+v, want none on a non-drive child", advances)
 	}
 }
