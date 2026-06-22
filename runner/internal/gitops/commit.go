@@ -521,6 +521,20 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		if err := p.run(ctx, args.RepoDir, "stash", "--include-untracked"); err != nil {
 			return nil, fmt.Errorf("gitops: stash: %w", err)
 		}
+		// Base-freshness positioning (ADR-043 rev 2, #1294): this fetch sits as
+		// LATE in CommitAndPush as the reapply-before-commit invariant allows.
+		// The fetch -> checkout -B FETCH_HEAD -> popStash sequence MUST complete
+		// before the staging/commit below: the checkout resets the working tree
+		// to the fetched base and popStash reapplies the agent's edits onto it,
+		// so the fetch cannot be deferred past the commit without committing
+		// against the stale ambient base. The residual staleness window is
+		// therefore the (intentionally small) interval between this fetch and
+		// the commit/VerifyCommit gates — there is no later, no-cost point to
+		// fetch from, so this is the freshest base a provider-agnostic fix can
+		// guarantee. A base that advances AFTER the push (the post-push
+		// semantic-staleness race) is out of reach here by construction and is
+		// documented as an ACCEPTED known limitation in docs/ARCHITECTURE.md.
+		//
 		// Fetch the authoritative base branch tip into FETCH_HEAD. A URL fetch
 		// does not create a refs/remotes tracking ref, so the checkout
 		// references FETCH_HEAD explicitly.

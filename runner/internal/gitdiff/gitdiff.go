@@ -94,6 +94,59 @@ func (r *Runner) Run(ctx context.Context, baseRef, repoDir string) (constraint.D
 	return diff, nil
 }
 
+// MergeBase returns the best common ancestor (the run's fork point) of
+// baseRef and HEAD by running `git merge-base <baseRef> HEAD` in repoDir.
+//
+// The runner uses it to turn the staged-index policy diff from a 2-dot
+// comparison (staged index vs. the base-branch TIP) into a 3-dot one
+// (staged index vs. the fork point): a file the base branch added
+// orthogonally AFTER the run branched is present in the tip's tree but
+// absent from the merge-base tree, so `git diff --cached <merge-base>` no
+// longer reports it as a phantom deletion that inflates the staged-file
+// count (#1290 / ADR-043 rev 2). This is a purely LOCAL git operation —
+// no forge API, no compare endpoint — so the gate stays provider-agnostic.
+//
+// It reuses Run/RunPatch's Binary/Cmd overridable plumbing so it is
+// testable with the package's fakeCmd harness, and surfaces stderr in the
+// error like Run/RunPatch so an unresolvable base (unrelated histories,
+// shallow clone, a ref not yet fetched) yields an actionable message the
+// caller logs before falling back to the tip baseRef.
+func (r *Runner) MergeBase(ctx context.Context, baseRef, repoDir string) (string, error) {
+	if baseRef == "" {
+		return "", fmt.Errorf("gitdiff: baseRef required")
+	}
+	if repoDir == "" {
+		return "", fmt.Errorf("gitdiff: repoDir required")
+	}
+
+	binary := r.Binary
+	if binary == "" {
+		binary = "git"
+	}
+	cmdFn := r.Cmd
+	if cmdFn == nil {
+		cmdFn = exec.CommandContext
+	}
+
+	args := []string{"merge-base", baseRef, "HEAD"}
+	cmd := cmdFn(ctx, binary, args...)
+	cmd.Dir = repoDir
+
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+			return "", fmt.Errorf("gitdiff: merge-base: %v: %s",
+				err, strings.TrimSpace(string(ee.Stderr)))
+		}
+		return "", fmt.Errorf("gitdiff: merge-base: %w", err)
+	}
+	mb := strings.TrimSpace(string(out))
+	if mb == "" {
+		return "", fmt.Errorf("gitdiff: merge-base: empty output resolving %q..HEAD", baseRef)
+	}
+	return mb, nil
+}
+
 // RunPatch executes `git diff --cached <baseRef>` WITHOUT
 // --name-status to produce the full unified-diff (hunk) text, mirroring
 // Run's binary/Cmd overridability for tests. It diffs the same staged

@@ -15,6 +15,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +26,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/codex"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gitdiff"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
@@ -9301,6 +9304,174 @@ func TestComputeAndEmitDiff_DecompositionChild_MeasuresAgainstBase(t *testing.T)
 	if v := constraint.Evaluate(d, constraint.Constraints{MaxFilesChanged: maxFiles}); len(v) != 0 {
 		t.Fatalf("increment of %d under maxFiles %d should not violate; got %v", childFiles, maxFiles, v)
 	}
+}
+
+// gitRunnerFor returns a runGit closure bound to repo, failing the test on
+// any non-zero git exit.
+func gitRunnerFor(t *testing.T, repo string) func(args ...string) {
+	t.Helper()
+	return func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+}
+
+// TestComputeAndEmitDiff_StaleBase_ThreeDot is the ADR-043 rev 2 (#1294)
+// end-to-end wiring proof against real git: with the run's HEAD at the fork
+// point B0 and the base branch advanced orthogonally to B1 (adds b.go), the
+// git_diff event computeAndEmitDiff emits — the single source gateevidence +
+// the #1151 scope-completeness gate read — carries ONLY the run's own
+// increment {a.go}, with NO phantom deletion for b.go and NO
+// merge_base_unresolved degradation. The pre-#1294 2-dot comparison would have
+// inflated this with a b.go deletion (the #1290 shape).
+func TestComputeAndEmitDiff_StaleBase_ThreeDot(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	runGit := gitRunnerFor(t, repo)
+	runGit("init", "--initial-branch=main")
+	runGit("config", "user.name", "init")
+	runGit("config", "user.email", "init@example.com")
+	runGit("config", "commit.gpgsign", "false")
+	runGit("config", "tag.gpgsign", "false")
+
+	// B0: shared base on main + base.
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "-A")
+	runGit("commit", "-m", "B0")
+	runGit("branch", "base")
+
+	// Advance base to B1 orthogonally (b.go), leaving HEAD (main) at B0.
+	runGit("checkout", "base")
+	if err := os.WriteFile(filepath.Join(repo, "b.go"), []byte("package b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "-A")
+	runGit("commit", "-m", "B1 orthogonal")
+	runGit("checkout", "main")
+
+	// The run's own increment a.go, written but not committed; computeAndEmitDiff
+	// stages it (git add -A fallback, no scope set).
+	if err := os.WriteFile(filepath.Join(repo, "a.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config{workingDir: repo, checkBaseRef: "base", stageID: "s-stale"}
+	var sink bytes.Buffer
+	d, events, err := computeAndEmitDiff(cfg, &sink)
+	if err != nil {
+		t.Fatalf("computeAndEmitDiff: %v", err)
+	}
+	if strings.Contains(sink.String(), "merge_base_unresolved") {
+		t.Errorf("merge-base should resolve on a normal stale base; got log:\n%s", sink.String())
+	}
+	if got := len(d.ChangedFiles); got != 1 || d.ChangedFiles[0].Path != "a.go" {
+		t.Fatalf("3-dot diff = %+v, want exactly [a.go] (no phantom b.go deletion)", d.ChangedFiles)
+	}
+	// The git_diff event the gate consumes must agree: NumFiles == 1, no b.go.
+	var saw bool
+	for _, e := range events {
+		if e.Kind != "git_diff" {
+			continue
+		}
+		saw = true
+		var p gitDiffPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode git_diff: %v", err)
+		}
+		if p.NumFiles != 1 {
+			t.Errorf("git_diff NumFiles = %d, want 1 (3-dot, no phantom deletion)", p.NumFiles)
+		}
+		for _, f := range p.Files {
+			if f.Path == "b.go" {
+				t.Errorf("git_diff event contains b.go (%s); orthogonal base advance must not appear", f.Status)
+			}
+		}
+	}
+	if !saw {
+		t.Fatal("no git_diff event emitted")
+	}
+}
+
+// TestComputeAndEmitDiff_MergeBaseFailOpen covers the FAIL-OPEN branch: when
+// merge-base cannot be resolved (here: unrelated histories), computeAndEmitDiff
+// logs merge_base_unresolved and falls back to the ORIGINAL tip baseRef,
+// reproducing today's exact 2-dot diff rather than blocking the stage. Asserted
+// by both the degradation log line AND the returned diff matching a direct 2-dot
+// `git diff --cached <tip>`.
+func TestComputeAndEmitDiff_MergeBaseFailOpen(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	runGit := gitRunnerFor(t, repo)
+	runGit("init", "--initial-branch=main")
+	runGit("config", "user.name", "init")
+	runGit("config", "user.email", "init@example.com")
+	runGit("config", "commit.gpgsign", "false")
+	runGit("config", "tag.gpgsign", "false")
+
+	// B0 on main.
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "-A")
+	runGit("commit", "-m", "main B0")
+
+	// An ORPHAN base branch with no common ancestor — merge-base(base, HEAD)
+	// exits non-zero, exercising the fail-open path.
+	runGit("checkout", "--orphan", "base")
+	runGit("rm", "-rf", ".")
+	if err := os.WriteFile(filepath.Join(repo, "base_only.go"), []byte("package z\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "-A")
+	runGit("commit", "-m", "orphan base")
+
+	// Back on main (the run's HEAD) with an unrelated base branch.
+	runGit("checkout", "main")
+	if err := os.WriteFile(filepath.Join(repo, "a.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config{workingDir: repo, checkBaseRef: "base", stageID: "s-fallback"}
+	var sink bytes.Buffer
+	d, _, err := computeAndEmitDiff(cfg, &sink)
+	if err != nil {
+		t.Fatalf("computeAndEmitDiff: %v", err)
+	}
+	if !strings.Contains(sink.String(), "merge_base_unresolved") {
+		t.Errorf("expected merge_base_unresolved degradation line; got log:\n%s", sink.String())
+	}
+
+	// Fail-open means the diff was measured against the original tip baseRef
+	// ("base"): identical to a direct 2-dot Run against the tip.
+	want, rerr := (&gitdiff.Runner{}).Run(context.Background(), "base", repo)
+	if rerr != nil {
+		t.Fatalf("reference Run(base tip): %v", rerr)
+	}
+	gotPaths := pathsOf(d)
+	wantPaths := pathsOf(want)
+	if !reflect.DeepEqual(gotPaths, wantPaths) {
+		t.Errorf("fail-open diff = %v, want tip-baseRef diff %v", gotPaths, wantPaths)
+	}
+}
+
+// pathsOf returns the sorted changed-file paths of a Diff.
+func pathsOf(d constraint.Diff) []string {
+	out := make([]string, 0, len(d.ChangedFiles))
+	for _, f := range d.ChangedFiles {
+		out = append(out, f.Path)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // TestComputeAndEmitDiff_CategorizesScopeDrift proves the per-path A/B
