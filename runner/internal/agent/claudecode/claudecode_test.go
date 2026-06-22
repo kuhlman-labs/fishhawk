@@ -136,6 +136,31 @@ func TestHelperProcess(t *testing.T) {
 		fmt.Println(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"go test"}}]}}`)
 		fmt.Println(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"b.go"}}]}}`)
 		fmt.Println(`{"type":"result","usage":{"input_tokens":5,"output_tokens":5}}`)
+	case "wait_poll_loop":
+		// Emit many identical SANCTIONED scope-amendment wait-poll Bash
+		// calls (well above the lowered threshold). The detector exempts
+		// them (#1273), so this must NOT trip; a clean result follows so
+		// the stage succeeds.
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		for n := 0; n < 30; n++ {
+			fmt.Println(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"curl -s $FISHHAWK_BACKEND_URL/v0/runs/rid/scope-amendments?wait=30"}}]}}`)
+			os.Stdout.Sync()
+			time.Sleep(2 * time.Millisecond)
+		}
+		fmt.Println(`{"type":"result","usage":{"input_tokens":5,"output_tokens":5}}`)
+	case "loop_with_wait_polls":
+		// A real identical-call loop (go test ./...) interleaved with
+		// sanctioned wait-polls. Because the wait-poll is a no-op (skipped,
+		// not reset), the real loop's streak still accumulates and trips —
+		// proving the skip does not reset an in-progress real loop (#1273).
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		for n := 0; n < 30; n++ {
+			fmt.Println(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"go test ./..."}}]}}`)
+			fmt.Println(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"curl -s $FISHHAWK_BACKEND_URL/v0/runs/rid/scope-amendments?wait=30"}}]}}`)
+			os.Stdout.Sync()
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(500 * time.Millisecond)
 	case "echo_env":
 		// Echo a single env var so we can assert the harness
 		// wired API key forwarding correctly.
@@ -1086,6 +1111,153 @@ func TestInvoke_NoLoopOnVariedTools(t *testing.T) {
 		if ev.Kind == "loop_detected" {
 			t.Errorf("loop_detected event emitted on a varied-tool trace: %s", ev.Payload)
 		}
+	}
+}
+
+// TestIsSanctionedWaitPoll is the pure-predicate table for the #1273
+// loop-detector exemption. It covers the EXEMPT form (the documented
+// scope-amendments wait-poll) and the false-positive cases that MUST still
+// be counted by the detector (binding condition 1): a wait= that is not a
+// query param of the scope-amendments path, a non-curl Bash command that
+// merely contains both substrings, the non-waiting amendments GET, and a
+// non-Bash tool whose input contains the substrings.
+func TestIsSanctionedWaitPoll(t *testing.T) {
+	cases := []struct {
+		name string
+		sig  string
+		want bool
+	}{
+		{
+			// EXEMPT: wait= is the sole query parameter.
+			name: "exempt_wait_query_only",
+			sig:  `Bash {"command":"curl -s $FISHHAWK_BACKEND_URL/v0/runs/r/scope-amendments?wait=30"}`,
+			want: true,
+		},
+		{
+			// EXEMPT: wait= introduced by '&' after another query param.
+			name: "exempt_wait_after_other_param",
+			sig:  `Bash {"command":"curl -s $FISHHAWK_BACKEND_URL/v0/runs/r/scope-amendments?status=pending&wait=30"}`,
+			want: true,
+		},
+		{
+			// (c) Non-waiting amendments GET (no wait=) — still counts.
+			name: "non_waiting_get",
+			sig:  `Bash {"command":"curl -s $FISHHAWK_BACKEND_URL/v0/runs/r/scope-amendments"}`,
+			want: false,
+		},
+		{
+			// (a) scope-amendments present + a wait= that is NOT a query
+			// param of that path — still counts.
+			name: "wait_not_query_param",
+			sig:  `Bash {"command":"curl $URL/scope-amendments && echo wait=now"}`,
+			want: false,
+		},
+		{
+			// (a) variant: a non-wait query param, with the unrelated wait=
+			// after the URL token ends — still counts.
+			name: "other_query_param_unrelated_wait",
+			sig:  `Bash {"command":"curl \"$URL/scope-amendments?status=pending\" ; sleep wait=5"}`,
+			want: false,
+		},
+		{
+			// (b) Non-curl Bash command that merely contains both strings —
+			// still counts.
+			name: "non_curl_both_substrings",
+			sig:  `Bash {"command":"echo scope-amendments wait=30"}`,
+			want: false,
+		},
+		{
+			// (d) Non-Bash tool whose input contains the substrings —
+			// still counts.
+			name: "non_bash_tool",
+			sig:  `Read {"file_path":"scope-amendments?wait=30"}`,
+			want: false,
+		},
+		{
+			// Unrelated Bash command, neither substring — still counts.
+			name: "unrelated_bash",
+			sig:  `Bash {"command":"go test ./..."}`,
+			want: false,
+		},
+		{
+			// Empty signature is never a wait-poll; the existing empty-sig
+			// no-op contract in loopdetect.go is unaffected.
+			name: "empty",
+			sig:  "",
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isSanctionedWaitPoll(tc.sig); got != tc.want {
+				t.Errorf("isSanctionedWaitPoll(%q) = %v, want %v", tc.sig, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestInvoke_NoLoopOnSanctionedWaitPoll drives the full scan->detector path
+// with a run of identical SANCTIONED wait-poll Bash calls well above the
+// threshold: the exemption (#1273) means the detector never trips and the
+// stage succeeds (no loop_detected event, no agent.ErrLoopDetected).
+func TestInvoke_NoLoopOnSanctionedWaitPoll(t *testing.T) {
+	inv := &Invoker{
+		Cmd:           helperCommand("wait_poll_loop"),
+		Now:           frozenNow(),
+		LoopThreshold: 4,
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{
+		RunID: "rid-wait", Stage: "implement", Prompt: "go",
+	})
+	if errors.Is(err, agent.ErrLoopDetected) {
+		t.Fatalf("sanctioned wait-poll tripped the loop detector: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false; sanctioned wait-poll must not trip the loop detector: %q", res.FailureReason)
+	}
+	for _, ev := range res.Events {
+		if ev.Kind == "loop_detected" {
+			t.Errorf("loop_detected event emitted on a sanctioned wait-poll trace: %s", ev.Payload)
+		}
+	}
+}
+
+// TestInvoke_LoopDetectedNotResetByWaitPolls proves the skip is a true no-op
+// rather than a reset: a real identical-call loop interleaved with sanctioned
+// wait-polls still trips (the wait-polls neither count toward nor reset the
+// real streak), and the tripping signature is the real repeated call.
+func TestInvoke_LoopDetectedNotResetByWaitPolls(t *testing.T) {
+	inv := &Invoker{
+		Cmd:           helperCommand("loop_with_wait_polls"),
+		Now:           frozenNow(),
+		LoopThreshold: 4,
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{
+		RunID: "rid-loop-wait", Stage: "implement", Prompt: "go",
+	})
+	if !errors.Is(err, agent.ErrLoopDetected) {
+		t.Fatalf("err = %v, want wrapping ErrLoopDetected (interleaved wait-polls must not reset a real loop)", err)
+	}
+	if res.OK {
+		t.Error("OK = true on a real loop interleaved with wait-polls")
+	}
+	var loopEvents int
+	for _, ev := range res.Events {
+		if ev.Kind == "loop_detected" {
+			loopEvents++
+			if !strings.Contains(string(ev.Payload), "go test") {
+				t.Errorf("loop signature should be the real repeated call, not the wait-poll: %s", ev.Payload)
+			}
+			if strings.Contains(string(ev.Payload), "scope-amendments") {
+				t.Errorf("loop signature must not be the exempt wait-poll: %s", ev.Payload)
+			}
+		}
+	}
+	if loopEvents != 1 {
+		t.Errorf("loop_detected event count = %d, want 1", loopEvents)
 	}
 }
 

@@ -483,6 +483,17 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 		// agent.ErrLoopDetected. Signatures are extracted fail-open, so an
 		// unparseable line contributes none.
 		for _, sig := range toolCallSignatures(line) {
+			// The sanctioned scope-amendments wait-poll (#1273) is an
+			// intentionally-repeated long-poll the prompt instructs the
+			// agent to issue (backend/internal/prompt/prompt.go:1020).
+			// Skip feeding it to the detector entirely: like an empty
+			// signature it is a no-op — it neither accumulates a streak
+			// nor resets a real one — so a bounded amendment wait reaches
+			// the agent's proceed-as-denied path instead of being killed
+			// early as a category-A loop_detected.
+			if isSanctionedWaitPoll(sig) {
+				continue
+			}
 			if loopDetector.Observe(sig) {
 				loopHit = true
 				loopSig = sig
@@ -807,6 +818,50 @@ func canonicalInput(raw json.RawMessage) string {
 		return string(raw)
 	}
 	return string(b)
+}
+
+// isSanctionedWaitPoll reports whether a tool-call signature is the
+// operator-gated scope-amendment wait-poll the prompt instructs the agent
+// to issue while awaiting a decision: GET .../scope-amendments?wait=30
+// (backend/internal/prompt/prompt.go:1020). That bounded long-poll is a
+// deliberately-repeated identical action, so the loop detector (#653) would
+// otherwise count it as a no-progress loop and kill the stage category-A
+// (#1273) before the documented ~15-minute proceed-as-denied window elapses.
+// The feed loop skips this signature so it is a no-op for the detector.
+//
+// The match is deliberately NARROW to the documented prompt form: it requires
+// the `Bash ` tool-name prefix AND the `scope-amendments` path AND `wait=` as
+// a QUERY parameter of that path (introduced by `?` immediately after the path
+// and present as the first parameter or after a `&`). A bare `wait=` elsewhere
+// in an arbitrary Bash command, a non-waiting GET (no `wait=`), or any non-Bash
+// tool does NOT match and is counted by the detector as normal.
+func isSanctionedWaitPoll(sig string) bool {
+	const bashPrefix = "Bash "
+	if !strings.HasPrefix(sig, bashPrefix) {
+		return false
+	}
+	const pathMarker = "scope-amendments"
+	idx := strings.Index(sig[len(bashPrefix):], pathMarker)
+	if idx < 0 {
+		return false
+	}
+	rest := sig[len(bashPrefix)+idx+len(pathMarker):]
+	// The query must be introduced by '?' immediately after the path.
+	if len(rest) == 0 || rest[0] != '?' {
+		return false
+	}
+	query := rest[1:]
+	// Bound the query to the URL token: stop at the first character that
+	// ends a URL inside a JSON-escaped shell command. '&' is excluded — it
+	// separates query parameters, so a wait= introduced by '&' stays in
+	// scope.
+	const urlEnders = " \t\n\"'\\<>}|;" + "`"
+	if end := strings.IndexAny(query, urlEnders); end >= 0 {
+		query = query[:end]
+	}
+	// wait= must be a query parameter of the scope-amendments path: the
+	// first parameter, or one introduced by '&'.
+	return strings.HasPrefix(query, "wait=") || strings.Contains(query, "&wait=")
 }
 
 // truncateSignature bounds a signature embedded in an audit/failure reason
