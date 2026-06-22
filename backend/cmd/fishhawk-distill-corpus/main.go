@@ -57,6 +57,12 @@ Default --out-dir is %s, resolved relative to the current directory. If its
 parent (%s) is absent from the cwd, the command fails loud — run from the repo
 root or pass --out-dir <dir>.
 
+Inline labeling (#1291): --signal and --narrative pre-fill the case.md
+distilled-signal sections so the operator can add + label in one shot; omit
+them to keep the #1290 TODO(operator) prompts. --dry-run scores the bundle and
+prints the would-be case (dir, outcome, expected.json, case.md) WITHOUT writing
+any files, so the operator can evaluate-before-keep.
+
 Flags:
 `, defaultCorpusRel, corpusParentRel)
 		fs.PrintDefaults()
@@ -69,6 +75,9 @@ Flags:
 		issue      = fs.String("issue", "", "originating issue/run reference recorded in case.md (required), e.g. '#819'")
 		outDir     = fs.String("out-dir", "", "corpus parent directory (default: "+defaultCorpusRel+" relative to cwd)")
 		force      = fs.Bool("force", false, "overwrite an existing case directory")
+		signal     = fs.String("signal", "", "optional scorecard signal/classification this case demonstrates (pre-fills case.md; else a TODO prompt)")
+		narrative  = fs.String("narrative", "", "optional distilled-signal narrative for case.md (pre-fills the section; else a TODO prompt)")
+		dryRun     = fs.Bool("dry-run", false, "score the bundle and print the would-be case (dir, outcome, expected.json, case.md) WITHOUT writing any files")
 		backendURL = fs.String("backend-url", envOr("FISHHAWK_BACKEND_URL", "http://localhost:8080"), "backend base URL for --stage-id fetch (env FISHHAWK_BACKEND_URL)")
 		token      = fs.String("token", os.Getenv("FISHHAWK_TOKEN"), "bearer API token for --stage-id fetch (env FISHHAWK_TOKEN)")
 	)
@@ -98,15 +107,37 @@ Flags:
 		return 1
 	}
 
-	caseDir, err := corpusdistill.Distill(src, corpusdistill.Options{
+	opts := corpusdistill.Options{
 		CaseName: *caseName,
 		Issue:    *issue,
 		OutDir:   resolvedOut,
 		Force:    *force,
 		// Only the --stage-id fetch path GETs the redacted-only trace
 		// endpoint, so only it can claim PRODUCTION+REDACTED provenance.
-		Fetched: *stageID != "",
-	})
+		Fetched:   *stageID != "",
+		Signal:    *signal,
+		Narrative: *narrative,
+	}
+
+	// --dry-run: score + render but write nothing, so the operator can
+	// evaluate the would-be case before keeping it. Exit non-zero ONLY on a
+	// genuine error (bad bundle, unsafe case name) — never on "previewed,
+	// not written".
+	if *dryRun {
+		res, err := corpusdistill.Preview(src, opts)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		_, _ = fmt.Fprintf(stdout, "DRY RUN — no files written.\n")
+		_, _ = fmt.Fprintf(stdout, "case dir: %s\n", res.CaseDir)
+		_, _ = fmt.Fprintf(stdout, "derived outcome: %s\n", res.Card.Outcome)
+		_, _ = fmt.Fprintf(stdout, "\n--- expected.json ---\n%s", res.ExpectedJSON)
+		_, _ = fmt.Fprintf(stdout, "\n--- case.md ---\n%s", res.CaseMD)
+		return 0
+	}
+
+	caseDir, err := corpusdistill.Distill(src, opts)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
