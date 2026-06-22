@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -532,6 +533,17 @@ func (s *Server) handleRecoverDecompositionChild(w http.ResponseWriter, r *http.
 		}
 	}
 
+	// Drive (#1271): the in-place re-drive re-opens the child's implement
+	// stage to pending — the recover_redispatch transition point. The
+	// Advance handoff above IS the auto-advance (workflow_dispatch for
+	// runner_kind github_actions), so stamp the run_auto_advanced entry
+	// that surfaces the required next action on the authoritative REST run
+	// resource; runner_kind local parks with a host-side
+	// run_implement_stage next action instead (ADR-024). Mirrors
+	// recordDriveReviseReplan; the RedriveChild above already re-opened the
+	// stage, so this fires unconditionally for a drive run.
+	s.recordDriveDecompositionChildRecovery(r.Context(), child, implementStage.ID)
+
 	// Return the re-opened child (re-fetched for its running state).
 	updated, err := s.cfg.RunRepo.GetRun(r.Context(), child.ID)
 	if err != nil {
@@ -540,6 +552,42 @@ func (s *Server) handleRecoverDecompositionChild(w http.ResponseWriter, r *http.
 		return
 	}
 	s.writeJSON(w, r, http.StatusCreated, toRunResponse(updated))
+}
+
+// recordDriveDecompositionChildRecovery stamps the drive engine's
+// recover_redispatch rule (#1271) after an in-place decomposition-child
+// re-drive re-opens the child's implement stage to pending. No-ops when no
+// engine is wired or the child is not a drive run (best-effort: the
+// re-drive already landed; a missing stamp degrades attribution, never the
+// run). The child run is already in hand (fetched at the top of the recover
+// handler), so its Drive + RunnerKind are read directly without a re-fetch.
+// For runner_kind github_actions the entry records the advance the
+// orchestrator's workflow_dispatch fired; for runner_kind local it records
+// the park (Parked=true) with the run_implement_stage next action that
+// surfaces on the REST run resource and MCP get_run_status. The entry is
+// keyed to the re-opened implement stage.
+func (s *Server) recordDriveDecompositionChildRecovery(ctx context.Context, child *run.Run, implementStageID uuid.UUID) {
+	if s.drive == nil {
+		return
+	}
+	if !child.Drive {
+		return
+	}
+	out := drive.EvaluateRecoverRedispatch(child.RunnerKind)
+	adv := drive.Advance{
+		Rule: drive.RuleRecoverRedispatch,
+		From: "implement:failed",
+	}
+	if out.Advance {
+		adv.To = "implement:dispatched"
+		adv.Event = "decomposition child re-driven in place; orchestrator re-dispatched the implement stage via workflow_dispatch"
+	} else {
+		adv.To = "implement:pending"
+		adv.Event = "decomposition child re-driven in place; runner_kind local parks for a host-side re-dispatch"
+		adv.Parked = true
+		adv.NextAction = out.NextAction
+	}
+	s.drive.Record(ctx, child.ID, &implementStageID, adv)
 }
 
 // validateExemptScopeFiles normalizes and validates the operator's

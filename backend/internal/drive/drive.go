@@ -53,6 +53,31 @@ const (
 	// run_plan_stage next action, because the runner is host-spawned per
 	// ADR-024 and the backend has no execution channel to it.
 	RuleReviseReplan Rule = "revise_replan"
+	// RuleRetryReopen covers a FAILED stage retried back into pending and
+	// re-dispatched (POST /v0/stages/{id}/retry, #1271). Like
+	// RuleReviseReplan it is mechanical: the operator already expressed
+	// intent by calling retry, so the re-dispatch is a mechanical
+	// transition, not a judgment point. For runner_kind github_actions the
+	// orchestrator's workflow_dispatch edge is the re-run (auto-advance);
+	// local parks with a host-side run_<stage>_stage next action
+	// (run_plan_stage for a retried plan stage, run_implement_stage for a
+	// retried implement stage), because the runner is host-spawned per
+	// ADR-024 and the backend has no execution channel to it. Only the
+	// retryable A/C paths re-open to pending (review/D-timeout retries land
+	// at awaiting_approval, not pending), so this rule fires only for plan
+	// or implement re-opens.
+	RuleRetryReopen Rule = "retry_reopen"
+	// RuleRecoverRedispatch covers a FAILED decomposition child re-driven
+	// in place on the shared parent branch (POST /v0/runs/{id}/recover's
+	// in-place branch, #1271). The recovered stage is always implement.
+	// Like RuleReviseReplan it is mechanical: the operator already
+	// expressed intent by calling recover, so the re-dispatch is a
+	// mechanical transition, not a judgment point. For runner_kind
+	// github_actions the orchestrator's workflow_dispatch edge is the
+	// re-run (auto-advance); local parks with a host-side
+	// run_implement_stage next action, because the runner is host-spawned
+	// per ADR-024 and the backend has no execution channel to it.
+	RuleRecoverRedispatch Rule = "recover_redispatch"
 	// RuleReviewsSettledGate covers every configured agent review for
 	// a stage reaching a terminal state, so the gate evaluation
 	// proceeds without an operator await/poll.
@@ -106,6 +131,8 @@ const (
 var mechanical = map[Rule]bool{
 	RulePlanApprovedDispatch:     true,
 	RuleReviseReplan:             true,
+	RuleRetryReopen:              true,
+	RuleRecoverRedispatch:        true,
 	RuleReviewsSettledGate:       true,
 	RuleFixupRereviewRepark:      true,
 	RuleChecksGreenAwaitingMerge: true,
@@ -174,6 +201,65 @@ func EvaluateReviseReplan(runnerKind string) Outcome {
 			NextAction: &NextAction{
 				Action: "run_plan_stage",
 				Detail: "runner_kind local: dispatch the re-planned plan stage from the operator host (fishhawk_run_stage plan)",
+			},
+		}
+	}
+	return Outcome{Advance: true}
+}
+
+// EvaluateRetryReopen classifies a failed stage retried back into
+// pending → dispatched (#1271) for the run's runner kind, mirroring
+// EvaluateReviseReplan (the dispatch primitive is the same
+// runner-kind-aware Advance edge). github_actions auto-advances (the
+// orchestrator's existing workflow_dispatch edge is the re-run); local
+// parks with a host-side next action — run_plan_stage for a retried plan
+// stage, run_implement_stage for a retried implement stage — because the
+// runner is a host-spawned subprocess (ADR-024) the backend cannot start.
+// Any other stage type returns no next action (Advance false, NextAction
+// nil): review/D-timeout retries re-open at awaiting_approval, not
+// pending, so they never reach this classification — the defensive arm
+// keeps a stray call from emitting a bogus next action.
+func EvaluateRetryReopen(runnerKind string, stageType run.StageType) Outcome {
+	if runnerKind == run.RunnerKindLocal {
+		switch stageType {
+		case run.StageTypePlan:
+			return Outcome{
+				Advance: false,
+				NextAction: &NextAction{
+					Action: "run_plan_stage",
+					Detail: "runner_kind local: dispatch the retried plan stage from the operator host (fishhawk_run_stage plan)",
+				},
+			}
+		case run.StageTypeImplement:
+			return Outcome{
+				Advance: false,
+				NextAction: &NextAction{
+					Action: "run_implement_stage",
+					Detail: "runner_kind local: dispatch the retried implement stage from the operator host (fishhawk_run_stage implement)",
+				},
+			}
+		default:
+			return Outcome{Advance: false, NextAction: nil}
+		}
+	}
+	return Outcome{Advance: true}
+}
+
+// EvaluateRecoverRedispatch classifies a failed decomposition child
+// re-driven in place (#1271) for the child's runner kind, mirroring
+// EvaluateReviseReplan (the dispatch primitive is the same
+// runner-kind-aware Advance edge). The recovered stage is always
+// implement. github_actions auto-advances (the orchestrator's existing
+// workflow_dispatch edge is the re-run); local parks with a host-side
+// run_implement_stage next action because the runner is a host-spawned
+// subprocess (ADR-024) the backend cannot start.
+func EvaluateRecoverRedispatch(runnerKind string) Outcome {
+	if runnerKind == run.RunnerKindLocal {
+		return Outcome{
+			Advance: false,
+			NextAction: &NextAction{
+				Action: "run_implement_stage",
+				Detail: "runner_kind local: dispatch the re-driven decomposition child's implement stage from the operator host (fishhawk_run_stage implement)",
 			},
 		}
 	}

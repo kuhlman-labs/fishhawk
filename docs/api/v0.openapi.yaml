@@ -668,6 +668,10 @@ components:
             (runner_kind `local` after a plan-gate revise re-opened the
             plan stage — re-dispatch it from the operator host, #1256),
             and `merge_pr` (all gates resolved, required checks green).
+            `run_implement_stage` / `run_plan_stage` are now ALSO produced
+            by the `retry_stage` and `resume_run`/`recover` re-open paths
+            on a `local` run (#1271), not only by plan-approve and revise;
+            no new action value is introduced.
           example: merge_pr
         detail:
           type: string
@@ -685,7 +689,10 @@ components:
         the from/to edge it stamps. Rule names are a closed set
         (`backend/internal/drive`): `plan_approved_dispatch`,
         `revise_replan` (a plan-gate revise re-opened the plan stage,
-        #1256), `reviews_settled_gate`, `fixup_rereview_repark`,
+        #1256), `retry_reopen` (a failed stage was retried back into
+        pending and re-dispatched, #1271), `recover_redispatch` (a failed
+        decomposition child was re-driven in place, #1271),
+        `reviews_settled_gate`, `fixup_rereview_repark`,
         `checks_green_awaiting_merge`, `ci_failed` (the negative mirror
         of `checks_green_awaiting_merge`: a required PR check concluded
         red).

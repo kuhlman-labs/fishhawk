@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -266,6 +268,16 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Capture the re-open shape BEFORE the post-Advance GetStage re-fetch
+	// below overwrites dec.Stage.State: the drive recording keys off
+	// whether the retry re-opened the stage to pending (only the
+	// retryable A/C paths do — D-timeout retries land at awaiting_approval),
+	// independent of whatever state the orchestrator advance then reached.
+	reopenedToPending := dec.Stage.State == run.StageStatePending
+	retriedStageType := dec.Stage.Type
+	retriedStageID := dec.Stage.ID
+	retriedRunID := dec.Stage.RunID
+
 	// A/C retries land the stage in pending; hand off to the
 	// orchestrator to walk pending → dispatched and fire
 	// workflow_dispatch. D-timeout retries land at
@@ -291,12 +303,69 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Drive (#1271): a retry that re-opened the stage to pending is the
+	// retry_reopen transition point — the orchestrator handoff above IS
+	// the auto-advance (workflow_dispatch for runner_kind github_actions),
+	// so stamp the run_auto_advanced entry that surfaces the required next
+	// action on the authoritative REST run resource; runner_kind local
+	// parks with a host-side run_<stage>_stage next action instead
+	// (ADR-024: the runner is host-spawned, the backend has no execution
+	// channel to it). Mirrors recordDriveReviseReplan; gated on the
+	// re-opened-to-pending shape captured before the re-fetch so it fires
+	// only for the retryable A/C re-opens, never the D-timeout
+	// awaiting_approval re-open.
+	if reopenedToPending {
+		s.recordDriveRetryStage(r.Context(), retriedStageType, retriedStageID, retriedRunID)
+	}
+
 	// Sticky status comment (E20.4 / #330). A retry flips a failed
 	// stage back to pending / dispatched / awaiting_approval; the
 	// status comment should reflect the new shape.
 	s.notifyStatusUpdate(r.Context(), dec.Stage.RunID, "stage_retry")
 
 	s.writeJSON(w, r, http.StatusOK, toStageResponse(dec.Stage))
+}
+
+// recordDriveRetryStage stamps the drive engine's retry_reopen rule
+// (#1271) after a retry re-opens a failed stage to pending. No-ops for
+// non-drive runs, when no engine is wired, or on a run read failure
+// (best-effort: the retry already landed; a missing stamp degrades
+// attribution, never the run). For runner_kind github_actions the entry
+// records the advance the orchestrator's workflow_dispatch fired; for
+// runner_kind local it records the park (Parked=true) with the
+// run_<stage>_stage next action that surfaces on the REST run resource and
+// MCP get_run_status. A stage type with no host-side next action (the
+// defensive EvaluateRetryReopen nil arm — review/D-timeout never reach the
+// pending re-open) records nothing. The entry is keyed to the re-opened
+// stage.
+func (s *Server) recordDriveRetryStage(ctx context.Context, stageType run.StageType, stageID, runID uuid.UUID) {
+	if s.drive == nil || s.cfg.RunRepo == nil {
+		return
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil || !runRow.Drive {
+		return
+	}
+	out := drive.EvaluateRetryReopen(runRow.RunnerKind, stageType)
+	adv := drive.Advance{
+		Rule: drive.RuleRetryReopen,
+		From: string(stageType) + ":retried",
+	}
+	if out.Advance {
+		adv.To = string(stageType) + ":dispatched"
+		adv.Event = "failed " + string(stageType) + " stage retried; orchestrator re-dispatched the stage via workflow_dispatch"
+	} else {
+		if out.NextAction == nil {
+			// Unsupported stage type for a pending re-open (defensive): emit
+			// no entry rather than a bogus next action.
+			return
+		}
+		adv.To = string(stageType) + ":pending"
+		adv.Event = "failed " + string(stageType) + " stage retried; runner_kind local parks for a host-side re-dispatch"
+		adv.Parked = true
+		adv.NextAction = out.NextAction
+	}
+	s.drive.Record(ctx, runID, &stageID, adv)
 }
 
 // writeRetryAudit appends a stage_retried entry capturing the
