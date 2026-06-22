@@ -1,0 +1,5 @@
+{"seq":1,"ts":"2026-06-10T09:00:00Z","kind":"manifest","data":{"bundle_schema":"v1","run_id":"run-distill-sample","stage_id":"implement","agent":"claudecode","model":"claude-opus-4-8","generated_at":"2026-06-10T09:05:00Z"}}
+{"seq":2,"ts":"2026-06-10T09:00:05Z","kind":"assistant","data":{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"backend/internal/domain/report.go"}}]}}}
+{"seq":3,"ts":"2026-06-10T09:00:12Z","kind":"assistant","data":{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"backend/internal/domain/report.go"}}]}}}
+{"seq":4,"ts":"2026-06-10T09:00:20Z","kind":"git_diff","data":{"kind":"git_diff","base_ref":"main","files":[{"path":"backend/internal/domain/report.go","status":"M"}],"num_files":1}}
+{"seq":5,"ts":"2026-06-10T09:00:25Z","kind":"trailer","data":{"event_count":4}}
