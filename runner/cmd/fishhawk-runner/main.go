@@ -4840,11 +4840,11 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// on an un-redrivable B.
 		if isDecomposed {
 			_, _ = fmt.Fprintf(logSink,
-				`{"event":"implement_child_no_changes","run_id":%q,"stage_id":%q,"shared_branch":%q,"base_sha":%q}`+"\n",
-				cfg.runID, cfg.stageID, branch, cap.BaseSHA,
+				`{"event":"implement_child_no_changes","run_id":%q,"stage_id":%q,"shared_branch":%q,"base_sha":%q,"slice_index":%d}`+"\n",
+				cfg.runID, cfg.stageID, branch, cap.BaseSHA, runSliceIndex,
 			)
 			reportPullRequestFailure(ctx, cfg, logSink, client, issued, "C",
-				"child_no_changes: decomposition child implement stage produced no changes; stage terminalized retryable (#1036)")
+				childNoChangesReason(runSliceIndex))
 			return nil
 		}
 		// Non-fix-up no-changes (first implement pass, no forward gate): no PR to
@@ -5069,6 +5069,35 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		cfg.runID, cfg.stageID, shipRes.ID, shipRes.ContentHash, shipRes.Idempotent,
 	)
 	return nil
+}
+
+// childNoChangesReason builds the failure reason for a decomposed-child
+// implement stage that produced no changes (#1258 slice C / #1279). The
+// diagnostic is position-aware on the child's 0-based sub_plan slice index:
+//
+//   - slice 0 has no predecessor, so a no-changes child is overwhelmingly a
+//     genuine no-op or a planning/decomposition error — advise reviewing the
+//     sub-plan scope (preserves the #1036 framing intent).
+//   - slice N>0 is a dependent slice: the merged changes of predecessor slices
+//     0..N-1 are absent from this slice's isolated base, so code referencing
+//     them could not compile and was correctly not written. Name the recovery:
+//     consolidate the predecessor slices via fishhawk_consolidate_slices, then
+//     re-drive against the integrated base.
+//
+// BOTH branches retain the literal `child_no_changes` token: it is load-bearing
+// for audit/await keying and the #1036 terminalization mirroring.
+func childNoChangesReason(sliceIndex int) string {
+	if sliceIndex <= 0 {
+		return "child_no_changes: decomposition child slice 0 implement stage produced no changes; " +
+			"slice 0 has no predecessor slice, so a no-changes child is overwhelmingly a genuine no-op or a " +
+			"planning/decomposition error — review the sub-plan scope. Stage terminalized retryable (#1036)."
+	}
+	return fmt.Sprintf("child_no_changes: dependent child slice %d implement stage produced no changes; "+
+		"the merged changes of predecessor slices 0..%d (every slice before this one) are absent from this "+
+		"slice's isolated base, so code referencing them could not compile and was correctly not written. "+
+		"Recovery: consolidate predecessor slices 0..%d via fishhawk_consolidate_slices, then re-drive this "+
+		"slice against the integrated base. Stage terminalized retryable (#1036).",
+		sliceIndex, sliceIndex-1, sliceIndex-1)
 }
 
 // reportPullRequestFailure POSTs a failure-outcome body to
