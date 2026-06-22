@@ -106,7 +106,7 @@ jobs:
           printf 'token=%s\n' "${TOKEN}" >> "${GITHUB_OUTPUT}"
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           token: ${{ steps.fishhawk-auth.outputs.token }}
           # persist-credentials: false — actions/checkout sets the
