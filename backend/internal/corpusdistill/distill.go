@@ -50,6 +50,35 @@ type Options struct {
 	// operator-supplied bundles (--in/stdin) the origin is unverifiable, so
 	// the provenance line is left as a TODO prompt for the operator.
 	Fetched bool
+	// Signal is the optional operator-supplied scorecard signal/classification
+	// this case demonstrates (e.g. "loop_detected", "scope_drift",
+	// "healthy_cross_boundary"). When empty, renderCaseMD falls back to the
+	// TODO(operator) prompt for the distilled-signal section (no regression).
+	Signal string
+	// Narrative is the optional operator-supplied distilled-signal explanation:
+	// the human description of what trajectory the trace represents and why the
+	// case is worth keeping. When empty, renderCaseMD falls back to the
+	// TODO(operator) prompts for the "What it represents"/"Distilled signal"
+	// sections (no regression).
+	Narrative string
+}
+
+// Result describes the would-be corpus-case artifacts a Distill/Preview call
+// produces. Preview returns it without writing anything; Distill computes the
+// same Result internally and then writes TraceJSONL/ExpectedJSON/CaseMD to
+// CaseDir. It lets the --dry-run path report the resolved case dir, derived
+// outcome, expected.json, and case.md content the operator would get.
+type Result struct {
+	// CaseDir is the resolved OutDir/CaseName path the case would be written to.
+	CaseDir string
+	// TraceJSONL is the plain-JSONL trace.jsonl content.
+	TraceJSONL []byte
+	// ExpectedJSON is the marshalled scorecard (expected.json) content.
+	ExpectedJSON []byte
+	// CaseMD is the rendered case.md content.
+	CaseMD string
+	// Card is the derived deterministic scorecard.
+	Card agenteval.Scorecard
 }
 
 // Distill reads a trace bundle from r, scores it, and writes a corpus case
@@ -62,46 +91,12 @@ type Options struct {
 // normalises to both forms because bundle.ReadEvents consumes gzipped
 // bytes while trace.jsonl must be written plain.
 func Distill(r io.Reader, opts Options) (string, error) {
-	if opts.CaseName == "" {
-		return "", fmt.Errorf("corpusdistill: CaseName is required")
-	}
-	if err := validateCaseName(opts.CaseName); err != nil {
-		return "", err
-	}
-	if opts.Issue == "" {
-		return "", fmt.Errorf("corpusdistill: Issue is required")
-	}
-	if opts.OutDir == "" {
-		return "", fmt.Errorf("corpusdistill: OutDir is required")
-	}
-
-	raw, err := io.ReadAll(r)
-	if err != nil {
-		return "", fmt.Errorf("corpusdistill: read bundle: %w", err)
-	}
-	if len(raw) == 0 {
-		return "", fmt.Errorf("corpusdistill: empty bundle input")
-	}
-
-	gzBytes, plainBytes, err := normalize(raw)
+	res, err := prepare(r, opts)
 	if err != nil {
 		return "", err
 	}
 
-	// bundle.ReadEvents requires gzipped input (it calls gzip.NewReader
-	// first and returns ErrBadGzip on a plain frame), so we always hand it
-	// the gzipped form.
-	lines, err := bundle.ReadEvents(gzBytes)
-	if err != nil {
-		return "", fmt.Errorf("corpusdistill: parse bundle: %w", err)
-	}
-	if len(lines) == 0 {
-		return "", fmt.Errorf("corpusdistill: bundle contained no events")
-	}
-
-	card := agenteval.Score(lines)
-
-	caseDir := filepath.Join(opts.OutDir, opts.CaseName)
+	caseDir := res.CaseDir
 	if _, statErr := os.Stat(caseDir); statErr == nil {
 		if !opts.Force {
 			return "", fmt.Errorf("corpusdistill: case dir %q already exists; pass --force to overwrite", caseDir)
@@ -117,21 +112,13 @@ func Distill(r io.Reader, opts Options) (string, error) {
 		return "", fmt.Errorf("corpusdistill: create case dir %q: %w", caseDir, err)
 	}
 
-	// expected.json: marshal the scorecard with the corpus's 2-space
-	// indent + a trailing newline so a fresh re-score byte-matches.
-	expected, err := json.MarshalIndent(card, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("corpusdistill: marshal scorecard: %w", err)
-	}
-	expected = append(expected, '\n')
-
 	files := []struct {
 		name string
 		data []byte
 	}{
-		{"trace.jsonl", plainBytes},
-		{"expected.json", expected},
-		{"case.md", []byte(renderCaseMD(opts, card))},
+		{"trace.jsonl", res.TraceJSONL},
+		{"expected.json", res.ExpectedJSON},
+		{"case.md", []byte(res.CaseMD)},
 	}
 	for _, f := range files {
 		if err := os.WriteFile(filepath.Join(caseDir, f.name), f.data, 0o644); err != nil {
@@ -140,6 +127,79 @@ func Distill(r io.Reader, opts Options) (string, error) {
 	}
 
 	return caseDir, nil
+}
+
+// Preview parses and scores the bundle from r exactly as Distill does and
+// returns the would-be case artifacts as a Result, but writes NOTHING to the
+// filesystem (no Stat, MkdirAll, or WriteFile). It backs the command's
+// --dry-run path: the operator can evaluate the derived scorecard, case dir,
+// and rendered case.md before committing the case to disk. It surfaces the
+// same validation/parse errors as Distill (empty bundle, corrupt gzip, unsafe
+// CaseName, missing required field) so a genuine error is reported, not masked.
+func Preview(r io.Reader, opts Options) (Result, error) {
+	return prepare(r, opts)
+}
+
+// prepare performs all the read/normalize/parse/validate/score/render work
+// shared by Distill and Preview and computes the resolved CaseDir, but does NO
+// filesystem writes and does NOT perform the overwrite stat-check. It returns
+// the would-be case artifacts; Distill layers the overwrite guard + writes on
+// top, while Preview returns the Result verbatim.
+func prepare(r io.Reader, opts Options) (Result, error) {
+	if opts.CaseName == "" {
+		return Result{}, fmt.Errorf("corpusdistill: CaseName is required")
+	}
+	if err := validateCaseName(opts.CaseName); err != nil {
+		return Result{}, err
+	}
+	if opts.Issue == "" {
+		return Result{}, fmt.Errorf("corpusdistill: Issue is required")
+	}
+	if opts.OutDir == "" {
+		return Result{}, fmt.Errorf("corpusdistill: OutDir is required")
+	}
+
+	raw, err := io.ReadAll(r)
+	if err != nil {
+		return Result{}, fmt.Errorf("corpusdistill: read bundle: %w", err)
+	}
+	if len(raw) == 0 {
+		return Result{}, fmt.Errorf("corpusdistill: empty bundle input")
+	}
+
+	gzBytes, plainBytes, err := normalize(raw)
+	if err != nil {
+		return Result{}, err
+	}
+
+	// bundle.ReadEvents requires gzipped input (it calls gzip.NewReader
+	// first and returns ErrBadGzip on a plain frame), so we always hand it
+	// the gzipped form.
+	lines, err := bundle.ReadEvents(gzBytes)
+	if err != nil {
+		return Result{}, fmt.Errorf("corpusdistill: parse bundle: %w", err)
+	}
+	if len(lines) == 0 {
+		return Result{}, fmt.Errorf("corpusdistill: bundle contained no events")
+	}
+
+	card := agenteval.Score(lines)
+
+	// expected.json: marshal the scorecard with the corpus's 2-space
+	// indent + a trailing newline so a fresh re-score byte-matches.
+	expected, err := json.MarshalIndent(card, "", "  ")
+	if err != nil {
+		return Result{}, fmt.Errorf("corpusdistill: marshal scorecard: %w", err)
+	}
+	expected = append(expected, '\n')
+
+	return Result{
+		CaseDir:      filepath.Join(opts.OutDir, opts.CaseName),
+		TraceJSONL:   plainBytes,
+		ExpectedJSON: expected,
+		CaseMD:       renderCaseMD(opts, card),
+		Card:         card,
+	}, nil
 }
 
 // validateCaseName constrains CaseName to a single, safe path element.
@@ -206,8 +266,11 @@ func gzipBytes(b []byte) ([]byte, error) {
 }
 
 // renderCaseMD produces the case.md template. It references the originating
-// issue/run, records the derived outcome, and leaves TODO prompts for the
-// operator's curated distilled-signal narrative (#819).
+// issue/run, records the derived outcome, and — when the operator supplies the
+// inline-labeling flags (opts.Signal/opts.Narrative, #1291) — pre-fills the
+// "What it represents" / "Distilled signal" sections with that text. When a
+// label flag is empty it falls back to the EXACT same TODO(operator) prompt the
+// #1290 scaffold emits, so omitting the flags is a byte-for-byte no-regression.
 //
 // The provenance block is source-dependent: the tool can only assert the
 // PRODUCTION + REDACTED-variant provenance for the --stage-id fetch path
@@ -229,18 +292,48 @@ are operator curation and must be completed before this case lands (#819).
 
 Derived outcome: `+"`%s`"+`.
 
-TODO(operator): describe the trajectory this trace represents — what the
-agent was asked to do, what it did, and why this case is worth keeping in
-the corpus (which scoring branch or failure mode it exercises).
+%s
 
 ## Distilled signal
 
-TODO(operator): state the distilled signal — the specific scorer behaviour
+%s
+`, opts.CaseName, provenanceBlock(opts), card.Outcome,
+		representsSection(opts), distilledSignalSection(opts))
+}
+
+// representsSection renders the "What it represents" body: the operator's
+// Narrative when supplied (#1291), else the EXACT #1290 TODO(operator) prompt.
+func representsSection(opts Options) string {
+	if opts.Narrative != "" {
+		return opts.Narrative
+	}
+	return `TODO(operator): describe the trajectory this trace represents — what the
+agent was asked to do, what it did, and why this case is worth keeping in
+the corpus (which scoring branch or failure mode it exercises).`
+}
+
+// distilledSignalSection renders the "Distilled signal" body: the operator's
+// Signal + Narrative when supplied (#1291), else the EXACT #1290
+// TODO(operator) prompt.
+func distilledSignalSection(opts Options) string {
+	if opts.Signal != "" || opts.Narrative != "" {
+		var b strings.Builder
+		if opts.Signal != "" {
+			fmt.Fprintf(&b, "Signal: `%s`.", opts.Signal)
+		}
+		if opts.Narrative != "" {
+			if b.Len() > 0 {
+				b.WriteString("\n\n")
+			}
+			b.WriteString(opts.Narrative)
+		}
+		return b.String()
+	}
+	return `TODO(operator): state the distilled signal — the specific scorer behaviour
 this case pins (the branch in deriveOutcome / evidence_before_edit /
 out_of_tree_writes / scope_drift_paths it covers) and how it contrasts with
 sibling cases. Add human_labels.json alongside this file once the editorial
-labels are agreed.
-`, opts.CaseName, provenanceBlock(opts), card.Outcome)
+labels are agreed.`
 }
 
 // provenanceBlock returns the case.md provenance paragraph. For the

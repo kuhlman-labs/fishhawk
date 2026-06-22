@@ -142,6 +142,121 @@ func TestDistill_CaseMD_UnverifiedProvenance(t *testing.T) {
 	}
 }
 
+// TestDistill_CaseMD_Labeled covers the #1291 inline-labeling done-means: a
+// case built with Signal+Narrative renders BOTH operator strings into case.md
+// and does NOT emit the TODO(operator) prompts for those sections. A no-op
+// that wires the flags but ignores them fails this assertion.
+func TestDistill_CaseMD_Labeled(t *testing.T) {
+	dir := t.TempDir()
+	const signal = "loop_detected"
+	const narrative = "Agent re-issued the same ?wait poll until the harness killed the stage."
+	caseDir, err := Distill(strings.NewReader(fixtureJSONL), Options{
+		CaseName: "c", Issue: "#1291", OutDir: dir,
+		Signal: signal, Narrative: narrative,
+	})
+	if err != nil {
+		t.Fatalf("Distill: %v", err)
+	}
+	md := string(readDir(t, caseDir)["case.md"])
+	for _, want := range []string{signal, narrative} {
+		if !strings.Contains(md, want) {
+			t.Errorf("labeled case.md missing %q\n---\n%s", want, md)
+		}
+	}
+	if strings.Contains(md, "TODO(operator): describe the trajectory") ||
+		strings.Contains(md, "TODO(operator): state the distilled signal") {
+		t.Errorf("labeled case.md must not emit the TODO(operator) prompts\n---\n%s", md)
+	}
+}
+
+// TestDistill_CaseMD_NoLabels_TemplateUnchanged covers the no-regression
+// done-means: omitting the label flags still emits the EXACT #1290
+// TODO(operator) prompt strings for both curated sections.
+func TestDistill_CaseMD_NoLabels_TemplateUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	caseDir, err := Distill(strings.NewReader(fixtureJSONL), Options{CaseName: "c", Issue: "#1290", OutDir: dir})
+	if err != nil {
+		t.Fatalf("Distill: %v", err)
+	}
+	md := string(readDir(t, caseDir)["case.md"])
+	wants := []string{
+		`TODO(operator): describe the trajectory this trace represents — what the
+agent was asked to do, what it did, and why this case is worth keeping in
+the corpus (which scoring branch or failure mode it exercises).`,
+		`TODO(operator): state the distilled signal — the specific scorer behaviour
+this case pins (the branch in deriveOutcome / evidence_before_edit /
+out_of_tree_writes / scope_drift_paths it covers) and how it contrasts with
+sibling cases. Add human_labels.json alongside this file once the editorial
+labels are agreed.`,
+	}
+	for _, want := range wants {
+		if !strings.Contains(md, want) {
+			t.Errorf("no-label case.md missing the exact #1290 TODO prompt:\nwant substring:\n%s\n---\ngot:\n%s", want, md)
+		}
+	}
+}
+
+// TestPreview_NoWrite covers the --dry-run no-write done-means: Preview
+// returns a populated Result yet writes NO files (OutDir stays empty), and it
+// surfaces the same validation errors as Distill (empty input, unsafe
+// CaseName, missing required field) without touching the filesystem.
+func TestPreview_NoWrite(t *testing.T) {
+	dir := t.TempDir()
+	res, err := Preview(strings.NewReader(fixtureJSONL), Options{CaseName: "c", Issue: "#1291", OutDir: dir})
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if res.CaseDir != filepath.Join(dir, "c") {
+		t.Errorf("Result.CaseDir = %q, want %q", res.CaseDir, filepath.Join(dir, "c"))
+	}
+	if len(res.ExpectedJSON) == 0 || res.CaseMD == "" || res.Card.Outcome == "" {
+		t.Errorf("Preview returned an unpopulated Result: %+v", res)
+	}
+	// expected.json content must match what Distill would write.
+	lines, err := bundle.ReadEvents(gzipFixture(t, fixtureJSONL))
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	want, err := json.MarshalIndent(agenteval.Score(lines), "", "  ")
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	want = append(want, '\n')
+	if !bytes.Equal(res.ExpectedJSON, want) {
+		t.Errorf("Preview ExpectedJSON mismatch\ngot:  %q\nwant: %q", res.ExpectedJSON, want)
+	}
+	// Proof of no-write: the OutDir must have zero entries.
+	if entries, err := os.ReadDir(dir); err != nil {
+		t.Fatalf("read out dir: %v", err)
+	} else if len(entries) != 0 {
+		t.Errorf("Preview wrote files under OutDir: %v", entries)
+	}
+
+	// Error parity: Preview must reject the same inputs Distill does, still
+	// without writing anything.
+	errCases := []struct {
+		name string
+		r    string
+		opts Options
+	}{
+		{"empty input", "", Options{CaseName: "c", Issue: "#1291", OutDir: dir}},
+		{"unsafe case name", fixtureJSONL, Options{CaseName: "../escape", Issue: "#1291", OutDir: dir}},
+		{"missing required field", fixtureJSONL, Options{CaseName: "c", OutDir: dir}}, // no Issue
+	}
+	for _, tc := range errCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Preview(strings.NewReader(tc.r), tc.opts); err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if entries, err := os.ReadDir(dir); err != nil {
+				t.Fatalf("read out dir: %v", err)
+			} else if len(entries) != 0 {
+				t.Errorf("Preview error path wrote files under OutDir: %v", entries)
+			}
+		})
+	}
+}
+
 // TestDistill_OverwriteGuard covers mode (5), both branches: a re-run
 // without Force errors and leaves the dir untouched; with Force it
 // succeeds.

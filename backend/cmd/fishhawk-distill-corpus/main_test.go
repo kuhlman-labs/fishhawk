@@ -99,6 +99,79 @@ func TestRun_DefaultOutDirFailLoud(t *testing.T) {
 	}
 }
 
+// TestRun_LabelFlags asserts --signal/--narrative wire through to a labeled
+// case.md (the operator's text lands; the TODO prompts do not).
+func TestRun_LabelFlags(t *testing.T) {
+	withStdin(t, minimalJSONL)
+	out := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	const signal = "scope_drift"
+	const narrative = "Agent edited an out-of-scope file the runner then dropped."
+	code := run([]string{
+		"--case-name", "c", "--issue", "#1291", "--out-dir", out,
+		"--signal", signal, "--narrative", narrative,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run exit = %d, stderr=%s", code, stderr.String())
+	}
+	md, err := os.ReadFile(filepath.Join(out, "c", "case.md"))
+	if err != nil {
+		t.Fatalf("read case.md: %v", err)
+	}
+	for _, want := range []string{signal, narrative} {
+		if !strings.Contains(string(md), want) {
+			t.Errorf("case.md missing %q\n---\n%s", want, md)
+		}
+	}
+	if strings.Contains(string(md), "TODO(operator): state the distilled signal") {
+		t.Errorf("labeled case.md still emits the distilled-signal TODO prompt\n---\n%s", md)
+	}
+}
+
+// TestRun_DryRun asserts --dry-run exits 0, writes NO case dir under
+// --out-dir, and prints the resolved case dir + derived outcome to stdout.
+func TestRun_DryRun(t *testing.T) {
+	withStdin(t, minimalJSONL)
+	out := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"--case-name", "c", "--issue", "#1291", "--out-dir", out, "--dry-run"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("dry-run exit = %d, stderr=%s", code, stderr.String())
+	}
+	// No files written: OutDir must be empty.
+	if entries, err := os.ReadDir(out); err != nil {
+		t.Fatalf("read out dir: %v", err)
+	} else if len(entries) != 0 {
+		t.Errorf("--dry-run wrote entries under --out-dir: %v", entries)
+	}
+	got := stdout.String()
+	for _, want := range []string{filepath.Join(out, "c"), "derived outcome:", "case.md"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("dry-run stdout missing %q\n---\n%s", want, got)
+		}
+	}
+}
+
+// TestRun_DryRun_ErrorExitsNonZero pins the exit contract's error branch: a
+// genuine error (empty stdin bundle) under --dry-run returns 1, not 0.
+func TestRun_DryRun_ErrorExitsNonZero(t *testing.T) {
+	withStdin(t, "")
+	out := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"--case-name", "c", "--issue", "#1291", "--out-dir", out, "--dry-run"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("dry-run on empty bundle exit = %d, want 1; stderr=%s", code, stderr.String())
+	}
+	if entries, err := os.ReadDir(out); err != nil {
+		t.Fatalf("read out dir: %v", err)
+	} else if len(entries) != 0 {
+		t.Errorf("--dry-run error path wrote entries under --out-dir: %v", entries)
+	}
+}
+
 // TestRun_MissingRequiredFlags covers the required-flag guards.
 func TestRun_MissingRequiredFlags(t *testing.T) {
 	cases := []struct {
