@@ -178,8 +178,8 @@ func TestCalibrateEmptyCases(t *testing.T) {
 // JudgeCard domain type, and the agreement-scoring consumer.
 func TestCalibrateCorpusReplay(t *testing.T) {
 	cases := loadCorpusCases(t)
-	if len(cases) != 4 {
-		t.Fatalf("want 4 corpus cases, got %d", len(cases))
+	if len(cases) < 4 {
+		t.Fatalf("want at least the 4 labeled seed corpus cases, got %d", len(cases))
 	}
 	for _, c := range cases {
 		if !c.Labels.Synthetic {
@@ -274,7 +274,18 @@ func loadCorpusCases(t *testing.T) []CalibrationCase {
 			continue
 		}
 		dir := filepath.Join(corpusDir, e.Name())
-		labels, err := loadHumanLabels(filepath.Join(dir, "human_labels.json"))
+		labelsPath := filepath.Join(dir, "human_labels.json")
+		if _, statErr := os.Stat(labelsPath); errors.Is(statErr, os.ErrNotExist) {
+			// Tier-A-only corpus case: it carries expected.json (exercised by
+			// the scorer's TestScore) but no Tier-B human_labels.json yet, so
+			// it is not part of the judge-calibration subset. Skip it rather
+			// than forcing every corpus case to be Tier-B-labeled — this
+			// decouples Tier-A corpus growth (#819) from Tier-B labeling and
+			// is why a labels-free case (e.g. a freshly distilled real trace)
+			// must not break calibration replay (#1174 / #1298).
+			continue
+		}
+		labels, err := loadHumanLabels(labelsPath)
 		if err != nil {
 			t.Fatalf("load labels for %s: %v", e.Name(), err)
 		}
