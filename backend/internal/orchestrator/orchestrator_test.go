@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1253,6 +1254,22 @@ func TestBranchNames_NoDFConflict(t *testing.T) {
 	// (ii) slice branch unchanged — byte-identical to the runner's name.
 	if got := sliceBranch(id, 0); got != "fishhawk/run-aaaaaaaa/slice-0" {
 		t.Errorf("sliceBranch(id,0) = %q, want fishhawk/run-aaaaaaaa/slice-0", got)
+	}
+
+	// (ii.a) The exported wrapper used by out-of-package consumers
+	// (server.fixupBranchFor, #1246) MUST emit the byte-identical name AND
+	// match the unexported formula the runner's childSliceBranch mirrors.
+	// Locking the exported symbol + its output here means the wrapper cannot
+	// be removed, renamed, or desynced from sliceBranch without failing this
+	// unit suite.
+	for n := 0; n < 4; n++ {
+		want := "fishhawk/run-aaaaaaaa/slice-" + strconv.Itoa(n)
+		if got := SliceBranch(id, n); got != want {
+			t.Errorf("SliceBranch(id,%d) = %q, want %q", n, got, want)
+		}
+		if got, unexp := SliceBranch(id, n), sliceBranch(id, n); got != unexp {
+			t.Errorf("SliceBranch(id,%d) = %q, want byte-identical to sliceBranch %q", n, got, unexp)
+		}
 	}
 
 	// (iii) D/F regression guard: the consolidated name is never a path

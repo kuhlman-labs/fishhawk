@@ -823,6 +823,21 @@ func sliceBranch(parentID uuid.UUID, sliceIndex int) string {
 	return runBranchPrefix(parentID) + "/slice-" + strconv.Itoa(sliceIndex)
 }
 
+// SliceBranch is the canonical, exported derivation of a decomposed child's
+// per-slice sole-writer branch (ADR-041 / E24.1 / #1141):
+// fishhawk/run-<short-parent>/slice-<n>. It delegates to the single
+// unexported sliceBranch formula so there is exactly one source of truth for
+// the name. Out-of-package consumers (e.g. server.fixupBranchFor, #1246) MUST
+// call this rather than re-hardcoding the slice-branch literal — the same
+// duplicated-reconstruction drift that orphaned parent fix-up commits on the
+// #1243 consolidated rename (#1245). It MUST stay byte-identical to the
+// runner's childSliceBranch (runner/cmd/fishhawk-runner/main.go), which
+// derives the same name in the separate runner module that cannot import this
+// package.
+func SliceBranch(parentID uuid.UUID, sliceIndex int) string {
+	return sliceBranch(parentID, sliceIndex)
+}
+
 // emitSlicesIntegrated writes a slices_integrated audit entry (system
 // actor) once every succeeded slice merged cleanly onto the consolidated
 // branch (#1142). Consumed by E24.7. Best-effort, mirroring
