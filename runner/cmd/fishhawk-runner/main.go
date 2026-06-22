@@ -2076,6 +2076,35 @@ func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent
 	// (#765); for everything else it is cfg.checkBaseRef unchanged.
 	baseRef := resolvePolicyBaseRef(context.Background(), cfg, logSink)
 
+	// ADR-043 rev 2 (#1294): convert the staged-index policy diff from a
+	// 2-dot comparison (staged index vs. the base-branch TIP) to a 3-dot one
+	// (staged index vs. the run's fork point) by diffing against the
+	// merge-base of baseRef and HEAD instead of the moving tip. Without this,
+	// a file the base branch added orthogonally AFTER the run branched is
+	// present in the tip's tree but absent from the run's index, so `git diff
+	// --cached <tip>` reports it as a phantom deletion (status D) that
+	// inflates the StagedFiles count gateevidence + the #1151
+	// scope-completeness gate read — reproducing #1290's 16-staged-vs-7-
+	// declared implement-review failure. merge-base is a purely LOCAL git
+	// operation (no forge API), so the gate stays provider-agnostic.
+	//
+	// FAIL-OPEN: if the merge-base cannot be resolved (unrelated histories,
+	// shallow clone, or a base ref not yet fetched locally) we log a
+	// degradation line and fall back to the original tip baseRef — today's
+	// exact behavior — never blocking the diff. baseRef stays the
+	// human-meaningful label on the git_diff event; diffBaseRef is the
+	// commit-ish the staged index is actually measured against, so the
+	// name-status (Run), patch (RunPatch), and numstat are all 3-dot and
+	// internally consistent.
+	diffBaseRef := baseRef
+	if mb, mbErr := (&gitdiff.Runner{}).MergeBase(context.Background(), baseRef, repoDir); mbErr != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"merge_base_unresolved","stage_id":%q,"base_ref":%q,"detail":%q}`+"\n",
+			cfg.stageID, baseRef, mbErr.Error())
+	} else {
+		diffBaseRef = mb
+	}
+
 	var events []agent.Event
 
 	if paths := scopePaths(cfg.scopeFiles); len(paths) > 0 {
@@ -2139,7 +2168,7 @@ func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent
 	}
 
 	runner := &gitdiff.Runner{}
-	d, err := runner.Run(context.Background(), baseRef, repoDir)
+	d, err := runner.Run(context.Background(), diffBaseRef, repoDir)
 	if err != nil {
 		events = append(events, agent.Event{
 			Kind:    "policy_event",
@@ -2155,14 +2184,14 @@ func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent
 	// name-status list (d, above) is the load-bearing policy input and
 	// is already in hand. The reviewer prompt falls back to its
 	// file-list rendering when the patch is absent.
-	patch, truncated, perr := runner.RunPatch(context.Background(), baseRef, repoDir)
+	patch, truncated, perr := runner.RunPatch(context.Background(), diffBaseRef, repoDir)
 	if perr != nil {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"git_diff_patch_failed","base_ref":%q,"detail":%q}`+"\n",
-			baseRef, perr.Error())
+			diffBaseRef, perr.Error())
 		patch, truncated = "", false
 	}
-	ins, dels := computeDiffNumstat(context.Background(), baseRef, repoDir, logSink)
+	ins, dels := computeDiffNumstat(context.Background(), diffBaseRef, repoDir, logSink)
 	events = append(events, makeGitDiffEventStats(baseRef, d, patch, truncated, ins, dels))
 	return d, events, nil
 }

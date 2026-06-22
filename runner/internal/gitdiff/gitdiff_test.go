@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -137,6 +139,10 @@ func TestHelperProcess(t *testing.T) {
 			" package x\n" +
 			"-old line\n" +
 			"+new line\n")
+	case "merge_base":
+		// Stand in for `git merge-base <base> HEAD`: print a SHA on stdout.
+		// The trailing newline is what MergeBase trims off.
+		fmt.Println("abc123def4567890abc123def4567890abc12345")
 	case "patch_big":
 		// Emit more than maxPatchBytes so RunPatch truncates.
 		fmt.Print(strings.Repeat("+", maxPatchBytes+1024))
@@ -386,6 +392,249 @@ func TestSplitNULs(t *testing.T) {
 	if err != nil || advance != 0 || token != nil {
 		t.Errorf("EOF empty: got (%d, %q, %v)", advance, token, err)
 	}
+}
+
+// TestMergeBase_ProviderAgnosticArgv asserts the merge-base resolution is a
+// purely LOCAL git invocation — `git merge-base <baseRef> HEAD` — and never a
+// forge API / compare-endpoint call. It drives MergeBase through a Cmd builder
+// that records the binary + argv, proving ADR-043 rev 2 stays provider-agnostic.
+func TestMergeBase_ProviderAgnosticArgv(t *testing.T) {
+	var gotName string
+	var gotArgs []string
+	r := &Runner{
+		Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			gotName = name
+			gotArgs = append([]string(nil), args...)
+			c := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess")
+			c.Env = append(os.Environ(), "GO_HELPER_PROCESS=1", "HELPER_MODE=merge_base")
+			return c
+		},
+	}
+	mb, err := r.MergeBase(context.Background(), "origin/main", t.TempDir())
+	if err != nil {
+		t.Fatalf("MergeBase: %v", err)
+	}
+	if gotName != "git" {
+		t.Errorf("binary = %q, want %q (local git, no forge API)", gotName, "git")
+	}
+	want := []string{"merge-base", "origin/main", "HEAD"}
+	if !reflect.DeepEqual(gotArgs, want) {
+		t.Errorf("argv = %v, want %v (local merge-base, not a forge compare endpoint)", gotArgs, want)
+	}
+	if mb != "abc123def4567890abc123def4567890abc12345" {
+		t.Errorf("merge-base = %q, want trimmed SHA", mb)
+	}
+}
+
+// TestMergeBase_Error_SurfacesStderr covers the fail-open error branch's
+// message quality: an unresolvable base (e.g. an ambiguous ref) surfaces git's
+// stderr so the caller's merge_base_unresolved log line is actionable.
+func TestMergeBase_Error_SurfacesStderr(t *testing.T) {
+	r := &Runner{Cmd: fakeCmd("error")}
+	_, err := r.MergeBase(context.Background(), "no-such-ref", t.TempDir())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "ambiguous argument") {
+		t.Errorf("err = %v, want stderr-derived message", err)
+	}
+}
+
+// TestMergeBase_EmptyOutput guards the exit-0-but-empty branch: git printing no
+// SHA (defensive; shouldn't happen on a real merge-base) is treated as an error
+// so the caller fails open to the tip baseRef rather than diffing against "".
+func TestMergeBase_EmptyOutput(t *testing.T) {
+	r := &Runner{Cmd: fakeCmd("ok_empty")}
+	_, err := r.MergeBase(context.Background(), "main", t.TempDir())
+	if err == nil {
+		t.Fatal("expected error for empty merge-base output")
+	}
+	if !strings.Contains(err.Error(), "empty output") {
+		t.Errorf("err = %v, want empty-output message", err)
+	}
+}
+
+func TestMergeBase_RequiredArgs(t *testing.T) {
+	r := &Runner{}
+	if _, err := r.MergeBase(context.Background(), "", "/x"); err == nil {
+		t.Error("expected baseRef required")
+	}
+	if _, err := r.MergeBase(context.Background(), "main", ""); err == nil {
+		t.Error("expected repoDir required")
+	}
+}
+
+// stagedPaths is a small helper: the sorted set of changed-file paths in a Diff.
+func stagedPaths(d constraint.Diff) []string {
+	out := make([]string, 0, len(d.ChangedFiles))
+	for _, f := range d.ChangedFiles {
+		out = append(out, f.Path)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// buildStaleBaseRepo constructs the #1290 shape with real git and returns the
+// repo dir. Layout: base commit B0; an orthogonal base advance to B1 (adds
+// b.go); HEAD pinned at B0 (the run's fork point) with a.go staged-not-committed
+// (the run's own increment). baseRef "base" points at B1.
+//
+//	B0 (main, HEAD) ── a.go staged
+//	 └── B1 (base)   ── adds b.go orthogonally
+func buildStaleBaseRepo(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	mustRunGit(t, repo, "init", "--initial-branch=main")
+	mustRunGit(t, repo, "config", "user.name", "init")
+	mustRunGit(t, repo, "config", "user.email", "init@example.com")
+	mustRunGit(t, repo, "config", "commit.gpgsign", "false")
+	mustRunGit(t, repo, "config", "tag.gpgsign", "false")
+
+	// B0: shared base commit, on both main and base.
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRunGit(t, repo, "add", "-A")
+	mustRunGit(t, repo, "commit", "-m", "B0")
+	mustRunGit(t, repo, "branch", "base")
+
+	// Advance base to B1 by adding an unrelated file b.go — an orthogonal
+	// move that does NOT touch the run's HEAD (main, still B0).
+	mustRunGit(t, repo, "checkout", "base")
+	if err := os.WriteFile(filepath.Join(repo, "b.go"), []byte("package b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRunGit(t, repo, "add", "-A")
+	mustRunGit(t, repo, "commit", "-m", "B1: orthogonal base advance")
+
+	// Back on the run's fork point (B0), stage the run's own edit a.go
+	// without committing — mirrors computeAndEmitDiff's staged index.
+	mustRunGit(t, repo, "checkout", "main")
+	if err := os.WriteFile(filepath.Join(repo, "a.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRunGit(t, repo, "add", "-A")
+	return repo
+}
+
+// TestMergeBase_StaleBase_RemovesPhantomDeletion is the #1290 repro (real git):
+// the 3-dot comparison (staged index vs. merge-base(base,HEAD)=B0) sees the
+// run's increment {a.go} with NO phantom deletion for the orthogonally-added
+// b.go, whereas the OLD 2-dot comparison (staged index vs. base TIP=B1) WOULD
+// have reported b.go as a phantom D — exactly the inflation ADR-043 rev 2 removes.
+func TestMergeBase_StaleBase_RemovesPhantomDeletion(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := buildStaleBaseRepo(t)
+	r := &Runner{}
+	ctx := context.Background()
+
+	// merge-base(base, HEAD=main) must resolve to the fork point B0.
+	mb, err := r.MergeBase(ctx, "base", repo)
+	if err != nil {
+		t.Fatalf("MergeBase: %v", err)
+	}
+	b0 := strings.TrimSpace(mustRunGitOut(t, repo, "rev-parse", "main"))
+	if mb != b0 {
+		t.Fatalf("merge-base = %q, want B0 (%q) — the run's fork point", mb, b0)
+	}
+
+	// NEW 3-dot path: diff the staged index against the merge-base.
+	newDiff, err := r.Run(ctx, mb, repo)
+	if err != nil {
+		t.Fatalf("Run(merge-base): %v", err)
+	}
+	if got := stagedPaths(newDiff); !reflect.DeepEqual(got, []string{"a.go"}) {
+		t.Fatalf("3-dot staged set = %v, want [a.go] (no phantom b.go deletion)", got)
+	}
+	for _, f := range newDiff.ChangedFiles {
+		if f.Path == "b.go" {
+			t.Errorf("3-dot diff contains b.go (%s); the orthogonal base advance must not appear", f.Status)
+		}
+	}
+
+	// OLD 2-dot path: diff against the base TIP (B1) — proves the bug the fix
+	// removes. b.go shows up as a phantom deletion that inflated the count.
+	oldDiff, err := r.Run(ctx, "base", repo)
+	if err != nil {
+		t.Fatalf("Run(base tip): %v", err)
+	}
+	var sawPhantomDelete bool
+	for _, f := range oldDiff.ChangedFiles {
+		if f.Path == "b.go" && f.Status == constraint.StatusDeleted {
+			sawPhantomDelete = true
+		}
+	}
+	if !sawPhantomDelete {
+		t.Fatalf("expected the OLD 2-dot diff to report b.go as a phantom deletion; got %+v", oldDiff.ChangedFiles)
+	}
+	if len(oldDiff.ChangedFiles) <= len(newDiff.ChangedFiles) {
+		t.Errorf("2-dot diff (%d files) should be inflated over 3-dot (%d files)",
+			len(oldDiff.ChangedFiles), len(newDiff.ChangedFiles))
+	}
+}
+
+// TestMergeBase_BaseUnmoved_BackCompat asserts the change is a no-op when the
+// base has NOT advanced: merge-base(base==B0, HEAD==B0) is B0, so the 3-dot
+// staged set is byte-for-byte identical to the 2-dot set — today's behavior is
+// preserved on the common (base-unmoved) path.
+func TestMergeBase_BaseUnmoved_BackCompat(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	mustRunGit(t, repo, "init", "--initial-branch=main")
+	mustRunGit(t, repo, "config", "user.name", "init")
+	mustRunGit(t, repo, "config", "user.email", "init@example.com")
+	mustRunGit(t, repo, "config", "commit.gpgsign", "false")
+	mustRunGit(t, repo, "config", "tag.gpgsign", "false")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRunGit(t, repo, "add", "-A")
+	mustRunGit(t, repo, "commit", "-m", "B0")
+	mustRunGit(t, repo, "branch", "base") // base stays pinned at B0 (unmoved)
+
+	// Stage the run's increment without committing; HEAD stays at B0.
+	if err := os.WriteFile(filepath.Join(repo, "a.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustRunGit(t, repo, "add", "-A")
+
+	r := &Runner{}
+	ctx := context.Background()
+	mb, err := r.MergeBase(ctx, "base", repo)
+	if err != nil {
+		t.Fatalf("MergeBase: %v", err)
+	}
+	threeDot, err := r.Run(ctx, mb, repo)
+	if err != nil {
+		t.Fatalf("Run(merge-base): %v", err)
+	}
+	twoDot, err := r.Run(ctx, "base", repo)
+	if err != nil {
+		t.Fatalf("Run(base tip): %v", err)
+	}
+	if !reflect.DeepEqual(stagedPaths(threeDot), stagedPaths(twoDot)) {
+		t.Errorf("base unmoved: 3-dot %v != 2-dot %v (must be identical)",
+			stagedPaths(threeDot), stagedPaths(twoDot))
+	}
+}
+
+// mustRunGitOut is mustRunGit that returns stdout, for ref resolution.
+func mustRunGitOut(t *testing.T, repoDir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = repoDir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %s: %v", strings.Join(args, " "), err)
+	}
+	return string(out)
 }
 
 // errExitWithoutStderr ensures the *exec.ExitError-without-stderr
