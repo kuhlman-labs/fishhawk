@@ -5,87 +5,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"os"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditrehash"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
-
-func startContainer(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	c, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
-		tcpostgres.WithDatabase("fishhawk"),
-		tcpostgres.WithUsername("fishhawk"),
-		tcpostgres.WithPassword("fishhawk"),
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(60*time.Second),
-		),
-	)
-	if err != nil {
-		if isDockerUnavailable(err) {
-			t.Skipf("Docker not available; skipping integration test: %v", err)
-		}
-		t.Fatalf("start postgres: %v", err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = c.Terminate(ctx)
-	})
-
-	url, err := c.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("conn string: %v", err)
-	}
-	if err := postgres.MigrateUp(url); err != nil {
-		t.Fatalf("migrate up: %v", err)
-	}
-	pool, err := postgres.Connect(ctx, url)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
-}
-
-func isDockerUnavailable(err error) bool {
-	if err == nil {
-		return false
-	}
-	if os.Getenv("FISHHAWK_SKIP_INTEGRATION") != "" {
-		return true
-	}
-	msg := strings.ToLower(err.Error())
-	for _, marker := range []string{
-		"cannot connect to the docker daemon",
-		"docker: not found",
-		"executable file not found",
-		"dial unix /var/run/docker.sock",
-	} {
-		if strings.Contains(msg, marker) {
-			return true
-		}
-	}
-	return false
-}
 
 func makeRun(t *testing.T, pool *pgxpool.Pool) uuid.UUID {
 	t.Helper()
@@ -219,7 +150,7 @@ func TestRehashAllChains_RewritesNonCanonicalEntriesAndLinksThemForward(t *testi
 	// under the new canonical algorithm. After RehashAllChains the
 	// chain must verify end-to-end and prev_hash on entries 2/3 must
 	// point at the recomputed predecessor (not the original).
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	runID := makeRun(t, pool)
 
 	// Nonzero nanoseconds in a non-UTC zone — the exact shape the
@@ -304,7 +235,7 @@ func TestRehashAllChains_IsIdempotent(t *testing.T) {
 	// Once a chain is canonical, a re-run reports zero changes and
 	// commits nothing. Idempotency is what makes the migration safe
 	// to re-run on a partially-completed batch.
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	runID := makeRun(t, pool)
 
 	// Write entries via the production AppendChained path — those
@@ -334,7 +265,7 @@ func TestRehashAllChains_IsIdempotent(t *testing.T) {
 }
 
 func TestRehashAllChains_DryRunReportsButDoesNotWrite(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	runID := makeRun(t, pool)
 
 	loc := time.FixedZone("EDT", -4*3600)

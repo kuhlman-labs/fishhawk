@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -36,7 +37,7 @@ func makeChildRun(t *testing.T, pool *pgxpool.Pool, parentRunID uuid.UUID, decom
 // (decomposed_from=P). ChainsByParent(P, false) must return entries for
 // P and C1 only — C2 is excluded from CI-retry chain walks.
 func TestChainsByParent_ExcludesDecomposedChildren(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 
 	parentID := makeRun(t, pool)
@@ -64,7 +65,7 @@ func TestChainsByParent_ExcludesDecomposedChildren(t *testing.T) {
 // TestChainsByParent_IncludesDecomposedChildren reuses the same fixture
 // but calls ChainsByParent(P, true) — all three entries must be present.
 func TestChainsByParent_IncludesDecomposedChildren(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
 
 	parentID := makeRun(t, pool)

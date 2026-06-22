@@ -19,23 +19,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
@@ -45,8 +38,8 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -76,74 +69,6 @@ func (a advancerAdapter) IntegrateSlices(ctx context.Context, parentRunID uuid.U
 		ChildRunID: conflict.ChildRunID,
 		Detail:     conflict.Detail,
 	}, nil
-}
-
-// startPostgres spins up a postgres:16-alpine container via
-// testcontainers-go, applies all migrations, opens a pool, and
-// registers t.Cleanup for both. Skips the test when Docker is
-// unavailable.
-func startPostgres(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	c, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
-		tcpostgres.WithDatabase("fishhawk"),
-		tcpostgres.WithUsername("fishhawk"),
-		tcpostgres.WithPassword("fishhawk"),
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(60*time.Second),
-		),
-	)
-	if err != nil {
-		if isDockerUnavailable(err) {
-			t.Skipf("Docker not available; skipping orchestrator E2E: %v", err)
-		}
-		t.Fatalf("start postgres: %v", err)
-	}
-	t.Cleanup(func() {
-		shutCtx, shutCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer shutCancel()
-		_ = c.Terminate(shutCtx)
-	})
-
-	pgURL, err := c.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("postgres connection string: %v", err)
-	}
-	if err := postgres.MigrateUp(pgURL); err != nil {
-		t.Fatalf("MigrateUp: %v", err)
-	}
-	pool, err := pgxpool.New(ctx, pgURL)
-	if err != nil {
-		t.Fatalf("pool: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
-}
-
-func isDockerUnavailable(err error) bool {
-	if err == nil {
-		return false
-	}
-	if os.Getenv("FISHHAWK_SKIP_INTEGRATION") != "" {
-		return true
-	}
-	msg := strings.ToLower(err.Error())
-	for _, marker := range []string{
-		"cannot connect to the docker daemon",
-		"docker: not found",
-		"executable file not found",
-		"dial unix /var/run/docker.sock",
-	} {
-		if strings.Contains(msg, strings.ToLower(marker)) {
-			return true
-		}
-	}
-	return errors.Is(err, exec.ErrNotFound)
 }
 
 // decomposedPlanContent builds a valid standard_v1 plan JSON with two
@@ -298,7 +223,7 @@ func seedParentRun(t *testing.T, ctx context.Context, runRepo runpkg.Repository,
 // the sweeper resolves the parent implement stage, and the
 // orchestrator completes the run.
 func TestDecomposition_E2E_HappyPath(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	ctx := context.Background()
 
 	runRepo := runpkg.NewPostgresRepository(pool)
@@ -498,7 +423,7 @@ func TestDecomposition_E2E_HappyPath(t *testing.T) {
 // stage to failed and the orchestrator completes the parent run as
 // failed.
 func TestDecomposition_E2E_OneChildFails(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	ctx := context.Background()
 
 	runRepo := runpkg.NewPostgresRepository(pool)
@@ -730,7 +655,7 @@ func (g *recordingGitHub) MergeBranch(_ context.Context, _ int64,
 // can't give (settle → orchestrator → githubclient → run-repo → review
 // dispatch in a single test; cf. #618).
 func TestDecomposition_E2E_ConsolidatedPR(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	ctx := context.Background()
 
 	runRepo := runpkg.NewPostgresRepository(pool)
@@ -850,7 +775,7 @@ func TestDecomposition_E2E_ConsolidatedPR(t *testing.T) {
 // githubclient merges → consolidated PR → review dispatch) the per-layer
 // units can't give.
 func TestDecomposition_E2E_FanInHappyPath(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	ctx := context.Background()
 
 	runRepo := runpkg.NewPostgresRepository(pool)
@@ -944,7 +869,7 @@ func TestDecomposition_E2E_FanInHappyPath(t *testing.T) {
 // (category-B) with the slice_integration_conflict audit present, and
 // opens NO consolidated PR.
 func TestDecomposition_E2E_FanInConflict(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	ctx := context.Background()
 
 	runRepo := runpkg.NewPostgresRepository(pool)
@@ -1087,7 +1012,7 @@ workflows:
 // fishhawk_fixup_stage targets (the load-bearing seam) and that a fix-up on
 // that stage resolves the concern over the shared branch.
 func TestDecomposition_E2E_ConsolidatedReviewGatesParentMerge(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	ctx := context.Background()
 
 	runRepo := runpkg.NewPostgresRepository(pool)
@@ -1364,7 +1289,7 @@ func driveStageThrough(t *testing.T, ctx context.Context, runRepo runpkg.Reposit
 // recover handler + scope-amendment persistence (slice 2), and the
 // sweeper/orchestrator consolidation seam — coverage no per-layer unit gives.
 func TestDecomposition_E2E_CategoryBChildRecoverInPlace(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	ctx := context.Background()
 
 	runRepo := runpkg.NewPostgresRepository(pool)
@@ -1772,7 +1697,7 @@ func seedApprovablePlanRun(t *testing.T, ctx context.Context, runRepo runpkg.Rep
 // recommendation/override yields the byte-identical empty baseline
 // (model_source=none, empty model -> no --model, today's spawn).
 func TestModelGate_E2E_CrossBoundary(t *testing.T) {
-	pool := startPostgres(t)
+	pool := pgtest.NewPool(t)
 	ctx := context.Background()
 
 	runRepo := runpkg.NewPostgresRepository(pool)

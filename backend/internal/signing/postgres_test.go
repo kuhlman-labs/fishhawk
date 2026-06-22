@@ -4,88 +4,17 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
-
-func startContainer(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-
-	c, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
-		tcpostgres.WithDatabase("fishhawk"),
-		tcpostgres.WithUsername("fishhawk"),
-		tcpostgres.WithPassword("fishhawk"),
-		testcontainers.WithWaitStrategy(
-			wait.ForAll(
-				wait.ForLog("database system is ready to accept connections").
-					WithOccurrence(2).
-					WithStartupTimeout(60*time.Second),
-				wait.ForListeningPort("5432/tcp"),
-			),
-		),
-	)
-	if err != nil {
-		if isDockerUnavailable(err) {
-			t.Skipf("Docker not available; skipping integration test: %v", err)
-		}
-		t.Fatalf("start postgres: %v", err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = c.Terminate(ctx)
-	})
-
-	url, err := c.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("conn string: %v", err)
-	}
-	if err := postgres.MigrateUp(url); err != nil {
-		t.Fatalf("migrate up: %v", err)
-	}
-	pool, err := postgres.Connect(ctx, url)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
-}
-
-func isDockerUnavailable(err error) bool {
-	if err == nil {
-		return false
-	}
-	if os.Getenv("FISHHAWK_SKIP_INTEGRATION") != "" {
-		return true
-	}
-	msg := strings.ToLower(err.Error())
-	for _, marker := range []string{
-		"cannot connect to the docker daemon",
-		"docker: not found",
-		"executable file not found",
-		"dial unix /var/run/docker.sock",
-	} {
-		if strings.Contains(msg, marker) {
-			return true
-		}
-	}
-	return false
-}
 
 func makeRun(t *testing.T, pool *pgxpool.Pool) uuid.UUID {
 	t.Helper()
@@ -155,7 +84,7 @@ func TestVerifyWith_RejectsTampering(t *testing.T) {
 // --- integration tests (testcontainers Postgres) ---
 
 func TestPostgres_IssueAndGet(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := signing.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -183,7 +112,7 @@ func TestPostgres_IssueAndGet(t *testing.T) {
 }
 
 func TestPostgres_Issue_RejectsZeroTTL(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := signing.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -197,7 +126,7 @@ func TestPostgres_Issue_AllowsRotation(t *testing.T) {
 	// later stage's runner process can sign with its own key. The
 	// second key's public half must differ from the first, and Get
 	// returns the latest.
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := signing.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -222,7 +151,7 @@ func TestPostgres_Issue_AllowsRotation(t *testing.T) {
 }
 
 func TestPostgres_Issue_RunNotFound(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := signing.NewPostgresRepository(pool)
 
 	// Run row does not exist; FK violation should bubble up as a
@@ -234,7 +163,7 @@ func TestPostgres_Issue_RunNotFound(t *testing.T) {
 }
 
 func TestPostgres_Get_NotFound(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := signing.NewPostgresRepository(pool)
 
 	_, err := repo.Get(context.Background(), uuid.New())
@@ -244,7 +173,7 @@ func TestPostgres_Get_NotFound(t *testing.T) {
 }
 
 func TestPostgres_Verify_HappyPath(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := signing.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 
@@ -263,7 +192,7 @@ func TestPostgres_Verify_HappyPath(t *testing.T) {
 }
 
 func TestPostgres_Verify_TamperedMessage(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := signing.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 	issued, _ := repo.Issue(context.Background(), runID, signing.DefaultTTL)
@@ -279,7 +208,7 @@ func TestPostgres_Verify_TamperedMessage(t *testing.T) {
 }
 
 func TestPostgres_Verify_TamperedSignature(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := signing.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 	issued, _ := repo.Issue(context.Background(), runID, signing.DefaultTTL)
@@ -298,7 +227,7 @@ func TestPostgres_Verify_TamperedSignature(t *testing.T) {
 func TestPostgres_Verify_WrongRunRejected(t *testing.T) {
 	// A signature from run A's key shouldn't pass for run B even
 	// though the bytes are identical and the cipher is the same.
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := signing.NewPostgresRepository(pool)
 
 	runA := makeRun(t, pool)
@@ -318,7 +247,7 @@ func TestPostgres_Verify_WrongRunRejected(t *testing.T) {
 }
 
 func TestPostgres_Verify_VerifyForUnknownRunReturnsNotFound(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := signing.NewPostgresRepository(pool)
 
 	err := repo.Verify(context.Background(), uuid.New(), []byte{1, 2, 3}, []byte{4, 5, 6})
@@ -331,7 +260,7 @@ func TestPostgres_Verify_ExpiredKey(t *testing.T) {
 	// Use the test-only constructor with a clock pinned to a fixed
 	// instant. Issue the key at T0 with TTL 1 hour, then advance
 	// the clock past expiry and verify.
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
 	clock := func() time.Time { return now }
 	repo := signing.NewPostgresRepositoryWithClock(pool, clock)
@@ -355,7 +284,7 @@ func TestPostgres_Verify_ExpiredKey(t *testing.T) {
 func TestPostgres_TriggerBlocksUpdate(t *testing.T) {
 	// Mirrors the audit_entries trigger test: signing_keys is also
 	// append-only, enforced by triggers regardless of the API.
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := signing.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 	if _, err := repo.Issue(context.Background(), runID, signing.DefaultTTL); err != nil {
@@ -374,7 +303,7 @@ func TestPostgres_TriggerBlocksUpdate(t *testing.T) {
 }
 
 func TestPostgres_TriggerBlocksDelete(t *testing.T) {
-	pool := startContainer(t)
+	pool := pgtest.NewPool(t)
 	repo := signing.NewPostgresRepository(pool)
 	runID := makeRun(t, pool)
 	if _, err := repo.Issue(context.Background(), runID, signing.DefaultTTL); err != nil {

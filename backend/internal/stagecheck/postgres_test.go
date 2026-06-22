@@ -10,47 +10,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
-	pgmig "github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
-
-// startPG spins up the same Postgres + migrations setup the rest of
-// the integration tests use. Lift into a shared helper if a third
-// package needs it.
-func startPG(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-	ctx := context.Background()
-	container, err := postgres.Run(ctx,
-		"postgres:16-alpine",
-		postgres.WithDatabase("fishhawk_test"),
-		postgres.WithUsername("fh"),
-		postgres.WithPassword("fh"),
-		postgres.BasicWaitStrategies(),
-	)
-	if err != nil {
-		t.Fatalf("postgres container: %v", err)
-	}
-	t.Cleanup(func() { _ = testcontainers.TerminateContainer(container) })
-
-	url, err := container.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := pgmig.MigrateUp(url); err != nil {
-		t.Fatalf("migrate up: %v", err)
-	}
-	pool, err := pgmig.Connect(ctx, url)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
-}
 
 func ptr[T any](v T) *T { return &v }
 
@@ -85,7 +50,7 @@ func seedStage(t *testing.T, pool *pgxpool.Pool) (runID, stageID uuid.UUID) {
 }
 
 func TestAppend_LatestForStageAndName_RoundTrip(t *testing.T) {
-	pool := startPG(t)
+	pool := pgtest.NewPool(t)
 	repo := stagecheck.NewPostgresRepository(pool)
 	_, stageID := seedStage(t, pool)
 
@@ -118,7 +83,7 @@ func TestAppend_LatestForStageAndName_RoundTrip(t *testing.T) {
 }
 
 func TestLatestForStageAndName_NotFound(t *testing.T) {
-	pool := startPG(t)
+	pool := pgtest.NewPool(t)
 	repo := stagecheck.NewPostgresRepository(pool)
 	_, stageID := seedStage(t, pool)
 
@@ -129,7 +94,7 @@ func TestLatestForStageAndName_NotFound(t *testing.T) {
 }
 
 func TestLatestForStageAndName_PicksMostRecent(t *testing.T) {
-	pool := startPG(t)
+	pool := pgtest.NewPool(t)
 	repo := stagecheck.NewPostgresRepository(pool)
 	_, stageID := seedStage(t, pool)
 
@@ -162,7 +127,7 @@ func TestLatestForStageAndName_PicksMostRecent(t *testing.T) {
 }
 
 func TestLatestForStage_OneRowPerCheckName(t *testing.T) {
-	pool := startPG(t)
+	pool := pgtest.NewPool(t)
 	repo := stagecheck.NewPostgresRepository(pool)
 	_, stageID := seedStage(t, pool)
 
@@ -190,7 +155,7 @@ func TestLatestForStage_OneRowPerCheckName(t *testing.T) {
 }
 
 func TestFindMatchingStages_FiltersByPRAndCheck(t *testing.T) {
-	pool := startPG(t)
+	pool := pgtest.NewPool(t)
 	scRepo := stagecheck.NewPostgresRepository(pool)
 	runRepo := run.NewPostgresRepository(pool)
 	artRepo := artifact.NewPostgresRepository(pool)
