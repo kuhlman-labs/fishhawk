@@ -2753,90 +2753,109 @@ func TestResolveFixupExpectedHeadSHA_ReadErrorOmitsField(t *testing.T) {
 	}
 }
 
-// TestGetStagePrompt_Implement_FixupDecomposedChild_SharedBranch covers the
-// decomposed-child fix-up branch form (#784): the runner routes a decomposed
-// child onto the shared parent branch fishhawk/run-<shortID(parentRunID)>, so
-// a fix-up on such a child must derive the same shared branch, not the
-// per-stage form.
-func TestGetStagePrompt_Implement_FixupDecomposedChild_SharedBranch(t *testing.T) {
-	rr := newPromptRunRepo()
-	sf := newSigningFake()
-	art := newFakeArtifactRepo()
+// TestGetStagePrompt_Implement_FixupDecomposedChild_SliceBranch covers the
+// decomposed-child fix-up branch form after ADR-041 (#1246): a child's work
+// lives on its per-slice sole-writer branch
+// fishhawk/run-<shortID(parentRunID)>/slice-<n>, so a fix-up on such a child
+// must derive that slice branch — NOT the pre-ADR-041 bare parent prefix
+// fishhawk/run-<parent> (orphaned from both the slice work and the #1243
+// consolidated head, and path-nesting with the slice refs). It covers BOTH
+// derivation branches: a non-nil SliceIndex (here 2) routes onto slice-2, and
+// a nil SliceIndex falls back to slice-0 (matching the runner's slice-0
+// default).
+func TestGetStagePrompt_Implement_FixupDecomposedChild_SliceBranch(t *testing.T) {
+	sliceIdx := 2
+	cases := []struct {
+		name       string
+		sliceIndex *int
+		wantSuffix string
+	}{
+		{name: "SliceIndexSet", sliceIndex: &sliceIdx, wantSuffix: "/slice-2"},
+		{name: "SliceIndexNilFallsBackToZero", sliceIndex: nil, wantSuffix: "/slice-0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := newPromptRunRepo()
+			sf := newSigningFake()
+			art := newFakeArtifactRepo()
 
-	parentRunID := uuid.New()
-	childRunID := uuid.New()
-	planStageID := uuid.New()
-	implStageID := uuid.New()
+			parentRunID := uuid.New()
+			childRunID := uuid.New()
+			planStageID := uuid.New()
+			implStageID := uuid.New()
 
-	p := &plan.Plan{
-		PlanVersion:  "standard_v1",
-		Summary:      "scoped plan",
-		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
-		Scope: plan.Scope{
-			Files: []plan.ScopeFile{
-				{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify},
-			},
-		},
-	}
-	planBytes, err := json.Marshal(p)
-	if err != nil {
-		t.Fatalf("marshal plan: %v", err)
-	}
-	sv := "standard_v1"
-	if _, err := art.Create(context.Background(), artifact.CreateParams{
-		StageID:       planStageID,
-		Kind:          artifact.KindPlan,
-		SchemaVersion: &sv,
-		Content:       planBytes,
-	}); err != nil {
-		t.Fatalf("seed plan artifact: %v", err)
-	}
+			p := &plan.Plan{
+				PlanVersion:  "standard_v1",
+				Summary:      "scoped plan",
+				Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+				Scope: plan.Scope{
+					Files: []plan.ScopeFile{
+						{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify},
+					},
+				},
+			}
+			planBytes, err := json.Marshal(p)
+			if err != nil {
+				t.Fatalf("marshal plan: %v", err)
+			}
+			sv := "standard_v1"
+			if _, err := art.Create(context.Background(), artifact.CreateParams{
+				StageID:       planStageID,
+				Kind:          artifact.KindPlan,
+				SchemaVersion: &sv,
+				Content:       planBytes,
+			}); err != nil {
+				t.Fatalf("seed plan artifact: %v", err)
+			}
 
-	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
-		childRunID: {
-			{ID: planStageID, RunID: childRunID, Type: run.StageTypePlan},
-			{ID: implStageID, RunID: childRunID, Type: run.StageTypeImplement},
-		},
-	}
-	rr.getRuns[childRunID] = &run.Run{
-		ID:             childRunID,
-		Repo:           "o/r",
-		WorkflowID:     "feature_change",
-		DecomposedFrom: &parentRunID,
-	}
-	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: childRunID, Type: run.StageTypeImplement}
+			rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+				childRunID: {
+					{ID: planStageID, RunID: childRunID, Type: run.StageTypePlan},
+					{ID: implStageID, RunID: childRunID, Type: run.StageTypeImplement},
+				},
+			}
+			rr.getRuns[childRunID] = &run.Run{
+				ID:             childRunID,
+				Repo:           "o/r",
+				WorkflowID:     "feature_change",
+				DecomposedFrom: &parentRunID,
+				SliceIndex:     tc.sliceIndex,
+			}
+			rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: childRunID, Type: run.StageTypeImplement}
 
-	concerns := []planreview.Concern{
-		{Severity: planreview.SeverityHigh, Category: "coverage", Note: "tighten the bound"},
-	}
-	auditByRun := map[uuid.UUID][]*audit.Entry{
-		childRunID: {makeFixupEntry(childRunID, implStageID, concerns)},
-	}
+			concerns := []planreview.Concern{
+				{Severity: planreview.SeverityHigh, Category: "coverage", Note: "tighten the bound"},
+			}
+			auditByRun := map[uuid.UUID][]*audit.Entry{
+				childRunID: {makeFixupEntry(childRunID, implStageID, concerns)},
+			}
 
-	priv, _ := sf.issue(t, childRunID)
-	s := New(Config{
-		Addr:         "127.0.0.1:0",
-		RunRepo:      rr,
-		SigningRepo:  sf,
-		ArtifactRepo: art,
-		AuditRepo:    &feedbackAuditRepo{byRunID: auditByRun},
-	})
-	s.promptIssueGetterOverride = &stubIssueGetter{}
+			priv, _ := sf.issue(t, childRunID)
+			s := New(Config{
+				Addr:         "127.0.0.1:0",
+				RunRepo:      rr,
+				SigningRepo:  sf,
+				ArtifactRepo: art,
+				AuditRepo:    &feedbackAuditRepo{byRunID: auditByRun},
+			})
+			s.promptIssueGetterOverride = &stubIssueGetter{}
 
-	w := promptRequest(t, s, childRunID, implStageID, priv, "")
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
-	}
-	var resp promptResponse
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if !resp.Fixup {
-		t.Fatalf("fixup = false, want true")
-	}
-	wantBranch := "fishhawk/run-" + parentRunID.String()[:8]
-	if resp.FixupBranch != wantBranch {
-		t.Errorf("fixup_branch = %q, want shared parent branch %q", resp.FixupBranch, wantBranch)
+			w := promptRequest(t, s, childRunID, implStageID, priv, "")
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			var resp promptResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if !resp.Fixup {
+				t.Fatalf("fixup = false, want true")
+			}
+			wantBranch := "fishhawk/run-" + parentRunID.String()[:8] + tc.wantSuffix
+			if resp.FixupBranch != wantBranch {
+				t.Errorf("fixup_branch = %q, want slice branch %q", resp.FixupBranch, wantBranch)
+			}
+		})
 	}
 }
 

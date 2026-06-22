@@ -203,12 +203,25 @@ func shortID(id uuid.UUID) string {
 
 // fixupBranchFor derives the existing PR branch a fix-up pass commits onto,
 // matching the runner's branch-routing logic. For a decomposed child the
-// branch is the shared parent branch `fishhawk/run-<shortID(parentRunID)>`;
-// otherwise it is the per-stage branch
+// branch is that child's per-slice sole-writer branch
+// `fishhawk/run-<shortID(parentRunID)>/slice-<n>` (ADR-041 / #1141): after
+// ADR-041 a child's work lives on its slice branch, NOT the pre-ADR-041 shared
+// `fishhawk/run-<parent>` bare prefix — which is orphaned from both the slice
+// work and the #1243 consolidated PR head, and path-NESTS with the slice refs
+// (the directory/file ref-conflict #1243 eliminated for fan-in, #1246). The
+// slice index comes from the child's SliceIndex, defaulting to 0 when nil to
+// match the runner's slice-0 default (runSliceIndex, runner main.go). We call
+// the exported orchestrator.SliceBranch rather than re-hardcoding the literal
+// — the single-source-of-truth discipline #1245 introduced for the
+// consolidated name. Otherwise the branch is the per-stage branch
 // `fishhawk/run-<shortID(runID)>/stage-<shortID(stageID)>`.
 func fixupBranchFor(runRow *run.Run, stage *run.Stage) string {
 	if runRow.DecomposedFrom != nil {
-		return "fishhawk/run-" + shortID(*runRow.DecomposedFrom)
+		idx := 0
+		if runRow.SliceIndex != nil {
+			idx = *runRow.SliceIndex
+		}
+		return orchestrator.SliceBranch(*runRow.DecomposedFrom, idx)
 	}
 	return fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(runRow.ID), shortID(stage.ID))
 }
@@ -223,9 +236,10 @@ func fixupBranchFor(runRow *run.Run, stage *run.Stage) string {
 // reconstruction here returned the pre-#1243 `fishhawk/run-<short>` form and
 // diverged from the renamed consolidated branch, orphaning the parent fix-up
 // commit (#1245). When the run is a parent (DecomposedFrom == nil) WITH minted
-// children, return that shared branch; otherwise delegate to fixupBranchFor. On
-// a probe error, fall back to fixupBranchFor — never widen an ordinary run onto
-// a shared branch.
+// children, return that consolidated head; otherwise delegate to
+// fixupBranchFor, which lands a decomposed child on its own per-slice branch
+// (#1246) and an ordinary run on its per-stage branch. On a probe error, fall
+// back to fixupBranchFor — never widen an ordinary run onto a shared branch.
 func (s *Server) fixupBranchForRun(ctx context.Context, runRow *run.Run, stage *run.Stage) string {
 	if runRow.DecomposedFrom == nil && s.hasDecomposedChildren(ctx, runRow.ID) {
 		return orchestrator.ConsolidatedBranch(runRow.ID)
