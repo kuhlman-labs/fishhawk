@@ -103,6 +103,9 @@ Flags:
 		Issue:    *issue,
 		OutDir:   resolvedOut,
 		Force:    *force,
+		// Only the --stage-id fetch path GETs the redacted-only trace
+		// endpoint, so only it can claim PRODUCTION+REDACTED provenance.
+		Fetched: *stageID != "",
 	})
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "error: %v\n", err)

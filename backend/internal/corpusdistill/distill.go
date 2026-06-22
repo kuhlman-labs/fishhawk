@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/agenteval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
@@ -43,6 +44,12 @@ type Options struct {
 	// Force permits overwriting an existing case directory. Without it,
 	// Distill fails closed when OutDir/CaseName already exists.
 	Force bool
+	// Fetched reports that the bundle came from FetchStageTrace (the
+	// --stage-id path), which GETs the redacted-only /v0/stages/{id}/trace.
+	// Only then can case.md assert the PRODUCTION + REDACTED provenance; for
+	// operator-supplied bundles (--in/stdin) the origin is unverifiable, so
+	// the provenance line is left as a TODO prompt for the operator.
+	Fetched bool
 }
 
 // Distill reads a trace bundle from r, scores it, and writes a corpus case
@@ -57,6 +64,9 @@ type Options struct {
 func Distill(r io.Reader, opts Options) (string, error) {
 	if opts.CaseName == "" {
 		return "", fmt.Errorf("corpusdistill: CaseName is required")
+	}
+	if err := validateCaseName(opts.CaseName); err != nil {
+		return "", err
 	}
 	if opts.Issue == "" {
 		return "", fmt.Errorf("corpusdistill: Issue is required")
@@ -132,6 +142,24 @@ func Distill(r io.Reader, opts Options) (string, error) {
 	return caseDir, nil
 }
 
+// validateCaseName constrains CaseName to a single, safe path element.
+// CaseName is untrusted input that is joined onto OutDir and, with Force,
+// passed to os.RemoveAll — so a value like "../outside", "sub/dir", or an
+// absolute path could write or delete outside the corpus tree. Rejecting
+// anything that is not one clean, separator-free, non-".."/"."  element
+// keeps every filesystem effect inside OutDir.
+func validateCaseName(name string) error {
+	if filepath.IsAbs(name) ||
+		strings.ContainsRune(name, '/') ||
+		strings.ContainsRune(name, filepath.Separator) ||
+		name == "." || name == ".." ||
+		name != filepath.Clean(name) {
+		return fmt.Errorf("corpusdistill: CaseName %q must be a single path element "+
+			"(no path separators, no '.'/'..', not absolute)", name)
+	}
+	return nil
+}
+
 // normalize returns both a gzipped and a plain copy of raw, auto-detecting
 // which form raw arrived in by the RFC 1952 gzip magic bytes (0x1f 0x8b).
 func normalize(raw []byte) (gzBytes, plainBytes []byte, err error) {
@@ -177,19 +205,21 @@ func gzipBytes(b []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// renderCaseMD produces the case.md template. It carries a
-// "Provenance: PRODUCTION" marker, states the bundle was sourced from the
-// REDACTED variant, references the originating issue/run, records the
-// derived outcome, and leaves TODO prompts for the operator's curated
-// distilled-signal narrative (#819).
+// renderCaseMD produces the case.md template. It references the originating
+// issue/run, records the derived outcome, and leaves TODO prompts for the
+// operator's curated distilled-signal narrative (#819).
+//
+// The provenance block is source-dependent: the tool can only assert the
+// PRODUCTION + REDACTED-variant provenance for the --stage-id fetch path
+// (opts.Fetched), which GETs the redacted-only /v0/stages/{id}/trace. For
+// operator-supplied bundles (--in/stdin) the origin and redaction status are
+// unverifiable, so the line is emitted as a TODO the operator must resolve
+// before the case lands — rather than mislabelling a possibly raw or
+// hand-authored bundle as PRODUCTION+REDACTED.
 func renderCaseMD(opts Options, card agenteval.Scorecard) string {
 	return fmt.Sprintf(`# Case: %s
 
-**Provenance: PRODUCTION.** This trace was captured from a real Fishhawk
-production run (%s), not hand-authored. It was sourced from the REDACTED
-trace-bundle variant (the only variant GET /v0/stages/{stage_id}/trace
-serves; the raw variant is object-locked and unredacted), so it carries no
-unredacted secrets.
+%s
 
 Scaffolded by `+"`fishhawk-distill-corpus`"+` (#1290). The scorecard below
 was derived deterministically by agenteval.Score; the sections marked TODO
@@ -210,5 +240,26 @@ this case pins (the branch in deriveOutcome / evidence_before_edit /
 out_of_tree_writes / scope_drift_paths it covers) and how it contrasts with
 sibling cases. Add human_labels.json alongside this file once the editorial
 labels are agreed.
-`, opts.CaseName, opts.Issue, card.Outcome)
+`, opts.CaseName, provenanceBlock(opts), card.Outcome)
+}
+
+// provenanceBlock returns the case.md provenance paragraph. For the
+// --stage-id fetch path it asserts the PRODUCTION + REDACTED-variant origin
+// the fetch guarantees; for operator-supplied bundles (--in/stdin) it emits a
+// TODO the operator must resolve, since the tool cannot vouch for an
+// arbitrary bundle's origin or redaction status.
+func provenanceBlock(opts Options) string {
+	if opts.Fetched {
+		return fmt.Sprintf(`**Provenance: PRODUCTION.** This trace was captured from a real Fishhawk
+production run (%s), not hand-authored. It was sourced from the REDACTED
+trace-bundle variant (the only variant GET /v0/stages/{stage_id}/trace
+serves; the raw variant is object-locked and unredacted), so it carries no
+unredacted secrets.`, opts.Issue)
+	}
+	return fmt.Sprintf(`**Provenance: TODO(operator).** This case was scaffolded from an
+operator-supplied bundle (%s) via `+"`--in`/stdin"+`, so the tool cannot
+assert its origin or redaction status. If this trace is a real production
+run's REDACTED bundle, replace this line with "Provenance: PRODUCTION" and
+note the redacted-variant source; if it is raw or hand-authored, state that
+instead. Confirm no unredacted secrets remain before this case lands.`, opts.Issue)
 }

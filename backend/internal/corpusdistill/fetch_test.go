@@ -89,3 +89,21 @@ func TestFetchStageTrace_NonOK(t *testing.T) {
 		t.Errorf("error does not name the status: %v", err)
 	}
 }
+
+// TestFetchStageTrace_TransportError covers the transport-error branch:
+// http.DefaultClient.Do returns an error (here, an unreachable backend whose
+// listener was closed before the request) and FetchStageTrace must surface it
+// wrapped as a GET failure rather than panic on a nil response.
+func TestFetchStageTrace_TransportError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := srv.URL
+	srv.Close() // close so the address is no longer accepting connections
+
+	_, err := FetchStageTrace(context.Background(), url, "sid", "")
+	if err == nil {
+		t.Fatal("expected transport error against a closed server, got nil")
+	}
+	if !strings.Contains(err.Error(), "GET ") {
+		t.Errorf("transport error not wrapped as a GET failure: %v", err)
+	}
+}

@@ -106,20 +106,39 @@ func TestDistill_ExpectedAndTraceBytes(t *testing.T) {
 	}
 }
 
-// TestDistill_CaseMD covers mode (4): case.md carries the PRODUCTION
-// provenance marker, the --issue reference, and the redacted-source
-// statement.
+// TestDistill_CaseMD covers mode (4): a Fetched (--stage-id) case asserts
+// the PRODUCTION + REDACTED provenance the fetch path guarantees, carries the
+// --issue reference and derived outcome.
 func TestDistill_CaseMD(t *testing.T) {
 	dir := t.TempDir()
-	caseDir, err := Distill(strings.NewReader(fixtureJSONL), Options{CaseName: "my-case", Issue: "#1290", OutDir: dir})
+	caseDir, err := Distill(strings.NewReader(fixtureJSONL), Options{CaseName: "my-case", Issue: "#1290", OutDir: dir, Fetched: true})
 	if err != nil {
 		t.Fatalf("Distill: %v", err)
 	}
 	md := string(readDir(t, caseDir)["case.md"])
-	for _, want := range []string{"Provenance: PRODUCTION", "#1290", "REDACTED", "no_diff"} {
+	for _, want := range []string{"**Provenance: PRODUCTION.**", "#1290", "REDACTED", "no_diff"} {
 		if !strings.Contains(md, want) {
 			t.Errorf("case.md missing %q\n---\n%s", want, md)
 		}
+	}
+}
+
+// TestDistill_CaseMD_UnverifiedProvenance covers the non-Fetched branch
+// (--in/stdin): the tool cannot vouch for an operator-supplied bundle, so
+// case.md must NOT assert PRODUCTION and must leave provenance as a TODO the
+// operator resolves before the case lands.
+func TestDistill_CaseMD_UnverifiedProvenance(t *testing.T) {
+	dir := t.TempDir()
+	caseDir, err := Distill(strings.NewReader(fixtureJSONL), Options{CaseName: "c", Issue: "#1290", OutDir: dir})
+	if err != nil {
+		t.Fatalf("Distill: %v", err)
+	}
+	md := string(readDir(t, caseDir)["case.md"])
+	if strings.Contains(md, "**Provenance: PRODUCTION.**") {
+		t.Errorf("non-fetched case.md must not assert PRODUCTION provenance\n---\n%s", md)
+	}
+	if !strings.Contains(md, "**Provenance: TODO(operator).**") {
+		t.Errorf("non-fetched case.md missing the TODO provenance prompt\n---\n%s", md)
 	}
 }
 
@@ -202,6 +221,43 @@ func TestDistill_Errors(t *testing.T) {
 				t.Fatal("expected error, got nil")
 			}
 		})
+	}
+}
+
+// TestDistill_RejectsUnsafeCaseName covers the path-traversal guard: a
+// CaseName that escapes OutDir (parent ref, separators, or absolute) is
+// rejected before any filesystem write, so Distill can neither write nor (with
+// Force) os.RemoveAll outside OutDir.
+func TestDistill_RejectsUnsafeCaseName(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"../outside", "sub/dir", "..", ".", "/abs/path", "a/../../b"} {
+		t.Run(name, func(t *testing.T) {
+			// Force on, so a slipped-through name would also try RemoveAll —
+			// the guard must reject before any filesystem effect.
+			if _, err := Distill(strings.NewReader(fixtureJSONL),
+				Options{CaseName: name, Issue: "#1290", OutDir: dir, Force: true}); err == nil {
+				t.Fatalf("expected error for unsafe CaseName %q, got nil", name)
+			}
+		})
+	}
+	// The escape target must not have been created/removed by any attempt.
+	if entries, err := os.ReadDir(dir); err != nil {
+		t.Fatalf("read out dir: %v", err)
+	} else if len(entries) != 0 {
+		t.Errorf("unsafe CaseName produced filesystem entries under OutDir: %v", entries)
+	}
+}
+
+// TestDistill_CorruptGzip covers the gunzip-failure branch in normalize(): a
+// buffer with the gzip magic but a corrupt header makes gzip.NewReader fail,
+// which Distill must surface as an error rather than panic or write a case.
+func TestDistill_CorruptGzip(t *testing.T) {
+	// 0x1f 0x8b passes isGzip(), but byte[2] (compression method) is invalid
+	// (not 8), so gzip.NewReader returns ErrHeader.
+	corrupt := append([]byte{0x1f, 0x8b}, []byte("not a real gzip frame")...)
+	dir := t.TempDir()
+	if _, err := Distill(bytes.NewReader(corrupt), Options{CaseName: "c", Issue: "#1290", OutDir: dir}); err == nil {
+		t.Fatal("expected error on corrupt gzip frame, got nil")
 	}
 }
 
