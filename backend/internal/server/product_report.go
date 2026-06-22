@@ -73,10 +73,24 @@ type productReportResponse struct {
 // carrying that fingerprint, and either appends an occurrence comment
 // (dedup hit) or files a new fingerprint-marked report (dedup miss) — then
 // writes a source-side product_report_filed audit entry naming what left
-// the boundary. Egress is gated two ways: only the run's own run-bound
-// agent token may drive a report on its chain (the runBoundTokenRunID
-// entitlement the work-item path enforces), and a per-repo
-// product_feedback kill-switch returns 403 and files nothing.
+// the boundary.
+//
+// Egress is gated by a mutually-exclusive entitlement switch (widened in
+// #1274 from the run-bound-only gate) plus a per-repo product_feedback
+// kill-switch (403, files nothing):
+//   - a run-bound agent token (mcp:run:<uuid> subject) may file ONLY on
+//     its own run — a token bound to a DIFFERENT run is rejected
+//     (run_not_entitled). The run-bound arm is terminal and does NOT
+//     require write:runs: run-bound MCP tokens carry mcp:read (never
+//     write:runs), so requiring it would break the run's own happy path.
+//   - a non-run-bound operator/operator-agent bearer token (TokenID set)
+//     must hold write:runs (rejected insufficient_scope otherwise) and may
+//     then file for ANY run — operator scope is the deployment (ADR-040).
+//   - a cookie-session operator (empty TokenID) is admitted.
+//
+// The product_report_filed audit names the acting caller via id.Subject +
+// actorKindForSubject, so operator/operator-agent provenance is honest
+// with no actor.go change.
 func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.RunRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "run_repo_unconfigured",
@@ -104,16 +118,34 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Entitlement: a product report is an egress on the run's hash chain,
-	// so only the run's own run-bound agent token may drive it. A token
-	// bound to a different run, an operator token, or a cookie session is
-	// rejected — the same gate the work-item audit path enforces.
+	// Entitlement (mutually-exclusive switch, #1274): the run-bound and
+	// operator arms never overlap. A run-bound token may ONLY drive its own
+	// run (terminal arm, NOT requiring write:runs — run-bound tokens carry
+	// mcp:read, never write:runs); a non-run-bound bearer (operator/
+	// operator-agent) must hold write:runs and may then file for any run; an
+	// empty-TokenID cookie session is the operator admitted directly.
 	tokenRunID, runBound := runBoundTokenRunID(id)
-	if !runBound || tokenRunID != runID {
-		s.writeError(w, r, http.StatusForbidden, "run_not_entitled",
-			"a product report may only be filed by that run's own run-bound agent token",
-			map[string]any{"run_id": runID.String()})
-		return
+	switch {
+	case runBound:
+		// A run-bound token may ONLY drive its own run; do NOT require write:runs.
+		if tokenRunID != runID {
+			s.writeError(w, r, http.StatusForbidden, "run_not_entitled",
+				"a product report may only be filed by that run's own run-bound agent token",
+				map[string]any{"run_id": runID.String()})
+			return
+		}
+		// else admit: the run's own run-bound agent token (unchanged #1006 happy path).
+	case id.TokenID != "":
+		// A NON-run-bound bearer token (operator/operator-agent) must hold write:runs.
+		if !hasScope(id, "write:runs") {
+			s.writeError(w, r, http.StatusForbidden, "insufficient_scope",
+				"token is missing required scope: write:runs",
+				map[string]any{"required_scope": "write:runs"})
+			return
+		}
+		// else admit: operator/operator-agent token, any run (operator scope = deployment).
+	default:
+		// Empty TokenID == session-cookie operator -> admit.
 	}
 
 	req, ok := s.decodeProductReportRequest(w, r)

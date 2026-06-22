@@ -3214,13 +3214,16 @@ paths:
         A source-side `product_report_filed` audit entry names what left
         the boundary (fingerprint, destination, created-vs-occurrence).
 
-        **Egress is gated.** Only the run's own run-bound agent token may
-        file a report on its chain (a foreign/unbound caller → 403
-        `run_not_entitled`), and a per-repo `product_feedback` kill-switch
-        (`enabled: false`) → 403 `product_feedback_disabled`, files
-        nothing. Slice 2 carries product facts only — the operator
-        free-text description and its consent/redaction are layered on by
-        the MCP/CLI surfaces (later slice).
+        **Egress is gated** by a mutually-exclusive entitlement switch
+        (widened in #1274). The report may be filed by the run's own
+        run-bound agent token, a non-run-bound operator/operator-agent
+        bearer token holding `write:runs`, or a cookie-session operator.
+        A run-bound token bound to a DIFFERENT run → 403 `run_not_entitled`;
+        a non-run-bound bearer WITHOUT `write:runs` → 403
+        `insufficient_scope`. An operator/operator-agent token may file for
+        ANY run (operator scope = the deployment). A per-repo
+        `product_feedback` kill-switch (`enabled: false`) → 403
+        `product_feedback_disabled`, files nothing.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -3240,8 +3243,10 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
-            `run_not_entitled` — caller is not the run's own run-bound agent
-            token; `product_feedback_disabled` — the repo's kill-switch is off.
+            `run_not_entitled` — a run-bound token may only file for its own
+            run; `insufficient_scope` — a non-run-bound operator bearer is
+            missing `write:runs`; `product_feedback_disabled` — the repo's
+            kill-switch is off.
         '404': { $ref: '#/components/responses/NotFound' }
         '501':
           description: "`provider_unimplemented` — no feedback provider registered for the conventions' provider."

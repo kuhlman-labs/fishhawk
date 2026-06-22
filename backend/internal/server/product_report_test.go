@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -110,10 +111,19 @@ func productReportFixture(t *testing.T, fp *fakeFeedbackProvider, af *scAuditFak
 }
 
 func postProductReport(s *Server, runID uuid.UUID, subject, body string) *httptest.ResponseRecorder {
+	return postProductReportAs(s, runID, Identity{Subject: subject}, body)
+}
+
+// postProductReportAs drives the handler with the FULL caller identity
+// (Subject + TokenID + Scopes), so the per-arm entitlement tests can model
+// a run-bound agent token, an operator/operator-agent bearer, or a cookie
+// session. postProductReport re-expresses the common Subject-only case in
+// terms of it so the existing happy-path tests keep compiling unchanged.
+func postProductReportAs(s *Server, runID uuid.UUID, id Identity, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost,
 		"/v0/runs/"+runID.String()+"/product-reports", bytes.NewReader([]byte(body)))
 	req.SetPathValue("run_id", runID.String())
-	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, Identity{Subject: subject}))
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
 	rec := httptest.NewRecorder()
 	s.handleFileProductReport(rec, req)
 	return rec
@@ -225,23 +235,204 @@ func TestProductReport_KillSwitch_Returns403(t *testing.T) {
 	}
 }
 
-// TestProductReport_ForeignToken_Returns403 asserts a token bound to a
-// different run (or unbound) cannot drive an egress on this run's chain.
-func TestProductReport_ForeignToken_Returns403(t *testing.T) {
+// TestProductReport_OwnRunBoundToken_NoWriteRuns_Created is the REGRESSION
+// test for #1274 (binding condition 1): the run's OWN run-bound token, with
+// TokenID set and scopes WITHOUT write:runs (run-bound tokens carry
+// mcp:read, never write:runs), filing for its own run must be admitted
+// (201) — NOT rejected as insufficient_scope. This is the exact branch the
+// rejected fall-through gate broke. The run-bound arm is terminal, so the
+// write:runs check never runs for it.
+func TestProductReport_OwnRunBoundToken_NoWriteRuns_Created(t *testing.T) {
 	fp := &fakeFeedbackProvider{}
 	af := &scAuditFake{}
 	s, runID := productReportFixture(t, fp, af)
 
-	// Operator token: not run-bound at all.
-	if rec := postProductReport(s, runID, "github:operator", ""); rec.Code != http.StatusForbidden {
-		t.Errorf("operator token status = %d, want 403", rec.Code)
+	id := Identity{
+		Subject: "mcp:run:" + runID.String(),
+		TokenID: "fhm_token_id",
+		Scopes:  []string{"mcp:read"},
 	}
-	// A different run's run-bound token.
-	if rec := postProductReport(s, runID, "mcp:run:"+uuid.New().String(), ""); rec.Code != http.StatusForbidden {
-		t.Errorf("foreign run-bound token status = %d, want 403", rec.Code)
+	rec := postProductReportAs(s, runID, id, "")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !fp.filed {
+		t.Error("the run's own run-bound token must reach the provider")
+	}
+}
+
+// TestProductReport_ForeignRunBoundToken_Returns403 asserts a run-bound
+// token bound to a DIFFERENT run cannot drive an egress on this run's chain
+// (run_not_entitled), even when the run-bound arm does not require
+// write:runs.
+func TestProductReport_ForeignRunBoundToken_Returns403(t *testing.T) {
+	fp := &fakeFeedbackProvider{}
+	af := &scAuditFake{}
+	s, runID := productReportFixture(t, fp, af)
+
+	id := Identity{
+		Subject: "mcp:run:" + uuid.New().String(),
+		TokenID: "fhm_token_id",
+		Scopes:  []string{"mcp:read"},
+	}
+	rec := postProductReportAs(s, runID, id, "")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "run_not_entitled") {
+		t.Errorf("body = %s, want run_not_entitled", rec.Body.String())
 	}
 	if fp.filed {
-		t.Error("an unentitled caller must not reach the provider")
+		t.Error("a foreign run-bound caller must not reach the provider")
+	}
+}
+
+// TestProductReport_OperatorAgentToken_AnyRun_Created asserts an
+// operator-agent bearer token (operatorrole subject prefix, write:runs,
+// TokenID set) may file for the run (operator scope = deployment), and the
+// product_report_filed audit records actor_kind=agent for that subject
+// (binding condition 2) — with no actor.go change.
+func TestProductReport_OperatorAgentToken_AnyRun_Created(t *testing.T) {
+	fp := &fakeFeedbackProvider{}
+	af := &scAuditFake{}
+	s, runID := productReportFixture(t, fp, af)
+
+	id := Identity{
+		Subject: operatorrole.TokenSubjectPrefix + "operator-role-v0",
+		TokenID: "uat_operator_agent",
+		Scopes:  []string{"write:runs"},
+	}
+	rec := postProductReportAs(s, runID, id, "")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !fp.filed {
+		t.Fatal("operator-agent token must reach the provider")
+	}
+	// Audit names the operator-agent actor as actor_kind=agent.
+	var found bool
+	for _, p := range af.appendedParams {
+		if p.Category != categoryProductReportFiled {
+			continue
+		}
+		found = true
+		if p.ActorKind == nil || *p.ActorKind != audit.ActorAgent {
+			t.Errorf("audit ActorKind = %v, want %v", p.ActorKind, audit.ActorAgent)
+		}
+		if p.ActorSubject == nil || *p.ActorSubject != id.Subject {
+			t.Errorf("audit ActorSubject = %v, want %s", p.ActorSubject, id.Subject)
+		}
+	}
+	if !found {
+		t.Error("no product_report_filed audit entry for the operator-agent caller")
+	}
+}
+
+// TestProductReport_OperatorSession_Created asserts a cookie-session
+// operator (empty TokenID) is admitted (201) by the default switch arm.
+func TestProductReport_OperatorSession_Created(t *testing.T) {
+	fp := &fakeFeedbackProvider{}
+	af := &scAuditFake{}
+	s, runID := productReportFixture(t, fp, af)
+
+	id := Identity{Subject: "github:operator"} // empty TokenID -> cookie session
+	rec := postProductReportAs(s, runID, id, "")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !fp.filed {
+		t.Error("a cookie-session operator must reach the provider")
+	}
+}
+
+// TestProductReport_OperatorBearer_MissingWriteRuns_Returns403 asserts a
+// non-run-bound bearer token without write:runs is rejected with
+// insufficient_scope and a required_scope detail.
+func TestProductReport_OperatorBearer_MissingWriteRuns_Returns403(t *testing.T) {
+	fp := &fakeFeedbackProvider{}
+	af := &scAuditFake{}
+	s, runID := productReportFixture(t, fp, af)
+
+	id := Identity{
+		Subject: "github:operator",
+		TokenID: "uat_no_write_runs",
+		Scopes:  []string{}, // no write:runs
+	}
+	rec := postProductReportAs(s, runID, id, "")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "insufficient_scope") {
+		t.Errorf("body = %s, want insufficient_scope", rec.Body.String())
+	}
+	var resp struct {
+		Error struct {
+			Details struct {
+				RequiredScope string `json:"required_scope"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if resp.Error.Details.RequiredScope != "write:runs" {
+		t.Errorf("required_scope = %q, want write:runs", resp.Error.Details.RequiredScope)
+	}
+	if fp.filed {
+		t.Error("a bearer without write:runs must not reach the provider")
+	}
+}
+
+// TestProductReport_Anonymous_Returns401 asserts an unauthenticated caller
+// is rejected before the entitlement switch.
+func TestProductReport_Anonymous_Returns401(t *testing.T) {
+	fp := &fakeFeedbackProvider{}
+	af := &scAuditFake{}
+	s, runID := productReportFixture(t, fp, af)
+
+	rec := postProductReportAs(s, runID, Identity{}, "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "authentication_required") {
+		t.Errorf("body = %s, want authentication_required", rec.Body.String())
+	}
+	if fp.filed {
+		t.Error("an anonymous caller must not reach the provider")
+	}
+}
+
+// TestProductReport_OperatorDedupHit_AppendsOccurrence asserts an operator
+// caller on a fingerprint hit appends an occurrence (201) and creates
+// nothing — caller identity does not change the dedup behavior.
+func TestProductReport_OperatorDedupHit_AppendsOccurrence(t *testing.T) {
+	fp := &fakeFeedbackProvider{searchHit: &workmgmt.ExistingReport{
+		Number: 11, URL: "https://github.com/kuhlman-labs/fishhawk/issues/11",
+	}}
+	af := &scAuditFake{}
+	s, runID := productReportFixture(t, fp, af)
+
+	id := Identity{
+		Subject: operatorrole.TokenSubjectPrefix + "operator-role-v0",
+		TokenID: "uat_operator_agent",
+		Scopes:  []string{"write:runs"},
+	}
+	rec := postProductReportAs(s, runID, id, "")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var resp productReportResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Action != "occurrence" || resp.Number != 11 {
+		t.Errorf("response = %+v, want action=occurrence number=11", resp)
+	}
+	if fp.filed {
+		t.Error("provider.File was called on a dedup hit; want nothing created")
+	}
+	if fp.occurrenceNumber != 11 {
+		t.Errorf("occurrence appended to #%d, want #11", fp.occurrenceNumber)
 	}
 }
 
