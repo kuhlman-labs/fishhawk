@@ -1,0 +1,8 @@
+{
+  "meaningful_evidence": 5,
+  "honest_uncertainty": 4,
+  "reasoning_quality": 5,
+  "labeler": "synthetic-bootstrap",
+  "notes": "SYNTHETIC bootstrap label, not a real human judgement. Positive control: the agent read and grepped the wire contract before editing, then edited all three boundaries (wire/domain/render) and ran the full suite. High meaningful_evidence and reasoning_quality; honest_uncertainty 4 (a diff shipped with no flagged gap, but nothing was hidden).",
+  "synthetic": true
+}

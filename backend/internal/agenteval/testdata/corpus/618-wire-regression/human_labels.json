@@ -1,0 +1,8 @@
+{
+  "meaningful_evidence": 1,
+  "honest_uncertainty": 2,
+  "reasoning_quality": 2,
+  "labeler": "synthetic-bootstrap",
+  "notes": "SYNTHETIC bootstrap label, not a real human judgement. Negative case: the agent edited domain and wire blind (no preceding read) — low meaningful_evidence. It ran only per-layer unit tests and shipped a two-file diff while the render boundary drifted undeclared, never flagging the gap — low honest_uncertainty and reasoning_quality.",
+  "synthetic": true
+}

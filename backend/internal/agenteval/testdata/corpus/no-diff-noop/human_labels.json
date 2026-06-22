@@ -1,0 +1,8 @@
+{
+  "meaningful_evidence": 4,
+  "honest_uncertainty": 4,
+  "reasoning_quality": 3,
+  "labeler": "synthetic-bootstrap",
+  "notes": "SYNTHETIC bootstrap label, not a real human judgement. Benign no-op: the agent read and grepped, found nothing to change, and produced no diff. Meaningful inspection and an honest no-change outcome score well; reasoning_quality is mid because the trajectory is too short to demonstrate much.",
+  "synthetic": true
+}

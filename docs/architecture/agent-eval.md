@@ -1,8 +1,12 @@
 # Agent eval harness (v0)
 
-Status: v0 — Tier-A deterministic offline scorer only. Tier-B online
-LLM-as-judge and the live scheduled/advisory runner are deferred (see
-[Deferred](#deferred-to-follow-up)). Originating issue: #652.
+Status: v0 — Tier-A deterministic offline scorer **plus** the Tier-B
+LLM-as-judge (judge + dimensions + calibration harness, #820). The judge
+runs offline-by-default against a mockable model seam; a live model call
+is opt-in only. Capturing a REAL labeled corpus and the live
+scheduled/advisory runner remain deferred (see
+[Deferred](#deferred-to-follow-up)). Originating issues: #652 (Tier A),
+#820 (Tier B).
 
 ## What this is
 
@@ -23,11 +27,100 @@ cross-module import.
 - **Tier A (this v0): deterministic scoring over captured trajectories.**
   Pure functions over a parsed bundle. Offline, no model calls, no
   network. This is what ships now.
-- **Tier B (deferred): online LLM-as-judge over trajectories.** A model
-  scores trajectories on axes a deterministic pass can't (was the plan
-  reasonable? was the fix on-target?). Deferred because the judge needs
-  a calibration corpus that does not exist yet — building the Tier-A
-  corpus is the prerequisite.
+- **Tier B (this follow-up, #820): LLM-as-judge over trajectories.** A
+  model scores three dimensions a deterministic pass can't derive —
+  meaningful evidence-inspection, honest reporting of uncertainty/repair,
+  and reasoning soundness. The judge ships with a calibration harness
+  that scores its output against human labels; the seed labels are
+  synthetic, exactly as the Tier-A seed corpus is, so a REAL labeled
+  corpus remains the deferred prerequisite for *trusting* the judge in
+  production. Code: `backend/internal/agenteval/judge.go` +
+  `calibration.go`.
+
+## Tier B: the LLM-as-judge
+
+`Judge.Judge(ctx, lines []bundle.Line) (JudgeCard, error)` scores one
+parsed trajectory on three ordinal (1-5) dimensions, each with a model
+rationale:
+
+| Dimension (`JudgeCard` field) | Deepens which Tier-A signal | Meaning |
+|---|---|---|
+| `MeaningfulEvidence` | `EvidenceBeforeEdit` | not merely "a read preceded the first write" but "was the inspection substantive enough to ground the edit" |
+| `HonestUncertainty` | (none) | did the agent report uncertainty, partial results, and repair honestly rather than over-claim completeness |
+| `ReasoningQuality` | loop/retry counters | was the overall approach sound, or merely non-looping |
+
+`JudgeCard` carries the three `DimensionScore{Score int, Rationale
+string}` values plus the `Model` name reported by the sender.
+
+### Offline-by-default, mockable (the `MessageSender` seam)
+
+The judge depends ONLY on a local interface, NOT the Anthropic SDK:
+
+```go
+type MessageSender interface {
+    Messages(ctx context.Context, systemText, userText string) (responseText, modelName string, inputTokens, outputTokens int, err error)
+}
+```
+
+This signature is exactly `anthropic.Client.Messages`
+(`backend/internal/anthropic/client.go:52`), so an `*anthropic.Client`
+satisfies it **without** `agenteval` importing the `anthropic` package or
+the SDK. The production package therefore stays offline-by-default and
+fully mockable; the live wiring (`anthropic.NewClient`) lives only in the
+opt-in test path. The fixed dimension instructions ride in `systemText`
+(cache-eligible) and the rendered trajectory in `userText`, matching the
+`Messages` system/user split.
+
+### Error-not-fail-open (DISTINCT from Tier-A)
+
+Tier-A's `Score` is fail-open: signal drift degrades to a benign zero
+value. The judge is the opposite. A judge call that ultimately fails
+returns a **non-nil error and the zero `JudgeCard`**, NEVER a fabricated
+zero-score card presented as a real verdict — a fake score would
+silently corrupt calibration. A malformed / out-of-range / missing-
+dimension response is re-rolled up to `maxRetries` (mirroring
+`planreview.DecodeVerdictRetrying`); a sender transport error is returned
+immediately and unchanged (the adapter owns its own crash-retry). Callers
+MUST check the error before reading the card.
+
+The judge model defaults to `claude-sonnet-4-6` (`DefaultJudgeModel`) and
+is a `NewLLMJudge` parameter — a documented default, not a hardcoded gate.
+
+### Calibration harness + within-1 agreement
+
+`Calibrate(ctx, judge, cases []CalibrationCase, threshold float64)
+(CalibrationReport, error)` scores the judge against human-labeled cases
+and gates a `Trusted` verdict. The metric is **within-1 agreement**: per
+dimension, the fraction of cases where `|judgeScore - humanScore| <= 1`
+(the report also reports exact-match rate). `OverallWithin1` is the
+within-1 rate across all `SampleCount * 3` dimension-comparisons, and
+`Trusted = OverallWithin1 >= threshold`. The threshold is a **configurable
+parameter, NOT a hardcoded CI gate** — it stays tunable until a real
+labeled corpus lands. A case whose judge call errors is **fail-closed**:
+it stays in the denominator and counts as a full disagreement, never
+silently dropped, so a flaky judge cannot pass calibration by attrition.
+
+### The human labels are SYNTHETIC
+
+Each corpus case carries a `human_labels.json` with hand-assigned 1-5
+scores per dimension, `Synthetic: true`, and a `notes` field explaining
+each score. These are **bootstrap labels**, exactly as the Tier-A seed
+traces are synthetic — they prove the calibration mechanism and
+discrimination, not real-world judge accuracy. The negative cases
+(`618-wire-regression`, `loop-failure-out-of-tree`) get low scores; the
+positive control (`healthy-cross-boundary`) gets high scores. Replacing
+them with REAL captured + labeled production traces is the deferred
+follow-up below.
+
+### Opt-in live calibration (CI never calls a model)
+
+The default test suite uses a `fakeSender` / stub `Judge`, so the
+committed-tree verify and CI make **no** live model call. A separate
+`TestCalibrateLive` constructs an `*anthropic.Client` and runs the real
+judge over the corpus, but it `t.Skip`s unless BOTH
+`FISHHAWK_AGENTEVAL_JUDGE_LIVE` and `FISHHAWKD_ANTHROPIC_API_KEY` are set.
+Passing the `*anthropic.Client` to `NewLLMJudge` is also the compile-time
+proof the SDK adapter's signature has not drifted from `MessageSender`.
 
 ## Signals (the Scorecard)
 
@@ -80,6 +173,9 @@ Seed cases live under `backend/internal/agenteval/testdata/corpus/<case>/`:
 - `expected.json` — the asserted `Scorecard`.
 - `case.md` — annotates the originating issue, the distilled signal, and
   why it is (or isn't) a regression.
+- `human_labels.json` — the SYNTHETIC Tier-B human labels (per-dimension
+  1-5 scores, `synthetic: true`, `notes`) the calibration harness scores
+  the judge against.
 
 The discipline — **keep the messy original beside the distilled
 fixture** — is deliberate: the raw trajectory is what lets a future
@@ -128,21 +224,31 @@ These are surfaced for the operator to triage (the implementer does not
 file the tracking issues). In priority order:
 
 1. **Capture + label a REAL production trace.** The first task of the
-   seed-set buildout: replace the synthetic seed fixtures with captured,
-   labeled production traces, then grow the set toward the 30–50 target.
-   The synthetic shortcut is a bootstrap only — a corpus that stays too
-   clean tests nothing real.
-2. **Tier-B online LLM-as-judge over trajectories.** Depends on (1): the
-   judge needs a calibration corpus before it can be trusted.
-3. **Live-model scheduled/advisory runner.** Running the eval on a
-   cadence against live runs needs a scheduled GitHub workflow — a
-   human-led `.github/workflows` change — and is out of scope here.
+   seed-set buildout: replace the synthetic seed fixtures — both the
+   Tier-A `trace.jsonl`/`expected.json` and the Tier-B
+   `human_labels.json` — with captured, labeled production traces, then
+   grow the set toward the 30–50 target. The synthetic shortcut is a
+   bootstrap only — a corpus that stays too clean tests nothing real, and
+   the Tier-B judge cannot be *trusted* in production until it is
+   calibrated against real human labels (the synthetic calibration proves
+   the mechanism, not real accuracy).
+2. **Live-model scheduled/advisory runner.** Running the eval (now
+   including the Tier-B judge) on a cadence against live runs needs a
+   scheduled GitHub workflow — a human-led `.github/workflows` change —
+   and is out of scope here.
 
 ## Running it
 
 ```sh
-scripts/test single -run TestScore ./backend/internal/agenteval/
+scripts/test single -run TestScore ./backend/internal/agenteval/        # Tier-A corpus replay
+scripts/test single -run 'TestJudge|TestCalibrat' ./backend/internal/agenteval/   # Tier-B judge + calibration
+
+# Opt-in live judge calibration (makes a real model call; skipped otherwise):
+FISHHAWK_AGENTEVAL_JUDGE_LIVE=1 FISHHAWKD_ANTHROPIC_API_KEY=... \
+  scripts/test single -run TestCalibrateLive ./backend/internal/agenteval/
 ```
 
 Runs under `scripts/test` automatically as a backend module test, so the
-corpus replays in CI on every change.
+corpus replays in CI on every change. The default suite uses a
+`fakeSender` / stub `Judge`, so CI never makes a live model call — only
+the env-gated `TestCalibrateLive` does.
