@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1586,5 +1587,115 @@ func TestShipPullRequest_SupplementalReinvokeReview_GatingReject_FailsAndClosesP
 	}
 	if n := auditCategoryCount(au, "pull_request_closed_after_review_reject"); n != 1 {
 		t.Errorf("pull_request_closed_after_review_reject audit entries = %d, want 1", n)
+	}
+}
+
+// failTransitionToFailedRepo wraps a *orchestratorRepo and forces an error on
+// the StageStateFailed transition ONLY, delegating every other transition (and
+// all other methods) to the embedded repo. It drives run.FailStage's internal
+// repo.TransitionStage(..., StageStateFailed, ...) call (run/failure.go:58) to
+// error WITHOUT failing the handler's earlier reads or non-failed transitions —
+// mirroring the categoryFailAuditRepo selective-failure pattern (lines
+// 1307-1317) so handleShipPullRequest's ferr != nil degradation branch fires.
+type failTransitionToFailedRepo struct {
+	*orchestratorRepo
+	err error
+}
+
+func (r *failTransitionToFailedRepo) TransitionStage(ctx context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	if to == run.StageStateFailed {
+		return nil, r.err
+	}
+	return r.orchestratorRepo.TransitionStage(ctx, id, to, c)
+}
+
+// TestShipPullRequest_SupplementalReinvokeReview_GatingReject_FailStageError
+// pins the FailStage-ERROR (ferr != nil) degradation sub-branch of the
+// gating-reject path: when the gating supplemental reviewer rejects AND
+// run.FailStage errors, the handler only WARN-logs and still responds 201
+// WITHOUT advancing the stage or closing the PR. This is the mirror of the
+// FailStage-SUCCESS branch covered by
+// TestShipPullRequest_SupplementalReinvokeReview_GatingReject_FailsAndClosesPR.
+func TestShipPullRequest_SupplementalReinvokeReview_GatingReject_FailStageError(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+		model:   "gpt-5.5",
+	}
+	s, sf, au, rr, runRow, implStage := newSupplementalReviewPRServer(t, reviewer, specImplementGatingReviewers)
+
+	// Wire a GitHub fake + InstallationID exactly as the happy-path test, so a
+	// PR close WOULD fire and be audited if the degradation branch erroneously
+	// attempted one — making closeCalls == 0 a meaningful assertion.
+	rec := &closeRecorder{}
+	ghSrv := rec.server(t)
+	s.cfg.GitHub = &githubclient.Client{
+		BaseURL: ghSrv.URL,
+		Tokens:  &ghTokensStub{tok: "ghs_test"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "gha_app_jwt_test", nil },
+	}
+	inst := int64(12345)
+	runRow.InstallationID = &inst
+
+	// Force run.FailStage's StageStateFailed transition to error, driving the
+	// handler's ferr != nil branch. The implement stage is left `running` by
+	// newSupplementalReviewPRServer, so FailStage single-steps straight to the
+	// failed transition the wrapper intercepts (no dispatched→running hop).
+	s.cfg.RunRepo = &failTransitionToFailedRepo{
+		orchestratorRepo: rr,
+		err:              fmt.Errorf("forced failed-transition error"),
+	}
+
+	// Capture the degradation WARN line (recover_test.go:1033 pattern).
+	var logBuf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body := runnerShapedSupplementalPRBody(t, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		"backend/internal/foo/foo.go", "hollow reason the reviewer rejects")
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+
+	// (a) The response is NOT unwound — degradation still returns 201.
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (degradation does not unwind the response):\n%s", w.Code, w.Body.String())
+	}
+
+	// (b) The failed transition did not apply — the stage is STILL running
+	// (no-advance). rr reads the same underlying store the wrapper delegates to.
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateRunning {
+		t.Errorf("stage state = %q, want running (FailStage errored → no-advance)", got.State)
+	}
+
+	// (c) The PR was NOT closed — the close helper runs only in the FailStage
+	// success arm, which the error branch skips.
+	rec.mu.Lock()
+	closeCalls := rec.closeCalls
+	rec.mu.Unlock()
+	if closeCalls != 0 {
+		t.Errorf("PR close calls = %d, want 0 (no close on the FailStage-error branch)", closeCalls)
+	}
+
+	// (d) No close audit row recorded.
+	if n := auditCategoryCount(au, "pull_request_closed_after_review_reject"); n != 0 {
+		t.Errorf("pull_request_closed_after_review_reject audit entries = %d, want 0", n)
+	}
+
+	// (e) The degradation WARN line was logged, carrying the stage_id.
+	logged := logBuf.String()
+	if !strings.Contains(logged, "transition to failed-B after supplemental reinvoke review gating reject failed") {
+		t.Errorf("missing degradation WARN line:\n%s", logged)
+	}
+	if !strings.Contains(logged, implStage.ID.String()) {
+		t.Errorf("WARN line missing stage_id %s:\n%s", implStage.ID, logged)
+	}
+
+	// The honest pull_request_opened audit row still landed (it precedes the
+	// gating branch) — the upload is not unwound by the degradation.
+	if findAuditByCategory(t, au, "pull_request_opened") == nil {
+		t.Error("no pull_request_opened audit entry recorded")
 	}
 }
