@@ -1,0 +1,80 @@
+# Codex executor example.
+#
+# Demonstrates selecting the OpenAI Codex CLI as the coding agent via
+# `executor.agent: codex` on the plan and implement stages. Validates
+# against ../workflow-v0.schema.json — `executor.agent` is a free-form
+# string the runner resolves to a provider adapter, so naming `codex`
+# needs no schema change.
+#
+# Provider setup (the required OPENAI_API_KEY secret, the action input
+# wiring, and local/hosted verification) is documented in
+# ../../../runner/README.md ("Choosing the coding agent").
+
+version: "0.3"
+
+roles:
+  tech_lead:
+    members: ["@org/tech-leads"]
+  senior_engineer:
+    members: ["@org/senior-engineers", "@org/tech-leads"]
+
+workflows:
+  feature_change:
+    description: "Feature workflow driven by the OpenAI Codex coding agent."
+
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: codex
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: plan
+            schema: standard_v1
+            persistence:
+              - target: originating_issue
+                mode: rendered_comment
+                update_on_change: true
+              - target: fishhawk_audit_log
+                mode: canonical
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead, senior_engineer]
+            sla: 4_business_hours
+
+      - id: implement
+        type: implement
+        executor:
+          agent: codex
+          verify:
+            command: 'scripts/test'
+            timeout: '10m'
+        inputs:
+          - artifact: plan
+            from_stage: plan
+        produces:
+          - artifact: pull_request
+        constraints:
+          - max_files_changed: 30
+          - forbidden_paths:
+              - "infra/**"
+              - ".github/workflows/**"
+              - ".fishhawk/**"
+          - required_outcomes:
+              - tests_added_or_updated
+              - ci_green
+
+      - id: review
+        type: review
+        executor:
+          human: true
+        inputs:
+          - artifact: pull_request
+            from_stage: implement
+        gates:
+          - type: approval
+            approvers:
+              any_of: [senior_engineer]

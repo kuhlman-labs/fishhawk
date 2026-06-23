@@ -41,7 +41,7 @@ Identifiers (`<role_id>`, `<workflow_id>`, stage `id`s) are `snake_case` — `^[
 - id: plan
   type: plan | implement | review # closed set; no custom types
   executor: # exactly one of agent or human
-    agent: claude-code        # any string; v0 ships claude-code
+    agent: claude-code        # any string; v0 ships claude-code (default) and codex
     model: claude-opus-4-8    # optional; per-stage model override (see ### Executor model override)
     timeout: 10m              # optional; stage-level override for agent timeout
     verify:                   # optional; in-band test gate (see ### Verify gate)
@@ -62,6 +62,12 @@ Identifiers (`<role_id>`, `<workflow_id>`, stage `id`s) are `snake_case` — `^[
 ```
 
 Stage `id` is unique within the workflow. The `from_stage` field on inputs cross-references it; the validator (E1.3 / #18) enforces this beyond the schema.
+
+### Executor agent (provider)
+
+`executor.agent` is a free-form string the runner resolves to a coding-agent adapter. v0 ships two providers: `claude-code` (the default — Anthropic's Claude Code CLI, reads `ANTHROPIC_API_KEY`) and `codex` (the OpenAI Codex CLI, reads `OPENAI_API_KEY`). Omitting `agent` selects `claude-code`; an unknown id fails the stage category-A before the agent is invoked. See the runner's [`Choosing the coding agent`](../../runner/README.md#choosing-the-coding-agent-claude-code-or-codex) section for the per-provider setup — the required GitHub secret, the action input wiring, and local/hosted verification. A worked example using Codex lives at [`examples/workflow-v0-codex-executor.yaml`](examples/workflow-v0-codex-executor.yaml).
+
+**Migration note.** Existing Claude Code users need no changes: `agent` defaults to `claude-code` and behavior is byte-identical to before the provider-selection work landed (#839/#840/#841). Opting into Codex is a per-stage `executor.agent: codex` plus the `OPENAI_API_KEY` secret — nothing else in the spec changes.
 
 ### Verify gate
 
