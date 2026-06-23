@@ -1,8 +1,8 @@
 // Package jiraclient is the backend's minimal typed wrapper around the
 // Jira Cloud REST API v3 for the small set of operations the Fishhawk
 // work-management jira provider (#1094, deferred from #1005) needs:
-// creating an issue (optionally linked to a parent/epic) and moving an
-// issue through a workflow transition.
+// creating an issue, linking it to a parent/epic via a best-effort
+// post-create edit, and moving an issue through a workflow transition.
 //
 // Auth is HTTP Basic with `email:api_token` (the documented Jira Cloud
 // server-to-server scheme — see
@@ -98,17 +98,16 @@ func New(baseURL, email, apiToken string, opts ...Option) *Client {
 }
 
 // CreateIssueParams describes a single issue to create. ProjectKey,
-// IssueType, and Summary are required; the rest are optional. ParentKey,
-// when set, links the new issue to a parent/epic via the team-managed
-// `fields.parent` reference (best-effort per #1107 — a wrong field for a
-// classic project is the caller's concern, the API surfaces it as a 4xx).
+// IssueType, and Summary are required; the rest are optional. Parent/epic
+// linking is NOT done at create time — it is a separate best-effort
+// post-create LinkParent PUT, so the per-project field-shape distinction
+// (team-managed `parent` vs a classic epic-link custom field) lives there.
 type CreateIssueParams struct {
 	ProjectKey  string
 	IssueType   string
 	Summary     string
 	Description string
 	Labels      []string
-	ParentKey   string
 }
 
 // CreatedIssue is the result of CreateIssue.
@@ -157,9 +156,6 @@ func (c *Client) CreateIssue(ctx context.Context, p CreateIssueParams) (*Created
 	if len(p.Labels) > 0 {
 		fields["labels"] = p.Labels
 	}
-	if p.ParentKey != "" {
-		fields["parent"] = map[string]string{"key": p.ParentKey}
-	}
 
 	resp, err := c.do(ctx, http.MethodPost, "/rest/api/3/issue", map[string]any{"fields": fields})
 	if err != nil {
@@ -180,6 +176,49 @@ func (c *Client) CreateIssue(ctx context.Context, p CreateIssueParams) (*Created
 		ID:  out.ID,
 		URL: c.baseURL + "/browse/" + out.Key,
 	}, nil
+}
+
+// LinkParent links the issue identified by issueKey to its parent epic
+// (epicKey) by editing the issue's fields.
+//
+//	PUT /rest/api/3/issue/{issueKey}
+//
+// fieldName selects the wire shape, which differs by project style:
+//   - "parent" (or an empty fieldName, normalised to "parent") is the
+//     team-managed (next-gen) reference and emits {"parent":{"key":epicKey}}.
+//   - any other fieldName is a company-managed (classic) epic-link custom
+//     field id (e.g. customfield_10014) and emits the bare-string form
+//     {<fieldName>: epicKey}.
+//
+// A non-2xx response becomes an *APIError via the shared errForStatus
+// helper; the jira provider treats a link failure as best-effort (#1107),
+// recording it without failing the filing.
+func (c *Client) LinkParent(ctx context.Context, issueKey, fieldName, epicKey string) error {
+	if issueKey == "" {
+		return errors.New("jiraclient: issue key required")
+	}
+	if epicKey == "" {
+		return errors.New("jiraclient: epic key required")
+	}
+	if fieldName == "" {
+		fieldName = "parent"
+	}
+
+	var value any
+	if fieldName == "parent" {
+		value = map[string]string{"key": epicKey}
+	} else {
+		value = epicKey
+	}
+
+	resp, err := c.do(ctx, http.MethodPut, "/rest/api/3/issue/"+issueKey, map[string]any{
+		"fields": map[string]any{fieldName: value},
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return errForStatus("link parent", resp)
 }
 
 // transitionsResponse is the subset of GET .../transitions Fishhawk

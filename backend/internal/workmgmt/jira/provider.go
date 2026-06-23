@@ -1,9 +1,10 @@
 // Package jira implements the work-management Provider (#1094, deferred
-// from #1005) against Jira Cloud: it creates the issue (labels and the
-// optional parent/epic reference applied at creation) and best-effort
-// moves it to the conventions' board status via a workflow transition.
-// The REST calls live in backend/internal/jiraclient; this package is the
-// orchestration that turns a resolved workmgmt.ProviderRequest into them.
+// from #1005) against Jira Cloud: it creates the issue (labels applied at
+// creation), best-effort links it to a parent/epic via a post-create edit
+// on the conventions-configured field, and best-effort moves it to the
+// conventions' board status via a workflow transition. The REST calls live
+// in backend/internal/jiraclient; this package is the orchestration that
+// turns a resolved workmgmt.ProviderRequest into them.
 //
 // Only Provider.File is implemented in v0. The board-state Transitioner
 // capability (#1012) is intentionally NOT implemented for jira — the
@@ -35,6 +36,7 @@ const ProviderName = "jira"
 // fake. *jiraclient.Client satisfies it directly.
 type API interface {
 	CreateIssue(ctx context.Context, p jiraclient.CreateIssueParams) (*jiraclient.CreatedIssue, error)
+	LinkParent(ctx context.Context, issueKey, fieldName, epicKey string) error
 	Transition(ctx context.Context, key, targetStatusName string) error
 }
 
@@ -53,9 +55,12 @@ func (*Provider) Name() string { return ProviderName }
 // The issue is created first — it is the durable result and the only fatal
 // step: a CreateIssue failure (or a failed pre-create guard) returns a nil
 // item and an error, because no issue exists. The parent/epic reference is
-// applied at create time via the team-managed `fields.parent` reference
-// (#1107 best-effort: a wrong parent for a classic project surfaces as a
-// create-time 4xx), so a requested parent that survives create is linked.
+// then linked best-effort (#1107) via a separate post-create LinkParent
+// edit on the conventions-configured field (the default `parent` reference
+// for team-managed projects, or a classic epic-link custom field id): a
+// requested parent that fails to link records the cause in
+// CreatedItem.EpicLinkError and leaves EpicLinked false without failing the
+// filing, while an empty parent leaves EpicLinked false with no error.
 // Board placement is a best-effort workflow transition (#1107): a created
 // issue lands in the project's default status, and reaching the
 // conventions' status requires a separate transition call — once the issue
@@ -81,7 +86,6 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 		Summary:     req.Item.Title,
 		Description: req.Item.Body,
 		Labels:      req.Item.Classification.Labels,
-		ParentKey:   parentKey,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/jira: create issue: %w", err)
@@ -95,10 +99,24 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 		Status:        req.Item.BoardPlacement.Status,
 		BoardColumn:   req.Item.BoardPlacement.BoardColumn,
 	}
-	// The parent reference is applied at create time via fields.parent, so a
-	// requested parent that survived create is linked; an empty parent means
-	// nothing to link (EpicLinked false with no error).
-	created.EpicLinked = parentKey != ""
+
+	// Epic linking is best-effort (#1107) via a separate post-create edit: an
+	// empty parent means nothing to link (EpicLinked false, no error); a link
+	// failure records the cause in EpicLinkError and leaves EpicLinked false,
+	// but the durable issue is still returned. The field defaults to the
+	// team-managed `parent` reference; a classic project configures its
+	// epic-link custom field id via conn.ParentField.
+	if parentKey != "" {
+		parentField := strings.TrimSpace(conn.ParentField)
+		if parentField == "" {
+			parentField = "parent"
+		}
+		if lerr := p.api.LinkParent(ctx, issue.Key, parentField, parentKey); lerr != nil {
+			created.EpicLinkError = lerr.Error()
+		} else {
+			created.EpicLinked = true
+		}
+	}
 
 	// Board placement is best-effort (#1107): no configured status means
 	// nothing to move (leave Boarded false with no error); a transition

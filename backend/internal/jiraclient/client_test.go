@@ -146,31 +146,128 @@ func TestCreateIssue_RequestShapeAndResult(t *testing.T) {
 	}
 }
 
-func TestCreateIssue_WithParentKey(t *testing.T) {
+// TestLinkParent_TeamManagedShape asserts the default/"parent" field emits a
+// PUT to /rest/api/3/issue/{key} carrying the team-managed object shape
+// {"fields":{"parent":{"key":"EPIC-1"}}}.
+func TestLinkParent_TeamManagedShape(t *testing.T) {
+	stub := &stubDoer{t: t}
+	stub.handler = func(rec *recordedRequest) (*http.Response, error) {
+		if rec.method != http.MethodPut {
+			t.Errorf("method = %s, want PUT", rec.method)
+		}
+		if rec.path != "/rest/api/3/issue/ENG-8" {
+			t.Errorf("path = %s, want /rest/api/3/issue/ENG-8", rec.path)
+		}
+		assertBasicAuth(t, rec.header)
+		var got struct {
+			Fields struct {
+				Parent *struct{ Key string } `json:"parent"`
+			} `json:"fields"`
+		}
+		if err := json.Unmarshal(rec.body, &got); err != nil {
+			t.Fatalf("unmarshal: %v\nbody=%s", err, rec.body)
+		}
+		if got.Fields.Parent == nil || got.Fields.Parent.Key != "EPIC-1" {
+			t.Errorf("parent = %+v, want {key: EPIC-1}", got.Fields.Parent)
+		}
+		return jsonResponse(http.StatusNoContent, ""), nil
+	}
+
+	c := New(testBaseURL, testEmail, testToken, WithHTTPClient(stub))
+	if err := c.LinkParent(context.Background(), "ENG-8", "parent", "EPIC-1"); err != nil {
+		t.Fatalf("LinkParent: %v", err)
+	}
+}
+
+// TestLinkParent_EmptyFieldDefaultsToParent asserts an empty fieldName is
+// normalised to "parent" and emits the same team-managed object shape.
+func TestLinkParent_EmptyFieldDefaultsToParent(t *testing.T) {
 	stub := &stubDoer{t: t}
 	stub.handler = func(rec *recordedRequest) (*http.Response, error) {
 		var got struct {
 			Fields struct {
-				Parent struct{ Key string } `json:"parent"`
+				Parent *struct{ Key string } `json:"parent"`
 			} `json:"fields"`
 		}
 		if err := json.Unmarshal(rec.body, &got); err != nil {
 			t.Fatalf("unmarshal: %v", err)
 		}
-		if got.Fields.Parent.Key != "ENG-1" {
-			t.Errorf("parent.key = %q, want ENG-1", got.Fields.Parent.Key)
+		if got.Fields.Parent == nil || got.Fields.Parent.Key != "EPIC-1" {
+			t.Errorf("parent = %+v, want {key: EPIC-1} (empty field defaults to parent)", got.Fields.Parent)
 		}
-		return jsonResponse(http.StatusCreated, `{"id":"1","key":"ENG-8"}`), nil
+		return jsonResponse(http.StatusNoContent, ""), nil
 	}
 
 	c := New(testBaseURL, testEmail, testToken, WithHTTPClient(stub))
-	if _, err := c.CreateIssue(context.Background(), CreateIssueParams{
-		ProjectKey: "ENG",
-		IssueType:  "Task",
-		Summary:    "child",
-		ParentKey:  "ENG-1",
-	}); err != nil {
-		t.Fatalf("CreateIssue: %v", err)
+	if err := c.LinkParent(context.Background(), "ENG-8", "", "EPIC-1"); err != nil {
+		t.Fatalf("LinkParent: %v", err)
+	}
+}
+
+// TestLinkParent_ClassicCustomFieldShape asserts a classic epic-link custom
+// field emits the bare-string shape {"fields":{"customfield_10014":"EPIC-1"}}.
+func TestLinkParent_ClassicCustomFieldShape(t *testing.T) {
+	stub := &stubDoer{t: t}
+	stub.handler = func(rec *recordedRequest) (*http.Response, error) {
+		var got map[string]map[string]json.RawMessage
+		if err := json.Unmarshal(rec.body, &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		raw, ok := got["fields"]["customfield_10014"]
+		if !ok {
+			t.Fatalf("customfield_10014 absent: %s", rec.body)
+		}
+		var val string
+		if err := json.Unmarshal(raw, &val); err != nil {
+			t.Fatalf("customfield_10014 is not a bare string: %s", raw)
+		}
+		if val != "EPIC-1" {
+			t.Errorf("customfield_10014 = %q, want bare string EPIC-1", val)
+		}
+		if _, present := got["fields"]["parent"]; present {
+			t.Errorf("parent present for a classic custom field: %s", rec.body)
+		}
+		return jsonResponse(http.StatusNoContent, ""), nil
+	}
+
+	c := New(testBaseURL, testEmail, testToken, WithHTTPClient(stub))
+	if err := c.LinkParent(context.Background(), "ENG-8", "customfield_10014", "EPIC-1"); err != nil {
+		t.Fatalf("LinkParent: %v", err)
+	}
+}
+
+// TestLinkParent_APIError asserts a non-2xx response becomes an *APIError.
+func TestLinkParent_APIError(t *testing.T) {
+	stub := &stubDoer{t: t}
+	stub.handler = func(*recordedRequest) (*http.Response, error) {
+		return jsonResponse(http.StatusBadRequest, `{"errorMessages":["field not on screen"]}`), nil
+	}
+	c := New(testBaseURL, testEmail, testToken, WithHTTPClient(stub))
+	err := c.LinkParent(context.Background(), "ENG-8", "customfield_10014", "EPIC-1")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want *APIError", err)
+	}
+	if apiErr.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", apiErr.StatusCode)
+	}
+}
+
+// TestLinkParent_ValidatesArgs asserts the pre-flight guards: an empty issue
+// key or epic key errors before any transport call.
+func TestLinkParent_ValidatesArgs(t *testing.T) {
+	c := New(testBaseURL, testEmail, testToken, WithHTTPClient(&stubDoer{
+		t: t,
+		handler: func(*recordedRequest) (*http.Response, error) {
+			t.Fatal("transport called despite invalid args")
+			return nil, nil
+		},
+	}))
+	if err := c.LinkParent(context.Background(), "", "parent", "EPIC-1"); err == nil {
+		t.Error("expected error for empty issue key")
+	}
+	if err := c.LinkParent(context.Background(), "ENG-8", "parent", ""); err == nil {
+		t.Error("expected error for empty epic key")
 	}
 }
 

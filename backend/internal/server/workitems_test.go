@@ -561,13 +561,19 @@ func TestFileWorkItem_UnimplementedProvider_FailsClosed(t *testing.T) {
 // transport — the seam a per-layer unit (Target.Jira left unpopulated)
 // would miss (cf. #618).
 func TestFileWorkItem_Jira_EndToEnd(t *testing.T) {
-	var createBody map[string]any
+	var createBody, linkBody map[string]any
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /rest/api/3/issue", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&createBody)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		_, _ = io.WriteString(w, `{"id":"10042","key":"FISH-42"}`)
+	})
+	// The post-create LinkParent PUT — capture its body so the test can
+	// assert the provider->client seam emits the right wire shape per field.
+	mux.HandleFunc("PUT /rest/api/3/issue/{key}", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&linkBody)
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("GET /rest/api/3/issue/{key}/transitions", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -588,24 +594,33 @@ func TestFileWorkItem_Jira_EndToEnd(t *testing.T) {
 	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
-	s := New(Config{})
-	rec := fileWorkItem(t, s, workItemRequest{
-		Repo:      "kuhlman-labs/fishhawk",
-		Type:      "feature",
-		Summary:   "Add the widget endpoint",
-		TitleVars: map[string]string{"epic": "22", "n": "5"},
-		Relations: &workItemRelations{ParentEpic: "FISH-100"},
-	}, "github:operator")
-
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	// file runs one filing flow with the conventions' current jira block and
+	// returns the decoded response; createBody/linkBody hold the captured
+	// transport bodies for that flow.
+	file := func(t *testing.T) workItemResponse {
+		t.Helper()
+		createBody, linkBody = nil, nil
+		s := New(Config{})
+		rec := fileWorkItem(t, s, workItemRequest{
+			Repo:      "kuhlman-labs/fishhawk",
+			Type:      "feature",
+			Summary:   "Add the widget endpoint",
+			TitleVars: map[string]string{"epic": "22", "n": "5"},
+			Relations: &workItemRelations{ParentEpic: "FISH-100"},
+		}, "github:operator")
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+		}
+		return decodeWorkItem(t, rec)
 	}
-	resp := decodeWorkItem(t, rec)
+
+	// Default (team-managed) flow: parent_field unset.
+	resp := file(t)
 	if resp.Provider != workmgmtjira.ProviderName {
 		t.Errorf("provider = %q, want %q", resp.Provider, workmgmtjira.ProviderName)
 	}
 	if !resp.EpicLinked {
-		t.Errorf("epic_linked = false, want true (parent FISH-100 set at create): %+v", resp)
+		t.Errorf("epic_linked = false, want true (parent FISH-100 linked post-create): %+v", resp)
 	}
 	// The created Jira issue key/URL is returned: Number is the key's numeric
 	// suffix, URL the browse URL carrying the full key.
@@ -620,7 +635,7 @@ func TestFileWorkItem_Jira_EndToEnd(t *testing.T) {
 	}
 
 	// Transport seam: the conventions-resolved title/body/labels reached the
-	// Jira create call.
+	// Jira create call — and the parent is NOT linked at create time.
 	if createBody == nil {
 		t.Fatal("create transport was not hit")
 	}
@@ -641,11 +656,39 @@ func TestFileWorkItem_Jira_EndToEnd(t *testing.T) {
 	if len(labels) == 0 || labels[0] != "type:feature" {
 		t.Errorf("transport labels = %v, want the resolved default type:feature", labels)
 	}
-	if parent, _ := fields["parent"].(map[string]any); parent["key"] != "FISH-100" {
-		t.Errorf("transport parent.key = %v, want FISH-100 (epic linked at create)", parent["key"])
+	if _, present := fields["parent"]; present {
+		t.Errorf("create body carried parent; linking is now a post-create PUT: %v", fields)
 	}
 	if _, ok := fields["description"]; !ok {
 		t.Errorf("transport body (description) not sent: %v", fields)
+	}
+
+	// Post-create link seam (team-managed): the PUT body emits the object
+	// shape {"parent":{"key":"FISH-100"}}.
+	if linkBody == nil {
+		t.Fatal("link (PUT) transport was not hit for the default parent_field")
+	}
+	linkFields, _ := linkBody["fields"].(map[string]any)
+	if parent, _ := linkFields["parent"].(map[string]any); parent["key"] != "FISH-100" {
+		t.Errorf("link body parent.key = %v, want FISH-100 (team-managed object shape)", parent["key"])
+	}
+
+	// Classic flow: a configured epic-link custom field emits the bare-string
+	// shape {"customfield_10014":"FISH-100"} at the same PUT seam.
+	conv.Jira = &workmgmt.JiraConnection{ProjectKey: "FISH", ParentField: "customfield_10014"}
+	resp = file(t)
+	if !resp.EpicLinked {
+		t.Errorf("epic_linked = false, want true (classic custom field linked): %+v", resp)
+	}
+	if linkBody == nil {
+		t.Fatal("link (PUT) transport was not hit for the classic parent_field")
+	}
+	linkFields, _ = linkBody["fields"].(map[string]any)
+	if got, _ := linkFields["customfield_10014"].(string); got != "FISH-100" {
+		t.Errorf("link body customfield_10014 = %v, want bare string FISH-100 (classic shape)", linkFields["customfield_10014"])
+	}
+	if _, present := linkFields["parent"]; present {
+		t.Errorf("classic link body carried a parent object: %v", linkFields)
 	}
 }
 
