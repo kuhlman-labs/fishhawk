@@ -35,6 +35,11 @@ jobs:
               - 'go.work'
               - 'go.work.sum'
               - '.golangci.yml'
+              # Go-test fixtures (e.g. backend/internal/agenteval/testdata/corpus)
+              # are consumed by Go tests (TestScore, TestCalibrateCorpusReplay), so a
+              # fixture-only change must run the Go job — otherwise it merges
+              # unvalidated and can red-line main post-merge (#1298/#1301).
+              - '**/testdata/**'
               - '.github/workflows/ci.yml'
             ts:
               - 'frontend/**'
