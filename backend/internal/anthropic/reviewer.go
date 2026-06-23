@@ -34,7 +34,13 @@ type Reviewer struct {
 // Extra opts (e.g. option.WithBaseURL for tests) are forwarded to the client.
 // The decode-retry budget defaults to 1; serve.go overrides it via
 // SetMaxRetries with the env-resolved FISHHAWKD_PLAN_REVIEW_MAX_RETRIES value.
+//
+// It pins cfg.Schema to planreview.VerdictSchema() before constructing the
+// Client, so the reviewer's Messages requests stay VerdictSchema-constrained
+// (#1324) regardless of any cfg.Schema the caller passed — the client carries
+// the output schema per-construction (#1326).
 func NewReviewer(cfg Config, opts ...option.RequestOption) *Reviewer {
+	cfg.Schema = planreview.VerdictSchema()
 	return &Reviewer{client: NewClient(cfg, opts...), maxDecodeRetries: 1}
 }
 

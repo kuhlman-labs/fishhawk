@@ -231,6 +231,10 @@ func TestCalibrateLive(t *testing.T) {
 		Model:     DefaultJudgeModel,
 		MaxTokens: 1024,
 		Timeout:   60 * time.Second,
+		// Pin JudgeCardSchema so the live judge issues the schema-constrained
+		// request (#1326), exercising the same output_config.format path the
+		// committed-tree integration test asserts.
+		Schema: JudgeCardSchema(),
 	})
 	// Passing *anthropic.Client to NewLLMJudge's MessageSender parameter
 	// is the compile-time proof the SDK adapter's signature still matches.
