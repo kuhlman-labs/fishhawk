@@ -2657,7 +2657,7 @@ func TestGateEvidenceForReview_MapsUndeclaredCategorized(t *testing.T) {
 			},
 		},
 	}
-	got := gateEvidenceForReview(ev)
+	got := gateEvidenceForReview(ev, nil)
 	if got.ScopeFacts == nil {
 		t.Fatal("ScopeFacts = nil, want populated")
 	}
@@ -2675,9 +2675,322 @@ func TestGateEvidenceForReview_MapsUndeclaredCategorized(t *testing.T) {
 	}
 
 	ev.ScopeFacts.UndeclaredCategorized = nil
-	if uncat := gateEvidenceForReview(ev); uncat.ScopeFacts.UndeclaredCategorized != nil {
+	if uncat := gateEvidenceForReview(ev, nil); uncat.ScopeFacts.UndeclaredCategorized != nil {
 		t.Errorf("nil categorized input mapped to %+v, want nil",
 			uncat.ScopeFacts.UndeclaredCategorized)
+	}
+}
+
+func TestSubtractPaths(t *testing.T) {
+	tests := []struct {
+		name   string
+		paths  []string
+		remove []string
+		want   []string
+	}{
+		{"nil remove returns input unchanged", []string{"a", "b"}, nil, []string{"a", "b"}},
+		{"empty remove returns input unchanged", []string{"a", "b"}, []string{}, []string{"a", "b"}},
+		{"nil paths yields nil", nil, []string{"a"}, nil},
+		{"full overlap empties", []string{"a", "b"}, []string{"a", "b"}, []string{}},
+		{"partial overlap drops only matched", []string{"a", "b", "c"}, []string{"b"}, []string{"a", "c"}},
+		{"order preserved", []string{"z", "y", "x", "w"}, []string{"y"}, []string{"z", "x", "w"}},
+		{"remove element absent from paths is a no-op", []string{"a"}, []string{"q"}, []string{"a"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := subtractPaths(tc.paths, tc.remove)
+			if len(got) != len(tc.want) {
+				t.Fatalf("subtractPaths(%v, %v) = %v, want %v", tc.paths, tc.remove, got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("index %d: got %q, want %q (full: %v)", i, got[i], tc.want[i], got)
+				}
+			}
+		})
+	}
+}
+
+// TestGateEvidenceForReview_SubtractsFoldedPaths is the #1317 DONE-MEANS test
+// for surface 2: a folded path is removed from BOTH ScopeFacts.UndeclaredPaths
+// and ScopeFacts.UndeclaredCategorized, while a co-present NON-folded drift
+// path is retained in both.
+func TestGateEvidenceForReview_SubtractsFoldedPaths(t *testing.T) {
+	ev := bundle.GateEvidence{
+		ScopeFacts: &bundle.ScopeFactsEvidence{
+			DeclaredFiles:   2,
+			UndeclaredPaths: []string{"folded.go", "other.go"},
+			UndeclaredCategorized: []bundle.DriftPathEvidence{
+				{Path: "folded.go", Category: "A", Disposition: "excluded_from_commit"},
+				{Path: "other.go", Category: "B", Disposition: "would_fail_loud"},
+			},
+		},
+	}
+	got := gateEvidenceForReview(ev, []string{"folded.go"})
+	if got.ScopeFacts == nil {
+		t.Fatal("ScopeFacts = nil, want populated")
+	}
+	if len(got.ScopeFacts.UndeclaredPaths) != 1 || got.ScopeFacts.UndeclaredPaths[0] != "other.go" {
+		t.Errorf("UndeclaredPaths = %v, want [other.go] (folded.go subtracted)", got.ScopeFacts.UndeclaredPaths)
+	}
+	if len(got.ScopeFacts.UndeclaredCategorized) != 1 || got.ScopeFacts.UndeclaredCategorized[0].Path != "other.go" {
+		t.Errorf("UndeclaredCategorized = %+v, want only other.go (folded.go subtracted)", got.ScopeFacts.UndeclaredCategorized)
+	}
+}
+
+// buildDriftReconcileBundle packs a manifest, an optional scope_drift
+// policy_event (undeclared paths), an optional scope_amendments_folded
+// policy_event (added — pass a raw JSON string to model an unparseable
+// payload), and an optional gate_evidence event whose ScopeFacts mirrors the
+// drift, into the gzipped JSONL wire shape the trace handler reads. It models
+// the runner's emission so the backend extraction+subtraction chain can be
+// driven exactly as handleTraceUpload runs it (#1317).
+func buildDriftReconcileBundle(t *testing.T, drift []string, foldedJSON string, gateScopeFacts map[string]any) []byte {
+	t.Helper()
+	type line struct {
+		Seq  int             `json:"seq"`
+		Kind string          `json:"kind"`
+		Data json.RawMessage `json:"data,omitempty"`
+	}
+	mdata, err := json.Marshal(bundle.Manifest{BundleSchema: "v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := []line{{Seq: 1, Kind: bundle.EventKindManifest, Data: mdata}}
+	seq := 2
+	if drift != nil {
+		dp, derr := json.Marshal(map[string]any{"check": "scope_drift", "outcome": "excluded", "undeclared": drift})
+		if derr != nil {
+			t.Fatal(derr)
+		}
+		lines = append(lines, line{Seq: seq, Kind: bundle.EventKindPolicyEvent, Data: dp})
+		seq++
+	}
+	if foldedJSON != "" {
+		lines = append(lines, line{Seq: seq, Kind: bundle.EventKindPolicyEvent, Data: json.RawMessage(foldedJSON)})
+		seq++
+	}
+	if gateScopeFacts != nil {
+		gp, gerr := json.Marshal(map[string]any{"scope_facts": gateScopeFacts})
+		if gerr != nil {
+			t.Fatal(gerr)
+		}
+		lines = append(lines, line{Seq: seq, Kind: bundle.EventKindGateEvidence, Data: gp})
+		seq++
+	}
+	lines = append(lines, line{Seq: seq, Kind: "trailer", Data: json.RawMessage(`{}`)})
+
+	var raw bytes.Buffer
+	for _, l := range lines {
+		b, merr := json.Marshal(l)
+		if merr != nil {
+			t.Fatal(merr)
+		}
+		raw.Write(b)
+		raw.WriteByte('\n')
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, werr := w.Write(raw.Bytes()); werr != nil {
+		t.Fatal(werr)
+	}
+	if cerr := w.Close(); cerr != nil {
+		t.Fatal(cerr)
+	}
+	return gz.Bytes()
+}
+
+// reconcileDriftSurfaces drives the exact extraction+subtraction chain the
+// trace handler runs (#1317): ExtractScopeDrift / ExtractScopeAmendmentsFolded
+// → subtractPaths over Trigger.ScopeDrift, and ExtractGateEvidence →
+// gateEvidenceForReview over the gate-evidence ScopeFacts. It returns the
+// reconciled drift list and the reconciled gate evidence so a test can assert
+// BOTH review surfaces. On an ExtractScopeAmendmentsFolded error it mirrors the
+// handler's WARN-degrade (folded = nil → no subtraction).
+func reconcileDriftSurfaces(t *testing.T, bundleBytes []byte) ([]string, *prompt.GateEvidence) {
+	t.Helper()
+	scopeDrift, err := bundle.ExtractScopeDrift(bundleBytes)
+	if err != nil {
+		t.Fatalf("ExtractScopeDrift: %v", err)
+	}
+	folded, ferr := bundle.ExtractScopeAmendmentsFolded(bundleBytes)
+	if ferr != nil {
+		// Handler degrade: WARN + subtract nothing.
+		folded = nil
+	}
+	scopeDrift = subtractPaths(scopeDrift, folded)
+	var ge *prompt.GateEvidence
+	if ev, geerr := bundle.ExtractGateEvidence(bundleBytes); geerr == nil {
+		ge = gateEvidenceForReview(ev, folded)
+	} else if !errors.Is(geerr, bundle.ErrNoGateEvidence) {
+		t.Fatalf("ExtractGateEvidence: %v", geerr)
+	}
+	return scopeDrift, ge
+}
+
+func pathsContain(paths []string, p string) bool {
+	for _, x := range paths {
+		if x == p {
+			return true
+		}
+	}
+	return false
+}
+
+func categorizedContains(cat []prompt.GateDriftPath, p string) bool {
+	for _, x := range cat {
+		if x.Path == p {
+			return true
+		}
+	}
+	return false
+}
+
+// TestTraceUpload_FoldedPathSubtractedFromBothSurfaces is the #1317
+// load-bearing cross-boundary test: it constructs a bundle in the runner's
+// wire shape carrying a scope_amendments_folded event for path P alongside a
+// scope_drift event {P, Q} and a gate_evidence event whose ScopeFacts also
+// list {P, Q}, then drives the full backend extraction+subtraction chain and
+// asserts P is removed from BOTH the #695 Trigger.ScopeDrift list and the
+// gate-evidence ScopeFacts, while the co-present non-folded drift path Q is
+// retained in both.
+func TestTraceUpload_FoldedPathSubtractedFromBothSurfaces(t *testing.T) {
+	bundleBytes := buildDriftReconcileBundle(t,
+		[]string{"P.go", "Q.go"},
+		`{"check":"scope_amendments_folded","added":["P.go"]}`,
+		map[string]any{
+			"declared_files":   2,
+			"undeclared_paths": []string{"P.go", "Q.go"},
+			"undeclared_categorized": []map[string]any{
+				{"path": "P.go", "category": "A", "disposition": "excluded_from_commit"},
+				{"path": "Q.go", "category": "B", "disposition": "would_fail_loud"},
+			},
+		},
+	)
+	scopeDrift, ge := reconcileDriftSurfaces(t, bundleBytes)
+
+	// Surface 1: Trigger.ScopeDrift.
+	if pathsContain(scopeDrift, "P.go") {
+		t.Errorf("folded path P.go must be removed from Trigger.ScopeDrift; got %v", scopeDrift)
+	}
+	if !pathsContain(scopeDrift, "Q.go") {
+		t.Errorf("non-folded drift path Q.go must be retained in Trigger.ScopeDrift; got %v", scopeDrift)
+	}
+	// Surface 2: gate-evidence ScopeFacts.
+	if ge == nil || ge.ScopeFacts == nil {
+		t.Fatal("gate evidence ScopeFacts = nil, want populated")
+	}
+	if pathsContain(ge.ScopeFacts.UndeclaredPaths, "P.go") {
+		t.Errorf("folded P.go must be removed from ScopeFacts.UndeclaredPaths; got %v", ge.ScopeFacts.UndeclaredPaths)
+	}
+	if !pathsContain(ge.ScopeFacts.UndeclaredPaths, "Q.go") {
+		t.Errorf("non-folded Q.go must be retained in ScopeFacts.UndeclaredPaths; got %v", ge.ScopeFacts.UndeclaredPaths)
+	}
+	if categorizedContains(ge.ScopeFacts.UndeclaredCategorized, "P.go") {
+		t.Errorf("folded P.go must be removed from UndeclaredCategorized; got %+v", ge.ScopeFacts.UndeclaredCategorized)
+	}
+	if !categorizedContains(ge.ScopeFacts.UndeclaredCategorized, "Q.go") {
+		t.Errorf("non-folded Q.go must be retained in UndeclaredCategorized; got %+v", ge.ScopeFacts.UndeclaredCategorized)
+	}
+}
+
+// TestTraceUpload_ApprovedButUnfoldedPathPreserved is the #1317 binding
+// correctness guard (operator condition): a path U that is approved/amended
+// but NOT present in the scope_amendments_folded event's `added` set — because
+// the runner never folded it (e.g. it was never edited/staged) — remains in
+// BOTH drift surfaces. The subtract set is sourced ONLY from the per-commit
+// fold record, so real drift is never hidden. Here F is the genuinely folded
+// path and U is approved-but-unfolded; only F is subtracted.
+func TestTraceUpload_ApprovedButUnfoldedPathPreserved(t *testing.T) {
+	bundleBytes := buildDriftReconcileBundle(t,
+		[]string{"U.go", "F.go"},
+		`{"check":"scope_amendments_folded","added":["F.go"]}`,
+		map[string]any{
+			"declared_files":   2,
+			"undeclared_paths": []string{"U.go", "F.go"},
+			"undeclared_categorized": []map[string]any{
+				{"path": "U.go", "category": "A", "disposition": "excluded_from_commit"},
+				{"path": "F.go", "category": "A", "disposition": "excluded_from_commit"},
+			},
+		},
+	)
+	scopeDrift, ge := reconcileDriftSurfaces(t, bundleBytes)
+
+	if !pathsContain(scopeDrift, "U.go") {
+		t.Errorf("approved-but-unfolded U.go MUST remain real drift in Trigger.ScopeDrift; got %v", scopeDrift)
+	}
+	if pathsContain(scopeDrift, "F.go") {
+		t.Errorf("folded F.go should be subtracted from Trigger.ScopeDrift; got %v", scopeDrift)
+	}
+	if ge == nil || ge.ScopeFacts == nil {
+		t.Fatal("gate evidence ScopeFacts = nil, want populated")
+	}
+	if !pathsContain(ge.ScopeFacts.UndeclaredPaths, "U.go") {
+		t.Errorf("approved-but-unfolded U.go MUST remain in ScopeFacts.UndeclaredPaths; got %v", ge.ScopeFacts.UndeclaredPaths)
+	}
+	if !categorizedContains(ge.ScopeFacts.UndeclaredCategorized, "U.go") {
+		t.Errorf("approved-but-unfolded U.go MUST remain in UndeclaredCategorized; got %+v", ge.ScopeFacts.UndeclaredCategorized)
+	}
+	if pathsContain(ge.ScopeFacts.UndeclaredPaths, "F.go") {
+		t.Errorf("folded F.go should be subtracted from ScopeFacts.UndeclaredPaths; got %v", ge.ScopeFacts.UndeclaredPaths)
+	}
+}
+
+// TestTraceUpload_FoldedEventAbsentKeepsDrift covers the #1317 degrade branch
+// where no scope_amendments_folded event is present (the ordinary
+// no-amendment case): ExtractScopeAmendmentsFolded returns (nil, nil),
+// subtractPaths is a no-op, and both surfaces keep the original drift — proving
+// real drift is NOT hidden when there is no fold record.
+func TestTraceUpload_FoldedEventAbsentKeepsDrift(t *testing.T) {
+	bundleBytes := buildDriftReconcileBundle(t,
+		[]string{"a.go", "b.go"},
+		"", // no scope_amendments_folded event
+		map[string]any{
+			"declared_files":   1,
+			"undeclared_paths": []string{"a.go", "b.go"},
+		},
+	)
+	scopeDrift, ge := reconcileDriftSurfaces(t, bundleBytes)
+	if !pathsContain(scopeDrift, "a.go") || !pathsContain(scopeDrift, "b.go") {
+		t.Errorf("absent fold event must leave Trigger.ScopeDrift unchanged; got %v", scopeDrift)
+	}
+	if ge == nil || ge.ScopeFacts == nil {
+		t.Fatal("gate evidence ScopeFacts = nil")
+	}
+	if !pathsContain(ge.ScopeFacts.UndeclaredPaths, "a.go") || !pathsContain(ge.ScopeFacts.UndeclaredPaths, "b.go") {
+		t.Errorf("absent fold event must leave ScopeFacts.UndeclaredPaths unchanged; got %v", ge.ScopeFacts.UndeclaredPaths)
+	}
+}
+
+// TestTraceUpload_FoldedEventUnparseableDegrades covers the #1317 degrade
+// branch where the scope_amendments_folded payload is malformed: the extractor
+// surfaces an error, the handler WARN-degrades to folded=nil → no subtraction,
+// and the review still proceeds with the original drift intact (never blocks).
+func TestTraceUpload_FoldedEventUnparseableDegrades(t *testing.T) {
+	bundleBytes := buildDriftReconcileBundle(t,
+		[]string{"a.go", "b.go"},
+		`{"check":"scope_amendments_folded","added":"not-an-array"}`,
+		map[string]any{
+			"declared_files":   1,
+			"undeclared_paths": []string{"a.go", "b.go"},
+		},
+	)
+	// The extractor itself surfaces the parse error (the handler keys its
+	// WARN-degrade off this).
+	if _, err := bundle.ExtractScopeAmendmentsFolded(bundleBytes); err == nil {
+		t.Fatal("ExtractScopeAmendmentsFolded: want a parse error on a malformed payload, got nil")
+	}
+	// The handler's degrade (folded=nil) leaves both surfaces unchanged and
+	// never blocks the review.
+	scopeDrift, ge := reconcileDriftSurfaces(t, bundleBytes)
+	if !pathsContain(scopeDrift, "a.go") || !pathsContain(scopeDrift, "b.go") {
+		t.Errorf("unparseable fold event must degrade to no subtraction on Trigger.ScopeDrift; got %v", scopeDrift)
+	}
+	if ge == nil || ge.ScopeFacts == nil {
+		t.Fatal("gate evidence ScopeFacts = nil")
+	}
+	if !pathsContain(ge.ScopeFacts.UndeclaredPaths, "a.go") || !pathsContain(ge.ScopeFacts.UndeclaredPaths, "b.go") {
+		t.Errorf("unparseable fold event must degrade to no subtraction on ScopeFacts; got %v", ge.ScopeFacts.UndeclaredPaths)
 	}
 }
 
@@ -2694,7 +3007,7 @@ func TestGateEvidenceForReview_PropagatesSuperseded(t *testing.T) {
 			{Command: "scripts/test verify", ExitCode: 0, Outcome: "passed", Superseded: false},
 		},
 	}
-	got := gateEvidenceForReview(ev)
+	got := gateEvidenceForReview(ev, nil)
 	if len(got.VerifyRuns) != 2 {
 		t.Fatalf("VerifyRuns = %d, want 2", len(got.VerifyRuns))
 	}
@@ -2717,7 +3030,7 @@ func TestGateEvidenceForReview_MapsScopeExemptions(t *testing.T) {
 			{Path: "b.go", Reason: "no change needed"},
 		},
 	}
-	got := gateEvidenceForReview(ev)
+	got := gateEvidenceForReview(ev, nil)
 	want := []prompt.GateScopeExemption{
 		{Path: "a.go", Reason: "already correct"},
 		{Path: "b.go", Reason: "no change needed"},
@@ -2732,7 +3045,7 @@ func TestGateEvidenceForReview_MapsScopeExemptions(t *testing.T) {
 	}
 
 	ev.ScopeExemptions = nil
-	if none := gateEvidenceForReview(ev); none.ScopeExemptions != nil {
+	if none := gateEvidenceForReview(ev, nil); none.ScopeExemptions != nil {
 		t.Errorf("nil exemptions input mapped to %+v, want nil", none.ScopeExemptions)
 	}
 }
@@ -2747,7 +3060,7 @@ func TestGateEvidenceForReview_MapsFixupSelfReportDivergence(t *testing.T) {
 			ClaimedVerifyStatus: "passed", ActualVerifyStatus: "failed",
 		},
 	}
-	got := gateEvidenceForReview(ev)
+	got := gateEvidenceForReview(ev, nil)
 	if got.FixupSelfReportDivergence == nil {
 		t.Fatal("FixupSelfReportDivergence mapped to nil, want populated")
 	}
@@ -2757,7 +3070,7 @@ func TestGateEvidenceForReview_MapsFixupSelfReportDivergence(t *testing.T) {
 	}
 
 	ev.FixupSelfReportDivergence = nil
-	if none := gateEvidenceForReview(ev); none.FixupSelfReportDivergence != nil {
+	if none := gateEvidenceForReview(ev, nil); none.FixupSelfReportDivergence != nil {
 		t.Errorf("nil divergence input mapped to %+v, want nil", none.FixupSelfReportDivergence)
 	}
 }
@@ -2820,7 +3133,7 @@ func TestFixupSelfReportDivergence_GateEvidence_EndToEnd(t *testing.T) {
 		t.Fatalf("bundle.GateEvidence.FixupSelfReportDivergence = %+v", ev.FixupSelfReportDivergence)
 	}
 	// Seam 2: bundle.GateEvidence -> prompt.GateEvidence.
-	pe := gateEvidenceForReview(ev)
+	pe := gateEvidenceForReview(ev, nil)
 	// Seam 3: prompt.GateEvidence -> writeGateEvidence-rendered reviewer text.
 	got, err := prompt.Build("implement_review", prompt.Trigger{
 		Repo:         "kuhlman-labs/example",
@@ -2898,7 +3211,7 @@ func TestScopeExemption_GateEvidence_EndToEnd(t *testing.T) {
 		t.Fatalf("bundle.GateEvidence.ScopeExemptions = %+v", ev.ScopeExemptions)
 	}
 	// Seam 2: bundle.GateEvidence -> prompt.GateEvidence.
-	pe := gateEvidenceForReview(ev)
+	pe := gateEvidenceForReview(ev, nil)
 	// Seam 3: prompt.GateEvidence -> writeGateEvidence-rendered reviewer text.
 	got, err := prompt.Build("implement_review", prompt.Trigger{
 		Repo:         "kuhlman-labs/example",

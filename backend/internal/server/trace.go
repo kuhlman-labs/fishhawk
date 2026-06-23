@@ -465,6 +465,38 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 				)
 				scopeDrift = nil
 			}
+			// Reconcile the PRE-fold scope_drift snapshot against the runner's
+			// authoritative per-commit fold record (#1317). When the implement
+			// stage folds an operator-approved mid-stage scope amendment, the
+			// runner emits scope_drift for the amendment path BEFORE folding it,
+			// then later folds it into the pushed HEAD — leaving the drift
+			// snapshot stale. The scope_amendments_folded event carries EXACTLY
+			// the paths the runner folded for this commit, so subtracting it
+			// from the review-presentation surfaces stops the reviewer (and
+			// operator agents) reading a landed path as drift-excluded.
+			//
+			// DELIBERATE Option-A scope (operator decision, #1317): we reconcile
+			// ONLY at the REVIEW-presentation surfaces (this Trigger.ScopeDrift
+			// list and the gate-evidence ScopeFacts below). The raw scope_drift
+			// bundle event / audit entry is intentionally left as the historical
+			// PRE-fold record — it is an event log, not a current-state claim.
+			//
+			// The subtract set is sourced ONLY from the fold record (never from
+			// amendment intent), so an approved-but-NOT-folded path is never in
+			// the event and stays as real drift — real drift is never hidden.
+			// Best-effort, mirroring the ExtractScopeDrift degrade: an extraction
+			// error WARN-logs and subtracts nothing, so the review still proceeds.
+			folded, fierr := bundle.ExtractScopeAmendmentsFolded(bundleBytes)
+			if fierr != nil {
+				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+					"trace upload: extract scope amendments folded failed — proceeding with no fold subtraction",
+					slog.String("run_id", runID.String()),
+					slog.String("stage_id", stageID.String()),
+					slog.String("error", fierr.Error()),
+				)
+				folded = nil
+			}
+			scopeDrift = subtractPaths(scopeDrift, folded)
 			// Extract the bundle's verify_run head_sha as the #797 dedup key
 			// threaded into runImplementReviews. Best-effort: ErrNoHeadSHA
 			// (the no-verify / head_sha-less case) leaves headSHA empty
@@ -494,7 +526,7 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 			// blocks the review.
 			var gateEvidence *prompt.GateEvidence
 			if ev, geerr := bundle.ExtractGateEvidence(bundleBytes); geerr == nil {
-				gateEvidence = gateEvidenceForReview(ev)
+				gateEvidence = gateEvidenceForReview(ev, folded)
 			} else if !errors.Is(geerr, bundle.ErrNoGateEvidence) {
 				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 					"trace upload: extract gate evidence failed — proceeding with no evidence",
@@ -3106,12 +3138,40 @@ func renderDiffForReview(diff policy.Diff) string {
 	return b.String()
 }
 
+// subtractPaths returns a new slice of `paths` with every element present in
+// `remove` dropped, preserving the order of the survivors. It is the single
+// set-difference primitive both #1317 review-surface subtractions use
+// (Trigger.ScopeDrift and the gate-evidence ScopeFacts). A nil/empty `remove`
+// returns `paths` unchanged; a nil `paths` yields nil.
+func subtractPaths(paths, remove []string) []string {
+	if len(remove) == 0 || len(paths) == 0 {
+		return paths
+	}
+	removeSet := make(map[string]struct{}, len(remove))
+	for _, p := range remove {
+		removeSet[p] = struct{}{}
+	}
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if _, ok := removeSet[p]; ok {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
 // gateEvidenceForReview maps the bundle's gate_evidence wire struct into
 // the prompt package's mirror (#963), keeping prompt free of a bundle
 // import — the same boundary pattern renderDiffForReview applies to
 // policy.Diff. Pure field copies; the runner already bounded and
 // redacted every free-text field before packing.
-func gateEvidenceForReview(ev bundle.GateEvidence) *prompt.GateEvidence {
+// folded carries the runner's authoritative per-commit scope_amendments_folded
+// set (#1317); it is subtracted from the ScopeFacts drift surfaces below
+// (UndeclaredPaths + UndeclaredCategorized) for the same review-presentation
+// reconciliation the trace handler applies to Trigger.ScopeDrift. nil/empty
+// folded leaves ScopeFacts byte-identical to the pre-#1317 behavior.
+func gateEvidenceForReview(ev bundle.GateEvidence, folded []string) *prompt.GateEvidence {
 	out := &prompt.GateEvidence{
 		FlakeRetries: ev.FlakeRetries,
 	}
@@ -3137,9 +3197,16 @@ func gateEvidenceForReview(ev bundle.GateEvidence) *prompt.GateEvidence {
 		out.ScopeFacts = &prompt.GateScopeFacts{
 			DeclaredFiles:   ev.ScopeFacts.DeclaredFiles,
 			StagedFiles:     ev.ScopeFacts.StagedFiles,
-			UndeclaredPaths: ev.ScopeFacts.UndeclaredPaths,
+			UndeclaredPaths: subtractPaths(ev.ScopeFacts.UndeclaredPaths, folded),
+		}
+		foldedSet := make(map[string]struct{}, len(folded))
+		for _, p := range folded {
+			foldedSet[p] = struct{}{}
 		}
 		for _, dp := range ev.ScopeFacts.UndeclaredCategorized {
+			if _, ok := foldedSet[dp.Path]; ok {
+				continue
+			}
 			out.ScopeFacts.UndeclaredCategorized = append(out.ScopeFacts.UndeclaredCategorized, prompt.GateDriftPath{
 				Path:        dp.Path,
 				Category:    dp.Category,
