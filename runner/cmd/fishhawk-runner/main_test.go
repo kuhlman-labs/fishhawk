@@ -3832,27 +3832,41 @@ func decomposedChildPromptResp() *upload.FetchedPrompt {
 // implement-stage flag set the sibling tests share.
 func runDecomposedChildStage(t *testing.T, stderr *strings.Builder) int {
 	t.Helper()
-	return run([]string{
+	return runDecomposedChildStageWithBase(t, stderr, "")
+}
+
+// runDecomposedChildStageWithBase drives the same decomposed-child stage but
+// threads --check-base-ref=<baseRef> (the resolved WAVE base #1302 keys the
+// pre-invoke base checkout on). An empty baseRef omits the flag.
+func runDecomposedChildStageWithBase(t *testing.T, stderr *strings.Builder, baseRef string) int {
+	t.Helper()
+	args := []string{
 		"--run-id", "11111111-2222-3333-4444-555555555555",
 		"--backend-url", "https://api.fishhawk.test",
 		"--workflow", "feature_change", "--stage", "implement",
 		"--stage-id", "22222222-3333-4444-5555-666666666666",
 		"--fetch-prompt", "--upload-trace",
-	}, stderr)
+	}
+	if baseRef != "" {
+		args = append(args, "--check-base-ref", baseRef)
+	}
+	return run(args, stderr)
 }
 
-// TestRun_DecomposedChild_EstablishesBaseBeforeAgentInvoke exercises the
-// retained #1036 base-establishment block: IF a child's slice branch is present
-// on the remote (forced here via the remoteBranchExists seam), the runner
-// fetches + checks it out BEFORE the agent is invoked and restores the
-// operator's original ref afterwards. Under ADR-041 (#1141) each child owns a
-// sole-writer slice branch minted once, so this path is dormant in production
-// (the branch never pre-exists — see DecomposedChild_SkipsChildBaseCheckout for
-// the real remoteBranchExists=false case); the block is retained and tested so
-// it stays correct if a future shared-checkout variant re-enables it.
+// TestRun_DecomposedChild_EstablishesBaseBeforeAgentInvoke exercises the #1302
+// wave-base establishment block: IF the resolved WAVE base ref (cfg.checkBaseRef
+// — the consolidated branch for wave N, main for wave 0) is present on the
+// remote (forced here via the remoteBranchExists seam), the runner fetches +
+// checks THAT base out BEFORE the agent is invoked and restores the operator's
+// original ref afterwards. The checkout is keyed on the wave base (--check-base-
+// ref), NOT the child's own sole-writer slice branch — the old slice-branch
+// keying never pre-existed on the remote, silently no-oped, and stranded a
+// dependent slice on main (the #1302 defect). See DecomposedChild_SkipsChildBase-
+// Checkout for the base-absent graceful-skip case.
 func TestRun_DecomposedChild_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
-	withFakeRemoteBranchExists(t, true) // force the retained base-establishment path
+	withFakeRemoteBranchExists(t, true) // force the wave-base establishment path
+	const waveBase = "fishhawk/run-aaaaaaaa/consolidated"
 
 	// Ordered spy: the agent invocation must observe the checkout already
 	// requested.
@@ -3901,22 +3915,25 @@ func TestRun_DecomposedChild_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
 	})
 
 	var stderr strings.Builder
-	if got := runDecomposedChildStage(t, &stderr); got != exitOK {
+	if got := runDecomposedChildStageWithBase(t, &stderr, waveBase); got != exitOK {
 		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
 	}
 
 	if len(order) < 2 || order[0] != "checkout" || order[1] != "invoke" {
-		t.Errorf("order = %v, want the shared-branch checkout BEFORE the agent invocation", order)
+		t.Errorf("order = %v, want the wave-base checkout BEFORE the agent invocation", order)
 	}
-	if gotBranch != "fishhawk/run-aaaaaaaa/slice-0" {
-		t.Errorf("checkout branch = %q, want the child's slice branch", gotBranch)
+	if gotBranch != waveBase {
+		t.Errorf("checkout branch = %q, want the WAVE base %q (not the child's slice branch)", gotBranch, waveBase)
+	}
+	if gotBranch == "fishhawk/run-aaaaaaaa/slice-0" {
+		t.Errorf("checkout keyed on the child's slice branch %q — the #1302 defect; it must key on the wave base", gotBranch)
 	}
 	if gotRemote != gitops.DefaultRemote {
 		t.Errorf("checkout remote = %q, want %q", gotRemote, gitops.DefaultRemote)
 	}
 	for _, want := range []string{
 		`"event":"child_base_established"`,
-		`"branch":"fishhawk/run-aaaaaaaa/slice-0"`,
+		`"branch":"fishhawk/run-aaaaaaaa/consolidated"`,
 		`"head_sha":"shared-branch-tip-sha"`,
 		`"original_ref":"main"`,
 	} {
@@ -3939,15 +3956,18 @@ func TestRun_DecomposedChild_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
 	}
 }
 
-// TestRun_DecomposedChild_SkipsChildBaseCheckout is the production case under
-// ADR-041 (#1141): a child's sole-writer slice branch never pre-exists on the
-// remote (remoteBranchExists=false), so the pre-invoke base-establishment
-// checkout must not fire — the child runs against the operator's base-branch
-// checkout, cutting its slice fresh from base.
+// TestRun_DecomposedChild_SkipsChildBaseCheckout is the base-absent per-failure-
+// mode (#1302): the resolved wave base ref is NOT present on the remote (a never-
+// pushed main, or an empty consolidated when GitHub is not wired — forced here
+// via remoteBranchExists=false), so the pre-invoke base-establishment checkout
+// must gracefully SKIP — the child runs against the worktree's ambient HEAD (no
+// runner_failed) and the agent is still invoked, degrading to today's behavior
+// rather than failing the stage.
 func TestRun_DecomposedChild_SkipsChildBaseCheckout(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
-	withFakeRemoteBranchExists(t, false) // slice branch never pre-exists
-	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	withFakeRemoteBranchExists(t, false) // wave base absent on the remote
+	inv := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, inv)
 	fu := newFakeUploader(t)
 	fu.promptResp = decomposedChildPromptResp()
 	withFakeUploader(t, fu)
@@ -3962,22 +3982,31 @@ func TestRun_DecomposedChild_SkipsChildBaseCheckout(t *testing.T) {
 	t.Cleanup(func() { checkoutChildBase = origCheckout })
 
 	var stderr strings.Builder
-	if got := runDecomposedChildStage(t, &stderr); got != exitOK {
+	if got := runDecomposedChildStageWithBase(t, &stderr, "fishhawk/run-aaaaaaaa/consolidated"); got != exitOK {
 		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
 	}
 	if checkoutCalled {
-		t.Error("checkoutChildBase called for the FIRST child — no shared branch exists, the checkout must be skipped")
+		t.Error("checkoutChildBase called when the wave base is absent on the remote — the checkout must gracefully skip")
 	}
 	if strings.Contains(stderr.String(), `"event":"child_base_established"`) {
-		t.Errorf("first child emitted child_base_established:\n%s", stderr.String())
+		t.Errorf("emitted child_base_established despite the absent wave base:\n%s", stderr.String())
+	}
+	// Graceful degrade: the agent still ran (against ambient HEAD) and the
+	// stage did NOT fail.
+	if inv.gotInv == nil {
+		t.Error("agent was not invoked — a base-absent skip must still run the agent against ambient HEAD")
+	}
+	if strings.Contains(stderr.String(), `"event":"runner_failed"`) {
+		t.Errorf("base-absent skip emitted runner_failed — it must degrade silently:\n%s", stderr.String())
 	}
 }
 
-// TestRun_DecomposedChild_CheckoutFailure_FailsBeforeAgentInvoke: when the
-// retained base-establishment block fires (slice branch present, forced via the
-// seam) and the slice-branch checkout fails (fetch auth, force-checkout error),
-// the runner must fail fast — the agent is NEVER invoked, no agent turns are
-// spent, and the failure names the child_base_checkout reason.
+// TestRun_DecomposedChild_CheckoutFailure_FailsBeforeAgentInvoke is the
+// checkout-error per-failure-mode (#1302): when the wave-base establishment
+// block fires (base present on the remote, forced via the seam) and the wave-
+// base checkout fails (fetch auth, force-checkout error), the runner must fail
+// fast — the agent is NEVER invoked, no agent turns are spent, and the failure
+// names the child_base_checkout reason.
 func TestRun_DecomposedChild_CheckoutFailure_FailsBeforeAgentInvoke(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	withFakeRemoteBranchExists(t, true)
@@ -4083,13 +4112,17 @@ func TestRun_ImplementStage_DecomposedChild_NoChanges_ReportsFailedCategoryC(t *
 }
 
 // TestRun_ImplementStage_DecomposedChild_NoChanges_DependentSlice_ReportsActionableC
-// drives the same no-changes decomposed-child path with runSliceIndex=2 (a
-// dependent slice). The terminalization contract is unchanged (outcome failed,
-// category C, literal child_no_changes token), but the reason is now the
-// position-aware dependent-slice diagnostic: it must convey the FULL predecessor
-// set (slices 0..1) and name the fishhawk_consolidate_slices recovery (#1258
-// slice C / #1279, condition 1). The log event carries the additive
-// "slice_index":2 field.
+// is the BINDING-CONDITION behavioral test (#1302): it drives the
+// implement_child_no_changes branch end to end with runSliceIndex=2 (a dependent
+// slice) and pins that reportPullRequestFailure terminalizes the stage with
+// category "C" — so fishhawk_retry_stage is genuinely applicable on the child,
+// closing the issue-evidence-vs-code-trace gap (the #1302 evidence run observed a
+// stale succeeded/422 from a partially-deployed binary). The reason is the
+// position-aware dependent-slice diagnostic: it conveys the FULL predecessor set
+// (slices 0..1) and names the WORKING recovery verbs (fishhawk_retry_stage then
+// fishhawk_run_children), and must NOT name fishhawk_consolidate_slices (which
+// returns 409 children_failed while this child is failed). The log event carries
+// the additive "slice_index":2 field.
 func TestRun_ImplementStage_DecomposedChild_NoChanges_DependentSlice_ReportsActionableC(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
 	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
@@ -4117,19 +4150,26 @@ func TestRun_ImplementStage_DecomposedChild_NoChanges_DependentSlice_ReportsActi
 		t.Errorf("report outcome = %q, want %q", fu.gotPRArgs.Outcome, "failed")
 	}
 	if fu.gotPRArgs.Category != "C" {
-		t.Errorf("report category = %q, want %q (retryable)", fu.gotPRArgs.Category, "C")
+		t.Errorf("report category = %q, want %q (retryable — fishhawk_retry_stage applies)", fu.gotPRArgs.Category, "C")
 	}
 	// The literal token + category C are load-bearing on BOTH branches
 	// (condition 2). The dependent-slice reason additionally conveys the FULL
-	// predecessor SET (slices 0 and 1, i.e. 0..1) and the consolidate recovery.
+	// predecessor SET (slices 0 and 1, i.e. 0..1) and the WORKING recovery verbs.
 	for _, want := range []string{
 		"child_no_changes",
 		"0..1",
-		"fishhawk_consolidate_slices",
+		"fishhawk_retry_stage",
+		"fishhawk_run_children",
 	} {
 		if !strings.Contains(fu.gotPRArgs.Reason, want) {
-			t.Errorf("report reason = %q, want it to contain %q (full predecessor set + recovery)", fu.gotPRArgs.Reason, want)
+			t.Errorf("report reason = %q, want it to contain %q (full predecessor set + working recovery)", fu.gotPRArgs.Reason, want)
 		}
+	}
+	// consolidate appears ONLY as an explicit prohibition (it returns 409
+	// children_failed while this child is failed), never as the recommended
+	// recovery (#1302 Defect 2).
+	if !strings.Contains(fu.gotPRArgs.Reason, "Do NOT call fishhawk_consolidate_slices") {
+		t.Errorf("report reason = %q, want fishhawk_consolidate_slices steered away as a prohibition, not recommended", fu.gotPRArgs.Reason)
 	}
 	for _, want := range []string{
 		`"event":"implement_child_no_changes"`,
@@ -4143,12 +4183,15 @@ func TestRun_ImplementStage_DecomposedChild_NoChanges_DependentSlice_ReportsActi
 	}
 }
 
-// TestChildNoChangesReason is a focused unit table over the pure helper,
-// isolating each branch's distinct text from the stage-driving harness (#1258
-// slice C / #1279). Every index keeps the always-present child_no_changes token
-// (condition 2); slice 0 keeps the planning/decomposition-error framing
-// (condition 3); slices >0 convey the full predecessor set 0..N-1 and the
-// consolidate recovery (condition 1).
+// TestChildNoChangesReason is the done-means unit table over the pure helper
+// (#1302 Defect 2): the rendered recovery text is not enforced by compilation,
+// so pin each branch's verbs. Every index keeps the always-present
+// child_no_changes token; slice 0 keeps the planning/decomposition-error
+// framing; slices >0 convey the full predecessor set 0..N-1 and the WORKING
+// recovery verbs (fishhawk_retry_stage then fishhawk_run_children) and names
+// fishhawk_consolidate_slices ONLY as a prohibition (it returns 409
+// children_failed while the child is failed), never as the recommended
+// recovery. The slice-0 text is unchanged from before.
 func TestChildNoChangesReason(t *testing.T) {
 	for _, tc := range []struct {
 		sliceIndex int
@@ -4164,10 +4207,14 @@ func TestChildNoChangesReason(t *testing.T) {
 			t.Errorf("index %d: reason = %q, want the always-present child_no_changes token", tc.sliceIndex, reason)
 		}
 		if tc.dependent {
-			for _, want := range []string{tc.predSet, "fishhawk_consolidate_slices"} {
+			for _, want := range []string{tc.predSet, "fishhawk_retry_stage", "fishhawk_run_children"} {
 				if !strings.Contains(reason, want) {
 					t.Errorf("index %d: reason = %q, want dependent-slice framing to contain %q", tc.sliceIndex, reason, want)
 				}
+			}
+			// consolidate is named ONLY as a prohibition, never recommended.
+			if !strings.Contains(reason, "Do NOT call fishhawk_consolidate_slices") {
+				t.Errorf("index %d: reason = %q, want fishhawk_consolidate_slices steered away as a prohibition", tc.sliceIndex, reason)
 			}
 			if strings.Contains(reason, "planning/decomposition error") {
 				t.Errorf("index %d: reason = %q, dependent slice must not use the planning-error framing", tc.sliceIndex, reason)
@@ -4176,8 +4223,12 @@ func TestChildNoChangesReason(t *testing.T) {
 			if !strings.Contains(reason, "planning/decomposition error") {
 				t.Errorf("index %d: reason = %q, want the slice-0 planning/decomposition-error framing", tc.sliceIndex, reason)
 			}
-			if strings.Contains(reason, "fishhawk_consolidate_slices") {
-				t.Errorf("index %d: reason = %q, slice 0 must not name the dependent-slice recovery", tc.sliceIndex, reason)
+			// slice 0 has no predecessor, so it names neither recovery verb nor
+			// the consolidate prohibition.
+			for _, absent := range []string{"fishhawk_retry_stage", "fishhawk_run_children", "fishhawk_consolidate_slices"} {
+				if strings.Contains(reason, absent) {
+					t.Errorf("index %d: reason = %q, slice 0 must not name the dependent-slice recovery verb %q", tc.sliceIndex, reason, absent)
+				}
 			}
 		}
 	}

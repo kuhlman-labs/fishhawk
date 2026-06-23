@@ -11,6 +11,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 )
 
 // Per-run working-tree isolation — cross-layer integration test (E22.X / #1137).
@@ -616,4 +619,169 @@ func gitPorcelainHead(t *testing.T, dir string) string {
 		t.Fatalf("git rev-parse HEAD: %v", err)
 	}
 	return out
+}
+
+// decomposedWaveBaseRepo builds the #1302 cross-boundary fixture with REAL git:
+// a bare origin carrying `main` (base.txt) plus a separate consolidated-stand-in
+// branch that ALSO carries predecessor.go (absent on main), and an operator
+// clone checked out on main with remote-tracking refs for BOTH branches (so the
+// production remoteBranchExists guard and gitops.CheckoutRemoteBranch fetch
+// resolve the consolidated base). Returns the operator checkout dir, its main
+// HEAD sha, and the consolidated branch name.
+func decomposedWaveBaseRepo(t *testing.T) (operatorRepo, mainSHA, consolidatedBranch string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	const consolidated = "fishhawk/run-aaaaaaaa/consolidated"
+	mustGit := func(dir string, args ...string) {
+		if err := runGitErr(dir, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Author main + the consolidated stand-in in a seed working repo.
+	seed := t.TempDir()
+	mustGit(seed, "init", "-q")
+	if err := os.WriteFile(filepath.Join(seed, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(seed, "add", "-A")
+	mustGit(seed, "commit", "-q", "-m", "base on main")
+	mustGit(seed, "branch", "-M", "main")
+	// The consolidated branch carries a predecessor slice's NEW symbol file that
+	// a dependent slice's agent must SEE to compile (#1302).
+	mustGit(seed, "checkout", "-q", "-b", consolidated)
+	if err := os.WriteFile(filepath.Join(seed, "predecessor.go"),
+		[]byte("package fixture\n\n// Predecessor is a symbol a dependent slice references.\nfunc Predecessor() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(seed, "add", "-A")
+	mustGit(seed, "commit", "-q", "-m", "predecessor slice merged onto consolidated")
+	mustGit(seed, "checkout", "-q", "main")
+
+	// Publish both branches to a bare origin and pin its HEAD to main, then
+	// clone so the operator checkout gets origin + tracking refs for both.
+	bare := filepath.Join(t.TempDir(), "origin.git")
+	mustGit(seed, "init", "--bare", "-q", bare)
+	mustGit(seed, "remote", "add", "origin", bare)
+	mustGit(seed, "push", "-q", "origin", "main", consolidated)
+	mustGit(bare, "symbolic-ref", "HEAD", "refs/heads/main")
+
+	operator := filepath.Join(t.TempDir(), "operator")
+	mustGit(seed, "clone", "-q", bare, operator)
+
+	sha, err := runGitOut(operator, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return operator, sha, consolidated
+}
+
+// TestRun_DecomposedChild_WaveBaseCheckout_CrossBoundary is the load-bearing
+// git-real cross-boundary test for #1302 (the worktree layer <-> agent-invoke
+// base seam that the MCP fake-spawn tests cannot reach). It drives a REAL
+// decomposed-child implement stage against a real bare origin with
+// --check-base-ref=<consolidated>, keeping the production checkoutChildBase +
+// remoteBranchExists + capture/restore seams live, and asserts:
+//
+//   - the provisioned worktree CONTAINS predecessor.go (the consolidated stand-
+//     in) BEFORE the agent is invoked — proving the agent sees its predecessors'
+//     integrated symbols. Under the pre-#1302 slice-branch keying the checkout
+//     targeted fishhawk/run-aaaaaaaa/slice-N (never on the remote), silently
+//     no-oped, and this file would be ABSENT — i.e. this test fails on the old
+//     code, pinning the exact #1302 defect; and
+//   - the worktree's HEAD is RESTORED to the operator's original ref afterward
+//     (off the consolidated branch), and the operator checkout stays clean.
+func TestRun_DecomposedChild_WaveBaseCheckout_CrossBoundary(t *testing.T) {
+	operator, mainSHA, consolidated := decomposedWaveBaseRepo(t)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+
+	// Capture the worktree state the agent observes. No mirroring — we want to
+	// read the REAL checked-out tree the runner established.
+	var (
+		sawPredecessor bool
+		invokeWorktree string
+		invokeHEAD     string
+	)
+	withFakeInvoker(t, &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(_ int, inv agent.Invocation) {
+			invokeWorktree = inv.WorkingDir
+			if _, err := os.Stat(filepath.Join(inv.WorkingDir, "predecessor.go")); err == nil {
+				sawPredecessor = true
+			}
+			invokeHEAD, _ = runGitOut(inv.WorkingDir, "rev-parse", "HEAD")
+		},
+	})
+
+	fu := newFakeUploader(t)
+	fu.promptResp = decomposedChildPromptResp()
+	withFakeUploader(t, fu)
+
+	// Swap only the push/PR egress to fakes — the agent makes no edits, so the
+	// child no-changes path terminalizes the stage. The base-checkout, capture,
+	// and restore seams stay PRODUCTION (real git) so this exercises the actual
+	// #1302 defect end to end against the worktree.
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base"}}
+	origPusher, origOpener := newPusher, newPROpener
+	newPusher = func() pusher { return fp }
+	newPROpener = func(string) prOpener { return &fakePROpener{} }
+	t.Cleanup(func() { newPusher = origPusher; newPROpener = origOpener })
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--working-dir", operator,
+		"--check-base-ref", consolidated,
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	// (1) The predecessor's symbol file was present in the worktree BEFORE the
+	// agent invoke — the agent could compile against it. This is the assertion
+	// that FAILS on the pre-#1302 slice-branch keying.
+	if !sawPredecessor {
+		t.Errorf("predecessor.go absent from the worktree at agent invoke — the dependent slice's agent could not see the consolidated base (#1302).\nstderr:\n%s", stderr.String())
+	}
+	if invokeWorktree == "" {
+		t.Fatal("agent invoke did not record a worktree path")
+	}
+	// The worktree was on the consolidated base at invoke time, not still on main.
+	if invokeHEAD == mainSHA {
+		t.Errorf("worktree HEAD at invoke = %q (still main) — the wave-base checkout did not move it onto the consolidated base", invokeHEAD)
+	}
+
+	// (2) The worktree was restored to the operator's original ref afterward —
+	// it is no longer parked on the consolidated branch.
+	restored, err := runGitOut(invokeWorktree, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse worktree HEAD after run: %v", err)
+	}
+	if restored != mainSHA {
+		t.Errorf("worktree HEAD after run = %q, want the restored original ref %q (off the consolidated base)", restored, mainSHA)
+	}
+
+	// The operator's own checkout never moved and stays clean.
+	if head := gitPorcelainHead(t, operator); head != mainSHA {
+		t.Errorf("operator HEAD moved: %q, want %q", head, mainSHA)
+	}
+	if status := gitPorcelain(t, operator); status != "" {
+		t.Errorf("operator git status not clean after the run:\n%s", status)
+	}
+
+	// The structured base-establishment record names the consolidated WAVE base.
+	for _, want := range []string{
+		`"event":"child_base_established"`,
+		`"branch":"` + consolidated + `"`,
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("missing %s in run output:\n%s", want, stderr.String())
+		}
+	}
 }
