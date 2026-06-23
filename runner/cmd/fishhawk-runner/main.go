@@ -74,6 +74,13 @@ var newInvoker = func(apiKey string) agent.Invoker {
 	return claudecode.New(apiKey)
 }
 
+// deriveStructuredOutputSchema is the seam that produces the plan-stage
+// structured-output schema (#1325). Production wiring derives it at runtime
+// from the embedded canonical standard_v1 schema; tests reassign it to force
+// the derivation-error path and assert the runner degrades gracefully to an
+// UNCONSTRAINED invocation rather than failing the plan stage.
+var deriveStructuredOutputSchema = plan.StructuredOutputSchema
+
 // uploadClient is the test seam for the backend HTTP client.
 // Tests substitute a fake to drive ShipTrace / IssueKey / FetchPrompt
 // without standing up an httptest.Server.
@@ -533,6 +540,33 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		ProgressSink: logSink,
 	}
 
+	// Constrain the plan-stage agent's standard_v1 artifact to the canonical
+	// schema's SHAPE via the claude CLI --json-schema structured-output flag
+	// (#1325), so a schema-invalid plan shape becomes (near-)impossible rather
+	// than the auto-retried norm. Populated ONLY for the plan stage (the same
+	// gate the post-invoke plan handling uses: a plan-out path on a non-
+	// implement/non-review stage); empty stageType (local replay without
+	// --fetch-prompt) preserves the historical --plan-out-driven behavior.
+	//
+	// NOTE: inv.JSONSchema (and the captured Result.StructuredOutput it
+	// produces) are honored ONLY by the claudecode backend; on any other
+	// backend they are a documented graceful no-op — the field is ignored and
+	// StructuredOutput stays nil, so the run falls through to TryCoerce+validate.
+	//
+	// Graceful degradation (#1325): if the derivation errors (a malformed
+	// embedded schema, an unresolvable $ref, or a future unsupported keyword),
+	// log and leave inv.JSONSchema empty — proceed UNCONSTRAINED rather than
+	// hard-fail the stage. The TryCoerce+validate path remains the fallback.
+	if cfg.planOut != "" && stageType != "implement" && stageType != "review" {
+		if schema, derr := deriveStructuredOutputSchema(); derr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"plan_schema_derive_failed","run_id":%q,"detail":%q}`+"\n",
+				cfg.runID, derr.Error())
+		} else {
+			inv.JSONSchema = string(schema)
+		}
+	}
+
 	// E19.8 / #348: mint a short-lived MCP token for the agent and
 	// layer it onto the invocation env. Best-effort — if the token
 	// fetch fails we log and continue. The agent loses Fishhawk
@@ -987,23 +1021,40 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// the historical behavior: operator's --plan-out flag drives
 		// validation directly.
 		if res.OK && cfg.planOut != "" && stageType != "implement" && stageType != "review" {
+			// Adoption precedence (#1325): clarification(file) > structured_output
+			// > agent-written file, then the existing TryCoerce+validate gate.
 			if isClarif, ev := detectClarificationRequest(cfg.planOut); isClarif {
-				// The planner parked: it emitted a clarification_request sibling
+				// (1) The planner parked: it emitted a clarification_request sibling
 				// (#1057) instead of a plan because the issue is not yet
-				// plannable. It is NOT a plan, so skip plan-schema validation
+				// plannable. Clarification ALWAYS wins — ignore any
+				// structured_output the (schema-constrained) invocation may also
+				// have produced. It is NOT a plan, so skip plan-schema validation
 				// (which would wrongly demote it to category-B) and leave res.OK
 				// true. uploadPlan ships the bytes as-is; the backend ingests the
 				// sibling, persists it, and parks the stage at awaiting_input.
 				res.Events = append(res.Events, ev)
-			} else if ev, demote := validatePlan(cfg.planOut); demote != nil {
-				res.Events = append(res.Events, ev)
-				res.OK = false
-				res.FailureCategory = "B"
-				res.FailureReason = demote.Error()
-				invokeErr = demote
-				planValidationFailed = true
 			} else {
-				res.Events = append(res.Events, ev)
+				// (2) structured_output present: overwrite the plan-out file with
+				// the schema-guaranteed bytes so uploadPlan ships them and the
+				// validate gate runs against them (now rarely tripped). Best-effort
+				// — a write failure logs via the returned event and leaves the
+				// agent-written file in place, degrading to branch (3).
+				if len(res.StructuredOutput) > 0 {
+					res.Events = append(res.Events, adoptStructuredOutput(cfg.planOut, res.StructuredOutput))
+				}
+				// (3) Run the existing TryCoerce+validate path against whatever now
+				// sits at cfg.planOut (the adopted structured_output, or the
+				// agent-written file when structured_output was absent).
+				if ev, demote := validatePlan(cfg.planOut); demote != nil {
+					res.Events = append(res.Events, ev)
+					res.OK = false
+					res.FailureCategory = "B"
+					res.FailureReason = demote.Error()
+					invokeErr = demote
+					planValidationFailed = true
+				} else {
+					res.Events = append(res.Events, ev)
+				}
 			}
 		}
 
@@ -2535,6 +2586,31 @@ func detectClarificationRequest(path string) (bool, agent.Event) {
 			"check":   "plan_validation",
 			"outcome": "clarification_request",
 			"path":    path,
+		}),
+	}
+}
+
+// adoptStructuredOutput overwrites the plan-out file with the schema-guaranteed
+// structured_output bytes captured from the agent's terminal result event
+// (#1325), so the subsequent uploadPlan ships them and validatePlan runs against
+// them. Returns a policy_event recording the adoption. On a write failure it
+// returns an event noting the failure and leaves the agent-written file in
+// place — the caller's validate path then runs against whatever the agent wrote
+// (today's fallback), so a write fault degrades rather than failing the stage.
+func adoptStructuredOutput(path string, out []byte) agent.Event {
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		return agent.Event{
+			Kind: "policy_event",
+			Payload: agent.MakePayload(map[string]string{
+				"check": "plan_validation", "outcome": "structured_output_write_failed",
+				"path": path, "error": err.Error(),
+			}),
+		}
+	}
+	return agent.Event{
+		Kind: "policy_event",
+		Payload: agent.MakePayload(map[string]string{
+			"check": "plan_validation", "outcome": "structured_output_adopted", "path": path,
 		}),
 	}
 }

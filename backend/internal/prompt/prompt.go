@@ -1299,6 +1299,9 @@ func buildPlan(t Trigger) string {
 		"Write it as a single JSON object to the SAME path (")
 	b.WriteString(PlanArtifactPath)
 	b.WriteString(") INSTEAD of a plan; the runner routes the artifact by its top-level \"kind\":\n")
+	b.WriteString("NOTE: the structured-output channel constrains the PLAN artifact only. " +
+		"To PARK you MUST still write the clarification_request to " + PlanArtifactPath + " as instructed here — " +
+		"that file is what the runner routes on, and you may leave the structured-output plan unfilled when parking.\n")
 	b.WriteString("- kind: \"clarification_request\" (REQUIRED discriminator; do NOT also set plan_version)\n")
 	b.WriteString("- ticket_reference, generated_by: same shape as the plan artifact\n")
 	b.WriteString("- summary: one paragraph on why the issue is not yet plannable (the lead line of the operator ping)\n")

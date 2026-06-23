@@ -67,6 +67,20 @@ type Invocation struct {
 	// byte-for-byte. Adapters MUST treat empty as "omit the flag".
 	Model string
 
+	// JSONSchema is an optional structured-output schema (#1325): the verbatim
+	// JSON Schema text the agent's terminal output must conform to. When
+	// non-empty the claudecode adapter passes it to the CLI's --json-schema
+	// flag, which constrains the model's structured_output object and surfaces
+	// it on Result.StructuredOutput. The runner populates this ONLY for the
+	// plan stage (with a CLI-subset-compatible derivation of the standard_v1
+	// schema) so a schema-invalid plan SHAPE becomes (near-)impossible rather
+	// than the auto-retried norm. An EMPTY value appends NO flag, so the spawn
+	// is byte-identical to today's behavior — the feature is gated entirely on
+	// this field being non-empty. Honored only by the claudecode backend; a
+	// documented graceful no-op on any other backend (the field is ignored and
+	// StructuredOutput stays nil).
+	JSONSchema string
+
 	// ProgressSink receives single-line JSON stage_progress
 	// heartbeats emitted at a fixed cadence during the invocation
 	// (#580). Each line is a complete `{"event":"stage_progress",...}`
@@ -137,6 +151,18 @@ type Result struct {
 	// (G6): the same model id keys pricing.Cost and is recorded on
 	// the run/audit trail. Empty when the agent didn't surface it.
 	Model string
+
+	// StructuredOutput is the schema-guaranteed object the agent emitted
+	// when the invocation carried a structured-output schema (#1325): the
+	// raw JSON bytes of the terminal result event's top-level
+	// `structured_output` field. The runner adopts it as the plan artifact
+	// when present. NIL when the invocation carried no JSONSchema, the
+	// backend does not support structured output, or the model did not /
+	// could not conform — which is the documented fallback trigger (the
+	// runner then keeps the agent-written file and runs the
+	// TryCoerce+validate path). Only the claudecode backend ever populates
+	// this.
+	StructuredOutput []byte
 }
 
 // Event is one entry in the captured trace. Kind is the discriminant

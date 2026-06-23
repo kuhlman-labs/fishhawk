@@ -577,6 +577,31 @@ func TestBuild_Plan_PerFailureModeTestRule(t *testing.T) {
 	}
 }
 
+// TestBuild_Plan_StructuredOutputParkViaFile pins the defensive sentence
+// (#1325): the structured-output channel constrains the PLAN artifact only, so
+// to PARK the planner must still write the clarification_request to the plan
+// artifact path. Guards the clarification path against the structured-output
+// tool nudging toward always emitting a plan.
+func TestBuild_Plan_StructuredOutputParkViaFile(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "Plan a refactor",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"structured-output channel constrains the PLAN artifact only",
+		"To PARK you MUST still write the clarification_request to " + PlanArtifactPath,
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing structured-output park-via-file sentence %q\n---\n%s", w, got)
+		}
+	}
+}
+
 func TestBuild_Plan_BudgetHintWithTimeouts(t *testing.T) {
 	got, err := Build("plan", Trigger{
 		IssueNumber:           7,

@@ -161,6 +161,14 @@ func TestHelperProcess(t *testing.T) {
 			time.Sleep(5 * time.Millisecond)
 		}
 		time.Sleep(500 * time.Millisecond)
+	case "structured_output":
+		// A captured-shape stream-json transcript whose terminal result event
+		// carries a top-level structured_output object conforming to the passed
+		// --json-schema (#1325). The harness must capture those exact bytes onto
+		// Result.StructuredOutput.
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		fmt.Println(`{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}`)
+		fmt.Println(`{"type":"result","usage":{"input_tokens":3,"output_tokens":4},"structured_output":{"plan_version":"standard_v1","summary":"hi"}}`)
 	case "echo_env":
 		// Echo a single env var so we can assert the harness
 		// wired API key forwarding correctly.
@@ -268,6 +276,66 @@ func TestInvoke_ModelFlag(t *testing.T) {
 			t.Fatalf("expected NO --model flag for empty model, got %v", captured)
 		}
 	})
+}
+
+// TestInvoke_JSONSchemaFlag asserts the structured-output gate (#1325): a
+// non-empty Invocation.JSONSchema appends `--json-schema <schema>`; an empty
+// JSONSchema appends NO such flag (byte-identical to today's spawn).
+func TestInvoke_JSONSchemaFlag(t *testing.T) {
+	t.Run("non-empty schema appends --json-schema with the schema text", func(t *testing.T) {
+		var captured []string
+		inv := &Invoker{Cmd: capturingHelperCommand(&captured), Now: frozenNow()}
+		schema := `{"type":"object","required":["plan_version"]}`
+		if _, err := inv.Invoke(context.Background(), agent.Invocation{Prompt: "p", JSONSchema: schema}); err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		if !argsHaveFlagValue(captured, "--json-schema", schema) {
+			t.Fatalf("expected --json-schema %q in args, got %v", schema, captured)
+		}
+	})
+	t.Run("empty schema omits --json-schema (byte-identical spawn)", func(t *testing.T) {
+		var captured []string
+		inv := &Invoker{Cmd: capturingHelperCommand(&captured), Now: frozenNow()}
+		if _, err := inv.Invoke(context.Background(), agent.Invocation{Prompt: "p"}); err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		if argsHaveFlag(captured, "--json-schema") {
+			t.Fatalf("expected NO --json-schema flag for empty JSONSchema, got %v", captured)
+		}
+	})
+}
+
+// TestInvoke_CapturesStructuredOutput pins the capture path (#1325): the terminal
+// result event's top-level structured_output object is surfaced verbatim on
+// Result.StructuredOutput. If the CLI ever stops emitting it, this fixture-driven
+// test fails.
+func TestInvoke_CapturesStructuredOutput(t *testing.T) {
+	inv := &Invoker{Cmd: helperCommand("structured_output"), Now: frozenNow()}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{Prompt: "p", JSONSchema: `{"type":"object"}`})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false; FailureReason = %q", res.FailureReason)
+	}
+	want := `{"plan_version":"standard_v1","summary":"hi"}`
+	if string(res.StructuredOutput) != want {
+		t.Errorf("StructuredOutput = %q, want %q", res.StructuredOutput, want)
+	}
+}
+
+// TestInvoke_NoStructuredOutputWhenAbsent asserts the fallback trigger: a normal
+// transcript with no structured_output field leaves Result.StructuredOutput nil,
+// so the runner falls through to the agent-written-file path.
+func TestInvoke_NoStructuredOutputWhenAbsent(t *testing.T) {
+	inv := &Invoker{Cmd: helperCommand("happy"), Now: frozenNow()}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{Prompt: "p"})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if res.StructuredOutput != nil {
+		t.Errorf("StructuredOutput = %q, want nil when the result event carries none", res.StructuredOutput)
+	}
 }
 
 // frozenNow returns a Now() that ticks deterministically so tests
