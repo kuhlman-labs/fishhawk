@@ -834,6 +834,56 @@ func TestRunChildren_SliceConflictStopsLoop(t *testing.T) {
 	}
 }
 
+// TestRunChildren_IntegrateWaveTransportErrorStopsLoop (verification mode 11b):
+// a transport error from integrate-wave (the apiClient.IntegrateWave ierr != nil
+// branch, distinct from the slice_conflict decoded-outcome branch) stops the loop
+// — wave 1 is not dispatched — and the transport error is surfaced as a warning
+// rather than hard-failing runChildren. Setting the fakeBackend's integrateWaveStatus
+// to 502 routes through the production client.go do/doWithStatus *apiError path, so
+// the real IntegrateWave error surface is exercised rather than a mocked error.
+func TestRunChildren_IntegrateWaveTransportErrorStopsLoop(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child0, child1 := uuid.New(), uuid.New()
+	seedChildRun(fb, child0, "pending")
+	seedChildRun(fb, child1, "pending")
+	seedPlanDecomposedWaves(fb, parent, []string{child0.String(), child1.String()}, 0, [][]int{{0}, {1}})
+
+	// A non-2xx status makes apiClient.IntegrateWave return an *apiError (ierr != nil).
+	// Deliberately do NOT seed integrateWaveResp: on the status-code error path the
+	// decoded body is irrelevant — the contrast with the slice_conflict test.
+	fb.mu.Lock()
+	fb.integrateWaveStatus = http.StatusBadGateway
+	fb.mu.Unlock()
+
+	spawn, baseByID, mu := captureBaseSpawn(nil)
+	withFakeSpawn(t, spawn)
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v (transport error must surface as a warning, not a hard error)", err)
+	}
+	if out.DispatchedCount != 1 {
+		t.Errorf("dispatched_count = %d, want 1 (wave 1 not dispatched after a transport error)", out.DispatchedCount)
+	}
+	mu.Lock()
+	_, child1Ran := baseByID[child1.String()]
+	mu.Unlock()
+	if child1Ran {
+		t.Error("wave-1 child dispatched despite an integrate-wave transport error; the loop did not stop")
+	}
+	if !containsWarning(out.Warnings, "integrate-wave after wave") {
+		t.Errorf("warnings = %v, want one mentioning the failed integrate-wave", out.Warnings)
+	}
+	if !containsWarning(out.Warnings, "stopping before the next wave") {
+		t.Errorf("warnings = %v, want the transport-error branch wording (distinct from slice conflict)", out.Warnings)
+	}
+}
+
 // TestRunChildren_EmptyConsolidatedBranchKeepsBase (verification mode 12): an
 // empty consolidated_branch from integrate-wave (the GitHub-not-wired graceful
 // skip) leaves the next wave's --base-branch unchanged (main) and warns rather
