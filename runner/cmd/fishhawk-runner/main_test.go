@@ -1061,6 +1061,304 @@ func TestRun_PlanValidationOK(t *testing.T) {
 	}
 }
 
+// coerceNeedingPlanJSON returns a standard_v1 plan whose scope.files entries
+// are BARE STRINGS — the #537 string-elision class TryCoerce repairs — so a
+// test can assert the fallback coerce+validate path runs and accepts the plan.
+func coerceNeedingPlanJSON() string {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["scope"] = map[string]any{"files": []any{"a.go"}}
+	})
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		panic("coerceNeedingPlanJSON marshal: " + err.Error())
+	}
+	return string(b)
+}
+
+// withDeriveSchemaError swaps the plan-stage structured-output schema derivation
+// for one that errors, so a test can exercise the graceful-degradation branch
+// (#1325): the runner must proceed UNCONSTRAINED rather than fail the stage.
+func withDeriveSchemaError(t *testing.T, derr error) {
+	t.Helper()
+	orig := deriveStructuredOutputSchema
+	deriveStructuredOutputSchema = func() ([]byte, error) { return nil, derr }
+	t.Cleanup(func() { deriveStructuredOutputSchema = orig })
+}
+
+func bundleHasPolicyOutcome(events []bundle.Line, outcome string) bool {
+	for _, ev := range events {
+		if ev.Kind == "policy_event" && strings.Contains(string(ev.Data), `"outcome":"`+outcome+`"`) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRun_PlanStage_SetsJSONSchema asserts the plan-stage invocation is
+// constrained: the runner derives the structured-output schema and threads it
+// onto inv.JSONSchema (#1325).
+func TestRun_PlanStage_SetsJSONSchema(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	planPath := filepath.Join(dir, "plan.json")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(planPath, []byte(validPlanJSON()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, fake)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u", "--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath, "--plan-out", planPath,
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fake.gotInv == nil || fake.gotInv.JSONSchema == "" {
+		t.Fatalf("expected non-empty inv.JSONSchema on the plan stage, got %+v", fake.gotInv)
+	}
+	// The derived schema must be the CLI-subset shape: no $ref survivors.
+	if strings.Contains(fake.gotInv.JSONSchema, "$ref") {
+		t.Errorf("inv.JSONSchema still contains $ref: %s", fake.gotInv.JSONSchema)
+	}
+}
+
+// TestRun_PlanStage_StructuredOutputAdopted is the branch-structured precedence
+// test: the agent's structured_output (a valid plan) overwrites the plan-out
+// file even when the agent-written file is invalid, and validation then passes
+// without coercion (#1325).
+func TestRun_PlanStage_StructuredOutputAdopted(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	planPath := filepath.Join(dir, "plan.json")
+	bundlePath := filepath.Join(dir, "trace.jsonl.gz")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The agent-written file is INVALID (missing required fields) — proving the
+	// structured_output is what gets adopted, not the file.
+	if err := os.WriteFile(planPath, []byte(`{"plan_version":"standard_v1"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	validPlan := validPlanJSON()
+	withFakeInvoker(t, &fakeInvoker{
+		canned: agent.Result{OK: true, StructuredOutput: []byte(validPlan)},
+	})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u", "--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath, "--plan-out", planPath, "--bundle-out", bundlePath,
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	// The plan-out file must now hold the adopted structured_output bytes.
+	onDisk, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(onDisk) != validPlan {
+		t.Errorf("plan file = %q, want adopted structured_output %q", onDisk, validPlan)
+	}
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, events, _, err := openBundleForTest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bundleHasPolicyOutcome(events, "structured_output_adopted") {
+		t.Errorf("missing structured_output_adopted policy_event:\n%+v", events)
+	}
+	if !bundleHasPolicyOutcome(events, "valid") {
+		t.Errorf("missing valid policy_event after adoption:\n%+v", events)
+	}
+}
+
+// TestRun_PlanStage_ClarificationWinsOverStructuredOutput is the
+// branch-clarification precedence test: a clarification_request written to the
+// plan-out file parks the stage and IGNORES any structured_output the
+// (schema-constrained) invocation also produced (#1325).
+func TestRun_PlanStage_ClarificationWinsOverStructuredOutput(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	planPath := filepath.Join(dir, "plan.json")
+	bundlePath := filepath.Join(dir, "trace.jsonl.gz")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clarification := `{"kind":"clarification_request","summary":"need direction"}`
+	if err := os.WriteFile(planPath, []byte(clarification), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withFakeInvoker(t, &fakeInvoker{
+		// structured_output ALSO carries a (throwaway) plan — clarification must win.
+		canned: agent.Result{OK: true, StructuredOutput: []byte(validPlanJSON())},
+	})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u", "--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath, "--plan-out", planPath, "--bundle-out", bundlePath,
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	// The file must still be the clarification — structured_output must NOT have
+	// overwritten it.
+	onDisk, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(onDisk) != clarification {
+		t.Errorf("plan file = %q, want untouched clarification %q", onDisk, clarification)
+	}
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, events, _, err := openBundleForTest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bundleHasPolicyOutcome(events, "clarification_request") {
+		t.Errorf("missing clarification_request policy_event:\n%+v", events)
+	}
+	if bundleHasPolicyOutcome(events, "structured_output_adopted") {
+		t.Errorf("structured_output was adopted but clarification should have won:\n%+v", events)
+	}
+}
+
+// TestRun_PlanStage_FallbackWhenNoStructuredOutput is the branch-fallback
+// precedence test: with no structured_output, the runner keeps the
+// agent-written (coerce-needing) file and the existing TryCoerce+validate path
+// accepts it (#1325).
+func TestRun_PlanStage_FallbackWhenNoStructuredOutput(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	planPath := filepath.Join(dir, "plan.json")
+	bundlePath := filepath.Join(dir, "trace.jsonl.gz")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(planPath, []byte(coerceNeedingPlanJSON()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withFakeInvoker(t, &fakeInvoker{
+		canned: agent.Result{OK: true}, // StructuredOutput nil
+	})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u", "--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath, "--plan-out", planPath, "--bundle-out", bundlePath,
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, events, _, err := openBundleForTest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bundleHasPolicyOutcome(events, "structured_output_adopted") {
+		t.Errorf("structured_output adopted despite none being present:\n%+v", events)
+	}
+	if !bundleHasPolicyOutcome(events, "valid") {
+		t.Errorf("fallback coerce+validate did not accept the plan:\n%+v", events)
+	}
+	// Coercion ran on the bare-string scope.files entry.
+	var sawCoerced bool
+	for _, ev := range events {
+		if ev.Kind == "policy_event" && strings.Contains(string(ev.Data), `"coerced"`) {
+			sawCoerced = true
+		}
+	}
+	if !sawCoerced {
+		t.Errorf("expected the coerce path to report a coercion:\n%+v", events)
+	}
+}
+
+// TestRun_PlanStage_DerivationErrorDegradesGracefully is the binding-condition
+// (opus LOW #1) test: when the schema derivation errors, the runner logs and
+// proceeds with an UNCONSTRAINED invocation (empty inv.JSONSchema) and the
+// existing TryCoerce+validate path still accepts the plan — the stage must NOT
+// hard-fail (#1325).
+func TestRun_PlanStage_DerivationErrorDegradesGracefully(t *testing.T) {
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	planPath := filepath.Join(dir, "plan.json")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A coerce-needing plan so we also prove the fallback coerce+validate path runs.
+	if err := os.WriteFile(planPath, []byte(coerceNeedingPlanJSON()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withDeriveSchemaError(t, errors.New("forced derivation failure"))
+	fake := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, fake)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "rid", "--backend-url", "u", "--workflow", "w", "--stage", "s",
+		"--prompt-file", promptPath, "--plan-out", planPath,
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK (derivation error must degrade, not fail):\n%s", got, stderr.String())
+	}
+	// Unconstrained invocation: no schema threaded.
+	if fake.gotInv == nil || fake.gotInv.JSONSchema != "" {
+		t.Errorf("expected empty inv.JSONSchema on derivation error, got %+v", fake.gotInv)
+	}
+	// The degradation was logged.
+	if !strings.Contains(stderr.String(), "plan_schema_derive_failed") {
+		t.Errorf("missing plan_schema_derive_failed log line:\n%s", stderr.String())
+	}
+}
+
+// TestAdoptStructuredOutput pins both branches of the adoption helper (#1325):
+// a successful overwrite emits structured_output_adopted, and a write failure
+// emits structured_output_write_failed (and leaves the caller to fall back) —
+// the write-failure branch degrades rather than failing the stage.
+func TestAdoptStructuredOutput(t *testing.T) {
+	t.Run("success overwrites and records adoption", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "plan.json")
+		if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ev := adoptStructuredOutput(path, []byte(`{"plan_version":"standard_v1"}`))
+		if !strings.Contains(string(ev.Payload), `"outcome":"structured_output_adopted"`) {
+			t.Errorf("expected structured_output_adopted, got %s", ev.Payload)
+		}
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != `{"plan_version":"standard_v1"}` {
+			t.Errorf("file not overwritten: %s", got)
+		}
+	})
+	t.Run("write failure records failure and does not panic", func(t *testing.T) {
+		// A path whose parent directory does not exist forces os.WriteFile to error.
+		path := filepath.Join(t.TempDir(), "no-such-dir", "plan.json")
+		ev := adoptStructuredOutput(path, []byte(`{}`))
+		if !strings.Contains(string(ev.Payload), `"outcome":"structured_output_write_failed"`) {
+			t.Errorf("expected structured_output_write_failed, got %s", ev.Payload)
+		}
+	})
+}
+
 func TestRun_PlanValidationInvalid_DemotesToCategoryB(t *testing.T) {
 	dir := t.TempDir()
 	promptPath := filepath.Join(dir, "prompt.txt")

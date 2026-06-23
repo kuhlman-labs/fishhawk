@@ -155,6 +155,10 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 		if res.Model != "" {
 			agg.Model = res.Model
 		}
+		// Structured output (#1325): latest non-empty attempt wins, like Model.
+		if len(res.StructuredOutput) > 0 {
+			agg.StructuredOutput = res.StructuredOutput
+		}
 
 		retriesLeft := attempt < maxAttempts
 		overBudget := inv.Budget.MaxTokens > 0 && agg.TokensUsed >= inv.Budget.MaxTokens
@@ -290,6 +294,17 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	if inv.Model != "" {
 		args = append(args, "--model", inv.Model)
 	}
+	// --json-schema: constrain the agent's structured_output to the given
+	// schema (#1325). The CLI takes the schema as an INLINE JSON string
+	// argument (NOT a file path — verified against claude 2.1.186). When set,
+	// the terminal result event carries a top-level structured_output object
+	// conforming to the schema, captured below onto Result.StructuredOutput.
+	// An empty inv.JSONSchema appends NO flag, so the spawn is byte-identical
+	// to today and structured_output stays nil — the feature is gated entirely
+	// on this field being non-empty.
+	if inv.JSONSchema != "" {
+		args = append(args, "--json-schema", inv.JSONSchema)
+	}
 	args = append(args, "-p", inv.Prompt)
 	cmd := cmdFn(ctx, binary, args...)
 	cmd.Dir = inv.WorkingDir
@@ -374,6 +389,11 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	// post-mortem can inspect is_error / api_error_status for
 	// thinking-block detection (see isThinkingBlock400).
 	var resultPayload []byte
+	// structuredOutput captures the schema-guaranteed object from the
+	// terminal result event's top-level `structured_output` field when the
+	// invocation carried a --json-schema (#1325). nil when absent — the
+	// documented fallback trigger.
+	var structuredOutput []byte
 
 	// Progress heartbeat state (#580). The scan loop below writes
 	// turns / tokensUsed / lastKind; the heartbeat goroutine reads
@@ -459,6 +479,12 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 		res.Events = append(res.Events, ev)
 		if ev.Kind == "result" || strings.HasPrefix(ev.Kind, "result.") {
 			resultPayload = append([]byte(nil), ev.Payload...)
+		}
+		// Capture the schema-guaranteed structured_output object whenever a
+		// line surfaces one (it rides on the terminal result event). The
+		// latest non-empty wins.
+		if len(info.StructuredOutput) > 0 {
+			structuredOutput = info.StructuredOutput
 		}
 		// Surface (never block) any agent write targeting a path outside
 		// the working tree + allowlist. Purely additive: a detection
@@ -563,6 +589,7 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	res.InputTokens = inputTokens
 	res.OutputTokens = outputTokens
 	res.Model = model
+	res.StructuredOutput = structuredOutput
 
 	// A non-zero exit whose result payload or stderr carries the
 	// durable thinking-block marker is the one fault Invoke retries.
@@ -683,6 +710,10 @@ type lineInfo struct {
 	InputTokens  int
 	OutputTokens int
 	Model        string
+	// StructuredOutput is the raw JSON bytes of the line's top-level
+	// `structured_output` field, present on the terminal result event when
+	// the invocation carried a --json-schema (#1325). nil otherwise.
+	StructuredOutput []byte
 }
 
 // usageBlock is the shape of Claude Code's `usage` object, present
@@ -715,11 +746,12 @@ func parseLine(line []byte, ts time.Time) (agent.Event, lineInfo, bool) {
 	// result event, but nested under `message` on a real assistant
 	// event — accept both shapes, top-level winning.
 	var meta struct {
-		Type    string      `json:"type"`
-		Subtype string      `json:"subtype"`
-		Model   string      `json:"model"`
-		Usage   *usageBlock `json:"usage"`
-		Message *struct {
+		Type             string          `json:"type"`
+		Subtype          string          `json:"subtype"`
+		Model            string          `json:"model"`
+		Usage            *usageBlock     `json:"usage"`
+		StructuredOutput json.RawMessage `json:"structured_output"`
+		Message          *struct {
 			Model string      `json:"model"`
 			Usage *usageBlock `json:"usage"`
 		} `json:"message"`
@@ -752,6 +784,11 @@ func parseLine(line []byte, ts time.Time) (agent.Event, lineInfo, bool) {
 
 	var info lineInfo
 	info.Model = model
+	// Capture structured_output (#1325) — copy out of the trimmed backing
+	// slice; skip a literal JSON null so it reads as absent.
+	if len(meta.StructuredOutput) > 0 && string(bytes.TrimSpace(meta.StructuredOutput)) != "null" {
+		info.StructuredOutput = append([]byte(nil), meta.StructuredOutput...)
+	}
 	hasUsage := false
 	if usage != nil {
 		info.InputTokens = usage.InputTokens

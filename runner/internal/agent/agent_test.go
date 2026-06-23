@@ -91,6 +91,19 @@ func TestAppendEnvOverride(t *testing.T) {
 	})
 }
 
+// TestStructuredOutput_ZeroValues pins the feature-gate default (#1325): an
+// Invocation with no JSONSchema and a Result with no StructuredOutput are the
+// zero values, so the structured-output path is inert unless explicitly wired —
+// every existing caller keeps today's byte-for-byte behavior.
+func TestStructuredOutput_ZeroValues(t *testing.T) {
+	if (Invocation{}).JSONSchema != "" {
+		t.Error("zero-value Invocation.JSONSchema should be empty (no --json-schema flag)")
+	}
+	if (Result{}).StructuredOutput != nil {
+		t.Error("zero-value Result.StructuredOutput should be nil")
+	}
+}
+
 func TestErrors_AreDistinct(t *testing.T) {
 	pairs := []struct {
 		a, b error
