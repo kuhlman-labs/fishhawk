@@ -10,6 +10,8 @@ import (
 
 	anthropicsdk "github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 )
 
 // Config holds the settings needed to create an Anthropic API client.
@@ -49,12 +51,25 @@ func NewClient(cfg Config, opts ...option.RequestOption) *Client {
 // usage (input/output) so the caller can attribute reviewer agent cost
 // (#681). The SDK always returns a Usage block on a successful Messages
 // call, so the token counts are authoritative on the happy path.
+//
+// The request carries OutputConfig.Format = json_schema with
+// planreview.VerdictSchema() (#1324): the Messages API constrains the model's
+// response to the single ReviewVerdict schema source of truth, so the verdict
+// body arrives as schema-guaranteed JSON. planreview.DecodeVerdict's
+// fence-strip + escape-repair stays the documented FALLBACK for any
+// non-constrained or error path. The SDK's Type field defaults to
+// "json_schema", so only Schema is set here.
 func (c *Client) Messages(ctx context.Context, systemText, userText string) (responseText, modelName string, inputTokens, outputTokens int, err error) {
 	params := anthropicsdk.MessageNewParams{
 		Model:     c.model,
 		MaxTokens: int64(c.maxTokens),
 		Messages: []anthropicsdk.MessageParam{
 			anthropicsdk.NewUserMessage(anthropicsdk.NewTextBlock(userText)),
+		},
+		OutputConfig: anthropicsdk.OutputConfigParam{
+			Format: anthropicsdk.JSONOutputFormatParam{
+				Schema: planreview.VerdictSchema(),
+			},
 		},
 	}
 	if systemText != "" {

@@ -11,13 +11,6 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
 
-// validVerdicts is the closed set of acceptable verdict strings per ADR-027.
-var validVerdicts = map[planreview.Verdict]struct{}{
-	planreview.VerdictApprove:             {},
-	planreview.VerdictApproveWithConcerns: {},
-	planreview.VerdictReject:              {},
-}
-
 // Reviewer implements server.PlanReviewer by calling the Anthropic Messages
 // API. It splits the prompt at prompt.PlanReviewSplitMarker so the stable
 // role-constraint preamble is placed in the cached system block and the
@@ -108,7 +101,7 @@ func (r *Reviewer) Review(ctx context.Context, promptText string) (*planreview.R
 		return nil, "", fmt.Errorf("anthropic: decode verdict JSON: %w", err)
 	}
 
-	if _, ok := validVerdicts[verdict.Verdict]; !ok {
+	if !verdict.Verdict.Valid() {
 		return nil, "", fmt.Errorf("anthropic: unknown verdict %q", verdict.Verdict)
 	}
 

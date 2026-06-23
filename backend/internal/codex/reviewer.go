@@ -7,15 +7,6 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 )
 
-// validVerdicts is the closed set of acceptable verdict strings per ADR-027.
-// It mirrors claudecode.validVerdicts so the Codex adapter enforces the same
-// shape guarantee as the Claude adapters.
-var validVerdicts = map[planreview.Verdict]struct{}{
-	planreview.VerdictApprove:             {},
-	planreview.VerdictApproveWithConcerns: {},
-	planreview.VerdictReject:              {},
-}
-
 // Reviewer implements server.PlanReviewer by shelling out to the `codex` CLI.
 // It is the Codex sibling of claudecode.Reviewer (#575): structurally identical,
 // it sends the full prompt as one positional argument to a `codex exec`
@@ -76,7 +67,7 @@ func (r *Reviewer) Review(ctx context.Context, promptText string) (*planreview.R
 		return nil, "", fmt.Errorf("codex: decode verdict JSON: %w", err)
 	}
 
-	if _, ok := validVerdicts[verdict.Verdict]; !ok {
+	if !verdict.Verdict.Valid() {
 		return nil, "", fmt.Errorf("codex: unknown verdict %q", verdict.Verdict)
 	}
 

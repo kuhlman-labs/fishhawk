@@ -7,15 +7,6 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 )
 
-// validVerdicts is the closed set of acceptable verdict strings per ADR-027.
-// It mirrors anthropic.validVerdicts so the local-mode adapter enforces the
-// same shape guarantee as the SDK adapter.
-var validVerdicts = map[planreview.Verdict]struct{}{
-	planreview.VerdictApprove:             {},
-	planreview.VerdictApproveWithConcerns: {},
-	planreview.VerdictReject:              {},
-}
-
 // Reviewer implements server.PlanReviewer by shelling out to the `claude` CLI.
 // It is the local-mode sibling of anthropic.Reviewer (#572): the SDK adapter
 // calls the Messages API with a cached system/user split, whereas this adapter
@@ -77,7 +68,7 @@ func (r *Reviewer) Review(ctx context.Context, promptText string) (*planreview.R
 		return nil, "", fmt.Errorf("claudecode: decode verdict JSON: %w", err)
 	}
 
-	if _, ok := validVerdicts[verdict.Verdict]; !ok {
+	if !verdict.Verdict.Valid() {
 		return nil, "", fmt.Errorf("claudecode: unknown verdict %q", verdict.Verdict)
 	}
 

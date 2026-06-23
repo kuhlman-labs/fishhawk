@@ -8,6 +8,17 @@ import (
 // DecodeVerdict unmarshals a model-emitted verdict body into a ReviewVerdict,
 // tolerating two common classes of model output that strict JSON rejects.
 //
+// As of #1324 this is the FALLBACK decode path, not the primary one. The
+// first-class structured-output backends constrain the model to emit
+// schema-guaranteed JSON directly — the Anthropic adapter sets
+// OutputConfig.Format=json_schema and the codex adapter passes
+// `--output-schema`, both built from the single VerdictSchema() source of
+// truth (see schema.go). DecodeVerdict remains the documented fallback for
+// every non-constrained path: claudecode (whose CLI exposes no response-schema
+// flag), and any error or unconstrained response from the constrained backends
+// where the model still returns free-text JSON. Its conservative fence-strip +
+// escape-repair below keeps those paths working unchanged.
+//
 // First, it strips a surrounding markdown code fence (```json … ``` or a bare
 // ``` … ```) via stripCodeFence — reviewer models routinely wrap their JSON in
 // a fence, and the leading backtick fails strict decode before any escape
