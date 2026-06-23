@@ -94,6 +94,13 @@ type Project struct {
 type JiraConnection struct {
 	ProjectKey string            `json:"project_key"`
 	IssueTypes map[string]string `json:"issue_types,omitempty"`
+	// ParentField selects how a filed issue links to its epic. An empty
+	// value means the team-managed `parent` default (fields.parent); a
+	// classic project sets it to its epic-link custom field id (e.g.
+	// customfield_10014). The schema documents the "parent" default, but
+	// encoding/json does not apply JSON-Schema defaults, so the
+	// empty-means-parent resolution lives in the jira provider.
+	ParentField string `json:"parent_field,omitempty"`
 }
 
 // ItemType is the conventions for one work-item type.

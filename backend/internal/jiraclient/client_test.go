@@ -117,7 +117,7 @@ func TestCreateIssue_RequestShapeAndResult(t *testing.T) {
 			t.Errorf("labels = %v", got.Fields.Labels)
 		}
 		if got.Fields.Parent != nil {
-			t.Errorf("parent set without ParentKey: %+v", got.Fields.Parent)
+			t.Errorf("create body set a parent; epic linking is a separate post-create step: %+v", got.Fields.Parent)
 		}
 		// Description must be wrapped in ADF (a doc), not a plain string.
 		if !bytes.Contains(got.Fields.Desc, []byte(`"type":"doc"`)) {
@@ -146,19 +146,25 @@ func TestCreateIssue_RequestShapeAndResult(t *testing.T) {
 	}
 }
 
-func TestCreateIssue_WithParentKey(t *testing.T) {
+// TestCreateIssue_NeverSetsParent locks the #1159 move of epic linking out
+// of issue creation: CreateIssue must NOT send a parent (or any custom)
+// field, because linking is now a separate best-effort post-create step
+// (LinkParent). The create body carries only project/issuetype/summary.
+func TestCreateIssue_NeverSetsParent(t *testing.T) {
 	stub := &stubDoer{t: t}
 	stub.handler = func(rec *recordedRequest) (*http.Response, error) {
-		var got struct {
-			Fields struct {
-				Parent struct{ Key string } `json:"parent"`
-			} `json:"fields"`
-		}
+		var got map[string]map[string]any
 		if err := json.Unmarshal(rec.body, &got); err != nil {
 			t.Fatalf("unmarshal: %v", err)
 		}
-		if got.Fields.Parent.Key != "ENG-1" {
-			t.Errorf("parent.key = %q, want ENG-1", got.Fields.Parent.Key)
+		fields := got["fields"]
+		if _, ok := fields["parent"]; ok {
+			t.Errorf("create body set a parent field: %v", fields)
+		}
+		for k := range fields {
+			if strings.HasPrefix(k, "customfield_") {
+				t.Errorf("create body set a custom field %q: %v", k, fields)
+			}
 		}
 		return jsonResponse(http.StatusCreated, `{"id":"1","key":"ENG-8"}`), nil
 	}
@@ -168,9 +174,112 @@ func TestCreateIssue_WithParentKey(t *testing.T) {
 		ProjectKey: "ENG",
 		IssueType:  "Task",
 		Summary:    "child",
-		ParentKey:  "ENG-1",
 	}); err != nil {
 		t.Fatalf("CreateIssue: %v", err)
+	}
+}
+
+// TestLinkParent covers both wire shapes the configured parent_field
+// selects: the team-managed `parent` reference (an object) and a classic
+// epic-link custom field (a bare string), both via PUT to the issue.
+func TestLinkParent(t *testing.T) {
+	cases := []struct {
+		name        string
+		parentField string
+		assert      func(t *testing.T, fields map[string]any)
+	}{
+		{
+			name:        "team-managed parent reference",
+			parentField: "parent",
+			assert: func(t *testing.T, fields map[string]any) {
+				parent, ok := fields["parent"].(map[string]any)
+				if !ok {
+					t.Fatalf("parent not an object: %v", fields["parent"])
+				}
+				if parent["key"] != "ENG-1" {
+					t.Errorf("parent.key = %v, want ENG-1", parent["key"])
+				}
+			},
+		},
+		{
+			name:        "classic epic-link custom field",
+			parentField: "customfield_10014",
+			assert: func(t *testing.T, fields map[string]any) {
+				if v := fields["customfield_10014"]; v != "ENG-1" {
+					t.Errorf("customfield_10014 = %v (%T), want bare string ENG-1", v, v)
+				}
+				if _, ok := fields["parent"]; ok {
+					t.Errorf("parent set for a custom-field link: %v", fields)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := &stubDoer{t: t}
+			stub.handler = func(rec *recordedRequest) (*http.Response, error) {
+				if rec.method != http.MethodPut {
+					t.Errorf("method = %s, want PUT", rec.method)
+				}
+				if rec.path != "/rest/api/3/issue/ENG-1" {
+					t.Errorf("path = %s, want /rest/api/3/issue/ENG-1", rec.path)
+				}
+				assertBasicAuth(t, rec.header)
+				var got struct {
+					Fields map[string]any `json:"fields"`
+				}
+				if err := json.Unmarshal(rec.body, &got); err != nil {
+					t.Fatalf("unmarshal: %v\nbody=%s", err, rec.body)
+				}
+				tc.assert(t, got.Fields)
+				return jsonResponse(http.StatusNoContent, ""), nil
+			}
+
+			c := New(testBaseURL, testEmail, testToken, WithHTTPClient(stub))
+			if err := c.LinkParent(context.Background(), "ENG-1", tc.parentField, "ENG-1"); err != nil {
+				t.Fatalf("LinkParent: %v", err)
+			}
+		})
+	}
+}
+
+// TestLinkParent_APIError asserts a non-2xx response surfaces as *APIError
+// so the provider can record it (best-effort, #1107) rather than swallow it.
+func TestLinkParent_APIError(t *testing.T) {
+	stub := &stubDoer{t: t}
+	stub.handler = func(*recordedRequest) (*http.Response, error) {
+		return jsonResponse(http.StatusBadRequest, `{"errorMessages":["Field 'customfield_99999' cannot be set"]}`), nil
+	}
+	c := New(testBaseURL, testEmail, testToken, WithHTTPClient(stub))
+	err := c.LinkParent(context.Background(), "ENG-1", "customfield_99999", "ENG-100")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want *APIError", err)
+	}
+	if apiErr.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", apiErr.StatusCode)
+	}
+}
+
+// TestLinkParent_ValidatesArgs asserts the empty-arg guards fire before any
+// transport call.
+func TestLinkParent_ValidatesArgs(t *testing.T) {
+	c := New(testBaseURL, testEmail, testToken, WithHTTPClient(&stubDoer{
+		t: t,
+		handler: func(*recordedRequest) (*http.Response, error) {
+			t.Fatal("transport called despite invalid args")
+			return nil, nil
+		},
+	}))
+	cases := []struct{ key, field, epic string }{
+		{"", "parent", "ENG-1"},
+		{"ENG-1", "", "ENG-1"},
+		{"ENG-1", "parent", ""},
+	}
+	for i, tc := range cases {
+		if err := c.LinkParent(context.Background(), tc.key, tc.field, tc.epic); err == nil {
+			t.Errorf("case %d: expected validation error", i)
+		}
 	}
 }
 

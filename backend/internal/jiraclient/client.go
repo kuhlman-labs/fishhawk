@@ -98,17 +98,25 @@ func New(baseURL, email, apiToken string, opts ...Option) *Client {
 }
 
 // CreateIssueParams describes a single issue to create. ProjectKey,
-// IssueType, and Summary are required; the rest are optional. ParentKey,
-// when set, links the new issue to a parent/epic via the team-managed
-// `fields.parent` reference (best-effort per #1107 — a wrong field for a
-// classic project is the caller's concern, the API surfaces it as a 4xx).
+// IssueType, and Summary are required; the rest are optional. When
+// ParentKey is set the issue is linked to its epic atomically at create
+// time, the shape selected by ParentField: the team-managed `parent`
+// reference (an object, the empty/"parent" default) or a classic project's
+// epic-link custom field (a bare string). Linking at create keeps the epic
+// reference durable with the issue rather than depending on a separate
+// post-create field update.
 type CreateIssueParams struct {
 	ProjectKey  string
 	IssueType   string
 	Summary     string
 	Description string
 	Labels      []string
-	ParentKey   string
+	// ParentKey is the epic/parent issue key to link; empty means no link.
+	ParentKey string
+	// ParentField selects the link shape: "" or "parent" sets the
+	// team-managed fields.parent object; any other value (e.g.
+	// customfield_10014) sets that classic epic-link field to the bare key.
+	ParentField string
 }
 
 // CreatedIssue is the result of CreateIssue.
@@ -158,7 +166,11 @@ func (c *Client) CreateIssue(ctx context.Context, p CreateIssueParams) (*Created
 		fields["labels"] = p.Labels
 	}
 	if p.ParentKey != "" {
-		fields["parent"] = map[string]string{"key": p.ParentKey}
+		if p.ParentField == "" || p.ParentField == "parent" {
+			fields["parent"] = map[string]string{"key": p.ParentKey}
+		} else {
+			fields[p.ParentField] = p.ParentKey
+		}
 	}
 
 	resp, err := c.do(ctx, http.MethodPost, "/rest/api/3/issue", map[string]any{"fields": fields})
@@ -180,6 +192,44 @@ func (c *Client) CreateIssue(ctx context.Context, p CreateIssueParams) (*Created
 		ID:  out.ID,
 		URL: c.baseURL + "/browse/" + out.Key,
 	}, nil
+}
+
+// LinkParent links an existing issue to its epic by updating a single
+// field via:
+//
+//	PUT /rest/api/3/issue/{issueKey}
+//
+// The request shape is selected by parentField so both Jira project styles
+// are supported: the team-managed `parent` reference takes an object
+// ({"parent":{"key":epicKey}}), whereas a company-managed (classic)
+// epic-link custom field takes the epic key as a bare string
+// ({parentField: epicKey}). All three arguments are required. The API
+// error is returned verbatim so the provider can record it best-effort
+// (#1107) without failing the durable filing.
+func (c *Client) LinkParent(ctx context.Context, issueKey, parentField, epicKey string) error {
+	if issueKey == "" {
+		return errors.New("jiraclient: issue key required")
+	}
+	if parentField == "" {
+		return errors.New("jiraclient: parent field required")
+	}
+	if epicKey == "" {
+		return errors.New("jiraclient: epic key required")
+	}
+
+	var fields map[string]any
+	if parentField == "parent" {
+		fields = map[string]any{"parent": map[string]string{"key": epicKey}}
+	} else {
+		fields = map[string]any{parentField: epicKey}
+	}
+
+	resp, err := c.do(ctx, http.MethodPut, "/rest/api/3/issue/"+issueKey, map[string]any{"fields": fields})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return errForStatus("link parent", resp)
 }
 
 // transitionsResponse is the subset of GET .../transitions Fishhawk

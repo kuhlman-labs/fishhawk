@@ -2,12 +2,122 @@ package jira
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/jiraclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
+
+// recordingDoer is a jiraclient.Doer that answers the create POST with a
+// canned issue and records that POST body, so the seam test can assert the
+// REAL jiraclient-emitted wire shape — including the parent field linked at
+// create time.
+type recordingDoer struct {
+	t       *testing.T
+	postReq *struct {
+		path string
+		body []byte
+	}
+}
+
+func (d *recordingDoer) Do(req *http.Request) (*http.Response, error) {
+	var body []byte
+	if req.Body != nil {
+		var err error
+		if body, err = io.ReadAll(req.Body); err != nil {
+			d.t.Fatalf("read request body: %v", err)
+		}
+	}
+	switch req.Method {
+	case http.MethodPost:
+		d.postReq = &struct {
+			path string
+			body []byte
+		}{path: req.URL.Path, body: body}
+		return &http.Response{
+			StatusCode: http.StatusCreated,
+			Body:       io.NopCloser(strings.NewReader(`{"id":"10007","key":"FISH-7"}`)),
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+		}, nil
+	default:
+		d.t.Fatalf("unexpected method %s", req.Method)
+		return nil, nil
+	}
+}
+
+// TestFile_LinkParentWireSeam threads a configured parent_field all the way
+// to the REAL jiraclient-emitted create body: the provider runs on a real
+// *jiraclient.Client backed by a recording Doer, not the fakeAPI double,
+// proving the configured value's serialization across the provider->client
+// seam in one flow — the epic is linked atomically at create time.
+func TestFile_LinkParentWireSeam(t *testing.T) {
+	cases := []struct {
+		name        string
+		parentField string
+		assert      func(t *testing.T, fields map[string]any)
+	}{
+		{
+			name:        "classic custom field -> bare string",
+			parentField: "customfield_10014",
+			assert: func(t *testing.T, fields map[string]any) {
+				if v := fields["customfield_10014"]; v != "FISH-100" {
+					t.Errorf("customfield_10014 = %v (%T), want bare string FISH-100", v, v)
+				}
+				if _, ok := fields["parent"]; ok {
+					t.Errorf("parent set for a custom-field link: %v", fields)
+				}
+			},
+		},
+		{
+			name:        "default/empty -> parent object",
+			parentField: "",
+			assert: func(t *testing.T, fields map[string]any) {
+				parent, ok := fields["parent"].(map[string]any)
+				if !ok {
+					t.Fatalf("parent not an object: %v", fields["parent"])
+				}
+				if parent["key"] != "FISH-100" {
+					t.Errorf("parent.key = %v, want FISH-100", parent["key"])
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doer := &recordingDoer{t: t}
+			client := jiraclient.New("https://acme.atlassian.net", "bot@acme.example", "tok", jiraclient.WithHTTPClient(doer))
+			p := New(client)
+			item := workmgmt.WorkItem{Type: "feature", Title: "t", Relations: workmgmt.Relations{ParentEpic: "FISH-100"}}
+			conn := &workmgmt.JiraConnection{ProjectKey: "FISH", ParentField: tc.parentField}
+
+			created, err := p.File(context.Background(), req(item, conn))
+			if err != nil {
+				t.Fatalf("File: %v", err)
+			}
+			if !created.EpicLinked {
+				t.Errorf("EpicLinked = false, want true; EpicLinkError=%q", created.EpicLinkError)
+			}
+			if doer.postReq == nil {
+				t.Fatal("no create POST was emitted")
+			}
+			if doer.postReq.path != "/rest/api/3/issue" {
+				t.Errorf("POST path = %s, want /rest/api/3/issue", doer.postReq.path)
+			}
+			var got struct {
+				Fields map[string]any `json:"fields"`
+			}
+			if err := json.Unmarshal(doer.postReq.body, &got); err != nil {
+				t.Fatalf("unmarshal POST body: %v\nbody=%s", err, doer.postReq.body)
+			}
+			tc.assert(t, got.Fields)
+		})
+	}
+}
 
 // fakeAPI is a jira API test double: it records the create/transition
 // calls and returns canned results or configured errors.
@@ -111,9 +221,12 @@ func TestFile_IssueTypeOverride(t *testing.T) {
 	}
 }
 
-// TestFile_ParentLink asserts the parent epic reference is passed to
-// CreateIssue (fields.parent) and EpicLinked is reported true.
-func TestFile_ParentLink(t *testing.T) {
+// TestFile_ParentLinkDefaultField asserts a requested parent with no
+// configured parent_field is linked at create time through the resolved
+// team-managed `parent` default and reports EpicLinked=true. This locks the
+// shipped default-value behavior (#1169): an empty parent_field resolves to
+// "parent", so a no-op of the default-resolution line fails here.
+func TestFile_ParentLinkDefaultField(t *testing.T) {
 	api := &fakeAPI{}
 	p := New(api)
 	item := workmgmt.WorkItem{Type: "feature", Title: "t", Relations: workmgmt.Relations{ParentEpic: "FISH-100"}}
@@ -123,10 +236,57 @@ func TestFile_ParentLink(t *testing.T) {
 		t.Fatalf("File: %v", err)
 	}
 	if api.createParams.ParentKey != "FISH-100" {
+		t.Errorf("ParentKey = %q, want FISH-100 (linked at create)", api.createParams.ParentKey)
+	}
+	if api.createParams.ParentField != "parent" {
+		t.Errorf("ParentField = %q, want the resolved team-managed default %q", api.createParams.ParentField, "parent")
+	}
+	if !created.EpicLinked {
+		t.Error("EpicLinked = false, want true when a parent was requested and the create succeeded")
+	}
+	if created.EpicLinkError != "" {
+		t.Errorf("EpicLinkError = %q, want empty on success", created.EpicLinkError)
+	}
+}
+
+// TestFile_ParentLinkClassicField asserts a configured classic epic-link
+// custom field is threaded through to the create call unchanged.
+func TestFile_ParentLinkClassicField(t *testing.T) {
+	api := &fakeAPI{}
+	p := New(api)
+	item := workmgmt.WorkItem{Type: "feature", Title: "t", Relations: workmgmt.Relations{ParentEpic: "FISH-100"}}
+	conn := &workmgmt.JiraConnection{ProjectKey: "FISH", ParentField: "customfield_10014"}
+
+	created, err := p.File(context.Background(), req(item, conn))
+	if err != nil {
+		t.Fatalf("File: %v", err)
+	}
+	if api.createParams.ParentField != "customfield_10014" {
+		t.Errorf("ParentField = %q, want the configured custom field", api.createParams.ParentField)
+	}
+	if api.createParams.ParentKey != "FISH-100" {
 		t.Errorf("ParentKey = %q, want FISH-100", api.createParams.ParentKey)
 	}
 	if !created.EpicLinked {
-		t.Error("EpicLinked = false, want true when a parent was requested and create succeeded")
+		t.Error("EpicLinked = false, want true on a successful classic-field link")
+	}
+}
+
+// TestFile_NoParentNoLink asserts an absent parent epic sends no parent at
+// create and leaves EpicLinked false with no error.
+func TestFile_NoParentNoLink(t *testing.T) {
+	api := &fakeAPI{}
+	p := New(api)
+
+	created, err := p.File(context.Background(), req(workmgmt.WorkItem{Type: "bug", Title: "t"}, &workmgmt.JiraConnection{ProjectKey: "FISH"}))
+	if err != nil {
+		t.Fatalf("File: %v", err)
+	}
+	if api.createParams.ParentKey != "" || api.createParams.ParentField != "" {
+		t.Errorf("parent threaded with no parent requested: key=%q field=%q", api.createParams.ParentKey, api.createParams.ParentField)
+	}
+	if created.EpicLinked || created.EpicLinkError != "" {
+		t.Errorf("EpicLinked/EpicLinkError = %v/%q, want false/empty with no parent", created.EpicLinked, created.EpicLinkError)
 	}
 }
 

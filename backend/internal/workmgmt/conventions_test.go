@@ -132,6 +132,7 @@ jira:
   issue_types:
     feature: Story
     bug: Bug
+  parent_field: customfield_10014
 required_fields: [Summary, Done-means, complexity]
 types: {feature: {body_skeleton: [Summary]}}
 `
@@ -150,6 +151,34 @@ types: {feature: {body_skeleton: [Summary]}}
 	}
 	if c.Jira.IssueTypes["feature"] != "Story" || c.Jira.IssueTypes["bug"] != "Bug" {
 		t.Errorf("Jira.IssueTypes = %v, want {feature:Story bug:Bug}", c.Jira.IssueTypes)
+	}
+	if c.Jira.ParentField != "customfield_10014" {
+		t.Errorf("Jira.ParentField = %q, want customfield_10014", c.Jira.ParentField)
+	}
+}
+
+// TestParseJiraParentFieldOptional proves parent_field is optional and
+// additive: a jira block omitting it parses cleanly and leaves
+// JiraConnection.ParentField empty (the provider resolves empty to the
+// team-managed `parent` default).
+func TestParseJiraParentFieldOptional(t *testing.T) {
+	cfg := `
+spec_version: work-management-v0
+provider: jira
+jira:
+  project_key: FISH
+required_fields: [Summary, Done-means, complexity]
+types: {feature: {body_skeleton: [Summary]}}
+`
+	c, err := Parse(strings.NewReader(cfg))
+	if err != nil {
+		t.Fatalf("Parse(jira without parent_field) = %v, want nil", err)
+	}
+	if c.Jira == nil {
+		t.Fatal("Jira is nil; the jira block did not round-trip into the struct")
+	}
+	if c.Jira.ParentField != "" {
+		t.Errorf("Jira.ParentField = %q, want empty when omitted", c.Jira.ParentField)
 	}
 }
 
