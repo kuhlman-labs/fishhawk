@@ -687,6 +687,31 @@ func TestProvider_DiscoverNumbers_ParsesPaddedAndClosedTitles(t *testing.T) {
 	}
 }
 
+func TestProvider_DiscoverNumbers_PrefixCannotBreakOutOfQuotedQualifier(t *testing.T) {
+	// A title_format whose literal prefix carries a double quote (or backslash)
+	// must not break out of the quoted in:title qualifier in the composed
+	// search query — the dangerous characters are stripped from the search term
+	// while the regex re-parse still matches real titles.
+	req := discoverRequest()
+	req.TitleFormat = `[A"D\R-{number}] {summary}`
+	api := &fakeAPI{searchResults: []githubclient.IssueTitleResult{
+		{Number: 5, Title: `[A"D\R-12] a decided one`},
+	}}
+	got, err := New(api).DiscoverNumbers(context.Background(), req)
+	if err != nil {
+		t.Fatalf("DiscoverNumbers: %v", err)
+	}
+	if strings.Contains(api.searchQuery, `"`+`]`) || strings.Count(api.searchQuery, `"`) != 2 {
+		t.Errorf("search query = %q must keep exactly the two enclosing quotes (no breakout)", api.searchQuery)
+	}
+	if strings.Contains(api.searchQuery, `\`) {
+		t.Errorf("search query = %q must not carry a backslash that could escape the closing quote", api.searchQuery)
+	}
+	if len(got) != 1 || got[0] != 12 {
+		t.Errorf("numbers = %v, want [12] (regex still matches the real title)", got)
+	}
+}
+
 func TestProvider_DiscoverNumbers_EmptyResultReturnsEmpty(t *testing.T) {
 	// The genuine-first path: no matches → empty slice, no error. The handler
 	// then seeds [0] → number 1, never a silent 001.

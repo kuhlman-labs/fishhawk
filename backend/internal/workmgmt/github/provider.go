@@ -320,7 +320,17 @@ func titleNumberSearchPrefix(format string) string {
 	if idx <= 0 {
 		return ""
 	}
-	return format[:idx]
+	// Drop characters that could break out of the quoted in:title qualifier in
+	// the composed search query: a double quote ends the quoted term and a
+	// backslash could escape the closing quote. A legitimate title prefix
+	// carries none of these, and the regex re-parse still validates exact
+	// matches, so stripping them only tightens the fuzzy search term.
+	return strings.Map(func(r rune) rune {
+		if r == '"' || r == '\\' {
+			return -1
+		}
+		return r
+	}, format[:idx])
 }
 
 // titleNumberRegexp builds an anchored regexp from a numbered type's
