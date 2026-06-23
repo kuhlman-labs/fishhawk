@@ -20,9 +20,9 @@ import (
 // extractOutputSchema strips the non-deterministic `--output-schema <path>`
 // pair the structured-outputs change (#1324) appends to the codex argv, and
 // reads the schema file at <path> so a caller can assert it byte-equals
-// planreview.VerdictSchemaJSON(). It MUST be called from inside the Cmd-builder
-// closure: invokeOnce removes the temp file via defer when it returns, so the
-// file only exists for the duration of the subprocess build/run.
+// planreview.StrictVerdictSchemaJSON(). It MUST be called from inside the
+// Cmd-builder closure: invokeOnce removes the temp file via defer when it
+// returns, so the file only exists for the duration of the subprocess build/run.
 func extractOutputSchema(t *testing.T, args []string) (stripped []string, schema []byte) {
 	t.Helper()
 	i := slices.Index(args, "--output-schema")
@@ -38,15 +38,16 @@ func extractOutputSchema(t *testing.T, args []string) (stripped []string, schema
 }
 
 // assertSchemaFileMatches asserts the captured --output-schema file content
-// byte-equals the single VerdictSchemaJSON() source of truth.
+// byte-equals the strict variant StrictVerdictSchemaJSON() the codex path writes
+// (#1330) — the lenient VerdictSchema() is rejected by codex strict mode.
 func assertSchemaFileMatches(t *testing.T, got []byte) {
 	t.Helper()
-	want, err := planreview.VerdictSchemaJSON()
+	want, err := planreview.StrictVerdictSchemaJSON()
 	if err != nil {
-		t.Fatalf("VerdictSchemaJSON: %v", err)
+		t.Fatalf("StrictVerdictSchemaJSON: %v", err)
 	}
 	if !bytes.Equal(got, want) {
-		t.Errorf("--output-schema file content = %s, want byte-equal to VerdictSchemaJSON() = %s", got, want)
+		t.Errorf("--output-schema file content = %s, want byte-equal to StrictVerdictSchemaJSON() = %s", got, want)
 	}
 }
 
@@ -169,6 +170,21 @@ func TestHelperProcess(t *testing.T) {
 		// *exec.ExitError with ctx.Err()==nil (the retryable external/OOM class).
 		_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
 		select {}
+	case "schema_error":
+		// Reproduce the #1330 deterministic HTTP-4xx fault: codex emits an
+		// error event carrying the real message and a turn.failed event on
+		// STDOUT, then exits non-zero with no stderr diagnostic. Must be
+		// classified NON-retryable with the real message surfaced, NOT the
+		// transient external/OOM kill label.
+		fmt.Println(`{"type":"error","message":"stream error: unexpected status 400 Bad Request: invalid_json_schema: 'required' must include every key in properties"}`)
+		fmt.Println(`{"type":"turn.failed"}`)
+		os.Exit(1)
+	case "turn_failed_only":
+		// A bare turn.failed with NO preceding error line (no message): still a
+		// deterministic non-retryable fault, surfaced via the generic fallback
+		// detail rather than the external/OOM kill label.
+		fmt.Println(`{"type":"turn.failed"}`)
+		os.Exit(1)
 	case "slow":
 		// Sleep past a short Timeout so the per-attempt deadline fires and the
 		// child is killed with ctx.Err()==DeadlineExceeded (the timeout class,
@@ -421,6 +437,59 @@ func TestInference_RetryExhausted(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "after ") {
 		t.Errorf("error = %q, want it to carry an elapsed substring", err)
+	}
+}
+
+// TestInference_SchemaErrorNonRetryable asserts the #1330 classification fix:
+// a deterministic codex fault that arrives as an error/turn.failed event on
+// STDOUT (the invalid_json_schema HTTP-4xx class) is NON-retryable — attempted
+// exactly ONCE even with MaxRetries=1 — and surfaces codex's REAL message, NOT
+// the external/OOM kill label a stdout-less SIGKILL gets. Paired with
+// TestInference_RetryExhausted (killed → attempts==2, external/OOM), this proves
+// the two ExitError branches are distinguished by the presence of a stdout error
+// event.
+func TestInference_SchemaErrorNonRetryable(t *testing.T) {
+	var attempts int
+	c := NewClient(testConfig())
+	c.Cmd = countingHelperCommand("schema_error", &attempts)
+
+	_, _, _, err := c.Inference(context.Background(), "review")
+	if err == nil {
+		t.Fatal("expected error from a codex schema-error exit, got nil")
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1 (a deterministic schema/4xx fault must not be retried)", attempts)
+	}
+	if !strings.Contains(err.Error(), "invalid_json_schema") {
+		t.Errorf("error = %q, want it to surface codex's real invalid_json_schema message", err)
+	}
+	if strings.Contains(err.Error(), "external/OOM") {
+		t.Errorf("error = %q, must NOT be mislabelled external/OOM (the #1330 misclassification)", err)
+	}
+}
+
+// TestInference_TurnFailedNoMessageNonRetryable covers the empty-message
+// fallback of the #1330 classification: a deterministic exit whose stdout
+// carries a bare turn.failed (no error line / message) is still NON-retryable
+// (attempts==1) and labelled with the generic "turn failure" detail rather than
+// external/OOM.
+func TestInference_TurnFailedNoMessageNonRetryable(t *testing.T) {
+	var attempts int
+	c := NewClient(testConfig())
+	c.Cmd = countingHelperCommand("turn_failed_only", &attempts)
+
+	_, _, _, err := c.Inference(context.Background(), "review")
+	if err == nil {
+		t.Fatal("expected error from a codex turn.failed exit, got nil")
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1 (a deterministic turn.failed must not be retried)", attempts)
+	}
+	if strings.Contains(err.Error(), "external/OOM") {
+		t.Errorf("error = %q, must NOT be mislabelled external/OOM", err)
+	}
+	if !strings.Contains(err.Error(), "turn failure") {
+		t.Errorf("error = %q, want the generic turn-failure fallback detail", err)
 	}
 }
 
