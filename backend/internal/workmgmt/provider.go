@@ -43,6 +43,37 @@ type Transitioner interface {
 	Transition(ctx context.Context, req TransitionRequest) (*TransitionResult, error)
 }
 
+// NumberDiscoverer is the optional server-side number-discovery capability
+// (#1269): enumerate the sequential numbers already in use for a numbered
+// type (e.g. ADR) by querying the tracker, so a numbered filing no longer
+// requires the caller to pass existing_numbers. Like Transitioner it is a
+// SEPARATE capability interface rather than folded into Provider, because not
+// every provider discovers numbers (jira is interface-only in v0) and widening
+// Provider would force every registered fake to grow the method. The filing
+// handler resolves a provider via Get and type-asserts this capability before
+// the pure Apply runs; a provider that does not implement it yields no
+// discovery, leaving Apply's existing fail-closed allocate (#1265) as the
+// last-line guard.
+//
+// DiscoverNumbers returns the numbers found (possibly empty, no error — an
+// empty result means a genuinely-first numbered item) or an error on a genuine
+// discovery failure (the handler then fails the filing closed). It must NOT
+// invent a number; allocation stays in Apply.
+type NumberDiscoverer interface {
+	DiscoverNumbers(ctx context.Context, req DiscoverNumbersRequest) ([]int, error)
+}
+
+// DiscoverNumbersRequest is the resolved input to NumberDiscoverer: the
+// filing Target (repo + installation), and the numbered type's Prefix (e.g.
+// "ADR-") and TitleFormat (e.g. "[ADR-{number}] {summary}") so the provider
+// can compose the in:title search term and parse the number back out of each
+// matched title.
+type DiscoverNumbersRequest struct {
+	Target      Target
+	Prefix      string
+	TitleFormat string
+}
+
 // Repo is a provider-neutral repository coordinate. The GitHub provider
 // maps it onto its own owner/name ref; a future Jira provider maps it
 // onto a project key.

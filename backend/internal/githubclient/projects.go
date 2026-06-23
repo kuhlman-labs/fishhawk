@@ -176,6 +176,82 @@ func (c *Client) SearchOpenIssues(ctx context.Context, installationID int64, que
 	return results, nil
 }
 
+// IssueTitleResult is the slice of a search-result item the work-management
+// number-discovery consumes: the issue Number (unused by discovery) and the
+// Title the provider re-parses for the numbered-type [PREFIX-N] token.
+type IssueTitleResult struct {
+	Number int
+	Title  string
+}
+
+// searchByTitlePerPage is the issue Search API page size (its 100-item max).
+// searchByTitleMaxPages caps the paginated walk at the GitHub search 1000-
+// result ceiling (10 * 100), bounding the network surface of one discovery.
+const (
+	searchByTitlePerPage  = 100
+	searchByTitleMaxPages = 10
+)
+
+// SearchIssuesByTitle runs a paginated issue search and returns the matched
+// items' number + title.
+//
+//	GET /search/issues?q={query}&per_page=100&page=N
+//
+// The caller composes the full query string (including any repo:owner/name
+// and in:title qualifiers). Unlike SearchOpenIssues this method imposes NO
+// state qualifier — the caller's query omits is:open so CLOSED items count
+// (decided ADRs are closed, and undercounting them would re-allocate an
+// existing number). It paginates from page 1, stopping when a page returns
+// fewer than per_page items (or zero), with a hard cap of
+// searchByTitleMaxPages pages (the GitHub search 1000-result ceiling).
+// Requires the App to hold `issues:read`. Returns ErrForbidden on auth
+// issues, ErrValidation when GitHub rejects the query.
+func (c *Client) SearchIssuesByTitle(ctx context.Context, installationID int64, query string) ([]IssueTitleResult, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if strings.TrimSpace(query) == "" {
+		return nil, errors.New("githubclient: search query required")
+	}
+
+	var results []IssueTitleResult
+	for page := 1; page <= searchByTitleMaxPages; page++ {
+		endpoint := fmt.Sprintf("%s?q=%s&per_page=%d&page=%d",
+			c.endpoint("/search/issues"), url.QueryEscape(query), searchByTitlePerPage, page)
+		req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("githubclient: search issues by title: %w", err)
+		}
+		var out struct {
+			Items []struct {
+				Number int    `json:"number"`
+				Title  string `json:"title"`
+			} `json:"items"`
+		}
+		if err := classifyStatus("search issues by title", resp); err != nil {
+			_ = resp.Body.Close()
+			return nil, err
+		}
+		decErr := json.NewDecoder(resp.Body).Decode(&out)
+		_ = resp.Body.Close()
+		if decErr != nil {
+			return nil, fmt.Errorf("githubclient: decode search issues by title: %w", decErr)
+		}
+		for _, it := range out.Items {
+			results = append(results, IssueTitleResult{Number: it.Number, Title: it.Title})
+		}
+		// A short (or empty) page is the last page — stop before the cap.
+		if len(out.Items) < searchByTitlePerPage {
+			break
+		}
+	}
+	return results, nil
+}
+
 // IssueNodeID resolves an existing issue's GraphQL node id by number.
 //
 //	GET /repos/{owner}/{repo}/issues/{number}

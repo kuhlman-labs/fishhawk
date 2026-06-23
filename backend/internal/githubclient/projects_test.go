@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -364,6 +366,138 @@ func TestSearchOpenIssues_EmptyMiss(t *testing.T) {
 func TestSearchOpenIssues_ErrorStatus(t *testing.T) {
 	_, c := newSearchFake(t, http.StatusUnprocessableEntity, `{"message":"Validation Failed"}`)
 	_, err := c.SearchOpenIssues(context.Background(), 7, "repo:o/r bad")
+	if err == nil || !errors.Is(err, ErrValidation) {
+		t.Fatalf("want ErrValidation, got %v", err)
+	}
+}
+
+// titleItemsPage renders a search-results body with n synthetic numbered
+// titles, numbering them from startNum so multi-page assertions can verify
+// every page's items are collected.
+func titleItemsPage(startNum, n int) string {
+	var b strings.Builder
+	b.WriteString(`{"items":[`)
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		num := startNum + i
+		_, _ = io.WriteString(&b, fmt.Sprintf(`{"number":%d,"title":"[ADR-%03d] a decision"}`, 1000+num, num))
+	}
+	b.WriteString(`]}`)
+	return b.String()
+}
+
+// newPagedSearchFake serves GET /search/issues, returning pageBodies[page]
+// keyed by the requested ?page= and recording how many distinct page requests
+// arrived (so the 10-page cap can be asserted). A page absent from the map
+// serves an empty items list.
+func newPagedSearchFake(t *testing.T, status int, pageBodies map[int]string) (*int, *Client) {
+	t.Helper()
+	var pages int
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /search/issues", func(w http.ResponseWriter, r *http.Request) {
+		pages++
+		page := 1
+		if p := r.URL.Query().Get("page"); p != "" {
+			if v, err := strconv.Atoi(p); err == nil {
+				page = v
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(orDefault(status, http.StatusOK))
+		body, ok := pageBodies[page]
+		if !ok {
+			body = `{"items":[]}`
+		}
+		_, _ = io.WriteString(w, body)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{
+		BaseURL: srv.URL,
+		Tokens:  &stubTokens{token: "ghs_canned"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+	}
+	return &pages, c
+}
+
+func TestSearchIssuesByTitle_SinglePageMapsNumberAndTitle(t *testing.T) {
+	gotQuery, c := newSearchFake(t, http.StatusOK,
+		`{"items":[{"number":865,"title":"[ADR-035] run branch ownership"},{"number":900,"title":"[ADR-040] operator role"}]}`)
+	const q = `repo:o/r in:title "[ADR-"`
+	got, err := c.SearchIssuesByTitle(context.Background(), 7, q)
+	if err != nil {
+		t.Fatalf("SearchIssuesByTitle: %v", err)
+	}
+	if *gotQuery != q {
+		t.Errorf("q parameter = %q, want %q", *gotQuery, q)
+	}
+	if len(got) != 2 {
+		t.Fatalf("results = %d, want 2", len(got))
+	}
+	if got[0].Number != 865 || got[0].Title != "[ADR-035] run branch ownership" {
+		t.Errorf("result[0] = %+v", got[0])
+	}
+	if got[1].Title != "[ADR-040] operator role" {
+		t.Errorf("result[1] = %+v", got[1])
+	}
+}
+
+func TestSearchIssuesByTitle_PaginatesAcrossPages(t *testing.T) {
+	// A full 100-item first page forces a second fetch; the short second page
+	// stops the walk. Every page's items must be collected.
+	pages, c := newPagedSearchFake(t, http.StatusOK, map[int]string{
+		1: titleItemsPage(1, 100),
+		2: titleItemsPage(101, 5),
+	})
+	got, err := c.SearchIssuesByTitle(context.Background(), 7, `repo:o/r in:title "[ADR-"`)
+	if err != nil {
+		t.Fatalf("SearchIssuesByTitle: %v", err)
+	}
+	if len(got) != 105 {
+		t.Errorf("results = %d, want 105 (100 + 5 across two pages)", len(got))
+	}
+	if *pages != 2 {
+		t.Errorf("requested %d pages, want 2 (stop on the short page)", *pages)
+	}
+}
+
+func TestSearchIssuesByTitle_StopsAtPageCap(t *testing.T) {
+	// Every page is full (100 items), so only the hard 10-page cap can stop the
+	// walk — the GitHub search 1000-result ceiling. Assert it fetches exactly 10
+	// pages and no more.
+	bodies := map[int]string{}
+	for p := 1; p <= 12; p++ {
+		bodies[p] = titleItemsPage((p-1)*100+1, 100)
+	}
+	pages, c := newPagedSearchFake(t, http.StatusOK, bodies)
+	got, err := c.SearchIssuesByTitle(context.Background(), 7, `repo:o/r in:title "[ADR-"`)
+	if err != nil {
+		t.Fatalf("SearchIssuesByTitle: %v", err)
+	}
+	if *pages != searchByTitleMaxPages {
+		t.Errorf("requested %d pages, want the %d-page cap", *pages, searchByTitleMaxPages)
+	}
+	if len(got) != searchByTitleMaxPages*searchByTitlePerPage {
+		t.Errorf("results = %d, want %d (capped)", len(got), searchByTitleMaxPages*searchByTitlePerPage)
+	}
+}
+
+func TestSearchIssuesByTitle_EmptyMiss(t *testing.T) {
+	_, c := newSearchFake(t, http.StatusOK, `{"items":[]}`)
+	got, err := c.SearchIssuesByTitle(context.Background(), 7, `repo:o/r in:title "[ADR-"`)
+	if err != nil {
+		t.Fatalf("SearchIssuesByTitle: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("results = %d, want 0", len(got))
+	}
+}
+
+func TestSearchIssuesByTitle_ErrorStatus(t *testing.T) {
+	_, c := newSearchFake(t, http.StatusUnprocessableEntity, `{"message":"Validation Failed"}`)
+	_, err := c.SearchIssuesByTitle(context.Background(), 7, "repo:o/r bad")
 	if err == nil || !errors.Is(err, ErrValidation) {
 		t.Fatalf("want ErrValidation, got %v", err)
 	}

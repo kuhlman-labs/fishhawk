@@ -56,6 +56,10 @@ type fakeAPI struct {
 	subParent, subChild string
 	subErr              error
 
+	searchQuery   string
+	searchResults []githubclient.IssueTitleResult
+	searchErr     error
+
 	projectsTokenConfigured bool
 }
 
@@ -108,6 +112,14 @@ func (f *fakeAPI) SetProjectItemSingleSelect(_ context.Context, _ int64, project
 func (f *fakeAPI) AddSubIssue(_ context.Context, _ int64, parentNodeID, childNodeID string) error {
 	f.subParent, f.subChild = parentNodeID, childNodeID
 	return f.subErr
+}
+
+func (f *fakeAPI) SearchIssuesByTitle(_ context.Context, _ int64, query string) ([]githubclient.IssueTitleResult, error) {
+	f.searchQuery = query
+	if f.searchErr != nil {
+		return nil, f.searchErr
+	}
+	return f.searchResults, nil
 }
 
 func (f *fakeAPI) ProjectsTokenConfigured() bool { return f.projectsTokenConfigured }
@@ -639,9 +651,102 @@ func TestProvider_Transition_MissingInstallationRejected(t *testing.T) {
 	}
 }
 
+// discoverRequest is the canonical adr number-discovery request: the ADR
+// title_format + prefix against the baseRequest target (installation 99).
+func discoverRequest() workmgmt.DiscoverNumbersRequest {
+	return workmgmt.DiscoverNumbersRequest{
+		Target:      baseRequest().Target,
+		Prefix:      "ADR-",
+		TitleFormat: "[ADR-{number}] {summary}",
+	}
+}
+
+func TestProvider_DiscoverNumbers_ParsesPaddedAndClosedTitles(t *testing.T) {
+	// Padded ([ADR-041]) and unpadded ([ADR-9]) titles both parse, and a
+	// closed-issue title counts (decided ADRs are closed → the query carries no
+	// is:open). The search term must be the literal prefix before {number}.
+	api := &fakeAPI{searchResults: []githubclient.IssueTitleResult{
+		{Number: 200, Title: "[ADR-041] padded decision"},
+		{Number: 201, Title: "[ADR-9] a closed, decided ADR"},
+	}}
+	got, err := New(api).DiscoverNumbers(context.Background(), discoverRequest())
+	if err != nil {
+		t.Fatalf("DiscoverNumbers: %v", err)
+	}
+	if len(got) != 2 || got[0] != 41 || got[1] != 9 {
+		t.Errorf("numbers = %v, want [41 9]", got)
+	}
+	if !strings.Contains(api.searchQuery, `in:title "[ADR-"`) {
+		t.Errorf("search query = %q, want it to carry the literal [ADR- in:title term", api.searchQuery)
+	}
+	if strings.Contains(api.searchQuery, "is:open") {
+		t.Errorf("search query = %q must NOT restrict to is:open (closed ADRs count)", api.searchQuery)
+	}
+	if !strings.Contains(api.searchQuery, "repo:kuhlman-labs/fishhawk") {
+		t.Errorf("search query = %q, want it scoped to the target repo", api.searchQuery)
+	}
+}
+
+func TestProvider_DiscoverNumbers_EmptyResultReturnsEmpty(t *testing.T) {
+	// The genuine-first path: no matches → empty slice, no error. The handler
+	// then seeds [0] → number 1, never a silent 001.
+	api := &fakeAPI{searchResults: nil}
+	got, err := New(api).DiscoverNumbers(context.Background(), discoverRequest())
+	if err != nil {
+		t.Fatalf("DiscoverNumbers: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("numbers = %v, want empty", got)
+	}
+}
+
+func TestProvider_DiscoverNumbers_SkipsMalformedTitles(t *testing.T) {
+	// GitHub in:title search is fuzzy, so a hit whose title lacks the [ADR-N]
+	// token must be ignored rather than counted.
+	api := &fakeAPI{searchResults: []githubclient.IssueTitleResult{
+		{Number: 1, Title: "[ADR-007] a real one"},
+		{Number: 2, Title: "ADR considerations without the token"},
+		{Number: 3, Title: "[ADR-] missing the number"},
+	}}
+	got, err := New(api).DiscoverNumbers(context.Background(), discoverRequest())
+	if err != nil {
+		t.Fatalf("DiscoverNumbers: %v", err)
+	}
+	if len(got) != 1 || got[0] != 7 {
+		t.Errorf("numbers = %v, want [7] (malformed titles skipped)", got)
+	}
+}
+
+func TestProvider_DiscoverNumbers_MissingInstallationRejected(t *testing.T) {
+	// Fail closed: a run-absent target leaves InstallationID 0; discovery must
+	// error rather than dispatch an untokened search.
+	req := discoverRequest()
+	req.Target.InstallationID = 0
+	api := &fakeAPI{}
+	_, err := New(api).DiscoverNumbers(context.Background(), req)
+	if err == nil || !strings.Contains(err.Error(), "no installation id available") {
+		t.Fatalf("want missing-installation error, got %v", err)
+	}
+	if api.searchQuery != "" {
+		t.Errorf("search must not be dispatched without an installation id, got query %q", api.searchQuery)
+	}
+}
+
+func TestProvider_DiscoverNumbers_SearchErrorPropagates(t *testing.T) {
+	// Fail closed: a genuine search error propagates so the handler returns the
+	// discovery_failed 422 rather than allocating off an empty result.
+	api := &fakeAPI{searchErr: errors.New("search API rejected the query")}
+	_, err := New(api).DiscoverNumbers(context.Background(), discoverRequest())
+	if err == nil || !strings.Contains(err.Error(), "search issues by title") {
+		t.Fatalf("want search error, got %v", err)
+	}
+}
+
 // Provider must satisfy workmgmt.Provider and the optional board-sync
-// capability workmgmt.Transitioner.
+// (workmgmt.Transitioner) + number-discovery (workmgmt.NumberDiscoverer)
+// capabilities.
 var (
-	_ workmgmt.Provider     = (*Provider)(nil)
-	_ workmgmt.Transitioner = (*Provider)(nil)
+	_ workmgmt.Provider         = (*Provider)(nil)
+	_ workmgmt.Transitioner     = (*Provider)(nil)
+	_ workmgmt.NumberDiscoverer = (*Provider)(nil)
 )
