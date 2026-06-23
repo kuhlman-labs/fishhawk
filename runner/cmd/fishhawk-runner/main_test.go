@@ -10678,7 +10678,7 @@ func TestRefreshScopeAmendments_FoldsApprovedOnly(t *testing.T) {
 	cfg := amendmentCfg(upload.ScopeFile{Path: "pkg/in_scope.go", Operation: "modify"})
 	var log bytes.Buffer
 
-	refreshScopeAmendments(context.Background(), fake, cfg, "fhm_heldbyrunner", &log)
+	events := refreshScopeAmendments(context.Background(), fake, cfg, "fhm_heldbyrunner", &log)
 
 	if fake.gotAmendmentArgs == nil {
 		t.Fatal("FetchScopeAmendments never called")
@@ -10706,6 +10706,59 @@ func TestRefreshScopeAmendments_FoldsApprovedOnly(t *testing.T) {
 	if !strings.Contains(log.String(), "scope_amendments_folded") {
 		t.Errorf("log missing scope_amendments_folded event: %s", log.String())
 	}
+
+	// The returned event records EXACTLY the folded set (approved AND not
+	// already present) — the per-commit fold record, not amendment intent.
+	// pending/denied and the already-declared in_scope path must NOT appear.
+	if len(events) != 1 {
+		t.Fatalf("expected exactly 1 returned event, got %d: %+v", len(events), events)
+	}
+	if events[0].Kind != "policy_event" {
+		t.Errorf("event kind = %q, want policy_event", events[0].Kind)
+	}
+	var payload struct {
+		Check string   `json:"check"`
+		Added []string `json:"added"`
+	}
+	if err := json.Unmarshal(events[0].Payload, &payload); err != nil {
+		t.Fatalf("decode event payload: %v", err)
+	}
+	if payload.Check != "scope_amendments_folded" {
+		t.Errorf("payload check = %q, want scope_amendments_folded", payload.Check)
+	}
+	gotAdded := map[string]int{}
+	for _, p := range payload.Added {
+		gotAdded[p]++
+	}
+	if len(payload.Added) != 2 || gotAdded["pkg/newfile.go"] != 1 || gotAdded["pkg/extra.go"] != 1 {
+		t.Errorf("added = %v, want exactly {pkg/newfile.go, pkg/extra.go} (the folded set, not intent)", payload.Added)
+	}
+	for _, never := range []string{"pkg/in_scope.go", "pkg/pending.go", "pkg/denied.go"} {
+		if gotAdded[never] != 0 {
+			t.Errorf("added must not contain %q (already-present / undecided / denied)", never)
+		}
+	}
+}
+
+func TestRefreshScopeAmendments_NoFoldNoEvent(t *testing.T) {
+	fake := newFakeUploader(t)
+	// All amendments are already-present, pending, or denied — nothing to fold.
+	fake.amendments = []upload.ScopeAmendment{
+		{ID: "a1", Status: "approved", Paths: []upload.ScopeAmendmentPath{{Path: "pkg/in_scope.go", Operation: "modify"}}},
+		{ID: "a2", Status: "pending", Paths: []upload.ScopeAmendmentPath{{Path: "pkg/pending.go", Operation: "modify"}}},
+		{ID: "a3", Status: "denied", Paths: []upload.ScopeAmendmentPath{{Path: "pkg/denied.go", Operation: "modify"}}},
+	}
+	cfg := amendmentCfg(upload.ScopeFile{Path: "pkg/in_scope.go", Operation: "modify"})
+	var log bytes.Buffer
+
+	events := refreshScopeAmendments(context.Background(), fake, cfg, "fhm_held", &log)
+
+	if events != nil {
+		t.Errorf("expected nil events when nothing folded, got %+v", events)
+	}
+	if strings.Contains(log.String(), "scope_amendments_folded") {
+		t.Errorf("must not log scope_amendments_folded when nothing folded: %s", log.String())
+	}
 }
 
 func TestRefreshScopeAmendments_NoTokenOrEmptyScopeNoOps(t *testing.T) {
@@ -10717,7 +10770,9 @@ func TestRefreshScopeAmendments_NoTokenOrEmptyScopeNoOps(t *testing.T) {
 
 	// No token → never calls the backend.
 	cfg := amendmentCfg(upload.ScopeFile{Path: "pkg/in_scope.go", Operation: "modify"})
-	refreshScopeAmendments(context.Background(), fake, cfg, "", &log)
+	if ev := refreshScopeAmendments(context.Background(), fake, cfg, "", &log); ev != nil {
+		t.Errorf("expected nil events on the no-token guard, got %+v", ev)
+	}
 	if fake.gotAmendmentArgs != nil {
 		t.Error("refresh called the backend without a token")
 	}
@@ -10727,7 +10782,9 @@ func TestRefreshScopeAmendments_NoTokenOrEmptyScopeNoOps(t *testing.T) {
 
 	// Empty scope (git add -A fallback) → never narrows.
 	cfg = amendmentCfg()
-	refreshScopeAmendments(context.Background(), fake, cfg, "fhm_held", &log)
+	if ev := refreshScopeAmendments(context.Background(), fake, cfg, "fhm_held", &log); ev != nil {
+		t.Errorf("expected nil events on the empty-scope guard, got %+v", ev)
+	}
 	if fake.gotAmendmentArgs != nil {
 		t.Error("refresh called the backend on an empty scope")
 	}
@@ -10742,7 +10799,9 @@ func TestRefreshScopeAmendments_FetchErrorKeepsScope(t *testing.T) {
 	cfg := amendmentCfg(upload.ScopeFile{Path: "pkg/in_scope.go", Operation: "modify"})
 	var log bytes.Buffer
 
-	refreshScopeAmendments(context.Background(), fake, cfg, "fhm_held", &log)
+	if ev := refreshScopeAmendments(context.Background(), fake, cfg, "fhm_held", &log); ev != nil {
+		t.Errorf("expected nil events on a fetch error, got %+v", ev)
+	}
 
 	if len(cfg.scopeFiles) != 1 || cfg.scopeFiles[0].Path != "pkg/in_scope.go" {
 		t.Errorf("scope changed on fetch error: %+v", cfg.scopeFiles)

@@ -1130,7 +1130,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// fail-loud for anything NOT requested. Best-effort (ADR-021): a
 	// refresh failure logs and proceeds with the unamended scope.
 	if res.OK && stageType == "implement" && !cfg.noPR {
-		refreshScopeAmendments(ctx, client, &cfg, mcpBearerToken, logSink)
+		res.Events = append(res.Events, refreshScopeAmendments(ctx, client, &cfg, mcpBearerToken, logSink)...)
 	}
 
 	// Committed-tree verify-fix loop (#651). On the implement push path,
@@ -5327,9 +5327,21 @@ func emitPendingScopeAmendments(seen map[string]struct{}, items []upload.ScopeAm
 // commit to just the amendment paths. Best-effort throughout: a fetch
 // failure logs scope_amendment_refresh_failed and the original scope
 // stays authoritative.
-func refreshScopeAmendments(ctx context.Context, client uploadClient, cfg *config, mcpToken string, logSink io.Writer) {
+// The returned []agent.Event carries a single scope_amendments_folded
+// policy_event recording EXACTLY the paths this call folded into
+// cfg.scopeFiles for this commit (the approved-and-not-already-present
+// set) — the authoritative per-commit fold record. The backend reads it
+// via bundle.ExtractScopeAmendmentsFolded and subtracts it from the
+// review-surface scope_drift, so an approved-amendment path that landed
+// in the pushed HEAD is no longer reported to the implement reviewer as
+// drift-excluded (#1317). The slice is sourced ONLY from the fold (never
+// from amendment intent): an approved-but-already-present or unapproved
+// path is never in `added`, so an approved-but-NOT-folded path stays as
+// real drift downstream. nil (no event) on the no-op guards and when
+// nothing was folded — mirroring the absent scope_drift event.
+func refreshScopeAmendments(ctx context.Context, client uploadClient, cfg *config, mcpToken string, logSink io.Writer) []agent.Event {
 	if client == nil || mcpToken == "" || len(cfg.scopeFiles) == 0 {
-		return
+		return nil
 	}
 	items, err := client.FetchScopeAmendments(ctx, upload.FetchScopeAmendmentsArgs{
 		RunID:    cfg.runID,
@@ -5339,7 +5351,7 @@ func refreshScopeAmendments(ctx context.Context, client uploadClient, cfg *confi
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"scope_amendment_refresh_failed","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
 			cfg.runID, cfg.stageID, err.Error())
-		return
+		return nil
 	}
 	existing := make(map[string]struct{}, len(cfg.scopeFiles))
 	for _, f := range cfg.scopeFiles {
@@ -5362,12 +5374,23 @@ func refreshScopeAmendments(ctx context.Context, client uploadClient, cfg *confi
 			added = append(added, p.Path)
 		}
 	}
-	if len(added) > 0 {
-		addedJSON, _ := json.Marshal(added)
-		_, _ = fmt.Fprintf(logSink,
-			`{"event":"scope_amendments_folded","run_id":%q,"stage_id":%q,"added":%s}`+"\n",
-			cfg.runID, cfg.stageID, addedJSON)
+	if len(added) == 0 {
+		return nil
 	}
+	addedJSON, _ := json.Marshal(added)
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"scope_amendments_folded","run_id":%q,"stage_id":%q,"added":%s}`+"\n",
+		cfg.runID, cfg.stageID, addedJSON)
+	// Mirror the scope_drift policy_event shape (computeAndEmitDiff) so the
+	// folded set rides into BOTH bundle variants (PackBytes / redactEvents)
+	// alongside the pre-fold scope_drift snapshot.
+	return []agent.Event{{
+		Kind: "policy_event",
+		Payload: agent.MakePayload(map[string]any{
+			"check": "scope_amendments_folded",
+			"added": added,
+		}),
+	}}
 }
 
 // scopePaths extracts the repo-relative path list from the resolved

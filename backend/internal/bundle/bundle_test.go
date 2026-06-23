@@ -459,6 +459,103 @@ func TestExtractScopeDrift_BadPayload(t *testing.T) {
 	}
 }
 
+func TestExtractScopeAmendmentsFolded_HappyPath(t *testing.T) {
+	// The runner's scope_amendments_folded policy_event carries the paths it
+	// folded into the effective scope for this commit; ExtractScopeAmendmentsFolded
+	// round-trips them (#1317). A co-present scope_drift event must NOT be
+	// mistaken for the fold record (discriminated by `check`).
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		makeDiffLine(t, "origin/main", [2]string{"a.go", "M"}),
+		{Seq: 3, Kind: EventKindPolicyEvent, Data: json.RawMessage(
+			`{"check":"scope_drift","outcome":"excluded","undeclared":["folded.go","real_drift.go"]}`)},
+		{Seq: 4, Kind: EventKindPolicyEvent, Data: json.RawMessage(
+			`{"check":"scope_amendments_folded","added":["folded.go"]}`)},
+		{Seq: 5, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractScopeAmendmentsFolded(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractScopeAmendmentsFolded: %v", err)
+	}
+	want := []string{"folded.go"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestExtractScopeAmendmentsFolded_NoEvent(t *testing.T) {
+	// No scope_amendments_folded event is the ordinary no-amendment case —
+	// (nil, nil), not an error. A non-folded policy_event (scope_drift) is
+	// skipped, not mistaken for the fold record.
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		makeDiffLine(t, "origin/main", [2]string{"a.go", "M"}),
+		{Seq: 3, Kind: EventKindPolicyEvent, Data: json.RawMessage(
+			`{"check":"scope_drift","outcome":"excluded","undeclared":["a_test.go"]}`)},
+		{Seq: 4, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractScopeAmendmentsFolded(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractScopeAmendmentsFolded: %v", err)
+	}
+	if got != nil {
+		t.Errorf("got %v, want nil for a bundle with no scope_amendments_folded event", got)
+	}
+}
+
+func TestExtractScopeAmendmentsFolded_BadGzip(t *testing.T) {
+	_, err := ExtractScopeAmendmentsFolded([]byte("not gzipped"))
+	if !errors.Is(err, ErrBadGzip) {
+		t.Errorf("err = %v, want ErrBadGzip", err)
+	}
+}
+
+func TestExtractScopeAmendmentsFolded_BadPayload(t *testing.T) {
+	// A scope_amendments_folded policy_event whose `added` is a string, not
+	// an array → json.Unmarshal into scopeAmendmentsFoldedPayload fails. The
+	// trace handler WARN-degrades to no subtraction, but this branch must
+	// still surface the error rather than silently returning empty.
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		{Seq: 2, Kind: EventKindPolicyEvent, Data: json.RawMessage(
+			`{"check":"scope_amendments_folded","added":"not-an-array"}`)},
+	}
+	_, err := ExtractScopeAmendmentsFolded(packLines(t, lines))
+	if err == nil || !strings.Contains(err.Error(), "parse policy_event payload") {
+		t.Errorf("err = %v, want a parse-payload error", err)
+	}
+}
+
+func TestExtractScopeAmendmentsFolded_RawAndRedactedVariantsAgree(t *testing.T) {
+	// The runner packs the same events into both the raw and the redacted
+	// bundle variant; the folded `added` set is a repo-relative path list that
+	// redaction never rewrites, so both variants must yield the identical
+	// fold record (mirrors the dual-variant idempotency property for
+	// ExtractScopeDrift). Modeled here as two packs of the same lines.
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		{Seq: 2, Kind: EventKindPolicyEvent, Data: json.RawMessage(
+			`{"check":"scope_amendments_folded","added":["x.go","y.go"]}`)},
+		{Seq: 3, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	rawGot, err := ExtractScopeAmendmentsFolded(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("raw variant: %v", err)
+	}
+	redGot, err := ExtractScopeAmendmentsFolded(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("redacted variant: %v", err)
+	}
+	if len(rawGot) != len(redGot) {
+		t.Fatalf("variant mismatch: raw %v vs redacted %v", rawGot, redGot)
+	}
+	for i := range rawGot {
+		if rawGot[i] != redGot[i] {
+			t.Errorf("path %d: raw %q vs redacted %q", i, rawGot[i], redGot[i])
+		}
+	}
+}
+
 func TestReadEvents_AllLinesReturned(t *testing.T) {
 	lines := []Line{
 		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{}`)},

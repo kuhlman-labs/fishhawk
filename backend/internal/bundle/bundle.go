@@ -206,6 +206,22 @@ type scopeDriftPayload struct {
 	Undeclared []string `json:"undeclared"`
 }
 
+// scopeAmendmentsFoldedPayload mirrors the runner's
+// scope_amendments_folded policy_event payload exactly. The emitter is
+// refreshScopeAmendments (runner/cmd/fishhawk-runner/main.go), which
+// builds it via agent.MakePayload(map[string]any{
+// "check":"scope_amendments_folded", "added":[...]}). Unlike the
+// scopeDriftPayload (a PRE-fold snapshot), this is the authoritative
+// per-commit FOLD record — exactly the approved-amendment paths the
+// runner folded into cfg.scopeFiles for this commit. Like scopeDriftPayload
+// this is a lockstep runner↔backend wire contract, not a JSON Schema — the
+// `check` / `added` json tags MUST stay identical to the emitter or
+// ExtractScopeAmendmentsFolded silently reads nothing.
+type scopeAmendmentsFoldedPayload struct {
+	Check string   `json:"check"`
+	Added []string `json:"added"`
+}
+
 // verifyRunPayload mirrors the runner's verify_run event payload
 // (verifyRunEvent in runner/cmd/fishhawk-runner/main.go). Only head_sha
 // is read here; like the other payloads this is a lockstep runner↔backend
@@ -532,6 +548,43 @@ func ExtractScopeDrift(bundleBytes []byte) ([]string, error) {
 			continue
 		}
 		return payload.Undeclared, nil
+	}
+	return nil, nil
+}
+
+// ExtractScopeAmendmentsFolded returns the `added` path list carried in the
+// bundle's scope_amendments_folded policy_event — the authoritative
+// per-commit record of the approved scope-amendment paths the runner folded
+// into the effective scope for THIS commit (#1317). It contrasts with
+// ExtractScopeDrift, which returns the PRE-fold drift snapshot: the trace
+// handler subtracts the folded set from the review-surface drift so an
+// approved-amendment path that landed in the pushed HEAD is not reported to
+// the implement reviewer as drift-excluded.
+//
+// refreshScopeAmendments (runner/cmd/fishhawk-runner/main.go) emits the event
+// only when it folded at least one approved-and-not-already-present path, so
+// an absent event is the ordinary no-amendment case and is NOT an error —
+// it returns (nil, nil). Only a corrupt gzip frame / malformed line
+// propagates as an error. Like ExtractScopeDrift this is a lockstep
+// runner↔backend wire contract; the scopeAmendmentsFoldedPayload tags move
+// with the emitter.
+func ExtractScopeAmendmentsFolded(bundleBytes []byte) ([]string, error) {
+	lines, err := ReadEvents(bundleBytes)
+	if err != nil {
+		return nil, err
+	}
+	for _, line := range lines {
+		if line.Kind != EventKindPolicyEvent {
+			continue
+		}
+		var payload scopeAmendmentsFoldedPayload
+		if err := json.Unmarshal(line.Data, &payload); err != nil {
+			return nil, fmt.Errorf("bundle: parse policy_event payload: %w", err)
+		}
+		if payload.Check != "scope_amendments_folded" {
+			continue
+		}
+		return payload.Added, nil
 	}
 	return nil, nil
 }
