@@ -315,8 +315,14 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 					"--fetch-prompt",
 					"--upload-trace",
 					"--github-repo", repo,
-					// wave N's children cut their slice branch from the prior
-					// wave's merged tree via the runner's freshFetchBase routing.
+					// --base-branch / --check-base-ref drives BOTH halves of wave
+					// N's basing on the prior wave's merged tree: (a) the runner's
+					// PRE-INVOKE working-tree checkout of this base into the child
+					// worktree, so the agent SEES its predecessors' integrated
+					// symbols and can compile (#1302); and (b) the commit-time
+					// branch cut from origin/<base> (the runner's freshFetchBase
+					// routing). freshFetchBase alone governs only (b) — the
+					// agent's working tree is established by (a).
 					"--base-branch", waveBase,
 					"--check-base-ref", waveBase,
 					// The load-bearing flag: each concurrent child keys its worktree

@@ -883,26 +883,40 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		})
 	}
 
-	// Child base establishment (#1036): pre-ADR-041 a subsequent child's
-	// declared policy base was the prior sibling's shared-branch tip (#765),
-	// so this block fetched + checked it out before invoking the agent. Under
-	// ADR-041 (#1141) each child cuts its OWN sole-writer slice branch
-	// (childSliceBranch) fresh from base, which is minted once and so never
-	// pre-exists on the remote: remoteBranchExists is always false here and
-	// this block correctly no-ops — independent slices run against the base,
-	// not a prior sibling's tree (fan-in is E24.2). The block is retained
-	// (keyed on the slice branch) so the behavior is explicit rather than
-	// silently dropped, and so a future shared-checkout variant re-enables it
-	// by construction. The restore defer fires BEFORE the #953 stage-wide net
-	// (LIFO), whose moved-HEAD guard then sees HEAD already restored and
-	// no-ops — the same double-fire-safe construction as the fixup block above.
+	// Child wave-base establishment (#1302, supersedes the dormant #1036 /
+	// ADR-041 slice-branch keying): a dependent (wave-N) decomposition slice
+	// must run against its predecessors' INTEGRATED tree, not the operator's
+	// ambient HEAD. The wave loop (fishhawk_run_children) merges each settled
+	// wave onto the consolidated branch and re-dispatches the next wave with
+	// --base-branch / --check-base-ref=<consolidated>; for wave 0 (and every
+	// independent fan-out) that resolved base is main. So fetch + check out the
+	// resolved WAVE base ref (cfg.checkBaseRef) into the worktree BEFORE the
+	// agent is invoked — then a slice referencing a predecessor's new symbols
+	// sees them and can compile, instead of correctly writing nothing and
+	// failing child_no_changes (#1302). The prior block keyed this checkout on
+	// the child's OWN sole-writer slice branch (childSliceBranch), which is
+	// minted once and so NEVER pre-exists on the remote: remoteBranchExists was
+	// always false and the block silently no-oped in production — the exact
+	// #1302 defect. The remoteBranchExists guard is retained so an absent base
+	// (a never-pushed main, or an empty consolidated when GitHub is not wired)
+	// gracefully skips and falls through to today's ambient-HEAD behavior. This
+	// base now AGREES with the commit-time branch cut (resolveImplementBranch-
+	// Routing's freshFetchBase = baseRef) and the policy diff (decomposedPolicy-
+	// Base → cfg.checkBaseRef), so the agent's view, the policy-diff base, and
+	// the push base are one wave base. The restore defer fires BEFORE the #953
+	// stage-wide net (LIFO), whose moved-HEAD guard then sees HEAD already
+	// restored and no-ops — the same double-fire-safe construction as the fixup
+	// block above.
 	if stageType == "implement" && cfg.decomposedFromRunID != "" && !cfg.fixup {
 		repoDir := cfg.workingDir
 		if repoDir == "" {
 			repoDir = "."
 		}
-		sharedBranch := childSliceBranch(cfg.decomposedFromRunID, runSliceIndex)
-		if remoteBranchExists(ctx, repoDir, sharedBranch) {
+		baseRef := cfg.checkBaseRef
+		if baseRef == "" {
+			baseRef = resolveImplementBaseRef(cfg)
+		}
+		if remoteBranchExists(ctx, repoDir, baseRef) {
 			childCheckoutMoved := false
 			if preAgentCaptured {
 				defer func() {
@@ -920,7 +934,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 						cfg.runID, cfg.stageID, preAgentRef, preAgentDetached)
 				}()
 			}
-			tipSHA, coErr := checkoutChildBase(ctx, repoDir, gitops.DefaultRemote, sharedBranch)
+			tipSHA, coErr := checkoutChildBase(ctx, repoDir, gitops.DefaultRemote, baseRef)
 			if coErr != nil {
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"runner_failed","reason":"child_base_checkout","detail":%q}`+"\n", coErr.Error())
@@ -929,7 +943,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			childCheckoutMoved = true
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"child_base_established","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"original_ref":%q}`+"\n",
-				cfg.runID, cfg.stageID, sharedBranch, tipSHA, preAgentRef)
+				cfg.runID, cfg.stageID, baseRef, tipSHA, preAgentRef)
 		}
 	}
 
@@ -5124,9 +5138,12 @@ func childNoChangesReason(sliceIndex int) string {
 	return fmt.Sprintf("child_no_changes: dependent child slice %d implement stage produced no changes; "+
 		"the merged changes of predecessor slices 0..%d (every slice before this one) are absent from this "+
 		"slice's isolated base, so code referencing them could not compile and was correctly not written. "+
-		"Recovery: consolidate predecessor slices 0..%d via fishhawk_consolidate_slices, then re-drive this "+
-		"slice against the integrated base. Stage terminalized retryable (#1036).",
-		sliceIndex, sliceIndex-1, sliceIndex-1)
+		"Recovery: re-drive this child's implement stage with fishhawk_retry_stage (category C is retryable), "+
+		"then fishhawk_run_children on the parent — the wave loop integrates the predecessor slices and "+
+		"re-bases this slice on the consolidated branch so it can compile. Do NOT call "+
+		"fishhawk_consolidate_slices while this child is failed; it returns 409 children_failed by design. "+
+		"Stage terminalized retryable (#1036).",
+		sliceIndex, sliceIndex-1)
 }
 
 // reportPullRequestFailure POSTs a failure-outcome body to
