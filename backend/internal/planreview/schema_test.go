@@ -276,6 +276,92 @@ func TestStrictVerdictSchema_DecodeNullOptionals(t *testing.T) {
 	}
 }
 
+// nullCount returns how many "null" string entries a type-union slice contains.
+// Used to pin the dedupe invariant: the union branch must add "null" exactly
+// once and never duplicate an existing one.
+func nullCount(typ any) int {
+	arr, ok := typ.([]any)
+	if !ok {
+		return 0
+	}
+	n := 0
+	for _, e := range arr {
+		if s, ok := e.(string); ok && s == "null" {
+			n++
+		}
+	}
+	return n
+}
+
+// TestMakeNullable exercises makeNullable's currently-unreached type-array
+// (union) widening branch directly. makeNullable is invoked by strictTransform
+// only on originally-optional VerdictSchema() properties, which all declare a
+// bare string type ("string"/"array"), so the existing suite never drives the
+// []any branch nor its duplicate-"null" guard. Each row builds a FRESH input
+// (makeNullable mutates and returns the passed-in map, so a shared map would
+// alias across cases) and asserts the returned value DeepEquals the expected
+// node, plus the "null" occurrence count where a union is involved.
+func TestMakeNullable(t *testing.T) {
+	cases := []struct {
+		name          string
+		input         any
+		want          any
+		wantNullCount int // expected count of "null" in the result type-union
+	}{
+		{
+			// Union branch: a type-union lacking "null" gains it exactly once.
+			name:          "union without null gains null once",
+			input:         map[string]any{"type": []any{"string"}},
+			want:          map[string]any{"type": []any{"string", "null"}},
+			wantNullCount: 1,
+		},
+		{
+			// Dedupe guard: a union ALREADY containing "null" is unchanged — no
+			// duplicate appended (the regression this test guards).
+			name:          "union already with null is unchanged",
+			input:         map[string]any{"type": []any{"string", "null"}},
+			want:          map[string]any{"type": []any{"string", "null"}},
+			wantNullCount: 1,
+		},
+		{
+			// The dedupe scans the whole array, not just the head — "null" first
+			// still counts as present, so the array is returned unchanged.
+			name:          "union with null not at head is unchanged",
+			input:         map[string]any{"type": []any{"null", "array"}},
+			want:          map[string]any{"type": []any{"null", "array"}},
+			wantNullCount: 1,
+		},
+		{
+			// Early-return guard: a node with no `type` key is returned unchanged.
+			name:          "node without type is unchanged",
+			input:         map[string]any{"description": "no type here"},
+			want:          map[string]any{"description": "no type here"},
+			wantNullCount: 0,
+		},
+		{
+			// Early-return guard: a non-map input is returned unchanged.
+			name:          "non-map input is unchanged",
+			input:         "string",
+			want:          "string",
+			wantNullCount: 0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := makeNullable(tc.input)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("makeNullable(%#v) = %#v, want %#v", tc.input, got, tc.want)
+			}
+			if m, ok := got.(map[string]any); ok {
+				if n := nullCount(m["type"]); n != tc.wantNullCount {
+					t.Errorf("makeNullable(%#v) type %#v has %d \"null\" entries, want %d", tc.input, m["type"], n, tc.wantNullCount)
+				}
+			}
+		})
+	}
+}
+
 func mustEnum(t *testing.T, props map[string]any, key string) []any {
 	t.Helper()
 	node, ok := props[key].(map[string]any)
