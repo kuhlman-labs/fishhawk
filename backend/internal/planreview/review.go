@@ -21,6 +21,34 @@ const (
 	VerdictReject              Verdict = "reject"
 )
 
+// AllVerdicts is the single source of truth for the closed Verdict set
+// (#1324). It is the ONE list both VerdictSchema()'s `verdict` enum array and
+// the Verdict.Valid validation path derive from — every reviewer adapter
+// validates through Verdict.Valid rather than a private hand-maintained map, so
+// adding a Verdict constant without also listing it here is impossible to do
+// silently: the new constant would be absent from BOTH the schema enum and the
+// accepted set together, and the schema drift test asserts this list equals the
+// schema enum. The ordering is the canonical approve→reject ordering and is the
+// order emitted into the schema enum.
+var AllVerdicts = []Verdict{
+	VerdictApprove,
+	VerdictApproveWithConcerns,
+	VerdictReject,
+}
+
+// Valid reports whether v is a member of the closed AllVerdicts set. It is the
+// canonical verdict-validation path the reviewer adapters consume (#1324),
+// replacing their previously per-adapter validVerdicts maps so there is exactly
+// one accepted-verdict list, shared with VerdictSchema().
+func (v Verdict) Valid() bool {
+	for _, known := range AllVerdicts {
+		if v == known {
+			return true
+		}
+	}
+	return false
+}
+
 // ConcernSeverity classifies the weight of a reviewer concern.
 type ConcernSeverity string
 
@@ -30,6 +58,26 @@ const (
 	SeverityMedium ConcernSeverity = "medium"
 	SeverityLow    ConcernSeverity = "low"
 )
+
+// AllConcernSeverities is the single source of truth for the closed
+// ConcernSeverity set (#1324), consumed by VerdictSchema()'s concern `severity`
+// enum for the same no-drift reason as AllVerdicts. The ordering is the
+// canonical high→low ordering and is the order emitted into the schema enum.
+var AllConcernSeverities = []ConcernSeverity{
+	SeverityHigh,
+	SeverityMedium,
+	SeverityLow,
+}
+
+// Valid reports whether s is a member of the closed AllConcernSeverities set.
+func (s ConcernSeverity) Valid() bool {
+	for _, known := range AllConcernSeverities {
+		if s == known {
+			return true
+		}
+	}
+	return false
+}
 
 // Concern is one flagged issue within a review verdict.
 // Severity drives how the concern is surfaced to the operator;

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -94,7 +95,8 @@ func TestReviewer_HappyPath(t *testing.T) {
 		t.Errorf("model = %q, want %q", model, "claude-sonnet-4-6")
 	}
 
-	// Parse the captured HTTP request body to verify the split.
+	// Parse the captured HTTP request body to verify the split AND the
+	// structured-outputs constraint (#1324).
 	var reqBody struct {
 		System []struct {
 			Type string `json:"type"`
@@ -107,9 +109,34 @@ func TestReviewer_HappyPath(t *testing.T) {
 				Text string `json:"text"`
 			} `json:"content"`
 		} `json:"messages"`
+		OutputConfig struct {
+			Format struct {
+				Type   string         `json:"type"`
+				Schema map[string]any `json:"schema"`
+			} `json:"format"`
+		} `json:"output_config"`
 	}
 	if err := json.Unmarshal(captured, &reqBody); err != nil {
 		t.Fatalf("parse captured request body: %v", err)
+	}
+
+	// (c) the request carries output_config.format.type == "json_schema" and a
+	// schema deep-equal to the single planreview.VerdictSchema() source of truth.
+	// VerdictSchema() is normalized through a json round-trip so map ordering and
+	// value types match the decoded request body exactly.
+	if got := reqBody.OutputConfig.Format.Type; got != "json_schema" {
+		t.Errorf("output_config.format.type = %q, want %q (structured outputs not requested)", got, "json_schema")
+	}
+	wantSchemaBytes, err := json.Marshal(planreview.VerdictSchema())
+	if err != nil {
+		t.Fatalf("marshal VerdictSchema: %v", err)
+	}
+	var wantSchema map[string]any
+	if err := json.Unmarshal(wantSchemaBytes, &wantSchema); err != nil {
+		t.Fatalf("normalize VerdictSchema: %v", err)
+	}
+	if !reflect.DeepEqual(reqBody.OutputConfig.Format.Schema, wantSchema) {
+		t.Errorf("output_config.format.schema = %#v, want planreview.VerdictSchema() = %#v", reqBody.OutputConfig.Format.Schema, wantSchema)
 	}
 
 	// (a) system block contains preamble substring and NOT the plan artifact body.

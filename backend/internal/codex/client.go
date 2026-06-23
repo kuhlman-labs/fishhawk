@@ -210,6 +210,35 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 	}
 	defer func() { _ = os.RemoveAll(scratchDir) }()
 
+	// Structured outputs (#1324): constrain the model's final response to the
+	// single planreview.VerdictSchema() source of truth via `codex exec
+	// --output-schema <FILE>` (pinned against codex-cli 0.140.0, which takes a
+	// JSON Schema file path). The schema is written to a 0600 temp file
+	// (os.CreateTemp → os.TempDir(), so it lives OUTSIDE scratchDir and does NOT
+	// violate the #995 empty-cwd bound the reviewer runs under) and the flag is
+	// appended below; the file is removed when the invocation returns. The
+	// agent-message body is still run through planreview.DecodeVerdict, which is
+	// now the documented FALLBACK for any unconstrained/error response. FAIL the
+	// invocation on a marshal/write error rather than silently dropping the
+	// constraint and sending an unconstrained request.
+	schemaJSON, err := planreview.VerdictSchemaJSON()
+	if err != nil {
+		return "", "", planreview.Usage{}, false, fmt.Errorf("codex: marshal verdict schema: %w", err)
+	}
+	schemaFile, err := os.CreateTemp("", "fishhawk-codex-schema-*.json")
+	if err != nil {
+		return "", "", planreview.Usage{}, false, fmt.Errorf("codex: create verdict schema file: %w", err)
+	}
+	schemaPath := schemaFile.Name()
+	defer func() { _ = os.Remove(schemaPath) }()
+	if _, werr := schemaFile.Write(schemaJSON); werr != nil {
+		_ = schemaFile.Close()
+		return "", "", planreview.Usage{}, false, fmt.Errorf("codex: write verdict schema file: %w", werr)
+	}
+	if cerr := schemaFile.Close(); cerr != nil {
+		return "", "", planreview.Usage{}, false, fmt.Errorf("codex: close verdict schema file: %w", cerr)
+	}
+
 	// Flag rationale (pinned against codex-cli 0.137.0):
 	//   exec                  — the non-interactive subcommand; reads the
 	//                           prompt from the positional argument.
@@ -220,6 +249,10 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 	//                           dir (above), so this is required. A real run
 	//                           from a non-repo dir returns cleanly without
 	//                           the executor's --dangerously-bypass flags.
+	//   --output-schema <FILE> — constrains the model's final response to the
+	//                           planreview.VerdictSchema() JSON Schema written
+	//                           to schemaPath above (#1324, pinned codex-cli
+	//                           0.140.0). Always passed for a review invocation.
 	//   --model <model>       — overrides the host ~/.codex config's model;
 	//                           appended only when cfg.Model is set, so an empty
 	//                           config inherits the host default.
@@ -233,6 +266,7 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 	args := []string{
 		"exec", "--json",
 		"--skip-git-repo-check",
+		"--output-schema", schemaPath,
 	}
 	if c.cfg.Model != "" {
 		args = append(args, "--model", c.cfg.Model)

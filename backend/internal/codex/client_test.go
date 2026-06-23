@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,7 +13,42 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 )
+
+// extractOutputSchema strips the non-deterministic `--output-schema <path>`
+// pair the structured-outputs change (#1324) appends to the codex argv, and
+// reads the schema file at <path> so a caller can assert it byte-equals
+// planreview.VerdictSchemaJSON(). It MUST be called from inside the Cmd-builder
+// closure: invokeOnce removes the temp file via defer when it returns, so the
+// file only exists for the duration of the subprocess build/run.
+func extractOutputSchema(t *testing.T, args []string) (stripped []string, schema []byte) {
+	t.Helper()
+	i := slices.Index(args, "--output-schema")
+	if i < 0 || i+1 >= len(args) {
+		t.Fatalf("argv %q is missing the --output-schema <path> pair", args)
+	}
+	content, err := os.ReadFile(args[i+1])
+	if err != nil {
+		t.Fatalf("read --output-schema file %q: %v", args[i+1], err)
+	}
+	stripped = append(append([]string(nil), args[:i]...), args[i+2:]...)
+	return stripped, content
+}
+
+// assertSchemaFileMatches asserts the captured --output-schema file content
+// byte-equals the single VerdictSchemaJSON() source of truth.
+func assertSchemaFileMatches(t *testing.T, got []byte) {
+	t.Helper()
+	want, err := planreview.VerdictSchemaJSON()
+	if err != nil {
+		t.Fatalf("VerdictSchemaJSON: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("--output-schema file content = %s, want byte-equal to VerdictSchemaJSON() = %s", got, want)
+	}
+}
 
 // secretAPIKey is the sentinel forwarded as OPENAI_API_KEY in the forwarding /
 // redaction tests; it must never appear in a surfaced error string.
@@ -457,9 +493,13 @@ func TestInference_EmptyAPIKeyNotAnError(t *testing.T) {
 // TestInference_ArgvModelAndEffort asserts the config→argv boundary: Model and
 // ReasoningEffort are appended as `--model <m>` / `-c model_reasoning_effort=<e>`
 // only when set, both placed BEFORE the prompt positional (pinned by the exact
-// argv comparison), and an all-empty config yields exactly the base argv — the
-// inherit-host-default regression guard. The returned model label must equal
-// the configured (argv) model, so label and reality match.
+// argv comparison after stripping the non-deterministic --output-schema pair),
+// and an all-empty config yields exactly the base argv — the inherit-host-default
+// regression guard. The returned model label must equal the configured (argv)
+// model, so label and reality match. The structured-outputs change (#1324)
+// always appends `--output-schema <path>`; the wantArgv slices are the argv with
+// that pair stripped, and the schema file content is asserted byte-equal to
+// VerdictSchemaJSON() separately.
 func TestInference_ArgvModelAndEffort(t *testing.T) {
 	const prompt = "review"
 	tests := []struct {
@@ -509,9 +549,10 @@ func TestInference_ArgvModelAndEffort(t *testing.T) {
 			cfg.ReasoningEffort = tt.effort
 			c := NewClient(cfg)
 			var captured []string
+			var capturedSchema []byte
 			build := helperCommand("happy")
 			c.Cmd = func(ctx context.Context, name string, args ...string) *exec.Cmd {
-				captured = append([]string(nil), args...)
+				captured, capturedSchema = extractOutputSchema(t, args)
 				return build(ctx, name, args...)
 			}
 
@@ -520,8 +561,9 @@ func TestInference_ArgvModelAndEffort(t *testing.T) {
 				t.Fatalf("Inference: %v", err)
 			}
 			if !slices.Equal(captured, tt.wantArgv) {
-				t.Errorf("argv = %q, want %q", captured, tt.wantArgv)
+				t.Errorf("argv (--output-schema pair stripped) = %q, want %q", captured, tt.wantArgv)
 			}
+			assertSchemaFileMatches(t, capturedSchema)
 			if model != tt.model {
 				t.Errorf("model label = %q, want the configured model %q", model, tt.model)
 			}
@@ -594,10 +636,11 @@ func TestInference_ScratchDirWorkspace(t *testing.T) {
 
 	c := NewClient(testConfig())
 	var capturedArgs []string
+	var capturedSchema []byte
 	var capturedCmd *exec.Cmd
 	build := helperCommand("echo_cwd")
 	c.Cmd = func(ctx context.Context, name string, args ...string) *exec.Cmd {
-		capturedArgs = append([]string(nil), args...)
+		capturedArgs, capturedSchema = extractOutputSchema(t, args)
 		capturedCmd = build(ctx, name, args...)
 		return capturedCmd
 	}
@@ -607,19 +650,24 @@ func TestInference_ScratchDirWorkspace(t *testing.T) {
 		t.Fatalf("Inference: %v", err)
 	}
 	// The child approves only when its observed cwd is an empty directory
-	// distinct from the parent cwd; its free_form names the failure cause.
+	// distinct from the parent cwd; its free_form names the failure cause. The
+	// #1324 schema temp file lives in os.TempDir(), NOT the scratch cwd, so the
+	// empty-cwd bound holds — this assertion also guards that placement.
 	if !strings.Contains(text, `"verdict":"approve"`) {
 		t.Errorf("child cwd probe rejected the workspace: %s", text)
 	}
-	// The prompt is the sole positional arg, after the pinned flag set.
+	// The prompt is the sole positional arg, after the pinned flag set (the
+	// non-deterministic --output-schema <path> pair is stripped by
+	// extractOutputSchema, and its file content is asserted separately).
 	wantArgv := []string{
 		"exec", "--json", "--skip-git-repo-check",
 		"--model", "gpt-5-codex",
 		prompt,
 	}
 	if !slices.Equal(capturedArgs, wantArgv) {
-		t.Errorf("argv = %q, want %q", capturedArgs, wantArgv)
+		t.Errorf("argv (--output-schema pair stripped) = %q, want %q", capturedArgs, wantArgv)
 	}
+	assertSchemaFileMatches(t, capturedSchema)
 	// cmd.Dir was pointed at a scratch dir, not inherited (empty) or the
 	// process cwd — and the deferred cleanup removed it.
 	if capturedCmd.Dir == "" {
