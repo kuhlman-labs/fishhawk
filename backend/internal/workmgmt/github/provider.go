@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,6 +39,7 @@ type API interface {
 	AddProjectItem(ctx context.Context, installationID int64, projectID, contentID string) (string, error)
 	SetProjectItemSingleSelect(ctx context.Context, installationID int64, projectID, itemID, fieldID, optionID string) error
 	AddSubIssue(ctx context.Context, installationID int64, parentNodeID, childNodeID string) error
+	SearchIssuesByTitle(ctx context.Context, installationID int64, query string) ([]githubclient.IssueTitleResult, error)
 	ProjectsTokenConfigured() bool
 }
 
@@ -246,6 +248,115 @@ func labelOrUnset(status string) string {
 		return "(unset)"
 	}
 	return status
+}
+
+// DiscoverNumbers enumerates the sequential numbers already in use for a
+// numbered type (#1269) by searching issue TITLES — open AND closed, since
+// decided ADRs are closed — and parsing the number out of each matched title.
+// It is the optional workmgmt.NumberDiscoverer capability the filing handler
+// calls before Apply when a numbered filing omits existing_numbers.
+//
+// It validates the target repo + installation (fail closed with the same
+// actionable style File uses), derives the literal title prefix from
+// req.TitleFormat (the substring before {number}, e.g. "[ADR-") as the
+// in:title search term, composes a query with NO is:open qualifier, and
+// re-parses every returned title with a regex built from req.TitleFormat —
+// GitHub's in:title search is fuzzy, so a search hit is not proof the title
+// carries the [PREFIX-N] token. Non-matching/malformed titles are skipped.
+// Returns the collected numbers (possibly empty, no error). It never invents
+// a number: allocation stays in Apply, which seeds the +1 (or the seed-zero
+// first item) from this result.
+func (p *Provider) DiscoverNumbers(ctx context.Context, req workmgmt.DiscoverNumbersRequest) ([]int, error) {
+	if p.api == nil {
+		return nil, errors.New("workmgmt/github: provider missing API client")
+	}
+	if req.Target.Repo.Owner == "" || req.Target.Repo.Name == "" {
+		return nil, errors.New("workmgmt/github: target repo owner and name required")
+	}
+	inst := req.Target.InstallationID
+	if inst == 0 {
+		return nil, errors.New("workmgmt/github: no installation id available; number discovery is run-scoped in v0 — file with a run_id whose run carries an installation, or pass existing_numbers explicitly")
+	}
+	re, err := titleNumberRegexp(req.TitleFormat)
+	if err != nil {
+		return nil, fmt.Errorf("workmgmt/github: build title number regexp: %w", err)
+	}
+
+	repoQ := req.Target.Repo.Owner + "/" + req.Target.Repo.Name
+	query := fmt.Sprintf(`repo:%s in:title "%s"`, repoQ, titleNumberSearchPrefix(req.TitleFormat))
+	hits, err := p.api.SearchIssuesByTitle(ctx, inst, query)
+	if err != nil {
+		return nil, fmt.Errorf("workmgmt/github: search issues by title: %w", err)
+	}
+
+	numbers := make([]int, 0, len(hits))
+	for _, h := range hits {
+		m := re.FindStringSubmatch(h.Title)
+		if m == nil {
+			continue
+		}
+		// strconv.Atoi parses leading zeros (pad:3 titles like 041) cleanly.
+		n, convErr := strconv.Atoi(m[1])
+		if convErr != nil {
+			continue
+		}
+		numbers = append(numbers, n)
+	}
+	return numbers, nil
+}
+
+// titlePlaceholderRE matches a `{name}` placeholder in a title_format, so the
+// number-discovery helpers can split the literal segments from the {number}
+// (and any other) placeholder.
+var titlePlaceholderRE = regexp.MustCompile(`\{([a-zA-Z0-9_]+)\}`)
+
+// titleNumberSearchPrefix returns the literal title segment before {number}
+// (e.g. "[ADR-" for "[ADR-{number}] {summary}") — the in:title search term
+// that narrows the fuzzy search to candidate numbered titles. An empty result
+// (no {number} or it leads the format) yields "" and the search degrades to
+// repo-wide title matching, which the regex re-parse still filters.
+func titleNumberSearchPrefix(format string) string {
+	idx := strings.Index(format, "{number}")
+	if idx <= 0 {
+		return ""
+	}
+	// Drop characters that could break out of the quoted in:title qualifier in
+	// the composed search query: a double quote ends the quoted term and a
+	// backslash could escape the closing quote. A legitimate title prefix
+	// carries none of these, and the regex re-parse still validates exact
+	// matches, so stripping them only tightens the fuzzy search term.
+	return strings.Map(func(r rune) rune {
+		if r == '"' || r == '\\' {
+			return -1
+		}
+		return r
+	}, format[:idx])
+}
+
+// titleNumberRegexp builds an anchored regexp from a numbered type's
+// title_format that captures the integer substituted for {number}. The literal
+// segments are QuoteMeta-escaped, {number} becomes a (\d+) capture group, and
+// any other {placeholder} (e.g. {summary}) becomes .*? so the whole title
+// shape is matched. It anchors at ^ so a stray leading token cannot smuggle a
+// false number. An error is returned only if the assembled pattern fails to
+// compile (it should not for any well-formed format).
+func titleNumberRegexp(format string) (*regexp.Regexp, error) {
+	var b strings.Builder
+	b.WriteString("^")
+	last := 0
+	for _, loc := range titlePlaceholderRE.FindAllStringSubmatchIndex(format, -1) {
+		// Literal text before this placeholder.
+		b.WriteString(regexp.QuoteMeta(format[last:loc[0]]))
+		name := format[loc[2]:loc[3]]
+		if name == "number" {
+			b.WriteString(`(\d+)`)
+		} else {
+			b.WriteString(`.*?`)
+		}
+		last = loc[1]
+	}
+	b.WriteString(regexp.QuoteMeta(format[last:]))
+	return regexp.Compile(b.String())
 }
 
 // placeOnBoard adds the created issue to the configured project and sets

@@ -332,6 +332,189 @@ func TestFileWorkItem_NumberedType_EmptyExistingNumbers_Unprocessable(t *testing
 	}
 }
 
+// fakeDiscoverProvider is a workmgmt.Provider that ALSO implements the
+// optional workmgmt.NumberDiscoverer capability (#1269), so the handler's
+// type-assert resolves it and runs server-side discovery before Apply. It
+// records whether discovery was called and the request it received.
+type fakeDiscoverProvider struct {
+	fakeWorkProvider
+	discovered     []int
+	discoverErr    error
+	discoverCalled bool
+	discoverReq    workmgmt.DiscoverNumbersRequest
+}
+
+func (f *fakeDiscoverProvider) DiscoverNumbers(_ context.Context, req workmgmt.DiscoverNumbersRequest) ([]int, error) {
+	f.discoverCalled = true
+	f.discoverReq = req
+	if f.discoverErr != nil {
+		return nil, f.discoverErr
+	}
+	return f.discovered, nil
+}
+
+// registerFakeDiscoverProvider registers a discovery-capable fake under the
+// default provider id so the handler's workmgmt.Get + NumberDiscoverer assert
+// resolve it.
+func registerFakeDiscoverProvider(t *testing.T, p *fakeDiscoverProvider) {
+	t.Helper()
+	if p.name == "" {
+		p.name = workmgmt.Default().Provider
+	}
+	workmgmt.Register(p)
+}
+
+// TestFileWorkItem_NumberedTypeDiscoversNextNumber is the cross-boundary seam
+// (handler -> NumberDiscoverer capability -> provider): an adr filing with
+// existing_numbers omitted discovers the in-use numbers server-side and
+// allocates max+1.
+func TestFileWorkItem_NumberedTypeDiscoversNextNumber(t *testing.T) {
+	fp := &fakeDiscoverProvider{discovered: []int{65, 70, 79}}
+	registerFakeDiscoverProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:    "kuhlman-labs/fishhawk",
+		Type:    "adr",
+		Summary: "Record the discovery boundary",
+		// existing_numbers omitted on purpose — discovery fills it.
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !fp.discoverCalled {
+		t.Fatal("discovery capability was not invoked")
+	}
+	if fp.discoverReq.Prefix != "ADR-" || fp.discoverReq.TitleFormat != "[ADR-{number}] {summary}" {
+		t.Errorf("discover request = %+v, want adr prefix/format", fp.discoverReq)
+	}
+	if fp.captured.Number != 80 {
+		t.Errorf("ProviderRequest.Number = %d, want 80 (max(65,70,79)+1)", fp.captured.Number)
+	}
+	if fp.captured.Item.Title != "[ADR-080] Record the discovery boundary" {
+		t.Errorf("title = %q, want ADR-080", fp.captured.Item.Title)
+	}
+}
+
+// TestFileWorkItem_NumberedTypeDiscoversFirstNumber asserts the empty-discovery
+// seed path: no existing numbers -> the handler seeds [0] -> allocate yields 1
+// (ADR-001), NOT a silent wrong number nor a crash.
+func TestFileWorkItem_NumberedTypeDiscoversFirstNumber(t *testing.T) {
+	fp := &fakeDiscoverProvider{discovered: nil}
+	registerFakeDiscoverProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:    "kuhlman-labs/fishhawk",
+		Type:    "adr",
+		Summary: "The very first decision",
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !fp.discoverCalled {
+		t.Fatal("discovery capability was not invoked")
+	}
+	if fp.captured.Number != 1 {
+		t.Errorf("ProviderRequest.Number = %d, want 1 (empty discovery -> seed [0] -> 1)", fp.captured.Number)
+	}
+	if fp.captured.Item.Title != "[ADR-001] The very first decision" {
+		t.Errorf("title = %q, want ADR-001", fp.captured.Item.Title)
+	}
+}
+
+// TestFileWorkItem_CallerExistingNumbersOverridesDiscovery asserts a
+// caller-supplied existing_numbers short-circuits discovery — the discoverer is
+// NOT called and the caller's list wins.
+func TestFileWorkItem_CallerExistingNumbersOverridesDiscovery(t *testing.T) {
+	fp := &fakeDiscoverProvider{discovered: []int{500}} // would yield 501 if discovery ran
+	registerFakeDiscoverProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:            "kuhlman-labs/fishhawk",
+		Type:            "adr",
+		Summary:         "Caller knows best",
+		ExistingNumbers: []int{34, 35},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if fp.discoverCalled {
+		t.Error("discovery ran despite a caller-supplied existing_numbers override")
+	}
+	if fp.captured.Number != 36 {
+		t.Errorf("ProviderRequest.Number = %d, want 36 (caller list 34,35 -> 36)", fp.captured.Number)
+	}
+}
+
+// TestFileWorkItem_DiscoveryErrorFailsClosed asserts a genuine discovery error
+// fails the filing closed with 422 work_item_invalid carrying
+// details.discovery_failed, and NO issue is created (File is never dispatched).
+func TestFileWorkItem_DiscoveryErrorFailsClosed(t *testing.T) {
+	fp := &fakeDiscoverProvider{discoverErr: errors.New("search API exploded")}
+	registerFakeDiscoverProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:    "kuhlman-labs/fishhawk",
+		Type:    "adr",
+		Summary: "Discovery will fail",
+	}, "github:operator")
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error.Code != "work_item_invalid" {
+		t.Errorf("code = %q, want work_item_invalid", env.Error.Code)
+	}
+	if got, _ := env.Error.Details["discovery_failed"].(string); got == "" || !strings.Contains(got, "search API exploded") {
+		t.Errorf("details.discovery_failed = %v, want it to carry the cause", env.Error.Details["discovery_failed"])
+	}
+	if fp.called {
+		t.Error("provider File dispatched despite a fail-closed discovery error")
+	}
+}
+
+// TestFileWorkItem_ProviderWithoutDiscovererFailsClosed asserts a provider that
+// does NOT implement NumberDiscoverer + an omitted existing_numbers falls
+// through to Apply's pre-existing #1265 fail-closed 422 (no silent ADR-001).
+// Discovery never ran, so the 422 is NOT enriched with discovery_failed.
+func TestFileWorkItem_ProviderWithoutDiscovererFailsClosed(t *testing.T) {
+	fp := &fakeWorkProvider{} // File-only, no NumberDiscoverer capability
+	registerFakeProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:    "kuhlman-labs/fishhawk",
+		Type:    "adr",
+		Summary: "No discovery capability",
+	}, "github:operator")
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error.Code != "work_item_invalid" {
+		t.Errorf("code = %q, want work_item_invalid", env.Error.Code)
+	}
+	if env.Error.Details["existing_numbers_required"] != true {
+		t.Errorf("details.existing_numbers_required = %v, want true (the #1265 guard)", env.Error.Details["existing_numbers_required"])
+	}
+	if _, present := env.Error.Details["discovery_failed"]; present {
+		t.Errorf("details must NOT carry discovery_failed (no discovery ran): %v", env.Error.Details)
+	}
+	if fp.called {
+		t.Error("provider File dispatched despite a fail-closed numbered allocate")
+	}
+}
+
 // TestFileWorkItem_UnimplementedProvider_FailsClosed asserts an
 // unregistered/unimplemented provider id returns a typed 501 naming the
 // missing provider rather than panicking. jira is now a real provider, so

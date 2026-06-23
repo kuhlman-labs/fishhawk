@@ -186,7 +186,13 @@ components:
         existing_numbers:
           type: array
           items: { type: integer }
-          description: Numbers already in use for a numbered type, so the next sequential number can be allocated.
+          description: >-
+            Optional for a numbered type: the numbers already in use, so the next
+            sequential number can be allocated. For the GitHub provider these are
+            discovered server-side from the tracker when omitted (#1269); supply
+            this list only to override/hint that discovery. A genuine discovery
+            failure returns 422 `work_item_invalid` with a `discovery_failed`
+            detail rather than allocating a wrong number.
         run_id:
           allOf: [ { $ref: '#/components/schemas/UUID' } ]
           description: Optional in-flight run; when set and non-terminal, a `work_item_filed` audit entry is appended to it.

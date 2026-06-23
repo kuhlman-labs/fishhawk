@@ -362,6 +362,16 @@ func (s *Server) applyAndFileWorkItem(ctx context.Context, filing workmgmt.Filin
 	// wrong title or a crash.
 	s.deriveEpicTitleVar(ctx, &filing, conv, target.InstallationID, owner, name)
 
+	// Discover the in-use sequential numbers server-side for a numbered type
+	// that omitted existing_numbers (#1269), so the caller no longer has to
+	// scan the tracker. Runs BEFORE the pure Apply (mirroring deriveEpicTitleVar)
+	// and seeds filing.ExistingNumbers; a genuine discovery failure fails the
+	// filing closed here, and a provider without the capability falls through to
+	// Apply's existing #1265 fail-closed 422.
+	if werr := s.discoverExistingNumbers(ctx, &filing, conv, target); werr != nil {
+		return nil, nil, werr
+	}
+
 	item, number, err := workmgmt.Apply(filing, conv)
 	if err != nil {
 		var sem *workmgmt.SemanticError
@@ -435,6 +445,75 @@ func (s *Server) applyAndFileWorkItem(ctx context.Context, filing workmgmt.Filin
 	}
 
 	return &item, created, nil
+}
+
+// discoverExistingNumbers fills filing.ExistingNumbers for a numbered type
+// (e.g. adr) by asking the resolved provider to enumerate the numbers already
+// in use in the tracker (#1269), so existing_numbers is optional again for
+// numbered filings. It runs BEFORE the pure workmgmt.Apply and mirrors
+// deriveEpicTitleVar's pre-Apply provider-side I/O step.
+//
+// It is a no-op (returns nil) when: the type is unknown, the type is not
+// numbered (Numbering == nil) or its scheme is not "sequential", or the caller
+// already supplied existing_numbers (an explicit hint/override short-circuits
+// discovery). Otherwise it resolves the provider via workmgmt.Get; if the
+// provider does NOT implement the optional workmgmt.NumberDiscoverer
+// capability it returns nil (no-op) and lets Apply's existing #1265 fail-closed
+// 422 fire unchanged — discovery never ran, so that 422 is NOT enriched with
+// discovery_failed. Only a genuine discovery error (capability present,
+// DiscoverNumbers returns an error) returns a *workItemError 422
+// work_item_invalid carrying details.discovery_failed.
+//
+// On success it sets filing.ExistingNumbers = append(discovered, 0): an empty
+// discovery seeds [0] (the documented seed-zero escape → number 1) and a
+// populated discovery allocates max+1. allocateNumber is unchanged and stays
+// the final fail-closed guard.
+// The receiver is unused (discovery resolves the provider through the global
+// workmgmt registry, not server config) but the method form mirrors
+// deriveEpicTitleVar's pre-Apply hook and keeps the call site uniform.
+func (*Server) discoverExistingNumbers(ctx context.Context, filing *workmgmt.FilingRequest, conv workmgmt.Conventions, target workmgmt.Target) *workItemError {
+	itemType, ok := conv.Types[filing.Type]
+	if !ok || itemType.Numbering == nil || itemType.Numbering.Scheme != "sequential" {
+		return nil
+	}
+	if len(filing.ExistingNumbers) > 0 {
+		// Caller-supplied numbers are an explicit hint/override — skip discovery.
+		return nil
+	}
+	provider, err := workmgmt.Get(conv.Provider)
+	if err != nil {
+		// Provider resolution failure is surfaced by applyAndFileWorkItem's own
+		// workmgmt.Get below (typed 501 / 500); leave it to that single mapping.
+		return nil
+	}
+	discoverer, ok := provider.(workmgmt.NumberDiscoverer)
+	if !ok {
+		// No discovery capability: fall through to Apply's #1265 fail-closed 422.
+		return nil
+	}
+	discovered, err := discoverer.DiscoverNumbers(ctx, workmgmt.DiscoverNumbersRequest{
+		Target:      target,
+		Prefix:      itemType.Numbering.Prefix,
+		TitleFormat: itemType.TitleFormat,
+	})
+	if err != nil {
+		return &workItemError{
+			status: http.StatusUnprocessableEntity, code: "work_item_invalid",
+			msg: fmt.Sprintf(
+				"could not discover existing numbers for the numbered type %q: %s; pass existing_numbers explicitly (or seed existing_numbers:[0] for a genuinely-first item)",
+				itemType.Numbering.Prefix, err.Error()),
+			details: map[string]any{
+				"type":                      filing.Type,
+				"numbered_type":             itemType.Numbering.Prefix,
+				"existing_numbers_required": true,
+				"discovery_failed":          err.Error(),
+			},
+		}
+	}
+	// Seed 0 so an empty discovery yields 1 via allocateNumber's seed-zero path,
+	// and a populated discovery allocates max+1.
+	filing.ExistingNumbers = append(discovered, 0)
+	return nil
 }
 
 // epicTitleRE extracts the epic number from a parent epic's leading
