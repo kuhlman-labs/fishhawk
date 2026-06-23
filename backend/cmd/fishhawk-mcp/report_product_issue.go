@@ -18,7 +18,7 @@ import (
 // machinery server-side first; without the flag the report carries
 // product-level facts ONLY.
 type ReportProductIssueInput struct {
-	RunID           string `json:"run_id,omitempty" jsonschema:"the run whose product-facts bundle to attach; falls back to FISHHAWK_RUN_ID env when omitted (the in-runner case)"`
+	RunID           string `json:"run_id,omitempty" jsonschema:"the run whose product-facts bundle to attach; falls back to FISHHAWK_RUN_ID env when omitted (the in-runner case). An operator/operator-agent session has no FISHHAWK_RUN_ID, so pass run_id explicitly"`
 	Kind            string `json:"kind,omitempty" jsonschema:"report flavor: 'bug' (default — attaches the diagnostic bundle) or 'feature' (an enhancement request; lighter workflow context)"`
 	Description     string `json:"description,omitempty" jsonschema:"OPTIONAL operator free text ('what was I trying to do'). It crosses the boundary ONLY when include_free_text is true, and is redacted server-side first. Ignored when include_free_text is false"`
 	IncludeFreeText bool   `json:"include_free_text,omitempty" jsonschema:"EXPLICIT consent: when true, the description crosses the egress boundary AFTER server-side redaction. Default false — only product-level facts leave the boundary"`
@@ -43,10 +43,13 @@ type ReportProductIssueOutput struct {
 // bug or feature request carrying an auto-collected, redacted,
 // fingerprint-deduped diagnostic bundle.
 //
-// Auth: a write tool that drives an egress on the run's hash chain, so the
-// backend requires the run's OWN run-bound agent token — an operator token
-// or a foreign run's token is rejected (run_not_entitled). The destination
-// is the FIXED upstream product repo; it is not caller-controlled.
+// Auth (widened in #1274): the backend admits the run's OWN run-bound agent
+// token OR a non-run-bound operator/operator-agent bearer holding write:runs
+// OR a cookie-session operator. A run-bound token bound to a DIFFERENT run is
+// rejected (run_not_entitled); a non-run-bound bearer without write:runs is
+// rejected (insufficient_scope). An operator/operator-agent session has no
+// FISHHAWK_RUN_ID, so it passes run_id explicitly. The destination is the
+// FIXED upstream product repo; it is not caller-controlled.
 func registerReportProductIssue(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_report_product_issue",
@@ -71,16 +74,18 @@ secret-redaction machinery first. Treat include_free_text as the operator's
 explicit consent; default it off.
 
 Inputs: run_id falls back to FISHHAWK_RUN_ID env when omitted (the in-runner
-case). kind is 'bug' (default) or 'feature'. description + include_free_text
-carry the consented, redacted free text.
+case); an operator/operator-agent session has no FISHHAWK_RUN_ID, so pass
+run_id explicitly. kind is 'bug' (default) or 'feature'. description +
+include_free_text carry the consented, redacted free text.
 
 Returns the egress outcome (report.action created|occurrence, fingerprint,
 upstream number/url, destination), a transparency preview of the product
 facts that were attached (diagnostics), and free_text_included. Tool errors:
 validation_failed (400), authentication_required (401), run_not_entitled
-(403 — only the run's own run-bound token may file), product_feedback_disabled
-(403 — the repo's kill-switch), run_not_found (404), provider_unimplemented
-(501), product_report_failed (502).
+(403 — a run-bound token may only file for its own run), insufficient_scope
+(403 — a non-run-bound operator bearer is missing write:runs),
+product_feedback_disabled (403 — the repo's kill-switch), run_not_found (404),
+provider_unimplemented (501), product_report_failed (502).
 `),
 	}, resolver.reportProductIssue)
 }

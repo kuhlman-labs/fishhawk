@@ -777,7 +777,13 @@ Notes:
   is written under its own category `product_report_filed` by the acting caller
   (`actor_kind` resolved from the token subject) in
   `server/product_report.go::auditProductReport` after `POST
-  /v0/runs/{run_id}/product-reports` files or dedups a report. It names ONLY
+  /v0/runs/{run_id}/product-reports` files or dedups a report. Since the
+  entitlement was widened (#1274), the acting caller may be the run's own
+  run-bound agent token OR a non-run-bound operator/operator-agent bearer (with
+  `write:runs`) OR a cookie-session operator — so the entry's `actor_kind`,
+  resolved from the subject, may now name an operator/operator-agent
+  (`actor_kind=agent` for the `operator-agent/` prefix) in addition to the
+  run-bound agent. No new surface or audit category is added. It names ONLY
   what left the boundary — `{fingerprint, destination, action
   (created|occurrence), upstream_url, upstream_num}` — and carries no diffs,
   paths, prompts, free text, or audit payload bodies. The write is best-effort
