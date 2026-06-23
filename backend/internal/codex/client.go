@@ -104,10 +104,14 @@ func NewClient(cfg Config) *Client {
 // whose nested item has type `agent_message`; the per-turn token usage arrives
 // on a `turn.completed` line. Both Item and Usage are pointers so a line that
 // carries neither (e.g. `thread.started`, `turn.started`) decodes with them nil.
+// On a deterministic failure (e.g. an HTTP 4xx invalid_json_schema, #1330) codex
+// emits a `type:"error"` line carrying Message, followed by a `type:"turn.failed"`
+// line, on STDOUT — codexStreamError scans for these to classify the fault.
 type codexEvent struct {
-	Type  string      `json:"type"`
-	Item  *codexItem  `json:"item"`
-	Usage *usageBlock `json:"usage"`
+	Type    string      `json:"type"`
+	Item    *codexItem  `json:"item"`
+	Usage   *usageBlock `json:"usage"`
+	Message string      `json:"message"`
 }
 
 // codexItem is the nested `item` object on an `item.completed` line. The
@@ -210,10 +214,15 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 	}
 	defer func() { _ = os.RemoveAll(scratchDir) }()
 
-	// Structured outputs (#1324): constrain the model's final response to the
-	// single planreview.VerdictSchema() source of truth via `codex exec
-	// --output-schema <FILE>` (pinned against codex-cli 0.140.0, which takes a
-	// JSON Schema file path). The schema is written to a 0600 temp file
+	// Structured outputs (#1324/#1330): constrain the model's final response via
+	// `codex exec --output-schema <FILE>` (pinned against codex-cli 0.140.0, which
+	// takes a JSON Schema file path). codex 0.140's strict structured-output mode
+	// requires each object's `required` to enumerate EVERY key in its `properties`,
+	// which the lenient planreview.VerdictSchema() (partial `required` arrays) does
+	// NOT satisfy — codex rejects it with HTTP 400 invalid_json_schema (#1330). So
+	// the codex path writes the STRICT variant, planreview.StrictVerdictSchemaJSON()
+	// (every property required, optionals nullable), DERIVED from the same single
+	// VerdictSchema() source of truth. The schema is written to a 0600 temp file
 	// (os.CreateTemp → os.TempDir(), so it lives OUTSIDE scratchDir and does NOT
 	// violate the #995 empty-cwd bound the reviewer runs under) and the flag is
 	// appended below; the file is removed when the invocation returns. The
@@ -221,7 +230,7 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 	// now the documented FALLBACK for any unconstrained/error response. FAIL the
 	// invocation on a marshal/write error rather than silently dropping the
 	// constraint and sending an unconstrained request.
-	schemaJSON, err := planreview.VerdictSchemaJSON()
+	schemaJSON, err := planreview.StrictVerdictSchemaJSON()
 	if err != nil {
 		return "", "", planreview.Usage{}, false, fmt.Errorf("codex: marshal verdict schema: %w", err)
 	}
@@ -250,9 +259,13 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 	//                           from a non-repo dir returns cleanly without
 	//                           the executor's --dangerously-bypass flags.
 	//   --output-schema <FILE> — constrains the model's final response to the
-	//                           planreview.VerdictSchema() JSON Schema written
-	//                           to schemaPath above (#1324, pinned codex-cli
-	//                           0.140.0). Always passed for a review invocation.
+	//                           planreview.StrictVerdictSchemaJSON() strict
+	//                           variant written to schemaPath above (#1324/#1330,
+	//                           pinned codex-cli 0.140.0). codex strict mode
+	//                           requires every property listed in `required`, so
+	//                           the lenient VerdictSchema() is rejected with HTTP
+	//                           400 invalid_json_schema — the strict variant is
+	//                           used here. Always passed for a review invocation.
 	//   --model <model>       — overrides the host ~/.codex config's model;
 	//                           appended only when cfg.Model is set, so an empty
 	//                           config inherits the host default.
@@ -310,11 +323,26 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 			// A per-attempt context deadline kills the child and leaves
 			// ctx.Err()==DeadlineExceeded: a slow review, not a launch crash.
 			// Label it and do NOT retry — retrying a timeout would compound the
-			// wait (#606). External/OOM kills (ctx.Err()==nil) are the transient
-			// #620 class and retry.
+			// wait (#606).
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				return "", "", planreview.Usage{}, false, fmt.Errorf("codex: codex killed after %s (timeout): %v%s", elapsed, runErr, stderrSuffix(stderrText))
 			}
+			// A deterministic codex fault (an HTTP 4xx like invalid_json_schema,
+			// #1330) arrives as an error / turn.failed event on STDOUT — captured
+			// into `out` by cmd.Output() even though runErr is set — NOT on stderr
+			// (which carries only the benign 'Reading additional input from
+			// stdin...' notice). Classify it NON-retryable and surface codex's
+			// REAL message: retrying a 4xx just repeats the failure, and the old
+			// blanket external/OOM label discarded the actual cause.
+			if codexMsg, ok := codexStreamError(out); ok {
+				detail := codexMsg
+				if detail == "" {
+					detail = "codex reported a turn failure"
+				}
+				return "", "", planreview.Usage{}, false, fmt.Errorf("codex: codex review failed after %s: %s%s", elapsed, detail, stderrSuffix(stderrText))
+			}
+			// No stdout error event: a real external/OOM SIGKILL (ctx.Err()==nil),
+			// the transient #620 class — retry.
 			return "", "", planreview.Usage{}, true, fmt.Errorf("codex: codex killed after %s (external/OOM): %v%s", elapsed, runErr, stderrSuffix(stderrText))
 		}
 		return "", "", planreview.Usage{}, false, fmt.Errorf("codex: codex invocation failed: %w", runErr)
@@ -408,6 +436,38 @@ func parseStream(out []byte) (verdictText string, usage planreview.Usage, err er
 		}
 	}
 	return verdictText, usage, nil
+}
+
+// codexStreamError scans captured codex stdout JSONL for a structured failure
+// event. On a deterministic non-zero exit (an HTTP 4xx like invalid_json_schema,
+// #1330) codex emits a `{"type":"error","message":...}` line followed by a
+// `{"type":"turn.failed"}` line on STDOUT (captured into `out` by cmd.Output()
+// even when the run errors), distinct from a transient external/OOM SIGKILL which
+// leaves no such event. It returns found=true when either event is present,
+// preferring the error line's message; a bare turn.failed yields found=true with
+// an empty message. Non-JSON log lines are skipped fail-open, mirroring
+// parseStream.
+func codexStreamError(out []byte) (msg string, found bool) {
+	for _, line := range bytes.Split(out, []byte("\n")) {
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
+			continue
+		}
+		var ev codexEvent
+		if jerr := json.Unmarshal(trimmed, &ev); jerr != nil {
+			continue
+		}
+		switch ev.Type {
+		case "error":
+			if ev.Message != "" {
+				msg = ev.Message
+			}
+			found = true
+		case "turn.failed":
+			found = true
+		}
+	}
+	return msg, found
 }
 
 // stderrSuffix formats captured child stderr as a trailing ": <text>" clause

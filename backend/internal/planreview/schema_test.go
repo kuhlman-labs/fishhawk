@@ -125,6 +125,157 @@ func TestVerdictSchema_MatchesStruct(t *testing.T) {
 	}
 }
 
+// assertRequiredEnumeratesAll asserts an object node's `required` array lists
+// EVERY key in its `properties` — the codex strict-mode invariant (#1330).
+func assertRequiredEnumeratesAll(t *testing.T, node map[string]any, where string) {
+	t.Helper()
+	props := propsOf(t, node, where)
+	req, ok := node["required"].([]any)
+	if !ok {
+		t.Fatalf("%s: missing or non-array \"required\"", where)
+	}
+	reqSet := make(map[string]bool, len(req))
+	for _, r := range req {
+		if s, ok := r.(string); ok {
+			reqSet[s] = true
+		}
+	}
+	for k := range props {
+		if !reqSet[k] {
+			t.Errorf("%s: property %q is absent from required (strict mode needs every property key)", where, k)
+		}
+	}
+	if len(reqSet) != len(props) {
+		t.Errorf("%s: required has %d keys, want %d (one per property)", where, len(reqSet), len(props))
+	}
+}
+
+// assertNullable asserts a property's declared type is a union that includes
+// "null" — the strict-mode encoding of an originally-optional field.
+func assertNullable(t *testing.T, props map[string]any, key, where string) {
+	t.Helper()
+	p, ok := props[key].(map[string]any)
+	if !ok {
+		t.Fatalf("%s: property %q missing or not an object", where, key)
+	}
+	arr, ok := p["type"].([]any)
+	if !ok {
+		t.Errorf("%s: property %q type = %v, want a nullable type-union array", where, key, p["type"])
+		return
+	}
+	for _, e := range arr {
+		if s, ok := e.(string); ok && s == "null" {
+			return
+		}
+	}
+	t.Errorf("%s: property %q type-union %v does not include \"null\"", where, key, arr)
+}
+
+// assertNonNull asserts a property keeps a plain (non-union) type — an
+// originally-required field must NOT be widened to nullable (the `severity` enum
+// stays a plain enum string, never enum+null).
+func assertNonNull(t *testing.T, props map[string]any, key, where string) {
+	t.Helper()
+	p, ok := props[key].(map[string]any)
+	if !ok {
+		t.Fatalf("%s: property %q missing or not an object", where, key)
+	}
+	if _, isArr := p["type"].([]any); isArr {
+		t.Errorf("%s: property %q type = %v, want a plain non-null type (it was originally required)", where, key, p["type"])
+	}
+}
+
+// TestStrictVerdictSchema_SatisfiesStrictRequired asserts the codex strict
+// variant satisfies OpenAI strict structured-output rules: for the top-level
+// object and both items sub-objects, `required` enumerates EVERY property key,
+// every property that was OPTIONAL in the lenient VerdictSchema() is nullable
+// (its type-union includes "null"), and the originally-required `severity` enum
+// stays a plain non-null enum string. It also asserts deriving the strict variant
+// does NOT mutate VerdictSchema()'s shared map (#1330 deep-copy condition).
+func TestStrictVerdictSchema_SatisfiesStrictRequired(t *testing.T) {
+	strict := StrictVerdictSchema()
+
+	if strict["additionalProperties"] != false {
+		t.Errorf("strict top-level additionalProperties = %v, want false (closed object preserved)", strict["additionalProperties"])
+	}
+
+	// Top-level: every property required; verdict stays non-null; the three
+	// originally-optional fields are nullable.
+	topProps := propsOf(t, strict, "strict top-level")
+	assertRequiredEnumeratesAll(t, strict, "strict top-level")
+	assertNonNull(t, topProps, "verdict", "strict top-level")
+	for _, k := range []string{"concerns", "free_form", "concern_resolutions"} {
+		assertNullable(t, topProps, k, "strict top-level")
+	}
+
+	// concerns.items: severity required & non-null enum; category/note/
+	// suggested_patch nullable.
+	concernItems := itemsOf(t, topProps, "concerns")
+	assertRequiredEnumeratesAll(t, concernItems, "strict concerns.items")
+	concernProps := propsOf(t, concernItems, "strict concerns.items")
+	assertNonNull(t, concernProps, "severity", "strict concerns.items")
+	if _, ok := concernProps["severity"].(map[string]any)["enum"]; !ok {
+		t.Error("strict concerns.items: severity lost its enum in the strict transform")
+	}
+	for _, k := range []string{"category", "note", "suggested_patch"} {
+		assertNullable(t, concernProps, k, "strict concerns.items")
+	}
+
+	// concern_resolutions.items: id/resolution required & non-null; note nullable.
+	resolutionItems := itemsOf(t, topProps, "concern_resolutions")
+	assertRequiredEnumeratesAll(t, resolutionItems, "strict concern_resolutions.items")
+	resProps := propsOf(t, resolutionItems, "strict concern_resolutions.items")
+	assertNonNull(t, resProps, "id", "strict concern_resolutions.items")
+	assertNonNull(t, resProps, "resolution", "strict concern_resolutions.items")
+	assertNullable(t, resProps, "note", "strict concern_resolutions.items")
+
+	// Deriving the strict variant must NOT mutate the lenient source map: its
+	// top-level required stays the partial [verdict].
+	lenient := VerdictSchema()
+	req, ok := lenient["required"].([]any)
+	if !ok || len(req) != 1 || req[0] != "verdict" {
+		t.Errorf("VerdictSchema() top-level required = %v, want the unmutated partial [verdict] (the strict derive mutated the source)", lenient["required"])
+	}
+	// The lenient severity stays a plain enum string too (no nullable leak).
+	lenientConcern := itemsOf(t, propsOf(t, lenient, "lenient top-level"), "concerns")
+	assertNonNull(t, propsOf(t, lenientConcern, "lenient concerns.items"), "severity", "lenient concerns.items")
+}
+
+// TestStrictVerdictSchema_DecodeNullOptionals asserts a strict-shaped body whose
+// optional fields are JSON null (the form the codex strict path emits for an
+// absent optional) decodes cleanly through DecodeVerdict — null unmarshals into
+// the Go string/slice fields as their zero value (#1330 nullable-optional
+// contract).
+func TestStrictVerdictSchema_DecodeNullOptionals(t *testing.T) {
+	if _, err := StrictVerdictSchemaJSON(); err != nil {
+		t.Fatalf("StrictVerdictSchemaJSON: %v", err)
+	}
+	body := `{
+		"verdict": "approve_with_concerns",
+		"free_form": null,
+		"concerns": [
+			{"severity": "low", "category": null, "note": null, "suggested_patch": null}
+		],
+		"concern_resolutions": null
+	}`
+	got, err := DecodeVerdict([]byte(body))
+	if err != nil {
+		t.Fatalf("DecodeVerdict of a strict body with null optionals: %v", err)
+	}
+	if got.Verdict != VerdictApproveWithConcerns {
+		t.Errorf("Verdict = %q, want %q", got.Verdict, VerdictApproveWithConcerns)
+	}
+	if len(got.Concerns) != 1 || got.Concerns[0].Severity != SeverityLow {
+		t.Fatalf("Concerns = %+v, want one low-severity concern", got.Concerns)
+	}
+	if got.Concerns[0].Category != "" || got.Concerns[0].Note != "" || got.Concerns[0].SuggestedPatch != "" {
+		t.Errorf("null concern fields did not decode to zero values: %+v", got.Concerns[0])
+	}
+	if got.FreeForm != "" || len(got.ConcernResolutions) != 0 {
+		t.Errorf("null top-level optionals did not decode to zero values: free_form=%q concern_resolutions=%v", got.FreeForm, got.ConcernResolutions)
+	}
+}
+
 func mustEnum(t *testing.T, props map[string]any, key string) []any {
 	t.Helper()
 	node, ok := props[key].(map[string]any)
