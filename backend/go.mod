@@ -3,7 +3,7 @@ module github.com/kuhlman-labs/fishhawk/backend
 go 1.25.0
 
 require (
-	github.com/anthropics/anthropic-sdk-go v1.50.1
+	github.com/anthropics/anthropic-sdk-go v1.51.0
 	github.com/aws/aws-sdk-go-v2 v1.42.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.25
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.24
@@ -15,11 +15,13 @@ require (
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/jackc/puddle/v2 v2.2.2
 	github.com/kuhlman-labs/fishhawk/pricing v0.0.0-20260606222916-3bdc667bf430
+	github.com/kuhlman-labs/fishhawk/redaction v0.0.0-20260622095901-47e0c4255798
 	github.com/modelcontextprotocol/go-sdk v1.6.1
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	github.com/testcontainers/testcontainers-go v0.42.0
 	github.com/testcontainers/testcontainers-go/modules/minio v0.42.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.42.0
+	golang.org/x/sync v0.19.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -102,7 +104,6 @@ require (
 	go.yaml.in/yaml/v4 v4.0.0-rc.2 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
-	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 )
