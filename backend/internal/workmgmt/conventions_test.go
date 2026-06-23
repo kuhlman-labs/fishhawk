@@ -153,6 +153,51 @@ types: {feature: {body_skeleton: [Summary]}}
 	}
 }
 
+// TestParseJiraParentField proves the additive jira.parent_field round-trips
+// through the schema-validated DisallowUnknownFields decode into the typed
+// JiraConnection.ParentField — the typed-config boundary directly, not only
+// via the end-to-end provider seam. A classic epic-link custom field id is
+// decoded verbatim; an absent field leaves ParentField empty (the provider
+// then defaults to the team-managed `parent` reference).
+func TestParseJiraParentField(t *testing.T) {
+	cfg := `
+spec_version: work-management-v0
+provider: jira
+jira:
+  project_key: FISH
+  parent_field: customfield_10014
+required_fields: [Summary, Done-means, complexity]
+types: {feature: {body_skeleton: [Summary]}}
+`
+	c, err := Parse(strings.NewReader(cfg))
+	if err != nil {
+		t.Fatalf("Parse(jira parent_field) = %v, want nil", err)
+	}
+	if c.Jira == nil {
+		t.Fatal("Jira is nil; the jira block did not round-trip into the struct")
+	}
+	if c.Jira.ParentField != "customfield_10014" {
+		t.Errorf("Jira.ParentField = %q, want customfield_10014", c.Jira.ParentField)
+	}
+
+	// Absent parent_field leaves the field empty (provider defaults to parent).
+	noField := `
+spec_version: work-management-v0
+provider: jira
+jira:
+  project_key: FISH
+required_fields: [Summary, Done-means, complexity]
+types: {feature: {body_skeleton: [Summary]}}
+`
+	c2, err := Parse(strings.NewReader(noField))
+	if err != nil {
+		t.Fatalf("Parse(jira no parent_field) = %v, want nil", err)
+	}
+	if c2.Jira == nil || c2.Jira.ParentField != "" {
+		t.Errorf("Jira.ParentField = %q, want empty when parent_field is absent", c2.Jira.ParentField)
+	}
+}
+
 // TestParseDoneMeansSpaceVariant proves the mandatory-field check is
 // robust to "Done means" vs "Done-means".
 func TestParseDoneMeansSpaceVariant(t *testing.T) {

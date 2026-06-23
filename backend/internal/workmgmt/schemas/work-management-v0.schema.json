@@ -58,6 +58,12 @@
           "type": "object",
           "additionalProperties": { "type": "string", "minLength": 1 },
           "description": "Optional map from canonical work-item type (bug, feature, chore, adr, …) to the Jira issue-type name (Bug, Story, Task, …). An absent entry falls back to a title-cased default in the provider."
+        },
+        "parent_field": {
+          "type": "string",
+          "minLength": 1,
+          "default": "parent",
+          "description": "Field used to link a created issue to its parent epic. Team-managed (next-gen) projects use the default `parent` reference ({\"parent\":{\"key\":\"EPIC-KEY\"}}); company-managed (classic) projects set the instance's epic-link custom field id (e.g. customfield_10014) to the bare epic key string. Optional; absent means the team-managed `parent` default."
         }
       }
     },
