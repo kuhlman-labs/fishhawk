@@ -286,19 +286,20 @@ func TestE2E_Fixup_ConcernRoutedBackAndBounded(t *testing.T) {
 // integration test for the fix-up allow-create allow-list (#823). It
 // drives the seam the per-layer unit tests can't cover alone (cf. #618):
 // the MCP tool input → HTTP request → stage_fixup_triggered audit payload
-// persist → prompt renderer's effective scope.files. It proves both
-// directions at once:
+// persist → prompt renderer's effective scope.files. Under the #1314
+// full-plan-scope-retention behavior it proves three directions at once:
 //
-//   - a path DECLARED via allow_create is part of the implement prompt's
-//     NARROWED scope.files (#1162) — the exact set the runner's #818
+//   - a path DECLARED via allow_create is folded into the implement prompt's
+//     effective scope.files (#823) — the exact set the runner's #818
 //     created-out-of-scope gate diffs created files against — so the runner
 //     stages it and the gate no longer trips for it;
-//   - the plan-only file NOT named by the routed concern is ABSENT (#1162):
-//     fix-up scope is narrowed to the concern surface, so a stray edit to a
-//     plan-only file surfaces as scope_drift rather than shipping silently;
-//   - a path NOT declared (nor named by a concern) does NOT appear in the
-//     effective scope.files, so the #818 silent-strip hole stays closed: an
-//     undeclared created file is still category-B.
+//   - the full approved plan scope is RETAINED (#1314): the plan-only file NOT
+//     named by the routed concern is PRESENT, so the agent's in-plan edits ship
+//     in the fix-up commit rather than being drift-excluded (the silent-no-op
+//     class #1314 fixes);
+//   - a path NOT declared (nor in plan scope) does NOT appear in the effective
+//     scope.files, so the #818 silent-strip hole stays closed: an undeclared
+//     created file is still category-B.
 func TestE2E_Fixup_AllowCreateFoldsIntoEffectiveScope(t *testing.T) {
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -422,20 +423,21 @@ func TestE2E_Fixup_AllowCreateFoldsIntoEffectiveScope(t *testing.T) {
 		t.Fatalf("persisted allow_create = %v, want [%s]", triggered.AllowCreate, declared)
 	}
 
-	// 6. The end-to-end assertion: the implement prompt's effective
-	// scope.files is NARROWED to the routed concern surface (#1162) — it
-	// CONTAINS the declared allow_create path, EXCLUDES the plan-only file
-	// not named by the concern, and does NOT contain the undeclared sibling.
+	// 6. The end-to-end assertion: under #1314 the implement prompt's effective
+	// scope.files RETAINS the full approved plan scope and folds the declared
+	// allow_create path on top — it CONTAINS the plan-only file (so the agent's
+	// in-plan edits ship rather than drift-excluded), CONTAINS the declared
+	// allow_create path, and does NOT contain the undeclared sibling.
 	scopeFiles := getPromptRenderScopeFiles(t, ctx, httpSrv.URL, implStage.ID)
 	inScope := map[string]bool{}
 	for _, p := range scopeFiles {
 		inScope[p] = true
 	}
-	if inScope["backend/internal/server/prompt.go"] {
-		t.Errorf("plan-only file not named by the concern must be ABSENT from the narrowed effective scope.files: %v", scopeFiles)
+	if !inScope["backend/internal/server/prompt.go"] {
+		t.Errorf("approved-plan file must be RETAINED in the effective scope.files (#1314 full-scope retention): %v", scopeFiles)
 	}
 	if !inScope[declared] {
-		t.Errorf("declared allow_create path %q missing from narrowed effective scope.files: %v", declared, scopeFiles)
+		t.Errorf("declared allow_create path %q missing from effective scope.files: %v", declared, scopeFiles)
 	}
 	if inScope[undeclared] {
 		t.Errorf("undeclared path %q leaked into effective scope.files — #818 silent-strip hole reopened: %v", undeclared, scopeFiles)
