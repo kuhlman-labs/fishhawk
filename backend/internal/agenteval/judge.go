@@ -92,6 +92,17 @@ type Judge interface {
 // llmJudge is the production Judge: it renders the trajectory into a
 // prompt, calls the MessageSender, and decodes a strict JSON JudgeCard,
 // re-rolling on a malformed response up to maxRetries.
+//
+// The production MessageSender is *anthropic.Client constructed with
+// Schema: JudgeCardSchema(), so its Messages call constrains the model's
+// response to JudgeCardSchema via output_config.format (#1326, the
+// companion to #1324's reviewer-verdict structured output). Under that
+// constraint a malformed / out-of-range / missing-dimension card cannot be
+// emitted, so it no longer costs a re-roll. The parseJudgeCard decode +
+// bounded-score validation + re-roll path below is RETAINED as the
+// documented FALLBACK for any unconstrained path (a sender that pins no
+// schema, or a future non-Anthropic backend), and the error-not-fail-open
+// contract is unchanged.
 type llmJudge struct {
 	sender     MessageSender
 	model      string

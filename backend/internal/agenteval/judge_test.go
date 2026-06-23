@@ -4,9 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/anthropics/anthropic-sdk-go/option"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/anthropic"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 )
 
@@ -203,6 +211,74 @@ func TestRenderTrajectory(t *testing.T) {
 	}
 	if len(s.gotSystem) != 1 || !strings.Contains(s.gotSystem[0], "meaningful_evidence") {
 		t.Errorf("sender did not receive the dimension system prompt: %v", s.gotSystem)
+	}
+}
+
+// TestJudgeConstrainsWireSchema is the cross-boundary integration test: a real
+// *anthropic.Client constructed with Schema: JudgeCardSchema() and pointed at an
+// httptest server is wired into NewLLMJudge, Judge is called against a sample
+// trajectory, and the captured request body is asserted to carry
+// output_config.format.schema deep-equal to JudgeCardSchema() — proving the
+// agenteval->anthropic->wire seam actually sends the JudgeCard constraint
+// (#1326), rather than testing each layer in isolation.
+func TestJudgeConstrainsWireSchema(t *testing.T) {
+	var captured []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		// A valid Messages envelope whose text block is a schema-shaped card so
+		// the judge decodes a successful verdict.
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":          "msg_test",
+			"type":        "message",
+			"role":        "assistant",
+			"model":       "claude-sonnet-4-6",
+			"stop_reason": "end_turn",
+			"content":     []map[string]any{{"type": "text", "text": goodVerdict}},
+			"usage":       map[string]any{"input_tokens": 10, "output_tokens": 20},
+		})
+	}))
+	defer srv.Close()
+
+	client := anthropic.NewClient(anthropic.Config{
+		APIKey:    "test-key",
+		Model:     DefaultJudgeModel,
+		MaxTokens: 1024,
+		Timeout:   5 * time.Second,
+		Schema:    JudgeCardSchema(),
+	}, option.WithBaseURL(srv.URL))
+
+	judge := NewLLMJudge(client, DefaultJudgeModel, 0)
+	if _, err := judge.Judge(context.Background(), sampleLines(t)); err != nil {
+		t.Fatalf("Judge: %v", err)
+	}
+
+	var reqBody struct {
+		OutputConfig struct {
+			Format struct {
+				Type   string         `json:"type"`
+				Schema map[string]any `json:"schema"`
+			} `json:"format"`
+		} `json:"output_config"`
+	}
+	if err := json.Unmarshal(captured, &reqBody); err != nil {
+		t.Fatalf("parse captured request body: %v", err)
+	}
+	if got := reqBody.OutputConfig.Format.Type; got != "json_schema" {
+		t.Errorf("output_config.format.type = %q, want %q (judge schema constraint not sent)", got, "json_schema")
+	}
+	// Normalize JudgeCardSchema() through a json round-trip so map ordering and
+	// numeric types (int enum -> float64) match the decoded request body.
+	wantBytes, err := json.Marshal(JudgeCardSchema())
+	if err != nil {
+		t.Fatalf("marshal JudgeCardSchema: %v", err)
+	}
+	var want map[string]any
+	if err := json.Unmarshal(wantBytes, &want); err != nil {
+		t.Fatalf("normalize JudgeCardSchema: %v", err)
+	}
+	if !reflect.DeepEqual(reqBody.OutputConfig.Format.Schema, want) {
+		t.Errorf("output_config.format.schema = %#v, want JudgeCardSchema() = %#v", reqBody.OutputConfig.Format.Schema, want)
 	}
 }
 
