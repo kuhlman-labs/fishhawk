@@ -282,6 +282,130 @@ func TestE2E_Fixup_ConcernRoutedBackAndBounded(t *testing.T) {
 	}
 }
 
+// TestE2E_Fixup_OperatorConcernRoutedToPrompt is the cross-boundary
+// integration test for the free-text operator_concern path (#1311). It drives
+// the seam the per-layer unit tests can't cover alone (cf. #618): the operator
+// triggers a fix-up through the REAL fishhawk-mcp binary with ONLY an
+// operator_concern (NO concern_ids, NO indices) on a gate-open implement stage
+// that has NO recorded implement-review concern (the CodeQL case) → the backend
+// folds it into a synthetic [high/operator] concern and re-opens the stage →
+// the deterministic prompt renderer reads the audit entry back and emits the
+// operator's VERBATIM text under the "### Fix-up concerns" MANDATORY /
+// win-on-conflict heading. This is the layer-crossing assertion (MCP tool →
+// server handler → audit payload → prompt renderer) that proves the operator
+// instruction reaches the agent as a binding instruction with no pre-existing
+// review concern.
+func TestE2E_Fixup_OperatorConcernRoutedToPrompt(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// GitHub-wired sibling server over the same pool so prompt-render serves
+	// (same shape as TestE2E_Fixup_ConcernRoutedBackAndBounded).
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	// 1. Implement stage parked at the review gate — with NO recorded
+	// implement-review concern (the zero-concern gate-open CodeQL case).
+	stage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypeImplement,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, stage.ID)
+
+	// 2. Trigger the fix-up through the real fishhawk-mcp binary with ONLY a
+	// free-text operator_concern. No seedImplementReview — there is nothing to
+	// address by id/index; the operator instruction is the entire routed set.
+	const operatorConcern = "CodeQL high alert: sanitize the user-supplied path before passing it to os.Open in backend/internal/server/upload.go"
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id":         stage.ID.String(),
+			"operator_concern": operatorConcern,
+			"reason":           "required CodeQL gate has no Fishhawk review concern",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("operator-concern fix-up tool returned error: %s", toolContentString(t, result))
+	}
+
+	var fixupOut struct {
+		Stage struct {
+			ID    string `json:"id"`
+			State string `json:"state"`
+		} `json:"stage"`
+	}
+	decodeStructured(t, result, &fixupOut)
+	if fixupOut.Stage.State != string(runpkg.StageStatePending) {
+		t.Errorf("fix-up stage state = %q, want pending", fixupOut.Stage.State)
+	}
+
+	// 3. The stage_fixup_triggered audit entry persisted the synthetic
+	// [high/operator] concern AND the raw operator_concern text.
+	entries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("stage_fixup_triggered entries = %d, want 1", len(entries))
+	}
+	var triggered struct {
+		Concerns        []planreview.Concern `json:"concerns"`
+		OperatorConcern string               `json:"operator_concern"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &triggered); err != nil {
+		t.Fatalf("unmarshal stage_fixup_triggered payload: %v", err)
+	}
+	if triggered.OperatorConcern != operatorConcern {
+		t.Errorf("persisted operator_concern = %q, want the verbatim text", triggered.OperatorConcern)
+	}
+	if len(triggered.Concerns) != 1 ||
+		triggered.Concerns[0].Severity != planreview.SeverityHigh ||
+		triggered.Concerns[0].Category != "operator" ||
+		triggered.Concerns[0].Note != operatorConcern {
+		t.Fatalf("persisted concerns = %+v, want one [high/operator] synthetic concern carrying the verbatim text", triggered.Concerns)
+	}
+
+	// 4. The done-means assertion: the deterministic prompt renders the
+	// operator's verbatim text under the binding "### Fix-up concerns" MANDATORY
+	// / win-on-conflict heading — the layer-crossing proof the operator
+	// instruction reaches the agent.
+	rendered := getPromptRender(t, ctx, httpSrv.URL, stage.ID)
+	if !strings.Contains(rendered, "### Fix-up concerns") {
+		t.Errorf("rendered prompt missing the Fix-up concerns section:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "MANDATORY") {
+		t.Errorf("rendered Fix-up concerns section missing the binding MANDATORY framing:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "win on conflict") {
+		t.Errorf("rendered Fix-up concerns section missing the win-on-conflict framing:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, operatorConcern) {
+		t.Errorf("rendered prompt missing the operator's verbatim instruction %q:\n%s", operatorConcern, rendered)
+	}
+}
+
 // TestE2E_Fixup_AllowCreateFoldsIntoEffectiveScope is the cross-boundary
 // integration test for the fix-up allow-create allow-list (#823). It
 // drives the seam the per-layer unit tests can't cover alone (cf. #618):

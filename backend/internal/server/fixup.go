@@ -60,6 +60,24 @@ const defaultMaxFixupPasses = 1
 // stop: merge-with-follow-up or a fresh run), not fixup_budget_exhausted.
 const defaultFixupCeiling = 3
 
+// operatorConcernCategory / operatorConcernSeverity classify the synthetic
+// concern the handler builds from a free-text operator_concern (#1311). The
+// category is "operator" (it is operator-authored, not reviewer-emitted) and
+// the severity is high so it renders as a binding instruction — the
+// approval-gate steer is MANDATORY, not advisory.
+const (
+	operatorConcernCategory                            = "operator"
+	operatorConcernSeverity planreview.ConcernSeverity = planreview.SeverityHigh
+)
+
+// maxOperatorConcernBytes caps the free-text operator_concern (#1311). It
+// matches the renderer's per-section cap (maxFixupConcernBytes in
+// backend/internal/prompt/prompt.go) so an over-length operator instruction
+// fails LOUD (400) here rather than being SILENTLY truncated by the renderer
+// downstream — a binding instruction must never be cut without the operator
+// knowing.
+const maxOperatorConcernBytes = 4000
+
 // fixupRequest is the JSON body of POST /v0/stages/{stage_id}/fixup.
 // ConcernIDs is the PRIMARY addressing scheme (#964): the stable
 // concern UUIDs (surfaced by GET /v0/runs/{run_id}'s concerns block) to
@@ -79,6 +97,21 @@ type fixupRequest struct {
 	Concerns    []int    `json:"concerns"`
 	Reason      string   `json:"reason"`
 	AllowCreate []string `json:"allow_create"`
+	// OperatorConcern is a free-text operator instruction routed back to the
+	// agent with NO pre-existing review concern (#1311 Option 1). It is the
+	// sanctioned escape hatch for a required-check failure with no Fishhawk
+	// review concern — a CodeQL/SAST alert on a clean approve-with-zero-concerns
+	// diff — or any operator steer that is not an implement-review concern.
+	// When supplied it is converted server-side into a synthetic
+	// [high/operator] planreview.Concern folded into the routed `selected` set,
+	// so it rides the unchanged budget/applicability/audit/prompt-render path
+	// and reaches the implement agent as a binding instruction (#558 framing)
+	// on the run branch — keeping lineage sole-writer (no foreign hand-commit
+	// that would trip ADR-035). At least one of concern_ids, concerns, or
+	// operator_concern is required; operator_concern alone is admitted on a
+	// zero-concern gate-open stage (it does NOT require a recorded
+	// approve_with_concerns verdict).
+	OperatorConcern string `json:"operator_concern"`
 	// ForceAdditionalPass is the bounded operator override (#860): when
 	// true it grants ONE fix-up pass beyond the normal budget
 	// (defaultMaxFixupPasses), hard-capped at defaultFixupCeiling total
@@ -201,9 +234,29 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"field": "concern_ids"})
 		return
 	}
-	if len(reqBody.ConcernIDs) == 0 && len(reqBody.Concerns) == 0 {
+	// Validate the optional free-text operator concern (#1311) when the field
+	// was provided, BEFORE the at-least-one guard so a whitespace-only value
+	// surfaces field=operator_concern rather than the generic at-least-one
+	// message. Both modes fail LOUD (400) — a binding instruction must never be
+	// silently dropped (whitespace) or truncated (over-length).
+	operatorConcern := strings.TrimSpace(reqBody.OperatorConcern)
+	if reqBody.OperatorConcern != "" {
+		if operatorConcern == "" {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"operator_concern must not be whitespace-only",
+				map[string]any{"field": "operator_concern"})
+			return
+		}
+		if len(operatorConcern) > maxOperatorConcernBytes {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				fmt.Sprintf("operator_concern is %d bytes; the maximum is %d (it must not be silently truncated as a binding instruction)", len(operatorConcern), maxOperatorConcernBytes),
+				map[string]any{"field": "operator_concern"})
+			return
+		}
+	}
+	if len(reqBody.ConcernIDs) == 0 && len(reqBody.Concerns) == 0 && operatorConcern == "" {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"concern_ids must select at least one recorded implement-review concern (stable UUIDs from the run's concerns block; the positional concerns field is a deprecated fallback)",
+			"select at least one of: concern_ids (stable concern UUIDs from the run's concerns block), the deprecated positional concerns indices, or a free-text operator_concern (#1311)",
 			map[string]any{"field": "concern_ids"})
 		return
 	}
@@ -281,7 +334,8 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 	// fallback resolves positional indices against the flattened
 	// implement_reviewed audit-entry concern set.
 	var selected []planreview.Concern
-	if len(concernIDs) > 0 {
+	switch {
+	case len(concernIDs) > 0:
 		if s.cfg.ConcernRepo == nil {
 			s.writeError(w, r, http.StatusServiceUnavailable, "fixup_unconfigured",
 				"concern_ids addressing requires a configured concern repository; use the deprecated positional concerns field or configure the store",
@@ -301,10 +355,12 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		selected = rows
-	} else {
+	case len(reqBody.Concerns) > 0:
 		// DEPRECATED positional-index path. Flattened across every
 		// reviewer entry, so with multiple heterogeneous reviews per
-		// stage the index is ambiguous — prefer concern_ids.
+		// stage the index is ambiguous — prefer concern_ids. This path —
+		// and ONLY this path — enforces the fixup_not_applicable 422 when no
+		// approve_with_concerns verdict is recorded.
 		concerns, err := s.resolveImplementConcerns(r.Context(), stage.RunID, stageID)
 		if err != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -327,6 +383,31 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 				map[string]any{"field": "concerns", "available": len(concerns)})
 			return
 		}
+	default:
+		// operator_concern is the SOLE selection (concern_ids and concerns
+		// both empty — the #1311 CodeQL case: a zero-concern gate-open stage
+		// with no recorded implement-review concern). Skip BOTH resolvers —
+		// there is nothing to resolve — and deliberately DO NOT enforce the
+		// deprecated positional path's fixup_not_applicable precondition: an
+		// operator-authored concern needs no recorded approve_with_concerns
+		// verdict. The synthetic concern appended below is the entire routed
+		// set; run.FixupStage admits the gate-open implement stage on stage
+		// type/state alone.
+	}
+
+	// Fold the synthetic operator concern (#1311) onto the routed set when a
+	// free-text operator_concern was supplied. It rides the same `selected`
+	// slice the existing budget/applicability/audit/prompt-render machinery
+	// already carries, so it reaches the implement agent as a binding
+	// instruction with no further special-casing. Carrying no SuggestedPatch,
+	// it correctly makes fixupApplyEligible(selected) false (free text is not a
+	// deterministic git-apply).
+	if operatorConcern != "" {
+		selected = append(selected, planreview.Concern{
+			Severity: operatorConcernSeverity,
+			Category: operatorConcernCategory,
+			Note:     operatorConcern,
+		})
 	}
 
 	// Count prior fix-up passes for this stage to enforce the bound.
@@ -437,7 +518,7 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 	// Audit first so the fix-up intent (and the selected concerns the
 	// prompt renderer reads back) is recorded even if the orchestrator
 	// handoff below fails. Same posture as the retry handler.
-	s.writeFixupAudit(r, dec, selected, concernIDs, reqBody.Concerns, reqBody.Reason, allowCreate, priorPasses, refundedPasses, delegatedRule, pinModel)
+	s.writeFixupAudit(r, dec, selected, concernIDs, reqBody.Concerns, reqBody.Reason, allowCreate, priorPasses, refundedPasses, delegatedRule, pinModel, operatorConcern)
 
 	// Mark the routed concerns addressed_pending in the durable store
 	// (#964), recording the operator's reason. AFTER the audit append so
@@ -676,9 +757,13 @@ func selectConcerns(all []planreview.Concern, indices []int) ([]planreview.Conce
 // presence-based read-back falls through to live resolution rather than pinning
 // an empty model over the run's already-resolved one. When delegatedRule is
 // non-empty the fix-up landed via the ADR-040 delegated path (#1026) and
-// the payload records `delegated: "<rule>"`. Best-effort: the transition is already
-// committed, so a failure here logs but doesn't unwind.
-func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string, pinModel *ResolvedModel) {
+// the payload records `delegated: "<rule>"`. When operatorConcern is non-empty
+// the fix-up carried a free-text operator instruction (#1311); the raw trimmed
+// text is recorded as `operator_concern` for audit clarity (the synthetic
+// concern it became already rides the `concerns` field the prompt renderer
+// reads). Best-effort: the transition is already committed, so a failure here
+// logs but doesn't unwind.
+func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string, pinModel *ResolvedModel, operatorConcern string) {
 	id := IdentityFrom(r.Context())
 	subject := id.Subject
 	if subject == "" {
@@ -748,6 +833,13 @@ func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, select
 	}
 	if delegatedRule != "" {
 		fields["delegated"] = delegatedRule
+	}
+	// #1311: record the raw operator instruction for audit clarity. The
+	// synthetic concern it became is already in `concerns` (read back by the
+	// prompt renderer); this key surfaces the operator's verbatim text on the
+	// trigger entry for the audit trail.
+	if operatorConcern != "" {
+		fields["operator_concern"] = operatorConcern
 	}
 
 	payload, _ := json.Marshal(fields)

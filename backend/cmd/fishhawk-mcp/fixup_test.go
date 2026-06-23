@@ -138,6 +138,63 @@ func TestFixupStage_ImplementModel_ThreadsIntoBody(t *testing.T) {
 	}
 }
 
+func TestFixupStage_OperatorConcern_ThreadsIntoBody(t *testing.T) {
+	// operator_concern (#1311) must reach the backend request body verbatim so
+	// the free-text instruction is converted server-side into the routed
+	// [high/operator] synthetic concern.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID := uuid.New()
+	runID := uuid.New()
+	fb.fixupResp[stageID] = Stage{
+		ID:    stageID.String(),
+		RunID: runID.String(),
+		Type:  "implement",
+		State: "pending",
+	}
+
+	const concern = "fix the CodeQL alert: sanitize the path before os.Open"
+	_, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID:         stageID.String(),
+		OperatorConcern: concern,
+		Reason:          "required CI gate",
+	})
+	if err != nil {
+		t.Fatalf("fixupStage: %v", err)
+	}
+	if fb.fixupBody.OperatorConcern != concern {
+		t.Errorf("body operator_concern = %q, want the threaded instruction", fb.fixupBody.OperatorConcern)
+	}
+	// operator_concern alone is a valid selection — the relaxed local guard
+	// admits it and the backend is reached.
+	if fb.fixupCalledByID[stageID] != 1 {
+		t.Errorf("fixup called %d times, want 1 (operator_concern-only must reach the backend)", fb.fixupCalledByID[stageID])
+	}
+}
+
+func TestFixupStage_OperatorConcernOnly_PassesLocalGuard(t *testing.T) {
+	// The relaxed local 'at least one' guard accepts an operator_concern-only
+	// call (no concern_ids, no indices) — it passes local validation and
+	// reaches the stub server, distinct from a fully-empty call (covered by
+	// TestFixupStage_NeitherAddressingForm / _EmptyConcerns) which still fails
+	// locally.
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID := uuid.New()
+	fb.fixupResp[stageID] = Stage{ID: stageID.String(), Type: "implement", State: "pending"}
+
+	_, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+		StageID:         stageID.String(),
+		OperatorConcern: "address the missed edge case",
+	})
+	if err != nil {
+		t.Fatalf("operator_concern-only call should pass local validation: %v", err)
+	}
+	if fb.fixupCalledByID[stageID] != 1 {
+		t.Errorf("backend fixup called %d times, want 1", fb.fixupCalledByID[stageID])
+	}
+}
+
 func TestFixupStage_CeilingReached_PropagatesAs422(t *testing.T) {
 	// At the hard ceiling the backend returns 422 with the DISTINCT code
 	// fixup_ceiling_reached (#860). The MCP tool propagates it as a tool

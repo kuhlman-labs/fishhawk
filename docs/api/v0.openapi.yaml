@@ -4764,11 +4764,14 @@ paths:
       requestBody:
         required: true
         description: |
-          Selects which recorded implement-review concerns to route back to
-          the agent: by stable concern ID (`concern_ids`, the primary
-          scheme, #964) or by deprecated positional index (`concerns`).
-          Exactly one of the two forms must be supplied — both at once is
-          400 (`validation_failed`), as is neither.
+          Selects what to route back to the agent: recorded implement-review
+          concerns by stable concern ID (`concern_ids`, the primary scheme,
+          #964) or by deprecated positional index (`concerns`), and/or a
+          free-text `operator_concern` that needs no pre-existing review
+          concern (#1311). `concern_ids` and `concerns` are mutually exclusive
+          — supplying both is 400 (`validation_failed`). At least one of
+          `concern_ids`, `concerns`, or `operator_concern` must be supplied —
+          none at all is 400 (`validation_failed`).
         content:
           application/json:
             schema:
@@ -4878,6 +4881,30 @@ paths:
                     (`fixup_model` / `fixup_model_source`) and read back when
                     the runner fetches the fix-up prompt, and is surfaced on
                     the run's `fixup_model` status field.
+                operator_concern:
+                  type: string
+                  description: |
+                    Optional free-text operator instruction routed back to the
+                    agent with NO pre-existing review concern (#1311). It is the
+                    sanctioned escape hatch for a REQUIRED external-check failure
+                    that has no Fishhawk review concern — a CodeQL/SAST alert on
+                    a clean approve-with-zero-concerns diff — or any operator
+                    steer that is not an implement-review concern. When supplied
+                    it is converted server-side into a synthetic
+                    `[high/operator]` concern folded into the routed set, so it
+                    rides the same budget / applicability / audit / prompt-render
+                    path and reaches the agent as a binding instruction (#558
+                    framing) on the run branch — keeping lineage sole-writer (no
+                    foreign hand-commit that would trip ADR-035). It needs NO
+                    recorded `approve_with_concerns` verdict: `operator_concern`
+                    ALONE is admitted on a zero-concern gate-open stage (it does
+                    NOT raise `fixup_not_applicable`). At least one of
+                    `concern_ids`, `concerns`, or `operator_concern` is required.
+                    A whitespace-only value, or one whose byte length exceeds
+                    4000 (the renderer's per-section cap), is rejected (400
+                    `validation_failed`, `field: operator_concern`) rather than
+                    silently dropped or truncated. The raw text is recorded on
+                    the `stage_fixup_triggered` audit entry as `operator_concern`.
       responses:
         '200':
           description: Stage re-opened for the fix-up pass; refreshed Stage row in body.
@@ -4886,9 +4913,11 @@ paths:
               schema: { $ref: '#/components/schemas/Stage' }
         '400':
           description: |
-            Malformed body, no concern selection, both `concern_ids` and
+            Malformed body, no selection at all (none of `concern_ids` /
+            `concerns` / `operator_concern`), both `concern_ids` and
             `concerns` supplied, an out-of-range / duplicate concern index,
-            or an unknown / foreign / plan-stage / non-open `concern_id`.
+            an unknown / foreign / plan-stage / non-open `concern_id`, or a
+            whitespace-only or over-length (>4000 bytes) `operator_concern`.
             Body's `error` is `validation_failed`.
           content:
             application/json:

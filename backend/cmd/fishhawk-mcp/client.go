@@ -433,6 +433,10 @@ type fixupRequest struct {
 	// fix-up pass (#1164). omitempty: the common fix-up omits it and inherits
 	// the run's already-resolved implement model (byte-identical default).
 	ImplementModel string `json:"implement_model,omitempty"`
+	// OperatorConcern is the optional free-text operator instruction routed
+	// back to the agent with NO pre-existing review concern (#1311). omitempty:
+	// the common fix-up omits it and addresses recorded concerns instead.
+	OperatorConcern string `json:"operator_concern,omitempty"`
 }
 
 // FixupStage routes one or more advisory implement-review concerns back
@@ -471,8 +475,11 @@ type fixupRequest struct {
 // implementModel is the optional operator/driver model override for this pass
 // (#1164), validated server-side against the deployment allow-list (422
 // fixup_invalid_model on reject); empty inherits the run's implement model.
-func (c *apiClient) FixupStage(ctx context.Context, id uuid.UUID, concernIDs []string, concerns []int, reason string, allowCreate []string, forceAdditionalPass bool, implementModel string) (*Stage, error) {
-	body, err := json.Marshal(fixupRequest{ConcernIDs: concernIDs, Concerns: concerns, Reason: reason, AllowCreate: allowCreate, ForceAdditionalPass: forceAdditionalPass, ImplementModel: implementModel})
+// operatorConcern is the optional free-text operator instruction routed back
+// to the agent with NO pre-existing review concern (#1311); empty addresses
+// recorded concerns instead.
+func (c *apiClient) FixupStage(ctx context.Context, id uuid.UUID, concernIDs []string, concerns []int, reason string, allowCreate []string, forceAdditionalPass bool, implementModel, operatorConcern string) (*Stage, error) {
+	body, err := json.Marshal(fixupRequest{ConcernIDs: concernIDs, Concerns: concerns, Reason: reason, AllowCreate: allowCreate, ForceAdditionalPass: forceAdditionalPass, ImplementModel: implementModel, OperatorConcern: operatorConcern})
 	if err != nil {
 		return nil, fmt.Errorf("marshal fixup: %w", err)
 	}
