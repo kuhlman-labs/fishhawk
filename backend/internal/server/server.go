@@ -314,6 +314,16 @@ type Config struct {
 	// set — fails OPEN (any model accepted, byte-identical to today). Wired
 	// from FISHHAWKD_IMPLEMENT_ALLOWED_MODELS in serve.go via ParseAllowedModels.
 	ImplementAllowedModels AllowedModels
+
+	// ReviewResolution is the deployment-level review-gate resolution provider
+	// id (ADR-031 Phase 2), defaulting to github_merge. It selects which
+	// reviewresolver.Resolver the merge-status reconciler routes through. The
+	// server does NOT read this field — it is wired from
+	// FISHHAWKD_REVIEW_RESOLUTION in serve.go, which selects the provider via
+	// reviewresolver.Select and passes it as mergereconciler.Ticker.Resolver.
+	// The server's own resolution code paths (ResolveReviewFromPollState) are
+	// unchanged; succeeded still means a verified GitHub merge.
+	ReviewResolution string
 }
 
 // Server wraps an http.Server with the routes and middleware stack

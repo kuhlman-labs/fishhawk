@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"io"
 	"log/slog"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 )
 
@@ -44,6 +49,93 @@ func resolveImplementModelConfig(t *testing.T, args []string) (string, server.Al
 		t.Fatalf("parse: %v", err)
 	}
 	return *deflt, server.ParseAllowedModels(*allowed)
+}
+
+// resolveReviewResolution mirrors runServe's --review-resolution flag wiring
+// (ADR-031 Phase 2) so the env > flag resolution and the reviewresolver.Select
+// handoff are unit-testable without booting the server. Same shape as the live
+// fs.String("review-resolution", envOr("FISHHAWKD_REVIEW_RESOLUTION",
+// reviewresolver.DefaultResolution), ...) call followed by reviewresolver.Select.
+func resolveReviewResolution(t *testing.T, args []string) (reviewresolver.Resolver, error) {
+	t.Helper()
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	v := fs.String("review-resolution",
+		envOr("FISHHAWKD_REVIEW_RESOLUTION", reviewresolver.DefaultResolution), "test")
+	if err := fs.Parse(args); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	return reviewresolver.Select(*v)
+}
+
+// noopReviewResolver is a named reviewresolver.Resolver for the serve-wiring
+// test: it records nothing and resolves to nil, standing in for a registered
+// provider so Select can return it.
+type noopReviewResolver struct{ name string }
+
+func (n noopReviewResolver) Name() string { return n.name }
+
+func (n noopReviewResolver) ResolveReviewFromPollState(context.Context, uuid.UUID, bool, string) error {
+	return nil
+}
+
+// TestResolveReviewResolution covers the --review-resolution /
+// FISHHAWKD_REVIEW_RESOLUTION wiring (ADR-031 Phase 2 binding condition): the
+// flag default resolves to github_merge, an explicit value is parsed and
+// selected, and an UNKNOWN value fails closed (reviewresolver.Select returns
+// UnknownResolverError — runServe fails startup, not silently defaulting).
+func TestResolveReviewResolution(t *testing.T) {
+	// Register the github_merge provider (as runServe does after srv is built)
+	// plus a second named provider so the explicit-value branch resolves to a
+	// real registration. The registry is global per-process; registering here
+	// mirrors the startup wiring without booting a server.
+	reviewresolver.Register(noopReviewResolver{name: reviewresolver.DefaultResolution})
+	reviewresolver.Register(noopReviewResolver{name: "alt_merge"})
+
+	t.Run("flag default resolves to github_merge", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_REVIEW_RESOLUTION", "")
+		got, err := resolveReviewResolution(t, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.Name() != reviewresolver.DefaultResolution {
+			t.Errorf("resolved provider = %q, want github_merge", got.Name())
+		}
+	})
+
+	t.Run("explicit value is parsed and selected", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_REVIEW_RESOLUTION", "")
+		got, err := resolveReviewResolution(t, []string{"--review-resolution", "alt_merge"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.Name() != "alt_merge" {
+			t.Errorf("resolved provider = %q, want alt_merge (explicit flag value selected)", got.Name())
+		}
+	})
+
+	t.Run("env value is parsed and selected", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_REVIEW_RESOLUTION", "alt_merge")
+		got, err := resolveReviewResolution(t, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.Name() != "alt_merge" {
+			t.Errorf("resolved provider = %q, want alt_merge (env value selected)", got.Name())
+		}
+	})
+
+	t.Run("unknown value fails closed", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_REVIEW_RESOLUTION", "")
+		_, err := resolveReviewResolution(t, []string{"--review-resolution", "nonexistent"})
+		var unknown *reviewresolver.UnknownResolverError
+		if !errors.As(err, &unknown) {
+			t.Fatalf("error = %v, want *UnknownResolverError (runServe would fail startup, not default)", err)
+		}
+		if unknown.ID != "nonexistent" {
+			t.Errorf("UnknownResolverError.ID = %q, want nonexistent", unknown.ID)
+		}
+	})
 }
 
 // TestResolveImplementModelConfig covers the implement-model deployment config
