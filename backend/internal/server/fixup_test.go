@@ -2034,3 +2034,166 @@ func TestNormalizeFixupApplyPath(t *testing.T) {
 		}
 	}
 }
+
+// --- free-text operator_concern (#1311) ---
+
+// TestFixupStage_OperatorConcernOnly_ZeroConcernGate is the #1311 CodeQL
+// case: an operator routes a free-text concern back on a gate-open implement
+// stage that has NO recorded implement-review concern. It must re-open the
+// stage to pending, fold the instruction into the routed set as a
+// [high/operator] synthetic concern (the prompt renderer reads `concerns`
+// back), and record the raw text under `operator_concern` — without 422
+// fixup_not_applicable, which the deprecated positional path would raise.
+func TestFixupStage_OperatorConcernOnly_ZeroConcernGate(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo) // NO seedConcernsReview — zero recorded concerns
+
+	const text = "fix the CodeQL alert: sanitize the path before os.Open"
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: text, Reason: "required CI gate"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (operator_concern must work on a zero-concern gate):\n%s", w.Code, w.Body.String())
+	}
+	var body stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.State != string(run.StageStatePending) {
+		t.Errorf("body.State = %q, want pending", body.State)
+	}
+
+	payload := latestFixupTriggeredPayload(t, au)
+	if payload["operator_concern"] != text {
+		t.Errorf("payload.operator_concern = %v, want the verbatim text", payload["operator_concern"])
+	}
+	concerns, ok := payload["concerns"].([]any)
+	if !ok || len(concerns) != 1 {
+		t.Fatalf("payload.concerns = %v, want one synthetic concern", payload["concerns"])
+	}
+	c0 := concerns[0].(map[string]any)
+	if c0["severity"] != string(operatorConcernSeverity) || c0["category"] != operatorConcernCategory || c0["note"] != text {
+		t.Errorf("synthetic concern = %v, want {severity:%s category:%s note:%q}", c0, operatorConcernSeverity, operatorConcernCategory, text)
+	}
+}
+
+// TestFixupStage_OperatorConcernOnly_NotFixupNotApplicable pins the negative:
+// the operator-concern-only path must NOT 422 fixup_not_applicable on a
+// zero-concern gate (the precondition only the deprecated positional path
+// enforces). The positive re-open is covered above; this isolates the branch
+// that the default switch arm skips resolveImplementConcerns.
+func TestFixupStage_OperatorConcernOnly_NotFixupNotApplicable(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "address the missed edge case"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "fixup_not_applicable") {
+		t.Errorf("operator-concern-only must NOT surface fixup_not_applicable: %s", w.Body.String())
+	}
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(au.appended))
+	}
+}
+
+// TestFixupStage_OperatorConcernWithConcernIDs_FoldsBoth: an operator_concern
+// supplied ALONGSIDE a valid concern_id routes BOTH — the resolved review
+// concern and the synthetic [high/operator] concern — into `selected`.
+func TestFixupStage_OperatorConcernWithConcernIDs_FoldsBoth(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	row := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 101, "reviewer's concern")
+
+	const text = "also bump the timeout per the operator steer"
+	w := postFixup(t, s, stage.ID, fixupRequest{
+		ConcernIDs:      []string{row.ID.String()},
+		OperatorConcern: text,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := latestFixupTriggeredPayload(t, au)
+	concerns, ok := payload["concerns"].([]any)
+	if !ok || len(concerns) != 2 {
+		t.Fatalf("payload.concerns = %v, want both the reviewer + synthetic concerns", payload["concerns"])
+	}
+	// The synthetic operator concern is appended last.
+	last := concerns[1].(map[string]any)
+	if last["category"] != operatorConcernCategory || last["note"] != text {
+		t.Errorf("appended synthetic concern = %v, want {category:%s note:%q}", last, operatorConcernCategory, text)
+	}
+	if payload["operator_concern"] != text {
+		t.Errorf("payload.operator_concern = %v, want the verbatim text", payload["operator_concern"])
+	}
+}
+
+// TestFixupStage_OperatorConcernWhitespaceOnly_Rejected: a provided-but-
+// whitespace-only operator_concern fails LOUD (400 field=operator_concern)
+// rather than silently dropping a binding instruction. No state change, no
+// audit entry.
+func TestFixupStage_OperatorConcernWhitespaceOnly_Rejected(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "   \t\n  "})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "operator_concern") {
+		t.Errorf("body should name operator_concern as the offending field: %s", w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit entries = %d, want 0 (rejected before any transition)", len(au.appended))
+	}
+}
+
+// TestFixupStage_OperatorConcernOverLength_Rejected: an operator_concern
+// exceeding maxOperatorConcernBytes fails LOUD (400 field=operator_concern)
+// rather than being silently truncated by the renderer downstream.
+func TestFixupStage_OperatorConcernOverLength_Rejected(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+
+	oversized := strings.Repeat("a", maxOperatorConcernBytes+1)
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: oversized})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "operator_concern") {
+		t.Errorf("body should name operator_concern as the offending field: %s", w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit entries = %d, want 0 (rejected before any transition)", len(au.appended))
+	}
+}
+
+// TestFixupStage_OperatorConcern_BudgetStillBounds: the synthetic operator
+// concern rides the same `selected` slice AFTER the budget controls, so the
+// bound is unaffected — a second operator-concern pass once the default
+// budget is spent is refused with fixup_budget_exhausted.
+func TestFixupStage_OperatorConcern_BudgetStillBounds(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+
+	if w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "first operator steer"}); w.Code != http.StatusOK {
+		t.Fatalf("first operator-concern pass status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	reparkFixupStage(repo, stage.ID)
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "second operator steer"})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("second operator-concern pass status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "fixup_budget_exhausted") {
+		t.Errorf("body missing fixup_budget_exhausted code: %s", w.Body.String())
+	}
+	// Only the first pass wrote a trigger entry.
+	n := 0
+	for _, e := range au.appended {
+		if e.Category == CategoryStageFixupTriggered {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("stage_fixup_triggered entries = %d, want 1", n)
+	}
+}

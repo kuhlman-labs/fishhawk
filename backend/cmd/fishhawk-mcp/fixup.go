@@ -30,6 +30,9 @@ type FixupStageInput struct {
 	// ImplementModel is the optional operator/driver model override for this
 	// fix-up pass (#1164).
 	ImplementModel string `json:"implement_model,omitempty" jsonschema:"optional operator/driver model override for THIS fix-up pass; default (empty) inherits the run's resolved implement model. Validated against the deployment per-adapter allow-list — a disallowed value returns fixup_invalid_model (422)."`
+	// OperatorConcern is the free-text operator instruction routed back with NO
+	// pre-existing review concern (#1311).
+	OperatorConcern string `json:"operator_concern,omitempty" jsonschema:"optional free-text operator instruction delivered to the agent as a binding instruction with NO pre-existing review concern. Use for a required CI/CodeQL/SAST finding, an ad-hoc steer, or a missed edge case on a clean approve-with-zero-concerns diff. Folded into the routed concern set as a [high/operator] concern. At least one of concern_ids/concerns/operator_concern is required; operator_concern alone is admitted on a zero-concern gate-open stage. A whitespace-only or over-length (>4000 bytes) value returns validation_failed (400)."`
 }
 
 // FixupStageOutput surfaces the re-opened Stage row. A successful fix-up
@@ -103,6 +106,16 @@ Inputs:
     flattened implement_reviewed concern set. Ambiguous once multiple
     heterogeneous review entries exist per stage; prefer concern_ids.
     Only valid when concern_ids is absent (supplying both is rejected).
+  - operator_concern : optional free-text operator instruction routed back
+    to the agent with NO pre-existing review concern (#1311). Use it when a
+    REQUIRED external check fails with no Fishhawk review concern — a
+    CodeQL/SAST alert on a clean approve-with-zero-concerns diff — or for any
+    ad-hoc steer that is not an implement-review concern. It is folded into
+    the routed set as a [high/operator] binding concern and delivered to the
+    agent on the run branch (sole-writer; no foreign hand-commit). It needs
+    NO recorded approve_with_concerns verdict: operator_concern ALONE is
+    admitted on a zero-concern gate-open stage. A whitespace-only or
+    over-length (>4000 bytes) value returns validation_failed.
   - reason   : optional operator note, recorded on the audit entry and
     as the routed concerns' state_reason.
   - allow_create : optional repo-relative paths the fix-up will CREATE.
@@ -148,9 +161,10 @@ pass including refunded ones.
 Returns the re-opened Stage row (pending → dispatched) on success.
 Returns a tool error on:
   - invalid UUID (caught before the HTTP hop)
-  - validation_failed (no concern selection / both concern_ids and
-    indices supplied / out-of-range index / unknown, foreign, plan-stage,
-    or non-open concern_id, 400)
+  - validation_failed (no selection at all — none of concern_ids /
+    concerns / operator_concern / both concern_ids and indices supplied /
+    out-of-range index / unknown, foreign, plan-stage, or non-open
+    concern_id / whitespace-only or over-length operator_concern, 400)
   - cross_run_fixup (a run-bound token reaching another run's stage, 403)
   - stage_not_found (404)
   - fixup_not_applicable (no recorded approve_with_concerns verdict, or
@@ -178,10 +192,10 @@ func (r *runResolver) fixupStage(ctx context.Context, _ *mcp.CallToolRequest, in
 	if len(in.ConcernIDs) > 0 && len(in.Concerns) > 0 {
 		return nil, FixupStageOutput{}, fmt.Errorf("supply concern_ids (stable concern UUIDs — the primary scheme) OR the deprecated positional concerns indices, not both")
 	}
-	if len(in.ConcernIDs) == 0 && len(in.Concerns) == 0 {
-		return nil, FixupStageOutput{}, fmt.Errorf("concern_ids must select at least one recorded implement-review concern (stable UUIDs from fishhawk_get_run_status's run.concerns block; the positional concerns field is a deprecated fallback)")
+	if len(in.ConcernIDs) == 0 && len(in.Concerns) == 0 && strings.TrimSpace(in.OperatorConcern) == "" {
+		return nil, FixupStageOutput{}, fmt.Errorf("select at least one of: concern_ids (stable concern UUIDs from fishhawk_get_run_status's run.concerns block), the deprecated positional concerns indices, or a free-text operator_concern")
 	}
-	fixed, err := r.api.FixupStage(ctx, stageID, in.ConcernIDs, in.Concerns, in.Reason, in.AllowCreate, in.ForceAdditionalPass, in.ImplementModel)
+	fixed, err := r.api.FixupStage(ctx, stageID, in.ConcernIDs, in.Concerns, in.Reason, in.AllowCreate, in.ForceAdditionalPass, in.ImplementModel, in.OperatorConcern)
 	if err != nil {
 		return nil, FixupStageOutput{}, fmt.Errorf("fixup stage: %w", err)
 	}
