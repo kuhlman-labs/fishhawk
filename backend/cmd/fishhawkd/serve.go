@@ -42,6 +42,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reactionpoller"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
@@ -339,6 +340,9 @@ func runServe(args []string, logSink io.Writer) int {
 	mergeReconcilerInterval := fs.Duration("merge-reconciler-interval",
 		mergereconciler.DefaultInterval,
 		"merge-status reconciler scan interval. Each tick makes one GitHub GetPullRequest call per parked review stage with no per-stage cooldown; tune this upward at scale to stay within GitHub REST rate limits (5,000/hour per installation).")
+	reviewResolution := fs.String("review-resolution",
+		envOr("FISHHAWKD_REVIEW_RESOLUTION", reviewresolver.DefaultResolution),
+		"deployment-level review-gate resolution provider (ADR-031 Phase 2; default github_merge). Selects which reviewresolver.Resolver the merge-status reconciler routes through. An unknown value fails startup (fail closed) rather than silently defaulting — succeeded must always mean a verified GitHub merge.")
 	enableChildCompletionSweeper := fs.Bool("enable-child-completion-sweeper",
 		envOr("FISHHAWKD_ENABLE_CHILD_COMPLETION_SWEEPER", "false") == "true",
 		"start the child-completion sweeper (#455 / ADR-025 D4); transitions parent stages parked in awaiting_children once their decomposed children all reach terminal states. Off by default to match the other tickers' dev-loop posture.")
@@ -490,7 +494,7 @@ func runServe(args []string, logSink io.Writer) int {
 		slog.Duration("cap", reviewBudget.Cap),
 		slog.String("ref", "#747"))
 
-	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels)}
+	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), ReviewResolution: *reviewResolution}
 
 	// Plan-review agent wiring. Resolved by a pure helper so the selection seam
 	// (which adapters the flags configure) is unit-testable without booting a
@@ -809,6 +813,27 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Info("slash-command approval handler wired")
 	}
 
+	// Review-gate resolution provider seam (ADR-031 Phase 2). Register the
+	// github_merge logic as the first provider — a thin Func adapter over
+	// srv.ResolveReviewFromPollState, so the reviewresolver package needs no
+	// import of server (no cycle). Select the configured provider by id; an
+	// unknown review.resolution value fails startup (fail closed) rather than
+	// silently defaulting to github_merge and masking a deployment error —
+	// succeeded must always mean a verified GitHub merge. The default
+	// (github_merge) wraps srv.ResolveReviewFromPollState, so the merge-status
+	// reconciler's resolution path is byte-for-byte unchanged.
+	reviewresolver.Register(reviewresolver.Func(reviewresolver.DefaultResolution, srv.ResolveReviewFromPollState))
+	reviewResolver, err := reviewresolver.Select(cfg.ReviewResolution)
+	if err != nil {
+		logger.Error("review-resolution provider invalid",
+			slog.String("requested", cfg.ReviewResolution),
+			slog.Any("registered", reviewresolver.Registered()),
+			slog.String("error", err.Error()))
+		return exitFailure
+	}
+	logger.Info("review-gate resolution provider selected",
+		slog.String("provider", reviewResolver.Name()))
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -917,11 +942,21 @@ func runServe(args []string, logSink io.Writer) int {
 			logger.Warn("--enable-merge-reconciler set but GitHub client unconfigured (no app id?); ticker not started")
 		default:
 			ticker := &mergereconciler.Ticker{
-				Runs:                  cfg.RunRepo,
-				PRGetter:              cfg.GitHub,
-				Resolver:              srv,
+				Runs:     cfg.RunRepo,
+				PRGetter: cfg.GitHub,
+				// Resolver is the config-selected review-resolution provider
+				// (ADR-031 Phase 2). For the github_merge default it wraps
+				// srv.ResolveReviewFromPollState, so resolution is byte-for-byte
+				// unchanged. NOTE: the Func adapter is not *server.Server, so
+				// Tick's Resolver-upgrade type assertions for the optional
+				// DriveObserver / BoardTransitionHealer no longer fire off
+				// Resolver — wire those (and LineageReverifier, as before)
+				// explicitly so the merge-reconciler behavior is preserved.
+				Resolver:              reviewResolver,
 				LineageReverifier:     srv,
 				AuditCheckRepublisher: srv,
+				DriveObserver:         srv,
+				BoardTransitionHealer: srv,
 				Logger:                logger,
 				Interval:              *mergeReconcilerInterval,
 			}

@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -129,6 +130,57 @@ func TestTick_Merged_ResolvesSucceeded(t *testing.T) {
 	}
 	if !res.calls[0].merged || res.calls[0].runID != r.ID {
 		t.Errorf("resolve call = %+v, want merged=true runID=%s", res.calls[0], r.ID)
+	}
+}
+
+// TestTick_ReviewResolverSeam_GithubMergeResolvesMerged is the cross-boundary
+// integration test for the reviewresolver provider seam (ADR-031 Phase 2): it
+// crosses config-string -> reviewresolver.Select -> Ticker.Resolver -> resolve.
+// A fake github_merge provider (a reviewresolver.Func over a recording func) is
+// registered, selected by the default config string, and wired as the Ticker's
+// Resolver; running Tick over a merged PR must invoke the recorded resolve with
+// merged=true and the run's PR URL — proving the default config still drives the
+// merged -> succeeded resolution end-to-end through the new seam, exactly as the
+// pre-refactor *server.Server path did.
+func TestTick_ReviewResolverSeam_GithubMergeResolvesMerged(t *testing.T) {
+	var (
+		gotRun    uuid.UUID
+		gotMerged bool
+		gotURL    string
+		calls     int
+	)
+	reviewresolver.Register(reviewresolver.Func(reviewresolver.DefaultResolution,
+		func(_ context.Context, runID uuid.UUID, merged bool, prURL string) error {
+			calls++
+			gotRun, gotMerged, gotURL = runID, merged, prURL
+			return nil
+		}))
+	// "" exercises the config default branch (-> github_merge).
+	resolver, err := reviewresolver.Select("")
+	if err != nil {
+		t.Fatalf("Select(\"\") errored: %v", err)
+	}
+	if resolver.Name() != reviewresolver.DefaultResolution {
+		t.Fatalf("selected provider %q, want %q", resolver.Name(), reviewresolver.DefaultResolution)
+	}
+
+	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
+	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
+	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	tk := &Ticker{Runs: repo, PRGetter: pg, Resolver: resolver}
+	tk.Tick(context.Background())
+
+	if calls != 1 {
+		t.Fatalf("resolve calls = %d, want 1 (config-selected provider must drive the merged resolve)", calls)
+	}
+	if !gotMerged {
+		t.Errorf("resolve merged = false, want true")
+	}
+	if gotRun != r.ID {
+		t.Errorf("resolve runID = %s, want %s", gotRun, r.ID)
+	}
+	if gotURL != "https://github.com/x/y/pull/42" {
+		t.Errorf("resolve prURL = %q, want the run's PR URL", gotURL)
 	}
 }
 
