@@ -57,6 +57,60 @@ For implement stages the runner additionally commits the agent's edits, pushes a
 
 The compile/test/verify gates run *committed agent-authored code* (`go vet`, `go test`, and the spec `executor.verify.command`). For the implement stage the spec `executor.verify.command` runs `scripts/test verify` (golangci-lint per module THEN the test loop, no coverage), so formatting/lint defects fail the stage's verify in-loop rather than red-lining the PR in CI after the agent is terminal (#1064). Because `sanitizedGateEnv` passes PATH through, golangci-lint on the runner's PATH is reachable; `scripts/test verify` fails closed with an actionable error if it is absent, never silently skipping lint. Those subprocesses run with the runner's credentials stripped from their env (ADR-029 #650 item 4, `sanitizedGateEnv`): the GitHub App installation token, agent API keys, and MCP backend token are NOT visible to agent code — only PATH/HOME/system essentials and the Go toolchain (`GO*`/`CGO_*`) vars are passed through. The git-plumbing operations (worktree/rev-parse/reset) keep the inherited env so push/auth still work.
 
+## Choosing the coding agent (Claude Code or Codex)
+
+The runner can drive either of two coding-agent providers, selected by the `agent` action input (see the [Inputs](#inputs-actionyml) table above). The provider story (#839 runner provider selection, #840 the Codex adapter, #841 the Actions wiring):
+
+| `agent` | Adapter | API key env var | GitHub secret |
+|---|---|---|---|
+| `claude-code` (default) | `internal/agent/claudecode/` | `ANTHROPIC_API_KEY` | `ANTHROPIC_API_KEY` |
+| `codex` | `internal/agent/codex/` | `OPENAI_API_KEY` | `OPENAI_API_KEY` |
+
+- **Default and fallback.** Omitting `agent` selects `claude-code`, so existing workflows are unchanged. Any value other than `claude-code` or `codex` fails the stage **category-A before the agent is invoked** (`selectInvoker` returns `errUnknownAgent` in `cmd/fishhawk-runner/agentselect.go`) — a typo can't silently fall through to the wrong provider.
+- **Codex key wiring.** Pass `agent: codex` plus `openai-api-key: ${{ secrets.OPENAI_API_KEY }}` to the action. The composite action threads that input into the `OPENAI_API_KEY` environment variable only when `agent == 'codex'` (`runner/action.yml`), and the codex adapter forwards it to the `codex` CLI child. The `anthropic-api-key` / `openai-api-key` inputs are independent; the unused one is left empty.
+- **Trace attribution.** The selected provider id is stamped into the trace bundle manifest's `agent` field, so a post-hoc reviewer can see which agent produced the run.
+
+### Local verification with a fake Codex binary
+
+You can exercise the codex dispatch path without the real OpenAI CLI or an API key by putting an executable named `codex` early on `PATH` that emits a canned `codex exec --json` event stream. The codex adapter parses newline-delimited JSON events; a minimal happy-path transcript (mirroring the helper in `internal/agent/codex/codex_test.go`) is:
+
+```sh
+mkdir -p /tmp/fakebin
+cat > /tmp/fakebin/codex <<'EOF'
+#!/usr/bin/env bash
+echo '{"type":"thread.started","thread_id":"t-1"}'
+echo '{"type":"turn.started"}'
+echo '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"hello"}}'
+echo '{"type":"turn.completed","usage":{"input_tokens":42,"cached_input_tokens":10,"output_tokens":50,"reasoning_output_tokens":8}}'
+EOF
+chmod +x /tmp/fakebin/codex
+
+echo "Summarize the README" > /tmp/prompt.txt
+PATH="/tmp/fakebin:$PATH" go run ./cmd/fishhawk-runner \
+  --run-id 11111111-2222-3333-4444-555555555555 \
+  --backend-url http://localhost:8080 \
+  --workflow feature_change \
+  --stage plan \
+  --agent codex \
+  --prompt-file /tmp/prompt.txt \
+  --bundle-out /tmp/trace.jsonl.gz
+```
+
+The fake binary stands in for the real `codex` so the adapter's event-parse, token-accounting, and bundle paths run end-to-end against a deterministic transcript.
+
+### Hosted Actions verification
+
+To verify against the real OpenAI CLI on a hosted Actions runner:
+
+1. Add the repo secret `OPENAI_API_KEY`.
+2. Pass `agent: codex` and `openai-api-key: ${{ secrets.OPENAI_API_KEY }}` to the action.
+
+The composite action's `Install Codex CLI` step installs the pinned `@openai/codex@0.137.0` (a specific immutable version per CLAUDE.md's run-time-tool pinning rule — never a floating tag) via Node 22 and invokes the `codex` binary by name.
+
+### Migration note
+
+Existing Claude Code users need no changes: `agent` defaults to `claude-code` and behavior is byte-identical to before provider selection landed. Opting into Codex is a per-stage `executor.agent: codex` in `.fishhawk/workflows.yaml` plus the `OPENAI_API_KEY` secret wired through `openai-api-key` — nothing else changes.
+
 ## Build and test
 
 From the repo root (workspace-aware):

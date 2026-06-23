@@ -193,7 +193,7 @@
             "agent": {
               "type": "string",
               "minLength": 1,
-              "description": "Agent identifier. v0 ships with claude-code; v0.x adds cursor and copilot."
+              "description": "Agent identifier. v0 ships claude-code (default) and codex (the OpenAI Codex CLI); v0.x later adds cursor and copilot. The runner resolves this free-form string to a coding-agent adapter — see runner/README.md 'Choosing the coding agent' for provider setup (the OPENAI_API_KEY secret for codex)."
             },
             "model": {
               "type": "string",
