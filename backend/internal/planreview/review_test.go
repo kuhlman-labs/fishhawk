@@ -273,6 +273,31 @@ func TestReviewVerdict_UsageIsolatedFromAgentJSON(t *testing.T) {
 	}
 }
 
+// TestUsage_CachedInputTokensAccessor pins the back-compat summed accessor
+// (#1343): CachedInputTokens() returns CacheReadInputTokens +
+// CacheWriteInputTokens, which the cost_recorded payload's cached_input_tokens
+// total and the #1010 total-context tripwire rely on. The zero-value case
+// returns 0 so a usage-free verdict stays at a zero cached total.
+func TestUsage_CachedInputTokensAccessor(t *testing.T) {
+	cases := []struct {
+		name      string
+		usage     planreview.Usage
+		wantTotal int
+	}{
+		{"zero value", planreview.Usage{}, 0},
+		{"read only (codex shape)", planreview.Usage{CacheReadInputTokens: 100}, 100},
+		{"read and write (anthropic shape)", planreview.Usage{CacheReadInputTokens: 11944, CacheWriteInputTokens: 7319}, 19263},
+		{"write only", planreview.Usage{CacheWriteInputTokens: 42}, 42},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.usage.CachedInputTokens(); got != c.wantTotal {
+				t.Errorf("CachedInputTokens() = %d, want %d (read+write)", got, c.wantTotal)
+			}
+		})
+	}
+}
+
 // --- ConcernResolutions on the wire (#984) ---
 
 // TestImplementReviewedPayload_JSONRoundTrip_WithResolutions covers the

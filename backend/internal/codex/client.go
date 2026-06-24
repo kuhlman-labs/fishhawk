@@ -428,11 +428,16 @@ func parseStream(out []byte) (verdictText string, usage planreview.Usage, err er
 			freshTok = 0
 		}
 		usage = planreview.Usage{
-			InputTokens:       freshTok,
-			CachedInputTokens: cachedTok,
-			OutputTokens:      outputTok,
-			Turns:             turns,
-			Known:             true,
+			InputTokens: freshTok,
+			// Codex reports a single cached_input_tokens that is cache READS
+			// only (a prefix-cache hit) — the CLI exposes no separate
+			// cache-write count — so it maps to CacheReadInputTokens and the
+			// write bucket is always 0 (#1343).
+			CacheReadInputTokens:  cachedTok,
+			CacheWriteInputTokens: 0,
+			OutputTokens:          outputTok,
+			Turns:                 turns,
+			Known:                 true,
 		}
 	}
 	return verdictText, usage, nil

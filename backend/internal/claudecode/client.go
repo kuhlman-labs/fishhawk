@@ -221,13 +221,16 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 		usageOut = planreview.Usage{
 			// The envelope's input_tokens is already cache-exclusive
 			// (Anthropic accounting), so it passes through unchanged as the
-			// normalized fresh count (#1010); the cache members sum into the
-			// ADDITIONAL CachedInputTokens split.
-			InputTokens:       env.Usage.InputTokens,
-			CachedInputTokens: env.Usage.CacheReadInputTokens + env.Usage.CacheCreationInputTokens,
-			OutputTokens:      env.Usage.OutputTokens,
-			Turns:             1, // single-shot --print: exactly one turn
-			Known:             true,
+			// normalized fresh count (#1010); the two cache members land in the
+			// ADDITIONAL read/write split (#1343) rather than being summed, so
+			// the cost path can price reads (cheap hits) and writes (premium
+			// ingestion) at their distinct rates.
+			InputTokens:           env.Usage.InputTokens,
+			CacheReadInputTokens:  env.Usage.CacheReadInputTokens,
+			CacheWriteInputTokens: env.Usage.CacheCreationInputTokens,
+			OutputTokens:          env.Usage.OutputTokens,
+			Turns:                 1, // single-shot --print: exactly one turn
+			Known:                 true,
 		}
 	}
 

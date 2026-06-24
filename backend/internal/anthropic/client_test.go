@@ -114,3 +114,40 @@ func TestClient_Messages_OmitsOutputConfigWhenNil(t *testing.T) {
 		t.Error("nil-schema client carried output_config; want it omitted (unconstrained fallback)")
 	}
 }
+
+// TestClient_MessagesWithCache_SurfacesCacheSplit pins the #1343 cache surface
+// on the dedicated 7-return entry point: MessagesWithCache returns the SDK
+// envelope's cache_read_input_tokens / cache_creation_input_tokens as the
+// separate cacheReadTokens / cacheWriteTokens return values (okResp stamps
+// 300 / 150), alongside the fresh input/output counts. The thin Messages
+// delegator drops the cache split — verified by it compiling against the
+// 5-return signature the agenteval MessageSender seam depends on.
+func TestClient_MessagesWithCache_SurfacesCacheSplit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(okResp(`{"verdict":"approve"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewClient(testConfig(), option.WithBaseURL(srv.URL))
+	_, _, inTok, outTok, cacheRead, cacheWrite, err := c.MessagesWithCache(context.Background(), "sys", "user")
+	if err != nil {
+		t.Fatalf("MessagesWithCache: %v", err)
+	}
+	if inTok != 100 || outTok != 20 {
+		t.Errorf("input/output = %d / %d, want 100 / 20 (fresh, cache-exclusive)", inTok, outTok)
+	}
+	if cacheRead != 300 || cacheWrite != 150 {
+		t.Errorf("cache read/write = %d / %d, want 300 / 150 (SDK cache_read vs cache_creation)", cacheRead, cacheWrite)
+	}
+
+	// The thin Messages delegator returns the same fresh counts and drops the
+	// cache split (its 5-return shape is what agenteval.MessageSender pins).
+	_, _, dInTok, dOutTok, err := c.Messages(context.Background(), "sys", "user")
+	if err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+	if dInTok != 100 || dOutTok != 20 {
+		t.Errorf("Messages input/output = %d / %d, want 100 / 20 (delegates to MessagesWithCache)", dInTok, dOutTok)
+	}
+}

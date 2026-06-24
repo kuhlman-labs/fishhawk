@@ -53,13 +53,39 @@ func NewClient(cfg Config, opts ...option.RequestOption) *Client {
 	}
 }
 
-// Messages calls the Anthropic Messages API. systemText is placed in a
-// system block with ephemeral cache_control; when empty, the system block is
+// Messages calls the Anthropic Messages API and returns the response text,
+// model name, and the fresh input/output token counts. It is the
+// cache-agnostic entry point retained verbatim for the agenteval
+// MessageSender seam (backend/internal/agenteval/judge.go), whose interface
+// mirrors this exact 5-return signature so an *anthropic.Client satisfies it
+// without agenteval importing this package. It delegates to MessagesWithCache
+// and drops the cache split — keeping the judge seam stable while the
+// reviewer path (#1343) gets the cache counts from MessagesWithCache. See
+// MessagesWithCache for the schema/caching semantics.
+func (c *Client) Messages(ctx context.Context, systemText, userText string) (responseText, modelName string, inputTokens, outputTokens int, err error) {
+	responseText, modelName, inputTokens, outputTokens, _, _, err = c.MessagesWithCache(ctx, systemText, userText)
+	return responseText, modelName, inputTokens, outputTokens, err
+}
+
+// MessagesWithCache calls the Anthropic Messages API. systemText is placed in
+// a system block with ephemeral cache_control; when empty, the system block is
 // omitted. userText becomes the single user message. Returns the first text
 // block from the response, the model name used, and the response's token
-// usage (input/output) so the caller can attribute reviewer agent cost
-// (#681). The SDK always returns a Usage block on a successful Messages
-// call, so the token counts are authoritative on the happy path.
+// usage (input/output plus the cache read/write split) so the caller can
+// attribute reviewer agent cost (#681) and price cached tokens at their
+// distinct rates (#1343). The SDK always returns a Usage block on a
+// successful Messages call, so the token counts are authoritative on the
+// happy path. The SDK's usage.input_tokens already EXCLUDES cache reads and
+// writes — those arrive as the separate CacheReadInputTokens /
+// CacheCreationInputTokens members surfaced here as cacheReadTokens /
+// cacheWriteTokens — so the caller satisfies the normalized cache-exclusive
+// Usage contract (#1010) with no boundary arithmetic.
+//
+// It is a SEPARATE method from Messages (rather than a signature change to
+// Messages) deliberately: the agenteval judge depends on Messages' 5-return
+// shape via its MessageSender interface, so widening Messages would ripple
+// into the out-of-scope agenteval package (#1343 slice boundary). Keeping
+// Messages as a thin delegator leaves that seam untouched.
 //
 // When c.schema is non-nil the request carries OutputConfig.Format =
 // json_schema with that per-client schema (#1324/#1326): the Messages API
@@ -73,7 +99,7 @@ func NewClient(cfg Config, opts ...option.RequestOption) *Client {
 //
 // When c.schema is nil the OutputConfig is OMITTED entirely so the response is
 // unconstrained — the caller's decode path is then the only validation.
-func (c *Client) Messages(ctx context.Context, systemText, userText string) (responseText, modelName string, inputTokens, outputTokens int, err error) {
+func (c *Client) MessagesWithCache(ctx context.Context, systemText, userText string) (responseText, modelName string, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens int, err error) {
 	params := anthropicsdk.MessageNewParams{
 		Model:     c.model,
 		MaxTokens: int64(c.maxTokens),
@@ -97,14 +123,16 @@ func (c *Client) Messages(ctx context.Context, systemText, userText string) (res
 
 	msg, err := c.inner.Messages.New(ctx, params)
 	if err != nil {
-		return "", "", 0, 0, err
+		return "", "", 0, 0, 0, 0, err
 	}
 	inTok := int(msg.Usage.InputTokens)
 	outTok := int(msg.Usage.OutputTokens)
+	cacheReadTok := int(msg.Usage.CacheReadInputTokens)
+	cacheWriteTok := int(msg.Usage.CacheCreationInputTokens)
 	for _, block := range msg.Content {
 		if block.Type == "text" {
-			return block.Text, msg.Model, inTok, outTok, nil
+			return block.Text, msg.Model, inTok, outTok, cacheReadTok, cacheWriteTok, nil
 		}
 	}
-	return "", msg.Model, inTok, outTok, nil
+	return "", msg.Model, inTok, outTok, cacheReadTok, cacheWriteTok, nil
 }

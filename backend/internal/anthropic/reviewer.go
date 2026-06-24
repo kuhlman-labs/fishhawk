@@ -77,7 +77,7 @@ func (r *Reviewer) Review(ctx context.Context, promptText string) (*planreview.R
 
 	var inferFailed bool
 	infer := func(ctx context.Context) (string, string, planreview.Usage, error) {
-		responseText, modelName, inputTokens, outputTokens, err := r.client.Messages(ctx, systemText, userText)
+		responseText, modelName, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, err := r.client.MessagesWithCache(ctx, systemText, userText)
 		if err != nil {
 			inferFailed = true
 			return "", "", planreview.Usage{}, fmt.Errorf("anthropic: messages call failed: %w", err)
@@ -87,15 +87,18 @@ func (r *Reviewer) Review(ctx context.Context, promptText string) (*planreview.R
 		// returns a Usage block on every successful Messages call, so Known is
 		// true here. The Messages API usage.input_tokens already EXCLUDES
 		// cache reads/writes (they arrive as separate cache_read_input_tokens
-		// / cache_creation_input_tokens fields), so this adapter satisfies the
-		// normalized cache-exclusive Usage contract (#1010) as-is;
-		// CachedInputTokens stays 0 until the Messages client surfaces the
-		// cache fields.
+		// / cache_creation_input_tokens fields, now surfaced by the client),
+		// so this adapter satisfies the normalized cache-exclusive Usage
+		// contract (#1010) as-is; the cache read/write counts populate the
+		// ADDITIONAL split (#1343) so the cost path prices each bucket at its
+		// own rate.
 		return responseText, modelName, planreview.Usage{
-			InputTokens:  inputTokens,
-			OutputTokens: outputTokens,
-			Turns:        1, // single Messages call: exactly one turn
-			Known:        true,
+			InputTokens:           inputTokens,
+			OutputTokens:          outputTokens,
+			CacheReadInputTokens:  cacheReadTokens,
+			CacheWriteInputTokens: cacheWriteTokens,
+			Turns:                 1, // single Messages call: exactly one turn
+			Known:                 true,
 		}, nil
 	}
 

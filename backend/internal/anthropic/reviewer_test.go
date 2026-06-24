@@ -37,8 +37,10 @@ type fakeAnthropicResp struct {
 	Model      string `json:"model"`
 	StopReason string `json:"stop_reason"`
 	Usage      struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
+		InputTokens              int `json:"input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 	} `json:"usage"`
 }
 
@@ -63,9 +65,11 @@ func okResp(verdictJSON string) fakeAnthropicResp {
 		Model:      "claude-sonnet-4-6",
 		StopReason: "end_turn",
 		Usage: struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-		}{InputTokens: 100, OutputTokens: 20},
+			InputTokens              int `json:"input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		}{InputTokens: 100, OutputTokens: 20, CacheReadInputTokens: 300, CacheCreationInputTokens: 150},
 	}
 }
 
@@ -303,11 +307,16 @@ func TestReviewer_PersistentBadJSONExhausts(t *testing.T) {
 // TestReviewer_PopulatesUsage asserts the SDK response's Usage block is
 // surfaced on the returned verdict (#681): the adapter attaches token usage
 // from the API envelope (not the agent JSON), with Known=true on the happy
-// path since the SDK always returns a Usage block on a successful call.
+// path since the SDK always returns a Usage block on a successful call. It
+// also pins the cache read/write split (#1343): the SDK's separate
+// cache_read_input_tokens / cache_creation_input_tokens members surface into
+// CacheReadInputTokens / CacheWriteInputTokens (no longer discarded at 0),
+// and InputTokens stays the SDK's cache-exclusive fresh count.
 func TestReviewer_PopulatesUsage(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		// okResp stamps Usage{InputTokens:100, OutputTokens:20}.
+		// okResp stamps Usage{InputTokens:100, OutputTokens:20,
+		// CacheReadInputTokens:300, CacheCreationInputTokens:150}.
 		_ = json.NewEncoder(w).Encode(okResp(`{"verdict":"approve"}`))
 	}))
 	defer srv.Close()
@@ -322,6 +331,13 @@ func TestReviewer_PopulatesUsage(t *testing.T) {
 	}
 	if verdict.Usage.InputTokens != 100 || verdict.Usage.OutputTokens != 20 {
 		t.Errorf("Usage = %+v, want {InputTokens:100 OutputTokens:20 Known:true}", verdict.Usage)
+	}
+	// The cache split surfaces into separate buckets (#1343), no longer 0.
+	if verdict.Usage.CacheReadInputTokens != 300 || verdict.Usage.CacheWriteInputTokens != 150 {
+		t.Errorf("Usage cache split = read %d / write %d, want 300 / 150 (SDK cache_read vs cache_creation surfaced)", verdict.Usage.CacheReadInputTokens, verdict.Usage.CacheWriteInputTokens)
+	}
+	if verdict.Usage.CachedInputTokens() != 450 {
+		t.Errorf("CachedInputTokens() = %d, want 450 (300 read + 150 write)", verdict.Usage.CachedInputTokens())
 	}
 	if verdict.Usage.Turns != 1 {
 		t.Errorf("Usage.Turns = %d, want 1 (single Messages call)", verdict.Usage.Turns)

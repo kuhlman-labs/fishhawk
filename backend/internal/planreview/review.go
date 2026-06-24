@@ -111,9 +111,10 @@ type Concern struct {
 //
 // Normalized accounting invariant (#1010, supersedes the #995 asymmetry):
 // InputTokens is the cache-EXCLUSIVE fresh input-token count for EVERY
-// adapter, and CachedInputTokens is the cache-served portion, always
-// ADDITIONAL to InputTokens — total input-side tokens = InputTokens +
-// CachedInputTokens, uniformly. Each adapter converts its backend's raw
+// adapter, and the cache-served portion is split into CacheReadInputTokens
+// + CacheWriteInputTokens, always ADDITIONAL to InputTokens — total
+// input-side tokens = InputTokens + CacheReadInputTokens +
+// CacheWriteInputTokens, uniformly. Each adapter converts its backend's raw
 // reporting to this contract at the boundary: codex's per-turn raw
 // `input_tokens` INCLUDES `cached_input_tokens` (pinned against codex-cli
 // 0.137.0), so the codex adapter subtracts the cached sum (clamped at 0);
@@ -121,19 +122,44 @@ type Concern struct {
 // and passes through unchanged. Turns makes a multi-turn agentic blowup
 // (many turns each re-sending the growing conversation) visible instead
 // of a single opaque sum.
+//
+// Read/write split (E22.X / #1343, ADR-044 slice 1): the cache-served
+// portion is now captured as two buckets because the vendors price them
+// differently — a cache READ (a prefix hit) is far cheaper than a cache
+// WRITE (the first ingestion that populates the cache). Splitting at the
+// adapter boundary is what lets the reviewer cost path price each bucket
+// at its own rate (pricing.CostWithCache) instead of a single blended
+// figure. The CachedInputTokens() accessor returns the summed total for
+// the back-compat audit-payload field and the #1010 total-context tripwire.
 type Usage struct {
 	InputTokens  int
 	OutputTokens int
-	// CachedInputTokens is the cache-served portion of the input-side count,
-	// ADDITIONAL to InputTokens for every adapter (the codex adapter
-	// subtracts it out of the CLI's cache-inclusive raw figure; the
-	// Anthropic-side adapters sum cache_read + cache_creation).
-	CachedInputTokens int
+	// CacheReadInputTokens is the cache-READ portion of the input-side count
+	// (a cheap prefix-cache HIT), ADDITIONAL to InputTokens. For codex the
+	// single cached_input_tokens is all reads (no write signal); for the
+	// Anthropic-side adapters it is cache_read_input_tokens.
+	CacheReadInputTokens int
+	// CacheWriteInputTokens is the cache-WRITE portion of the input-side count
+	// (the first ingestion that POPULATES the cache, priced at a premium),
+	// ADDITIONAL to InputTokens. For the Anthropic-side adapters it is
+	// cache_creation_input_tokens; codex reports no separate write count so it
+	// is always 0 there.
+	CacheWriteInputTokens int
 	// Turns is the number of model turns the invocation took: summed
 	// turn.completed lines for codex, 1 for the single-shot adapters
 	// (claudecode --print, anthropic Messages). 0 when unknown.
 	Turns int
 	Known bool
+}
+
+// CachedInputTokens returns the total cache-served input-token count —
+// reads + writes — for the back-compat audit-payload `cached_input_tokens`
+// field and the #1010 total-context (fresh + cached) warn tripwire. It
+// replaces the former CachedInputTokens int field (#1343): callers that
+// read the summed total are source-unchanged at the call site except for
+// the trailing () turning the field read into this method call.
+func (u Usage) CachedInputTokens() int {
+	return u.CacheReadInputTokens + u.CacheWriteInputTokens
 }
 
 // ConcernResolution is one reviewer judgment on a PRIOR concern listed
