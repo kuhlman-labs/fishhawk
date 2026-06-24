@@ -56,6 +56,13 @@ type promptRunRepo struct {
 	// cost-rollup seam test (#681) can assert the rollup was actually
 	// driven with a non-zero delta rather than silently skipped.
 	addRunCostDeltas []float64
+	// onTransitionStage, when set, is invoked at the start of every
+	// TransitionStage call (before the state mutation is recorded). The #1351
+	// audit-visible-before-dispatch ordering test uses it to snapshot whether
+	// the approval_submitted add_scope_files audit is already durable at the
+	// instant the plan stage flips to succeeded — the dispatch-gating
+	// transition.
+	onTransitionStage func(id uuid.UUID, to run.StageState)
 }
 
 type promptTransitionStageCall struct {
@@ -201,6 +208,9 @@ func (r *promptRunRepo) RetryStage(context.Context, uuid.UUID, run.StageState) (
 	return nil, errors.New("not used")
 }
 func (r *promptRunRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	if r.onTransitionStage != nil {
+		r.onTransitionStage(id, to)
+	}
 	r.transitionStageCalls = append(r.transitionStageCalls, promptTransitionStageCall{
 		StageID:    id,
 		To:         to,
@@ -1819,6 +1829,39 @@ func (f *feedbackAuditRepo) ListAll(_ context.Context, _ audit.ListAllParams) ([
 }
 func (f *feedbackAuditRepo) ChainsByParent(_ context.Context, _ uuid.UUID, _ bool) ([]*audit.Entry, error) {
 	return nil, nil
+}
+
+// storingAuditRepo is an audit.Repository fake whose AppendChained actually
+// PERSISTS the entry — preserving Category and Payload, keyed by RunID — into
+// the embedded feedbackAuditRepo's byRunID, so a single in-process test can
+// round-trip the approval-audit WRITE (handleSubmitApproval -> writeApprovalAudit
+// -> AppendChained) through the implement prompt-fetch READ (handleGetStagePrompt
+// -> loadApprovalAddScopeFiles -> ListForRunByCategory). feedbackAuditRepo's
+// AppendChained is a no-op that discards the write — which is exactly why the
+// existing fold test (TestGetStagePrompt_Implement_AddScopeFilesFoldedIntoScope)
+// hand-seeds the read side and so cannot reproduce the #1351
+// approve->dispatch->first-fetch seam. This fake closes that gap. The
+// category-filtering ListForRunByCategory reader and every other interface method
+// are inherited from feedbackAuditRepo.
+type storingAuditRepo struct {
+	*feedbackAuditRepo
+}
+
+func newStoringAuditRepo() *storingAuditRepo {
+	return &storingAuditRepo{feedbackAuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{}}}
+}
+
+// AppendChained persists the entry so a later ListForRunByCategory on the same
+// fake returns it. This is the only override; every other audit.Repository
+// method is the embedded feedbackAuditRepo's.
+func (a *storingAuditRepo) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if a.listErr != nil {
+		return nil, a.listErr
+	}
+	rid := p.RunID
+	e := &audit.Entry{ID: uuid.New(), RunID: &rid, Category: p.Category, Payload: p.Payload}
+	a.byRunID[p.RunID] = append(a.byRunID[p.RunID], e)
+	return e, nil
 }
 
 func newFeedbackServer(t *testing.T, runs []*run.Run, auditByRun map[uuid.UUID][]*audit.Entry) *Server {
@@ -4665,6 +4708,201 @@ func TestGetStagePrompt_Implement_AddScopeFilesFoldedIntoScope(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestGetStagePrompt_Implement_AddScopeFilesFoldedOnInitialDispatch is the
+// #1351 regression test and the issue's done-means. Unlike
+// TestGetStagePrompt_Implement_AddScopeFilesFoldedIntoScope — which hand-seeds
+// the approval_submitted audit entry through a no-op AppendChained fake and so
+// masks any write->persist->read seam — this test drives the REAL
+// approve->advance->first-fetch sequence end to end:
+//
+//	(a) seed an approved plan artifact with one scope.file;
+//	(b) call the REAL handleSubmitApproval on the plan stage with
+//	    add_scope_files=[two paths] so writeApprovalAudit emits the
+//	    approval_submitted entry exactly as production does, persisted through a
+//	    STORING audit fake (storingAuditRepo) that genuinely round-trips
+//	    AppendChained -> ListForRunByCategory;
+//	(c) advance the plan stage (the handler does this);
+//	(d) call handleGetStagePrompt for the implement stage exactly ONCE — the
+//	    initial dispatch, with NO second render-poll;
+//
+// then assert resp.ScopeFiles == plan.Scope ∪ add_scope_files on that FIRST
+// fetch. This is the exact write->persist->read seam the no-op AppendChained
+// fake hid (#1351), and a cross-boundary integration test (#618): it crosses
+// the approve-write -> approval_submitted persist -> implement prompt-read
+// boundary that breaks in production while the per-helper unit tests each pass.
+func TestGetStagePrompt_Implement_AddScopeFilesFoldedOnInitialDispatch(t *testing.T) {
+	const plannedFile = "backend/internal/server/prompt.go"
+	// The two paths from the originating run 03f6e28a/#1349.
+	addScopeFiles := []string{
+		"runner/cmd/fishhawk-runner/main_test.go",
+		"runner/internal/agent/agent_test.go",
+	}
+
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+	au := newStoringAuditRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{{Path: plannedFile, Operation: plan.FileOpModify}},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	// The plan stage must be awaiting_approval so the approve transition
+	// (awaiting_approval -> succeeded) is valid; it is also listed under the run
+	// so loadApprovedPlanForRun resolves the artifact post-advance.
+	planStage := &run.Stage{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {planStage}}
+	rr.getStages[planStageID] = planStage
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+	rr.getRuns[runID] = &run.Run{
+		ID:            runID,
+		Repo:          "o/r",
+		WorkflowID:    "feature_change",
+		TriggerSource: run.TriggerCLI,
+	}
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		SigningRepo:  sf,
+		ArtifactRepo: art,
+		ApprovalRepo: newFakeApprovalRepo(),
+		AuditRepo:    au,
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	// (b)+(c): the REAL approval WRITE path — writeApprovalAudit persists
+	// approval_submitted carrying the two paths through the storing fake, and
+	// advanceStage flips the plan stage to succeeded.
+	body := fmt.Sprintf(`{"decision":"approve","add_scope_files":[%q,%q]}`, addScopeFiles[0], addScopeFiles[1])
+	aw := submitApproval(t, s, planStageID, body)
+	if aw.Code != http.StatusOK {
+		t.Fatalf("approval status = %d, want 200:\n%s", aw.Code, aw.Body.String())
+	}
+
+	// (d): ONE implement prompt-fetch — the initial dispatch, no render-poll.
+	priv, _ := sf.issue(t, runID)
+	w := promptRequest(t, s, runID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("prompt status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got := make(map[string]bool, len(resp.ScopeFiles))
+	for _, f := range resp.ScopeFiles {
+		got[f.Path] = true
+	}
+	for _, want := range append([]string{plannedFile}, addScopeFiles...) {
+		if !got[want] {
+			t.Errorf("FIRST implement prompt-fetch scope_files missing %q; must be plan.Scope ∪ add_scope_files on the initial dispatch (#1351); got %#v", want, resp.ScopeFiles)
+		}
+	}
+}
+
+// TestSubmitApproval_AddScopeFiles_AuditVisibleBeforePlanStageAdvance pins the
+// #1351 ROOT CAUSE (the contingency the in-process fold test confirmed): the
+// approval_submitted audit carrying add_scope_files MUST be durably committed
+// BEFORE the plan stage transitions to succeeded. That transition is the signal
+// every dispatch path keys on — the synchronous Orchestrator.Advance AND an
+// asynchronous reconciler that observes a succeeded plan stage with a still-
+// pending implement stage. If the audit lands AFTER the transition (the pre-fix
+// ordering: advanceStage then writeApprovalAudit), the initial implement
+// prompt-fetch can race the write and lose — loadApprovalAddScopeFiles returns
+// empty and the operator-declared paths are dropped from the enforced scope,
+// forcing the redundant mid-stage amendment observed in runs 03f6e28a/#1349 and
+// e6e379fd/#1352 (the merge logs fired only on the later render-poll, never at
+// the initial dispatch fetch).
+//
+// The assertion is the happens-before: at the instant the plan stage flips to
+// succeeded, the add_scope_files audit is already queryable. This FAILS on the
+// pre-fix ordering and PASSES once writeApprovalAudit is moved ahead of
+// advanceStage. No ArtifactRepo/SigningRepo is wired — the prompt is never
+// fetched; the test isolates the write→transition ordering inside the approval
+// handler.
+func TestSubmitApproval_AddScopeFiles_AuditVisibleBeforePlanStageAdvance(t *testing.T) {
+	addScopeFiles := []string{
+		"runner/cmd/fishhawk-runner/main_test.go",
+		"runner/internal/agent/agent_test.go",
+	}
+
+	rr := newPromptRunRepo()
+	au := newStoringAuditRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+
+	planStage := &run.Stage{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}
+	rr.getStages[planStageID] = planStage
+	rr.getRuns[runID] = &run.Run{
+		ID:            runID,
+		Repo:          "o/r",
+		WorkflowID:    "feature_change",
+		TriggerSource: run.TriggerCLI,
+	}
+
+	var transitionObserved, addScopeFilesVisibleAtTransition bool
+	rr.onTransitionStage = func(id uuid.UUID, to run.StageState) {
+		if id != planStageID || to != run.StageStateSucceeded {
+			return
+		}
+		transitionObserved = true
+		entries, _ := au.ListForRunByCategory(context.Background(), runID, "approval_submitted")
+		for _, e := range entries {
+			var pl struct {
+				Decision      string   `json:"decision"`
+				AddScopeFiles []string `json:"add_scope_files"`
+			}
+			if json.Unmarshal(e.Payload, &pl) == nil && pl.Decision == "approve" && len(pl.AddScopeFiles) > 0 {
+				addScopeFilesVisibleAtTransition = true
+			}
+		}
+	}
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		ApprovalRepo: newFakeApprovalRepo(),
+		AuditRepo:    au,
+	})
+
+	body := fmt.Sprintf(`{"decision":"approve","add_scope_files":[%q,%q]}`, addScopeFiles[0], addScopeFiles[1])
+	w := submitApproval(t, s, planStageID, body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("approval status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	if !transitionObserved {
+		t.Fatal("plan stage never transitioned to succeeded")
+	}
+	if !addScopeFilesVisibleAtTransition {
+		t.Error("approval_submitted add_scope_files audit was NOT visible when the plan stage advanced to succeeded; the initial implement dispatch can race the write and drop the operator-declared scope (#1351)")
+	}
 }
 
 // makeApproveWithCommentAndScopeFilesEntry builds an approval_submitted audit
