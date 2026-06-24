@@ -72,6 +72,15 @@ The HTTP transport is a **single-operator local shared endpoint, NOT multi-tenan
 
 The go-sdk's own DNS-rebinding protection (rejecting a non-loopback `Host` header) stays enabled; the loopback bind + bearer gate are independent of it. Tool registration is identical across both transports.
 
+## In-band onboarding (server `instructions` + `fishhawk://runbook`, [#1356](https://github.com/kuhlman-labs/fishhawk/issues/1356))
+
+A connecting client whose agent holds no operator memory gets enough to drive a run without a CLI alt-tab, delivered over the protocol itself:
+
+- **Non-empty server `instructions`** — returned on every MCP `initialize`. A concise happy-path verb sequence (`fishhawk_start_run` → `fishhawk_run_stage` plan → `fishhawk_approve_plan` → `fishhawk_dispatch_stage` implement → `fishhawk_await_review` → approve PR → merge → post-merge) plus the gate semantics that decide when each verb is legal (don't approve before plan review clears, wait for all configured reviewers, operator-gated scope amendments, `next_actions` is authoritative). Kept deliberately short; the long form lives in the runbook resource it points at.
+- **`fishhawk://runbook` resource** — a listable/readable `text/markdown` resource carrying the full loop-driving procedure (the ADR-040 operator-role contract) and the edge-case playbook: `runner_kind:local` for the local dogfood loop, local-drive fixup requiring an explicit `fishhawk_dispatch_stage` to spawn the runner, the scope-amendment decide/naming flow, heterogeneous-review two-verdict waits, and post-failure clean-tree discipline.
+
+Both register in the single shared `newServer` construction path (`onboarding.go`, content in `runbook.md`), so they are **transport-neutral** — identical over stdio and streamable-HTTP, and they carry into the #655 gateway unchanged.
+
 ## Install (operators)
 
 Pre-built binaries ship with every `mcp/vX.Y.Z` GitHub Release: darwin-arm64, darwin-amd64, linux-amd64, linux-arm64. Full install path including cosign verification and `claude mcp add` registration lives at [`docs/mcp/install.md`](../../../docs/mcp/install.md).

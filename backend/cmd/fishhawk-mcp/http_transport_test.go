@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -167,6 +168,10 @@ func TestServeHTTP_RoundTrip(t *testing.T) {
 	newServer := func() *mcp.Server {
 		srv := buildServer(cfg)
 		registerTools(srv, &runResolver{api: newAPIClient(cfg), getenv: envFunc(nil)})
+		// Mirror production's construction path (main.go newServer) so this
+		// test does not diverge from it — the onboarding resource must cross
+		// the registration->transport seam on the HTTP transport too.
+		registerOnboardingResources(srv)
 		return srv
 	}
 
@@ -218,6 +223,51 @@ func TestServeHTTP_RoundTrip(t *testing.T) {
 		}
 		if !sameStringSet(got, wantTools) {
 			t.Errorf("HTTP tool surface = %v, want %v (must match stdio)", got, wantTools)
+		}
+	})
+
+	t.Run("authenticated client reads the onboarding runbook over HTTP", func(t *testing.T) {
+		httpClient := &http.Client{
+			Transport: bearerRoundTripper{token: token, base: http.DefaultTransport},
+		}
+		client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil)
+		session, err := client.Connect(ctx, &mcp.StreamableClientTransport{
+			Endpoint:   url,
+			HTTPClient: httpClient,
+		}, nil)
+		if err != nil {
+			t.Fatalf("connect with bearer: %v", err)
+		}
+		defer session.Close()
+
+		// The instructions field also crosses the HTTP handshake.
+		if got := session.InitializeResult().Instructions; !strings.Contains(got, "fishhawk_start_run") {
+			t.Errorf("HTTP initialize instructions missing happy-path anchor; got %q", got)
+		}
+
+		list, err := session.ListResources(ctx, nil)
+		if err != nil {
+			t.Fatalf("ListResources over HTTP: %v", err)
+		}
+		found := false
+		for _, r := range list.Resources {
+			if r.URI == runbookURI {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("HTTP ListResources did not include %s (resource did not cross the transport seam)", runbookURI)
+		}
+
+		res, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: runbookURI})
+		if err != nil {
+			t.Fatalf("ReadResource over HTTP: %v", err)
+		}
+		if len(res.Contents) == 0 || strings.TrimSpace(res.Contents[0].Text) == "" {
+			t.Fatal("HTTP runbook read returned empty content")
+		}
+		if !strings.Contains(res.Contents[0].Text, "runner_kind:local") {
+			t.Error("HTTP runbook content missing the runner_kind:local edge case")
 		}
 	})
 
