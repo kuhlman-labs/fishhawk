@@ -560,6 +560,25 @@ func TestParseLine_UsageAndModel(t *testing.T) {
 		t.Errorf("OutputTokens = %d, want 45 (30 + 15 reasoning)", info.OutputTokens)
 	}
 
+	// Degenerate block where cached_input_tokens EXCEEDS input_tokens: the
+	// fresh subtraction (input - cached) is negative and must clamp at 0, never
+	// underflowing into a negative InputTokens that would then under-sum
+	// TokensUsed/sumRunTokens (#1349). The full cached count still surfaces as
+	// the cache-read bucket. Exercises the `if fresh < 0` clamp branch.
+	ev, info = parseLine([]byte(`{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":25,"output_tokens":5,"reasoning_output_tokens":0}}`), ts)
+	if ev.Kind != "turn.completed" {
+		t.Errorf("kind = %q, want turn.completed", ev.Kind)
+	}
+	if !info.HasUsage {
+		t.Fatal("HasUsage = false on degenerate cached>input block")
+	}
+	if info.InputTokens != 0 {
+		t.Errorf("InputTokens = %d, want 0 (fresh clamped at 0 when cached>input)", info.InputTokens)
+	}
+	if info.CacheReadInputTokens != 25 {
+		t.Errorf("CacheReadInputTokens = %d, want 25 (full cached subset surfaces)", info.CacheReadInputTokens)
+	}
+
 	// Non-JSON line → raw, no usage.
 	ev, info = parseLine([]byte(`not json at all`), ts)
 	if ev.Kind != "raw" {

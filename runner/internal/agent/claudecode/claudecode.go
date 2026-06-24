@@ -548,10 +548,15 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 		progMu.Lock()
 		turns++
 		lastKind = ev.Kind
-		if ok && used > 0 {
-			// Usage lines report cumulative counts, so the latest
-			// non-zero line wins (not a running sum within an attempt).
-			// The cache buckets ride the same winning line (#1349).
+		if ok {
+			// Usage lines report cumulative counts, so the latest line
+			// carrying usage wins (not a running sum within an attempt). The
+			// gate is hasUsage (ok), not a non-zero fresh-token sum: a
+			// cache-only line (zero fresh input/output but non-zero cache
+			// read/write) still carries spend and its buckets must not be
+			// dropped (#1349). TokensUsed stays the fresh input+output total
+			// (the cache buckets are priced separately on Result); the buckets
+			// ride the same winning line.
 			tokensUsed = used
 			inputTokens = info.InputTokens
 			outputTokens = info.OutputTokens
@@ -559,7 +564,7 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 			cacheWriteInputTokens = info.CacheWriteInputTokens
 		}
 		progMu.Unlock()
-		if ok && used > 0 {
+		if ok {
 			if inv.Budget.MaxTokens > 0 && tokensUsed > inv.Budget.MaxTokens {
 				budgetHit = true
 				_ = cmd.Process.Kill()
@@ -821,7 +826,12 @@ func parseLine(line []byte, ts time.Time) (agent.Event, lineInfo, bool) {
 		// alongside as their own additive buckets (#1349).
 		info.CacheReadInputTokens = usage.CacheReadInputTokens
 		info.CacheWriteInputTokens = usage.CacheCreationInputTokens
-		hasUsage = info.InputTokens+info.OutputTokens > 0
+		// A line carries usage if ANY token bucket is non-zero — including a
+		// cache-only line (zero fresh input/output but a non-zero cache read or
+		// cache-creation count), e.g. a turn whose entire prompt was served from
+		// the prompt cache. Gating on the fresh input+output sum alone would
+		// drop that cache spend before it reaches agent.Result (#1349).
+		hasUsage = info.InputTokens+info.OutputTokens+info.CacheReadInputTokens+info.CacheWriteInputTokens > 0
 	}
 
 	return agent.Event{
