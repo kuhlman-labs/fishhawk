@@ -195,6 +195,19 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// runner_kind reconciliation (#1346 / ADR-045). The runner self-reports
+	// its observed execution channel inside the SIGNED manifest; reconcile it
+	// against the run's create-time hint and LOCK runner_kind on the first
+	// report, closing the #1344 local-loop wedge. Best-effort: the trace is
+	// already stored, so any error WARN-logs and never unwinds the upload.
+	// Done BEFORE the trace_uploaded audit append so that entry attests the
+	// reconciled (locked) kind; the runner_kind_resolved / runner_kind_mismatch
+	// entries are chained AFTER trace_uploaded below.
+	runnerKindRes := s.reconcileRunnerKind(r.Context(), runID, body)
+	if runnerKindRes.Locked != "" {
+		auditFields["runner_kind"] = runnerKindRes.Locked
+	}
+
 	// Audit: append a chained entry tying the upload to this run's
 	// prior history. AppendChained holds a row-lock on runs so two
 	// concurrent uploads can't fork the chain.
@@ -216,6 +229,12 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 			"append audit entry failed", map[string]any{"error": err.Error()})
 		return
 	}
+
+	// Emit the reconciliation guardrail audit (#1346 / ADR-045), chained
+	// after trace_uploaded. Changed → runner_kind_resolved (the hint was
+	// corrected); Mismatch → runner_kind_mismatch (a later report disagreed
+	// with the already-locked kind). Best-effort: a failure WARN-logs.
+	s.emitRunnerKindReconcileAudit(r.Context(), runID, stageID, runnerKindRes)
 
 	// Cost rollup (#649). Compute the estimated cost of this bundle's
 	// model usage from the SIGNED manifest's token counts (not from a
@@ -1280,6 +1299,115 @@ func (s *Server) emitRuntimeObserved(ctx context.Context, runID, stageID uuid.UU
 			"runtime calibration: append audit entry failed",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
+}
+
+// runnerKindResolver is the optional capability the trace handler uses to
+// reconcile a runner self-report against the run's persisted runner_kind
+// and LOCK it on the first report (#1346 / ADR-045). The Postgres run
+// repository implements it; like runCostRecorder it is deliberately NOT
+// part of run.Repository — adding it would break the many hand-rolled test
+// fakes that implement the interface without embedding BaseFake — so the
+// trace handler asserts for it at runtime and skips reconciliation
+// (warn-only) when the wired RunRepo doesn't satisfy it.
+type runnerKindResolver interface {
+	ResolveRunnerKind(ctx context.Context, runID uuid.UUID, observed string) (run.RunnerKindResolution, error)
+}
+
+// reconcileRunnerKind reads the bundle manifest's self-reported execution
+// channel and reconciles it against the run's persisted runner_kind
+// (#1346 / ADR-045), returning the resolution so the caller can stamp the
+// trace_uploaded audit and emit the guardrail audit entry.
+//
+// Best-effort throughout — the trace is already stored by the time this
+// runs, so every degradation returns the zero RunnerKindResolution (a
+// no-op the caller treats as "nothing to reconcile") rather than failing
+// the upload:
+//   - RunRepo nil, or it doesn't implement runnerKindResolver → no-op.
+//   - manifest unparsable, or it carries no runner_kind (legacy bundle) →
+//     no-op (no WARN for the ordinary no-report case).
+//   - ResolveRunnerKind errors → WARN-log, no-op.
+func (s *Server) reconcileRunnerKind(ctx context.Context, runID uuid.UUID, body []byte) run.RunnerKindResolution {
+	if s.cfg.RunRepo == nil {
+		return run.RunnerKindResolution{}
+	}
+	resolver, ok := s.cfg.RunRepo.(runnerKindResolver)
+	if !ok {
+		return run.RunnerKindResolution{}
+	}
+	manifest, err := bundle.ExtractManifest(body)
+	if err != nil || manifest.RunnerKind == "" {
+		// A legacy / channel-less bundle carries no self-report; that is the
+		// ordinary back-compat case, not an error worth a WARN.
+		return run.RunnerKindResolution{}
+	}
+	res, err := resolver.ResolveRunnerKind(ctx, runID, manifest.RunnerKind)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"trace upload: resolve runner_kind failed — leaving runner_kind unreconciled",
+			slog.String("run_id", runID.String()),
+			slog.String("observed", manifest.RunnerKind),
+			slog.String("error", err.Error()))
+		return run.RunnerKindResolution{}
+	}
+	return res
+}
+
+// emitRunnerKindReconcileAudit chains the runner_kind reconciliation
+// guardrail audit entry after trace_uploaded (#1346 / ADR-045):
+//
+//   - Changed → category runner_kind_resolved, payload {from, to}: the
+//     first signed report corrected the create-time hint (the #1344 fix).
+//   - Mismatch → category runner_kind_mismatch, payload {declared,
+//     observed}: a later report disagreed with the already-locked kind; the
+//     row was left unchanged (warn, never silently flip). This is the
+//     post-execution guardrail.
+//
+// A no-op / re-affirmation resolution emits nothing. Best-effort: a
+// nil AuditRepo or an append failure WARN-logs and never unwinds the
+// already-stored, already-trace_uploaded-audited upload.
+func (s *Server) emitRunnerKindReconcileAudit(ctx context.Context, runID, stageID uuid.UUID, res run.RunnerKindResolution) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	var category string
+	var fields map[string]any
+	switch {
+	case res.Mismatch:
+		category = "runner_kind_mismatch"
+		fields = map[string]any{
+			"run_id":   runID.String(),
+			"stage_id": stageID.String(),
+			"declared": res.Prior,
+			"observed": res.Observed,
+		}
+	case res.Changed:
+		category = "runner_kind_resolved"
+		fields = map[string]any{
+			"run_id":   runID.String(),
+			"stage_id": stageID.String(),
+			"from":     res.Prior,
+			"to":       res.Locked,
+		}
+	default:
+		return
+	}
+	payload, _ := json.Marshal(fields)
+	systemKind := audit.ActorKind("system")
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  category,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"trace upload: append runner_kind reconcile audit failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("category", category),
 			slog.String("error", err.Error()))
 	}
 }

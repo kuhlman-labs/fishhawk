@@ -1458,6 +1458,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			OutputTokens:       res.OutputTokens,
 			AgentFailed:        agentFailed,
 			AgentFailureReason: agentFailureReason,
+			// Self-observed execution channel (#1346 / ADR-045). Set on the
+			// raw manifest; manifestRedacted copies it verbatim below (it is
+			// a provenance tag, not a secret). The backend reconciles it
+			// against the run's creation-time hint and LOCKS runner_kind to
+			// it, closing the #1344 local-loop wedge.
+			RunnerKind:         detectRunnerKind(os.Getenv),
 			PushAndOpenPR:      willOpenPR,
 			PushToSharedBranch: willPushChild,
 			PushFixup:          willPushFixup,
@@ -2001,9 +2007,13 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 }
 
 func logStartup(w io.Writer, cfg config) {
+	// runner_kind is the self-observed execution channel (#1346 / ADR-045),
+	// surfaced here for log observability and computed from the SAME
+	// detectRunnerKind(os.Getenv) source that stamps the signed manifest, so
+	// the log line and the attestable manifest claim never disagree.
 	_, _ = fmt.Fprintf(w,
-		`{"event":"runner_started","run_id":%q,"workflow":%q,"stage":%q,"backend_url":%q,"version":%q,"git_sha":%q,"prompt_file":%q}`+"\n",
-		cfg.runID, cfg.workflow, cfg.stage, cfg.backendURL, runnerVersion(), runnerGitSHA(), cfg.promptFile,
+		`{"event":"runner_started","run_id":%q,"workflow":%q,"stage":%q,"backend_url":%q,"version":%q,"git_sha":%q,"prompt_file":%q,"runner_kind":%q}`+"\n",
+		cfg.runID, cfg.workflow, cfg.stage, cfg.backendURL, runnerVersion(), runnerGitSHA(), cfg.promptFile, detectRunnerKind(os.Getenv),
 	)
 }
 

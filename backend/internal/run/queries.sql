@@ -47,6 +47,19 @@ UPDATE runs
  WHERE id = $1
 RETURNING *;
 
+-- name: UpdateRunnerKind :one
+-- Locks the observed execution channel onto the run (#1346 / ADR-045):
+-- sets runner_kind to the runner's self-reported value and flips
+-- runner_kind_resolved=true so the create-time hint is corrected exactly
+-- once. ResolveRunnerKind calls this inside a FOR UPDATE transaction only
+-- when the run is not yet resolved; a later disagreeing report takes the
+-- mismatch branch and never reaches this UPDATE.
+UPDATE runs
+   SET runner_kind = $2,
+       runner_kind_resolved = true
+ WHERE id = $1
+RETURNING *;
+
 -- name: SetRunPullRequestURL :one
 -- Backfills the implement-stage PR URL onto the run row when the
 -- pull_request artifact lands (#216). Idempotent: a re-upload with

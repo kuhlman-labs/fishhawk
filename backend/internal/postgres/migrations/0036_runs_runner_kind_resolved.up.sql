@@ -1,0 +1,40 @@
+-- 0036: add the runner_kind LOCK flag (#1346 / ADR-045).
+--
+-- Supersedes migration 0024's authority paragraph for the
+-- host-dispatch/local path. 0024 made runner_kind a create-time
+-- DECLARATION the backend stamped, with the note "the runner never
+-- self-declares" — a guard against a FALSIFIABLE runner claim. That left
+-- the #1344 local-loop hole: a host-side dispatch that omitted
+-- runner_kind:local defaulted to 'github_actions', and the drive's
+-- plan-approval gate then waited forever on a phantom GitHub-Actions
+-- runner that never dispatches.
+--
+-- New model: runner_kind at create time is a HINT. The runner observes
+-- its OWN execution channel (GITHUB_* present ⇒ github_actions, absent ⇒
+-- local) and self-reports it INSIDE the SIGNED trace-bundle manifest —
+-- attestable, not falsifiable, because the per-run Ed25519 signature
+-- makes it tamper-evident. The trace handler reconciles: the FIRST
+-- report LOCKS runner_kind (runner_kind_resolved = true), correcting the
+-- hint; a later report that disagrees with the locked kind is FLAGGED
+-- via a runner_kind_mismatch audit entry and does NOT mutate the row.
+--
+-- Because the plan stage ships its trace (--upload-trace) BEFORE the
+-- operator approves the plan, runner_kind is locked to the observed
+-- channel by the time the drive's plan-approval gate reads it.
+--
+-- Default false covers all legacy rows and every freshly-created run:
+-- false = "still an un-locked creation hint" (pre-change semantics).
+-- Additive with a non-volatile default, so PostgreSQL backfills without
+-- rewriting rows and pre-migration binaries never reference the column.
+--
+-- Verifier impact (verifier/internal/audit/): the flag is metadata atop
+-- the tamper-evidence chain, not a hash input; the verifier does not read
+-- runner_kind OR runner_kind_resolved, so the rehash invariant is
+-- unaffected. The runner_kind_resolved / runner_kind_mismatch audit
+-- entries are the canonical record of what reconciliation did.
+--
+-- No index: read by PK (id) on the same row the trace handler already
+-- locks FOR UPDATE.
+
+ALTER TABLE runs
+    ADD COLUMN runner_kind_resolved BOOLEAN NOT NULL DEFAULT false;

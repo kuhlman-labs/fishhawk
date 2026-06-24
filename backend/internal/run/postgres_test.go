@@ -895,6 +895,169 @@ func TestPostgres_StageGate_CheckGateHasNoApprovers(t *testing.T) {
 	}
 }
 
+// runnerKindResolverRepo is the optional runner_kind reconciliation surface
+// the trace handler consumes via capability assertion (#1346 / ADR-045).
+// ResolveRunnerKind is not part of run.Repository (adding it would break the
+// many hand-rolled fakes), so the test asserts for it the same way the
+// server does.
+type runnerKindResolverRepo interface {
+	ResolveRunnerKind(ctx context.Context, runID uuid.UUID, observed string) (run.RunnerKindResolution, error)
+}
+
+func runnerKindResolver(t *testing.T, repo run.Repository) runnerKindResolverRepo {
+	t.Helper()
+	rk, ok := repo.(runnerKindResolverRepo)
+	if !ok {
+		t.Fatal("postgres repo does not implement ResolveRunnerKind")
+	}
+	return rk
+}
+
+// TestPostgres_ResolveRunnerKind_FirstReportFlipsAndLocks is the #1344 fix
+// (done-means #1): an un-resolved run defaulting to github_actions, on its
+// FIRST signed-manifest report of `local`, flips runner_kind to local and
+// locks it (runner_kind_resolved=true).
+func TestPostgres_ResolveRunnerKind_FirstReportFlipsAndLocks(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	rk := runnerKindResolver(t, repo)
+	ctx := context.Background()
+
+	r := makeRun(t, repo) // default runner_kind = github_actions, unresolved
+	if r.RunnerKind != run.RunnerKindGitHubActions || r.RunnerKindResolved {
+		t.Fatalf("seed: runner_kind=%q resolved=%v, want github_actions/false", r.RunnerKind, r.RunnerKindResolved)
+	}
+
+	res, err := rk.ResolveRunnerKind(ctx, r.ID, run.RunnerKindLocal)
+	if err != nil {
+		t.Fatalf("ResolveRunnerKind: %v", err)
+	}
+	if !res.Changed || res.Mismatch || res.Locked != run.RunnerKindLocal || res.Prior != run.RunnerKindGitHubActions {
+		t.Errorf("resolution = %+v, want Changed locked=local prior=github_actions", res)
+	}
+	got, err := repo.GetRun(ctx, r.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if got.RunnerKind != run.RunnerKindLocal || !got.RunnerKindResolved {
+		t.Errorf("persisted runner_kind=%q resolved=%v, want local/true", got.RunnerKind, got.RunnerKindResolved)
+	}
+}
+
+// TestPostgres_ResolveRunnerKind_FirstReportLocksSameValue is done-means #2:
+// a first report of github_actions on the github_actions-default run locks
+// it (resolved=true) but reports Changed=false (the hint was already right).
+func TestPostgres_ResolveRunnerKind_FirstReportLocksSameValue(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	rk := runnerKindResolver(t, repo)
+	ctx := context.Background()
+
+	r := makeRun(t, repo)
+	res, err := rk.ResolveRunnerKind(ctx, r.ID, run.RunnerKindGitHubActions)
+	if err != nil {
+		t.Fatalf("ResolveRunnerKind: %v", err)
+	}
+	if res.Changed || res.Mismatch || res.Locked != run.RunnerKindGitHubActions {
+		t.Errorf("resolution = %+v, want locked=github_actions not changed not mismatch", res)
+	}
+	got, err := repo.GetRun(ctx, r.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if got.RunnerKind != run.RunnerKindGitHubActions || !got.RunnerKindResolved {
+		t.Errorf("persisted runner_kind=%q resolved=%v, want github_actions/true", got.RunnerKind, got.RunnerKindResolved)
+	}
+}
+
+// TestPostgres_ResolveRunnerKind_MismatchLeavesRowUnchanged is done-means #3,
+// BOTH guardrail directions: once a run is LOCKED, a later report disagreeing
+// with the locked kind returns Mismatch and does NOT mutate the row.
+func TestPostgres_ResolveRunnerKind_MismatchLeavesRowUnchanged(t *testing.T) {
+	cases := []struct {
+		name        string
+		lockTo      string
+		thenObserve string
+	}{
+		{name: "locked_local_observe_github", lockTo: run.RunnerKindLocal, thenObserve: run.RunnerKindGitHubActions},
+		{name: "locked_github_observe_local", lockTo: run.RunnerKindGitHubActions, thenObserve: run.RunnerKindLocal},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := pgtest.NewPool(t)
+			repo := run.NewPostgresRepository(pool)
+			rk := runnerKindResolver(t, repo)
+			ctx := context.Background()
+
+			r := makeRun(t, repo)
+			// First report locks runner_kind to lockTo.
+			if _, err := rk.ResolveRunnerKind(ctx, r.ID, tc.lockTo); err != nil {
+				t.Fatalf("lock ResolveRunnerKind: %v", err)
+			}
+			// Disagreeing second report.
+			res, err := rk.ResolveRunnerKind(ctx, r.ID, tc.thenObserve)
+			if err != nil {
+				t.Fatalf("mismatch ResolveRunnerKind: %v", err)
+			}
+			if !res.Mismatch || res.Changed {
+				t.Errorf("resolution = %+v, want Mismatch not Changed", res)
+			}
+			if res.Prior != tc.lockTo || res.Observed != tc.thenObserve {
+				t.Errorf("resolution prior/observed = %q/%q, want %q/%q", res.Prior, res.Observed, tc.lockTo, tc.thenObserve)
+			}
+			got, err := repo.GetRun(ctx, r.ID)
+			if err != nil {
+				t.Fatalf("GetRun: %v", err)
+			}
+			if got.RunnerKind != tc.lockTo || !got.RunnerKindResolved {
+				t.Errorf("row mutated on mismatch: runner_kind=%q resolved=%v, want %q/true (unchanged)", got.RunnerKind, got.RunnerKindResolved, tc.lockTo)
+			}
+		})
+	}
+}
+
+// TestPostgres_ResolveRunnerKind_UnrecognizedReportIsNoOp covers the
+// fail-closed guard: an empty or non-ValidRunnerKind observed value never
+// persists (the create-time hint stands) and returns the zero resolution.
+func TestPostgres_ResolveRunnerKind_UnrecognizedReportIsNoOp(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	rk := runnerKindResolver(t, repo)
+	ctx := context.Background()
+
+	r := makeRun(t, repo)
+	for _, observed := range []string{"", "kubernetes", "GITHUB_ACTIONS"} {
+		res, err := rk.ResolveRunnerKind(ctx, r.ID, observed)
+		if err != nil {
+			t.Fatalf("ResolveRunnerKind(%q): %v", observed, err)
+		}
+		if res != (run.RunnerKindResolution{}) {
+			t.Errorf("ResolveRunnerKind(%q) = %+v, want zero (no-op)", observed, res)
+		}
+	}
+	got, err := repo.GetRun(ctx, r.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if got.RunnerKind != run.RunnerKindGitHubActions || got.RunnerKindResolved {
+		t.Errorf("row mutated by unrecognized report: runner_kind=%q resolved=%v, want github_actions/false", got.RunnerKind, got.RunnerKindResolved)
+	}
+}
+
+// TestPostgres_ResolveRunnerKind_NotFound covers the missing-run error
+// branch: a valid observed value against a non-existent run returns
+// ErrNotFound (which the trace handler degrades to a WARN).
+func TestPostgres_ResolveRunnerKind_NotFound(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	rk := runnerKindResolver(t, repo)
+
+	_, err := rk.ResolveRunnerKind(context.Background(), uuid.New(), run.RunnerKindLocal)
+	if !errors.Is(err, run.ErrNotFound) {
+		t.Errorf("ResolveRunnerKind on missing run = %v, want ErrNotFound", err)
+	}
+}
+
 // costRepo is the optional cost-rollup surface the trace handler
 // consumes via capability assertion (#649 / #688). AddRunCost and
 // SumWorkflowCostInRange are not part of run.Repository, so the test

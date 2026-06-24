@@ -4621,6 +4621,82 @@ func TestRun_ImplementStage_PushToSharedBranch_ManifestMatrix(t *testing.T) {
 	}
 }
 
+// TestRun_StampsRunnerKindOnManifestsAndStartup asserts the load-bearing
+// runner-side wiring (#1346 / ADR-045, binding condition #2): PackInputs
+// .RunnerKind is set from detectRunnerKind(os.Getenv) onto BOTH the raw and
+// the redacted signed manifests, and the same value is surfaced on the
+// runner_started log line. Both reviewers flagged this path untested. The
+// env is forced via t.Setenv so the assertion is deterministic regardless of
+// where the suite runs (CI exports GITHUB_ACTIONS=true; a local shell may
+// export CI=true).
+func TestRun_StampsRunnerKindOnManifestsAndStartup(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{
+			name: "github_actions channel",
+			env:  map[string]string{"GITHUB_ACTIONS": "true", "GITHUB_RUN_ID": "777", "CI": "true"},
+			want: "github_actions",
+		},
+		{
+			// The #1344 local-loop channel: no GITHUB_* var, even with CI=true.
+			name: "local channel",
+			env:  map[string]string{"GITHUB_ACTIONS": "", "GITHUB_RUN_ID": "", "CI": "true"},
+			want: "local",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			dir := t.TempDir()
+			promptPath := filepath.Join(dir, "prompt.txt")
+			if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+			fu := newFakeUploader(t)
+			withFakeUploader(t, fu)
+
+			var stderr strings.Builder
+			got := run([]string{
+				"--run-id", "11111111-2222-3333-4444-555555555555",
+				"--backend-url", "https://api.fishhawk.test",
+				"--workflow", "feature_change", "--stage", "plan",
+				"--prompt-file", promptPath,
+				"--upload-trace",
+				"--stage-id", "22222222-3333-4444-5555-666666666666",
+			}, &stderr)
+			if got != exitOK {
+				t.Fatalf("run = %d:\n%s", got, stderr.String())
+			}
+			if len(fu.gotShipCalls) != 2 {
+				t.Fatalf("ShipTrace calls = %d, want 2 (raw + redacted)", len(fu.gotShipCalls))
+			}
+			// Both variants must carry the detected channel — the redacted
+			// manifest copies the raw one, so a regression that only stamped raw
+			// would surface here.
+			for i, label := range []string{"raw", "redacted"} {
+				manifest, _, _, err := openBundleForTest(fu.gotShipCalls[i].Bundle)
+				if err != nil {
+					t.Fatalf("open %s bundle: %v", label, err)
+				}
+				if manifest.RunnerKind != tc.want {
+					t.Errorf("%s manifest.RunnerKind = %q, want %q", label, manifest.RunnerKind, tc.want)
+				}
+			}
+			// Surfaced on runner_started for log observability.
+			wantLog := `"runner_kind":"` + tc.want + `"`
+			if !strings.Contains(stderr.String(), wantLog) {
+				t.Errorf("runner_started missing %s:\n%s", wantLog, stderr.String())
+			}
+		})
+	}
+}
+
 // TestRun_ImplementStage_DecomposedChildPushFailure_ReportsFailed confirms
 // the load-bearing #771 fix: when a decomposed child's commit/push onto the
 // shared branch fails (a generic git/network error → category C), the runner

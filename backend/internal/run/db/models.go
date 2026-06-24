@@ -106,6 +106,7 @@ type Run struct {
 	ResolvedModel          string             `json:"resolved_model"`
 	Drive                  bool               `json:"drive"`
 	SliceIndex             *int32             `json:"slice_index"`
+	RunnerKindResolved     bool               `json:"runner_kind_resolved"`
 }
 
 type ScopeAmendment struct {

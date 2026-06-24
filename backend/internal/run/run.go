@@ -261,7 +261,22 @@ type Run struct {
 	//
 	// Legacy rows (created before migration 0024) carry the
 	// migration's column-level default of `github_actions`.
+	//
+	// As of #1346 / ADR-045 the create-time value is a HINT, not the
+	// authority: the runner self-reports the observed execution channel in
+	// its SIGNED trace-bundle manifest, and the trace handler reconciles —
+	// the first report LOCKS runner_kind (see RunnerKindResolved). This
+	// closes the #1344 local-loop wedge where an omitted runner_kind:local
+	// defaulted to github_actions and the drive's plan-approval gate waited
+	// on a phantom GitHub-Actions runner.
 	RunnerKind string
+	// RunnerKindResolved reports whether RunnerKind has been LOCKED by a
+	// runner self-report (#1346 / ADR-045). False (the migration 0036
+	// default for every legacy row and every freshly-created run) means
+	// RunnerKind is still the un-locked creation-time hint; the first signed
+	// manifest report flips it true and a later disagreeing report is
+	// FLAGGED (runner_kind_mismatch audit) rather than allowed to mutate.
+	RunnerKindResolved bool
 	// IssueContext caches the triggering GitHub issue's title,
 	// body, url, and number at run-create time (#415). Populated
 	// by the CLI's operator-side `gh issue view` fetch for runs
@@ -350,6 +365,39 @@ const (
 var ValidRunnerKinds = map[string]struct{}{
 	RunnerKindGitHubActions: {},
 	RunnerKindLocal:         {},
+}
+
+// RunnerKindResolution is the outcome of reconciling a runner self-report
+// against a run's persisted runner_kind (#1346 / ADR-045). Exactly one of
+// the three outcomes is meaningful at a time:
+//
+//   - Changed: the report LOCKED the run (first report on an un-resolved
+//     run) AND the locked value differs from the prior hint — emit a
+//     runner_kind_resolved audit entry (Prior → Locked). The #1344 fix.
+//   - Locked-but-not-Changed: the report locked (or re-affirmed) the run to
+//     a value equal to the prior hint — no audit, nothing to surface.
+//   - Mismatch: the run was ALREADY locked to a value that disagrees with
+//     this report — the row is NOT mutated (warn, never silently flip) and
+//     a runner_kind_mismatch audit entry is emitted (Prior=locked,
+//     Observed=report). The post-execution guardrail.
+//
+// A no-op (empty/invalid observed value, or a run that doesn't exist) is the
+// zero value: Locked=="" and all bools false.
+type RunnerKindResolution struct {
+	// Locked is the value runner_kind holds after reconciliation. Empty for
+	// a no-op (unrecognized report).
+	Locked string
+	// Changed is true only when this report locked the run AND moved
+	// runner_kind off its prior value (the create-time hint was wrong).
+	Changed bool
+	// Mismatch is true when the run was already locked to a DIFFERENT value;
+	// the row was left unchanged.
+	Mismatch bool
+	// Observed is the runner-reported value that drove this reconciliation.
+	Observed string
+	// Prior is the runner_kind value before reconciliation (the value that
+	// remains on a Mismatch).
+	Prior string
 }
 
 // RequiredChecksSnapshot captures the required-status-checks list

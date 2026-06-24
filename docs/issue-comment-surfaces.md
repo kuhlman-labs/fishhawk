@@ -798,6 +798,29 @@ Notes:
   does not touch the run thread; it collapses repeat occurrences of the same
   failure onto one upstream report instead of filing duplicates.
 
+- The runner-kind reconciliation audit kinds — `runner_kind_resolved` and
+  `runner_kind_mismatch` (#1346 / ADR-045) — are **internal, system-actor
+  audit kinds, not issue-comment surfaces**. Nothing in `issuecomment` posts
+  them; they have no Notifier methods. The trace upload handler
+  (`trace.go::reconcileRunnerKind` → `run.(runnerKindResolver).ResolveRunnerKind`,
+  then `trace.go::emitRunnerKindReconcileAudit`) reconciles the runner's
+  self-observed execution channel (carried inside the SIGNED bundle manifest's
+  `runner_kind` field) against the run's create-time hint. The FIRST report
+  LOCKS `runner_kind` (`runs.runner_kind_resolved=true`, migration 0036): when
+  the locked value differs from the prior hint the handler writes
+  `runner_kind_resolved` (payload `{run_id, stage_id, from, to}`) — the #1344
+  fix that corrects an omitted `runner_kind:local` defaulted to
+  `github_actions`. A LATER report disagreeing with the already-locked kind
+  writes `runner_kind_mismatch` (payload `{run_id, stage_id, declared,
+  observed}`) and does NOT mutate the row (warn, never silently flip) — the
+  post-execution guardrail. A re-affirmation (locked value == report), a
+  legacy bundle with no `runner_kind`, an unrecognized report, or a resolver
+  error emits NEITHER. Both are chained AFTER the `trace_uploaded` entry, which
+  itself is stamped with the reconciled (locked) kind. Best-effort throughout:
+  the trace is already stored, so any reconciliation failure WARN-logs and
+  never unwinds the upload. Listed here only so a future reader grepping the
+  audit categories doesn't mistake them for comment surfaces.
+
 ## Routing
 
 All surfaces above only fire when the run's `TriggerSource = github_issue`.
