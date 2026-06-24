@@ -366,6 +366,42 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Persist the approval audits BEFORE advancing the stage (#1351). The
+	// stage transition below is the dispatch-gating signal: BOTH the
+	// synchronous Orchestrator.Advance handoff AND an asynchronous reconciler
+	// that observes a succeeded plan stage with a still-pending implement stage
+	// can dispatch the implement stage — and the runner can fetch its prompt —
+	// the instant the plan stage flips to succeeded. That prompt-fetch reads
+	// these audits: loadApprovalAddScopeFiles folds approval_submitted's
+	// add_scope_files into the implement agent's enforced scope, and the
+	// runner-spawn router reads model_resolved. With the writes AFTER the
+	// transition (the prior ordering), the initial dispatch's fetch raced the
+	// write and lost — the operator-declared add_scope_files paths were absent
+	// from the enforced scope on the first dispatch, forcing a redundant
+	// mid-stage amendment for the very files already declared (reproduced in
+	// runs 03f6e28a/#1349 and e6e379fd/#1352). Writing them first makes them
+	// durably visible before any dispatch path can observe the transition. The
+	// `stage` here is the pre-advance row; advanceStage mutates only its State,
+	// not the ID/RunID these audits read, so the persisted payloads are
+	// byte-identical to the prior ordering — only their commit point moves
+	// earlier. Both writes are best-effort (a logged append failure never
+	// unwinds the approval the gate already recorded via Submit).
+	s.writeApprovalAudit(r, stage, res.Approval, req.Comment, req.ApproverGithubLogin, req.AddScopeFiles, req.BindingAssertions, delegatedRule)
+
+	// Model resolution (#1013): emit the source-tagged model_resolved audit
+	// the gate computed on this plan-stage approve — the INTRODUCTION of the
+	// model_resolved kind (CategoryModelResolved). The slice-1 reader
+	// (gateResolvedModel) consumes the most-recent entry to route the runner
+	// spawn's --model. Emitted even when the resolution is empty
+	// (ModelSourceNone): the reader returns it as a deliberate "use the
+	// default spawn" decision, byte-identical to today's no---model spawn. Like
+	// the approval audit above, it must precede advanceStage so the runner-spawn
+	// router cannot read an empty model_resolved on a dispatch that races the
+	// transition.
+	if resolvedModel != nil {
+		s.writeModelResolvedAudit(r, stage, res.Approval, *resolvedModel)
+	}
+
 	stage, err = s.advanceStage(r.Context(), stageID, decision)
 	if err != nil {
 		var inv run.InvalidTransitionError
@@ -379,21 +415,6 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"transition stage failed", map[string]any{"error": err.Error()})
 		return
-	}
-
-	s.writeApprovalAudit(r, stage, res.Approval, req.Comment, req.ApproverGithubLogin, req.AddScopeFiles, req.BindingAssertions, delegatedRule)
-
-	// Model resolution (#1013): emit the source-tagged model_resolved audit
-	// the gate computed on this plan-stage approve — the INTRODUCTION of the
-	// model_resolved kind (CategoryModelResolved). The slice-1 reader
-	// (gateResolvedModel) consumes the most-recent entry to route the runner
-	// spawn's --model. Emitted even when the resolution is empty
-	// (ModelSourceNone): the reader returns it as a deliberate "use the
-	// default spawn" decision, byte-identical to today's no---model spawn.
-	// Best-effort like writeApprovalAudit — a logged failure never unwinds
-	// the approval.
-	if resolvedModel != nil {
-		s.writeModelResolvedAudit(r, stage, res.Approval, *resolvedModel)
 	}
 
 	// Hand off to the orchestrator on both approve AND reject
