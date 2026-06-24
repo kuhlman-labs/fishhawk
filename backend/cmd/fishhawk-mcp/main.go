@@ -145,6 +145,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 			api:    newAPIClient(cfg),
 			getenv: os.Getenv,
 		})
+		registerOnboardingResources(srv)
 		return srv
 	}
 
@@ -205,5 +206,5 @@ func buildServer(_ config) *mcp.Server {
 	return mcp.NewServer(&mcp.Implementation{
 		Name:    serverName,
 		Version: handshakeVersion(version.GitSHA),
-	}, nil)
+	}, &mcp.ServerOptions{Instructions: onboardingInstructions})
 }
