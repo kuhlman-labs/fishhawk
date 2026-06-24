@@ -33,10 +33,14 @@ func TestReviewer_HappyPath(t *testing.T) {
 	if !verdict.Usage.Known || verdict.Usage.InputTokens != 1134 || verdict.Usage.OutputTokens != 600 {
 		t.Errorf("Usage = %+v, want {1134 600 true}", verdict.Usage)
 	}
-	// The #995 instrumentation rides the same pass-through: cached split and
-	// turn count reach the server contract unmodified.
-	if verdict.Usage.CachedInputTokens != 100 || verdict.Usage.Turns != 1 {
-		t.Errorf("Usage = %+v, want CachedInputTokens=100 Turns=1", verdict.Usage)
+	// The #995/#1343 instrumentation rides the same pass-through: codex's single
+	// cached total reaches the cache READ bucket (write 0), and turn count
+	// reaches the server contract unmodified.
+	if verdict.Usage.CacheReadInputTokens != 100 || verdict.Usage.CacheWriteInputTokens != 0 || verdict.Usage.Turns != 1 {
+		t.Errorf("Usage = %+v, want CacheReadInputTokens=100 CacheWriteInputTokens=0 Turns=1", verdict.Usage)
+	}
+	if got := verdict.Usage.CachedInputTokens(); got != 100 {
+		t.Errorf("Usage.CachedInputTokens() = %d, want 100 (read 100 + write 0)", got)
 	}
 }
 

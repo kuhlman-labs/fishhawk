@@ -273,6 +273,28 @@ func TestReviewVerdict_UsageIsolatedFromAgentJSON(t *testing.T) {
 	}
 }
 
+// TestUsage_CachedInputTokensAccessor pins the back-compat accessor (#1343):
+// after splitting the former CachedInputTokens field into separate cache
+// read / write buckets, the CachedInputTokens() method must return their sum
+// so every prior reader of the summed total keeps working. The zero value
+// returns 0, and Usage stays a comparable struct (asserted by the zero-value
+// equality checks above) so adding the method changed no other contract.
+func TestUsage_CachedInputTokensAccessor(t *testing.T) {
+	u := planreview.Usage{
+		InputTokens:           1000,
+		CacheReadInputTokens:  400,
+		CacheWriteInputTokens: 150,
+		OutputTokens:          2000,
+		Known:                 true,
+	}
+	if got := u.CachedInputTokens(); got != 550 {
+		t.Errorf("CachedInputTokens() = %d, want 550 (read 400 + write 150)", got)
+	}
+	if got := (planreview.Usage{}).CachedInputTokens(); got != 0 {
+		t.Errorf("zero-value CachedInputTokens() = %d, want 0", got)
+	}
+}
+
 // --- ConcernResolutions on the wire (#984) ---
 
 // TestImplementReviewedPayload_JSONRoundTrip_WithResolutions covers the

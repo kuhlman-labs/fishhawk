@@ -70,7 +70,7 @@ func TestClient_Messages_SendsSchemaWhenSet(t *testing.T) {
 	cfg.Schema = schema
 	c := NewClient(cfg, option.WithBaseURL(srv.URL))
 
-	if _, _, _, _, err := c.Messages(context.Background(), "sys", "user"); err != nil {
+	if _, _, _, _, _, _, err := c.Messages(context.Background(), "sys", "user"); err != nil {
 		t.Fatalf("Messages: %v", err)
 	}
 
@@ -105,7 +105,7 @@ func TestClient_Messages_OmitsOutputConfigWhenNil(t *testing.T) {
 	cfg := testConfig() // Schema left nil
 	c := NewClient(cfg, option.WithBaseURL(srv.URL))
 
-	if _, _, _, _, err := c.Messages(context.Background(), "sys", "user"); err != nil {
+	if _, _, _, _, _, _, err := c.Messages(context.Background(), "sys", "user"); err != nil {
 		t.Fatalf("Messages: %v", err)
 	}
 

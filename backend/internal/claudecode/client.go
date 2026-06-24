@@ -221,13 +221,16 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 		usageOut = planreview.Usage{
 			// The envelope's input_tokens is already cache-exclusive
 			// (Anthropic accounting), so it passes through unchanged as the
-			// normalized fresh count (#1010); the cache members sum into the
-			// ADDITIONAL CachedInputTokens split.
-			InputTokens:       env.Usage.InputTokens,
-			CachedInputTokens: env.Usage.CacheReadInputTokens + env.Usage.CacheCreationInputTokens,
-			OutputTokens:      env.Usage.OutputTokens,
-			Turns:             1, // single-shot --print: exactly one turn
-			Known:             true,
+			// normalized fresh count (#1010). The cache members are carried
+			// SEPARATELY into the read/write split (#1343) rather than summed:
+			// cache_read_input_tokens → CacheReadInputTokens (cheaper),
+			// cache_creation_input_tokens → CacheWriteInputTokens (premium).
+			InputTokens:           env.Usage.InputTokens,
+			CacheReadInputTokens:  env.Usage.CacheReadInputTokens,
+			CacheWriteInputTokens: env.Usage.CacheCreationInputTokens,
+			OutputTokens:          env.Usage.OutputTokens,
+			Turns:                 1, // single-shot --print: exactly one turn
+			Known:                 true,
 		}
 	}
 

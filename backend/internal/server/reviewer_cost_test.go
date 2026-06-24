@@ -21,16 +21,18 @@ import (
 // reviewer entry (plan_review / implement_review) from a runner stage-agent
 // entry (no source), and known_usage is the graceful-degradation marker.
 type reviewerCostPayload struct {
-	Model             string  `json:"model"`
-	InputTokens       int     `json:"input_tokens"`
-	OutputTokens      int     `json:"output_tokens"`
-	CachedInputTokens int     `json:"cached_input_tokens"`
-	TotalInputTokens  int     `json:"total_input_tokens"`
-	Turns             int     `json:"turns"`
-	USD               float64 `json:"usd"`
-	KnownModel        bool    `json:"known_model"`
-	KnownUsage        bool    `json:"known_usage"`
-	Source            string  `json:"source"`
+	Model                 string  `json:"model"`
+	InputTokens           int     `json:"input_tokens"`
+	OutputTokens          int     `json:"output_tokens"`
+	CachedInputTokens     int     `json:"cached_input_tokens"`
+	CacheReadInputTokens  int     `json:"cache_read_input_tokens"`
+	CacheWriteInputTokens int     `json:"cache_write_input_tokens"`
+	TotalInputTokens      int     `json:"total_input_tokens"`
+	Turns                 int     `json:"turns"`
+	USD                   float64 `json:"usd"`
+	KnownModel            bool    `json:"known_model"`
+	KnownUsage            bool    `json:"known_usage"`
+	Source                string  `json:"source"`
 }
 
 // reviewedTokenFields decodes only the #995 token members of a persisted
@@ -120,19 +122,25 @@ func TestPlanReview_RecordsReviewerCost(t *testing.T) {
 	// and must NOT clobber that pin (#684).
 	const stageAgentModel = "claude-opus-4-8"
 	const reviewerModel = "claude-sonnet-4-6"
-	const inTok, outTok, cachedTok, turns = 1000, 2000, 400, 3
-	wantUSD, ok := pricing.Cost(reviewerModel, inTok, outTok)
+	// Distinct fresh / cache-read / cache-write counts so the read/write-aware
+	// pricing and the additive payload split are each pinned independently (#1343).
+	const inTok, outTok, cacheRead, cacheWrite, turns = 1000, 2000, 400, 150, 3
+	const cachedTok = cacheRead + cacheWrite
+	// USD is now the CACHE-AWARE total (trace.go overrides rec.USD with
+	// pricing.CostWithCache): fresh+output at the flat rate, cache-read at the
+	// discount, cache-write at the premium.
+	wantUSD, ok := pricing.CostWithCache(reviewerModel, inTok, cacheRead, cacheWrite, outTok)
 	if !ok {
-		t.Fatalf("pricing.Cost ok=false for %q — fixture model must be priced", reviewerModel)
+		t.Fatalf("pricing.CostWithCache ok=false for %q — fixture model must be priced", reviewerModel)
 	}
 
 	reviewer := &usageReviewer{
 		verdict: &planreview.ReviewVerdict{
 			Verdict: planreview.VerdictApprove,
-			// Fully populated usage (#995): the cached split and turn count
-			// must cross the adapter-contract → server-record → audit-payload
-			// seam end to end, alongside the priced token counts.
-			Usage: planreview.Usage{InputTokens: inTok, OutputTokens: outTok, CachedInputTokens: cachedTok, Turns: turns, Known: true},
+			// Fully populated usage (#995/#1343): the read/write cache split and
+			// turn count must cross the adapter-contract → server-record →
+			// audit-payload seam end to end, alongside the priced token counts.
+			Usage: planreview.Usage{InputTokens: inTok, OutputTokens: outTok, CacheReadInputTokens: cacheRead, CacheWriteInputTokens: cacheWrite, Turns: turns, Known: true},
 		},
 		model: reviewerModel,
 	}
@@ -156,14 +164,26 @@ func TestPlanReview_RecordsReviewerCost(t *testing.T) {
 	if got.Model != reviewerModel || got.InputTokens != inTok || got.OutputTokens != outTok {
 		t.Errorf("plan_review cost payload mismatch: %+v", got)
 	}
+	// Additive read/write split (#1343): the new fields carry the separate
+	// counts, cached_input_tokens stays the summed total (= read + write), and
+	// turns is unchanged.
+	if got.CacheReadInputTokens != cacheRead || got.CacheWriteInputTokens != cacheWrite {
+		t.Errorf("plan_review cache split = read %d / write %d, want %d/%d (#1343)", got.CacheReadInputTokens, got.CacheWriteInputTokens, cacheRead, cacheWrite)
+	}
 	if got.CachedInputTokens != cachedTok || got.Turns != turns {
-		t.Errorf("plan_review cost payload cached_input_tokens=%d turns=%d, want %d/%d (#995)", got.CachedInputTokens, got.Turns, cachedTok, turns)
+		t.Errorf("plan_review cost payload cached_input_tokens=%d turns=%d, want %d/%d (= read+write, back-compat)", got.CachedInputTokens, got.Turns, cachedTok, turns)
 	}
 	if got.TotalInputTokens != inTok+cachedTok {
 		t.Errorf("plan_review cost payload total_input_tokens=%d, want %d (fresh + cached, #1010)", got.TotalInputTokens, inTok+cachedTok)
 	}
+	// The recorded USD is read/write-aware: cache-read priced at the discount,
+	// cache-write at the premium — distinct from the flat pricing.Cost, which a
+	// reviewer summing read+write into one bucket would wrongly produce.
 	if got.USD != wantUSD {
-		t.Errorf("plan_review usd = %v, want %v (pricing.Cost)", got.USD, wantUSD)
+		t.Errorf("plan_review usd = %v, want %v (pricing.CostWithCache, read/write-aware)", got.USD, wantUSD)
+	}
+	if flat, _ := pricing.Cost(reviewerModel, inTok, outTok); got.USD == flat {
+		t.Errorf("plan_review usd = %v equals the non-cache-aware Cost(in,out) = %v — cache pricing was not applied", got.USD, flat)
 	}
 	if !got.KnownModel || !got.KnownUsage {
 		t.Errorf("plan_review known_model=%v known_usage=%v, want both true", got.KnownModel, got.KnownUsage)
@@ -213,17 +233,18 @@ func TestImplementReview_RecordsReviewerCost(t *testing.T) {
 	// DIFFERENT model) runs. The reviewer must not clobber that pin (#684).
 	const stageAgentModel = "claude-opus-4-8"
 	const reviewerModel = "claude-sonnet-4-6"
-	const inTok, outTok, cachedTok, turns = 1500, 3000, 250, 2
-	wantUSD, ok := pricing.Cost(reviewerModel, inTok, outTok)
+	const inTok, outTok, cacheRead, cacheWrite, turns = 1500, 3000, 250, 120, 2
+	const cachedTok = cacheRead + cacheWrite
+	wantUSD, ok := pricing.CostWithCache(reviewerModel, inTok, cacheRead, cacheWrite, outTok)
 	if !ok {
-		t.Fatalf("pricing.Cost ok=false for %q — fixture model must be priced", reviewerModel)
+		t.Fatalf("pricing.CostWithCache ok=false for %q — fixture model must be priced", reviewerModel)
 	}
 
 	reviewer := &usageReviewer{
 		verdict: &planreview.ReviewVerdict{
 			Verdict: planreview.VerdictApprove,
-			// Fully populated usage (#995), mirroring the plan-side seam test.
-			Usage: planreview.Usage{InputTokens: inTok, OutputTokens: outTok, CachedInputTokens: cachedTok, Turns: turns, Known: true},
+			// Fully populated usage (#995/#1343), mirroring the plan-side seam test.
+			Usage: planreview.Usage{InputTokens: inTok, OutputTokens: outTok, CacheReadInputTokens: cacheRead, CacheWriteInputTokens: cacheWrite, Turns: turns, Known: true},
 		},
 		model: reviewerModel,
 	}
@@ -250,14 +271,20 @@ func TestImplementReview_RecordsReviewerCost(t *testing.T) {
 	if got.Model != reviewerModel || got.InputTokens != inTok || got.OutputTokens != outTok {
 		t.Errorf("implement_review cost payload mismatch: %+v", got)
 	}
+	if got.CacheReadInputTokens != cacheRead || got.CacheWriteInputTokens != cacheWrite {
+		t.Errorf("implement_review cache split = read %d / write %d, want %d/%d (#1343)", got.CacheReadInputTokens, got.CacheWriteInputTokens, cacheRead, cacheWrite)
+	}
 	if got.CachedInputTokens != cachedTok || got.Turns != turns {
-		t.Errorf("implement_review cost payload cached_input_tokens=%d turns=%d, want %d/%d (#995)", got.CachedInputTokens, got.Turns, cachedTok, turns)
+		t.Errorf("implement_review cost payload cached_input_tokens=%d turns=%d, want %d/%d (= read+write, back-compat)", got.CachedInputTokens, got.Turns, cachedTok, turns)
 	}
 	if got.TotalInputTokens != inTok+cachedTok {
 		t.Errorf("implement_review cost payload total_input_tokens=%d, want %d (fresh + cached, #1010)", got.TotalInputTokens, inTok+cachedTok)
 	}
 	if got.USD != wantUSD {
-		t.Errorf("implement_review usd = %v, want %v (pricing.Cost)", got.USD, wantUSD)
+		t.Errorf("implement_review usd = %v, want %v (pricing.CostWithCache, read/write-aware)", got.USD, wantUSD)
+	}
+	if flat, _ := pricing.Cost(reviewerModel, inTok, outTok); got.USD == flat {
+		t.Errorf("implement_review usd = %v equals the non-cache-aware Cost(in,out) = %v — cache pricing was not applied", got.USD, flat)
 	}
 	if !got.KnownModel || !got.KnownUsage {
 		t.Errorf("implement_review known_model=%v known_usage=%v, want both true", got.KnownModel, got.KnownUsage)
@@ -336,12 +363,12 @@ func TestRecordReviewerCost_WarnCeiling(t *testing.T) {
 			// heavy caching keeps fresh under the fresh ceiling, but the total
 			// context is a runaway — only the total ceiling fires.
 			name:          "heavy-cache total blowup trips total ceiling only",
-			usage:         planreview.Usage{InputTokens: 90_000, CachedInputTokens: 560_000, OutputTokens: 900, Turns: 21, Known: true},
+			usage:         planreview.Usage{InputTokens: 90_000, CacheReadInputTokens: 500_000, CacheWriteInputTokens: 60_000, OutputTokens: 900, Turns: 21, Known: true},
 			wantTotalWarn: true,
 		},
 		{
 			name:  "cached review under both ceilings stays silent",
-			usage: planreview.Usage{InputTokens: 4000, CachedInputTokens: 120_000, OutputTokens: 900, Turns: 3, Known: true},
+			usage: planreview.Usage{InputTokens: 4000, CacheReadInputTokens: 100_000, CacheWriteInputTokens: 20_000, OutputTokens: 900, Turns: 3, Known: true},
 		},
 		{
 			name:  "unknown usage never warns",
@@ -382,10 +409,10 @@ func TestRecordReviewerCost_WarnCeiling(t *testing.T) {
 			}
 			if tt.wantTotalWarn {
 				// The total warn carries the fresh/cached split alongside the sum.
-				total := tt.usage.InputTokens + tt.usage.CachedInputTokens
+				total := tt.usage.InputTokens + tt.usage.CachedInputTokens()
 				for _, want := range []string{
 					fmt.Sprintf(`"total_input_tokens":%d`, total),
-					fmt.Sprintf(`"cached_input_tokens":%d`, tt.usage.CachedInputTokens),
+					fmt.Sprintf(`"cached_input_tokens":%d`, tt.usage.CachedInputTokens()),
 				} {
 					if !strings.Contains(logs, want) {
 						t.Errorf("total warn log missing %s; logs:\n%s", want, logs)
@@ -435,5 +462,53 @@ func TestRecordReviewerCost_UnknownUsageDegrades(t *testing.T) {
 	}
 	if gotRun.CostUSDTotal != 0 {
 		t.Errorf("run.CostUSDTotal = %v, want 0 for degraded usage", gotRun.CostUSDTotal)
+	}
+}
+
+// TestRecordReviewerCost_UnknownModelKnownUsage pins the cache-aware pricing's
+// unknown-model branch (#1343): when usage IS known but the model is unpriced,
+// pricing.CostWithCache returns ok=false, so recordReviewerCost does NOT
+// override rec.USD — it falls through to cost.FromManifest's unknown-model
+// contract (USD=0, known_model=false). This is the fail-open guard that keeps a
+// future model the table doesn't know about recorded at $0 rather than
+// mispriced, even on the cache-aware path. It is distinct from the
+// Known=false degradation above (that branch zeroes USD unconditionally).
+func TestRecordReviewerCost_UnknownModelKnownUsage(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	au := newAuditFake()
+	s := New(Config{
+		Addr:      "127.0.0.1:0",
+		AuditRepo: au,
+		RunRepo:   newPromptRunRepo(),
+		Logger:    slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
+	})
+
+	// Known usage with cache split, but an unpriced model id.
+	usage := planreview.Usage{
+		InputTokens:           1000,
+		OutputTokens:          2000,
+		CacheReadInputTokens:  400,
+		CacheWriteInputTokens: 150,
+		Turns:                 1,
+		Known:                 true,
+	}
+	s.recordReviewerCost(context.Background(), runID, stageID, "some-future-model-9", usage, "plan_review")
+
+	got := findReviewerCostEntry(t, au, "plan_review", stageID)
+	if got == nil {
+		t.Fatal("no cost_recorded entry sourced plan_review")
+	}
+	if got.KnownModel {
+		t.Error("known_model = true, want false for an unpriced model id")
+	}
+	if !got.KnownUsage {
+		t.Error("known_usage = false, want true (usage WAS reported)")
+	}
+	if got.USD != 0 {
+		t.Errorf("usd = %v, want 0 (unpriced model must not be guessed even on the cache-aware path)", got.USD)
+	}
+	// The read/write split still rides the payload additively even when unpriced.
+	if got.CacheReadInputTokens != 400 || got.CacheWriteInputTokens != 150 {
+		t.Errorf("cache split = read %d / write %d, want 400/150 (additive payload independent of pricing)", got.CacheReadInputTokens, got.CacheWriteInputTokens)
 	}
 }

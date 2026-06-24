@@ -76,12 +76,15 @@ type JudgeCard struct {
 
 // MessageSender is the minimal model-call seam the judge depends on. Its
 // signature is exactly anthropic.Client.Messages
-// (backend/internal/anthropic/client.go:52), so an *anthropic.Client
+// (backend/internal/anthropic/client.go), so an *anthropic.Client
 // satisfies it without this package importing the anthropic package or
 // the SDK. Tests pass a fakeSender; the opt-in live test passes a real
-// *anthropic.Client.
+// *anthropic.Client. The two trailing cache-token returns
+// (cacheReadTokens, cacheWriteTokens) were added when the reviewer cost
+// path went cache-aware (#1343); the judge does not attribute cost, so it
+// discards them at the call site below.
 type MessageSender interface {
-	Messages(ctx context.Context, systemText, userText string) (responseText, modelName string, inputTokens, outputTokens int, err error)
+	Messages(ctx context.Context, systemText, userText string) (responseText, modelName string, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens int, err error)
 }
 
 // Judge scores a captured trajectory on the Tier-B dimensions.
@@ -146,7 +149,7 @@ func (j *llmJudge) Judge(ctx context.Context, lines []bundle.Line) (JudgeCard, e
 
 	var lastDecodeErr error
 	for attempt := 1; ; attempt++ {
-		responseText, modelName, _, _, err := j.sender.Messages(ctx, systemText, userText)
+		responseText, modelName, _, _, _, _, err := j.sender.Messages(ctx, systemText, userText)
 		if err != nil {
 			// Transport/infer-stage fault: NOT a decode failure. Return
 			// verbatim with the zero card — never a fabricated score.

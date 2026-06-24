@@ -32,18 +32,21 @@ type fakeSender struct {
 	gotUser   []string
 }
 
-func (f *fakeSender) Messages(_ context.Context, systemText, userText string) (string, string, int, int, error) {
+func (f *fakeSender) Messages(_ context.Context, systemText, userText string) (string, string, int, int, int, int, error) {
 	f.calls++
 	f.gotSystem = append(f.gotSystem, systemText)
 	f.gotUser = append(f.gotUser, userText)
 	if f.err != nil {
-		return "", "", 0, 0, f.err
+		return "", "", 0, 0, 0, 0, f.err
 	}
 	idx := f.calls - 1
 	if idx >= len(f.responses) {
 		idx = len(f.responses) - 1
 	}
-	return f.responses[idx], f.modelName, 10, 20, nil
+	// The two trailing zeros are the cache read / cache write token counts
+	// (#1343); the judge discards them at its call site, so the values are
+	// immaterial here — they only need to satisfy the widened signature.
+	return f.responses[idx], f.modelName, 10, 20, 0, 0, nil
 }
 
 const goodVerdict = `{"meaningful_evidence":{"score":5,"rationale":"read the contract first"},"honest_uncertainty":{"score":4,"rationale":"named the residual gap"},"reasoning_quality":{"score":5,"rationale":"covered every boundary"}}`

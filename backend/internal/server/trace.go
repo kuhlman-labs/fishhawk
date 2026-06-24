@@ -33,6 +33,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spendalert"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
+	"github.com/kuhlman-labs/fishhawk/pricing"
 )
 
 // maxTraceBundleBytes mirrors the runner's bundle.MaxBundleBytes so
@@ -1468,8 +1469,19 @@ func (s *Server) recordReviewerCost(ctx context.Context, runID, stageID uuid.UUI
 		return
 	}
 
+	// cost.FromManifest stays the source for the Record metadata (Model,
+	// KnownModel, PricingAsOf) — it is out of scope this slice (the agent
+	// path; slice 2). The reviewer USD is then OVERRIDDEN with the
+	// cache-aware total (#1343): fresh input + output priced exactly as
+	// FromManifest, plus cache-read at the discount and cache-write at the
+	// premium. CostWithCache(model, in, 0, 0, out) reduces exactly to the
+	// flat Cost FromManifest uses, so a no-cache reviewer is unaffected.
 	rec := cost.FromManifest(model, usage.InputTokens, usage.OutputTokens)
-	if !usage.Known {
+	if usage.Known {
+		if usd, ok := pricing.CostWithCache(model, usage.InputTokens, usage.CacheReadInputTokens, usage.CacheWriteInputTokens, usage.OutputTokens); ok {
+			rec.USD = usd
+		}
+	} else {
 		// The backend could not report usage; record the cost at 0 rather
 		// than pricing zero-value tokens that might be wrong.
 		rec.USD = 0
@@ -1494,7 +1506,8 @@ func (s *Server) recordReviewerCost(ctx context.Context, runID, stageID uuid.UUI
 	// Companion total-context tripwire (#1010): fresh + cached past the
 	// higher ceiling means a runaway total context that heavy caching kept
 	// off the fresh ceiling — still worth a loud line.
-	totalInputTokens := usage.InputTokens + usage.CachedInputTokens
+	cachedInputTokens := usage.CachedInputTokens()
+	totalInputTokens := usage.InputTokens + cachedInputTokens
 	if usage.Known && totalInputTokens > reviewerTotalInputTokenWarnCeiling {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"reviewer cost: total input tokens (fresh + cached) exceed warn ceiling — runaway total context",
@@ -1504,31 +1517,36 @@ func (s *Server) recordReviewerCost(ctx context.Context, runID, stageID uuid.UUI
 			slog.String("model", model),
 			slog.Int("total_input_tokens", totalInputTokens),
 			slog.Int("input_tokens", usage.InputTokens),
-			slog.Int("cached_input_tokens", usage.CachedInputTokens),
+			slog.Int("cached_input_tokens", cachedInputTokens),
 			slog.Int("turns", usage.Turns),
 			slog.Int("ceiling", reviewerTotalInputTokenWarnCeiling))
 	}
 
-	// turns / cached_input_tokens / total_input_tokens are observability-only
-	// (#995/#1010): turns exposes a multi-turn agentic blowup; input_tokens is
-	// the normalized FRESH (cache-exclusive) count for every adapter, with
-	// cached_input_tokens the additional cache-served split; and
-	// total_input_tokens (= fresh + cached) preserves the raw input-side total
-	// so fresh-vs-cached pricing math stays possible when per-model cache
-	// pricing lands. Pricing is untouched.
+	// turns / cached_input_tokens / cache_read_input_tokens /
+	// cache_write_input_tokens / total_input_tokens are observability-only
+	// (#995/#1010/#1343): turns exposes a multi-turn agentic blowup;
+	// input_tokens is the normalized FRESH (cache-exclusive) count for every
+	// adapter; cached_input_tokens is the summed cache-served total (= read +
+	// write via the CachedInputTokens() accessor) kept for back-compat, with
+	// cache_read_input_tokens / cache_write_input_tokens added ADDITIVELY for
+	// the read/write split; and total_input_tokens (= fresh + cached)
+	// preserves the raw input-side total. USD is now cache-aware (priced via
+	// pricing.CostWithCache above).
 	payload, _ := json.Marshal(map[string]any{
-		"model":               rec.Model,
-		"input_tokens":        rec.InputTokens,
-		"output_tokens":       rec.OutputTokens,
-		"cached_input_tokens": usage.CachedInputTokens,
-		"total_input_tokens":  totalInputTokens,
-		"turns":               usage.Turns,
-		"usd":                 rec.USD,
-		"known_model":         rec.KnownModel,
-		"known_usage":         usage.Known,
-		"pricing_as_of":       rec.PricingAsOf,
-		"source":              source,
-		"estimated":           true,
+		"model":                    rec.Model,
+		"input_tokens":             rec.InputTokens,
+		"output_tokens":            rec.OutputTokens,
+		"cached_input_tokens":      cachedInputTokens,
+		"cache_read_input_tokens":  usage.CacheReadInputTokens,
+		"cache_write_input_tokens": usage.CacheWriteInputTokens,
+		"total_input_tokens":       totalInputTokens,
+		"turns":                    usage.Turns,
+		"usd":                      rec.USD,
+		"known_model":              rec.KnownModel,
+		"known_usage":              usage.Known,
+		"pricing_as_of":            rec.PricingAsOf,
+		"source":                   source,
+		"estimated":                true,
 	})
 	systemKind := audit.ActorKind("system")
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{

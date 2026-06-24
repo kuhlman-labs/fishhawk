@@ -57,9 +57,11 @@ func NewClient(cfg Config, opts ...option.RequestOption) *Client {
 // system block with ephemeral cache_control; when empty, the system block is
 // omitted. userText becomes the single user message. Returns the first text
 // block from the response, the model name used, and the response's token
-// usage (input/output) so the caller can attribute reviewer agent cost
-// (#681). The SDK always returns a Usage block on a successful Messages
-// call, so the token counts are authoritative on the happy path.
+// usage — fresh input, output, and the cache read / cache write split
+// (#681/#1343) — so the caller can attribute reviewer agent cost including
+// cache-aware pricing. The SDK always returns a Usage block on a successful
+// Messages call, so the token counts are authoritative on the happy path.
+// The error / no-text paths return zero for all four counts.
 //
 // When c.schema is non-nil the request carries OutputConfig.Format =
 // json_schema with that per-client schema (#1324/#1326): the Messages API
@@ -73,7 +75,7 @@ func NewClient(cfg Config, opts ...option.RequestOption) *Client {
 //
 // When c.schema is nil the OutputConfig is OMITTED entirely so the response is
 // unconstrained — the caller's decode path is then the only validation.
-func (c *Client) Messages(ctx context.Context, systemText, userText string) (responseText, modelName string, inputTokens, outputTokens int, err error) {
+func (c *Client) Messages(ctx context.Context, systemText, userText string) (responseText, modelName string, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens int, err error) {
 	params := anthropicsdk.MessageNewParams{
 		Model:     c.model,
 		MaxTokens: int64(c.maxTokens),
@@ -97,14 +99,21 @@ func (c *Client) Messages(ctx context.Context, systemText, userText string) (res
 
 	msg, err := c.inner.Messages.New(ctx, params)
 	if err != nil {
-		return "", "", 0, 0, err
+		return "", "", 0, 0, 0, 0, err
 	}
 	inTok := int(msg.Usage.InputTokens)
 	outTok := int(msg.Usage.OutputTokens)
+	// The Messages response Usage block carries the cache split alongside
+	// the cache-exclusive input_tokens (#1343): cache_read_input_tokens and
+	// cache_creation_input_tokens (int64 on message.go Usage, anthropic-sdk-go
+	// v1.50.1). Surface them so the reviewer cost path prices cache-read at
+	// the discount and cache-write at the premium instead of discarding them.
+	cacheReadTok := int(msg.Usage.CacheReadInputTokens)
+	cacheWriteTok := int(msg.Usage.CacheCreationInputTokens)
 	for _, block := range msg.Content {
 		if block.Type == "text" {
-			return block.Text, msg.Model, inTok, outTok, nil
+			return block.Text, msg.Model, inTok, outTok, cacheReadTok, cacheWriteTok, nil
 		}
 	}
-	return "", msg.Model, inTok, outTok, nil
+	return "", msg.Model, inTok, outTok, cacheReadTok, cacheWriteTok, nil
 }

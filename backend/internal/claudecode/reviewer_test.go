@@ -482,17 +482,19 @@ func TestReviewer_PopulatesUsageFromEnvelope(t *testing.T) {
 	if verdict.Usage.Turns != 1 {
 		t.Errorf("Usage.Turns = %d, want 1 (single-shot --print)", verdict.Usage.Turns)
 	}
-	if verdict.Usage.CachedInputTokens != 0 {
-		t.Errorf("Usage.CachedInputTokens = %d, want 0 for an envelope without cache members", verdict.Usage.CachedInputTokens)
+	if verdict.Usage.CacheReadInputTokens != 0 || verdict.Usage.CacheWriteInputTokens != 0 {
+		t.Errorf("Usage cache split = read %d / write %d, want 0/0 for an envelope without cache members", verdict.Usage.CacheReadInputTokens, verdict.Usage.CacheWriteInputTokens)
 	}
 }
 
 // TestReviewer_PopulatesCachedUsageFromEnvelope is the claudecode contract
-// pin for the normalized Usage accounting (#1010): InputTokens stays the
-// envelope's cache-EXCLUSIVE fresh count (10 — NOT inflated by the ~19k cache
-// tokens), and CachedInputTokens = cache_read + cache_creation, ADDITIONAL to
-// it, with Turns=1 (#995). A cache-inclusive envelope (or an adapter that
-// started subtracting) would break the 10/19263 expectations loudly.
+// pin for the normalized Usage accounting (#1010) and the read/write cache
+// split (#1343): InputTokens stays the envelope's cache-EXCLUSIVE fresh count
+// (10 — NOT inflated by the ~19k cache tokens), cache_read lands in the READ
+// bucket and cache_creation in the WRITE bucket SEPARATELY (not summed), and
+// the CachedInputTokens() accessor returns read+write, with Turns=1 (#995). A
+// cache-inclusive envelope (or an adapter that started subtracting or summing)
+// would break the 10/11944/7319 expectations loudly.
 func TestReviewer_PopulatesCachedUsageFromEnvelope(t *testing.T) {
 	verdict, _, err := reviewerWithMode("happy_usage_cache").Review(context.Background(), "review this plan")
 	if err != nil {
@@ -504,9 +506,14 @@ func TestReviewer_PopulatesCachedUsageFromEnvelope(t *testing.T) {
 	if verdict.Usage.InputTokens != 10 || verdict.Usage.OutputTokens != 41 {
 		t.Errorf("Usage = %+v, want {InputTokens:10 OutputTokens:41} (fresh, cache-exclusive)", verdict.Usage)
 	}
-	// cache_read 11944 + cache_creation 7319 = 19263.
-	if verdict.Usage.CachedInputTokens != 19263 {
-		t.Errorf("CachedInputTokens = %d, want 19263 (cache_read + cache_creation)", verdict.Usage.CachedInputTokens)
+	// cache_read 11944 → CacheReadInputTokens (cheaper); cache_creation 7319 →
+	// CacheWriteInputTokens (premium) — kept SEPARATE, not summed.
+	if verdict.Usage.CacheReadInputTokens != 11944 || verdict.Usage.CacheWriteInputTokens != 7319 {
+		t.Errorf("Usage cache split = read %d / write %d, want 11944/7319 (cache_read vs cache_creation, not summed)", verdict.Usage.CacheReadInputTokens, verdict.Usage.CacheWriteInputTokens)
+	}
+	// The accessor returns the summed total = 11944 + 7319 = 19263 (back-compat).
+	if got := verdict.Usage.CachedInputTokens(); got != 19263 {
+		t.Errorf("CachedInputTokens() = %d, want 19263 (cache_read + cache_creation)", got)
 	}
 	if verdict.Usage.Turns != 1 {
 		t.Errorf("Usage.Turns = %d, want 1 (single-shot --print)", verdict.Usage.Turns)
