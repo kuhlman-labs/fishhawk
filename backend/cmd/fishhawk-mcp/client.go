@@ -202,6 +202,66 @@ func (c *apiClient) GetRunBudget(ctx context.Context, runID uuid.UUID) (*BudgetS
 	return &b, nil
 }
 
+// CacheEfficiency mirrors the backend's GET
+// /v0/runs/{run_id}/cache-efficiency body
+// (`backend/internal/server/cache_efficiency.go::cacheEfficiencyResponse`):
+// the per-run prompt-cache efficiency metric derived from the run's
+// cost_recorded ledger (ADR-044 slice 3 / #1352). DISPLAY-ONLY — surfaced
+// in fishhawk_get_run_status so the operator sees cache-hit usage and the
+// net dollar effect; it never gates a run.
+//
+// Repeated here rather than imported because the MCP server's apiClient is
+// a thin local copy (the import direction is `cli → backend`, not the
+// reverse). The scalar fields are omitempty so the no-data path — which
+// GetRunCacheEfficiency collapses to a nil pointer — never marshals a
+// half-empty block.
+type CacheEfficiency struct {
+	FreshInputTokens    int                    `json:"fresh_input_tokens,omitempty"`
+	CacheReadTokens     int                    `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens    int                    `json:"cache_write_tokens,omitempty"`
+	OutputTokens        int                    `json:"output_tokens,omitempty"`
+	CacheReadRatio      float64                `json:"cache_read_ratio,omitempty"`
+	ReuseFactor         float64                `json:"reuse_factor,omitempty"`
+	GrossReadSavingsUSD float64                `json:"gross_read_savings_usd,omitempty"`
+	WritePenaltyUSD     float64                `json:"write_penalty_usd,omitempty"`
+	NetSavingsUSD       float64                `json:"net_savings_usd,omitempty"`
+	Stages              []CacheEfficiencyStage `json:"stages,omitempty"`
+}
+
+// CacheEfficiencyStage is the per-source breakdown row (plan_review /
+// implement_review / agent).
+type CacheEfficiencyStage struct {
+	Source              string  `json:"source"`
+	FreshInputTokens    int     `json:"fresh_input_tokens,omitempty"`
+	CacheReadTokens     int     `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens    int     `json:"cache_write_tokens,omitempty"`
+	OutputTokens        int     `json:"output_tokens,omitempty"`
+	CacheReadRatio      float64 `json:"cache_read_ratio,omitempty"`
+	ReuseFactor         float64 `json:"reuse_factor,omitempty"`
+	GrossReadSavingsUSD float64 `json:"gross_read_savings_usd,omitempty"`
+	WritePenaltyUSD     float64 `json:"write_penalty_usd,omitempty"`
+	NetSavingsUSD       float64 `json:"net_savings_usd,omitempty"`
+}
+
+// GetRunCacheEfficiency fetches the run's cache-efficiency metric. The
+// backend returns 200 with an empty object when the run has no cost data;
+// GetRunCacheEfficiency collapses that to (nil, nil) so every caller treats
+// "no data" uniformly by checking for a nil pointer. The presence sentinel
+// is "all token buckets zero AND no stages" — analogous to budget's
+// Period=="" check; a real run always reports output tokens, so the empty
+// object never false-collapses a real metric.
+func (c *apiClient) GetRunCacheEfficiency(ctx context.Context, runID uuid.UUID) (*CacheEfficiency, error) {
+	var ce CacheEfficiency
+	if err := c.do(ctx, http.MethodGet, "/v0/runs/"+runID.String()+"/cache-efficiency", nil, &ce); err != nil {
+		return nil, err
+	}
+	if ce.FreshInputTokens == 0 && ce.CacheReadTokens == 0 && ce.CacheWriteTokens == 0 &&
+		ce.OutputTokens == 0 && len(ce.Stages) == 0 {
+		return nil, nil
+	}
+	return &ce, nil
+}
+
 // createRunRequest mirrors the backend's `POST /v0/runs` request body
 // (`backend/internal/server/runs.go::createRunRequest`). Repeated here
 // rather than imported because the MCP server's apiClient is

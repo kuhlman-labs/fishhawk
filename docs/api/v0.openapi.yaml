@@ -1531,6 +1531,75 @@ components:
             Budget enforcement mode. A spec budget with no enforcement
             value defaults to (and surfaces as) `advisory`.
 
+    RunCacheEfficiency:
+      type: object
+      description: |
+        Per-run prompt-cache efficiency derived from the run's
+        `cost_recorded` ledger (ADR-044 / #1352). **Display-only** — never
+        gates or blocks a run.
+
+        When the run has no cost data the endpoint returns an **empty
+        object** (none of the fields below present); clients detect "no
+        data" by the absence of a field. The fields below are present only
+        when the run has cost data.
+      properties:
+        fresh_input_tokens:
+          type: integer
+          description: Total cache-exclusive (fresh) input tokens across the run.
+        cache_read_tokens:
+          type: integer
+          description: Total cache-served (read) input tokens across the run.
+        cache_write_tokens:
+          type: integer
+          description: Total cache-creation (write) input tokens across the run.
+        output_tokens:
+          type: integer
+          description: Total output tokens across the run.
+        cache_read_ratio:
+          type: number
+          description: |
+            `cache_read / (cache_read + fresh_input)` — the share of input
+            served from cache. `0` when the denominator is `0`.
+        reuse_factor:
+          type: number
+          description: |
+            `cache_read / max(cache_write, 1)` — how many times each
+            cache-creation token was re-read.
+        gross_read_savings_usd:
+          type: number
+          description: |
+            US dollars saved by serving `cache_read` tokens at the family
+            cache-read discount instead of the fresh-input rate.
+        write_penalty_usd:
+          type: number
+          description: |
+            Extra US dollars paid to write `cache_write` tokens at the
+            family cache-write premium over the fresh-input rate.
+        net_savings_usd:
+          type: number
+          description: '`gross_read_savings_usd − write_penalty_usd`.'
+        stages:
+          type: array
+          description: |
+            Per-source breakdown (`plan_review` / `implement_review` /
+            `agent`, sorted by source), each carrying the same token totals,
+            ratios, and savings as the run-level figures.
+          items:
+            type: object
+            properties:
+              source:
+                type: string
+                description: 'Stage bucket: `plan_review`, `implement_review`, or `agent` (the runner stage-agent path, which carries no `source`).'
+              fresh_input_tokens: { type: integer }
+              cache_read_tokens: { type: integer }
+              cache_write_tokens: { type: integer }
+              output_tokens: { type: integer }
+              cache_read_ratio: { type: number }
+              reuse_factor: { type: number }
+              gross_read_savings_usd: { type: number }
+              write_penalty_usd: { type: number }
+              net_savings_usd: { type: number }
+
     CalibrationResult:
       type: object
       description: |
@@ -3166,6 +3235,45 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/RunBudgetStatus' }
+        '400':
+          description: "`validation_failed` — `run_id` not a UUID."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { description: Run repository unavailable. }
+
+  /v0/runs/{run_id}/cache-efficiency:
+    get:
+      operationId: getRunCacheEfficiency
+      summary: Per-run prompt-cache efficiency metric
+      description: |
+        Returns the run's prompt-cache efficiency, derived purely from the
+        run's `cost_recorded` audit ledger (ADR-044 / #1352): the cache-read
+        ratio (share of input served from cache), the reuse factor (re-reads
+        per cache-write token), and the gross / penalty / net US-dollar
+        effect of caching, plus a per-stage breakdown keyed on the entry's
+        `source` (`plan_review` / `implement_review`, with the runner
+        stage-agent path — entries that carry no `source` — bucketed as
+        `agent`).
+
+        **Display-only.** This endpoint never gates or blocks a run; it
+        exists so the MCP loop can surface and maximize cache-hit usage. It
+        has no write path and no migration — it reads existing audit data.
+
+        When the run has no `cost_recorded` data the response is **200 with
+        an empty object** (`{}`) rather than a 404, so clients branch on the
+        presence of a field. An unknown / unpriced model contributes 0 to
+        the savings figures while its tokens still count toward the ratios.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: |
+            Cache-efficiency metric, or an empty object when the run has no
+            cost data.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunCacheEfficiency' }
         '400':
           description: "`validation_failed` — `run_id` not a UUID."
         '401': { $ref: '#/components/responses/Unauthorized' }
