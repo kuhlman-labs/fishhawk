@@ -292,6 +292,14 @@ type fakeBackend struct {
 	budgetStatus     int
 	budgetCalledByID map[uuid.UUID]int
 
+	// Cache-efficiency fixtures: GET /v0/runs/{run_id}/cache-efficiency
+	// (ADR-044 slice 3 / #1352). cacheEffByRun seeds the metric per run; an
+	// unseeded run returns the empty object {} — mirroring the backend's
+	// no-cost-data 200. cacheEffStatus drives the HTTP status code (default
+	// 200).
+	cacheEffByRun  map[uuid.UUID]CacheEfficiency
+	cacheEffStatus int
+
 	// integrate-wave fixtures: POST /v0/runs/{run_id}/integrate-wave (#1278
 	// slice B). The run_children wave loop calls this between waves; the tests
 	// drive its response and assert the call counter. integrateWaveResp is the
@@ -365,6 +373,8 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		budgetByRun:                   map[uuid.UUID]BudgetStatus{},
 		budgetStatus:                  http.StatusOK,
 		budgetCalledByID:              map[uuid.UUID]int{},
+		cacheEffByRun:                 map[uuid.UUID]CacheEfficiency{},
+		cacheEffStatus:                http.StatusOK,
 		integrateWaveResp:             map[uuid.UUID]IntegrateWaveResult{},
 		integrateWaveStatus:           http.StatusOK,
 		integrateWaveCalledBy:         map[uuid.UUID]int{},
@@ -893,6 +903,25 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(bs)
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}/cache-efficiency", func(w http.ResponseWriter, r *http.Request) {
+		id, perr := uuid.Parse(r.PathValue("run_id"))
+		w.Header().Set("Content-Type", "application/json")
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		ce, ok := fb.cacheEffByRun[id]
+		status := fb.cacheEffStatus
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if !ok {
+			// No cost data — empty object, as the backend does.
+			_, _ = w.Write([]byte("{}"))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ce)
 	})
 	mux.HandleFunc("GET /v0/audit", func(w http.ResponseWriter, r *http.Request) {
 		runIDQ := r.URL.Query().Get("run_id")
@@ -4918,6 +4947,86 @@ func TestGetRunStatus_OmitsBudgetWhenNoBudget(t *testing.T) {
 	}
 	if out.Budget != nil {
 		t.Errorf("expected no budget block; got %+v", out.Budget)
+	}
+}
+
+// --- cache efficiency (ADR-044 slice 3 / #1352) ---
+//
+// Cross-boundary wire-to-tool seam: a stub backend serves
+// GET /v0/runs/{id}/cache-efficiency and getRunStatus surfaces the same
+// block (and omits it when the backend returns the empty no-data object).
+// Per-layer unit tests alone would pass while the field silently dropped at
+// the seam (cf. #618), so this drives the full apiClient.GetRunCacheEfficiency
+// -> tool-output path. The compute → endpoint layers are covered by the cost
+// package and server handler tests; this asserts the MCP-mapping seam.
+
+func seedCacheEfficiency(fb *fakeBackend, runID uuid.UUID, ce CacheEfficiency) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.cacheEffByRun[runID] = ce
+}
+
+func TestGetRunStatus_SurfacesCacheEfficiencyBlock(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: "running"}
+	seedCacheEfficiency(fb, runID, CacheEfficiency{
+		FreshInputTokens: 4_000_000, CacheReadTokens: 4_000_000, CacheWriteTokens: 2_000_000,
+		CacheReadRatio: 0.5, ReuseFactor: 2.0,
+		GrossReadSavingsUSD: 18.0, WritePenaltyUSD: 1.25, NetSavingsUSD: 16.75,
+		Stages: []CacheEfficiencyStage{
+			{Source: "agent", FreshInputTokens: 2_000_000},
+			{Source: "implement_review", CacheReadRatio: 0.5, NetSavingsUSD: 4.5},
+			{Source: "plan_review", CacheReadRatio: 0.75, ReuseFactor: 3.0, NetSavingsUSD: 12.25},
+		},
+	})
+
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.CacheEfficiency == nil {
+		t.Fatal("expected cache_efficiency block surfaced from backend; got nil")
+	}
+	if out.CacheEfficiency.CacheReadRatio != 0.5 || out.CacheEfficiency.ReuseFactor != 2.0 {
+		t.Errorf("cache efficiency ratios = read %g reuse %g, want 0.5/2.0",
+			out.CacheEfficiency.CacheReadRatio, out.CacheEfficiency.ReuseFactor)
+	}
+	if out.CacheEfficiency.NetSavingsUSD != 16.75 {
+		t.Errorf("net savings = %g, want 16.75", out.CacheEfficiency.NetSavingsUSD)
+	}
+	if len(out.CacheEfficiency.Stages) != 3 {
+		t.Fatalf("want 3 stage rows, got %d: %+v", len(out.CacheEfficiency.Stages), out.CacheEfficiency.Stages)
+	}
+	if out.CacheEfficiency.Stages[2].Source != "plan_review" || out.CacheEfficiency.Stages[2].NetSavingsUSD != 12.25 {
+		t.Errorf("plan_review stage = %+v, want source plan_review net 12.25", out.CacheEfficiency.Stages[2])
+	}
+}
+
+func TestGetRunStatus_OmitsCacheEfficiencyWhenNoData(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: "running"}
+	// No seedCacheEfficiency → backend returns {} → GetRunCacheEfficiency yields nil.
+
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.CacheEfficiency != nil {
+		t.Errorf("expected no cache_efficiency block; got %+v", out.CacheEfficiency)
+	}
+	// The no-data block must omit the JSON key entirely (nil pointer +
+	// omitempty), not serialize a null.
+	raw, _ := json.Marshal(out)
+	var m map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &m)
+	if _, ok := m["cache_efficiency"]; ok {
+		t.Errorf("marshaled output must omit the cache_efficiency key when no data; got %s", raw)
 	}
 }
 

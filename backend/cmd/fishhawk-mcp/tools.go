@@ -877,6 +877,11 @@ type GetRunStatusOutput struct {
 	// ADR-030), fetched best-effort. Omitted when the workflow declares
 	// no budget or the fetch failed — DISPLAY-ONLY, never gates a run.
 	Budget *BudgetStatus `json:"budget,omitempty" jsonschema:"workflow periodic-budget status for the current calendar period (spend vs limit, tier ok|warn|over); omitted when no budget is configured. Display-only — never blocks the run"`
+	// CacheEfficiency is the run's prompt-cache efficiency metric (ADR-044
+	// slice 3 / #1352), fetched best-effort and derived from the run's
+	// cost_recorded ledger. Omitted when the run has no cost data or the
+	// fetch failed — DISPLAY-ONLY, never gates a run.
+	CacheEfficiency *CacheEfficiency `json:"cache_efficiency,omitempty" jsonschema:"per-run prompt-cache efficiency derived from the cost ledger (ADR-044): cache_read_ratio (share of input served from cache), reuse_factor (re-reads per cache-write token), and gross/penalty/net USD savings, with a per-stage (plan_review|implement_review|agent) breakdown. Omitted when the run has no cost data. Display-only — never blocks the run"`
 	// ReviewActionHint is a display-only next-action pointer (#777) surfaced
 	// when the implement review has landed with unresolved approve_with_concerns
 	// concerns and the bounded fix-up budget is not yet spent. It points at
@@ -1081,6 +1086,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	// Best-effort periodic-budget status (#693). On a fetch error the
 	// field stays nil — never fails the snapshot.
 	budgetStatus, _ := r.fetchBudgetStatus(ctx, runID)
+	cacheEfficiency, _ := r.fetchCacheEfficiency(ctx, runID)
 
 	// Best-effort review-action hint (#777). Derived from the SAME
 	// implementReviewStatus computed above (single audit read — the hint
@@ -1123,6 +1129,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 		PlanStageWaitStatus:      planStageWaitStatus,
 		ImplementStageWaitStatus: implementStageWaitStatus,
 		Budget:                   budgetStatus,
+		CacheEfficiency:          cacheEfficiency,
 		ReviewActionHint:         reviewActionHint,
 		ImplementReviewMergeHint: implementReviewMergeHint(implementReviewStatus),
 		DriveStatus:              view.driveStatus(),
@@ -1437,6 +1444,18 @@ func (r *runResolver) fetchBudgetStatus(ctx context.Context, runID uuid.UUID) (*
 		return nil, fmt.Sprintf("budget status unavailable: %v", err)
 	}
 	return bs, ""
+}
+
+// fetchCacheEfficiency retrieves the run's cache-efficiency metric
+// best-effort, mirroring fetchBudgetStatus. It NEVER fails the caller: on
+// any error it returns (nil, <warning>); on a no-data response it returns
+// (nil, ""). get_run_status discards the warning and omits the field.
+func (r *runResolver) fetchCacheEfficiency(ctx context.Context, runID uuid.UUID) (*CacheEfficiency, string) {
+	ce, err := r.api.GetRunCacheEfficiency(ctx, runID)
+	if err != nil {
+		return nil, fmt.Sprintf("cache efficiency unavailable: %v", err)
+	}
+	return ce, ""
 }
 
 // registerStartRun wires the fishhawk_start_run tool (E22.1 / #390;
