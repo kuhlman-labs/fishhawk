@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 )
@@ -277,4 +278,113 @@ func TestNewChildCompletionSweeper_WiresDispatchBackstop(t *testing.T) {
 	if sw.Integrate == nil {
 		t.Error("sweeper Integrate adapter is nil")
 	}
+}
+
+// TestBuildModelProviders covers the live ModelOracle provider-registration
+// wiring (#1341, binding condition 1 — the previously-untested serve.go
+// activation seam). A provider is registered ONLY when its API key is present;
+// an absent key leaves it UNREGISTERED so its Snapshot reports ok=false (the
+// fail-open / never-a-boot-blocker invariant). Keyed under the existing
+// "claudecode"/"codex" strings the allow-list and #1339 already use.
+func TestBuildModelProviders(t *testing.T) {
+	t.Run("both keys present registers both providers", func(t *testing.T) {
+		p := buildModelProviders("anthropic-key", "openai-key")
+		if _, ok := p["claudecode"]; !ok {
+			t.Error("claudecode not registered with an anthropic key present")
+		}
+		if _, ok := p["codex"]; !ok {
+			t.Error("codex not registered with an openai key present")
+		}
+		if len(p) != 2 {
+			t.Errorf("len(providers) = %d, want 2", len(p))
+		}
+	})
+
+	t.Run("anthropic key only registers claudecode and leaves codex unregistered", func(t *testing.T) {
+		p := buildModelProviders("anthropic-key", "")
+		if _, ok := p["claudecode"]; !ok {
+			t.Error("claudecode not registered with an anthropic key present")
+		}
+		if _, ok := p["codex"]; ok {
+			t.Error("codex registered despite an absent openai key")
+		}
+	})
+
+	t.Run("openai key only registers codex and leaves claudecode unregistered", func(t *testing.T) {
+		p := buildModelProviders("", "openai-key")
+		if _, ok := p["codex"]; !ok {
+			t.Error("codex not registered with an openai key present")
+		}
+		if _, ok := p["claudecode"]; ok {
+			t.Error("claudecode registered despite an absent anthropic key")
+		}
+	})
+
+	t.Run("no keys registers nothing and Snapshot fails open", func(t *testing.T) {
+		p := buildModelProviders("", "")
+		if len(p) != 0 {
+			t.Fatalf("len(providers) = %d, want 0 with no keys", len(p))
+		}
+		// An unregistered provider must report ok=false so #1339 fails open
+		// (never a boot blocker, never a false rejection).
+		o := modeloracle.NewCached(p, 24*time.Hour, slog.Default())
+		if _, _, ok := o.Snapshot(context.Background(), "claudecode"); ok {
+			t.Error("Snapshot ok=true for an unregistered provider, want false (fail-open)")
+		}
+	})
+}
+
+// resolveModelsFlags mirrors runServe's --models-refresh-interval /
+// --models-staleness-threshold flag wiring (#1341) so the duration defaults
+// (12h refresh / 24h staleness) are unit-testable without booting the server —
+// binding condition 1's "assert the two duration-flag defaults parse" clause.
+func resolveModelsFlags(t *testing.T, args []string) (refresh, staleness time.Duration) {
+	t.Helper()
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	r := fs.Duration("models-refresh-interval",
+		envOrDuration("FISHHAWKD_MODELS_REFRESH_INTERVAL", 12*time.Hour), "test")
+	s := fs.Duration("models-staleness-threshold",
+		envOrDuration("FISHHAWKD_MODELS_STALENESS_THRESHOLD", 24*time.Hour), "test")
+	if err := fs.Parse(args); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	return *r, *s
+}
+
+// TestResolveModelsFlags asserts the model-oracle duration defaults parse to 12h
+// / 24h, an env override is honored, and an explicit flag wins — the done-means
+// defaults from #1341's plan (binding condition 1).
+func TestResolveModelsFlags(t *testing.T) {
+	t.Run("defaults parse to 12h / 24h", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_MODELS_REFRESH_INTERVAL", "")
+		t.Setenv("FISHHAWKD_MODELS_STALENESS_THRESHOLD", "")
+		refresh, staleness := resolveModelsFlags(t, nil)
+		if refresh != 12*time.Hour {
+			t.Errorf("refresh default = %s, want 12h", refresh)
+		}
+		if staleness != 24*time.Hour {
+			t.Errorf("staleness default = %s, want 24h", staleness)
+		}
+	})
+
+	t.Run("env override honored", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_MODELS_REFRESH_INTERVAL", "6h")
+		t.Setenv("FISHHAWKD_MODELS_STALENESS_THRESHOLD", "48h")
+		refresh, staleness := resolveModelsFlags(t, nil)
+		if refresh != 6*time.Hour {
+			t.Errorf("refresh = %s, want 6h from env", refresh)
+		}
+		if staleness != 48*time.Hour {
+			t.Errorf("staleness = %s, want 48h from env", staleness)
+		}
+	})
+
+	t.Run("explicit flag wins over env", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_MODELS_REFRESH_INTERVAL", "6h")
+		refresh, _ := resolveModelsFlags(t, []string{"--models-refresh-interval", "1h"})
+		if refresh != time.Hour {
+			t.Errorf("refresh = %s, want 1h from the explicit flag", refresh)
+		}
+	})
 }
