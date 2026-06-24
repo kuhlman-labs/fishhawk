@@ -24,7 +24,7 @@ func TestCost_KnownTiers(t *testing.T) {
 			model:  "claude-opus-4-8",
 			input:  1_000_000,
 			output: 1_000_000,
-			want:   15 + 75, // $15 input + $75 output per 1M
+			want:   5 + 25, // $5 input + $25 output per 1M
 		},
 		{
 			name:   "sonnet dated point release inherits family rate",
@@ -38,7 +38,21 @@ func TestCost_KnownTiers(t *testing.T) {
 			model:  "claude-haiku-4-5",
 			input:  500_000,
 			output: 250_000,
-			want:   0.5*0.80 + 0.25*4,
+			want:   0.5*1 + 0.25*5,
+		},
+		{
+			name:   "gpt-5.5 exact family id",
+			model:  "gpt-5.5",
+			input:  1_000_000,
+			output: 1_000_000,
+			want:   5 + 30, // $5 input + $30 output per 1M
+		},
+		{
+			name:   "gpt-5.5 dated point release inherits family rate",
+			model:  "gpt-5.5-20260601",
+			input:  2_000_000,
+			output: 1_000_000,
+			want:   2*5 + 1*30,
 		},
 		{
 			name:   "zero usage is zero cost",
@@ -56,6 +70,29 @@ func TestCost_KnownTiers(t *testing.T) {
 			}
 			approx(t, got, tc.want)
 		})
+	}
+}
+
+// TestCost_PricesLiveModelIDs is the drift guard: every model id the
+// product actually dispatches today must price (ok==true), so a live
+// model the table never covers fails CI here instead of silently
+// recording $0. Keep this list in sync with the default allow-list in
+// backend/cmd/fishhawkd/serve.go and backend/internal/server/modelpolicy.go
+// (claudecode=claude-opus-4-8,claude-sonnet-4-6; codex=gpt-5.5) — those
+// are the source of truth for which model ids are in use. The pricing
+// module is standalone (no dependency on backend/server), so this
+// literal list is the manual mirror, and this comment is the guard
+// against it going stale when a maintainer adds a new default model.
+func TestCost_PricesLiveModelIDs(t *testing.T) {
+	live := []string{
+		"claude-opus-4-8",
+		"claude-sonnet-4-6",
+		"gpt-5.5",
+	}
+	for _, model := range live {
+		if _, ok := Cost(model, 1, 1); !ok {
+			t.Errorf("Cost(%q) ok = false, want true — live model id is unpriced", model)
+		}
 	}
 }
 
