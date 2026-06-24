@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -828,5 +829,104 @@ func TestCreateRun_InlineSpec_StampThreadsToTokenEndpoint(t *testing.T) {
 	}
 	if tokResp.Token != "ghs_xyz" {
 		t.Errorf("token = %q, want ghs_xyz", tokResp.Token)
+	}
+}
+
+// modelValiditySpecYAML is a one-workflow spec whose implement stage declares
+// executor.model, so the submit-time #1339 validity seam has a model to check.
+func modelValiditySpecYAML(model string) string {
+	return `version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          model: ` + model + `
+        produces:
+          - artifact: pull_request
+`
+}
+
+// createRunWithSpec posts an inline workflow_spec for workflow "trivial" and
+// returns the recorder.
+func createRunWithSpec(t *testing.T, s *Server, specYAML string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "trivial",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"runner_kind":    "local",
+		"workflow_spec":  specYAML,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+	return w
+}
+
+// TestCreateRun_ModelValidity_RejectOnFreshAbsence is the submit-seam reject
+// (#1339), end-to-end: handler -> spec.ValidateModels -> oracle. A spec model
+// absent from a fresh+ok snapshot yields 422 model_invalid and NO run row.
+func TestCreateRun_ModelValidity_RejectOnFreshAbsence(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+	s.cfg.ModelOracle = modeloracle.Static{
+		Models: map[string][]string{"claudecode": {"claude-opus-4-8"}},
+		Fresh:  true,
+	}
+
+	w := createRunWithSpec(t, s, modelValiditySpecYAML("claude-typo-9"))
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"model_invalid"`) {
+		t.Errorf("body missing model_invalid: %s", w.Body.String())
+	}
+	if n := len(repo.runs); n != 0 {
+		t.Errorf("run rows after a 422 = %d, want 0 (no half-formed run)", n)
+	}
+}
+
+// TestCreateRun_ModelValidity_AcceptOnFreshPresent: a spec model present in a
+// fresh+ok snapshot creates the run normally.
+func TestCreateRun_ModelValidity_AcceptOnFreshPresent(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+	s.cfg.ModelOracle = modeloracle.Static{
+		Models: map[string][]string{"claudecode": {"claude-opus-4-8"}},
+		Fresh:  true,
+	}
+
+	w := createRunWithSpec(t, s, modelValiditySpecYAML("claude-opus-4-8"))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+}
+
+// TestCreateRun_ModelValidity_FailOpen covers both fail-open submit cases: the
+// wired NoData oracle and a nil oracle both create the run despite an unknown
+// model (no false rejection in production today).
+func TestCreateRun_ModelValidity_FailOpen(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		oracle modeloracle.ModelOracle
+	}{
+		{"nodata", modeloracle.NewNoData()},
+		{"nil", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newFakeRepo()
+			s := newServer(t, repo)
+			s.cfg.ModelOracle = tc.oracle
+
+			w := createRunWithSpec(t, s, modelValiditySpecYAML("anything-goes"))
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201 (fail open):\n%s", w.Code, w.Body.String())
+			}
+		})
 	}
 }

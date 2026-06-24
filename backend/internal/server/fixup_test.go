@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -2195,5 +2196,93 @@ func TestFixupStage_OperatorConcern_BudgetStillBounds(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("stage_fixup_triggered entries = %d, want 1", n)
+	}
+}
+
+// --- Model validity gate (#1339) on the fix-up path --------------------------
+
+// reject: an override model absent from a fresh+ok snapshot is refused 422
+// model_invalid BEFORE the allow-list, with NO transition and NO audit entry.
+func TestFixupStage_ModelValidity_RejectOnFreshAbsence(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	s.cfg.ModelOracle = modeloracle.Static{
+		Models: map[string][]string{"claudecode": {"claude-opus-4-8"}},
+		Fresh:  true,
+	}
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityLow, Category: "style", Note: "naming nit"},
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ImplementModel: "claude-typo-9"})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "model_invalid") {
+		t.Errorf("body missing model_invalid code: %s", w.Body.String())
+	}
+	got, err := repo.GetStage(context.Background(), stage.ID)
+	if err != nil {
+		t.Fatalf("get stage: %v", err)
+	}
+	if got.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (no transition on reject)", got.State)
+	}
+	for _, e := range au.appended {
+		if e.Category == CategoryStageFixupTriggered {
+			t.Errorf("stage_fixup_triggered appended despite the 422 reject")
+		}
+	}
+}
+
+// accept: an override present in a fresh+ok snapshot passes the validity layer
+// (and the empty allow-list), triggering the fix-up 200.
+func TestFixupStage_ModelValidity_AcceptOnFreshPresent(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	s.cfg.ModelOracle = modeloracle.Static{
+		Models: map[string][]string{"claudecode": {"claude-opus-4-8"}},
+		Fresh:  true,
+	}
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityLow, Category: "style", Note: "naming nit"},
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ImplementModel: "claude-opus-4-8"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+}
+
+// fail-open-stale: a stale snapshot cannot reject — the fix-up proceeds 200.
+func TestFixupStage_ModelValidity_FailOpenStale(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	s.cfg.ModelOracle = modeloracle.Static{
+		Models: map[string][]string{"claudecode": {"claude-opus-4-8"}},
+		Fresh:  false,
+	}
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityLow, Category: "style", Note: "naming nit"},
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ImplementModel: "claude-typo-9"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (stale → fail open):\n%s", w.Code, w.Body.String())
+	}
+}
+
+// fail-open-no-snapshot: with no oracle wired the validity layer is inert (the
+// existing fix-up tests' posture) — an unknown override is not rejected by it.
+func TestFixupStage_ModelValidity_FailOpenNoOracle(t *testing.T) {
+	s, repo, au := fixupServer(t) // no ModelOracle wired
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityLow, Category: "style", Note: "naming nit"},
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ImplementModel: "anything-goes"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (nil oracle → fail open):\n%s", w.Code, w.Body.String())
 	}
 }

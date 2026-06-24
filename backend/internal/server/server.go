@@ -30,6 +30,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
@@ -324,6 +325,16 @@ type Config struct {
 	// The server's own resolution code paths (ResolveReviewFromPollState) are
 	// unchanged; succeeded still means a verified GitHub merge.
 	ReviewResolution string
+
+	// ModelOracle is the snapshot seam the model-id validity layer (#1339)
+	// queries to decide whether a model named in a workflow spec is a real,
+	// currently-served model. Nil is treated as fail-open by every consumer
+	// (ValidateModels at submit, checkModelValidityGate at the plan/fixup
+	// gates), so existing zero-Config tests are unaffected. serve.go wires
+	// modeloracle.NewNoData() — ok=false for every provider — so production is
+	// accept-with-warning today and becomes live the moment #1335 wires a real
+	// /v1/models snapshot, with zero validation-code change.
+	ModelOracle modeloracle.ModelOracle
 }
 
 // Server wraps an http.Server with the routes and middleware stack

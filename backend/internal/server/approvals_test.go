@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -3447,5 +3448,110 @@ func TestSubmitApproval_OperatorAgentActorAttribution(t *testing.T) {
 	}
 	if humanEntry.ActorSubject == nil || *humanEntry.ActorSubject != testOperatorIdentity().Subject {
 		t.Errorf("human entry ActorSubject = %v, want %q", humanEntry.ActorSubject, testOperatorIdentity().Subject)
+	}
+}
+
+// --- Model validity gate (#1339) ---------------------------------------------
+
+// newModelValidityServer mirrors newModelGateServer but injects a snapshot
+// oracle and leaves the allow-list empty, so the VALIDITY layer (not the
+// allow-list) is what gates. A fresh+ok oracle keyed by "claudecode" exercises
+// the layered validity -> policy ordering end to end via the approval path.
+func newModelValidityServer(t *testing.T, art artifact.Repository, oracle modeloracle.ModelOracle) (*Server, *orchestratorRepo, *approvalAuditFake, *fakeApprovalRepo) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	app := newFakeApprovalRepo()
+	au := newApprovalAuditFake()
+	o := &orchestrator.Orchestrator{Runs: rr}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		ApprovalRepo: app,
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: o,
+		ArtifactRepo: art,
+		ModelOracle:  oracle,
+	})
+	return s, rr, au, app
+}
+
+// reject: a spec executor.model absent from a fresh+ok snapshot is refused 422
+// model_invalid at the approval gate with NO approval row and NO model_resolved
+// audit (PRE-Submit), proving the validity layer runs before the allow-list.
+func TestSubmitApproval_ModelValidity_RejectOnFreshAbsence(t *testing.T) {
+	oracle := modeloracle.Static{
+		Models: map[string][]string{"claudecode": {"claude-opus-4-8"}},
+		Fresh:  true,
+	}
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newModelValidityServer(t, art, oracle)
+	r, stage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+	r.WorkflowSpec = specImplementAgentModel("claude-code", "claude-typo-9")
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"model_invalid"`) {
+		t.Errorf("body missing model_invalid: %s", w.Body.String())
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+		t.Errorf("approval rows after 422 = %d (err=%v), want 0", len(rows), err)
+	}
+	for _, e := range au.appended {
+		if e.Category == CategoryModelResolved || e.Category == "approval_submitted" {
+			t.Errorf("unexpected %s audit entry after a 422", e.Category)
+		}
+	}
+}
+
+// accept: a spec model present in a fresh+ok snapshot passes the validity layer
+// and the (empty) allow-list, approving 200.
+func TestSubmitApproval_ModelValidity_AcceptOnFreshPresent(t *testing.T) {
+	oracle := modeloracle.Static{
+		Models: map[string][]string{"claudecode": {"claude-opus-4-8"}},
+		Fresh:  true,
+	}
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newModelValidityServer(t, art, oracle)
+	r, stage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+	r.WorkflowSpec = specImplementAgentModel("claude-code", "claude-opus-4-8")
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	_ = au
+}
+
+// fail-open-stale: a stale snapshot (Fresh=false) cannot reject the unknown
+// model — the approval proceeds to 200.
+func TestSubmitApproval_ModelValidity_FailOpenStale(t *testing.T) {
+	oracle := modeloracle.Static{
+		Models: map[string][]string{"claudecode": {"claude-opus-4-8"}},
+		Fresh:  false,
+	}
+	art := newFakeArtifactRepo()
+	s, rr, _, _ := newModelValidityServer(t, art, oracle)
+	r, stage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+	r.WorkflowSpec = specImplementAgentModel("claude-code", "claude-typo-9")
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (stale → fail open):\n%s", w.Code, w.Body.String())
+	}
+}
+
+// fail-open-no-snapshot: with no oracle wired (the existing allow-list tests'
+// posture) the validity layer is inert — an unknown model is NOT rejected by it.
+func TestSubmitApproval_ModelValidity_FailOpenNoOracle(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, _, _ := newModelValidityServer(t, art, nil)
+	r, stage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+	r.WorkflowSpec = specImplementAgentModel("claude-code", "anything-goes")
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (nil oracle → fail open):\n%s", w.Code, w.Body.String())
 	}
 }

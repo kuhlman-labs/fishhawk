@@ -309,6 +309,19 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		if !s.checkPlanBudget(w, r, stage, req.Comment) {
 			return
 		}
+		// Model validity gate (#1339): BEFORE the allow-list, reject a
+		// resolved model that is definitively not a real, currently-served
+		// model for the run adapter (validity → policy → pricing layering).
+		// Pre-Submit for the same ADR-036 reason as its siblings: a 422
+		// inserts no row. Fail-OPEN everywhere (nil oracle, no/stale snapshot,
+		// empty model) so the wired no-data oracle can never hard-fail prod.
+		if runRow, rerr := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID); rerr == nil {
+			rmv := s.gateResolveImplementModel(r.Context(), runRow, req.ImplementModel)
+			adapter := adapterForImplementAgent(specImplementExecutorAgent(runRow.WorkflowSpec, runRow.WorkflowID))
+			if !s.checkModelValidityGate(w, r, stage, rmv.Value, adapter) {
+				return
+			}
+		}
 		// Model gate (#1013): resolve the implement-model ladder with the
 		// operator override as the highest rung, then validate the RESOLVED
 		// non-empty value against the per-adapter allow-list. PRE-Submit for
