@@ -525,7 +525,31 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		haveStageDefs = true
 		maxRetriesSnap = webhook.WorkflowMaxRetries(wf)
 	}
-	_ = parsed // parsed is reserved for future spec-driven checks
+	// Model-id validity layer (#1339). Validate every model named in the
+	// resolved spec (executor.model + reviewers.agents[].model) against the
+	// snapshot oracle BEFORE the idempotency / repository writes, so a
+	// definitively-invalid model fails fast with a 422 and inserts no run row.
+	// Fail-OPEN: a nil oracle, no snapshot (ok=false), or a stale one
+	// (fresh=false) accepts with a warning — so the wired no-data oracle can
+	// never hard-fail production today. Warnings are logged only this slice
+	// (no HTTP response field; the user-facing surface lands with #1335).
+	if parsed != nil {
+		warnings, verr := spec.ValidateModels(parsed, s.cfg.ModelOracle)
+		for _, wn := range warnings {
+			s.cfg.Logger.Warn("workflow model unverifiable",
+				"repo", req.Repo,
+				"workflow_id", req.WorkflowID,
+				"path", wn.Path,
+				"code", wn.Code,
+				"message", wn.Message)
+		}
+		if verr != nil {
+			s.writeError(w, r, http.StatusUnprocessableEntity, "model_invalid",
+				verr.Error(),
+				map[string]any{"field": "workflow_spec", "workflow_id": req.WorkflowID})
+			return
+		}
+	}
 
 	// Plan-review wiring guard (#574 / ADR-027 / #955). When the resolved
 	// spec declares an agent-gated plan review (effective agent count > 0,

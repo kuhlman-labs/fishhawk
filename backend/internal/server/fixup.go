@@ -464,6 +464,16 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 	var pinModel *ResolvedModel
 	if runRow, runErr := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID); runErr == nil {
 		rm := s.resolveFixupImplementModel(r.Context(), runRow, reqBody.ImplementModel)
+		// Model validity gate (#1339): BEFORE the allow-list (validity →
+		// policy), reject a resolved fix-up model that is definitively not a
+		// real, currently-served model for the run adapter. Fail-OPEN
+		// everywhere so the wired no-data oracle never hard-fails prod; a 422
+		// here precedes the transition + audit write, mirroring
+		// checkFixupModelAllowed.
+		adapter := adapterForImplementAgent(specImplementExecutorAgent(runRow.WorkflowSpec, runRow.WorkflowID))
+		if !s.checkModelValidityGate(w, r, stage, rm.Value, adapter) {
+			return
+		}
 		if !s.checkFixupModelAllowed(w, r, stage, runRow, rm) {
 			return
 		}
