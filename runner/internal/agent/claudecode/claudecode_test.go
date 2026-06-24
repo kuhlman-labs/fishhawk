@@ -95,6 +95,20 @@ func TestHelperProcess(t *testing.T) {
 		os.Stdout.Sync()
 		time.Sleep(60 * time.Millisecond)
 		fmt.Println(`{"type":"result","usage":{"input_tokens":50,"output_tokens":20}}`)
+	case "cache_split":
+		// A transcript whose terminal result event carries the prompt-cache
+		// split alongside the (already cache-exclusive) input_tokens, so the
+		// adapter surfaces Result.CacheRead/CacheWrite while InputTokens stays
+		// unchanged (#1349).
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		fmt.Println(`{"type":"result","model":"claude-opus-4-8","usage":{"input_tokens":200,"output_tokens":80,"cache_read_input_tokens":400,"cache_creation_input_tokens":150}}`)
+	case "cache_only":
+		// A terminal result event with ZERO fresh input/output but non-zero
+		// cache read/write — the cache-only spend edge (#1349). The scan loop
+		// must still capture the cache buckets onto Result rather than dropping
+		// the line because its fresh input+output sum is 0.
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		fmt.Println(`{"type":"result","model":"claude-opus-4-8","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":500,"cache_creation_input_tokens":120}}`)
 	case "model_split":
 		// A realistic transcript: the assistant event carries the
 		// model id + usage nested under `message` (the real
@@ -446,6 +460,99 @@ func TestInvoke_ModelAndSplitSurfaced(t *testing.T) {
 	}
 	if res.TokensUsed != 280 {
 		t.Errorf("Result.TokensUsed = %d, want 280", res.TokensUsed)
+	}
+}
+
+// TestParseLine_CacheSplit pins the #1349 cache capture: Anthropic reports
+// input_tokens EXCLUSIVE of the cache buckets, so parseLine lands
+// cache_read_input_tokens / cache_creation_input_tokens in CacheRead/CacheWrite
+// while leaving InputTokens (the fresh portion) unchanged.
+func TestParseLine_CacheSplit(t *testing.T) {
+	ts := time.Now()
+	line := `{"type":"result","model":"claude-opus-4-8","usage":{"input_tokens":200,"output_tokens":80,"cache_read_input_tokens":400,"cache_creation_input_tokens":150}}`
+	_, info, ok := parseLine([]byte(line), ts)
+	if !ok {
+		t.Fatal("hasUsage = false")
+	}
+	if info.InputTokens != 200 || info.OutputTokens != 80 {
+		t.Errorf("split = (%d,%d), want (200,80) — input is already cache-exclusive", info.InputTokens, info.OutputTokens)
+	}
+	if info.CacheReadInputTokens != 400 {
+		t.Errorf("CacheReadInputTokens = %d, want 400", info.CacheReadInputTokens)
+	}
+	if info.CacheWriteInputTokens != 150 {
+		t.Errorf("CacheWriteInputTokens = %d, want 150 (from cache_creation_input_tokens)", info.CacheWriteInputTokens)
+	}
+}
+
+// TestInvoke_CacheSplitSurfaced drives the full scan-loop capture: the cache
+// buckets from the winning usage line must land on the aggregated Result with
+// InputTokens unchanged (#1349).
+func TestInvoke_CacheSplitSurfaced(t *testing.T) {
+	inv := &Invoker{
+		Cmd: helperCommand("cache_split"),
+		Now: frozenNow(),
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{
+		RunID: "r", Stage: "implement", Prompt: "go",
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if res.InputTokens != 200 || res.OutputTokens != 80 {
+		t.Errorf("Result split = (%d,%d), want (200,80)", res.InputTokens, res.OutputTokens)
+	}
+	if res.CacheReadInputTokens != 400 || res.CacheWriteInputTokens != 150 {
+		t.Errorf("Result cache split = (read %d, write %d), want (400, 150)",
+			res.CacheReadInputTokens, res.CacheWriteInputTokens)
+	}
+}
+
+// TestParseLine_CacheOnly pins the cache-only edge (#1349): a usage line with
+// zero fresh input/output but non-zero cache read/write still reports
+// hasUsage=true, so the scan loop captures it instead of dropping the cache
+// spend. A regression that gated hasUsage on the fresh input+output sum alone
+// would fail here.
+func TestParseLine_CacheOnly(t *testing.T) {
+	ts := time.Now()
+	line := `{"type":"result","model":"claude-opus-4-8","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":500,"cache_creation_input_tokens":120}}`
+	_, info, ok := parseLine([]byte(line), ts)
+	if !ok {
+		t.Fatal("hasUsage = false on a cache-only line; cache spend would be dropped")
+	}
+	if info.InputTokens != 0 || info.OutputTokens != 0 {
+		t.Errorf("fresh split = (%d,%d), want (0,0)", info.InputTokens, info.OutputTokens)
+	}
+	if info.CacheReadInputTokens != 500 || info.CacheWriteInputTokens != 120 {
+		t.Errorf("cache split = (read %d, write %d), want (500, 120)",
+			info.CacheReadInputTokens, info.CacheWriteInputTokens)
+	}
+}
+
+// TestInvoke_CacheOnlySurfaced drives the full scan-loop capture for the
+// cache-only edge: a result line with zero fresh input/output but non-zero
+// cache buckets must still land its cache read/write on the aggregated Result
+// (#1349). Before the hasUsage fix the scan loop dropped this line entirely.
+func TestInvoke_CacheOnlySurfaced(t *testing.T) {
+	inv := &Invoker{
+		Cmd: helperCommand("cache_only"),
+		Now: frozenNow(),
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{
+		RunID: "r", Stage: "implement", Prompt: "go",
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false; FailureReason = %q", res.FailureReason)
+	}
+	if res.InputTokens != 0 || res.OutputTokens != 0 {
+		t.Errorf("Result fresh split = (%d,%d), want (0,0)", res.InputTokens, res.OutputTokens)
+	}
+	if res.CacheReadInputTokens != 500 || res.CacheWriteInputTokens != 120 {
+		t.Errorf("Result cache split = (read %d, write %d), want (500, 120) — cache-only spend must not be dropped",
+			res.CacheReadInputTokens, res.CacheWriteInputTokens)
 	}
 }
 

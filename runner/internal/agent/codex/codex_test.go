@@ -200,12 +200,18 @@ func TestInvoke_HappyPath(t *testing.T) {
 	if !res.OK {
 		t.Errorf("OK = false; FailureReason = %q", res.FailureReason)
 	}
-	// input 42, output 50+8 reasoning = 58 → 100.
+	// input 42 (cached 10 → fresh 32, cache-read 10), output 50+8 reasoning =
+	// 58. TokensUsed is preserved across the #1349 split: fresh 32 + cache-read
+	// 10 + output 58 = 100, the same total as the prior cache-inclusive form.
 	if res.TokensUsed != 100 {
 		t.Errorf("TokensUsed = %d, want 100", res.TokensUsed)
 	}
-	if res.InputTokens != 42 || res.OutputTokens != 58 {
-		t.Errorf("split = (%d,%d), want (42,58)", res.InputTokens, res.OutputTokens)
+	if res.InputTokens != 32 || res.OutputTokens != 58 {
+		t.Errorf("split = (%d,%d), want (32,58) — fresh input is cache-exclusive", res.InputTokens, res.OutputTokens)
+	}
+	if res.CacheReadInputTokens != 10 || res.CacheWriteInputTokens != 0 {
+		t.Errorf("cache split = (read %d, write %d), want (10, 0) — codex has no cache write",
+			res.CacheReadInputTokens, res.CacheWriteInputTokens)
 	}
 	// invocation_start, thread.started, turn.started, item.completed,
 	// turn.completed, invocation_end → 6.
@@ -534,7 +540,8 @@ func TestNew_DefaultsBinary(t *testing.T) {
 func TestParseLine_UsageAndModel(t *testing.T) {
 	ts := time.Now()
 
-	// turn.completed with usage: cached is a subset of input (not added),
+	// turn.completed with usage: cached is a subset of input, SUBTRACTED to
+	// recover fresh input and surfaced as the cache-read bucket (#1349);
 	// reasoning is added to output.
 	ev, info := parseLine([]byte(`{"type":"turn.completed","usage":{"input_tokens":120,"cached_input_tokens":40,"output_tokens":30,"reasoning_output_tokens":15}}`), ts)
 	if ev.Kind != "turn.completed" {
@@ -543,11 +550,33 @@ func TestParseLine_UsageAndModel(t *testing.T) {
 	if !info.HasUsage {
 		t.Fatal("HasUsage = false")
 	}
-	if info.InputTokens != 120 {
-		t.Errorf("InputTokens = %d, want 120 (cached not added)", info.InputTokens)
+	if info.InputTokens != 80 {
+		t.Errorf("InputTokens = %d, want 80 (120 - 40 cached = fresh)", info.InputTokens)
+	}
+	if info.CacheReadInputTokens != 40 {
+		t.Errorf("CacheReadInputTokens = %d, want 40 (the cached subset)", info.CacheReadInputTokens)
 	}
 	if info.OutputTokens != 45 {
 		t.Errorf("OutputTokens = %d, want 45 (30 + 15 reasoning)", info.OutputTokens)
+	}
+
+	// Degenerate block where cached_input_tokens EXCEEDS input_tokens: the
+	// fresh subtraction (input - cached) is negative and must clamp at 0, never
+	// underflowing into a negative InputTokens that would then under-sum
+	// TokensUsed/sumRunTokens (#1349). The full cached count still surfaces as
+	// the cache-read bucket. Exercises the `if fresh < 0` clamp branch.
+	ev, info = parseLine([]byte(`{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":25,"output_tokens":5,"reasoning_output_tokens":0}}`), ts)
+	if ev.Kind != "turn.completed" {
+		t.Errorf("kind = %q, want turn.completed", ev.Kind)
+	}
+	if !info.HasUsage {
+		t.Fatal("HasUsage = false on degenerate cached>input block")
+	}
+	if info.InputTokens != 0 {
+		t.Errorf("InputTokens = %d, want 0 (fresh clamped at 0 when cached>input)", info.InputTokens)
+	}
+	if info.CacheReadInputTokens != 25 {
+		t.Errorf("CacheReadInputTokens = %d, want 25 (full cached subset surfaces)", info.CacheReadInputTokens)
 	}
 
 	// Non-JSON line → raw, no usage.

@@ -109,6 +109,61 @@ func TestExtractManifest_OlderBundleParsesAgentFailedAsFalse(t *testing.T) {
 	}
 }
 
+func TestExtractManifest_CacheTokensRoundTrip(t *testing.T) {
+	// ADR-044 / #1349 wire-flag lockstep: the read side must decode the exact
+	// `cache_read_input_tokens` / `cache_write_input_tokens` json keys the
+	// runner stamps, so the cost rollup prices the cache split. No schema-sync
+	// CI guards this wire format, so this test pins the backend half.
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{
+			"bundle_schema":"v1",
+			"run_id":"run-1",
+			"stage_id":"stage-1",
+			"agent":"claude-code",
+			"input_tokens":200,
+			"output_tokens":80,
+			"cache_read_input_tokens":400,
+			"cache_write_input_tokens":150
+		}`)},
+		{Seq: 2, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractManifest(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractManifest: %v", err)
+	}
+	if got.CacheReadInputTokens != 400 || got.CacheWriteInputTokens != 150 {
+		t.Errorf("cache split = (read %d, write %d), want (400, 150)",
+			got.CacheReadInputTokens, got.CacheWriteInputTokens)
+	}
+	if got.InputTokens != 200 || got.OutputTokens != 80 {
+		t.Errorf("token split = (%d,%d), want (200,80)", got.InputTokens, got.OutputTokens)
+	}
+}
+
+func TestExtractManifest_OlderBundleParsesCacheTokensAsZero(t *testing.T) {
+	// An older bundle omits the cache fields; the read side must default both
+	// to 0 so the bundle is priced as no cache (#1349 back-compat).
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{
+			"bundle_schema":"v1",
+			"run_id":"run-1",
+			"stage_id":"stage-1",
+			"agent":"claude-code",
+			"input_tokens":200,
+			"output_tokens":80
+		}`)},
+		{Seq: 2, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractManifest(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractManifest: %v", err)
+	}
+	if got.CacheReadInputTokens != 0 || got.CacheWriteInputTokens != 0 {
+		t.Errorf("cache split = (read %d, write %d) on a bundle without the fields, want (0, 0)",
+			got.CacheReadInputTokens, got.CacheWriteInputTokens)
+	}
+}
+
 func TestExtractManifest_PushFixupRoundTrips(t *testing.T) {
 	// #794 wire-flag lockstep: the read side must decode the exact
 	// `push_fixup` json key the runner stamps. No schema-sync CI guards this

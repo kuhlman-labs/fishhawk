@@ -109,6 +109,83 @@ func TestPack_RoundTrip(t *testing.T) {
 	}
 }
 
+// ADR-044 / #1349: the runner carries the prompt-cache split
+// (cache-read / cache-write input tokens) through the manifest so the
+// backend prices cache reads at the discount and writes at the premium.
+// Round-trip both buckets through Pack + Open.
+func TestPack_CacheTokensRoundTrip(t *testing.T) {
+	in := PackInputs{
+		RunID:                 "11111111-2222-3333-4444-555555555555",
+		StageID:               "22222222-3333-4444-5555-666666666666",
+		Agent:                 "claude-code",
+		Model:                 "claude-opus-4-8",
+		InputTokens:           200,
+		OutputTokens:          80,
+		CacheReadInputTokens:  400,
+		CacheWriteInputTokens: 150,
+		Now:                   frozenNow(),
+	}
+	data, _, err := PackBytes(in, sampleEvents())
+	if err != nil {
+		t.Fatalf("PackBytes: %v", err)
+	}
+	manifest, _, _, err := Open(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if manifest.CacheReadInputTokens != 400 || manifest.CacheWriteInputTokens != 150 {
+		t.Errorf("manifest cache split = (read %d, write %d), want (400, 150)",
+			manifest.CacheReadInputTokens, manifest.CacheWriteInputTokens)
+	}
+	// InputTokens stays the fresh (cache-exclusive) input, unchanged.
+	if manifest.InputTokens != 200 || manifest.OutputTokens != 80 {
+		t.Errorf("manifest token split = (%d,%d), want (200,80)",
+			manifest.InputTokens, manifest.OutputTokens)
+	}
+}
+
+// TestPack_CacheTokensDefaultZeroAndOmitField pins the back-compat
+// contract: a bundle packed without the cache buckets omits both fields
+// on the wire (omitempty) and decodes to 0 — so an older bundle without
+// the fields is priced as no cache. (#1349)
+func TestPack_CacheTokensDefaultZeroAndOmitField(t *testing.T) {
+	in := PackInputs{
+		RunID:        "11111111-2222-3333-4444-555555555555",
+		StageID:      "22222222-3333-4444-5555-666666666666",
+		Agent:        "claude-code",
+		InputTokens:  200,
+		OutputTokens: 80,
+		Now:          frozenNow(),
+	}
+	data, _, err := PackBytes(in, sampleEvents())
+	if err != nil {
+		t.Fatalf("PackBytes: %v", err)
+	}
+	manifest, _, _, err := Open(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if manifest.CacheReadInputTokens != 0 || manifest.CacheWriteInputTokens != 0 {
+		t.Errorf("cache split on a no-cache bundle = (read %d, write %d), want (0, 0)",
+			manifest.CacheReadInputTokens, manifest.CacheWriteInputTokens)
+	}
+	// omitempty must drop both keys from the wire when zero.
+	zr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	raw, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if bytes.Contains(raw, []byte("cache_read_input_tokens")) {
+		t.Errorf("omitempty failed: cache_read_input_tokens present on a no-cache bundle:\n%s", raw)
+	}
+	if bytes.Contains(raw, []byte("cache_write_input_tokens")) {
+		t.Errorf("omitempty failed: cache_write_input_tokens present on a no-cache bundle:\n%s", raw)
+	}
+}
+
 // E8.5 (#163): the runner stamps category-A failures into the
 // bundle manifest so the backend's trace handler can route to
 // FailStage(FailureA, …) without re-running the agent. Round-trip

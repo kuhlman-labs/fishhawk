@@ -77,11 +77,22 @@ type Manifest struct {
 	// plane-side, not trusted from a runner span. Older bundles omit
 	// the fields and decode to 0 (recorded as zero-cost). Keep in
 	// lockstep with runner/internal/bundle.ManifestData.
-	InputTokens        int    `json:"input_tokens,omitempty"`
-	OutputTokens       int    `json:"output_tokens,omitempty"`
-	GeneratedAt        string `json:"generated_at"`
-	AgentFailed        bool   `json:"agent_failed,omitempty"`
-	AgentFailureReason string `json:"agent_failure_reason,omitempty"`
+	InputTokens  int `json:"input_tokens,omitempty"`
+	OutputTokens int `json:"output_tokens,omitempty"`
+	// CacheReadInputTokens / CacheWriteInputTokens are the prompt-cache split
+	// of the input side (ADR-044 / #1349), added on the runner side alongside
+	// InputTokens. The backend's cost rollup (backend/internal/cost) reads them
+	// from the signed manifest and prices cache reads at the family discount
+	// and cache writes at the premium via cost.FromManifestWithCache, instead
+	// of the flat input rate. InputTokens is the FRESH (cache-exclusive) input;
+	// these are the read and write portions. Older bundles omit the fields and
+	// decode to 0 (priced as no cache). Keep in lockstep with
+	// runner/internal/bundle.ManifestData.
+	CacheReadInputTokens  int    `json:"cache_read_input_tokens,omitempty"`
+	CacheWriteInputTokens int    `json:"cache_write_input_tokens,omitempty"`
+	GeneratedAt           string `json:"generated_at"`
+	AgentFailed           bool   `json:"agent_failed,omitempty"`
+	AgentFailureReason    string `json:"agent_failure_reason,omitempty"`
 	// RunnerKind is the runner's self-observed execution channel
 	// (`github_actions` | `local`, #1346 / ADR-045). The trace handler
 	// reads it and LOCKS the run's runner_kind to it (correcting the

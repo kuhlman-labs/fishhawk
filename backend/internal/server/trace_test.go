@@ -2109,6 +2109,116 @@ func TestShipTrace_RecordsCost(t *testing.T) {
 	}
 }
 
+// TestShipTrace_RecordsCacheAwareCost is the cross-boundary seam test for the
+// agent-stage cache-aware cost rollup (ADR-044 / #1349): runner executor →
+// signed manifest wire → cost.FromManifestWithCache → cost_recorded audit
+// payload → sumRunTokens. It POSTs a trace bundle whose manifest carries the
+// prompt-cache split (fresh input + cache read + cache write + output) and
+// asserts end-to-end that:
+//
+//	(a) the cost_recorded usd is the cache-aware price — cache read at the
+//	    family DISCOUNT and cache write at the PREMIUM, NOT the flat input
+//	    rate (the falsifier),
+//	(b) the payload carries cache_read_input_tokens / cache_write_input_tokens
+//	    ADDITIVELY alongside the unchanged input_tokens / output_tokens, and
+//	(c) sumRunTokens includes the cache buckets.
+//
+// A regression in the manifest decode, the CostWithCache call, the additive
+// payload keys, or the sumRunTokens accumulation trips this even when the
+// per-layer units still pass (cf. #618).
+func TestShipTrace_RecordsCacheAwareCost(t *testing.T) {
+	s, sf, _, au := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStateDispatched)
+	rr.seedRun(&run.Run{ID: stage.RunID, Repo: "kuhlman-labs/fishhawk"})
+	s.cfg.RunRepo = rr
+
+	const model = "claude-opus-4-8"
+	const freshIn, cacheRead, cacheWrite, outTok = 1000, 4000, 2000, 2000
+	wantUSD, ok := pricing.CostWithCache(model, freshIn, cacheRead, cacheWrite, outTok)
+	if !ok {
+		t.Fatalf("pricing.CostWithCache returned ok=false for %q", model)
+	}
+	// Falsifier baseline: pricing the cache portions at the flat input rate
+	// would treat (fresh+read+write) all as input. The cache-aware total must
+	// differ (read at discount, write at premium).
+	flatUSD, _ := pricing.Cost(model, freshIn+cacheRead+cacheWrite, outTok)
+	if wantUSD == flatUSD {
+		t.Fatalf("test fixture is degenerate: cache-aware (%v) == flat-rate (%v)", wantUSD, flatUSD)
+	}
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema:          "trace-bundle-v0",
+		RunID:                 stage.RunID.String(),
+		StageID:               stage.ID.String(),
+		Agent:                 "claude-code",
+		Model:                 model,
+		InputTokens:           freshIn,
+		OutputTokens:          outTok,
+		CacheReadInputTokens:  cacheRead,
+		CacheWriteInputTokens: cacheWrite,
+		GeneratedAt:           time.Now().UTC().Format(time.RFC3339),
+	})
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	au.mu.Lock()
+	var costEntry *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "cost_recorded" {
+			costEntry = &au.appended[i]
+			break
+		}
+	}
+	au.mu.Unlock()
+	if costEntry == nil {
+		t.Fatal("no cost_recorded audit entry written")
+	}
+	var payload struct {
+		Model                 string  `json:"model"`
+		InputTokens           int     `json:"input_tokens"`
+		OutputTokens          int     `json:"output_tokens"`
+		CacheReadInputTokens  int     `json:"cache_read_input_tokens"`
+		CacheWriteInputTokens int     `json:"cache_write_input_tokens"`
+		USD                   float64 `json:"usd"`
+		KnownModel            bool    `json:"known_model"`
+		KnownUsage            bool    `json:"known_usage"`
+	}
+	if err := json.Unmarshal(costEntry.Payload, &payload); err != nil {
+		t.Fatalf("decode cost_recorded payload: %v", err)
+	}
+	// (a) cache-aware USD (read discount + write premium), not the flat rate.
+	if payload.USD != wantUSD {
+		t.Errorf("cost_recorded usd = %v, want %v (CostWithCache: read at discount, write at premium)", payload.USD, wantUSD)
+	}
+	if payload.USD == flatUSD {
+		t.Errorf("cost_recorded usd = %v priced cache at the flat input rate; discount/premium not applied", payload.USD)
+	}
+	// (b) additive cache keys alongside the unchanged fresh-input/output keys.
+	if payload.InputTokens != freshIn || payload.OutputTokens != outTok {
+		t.Errorf("input/output = (%d,%d), want (%d,%d) — fresh input is cache-exclusive",
+			payload.InputTokens, payload.OutputTokens, freshIn, outTok)
+	}
+	if payload.CacheReadInputTokens != cacheRead || payload.CacheWriteInputTokens != cacheWrite {
+		t.Errorf("cache split = (read %d, write %d), want (%d, %d)",
+			payload.CacheReadInputTokens, payload.CacheWriteInputTokens, cacheRead, cacheWrite)
+	}
+	if !payload.KnownUsage {
+		t.Error("known_usage = false, want true for a non-zero cache-aware split")
+	}
+
+	// (c) sumRunTokens must include the cache buckets.
+	gotTokens := s.sumRunTokens(t.Context(), stage.RunID)
+	const wantTokens = freshIn + outTok + cacheRead + cacheWrite
+	if gotTokens != wantTokens {
+		t.Errorf("sumRunTokens = %d, want %d (fresh + output + cache read + cache write)", gotTokens, wantTokens)
+	}
+}
+
 // TestShipTrace_RecordsCostOncePerBundle is the regression test for the
 // 2x double-count (#678). The runner POSTs each stage bundle twice — once
 // as the raw variant, once as the redacted variant — with identical
@@ -2295,6 +2405,69 @@ func TestShipTrace_RecordsCost_NoUsageKnownUsageFalse(t *testing.T) {
 	got, _ := rr.GetRun(t.Context(), stage.RunID)
 	if got.CostUSDTotal != 0 {
 		t.Errorf("run.CostUSDTotal = %v, want 0 for no-usage bundle", got.CostUSDTotal)
+	}
+}
+
+// TestShipTrace_RecordsCost_CacheOnlyKnownUsageTrue pins the #1349 extension to
+// the known_usage inference: a bundle with zero FRESH input and zero output but
+// NON-zero cache tokens (a fully cache-served continuation) is real spend, so it
+// must record known_usage=true at a non-zero cache-aware usd — NOT the
+// known_usage=false / usd=0 the 0/0 path stamps. This is the defensive branch
+// `cacheRead > 0 || cacheWrite > 0` added to the knownUsage guard.
+func TestShipTrace_RecordsCost_CacheOnlyKnownUsageTrue(t *testing.T) {
+	s, sf, _, au := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStateDispatched)
+	rr.seedRun(&run.Run{ID: stage.RunID, Repo: "kuhlman-labs/fishhawk"})
+	s.cfg.RunRepo = rr
+
+	const model = "claude-opus-4-8"
+	const cacheRead = 5000
+	wantUSD, ok := pricing.CostWithCache(model, 0, cacheRead, 0, 0)
+	if !ok || wantUSD == 0 {
+		t.Fatalf("fixture: CostWithCache(read only) ok=%v usd=%v, want ok=true and >0", ok, wantUSD)
+	}
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema:         "trace-bundle-v0",
+		RunID:                stage.RunID.String(),
+		StageID:              stage.ID.String(),
+		Agent:                "claude-code",
+		Model:                model,
+		InputTokens:          0,
+		OutputTokens:         0,
+		CacheReadInputTokens: cacheRead,
+		GeneratedAt:          time.Now().UTC().Format(time.RFC3339),
+	})
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	au.mu.Lock()
+	var found bool
+	for i := range au.appended {
+		if au.appended[i].Category == "cost_recorded" {
+			found = true
+			var p struct {
+				USD        float64 `json:"usd"`
+				KnownUsage bool    `json:"known_usage"`
+			}
+			if err := json.Unmarshal(au.appended[i].Payload, &p); err != nil {
+				t.Fatalf("decode payload: %v", err)
+			}
+			if !p.KnownUsage {
+				t.Error("cache-only: known_usage=false, want true — cache spend is real usage")
+			}
+			if p.USD != wantUSD {
+				t.Errorf("cache-only: usd=%v, want %v (cache read priced, not zeroed)", p.USD, wantUSD)
+			}
+		}
+	}
+	au.mu.Unlock()
+	if !found {
+		t.Fatal("no cost_recorded entry for cache-only bundle")
 	}
 }
 

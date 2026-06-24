@@ -145,6 +145,22 @@ type Result struct {
 	InputTokens  int
 	OutputTokens int
 
+	// CacheReadInputTokens and CacheWriteInputTokens split out the
+	// prompt-cache portions of the input side (ADR-044 / #1349), so the
+	// backend can price cache reads at the family discount and cache
+	// writes at the premium rather than at the flat input rate. They follow
+	// the same cache-exclusive normalization contract as InputTokens:
+	// InputTokens carries FRESH (cache-exclusive) input, CacheReadInputTokens
+	// the cache-served (read) portion, and CacheWriteInputTokens the
+	// cache-creation (write) portion. Both are cumulative across in-driver
+	// retries, exactly like InputTokens/OutputTokens, so cost stays honest
+	// when a retry doubles spend. A backend that cannot surface cache usage
+	// leaves them zero, which the backend prices as no cache — fully
+	// back-compatible (CostWithCache(model, in, 0, 0, out) reduces to the
+	// flat Cost(model, in, out)).
+	CacheReadInputTokens  int
+	CacheWriteInputTokens int
+
 	// Model is the resolved model id the agent reported (the `model`
 	// field on Claude Code's assistant/result events), e.g.
 	// "claude-opus-4-8". Pinned for cost pricing and reproducibility
@@ -184,6 +200,13 @@ type Event struct {
 // fields zero, and the backend cost rollup records that bundle as
 // known_usage=false at usd=0 rather than a silent $0 (#682). claudecode
 // is the only current backend and always reports usage.
+//
+// Cache usage is OPTIONAL (ADR-044 / #1349): a backend that can surface
+// the prompt-cache split SHOULD populate
+// Result.CacheReadInputTokens/CacheWriteInputTokens (with InputTokens
+// normalized to the cache-exclusive fresh portion); a backend that cannot
+// leaves them zero, which the backend prices as no cache — fully
+// back-compatible with the flat input rate.
 type Invoker interface {
 	Invoke(ctx context.Context, inv Invocation) (Result, error)
 }

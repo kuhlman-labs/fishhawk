@@ -152,6 +152,8 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 		agg.TokensUsed += res.TokensUsed
 		agg.InputTokens += res.InputTokens
 		agg.OutputTokens += res.OutputTokens
+		agg.CacheReadInputTokens += res.CacheReadInputTokens
+		agg.CacheWriteInputTokens += res.CacheWriteInputTokens
 		if res.Model != "" {
 			agg.Model = res.Model
 		}
@@ -372,6 +374,8 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	tokensUsed := 0
 	inputTokens := 0
 	outputTokens := 0
+	cacheReadInputTokens := 0
+	cacheWriteInputTokens := 0
 	model := ""
 	budgetHit := false
 	// Loop / duplicate-action detection (#653). The detector watches the
@@ -544,15 +548,23 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 		progMu.Lock()
 		turns++
 		lastKind = ev.Kind
-		if ok && used > 0 {
-			// Usage lines report cumulative counts, so the latest
-			// non-zero line wins (not a running sum within an attempt).
+		if ok {
+			// Usage lines report cumulative counts, so the latest line
+			// carrying usage wins (not a running sum within an attempt). The
+			// gate is hasUsage (ok), not a non-zero fresh-token sum: a
+			// cache-only line (zero fresh input/output but non-zero cache
+			// read/write) still carries spend and its buckets must not be
+			// dropped (#1349). TokensUsed stays the fresh input+output total
+			// (the cache buckets are priced separately on Result); the buckets
+			// ride the same winning line.
 			tokensUsed = used
 			inputTokens = info.InputTokens
 			outputTokens = info.OutputTokens
+			cacheReadInputTokens = info.CacheReadInputTokens
+			cacheWriteInputTokens = info.CacheWriteInputTokens
 		}
 		progMu.Unlock()
-		if ok && used > 0 {
+		if ok {
 			if inv.Budget.MaxTokens > 0 && tokensUsed > inv.Budget.MaxTokens {
 				budgetHit = true
 				_ = cmd.Process.Kill()
@@ -588,6 +600,8 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	res.TokensUsed = tokensUsed
 	res.InputTokens = inputTokens
 	res.OutputTokens = outputTokens
+	res.CacheReadInputTokens = cacheReadInputTokens
+	res.CacheWriteInputTokens = cacheWriteInputTokens
 	res.Model = model
 	res.StructuredOutput = structuredOutput
 
@@ -709,7 +723,15 @@ func failureResult(res agent.Result, ts time.Time, category, reason, outcome str
 type lineInfo struct {
 	InputTokens  int
 	OutputTokens int
-	Model        string
+	// CacheReadInputTokens / CacheWriteInputTokens are the prompt-cache
+	// split (ADR-044 / #1349): Anthropic usage reports input_tokens
+	// EXCLUSIVE of cache_read_input_tokens and cache_creation_input_tokens
+	// (three separate, additive line items), so InputTokens needs no
+	// normalization — these carry the cache-served read and the
+	// cache-creation write portions independently.
+	CacheReadInputTokens  int
+	CacheWriteInputTokens int
+	Model                 string
 	// StructuredOutput is the raw JSON bytes of the line's top-level
 	// `structured_output` field, present on the terminal result event when
 	// the invocation carried a --json-schema (#1325). nil otherwise.
@@ -722,6 +744,12 @@ type lineInfo struct {
 type usageBlock struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+	// CacheReadInputTokens / CacheCreationInputTokens are the prompt-cache
+	// portions of the input side (ADR-044 / #1349). Anthropic reports them as
+	// separate, additive line items alongside input_tokens (which is already
+	// cache-exclusive). Absent on older streams / non-cache lines → decode 0.
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 }
 
 // parseLine turns one JSON line from Claude Code's stream-json
@@ -793,7 +821,17 @@ func parseLine(line []byte, ts time.Time) (agent.Event, lineInfo, bool) {
 	if usage != nil {
 		info.InputTokens = usage.InputTokens
 		info.OutputTokens = usage.OutputTokens
-		hasUsage = info.InputTokens+info.OutputTokens > 0
+		// input_tokens is already cache-exclusive in Anthropic usage, so
+		// InputTokens needs no normalization; the cache portions ride
+		// alongside as their own additive buckets (#1349).
+		info.CacheReadInputTokens = usage.CacheReadInputTokens
+		info.CacheWriteInputTokens = usage.CacheCreationInputTokens
+		// A line carries usage if ANY token bucket is non-zero — including a
+		// cache-only line (zero fresh input/output but a non-zero cache read or
+		// cache-creation count), e.g. a turn whose entire prompt was served from
+		// the prompt cache. Gating on the fresh input+output sum alone would
+		// drop that cache spend before it reaches agent.Result (#1349).
+		hasUsage = info.InputTokens+info.OutputTokens+info.CacheReadInputTokens+info.CacheWriteInputTokens > 0
 	}
 
 	return agent.Event{
