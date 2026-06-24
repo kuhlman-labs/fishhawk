@@ -1466,14 +1466,24 @@ func (s *Server) recordCost(ctx context.Context, runID, stageID uuid.UUID, bundl
 		return
 	}
 
-	rec := cost.FromManifest(manifest.Model, manifest.InputTokens, manifest.OutputTokens)
+	// Price the agent-stage bundle cache-aware (ADR-044 / #1349): the manifest's
+	// InputTokens is the FRESH (cache-exclusive) input, with the cache-served
+	// read and cache-creation write portions carried separately. FromManifestWithCache
+	// prices fresh input + output at the flat rates plus cache read at the family
+	// discount and cache write at the premium; an older bundle without the cache
+	// fields decodes them to 0 and prices identically to the flat FromManifest.
+	rec := cost.FromManifestWithCache(manifest.Model, manifest.InputTokens,
+		manifest.CacheReadInputTokens, manifest.CacheWriteInputTokens, manifest.OutputTokens)
 
 	// Infer whether the backend reported usage from the token split. A
-	// real invocation always has >0 tokens, so a 0/0 manifest means the
+	// real invocation always has >0 tokens, so an all-zero manifest means the
 	// backend did not report usage — record it at usd=0 rather than a
 	// guessed/priced figure (mirroring recordReviewerCost's usage.Known
-	// override and the known_model=false contract). #682.
-	knownUsage := manifest.InputTokens > 0 || manifest.OutputTokens > 0
+	// override and the known_model=false contract). #682. Any of the four
+	// token buckets being positive counts as usage reported (#1349): a fully
+	// cache-served invocation can have zero fresh input/output yet real spend.
+	knownUsage := manifest.InputTokens > 0 || manifest.OutputTokens > 0 ||
+		manifest.CacheReadInputTokens > 0 || manifest.CacheWriteInputTokens > 0
 	if !knownUsage {
 		rec.USD = 0
 	}
@@ -1485,17 +1495,24 @@ func (s *Server) recordCost(ctx context.Context, runID, stageID uuid.UUID, bundl
 	// agent-reported `model`. Empty value/source means today's default spawn.
 	rm := s.resolvedImplementModelForRunID(ctx, runID)
 
+	// cache_read_input_tokens / cache_write_input_tokens are added ADDITIVELY
+	// (#1349) alongside the unchanged input_tokens (FRESH/cache-exclusive) and
+	// output_tokens keys, so the read/write split is on the ledger and
+	// sumRunTokens can include the cache buckets. Older readers ignore the new
+	// keys; older bundles emit them as 0.
 	payload, _ := json.Marshal(map[string]any{
-		"model":                 rec.Model,
-		"input_tokens":          rec.InputTokens,
-		"output_tokens":         rec.OutputTokens,
-		"usd":                   rec.USD,
-		"known_model":           rec.KnownModel,
-		"known_usage":           knownUsage,
-		"pricing_as_of":         rec.PricingAsOf,
-		"estimated":             true,
-		"resolved_model":        rm.Value,
-		"resolved_model_source": string(rm.Source),
+		"model":                    rec.Model,
+		"input_tokens":             rec.InputTokens,
+		"output_tokens":            rec.OutputTokens,
+		"cache_read_input_tokens":  rec.CacheReadInputTokens,
+		"cache_write_input_tokens": rec.CacheWriteInputTokens,
+		"usd":                      rec.USD,
+		"known_model":              rec.KnownModel,
+		"known_usage":              knownUsage,
+		"pricing_as_of":            rec.PricingAsOf,
+		"estimated":                true,
+		"resolved_model":           rm.Value,
+		"resolved_model_source":    string(rm.Source),
 	})
 	systemKind := audit.ActorKind("system")
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -2261,13 +2278,19 @@ func (s *Server) sumRunTokens(ctx context.Context, runID uuid.UUID) int64 {
 	var total int64
 	for _, e := range entries {
 		var p struct {
-			InputTokens  int64 `json:"input_tokens"`
-			OutputTokens int64 `json:"output_tokens"`
+			InputTokens           int64 `json:"input_tokens"`
+			OutputTokens          int64 `json:"output_tokens"`
+			CacheReadInputTokens  int64 `json:"cache_read_input_tokens"`
+			CacheWriteInputTokens int64 `json:"cache_write_input_tokens"`
 		}
 		if err := json.Unmarshal(e.Payload, &p); err != nil {
 			continue
 		}
-		total += p.InputTokens + p.OutputTokens
+		// Include the cache buckets (#1349): input_tokens is now FRESH
+		// (cache-exclusive), so the cache-served read and cache-creation write
+		// tokens are real spend that the tripwire must count. Older entries
+		// without the keys decode them to 0 — the prior fresh+output figure.
+		total += p.InputTokens + p.OutputTokens + p.CacheReadInputTokens + p.CacheWriteInputTokens
 	}
 	return total
 }

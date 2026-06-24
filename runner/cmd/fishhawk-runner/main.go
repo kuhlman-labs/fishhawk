@@ -1453,11 +1453,18 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			// Carry the resolved model id + token split to the manifest
 			// so the backend prices the run from this signed record
 			// (authoritative cost), not from a runner-emitted span.
-			Model:              res.Model,
-			InputTokens:        res.InputTokens,
-			OutputTokens:       res.OutputTokens,
-			AgentFailed:        agentFailed,
-			AgentFailureReason: agentFailureReason,
+			Model:        res.Model,
+			InputTokens:  res.InputTokens,
+			OutputTokens: res.OutputTokens,
+			// Prompt-cache split (ADR-044 / #1349): InputTokens is the fresh
+			// (cache-exclusive) input; these carry the cache-served read and
+			// cache-creation write portions so the backend prices cache reads
+			// at the discount and writes at the premium. manifestRedacted
+			// copies them verbatim below (token counts are not secrets).
+			CacheReadInputTokens:  res.CacheReadInputTokens,
+			CacheWriteInputTokens: res.CacheWriteInputTokens,
+			AgentFailed:           agentFailed,
+			AgentFailureReason:    agentFailureReason,
 			// Self-observed execution channel (#1346 / ADR-045). Set on the
 			// raw manifest; manifestRedacted copies it verbatim below (it is
 			// a provenance tag, not a secret). The backend reconciles it
@@ -3042,6 +3049,11 @@ func runVerifyFixLoop(ctx context.Context, cfg config, invoker agent.Invoker, ba
 		res.TokensUsed += fixRes.TokensUsed
 		res.InputTokens += fixRes.InputTokens
 		res.OutputTokens += fixRes.OutputTokens
+		// Aggregate the cache buckets across the verify-fix re-dispatch too
+		// (#1349) — a dropped += would silently under-count cache spend across
+		// retries.
+		res.CacheReadInputTokens += fixRes.CacheReadInputTokens
+		res.CacheWriteInputTokens += fixRes.CacheWriteInputTokens
 		if fixRes.Model != "" {
 			res.Model = fixRes.Model
 		}
@@ -3410,6 +3422,11 @@ func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent
 	res.TokensUsed += reRes.TokensUsed
 	res.InputTokens += reRes.InputTokens
 	res.OutputTokens += reRes.OutputTokens
+	// Aggregate the cache buckets across the base-rebase re-invoke too
+	// (#1349) — a dropped += would silently under-count cache spend across
+	// retries.
+	res.CacheReadInputTokens += reRes.CacheReadInputTokens
+	res.CacheWriteInputTokens += reRes.CacheWriteInputTokens
 	if reRes.Model != "" {
 		res.Model = reRes.Model
 	}

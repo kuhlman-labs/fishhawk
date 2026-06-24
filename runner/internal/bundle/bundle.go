@@ -74,6 +74,17 @@ type ManifestData struct {
 	InputTokens  int `json:"input_tokens,omitempty"`
 	OutputTokens int `json:"output_tokens,omitempty"`
 
+	// CacheReadInputTokens and CacheWriteInputTokens carry the prompt-cache
+	// split of the input side (ADR-044 / #1349): the backend prices cache
+	// reads at the family discount and cache writes at the premium via
+	// cost.FromManifestWithCache, rather than the flat input rate. InputTokens
+	// is the FRESH (cache-exclusive) input; these two are the cache-served read
+	// and cache-creation write portions. omitempty keeps older bundles (without
+	// the fields) decoding to 0 — priced as no cache, fully back-compatible.
+	// Keep in lockstep with backend/internal/bundle.Manifest.
+	CacheReadInputTokens  int `json:"cache_read_input_tokens,omitempty"`
+	CacheWriteInputTokens int `json:"cache_write_input_tokens,omitempty"`
+
 	AgentFailed        bool   `json:"agent_failed,omitempty"`
 	AgentFailureReason string `json:"agent_failure_reason,omitempty"`
 
@@ -172,6 +183,14 @@ type PackInputs struct {
 	InputTokens  int
 	OutputTokens int
 
+	// CacheReadInputTokens / CacheWriteInputTokens are the prompt-cache split
+	// of the input side (ADR-044 / #1349), carried through to the manifest so
+	// the backend prices cache reads at the discount and cache writes at the
+	// premium. Zero omits the field (older / cache-less bundles) — priced as
+	// no cache, fully back-compatible (same note as InputTokens).
+	CacheReadInputTokens  int
+	CacheWriteInputTokens int
+
 	// AgentFailed flags a category-A failure originating in the
 	// agent invocation. The runner sets this when agent.Result.OK
 	// is false and the FailureCategory is "A". Backend's trace
@@ -251,20 +270,22 @@ func Pack(w io.Writer, in PackInputs, events []agent.Event) (int, error) {
 	// and the size cap enforceable.
 	var raw bytes.Buffer
 	manifestPayload, err := json.Marshal(ManifestData{
-		BundleSchema:       SchemaV1,
-		RunID:              in.RunID,
-		StageID:            in.StageID,
-		Agent:              in.Agent,
-		Model:              in.Model,
-		InputTokens:        in.InputTokens,
-		OutputTokens:       in.OutputTokens,
-		GeneratedAt:        now(),
-		AgentFailed:        in.AgentFailed,
-		AgentFailureReason: in.AgentFailureReason,
-		RunnerKind:         in.RunnerKind,
-		PushAndOpenPR:      in.PushAndOpenPR,
-		PushToSharedBranch: in.PushToSharedBranch,
-		PushFixup:          in.PushFixup,
+		BundleSchema:          SchemaV1,
+		RunID:                 in.RunID,
+		StageID:               in.StageID,
+		Agent:                 in.Agent,
+		Model:                 in.Model,
+		InputTokens:           in.InputTokens,
+		OutputTokens:          in.OutputTokens,
+		CacheReadInputTokens:  in.CacheReadInputTokens,
+		CacheWriteInputTokens: in.CacheWriteInputTokens,
+		GeneratedAt:           now(),
+		AgentFailed:           in.AgentFailed,
+		AgentFailureReason:    in.AgentFailureReason,
+		RunnerKind:            in.RunnerKind,
+		PushAndOpenPR:         in.PushAndOpenPR,
+		PushToSharedBranch:    in.PushToSharedBranch,
+		PushFixup:             in.PushFixup,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("bundle: marshal manifest: %w", err)

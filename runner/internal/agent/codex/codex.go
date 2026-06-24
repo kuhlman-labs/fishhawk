@@ -249,6 +249,7 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 
 	tokensUsed := 0
 	inputTokens := 0
+	cacheReadInputTokens := 0
 	outputTokens := 0
 	model := ""
 	budgetHit := false
@@ -320,8 +321,14 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 			// just that turn's figures; summing is the correct accumulation
 			// if a future Codex version emits multiple turns per exec, and
 			// can never silently undercount.
-			tokensUsed += info.InputTokens + info.OutputTokens
+			//
+			// TokensUsed semantics are PRESERVED across the #1349 cache split:
+			// info.InputTokens is now FRESH (cache-exclusive), so the cache-read
+			// portion is added back here — fresh + cacheRead + output == the
+			// prior (cache-inclusive input) + output.
+			tokensUsed += info.InputTokens + info.CacheReadInputTokens + info.OutputTokens
 			inputTokens += info.InputTokens
+			cacheReadInputTokens += info.CacheReadInputTokens
 			outputTokens += info.OutputTokens
 		}
 		curTokens := tokensUsed
@@ -363,6 +370,7 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 	waitErr := cmd.Wait()
 	res.TokensUsed = tokensUsed
 	res.InputTokens = inputTokens
+	res.CacheReadInputTokens = cacheReadInputTokens
 	res.OutputTokens = outputTokens
 	res.Model = model
 
@@ -440,10 +448,18 @@ func failureResult(res agent.Result, ts time.Time, category, reason, outcome str
 // lineInfo carries the structured usage + model metadata parseLine
 // extracted from one JSONL line, beyond the kind already on the event.
 type lineInfo struct {
-	InputTokens  int
-	OutputTokens int
-	Model        string
-	HasUsage     bool
+	// InputTokens is the FRESH (cache-exclusive) input count: codex reports
+	// cached_input_tokens as a SUBSET of input_tokens, so parseLine subtracts
+	// it to recover fresh input (#1349), mirroring the claudecode adapter's
+	// cache-exclusive contract.
+	InputTokens int
+	// CacheReadInputTokens is the cache-served (read) portion — codex's
+	// cached_input_tokens. Codex prompt caching has no separate cache-creation
+	// (write) line item, so the write bucket is always 0 for this adapter.
+	CacheReadInputTokens int
+	OutputTokens         int
+	Model                string
+	HasUsage             bool
 }
 
 // usageBlock is the shape of Codex's `usage` object on a `turn.completed`
@@ -452,13 +468,18 @@ type lineInfo struct {
 //	{"type":"turn.completed","usage":{"input_tokens":N,"cached_input_tokens":N,
 //	 "output_tokens":N,"reasoning_output_tokens":N}}
 //
-// cached_input_tokens is a (cheaper) SUBSET of input_tokens, so it is not
-// added in — input_tokens already counts it. reasoning_output_tokens is a
-// SEPARATE completion-side count (the hidden reasoning tokens, distinct
-// from output_tokens which counts the visible message), so it IS added to
-// the output side to avoid undercounting billable output.
+// cached_input_tokens is a (cheaper) SUBSET of input_tokens. parseLine
+// SUBTRACTS it from input_tokens to recover the FRESH (cache-exclusive)
+// input and surfaces the cached portion as the cache-read bucket (#1349),
+// so the backend prices it at the cache-read discount rather than the flat
+// input rate; TokensUsed is unchanged (fresh + cacheRead == the old
+// cache-inclusive input). reasoning_output_tokens is a SEPARATE
+// completion-side count (the hidden reasoning tokens, distinct from
+// output_tokens which counts the visible message), so it IS added to the
+// output side to avoid undercounting billable output.
 type usageBlock struct {
 	InputTokens           int `json:"input_tokens"`
+	CachedInputTokens     int `json:"cached_input_tokens"`
 	OutputTokens          int `json:"output_tokens"`
 	ReasoningOutputTokens int `json:"reasoning_output_tokens"`
 }
@@ -503,9 +524,20 @@ func parseLine(line []byte, ts time.Time) (agent.Event, lineInfo) {
 	var info lineInfo
 	info.Model = meta.Model
 	if meta.Usage != nil {
-		info.InputTokens = meta.Usage.InputTokens
+		// cached_input_tokens is a SUBSET of input_tokens, so subtract it to
+		// recover the fresh (cache-exclusive) input and surface the cache
+		// portion as the read bucket (#1349). Clamp the subtraction at 0 so a
+		// malformed block where cached > input can never produce a negative
+		// fresh count. Codex has no cache-creation (write) line item → the
+		// write bucket stays 0.
+		fresh := meta.Usage.InputTokens - meta.Usage.CachedInputTokens
+		if fresh < 0 {
+			fresh = 0
+		}
+		info.InputTokens = fresh
+		info.CacheReadInputTokens = meta.Usage.CachedInputTokens
 		info.OutputTokens = meta.Usage.OutputTokens + meta.Usage.ReasoningOutputTokens
-		info.HasUsage = info.InputTokens+info.OutputTokens > 0
+		info.HasUsage = info.InputTokens+info.CacheReadInputTokens+info.OutputTokens > 0
 	}
 
 	return agent.Event{

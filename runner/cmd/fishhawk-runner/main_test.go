@@ -6299,6 +6299,54 @@ func TestRun_ImplementStage_BaseRebaseConflict_ReinvokeSucceeds(t *testing.T) {
 	}
 }
 
+// TestReinvokeOnBaseRebaseConflict_AggregatesCacheTokens pins binding condition
+// #1 for the base-rebase re-invoke aggregation site (main.go ~3411). Unlike the
+// verify-fix loop (which runs BEFORE the bundle is packed), the base-rebase
+// re-invoke runs during the push, AFTER the trace bundle has shipped, so its
+// tokens are only ever observable on res — not via the uploaded manifest. This
+// drives reinvokeOnBaseRebaseConflict directly: the prompt-cache buckets (#1349)
+// from the re-invoke's Result must accumulate onto the pre-existing res, so a
+// dropped += on CacheReadInputTokens / CacheWriteInputTokens fails here rather
+// than silently under-counting cache spend across the retry.
+func TestReinvokeOnBaseRebaseConflict_AggregatesCacheTokens(t *testing.T) {
+	// checkoutRunBranch hits real git; stub it to a no-op so the test exercises
+	// the aggregation, not the checkout. resolveImplementBranchRouting's default
+	// (standalone) case is pure — no fixup/decomposed cfg, no git needed.
+	orig := checkoutRunBranch
+	checkoutRunBranch = func(_ context.Context, _, _ string) error { return nil }
+	t.Cleanup(func() { checkoutRunBranch = orig })
+
+	cfg := config{
+		runID:      "11111111-2222-3333-4444-555555555555",
+		stageID:    "22222222-3333-4444-5555-666666666666",
+		workingDir: t.TempDir(),
+	}
+	fi := &fakeInvoker{canned: agent.Result{
+		OK:                    true,
+		InputTokens:           200,
+		OutputTokens:          80,
+		CacheReadInputTokens:  100,
+		CacheWriteInputTokens: 40,
+	}}
+
+	// res carries the base invocation's already-aggregated cache buckets; the
+	// re-invoke must add to them, not replace them.
+	res := agent.Result{CacheReadInputTokens: 5, CacheWriteInputTokens: 3}
+	err := reinvokeOnBaseRebaseConflict(context.Background(), cfg, fi, agent.Invocation{},
+		&res, gitops.ErrBaseRebaseConflict, io.Discard)
+	if err != nil {
+		t.Fatalf("reinvokeOnBaseRebaseConflict: %v", err)
+	}
+	if res.CacheReadInputTokens != 105 {
+		t.Errorf("res.CacheReadInputTokens = %d, want 105 (base 5 + re-invoke 100); a dropped += under-counts",
+			res.CacheReadInputTokens)
+	}
+	if res.CacheWriteInputTokens != 43 {
+		t.Errorf("res.CacheWriteInputTokens = %d, want 43 (base 3 + re-invoke 40)",
+			res.CacheWriteInputTokens)
+	}
+}
+
 // TestRun_ImplementStage_BaseRebaseConflict_Reinvoke_ReloadsExemptions is the
 // #1153 fail-closed-freshness regression for the base-rebase re-invoke path: a
 // SECOND agent invocation within the SAME stage must NOT inherit attempt 1's
@@ -7442,6 +7490,91 @@ func TestRun_VerifyFixLoop_FailThenPass_CommittedTree(t *testing.T) {
 		t.Error("iteration 1 must pass after the fix (missing verify_run outcome=passed)")
 	}
 	assertVerifySummary(t, events, "passed", 2, 2)
+}
+
+// TestRun_VerifyFixLoop_AggregatesCacheTokensAcrossReinvoke pins binding
+// condition #1 for the fix-up re-dispatch aggregation site (main.go ~3043):
+// the prompt-cache buckets (#1349) must accumulate across the initial agent
+// invocation AND the verify-fix re-invoke, so a dropped += on
+// CacheReadInputTokens / CacheWriteInputTokens fails here rather than silently
+// under-counting cache spend across retries. The canned Result carries cache
+// tokens; the invoker is called twice (initial + one fix), so the bundle
+// manifest must show 2x — a dropped += would show 1x.
+func TestRun_VerifyFixLoop_AggregatesCacheTokensAcrossReinvoke(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	regPath := filepath.Join(repo, "mod", "reg.go")
+	mustWrite(t, regPath, regGetBuggy)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+	mustWrite(t, filepath.Join(repo, "mod", "seed.go"),
+		"package mod\n\nfunc init() { registry[\"x\"] = 42 }\n")
+
+	const (
+		cannedRead  = 100
+		cannedWrite = 40
+	)
+	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo,
+		canned: agent.Result{
+			OK:                    true,
+			Events:                []agent.Event{{Kind: "invocation_start"}},
+			InputTokens:           200,
+			OutputTokens:          80,
+			CacheReadInputTokens:  cannedRead,
+			CacheWriteInputTokens: cannedWrite,
+		},
+		onInvoke: func(idx int, _ agent.Invocation) {
+			if idx == 1 {
+				mustWrite(t, regPath, regGetFixed)
+			}
+		},
+	}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "cd mod && go test ./...",
+		VerifyMaxIterations: 2,
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run(verifyFixRunArgs(repo, bundlePath), &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if invoker.callIdx != 2 {
+		t.Fatalf("Invoke call count = %d, want 2 (initial + one fix)", invoker.callIdx)
+	}
+
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatalf("read bundle: %v", err)
+	}
+	manifest, _, _, err := openBundleForTest(data)
+	if err != nil {
+		t.Fatalf("open bundle: %v", err)
+	}
+	if manifest.CacheReadInputTokens != 2*cannedRead {
+		t.Errorf("manifest CacheReadInputTokens = %d, want %d (initial + fix re-invoke); a dropped += at the fix-up aggregation site under-counts",
+			manifest.CacheReadInputTokens, 2*cannedRead)
+	}
+	if manifest.CacheWriteInputTokens != 2*cannedWrite {
+		t.Errorf("manifest CacheWriteInputTokens = %d, want %d (initial + fix re-invoke)",
+			manifest.CacheWriteInputTokens, 2*cannedWrite)
+	}
 }
 
 // gitDiffPatches returns the `patch` text of every git_diff event in the

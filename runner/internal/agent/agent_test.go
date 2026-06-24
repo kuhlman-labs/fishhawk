@@ -104,6 +104,22 @@ func TestStructuredOutput_ZeroValues(t *testing.T) {
 	}
 }
 
+// TestResult_CacheTokenZeroValues pins the #1349 back-compat default: a
+// Result from a backend that cannot surface the prompt-cache split leaves
+// both cache buckets at zero, which the backend prices as no cache
+// (CostWithCache(model, in, 0, 0, out) reduces to the flat Cost). Every
+// existing backend that does not populate them keeps today's flat-rate
+// pricing byte-for-byte.
+func TestResult_CacheTokenZeroValues(t *testing.T) {
+	var r Result
+	if r.CacheReadInputTokens != 0 {
+		t.Errorf("zero-value Result.CacheReadInputTokens = %d, want 0", r.CacheReadInputTokens)
+	}
+	if r.CacheWriteInputTokens != 0 {
+		t.Errorf("zero-value Result.CacheWriteInputTokens = %d, want 0", r.CacheWriteInputTokens)
+	}
+}
+
 func TestErrors_AreDistinct(t *testing.T) {
 	pairs := []struct {
 		a, b error

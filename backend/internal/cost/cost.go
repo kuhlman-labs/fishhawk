@@ -17,8 +17,17 @@ type Record struct {
 	// "claude-opus-4-8". Empty when the runner didn't stamp one.
 	Model string
 	// InputTokens / OutputTokens are the agent-reported token split.
+	// InputTokens is the FRESH (cache-exclusive) input when the record came
+	// from FromManifestWithCache; the flat FromManifest path leaves the cache
+	// fields zero and InputTokens carries the whole input side.
 	InputTokens  int
 	OutputTokens int
+	// CacheReadInputTokens / CacheWriteInputTokens are the prompt-cache split
+	// of the input side (ADR-044 / #1349): cache-served reads (priced at the
+	// family discount) and cache-creation writes (priced at the premium). Zero
+	// on a FromManifest record and on any bundle without cache usage.
+	CacheReadInputTokens  int
+	CacheWriteInputTokens int
 	// USD is the estimated cost. Always >= 0; 0 for an unknown model.
 	USD float64
 	// KnownModel reports whether pricing recognized Model. False means
@@ -44,5 +53,33 @@ func FromManifest(model string, inputTokens, outputTokens int) Record {
 		USD:          usd,
 		KnownModel:   ok,
 		PricingAsOf:  pricing.AsOf,
+	}
+}
+
+// FromManifestWithCache computes the estimated cost of a bundle's model
+// usage when the manifest carries the prompt-cache split (ADR-044 / #1349):
+// freshInput fresh (cache-exclusive) input tokens, cacheRead cache-served
+// input tokens, cacheWrite cache-creation input tokens, and outputTokens
+// output. It prices via pricing.CostWithCache — fresh input + output at the
+// flat rates, plus cache read at the family discount and cache write at the
+// premium — and populates all four token buckets on the Record.
+//
+// Like FromManifest it never errors: an unknown or empty model id yields
+// USD=0 with KnownModel=false. Because pricing.CostWithCache(model, in, 0, 0,
+// out) reduces exactly to pricing.Cost(model, in, out),
+// FromManifestWithCache(model, in, 0, 0, out) reduces exactly to
+// FromManifest(model, in, out) — so a cache-less bundle is priced identically
+// and non-cache-aware callers can stay on FromManifest unchanged.
+func FromManifestWithCache(model string, freshInput, cacheRead, cacheWrite, outputTokens int) Record {
+	usd, ok := pricing.CostWithCache(model, freshInput, cacheRead, cacheWrite, outputTokens)
+	return Record{
+		Model:                 model,
+		InputTokens:           freshInput,
+		OutputTokens:          outputTokens,
+		CacheReadInputTokens:  cacheRead,
+		CacheWriteInputTokens: cacheWrite,
+		USD:                   usd,
+		KnownModel:            ok,
+		PricingAsOf:           pricing.AsOf,
 	}
 }
