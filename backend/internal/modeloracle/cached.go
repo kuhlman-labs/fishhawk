@@ -130,13 +130,31 @@ func (c *Cached) Refresh(ctx context.Context) {
 	}
 }
 
+// defaultRefreshInterval is the fallback cadence Run uses when handed a
+// non-positive interval. time.NewTicker panics for <= 0, so an operator who
+// sets --models-refresh-interval / FISHHAWKD_MODELS_REFRESH_INTERVAL to 0 or a
+// negative value must degrade to this default (with a WARN) rather than crash
+// fishhawkd at boot. Matches the serve.go flag default (12h).
+const defaultRefreshInterval = 12 * time.Hour
+
 // Run fires one Refresh immediately (best-effort startup fetch — a failure
 // leaves the oracle ok=false/fail-open, never blocking boot) then refreshes on
 // the ticker until ctx is cancelled. Mirrors runWebhookEvictor: a single ticker,
 // select on ctx.Done()/ticker.C, with each refresh bounded by its own timeout so
 // one hung fetch cannot wedge the loop.
+//
+// A non-positive interval would panic time.NewTicker; rather than crash boot on
+// a bad operator config, Run falls back to defaultRefreshInterval and logs a
+// WARN — fail-safe, consistent with the oracle's fail-open posture everywhere.
 func (c *Cached) Run(ctx context.Context, interval time.Duration) {
 	c.refreshBounded(ctx)
+
+	if interval <= 0 {
+		c.logger.Warn("model oracle refresh interval is non-positive; falling back to default",
+			slog.Duration("configured", interval),
+			slog.Duration("default", defaultRefreshInterval))
+		interval = defaultRefreshInterval
+	}
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

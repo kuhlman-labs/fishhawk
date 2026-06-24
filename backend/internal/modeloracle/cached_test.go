@@ -206,6 +206,45 @@ func TestCached_RunStopsOnContextCancel(t *testing.T) {
 	}
 }
 
+// TestCached_RunNonPositiveIntervalDoesNotPanic asserts that a zero or negative
+// refresh interval (a bad operator --models-refresh-interval) does NOT panic
+// time.NewTicker but degrades to the default cadence with a WARN — fail-safe, so
+// a bad config can never crash fishhawkd at boot. The recover() makes a
+// regression (an unguarded NewTicker) a test failure rather than a goroutine
+// crash that takes the test binary down.
+func TestCached_RunNonPositiveIntervalDoesNotPanic(t *testing.T) {
+	for _, interval := range []time.Duration{0, -time.Second} {
+		t.Run(interval.String(), func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+			f := &fakeFetcher{ids: []string{"claude-opus-4-8"}}
+			o := modeloracle.NewCached(map[string]modeloracle.Fetcher{"claudecode": f}, time.Hour, logger)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Errorf("Run panicked on interval %v: %v", interval, r)
+					}
+					close(done)
+				}()
+				o.Run(ctx, interval)
+			}()
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("Run did not return within 2s for interval %v", interval)
+			}
+
+			if !strings.Contains(buf.String(), "non-positive") {
+				t.Errorf("missing non-positive-interval WARN for interval %v; got:\n%s", interval, buf.String())
+			}
+		})
+	}
+}
+
 // --- cross-boundary seam: oracle <-> spec.ValidateModels (#1339 activation) ---
 //
 // This test lives in package modeloracle_test (external) and imports spec; spec
