@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os/signal"
+	"sort"
 	"syscall"
 
 	"time"
@@ -254,6 +256,41 @@ func resolvePlanReviewers(opts planReviewerOptions, logger *slog.Logger) server.
 	return set
 }
 
+// buildModelProviders builds the provider→Fetcher map the live ModelOracle
+// (#1341) refreshes. A provider is registered ONLY when its API key is present:
+// an absent key leaves the provider UNREGISTERED, so its Snapshot reports
+// ok=false and the #1339 validation fails open for it — never a boot blocker.
+// Keyed under the EXISTING provider strings "claudecode"/"codex" (the same keys
+// the allow-list and #1339's providerForExecutorAgent use), each fetching its
+// vendor internally (claudecode→Anthropic, codex→OpenAI). The optional httpClient
+// is injected by tests; production passes none so each Fetcher builds its own
+// bounded-timeout client.
+func buildModelProviders(anthropicKey, openaiKey string, httpClient ...*http.Client) map[string]modeloracle.Fetcher {
+	var client *http.Client
+	if len(httpClient) > 0 {
+		client = httpClient[0]
+	}
+	providers := make(map[string]modeloracle.Fetcher)
+	if anthropicKey != "" {
+		providers["claudecode"] = modeloracle.NewAnthropicFetcher(anthropicKey, "", client)
+	}
+	if openaiKey != "" {
+		providers["codex"] = modeloracle.NewOpenAIFetcher(openaiKey, "", client)
+	}
+	return providers
+}
+
+// modelProviderNames returns the registered provider keys in sorted order for a
+// deterministic startup log line.
+func modelProviderNames(providers map[string]modeloracle.Fetcher) []string {
+	names := make([]string, 0, len(providers))
+	for name := range providers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // resolveBudgetLocation resolves an IANA timezone name to a
 // *time.Location for the advisory periodic-budget evaluator (#688). A
 // missing zoneinfo (minimal container image) or a typo'd name must never
@@ -459,6 +496,16 @@ func runServe(args []string, logSink io.Writer) int {
 			"computes calendar period boundaries in — a weekly budget resets Monday 00:00 in this "+
 			"zone, a monthly budget on the 1st. An unresolvable zone name falls back to UTC with a "+
 			"WARN at startup rather than failing the boot")
+	modelsRefreshInterval := fs.Duration("models-refresh-interval",
+		envOrDuration("FISHHAWKD_MODELS_REFRESH_INTERVAL", 12*time.Hour),
+		"how often the live ModelOracle (#1341) re-fetches each provider's /v1/models snapshot "+
+			"that backs #1339's model-id validation. The background refresh is best-effort: a failed "+
+			"fetch keeps the prior snapshot and decays its freshness, never blocking submits")
+	modelsStalenessThreshold := fs.Duration("models-staleness-threshold",
+		envOrDuration("FISHHAWKD_MODELS_STALENESS_THRESHOLD", 24*time.Hour),
+		"how old a provider's last SUCCESSFUL /v1/models fetch may be before the ModelOracle "+
+			"snapshot is treated as stale (#1341). A stale snapshot fails open (model_unverifiable "+
+			"warning, accept) rather than rejecting — absence from a stale list cannot authoritatively reject")
 	if err := fs.Parse(args); err != nil {
 		return exitFailure
 	}
@@ -495,7 +542,15 @@ func runServe(args []string, logSink io.Writer) int {
 		slog.Duration("cap", reviewBudget.Cap),
 		slog.String("ref", "#747"))
 
-	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modeloracle.NewNoData()}
+	// Live ModelOracle (#1341): the per-provider /v1/models cache that activates
+	// #1339's model-id validation. Providers are registered only for present API
+	// keys (absent key => unregistered => Snapshot ok=false => fail-open), keyed
+	// under the existing "claudecode"/"codex" strings. The background refresh
+	// goroutine is started after the signal context is created, below.
+	modelProviders := buildModelProviders(*anthropicAPIKey, *openAIAPIKey)
+	modelOracle := modeloracle.NewCached(modelProviders, *modelsStalenessThreshold, logger)
+
+	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modelOracle}
 
 	// Plan-review agent wiring. Resolved by a pure helper so the selection seam
 	// (which adapters the flags configure) is unit-testable without booting a
@@ -837,6 +892,18 @@ func runServe(args []string, logSink io.Writer) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Start the live ModelOracle refresh goroutine (#1341). Fires an initial
+	// best-effort fetch then refreshes on the ticker; stops on ctx cancellation
+	// like the other background workers. A failed fetch keeps the prior snapshot
+	// and fails open, so this never blocks boot. With no providers registered
+	// (no API keys) the loop still runs but refreshes nothing — every Snapshot
+	// stays ok=false (inert, exactly as the prior NoData default).
+	go modelOracle.Run(ctx, *modelsRefreshInterval)
+	logger.Info("model oracle refresh started",
+		slog.Any("providers", modelProviderNames(modelProviders)),
+		slog.Duration("refresh_interval", *modelsRefreshInterval),
+		slog.Duration("staleness_threshold", *modelsStalenessThreshold))
 
 	// Start the webhook dedup evictor when the Postgres store is
 	// in use. 1h tick is fine for 24h retention — eviction lag of
