@@ -82,6 +82,22 @@ type Manifest struct {
 	GeneratedAt        string `json:"generated_at"`
 	AgentFailed        bool   `json:"agent_failed,omitempty"`
 	AgentFailureReason string `json:"agent_failure_reason,omitempty"`
+	// RunnerKind is the runner's self-observed execution channel
+	// (`github_actions` | `local`, #1346 / ADR-045). The trace handler
+	// reads it and LOCKS the run's runner_kind to it (correcting the
+	// creation-time hint), closing the #1344 local-loop wedge where an
+	// omitted runner_kind:local defaulted to github_actions and the drive
+	// waited on a phantom GitHub-Actions runner.
+	//
+	// Unlike migration 0024's note that "the runner never self-declares"
+	// (which guarded against a FALSIFIABLE claim), this self-report rides
+	// INSIDE the signed bundle manifest: the per-run Ed25519 signature over
+	// the raw bytes makes it tamper-evident, hence attestable. The verifier
+	// does NOT read runner_kind (provenance metadata, not a hash input), so
+	// the rehash invariant is unaffected. Older bundles omit it and decode
+	// to "" — treated as no report, skipping reconciliation. Keep in
+	// lockstep with runner/internal/bundle.ManifestData.
+	RunnerKind string `json:"runner_kind,omitempty"`
 	// PushAndOpenPR signals an implement stage that will commit + push +
 	// open a PR after the trace upload. The trace handler reads it to
 	// forward-gate the implement stage's terminal transition onto the

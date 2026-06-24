@@ -77,6 +77,24 @@ type ManifestData struct {
 	AgentFailed        bool   `json:"agent_failed,omitempty"`
 	AgentFailureReason string `json:"agent_failure_reason,omitempty"`
 
+	// RunnerKind is the runner's self-observed execution channel
+	// (`github_actions` | `local`, #1346 / ADR-045): the runner detects
+	// it from its own environment (detectRunnerKind) rather than trusting
+	// the operator's creation-time declaration. The backend's trace
+	// handler reads it and LOCKS the run's runner_kind to it (correcting
+	// the creation hint), closing the #1344 local-loop wedge where an
+	// omitted runner_kind:local defaulted to github_actions and the drive
+	// waited on a phantom GitHub-Actions runner.
+	//
+	// Carrying it INSIDE the signed manifest is what makes it attestable:
+	// migration 0024's note that "the runner never self-declares" guarded
+	// against a FALSIFIABLE claim, but a claim committed under the per-run
+	// Ed25519 signature is tamper-evident, not falsifiable. omitempty keeps
+	// older bundles (without the field) parsing as "" — treated as no
+	// report, skipping reconciliation. Keep in lockstep with
+	// backend/internal/bundle.Manifest.
+	RunnerKind string `json:"runner_kind,omitempty"`
+
 	// PushAndOpenPR signals that this implement stage will commit, push,
 	// and open a PR AFTER the trace upload. The backend's trace handler
 	// reads it to forward-gate the implement stage's terminal transition:
@@ -162,6 +180,13 @@ type PackInputs struct {
 	AgentFailed        bool
 	AgentFailureReason string
 
+	// RunnerKind is the runner's self-observed execution channel
+	// (`github_actions` | `local`, #1346 / ADR-045), set from
+	// detectRunnerKind(os.Getenv) at pack time and carried into the signed
+	// manifest. Empty omits the field (older / channel-less bundles), which
+	// the backend treats as no self-report.
+	RunnerKind string
+
 	// PushAndOpenPR flags an implement stage that will open a PR after the
 	// trace upload. The runner sets it for standalone implement stages
 	// (not --no-pr, not a decomposed child) so the backend forward-gates
@@ -236,6 +261,7 @@ func Pack(w io.Writer, in PackInputs, events []agent.Event) (int, error) {
 		GeneratedAt:        now(),
 		AgentFailed:        in.AgentFailed,
 		AgentFailureReason: in.AgentFailureReason,
+		RunnerKind:         in.RunnerKind,
 		PushAndOpenPR:      in.PushAndOpenPR,
 		PushToSharedBranch: in.PushToSharedBranch,
 		PushFixup:          in.PushFixup,

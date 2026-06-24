@@ -234,6 +234,75 @@ func (r *postgresRepo) RetryRun(ctx context.Context, id uuid.UUID, to State) (*R
 	return result, nil
 }
 
+// ResolveRunnerKind reconciles a runner self-report (carried in the SIGNED
+// trace-bundle manifest, #1346 / ADR-045) against the run's persisted
+// runner_kind, under a FOR UPDATE row lock so two concurrent uploads can't
+// race the lock decision. The contract (see RunnerKindResolution):
+//
+//   - observed empty or not a ValidRunnerKind → no-op zero result (an
+//     unrecognized report never persists; the create-time hint stands).
+//   - run not yet resolved → LOCK it: UpdateRunnerKind(observed),
+//     runner_kind_resolved=true. Changed iff observed != prior hint.
+//   - already resolved, observed == locked → no-op (re-affirmation; a
+//     second stage's bundle reports the same channel).
+//   - already resolved, observed != locked → MISMATCH: leave the row
+//     UNCHANGED (warn, never silently flip) and report Mismatch so the
+//     caller emits the runner_kind_mismatch guardrail audit.
+//
+// Not part of the run.Repository interface: the trace handler consumes it
+// through an optional capability assertion (best-effort, like AddRunCost /
+// ParkScopeCompletenessAndAppend), so the many hand-rolled test fakes that
+// don't reconcile runner_kind need no stub.
+func (r *postgresRepo) ResolveRunnerKind(ctx context.Context, runID uuid.UUID, observed string) (RunnerKindResolution, error) {
+	if observed == "" {
+		return RunnerKindResolution{}, nil
+	}
+	if _, ok := ValidRunnerKinds[observed]; !ok {
+		return RunnerKindResolution{}, nil
+	}
+	var result RunnerKindResolution
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := rundb.New(tx)
+		current, err := q.LockRunForUpdate(ctx, runID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock run: %w", err)
+		}
+		prior := current.RunnerKind
+		if current.RunnerKindResolved {
+			if prior == observed {
+				// Re-affirmation: already locked to the same channel.
+				result = RunnerKindResolution{Locked: prior, Observed: observed, Prior: prior}
+				return nil
+			}
+			// Disagreement with the locked kind: do NOT mutate.
+			result = RunnerKindResolution{Mismatch: true, Locked: prior, Observed: observed, Prior: prior}
+			return nil
+		}
+		// First report: lock runner_kind to the observed channel.
+		updated, err := q.UpdateRunnerKind(ctx, rundb.UpdateRunnerKindParams{
+			ID:         runID,
+			RunnerKind: observed,
+		})
+		if err != nil {
+			return fmt.Errorf("update runner_kind: %w", err)
+		}
+		result = RunnerKindResolution{
+			Locked:   updated.RunnerKind,
+			Changed:  prior != observed,
+			Observed: observed,
+			Prior:    prior,
+		}
+		return nil
+	})
+	if err != nil {
+		return RunnerKindResolution{}, err
+	}
+	return result, nil
+}
+
 // --- Stage methods ---
 
 func (r *postgresRepo) SetRunPullRequestURL(ctx context.Context, id uuid.UUID, url string) (*Run, error) {
@@ -704,6 +773,7 @@ func rowToRun(r rundb.Run) *Run {
 		RetryAttempt:       int(r.RetryAttempt),
 		MaxRetriesSnapshot: int(r.MaxRetriesSnapshot),
 		RunnerKind:         r.RunnerKind,
+		RunnerKindResolved: r.RunnerKindResolved,
 		State:              State(r.State),
 		CreatedAt:          r.CreatedAt.Time,
 		UpdatedAt:          r.UpdatedAt.Time,

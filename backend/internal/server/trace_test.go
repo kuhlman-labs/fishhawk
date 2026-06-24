@@ -879,6 +879,330 @@ func TestShipTrace_OmitsRunnerKindWhenRunRepoNil(t *testing.T) {
 	}
 }
 
+// runnerKindResolverFake embeds the package fakeRepo (so it satisfies the
+// full run.Repository) and adds the optional ResolveRunnerKind capability
+// (#1346 / ADR-045) the trace handler consumes via type assertion. It
+// records the (runID, observed) it was called with and returns a canned
+// resolution / error, so the handler-wiring tests assert that handleShipTrace
+// extracts the manifest's runner_kind, calls the resolver, and emits the
+// right reconciliation audit — without standing up Postgres (the real DB
+// lock/mismatch semantics are covered exhaustively in run/postgres_test.go).
+type runnerKindResolverFake struct {
+	*fakeRepo
+	called      int
+	gotRunID    uuid.UUID
+	gotObserved string
+	result      run.RunnerKindResolution
+	resolveErr  error
+}
+
+func (r *runnerKindResolverFake) ResolveRunnerKind(_ context.Context, runID uuid.UUID, observed string) (run.RunnerKindResolution, error) {
+	r.called++
+	r.gotRunID = runID
+	r.gotObserved = observed
+	if r.resolveErr != nil {
+		return run.RunnerKindResolution{}, r.resolveErr
+	}
+	return r.result, nil
+}
+
+// makeRunnerKindBundle builds a minimal gzip JSONL bundle whose manifest
+// carries the given runner_kind (empty omits the field, modelling a legacy
+// bundle). It has no git_diff event, so the handler's policy re-eval takes
+// the no-diff skip path and the stage advances normally.
+func makeRunnerKindBundle(t *testing.T, runnerKind string) []byte {
+	t.Helper()
+	manifestData := `{"bundle_schema":"v1","agent_failed":false`
+	if runnerKind != "" {
+		manifestData += `,"runner_kind":"` + runnerKind + `"`
+	}
+	manifestData += `}`
+	type line struct {
+		Seq  int             `json:"seq"`
+		TS   time.Time       `json:"ts"`
+		Kind string          `json:"kind"`
+		Data json.RawMessage `json:"data,omitempty"`
+	}
+	lines := []line{
+		{Seq: 1, Kind: bundle.EventKindManifest, Data: json.RawMessage(manifestData)},
+		{Seq: 2, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	var raw bytes.Buffer
+	for _, l := range lines {
+		b, err := json.Marshal(l)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw.Write(b)
+		raw.WriteByte('\n')
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, err := w.Write(raw.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return gz.Bytes()
+}
+
+// findAppendedByCategory returns the single appended audit entry with the
+// given category, failing if zero or more than one match.
+func findAppendedByCategory(t *testing.T, au *auditFake, category string) audit.ChainAppendParams {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var matches []audit.ChainAppendParams
+	for _, e := range au.appended {
+		if e.Category == category {
+			matches = append(matches, e)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("appended entries with category %q = %d, want 1", category, len(matches))
+	}
+	return matches[0]
+}
+
+func countAppendedByCategory(au *auditFake, category string) int {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	n := 0
+	for _, e := range au.appended {
+		if e.Category == category {
+			n++
+		}
+	}
+	return n
+}
+
+// TestShipTrace_RunnerKind_ChangedLocksAndAudits asserts the load-bearing
+// handler wiring for the #1344 fix: a bundle whose signed manifest reports
+// runner_kind=local against a github_actions-default run drives
+// ResolveRunnerKind with the observed value, the trace_uploaded audit is
+// stamped with the LOCKED kind, and a runner_kind_resolved entry (from→to)
+// is chained.
+func TestShipTrace_RunnerKind_ChangedLocksAndAudits(t *testing.T) {
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	rr := &runnerKindResolverFake{
+		fakeRepo: newFakeRepo(),
+		result: run.RunnerKindResolution{
+			Locked:   run.RunnerKindLocal,
+			Changed:  true,
+			Observed: run.RunnerKindLocal,
+			Prior:    run.RunnerKindGitHubActions,
+		},
+	}
+	rr.runs[runID] = &run.Run{ID: runID, Repo: "x/y", RunnerKind: run.RunnerKindGitHubActions, State: run.StatePending}
+
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		SigningRepo: sf,
+		TraceStore:  ts,
+		AuditRepo:   au,
+		RunRepo:     rr,
+	})
+
+	body := makeRunnerKindBundle(t, run.RunnerKindLocal)
+	w := shipRequest(t, s, runID, stageID, "raw", priv, body, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	// The resolver was driven with the manifest's observed channel.
+	if rr.called != 1 || rr.gotRunID != runID || rr.gotObserved != run.RunnerKindLocal {
+		t.Fatalf("ResolveRunnerKind called=%d runID=%s observed=%q, want 1/%s/local", rr.called, rr.gotRunID, rr.gotObserved, runID)
+	}
+
+	// trace_uploaded payload reflects the LOCKED kind, not the prior hint.
+	traceEntry := findAppendedByCategory(t, au, "trace_uploaded")
+	var tracePayload map[string]any
+	if err := json.Unmarshal(traceEntry.Payload, &tracePayload); err != nil {
+		t.Fatalf("decode trace_uploaded payload: %v", err)
+	}
+	if got, _ := tracePayload["runner_kind"].(string); got != run.RunnerKindLocal {
+		t.Errorf("trace_uploaded payload.runner_kind = %q, want local", got)
+	}
+
+	// A runner_kind_resolved entry was chained with from→to.
+	resEntry := findAppendedByCategory(t, au, "runner_kind_resolved")
+	var resPayload map[string]any
+	if err := json.Unmarshal(resEntry.Payload, &resPayload); err != nil {
+		t.Fatalf("decode runner_kind_resolved payload: %v", err)
+	}
+	if from, _ := resPayload["from"].(string); from != run.RunnerKindGitHubActions {
+		t.Errorf("runner_kind_resolved.from = %q, want github_actions", from)
+	}
+	if to, _ := resPayload["to"].(string); to != run.RunnerKindLocal {
+		t.Errorf("runner_kind_resolved.to = %q, want local", to)
+	}
+	if n := countAppendedByCategory(au, "runner_kind_mismatch"); n != 0 {
+		t.Errorf("runner_kind_mismatch entries = %d, want 0 on a Changed resolution", n)
+	}
+}
+
+// TestShipTrace_RunnerKind_MismatchAudits asserts the post-execution
+// guardrail wiring: when ResolveRunnerKind reports a Mismatch (a later report
+// disagreeing with the already-locked kind), the handler emits a
+// runner_kind_mismatch audit (declared/observed) and NO runner_kind_resolved.
+func TestShipTrace_RunnerKind_MismatchAudits(t *testing.T) {
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	rr := &runnerKindResolverFake{
+		fakeRepo: newFakeRepo(),
+		result: run.RunnerKindResolution{
+			Mismatch: true,
+			Locked:   run.RunnerKindLocal,
+			Observed: run.RunnerKindGitHubActions,
+			Prior:    run.RunnerKindLocal,
+		},
+	}
+	rr.runs[runID] = &run.Run{ID: runID, Repo: "x/y", RunnerKind: run.RunnerKindLocal, State: run.StatePending}
+
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		SigningRepo: sf,
+		TraceStore:  ts,
+		AuditRepo:   au,
+		RunRepo:     rr,
+	})
+
+	body := makeRunnerKindBundle(t, run.RunnerKindGitHubActions)
+	w := shipRequest(t, s, runID, stageID, "raw", priv, body, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	mismatch := findAppendedByCategory(t, au, "runner_kind_mismatch")
+	var payload map[string]any
+	if err := json.Unmarshal(mismatch.Payload, &payload); err != nil {
+		t.Fatalf("decode runner_kind_mismatch payload: %v", err)
+	}
+	if declared, _ := payload["declared"].(string); declared != run.RunnerKindLocal {
+		t.Errorf("runner_kind_mismatch.declared = %q, want local", declared)
+	}
+	if observed, _ := payload["observed"].(string); observed != run.RunnerKindGitHubActions {
+		t.Errorf("runner_kind_mismatch.observed = %q, want github_actions", observed)
+	}
+	// The locked kind (not the rejected report) is stamped on trace_uploaded.
+	traceEntry := findAppendedByCategory(t, au, "trace_uploaded")
+	var tracePayload map[string]any
+	if err := json.Unmarshal(traceEntry.Payload, &tracePayload); err != nil {
+		t.Fatalf("decode trace_uploaded payload: %v", err)
+	}
+	if got, _ := tracePayload["runner_kind"].(string); got != run.RunnerKindLocal {
+		t.Errorf("trace_uploaded payload.runner_kind = %q, want local (unchanged on mismatch)", got)
+	}
+	if n := countAppendedByCategory(au, "runner_kind_resolved"); n != 0 {
+		t.Errorf("runner_kind_resolved entries = %d, want 0 on a Mismatch resolution", n)
+	}
+}
+
+// TestShipTrace_RunnerKind_LegacyBundleSkipsReconcile asserts the back-compat
+// path: a bundle whose manifest omits runner_kind (older runner) drives NO
+// resolver call and emits neither reconciliation audit — the create-time hint
+// stands and the trace_uploaded payload keeps the run's recorded kind.
+func TestShipTrace_RunnerKind_LegacyBundleSkipsReconcile(t *testing.T) {
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	rr := &runnerKindResolverFake{fakeRepo: newFakeRepo()}
+	rr.runs[runID] = &run.Run{ID: runID, Repo: "x/y", RunnerKind: run.RunnerKindGitHubActions, State: run.StatePending}
+
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		SigningRepo: sf,
+		TraceStore:  ts,
+		AuditRepo:   au,
+		RunRepo:     rr,
+	})
+
+	body := makeRunnerKindBundle(t, "") // no runner_kind in manifest
+	w := shipRequest(t, s, runID, stageID, "raw", priv, body, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	if rr.called != 0 {
+		t.Errorf("ResolveRunnerKind called %d times on a legacy bundle, want 0", rr.called)
+	}
+	if n := countAppendedByCategory(au, "runner_kind_resolved") + countAppendedByCategory(au, "runner_kind_mismatch"); n != 0 {
+		t.Errorf("reconciliation audit entries = %d on a legacy bundle, want 0", n)
+	}
+	// trace_uploaded keeps the run's recorded hint.
+	traceEntry := findAppendedByCategory(t, au, "trace_uploaded")
+	var tracePayload map[string]any
+	if err := json.Unmarshal(traceEntry.Payload, &tracePayload); err != nil {
+		t.Fatalf("decode trace_uploaded payload: %v", err)
+	}
+	if got, _ := tracePayload["runner_kind"].(string); got != run.RunnerKindGitHubActions {
+		t.Errorf("trace_uploaded payload.runner_kind = %q, want github_actions (hint preserved)", got)
+	}
+}
+
+// TestShipTrace_RunnerKind_ResolveErrorDegrades asserts the best-effort
+// contract: when ResolveRunnerKind errors, the upload still succeeds (202),
+// no reconciliation audit is emitted, and the trace_uploaded payload falls
+// back to the run's recorded hint.
+func TestShipTrace_RunnerKind_ResolveErrorDegrades(t *testing.T) {
+	sf := newSigningFake()
+	ts := newTraceStoreFake()
+	au := newAuditFake()
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	rr := &runnerKindResolverFake{
+		fakeRepo:   newFakeRepo(),
+		resolveErr: errors.New("db down"),
+	}
+	rr.runs[runID] = &run.Run{ID: runID, Repo: "x/y", RunnerKind: run.RunnerKindGitHubActions, State: run.StatePending}
+
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		SigningRepo: sf,
+		TraceStore:  ts,
+		AuditRepo:   au,
+		RunRepo:     rr,
+	})
+
+	body := makeRunnerKindBundle(t, run.RunnerKindLocal)
+	w := shipRequest(t, s, runID, stageID, "raw", priv, body, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (best-effort never unwinds the upload):\n%s", w.Code, w.Body.String())
+	}
+	if n := countAppendedByCategory(au, "runner_kind_resolved") + countAppendedByCategory(au, "runner_kind_mismatch"); n != 0 {
+		t.Errorf("reconciliation audit entries = %d on a resolver error, want 0", n)
+	}
+	traceEntry := findAppendedByCategory(t, au, "trace_uploaded")
+	var tracePayload map[string]any
+	if err := json.Unmarshal(traceEntry.Payload, &tracePayload); err != nil {
+		t.Fatalf("decode trace_uploaded payload: %v", err)
+	}
+	if got, _ := tracePayload["runner_kind"].(string); got != run.RunnerKindGitHubActions {
+		t.Errorf("trace_uploaded payload.runner_kind = %q, want github_actions (hint preserved on error)", got)
+	}
+}
+
 // ── runtime_observed emission from trace upload ───────────────────────────────
 
 // makeTimedBundle builds a minimal gzip JSONL bundle with a manifest

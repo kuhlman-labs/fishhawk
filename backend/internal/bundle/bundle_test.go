@@ -154,6 +154,52 @@ func TestExtractManifest_OlderBundleParsesPushFixupAsFalse(t *testing.T) {
 	}
 }
 
+func TestExtractManifest_RunnerKindRoundTrips(t *testing.T) {
+	// #1346/ADR-045 wire-flag lockstep: the read side must decode the exact
+	// `runner_kind` json key the runner stamps. No schema-sync CI guards this
+	// wire format, so this test pins the backend half of the contract — the
+	// reconciliation seam in handleShipTrace reads exactly this field.
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{
+			"bundle_schema":"v1",
+			"run_id":"run-1",
+			"stage_id":"stage-1",
+			"agent":"claude-code",
+			"runner_kind":"local"
+		}`)},
+		{Seq: 2, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractManifest(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractManifest: %v", err)
+	}
+	if got.RunnerKind != "local" {
+		t.Errorf("RunnerKind = %q, want %q", got.RunnerKind, "local")
+	}
+}
+
+func TestExtractManifest_OlderBundleParsesRunnerKindAsEmpty(t *testing.T) {
+	// A legacy bundle (older runner) omits the field; the read side must
+	// default to RunnerKind="" so the trace handler treats it as no
+	// self-report and skips reconciliation, preserving the creation-time hint.
+	lines := []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{
+			"bundle_schema":"v1",
+			"run_id":"run-1",
+			"stage_id":"stage-1",
+			"agent":"claude-code"
+		}`)},
+		{Seq: 2, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	}
+	got, err := ExtractManifest(packLines(t, lines))
+	if err != nil {
+		t.Fatalf("ExtractManifest: %v", err)
+	}
+	if got.RunnerKind != "" {
+		t.Errorf("RunnerKind = %q, want empty on a bundle without the field", got.RunnerKind)
+	}
+}
+
 func TestExtractManifest_EmptyBundle(t *testing.T) {
 	_, err := ExtractManifest(packLines(t, nil))
 	if !errors.Is(err, ErrNoManifest) {

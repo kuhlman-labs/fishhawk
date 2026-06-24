@@ -235,6 +235,80 @@ func TestPack_PushFixupDefaultsFalseAndOmitsField(t *testing.T) {
 	}
 }
 
+func TestPack_RunnerKindRoundTrips(t *testing.T) {
+	// #1346/ADR-045 wire-flag lockstep: runner_kind must marshal under the
+	// exact json key and round-trip through Open. There is no schema-sync CI
+	// for this wire format, so this test plus the backend reader's decode test
+	// are what keep the two modules in lockstep.
+	in := PackInputs{
+		RunID:      "11111111-2222-3333-4444-555555555555",
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		Agent:      "claude-code",
+		RunnerKind: "local",
+		Now:        frozenNow(),
+	}
+	data, _, err := PackBytes(in, sampleEvents())
+	if err != nil {
+		t.Fatalf("PackBytes: %v", err)
+	}
+	manifest, _, _, err := Open(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if manifest.RunnerKind != "local" {
+		t.Errorf("manifest.RunnerKind = %q, want %q", manifest.RunnerKind, "local")
+	}
+
+	// Assert the exact on-the-wire json key so a rename can't silently drift
+	// from the backend reader's `json:"runner_kind"` tag.
+	zr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	raw, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"runner_kind":"local"`)) {
+		t.Errorf("bundle manifest missing exact key %q; got:\n%s", `"runner_kind":"local"`, raw)
+	}
+}
+
+func TestPack_RunnerKindDefaultsEmptyAndOmitsField(t *testing.T) {
+	// omitempty back-compat: an older / channel-less bundle packs without the
+	// field and decodes to RunnerKind="" (the backend treats it as no
+	// self-report and skips reconciliation). Lock that in by asserting the key
+	// is absent from the wire bytes and decodes empty.
+	in := PackInputs{
+		RunID:   "11111111-2222-3333-4444-555555555555",
+		StageID: "22222222-3333-4444-5555-666666666666",
+		Agent:   "claude-code",
+		Now:     frozenNow(),
+	}
+	data, _, err := PackBytes(in, sampleEvents())
+	if err != nil {
+		t.Fatalf("PackBytes: %v", err)
+	}
+	manifest, _, _, err := Open(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if manifest.RunnerKind != "" {
+		t.Errorf("manifest.RunnerKind = %q, want empty on a channel-less bundle", manifest.RunnerKind)
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	raw, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if bytes.Contains(raw, []byte("runner_kind")) {
+		t.Errorf("omitempty failed: runner_kind present on a channel-less bundle:\n%s", raw)
+	}
+}
+
 func TestPack_StorageHashIsDeterministic(t *testing.T) {
 	// Same inputs + same Now produce byte-identical output and
 	// thus the same storage hash. Required for content-addressed
