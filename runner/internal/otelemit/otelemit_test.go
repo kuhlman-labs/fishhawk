@@ -80,9 +80,9 @@ func TestEmitStage_AttributesAndTraceID(t *testing.T) {
 	if got := a["gen_ai.usage.output_tokens"].AsInt64(); got != 1_000_000 {
 		t.Errorf("output_tokens = %d", got)
 	}
-	// 1M input @ $15/1M + 1M output @ $75/1M = $90.
-	if got := a["fishhawk.cost.usd"].AsFloat64(); got < 89.999 || got > 90.001 {
-		t.Errorf("fishhawk.cost.usd = %v, want ~90", got)
+	// 1M input @ $5/1M + 1M output @ $25/1M = $30.
+	if got := a["fishhawk.cost.usd"].AsFloat64(); got < 29.999 || got > 30.001 {
+		t.Errorf("fishhawk.cost.usd = %v, want ~30", got)
 	}
 	if !a["fishhawk.cost.priced"].AsBool() {
 		t.Error("fishhawk.cost.priced = false, want true for known model")

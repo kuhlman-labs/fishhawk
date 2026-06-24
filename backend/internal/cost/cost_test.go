@@ -7,14 +7,14 @@ import (
 )
 
 func TestFromManifest_KnownModel(t *testing.T) {
-	// claude-opus list price is 15/75 $/1M tokens (see pricing table).
-	// 1,000,000 input + 1,000,000 output → $15 + $75 = $90.
+	// claude-opus list price is 5/25 $/1M tokens (see pricing table).
+	// 1,000,000 input + 1,000,000 output → $5 + $25 = $30.
 	got := FromManifest("claude-opus-4-8", 1_000_000, 1_000_000)
 	if !got.KnownModel {
 		t.Fatalf("KnownModel = false, want true for a known model id")
 	}
-	if got.USD != 90 {
-		t.Errorf("USD = %v, want 90", got.USD)
+	if got.USD != 30 {
+		t.Errorf("USD = %v, want 30", got.USD)
 	}
 	if got.Model != "claude-opus-4-8" || got.InputTokens != 1_000_000 || got.OutputTokens != 1_000_000 {
 		t.Errorf("echoed fields wrong: %+v", got)

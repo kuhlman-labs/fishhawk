@@ -6,12 +6,14 @@
 // total and feeds the spend-alert detector) call Cost so the two
 // sides can never drift to different numbers for the same usage.
 //
-// The table is a point-in-time snapshot keyed by model family. Model
-// vendors change published prices over time, so any value derived
-// from this table is an ESTIMATE — see AsOf for the snapshot date.
-// An unknown model id returns ok=false and a zero cost rather than a
-// guess, so a future model the table doesn't know about is recorded
-// at 0 (estimated) instead of silently mispriced or panicking.
+// The table is a point-in-time snapshot keyed by model family,
+// covering the Anthropic (claude-*) and OpenAI (gpt-*) families in
+// active use. Model vendors change published prices over time, so any
+// value derived from this table is an ESTIMATE — see AsOf for the
+// snapshot date. An unknown model id returns ok=false and a zero cost
+// rather than a guess, so a future model the table doesn't know about
+// is recorded at 0 (estimated) instead of silently mispriced or
+// panicking.
 package pricing
 
 import "strings"
@@ -19,7 +21,7 @@ import "strings"
 // AsOf is the date the price table was last reconciled against
 // published vendor pricing. Surfaced alongside any rolled cost so
 // consumers can label the figure as an estimate of a known vintage.
-const AsOf = "2026-06-02"
+const AsOf = "2026-06-23"
 
 // rate is the per-token price for a single model family, in US
 // dollars. Vendors publish per-million-token prices; we store the
@@ -40,19 +42,23 @@ func perMillion(input, output float64) rate {
 	}
 }
 
-// familyRates maps a model-id prefix to its rate. Claude model ids
-// carry a family + version + date suffix (e.g.
-// "claude-opus-4-8", "claude-sonnet-4-6-20260201"), so we match on
+// familyRates maps a model-id prefix to its rate. Model ids carry a
+// family + version + date suffix (e.g. "claude-opus-4-8",
+// "claude-sonnet-4-6-20260201", "gpt-5.5-2026xxxx"), so we match on
 // the family prefix and let every dated point release inherit the
 // family price. Longest-prefix wins (see Cost) so a more specific
 // key can override a broader one if a future release reprices.
 //
-// Prices are published Anthropic list prices as of AsOf, in
-// $/1M-tokens: Opus 15/75, Sonnet 3/15, Haiku 0.80/4.
+// Prices are published vendor list prices as of AsOf, in $/1M-tokens:
+// Opus 5/25 (non-fast tier), Sonnet 3/15, Haiku 1/5 (Anthropic);
+// gpt-5.5 5/30 (OpenAI standard short-context; the $0.50 cached-input
+// rate is intentionally not modeled — the rate struct is flat
+// input/output only).
 var familyRates = map[string]rate{
-	"claude-opus":   perMillion(15, 75),
+	"claude-opus":   perMillion(5, 25),
 	"claude-sonnet": perMillion(3, 15),
-	"claude-haiku":  perMillion(0.80, 4),
+	"claude-haiku":  perMillion(1, 5),
+	"gpt-5.5":       perMillion(5, 30),
 }
 
 // Cost returns the estimated US-dollar cost of an invocation that
