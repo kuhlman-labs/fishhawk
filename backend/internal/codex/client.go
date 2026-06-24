@@ -427,12 +427,20 @@ func parseStream(out []byte) (verdictText string, usage planreview.Usage, err er
 		if freshTok < 0 {
 			freshTok = 0
 		}
+		// Codex reports a single cached_input_tokens that is cache READS
+		// only — it has no separate cache-write signal — so it maps to
+		// CacheReadInputTokens and CacheWriteInputTokens stays 0 (#1343).
+		// The cache-write premium is therefore unexercised for codex; the
+		// reviewer cost path prices its cache-served tokens at the cheaper
+		// read rate. The fresh = input - cached subtraction (clamped above)
+		// and the cache-exclusive InputTokens contract are unchanged.
 		usage = planreview.Usage{
-			InputTokens:       freshTok,
-			CachedInputTokens: cachedTok,
-			OutputTokens:      outputTok,
-			Turns:             turns,
-			Known:             true,
+			InputTokens:           freshTok,
+			CacheReadInputTokens:  cachedTok,
+			CacheWriteInputTokens: 0,
+			OutputTokens:          outputTok,
+			Turns:                 turns,
+			Known:                 true,
 		}
 	}
 	return verdictText, usage, nil

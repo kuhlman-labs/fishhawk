@@ -298,8 +298,13 @@ func TestInference_HappyUsage(t *testing.T) {
 	if usage.InputTokens != 1134 || usage.OutputTokens != 600 {
 		t.Errorf("Usage = %+v, want {InputTokens:1134 OutputTokens:600 Known:true}", usage)
 	}
-	if usage.CachedInputTokens != 100 || usage.Turns != 1 {
-		t.Errorf("Usage = %+v, want CachedInputTokens=100 Turns=1", usage)
+	// codex's single cached_input_tokens maps to the cache READ bucket, with
+	// cache WRITE 0 (codex has no cache-write signal) (#1343).
+	if usage.CacheReadInputTokens != 100 || usage.CacheWriteInputTokens != 0 || usage.Turns != 1 {
+		t.Errorf("Usage = %+v, want CacheReadInputTokens=100 CacheWriteInputTokens=0 Turns=1", usage)
+	}
+	if got := usage.CachedInputTokens(); got != 100 {
+		t.Errorf("Usage.CachedInputTokens() = %d, want 100 (read 100 + write 0)", got)
 	}
 }
 
@@ -661,8 +666,13 @@ func TestParseStream_SumsMultipleTurns(t *testing.T) {
 	if usage.InputTokens != 115 || usage.OutputTokens != 17 || !usage.Known {
 		t.Errorf("Usage = %+v, want {InputTokens:115 OutputTokens:17 Known:true}", usage)
 	}
-	if usage.CachedInputTokens != 60 {
-		t.Errorf("CachedInputTokens = %d, want 60 (summed across turns)", usage.CachedInputTokens)
+	// The summed cached total (30+20+10) lands in the cache READ bucket, write 0
+	// (#1343); the accessor returns read+write = 60.
+	if usage.CacheReadInputTokens != 60 || usage.CacheWriteInputTokens != 0 {
+		t.Errorf("Usage cache split = read %d / write %d, want 60/0 (codex: read-only)", usage.CacheReadInputTokens, usage.CacheWriteInputTokens)
+	}
+	if got := usage.CachedInputTokens(); got != 60 {
+		t.Errorf("CachedInputTokens() = %d, want 60 (summed across turns)", got)
 	}
 	if usage.Turns != 3 {
 		t.Errorf("Turns = %d, want 3 (one per turn.completed line)", usage.Turns)
@@ -684,8 +694,8 @@ func TestParseStream_ClampsNegativeFresh(t *testing.T) {
 	if usage.InputTokens != 0 {
 		t.Errorf("InputTokens = %d, want 0 (clamped: cached 80 > raw input 50)", usage.InputTokens)
 	}
-	if usage.CachedInputTokens != 80 || usage.OutputTokens != 5 || !usage.Known {
-		t.Errorf("Usage = %+v, want {CachedInputTokens:80 OutputTokens:5 Known:true}", usage)
+	if usage.CacheReadInputTokens != 80 || usage.CacheWriteInputTokens != 0 || usage.OutputTokens != 5 || !usage.Known {
+		t.Errorf("Usage = %+v, want {CacheReadInputTokens:80 CacheWriteInputTokens:0 OutputTokens:5 Known:true}", usage)
 	}
 }
 

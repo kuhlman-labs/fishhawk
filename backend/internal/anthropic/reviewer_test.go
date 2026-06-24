@@ -37,8 +37,10 @@ type fakeAnthropicResp struct {
 	Model      string `json:"model"`
 	StopReason string `json:"stop_reason"`
 	Usage      struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
+		InputTokens              int `json:"input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 	} `json:"usage"`
 }
 
@@ -63,9 +65,11 @@ func okResp(verdictJSON string) fakeAnthropicResp {
 		Model:      "claude-sonnet-4-6",
 		StopReason: "end_turn",
 		Usage: struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-		}{InputTokens: 100, OutputTokens: 20},
+			InputTokens              int `json:"input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		}{InputTokens: 100, OutputTokens: 20, CacheReadInputTokens: 70, CacheCreationInputTokens: 30},
 	}
 }
 
@@ -325,5 +329,18 @@ func TestReviewer_PopulatesUsage(t *testing.T) {
 	}
 	if verdict.Usage.Turns != 1 {
 		t.Errorf("Usage.Turns = %d, want 1 (single Messages call)", verdict.Usage.Turns)
+	}
+	// The SDK Usage block's cache split surfaces into the read/write buckets
+	// (#1343) — no longer discarded/0. okResp stamps cache_read=70,
+	// cache_creation=30; the adapter maps read→CacheReadInputTokens (cheaper),
+	// creation→CacheWriteInputTokens (premium). If a future SDK renames these
+	// fields, this assertion fails rather than silently zeroing the cache cost.
+	if verdict.Usage.CacheReadInputTokens != 70 || verdict.Usage.CacheWriteInputTokens != 30 {
+		t.Errorf("Usage cache split = read %d / write %d, want 70/30 (surfaced from SDK envelope, not 0)",
+			verdict.Usage.CacheReadInputTokens, verdict.Usage.CacheWriteInputTokens)
+	}
+	// The summed accessor equals read+write (back-compat for the former field).
+	if got := verdict.Usage.CachedInputTokens(); got != 100 {
+		t.Errorf("Usage.CachedInputTokens() = %d, want 100 (read 70 + write 30)", got)
 	}
 }
