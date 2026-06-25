@@ -569,6 +569,23 @@ components:
             audit read, same single-read posture as `concerns`); omitted on
             the list endpoint and when the run has had no fix-up (or the pin
             predates #1164).
+        security_findings:
+          type: array
+          items:
+            $ref: '#/components/schemas/SecurityFinding'
+          description: |
+            The run's unresolved high-severity code-scanning (CodeQL/SAST)
+            findings on the implement diff (#1096), distilled from the newest
+            `implement_security_findings` audit entry (the webhook ingest
+            records ONE idempotent entry per scan, floored on the latest
+            fix-up, so the newest entry reflects the current scan state). A
+            SEPARATE signal from `concerns`: a finding here is held by its own
+            merge gate (`security_findings_unresolved`) and routed to its own
+            fix-up pass, never consuming a design-concern budget. Emitted by
+            `GET /v0/runs/{run_id}` ONLY (a single audit read, same single-read
+            posture as `concerns`); omitted on the list endpoint and when the
+            run has no findings (no scan yet, a clean scan, or a clean re-scan
+            after a fix-up cleared them).
         created_at:
           type: string
           format: date-time
@@ -599,6 +616,41 @@ components:
           type: integer
           minimum: 1
           description: The 1-based fix-up pass ordinal this model was pinned on.
+
+    SecurityFinding:
+      type: object
+      description: |
+        One high-severity GitHub code-scanning (CodeQL/SAST) finding on the
+        implement diff (#1096): the subset a reviewer/operator needs to locate
+        and open the alert. Surfaced on `GET /v0/runs/{run_id}` only.
+      required: [number, rule_id, severity, path]
+      properties:
+        number:
+          type: integer
+          description: The alert's per-repo identifier.
+        rule_id:
+          type: string
+          description: The analysis rule that fired (e.g. `go/sql-injection`).
+        description:
+          type: string
+          description: Human-facing rule description.
+        severity:
+          type: string
+          description: |
+            Normalized security-severity level — `critical` or `high` (the
+            gating levels; medium/low/none never surface here).
+        state:
+          type: string
+          description: 'Alert state: `open`, `fixed`, or `dismissed`.'
+        path:
+          type: string
+          description: Repo-relative file the finding's most-recent instance points at.
+        start_line:
+          type: integer
+          description: 1-based line of the finding; omitted/0 when GitHub omits a location.
+        html_url:
+          type: string
+          description: Link to the alert on GitHub.
 
     RunConcerns:
       type: object

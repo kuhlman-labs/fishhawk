@@ -12,6 +12,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
 )
 
 // runResolver bundles the API client + an env getter so the tool
@@ -924,6 +926,30 @@ type GetRunStatusOutput struct {
 	// decomposition audit marker in the recent window), so ordinary runs pay
 	// nothing. Omitted for non-decomposed runs.
 	ChildrenStatus *ChildrenStatus `json:"children_status,omitempty" jsonschema:"decomposed-parent per-child status + fan-in phase (#1147): children[] lists each child's live state (pending/running/succeeded/failed/unknown) in slice-index order; integration_phase is running_children, ready_to_integrate, integrated, or integration_conflict; consolidated_branch / conflicting_child_run_id surface the fan-in outcome. Best-effort (a child read failure yields state=unknown, never fails the snapshot). Omitted for non-decomposed runs"`
+	// SecurityFindings surfaces the run's unresolved high-severity
+	// code-scanning (CodeQL/SAST) findings on the implement diff (#1096),
+	// distilled from the newest implement_security_findings audit entry. A
+	// SEPARATE signal from the implement-review concerns: a finding here is
+	// held by its own merge gate (security_findings_unresolved) and routed
+	// to its own fix-up pass, so it never consumes a design-concern budget.
+	// Best-effort (a read/decode error or no scan leaves it empty — never
+	// fails the snapshot). Omitted when the run has no findings (no scan
+	// yet, a clean scan, or a clean re-scan after a fix-up cleared them).
+	SecurityFindings []SecurityFinding `json:"security_findings,omitempty" jsonschema:"unresolved high-severity code-scanning (CodeQL/SAST) findings on the implement diff (#1096), from the newest scan. A SEPARATE signal from implement-review concerns — held by its own merge gate and routed to its own fix-up pass, never consuming a design-concern budget. Omitted when the run has no findings (no scan, a clean scan, or a clean re-scan after a fix-up)"`
+}
+
+// SecurityFinding is one high-severity code-scanning finding on the MCP
+// run-status surface (#1096), mirroring the REST security_findings shape so
+// the agent locates and opens the alert (severity, rule, path:line, link).
+type SecurityFinding struct {
+	Number      int    `json:"number" jsonschema:"the alert's per-repo identifier"`
+	RuleID      string `json:"rule_id" jsonschema:"the analysis rule that fired (e.g. go/sql-injection)"`
+	Description string `json:"description,omitempty" jsonschema:"human-facing rule description"`
+	Severity    string `json:"severity" jsonschema:"normalized security-severity: critical or high (the gating levels)"`
+	State       string `json:"state,omitempty" jsonschema:"alert state: open, fixed, or dismissed"`
+	Path        string `json:"path" jsonschema:"repo-relative file the finding points at"`
+	StartLine   int    `json:"start_line,omitempty" jsonschema:"1-based line of the finding; 0 when GitHub omits a location"`
+	HTMLURL     string `json:"html_url,omitempty" jsonschema:"link to the alert on GitHub"`
 }
 
 // registerGetRunStatus wires the fishhawk_get_run_status tool. The
@@ -1119,6 +1145,12 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 		childrenStatus, _ = r.childrenStatusFor(ctx, runID, recent)
 	}
 
+	// Best-effort security-findings surface (#1096). A dedicated read of the
+	// implement_security_findings audit category — a SEPARATE signal from the
+	// review concerns. On any error the slice stays nil — never fails the
+	// snapshot.
+	securityFindings := r.securityFindingsFor(ctx, runID)
+
 	return nil, GetRunStatusOutput{
 		Run:                      *runRow,
 		Stages:                   stages,
@@ -1135,7 +1167,57 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 		DriveStatus:              view.driveStatus(),
 		NextActions:              nextActions,
 		ChildrenStatus:           childrenStatus,
+		SecurityFindings:         securityFindings,
 	}, nil
+}
+
+// securityFindingsFor distills the run's unresolved high-severity
+// code-scanning findings (#1096) from the newest implement_security_findings
+// audit entry. Returns nil — the field is omitted — on any read/decode error
+// (best-effort, never fails the snapshot), when the run has had no scan, or
+// when the newest entry carries no findings (a clean scan or a clean re-scan
+// after a fix-up). Newest-wins: ListRunAudit returns the per-run chain
+// sequence-ascending, so the last entry is the most-recent scan state.
+func (r *runResolver) securityFindingsFor(ctx context.Context, runID uuid.UUID) []SecurityFinding {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: securityscan.AuditCategorySecurityFindings,
+	})
+	if err != nil || len(entries) == 0 {
+		return nil
+	}
+	newest := entries[len(entries)-1]
+	if newest.Payload == nil {
+		return nil
+	}
+	// Payload is decoded JSON (any); re-marshal then unmarshal into the
+	// cross-slice {findings:[...]} shape, mirroring decodeReviewVerdicts.
+	raw, merr := json.Marshal(newest.Payload)
+	if merr != nil {
+		return nil
+	}
+	var payload struct {
+		Findings []securityscan.Finding `json:"findings"`
+	}
+	if uerr := json.Unmarshal(raw, &payload); uerr != nil {
+		return nil
+	}
+	if len(payload.Findings) == 0 {
+		return nil
+	}
+	out := make([]SecurityFinding, 0, len(payload.Findings))
+	for _, f := range payload.Findings {
+		out = append(out, SecurityFinding{
+			Number:      f.Number,
+			RuleID:      f.RuleID,
+			Description: f.Description,
+			Severity:    f.Severity,
+			State:       f.State,
+			Path:        f.Path,
+			StartLine:   f.StartLine,
+			HTMLURL:     f.HTMLURL,
+		})
+	}
+	return out
 }
 
 // decompositionAuditCategories are the recent-audit markers that, present on a

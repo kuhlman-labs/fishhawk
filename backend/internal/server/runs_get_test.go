@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
 )
 
 func TestGetRun_HappyPath(t *testing.T) {
@@ -552,6 +553,157 @@ func seedAutoAdvance(t *testing.T, au *auditFake, runID uuid.UUID, seq int64, ts
 		RunID: &rid, Sequence: seq, Category: drive.Category,
 		Payload: payload, Timestamp: ts,
 	})
+}
+
+// seedSecurityFindings seeds one implement_security_findings audit entry
+// (#1096) carrying the given findings under the cross-slice "findings" key.
+func seedSecurityFindings(t *testing.T, au *auditFake, runID uuid.UUID, seq int64, findings []securityscan.Finding) {
+	t.Helper()
+	payload, err := json.Marshal(securityFindingsAuditPayload{Findings: findings})
+	if err != nil {
+		t.Fatalf("marshal security findings: %v", err)
+	}
+	rid := runID
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, Sequence: seq, Category: securityscan.AuditCategorySecurityFindings,
+		Payload: payload, Timestamp: time.Now().UTC(),
+	})
+}
+
+// newSecurityGetServer wires a run repo + audit fake and seeds one run,
+// returning the seeded row for mutation.
+func newSecurityGetServer(t *testing.T) (*Server, *auditFake, *run.Run) {
+	t.Helper()
+	repo := newFakeRepo()
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au})
+	seeded, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	return s, au, seeded
+}
+
+// TestGetRun_SurfacesSecurityFindings (#1096): the single-run read distills
+// the newest implement_security_findings audit entry's findings onto the
+// run response so a high-severity code-scanning finding surfaces at the
+// review gate, not first at merge.
+func TestGetRun_SurfacesSecurityFindings(t *testing.T) {
+	s, au, seeded := newSecurityGetServer(t)
+	seedSecurityFindings(t, au, seeded.ID, 5, []securityscan.Finding{
+		{
+			Number:      7,
+			RuleID:      "go/sql-injection",
+			Description: "Database query built from user-controlled sources",
+			Severity:    securityscan.SeverityHigh,
+			State:       "open",
+			Path:        "pkg/bar/bar.go",
+			StartLine:   42,
+			HTMLURL:     "https://github.com/x/y/security/code-scanning/7",
+		},
+	})
+
+	resp, raw := getRunResponse(t, s, seeded.ID)
+	if len(resp.SecurityFindings) != 1 {
+		t.Fatalf("security_findings = %+v, want 1 entry", resp.SecurityFindings)
+	}
+	f := resp.SecurityFindings[0]
+	if f.RuleID != "go/sql-injection" || f.Severity != securityscan.SeverityHigh ||
+		f.Path != "pkg/bar/bar.go" || f.StartLine != 42 || f.Number != 7 {
+		t.Errorf("security_findings[0] = %+v, want the seeded high-severity finding", f)
+	}
+	if _, ok := raw["security_findings"]; !ok {
+		t.Errorf("body should carry security_findings: %v", raw)
+	}
+}
+
+// TestGetRun_SecurityFindings_NewestWins pins the newest-entry-wins rule:
+// a clean re-scan recorded AFTER a finding (higher sequence, empty findings)
+// clears the surface — the gate-clearing behavior on the read side.
+func TestGetRun_SecurityFindings_NewestWins(t *testing.T) {
+	s, au, seeded := newSecurityGetServer(t)
+	// Older scan: a high-severity finding.
+	seedSecurityFindings(t, au, seeded.ID, 5, []securityscan.Finding{
+		{Number: 7, RuleID: "go/sql-injection", Severity: securityscan.SeverityHigh, Path: "pkg/bar/bar.go"},
+	})
+	// Newer clean re-scan after a fix-up: no findings.
+	seedSecurityFindings(t, au, seeded.ID, 9, nil)
+
+	resp, raw := getRunResponse(t, s, seeded.ID)
+	if len(resp.SecurityFindings) != 0 {
+		t.Errorf("security_findings = %+v, want empty (newest clean re-scan wins)", resp.SecurityFindings)
+	}
+	if _, ok := raw["security_findings"]; ok {
+		t.Errorf("clean re-scan should omit security_findings: %v", raw)
+	}
+}
+
+// TestGetRun_NoSecurityFindings_OmitsBlock: a run with no scan entry carries
+// no security_findings field (additive — byte-identical to pre-#1096).
+func TestGetRun_NoSecurityFindings_OmitsBlock(t *testing.T) {
+	s, _, seeded := newSecurityGetServer(t)
+	resp, raw := getRunResponse(t, s, seeded.ID)
+	if resp.SecurityFindings != nil {
+		t.Errorf("security_findings = %+v, want nil when no scan landed", resp.SecurityFindings)
+	}
+	if _, ok := raw["security_findings"]; ok {
+		t.Errorf("no scan should omit security_findings: %v", raw)
+	}
+}
+
+// TestGetRun_SecurityFindings_NoAuditRepoOmitsBlock: with no AuditRepo
+// wired the field is omitted rather than the read panicking.
+func TestGetRun_SecurityFindings_NoAuditRepoOmitsBlock(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo) // no AuditRepo
+	seeded, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s", TriggerSource: run.TriggerCLI,
+	})
+	resp, raw := getRunResponse(t, s, seeded.ID)
+	if resp.SecurityFindings != nil {
+		t.Errorf("security_findings = %+v, want nil with no audit repo", resp.SecurityFindings)
+	}
+	if _, ok := raw["security_findings"]; ok {
+		t.Errorf("no audit repo should omit security_findings: %v", raw)
+	}
+}
+
+// TestGetRun_SecurityFindings_ReadFailureOmitsBlock: a category-read error
+// degrades to an omitted field (best-effort), never failing the run read.
+func TestGetRun_SecurityFindings_ReadFailureOmitsBlock(t *testing.T) {
+	s, au, seeded := newSecurityGetServer(t)
+	au.listByCategoryErr = errors.New("boom")
+
+	resp, raw := getRunResponse(t, s, seeded.ID)
+	if resp.SecurityFindings != nil {
+		t.Errorf("security_findings = %+v, want nil on read error", resp.SecurityFindings)
+	}
+	if _, ok := raw["security_findings"]; ok {
+		t.Errorf("read error should omit security_findings: %v", raw)
+	}
+}
+
+// TestGetRun_SecurityFindings_UndecodablePayloadOmitsBlock: a corrupt audit
+// payload degrades to an omitted field rather than surfacing a half-decoded
+// list.
+func TestGetRun_SecurityFindings_UndecodablePayloadOmitsBlock(t *testing.T) {
+	s, au, seeded := newSecurityGetServer(t)
+	rid := seeded.ID
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, Sequence: 5, Category: securityscan.AuditCategorySecurityFindings,
+		Payload: json.RawMessage(`{"findings": "not-an-array"}`), Timestamp: time.Now().UTC(),
+	})
+
+	resp, raw := getRunResponse(t, s, seeded.ID)
+	if resp.SecurityFindings != nil {
+		t.Errorf("security_findings = %+v, want nil on undecodable payload", resp.SecurityFindings)
+	}
+	if _, ok := raw["security_findings"]; ok {
+		t.Errorf("undecodable payload should omit security_findings: %v", raw)
+	}
 }
 
 // newDriveGetServer wires a run repo + audit fake server and seeds one

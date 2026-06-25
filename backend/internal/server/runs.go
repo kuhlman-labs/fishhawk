@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
@@ -116,6 +117,44 @@ type runResponse struct {
 	// extra read. Omitted when the run has had no fix-up (or the pin predates
 	// #1164).
 	FixupModel *runFixupModelPayload `json:"fixup_model,omitempty"`
+	// SecurityFindings is the run's unresolved high-severity code-scanning
+	// (CodeQL/SAST) findings on the implement diff (#1096), distilled from
+	// the newest implement_security_findings audit entry (the webhook ingest
+	// records ONE idempotent entry per scan, floored on the latest fix-up, so
+	// the newest entry reflects the current scan state). Populated by
+	// handleGetRun ONLY (a single audit read, same posture as Concerns) — so
+	// the list endpoint stays free of the extra read. A SEPARATE signal from
+	// Concerns: a finding here is held by its own merge gate and routed to
+	// its own fix-up pass. Omitted when the run has no findings (no scan yet,
+	// a clean scan, or a clean re-scan after a fix-up cleared them).
+	SecurityFindings []securityFindingPayload `json:"security_findings,omitempty"`
+}
+
+// securityFindingPayload is one high-severity code-scanning finding on the
+// wire (#1096). Kept distinct from securityscan.Finding so the audit payload
+// shape (recorded by the webhook ingest) cannot silently leak fields through
+// the API surface; the surfaced subset is what a reviewer/operator needs to
+// locate and open the alert.
+type securityFindingPayload struct {
+	Number      int    `json:"number"`
+	RuleID      string `json:"rule_id"`
+	Description string `json:"description,omitempty"`
+	Severity    string `json:"severity"`
+	State       string `json:"state,omitempty"`
+	Path        string `json:"path"`
+	StartLine   int    `json:"start_line,omitempty"`
+	HTMLURL     string `json:"html_url,omitempty"`
+}
+
+// securityFindingsAuditPayload is the cross-slice shape of the
+// implement_security_findings audit entry the webhook ingest records
+// (#1096) and the surfaces + merge gate read. The webhook marshals the
+// high-severity findings intersecting the diff under "findings"; consumers
+// decode only that key and tolerate any additional metadata fields the
+// ingest may carry (head SHA, fix-up floor), so an additive payload change
+// never breaks the surface.
+type securityFindingsAuditPayload struct {
+	Findings []securityscan.Finding `json:"findings"`
 }
 
 // runFixupModelPayload is the model a fix-up pass ran under on the wire
@@ -809,7 +848,69 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// the run's newest stage_fixup_triggered entry's pinned model; nil (field
 	// omitted) when the run has had no fix-up or the pin predates #1164.
 	resp.FixupModel = s.fixupModelForRun(r.Context(), runID)
+	// Security-findings surface (#1096): single-run read ONLY (same posture
+	// as Concerns / FixupModel — no per-row audit query on the list
+	// endpoint). Distilled from the run's newest implement_security_findings
+	// entry; nil (field omitted) when the run has no findings, the read
+	// fails (best-effort — warn and omit, never fail the read), or no audit
+	// repo is wired.
+	resp.SecurityFindings = s.securityFindingsForRun(r.Context(), runID)
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// securityFindingsForRun distills the run's unresolved high-severity
+// code-scanning findings (#1096) from the newest implement_security_findings
+// audit entry. The webhook ingest records ONE idempotent entry per scan,
+// floored on the latest fix-up, so the newest entry reflects the current
+// scan state: a clean re-scan after a fix-up records an entry with no
+// findings, which surfaces as an omitted field. Returns nil — the
+// security_findings field is omitted — when the AuditRepo is unconfigured,
+// the lookup fails (warn-logged, best-effort), the run has had no scan, or
+// the newest entry carries no findings. A read failure degrades to omitted
+// rather than failing the run read, matching the Concerns / drive-surface
+// posture.
+func (s *Server) securityFindingsForRun(ctx context.Context, runID uuid.UUID) []securityFindingPayload {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, securityscan.AuditCategorySecurityFindings)
+	if err != nil {
+		s.cfg.Logger.Warn("list security findings failed; omitting security_findings block",
+			"run_id", runID.String(), "error", err.Error())
+		return nil
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	// Newest wins: ListForRunByCategory returns the per-run chain
+	// sequence-ascending, so the last entry is the most-recent scan.
+	newest := entries[len(entries)-1]
+	var payload securityFindingsAuditPayload
+	if err := json.Unmarshal(newest.Payload, &payload); err != nil {
+		// A corrupt/undecodable payload degrades to omitted rather than
+		// surfacing a half-decoded list — the gate (slice 3) is the
+		// authoritative fail-open signal; the surface stays quiet.
+		s.cfg.Logger.Warn("decode security findings payload failed; omitting security_findings block",
+			"run_id", runID.String(), "error", err.Error())
+		return nil
+	}
+	if len(payload.Findings) == 0 {
+		return nil
+	}
+	out := make([]securityFindingPayload, 0, len(payload.Findings))
+	for _, f := range payload.Findings {
+		out = append(out, securityFindingPayload{
+			Number:      f.Number,
+			RuleID:      f.RuleID,
+			Description: f.Description,
+			Severity:    f.Severity,
+			State:       f.State,
+			Path:        f.Path,
+			StartLine:   f.StartLine,
+			HTMLURL:     f.HTMLURL,
+		})
+	}
+	return out
 }
 
 // fixupModelForRun distills the run's most-recent fix-up model pin (#1164)

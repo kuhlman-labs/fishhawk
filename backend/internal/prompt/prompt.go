@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
 )
 
 // defaultStageTimeoutMinutes mirrors spec.DefaultStageTimeout (15 minutes,
@@ -352,6 +353,20 @@ type Trigger struct {
 	// (run 07bce059). Nil (older bundles, no gate ran, extraction error)
 	// omits the section and keeps the prompt byte-identical to today.
 	GateEvidence *GateEvidence
+
+	// SecurityFindings carries the high-severity GitHub code-scanning
+	// (CodeQL/SAST) alerts that intersect the implement diff (#1096),
+	// surfaced into the implement-review prompt as a SEPARATE signal from
+	// the review-verdict concerns so a security finding routes its own
+	// fix-up pass without consuming a design-concern budget uninformed.
+	// Each entry is a securityscan.Finding (the cross-slice contract type
+	// the webhook ingest records and the merge gate reads). When non-empty,
+	// buildImplementReview renders a "### Security findings" section naming
+	// each finding (severity, rule, path:line, link). Empty/nil (no scan
+	// landed, a clean re-scan after a fix-up, or any non-implement-review
+	// build) omits the section, keeping the prompt byte-identical to the
+	// pre-#1096 output.
+	SecurityFindings []securityscan.Finding
 
 	// ImplementRunID and ImplementStageID are the run/stage UUIDs of the
 	// implement stage being dispatched (#1153). Populated ONLY for implement-
@@ -1798,6 +1813,15 @@ func buildImplementReview(t Trigger) string {
 		writeGateEvidence(&b, t.GateEvidence)
 	}
 
+	// Security-findings section (#1096). High-severity code-scanning
+	// (CodeQL/SAST) alerts intersecting the implement diff are a SEPARATE
+	// signal from the review-verdict concerns: a finding routes its own
+	// fix-up pass and must not be folded into a design-concern judgment.
+	// Guarded by len>0, so a run with no findings (the common case, a clean
+	// scan, or a clean re-scan after a fix-up) omits the section and keeps
+	// the prompt byte-identical to the pre-#1096 output.
+	writeSecurityFindings(&b, t)
+
 	// Scope-amended-at-approval section (#829). Paths the operator authorized
 	// at approval time — via an approval condition (#730) or the structured
 	// add_scope_files fold (#824) — that are NOT in the plan's raw scope.files.
@@ -2078,6 +2102,49 @@ func writeSupplementalReinvokeReview(b *strings.Builder, t Trigger) {
 		"or incorrect reason; record each as a `high`-severity `{category: \"scope\"}` concern.\n\n")
 
 	b.WriteString("Emit your verdict now. Remember: JSON only, no surrounding prose.\n")
+}
+
+// writeSecurityFindings renders the "### Security findings" section of the
+// implement-review prompt (#1096): the high-severity code-scanning
+// (CodeQL/SAST) alerts that intersect the implement diff. It is a SEPARATE
+// signal from the review-verdict concerns — a security finding is held by
+// its own merge gate (security_findings_unresolved) and routes its own
+// fix-up pass, so it must never be folded into a design-concern judgment or
+// counted against the review-concern budget. Guarded by len>0: a run with no
+// findings (no scan yet, a clean scan, or a clean re-scan after a fix-up)
+// omits the section entirely, keeping the prompt byte-identical to today.
+func writeSecurityFindings(b *strings.Builder, t Trigger) {
+	if len(t.SecurityFindings) == 0 {
+		return
+	}
+	b.WriteString("### Security findings (code-scanning alerts on the diff — a SEPARATE signal)\n\n")
+	b.WriteString("GitHub code-scanning (CodeQL/SAST) reported the high-severity alert(s) below on files this " +
+		"implement stage changed. These are a SEPARATE signal from the design/correctness concerns you record: a " +
+		"security finding is held by its own merge gate and routed to its own fix-up pass, so do NOT fold it into a " +
+		"review-verdict concern and do NOT let it consume a design-concern judgment. Note them so the reviewer and " +
+		"operator see them at the review gate rather than first at merge:\n\n")
+	for _, f := range t.SecurityFindings {
+		loc := f.Path
+		if loc != "" && f.StartLine > 0 {
+			loc = fmt.Sprintf("%s:%d", f.Path, f.StartLine)
+		}
+		severity := f.Severity
+		if severity == "" {
+			severity = "unknown"
+		}
+		fmt.Fprintf(b, "- [%s] %s", severity, f.RuleID)
+		if loc != "" {
+			fmt.Fprintf(b, " — %s", loc)
+		}
+		if f.Description != "" {
+			fmt.Fprintf(b, " — %s", f.Description)
+		}
+		if f.HTMLURL != "" {
+			fmt.Fprintf(b, " (%s)", f.HTMLURL)
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
 }
 
 // writeGateEvidence renders the "### Gate evidence" section of the
