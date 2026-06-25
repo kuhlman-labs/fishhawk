@@ -502,6 +502,12 @@ func TestAdvance_DispatchesNextAgentStage(t *testing.T) {
 	if call.Inputs["run_id"] != r.ID.String() {
 		t.Errorf("inputs.run_id = %q", call.Inputs["run_id"])
 	}
+	// #1227: a non-decomposed run carries no parent_run_id, so the customer
+	// workflow's concurrency group falls back to a per-run unique key and never
+	// serializes.
+	if got, ok := call.Inputs["parent_run_id"]; ok {
+		t.Errorf("non-decomposed run set parent_run_id=%q, want it absent", got)
+	}
 	if call.Inputs["stage_id"] != stages[1].ID.String() {
 		t.Errorf("inputs.stage_id = %q", call.Inputs["stage_id"])
 	}

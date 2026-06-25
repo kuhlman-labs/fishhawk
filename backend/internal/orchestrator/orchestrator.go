@@ -1927,13 +1927,24 @@ func (o *Orchestrator) fireDispatch(ctx context.Context, r *run.Run, next *run.S
 		)
 	}
 
-	return o.GitHub.DispatchWorkflow(ctx, *r.InstallationID, repo,
-		actionsFile, ref, githubclient.DispatchInputs{
-			"run_id":      r.ID.String(),
-			"stage_id":    next.ID.String(),
-			"workflow_id": r.WorkflowID,
-			"stage":       next.ExecutorRef,
-		})
+	inputs := githubclient.DispatchInputs{
+		"run_id":      r.ID.String(),
+		"stage_id":    next.ID.String(),
+		"workflow_id": r.WorkflowID,
+		"stage":       next.ExecutorRef,
+	}
+	// #1227: a decomposed child carries its decomposition-parent id so the
+	// customer workflow can key an Actions `concurrency:` group on the run
+	// FAMILY and queue/serialize sibling child jobs as a runner-capacity guard
+	// (complements the backend dispatch cap, FISHHAWKD_MAX_PARALLEL_CHILDREN).
+	// DecomposedFrom (the fan-out parent), NOT ParentRunID (retry/related-run
+	// threading), is the sibling family. A non-decomposed run omits the input,
+	// so the workflow's group falls back to a per-run unique key (no
+	// serialization). Empty when DecomposedFrom is nil.
+	if r.DecomposedFrom != nil {
+		inputs["parent_run_id"] = r.DecomposedFrom.String()
+	}
+	return o.GitHub.DispatchWorkflow(ctx, *r.InstallationID, repo, actionsFile, ref, inputs)
 }
 
 func (o *Orchestrator) logger() *slog.Logger {
