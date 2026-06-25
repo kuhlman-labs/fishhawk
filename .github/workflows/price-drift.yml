@@ -1,0 +1,61 @@
+# Daily LiteLLM price drift-check (#1335, ADR-044 decision 1).
+#
+# Runs the pure pricing.CheckDrift (via pricing/cmd/price-drift) against the
+# PINNED LiteLLM price dataset and opens/updates a tracking issue on real
+# drift. WARN-not-fail: this is an advisory alarm and never blocks a build —
+# the manual pricing table stays source of truth, and the internal
+# completeness invariant (every live model id priced) is a separate hard CI
+# FAIL in pricing_test.go.
+#
+# Gating: the cmd emits `high_severity`, `has_drift` (warn/high, EXCLUDING the
+# persistent no_reference provenance gaps), and `has_findings`. We gate on
+# `has_drift` so the healthy baseline (which always carries a no_reference
+# finding, e.g. gpt-5.5 cache_write that LiteLLM leaves null) never false-alarms.
+name: Price drift-check
+
+on:
+  schedule:
+    - cron: '17 6 * * *' # daily 06:17 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: price-drift
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    name: LiteLLM price drift-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: pricing/go.mod
+          cache: false # pricing is stdlib-only (no go.sum to cache)
+      - name: Run drift-check
+        id: drift
+        working-directory: pricing
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./cmd/price-drift | tee "$RUNNER_TEMP/drift.md"
+      - name: Open/update tracking issue on drift
+        if: steps.drift.outputs.has_drift == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HIGH: ${{ steps.drift.outputs.high_severity }}
+          TITLE: 'Pricing drift: LiteLLM cross-check'
+        shell: bash
+        run: |
+          set -euo pipefail
+          num="$(gh issue list --state open --search "in:title \"$TITLE\"" \
+                  --json number,title --jq "map(select(.title==\"$TITLE\"))[0].number // empty")"
+          if [ -n "$num" ]; then
+            gh issue comment "$num" --body-file "$RUNNER_TEMP/drift.md"
+          elif [ "$HIGH" = "true" ]; then
+            gh issue create --title "$TITLE" --label "area:backend" --body-file "$RUNNER_TEMP/drift.md"
+          fi
