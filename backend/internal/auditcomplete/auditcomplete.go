@@ -2,9 +2,10 @@
 // `fishhawk_audit_complete` blocking check (#229). The check fails
 // when the audit story for a run isn't intact: a missing plan
 // artifact, a missing trace bundle, a missing pull_request
-// artifact, or a tampered/missing audit-chain link. The reviewer
-// can't approve until everything Fishhawk claims to record actually
-// landed.
+// artifact, a tampered/missing audit-chain link, or an unresolved
+// high-severity code-scanning finding on the implement diff (#1096).
+// The reviewer can't approve until everything Fishhawk claims to
+// record actually landed.
 //
 // Scope:
 //   - Read-only. Compute pulls from the run, artifact, and audit
@@ -69,7 +70,58 @@ const (
 	// green while a dispatched agent review is still in-flight. ADR-027's
 	// advisory verdict stays non-blocking: ANY terminal kind clears this.
 	MissingReviewPending MissingKind = "review_pending"
+	// MissingSecurityFindings holds the merge gate while unresolved
+	// high-severity GitHub code-scanning (CodeQL/SAST) findings intersect the
+	// implement diff (#1096). The token mirrors the securityscan cross-slice
+	// contract; see the Finding/AuditCategorySecurityFindings declarations below
+	// for why it is defined locally in this slice. Unlike the pending-flavored
+	// kinds this is a HARD gate hold (State=fail): a real finding is a genuine
+	// audit gap that must be routed through fixup_stage, not a "wait". Findings
+	// are a separate signal from review-verdict design concerns and must not
+	// consume a design-concern fixup pass.
+	MissingSecurityFindings MissingKind = "security_findings_unresolved"
+	// MissingSecurityScanReadFailed is the pending-flavored kind emitted when
+	// the securityscan audit entries can't be read or decoded (#1096). Mirrors
+	// head_fetch_failed exactly: a transient read/decode failure must NOT flip
+	// the gate to a hard fail (a flapping store would red-line every run), but
+	// it must ALSO never silently open the gate — so it demotes the overall
+	// state to pending (see onlyPendingFlavored) and branch protection re-
+	// evaluates on the next successful publish.
+	MissingSecurityScanReadFailed MissingKind = "security_findings_read_failed"
 )
+
+// Finding is the high-severity code-scanning finding the webhook slice records
+// and the merge gate reads (#1096). It is the cross-slice contract between the
+// securityscan recorder and this gate. The recorder lives in a sibling slice
+// (backend/internal/securityscan) that is out of this slice's scope, so the
+// contract is declared here as the consuming end: the recorder writes, and the
+// surface (run-status) and this gate read, the identical JSON shape. The field
+// tags ARE the wire contract — keep them in lockstep with the recorder.
+type Finding struct {
+	Number      int    `json:"number"`
+	RuleID      string `json:"rule_id"`
+	Severity    string `json:"severity"`
+	Description string `json:"description"`
+	Path        string `json:"path"`
+	Line        int    `json:"line"`
+	State       string `json:"state"`
+	URL         string `json:"url"`
+}
+
+// AuditCategorySecurityFindings is the audit category the webhook slice records
+// the filtered high-severity findings under (#1096). Distinct from the review-
+// verdict category ("implement_reviewed") so a finding never consumes a design-
+// concern fix-up pass. Declared here alongside Finding for the same reason.
+const AuditCategorySecurityFindings = "implement_security_findings"
+
+// categoryStageFixupTriggered is the audit category the fix-up handler writes
+// when it routes review concerns back to the implement agent (server.Category
+// StageFixupTriggered). Duplicated here as a literal — like the "trace_uploaded"
+// / "implement_review_started" literals above and the parseRepo helper — to
+// keep auditcomplete import-free of the higher server layer. The securityscan
+// rule floors to the LATEST such entry so a clean re-scan published after a
+// fix-up clears the gate.
+const categoryStageFixupTriggered = "stage_fixup_triggered"
 
 // TerminalImplementReviewCategories is the set of audit categories that count
 // as a settled agent implement-review verdict (#947 / ADR-027). ANY of them
@@ -333,12 +385,22 @@ func Compute(ctx context.Context, runID uuid.UUID, deps Deps) (stagecheck.State,
 		}
 	}
 
-	// Decide overall state. A `head_fetch_failed` or `review_pending` item
-	// is pending-flavored — if the missing list holds ONLY such items, the
-	// audit isn't broken: we either couldn't verify the drift rule against
-	// a live source, or a dispatched agent review simply hasn't landed yet.
-	// State stays pending so branch protection re-evaluates on a successful
-	// follow-up publish rather than tripping a misleading red.
+	// Rule 7: hold the gate while unresolved high-severity code-scanning
+	// (CodeQL/SAST) findings intersect the implement diff (#1096). Reads the
+	// securityscan audit entry the webhook records, floored to the latest
+	// fix-up so a clean re-scan clears the gate. Self-guarding: a run with no
+	// recorded findings (the common case, and every non-implement workflow)
+	// no-ops. Read/decode failures fail OPEN (pending-flavored), never a hard
+	// Compute error and never a silently-open gate — see rule5's posture.
+	securityFindingsRule(ctx, deps, runID, &missing)
+
+	// Decide overall state. A `head_fetch_failed`, `review_pending`, or
+	// `security_findings_read_failed` item is pending-flavored — if the missing
+	// list holds ONLY such items, the audit isn't broken: we either couldn't
+	// verify the drift rule against a live source, a dispatched agent review
+	// simply hasn't landed yet, or we couldn't read the security-findings
+	// signal. State stays pending so branch protection re-evaluates on a
+	// successful follow-up publish rather than tripping a misleading red.
 	switch {
 	case len(missing) == 0:
 		return stagecheck.StatePass, nil, nil
@@ -408,6 +470,137 @@ func reviewPendingRule(ctx context.Context, deps Deps, runID uuid.UUID, implemen
 			"implement stage %s: %d/%d configured agent implement-review(s) settled; review has not landed yet",
 			shortID(implementStage.ID), terminalCount, cfg.Agent),
 	}, nil
+}
+
+// securityFindingsRule implements Compute's rule 7 (#1096): hold the merge
+// gate while unresolved high-severity code-scanning findings intersect the
+// implement diff. The webhook slice records ONE securityscan audit entry per
+// scan (category securityscan.AuditCategorySecurityFindings) already reduced
+// to the high-severity findings that intersect the diff — a SEPARATE signal
+// from review-verdict concern entries, so it never consumes a design-concern
+// fix-up pass. This rule:
+//
+//   - floors to the latest stage_fixup_triggered: only a finding entry
+//     recorded AFTER the most recent fix-up gates, so a clean re-scan published
+//     after a fix-up clears the gate;
+//   - holds the gate (a MissingSecurityFindings item → State=fail) when the
+//     newest post-floor entry carries one or more findings;
+//   - fails OPEN on a read/decode error — a pending-flavored
+//     MissingSecurityScanReadFailed item, never a hard Compute error and never
+//     a silently-open gate (mirrors rule5's head_fetch_failed posture).
+//
+// Appends to out; never returns an error. The I/O is unconditional (deps.Audit
+// is always wired); a run with no recorded findings reads an empty list and
+// no-ops, so non-implement workflows and pre-scan runs pass cleanly.
+func securityFindingsRule(ctx context.Context, deps Deps, runID uuid.UUID, out *[]MissingItem) {
+	// Floor: the latest fix-up's sequence. A finding recorded at or before
+	// this point was the subject of (or predates) a fix-up and must not gate;
+	// a clean re-scan recorded after it clears the prior finding.
+	fixups, err := deps.Audit.ListForRunByCategory(ctx, runID, categoryStageFixupTriggered)
+	if err != nil {
+		*out = append(*out, MissingItem{
+			Kind:   MissingSecurityScanReadFailed,
+			Detail: fmt.Sprintf("could not read %s audit entries: %v", categoryStageFixupTriggered, err),
+		})
+		return
+	}
+	var floor int64
+	for _, e := range fixups {
+		if e.Sequence > floor {
+			floor = e.Sequence
+		}
+	}
+
+	entries, err := deps.Audit.ListForRunByCategory(ctx, runID, AuditCategorySecurityFindings)
+	if err != nil {
+		*out = append(*out, MissingItem{
+			Kind:   MissingSecurityScanReadFailed,
+			Detail: fmt.Sprintf("could not read %s audit entries: %v", AuditCategorySecurityFindings, err),
+		})
+		return
+	}
+
+	// The newest finding entry recorded strictly after the floor is
+	// authoritative; a fix-up-then-clean-re-scan cycle floors out the prior
+	// (now-stale) finding entry.
+	var latest *audit.Entry
+	for _, e := range entries {
+		if e.Sequence <= floor {
+			continue
+		}
+		if latest == nil || e.Sequence > latest.Sequence {
+			latest = e
+		}
+	}
+	if latest == nil {
+		// No finding recorded after the latest fix-up — nothing unresolved.
+		return
+	}
+
+	findings, err := decodeSecurityFindings(latest.Payload)
+	if err != nil {
+		// Corrupt/unexpected payload: fail OPEN. Decoding to "no findings"
+		// here would silently open the gate on bad data — forbidden.
+		*out = append(*out, MissingItem{
+			Kind:   MissingSecurityScanReadFailed,
+			Detail: fmt.Sprintf("could not decode %s audit payload: %v", AuditCategorySecurityFindings, err),
+		})
+		return
+	}
+	if len(findings) == 0 {
+		// A clean re-scan recorded an empty finding set — gate clears.
+		return
+	}
+
+	*out = append(*out, MissingItem{
+		Kind: MissingSecurityFindings,
+		Detail: fmt.Sprintf(
+			"%d unresolved high-severity code-scanning finding(s) intersect the implement diff (e.g. %s); route via fixup_stage",
+			len(findings), describeFinding(findings[0])),
+	})
+}
+
+// securityFindingsPayload is the envelope the webhook slice records the
+// filtered findings under (#1096). The findings live under a "findings" key so
+// the recorded entry can carry scan metadata alongside without ambiguity. This
+// is the load-bearing cross-slice contract: the recorder (webhook) and the
+// surface (run-status) decode the identical shape, and slice 5's end-to-end
+// test crosses the seam to catch a mismatch.
+type securityFindingsPayload struct {
+	Findings []Finding `json:"findings"`
+}
+
+// decodeSecurityFindings extracts the recorded findings from a securityscan
+// audit entry's payload. An empty payload decodes to zero findings (a clean
+// scan). A malformed payload returns an error so the caller fails OPEN rather
+// than silently treating a decode failure as "no findings" — which would open
+// the merge gate on corrupt data.
+func decodeSecurityFindings(payload []byte) ([]Finding, error) {
+	if len(payload) == 0 {
+		return nil, nil
+	}
+	var p securityFindingsPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return nil, err
+	}
+	return p.Findings, nil
+}
+
+// describeFinding renders a one-line human pointer (rule + location) for the
+// merge-gate detail so a reviewer sees what to fix without opening the run.
+func describeFinding(f Finding) string {
+	loc := f.Path
+	if loc != "" && f.Line > 0 {
+		loc = fmt.Sprintf("%s:%d", f.Path, f.Line)
+	}
+	switch {
+	case f.RuleID != "" && loc != "":
+		return fmt.Sprintf("%s at %s", f.RuleID, loc)
+	case f.RuleID != "":
+		return f.RuleID
+	default:
+		return loc
+	}
 }
 
 // rule5 implements the foreign-commit detection. Appends missing
@@ -601,13 +794,18 @@ func shortSHA(sha string) string {
 
 // onlyPendingFlavored returns true when every entry in `missing` is a
 // pending-flavored row — `head_fetch_failed` (we couldn't read the live
-// PR HEAD) or `review_pending` (a dispatched agent review hasn't landed
-// yet). Used to demote the overall state from fail to pending: neither is
-// an audit GAP, just "wait / we don't know." A mix with any hard gap
-// (plan_missing, trace_missing, foreign_commit, …) still fails.
+// PR HEAD), `review_pending` (a dispatched agent review hasn't landed
+// yet), or `security_findings_read_failed` (we couldn't read/decode the
+// code-scanning signal, #1096). Used to demote the overall state from fail
+// to pending: none is an audit GAP, just "wait / we don't know." A mix with
+// any hard gap (plan_missing, trace_missing, foreign_commit,
+// security_findings_unresolved, …) still fails.
 func onlyPendingFlavored(missing []MissingItem) bool {
 	for _, m := range missing {
-		if m.Kind != MissingHeadFetchFail && m.Kind != MissingReviewPending {
+		switch m.Kind {
+		case MissingHeadFetchFail, MissingReviewPending, MissingSecurityScanReadFailed:
+			// pending-flavored — keep scanning
+		default:
 			return false
 		}
 	}

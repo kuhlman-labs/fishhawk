@@ -535,6 +535,221 @@ func TestCompute_Rule6_NilClosuresSkip(t *testing.T) {
 	}
 }
 
+// --- Rule 7 (security findings, #1096) ---
+
+// highSeverityFinding is a representative recorded finding intersecting the
+// implement diff — the go/allocation-size-overflow false positive that both
+// reviewers approved past on #1005/#1004, the case that motivated the gate.
+func highSeverityFinding() auditcomplete.Finding {
+	return auditcomplete.Finding{
+		Number:      42,
+		RuleID:      "go/allocation-size-overflow",
+		Severity:    "high",
+		Description: "Allocation size overflow",
+		Path:        "backend/internal/server/runs.go",
+		Line:        128,
+		State:       "open",
+		URL:         "https://github.com/kuhlman-labs/fishhawk/security/code-scanning/42",
+	}
+}
+
+// securityFindingPayload renders the recorded securityscan audit entry's
+// envelope: the cross-slice {"findings": [...]} shape the webhook writes and
+// both the merge gate and the surface read.
+func securityFindingPayload(findings ...auditcomplete.Finding) json.RawMessage {
+	b, _ := json.Marshal(struct {
+		Findings []auditcomplete.Finding `json:"findings"`
+	}{Findings: findings})
+	return b
+}
+
+func TestCompute_SecurityFindingsUnresolved_Holds(t *testing.T) {
+	// An unresolved high-severity finding recorded against the implement diff
+	// (no fix-up yet) holds the gate: State=fail with the security_findings_
+	// unresolved kind. This is the hard-fail branch.
+	runID, runs, arts, ar := happyPath(t)
+	implID := runs.stages[1].ID
+	ar.appendChained(t, runID, &implID, auditcomplete.AuditCategorySecurityFindings,
+		securityFindingPayload(highSeverityFinding()))
+
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StateFail {
+		t.Fatalf("state = %s want fail (unresolved finding holds the gate); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingSecurityFindings) {
+		t.Fatalf("missing did not include security_findings_unresolved: %+v", missing)
+	}
+	// The detail names the rule + location so a reviewer can act without
+	// opening the run.
+	var detail string
+	for _, m := range missing {
+		if m.Kind == auditcomplete.MissingSecurityFindings {
+			detail = m.Detail
+		}
+	}
+	if !strings.Contains(detail, "go/allocation-size-overflow") {
+		t.Errorf("detail should name the rule id: %s", detail)
+	}
+}
+
+func TestCompute_SecurityFindings_SeparateSignal(t *testing.T) {
+	// Findings are a SEPARATE signal from review-verdict concerns (binding
+	// invariant 3): the gate keys off the dedicated implement_security_findings
+	// category, NOT implement_reviewed. A landed review verdict carrying
+	// concerns does not synthesize a finding, and a finding is recorded under
+	// its own category — so the security rule reads exactly that category.
+	if auditcomplete.AuditCategorySecurityFindings == "implement_reviewed" {
+		t.Fatal("security findings must not share the review-verdict category")
+	}
+	runID, runs, arts, ar := happyPath(t)
+	implID := runs.stages[1].ID
+	// A review-verdict entry with concerns under the review category must NOT
+	// hold the security gate.
+	reviewPayload, _ := json.Marshal(map[string]any{"verdict": "approve_with_concerns", "concerns": []any{map[string]any{"category": "scope"}}})
+	ar.appendChained(t, runID, &implID, "implement_reviewed", reviewPayload)
+
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if containsKind(missing, auditcomplete.MissingSecurityFindings) {
+		t.Fatalf("a review-verdict concern must not register as a security finding: %+v", missing)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (review concern is not a security finding); missing=%+v", state, missing)
+	}
+}
+
+func TestCompute_SecurityFindingsClearedAfterFixup(t *testing.T) {
+	// A clean re-scan recorded AFTER the latest stage_fixup_triggered floors
+	// the prior finding and returns pass. This is the gate-clears branch and
+	// asserts the flooring-on-latest-fix-up ordering (binding invariant 4).
+	runID, runs, arts, ar := happyPath(t)
+	implID := runs.stages[1].ID
+	ar.appendChained(t, runID, &implID, auditcomplete.AuditCategorySecurityFindings,
+		securityFindingPayload(highSeverityFinding())) // stale finding
+	ar.appendChained(t, runID, &implID, "stage_fixup_triggered", nil)
+	ar.appendChained(t, runID, &implID, auditcomplete.AuditCategorySecurityFindings,
+		securityFindingPayload()) // clean re-scan, no findings
+
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (clean re-scan after fix-up clears the gate); missing=%+v", state, missing)
+	}
+	if containsKind(missing, auditcomplete.MissingSecurityFindings) {
+		t.Fatalf("stale finding before the fix-up must be floored out: %+v", missing)
+	}
+}
+
+func TestCompute_SecurityFindingsFlooredByFixup_NoRescan_Pass(t *testing.T) {
+	// A finding recorded BEFORE the latest fix-up with no re-scan yet is
+	// floored out: the absence of a post-fix-up finding entry is "nothing
+	// unresolved" (pass), not a held gate. The gate re-holds only when a new
+	// scan records a post-fix-up finding. Covers the latest==nil branch.
+	runID, runs, arts, ar := happyPath(t)
+	implID := runs.stages[1].ID
+	ar.appendChained(t, runID, &implID, auditcomplete.AuditCategorySecurityFindings,
+		securityFindingPayload(highSeverityFinding()))
+	ar.appendChained(t, runID, &implID, "stage_fixup_triggered", nil)
+
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (finding floored, no re-scan recorded); missing=%+v", state, missing)
+	}
+}
+
+func TestCompute_SecurityFindingsReadError_PendingNotFail(t *testing.T) {
+	// A read failure on the securityscan category must fail OPEN: a pending-
+	// flavored security_findings_read_failed item, overall state pending (not
+	// fail, never a hard Compute error). Mirrors rule5's head_fetch_failed.
+	runID, runs, arts, ar := happyPath(t)
+	ar.catErr = map[string]error{
+		auditcomplete.AuditCategorySecurityFindings: errors.New("audit store down"),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute should not hard-error on a security read failure: %v", err)
+	}
+	if state != stagecheck.StatePending {
+		t.Fatalf("state = %s want pending (security read failure fails OPEN); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingSecurityScanReadFailed) {
+		t.Fatalf("missing did not include security_findings_read_failed: %+v", missing)
+	}
+}
+
+func TestCompute_SecurityFindings_FixupListError_PendingNotFail(t *testing.T) {
+	// The floor read (stage_fixup_triggered) failing must ALSO fail OPEN, not
+	// hard-error and not silently gate — the floor read is a distinct branch
+	// from the findings read.
+	runID, runs, arts, ar := happyPath(t)
+	ar.catErr = map[string]error{
+		"stage_fixup_triggered": errors.New("audit store down"),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute should not hard-error on a fix-up read failure: %v", err)
+	}
+	if state != stagecheck.StatePending {
+		t.Fatalf("state = %s want pending (fix-up read failure fails OPEN); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingSecurityScanReadFailed) {
+		t.Fatalf("missing did not include security_findings_read_failed: %+v", missing)
+	}
+}
+
+func TestCompute_SecurityFindingsDecodeError_PendingNotFail(t *testing.T) {
+	// A malformed recorded payload (a JSON array where the {"findings": [...]}
+	// envelope is expected) must fail OPEN, NOT decode to "no findings" and
+	// silently open the gate. Distinct branch from the list-read errors.
+	runID, runs, arts, ar := happyPath(t)
+	implID := runs.stages[1].ID
+	ar.appendChained(t, runID, &implID, auditcomplete.AuditCategorySecurityFindings,
+		json.RawMessage(`[{"rule_id":"go/allocation-size-overflow"}]`))
+
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute should not hard-error on a decode failure: %v", err)
+	}
+	if state != stagecheck.StatePending {
+		t.Fatalf("state = %s want pending (decode failure fails OPEN); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingSecurityScanReadFailed) {
+		t.Fatalf("missing did not include security_findings_read_failed: %+v", missing)
+	}
+}
+
+func TestCompute_SecurityFindingsReadFailed_IsPendingFlavored(t *testing.T) {
+	// security_findings_read_failed must be in onlyPendingFlavored's allowed
+	// set so it demotes (not fails) the gate even when it is the ONLY miss,
+	// AND must not mask a co-occurring HARD gap. Pairing it with a real
+	// plan_missing gap must still fail.
+	runID, runs, arts, ar := happyPath(t)
+	delete(arts.byStage, runs.stages[0].ID) // plan_missing: a hard gap
+	ar.catErr = map[string]error{
+		auditcomplete.AuditCategorySecurityFindings: errors.New("audit store down"),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StateFail {
+		t.Fatalf("state = %s want fail (a hard plan_missing gap is not masked by the pending read item); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingSecurityScanReadFailed) || !containsKind(missing, auditcomplete.MissingPlan) {
+		t.Fatalf("expected both security_findings_read_failed and plan_missing: %+v", missing)
+	}
+}
+
 // stubPRHead returns a PRHeadFetcher that always returns `(headSHA,
 // err)`. Captures the input args in t.Log so a failing test can show
 // what was asked.
@@ -839,6 +1054,10 @@ func (f *fakeArtifacts) ListForStage(_ context.Context, stageID uuid.UUID) ([]*a
 type fakeAudit struct {
 	audit.Repository
 	entries []*audit.Entry
+	// catErr injects an error for ListForRunByCategory calls on a specific
+	// category, exercising the security-findings rule's fail-OPEN read-error
+	// branches (#1096) without disturbing the other categories' reads.
+	catErr map[string]error
 }
 
 // appendChained mirrors what the real audit.Repository.AppendChained
@@ -927,6 +1146,9 @@ func (f *fakeAudit) ListForRun(_ context.Context, runID uuid.UUID) ([]*audit.Ent
 }
 
 func (f *fakeAudit) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if err := f.catErr[category]; err != nil {
+		return nil, err
+	}
 	out := []*audit.Entry{}
 	for _, e := range f.entries {
 		if e.Category != category {
