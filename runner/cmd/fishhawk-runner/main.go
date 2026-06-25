@@ -941,6 +941,26 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// stage-wide net (LIFO), whose moved-HEAD guard then sees HEAD already
 	// restored and no-ops — the same double-fire-safe construction as the fixup
 	// block above.
+	//
+	// The guard is the REMOTE-AUTHORITATIVE remoteHasBranch (git ls-remote),
+	// NOT the local-tracking remoteBranchExists (git show-ref) the #1302 block
+	// originally used (#1363). The consolidated wave base is created on GitHub
+	// via the API during integrate-wave and is NEVER fetched into the local
+	// runner's tracking refs, so show-ref ALWAYS returned false for it: the
+	// whole block silently no-oped and a dependent slice ran against ambient
+	// HEAD (plain main) — exactly the #1363 symptom. ls-remote queries the
+	// remote directly, so the just-created base is detected immediately.
+	// remoteHasBranch returns (exists, error): a genuine branch-ABSENCE
+	// (ls-remote succeeded, empty output) gracefully skips and falls through to
+	// today's ambient-HEAD behavior (a never-pushed main, or an empty
+	// consolidated when GitHub is not wired — the #1302 degrade contract).
+	// A remote-query FAILURE (ls-remote errored) is then classified by
+	// remoteConfigured: against a CONFIGURED remote it is a transient failure
+	// (network/auth/transient) on a child that HAS an expected base, which must
+	// NOT silently degrade to skip-and-run-against-ambient-HEAD — that
+	// reintroduces the #1363 symptom — so it fails loud at child_base_checkout;
+	// against an UNCONFIGURED remote (a bare local-runner checkout with no
+	// origin) it IS the GitHub-not-wired degrade state and skips like an absence.
 	if stageType == "implement" && cfg.decomposedFromRunID != "" && !cfg.fixup {
 		repoDir := cfg.workingDir
 		if repoDir == "" {
@@ -950,7 +970,24 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		if baseRef == "" {
 			baseRef = resolveImplementBaseRef(cfg)
 		}
-		if remoteBranchExists(ctx, repoDir, baseRef) {
+		baseExists, rhErr := remoteHasBranch(ctx, repoDir, gitops.DefaultRemote, baseRef)
+		if rhErr != nil {
+			// A remote-query FAILURE splits two ways. Against a CONFIGURED remote
+			// it is a genuine transient failure (network/auth/SSH-agent drop) on a
+			// child with an expected wave base — fail loud rather than silently
+			// degrade to ambient HEAD (#1363). But against a remote that is NOT
+			// configured at all — a bare local-runner checkout with no origin —
+			// the failure is the "GitHub not wired" degrade state (#1302), which
+			// must gracefully skip to ambient HEAD exactly like a genuine
+			// branch-absence (false, nil). remoteConfigured is the discriminator.
+			if remoteConfigured(ctx, repoDir, gitops.DefaultRemote) {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"runner_failed","reason":"child_base_checkout","detail":%q}`+"\n", rhErr.Error())
+				return exitFailure
+			}
+			baseExists = false
+		}
+		if baseExists {
 			childCheckoutMoved := false
 			if preAgentCaptured {
 				defer func() {
@@ -3744,6 +3781,32 @@ var (
 		cmd.Dir = repoDir
 		return cmd.Run() == nil
 	}
+
+	// remoteHasBranch is the REMOTE-AUTHORITATIVE branch-existence seam used by
+	// the wave-N decomposed-child base-establishment block (#1363). Unlike
+	// remoteBranchExists (git show-ref against refs/remotes/origin/<branch> —
+	// LOCAL tracking refs only), it queries the actual remote via git
+	// ls-remote, so the consolidated wave base — created on GitHub via the API
+	// during integrate-wave and NEVER fetched into local tracking refs — is
+	// seen immediately. Wired DIRECTLY to gitops.RemoteHasBranch (no closure)
+	// so the #1363 wiring/identity test can assert it has not silently reverted
+	// to the local-tracking show-ref guard (which would reintroduce the
+	// wave-N-on-main defect). It returns (exists, error): the wave-base block
+	// treats a query ERROR as fail-loud (a transient ls-remote failure must NOT
+	// degrade to running a dependent slice against ambient HEAD), distinct from
+	// a successful empty result (branch genuinely absent → graceful skip,
+	// preserving the #1302 degrade contract).
+	remoteHasBranch = gitops.RemoteHasBranch
+
+	// remoteConfigured is the not-wired-vs-transient discriminator the wave-base
+	// block consults ONLY when remoteHasBranch errors (#1363). A remoteHasBranch
+	// failure against a remote that is NOT configured — a bare local-runner
+	// checkout with no origin — is the "GitHub not wired" degrade state (#1302),
+	// which must gracefully skip to ambient HEAD, NOT fail loud; a transient
+	// failure against a CONFIGURED remote stays fail-loud. A package-level var
+	// for the same reason as remoteHasBranch: fake-pusher run() tests default
+	// repoDir to "." and must never probe the runner's own source repo.
+	remoteConfigured = gitops.RemoteConfigured
 
 	// ghAuthToken sources a GitHub token from the operator's local `gh`
 	// CLI, used as the push + PR fallback when the run has no attributed
