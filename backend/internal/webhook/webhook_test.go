@@ -191,3 +191,32 @@ func TestErrors_Distinct(t *testing.T) {
 		}
 	}
 }
+
+// TestParseEvent_CodeScanningAlert_PreservesRawBodyForMatcher pins the
+// receiver → matcher contract for the #1096 event: ParseEvent surfaces
+// the common envelope fields AND keeps RawBody intact, because
+// matchCodeScanningAlert re-decodes commit_oid / alert.number from the
+// raw payload (the minimal envelope doesn't carry those).
+func TestParseEvent_CodeScanningAlert_PreservesRawBodyForMatcher(t *testing.T) {
+	body := []byte(`{"action":"created",` +
+		`"alert":{"number":12},` +
+		`"ref":"refs/heads/main",` +
+		`"commit_oid":"deadbeefcafe",` +
+		`"repository":{"full_name":"kuhlman-labs/fishhawk"},` +
+		`"installation":{"id":42},` +
+		`"sender":{"login":"alice","type":"User"}}`)
+	ev, err := ParseEvent("code_scanning_alert", "deliv-cs", body)
+	if err != nil {
+		t.Fatalf("ParseEvent: %v", err)
+	}
+	if ev.Repo != "kuhlman-labs/fishhawk" || ev.InstallationID != 42 {
+		t.Fatalf("envelope = %q/%d, want kuhlman-labs/fishhawk/42", ev.Repo, ev.InstallationID)
+	}
+	m := MatchEvent(ev)
+	if m.Skip || m.Action != MatchActionCodeScanningAlert {
+		t.Fatalf("MatchEvent = skip=%v action=%q, want code_scanning_alert action", m.Skip, m.Action)
+	}
+	if m.CodeScanningRef == nil || m.CodeScanningRef.HeadSHA != "deadbeefcafe" || m.CodeScanningRef.AlertNumber != 12 {
+		t.Fatalf("CodeScanningRef = %+v, want head=deadbeefcafe number=12", m.CodeScanningRef)
+	}
+}

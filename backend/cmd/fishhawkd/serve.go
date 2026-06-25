@@ -718,7 +718,12 @@ func runServe(args []string, logSink io.Writer) int {
 			Runs:      cfg.RunRepo,
 			Audit:     cfg.AuditRepo,
 			Artifacts: cfg.ArtifactRepo,
-			Logger:    logger,
+			// CodeScanning (the code_scanning_alert handler, #1096) is
+			// left unwired for now: the live client method that satisfies
+			// CodeScanningAPI.ListCodeScanningAlerts is not yet available,
+			// so the security-findings path stays off (the handler's
+			// documented nil-degraded "no-finding" posture) until it lands.
+			Logger: logger,
 			// Route the webhook surfaces through the Channel abstraction
 			// too (ADR-015 #79): the Router satisfies the dispatcher's
 			// narrower webhook.IssueNotifier subset and fans out to the v0

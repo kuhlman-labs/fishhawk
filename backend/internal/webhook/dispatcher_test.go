@@ -750,6 +750,41 @@ type stubGitHub struct {
 	rulesetsErr    error
 	rulesetsCalls  int
 	rulesetsBranch string
+
+	// codeScanningAlerts / err drive ListCodeScanningAlerts (#1096).
+	codeScanningAlerts     []Finding
+	codeScanningAlertsErr  error
+	codeScanningAlertCalls int
+	// comparePatch / err drive ComparePatch (#1096); default returns
+	// an empty result (no changed files).
+	comparePatch      *githubclient.ComparePatchResult
+	comparePatchErr   error
+	comparePatchCalls int
+}
+
+func (s *stubGitHub) ListCodeScanningAlerts(_ context.Context, _ int64,
+	_ githubclient.RepoRef, _ string) ([]Finding, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.codeScanningAlertCalls++
+	if s.codeScanningAlertsErr != nil {
+		return nil, s.codeScanningAlertsErr
+	}
+	return s.codeScanningAlerts, nil
+}
+
+func (s *stubGitHub) ComparePatch(_ context.Context, _ int64,
+	_ githubclient.RepoRef, _, _ string) (*githubclient.ComparePatchResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.comparePatchCalls++
+	if s.comparePatchErr != nil {
+		return nil, s.comparePatchErr
+	}
+	if s.comparePatch != nil {
+		return s.comparePatch, nil
+	}
+	return &githubclient.ComparePatchResult{}, nil
 }
 
 func (s *stubGitHub) GetWorkflowSpec(_ context.Context, _ int64,
@@ -1021,6 +1056,44 @@ type stubAudit struct {
 	appended       []audit.ChainAppendParams
 	globalAppended []audit.GlobalChainAppendParams
 	appendErr      error
+
+	// byCategory backs ListForRunByCategory: appended entries are
+	// indexed here (with a synthetic increasing Sequence) so the
+	// code_scanning_alert handler's idempotency read sees what it just
+	// recorded, and tests can pre-seed prior entries (fixup triggers,
+	// fixup pushes) via seedEntry. seq is the monotonic sequence
+	// counter mirroring the DB's append order.
+	byCategory      map[string][]*audit.Entry
+	seq             int64
+	listCategoryErr error
+}
+
+// seedEntry pre-populates a category with an entry at the next
+// sequence, so tests can simulate a prior stage_fixup_triggered /
+// fixup_pushed / securityscan row the handler reads back.
+func (s *stubAudit) seedEntry(runID uuid.UUID, category string, payload []byte) *audit.Entry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendLocked(runID, category, payload)
+}
+
+// appendLocked records an entry under category with the next sequence.
+// Caller holds mu.
+func (s *stubAudit) appendLocked(runID uuid.UUID, category string, payload []byte) *audit.Entry {
+	s.seq++
+	rid := runID
+	e := &audit.Entry{
+		ID:       uuid.New(),
+		RunID:    &rid,
+		Sequence: s.seq,
+		Category: category,
+		Payload:  payload,
+	}
+	if s.byCategory == nil {
+		s.byCategory = map[string][]*audit.Entry{}
+	}
+	s.byCategory[category] = append(s.byCategory[category], e)
+	return e
 }
 
 func (s *stubAudit) Append(context.Context, audit.AppendParams) (*audit.Entry, error) {
@@ -1037,8 +1110,7 @@ func (s *stubAudit) AppendChained(_ context.Context, p audit.ChainAppendParams) 
 		return nil, s.appendErr
 	}
 	s.appended = append(s.appended, p)
-	rid := p.RunID
-	return &audit.Entry{ID: uuid.New(), RunID: &rid}, nil
+	return s.appendLocked(p.RunID, p.Category, p.Payload), nil
 }
 
 func (s *stubAudit) AppendGlobalChained(_ context.Context, p audit.GlobalChainAppendParams) (*audit.Entry, error) {
@@ -1065,8 +1137,19 @@ func (s *stubAudit) ListForRun(context.Context, uuid.UUID) ([]*audit.Entry, erro
 func (s *stubAudit) LastForRun(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
-func (s *stubAudit) ListForRunByCategory(context.Context, uuid.UUID, string) ([]*audit.Entry, error) {
-	return nil, errors.New("not used")
+func (s *stubAudit) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listCategoryErr != nil {
+		return nil, s.listCategoryErr
+	}
+	var out []*audit.Entry
+	for _, e := range s.byCategory[category] {
+		if e.RunID != nil && *e.RunID == runID {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 
 // validSpec is the canonical workflow YAML used in dispatcher
@@ -3085,5 +3168,415 @@ func TestHandle_CIFailureRetry_LocalRunner_MintsChildSkipsDispatch(t *testing.T)
 	}
 	if !strings.Contains(payload, `"outcome":"dispatched"`) {
 		t.Errorf("audit payload missing outcome:dispatched: %s", payload)
+	}
+}
+
+// ---- code_scanning_alert (#1096) -----------------------------------
+
+// csFinding builds a Finding for the alert-fetch stub.
+func csFinding(number int, severity, path string) Finding {
+	return Finding{
+		Number:      number,
+		RuleID:      "go/test-rule",
+		Severity:    severity,
+		Description: "test finding",
+		Path:        path,
+		Line:        7,
+		State:       "open",
+		URL:         "https://github.com/example/alert",
+	}
+}
+
+// codeScanningAlertEvent builds a code_scanning_alert delivery whose
+// commit_oid is the analyzed head SHA.
+func codeScanningAlertEvent(t *testing.T, repo, commitOID, deliveryID string, alertNumber int) Event {
+	t.Helper()
+	raw, _ := json.Marshal(map[string]any{
+		"action":       "created",
+		"alert":        map[string]any{"number": alertNumber},
+		"ref":          "refs/heads/main",
+		"commit_oid":   commitOID,
+		"repository":   map[string]any{"full_name": repo},
+		"installation": map[string]any{"id": 42},
+		"sender":       map[string]any{"login": "alice", "type": "User"},
+	})
+	ev, err := ParseEvent("code_scanning_alert", deliveryID, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ev
+}
+
+// seedCodeScanRun inserts a non-cancelled run with an implement stage
+// carrying a pull_request artifact at (headSHA, baseSHA), the shape a
+// real implement run lands. Returns the run + implement stage.
+func seedCodeScanRun(t *testing.T, runs *stubRuns, arts *stubArtifacts, repo, headSHA, baseSHA string) (*run.Run, *run.Stage) {
+	t.Helper()
+	installID := int64(42)
+	r := &run.Run{
+		ID:             uuid.New(),
+		Repo:           repo,
+		InstallationID: &installID,
+		State:          run.StateRunning,
+		CreatedAt:      time.Now().Add(-time.Minute).UTC(),
+		UpdatedAt:      time.Now().UTC(),
+	}
+	st := &run.Stage{
+		ID:    uuid.New(),
+		RunID: r.ID,
+		Type:  run.StageTypeImplement,
+		State: run.StageStateAwaitingApproval,
+	}
+	runs.mu.Lock()
+	runs.created = append(runs.created, r)
+	runs.createdStages = append(runs.createdStages, st)
+	runs.mu.Unlock()
+	arts.add(st.ID, &artifact.Artifact{
+		ID:      uuid.New(),
+		StageID: st.ID,
+		Kind:    artifact.KindPullRequest,
+		Content: []byte(fmt.Sprintf(`{"head_sha":%q,"base_sha":%q}`, headSHA, baseSHA)),
+	})
+	return r, st
+}
+
+// securityFindingEntries returns the appended securityscan finding
+// audit rows.
+func securityFindingEntries(au *stubAudit) []audit.ChainAppendParams {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []audit.ChainAppendParams
+	for _, p := range au.appended {
+		if p.Category == AuditCategorySecurityFindings {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// changedFilesCompare is a ComparePatchResult naming the implement
+// diff's changed files, so FilterToDiffFiles has a diff to intersect.
+func changedFilesCompare(paths ...string) *githubclient.ComparePatchResult {
+	files := make([]githubclient.ComparePatchFile, 0, len(paths))
+	for _, p := range paths {
+		files = append(files, githubclient.ComparePatchFile{Path: p, Status: "modified"})
+	}
+	return &githubclient.ComparePatchResult{Files: files}
+}
+
+func TestMatchEvent_CodeScanningAlert_Matches(t *testing.T) {
+	ev := codeScanningAlertEvent(t, "kuhlman-labs/fishhawk", "deadbeef", "deliv-cs-1", 7)
+	m := MatchEvent(ev)
+	if m.Skip {
+		t.Fatalf("expected match, got skip: %s", m.Reason)
+	}
+	if m.Action != MatchActionCodeScanningAlert {
+		t.Fatalf("Action = %q, want %q", m.Action, MatchActionCodeScanningAlert)
+	}
+	if m.CodeScanningRef == nil {
+		t.Fatal("CodeScanningRef is nil")
+	}
+	if m.CodeScanningRef.HeadSHA != "deadbeef" {
+		t.Errorf("HeadSHA = %q, want deadbeef", m.CodeScanningRef.HeadSHA)
+	}
+	if m.CodeScanningRef.AlertNumber != 7 {
+		t.Errorf("AlertNumber = %d, want 7", m.CodeScanningRef.AlertNumber)
+	}
+	if m.CodeScanningRef.Ref != "refs/heads/main" {
+		t.Errorf("Ref = %q, want refs/heads/main", m.CodeScanningRef.Ref)
+	}
+}
+
+func TestMatchEvent_CodeScanningAlert_NoCommitOID_Skips(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{
+		"action":       "created",
+		"alert":        map[string]any{"number": 1},
+		"repository":   map[string]any{"full_name": "kuhlman-labs/fishhawk"},
+		"installation": map[string]any{"id": 42},
+		"sender":       map[string]any{"login": "alice", "type": "User"},
+	})
+	ev, err := ParseEvent("code_scanning_alert", "deliv-cs-nocommit", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := MatchEvent(ev)
+	if !m.Skip {
+		t.Fatalf("expected skip for missing commit_oid, got action %q", m.Action)
+	}
+}
+
+func TestMatchEvent_CodeScanningAlert_MalformedPayload_Skips(t *testing.T) {
+	ev := Event{
+		Type:           "code_scanning_alert",
+		DeliveryID:     "deliv-cs-bad",
+		Repo:           "kuhlman-labs/fishhawk",
+		SenderType:     "User",
+		InstallationID: 42,
+		RawBody:        []byte("{not json"),
+	}
+	m := MatchEvent(ev)
+	if !m.Skip {
+		t.Fatalf("expected skip for malformed payload, got action %q", m.Action)
+	}
+}
+
+func TestHandle_CodeScanningAlert_RecordsHighSeverityFinding(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	arts := &stubArtifacts{}
+	d.Artifacts = arts
+	d.CodeScanning = gh
+	repo := "kuhlman-labs/fishhawk"
+	r, st := seedCodeScanRun(t, runs, arts, repo, "headsha1", "basesha1")
+
+	gh.codeScanningAlerts = []Finding{csFinding(7, "high", "backend/main.go")}
+	gh.comparePatch = changedFilesCompare("backend/main.go")
+
+	if err := d.Handle(context.Background(), codeScanningAlertEvent(t, repo, "headsha1", "deliv-cs-1", 7)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	entries := securityFindingEntries(au)
+	if len(entries) != 1 {
+		t.Fatalf("securityscan entries = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	// Separate signal: recorded under the dedicated category, not a
+	// review-verdict concern category.
+	if e.Category != AuditCategorySecurityFindings {
+		t.Errorf("category = %q, want %q", e.Category, AuditCategorySecurityFindings)
+	}
+	if e.Category != "implement_security_findings" {
+		t.Errorf("category string = %q, want implement_security_findings", e.Category)
+	}
+	if e.RunID != r.ID {
+		t.Errorf("RunID = %s, want %s", e.RunID, r.ID)
+	}
+	if e.StageID == nil || *e.StageID != st.ID {
+		t.Errorf("StageID = %v, want %s (implement stage)", e.StageID, st.ID)
+	}
+	var payload securityFindingsPayload
+	if err := json.Unmarshal(e.Payload, &payload); err != nil {
+		t.Fatalf("payload decode: %v", err)
+	}
+	if payload.FindingCount != 1 || len(payload.Findings) != 1 {
+		t.Fatalf("finding_count=%d findings=%d, want 1/1", payload.FindingCount, len(payload.Findings))
+	}
+	if payload.Findings[0].Number != 7 || payload.Findings[0].Severity != "high" {
+		t.Errorf("finding = %+v, want number 7 / high", payload.Findings[0])
+	}
+	if payload.HeadSHA != "headsha1" || payload.BaseSHA != "basesha1" {
+		t.Errorf("payload sha = %s/%s, want headsha1/basesha1", payload.HeadSHA, payload.BaseSHA)
+	}
+}
+
+func TestHandle_CodeScanningAlert_FiltersLowSeverityAndOutOfDiff(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	arts := &stubArtifacts{}
+	d.Artifacts = arts
+	d.CodeScanning = gh
+	repo := "kuhlman-labs/fishhawk"
+	seedCodeScanRun(t, runs, arts, repo, "headsha1", "basesha1")
+
+	// One high-sev in-diff (kept), one low-sev in-diff (dropped), one
+	// high-sev out-of-diff (dropped).
+	gh.codeScanningAlerts = []Finding{
+		csFinding(1, "high", "backend/in_diff.go"),
+		csFinding(2, "low", "backend/in_diff.go"),
+		csFinding(3, "critical", "backend/untouched.go"),
+	}
+	gh.comparePatch = changedFilesCompare("backend/in_diff.go")
+
+	if err := d.Handle(context.Background(), codeScanningAlertEvent(t, repo, "headsha1", "deliv-cs-1", 1)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	entries := securityFindingEntries(au)
+	if len(entries) != 1 {
+		t.Fatalf("securityscan entries = %d, want 1", len(entries))
+	}
+	var payload securityFindingsPayload
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("payload decode: %v", err)
+	}
+	if payload.FindingCount != 1 {
+		t.Fatalf("finding_count = %d, want 1 (only the high in-diff alert gates)", payload.FindingCount)
+	}
+	if payload.Findings[0].Number != 1 {
+		t.Errorf("kept finding = %d, want 1", payload.Findings[0].Number)
+	}
+}
+
+func TestHandle_CodeScanningAlert_NoClient_Skips(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	arts := &stubArtifacts{}
+	d.Artifacts = arts
+	d.CodeScanning = nil // not wired
+	repo := "kuhlman-labs/fishhawk"
+	seedCodeScanRun(t, runs, arts, repo, "headsha1", "basesha1")
+	gh.codeScanningAlerts = []Finding{csFinding(7, "high", "backend/main.go")}
+
+	if err := d.Handle(context.Background(), codeScanningAlertEvent(t, repo, "headsha1", "deliv-cs-1", 7)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got := len(securityFindingEntries(au)); got != 0 {
+		t.Errorf("securityscan entries = %d, want 0 (client not wired)", got)
+	}
+}
+
+func TestHandle_CodeScanningAlert_NoRunMatch_Skips(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	arts := &stubArtifacts{}
+	d.Artifacts = arts
+	d.CodeScanning = gh
+	repo := "kuhlman-labs/fishhawk"
+	// Run exists but its head differs from the analyzed commit.
+	seedCodeScanRun(t, runs, arts, repo, "otherhead", "basesha1")
+	gh.codeScanningAlerts = []Finding{csFinding(7, "high", "backend/main.go")}
+	gh.comparePatch = changedFilesCompare("backend/main.go")
+
+	if err := d.Handle(context.Background(), codeScanningAlertEvent(t, repo, "headsha1", "deliv-cs-1", 7)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got := len(securityFindingEntries(au)); got != 0 {
+		t.Errorf("securityscan entries = %d, want 0 (no run owns the commit)", got)
+	}
+	if gh.codeScanningAlertCalls != 0 {
+		t.Errorf("ListCodeScanningAlerts calls = %d, want 0 (skipped before fetch)", gh.codeScanningAlertCalls)
+	}
+}
+
+func TestHandle_CodeScanningAlert_ListAlertsError_DegradesNoFinding(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	arts := &stubArtifacts{}
+	d.Artifacts = arts
+	d.CodeScanning = gh
+	repo := "kuhlman-labs/fishhawk"
+	seedCodeScanRun(t, runs, arts, repo, "headsha1", "basesha1")
+	gh.codeScanningAlertsErr = errors.New("github 503")
+
+	if err := d.Handle(context.Background(), codeScanningAlertEvent(t, repo, "headsha1", "deliv-cs-1", 7)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got := len(securityFindingEntries(au)); got != 0 {
+		t.Errorf("securityscan entries = %d, want 0 (alert read failed → no-finding)", got)
+	}
+}
+
+func TestHandle_CodeScanningAlert_ComparePatchError_Skips(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	arts := &stubArtifacts{}
+	d.Artifacts = arts
+	d.CodeScanning = gh
+	repo := "kuhlman-labs/fishhawk"
+	seedCodeScanRun(t, runs, arts, repo, "headsha1", "basesha1")
+	gh.codeScanningAlerts = []Finding{csFinding(7, "high", "backend/main.go")}
+	gh.comparePatchErr = errors.New("github 500")
+
+	if err := d.Handle(context.Background(), codeScanningAlertEvent(t, repo, "headsha1", "deliv-cs-1", 7)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got := len(securityFindingEntries(au)); got != 0 {
+		t.Errorf("securityscan entries = %d, want 0 (compare failed → cannot intersect diff)", got)
+	}
+}
+
+func TestHandle_CodeScanningAlert_Idempotent_RepeatDelivery_NoDuplicate(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	arts := &stubArtifacts{}
+	d.Artifacts = arts
+	d.CodeScanning = gh
+	repo := "kuhlman-labs/fishhawk"
+	seedCodeScanRun(t, runs, arts, repo, "headsha1", "basesha1")
+	gh.codeScanningAlerts = []Finding{csFinding(7, "high", "backend/main.go")}
+	gh.comparePatch = changedFilesCompare("backend/main.go")
+
+	// Two deliveries of the same alert state (a GitHub redelivery).
+	if err := d.Handle(context.Background(), codeScanningAlertEvent(t, repo, "headsha1", "deliv-cs-1", 7)); err != nil {
+		t.Fatalf("Handle #1: %v", err)
+	}
+	if err := d.Handle(context.Background(), codeScanningAlertEvent(t, repo, "headsha1", "deliv-cs-2", 7)); err != nil {
+		t.Fatalf("Handle #2: %v", err)
+	}
+	if got := len(securityFindingEntries(au)); got != 1 {
+		t.Errorf("securityscan entries = %d, want 1 (repeat delivery deduped)", got)
+	}
+}
+
+func TestHandle_CodeScanningAlert_ClearedAfterFixup_RecordsFreshEntry(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	arts := &stubArtifacts{}
+	d.Artifacts = arts
+	d.CodeScanning = gh
+	repo := "kuhlman-labs/fishhawk"
+	r, _ := seedCodeScanRun(t, runs, arts, repo, "headsha1", "basesha1")
+
+	// Epoch 1: a high-severity finding is recorded → gate would hold.
+	gh.codeScanningAlerts = []Finding{csFinding(7, "high", "backend/main.go")}
+	gh.comparePatch = changedFilesCompare("backend/main.go")
+	if err := d.Handle(context.Background(), codeScanningAlertEvent(t, repo, "headsha1", "deliv-cs-1", 7)); err != nil {
+		t.Fatalf("Handle epoch1: %v", err)
+	}
+
+	// A fixup is triggered (opens epoch 2), then a clean re-scan: the
+	// alert is fixed so the open-alert fetch is now empty.
+	au.seedEntry(r.ID, "stage_fixup_triggered", []byte(`{}`))
+	gh.codeScanningAlerts = nil
+	if err := d.Handle(context.Background(), codeScanningAlertEvent(t, repo, "headsha1", "deliv-cs-2", 7)); err != nil {
+		t.Fatalf("Handle epoch2: %v", err)
+	}
+
+	entries := securityFindingEntries(au)
+	if len(entries) != 2 {
+		t.Fatalf("securityscan entries = %d, want 2 (epoch1 finding + epoch2 clean)", len(entries))
+	}
+	var clean securityFindingsPayload
+	if err := json.Unmarshal(entries[1].Payload, &clean); err != nil {
+		t.Fatalf("clean payload decode: %v", err)
+	}
+	if clean.FindingCount != 0 {
+		t.Errorf("epoch2 finding_count = %d, want 0 (clean re-scan clears the gate)", clean.FindingCount)
+	}
+}
+
+func TestHandle_CodeScanningAlert_PostFixupHeadSHA_MatchesViaFixupPush(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	arts := &stubArtifacts{}
+	d.Artifacts = arts
+	d.CodeScanning = gh
+	repo := "kuhlman-labs/fishhawk"
+	// The PR artifact still pins the original head; the fixup pushed a
+	// NEW commit the re-scan fires on.
+	r, _ := seedCodeScanRun(t, runs, arts, repo, "origheadsha", "basesha1")
+	au.seedEntry(r.ID, "fixup_pushed", []byte(`{"head_sha":"fixupheadsha"}`))
+	gh.codeScanningAlerts = []Finding{csFinding(9, "critical", "backend/main.go")}
+	gh.comparePatch = changedFilesCompare("backend/main.go")
+
+	if err := d.Handle(context.Background(), codeScanningAlertEvent(t, repo, "fixupheadsha", "deliv-cs-1", 9)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got := len(securityFindingEntries(au)); got != 1 {
+		t.Fatalf("securityscan entries = %d, want 1 (matched via fixup_pushed head)", got)
+	}
+}
+
+func TestHandle_CodeScanningAlert_PriorEntryReadError_Skips(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	arts := &stubArtifacts{}
+	d.Artifacts = arts
+	d.CodeScanning = gh
+	repo := "kuhlman-labs/fishhawk"
+	seedCodeScanRun(t, runs, arts, repo, "headsha1", "basesha1")
+	gh.codeScanningAlerts = []Finding{csFinding(7, "high", "backend/main.go")}
+	gh.comparePatch = changedFilesCompare("backend/main.go")
+	// The prior-finding read fails: the handler skips recording rather
+	// than risk a duplicate (a redelivery retries). latestFixupFloorSeq
+	// degrades to 0 on the same error without propagating it.
+	au.listCategoryErr = errors.New("audit db down")
+
+	if err := d.Handle(context.Background(), codeScanningAlertEvent(t, repo, "headsha1", "deliv-cs-1", 7)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got := len(securityFindingEntries(au)); got != 0 {
+		t.Errorf("securityscan entries = %d, want 0 (prior-entry read failed → skip, no duplicate)", got)
 	}
 }
