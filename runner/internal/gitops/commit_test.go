@@ -1171,6 +1171,153 @@ func TestCheckoutRemoteBranch_RejectsEmptyBranch(t *testing.T) {
 	}
 }
 
+// TestCheckoutRemoteBranchDetached_NoBranchCollisionWithSiblingWorktree is the
+// core #1361 done-means: it reproduces the exact collision (the operator's
+// primary checkout holds `main` in a linked worktree) and proves the detached
+// child-base checkout SUCCEEDS where the on-branch `-B` checkout FAILS with
+// `already used by worktree`. A single branch may not be checked out in more
+// than one linked worktree of the same gitdir (git-worktree(1)); a detached
+// HEAD claims no branch name and so is immune.
+func TestCheckoutRemoteBranchDetached_NoBranchCollisionWithSiblingWorktree(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+	mainTip := mustGitOut(t, repo, "rev-parse", "HEAD")
+
+	// The operator's PRIMARY checkout holds `main`. Move the source repo OFF
+	// main (so `main` is free in this worktree) and add a SECOND linked
+	// worktree that checks out `main` — now `main` is claimed gitdir-globally
+	// by that sibling, exactly the #1361 shape.
+	mustGit(t, repo, "checkout", "--detach", "HEAD")
+	primary := filepath.Join(dir, "primary")
+	mustGit(t, repo, "worktree", "add", primary, "main")
+
+	// The decomposed child runs from a THIRD linked worktree.
+	child := filepath.Join(dir, "child")
+	mustGit(t, repo, "worktree", "add", "--detach", child, mainTip)
+
+	// The on-branch -B variant must FAIL with the worktree-collision error —
+	// proving the detach is what fixes the collision.
+	if _, err := CheckoutRemoteBranch(context.Background(), child, "origin", "main"); err == nil {
+		t.Fatal("CheckoutRemoteBranch (-B main) unexpectedly succeeded with `main` held by a sibling worktree; the collision the detach fixes is gone")
+	} else if !strings.Contains(err.Error(), "already used by worktree") {
+		t.Fatalf("CheckoutRemoteBranch (-B main) failed with %v, want an `already used by worktree` collision", err)
+	}
+
+	// The detached variant SUCCEEDS in the same setup.
+	tip, err := CheckoutRemoteBranchDetached(context.Background(), child, "origin", "main")
+	if err != nil {
+		t.Fatalf("CheckoutRemoteBranchDetached: %v (must not collide with the sibling `main` worktree)", err)
+	}
+	if tip != mainTip {
+		t.Errorf("returned tip = %q, want main tip %q", tip, mainTip)
+	}
+	// HEAD is DETACHED at the fetched tip: symbolic-ref exits non-zero AND
+	// rev-parse HEAD == tip.
+	if out, err := exec.Command("git", "-C", child, "symbolic-ref", "-q", "HEAD").Output(); err == nil {
+		t.Errorf("HEAD is on a branch (%q); want a detached HEAD", strings.TrimSpace(string(out)))
+	}
+	if got := mustGitOut(t, child, "rev-parse", "HEAD"); got != mainTip {
+		t.Errorf("detached HEAD sha = %q, want fetched tip %q", got, mainTip)
+	}
+}
+
+// TestCheckoutRemoteBranchDetached_DetachesAndReturnsTip is the happy path
+// without a sibling worktree: the function fetches the tip, leaves HEAD
+// detached at it, updates the remote-tracking ref, and a commit can proceed
+// from the detached HEAD — proving the decomposed-child commit seam
+// (CommitAndPush's freshFetchBase/childSliceBranch routing) does not require
+// being ON the base branch.
+func TestCheckoutRemoteBranchDetached_DetachesAndReturnsTip(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+
+	// Advance main in the remote only (a tip the local clone never fetched),
+	// then drop the local tracking ref so the function must fetch it.
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "v2")
+	remoteTip := mustGitOut(t, repo, "rev-parse", "HEAD")
+	mustGit(t, repo, "push", "origin", "main")
+	mustGit(t, repo, "reset", "--hard", "HEAD~1")
+	mustGit(t, repo, "update-ref", "-d", "refs/remotes/origin/main")
+
+	tip, err := CheckoutRemoteBranchDetached(context.Background(), repo, "origin", "main")
+	if err != nil {
+		t.Fatalf("CheckoutRemoteBranchDetached: %v", err)
+	}
+	if tip != remoteTip {
+		t.Errorf("returned tip = %q, want fetched remote tip %q", tip, remoteTip)
+	}
+	// HEAD is detached at the fetched tip.
+	if out, err := exec.Command("git", "-C", repo, "symbolic-ref", "-q", "HEAD").Output(); err == nil {
+		t.Errorf("HEAD is on a branch (%q); want a detached HEAD", strings.TrimSpace(string(out)))
+	}
+	if got := mustGitOut(t, repo, "rev-parse", "HEAD"); got != remoteTip {
+		t.Errorf("detached HEAD sha = %q, want fetched tip %q", got, remoteTip)
+	}
+	// The explicit refspec updated the remote-tracking ref.
+	if got := mustGitOut(t, repo, "rev-parse", "refs/remotes/origin/main"); got != remoteTip {
+		t.Errorf("tracking ref = %q, want %q", got, remoteTip)
+	}
+	// A commit can proceed from the detached HEAD — the child's per-slice
+	// sole-writer branch is cut from here without ever being ON main.
+	mustGit(t, repo, "checkout", "-b", "fishhawk/run-aaaabbbb/slice-1")
+	if err := os.WriteFile(filepath.Join(repo, "slice.txt"), []byte("slice\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "slice work")
+}
+
+// TestCheckoutRemoteBranchDetached_RejectsEmptyBranch pins the input contract.
+func TestCheckoutRemoteBranchDetached_RejectsEmptyBranch(t *testing.T) {
+	if _, err := CheckoutRemoteBranchDetached(context.Background(), t.TempDir(), "origin", ""); err == nil {
+		t.Fatal("expected error for empty branch")
+	}
+}
+
 func mustGitOut(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
