@@ -680,6 +680,11 @@ func runServe(args []string, logSink io.Writer) int {
 			return exitFailure
 		}
 		cfg.GitHubTokens = githubapp.NewCachedProvider(githubapp.NewClient(signer))
+		// This REST client backs every backend → GitHub read/write, including
+		// the code_scanning_alert webhook ingest (#1096), which reuses it via
+		// ListCodeScanningAlerts to surface CodeQL/SAST findings to the
+		// implement-review gate. Wired here once; the server consumes it as
+		// cfg.GitHub — no separate code-scanning client is constructed.
 		cfg.GitHub = githubclient.NewWithSigner(cfg.GitHubTokens, signer)
 		// Optional user-scoped projects token. Presence-only log: the token
 		// is a secret and must never be logged or traced (#1114). Absent, a

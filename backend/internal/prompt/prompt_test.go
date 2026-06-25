@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
 )
 
 // fixturePlan returns a standard_v1 plan with all sections populated
@@ -3114,6 +3115,75 @@ func TestBuild_ImplementReview_ScopeDrift_RendersSection(t *testing.T) {
 		if !strings.Contains(got, w) {
 			t.Errorf("scope-drift prompt missing %q:\n%s", w, got)
 		}
+	}
+}
+
+func TestBuild_ImplementReview_SecurityFindings_RendersSection(t *testing.T) {
+	// #1096: when high-severity code-scanning findings intersect the diff,
+	// the implement-review prompt names them in a SEPARATE "### Security
+	// findings" section so the reviewer sees them at the review gate (not
+	// first at merge) and does not fold them into a design-concern verdict.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		SecurityFindings: []securityscan.Finding{
+			{
+				Number:      7,
+				RuleID:      "go/sql-injection",
+				Description: "Database query built from user-controlled sources",
+				Severity:    securityscan.SeverityHigh,
+				Path:        "pkg/bar/bar.go",
+				StartLine:   42,
+				HTMLURL:     "https://github.com/kuhlman-labs/example/security/code-scanning/7",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"### Security findings (code-scanning alerts on the diff — a SEPARATE signal)",
+		"[high] go/sql-injection",
+		"pkg/bar/bar.go:42",
+		"Database query built from user-controlled sources",
+		"https://github.com/kuhlman-labs/example/security/code-scanning/7",
+		// The separate-signal framing is load-bearing (approval condition 3).
+		"do NOT fold it into a",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("security-findings prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_ImplementReview_SecurityFindings_AbsentWhenEmpty(t *testing.T) {
+	// #1096: the security-findings section is guarded by len>0, so a review
+	// prompt with no findings (no scan, a clean scan, or a clean re-scan
+	// after a fix-up) is byte-identical to the pre-#1096 output. Build twice
+	// — once with nil SecurityFindings, once omitting the field — and assert
+	// the section header never appears and both renders match.
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	}
+	withNil := base
+	withNil.SecurityFindings = nil
+
+	gotBase, err := Build("implement_review", base)
+	if err != nil {
+		t.Fatalf("Build base: %v", err)
+	}
+	gotNil, err := Build("implement_review", withNil)
+	if err != nil {
+		t.Fatalf("Build nil: %v", err)
+	}
+	if strings.Contains(gotBase, "### Security findings") {
+		t.Errorf("security-findings section should be absent when empty:\n%s", gotBase)
+	}
+	if gotBase != gotNil {
+		t.Errorf("nil and omitted SecurityFindings must produce byte-identical prompts")
 	}
 }
 
