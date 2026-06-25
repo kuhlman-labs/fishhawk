@@ -61,6 +61,34 @@ func TestWebhook_HappyPath(t *testing.T) {
 	}
 }
 
+func TestWebhook_CodeScanningAlertRouted(t *testing.T) {
+	// A signed code_scanning_alert delivery is accepted (202) and routed
+	// to the ingest, observable here by the PR-URL run lookup the ingest
+	// performs while matching the alert to a run (#1096).
+	store := webhook.NewMemoryStore(0)
+	rr := &codeScanRunRepo{listResult: nil} // no managed run; ingest no-ops after lookup
+	s := New(Config{
+		Addr:                "127.0.0.1:0",
+		GitHubWebhookSecret: []byte(testSecret),
+		WebhookDeliveries:   store,
+		RunRepo:             rr,
+		AuditRepo:           &codeScanAuditRepo{},
+	})
+	body := codeScanPayload(42, "deadbeef")
+	w := postWebhook(t, s, map[string]string{
+		"X-GitHub-Event":      "code_scanning_alert",
+		"X-GitHub-Delivery":   "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		"X-Hub-Signature-256": sign(body),
+		"Content-Type":        "application/json",
+	}, body)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	if rr.listCallCount() != 1 || rr.listURLs[0] != "https://github.com/octo/app/pull/42" {
+		t.Errorf("ingest run lookup = %+v, want one PR-url lookup (routing reached ingest?)", rr.listURLs)
+	}
+}
+
 func TestWebhook_BadSignature(t *testing.T) {
 	s, _ := newWebhookServer(t)
 	body := []byte(`{}`)

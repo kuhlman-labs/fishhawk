@@ -148,5 +148,16 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		s.handlePullRequestReviewSubmitted(r.Context(), ev.RawBody)
 	}
 
+	// `code_scanning_alert` carries a CodeQL/SAST finding (#1096). Route
+	// it to the ingest, which matches the alert to a run by PR, fetches +
+	// filters the repo's open alerts to the high-severity findings on the
+	// implement diff, and records one idempotent securityscan audit entry
+	// the merge gate reads — so a new finding surfaces at the review gate
+	// (routable via fixup_stage), not first as a blocked check at merge.
+	// Audit-only; best-effort — never a 5xx.
+	if ev.Type == "code_scanning_alert" {
+		s.ingestCodeScanningAlert(r.Context(), ev.RawBody)
+	}
+
 	w.WriteHeader(http.StatusAccepted)
 }
