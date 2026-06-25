@@ -4930,8 +4930,14 @@ paths:
         total passes** per stage (#860). A forced pass is audited (a `forced`
         flag plus the operator `reason` on the `stage_fixup_triggered` entry).
         Once the hard ceiling is reached, even a forced attempt returns the
-        DISTINCT 422 (`fixup_ceiling_reached`) — a hard stop: merge with a
-        follow-up, or start a fresh run. The operator still owns the merge.
+        DISTINCT 422 (`fixup_ceiling_reached`), whose `details` carries a
+        `remediation` pointer: for a late CI/SAST finding, commit the fix on the
+        run branch then `fishhawk_vouch_commit` it (operator/operator-agent
+        token, NOT the run-bound `fhm_` token, which is rejected
+        `run_token_forbidden`) so the operator commit clears the run's
+        sole-writer lineage gate without breaking ADR-035 (#1068/#1044).
+        Otherwise merge with a follow-up, or start a fresh run. The operator
+        still owns the merge.
       tags: [stages]
       parameters:
         - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -5123,7 +5129,9 @@ paths:
             one more pass is available via `force_additional_pass: true`); or
             the hard ceiling of 3 total passes is reached and the override can
             no longer help (`fixup_ceiling_reached`, distinct from
-            `fixup_budget_exhausted`); or the resolved `implement_model`
+            `fixup_budget_exhausted`; its `details` carry a `remediation`
+            pointer to the operator commit-and-`fishhawk_vouch_commit` path for
+            a late CI/SAST finding, #1068/#1044); or the resolved `implement_model`
             override is not in the deployment's per-adapter allow-list
             (`fixup_invalid_model`, #1164 — `details` carry the resolved
             `model`, `model_source`, and `adapter`). Body's `message` explains
