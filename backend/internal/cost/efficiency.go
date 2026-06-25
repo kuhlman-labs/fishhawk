@@ -133,6 +133,63 @@ func AggregateCacheEfficiency(entries []CacheEfficiencyEntry) CacheEfficiency {
 	return run
 }
 
+// RunCostEntry is one cost_recorded ledger row's dollar figure plus the
+// source it was attributed to. Source is the audit payload's `source` ("" for
+// the runner stage-agent path, which AggregateRunCost buckets as
+// StageAgentSource — the same convention as CacheEfficiencyEntry).
+type RunCostEntry struct {
+	Source string
+	USD    float64
+}
+
+// RunCostStage is the per-source dollar rollup: the summed USD over only the
+// entries that carried this Source.
+type RunCostStage struct {
+	Source  string  `json:"source"`
+	CostUSD float64 `json:"cost_usd"`
+}
+
+// RunCostSummary is the per-run cost breakdown derived from a run's
+// cost_recorded entries: TotalUSD is the sum across all entries, and Stages
+// carries the same sum per source (agent / plan_review / implement_review),
+// sorted by source for deterministic output. DISPLAY-ONLY — derived from
+// existing audit data, never a gate.
+type RunCostSummary struct {
+	TotalUSD float64        `json:"total_cost_usd"`
+	Stages   []RunCostStage `json:"stages,omitempty"`
+}
+
+// AggregateRunCost folds a run's cost_recorded entries into the per-run total
+// USD and a per-source breakdown. It is pure (no repository, no error): an
+// empty slice yields the all-zero value with no stages. An entry whose Source
+// is empty buckets under StageAgentSource, mirroring AggregateCacheEfficiency.
+func AggregateRunCost(entries []RunCostEntry) RunCostSummary {
+	var summary RunCostSummary
+	stages := map[string]*RunCostStage{}
+
+	for _, e := range entries {
+		src := e.Source
+		if src == "" {
+			src = StageAgentSource
+		}
+		st, ok := stages[src]
+		if !ok {
+			st = &RunCostStage{Source: src}
+			stages[src] = st
+		}
+		summary.TotalUSD += e.USD
+		st.CostUSD += e.USD
+	}
+
+	for _, st := range stages {
+		summary.Stages = append(summary.Stages, *st)
+	}
+	sort.Slice(summary.Stages, func(i, j int) bool {
+		return summary.Stages[i].Source < summary.Stages[j].Source
+	})
+	return summary
+}
+
 // entrySavings prices one entry's cache read/write against its model per
 // ADR-044, reusing slice 1's pricing API with NO new pricing surface:
 //

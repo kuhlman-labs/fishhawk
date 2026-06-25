@@ -267,6 +267,57 @@ func (c *apiClient) GetRunCacheEfficiency(ctx context.Context, runID uuid.UUID) 
 	return &ce, nil
 }
 
+// RunCost mirrors the backend's GET /v0/runs/{run_id}/cost body
+// (`backend/internal/server/cost.go::costSummaryResponse`): the per-run
+// estimated cost derived from the run's cost_recorded ledger, a per-stage
+// (agent / plan_review / implement_review) breakdown, and — when the run
+// resolved to a merged PR — the cost-per-merged-PR rollup (#1372).
+// DISPLAY-ONLY — surfaced in fishhawk_get_run_status so the operator sees the
+// cost to land work; it never gates a run.
+//
+// Repeated here rather than imported because the MCP server's apiClient is a
+// thin local copy (the import direction is `cli → backend`, not the reverse).
+// The scalar fields are omitempty so the no-data path — which GetRunCost
+// collapses to a nil pointer — never marshals a half-empty block.
+type RunCost struct {
+	TotalCostUSD float64          `json:"total_cost_usd,omitempty"`
+	Stages       []RunCostStage   `json:"stages,omitempty"`
+	MergedPR     *RunMergedPRCost `json:"merged_pr,omitempty"`
+}
+
+// RunCostStage is the per-source cost breakdown row (agent / plan_review /
+// implement_review).
+type RunCostStage struct {
+	Source  string  `json:"source"`
+	CostUSD float64 `json:"cost_usd"`
+}
+
+// RunMergedPRCost is the cost-per-merged-PR rollup: the summed CostUSDTotal
+// across every run sharing the PR URL, present only when the run resolved to a
+// merged PR.
+type RunMergedPRCost struct {
+	PullRequestURL     string  `json:"pull_request_url"`
+	CostPerMergedPRUSD float64 `json:"cost_per_merged_pr_usd"`
+	RunCount           int     `json:"run_count"`
+}
+
+// GetRunCost fetches the run's cost summary. The backend returns 200 with an
+// empty object when the run has no cost data; GetRunCost collapses that to
+// (nil, nil) so every caller treats "no data" uniformly by checking for a nil
+// pointer. The presence sentinel is "no per-stage rows AND no merged-PR
+// rollup" — the empty object has neither, while any costed run reports at
+// least one stage, so the empty object never false-collapses a real metric.
+func (c *apiClient) GetRunCost(ctx context.Context, runID uuid.UUID) (*RunCost, error) {
+	var rc RunCost
+	if err := c.do(ctx, http.MethodGet, "/v0/runs/"+runID.String()+"/cost", nil, &rc); err != nil {
+		return nil, err
+	}
+	if len(rc.Stages) == 0 && rc.MergedPR == nil {
+		return nil, nil
+	}
+	return &rc, nil
+}
+
 // createRunRequest mirrors the backend's `POST /v0/runs` request body
 // (`backend/internal/server/runs.go::createRunRequest`). Repeated here
 // rather than imported because the MCP server's apiClient is

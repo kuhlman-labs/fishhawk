@@ -94,6 +94,81 @@ func TestAggregateCacheEfficiency_MultiModelMultiStage(t *testing.T) {
 	}
 }
 
+// findCostStage returns the per-source cost rollup with the given source, or
+// fails.
+func findCostStage(t *testing.T, stages []RunCostStage, source string) RunCostStage {
+	t.Helper()
+	for _, st := range stages {
+		if st.Source == source {
+			return st
+		}
+	}
+	t.Fatalf("no cost stage rollup for source %q; got %+v", source, stages)
+	return RunCostStage{}
+}
+
+// TestAggregateRunCost_MixedSources: agent (no-source) + plan_review +
+// implement_review entries fold into the correct total and per-stage sums
+// with deterministic source ordering.
+func TestAggregateRunCost_MixedSources(t *testing.T) {
+	got := AggregateRunCost([]RunCostEntry{
+		{Source: "plan_review", USD: 1.50},
+		{Source: "implement_review", USD: 2.25},
+		{Source: "", USD: 4.00}, // runner stage-agent path, no source
+		{Source: "implement_review", USD: 0.75},
+	})
+
+	if !approxEqual(got.TotalUSD, 8.50) {
+		t.Errorf("TotalUSD = %v, want 8.50", got.TotalUSD)
+	}
+	// Stages sorted by source: agent, implement_review, plan_review.
+	if len(got.Stages) != 3 {
+		t.Fatalf("want 3 stage rollups, got %d: %+v", len(got.Stages), got.Stages)
+	}
+	wantOrder := []string{"agent", "implement_review", "plan_review"}
+	for i, src := range wantOrder {
+		if got.Stages[i].Source != src {
+			t.Errorf("Stages[%d].Source = %q, want %q (sorted)", i, got.Stages[i].Source, src)
+		}
+	}
+	if st := findCostStage(t, got.Stages, "agent"); !approxEqual(st.CostUSD, 4.00) {
+		t.Errorf("agent stage = %v, want 4.00", st.CostUSD)
+	}
+	if st := findCostStage(t, got.Stages, "implement_review"); !approxEqual(st.CostUSD, 3.00) {
+		t.Errorf("implement_review stage = %v, want 3.00 (0.75+2.25)", st.CostUSD)
+	}
+	if st := findCostStage(t, got.Stages, "plan_review"); !approxEqual(st.CostUSD, 1.50) {
+		t.Errorf("plan_review stage = %v, want 1.50", st.CostUSD)
+	}
+}
+
+// TestAggregateRunCost_EmptySourceBucketsAsAgent: an entry with an empty
+// Source is bucketed under the `agent` stage.
+func TestAggregateRunCost_EmptySourceBucketsAsAgent(t *testing.T) {
+	got := AggregateRunCost([]RunCostEntry{{Source: "", USD: 1.23}})
+	if len(got.Stages) != 1 {
+		t.Fatalf("want 1 stage, got %d: %+v", len(got.Stages), got.Stages)
+	}
+	if got.Stages[0].Source != StageAgentSource {
+		t.Errorf("Stages[0].Source = %q, want %q", got.Stages[0].Source, StageAgentSource)
+	}
+	if !approxEqual(got.Stages[0].CostUSD, 1.23) {
+		t.Errorf("agent stage = %v, want 1.23", got.Stages[0].CostUSD)
+	}
+}
+
+// TestAggregateRunCost_Empty: an empty slice yields the zero summary with no
+// stages.
+func TestAggregateRunCost_Empty(t *testing.T) {
+	got := AggregateRunCost(nil)
+	if got.TotalUSD != 0 {
+		t.Errorf("TotalUSD = %v, want 0", got.TotalUSD)
+	}
+	if got.Stages != nil {
+		t.Errorf("Stages = %+v, want nil for empty input", got.Stages)
+	}
+}
+
 // TestAggregateCacheEfficiency_DivByZeroGuard: an entry with no cache read
 // and no fresh input must yield cache_read_ratio 0, never NaN.
 func TestAggregateCacheEfficiency_DivByZeroGuard(t *testing.T) {

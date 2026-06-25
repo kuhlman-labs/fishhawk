@@ -301,6 +301,13 @@ type fakeBackend struct {
 	cacheEffByRun  map[uuid.UUID]CacheEfficiency
 	cacheEffStatus int
 
+	// Cost fixtures: GET /v0/runs/{run_id}/cost (#1372). costByRun seeds the
+	// cost surface per run; an unseeded run returns the empty object {} —
+	// mirroring the backend's no-cost-data 200. costStatus drives the HTTP
+	// status code (default 200).
+	costByRun  map[uuid.UUID]RunCost
+	costStatus int
+
 	// integrate-wave fixtures: POST /v0/runs/{run_id}/integrate-wave (#1278
 	// slice B). The run_children wave loop calls this between waves; the tests
 	// drive its response and assert the call counter. integrateWaveResp is the
@@ -376,6 +383,8 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		budgetCalledByID:              map[uuid.UUID]int{},
 		cacheEffByRun:                 map[uuid.UUID]CacheEfficiency{},
 		cacheEffStatus:                http.StatusOK,
+		costByRun:                     map[uuid.UUID]RunCost{},
+		costStatus:                    http.StatusOK,
 		integrateWaveResp:             map[uuid.UUID]IntegrateWaveResult{},
 		integrateWaveStatus:           http.StatusOK,
 		integrateWaveCalledBy:         map[uuid.UUID]int{},
@@ -923,6 +932,25 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(ce)
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}/cost", func(w http.ResponseWriter, r *http.Request) {
+		id, perr := uuid.Parse(r.PathValue("run_id"))
+		w.Header().Set("Content-Type", "application/json")
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		rc, ok := fb.costByRun[id]
+		status := fb.costStatus
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if !ok {
+			// No cost data — empty object, as the backend does.
+			_, _ = w.Write([]byte("{}"))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(rc)
 	})
 	mux.HandleFunc("GET /v0/audit", func(w http.ResponseWriter, r *http.Request) {
 		runIDQ := r.URL.Query().Get("run_id")
@@ -5178,6 +5206,99 @@ func TestGetRunStatus_OmitsCacheEfficiencyWhenNoData(t *testing.T) {
 	_ = json.Unmarshal(raw, &m)
 	if _, ok := m["cache_efficiency"]; ok {
 		t.Errorf("marshaled output must omit the cache_efficiency key when no data; got %s", raw)
+	}
+}
+
+// --- run cost (#1372) ---
+//
+// Cross-boundary wire-to-tool seam: a stub backend serves GET
+// /v0/runs/{id}/cost and getRunStatus surfaces the same block (and omits it
+// when the backend returns the empty no-data object). The compute → endpoint
+// layers — the cost_recorded-ledger aggregation, the pr_merged + PR-URL merge
+// detection, and the two-runs-on-one-PR rollup sum — are covered end-to-end by
+// the cost package (AggregateRunCost) and the server handler tests
+// (cost_test.go); this asserts the MCP-mapping seam so the per-stage breakdown
+// and merged-PR rollup don't silently drop on the wire (cf. #618).
+
+func seedRunCost(fb *fakeBackend, runID uuid.UUID, rc RunCost) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.costByRun[runID] = rc
+}
+
+func TestGetRunStatus_SurfacesCostBlock(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	url := "https://github.com/x/y/pull/7"
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: "succeeded"}
+	// Mirrors the cost_test.go merged-PR case: a per-stage breakdown summing to
+	// the total, plus a two-run merged-PR rollup (5.00 + 3.00 = 8.00).
+	seedRunCost(fb, runID, RunCost{
+		TotalCostUSD: 5.00,
+		Stages: []RunCostStage{
+			{Source: "agent", CostUSD: 4.00},
+			{Source: "implement_review", CostUSD: 0.50},
+			{Source: "plan_review", CostUSD: 0.50},
+		},
+		MergedPR: &RunMergedPRCost{
+			PullRequestURL:     url,
+			CostPerMergedPRUSD: 8.00,
+			RunCount:           2,
+		},
+	})
+
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.Cost == nil {
+		t.Fatal("expected cost block surfaced from backend; got nil")
+	}
+	if out.Cost.TotalCostUSD != 5.00 {
+		t.Errorf("total_cost_usd = %g, want 5.00", out.Cost.TotalCostUSD)
+	}
+	if len(out.Cost.Stages) != 3 {
+		t.Fatalf("want 3 stage rows, got %d: %+v", len(out.Cost.Stages), out.Cost.Stages)
+	}
+	if out.Cost.Stages[0].Source != "agent" || out.Cost.Stages[0].CostUSD != 4.00 {
+		t.Errorf("agent stage = %+v, want source agent cost 4.00", out.Cost.Stages[0])
+	}
+	if out.Cost.MergedPR == nil {
+		t.Fatal("expected merged_pr rollup surfaced; got nil")
+	}
+	if out.Cost.MergedPR.PullRequestURL != url {
+		t.Errorf("merged_pr.pull_request_url = %q, want %q", out.Cost.MergedPR.PullRequestURL, url)
+	}
+	if out.Cost.MergedPR.CostPerMergedPRUSD != 8.00 || out.Cost.MergedPR.RunCount != 2 {
+		t.Errorf("merged_pr rollup = cost %g run_count %d, want 8.00 / 2",
+			out.Cost.MergedPR.CostPerMergedPRUSD, out.Cost.MergedPR.RunCount)
+	}
+}
+
+func TestGetRunStatus_OmitsCostWhenNoData(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: "running"}
+	// No seedRunCost → backend returns {} → GetRunCost yields nil.
+
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.Cost != nil {
+		t.Errorf("expected no cost block; got %+v", out.Cost)
+	}
+	// The no-data block must omit the JSON key entirely (nil pointer +
+	// omitempty), not serialize a null.
+	raw, _ := json.Marshal(out)
+	var m map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &m)
+	if _, ok := m["cost"]; ok {
+		t.Errorf("marshaled output must omit the cost key when no data; got %s", raw)
 	}
 }
 

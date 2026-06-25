@@ -1666,6 +1666,57 @@ components:
               write_penalty_usd: { type: number }
               net_savings_usd: { type: number }
 
+    RunCost:
+      type: object
+      description: |
+        Per-run estimated cost derived from the run's `cost_recorded`
+        ledger (#1372). **Display-only** — never gates or blocks a run.
+
+        When the run has no cost data the endpoint returns an **empty
+        object** (none of the fields below present); clients detect "no
+        data" by the absence of a field. The fields below are present only
+        when the run has cost data.
+      properties:
+        total_cost_usd:
+          type: number
+          description: |
+            The run's rolled estimated US-dollar cost (the run record's
+            `cost_usd_total`), reconstructed per-stage from the ledger.
+        stages:
+          type: array
+          description: |
+            Per-source cost breakdown (`agent` / `plan_review` /
+            `implement_review`, sorted by source), each carrying the summed
+            US dollars attributed to that stage bucket.
+          items:
+            type: object
+            properties:
+              source:
+                type: string
+                description: 'Stage bucket: `plan_review`, `implement_review`, or `agent` (the runner stage-agent path, which carries no `source`).'
+              cost_usd:
+                type: number
+                description: Summed estimated US dollars for this stage bucket.
+        merged_pr:
+          type: object
+          description: |
+            Cost-per-merged-PR rollup, present **only** when the run
+            resolved to a merged PR (a `pr_merged` audit row exists AND the
+            run carries a pull-request URL). Omitted otherwise.
+          properties:
+            pull_request_url:
+              type: string
+              description: The merged pull-request URL the rollup is summed over.
+            cost_per_merged_pr_usd:
+              type: number
+              description: |
+                Sum of `cost_usd_total` across every run sharing this PR URL
+                (the original run plus any fixup/follow-up runs) — the total
+                estimated cost to land the PR.
+            run_count:
+              type: integer
+              description: Number of runs contributing to the rollup.
+
     CalibrationResult:
       type: object
       description: |
@@ -3340,6 +3391,45 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/RunCacheEfficiency' }
+        '400':
+          description: "`validation_failed` — `run_id` not a UUID."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { description: Run repository unavailable. }
+
+  /v0/runs/{run_id}/cost:
+    get:
+      operationId: getRunCost
+      summary: Per-run estimated cost with per-stage and per-merged-PR rollup
+      description: |
+        Returns the run's estimated cost, derived purely from the run's
+        `cost_recorded` audit ledger (#1372): the run's total estimated
+        US-dollar cost, a per-stage breakdown keyed on the entry's `source`
+        (`plan_review` / `implement_review`, with the runner stage-agent
+        path — entries that carry no `source` — bucketed as `agent`), and —
+        when the run resolved to a merged PR (a `pr_merged` audit row exists
+        AND the run carries a pull-request URL) — a cost-per-merged-PR
+        rollup summing `cost_usd_total` across every run sharing that PR URL
+        plus the contributing run count.
+
+        **Display-only.** This endpoint never gates or blocks a run; it
+        exists so the MCP loop can surface the cost to land work. It has no
+        write path and no migration — it reads existing audit and run data;
+        merge state is read from the audit ledger, never the GitHub API.
+
+        When the run has no `cost_recorded` data the response is **200 with
+        an empty object** (`{}`) rather than a 404, so clients branch on the
+        presence of a field.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: |
+            Cost summary, or an empty object when the run has no cost data.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunCost' }
         '400':
           description: "`validation_failed` — `run_id` not a UUID."
         '401': { $ref: '#/components/responses/Unauthorized' }

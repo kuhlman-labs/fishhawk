@@ -30,6 +30,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/runs/{run_id}/audit", s.handleListRunAudit)
 	mux.HandleFunc("GET /v0/runs/{run_id}/budget", s.handleGetRunBudget)
 	mux.HandleFunc("GET /v0/runs/{run_id}/cache-efficiency", s.handleGetRunCacheEfficiency)
+	mux.HandleFunc("GET /v0/runs/{run_id}/cost", s.handleGetRunCost)
 	mux.HandleFunc("GET /v0/runs/{run_id}/diagnostics", s.handleGetRunDiagnostics)
 	mux.HandleFunc("POST /v0/runs/{run_id}/product-reports", s.handleFileProductReport)
 	mux.HandleFunc("GET /v0/runs/{run_id}/status-comment", s.handleGetStatusComment)
