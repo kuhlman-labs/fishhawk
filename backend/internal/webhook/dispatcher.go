@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,6 +19,81 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
+
+// Finding is the subset of a code-scanning (CodeQL / SAST) alert the
+// implement-review merge gate needs (#1096). It is the cross-slice
+// contract the security-findings audit entry carries: Number is the
+// stable dedup key, Severity drives the high/critical gating filter,
+// and Path joins a finding onto the implement diff's changed files.
+//
+// Defined here, in the webhook package, rather than in a shared
+// `securityscan` package: the gating logic that consumes it
+// (FilterToDiffFiles / FilterHighSeverity, below) is small and has no
+// other consumer yet, so keeping it local avoids a new module-level
+// dependency. A future PR that grows a second consumer can promote
+// this to its own package.
+type Finding struct {
+	Number      int    `json:"number"`
+	RuleID      string `json:"rule_id"`
+	Severity    string `json:"severity"`
+	Description string `json:"description"`
+	Path        string `json:"path"`
+	Line        int    `json:"line"`
+	State       string `json:"state"`
+	URL         string `json:"url"`
+}
+
+// AuditCategorySecurityFindings is the audit category the
+// code_scanning_alert handler records its gating finding set under
+// (#1096). A dedicated category — separate from review-verdict concern
+// categories — so a security finding is its own signal and does not
+// consume a design-concern fixup pass.
+const AuditCategorySecurityFindings = "implement_security_findings"
+
+// gatingSeverities is the closed set of code-scanning security
+// severities that hold the merge gate. Lower severities (medium / low /
+// note / warning) are surfaced by GitHub but do not gate a Fishhawk
+// run. Matched case-insensitively.
+var gatingSeverities = map[string]struct{}{
+	"critical": {},
+	"high":     {},
+}
+
+// filterToDiffFiles keeps only the findings whose Path is one of the
+// implement diff's changed files. A repo-wide code-scanning run reports
+// pre-existing alerts on untouched files; only findings the run's diff
+// introduced (or touched) should gate it.
+func filterToDiffFiles(findings []Finding, changedFiles []string) []Finding {
+	if len(findings) == 0 {
+		return nil
+	}
+	inDiff := make(map[string]struct{}, len(changedFiles))
+	for _, f := range changedFiles {
+		inDiff[f] = struct{}{}
+	}
+	out := make([]Finding, 0, len(findings))
+	for _, f := range findings {
+		if _, ok := inDiff[f.Path]; ok {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// filterHighSeverity keeps only the high/critical-severity findings —
+// the gating set. Severity comparison is case-insensitive.
+func filterHighSeverity(findings []Finding) []Finding {
+	if len(findings) == 0 {
+		return nil
+	}
+	out := make([]Finding, 0, len(findings))
+	for _, f := range findings {
+		if _, ok := gatingSeverities[strings.ToLower(f.Severity)]; ok {
+			out = append(out, f)
+		}
+	}
+	return out
+}
 
 // FishhawkLabel is the issue / PR label that triggers a default
 // run. Customers add this label to their issue when they want
@@ -115,6 +191,18 @@ const (
 	// `ci_retry_exhausted`. Matching stays pure here; the real I/O
 	// lives in handleCIFailureRetry.
 	MatchActionCIFailureRetry MatchAction = "ci_failure_retry"
+	// MatchActionCodeScanningAlert tags a code_scanning_alert event
+	// (CodeQL / SAST) on a commit Fishhawk analyzed for an implement
+	// PR (#1096). matchCodeScanningAlert fills CodeScanningRef from the
+	// payload; the handler in handleCodeScanningAlert matches the
+	// commit_oid to a run by head-SHA against the run's implement
+	// pull_request artifact (and any later fixup push), fetches the
+	// open alerts, filters them to the implement diff's high-severity
+	// findings, and records ONE securityscan audit entry so the
+	// implement-review merge gate can hold on unresolved findings
+	// instead of first surfacing them as a blocked required check at
+	// merge time. Matching stays pure here; all I/O is in the handler.
+	MatchActionCodeScanningAlert MatchAction = "code_scanning_alert"
 )
 
 // DefaultWorkflowID is the workflow_id (a key under `workflows:`
@@ -185,6 +273,13 @@ type Match struct {
 	// runs.pull_request_url and uses CheckName + Conclusion for
 	// the audit-row payload.
 	CheckRunRef *CheckRunRef
+
+	// CodeScanningRef carries the bits of a code_scanning_alert
+	// payload the security-findings handler needs (#1096). Set when
+	// Action is MatchActionCodeScanningAlert. The handler uses HeadSHA
+	// (the analyzed commit_oid) to match the alert to a run and
+	// AlertNumber / Ref for the recorded audit entry's payload.
+	CodeScanningRef *CodeScanningRef
 }
 
 // CheckRunRef is the subset of a check_run payload the CI-retry
@@ -196,6 +291,18 @@ type CheckRunRef struct {
 	HeadSHA    string
 	CheckName  string
 	Conclusion string
+}
+
+// CodeScanningRef is the subset of a code_scanning_alert payload the
+// security-findings handler needs (#1096). HeadSHA (the payload's
+// commit_oid — the commit GitHub analyzed) is the join key onto a
+// Fishhawk run's implement diff; AlertNumber and Ref are carried for
+// the recorded audit entry's payload / log correlation. HeadSHA is
+// required — matchCodeScanningAlert skips when commit_oid is empty.
+type CodeScanningRef struct {
+	HeadSHA     string
+	AlertNumber int
+	Ref         string
 }
 
 // IssueRef captures the bits of an issue payload the dispatcher
@@ -233,6 +340,8 @@ func MatchEvent(ev Event) Match {
 		return matchWorkflowRun(ev)
 	case "check_run":
 		return matchCheckRun(ev)
+	case "code_scanning_alert":
+		return matchCodeScanningAlert(ev)
 	case "branch_protection_rule", "repository_ruleset":
 		// Recognized for #251 / ADR-017: an upstream protection
 		// edit invalidates any cached snapshot for the repo. v0
@@ -620,6 +729,47 @@ func matchCheckRun(ev Event) Match {
 	}
 }
 
+// matchCodeScanningAlert classifies a code_scanning_alert event
+// (#1096). Pure: no I/O. The handler does the run match + alert fetch.
+//
+// We do NOT gate on ev.Action. Every code_scanning_alert action
+// (created / reopened / appeared_in_branch / fixed / closed_by_user)
+// changes the open-alert set the handler re-fetches authoritatively
+// from the REST API, so any of them is a reason to re-evaluate; a
+// "fixed" delivery is exactly how a clean re-scan after a fixup gets
+// recorded so the gate clears. The handler's per-epoch dedup collapses
+// repeat deliveries, so matching every action is robust (a missed
+// "created" still gets picked up by a later "reopened") without
+// double-recording.
+//
+// The only structural requirement is commit_oid: it is the head-SHA
+// join key onto a run's implement diff. A payload without one can't be
+// matched to a run, so it skips.
+func matchCodeScanningAlert(ev Event) Match {
+	var payload struct {
+		Alert struct {
+			Number int `json:"number"`
+		} `json:"alert"`
+		Ref       string `json:"ref"`
+		CommitOID string `json:"commit_oid"`
+	}
+	if err := json.Unmarshal(ev.RawBody, &payload); err != nil {
+		return Match{Skip: true, Reason: "code_scanning_alert payload parse failed"}
+	}
+	if payload.CommitOID == "" {
+		return Match{Skip: true,
+			Reason: "code_scanning_alert has no commit_oid; nothing to match a run against"}
+	}
+	return Match{
+		Action: MatchActionCodeScanningAlert,
+		CodeScanningRef: &CodeScanningRef{
+			HeadSHA:     payload.CommitOID,
+			AlertNumber: payload.Alert.Number,
+			Ref:         payload.Ref,
+		},
+	}
+}
+
 // GitHubAPI is the slice of githubclient.Client the dispatcher
 // uses. Defining it as an interface lets tests substitute a stub
 // without standing up an httptest.Server alongside the existing
@@ -636,6 +786,27 @@ type GitHubAPI interface {
 		repo githubclient.RepoRef, branch string) (*githubclient.BranchProtection, error)
 	ListRulesetRequiredChecks(ctx context.Context, installationID int64,
 		repo githubclient.RepoRef, branch string) ([]githubclient.RulesetRequiredCheck, error)
+}
+
+// CodeScanningAPI is the slice of githubclient.Client the
+// code_scanning_alert handler uses (#1096). It is a separate, narrow
+// interface from GitHubAPI so the existing dispatcher seams and their
+// stubs stay untouched; *githubclient.Client satisfies both. Nil at
+// the Dispatcher leaves the security-findings path off — a delivery
+// then degrades to no-finding (the merge gate stays open, the same
+// end state as a repo with code scanning disabled) rather than
+// erroring.
+type CodeScanningAPI interface {
+	// ListCodeScanningAlerts returns the OPEN code-scanning alerts for
+	// the analyzed commit (ref = the alert's commit_oid), already
+	// mapped onto the securityscan contract type.
+	ListCodeScanningAlerts(ctx context.Context, installationID int64,
+		repo githubclient.RepoRef, ref string) ([]Finding, error)
+	// ComparePatch returns the changed files between the run's base
+	// and the analyzed head, used to intersect the repo-wide alerts
+	// against the implement diff (FilterToDiffFiles).
+	ComparePatch(ctx context.Context, installationID int64,
+		repo githubclient.RepoRef, base, head string) (*githubclient.ComparePatchResult, error)
 }
 
 // IssueNotifier is the slice of issuecomment.Notifier the dispatcher
@@ -728,7 +899,15 @@ type Dispatcher struct {
 	// dedup guard at "no, this head_sha isn't recorded yet" — the
 	// audit cap still bounds runaway retries.
 	Artifacts artifact.Repository
-	Logger    *slog.Logger
+
+	// CodeScanning consumes GitHub code-scanning alerts for the
+	// code_scanning_alert handler (#1096). Nil leaves the
+	// security-findings path off: a delivery degrades to no-finding
+	// (the merge gate stays open) rather than erroring — the same end
+	// state as a repo without code scanning enabled.
+	CodeScanning CodeScanningAPI
+
+	Logger *slog.Logger
 
 	// IssueNotifier posts the pickup-acknowledgment comment back
 	// to the triggering issue (#234). Best-effort: failures log
@@ -817,6 +996,8 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		return d.handleRunnerActionFailed(ctx, ev, m)
 	case MatchActionCIFailureRetry:
 		return d.handleCIFailureRetry(ctx, ev, m)
+	case MatchActionCodeScanningAlert:
+		return d.handleCodeScanningAlert(ctx, ev, m)
 	}
 
 	repo, err := parseRepo(ev.Repo)
@@ -1754,6 +1935,390 @@ func (d *Dispatcher) writeCIRetryExhaustedAudit(ctx context.Context, ev Event, p
 		slog.Int("retry_attempt", parent.RetryAttempt),
 		slog.Int("max_retries", maxRetries),
 	)
+}
+
+// categoryStageFixupTriggered and categoryFixupPushed mirror the
+// server-package audit categories (server.CategoryStageFixupTriggered
+// = "stage_fixup_triggered"; the fixup_pushed entry written by
+// succeedFixupPushStage). They are duplicated here as untyped string
+// constants — like decodeArtifactHeadSHA duplicates the auditcheck
+// helper — to keep the dispatcher import-free of the server package
+// (server already depends on webhook; importing it back would cycle).
+const (
+	categoryStageFixupTriggered = "stage_fixup_triggered"
+	categoryFixupPushed         = "fixup_pushed"
+)
+
+// securityFindingsPayload is the recorded-entry shape under the
+// securityscan.AuditCategorySecurityFindings category — the cross-slice
+// contract the merge-gate (auditcomplete) and surface (run-status /
+// review prompt) slices read back (#1096). Findings is the gating set
+// (high-severity ∩ implement diff), sorted by Number for a canonical,
+// order-independent form; FindingCount mirrors len(Findings) so a
+// reader can branch without decoding the slice. The remaining fields
+// are provenance for the operator / audit trail.
+type securityFindingsPayload struct {
+	Repo         string    `json:"repo"`
+	Ref          string    `json:"ref"`
+	HeadSHA      string    `json:"head_sha"`
+	BaseSHA      string    `json:"base_sha"`
+	AlertNumber  int       `json:"alert_number"`
+	FindingCount int       `json:"finding_count"`
+	Findings     []Finding `json:"findings"`
+	DeliveryID   string    `json:"delivery_id"`
+}
+
+// codeScanMatch is the run + provenance a code_scanning_alert head-SHA
+// matched against — the implement stage the finding entry attaches to
+// and the base SHA ComparePatch diffs from.
+type codeScanMatch struct {
+	run     *run.Run
+	stage   *run.Stage
+	baseSHA string
+}
+
+// handleCodeScanningAlert consumes a code_scanning_alert event and
+// records the run's gating security findings (#1096). It is the
+// in-loop alternative to a high-severity CodeQL alert first surfacing
+// as a blocked required check at merge time: by recording the finding
+// against the run, the implement-review merge gate (auditcomplete) can
+// hold on it and the operator can route a fixup.
+//
+// Best-effort throughout — every skip path logs and returns nil so
+// GitHub does not redeliver. Algorithm:
+//
+//  1. Skip when the code-scanning client isn't wired (degrade to
+//     no-finding: the gate stays open, same as code scanning disabled).
+//  2. Match the analyzed commit_oid to a run by head-SHA against the
+//     run's implement pull_request artifact OR a later fixup push (a
+//     fixup pushes a new head the re-scan fires on). Skip when no
+//     Fishhawk run owns the commit.
+//  3. Fetch the OPEN alerts for the commit, then reduce them to the
+//     gating set: intersect against the implement diff's changed files
+//     (FilterToDiffFiles) and keep only high/critical security severity
+//     (FilterHighSeverity). A read error degrades to no-finding.
+//  4. Record ONE securityscan audit entry per fixup epoch. The epoch
+//     floor is the latest stage_fixup_triggered sequence, so a clean
+//     re-scan recorded after a fixup is a fresh entry the gate reads to
+//     clear. Within an epoch, an identical re-delivery (same finding
+//     set) is idempotently skipped; a changed set supersedes.
+func (d *Dispatcher) handleCodeScanningAlert(ctx context.Context, ev Event, m Match) error {
+	if m.CodeScanningRef == nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"code_scanning_alert: missing CodeScanningRef",
+			slog.String("delivery_id", ev.DeliveryID))
+		return nil
+	}
+	ref := m.CodeScanningRef
+
+	// Step 1: the client must be wired. Nil degrades to no-finding.
+	if d.CodeScanning == nil {
+		d.logger().LogAttrs(ctx, slog.LevelDebug,
+			"code_scanning_alert: code-scanning client not wired; skipping",
+			slog.String("delivery_id", ev.DeliveryID))
+		return nil
+	}
+
+	// Step 2: match the analyzed commit to a Fishhawk run.
+	match, ok := d.findRunForCodeScanning(ctx, ev.Repo, ref.HeadSHA)
+	if !ok {
+		d.logger().LogAttrs(ctx, slog.LevelDebug,
+			"code_scanning_alert: no Fishhawk run for analyzed commit",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("repo", ev.Repo),
+			slog.String("head_sha", ref.HeadSHA))
+		return nil
+	}
+	runID := match.run.ID
+	installationID := int64(0)
+	if match.run.InstallationID != nil {
+		installationID = *match.run.InstallationID
+	}
+	repo, err := parseRepo(ev.Repo)
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"code_scanning_alert: repo malformed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("repo", ev.Repo))
+		return nil
+	}
+
+	// Step 3: fetch + filter. Any read failure (alerts or compare)
+	// degrades to no-finding — an unreadable scan must not be recorded
+	// as "findings"; the gate stays open and a later delivery retries.
+	alerts, err := d.CodeScanning.ListCodeScanningAlerts(ctx, installationID, repo, ref.HeadSHA)
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"code_scanning_alert: list alerts failed; degrading to no-finding",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return nil
+	}
+	cmp, err := d.CodeScanning.ComparePatch(ctx, installationID, repo, match.baseSHA, ref.HeadSHA)
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"code_scanning_alert: compare patch failed; cannot intersect diff",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("run_id", runID.String()),
+			slog.String("base_sha", match.baseSHA),
+			slog.String("head_sha", ref.HeadSHA),
+			slog.String("error", err.Error()))
+		return nil
+	}
+	changedFiles := make([]string, 0, len(cmp.Files))
+	for _, f := range cmp.Files {
+		changedFiles = append(changedFiles, f.Path)
+	}
+	findings := filterHighSeverity(filterToDiffFiles(alerts, changedFiles))
+	// Canonical order so the per-epoch dedup compares set-for-set
+	// regardless of GitHub's page ordering.
+	sort.Slice(findings, func(i, j int) bool { return findings[i].Number < findings[j].Number })
+
+	// Step 4: per-epoch idempotency. Read existing entries; on a read
+	// error skip rather than risk a duplicate (a redelivery retries).
+	floor := d.latestFixupFloorSeq(ctx, runID)
+	existing, err := d.Audit.ListForRunByCategory(ctx, runID, AuditCategorySecurityFindings)
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"code_scanning_alert: list prior findings failed; skipping to avoid a duplicate",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return nil
+	}
+	if latest := latestEntryAfter(existing, floor); latest != nil && sameFindingSet(latest, findings) {
+		d.logger().LogAttrs(ctx, slog.LevelDebug,
+			"code_scanning_alert: finding set unchanged this epoch; idempotent skip",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("run_id", runID.String()),
+			slog.Int("finding_count", len(findings)))
+		return nil
+	}
+
+	d.writeSecurityFindingsAudit(ctx, ev, match, ref, findings, d.now())
+	d.logger().LogAttrs(ctx, slog.LevelInfo,
+		"code_scanning_alert: recorded security findings",
+		slog.String("delivery_id", ev.DeliveryID),
+		slog.String("run_id", runID.String()),
+		slog.String("head_sha", ref.HeadSHA),
+		slog.Int("finding_count", len(findings)),
+	)
+	return nil
+}
+
+// findRunForCodeScanning matches an analyzed commit to the run whose
+// implement diff it belongs to. It lists the repo's recent runs and,
+// for each non-cancelled one, checks the analyzed head-SHA against the
+// run's implement pull_request artifact head OR any later fixup_pushed
+// head (a fixup re-push moves the head the re-scan fires on, while the
+// PR artifact keeps the original head — matching both keeps a
+// post-fixup re-scan attributable). Returns the matched run, the
+// implement stage the finding entry attaches to, and the base SHA the
+// diff is taken from.
+func (d *Dispatcher) findRunForCodeScanning(ctx context.Context, repo, headSHA string) (codeScanMatch, bool) {
+	if d.Runs == nil || d.Artifacts == nil || repo == "" || headSHA == "" {
+		return codeScanMatch{}, false
+	}
+	runs, err := d.Runs.ListRuns(ctx, run.ListRunsFilter{Repo: repo, Limit: 25})
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"code_scanning_alert: list runs failed",
+			slog.String("repo", repo),
+			slog.String("error", err.Error()))
+		return codeScanMatch{}, false
+	}
+	for _, r := range runs {
+		if r.State == run.StateCancelled {
+			// Lineage manually stopped; don't attribute findings to it.
+			continue
+		}
+		stage, baseSHA, artHead, ok := d.implementPRArtifact(ctx, r.ID)
+		if !ok {
+			continue
+		}
+		if artHead == headSHA || d.fixupHeadMatches(ctx, r.ID, headSHA) {
+			return codeScanMatch{run: r, stage: stage, baseSHA: baseSHA}, true
+		}
+	}
+	return codeScanMatch{}, false
+}
+
+// implementPRArtifact returns the run's first implement-stage
+// pull_request artifact's base/head SHAs and the owning stage. ok is
+// false when the run has no implement PR artifact yet (no PR opened) —
+// such a run can't own a code-scanning finding.
+func (d *Dispatcher) implementPRArtifact(ctx context.Context, runID uuid.UUID) (*run.Stage, string, string, bool) {
+	stages, err := d.Runs.ListStagesForRun(ctx, runID)
+	if err != nil {
+		return nil, "", "", false
+	}
+	for _, s := range stages {
+		if s.Type != run.StageTypeImplement {
+			continue
+		}
+		arts, err := d.Artifacts.ListForStage(ctx, s.ID)
+		if err != nil {
+			return nil, "", "", false
+		}
+		for _, a := range arts {
+			if a.Kind != artifact.KindPullRequest {
+				continue
+			}
+			base, head := decodeArtifactBaseHead(a.Content)
+			if head == "" {
+				continue
+			}
+			return s, base, head, true
+		}
+	}
+	return nil, "", "", false
+}
+
+// fixupHeadMatches reports whether headSHA equals the pushed commit of
+// any fixup_pushed audit entry for the run. A fixup re-push moves the
+// branch tip to a new commit the post-fixup CodeQL re-scan fires on, so
+// the analyzed commit_oid won't equal the original PR artifact head;
+// matching the fixup heads keeps the clean re-scan attributable so the
+// gate can clear. Best-effort: a read error reports no match.
+func (d *Dispatcher) fixupHeadMatches(ctx context.Context, runID uuid.UUID, headSHA string) bool {
+	entries, err := d.Audit.ListForRunByCategory(ctx, runID, categoryFixupPushed)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if decodeArtifactHeadSHA(e.Payload) == headSHA {
+			return true
+		}
+	}
+	return false
+}
+
+// latestFixupFloorSeq returns the sequence of the run's most-recent
+// stage_fixup_triggered audit entry, or 0 when there is none. It is the
+// per-epoch floor: a securityscan entry recorded after it belongs to
+// the current fixup epoch. Best-effort — a read error returns 0, which
+// only widens the dedup window (compare against all prior entries),
+// never silently double-records.
+func (d *Dispatcher) latestFixupFloorSeq(ctx context.Context, runID uuid.UUID) int64 {
+	entries, err := d.Audit.ListForRunByCategory(ctx, runID, categoryStageFixupTriggered)
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"code_scanning_alert: list fixup-trigger entries failed; flooring at 0",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return 0
+	}
+	var floor int64
+	for _, e := range entries {
+		if e.Sequence > floor {
+			floor = e.Sequence
+		}
+	}
+	return floor
+}
+
+// latestEntryAfter returns the highest-sequence entry strictly above
+// floor, or nil when none — the current epoch's recorded finding state.
+func latestEntryAfter(entries []*audit.Entry, floor int64) *audit.Entry {
+	var latest *audit.Entry
+	for _, e := range entries {
+		if e.Sequence <= floor {
+			continue
+		}
+		if latest == nil || e.Sequence > latest.Sequence {
+			latest = e
+		}
+	}
+	return latest
+}
+
+// sameFindingSet reports whether the recorded entry's finding set
+// matches findings by alert Number — the stable dedup key per the
+// securityscan.Finding contract. A payload that can't be decoded counts
+// as different (record, don't suppress) so a malformed prior row never
+// masks a real finding.
+func sameFindingSet(entry *audit.Entry, findings []Finding) bool {
+	var prev securityFindingsPayload
+	if err := json.Unmarshal(entry.Payload, &prev); err != nil {
+		return false
+	}
+	if len(prev.Findings) != len(findings) {
+		return false
+	}
+	prevNums := make([]int, len(prev.Findings))
+	for i, f := range prev.Findings {
+		prevNums[i] = f.Number
+	}
+	curNums := make([]int, len(findings))
+	for i, f := range findings {
+		curNums[i] = f.Number
+	}
+	sort.Ints(prevNums)
+	sort.Ints(curNums)
+	for i := range curNums {
+		if curNums[i] != prevNums[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// decodeArtifactBaseHead pulls base_sha + head_sha out of a
+// pull_request artifact's JSON content. Mirrors decodeArtifactHeadSHA;
+// the code-scanning path needs the base too (ComparePatch diffs
+// base...head to intersect alerts against the implement diff).
+func decodeArtifactBaseHead(content []byte) (base, head string) {
+	if len(content) == 0 {
+		return "", ""
+	}
+	var body struct {
+		HeadSHA string `json:"head_sha"`
+		BaseSHA string `json:"base_sha"`
+	}
+	if err := json.Unmarshal(content, &body); err != nil {
+		return "", ""
+	}
+	return body.BaseSHA, body.HeadSHA
+}
+
+// writeSecurityFindingsAudit records ONE securityscan finding entry
+// against the matched implement stage (#1096). It is a SEPARATE audit
+// category from review-verdict concerns — a finding here is its own
+// signal and must not consume a design-concern fixup pass. Best-effort:
+// an append failure logs but does not fail the delivery.
+func (d *Dispatcher) writeSecurityFindingsAudit(ctx context.Context, ev Event, match codeScanMatch,
+	ref *CodeScanningRef, findings []Finding, now time.Time) {
+	systemKind := audit.ActorKind("system")
+	if findings == nil {
+		findings = []Finding{}
+	}
+	payload, _ := json.Marshal(securityFindingsPayload{
+		Repo:         ev.Repo,
+		Ref:          ref.Ref,
+		HeadSHA:      ref.HeadSHA,
+		BaseSHA:      match.baseSHA,
+		AlertNumber:  ref.AlertNumber,
+		FindingCount: len(findings),
+		Findings:     findings,
+		DeliveryID:   ev.DeliveryID,
+	})
+	stageID := match.stage.ID
+	if _, err := d.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        match.run.ID,
+		StageID:      &stageID,
+		Timestamp:    now,
+		Category:     AuditCategorySecurityFindings,
+		ActorKind:    &systemKind,
+		ActorSubject: stringPtr("github-webhook"),
+		Payload:      payload,
+	}); err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelError,
+			"code_scanning_alert: audit append failed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("run_id", match.run.ID.String()),
+			slog.String("error", err.Error()))
+	}
 }
 
 func (d *Dispatcher) logger() *slog.Logger {
