@@ -174,9 +174,21 @@ func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) [
 		}
 	}
 
-	// Hard ceiling reached: merge-with-follow-up or a fresh run.
+	// Hard ceiling reached: merge-with-follow-up, an operator commit-and-vouch
+	// for a late CI/SAST finding (#1097), or a fresh run. The commit_and_vouch
+	// arm mirrors ciFailedNextActions (next_actions.go): commit the fix on the
+	// run branch then fishhawk_vouch_commit so the operator-authored commit
+	// clears the run's sole-writer lineage gate (ADR-035) WITHOUT consuming a
+	// fix-up pass — the sanctioned in-loop remedy past the ceiling.
 	return []SuggestedAction{
 		mergeWithFollowUp,
+		{
+			Action:       "commit_and_vouch",
+			Params:       prParams(run),
+			Precondition: fmt.Sprintf("the hard fix-up ceiling of %d total passes is reached and a late CI/SAST finding still needs an in-loop fix", fixupCeiling),
+			Consumes:     consumesNone,
+			Reason:       "commit the fix on the run branch, then fishhawk_vouch_commit (operator/operator-agent token, NOT the run's fhm_ token) so the operator-authored commit clears the run's sole-writer lineage gate without breaking ADR-035 (#1068/#1044)",
+		},
 		{
 			Action:       "fishhawk_start_run",
 			Params:       nil,
@@ -296,14 +308,14 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 		}, nil
 	}
 
-	// Hard ceiling reached: no override left — merge-with-follow-up or a
-	// fresh run.
+	// Hard ceiling reached: no override left — merge-with-follow-up, a
+	// commit-and-vouch for a late CI/SAST finding (#1097), or a fresh run.
 	return &ReviewActionHint{
 		Concerns:             concerns,
 		RemainingFixupBudget: 0,
 		OverrideAvailable:    false,
 		Message: fmt.Sprintf(
-			"%d concern(s) remain but the hard fix-up ceiling of %d total passes is reached — no override left. Merge now and file a follow-up, or start a fresh run to address them.",
+			"%d concern(s) remain but the hard fix-up ceiling of %d total passes is reached — no override left. Merge now and file a follow-up; for a late CI/SAST finding, commit the fix on the run branch then fishhawk_vouch_commit it (operator/operator-agent token, NOT the run's fhm_ token) so the operator commit clears the run's sole-writer lineage gate (ADR-035, #1068/#1044); or start a fresh run to address them.",
 			concerns, fixupCeiling),
 	}, nil
 }

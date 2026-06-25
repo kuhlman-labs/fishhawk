@@ -101,6 +101,10 @@ func TestReviewActionHintFor(t *testing.T) {
 		wantConcerns      int
 		wantRemaining     int
 		wantOverride      bool
+		// wantMessageContains, when non-empty, asserts the hint Message
+		// contains this substring — used to pin the #1097 commit-and-vouch
+		// wording on the hard-ceiling arm.
+		wantMessageContains string
 	}{
 		{
 			name:    "nil status -> no hint",
@@ -195,25 +199,27 @@ func TestReviewActionHintFor(t *testing.T) {
 			// must key off RAW priorPasses=3, which is at the ceiling => no
 			// override left. This is the case that truly distinguishes raw
 			// from effective.
-			name:          "ceiling keys off raw passes despite refund -> no override",
-			status:        completeStatus(),
-			seedConcerns:  1,
-			priorPasses:   3,
-			refunds:       1,
-			wantNil:       false,
-			wantConcerns:  1,
-			wantRemaining: 0,
-			wantOverride:  false,
+			name:                "ceiling keys off raw passes despite refund -> no override",
+			status:              completeStatus(),
+			seedConcerns:        1,
+			priorPasses:         3,
+			refunds:             1,
+			wantNil:             false,
+			wantConcerns:        1,
+			wantRemaining:       0,
+			wantOverride:        false,
+			wantMessageContains: "fishhawk_vouch_commit",
 		},
 		{
-			name:          "ceiling reached -> hard-stop hint, no override",
-			status:        completeStatus(),
-			seedConcerns:  1,
-			priorPasses:   3,
-			wantNil:       false,
-			wantConcerns:  1,
-			wantRemaining: 0,
-			wantOverride:  false,
+			name:                "ceiling reached -> hard-stop hint, no override",
+			status:              completeStatus(),
+			seedConcerns:        1,
+			priorPasses:         3,
+			wantNil:             false,
+			wantConcerns:        1,
+			wantRemaining:       0,
+			wantOverride:        false,
+			wantMessageContains: "fishhawk_vouch_commit",
 		},
 		{
 			name:              "fix-up on a different stage does not consume budget -> below-budget hint",
@@ -326,6 +332,11 @@ func TestReviewActionHintFor(t *testing.T) {
 				if strings.Contains(hint.Message, "concern indices") {
 					t.Errorf("Message still points at deprecated positional indices; got %q", hint.Message)
 				}
+			}
+			// #1097: the hard-ceiling Message must surface the commit-and-vouch
+			// remedy for a late CI/SAST finding.
+			if tc.wantMessageContains != "" && !strings.Contains(hint.Message, tc.wantMessageContains) {
+				t.Errorf("Message should contain %q; got %q", tc.wantMessageContains, hint.Message)
 			}
 		})
 	}
@@ -453,14 +464,26 @@ func TestReviewActionHint_SuggestedActions(t *testing.T) {
 		}
 	})
 
-	t.Run("ceiling reached -> merge-with-follow-up or fresh run", func(t *testing.T) {
+	t.Run("ceiling reached -> merge-with-follow-up, commit-and-vouch, or fresh run", func(t *testing.T) {
 		h := &ReviewActionHint{Concerns: 1, RemainingFixupBudget: 0, OverrideAvailable: false}
 		actions := h.suggestedActions(run, stageID)
-		if len(actions) != 2 || actions[0].Action != "merge_and_file_follow_up" || actions[1].Action != "fishhawk_start_run" {
-			t.Fatalf("actions = %+v, want [merge_and_file_follow_up fishhawk_start_run]", actions)
+		if len(actions) != 3 ||
+			actions[0].Action != "merge_and_file_follow_up" ||
+			actions[1].Action != "commit_and_vouch" ||
+			actions[2].Action != "fishhawk_start_run" {
+			t.Fatalf("actions = %+v, want [merge_and_file_follow_up commit_and_vouch fishhawk_start_run]", actions)
 		}
-		if actions[1].Consumes != consumesNewRun {
-			t.Errorf("fresh-run consumes = %q, want new_run", actions[1].Consumes)
+		// #1097: commit-and-vouch is the in-loop remedy for a late CI/SAST
+		// finding at the ceiling — it consumes NO fix-up budget and steers the
+		// operator at fishhawk_vouch_commit.
+		if actions[1].Consumes != consumesNone {
+			t.Errorf("commit_and_vouch consumes = %q, want none", actions[1].Consumes)
+		}
+		if !strings.Contains(actions[1].Reason, "fishhawk_vouch_commit") {
+			t.Errorf("commit_and_vouch reason should name fishhawk_vouch_commit; got %q", actions[1].Reason)
+		}
+		if actions[2].Consumes != consumesNewRun {
+			t.Errorf("fresh-run consumes = %q, want new_run", actions[2].Consumes)
 		}
 	})
 }

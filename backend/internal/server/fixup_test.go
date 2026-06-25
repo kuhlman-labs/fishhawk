@@ -891,6 +891,11 @@ func TestFixupStage_CeilingReachedReturns422(t *testing.T) {
 	if strings.Contains(w.Body.String(), "fixup_budget_exhausted") {
 		t.Errorf("body should carry the distinct ceiling code, not budget_exhausted: %s", w.Body.String())
 	}
+	// #1097: the 422 must surface the vouch-commit remediation pointer so a
+	// late CI/SAST finding has a discoverable in-loop path at the ceiling.
+	if !strings.Contains(w.Body.String(), "remediation") || !strings.Contains(w.Body.String(), "fishhawk_vouch_commit") {
+		t.Errorf("body missing the vouch-commit remediation pointer: %s", w.Body.String())
+	}
 	// Exactly three fix-up entries — the refused pass wrote none.
 	n := 0
 	for _, e := range au.appended {

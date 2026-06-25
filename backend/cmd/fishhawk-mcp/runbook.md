@@ -71,6 +71,30 @@ budget and wedges the run. Before approving a fixup, cross-check the
 files-changed against the plan scope; if a pass would be a no-op, abandon and
 start a fresh run instead.
 
+### Late CI/SAST finding after the fix-up ceiling
+
+The bounded fix-up budget is hard-capped at 3 total passes per implement stage
+(normal pass + operator overrides). Once that ceiling is reached,
+`fishhawk_fixup_stage` refuses with `422 fixup_ceiling_reached` and the MCP
+`review_action_hint` stops offering an override. A required external check
+(CodeQL/SAST) can still surface a late finding at that point, and there is no
+fix-up pass left to route it through the agent.
+
+The sanctioned in-loop remedy is the operator-vouched patch path (#1068/#1044),
+NOT a separate CI/SAST budget: commit the one-line fix on the run branch
+yourself, then `fishhawk_vouch_commit` it. The vouch unions your operator
+commit into the run's reported-head ledger so it clears the ADR-035
+sole-writer lineage gate — the run is not wedged with a `foreign_commit_on_branch`
+failure, and the operator commit is attributed in the audit chain.
+
+Use the **operator / operator-agent token** for the vouch. `fishhawk_vouch_commit`
+rejects a run-bound `mcp:run:<uuid>` (`fhm_`) token outright
+(`run_token_forbidden`) by design — an agent self-declaring lineage for a
+commit on its own branch would defeat the cross-write protection the vouch
+exists to preserve. So the surfaced remedy is only actionable with the operator
+token. If the finding is not worth an in-loop fix, the ceiling-reached hint's
+other arms still apply: merge with a follow-up issue, or start a fresh run.
+
 ### Scope-amendment decide / naming flow
 
 When the implement agent discovers a file it must change that is outside the

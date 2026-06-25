@@ -281,14 +281,17 @@ func TestNextActions_StateTable(t *testing.T) {
 			wantConsumes: []string{consumesNone, consumesNone, consumesFixupBudget},
 		},
 		{
-			name:         "h_concerns_open_ceiling_reached",
-			run:          naRun("running"),
-			stages:       []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_approval")},
-			implRS:       naReviewStatus("implement", "complete"),
-			hint:         &ReviewActionHint{Concerns: 1, RemainingFixupBudget: 0, OverrideAvailable: false},
-			wantState:    "implement_concerns_open",
-			wantActions:  []string{"merge_and_file_follow_up", "fishhawk_start_run"},
-			wantConsumes: []string{consumesNone, consumesNewRun},
+			name:      "h_concerns_open_ceiling_reached",
+			run:       naRun("running"),
+			stages:    []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_approval")},
+			implRS:    naReviewStatus("implement", "complete"),
+			hint:      &ReviewActionHint{Concerns: 1, RemainingFixupBudget: 0, OverrideAvailable: false},
+			wantState: "implement_concerns_open",
+			// #1097: the ceiling-reached arm now also advertises commit_and_vouch
+			// (the operator-vouched patch path for a late CI/SAST finding), which
+			// consumes no fix-up budget, between merge-with-follow-up and a fresh run.
+			wantActions:  []string{"merge_and_file_follow_up", "commit_and_vouch", "fishhawk_start_run"},
+			wantConsumes: []string{consumesNone, consumesNone, consumesNewRun},
 		},
 		{
 			name:         "implement_gate_settled_merge_ritual",

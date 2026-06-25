@@ -508,8 +508,22 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 			// Placed BEFORE the budget-exhausted arm so the distinct
 			// hard-stop error is not masked (the override cannot push past
 			// this — #860).
+			//
+			// #1097: the ceiling is a hard stop for AGENT-routed fix-up, but a
+			// late CI/SAST finding can still be remedied in-loop without
+			// breaking ADR-035 sole-writer lineage — commit the one-line fix on
+			// the run branch, then fishhawk_vouch_commit it (the #1068/#1044
+			// operator-vouched patch path). Surface that as a stable
+			// remediation pointer alongside the existing ceiling/used keys so
+			// the path is discoverable at the exact error where it is needed.
+			// Operator/operator-agent token only: fishhawk_vouch_commit rejects
+			// a run-bound mcp:run:<uuid> token (run_token_forbidden).
 			s.writeError(w, r, http.StatusUnprocessableEntity, "fixup_ceiling_reached",
-				err.Error(), map[string]any{"ceiling": defaultFixupCeiling, "used": priorPasses})
+				err.Error(), map[string]any{
+					"ceiling":     defaultFixupCeiling,
+					"used":        priorPasses,
+					"remediation": "fix-up ceiling reached; for a late CI/SAST finding, commit the fix on the run branch then fishhawk_vouch_commit it (operator/operator-agent token, NOT the run's fhm_ token) so the operator commit clears the run's sole-writer lineage gate without breaking ADR-035 (#1068/#1044). Otherwise merge with a follow-up or start a fresh run.",
+				})
 			return
 		case errors.Is(err, run.ErrFixupBudgetExhausted):
 			s.writeError(w, r, http.StatusUnprocessableEntity, "fixup_budget_exhausted",
