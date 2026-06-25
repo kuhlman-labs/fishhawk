@@ -43,6 +43,32 @@ on:
         required: false
         type: string
         default: claude-code
+      parent_run_id:
+        # The decomposition-parent run UUID, set by the backend dispatcher
+        # (orchestrator.go fireDispatch) ONLY for a decomposed-fan-out child;
+        # empty for a normal run. The concurrency: group below keys off it so
+        # the sibling child jobs of one fan-out share a group. (#1227)
+        description: 'Decomposition-parent run UUID — set only for fan-out children; keys the runner-pool concurrency guard'
+        required: false
+        type: string
+        default: ''
+
+# #1227: bound the customer's GitHub Actions runner pool under a decomposition
+# fan-out. The backend dispatches a distinct workflow_dispatch per decomposed
+# child (capped by FISHHAWKD_MAX_PARALLEL_CHILDREN), but that does not bound the
+# customer's concurrent-job capacity. Sibling children of one fan-out share
+# parent_run_id, so this group queues them — cancel-in-progress: false NEVER
+# cancels a running stage — serializing the fan-out to one runner at a time as a
+# capacity guard. A normal run has an empty parent_run_id, so the group falls
+# back to the unique Actions run id and is NEVER serialized.
+#
+# Tradeoff: a fan-out runs sequentially at the Actions layer regardless of how
+# many runners are free. A well-provisioned customer who wants parallel children
+# can widen the group (e.g. add a bucket to parent_run_id) or remove this block;
+# it is a conservative safe default for capacity-constrained pools.
+concurrency:
+  group: fishhawk-run-${{ inputs.parent_run_id || github.run_id }}
+  cancel-in-progress: false
 
 permissions:
   # id-token: write — the auth pre-step (#201) mints a GitHub

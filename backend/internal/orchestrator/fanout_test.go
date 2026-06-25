@@ -1103,6 +1103,12 @@ func TestDispatchDecomposedChildren_GitHubActions_FiresPerChildDispatch(t *testi
 		if stageID != wantStage {
 			t.Errorf("call %d stage_id = %q, want %q (child %s implement stage)", i, stageID, wantStage, runID)
 		}
+		// #1227: every decomposed child carries its decomposition-parent id as
+		// parent_run_id so the customer workflow can key an Actions concurrency:
+		// group on the run family and serialize siblings.
+		if got := call.Inputs["parent_run_id"]; got != parent.ID.String() {
+			t.Errorf("call %d parent_run_id = %q, want %q (the decomposition parent / run family)", i, got, parent.ID.String())
+		}
 		// Pairwise distinct run_id + stage_id across calls — proves per-slice
 		// independence (no shared branch target).
 		if seenRun[runID] {
