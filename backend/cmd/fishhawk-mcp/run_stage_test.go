@@ -1699,3 +1699,40 @@ func TestRunStage_NextActions_SurfacedAfterStage(t *testing.T) {
 		t.Errorf("next_actions should offer fishhawk_approve_plan at the parked plan gate; got %+v", out.NextActions.Actions)
 	}
 }
+
+// TestRunStage_BlocksHostDispatchAgainstActionsLockedRun asserts the #1355
+// guardrail on the SYNCHRONOUS host-dispatch verb: a run already LOCKED to
+// runner_kind=github_actions returns a non-nil error and spawns ZERO runners,
+// just like the detached fishhawk_dispatch_stage path. Both host-dispatch entry
+// points must enforce the same pre-execution block.
+func TestRunStage_BlocksHostDispatchAgainstActionsLockedRun(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	argv := captureArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+	fb.getRunByID[runID] = Run{
+		ID:                 runID.String(),
+		State:              "running",
+		RunnerKind:         "github_actions",
+		RunnerKindResolved: true,
+	}
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		Workflow:   "feature_change",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	})
+	if err == nil {
+		t.Fatal("expected a pre-dispatch block error for a github_actions-locked run")
+	}
+	if !strings.Contains(err.Error(), "github_actions") {
+		t.Errorf("block error should name the locked kind: %v", err)
+	}
+	if len(*argv) != 0 {
+		t.Errorf("a blocked run_stage must spawn ZERO runners, got argv %v", *argv)
+	}
+}

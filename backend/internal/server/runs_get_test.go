@@ -89,6 +89,50 @@ func TestGetRun_EchoesDrive(t *testing.T) {
 	}
 }
 
+// TestGetRun_EchoesRunnerKindResolved asserts GET /v0/runs/{id} projects the
+// run's runner_kind_resolved lock flag (#1346/#1348/#1355) onto the read
+// surface, always present (false for legacy/un-resolved rows) so the
+// host-dispatch guardrail can read it.
+func TestGetRun_EchoesRunnerKindResolved(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+
+	seeded, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI,
+	})
+	// The fake returns the stored pointer; stamp the lock flag directly to
+	// model a row whose first signed runner self-report LOCKED runner_kind.
+	seeded.RunnerKindResolved = true
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", seeded.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp runResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if !resp.RunnerKindResolved {
+		t.Errorf("RunnerKindResolved = false, want true")
+	}
+
+	// An un-resolved run still carries the field explicitly (no omitempty).
+	plain, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI,
+	})
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", plain.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"runner_kind_resolved":false`) {
+		t.Errorf("body should carry an explicit runner_kind_resolved:false: %s", w.Body.String())
+	}
+}
+
 // TestGetRun_LineageComplete asserts GET /v0/runs/{id} computes the
 // E22.X / #1137 lineage_complete signal across solo and decomposed
 // graphs: a terminal solo run is complete; a non-terminal run is not; a

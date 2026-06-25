@@ -42,6 +42,12 @@ type runResponse struct {
 	RetryAttempt       int        `json:"retry_attempt"`
 	MaxRetriesSnapshot int        `json:"max_retries_snapshot"`
 	RunnerKind         string     `json:"runner_kind"`
+	// RunnerKindResolved echoes whether RunnerKind has been LOCKED by the
+	// run's first signed runner self-report (#1346/#1348). Always emitted
+	// (false for legacy / un-resolved rows), matching drive / cost_usd_total
+	// / resolved_model. The host-dispatch guardrail (#1355) reads this lock
+	// flag to engage only against an already-resolved conflicting kind.
+	RunnerKindResolved bool `json:"runner_kind_resolved"`
 	// Drive echoes the run's persisted drive-mode flag (#1023).
 	// Always emitted; false for legacy rows (migration 0031).
 	Drive        bool                 `json:"drive"`
@@ -224,6 +230,7 @@ func toRunResponse(r *run.Run) runResponse {
 		RetryAttempt:       r.RetryAttempt,
 		MaxRetriesSnapshot: r.MaxRetriesSnapshot,
 		RunnerKind:         r.RunnerKind,
+		RunnerKindResolved: r.RunnerKindResolved,
 		Drive:              r.Drive,
 		CostUSDTotal:       r.CostUSDTotal,
 		ResolvedModel:      r.ResolvedModel,

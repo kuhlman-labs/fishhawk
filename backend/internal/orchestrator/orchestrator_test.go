@@ -507,6 +507,59 @@ func TestAdvance_DispatchesNextAgentStage(t *testing.T) {
 	}
 }
 
+// TestAdvance_LocalLockedRun_SkipsWorkflowDispatch asserts the Actions-direction
+// half of the #1355 runner_kind mismatch guardrail: a run already LOCKED to
+// runner_kind=local must NOT fire a github_actions workflow_dispatch (which
+// would be a phantom Actions run against a local-locked run). The stage still
+// advances to dispatched; only the Actions firing is skipped.
+func TestAdvance_LocalLockedRun_SkipsWorkflowDispatch(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	r, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	// Lock the run to the local channel.
+	r.RunnerKind = run.RunnerKindLocal
+	r.RunnerKindResolved = true
+
+	out, err := o.Advance(context.Background(), r.ID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out != OutcomeDispatched {
+		t.Errorf("Outcome = %q, want dispatched (the stage still advances)", out)
+	}
+	if stages[1].State != run.StageStateDispatched {
+		t.Errorf("stage[1].State = %q, want dispatched", stages[1].State)
+	}
+	// The local lock must suppress the github_actions workflow_dispatch.
+	if len(gh.calls) != 0 {
+		t.Errorf("workflow_dispatch fired for a local-locked run: %d", len(gh.calls))
+	}
+}
+
+// TestAdvance_GitHubActionsLockedRun_StillFires is the negative control for the
+// #1355 Actions-direction guard: a run LOCKED to runner_kind=github_actions
+// fires the workflow_dispatch normally (the guard engages only on the local
+// lock). The default-seeded un-resolved case is covered by
+// TestAdvance_DispatchesNextAgentStage.
+func TestAdvance_GitHubActionsLockedRun_StillFires(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	r, _ := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	r.RunnerKind = run.RunnerKindGitHubActions
+	r.RunnerKindResolved = true
+
+	if _, err := o.Advance(context.Background(), r.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Errorf("workflow_dispatch calls = %d, want 1 for a github_actions-locked run", len(gh.calls))
+	}
+}
+
 func TestAdvance_HumanStage_TransitionsToAwaitingApproval(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
 	_, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{

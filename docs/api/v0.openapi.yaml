@@ -334,8 +334,9 @@ components:
         table in `backend/internal/run/transition.go`.
       required:
         [id, repo, workflow_id, workflow_sha, trigger_source, state,
-         retry_attempt, max_retries_snapshot, runner_kind, drive,
-         cost_usd_total, resolved_model, created_at, updated_at]
+         retry_attempt, max_retries_snapshot, runner_kind,
+         runner_kind_resolved, drive, cost_usd_total, resolved_model,
+         created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/UUID' }
         repo:
@@ -419,6 +420,19 @@ components:
             pre-pluggable-backends view via
             `GET /v0/runs?runner_kind=github_actions`.
           example: github_actions
+        runner_kind_resolved:
+          type: boolean
+          description: |
+            Whether `runner_kind` has been LOCKED by the run's first
+            signed runner self-report (#1346 / #1348). `false` for the
+            un-resolved create-time hint and for legacy rows; `true`
+            once the first dispatch's signed self-report fixed the
+            execution channel. The host-dispatch mismatch guardrail
+            (#1355) reads this so it engages only against an
+            already-resolved conflicting kind — an un-resolved run is
+            always allowed to dispatch so first-dispatch auto-resolve
+            still fires.
+          example: false
         drive:
           type: boolean
           description: |

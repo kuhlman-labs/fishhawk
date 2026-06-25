@@ -1870,6 +1870,21 @@ func pullRequestNumberFromURL(u string) (int, error) {
 // decomposed child the dispatch is annotated with structured slice_index /
 // decomposed_from log fields so the per-slice fan-out is observable.
 func (o *Orchestrator) fireDispatch(ctx context.Context, r *run.Run, next *run.Stage) error {
+	// Pre-dispatch runner_kind mismatch guardrail, Actions direction (#1355,
+	// the ADR-045 guardrail variant #1346 deferred). A workflow_dispatch fires
+	// a GitHub Actions runner; firing one against a run already LOCKED to
+	// runner_kind=local is a guaranteed channel mismatch that #1348 would only
+	// FLAG after execution. Skip the dispatch instead. Engages ONLY on the
+	// LOCKED state (RunnerKindResolved == true) so an un-resolved run still
+	// auto-resolves on its first dispatch (#1346 decision-1) and a
+	// github_actions-locked run fires unchanged.
+	if r.RunnerKindResolved && r.RunnerKind == run.RunnerKindLocal {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: run locked to runner_kind=local; skipping github_actions workflow_dispatch",
+			slog.String("run_id", r.ID.String()),
+			slog.String("runner_kind", r.RunnerKind),
+		)
+		return nil
+	}
 	if o.GitHub == nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: GitHub not configured; skipping workflow_dispatch",
 			slog.String("run_id", r.ID.String()),
