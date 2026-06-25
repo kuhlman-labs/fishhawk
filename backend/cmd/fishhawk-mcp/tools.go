@@ -884,6 +884,10 @@ type GetRunStatusOutput struct {
 	// cost_recorded ledger. Omitted when the run has no cost data or the
 	// fetch failed — DISPLAY-ONLY, never gates a run.
 	CacheEfficiency *CacheEfficiency `json:"cache_efficiency,omitempty" jsonschema:"per-run prompt-cache efficiency derived from the cost ledger (ADR-044): cache_read_ratio (share of input served from cache), reuse_factor (re-reads per cache-write token), and gross/penalty/net USD savings, with a per-stage (plan_review|implement_review|agent) breakdown. Omitted when the run has no cost data. Display-only — never blocks the run"`
+	// Cost is the run's estimated cost surface (#1372), fetched best-effort
+	// and derived from the run's cost_recorded ledger. Omitted when the run has
+	// no cost data or the fetch failed — DISPLAY-ONLY, never gates a run.
+	Cost *RunCost `json:"cost,omitempty" jsonschema:"per-run estimated cost derived from the cost ledger (#1372): total_cost_usd, a per-stage (agent|plan_review|implement_review) breakdown, and — when the run resolved to a merged PR — a cost-per-merged-PR rollup (cost_per_merged_pr_usd summed across every run on that PR plus run_count). Omitted when the run has no cost data. Display-only — never blocks the run"`
 	// ReviewActionHint is a display-only next-action pointer (#777) surfaced
 	// when the implement review has landed with unresolved approve_with_concerns
 	// concerns and the bounded fix-up budget is not yet spent. It points at
@@ -1113,6 +1117,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	// field stays nil — never fails the snapshot.
 	budgetStatus, _ := r.fetchBudgetStatus(ctx, runID)
 	cacheEfficiency, _ := r.fetchCacheEfficiency(ctx, runID)
+	runCost, _ := r.fetchRunCost(ctx, runID)
 
 	// Best-effort review-action hint (#777). Derived from the SAME
 	// implementReviewStatus computed above (single audit read — the hint
@@ -1162,6 +1167,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 		ImplementStageWaitStatus: implementStageWaitStatus,
 		Budget:                   budgetStatus,
 		CacheEfficiency:          cacheEfficiency,
+		Cost:                     runCost,
 		ReviewActionHint:         reviewActionHint,
 		ImplementReviewMergeHint: implementReviewMergeHint(implementReviewStatus),
 		DriveStatus:              view.driveStatus(),
@@ -1579,6 +1585,18 @@ func (r *runResolver) fetchCacheEfficiency(ctx context.Context, runID uuid.UUID)
 		return nil, fmt.Sprintf("cache efficiency unavailable: %v", err)
 	}
 	return ce, ""
+}
+
+// fetchRunCost retrieves the run's estimated-cost surface best-effort,
+// mirroring fetchCacheEfficiency. It NEVER fails the caller: on any error it
+// returns (nil, <warning>); on a no-data response it returns (nil, "").
+// get_run_status discards the warning and omits the field.
+func (r *runResolver) fetchRunCost(ctx context.Context, runID uuid.UUID) (*RunCost, string) {
+	rc, err := r.api.GetRunCost(ctx, runID)
+	if err != nil {
+		return nil, fmt.Sprintf("run cost unavailable: %v", err)
+	}
+	return rc, ""
 }
 
 // registerStartRun wires the fishhawk_start_run tool (E22.1 / #390;
