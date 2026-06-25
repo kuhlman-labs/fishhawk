@@ -860,15 +860,17 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 
 // securityFindingsForRun distills the run's unresolved high-severity
 // code-scanning findings (#1096) from the newest implement_security_findings
-// audit entry. The webhook ingest records ONE idempotent entry per scan,
-// floored on the latest fix-up, so the newest entry reflects the current
-// scan state: a clean re-scan after a fix-up records an entry with no
-// findings, which surfaces as an omitted field. Returns nil — the
-// security_findings field is omitted — when the AuditRepo is unconfigured,
-// the lookup fails (warn-logged, best-effort), the run has had no scan, or
-// the newest entry carries no findings. A read failure degrades to omitted
-// rather than failing the run read, matching the Concerns / drive-surface
-// posture.
+// audit entry recorded ABOVE the latest stage_fixup_triggered floor — the same
+// floor the merge gate (auditcomplete.securityFindingsRule) applies. The floor
+// is load-bearing: the webhook writer records no clean marker entry when a
+// post-fixup re-scan comes back clean, so the floor is what lets a clean
+// re-scan clear the surface (the newest in-window entry then carries no
+// findings, or there is none). Returns nil — the security_findings field is
+// omitted — when the AuditRepo is unconfigured, either lookup fails
+// (warn-logged, best-effort), the run has had no scan, every scan predates the
+// latest fix-up, or the newest in-window entry carries no findings. A read
+// failure degrades to omitted rather than failing the run read, matching the
+// Concerns / drive-surface posture.
 func (s *Server) securityFindingsForRun(ctx context.Context, runID uuid.UUID) []securityFindingPayload {
 	if s.cfg.AuditRepo == nil {
 		return nil
@@ -882,9 +884,35 @@ func (s *Server) securityFindingsForRun(ctx context.Context, runID uuid.UUID) []
 	if len(entries) == 0 {
 		return nil
 	}
-	// Newest wins: ListForRunByCategory returns the per-run chain
-	// sequence-ascending, so the last entry is the most-recent scan.
-	newest := entries[len(entries)-1]
+	// Floor on the latest fix-up, exactly as the merge gate
+	// (auditcomplete.securityFindingsRule) does: a securityscan entry
+	// recorded before the most recent stage_fixup_triggered is stale (the
+	// fix-up may have resolved it), so the current scan is the newest entry
+	// recorded ABOVE that floor. This matters because the webhook writer
+	// (codescanning.go recordSecurityScan) deliberately records NO clean
+	// marker entry in the post-fixup-clean path — so "newest overall" would
+	// still be the pre-fixup dirty entry even after a clean re-scan cleared
+	// the gate, surfacing a resolved finding (#1096). A floor-read failure
+	// degrades to an omitted field (best-effort), matching the posture above.
+	floorSeq, ferr := s.latestFixupSequenceForRun(ctx, runID)
+	if ferr != nil {
+		s.cfg.Logger.Warn("list fixup markers failed; omitting security_findings block",
+			"run_id", runID.String(), "error", ferr.Error())
+		return nil
+	}
+	newestIdx := -1
+	for i := range entries {
+		if entries[i].Sequence > floorSeq {
+			newestIdx = i
+		}
+	}
+	if newestIdx == -1 {
+		// Every recorded scan predates the latest fix-up: the clean re-scan
+		// either cleared the findings (no marker written) or has not landed
+		// yet. Omit — the gate floors identically.
+		return nil
+	}
+	newest := entries[newestIdx]
 	var payload securityFindingsAuditPayload
 	if err := json.Unmarshal(newest.Payload, &payload); err != nil {
 		// A corrupt/undecodable payload degrades to omitted rather than
@@ -911,6 +939,25 @@ func (s *Server) securityFindingsForRun(ctx context.Context, runID uuid.UUID) []
 		})
 	}
 	return out
+}
+
+// latestFixupSequenceForRun returns the audit sequence of the most-recent
+// stage_fixup_triggered entry for the run, or 0 when none has been recorded
+// (no fix-up yet → floor 0, so every securityscan entry is in-window). Run-
+// scoped (any stage's fix-up), mirroring auditcomplete.latestFixupSequence so
+// the run-status surface and the merge gate floor identically (#1096).
+func (s *Server) latestFixupSequenceForRun(ctx context.Context, runID uuid.UUID) (int64, error) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageFixupTriggered)
+	if err != nil {
+		return 0, err
+	}
+	var latest int64
+	for _, e := range entries {
+		if e.Sequence > latest {
+			latest = e.Sequence
+		}
+	}
+	return latest, nil
 }
 
 // fixupModelForRun distills the run's most-recent fix-up model pin (#1164)

@@ -1173,11 +1173,15 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 
 // securityFindingsFor distills the run's unresolved high-severity
 // code-scanning findings (#1096) from the newest implement_security_findings
-// audit entry. Returns nil — the field is omitted — on any read/decode error
-// (best-effort, never fails the snapshot), when the run has had no scan, or
-// when the newest entry carries no findings (a clean scan or a clean re-scan
-// after a fix-up). Newest-wins: ListRunAudit returns the per-run chain
-// sequence-ascending, so the last entry is the most-recent scan state.
+// audit entry recorded ABOVE the latest stage_fixup_triggered floor — the same
+// floor the merge gate (auditcomplete.securityFindingsRule) applies. The floor
+// is load-bearing: the webhook writer records no clean marker entry when a
+// post-fixup re-scan comes back clean, so without it "newest overall" would
+// keep surfacing the pre-fixup dirty entry after a clean re-scan cleared the
+// gate. Returns nil — the field is omitted — on any read/decode error
+// (best-effort, never fails the snapshot), when the run has had no scan, when
+// every scan predates the latest fix-up, or when the newest in-window entry
+// carries no findings (a clean scan or a clean re-scan after a fix-up).
 func (r *runResolver) securityFindingsFor(ctx context.Context, runID uuid.UUID) []SecurityFinding {
 	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
 		Category: securityscan.AuditCategorySecurityFindings,
@@ -1185,7 +1189,22 @@ func (r *runResolver) securityFindingsFor(ctx context.Context, runID uuid.UUID) 
 	if err != nil || len(entries) == 0 {
 		return nil
 	}
-	newest := entries[len(entries)-1]
+	// Floor on the latest fix-up, mirroring the merge gate; a floor-read
+	// failure degrades to an omitted block (best-effort).
+	floorSeq, ferr := r.latestFixupSequenceFor(ctx, runID)
+	if ferr != nil {
+		return nil
+	}
+	newestIdx := -1
+	for i := range entries {
+		if entries[i].Sequence > floorSeq {
+			newestIdx = i
+		}
+	}
+	if newestIdx == -1 {
+		return nil
+	}
+	newest := entries[newestIdx]
 	if newest.Payload == nil {
 		return nil
 	}
@@ -1218,6 +1237,28 @@ func (r *runResolver) securityFindingsFor(ctx context.Context, runID uuid.UUID) 
 		})
 	}
 	return out
+}
+
+// latestFixupSequenceFor returns the audit sequence of the most-recent
+// stage_fixup_triggered entry for the run, or 0 when none has been recorded.
+// Run-scoped (any stage's fix-up, no stage filter), mirroring the merge gate's
+// floor (auditcomplete.latestFixupSequence) so the MCP run-status surface and
+// the gate floor the securityscan signal identically (#1096). Distinct from
+// fixupPassesAndLatestSeq, which is stage-scoped for the per-stage pass budget.
+func (r *runResolver) latestFixupSequenceFor(ctx context.Context, runID uuid.UUID) (int64, error) {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: categoryStageFixupTriggered,
+	})
+	if err != nil {
+		return 0, err
+	}
+	var latest int64
+	for _, e := range entries {
+		if e.Sequence > latest {
+			latest = e.Sequence
+		}
+	}
+	return latest, nil
 }
 
 // decompositionAuditCategories are the recent-audit markers that, present on a

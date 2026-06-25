@@ -570,6 +570,19 @@ func seedSecurityFindings(t *testing.T, au *auditFake, runID uuid.UUID, seq int6
 	})
 }
 
+// seedFixupMarker appends a stage_fixup_triggered audit entry at the given
+// sequence, so a securityscan entry seeded below it is floored out of the
+// current window (#1096) — the post-fix-up clean path the real webhook writer
+// records no clean marker for.
+func seedFixupMarker(t *testing.T, au *auditFake, runID uuid.UUID, seq int64) {
+	t.Helper()
+	rid := runID
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, Sequence: seq, Category: CategoryStageFixupTriggered,
+		Payload: json.RawMessage(`{}`), Timestamp: time.Now().UTC(),
+	})
+}
+
 // newSecurityGetServer wires a run repo + audit fake and seeds one run,
 // returning the seeded row for mutation.
 func newSecurityGetServer(t *testing.T) (*Server, *auditFake, *run.Run) {
@@ -638,6 +651,52 @@ func TestGetRun_SecurityFindings_NewestWins(t *testing.T) {
 	}
 	if _, ok := raw["security_findings"]; ok {
 		t.Errorf("clean re-scan should omit security_findings: %v", raw)
+	}
+}
+
+// TestGetRun_SecurityFindings_ClearsAfterFixupFloor reproduces the real
+// post-fix-up-clean writer path (#1096): a dirty scan is recorded (seq 5), then
+// a fix-up is triggered (seq 9), and the clean re-scan records NOTHING — the
+// webhook writer (codescanning.go recordSecurityScan) omits a clean marker
+// above the floor. The surface must still omit the resolved finding by flooring
+// on the latest stage_fixup_triggered, exactly as the merge gate does, instead
+// of surfacing the stale pre-fix-up dirty entry (the writer/reader floor
+// mismatch this fix-up closes).
+func TestGetRun_SecurityFindings_ClearsAfterFixupFloor(t *testing.T) {
+	s, au, seeded := newSecurityGetServer(t)
+	seedSecurityFindings(t, au, seeded.ID, 5, []securityscan.Finding{
+		{Number: 7, RuleID: "go/sql-injection", Severity: securityscan.SeverityHigh, Path: "pkg/bar/bar.go"},
+	})
+	seedFixupMarker(t, au, seeded.ID, 9)
+
+	resp, raw := getRunResponse(t, s, seeded.ID)
+	if len(resp.SecurityFindings) != 0 {
+		t.Errorf("security_findings = %+v, want empty (finding floored below the fix-up marker)", resp.SecurityFindings)
+	}
+	if _, ok := raw["security_findings"]; ok {
+		t.Errorf("post-fix-up clean re-scan should omit security_findings: %v", raw)
+	}
+}
+
+// TestGetRun_SecurityFindings_DirtyReScanAboveFloorReblocks: a fresh dirty
+// re-scan recorded ABOVE the fix-up floor must surface — the floor stales only
+// pre-fix-up entries, not a genuine new finding after the fix-up.
+func TestGetRun_SecurityFindings_DirtyReScanAboveFloorReblocks(t *testing.T) {
+	s, au, seeded := newSecurityGetServer(t)
+	seedSecurityFindings(t, au, seeded.ID, 5, []securityscan.Finding{
+		{Number: 7, RuleID: "go/sql-injection", Severity: securityscan.SeverityHigh, Path: "pkg/bar/bar.go"},
+	})
+	seedFixupMarker(t, au, seeded.ID, 9)
+	seedSecurityFindings(t, au, seeded.ID, 11, []securityscan.Finding{
+		{Number: 9, RuleID: "go/path-injection", Severity: securityscan.SeverityHigh, Path: "pkg/baz/baz.go"},
+	})
+
+	resp, raw := getRunResponse(t, s, seeded.ID)
+	if len(resp.SecurityFindings) != 1 || resp.SecurityFindings[0].Number != 9 {
+		t.Errorf("security_findings = %+v, want the post-fix-up finding #9", resp.SecurityFindings)
+	}
+	if _, ok := raw["security_findings"]; !ok {
+		t.Errorf("dirty re-scan above the floor should surface security_findings: %v", raw)
 	}
 }
 

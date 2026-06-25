@@ -1759,6 +1759,61 @@ func seedSecurityFindingsAudit(fb *fakeBackend, runID uuid.UUID, findings []secu
 	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], entry)
 }
 
+// TestGetRunStatus_SecurityFindings_ClearsAfterFixupFloor reproduces the real
+// post-fix-up-clean writer path (#1096): a dirty scan is recorded, then a
+// fix-up is triggered, then the clean re-scan records NOTHING (the webhook
+// writer omits a clean marker above the floor). The surface must still omit the
+// resolved finding by flooring on the latest stage_fixup_triggered — exactly as
+// the merge gate does — rather than surfacing the stale pre-fix-up dirty entry.
+func TestGetRunStatus_SecurityFindings_ClearsAfterFixupFloor(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+
+	// Dirty scan, then a fix-up triggered after it. No clean entry follows —
+	// the writer records none in the post-fix-up-clean path.
+	seedSecurityFindingsAudit(fb, runID, []securityscan.Finding{
+		{Number: 7, RuleID: "go/sql-injection", Severity: securityscan.SeverityHigh, Path: "pkg/bar/bar.go"},
+	})
+	seedFixupTriggeredAudit(fb, runID, uuid.New())
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if len(out.SecurityFindings) != 0 {
+		t.Errorf("SecurityFindings = %+v, want empty (finding floored below the fix-up marker)", out.SecurityFindings)
+	}
+}
+
+// TestGetRunStatus_SecurityFindings_DirtyReScanAboveFloorReblocks: a fresh dirty
+// re-scan recorded ABOVE the fix-up floor must surface — the floor stales only
+// pre-fix-up entries, not a genuine new finding after the fix-up.
+func TestGetRunStatus_SecurityFindings_DirtyReScanAboveFloorReblocks(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+
+	seedSecurityFindingsAudit(fb, runID, []securityscan.Finding{
+		{Number: 7, RuleID: "go/sql-injection", Severity: securityscan.SeverityHigh, Path: "pkg/bar/bar.go"},
+	})
+	seedFixupTriggeredAudit(fb, runID, uuid.New())
+	// Fresh dirty re-scan after the fix-up — above the floor, must re-block.
+	seedSecurityFindingsAudit(fb, runID, []securityscan.Finding{
+		{Number: 9, RuleID: "go/path-injection", Severity: securityscan.SeverityHigh, Path: "pkg/baz/baz.go"},
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if len(out.SecurityFindings) != 1 || out.SecurityFindings[0].Number != 9 {
+		t.Errorf("SecurityFindings = %+v, want the post-fix-up finding #9", out.SecurityFindings)
+	}
+}
+
 // TestGetRunStatus_SurfacesSecurityFindings (#1096): the run-status output
 // distills the newest implement_security_findings audit entry's findings so
 // a high-severity code-scanning finding surfaces at the review gate.

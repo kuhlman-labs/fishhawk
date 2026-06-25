@@ -365,6 +365,23 @@ func TestCodeScanningAlert_EndToEnd_WebhookGateSurface(t *testing.T) {
 	if state2 != stagecheck.StatePass {
 		t.Fatalf("gate state (clean) = %q, want pass; missing=%+v", state2, missing2)
 	}
+
+	// 6) The display surfaces MUST clear in lockstep with the gate. The writer
+	//    records no clean marker entry in the post-fix-up path, so the dirty
+	//    entry is still the newest securityscan entry overall — the REST run
+	//    response and the MCP run-status surface must floor on the latest
+	//    stage_fixup_triggered (as the gate does) and omit the resolved
+	//    finding, not keep surfacing it (the writer/reader floor mismatch).
+	resp2, raw2 := getRunResponse(t, s, runID)
+	if len(resp2.SecurityFindings) != 0 {
+		t.Fatalf("run response still surfaces resolved finding after fix-up floor: %+v", resp2.SecurityFindings)
+	}
+	if _, ok := raw2["security_findings"]; ok {
+		t.Errorf("post-fix-up clean run response should omit security_findings: %v", raw2)
+	}
+	if got := mcpSecurityFindings(t, s, runID); len(got) != 0 {
+		t.Fatalf("MCP run-status still surfaces resolved finding after fix-up floor: %+v", got)
+	}
 }
 
 // --- helpers -------------------------------------------------------------
@@ -380,12 +397,45 @@ func hasMissingKind(missing []auditcomplete.MissingItem, kind auditcomplete.Miss
 
 // mcpSecurityFindings reads the run's audit feed exactly the way the MCP
 // run-status tool's securityFindingsFor does — GET the
-// implement_security_findings category, take the newest entry, decode its
-// payload as the cross-slice {findings:[...]} shape — so this seam test
-// covers the MCP surface without importing the fishhawk-mcp main package.
+// implement_security_findings category, floor on the latest
+// stage_fixup_triggered, take the newest entry ABOVE that floor, decode its
+// payload as the cross-slice {findings:[...]} shape — so this seam test covers
+// the MCP surface (including the post-fix-up floor) without importing the
+// fishhawk-mcp main package.
 func mcpSecurityFindings(t *testing.T, s *Server, runID uuid.UUID) []securityscan.Finding {
 	t.Helper()
-	url := fmt.Sprintf("/v0/runs/%s/audit?category=%s", runID, securityscan.AuditCategorySecurityFindings)
+	floor := latestAuditSeq(t, s, runID, CategoryStageFixupTriggered)
+	items := auditFeedItems(t, s, runID, securityscan.AuditCategorySecurityFindings)
+	newestIdx := -1
+	for i := range items {
+		if items[i].Sequence > floor {
+			newestIdx = i
+		}
+	}
+	if newestIdx == -1 {
+		return nil
+	}
+	var payload struct {
+		Findings []securityscan.Finding `json:"findings"`
+	}
+	if err := json.Unmarshal(items[newestIdx].Payload, &payload); err != nil {
+		t.Fatalf("decode securityscan payload off audit feed: %v", err)
+	}
+	return payload.Findings
+}
+
+// auditFeedEntry is the slice of an audit-feed item this seam test reads.
+type auditFeedEntry struct {
+	Sequence int64           `json:"sequence"`
+	Category string          `json:"category"`
+	Payload  json.RawMessage `json:"payload"`
+}
+
+// auditFeedItems GETs /v0/runs/{id}/audit for a category and returns the
+// decoded items (chain sequence-ascending, as the production endpoint emits).
+func auditFeedItems(t *testing.T, s *Server, runID uuid.UUID, category string) []auditFeedEntry {
+	t.Helper()
+	url := fmt.Sprintf("/v0/runs/%s/audit?category=%s", runID, category)
 	req := httptest.NewRequest(http.MethodGet, url, nil)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
@@ -393,23 +443,23 @@ func mcpSecurityFindings(t *testing.T, s *Server, runID uuid.UUID) []securitysca
 		t.Fatalf("GET audit feed status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
 	var page struct {
-		Items []struct {
-			Category string          `json:"category"`
-			Payload  json.RawMessage `json:"payload"`
-		} `json:"items"`
+		Items []auditFeedEntry `json:"items"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &page); err != nil {
 		t.Fatalf("decode audit page: %v", err)
 	}
-	if len(page.Items) == 0 {
-		return nil
+	return page.Items
+}
+
+// latestAuditSeq returns the highest sequence among the run's entries of the
+// given category (0 when none) — the fix-up floor the surface mirrors.
+func latestAuditSeq(t *testing.T, s *Server, runID uuid.UUID, category string) int64 {
+	t.Helper()
+	var latest int64
+	for _, it := range auditFeedItems(t, s, runID, category) {
+		if it.Sequence > latest {
+			latest = it.Sequence
+		}
 	}
-	newest := page.Items[len(page.Items)-1]
-	var payload struct {
-		Findings []securityscan.Finding `json:"findings"`
-	}
-	if err := json.Unmarshal(newest.Payload, &payload); err != nil {
-		t.Fatalf("decode securityscan payload off audit feed: %v", err)
-	}
-	return payload.Findings
+	return latest
 }
