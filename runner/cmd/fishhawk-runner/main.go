@@ -3802,7 +3802,19 @@ var (
 	// child_base_established record. A package-level var for the same reason
 	// as checkoutFixupBase: the fake-pusher run() tests default repoDir to
 	// "." and must never fetch + force-checkout the runner's own source repo.
-	checkoutChildBase = gitops.CheckoutRemoteBranch
+	//
+	// Wired to gitops.CheckoutRemoteBranchDetached (NOT the on-branch
+	// CheckoutRemoteBranch used by checkoutFixupBase) so the child base is a
+	// DETACHED HEAD at the base tip (#1361). The on-branch `checkout -B main`
+	// claims the gitdir-global `main` branch name, which git refuses when the
+	// operator's primary checkout already holds `main` in another linked
+	// worktree — failing at child_base_checkout for BOTH the run_children
+	// --parallel-isolate child (own run-<child> worktree) and the host
+	// fishhawk_dispatch_stage child (shared run-<parent> worktree). A detached
+	// HEAD claims no branch name, so it never collides; the per-slice
+	// sole-writer branch is cut later by CommitAndPush's freshFetchBase routing
+	// (ADR-035), which does not require HEAD to be ON the base branch.
+	checkoutChildBase = gitops.CheckoutRemoteBranchDetached
 
 	// checkoutRunBranch re-checks-out the run branch for the base-rebase-
 	// conflict re-invoke (#989). The local branch ref already points at the

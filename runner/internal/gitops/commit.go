@@ -1097,21 +1097,75 @@ func CheckoutRemoteBranch(ctx context.Context, repoDir, remote, branch string) (
 	if branch == "" {
 		return "", errors.New("gitops: branch required")
 	}
-	remote = orDefault(remote, DefaultRemote)
-	trackingRef := fmt.Sprintf("refs/remotes/%s/%s", remote, branch)
 	p := &Pusher{}
-	if err := p.run(ctx, repoDir, "fetch", remote,
-		fmt.Sprintf("+refs/heads/%s:%s", branch, trackingRef)); err != nil {
-		return "", fmt.Errorf("gitops: fetch %s from %s: %w", branch, remote, err)
-	}
-	tip, err := p.runOut(ctx, repoDir, "rev-parse", trackingRef)
+	trackingRef, tip, err := fetchRemoteBranchTip(ctx, p, repoDir, remote, branch)
 	if err != nil {
-		return "", fmt.Errorf("gitops: rev-parse %s: %w", trackingRef, err)
+		return "", err
 	}
 	if err := p.run(ctx, repoDir, "checkout", "-B", branch, trackingRef); err != nil {
 		return "", fmt.Errorf("gitops: checkout -B %s %s: %w", branch, trackingRef, err)
 	}
-	return strings.TrimSpace(tip), nil
+	return tip, nil
+}
+
+// fetchRemoteBranchTip is the shared fetch+rev-parse prologue of
+// CheckoutRemoteBranch and CheckoutRemoteBranchDetached. It fetches
+// refs/heads/<branch> from the named remote into the remote-tracking ref
+// refs/remotes/<remote>/<branch> via the explicit refspec (see
+// CheckoutRemoteBranch's doc for the lockstep / non-fast-forward rationale)
+// and returns that trackingRef plus the fetched tip SHA. The two checkout
+// variants diverge only in HOW they move the working tree onto that tip:
+// on-branch `checkout -B` (fix-up) vs. detached `checkout --detach` (the
+// decomposed-child base, #1361).
+func fetchRemoteBranchTip(ctx context.Context, p *Pusher, repoDir, remote, branch string) (trackingRef, tipSHA string, err error) {
+	remote = orDefault(remote, DefaultRemote)
+	trackingRef = fmt.Sprintf("refs/remotes/%s/%s", remote, branch)
+	if err := p.run(ctx, repoDir, "fetch", remote,
+		fmt.Sprintf("+refs/heads/%s:%s", branch, trackingRef)); err != nil {
+		return "", "", fmt.Errorf("gitops: fetch %s from %s: %w", branch, remote, err)
+	}
+	tip, err := p.runOut(ctx, repoDir, "rev-parse", trackingRef)
+	if err != nil {
+		return "", "", fmt.Errorf("gitops: rev-parse %s: %w", trackingRef, err)
+	}
+	return trackingRef, strings.TrimSpace(tip), nil
+}
+
+// CheckoutRemoteBranchDetached is the decomposed-child base-establishment
+// path (#1361). Like CheckoutRemoteBranch it fetches the base branch tip
+// from the named remote (sharing the same explicit-refspec fetch prologue),
+// but it then moves the working tree onto that tip with `git checkout
+// --detach <tipSHA>` — a DETACHED HEAD that claims NO branch name.
+//
+// This is what fixes the #1361 collision. The on-branch `checkout -B main`
+// claims the gitdir-global `main` branch name, which git refuses when the
+// operator's primary checkout already has `main` checked out in another
+// linked worktree (`fatal: 'main' is already used by worktree at ...`). That
+// killed BOTH the run_children --parallel-isolate child (which runs in its
+// own run-<child> worktree) and the host fishhawk_dispatch_stage child (which
+// shares the run-<parent> worktree) at child_base_checkout. A detached HEAD
+// claims no branch name, so it never collides with the operator's primary
+// `main` worktree.
+//
+// The decomposed-child commit path does not require HEAD to be ON the base
+// branch: CommitAndPush cuts each per-slice sole-writer branch fresh from a
+// freshly-fetched origin/<base> (freshFetchBase routing, ADR-035), so
+// establishing the working tree at the base tip via a detached HEAD is
+// sufficient. Auth is ambient and the function is package-level for the same
+// reasons as CheckoutRemoteBranch.
+func CheckoutRemoteBranchDetached(ctx context.Context, repoDir, remote, branch string) (tipSHA string, err error) {
+	if branch == "" {
+		return "", errors.New("gitops: branch required")
+	}
+	p := &Pusher{}
+	_, tip, err := fetchRemoteBranchTip(ctx, p, repoDir, remote, branch)
+	if err != nil {
+		return "", err
+	}
+	if err := p.run(ctx, repoDir, "checkout", "--detach", tip); err != nil {
+		return "", fmt.Errorf("gitops: checkout --detach %s: %w", tip, err)
+	}
+	return tip, nil
 }
 
 // RestoreHead returns the operator's checkout to ref via `git checkout

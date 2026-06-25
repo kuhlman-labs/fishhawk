@@ -4254,6 +4254,33 @@ func TestRun_DecomposedChild_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
 	}
 }
 
+// TestChildBaseSeam_WiredToDetachedCheckout protects the load-bearing #1361
+// wiring: the production checkoutChildBase seam must resolve to the DETACHED
+// checkout (gitops.CheckoutRemoteBranchDetached), never the on-branch
+// gitops.CheckoutRemoteBranch. The other child-base tests replace the seam
+// with a fake before exercising it, so a silent revert of this one-line
+// wiring (back to the -B variant that collides with the operator's primary
+// `main` worktree) would pass every other test undetected. This asserts the
+// default value's identity directly. checkoutFixupBase, by contrast, must
+// STAY on the on-branch CheckoutRemoteBranch (it adds commits ON the fix-up
+// branch); that contrast is asserted too.
+func TestChildBaseSeam_WiredToDetachedCheckout(t *testing.T) {
+	gotChild := reflect.ValueOf(checkoutChildBase).Pointer()
+	wantDetached := reflect.ValueOf(gitops.CheckoutRemoteBranchDetached).Pointer()
+	onBranch := reflect.ValueOf(gitops.CheckoutRemoteBranch).Pointer()
+
+	if gotChild != wantDetached {
+		t.Errorf("checkoutChildBase must be wired to gitops.CheckoutRemoteBranchDetached (the #1361 detached-HEAD child base); got a different function")
+	}
+	if gotChild == onBranch {
+		t.Error("checkoutChildBase is wired to the on-branch gitops.CheckoutRemoteBranch — that claims the gitdir-global branch name and collides with the operator's primary `main` worktree (#1361)")
+	}
+	// The fix-up base seam must remain on the on-branch variant.
+	if got := reflect.ValueOf(checkoutFixupBase).Pointer(); got != onBranch {
+		t.Error("checkoutFixupBase must stay wired to gitops.CheckoutRemoteBranch — the fix-up pass adds commits ON the fix-up branch")
+	}
+}
+
 // TestRun_DecomposedChild_SkipsChildBaseCheckout is the base-absent per-failure-
 // mode (#1302): the resolved wave base ref is NOT present on the remote (a never-
 // pushed main, or an empty consolidated when GitHub is not wired — forced here
