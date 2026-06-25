@@ -224,6 +224,80 @@ func TestDispatchStage_PostFetchFailureWarnsNoError(t *testing.T) {
 	}
 }
 
+// --- pre-dispatch runner_kind mismatch guardrail (#1355) ---
+
+// TestDispatchStage_BlocksHostDispatchAgainstActionsLockedRun is the
+// cross-boundary integration test for the #1355 host-dispatch guardrail: a
+// detached dispatch against a run already LOCKED to runner_kind=github_actions
+// must return a non-nil error AND spawn ZERO runners. It seeds the run on the
+// fake backend so the guard reads the lock state through the real GET /v0/runs
+// round-trip (api client -> MCP Run decode -> guard), and uses captureAllArgv
+// to prove no runner invocation happened.
+func TestDispatchStage_BlocksHostDispatchAgainstActionsLockedRun(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	calls := captureAllArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	// A stage exists, but the guard fires before stage resolution / spawn.
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+	fb.getRunByID[runID] = Run{
+		ID:                 runID.String(),
+		State:              "running",
+		RunnerKind:         "github_actions",
+		RunnerKindResolved: true,
+	}
+
+	_, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID:      runID.String(),
+		Workflow:   "feature_change",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	})
+	if err == nil {
+		t.Fatal("expected a pre-dispatch block error for a github_actions-locked run")
+	}
+	if !strings.Contains(err.Error(), "github_actions") {
+		t.Errorf("block error should name the locked kind: %v", err)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("a blocked dispatch must spawn ZERO runners, got %d invocations", len(*calls))
+	}
+}
+
+// TestDispatchStage_LocalLockedRunPassesThrough asserts the allow side of the
+// guardrail: a run LOCKED to runner_kind=local proceeds to spawn exactly one
+// runner (the host dispatch matches the resolved local channel).
+func TestDispatchStage_LocalLockedRunPassesThrough(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	calls := captureAllArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "running")
+	fb.getRunByID[runID] = Run{
+		ID:                 runID.String(),
+		State:              "running",
+		RunnerKind:         "local",
+		RunnerKindResolved: true,
+	}
+
+	_, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID:      runID.String(),
+		Workflow:   "feature_change",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("a local-locked run must dispatch, got %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Errorf("a local-locked dispatch must spawn exactly one runner, got %d", len(*calls))
+	}
+}
+
 // --- fail-closed: missing binary ---
 
 // TestDispatchStage_MissingBinaryReturnsCleanError asserts the fail-closed

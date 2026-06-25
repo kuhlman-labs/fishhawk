@@ -112,6 +112,16 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		}
 	}
 
+	// (1a) Pre-dispatch runner_kind mismatch guardrail (#1355). A host
+	// dispatch always spawns a LOCAL runner, so reject one against a run
+	// already LOCKED to runner_kind=github_actions BEFORE the runner spawns.
+	// Engages only on the locked state (un-resolved runs auto-resolve to
+	// local on first dispatch); fails OPEN on a GetRun error.
+	guardWarnings, guardErr := r.guardHostDispatch(ctx, runUUID)
+	if guardErr != nil {
+		return nil, DispatchStageOutput{}, guardErr
+	}
+
 	// (2) Resolve the stage id from (run_id, stage type) — the same
 	// belongs-to-run-validating resolver fishhawk_run_stage uses.
 	resolvedStageID, err := r.resolveStageID(ctx, runUUID, in.Stage, in.StageID)
@@ -132,7 +142,8 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 
 	// (4) Resolve the GitHub repo with the same soft-fail rule run_stage uses:
 	// push_and_open_pr=false makes a missing repo a warning, not an error.
-	var warnings []string
+	// Seeded with any guard fail-open warning from step (1a).
+	warnings := guardWarnings
 	repo := in.GitHubRepo
 	if repo == "" {
 		detected, derr := runStageDetectGitHubRepo(workingDir)

@@ -70,18 +70,23 @@ func (e *apiError) Error() string {
 // though the JSON payload itself is a string. Tools that need a
 // typed UUID parse the string locally (e.g. `uuid.Parse(in.RunID)`).
 type Run struct {
-	ID                 string        `json:"id"`
-	Repo               string        `json:"repo"`
-	WorkflowID         string        `json:"workflow_id"`
-	WorkflowSHA        string        `json:"workflow_sha"`
-	TriggerSource      string        `json:"trigger_source"`
-	TriggerRef         *string       `json:"trigger_ref"`
-	State              string        `json:"state"`
-	ParentRunID        *string       `json:"parent_run_id"`
-	PullRequestURL     *string       `json:"pull_request_url"`
-	RetryAttempt       int           `json:"retry_attempt"`
-	MaxRetriesSnapshot int           `json:"max_retries_snapshot"`
-	RunnerKind         string        `json:"runner_kind,omitempty"`
+	ID                 string  `json:"id"`
+	Repo               string  `json:"repo"`
+	WorkflowID         string  `json:"workflow_id"`
+	WorkflowSHA        string  `json:"workflow_sha"`
+	TriggerSource      string  `json:"trigger_source"`
+	TriggerRef         *string `json:"trigger_ref"`
+	State              string  `json:"state"`
+	ParentRunID        *string `json:"parent_run_id"`
+	PullRequestURL     *string `json:"pull_request_url"`
+	RetryAttempt       int     `json:"retry_attempt"`
+	MaxRetriesSnapshot int     `json:"max_retries_snapshot"`
+	RunnerKind         string  `json:"runner_kind,omitempty"`
+	// RunnerKindResolved mirrors GET /v0/runs/{id}'s lock flag (#1355):
+	// true once the run's first signed runner self-report LOCKED runner_kind
+	// (#1346/#1348). The host-dispatch guard (guardHostDispatch) reads it to
+	// reject a local host dispatch against a github_actions-locked run.
+	RunnerKindResolved bool          `json:"runner_kind_resolved,omitempty"`
 	IssueContext       *IssueContext `json:"issue_context,omitempty"`
 	// Concerns is the run's OPEN review-concern summary (#964), mirrored
 	// from GET /v0/runs/{run_id}: count, per-state breakdown, and the
