@@ -1318,6 +1318,140 @@ func TestCheckoutRemoteBranchDetached_RejectsEmptyBranch(t *testing.T) {
 	}
 }
 
+// TestRemoteHasBranch is the #1363 primary done-means / regression test: it
+// pins the remote-vs-local-tracking distinction the bug turned on. The wave-N
+// child bases on the consolidated branch, which is created on GitHub via the
+// API and never fetched into local tracking refs, so the old `git show-ref`
+// guard (local refs only) always returned false. RemoteHasBranch queries the
+// remote directly via `git ls-remote`, so it sees the branch.
+func TestRemoteHasBranch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+
+	// Create a branch, push it to origin, then return local to main and ERASE
+	// every local trace (local ref + tracking ref) — the API-created
+	// consolidated-branch shape: present on the remote, absent from local
+	// tracking refs. This is the exact state the old show-ref guard mis-read.
+	const branch = "fishhawk/run-aaaaaaaa/consolidated"
+	mustGit(t, repo, "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(repo, "slice.txt"), []byte("slice\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "predecessor slice")
+	mustGit(t, repo, "push", "origin", branch)
+	mustGit(t, repo, "checkout", "main")
+	mustGit(t, repo, "branch", "-D", branch)
+	mustGit(t, repo, "update-ref", "-d", "refs/remotes/origin/"+branch)
+
+	// (a) THE REGRESSION ASSERTION: present on origin, absent from local
+	// tracking refs. RemoteHasBranch reports true; `git show-ref --verify
+	// refs/remotes/origin/<branch>` (the old local-tracking guard) is non-zero.
+	t.Run("present_on_remote_only", func(t *testing.T) {
+		got, err := RemoteHasBranch(context.Background(), repo, "origin", branch)
+		if err != nil {
+			t.Fatalf("RemoteHasBranch: %v", err)
+		}
+		if !got {
+			t.Errorf("RemoteHasBranch = false, want true (branch is on origin); the show-ref guard's exact blind spot (#1363)")
+		}
+		// Prove the local-tracking guard the new helper replaces would FAIL here.
+		showRef := exec.Command("git", "show-ref", "--verify", "refs/remotes/origin/"+branch)
+		showRef.Dir = repo
+		if showRef.Run() == nil {
+			t.Errorf("git show-ref --verify found refs/remotes/origin/%s — fixture invalid; the regression requires the branch absent from local tracking refs", branch)
+		}
+	})
+
+	// (b) Branch absent on origin: ls-remote exits 0 with EMPTY output (a
+	// no-match is not an error), so existence must be derived from the output,
+	// not the exit code. Fails if the helper keys on exit code alone.
+	t.Run("absent_on_remote", func(t *testing.T) {
+		got, err := RemoteHasBranch(context.Background(), repo, "origin", "never/pushed")
+		if err != nil {
+			t.Fatalf("RemoteHasBranch (absent): %v", err)
+		}
+		if got {
+			t.Errorf("RemoteHasBranch = true for an absent branch, want false")
+		}
+	})
+
+	// (c) No reachable origin: ls-remote errors, so the helper returns an error
+	// the runner seam surfaces (fail-loud distinction, #1363) rather than a
+	// silent false. A repo with no origin remote is the simplest such state.
+	t.Run("no_origin_errors", func(t *testing.T) {
+		noremote := filepath.Join(dir, "noremote")
+		if err := os.Mkdir(noremote, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mustGit(t, noremote, "init", "--initial-branch=main")
+		if _, err := RemoteHasBranch(context.Background(), noremote, "origin", "main"); err == nil {
+			t.Error("RemoteHasBranch returned nil error with no reachable origin; the runner seam needs the error to fail loud rather than skip")
+		}
+	})
+
+	// Empty branch is rejected at the input guard.
+	t.Run("rejects_empty_branch", func(t *testing.T) {
+		if _, err := RemoteHasBranch(context.Background(), repo, "origin", ""); err == nil {
+			t.Error("expected error for empty branch")
+		}
+	})
+}
+
+// TestRemoteConfigured pins the not-wired-vs-transient discriminator (#1363):
+// a configured remote reports true, an unconfigured one (a bare checkout with
+// no origin — the local-runner E2E shape whose ls-remote errors) reports false
+// so the runner degrades to a graceful skip instead of failing loud.
+func TestRemoteConfigured(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	dir := t.TempDir()
+
+	// (a) Configured remote → true. A bare repo as origin is enough; no push or
+	// fetch is needed because `git remote get-url` only reads local config.
+	t.Run("configured", func(t *testing.T) {
+		repo := filepath.Join(dir, "wired")
+		bare := filepath.Join(dir, "wired-origin.git")
+		mustGit(t, dir, "init", repo)
+		mustGit(t, dir, "init", "--bare", bare)
+		mustGit(t, repo, "remote", "add", "origin", bare)
+		if !RemoteConfigured(context.Background(), repo, "origin") {
+			t.Error("RemoteConfigured = false for a configured origin, want true")
+		}
+	})
+
+	// (b) No origin remote → false (the GitHub-not-wired degrade state), not an
+	// error the caller would mistake for a transient failure.
+	t.Run("not_configured", func(t *testing.T) {
+		repo := filepath.Join(dir, "bare")
+		mustGit(t, dir, "init", repo)
+		if RemoteConfigured(context.Background(), repo, "origin") {
+			t.Error("RemoteConfigured = true for a repo with no origin, want false")
+		}
+	})
+}
+
 func mustGitOut(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)

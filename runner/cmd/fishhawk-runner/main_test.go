@@ -2687,6 +2687,8 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	origCap, origRes := captureHead, restoreHead
 	origCheckout := checkoutFixupBase
 	origChildCheckout := checkoutChildBase
+	origRemoteHas := remoteHasBranch
+	origRemoteConfigured := remoteConfigured
 	origRunBranch := checkoutRunBranch
 	origDirty, origClean, origResPres := dirtyPaths, cleanDriftPaths, restoreHeadPreserving
 	origApply, origReset, origGate := applyFixupPatch, resetFixupWorktree, fixupVerifyGate
@@ -2718,6 +2720,20 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	checkoutChildBase = func(_ context.Context, _, _, _ string) (string, error) {
 		return "shared-branch-tip-sha", nil
 	}
+	// Stub the remote-authoritative wave-base guard (#1363) to a safe absent
+	// result (false, nil → block gracefully skips) so a decomposed-child run()
+	// test never shells out to `git ls-remote` against the runner's own source
+	// repo (a network round-trip). This mirrors the prior implicit default,
+	// where the local-tracking remoteBranchExists show-ref in "." returned
+	// false and the block no-oped. Tests that force the wave-base path swap in
+	// withFakeRemoteHasBranch AFTER this call.
+	remoteHasBranch = func(_ context.Context, _, _, _ string) (bool, error) { return false, nil }
+	// Default the not-wired-vs-transient discriminator (#1363) to "configured"
+	// so a test that forces the remoteHasBranch error path (withFakeRemoteHasBranch
+	// with a non-nil err) exercises the fail-loud branch without shelling out to
+	// `git remote get-url` against the runner's own source repo. Tests that need
+	// the not-wired graceful-skip swap in withFakeRemoteConfigured(false) after.
+	remoteConfigured = func(_ context.Context, _, _ string) bool { return true }
 	// Stub the base-rebase-conflict re-checkout (#989) the same way: the
 	// re-invoke handler must never force-checkout the runner's own source
 	// repo in a fake-pusher run() test.
@@ -2748,6 +2764,8 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 		restoreHead = origRes
 		checkoutFixupBase = origCheckout
 		checkoutChildBase = origChildCheckout
+		remoteHasBranch = origRemoteHas
+		remoteConfigured = origRemoteConfigured
 		checkoutRunBranch = origRunBranch
 		dirtyPaths = origDirty
 		cleanDriftPaths = origClean
@@ -3865,6 +3883,32 @@ func withFakeRemoteBranchExists(t *testing.T, exists bool) {
 	t.Cleanup(func() { remoteBranchExists = orig })
 }
 
+// withFakeRemoteHasBranch swaps the remote-authoritative remoteHasBranch seam
+// (#1363) — the guard the wave-N child-base establishment block now reads — for
+// the duration of a test. exists controls the reported presence; err is the
+// remote-query result (non-nil drives the fail-loud branch, distinct from a
+// successful absent==false graceful skip). Mirrors withFakeRemoteBranchExists,
+// which still drives resolvePolicyBaseRef's LOCAL-tracking routing.
+func withFakeRemoteHasBranch(t *testing.T, exists bool, err error) {
+	t.Helper()
+	orig := remoteHasBranch
+	remoteHasBranch = func(_ context.Context, _, _, _ string) (bool, error) { return exists, err }
+	t.Cleanup(func() { remoteHasBranch = orig })
+}
+
+// withFakeRemoteConfigured swaps the not-wired-vs-transient discriminator seam
+// (#1363) the wave-base block consults on a remoteHasBranch error. configured ==
+// false models a bare checkout with no origin (GitHub not wired, #1302), so a
+// remoteHasBranch failure degrades to a graceful skip instead of failing loud.
+// withFakeGitOps defaults this to true (configured); call this AFTER it to model
+// the not-wired shape.
+func withFakeRemoteConfigured(t *testing.T, configured bool) {
+	t.Helper()
+	orig := remoteConfigured
+	remoteConfigured = func(_ context.Context, _, _ string) bool { return configured }
+	t.Cleanup(func() { remoteConfigured = orig })
+}
+
 // TestRun_ImplementStage_DecomposedChild_SliceZero verifies the ADR-041
 // (#1141) slice-branch routing for a child at slice 0 (the omitempty-default
 // SliceIndex): the runner pushes onto its own sole-writer slice branch
@@ -4163,7 +4207,7 @@ func runDecomposedChildStageWithBase(t *testing.T, stderr *strings.Builder, base
 // Checkout for the base-absent graceful-skip case.
 func TestRun_DecomposedChild_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
-	withFakeRemoteBranchExists(t, true) // force the wave-base establishment path
+	withFakeRemoteBranchExists(t, false) // sole-writer slice branch never pre-exists (resolvePolicyBaseRef routing)
 	const waveBase = "fishhawk/run-aaaaaaaa/consolidated"
 
 	// Ordered spy: the agent invocation must observe the checkout already
@@ -4180,6 +4224,9 @@ func TestRun_DecomposedChild_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
 	withFakeUploader(t, fu)
 	fp := &fakePusher{}
 	withFakeGitOps(t, fp, &fakePROpener{})
+	// Force the wave-base establishment path (remote-authoritative guard,
+	// #1363) AFTER withFakeGitOps, which defaults remoteHasBranch to absent.
+	withFakeRemoteHasBranch(t, true, nil)
 
 	// The operator's tree sits on main — the exact run-d816e58a shape. Both
 	// restore seams record into restoredRefs: run()'s child defer calls
@@ -4281,6 +4328,23 @@ func TestChildBaseSeam_WiredToDetachedCheckout(t *testing.T) {
 	}
 }
 
+// TestWaveBaseGuardSeam_WiredToRemoteHasBranch protects the load-bearing #1363
+// wiring: the production remoteHasBranch seam (the wave-N child-base guard)
+// must resolve to the REMOTE-AUTHORITATIVE gitops.RemoteHasBranch (git
+// ls-remote), never the LOCAL-tracking remoteBranchExists (git show-ref). The
+// other child-base tests replace the seam with a fake before exercising it, so
+// a silent revert of this one-line wiring — back to the show-ref guard that
+// never sees the API-created consolidated branch and strands a dependent slice
+// on plain main (the #1363 defect) — would pass every other test undetected.
+// This asserts the default value's identity directly.
+func TestWaveBaseGuardSeam_WiredToRemoteHasBranch(t *testing.T) {
+	got := reflect.ValueOf(remoteHasBranch).Pointer()
+	want := reflect.ValueOf(gitops.RemoteHasBranch).Pointer()
+	if got != want {
+		t.Error("remoteHasBranch must be wired to gitops.RemoteHasBranch (the #1363 remote-authoritative ls-remote guard); a silent revert to the local-tracking show-ref guard reintroduces wave-N-on-main")
+	}
+}
+
 // TestRun_DecomposedChild_SkipsChildBaseCheckout is the base-absent per-failure-
 // mode (#1302): the resolved wave base ref is NOT present on the remote (a never-
 // pushed main, or an empty consolidated when GitHub is not wired — forced here
@@ -4290,13 +4354,17 @@ func TestChildBaseSeam_WiredToDetachedCheckout(t *testing.T) {
 // rather than failing the stage.
 func TestRun_DecomposedChild_SkipsChildBaseCheckout(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
-	withFakeRemoteBranchExists(t, false) // wave base absent on the remote
+	withFakeRemoteBranchExists(t, false) // resolvePolicyBaseRef routing
 	inv := &fakeInvoker{canned: agent.Result{OK: true}}
 	withFakeInvoker(t, inv)
 	fu := newFakeUploader(t)
 	fu.promptResp = decomposedChildPromptResp()
 	withFakeUploader(t, fu)
 	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+	// Wave base absent on the remote — ls-remote succeeded with empty output
+	// (false, nil), the legitimate graceful-skip case. Set AFTER withFakeGitOps
+	// (whose default is the same) to make the intent explicit.
+	withFakeRemoteHasBranch(t, false, nil)
 
 	checkoutCalled := false
 	origCheckout := checkoutChildBase
@@ -4334,13 +4402,16 @@ func TestRun_DecomposedChild_SkipsChildBaseCheckout(t *testing.T) {
 // names the child_base_checkout reason.
 func TestRun_DecomposedChild_CheckoutFailure_FailsBeforeAgentInvoke(t *testing.T) {
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
-	withFakeRemoteBranchExists(t, true)
+	withFakeRemoteBranchExists(t, false) // resolvePolicyBaseRef routing
 	inv := &fakeInvoker{canned: agent.Result{OK: true}}
 	withFakeInvoker(t, inv)
 	fu := newFakeUploader(t)
 	fu.promptResp = decomposedChildPromptResp()
 	withFakeUploader(t, fu)
 	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+	// Wave base present (forced AFTER withFakeGitOps's absent default); the
+	// checkout itself fails below.
+	withFakeRemoteHasBranch(t, true, nil)
 
 	var restoredRefs []string
 	origCap, origRes, origCheckout := captureHead, restoreHead, checkoutChildBase
@@ -4375,6 +4446,106 @@ func TestRun_DecomposedChild_CheckoutFailure_FailsBeforeAgentInvoke(t *testing.T
 	// so the child restore defer must not fire a checkout.
 	if len(restoredRefs) != 0 {
 		t.Errorf("restoredRefs = %v, want none (HEAD never moved)", restoredRefs)
+	}
+}
+
+// TestRun_DecomposedChild_RemoteQueryFailure_FailsBeforeAgentInvoke is the
+// #1363 binding-condition per-failure-mode: a remote-query FAILURE (a transient
+// ls-remote error — network/auth/SSH-agent drop) on a wave-N child that HAS an
+// expected base must FAIL LOUD, not silently degrade to skip-and-run-against-
+// ambient-HEAD. A silent skip there reintroduces the exact #1363 symptom (the
+// dependent slice runs against plain main and cannot compile against its
+// predecessors). Driven via the remoteHasBranch seam returning (false, err):
+// the agent is NEVER invoked, no base checkout is attempted, and the failure
+// names child_base_checkout — distinct from the absent-base graceful skip
+// (false, nil) asserted by DecomposedChild_SkipsChildBaseCheckout.
+func TestRun_DecomposedChild_RemoteQueryFailure_FailsBeforeAgentInvoke(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeRemoteBranchExists(t, false) // resolvePolicyBaseRef routing
+	inv := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, inv)
+	fu := newFakeUploader(t)
+	fu.promptResp = decomposedChildPromptResp()
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+	// A transient ls-remote query failure (forced AFTER withFakeGitOps's
+	// absent default) on a child with an expected base — must fail loud.
+	withFakeRemoteHasBranch(t, false, errors.New("ls-remote origin: ssh: connect to host github.com port 22: operation timed out"))
+
+	checkoutCalled := false
+	origCheckout := checkoutChildBase
+	checkoutChildBase = func(_ context.Context, _, _, _ string) (string, error) {
+		checkoutCalled = true
+		return "shared-branch-tip-sha", nil
+	}
+	t.Cleanup(func() { checkoutChildBase = origCheckout })
+
+	var stderr strings.Builder
+	if got := runDecomposedChildStageWithBase(t, &stderr, "fishhawk/run-aaaaaaaa/consolidated"); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure on a remote-query failure with an expected base:\n%s", got, stderr.String())
+	}
+	if inv.gotInv != nil {
+		t.Error("agent was invoked despite the remote-query failure — a transient ls-remote error must fail fast BEFORE any invocation (#1363)")
+	}
+	if checkoutCalled {
+		t.Error("checkoutChildBase called despite the remote-query failure — the guard error must short-circuit before the checkout")
+	}
+	for _, want := range []string{
+		`"event":"runner_failed"`,
+		`"reason":"child_base_checkout"`,
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("missing %s in remote-query-failure emission:\n%s", want, stderr.String())
+		}
+	}
+}
+
+// TestRun_DecomposedChild_RemoteNotConfigured_SkipsGracefully is the #1363
+// not-wired carve-out: a remoteHasBranch FAILURE against a remote that is NOT
+// configured — a bare local-runner checkout with no origin — is the "GitHub not
+// wired" degrade state (#1302), NOT a transient failure. It must gracefully SKIP
+// the wave-base establishment (run against ambient HEAD, agent still invoked, no
+// runner_failed) rather than fail loud. This is the in-band guard for the
+// local-runner E2E shape (a remote-less temp repo whose ls-remote errors): the
+// remote-query-failure fail-loud branch above keys on remoteConfigured==true, so
+// an unconfigured remote degrades like a genuine branch-absence (false, nil).
+func TestRun_DecomposedChild_RemoteNotConfigured_SkipsGracefully(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeRemoteBranchExists(t, false) // resolvePolicyBaseRef routing
+	inv := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, inv)
+	fu := newFakeUploader(t)
+	fu.promptResp = decomposedChildPromptResp()
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+	// ls-remote errored, but the remote is NOT configured (no origin) — the
+	// GitHub-not-wired degrade state, which must skip, not fail loud.
+	withFakeRemoteHasBranch(t, false, errors.New("gitops: ls-remote origin main: exit status 128 (stderr: fatal: 'origin' does not appear to be a git repository)"))
+	withFakeRemoteConfigured(t, false)
+
+	checkoutCalled := false
+	origCheckout := checkoutChildBase
+	checkoutChildBase = func(_ context.Context, _, _, _ string) (string, error) {
+		checkoutCalled = true
+		return "shared-branch-tip-sha", nil
+	}
+	t.Cleanup(func() { checkoutChildBase = origCheckout })
+
+	var stderr strings.Builder
+	if got := runDecomposedChildStageWithBase(t, &stderr, "fishhawk/run-aaaaaaaa/consolidated"); got != exitOK {
+		t.Fatalf("run = %d, want exitOK on a not-wired (no-origin) degrade:\n%s", got, stderr.String())
+	}
+	if checkoutCalled {
+		t.Error("checkoutChildBase called despite the not-wired remote — the block must gracefully skip")
+	}
+	if inv.gotInv == nil {
+		t.Error("agent was not invoked — a not-wired skip must still run the agent against ambient HEAD")
+	}
+	if strings.Contains(stderr.String(), `"event":"runner_failed"`) {
+		t.Errorf("not-wired skip emitted runner_failed — it must degrade silently like a branch-absence:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"event":"child_base_established"`) {
+		t.Errorf("emitted child_base_established despite the not-wired remote:\n%s", stderr.String())
 	}
 }
 

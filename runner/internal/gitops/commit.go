@@ -1168,6 +1168,66 @@ func CheckoutRemoteBranchDetached(ctx context.Context, repoDir, remote, branch s
 	return tip, nil
 }
 
+// RemoteHasBranch reports whether branch exists on the named remote by
+// querying the remote DIRECTLY with `git ls-remote --heads <remote>
+// refs/heads/<branch>` (remote defaulting to DefaultRemote, matching
+// fetchRemoteBranchTip). It reports true iff the command succeeds AND its
+// stdout is non-empty: `git ls-remote` exits 0 with EMPTY output for a
+// no-match (a branch absent on the remote is NOT an error), so existence
+// must be derived from the output, not the exit code alone.
+//
+// Unlike `git show-ref --verify refs/remotes/origin/<branch>` — which reads
+// only LOCAL tracking refs — this queries the actual remote, so a branch
+// freshly created via the GitHub API is visible without a prior fetch. That
+// is the #1363 fix: a native depends_on wave-N decomposed child bases on the
+// integrate-wave CONSOLIDATED branch, which the MCP creates on GitHub via
+// CreateRef/MergeBranch and which therefore NEVER enters the local runner's
+// tracking refs. The local-tracking show-ref guard always returned false for
+// it, so the child-base establishment block silently no-oped and the
+// dependent slice ran against ambient HEAD (plain main) — unable to compile
+// against its predecessors, failing wave fan-in (slice_integration_error).
+//
+// It returns (exists, error) rather than swallowing the error: the caller
+// (the runner's wave-base block) must DISTINGUISH a genuine branch-absence
+// (success + empty output → false, nil → legitimate graceful skip preserving
+// the #1302 degrade contract) from a remote-query FAILURE (network/auth/
+// transient ls-remote error → false, err), which on a decomposed child with
+// an expected base must fail loud rather than silently degrade to running
+// against ambient HEAD and reintroducing the #1363 symptom.
+func RemoteHasBranch(ctx context.Context, repoDir, remote, branch string) (bool, error) {
+	if branch == "" {
+		return false, errors.New("gitops: branch required")
+	}
+	remote = orDefault(remote, DefaultRemote)
+	out, err := (&Pusher{}).runOut(ctx, repoDir, "ls-remote", "--heads", remote, "refs/heads/"+branch)
+	if err != nil {
+		return false, fmt.Errorf("gitops: ls-remote %s %s: %w", remote, branch, err)
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
+// RemoteConfigured reports whether the named remote (defaulting to
+// DefaultRemote) is configured in repoDir, via `git remote get-url <remote>`:
+// a configured remote prints its URL and exits 0, while an unconfigured one
+// exits non-zero ("No such remote"). It is the runner's not-wired-vs-transient
+// discriminator for a RemoteHasBranch failure (#1363): an ls-remote error
+// against a remote that is NOT configured is the "GitHub not wired" degrade
+// state (#1302) — the local-runner / bare-checkout shape with no origin — which
+// must gracefully skip the wave-base establishment to ambient HEAD, NOT fail
+// loud. A genuine transient ls-remote failure (network/auth/SSH-agent drop)
+// against a CONFIGURED remote stays fail-loud. It collapses every probe failure
+// (unconfigured, or git itself unavailable) to a single false because the
+// caller only consults it on an already-errored RemoteHasBranch path, where
+// "cannot confirm the remote is wired" is exactly the skip-eligible case.
+func RemoteConfigured(ctx context.Context, repoDir, remote string) bool {
+	remote = orDefault(remote, DefaultRemote)
+	out, err := (&Pusher{}).runOut(ctx, repoDir, "remote", "get-url", remote)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(out) != ""
+}
+
 // RestoreHead returns the operator's checkout to ref via `git checkout
 // --force` (#911). After an implement/fix-up pass the runner has switched
 // HEAD onto the run branch (via CommitAndPush's `checkout -b`/`-B`), and on a
