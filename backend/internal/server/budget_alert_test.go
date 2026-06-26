@@ -98,10 +98,14 @@ func TestRecordCost_AdvisoryBudget_WarnThenOver(t *testing.T) {
 	if !ok || x <= 0 {
 		t.Fatalf("pricing.Cost(%q) ok=%v usd=%v — fixture model must be priced", model, ok, x)
 	}
-	// limit = 1.5x, warn_at = 0.5:
-	//   pass 1 → sum x   → fraction 0.667 → warn, not over
-	//   pass 2 → sum 2x  → fraction 1.33  → over
-	spec := budgetAlertSpec(1.5*x, "advisory", 0.5)
+	// limit = 1.7x, warn_at = 0.5:
+	//   pass 1 → sum x   → fraction 0.588 → warn, not over
+	//   pass 2 → sum 2x  → fraction 1.176 → over
+	//   pass 3 → sum 3x  → fraction 1.765 → still 'over' (< the 2x ack
+	//            rung), so the per-tier dedup suppresses a re-emit. The
+	//            escalation past 'over' is covered separately by
+	//            TestRecordCost_AdvisoryBudget_EscalatesToAckThenPage.
+	spec := budgetAlertSpec(1.7*x, "advisory", 0.5)
 
 	stage := rr.seedStage(run.StageStateRunning)
 	runID := stage.RunID
@@ -200,9 +204,10 @@ func TestRecordCost_AdvisoryBudget_HealsAfterCommentlessFirstEmission(t *testing
 	if !ok || x <= 0 {
 		t.Fatalf("pricing.Cost(%q) ok=%v usd=%v — fixture model must be priced", model, ok, x)
 	}
-	// limit = x/10, warn_at = 0.5: a single bundle's cost (x) already
-	// drives the period over 100%, so both runs cross the "over" tier.
-	spec := budgetAlertSpec(x/10, "advisory", 0.5)
+	// limit = x/1.5, warn_at = 0.5: a single bundle's cost (x) drives the
+	// period to ~1.5x — the "over" tier (below the 2x ack rung), so both
+	// runs cross "over".
+	spec := budgetAlertSpec(x/1.5, "advisory", 0.5)
 	triggerRef := "issue:42"
 
 	// Run A: no installation_id — the visible comment is structurally
@@ -256,6 +261,93 @@ func TestRecordCost_AdvisoryBudget_HealsAfterCommentlessFirstEmission(t *testing
 	}
 	if got := len(budgetCommentBodies(gh)); got != 1 {
 		t.Fatalf("after run B: budget comments = %d, want 1 (comment heals on the capable run)", got)
+	}
+}
+
+// TestRecordCost_AdvisoryBudget_EscalatesToAckThenPage exercises the
+// #1371 escalating ladder past 100%: with the limit calibrated low, each
+// successive bundle drives the period fraction higher, crossing the
+// ack_required (2x) and page (3x) rungs. Each new tier emits exactly one
+// budget_alert, and a re-run at the same tier does not re-emit.
+func TestRecordCost_AdvisoryBudget_EscalatesToAckThenPage(t *testing.T) {
+	au := newAuditFake()
+	rr := newApprovalRunRepo()
+	gh := newSlashGitHubRecorder()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, RunRepo: rr})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	const model = "claude-opus-4-8"
+	const inTok, outTok = 1000, 2000
+	x, ok := pricing.Cost(model, inTok, outTok)
+	if !ok || x <= 0 {
+		t.Fatalf("pricing.Cost(%q) ok=%v usd=%v — fixture model must be priced", model, ok, x)
+	}
+	// limit = 0.9x so a single bundle (x) already lands at fraction ~1.11
+	// ('over'); the 2nd bundle reaches ~2.22x (ack_required) and the 3rd
+	// ~3.33x (page). Default ack/page multiples (2x/3x) apply — the Config
+	// sets no BudgetAckMultiple/BudgetPageMultiple.
+	spec := budgetAlertSpec(0.9*x, "advisory", 0.5)
+
+	stage := rr.seedStage(run.StageStateRunning)
+	runID := stage.RunID
+	triggerRef := "issue:42"
+	rr.seedRun(&run.Run{
+		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
+		TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef,
+		InstallationID: ptrInt64(99),
+		WorkflowSpec:   spec,
+		CreatedAt:      time.Now().UTC(),
+	})
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        runID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        model,
+		InputTokens:  inTok,
+		OutputTokens: outTok,
+	})
+
+	ctx := context.Background()
+
+	// Pass 1 → over tier (fraction ~1.11).
+	s.recordCost(ctx, runID, stage.ID, bundleBytes)
+	if got := countBudgetAlerts(au, "over"); got != 1 {
+		t.Fatalf("after pass 1: over budget_alert count = %d, want 1", got)
+	}
+	if got := countBudgetAlerts(au, "ack_required"); got != 0 {
+		t.Fatalf("after pass 1: ack_required count = %d, want 0", got)
+	}
+
+	// Pass 2 → ack_required tier (fraction ~2.22).
+	s.recordCost(ctx, runID, stage.ID, bundleBytes)
+	if got := countBudgetAlerts(au, "ack_required"); got != 1 {
+		t.Fatalf("after pass 2: ack_required count = %d, want 1", got)
+	}
+	if got := countBudgetAlerts(au, "page"); got != 0 {
+		t.Fatalf("after pass 2: page count = %d, want 0", got)
+	}
+
+	// Pass 3 → page tier (fraction ~3.33).
+	s.recordCost(ctx, runID, stage.ID, bundleBytes)
+	if got := countBudgetAlerts(au, "page"); got != 1 {
+		t.Fatalf("after pass 3: page count = %d, want 1", got)
+	}
+
+	// Pass 4 in the same period at the same (page) tier → no re-emit.
+	s.recordCost(ctx, runID, stage.ID, bundleBytes)
+	if got := countBudgetAlerts(au, "page"); got != 1 {
+		t.Errorf("after pass 4: page count = %d, want 1 (deduped per tier)", got)
+	}
+	// Each tier recorded exactly once across the escalation.
+	for _, tier := range []string{"over", "ack_required", "page"} {
+		if got := countBudgetAlerts(au, tier); got != 1 {
+			t.Errorf("tier %q emitted %d times, want exactly 1", tier, got)
+		}
 	}
 }
 

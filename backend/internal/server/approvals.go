@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/budget"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -307,6 +308,14 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		// --override-budget retry dead-ended as an idempotent-first-wins
 		// duplicate, silently stranding the stage.
 		if !s.checkPlanBudget(w, r, stage, req.Comment) {
+			return
+		}
+		// Periodic-budget escalation gate (#1371): refuse an approve once
+		// the run's advisory periodic budget has escalated to the
+		// ack_required/page tier, unless the comment carries --ack-budget.
+		// PRE-Submit for the same ADR-036 reason as its siblings: a 422
+		// must insert no row so an --ack-budget retry flows normally.
+		if !s.checkPeriodicBudgetTier(w, r, stage, req.Comment) {
 			return
 		}
 		// Model validity gate (#1339): BEFORE the allow-list, reject a
@@ -1013,6 +1022,171 @@ func (s *Server) checkPlanBudget(w http.ResponseWriter, r *http.Request, stage *
 			"budget_source":       budgetSource,
 			"spec_budget_minutes": specBudgetMinutes,
 			"timeout_source":      timeoutSource,
+		})
+	return false
+}
+
+// checkPeriodicBudgetTier enforces the escalating periodic-budget
+// acknowledgment gate on plan-stage approvals (#1371). Returns true when
+// the approval should proceed; returns false (and writes a 422
+// periodic_budget_requires_ack response) when the run's advisory periodic
+// budget has escalated to the ack_required or page tier — period spend has
+// reached the configured ack multiple of the (possibly overridden) limit —
+// and the comment lacks --ack-budget.
+//
+// This is the calibrate-OR-escalate other half of #1371: once the limit is
+// calibrated, a normal week sits below 1x and never reaches this gate; an
+// over-budget signal escalates through tiers requiring an audited
+// acknowledgment instead of reading 'over' forever. Mirrors checkPlanBudget's
+// --override-budget posture: --ack-budget records a
+// plan_periodic_budget_tier_acknowledged audit entry; its absence at the ack
+// rung records plan_violates_periodic_budget and refuses.
+//
+// Fail-OPEN throughout, matching the sibling plan gates — a degraded backend
+// can never brick the approval gate. Proceeds (return true) when:
+//   - RunRepo is nil or doesn't implement runCostSummer (no period sum
+//     available),
+//   - the run lookup fails, the cached spec is absent/unparseable, the
+//     workflow is absent, or it declares no advisory budget,
+//   - the budget's period is unrecognized, or
+//   - the period-sum query errors,
+//   - the evaluated tier is below the ack rung (ok|warn|over).
+func (s *Server) checkPeriodicBudgetTier(w http.ResponseWriter, r *http.Request, stage *run.Stage, comment string) bool {
+	ctx := r.Context()
+	if s.cfg.RunRepo == nil {
+		return true
+	}
+	summer, ok := s.cfg.RunRepo.(runCostSummer)
+	if !ok {
+		return true
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "periodic-budget gate: get run failed",
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return true
+	}
+	if len(runRow.WorkflowSpec) == 0 {
+		return true
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "periodic-budget gate: parse spec failed",
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return true
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		return true
+	}
+
+	// The first advisory budget is the one the dogfood workflows declare;
+	// blocking budgets are an admission-time gate, never this plan-approval
+	// path. No advisory budget → nothing to gate on.
+	var b spec.PeriodicBudget
+	found := false
+	for _, candidate := range wf.Budgets {
+		if candidate.Enforcement == spec.EnforcementBlocking {
+			continue
+		}
+		b = candidate
+		found = true
+		break
+	}
+	if !found {
+		return true
+	}
+
+	loc := s.cfg.BudgetLocation
+	if loc == nil {
+		loc = time.UTC
+	}
+	b.LimitUSD = s.effectiveBudgetLimit(b)
+
+	d, ok, err := evaluateWorkflowBudget(ctx, summer, runRow.Repo, runRow.WorkflowID, b, time.Now(), loc)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "periodic-budget gate: sum period spend failed",
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return true
+	}
+	if !ok {
+		// Unrecognized period — schema enum makes this unreachable.
+		return true
+	}
+
+	tier := budget.Tier(d, s.cfg.BudgetAckMultiple, s.cfg.BudgetPageMultiple)
+	if !budget.AckRequired(tier) {
+		// ok|warn|over — below the acknowledgment rung; nothing to gate.
+		return true
+	}
+
+	// Resolve the reported ack multiple through the same defensive
+	// fallback budget.Tier applied, so the threshold the 422 message and
+	// audit payload advertise matches the rung the gate actually evaluated
+	// — including the inverted-pair case (e.g. ack=5/page=3 gates at the 2x
+	// default and must report 2x, not the configured 5x) (#1371).
+	ackMultiple, _ := budget.EffectiveMultiples(s.cfg.BudgetAckMultiple, s.cfg.BudgetPageMultiple)
+	auditPayload, _ := json.Marshal(map[string]any{
+		"stage_id":     stage.ID.String(),
+		"workflow_id":  runRow.WorkflowID,
+		"period":       b.Period,
+		"spent":        d.Spent,
+		"limit":        d.Limit,
+		"fraction":     d.Fraction,
+		"tier":         tier,
+		"ack_multiple": ackMultiple,
+	})
+	systemKind := audit.ActorKind("system")
+
+	if strings.Contains(comment, "--ack-budget") {
+		if s.cfg.AuditRepo != nil {
+			if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+				RunID:     stage.RunID,
+				StageID:   &stage.ID,
+				Timestamp: time.Now().UTC(),
+				Category:  "plan_periodic_budget_tier_acknowledged",
+				ActorKind: &systemKind,
+				Payload:   auditPayload,
+			}); err != nil {
+				s.cfg.Logger.Error("audit append failed for periodic-budget ack",
+					"run_id", stage.RunID, "stage_id", stage.ID, "error", err.Error())
+			}
+		}
+		return true
+	}
+
+	if s.cfg.AuditRepo != nil {
+		if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+			RunID:     stage.RunID,
+			StageID:   &stage.ID,
+			Timestamp: time.Now().UTC(),
+			Category:  "plan_violates_periodic_budget",
+			ActorKind: &systemKind,
+			Payload:   auditPayload,
+		}); err != nil {
+			s.cfg.Logger.Error("audit append failed for periodic-budget violation",
+				"run_id", stage.RunID, "stage_id", stage.ID, "error", err.Error())
+		}
+	}
+
+	s.writeError(w, r, http.StatusUnprocessableEntity, "periodic_budget_requires_ack",
+		fmt.Sprintf("period spend $%.2f has reached %.2gx the effective periodic budget limit $%.2f (tier %s); acknowledge the over-budget state by including --ack-budget in the approval comment, or wait for the calendar period to reset",
+			d.Spent, ackMultiple, d.Limit, tier),
+		map[string]any{
+			"stage_id":     stage.ID.String(),
+			"workflow_id":  runRow.WorkflowID,
+			"period":       b.Period,
+			"spent":        d.Spent,
+			"limit":        d.Limit,
+			"fraction":     d.Fraction,
+			"tier":         tier,
+			"ack_multiple": ackMultiple,
 		})
 	return false
 }

@@ -496,6 +496,24 @@ func runServe(args []string, logSink io.Writer) int {
 			"computes calendar period boundaries in — a weekly budget resets Monday 00:00 in this "+
 			"zone, a monthly budget on the 1st. An unresolvable zone name falls back to UTC with a "+
 			"WARN at startup rather than failing the boot")
+	budgetLimitOverrideUSD := fs.Float64("budget-limit-override-usd",
+		envOrFloat("FISHHAWKD_BUDGET_LIMIT_OVERRIDE_USD", 0),
+		"calibrate the advisory periodic-budget limit (#1371) WITHOUT editing .fishhawk/workflows.yaml "+
+			"(a forbidden commit path for the implement stage). When > 0 it replaces the spec budget's "+
+			"limit_usd in both the GET /v0/runs/{id}/budget display and the budget_alert path, so a normal "+
+			"calibrated week reads a believable fraction. The default 0 means use the spec limit. GLOBAL "+
+			"across the run's advisory budgets (the dogfood spec declares exactly one)")
+	budgetAckMultiple := fs.Float64("budget-ack-multiple",
+		envOrFloat("FISHHAWKD_BUDGET_ACK_MULTIPLE", 2.0),
+		"multiple of the (possibly overridden) periodic-budget limit at which the escalating tier ladder "+
+			"(#1371) trips ack_required — the rung where a plan approval needs an explicit --ack-budget "+
+			"acknowledgment. Default 2.0. A non-positive value falls back to the 2x built-in default")
+	budgetPageMultiple := fs.Float64("budget-page-multiple",
+		envOrFloat("FISHHAWKD_BUDGET_PAGE_MULTIPLE", 3.0),
+		"multiple of the (possibly overridden) periodic-budget limit at which the escalating tier ladder "+
+			"(#1371) trips the highest 'page' rung. Default 3.0. A non-positive value, or a value <= the ack "+
+			"multiple, falls back to the 3x built-in default so a misconfigured pair never collapses every "+
+			"fraction into 'page'")
 	modelsRefreshInterval := fs.Duration("models-refresh-interval",
 		envOrDuration("FISHHAWKD_MODELS_REFRESH_INTERVAL", 12*time.Hour),
 		"how often the live ModelOracle (#1341) re-fetches each provider's /v1/models snapshot "+
@@ -550,7 +568,7 @@ func runServe(args []string, logSink io.Writer) int {
 	modelProviders := buildModelProviders(*anthropicAPIKey, *openAIAPIKey)
 	modelOracle := modeloracle.NewCached(modelProviders, *modelsStalenessThreshold, logger)
 
-	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modelOracle}
+	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, BudgetLimitOverrideUSD: *budgetLimitOverrideUSD, BudgetAckMultiple: *budgetAckMultiple, BudgetPageMultiple: *budgetPageMultiple, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modelOracle}
 
 	// Plan-review agent wiring. Resolved by a pure helper so the selection seam
 	// (which adapters the flags configure) is unit-testable without booting a

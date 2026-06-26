@@ -189,7 +189,13 @@ type BudgetStatus struct {
 	Fraction    float64  `json:"fraction,omitempty"`
 	WarnAt      *float64 `json:"warn_at,omitempty"`
 	Tier        string   `json:"tier,omitempty"`
-	Enforcement string   `json:"enforcement,omitempty"`
+	// AckRequired mirrors the backend's escalation boolean (#1371): true
+	// once period spend reaches the configured ack multiple (the
+	// ack_required or page tier), signalling that a plan-approval gate now
+	// requires an explicit --ack-budget acknowledgment. omitempty so the
+	// no-budget / sub-ack path stays byte-identical to today.
+	AckRequired bool   `json:"ack_required,omitempty"`
+	Enforcement string `json:"enforcement,omitempty"`
 }
 
 // GetRunBudget fetches the run's workflow periodic-budget status. The

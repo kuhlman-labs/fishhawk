@@ -1904,6 +1904,10 @@ func (s *Server) checkBudgetAlerts(ctx context.Context, runID, stageID uuid.UUID
 		if b.Enforcement == spec.EnforcementBlocking {
 			continue
 		}
+		// Apply the operator's calibration override (#1371) centrally on a
+		// copy of the budget so the period sum is evaluated against — and the
+		// alert payload reports — the effective limit, not the raw spec one.
+		b.LimitUSD = s.effectiveBudgetLimit(b)
 		d, ok, err := evaluateWorkflowBudget(ctx, summer, runRow.Repo, runRow.WorkflowID, b, now, loc)
 		if err != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
@@ -1919,29 +1923,35 @@ func (s *Server) checkBudgetAlerts(ctx context.Context, runID, stageID uuid.UUID
 			// unreachable, but don't bucket into the wrong window.
 			continue
 		}
-		// Decide the tier this crossing represents. Over implies
-		// WarnCrossed (warn_at <= 1), so check Over first and emit only
-		// the higher tier per bundle; the 'warn' tier still fires on the
-		// earlier bundle that first crossed warn_at but not 100%.
-		tier := ""
-		switch {
-		case d.Over:
-			tier = budgetTierOver
-		case d.WarnCrossed:
-			tier = budgetTierWarn
-		default:
+		// Decide the tier this crossing represents via the single-source
+		// escalating ladder (#1371): page > ack_required > over > warn. Each
+		// higher tier fires on the bundle that first reached it, deduped
+		// per-(workflow,period,tier) by emitBudgetAlert, so the earlier 'warn'
+		// / 'over' crossings still emit on their own bundles. budget.Tier's
+		// defensive multiple-fallback means a zero-value Config never
+		// classifies an ordinary crossing as 'page'.
+		tier := budget.Tier(d, s.cfg.BudgetAckMultiple, s.cfg.BudgetPageMultiple)
+		if tier == budget.TierOK {
 			continue
 		}
 		s.emitBudgetAlert(ctx, runID, stageID, runRow, b, d, tier)
 	}
 }
 
-// Budget alert tiers, recorded in the budget_alert payload and used as
-// the per-period de-dup discriminator.
-const (
-	budgetTierWarn = "warn"
-	budgetTierOver = "over"
-)
+// effectiveBudgetLimit returns the limit the periodic-budget evaluator
+// should use for b: the operator's BudgetLimitOverrideUSD when it is
+// configured (> 0), else the spec budget's own limit_usd (#1371). It is
+// the single application point of the calibration override, reused by both
+// the alert path (checkBudgetAlerts) and the display path
+// (runBudgetStatus) so the two surfaces cannot drift on which limit they
+// report. A zero or negative override (the default) leaves the spec limit
+// untouched, byte-identical to pre-#1371 behavior.
+func (s *Server) effectiveBudgetLimit(b spec.PeriodicBudget) float64 {
+	if s.cfg.BudgetLimitOverrideUSD > 0 {
+		return s.cfg.BudgetLimitOverrideUSD
+	}
+	return b.LimitUSD
+}
 
 // budgetAlertSentCategory is the audit category of the cross-run
 // comment-delivery dedup marker (#758). It is NOT an issue-comment

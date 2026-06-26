@@ -12,7 +12,7 @@ it.
 | Living anchor | `status_comment_posted` | `status_update` | `Dispatcher.Handle` (run create); `Server.notifyStatusUpdate` (every stage transition); `Server.notifyPlanReady` (plan-stage terminal) | run dispatch | Yes — one comment per run, every transition rebuilds + edits the same comment id |
 | Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, advisory-reject arbitrated, must_page_human, clarification request / awaiting_input park, CI failure) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor |
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
-| Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688) | warn_at / 100% crossing of an advisory periodic budget | No (per-`(period_start, tier)` dedup; the warn comment and the 100% comment each post once per calendar period) |
+| Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688, #1371) | crossing of an advisory periodic-budget ladder rung — `warn` / `over` / `ack_required` (≥2x) / `page` (≥3x) | No (per-`(period_start, tier)` dedup; each tier posts once per calendar period) |
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
 | Run rejected (misconfigured) | _(none at notifier; global-chain `run_rejected_misconfigured` on the dispatcher)_ | _(none)_ | `Dispatcher.Handle` reviewer-misconfigured guard (#599) | dispatch refusal (agent-gated plan stage, no reviewer wired) | No (each refusal posts its own comment) |
 
@@ -258,13 +258,18 @@ Notes:
   the warn-only audit-only `spend_alert`. For each workflow budget with
   `enforcement: advisory`, the handler sums the workflow's spend over the
   current calendar period (timezone-aware in `FISHHAWKD_BUDGET_TIMEZONE`) and,
-  on a `warn_at` or 100% crossing, both appends a `budget_alert` audit entry
-  (category `budget_alert`, payload `{workflow_id, repo, period, period_start,
-  spent, limit, fraction, warn_at, tier, enforcement}`) AND posts the issue
-  comment via `NotifyBudgetAlert`. Both are deduped on `(workflow_id,
-  period_start, tier)` so each tier fires once per period. It is warn-only and
-  best-effort — it never gates, fails, or blocks a run; blocking enforcement
-  (admission-time refusal) is a separate scope item. The comment body carries
+  on a crossing of the escalating ladder rung (#1371) — `warn` (warn_at),
+  `over` (100%), `ack_required` (the configured ack multiple of the effective
+  limit, default 2x), or `page` (the page multiple, default 3x) — both appends
+  a `budget_alert` audit entry (category `budget_alert`, payload `{workflow_id,
+  repo, period, period_start, spent, limit, fraction, warn_at, tier,
+  enforcement}`, where `limit`/`fraction` are against the effective limit —
+  `FISHHAWKD_BUDGET_LIMIT_OVERRIDE_USD` when set, else the spec `limit_usd`)
+  AND posts the issue comment via `NotifyBudgetAlert`. Both are deduped on
+  `(workflow_id, period_start, tier)` so each tier fires once per period. It is
+  warn-only and best-effort — it never gates, fails, or blocks a run; blocking
+  enforcement (admission-time refusal) is a separate scope item. The comment
+  body carries
   the same estimate caveat as the cost ledger: period spend undercounts
   invocations a backend reported no tokens for (`known_usage=false`, #685), so
   actual spend is a lower bound.
@@ -325,6 +330,20 @@ Notes:
   continuations are never gated, so neither kind is emitted for them. Listed
   here only so a future reader grepping the audit categories doesn't mistake
   them for comment surfaces.
+- The escalating periodic-budget plan-gate audit kinds —
+  `plan_violates_periodic_budget` and `plan_periodic_budget_tier_acknowledged`
+  (#1371) — are **internal, system-actor audit kinds, NOT issue-comment
+  surfaces**. Nothing in `issuecomment` posts them; they have no Notifier
+  method. The approval handler (`approvals.go::checkPeriodicBudgetTier`) writes
+  one once per plan-stage approve whose advisory periodic budget has escalated
+  to the `ack_required`/`page` tier: `plan_violates_periodic_budget` alongside
+  the `422 periodic_budget_requires_ack` refusal when the comment lacks
+  `--ack-budget`, or `plan_periodic_budget_tier_acknowledged` when it carries
+  it. Both use a `system` actor and payload `{stage_id, workflow_id, period,
+  spent, limit, fraction, tier, ack_multiple}`. They mirror the
+  `plan_violates_budget` / `plan_budget_override_acknowledged` runtime-budget
+  pattern. Listed here only so a future reader grepping the audit categories
+  doesn't mistake them for comment surfaces.
 - The fan-out re-drive parking audit kind — `parent_awaiting_redrive` (#698) —
   is an **internal, system-actor audit kind, not an issue-comment surface**.
   Nothing in `issuecomment` posts it to the issue thread; it has no Notifier
