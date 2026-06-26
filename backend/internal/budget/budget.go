@@ -56,6 +56,81 @@ const (
 	PeriodMonthly = "monthly"
 )
 
+// Escalating tier strings for a periodic-budget status (#1371). They form
+// a single, ordered ladder — ok < warn < over < ack_required < page —
+// used as the one source of truth by the display path
+// (server.runBudgetStatus / GET /v0/runs/{id}/budget), the alert path
+// (server.checkBudgetAlerts / budget_alert), the MCP BudgetStatus block,
+// and the plan-approval gate (server.checkPeriodicBudgetTier). The first
+// three are byte-identical supersets of the prior {ok, warn, over} set;
+// ack_required and page are the new escalation rungs past the limit,
+// driven by configured multiples of it.
+const (
+	TierOK          = "ok"
+	TierWarn        = "warn"
+	TierOver        = "over"
+	TierAckRequired = "ack_required"
+	TierPage        = "page"
+)
+
+// Default ack/page multiples of the limit (#1371). The ack rung trips at
+// 2x the limit and the page rung at 3x. They are the fallback whenever a
+// supplied multiple is unusable (non-positive or inverted), so a
+// zero-value Config — one built without serve.go's flag wiring, e.g. in
+// tests or by an embedder — never collapses every fraction into 'page'.
+const (
+	DefaultAckMultiple  = 2.0
+	DefaultPageMultiple = 3.0
+)
+
+// Tier maps a Decision to its escalating ladder rung (#1371), the single
+// source of truth shared by the display, alert, MCP, and plan-gate paths.
+// The ladder is, from a Decision d and the configured multiples:
+//
+//	d.Fraction >= pageMultiple  -> page
+//	d.Fraction >= ackMultiple   -> ack_required
+//	d.Over                      -> over
+//	d.WarnCrossed               -> warn
+//	otherwise                   -> ok
+//
+// The page and ack bands are checked first and highest-first so a single
+// fraction maps to exactly the top rung it has reached. The warn band needs
+// no separate input — d.WarnCrossed already encodes the warn_at threshold
+// Evaluate applied.
+//
+// Defensive fallback: a non-positive ackMultiple or pageMultiple, or an
+// inverted pair (pageMultiple <= ackMultiple), is replaced wholesale by
+// DefaultAckMultiple / DefaultPageMultiple. This guarantees a zero-value
+// Config (ackMultiple == pageMultiple == 0) does not classify every
+// positive fraction as 'page' (0 >= 0), which would saturate the gate.
+func Tier(d Decision, ackMultiple, pageMultiple float64) string {
+	if ackMultiple <= 0 || pageMultiple <= 0 || pageMultiple <= ackMultiple {
+		ackMultiple = DefaultAckMultiple
+		pageMultiple = DefaultPageMultiple
+	}
+	switch {
+	case d.Fraction >= pageMultiple:
+		return TierPage
+	case d.Fraction >= ackMultiple:
+		return TierAckRequired
+	case d.Over:
+		return TierOver
+	case d.WarnCrossed:
+		return TierWarn
+	default:
+		return TierOK
+	}
+}
+
+// AckRequired reports whether a tier has reached the acknowledgment
+// escalation rung — ack_required or page (#1371). The plan-approval gate
+// keys its --ack-budget requirement off this, and the budget-status
+// response surfaces it as a boolean so a caller need not re-derive the
+// ladder ordering.
+func AckRequired(tier string) bool {
+	return tier == TierAckRequired || tier == TierPage
+}
+
 // PeriodRange returns the half-open [start, end) calendar period that
 // contains now, evaluated in loc. Weekly periods run Monday 00:00 local
 // to the following Monday; monthly periods run the first of the month

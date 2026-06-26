@@ -1570,15 +1570,20 @@ components:
             the server's configured budget timezone.
         limit_usd:
           type: number
-          description: Configured spend ceiling in US dollars for the period.
+          description: |
+            Effective spend ceiling in US dollars for the period. This is
+            the operator's `FISHHAWKD_BUDGET_LIMIT_OVERRIDE_USD` calibration
+            override when configured (> 0), else the spec budget's
+            `limit_usd` (#1371).
         spent_usd:
           type: number
           description: Cross-run workflow spend so far in the current period.
         fraction:
           type: number
           description: |
-            `spent_usd / limit_usd`. May exceed 1 when over the ceiling.
-            Zero when the limit is non-positive (no usable ceiling).
+            `spent_usd / limit_usd` against the effective limit. May exceed
+            1 when over the ceiling. Zero when the limit is non-positive (no
+            usable ceiling).
         warn_at:
           type: [number, "null"]
           description: |
@@ -1586,10 +1591,22 @@ components:
             the budget configures no warn threshold.
         tier:
           type: string
-          enum: [ok, warn, over]
+          enum: [ok, warn, over, ack_required, page]
           description: |
-            `over` when `fraction >= 1`; `warn` when the configured
-            `warn_at` is crossed but not yet over; otherwise `ok`.
+            Escalating ladder rung (#1371): `over` when `fraction >= 1`;
+            `warn` when the configured `warn_at` is crossed but not yet
+            over; otherwise `ok`. Past the ceiling the signal escalates by
+            configured multiples of the effective limit —
+            `ack_required` at the ack multiple (default 2x) and `page` at
+            the page multiple (default 3x) — instead of saturating at
+            `over`.
+        ack_required:
+          type: boolean
+          description: |
+            True when `tier` has reached the acknowledgment rung
+            (`ack_required` or `page`): plan approval for the run now
+            requires an explicit `--ack-budget` acknowledgment (#1371).
+            Omitted (absent) when false.
         enforcement:
           type: string
           enum: [advisory, blocking]

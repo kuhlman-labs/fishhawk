@@ -5129,6 +5129,83 @@ func TestGetRunStatus_OmitsBudgetWhenNoBudget(t *testing.T) {
 	}
 }
 
+// TestGetRunStatus_SurfacesEscalatedTierAndAckRequired is the #1371
+// cross-boundary seam (binding condition 2): the new escalating tier
+// values (ack_required, page) and the new ack_required boolean must decode
+// off the wire (the backend handler's budgetStatusResponse round-trips
+// through JSON via the stub backend's GET /v0/runs/{id}/budget) and surface
+// through get_run_status. A per-layer unit on either side would pass while
+// the new field silently dropped at the MCP-mapping seam (cf. #618).
+func TestGetRunStatus_SurfacesEscalatedTierAndAckRequired(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tier string
+	}{
+		{"ack_required", "ack_required"},
+		{"page", "page"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			r := newResolver(srv, nil)
+
+			runID := uuid.New()
+			fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: "running"}
+			seedBudget(fb, runID, BudgetStatus{
+				Period: "weekly", LimitUSD: 100, SpentUSD: 250, Fraction: 2.5,
+				WarnAt: warnFloat(0.8), Tier: tc.tier, AckRequired: true,
+				Enforcement: "advisory",
+			})
+
+			_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+			if err != nil {
+				t.Fatalf("getRunStatus: %v", err)
+			}
+			if out.Budget == nil {
+				t.Fatal("expected budget block surfaced; got nil")
+			}
+			if out.Budget.Tier != tc.tier {
+				t.Errorf("budget tier = %q, want %q", out.Budget.Tier, tc.tier)
+			}
+			if !out.Budget.AckRequired {
+				t.Errorf("budget ack_required = false, want true at tier %q", tc.tier)
+			}
+		})
+	}
+}
+
+// TestGetRunStatus_BudgetAckRequiredOmittedBelowRung confirms the omitempty
+// seam: an ok/warn/over budget surfaces ack_required=false and the field is
+// dropped from the marshaled tool output (never serialized as a stray
+// false), so existing consumers stay byte-identical.
+func TestGetRunStatus_BudgetAckRequiredOmittedBelowRung(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: "running"}
+	seedBudget(fb, runID, BudgetStatus{
+		Period: "weekly", LimitUSD: 100, SpentUSD: 60, Fraction: 0.6,
+		WarnAt: warnFloat(0.5), Tier: "warn", Enforcement: "advisory",
+	})
+
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.Budget == nil {
+		t.Fatal("expected budget block surfaced; got nil")
+	}
+	if out.Budget.AckRequired {
+		t.Error("ack_required must be false at the warn tier")
+	}
+	raw, _ := json.Marshal(out.Budget)
+	var m map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &m)
+	if _, ok := m["ack_required"]; ok {
+		t.Errorf("marshaled budget must omit ack_required when false; got %s", raw)
+	}
+}
+
 // --- cache efficiency (ADR-044 slice 3 / #1352) ---
 //
 // Cross-boundary wire-to-tool seam: a stub backend serves

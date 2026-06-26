@@ -52,6 +52,78 @@ func resolveImplementModelConfig(t *testing.T, args []string) (string, server.Al
 	return *deflt, server.ParseAllowedModels(*allowed)
 }
 
+// resolveBudgetTierConfig mirrors runServe's --budget-limit-override-usd /
+// --budget-ack-multiple / --budget-page-multiple flag wiring (#1371) and
+// the handoff into server.Config (serve.go line ~553), so the env > flag
+// resolution AND the Config wiring are unit-testable without booting the
+// server. It returns a server.Config carrying only the three #1371 fields,
+// built exactly as runServe builds them.
+func resolveBudgetTierConfig(t *testing.T, args []string) server.Config {
+	t.Helper()
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	limitOverride := fs.Float64("budget-limit-override-usd",
+		envOrFloat("FISHHAWKD_BUDGET_LIMIT_OVERRIDE_USD", 0), "test")
+	ackMultiple := fs.Float64("budget-ack-multiple",
+		envOrFloat("FISHHAWKD_BUDGET_ACK_MULTIPLE", 2.0), "test")
+	pageMultiple := fs.Float64("budget-page-multiple",
+		envOrFloat("FISHHAWKD_BUDGET_PAGE_MULTIPLE", 3.0), "test")
+	if err := fs.Parse(args); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	return server.Config{
+		BudgetLimitOverrideUSD: *limitOverride,
+		BudgetAckMultiple:      *ackMultiple,
+		BudgetPageMultiple:     *pageMultiple,
+	}
+}
+
+// TestResolveBudgetTierConfig is binding condition (1): the three #1371
+// budget env vars parse and wire into server.Config — both the defaults
+// (0 / 2.0 / 3.0) and an explicit override.
+func TestResolveBudgetTierConfig(t *testing.T) {
+	t.Run("defaults when unset", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_BUDGET_LIMIT_OVERRIDE_USD", "")
+		t.Setenv("FISHHAWKD_BUDGET_ACK_MULTIPLE", "")
+		t.Setenv("FISHHAWKD_BUDGET_PAGE_MULTIPLE", "")
+		cfg := resolveBudgetTierConfig(t, nil)
+		if cfg.BudgetLimitOverrideUSD != 0 {
+			t.Errorf("BudgetLimitOverrideUSD = %g, want 0 (spec limit)", cfg.BudgetLimitOverrideUSD)
+		}
+		if cfg.BudgetAckMultiple != 2.0 {
+			t.Errorf("BudgetAckMultiple = %g, want 2.0", cfg.BudgetAckMultiple)
+		}
+		if cfg.BudgetPageMultiple != 3.0 {
+			t.Errorf("BudgetPageMultiple = %g, want 3.0", cfg.BudgetPageMultiple)
+		}
+	})
+	t.Run("explicit overrides via flags wire into Config", func(t *testing.T) {
+		cfg := resolveBudgetTierConfig(t, []string{
+			"--budget-limit-override-usd", "250",
+			"--budget-ack-multiple", "1.5",
+			"--budget-page-multiple", "2.5",
+		})
+		if cfg.BudgetLimitOverrideUSD != 250 {
+			t.Errorf("BudgetLimitOverrideUSD = %g, want 250", cfg.BudgetLimitOverrideUSD)
+		}
+		if cfg.BudgetAckMultiple != 1.5 {
+			t.Errorf("BudgetAckMultiple = %g, want 1.5", cfg.BudgetAckMultiple)
+		}
+		if cfg.BudgetPageMultiple != 2.5 {
+			t.Errorf("BudgetPageMultiple = %g, want 2.5", cfg.BudgetPageMultiple)
+		}
+	})
+	t.Run("env override wins over default", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_BUDGET_LIMIT_OVERRIDE_USD", "500")
+		t.Setenv("FISHHAWKD_BUDGET_ACK_MULTIPLE", "2.25")
+		t.Setenv("FISHHAWKD_BUDGET_PAGE_MULTIPLE", "4")
+		cfg := resolveBudgetTierConfig(t, nil)
+		if cfg.BudgetLimitOverrideUSD != 500 || cfg.BudgetAckMultiple != 2.25 || cfg.BudgetPageMultiple != 4 {
+			t.Errorf("env values not wired: %+v", cfg)
+		}
+	})
+}
+
 // resolveReviewResolution mirrors runServe's --review-resolution flag wiring
 // (ADR-031 Phase 2) so the env > flag resolution and the reviewresolver.Select
 // handoff are unit-testable without booting the server. Same shape as the live

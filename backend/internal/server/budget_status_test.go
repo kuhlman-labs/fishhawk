@@ -146,20 +146,24 @@ func TestGetRunBudget_WarnCrossed_TierWarn(t *testing.T) {
 	assertJSONFloat(t, raw, "fraction", 0.6)
 }
 
-// TestGetRunBudget_Over_TierOver mirrors the #693 evidence: $165.86 spent
-// against a $50 limit — fraction > 1, tier over.
+// TestGetRunBudget_Over_TierOver exercises the 'over' band specifically:
+// spend between 1x and the 2x ack rung (here $75 against a $50 limit →
+// 1.5x). The #693 saturating evidence ($165.86 vs $50 ≈ 3.3x) now escalates
+// past 'over' to 'page' under the #1371 ladder — that band is covered by
+// TestGetRunBudget_Page_TierAndFlag.
 func TestGetRunBudget_Over_TierOver(t *testing.T) {
 	rr := newApprovalRunRepo()
 	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr})
 
 	warn := 0.8
-	id := seedBudgetStatusRun(rr, budgetStatusSpec(50, "advisory", &warn), 165.86)
+	id := seedBudgetStatusRun(rr, budgetStatusSpec(50, "advisory", &warn), 75)
 
 	code, raw := getRunBudget(t, s, id.String())
 	if code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", code)
 	}
 	assertJSONString(t, raw, "tier", "over")
+	assertJSONBool(t, raw, "ack_required", false)
 	var frac float64
 	if err := json.Unmarshal(raw["fraction"], &frac); err != nil {
 		t.Fatalf("decode fraction: %v", err)
@@ -188,6 +192,127 @@ func TestGetRunBudget_DefaultAdvisory_NormalizesEnforcement(t *testing.T) {
 	if _, ok := raw["warn_at"]; ok {
 		t.Errorf("warn_at must be omitted when not configured; got %v", raw["warn_at"])
 	}
+}
+
+// assertJSONBool asserts a boolean JSON field equals want.
+func assertJSONBool(t *testing.T, raw map[string]json.RawMessage, key string, want bool) {
+	t.Helper()
+	v, ok := raw[key]
+	if !ok {
+		if !want {
+			return // omitempty drops a false ack_required — absence == false
+		}
+		t.Fatalf("response missing %q key; got %v", key, raw)
+	}
+	var got bool
+	if err := json.Unmarshal(v, &got); err != nil {
+		t.Fatalf("decode %q: %v", key, err)
+	}
+	if got != want {
+		t.Errorf("%s = %v, want %v", key, got, want)
+	}
+}
+
+// TestGetRunBudget_AckRequired_TierAndFlag is the #1371 escalation band:
+// spend at the 2x default ack multiple surfaces tier=ack_required and
+// ack_required=true (no override / multiples configured → budget.Tier's
+// 2x/3x defaults apply).
+func TestGetRunBudget_AckRequired_TierAndFlag(t *testing.T) {
+	rr := newApprovalRunRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr})
+
+	warn := 0.8
+	// limit 100, spend 250 → fraction 2.5 → ack_required (>= 2x, < 3x).
+	id := seedBudgetStatusRun(rr, budgetStatusSpec(100, "advisory", &warn), 250)
+
+	code, raw := getRunBudget(t, s, id.String())
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	assertJSONString(t, raw, "tier", "ack_required")
+	assertJSONBool(t, raw, "ack_required", true)
+	assertJSONFloat(t, raw, "fraction", 2.5)
+}
+
+// TestGetRunBudget_Page_TierAndFlag: spend at the 3x default page multiple
+// surfaces tier=page and ack_required=true.
+func TestGetRunBudget_Page_TierAndFlag(t *testing.T) {
+	rr := newApprovalRunRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr})
+
+	warn := 0.8
+	// limit 100, spend 350 → fraction 3.5 → page (>= 3x).
+	id := seedBudgetStatusRun(rr, budgetStatusSpec(100, "advisory", &warn), 350)
+
+	code, raw := getRunBudget(t, s, id.String())
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	assertJSONString(t, raw, "tier", "page")
+	assertJSONBool(t, raw, "ack_required", true)
+}
+
+// TestGetRunBudget_BelowAck_NoAckRequired confirms the ok/warn/over bands
+// carry ack_required=false (omitted on the wire by omitempty).
+func TestGetRunBudget_BelowAck_NoAckRequired(t *testing.T) {
+	rr := newApprovalRunRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr})
+
+	warn := 0.8
+	// limit 100, spend 150 → fraction 1.5 → over, NOT ack_required.
+	id := seedBudgetStatusRun(rr, budgetStatusSpec(100, "advisory", &warn), 150)
+
+	code, raw := getRunBudget(t, s, id.String())
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	assertJSONString(t, raw, "tier", "over")
+	assertJSONBool(t, raw, "ack_required", false)
+}
+
+// TestGetRunBudget_LimitOverride_ChangesLimitFractionTier is the #1371
+// calibration seam: BudgetLimitOverrideUSD > 0 replaces the spec limit, so
+// limit_usd, fraction, and tier all report against the effective limit.
+// Same seeded spend ($150) reads 'over' against the $100 spec limit but
+// only 'warn' against a $300 calibrated override.
+func TestGetRunBudget_LimitOverride_ChangesLimitFractionTier(t *testing.T) {
+	rr := newApprovalRunRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, BudgetLimitOverrideUSD: 300})
+
+	warn := 0.8
+	// spec limit 100, override 300, spend 150 → fraction 0.5 against the
+	// effective $300 limit → tier ok (0.5 < warn 0.8).
+	id := seedBudgetStatusRun(rr, budgetStatusSpec(100, "advisory", &warn), 150)
+
+	code, raw := getRunBudget(t, s, id.String())
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	assertJSONFloat(t, raw, "limit_usd", 300)
+	assertJSONFloat(t, raw, "fraction", 0.5)
+	assertJSONString(t, raw, "tier", "ok")
+}
+
+// TestGetRunBudget_ZeroValueMultiples_FallBackToDefaults pins the defensive
+// fallback at the response seam: a Server built with no BudgetAckMultiple /
+// BudgetPageMultiple (both zero) must NOT collapse an over-limit fraction
+// into 'page'. Spend 1.5x reads 'over', not 'page'.
+func TestGetRunBudget_ZeroValueMultiples_FallBackToDefaults(t *testing.T) {
+	rr := newApprovalRunRepo()
+	// Note: no BudgetAckMultiple/BudgetPageMultiple set — both default 0.
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr})
+
+	warn := 0.8
+	id := seedBudgetStatusRun(rr, budgetStatusSpec(100, "advisory", &warn), 150)
+
+	code, raw := getRunBudget(t, s, id.String())
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	// With the bad zero pair honored, 1.5 >= 0 would be 'page'; the
+	// fallback to 2x/3x keeps it 'over'.
+	assertJSONString(t, raw, "tier", "over")
+	assertJSONBool(t, raw, "ack_required", false)
 }
 
 func TestGetRunBudget_BadUUID_400(t *testing.T) {

@@ -8,15 +8,10 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/budget"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
-
-// budgetTierOK is the no-crossing tier for a periodic-budget status. It
-// joins budgetTierWarn / budgetTierOver (declared in trace.go for the
-// alert path) to form the {ok, warn, over} display tier set surfaced by
-// GET /v0/runs/{run_id}/budget.
-const budgetTierOK = "ok"
 
 // budgetStatusResponse is the GET /v0/runs/{run_id}/budget body: the
 // current calendar-period status of the run's workflow periodic budget
@@ -36,6 +31,7 @@ type budgetStatusResponse struct {
 	Fraction    float64  `json:"fraction"`
 	WarnAt      *float64 `json:"warn_at,omitempty"`
 	Tier        string   `json:"tier"`
+	AckRequired bool     `json:"ack_required,omitempty"`
 	Enforcement string   `json:"enforcement"`
 }
 
@@ -85,6 +81,12 @@ func (s *Server) runBudgetStatus(ctx context.Context, runID uuid.UUID) (*budgetS
 	}
 	now := time.Now()
 
+	// Apply the operator's calibration override (#1371) on a copy of the
+	// budget so spend is evaluated against — and limit_usd/fraction/tier
+	// report — the effective limit, matching the alert path
+	// (checkBudgetAlerts) which uses the same effectiveBudgetLimit helper.
+	b.LimitUSD = s.effectiveBudgetLimit(b)
+
 	d, ok, err := evaluateWorkflowBudget(ctx, summer, runRow.Repo, runRow.WorkflowID, b, now, loc)
 	if err != nil {
 		return nil, err
@@ -94,13 +96,11 @@ func (s *Server) runBudgetStatus(ctx context.Context, runID uuid.UUID) (*budgetS
 		return nil, nil
 	}
 
-	tier := budgetTierOK
-	switch {
-	case d.Over:
-		tier = budgetTierOver
-	case d.WarnCrossed:
-		tier = budgetTierWarn
-	}
+	// Single-source escalating ladder (#1371): ok|warn|over|ack_required|page,
+	// driven by the configured ack/page multiples (with budget.Tier's
+	// defensive fallback to 2x/3x for a zero-value Config). ack_required
+	// surfaces as the ack_required boolean so callers need not re-derive it.
+	tier := budget.Tier(d, s.cfg.BudgetAckMultiple, s.cfg.BudgetPageMultiple)
 
 	// An empty enforcement value defaults to advisory — the spec's
 	// documented zero-value. Normalize it so the wire never carries ""
@@ -118,6 +118,7 @@ func (s *Server) runBudgetStatus(ctx context.Context, runID uuid.UUID) (*budgetS
 		Fraction:    d.Fraction,
 		WarnAt:      b.WarnAt,
 		Tier:        tier,
+		AckRequired: budget.AckRequired(tier),
 		Enforcement: enforcement,
 	}, nil
 }

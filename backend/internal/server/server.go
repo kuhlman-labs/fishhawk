@@ -272,6 +272,30 @@ type Config struct {
 	// zoneinfo never crashes startup.
 	BudgetLocation *time.Location
 
+	// BudgetLimitOverrideUSD calibrates the advisory periodic-budget signal
+	// (#1371) WITHOUT editing .fishhawk/workflows.yaml — a forbidden commit
+	// path for the implement stage. When > 0 it replaces the spec budget's
+	// limit_usd in BOTH the display path (GET /v0/runs/{id}/budget) and the
+	// alert path (checkBudgetAlerts), so the dogfood weekly limit can be set
+	// to a believable reality and a normal calibrated week reads a believable
+	// fraction instead of saturating at 'over'. The default 0 means "use the
+	// spec limit", byte-identical to today. It is a GLOBAL override across the
+	// run's advisory budgets — acceptable for v0, where the dogfood spec
+	// declares exactly one. Wired from FISHHAWKD_BUDGET_LIMIT_OVERRIDE_USD in
+	// serve.go.
+	BudgetLimitOverrideUSD float64
+
+	// BudgetAckMultiple and BudgetPageMultiple are the configured multiples of
+	// the (possibly overridden) periodic-budget limit at which the escalating
+	// tier ladder (#1371) trips its ack_required and page rungs — the input to
+	// budget.Tier. Defaults: ack at 2x, page at 3x. A non-positive value, or an
+	// inverted pair (page <= ack), falls back to budget.DefaultAckMultiple /
+	// budget.DefaultPageMultiple inside budget.Tier, so a zero-value Config can
+	// never collapse every fraction into 'page'. Wired from
+	// FISHHAWKD_BUDGET_ACK_MULTIPLE / FISHHAWKD_BUDGET_PAGE_MULTIPLE in serve.go.
+	BudgetAckMultiple  float64
+	BudgetPageMultiple float64
+
 	// MaxRunUSD is the per-run US-dollar spend ceiling — a global operator
 	// safety rail (ADR-030 / #653) that HALTS a single run once its rolled
 	// cost_usd_total (#649) reaches this figure, independent of the

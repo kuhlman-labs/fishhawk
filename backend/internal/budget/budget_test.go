@@ -205,6 +205,109 @@ func TestEvaluate_NonPositiveLimitNeverBlocks(t *testing.T) {
 	}
 }
 
+// decisionAtFraction builds a Decision with the given Fraction and the
+// Over/WarnCrossed flags Evaluate would set for it against warnAt, so
+// TestTier exercises Tier with realistic decisions rather than hand-set
+// flag combinations.
+func decisionAtFraction(fraction float64, warnAt *float64) Decision {
+	d := Decision{Fraction: fraction, Over: fraction >= 1.0}
+	if warnAt != nil && *warnAt > 0 {
+		d.WarnCrossed = fraction >= *warnAt
+	}
+	return d
+}
+
+func TestTier(t *testing.T) {
+	warn := floatPtr(0.8)
+	const ack, page = 2.0, 3.0
+
+	cases := []struct {
+		name     string
+		fraction float64
+		want     string
+	}{
+		{"below warn", 0.5, TierOK},
+		{"just below warn", 0.79, TierOK},
+		{"at warn", 0.8, TierWarn},
+		{"between warn and limit", 0.95, TierWarn},
+		{"just below limit", 0.999, TierWarn},
+		{"at limit", 1.0, TierOver},
+		{"over but below ack", 1.5, TierOver},
+		{"just below ack", 1.999, TierOver},
+		{"at ack", 2.0, TierAckRequired},
+		{"between ack and page", 2.5, TierAckRequired},
+		{"just below page", 2.999, TierAckRequired},
+		{"at page", 3.0, TierPage},
+		{"above page", 5.0, TierPage},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := decisionAtFraction(tc.fraction, warn)
+			if got := Tier(d, ack, page); got != tc.want {
+				t.Errorf("Tier(fraction=%g) = %q, want %q", tc.fraction, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTier_NoWarnAt confirms that with a nil warn_at the sub-limit bands
+// never reach 'warn' — a Decision Evaluate produced with WarnCrossed=false
+// stays 'ok' right up to the limit, then escalates normally.
+func TestTier_NoWarnAt(t *testing.T) {
+	const ack, page = 2.0, 3.0
+	if got := Tier(decisionAtFraction(0.95, nil), ack, page); got != TierOK {
+		t.Errorf("Tier(0.95, nil warn_at) = %q, want %q", got, TierOK)
+	}
+	if got := Tier(decisionAtFraction(1.0, nil), ack, page); got != TierOver {
+		t.Errorf("Tier(1.0, nil warn_at) = %q, want %q", got, TierOver)
+	}
+}
+
+// TestTier_DefensiveFallback pins the zero/inverted-multiple guard: an
+// unconfigured (zero-value) Config must NOT collapse every positive
+// fraction into 'page', and an inverted pair (page <= ack) must fall back
+// to the 2x/3x defaults rather than honoring the bad ordering.
+func TestTier_DefensiveFallback(t *testing.T) {
+	warn := floatPtr(0.8)
+
+	// Zero multiples → defaults (2x ack, 3x page). A 1.5x fraction is
+	// merely 'over', not 'page'; a 2.5x fraction is 'ack_required'.
+	if got := Tier(decisionAtFraction(1.5, warn), 0, 0); got != TierOver {
+		t.Errorf("Tier(1.5, zero multiples) = %q, want %q (defaults applied)", got, TierOver)
+	}
+	if got := Tier(decisionAtFraction(2.5, warn), 0, 0); got != TierAckRequired {
+		t.Errorf("Tier(2.5, zero multiples) = %q, want %q (defaults applied)", got, TierAckRequired)
+	}
+	if got := Tier(decisionAtFraction(3.0, warn), 0, 0); got != TierPage {
+		t.Errorf("Tier(3.0, zero multiples) = %q, want %q (defaults applied)", got, TierPage)
+	}
+
+	// Inverted pair (page <= ack) → defaults, not the bad ordering. With
+	// the bad pair honored, a 2.0x fraction would be 'page' (>= page=1.5);
+	// with the fallback it is 'ack_required' (>= 2.0 default ack).
+	if got := Tier(decisionAtFraction(2.0, warn), 2.0, 1.5); got != TierAckRequired {
+		t.Errorf("Tier(2.0, inverted page<=ack) = %q, want %q (defaults applied)", got, TierAckRequired)
+	}
+
+	// A negative multiple is non-positive → defaults.
+	if got := Tier(decisionAtFraction(2.5, warn), -1, 3.0); got != TierAckRequired {
+		t.Errorf("Tier(2.5, negative ack) = %q, want %q (defaults applied)", got, TierAckRequired)
+	}
+}
+
+func TestAckRequired(t *testing.T) {
+	for _, tier := range []string{TierOK, TierWarn, TierOver} {
+		if AckRequired(tier) {
+			t.Errorf("AckRequired(%q) = true, want false", tier)
+		}
+	}
+	for _, tier := range []string{TierAckRequired, TierPage} {
+		if !AckRequired(tier) {
+			t.Errorf("AckRequired(%q) = false, want true", tier)
+		}
+	}
+}
+
 func TestEvaluate_WeeklyPeriodStart(t *testing.T) {
 	// Wednesday 2026-06-03; weekly period started Monday 2026-06-01.
 	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
