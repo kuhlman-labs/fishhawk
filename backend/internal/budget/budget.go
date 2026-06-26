@@ -104,10 +104,7 @@ const (
 // Config (ackMultiple == pageMultiple == 0) does not classify every
 // positive fraction as 'page' (0 >= 0), which would saturate the gate.
 func Tier(d Decision, ackMultiple, pageMultiple float64) string {
-	if ackMultiple <= 0 || pageMultiple <= 0 || pageMultiple <= ackMultiple {
-		ackMultiple = DefaultAckMultiple
-		pageMultiple = DefaultPageMultiple
-	}
+	ackMultiple, pageMultiple = EffectiveMultiples(ackMultiple, pageMultiple)
 	switch {
 	case d.Fraction >= pageMultiple:
 		return TierPage
@@ -120,6 +117,22 @@ func Tier(d Decision, ackMultiple, pageMultiple float64) string {
 	default:
 		return TierOK
 	}
+}
+
+// EffectiveMultiples returns the (ack, page) multiples Tier will actually
+// gate on for a given configured pair, applying the same defensive fallback
+// as Tier: a non-positive multiple or an inverted pair
+// (pageMultiple <= ackMultiple) is replaced wholesale by DefaultAckMultiple /
+// DefaultPageMultiple. Callers that surface the threshold they gated on — the
+// plan-approval gate's 422 message and audit payload (#1371) — resolve it
+// through here so the reported ack_multiple matches the rung Tier evaluated,
+// even when the operator's configured pair is unusable (e.g. ack=5/page=3
+// gates at the 2x default but must report 2x, not 5x).
+func EffectiveMultiples(ackMultiple, pageMultiple float64) (float64, float64) {
+	if ackMultiple <= 0 || pageMultiple <= 0 || pageMultiple <= ackMultiple {
+		return DefaultAckMultiple, DefaultPageMultiple
+	}
+	return ackMultiple, pageMultiple
 }
 
 // AckRequired reports whether a tier has reached the acknowledgment

@@ -1126,10 +1126,12 @@ func (s *Server) checkPeriodicBudgetTier(w http.ResponseWriter, r *http.Request,
 		return true
 	}
 
-	ackMultiple := s.cfg.BudgetAckMultiple
-	if ackMultiple <= 0 {
-		ackMultiple = budget.DefaultAckMultiple
-	}
+	// Resolve the reported ack multiple through the same defensive
+	// fallback budget.Tier applied, so the threshold the 422 message and
+	// audit payload advertise matches the rung the gate actually evaluated
+	// — including the inverted-pair case (e.g. ack=5/page=3 gates at the 2x
+	// default and must report 2x, not the configured 5x) (#1371).
+	ackMultiple, _ := budget.EffectiveMultiples(s.cfg.BudgetAckMultiple, s.cfg.BudgetPageMultiple)
 	auditPayload, _ := json.Marshal(map[string]any{
 		"stage_id":     stage.ID.String(),
 		"workflow_id":  runRow.WorkflowID,
