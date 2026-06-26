@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -840,6 +841,159 @@ func TestResolveReview_PollThenWebhook_ClosedUnmerged_SingleCancelled(t *testing
 	}
 	if rr.transitions[0].To != run.StageStateCancelled {
 		t.Errorf("transition.To = %q, want cancelled", rr.transitions[0].To)
+	}
+}
+
+// --- post_merge_observed (#1370) -------------------------------------------
+//
+// The run lifecycle owns its post-merge tail: resolveReviewStageOnMerge emits a
+// post_merge_observed audit row once per ACTUALLY-resolved merge (review-gated
+// and no-review alike), and NEVER for a merge held by the implement-review gate
+// or a closed-without-merge resolution. next_actions keys the succeeded_merged
+// state off that exact category string, so these tests pin the server end of
+// the cross-binary seam.
+
+// countCategory counts captured audit rows of the given category.
+func countCategory(rows []audit.ChainAppendParams, category string) int {
+	n := 0
+	for _, r := range rows {
+		if r.Category == category {
+			n++
+		}
+	}
+	return n
+}
+
+// (a) a review-gated merge resolution writes exactly one post_merge_observed
+// row carrying the expected payload and the resolved review stage id.
+func TestResolveReviewOnMerge_ReviewGated_WritesPostMergeObserved(t *testing.T) {
+	runID := uuid.New()
+	reviewStageID := uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{{ID: runID, PullRequestURL: &prURL}},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {
+				{ID: uuid.New(), RunID: runID, Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+				{ID: reviewStageID, RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval},
+			},
+		},
+	}
+	ar := &prEventsAuditRepo{}
+	s := prEventsTestServer(t, rr, ar)
+
+	payload, _ := json.Marshal(map[string]any{
+		"pull_request": map[string]any{
+			"html_url":  prURL,
+			"merged":    true,
+			"merged_by": map[string]any{"login": "alice"},
+			"head":      map[string]any{"sha": "headsha"},
+			"base":      map[string]any{"sha": "basesha"},
+		},
+		"sender": map[string]any{"login": "alice"},
+	})
+	s.handlePullRequestClosed(context.Background(), payload)
+
+	if n := countCategory(ar.appended, CategoryPostMergeObserved); n != 1 {
+		t.Fatalf("post_merge_observed rows = %d, want exactly 1; got categories %v", n, auditCategories(ar.appended))
+	}
+	row := findCategory(ar.appended, CategoryPostMergeObserved)
+	if row.RunID != runID {
+		t.Errorf("audit RunID = %s, want %s", row.RunID, runID)
+	}
+	if row.StageID == nil || *row.StageID != reviewStageID {
+		t.Errorf("audit StageID = %v, want the resolved review stage %s", row.StageID, reviewStageID)
+	}
+	if row.ActorKind == nil || *row.ActorKind != audit.ActorSystem {
+		t.Errorf("audit ActorKind = %v, want system (lifecycle observation, not a user action)", row.ActorKind)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(row.Payload, &body); err != nil {
+		t.Fatalf("payload unmarshal: %v", err)
+	}
+	if body["pr_url"] != prURL || body["merger"] != "alice" || body["head_sha"] != "headsha" || body["base_sha"] != "basesha" {
+		t.Errorf("post_merge_observed payload missing expected fields: %+v", body)
+	}
+}
+
+// (b) a no-review (implement-only) merge resolution writes one
+// post_merge_observed row, carrying no stage id (no review stage on the shape).
+func TestResolveReviewOnMerge_NoReviewStage_WritesPostMergeObserved(t *testing.T) {
+	runID := uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{{ID: runID, PullRequestURL: &prURL}},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {{ID: uuid.New(), RunID: runID, Type: run.StageTypeImplement, State: run.StageStateSucceeded}},
+		},
+	}
+	ar := &prEventsAuditRepo{}
+	s := prEventsTestServer(t, rr, ar)
+
+	payload, _ := json.Marshal(map[string]any{
+		"pull_request": map[string]any{
+			"html_url":  prURL,
+			"merged":    true,
+			"merged_by": map[string]any{"login": "alice"},
+			"head":      map[string]any{"sha": "h"},
+			"base":      map[string]any{"sha": "b"},
+		},
+	})
+	s.handlePullRequestClosed(context.Background(), payload)
+
+	if n := countCategory(ar.appended, CategoryPostMergeObserved); n != 1 {
+		t.Fatalf("post_merge_observed rows = %d, want exactly 1; got %v", n, auditCategories(ar.appended))
+	}
+	if row := findCategory(ar.appended, CategoryPostMergeObserved); row.StageID != nil {
+		t.Errorf("audit StageID = %v, want nil (no review stage)", row.StageID)
+	}
+}
+
+// (c) a merge HELD by the unsettled implement-review gate writes NO
+// post_merge_observed row — the run stays parked, so nothing resolved. Drives
+// the full gate-plus-resolver seam via the implement-review-gate harness.
+func TestResolveReviewOnMerge_HeldByReviewGate_NoPostMergeObserved(t *testing.T) {
+	s, _, ar, runID, _ := newImplementReviewGateRun(t, 1)
+	ar.seedCategory("implement_review_started", time.Now().UTC())
+
+	if err := s.ResolveReviewFromPollState(context.Background(), runID, true, implementReviewGatePRURL); err != nil {
+		t.Fatalf("ResolveReviewFromPollState: %v", err)
+	}
+	for _, e := range ar.appended {
+		if e.Category == CategoryPostMergeObserved {
+			t.Fatalf("post_merge_observed written while the merge is held pending implement review; want none")
+		}
+	}
+}
+
+// (d) a closed-without-merge resolution writes NO post_merge_observed row —
+// the tail event fires only on an actually-merged resolution.
+func TestResolveReviewOnMerge_ClosedWithoutMerge_NoPostMergeObserved(t *testing.T) {
+	runID := uuid.New()
+	reviewStageID := uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{{ID: runID, PullRequestURL: &prURL}},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {{ID: reviewStageID, RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval}},
+		},
+	}
+	ar := &prEventsAuditRepo{}
+	s := prEventsTestServer(t, rr, ar)
+
+	payload, _ := json.Marshal(map[string]any{
+		"pull_request": map[string]any{
+			"html_url": prURL,
+			"merged":   false,
+			"head":     map[string]any{"sha": "h"},
+			"base":     map[string]any{"sha": "b"},
+		},
+		"sender": map[string]any{"login": "alice"},
+	})
+	s.handlePullRequestClosed(context.Background(), payload)
+
+	if n := countCategory(ar.appended, CategoryPostMergeObserved); n != 0 {
+		t.Fatalf("post_merge_observed rows = %d, want 0 on a closed-without-merge resolution; got %v", n, auditCategories(ar.appended))
 	}
 }
 

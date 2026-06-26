@@ -1137,8 +1137,10 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 
 	// Server-suggested next actions (#1024): a pure function over the
 	// run/stage/review/hint/drive data fetched above — no extra
-	// round-trip, never fails the snapshot.
-	nextActions := nextActionsFor(runRow, stages, planReviewStatus, implementReviewStatus, reviewActionHint, view.driveStatus())
+	// round-trip, never fails the snapshot. mergeObserved (#1370) is read
+	// off the same `recent` slice and gates the succeeded_merged state.
+	mergeObserved := mergeObservedIn(recent)
+	nextActions := nextActionsFor(runRow, stages, planReviewStatus, implementReviewStatus, reviewActionHint, view.driveStatus(), mergeObserved)
 
 	// Best-effort decomposed-parent children status (#1147). Cost-gated so an
 	// ordinary run pays nothing: only a decomposed parent (no parent_run_id,

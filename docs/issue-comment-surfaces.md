@@ -840,6 +840,26 @@ Notes:
   never unwinds the upload. Listed here only so a future reader grepping the
   audit categories doesn't mistake them for comment surfaces.
 
+- The post-merge lifecycle audit kind — `post_merge_observed` (#1370) — is an
+  **internal, system-actor audit kind, not an issue-comment surface**. Nothing
+  in `issuecomment` posts it; it has no Notifier method. It is written
+  best-effort by `server/pullrequest_review_events.go::resolveReviewStageOnMerge`
+  (via `writePostMergeObservedAudit`) once per ACTUALLY-resolved merge —
+  alongside the `pr_merged` row and the `run_merged` board move — from BOTH the
+  `pull_request.closed` webhook handler and the merge-reconciler poll
+  (`ResolveReviewFromPollState`), which share that resolution method. It fires
+  for the review-gated and no-review (implement-only) merge paths alike, and
+  NEVER for a merge held by the implement-review gate (the run stays parked) or a
+  closed-without-merge resolution. Payload shape: `{pr_url, merger, head_sha,
+  base_sha}` — the same fields `pr_merged` serializes. The write is best-effort
+  and logged-never-rolled-back (it mirrors the `run_merged` board move's
+  never-unwind contract). The `fishhawk-mcp` `next_actions` classifier consumes
+  it (off the recent-audit slice `get_run_status` already fetches) to surface the
+  `succeeded_merged` lifecycle state — a merged run's tail state owned and
+  observable in `get_run_status` rather than implicit in whether the operator ran
+  `scripts/dev post-merge`. Listed here only so a future reader grepping the
+  audit categories doesn't mistake it for a comment surface.
+
 ## Routing
 
 All surfaces above only fire when the run's `TriggerSource = github_issue`.
