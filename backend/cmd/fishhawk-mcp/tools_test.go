@@ -2894,6 +2894,77 @@ func TestGetRunStatus_HappyPath_BundlesThreeReads(t *testing.T) {
 	}
 }
 
+// TestGetRunStatus_SucceededMerged_NextActionsState drives the full
+// getRunStatus handler to pin the #1370 cross-binary seam: a SUCCEEDED run
+// with an open PR URL whose recent-audit slice carries a post_merge_observed
+// entry (the server lifecycle event) reclassifies next_actions to
+// succeeded_merged — the operator post_merge dev-host step survives while the
+// now-completed approve_pr / merge_pr ritual steps drop away. The negative
+// mirror (no post_merge_observed → unchanged succeeded_pr_open) is asserted in
+// the second sub-run so the gate is proven from BOTH sides through the handler.
+func TestGetRunStatus_SucceededMerged_NextActionsState(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	seedRun := func(fb *fakeBackend, runID uuid.UUID, withObserved bool) {
+		pr := prURL
+		fb.getRunByID[runID] = Run{
+			ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change",
+			State: "succeeded", PullRequestURL: &pr,
+		}
+		fb.stagesByRun[runID] = []Stage{
+			{ID: uuid.New().String(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+			{ID: uuid.New().String(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "succeeded"},
+			{ID: uuid.New().String(), RunID: runID.String(), Sequence: 3, Type: "review", State: "succeeded"},
+		}
+		audit := []AuditEntry{auditFixture(2, runID, "pr_merged", "alice", 2*time.Minute)}
+		if withObserved {
+			audit = append([]AuditEntry{auditFixture(3, runID, "post_merge_observed", "system", 1*time.Minute)}, audit...)
+		}
+		fb.auditByRun[runID] = audit
+	}
+
+	t.Run("merge observed -> succeeded_merged", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		seedRun(fb, runID, true)
+
+		r := newResolver(srv, nil)
+		_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		if out.NextActions == nil || out.NextActions.State != "succeeded_merged" {
+			t.Fatalf("next_actions = %+v, want state succeeded_merged", out.NextActions)
+		}
+		var hasPostMerge bool
+		for _, a := range out.NextActions.Actions {
+			if a.Action == "approve_pr" || a.Action == "merge_pr" {
+				t.Errorf("merge ritual action %q surfaced on a merged run", a.Action)
+			}
+			if a.Action == "post_merge" {
+				hasPostMerge = true
+			}
+		}
+		if !hasPostMerge {
+			t.Errorf("succeeded_merged should still surface the operator post_merge step; got %+v", out.NextActions.Actions)
+		}
+	})
+
+	t.Run("merge not observed -> succeeded_pr_open", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		seedRun(fb, runID, false)
+
+		r := newResolver(srv, nil)
+		_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		if out.NextActions == nil || out.NextActions.State != "succeeded_pr_open" {
+			t.Fatalf("next_actions = %+v, want state succeeded_pr_open (no post_merge_observed)", out.NextActions)
+		}
+	})
+}
+
 // TestGetRunStatus_StageWaitStatus_PropagatesEndToEnd drives the full
 // getRunStatus handler against the fake backend to cover the cross-layer seam
 // (#879/#880, cf. #618): backend Stage.State -> stageWaitStatusFor derivation

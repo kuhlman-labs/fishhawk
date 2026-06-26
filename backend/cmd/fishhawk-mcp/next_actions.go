@@ -64,7 +64,7 @@ type NextActions struct {
 // every input except run and stages may be nil. For drive-enabled runs
 // with a distilled NextAction, that action is folded in FIRST so drive
 // and next_actions never point different ways.
-func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, drive *DriveStatus) *NextActions {
+func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, drive *DriveStatus, mergeObserved bool) *NextActions {
 	if run == nil {
 		return nil
 	}
@@ -81,7 +81,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		return na
 	}
 
-	na := classifyNextActions(run, stages, planReviewStatus, implementReviewStatus, hint)
+	na := classifyNextActions(run, stages, planReviewStatus, implementReviewStatus, hint, mergeObserved)
 
 	if drive != nil && drive.NextAction != nil {
 		na.Actions = append([]SuggestedAction{driveAction(run, drive.NextAction)}, na.Actions...)
@@ -99,7 +99,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 
 // classifyNextActions is the state table. Each arm returns a labeled
 // state with >= 1 action; only terminal arms return nil actions.
-func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint) *NextActions {
+func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, mergeObserved bool) *NextActions {
 	plan := stageByType(stages, "plan")
 	impl := stageByType(stages, "implement")
 	review := stageByType(stages, "review")
@@ -147,6 +147,16 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 			}
 		}
 		if run.PullRequestURL != nil && *run.PullRequestURL != "" {
+			// Lifecycle owns its post-merge tail (#1370): when a
+			// post_merge_observed audit entry is present the backend has
+			// observed the PR merge resolve, so the approve_pr/merge_pr
+			// ritual is already complete. Surface succeeded_merged with only
+			// the operator post_merge dev-host step (rebuild/reload stays an
+			// operator/deploy concern, ADR-038) — dropping the now-done
+			// approve_pr/merge_pr steps.
+			if mergeObserved {
+				return &NextActions{State: "succeeded_merged", Actions: []SuggestedAction{postMergeStep(run)}}
+			}
 			return &NextActions{State: "succeeded_pr_open", Actions: mergeRitualActions(run, "the run succeeded with its PR open")}
 		}
 		return &NextActions{State: run.State}
@@ -619,14 +629,38 @@ func mergeRitualActions(run *Run, why string) []SuggestedAction {
 			Consumes:     consumesNone,
 			Reason:       "merging resolves the run via the merge reconciler",
 		},
-		{
-			Action:       "post_merge",
-			Params:       nil,
-			Precondition: "the PR is merged",
-			Consumes:     consumesNone,
-			Reason:       "scripts/dev post-merge pulls main, prunes the merged branch, and reloads the stack",
-		},
+		postMergeStep(run),
 	}
+}
+
+// postMergeStep is the single source of truth for the operator post-merge
+// dev-host SuggestedAction, reused by mergeRitualActions and the
+// succeeded_merged arm (#1370). The rebuild/reload of the dev host stays
+// an operator/deploy concern (ADR-038 #925) even once the lifecycle owns
+// the merge tail, so this step survives in the succeeded_merged state
+// after approve_pr/merge_pr drop away.
+func postMergeStep(_ *Run) SuggestedAction {
+	return SuggestedAction{
+		Action:       "post_merge",
+		Params:       nil,
+		Precondition: "the PR is merged",
+		Consumes:     consumesNone,
+		Reason:       "scripts/dev post-merge pulls main, prunes the merged branch, and reloads the stack",
+	}
+}
+
+// mergeObservedIn reports whether the recent-audit slice carries a
+// post_merge_observed entry (#1370) — the backend lifecycle signal that
+// the run's PR merge resolved. getRunStatus computes this off the `recent`
+// slice it already fetches and threads it into nextActionsFor to gate the
+// succeeded_merged state.
+func mergeObservedIn(recent []AuditEntry) bool {
+	for _, e := range recent {
+		if e.Category == "post_merge_observed" {
+			return true
+		}
+	}
+	return false
 }
 
 // unclassifiedNextActions is the labeled fallback for any non-terminal

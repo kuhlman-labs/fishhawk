@@ -405,7 +405,7 @@ func TestNextActions_StateTable(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			na := nextActionsFor(tc.run, tc.stages, tc.planRS, tc.implRS, tc.hint, nil)
+			na := nextActionsFor(tc.run, tc.stages, tc.planRS, tc.implRS, tc.hint, nil, false)
 			if na == nil {
 				t.Fatal("nextActionsFor returned nil; the block must always be present")
 			}
@@ -450,7 +450,7 @@ func TestNextActions_ImplementLocalDispatchDefault(t *testing.T) {
 	run := naRun("running")
 	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "pending")}
 
-	na := nextActionsFor(run, stages, nil, nil, nil, nil)
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
 	if na == nil || na.State != "implement_pending" {
 		t.Fatalf("state = %+v, want implement_pending", na)
 	}
@@ -475,7 +475,7 @@ func TestNextActions_PlanLocalDispatchUnchanged(t *testing.T) {
 	run := naRun("pending")
 	stages := []Stage{naStage("plan", "pending")}
 
-	na := nextActionsFor(run, stages, nil, nil, nil, nil)
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
 	if got := actionNames(na); len(got) != 1 || got[0] != "fishhawk_run_stage" {
 		t.Fatalf("plan-local actions = %v, want exactly [fishhawk_run_stage]", got)
 	}
@@ -489,7 +489,7 @@ func TestNextActions_AwaitingChildren_FanOutArm(t *testing.T) {
 	run := naRun("running")
 	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_children")}
 
-	na := nextActionsFor(run, stages, nil, nil, nil, nil)
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
 	if na == nil || na.State != "implement_awaiting_children" {
 		t.Fatalf("state = %+v, want implement_awaiting_children", na)
 	}
@@ -511,7 +511,7 @@ func TestNextActions_AwaitingScopeDecision_DecideArm(t *testing.T) {
 	run := naRun("running")
 	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_scope_decision")}
 
-	na := nextActionsFor(run, stages, nil, nil, nil, nil)
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
 	if na == nil || na.State != "implement_awaiting_scope_decision" {
 		t.Fatalf("state = %+v, want implement_awaiting_scope_decision", na)
 	}
@@ -538,7 +538,7 @@ func TestNextActions_UnclassifiedFallback(t *testing.T) {
 	// run is non-terminal — the synthetic unmatched fixture.
 	stages := []Stage{naStage("review", "succeeded")}
 
-	na := nextActionsFor(run, stages, nil, nil, nil, nil)
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
 	if na == nil {
 		t.Fatal("nextActionsFor returned nil")
 	}
@@ -572,7 +572,7 @@ func TestNextActions_DriveActionFoldsFirst(t *testing.T) {
 		NextAction: &RunNextAction{Action: "merge_pr", Detail: "all gates resolved", PRURL: prURL},
 	}
 
-	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, drive)
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, drive, false)
 	if na == nil || len(na.Actions) == 0 {
 		t.Fatalf("nextActionsFor = %+v, want the drive action folded in first", na)
 	}
@@ -594,14 +594,14 @@ func TestNextActions_DriveActionFoldsFirst(t *testing.T) {
 func TestNextActions_CategoryAFlakeCitation(t *testing.T) {
 	run := naRun("failed")
 	cited := nextActionsFor(run, []Stage{naStage("plan", "succeeded"),
-		naFailedImplement("A", "verify aborted after verify_infra_flake_retry")}, nil, nil, nil, nil)
+		naFailedImplement("A", "verify aborted after verify_infra_flake_retry")}, nil, nil, nil, nil, false)
 	retry := findAction(t, cited, "fishhawk_retry_stage")
 	if !strings.Contains(retry.Reason, "verify_infra_flake_retry") {
 		t.Errorf("retry reason should cite the flake trace event; got %q", retry.Reason)
 	}
 
 	uncited := nextActionsFor(run, []Stage{naStage("plan", "succeeded"),
-		naFailedImplement("A", "agent crashed")}, nil, nil, nil, nil)
+		naFailedImplement("A", "agent crashed")}, nil, nil, nil, nil, false)
 	retry = findAction(t, uncited, "fishhawk_retry_stage")
 	if strings.Contains(retry.Reason, "verify_infra_flake_retry") {
 		t.Errorf("retry reason cites a flake event the failure detail does not carry: %q", retry.Reason)
@@ -615,7 +615,7 @@ func TestNextActions_CategoryAFlakeCitation(t *testing.T) {
 func TestNextActions_ResumeRunNamesThisRunAsParent(t *testing.T) {
 	run := naRun("failed")
 	na := nextActionsFor(run, []Stage{naStage("plan", "succeeded"),
-		naFailedImplement("B", "undeclared created file")}, nil, nil, nil, nil)
+		naFailedImplement("B", "undeclared created file")}, nil, nil, nil, nil, false)
 	resume := findAction(t, na, "fishhawk_resume_run")
 	if resume.Params["parent_run_id"] != run.ID {
 		t.Errorf("resume_run params.parent_run_id = %q, want this run's id %s", resume.Params["parent_run_id"], run.ID)
@@ -634,7 +634,7 @@ func TestNextActions_AwaitingParentConsolidationPointsAtParent(t *testing.T) {
 	parent := uuid.NewString()
 	r.ParentRunID = &parent
 	na := nextActionsFor(r, []Stage{naStage("implement", "succeeded")},
-		nil, naReviewStatus("implement", "pending"), nil, nil)
+		nil, naReviewStatus("implement", "pending"), nil, nil, false)
 	if na.State != "awaiting_parent_consolidation" {
 		t.Fatalf("state = %q, want awaiting_parent_consolidation", na.State)
 	}
@@ -646,8 +646,8 @@ func TestNextActions_AwaitingParentConsolidationPointsAtParent(t *testing.T) {
 
 // TestNextActions_NilRun pins the nil guard.
 func TestNextActions_NilRun(t *testing.T) {
-	if na := nextActionsFor(nil, nil, nil, nil, nil, nil); na != nil {
-		t.Errorf("nextActionsFor(nil run) = %+v, want nil", na)
+	if na := nextActionsFor(nil, nil, nil, nil, nil, nil, false); na != nil {
+		t.Errorf("nextActionsFor(nil run, false) = %+v, want nil", na)
 	}
 }
 
@@ -657,7 +657,7 @@ func TestNextActions_NilRun(t *testing.T) {
 func TestNextActions_PlanReviewPendingDoesNotOfferApproval(t *testing.T) {
 	run := naRun("running")
 	na := nextActionsFor(run, []Stage{naStage("plan", "awaiting_approval")},
-		naReviewStatus("plan", "pending"), nil, nil, nil)
+		naReviewStatus("plan", "pending"), nil, nil, nil, false)
 	for _, a := range na.Actions {
 		if a.Action == "fishhawk_approve_plan" {
 			t.Error("approve_plan offered while the plan review is still pending — the verdict must be read first")
@@ -680,7 +680,7 @@ func TestNextActions_CIFailedRoutable(t *testing.T) {
 	drive := &DriveStatus{Drive: true, DerivedStatus: "ci_failed"}
 	hint := &ReviewActionHint{Concerns: 2, RemainingFixupBudget: 1}
 
-	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), hint, drive)
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), hint, drive, false)
 	if na.State != "ci_failed_routable" {
 		t.Fatalf("state = %q, want ci_failed_routable", na.State)
 	}
@@ -712,7 +712,7 @@ func TestNextActions_CIFailedUnroutable(t *testing.T) {
 	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_approval")}
 	drive := &DriveStatus{Drive: true, DerivedStatus: "ci_failed"}
 
-	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, drive)
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, drive, false)
 	if na.State != "ci_failed_unroutable" {
 		t.Fatalf("state = %q, want ci_failed_unroutable", na.State)
 	}
@@ -740,7 +740,7 @@ func TestNextActions_CIFailedFoldsDriveNextActionFirst(t *testing.T) {
 		NextAction:    &RunNextAction{Action: "classify_ci_failure", Detail: "required PR checks red", PRURL: prURL},
 	}
 
-	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, drive)
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, drive, false)
 	if na.Actions[0].Action != "classify_ci_failure" {
 		t.Errorf("actions[0] = %q, want the drive next_action classify_ci_failure folded first", na.Actions[0].Action)
 	}
@@ -762,7 +762,7 @@ func TestNextActions_SliceIntegrationConflict(t *testing.T) {
 		naStage("review", "pending"),
 	}
 
-	na := nextActionsFor(run, stages, nil, nil, nil, nil)
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
 	if na.State != "slices_integration_conflict" {
 		t.Fatalf("state = %q, want slices_integration_conflict", na.State)
 	}
@@ -782,8 +782,77 @@ func TestNextActions_OrdinaryCategoryBParentUnaffected(t *testing.T) {
 	run := naRun("failed")
 	stages := []Stage{naStage("plan", "succeeded"), naFailedImplement("B", "undeclared created file")}
 
-	na := nextActionsFor(run, stages, nil, nil, nil, nil)
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
 	if na.State != "implement_failed_category_b" {
 		t.Errorf("state = %q, want implement_failed_category_b for an ordinary category-B failure", na.State)
+	}
+}
+
+// TestNextActions_SucceededMerged pins the #1370 lifecycle-owns-its-tail
+// arm: a succeeded run with an open PR URL AND mergeObserved=true (a
+// post_merge_observed audit entry was seen) classifies succeeded_merged,
+// surfacing ONLY the operator post_merge dev-host step and dropping the
+// now-completed approve_pr / merge_pr ritual steps.
+func TestNextActions_SucceededMerged(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	run := naRun("succeeded")
+	run.PullRequestURL = &prURL
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, true)
+	if na == nil || na.State != "succeeded_merged" {
+		t.Fatalf("state = %+v, want succeeded_merged", na)
+	}
+	// The post_merge dev-host step survives (rebuild/reload stays an
+	// operator concern, ADR-038).
+	post := findAction(t, na, "post_merge")
+	if !strings.Contains(post.Reason, "scripts/dev post-merge") {
+		t.Errorf("post_merge reason should name scripts/dev post-merge; got %q", post.Reason)
+	}
+	// The now-completed merge ritual steps are gone.
+	for _, a := range na.Actions {
+		if a.Action == "approve_pr" || a.Action == "merge_pr" {
+			t.Errorf("merge ritual action %q surfaced on a merged run — approve/merge are already done", a.Action)
+		}
+	}
+}
+
+// TestNextActions_SucceededPROpenUnchangedWhenMergeNotObserved pins the
+// negative mirror of #1370: a succeeded run with an open PR but
+// mergeObserved=false keeps the prior succeeded_pr_open state and the
+// full approve_pr -> merge_pr -> post_merge ritual.
+func TestNextActions_SucceededPROpenUnchangedWhenMergeNotObserved(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	run := naRun("succeeded")
+	run.PullRequestURL = &prURL
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false)
+	if na == nil || na.State != "succeeded_pr_open" {
+		t.Fatalf("state = %+v, want succeeded_pr_open", na)
+	}
+	if got := actionNames(na); len(got) != 3 || got[0] != "approve_pr" || got[1] != "merge_pr" || got[2] != "post_merge" {
+		t.Fatalf("actions = %v, want [approve_pr merge_pr post_merge]", got)
+	}
+}
+
+// TestMergeObservedIn pins the #1370 detector: it returns true for a
+// recent-audit slice carrying a post_merge_observed entry and false for a
+// slice with only other categories.
+func TestMergeObservedIn(t *testing.T) {
+	if !mergeObservedIn([]AuditEntry{
+		{Category: "pr_merged"},
+		{Category: "post_merge_observed"},
+	}) {
+		t.Error("mergeObservedIn = false, want true when a post_merge_observed entry is present")
+	}
+	if mergeObservedIn([]AuditEntry{
+		{Category: "pr_merged"},
+		{Category: "work_item_transitioned"},
+	}) {
+		t.Error("mergeObservedIn = true, want false when no post_merge_observed entry is present")
+	}
+	if mergeObservedIn(nil) {
+		t.Error("mergeObservedIn(nil) = true, want false")
 	}
 }

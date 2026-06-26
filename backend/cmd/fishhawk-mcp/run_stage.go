@@ -586,7 +586,10 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	// next move directly. Omitted when the run fetch failed.
 	var nextActions *NextActions
 	if runView != nil {
-		nextActions = nextActionsFor(&runView.Run, postStages, planReviewStatus, implementReviewStatus, reviewActionHint, runView.driveStatus())
+		// A run_stage call executes the plan or implement stage and can
+		// never observe a post-merge (the PR is not even open yet at
+		// implement-stage exit), so mergeObserved is the literal false (#1370).
+		nextActions = nextActionsFor(&runView.Run, postStages, planReviewStatus, implementReviewStatus, reviewActionHint, runView.driveStatus(), false)
 	}
 
 	out := RunStageOutput{

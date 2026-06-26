@@ -54,6 +54,17 @@ const (
 	// the existing state machine has a clean target (`cancelled`)
 	// reachable from `awaiting_approval`.
 	CategoryPRClosedWithoutMerge = "pr_closed_without_merge"
+	// CategoryPostMergeObserved records that the run lifecycle observed
+	// its PR merge resolve to terminal state (#1370). Emitted best-effort
+	// from the shared resolveReviewStageOnMerge path alongside the
+	// pr_merged / run_merged board move, so it fires for every actually-
+	// resolved merge regardless of which surface (webhook or reconciler
+	// poll) drove the resolution. Internal lifecycle audit only (not an
+	// issue-comment surface); the fishhawk-mcp next_actions classifier
+	// consumes it to surface the succeeded_merged state so a merged run's
+	// tail state is owned and observable in get_run_status rather than
+	// implicit in whether the operator ran scripts/dev post-merge.
+	CategoryPostMergeObserved = "post_merge_observed"
 )
 
 // pullRequestClosedPayload is the subset of the GitHub
@@ -236,6 +247,11 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 			// Sticky status comment (E20.4 / #330) — the audit row
 			// reflects the merge; the comment should too.
 			s.notifyStatusUpdate(ctx, target.ID, "pr_merged_no_review")
+			// Lifecycle owns its post-merge tail (#1370): record the
+			// merge observation so next_actions can surface
+			// succeeded_merged. No review stage on this shape, so the
+			// entry carries no stage id.
+			s.writePostMergeObservedAudit(ctx, target.ID, nil, meta)
 			return
 		}
 		if _, err := s.cfg.RunRepo.TransitionStage(ctx,
@@ -267,6 +283,10 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 		// Board-state sync (#1012): the PR merging advances the work item to
 		// the done canonical state. Best-effort; never unwinds the merge.
 		s.notifyBoardTransition(ctx, target.ID, lifecycleRunMerged)
+		// Lifecycle owns its post-merge tail (#1370): record the merge
+		// observation alongside the run_merged board move so next_actions
+		// can surface succeeded_merged. Carries the resolved review stage id.
+		s.writePostMergeObservedAudit(ctx, target.ID, stageID, meta)
 		return
 	}
 
@@ -532,6 +552,45 @@ func (s *Server) writePRMergedAudit(ctx context.Context, runID uuid.UUID, stageI
 	}); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
 			"pull_request.closed: pr_merged audit append failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+	}
+}
+
+// writePostMergeObservedAudit appends a post_merge_observed audit row
+// recording that the run lifecycle observed its PR merge resolve (#1370).
+// Called from the two merge-RESOLUTION success paths inside
+// resolveReviewStageOnMerge — once per actually-resolved merge, from both
+// the webhook handler and the reconciler poll (both route through that
+// method) — and never for a held or closed-unmerged run. The payload
+// reuses the fields writePRMergedAudit serializes (pr_url, merger,
+// head/base SHAs). ActorKind is the system marker: this is a lifecycle
+// observation, not a user action.
+//
+// Best-effort, mirroring the run_merged board move's never-unwind
+// contract: a logged append failure never rolls back the merge or its
+// pr_merged row.
+func (s *Server) writePostMergeObservedAudit(ctx context.Context, runID uuid.UUID, stageID *uuid.UUID, meta reviewMergeMeta) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	systemKind := audit.ActorSystem
+	payload, _ := json.Marshal(map[string]any{
+		"pr_url":   meta.prURL,
+		"merger":   meta.actorLogin,
+		"head_sha": meta.headSHA,
+		"base_sha": meta.baseSHA,
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryPostMergeObserved,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"resolve review on merge: post_merge_observed audit append failed",
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()))
 	}
