@@ -12,6 +12,11 @@ const stageStateStyles: Record<StageState, string> = {
   dispatched: 'text-blue-700 dark:text-blue-300',
   running: 'text-blue-700 dark:text-blue-300',
   awaiting_approval: 'text-amber-700 dark:text-amber-300',
+  // Deploy parked states (#1389): awaiting_deploy_approval is an
+  // operator-action gate (amber, matching awaiting_approval);
+  // awaiting_deployment is in-flight (blue, matching dispatched/running).
+  awaiting_deploy_approval: 'text-amber-700 dark:text-amber-300',
+  awaiting_deployment: 'text-blue-700 dark:text-blue-300',
   succeeded: 'text-emerald-700 dark:text-emerald-300',
   failed: 'text-rose-700 dark:text-rose-300',
   cancelled: 'text-neutral-500',

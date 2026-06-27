@@ -52,11 +52,21 @@ export type StageState =
   | 'dispatched'
   | 'running'
   | 'awaiting_approval'
+  // Deploy-stage parked states, mirroring the Go constants in
+  // backend/internal/run/run.go (StageStateAwaitingDeployApproval /
+  // StageStateAwaitingDeployment). awaiting_deploy_approval is the
+  // pre-execution gate (operator action pending); awaiting_deployment
+  // is the in-flight post-approval state while the delegated external
+  // pipeline runs. The OpenAPI Stage.state enum may not yet enumerate
+  // these even though the backend emits them — the mirror tracks the
+  // wire values the SPA actually renders.
+  | 'awaiting_deploy_approval'
+  | 'awaiting_deployment'
   | 'succeeded'
   | 'failed'
   | 'cancelled';
 
-export type StageType = 'plan' | 'implement' | 'review';
+export type StageType = 'plan' | 'implement' | 'review' | 'deploy';
 export type ExecutorKind = 'agent' | 'human';
 export type FailureCategory = 'A' | 'B' | 'C' | 'D';
 
@@ -120,7 +130,7 @@ export interface Stage {
   updated_at: string;
 }
 
-export type ArtifactKind = 'plan' | 'pull_request';
+export type ArtifactKind = 'plan' | 'pull_request' | 'deployment';
 
 export interface Artifact<C = unknown> {
   id: string;
