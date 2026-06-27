@@ -4,11 +4,13 @@ import { api } from '@/api/client';
 import { useAsync } from '@/api/use-async';
 import { isStandardV1Plan, type StandardV1Plan } from '@/api/plan';
 import { isPullRequestArtifact, type PullRequestArtifactBody } from '@/api/pull-request';
+import { isDeploymentArtifact, type DeploymentArtifactBody } from '@/api/deployment';
 import type { Artifact, Stage } from '@/api/types';
 import { FailureBanner } from '@/components/failure-banner';
 import { ImplementSessionDocument } from '@/implement/session-document';
 import { PlanDocument } from '@/plan/plan-document';
 import { ReviewDocument } from '@/review/review-document';
+import { DeployDocument } from '@/deploy/deploy-document';
 
 /*
  * Stage detail. Dispatches on stage.type:
@@ -17,6 +19,8 @@ import { ReviewDocument } from '@/review/review-document';
  *                 + a small PR-link footer (#215, replacing the old
  *                 PR-card-as-page that was redundant with review)
  *   - review    → ReviewDocument fed the implement stage's pull_request artifact (#213)
+ *   - deploy    → DeployDocument fed the most-recent deployment artifact +
+ *                 a pre-execution approval gate (E23.9 / #1389)
  *   - other     → placeholder
  *
  * Stage state lives in component state so the approval panel can
@@ -78,6 +82,12 @@ function StageDetailView({
   const prArtifact = artifacts
     .filter((a) => a.kind === 'pull_request')
     .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+  // Deploy stages produce a single deployment artifact per outcome
+  // record; pick the most recent so a rollback record (a later
+  // deployment artifact) supersedes the original deploy.
+  const deploymentArtifact = artifacts
+    .filter((a) => a.kind === 'deployment')
+    .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
 
   return (
     <section className="space-y-6">
@@ -117,14 +127,27 @@ function StageDetailView({
         />
       )}
 
-      {stage.type !== 'plan' && stage.type !== 'implement' && stage.type !== 'review' && (
-        <article className="space-y-2">
-          <h1 className="font-mono text-lg font-semibold tracking-tight">Stage · {stage.type}</h1>
-          <p className="text-sm text-neutral-500">
-            Detail view for {stage.type} stages lands later in E7.
-          </p>
-        </article>
+      {stage.type === 'deploy' && (
+        <DeployStageArtifact
+          deploymentArtifactId={deploymentArtifact?.id ?? null}
+          stage={stage}
+          runId={runId}
+          onStageUpdate={setStage}
+          onStageRollback={setStage}
+        />
       )}
+
+      {stage.type !== 'plan' &&
+        stage.type !== 'implement' &&
+        stage.type !== 'review' &&
+        stage.type !== 'deploy' && (
+          <article className="space-y-2">
+            <h1 className="font-mono text-lg font-semibold tracking-tight">Stage · {stage.type}</h1>
+            <p className="text-sm text-neutral-500">
+              Detail view for {stage.type} stages lands later in E7.
+            </p>
+          </article>
+        )}
     </section>
   );
 }
@@ -228,6 +251,80 @@ function ImplementSessionArtifact({
         stage={stage}
         runId={runId}
         pullRequest={pullRequest}
+        onStageUpdate={onStageUpdate}
+        onStageRollback={onStageRollback}
+      />
+    </>
+  );
+}
+
+interface DeployStageArtifactProps {
+  deploymentArtifactId: string | null;
+  stage: Stage;
+  runId: string;
+  onStageUpdate: (next: Stage) => void;
+  onStageRollback: (prev: Stage) => void;
+}
+
+/*
+ * Loader for the deploy-stage page (E23.9 / #1389). The deployment
+ * artifact is an *output* of the deploy stage — it lands only once the
+ * delegated external pipeline reports an outcome. So the loader
+ * renders DeployDocument eagerly with artifact=null in the common
+ * pre-execution case (the page still shows the approval gate / state),
+ * and surfaces a labelled inline warning when the artifact is present
+ * but its wire shape isn't recognized — same degrade-not-block
+ * pattern as the implement/review PR-artifact loaders.
+ */
+function DeployStageArtifact({
+  deploymentArtifactId,
+  stage,
+  runId,
+  onStageUpdate,
+  onStageRollback,
+}: DeployStageArtifactProps) {
+  const result = useAsync(
+    () =>
+      deploymentArtifactId ? api.getArtifact<unknown>(deploymentArtifactId) : Promise.resolve(null),
+    [deploymentArtifactId],
+  );
+
+  if (result.status === 'loading') {
+    return <div className="text-sm text-neutral-500">Loading deployment…</div>;
+  }
+  if (result.status === 'error') {
+    return <ErrorBox label="deployment artifact" error={result.error} />;
+  }
+
+  let deployment: DeploymentArtifactBody | null = null;
+  let warning: React.ReactNode = null;
+
+  if (result.data) {
+    const content = result.data.content;
+    if (isDeploymentArtifact(content)) {
+      deployment = content as DeploymentArtifactBody;
+    } else {
+      warning = (
+        <div
+          role="alert"
+          className="rounded-md border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-200"
+        >
+          <div className="font-medium">Unrecognized deployment artifact shape.</div>
+          <div className="mt-1 font-mono text-xs">
+            schema_version={result.data.schema_version ?? 'null'} · kind={result.data.kind}
+          </div>
+        </div>
+      );
+    }
+  }
+
+  return (
+    <>
+      {warning}
+      <DeployDocument
+        artifact={deployment}
+        stage={stage}
+        runId={runId}
         onStageUpdate={onStageUpdate}
         onStageRollback={onStageRollback}
       />
