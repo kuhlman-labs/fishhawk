@@ -96,8 +96,13 @@ describe('<StageDetail> deploy route', () => {
     await waitFor(() => {
       expect(screen.getByRole('heading', { name: /deploy stage/i })).toBeInTheDocument();
     });
-    // Newest-by-created_at selector fed the loader the right id.
+    // Newest-by-created_at selector fed the loader the right id — and
+    // ONLY that id. A selector that picked the first row, or failed to
+    // sort descending, would fetch 'old-deploy' instead; assert the
+    // stale artifact is excluded, not merely that the newest is included.
     expect(getArtifact).toHaveBeenCalledWith('new-deploy');
+    expect(getArtifact).not.toHaveBeenCalledWith('old-deploy');
+    expect(getArtifact).toHaveBeenCalledTimes(1);
     // Guard passed → DeployDocument rendered the artifact fields.
     expect(screen.getByText('production')).toBeInTheDocument();
     expect(screen.getByText('1234567890abcdef1234567890abcdef12345678')).toBeInTheDocument();
