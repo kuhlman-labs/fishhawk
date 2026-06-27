@@ -2975,6 +2975,78 @@ func TestBuild_ImplementReview_SupplementalReinvoke_FalseRendersDiffNotFraming(t
 	}
 }
 
+func TestBuild_ImplementReview_OperatorScopeUndelivered_RendersWarningAndBindingBullet(t *testing.T) {
+	// #1407: when GateEvidence.OperatorScopeUndelivered is populated, the
+	// gate-evidence section renders the named operator_scope_path_undelivered
+	// warning block (naming each undelivered path) AND the BINDING preamble
+	// bullet that ranks the miss above stylistic findings.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			OperatorScopeUndelivered: []string{
+				"frontend/src/components/stage-detail.test.tsx",
+				"backend/internal/reactionpoller/poller_test.go",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		// The BINDING preamble bullet next to the scope-divergence bullet.
+		"An `operator_scope_path_undelivered` warning below (an operator-added scope path the commit left",
+		// The warning block header + each named undelivered path.
+		"operator_scope_path_undelivered (operator-added scope path left UNTOUCHED by the commit):",
+		"- frontend/src/components/stage-detail.test.tsx",
+		"- backend/internal/reactionpoller/poller_test.go",
+		// The untouched-only limitation is stated explicitly (binding condition 1).
+		"untouched-only",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement_review prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_ImplementReview_OperatorScopeUndelivered_EmptyByteIdentical(t *testing.T) {
+	// #1407 byte-identical-when-empty property: an otherwise-identical
+	// GateEvidence with a nil/empty OperatorScopeUndelivered renders no
+	// undelivered block and no new bytes versus the pre-change render — so the
+	// all-delivered (happy) path is unchanged.
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeFacts: &GateScopeFacts{DeclaredFiles: 2},
+		},
+	}
+	gotNil, err := Build("implement_review", base)
+	if err != nil {
+		t.Fatalf("Build nil: %v", err)
+	}
+	withEmpty := base
+	withEmpty.GateEvidence = &GateEvidence{
+		ScopeFacts:               &GateScopeFacts{DeclaredFiles: 2},
+		OperatorScopeUndelivered: []string{},
+	}
+	gotEmpty, err := Build("implement_review", withEmpty)
+	if err != nil {
+		t.Fatalf("Build empty: %v", err)
+	}
+	if gotNil != gotEmpty {
+		t.Errorf("empty OperatorScopeUndelivered must be byte-identical to nil")
+	}
+	if strings.Contains(gotNil, "operator_scope_path_undelivered (operator-added scope path left UNTOUCHED") {
+		t.Errorf("nil/empty OperatorScopeUndelivered must NOT render the warning block:\n%s", gotNil)
+	}
+	if strings.Contains(gotNil, "An `operator_scope_path_undelivered` warning below") {
+		t.Errorf("nil/empty OperatorScopeUndelivered must NOT render the BINDING bullet:\n%s", gotNil)
+	}
+}
+
 func TestBuild_ImplementReview_GroundsRuleCitationsAndScopesStyle(t *testing.T) {
 	// #595: on run 112743b1 the implement-review raised {category:scope}
 	// concerns asserting a CLAUDE.md comment-length rule that does not exist

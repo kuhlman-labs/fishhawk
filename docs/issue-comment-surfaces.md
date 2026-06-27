@@ -226,6 +226,29 @@ Notes:
   prompt's gate-evidence section as a reviewer-judged advisory. Listed here
   only so a future reader grepping the audit categories doesn't mistake it
   for a comment surface.
+- The operator-scope-undelivered audit kind — `operator_scope_path_undelivered`
+  (#1407), written by the implement-review assembly path
+  (`trace.go::runImplementReviews`) before any reviewer verdict — is an
+  **internal, advisory audit kind, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it to the issue thread. It fires when an implement commit
+  leaves an OPERATOR-DELIBERATELY-added scope path (an `add_scope_files` path
+  folded at plan approval, or an approved mid-stage scope amendment) UNTOUCHED —
+  the deterministic detection is untouched-only: a path ABSENT from the
+  committed diff's file set. (A path the commit DID touch but with the wrong
+  content is undecidable deterministically and stays a review concern — e.g. the
+  E23.9 never-created case is caught here, the E23.10 wrong-content case is a
+  review catch.) Payload `{undelivered_paths, undelivered_count,
+  operator_added_count}`. Advisory + best-effort — a nil `ScopeAmendmentRepo` or
+  a `ListByRun` error contributes nothing and never blocks the review, and the
+  entry is written only when the undelivered set is non-empty (an all-delivered
+  commit keeps the prompt byte-identical and emits no entry). The same set is
+  rendered into the implement-review prompt's gate-evidence section as a
+  high-priority `operator_scope_path_undelivered` warning. The complementary
+  BLOCKING gate for a FULLY-untouched concrete DECLARED scope path is the
+  runner's #1151/#1231 scope-completeness park; this signal is the advisory
+  pre-review surface for the partial / operator-added case. Listed here only so a
+  future reader grepping the audit categories doesn't mistake it for a comment
+  surface.
 - The cost-accounting audit kind — `cost_recorded` (#649), written by the
   trace upload handler (`trace.go::recordCost`) once per bundle receipt with
   payload `{model, input_tokens, output_tokens, usd, known_model,

@@ -29,6 +29,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spendalert"
@@ -2373,6 +2374,23 @@ func (s *Server) familyRuns(ctx context.Context, runRow *run.Run) []*run.Run {
 // under-reviewing.
 const consolidatedReviewTruncatedCategory = "consolidated_review_diff_truncated"
 
+// operatorScopeUndeliveredCategory is the audit-log category for the advisory
+// pre-review signal (#1407) emitted when an implement commit leaves an
+// operator-DELIBERATELY-added scope path (an add_scope_files path folded at
+// plan approval, or an approved mid-stage scope amendment) UNTOUCHED. It is an
+// internal advisory audit kind written by the trace handler before the reviewer
+// verdict — NOT an issue-comment surface (nothing in issuecomment emits it).
+const operatorScopeUndeliveredCategory = "operator_scope_path_undelivered"
+
+// operatorScopeUndeliveredPayload is the audit payload for an
+// operator_scope_path_undelivered entry (#1407): the operator-added scope paths
+// the implement commit left untouched, plus the counts that produced the set.
+type operatorScopeUndeliveredPayload struct {
+	UndeliveredPaths   []string `json:"undelivered_paths"`
+	UndeliveredCount   int      `json:"undelivered_count"`
+	OperatorAddedCount int      `json:"operator_added_count"`
+}
+
 // DispatchConsolidatedReview dispatches the gating agent implement review
 // for a decomposed parent run against its consolidated PR diff (#1060),
 // satisfying orchestrator.ConsolidatedReviewDispatcher. The orchestrator
@@ -2718,6 +2736,58 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 			trig.IssueNumber = n
 		}
 	}
+
+	// Operator-scope-undelivered pre-review signal (#1407): the operator may
+	// have DELIBERATELY added a scope path — either an add_scope_files path
+	// folded at plan approval (already computed as trig.AmendedScopeFiles) or
+	// an approved mid-stage scope amendment — that the implement commit left
+	// UNTOUCHED. Today that is conflated with benign plan-scope under-staging
+	// and surfaces only at the implement-review reject → fixup round-trip
+	// (E23.9/E23.10). Union both operator-add provenance channels and compute
+	// the subset absent from the committed diff. Both channel lookups are
+	// best-effort and never block the review (approvedAmendmentScopePaths
+	// WARN-logs a nil repo / list error and contributes nothing).
+	operatorAdded := append([]string(nil), trig.AmendedScopeFiles...)
+	operatorAdded = append(operatorAdded, s.approvedAmendmentScopePaths(ctx, runID)...)
+	if undelivered := operatorScopeUndelivered(operatorAdded, diff); len(undelivered) > 0 {
+		// Populate the prompt signal so the reviewer sees the miss as a
+		// high-priority gate-evidence warning. Allocate gateEvidence if the
+		// bundle carried none (mirrors the existing allocate-if-needed
+		// pattern), then thread it onto the trigger.
+		if gateEvidence == nil {
+			gateEvidence = &prompt.GateEvidence{}
+			trig.GateEvidence = gateEvidence
+		}
+		gateEvidence.OperatorScopeUndelivered = undelivered
+
+		// Append the deterministic advisory audit entry so the miss is
+		// visible on the run surface BEFORE any reviewer verdict. Best-effort
+		// with a WARN on failure, exactly like the implement_review_skipped
+		// emission; a nil AuditRepo skips the entry (mirrors that guard).
+		if s.cfg.AuditRepo != nil {
+			payload, _ := json.Marshal(operatorScopeUndeliveredPayload{
+				UndeliveredPaths:   undelivered,
+				UndeliveredCount:   len(undelivered),
+				OperatorAddedCount: len(operatorAdded),
+			})
+			systemKind := audit.ActorKind("system")
+			if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+				RunID:     runID,
+				StageID:   &stageID,
+				Timestamp: time.Now().UTC(),
+				Category:  operatorScopeUndeliveredCategory,
+				ActorKind: &systemKind,
+				Payload:   payload,
+			}); aerr != nil {
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: append operator_scope_path_undelivered audit entry failed",
+					slog.String("run_id", runID.String()),
+					slog.String("stage_id", stageID.String()),
+					slog.String("error", aerr.Error()),
+				)
+			}
+		}
+	}
+
 	promptText, err := prompt.Build("implement_review", trig)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: build prompt failed",
@@ -2838,6 +2908,41 @@ func (s *Server) amendedScopeFilesForReview(ctx context.Context, runRow *run.Run
 
 	add(s.resolveApprovalAddScopeFiles(ctx, runRow))
 	return amended
+}
+
+// approvedAmendmentScopePaths returns the paths of every APPROVED mid-stage
+// scope amendment on the run (#1407). It is the SECOND operator-add provenance
+// channel the operator_scope_path_undelivered signal must union with the
+// approval-time add_scope_files folds — amendedScopeFilesForReview folds ONLY
+// resolveApprovalAddScopeFiles, never approved mid-stage amendments, so relying
+// on it alone would miss the amendment channel that recurred in E23.9/E23.10.
+// Best-effort and fail-closed: a nil ScopeAmendmentRepo or a ListByRun error
+// WARN-logs and contributes nothing, never blocking the review. Filters to
+// StatusApproved (pending/denied confer nothing). Returns order-preserving paths
+// (de-dup is performed by the downstream operatorScopeUndelivered set walk).
+func (s *Server) approvedAmendmentScopePaths(ctx context.Context, runID uuid.UUID) []string {
+	if s.cfg.ScopeAmendmentRepo == nil {
+		return nil
+	}
+	items, err := s.cfg.ScopeAmendmentRepo.ListByRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"implement review: list scope amendments failed — operator-scope-undelivered signal contributes nothing for this run",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	var out []string
+	for _, a := range items {
+		if a.Status != scopeamendment.StatusApproved {
+			continue
+		}
+		for _, p := range a.Paths {
+			out = append(out, p.Path)
+		}
+	}
+	return out
 }
 
 // runImplementReviewInvocations runs the per-reviewer implement-review loop
@@ -3341,6 +3446,43 @@ func subtractPaths(paths, remove []string) []string {
 		if _, ok := removeSet[p]; ok {
 			continue
 		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// operatorScopeUndelivered returns the order-preserving, deduped subset of
+// operatorAdded paths the implement commit left UNTOUCHED — i.e. NOT present in
+// the committed diff's file set (#1407). It is the deterministic detection
+// behind the operator_scope_path_undelivered signal: an operator-deliberately-
+// added scope path (add_scope_files fold or approved amendment) absent from the
+// committed tree is a likely dropped operator-required edit. Detection is
+// untouched-only; a path touched with the wrong content cannot be detected
+// deterministically and stays a review concern. Trailing-slash directory-prefix
+// entries and non-repo-relative tokens are skipped (mirroring MissingScopeFiles)
+// — a directory or absolute/traversal token can never name a committed diff
+// path, so it would only produce false positives.
+func operatorScopeUndelivered(operatorAdded []string, diff policy.Diff) []string {
+	if len(operatorAdded) == 0 {
+		return nil
+	}
+	committed := make(map[string]struct{}, len(diff.ChangedFiles))
+	for _, f := range diff.ChangedFiles {
+		committed[f.Path] = struct{}{}
+	}
+	var out []string
+	seen := make(map[string]struct{}, len(operatorAdded))
+	for _, p := range operatorAdded {
+		if strings.HasSuffix(p, "/") || !isRepoRelativePath(p) {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		if _, ok := committed[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
 		out = append(out, p)
 	}
 	return out
