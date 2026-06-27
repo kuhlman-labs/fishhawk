@@ -588,6 +588,50 @@ func TestAdvance_HumanStage_TransitionsToAwaitingApproval(t *testing.T) {
 	}
 }
 
+// TestAdvance_DeployStage_ParksPreExecution asserts the ADR-038 / #1384
+// pre-execution park: a pending deploy stage transitions to
+// awaiting_deploy_approval and fires ZERO workflow_dispatch — nothing ships
+// before the operator approves the deploy intent at the gate. The deploy
+// stage is seeded with an AGENT executor to prove the deploy guard short-
+// circuits the dispatch path that an agent stage would otherwise take.
+func TestAdvance_DeployStage_ParksPreExecution(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	_, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeDeploy, ExecutorKind: run.ExecutorAgent, ExecutorRef: "deploy", State: run.StageStatePending},
+	})
+	out, err := o.Advance(context.Background(), stages[0].RunID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out != OutcomeDispatched {
+		t.Errorf("Outcome = %q, want dispatched (advanced to the deploy gate)", out)
+	}
+	if stages[1].State != run.StageStateAwaitingDeployApproval {
+		t.Errorf("deploy stage state = %q, want awaiting_deploy_approval", stages[1].State)
+	}
+	// Nothing ships pre-gate: no workflow_dispatch fired.
+	if len(gh.calls) != 0 {
+		t.Errorf("workflow_dispatch fired for a parked deploy stage: %d", len(gh.calls))
+	}
+
+	// Idempotent: a re-entrant Advance is a no-op (the deploy stage is now
+	// settled at the gate, not pending), still firing zero dispatch.
+	out2, err := o.Advance(context.Background(), stages[0].RunID)
+	if err != nil {
+		t.Fatalf("re-entrant Advance: %v", err)
+	}
+	if out2 != OutcomeNoOp {
+		t.Errorf("re-entrant Outcome = %q, want noop", out2)
+	}
+	if stages[1].State != run.StageStateAwaitingDeployApproval {
+		t.Errorf("deploy stage state after re-entry = %q, want awaiting_deploy_approval", stages[1].State)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("workflow_dispatch fired on re-entry: %d", len(gh.calls))
+	}
+}
+
 func TestAdvance_AutoMergeStage_QueuesAndSucceeds(t *testing.T) {
 	// routine_change canonical case (#255 / ADR-017): the review
 	// stage carries a check-only gate. Advance must queue

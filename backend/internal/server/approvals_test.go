@@ -3555,3 +3555,467 @@ func TestSubmitApproval_ModelValidity_FailOpenNoOracle(t *testing.T) {
 		t.Fatalf("status = %d, want 200 (nil oracle → fail open):\n%s", w.Code, w.Body.String())
 	}
 }
+
+// --- Deploy stage pre-execution gate (ADR-038 / E23.4 / #1384) ---
+
+// Deploy gate spec fixtures: each isolates one pre-flight constraint kind so a
+// behavioral test can assert exactly one branch of checkDeployPreflight. The
+// workflow id is "release" throughout.
+
+const deploySpecEnvOnly = `
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+        constraints:
+          - allowed_environments: [production, staging]
+        produces:
+          - artifact: deployment
+`
+
+const deploySpecFreezeOnly = `
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+        constraints:
+          - change_freeze: true
+`
+
+const deploySpecUpstreamReviewMerged = `
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+        constraints:
+          - required_upstream: [review_merged]
+`
+
+const deploySpecUpstreamCIGreen = `
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+        constraints:
+          - required_upstream: [ci_green]
+`
+
+const deploySpecNoConstraints = `
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+`
+
+const deploySpecAllConstraints = `
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+        constraints:
+          - allowed_environments: [production]
+          - change_freeze: true
+          - required_upstream: [review_merged]
+        produces:
+          - artifact: deployment
+`
+
+// a non-deploy workflow: used for the fail-closed "deploy stage absent" branch.
+const deploySpecNoDeployStage = `
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+
+// seedDeployRun stands up a deploy stage parked at awaiting_deploy_approval and
+// its run (carrying specYAML as the cached workflow spec) on a shared run id.
+func seedDeployRun(rr *approvalRunRepo, workflowID, specYAML string) (*run.Stage, *run.Run) {
+	runID := uuid.New()
+	st := &run.Stage{
+		ID:               uuid.New(),
+		RunID:            runID,
+		Sequence:         0,
+		Type:             run.StageTypeDeploy,
+		ExecutorKind:     run.ExecutorAgent,
+		ExecutorRef:      "deploy",
+		State:            run.StageStateAwaitingDeployApproval,
+		RequiresApproval: true,
+		CreatedAt:        time.Now().UTC(),
+		UpdatedAt:        time.Now().UTC(),
+	}
+	rr.mu.Lock()
+	rr.stages[st.ID] = st
+	rr.mu.Unlock()
+	runRow := &run.Run{
+		ID:           runID,
+		Repo:         "kuhlman-labs/example",
+		WorkflowID:   workflowID,
+		WorkflowSHA:  "sha",
+		WorkflowSpec: []byte(specYAML),
+	}
+	rr.seedRun(runRow)
+	return st, runRow
+}
+
+// seedStageOnRun adds an extra stage (e.g. a succeeded review stage) to an
+// existing run so the review_merged proxy can find it.
+func (r *approvalRunRepo) seedStageOnRun(runID uuid.UUID, typ run.StageType, state run.StageState) *run.Stage {
+	st := &run.Stage{
+		ID:        uuid.New(),
+		RunID:     runID,
+		Type:      typ,
+		State:     state,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	r.mu.Lock()
+	r.stages[st.ID] = st
+	r.mu.Unlock()
+	return st
+}
+
+// countAppendedCategory returns how many entries of the given category the
+// approvalAuditFake recorded.
+func countAppendedCategory(au *approvalAuditFake, category string) int {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	n := 0
+	for _, p := range au.appended {
+		if p.Category == category {
+			n++
+		}
+	}
+	return n
+}
+
+// assertDeployRefused asserts a 422 with the expected code, a
+// deploy_preflight_refused audit, and that the deploy stage did NOT advance
+// (still parked at awaiting_deploy_approval — a pre-Submit refusal records no
+// approval row).
+func assertDeployRefused(t *testing.T, w *httptest.ResponseRecorder, rr *approvalRunRepo, au *approvalAuditFake, stage *run.Stage, wantCode string) {
+	t.Helper()
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	body := decodeErrorEnvelope(t, w)
+	if body.Code != wantCode {
+		t.Errorf("error code = %q, want %q", body.Code, wantCode)
+	}
+	if got := countAppendedCategory(au, "deploy_preflight_refused"); got != 1 {
+		t.Errorf("deploy_preflight_refused audit entries = %d, want 1", got)
+	}
+	if cur, _ := rr.GetStage(context.Background(), stage.ID); cur.State != run.StageStateAwaitingDeployApproval {
+		t.Errorf("deploy stage advanced to %q on a refused approval; want it parked at awaiting_deploy_approval", cur.State)
+	}
+}
+
+// (a) allowed_environments — a requested env not in the allow-list refuses.
+func TestDeployGate_DisallowedEnvironment(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage, _ := seedDeployRun(rr, "release", deploySpecEnvOnly)
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"--environment=qa"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_environment_not_allowed")
+}
+
+// (b) allowed_environments — no --environment flag when the constraint is set
+// refuses (empty env is not a member).
+func TestDeployGate_MissingEnvironment(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage, _ := seedDeployRun(rr, "release", deploySpecEnvOnly)
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"ship it"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_environment_not_allowed")
+}
+
+// (c) change_freeze active without --override-freeze refuses.
+func TestDeployGate_ChangeFreezeActive(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage, _ := seedDeployRun(rr, "release", deploySpecFreezeOnly)
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"deploy now"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_change_freeze_active")
+}
+
+// (d) change_freeze WITH --override-freeze proceeds (no other constraints).
+func TestDeployGate_ChangeFreezeOverride_Proceeds(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	stage, _ := seedDeployRun(rr, "release", deploySpecFreezeOnly)
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"--override-freeze emergency hotfix"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (override-freeze proceeds):\n%s", w.Code, w.Body.String())
+	}
+	// A deploy approve advances the stage to dispatched, NOT succeeded.
+	cur, _ := rr.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateDispatched {
+		t.Errorf("deploy stage state = %q, want dispatched", cur.State)
+	}
+}
+
+// (e) required_upstream review_merged unmet (no PR url) refuses.
+func TestDeployGate_RequiredUpstreamReviewMergedUnmet(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage, _ := seedDeployRun(rr, "release", deploySpecUpstreamReviewMerged)
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+}
+
+// (f) required_upstream ci_green unmet (no StageCheckRepo / snapshot) refuses.
+func TestDeployGate_RequiredUpstreamCIGreenUnmet(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage, _ := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+}
+
+// (c') change_freeze with --override-freeze as an EMBEDDED substring (not a
+// standalone whitespace-delimited token) does NOT override (#1384 safety):
+// overriding a freeze is an explicit operator sub-action, so an incidental
+// substring inside a larger token must never bypass the gate the way the old
+// strings.Contains check did.
+func TestDeployGate_ChangeFreezeOverride_EmbeddedSubstringRefuses(t *testing.T) {
+	for _, comment := range []string{
+		"see runbook --override-freeze-policy for details",
+		"absolutely no--override-freeze here",
+	} {
+		s, _, rr, au := newApprovalServer(t)
+		stage, _ := seedDeployRun(rr, "release", deploySpecFreezeOnly)
+		body := fmt.Sprintf(`{"decision":"approve","comment":%q}`, comment)
+		w := submitApproval(t, s, stage.ID, body)
+		assertDeployRefused(t, w, rr, au, stage, "deploy_change_freeze_active")
+	}
+}
+
+// (f') required_upstream ci_green MET: an aggregate-green implement stage
+// (RequiredChecksSnapshot ∩ LatestForStage all passing) proceeds to dispatch.
+// This pins the SUCCESS branch of the ci_green pre-flight constraint, the
+// counterpart to TestDeployGate_RequiredUpstreamCIGreenUnmet.
+func TestDeployGate_RequiredUpstreamCIGreenMet(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	scs := newFakeStageCheckRepo()
+	s.cfg.StageCheckRepo = scs
+
+	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
+	// The run carries a required-checks snapshot; the implement stage's
+	// checks all report green, so aggregateCIGreen folds to true.
+	runRow.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
+	implStage := rr.seedStageOnRun(runRow.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	success := "success"
+	scs.byKey[scs.keyFor(implStage.ID, "ci/build")] = &stagecheck.Check{
+		StageID: implStage.ID, Name: "ci/build", Status: "completed", Conclusion: &success,
+	}
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (ci_green satisfied):\n%s", w.Code, w.Body.String())
+	}
+	if got := countAppendedCategory(au, "deploy_preflight_refused"); got != 0 {
+		t.Errorf("deploy_preflight_refused entries = %d, want 0 (ci_green met)", got)
+	}
+	cur, _ := rr.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateDispatched {
+		t.Errorf("deploy stage state = %q, want dispatched", cur.State)
+	}
+}
+
+// (g) all constraints satisfied → happy path proceeds to dispatch.
+func TestDeployGate_AllConstraintsSatisfied(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	stage, runRow := seedDeployRun(rr, "release", deploySpecAllConstraints)
+	// Satisfy review_merged: a PR url plus a succeeded review stage.
+	prURL := "https://github.com/kuhlman-labs/example/pull/7"
+	runRow.PullRequestURL = &prURL
+	rr.seedStageOnRun(runRow.ID, run.StageTypeReview, run.StageStateSucceeded)
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","comment":"--environment=production --override-freeze"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (all pre-flight satisfied):\n%s", w.Code, w.Body.String())
+	}
+	cur, _ := rr.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateDispatched {
+		t.Errorf("deploy stage state = %q, want dispatched", cur.State)
+	}
+}
+
+// A deploy stage with NO pre-flight constraints passes (nothing to enforce) —
+// the fail-closed NUANCE (#1384 condition 1): fail-closed targets the
+// can't-evaluate path, not the nothing-declared case.
+func TestDeployGate_NoConstraints_Proceeds(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage, _ := seedDeployRun(rr, "release", deploySpecNoConstraints)
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (no constraints to enforce):\n%s", w.Code, w.Body.String())
+	}
+	if got := countAppendedCategory(au, "deploy_preflight_refused"); got != 0 {
+		t.Errorf("deploy_preflight_refused entries = %d, want 0 (nothing refused)", got)
+	}
+	cur, _ := rr.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateDispatched {
+		t.Errorf("deploy stage state = %q, want dispatched", cur.State)
+	}
+}
+
+// FAIL CLOSED (#1384 condition 1): a run whose cached spec does not parse is a
+// can't-evaluate branch → 422 deploy_preflight_unevaluable, never a pass.
+func TestDeployGate_FailClosed_UnparseableSpec(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage, _ := seedDeployRun(rr, "release", "this: is: not: valid: yaml: ::::")
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_preflight_unevaluable")
+}
+
+// FAIL CLOSED: an absent cached spec (legacy run) is a can't-evaluate branch.
+func TestDeployGate_FailClosed_AbsentSpec(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage, runRow := seedDeployRun(rr, "release", deploySpecEnvOnly)
+	runRow.WorkflowSpec = nil // strip the cached spec
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"--environment=production"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_preflight_unevaluable")
+}
+
+// FAIL CLOSED: a spec that parses but contains NO deploy stage is a
+// can't-evaluate branch.
+func TestDeployGate_FailClosed_DeployStageAbsent(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage, _ := seedDeployRun(rr, "release", deploySpecNoDeployStage)
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_preflight_unevaluable")
+}
+
+// FAIL CLOSED: the run's workflow id is not present in the cached spec.
+func TestDeployGate_FailClosed_WorkflowNotInSpec(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage, _ := seedDeployRun(rr, "nonexistent_workflow", deploySpecEnvOnly)
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"--environment=production"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_preflight_unevaluable")
+}
+
+// FAIL CLOSED: a run-read failure (GetStage succeeds, GetRun returns
+// ErrNotFound for an unseeded run) is a can't-evaluate branch.
+func TestDeployGate_FailClosed_RunReadFailure(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	// Seed only the stage, NOT the run, so GetStage succeeds but GetRun fails.
+	st := &run.Stage{
+		ID:               uuid.New(),
+		RunID:            uuid.New(),
+		Type:             run.StageTypeDeploy,
+		ExecutorKind:     run.ExecutorAgent,
+		State:            run.StageStateAwaitingDeployApproval,
+		RequiresApproval: true,
+		CreatedAt:        time.Now().UTC(),
+		UpdatedAt:        time.Now().UTC(),
+	}
+	rr.mu.Lock()
+	rr.stages[st.ID] = st
+	rr.mu.Unlock()
+	w := submitApproval(t, s, st.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, st, "deploy_preflight_unevaluable")
+}
+
+// FAIL CLOSED: an unrecognized required_upstream token denies. The
+// workflow-v1 schema enum-validates required_upstream, so such a token is
+// rejected at the spec-parse layer (deploy_preflight_unevaluable) — still a
+// fail-closed refusal, never a pass. The default arm of checkDeployPreflight's
+// required_upstream switch is the belt-and-suspenders backstop for the same
+// case should the schema ever loosen.
+func TestDeployGate_FailClosed_UnknownUpstreamToken(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	const spec = `
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+        constraints:
+          - required_upstream: [some_unknown_signal]
+`
+	stage, _ := seedDeployRun(rr, "release", spec)
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_preflight_unevaluable")
+}
+
+// FAIL CLOSED: nil RunRepo is a defensive can't-evaluate branch. It is
+// unreachable via handleSubmitApproval (an earlier guard returns 503), so it
+// is exercised by calling checkDeployPreflight directly.
+func TestDeployGate_FailClosed_NilRunRepo(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: newApprovalAuditFake()})
+	stage := &run.Stage{ID: uuid.New(), RunID: uuid.New(), Type: run.StageTypeDeploy}
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(""))
+	w := httptest.NewRecorder()
+	if s.checkDeployPreflight(w, withAuth(req), stage, "") {
+		t.Fatal("checkDeployPreflight passed with a nil RunRepo; it must fail closed")
+	}
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", w.Code)
+	}
+	if body := decodeErrorEnvelope(t, w); body.Code != "deploy_preflight_unevaluable" {
+		t.Errorf("error code = %q, want deploy_preflight_unevaluable", body.Code)
+	}
+}
+
+// A deploy-gate REJECT fails the stage category-D and never runs the
+// pre-flight gate (deploy delegation covers approve only).
+func TestDeployGate_Reject_FailsCategoryD(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage, _ := seedDeployRun(rr, "release", deploySpecAllConstraints)
+	w := submitApproval(t, s, stage.ID, `{"decision":"reject","comment":"not now"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	cur, _ := rr.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateFailed {
+		t.Errorf("deploy stage state = %q, want failed", cur.State)
+	}
+	if cur.FailureCategory == nil || *cur.FailureCategory != run.FailureD {
+		t.Errorf("failure category = %v, want D", cur.FailureCategory)
+	}
+	// The pre-flight gate never ran on a reject.
+	if got := countAppendedCategory(au, "deploy_preflight_refused"); got != 0 {
+		t.Errorf("deploy_preflight_refused entries = %d on a reject, want 0", got)
+	}
+}

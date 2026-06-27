@@ -97,13 +97,35 @@ func ValidRunRetryTransition(from, to State) bool {
 //
 //	restore path.
 //
+// Pending → AwaitingDeployApproval: a deploy stage parks at its PRE-execution
+//
+//	gate before any dispatch (ADR-038 / #1384) — the deploy intent must be
+//	approved before anything ships. Mirrors the Pending → AwaitingChildren
+//	direct park.
+//
+// AwaitingDeployApproval → Dispatched: operator approved AND pre-flight
+//
+//	constraints passed; the stage advances to dispatch (NOT succeeded — the
+//	deploy has not happened yet; the downstream executor fires it).
+//
+// AwaitingDeployApproval → Failed: pre-flight refusal, gate reject, or
+//
+//	D-category SLA timeout.
+//
+// Running → AwaitingDeployment: post-approval, the executor is polling the
+//
+//	external delegating pipeline (ADR-038 / #1384).
+//
+// AwaitingDeployment → Succeeded / Failed: the external pipeline settled.
+//
 // Cancelled is reachable from any non-terminal state via manual halt.
 var stageTransitions = map[StageState]map[StageState]struct{}{
 	StageStatePending: {
-		StageStateDispatched:       {},
-		StageStateCancelled:        {},
-		StageStateFailed:           {},
-		StageStateAwaitingChildren: {},
+		StageStateDispatched:             {},
+		StageStateCancelled:              {},
+		StageStateFailed:                 {},
+		StageStateAwaitingChildren:       {},
+		StageStateAwaitingDeployApproval: {}, // deploy stage parks pre-execution (ADR-038 / #1384)
 	},
 	StageStateDispatched: {
 		StageStateRunning:   {},
@@ -114,6 +136,7 @@ var stageTransitions = map[StageState]map[StageState]struct{}{
 		StageStateAwaitingApproval:      {},
 		StageStateAwaitingInput:         {},
 		StageStateAwaitingScopeDecision: {},
+		StageStateAwaitingDeployment:    {}, // deploy executor begins polling the external pipeline (ADR-038 / #1384)
 		StageStateSucceeded:             {},
 		StageStateFailed:                {},
 		StageStateCancelled:             {},
@@ -137,6 +160,16 @@ var stageTransitions = map[StageState]map[StageState]struct{}{
 	StageStateAwaitingScopeDecision: {
 		StageStateRunning:   {}, // operator exempted → resume to open the PR from the held commit (no agent re-run, #1231)
 		StageStateFailed:    {}, // operator failed it → category-B, today's restore path
+		StageStateCancelled: {},
+	},
+	StageStateAwaitingDeployApproval: {
+		StageStateDispatched: {}, // approved + pre-flight passed → advance to dispatch (NOT succeeded; deploy not yet run, ADR-038 / #1384)
+		StageStateFailed:     {}, // pre-flight refusal / gate reject / D-timeout
+		StageStateCancelled:  {},
+	},
+	StageStateAwaitingDeployment: {
+		StageStateSucceeded: {}, // external delegating pipeline reported success
+		StageStateFailed:    {}, // external pipeline failed
 		StageStateCancelled: {},
 	},
 }
