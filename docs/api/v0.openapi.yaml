@@ -1024,7 +1024,7 @@ components:
           minimum: 0
         type:
           type: string
-          enum: [plan, implement, review]
+          enum: [plan, implement, review, deploy]
         executor:
           type: object
           description: Exactly one of agent or human.
@@ -1442,7 +1442,7 @@ components:
         stage_id: { $ref: '#/components/schemas/UUID' }
         kind:
           type: string
-          enum: [plan, pull_request]
+          enum: [plan, pull_request, deployment]
         schema_version:
           type: [string, "null"]
           example: standard_v1
@@ -1453,7 +1453,10 @@ components:
           description: |
             JSON content of the artifact. For kind=plan validated
             against the standard_v1 schema in
-            docs/spec/plan-standard-v1.schema.json.
+            docs/spec/plan-standard-v1.schema.json. For
+            kind=pull_request the content carries the
+            PullRequestArtifactBody shape; for kind=deployment it
+            carries the DeploymentArtifactBody shape.
         created_at:
           type: string
           format: date-time
