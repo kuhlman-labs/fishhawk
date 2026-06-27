@@ -2789,10 +2789,16 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 
 // amendedScopeFilesForReview computes the approval-time scope folds that the
 // implement-review prompt must treat as in-scope rather than as scope drift
-// (#829). It reuses the SAME single fold source handleGetStagePrompt applies to
-// the implement-stage prompt — resolveApprovalAddScopeFiles (#824 structured
-// add_scope_files) — so the review-side and stage-side folds stay in lockstep
-// (single source of truth). The #730 approve-reason prose fold
+// (#829). Despite the name it now also feeds the implement-STAGE prompt: both
+// handleGetStagePrompt and handleGetStagePromptRender call it to populate
+// Trigger.AmendedScopeFiles so the implement agent SEES the operator-added paths
+// as in-scope and does not file a redundant mid-stage amendment for paths
+// already folded into the enforced scope (#1406). It reuses the SAME single fold
+// source handleGetStagePrompt applies to the implement-stage prompt —
+// resolveApprovalAddScopeFiles (#824 structured add_scope_files) — so the
+// review-side, stage-side, and enforced-scope folds all stay in lockstep (single
+// source of truth). The name is retained to avoid churn (the #1225 regression
+// test pins it). The #730 approve-reason prose fold
 // (extractScopePathsFromConditions over resolveApprovalConditions) was removed
 // from BOTH sides in #1225: a repo-relative token scraped out of the operator's
 // free-text reason no longer mutates scope, so the review side must no longer

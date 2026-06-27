@@ -3276,6 +3276,87 @@ func TestBuild_ImplementReview_AmendedScope_AbsentWhenEmpty(t *testing.T) {
 	}
 }
 
+func TestBuild_Implement_AmendedScope_RendersSection(t *testing.T) {
+	// #1406: when the operator folds add_scope_files at approval time, the
+	// handler threads the paths onto Trigger.AmendedScopeFiles. The fresh
+	// (non-fix-up) implement prompt names them as already-approved in-scope so
+	// the agent edits them WITHOUT filing a redundant mid-stage amendment for
+	// paths already folded into the enforced scope.
+	got, err := Build("implement", Trigger{
+		Repo:              "kuhlman-labs/example",
+		ApprovedPlan:      fixturePlan(),
+		AmendedScopeFiles: []string{"backend/cmd/fishhawk-mcp/README.md", "docs/extra.md"},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"Operator-added scope files (approved — in-scope, do NOT request an amendment)",
+		"backend/cmd/fishhawk-mcp/README.md",
+		"docs/extra.md",
+		"already approved",
+		"Do NOT file a mid-stage scope amendment requesting any of them",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("operator-added-scope prompt missing %q:\n%s", w, got)
+		}
+	}
+	// Deterministic input order is preserved (the handler derives a deduped,
+	// raw-scope-excluded list; the prompt renders it verbatim).
+	if i, j := strings.Index(got, "fishhawk-mcp/README.md"), strings.Index(got, "docs/extra.md"); i < 0 || j < 0 || i > j {
+		t.Errorf("operator-added-scope paths rendered out of input order:\n%s", got)
+	}
+}
+
+func TestBuild_Implement_AmendedScope_AbsentWhenEmpty(t *testing.T) {
+	// #1406: the operator-added-scope section is guarded by len>0, so an
+	// implement prompt with no additions is byte-identical to today — this
+	// preserves deterministic prompt-hash replay / audit stability. Build twice
+	// (explicit-nil and omitting the field) and assert the section never appears
+	// and the two renders match byte-for-byte.
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+	}
+	withNil := base
+	withNil.AmendedScopeFiles = nil
+
+	gotBase, err := Build("implement", base)
+	if err != nil {
+		t.Fatalf("Build base: %v", err)
+	}
+	gotNil, err := Build("implement", withNil)
+	if err != nil {
+		t.Fatalf("Build nil: %v", err)
+	}
+	if strings.Contains(gotBase, "Operator-added scope files") {
+		t.Errorf("operator-added-scope section should be absent when AmendedScopeFiles is empty:\n%s", gotBase)
+	}
+	if gotBase != gotNil {
+		t.Errorf("explicit-nil AmendedScopeFiles must be byte-identical to omitting it")
+	}
+}
+
+func TestBuild_Implement_AmendedScope_OmittedOnFixupFork(t *testing.T) {
+	// #1406: the operator-added-scope section renders only on the fresh
+	// (non-fix-up) implement prompt — the bug's locus. buildImplement returns
+	// the slim buildImplementFixup early when FixupConcerns is non-empty, so a
+	// fix-up pass (which already retains the full effective scope, #1314) never
+	// renders the section even when AmendedScopeFiles is set.
+	got, err := Build("implement", Trigger{
+		Repo:              "kuhlman-labs/example",
+		ApprovedPlan:      fixturePlan(),
+		AmendedScopeFiles: []string{"backend/cmd/fishhawk-mcp/README.md"},
+		FixupConcerns:     []string{"Address the missing nil check in foo()."},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "Operator-added scope files") {
+		t.Errorf("operator-added-scope section must NOT render on the fix-up fork:\n%s", got)
+	}
+}
+
 func TestBuild_ImplementReview_PriorConcerns_RendersAllStates(t *testing.T) {
 	// #984: a re-review prompt lists the stage's prior concerns with their
 	// lifecycle states. addressed_pending carries the mandatory

@@ -4825,6 +4825,127 @@ func TestGetStagePrompt_Implement_AddScopeFilesFoldedOnInitialDispatch(t *testin
 	}
 }
 
+// TestGetStagePrompt_Implement_AddScopeFilesVisibleInPromptText is the #1406
+// done-means and a cross-boundary integration test (#618): operator-added
+// scope.files must be visible in the implement prompt TEXT, not only the
+// enforced ScopeFiles list. #1351 folded them into the ENFORCED scope; this seam
+// proves the complementary AGENT-VISIBILITY half — without it a defensive agent
+// reads only the rendered plan scope, concludes the added paths are out of
+// scope, and files a redundant mid-stage amendment for paths already folded
+// (run 6434aae9). It drives the REAL approve-write -> approval_submitted persist
+// -> implement prompt-read path (mirroring AddScopeFilesFoldedOnInitialDispatch)
+// and asserts resp.Prompt carries the "Operator-added scope files" section AND
+// each added path — a comment-only/no-op touch of prompt.go fails it where a
+// presence-only gate would pass (#1169). The render (SPA-readable) handler is
+// asserted to carry the identical text so the two prompt paths stay byte-aligned.
+func TestGetStagePrompt_Implement_AddScopeFilesVisibleInPromptText(t *testing.T) {
+	const plannedFile = "backend/internal/server/prompt.go"
+	addScopeFiles := []string{
+		"backend/internal/server/trace.go",
+		"docs/issue-comment-surfaces.md",
+	}
+
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+	au := newStoringAuditRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{{Path: plannedFile, Operation: plan.FileOpModify}},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	planStage := &run.Stage{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {planStage}}
+	rr.getStages[planStageID] = planStage
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+	rr.getRuns[runID] = &run.Run{
+		ID:            runID,
+		Repo:          "o/r",
+		WorkflowID:    "feature_change",
+		TriggerSource: run.TriggerCLI,
+	}
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		SigningRepo:  sf,
+		ArtifactRepo: art,
+		ApprovalRepo: newFakeApprovalRepo(),
+		AuditRepo:    au,
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	// REAL approve-write: writeApprovalAudit persists approval_submitted with the
+	// two added paths through the storing fake; advanceStage flips plan->succeeded.
+	body := fmt.Sprintf(`{"decision":"approve","add_scope_files":[%q,%q]}`, addScopeFiles[0], addScopeFiles[1])
+	aw := submitApproval(t, s, planStageID, body)
+	if aw.Code != http.StatusOK {
+		t.Fatalf("approval status = %d, want 200:\n%s", aw.Code, aw.Body.String())
+	}
+
+	// Runner-facing (signed) implement prompt.
+	priv, _ := sf.issue(t, runID)
+	w := promptRequest(t, s, runID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("prompt status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// The shipped behavior: the section header AND each added path appear in the
+	// prompt TEXT. (The enforced ScopeFiles fold is covered by #1351's tests.)
+	if !contains(resp.Prompt, "Operator-added scope files (approved — in-scope, do NOT request an amendment)") {
+		t.Errorf("implement prompt missing the operator-added-scope section:\n%s", resp.Prompt)
+	}
+	for _, path := range addScopeFiles {
+		if !contains(resp.Prompt, path) {
+			t.Errorf("implement prompt text missing operator-added path %q:\n%s", path, resp.Prompt)
+		}
+	}
+
+	// Render (SPA-readable) handler must carry the identical section text so the
+	// two prompt paths stay byte-aligned (the audit story depends on the SPA
+	// showing what the runner saw).
+	rendered := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt-render", implStageID), nil)
+	rw := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rw, rendered)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("render status = %d, want 200:\n%s", rw.Code, rw.Body.String())
+	}
+	var renderResp promptResponse
+	if err := json.Unmarshal(rw.Body.Bytes(), &renderResp); err != nil {
+		t.Fatalf("decode render: %v", err)
+	}
+	if renderResp.Prompt != resp.Prompt {
+		t.Errorf("render-path prompt diverged from signed path:\nsigned:\n%s\n---\nrendered:\n%s",
+			resp.Prompt, renderResp.Prompt)
+	}
+}
+
 // TestSubmitApproval_AddScopeFiles_AuditVisibleBeforePlanStageAdvance pins the
 // #1351 ROOT CAUSE (the contingency the in-process fold test confirmed): the
 // approval_submitted audit carrying add_scope_files MUST be durably committed
