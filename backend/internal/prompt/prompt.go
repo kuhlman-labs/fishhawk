@@ -427,6 +427,18 @@ type GateEvidence struct {
 	// arbitrate. Nil (no fix-up pass, no claim, or claim and reality agreed)
 	// omits the section. Advisory only — it never failed or re-opened the pass.
 	FixupSelfReportDivergence *GateFixupSelfReportDivergence
+	// OperatorScopeUndelivered carries the operator-deliberately-added scope
+	// paths (an add_scope_files path folded at plan approval, or an approved
+	// mid-stage scope amendment) that the implement commit left UNTOUCHED
+	// (#1407). Computed backend-side from the run's operator-scope provenance
+	// against the committed diff — it is NOT mapped from the bundle, so a
+	// nil/empty slice keeps the prompt byte-identical. The detection is
+	// untouched-only (a path absent from the committed file set): a path that
+	// WAS touched but with the wrong content is undecidable deterministically
+	// and stays a review concern. writeGateEvidence renders each named path as
+	// a high-priority operator_scope_path_undelivered warning. Nil/empty omits
+	// the block.
+	OperatorScopeUndelivered []string
 }
 
 // GateFixupSelfReportDivergence is the advisory fix-up self-report divergence
@@ -2183,6 +2195,14 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 		"passed iteration is NOT a blocker; a terminal failure still is.\n")
 	b.WriteString("- A divergence between the declared and staged scope (counts below, or drift-excluded paths) " +
 		"likewise outranks stylistic findings — name it before them.\n")
+	// The operator_scope_path_undelivered BINDING bullet is rendered only when
+	// the signal is present (#1407), so an empty/nil OperatorScopeUndelivered
+	// keeps the prompt byte-identical to the pre-change render.
+	if len(ev.OperatorScopeUndelivered) > 0 {
+		b.WriteString("- An `operator_scope_path_undelivered` warning below (an operator-added scope path the commit left " +
+			"UNTOUCHED) is a high-priority miss — a likely dropped operator-required edit. Treat it as outranking " +
+			"stylistic findings and name it before them.\n")
+	}
 	b.WriteString("- A SKIPPED verify run means compile/test state is UNVERIFIED. Do NOT assume the change is " +
 		"CI-green; state the unverified status in a concern or in `free_form`.\n")
 	b.WriteString("- A PASSED verify run certifies ONLY that the named command exited 0 against the committed " +
@@ -2262,6 +2282,21 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 					fmt.Fprintf(b, "  - %s\n", p)
 				}
 			}
+		}
+		b.WriteString("\n")
+	}
+
+	if len(ev.OperatorScopeUndelivered) > 0 {
+		b.WriteString("operator_scope_path_undelivered (operator-added scope path left UNTOUCHED by the commit):\n\n")
+		b.WriteString("The operator DELIBERATELY added the scope path(s) below — either an add_scope_files path folded " +
+			"at plan approval or an approved mid-stage scope amendment (often a binding-condition test) — yet the " +
+			"committed tree did NOT touch them. This is a deterministic, machine-verified signal: each path is absent " +
+			"from the committed file set. Treat it as a HIGH-priority miss — a likely dropped operator-required edit, " +
+			"not a stylistic finding — and name it before stylistic concerns. (Scope here is untouched-only: a path " +
+			"the commit DID touch but with the wrong content is not detected deterministically and remains for you to " +
+			"judge on the diff.)\n\n")
+		for _, p := range ev.OperatorScopeUndelivered {
+			fmt.Fprintf(b, "- %s\n", p)
 		}
 		b.WriteString("\n")
 	}

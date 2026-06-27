@@ -30,8 +30,10 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
@@ -4472,4 +4474,338 @@ func TestRunSupplementalReinvokeReview_NoReviewerBackend_Skips(t *testing.T) {
 	if n := countAuditCategory(au, "implement_reviewed"); n != 0 {
 		t.Errorf("implement_reviewed = %d with no reviewer backend, want 0 (dispatch skipped)", n)
 	}
+}
+
+// seedApprovedAmendment creates a pending amendment for the run/stage then
+// approves it, so the fake repo's ListByRun returns an approved row carrying
+// the given path — the second operator-add provenance channel the #1407
+// operator_scope_path_undelivered signal must union (the amendment channel
+// amendedScopeFilesForReview never folds).
+func seedApprovedAmendment(t *testing.T, sa *fakeScopeAmendmentRepo, runID, stageID uuid.UUID, path string) {
+	t.Helper()
+	a, err := sa.Create(context.Background(), scopeamendment.CreateParams{
+		RunID:   runID,
+		StageID: stageID,
+		Paths:   []scopeamendment.PathEntry{{Path: path, Operation: scopeamendment.OperationModify}},
+		Reason:  "coupled seam",
+	})
+	if err != nil {
+		t.Fatalf("create amendment: %v", err)
+	}
+	if _, err := sa.Decide(context.Background(), scopeamendment.DecideParams{
+		ID: a.ID, Status: scopeamendment.StatusApproved, Reason: "ok", DecidedBy: "github:operator",
+	}); err != nil {
+		t.Fatalf("approve amendment: %v", err)
+	}
+}
+
+// operatorScopeUndeliveredAuditPaths returns the undelivered_paths recorded by
+// the single operator_scope_path_undelivered audit entry (#1407), or nil when
+// no such entry was appended. Fails the test if more than one entry exists (the
+// signal is emitted at most once per review).
+func operatorScopeUndeliveredAuditPaths(t *testing.T, au *auditFake) []string {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var found []string
+	n := 0
+	for i := range au.appended {
+		if au.appended[i].Category != operatorScopeUndeliveredCategory {
+			continue
+		}
+		n++
+		var p operatorScopeUndeliveredPayload
+		if err := json.Unmarshal(au.appended[i].Payload, &p); err != nil {
+			t.Fatalf("unmarshal operator_scope_path_undelivered payload: %v", err)
+		}
+		found = p.UndeliveredPaths
+	}
+	if n > 1 {
+		t.Fatalf("operator_scope_path_undelivered emitted %d times, want at most 1", n)
+	}
+	return found
+}
+
+// TestRunImplementReviews_OperatorScopeUndelivered_BothChannels_AuditAndPrompt
+// is the #1407 cross-boundary integration test: a run whose approved plan
+// declares scope, with one add_scope_files path (approval fold) AND one approved
+// mid-stage scope amendment, where the committed diff touches NEITHER operator-
+// added path. It asserts the compute -> audit -> prompt seam end-to-end — the
+// deterministic operator_scope_path_undelivered audit entry names BOTH paths,
+// AND the rendered implement-review prompt contains the operator_scope_path_-
+// undelivered warning naming both paths. The bundle here carries no
+// gate_evidence, so this also exercises the allocate-if-nil gateEvidence path.
+func TestRunImplementReviews_OperatorScopeUndelivered_BothChannels_AuditAndPrompt(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	const addPath = "frontend/src/components/stage-detail.test.tsx"
+	const amendPath = "backend/internal/reactionpoller/poller_test.go"
+	au.seeded = append(au.seeded, makeApproveWithScopeFilesEntry(runRow.ID, []string{addPath}))
+	sa := newFakeScopeAmendmentRepo()
+	s.cfg.ScopeAmendmentRepo = sa
+	seedApprovedAmendment(t, sa, runRow.ID, implStage.ID, amendPath)
+
+	// Committed diff touches only the raw plan scope file — neither operator-
+	// added path is present.
+	diff := policy.Diff{
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	gotPaths := operatorScopeUndeliveredAuditPaths(t, au)
+	for _, want := range []string{addPath, amendPath} {
+		if !containsString(gotPaths, want) {
+			t.Errorf("audit entry missing undelivered path %q; got %v", want, gotPaths)
+		}
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	for _, want := range []string{
+		"operator_scope_path_undelivered (operator-added scope path left UNTOUCHED by the commit):",
+		"- " + addPath,
+		"- " + amendPath,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("reviewer prompt missing %q from operator-scope-undelivered signal:\n%s", want, got)
+		}
+	}
+}
+
+// TestRunImplementReviews_OperatorScopeUndelivered_AllDelivered_NoSignal is the
+// #1407 byte-identical control: both operator-added paths ARE present in the
+// committed diff, so NO operator_scope_path_undelivered audit entry is appended
+// and the prompt has no undelivered section.
+func TestRunImplementReviews_OperatorScopeUndelivered_AllDelivered_NoSignal(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	const addPath = "frontend/src/components/stage-detail.test.tsx"
+	const amendPath = "backend/internal/reactionpoller/poller_test.go"
+	au.seeded = append(au.seeded, makeApproveWithScopeFilesEntry(runRow.ID, []string{addPath}))
+	sa := newFakeScopeAmendmentRepo()
+	s.cfg.ScopeAmendmentRepo = sa
+	seedApprovedAmendment(t, sa, runRow.ID, implStage.ID, amendPath)
+
+	// Both operator-added paths present in the committed diff → all delivered.
+	diff := policy.Diff{
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+			{Path: addPath, Status: policy.StatusAdded},
+			{Path: amendPath, Status: policy.StatusModified},
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	if n := countAuditCategory(au, operatorScopeUndeliveredCategory); n != 0 {
+		t.Errorf("operator_scope_path_undelivered entries = %d, want 0 when all delivered", n)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	got := reviewer.calls[0]
+	if strings.Contains(got, "operator_scope_path_undelivered (operator-added scope path left UNTOUCHED") {
+		t.Errorf("all-delivered prompt must NOT render the undelivered section:\n%s", got)
+	}
+	if strings.Contains(got, "An `operator_scope_path_undelivered` warning below") {
+		t.Errorf("all-delivered prompt must NOT render the BINDING bullet:\n%s", got)
+	}
+}
+
+// TestRunImplementReviews_OperatorScopeUndelivered_AddScopeFilesOnly isolates
+// the add_scope_files provenance channel (#1407): the run has an approval-time
+// add_scope_files path left untouched and NO ScopeAmendmentRepo wired (nil-repo
+// degrade). The signal still fires naming ONLY the add_scope_files path, and the
+// review runs (the nil repo contributes nothing and never blocks).
+func TestRunImplementReviews_OperatorScopeUndelivered_AddScopeFilesOnly(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	const addPath = "frontend/src/components/stage-detail.test.tsx"
+	au.seeded = append(au.seeded, makeApproveWithScopeFilesEntry(runRow.ID, []string{addPath}))
+	// ScopeAmendmentRepo deliberately left nil (newImplementReviewServer wires
+	// none) — the amendment channel must degrade to nothing.
+
+	diff := policy.Diff{
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	gotPaths := operatorScopeUndeliveredAuditPaths(t, au)
+	if len(gotPaths) != 1 || gotPaths[0] != addPath {
+		t.Errorf("undelivered paths = %v, want exactly [%q]", gotPaths, addPath)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1 (nil ScopeAmendmentRepo must not block)", len(reviewer.calls))
+	}
+}
+
+// TestRunImplementReviews_OperatorScopeUndelivered_AmendmentOnly isolates the
+// approved-amendment provenance channel (#1407): the run has an approved
+// mid-stage amendment path left untouched and NO add_scope_files fold. The
+// signal fires naming ONLY the amendment path — proving amendedScopeFilesForReview
+// alone (which never folds amendments) would have missed it.
+func TestRunImplementReviews_OperatorScopeUndelivered_AmendmentOnly(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	const amendPath = "backend/internal/reactionpoller/poller_test.go"
+	sa := newFakeScopeAmendmentRepo()
+	s.cfg.ScopeAmendmentRepo = sa
+	seedApprovedAmendment(t, sa, runRow.ID, implStage.ID, amendPath)
+
+	diff := policy.Diff{
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	gotPaths := operatorScopeUndeliveredAuditPaths(t, au)
+	if len(gotPaths) != 1 || gotPaths[0] != amendPath {
+		t.Errorf("undelivered paths = %v, want exactly [%q]", gotPaths, amendPath)
+	}
+}
+
+// TestRunImplementReviews_OperatorScopeUndelivered_ListError_Degrades exercises
+// the ListByRun-error degrade branch (#1407): the amendment channel's repo
+// returns an error, so it contributes nothing and never blocks the review. The
+// add_scope_files channel still surfaces its untouched path, and the review runs
+// to completion without panicking.
+func TestRunImplementReviews_OperatorScopeUndelivered_ListError_Degrades(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	const addPath = "frontend/src/components/stage-detail.test.tsx"
+	au.seeded = append(au.seeded, makeApproveWithScopeFilesEntry(runRow.ID, []string{addPath}))
+	sa := newFakeScopeAmendmentRepo()
+	sa.failListOn = 1 // approvedAmendmentScopePaths' ListByRun is the only call → fails it.
+	s.cfg.ScopeAmendmentRepo = sa
+
+	diff := policy.Diff{
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	// Amendment channel errored → only the add_scope_files path surfaces; the
+	// review still ran.
+	gotPaths := operatorScopeUndeliveredAuditPaths(t, au)
+	if len(gotPaths) != 1 || gotPaths[0] != addPath {
+		t.Errorf("undelivered paths = %v, want exactly [%q] (list error contributes nothing)", gotPaths, addPath)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1 (ListByRun error must not block)", len(reviewer.calls))
+	}
+}
+
+// TestOperatorScopeUndelivered_Helper unit-pins the deterministic detection
+// (#1407): order-preserving dedup, untouched-only (a path present in the
+// committed set is delivered), and the directory-prefix / non-repo-relative
+// skips that mirror MissingScopeFiles to avoid false positives.
+func TestOperatorScopeUndelivered_Helper(t *testing.T) {
+	diff := policy.Diff{
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "a.go", Status: policy.StatusModified},
+			{Path: "dir/touched.go", Status: policy.StatusModified},
+		},
+	}
+	operatorAdded := []string{
+		"dir/touched.go", // present in diff → delivered, dropped
+		"dir/missing.go", // absent → undelivered
+		"dir/missing.go", // duplicate → deduped
+		"frontend/x.tsx", // absent → undelivered
+		"pkg/",           // trailing-slash directory → skipped
+		"/etc/passwd",    // absolute → skipped
+		"../escape.go",   // traversal → skipped
+	}
+	got := operatorScopeUndelivered(operatorAdded, diff)
+	want := []string{"dir/missing.go", "frontend/x.tsx"}
+	if len(got) != len(want) {
+		t.Fatalf("operatorScopeUndelivered = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("operatorScopeUndelivered[%d] = %q, want %q (order-preserving)", i, got[i], want[i])
+		}
+	}
+
+	// Empty operator-added set → nil (no signal).
+	if got := operatorScopeUndelivered(nil, diff); got != nil {
+		t.Errorf("operatorScopeUndelivered(nil, ...) = %v, want nil", got)
+	}
+	// All present → nil (all delivered).
+	allPresent := operatorScopeUndelivered([]string{"a.go", "dir/touched.go"}, diff)
+	if allPresent != nil {
+		t.Errorf("all-delivered operatorScopeUndelivered = %v, want nil", allPresent)
+	}
+}
+
+// TestApprovedAmendmentScopePaths_Degrades pins the two fail-closed branches of
+// approvedAmendmentScopePaths (#1407): a nil ScopeAmendmentRepo and a ListByRun
+// error each return nil (contribute nothing) without panicking.
+func TestApprovedAmendmentScopePaths_Degrades(t *testing.T) {
+	runID := uuid.New()
+
+	// nil repo → nil.
+	sNil := New(Config{Addr: "127.0.0.1:0"})
+	if got := sNil.approvedAmendmentScopePaths(context.Background(), runID); got != nil {
+		t.Errorf("nil ScopeAmendmentRepo: got %v, want nil", got)
+	}
+
+	// ListByRun error → nil (WARN-logged, contributes nothing).
+	sa := newFakeScopeAmendmentRepo()
+	sa.failListOn = 1
+	sErr := New(Config{Addr: "127.0.0.1:0", ScopeAmendmentRepo: sa})
+	if got := sErr.approvedAmendmentScopePaths(context.Background(), runID); got != nil {
+		t.Errorf("ListByRun error: got %v, want nil", got)
+	}
+}
+
+// containsString reports whether want is in xs.
+func containsString(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
 }
