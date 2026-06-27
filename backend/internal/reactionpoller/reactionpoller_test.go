@@ -448,6 +448,25 @@ func TestTick_NonPlanStage_Ignored(t *testing.T) {
 	}
 }
 
+// TestTick_DeployStageAwaitingDeployApproval_Ignored pins #1390 binding
+// condition 1: ListStagesAwaitingApproval was broadened to also return deploy
+// stages parked at awaiting_deploy_approval (the SLA ticker's second consumer
+// is THIS reaction poller). The broadening is safe ONLY because the poller
+// skips any stage whose Type != plan. This asserts the deploy gate row the
+// broadening newly surfaces is filtered out before any GitHub call — the
+// poller must never treat a deploy approval as a plan-comment reaction target.
+func TestTick_DeployStageAwaitingDeployApproval_Ignored(t *testing.T) {
+	fx := newFixture(t)
+	fx.runs.stages[0].Type = run.StageTypeDeploy
+	fx.runs.stages[0].State = run.StageStateAwaitingDeployApproval
+
+	fx.ticker.Tick(context.Background())
+
+	if fx.reactions.calls != 0 {
+		t.Errorf("deploy stage at awaiting_deploy_approval must not produce a GitHub call; got %d", fx.reactions.calls)
+	}
+}
+
 func TestTick_NoPlanCommentYet_Skips(t *testing.T) {
 	fx := newFixture(t)
 	// Wipe the seeded anchor + plan_generated audit rows.

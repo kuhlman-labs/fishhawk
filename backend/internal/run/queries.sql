@@ -120,14 +120,24 @@ SELECT * FROM stages WHERE run_id = $1 ORDER BY sequence ASC;
 SELECT * FROM stages WHERE id = $1 FOR UPDATE;
 
 -- name: ListStagesAwaitingApproval :many
--- Used by the SLA ticker to find candidates for timeout. Filters
--- to stages in awaiting_approval state with a non-null gate_sla so
--- the ticker doesn't pay for SLA parsing on rows where it isn't
--- applicable. Ordered by updated_at ASC: the oldest entry is the
--- most likely to be past SLA, so the ticker can early-exit if the
--- first row hasn't elapsed (when the parsed durations are uniform).
+-- The SLA ticker's candidate listing for gate timeout (#1390 broadened it
+-- to the deploy gate). Matches stages parked at EITHER the generic
+-- awaiting_approval gate OR the deploy pre-execution gate
+-- (awaiting_deploy_approval), both filtered to a non-null gate_sla so the
+-- ticker doesn't pay for SLA parsing on rows where it isn't applicable.
+-- Deploy stages already carry gate_sla and awaiting_deploy_approval->failed
+-- (category D) is already a legal transition, so the broadening needs no new
+-- transition or row field. Ordered by updated_at ASC: the oldest entry is the
+-- most likely to be past SLA, so the ticker can early-exit if the first row
+-- hasn't elapsed (when the parsed durations are uniform).
+--
+-- Consumers: the SLA ticker (backend/internal/sla) AND the reaction poller
+-- (backend/internal/reactionpoller). The poller is unaffected by the deploy
+-- broadening because it skips any stage whose Type != plan, so the newly
+-- included deploy rows are filtered out before any GitHub call (#1390 binding
+-- condition 1).
 SELECT * FROM stages
- WHERE state = 'awaiting_approval'
+ WHERE state IN ('awaiting_approval', 'awaiting_deploy_approval')
    AND gate_sla IS NOT NULL
  ORDER BY updated_at ASC;
 

@@ -372,9 +372,42 @@ func TestShipDeployment_BearerInsufficientScope_401(t *testing.T) {
 	}
 }
 
-// TestShipDeployment_BearerHappyPath_201 pins the operator bearer path: a
-// write:runs token records the artifact + audit with auth_method=bearer and the
-// actor kind resolved from the subject (ADR-040 D4).
+// TestShipDeployment_BearerMissingWriteDeploy_403 pins the #1390 deploy-scope
+// branch: a bearer token that HAS write:runs but LACKS write:deploy is rejected
+// 403 insufficient_scope naming write:deploy, with no artifact persisted. This
+// is distinct from TestShipDeployment_BearerInsufficientScope_401 (no write:runs
+// at all → the 401 default arm).
+func TestShipDeployment_BearerMissingWriteDeploy_403(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, ar, _, _ := newDeploymentServer(t, runID, stageID)
+	url := fmt.Sprintf("/v0/runs/%s/deployment?stage_id=%s", runID, stageID)
+	req := httptest.NewRequest(http.MethodPost, url, bytes.NewReader(validDeploymentBytes(t)))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("run_id", runID.String())
+	req.SetPathValue("stage_id", stageID.String())
+	ctx := context.WithValue(req.Context(), ctxKeyIdentity, Identity{
+		Subject: "operator:test",
+		TokenID: "tok-abc",
+		Scopes:  []string{"write:runs"},
+	})
+	w := httptest.NewRecorder()
+	s.handleShipDeployment(w, req.WithContext(ctx))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "insufficient_scope") ||
+		!strings.Contains(w.Body.String(), "write:deploy") {
+		t.Errorf("body missing insufficient_scope/write:deploy:\n%s", w.Body.String())
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("artifacts = %d, want 0 on a scope-denied upload", len(ar.all))
+	}
+}
+
+// TestShipDeployment_BearerHappyPath_201 pins the operator bearer path: a token
+// holding BOTH write:runs and write:deploy (#1390) records the artifact + audit
+// with auth_method=bearer and the actor kind resolved from the subject
+// (ADR-040 D4).
 func TestShipDeployment_BearerHappyPath_201(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	s, _, ar, au, _ := newDeploymentServer(t, runID, stageID)
@@ -387,7 +420,7 @@ func TestShipDeployment_BearerHappyPath_201(t *testing.T) {
 	ctx := context.WithValue(req.Context(), ctxKeyIdentity, Identity{
 		Subject: "operator:test",
 		TokenID: "tok-abc",
-		Scopes:  []string{"write:runs"},
+		Scopes:  []string{"write:runs", "write:deploy"},
 	})
 	w := httptest.NewRecorder()
 	s.handleShipDeployment(w, req.WithContext(ctx))

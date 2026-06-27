@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -149,6 +150,63 @@ func TestRollbackDeployment_CrossRunMCPToken(t *testing.T) {
 	w := rollbackRequest(t, s, stage.RunID, &other)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+}
+
+// (4') #1390: an OPERATOR bearer token (non-mcp:run subject) holding write:runs
+// but missing write:deploy → 403 insufficient_scope naming write:deploy. This
+// is the deploy-scope branch layered on top of the existing write:runs check.
+func TestRollbackDeployment_OperatorMissingWriteDeploy_403(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	stage, _ := seedSettledDeployRun(rr, deploySpecNoConstraints, run.StageStateSucceeded, instID(99))
+	tok := Identity{Subject: "operator:test", TokenID: "tok_ops", Scopes: []string{"write:runs"}}
+	w := rollbackRequest(t, s, stage.RunID, &tok)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "insufficient_scope") ||
+		!strings.Contains(w.Body.String(), "write:deploy") {
+		t.Errorf("body missing insufficient_scope/write:deploy:\n%s", w.Body.String())
+	}
+}
+
+// (4”) #1390: an operator bearer token holding BOTH write:runs and write:deploy
+// proceeds — the rollback re-dispatches and records the initiated handle (202).
+func TestRollbackDeployment_OperatorWithWriteDeploy_Proceeds(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stub, gh := newDeployTriggerGitHub(t)
+	s.cfg.GitHub = gh
+	stage, _ := seedSettledDeployRun(rr, deploySpecNoConstraints, run.StageStateSucceeded, instID(99))
+	stub.listBody = fmt.Sprintf(`{"workflow_runs":[{"id":616161,"html_url":"https://github.com/kuhlman-labs/example/actions/runs/616161","status":"queued","event":"workflow_dispatch","head_branch":"main","inputs":{"fishhawk_run_id":%q,"fishhawk_stage_id":%q,"fishhawk_rollback":"true"}}]}`,
+		stage.RunID.String(), stage.ID.String())
+	tok := Identity{Subject: "operator:test", TokenID: "tok_ops", Scopes: []string{"write:runs", "write:deploy"}}
+	w := rollbackRequest(t, s, stage.RunID, &tok)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	if countAppendedCategory(au, CategoryDeploymentRollbackInitiated) != 1 {
+		t.Errorf("deployment_rollback_initiated entries = %d, want 1", countAppendedCategory(au, CategoryDeploymentRollbackInitiated))
+	}
+}
+
+// (5') the mcp:run self-rollback carve-out: a run-bound MCP token rolling back
+// ITS OWN run authorizes WITHOUT write:deploy — the deploy-scope gate exempts
+// mcp:run subjects (they are constrained instead by the subject-binding guard).
+// Proves #1390 preserved the self-rollback path.
+func TestRollbackDeployment_OwnRunMCPToken_NoWriteDeploy_Proceeds(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stub, gh := newDeployTriggerGitHub(t)
+	s.cfg.GitHub = gh
+	stage, _ := seedSettledDeployRun(rr, deploySpecNoConstraints, run.StageStateSucceeded, instID(99))
+	stub.listBody = fmt.Sprintf(`{"workflow_runs":[{"id":717171,"html_url":"https://github.com/kuhlman-labs/example/actions/runs/717171","status":"queued","event":"workflow_dispatch","head_branch":"main","inputs":{"fishhawk_run_id":%q,"fishhawk_stage_id":%q,"fishhawk_rollback":"true"}}]}`,
+		stage.RunID.String(), stage.ID.String())
+	self := Identity{Subject: "mcp:run:" + stage.RunID.String(), TokenID: "tok_mcp", Scopes: []string{"write:runs"}}
+	w := rollbackRequest(t, s, stage.RunID, &self)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (mcp:run self-rollback exempt from write:deploy):\n%s", w.Code, w.Body.String())
+	}
+	if countAppendedCategory(au, CategoryDeploymentRollbackInitiated) != 1 {
+		t.Errorf("deployment_rollback_initiated entries = %d, want 1", countAppendedCategory(au, CategoryDeploymentRollbackInitiated))
 	}
 }
 

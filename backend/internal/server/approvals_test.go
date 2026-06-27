@@ -4019,3 +4019,106 @@ func TestDeployGate_Reject_FailsCategoryD(t *testing.T) {
 		t.Errorf("deploy_preflight_refused entries = %d on a reject, want 0", got)
 	}
 }
+
+// --- write:deploy scope on the deploy approval path (ADR-038 / #1390) ---
+
+// submitApprovalWithIdentity drives handleSubmitApproval directly with an
+// explicit Identity, so a test can exercise the bearer scope branches the
+// cookie-session withAuth helper bypasses (requireWriteScope exempts cookie
+// sessions). A nil identity means anonymous (no identity in context).
+func submitApprovalWithIdentity(t *testing.T, s *Server, stageID uuid.UUID, id *Identity, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/v0/stages/%s/approvals", stageID), strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("stage_id", stageID.String())
+	if id != nil {
+		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, *id))
+	}
+	w := httptest.NewRecorder()
+	s.handleSubmitApproval(w, req)
+	return w
+}
+
+// (b) anonymous deploy approve → 401. The handler's entry-point
+// requireWriteScope("write:approvals") rejects an anonymous caller before the
+// deploy-specific scope check is reached; the observable contract is a 401 and
+// an unadvanced stage either way.
+func TestDeployGate_Scope_Anonymous_Unauthorized(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	stage, _ := seedDeployRun(rr, "release", deploySpecNoConstraints)
+	w := submitApprovalWithIdentity(t, s, stage.ID, nil, `{"decision":"approve"}`)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401:\n%s", w.Code, w.Body.String())
+	}
+	if cur, _ := rr.GetStage(context.Background(), stage.ID); cur.State != run.StageStateAwaitingDeployApproval {
+		t.Errorf("stage advanced to %q on an anonymous approve; want it parked", cur.State)
+	}
+}
+
+// (b) a bearer token that HAS write:approvals (so it clears the entry gate) but
+// LACKS write:deploy → 403 insufficient_scope naming write:deploy, with NO
+// stage transition and NO pre-flight evaluation (the scope check precedes
+// checkDeployPreflight and Submit).
+func TestDeployGate_Scope_TokenMissingWriteDeploy_Forbidden(t *testing.T) {
+	s, ar, rr, au := newApprovalServer(t)
+	stage, _ := seedDeployRun(rr, "release", deploySpecNoConstraints)
+	id := &Identity{Subject: "github:op", TokenID: "tok_no_deploy", Scopes: []string{"write:approvals"}}
+	w := submitApprovalWithIdentity(t, s, stage.ID, id, `{"decision":"approve"}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	body := decodeErrorEnvelope(t, w)
+	if body.Code != "insufficient_scope" {
+		t.Errorf("error code = %q, want insufficient_scope", body.Code)
+	}
+	if got, _ := body.Details["required_scope"].(string); got != "write:deploy" {
+		t.Errorf("required_scope = %v, want write:deploy", body.Details["required_scope"])
+	}
+	if cur, _ := rr.GetStage(context.Background(), stage.ID); cur.State != run.StageStateAwaitingDeployApproval {
+		t.Errorf("stage advanced to %q on a scope-denied approve; want it parked", cur.State)
+	}
+	// Pre-flight never ran and no approval row was inserted (pre-Submit refusal).
+	if got := countAppendedCategory(au, "deploy_preflight_refused"); got != 0 {
+		t.Errorf("deploy_preflight_refused entries = %d, want 0 (scope check precedes pre-flight)", got)
+	}
+	if rows, _ := ar.ListForStage(context.Background(), stage.ID); len(rows) != 0 {
+		t.Errorf("approval rows inserted = %d, want 0 on a scope-denied approve", len(rows))
+	}
+}
+
+// (b) cross-boundary happy path: a bearer token holding BOTH write:approvals
+// and write:deploy clears middleware scope-check → handler → checkDeployPreflight
+// → the run-repo transition to dispatched in one request.
+func TestDeployGate_Scope_TokenWithWriteDeploy_Proceeds(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	stage, _ := seedDeployRun(rr, "release", deploySpecNoConstraints)
+	id := &Identity{Subject: "github:op", TokenID: "tok_deploy", Scopes: []string{"write:approvals", "write:deploy"}}
+	w := submitApprovalWithIdentity(t, s, stage.ID, id, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if cur, _ := rr.GetStage(context.Background(), stage.ID); cur.State != run.StageStateDispatched {
+		t.Errorf("deploy stage state = %q, want dispatched", cur.State)
+	}
+}
+
+// (b) the reject path is NOT gated by write:deploy — a deploy reject is the
+// reviewer judgment that always pages the human. A token lacking write:deploy
+// (but holding write:approvals) still rejects and fails the stage category D.
+func TestDeployGate_Scope_RejectWithoutWriteDeploy_Proceeds(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	stage, _ := seedDeployRun(rr, "release", deploySpecNoConstraints)
+	id := &Identity{Subject: "github:op", TokenID: "tok_no_deploy", Scopes: []string{"write:approvals"}}
+	w := submitApprovalWithIdentity(t, s, stage.ID, id, `{"decision":"reject","comment":"not now"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (reject is not deploy-scope gated):\n%s", w.Code, w.Body.String())
+	}
+	cur, _ := rr.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateFailed {
+		t.Errorf("deploy stage state = %q, want failed", cur.State)
+	}
+	if cur.FailureCategory == nil || *cur.FailureCategory != run.FailureD {
+		t.Errorf("failure category = %v, want D", cur.FailureCategory)
+	}
+}

@@ -389,10 +389,22 @@ func (s *Server) authorizeDeployment(w http.ResponseWriter, r *http.Request, run
 			return "", "", nil, false
 		}
 		return "ed25519", audit.ActorKind("system"), nil, true
-	case !id.IsAnonymous() && hasScope(id, "write:runs"):
+	case !id.IsAnonymous() && hasScope(id, "write:runs") && hasScope(id, "write:deploy"):
 		// ADR-040 D4 (#1027): kind from the token subject — user or agent.
+		// write:deploy (ADR-038 / #1390) gates the operator bearer path on
+		// top of write:runs — the deploy ship/rollback record is a
+		// governance write specific to the deploy gate. The ed25519
+		// signature branch above is the runner path and is NOT scope-gated.
 		subj := id.Subject
 		return "bearer", actorKindForSubject(id.Subject), &subj, true
+	case !id.IsAnonymous() && hasScope(id, "write:runs") && !hasScope(id, "write:deploy"):
+		// Authenticated with write:runs but missing the deploy-specific
+		// scope: a 403 naming the missing scope, distinct from the 401 the
+		// fully-unauthenticated default arm returns.
+		s.writeError(w, r, http.StatusForbidden, "insufficient_scope",
+			"deployment upload requires the write:deploy scope in addition to write:runs",
+			map[string]any{"required_scope": "write:deploy"})
+		return "", "", nil, false
 	default:
 		s.writeError(w, r, http.StatusUnauthorized, "signature_or_bearer_required",
 			"request must include X-Fishhawk-Signature or an authenticated bearer token with write:runs scope", nil)

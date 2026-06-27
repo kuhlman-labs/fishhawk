@@ -20,6 +20,12 @@ import (
 // runTokenIssue and runTokenMigrate so there is one source of truth.
 var operatorDefaultScopes = []string{
 	"read:runs", "read:audit", "write:runs", "write:approvals", "write:stages",
+	// write:deploy gates the deploy stage's pre-execution approval and the
+	// deploy dispatch/rollback operator bearer paths (ADR-038 / #1390). New
+	// operator tokens and `token migrate --apply` promotions carry it; the
+	// ed25519 runner-signature path and the mcp:run self-rollback subject-
+	// binding path are NOT scope-gated and stay unaffected.
+	"write:deploy",
 }
 
 // mcpCapabilityScopes lists the optional scopes that can be granted

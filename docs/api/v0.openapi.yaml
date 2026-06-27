@@ -4418,6 +4418,18 @@ paths:
         gate's `approvers` block. Submitting an `approve` decision
         transitions the gate to passed; `reject` fails the stage as
         category D.
+
+        Requires `write:approvals` scope. A **deploy-stage** approve
+        additionally requires `write:deploy` (ADR-038 / #1390): the deploy
+        gate's `approve` is the pre-execution authorization for a real release,
+        so an operator bearer holding `write:approvals` but missing
+        `write:deploy` is refused 403 `insufficient_scope`
+        (`required_scope: write:deploy`) before the deploy pre-flight runs. The
+        `write:deploy` requirement applies to the deploy `approve` path ONLY —
+        a deploy `reject` (the reviewer judgment that always pages the human)
+        and every plan/implement/review approval are unaffected. Deploy
+        approvers are enforced through the same `approvers` block; an `all_of`
+        deploy gate requires the subject to belong to EVERY named role.
       tags: [approvals]
       parameters:
         - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -4614,7 +4626,13 @@ paths:
             Possible error codes:
 
             - `approver_not_authorized` — a RoleResolver is configured
-              and the subject is not in the gate's approvers list.
+              and the subject is not in the gate's approvers list. For an
+              `all_of` deploy gate this fires unless the subject belongs to
+              EVERY named role.
+            - `insufficient_scope` — a **deploy-stage** `approve` from an
+              operator bearer that holds `write:approvals` but is missing
+              `write:deploy` (ADR-038 / #1390). `details.required_scope` is
+              `write:deploy`. Applies to the deploy `approve` path only.
             - `delegation_not_configured` — the request carried
               `delegated: true` but no effective `operator_agent` block
               delegates the approve action (ADR-040 / #1026,
@@ -5990,9 +6008,13 @@ paths:
 
         - **Ed25519 signature** (canonical deploy-executor path): supply
           `X-Fishhawk-Signature` — the hex-encoded 64-byte Ed25519
-          signature over sha256(body), using the per-run ephemeral key.
+          signature over sha256(body), using the per-run ephemeral key. The
+          signature path is NOT scope-gated.
         - **Bearer token** (operator path): supply `Authorization: Bearer
-          <token>` with `write:runs` scope.
+          <token>` with BOTH `write:runs` AND `write:deploy` scope (ADR-038 /
+          #1390 — the deploy ship is a governance write specific to the deploy
+          gate). A token holding `write:runs` but missing `write:deploy` is
+          rejected 403 `insufficient_scope` (`required_scope: write:deploy`).
 
         When both are present the signature path wins. The audit payload's
         `auth_method` field records `ed25519` or `bearer`.
@@ -6054,6 +6076,14 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: |
+            Bearer token holds `write:runs` but is missing the deploy-specific
+            `write:deploy` scope (`code: insufficient_scope`,
+            `required_scope: write:deploy`, ADR-038 / #1390).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '404': { $ref: '#/components/responses/NotFound' }
         '413':
           description: Deployment body exceeds the per-stage size cap (32 KiB).
@@ -6108,11 +6138,14 @@ paths:
         state (`succeeded` or `failed`); an in-flight stage has nothing to
         revert (refused 409 `deploy_not_settled`).
 
-        **Authorization.** Operator-only — an authenticated bearer with
-        `write:runs` scope (a rollback is never runner-initiated, so there is
-        no Ed25519 signature path). A run-bound MCP token (subject
-        `mcp:run:<uuid>`) may roll back ONLY its own run's deploy; another
-        run is refused 403 (`cross_run_rollback`).
+        **Authorization.** Operator-only — an authenticated bearer with BOTH
+        `write:runs` AND `write:deploy` scope (ADR-038 / #1390; a rollback is
+        never runner-initiated, so there is no Ed25519 signature path). A token
+        holding `write:runs` but missing `write:deploy` is refused 403
+        `insufficient_scope` (`required_scope: write:deploy`). A run-bound MCP
+        token (subject `mcp:run:<uuid>`) is EXEMPT from the `write:deploy`
+        requirement and may roll back ONLY its own run's deploy; another run is
+        refused 403 (`cross_run_rollback`).
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -6143,8 +6176,11 @@ paths:
         '403':
           description: |
             One of: (1) bearer token lacks `write:runs` scope —
-            `insufficient_scope`; (2) an mcp run-bound token targeting another
-            run — `cross_run_rollback`.
+            `insufficient_scope`; (2) an operator bearer holds `write:runs` but
+            lacks the deploy-specific `write:deploy` scope —
+            `insufficient_scope` (`required_scope: write:deploy`, ADR-038 /
+            #1390; mcp run-bound tokens are exempt); (3) an mcp run-bound token
+            targeting another run — `cross_run_rollback`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

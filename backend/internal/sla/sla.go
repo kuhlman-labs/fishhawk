@@ -1,7 +1,11 @@
 // Package sla parses workflow-spec gate SLA strings into
 // wall-clock durations and runs the background ticker that
-// transitions awaiting_approval stages to failed-D when their SLA
-// elapses.
+// transitions gated stages to failed-D when their SLA elapses.
+// The ticker's candidate query (ListStagesAwaitingApproval) covers
+// both the generic awaiting_approval gate and the deploy
+// pre-execution gate (awaiting_deploy_approval, #1390), so a deploy
+// stage whose operator never decides within gate_sla also times out
+// to failed-D — the deploy-gate SLA-elapsed → category-D path.
 //
 // v0 punts business-hours math: "4_business_hours" is treated as
 // 4 wall-clock hours. The string is preserved verbatim on the
@@ -84,10 +88,11 @@ func Parse(s string) (time.Duration, error) {
 // callers to wrap their advancer in a typed conversion at every
 // call site.)
 
-// Ticker scans for awaiting_approval stages whose SLA has elapsed
-// and transitions them to failed with category D. Run() blocks
-// until ctx is done; for production wiring start it on its own
-// goroutine via the server config.
+// Ticker scans for gated stages (awaiting_approval and the deploy
+// gate's awaiting_deploy_approval, #1390) whose SLA has elapsed and
+// transitions them to failed with category D. Run() blocks until ctx
+// is done; for production wiring start it on its own goroutine via
+// the server config.
 type Ticker struct {
 	// Repo persists stages and applies the failed-D transition.
 	// Required.
@@ -120,11 +125,11 @@ type Ticker struct {
 	Now func() time.Time
 }
 
-// Run drives the ticker until ctx is cancelled. Each tick lists
-// awaiting_approval stages, computes their per-row deadline, and
-// transitions any that have elapsed. Errors at the per-stage level
-// are logged but don't abort the loop — a stuck stage shouldn't
-// block timeouts on others.
+// Run drives the ticker until ctx is cancelled. Each tick lists the
+// gated stages (awaiting_approval + awaiting_deploy_approval),
+// computes their per-row deadline, and transitions any that have
+// elapsed. Errors at the per-stage level are logged but don't abort
+// the loop — a stuck stage shouldn't block timeouts on others.
 func (t *Ticker) Run(ctx context.Context) error {
 	if t.Repo == nil {
 		return errors.New("sla: ticker requires Repo")
@@ -212,10 +217,12 @@ func (t *Ticker) handleStage(ctx context.Context, logger *slog.Logger, now time.
 	if d == 0 {
 		return
 	}
-	// SLA clock starts when the stage entered awaiting_approval,
-	// approximated by UpdatedAt. Trace handler walks dispatched →
-	// running → awaiting_approval atomically; subsequent updates
-	// only happen on this transition we're about to write.
+	// SLA clock starts when the stage entered its gate
+	// (awaiting_approval, or awaiting_deploy_approval for a deploy
+	// stage, #1390), approximated by UpdatedAt. The entering
+	// transition is atomic and subsequent updates only happen on the
+	// failed-D transition we're about to write, so UpdatedAt is the
+	// gate-entry instant for both gate states.
 	deadline := s.UpdatedAt.Add(d)
 	if now.Before(deadline) {
 		return

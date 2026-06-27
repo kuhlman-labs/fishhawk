@@ -82,6 +82,18 @@ func (s *Server) handleRollbackDeployment(w http.ResponseWriter, r *http.Request
 			map[string]any{"required_scope": "write:runs"})
 		return
 	}
+	// write:deploy (ADR-038 / #1390) gates the OPERATOR bearer rollback path
+	// on top of write:runs. The mcp:run self-rollback path is exempt: a
+	// run-bound token (subject "mcp:run:<uuid>") is constrained instead by the
+	// subject-binding guard below (it may roll back only its own run), so it
+	// keeps working without the deploy scope. Cookie sessions (TokenID == "")
+	// are exempt like every other scope check.
+	if id.TokenID != "" && !strings.HasPrefix(id.Subject, "mcp:run:") && !hasScope(id, "write:deploy") {
+		s.writeError(w, r, http.StatusForbidden, "insufficient_scope",
+			"token is missing required scope: write:deploy",
+			map[string]any{"required_scope": "write:deploy"})
+		return
+	}
 
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "rollback_unconfigured",

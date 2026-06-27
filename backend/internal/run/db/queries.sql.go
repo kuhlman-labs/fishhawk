@@ -529,17 +529,27 @@ func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, erro
 
 const listStagesAwaitingApproval = `-- name: ListStagesAwaitingApproval :many
 SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park FROM stages
- WHERE state = 'awaiting_approval'
+ WHERE state IN ('awaiting_approval', 'awaiting_deploy_approval')
    AND gate_sla IS NOT NULL
  ORDER BY updated_at ASC
 `
 
-// Used by the SLA ticker to find candidates for timeout. Filters
-// to stages in awaiting_approval state with a non-null gate_sla so
-// the ticker doesn't pay for SLA parsing on rows where it isn't
-// applicable. Ordered by updated_at ASC: the oldest entry is the
-// most likely to be past SLA, so the ticker can early-exit if the
-// first row hasn't elapsed (when the parsed durations are uniform).
+// The SLA ticker's candidate listing for gate timeout (#1390 broadened it
+// to the deploy gate). Matches stages parked at EITHER the generic
+// awaiting_approval gate OR the deploy pre-execution gate
+// (awaiting_deploy_approval), both filtered to a non-null gate_sla so the
+// ticker doesn't pay for SLA parsing on rows where it isn't applicable.
+// Deploy stages already carry gate_sla and awaiting_deploy_approval->failed
+// (category D) is already a legal transition, so the broadening needs no new
+// transition or row field. Ordered by updated_at ASC: the oldest entry is the
+// most likely to be past SLA, so the ticker can early-exit if the first row
+// hasn't elapsed (when the parsed durations are uniform).
+//
+// Consumers: the SLA ticker (backend/internal/sla) AND the reaction poller
+// (backend/internal/reactionpoller). The poller is unaffected by the deploy
+// broadening because it skips any stage whose Type != plan, so the newly
+// included deploy rows are filtered out before any GitHub call (#1390 binding
+// condition 1).
 func (q *Queries) ListStagesAwaitingApproval(ctx context.Context) ([]Stage, error) {
 	rows, err := q.db.Query(ctx, listStagesAwaitingApproval)
 	if err != nil {
