@@ -221,6 +221,13 @@ type runConcernPayload struct {
 type runDelegationPayload struct {
 	Actions       []runDelegationActionPayload `json:"actions"`
 	MustPageHuman []string                     `json:"must_page_human,omitempty"`
+	// ReviewerRejectClass names the reviewer-reject page-event class the
+	// run currently resolves to (#1378): gating_reviewer_reject (a reject
+	// pages the human) or advisory_reviewer_reject (arbitrable /
+	// auto-routed). Omitted when the implement stage is gateless — no
+	// agent-reviewer authority — preserving byte-identical responses for
+	// runs that resolve gateless.
+	ReviewerRejectClass string `json:"reviewer_reject_class,omitempty"`
 }
 
 // runDelegationActionPayload is one knob's evaluation on the wire.
@@ -1040,8 +1047,9 @@ func (s *Server) buildDelegationPayload(ctx context.Context, runRow *run.Run) *r
 		return nil
 	}
 	out := &runDelegationPayload{
-		Actions:       make([]runDelegationActionPayload, 0, len(res.Actions)),
-		MustPageHuman: res.MustPageHuman,
+		Actions:             make([]runDelegationActionPayload, 0, len(res.Actions)),
+		MustPageHuman:       res.MustPageHuman,
+		ReviewerRejectClass: res.ReviewerRejectClass,
 	}
 	for _, d := range res.Actions {
 		out.Actions = append(out.Actions, runDelegationActionPayload{

@@ -75,6 +75,16 @@ type Decision struct {
 type Result struct {
 	Actions       []Decision
 	MustPageHuman []string
+	// ReviewerRejectClass names the reviewer-reject page-event class the
+	// run's implement review currently resolves to (#1378): the explicit
+	// spec.PageEventGatingReviewerReject when implement review authority is
+	// gating (a reject pages the human), spec.PageEventAdvisoryReviewerReject
+	// when advisory (a reject is arbitrable / auto-routed), and "" when the
+	// implement stage is gateless (no agent-reviewer authority — omitted).
+	// This only makes the authority-resolved class legible; it does not
+	// change the page/auto decision, which stays resolved from
+	// implementReviewAuthority.
+	ReviewerRejectClass string
 }
 
 // Evaluator answers delegation conditions over the server's existing
@@ -138,8 +148,9 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 	// This is fail-closed by intent — without it a stale open concern
 	// could still satisfy a knob (e.g. solo_low) while the run is
 	// genuinely blocked on operator answers.
+	rejectClass := reviewerRejectClass(wf)
 	if parkedAwaitingInput(stages) {
-		return &Result{MustPageHuman: effective.MustPageHuman}, nil
+		return &Result{MustPageHuman: effective.MustPageHuman, ReviewerRejectClass: rejectClass}, nil
 	}
 
 	open, err := e.Concerns.ListOpenByRun(ctx, runRow.ID)
@@ -147,7 +158,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 		return nil, fmt.Errorf("list open concerns: %w", err)
 	}
 
-	res := &Result{MustPageHuman: effective.MustPageHuman}
+	res := &Result{MustPageHuman: effective.MustPageHuman, ReviewerRejectClass: rejectClass}
 	type knob struct {
 		action    string
 		condition spec.DelegationCondition
@@ -376,6 +387,24 @@ func implementReviewAuthority(wf *spec.Workflow) planreview.AuthorityMode {
 	return planreview.ResolveAuthority(*st.Reviewers)
 }
 
+// reviewerRejectClass maps the implement-stage review authority (#1378)
+// to the legible reviewer-reject page-event class surfaced on the wire:
+// gating authority -> spec.PageEventGatingReviewerReject (a reject pages
+// the human), advisory -> spec.PageEventAdvisoryReviewerReject (a reject
+// is arbitrable / auto-routed), and gateless -> "" (no agent-reviewer
+// authority; omitted). This is the same authority resolution the
+// page/auto decision uses — it only makes the resolved class explicit.
+func reviewerRejectClass(wf *spec.Workflow) string {
+	switch implementReviewAuthority(wf) {
+	case planreview.AuthorityGating:
+		return spec.PageEventGatingReviewerReject
+	case planreview.AuthorityAdvisory:
+		return spec.PageEventAdvisoryReviewerReject
+	default:
+		return ""
+	}
+}
+
 // evalConvergentConcerns answers may_route_fixup's condition: the
 // implement-review round's verdicts are all in, no GATING-authority
 // reject is present, and at least one concern is open to route. Pinned
@@ -407,7 +436,7 @@ func (e *Evaluator) evalConvergentConcerns(ctx context.Context, runRow *run.Run,
 	gating := implementReviewAuthority(wf) == planreview.AuthorityGating
 	for _, v := range verdicts {
 		if v == planreview.VerdictReject && gating {
-			return false, cond + ": a gating-authority reviewer rejected (reviewer_reject pages the human)", nil
+			return false, cond + ": a gating-authority reviewer rejected (" + spec.PageEventGatingReviewerReject + " pages the human)", nil
 		}
 	}
 	if len(open) == 0 {

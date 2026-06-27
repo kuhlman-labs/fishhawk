@@ -1419,6 +1419,35 @@ workflows:
 	}
 }
 
+func TestParse_OperatorAgent_ExplicitRejectClasses_Accepted(t *testing.T) {
+	// #1378 / workflow-v0.7: the explicit advisory_reviewer_reject and
+	// gating_reviewer_reject page-event classes join the closed
+	// must_page_human set. Assert the wire-string constants first, then
+	// that a 0.7 spec listing both explicit tokens parses.
+	if spec.PageEventAdvisoryReviewerReject != "advisory_reviewer_reject" {
+		t.Fatalf("PageEventAdvisoryReviewerReject = %q, want advisory_reviewer_reject", spec.PageEventAdvisoryReviewerReject)
+	}
+	if spec.PageEventGatingReviewerReject != "gating_reviewer_reject" {
+		t.Fatalf("PageEventGatingReviewerReject = %q, want gating_reviewer_reject", spec.PageEventGatingReviewerReject)
+	}
+	s, err := spec.ParseBytes(readFixture(t, "valid/operator-agent-explicit-reject-classes.yaml"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if s.Version != "0.7" {
+		t.Errorf("version = %q, want 0.7", s.Version)
+	}
+	wf, ok := s.Workflows["feature_change"]
+	if !ok {
+		t.Fatal(`workflows["feature_change"] missing`)
+	}
+	want := []string{spec.PageEventAdvisoryReviewerReject, spec.PageEventGatingReviewerReject}
+	got := wf.OperatorAgent.MustPageHuman
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("MustPageHuman = %v, want %v", got, want)
+	}
+}
+
 func TestParse_OperatorAgent_OnCheckGate_Rejected(t *testing.T) {
 	// operator_agent lives on the approval branch of the gate oneOf
 	// only; unevaluatedProperties rejects it on a check gate.

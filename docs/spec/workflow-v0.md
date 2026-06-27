@@ -15,7 +15,7 @@ Reference for `.fishhawk/workflows.yaml`. The canonical schema is [`workflow-v0.
 ## Top-level shape
 
 ```yaml
-version: "0.3" # required; "0.3", "0.4" (adds workflow.budgets), "0.5" (adds operator_agent), or "0.6" (adds workflow.decomposition.max_parallel)
+version: "0.3" # required; "0.3", "0.4" (adds workflow.budgets), "0.5" (adds operator_agent), "0.6" (adds workflow.decomposition.max_parallel), or "0.7" (adds the explicit advisory_reviewer_reject / gating_reviewer_reject page-event classes)
 roles: # optional; named groups referenced by gates
   <role_id>:
     members: ["@org/team", "@user"]
@@ -405,9 +405,11 @@ workflows:
 
 **Precedence.** A gate-level block (approval gates only — the schema rejects `operator_agent` on `check` gates) overrides the workflow-level block **wholesale**: knobs are never merged across levels, so a gate block that omits `may_retry` does not inherit the workflow's `may_retry`. Resolution lives in `spec.Workflow.EffectiveOperatorAgent(gate)`: gate block if present, else workflow block, else nil.
 
-**`must_page_human`.** Events that always page the human regardless of the `may_*` knobs (closed set: `reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`, `clarification_request`). An event listed here is never absorbed by a delegation. (`clarification_request` is the planner parking the plan stage at `awaiting_input` because the issue is not yet plannable — #1057.)
+**`must_page_human`.** Events that always page the human regardless of the `may_*` knobs (closed set: `reviewer_reject`, `advisory_reviewer_reject`, `gating_reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`, `clarification_request`). An event listed here is never absorbed by a delegation. (`clarification_request` is the planner parking the plan stage at `awaiting_input` because the issue is not yet plannable — #1057.)
 
-`reviewer_reject` specifically means a **gating-authority** agent reject — an agent reject on an agent-only implement review, where no human approver overrides it (ADR-027). It is the only reviewer reject that pages here, because the two other reject shapes are governed elsewhere: an **advisory** agent reject (agent + human reviewers) is non-blocking and arbitrable via `may_route_fixup` / `convergent_concerns`, and a **human** reviewer reject does not arrive as an `implement_reviewed` verdict at all — it surfaces as `plan_rejection` / gate rejection, which already pages.
+**Reviewer-reject taxonomy (v0.7+).** The reviewer-reject class is now self-documenting via two explicit tokens (#1378): `gating_reviewer_reject` — an agent reject on an agent-only implement review, where no human approver overrides it (ADR-027); this **pages** the human — and `advisory_reviewer_reject` — an agent reject under agent + human authority; this is non-blocking and **arbitrable** via `may_route_fixup` / `convergent_concerns`, so it does not page on its own. The legacy bare `reviewer_reject` is preserved and **resolves to the gating sense** for back-compat: a spec using it pages exactly as before. The page/auto decision itself stays resolved from ADR-027 review authority (`planreview.ResolveAuthority`) — the explicit tokens only make the resolved class legible in config; they do not change behavior. A **human** reviewer reject does not arrive as an `implement_reviewed` verdict at all — it surfaces as `plan_rejection` / gate rejection, which already pages.
+
+The class a run currently resolves to is surfaced on the wire as `reviewer_reject_class` on the `GET /v0/runs/{id}` delegation block (`gating_reviewer_reject` / `advisory_reviewer_reject`, omitted when the implement stage is gateless), so a reader need not cross-reference the authority resolver.
 
 **Authority unchanged (ADR-027).** Delegation changes *who* may act at a gate, not what gates exist or how reviewer authority resolves. The condition evaluator reads authority from the same ADR-027 mechanism the review pipeline uses (`planreview.ResolveAuthority`: advisory when agent + human, gating when agent-only), so a delegated decision can never weaken a gating gate — it only loosens delegation where ADR-027 already makes agent verdicts non-blocking.
 
@@ -419,8 +421,8 @@ workflows:
 |---|---|---|
 | Clean dual approval (all verdicts approve, no concerns) | auto | `may_approve` / `clean_dual_approval` |
 | Advisory-concern arbitration (verdicts in, no gating reject, concern open) | auto | `may_route_fixup` / `convergent_concerns` |
-| Advisory reviewer reject (agent reject under agent + human authority) | auto | `may_route_fixup` / `convergent_concerns` (arbitrable; non-blocking per ADR-027) |
-| Gating reviewer reject (agent reject under agent-only authority) | page | `reviewer_reject` |
+| Advisory reviewer reject (agent reject under agent + human authority) | auto | `may_route_fixup` / `convergent_concerns` (arbitrable; non-blocking per ADR-027); legible token `advisory_reviewer_reject` |
+| Gating reviewer reject (agent reject under agent-only authority) | page | `gating_reviewer_reject` (legacy `reviewer_reject` resolves to this sense) |
 | Human / hard reject | page | `plan_rejection` (gate rejection — never an `implement_reviewed` verdict) |
 | Scope amendment (agent requests new in-scope paths) | page | `scope_amendment` |
 | Budget / policy override | page | `budget_override`, `policy_override` |
@@ -481,7 +483,7 @@ workflows:
 | --------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | `test_conventions[].match`  | non-empty doublestar glob                                                    | per-repo test-location rule for the plan-gate test sweep (#1004); `**` crosses `/`; additive to built-in Go + TS defaults |
 | `test_conventions[].candidates` | array of non-empty path templates, `minItems: 1`                         | template vars `{dir}` / `{name}` / `{ext}` / `{relpath}`                                            |
-| `version`                   | `"0.3"` \| `"0.4"` \| `"0.5"`                                               | 0.5 adds `operator_agent` (ADR-040 / #1026); 0.4 adds workflow-level `budgets` (ADR-030 / #688); 0.3 adds `on_ci_failure.max_retries` (#277); 0.2 dropped `blocking_checks` |
+| `version`                   | `"0.3"` \| `"0.4"` \| `"0.5"` \| `"0.6"` \| `"0.7"`                          | 0.7 adds the explicit `advisory_reviewer_reject` / `gating_reviewer_reject` page-event classes (#1378); 0.6 adds `decomposition.max_parallel` (#1146); 0.5 adds `operator_agent` (ADR-040 / #1026); 0.4 adds workflow-level `budgets` (ADR-030 / #688); 0.3 adds `on_ci_failure.max_retries` (#277); 0.2 dropped `blocking_checks` |
 | `budgets[].period`          | `weekly` \| `monthly`                                                        | workflow-level periodic budget reset cadence (v0.4+)                                                |
 | `budgets[].enforcement`     | `advisory` \| `blocking`                                                     | advisory warns; blocking refuses a new run at admission                                             |
 | Role / workflow / stage IDs | `^[a-z][a-z0-9_]*$`                                                          | snake_case                                                                                          |
@@ -505,7 +507,7 @@ workflows:
 | Gate `type`                 | `approval` \| `check`                                                        | closed set                                                                                          |
 | Approvers shape             | `any_of: [<role_id>...]` xor `all_of: [<role_id>...]`                        | one shape per gate                                                                                  |
 | `operator_agent.may_*`      | one closed condition per knob (see ## Operator agent delegation)             | v0.5+; workflow level + approval-gate override (gate wins wholesale); absent → fail-closed          |
-| `operator_agent.must_page_human` | `reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`, `clarification_request` | closed set; always pages the human regardless of `may_*` knobs |
+| `operator_agent.must_page_human` | `reviewer_reject`, `advisory_reviewer_reject`, `gating_reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`, `clarification_request` | closed set; always pages the human regardless of `may_*` knobs. The explicit reject classes (v0.7+) make the taxonomy self-documenting; legacy `reviewer_reject` resolves to the gating sense |
 
 ## Validation rules beyond the schema
 

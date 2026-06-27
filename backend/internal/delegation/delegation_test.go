@@ -503,6 +503,121 @@ func TestConvergentConcerns_GatelessReviewersGuard(t *testing.T) {
 	}
 }
 
+// --- reviewer_reject_class (#1378) -------------------------------------------
+
+// TestReviewerRejectClass_PerAuthority asserts the resolved reviewer-reject
+// page-event class surfaced on Result for each of the three implement-review
+// authority modes (the enumerated failure/branch set of reviewerRejectClass).
+func TestReviewerRejectClass_PerAuthority(t *testing.T) {
+	tests := []struct {
+		name      string
+		reviewers *spec.ReviewersConfig
+		want      string
+	}{
+		{"gating: agent-only", &spec.ReviewersConfig{Agent: 1, Human: 0}, spec.PageEventGatingReviewerReject},
+		{"advisory: agent+human", &spec.ReviewersConfig{Agent: 2, Human: 1}, spec.PageEventAdvisoryReviewerReject},
+		{"gateless: nil reviewers", nil, ""},
+		{"gateless: zero agents", &spec.ReviewersConfig{Agent: 0, Human: 1}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wf := testWorkflow(allKnobs(), nil)
+			implementStage(wf).Reviewers = tt.reviewers
+			ev := cleanDualEvaluator(nil, nil, &fakeAudit{})
+			res := evaluate(t, ev, wf, newRun())
+			if res == nil {
+				t.Fatal("Result is nil; want a configured evaluation")
+			}
+			if res.ReviewerRejectClass != tt.want {
+				t.Errorf("ReviewerRejectClass = %q, want %q", res.ReviewerRejectClass, tt.want)
+			}
+		})
+	}
+}
+
+// TestReviewerRejectClass_ParkedAwaitingInput asserts the class is also
+// populated on the parked awaiting_input return path, so the surfaced
+// class is consistent regardless of run state.
+func TestReviewerRejectClass_ParkedAwaitingInput(t *testing.T) {
+	wf := testWorkflow(allKnobs(), nil)
+	implementStage(wf).Reviewers = &spec.ReviewersConfig{Agent: 1, Human: 0} // gating
+	ev := &Evaluator{
+		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingInput)}},
+		Concerns: &fakeConcerns{},
+		Audit:    &fakeAudit{},
+	}
+	res := evaluate(t, ev, wf, newRun())
+	if res == nil {
+		t.Fatal("Result is nil; want the must_page_human envelope while parked")
+	}
+	if res.ReviewerRejectClass != spec.PageEventGatingReviewerReject {
+		t.Errorf("ReviewerRejectClass = %q, want %q on the parked path", res.ReviewerRejectClass, spec.PageEventGatingReviewerReject)
+	}
+}
+
+// TestReviewerRejectClass_LegacyTokenBackCompat is the done-means
+// no-behavior-change assertion: a config whose must_page_human lists the
+// legacy bare reviewer_reject produces the IDENTICAL route_fixup outcome
+// (met/unmet + reason) and the IDENTICAL resolved reviewer-reject class as
+// a config listing the explicit gating_reviewer_reject. The page/auto
+// decision stays authority-resolved; the explicit token only makes the
+// class legible.
+func TestReviewerRejectClass_LegacyTokenBackCompat(t *testing.T) {
+	rejectAudit := &fakeAudit{entries: map[string][]*audit.Entry{
+		"implement_review_started": {startedEntry(1, 1)},
+		"implement_reviewed":       {verdictEntry(2, planreview.VerdictReject)},
+	}}
+	open := []*concern.Concern{openConcern("medium")}
+
+	build := func(pageEvent string) *Result {
+		wf := testWorkflow(&spec.OperatorAgent{
+			MayRouteFixup: spec.ConditionConvergentConcerns,
+			MustPageHuman: []string{pageEvent},
+		}, nil)
+		implementStage(wf).Reviewers = &spec.ReviewersConfig{Agent: 1, Human: 0} // gating
+		ev := cleanDualEvaluator(nil, open, rejectAudit)
+		return evaluate(t, ev, wf, newRun())
+	}
+
+	legacy := build(spec.PageEventReviewerReject)
+	explicit := build(spec.PageEventGatingReviewerReject)
+
+	legacyFixup := decisionFor(t, legacy, ActionRouteFixup)
+	explicitFixup := decisionFor(t, explicit, ActionRouteFixup)
+	if legacyFixup.Met != explicitFixup.Met || legacyFixup.UnmetReason != explicitFixup.UnmetReason {
+		t.Errorf("route_fixup outcome differs: legacy %+v vs explicit %+v", legacyFixup, explicitFixup)
+	}
+	if legacyFixup.Met {
+		t.Errorf("route_fixup Met = true, want false: a gating reject pages the human")
+	}
+	if legacy.ReviewerRejectClass != explicit.ReviewerRejectClass {
+		t.Errorf("ReviewerRejectClass differs: legacy %q vs explicit %q", legacy.ReviewerRejectClass, explicit.ReviewerRejectClass)
+	}
+	if legacy.ReviewerRejectClass != spec.PageEventGatingReviewerReject {
+		t.Errorf("ReviewerRejectClass = %q, want %q (legacy reviewer_reject resolves to the gating sense)", legacy.ReviewerRejectClass, spec.PageEventGatingReviewerReject)
+	}
+}
+
+// TestConvergentConcerns_GatingRejectReasonNamesClass asserts the gating
+// unmet-reason names the explicit gating_reviewer_reject class so a reader
+// need not cross-reference the authority resolver.
+func TestConvergentConcerns_GatingRejectReasonNamesClass(t *testing.T) {
+	wf := testWorkflow(&spec.OperatorAgent{MayRouteFixup: spec.ConditionConvergentConcerns}, nil)
+	implementStage(wf).Reviewers = &spec.ReviewersConfig{Agent: 1, Human: 0} // gating
+	au := &fakeAudit{entries: map[string][]*audit.Entry{
+		"implement_review_started": {startedEntry(1, 1)},
+		"implement_reviewed":       {verdictEntry(2, planreview.VerdictReject)},
+	}}
+	ev := cleanDualEvaluator(nil, []*concern.Concern{openConcern("medium")}, au)
+	d := decisionFor(t, evaluate(t, ev, wf, newRun()), ActionRouteFixup)
+	if d.Met {
+		t.Fatalf("Met = true, want false for a gating reject")
+	}
+	if !strings.Contains(d.UnmetReason, spec.PageEventGatingReviewerReject) {
+		t.Errorf("UnmetReason = %q, want it to name %q", d.UnmetReason, spec.PageEventGatingReviewerReject)
+	}
+}
+
 // --- solo_low ----------------------------------------------------------------
 
 func TestSoloLow(t *testing.T) {
