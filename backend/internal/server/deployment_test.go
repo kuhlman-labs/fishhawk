@@ -11,12 +11,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/deployreconciler"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
@@ -498,4 +502,275 @@ func TestShipDeployment_BodyTooLarge_413(t *testing.T) {
 	if w.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("status = %d, want 413", w.Code)
 	}
+}
+
+// ---- slice 2 (#1386 / E23.6): deploy reconciler resolver + webhook terminal ----
+
+// deployStageRepo is a stateful run.Repository for the deploy-executor tests:
+// it serves the parked deploy stage, records transitions, and lists
+// awaiting-deployment deploy stages for the reconciler drive. Embeds BaseFake
+// for the rest of the interface.
+type deployStageRepo struct {
+	run.BaseFake
+	mu          sync.Mutex
+	stages      map[uuid.UUID]*run.Stage
+	runs        map[uuid.UUID]*run.Run
+	transitions []run.StageState
+}
+
+func newDeployStageRepo() *deployStageRepo {
+	return &deployStageRepo{stages: map[uuid.UUID]*run.Stage{}, runs: map[uuid.UUID]*run.Run{}}
+}
+
+func (r *deployStageRepo) GetStage(_ context.Context, id uuid.UUID) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s, ok := r.stages[id]; ok {
+		cp := *s
+		return &cp, nil
+	}
+	return nil, run.ErrNotFound
+}
+
+func (r *deployStageRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if rn, ok := r.runs[id]; ok {
+		return rn, nil
+	}
+	return nil, run.ErrNotFound
+}
+
+func (r *deployStageRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, _ *run.StageCompletion) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.stages[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	s.State = to
+	r.transitions = append(r.transitions, to)
+	cp := *s
+	return &cp, nil
+}
+
+func (r *deployStageRepo) ListDeployStagesAwaitingDeployment(_ context.Context) ([]*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []*run.Stage
+	for _, s := range r.stages {
+		if s.Type == run.StageTypeDeploy && s.State == run.StageStateAwaitingDeployment {
+			cp := *s
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
+}
+
+func (r *deployStageRepo) stageState(id uuid.UUID) run.StageState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stages[id].State
+}
+
+// newResolverServer wires a server whose RunRepo is the stateful deploy repo,
+// with the deploy stage seeded at awaiting_deployment.
+func newResolverServer(t *testing.T) (*Server, *deployStageRepo, *fakeArtifactRepo, *auditFake, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	runID, stageID := uuid.New(), uuid.New()
+	rr := newDeployStageRepo()
+	rr.stages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeDeploy, State: run.StageStateAwaitingDeployment}
+	rr.runs[runID] = &run.Run{ID: runID, Repo: "octo/repo", WorkflowID: "deploy"}
+	ar := newFakeArtifactRepo()
+	au := newAuditFake()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  newSigningFake(),
+		ArtifactRepo: ar,
+		AuditRepo:    au,
+		RunRepo:      rr,
+	})
+	return s, rr, ar, au, runID, stageID
+}
+
+func TestResolveDeploymentFromPollState_Success(t *testing.T) {
+	s, rr, ar, au, runID, stageID := newResolverServer(t)
+	wr := &githubclient.WorkflowRun{ID: 555, HTMLURL: "https://gh/run/555", Status: "completed", Conclusion: "success"}
+
+	if err := s.ResolveDeploymentFromPollState(context.Background(), runID, stageID, run.DeployOutcomeSucceeded, "main", wr); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got := rr.stageState(stageID); got != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want succeeded", got)
+	}
+	if len(ar.all) != 1 || ar.all[0].Kind != artifact.KindDeployment {
+		t.Fatalf("want 1 deployment artifact, got %d", len(ar.all))
+	}
+	if !strings.Contains(string(ar.all[0].Content), `"outcome":"succeeded"`) {
+		t.Errorf("artifact content missing outcome: %s", ar.all[0].Content)
+	}
+	if n := countByCategory(au, CategoryDeploymentOutcomeRecorded); n != 1 {
+		t.Errorf("deployment_outcome_recorded entries = %d, want 1", n)
+	}
+	if n := countByCategory(au, CategoryDeployRun); n != 1 {
+		t.Errorf("deploy_run trace events = %d, want 1", n)
+	}
+}
+
+func TestResolveDeploymentFromPollState_FailedAndPartial(t *testing.T) {
+	cases := []struct {
+		name    string
+		outcome run.DeployOutcome
+	}{
+		{"failed", run.DeployOutcomeFailed},
+		{"partial", run.DeployOutcomePartial},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, rr, ar, _, runID, stageID := newResolverServer(t)
+			wr := &githubclient.WorkflowRun{ID: 1, Status: "completed", Conclusion: "failure"}
+			if err := s.ResolveDeploymentFromPollState(context.Background(), runID, stageID, c.outcome, "main", wr); err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			// Both failed and partial land the stage in the failed STATE; the
+			// disposition rides the artifact's outcome field.
+			if got := rr.stageState(stageID); got != run.StageStateFailed {
+				t.Errorf("stage state = %q, want failed", got)
+			}
+			want := fmt.Sprintf(`"outcome":%q`, c.outcome)
+			if !strings.Contains(string(ar.all[0].Content), want) {
+				t.Errorf("artifact missing %s: %s", want, ar.all[0].Content)
+			}
+		})
+	}
+}
+
+// A repeat resolve (the webhook callback or an earlier tick already moved the
+// stage out of awaiting_deployment) is an idempotent no-op: no second artifact,
+// no second audit, no transition.
+func TestResolveDeploymentFromPollState_NotParked_NoOp(t *testing.T) {
+	s, rr, ar, au, runID, stageID := newResolverServer(t)
+	rr.stages[stageID].State = run.StageStateSucceeded // already resolved
+
+	if err := s.ResolveDeploymentFromPollState(context.Background(), runID, stageID, run.DeployOutcomeSucceeded, "main",
+		&githubclient.WorkflowRun{ID: 1, Status: "completed", Conclusion: "success"}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("artifacts = %d, want 0 (no-op on settled stage)", len(ar.all))
+	}
+	if n := countByCategory(au, CategoryDeploymentOutcomeRecorded); n != 0 {
+		t.Errorf("audit entries = %d, want 0 (no-op)", n)
+	}
+}
+
+func TestResolveDeploymentFromPollState_InvalidOutcome_Errors(t *testing.T) {
+	s, _, _, _, runID, stageID := newResolverServer(t)
+	if err := s.ResolveDeploymentFromPollState(context.Background(), runID, stageID, run.DeployOutcome("bogus"), "main", nil); err == nil {
+		t.Fatal("want error on invalid outcome, got nil")
+	}
+}
+
+// Webhook-target callback: the external pipeline POSTs its terminal outcome to
+// POST /v0/runs/{run_id}/deployment, and the handler advances the parked deploy
+// stage to the mapped terminal state (#1386 slice-2 / item 7).
+func TestShipDeployment_WebhookCallback_TransitionsTerminal(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	rr := newDeployStageRepo()
+	rr.stages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeDeploy, State: run.StageStateAwaitingDeployment}
+	ar := newFakeArtifactRepo()
+	au := newAuditFake()
+	sf := newSigningFake()
+	s := New(Config{Addr: "127.0.0.1:0", SigningRepo: sf, ArtifactRepo: ar, AuditRepo: au, RunRepo: rr})
+	priv, _ := sf.issue(t, runID)
+
+	if w := shipDeploymentRequest(t, s, runID, stageID, priv, validDeploymentBytes(t), ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.stageState(stageID); got != run.StageStateSucceeded {
+		t.Errorf("webhook callback left stage at %q, want succeeded", got)
+	}
+}
+
+// A callback whose stage is NOT parked at awaiting_deployment must not
+// re-transition (github_actions stages reach terminal via the reconciler; a
+// re-delivery to a settled stage is a no-op).
+func TestShipDeployment_WebhookCallback_NotParked_NoTransition(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	rr := newDeployStageRepo()
+	rr.stages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeDeploy, State: run.StageStateRunning}
+	ar := newFakeArtifactRepo()
+	au := newAuditFake()
+	sf := newSigningFake()
+	s := New(Config{Addr: "127.0.0.1:0", SigningRepo: sf, ArtifactRepo: ar, AuditRepo: au, RunRepo: rr})
+	priv, _ := sf.issue(t, runID)
+
+	if w := shipDeploymentRequest(t, s, runID, stageID, priv, validDeploymentBytes(t), ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", w.Code)
+	}
+	if got := rr.stageState(stageID); got != run.StageStateRunning {
+		t.Errorf("stage transitioned to %q, want unchanged running (not parked)", got)
+	}
+	if len(rr.transitions) != 0 {
+		t.Errorf("transitions = %v, want none on a non-parked stage", rr.transitions)
+	}
+}
+
+// Cross-boundary integration (required by the plan): drive a deploy stage
+// end-to-end through the real deployreconciler.Ticker against a fakeGitHub
+// poller, with the server as the Resolver. Asserts the trigger→poll→persist
+// seam: the reconciler reads the dispatched handle, polls the run to a terminal
+// success, and the server resolve persists the artifact + audits + deploy_run
+// trace event AND transitions the stage to the mapped terminal state.
+func TestDeployReconciler_EndToEnd(t *testing.T) {
+	s, rr, ar, au, runID, stageID := newResolverServer(t)
+
+	// Seed slice-1's deployment_dispatched handle the reconciler reads back.
+	handle, _ := json.Marshal(map[string]any{
+		"target":        "github_actions",
+		"gha_run_id":    int64(909),
+		"git_ref":       "main",
+		"dispatched_at": time.Now().UTC().Format(time.RFC3339),
+	})
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &runID, StageID: &stageID, Category: CategoryDeploymentDispatched, Payload: handle,
+	})
+	// The run needs an installation id for the reconciler to poll.
+	rr.runs[runID].InstallationID = ptrInt64(99)
+
+	poller := &fakeDeployPoller{get: &githubclient.WorkflowRun{ID: 909, HTMLURL: "https://gh/run/909", Status: "completed", Conclusion: "success"}}
+	ticker := &deployreconciler.Ticker{Runs: rr, GH: poller, Audit: au, Resolver: s}
+	ticker.Tick(context.Background())
+
+	if got := rr.stageState(stageID); got != run.StageStateSucceeded {
+		t.Fatalf("end-to-end stage state = %q, want succeeded", got)
+	}
+	if len(ar.all) != 1 || ar.all[0].Kind != artifact.KindDeployment {
+		t.Fatalf("want 1 deployment artifact persisted, got %d", len(ar.all))
+	}
+	if n := countByCategory(au, CategoryDeploymentOutcomeRecorded); n != 1 {
+		t.Errorf("deployment_outcome_recorded entries = %d, want 1", n)
+	}
+	if n := countByCategory(au, CategoryDeployRun); n != 1 {
+		t.Errorf("deploy_run trace events = %d, want 1", n)
+	}
+	if poller.getCalls != 1 {
+		t.Errorf("GetWorkflowRun calls = %d, want 1", poller.getCalls)
+	}
+}
+
+// fakeDeployPoller is the deployreconciler.WorkflowRunPoller seam for the
+// cross-boundary drive.
+type fakeDeployPoller struct {
+	get      *githubclient.WorkflowRun
+	getCalls int
+}
+
+func (f *fakeDeployPoller) GetWorkflowRun(_ context.Context, _ int64, _ githubclient.RepoRef, _ int64) (*githubclient.WorkflowRun, error) {
+	f.getCalls++
+	return f.get, nil
+}
+
+func (f *fakeDeployPoller) ResolveDispatchedRun(_ context.Context, _ int64, _ githubclient.RepoRef, _ string, _ map[string]string, _ time.Time) (*githubclient.WorkflowRun, error) {
+	return nil, nil
 }

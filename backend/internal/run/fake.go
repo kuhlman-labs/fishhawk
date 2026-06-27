@@ -80,6 +80,11 @@ func (BaseFake) ListReviewStagesAwaitingApproval(_ context.Context) ([]*Stage, e
 	return nil, nil
 }
 
+// ListDeployStagesAwaitingDeployment returns nil, nil.
+func (BaseFake) ListDeployStagesAwaitingDeployment(_ context.Context) ([]*Stage, error) {
+	return nil, nil
+}
+
 // ListStagesAwaitingChildren returns nil, nil.
 func (BaseFake) ListStagesAwaitingChildren(_ context.Context) ([]*Stage, error) {
 	return nil, nil

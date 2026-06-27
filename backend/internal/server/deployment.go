@@ -45,6 +45,13 @@ const (
 	// carries the matching rollback_action.
 	CategoryDeploymentRollbackInitiated = "deployment_rollback_initiated"
 	CategoryDeploymentRollbackCompleted = "deployment_rollback_completed"
+	// CategoryDeployRun is the deploy-side "trace event": the governance
+	// record of the external pipeline run the deploy reconciler polled to
+	// terminal (#1386 / E23.6). Written by ResolveDeploymentFromPollState
+	// alongside the deployment_outcome_recorded entry. An audit category,
+	// not an issue-comment surface, so it needs no
+	// docs/issue-comment-surfaces.md entry.
+	CategoryDeployRun = "deploy_run"
 )
 
 // deploymentBody is the wire shape the deploy executor POSTs. It carries
@@ -288,6 +295,31 @@ func (s *Server) handleShipDeployment(w http.ResponseWriter, r *http.Request) {
 				slog.String("stage_id", stageID.String()),
 				slog.String("category", cat),
 				slog.String("error", err.Error()))
+		}
+	}
+
+	// Webhook-target terminal transition (#1386 / E23.6). A generic-webhook
+	// deploy pipeline has no GitHub run for the reconciler to poll, so it
+	// reports its terminal outcome by calling back into THIS endpoint. When
+	// the deploy stage is still parked at awaiting_deployment, advance it to
+	// the terminal state mapped from the reported outcome (succeeded →
+	// succeeded; failed/partial/rolled_back → failed, the disposition riding
+	// the artifact's outcome field) and advance the run. github_actions
+	// stages reach terminal via the reconciler instead, so this no-ops for a
+	// stage already resolved (state != awaiting_deployment). Best-effort: a
+	// transition failure WARN-logs rather than 500-ing the already-persisted
+	// artifact + outcome record.
+	if stage.State == run.StageStateAwaitingDeployment {
+		if err := s.advanceDeployStageTerminal(r.Context(), stageID,
+			run.DeployOutcome(dep.Outcome), "webhook"); err != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"deployment upload: webhook terminal transition failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("outcome", dep.Outcome),
+				slog.String("error", err.Error()))
+		} else {
+			s.advanceRunAfterReviewResolve(r.Context(), runID)
 		}
 	}
 

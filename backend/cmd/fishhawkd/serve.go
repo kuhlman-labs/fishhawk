@@ -30,6 +30,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/deployreconciler"
 	dispatchwatchdog "github.com/kuhlman-labs/fishhawk/backend/internal/dispatchwatchdog"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
@@ -378,6 +379,12 @@ func runServe(args []string, logSink io.Writer) int {
 	mergeReconcilerInterval := fs.Duration("merge-reconciler-interval",
 		mergereconciler.DefaultInterval,
 		"merge-status reconciler scan interval. Each tick makes one GitHub GetPullRequest call per parked review stage with no per-stage cooldown; tune this upward at scale to stay within GitHub REST rate limits (5,000/hour per installation).")
+	enableDeployReconciler := fs.Bool("enable-deploy-reconciler",
+		envOr("FISHHAWKD_ENABLE_DEPLOY_RECONCILER", "false") == "true",
+		"start the deploy reconciler (#1386 / E23.6); polls a delegating deploy stage's external GitHub Actions run to a terminal outcome and resolves the stage. Off by default — only useful with a GitHub App wired. See --deploy-reconciler-interval for the rate-limit caveat at scale.")
+	deployReconcilerInterval := fs.Duration("deploy-reconciler-interval",
+		deployreconciler.DefaultInterval,
+		"deploy reconciler scan interval. Each tick makes up to one GitHub GetWorkflowRun call per parked deploy stage with no per-stage cooldown; tune this upward at scale to stay within GitHub REST rate limits (5,000/hour per installation).")
 	reviewResolution := fs.String("review-resolution",
 		envOr("FISHHAWKD_REVIEW_RESOLUTION", reviewresolver.DefaultResolution),
 		"deployment-level review-gate resolution provider (ADR-031 Phase 2; default github_merge). Selects which reviewresolver.Resolver the merge-status reconciler routes through. An unknown value fails startup (fail closed) rather than silently defaulting — succeeded must always mean a verified GitHub merge.")
@@ -1058,6 +1065,43 @@ func runServe(args []string, logSink io.Writer) int {
 			}()
 			logger.Info("merge-status reconciler started",
 				slog.Duration("interval", *mergeReconcilerInterval))
+		}
+	}
+
+	// Deploy reconciler (#1386 / E23.6). Polls a delegating deploy stage's
+	// external GitHub Actions run to a terminal outcome and resolves the
+	// stage through srv.ResolveDeploymentFromPollState — the deploy-side
+	// analogue of the merge-status reconciler. Off by default; on requires
+	// RunRepo + AuditRepo + a GitHub client + the server (Resolver). Same
+	// fall-through posture as the other tickers.
+	if *enableDeployReconciler {
+		// The deploy reconciler needs the narrow DeployStageSource capability
+		// (awaiting-deployment listing), which the concrete repo carries but
+		// the broad run.Repository interface does not — assert for it directly.
+		deployStageSource, hasDeployListing := cfg.RunRepo.(deployreconciler.DeployStageSource)
+		switch {
+		case cfg.RunRepo == nil || cfg.AuditRepo == nil:
+			logger.Warn("--enable-deploy-reconciler set but RunRepo or AuditRepo unconfigured; ticker not started")
+		case cfg.GitHub == nil:
+			logger.Warn("--enable-deploy-reconciler set but GitHub client unconfigured (no app id?); ticker not started")
+		case !hasDeployListing:
+			logger.Warn("--enable-deploy-reconciler set but RunRepo does not support deploy-stage listing; ticker not started")
+		default:
+			ticker := &deployreconciler.Ticker{
+				Runs:     deployStageSource,
+				GH:       cfg.GitHub,
+				Audit:    cfg.AuditRepo,
+				Resolver: srv,
+				Logger:   logger,
+				Interval: *deployReconcilerInterval,
+			}
+			go func() {
+				if err := ticker.Run(ctx); err != nil {
+					logger.Error("deploy reconciler exited with error", slog.String("error", err.Error()))
+				}
+			}()
+			logger.Info("deploy reconciler started",
+				slog.Duration("interval", *deployReconcilerInterval))
 		}
 	}
 

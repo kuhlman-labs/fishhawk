@@ -386,6 +386,58 @@ func (q *Queries) ListReviewStagesAwaitingApproval(ctx context.Context) ([]Stage
 	return items, nil
 }
 
+const listDeployStagesAwaitingDeployment = `-- name: ListDeployStagesAwaitingDeployment :many
+SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park FROM stages
+ WHERE state = 'awaiting_deployment'
+   AND stage_type = 'deploy'
+ ORDER BY updated_at ASC
+`
+
+// The deploy reconciler's candidate listing (#1386 / E23.6) — every deploy
+// stage parked in awaiting_deployment, polled to a terminal outcome against
+// the external pipeline's GitHub Actions run. Mirrors
+// ListReviewStagesAwaitingApproval's shape for the merge reconciler. Ordered
+// updated_at ASC so the oldest parked deploy is reconciled first.
+func (q *Queries) ListDeployStagesAwaitingDeployment(ctx context.Context) ([]Stage, error) {
+	rows, err := q.db.Query(ctx, listDeployStagesAwaitingDeployment)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Stage
+	for rows.Next() {
+		var i Stage
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Sequence,
+			&i.StageType,
+			&i.ExecutorKind,
+			&i.ExecutorRef,
+			&i.State,
+			&i.StartedAt,
+			&i.EndedAt,
+			&i.FailureCategory,
+			&i.FailureReason,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.GateSla,
+			&i.RequiresApproval,
+			&i.GateType,
+			&i.GateApprovers,
+			&i.SelfRetryCount,
+			&i.ScopeCompletenessPark,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRuns = `-- name: ListRuns :many
 SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved FROM runs
  WHERE ($1::text = '' OR repo = $1)

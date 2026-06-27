@@ -3559,6 +3559,209 @@ func implementReviewAlreadyStarted(entries []*audit.Entry, stageID uuid.UUID, he
 	return false
 }
 
+// ResolveDeploymentFromPollState records a delegating deploy stage's
+// terminal outcome once the deploy reconciler has polled the external
+// GitHub Actions run to completion (#1386 / E23.6, ADR-038). It is the
+// deploy-side analogue of ResolveReviewFromPollState: the deployreconciler
+// owns the GitHub polling + conclusion→outcome mapping; this method owns the
+// server-internal persistence — artifact, audit, trace event, stage
+// transition, and run advance — so all of it stays in the server package.
+//
+// Steps:
+//  1. Re-read the stage; no-op when it is no longer parked at
+//     awaiting_deployment (a webhook callback or an earlier tick already
+//     resolved it — the resolve is idempotent).
+//  2. Persist the deployment artifact (artifact.KindDeployment), deduped on
+//     (stage_id, content_hash) exactly like handleShipDeployment so a repeat
+//     tick before the transition lands does not double-write.
+//  3. Append the deployment_outcome_recorded audit entry (same payload shape
+//     the webhook callback writes, for consistent issue-comment rendering)
+//     and the deploy_run trace event carrying the polled run's identity.
+//  4. Transition awaiting_deployment → succeeded (outcome=succeeded) or →
+//     failed (outcome=failed/partial; partial rides State=failed +
+//     the artifact's outcome=partial per run.Stage.DeployOutcome's contract).
+//  5. Advance the run so a terminal deploy stage completes the run.
+//
+// Best-effort audit: an audit-append failure WARN-logs and does NOT unwind
+// the already-persisted artifact. A transition failure IS returned so the
+// reconciler retries next tick.
+func (s *Server) ResolveDeploymentFromPollState(ctx context.Context, runID, stageID uuid.UUID, outcome run.DeployOutcome, gitRef string, wr *githubclient.WorkflowRun) error {
+	if s.cfg.RunRepo == nil || s.cfg.ArtifactRepo == nil || s.cfg.AuditRepo == nil {
+		return errors.New("server: ResolveDeploymentFromPollState requires RunRepo, ArtifactRepo, and AuditRepo")
+	}
+	if !outcome.Valid() {
+		return fmt.Errorf("server: ResolveDeploymentFromPollState invalid outcome %q", outcome)
+	}
+
+	stage, err := s.cfg.RunRepo.GetStage(ctx, stageID)
+	if err != nil {
+		return fmt.Errorf("resolve deployment from poll: get stage %s: %w", stageID, err)
+	}
+	if stage.State != run.StageStateAwaitingDeployment {
+		// Already resolved by a prior tick or the webhook callback. Idempotent
+		// no-op — the deploy executor never re-records a settled stage.
+		return nil
+	}
+
+	externalURL := ""
+	if wr != nil {
+		externalURL = wr.HTMLURL
+	}
+	environment := s.deployEnvironmentForRun(ctx, runID)
+
+	// Persist the deployment artifact (the durable carrier of the outcome —
+	// partial/rolled_back are representable here even though the stage STATE
+	// is only succeeded/failed). Mirrors handleShipDeployment's body shape.
+	depBody := deploymentBody{
+		Environment:    environment,
+		Ref:            gitRef,
+		ExternalRunURL: externalURL,
+		Outcome:        string(outcome),
+	}
+	content, _ := json.Marshal(depBody)
+	contentHash := sha256Hex(content)
+
+	var artifactID uuid.UUID
+	if existing, gerr := s.cfg.ArtifactRepo.GetByHash(ctx, stageID, contentHash); gerr == nil {
+		artifactID = existing.ID
+	} else if !errors.Is(gerr, artifact.ErrNotFound) {
+		return fmt.Errorf("resolve deployment from poll: check existing artifact: %w", gerr)
+	} else {
+		created, cerr := s.cfg.ArtifactRepo.Create(ctx, artifact.CreateParams{
+			StageID:     stageID,
+			Kind:        artifact.KindDeployment,
+			Content:     json.RawMessage(content),
+			ContentHash: contentHash,
+		})
+		if cerr != nil {
+			return fmt.Errorf("resolve deployment from poll: create artifact: %w", cerr)
+		}
+		artifactID = created.ID
+	}
+
+	systemKind := audit.ActorSystem
+	outcomePayload, _ := json.Marshal(map[string]any{
+		"run_id":           runID.String(),
+		"stage_id":         stageID.String(),
+		"artifact_id":      artifactID.String(),
+		"content_hash":     contentHash,
+		"environment":      environment,
+		"ref":              gitRef,
+		"external_run_url": externalURL,
+		"outcome":          string(outcome),
+		"auth_method":      "reconciler",
+	})
+	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryDeploymentOutcomeRecorded,
+		ActorKind: &systemKind,
+		Payload:   outcomePayload,
+	}); aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"resolve deployment from poll: append outcome audit failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", aerr.Error()))
+	}
+
+	// deploy_run trace event: the governance record of the external run the
+	// reconciler polled to terminal. Best-effort, like the outcome audit.
+	var ghaRunID int64
+	var conclusion, ghStatus string
+	if wr != nil {
+		ghaRunID, conclusion, ghStatus = wr.ID, wr.Conclusion, wr.Status
+	}
+	deployRunPayload, _ := json.Marshal(map[string]any{
+		"run_id":           runID.String(),
+		"stage_id":         stageID.String(),
+		"gha_run_id":       ghaRunID,
+		"external_run_url": externalURL,
+		"conclusion":       conclusion,
+		"status":           ghStatus,
+		"outcome":          string(outcome),
+	})
+	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryDeployRun,
+		ActorKind: &systemKind,
+		Payload:   deployRunPayload,
+	}); aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"resolve deployment from poll: append deploy_run trace event failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", aerr.Error()))
+	}
+
+	if err := s.advanceDeployStageTerminal(ctx, stageID, outcome, conclusion); err != nil {
+		return err
+	}
+
+	s.notifyStatusUpdate(ctx, runID, "deployment_recorded")
+	s.advanceRunAfterReviewResolve(ctx, runID)
+	return nil
+}
+
+// advanceDeployStageTerminal transitions a parked deploy stage to its
+// terminal state from the mapped outcome (#1386 / E23.6): succeeded →
+// StageStateSucceeded; failed/partial → StageStateFailed (category C — the
+// external pipeline, not a Fishhawk agent, produced the failure). A
+// partial deploy is a failed STATE whose partial disposition rides the
+// artifact's outcome field (run.Stage.DeployOutcome's contract). Shared by
+// the reconciler resolve and the webhook callback so both surfaces map an
+// outcome to a state identically.
+func (s *Server) advanceDeployStageTerminal(ctx context.Context, stageID uuid.UUID, outcome run.DeployOutcome, conclusion string) error {
+	switch outcome {
+	case run.DeployOutcomeSucceeded:
+		if _, err := s.cfg.RunRepo.TransitionStage(ctx, stageID, run.StageStateSucceeded, nil); err != nil {
+			return fmt.Errorf("resolve deployment: awaiting_deployment → succeeded: %w", err)
+		}
+		return nil
+	default:
+		reason := fmt.Sprintf("external deploy pipeline reported %s (conclusion=%q)", outcome, conclusion)
+		if _, err := run.FailStage(ctx, s.cfg.RunRepo, stageID, run.FailureC, reason); err != nil {
+			return fmt.Errorf("resolve deployment: awaiting_deployment → failed: %w", err)
+		}
+		return nil
+	}
+}
+
+// deployEnvironmentForRun derives the deployed environment label from the
+// run's cached workflow spec — the deploy stage's first
+// allowed_environments entry (the pre-execution gate already constrained
+// the deploy to that set). Best-effort: an unparseable/absent spec yields
+// "" rather than failing the resolve, since the authoritative outcome
+// fields are the external_run_url + outcome, not the environment label.
+func (s *Server) deployEnvironmentForRun(ctx context.Context, runID uuid.UUID) string {
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil || len(runRow.WorkflowSpec) == 0 {
+		return ""
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		return ""
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		return ""
+	}
+	for _, st := range wf.Stages {
+		if st.Type != spec.StageTypeDeploy {
+			continue
+		}
+		for _, c := range st.Constraints {
+			if len(c.AllowedEnvironments) > 0 {
+				return c.AllowedEnvironments[0]
+			}
+		}
+	}
+	return ""
+}
+
 // pickRedactedTraceHash walks the run's trace_uploaded audit entries
 // and returns the most recent redacted variant's content hash for
 // the given stage. Returns false when none match.

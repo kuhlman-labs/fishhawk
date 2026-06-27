@@ -218,6 +218,15 @@ type Repository interface {
 	// (#725). Ordered updated_at ASC.
 	ListReviewStagesAwaitingApproval(ctx context.Context) ([]*Stage, error)
 
+	// NOTE (#1386 / E23.6): the deploy reconciler's analogous
+	// "ListDeployStagesAwaitingDeployment" (deploy stages parked at
+	// awaiting_deployment) is deliberately NOT on this broad interface. It is
+	// a capability only the deploy executor consumes, so it lives on the
+	// concrete *postgresRepo and is reached through deployreconciler's narrow
+	// DeployStageSource interface (serve.go type-asserts cfg.RunRepo to it) —
+	// keeping it off run.Repository avoids forcing a stub into every
+	// run.Repository test fake for a method nothing else calls.
+
 	// ListStagesAwaitingChildren returns every stage currently in
 	// awaiting_children state. The child-completion sweeper scans
 	// this to find parent stages whose children may have reached
