@@ -204,3 +204,52 @@ func messageStrings(ve *spec.ValidationError) []string {
 	}
 	return out
 }
+
+// --- Version routing (ADR-046 / #1381) ---
+
+// minimalSpecAtVersion renders the smallest valid spec at the given
+// version, used to exercise the version-routed validator.
+func minimalSpecAtVersion(version string) string {
+	return "version: \"" + version + "\"\n" + `
+workflows:
+  trivial:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+}
+
+// TestValidateBytes_RoutesV1Spec proves a version: "1.0" spec routes to
+// the v1 schema and is accepted (the v1-accepts branch).
+func TestValidateBytes_RoutesV1Spec(t *testing.T) {
+	if err := spec.ValidateBytes([]byte(minimalSpecAtVersion("1.0"))); err != nil {
+		t.Errorf("expected v1 spec to validate, got: %v", err)
+	}
+}
+
+// TestValidateBytes_RoutesV0Spec proves a version the v0 enum accepts
+// ("0.7") routes to v0 and validates (the v0-routes branch).
+func TestValidateBytes_RoutesV0Spec(t *testing.T) {
+	if err := spec.ValidateBytes([]byte(minimalSpecAtVersion("0.7"))); err != nil {
+		t.Errorf("expected v0 spec to validate, got: %v", err)
+	}
+}
+
+// TestValidateBytes_UnsupportedMajorFailsClosed proves a well-formed but
+// unrecognized major (2.0) fails closed with a *ValidationError naming
+// the supported majors (the fail-closed-on-unknown-major branch).
+func TestValidateBytes_UnsupportedMajorFailsClosed(t *testing.T) {
+	err := spec.ValidateBytes([]byte(minimalSpecAtVersion("2.0")))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	joined := strings.Join(messageStrings(ve), "\n")
+	for _, want := range []string{"0", "1"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("error %q does not name supported major %q", joined, want)
+		}
+	}
+}

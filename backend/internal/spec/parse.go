@@ -9,50 +9,99 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"gopkg.in/yaml.v3"
 )
 
-//go:embed schemas/workflow-v0.schema.json
+//go:embed schemas/workflow-v0.schema.json schemas/workflow-v1.schema.json
 var schemaFS embed.FS
 
-// compiledSchema is the JSON Schema used by Parse. Compiled once at
-// package init; if the embedded schema is malformed we want to crash
-// loudly at process start, not on the first Parse call.
-var compiledSchema = mustCompileSchema()
+// embeddedSchema names one embedded canonical schema and the major
+// version of the spec it validates. ADR-046 introduces version
+// routing: a spec is dispatched to the schema whose Major matches the
+// spec's version major component.
+type embeddedSchema struct {
+	Major int
+	Path  string
+}
 
-// embeddedSchemaHash is the hex-encoded SHA-256 of the canonical JSON
-// bytes of the embedded workflow-v0 schema. Computed once at init so
-// /healthz can serve it cheaply.
-var embeddedSchemaHash = computeSchemaHash()
+// embeddedSchemas is the version routing table. Adding a major version
+// (workflow-v2…) means embedding its schema above and appending an
+// entry here — the routing in ParseBytes and the per-major hashes flow
+// from this list.
+var embeddedSchemas = []embeddedSchema{
+	{Major: 0, Path: "schemas/workflow-v0.schema.json"},
+	{Major: 1, Path: "schemas/workflow-v1.schema.json"},
+}
 
-func computeSchemaHash() string {
-	const path = "schemas/workflow-v0.schema.json"
-	data, err := schemaFS.ReadFile(path)
-	if err != nil {
-		panic(fmt.Sprintf("spec: read embedded schema for hash %s: %v", path, err))
+// compiledSchemas maps a version major to its compiled JSON Schema.
+// Compiled once at package init; if any embedded schema is malformed we
+// want to crash loudly at process start, not on the first Parse call.
+var compiledSchemas = mustCompileSchemas()
+
+// embeddedSchemaHashes maps a version major to the hex-encoded SHA-256
+// of that schema's canonical JSON bytes. Computed once at init so
+// /healthz can serve each per-major hash cheaply.
+var embeddedSchemaHashes = computeSchemaHashes()
+
+// supportedMajors lists the routable version majors in ascending order,
+// for the fail-closed error message naming what is supported.
+var supportedMajors = computeSupportedMajors()
+
+func computeSupportedMajors() []int {
+	majors := make([]int, 0, len(embeddedSchemas))
+	for _, es := range embeddedSchemas {
+		majors = append(majors, es.Major)
 	}
-	var raw any
-	if err := json.Unmarshal(data, &raw); err != nil {
-		panic(fmt.Sprintf("spec: parse embedded schema for hash %s: %v", path, err))
+	sort.Ints(majors)
+	return majors
+}
+
+func computeSchemaHashes() map[int]string {
+	out := make(map[int]string, len(embeddedSchemas))
+	for _, es := range embeddedSchemas {
+		data, err := schemaFS.ReadFile(es.Path)
+		if err != nil {
+			panic(fmt.Sprintf("spec: read embedded schema for hash %s: %v", es.Path, err))
+		}
+		var raw any
+		if err := json.Unmarshal(data, &raw); err != nil {
+			panic(fmt.Sprintf("spec: parse embedded schema for hash %s: %v", es.Path, err))
+		}
+		canonical, err := json.Marshal(raw)
+		if err != nil {
+			panic(fmt.Sprintf("spec: re-marshal embedded schema for hash %s: %v", es.Path, err))
+		}
+		sum := sha256.Sum256(canonical)
+		out[es.Major] = hex.EncodeToString(sum[:])
 	}
-	canonical, err := json.Marshal(raw)
-	if err != nil {
-		panic(fmt.Sprintf("spec: re-marshal embedded schema for hash %s: %v", path, err))
-	}
-	sum := sha256.Sum256(canonical)
-	return hex.EncodeToString(sum[:])
+	return out
 }
 
 // EmbeddedSchemaHash returns the hex-encoded SHA-256 of the canonical JSON
 // bytes of the embedded workflow-v0 schema. Callers use this to detect
-// schema drift between components at startup.
-func EmbeddedSchemaHash() string { return embeddedSchemaHash }
+// schema drift between components at startup. Retained for back-compat;
+// EmbeddedSchemaHashV1 advertises the v1 hash alongside it.
+func EmbeddedSchemaHash() string { return embeddedSchemaHashes[0] }
 
-func mustCompileSchema() *jsonschema.Schema {
-	const path = "schemas/workflow-v0.schema.json"
+// EmbeddedSchemaHashV1 returns the hex-encoded SHA-256 of the canonical
+// JSON bytes of the embedded workflow-v1 schema (ADR-046). /healthz
+// advertises it next to the v0 hash so a component can detect v1 drift.
+func EmbeddedSchemaHashV1() string { return embeddedSchemaHashes[1] }
+
+func mustCompileSchemas() map[int]*jsonschema.Schema {
+	out := make(map[int]*jsonschema.Schema, len(embeddedSchemas))
+	for _, es := range embeddedSchemas {
+		out[es.Major] = mustCompileSchema(es.Path)
+	}
+	return out
+}
+
+func mustCompileSchema(path string) *jsonschema.Schema {
 	data, err := schemaFS.ReadFile(path)
 	if err != nil {
 		panic(fmt.Sprintf("spec: read embedded schema %s: %v", path, err))
@@ -61,15 +110,65 @@ func mustCompileSchema() *jsonschema.Schema {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		panic(fmt.Sprintf("spec: parse embedded schema %s: %v", path, err))
 	}
+	// Resource name = the basename, so the two majors register under
+	// distinct names (workflow-v0.schema.json vs workflow-v1.schema.json)
+	// and the v6 compiler holds them independently in one process.
+	resource := path
+	if idx := strings.LastIndex(resource, "/"); idx >= 0 {
+		resource = resource[idx+1:]
+	}
 	c := jsonschema.NewCompiler()
-	if err := c.AddResource("workflow-v0.schema.json", raw); err != nil {
+	if err := c.AddResource(resource, raw); err != nil {
 		panic(fmt.Sprintf("spec: register embedded schema %s: %v", path, err))
 	}
-	s, err := c.Compile("workflow-v0.schema.json")
+	s, err := c.Compile(resource)
 	if err != nil {
 		panic(fmt.Sprintf("spec: compile embedded schema %s: %v", path, err))
 	}
 	return s
+}
+
+// schemaForVersion routes a spec's raw version string to its compiled
+// schema by major component. A missing / non-string / unparseable
+// version falls through to the v0 schema, which then emits the existing
+// required-version / enum SchemaError — so a malformed version never
+// silently passes. A well-formed but unsupported major (>= 2) fails
+// closed with a *SchemaError naming the supported majors.
+func schemaForVersion(raw any) (*jsonschema.Schema, error) {
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return compiledSchemas[0], nil
+	}
+	vs, ok := m["version"].(string)
+	if !ok {
+		return compiledSchemas[0], nil
+	}
+	majorPart := vs
+	if idx := strings.IndexByte(majorPart, '.'); idx >= 0 {
+		majorPart = majorPart[:idx]
+	}
+	major, err := strconv.Atoi(majorPart)
+	if err != nil {
+		return compiledSchemas[0], nil
+	}
+	s, ok := compiledSchemas[major]
+	if !ok {
+		return nil, &SchemaError{
+			Path:    "/version",
+			Message: fmt.Sprintf("unsupported spec version %q: major %d is not recognized (supported majors: %s)", vs, major, formatMajors(supportedMajors)),
+		}
+	}
+	return s, nil
+}
+
+// formatMajors renders the supported-majors list as a comma-separated
+// string (e.g. "0, 1") for the fail-closed error message.
+func formatMajors(majors []int) string {
+	parts := make([]string, len(majors))
+	for i, m := range majors {
+		parts[i] = strconv.Itoa(m)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // Parse reads YAML from r, validates it against the workflow-v0 JSON
@@ -105,7 +204,15 @@ func ParseBytes(data []byte) (*Spec, error) {
 		return nil, &YAMLError{Msg: err.Error(), Cause: err}
 	}
 
-	if err := compiledSchema.Validate(raw); err != nil {
+	// Route to the schema for the spec's version major (ADR-046). A
+	// missing/unparseable version falls through to v0 so the existing
+	// required-version error is preserved; an unsupported major fails
+	// closed naming the supported majors.
+	schema, err := schemaForVersion(raw)
+	if err != nil {
+		return nil, err
+	}
+	if err := schema.Validate(raw); err != nil {
 		var verr *jsonschema.ValidationError
 		if errors.As(err, &verr) {
 			return nil, schemaErrorFrom(verr)

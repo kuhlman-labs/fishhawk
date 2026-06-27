@@ -1,0 +1,682 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fishhawk.dev/spec/workflow-v1.schema.json",
+  "title": "Fishhawk workflow spec v1",
+  "description": "Schema for .fishhawk/workflows.yaml at major version 1. v1 begins as a STRUCTURAL COPY of workflow-v0 (ADR-046 / #1380): the $defs and properties are byte-for-byte identical to workflow-v0.schema.json and the only differences are $id, title, and the version enum. No deploy content has been added yet \u2014 v1-specific grammar is deferred to E23.2. The version-routed validator dispatches on the version major (0.x -> this schema's sibling workflow-v0; 1.x -> this schema). Never break a published schema in place \u2014 bump the major instead.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "workflows"
+  ],
+  "properties": {
+    "version": {
+      "type": "string",
+      "enum": [
+        "1.0"
+      ],
+      "description": "Spec syntax version. workflow-v1 currently advertises exactly 1.0, a structural copy of the latest workflow-v0 grammar (no deploy content yet; deferred to E23.2). The validator routes a spec to this schema when its version major is 1. Old specs in the audit log remain readable forever via their historical schemas; this enum gates *new* v1 specs only."
+    },
+    "roles": {
+      "type": "object",
+      "description": "Named roles referenced by gate approvers. Keys are snake_case identifiers; values list GitHub user/team refs.",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[a-z][a-z0-9_]*$": {
+          "$ref": "#/$defs/role"
+        }
+      }
+    },
+    "workflows": {
+      "type": "object",
+      "description": "Named workflows. Keys are snake_case identifiers (e.g. feature_change). At least one workflow must be defined.",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[a-z][a-z0-9_]*$": {
+          "$ref": "#/$defs/workflow"
+        }
+      }
+    },
+    "test_conventions": {
+      "type": "array",
+      "description": "Optional per-repo test-location conventions that generalize the plan-gate test sweep (#1004) beyond the built-in Go (name.go -> name_test.go) and colocated-TypeScript defaults. Each entry maps production files matching a glob to candidate test-file path templates. Declared entries are ADDITIVE to the built-in defaults (Go + colocated TS stay covered regardless), so a repo typically declares only its Python / Ruby / parallel-tree conventions. Advisory-only and fail-open: the sweep never blocks a plan. Additive optional field within workflow-v0.x \u2014 accepted at every advertised version.",
+      "items": {
+        "$ref": "#/$defs/test_convention"
+      }
+    }
+  },
+  "$defs": {
+    "test_convention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "match",
+        "candidates"
+      ],
+      "description": "One test-location convention: a production file whose repo-relative path matches `match` is expected to have a test at one of `candidates`. The plan-gate test sweep (#1004) flags an existing candidate test that is absent from the plan's scope.files.",
+      "properties": {
+        "match": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Doublestar glob (bmatcuk/doublestar/v4 semantics; `**` crosses directory separators) matched against the repo-relative production-file path, e.g. `**/*.go`, `**/*.{ts,tsx}`, `src/**/*.py`. A scoped file whose basename also matches a candidate's test-file shape is treated as a test, not a production file."
+        },
+        "candidates": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Candidate test-file path templates for a matched production file. Template variables: `{dir}` (the production file's directory), `{name}` (basename without its final extension), `{ext}` (final extension without the leading dot), `{relpath}` (full repo-relative path without its final extension). Examples: `{dir}/{name}_test.go`, `tests/test_{name}.py`, `spec/{relpath}_spec.rb`. The sweep reports a candidate that exists on the base ref but is missing from scope.files."
+        }
+      }
+    },
+    "role": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "members"
+      ],
+      "properties": {
+        "members": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/member-ref"
+          }
+        }
+      }
+    },
+    "member-ref": {
+      "type": "string",
+      "pattern": "^@[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?$",
+      "description": "GitHub user (@user) or team (@org/team) reference. Resolved against the GitHub App installation at run time."
+    },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stages"
+      ],
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "stages": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/stage"
+          }
+        },
+        "on_ci_failure": {
+          "$ref": "#/$defs/on_ci_failure"
+        },
+        "policy": {
+          "$ref": "#/$defs/policy"
+        },
+        "drive": {
+          "type": "boolean",
+          "description": "Opt-in drive mode (#1023 / #996 theme 1): when true, fishhawkd auto-advances the run's mechanical transitions (plan-approved dispatch, review-verdict settlement, fixup re-park, checks-green awaiting_merge) and records a run_auto_advanced audit entry per advance. Judgment points (gate approvals, concern routing, merge) always park. Default false preserves operator-driven advancement. Overridable per-run via POST /v0/runs `drive`. Additive within workflow-v0.x."
+        },
+        "budgets": {
+          "type": "array",
+          "description": "Periodic per-workflow cost ceilings (ADR-030 / #688). Each entry caps total USD spend across all runs of this workflow within a calendar period, resetting at the period boundary. Distinct from the per-stage `budget` ($defs/budget: token/runtime caps on one stage execution). Requires version 0.4+.",
+          "items": {
+            "$ref": "#/$defs/periodic_budget"
+          }
+        },
+        "operator_agent": {
+          "$ref": "#/$defs/operator_agent"
+        },
+        "decomposition": {
+          "$ref": "#/$defs/decomposition"
+        }
+      }
+    },
+    "decomposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Per-workflow decomposition controls (E24.6 / #1146). Requires version 0.6+.",
+      "properties": {
+        "max_parallel": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Maximum number of decomposed child runs that may dispatch concurrently for a run of this workflow. 0 = unlimited. Per-workflow override of the global FISHHAWKD_MAX_PARALLEL_CHILDREN; when > 0 it wins, otherwise the global default applies. This declares the cap; concurrency throttling that consumes it lands in E24.3 (#1143)."
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Per-workflow execution policy.",
+      "properties": {
+        "max_stage_runtime": {
+          "type": "string",
+          "pattern": "^([0-9]+(ns|us|ms|s|m|h))+$",
+          "description": "Default wall-clock cap for every agent stage in the workflow. Overridable per-stage via executor.timeout. Parsed by time.ParseDuration. Resolved by spec.ResolveStageTimeout on the backend and delivered to the runner via agent_timeout_seconds on the prompt-fetch response."
+        }
+      }
+    },
+    "on_ci_failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Auto-retry policy when a required CI check fails on the implement stage's PR (#276 / E16). The dispatcher fires a fresh implement workflow_dispatch up to `max_retries` times, threading the new run via `parent_run_id` (#216). Only the closed set of failing conclusions in stagecheck.DeriveState triggers a retry; `fishhawk_audit_complete` failures are explicitly excluded \u2014 retrying won't fix Fishhawk's own audit gaps.",
+      "properties": {
+        "max_retries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5,
+          "description": "Bound on the retry chain length. 1 (the default when the field is absent) means \"on CI failure, dispatch one more run, total agent-touch count 2.\" 0 disables auto-retries \u2014 useful for low-autonomy workflows that prefer a human re-trigger. Capped at 5 to keep runaway loops contained in v0."
+        }
+      }
+    },
+    "stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "type",
+        "executor"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "description": "Unique within the parent workflow. Referenced by inputs.from_stage."
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "plan",
+            "implement",
+            "review"
+          ],
+          "description": "v0 closed set. Custom stage types are deliberately disallowed."
+        },
+        "executor": {
+          "$ref": "#/$defs/executor"
+        },
+        "inputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/input"
+          }
+        },
+        "produces": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/produces"
+          }
+        },
+        "constraints": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/constraint"
+          }
+        },
+        "budget": {
+          "$ref": "#/$defs/budget"
+        },
+        "gates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/gate"
+          }
+        },
+        "reviewers": {
+          "$ref": "#/$defs/reviewers_config"
+        }
+      }
+    },
+    "executor": {
+      "type": "object",
+      "description": "Exactly one of agent (string) or human (true).",
+      "unevaluatedProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "agent"
+          ],
+          "properties": {
+            "agent": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Agent identifier. v0 ships claude-code (default) and codex (the OpenAI Codex CLI); v0.x later adds cursor and copilot. The runner resolves this free-form string to a coding-agent adapter \u2014 see runner/README.md 'Choosing the coding agent' for provider setup (the OPENAI_API_KEY secret for codex)."
+            },
+            "model": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Optional model override for this stage's agent invocation (#1013). One rung of the implement-model resolution ladder: deployment default < this executor.model < plan model_recommendation < operator gate decision. Empty/absent falls through to the next-lower rung (ultimately the deployment default spawn). The resolved model is validated against the deployment's per-adapter allowed-model set at the approval gate. Additive optional field within workflow-v0.x \u2014 accepted at every advertised version."
+            },
+            "timeout": {
+              "type": "string",
+              "pattern": "^([0-9]+(ns|us|ms|s|m|h))+$",
+              "description": "Wall-clock cap for this stage's agent invocation. Overrides workflow.policy.max_stage_runtime when set. Falls back to the workflow policy or the backend default (15m) when absent. Parsed by time.ParseDuration."
+            },
+            "verify": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "command"
+              ],
+              "description": "Optional in-band test gate. When present, the runner executes the command after the agent exits cleanly. Non-zero exit demotes the run to category-A before the bundle is committed.",
+              "properties": {
+                "command": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Shell command run as the verify gate (executed via sh -c). Non-zero exit code demotes the run to category-A."
+                },
+                "timeout": {
+                  "type": "string",
+                  "pattern": "^([0-9]+(ns|us|ms|s|m|h))+$",
+                  "description": "Wall-clock cap on the verify command. Parsed by time.ParseDuration. Defaults to 10m when absent."
+                },
+                "max_iterations": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "default": 0,
+                  "description": "0 (default) preserves today's single-shot demote-on-failure verify gate; >0 enables a bounded evaluator-optimizer fix loop run against the committed scope-only tree, capping the TOTAL verify-fix agent invocations across the stage at this value. Worst-case wall clock is bounded by (max_iterations+1) x executor.timeout plus (max_iterations+1) x verify.timeout; max_iterations is the control surface and ties to the periodic cost budget (ADR-030)."
+                }
+              }
+            },
+            "agent_self_retry": {
+              "type": "boolean",
+              "description": "Opt-in flag (default false, per ADR-023) that tells the runner to allow the agent one self-initiated retry when it detects a recoverable failure before yielding to the workflow's on_ci_failure policy. Only meaningful on agent-executed stages; setting it on a human executor is a schema error (the field is declared in the agent branch only, so unevaluatedProperties rejects it on the human branch)."
+            }
+          }
+        },
+        {
+          "required": [
+            "human"
+          ],
+          "properties": {
+            "human": {
+              "type": "boolean",
+              "const": true
+            }
+          }
+        }
+      ]
+    },
+    "input": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "oneOf": [
+        {
+          "description": "Trigger input from outside the workflow (an issue, a PR).",
+          "required": [
+            "source"
+          ],
+          "properties": {
+            "source": {
+              "type": "string",
+              "enum": [
+                "github_issue",
+                "pull_request"
+              ]
+            },
+            "required": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "description": "Artifact input from a prior stage in the same run.",
+          "required": [
+            "artifact",
+            "from_stage"
+          ],
+          "properties": {
+            "artifact": {
+              "type": "string",
+              "enum": [
+                "plan",
+                "pull_request"
+              ]
+            },
+            "from_stage": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]*$"
+            }
+          }
+        }
+      ]
+    },
+    "produces": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact"
+      ],
+      "properties": {
+        "artifact": {
+          "type": "string",
+          "enum": [
+            "plan",
+            "pull_request"
+          ],
+          "description": "v0 closed set. Custom artifacts deferred."
+        },
+        "schema": {
+          "type": "string",
+          "description": "Artifact schema version (e.g. standard_v1 for plan)."
+        },
+        "persistence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/persistence"
+          }
+        }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target",
+        "mode"
+      ],
+      "properties": {
+        "target": {
+          "type": "string",
+          "enum": [
+            "originating_issue",
+            "fishhawk_audit_log"
+          ]
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "rendered_comment",
+            "canonical"
+          ],
+          "description": "rendered_comment: posted as a formatted comment on the target. canonical: stored as the authoritative copy in the audit log."
+        },
+        "update_on_change": {
+          "type": "boolean",
+          "description": "Re-publish to the target if the artifact is regenerated."
+        }
+      }
+    },
+    "constraint": {
+      "type": "object",
+      "description": "Exactly one constraint kind per object. Closed set per MVP_SPEC \u00a74.1.",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "maxProperties": 1,
+      "properties": {
+        "max_files_changed": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "forbidden_paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Glob patterns (gitignore-style) that the stage's diff must not touch."
+        },
+        "allowed_paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Glob patterns; the stage's diff must touch only these paths."
+        },
+        "required_outcomes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "tests_added_or_updated",
+              "ci_green"
+            ]
+          }
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_runtime_minutes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "enforcement": {
+          "type": "string",
+          "enum": [
+            "advisory",
+            "blocking"
+          ],
+          "description": "v0 ships advisory only; blocking arrives in v0.x with the Fishhawk-issued ephemeral key path."
+        }
+      }
+    },
+    "periodic_budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "period",
+        "limit_usd"
+      ],
+      "description": "A workflow-level recurring cost ceiling (ADR-030 / #688). Caps aggregate USD spend across all runs of the workflow within a calendar period. Distinct from the per-stage `budget` def, which caps token/runtime on a single stage execution.",
+      "properties": {
+        "period": {
+          "type": "string",
+          "enum": [
+            "weekly",
+            "monthly"
+          ],
+          "description": "Calendar reset cadence. weekly resets at the start of the ISO week; monthly resets on the first of the month. Boundaries are timezone-aware."
+        },
+        "limit_usd": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Cost ceiling in USD for the period, summed from runs.cost_usd_total across the workflow's runs created within the current period."
+        },
+        "enforcement": {
+          "type": "string",
+          "enum": [
+            "advisory",
+            "blocking"
+          ],
+          "description": "advisory (default): emit a budget_alert audit entry + issue comment on warn_at and 100% crossings; never blocks. blocking: refuse a NEW run at admission once the period spend exhausts limit_usd; in-flight runs are untouched and an operator can override."
+        },
+        "warn_at": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Optional fraction in [0,1] (e.g. 0.8 for 80%) at which an advisory warning fires ahead of the 100% crossing. Absent means only the 100% threshold is surfaced."
+        }
+      }
+    },
+    "gate": {
+      "type": "object",
+      "unevaluatedProperties": false,
+      "required": [
+        "type"
+      ],
+      "oneOf": [
+        {
+          "description": "Approval gate \u2014 blocks until an approver acts.",
+          "required": [
+            "type",
+            "approvers"
+          ],
+          "properties": {
+            "type": {
+              "const": "approval"
+            },
+            "approvers": {
+              "$ref": "#/$defs/approvers"
+            },
+            "sla": {
+              "type": "string",
+              "description": "SLA before timeout fires a category-D failure (e.g. '4_business_hours', '24_hours')."
+            },
+            "operator_agent": {
+              "$ref": "#/$defs/operator_agent"
+            }
+          }
+        },
+        {
+          "description": "Check gate \u2014 placeholder for workflows that delegate to GitHub branch protection (ADR-017 / #249). Carries no fields in v0.2; the merge-readiness signal lives in branch protection / rulesets, not in the spec.",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "const": "check"
+            }
+          }
+        }
+      ]
+    },
+    "operator_agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Delegation knobs for the operator agent (ADR-040 / #1026). Each may_* knob names the single backend-evaluable condition under which the operator agent may take that action without paging the human; the per-knob enums are a closed set \u2014 the backend must be able to answer every condition from run state. Absent block (and absent knob) = fail-closed: nothing is delegated, every judgment pages the human. Declarable at workflow level (default for all gates) and on an approval gate (per-gate override; a gate-level block wins WHOLESALE over the workflow block \u2014 knobs are not merged). Authority semantics (ADR-027) are unchanged: delegation changes who may act, not what gates exist. Requires version 0.5+.",
+      "properties": {
+        "may_approve": {
+          "type": "string",
+          "enum": [
+            "clean_dual_approval"
+          ],
+          "description": "The operator agent may approve a gate when every configured reviewer for the gated stage returned an approve verdict and zero concerns are open."
+        },
+        "may_route_fixup": {
+          "type": "string",
+          "enum": [
+            "convergent_concerns"
+          ],
+          "description": "The operator agent may route review concerns to a fixup when all reviewer verdicts are in, at least one concern is open, and no reviewer rejected."
+        },
+        "may_waive": {
+          "type": "string",
+          "enum": [
+            "solo_low"
+          ],
+          "description": "The operator agent may waive a concern when it is the only open concern and its severity is low."
+        },
+        "may_retry": {
+          "type": "string",
+          "enum": [
+            "infra_flake"
+          ],
+          "description": "The operator agent may retry a failed stage when the latest stage failure is classified as an infrastructure flake."
+        },
+        "may_merge": {
+          "type": "string",
+          "enum": [
+            "gates_resolved_ci_green"
+          ],
+          "description": "The operator agent may merge when no gate approvals are pending, zero concerns are open, the PR is open, and required checks are green. Evaluated and surfaced in v0; merge itself happens on GitHub, so backend enforcement attaches once a merge action surface exists."
+        },
+        "must_page_human": {
+          "type": "array",
+          "uniqueItems": true,
+          "description": "Events that always page the human regardless of the may_* knobs. Closed v0 set; an event listed here is never absorbed by a delegation. The reviewer-reject taxonomy carries three tokens: the explicit advisory_reviewer_reject (an agent reject under advisory review authority \u2014 arbitrable / auto-routed) and gating_reviewer_reject (an agent reject under gating authority \u2014 pages the human), plus the legacy bare reviewer_reject, which is preserved and maps to the gating class for back-compat (requires version 0.7+ for the explicit tokens).",
+          "items": {
+            "type": "string",
+            "enum": [
+              "reviewer_reject",
+              "advisory_reviewer_reject",
+              "gating_reviewer_reject",
+              "plan_rejection",
+              "scope_amendment",
+              "budget_override",
+              "policy_override",
+              "exception_request",
+              "requirement_arbitration",
+              "clarification_request"
+            ]
+          }
+        }
+      }
+    },
+    "approvers": {
+      "type": "object",
+      "description": "Either any_of (one approver suffices) or all_of (every named role must approve).",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "maxProperties": 1,
+      "properties": {
+        "any_of": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          }
+        },
+        "all_of": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          }
+        }
+      }
+    },
+    "reviewers_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Plan-review reviewer counts for plan stages (ADR-027). Authority table: agent>0 && human==0 \u2192 gating (agent rejections block stage advancement); agent>0 && human>0 \u2192 advisory (agent verdicts surfaced, cannot block human approval); agent==0 \u2192 gateless. The effective agent count is len(agents) when the `agents` list is present and non-empty, else the bare `agent` integer. When the reviewers block is absent entirely, the backend defaults to {human:1} \u2014 preserving pre-ADR-027 behavior.",
+      "properties": {
+        "agent": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of agent reviewers to invoke after the plan artifact is validated. 0 (default) means no agent review. Superseded by `agents` when that list is present and non-empty; each invocation then uses the deployment's precedence-selected default adapter."
+        },
+        "agents": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Heterogeneous agent reviewers (#955): one entry per reviewer invocation, each naming its provider and optionally its model. When present and non-empty this list supersedes the bare `agent` integer count \u2014 the effective agent count for the ADR-027 authority table is len(agents). Authority semantics are unchanged: heterogeneity changes WHO reviews, not gating semantics.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "provider"
+            ],
+            "properties": {
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "anthropic",
+                  "claudecode",
+                  "codex"
+                ],
+                "description": "Reviewer adapter to invoke. Must be configured in the deployment (FISHHAWKD_ANTHROPIC_API_KEY / FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER / FISHHAWKD_ENABLE_CODEX_REVIEWER); a gating stage naming an unconfigured provider fails dispatch up front."
+              },
+              "model": {
+                "type": "string",
+                "description": "Model identifier passed to the adapter. Empty/absent falls back to the provider's deployment-configured default model."
+              }
+            }
+          }
+        },
+        "human": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of human approvers required. 0 means no human approval gate for this plan stage."
+        }
+      }
+    }
+  }
+}

@@ -1,7 +1,15 @@
 // Package spec validates `.fishhawk/workflows.yaml` files locally
-// against the workflow-v0 JSON Schema (the same one
-// docs/spec/workflow-v0.schema.json defines and CI enforces in
-// sync with the backend's copy).
+// against the version-routed workflow JSON Schemas (the same
+// docs/spec/workflow-v*.schema.json files CI enforces in sync with
+// the backend's copies).
+//
+// Version routing (ADR-046): both the workflow-v0 and workflow-v1
+// schemas are embedded and compiled at init. ValidateBytes reads the
+// spec's version, parses its major component, and validates against
+// the schema for that major (0.x -> v0, 1.x -> v1). A
+// missing/unparseable version falls through to the v0 schema so the
+// existing required-version error is preserved; a well-formed but
+// unsupported major (>= 2) fails closed naming the supported majors.
 //
 // Why this lives in cli/ and not backend/internal/spec: the Go
 // modules are separate, and a cross-module import would couple
@@ -25,40 +33,124 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"gopkg.in/yaml.v3"
 )
 
-//go:embed schemas/workflow-v0.schema.json
+//go:embed schemas/workflow-v0.schema.json schemas/workflow-v1.schema.json
 var schemaFS embed.FS
 
-const schemaPath = "schemas/workflow-v0.schema.json"
+// embeddedSchema names one embedded canonical schema and the spec
+// version major it validates (ADR-046 version routing).
+type embeddedSchema struct {
+	Major int
+	Path  string
+}
 
-// compiledSchema is the JSON Schema compiled at package init.
-// Failing here panics so a malformed embedded copy is caught at
+// embeddedSchemas is the version routing table. Adding a major
+// version means embedding its schema above and appending an entry
+// here; the routing in ValidateBytes flows from this list.
+var embeddedSchemas = []embeddedSchema{
+	{Major: 0, Path: "schemas/workflow-v0.schema.json"},
+	{Major: 1, Path: "schemas/workflow-v1.schema.json"},
+}
+
+// compiledSchemas maps a version major to its compiled JSON Schema.
+// Compiled at package init; a malformed embedded copy panics here, at
 // process start, not the first ValidateBytes call.
-var compiledSchema = mustCompileSchema()
+var compiledSchemas = mustCompileSchemas()
 
-func mustCompileSchema() *jsonschema.Schema {
-	data, err := schemaFS.ReadFile(schemaPath)
+// supportedMajors lists the routable majors ascending, for the
+// fail-closed error naming what is supported.
+var supportedMajors = computeSupportedMajors()
+
+func computeSupportedMajors() []int {
+	majors := make([]int, 0, len(embeddedSchemas))
+	for _, es := range embeddedSchemas {
+		majors = append(majors, es.Major)
+	}
+	sort.Ints(majors)
+	return majors
+}
+
+func mustCompileSchemas() map[int]*jsonschema.Schema {
+	out := make(map[int]*jsonschema.Schema, len(embeddedSchemas))
+	for _, es := range embeddedSchemas {
+		out[es.Major] = mustCompileSchema(es.Path)
+	}
+	return out
+}
+
+func mustCompileSchema(path string) *jsonschema.Schema {
+	data, err := schemaFS.ReadFile(path)
 	if err != nil {
-		panic(fmt.Sprintf("spec: read embedded schema %s: %v", schemaPath, err))
+		panic(fmt.Sprintf("spec: read embedded schema %s: %v", path, err))
 	}
 	var raw any
 	if err := json.Unmarshal(data, &raw); err != nil {
-		panic(fmt.Sprintf("spec: parse embedded schema %s: %v", schemaPath, err))
+		panic(fmt.Sprintf("spec: parse embedded schema %s: %v", path, err))
+	}
+	// Resource name = the basename so the two majors register under
+	// distinct names and the v6 compiler holds them independently.
+	resource := path
+	if idx := strings.LastIndex(resource, "/"); idx >= 0 {
+		resource = resource[idx+1:]
 	}
 	c := jsonschema.NewCompiler()
-	if err := c.AddResource("workflow-v0.schema.json", raw); err != nil {
-		panic(fmt.Sprintf("spec: register embedded schema %s: %v", schemaPath, err))
+	if err := c.AddResource(resource, raw); err != nil {
+		panic(fmt.Sprintf("spec: register embedded schema %s: %v", path, err))
 	}
-	s, err := c.Compile("workflow-v0.schema.json")
+	s, err := c.Compile(resource)
 	if err != nil {
-		panic(fmt.Sprintf("spec: compile embedded schema %s: %v", schemaPath, err))
+		panic(fmt.Sprintf("spec: compile embedded schema %s: %v", path, err))
 	}
 	return s
+}
+
+// schemaForVersion routes a spec's raw decoded document to its
+// compiled schema by version major. A missing / non-string /
+// unparseable version falls through to the v0 schema (preserving the
+// existing required-version error); a well-formed but unsupported
+// major (>= 2) fails closed with a *ValidationError naming the
+// supported majors.
+func schemaForVersion(raw any) (*jsonschema.Schema, error) {
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return compiledSchemas[0], nil
+	}
+	vs, ok := m["version"].(string)
+	if !ok {
+		return compiledSchemas[0], nil
+	}
+	majorPart := vs
+	if idx := strings.IndexByte(majorPart, '.'); idx >= 0 {
+		majorPart = majorPart[:idx]
+	}
+	major, err := strconv.Atoi(majorPart)
+	if err != nil {
+		return compiledSchemas[0], nil
+	}
+	s, ok := compiledSchemas[major]
+	if !ok {
+		return nil, &ValidationError{Errors: []ValidationErrorEntry{{
+			Path:    "/version",
+			Message: fmt.Sprintf("unsupported spec version %q: major %d is not recognized (supported majors: %s)", vs, major, formatMajors(supportedMajors)),
+		}}}
+	}
+	return s, nil
+}
+
+// formatMajors renders the supported-majors list (e.g. "0, 1").
+func formatMajors(majors []int) string {
+	parts := make([]string, len(majors))
+	for i, m := range majors {
+		parts[i] = strconv.Itoa(m)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // ValidationError is the shape ValidateBytes returns on schema
@@ -103,9 +195,10 @@ type ParseError struct {
 func (e *ParseError) Error() string { return "spec: " + e.Msg }
 
 // ValidateBytes parses data as YAML and validates the resulting
-// document against the workflow-v0 schema. Returns a *ParseError
-// for empty / malformed YAML, a *ValidationError for schema
-// failures, and nil on success.
+// document against the version-routed workflow schema (v0 or v1, by
+// the spec's version major; ADR-046). Returns a *ParseError for
+// empty / malformed YAML, a *ValidationError for schema failures
+// (including an unsupported version major), and nil on success.
 func ValidateBytes(data []byte) error {
 	if len(bytes.TrimSpace(data)) == 0 {
 		return &ParseError{Msg: "empty document"}
@@ -124,7 +217,12 @@ func ValidateBytes(data []byte) error {
 		return &ParseError{Msg: err.Error()}
 	}
 
-	if err := compiledSchema.Validate(raw); err != nil {
+	// Route to the schema for the spec's version major (ADR-046).
+	schema, err := schemaForVersion(raw)
+	if err != nil {
+		return err
+	}
+	if err := schema.Validate(raw); err != nil {
 		var verr *jsonschema.ValidationError
 		if errors.As(err, &verr) {
 			return validationErrorFrom(verr)

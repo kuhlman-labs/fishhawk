@@ -97,6 +97,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Schemas: map[string]string{
 			"plan-standard-v1": plan.EmbeddedSchemaHash(),
 			"workflow-v0":      spec.EmbeddedSchemaHash(),
+			"workflow-v1":      spec.EmbeddedSchemaHashV1(),
 		},
 		StartNonce: s.cfg.StartNonce,
 	}

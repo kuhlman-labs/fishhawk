@@ -1,6 +1,7 @@
 package spec_test
 
 import (
+	"encoding/hex"
 	"errors"
 	"os"
 	"strings"
@@ -1681,5 +1682,83 @@ func TestEffectiveMaxParallel_NilReceiver(t *testing.T) {
 	var wf *spec.Workflow
 	if got := wf.EffectiveMaxParallel(6); got != 6 {
 		t.Errorf("EffectiveMaxParallel on nil receiver = %d, want 6", got)
+	}
+}
+
+// --- Version routing (ADR-046 / #1381) ---
+
+// minimalSpecAtVersion renders the smallest valid spec body at the
+// given version string, used to exercise the version-routed validator
+// without coupling to a testdata fixture's frozen version.
+func minimalSpecAtVersion(version string) []byte {
+	return []byte("version: \"" + version + "\"\n" + `
+workflows:
+  trivial:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`)
+}
+
+// TestParse_RoutesV1Spec proves a version: "1.0" spec routes to the v1
+// schema and is accepted (the v1-accepts branch).
+func TestParse_RoutesV1Spec(t *testing.T) {
+	s, err := spec.ParseBytes(minimalSpecAtVersion("1.0"))
+	if err != nil {
+		t.Fatalf("ParseBytes(version 1.0): %v", err)
+	}
+	if s.Version != "1.0" {
+		t.Errorf("version = %q, want 1.0", s.Version)
+	}
+}
+
+// TestParse_RoutesV0Spec proves a version the v0 enum accepts ("0.7",
+// the current latest) routes to v0 AND validates against it (the
+// v0-routes branch — confirmed in the v0 enum so the pass is unambiguous).
+func TestParse_RoutesV0Spec(t *testing.T) {
+	s, err := spec.ParseBytes(minimalSpecAtVersion("0.7"))
+	if err != nil {
+		t.Fatalf("ParseBytes(version 0.7): %v", err)
+	}
+	if s.Version != "0.7" {
+		t.Errorf("version = %q, want 0.7", s.Version)
+	}
+}
+
+// TestParse_UnsupportedMajorFailsClosed proves a well-formed but
+// unrecognized major (2.0) fails closed with a *SchemaError naming the
+// supported majors (the fail-closed-on-unknown-major branch).
+func TestParse_UnsupportedMajorFailsClosed(t *testing.T) {
+	_, err := spec.ParseBytes(minimalSpecAtVersion("2.0"))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+	// The message must name the supported majors so an operator knows
+	// what is routable.
+	for _, want := range []string{"0", "1"} {
+		if !strings.Contains(se.Message, want) {
+			t.Errorf("message %q does not name supported major %q", se.Message, want)
+		}
+	}
+}
+
+// TestEmbeddedSchemaHashV1 proves the v1 hash advertised on /healthz is
+// a non-empty hex string distinct from the v0 hash (the two schemas
+// differ by $id/title/version enum, so their hashes must differ).
+func TestEmbeddedSchemaHashV1(t *testing.T) {
+	h := spec.EmbeddedSchemaHashV1()
+	if h == "" {
+		t.Fatal("EmbeddedSchemaHashV1() is empty")
+	}
+	if _, err := hex.DecodeString(h); err != nil {
+		t.Errorf("EmbeddedSchemaHashV1() = %q is not hex: %v", h, err)
+	}
+	if h == spec.EmbeddedSchemaHash() {
+		t.Error("v1 hash equals v0 hash; the structural-copy schemas must still differ by $id/title/version")
 	}
 }

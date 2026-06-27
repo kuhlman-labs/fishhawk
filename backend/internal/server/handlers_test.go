@@ -45,6 +45,9 @@ func TestHandleHealth(t *testing.T) {
 	if body.Schemas["workflow-v0"] == "" {
 		t.Error("schemas[workflow-v0] must not be empty")
 	}
+	if body.Schemas["workflow-v1"] == "" {
+		t.Error("schemas[workflow-v1] must not be empty")
+	}
 
 	// Wire-level omission pin (#1018): with no StartNonce configured, the
 	// RAW body must not carry the key at all (omitempty), so a pre-nonce

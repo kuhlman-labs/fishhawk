@@ -212,6 +212,23 @@ func TestEvaluateSurfaceSweep(t *testing.T) {
 			},
 		},
 		{
+			// ADR-046 / #1381: a canonical workflow-v1 schema edited with its
+			// backend mirror but not the cli mirror flags the missing cli copy
+			// — the v1 mirror set is its own self-referential pattern.
+			name: "workflow-v1 schema without cli mirror flags it",
+			scope: []string{
+				"docs/spec/workflow-v1.schema.json",
+				"backend/internal/spec/schemas/workflow-v1.schema.json",
+			},
+			want: []SurfaceSweepFinding{
+				{
+					Pattern:         "workflow-v1 schema requires every mirror",
+					TriggerPath:     "docs/spec/workflow-v1.schema.json",
+					MissingSiblings: []string{"cli/internal/spec/schemas/workflow-v1.schema.json"},
+				},
+			},
+		},
+		{
 			// All three mirrors of a schema family present: no finding.
 			name: "plan-standard schema all mirrors no finding",
 			scope: []string{

@@ -10,6 +10,8 @@ Reference for `.fishhawk/workflows.yaml`. The canonical schema is [`workflow-v0.
 
 **Breaking additions** (required new fields, renamed fields, removed fields, changed semantics of existing fields) require a version bump to `workflow-v1`. During the deprecation window, the backend accepts both `v0` and `v1` workflow specs simultaneously — the version string in the YAML routes each spec to its respective schema and execution path.
 
+> **`workflow-v1` now exists (ADR-046 / #1381).** [`workflow-v1.schema.json`](workflow-v1.schema.json) ships alongside this schema; the backend and CLI validators compile both and route a spec by its `version` major (`0.x` → this v0 schema, `1.x` → v1), failing closed on an unrecognized major. v1 begins as a **structural copy** of v0 (only `$id`, `title`, and the `version` enum differ — `["1.0"]`), so a v1 spec is grammar-identical to the latest v0; deploy content is deferred to E23.2. See [`workflow-v1.md`](workflow-v1.md).
+
 **`x-intended-required`** may annotate optional fields that are candidates for required promotion in `workflow-v1`. Annotation semantics and soak-period rules match those in `plan-standard-v1.md`.
 
 ## Top-level shape
