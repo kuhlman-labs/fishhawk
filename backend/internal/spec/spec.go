@@ -380,18 +380,24 @@ type Stage struct {
 	Reviewers   *ReviewersConfig `json:"reviewers,omitempty" yaml:"reviewers,omitempty"`
 }
 
-// StageType is the stage's kind, drawn from a closed v0 set.
+// StageType is the stage's kind, drawn from a closed set.
 type StageType string
 
-// Stage types per MVP_SPEC §4.1.
+// Stage types. plan/implement/review are the v0 closed set per
+// MVP_SPEC §4.1; deploy is the v1 delegating release stage (ADR-038 /
+// #925, E23.2). The v0 schema rejects deploy before Validate runs, so
+// the semantic binding rules in validate.go stay version-agnostic.
 const (
 	StageTypePlan      StageType = "plan"
 	StageTypeImplement StageType = "implement"
 	StageTypeReview    StageType = "review"
+	StageTypeDeploy    StageType = "deploy"
 )
 
-// Executor describes what runs the stage. Exactly one of Agent or
-// Human is set. The schema enforces the mutual exclusion.
+// Executor describes what runs the stage. Exactly one of Agent, Human,
+// or Delegate is set. The schema enforces the mutual exclusion (a
+// three-branch oneOf); Validate enforces the type<->executor binding
+// (Delegate is valid only on a deploy stage; Agent/Human only off one).
 type Executor struct {
 	Agent string `json:"agent,omitempty" yaml:"agent,omitempty"`
 	// Model is the optional per-stage model override (#1013). One rung of
@@ -405,7 +411,37 @@ type Executor struct {
 	Timeout        Duration      `json:"timeout,omitempty" yaml:"timeout,omitempty"`
 	Verify         *VerifyConfig `json:"verify,omitempty" yaml:"verify,omitempty"`
 	AgentSelfRetry bool          `json:"agent_self_retry,omitempty" yaml:"agent_self_retry,omitempty"`
+	// Delegate is the v1 delegating-executor declaration for a deploy
+	// stage (ADR-038 / #925). Nil on non-deploy stages. Names the
+	// external pipeline a deploy stage delegates to — Fishhawk holds no
+	// deploy logic or credentials. The schema rejects it on a non-deploy
+	// stage only via the validator (the executor oneOf itself permits it
+	// on any stage type); Validate enforces the type<->executor binding.
+	Delegate *DelegateConfig `json:"delegate,omitempty" yaml:"delegate,omitempty"`
 }
+
+// DelegateConfig is the delegating-executor declaration for a deploy
+// stage (ADR-038 / #925). Target is the pipeline-kind discriminator:
+//
+//   - github_actions — dispatch a workflow via workflow_dispatch;
+//     WorkflowRef is required (the workflow file or id), GitRef is the
+//     optional branch/tag/sha to dispatch against.
+//   - webhook — POST the deploy trigger to URL (required).
+//
+// The schema's nested oneOf enforces which fields each target requires;
+// the unset fields stay empty.
+type DelegateConfig struct {
+	Target      string `json:"target" yaml:"target"`
+	WorkflowRef string `json:"workflow_ref,omitempty" yaml:"workflow_ref,omitempty"`
+	GitRef      string `json:"git_ref,omitempty" yaml:"git_ref,omitempty"`
+	URL         string `json:"url,omitempty" yaml:"url,omitempty"`
+}
+
+// Delegate targets per the schema's delegate.target discriminator.
+const (
+	DelegateTargetGitHubActions = "github_actions"
+	DelegateTargetWebhook       = "webhook"
+)
 
 // VerifyConfig holds the optional in-band test gate for a stage.
 // Command is a shell expression (passed to sh -c) that must exit 0
@@ -451,13 +487,16 @@ type Produces struct {
 	Persistence []Persistence `json:"persistence,omitempty" yaml:"persistence,omitempty"`
 }
 
-// ArtifactKind is the closed v0 artifact set.
+// ArtifactKind is the closed artifact set.
 type ArtifactKind string
 
-// Artifact kinds per the schema.
+// Artifact kinds per the schema. plan/pull_request are the v0 set;
+// deployment is the v1 deploy-stage artifact (ADR-038 / #925) — valid
+// only on a deploy stage, enforced by Validate.
 const (
 	ArtifactPlan        ArtifactKind = "plan"
 	ArtifactPullRequest ArtifactKind = "pull_request"
+	ArtifactDeployment  ArtifactKind = "deployment"
 )
 
 // Persistence says where an artifact is stored.
@@ -485,15 +524,49 @@ const (
 	ModeCanonical       PersistenceMode = "canonical"
 )
 
-// Constraint is exactly one of the closed-set rules (max_files_changed,
-// forbidden_paths, allowed_paths, required_outcomes). At decode time
-// every Constraint has exactly one non-zero field; the schema enforces
-// this with maxProperties: 1.
+// Constraint is exactly one constraint kind per object; the schema
+// enforces this with maxProperties: 1. Two families:
+//
+//   - Post-hoc diff constraints (max_files_changed, forbidden_paths,
+//     allowed_paths, required_outcomes) — evaluated against a stage's
+//     produced diff. The v0 closed set; valid on non-deploy stages.
+//   - Pre-flight deploy constraints (allowed_environments, change_freeze,
+//     required_upstream; ADR-038 / #925) — evaluated BEFORE a delegating
+//     deploy stage executes. Valid only on a deploy stage.
+//
+// Validate enforces the type<->constraint binding. ChangeFreeze is a
+// presence-aware *bool, NOT a plain bool: because each constraint object
+// carries exactly one key, `{change_freeze: false}` is a VALID shape
+// whose key is PRESENT, and the "pre-flight constraints are deploy-only"
+// rule must reject it on a non-deploy stage. A plain bool zero-value
+// cannot distinguish "present and false" from "absent"; the pointer
+// makes presence (ChangeFreeze != nil) detectable.
 type Constraint struct {
 	MaxFilesChanged  int      `json:"max_files_changed,omitempty" yaml:"max_files_changed,omitempty"`
 	ForbiddenPaths   []string `json:"forbidden_paths,omitempty" yaml:"forbidden_paths,omitempty"`
 	AllowedPaths     []string `json:"allowed_paths,omitempty" yaml:"allowed_paths,omitempty"`
 	RequiredOutcomes []string `json:"required_outcomes,omitempty" yaml:"required_outcomes,omitempty"`
+	// Pre-flight deploy constraint kinds (ADR-038 / #925). See the type
+	// doc; ChangeFreeze is *bool for presence detection.
+	AllowedEnvironments []string `json:"allowed_environments,omitempty" yaml:"allowed_environments,omitempty"`
+	ChangeFreeze        *bool    `json:"change_freeze,omitempty" yaml:"change_freeze,omitempty"`
+	RequiredUpstream    []string `json:"required_upstream,omitempty" yaml:"required_upstream,omitempty"`
+}
+
+// isPreflight reports whether the constraint is one of the pre-flight
+// deploy kinds (allowed_environments, change_freeze, required_upstream).
+// change_freeze presence is detected via the pointer (ChangeFreeze !=
+// nil), so `{change_freeze: false}` counts as a pre-flight constraint.
+func (c Constraint) isPreflight() bool {
+	return len(c.AllowedEnvironments) > 0 || c.ChangeFreeze != nil || len(c.RequiredUpstream) > 0
+}
+
+// isPostHoc reports whether the constraint is one of the post-hoc diff
+// kinds (max_files_changed, forbidden_paths, allowed_paths,
+// required_outcomes).
+func (c Constraint) isPostHoc() bool {
+	return c.MaxFilesChanged != 0 || len(c.ForbiddenPaths) > 0 ||
+		len(c.AllowedPaths) > 0 || len(c.RequiredOutcomes) > 0
 }
 
 // Budget caps token / runtime usage for a stage.
