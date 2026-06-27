@@ -150,6 +150,16 @@ func (s *Server) handleShipDeployment(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"stage_id": stageID.String(), "run_id": runID.String()})
 		return
 	}
+	// A deployment governance artifact is scoped to a deploy stage (ADR-038 /
+	// #1385). Without this guard a valid run signer or write:runs bearer could
+	// pin a signed deployment record + deploy audit chain onto a plan/implement/
+	// review stage. Reject any non-deploy stage before any persistence.
+	if stage.Type != run.StageTypeDeploy {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"deployment artifacts may only be attached to a deploy stage",
+			map[string]any{"stage_id": stageID.String(), "stage_type": string(stage.Type)})
+		return
+	}
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxDeploymentBundleBytes+1))
 	if err != nil {

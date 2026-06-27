@@ -252,6 +252,76 @@ func TestShipDeployment_RollbackVariants(t *testing.T) {
 	}
 }
 
+// auditFailOnCategory wraps an auditFake and forces AppendChained to fail for
+// exactly one category, delegating every other append (and the rest of the
+// audit.Repository surface) to the embedded fake. A global au.appendErr makes
+// the FIRST (deployment_outcome_recorded) append fail and short-circuits with a
+// 500 before the rollback append is reached, so it cannot exercise the
+// best-effort rollback branch — this wrapper lets the outcome append succeed
+// and fails only the second (rollback) append.
+type auditFailOnCategory struct {
+	*auditFake
+	failCategory string
+}
+
+func (a *auditFailOnCategory) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if p.Category == a.failCategory {
+		return nil, errors.New("rollback append boom")
+	}
+	return a.auditFake.AppendChained(ctx, p)
+}
+
+// TestShipDeployment_RollbackAppendFails_StillCreated pins the best-effort
+// rollback-append branch: when the always-written deployment_outcome_recorded
+// append succeeds but the additive rollback append fails, the handler WARN-logs
+// and still returns 201 — it does NOT unwind the already-persisted artifact or
+// the durable outcome entry. This is the one error path the global-appendErr
+// test can't reach (that one fails the first append and 500s first).
+func TestShipDeployment_RollbackAppendFails_StillCreated(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	sf := newSigningFake()
+	ar := newFakeArtifactRepo()
+	au := newAuditFake()
+	rr := newPromptRunRepo()
+	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeDeploy}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		ArtifactRepo: ar,
+		AuditRepo:    &auditFailOnCategory{auditFake: au, failCategory: CategoryDeploymentRollbackInitiated},
+		RunRepo:      rr,
+	})
+	priv, _ := sf.issue(t, runID)
+	body, err := json.Marshal(map[string]any{
+		"environment":      "production",
+		"ref":              "abc",
+		"external_run_url": "https://x/1",
+		"outcome":          "rolled_back",
+		"rollback_handle":  "deploy-42",
+		"rollback_action":  "initiated",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := shipDeploymentRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (rollback append is best-effort, non-fatal):\n%s", w.Code, w.Body.String())
+	}
+	// Artifact persisted and NOT unwound by the failed rollback append.
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1 (artifact kept despite rollback-append failure)", len(ar.all))
+	}
+	// The durable outcome entry succeeded and is kept.
+	if n := countByCategory(au, "deployment_outcome_recorded"); n != 1 {
+		t.Errorf("deployment_outcome_recorded entries = %d, want 1 (durable record kept)", n)
+	}
+	// The rollback entry append failed, so none is recorded.
+	if n := countByCategory(au, "deployment_rollback_initiated"); n != 0 {
+		t.Errorf("deployment_rollback_initiated entries = %d, want 0 (append failed)", n)
+	}
+}
+
 // TestShipDeployment_NoAuth_401 pins the auth-rejection branch: a request with
 // neither a signature nor a bearer token is refused 401.
 func TestShipDeployment_NoAuth_401(t *testing.T) {
@@ -349,6 +419,29 @@ func TestShipDeployment_StageMismatch_400(t *testing.T) {
 	}
 	if len(ar.all) != 0 {
 		t.Errorf("artifacts = %d, want 0", len(ar.all))
+	}
+}
+
+// TestShipDeployment_WrongStageType_400 pins the stage-type guard: a stage
+// that belongs to the run but is NOT a deploy stage (e.g. implement) is
+// rejected before any persistence. A deployment governance artifact may only
+// be attached to a deploy stage (ADR-038), so a valid run signer or write:runs
+// bearer cannot pin a signed deploy record + deploy audit chain onto a
+// plan/implement/review stage.
+func TestShipDeployment_WrongStageType_400(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newDeploymentServer(t, runID, stageID)
+	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+	priv, _ := sf.issue(t, runID)
+	w := shipDeploymentRequest(t, s, runID, stageID, priv, validDeploymentBytes(t), "")
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 (stage is not a deploy stage):\n%s", w.Code, w.Body.String())
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("artifacts = %d, want 0 (rejected before persistence)", len(ar.all))
+	}
+	if n := countByCategory(au, "deployment_outcome_recorded"); n != 0 {
+		t.Errorf("deployment_outcome_recorded entries = %d, want 0 (rejected before persistence)", n)
 	}
 }
 
