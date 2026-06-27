@@ -43,6 +43,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/runs/{run_id}/plan", s.handleShipPlan)
 	mux.HandleFunc("POST /v0/runs/{run_id}/pull-request", s.handleShipPullRequest)
 	mux.HandleFunc("POST /v0/runs/{run_id}/deployment", s.handleShipDeployment)
+	mux.HandleFunc("POST /v0/runs/{run_id}/deployment/rollback", s.handleRollbackDeployment)
 	mux.HandleFunc("POST /v0/runs/{run_id}/installation-token", s.handleIssueInstallationToken)
 	mux.HandleFunc("POST /v0/runs/{run_id}/mcp-token", s.handleIssueMCPToken)
 	mux.HandleFunc("POST /v0/runs/{run_id}/scope-amendments", s.handleRequestScopeAmendment)

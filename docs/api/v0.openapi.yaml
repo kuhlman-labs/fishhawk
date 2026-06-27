@@ -6061,6 +6061,134 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/runs/{run_id}/deployment/rollback:
+    post:
+      operationId: rollbackDeployment
+      summary: Re-dispatch a delegating deploy's rollback path
+      description: |
+        Operator-triggered rollback sub-action for a delegating deploy
+        (E23.6 / #1386, ADR-038's `rolled_back` disposition). Fishhawk holds
+        no prod credentials, so a rollback is just another delegating
+        trigger: it re-dispatches the SAME external pipeline down its
+        rollback path and records the rollback run handle.
+
+        The endpoint owns only the **initiate** side. It reads the run's
+        deploy stage's `executor.delegate` config from the cached workflow
+        spec and, by target:
+
+        - **github_actions** — fires a `workflow_dispatch` of the SAME
+          `workflow_ref` carrying the Fishhawk correlation
+          (`fishhawk_run_id` / `fishhawk_stage_id`) plus
+          `fishhawk_rollback=true` as inputs, then best-effort resolves the
+          rollback run id (the dispatch endpoint returns 204 with no body).
+          Re-dispatching the same `workflow_ref` with a rollback input (rather
+          than a separately configured `rollback_workflow_ref`) avoids a
+          `workflow-v*` schema bump; a distinct rollback ref stays a deferred
+          additive spec field.
+        - **webhook** — POSTs a rollback payload (`fishhawk_rollback: true`)
+          to the delegate URL.
+
+        On a successful dispatch it writes a `deployment_rollback_initiated`
+        chained audit entry carrying the rollback run handle — **distinct**
+        from the initial deploy's `deployment_dispatched` handle — and
+        refreshes the run's living-anchor issue comment.
+
+        **Terminal completion is NOT recorded here.** Setting the
+        `rolled_back` outcome and writing `deployment_rollback_completed`
+        happen ONLY when the rollback run reaches terminal: the external
+        rollback pipeline reports it by calling back into
+        `POST /v0/runs/{run_id}/deployment` with
+        `{ outcome: "rolled_back", rollback_action: "completed" }`, which
+        persists the `rolled_back` deployment artifact (the durable carrier
+        of the deploy outcome) and chains `deployment_rollback_completed`.
+        This is the rollback terminal callback path and is uniform across
+        both targets.
+
+        **Preconditions.** The run must have a deploy stage in a terminal
+        state (`succeeded` or `failed`); an in-flight stage has nothing to
+        revert (refused 409 `deploy_not_settled`).
+
+        **Authorization.** Operator-only — an authenticated bearer with
+        `write:runs` scope (a rollback is never runner-initiated, so there is
+        no Ed25519 signature path). A run-bound MCP token (subject
+        `mcp:run:<uuid>`) may roll back ONLY its own run's deploy; another
+        run is refused 403 (`cross_run_rollback`).
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '202':
+          description: |
+            Rollback re-dispatched; the rollback run handle is echoed back.
+            Terminal completion (the `rolled_back` outcome +
+            `deployment_rollback_completed`) is recorded later via the
+            deployment callback.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  stage_id: { $ref: '#/components/schemas/UUID' }
+                  target: { type: string, enum: [github_actions, webhook], description: 'The delegate target the rollback was re-dispatched against.' }
+                  gha_run_id: { type: integer, format: int64, description: 'Resolved GitHub Actions rollback run id; omitted/0 when not yet resolvable.' }
+                  external_run_url: { type: string, description: 'URL of the external rollback run (GHA run html_url, or the webhook delegate URL).' }
+                  message: { type: string }
+        '400':
+          description: '`run_id` is not a valid UUID (`validation_failed`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            One of: (1) bearer token lacks `write:runs` scope —
+            `insufficient_scope`; (2) an mcp run-bound token targeting another
+            run — `cross_run_rollback`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            No run with that id (`run_not_found`), or the run has no deploy
+            stage to roll back (`deploy_stage_not_found`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            The deploy stage has not reached a terminal outcome; nothing to
+            roll back (`deploy_not_settled`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            The rollback could not be dispatched from config
+            (`rollback_unconfigured`): the cached spec carries no delegating
+            deploy stage, the github_actions delegate is missing a
+            `workflow_ref`, the run has no `installation_id`, the webhook
+            delegate is missing a `url`, or the repo ref is malformed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: |
+            The external rollback trigger failed (`rollback_dispatch_failed`):
+            the `workflow_dispatch` returned non-204, or the webhook POST
+            errored / returned a non-2xx status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            Rollback unavailable (`rollback_unconfigured`): the backend has no
+            run/audit repositories, or a github_actions rollback was requested
+            against a backend with no configured GitHub client.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/runs/{run_id}/installation-token:
     post:
       operationId: issueInstallationToken
