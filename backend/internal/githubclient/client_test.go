@@ -71,6 +71,9 @@ type fakeGitHub struct {
 	getWorkflowRunStatus int
 	getWorkflowRunBody   string
 
+	listWorkflowRunsStatus int
+	listWorkflowRunsBody   string
+
 	getBranchProtectionStatus int
 	getBranchProtectionBody   string
 
@@ -260,6 +263,22 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			if fg.getWorkflowRunBody != "" {
 				_, _ = io.WriteString(w, fg.getWorkflowRunBody)
 			}
+		})
+
+	mux.HandleFunc("GET /repos/{owner}/{repo}/actions/runs",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			status := fg.listWorkflowRunsStatus
+			if status == 0 {
+				status = http.StatusOK
+			}
+			w.WriteHeader(status)
+			body := fg.listWorkflowRunsBody
+			if body == "" {
+				body = `{"workflow_runs":[]}`
+			}
+			_, _ = io.WriteString(w, body)
 		})
 
 	mux.HandleFunc("GET /repos/{owner}/{repo}/branches/{branch}/protection",
@@ -1281,6 +1300,156 @@ func TestGetWorkflowRun_ValidationErrors(t *testing.T) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
 		})
+	}
+}
+
+const corrRunID = "11111111-1111-1111-1111-111111111111"
+const corrStageID = "22222222-2222-2222-2222-222222222222"
+
+func deployCorrelation() map[string]string {
+	return map[string]string{"fishhawk_run_id": corrRunID, "fishhawk_stage_id": corrStageID}
+}
+
+// PRIMARY match: a listed run whose echoed inputs carry the exact correlation is
+// resolved unambiguously even when other candidates share the branch.
+func TestResolveDispatchedRun_CorrelationMatch(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.listWorkflowRunsBody = `{"workflow_runs":[
+		{"id":111,"html_url":"https://github.com/x/y/actions/runs/111","status":"queued","event":"workflow_dispatch","head_branch":"main","inputs":{"fishhawk_run_id":"other","fishhawk_stage_id":"other"}},
+		{"id":222,"html_url":"https://github.com/x/y/actions/runs/222","status":"in_progress","event":"workflow_dispatch","head_branch":"main","inputs":{"fishhawk_run_id":"` + corrRunID + `","fishhawk_stage_id":"` + corrStageID + `"}}
+	]}`
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.ResolveDispatchedRun(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "main", deployCorrelation(), time.Time{})
+	if err != nil {
+		t.Fatalf("ResolveDispatchedRun: %v", err)
+	}
+	if got == nil || got.ID != 222 {
+		t.Fatalf("resolved run = %+v, want id 222 (correlation match)", got)
+	}
+	// The request must filter by event=workflow_dispatch + branch.
+	if !strings.Contains(fg.gotQuery, "event=workflow_dispatch") || !strings.Contains(fg.gotQuery, "branch=main") {
+		t.Errorf("query = %q, want event + branch filters", fg.gotQuery)
+	}
+}
+
+// FALLBACK single-match: no run echoes inputs, but exactly one candidate is on
+// the branch+created window → safe to associate.
+func TestResolveDispatchedRun_FallbackSingleCandidate(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.listWorkflowRunsBody = `{"workflow_runs":[
+		{"id":333,"html_url":"https://github.com/x/y/actions/runs/333","status":"queued","event":"workflow_dispatch","head_branch":"main"}
+	]}`
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.ResolveDispatchedRun(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "main", deployCorrelation(), time.Time{})
+	if err != nil {
+		t.Fatalf("ResolveDispatchedRun: %v", err)
+	}
+	if got == nil || got.ID != 333 {
+		t.Fatalf("resolved run = %+v, want id 333 (single-candidate fallback)", got)
+	}
+}
+
+// AMBIGUOUS (binding condition 1, #1386): multiple concurrent workflow_dispatch
+// runs on the same branch with NO correlating inputs must resolve to (nil, nil)
+// — never a guessed run. This is the no-mis-association assertion the operator
+// condition specifically requires beyond the single-match fallback.
+func TestResolveDispatchedRun_AmbiguousNoInputs_Indeterminate(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.listWorkflowRunsBody = `{"workflow_runs":[
+		{"id":444,"status":"queued","event":"workflow_dispatch","head_branch":"main"},
+		{"id":555,"status":"queued","event":"workflow_dispatch","head_branch":"main"}
+	]}`
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.ResolveDispatchedRun(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "main", deployCorrelation(), time.Time{})
+	if err != nil {
+		t.Fatalf("ResolveDispatchedRun: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("resolved run = %+v, want nil (ambiguous, indeterminate — no mis-association)", got)
+	}
+}
+
+// Some candidates carry inputs but none match the correlation → the dispatched
+// run is not among the listed runs yet (eventual consistency); resolve to nil
+// rather than fall back into the inputs-bearing crowd.
+func TestResolveDispatchedRun_InputsPresentNoMatch_NotFound(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.listWorkflowRunsBody = `{"workflow_runs":[
+		{"id":666,"status":"queued","event":"workflow_dispatch","head_branch":"main","inputs":{"fishhawk_run_id":"someone-else","fishhawk_stage_id":"x"}},
+		{"id":777,"status":"queued","event":"workflow_dispatch","head_branch":"main"}
+	]}`
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.ResolveDispatchedRun(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "main", deployCorrelation(), time.Time{})
+	if err != nil {
+		t.Fatalf("ResolveDispatchedRun: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("resolved run = %+v, want nil (inputs present but none match)", got)
+	}
+}
+
+// Empty list (no run has appeared yet) → (nil, nil), the retry-later signal.
+func TestResolveDispatchedRun_EmptyList_NotFound(t *testing.T) {
+	_, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+	got, err := c.ResolveDispatchedRun(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "main", deployCorrelation(), time.Now())
+	if err != nil {
+		t.Fatalf("ResolveDispatchedRun: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("resolved run = %+v, want nil (empty list)", got)
+	}
+}
+
+// A hard API failure surfaces as a typed error, not a silent nil.
+func TestResolveDispatchedRun_APIError(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.listWorkflowRunsStatus = http.StatusForbidden
+	fg.listWorkflowRunsBody = `{"message":"Forbidden"}`
+	c, _ := newTestClient(t, srv, nil)
+	_, err := c.ResolveDispatchedRun(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "main", deployCorrelation(), time.Time{})
+	if err == nil || !errors.Is(err, ErrForbidden) {
+		t.Errorf("err = %v, want ErrForbidden", err)
+	}
+}
+
+func TestResolveDispatchedRun_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	cases := []struct {
+		name        string
+		repo        RepoRef
+		correlation map[string]string
+		wantSubst   string
+	}{
+		{"missing owner", RepoRef{Name: "y"}, deployCorrelation(), "owner and name"},
+		{"empty correlation", RepoRef{Owner: "x", Name: "y"}, nil, "correlation token required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := c.ResolveDispatchedRun(context.Background(), 1, tc.repo, "main", tc.correlation, time.Time{})
+			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
+			}
+		})
+	}
+}
+
+func TestResolveDispatchedRun_NilTokens(t *testing.T) {
+	c := &Client{}
+	_, err := c.ResolveDispatchedRun(context.Background(), 1,
+		RepoRef{Owner: "x", Name: "y"}, "main", deployCorrelation(), time.Time{})
+	if err == nil || !strings.Contains(err.Error(), "TokenProvider") {
+		t.Errorf("err = %v", err)
 	}
 }
 
