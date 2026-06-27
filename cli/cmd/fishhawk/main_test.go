@@ -47,6 +47,22 @@ func TestRun_Help_ListsReportIssue(t *testing.T) {
 	}
 }
 
+func TestRun_Help_ListsDeployVerbs(t *testing.T) {
+	// E23.8 / #1388: the deploy verbs must be discoverable in the
+	// printUsage listing.
+	var stdout strings.Builder
+	if got := run([]string{"help"}, &stdout, io.Discard); got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	for _, want := range []string{
+		"deploy status", "deploy approve", "deploy reject", "deploy rollback",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("usage missing %q verb:\n%s", want, stdout.String())
+		}
+	}
+}
+
 func TestRun_Version(t *testing.T) {
 	var stdout strings.Builder
 	got := run([]string{"version"}, &stdout, io.Discard)

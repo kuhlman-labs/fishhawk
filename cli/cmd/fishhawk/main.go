@@ -11,6 +11,10 @@
 //	fishhawk run retry    <stage-id> [--output text|json]
 //	fishhawk plan approve <run-id> [--reason ...] [--output text|json]
 //	fishhawk plan reject  <run-id> [--reason ...] [--output text|json]
+//	fishhawk deploy status   <run-id> [--output text|json]
+//	fishhawk deploy approve  <run-id> [--reason ...] [--output text|json]
+//	fishhawk deploy reject   <run-id> [--reason ...] [--output text|json]
+//	fishhawk deploy rollback <run-id> [--output text|json]
 //	fishhawk audit list   <run-id> [--category C] [--stage UUID] [--limit N] [--cursor X] [--output text|json]
 //	fishhawk audit tail   <run-id> [--interval D] [--output text|json] [--max-polls N]
 //	fishhawk file-issue   --repo R --type T --summary S [--body B] [--label L]... [--parent-epic E] [--run-id ID] [--output text|json]
@@ -60,6 +64,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runRun(rest, stdout, stderr)
 	case "plan":
 		return runPlan(rest, stdout, stderr)
+	case "deploy":
+		return runDeploy(rest, stdout, stderr)
 	case "audit":
 		return runAudit(rest, stdout, stderr)
 	case "validate":
@@ -118,6 +124,10 @@ func printUsage(w io.Writer) {
 		"  run retry    Retry a failed stage (takes a stage id, not a run id).",
 		"  plan approve Approve the plan stage on a run.",
 		"  plan reject  Reject the plan stage on a run (category-D failure).",
+		"  deploy status   Show the deploy stage state and the deployment artifact.",
+		"  deploy approve  Approve the deploy stage's pre-execution gate (needs write:deploy).",
+		"  deploy reject   Reject the deploy stage's pre-execution gate (category-D failure).",
+		"  deploy rollback Roll back a settled deploy (re-dispatches the rollback path).",
 		"  audit list   List audit entries for a run.",
 		"  audit tail   Follow the audit log of a run in real time.",
 		"  validate     Validate a workflow spec file locally.",
