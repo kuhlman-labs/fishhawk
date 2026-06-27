@@ -31,6 +31,8 @@ The base role spec ships with the product. A repo does NOT write its own role sp
 
 Every object level is `additionalProperties: false` — the surface is closed; new sections are additive schema changes within v0.
 
+**Reviewer-reject classification is read from config, not judged.** In the `implement_review_gate` and `escalation` procedures, the advisory-vs-hard line on a reviewer reject is resolved from the workflow spec's `operator_agent` contract, not from per-run operator judgment. The mapping is the [decision-class taxonomy](./workflow-v0.md#operator-agent-delegation-v05): an **advisory** agent reject (agent + human reviewers) is non-blocking and routes back through `may_route_fixup` / `convergent_concerns`; a **gating** agent reject (agent-only) fires `reviewer_reject` and pages; a **human** reject arrives as `plan_rejection` and pages. Authority is the ADR-027 `planreview.ResolveAuthority` semantics, unchanged. The interactive operator prompt that asks a human to classify the reject is a fallback **only** when no `operator_agent` contract governs the run (the fail-closed default, where every judgment pages).
+
 ## Overlay contract (`.fishhawk/operator.yaml`)
 
 The overlay may ONLY:
