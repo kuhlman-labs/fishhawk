@@ -1747,6 +1747,307 @@ func TestParse_UnsupportedMajorFailsClosed(t *testing.T) {
 	}
 }
 
+// --- v1 deploy surface (E23.2 / #1382, ADR-038 / #925) ---
+
+// v1DeploySpec is the canonical gated delegating deploy spec exercised by
+// the happy-path and schema-shape tests. The deploy stage delegates to a
+// github_actions workflow_dispatch, produces a deployment artifact,
+// carries all three pre-flight constraint kinds, and is gated by an
+// approval gate — the full type<->executor<->constraint binding in one
+// spec.
+const v1DeploySpec = `
+version: "1.0"
+roles:
+  release_manager:
+    members: ["@kuhlman-labs"]
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+            git_ref: main
+        constraints:
+          - allowed_environments: [production]
+          - change_freeze: true
+          - required_upstream: [review_merged, ci_green]
+        produces:
+          - artifact: deployment
+        gates:
+          - type: approval
+            approvers:
+              any_of: [release_manager]
+`
+
+// TestParse_V1DeployStage_Valid drives a full version "1.0" deploy spec
+// through the real ParseBytes path (version routing -> v1 JSON Schema ->
+// YAML decode -> semantic Validate) and asserts every decoded member of
+// the new deploy surface round-trips. This is the end-to-end / cross-layer
+// test: the seam being added is the type<->executor<->constraint binding
+// spread across the schema and the validator, so a single spec crossing
+// all three layers is the right shape.
+func TestParse_V1DeployStage_Valid(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(v1DeploySpec))
+	if err != nil {
+		t.Fatalf("ParseBytes(v1 deploy): %v", err)
+	}
+	if s.Version != "1.0" {
+		t.Errorf("version = %q, want 1.0", s.Version)
+	}
+	st := s.Workflows["release"].Stages[0]
+	if st.Type != spec.StageTypeDeploy {
+		t.Errorf("stage type = %q, want deploy", st.Type)
+	}
+	// Delegating executor round-trips with target + workflow_ref + git_ref.
+	if st.Executor.Delegate == nil {
+		t.Fatal("Executor.Delegate = nil, want decoded delegate block")
+	}
+	d := st.Executor.Delegate
+	if d.Target != spec.DelegateTargetGitHubActions {
+		t.Errorf("Delegate.Target = %q, want github_actions", d.Target)
+	}
+	if d.WorkflowRef != "deploy.yml" {
+		t.Errorf("Delegate.WorkflowRef = %q, want deploy.yml", d.WorkflowRef)
+	}
+	if d.GitRef != "main" {
+		t.Errorf("Delegate.GitRef = %q, want main", d.GitRef)
+	}
+	if st.Executor.Agent != "" || st.Executor.Human {
+		t.Errorf("deploy executor should carry neither agent nor human, got agent=%q human=%v", st.Executor.Agent, st.Executor.Human)
+	}
+	// deployment artifact round-trips.
+	if len(st.Produces) != 1 || st.Produces[0].Artifact != spec.ArtifactDeployment {
+		t.Errorf("Produces = %+v, want a single deployment artifact", st.Produces)
+	}
+	// All three pre-flight constraint kinds round-trip.
+	if len(st.Constraints) != 3 {
+		t.Fatalf("constraints count = %d, want 3", len(st.Constraints))
+	}
+	if got := st.Constraints[0].AllowedEnvironments; len(got) != 1 || got[0] != "production" {
+		t.Errorf("constraints[0].AllowedEnvironments = %v, want [production]", got)
+	}
+	if cf := st.Constraints[1].ChangeFreeze; cf == nil || !*cf {
+		t.Errorf("constraints[1].ChangeFreeze = %v, want non-nil true", cf)
+	}
+	if got := st.Constraints[2].RequiredUpstream; len(got) != 2 || got[0] != "review_merged" || got[1] != "ci_green" {
+		t.Errorf("constraints[2].RequiredUpstream = %v, want [review_merged ci_green]", got)
+	}
+}
+
+// TestParse_V1Deploy_WithoutDelegate_Rejected asserts rule (1): a deploy
+// stage that uses an agent executor (schema-valid on its own) is rejected
+// by the semantic validator because deploy must delegate.
+func TestParse_V1Deploy_WithoutDelegate_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          agent: claude-code
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Message, "delegating executor") {
+		t.Errorf("message = %q, want it to mention the delegating-executor requirement", ve.Message)
+	}
+}
+
+// TestParse_V1NonDeploy_WithDelegate_Rejected asserts rule (2): a
+// non-deploy stage carrying a delegating executor is rejected.
+func TestParse_V1NonDeploy_WithDelegate_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Message, "delegating executor") {
+		t.Errorf("message = %q, want it to flag the delegating executor on a non-deploy stage", ve.Message)
+	}
+}
+
+// TestParse_V1PreflightConstraint_OnNonDeploy_Rejected asserts rule (3),
+// and specifically the binding condition's falsifying case: a non-deploy
+// stage carrying a `change_freeze: false` constraint is rejected. The
+// `*bool` presence model is load-bearing — a plain bool zero-value could
+// not tell "present and false" from "absent" and would miss this.
+func TestParse_V1PreflightConstraint_OnNonDeploy_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - change_freeze: false
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Message, "pre-flight deploy constraint") {
+		t.Errorf("message = %q, want it to flag the pre-flight constraint on a non-deploy stage", ve.Message)
+	}
+}
+
+// TestParse_V1PostHocConstraint_OnDeploy_Rejected asserts rule (4): a
+// deploy stage carrying a post-hoc diff constraint is rejected.
+func TestParse_V1PostHocConstraint_OnDeploy_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: webhook
+            url: https://example.com/deploy
+        constraints:
+          - max_files_changed: 5
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Message, "post-hoc diff constraint") {
+		t.Errorf("message = %q, want it to flag the post-hoc constraint on a deploy stage", ve.Message)
+	}
+}
+
+// TestParse_V1DeploymentArtifact_OnNonDeploy_Rejected asserts rule (5): a
+// non-deploy stage declaring the deployment artifact is rejected.
+func TestParse_V1DeploymentArtifact_OnNonDeploy_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: deployment
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Message, "deployment artifact is valid only on a deploy stage") {
+		t.Errorf("message = %q, want it to flag the deployment artifact on a non-deploy stage", ve.Message)
+	}
+}
+
+// TestValidate_V1Deploy_DelegateWithAgent_Rejected exercises the second
+// half of rule (1) — a deploy stage that sets BOTH a delegate and an agent
+// executor. The JSON Schema's executor oneOf rejects {delegate, agent}
+// together, so this branch is unreachable via ParseBytes; it guards
+// programmatic Spec builders, so it is driven through Validate directly.
+func TestValidate_V1Deploy_DelegateWithAgent_Rejected(t *testing.T) {
+	s := &spec.Spec{
+		Version: "1.0",
+		Workflows: map[string]spec.Workflow{
+			"release": {
+				Stages: []spec.Stage{
+					{
+						ID:   "deploy",
+						Type: spec.StageTypeDeploy,
+						Executor: spec.Executor{
+							Agent: "claude-code",
+							Delegate: &spec.DelegateConfig{
+								Target:      spec.DelegateTargetGitHubActions,
+								WorkflowRef: "deploy.yml",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	err := spec.Validate(s)
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Message, "must not use an agent or human") {
+		t.Errorf("message = %q, want it to flag the agent/human executor on a deploy stage", ve.Message)
+	}
+}
+
+// TestParse_V1Deploy_WebhookTarget_Valid is a schema-shape test: a deploy
+// stage delegating to a webhook target (url) parses and validates.
+func TestParse_V1Deploy_WebhookTarget_Valid(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: webhook
+            url: https://example.com/deploy
+        produces:
+          - artifact: deployment
+`))
+	if err != nil {
+		t.Fatalf("ParseBytes(webhook delegate): %v", err)
+	}
+	d := s.Workflows["release"].Stages[0].Executor.Delegate
+	if d == nil || d.Target != spec.DelegateTargetWebhook {
+		t.Fatalf("Delegate = %+v, want target webhook", d)
+	}
+	if d.URL != "https://example.com/deploy" {
+		t.Errorf("Delegate.URL = %q, want https://example.com/deploy", d.URL)
+	}
+}
+
+// TestParse_V1Deploy_GitHubActionsMissingWorkflowRef_Rejected is a
+// schema-shape test: the github_actions delegate target requires
+// workflow_ref, so omitting it is a *SchemaError (caught at the schema
+// layer, before the semantic validator).
+func TestParse_V1Deploy_GitHubActionsMissingWorkflowRef_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
 // TestEmbeddedSchemaHashV1 proves the v1 hash advertised on /healthz is
 // a non-empty hex string distinct from the v0 hash (the two schemas
 // differ by $id/title/version enum, so their hashes must differ).

@@ -2,11 +2,11 @@
 
 Reference for `.fishhawk/workflows.yaml` at major version 1. The canonical schema is [`workflow-v1.schema.json`](workflow-v1.schema.json) (JSON Schema Draft 2020-12).
 
-> **v1 begins as a structural copy of v0 (ADR-046 / #1381).** The `$defs` and `properties` are byte-for-byte identical to [`workflow-v0.schema.json`](workflow-v0.schema.json); the only differences are `$id`, `title`, and the top-level `version` enum (`["1.0"]`). No v1-specific grammar has been added yet — **deploy content is deferred to E23.2.** This issue (#1381) stands up the versioning *mechanism* — a separate schema file and a version-routed validator — so the v1 deploy fields can land additively later without touching v0.
+> **v1 began as a structural copy of v0 (ADR-046 / #1381) and now adds the deploy surface (E23.2 / #1382).** The inherited `$defs` and `properties` stay byte-for-byte identical to [`workflow-v0.schema.json`](workflow-v0.schema.json); v1 layers the delegating deploy grammar (per ADR-038 / #925) on top — the `deploy` stage type, the `deployment` artifact, the delegating executor, and three pre-flight constraint kinds. **v0 stays frozen** and rejects `deploy` via its closed enums, so a v0 spec carrying a deploy stage fails at the schema layer.
 
 ## Grammar
 
-Identical to v0. For the full field reference (top-level shape, stages, executors, inputs, produces, constraints, budgets, gates, operator-agent delegation, decomposition controls), see [`workflow-v0.md`](workflow-v0.md). A v1 spec differs from a v0 spec only in its `version` value:
+Every v0 field is inherited unchanged. For the full base reference (top-level shape, stages, executors, inputs, produces, constraints, budgets, gates, operator-agent delegation, decomposition controls), see [`workflow-v0.md`](workflow-v0.md). The v1 additions are the [deploy stage](#deploy-stage-v1) members below. A minimal non-deploy v1 spec differs from a v0 spec only in its `version` value:
 
 ```yaml
 version: "1.0" # required; routes to workflow-v1.schema.json
@@ -18,6 +18,70 @@ workflows:
         executor:
           agent: claude-code
 ```
+
+## Deploy stage (v1)
+
+The `deploy` stage type is **delegating-only** (ADR-038 / #925): Fishhawk orchestrates and gates the release but holds **no deploy logic or credentials**. A deploy stage hands execution to an external pipeline and captures the outcome as a `deployment` artifact. The deploy members are bound together by the semantic validator (`backend/internal/spec/validate.go`) because the executor and constraint schema `$def`s are shared across every stage type and so can't express the type-specific pairing themselves:
+
+- A **deploy stage MUST** use a delegating executor (`executor.delegate`) and **MUST NOT** use an `agent` or `human` executor.
+- A **non-deploy stage MUST NOT** use `executor.delegate`.
+- The **pre-flight constraint kinds** (`allowed_environments`, `change_freeze`, `required_upstream`) are valid **only** on a deploy stage.
+- The **post-hoc diff constraint kinds** (`max_files_changed`, `forbidden_paths`, `allowed_paths`, `required_outcomes`) are **not** valid on a deploy stage — a delegating deploy produces no reviewable diff.
+- The **`deployment` artifact** is valid **only** on a deploy stage.
+
+### Delegating executor
+
+`executor.delegate` names the external pipeline via a `target` discriminator:
+
+| `target` | Required | Optional | Meaning |
+|---|---|---|---|
+| `github_actions` | `workflow_ref` | `git_ref` | Dispatch a GitHub Actions workflow via `workflow_dispatch`. `workflow_ref` is the workflow file or id (e.g. `deploy.yml`); `git_ref` is the branch/tag/sha to dispatch against (absent = the provider default). |
+| `webhook` | `url` | — | POST the deploy trigger to a generic webhook endpoint. |
+
+### deployment artifact
+
+The `deployment` artifact records the delegated release outcome — its runtime shape is `{environment, ref/sha, external_run_url, outcome, rollback_handle}`. This schema slice only declares the artifact so a deploy spec parses and validates; the runtime that populates it is downstream (the run lifecycle / runner that consume the spec).
+
+### Pre-flight constraints
+
+The three pre-flight deploy constraint kinds are evaluated **before** the stage executes (a pre-execution gate), distinct from the post-hoc diff constraints evaluated against a produced diff:
+
+| Kind | Shape | Meaning |
+|---|---|---|
+| `allowed_environments` | array of strings (min 1) | The deploy stage may target only these environments. |
+| `change_freeze` | boolean | When `true`, the stage is blocked while a change freeze is active. The freeze-signal source is out of scope for the spec (it belongs to the consuming runtime). |
+| `required_upstream` | array, unique, items `review_merged` \| `ci_green` (min 1) | Upstream conditions that must hold before the stage may run. |
+
+### Example — a gated deploy stage
+
+```yaml
+version: "1.0"
+roles:
+  release_manager:
+    members: ["@kuhlman-labs"]
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions # or: webhook + url
+            workflow_ref: deploy.yml
+            git_ref: main
+        constraints:
+          - allowed_environments: [production]
+          - change_freeze: true
+          - required_upstream: [review_merged, ci_green]
+        produces:
+          - artifact: deployment
+        gates:
+          - type: approval # pre-execution operator gate
+            approvers:
+              any_of: [release_manager]
+```
+
+See [ADR-038 (#925)](https://github.com/kuhlman-labs/fishhawk/issues/925) for the delegating-only deploy decision and epic [#924](https://github.com/kuhlman-labs/fishhawk/issues/924) for the deploy workstream.
 
 ## Version routing
 

@@ -237,6 +237,69 @@ func TestValidateBytes_RoutesV0Spec(t *testing.T) {
 	}
 }
 
+// TestValidateBytes_V1DeploySpec_Accepted proves the cli's v1 schema
+// mirror picked up the E23.2 deploy surface (#1382): a version "1.0"
+// deploy spec — delegating github_actions executor, deployment artifact,
+// and all three pre-flight constraint kinds — validates at the schema
+// level. The CLI validates schema-only (no Go domain types / semantic
+// binding), so this confirms the embedded mirror carries the new members
+// and the CI schema-sync gate is satisfied.
+func TestValidateBytes_V1DeploySpec_Accepted(t *testing.T) {
+	yml := `
+version: "1.0"
+roles:
+  release_manager:
+    members: ["@kuhlman-labs"]
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+            git_ref: main
+        constraints:
+          - allowed_environments: [production]
+          - change_freeze: false
+          - required_upstream: [review_merged, ci_green]
+        produces:
+          - artifact: deployment
+        gates:
+          - type: approval
+            approvers:
+              any_of: [release_manager]
+`
+	if err := spec.ValidateBytes([]byte(yml)); err != nil {
+		t.Errorf("expected v1 deploy spec to validate at the schema level, got: %v", err)
+	}
+}
+
+// TestValidateBytes_V1Deploy_GitHubActionsMissingWorkflowRef_Rejected
+// proves the github_actions delegate target requires workflow_ref: the cli
+// mirror's nested oneOf rejects a spec that omits it.
+func TestValidateBytes_V1Deploy_GitHubActionsMissingWorkflowRef_Rejected(t *testing.T) {
+	yml := `
+version: "1.0"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+        produces:
+          - artifact: deployment
+`
+	err := spec.ValidateBytes([]byte(yml))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+}
+
 // TestValidateBytes_UnsupportedMajorFailsClosed proves a well-formed but
 // unrecognized major (2.0) fails closed with a *ValidationError naming
 // the supported majors (the fail-closed-on-unknown-major branch).
