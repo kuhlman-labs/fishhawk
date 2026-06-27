@@ -681,6 +681,19 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// binding instructions; only the scope-mutation consumption is gone.
 		// No-op on an empty scope (keeps the runner's git add -A fallback).
 		scopeFiles = s.mergeStructuredScopeFiles(r.Context(), scopeFiles, s.resolveApprovalAddScopeFiles(r.Context(), runRow))
+		// Surface the operator's approval-time add_scope_files additions in the
+		// implement prompt TEXT (#1406). The fold above already puts these paths
+		// in the ENFORCED scope, but writeApprovedPlan renders only the immutable
+		// plan artifact's scope.files, so a defensive agent reads the shown scope,
+		// concludes the added paths are out of scope, and files a redundant
+		// mid-stage amendment for paths already folded (run 6434aae9). Derive the
+		// agent-shown set from the SAME single fold source the enforced scope and
+		// the review prompt (trace.go:2680) already use — amendedScopeFilesForReview
+		// — so the three stay in lockstep. It returns nil for a nil/empty-scope
+		// plan and excludes paths already in raw scope.files, so a run with no
+		// additions leaves trigger.AmendedScopeFiles nil and the prompt
+		// byte-identical (audit prompt-hash replay stability).
+		trigger.AmendedScopeFiles = s.amendedScopeFilesForReview(r.Context(), runRow, approvedPlan)
 		// Fold the operator-approved mid-stage scope amendment paths (#961)
 		// into the effective scope so a stage restart or fix-up prompt
 		// carries the amended scope. No-op on an empty scope (keeps the
@@ -958,6 +971,11 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// mutate scope. No-op on an empty scope (keeps the runner's git add -A
 		// fallback).
 		scopeFiles = s.mergeStructuredScopeFiles(r.Context(), scopeFiles, s.resolveApprovalAddScopeFiles(r.Context(), runRow))
+		// Surface the operator's approval-time add_scope_files additions in the
+		// rendered (SPA-readable) implement prompt TEXT (#1406), the SAME
+		// derivation as the dispatch path above so the displayed prompt stays
+		// byte-for-byte consistent with the runner-facing prompt.
+		trigger.AmendedScopeFiles = s.amendedScopeFilesForReview(r.Context(), runRow, approvedPlan)
 		// Fold the operator-approved mid-stage scope amendment paths (#961),
 		// same derivation as the dispatch path so the rendered view matches.
 		scopeFiles = s.mergeApprovedScopeAmendments(r.Context(), scopeFiles, runRow.ID, stage.ID)

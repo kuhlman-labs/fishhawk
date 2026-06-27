@@ -780,6 +780,19 @@ func buildImplement(t Trigger) string {
 	// `plan_missing_for_implement` audit entry on the handler side.
 	if t.ApprovedPlan != nil {
 		writeApprovedPlan(&b, t.ApprovedPlan)
+		// Operator-added scope files (#1406): paths the operator folded into
+		// the effective scope at approval time via the #824 add_scope_files
+		// amendment that are NOT in the plan's immutable scope.files. The
+		// enforced scope already carries them (mergeStructuredScopeFiles /
+		// resolveApprovalAddScopeFiles), and the review prompt names them
+		// (#829), but writeApprovedPlan renders only the immutable plan
+		// artifact's scope.files — so without this section a defensive agent
+		// reads the shown scope, concludes the operator-added paths are out of
+		// scope, and files a redundant mid-stage amendment for paths already
+		// folded. Naming them here as already-approved closes that gap.
+		// Guarded by len>0 inside the helper so a run with no additions keeps
+		// the prompt byte-identical (audit prompt-hash replay stability).
+		writeAmendedScopeFilesForImplement(&b, t)
 		b.WriteString("Originating issue (link only — fetch if you need detail):\n\n")
 		writeIssueLink(&b, t)
 
@@ -2425,6 +2438,37 @@ func writeApprovedPlan(b *strings.Builder, p *plan.Plan) {
 		fmt.Fprintf(b, "Runtime prediction: %d minutes (%s confidence)\n\n",
 			p.PredictedRuntimeMinutes, p.PredictedRuntimeConfidence)
 	}
+}
+
+// writeAmendedScopeFilesForImplement renders the operator-added scope files
+// section on the fresh (non-fix-up) implement prompt (#1406). The paths in
+// t.AmendedScopeFiles were folded into the effective scope at approval time via
+// the #824 add_scope_files amendment but are NOT in the immutable plan
+// artifact's scope.files, so writeApprovedPlan never surfaces them. The runner's
+// enforced scope already carries them and the review prompt already names them
+// (#829 / buildImplementReview); this is the implement-agent-visibility half so
+// a defensive agent edits them without filing a redundant mid-stage amendment
+// for paths already approved.
+//
+// Guarded by len>0 so a run with no operator additions keeps the implement
+// prompt byte-identical to today, preserving deterministic prompt-hash replay.
+// Input order is preserved (the handler derives it from the deduped, raw-scope-
+// excluded amendedScopeFilesForReview fold). Empty/nil is a no-op.
+func writeAmendedScopeFilesForImplement(b *strings.Builder, t Trigger) {
+	if len(t.AmendedScopeFiles) == 0 {
+		return
+	}
+	b.WriteString("Operator-added scope files (approved — in-scope, do NOT request an amendment)\n")
+	b.WriteString("===========================================================================\n\n")
+	b.WriteString("The paths below were folded into the effective scope at approval time via the " +
+		"operator's add_scope_files amendment. They are NOT listed in the plan's Files-in-scope above " +
+		"because that section renders only the immutable plan artifact, but they ARE in scope. Edit them " +
+		"as the plan requires. Do NOT file a mid-stage scope amendment requesting any of them — they are " +
+		"already approved:\n\n")
+	for _, p := range t.AmendedScopeFiles {
+		fmt.Fprintf(b, "- %s\n", p)
+	}
+	b.WriteString("\n")
 }
 
 // writeIssueLink renders the issue's number, title, and URL — but
