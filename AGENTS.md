@@ -60,7 +60,7 @@ done < <(go work edit -json | jq -r '.Use[].DiskPath')
 python3 scripts/check-coverage.py --threshold 80 --exclude '/db/' "${profiles[@]}"
 ```
 
-When editing a schema under `docs/spec/`, run `scripts/sync-schemas` to mirror the change into all embedded copies before committing. CI fails the schema-sync gate otherwise. Opt-in local check: `git config core.hooksPath .githooks`.
+When editing a schema under `docs/spec/`, run `scripts/sync-schemas` to mirror the change into all embedded copies before committing. CI fails the schema-sync gate otherwise. Opt-in local check: `git config core.hooksPath .githooks`. The `workflow-v*.schema.json` glob fans each workflow major out to two mirrors — `backend/internal/spec/schemas/` and `cli/internal/spec/schemas/` — so `workflow-v0` and `workflow-v1` (ADR-046 / #1381) each have a canonical + two mirror copies, and `/healthz` advertises both the `workflow-v0` and `workflow-v1` embedded-schema hashes (`spec.EmbeddedSchemaHash` / `EmbeddedSchemaHashV1`).
 
 ### Schema change checklist
 
@@ -73,6 +73,7 @@ Before opening a PR that adds or modifies a field in `docs/spec/`:
 3. **Version advertising.** After the schema change merges, update every surface that advertises supported schema versions:
    - Plan validator (`backend/internal/plan/`) — add the new version string to the recognized set.
    - Runner `/healthz` schema-versions endpoint (once #466 lands) — add the new version to the advertised list.
+   - **A NEW workflow MAJOR** (ADR-046 / #1381 stood up `workflow-v1` as the keystone): add the canonical `docs/spec/workflow-vN.schema.json`, run `scripts/sync-schemas` to mirror it into `backend/internal/spec/schemas/` + `cli/internal/spec/schemas/` (the `workflow-v*` glob routes it — no script edit), append a `{Major: N, Path: …}` entry to the `embeddedSchemas` routing table in BOTH `backend/internal/spec/parse.go` and `cli/internal/spec/spec.go` (this is what makes the version-routed validator dispatch to the new major instead of failing closed), add an `EmbeddedSchemaHashVN()` + the `workflow-vN` `/healthz` `schemas`-map entry in `backend/internal/server/handlers.go`, and register the new mirror set as its own self-referential surface-sweep pattern in `backend/internal/server/surface_sweep.go`.
 
 4. **`x-intended-required` annotation.** When a field is optional now but will become required in the next major version, annotate it in the JSON Schema:
    ```json
