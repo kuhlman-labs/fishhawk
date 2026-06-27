@@ -1,0 +1,29 @@
+# operator_agent must_page_human using the explicit reviewer-reject
+# classes introduced in workflow-v0.7 (#1378): advisory_reviewer_reject
+# (arbitrable / auto-routed) and gating_reviewer_reject (pages the
+# human), alongside the preserved legacy bare reviewer_reject. Exercises
+# that the explicit tokens parse at version 0.7.
+version: "0.7"
+roles:
+  founder:
+    members: ["@kuhlman-labs"]
+workflows:
+  feature_change:
+    description: "Explicit reviewer-reject page-event classes."
+    operator_agent:
+      may_route_fixup: convergent_concerns
+      must_page_human: [advisory_reviewer_reject, gating_reviewer_reject]
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request

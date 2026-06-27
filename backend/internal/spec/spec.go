@@ -209,9 +209,25 @@ const (
 )
 
 // must_page_human events — the closed v0 set of events that always
-// page the human regardless of the may_* knobs.
+// page the human regardless of the may_* knobs. The reviewer-reject
+// taxonomy now carries the explicit advisory/gating classes (#1378,
+// workflow-v0.7) alongside the preserved legacy bare token.
 const (
-	PageEventReviewerReject         = "reviewer_reject"
+	// PageEventReviewerReject is the legacy bare reviewer-reject token.
+	// Preserved for back-compat; it resolves to the gating sense
+	// (PageEventGatingReviewerReject), so a bare reviewer_reject still
+	// pages the human exactly as before #1378.
+	PageEventReviewerReject = "reviewer_reject"
+	// PageEventAdvisoryReviewerReject (#1378, workflow-v0.7): an agent
+	// reject under advisory review authority (agent + human reviewers).
+	// The human approver is the gate, so the reject is arbitrable /
+	// auto-routed — it does not page on its own.
+	PageEventAdvisoryReviewerReject = "advisory_reviewer_reject"
+	// PageEventGatingReviewerReject (#1378, workflow-v0.7): an agent
+	// reject under gating review authority (agent-only review). The
+	// reject blocks and pages the human; this is the class the legacy
+	// bare reviewer_reject resolves to.
+	PageEventGatingReviewerReject   = "gating_reviewer_reject"
 	PageEventPlanRejection          = "plan_rejection"
 	PageEventScopeAmendment         = "scope_amendment"
 	PageEventBudgetOverride         = "budget_override"

@@ -1416,6 +1416,96 @@ func TestGetRun_Delegation_SpecToWire_EndToEnd(t *testing.T) {
 	}
 }
 
+// gatingImplementSpecYAML carries an operator_agent block and a GATING
+// implement stage (agent-only reviewers, no human), so the run resolves
+// to the gating reviewer-reject class (#1378).
+const gatingImplementSpecYAML = `version: "0.7"
+roles:
+  tech_lead:
+    members: ["@org/tech-leads"]
+workflows:
+  feature_change:
+    operator_agent:
+      may_route_fixup: convergent_concerns
+      must_page_human: [gating_reviewer_reject]
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 1
+          human: 0
+        produces:
+          - artifact: pull_request
+`
+
+// TestGetRun_Delegation_ReviewerRejectClass_SpecToWire is the
+// cross-boundary seam (#1378): a workflow spec whose implement stage is
+// gating-authority resolves to gating_reviewer_reject, and that resolved
+// class lands on the GET /v0/runs/{id} delegation block — exercising spec
+// parse -> delegation.Evaluate -> runDelegationPayload serialization.
+func TestGetRun_Delegation_ReviewerRejectClass_SpecToWire(t *testing.T) {
+	s, repo, _, _ := newDelegationServer(t)
+	runID, _ := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": gatingImplementSpecYAML,
+	})
+	resp, raw := getRunResponse(t, s, runID)
+	if resp.Delegation == nil {
+		t.Fatal("delegation block missing")
+	}
+	if got := resp.Delegation.ReviewerRejectClass; got != "gating_reviewer_reject" {
+		t.Errorf("reviewer_reject_class = %q, want gating_reviewer_reject", got)
+	}
+	// The class must be present in the raw wire body, not just the typed struct.
+	deleg, ok := raw["delegation"].(map[string]any)
+	if !ok {
+		t.Fatalf("delegation block not an object in raw body: %v", raw["delegation"])
+	}
+	if deleg["reviewer_reject_class"] != "gating_reviewer_reject" {
+		t.Errorf("raw reviewer_reject_class = %v, want gating_reviewer_reject", deleg["reviewer_reject_class"])
+	}
+}
+
+// TestGetRun_Delegation_ReviewerRejectClass_GatelessOmitted asserts the
+// omit-when-empty posture: a gateless implement stage (no agent reviewers)
+// resolves to "" so the reviewer_reject_class key is absent from the wire,
+// preserving byte-identical responses for gateless runs.
+func TestGetRun_Delegation_ReviewerRejectClass_GatelessOmitted(t *testing.T) {
+	s, repo, _, _ := newDelegationServer(t)
+	// delegationSpecYAML's implement stage carries no reviewers block → gateless.
+	runID, _ := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": delegationSpecYAML,
+	})
+	resp, raw := getRunResponse(t, s, runID)
+	if resp.Delegation == nil {
+		t.Fatal("delegation block missing")
+	}
+	if got := resp.Delegation.ReviewerRejectClass; got != "" {
+		t.Errorf("reviewer_reject_class = %q, want empty for a gateless implement stage", got)
+	}
+	deleg, ok := raw["delegation"].(map[string]any)
+	if !ok {
+		t.Fatalf("delegation block not an object in raw body: %v", raw["delegation"])
+	}
+	if _, present := deleg["reviewer_reject_class"]; present {
+		t.Errorf("reviewer_reject_class key present on a gateless run: %v", deleg)
+	}
+}
+
 // TestGetRun_Delegation_NoBlock_Omitted is the fail-closed control: a
 // spec without an operator_agent block yields a response with no
 // delegation key at all — byte-identical to today.

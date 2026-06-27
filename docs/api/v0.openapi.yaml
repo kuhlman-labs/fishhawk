@@ -823,8 +823,26 @@ components:
             The effective block's `must_page_human` event list —
             events that always page the human regardless of the
             `may_*` knobs (closed set per the workflow-v0 schema, e.g.
-            `reviewer_reject`, `plan_rejection`).
+            `reviewer_reject`, `gating_reviewer_reject`,
+            `advisory_reviewer_reject`, `plan_rejection`). The explicit
+            reviewer-reject classes (workflow-v0.7+, #1378) make the
+            taxonomy self-documenting; the legacy bare `reviewer_reject`
+            resolves to the gating sense.
           example: [reviewer_reject, budget_override]
+        reviewer_reject_class:
+          type: string
+          enum: [gating_reviewer_reject, advisory_reviewer_reject]
+          description: |
+            The reviewer-reject page-event class the run currently
+            resolves to (#1378), from the implement stage's ADR-027
+            review authority: `gating_reviewer_reject` (agent-only
+            review — a reject pages the human) or
+            `advisory_reviewer_reject` (agent + human — a reject is
+            arbitrable / auto-routed). Omitted when the implement stage
+            is gateless (no agent reviewers). This only makes the
+            authority-resolved class legible; it does not change the
+            page/auto decision.
+          example: gating_reviewer_reject
 
     RunDelegationAction:
       type: object

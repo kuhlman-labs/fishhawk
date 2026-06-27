@@ -81,7 +81,7 @@ reference these presets once it ships).
 | Tier | Preset | `operator_agent` block |
 |---|---|---|
 | Low | `low` | No block at all. Nothing is delegated; every judgment — approval, fix-up routing, waiver, retry, merge — pages the human. This is also the default for any spec that predates the block. |
-| Medium | `medium` | `may_approve: clean_dual_approval`, `may_retry: infra_flake`, `may_route_fixup: convergent_concerns`, with the full v0 `must_page_human` event list (`reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`). The operator agent advances mechanical judgments whose evidence is unambiguous; waivers and merges stay human. |
+| Medium | `medium` | `may_approve: clean_dual_approval`, `may_retry: infra_flake`, `may_route_fixup: convergent_concerns`, with the full v0 `must_page_human` event list (`reviewer_reject` — or the explicit v0.7+ `gating_reviewer_reject` / `advisory_reviewer_reject` classes — `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`). The operator agent advances mechanical judgments whose evidence is unambiguous; waivers and merges stay human. |
 | High | `high` | All five knobs delegated: the medium set plus `may_waive: solo_low` and `may_merge: gates_resolved_ci_green`. `must_page_human` still carries the full event list — high autonomy delegates clean-path verbs, never disagreement arbitration. |
 
 Two invariants hold at every tier (ADR-027 authority unchanged):

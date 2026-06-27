@@ -11,8 +11,8 @@
   "properties": {
     "version": {
       "type": "string",
-      "enum": ["0.3", "0.4", "0.5", "0.6"],
-      "description": "Spec syntax version. 0.6 adds workflow.decomposition.max_parallel — a per-workflow override of FISHHAWKD_MAX_PARALLEL_CHILDREN bounding how many decomposed child runs dispatch concurrently (E24.6 / #1146), additive within workflow-v0.x. 0.5 adds operator_agent — delegation knobs for the operator agent, declarable at workflow level and per approval gate (ADR-040 / #1026), additive within workflow-v0.x. 0.4 adds workflow.budgets — periodic per-workflow cost ceilings (ADR-030 / #688), additive within workflow-v0.x. 0.3 adds workflow.on_ci_failure.max_retries for the auto-retry epic (#276 / #277), workflow.policy.max_stage_runtime and stage.executor.timeout for spec-governed agent timeouts (#452). 0.2 dropped gate.blocking_checks (ADR-017 / #249); 0.1 is rejected. Old specs in the audit log remain readable forever via the historical schemas; this enum gates *new* specs only."
+      "enum": ["0.3", "0.4", "0.5", "0.6", "0.7"],
+      "description": "Spec syntax version. 0.7 adds the explicit advisory_reviewer_reject / gating_reviewer_reject delegation page-event classes (#1378), additive within workflow-v0.x; the bare reviewer_reject is preserved and resolves to the gating sense. 0.6 adds workflow.decomposition.max_parallel — a per-workflow override of FISHHAWKD_MAX_PARALLEL_CHILDREN bounding how many decomposed child runs dispatch concurrently (E24.6 / #1146), additive within workflow-v0.x. 0.5 adds operator_agent — delegation knobs for the operator agent, declarable at workflow level and per approval gate (ADR-040 / #1026), additive within workflow-v0.x. 0.4 adds workflow.budgets — periodic per-workflow cost ceilings (ADR-030 / #688), additive within workflow-v0.x. 0.3 adds workflow.on_ci_failure.max_retries for the auto-retry epic (#276 / #277), workflow.policy.max_stage_runtime and stage.executor.timeout for spec-governed agent timeouts (#452). 0.2 dropped gate.blocking_checks (ADR-017 / #249); 0.1 is rejected. Old specs in the audit log remain readable forever via the historical schemas; this enum gates *new* specs only."
     },
     "roles": {
       "type": "object",
@@ -458,11 +458,13 @@
         "must_page_human": {
           "type": "array",
           "uniqueItems": true,
-          "description": "Events that always page the human regardless of the may_* knobs. Closed v0 set; an event listed here is never absorbed by a delegation.",
+          "description": "Events that always page the human regardless of the may_* knobs. Closed v0 set; an event listed here is never absorbed by a delegation. The reviewer-reject taxonomy carries three tokens: the explicit advisory_reviewer_reject (an agent reject under advisory review authority — arbitrable / auto-routed) and gating_reviewer_reject (an agent reject under gating authority — pages the human), plus the legacy bare reviewer_reject, which is preserved and maps to the gating class for back-compat (requires version 0.7+ for the explicit tokens).",
           "items": {
             "type": "string",
             "enum": [
               "reviewer_reject",
+              "advisory_reviewer_reject",
+              "gating_reviewer_reject",
               "plan_rejection",
               "scope_amendment",
               "budget_override",
