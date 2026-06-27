@@ -564,6 +564,38 @@ func (c *Client) ListStageArtifacts(ctx context.Context, stageID uuid.UUID) ([]A
 	return res.Items, nil
 }
 
+// RollbackDeploymentResult is the decoded 202 body of POST
+// /v0/runs/{run_id}/deployment/rollback. Field names + types match the
+// backend rollbackResponse wire shape (backend/internal/server/deploy_rollback.go)
+// verbatim: the run + deploy stage the rollback targets, the resolved external
+// rollback handle (GHARunID/ExternalRunURL, omitempty when the dispatch endpoint
+// returns no run id yet, e.g. a github_actions dispatch whose run isn't visible),
+// and the human Message explaining when the rolled_back outcome is recorded.
+type RollbackDeploymentResult struct {
+	RunID          uuid.UUID `json:"run_id"`
+	StageID        uuid.UUID `json:"stage_id"`
+	Target         string    `json:"target"`
+	GHARunID       int64     `json:"gha_run_id,omitempty"`
+	ExternalRunURL string    `json:"external_run_url,omitempty"`
+	Message        string    `json:"message"`
+}
+
+// RollbackDeployment calls POST /v0/runs/{run_id}/deployment/rollback (no
+// request body) — the operator-triggered rollback sub-action for a delegating
+// deploy (ADR-038 / #1386). The endpoint re-dispatches the same external
+// pipeline down its rollback path and returns the rollback run handle (202).
+// Server-side preconditions surface as *APIError verbatim: a deploy stage that
+// has not settled (409 deploy_not_settled), a run whose cached spec carries no
+// delegating deploy stage (422 rollback_unconfigured), or a token missing the
+// write:deploy scope (403 insufficient_scope).
+func (c *Client) RollbackDeployment(ctx context.Context, runID uuid.UUID) (*RollbackDeploymentResult, error) {
+	var res RollbackDeploymentResult
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/deployment/rollback", nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // do performs the request and decodes the JSON body into out (or
 // reads the error envelope on non-2xx and returns *APIError).
 func (c *Client) do(ctx context.Context, method, path string, body []byte, out any) error {

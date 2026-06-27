@@ -13,7 +13,7 @@ This directory is its own Go module (`github.com/kuhlman-labs/fishhawk/cli`) so 
 
 ## Status
 
-E6.1 (#55), E6.2 (#33), E6.3 (#34), E6.4 (#35), E6.5 (#36) shipped: scaffold + `run start`, `run status`, `run list`, `run cancel`, `run open`, `validate`. E18.1 (#332), E18.2 (#333), E18.3 (#334), E18.4 (#335), E18.5 (#336) added `plan approve`, `plan reject`, `run retry`, `audit list`, `audit tail`.
+E6.1 (#55), E6.2 (#33), E6.3 (#34), E6.4 (#35), E6.5 (#36) shipped: scaffold + `run start`, `run status`, `run list`, `run cancel`, `run open`, `validate`. E18.1 (#332), E18.2 (#333), E18.3 (#334), E18.4 (#335), E18.5 (#336) added `plan approve`, `plan reject`, `run retry`, `audit list`, `audit tail`. E23.8 (#1388) added `deploy status`, `deploy approve`, `deploy reject`, `deploy rollback`.
 
 ## Subcommands
 
@@ -27,6 +27,10 @@ fishhawk run retry    <stage-id> [--output text|json]
 fishhawk run auto-decide <run-id> [--poll N] [--max-duration D] [--dry-run]   # INTERIM (#1233)
 fishhawk plan approve <run-id> [--reason R] [--output text|json]
 fishhawk plan reject  <run-id> [--reason R] [--output text|json]
+fishhawk deploy status   <run-id> [--output text|json]
+fishhawk deploy approve  <run-id> [--reason R] [--output text|json]
+fishhawk deploy reject   <run-id> [--reason R] [--output text|json]
+fishhawk deploy rollback <run-id> [--output text|json]
 fishhawk audit list   <run-id> [--category C] [--stage UUID] [--limit N] [--cursor X] [--output text|json]
 fishhawk audit tail   <run-id> [--interval D] [--output text|json] [--max-polls N]
 fishhawk diagnose     <run-id> [--output text|json]
@@ -40,6 +44,8 @@ fishhawk version
 `report-issue` files a deduped, audited **upstream Fishhawk product** bug or feature request (`POST /v0/runs/{id}/product-reports`), carrying the run's auto-collected diagnostic bundle. The destination is the fixed product repo, not the run's repo. By default the report carries **product facts only**; a dedup hit on the failure fingerprint appends an occurrence comment instead of opening a duplicate. Operator free text (`--description`) crosses the egress boundary **only** with the explicit `--include-free-text` consent flag, and is run through secret-redaction server-side first — without the flag the description is dropped with a warning. Egress requires the run's own run-bound token, and a per-repo `product_feedback` kill-switch returns `product_feedback_disabled`.
 
 `run retry` takes a **stage** id, not a run id — retry is stage-scoped per the state machine. Pick the failed stage from `fishhawk run status <run-id> --output json` (`.stages[].id`).
+
+`deploy` drives a run's deploy stage from the terminal. `deploy status` shows the deploy stage state plus the persisted `deployment` artifact (environment, ref, external run URL, outcome, and a rollback handle when one exists), or `deployment: (not yet recorded)` when no deployment has been attached yet. `deploy approve` / `deploy reject` decide the deploy stage's pre-execution gate through the same approvals endpoint as `plan`; `deploy approve` additionally requires the `write:deploy` scope, enforced server-side (ADR-038 / #1390) — a token without it surfaces a `403 insufficient_scope` (`required_scope: write:deploy`) verbatim. `deploy rollback` re-dispatches the same delegating pipeline down its rollback path (Fishhawk holds no prod credentials, so a rollback is just another delegating trigger); it only applies to a settled deploy (`409 deploy_not_settled` otherwise) and a run whose cached spec carries a delegating deploy stage (`422 rollback_unconfigured` otherwise).
 
 `run auto-decide` is an **INTERIM** second-channel auto-decider for known-safe mid-stage scope amendments (#1233), to be **removed when #1232 (durable non-blocking dispatch) ships**. Launch it detached alongside a blocking `fishhawk_run_stage` so a known-safe amendment can be decided in-band while the driving MCP session is blocked. It polls the run's pending amendments (reusing the `?wait` long-poll, #1035) and **auto-approves only** amendments whose every path is a coupled `*_test.go` sibling — i.e. a `<dir>/<stem>_test.go` whose production sibling `<dir>/<stem>.go` is already in the run's approved-plan `scope.files`. Everything else (any non-test path, any production file, or a test whose production sibling is out of scope) is left undecided → today's fail-and-retry. It changes no backend or runner code; it reuses endpoints that already exist. Run it with the **operator/operator-agent token** (the decision endpoint rejects run-bound `fhm_` tokens). `--poll` is the per-iteration long-poll seconds (default 25, clamped to the backend's 30s cap); `--max-duration` bounds the overall loop (default 50m); `--dry-run` logs verdicts without POSTing.
 

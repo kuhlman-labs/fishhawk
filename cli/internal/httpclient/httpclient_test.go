@@ -710,3 +710,72 @@ func TestListStageArtifacts_EnvelopeDecoded(t *testing.T) {
 		t.Errorf("content decode mismatch: %s", arts[0].Content)
 	}
 }
+
+func TestRollbackDeployment_202Decoded(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/deployment/rollback", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %q, want POST", r.Method)
+		}
+		if got := r.PathValue("run_id"); got != runID.String() {
+			t.Errorf("run_id = %q, want %s", got, runID)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer op-tok" {
+			t.Errorf("Authorization = %q, want Bearer op-tok", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(RollbackDeploymentResult{
+			RunID: runID, StageID: stageID, Target: "github_actions",
+			GHARunID: 998877, ExternalRunURL: "https://github.com/x/y/actions/runs/998877",
+			Message: "rollback re-dispatched",
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "op-tok")
+	got, err := c.RollbackDeployment(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("RollbackDeployment: %v", err)
+	}
+	if got.StageID != stageID {
+		t.Errorf("StageID = %s, want %s", got.StageID, stageID)
+	}
+	if got.Target != "github_actions" || got.GHARunID != 998877 {
+		t.Errorf("handle round-trip mismatch: %+v", got)
+	}
+	if got.ExternalRunURL == "" || got.Message == "" {
+		t.Errorf("expected external_run_url + message: %+v", got)
+	}
+}
+
+func TestRollbackDeployment_APIErrorPassthrough(t *testing.T) {
+	runID := uuid.New()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/deployment/rollback", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"error":{"code":"deploy_not_settled","message":"deploy stage has not reached a terminal outcome; nothing to roll back","details":null}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "op-tok")
+	_, err := c.RollbackDeployment(context.Background(), runID)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v, want *APIError", err)
+	}
+	if apiErr.StatusCode != http.StatusConflict {
+		t.Errorf("StatusCode = %d, want 409", apiErr.StatusCode)
+	}
+	if apiErr.Code != "deploy_not_settled" {
+		t.Errorf("Code = %q, want deploy_not_settled", apiErr.Code)
+	}
+}
