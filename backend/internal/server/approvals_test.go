@@ -3806,6 +3806,56 @@ func TestDeployGate_RequiredUpstreamCIGreenUnmet(t *testing.T) {
 	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
 }
 
+// (c') change_freeze with --override-freeze as an EMBEDDED substring (not a
+// standalone whitespace-delimited token) does NOT override (#1384 safety):
+// overriding a freeze is an explicit operator sub-action, so an incidental
+// substring inside a larger token must never bypass the gate the way the old
+// strings.Contains check did.
+func TestDeployGate_ChangeFreezeOverride_EmbeddedSubstringRefuses(t *testing.T) {
+	for _, comment := range []string{
+		"see runbook --override-freeze-policy for details",
+		"absolutely no--override-freeze here",
+	} {
+		s, _, rr, au := newApprovalServer(t)
+		stage, _ := seedDeployRun(rr, "release", deploySpecFreezeOnly)
+		body := fmt.Sprintf(`{"decision":"approve","comment":%q}`, comment)
+		w := submitApproval(t, s, stage.ID, body)
+		assertDeployRefused(t, w, rr, au, stage, "deploy_change_freeze_active")
+	}
+}
+
+// (f') required_upstream ci_green MET: an aggregate-green implement stage
+// (RequiredChecksSnapshot ∩ LatestForStage all passing) proceeds to dispatch.
+// This pins the SUCCESS branch of the ci_green pre-flight constraint, the
+// counterpart to TestDeployGate_RequiredUpstreamCIGreenUnmet.
+func TestDeployGate_RequiredUpstreamCIGreenMet(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	scs := newFakeStageCheckRepo()
+	s.cfg.StageCheckRepo = scs
+
+	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
+	// The run carries a required-checks snapshot; the implement stage's
+	// checks all report green, so aggregateCIGreen folds to true.
+	runRow.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
+	implStage := rr.seedStageOnRun(runRow.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	success := "success"
+	scs.byKey[scs.keyFor(implStage.ID, "ci/build")] = &stagecheck.Check{
+		StageID: implStage.ID, Name: "ci/build", Status: "completed", Conclusion: &success,
+	}
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (ci_green satisfied):\n%s", w.Code, w.Body.String())
+	}
+	if got := countAppendedCategory(au, "deploy_preflight_refused"); got != 0 {
+		t.Errorf("deploy_preflight_refused entries = %d, want 0 (ci_green met)", got)
+	}
+	cur, _ := rr.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateDispatched {
+		t.Errorf("deploy stage state = %q, want dispatched", cur.State)
+	}
+}
+
 // (g) all constraints satisfied → happy path proceeds to dispatch.
 func TestDeployGate_AllConstraintsSatisfied(t *testing.T) {
 	s, _, rr, _ := newApprovalServer(t)

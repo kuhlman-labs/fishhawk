@@ -1652,7 +1652,7 @@ func (s *Server) checkDeployPreflight(w http.ResponseWriter, r *http.Request, st
 	// this slice the operator overrides an active freeze with an explicit
 	// --override-freeze comment flag (an explicit operator sub-action,
 	// consistent with the issue's "never a blind retry" philosophy).
-	if changeFreeze && !strings.Contains(comment, "--override-freeze") {
+	if changeFreeze && !commentHasFlag(comment, "--override-freeze") {
 		s.refuseDeploy(w, r, stage, "deploy_change_freeze_active",
 			"the deploy stage declares change_freeze; a deploy during an active change freeze requires an explicit --override-freeze in the approval comment",
 			map[string]any{"change_freeze": true})
@@ -1737,6 +1737,22 @@ func parseEnvironmentFlag(comment string) string {
 		}
 	}
 	return ""
+}
+
+// commentHasFlag reports whether flag appears as a standalone,
+// whitespace-delimited token in an approval comment (#1384 safety). Unlike
+// strings.Contains, it does NOT match an embedded occurrence — so a comment
+// like "do not --override-freeze" or "see --override-freeze-docs" does not
+// count as the operator invoking the flag. Overriding a change freeze is an
+// explicit operator sub-action; an incidental substring must never bypass the
+// freeze gate.
+func commentHasFlag(comment, flag string) bool {
+	for _, tok := range strings.Fields(comment) {
+		if tok == flag {
+			return true
+		}
+	}
+	return false
 }
 
 // sliceContains reports whether want is a member of xs.
