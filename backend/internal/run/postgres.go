@@ -473,6 +473,19 @@ func (r *postgresRepo) ListStagesDispatched(ctx context.Context) ([]*Stage, erro
 	return out, nil
 }
 
+func (r *postgresRepo) ListDeployStagesAwaitingDeployment(ctx context.Context) ([]*Stage, error) {
+	q := rundb.New(r.pool)
+	rows, err := q.ListDeployStagesAwaitingDeployment(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list deploy stages awaiting deployment: %w", err)
+	}
+	out := make([]*Stage, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, rowToStage(row))
+	}
+	return out, nil
+}
+
 func (r *postgresRepo) ListStagesAwaitingChildren(ctx context.Context) ([]*Stage, error) {
 	q := rundb.New(r.pool)
 	rows, err := q.ListStagesAwaitingChildren(ctx)

@@ -144,6 +144,17 @@ SELECT * FROM stages
    AND stage_type = 'review'
  ORDER BY updated_at ASC;
 
+-- name: ListDeployStagesAwaitingDeployment :many
+-- The deploy reconciler's candidate listing (#1386 / E23.6) — every deploy
+-- stage parked in awaiting_deployment, polled to a terminal outcome against
+-- the external pipeline's GitHub Actions run. Mirrors
+-- ListReviewStagesAwaitingApproval's shape for the merge reconciler. Ordered
+-- updated_at ASC so the oldest parked deploy is reconciled first.
+SELECT * FROM stages
+ WHERE state = 'awaiting_deployment'
+   AND stage_type = 'deploy'
+ ORDER BY updated_at ASC;
+
 -- name: ListStagesDispatched :many
 -- Used by the dispatch watchdog (E8.4) to find stages stuck at
 -- 'dispatched' past a configurable timeout. Ordered by updated_at

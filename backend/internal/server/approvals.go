@@ -579,14 +579,24 @@ func (s *Server) advanceStage(ctx context.Context, stageID uuid.UUID, decision a
 
 // advanceForDecision applies the gate decision for a stage, special-casing
 // the DEPLOY pre-execution gate (ADR-038 / #1384): an approved deploy advances
-// awaiting_deploy_approval → dispatched (the downstream executor fires the
-// delegating deploy), NOT the generic approve → succeeded. Every other stage
-// and the reject path delegate to advanceStage unchanged. The full stage is
-// already in the caller's hand, so this needs no extra read.
+// awaiting_deploy_approval → dispatched, then IMMEDIATELY fires the external
+// delegating pipeline and parks at awaiting_deployment (E23.6 / #1386) — NOT the
+// generic approve → succeeded. Every other stage and the reject path delegate to
+// advanceStage unchanged. The full stage is already in the caller's hand, so
+// this needs no extra read.
+//
+// triggerDeploy owns the dispatch → running → awaiting_deployment walk and, on a
+// trigger error, fails the stage category C (returning the failed stage) rather
+// than silently parking at dispatched. A nil error from triggerDeploy means the
+// approval response should reflect the returned stage state.
 func (s *Server) advanceForDecision(ctx context.Context, stage *run.Stage, decision approval.Decision) (*run.Stage, error) {
 	if decision == approval.DecisionApprove && stage.Type == run.StageTypeDeploy {
-		return s.cfg.RunRepo.TransitionStage(ctx, stage.ID,
+		dispatched, err := s.cfg.RunRepo.TransitionStage(ctx, stage.ID,
 			run.StageStateDispatched, nil)
+		if err != nil {
+			return nil, err
+		}
+		return s.triggerDeploy(ctx, dispatched)
 	}
 	return s.advanceStage(ctx, stage.ID, decision)
 }
