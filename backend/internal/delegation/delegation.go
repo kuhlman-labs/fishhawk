@@ -361,10 +361,37 @@ func (e *Evaluator) evalCleanDualApproval(ctx context.Context, runRow *run.Run, 
 	return true, "", nil
 }
 
+// implementReviewAuthority resolves the ADR-027 reviewer authority
+// (planreview.ResolveAuthority) for the implement stage's review round:
+// advisory when agent AND human reviewers are configured (the human
+// approver is the authoritative gate), gating when agent-only. A stage
+// with no Reviewers block — or absent from the spec entirely — is
+// gateless: no agent-reviewer authority governs the verdict, so a reject
+// can only be advisory.
+func implementReviewAuthority(wf *spec.Workflow) planreview.AuthorityMode {
+	st := specStageFor(wf, run.StageTypeImplement)
+	if st == nil || st.Reviewers == nil {
+		return planreview.AuthorityGateless
+	}
+	return planreview.ResolveAuthority(*st.Reviewers)
+}
+
 // evalConvergentConcerns answers may_route_fixup's condition: the
-// implement-review round's verdicts are all in, none rejected, and at
-// least one concern is open to route. Pinned to the implement stage
-// because fix-up routing is an implement-stage verb.
+// implement-review round's verdicts are all in, no GATING-authority
+// reject is present, and at least one concern is open to route. Pinned
+// to the implement stage because fix-up routing is an implement-stage
+// verb.
+//
+// The reject branch is ADR-027 authority-aware. A planreview.VerdictReject
+// disqualifies route_fixup and pages the human (reviewer_reject) ONLY
+// under AuthorityGating (agent-only review). Under AuthorityAdvisory the
+// human approver is the gate, so an agent reject is advisory and
+// arbitrable: it does NOT disqualify, and with an open concern the
+// condition stays met so the operator agent may auto-route the fix-up.
+// A human reviewer reject is not an implement_reviewed verdict this
+// evaluator reads — it arrives via plan_rejection / gate rejection, which
+// already pages — so reviewer_reject here means a gating-authority agent
+// reject specifically.
 func (e *Evaluator) evalConvergentConcerns(ctx context.Context, runRow *run.Run, wf *spec.Workflow, open []*concern.Concern) (bool, string, error) {
 	const cond = string(spec.ConditionConvergentConcerns)
 	configured, verdicts, started, err := e.reviewRound(ctx, runRow, wf, run.StageTypeImplement)
@@ -377,9 +404,10 @@ func (e *Evaluator) evalConvergentConcerns(ctx context.Context, runRow *run.Run,
 	if len(verdicts) < configured {
 		return false, fmt.Sprintf("%s: %d of %d reviewer verdicts received", cond, len(verdicts), configured), nil
 	}
+	gating := implementReviewAuthority(wf) == planreview.AuthorityGating
 	for _, v := range verdicts {
-		if v == planreview.VerdictReject {
-			return false, cond + ": a reviewer rejected (reviewer_reject pages the human)", nil
+		if v == planreview.VerdictReject && gating {
+			return false, cond + ": a gating-authority reviewer rejected (reviewer_reject pages the human)", nil
 		}
 	}
 	if len(open) == 0 {

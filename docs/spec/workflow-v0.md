@@ -396,7 +396,7 @@ workflows:
 | Knob | Condition | Met when |
 |---|---|---|
 | `may_approve` | `clean_dual_approval` | every configured reviewer for the gated stage returned an approve verdict AND zero concerns are open |
-| `may_route_fixup` | `convergent_concerns` | all reviewer verdicts are in, at least one concern is open, no reviewer rejected |
+| `may_route_fixup` | `convergent_concerns` | all reviewer verdicts are in, at least one concern is open, and no **gating-authority** reviewer rejected — under advisory authority (agent + human reviewers, ADR-027) an agent reject is arbitrable and does NOT disqualify; under gating authority (agent-only) a reject fires `reviewer_reject` and pages |
 | `may_waive` | `solo_low` | exactly one open concern and its severity is low |
 | `may_retry` | `infra_flake` | the latest stage failure is classified as an infrastructure flake |
 | `may_merge` | `gates_resolved_ci_green` | no pending gate approvals, zero open concerns, PR open, required checks green |
@@ -407,9 +407,25 @@ workflows:
 
 **`must_page_human`.** Events that always page the human regardless of the `may_*` knobs (closed set: `reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`, `clarification_request`). An event listed here is never absorbed by a delegation. (`clarification_request` is the planner parking the plan stage at `awaiting_input` because the issue is not yet plannable — #1057.)
 
-**Authority unchanged (ADR-027).** Delegation changes *who* may act at a gate, not what gates exist or how reviewer authority resolves. The condition evaluation, API surfacing, and delegated-action enforcement are backend follow-ups (#1026 sibling slices); v0.5 of the schema defines the authoring surface and the parsed types.
+`reviewer_reject` specifically means a **gating-authority** agent reject — an agent reject on an agent-only implement review, where no human approver overrides it (ADR-027). It is the only reviewer reject that pages here, because the two other reject shapes are governed elsewhere: an **advisory** agent reject (agent + human reviewers) is non-blocking and arbitrable via `may_route_fixup` / `convergent_concerns`, and a **human** reviewer reject does not arrive as an `implement_reviewed` verdict at all — it surfaces as `plan_rejection` / gate rejection, which already pages.
+
+**Authority unchanged (ADR-027).** Delegation changes *who* may act at a gate, not what gates exist or how reviewer authority resolves. The condition evaluator reads authority from the same ADR-027 mechanism the review pipeline uses (`planreview.ResolveAuthority`: advisory when agent + human, gating when agent-only), so a delegated decision can never weaken a gating gate — it only loosens delegation where ADR-027 already makes agent verdicts non-blocking.
 
 - `may_merge` is evaluated and surfaced but has no backend merge endpoint to enforce in v0 — merge happens on GitHub; enforcement attaches when a merge action surface exists.
+
+**Decision-class taxonomy.** Each class of operator decision resolves to either an **auto** action (delegated via a `may_*` knob when its condition is met) or a **page** (a `must_page_human` event). The operator agent reads this mapping from config rather than judging the advisory-vs-hard line per-run.
+
+| Decision class | Resolution | Via |
+|---|---|---|
+| Clean dual approval (all verdicts approve, no concerns) | auto | `may_approve` / `clean_dual_approval` |
+| Advisory-concern arbitration (verdicts in, no gating reject, concern open) | auto | `may_route_fixup` / `convergent_concerns` |
+| Advisory reviewer reject (agent reject under agent + human authority) | auto | `may_route_fixup` / `convergent_concerns` (arbitrable; non-blocking per ADR-027) |
+| Gating reviewer reject (agent reject under agent-only authority) | page | `reviewer_reject` |
+| Human / hard reject | page | `plan_rejection` (gate rejection — never an `implement_reviewed` verdict) |
+| Scope amendment (agent requests new in-scope paths) | page | `scope_amendment` |
+| Budget / policy override | page | `budget_override`, `policy_override` |
+| Plan design-fork / clarification gate (plan parked at `awaiting_input`) | page | `clarification_request`, `requirement_arbitration`, `exception_request` |
+| Merge (gates resolved, CI green) | auto | `may_merge` / `gates_resolved_ci_green` (surfaced-only in v0; no enforce endpoint) |
 
 ## Decomposition controls (v0.6+)
 

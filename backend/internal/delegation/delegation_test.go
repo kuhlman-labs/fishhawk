@@ -373,15 +373,28 @@ func TestConvergentConcerns(t *testing.T) {
 			verdictEntry(3, planreview.VerdictApproveWithConcerns),
 		},
 	}}
+	rejectAudit := &fakeAudit{entries: map[string][]*audit.Entry{
+		"implement_review_started": {startedEntry(1, 2)},
+		"implement_reviewed": {
+			verdictEntry(2, planreview.VerdictApprove),
+			verdictEntry(3, planreview.VerdictReject),
+		},
+	}}
+	// advisory is the default testWorkflow implement-stage authority
+	// (agent:2, human:1 → AuthorityAdvisory); gating overrides to
+	// agent-only (agent:1, human:0 → AuthorityGating).
+	advisory := &spec.ReviewersConfig{Agent: 2, Human: 1}
+	gating := &spec.ReviewersConfig{Agent: 1, Human: 0}
 	tests := []struct {
 		name       string
+		reviewers  *spec.ReviewersConfig // implement-stage reviewers; nil = default advisory
 		open       []*concern.Concern
 		audit      *fakeAudit
 		wantMet    bool
 		wantReason string
 	}{
 		{
-			name:  "met: verdicts in, no reject, one open concern",
+			name:  "advisory met: verdicts in, no reject, one open concern",
 			open:  []*concern.Concern{openConcern("medium")},
 			audit: settledWithConcerns, wantMet: true,
 		},
@@ -401,16 +414,34 @@ func TestConvergentConcerns(t *testing.T) {
 			wantReason: "1 of 2 reviewer verdicts received",
 		},
 		{
-			name: "unmet: a reject pages the human",
-			open: []*concern.Concern{openConcern("medium")},
+			// Advisory authority (agent+human): an agent reject is
+			// arbitrable, not a hard page. With an open concern the
+			// condition stays met so route_fixup auto-arbitrates.
+			name:    "advisory met: agent reject is arbitrable with an open concern",
+			open:    []*concern.Concern{openConcern("medium")},
+			audit:   rejectAudit,
+			wantMet: true,
+		},
+		{
+			// Gating authority (agent-only): an agent reject is a hard
+			// reviewer_reject page — route_fixup is disqualified.
+			name:       "gating unmet: agent reject pages the human (reviewer_reject)",
+			reviewers:  gating,
+			open:       []*concern.Concern{openConcern("medium")},
+			audit:      rejectAudit,
+			wantReason: "reviewer_reject",
+		},
+		{
+			// Gating no-reject regression: the convergent path is
+			// otherwise unchanged — verdicts in, no reject, open concern.
+			name:      "gating met: no reject, one open concern",
+			reviewers: gating,
+			open:      []*concern.Concern{openConcern("medium")},
 			audit: &fakeAudit{entries: map[string][]*audit.Entry{
-				"implement_review_started": {startedEntry(1, 2)},
-				"implement_reviewed": {
-					verdictEntry(2, planreview.VerdictApprove),
-					verdictEntry(3, planreview.VerdictReject),
-				},
+				"implement_review_started": {startedEntry(1, 1)},
+				"implement_reviewed":       {verdictEntry(2, planreview.VerdictApproveWithConcerns)},
 			}},
-			wantReason: "a reviewer rejected",
+			wantMet: true,
 		},
 		{
 			name:       "unmet: zero open concerns to route",
@@ -421,6 +452,11 @@ func TestConvergentConcerns(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			wf := testWorkflow(&spec.OperatorAgent{MayRouteFixup: spec.ConditionConvergentConcerns}, nil)
+			reviewers := advisory
+			if tt.reviewers != nil {
+				reviewers = tt.reviewers
+			}
+			implementStage(wf).Reviewers = reviewers
 			ev := cleanDualEvaluator(nil, tt.open, tt.audit)
 			d := decisionFor(t, evaluate(t, ev, wf, newRun()), ActionRouteFixup)
 			if d.Met != tt.wantMet {
@@ -430,6 +466,40 @@ func TestConvergentConcerns(t *testing.T) {
 				t.Errorf("UnmetReason = %q, want it to contain %q", d.UnmetReason, tt.wantReason)
 			}
 		})
+	}
+}
+
+// implementStage returns the implement-stage definition in a testWorkflow.
+func implementStage(wf *spec.Workflow) *spec.Stage {
+	for i := range wf.Stages {
+		if wf.Stages[i].Type == spec.StageTypeImplement {
+			return &wf.Stages[i]
+		}
+	}
+	panic("testWorkflow has no implement stage")
+}
+
+// TestConvergentConcerns_GatelessReviewersGuard exercises
+// implementReviewAuthority's nil-Reviewers guard: a stage with no
+// reviewers block resolves to gateless authority, so a reject is NOT a
+// gating reject and does not disqualify route_fixup — with an open
+// concern the condition stays met. Fail-closed in the sense that the
+// gateless path can never fire the reviewer_reject page (no agent
+// authority gates the verdict).
+func TestConvergentConcerns_GatelessReviewersGuard(t *testing.T) {
+	wf := testWorkflow(&spec.OperatorAgent{MayRouteFixup: spec.ConditionConvergentConcerns}, nil)
+	implementStage(wf).Reviewers = nil
+	au := &fakeAudit{entries: map[string][]*audit.Entry{
+		"implement_review_started": {startedEntry(1, 2)},
+		"implement_reviewed": {
+			verdictEntry(2, planreview.VerdictApprove),
+			verdictEntry(3, planreview.VerdictReject),
+		},
+	}}
+	ev := cleanDualEvaluator(nil, []*concern.Concern{openConcern("medium")}, au)
+	d := decisionFor(t, evaluate(t, ev, wf, newRun()), ActionRouteFixup)
+	if !d.Met {
+		t.Errorf("Met = false (reason %q), want true: a gateless reject is not a gating reject", d.UnmetReason)
 	}
 }
 
