@@ -252,6 +252,58 @@ func TestRenderStatusBody_ModelResolvedActivity(t *testing.T) {
 	}
 }
 
+// TestRenderStatusBody_DeployActivity pins E23.5 / #1385: the deploy audit
+// kinds are admitted by pickActivity (not filtered as noise) and rendered
+// with brand-compliant verb phrases — the dispatch + rollback rows carry the
+// environment, and the settled outcome carries both environment and outcome.
+func TestRenderStatusBody_DeployActivity(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	cases := []struct {
+		name     string
+		category string
+		payload  map[string]any
+		want     string
+	}{
+		{
+			name:     "dispatched carries environment",
+			category: "deployment_dispatched",
+			payload:  map[string]any{"environment": "production"},
+			want:     "Deploy dispatched to `production`",
+		},
+		{
+			name:     "outcome carries environment and outcome",
+			category: "deployment_outcome_recorded",
+			payload:  map[string]any{"environment": "production", "outcome": "succeeded"},
+			want:     "Deployed to `production` — succeeded",
+		},
+		{
+			name:     "rollback initiated",
+			category: "deployment_rollback_initiated",
+			payload:  map[string]any{"environment": "staging"},
+			want:     "Deploy rollback initiated to `staging`",
+		},
+		{
+			name:     "rollback completed",
+			category: "deployment_rollback_completed",
+			payload:  map[string]any{"environment": "staging"},
+			want:     "Deploy rollback completed to `staging`",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := []*audit.Entry{
+				auditEntry(runID, 1, tc.category, "system", now.Add(-1*time.Minute), tc.payload),
+			}
+			body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+			if !strings.Contains(body, tc.want) {
+				t.Errorf("expected %q in the activity section\n---\n%s", tc.want, body)
+			}
+		})
+	}
+}
+
 func TestRenderStatusBody_NoActivity_OmitsLatestSection(t *testing.T) {
 	r, stages := statusRun(t, uuid.New())
 	body := issuecomment.RenderStatusBody(r, stages, nil, "https://x", time.Now())

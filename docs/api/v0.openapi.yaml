@@ -1350,6 +1350,71 @@ components:
         branch: { type: string }
         head_sha: { type: string }
 
+    DeploymentArtifactBody:
+      type: object
+      description: |
+        Wire shape posted to /v0/runs/{run_id}/deployment (E23.5 / #1385).
+        ADR-038's signed deployment record. Stored verbatim as the
+        artifact's content; v0 carries no schema_version because the field
+        shape isn't yet schema-stable. Fishhawk is delegating-only — the
+        external pipeline runs the deploy and this body reports its outcome.
+      required: [environment, ref, external_run_url, outcome]
+      properties:
+        environment:
+          type: string
+          description: |
+            The deploy target (gated pre-execution by the deploy stage's
+            allowed_environments constraint).
+          example: production
+        ref:
+          type: string
+          description: The git ref or sha that was deployed (ADR-038's "ref/sha").
+          example: "1111111111111111111111111111111111111111"
+        external_run_url:
+          type: string
+          format: uri
+          description: |
+            The external pipeline run Fishhawk delegated to (delegating mode —
+            Fishhawk holds no deploy logic).
+          example: https://github.com/kuhlman-labs/fishhawk/actions/runs/42
+        outcome:
+          type: string
+          enum: [succeeded, failed, partial, rolled_back]
+          description: |
+            The terminal deploy disposition (ADR-038 / #1384). `partial` and
+            `rolled_back` are non-idempotent dispositions that are never
+            blindly re-run.
+        rollback_handle:
+          type: string
+          description: |
+            Opaque handle the external pipeline returns for reverting this
+            deploy, when one exists. Optional.
+        rollback_action:
+          type: string
+          enum: [initiated, completed]
+          description: |
+            Present when the body reports an explicit rollback sub-action
+            against a prior deploy. `initiated` writes a
+            `deployment_rollback_initiated` audit entry, `completed` writes a
+            `deployment_rollback_completed` entry — in ADDITION to the
+            always-written `deployment_outcome_recorded` entry.
+
+    DeploymentUploadResponse:
+      type: object
+      description: |
+        Echoed by `POST /v0/runs/{run_id}/deployment`. `idempotent` is true
+        when the upload matched an existing artifact for the stage.
+      required: [id, stage_id, content_hash, environment, outcome, idempotent]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        content_hash:
+          type: string
+          description: Hex sha256 of the canonical deployment bytes shipped.
+        environment: { type: string }
+        outcome: { type: string, enum: [succeeded, failed, partial, rolled_back] }
+        idempotent: { type: boolean }
+
     PlanUploadResponse:
       type: object
       description: |
@@ -5895,6 +5960,103 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '413':
           description: Pull-request body exceeds the per-stage size cap (32 KiB).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/deployment:
+    post:
+      operationId: shipDeployment
+      summary: Record a deployment artifact for a deploy stage
+      description: |
+        Records ADR-038's signed `deployment` artifact (E23.5 / #1385) —
+        the governance record of a delegated release. Modeled on
+        `POST /v0/runs/{run_id}/pull-request`: Fishhawk holds no deploy
+        logic or credentials, so the external pipeline runs the deploy and
+        the body reports its settled outcome.
+
+        The body carries `{ environment, ref, external_run_url, outcome,
+        rollback_handle? }`. `outcome` is one of `succeeded` / `failed` /
+        `partial` / `rolled_back` (the ADR-038 deploy dispositions). The
+        handler stores the artifact (`artifact.kind = deployment`) and
+        writes a `deployment_outcome_recorded` chained audit entry. When the
+        body additionally carries `rollback_action` (`initiated` /
+        `completed`) it writes the matching
+        `deployment_rollback_initiated` / `deployment_rollback_completed`
+        entry as well. The deploy outcome surfaces on the run's living-anchor
+        issue timeline.
+
+        Two auth paths are accepted, mirroring the pull-request upload:
+
+        - **Ed25519 signature** (canonical deploy-executor path): supply
+          `X-Fishhawk-Signature` — the hex-encoded 64-byte Ed25519
+          signature over sha256(body), using the per-run ephemeral key.
+        - **Bearer token** (operator path): supply `Authorization: Bearer
+          <token>` with `write:runs` scope.
+
+        When both are present the signature path wins. The audit payload's
+        `auth_method` field records `ed25519` or `bearer`.
+
+        Returns 401 `signature_or_bearer_required` when neither is present.
+
+        Idempotent on (stage_id, content_hash): a re-delivery of the same
+        deployment record returns the existing artifact unchanged rather
+        than inserting a duplicate or writing a second audit entry.
+
+        v0 has no formal JSON Schema for the body — required-field checks
+        happen in the handler.
+      tags: [runner]
+      security: []
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - { name: stage_id, in: query, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - name: X-Fishhawk-Signature
+          in: header
+          required: false
+          schema:
+            type: string
+            description: Hex-encoded 64-byte Ed25519 signature over sha256(body).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeploymentArtifactBody' }
+      responses:
+        '201':
+          description: Deployment accepted; new artifact row created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeploymentUploadResponse' }
+        '200':
+          description: |
+            A deployment artifact with this content_hash already exists for
+            the stage (idempotent re-upload returns the existing artifact
+            unchanged).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeploymentUploadResponse' }
+        '400':
+          description: |
+            Body missing required fields or malformed
+            (`code: deployment_invalid`) — for example an absent
+            `environment`/`ref`/`external_run_url`, a non-http
+            `external_run_url`, an `outcome` outside the closed set, or an
+            unrecognized `rollback_action` — or path/query parameters were
+            malformed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            Auth failed. Possible codes:
+            - `signature_invalid` — `X-Fishhawk-Signature` did not verify against the run's public key, or no signing key exists for this run.
+            - `signature_or_bearer_required` — request included neither `X-Fishhawk-Signature` nor an authenticated bearer token with `write:runs` scope.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413':
+          description: Deployment body exceeds the per-stage size cap (32 KiB).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

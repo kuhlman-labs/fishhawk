@@ -71,6 +71,27 @@ func TestRenderAnchorBody_SliceIntegrationTimeline(t *testing.T) {
 	}
 }
 
+// TestRenderAnchorBody_DeployTimeline pins E23.5 / #1385: the deploy
+// governance audit kinds surface on the living-anchor timeline (which reuses
+// pickActivity + renderActivityLine), so a completed deploy's outcome renders
+// in the anchor with no anchor-specific rendering code.
+func TestRenderAnchorBody_DeployTimeline(t *testing.T) {
+	payload, _ := json.Marshal(map[string]any{"environment": "production", "outcome": "succeeded"})
+	entries := []*audit.Entry{
+		{Sequence: 7, Category: "deployment_outcome_recorded", Payload: payload, Timestamp: time.Unix(7, 0).UTC()},
+	}
+	body := RenderAnchorBody(AnchorInput{
+		Run:         anchorRun(),
+		Stages:      []*run.Stage{{Type: run.StageTypeDeploy, State: run.StageStateRunning}},
+		Audit:       entries,
+		ExternalURL: "https://app.example",
+		Now:         time.Unix(1000, 0).UTC(),
+	})
+	if !strings.Contains(body, "Deployed to `production` — succeeded") {
+		t.Errorf("anchor timeline missing the deploy outcome:\n%s", body)
+	}
+}
+
 // TestRenderAnchorBody_ModelRecommendationAndResolved pins #1013: the anchor
 // renders the plan's model_recommendation (implement_model + rationale) under
 // the plan, and the gate's resolved model_resolved {value, source} as a

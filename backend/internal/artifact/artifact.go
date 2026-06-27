@@ -28,12 +28,18 @@ type Artifact struct {
 	CreatedAt     time.Time
 }
 
-// Kind enumerates the v0 artifact kinds. Closed set per the schema's
-// CHECK constraint.
+// Kind enumerates the artifact kinds. Closed set per the schema's
+// CHECK constraint (migration 0002, widened by 0037): plan,
+// pull_request, deployment.
 type Kind string
 
 // Artifact kinds.
 const (
 	KindPlan        Kind = "plan"
 	KindPullRequest Kind = "pull_request"
+	// KindDeployment is ADR-038's signed deploy record (E23.5 / #1385):
+	// the governance artifact a delegating deploy stage emits capturing
+	// {environment, ref/sha, external_run_url, outcome, rollback_handle}.
+	// Admitted by migration 0037, which widens artifacts_kind_check.
+	KindDeployment Kind = "deployment"
 )
