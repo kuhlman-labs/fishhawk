@@ -1848,6 +1848,152 @@ func (c *Client) GetWorkflowRun(ctx context.Context, installationID int64, repo 
 	}, nil
 }
 
+// ResolveDispatchedRun recovers the workflow_dispatch run a DispatchWorkflow
+// just fired (#1386 / E23.6). GitHub's create-a-workflow-dispatch endpoint
+// returns 204 with NO run id, so the run must be resolved after the fact by
+// listing recent runs and matching the Fishhawk correlation token.
+//
+//	GET /repos/{owner}/{repo}/actions/runs?event=workflow_dispatch&branch={branch}&created=>={ts}
+//
+// correlation is the run_id+stage_id map the dispatch fired with. It is the
+// PRIMARY, REQUIRED match (binding condition 1, #1386): a listed run whose
+// echoed Inputs carry the exact correlation is an unambiguous hit. GitHub does
+// NOT populate `inputs` on every run object, so when NO listed candidate echoes
+// inputs the resolver FALLS BACK to the branch+created window — but returns a
+// run ONLY when EXACTLY ONE candidate exists. Multiple concurrent
+// workflow_dispatch runs on the same branch with no correlating inputs are
+// AMBIGUOUS and resolve to (nil, nil): INDETERMINATE, never a guess, so a caller
+// never associates a wrong external run with the deploy (and never records a
+// wrong outcome). (nil, nil) is also returned when no run has appeared yet
+// (GitHub's listing is eventually consistent) — the caller retries later.
+//
+// Returns a typed error (ErrNotFound / ErrForbidden / ErrValidation) only on a
+// hard API failure; an empty/ambiguous result is (nil, nil), not an error.
+func (c *Client) ResolveDispatchedRun(ctx context.Context, installationID int64,
+	repo RepoRef, branch string, correlation map[string]string, createdAfter time.Time) (*WorkflowRun, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if len(correlation) == 0 {
+		return nil, errors.New("githubclient: correlation token required")
+	}
+
+	q := url.Values{}
+	q.Set("event", "workflow_dispatch")
+	if branch != "" {
+		q.Set("branch", branch)
+	}
+	if !createdAfter.IsZero() {
+		// GitHub's `created` filter accepts a `>=ISO8601` value; url.Values
+		// percent-encodes the `>=` prefix, which the API decodes back.
+		q.Set("created", ">="+createdAfter.UTC().Format(time.RFC3339))
+	}
+	q.Set("per_page", "30")
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/actions/runs?" + q.Encode())
+
+	req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: resolve dispatched run: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("resolve dispatched run", resp); err != nil {
+		return nil, err
+	}
+
+	var body struct {
+		WorkflowRuns []struct {
+			ID         int64             `json:"id"`
+			HTMLURL    string            `json:"html_url"`
+			Conclusion string            `json:"conclusion"`
+			Status     string            `json:"status"`
+			Event      string            `json:"event"`
+			HeadBranch string            `json:"head_branch"`
+			HeadSHA    string            `json:"head_sha"`
+			Inputs     map[string]string `json:"inputs"`
+		} `json:"workflow_runs"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("githubclient: decode workflow runs: %w", err)
+	}
+
+	var (
+		correlated []*WorkflowRun
+		candidates []*WorkflowRun
+		anyInputs  bool
+	)
+	for i := range body.WorkflowRuns {
+		raw := body.WorkflowRuns[i]
+		// Defensive branch filter: the query already constrains by branch, but
+		// a proxy/stub may echo the whole list. Skip runs on a different branch
+		// (an empty head_branch is admitted — the API occasionally omits it).
+		if branch != "" && raw.HeadBranch != "" && raw.HeadBranch != branch {
+			continue
+		}
+		wr := &WorkflowRun{
+			ID:         raw.ID,
+			HTMLURL:    raw.HTMLURL,
+			Conclusion: raw.Conclusion,
+			Status:     raw.Status,
+			Event:      raw.Event,
+			HeadBranch: raw.HeadBranch,
+			HeadSHA:    raw.HeadSHA,
+			Inputs:     raw.Inputs,
+		}
+		candidates = append(candidates, wr)
+		if len(raw.Inputs) > 0 {
+			anyInputs = true
+			if inputsMatchCorrelation(raw.Inputs, correlation) {
+				correlated = append(correlated, wr)
+			}
+		}
+	}
+
+	// PRIMARY: an exact correlation-input match is unambiguous.
+	if len(correlated) == 1 {
+		return correlated[0], nil
+	}
+	if len(correlated) > 1 {
+		// Two runs echoing the SAME run_id+stage_id should be impossible;
+		// refuse to guess between them rather than associate a wrong run.
+		return nil, nil
+	}
+	// No correlation hit. If ANY candidate carried inputs, this dispatch's run
+	// is simply not among the listed runs yet — not found, retry later.
+	if anyInputs {
+		return nil, nil
+	}
+	// FALLBACK (echoed Inputs absent on every candidate): a SINGLE candidate on
+	// the branch+created window is safe to associate. Multiple are AMBIGUOUS —
+	// return INDETERMINATE rather than mis-associate (binding condition 1).
+	if len(candidates) == 1 {
+		return candidates[0], nil
+	}
+	return nil, nil
+}
+
+// inputsMatchCorrelation reports whether every key/value in correlation is
+// present and equal in inputs (the echoed workflow_dispatch inputs). Extra
+// inputs keys are ignored — only the correlation token must match.
+func inputsMatchCorrelation(inputs, correlation map[string]string) bool {
+	for k, v := range correlation {
+		if inputs[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
 // CreateIssueComment posts a markdown comment to the given issue
 // (or PR — GitHub treats PR conversations as issue threads).
 //
