@@ -424,6 +424,36 @@ Notes:
   plan's `model_recommendation` (implement_model + rationale) under the plan
   section. Best-effort: a nil `Audit` or append failure logs and never unwinds
   the approval the gate already recorded.
+- The deploy-stage governance audit kinds — `deployment_dispatched`,
+  `deployment_outcome_recorded`, `deployment_rollback_initiated`, and
+  `deployment_rollback_completed` (E23.5 / #1385, ADR-038) — are **system-actor
+  audit kinds with NO dedicated Notifier method**, but (like
+  `slices_integrated` / `model_resolved`) they ALSO appear in the living-anchor
+  timeline (the `status_comment_posted` surface). Nothing in `issuecomment`
+  posts them via a dedicated method; instead they render **data-drivenly**
+  through the `activityCategories` set in `status_template.go` (rendered as
+  "Deploy dispatched to `<env>`" / "Deployed to `<env>` — <outcome>" / "Deploy
+  rollback initiated to `<env>`" / "Deploy rollback completed to `<env>`"),
+  which both `RenderStatusBody` and `renderAnchorTimeline` consume — so the
+  deploy dispatch, settled outcome, and any rollback sub-action surface on the
+  living anchor with no per-kind Notifier code (and `notifier.go`'s actor
+  @-mention render surface is genuinely uninvolved: these are fixed
+  system-actor verb phrases that never `@`-mention an approver). The ship
+  handler (`server/deployment.go::handleShipDeployment`,
+  `POST /v0/runs/{run_id}/deployment`) is the SOLE writer of
+  `deployment_outcome_recorded` (payload `{run_id, stage_id, artifact_id,
+  content_hash, environment, ref, external_run_url, outcome, rollback_handle,
+  auth_method}`, written on every persisted `deployment` artifact) and — when
+  the body carries a `rollback_action` — the matching
+  `deployment_rollback_initiated` / `deployment_rollback_completed` entry
+  (payload `{run_id, stage_id, artifact_id, environment, rollback_handle,
+  rollback_action, auth_method}`, best-effort: an append failure WARN-logs and
+  never unwinds the recorded artifact + outcome). `deployment_dispatched` is
+  EMITTED by the E23.4 deploy stage machine (the pre-execution-gated dispatch),
+  not by this handler; it is introduced as a constant + surfaced on the timeline
+  here so dispatch and outcome render consistently. The handler refreshes the
+  sticky living-anchor comment via the separate `notifyStatusUpdate` hook (like
+  the PR-upload handler), not by posting a dedicated comment.
 - The bounded-retry give-up audit kind — `slice_integration_failed` (#1243) —
   is a **system-actor audit kind with no dedicated Notifier method and is NOT
   an issue-comment surface**. The child-completion sweeper

@@ -142,6 +142,16 @@ var activityCategories = map[string]struct{}{
 	// surfacing it lets the issue thread show which model (and which rung)
 	// will drive the implement stage.
 	"model_resolved": {},
+	// Deploy stage governance trail (E23.5 / #1385, ADR-038). Like
+	// slices_integrated / model_resolved, these are system-actor audit kinds
+	// with NO dedicated Notifier method — they render data-drivenly through
+	// this set (and renderActivityLine below), so the deploy dispatch, the
+	// settled outcome, and any rollback sub-action surface on the living
+	// anchor / status comment timeline without per-kind Notifier code.
+	"deployment_dispatched":         {},
+	"deployment_outcome_recorded":   {},
+	"deployment_rollback_initiated": {},
+	"deployment_rollback_completed": {},
 }
 
 // renderActivityLine returns a user-readable verb-phrase for an
@@ -182,6 +192,14 @@ func renderActivityLine(e *audit.Entry) string {
 		return "Slice integration conflict"
 	case "model_resolved":
 		return renderModelResolvedLine(e.Payload)
+	case "deployment_dispatched":
+		return renderDeployLine("Deploy dispatched", e.Payload)
+	case "deployment_outcome_recorded":
+		return renderDeployOutcomeLine(e.Payload)
+	case "deployment_rollback_initiated":
+		return renderDeployLine("Deploy rollback initiated", e.Payload)
+	case "deployment_rollback_completed":
+		return renderDeployLine("Deploy rollback completed", e.Payload)
 	default:
 		if actor == "" {
 			return e.Category
@@ -305,6 +323,50 @@ func decodeModelResolved(payload json.RawMessage) (model, source string) {
 		return "", ""
 	}
 	return p.Model, p.ModelSource
+}
+
+// renderDeployLine renders a deploy activity row (E23.5 / #1385) as a verb
+// phrase with the target environment appended when the payload carries one,
+// e.g. "Deploy dispatched to `production`". Used for the dispatch + rollback
+// categories; the settled-outcome category has its own renderer.
+func renderDeployLine(verb string, payload json.RawMessage) string {
+	if env, _ := decodeDeployActivity(payload); env != "" {
+		return fmt.Sprintf("%s to `%s`", verb, env)
+	}
+	return verb
+}
+
+// renderDeployOutcomeLine renders a deployment_outcome_recorded row with both
+// the environment and the settled outcome, e.g. "Deployed to `production` —
+// succeeded". Falls back gracefully when either field is absent.
+func renderDeployOutcomeLine(payload json.RawMessage) string {
+	env, outcome := decodeDeployActivity(payload)
+	switch {
+	case env != "" && outcome != "":
+		return fmt.Sprintf("Deployed to `%s` — %s", env, outcome)
+	case env != "":
+		return fmt.Sprintf("Deployed to `%s`", env)
+	case outcome != "":
+		return fmt.Sprintf("Deploy outcome recorded — %s", outcome)
+	}
+	return "Deploy outcome recorded"
+}
+
+// decodeDeployActivity reads the {environment, outcome} fields a deploy audit
+// payload carries (the handleShipDeployment payload tags). Returns ("", "")
+// on any decode failure so the activity line degrades to its bare verb.
+func decodeDeployActivity(payload json.RawMessage) (environment, outcome string) {
+	if len(payload) == 0 {
+		return "", ""
+	}
+	var p struct {
+		Environment string `json:"environment"`
+		Outcome     string `json:"outcome"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return "", ""
+	}
+	return p.Environment, p.Outcome
 }
 
 func retryAttemptSuffix(payload json.RawMessage) string {

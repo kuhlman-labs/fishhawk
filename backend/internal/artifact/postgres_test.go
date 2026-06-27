@@ -94,6 +94,63 @@ func TestPostgres_CreateAndGetArtifact(t *testing.T) {
 	}
 }
 
+// TestPostgres_CreateAndGet_DeploymentKind pins E23.5 / #1385: the
+// `deployment` artifact kind (ADR-038) round-trips through Create + Get +
+// ListForStage. This is the real-DB assertion that migration 0037 widened
+// artifacts_kind_check to admit it — the pgtest template auto-applies 0037,
+// so a Create with KindDeployment that would fail SQLSTATE 23514 against the
+// un-migrated two-value CHECK succeeds here.
+func TestPostgres_CreateAndGet_DeploymentKind(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := artifact.NewPostgresRepository(pool)
+	stageID := makeStage(t, pool)
+
+	body, err := json.Marshal(map[string]any{
+		"environment":      "production",
+		"ref":              "1111111111111111111111111111111111111111",
+		"external_run_url": "https://github.com/kuhlman-labs/fishhawk/actions/runs/42",
+		"outcome":          "succeeded",
+		"rollback_handle":  "deploy-42",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := repo.Create(context.Background(), artifact.CreateParams{
+		StageID:     stageID,
+		Kind:        artifact.KindDeployment,
+		Content:     body,
+		ContentHash: sha256Hex(body),
+	})
+	if err != nil {
+		t.Fatalf("Create deployment artifact (migration 0037 must admit the kind): %v", err)
+	}
+	if created.Kind != artifact.KindDeployment {
+		t.Errorf("Kind = %q, want deployment", created.Kind)
+	}
+
+	got, err := repo.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Kind != artifact.KindDeployment {
+		t.Errorf("round-tripped Kind = %q, want deployment", got.Kind)
+	}
+
+	listed, err := repo.ListForStage(context.Background(), stageID)
+	if err != nil {
+		t.Fatalf("ListForStage: %v", err)
+	}
+	var found bool
+	for _, a := range listed {
+		if a.ID == created.ID && a.Kind == artifact.KindDeployment {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("ListForStage did not return the deployment artifact; got %d artifacts", len(listed))
+	}
+}
+
 func TestPostgres_GetArtifact_NotFound(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := artifact.NewPostgresRepository(pool)
