@@ -797,6 +797,108 @@ func TestPostgres_ListReviewStagesAwaitingApproval_IncludesSLALess(t *testing.T)
 	}
 }
 
+func TestPostgres_DeployStage_PersistRoundTrip(t *testing.T) {
+	// #1400 done-means: a real deploy stage row must be insertable and its
+	// deploy-only type + states must round-trip through Postgres. Before
+	// migration 0038 widened stages_type_check ('deploy') and
+	// stages_state_check ('awaiting_deploy_approval' / 'awaiting_deployment'),
+	// the CreateStage insert here failed with SQLSTATE 23514 (check_violation)
+	// and the transitions were unreachable. The insert succeeding IS the
+	// load-bearing assertion (the Go fake doesn't enforce the CHECK).
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+	r := makeRun(t, repo)
+
+	s, err := repo.CreateStage(ctx, run.CreateStageParams{
+		RunID:        r.ID,
+		Sequence:     0,
+		Type:         run.StageTypeDeploy,
+		ExecutorKind: run.ExecutorAgent,
+		ExecutorRef:  "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(deploy): %v", err)
+	}
+	if s.Type != run.StageTypeDeploy {
+		t.Errorf("CreateStage Type = %q, want %q", s.Type, run.StageTypeDeploy)
+	}
+
+	// Walk the deploy lifecycle: pending → awaiting_deploy_approval (the
+	// pre-execution gate park) → dispatched → running → awaiting_deployment
+	// (the in-flight external-pipeline poll). Each transition's persisted
+	// state must satisfy the widened stages_state_check.
+	for _, to := range []run.StageState{
+		run.StageStateAwaitingDeployApproval,
+		run.StageStateDispatched,
+		run.StageStateRunning,
+		run.StageStateAwaitingDeployment,
+	} {
+		got, err := repo.TransitionStage(ctx, s.ID, to, nil)
+		if err != nil {
+			t.Fatalf("→%s: %v", to, err)
+		}
+		if got.State != to {
+			t.Errorf("after transition State = %q, want %q", got.State, to)
+		}
+	}
+
+	// GetStage confirms the deploy type + the in-flight deploy state survive
+	// a fresh read from Postgres.
+	got, err := repo.GetStage(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.Type != run.StageTypeDeploy {
+		t.Errorf("GetStage Type = %q, want %q", got.Type, run.StageTypeDeploy)
+	}
+	if got.State != run.StageStateAwaitingDeployment {
+		t.Errorf("GetStage State = %q, want %q", got.State, run.StageStateAwaitingDeployment)
+	}
+}
+
+func TestPostgres_ListStagesAwaitingApproval_IncludesDeployStage(t *testing.T) {
+	// The SLA ticker's gate_sla-filtered query (ListStagesAwaitingApproval)
+	// was broadened (#1390 / #1399) to also surface deploy stages parked at
+	// awaiting_deploy_approval with a non-null gate_sla. This real-SQL test
+	// pins that a deploy stage with a gate_sla is returned — the insert and
+	// the awaiting_deploy_approval park both depend on migration 0038.
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+	r := makeRun(t, repo)
+
+	sla := "4_business_hours"
+	s, err := repo.CreateStage(ctx, run.CreateStageParams{
+		RunID:            r.ID,
+		Sequence:         0,
+		Type:             run.StageTypeDeploy,
+		ExecutorKind:     run.ExecutorAgent,
+		ExecutorRef:      "claude-code",
+		RequiresApproval: true,
+		GateSLA:          &sla,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(deploy): %v", err)
+	}
+	// Park directly at the pre-execution gate (pending → awaiting_deploy_approval).
+	if _, err := repo.TransitionStage(ctx, s.ID, run.StageStateAwaitingDeployApproval, nil); err != nil {
+		t.Fatalf("→awaiting_deploy_approval: %v", err)
+	}
+
+	stages, err := repo.ListStagesAwaitingApproval(ctx)
+	if err != nil {
+		t.Fatalf("ListStagesAwaitingApproval: %v", err)
+	}
+	got := map[uuid.UUID]bool{}
+	for _, st := range stages {
+		got[st.ID] = true
+	}
+	if !got[s.ID] {
+		t.Errorf("ListStagesAwaitingApproval dropped the awaiting_deploy_approval deploy stage %s (gate_sla set)", s.ID)
+	}
+}
+
 func TestPostgres_StageGate_NilWhenSpecHasNoGate(t *testing.T) {
 	// The dispatcher passes Gate=nil for gateless stages (e.g.
 	// implement). The persisted row's Gate must come back nil too,
