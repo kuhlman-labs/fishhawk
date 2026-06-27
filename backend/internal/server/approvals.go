@@ -345,6 +345,22 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		resolvedModel = rm
 	}
 
+	// Deploy gate (#1384 / E23.4 / ADR-038): the deploy stage's PRE-execution
+	// approval gate. Unlike the post-hoc plan/review gates, a deploy stage's
+	// effect IS the side effect, so the gate evaluates the deploy's pre-flight
+	// constraints (allowed_environments / change_freeze / required_upstream)
+	// BEFORE the approval advances the stage off the gate to dispatch.
+	// PRE-Submit for the same ADR-036 ordering reason as the plan gates: a
+	// refused approval inserts no row, so a corrected retry (e.g. with
+	// --environment / --override-freeze) flows normally. Unlike the plan
+	// gates' fail-open posture, checkDeployPreflight FAILS CLOSED (#1384,
+	// operator binding condition 1): an unverifiable deploy is denied.
+	if decision == approval.DecisionApprove && stage.Type == run.StageTypeDeploy {
+		if !s.checkDeployPreflight(w, r, stage, req.Comment) {
+			return
+		}
+	}
+
 	// ADR-017 (#249, #253): the approval handler no longer gates on
 	// stage_check state. Reviewers approve based on plan + diff;
 	// GitHub branch protection blocks the merge until the required
@@ -411,7 +427,7 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		s.writeModelResolvedAudit(r, stage, res.Approval, *resolvedModel)
 	}
 
-	stage, err = s.advanceStage(r.Context(), stageID, decision)
+	stage, err = s.advanceForDecision(r.Context(), stage, decision)
 	if err != nil {
 		var inv run.InvalidTransitionError
 		if errors.As(err, &inv) {
@@ -540,6 +556,14 @@ func (s *Server) findPriorApproval(ctx context.Context, stageID uuid.UUID, subje
 // path delegates to run.FailStage so the failure pattern is
 // identical to the SLA path and the trace-time policy path
 // (E8.1 #39).
+//
+// NOTE (ADR-038 / #1384): a DEPLOY-stage approve does NOT route through here.
+// Its pre-execution gate advances awaiting_deploy_approval → dispatched (the
+// delegating executor still has to fire — the work is NOT done), so the
+// caller special-cases it BEFORE calling advanceStage rather than threading a
+// stage-type parameter through every call site (see handleSubmitApproval's
+// advanceForDecision). advanceStage keeps the generic approve → succeeded
+// semantics every non-deploy gated stage relies on.
 func (s *Server) advanceStage(ctx context.Context, stageID uuid.UUID, decision approval.Decision) (*run.Stage, error) {
 	switch decision {
 	case approval.DecisionApprove:
@@ -551,6 +575,20 @@ func (s *Server) advanceStage(ctx context.Context, stageID uuid.UUID, decision a
 	}
 	// Unreachable — decision was validated earlier.
 	return nil, errors.New("approval: unknown decision (programmer error)")
+}
+
+// advanceForDecision applies the gate decision for a stage, special-casing
+// the DEPLOY pre-execution gate (ADR-038 / #1384): an approved deploy advances
+// awaiting_deploy_approval → dispatched (the downstream executor fires the
+// delegating deploy), NOT the generic approve → succeeded. Every other stage
+// and the reject path delegate to advanceStage unchanged. The full stage is
+// already in the caller's hand, so this needs no extra read.
+func (s *Server) advanceForDecision(ctx context.Context, stage *run.Stage, decision approval.Decision) (*run.Stage, error) {
+	if decision == approval.DecisionApprove && stage.Type == run.StageTypeDeploy {
+		return s.cfg.RunRepo.TransitionStage(ctx, stage.ID,
+			run.StageStateDispatched, nil)
+	}
+	return s.advanceStage(ctx, stage.ID, decision)
 }
 
 // checkApproverAuthorization returns true when subject is allowed
@@ -1499,4 +1537,267 @@ func (s *Server) checkDelegation(w http.ResponseWriter, r *http.Request, runID u
 		"the effective operator_agent block does not delegate this action (fail-closed)",
 		map[string]any{"action": action})
 	return "", false
+}
+
+// checkDeployPreflight is the deploy stage's PRE-execution approval gate
+// (ADR-038 / #1384). It resolves the deploy stage from the run's cached
+// workflow spec, collects its pre-flight constraints (allowed_environments /
+// change_freeze / required_upstream), and refuses the approval (422 + a
+// deploy_preflight_refused audit) when any is violated. Returns true to
+// proceed; false after writing the error response.
+//
+// FAIL CLOSED (#1384, operator binding condition 1) — the inverse of
+// checkPlanBudget's fail-open posture. A deploy stage's effect IS the side
+// effect, so an unverifiable deploy must be DENIED, not waved through. Every
+// can't-EVALUATE branch (nil repos, run-read failure, absent/unparseable
+// spec, deploy stage not found) refuses with 422 deploy_preflight_unevaluable
+// and a deploy_preflight_refused audit.
+//
+// NUANCE: a deploy stage whose spec parses but declares NO pre-flight
+// constraints PASSES — there is nothing to enforce. Fail-closed targets the
+// can't-evaluate-due-to-error path only, not the no-constraints-declared
+// case.
+func (s *Server) checkDeployPreflight(w http.ResponseWriter, r *http.Request, stage *run.Stage, comment string) bool {
+	ctx := r.Context()
+
+	if s.cfg.RunRepo == nil {
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			"deploy pre-flight cannot be evaluated: run repository is not configured; an unverifiable deploy is denied (fail-closed)", nil)
+		return false
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
+	if err != nil {
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			"deploy pre-flight cannot be evaluated: run lookup failed; an unverifiable deploy is denied (fail-closed)",
+			map[string]any{"error": err.Error()})
+		return false
+	}
+	if len(runRow.WorkflowSpec) == 0 {
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			"deploy pre-flight cannot be evaluated: the run carries no cached workflow spec; an unverifiable deploy is denied (fail-closed)", nil)
+		return false
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			"deploy pre-flight cannot be evaluated: the cached workflow spec does not parse; an unverifiable deploy is denied (fail-closed)",
+			map[string]any{"error": err.Error()})
+		return false
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			"deploy pre-flight cannot be evaluated: the run's workflow is not in its cached spec; an unverifiable deploy is denied (fail-closed)",
+			map[string]any{"workflow_id": runRow.WorkflowID})
+		return false
+	}
+	var deployStage spec.Stage
+	foundDeploy := false
+	for _, st := range wf.Stages {
+		if st.Type == spec.StageTypeDeploy {
+			deployStage = st
+			foundDeploy = true
+			break
+		}
+	}
+	if !foundDeploy {
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			"deploy pre-flight cannot be evaluated: no deploy stage found in the run's workflow; an unverifiable deploy is denied (fail-closed)", nil)
+		return false
+	}
+
+	// Collect the pre-flight constraints. NUANCE (#1384 condition 1): a
+	// deploy stage that parses but declares NO pre-flight constraints passes
+	// — there is nothing to enforce, and fail-closed targets the
+	// can't-evaluate path, not the nothing-declared case.
+	var (
+		allowedEnvs   []string
+		changeFreeze  bool
+		requiredUp    []string
+		hasConstraint bool
+	)
+	for _, c := range deployStage.Constraints {
+		if len(c.AllowedEnvironments) > 0 {
+			allowedEnvs = c.AllowedEnvironments
+			hasConstraint = true
+		}
+		if c.ChangeFreeze != nil {
+			changeFreeze = *c.ChangeFreeze
+			hasConstraint = true
+		}
+		if len(c.RequiredUpstream) > 0 {
+			requiredUp = c.RequiredUpstream
+			hasConstraint = true
+		}
+	}
+	if !hasConstraint {
+		return true
+	}
+
+	// (a) allowed_environments — the requested target environment is read
+	// from a `--environment=<env>` approval-comment flag (#1384 design
+	// default, mirroring --override-budget's comment-flag convention).
+	if len(allowedEnvs) > 0 {
+		env := parseEnvironmentFlag(comment)
+		if env == "" || !sliceContains(allowedEnvs, env) {
+			s.refuseDeploy(w, r, stage, "deploy_environment_not_allowed",
+				fmt.Sprintf("requested deploy environment %q is not in the deploy stage's allowed_environments %v; pass --environment=<env> with an allowed value in the approval comment", env, allowedEnvs),
+				map[string]any{"requested_environment": env, "allowed_environments": allowedEnvs})
+			return false
+		}
+	}
+
+	// (b) change_freeze — a spec-declared `change_freeze: true` gates the
+	// deploy. The live freeze-window signal is downstream (E23.5/6/10); in
+	// this slice the operator overrides an active freeze with an explicit
+	// --override-freeze comment flag (an explicit operator sub-action,
+	// consistent with the issue's "never a blind retry" philosophy).
+	if changeFreeze && !strings.Contains(comment, "--override-freeze") {
+		s.refuseDeploy(w, r, stage, "deploy_change_freeze_active",
+			"the deploy stage declares change_freeze; a deploy during an active change freeze requires an explicit --override-freeze in the approval comment",
+			map[string]any{"change_freeze": true})
+		return false
+	}
+
+	// (c) required_upstream — ci_green and review_merged proxies (#1384
+	// design default). A required upstream that is not satisfied refuses.
+	for _, up := range requiredUp {
+		switch up {
+		case "ci_green":
+			if !s.deployCIGreen(ctx, runRow) {
+				s.refuseDeploy(w, r, stage, "deploy_upstream_not_satisfied",
+					"required upstream ci_green is not satisfied: not every required status check has reported green on the implement stage",
+					map[string]any{"required_upstream": up})
+				return false
+			}
+		case "review_merged":
+			if !s.deployReviewMerged(ctx, runRow) {
+				s.refuseDeploy(w, r, stage, "deploy_upstream_not_satisfied",
+					"required upstream review_merged is not satisfied: the run has no pull_request_url and a succeeded review stage",
+					map[string]any{"required_upstream": up})
+				return false
+			}
+		default:
+			// Unrecognized required_upstream token: fail closed — an
+			// upstream the gate cannot evaluate must not pass an
+			// unverifiable deploy.
+			s.refuseDeploy(w, r, stage, "deploy_upstream_not_satisfied",
+				fmt.Sprintf("required upstream %q is not a recognized pre-flight signal; an unevaluable upstream denies the deploy (fail-closed)", up),
+				map[string]any{"required_upstream": up})
+			return false
+		}
+	}
+
+	return true
+}
+
+// refuseDeploy emits a deploy_preflight_refused audit (system actor) and
+// writes a 422 with the given code/message (#1384). Shared by every
+// checkDeployPreflight refusal — both the can't-evaluate (fail-closed) path
+// and the constraint-violation paths — so every deploy-gate refusal lands a
+// uniform audit receipt carrying the specific reason code. Best-effort audit:
+// a logged append failure never suppresses the refusal the gate already
+// decided.
+func (s *Server) refuseDeploy(w http.ResponseWriter, r *http.Request, stage *run.Stage, code, message string, details map[string]any) {
+	if details == nil {
+		details = map[string]any{}
+	}
+	details["stage_id"] = stage.ID.String()
+
+	if s.cfg.AuditRepo != nil {
+		payload, _ := json.Marshal(map[string]any{
+			"stage_id":      stage.ID.String(),
+			"refusal_code":  code,
+			"refusal_field": message,
+		})
+		systemKind := audit.ActorKind("system")
+		if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+			RunID:     stage.RunID,
+			StageID:   &stage.ID,
+			Timestamp: time.Now().UTC(),
+			Category:  "deploy_preflight_refused",
+			ActorKind: &systemKind,
+			Payload:   payload,
+		}); err != nil {
+			s.cfg.Logger.Error("audit append failed for deploy_preflight_refused",
+				"run_id", stage.RunID, "stage_id", stage.ID, "error", err.Error())
+		}
+	}
+
+	s.writeError(w, r, http.StatusUnprocessableEntity, code, message, details)
+}
+
+// parseEnvironmentFlag extracts the value of a `--environment=<env>` flag
+// from an approval comment (#1384). Returns the empty string when absent.
+func parseEnvironmentFlag(comment string) string {
+	const flag = "--environment="
+	for _, tok := range strings.Fields(comment) {
+		if strings.HasPrefix(tok, flag) {
+			return strings.TrimPrefix(tok, flag)
+		}
+	}
+	return ""
+}
+
+// sliceContains reports whether want is a member of xs.
+func sliceContains(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
+}
+
+// deployCIGreen evaluates the required_upstream `ci_green` pre-flight signal
+// (#1384): every required status check has reported green on the run's
+// implement stage, reusing aggregateCIGreen over the run's
+// RequiredChecksSnapshot. Returns false (not satisfied) when the snapshot or
+// the stage-check repo is unwired, the implement stage is absent, the check
+// read errors, or the aggregate is nil/false — the safe direction for a
+// pre-execution deploy gate.
+func (s *Server) deployCIGreen(ctx context.Context, runRow *run.Run) bool {
+	if runRow.RequiredChecksSnapshot == nil || s.cfg.StageCheckRepo == nil {
+		return false
+	}
+	implStage := s.findImplementStage(ctx, runRow.ID)
+	if implStage == nil {
+		return false
+	}
+	checks, err := s.cfg.StageCheckRepo.LatestForStage(ctx, implStage.ID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "deploy gate: list stage checks failed",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+	g := aggregateCIGreen(runRow.RequiredChecksSnapshot.Contexts, checks)
+	return g != nil && *g
+}
+
+// deployReviewMerged evaluates the required_upstream `review_merged`
+// pre-flight signal (#1384): the run carries a pull_request_url AND a
+// succeeded review stage — a proxy for "the change merged", since merged
+// state is not tracked on the run row today (the precise signal tightens when
+// the deploy executor lands, E23.5/6/10). Returns false on a stage-list error
+// (the safe direction).
+func (s *Server) deployReviewMerged(ctx context.Context, runRow *run.Run) bool {
+	if runRow.PullRequestURL == nil || *runRow.PullRequestURL == "" {
+		return false
+	}
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runRow.ID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "deploy gate: list stages failed",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+	for _, st := range stages {
+		if st.Type == run.StageTypeReview && st.State == run.StageStateSucceeded {
+			return true
+		}
+	}
+	return false
 }

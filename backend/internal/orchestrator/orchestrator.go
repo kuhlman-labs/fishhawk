@@ -251,6 +251,30 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 		return o.completeRun(ctx, r, stages)
 	}
 
+	// ADR-038 (#1384): a deploy stage's effect IS the side effect, so its
+	// gate is PRE-execution. Park the pending deploy stage at its
+	// pre-execution approval gate (pending → awaiting_deploy_approval) and
+	// return WITHOUT dispatching — nothing ships until an operator approves
+	// the deploy INTENT (checkDeployPreflight at the approval gate). This is
+	// the inverse of the plan/implement/review stages, which dispatch first
+	// and gate after. Return OutcomeDispatched (advanced to the gate,
+	// consistent with the human-stage gate path). Idempotent: a re-entrant
+	// Advance hits the same-state no-op (awaiting_deploy_approval is settled,
+	// so the next Advance finds it as `gated`, not pending). Placed BEFORE
+	// the decomposition / consolidated-PR / dispatch block so no
+	// fireDispatch / workflow_dispatch can fire for a deploy stage.
+	if next.Type == run.StageTypeDeploy {
+		if _, err := o.Runs.TransitionStage(ctx, next.ID, run.StageStateAwaitingDeployApproval, nil); err != nil {
+			return OutcomeNoOp, fmt.Errorf("orchestrator: park deploy stage at pre-execution gate: %w", err)
+		}
+		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator parked deploy stage at pre-execution approval gate",
+			slog.String("run_id", r.ID.String()),
+			slog.String("stage_id", next.ID.String()),
+			slog.Int("sequence", next.Sequence),
+		)
+		return OutcomeDispatched, nil
+	}
+
 	// ADR-025 D4: when the approved plan declares decomposition,
 	// fan the parent's implement stage out into child runs rather
 	// than dispatching it. Only checked when the next pending stage

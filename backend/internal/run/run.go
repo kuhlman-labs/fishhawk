@@ -59,6 +59,17 @@ func (s State) IsTerminal() bool {
 // accept the already-committed tree (exempt, zero agent re-run) or fail
 // it (category-B) per #1231. Like awaiting_input it is a parked judgment,
 // not a failure.
+//
+// `awaiting_deploy_approval` and `awaiting_deployment` are the deploy
+// stage's two non-terminal states (ADR-038 / #1384). They invert the plan/
+// review post-hoc-gate model: a deploy stage's effect IS the side effect, so
+// its gate is PRE-execution. `awaiting_deploy_approval` is the pre-execution
+// gate park — the stage waits for an operator to approve the deploy INTENT
+// before anything ships, so (like awaiting_approval) it is a parked judgment
+// settled by operator action. `awaiting_deployment` is the in-flight state
+// AFTER approval: the executor is polling the external delegating pipeline,
+// so (like dispatched/running) it is NOT awaiting operator action and is
+// deliberately excluded from IsSettled.
 type StageState string
 
 // Stage states. Terminal states (Succeeded, Failed, Cancelled) admit
@@ -71,9 +82,21 @@ const (
 	StageStateAwaitingChildren      StageState = "awaiting_children"
 	StageStateAwaitingInput         StageState = "awaiting_input"
 	StageStateAwaitingScopeDecision StageState = "awaiting_scope_decision"
-	StageStateSucceeded             StageState = "succeeded"
-	StageStateFailed                StageState = "failed"
-	StageStateCancelled             StageState = "cancelled"
+	// StageStateAwaitingDeployApproval is the deploy stage's pre-execution
+	// gate park: the stage waits for an operator to approve the deploy
+	// INTENT before anything ships (ADR-038 / #1384). Settled (awaiting
+	// operator action), never terminal.
+	StageStateAwaitingDeployApproval StageState = "awaiting_deploy_approval"
+	// StageStateAwaitingDeployment is the deploy stage's in-flight state
+	// AFTER approval: the downstream executor is polling the external
+	// delegating pipeline (ADR-038 / #1384). Like dispatched/running it is
+	// in-flight (NOT awaiting operator action), so it is deliberately
+	// EXCLUDED from IsSettled — including it would release the stage
+	// terminal-wait long-poll mid-poll (#1384, operator binding condition 2).
+	StageStateAwaitingDeployment StageState = "awaiting_deployment"
+	StageStateSucceeded          StageState = "succeeded"
+	StageStateFailed             StageState = "failed"
+	StageStateCancelled          StageState = "cancelled"
 )
 
 // IsTerminal reports whether the state admits no further transitions.
@@ -89,8 +112,11 @@ func (s StageState) IsTerminal() bool {
 // IsSettled reports whether the stage has stopped making forward
 // progress on its own — it is either terminal (succeeded, failed,
 // cancelled) or parked awaiting an operator action (awaiting_approval,
-// awaiting_children, awaiting_input, awaiting_scope_decision). The
-// in-flight states (pending, dispatched, running) are NOT settled.
+// awaiting_children, awaiting_input, awaiting_scope_decision,
+// awaiting_deploy_approval). The in-flight states (pending, dispatched,
+// running, awaiting_deployment) are NOT settled — awaiting_deployment is the
+// executor polling the external pipeline, not an operator gate (#1384,
+// operator binding condition 2).
 //
 // This is a strictly wider classifier than IsTerminal, used by the
 // stage terminal-wait long-poll (GET /v0/runs/{run_id}/stages/{stage_id}
@@ -102,21 +128,26 @@ func (s StageState) IsSettled() bool {
 	switch s {
 	case StageStateSucceeded, StageStateFailed, StageStateCancelled,
 		StageStateAwaitingApproval, StageStateAwaitingChildren,
-		StageStateAwaitingInput, StageStateAwaitingScopeDecision:
+		StageStateAwaitingInput, StageStateAwaitingScopeDecision,
+		StageStateAwaitingDeployApproval:
 		return true
 	default:
 		return false
 	}
 }
 
-// StageType is one of the three stage kinds permitted in v0.
+// StageType is one of the stage kinds the run state machine recognizes.
 type StageType string
 
-// Stage types. Closed set per MVP_SPEC §4.1; no custom types in v0.
+// Stage types. plan/implement/review are the v0 closed set per MVP_SPEC
+// §4.1; `deploy` is the v1 delegating release stage (ADR-038 / #925, E23.4)
+// whose effect is the side effect — its gate is PRE-execution, see
+// StageStateAwaitingDeployApproval.
 const (
 	StageTypePlan      StageType = "plan"
 	StageTypeImplement StageType = "implement"
 	StageTypeReview    StageType = "review"
+	StageTypeDeploy    StageType = "deploy"
 )
 
 // ExecutorKind says who executes the stage.
@@ -170,6 +201,64 @@ func (c FailureCategory) Description() string {
 		return "approval timeout or rejection"
 	}
 	return string(c)
+}
+
+// DeployOutcome is the terminal disposition of a deploy stage (ADR-038 /
+// #1384), modeled alongside FailureCategory rather than overloaded onto it.
+//
+// The A/B/C/D failure categories all assume re-execution is idempotent — a
+// retry re-runs the same work safely. A deploy stage breaks that assumption:
+//
+//   - `partial` — the deploy neither cleanly succeeded nor is safe to blindly
+//     re-run (some targets shipped, some did not). Treating it as a
+//     retryable A/C failure would re-ship the already-shipped targets.
+//   - `rolled_back` — an explicit operator sub-action reverted the deploy.
+//     It is a deliberate terminal disposition, NEVER a blind retry.
+//
+// `succeeded` / `failed` map to the stage's succeeded / failed terminal
+// states; `partial` / `rolled_back` are the disposition a stage can ALSO
+// carry on a terminal deploy (see Stage.DeployOutcome). Persisting the
+// outcome to a stage column and the producing executor are downstream
+// (E23.5/E23.6/E23.10); this slice delivers the representable, validated
+// type and its carrier on the in-memory stage.
+type DeployOutcome string
+
+// Deploy outcomes (ADR-038 / #1384).
+const (
+	DeployOutcomeSucceeded  DeployOutcome = "succeeded"
+	DeployOutcomeFailed     DeployOutcome = "failed"
+	DeployOutcomePartial    DeployOutcome = "partial"
+	DeployOutcomeRolledBack DeployOutcome = "rolled_back"
+)
+
+// Valid reports whether o is one of the four canonical deploy outcomes.
+// Empty / unknown values fail this check — the same fail-closed posture
+// FailureCategory.Valid enforces so a typo can't write a non-conforming
+// outcome to a deploy stage.
+func (o DeployOutcome) Valid() bool {
+	switch o {
+	case DeployOutcomeSucceeded, DeployOutcomeFailed,
+		DeployOutcomePartial, DeployOutcomeRolledBack:
+		return true
+	}
+	return false
+}
+
+// Description returns a single-line human label for o. Stable across calls;
+// mirrors FailureCategory.Description's shape. Unknown outcomes surface as
+// the literal value so bad data is not silently masked.
+func (o DeployOutcome) Description() string {
+	switch o {
+	case DeployOutcomeSucceeded:
+		return "deploy succeeded"
+	case DeployOutcomeFailed:
+		return "deploy failed"
+	case DeployOutcomePartial:
+		return "deploy partially succeeded (not safe to blindly re-run)"
+	case DeployOutcomeRolledBack:
+		return "deploy rolled back (explicit operator sub-action)"
+	}
+	return string(o)
 }
 
 // TriggerSource identifies where a run originated.
@@ -477,6 +566,18 @@ type Stage struct {
 	// for a scope-completeness decision (the column is NULL). Persisted
 	// to stages.scope_completeness_park JSONB per migration 0035.
 	ScopeCompletenessPark *ScopeCompletenessPark
+
+	// DeployOutcome carries the terminal disposition of a deploy stage
+	// (ADR-038 / #1384). Nil on every non-deploy stage and on a deploy
+	// stage that has not reached a terminal disposition. It is what makes
+	// `partial` / `rolled_back` representable terminal states in THIS slice
+	// (#1384, operator binding condition 3): a deploy stage's succeeded /
+	// failed terminal STATE plus this field together describe the full
+	// disposition (e.g. State=failed + DeployOutcome=partial, or
+	// State=failed + DeployOutcome=rolled_back). The DB column + migration
+	// and the producing executor are downstream (E23.5/E23.6); for now the
+	// carrier is in-memory only — persistence does not round-trip it yet.
+	DeployOutcome *DeployOutcome
 
 	CreatedAt time.Time
 	UpdatedAt time.Time

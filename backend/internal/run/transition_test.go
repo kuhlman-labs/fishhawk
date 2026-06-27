@@ -110,6 +110,22 @@ func TestStageTransitions_AllowedAndForbidden(t *testing.T) {
 		{StageStateAwaitingScopeDecision, StageStatePending, false},   // never rewinds to a fresh dispatch
 		{StageStateAwaitingScopeDecision, StageStateSucceeded, false}, // success only via the runner's PR-open, not the decision
 		{StageStateAwaitingScopeDecision, StageStateDispatched, false},
+		// pending → awaiting_deploy_approval (deploy stage parks pre-execution, ADR-038 / #1384)
+		{StageStatePending, StageStateAwaitingDeployApproval, true},
+		// awaiting_deploy_approval → dispatched (approve + pre-flight pass) | failed (refusal/reject/D-timeout) | cancelled
+		{StageStateAwaitingDeployApproval, StageStateDispatched, true},
+		{StageStateAwaitingDeployApproval, StageStateFailed, true},
+		{StageStateAwaitingDeployApproval, StageStateCancelled, true},
+		{StageStateAwaitingDeployApproval, StageStateSucceeded, false}, // deploy approve advances to dispatch, never straight to succeeded
+		{StageStateAwaitingDeployApproval, StageStateRunning, false},
+		// running → awaiting_deployment (executor begins polling the external pipeline)
+		{StageStateRunning, StageStateAwaitingDeployment, true},
+		// awaiting_deployment → succeeded | failed | cancelled
+		{StageStateAwaitingDeployment, StageStateSucceeded, true},
+		{StageStateAwaitingDeployment, StageStateFailed, true},
+		{StageStateAwaitingDeployment, StageStateCancelled, true},
+		{StageStateAwaitingDeployment, StageStateDispatched, false}, // in-flight poll never rewinds to dispatch
+		{StageStateAwaitingDeployment, StageStateRunning, false},
 		// terminal idempotency + lockdown
 		{StageStateSucceeded, StageStateSucceeded, true},
 		{StageStateSucceeded, StageStateRunning, false},
@@ -126,13 +142,15 @@ func TestStageTransitions_AllowedAndForbidden(t *testing.T) {
 }
 
 // TestStageState_IsSettled pins the settled classification (#1252)
-// across ALL ten StageState constants: the three terminal states and
-// the four parked states are settled; the three in-flight states are
+// across ALL twelve StageState constants: the three terminal states and
+// the five parked states are settled; the four in-flight states are
 // not. This is the load-bearing behavioral assertion for the stage
 // terminal-wait long-poll — its correctness is not enforced by
 // compilation, so every constant is enumerated explicitly. Keep
 // IsTerminal's narrower three-state semantics distinct (asserted by the
-// transition tables above).
+// transition tables above). awaiting_deploy_approval is settled (parked
+// for operator action); awaiting_deployment is NOT (executor polling the
+// external pipeline, #1384 operator binding condition 2).
 func TestStageState_IsSettled(t *testing.T) {
 	cases := []struct {
 		state StageState
@@ -147,13 +165,15 @@ func TestStageState_IsSettled(t *testing.T) {
 		{StageStateAwaitingChildren, true},
 		{StageStateAwaitingInput, true},
 		{StageStateAwaitingScopeDecision, true},
+		{StageStateAwaitingDeployApproval, true},
 		// In-flight: not settled.
 		{StageStatePending, false},
 		{StageStateDispatched, false},
 		{StageStateRunning, false},
+		{StageStateAwaitingDeployment, false},
 	}
-	if len(cases) != 10 {
-		t.Fatalf("expected all ten StageState constants enumerated, got %d", len(cases))
+	if len(cases) != 12 {
+		t.Fatalf("expected all twelve StageState constants enumerated, got %d", len(cases))
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.state), func(t *testing.T) {
@@ -284,15 +304,17 @@ func TestStateIsTerminal(t *testing.T) {
 
 func TestStageStateIsTerminal(t *testing.T) {
 	cases := map[StageState]bool{
-		StageStatePending:               false,
-		StageStateDispatched:            false,
-		StageStateRunning:               false,
-		StageStateAwaitingApproval:      false,
-		StageStateAwaitingInput:         false,
-		StageStateAwaitingScopeDecision: false,
-		StageStateSucceeded:             true,
-		StageStateFailed:                true,
-		StageStateCancelled:             true,
+		StageStatePending:                false,
+		StageStateDispatched:             false,
+		StageStateRunning:                false,
+		StageStateAwaitingApproval:       false,
+		StageStateAwaitingInput:          false,
+		StageStateAwaitingScopeDecision:  false,
+		StageStateAwaitingDeployApproval: false,
+		StageStateAwaitingDeployment:     false,
+		StageStateSucceeded:              true,
+		StageStateFailed:                 true,
+		StageStateCancelled:              true,
 	}
 	for s, want := range cases {
 		if got := s.IsTerminal(); got != want {
