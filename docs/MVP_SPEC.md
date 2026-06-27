@@ -424,12 +424,13 @@ Failures are first-class. All failure modes are recorded in the audit log with c
 - Workflow spec custom predicates (Rego or Cedar)
 - BYO compute / self-hosted runner alternative
 - Multi-CI providers beyond GitHub Actions
+- Deploy stage (`type: deploy`) for post-merge release governance — *delegating* mode only: Fishhawk triggers and monitors an external pipeline (no prod credentials), gates the intent pre-execution, and records a signed deploy artifact. Governance envelope, not deploy mechanics. (ADR-038, epic #924, `workflow-v1` bump. Agentic execution is a separate, deferred decision — ADR-039 / #937.)
 
 ### Explicitly out of scope
 
 - Multi-repo workflows (separate product question)
-- Deploy monitoring, incident response, rollback orchestration (entirely separate product, possibly v2 or never)
-- Custom stage types beyond plan/implement/review
+- Deploy *mechanics* as a product — pipeline logic, prod-credential custody, agentic rollout execution (deferred to ADR-039 / #937), incident response, and standalone rollback/monitoring tooling. Fishhawk does not compete with Argo / Spinnaker / Terraform Cloud / GitHub Environments. (Refined by ADR-038: the *governed deploy gate + signed record* moves into `workflow-v1`; the deploy *mechanics* remain out.)
+- User-extensible / open-ended stage types. The stage set stays a small closed set; ADR-038 adds exactly one (`deploy`) in `workflow-v1` — a deliberate closed-set expansion, not a custom-type mechanism. (Workflow conditionals remain out — see below.)
 - Workflow conditionals
 - Workflow marketplace / templates (until there's a community)
 
