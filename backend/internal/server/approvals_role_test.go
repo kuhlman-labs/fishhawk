@@ -279,3 +279,117 @@ func TestApproval_RoleCheck_RejectAlsoChecked(t *testing.T) {
 		t.Errorf("status = %d, want 403 (reject must enforce role)", w.Code)
 	}
 }
+
+// deployAllOfSpec declares a delegating deploy stage whose approval gate uses
+// all_of [eng_team, leads]: the approving subject must belong to EVERY named
+// role (#1390 — the deploy gate routes enforcement through the existing
+// checkApproverAuthorization -> RoleResolver.CanApprove path). No constraints
+// so checkDeployPreflight passes on the admit case and the stage advances to
+// dispatched.
+const deployAllOfSpec = `
+version: "1.0"
+roles:
+  eng_team:
+    members: ["@acme/eng"]
+  leads:
+    members: ["@acme/leads"]
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+        gates:
+          - type: approval
+            approvers:
+              all_of: [eng_team, leads]
+`
+
+// newDeployRoleServer stands up a deploy stage parked at
+// awaiting_deploy_approval whose gate carries the deployAllOfSpec all_of
+// approvers, wired to a real role.Resolver over the supplied team membership.
+func newDeployRoleServer(t *testing.T, members map[string][]role.TeamMember) (*Server, *approvalGateRunRepo, *fakeApprovalRepo) {
+	t.Helper()
+	stage := &run.Stage{
+		ID:               uuid.New(),
+		RunID:            uuid.New(),
+		Type:             run.StageTypeDeploy,
+		ExecutorKind:     run.ExecutorAgent,
+		ExecutorRef:      "deploy",
+		State:            run.StageStateAwaitingDeployApproval,
+		RequiresApproval: true,
+		CreatedAt:        time.Now().UTC(),
+		UpdatedAt:        time.Now().UTC(),
+	}
+	installation := int64(99)
+	runRow := &run.Run{
+		ID:             stage.RunID,
+		Repo:           "kuhlman-labs/example",
+		WorkflowID:     "release",
+		WorkflowSHA:    "abc123",
+		InstallationID: &installation,
+		WorkflowSpec:   []byte(deployAllOfSpec),
+	}
+	rr := &approvalGateRunRepo{stage: stage, runRow: runRow}
+	resolver := role.NewResolver(&stubTeamLister{teamMembers: members})
+	apRepo := newFakeApprovalRepo()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		ApprovalRepo: apRepo,
+		AuditRepo:    newAuditFake(),
+		RoleResolver: resolver,
+	})
+	return s, rr, apRepo
+}
+
+// (step 3) deploy all_of DENIES a subject missing one of the named roles: a
+// member of eng_team but not leads cannot satisfy all_of, so the gate returns
+// 403 approver_not_authorized and records no approval row — the deploy stage
+// stays parked.
+func TestApproval_DeployAllOf_DeniesSubjectMissingRole(t *testing.T) {
+	s, rr, apRepo := newDeployRoleServer(t, map[string][]role.TeamMember{
+		"acme/eng":   {{Login: "alice"}},
+		"acme/leads": {{Login: "carol"}},
+	})
+	// alice is in eng_team but NOT leads → all_of unsatisfied.
+	w := approveRequest(t, s, rr.stage.ID, "alice", "approve")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if body := decodeErrorEnvelope(t, w); body.Code != "approver_not_authorized" {
+		t.Errorf("error code = %q, want approver_not_authorized", body.Code)
+	}
+	if len(apRepo.all) != 0 {
+		t.Errorf("expected no approval recorded on all_of denial, got %d", len(apRepo.all))
+	}
+	if rr.stage.State != run.StageStateAwaitingDeployApproval {
+		t.Errorf("stage advanced to %q on a denied approve; want it parked", rr.stage.State)
+	}
+}
+
+// (step 3) deploy all_of ADMITS a subject in EVERY named role: a member of both
+// eng_team and leads satisfies all_of; the gate passes, checkDeployPreflight
+// (no constraints) passes, and the deploy stage advances to dispatched. This is
+// the cross-boundary seam: role resolver -> approval Submit -> run-repo
+// transition in one request.
+func TestApproval_DeployAllOf_AdmitsSubjectInAllRoles(t *testing.T) {
+	s, rr, apRepo := newDeployRoleServer(t, map[string][]role.TeamMember{
+		"acme/eng":   {{Login: "alice"}, {Login: "dana"}},
+		"acme/leads": {{Login: "dana"}},
+	})
+	// dana is in BOTH eng_team and leads → all_of satisfied.
+	w := approveRequest(t, s, rr.stage.ID, "dana", "approve")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(apRepo.all) != 1 {
+		t.Errorf("expected 1 approval recorded, got %d", len(apRepo.all))
+	}
+	if rr.stage.State != run.StageStateDispatched {
+		t.Errorf("deploy stage state = %q, want dispatched", rr.stage.State)
+	}
+}

@@ -356,6 +356,18 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// gates' fail-open posture, checkDeployPreflight FAILS CLOSED (#1384,
 	// operator binding condition 1): an unverifiable deploy is denied.
 	if decision == approval.DecisionApprove && stage.Type == run.StageTypeDeploy {
+		// write:deploy scope (ADR-038 / #1390): the deploy gate is an
+		// operator bearer path, so it requires the deploy-specific scope on
+		// top of the write:approvals the handler already enforced at entry.
+		// requireWriteScope 401s anonymous, 403s a token missing the scope,
+		// and exempts cookie sessions (OAuth callers carry no scope list).
+		// Placed before checkDeployPreflight so an unauthorized caller never
+		// reaches the pre-flight evaluation. The reject path is unaffected: a
+		// deploy reject routes through advanceStage (not this approve-only
+		// block), so a rejection still pages the human without write:deploy.
+		if !s.requireWriteScope(w, r, "write:deploy") {
+			return
+		}
 		if !s.checkDeployPreflight(w, r, stage, req.Comment) {
 			return
 		}

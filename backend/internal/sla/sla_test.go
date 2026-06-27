@@ -79,9 +79,13 @@ func (f *fakeRepo) ListStagesAwaitingApproval(_ context.Context) ([]*run.Stage, 
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
+	// Mirror the broadened prod query (#1390): the SLA ticker's candidate
+	// listing now matches BOTH the generic awaiting_approval gate and the
+	// deploy pre-execution gate (awaiting_deploy_approval).
 	out := make([]*run.Stage, 0, len(f.stages))
 	for _, s := range f.stages {
-		if s.State == run.StageStateAwaitingApproval {
+		if s.State == run.StageStateAwaitingApproval ||
+			s.State == run.StageStateAwaitingDeployApproval {
 			out = append(out, s)
 		}
 	}
@@ -167,6 +171,19 @@ func mkStage(updatedAgo time.Duration, sla *string) *run.Stage {
 	}
 }
 
+// mkDeployStage builds a deploy stage parked at the deploy pre-execution gate
+// (awaiting_deploy_approval) — the #1390 SLA broadening target.
+func mkDeployStage(updatedAgo time.Duration, sla *string) *run.Stage {
+	return &run.Stage{
+		ID:        uuid.New(),
+		RunID:     uuid.New(),
+		Type:      run.StageTypeDeploy,
+		State:     run.StageStateAwaitingDeployApproval,
+		GateSLA:   sla,
+		UpdatedAt: time.Now().UTC().Add(-updatedAgo),
+	}
+}
+
 func TestTicker_TimesOutPastSLA(t *testing.T) {
 	repo := &fakeRepo{}
 	au := &fakeAudit{}
@@ -208,6 +225,71 @@ func TestTicker_TimesOutPastSLA(t *testing.T) {
 	}
 	if payload["failure_category"] != "D" {
 		t.Errorf("payload.failure_category = %v", payload["failure_category"])
+	}
+}
+
+// TestTicker_DeployStageTimesOutCategoryD pins #1390 binding condition 3: a
+// deploy stage parked at awaiting_deploy_approval whose gate_sla has elapsed
+// with no operator decision is failed category D, an approval_sla_elapsed audit
+// is written, and the run is advanced. The ticker is state-agnostic — the
+// broadened candidate query surfaces the deploy row and handleStage fails it
+// exactly as it does an awaiting_approval row.
+func TestTicker_DeployStageTimesOutCategoryD(t *testing.T) {
+	repo := &fakeRepo{}
+	au := &fakeAudit{}
+
+	// Deploy stage updated 5h ago with a 4h SLA → past deadline.
+	s := mkDeployStage(5*time.Hour, ptrStr("4_hours"))
+	repo.stages = []*run.Stage{s}
+
+	var advancedRun *uuid.UUID
+	ticker := &Ticker{
+		Repo:  repo,
+		Audit: au,
+		Now:   func() time.Time { return time.Now().UTC() },
+		Advance: func(_ context.Context, runID uuid.UUID) error {
+			advancedRun = &runID
+			return nil
+		},
+	}
+	ticker.Tick(context.Background())
+
+	if len(repo.transitionedTo) != 1 {
+		t.Fatalf("transitions = %d, want 1", len(repo.transitionedTo))
+	}
+	got := repo.transitionedTo[0]
+	if got.State != run.StageStateFailed {
+		t.Errorf("State = %s, want failed", got.State)
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != run.FailureD {
+		t.Errorf("FailureCategory = %v, want D", got.FailureCategory)
+	}
+	if len(au.appended) != 1 || au.appended[0].Category != CategoryApprovalSLAElapsed {
+		t.Fatalf("want 1 approval_sla_elapsed audit, got %d entries", len(au.appended))
+	}
+	if advancedRun == nil || *advancedRun != s.RunID {
+		t.Errorf("run advance not invoked for the timed-out deploy stage (got %v)", advancedRun)
+	}
+}
+
+// TestTicker_DeployStageWithinSLA_NoTimeout pins the not-yet-elapsed deploy
+// branch: a deploy stage still within its gate_sla window is NOT failed.
+func TestTicker_DeployStageWithinSLA_NoTimeout(t *testing.T) {
+	repo := &fakeRepo{}
+	au := &fakeAudit{}
+
+	// Deploy stage updated 1h ago with a 4h SLA → still in the window.
+	s := mkDeployStage(1*time.Hour, ptrStr("4_hours"))
+	repo.stages = []*run.Stage{s}
+
+	ticker := &Ticker{Repo: repo, Audit: au}
+	ticker.Tick(context.Background())
+
+	if len(repo.transitionedTo) != 0 {
+		t.Errorf("deploy stage within SLA should not transition, got %d", len(repo.transitionedTo))
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("expected no audit entries, got %d", len(au.appended))
 	}
 }
 
