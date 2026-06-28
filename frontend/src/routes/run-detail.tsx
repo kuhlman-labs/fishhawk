@@ -110,6 +110,14 @@ function RunDetailView({ run, stages }: { run: Run; stages: Stage[] }) {
                 <span className="font-mono text-xs text-neutral-500">
                   {stage.executor.kind}:{stage.executor.ref}
                 </span>
+                {stage.resolved_model && (
+                  <span
+                    className="font-mono text-xs text-neutral-500"
+                    title="Resolved model for this stage's agent spawn"
+                  >
+                    {stage.resolved_model}
+                  </span>
+                )}
                 <span className="ml-auto flex items-center gap-2 font-mono text-xs">
                   {stage.state === 'failed' && stage.failure_category && (
                     <span

@@ -99,6 +99,13 @@ function StageDetailView({
 
       <FailureBanner stage={stage} onStageUpdate={setStage} onStageRollback={setStage} />
 
+      {stage.resolved_model && (
+        <p className="font-mono text-xs text-neutral-500" data-testid="stage-resolved-model">
+          Resolved model:{' '}
+          <span className="text-neutral-700 dark:text-neutral-300">{stage.resolved_model}</span>
+        </p>
+      )}
+
       {stage.type === 'plan' &&
         (planArtifact ? (
           <PlanArtifact artifactId={planArtifact.id} stage={stage} runId={runId} />
