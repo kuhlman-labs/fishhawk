@@ -11,7 +11,7 @@
 # When the product can execute this spec, the syntax may be revised to
 # match the frozen v0 schema. The intent expressed here will not change.
 
-version: "0.5"
+version: "1.0"
 
 roles:
   founder:
@@ -249,3 +249,56 @@ workflows:
           # side gate is degenerate now — it just lets the run
           # advance once branch protection clears.
           - type: check
+
+  # Delegating deploy (ADR-038 / E23, workflow-v1). Operator-triggered
+  # after the corresponding feature_change run merges. Fishhawk holds no
+  # deploy logic or credentials: the deploy stage TRIGGERS an external
+  # pipeline (.github/workflows/deploy.yml via workflow_dispatch, passing
+  # the fishhawk_run_id + fishhawk_stage_id correlation inputs the
+  # deployreconciler re-resolves the run by) and MONITORS it to terminal,
+  # recording a `deployment` artifact + audit trail.
+  #
+  # `required_upstream` is intentionally OMITTED here: it evaluates the
+  # CURRENT run's own implement/review state, which a deploy-only release
+  # run lacks, so it would fail closed. Declarative cross-workflow gating
+  # on the feature_change run is tracked in #1417; until it lands, the
+  # fail-closed approval gate below is the control point and the operator
+  # confirms the change merged before triggering the release.
+  #
+  # deploy.yml is an echo/no-op validation stub for now (echo-now-real-later,
+  # #1418) — it exercises the full dispatch -> poll -> deployment-artifact
+  # loop without touching real infrastructure.
+  release:
+    description: >-
+      Delegating deploy workflow (ADR-038): triggers an external release
+      pipeline via workflow_dispatch and monitors it to terminal. Fishhawk
+      holds no deploy logic or credentials. Operator-triggered after the
+      feature_change run merges.
+    # Drive mode (#1023): surface next_action and auto-advance mechanical
+    # transitions; the deploy approval below still parks for the human (no
+    # operator_agent delegation is configured, so a production deploy always
+    # pages rather than auto-approving).
+    drive: true
+    policy:
+      max_stage_runtime: "30m"
+
+    stages:
+      - id: deploy
+        type: deploy
+        # A deploy stage MUST delegate (ADR-038): no agent/human executor.
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+            git_ref: main
+        # Pre-flight deploy constraints (evaluated BEFORE execution at the
+        # gate). change_freeze:false declares the surface without blocking.
+        constraints:
+          - allowed_environments: [staging, production]
+          - change_freeze: false
+        produces:
+          - artifact: deployment
+        gates:
+          - type: approval
+            approvers:
+              any_of: [founder]
