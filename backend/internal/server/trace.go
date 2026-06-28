@@ -2831,8 +2831,12 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 
 	// Resolve the per-invocation reviewer list (#955) up front so the
 	// detached goroutine closes over fully-resolved adapters, never the
-	// spec config or request-scoped state.
-	invocations := s.resolveReviewerInvocations(reviewersCfg)
+	// spec config or request-scoped state. The gate-resolved review_model
+	// override (#1416/#1426) is threaded in here so an operator-supplied
+	// review_model actually reaches the reviewer adapter; an empty override
+	// (no review model_resolved entry) leaves the spawn byte-identical to today.
+	reviewModelOverride := s.gateResolvedReviewModel(ctx, runID)
+	invocations := s.resolveReviewerInvocationsWithReviewModel(reviewersCfg, reviewModelOverride)
 
 	// Detach the reviewer context from the request lifecycle (#584); see
 	// runPlanReviews for the rationale. The goroutine / loop closes over
@@ -3217,7 +3221,11 @@ func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stage
 		return false
 	}
 
-	invocations := s.resolveReviewerInvocations(reviewersCfg)
+	// Thread the gate-resolved review_model override (#1416/#1426) so the
+	// supplemental reinvoke verdict runs under the same operator-resolved model
+	// as the first review; an empty override leaves the spawn byte-identical to today.
+	reviewModelOverride := s.gateResolvedReviewModel(ctx, runID)
+	invocations := s.resolveReviewerInvocationsWithReviewModel(reviewersCfg, reviewModelOverride)
 	authorModel := approvedPlan.GeneratedBy.Model
 	reviewCtx := context.WithoutCancel(ctx)
 

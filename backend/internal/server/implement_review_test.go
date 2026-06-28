@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -1292,6 +1293,75 @@ func TestShipTrace_ImplementReview_Heterogeneous_CrossBoundary(t *testing.T) {
 	if costs != 2 {
 		t.Errorf("implement_review cost_recorded entries = %d, want 2", costs)
 	}
+}
+
+// reviewModelResolvedEntry builds a review-stage model_resolved audit entry
+// (#1416) carrying the operator's gate-resolved review model, seeded into the
+// auditFake so gateResolvedReviewModel reads it back at implement-review time.
+func reviewModelResolvedEntry(runID uuid.UUID, model string) *audit.Entry {
+	payload, _ := json.Marshal(modelResolvedPayload{
+		ResolvedModel: ResolvedModel{Value: model, Source: ModelSourceOperator},
+		StageType:     string(run.StageTypeReview),
+	})
+	return &audit.Entry{RunID: &runID, Category: CategoryModelResolved, Payload: payload}
+}
+
+// TestRunImplementReviews_ReviewModelOverride_Threaded is the #1426
+// cross-boundary behavioral test: it drives the REAL production
+// runImplementReviews entrypoint and asserts that the gate-resolved review_model
+// override actually reaches the reviewer-adapter lookup. The gap #1426 closes is
+// precisely the seam between the gate-resolved audit value (gateResolvedReviewModel)
+// and the reviewer invocation (resolveReviewerInvocationsWithReviewModel) — a per-
+// layer unit passes on each side while the seam stays unwired (cf. #618). Two
+// named branches: (1) override present — a seeded review model_resolved entry
+// makes the capturingReviewerSet resolve EVERY heterogeneous reviewer under the
+// operator override model; (2) override absent (fail-open) — no review
+// model_resolved entry leaves each reviewer on its spec-declared model, byte-
+// identical to today.
+func TestRunImplementReviews_ReviewModelOverride_Threaded(t *testing.T) {
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+	}}
+
+	t.Run("override present — every reviewer resolved under the operator model", func(t *testing.T) {
+		set := &capturingReviewerSet{reviewer: &fakePlanReviewer{
+			verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+			model:   "operator-review-model",
+		}}
+		s, _, au, _, runRow, implStage := newImplementReviewServerWithSet(t, set, specImplementHeterogeneousGating)
+		// The plan gate recorded the operator's review_model for the review stage.
+		au.seeded = append(au.seeded, reviewModelResolvedEntry(runRow.ID, "operator-review-model"))
+
+		s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil)
+
+		if len(set.calls) != 2 {
+			t.Fatalf("For called %d times, want 2 (one per heterogeneous reviewer)", len(set.calls))
+		}
+		for i, c := range set.calls {
+			if c.model != "operator-review-model" {
+				t.Errorf("For call %d resolved model %q, want operator-review-model (override threaded through the audit-read → resolve → lookup seam)", i, c.model)
+			}
+		}
+	})
+
+	t.Run("override absent (fail-open) — every reviewer resolved under its spec model", func(t *testing.T) {
+		set := &capturingReviewerSet{reviewer: &fakePlanReviewer{
+			verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		}}
+		s, _, _, _, runRow, implStage := newImplementReviewServerWithSet(t, set, specImplementHeterogeneousGating)
+		// No review model_resolved entry seeded → gateResolvedReviewModel returns
+		// "" → the spawn stays byte-identical to today.
+
+		s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil)
+
+		if len(set.calls) != 2 {
+			t.Fatalf("For called %d times, want 2 (one per heterogeneous reviewer)", len(set.calls))
+		}
+		gotModels := map[string]bool{set.calls[0].model: true, set.calls[1].model: true}
+		if !gotModels["claude-opus-4-8"] || !gotModels["gpt-5.5"] {
+			t.Errorf("For models = %v, want the spec models {claude-opus-4-8, gpt-5.5} (fail-open: no override leaves the spec model byte-identical)", gotModels)
+		}
+	})
 }
 
 // TestShipTrace_ImplementReview_Heterogeneous_UnresolvableProvider_Gating
