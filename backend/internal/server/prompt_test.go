@@ -554,6 +554,105 @@ func TestGetStagePrompt_Implement_EmptyModelOmitted(t *testing.T) {
 	}
 }
 
+// TestGetStagePrompt_Plan_CarriesResolvedModel asserts the plan-model producer
+// side (#1416): a spec-pinned plan executor.model (Scenario B) is carried on the
+// plan-stage prompt response under the byte-identical `plan_model` json tag the
+// runner decoder reads, and lands on both the signed /prompt and the SPA
+// /prompt-render endpoints.
+func TestGetStagePrompt_Plan_CarriesResolvedModel(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	rr.runRow = &run.Run{
+		ID:            runID,
+		Repo:          "kuhlman-labs/example",
+		WorkflowID:    "feature_change",
+		TriggerSource: "manual",
+		WorkflowSpec: []byte("workflows:\n" +
+			"  feature_change:\n" +
+			"    stages:\n" +
+			"      - id: plan\n" +
+			"        type: plan\n" +
+			"        executor:\n" +
+			"          agent: claudecode\n" +
+			"          model: claude-opus-4-8\n"),
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.PlanModel != "claude-opus-4-8" {
+		t.Fatalf("PlanModel = %q, want claude-opus-4-8", resp.PlanModel)
+	}
+	// Pin the wire tag byte-identical to the runner decoder.
+	if !contains(w.Body.String(), `"plan_model":"claude-opus-4-8"`) {
+		t.Fatalf("response missing the plan_model json tag:\n%s", w.Body.String())
+	}
+	// The implement_model json field must NOT appear on a plan-stage response
+	// (the prompt TEXT may mention implement_model in prose, so match the field).
+	if contains(w.Body.String(), `"implement_model":`) {
+		t.Fatalf("plan-stage response must not carry the implement_model field:\n%s", w.Body.String())
+	}
+
+	// The SPA-readable render path carries the same resolution.
+	rreq := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	rw := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rw, rreq)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("render status = %d, want 200:\n%s", rw.Code, rw.Body.String())
+	}
+	var rendered promptResponse
+	if err := json.Unmarshal(rw.Body.Bytes(), &rendered); err != nil {
+		t.Fatalf("decode render: %v", err)
+	}
+	if rendered.PlanModel != "claude-opus-4-8" {
+		t.Fatalf("render PlanModel = %q, want claude-opus-4-8", rendered.PlanModel)
+	}
+}
+
+// TestGetStagePrompt_Plan_EmptyModelOmitted asserts the byte-identical
+// today's-spawn path (#1416): with no plan executor.model and no default, the
+// resolved plan model is empty and the plan_model key is OMITTED from the
+// response.
+func TestGetStagePrompt_Plan_EmptyModelOmitted(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	rr.runRow = &run.Run{
+		ID:            runID,
+		Repo:          "kuhlman-labs/example",
+		WorkflowID:    "feature_change",
+		TriggerSource: "manual",
+		// No WorkflowSpec plan executor.model, no default.
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.PlanModel != "" {
+		t.Fatalf("PlanModel = %q, want empty", resp.PlanModel)
+	}
+	if contains(w.Body.String(), "plan_model") {
+		t.Fatalf("plan_model key must be omitted when empty (byte-identical spawn):\n%s", w.Body.String())
+	}
+}
+
 func TestGetStagePrompt_Implement_CarriesScopeJustificationPath(t *testing.T) {
 	// #1153: the implement handler populates trigger.ImplementRunID /
 	// ImplementStageID, so the rendered prompt carries the run/stage-keyed scope

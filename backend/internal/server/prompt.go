@@ -164,6 +164,22 @@ type promptResponse struct {
 	// by-tag convention as ScopeExemptions/BindingAssertions. A tag drift here
 	// silently drops the model and the runner falls back to today's spawn.
 	ImplementModel string `json:"implement_model,omitempty"`
+	// PlanModel is the backend-resolved plan model id (#1416), carried on a
+	// plan-stage prompt so the runner pins the plan agent spawn to it
+	// (`--model <PlanModel>`), reusing the same FetchedPrompt -> inv.Model seam
+	// as ImplementModel. Resolved through the plan-model ladder
+	// (resolvePlanModelForRun): spec executor.model (plan stage) > deployment
+	// default, with the operator gate rung added by a sibling slice. EMPTY/
+	// omitted (the common case) means no rung supplied a model, and the runner
+	// spawns the plan agent on the adapter's built-in default exactly as today,
+	// byte-for-byte.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (`plan_model`) MUST stay
+	// byte-identical to the runner's upload.FetchedPrompt.PlanModel decoder
+	// (runner/internal/upload/upload.go) — the same independent-struct-by-tag
+	// convention as ImplementModel. A tag drift here silently drops the model and
+	// the runner falls back to today's spawn.
+	PlanModel string `json:"plan_model,omitempty"`
 }
 
 // scopeExemption is one operator scope exemption: a DECLARED scope.files path
@@ -824,6 +840,15 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		resp.ImplementModel = rm.Value
 		s.logModelResolution(r.Context(), runRow.ID, rm)
 	}
+	// Plan-stage model routing (#1416): resolve the plan-model ladder and carry
+	// the resolved value to the runner, which pins it onto the plan agent spawn
+	// (parallel to ImplementModel). An empty resolution (no rung supplied a
+	// model) leaves PlanModel empty so the spawn is byte-identical to today.
+	if stage.Type == run.StageTypePlan {
+		rm := s.resolvePlanModelForRun(r.Context(), runRow)
+		resp.PlanModel = rm.Value
+		s.logModelResolution(r.Context(), runRow.ID, rm)
+	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
@@ -1097,6 +1122,13 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	if stage.Type == run.StageTypeImplement {
 		rm := s.resolveImplementDispatchModel(r.Context(), runRow, stage, fixup)
 		resp.ImplementModel = rm.Value
+	}
+	// Plan-stage model routing (#1416), same derivation as the dispatch path so
+	// the rendered (SPA-readable) prompt response stays byte-consistent with the
+	// runner-facing one.
+	if stage.Type == run.StageTypePlan {
+		rm := s.resolvePlanModelForRun(r.Context(), runRow)
+		resp.PlanModel = rm.Value
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }

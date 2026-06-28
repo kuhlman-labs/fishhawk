@@ -2931,6 +2931,77 @@ func TestRun_ImplementStage_ImplementModelPinnedToSpawn(t *testing.T) {
 	}
 }
 
+// TestRun_PlanStage_PlanModelPinnedToSpawn is the cross-boundary integration
+// assertion for #1416 (Scenario B done-means): it drives run() end-to-end
+// through the FetchPrompt decode -> fetchPromptToFile threading ->
+// agent.Invocation.Model path for a PLAN-type stage, and asserts the
+// backend-resolved plan_model reaches the agent spawn. The two sub-tests cover
+// both enumerated modes: a present model is pinned onto the plan spawn (the
+// claudecode adapter then appends --model), and an absent model leaves inv.Model
+// empty (no --model flag, byte-identical to today's plan spawn). This is the
+// runner half of the spec-pinned-plan-model -> plan-agent route the backend
+// resolves through promptResponse.PlanModel.
+func TestRun_PlanStage_PlanModelPinnedToSpawn(t *testing.T) {
+	cases := []struct {
+		name      string
+		planModel string
+		wantModel string
+	}{
+		{
+			name:      "model present is pinned onto the plan spawn",
+			planModel: "claude-opus-4-8",
+			wantModel: "claude-opus-4-8",
+		},
+		{
+			name:      "model absent leaves inv.Model empty (byte-identical spawn)",
+			planModel: "",
+			wantModel: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotModel string
+			var captured bool
+			withFakeInvoker(t, &fakeInvoker{
+				canned: agent.Result{OK: true},
+				onInvoke: func(_ int, inv agent.Invocation) {
+					gotModel = inv.Model
+					captured = true
+				},
+			})
+			fu := newFakeUploader(t)
+			stageID := "22222222-3333-4444-5555-666666666666"
+			fu.promptResp = &upload.FetchedPrompt{
+				StageID:    stageID,
+				StageType:  "plan",
+				Prompt:     "plan",
+				PromptHash: "h",
+				PlanModel:  tc.planModel,
+			}
+			withFakeUploader(t, fu)
+
+			var stderr strings.Builder
+			got := run([]string{
+				"--run-id", "11111111-2222-3333-4444-555555555555",
+				"--backend-url", "https://api.fishhawk.test",
+				"--workflow", "feature_change", "--stage", "plan",
+				"--stage-id", stageID,
+				"--fetch-prompt",
+				"--upload-trace",
+			}, &stderr)
+			if got != exitOK {
+				t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+			}
+			if !captured {
+				t.Fatal("agent invoker was never called")
+			}
+			if gotModel != tc.wantModel {
+				t.Errorf("inv.Model = %q, want %q", gotModel, tc.wantModel)
+			}
+		})
+	}
+}
+
 // TestRun_ImplementStage_NoScopeFiles_FallsBack confirms that when the
 // prompt response carries no scope_files, CommitAndPush gets an empty
 // ScopeFiles (the `git add -A` fallback) and no handoff file is written.
