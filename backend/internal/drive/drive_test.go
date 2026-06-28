@@ -58,6 +58,7 @@ func TestMechanical_RuleTable(t *testing.T) {
 		RuleFixupRereviewRepark,
 		RuleChecksGreenAwaitingMerge,
 		RuleCIFailed,
+		RuleDeployInitialization,
 		RuleChildrenDispatch,
 	} {
 		if !Mechanical(rule) {
@@ -199,6 +200,21 @@ func TestEvaluateChildrenDispatch_Local_ParksWithNextAction(t *testing.T) {
 	}
 	if out.NextAction == nil || out.NextAction.Action != "run_implement_stage" {
 		t.Fatalf("NextAction = %+v, want action run_implement_stage", out.NextAction)
+	}
+}
+
+func TestEvaluateDeployInitialization(t *testing.T) {
+	// The deploy-first creation park is host-independent: the SAME outcome
+	// (Advance true + an approve next action) holds regardless of runner kind,
+	// unlike the plan/implement dispatch evaluators that branch on local.
+	for _, rk := range []string{run.RunnerKindGitHubActions, run.RunnerKindLocal} {
+		out := EvaluateDeployInitialization()
+		if !out.Advance {
+			t.Fatalf("Advance = false, want true (the orchestrator already parked the deploy stage at its gate) [runner_kind=%s]", rk)
+		}
+		if out.NextAction == nil || out.NextAction.Action != "fishhawk_approve_plan" {
+			t.Fatalf("NextAction = %+v, want action fishhawk_approve_plan [runner_kind=%s]", out.NextAction, rk)
+		}
 	}
 }
 

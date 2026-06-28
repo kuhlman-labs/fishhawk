@@ -503,6 +503,81 @@ func TestNextActions_AwaitingChildren_FanOutArm(t *testing.T) {
 	}
 }
 
+// TestNextActions_DeployStage covers the E23.13 / #1429 deploy arm: a
+// standalone delegating release run (a single deploy stage, no plan/implement)
+// classifies per the deploy stage's state instead of falling through to
+// unclassified. One behavioral assertion per named branch.
+func TestNextActions_DeployStage(t *testing.T) {
+	cases := []struct {
+		name        string
+		deployState string
+		wantState   string
+		wantAction  string // first action
+	}{
+		{"awaiting_deploy_approval -> approve", "awaiting_deploy_approval", "deploy_gate_parked", "fishhawk_approve_plan"},
+		{"awaiting_deployment -> poll", "awaiting_deployment", "deploy_in_flight", "fishhawk_get_run_status"},
+		{"defensive pending -> poll", "pending", "deploy_initializing", "fishhawk_get_run_status"},
+		{"defensive running -> poll", "running", "deploy_in_flight", "fishhawk_get_run_status"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			run := naRun("running")
+			run.WorkflowID = "release"
+			stages := []Stage{naStage("deploy", tc.deployState)}
+
+			na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
+			if na == nil {
+				t.Fatal("nextActionsFor = nil")
+			}
+			if na.State == "unclassified" {
+				t.Fatalf("deploy state %q classified as unclassified — the deploy arm did not fire", tc.deployState)
+			}
+			if na.State != tc.wantState {
+				t.Errorf("state = %q, want %q", na.State, tc.wantState)
+			}
+			if len(na.Actions) == 0 {
+				t.Fatalf("zero actions for deploy state %q — structural invariant broken", tc.deployState)
+			}
+			if na.Actions[0].Action != tc.wantAction {
+				t.Errorf("actions[0] = %q, want %q (full: %v)", na.Actions[0].Action, tc.wantAction, actionNames(na))
+			}
+			// The approve action targets the run and consumes an approval slot.
+			if tc.wantAction == "fishhawk_approve_plan" {
+				if na.Actions[0].Params["run_id"] != run.ID {
+					t.Errorf("approve params = %v, want run_id=%s", na.Actions[0].Params, run.ID)
+				}
+				if na.Actions[0].Consumes != consumesApprovalSlot {
+					t.Errorf("approve consumes = %q, want %q", na.Actions[0].Consumes, consumesApprovalSlot)
+				}
+			}
+			// Every action carries the structured fields.
+			for i, a := range na.Actions {
+				if a.Precondition == "" || a.Consumes == "" || a.Reason == "" {
+					t.Errorf("actions[%d] (%s) missing precondition/consumes/reason: %+v", i, a.Action, a)
+				}
+			}
+		})
+	}
+}
+
+// TestNextActions_DeployStage_TerminalFallsThrough pins that a TERMINAL deploy
+// stage does NOT enter the deploy arm (the `!stageStateIsTerminal` guard): a
+// succeeded deploy stage on a succeeded run falls through to the run-state
+// terminal block, not deploy_gate_parked.
+func TestNextActions_DeployStage_TerminalFallsThrough(t *testing.T) {
+	run := naRun("succeeded")
+	run.WorkflowID = "release"
+	stages := []Stage{naStage("deploy", "succeeded")}
+
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
+	if na == nil {
+		t.Fatal("nextActionsFor = nil")
+	}
+	if na.State == "deploy_gate_parked" || na.State == "deploy_in_flight" || na.State == "deploy_initializing" {
+		t.Errorf("terminal deploy stage entered the deploy arm (state=%q); the !stageStateIsTerminal guard should skip it", na.State)
+	}
+}
+
 // TestNextActions_AwaitingScopeDecision_DecideArm pins the #1231 arm: an
 // implement stage parked at awaiting_scope_decision offers
 // fishhawk_decide_scope_completeness carrying run_id + the exempt|fail

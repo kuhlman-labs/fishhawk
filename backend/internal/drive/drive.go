@@ -99,6 +99,20 @@ const (
 	// never advances — the remediation (fix-up, an operator commit +
 	// vouch, or a checks re-run) stays the operator's call.
 	RuleCIFailed Rule = "ci_failed"
+	// RuleDeployInitialization covers a deploy-FIRST run's
+	// pending → awaiting_deploy_approval pre-execution park at run
+	// creation (E23.13 / #1429). A deploy stage has no agent or runner, so
+	// (unlike plan/implement) there is no operator-driven run_stage entry to
+	// trigger Advance — the park has to be kicked at creation. The park
+	// itself is MECHANICAL: orchestrator.Advance transitions the run
+	// pending → running and the deploy stage pending → awaiting_deploy_approval
+	// without judgment (ADR-038: a deploy stage's effect IS the side effect,
+	// so its gate is PRE-execution; the subsequent approval is the operator's
+	// judgment point, classified separately as RuleGateApproval). Unlike the
+	// plan/implement dispatch rules there is NO runner-kind branch: the backend
+	// triggers the external delegate AFTER approval, so the park is
+	// host-independent.
+	RuleDeployInitialization Rule = "deploy_initialization"
 	// RuleChildrenDispatch covers a decomposed parent parked in
 	// awaiting_children dispatching its pending child runs up to the
 	// resolved concurrency cap (E24.3 / ADR-041). The orchestrator's
@@ -137,6 +151,7 @@ var mechanical = map[Rule]bool{
 	RuleFixupRereviewRepark:      true,
 	RuleChecksGreenAwaitingMerge: true,
 	RuleCIFailed:                 true,
+	RuleDeployInitialization:     true,
 	RuleChildrenDispatch:         true,
 	RuleGateApproval:             false,
 	RuleConcernRouting:           false,
@@ -286,6 +301,26 @@ func EvaluateChildrenDispatch(runnerKind string) Outcome {
 		}
 	}
 	return Outcome{Advance: true}
+}
+
+// EvaluateDeployInitialization classifies a deploy-first run's creation-time
+// pending → awaiting_deploy_approval park (E23.13 / #1429). Unlike the
+// plan/implement dispatch evaluators there is NO runner-kind branch: the park
+// is host-independent (the backend triggers the external delegate AFTER the
+// operator approves the deploy intent, ADR-038), so the outcome is the same
+// regardless of runner kind — Advance true (the orchestrator already parked the
+// stage at the gate) with a next action telling the operator to approve the
+// deploy intent. The deploy gate is approved via the generic approval verb
+// (fishhawk_approve_plan special-cases stage.Type==deploy in the approval
+// handler); there is no separate deploy-approval tool.
+func EvaluateDeployInitialization() Outcome {
+	return Outcome{
+		Advance: true,
+		NextAction: &NextAction{
+			Action: "fishhawk_approve_plan",
+			Detail: "deploy stage parked at its pre-execution approval gate; approve the deploy intent (fishhawk_approve_plan on the deploy stage) — a deploy approval pages the human regardless of runner kind",
+		},
+	}
 }
 
 // Advance is the run_auto_advanced audit payload: the rule that
