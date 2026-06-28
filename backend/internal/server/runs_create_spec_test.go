@@ -9,12 +9,17 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -904,6 +909,318 @@ func TestCreateRun_ModelValidity_AcceptOnFreshPresent(t *testing.T) {
 	w := createRunWithSpec(t, s, modelValiditySpecYAML("claude-opus-4-8"))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+}
+
+// --- deploy-first creation park (E23.13 / #1429) ---
+
+// releaseSpecYAML is a standalone delegating release workflow (workflow-v1,
+// ADR-038): a single deploy stage with a delegating executor and a
+// pre-execution approval gate, drive on. Mirrors the `release` workflow in
+// .fishhawk/workflows.yaml. The deploy stage's effect IS the side effect, so
+// its only stage has no agent or runner — the shape that strands at pending
+// without the creation-time Advance this slice adds.
+const releaseSpecYAML = `version: "1.0"
+roles:
+  founder:
+    members: ["@kuhlman-labs"]
+workflows:
+  release:
+    drive: true
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+            git_ref: main
+        produces:
+          - artifact: deployment
+        gates:
+          - type: approval
+            approvers:
+              any_of: [founder]
+`
+
+// driveStageRepo extends fakeRepo with the two repository methods the real
+// orchestrator.Advance walks (ListStagesForRun, TransitionStage) plus a
+// CreateRun that honors the resolved Drive flag — so the create →
+// orchestrator.Advance → stage-transition → drive-audit seam runs end to end.
+// fakeRepo leaves these unimplemented (they error) because its handler tests
+// never drive a real orchestrator; this in-file extension keeps the seam test
+// self-contained.
+type driveStageRepo struct {
+	*fakeRepo
+}
+
+func newDriveStageRepo() *driveStageRepo { return &driveStageRepo{fakeRepo: newFakeRepo()} }
+
+// CreateRun delegates to the embedded fake, then stamps the resolved Drive flag
+// (fakeRepo.CreateRun drops it). The map stores the returned pointer, so a later
+// GetRun sees the same Drive value.
+func (f *driveStageRepo) CreateRun(ctx context.Context, p run.CreateRunParams) (*run.Run, error) {
+	r, err := f.fakeRepo.CreateRun(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	r.Drive = p.Drive
+	f.mu.Unlock()
+	return r, nil
+}
+
+func (f *driveStageRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	src := f.stagesByRun[runID]
+	out := make([]*run.Stage, len(src))
+	copy(out, src)
+	sort.Slice(out, func(i, j int) bool { return out[i].Sequence < out[j].Sequence })
+	return out, nil
+}
+
+func (f *driveStageRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, _ *run.StageCompletion) (*run.Stage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, stages := range f.stagesByRun {
+		for _, st := range stages {
+			if st.ID == id {
+				st.State = to
+				st.UpdatedAt = time.Now().UTC()
+				return st, nil
+			}
+		}
+	}
+	return nil, run.ErrNotFound
+}
+
+// hasDeployInitializationEntry reports whether the audit fake captured a
+// run_auto_advanced entry naming the deploy_initialization drive rule.
+func hasDeployInitializationEntry(t *testing.T, au *auditFake) bool {
+	t.Helper()
+	for _, e := range au.appended {
+		if e.Category != drive.Category {
+			continue
+		}
+		var adv drive.Advance
+		if err := json.Unmarshal(e.Payload, &adv); err != nil {
+			continue
+		}
+		if adv.Rule == drive.RuleDeployInitialization {
+			return true
+		}
+	}
+	return false
+}
+
+// TestCreateRun_DeployFirst_ParksAtApprovalGate is the cross-boundary
+// integration test (#1429, operator binding condition 2): creating a standalone
+// release run drives the real create → orchestrator.Advance →
+// stage-transition → drive-audit seam. The deploy stage must reach
+// awaiting_deploy_approval, the run must reach running, and a
+// deploy_initialization run_auto_advanced entry must be recorded — proving the
+// creation→Advance edge this slice adds (the per-layer Advance deploy-park unit
+// already exists as orchestrator's TestAdvance_DeployStage_ParksPreExecution).
+func TestCreateRun_DeployFirst_ParksAtApprovalGate(t *testing.T) {
+	repo := newDriveStageRepo()
+	au := newAuditFake()
+	orch := &orchestrator.Orchestrator{Runs: repo}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au, Orchestrator: orch})
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "release",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"runner_kind":    "local",
+		"workflow_spec":  releaseSpecYAML,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var got runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+
+	// The deploy stage reached its pre-execution approval gate.
+	stages := repo.stagesFor(got.ID)
+	if len(stages) != 1 {
+		t.Fatalf("len(stages) = %d, want 1 (single deploy stage): %#v", len(stages), stages)
+	}
+	if stages[0].Type != run.StageTypeDeploy {
+		t.Fatalf("stage[0].Type = %q, want deploy", stages[0].Type)
+	}
+	if stages[0].State != run.StageStateAwaitingDeployApproval {
+		t.Errorf("deploy stage state = %q, want awaiting_deploy_approval (creation-time Advance must park it)", stages[0].State)
+	}
+
+	// The run walked pending → running (Advance's top transition).
+	gotRun, err := repo.GetRun(context.Background(), got.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.State != run.StateRunning {
+		t.Errorf("run state = %q, want running", gotRun.State)
+	}
+
+	// The park is attributable to the deploy_initialization drive rule.
+	if !hasDeployInitializationEntry(t, au) {
+		t.Errorf("no deploy_initialization run_auto_advanced audit entry recorded: %#v", au.appended)
+	}
+}
+
+// TestCreateRun_DeployFirst_DriveOff_ParksWithoutAudit pins the
+// recordDriveDeployInitialization `!runRow.Drive` guard: the creation-time
+// Advance is gated on the first stage being a deploy stage (NOT on drive), so a
+// drive-OFF release run still parks the deploy stage at its gate — but no
+// deploy_initialization run_auto_advanced entry is recorded (the drive audit is
+// drive-only). The workflow spec defaults drive on; the per-run override turns
+// it off.
+func TestCreateRun_DeployFirst_DriveOff_ParksWithoutAudit(t *testing.T) {
+	repo := newDriveStageRepo()
+	au := newAuditFake()
+	orch := &orchestrator.Orchestrator{Runs: repo}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au, Orchestrator: orch})
+
+	driveOff := false
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "release",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"runner_kind":    "local",
+		"drive":          driveOff, // override the spec's drive: true
+		"workflow_spec":  releaseSpecYAML,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var got runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	// The deploy stage still parks (Advance is gated on stage type, not drive).
+	stages := repo.stagesFor(got.ID)
+	if len(stages) != 1 || stages[0].State != run.StageStateAwaitingDeployApproval {
+		t.Errorf("deploy stage = %#v, want parked at awaiting_deploy_approval even with drive off", stages)
+	}
+	// But no drive audit entry — the run is not drive-enabled.
+	if hasDeployInitializationEntry(t, au) {
+		t.Error("deploy_initialization entry recorded for a drive-OFF run (the !runRow.Drive guard should suppress it)")
+	}
+}
+
+// TestCreateRun_DeployFirst_AdvanceError_StillCreates pins binding condition 1
+// (#1429): the creation-time Advance is BEST-EFFORT — an Advance error WARN-logs
+// and does NOT unwind the created-run 201 (consistent with boardTransitionForRun).
+// The transitionErr forces orchestrator.Advance's pending→running step to fail
+// before the deploy stage is parked; the create must still return 201 with the
+// run row present and the deploy stage left pending, and NO deploy_initialization
+// entry recorded.
+func TestCreateRun_DeployFirst_AdvanceError_StillCreates(t *testing.T) {
+	repo := newDriveStageRepo()
+	repo.transitionErr = errors.New("boom") // fails Advance's run pending→running step
+	au := newAuditFake()
+	orch := &orchestrator.Orchestrator{Runs: repo}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au, Orchestrator: orch})
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "release",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"runner_kind":    "local",
+		"workflow_spec":  releaseSpecYAML,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (Advance error must not unwind the create):\n%s", w.Code, w.Body.String())
+	}
+	var got runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	// The run row exists despite the Advance failure.
+	if _, err := repo.GetRun(context.Background(), got.ID); err != nil {
+		t.Fatalf("run row missing after best-effort Advance failure: %v", err)
+	}
+	// The deploy stage was not parked (Advance failed before the stage
+	// transition), and no drive entry was recorded.
+	stages := repo.stagesFor(got.ID)
+	if len(stages) != 1 || stages[0].State != run.StageStatePending {
+		t.Errorf("deploy stage = %#v, want a single pending stage (Advance failed pre-park)", stages)
+	}
+	if hasDeployInitializationEntry(t, au) {
+		t.Error("deploy_initialization entry recorded despite the Advance failure")
+	}
+}
+
+// TestCreateRun_PlanFirst_NotAdvancedAtCreation is the load-bearing negative
+// (#1429 binding condition 2): the creation-time Advance is gated STRICTLY on
+// the first stage being a deploy stage, so an agent-first (plan-first) run is
+// NOT advanced at creation — its plan stage stays pending and the run stays
+// pending, preserving the operator-driven fishhawk_run_stage entry. A gate that
+// was too broad would dispatch the plan stage here and fail this test.
+func TestCreateRun_PlanFirst_NotAdvancedAtCreation(t *testing.T) {
+	repo := newDriveStageRepo()
+	au := newAuditFake()
+	orch := &orchestrator.Orchestrator{Runs: repo}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au, Orchestrator: orch})
+
+	driveTrue := true
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"runner_kind":    "local",
+		"drive":          driveTrue,
+		"workflow_spec":  gatedSpecYAML, // plan-first (plan → implement)
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var got runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+
+	// Plan-first run: Advance must NOT have run, so the plan stage stays
+	// pending and the run stays pending.
+	stages := repo.stagesFor(got.ID)
+	if len(stages) != 2 || stages[0].Type != run.StageTypePlan {
+		t.Fatalf("stages = %#v, want [plan, implement]", stages)
+	}
+	if stages[0].State != run.StageStatePending {
+		t.Errorf("plan stage state = %q, want pending (a plan-first run must not be advanced at creation)", stages[0].State)
+	}
+	gotRun, err := repo.GetRun(context.Background(), got.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.State != run.StatePending {
+		t.Errorf("run state = %q, want pending (creation-time Advance must not fire for plan-first)", gotRun.State)
+	}
+	// And no deploy_initialization entry was recorded.
+	if hasDeployInitializationEntry(t, au) {
+		t.Error("deploy_initialization entry recorded for a plan-first run")
 	}
 }
 

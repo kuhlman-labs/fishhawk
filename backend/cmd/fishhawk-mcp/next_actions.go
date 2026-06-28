@@ -188,6 +188,15 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 		}
 	}
 
+	// Deploy stage arms (E23.13 / #1429). A standalone delegating release run
+	// has a single deploy stage and no plan/implement of its own, so it falls
+	// through every arm above; without this it would read as unclassified.
+	// Placed AFTER the implement arm and BEFORE the no-stages / unclassified
+	// fallback.
+	if deploy := stageByType(stages, "deploy"); deploy != nil && !stageStateIsTerminal(deploy.State) {
+		return deployStageNextActions(run, deploy)
+	}
+
 	// A run with no stage rows yet (just created; stages not materialized).
 	if len(stages) == 0 {
 		return &NextActions{
@@ -349,6 +358,64 @@ func implementStageNextActions(run *Run, impl *Stage, implementReviewStatus *Rev
 		return &NextActions{State: "implement_gate_settled", Actions: mergeRitualActions(run, "the implement review is settled with no open concerns")}
 	default:
 		return nil
+	}
+}
+
+// deployStageNextActions covers a delegating deploy stage's non-terminal
+// states (E23.13 / #1429 / ADR-038). A deploy stage's gate is PRE-execution
+// (its effect IS the side effect), so the operator judgment point is the
+// approval at awaiting_deploy_approval; once approved, the backend triggers the
+// external pipeline and the deployreconciler polls it to terminal
+// (awaiting_deployment). The defensive pending/dispatched/running arms cover
+// the brief windows the backend itself parks/advances the stage through — there
+// is nothing for the operator to do but re-poll.
+func deployStageNextActions(run *Run, deploy *Stage) *NextActions {
+	switch deploy.State {
+	case "awaiting_deploy_approval":
+		// The pre-execution approval gate (the operator judgment point). The
+		// deploy gate is approved via the generic approval verb — the approval
+		// handler special-cases stage.Type==deploy (checkDeployPreflight); there
+		// is no separate fishhawk_approve_deploy tool.
+		return &NextActions{
+			State: "deploy_gate_parked",
+			Actions: []SuggestedAction{{
+				Action:       "fishhawk_approve_plan",
+				Params:       map[string]string{"run_id": run.ID},
+				Precondition: "the deploy stage is parked at its pre-execution approval gate (awaiting_deploy_approval); confirm the corresponding change merged and the pre-flight deploy constraints (allowed_environments, change_freeze) hold before approving",
+				Consumes:     consumesApprovalSlot,
+				Reason:       "approve the deploy INTENT (ADR-038: a deploy stage's effect is the side effect, so the gate is pre-execution) — approval triggers the external pipeline; a production deploy pages the human regardless of runner kind",
+			}},
+		}
+	case "awaiting_deployment":
+		// Approved and triggered: the backend deployreconciler is polling the
+		// external pipeline to terminal. Nothing for the operator to do but
+		// re-poll.
+		return &NextActions{
+			State: "deploy_in_flight",
+			Actions: []SuggestedAction{pollAction(run,
+				suggestedStageWaitPollIntervalSeconds,
+				"the deploy intent was approved and the external pipeline is running — the backend deployreconciler is polling it to terminal; re-poll until the deploy stage settles")},
+		}
+	case "dispatched", "running":
+		// Defensive: brief windows the backend advances the stage through after
+		// approval, before the reconciler picks it up. Poll.
+		return &NextActions{
+			State: "deploy_in_flight",
+			Actions: []SuggestedAction{pollAction(run,
+				suggestedStageWaitPollIntervalSeconds,
+				"the deploy stage is advancing through the backend toward the external pipeline — re-poll until it settles")},
+		}
+	default: // pending
+		// Defensive: a deploy-first run is parked at the gate at creation
+		// (#1429), so a pending deploy stage is a transient pre-park window
+		// (or a creation-time Advance that has not landed). Poll — the backend
+		// parks it at the gate.
+		return &NextActions{
+			State: "deploy_initializing",
+			Actions: []SuggestedAction{pollAction(run,
+				suggestedStageWaitPollIntervalSeconds,
+				"the deploy stage has not yet parked at its pre-execution approval gate — re-poll until it reaches awaiting_deploy_approval (the backend parks it at creation)")},
+		}
 	}
 }
 

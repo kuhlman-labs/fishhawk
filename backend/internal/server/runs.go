@@ -755,11 +755,36 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	// the snapshot (no PR merge gate enforcement); github_actions
 	// runs minted via this path can be backfilled by the webhook
 	// trace handler if needed.
+	var createdStages []*run.Stage
 	if haveStageDefs {
-		if _, err := webhook.CreateStagesFromSpec(r.Context(), s.cfg.RunRepo, created.ID, workflowDef.Stages); err != nil {
+		createdStages, err = webhook.CreateStagesFromSpec(r.Context(), s.cfg.RunRepo, created.ID, workflowDef.Stages)
+		if err != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 				"create stages failed", map[string]any{"error": err.Error()})
 			return
+		}
+	}
+
+	// Deploy-first creation park (E23.13 / #1429). A standalone delegating
+	// release run's only stage is a deploy stage, which has no agent or runner —
+	// so unlike a plan/implement-first run there is NO operator-driven
+	// fishhawk_run_stage entry to trigger orchestrator.Advance, and the deploy
+	// stage would otherwise sit at pending forever. When the FIRST stage is a
+	// deploy stage, kick Advance at creation: it transitions the run
+	// pending → running and parks the deploy stage pending → awaiting_deploy_approval
+	// (orchestrator.go's deploy guard), making the pre-execution approval gate
+	// reachable. Gated STRICTLY on the first stage being a deploy stage so
+	// agent-first runs keep their operator-driven entry — calling Advance for a
+	// plan-first run would prematurely dispatch the plan stage. Best-effort,
+	// consistent with the boardTransitionForRun posture below: an Advance error
+	// WARN-logs and never unwinds the created-run 201 (the run row exists; a
+	// status re-poll re-reaches the operator).
+	if len(createdStages) > 0 && createdStages[0].Type == run.StageTypeDeploy && s.cfg.Orchestrator != nil {
+		if _, aerr := s.cfg.Orchestrator.Advance(r.Context(), created.ID); aerr != nil {
+			s.cfg.Logger.Warn("deploy-first creation Advance failed; deploy stage left pending (re-poll will re-reach the gate)",
+				"run_id", created.ID.String(), "error", aerr.Error())
+		} else {
+			s.recordDriveDeployInitialization(r.Context(), created, createdStages[0])
 		}
 	}
 
@@ -779,6 +804,30 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	s.boardTransitionForRun(r.Context(), created, lifecycleRunStarted)
 
 	s.writeJSON(w, r, http.StatusCreated, toRunResponse(created))
+}
+
+// recordDriveDeployInitialization stamps the drive engine's
+// deploy_initialization rule (E23.13 / #1429) after a deploy-first run's
+// creation-time orchestrator.Advance parks the deploy stage at its
+// pre-execution approval gate. No-ops for non-drive runs, when no engine is
+// wired, or when no run repo is wired (best-effort: the park already landed; a
+// missing stamp degrades attribution, never the run). Modeled on
+// recordDrivePlanApproved / recordDriveFixupRepark. The entry is keyed to the
+// parked deploy stage and carries the operator's approve-the-deploy-intent next
+// action — the run is now parked awaiting that judgment.
+func (s *Server) recordDriveDeployInitialization(ctx context.Context, runRow *run.Run, deployStage *run.Stage) {
+	if s.drive == nil || s.cfg.RunRepo == nil || !runRow.Drive {
+		return
+	}
+	out := drive.EvaluateDeployInitialization()
+	s.drive.Record(ctx, runRow.ID, &deployStage.ID, drive.Advance{
+		Rule:       drive.RuleDeployInitialization,
+		From:       "deploy:pending",
+		To:         "deploy:awaiting_deploy_approval",
+		Event:      "deploy-first run created; orchestrator parked the deploy stage at its pre-execution approval gate",
+		Parked:     true,
+		NextAction: out.NextAction,
+	})
 }
 
 // handleGetRun implements GET /v0/runs/{run_id}. Returns 404 with
