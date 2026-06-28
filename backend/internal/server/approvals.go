@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gopkg.in/yaml.v3"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
@@ -367,6 +368,16 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		resolvedModel = rm
+
+		// Plan/review allow-list parity (#1416): the implement gate above
+		// validates only the implement model. Validate the RESOLVED plan and
+		// review models (the same ladders writeStageModelResolutions emits) against
+		// their per-adapter allow-lists too, PRE-Submit for the same ADR-036 reason:
+		// a 422 inserts no row so a corrected re-approval flows normally. Fail-OPEN
+		// when a policy is unset (byte-identical to today).
+		if !s.checkStageModelsAllowed(w, r, stage, req.PlanModel, req.ReviewModel) {
+			return
+		}
 	}
 
 	// Deploy gate (#1384 / E23.4 / ADR-038): the deploy stage's PRE-execution
@@ -917,6 +928,144 @@ func (s *Server) checkPlanModelAllowed(w http.ResponseWriter, r *http.Request, s
 			"adapter":      adapter,
 		})
 	return nil, false
+}
+
+// checkStageModelsAllowed is the plan/review allow-list gate (#1416), the
+// plan-stage parity of checkPlanModelAllowed. It validates the RESOLVED plan and
+// review models — the very ladders writeStageModelResolutions re-resolves and
+// emits — against PlanAllowedModels / ReviewAllowedModels. Returns true to
+// proceed; returns false after writing a 422 (plan_model_not_allowed /
+// review_model_not_allowed, naming the resolved SOURCE) on the first disallowed
+// model.
+//
+// Fail-OPEN throughout, matching the sibling implement gate:
+//   - GetRun failure returns true: proceed, leaving the resolution to the
+//     post-advance writeStageModelResolutions, rather than blocking on a read
+//     error.
+//   - An empty resolved model (ModelSourceNone, today's default spawn) skips its
+//     check — there is nothing to validate.
+//   - An empty/unconfigured allow-list — or an adapter/provider with no set —
+//     accepts any model via IsAllowed, byte-identical to today.
+//
+// The plan model is keyed by the plan stage's executor.agent adapter
+// (specPlanExecutorAgent → adapterForImplementAgent, the same agent→adapter map
+// the implement gate uses). The review model is validated against EACH distinct
+// implement-review reviewer provider, because the review_model override is
+// applied to every heterogeneous reviewer (resolveReviewerInvocationsWithReviewModel);
+// a run with no agent reviewers has no provider to validate against and so
+// fails open.
+func (s *Server) checkStageModelsAllowed(w http.ResponseWriter, r *http.Request, stage *run.Stage, planOverride, reviewOverride string) bool {
+	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "plan/review model gate: get run failed",
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return true
+	}
+
+	if planRM := s.gateResolvePlanModel(runRow, planOverride); planRM.Value != "" {
+		adapter := adapterForImplementAgent(specPlanExecutorAgent(runRow.WorkflowSpec, runRow.WorkflowID))
+		if !s.cfg.PlanAllowedModels.IsAllowed(adapter, planRM.Value) {
+			s.writeError(w, r, http.StatusUnprocessableEntity, "plan_model_not_allowed",
+				fmt.Sprintf("resolved plan model %q (source %s) is not in the configured allow-list for adapter %q; choose an allowed model via the plan stage executor.model or the plan_model approval override, or widen the deployment allow-list",
+					planRM.Value, planRM.Source, adapter),
+				map[string]any{
+					"stage_id":     stage.ID.String(),
+					"model":        planRM.Value,
+					"model_source": string(planRM.Source),
+					"adapter":      adapter,
+				})
+			return false
+		}
+	}
+
+	if reviewRM := s.gateResolveReviewModel(runRow, reviewOverride); reviewRM.Value != "" {
+		for _, provider := range s.reviewProvidersForRun(r.Context(), runRow) {
+			if s.cfg.ReviewAllowedModels.IsAllowed(provider, reviewRM.Value) {
+				continue
+			}
+			s.writeError(w, r, http.StatusUnprocessableEntity, "review_model_not_allowed",
+				fmt.Sprintf("resolved review model %q (source %s) is not in the configured allow-list for reviewer provider %q; choose an allowed model via the review stage executor.model or the review_model approval override, or widen the deployment allow-list",
+					reviewRM.Value, reviewRM.Source, provider),
+				map[string]any{
+					"stage_id":     stage.ID.String(),
+					"model":        reviewRM.Value,
+					"model_source": string(reviewRM.Source),
+					"provider":     provider,
+				})
+			return false
+		}
+	}
+
+	return true
+}
+
+// reviewProvidersForRun returns the distinct agent reviewer providers the
+// review_model override would be applied to — the implement stage's reviewers
+// (#1416), where the heterogeneous agent reviewers live and which the
+// post-plan-gate (implement) review runs. Order is deterministic (config order,
+// first occurrence wins) so the gate rejects on a stable provider. An absent
+// reviewers config — or a bare-count form with no declared providers — yields an
+// empty slice, so the review allow-list check fails open (nothing to validate).
+func (s *Server) reviewProvidersForRun(ctx context.Context, runRow *run.Run) []string {
+	reviewersCfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement)
+	if reviewersCfg == nil {
+		return nil
+	}
+	var providers []string
+	seen := map[string]bool{}
+	for _, a := range reviewersCfg.Agents {
+		p := strings.TrimSpace(a.Provider)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		providers = append(providers, p)
+	}
+	return providers
+}
+
+// specPlanExecutorAgent reads executor.agent on the plan stage of the given
+// workflow from raw workflow-spec bytes via a local YAML probe, returning ""
+// when the spec is empty, malformed, or declares no executor.agent. It mirrors
+// specImplementExecutorAgent exactly but targets the PLAN stage (prefer a stage
+// whose id == "plan", else the first stage whose type == "plan"). The gate maps
+// the returned id to the allow-list adapter key via adapterForImplementAgent,
+// so an empty/absent agent keys the default-spawn adapter ("claudecode").
+func specPlanExecutorAgent(specBytes []byte, workflowID string) string {
+	if len(specBytes) == 0 {
+		return ""
+	}
+	var probe struct {
+		Workflows map[string]struct {
+			Stages []struct {
+				ID       string `yaml:"id"`
+				Type     string `yaml:"type"`
+				Executor struct {
+					Agent string `yaml:"agent"`
+				} `yaml:"executor"`
+			} `yaml:"stages"`
+		} `yaml:"workflows"`
+	}
+	if err := yaml.Unmarshal(specBytes, &probe); err != nil {
+		return ""
+	}
+	wf, ok := probe.Workflows[workflowID]
+	if !ok {
+		return ""
+	}
+	for _, st := range wf.Stages {
+		if st.ID == "plan" {
+			return strings.TrimSpace(st.Executor.Agent)
+		}
+	}
+	for _, st := range wf.Stages {
+		if st.Type == "plan" {
+			return strings.TrimSpace(st.Executor.Agent)
+		}
+	}
+	return ""
 }
 
 // writeStageModelResolutions emits the per-stage model_resolved audit entries on

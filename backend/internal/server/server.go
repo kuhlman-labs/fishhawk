@@ -340,6 +340,24 @@ type Config struct {
 	// from FISHHAWKD_IMPLEMENT_ALLOWED_MODELS in serve.go via ParseAllowedModels.
 	ImplementAllowedModels AllowedModels
 
+	// PlanAllowedModels is the per-adapter allowed-model policy the approval
+	// gate validates the RESOLVED plan model against (#1416), the plan-stage
+	// parity of ImplementAllowedModels. The gate keys it by the plan stage's
+	// executor.agent adapter. A nil/empty policy — or an adapter with no
+	// configured set — fails OPEN (any model accepted, byte-identical to today).
+	// Wired from FISHHAWKD_PLAN_ALLOWED_MODELS in serve.go via ParseAllowedModels.
+	PlanAllowedModels AllowedModels
+
+	// ReviewAllowedModels is the per-adapter allowed-model policy the approval
+	// gate validates the RESOLVED review model against (#1416), the review-stage
+	// parity of ImplementAllowedModels. The review_model override is applied to
+	// the implement-stage agent reviewers, so the gate validates the resolved
+	// value against each reviewer provider's allow-set. A nil/empty policy — or a
+	// provider with no configured set — fails OPEN (any model accepted,
+	// byte-identical to today). Wired from FISHHAWKD_REVIEW_ALLOWED_MODELS in
+	// serve.go via ParseAllowedModels.
+	ReviewAllowedModels AllowedModels
+
 	// ReviewResolution is the deployment-level review-gate resolution provider
 	// id (ADR-031 Phase 2), defaulting to github_merge. It selects which
 	// reviewresolver.Resolver the merge-status reconciler routes through. The
