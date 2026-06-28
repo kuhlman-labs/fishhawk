@@ -332,22 +332,20 @@ func (q *Queries) GetStage(ctx context.Context, id uuid.UUID) (Stage, error) {
 	return i, err
 }
 
-const listReviewStagesAwaitingApproval = `-- name: ListReviewStagesAwaitingApproval :many
+const listDeployStagesAwaitingDeployment = `-- name: ListDeployStagesAwaitingDeployment :many
 SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park FROM stages
- WHERE state = 'awaiting_approval'
-   AND stage_type = 'review'
+ WHERE state = 'awaiting_deployment'
+   AND stage_type = 'deploy'
  ORDER BY updated_at ASC
 `
 
-// The merge reconciler's candidate listing — every review stage parked
-// in awaiting_approval, SLA-independent BY DESIGN. Unlike the adjacent
-// ListStagesAwaitingApproval (which the SLA ticker keeps using with its
-// `gate_sla IS NOT NULL` filter), this query must NOT filter on gate_sla:
-// the feature_change review gate has no sla, so an SLA filter would hide
-// every feature_change merge from the reconciler and park those runs at
-// review awaiting_approval forever (#725). Ordered updated_at ASC.
-func (q *Queries) ListReviewStagesAwaitingApproval(ctx context.Context) ([]Stage, error) {
-	rows, err := q.db.Query(ctx, listReviewStagesAwaitingApproval)
+// The deploy reconciler's candidate listing (#1386 / E23.6) — every deploy
+// stage parked in awaiting_deployment, polled to a terminal outcome against
+// the external pipeline's GitHub Actions run. Mirrors
+// ListReviewStagesAwaitingApproval's shape for the merge reconciler. Ordered
+// updated_at ASC so the oldest parked deploy is reconciled first.
+func (q *Queries) ListDeployStagesAwaitingDeployment(ctx context.Context) ([]Stage, error) {
+	rows, err := q.db.Query(ctx, listDeployStagesAwaitingDeployment)
 	if err != nil {
 		return nil, err
 	}
@@ -386,20 +384,85 @@ func (q *Queries) ListReviewStagesAwaitingApproval(ctx context.Context) ([]Stage
 	return items, nil
 }
 
-const listDeployStagesAwaitingDeployment = `-- name: ListDeployStagesAwaitingDeployment :many
+const listDeployStagesRollbackPending = `-- name: ListDeployStagesRollbackPending :many
+SELECT s.id, s.run_id, s.sequence, s.stage_type, s.executor_kind, s.executor_ref, s.state, s.started_at, s.ended_at, s.failure_category, s.failure_reason, s.created_at, s.updated_at, s.gate_sla, s.requires_approval, s.gate_type, s.gate_approvers, s.self_retry_count, s.scope_completeness_park FROM stages s
+ WHERE s.stage_type = 'deploy'
+   AND EXISTS (
+     SELECT 1 FROM audit_entries ai
+      WHERE ai.stage_id = s.id
+        AND ai.category = 'deployment_rollback_initiated')
+   AND NOT EXISTS (
+     SELECT 1 FROM audit_entries ac
+      WHERE ac.stage_id = s.id
+        AND ac.category = 'deployment_rollback_completed')
+ ORDER BY s.updated_at ASC
+`
+
+// The deploy reconciler's ROLLBACK candidate listing (#1398 / E23.6, #1386
+// binding condition 2) — every deploy stage with a deployment_rollback_initiated
+// audit entry that has NO matching deployment_rollback_completed entry. Keyed on
+// the rollback HANDLE (audit), not stage state: a rolled-back deploy stage is
+// already terminal (succeeded/failed), so it would never appear in
+// ListDeployStagesAwaitingDeployment. The reconciler polls each candidate's
+// github_actions rollback run to terminal and records rolled_back +
+// deployment_rollback_completed when the external pipeline never calls back.
+// Ordered updated_at ASC so the oldest pending rollback is reconciled first.
+func (q *Queries) ListDeployStagesRollbackPending(ctx context.Context) ([]Stage, error) {
+	rows, err := q.db.Query(ctx, listDeployStagesRollbackPending)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Stage
+	for rows.Next() {
+		var i Stage
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.Sequence,
+			&i.StageType,
+			&i.ExecutorKind,
+			&i.ExecutorRef,
+			&i.State,
+			&i.StartedAt,
+			&i.EndedAt,
+			&i.FailureCategory,
+			&i.FailureReason,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.GateSla,
+			&i.RequiresApproval,
+			&i.GateType,
+			&i.GateApprovers,
+			&i.SelfRetryCount,
+			&i.ScopeCompletenessPark,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listReviewStagesAwaitingApproval = `-- name: ListReviewStagesAwaitingApproval :many
 SELECT id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at, ended_at, failure_category, failure_reason, created_at, updated_at, gate_sla, requires_approval, gate_type, gate_approvers, self_retry_count, scope_completeness_park FROM stages
- WHERE state = 'awaiting_deployment'
-   AND stage_type = 'deploy'
+ WHERE state = 'awaiting_approval'
+   AND stage_type = 'review'
  ORDER BY updated_at ASC
 `
 
-// The deploy reconciler's candidate listing (#1386 / E23.6) — every deploy
-// stage parked in awaiting_deployment, polled to a terminal outcome against
-// the external pipeline's GitHub Actions run. Mirrors
-// ListReviewStagesAwaitingApproval's shape for the merge reconciler. Ordered
-// updated_at ASC so the oldest parked deploy is reconciled first.
-func (q *Queries) ListDeployStagesAwaitingDeployment(ctx context.Context) ([]Stage, error) {
-	rows, err := q.db.Query(ctx, listDeployStagesAwaitingDeployment)
+// The merge reconciler's candidate listing — every review stage parked
+// in awaiting_approval, SLA-independent BY DESIGN. Unlike the adjacent
+// ListStagesAwaitingApproval (which the SLA ticker keeps using with its
+// `gate_sla IS NOT NULL` filter), this query must NOT filter on gate_sla:
+// the feature_change review gate has no sla, so an SLA filter would hide
+// every feature_change merge from the reconciler and park those runs at
+// review awaiting_approval forever (#725). Ordered updated_at ASC.
+func (q *Queries) ListReviewStagesAwaitingApproval(ctx context.Context) ([]Stage, error) {
+	rows, err := q.db.Query(ctx, listReviewStagesAwaitingApproval)
 	if err != nil {
 		return nil, err
 	}

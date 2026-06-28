@@ -19,10 +19,12 @@ import (
 // methods the ticker calls.
 type fakeRepo struct {
 	run.BaseFake
-	awaiting []*run.Stage
-	awaitErr error
-	runs     map[uuid.UUID]*run.Run
-	getErr   error
+	awaiting        []*run.Stage
+	awaitErr        error
+	rollbackPending []*run.Stage
+	rollbackErr     error
+	runs            map[uuid.UUID]*run.Run
+	getErr          error
 }
 
 func (f *fakeRepo) ListDeployStagesAwaitingDeployment(_ context.Context) ([]*run.Stage, error) {
@@ -30,6 +32,13 @@ func (f *fakeRepo) ListDeployStagesAwaitingDeployment(_ context.Context) ([]*run
 		return nil, f.awaitErr
 	}
 	return f.awaiting, nil
+}
+
+func (f *fakeRepo) ListDeployStagesRollbackPending(_ context.Context) ([]*run.Stage, error) {
+	if f.rollbackErr != nil {
+		return nil, f.rollbackErr
+	}
+	return f.rollbackPending, nil
 }
 
 func (f *fakeRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
@@ -43,18 +52,32 @@ func (f *fakeRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
 	return r, nil
 }
 
-// fakeAudit serves the deployment_dispatched handle entries.
+// fakeAudit serves handle entries, filtered by the queried category so the
+// forward scan (deployment_dispatched) and the rollback scan
+// (deployment_rollback_initiated) read their own handles. entries holds the
+// forward handle for back-compat with the existing scenarios; byCategory, when
+// set, overrides per-category lookups.
 type fakeAudit struct {
 	audit.BaseFake
-	entries []*audit.Entry
-	err     error
+	entries    []*audit.Entry
+	byCategory map[string][]*audit.Entry
+	err        error
 }
 
-func (f *fakeAudit) ListForRunByCategory(_ context.Context, _ uuid.UUID, _ string) ([]*audit.Entry, error) {
+func (f *fakeAudit) ListForRunByCategory(_ context.Context, _ uuid.UUID, category string) ([]*audit.Entry, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
-	return f.entries, nil
+	if f.byCategory != nil {
+		return f.byCategory[category], nil
+	}
+	// Back-compat: the forward scenarios seed `entries` as deployment_dispatched
+	// handles. Only return them for that category so a rollback-category query
+	// against a forward fixture reads empty.
+	if category == categoryDeploymentDispatched {
+		return f.entries, nil
+	}
+	return nil, nil
 }
 
 // stubPoller returns canned workflow-run states and counts calls. get is
@@ -67,6 +90,10 @@ type stubPoller struct {
 	resolve      *githubclient.WorkflowRun
 	resolveErr   error
 	resolveCalls int
+	// lastCorrelation captures the correlation map the most recent
+	// ResolveDispatchedRun call received, so a test can assert the rollback
+	// scan supplies the fishhawk_rollback marker.
+	lastCorrelation map[string]string
 }
 
 func (s *stubPoller) GetWorkflowRun(_ context.Context, _ int64, _ githubclient.RepoRef, _ int64) (*githubclient.WorkflowRun, error) {
@@ -77,8 +104,9 @@ func (s *stubPoller) GetWorkflowRun(_ context.Context, _ int64, _ githubclient.R
 	return s.get, nil
 }
 
-func (s *stubPoller) ResolveDispatchedRun(_ context.Context, _ int64, _ githubclient.RepoRef, _ string, _ map[string]string, _ time.Time) (*githubclient.WorkflowRun, error) {
+func (s *stubPoller) ResolveDispatchedRun(_ context.Context, _ int64, _ githubclient.RepoRef, _ string, correlation map[string]string, _ time.Time) (*githubclient.WorkflowRun, error) {
 	s.resolveCalls++
+	s.lastCorrelation = correlation
 	if s.resolveErr != nil {
 		return nil, s.resolveErr
 	}
@@ -93,6 +121,11 @@ type recordingResolver struct {
 	gitRef  string
 	wr      *githubclient.WorkflowRun
 	err     error
+
+	rollbackCalls  int
+	rollbackGitRef string
+	rollbackWR     *githubclient.WorkflowRun
+	rollbackErr    error
 }
 
 func (r *recordingResolver) ResolveDeploymentFromPollState(_ context.Context, _, _ uuid.UUID, outcome run.DeployOutcome, gitRef string, wr *githubclient.WorkflowRun) error {
@@ -101,6 +134,13 @@ func (r *recordingResolver) ResolveDeploymentFromPollState(_ context.Context, _,
 	r.gitRef = gitRef
 	r.wr = wr
 	return r.err
+}
+
+func (r *recordingResolver) ResolveDeploymentRollbackFromPollState(_ context.Context, _, _ uuid.UUID, gitRef string, wr *githubclient.WorkflowRun) error {
+	r.rollbackCalls++
+	r.rollbackGitRef = gitRef
+	r.rollbackWR = wr
+	return r.rollbackErr
 }
 
 const testInstallID int64 = 42
@@ -148,6 +188,192 @@ func ghaHandle(runID int64) map[string]any {
 		"gha_run_id":    runID,
 		"git_ref":       "main",
 		"dispatched_at": time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+// rollbackEntry builds a deployment_rollback_initiated audit entry, modeling
+// slice-1's handleRollbackDeployment handle.
+func rollbackEntry(runID, stageID uuid.UUID, payload map[string]any) *audit.Entry {
+	raw, _ := json.Marshal(payload)
+	return &audit.Entry{RunID: &runID, StageID: &stageID, Category: categoryDeploymentRollbackInitiated, Payload: raw}
+}
+
+// newRollbackScenario wires a single ALREADY-TERMINAL deploy stage (succeeded)
+// carrying a pending rollback handle (deployment_rollback_initiated with no
+// completed). The stage is listed by the rollback scan, not the forward
+// awaiting_deployment scan.
+func newRollbackScenario(install *int64, handle map[string]any, poller *stubPoller) *scenario {
+	runID := uuid.New()
+	stageID := uuid.New()
+	st := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeDeploy, State: run.StageStateSucceeded}
+	r := &run.Run{ID: runID, Repo: "octo/repo", InstallationID: install, WorkflowID: "deploy"}
+	repo := &fakeRepo{rollbackPending: []*run.Stage{st}, runs: map[uuid.UUID]*run.Run{runID: r}}
+	aud := &fakeAudit{byCategory: map[string][]*audit.Entry{}}
+	if handle != nil {
+		aud.byCategory[categoryDeploymentRollbackInitiated] = []*audit.Entry{rollbackEntry(runID, stageID, handle)}
+	}
+	res := &recordingResolver{}
+	return &scenario{
+		ticker:   &Ticker{Runs: repo, GH: poller, Audit: aud, Resolver: res},
+		resolver: res,
+		poller:   poller,
+		runID:    runID,
+		stageID:  stageID,
+	}
+}
+
+// rollbackHandle builds a github_actions rollback handle payload.
+func rollbackHandle(ghaRunID int64) map[string]any {
+	return map[string]any{
+		"target":        "github_actions",
+		"gha_run_id":    ghaRunID,
+		"git_ref":       "release",
+		"rollback":      true,
+		"dispatched_at": time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+// --- rollback scan (#1398): poll a github_actions rollback handle to terminal ---
+
+// HAPPY: a rollback handle with a gha_run_id whose run completed terminal drives
+// exactly one rollback resolve carrying the handle git ref + the polled run.
+func TestTick_Rollback_TerminalSuccess_RecordsRolledBack(t *testing.T) {
+	s := newRollbackScenario(ptr(testInstallID), rollbackHandle(888),
+		&stubPoller{get: &githubclient.WorkflowRun{ID: 888, HTMLURL: "https://gh/run/888", Status: "completed", Conclusion: "success"}})
+	s.ticker.Tick(context.Background())
+	if s.resolver.rollbackCalls != 1 {
+		t.Fatalf("rollback resolver calls = %d, want 1", s.resolver.rollbackCalls)
+	}
+	if s.resolver.rollbackGitRef != "release" {
+		t.Errorf("rollback gitRef = %q, want release", s.resolver.rollbackGitRef)
+	}
+	if s.resolver.rollbackWR == nil || s.resolver.rollbackWR.HTMLURL != "https://gh/run/888" {
+		t.Errorf("rollback wr not threaded: %+v", s.resolver.rollbackWR)
+	}
+	// The forward resolve must NOT fire for a rollback-only stage.
+	if s.resolver.calls != 0 {
+		t.Errorf("forward resolver calls = %d, want 0 on a rollback stage", s.resolver.calls)
+	}
+}
+
+// ANY terminal conclusion (here a failed rollback run) still records rolled_back,
+// mirroring the webhook callback.
+func TestTick_Rollback_TerminalFailure_StillRecordsRolledBack(t *testing.T) {
+	s := newRollbackScenario(ptr(testInstallID), rollbackHandle(1),
+		&stubPoller{get: &githubclient.WorkflowRun{ID: 1, Status: "completed", Conclusion: "failure"}})
+	s.ticker.Tick(context.Background())
+	if s.resolver.rollbackCalls != 1 {
+		t.Fatalf("rollback resolver calls = %d, want 1 (any terminal conclusion records rolled_back)", s.resolver.rollbackCalls)
+	}
+}
+
+// CORRELATION MARKER: when the handle has no gha_run_id, the re-resolve MUST
+// carry fishhawk_rollback="true" so it never matches the forward deploy run.
+func TestTick_Rollback_ReResolveCarriesRollbackMarker(t *testing.T) {
+	poller := &stubPoller{resolve: &githubclient.WorkflowRun{ID: 9, Status: "completed", Conclusion: "success"}}
+	handle := map[string]any{"target": "github_actions", "gha_run_id": 0, "git_ref": "release",
+		"dispatched_at": time.Now().UTC().Format(time.RFC3339)}
+	s := newRollbackScenario(ptr(testInstallID), handle, poller)
+	s.ticker.Tick(context.Background())
+	if poller.resolveCalls != 1 {
+		t.Fatalf("ResolveDispatchedRun calls = %d, want 1", poller.resolveCalls)
+	}
+	if got := poller.lastCorrelation[rollbackCorrelationMarker]; got != "true" {
+		t.Errorf("re-resolve correlation[%q] = %q, want \"true\"", rollbackCorrelationMarker, got)
+	}
+	if s.resolver.rollbackCalls != 1 {
+		t.Errorf("rollback resolver calls = %d, want 1 from re-resolve", s.resolver.rollbackCalls)
+	}
+}
+
+// AMBIGUOUS CORRELATION: gha_run_id=0 and ResolveDispatchedRun returns (nil,nil)
+// → no resolve, stage untouched (no mis-association of the forward run).
+func TestTick_Rollback_AmbiguousReResolve_RecordsNothing(t *testing.T) {
+	poller := &stubPoller{resolve: nil}
+	handle := map[string]any{"target": "github_actions", "gha_run_id": 0, "git_ref": "release",
+		"dispatched_at": time.Now().UTC().Format(time.RFC3339)}
+	s := newRollbackScenario(ptr(testInstallID), handle, poller)
+	s.ticker.Tick(context.Background())
+	if s.resolver.rollbackCalls != 0 {
+		t.Fatalf("rollback resolver called on ambiguous correlation, want 0")
+	}
+	if poller.resolveCalls != 1 {
+		t.Fatalf("ResolveDispatchedRun calls = %d, want 1 (re-resolve attempted)", poller.resolveCalls)
+	}
+	if poller.getCalls != 0 {
+		t.Fatalf("GetWorkflowRun called with no run id, got %d", poller.getCalls)
+	}
+}
+
+// WEBHOOK TARGET: a webhook rollback reports terminal via the callback, not the
+// reconciler — no poll, no resolve.
+func TestTick_Rollback_WebhookTarget_Skipped(t *testing.T) {
+	s := newRollbackScenario(ptr(testInstallID), map[string]any{"target": "webhook", "url": "https://hook"},
+		&stubPoller{})
+	s.ticker.Tick(context.Background())
+	if s.resolver.rollbackCalls != 0 {
+		t.Fatalf("rollback resolver called for webhook target, want 0 (callback path)")
+	}
+	if s.poller.getCalls != 0 || s.poller.resolveCalls != 0 {
+		t.Fatalf("webhook rollback should not poll GitHub: get=%d resolve=%d", s.poller.getCalls, s.poller.resolveCalls)
+	}
+}
+
+// IN-FLIGHT: the rollback run is still in_progress → no resolve, left pending.
+func TestTick_Rollback_InProgress_StaysPending(t *testing.T) {
+	s := newRollbackScenario(ptr(testInstallID), rollbackHandle(1),
+		&stubPoller{get: &githubclient.WorkflowRun{ID: 1, Status: "in_progress", Conclusion: ""}})
+	s.ticker.Tick(context.Background())
+	if s.resolver.rollbackCalls != 0 {
+		t.Fatalf("rollback resolver called on in-progress run, want 0")
+	}
+}
+
+// UNMAPPED CONCLUSION: completed but with an empty/unknown conclusion → no
+// resolve, left pending (no guessed disposition).
+func TestTick_Rollback_CompletedUnmappedConclusion_StaysPending(t *testing.T) {
+	s := newRollbackScenario(ptr(testInstallID), rollbackHandle(1),
+		&stubPoller{get: &githubclient.WorkflowRun{ID: 1, Status: "completed", Conclusion: ""}})
+	s.ticker.Tick(context.Background())
+	if s.resolver.rollbackCalls != 0 {
+		t.Fatalf("rollback resolver called on unmapped conclusion, want 0")
+	}
+}
+
+// NO INSTALLATION: no installation id → no creds to poll with, left pending.
+func TestTick_Rollback_NoInstallation_Skipped(t *testing.T) {
+	s := newRollbackScenario(nil, rollbackHandle(1),
+		&stubPoller{get: &githubclient.WorkflowRun{ID: 1, Status: "completed", Conclusion: "success"}})
+	s.ticker.Tick(context.Background())
+	if s.resolver.rollbackCalls != 0 {
+		t.Fatalf("rollback resolver called with no installation id, want 0")
+	}
+}
+
+// LIST ERROR on the rollback scan does not prevent (or crash) the forward scan,
+// and records nothing.
+func TestTick_Rollback_ListError_NoResolve(t *testing.T) {
+	repo := &fakeRepo{rollbackErr: errors.New("db down")}
+	res := &recordingResolver{}
+	tk := &Ticker{Runs: repo, GH: &stubPoller{}, Audit: &fakeAudit{}, Resolver: res}
+	tk.Tick(context.Background())
+	if res.rollbackCalls != 0 {
+		t.Fatalf("rollback resolver called after list error, want 0")
+	}
+}
+
+// TRANSIENT POLL ERROR: a GetWorkflowRun error leaves the rollback pending and
+// is retried next tick (never a terminal record).
+func TestTick_Rollback_TransientGetError_StaysPendingAndRetries(t *testing.T) {
+	poller := &stubPoller{getErr: errors.New("502 bad gateway")}
+	s := newRollbackScenario(ptr(testInstallID), rollbackHandle(1), poller)
+	s.ticker.Tick(context.Background())
+	if s.resolver.rollbackCalls != 0 {
+		t.Fatalf("rollback resolver called on transient poll error, want 0")
+	}
+	s.ticker.Tick(context.Background())
+	if poller.getCalls != 2 {
+		t.Fatalf("GetWorkflowRun calls = %d across two ticks, want 2 (retried)", poller.getCalls)
 	}
 }
 

@@ -857,6 +857,98 @@ func TestPostgres_DeployStage_PersistRoundTrip(t *testing.T) {
 	}
 }
 
+// rollbackLister is the narrow type-assert for the rollback-pending listing,
+// which is off the broad run.Repository interface by design (#1398).
+type rollbackLister interface {
+	ListDeployStagesRollbackPending(ctx context.Context) ([]*run.Stage, error)
+}
+
+func TestPostgres_ListDeployStagesRollbackPending(t *testing.T) {
+	// #1398 done-means: the rollback scan must return a deploy stage with a
+	// deployment_rollback_initiated audit entry and NO deployment_rollback_completed,
+	// EXCLUDE one that has both, and EXCLUDE a non-deploy stage (the EXISTS /
+	// NOT-EXISTS join across audit_entries is the crux — not compile-enforced).
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	lister, ok := repo.(rollbackLister)
+	if !ok {
+		t.Fatal("postgres repo does not implement ListDeployStagesRollbackPending")
+	}
+	auditRepo := audit.NewPostgresRepository(pool)
+	ctx := context.Background()
+	r := makeRun(t, repo)
+
+	// deployStage parks a fresh deploy stage at a terminal (succeeded) state —
+	// the realistic precondition for a rollback (only a settled deploy is
+	// rolled back).
+	deployStage := func(seq int) *run.Stage {
+		s, err := repo.CreateStage(ctx, run.CreateStageParams{
+			RunID: r.ID, Sequence: seq, Type: run.StageTypeDeploy,
+			ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+		})
+		if err != nil {
+			t.Fatalf("CreateStage(deploy seq=%d): %v", seq, err)
+		}
+		// pending → awaiting_deploy_approval → dispatched → running →
+		// awaiting_deployment → succeeded.
+		for _, to := range []run.StageState{
+			run.StageStateAwaitingDeployApproval, run.StageStateDispatched,
+			run.StageStateRunning, run.StageStateAwaitingDeployment, run.StageStateSucceeded,
+		} {
+			if _, err := repo.TransitionStage(ctx, s.ID, to, nil); err != nil {
+				t.Fatalf("→%s: %v", to, err)
+			}
+		}
+		return s
+	}
+	appendAudit := func(stageID uuid.UUID, category string) {
+		sid := stageID
+		kind := audit.ActorKind("system")
+		if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
+			RunID:     r.ID,
+			StageID:   &sid,
+			Timestamp: time.Now().UTC(),
+			Category:  category,
+			ActorKind: &kind,
+			Payload:   []byte(`{"rollback":true}`),
+		}); err != nil {
+			t.Fatalf("append %s: %v", category, err)
+		}
+	}
+
+	// A: initiated, NOT completed → pending (should be returned).
+	pending := deployStage(0)
+	appendAudit(pending.ID, "deployment_rollback_initiated")
+
+	// B: initiated AND completed → finalized (should be EXCLUDED).
+	done := deployStage(1)
+	appendAudit(done.ID, "deployment_rollback_initiated")
+	appendAudit(done.ID, "deployment_rollback_completed")
+
+	// C: a non-deploy (plan) stage carrying a rollback_initiated entry →
+	// EXCLUDED by the stage_type = 'deploy' filter.
+	nonDeploy := makeStage(t, repo, r.ID, 2)
+	appendAudit(nonDeploy.ID, "deployment_rollback_initiated")
+
+	got, err := lister.ListDeployStagesRollbackPending(ctx)
+	if err != nil {
+		t.Fatalf("ListDeployStagesRollbackPending: %v", err)
+	}
+	ids := map[uuid.UUID]bool{}
+	for _, s := range got {
+		ids[s.ID] = true
+	}
+	if !ids[pending.ID] {
+		t.Errorf("rollback-pending listing dropped the initiated-only deploy stage %s", pending.ID)
+	}
+	if ids[done.ID] {
+		t.Errorf("rollback-pending listing included the already-completed deploy stage %s", done.ID)
+	}
+	if ids[nonDeploy.ID] {
+		t.Errorf("rollback-pending listing included the non-deploy stage %s", nonDeploy.ID)
+	}
+}
+
 func TestPostgres_ListStagesAwaitingApproval_IncludesDeployStage(t *testing.T) {
 	// The SLA ticker's gate_sla-filtered query (ListStagesAwaitingApproval)
 	// was broadened (#1390 / #1399) to also surface deploy stages parked at

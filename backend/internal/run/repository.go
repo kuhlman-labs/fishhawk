@@ -225,7 +225,12 @@ type Repository interface {
 	// concrete *postgresRepo and is reached through deployreconciler's narrow
 	// DeployStageSource interface (serve.go type-asserts cfg.RunRepo to it) —
 	// keeping it off run.Repository avoids forcing a stub into every
-	// run.Repository test fake for a method nothing else calls.
+	// run.Repository test fake for a method nothing else calls. Its rollback
+	// sibling "ListDeployStagesRollbackPending" (#1398 — deploy stages with a
+	// deployment_rollback_initiated audit entry and no deployment_rollback_completed)
+	// is off this interface for the same reason: only the deploy reconciler's
+	// rollback scan consumes it, so it likewise lives on *postgresRepo and
+	// reaches the reconciler through the widened DeployStageSource.
 
 	// ListStagesAwaitingChildren returns every stage currently in
 	// awaiting_children state. The child-completion sweeper scans

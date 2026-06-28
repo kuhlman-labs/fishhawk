@@ -545,10 +545,11 @@ func TestShipDeployment_BodyTooLarge_413(t *testing.T) {
 // for the rest of the interface.
 type deployStageRepo struct {
 	run.BaseFake
-	mu          sync.Mutex
-	stages      map[uuid.UUID]*run.Stage
-	runs        map[uuid.UUID]*run.Run
-	transitions []run.StageState
+	mu              sync.Mutex
+	stages          map[uuid.UUID]*run.Stage
+	runs            map[uuid.UUID]*run.Run
+	transitions     []run.StageState
+	rollbackPending []uuid.UUID // stage ids the rollback scan should return
 }
 
 func newDeployStageRepo() *deployStageRepo {
@@ -593,6 +594,19 @@ func (r *deployStageRepo) ListDeployStagesAwaitingDeployment(_ context.Context) 
 	var out []*run.Stage
 	for _, s := range r.stages {
 		if s.Type == run.StageTypeDeploy && s.State == run.StageStateAwaitingDeployment {
+			cp := *s
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
+}
+
+func (r *deployStageRepo) ListDeployStagesRollbackPending(_ context.Context) ([]*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []*run.Stage
+	for _, id := range r.rollbackPending {
+		if s, ok := r.stages[id]; ok {
 			cp := *s
 			out = append(out, &cp)
 		}
@@ -704,6 +718,66 @@ func TestResolveDeploymentFromPollState_InvalidOutcome_Errors(t *testing.T) {
 	}
 }
 
+// ---- rollback resolver (#1398): reconciler-driven github_actions rollback ----
+
+// ResolveDeploymentRollbackFromPollState on an ALREADY-TERMINAL deploy stage
+// persists a rolled_back artifact and writes deployment_outcome_recorded +
+// deploy_run + deployment_rollback_completed, WITHOUT transitioning the stage or
+// advancing the run (the stage is already terminal; the rolled_back disposition
+// rides the artifact + audit). Crosses the resolver -> artifact -> audit seam.
+func TestResolveDeploymentRollbackFromPollState_RecordsRolledBack(t *testing.T) {
+	s, rr, ar, au, runID, stageID := newResolverServer(t)
+	rr.stages[stageID].State = run.StageStateSucceeded // deploy already terminal
+	wr := &githubclient.WorkflowRun{ID: 321, HTMLURL: "https://gh/run/321", Status: "completed", Conclusion: "success"}
+
+	if err := s.ResolveDeploymentRollbackFromPollState(context.Background(), runID, stageID, "release", wr); err != nil {
+		t.Fatalf("resolve rollback: %v", err)
+	}
+	if len(ar.all) != 1 || ar.all[0].Kind != artifact.KindDeployment {
+		t.Fatalf("want 1 deployment artifact, got %d", len(ar.all))
+	}
+	if !strings.Contains(string(ar.all[0].Content), `"outcome":"rolled_back"`) {
+		t.Errorf("artifact content missing rolled_back outcome: %s", ar.all[0].Content)
+	}
+	if n := countByCategory(au, CategoryDeploymentOutcomeRecorded); n != 1 {
+		t.Errorf("deployment_outcome_recorded entries = %d, want 1", n)
+	}
+	if n := countByCategory(au, CategoryDeployRun); n != 1 {
+		t.Errorf("deploy_run trace events = %d, want 1", n)
+	}
+	if n := countByCategory(au, CategoryDeploymentRollbackCompleted); n != 1 {
+		t.Errorf("deployment_rollback_completed entries = %d, want 1", n)
+	}
+	// The stage must NOT be transitioned and the run must NOT advance.
+	if got := rr.stageState(stageID); got != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want unchanged succeeded (rollback does not transition)", got)
+	}
+	if len(rr.transitions) != 0 {
+		t.Errorf("transitions = %v, want none on a rollback resolve", rr.transitions)
+	}
+}
+
+// Idempotency: a second resolve (a later tick re-observing the same terminal
+// rollback run) is a no-op once a deployment_rollback_completed entry exists for
+// the stage — no duplicate artifact, no duplicate completed entry.
+func TestResolveDeploymentRollbackFromPollState_Idempotent(t *testing.T) {
+	s, rr, ar, au, runID, stageID := newResolverServer(t)
+	rr.stages[stageID].State = run.StageStateSucceeded
+	wr := &githubclient.WorkflowRun{ID: 1, Status: "completed", Conclusion: "success"}
+
+	for i := 0; i < 2; i++ {
+		if err := s.ResolveDeploymentRollbackFromPollState(context.Background(), runID, stageID, "release", wr); err != nil {
+			t.Fatalf("resolve rollback #%d: %v", i, err)
+		}
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1 (idempotent re-call)", len(ar.all))
+	}
+	if n := countByCategory(au, CategoryDeploymentRollbackCompleted); n != 1 {
+		t.Errorf("deployment_rollback_completed entries = %d, want 1 (idempotent re-call)", n)
+	}
+}
+
 // Webhook-target callback: the external pipeline POSTs its terminal outcome to
 // POST /v0/runs/{run_id}/deployment, and the handler advances the parked deploy
 // stage to the mapped terminal state (#1386 slice-2 / item 7).
@@ -789,6 +863,70 @@ func TestDeployReconciler_EndToEnd(t *testing.T) {
 	}
 	if poller.getCalls != 1 {
 		t.Errorf("GetWorkflowRun calls = %d, want 1", poller.getCalls)
+	}
+}
+
+// Cross-boundary integration for the ROLLBACK scan (#1398): drive an
+// already-terminal deploy stage carrying a pending rollback handle end-to-end
+// through the real deployreconciler.Ticker with the server as Resolver. Asserts
+// the rollback DB-query -> poll -> server-persist seam: the reconciler reads the
+// deployment_rollback_initiated handle, polls the rollback run to terminal, and
+// the server records a rolled_back artifact + deployment_rollback_completed
+// WITHOUT transitioning the already-terminal stage.
+func TestDeployReconciler_Rollback_EndToEnd(t *testing.T) {
+	s, rr, ar, au, runID, stageID := newResolverServer(t)
+	rr.stages[stageID].State = run.StageStateSucceeded // deploy already terminal
+	rr.rollbackPending = []uuid.UUID{stageID}
+	rr.runs[runID].InstallationID = ptrInt64(99)
+
+	// Seed the deployment_rollback_initiated handle the reconciler reads back.
+	handle, _ := json.Marshal(map[string]any{
+		"target":        "github_actions",
+		"gha_run_id":    int64(606),
+		"git_ref":       "release",
+		"rollback":      true,
+		"dispatched_at": time.Now().UTC().Format(time.RFC3339),
+	})
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &runID, StageID: &stageID, Category: CategoryDeploymentRollbackInitiated, Payload: handle,
+	})
+
+	poller := &fakeDeployPoller{get: &githubclient.WorkflowRun{ID: 606, HTMLURL: "https://gh/run/606", Status: "completed", Conclusion: "success"}}
+	ticker := &deployreconciler.Ticker{Runs: rr, GH: poller, Audit: au, Resolver: s}
+	ticker.Tick(context.Background())
+
+	if got := rr.stageState(stageID); got != run.StageStateSucceeded {
+		t.Fatalf("end-to-end rollback stage state = %q, want unchanged succeeded", got)
+	}
+	if len(ar.all) != 1 || !strings.Contains(string(ar.all[0].Content), `"outcome":"rolled_back"`) {
+		t.Fatalf("want 1 rolled_back artifact, got %d: %+v", len(ar.all), ar.all)
+	}
+	if n := countByCategory(au, CategoryDeploymentRollbackCompleted); n != 1 {
+		t.Errorf("deployment_rollback_completed entries = %d, want 1", n)
+	}
+	if poller.getCalls != 1 {
+		t.Errorf("GetWorkflowRun calls = %d, want 1", poller.getCalls)
+	}
+}
+
+// Fail-open: when the idempotency read (ListForRunByCategory) errors, the
+// resolver proceeds to record rather than silently dropping the rollback — at
+// worst a content-identical artifact is re-written, which the hash dedup
+// collapses. Asserts the degraded branch records the outcome.
+func TestResolveDeploymentRollbackFromPollState_IdempotencyReadError_FailOpen(t *testing.T) {
+	s, rr, ar, au, runID, stageID := newResolverServer(t)
+	rr.stages[stageID].State = run.StageStateSucceeded
+	au.listByCategoryErr = errors.New("audit read down")
+
+	if err := s.ResolveDeploymentRollbackFromPollState(context.Background(), runID, stageID, "release",
+		&githubclient.WorkflowRun{ID: 1, Status: "completed", Conclusion: "success"}); err != nil {
+		t.Fatalf("resolve rollback (fail-open): %v", err)
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1 (fail-open records despite read error)", len(ar.all))
+	}
+	if n := countByCategory(au, CategoryDeploymentRollbackCompleted); n != 1 {
+		t.Errorf("deployment_rollback_completed entries = %d, want 1 (fail-open)", n)
 	}
 }
 
