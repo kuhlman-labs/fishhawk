@@ -471,7 +471,15 @@ Notes:
   `deployment_rollback_initiated` / `deployment_rollback_completed` entry
   (payload `{run_id, stage_id, artifact_id, environment, rollback_handle,
   rollback_action, auth_method}`, best-effort: an append failure WARN-logs and
-  never unwinds the recorded artifact + outcome). `deployment_dispatched` is
+  never unwinds the recorded artifact + outcome). Delivery guarantee (#1396): the
+  primary `deployment_outcome_recorded` entry is NOT best-effort — a failed
+  append 500s the request, and because the artifact persist and the audit append
+  are two non-atomic steps, the handler's idempotent-retry path (GetByHash hit)
+  self-heals: it verifies an outcome entry exists for the persisted artifact and
+  appends it if missing, so a retry after a partial Create-succeeded /
+  AppendChained-failed 500 ends with BOTH the artifact and its governance entry
+  present (the rollback sub-action entries stay best-effort and are NOT healed).
+  `deployment_dispatched` is
   EMITTED by the E23.4 deploy stage machine (the pre-execution-gated dispatch),
   not by this handler; it is introduced as a constant + surfaced on the timeline
   here so dispatch and outcome render consistently. The handler refreshes the
