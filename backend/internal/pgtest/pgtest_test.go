@@ -33,6 +33,28 @@ func TestIsContainerNameConflict(t *testing.T) {
 	}
 }
 
+func TestIsStaleContainerRef(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"docker no such container", errors.New(`start container fishhawk-test-postgres in state running: container start: Error response from daemon: No such container: b2428abc123`), true},
+		{"lowercase variant", errors.New("no such container: deadbeef"), true},
+		{"name conflict not stale", errors.New(`Conflict. The container name "/fishhawk-test-postgres" is already in use`), false},
+		{"unrelated error", errors.New("disk full"), false},
+		{"pg error", &pgconn.PgError{Code: "42P04", Message: "database already exists"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isStaleContainerRef(tt.err); got != tt.want {
+				t.Errorf("isStaleContainerRef() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsDuplicateDatabase(t *testing.T) {
 	tests := []struct {
 		name string
@@ -144,6 +166,60 @@ func TestSharedContainer_NameConflictAttaches(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("run invoked %d times on non-conflict error, want 1 (no retry)", calls)
+	}
+}
+
+// TestSharedContainer_StaleRefReattaches injects a docker stale-reuse-handle
+// error ("No such container") followed by success and asserts attachWithRetry
+// RE-CREATES the evicted container (converging in exactly 2 calls), distinct
+// from the name-conflict retry path. It also asserts the two fail-closed
+// modes: a PERSISTENT stale ref exhausts the attempt cap and errors (give-up
+// branch), and a genuinely-unretryable error returns immediately with no
+// retry (fail-hard preserved).
+func TestSharedContainer_StaleRefReattaches(t *testing.T) {
+	stale := errors.New(`container start: Error response from daemon: No such container: b2428abc123`)
+	calls := 0
+	got, err := attachWithRetry(5, time.Millisecond, func() (string, error) {
+		calls++
+		if calls == 1 {
+			return "", stale
+		}
+		return "attached", nil
+	})
+	if err != nil {
+		t.Fatalf("attachWithRetry: unexpected error %v", err)
+	}
+	if got != "attached" {
+		t.Errorf("attachWithRetry returned %q, want %q", got, "attached")
+	}
+	if calls != 2 {
+		t.Errorf("run invoked %d times, want 2 (one stale ref, one success)", calls)
+	}
+
+	// Give-up: a persistent stale ref exhausts the attempts and errors.
+	calls = 0
+	if _, err := attachWithRetry(3, time.Millisecond, func() (string, error) {
+		calls++
+		return "", stale
+	}); err == nil {
+		t.Error("attachWithRetry: expected error after attempts exhausted, got nil")
+	}
+	if calls != 3 {
+		t.Errorf("run invoked %d times, want 3 (the attempt cap)", calls)
+	}
+
+	// Fail-hard preserved: a genuinely-unretryable error returns immediately
+	// without retrying.
+	calls = 0
+	other := errors.New("disk full")
+	if _, err := attachWithRetry(5, time.Millisecond, func() (string, error) {
+		calls++
+		return "", other
+	}); !errors.Is(err, other) {
+		t.Errorf("attachWithRetry returned %v, want the unretryable error", err)
+	}
+	if calls != 1 {
+		t.Errorf("run invoked %d times on unretryable error, want 1 (no retry)", calls)
 	}
 }
 

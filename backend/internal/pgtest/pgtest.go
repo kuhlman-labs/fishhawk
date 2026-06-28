@@ -14,6 +14,12 @@
 //     binaries can both try to create the named container; the loser gets a
 //     docker name conflict. A bounded attach-retry re-resolves to the now
 //     existing container instead of erroring or starting a second one.
+//   - Stale reuse reference (isStaleContainerRef): the WithReuseByName handle
+//     can point at a container the daemon has since evicted, so the start
+//     fails with docker "No such container: <id>" (#1402, PR #1401). The same
+//     bounded attach-retry re-creates the evicted container instead of failing
+//     hard, because re-invoking WithReuseByName falls through to a fresh create
+//     once the dangling id is gone.
 //   - Cross-process template bootstrap (isDuplicateDatabase): each process
 //     has its own sync.Once, so the 2nd+ processes re-attempt CREATE DATABASE
 //     fishhawk_tmpl and hit SQLSTATE 42P04. The advisory-locked bootstrap
@@ -65,11 +71,11 @@ const (
 	// so locking on the base database serializes every bootstrapper.
 	bootstrapLockKey int64 = 1174
 
-	attachAttempts     = 12
+	attachAttempts     = 20
 	attachRetryDelay   = 500 * time.Millisecond
 	contentionAttempts = 12
 	contentionDelay    = 250 * time.Millisecond
-	startTimeout       = 120 * time.Second
+	startTimeout       = 180 * time.Second
 )
 
 var (
@@ -230,11 +236,14 @@ func bootstrapWith(createTemplate, migrate func() error) error {
 	return nil
 }
 
-// attachWithRetry runs the container start, retrying ONLY on a docker
-// name conflict (isContainerNameConflict) — the first-start race where a
-// sibling process won the create. On retry, WithReuseByName re-resolves to
-// the now-existing container, converging to a single shared handle. Any
-// other error returns immediately.
+// attachWithRetry runs the container start, retrying on either a docker name
+// conflict (isContainerNameConflict) — the first-start race where a sibling
+// process won the create — or a stale reuse reference (isStaleContainerRef) —
+// where the WithReuseByName handle points at a daemon-evicted container. On a
+// name-conflict retry, WithReuseByName re-resolves to the now-existing
+// container, converging to a single shared handle; on a stale-ref retry it
+// falls through to a fresh create once the dangling id is gone. Any other
+// (genuinely-unretryable) error returns immediately.
 func attachWithRetry[T any](attempts int, delay time.Duration, run func() (T, error)) (T, error) {
 	var zero T
 	var lastErr error
@@ -243,13 +252,13 @@ func attachWithRetry[T any](attempts int, delay time.Duration, run func() (T, er
 		if err == nil {
 			return v, nil
 		}
-		if !isContainerNameConflict(err) {
+		if !isContainerNameConflict(err) && !isStaleContainerRef(err) {
 			return zero, err
 		}
 		lastErr = err
 		time.Sleep(delay)
 	}
-	return zero, fmt.Errorf("attach to shared container: name conflict persisted after %d attempts: %w", attempts, lastErr)
+	return zero, fmt.Errorf("attach to shared container: name conflict or stale reuse reference persisted after %d attempts: %w", attempts, lastErr)
 }
 
 // createWithContentionRetry runs the per-test CREATE DATABASE ... TEMPLATE,
@@ -314,6 +323,18 @@ func isContainerNameConflict(err error) bool {
 		return true
 	}
 	return strings.Contains(msg, "status code 409") && strings.Contains(msg, "conflict")
+}
+
+// isStaleContainerRef reports whether err is the docker stale-reuse-handle
+// shape — "No such container: <id>" — raised when the WithReuseByName
+// reference points at a container the daemon has since evicted (#1402,
+// PR #1401: `container start: Error response from daemon: No such container:
+// b2428...`). Retrying re-creates the evicted container.
+func isStaleContainerRef(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "no such container")
 }
 
 // isDuplicateDatabase reports whether err carries SQLSTATE 42P04
