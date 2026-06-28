@@ -4024,6 +4024,18 @@ paths:
                         reason:
                           type: string
                           description: Operator justification for leaving the declared path unchanged.
+                  implement_model:
+                    type: string
+                    description: |
+                      The backend-resolved implement model id (#1013), echoed
+                      on implement stages so the runner pins the agent spawn to
+                      it (`--model <implement_model>`). Resolved through the
+                      implement-model ladder: operator gate decision < plan
+                      `model_recommendation.implement_model` < spec
+                      `executor.model` < deployment default. Absent when no rung
+                      supplied a model — the runner leaves the model unset and
+                      the agent spawns on the adapter's built-in default,
+                      byte-identical to today.
                   commit_author_name:
                     type: string
                     description: |
@@ -4193,6 +4205,9 @@ paths:
                         reason:
                           type: string
                           description: Operator justification for leaving the declared path unchanged.
+                  implement_model:
+                    type: string
+                    description: Backend-resolved implement model id (#1013), echoed on implement stages so the runner pins the agent spawn to it (`--model <implement_model>`). Resolved through the implement-model ladder (operator gate decision < plan `model_recommendation.implement_model` < spec `executor.model` < deployment default). Absent when no rung supplied a model — the runner leaves the model unset and the agent spawns on the adapter's built-in default, byte-identical to today.
                   commit_author_name:
                     type: string
                     description: GitHub App bot account's git author name (`<app-slug>[bot]`), resolved backend-side (#722). Absent when unresolvable; the runner falls back to its default.

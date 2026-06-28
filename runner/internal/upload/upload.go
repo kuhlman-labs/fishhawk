@@ -401,6 +401,24 @@ type FetchedPrompt struct {
 	// gitops.DefaultAuthorName/DefaultAuthorEmail.
 	CommitAuthorName  string `json:"commit_author_name,omitempty"`
 	CommitAuthorEmail string `json:"commit_author_email,omitempty"`
+	// ImplementModel is the backend-resolved implement model id (#1013),
+	// echoed by the backend on an implement-stage prompt so the runner pins
+	// the agent spawn to it (the claudecode adapter appends `--model
+	// <ImplementModel>` when set). The backend resolves it through the
+	// implement-model ladder: operator gate decision > plan
+	// model_recommendation.implement_model > spec executor.model > deployment
+	// default. EMPTY/omitted (the common case on every run today) means no
+	// rung supplied a model, and the runner leaves agent.Invocation.Model
+	// unset so the adapter spawns on its built-in default — byte-identical to
+	// today's spawn.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (implement_model) MUST stay
+	// byte-identical to the backend's promptResponse.ImplementModel
+	// (backend/internal/server/prompt.go) so the wire value round-trips. Same
+	// independent-struct-by-tag convention as ScopeExemptions (#1229) and
+	// BindingAssertions (#1171). A tag drift silently drops the model and the
+	// runner falls back to today's spawn.
+	ImplementModel string `json:"implement_model,omitempty"`
 	// Fixup is true when this implement stage is an operator-triggered
 	// implement-review fix-up pass (sub-plan A / #762). A fix-up re-runs
 	// the implement agent against the selected concerns and commits the
