@@ -81,6 +81,33 @@ func resolveImplementModel(deflt, spec, plan, operator string) ResolvedModel {
 	}
 }
 
+// resolvePlanModel applies the plan-model ladder, lowest to highest precedence:
+//
+//	deployment default  <  spec.executor.model (plan stage)  <  operator gate decision
+//
+// It mirrors resolveImplementModel but omits the implement ladder's plan
+// model_recommendation rung: the plan agent is spawned BEFORE any plan artifact
+// exists, so there is no plan recommendation to read for the plan stage's own
+// model (the model_recommendation a plan emits is for the IMPLEMENT stage). The
+// highest non-empty rung wins and its name is the source; an all-empty ladder
+// returns {Value: "", Source: ModelSourceNone}, so the caller carries no model
+// and the runner spawns the plan agent byte-for-byte as today (no --model
+// argument). Pure — no IO — and the single chokepoint both the prompt path
+// (this slice) and the approval gate (the operator-override slice) resolve
+// through, so a re-dispatched plan resolves its operator override the same way.
+func resolvePlanModel(deflt, spec, operator string) ResolvedModel {
+	switch {
+	case operator != "":
+		return ResolvedModel{Value: operator, Source: ModelSourceOperator}
+	case spec != "":
+		return ResolvedModel{Value: spec, Source: ModelSourceSpec}
+	case deflt != "":
+		return ResolvedModel{Value: deflt, Source: ModelSourceDefault}
+	default:
+		return ResolvedModel{Value: "", Source: ModelSourceNone}
+	}
+}
+
 // AllowedModels is the per-adapter allowed-model policy sourced from deployment
 // config (ParseAllowedModels). It maps an adapter name (claudecode | codex |
 // anthropic) to the set of model ids the operator permits for that adapter.
@@ -186,6 +213,26 @@ func (s *Server) resolveImplementModelForRun(ctx context.Context, runRow *run.Ru
 	specModel := specImplementExecutorModel(runRow.WorkflowSpec, runRow.WorkflowID)
 	planModel := s.planImplementModelRecommendation(ctx, runRow.ID)
 	return resolveImplementModel(deflt, specModel, planModel, "")
+}
+
+// resolvePlanModelForRun resolves the plan-model ladder for a run through the
+// pure resolvePlanModel chokepoint. It reads executor.model on the run's
+// workflow plan stage (specPlanExecutorModel) from the raw spec bytes, keeping
+// this slice free of a static dependency on the spec.Executor.Model field. The
+// deployment-default rung is left empty here: a PlanModelDefault config field is
+// owned by the allow-list/config slice, not this one, so the plan default is ""
+// and the ladder is effectively spec-only until that slice folds in a default
+// and the operator-override slice folds in the gate rung. The operator rung is
+// empty on this path — a plan prompt fetch precedes the plan-approval gate, so
+// it carries only the spec pin. An all-empty ladder (ModelSourceNone) leaves
+// PlanModel empty so the runner spawns the plan agent identically to today.
+//
+// The ctx parameter is reserved for the operator-override slice, which will read
+// the gate's per-stage model_resolved resolution here; this slice consults no
+// audit, so an empty/spec-only resolution stays byte-identical to today.
+func (*Server) resolvePlanModelForRun(_ context.Context, runRow *run.Run) ResolvedModel {
+	specModel := specPlanExecutorModel(runRow.WorkflowSpec, runRow.WorkflowID)
+	return resolvePlanModel("", specModel, "")
 }
 
 // resolveFixupImplementModel resolves the model a fix-up pass will run under
@@ -541,6 +588,49 @@ func specImplementExecutorModel(specBytes []byte, workflowID string) string {
 	}
 	for _, st := range wf.Stages {
 		if st.Type == "implement" {
+			return strings.TrimSpace(st.Executor.Model)
+		}
+	}
+	return ""
+}
+
+// specPlanExecutorModel reads executor.model on the plan stage of the given
+// workflow from raw workflow-spec bytes via a local YAML probe, returning ""
+// when the spec is empty, malformed, or declares no executor.model. It mirrors
+// specImplementExecutorModel exactly but targets the PLAN stage (prefer a stage
+// whose id == "plan", else the first stage whose type == "plan"), staying free
+// of a static dependency on the spec.Executor.Model field (owned by a sibling
+// schema slice). This is the spec rung of the plan-model ladder — the pinned
+// plan executor.model Scenario B honors.
+func specPlanExecutorModel(specBytes []byte, workflowID string) string {
+	if len(specBytes) == 0 {
+		return ""
+	}
+	var probe struct {
+		Workflows map[string]struct {
+			Stages []struct {
+				ID       string `yaml:"id"`
+				Type     string `yaml:"type"`
+				Executor struct {
+					Model string `yaml:"model"`
+				} `yaml:"executor"`
+			} `yaml:"stages"`
+		} `yaml:"workflows"`
+	}
+	if err := yaml.Unmarshal(specBytes, &probe); err != nil {
+		return ""
+	}
+	wf, ok := probe.Workflows[workflowID]
+	if !ok {
+		return ""
+	}
+	for _, st := range wf.Stages {
+		if st.ID == "plan" {
+			return strings.TrimSpace(st.Executor.Model)
+		}
+	}
+	for _, st := range wf.Stages {
+		if st.Type == "plan" {
 			return strings.TrimSpace(st.Executor.Model)
 		}
 	}

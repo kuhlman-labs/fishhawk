@@ -419,6 +419,22 @@ type FetchedPrompt struct {
 	// BindingAssertions (#1171). A tag drift silently drops the model and the
 	// runner falls back to today's spawn.
 	ImplementModel string `json:"implement_model,omitempty"`
+	// PlanModel is the backend-resolved plan model id (#1416), echoed by the
+	// backend on a plan-stage prompt so the runner pins the plan agent spawn to
+	// it (the claudecode adapter appends `--model <PlanModel>` when set), reusing
+	// the same FetchedPrompt -> agent.Invocation.Model seam as ImplementModel.
+	// The backend resolves it through the plan-model ladder: spec executor.model
+	// (plan stage) > deployment default, with the operator gate rung added by a
+	// sibling slice. EMPTY/omitted (the common case on every run today) means no
+	// rung supplied a model, and the runner leaves agent.Invocation.Model unset so
+	// the adapter spawns on its built-in default — byte-identical to today's spawn.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (plan_model) MUST stay
+	// byte-identical to the backend's promptResponse.PlanModel
+	// (backend/internal/server/prompt.go) so the wire value round-trips. Same
+	// independent-struct-by-tag convention as ImplementModel. A tag drift silently
+	// drops the model and the runner falls back to today's spawn.
+	PlanModel string `json:"plan_model,omitempty"`
 	// Fixup is true when this implement stage is an operator-triggered
 	// implement-review fix-up pass (sub-plan A / #762). A fix-up re-runs
 	// the implement agent against the selected concerns and commits the

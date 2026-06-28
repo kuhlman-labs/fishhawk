@@ -552,6 +552,158 @@ workflows:
 	}
 }
 
+// TestResolvePlanModel_LadderPrecedence covers the plan-model ladder (#1416):
+// operator > spec > default, with an all-empty ladder yielding ModelSourceNone
+// (today's spawn). Unlike the implement ladder it has no plan-recommendation
+// rung — the plan agent is spawned before any plan artifact exists.
+func TestResolvePlanModel_LadderPrecedence(t *testing.T) {
+	tests := []struct {
+		name                  string
+		deflt, spec, operator string
+		wantValue             string
+		wantSource            ModelSource
+	}{
+		{
+			name:  "operator wins over all lower rungs",
+			deflt: "d", spec: "s", operator: "o",
+			wantValue: "o", wantSource: ModelSourceOperator,
+		},
+		{
+			name:  "spec wins when no operator",
+			deflt: "d", spec: "s", operator: "",
+			wantValue: "s", wantSource: ModelSourceSpec,
+		},
+		{
+			name:  "default wins when it is the only rung",
+			deflt: "d", spec: "", operator: "",
+			wantValue: "d", wantSource: ModelSourceDefault,
+		},
+		{
+			name:  "all empty yields none (today's spawn)",
+			deflt: "", spec: "", operator: "",
+			wantValue: "", wantSource: ModelSourceNone,
+		},
+		{
+			name:  "higher empty rung skipped, lower non-empty wins",
+			deflt: "d", spec: "", operator: "",
+			wantValue: "d", wantSource: ModelSourceDefault,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolvePlanModel(tt.deflt, tt.spec, tt.operator)
+			if got.Value != tt.wantValue || got.Source != tt.wantSource {
+				t.Fatalf("resolvePlanModel(%q,%q,%q) = {%q,%q}, want {%q,%q}",
+					tt.deflt, tt.spec, tt.operator,
+					got.Value, got.Source, tt.wantValue, tt.wantSource)
+			}
+		})
+	}
+}
+
+// TestResolvePlanModelForRun covers the run-level plan-model resolution (#1416):
+// the spec executor.model (plan stage) is honored (Scenario B), and a spec with
+// no plan executor.model resolves to ModelSourceNone (byte-identical default
+// spawn). The deployment-default and operator rungs are not wired in this slice,
+// so resolution is spec-only.
+func TestResolvePlanModelForRun(t *testing.T) {
+	s := New(Config{})
+	ctx := context.Background()
+
+	t.Run("spec pin honored", func(t *testing.T) {
+		runRow := &run.Run{
+			WorkflowID: "feature_change",
+			WorkflowSpec: []byte("workflows:\n" +
+				"  feature_change:\n" +
+				"    stages:\n" +
+				"      - id: plan\n" +
+				"        type: plan\n" +
+				"        executor:\n" +
+				"          agent: claudecode\n" +
+				"          model: claude-opus-4-8\n"),
+		}
+		rm := s.resolvePlanModelForRun(ctx, runRow)
+		if rm.Value != "claude-opus-4-8" || rm.Source != ModelSourceSpec {
+			t.Fatalf("resolvePlanModelForRun = {%q,%q}, want {claude-opus-4-8, spec}", rm.Value, rm.Source)
+		}
+	})
+
+	t.Run("no plan executor.model yields none", func(t *testing.T) {
+		runRow := &run.Run{
+			WorkflowID: "feature_change",
+			WorkflowSpec: []byte("workflows:\n" +
+				"  feature_change:\n" +
+				"    stages:\n" +
+				"      - id: plan\n" +
+				"        type: plan\n" +
+				"        executor:\n" +
+				"          agent: claudecode\n"),
+		}
+		rm := s.resolvePlanModelForRun(ctx, runRow)
+		if rm.Value != "" || rm.Source != ModelSourceNone {
+			t.Fatalf("resolvePlanModelForRun = {%q,%q}, want {empty, none}", rm.Value, rm.Source)
+		}
+	})
+}
+
+// TestSpecPlanExecutorModel mirrors TestSpecImplementExecutorModel for the PLAN
+// stage probe (#1416): prefer a stage whose id == "plan", else the first stage
+// whose type == "plan"; every malformed/absent path degrades to "".
+func TestSpecPlanExecutorModel(t *testing.T) {
+	specByID := []byte(`
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claudecode
+          model: claude-opus-4-8
+      - id: implement
+        type: implement
+        executor:
+          model: gpt-5.5
+`)
+	specByType := []byte(`
+workflows:
+  feature_change:
+    stages:
+      - id: plan-stage
+        type: plan
+        executor:
+          model: claude-sonnet-4-6
+`)
+	specNoModel := []byte(`
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claudecode
+`)
+	tests := []struct {
+		name       string
+		spec       []byte
+		workflowID string
+		want       string
+	}{
+		{"matched by stage id", specByID, "feature_change", "claude-opus-4-8"},
+		{"matched by stage type when id differs", specByType, "feature_change", "claude-sonnet-4-6"},
+		{"plan stage declares no model", specNoModel, "feature_change", ""},
+		{"unknown workflow id", specByID, "nonexistent", ""},
+		{"empty spec bytes", nil, "feature_change", ""},
+		{"malformed yaml degrades to empty", []byte("\t\tnot: [valid"), "feature_change", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := specPlanExecutorModel(tt.spec, tt.workflowID); got != tt.want {
+				t.Fatalf("specPlanExecutorModel() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSpecImplementExecutorModel(t *testing.T) {
 	specByID := []byte(`
 workflows:
