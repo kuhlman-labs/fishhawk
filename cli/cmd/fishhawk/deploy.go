@@ -313,12 +313,18 @@ func findDeployStage(stages []httpclient.Stage) *httpclient.Stage {
 	return nil
 }
 
+// deployGateState is the deploy pre-execution gate state the backend parks at
+// (backend/internal/run/run.go StageStateAwaitingDeployApproval). The CLI is a
+// separate Go module and cannot import the backend run package, so this local
+// constant is the drift-prevention mechanism.
+const deployGateState = "awaiting_deploy_approval"
+
 // findAwaitingApprovalDeployStage returns the first deploy stage parked at
-// awaiting_approval — the pre-execution gate `deploy approve`/`reject`
+// awaiting_deploy_approval — the pre-execution gate `deploy approve`/`reject`
 // decide. Returns nil when no such stage exists.
 func findAwaitingApprovalDeployStage(stages []httpclient.Stage) *httpclient.Stage {
 	for i := range stages {
-		if stages[i].Type == "deploy" && stages[i].State == "awaiting_approval" {
+		if stages[i].Type == "deploy" && stages[i].State == deployGateState {
 			return &stages[i]
 		}
 	}

@@ -293,7 +293,7 @@ func TestDeployApprove_HappyPath(t *testing.T) {
 	fb, srv := newDeployFake(t)
 	withBackend(t, srv)
 	runID := uuid.New()
-	stages := deployStages(runID, "awaiting_approval")
+	stages := deployStages(runID, "awaiting_deploy_approval")
 	deployStageID := stages[1].ID
 	fb.stages = stages
 	fb.approvalResp = httpclient.Stage{
@@ -324,7 +324,7 @@ func TestDeployReject_MissingReasonWarns(t *testing.T) {
 	fb, srv := newDeployFake(t)
 	withBackend(t, srv)
 	runID := uuid.New()
-	stages := deployStages(runID, "awaiting_approval")
+	stages := deployStages(runID, "awaiting_deploy_approval")
 	deployStageID := stages[1].ID
 	fb.stages = stages
 	cat := "D"
@@ -418,7 +418,7 @@ func TestDeployApprove_InsufficientScope403(t *testing.T) {
 	fb, srv := newDeployFake(t)
 	withBackend(t, srv)
 	runID := uuid.New()
-	fb.stages = deployStages(runID, "awaiting_approval")
+	fb.stages = deployStages(runID, "awaiting_deploy_approval")
 	fb.approvalStatus = http.StatusForbidden
 	fb.approvalErrCode = "insufficient_scope"
 
@@ -436,7 +436,7 @@ func TestDeployApprove_JSONOutput(t *testing.T) {
 	fb, srv := newDeployFake(t)
 	withBackend(t, srv)
 	runID := uuid.New()
-	stages := deployStages(runID, "awaiting_approval")
+	stages := deployStages(runID, "awaiting_deploy_approval")
 	deployStageID := stages[1].ID
 	fb.stages = stages
 	fb.approvalResp = httpclient.Stage{
@@ -468,6 +468,57 @@ func TestDeployApprove_BadOutputValue(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "invalid --output") {
 		t.Errorf("stderr missing diagnostic: %s", stderr.String())
+	}
+}
+
+// TestFindAwaitingApprovalDeployStage pins the exact gate-state constant so
+// that a future drift back to "awaiting_approval" (the old wrong string) fails
+// this test rather than silently passing.
+func TestFindAwaitingApprovalDeployStage(t *testing.T) {
+	runID := uuid.New()
+	makeStage := func(typ, state string) httpclient.Stage {
+		return httpclient.Stage{
+			ID: uuid.New(), RunID: runID, Sequence: 2, Type: typ, State: state,
+			Executor: httpclient.StageExecutor{Kind: "delegate", Ref: "github_actions"},
+		}
+	}
+
+	cases := []struct {
+		name      string
+		stages    []httpclient.Stage
+		wantFound bool
+	}{
+		{
+			name:      "deploy at awaiting_deploy_approval resolves",
+			stages:    []httpclient.Stage{makeStage("deploy", "awaiting_deploy_approval")},
+			wantFound: true,
+		},
+		{
+			name:      "deploy at awaiting_approval (old wrong constant) does not resolve",
+			stages:    []httpclient.Stage{makeStage("deploy", "awaiting_approval")},
+			wantFound: false,
+		},
+		{
+			name:      "settled deploy stage does not resolve",
+			stages:    []httpclient.Stage{makeStage("deploy", "succeeded")},
+			wantFound: false,
+		},
+		{
+			name:      "non-deploy stage at awaiting_deploy_approval does not resolve",
+			stages:    []httpclient.Stage{makeStage("implement", "awaiting_deploy_approval")},
+			wantFound: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := findAwaitingApprovalDeployStage(tc.stages)
+			if tc.wantFound && got == nil {
+				t.Errorf("expected a stage to be found, got nil")
+			}
+			if !tc.wantFound && got != nil {
+				t.Errorf("expected nil, got stage id=%s state=%s", got.ID, got.State)
+			}
+		})
 	}
 }
 
