@@ -729,6 +729,56 @@ func TestFetchPrompt_ScopeExemptionsOmittedWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestFetchPrompt_DecodesImplementModel confirms the client decodes the
+// backend's implement_model response field (#1013) into
+// FetchedPrompt.ImplementModel, the wire value the runner pins onto the agent
+// spawn as --model.
+func TestFetchPrompt_DecodesImplementModel(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "implement",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"implement_model": "claude-opus-4-8"
+	}`
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.ImplementModel != "claude-opus-4-8" {
+		t.Errorf("ImplementModel = %q, want %q", got.ImplementModel, "claude-opus-4-8")
+	}
+}
+
+// TestFetchPrompt_ImplementModelOmittedWhenAbsent confirms ImplementModel
+// decodes to the empty string when the backend omits the field (no rung of the
+// implement-model ladder supplied a model — the common case), so the runner
+// leaves agent.Invocation.Model unset and spawns on the adapter default —
+// byte-identical to behavior before #1013 wired the routing.
+func TestFetchPrompt_ImplementModelOmittedWhenAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.ImplementModel != "" {
+		t.Errorf("ImplementModel = %q, want empty when absent", got.ImplementModel)
+	}
+}
+
 // TestBindingAssertions_BackendEmitRunnerDecodeRoundTrip pins the backend
 // prompt-response binding_assertions JSON serialization against this package's
 // FetchedPrompt decoder (#1171 approval condition 1), the binding-assertion
