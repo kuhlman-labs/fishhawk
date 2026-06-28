@@ -1,0 +1,54 @@
+name: Deploy (dogfood stub)
+
+# Delegating-deploy target for Fishhawk's `release` workflow (ADR-038 / E23).
+#
+# Fishhawk's deploy stage triggers this workflow via workflow_dispatch, passing
+# the fishhawk_run_id + fishhawk_stage_id correlation inputs (and fishhawk_rollback
+# on the rollback sub-action). The deployreconciler re-resolves the dispatched run
+# by matching those inputs (ResolveDispatchedRun → inputsMatchCorrelation) and polls
+# it to terminal, recording a `deployment` artifact + audit trail.
+#
+# This is a VALIDATION STUB (echo-now-real-later, #1418): it echoes the correlation
+# inputs and exits 0, exercising the full dispatch → poll → deployment-artifact loop
+# and the success outcome mapping WITHOUT touching real infrastructure. A follow-up
+# (#1418) will point it at a real target (k8s/Helm or GitHub Pages).
+#
+# The three inputs below are exactly what the backend may send:
+#   - forward deploy  → fishhawk_run_id, fishhawk_stage_id
+#   - rollback action → fishhawk_run_id, fishhawk_stage_id, fishhawk_rollback=true
+# GitHub Actions rejects an undeclared workflow_dispatch input, so all three are
+# declared even though the forward path omits fishhawk_rollback (it defaults below).
+
+on:
+  workflow_dispatch:
+    inputs:
+      fishhawk_run_id:
+        description: "Fishhawk run id (correlation token; set by the deploy stage)"
+        required: true
+      fishhawk_stage_id:
+        description: "Fishhawk deploy stage id (correlation token)"
+        required: true
+      fishhawk_rollback:
+        description: "Set to true by the rollback sub-action; the stub treats it as a no-op rollback"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy (stub)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Echo deploy correlation and outcome
+        run: |
+          echo "::notice::Fishhawk dogfood deploy stub — no-op (echo-now-real-later, #1418)"
+          echo "fishhawk_run_id:   ${{ inputs.fishhawk_run_id }}"
+          echo "fishhawk_stage_id: ${{ inputs.fishhawk_stage_id }}"
+          echo "fishhawk_rollback: ${{ inputs.fishhawk_rollback }}"
+          if [ "${{ inputs.fishhawk_rollback }}" = "true" ]; then
+            echo "rollback path (stub) — succeeding"
+          else
+            echo "forward deploy path (stub) — succeeding"
+          fi
