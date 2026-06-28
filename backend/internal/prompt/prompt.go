@@ -1428,6 +1428,17 @@ func buildPlan(t Trigger) string {
 		"Run golangci-lint on touched packages only (e.g. `golangci-lint run ./internal/foo/...`), not the whole repo. " +
 		"Reserve expensive gates (e.g. -count >= 50, full-repo -race) for the final iteration once you are confident the implementation is correct. " +
 		"If your plan commits to an expensive step, allocate explicit minutes for it in predicted_runtime_minutes.\n")
+	b.WriteString("\n### Model recommendation\n\n")
+	b.WriteString("Populate the optional `model_recommendation` object in your plan artifact with the implement-stage model best suited to the change you assessed. " +
+		"Emit all three fields: `implement_model` (the recommended implement-stage model id, e.g. claude-opus-4-8), " +
+		"`rationale` (a sentence on why that model fits the assessed complexity), and " +
+		"`complexity_assessed` (one of low | medium | high). " +
+		"Match the model to complexity: reserve the most capable model for genuinely hard, multi-file, or subtle-logic changes; " +
+		"a smaller/faster model is appropriate for mechanical or low-risk changes.\n")
+	b.WriteString("This recommendation is ADVISORY and explicitly subordinate to the operator's plan-approval gate decision: " +
+		"the operator ratifies or overrides it at the gate, and the resolved value is validated against the per-adapter allow-list before any spawn. " +
+		"The field is optional in the schema, but emit it reliably — it is the `plan` rung of the implement-model resolution ladder (#1013/#1415), " +
+		"and omitting it falls the ladder through to the spec default.\n")
 	if t.CalibrationHint != nil {
 		b.WriteString("\n### Calibration hint\n\n")
 		fmt.Fprintf(&b, "Your last %d implement-stage predictions on this workflow: actual p50 = %.1f min, p95 = %.1f min, ratio = %.2f.\n",

@@ -578,6 +578,39 @@ func TestBuild_Plan_PerFailureModeTestRule(t *testing.T) {
 	}
 }
 
+// TestBuild_Plan_ModelRecommendationInstruction pins the #1415 plan-prompt
+// section that activates the dormant model_recommendation rung of the
+// implement-model ladder (#1013): the plan prompt must instruct the agent to
+// emit model_recommendation = {implement_model, rationale, complexity_assessed}
+// based on assessed complexity, advisory and subordinate to the operator gate.
+// Asserts the SHIPPED prompt output (distinctive substrings, not scope
+// presence), itself honoring the #1169 done-means discipline.
+func TestBuild_Plan_ModelRecommendationInstruction(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "Plan a refactor",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"Model recommendation",
+		"model_recommendation",
+		"implement_model",
+		"complexity_assessed",
+		"low | medium | high",
+		"operator",
+		"override",
+		"#1013",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing model-recommendation instruction string %q\n---\n%s", w, got)
+		}
+	}
+}
+
 // TestBuild_Plan_StructuredOutputParkViaFile pins the defensive sentence
 // (#1325): the structured-output channel constrains the PLAN artifact only, so
 // to PARK the planner must still write the clarification_request to the plan
