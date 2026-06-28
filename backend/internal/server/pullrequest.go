@@ -432,6 +432,48 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 	// re-running an identical job returns the same artifact rather
 	// than creating a duplicate.
 	if existing, err := s.cfg.ArtifactRepo.GetByHash(r.Context(), stageID, contentHash); err == nil {
+		// Self-heal the chained governance audit entry (#1396). A prior
+		// attempt may have persisted the artifact (Create succeeded) but
+		// failed its pull_request_opened append (AppendChained failed →
+		// 500); this identical retry short-circuits here. Verify the
+		// pull_request_opened entry exists for this artifact and append it
+		// idempotently if missing, so a retry-after-partial-failure ends
+		// with BOTH the artifact and its governance record. The helper
+		// fails closed on a read error (caller 500s; a further retry can
+		// re-heal) rather than returning a possibly-gapped 200. Only the
+		// primary governance entry is healed; the best-effort supplemental
+		// rows and the pull_request_url backfill remain create-path-only.
+		if _, herr := s.ensureGovernanceAuditEntry(r.Context(), runID,
+			"pull_request_opened", existing.ID.String(), func() error {
+				auditPayload, _ := json.Marshal(map[string]any{
+					"run_id":              runID.String(),
+					"stage_id":            stageID.String(),
+					"artifact_id":         existing.ID.String(),
+					"content_hash":        contentHash,
+					"pr_number":           pr.PRNumber,
+					"pr_url":              pr.PRURL,
+					"branch":              pr.Branch,
+					"head_sha":            pr.HeadSHA,
+					"base_sha":            pr.BaseSHA,
+					"files_changed_count": pr.FilesChangedCount,
+					"size_bytes":          len(body),
+					"auth_method":         authMethod,
+				})
+				_, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+					RunID:        runID,
+					StageID:      &stageID,
+					Timestamp:    time.Now().UTC(),
+					Category:     "pull_request_opened",
+					ActorKind:    &actorKind,
+					ActorSubject: actorSubject,
+					Payload:      auditPayload,
+				})
+				return aerr
+			}); herr != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"heal governance audit entry failed", map[string]any{"error": herr.Error()})
+			return
+		}
 		s.writeJSON(w, r, http.StatusOK, pullRequestResponse{
 			ID:          existing.ID,
 			StageID:     existing.StageID,

@@ -512,6 +512,102 @@ func TestShipDeployment_AuditAppendFails_500(t *testing.T) {
 	}
 }
 
+// TestShipDeployment_RetryAfterAuditAppendFailure_Heals is the #1396 done-means
+// cross-layer integration test: a partial write (artifact created, audit append
+// fails → 500) followed by an identical retry must end with BOTH the artifact
+// and its governance audit entry present. First ship with au.appendErr set:
+// the artifact persists but the deployment_outcome_recorded append fails (500,
+// zero governance entries). Clear the error and re-ship the identical body: the
+// GetByHash idempotent branch self-heals — 200 idempotent, still exactly one
+// artifact (no duplicate), and exactly one outcome entry (healed).
+func TestShipDeployment_RetryAfterAuditAppendFailure_Heals(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, _ := newDeploymentServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	body := validDeploymentBytes(t)
+
+	// Partial write: Create succeeds, AppendChained fails → 500.
+	au.appendErr = errors.New("boom")
+	w1 := shipDeploymentRequest(t, s, runID, stageID, priv, body, "")
+	if w1.Code != http.StatusInternalServerError {
+		t.Fatalf("first ship status = %d, want 500:\n%s", w1.Code, w1.Body.String())
+	}
+	if len(ar.all) != 1 {
+		t.Fatalf("artifacts after partial write = %d, want 1 (artifact persisted)", len(ar.all))
+	}
+	if n := countByCategory(au, "deployment_outcome_recorded"); n != 0 {
+		t.Fatalf("deployment_outcome_recorded entries after partial write = %d, want 0 (append failed)", n)
+	}
+
+	// Identical retry heals the missing governance entry on the idempotent path.
+	au.appendErr = nil
+	w2 := shipDeploymentRequest(t, s, runID, stageID, priv, body, "")
+	if w2.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200 (idempotent heal):\n%s", w2.Code, w2.Body.String())
+	}
+	var resp deploymentResponse
+	if err := json.NewDecoder(w2.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Idempotent {
+		t.Error("retry should be marked idempotent=true")
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts after retry = %d, want 1 (no duplicate)", len(ar.all))
+	}
+	if n := countByCategory(au, "deployment_outcome_recorded"); n != 1 {
+		t.Errorf("deployment_outcome_recorded entries after retry = %d, want 1 (healed)", n)
+	}
+}
+
+// TestShipDeployment_Idempotent_AuditPresent_NoDuplicate pins that a clean first
+// ship followed by an identical second ship leaves exactly one governance entry:
+// the self-heal must not append a duplicate on the already-healthy idempotent
+// path (presence detection keys on the entry's artifact_id).
+func TestShipDeployment_Idempotent_AuditPresent_NoDuplicate(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, _ := newDeploymentServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	body := validDeploymentBytes(t)
+
+	if w := shipDeploymentRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("first ship status = %d, want 201", w.Code)
+	}
+	w2 := shipDeploymentRequest(t, s, runID, stageID, priv, body, "")
+	if w2.Code != http.StatusOK {
+		t.Fatalf("second ship status = %d, want 200", w2.Code)
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1 (no duplicate)", len(ar.all))
+	}
+	if n := countByCategory(au, "deployment_outcome_recorded"); n != 1 {
+		t.Errorf("deployment_outcome_recorded entries = %d, want 1 (no duplicate heal)", n)
+	}
+}
+
+// TestShipDeployment_IdempotentHeal_ListError_500 pins the fail-closed read
+// branch: an idempotent retry while ListForRunByCategory errors returns 500
+// (governance integrity, not a gapped 200). The artifact must already exist so
+// the GetByHash branch is taken; the helper's list read then fails.
+func TestShipDeployment_IdempotentHeal_ListError_500(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, _ := newDeploymentServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	body := validDeploymentBytes(t)
+
+	if w := shipDeploymentRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("first ship status = %d, want 201", w.Code)
+	}
+	if len(ar.all) != 1 {
+		t.Fatalf("artifacts = %d, want 1", len(ar.all))
+	}
+	au.listByCategoryErr = errors.New("audit read down")
+	w2 := shipDeploymentRequest(t, s, runID, stageID, priv, body, "")
+	if w2.Code != http.StatusInternalServerError {
+		t.Fatalf("retry status = %d, want 500 (fail closed on read error):\n%s", w2.Code, w2.Body.String())
+	}
+}
+
 // TestShipDeployment_Unconfigured_503 pins the dependency guard: with no repos
 // wired the handler is unavailable.
 func TestShipDeployment_Unconfigured_503(t *testing.T) {

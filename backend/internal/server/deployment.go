@@ -208,6 +208,44 @@ func (s *Server) handleShipDeployment(w http.ResponseWriter, r *http.Request) {
 	// same deployment record returns the existing artifact rather than
 	// creating a duplicate (and writing a second audit entry).
 	if existing, err := s.cfg.ArtifactRepo.GetByHash(r.Context(), stageID, contentHash); err == nil {
+		// Self-heal the chained governance audit entry (#1396). A prior
+		// attempt may have persisted the artifact (Create succeeded) but
+		// failed its deployment_outcome_recorded append (AppendChained
+		// failed → 500); this identical retry short-circuits here. Verify
+		// the outcome entry exists for this artifact and append it
+		// idempotently if missing, so a retry-after-partial-failure ends
+		// with BOTH the artifact and its governance record. The helper
+		// fails closed on a read error (caller 500s; a further retry can
+		// re-heal) rather than returning a possibly-gapped 200.
+		if _, herr := s.ensureGovernanceAuditEntry(r.Context(), runID,
+			CategoryDeploymentOutcomeRecorded, existing.ID.String(), func() error {
+				outcomePayload, _ := json.Marshal(map[string]any{
+					"run_id":           runID.String(),
+					"stage_id":         stageID.String(),
+					"artifact_id":      existing.ID.String(),
+					"content_hash":     contentHash,
+					"environment":      dep.Environment,
+					"ref":              dep.Ref,
+					"external_run_url": dep.ExternalRunURL,
+					"outcome":          dep.Outcome,
+					"rollback_handle":  dep.RollbackHandle,
+					"auth_method":      authMethod,
+				})
+				_, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+					RunID:        runID,
+					StageID:      &stageID,
+					Timestamp:    time.Now().UTC(),
+					Category:     CategoryDeploymentOutcomeRecorded,
+					ActorKind:    &actorKind,
+					ActorSubject: actorSubject,
+					Payload:      outcomePayload,
+				})
+				return aerr
+			}); herr != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"heal governance audit entry failed", map[string]any{"error": herr.Error()})
+			return
+		}
 		s.writeJSON(w, r, http.StatusOK, deploymentResponse{
 			ID:          existing.ID,
 			StageID:     existing.StageID,
