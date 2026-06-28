@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/uuid"
@@ -110,5 +112,64 @@ func TestEnsureGovernanceAuditEntry_AppendError(t *testing.T) {
 	}
 	if !healed {
 		t.Error("healed = false, want true (append was attempted)")
+	}
+}
+
+// TestEnsureGovernanceAuditEntry_ConcurrentRetries_NoDuplicate pins the #1396
+// concurrency requirement the sequential no-duplicate tests miss: two (here:
+// many) identical idempotent retries racing after the same partial
+// Create-succeeded/AppendChained-failed 500 must NOT both observe the entry as
+// missing and both append it. governanceHealMu serializes the helper's
+// read-then-append, so every loser re-reads under the lock, sees the winner's
+// entry, and no-ops — exactly one append and exactly one healed=true. Run under
+// -race this also pins that the heal path itself is data-race-free.
+func TestEnsureGovernanceAuditEntry_ConcurrentRetries_NoDuplicate(t *testing.T) {
+	runID := uuid.New()
+	artifactID := uuid.New().String()
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+
+	// The append closure writes a real governance entry carrying the
+	// artifact_id, so a serialized re-read by a losing goroutine observes it
+	// and skips its own append.
+	appendOne := func() error {
+		payload, _ := json.Marshal(map[string]any{"artifact_id": artifactID})
+		_, err := au.AppendChained(context.Background(), audit.ChainAppendParams{
+			RunID:    runID,
+			Category: "pull_request_opened",
+			Payload:  payload,
+		})
+		return err
+	}
+
+	const goroutines = 8
+	var (
+		wg      sync.WaitGroup
+		healedN int64
+		start   = make(chan struct{})
+	)
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			<-start // release all goroutines together to maximize the race window
+			healed, err := s.ensureGovernanceAuditEntry(context.Background(), runID,
+				"pull_request_opened", artifactID, appendOne)
+			if err != nil {
+				t.Errorf("ensureGovernanceAuditEntry: %v", err)
+			}
+			if healed {
+				atomic.AddInt64(&healedN, 1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if n := countByCategory(au, "pull_request_opened"); n != 1 {
+		t.Errorf("pull_request_opened entries = %d, want exactly 1 (no duplicate under concurrent retries)", n)
+	}
+	if healedN != 1 {
+		t.Errorf("healed=true count = %d, want exactly 1 (only one goroutine appends)", healedN)
 	}
 }

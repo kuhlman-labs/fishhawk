@@ -3,9 +3,17 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"sync"
 
 	"github.com/google/uuid"
 )
+
+// governanceHealMu serializes the read-then-append in ensureGovernanceAuditEntry
+// so two concurrent identical retries cannot both observe the entry as missing
+// and both append it. It is process-local (package scope), which is sufficient:
+// a cross-process race is no worse than the pre-existing non-atomic create path
+// (see the helper doc comment).
+var governanceHealMu sync.Mutex
 
 // ensureGovernanceAuditEntry idempotently heals the chained governance audit
 // entry that pairs with a just-persisted artifact (#1396).
@@ -36,7 +44,22 @@ import (
 // Payload construction stays in the per-handler closure so each handler keeps
 // its distinct payload shape; presence detection keys only on the audit
 // payload's artifact_id field, which both create-path payloads embed.
+//
+// Concurrency: the list-then-append is non-atomic, so two concurrent identical
+// retries could both observe the entry as missing and both append it (a
+// duplicate). governanceHealMu serializes the whole read-and-append, so a
+// second concurrent heal blocks, re-reads under the lock, sees the first heal's
+// entry, and no-ops. This closes the duplicate race within the process. A
+// cross-process race (two fishhawkd replicas healing the same artifact at the
+// same instant) is not covered by a process-local lock — but it is no worse
+// than the pre-existing create path, which is itself a non-atomic
+// GetByHash-then-Create-then-AppendChained with no DB uniqueness on
+// (stage, content_hash); a true cross-process guarantee would need DB-level
+// dedup that governs both paths, out of scope for this self-heal.
 func (s *Server) ensureGovernanceAuditEntry(ctx context.Context, runID uuid.UUID, category, artifactID string, appendEntry func() error) (healed bool, err error) {
+	governanceHealMu.Lock()
+	defer governanceHealMu.Unlock()
+
 	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, category)
 	if err != nil {
 		// Fail closed: governance integrity beats a possibly-gapped 200.
