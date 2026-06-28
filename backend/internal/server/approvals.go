@@ -78,6 +78,30 @@ type approvalRequest struct {
 	// rungs and stays byte-identical to today. Declared here so the
 	// DisallowUnknownFields decode accepts it; callers omit it (omitempty).
 	ImplementModel string `json:"implement_model,omitempty"`
+	// PlanModel is the OPTIONAL operator override for the PLAN stage's model
+	// (#1416) — the highest rung of the plan-model ladder (deployment default <
+	// spec executor.model (plan stage) < this operator override). On a
+	// plan-stage approve the gate resolves the plan ladder with this as the
+	// operator rung and emits the plan stage's model_resolved audit; a
+	// re-dispatched plan stage then spawns under the resolved value
+	// (resolvePlanModelForRun reads the gate entry). Empty (the default) leaves
+	// resolution to the lower rungs and stays byte-identical to today. Declared
+	// here so the DisallowUnknownFields decode accepts it; callers omit it
+	// (omitempty).
+	PlanModel string `json:"plan_model,omitempty"`
+	// ReviewModel is the OPTIONAL operator override for the REVIEW stage's model
+	// (#1416) — the highest rung of the review-model ladder (deployment default
+	// < spec executor.model (review stage) < this operator override). On a
+	// plan-stage approve the gate resolves the review ladder with this as the
+	// operator rung and emits the review stage's model_resolved audit; the
+	// post-plan-gate implement review (and any post-gate re-review) then invokes
+	// each reviewer under the resolved value (resolveReviewerInvocations reads
+	// gateResolvedReviewModel). Per the operator's binding approval condition it
+	// governs the implement review, NOT the already-completed plan review. Empty
+	// (the default) leaves the reviewer on its spec model, byte-identical to
+	// today. Declared here so the DisallowUnknownFields decode accepts it;
+	// callers omit it (omitempty).
+	ReviewModel string `json:"review_model,omitempty"`
 	// Delegated opts the submission into the ADR-040 delegated-action
 	// path (#1026): the operator agent asserts it acts under the
 	// workflow's operator_agent.may_approve knob. The server NEVER
@@ -425,18 +449,21 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// unwinds the approval the gate already recorded via Submit).
 	s.writeApprovalAudit(r, stage, res.Approval, req.Comment, req.ApproverGithubLogin, req.AddScopeFiles, req.BindingAssertions, delegatedRule)
 
-	// Model resolution (#1013): emit the source-tagged model_resolved audit
-	// the gate computed on this plan-stage approve — the INTRODUCTION of the
-	// model_resolved kind (CategoryModelResolved). The slice-1 reader
-	// (gateResolvedModel) consumes the most-recent entry to route the runner
-	// spawn's --model. Emitted even when the resolution is empty
-	// (ModelSourceNone): the reader returns it as a deliberate "use the
-	// default spawn" decision, byte-identical to today's no---model spawn. Like
-	// the approval audit above, it must precede advanceStage so the runner-spawn
+	// Model resolution (#1013, extended #1416): emit the source-tagged
+	// model_resolved audit entries the gate computed on this plan-stage approve
+	// — the INTRODUCTION of the model_resolved kind (CategoryModelResolved). The
+	// implement entry routes the runner spawn's --model (gateResolvedModel reads
+	// it); #1416 adds per-stage plan and review entries (each keyed to its
+	// target stage so the observability slice reads a stage's model by StageID,
+	// and tagged with stage_type so the implement runner-spawn reader filters to
+	// the implement entry). Emitted even when a resolution is empty
+	// (ModelSourceNone): the readers return it as a deliberate "use the default
+	// spawn" decision, byte-identical to today's no---model spawn. Like the
+	// approval audit above, they must precede advanceStage so the runner-spawn
 	// router cannot read an empty model_resolved on a dispatch that races the
-	// transition.
+	// transition. A nil resolvedModel (GetRun fail-open) emits NOTHING.
 	if resolvedModel != nil {
-		s.writeModelResolvedAudit(r, stage, res.Approval, *resolvedModel)
+		s.writeStageModelResolutions(r, stage, res.Approval, *resolvedModel, req.PlanModel, req.ReviewModel)
 	}
 
 	stage, err = s.advanceForDecision(r.Context(), stage, decision)
@@ -892,20 +919,117 @@ func (s *Server) checkPlanModelAllowed(w http.ResponseWriter, r *http.Request, s
 	return nil, false
 }
 
-// writeModelResolvedAudit emits the source-tagged model_resolved audit entry
-// (CategoryModelResolved, #1013) recording the implement model the gate
-// resolved on a valid plan-stage approve. The payload is the ResolvedModel's
-// {model, model_source} json shape the slice-1 reader (gateResolvedModel)
-// consumes to route the runner spawn. Actor attribution mirrors
+// writeStageModelResolutions emits the per-stage model_resolved audit entries on
+// a valid plan-stage approve (#1416), extending the implement-only emission of
+// #1013. It writes one entry per stamped stage, each keyed to its TARGET stage's
+// StageID (so the observability slice reads a stage's model by StageID) and
+// tagged with the stage_type discriminator (so the implement runner-spawn reader
+// filters to the implement entry regardless of write order):
+//
+//   - implement: the already-resolved, allow-list-validated value the model gate
+//     produced (implementRM), keyed to the implement stage. ALWAYS emitted.
+//   - plan: gateResolvePlanModel(planOverride), keyed to the approved plan stage —
+//     only when the plan ladder resolves to a non-empty model.
+//   - review: gateResolveReviewModel(reviewOverride), keyed to the review stage —
+//     only when the workflow has a review stage AND the review ladder resolves to
+//     a non-empty model.
+//
+// The plan/review entries are suppressed when their resolution is empty: their
+// readers (resolvePlanModelForRun, gateResolvedReviewModel) fall back to the
+// spec-only / empty resolution when no entry exists, so an empty entry would be
+// byte-identical to none — and emitting one would shadow the #1013 single-entry
+// surface for a run with no plan/review pin or override. The implement entry is
+// NOT suppressed: the runner-spawn reader needs the explicit empty "default
+// spawn" decision.
+//
+// planStage is the approved plan stage. Fail-OPEN throughout, matching the
+// sibling gates: a GetRun/ListStagesForRun failure degrades to the legacy
+// keying (the implement entry on the plan stage) or skips the per-stage entries
+// rather than unwinding the approval. The implement entry is ALWAYS emitted
+// (even on a stage-lookup miss) so the runner-spawn route is never starved.
+func (s *Server) writeStageModelResolutions(r *http.Request, planStage *run.Stage, app *approval.Approval, implementRM ResolvedModel, planOverride, reviewOverride string) {
+	ctx := r.Context()
+
+	// Default the implement entry's key to the plan stage (the legacy #1013
+	// keying) so a stage-lookup failure still routes the runner spawn; upgrade
+	// to the implement stage's id when the lookup succeeds.
+	implStageID := planStage.ID
+	var stages []*run.Stage
+	if runStages, err := s.cfg.RunRepo.ListStagesForRun(ctx, planStage.RunID); err == nil {
+		stages = runStages
+		if id, ok := findStageIDByType(stages, run.StageTypeImplement); ok {
+			implStageID = id
+		}
+	} else {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "model resolution: list stages failed; falling back to legacy keying",
+			slog.String("run_id", planStage.RunID.String()),
+			slog.String("error", err.Error()),
+		)
+	}
+
+	s.writeModelResolvedAudit(r, planStage.RunID, implStageID, app, implementRM, string(run.StageTypeImplement))
+
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, planStage.RunID)
+	if err != nil {
+		// Implement entry already landed; without the run row the plan/review
+		// ladders cannot be resolved, so degrade to implement-only (the #1013
+		// surface) rather than unwinding the approval.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "model resolution: get run failed; skipping plan/review entries",
+			slog.String("run_id", planStage.RunID.String()),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+
+	// The plan and review entries are emitted ONLY when their ladder resolves to
+	// a NON-EMPTY model. Unlike the implement entry — which the runner-spawn
+	// reader (gateResolvedModel) must see even as an explicit empty "default
+	// spawn" decision — the plan and review readers (resolvePlanModelForRun,
+	// gateResolvedReviewModel) already fall back to the spec-only / empty
+	// resolution when no entry exists, so an empty entry is byte-identical to no
+	// entry. Suppressing it keeps a run with no plan/review pin or override
+	// carrying exactly the single implement entry (#1013's surface), rather than
+	// shadow plan/review rows the readers would resolve identically.
+	if planRM := s.gateResolvePlanModel(runRow, planOverride); planRM.Value != "" {
+		s.writeModelResolvedAudit(r, planStage.RunID, planStage.ID, app, planRM, string(run.StageTypePlan))
+	}
+
+	if reviewStageID, ok := findStageIDByType(stages, run.StageTypeReview); ok {
+		if reviewRM := s.gateResolveReviewModel(runRow, reviewOverride); reviewRM.Value != "" {
+			s.writeModelResolvedAudit(r, planStage.RunID, reviewStageID, app, reviewRM, string(run.StageTypeReview))
+		}
+	}
+}
+
+// findStageIDByType returns the id of the first stage of the given type in the
+// run's materialized stage list, or ok=false when none exists (e.g. a workflow
+// with no review stage). All stages are materialized at run creation
+// (CreateStagesFromSpec), so the implement and review rows exist at plan-approve
+// time.
+func findStageIDByType(stages []*run.Stage, t run.StageType) (uuid.UUID, bool) {
+	for _, st := range stages {
+		if st.Type == t {
+			return st.ID, true
+		}
+	}
+	return uuid.Nil, false
+}
+
+// writeModelResolvedAudit emits one source-tagged model_resolved audit entry
+// (CategoryModelResolved, #1013/#1416) for a target stage. The payload is the
+// ResolvedModel's {model, model_source} json shape plus a stage_type
+// discriminator (modelResolvedPayload): the per-stage readers
+// (gateResolvedModelForStage) filter by stage_type, and the observability slice
+// reads a stage's model by the entry's StageID. Actor attribution mirrors
 // writeApprovalAudit (the acting subject selects agent vs user). Best-effort: a
 // logged append failure never unwinds the approval the gate already recorded.
-func (s *Server) writeModelResolvedAudit(r *http.Request, stage *run.Stage, app *approval.Approval, rm ResolvedModel) {
+func (s *Server) writeModelResolvedAudit(r *http.Request, runID, targetStageID uuid.UUID, app *approval.Approval, rm ResolvedModel, stageType string) {
 	actorKind := actorKindForSubject(app.ApproverSubject)
 	approver := app.ApproverSubject
-	payload, _ := json.Marshal(rm)
+	payload, _ := json.Marshal(modelResolvedPayload{ResolvedModel: rm, StageType: stageType})
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
-		RunID:        stage.RunID,
-		StageID:      &stage.ID,
+		RunID:        runID,
+		StageID:      &targetStageID,
 		Timestamp:    time.Now().UTC(),
 		Category:     CategoryModelResolved,
 		ActorKind:    &actorKind,
@@ -913,8 +1037,9 @@ func (s *Server) writeModelResolvedAudit(r *http.Request, stage *run.Stage, app 
 		Payload:      payload,
 	}); err != nil {
 		s.cfg.Logger.Error("audit append failed for model_resolved",
-			"run_id", stage.RunID,
-			"stage_id", stage.ID,
+			"run_id", runID,
+			"stage_id", targetStageID,
+			"stage_type", stageType,
 			"error", err.Error(),
 		)
 	}

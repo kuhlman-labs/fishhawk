@@ -77,11 +77,32 @@ type reviewerInvocation struct {
 // count form repeats the precedence-selected default adapter Agent times
 // (today's behavior). Callers guard on defaultPlanReviewer() != nil first,
 // so cfg.PlanReviewers is non-nil here.
+//
+// It is the no-override wrapper over resolveReviewerInvocationsWithReviewModel:
+// the plan-review path (which precedes the plan-approval gate, so no operator
+// review_model is resolved yet — #1416 condition 3) calls it directly.
 func (s *Server) resolveReviewerInvocations(reviewersCfg *spec.ReviewersConfig) []reviewerInvocation {
+	return s.resolveReviewerInvocationsWithReviewModel(reviewersCfg, "")
+}
+
+// resolveReviewerInvocationsWithReviewModel is resolveReviewerInvocations with
+// the operator's gate-resolved review_model threaded in (#1416). The
+// implement-review call sites pass gateResolvedReviewModel; when non-empty it
+// REPLACES each heterogeneous reviewer's spec model in the PlanReviewers.For
+// lookup, so every reviewer runs under the operator's chosen model, while the
+// recorded specModel keeps the spec-declared value for the self-review guard. An
+// empty override leaves every invocation byte-identical to today. The bare count
+// form has no provider to pair a model with, so the override does not apply to
+// it — it stays on the precedence-selected default adapter regardless.
+func (s *Server) resolveReviewerInvocationsWithReviewModel(reviewersCfg *spec.ReviewersConfig, reviewModelOverride string) []reviewerInvocation {
 	if len(reviewersCfg.Agents) > 0 {
 		invocations := make([]reviewerInvocation, 0, len(reviewersCfg.Agents))
 		for _, a := range reviewersCfg.Agents {
-			reviewer, err := s.cfg.PlanReviewers.For(a.Provider, a.Model)
+			model := a.Model
+			if reviewModelOverride != "" {
+				model = reviewModelOverride
+			}
+			reviewer, err := s.cfg.PlanReviewers.For(a.Provider, model)
 			invocations = append(invocations, reviewerInvocation{
 				reviewer:   reviewer,
 				provider:   a.Provider,
@@ -993,7 +1014,10 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 
 	// Resolve the per-invocation reviewer list (#955) up front so the
 	// detached goroutine closes over fully-resolved adapters, never the
-	// spec config or request-scoped state.
+	// spec config or request-scoped state. The plan review runs BEFORE the
+	// plan-approval gate, so the operator's review_model override is not yet
+	// resolved and does not apply here (#1416 condition 3) — the no-override
+	// wrapper keeps the plan review byte-identical to today.
 	invocations := s.resolveReviewerInvocations(reviewersCfg)
 
 	// Detach the reviewer context from the request lifecycle (#584).
