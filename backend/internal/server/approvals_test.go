@@ -1514,26 +1514,43 @@ func planWithRecommendation(implementModel string) *plan.Plan {
 	return p
 }
 
-// findModelResolvedPayload returns the decoded ResolvedModel from the single
-// model_resolved audit entry, failing when zero or more than one exists.
+// findModelResolvedPayload returns the decoded ResolvedModel from the IMPLEMENT
+// stage's model_resolved audit entry, failing when zero or more than one exists.
+// Since #1416 the plan gate stamps a model_resolved entry per stage (implement,
+// plan, and — when present — review), so this filters to the implement entry by
+// the payload stage_type discriminator (treating a legacy untyped entry as
+// implement) — the resolution the existing model-gate assertions target.
 func findModelResolvedPayload(t *testing.T, appended []audit.ChainAppendParams) ResolvedModel {
+	t.Helper()
+	return findModelResolvedPayloadForStage(t, appended, string(run.StageTypeImplement))
+}
+
+// findModelResolvedPayloadForStage returns the decoded ResolvedModel from the
+// model_resolved audit entry stamped for the given stage type (#1416). A legacy
+// untyped entry counts as the implement stage. Fails when zero or more than one
+// matching entry exists.
+func findModelResolvedPayloadForStage(t *testing.T, appended []audit.ChainAppendParams, stageType string) ResolvedModel {
 	t.Helper()
 	var found *ResolvedModel
 	for _, e := range appended {
 		if e.Category != CategoryModelResolved {
 			continue
 		}
-		if found != nil {
-			t.Fatalf("expected exactly one model_resolved entry, got more than one")
-		}
-		var rm ResolvedModel
-		if err := json.Unmarshal(e.Payload, &rm); err != nil {
+		var p modelResolvedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
 			t.Fatalf("unmarshal model_resolved payload: %v", err)
 		}
+		if !modelResolvedStageMatches(p.StageType, stageType) {
+			continue
+		}
+		if found != nil {
+			t.Fatalf("expected exactly one %s model_resolved entry, got more than one", stageType)
+		}
+		rm := p.ResolvedModel
 		found = &rm
 	}
 	if found == nil {
-		t.Fatalf("expected a model_resolved audit entry, got %+v", appended)
+		t.Fatalf("expected a %s model_resolved audit entry, got %+v", stageType, appended)
 	}
 	return *found
 }
@@ -1721,6 +1738,176 @@ func TestSubmitApproval_ModelGate_GetRunError_FailsOpen(t *testing.T) {
 			t.Errorf("unexpected model_resolved audit entry on the GetRun fail-open path: %+v", e)
 		}
 	}
+}
+
+// specPlanImplementReview builds a workflow "w" spec with plan + implement +
+// review stages, with optional plan/implement/review executor.model pins. Mirrors
+// specImplementAgentModel but adds the review stage so the per-stage
+// model_resolved emission (#1416) routes a review entry.
+func specPlanImplementReview(planModel, implModel, reviewModel string) []byte {
+	pin := func(m string) string {
+		if m == "" {
+			return ""
+		}
+		return "\n          model: " + m
+	}
+	return []byte(`version: "0.3"
+workflows:
+  w:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code` + pin(planModel) + `
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code` + pin(implModel) + `
+      - id: review
+        type: review
+        executor:
+          agent: claude-code` + pin(reviewModel) + `
+`)
+}
+
+// findModelResolvedEntryForStage returns the single model_resolved ChainAppendParams
+// stamped for the given stage type (#1416), so a test can assert BOTH the resolved
+// value AND the audit's target StageID (the per-stage keying observability reads).
+func findModelResolvedEntryForStage(t *testing.T, appended []audit.ChainAppendParams, stageType string) (audit.ChainAppendParams, modelResolvedPayload) {
+	t.Helper()
+	var found *audit.ChainAppendParams
+	var foundPayload modelResolvedPayload
+	for i := range appended {
+		e := appended[i]
+		if e.Category != CategoryModelResolved {
+			continue
+		}
+		var p modelResolvedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("unmarshal model_resolved payload: %v", err)
+		}
+		if p.StageType != stageType {
+			continue
+		}
+		if found != nil {
+			t.Fatalf("expected exactly one %s model_resolved entry, got more than one", stageType)
+		}
+		ec := e
+		found = &ec
+		foundPayload = p
+	}
+	if found == nil {
+		t.Fatalf("expected a %s model_resolved audit entry, got %+v", stageType, appended)
+	}
+	return *found, foundPayload
+}
+
+// TestSubmitApproval_PerStageModelResolutions covers the #1416 plan- and
+// review-model operator overrides at the gate (scope-b done-means): a plan-stage
+// approve resolves and emits a per-stage model_resolved audit for the implement,
+// plan, and review stages — each keyed to its TARGET stage's id and tagged with
+// its stage_type — with the operator plan_model/review_model winning their
+// ladders. It also covers verification mode 6 (combination): the review model is
+// pinned in the spec while the operator overrides plan + implement, and each
+// stage resolves independently.
+func TestSubmitApproval_PerStageModelResolutions(t *testing.T) {
+	t.Run("operator plan_model and review_model win and are keyed per stage", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		s, rr, au, _ := newModelGateServer(t, art, nil, "") // fail-open allow-list
+		r, planStage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+		implStage := rr.seedStage(r.ID, 1, run.StageStatePending)
+		implStage.Type = run.StageTypeImplement
+		reviewStage := rr.seedStage(r.ID, 2, run.StageStatePending)
+		reviewStage.Type = run.StageTypeReview
+		r.WorkflowSpec = specPlanImplementReview("", "", "")
+
+		body := `{"decision":"approve","implement_model":"op-impl","plan_model":"op-plan","review_model":"op-review"}`
+		w := submitApproval(t, s, planStage.ID, body)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+
+		implEntry, implPayload := findModelResolvedEntryForStage(t, au.appended, "implement")
+		if implPayload.Value != "op-impl" || implPayload.Source != ModelSourceOperator {
+			t.Errorf("implement model_resolved = {%q,%q}, want {op-impl,operator}", implPayload.Value, implPayload.Source)
+		}
+		if implEntry.StageID == nil || *implEntry.StageID != implStage.ID {
+			t.Errorf("implement entry StageID = %v, want the implement stage %v", implEntry.StageID, implStage.ID)
+		}
+
+		planEntry, planPayload := findModelResolvedEntryForStage(t, au.appended, "plan")
+		if planPayload.Value != "op-plan" || planPayload.Source != ModelSourceOperator {
+			t.Errorf("plan model_resolved = {%q,%q}, want {op-plan,operator}", planPayload.Value, planPayload.Source)
+		}
+		if planEntry.StageID == nil || *planEntry.StageID != planStage.ID {
+			t.Errorf("plan entry StageID = %v, want the plan stage %v", planEntry.StageID, planStage.ID)
+		}
+
+		reviewEntry, reviewPayload := findModelResolvedEntryForStage(t, au.appended, "review")
+		if reviewPayload.Value != "op-review" || reviewPayload.Source != ModelSourceOperator {
+			t.Errorf("review model_resolved = {%q,%q}, want {op-review,operator}", reviewPayload.Value, reviewPayload.Source)
+		}
+		if reviewEntry.StageID == nil || *reviewEntry.StageID != reviewStage.ID {
+			t.Errorf("review entry StageID = %v, want the review stage %v", reviewEntry.StageID, reviewStage.ID)
+		}
+	})
+
+	t.Run("combination: spec-pinned review while operator overrides plan and implement", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		s, rr, au, _ := newModelGateServer(t, art, nil, "")
+		r, planStage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+		implStage := rr.seedStage(r.ID, 1, run.StageStatePending)
+		implStage.Type = run.StageTypeImplement
+		reviewStage := rr.seedStage(r.ID, 2, run.StageStatePending)
+		reviewStage.Type = run.StageTypeReview
+		// Review model pinned in the spec; operator overrides only plan + implement.
+		r.WorkflowSpec = specPlanImplementReview("", "", "spec-review")
+
+		body := `{"decision":"approve","implement_model":"op-impl","plan_model":"op-plan"}`
+		w := submitApproval(t, s, planStage.ID, body)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		_, implPayload := findModelResolvedEntryForStage(t, au.appended, "implement")
+		if implPayload.Value != "op-impl" {
+			t.Errorf("implement = %q, want op-impl", implPayload.Value)
+		}
+		_, planPayload := findModelResolvedEntryForStage(t, au.appended, "plan")
+		if planPayload.Value != "op-plan" {
+			t.Errorf("plan = %q, want op-plan", planPayload.Value)
+		}
+		// Review resolves to the spec pin, unaffected by the plan/implement overrides.
+		_, reviewPayload := findModelResolvedEntryForStage(t, au.appended, "review")
+		if reviewPayload.Value != "spec-review" || reviewPayload.Source != ModelSourceSpec {
+			t.Errorf("review = {%q,%q}, want {spec-review,spec}", reviewPayload.Value, reviewPayload.Source)
+		}
+	})
+
+	t.Run("no review stage emits no review entry (byte-identical default)", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		s, rr, au, _ := newModelGateServer(t, art, nil, "")
+		r, planStage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+		implStage := rr.seedStage(r.ID, 1, run.StageStatePending)
+		implStage.Type = run.StageTypeImplement
+		r.WorkflowSpec = specImplementAgentModel("claude-code", "")
+
+		w := submitApproval(t, s, planStage.ID, `{"decision":"approve","review_model":"op-review"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		for _, e := range au.appended {
+			if e.Category != CategoryModelResolved {
+				continue
+			}
+			var p modelResolvedPayload
+			if err := json.Unmarshal(e.Payload, &p); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if p.StageType == "review" {
+				t.Errorf("unexpected review model_resolved entry on a workflow with no review stage: %+v", p)
+			}
+		}
+	})
 }
 
 func TestSubmitApproval_BudgetCheck_OverBudgetWithDecomp_Proceeds(t *testing.T) {

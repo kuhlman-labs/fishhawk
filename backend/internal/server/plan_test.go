@@ -26,6 +26,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // recordingOrchestratorRepo wraps orchestratorRepo to record every
@@ -473,6 +474,74 @@ func (s fakeReviewerSet) For(provider, _ string) (PlanReviewer, error) {
 		return nil, fmt.Errorf("reviewer provider %q is not configured", provider)
 	}
 	return r, nil
+}
+
+// capturingReviewerSet records every (provider, model) pair passed to For so a
+// test can assert which model the review-model override (#1416) threaded into the
+// adapter lookup.
+type capturingReviewerSet struct {
+	reviewer PlanReviewer
+	calls    []struct{ provider, model string }
+}
+
+func (s *capturingReviewerSet) Default() PlanReviewer { return s.reviewer }
+
+func (s *capturingReviewerSet) For(provider, model string) (PlanReviewer, error) {
+	s.calls = append(s.calls, struct{ provider, model string }{provider, model})
+	return s.reviewer, nil
+}
+
+// TestResolveReviewerInvocations_ReviewModelOverride covers the #1416 review-model
+// override applied at the reviewer invocation: a non-empty override replaces each
+// heterogeneous reviewer's spec model in the For lookup (while specModel records
+// the spec-declared value), and an empty override (the plan-review caller, and
+// the no-override default) leaves the spec model byte-identical to today.
+func TestResolveReviewerInvocations_ReviewModelOverride(t *testing.T) {
+	cfg := &spec.ReviewersConfig{Agents: []spec.AgentReviewer{
+		{Provider: "anthropic", Model: "spec-opus"},
+		{Provider: "codex", Model: "spec-gpt"},
+	}}
+
+	t.Run("override replaces each reviewer's model in the For lookup", func(t *testing.T) {
+		set := &capturingReviewerSet{reviewer: &fakePlanReviewer{}}
+		s := New(Config{PlanReviewers: set})
+		invs := s.resolveReviewerInvocationsWithReviewModel(cfg, "operator-model")
+		if len(invs) != 2 {
+			t.Fatalf("got %d invocations, want 2", len(invs))
+		}
+		for i, c := range set.calls {
+			if c.model != "operator-model" {
+				t.Fatalf("For call %d used model %q, want operator-model", i, c.model)
+			}
+		}
+		// specModel preserves the spec-declared value for the self-review guard.
+		if invs[0].specModel != "spec-opus" || invs[1].specModel != "spec-gpt" {
+			t.Fatalf("specModel = {%q,%q}, want {spec-opus,spec-gpt}", invs[0].specModel, invs[1].specModel)
+		}
+	})
+
+	t.Run("empty override leaves the spec model byte-identical", func(t *testing.T) {
+		set := &capturingReviewerSet{reviewer: &fakePlanReviewer{}}
+		s := New(Config{PlanReviewers: set})
+		s.resolveReviewerInvocationsWithReviewModel(cfg, "")
+		if set.calls[0].model != "spec-opus" || set.calls[1].model != "spec-gpt" {
+			t.Fatalf("For models = {%q,%q}, want the spec models {spec-opus,spec-gpt}", set.calls[0].model, set.calls[1].model)
+		}
+	})
+
+	t.Run("count form ignores the override (no provider to pair)", func(t *testing.T) {
+		set := &capturingReviewerSet{reviewer: &fakePlanReviewer{}}
+		s := New(Config{PlanReviewers: set})
+		invs := s.resolveReviewerInvocationsWithReviewModel(&spec.ReviewersConfig{Agent: 2}, "operator-model")
+		if len(invs) != 2 {
+			t.Fatalf("got %d invocations, want 2", len(invs))
+		}
+		// The count form resolves via Default(), never For — so the override
+		// cannot reach it and the spawn stays byte-identical to today.
+		if len(set.calls) != 0 {
+			t.Fatalf("count form called For %d times, want 0 (Default-only)", len(set.calls))
+		}
+	})
 }
 
 // blockingPlanReviewer blocks each Review call until release is closed,

@@ -704,6 +704,249 @@ workflows:
 	}
 }
 
+// TestResolveReviewModel_LadderPrecedence covers the review-model ladder (#1416),
+// which mirrors the plan ladder: operator > spec > default > none.
+func TestResolveReviewModel_LadderPrecedence(t *testing.T) {
+	tests := []struct {
+		name                  string
+		deflt, spec, operator string
+		wantValue             string
+		wantSource            ModelSource
+	}{
+		{"operator wins over all lower rungs", "d", "s", "o", "o", ModelSourceOperator},
+		{"spec wins when no operator", "d", "s", "", "s", ModelSourceSpec},
+		{"default wins when it is the only rung", "d", "", "", "d", ModelSourceDefault},
+		{"all empty yields none (today's reviewer spawn)", "", "", "", "", ModelSourceNone},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveReviewModel(tt.deflt, tt.spec, tt.operator)
+			if got.Value != tt.wantValue || got.Source != tt.wantSource {
+				t.Fatalf("resolveReviewModel(%q,%q,%q) = {%q,%q}, want {%q,%q}",
+					tt.deflt, tt.spec, tt.operator, got.Value, got.Source, tt.wantValue, tt.wantSource)
+			}
+		})
+	}
+}
+
+// TestSpecReviewExecutorModel mirrors TestSpecPlanExecutorModel for the REVIEW
+// stage probe (#1416): prefer a stage whose id == "review", else the first stage
+// whose type == "review"; every malformed/absent path degrades to "".
+func TestSpecReviewExecutorModel(t *testing.T) {
+	specByID := []byte(`
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          model: gpt-5.5
+      - id: implement
+        type: implement
+        executor:
+          model: claude-opus-4-8
+`)
+	specByType := []byte(`
+workflows:
+  feature_change:
+    stages:
+      - id: review-stage
+        type: review
+        executor:
+          model: claude-sonnet-4-6
+`)
+	specNoModel := []byte(`
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          agent: codex
+`)
+	tests := []struct {
+		name       string
+		spec       []byte
+		workflowID string
+		want       string
+	}{
+		{"matched by stage id", specByID, "feature_change", "gpt-5.5"},
+		{"matched by stage type when id differs", specByType, "feature_change", "claude-sonnet-4-6"},
+		{"review stage declares no model", specNoModel, "feature_change", ""},
+		{"unknown workflow id", specByID, "nonexistent", ""},
+		{"empty spec bytes", nil, "feature_change", ""},
+		{"malformed yaml degrades to empty", []byte("\t\tnot: [valid"), "feature_change", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := specReviewExecutorModel(tt.spec, tt.workflowID); got != tt.want {
+				t.Fatalf("specReviewExecutorModel() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestModelResolvedStageMatches covers the legacy-compat discriminator (#1416):
+// an exact stage_type match always wins; a legacy entry with no stage_type ("")
+// is treated as the implement resolution and NOTHING else.
+func TestModelResolvedStageMatches(t *testing.T) {
+	tests := []struct {
+		have, want string
+		match      bool
+	}{
+		{"implement", "implement", true},
+		{"plan", "plan", true},
+		{"review", "review", true},
+		{"", "implement", true}, // legacy entry → implement
+		{"", "plan", false},     // legacy entry never matches plan
+		{"", "review", false},   // legacy entry never matches review
+		{"plan", "implement", false},
+		{"review", "implement", false},
+		{"implement", "review", false},
+	}
+	for _, tt := range tests {
+		if got := modelResolvedStageMatches(tt.have, tt.want); got != tt.match {
+			t.Fatalf("modelResolvedStageMatches(%q,%q) = %v, want %v", tt.have, tt.want, got, tt.match)
+		}
+	}
+}
+
+// TestGateResolvedModelForStage covers the per-stage filtering (#1416): with one
+// model_resolved entry per stage stamped at the gate, each reader resolves ONLY
+// its own stage's entry regardless of which was written last, and the implement
+// reader still matches a legacy untyped entry.
+func TestGateResolvedModelForStage(t *testing.T) {
+	ctx := context.Background()
+	runID := uuid.New()
+
+	t.Run("each stage reads its own entry", func(t *testing.T) {
+		s := New(Config{AuditRepo: &gateAuditFake{entries: []*audit.Entry{
+			entry(1, `{"model":"impl-m","model_source":"operator","stage_type":"implement"}`),
+			entry(2, `{"model":"plan-m","model_source":"operator","stage_type":"plan"}`),
+			entry(3, `{"model":"rev-m","model_source":"operator","stage_type":"review"}`),
+		}}})
+		impl, ok := s.gateResolvedModelForStage(ctx, runID, "implement")
+		if !ok || impl.Value != "impl-m" {
+			t.Fatalf("implement = {%q} ok=%v, want impl-m", impl.Value, ok)
+		}
+		// gateResolvedModel must still route the implement entry, NOT the
+		// highest-sequence review entry.
+		gm, ok := s.gateResolvedModel(ctx, runID)
+		if !ok || gm.Value != "impl-m" {
+			t.Fatalf("gateResolvedModel = {%q} ok=%v, want impl-m (not the newest review entry)", gm.Value, ok)
+		}
+		pl, ok := s.gateResolvedModelForStage(ctx, runID, "plan")
+		if !ok || pl.Value != "plan-m" {
+			t.Fatalf("plan = {%q} ok=%v, want plan-m", pl.Value, ok)
+		}
+		if rev := s.gateResolvedReviewModel(ctx, runID); rev != "rev-m" {
+			t.Fatalf("gateResolvedReviewModel = %q, want rev-m", rev)
+		}
+	})
+
+	t.Run("legacy untyped entry resolves as implement only", func(t *testing.T) {
+		s := New(Config{AuditRepo: &gateAuditFake{entries: []*audit.Entry{
+			entry(1, `{"model":"legacy-m","model_source":"plan"}`),
+		}}})
+		impl, ok := s.gateResolvedModelForStage(ctx, runID, "implement")
+		if !ok || impl.Value != "legacy-m" {
+			t.Fatalf("implement = {%q} ok=%v, want legacy-m", impl.Value, ok)
+		}
+		if _, ok := s.gateResolvedModelForStage(ctx, runID, "plan"); ok {
+			t.Fatal("legacy untyped entry must NOT match the plan stage")
+		}
+		if rev := s.gateResolvedReviewModel(ctx, runID); rev != "" {
+			t.Fatalf("gateResolvedReviewModel = %q, want \"\" (legacy entry is not a review entry)", rev)
+		}
+	})
+
+	t.Run("no review entry yields empty override (fail-open)", func(t *testing.T) {
+		s := New(Config{AuditRepo: &gateAuditFake{entries: []*audit.Entry{
+			entry(1, `{"model":"impl-m","model_source":"operator","stage_type":"implement"}`),
+		}}})
+		if rev := s.gateResolvedReviewModel(ctx, runID); rev != "" {
+			t.Fatalf("gateResolvedReviewModel = %q, want \"\"", rev)
+		}
+	})
+
+	t.Run("recorded empty plan resolution is honored as none/ok", func(t *testing.T) {
+		s := New(Config{AuditRepo: &gateAuditFake{entries: []*audit.Entry{
+			entry(1, `{"model":"","model_source":"","stage_type":"plan"}`),
+		}}})
+		rm, ok := s.gateResolvedModelForStage(ctx, runID, "plan")
+		if !ok || rm.Value != "" || rm.Source != ModelSourceNone {
+			t.Fatalf("plan = {%q,%q} ok=%v, want {\"\",none} ok=true", rm.Value, rm.Source, ok)
+		}
+	})
+}
+
+// TestGateResolvePlanReviewModel_OperatorPrecedence covers the gate-time plan and
+// review resolvers (#1416): the operator override wins over the spec rung, and an
+// empty operator falls back to the spec executor.model.
+func TestGateResolvePlanReviewModel_OperatorPrecedence(t *testing.T) {
+	s := New(Config{})
+	runRow := &run.Run{
+		WorkflowID: "feature_change",
+		WorkflowSpec: []byte("workflows:\n" +
+			"  feature_change:\n" +
+			"    stages:\n" +
+			"      - id: plan\n" +
+			"        type: plan\n" +
+			"        executor:\n" +
+			"          model: spec-plan\n" +
+			"      - id: review\n" +
+			"        type: review\n" +
+			"        executor:\n" +
+			"          model: spec-review\n"),
+	}
+
+	if got := s.gateResolvePlanModel(runRow, "op-plan"); got.Value != "op-plan" || got.Source != ModelSourceOperator {
+		t.Fatalf("gateResolvePlanModel(op) = {%q,%q}, want {op-plan,operator}", got.Value, got.Source)
+	}
+	if got := s.gateResolvePlanModel(runRow, ""); got.Value != "spec-plan" || got.Source != ModelSourceSpec {
+		t.Fatalf("gateResolvePlanModel(empty) = {%q,%q}, want {spec-plan,spec}", got.Value, got.Source)
+	}
+	if got := s.gateResolveReviewModel(runRow, "op-rev"); got.Value != "op-rev" || got.Source != ModelSourceOperator {
+		t.Fatalf("gateResolveReviewModel(op) = {%q,%q}, want {op-rev,operator}", got.Value, got.Source)
+	}
+	if got := s.gateResolveReviewModel(runRow, ""); got.Value != "spec-review" || got.Source != ModelSourceSpec {
+		t.Fatalf("gateResolveReviewModel(empty) = {%q,%q}, want {spec-review,spec}", got.Value, got.Source)
+	}
+	// Combination case (#1416 verification mode 6): review pinned in spec while
+	// the operator overrides only the plan model — each resolves independently.
+	if pl := s.gateResolvePlanModel(runRow, "op-plan"); pl.Value != "op-plan" {
+		t.Fatalf("combination plan = %q, want op-plan", pl.Value)
+	}
+	if rev := s.gateResolveReviewModel(runRow, ""); rev.Value != "spec-review" {
+		t.Fatalf("combination review = %q, want spec-review (spec pin unaffected by plan override)", rev.Value)
+	}
+}
+
+// TestResolvePlanModelForRun_ReadsGateEntry covers the operator plan-model
+// override routing to a re-dispatched plan spawn (#1416): when the gate recorded
+// a plan model_resolved entry, resolvePlanModelForRun returns it (winning over
+// the spec rung).
+func TestResolvePlanModelForRun_ReadsGateEntry(t *testing.T) {
+	ctx := context.Background()
+	s := New(Config{AuditRepo: &gateAuditFake{entries: []*audit.Entry{
+		entry(1, `{"model":"op-plan","model_source":"operator","stage_type":"plan"}`),
+	}}})
+	runRow := &run.Run{
+		WorkflowID: "feature_change",
+		WorkflowSpec: []byte("workflows:\n" +
+			"  feature_change:\n" +
+			"    stages:\n" +
+			"      - id: plan\n" +
+			"        type: plan\n" +
+			"        executor:\n" +
+			"          model: spec-plan\n"),
+	}
+	rm := s.resolvePlanModelForRun(ctx, runRow)
+	if rm.Value != "op-plan" || rm.Source != ModelSourceOperator {
+		t.Fatalf("resolvePlanModelForRun = {%q,%q}, want {op-plan,operator} (gate entry wins over spec)", rm.Value, rm.Source)
+	}
+}
+
 func TestSpecImplementExecutorModel(t *testing.T) {
 	specByID := []byte(`
 workflows:
