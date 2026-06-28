@@ -486,6 +486,19 @@ func (r *postgresRepo) ListDeployStagesAwaitingDeployment(ctx context.Context) (
 	return out, nil
 }
 
+func (r *postgresRepo) ListDeployStagesRollbackPending(ctx context.Context) ([]*Stage, error) {
+	q := rundb.New(r.pool)
+	rows, err := q.ListDeployStagesRollbackPending(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list deploy stages rollback pending: %w", err)
+	}
+	out := make([]*Stage, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, rowToStage(row))
+	}
+	return out, nil
+}
+
 func (r *postgresRepo) ListStagesAwaitingChildren(ctx context.Context) ([]*Stage, error) {
 	q := rundb.New(r.pool)
 	rows, err := q.ListStagesAwaitingChildren(ctx)

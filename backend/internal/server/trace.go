@@ -3854,6 +3854,181 @@ func (s *Server) ResolveDeploymentFromPollState(ctx context.Context, runID, stag
 	return nil
 }
 
+// ResolveDeploymentRollbackFromPollState records a delegating deploy stage's
+// ROLLBACK as terminal once the deploy reconciler has polled the rollback's
+// external GitHub Actions run to completion (#1398 / E23.6, #1386 binding
+// condition 2). It is the rollback-side analogue of ResolveDeploymentFromPollState:
+// the deployreconciler owns the GitHub polling; this method owns the
+// server-internal persistence — a rolled_back deployment artifact, the
+// deployment_outcome_recorded + deploy_run trace + deployment_rollback_completed
+// audit entries.
+//
+// Unlike the forward resolve, the deploy stage is ALREADY terminal
+// (succeeded/failed) when a rollback is initiated, so this method does NOT
+// transition the stage or advance the run. "Set DeployOutcome=rolled_back" is
+// realized through the rolled_back deployment artifact + audit (DeployOutcome is
+// in-memory only — no column per migration 0038), mirroring the webhook callback
+// (deployment.go::handleShipDeployment with rollback_action=completed).
+//
+// Idempotency: a no-op when a deployment_rollback_completed entry already exists
+// for the stage (a prior tick or the webhook callback already finalized the
+// rollback). Best-effort audit: an audit-append failure WARN-logs and does NOT
+// unwind the already-persisted artifact.
+func (s *Server) ResolveDeploymentRollbackFromPollState(ctx context.Context, runID, stageID uuid.UUID, gitRef string, wr *githubclient.WorkflowRun) error {
+	if s.cfg.RunRepo == nil || s.cfg.ArtifactRepo == nil || s.cfg.AuditRepo == nil {
+		return errors.New("server: ResolveDeploymentRollbackFromPollState requires RunRepo, ArtifactRepo, and AuditRepo")
+	}
+
+	// Idempotency guard: if a rollback_completed entry already exists for this
+	// stage, the rollback was already finalized (an earlier tick or the webhook
+	// callback). Re-recording would double-write the artifact + audit.
+	if entries, lerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryDeploymentRollbackCompleted); lerr == nil {
+		for _, e := range entries {
+			if e.StageID != nil && *e.StageID == stageID {
+				return nil
+			}
+		}
+	} else {
+		// A read error is fail-open (proceed to record): a missed idempotency
+		// check at worst double-writes a content-identical artifact, which the
+		// hash dedup below collapses anyway.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"resolve deployment rollback: read rollback_completed history failed; proceeding",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", lerr.Error()))
+	}
+
+	externalURL := ""
+	if wr != nil {
+		externalURL = wr.HTMLURL
+	}
+	environment := s.deployEnvironmentForRun(ctx, runID)
+
+	// Persist the rolled_back deployment artifact — the durable carrier of the
+	// rolled_back disposition. Deduped on (stage_id, content_hash) so a repeat
+	// tick before the audit lands does not double-write.
+	depBody := deploymentBody{
+		Environment:    environment,
+		Ref:            gitRef,
+		ExternalRunURL: externalURL,
+		Outcome:        string(run.DeployOutcomeRolledBack),
+	}
+	content, _ := json.Marshal(depBody)
+	contentHash := sha256Hex(content)
+
+	var artifactID uuid.UUID
+	if existing, gerr := s.cfg.ArtifactRepo.GetByHash(ctx, stageID, contentHash); gerr == nil {
+		artifactID = existing.ID
+	} else if !errors.Is(gerr, artifact.ErrNotFound) {
+		return fmt.Errorf("resolve deployment rollback: check existing artifact: %w", gerr)
+	} else {
+		created, cerr := s.cfg.ArtifactRepo.Create(ctx, artifact.CreateParams{
+			StageID:     stageID,
+			Kind:        artifact.KindDeployment,
+			Content:     json.RawMessage(content),
+			ContentHash: contentHash,
+		})
+		if cerr != nil {
+			return fmt.Errorf("resolve deployment rollback: create artifact: %w", cerr)
+		}
+		artifactID = created.ID
+	}
+
+	systemKind := audit.ActorSystem
+	outcomePayload, _ := json.Marshal(map[string]any{
+		"run_id":           runID.String(),
+		"stage_id":         stageID.String(),
+		"artifact_id":      artifactID.String(),
+		"content_hash":     contentHash,
+		"environment":      environment,
+		"ref":              gitRef,
+		"external_run_url": externalURL,
+		"outcome":          string(run.DeployOutcomeRolledBack),
+		"auth_method":      "reconciler",
+	})
+	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryDeploymentOutcomeRecorded,
+		ActorKind: &systemKind,
+		Payload:   outcomePayload,
+	}); aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"resolve deployment rollback: append outcome audit failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", aerr.Error()))
+	}
+
+	// deploy_run trace event: the governance record of the rollback run the
+	// reconciler polled to terminal. The actual conclusion is preserved here
+	// even though the recorded outcome is always rolled_back.
+	var ghaRunID int64
+	var conclusion, ghStatus string
+	if wr != nil {
+		ghaRunID, conclusion, ghStatus = wr.ID, wr.Conclusion, wr.Status
+	}
+	deployRunPayload, _ := json.Marshal(map[string]any{
+		"run_id":           runID.String(),
+		"stage_id":         stageID.String(),
+		"gha_run_id":       ghaRunID,
+		"external_run_url": externalURL,
+		"conclusion":       conclusion,
+		"status":           ghStatus,
+		"outcome":          string(run.DeployOutcomeRolledBack),
+		"rollback":         true,
+	})
+	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryDeployRun,
+		ActorKind: &systemKind,
+		Payload:   deployRunPayload,
+	}); aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"resolve deployment rollback: append deploy_run trace event failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", aerr.Error()))
+	}
+
+	// deployment_rollback_completed: the terminal rollback marker, chaining the
+	// deployment_rollback_initiated handle. This is what removes the stage from
+	// the reconciler's rollback-pending scan on the next tick.
+	rollbackPayload, _ := json.Marshal(map[string]any{
+		"run_id":           runID.String(),
+		"stage_id":         stageID.String(),
+		"artifact_id":      artifactID.String(),
+		"environment":      environment,
+		"external_run_url": externalURL,
+		"rollback_action":  "completed",
+		"auth_method":      "reconciler",
+	})
+	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryDeploymentRollbackCompleted,
+		ActorKind: &systemKind,
+		Payload:   rollbackPayload,
+	}); aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"resolve deployment rollback: append rollback_completed audit failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", aerr.Error()))
+	}
+
+	// Refresh the sticky living-anchor comment so the rolled_back disposition
+	// surfaces on the issue timeline. The stage is already terminal — no stage
+	// transition, no run advance.
+	s.notifyStatusUpdate(ctx, runID, "deployment_recorded")
+	return nil
+}
+
 // advanceDeployStageTerminal transitions a parked deploy stage to its
 // terminal state from the mapped outcome (#1386 / E23.6): succeeded →
 // StageStateSucceeded; failed/partial → StageStateFailed (category C — the

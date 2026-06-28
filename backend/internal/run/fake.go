@@ -85,6 +85,11 @@ func (BaseFake) ListDeployStagesAwaitingDeployment(_ context.Context) ([]*Stage,
 	return nil, nil
 }
 
+// ListDeployStagesRollbackPending returns nil, nil.
+func (BaseFake) ListDeployStagesRollbackPending(_ context.Context) ([]*Stage, error) {
+	return nil, nil
+}
+
 // ListStagesAwaitingChildren returns nil, nil.
 func (BaseFake) ListStagesAwaitingChildren(_ context.Context) ([]*Stage, error) {
 	return nil, nil

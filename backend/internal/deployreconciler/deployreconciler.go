@@ -18,6 +18,20 @@
 // external pipeline calling back into POST /v0/runs/{run_id}/deployment
 // (#1395) — the reconciler skips webhook stages.
 //
+// Each tick runs TWO distinct scans. The first (above) walks
+// awaiting_deployment stages for the FORWARD deploy. The second (#1398 /
+// #1386 binding condition 2) walks deploy stages with a pending ROLLBACK —
+// those carrying a deployment_rollback_initiated audit entry with no matching
+// deployment_rollback_completed. A rolled-back deploy stage is ALREADY terminal
+// (succeeded/failed), so it never appears in the awaiting_deployment scan; the
+// rollback scan is keyed on the rollback HANDLE (audit), polls the rollback run
+// via the slice-1 fishhawk_rollback-extended correlation token (so it never
+// mis-associates the forward deploy run), and on a terminal conclusion records
+// rolled_back + deployment_rollback_completed through
+// ResolveDeploymentRollbackFromPollState. This closes the gap where a
+// github_actions rollback pipeline that never calls back would leave the
+// rollback un-finalized.
+//
 // Correlation safety (binding condition 1, #1386): when slice-1's
 // best-effort run-id resolution came up empty (GitHub's run listing is
 // eventually consistent), the handle's gha_run_id is 0. The reconciler
@@ -61,6 +75,26 @@ const DefaultInterval = 60 * time.Second
 // posture. It MUST match server.CategoryDeploymentDispatched.
 const categoryDeploymentDispatched = "deployment_dispatched"
 
+// categoryDeploymentRollbackInitiated / categoryDeploymentRollbackCompleted
+// are the rollback handle's audit categories (#1398, #1386 binding condition
+// 2). The rollback scan reads the initiated entry's handle (the DISTINCT
+// rollback run, separate from the forward deploy's deployment_dispatched) and
+// the completed entry is what marks a rollback terminal. Local consts for the
+// same no-server-dependency reason; they MUST match
+// server.CategoryDeploymentRollbackInitiated / …Completed.
+const (
+	categoryDeploymentRollbackInitiated = "deployment_rollback_initiated"
+	categoryDeploymentRollbackCompleted = "deployment_rollback_completed"
+)
+
+// rollbackCorrelationMarker is the workflow_dispatch input slice-1's rollback
+// trigger (deploy_rollback.go::dispatchRollbackGitHubActions) injects to
+// distinguish the rollback run from the forward deploy run. Both echo
+// fishhawk_run_id + fishhawk_stage_id, so the rollback re-resolve MUST include
+// this marker or ResolveDispatchedRun's primary match could associate the
+// wrong (forward) run. MUST match server.rollbackDispatchInput.
+const rollbackCorrelationMarker = "fishhawk_rollback"
+
 // WorkflowRunPoller reads a dispatched GitHub Actions run's live state and
 // re-resolves a dispatched run from its correlation token. Satisfied by
 // *githubclient.Client. Tests inject a stub returning canned run states.
@@ -84,6 +118,12 @@ type AuditReader interface {
 // run.BaseFake-based test fakes; serve.go type-asserts cfg.RunRepo to it.
 type DeployStageSource interface {
 	ListDeployStagesAwaitingDeployment(ctx context.Context) ([]*run.Stage, error)
+	// ListDeployStagesRollbackPending lists deploy stages with a
+	// deployment_rollback_initiated audit entry and NO matching
+	// deployment_rollback_completed (#1398). The rollback-side analogue of
+	// ListDeployStagesAwaitingDeployment, keyed on the rollback handle (audit)
+	// not stage state — a rolled-back deploy stage is already terminal.
+	ListDeployStagesRollbackPending(ctx context.Context) ([]*run.Stage, error)
 	GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error)
 }
 
@@ -96,6 +136,15 @@ type DeployStageSource interface {
 // ResolveReviewFromPollState — this package stays a thin GitHub poller.
 type Resolver interface {
 	ResolveDeploymentFromPollState(ctx context.Context, runID, stageID uuid.UUID, outcome run.DeployOutcome, gitRef string, wr *githubclient.WorkflowRun) error
+	// ResolveDeploymentRollbackFromPollState records a rolled_back disposition
+	// once the reconciler has polled the rollback run to terminal (#1398): it
+	// persists a rolled_back deployment artifact and writes
+	// deployment_outcome_recorded + deploy_run + deployment_rollback_completed.
+	// The deploy stage is ALREADY terminal, so this does NOT transition the
+	// stage or advance the run — the rolled_back outcome rides the artifact +
+	// audit (DeployOutcome is in-memory only, no column per migration 0038).
+	// Satisfied by *server.Server.
+	ResolveDeploymentRollbackFromPollState(ctx context.Context, runID, stageID uuid.UUID, gitRef string, wr *githubclient.WorkflowRun) error
 }
 
 // Ticker scans deploy stages parked in awaiting_deployment and resolves
@@ -181,16 +230,39 @@ func (t *Ticker) Tick(ctx context.Context) {
 	if err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "deployreconciler: list awaiting-deployment stages failed",
 			slog.String("error", err.Error()))
+	} else {
+		for _, s := range stages {
+			if s.Type != run.StageTypeDeploy {
+				// Defense-in-depth: the query already filters to
+				// stage_type = 'deploy'. A fake or future listing that returns a
+				// non-deploy stage can't reach reconcileStage.
+				continue
+			}
+			t.reconcileStage(ctx, logger, s)
+		}
+	}
+
+	// Second, DISTINCT scan: deploy stages with a pending rollback (#1398 /
+	// #1386 binding condition 2). A rolled-back deploy stage is already terminal
+	// (succeeded/failed), so it never appears in the awaiting_deployment scan
+	// above; the rollback handle lives in a deployment_rollback_initiated audit
+	// entry. Records rolled_back + deployment_rollback_completed for a
+	// github_actions rollback pipeline that never calls back. A list error here
+	// does NOT abort the forward scan above (and vice versa).
+	rollbacks, err := t.Runs.ListDeployStagesRollbackPending(ctx)
+	if err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "deployreconciler: list rollback-pending stages failed",
+			slog.String("error", err.Error()))
 		return
 	}
-	for _, s := range stages {
+	for _, s := range rollbacks {
 		if s.Type != run.StageTypeDeploy {
-			// Defense-in-depth: the query already filters to
-			// stage_type = 'deploy'. A fake or future listing that returns a
-			// non-deploy stage can't reach reconcileStage.
+			// Defense-in-depth: the query already filters to stage_type =
+			// 'deploy'. A fake returning a non-deploy stage can't reach
+			// reconcileRollback.
 			continue
 		}
-		t.reconcileStage(ctx, logger, s)
+		t.reconcileRollback(ctx, logger, s)
 	}
 }
 
@@ -231,7 +303,7 @@ func (t *Ticker) reconcileStage(ctx context.Context, logger *slog.Logger, s *run
 		return
 	}
 
-	handle, ok := t.latestDispatchHandle(ctx, logger, s)
+	handle, ok := t.latestHandle(ctx, logger, s, categoryDeploymentDispatched)
 	if !ok {
 		// No dispatch handle recorded yet (slice-1's trigger has not fired,
 		// or the audit append failed). Nothing to poll; leave parked.
@@ -243,7 +315,11 @@ func (t *Ticker) reconcileStage(ctx context.Context, logger *slog.Logger, s *run
 		return
 	}
 
-	wr := t.resolveRun(ctx, logger, s, repo, *runRow.InstallationID, handle)
+	correlation := map[string]string{
+		"fishhawk_run_id":   s.RunID.String(),
+		"fishhawk_stage_id": s.ID.String(),
+	}
+	wr := t.resolveRun(ctx, logger, s, repo, *runRow.InstallationID, handle, correlation)
 	if wr == nil {
 		// Indeterminate / not-yet-resolvable / transient poll error — leave
 		// parked and retry next tick. NEVER terminal-fail on a poll miss.
@@ -281,14 +357,106 @@ func (t *Ticker) reconcileStage(ctx context.Context, logger *slog.Logger, s *run
 		slog.String("outcome", string(outcome)))
 }
 
-// latestDispatchHandle reads the most-recent deployment_dispatched audit
-// entry's payload for the stage's run. Returns ok=false when none exists or
-// the payload can't be parsed.
-func (t *Ticker) latestDispatchHandle(ctx context.Context, logger *slog.Logger, s *run.Stage) (dispatchHandle, bool) {
-	entries, err := t.Audit.ListForRunByCategory(ctx, s.RunID, categoryDeploymentDispatched)
+// reconcileRollback polls one deploy stage's pending ROLLBACK run and, on a
+// terminal conclusion, hands off to the server's rollback resolver (#1398). The
+// deploy stage is already terminal; this scan exists so a github_actions
+// rollback pipeline that never calls back into POST /v0/runs/{run_id}/deployment
+// still records rolled_back + deployment_rollback_completed. Skips cleanly (no
+// record) when the run has no installation, no rollback handle was recorded,
+// the target is webhook (callback path), or the rollback run is still in-flight.
+// Per-row errors log but don't propagate.
+func (t *Ticker) reconcileRollback(ctx context.Context, logger *slog.Logger, s *run.Stage) {
+	runRow, err := t.Runs.GetRun(ctx, s.RunID)
+	if err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "deployreconciler: get run failed (rollback)",
+			slog.String("run_id", s.RunID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
+		// No installation_id → no GitHub creds to poll with. Leave pending.
+		return
+	}
+	repo, err := parseRepoRef(runRow.Repo)
+	if err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "deployreconciler: malformed run repo (rollback)",
+			slog.String("run_id", s.RunID.String()),
+			slog.String("repo", runRow.Repo),
+			slog.String("error", err.Error()))
+		return
+	}
+
+	handle, ok := t.latestHandle(ctx, logger, s, categoryDeploymentRollbackInitiated)
+	if !ok {
+		// No rollback handle (the query selected on its presence, but the
+		// payload may be unparseable). Nothing to poll; leave pending.
+		return
+	}
+	if handle.Target == "webhook" {
+		// Webhook rollbacks report terminal via the deployment callback, not
+		// the reconciler. Leave pending.
+		return
+	}
+
+	// Re-resolve correlation MUST carry the rollback marker: the forward deploy
+	// run and the rollback run both echo run_id+stage_id, so without
+	// fishhawk_rollback="true" ResolveDispatchedRun could associate the wrong
+	// (forward) run (plan risk #1).
+	correlation := map[string]string{
+		"fishhawk_run_id":         s.RunID.String(),
+		"fishhawk_stage_id":       s.ID.String(),
+		rollbackCorrelationMarker: "true",
+	}
+	wr := t.resolveRun(ctx, logger, s, repo, *runRow.InstallationID, handle, correlation)
+	if wr == nil {
+		// Indeterminate / not-yet-resolvable / transient poll error — leave
+		// pending and retry next tick. NEVER mis-associate on an ambiguous
+		// correlation.
+		return
+	}
+
+	if !strings.EqualFold(wr.Status, "completed") {
+		// Rollback run still queued/in-progress — leave pending.
+		return
+	}
+	// Any TERMINAL conclusion records rolled_back, mirroring the webhook
+	// callback (which sets outcome=rolled_back regardless of the rollback run's
+	// conclusion — the actual conclusion is preserved in the deploy_run trace).
+	// A non-terminal/unmapped conclusion (e.g. empty) is left pending rather
+	// than recording a guessed disposition.
+	if _, terminal := mapConclusion(wr.Conclusion); !terminal {
+		logger.LogAttrs(ctx, slog.LevelWarn,
+			"deployreconciler: completed rollback run with unmapped conclusion; left pending",
+			slog.String("run_id", s.RunID.String()),
+			slog.String("conclusion", wr.Conclusion))
+		return
+	}
+
+	if err := t.Resolver.ResolveDeploymentRollbackFromPollState(ctx, s.RunID, s.ID, handle.GitRef, wr); err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "deployreconciler: resolve deployment rollback failed",
+			slog.String("run_id", s.RunID.String()),
+			slog.String("stage_id", s.ID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	logger.LogAttrs(ctx, slog.LevelInfo, "deployreconciler: resolved deployment rollback from poll",
+		slog.String("run_id", s.RunID.String()),
+		slog.String("stage_id", s.ID.String()),
+		slog.String("conclusion", wr.Conclusion))
+}
+
+// latestHandle reads the most-recent audit entry of the given category for the
+// stage's run and unmarshals its payload into a dispatchHandle. Returns
+// ok=false when none exists or the payload can't be parsed. Shared by the
+// forward scan (category deployment_dispatched) and the rollback scan (category
+// deployment_rollback_initiated) — both audit payloads carry the same
+// target/gha_run_id/git_ref/dispatched_at handle fields.
+func (t *Ticker) latestHandle(ctx context.Context, logger *slog.Logger, s *run.Stage, category string) (dispatchHandle, bool) {
+	entries, err := t.Audit.ListForRunByCategory(ctx, s.RunID, category)
 	if err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "deployreconciler: read dispatch handle failed",
 			slog.String("run_id", s.RunID.String()),
+			slog.String("category", category),
 			slog.String("error", err.Error()))
 		return dispatchHandle{}, false
 	}
@@ -302,6 +470,7 @@ func (t *Ticker) latestDispatchHandle(ctx context.Context, logger *slog.Logger, 
 	if err := json.Unmarshal(latest.Payload, &h); err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "deployreconciler: dispatch handle payload unparseable",
 			slog.String("run_id", s.RunID.String()),
+			slog.String("category", category),
 			slog.String("error", err.Error()))
 		return dispatchHandle{}, false
 	}
@@ -315,7 +484,7 @@ func (t *Ticker) latestDispatchHandle(ctx context.Context, logger *slog.Logger, 
 // resolution was empty) it is re-resolved by the correlation token —
 // returning nil on an ambiguous fallback rather than associating a wrong
 // run (binding condition 1, #1386).
-func (t *Ticker) resolveRun(ctx context.Context, logger *slog.Logger, s *run.Stage, repo githubclient.RepoRef, installationID int64, handle dispatchHandle) *githubclient.WorkflowRun {
+func (t *Ticker) resolveRun(ctx context.Context, logger *slog.Logger, s *run.Stage, repo githubclient.RepoRef, installationID int64, handle dispatchHandle, correlation map[string]string) *githubclient.WorkflowRun {
 	if handle.GHARunID > 0 {
 		wr, err := t.GH.GetWorkflowRun(ctx, installationID, repo, handle.GHARunID)
 		if err != nil {
@@ -331,16 +500,15 @@ func (t *Ticker) resolveRun(ctx context.Context, logger *slog.Logger, s *run.Sta
 	// gha_run_id absent — re-resolve by the correlation token. The created
 	// window mirrors slice-1's trigger (dispatched_at minus a minute of
 	// slack); a parse failure falls back to the zero time (no created
-	// filter), which ResolveDispatchedRun tolerates.
+	// filter), which ResolveDispatchedRun tolerates. The correlation map is
+	// supplied by the caller: the forward scan passes run_id+stage_id; the
+	// rollback scan ADDS fishhawk_rollback="true" so it never matches the
+	// forward deploy run (which echoes the same run_id+stage_id).
 	createdAfter := time.Time{}
 	if handle.DispatchedAt != "" {
 		if ts, perr := time.Parse(time.RFC3339, handle.DispatchedAt); perr == nil {
 			createdAfter = ts.Add(-1 * time.Minute)
 		}
-	}
-	correlation := map[string]string{
-		"fishhawk_run_id":   s.RunID.String(),
-		"fishhawk_stage_id": s.ID.String(),
 	}
 	wr, err := t.GH.ResolveDispatchedRun(ctx, installationID, repo, handle.GitRef, correlation, createdAfter)
 	if err != nil {

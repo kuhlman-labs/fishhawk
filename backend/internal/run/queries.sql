@@ -165,6 +165,28 @@ SELECT * FROM stages
    AND stage_type = 'deploy'
  ORDER BY updated_at ASC;
 
+-- name: ListDeployStagesRollbackPending :many
+-- The deploy reconciler's ROLLBACK candidate listing (#1398 / E23.6, #1386
+-- binding condition 2) — every deploy stage with a deployment_rollback_initiated
+-- audit entry that has NO matching deployment_rollback_completed entry. Keyed on
+-- the rollback HANDLE (audit), not stage state: a rolled-back deploy stage is
+-- already terminal (succeeded/failed), so it would never appear in
+-- ListDeployStagesAwaitingDeployment. The reconciler polls each candidate's
+-- github_actions rollback run to terminal and records rolled_back +
+-- deployment_rollback_completed when the external pipeline never calls back.
+-- Ordered updated_at ASC so the oldest pending rollback is reconciled first.
+SELECT s.* FROM stages s
+ WHERE s.stage_type = 'deploy'
+   AND EXISTS (
+     SELECT 1 FROM audit_entries ai
+      WHERE ai.stage_id = s.id
+        AND ai.category = 'deployment_rollback_initiated')
+   AND NOT EXISTS (
+     SELECT 1 FROM audit_entries ac
+      WHERE ac.stage_id = s.id
+        AND ac.category = 'deployment_rollback_completed')
+ ORDER BY s.updated_at ASC;
+
 -- name: ListStagesDispatched :many
 -- Used by the dispatch watchdog (E8.4) to find stages stuck at
 -- 'dispatched' past a configurable timeout. Ordered by updated_at
