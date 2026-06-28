@@ -127,42 +127,36 @@ jobs:
           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.8.0/install.sh \
             | sh -s -- -b "$(go env GOPATH)/bin" v2.8.0
 
-      - name: Lint, build, and test each module
+      # Route the Go gate through scripts/test instead of an inline `go test`
+      # loop so CI runs the suite in the SAME tuned environment as the local
+      # and runner gates (#1413, the #1402 testcontainer flake). The inline
+      # loop bypassed scripts/test entirely, so in CI the testcontainers ryuk
+      # reaper stayed ENABLED — a shared single-point-of-failure container that
+      # times out under daemon load and cascades one flake into a whole-suite
+      # red (#972) — and the shared fishhawk-test-postgres container (#1174)
+      # was never reaped, so stale named containers accumulated across runs
+      # (the `No such container` stale-reuse symptom). scripts/test exports
+      # TESTCONTAINERS_RYUK_DISABLED=true and reaps fishhawk-test-postgres in
+      # an EXIT trap, so both causes are removed at the source.
+      - name: Lint each module
         if: steps.have-modules.outputs.yes == 'true'
-        run: |
-          set -eu
-          GOLANGCI_LINT="$(go env GOPATH)/bin/golangci-lint"
-          for m in $(go work edit -json | jq -r '.Use[].DiskPath'); do
-            echo "::group::go module: $m"
-            (
-              cd "$m"
-              "$GOLANGCI_LINT" run ./...
-              go build ./...
-              go test -race -coverprofile=coverage.out -covermode=atomic ./...
-            )
-            echo "::endgroup::"
-          done
+        # `scripts/test lint` is byte-for-byte the prior per-module
+        # `golangci-lint run ./...` (AGENTS.md "Build, test, lint") and fails
+        # closed when golangci-lint is missing (installed in the step above).
+        # The dropped `go build ./...` is redundant: lint typechecks/builds and
+        # the test pass compiles every package — exactly what the runner's
+        # `scripts/test verify` gate already relies on.
+        run: scripts/test lint
 
-      - name: Coverage threshold (≥ 80% aggregate, excl. sqlc-generated)
+      - name: Test + coverage threshold (≥ 80% aggregate, excl. sqlc-generated)
         if: steps.have-modules.outputs.yes == 'true'
-        run: |
-          set -eu
-          # Build a list of per-module coverage profiles. The threshold
-          # script aggregates across all of them; --exclude drops generated
-          # packages before counting. Targets documented in
-          # docs/ARCHITECTURE.md §9.
-          #
-          # The /db/ exclude pattern matches every sqlc-generated package
-          # (convention: `internal/<feature>/db/`). New sqlc packages
-          # auto-skip without editing this list.
-          profiles=()
-          while IFS= read -r m; do
-            profiles+=("$m/coverage.out")
-          done < <(go work edit -json | jq -r '.Use[].DiskPath')
-          python3 scripts/check-coverage.py \
-            --threshold 80 \
-            --exclude '/db/' \
-            "${profiles[@]}"
+        # `scripts/test coverage` writes the per-module coverage.out profiles
+        # and runs scripts/check-coverage.py --threshold 80 --exclude '/db/'
+        # itself — identical to the gate this replaces (the /db/ exclude drops
+        # sqlc-generated packages; new ones auto-skip). Targets: ARCHITECTURE
+        # §9. Lower test-binary parallelism on a constrained daemon with
+        # FISHHAWK_TEST_P (default 4, #1174).
+        run: scripts/test coverage
 
   ts:
     name: TypeScript (lint + build + test)
