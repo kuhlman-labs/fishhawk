@@ -126,6 +126,16 @@ export interface Stage {
    * from GET /v0/stages/{id}/checks.
    */
   gate?: StageGate;
+  /**
+   * The model the gate resolved for this stage's agent spawn, read
+   * from the per-stage `model_resolved` audit (#1416). The wire always
+   * carries it; it is empty string when no resolution was recorded for
+   * the stage (the adapter-default spawn, and every stage of a run
+   * approved before per-stage model selection landed). Optional here
+   * only so existing Stage fixtures need not enumerate it — the UI
+   * treats absent and empty identically (renders nothing).
+   */
+  resolved_model?: string;
   created_at: string;
   updated_at: string;
 }

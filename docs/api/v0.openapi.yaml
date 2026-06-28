@@ -1068,6 +1068,19 @@ components:
             that field (ADR-017 / #249) — required CI checks now
             live in branch protection, snapshotted onto the run
             row's `required_checks_snapshot` (#251).
+        resolved_model:
+          type: string
+          description: |
+            The model id the approval gate resolved for this stage's
+            agent spawn (#1416), surfaced from the per-stage
+            `model_resolved` audit entry keyed by this stage's id.
+            Empty string when no resolution was recorded for the stage
+            — the adapter-default spawn, and every stage of a run
+            approved before per-stage model selection landed. Optional
+            until the handler-side population lands (see Notes) — the
+            field is omitted on responses from a backend that does not
+            yet read the audit.
+          example: claude-opus-4-8
         created_at:
           type: string
           format: date-time
@@ -4573,6 +4586,35 @@ paths:
                     Omitting the field leaves the model to the lower rungs; an
                     empty resolution still records `model_resolved` and spawns
                     with no `--model`, exactly as today.
+                plan_model:
+                  type: string
+                  description: |
+                    Optional operator override for the PLAN-stage model (#1416)
+                    — the top rung of the plan-model ladder (deployment default
+                    < spec `executor.model` on the plan stage < this override).
+                    On a plan-stage approve the gate resolves the plan ladder
+                    with this as the operator rung and emits the plan stage's
+                    `model_resolved` audit entry (`{model, model_source,
+                    stage_type: plan}`); a re-dispatched plan stage then spawns
+                    under the resolved value. Honored only on `approve`; ignored
+                    on `reject`. Omitting the field leaves the plan model to the
+                    lower rungs, byte-identical to today.
+                review_model:
+                  type: string
+                  description: |
+                    Optional operator override for the REVIEW-stage model
+                    (#1416) — the top rung of the review-model ladder
+                    (deployment default < spec `executor.model` on the review
+                    stage < this override). On a plan-stage approve the gate
+                    resolves the review ladder with this as the operator rung and
+                    emits the review stage's `model_resolved` audit entry
+                    (`{model, model_source, stage_type: review}`); the
+                    post-plan-gate implement review (and any post-gate
+                    re-review) then invokes each heterogeneous reviewer under the
+                    resolved value. It governs the implement review, NOT the
+                    already-completed plan review. Honored only on `approve`;
+                    ignored on `reject`. Omitting the field leaves each reviewer
+                    on its spec model, byte-identical to today.
                 delegated:
                   type: boolean
                   default: false

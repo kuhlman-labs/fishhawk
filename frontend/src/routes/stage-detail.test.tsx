@@ -30,6 +30,7 @@ const deployStage: Stage = {
   ended_at: '2026-05-04T20:10:00Z',
   failure_category: null,
   failure_reason: null,
+  resolved_model: '',
   created_at: '2026-05-04T20:00:00Z',
   updated_at: '2026-05-04T20:10:00Z',
   gate: { type: 'approval', approvers: { any_of: ['founder'] } },
@@ -161,5 +162,46 @@ describe('<StageDetail> deploy route', () => {
     // The pre-execution gate is shown so the operator can act.
     expect(screen.getByText('awaiting_deploy_approval')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /^approve$/i })).toBeInTheDocument();
+  });
+});
+
+/*
+ * Per-stage resolved_model observability (#1416, slice d). The Stage API
+ * surfaces the model the gate resolved for the stage's agent spawn from
+ * the per-stage model_resolved audit. The detail page renders it when
+ * non-empty and omits the line entirely on the empty (default-spawn /
+ * legacy) path — the two observable branches of slice d's frontend.
+ */
+describe('<StageDetail> resolved model line', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, 'listStageArtifacts').mockResolvedValue({ items: [] });
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('renders the resolved model when the Stage carries a non-empty resolved_model', async () => {
+    vi.spyOn(api, 'getStage').mockResolvedValue({
+      ...deployStage,
+      resolved_model: 'claude-opus-4-8',
+    });
+
+    renderRoute();
+
+    await waitFor(() => {
+      expect(screen.getByTestId('stage-resolved-model')).toBeInTheDocument();
+    });
+    expect(screen.getByTestId('stage-resolved-model')).toHaveTextContent('claude-opus-4-8');
+  });
+
+  it('omits the resolved-model line when resolved_model is empty (default-spawn / legacy path)', async () => {
+    // deployStage carries resolved_model: '' — the no-resolution path.
+    vi.spyOn(api, 'getStage').mockResolvedValue(deployStage);
+
+    renderRoute();
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /deploy stage/i })).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId('stage-resolved-model')).not.toBeInTheDocument();
   });
 });

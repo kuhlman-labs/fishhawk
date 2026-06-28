@@ -1514,26 +1514,43 @@ func planWithRecommendation(implementModel string) *plan.Plan {
 	return p
 }
 
-// findModelResolvedPayload returns the decoded ResolvedModel from the single
-// model_resolved audit entry, failing when zero or more than one exists.
+// findModelResolvedPayload returns the decoded ResolvedModel from the IMPLEMENT
+// stage's model_resolved audit entry, failing when zero or more than one exists.
+// Since #1416 the plan gate stamps a model_resolved entry per stage (implement,
+// plan, and — when present — review), so this filters to the implement entry by
+// the payload stage_type discriminator (treating a legacy untyped entry as
+// implement) — the resolution the existing model-gate assertions target.
 func findModelResolvedPayload(t *testing.T, appended []audit.ChainAppendParams) ResolvedModel {
+	t.Helper()
+	return findModelResolvedPayloadForStage(t, appended, string(run.StageTypeImplement))
+}
+
+// findModelResolvedPayloadForStage returns the decoded ResolvedModel from the
+// model_resolved audit entry stamped for the given stage type (#1416). A legacy
+// untyped entry counts as the implement stage. Fails when zero or more than one
+// matching entry exists.
+func findModelResolvedPayloadForStage(t *testing.T, appended []audit.ChainAppendParams, stageType string) ResolvedModel {
 	t.Helper()
 	var found *ResolvedModel
 	for _, e := range appended {
 		if e.Category != CategoryModelResolved {
 			continue
 		}
-		if found != nil {
-			t.Fatalf("expected exactly one model_resolved entry, got more than one")
-		}
-		var rm ResolvedModel
-		if err := json.Unmarshal(e.Payload, &rm); err != nil {
+		var p modelResolvedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
 			t.Fatalf("unmarshal model_resolved payload: %v", err)
 		}
+		if !modelResolvedStageMatches(p.StageType, stageType) {
+			continue
+		}
+		if found != nil {
+			t.Fatalf("expected exactly one %s model_resolved entry, got more than one", stageType)
+		}
+		rm := p.ResolvedModel
 		found = &rm
 	}
 	if found == nil {
-		t.Fatalf("expected a model_resolved audit entry, got %+v", appended)
+		t.Fatalf("expected a %s model_resolved audit entry, got %+v", stageType, appended)
 	}
 	return *found
 }
@@ -1720,6 +1737,449 @@ func TestSubmitApproval_ModelGate_GetRunError_FailsOpen(t *testing.T) {
 		if e.Category == CategoryModelResolved {
 			t.Errorf("unexpected model_resolved audit entry on the GetRun fail-open path: %+v", e)
 		}
+	}
+}
+
+// specPlanImplementReview builds a workflow "w" spec with plan + implement +
+// review stages, with optional plan/implement/review executor.model pins. Mirrors
+// specImplementAgentModel but adds the review stage so the per-stage
+// model_resolved emission (#1416) routes a review entry.
+func specPlanImplementReview(planModel, implModel, reviewModel string) []byte {
+	pin := func(m string) string {
+		if m == "" {
+			return ""
+		}
+		return "\n          model: " + m
+	}
+	return []byte(`version: "0.3"
+workflows:
+  w:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code` + pin(planModel) + `
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code` + pin(implModel) + `
+      - id: review
+        type: review
+        executor:
+          agent: claude-code` + pin(reviewModel) + `
+`)
+}
+
+// findModelResolvedEntryForStage returns the single model_resolved ChainAppendParams
+// stamped for the given stage type (#1416), so a test can assert BOTH the resolved
+// value AND the audit's target StageID (the per-stage keying observability reads).
+func findModelResolvedEntryForStage(t *testing.T, appended []audit.ChainAppendParams, stageType string) (audit.ChainAppendParams, modelResolvedPayload) {
+	t.Helper()
+	var found *audit.ChainAppendParams
+	var foundPayload modelResolvedPayload
+	for i := range appended {
+		e := appended[i]
+		if e.Category != CategoryModelResolved {
+			continue
+		}
+		var p modelResolvedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("unmarshal model_resolved payload: %v", err)
+		}
+		if p.StageType != stageType {
+			continue
+		}
+		if found != nil {
+			t.Fatalf("expected exactly one %s model_resolved entry, got more than one", stageType)
+		}
+		ec := e
+		found = &ec
+		foundPayload = p
+	}
+	if found == nil {
+		t.Fatalf("expected a %s model_resolved audit entry, got %+v", stageType, appended)
+	}
+	return *found, foundPayload
+}
+
+// TestSubmitApproval_PerStageModelResolutions covers the #1416 plan- and
+// review-model operator overrides at the gate (scope-b done-means): a plan-stage
+// approve resolves and emits a per-stage model_resolved audit for the implement,
+// plan, and review stages — each keyed to its TARGET stage's id and tagged with
+// its stage_type — with the operator plan_model/review_model winning their
+// ladders. It also covers verification mode 6 (combination): the review model is
+// pinned in the spec while the operator overrides plan + implement, and each
+// stage resolves independently.
+func TestSubmitApproval_PerStageModelResolutions(t *testing.T) {
+	t.Run("operator plan_model and review_model win and are keyed per stage", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		s, rr, au, _ := newModelGateServer(t, art, nil, "") // fail-open allow-list
+		r, planStage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+		implStage := rr.seedStage(r.ID, 1, run.StageStatePending)
+		implStage.Type = run.StageTypeImplement
+		reviewStage := rr.seedStage(r.ID, 2, run.StageStatePending)
+		reviewStage.Type = run.StageTypeReview
+		r.WorkflowSpec = specPlanImplementReview("", "", "")
+
+		body := `{"decision":"approve","implement_model":"op-impl","plan_model":"op-plan","review_model":"op-review"}`
+		w := submitApproval(t, s, planStage.ID, body)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+
+		implEntry, implPayload := findModelResolvedEntryForStage(t, au.appended, "implement")
+		if implPayload.Value != "op-impl" || implPayload.Source != ModelSourceOperator {
+			t.Errorf("implement model_resolved = {%q,%q}, want {op-impl,operator}", implPayload.Value, implPayload.Source)
+		}
+		if implEntry.StageID == nil || *implEntry.StageID != implStage.ID {
+			t.Errorf("implement entry StageID = %v, want the implement stage %v", implEntry.StageID, implStage.ID)
+		}
+
+		planEntry, planPayload := findModelResolvedEntryForStage(t, au.appended, "plan")
+		if planPayload.Value != "op-plan" || planPayload.Source != ModelSourceOperator {
+			t.Errorf("plan model_resolved = {%q,%q}, want {op-plan,operator}", planPayload.Value, planPayload.Source)
+		}
+		if planEntry.StageID == nil || *planEntry.StageID != planStage.ID {
+			t.Errorf("plan entry StageID = %v, want the plan stage %v", planEntry.StageID, planStage.ID)
+		}
+
+		reviewEntry, reviewPayload := findModelResolvedEntryForStage(t, au.appended, "review")
+		if reviewPayload.Value != "op-review" || reviewPayload.Source != ModelSourceOperator {
+			t.Errorf("review model_resolved = {%q,%q}, want {op-review,operator}", reviewPayload.Value, reviewPayload.Source)
+		}
+		if reviewEntry.StageID == nil || *reviewEntry.StageID != reviewStage.ID {
+			t.Errorf("review entry StageID = %v, want the review stage %v", reviewEntry.StageID, reviewStage.ID)
+		}
+	})
+
+	t.Run("combination: spec-pinned review while operator overrides plan and implement", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		s, rr, au, _ := newModelGateServer(t, art, nil, "")
+		r, planStage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+		implStage := rr.seedStage(r.ID, 1, run.StageStatePending)
+		implStage.Type = run.StageTypeImplement
+		reviewStage := rr.seedStage(r.ID, 2, run.StageStatePending)
+		reviewStage.Type = run.StageTypeReview
+		// Review model pinned in the spec; operator overrides only plan + implement.
+		r.WorkflowSpec = specPlanImplementReview("", "", "spec-review")
+
+		body := `{"decision":"approve","implement_model":"op-impl","plan_model":"op-plan"}`
+		w := submitApproval(t, s, planStage.ID, body)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		_, implPayload := findModelResolvedEntryForStage(t, au.appended, "implement")
+		if implPayload.Value != "op-impl" {
+			t.Errorf("implement = %q, want op-impl", implPayload.Value)
+		}
+		_, planPayload := findModelResolvedEntryForStage(t, au.appended, "plan")
+		if planPayload.Value != "op-plan" {
+			t.Errorf("plan = %q, want op-plan", planPayload.Value)
+		}
+		// Review resolves to the spec pin, unaffected by the plan/implement overrides.
+		_, reviewPayload := findModelResolvedEntryForStage(t, au.appended, "review")
+		if reviewPayload.Value != "spec-review" || reviewPayload.Source != ModelSourceSpec {
+			t.Errorf("review = {%q,%q}, want {spec-review,spec}", reviewPayload.Value, reviewPayload.Source)
+		}
+	})
+
+	t.Run("no review stage emits no review entry (byte-identical default)", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		s, rr, au, _ := newModelGateServer(t, art, nil, "")
+		r, planStage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+		implStage := rr.seedStage(r.ID, 1, run.StageStatePending)
+		implStage.Type = run.StageTypeImplement
+		r.WorkflowSpec = specImplementAgentModel("claude-code", "")
+
+		w := submitApproval(t, s, planStage.ID, `{"decision":"approve","review_model":"op-review"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		for _, e := range au.appended {
+			if e.Category != CategoryModelResolved {
+				continue
+			}
+			var p modelResolvedPayload
+			if err := json.Unmarshal(e.Payload, &p); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if p.StageType == "review" {
+				t.Errorf("unexpected review model_resolved entry on a workflow with no review stage: %+v", p)
+			}
+		}
+	})
+}
+
+// --- Plan/review allow-list parity gate (#1416, slice c) ----------------
+
+// newStageModelGateServer mirrors newModelGateServer but wires the plan and
+// review allow-list policies (#1416) so checkStageModelsAllowed is exercisable
+// end to end. The implement allow-list is left unset (fail-open) so an approve
+// reaches the plan/review check without first tripping the implement gate.
+func newStageModelGateServer(t *testing.T, art artifact.Repository, planAllow, reviewAllow AllowedModels) (*Server, *orchestratorRepo, *approvalAuditFake, *fakeApprovalRepo) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	app := newFakeApprovalRepo()
+	au := newApprovalAuditFake()
+	o := &orchestrator.Orchestrator{Runs: rr}
+	s := New(Config{
+		Addr:                "127.0.0.1:0",
+		ApprovalRepo:        app,
+		RunRepo:             rr,
+		AuditRepo:           au,
+		Orchestrator:        o,
+		ArtifactRepo:        art,
+		PlanAllowedModels:   planAllow,
+		ReviewAllowedModels: reviewAllow,
+	})
+	return s, rr, au, app
+}
+
+// specPlanImplementReviewers builds a workflow "w" spec whose implement stage
+// carries the given reviewer providers (each with a placeholder spec model), so
+// reviewProvidersForRun resolves the providers the review_model override is
+// validated against (#1416). planModel pins the plan stage executor.model (the
+// plan-model spec rung). Empty reviewProviders omits the reviewers block.
+func specPlanImplementReviewers(planModel string, reviewProviders ...string) []byte {
+	planLine := ""
+	if planModel != "" {
+		planLine = "\n          model: " + planModel
+	}
+	reviewers := ""
+	if len(reviewProviders) > 0 {
+		reviewers = "\n        reviewers:\n          agents:"
+		for _, p := range reviewProviders {
+			reviewers += "\n            - provider: " + p + "\n              model: placeholder"
+		}
+		reviewers += "\n          human: 1"
+	}
+	return []byte(`version: "0.3"
+workflows:
+  w:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code` + planLine + `
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code` + reviewers + `
+`)
+}
+
+// TestSubmitApproval_PlanModelGate_Rejected covers verification mode 3 for the
+// PLAN model: a resolved plan model absent from PlanAllowedModels is rejected
+// 422 plan_model_not_allowed naming the resolved source — for BOTH the spec
+// rung (executor.model) and the operator rung (plan_model override). A 422 must
+// insert no approval row and leave the stage on the gate.
+func TestSubmitApproval_PlanModelGate_Rejected(t *testing.T) {
+	planAllow := AllowedModels{"claudecode": {"good-plan": true}}
+	tests := []struct {
+		name       string
+		specPlan   string
+		operator   string
+		wantSource string
+	}{
+		{name: "spec source rejected", specPlan: "bad-plan", wantSource: "spec"},
+		{name: "operator source rejected", operator: "bad-plan", wantSource: "operator"},
+		{
+			// Operator override wins the ladder even over a valid spec rung, so an
+			// invalid operator value is the rejected source.
+			name:     "operator override rejected over a valid spec rung",
+			specPlan: "good-plan", operator: "bad-plan", wantSource: "operator",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			art := newFakeArtifactRepo()
+			s, rr, au, app := newStageModelGateServer(t, art, planAllow, nil)
+			r, stage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+			r.WorkflowSpec = specPlanImplementReviewers(tt.specPlan)
+
+			body := `{"decision":"approve"}`
+			if tt.operator != "" {
+				body = fmt.Sprintf(`{"decision":"approve","plan_model":%q}`, tt.operator)
+			}
+			w := submitApproval(t, s, stage.ID, body)
+			if w.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), `"plan_model_not_allowed"`) {
+				t.Errorf("body missing plan_model_not_allowed: %s", w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), `"model_source":"`+tt.wantSource+`"`) {
+				t.Errorf("body missing model_source=%s: %s", tt.wantSource, w.Body.String())
+			}
+			// PRE-Submit: no approval row, stage unchanged, no model_resolved audit.
+			if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+				t.Errorf("approval rows after 422 = %d (err=%v), want 0", len(rows), err)
+			}
+			if stage.State != run.StageStateAwaitingApproval {
+				t.Errorf("stage.State = %q, want awaiting_approval", stage.State)
+			}
+			for _, e := range au.appended {
+				if e.Category == CategoryModelResolved || e.Category == "approval_submitted" {
+					t.Errorf("unexpected %s audit entry after a 422", e.Category)
+				}
+			}
+		})
+	}
+}
+
+// TestSubmitApproval_ReviewModelGate_Rejected covers verification mode 3 for the
+// REVIEW model: a resolved review model absent from a reviewer provider's
+// allow-set is rejected 422 review_model_not_allowed naming the provider and the
+// resolved source. The override is validated against the IMPLEMENT stage's
+// reviewer providers (where the post-plan-gate review runs).
+func TestSubmitApproval_ReviewModelGate_Rejected(t *testing.T) {
+	t.Run("operator review_model rejected for a configured provider", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		reviewAllow := AllowedModels{"codex": {"gpt-5.5": true}}
+		s, rr, au, app := newStageModelGateServer(t, art, nil, reviewAllow)
+		r, stage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+		r.WorkflowSpec = specPlanImplementReviewers("", "codex")
+
+		w := submitApproval(t, s, stage.ID, `{"decision":"approve","review_model":"bad-review"}`)
+		if w.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), `"review_model_not_allowed"`) {
+			t.Errorf("body missing review_model_not_allowed: %s", w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), `"model_source":"operator"`) {
+			t.Errorf("body missing model_source=operator: %s", w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), `"provider":"codex"`) {
+			t.Errorf("body missing provider=codex: %s", w.Body.String())
+		}
+		if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+			t.Errorf("approval rows after 422 = %d (err=%v), want 0", len(rows), err)
+		}
+		for _, e := range au.appended {
+			if e.Category == CategoryModelResolved || e.Category == "approval_submitted" {
+				t.Errorf("unexpected %s audit entry after a 422", e.Category)
+			}
+		}
+	})
+
+	t.Run("rejected when ANY of multiple providers omits the model", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		// claudecode permits the model; codex does not → the heterogeneous pair
+		// rejects because the single override is applied to BOTH reviewers.
+		reviewAllow := AllowedModels{
+			"claudecode": {"shared-review": true},
+			"codex":      {"gpt-5.5": true},
+		}
+		s, rr, _, _ := newStageModelGateServer(t, art, nil, reviewAllow)
+		r, stage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+		r.WorkflowSpec = specPlanImplementReviewers("", "claudecode", "codex")
+
+		w := submitApproval(t, s, stage.ID, `{"decision":"approve","review_model":"shared-review"}`)
+		if w.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), `"provider":"codex"`) {
+			t.Errorf("expected rejection naming the codex provider: %s", w.Body.String())
+		}
+	})
+}
+
+// TestSubmitApproval_StageModelsGate_FailOpenUnset covers verification modes 4
+// and 5: an UNSET plan/review allow-list accepts any resolved model (fail-open,
+// byte-identical to today), and an EMPTY resolution (no pin, no override) skips
+// the check entirely even with a configured allow-list — the approve proceeds
+// 200 in both cases.
+func TestSubmitApproval_StageModelsGate_FailOpenUnset(t *testing.T) {
+	t.Run("unset policies accept arbitrary overrides", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		s, rr, _, app := newStageModelGateServer(t, art, nil, nil) // both unset
+		r, stage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+		r.WorkflowSpec = specPlanImplementReviewers("", "codex")
+
+		w := submitApproval(t, s, stage.ID, `{"decision":"approve","plan_model":"any-plan","review_model":"any-review"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (fail-open unset policy):\n%s", w.Code, w.Body.String())
+		}
+		if stage.State != run.StageStateSucceeded {
+			t.Errorf("stage.State = %q, want succeeded", stage.State)
+		}
+		if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 1 {
+			t.Errorf("approval rows = %d (err=%v), want 1", len(rows), err)
+		}
+	})
+
+	t.Run("empty resolution skips the check under a configured allow-list", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		// Configured but restrictive policies; with NO plan pin/override and NO
+		// review override, both ladders resolve empty so neither check fires.
+		planAllow := AllowedModels{"claudecode": {"nothing-matches": true}}
+		reviewAllow := AllowedModels{"codex": {"nothing-matches": true}}
+		s, rr, _, _ := newStageModelGateServer(t, art, planAllow, reviewAllow)
+		r, stage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+		r.WorkflowSpec = specPlanImplementReviewers("", "codex") // no plan/review pin
+
+		w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (empty resolution skips check):\n%s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("review override with no agent reviewers fails open", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		// Restrictive review policy, but the workflow declares NO agent reviewers,
+		// so reviewProvidersForRun yields nothing to validate against → fail open.
+		reviewAllow := AllowedModels{"codex": {"nothing-matches": true}}
+		s, rr, _, _ := newStageModelGateServer(t, art, nil, reviewAllow)
+		r, stage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+		r.WorkflowSpec = specPlanImplementReviewers("") // implement stage carries no reviewers
+
+		w := submitApproval(t, s, stage.ID, `{"decision":"approve","review_model":"unlisted-review"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (no providers to validate):\n%s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("allowed models proceed", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		planAllow := AllowedModels{"claudecode": {"good-plan": true}}
+		reviewAllow := AllowedModels{"codex": {"good-review": true}}
+		s, rr, _, _ := newStageModelGateServer(t, art, planAllow, reviewAllow)
+		r, stage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+		r.WorkflowSpec = specPlanImplementReviewers("good-plan", "codex")
+
+		w := submitApproval(t, s, stage.ID, `{"decision":"approve","review_model":"good-review"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (allowed models):\n%s", w.Code, w.Body.String())
+		}
+	})
+}
+
+// TestSubmitApproval_StageModelsGate_GetRunError_FailsOpen pins
+// checkStageModelsAllowed's fail-OPEN branch on a RunRepo.GetRun read failure:
+// the plan/review check returns true BEFORE any resolution, so the approve
+// proceeds rather than 422-ing on a transient read error.
+func TestSubmitApproval_StageModelsGate_GetRunError_FailsOpen(t *testing.T) {
+	art := newFakeArtifactRepo()
+	// Restrictive policies make the test meaningful: it proves the branch
+	// short-circuits before the resolve+validate path, not that the allow-list
+	// happened to be empty.
+	planAllow := AllowedModels{"claudecode": {"nothing": true}}
+	reviewAllow := AllowedModels{"codex": {"nothing": true}}
+	s, rr, _, _ := newStageModelGateServer(t, art, planAllow, reviewAllow)
+	r, stage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+	r.WorkflowSpec = specPlanImplementReviewers("", "codex")
+
+	rr.mu.Lock()
+	delete(rr.runs, stage.RunID) // both GetRun calls now return run.ErrNotFound
+	rr.mu.Unlock()
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","plan_model":"bad-plan","review_model":"bad-review"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (GetRun failure fails open):\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Errorf("stage.State = %q, want succeeded", stage.State)
 	}
 }
 

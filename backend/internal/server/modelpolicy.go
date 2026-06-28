@@ -81,6 +81,78 @@ func resolveImplementModel(deflt, spec, plan, operator string) ResolvedModel {
 	}
 }
 
+// resolvePlanModel applies the plan-model ladder, lowest to highest precedence:
+//
+//	deployment default  <  spec.executor.model (plan stage)  <  operator gate decision
+//
+// It mirrors resolveImplementModel but omits the implement ladder's plan
+// model_recommendation rung: the plan agent is spawned BEFORE any plan artifact
+// exists, so there is no plan recommendation to read for the plan stage's own
+// model (the model_recommendation a plan emits is for the IMPLEMENT stage). The
+// highest non-empty rung wins and its name is the source; an all-empty ladder
+// returns {Value: "", Source: ModelSourceNone}, so the caller carries no model
+// and the runner spawns the plan agent byte-for-byte as today (no --model
+// argument). Pure — no IO — and the single chokepoint both the prompt path
+// (this slice) and the approval gate (the operator-override slice) resolve
+// through, so a re-dispatched plan resolves its operator override the same way.
+func resolvePlanModel(deflt, spec, operator string) ResolvedModel {
+	switch {
+	case operator != "":
+		return ResolvedModel{Value: operator, Source: ModelSourceOperator}
+	case spec != "":
+		return ResolvedModel{Value: spec, Source: ModelSourceSpec}
+	case deflt != "":
+		return ResolvedModel{Value: deflt, Source: ModelSourceDefault}
+	default:
+		return ResolvedModel{Value: "", Source: ModelSourceNone}
+	}
+}
+
+// resolveReviewModel applies the review-model ladder, lowest to highest
+// precedence:
+//
+//	deployment default  <  spec.executor.model (review stage)  <  operator gate decision
+//
+// It mirrors resolvePlanModel exactly: the review agent — like the plan agent —
+// carries no plan model_recommendation rung (model_recommendation feeds the
+// implement stage), so the ladder is the same 3-rung shape. The operator rung is
+// the review_model the operator supplies at the plan-approval gate (#1416); it
+// governs the post-plan-gate implement review (and any post-gate re-review), NOT
+// the already-completed plan review. The highest non-empty rung wins; an
+// all-empty ladder returns {Value: "", Source: ModelSourceNone}, so the reviewer
+// invocation falls back to the spec model byte-for-byte as today. Pure — no IO.
+func resolveReviewModel(deflt, spec, operator string) ResolvedModel {
+	switch {
+	case operator != "":
+		return ResolvedModel{Value: operator, Source: ModelSourceOperator}
+	case spec != "":
+		return ResolvedModel{Value: spec, Source: ModelSourceSpec}
+	case deflt != "":
+		return ResolvedModel{Value: deflt, Source: ModelSourceDefault}
+	default:
+		return ResolvedModel{Value: "", Source: ModelSourceNone}
+	}
+}
+
+// modelResolvedPayload is the model_resolved audit payload (#1416): the
+// source-tagged ResolvedModel plus a StageType discriminator. Once the plan
+// gate stamps a model_resolved entry for MORE THAN ONE stage (implement, plan,
+// review), the per-stage readers need to tell the entries apart. Each entry is
+// keyed by its TARGET stage's StageID (so the observability slice reads a
+// stage's model by StageID), and the StageType is carried in the payload so the
+// runner-spawn reader — which holds only the run id, not a stage id — can filter
+// the run's entries to the stage it routes WITHOUT an extra stage lookup.
+//
+// StageType is ADDITIVE to the {model, model_source} wire contract the slice-1
+// reader relies on (#1013): a legacy implement-only entry written before this
+// slice decodes to StageType=="" and is treated as the implement resolution (the
+// only stage that stamped the category before #1416). gateResolvedModelForStage
+// owns that compatibility via modelResolvedStageMatches.
+type modelResolvedPayload struct {
+	ResolvedModel
+	StageType string `json:"stage_type,omitempty"`
+}
+
 // AllowedModels is the per-adapter allowed-model policy sourced from deployment
 // config (ParseAllowedModels). It maps an adapter name (claudecode | codex |
 // anthropic) to the set of model ids the operator permits for that adapter.
@@ -186,6 +258,73 @@ func (s *Server) resolveImplementModelForRun(ctx context.Context, runRow *run.Ru
 	specModel := specImplementExecutorModel(runRow.WorkflowSpec, runRow.WorkflowID)
 	planModel := s.planImplementModelRecommendation(ctx, runRow.ID)
 	return resolveImplementModel(deflt, specModel, planModel, "")
+}
+
+// resolvePlanModelForRun resolves the plan-model ladder for a run through the
+// pure resolvePlanModel chokepoint. It reads executor.model on the run's
+// workflow plan stage (specPlanExecutorModel) from the raw spec bytes, keeping
+// this slice free of a static dependency on the spec.Executor.Model field. The
+// deployment-default rung is left empty here: a PlanModelDefault config field is
+// owned by the allow-list/config slice, not this one, so the plan default is ""
+// and the ladder is effectively spec-only until that slice folds in a default
+// and the operator-override slice folds in the gate rung. The operator rung is
+// empty on this path — a plan prompt fetch precedes the plan-approval gate, so
+// it carries only the spec pin. An all-empty ladder (ModelSourceNone) leaves
+// PlanModel empty so the runner spawns the plan agent identically to today.
+//
+// The operator-override slice (#1416) fills in the reserved ctx parameter: it
+// reads the plan gate's per-stage model_resolved resolution FIRST, so a
+// re-dispatched plan stage spawns under the operator's plan_model override when
+// one was recorded at the plan-approval gate. When no gate plan resolution
+// exists (pre-approval, or a deployment without the gate writer) the function
+// falls back to the spec-only ladder, leaving an empty/spec-only resolution
+// byte-identical to today.
+func (s *Server) resolvePlanModelForRun(ctx context.Context, runRow *run.Run) ResolvedModel {
+	if rm, ok := s.gateResolvedModelForStage(ctx, runRow.ID, string(run.StageTypePlan)); ok {
+		return rm
+	}
+	specModel := specPlanExecutorModel(runRow.WorkflowSpec, runRow.WorkflowID)
+	return resolvePlanModel("", specModel, "")
+}
+
+// gateResolvePlanModel resolves the plan-model ladder AT THE APPROVAL GATE, with
+// the operator's plan_model as the highest rung (#1416). Like
+// gateResolveImplementModel it does NOT consult a prior gate resolution — the
+// gate is the WRITER, so re-reading would let a prior approve shadow a
+// re-approval's fresh override. It reads the spec rung (specPlanExecutorModel)
+// and folds in the operator string; the deployment-default rung is empty (a
+// PlanModelDefault config field is the allow-list slice's concern). An all-empty
+// ladder yields ModelSourceNone (today's empty spawn). Pure resolution.
+func (*Server) gateResolvePlanModel(runRow *run.Run, operator string) ResolvedModel {
+	specModel := specPlanExecutorModel(runRow.WorkflowSpec, runRow.WorkflowID)
+	return resolvePlanModel("", specModel, strings.TrimSpace(operator))
+}
+
+// gateResolveReviewModel resolves the review-model ladder AT THE APPROVAL GATE,
+// with the operator's review_model as the highest rung (#1416). It mirrors
+// gateResolvePlanModel: spec rung (specReviewExecutorModel) plus the operator
+// override, no deployment default, no re-read of a prior gate resolution. The
+// resolved value is recorded as the review stage's model_resolved audit and read
+// back at implement-review time (gateResolvedReviewModel) to override the
+// reviewer invocation's model. An all-empty ladder yields ModelSourceNone, so
+// the reviewer falls back to its spec model byte-for-byte as today.
+func (*Server) gateResolveReviewModel(runRow *run.Run, operator string) ResolvedModel {
+	specModel := specReviewExecutorModel(runRow.WorkflowSpec, runRow.WorkflowID)
+	return resolveReviewModel("", specModel, strings.TrimSpace(operator))
+}
+
+// gateResolvedReviewModel returns the review model the plan gate resolved for
+// the run (#1416), or "" when no review model_resolved entry exists (or it
+// recorded an empty resolution). It is the read-only bridge the implement-review
+// invocation path (resolveReviewerInvocations) consults to override each
+// reviewer's model. Returning "" — the fail-open default — leaves the reviewer
+// on its spec model byte-for-byte as today.
+func (s *Server) gateResolvedReviewModel(ctx context.Context, runID uuid.UUID) string {
+	rm, ok := s.gateResolvedModelForStage(ctx, runID, string(run.StageTypeReview))
+	if !ok {
+		return ""
+	}
+	return rm.Value
 }
 
 // resolveFixupImplementModel resolves the model a fix-up pass will run under
@@ -400,7 +539,28 @@ func (s *Server) resolvedImplementModelForRunID(ctx context.Context, runID uuid.
 // WIRE CONTRACT: the model_resolved payload MUST carry the {model, model_source}
 // keys (ResolvedModel's json tags). The gate writer (sibling slice) emits that
 // shape; a drift degrades this read to ok=false (fall back), never a panic.
+//
+// It resolves the IMPLEMENT stage's entry specifically (#1416): the plan gate now
+// stamps model_resolved for the plan and review stages too, so the bare
+// "most-recent for the run" read would return whichever stage's entry happened
+// to be written last. gateResolvedModelForStage filters by the payload's
+// StageType discriminator (treating a legacy entry with no StageType as the
+// implement resolution) so the runner-spawn route is unaffected by the sibling
+// entries.
 func (s *Server) gateResolvedModel(ctx context.Context, runID uuid.UUID) (ResolvedModel, bool) {
+	return s.gateResolvedModelForStage(ctx, runID, string(run.StageTypeImplement))
+}
+
+// gateResolvedModelForStage returns the most-recent model_resolved entry whose
+// payload StageType identifies the given stage (#1416), or ok=false when the
+// AuditRepo is unconfigured, the lookup fails, or no entry matches the stage. It
+// is the per-stage generalization of gateResolvedModel: the run can now carry one
+// model_resolved entry per stamped stage (implement, plan, review), and each
+// reader filters to the stage it routes. A recorded empty resolution
+// (ModelSourceNone) for a matching stage is surfaced as ok=true so the caller
+// honors the gate's deliberate "use the default spawn" decision rather than
+// re-deriving a lower rung.
+func (s *Server) gateResolvedModelForStage(ctx context.Context, runID uuid.UUID, stageType string) (ResolvedModel, bool) {
 	if s.cfg.AuditRepo == nil {
 		return ResolvedModel{}, false
 	}
@@ -414,17 +574,35 @@ func (s *Server) gateResolvedModel(ctx context.Context, runID uuid.UUID) (Resolv
 	sort.SliceStable(entries, func(i, j int) bool {
 		return entries[i].Sequence > entries[j].Sequence
 	})
-	var rm ResolvedModel
-	if err := json.Unmarshal(entries[0].Payload, &rm); err != nil {
-		return ResolvedModel{}, false
+	for _, e := range entries {
+		var p modelResolvedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			continue
+		}
+		if !modelResolvedStageMatches(p.StageType, stageType) {
+			continue
+		}
+		if p.Value == "" {
+			// A recorded empty resolution is a valid "use the default spawn"
+			// decision; surface it so the caller does not re-derive a non-empty
+			// rung the gate deliberately left empty.
+			return ResolvedModel{Value: "", Source: ModelSourceNone}, true
+		}
+		return p.ResolvedModel, true
 	}
-	if rm.Value == "" {
-		// A recorded empty resolution is a valid "use the default spawn"
-		// decision; surface it so the caller does not re-derive a non-empty
-		// rung the gate deliberately left empty.
-		return ResolvedModel{Value: "", Source: ModelSourceNone}, true
+	return ResolvedModel{}, false
+}
+
+// modelResolvedStageMatches reports whether a model_resolved entry's payload
+// StageType (have) identifies the stage a reader wants (want). A legacy
+// implement-only entry written before #1416 carries no StageType (have==""); it
+// is treated as the implement resolution so the runner-spawn route stays
+// byte-identical for runs approved before this slice.
+func modelResolvedStageMatches(have, want string) bool {
+	if have == want {
+		return true
 	}
-	return rm, true
+	return want == string(run.StageTypeImplement) && have == ""
 }
 
 // planImplementModelRecommendation reads model_recommendation.implement_model
@@ -541,6 +719,91 @@ func specImplementExecutorModel(specBytes []byte, workflowID string) string {
 	}
 	for _, st := range wf.Stages {
 		if st.Type == "implement" {
+			return strings.TrimSpace(st.Executor.Model)
+		}
+	}
+	return ""
+}
+
+// specPlanExecutorModel reads executor.model on the plan stage of the given
+// workflow from raw workflow-spec bytes via a local YAML probe, returning ""
+// when the spec is empty, malformed, or declares no executor.model. It mirrors
+// specImplementExecutorModel exactly but targets the PLAN stage (prefer a stage
+// whose id == "plan", else the first stage whose type == "plan"), staying free
+// of a static dependency on the spec.Executor.Model field (owned by a sibling
+// schema slice). This is the spec rung of the plan-model ladder — the pinned
+// plan executor.model Scenario B honors.
+func specPlanExecutorModel(specBytes []byte, workflowID string) string {
+	if len(specBytes) == 0 {
+		return ""
+	}
+	var probe struct {
+		Workflows map[string]struct {
+			Stages []struct {
+				ID       string `yaml:"id"`
+				Type     string `yaml:"type"`
+				Executor struct {
+					Model string `yaml:"model"`
+				} `yaml:"executor"`
+			} `yaml:"stages"`
+		} `yaml:"workflows"`
+	}
+	if err := yaml.Unmarshal(specBytes, &probe); err != nil {
+		return ""
+	}
+	wf, ok := probe.Workflows[workflowID]
+	if !ok {
+		return ""
+	}
+	for _, st := range wf.Stages {
+		if st.ID == "plan" {
+			return strings.TrimSpace(st.Executor.Model)
+		}
+	}
+	for _, st := range wf.Stages {
+		if st.Type == "plan" {
+			return strings.TrimSpace(st.Executor.Model)
+		}
+	}
+	return ""
+}
+
+// specReviewExecutorModel reads executor.model on the review stage of the given
+// workflow from raw workflow-spec bytes via a local YAML probe, returning ""
+// when the spec is empty, malformed, or declares no executor.model. It mirrors
+// specPlanExecutorModel exactly but targets the REVIEW stage (prefer a stage
+// whose id == "review", else the first stage whose type == "review"), staying
+// free of a static dependency on the spec.Executor.Model field. This is the spec
+// rung of the review-model ladder (#1416).
+func specReviewExecutorModel(specBytes []byte, workflowID string) string {
+	if len(specBytes) == 0 {
+		return ""
+	}
+	var probe struct {
+		Workflows map[string]struct {
+			Stages []struct {
+				ID       string `yaml:"id"`
+				Type     string `yaml:"type"`
+				Executor struct {
+					Model string `yaml:"model"`
+				} `yaml:"executor"`
+			} `yaml:"stages"`
+		} `yaml:"workflows"`
+	}
+	if err := yaml.Unmarshal(specBytes, &probe); err != nil {
+		return ""
+	}
+	wf, ok := probe.Workflows[workflowID]
+	if !ok {
+		return ""
+	}
+	for _, st := range wf.Stages {
+		if st.ID == "review" {
+			return strings.TrimSpace(st.Executor.Model)
+		}
+	}
+	for _, st := range wf.Stages {
+		if st.Type == "review" {
 			return strings.TrimSpace(st.Executor.Model)
 		}
 	}

@@ -497,6 +497,18 @@ func runServe(args []string, logSink io.Writer) int {
 			"against (#1013). Format: `adapter=model1,model2;adapter2=model3`, e.g. "+
 			"`claudecode=claude-opus-4-8,claude-sonnet-4-6;codex=gpt-5.5`. Empty (the default) or an "+
 			"adapter with no configured set fails OPEN — any model accepted, byte-identical to today")
+	planAllowedModels := fs.String("plan-allowed-models",
+		envOr("FISHHAWKD_PLAN_ALLOWED_MODELS", ""),
+		"per-adapter allowed-model policy the approval gate validates the RESOLVED plan model "+
+			"against (#1416), keyed by the plan stage's executor.agent adapter. Same format as "+
+			"--implement-allowed-models. Empty (the default) or an adapter with no configured set "+
+			"fails OPEN — any model accepted, byte-identical to today")
+	reviewAllowedModels := fs.String("review-allowed-models",
+		envOr("FISHHAWKD_REVIEW_ALLOWED_MODELS", ""),
+		"per-adapter allowed-model policy the approval gate validates the RESOLVED review model "+
+			"against (#1416), keyed by each implement-review reviewer provider. Same format as "+
+			"--implement-allowed-models. Empty (the default) or a provider with no configured set "+
+			"fails OPEN — any model accepted, byte-identical to today")
 	budgetTimezone := fs.String("budget-timezone",
 		envOr("FISHHAWKD_BUDGET_TIMEZONE", "UTC"),
 		"IANA timezone (e.g. America/New_York) the advisory periodic-budget evaluator (#688) "+
@@ -575,7 +587,7 @@ func runServe(args []string, logSink io.Writer) int {
 	modelProviders := buildModelProviders(*anthropicAPIKey, *openAIAPIKey)
 	modelOracle := modeloracle.NewCached(modelProviders, *modelsStalenessThreshold, logger)
 
-	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, BudgetLimitOverrideUSD: *budgetLimitOverrideUSD, BudgetAckMultiple: *budgetAckMultiple, BudgetPageMultiple: *budgetPageMultiple, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modelOracle}
+	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, BudgetLimitOverrideUSD: *budgetLimitOverrideUSD, BudgetAckMultiple: *budgetAckMultiple, BudgetPageMultiple: *budgetPageMultiple, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), PlanAllowedModels: server.ParseAllowedModels(*planAllowedModels), ReviewAllowedModels: server.ParseAllowedModels(*reviewAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modelOracle}
 
 	// Plan-review agent wiring. Resolved by a pure helper so the selection seam
 	// (which adapters the flags configure) is unit-testable without booting a

@@ -779,6 +779,55 @@ func TestFetchPrompt_ImplementModelOmittedWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestFetchPrompt_DecodesPlanModel confirms the client decodes the backend's
+// plan_model response field (#1416) into FetchedPrompt.PlanModel, the wire value
+// the runner pins onto a plan-stage agent spawn as --model.
+func TestFetchPrompt_DecodesPlanModel(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "plan",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"plan_model": "claude-opus-4-8"
+	}`
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.PlanModel != "claude-opus-4-8" {
+		t.Errorf("PlanModel = %q, want %q", got.PlanModel, "claude-opus-4-8")
+	}
+}
+
+// TestFetchPrompt_PlanModelOmittedWhenAbsent confirms PlanModel decodes to the
+// empty string when the backend omits the field (no rung of the plan-model
+// ladder supplied a model — the common case), so the runner leaves
+// agent.Invocation.Model unset and spawns the plan agent on the adapter default
+// — byte-identical to behavior before #1416 wired the routing.
+func TestFetchPrompt_PlanModelOmittedWhenAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.PlanModel != "" {
+		t.Errorf("PlanModel = %q, want empty when absent", got.PlanModel)
+	}
+}
+
 // TestBindingAssertions_BackendEmitRunnerDecodeRoundTrip pins the backend
 // prompt-response binding_assertions JSON serialization against this package's
 // FetchedPrompt decoder (#1171 approval condition 1), the binding-assertion
