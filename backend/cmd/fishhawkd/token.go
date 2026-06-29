@@ -26,6 +26,13 @@ var operatorDefaultScopes = []string{
 	// ed25519 runner-signature path and the mcp:run self-rollback subject-
 	// binding path are NOT scope-gated and stay unaffected.
 	"write:deploy",
+	// write:campaigns gates POST/GET /v0/campaigns and POST
+	// /v0/campaigns/{id}/resume (E25.4 / #1443;
+	// requireWriteScope("write:campaigns") in
+	// backend/internal/server/campaigns.go), so operator tokens need it to
+	// drive the campaign primitive. New tokens and `token migrate --apply`
+	// promotions carry it.
+	"write:campaigns",
 }
 
 // mcpCapabilityScopes lists the optional scopes that can be granted

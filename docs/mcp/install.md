@@ -8,7 +8,7 @@ E19.7 / #347 shipped the release pipeline + v0 read-only tools. E22 added the li
 
 ## Prerequisites
 
-- A Fishhawk API token (`fhk_*`). Issued by the backend's apitoken surface; for local dev, `fishhawkd token issue --subject <login> --scopes read:runs,read:audit,write:runs,write:approvals,write:stages` mints a token with the full operator surface.
+- A Fishhawk API token (`fhk_*`). Issued by the backend's apitoken surface; for local dev, `fishhawkd token issue --subject <login> --scopes read:runs,read:audit,write:runs,write:approvals,write:stages,write:deploy,write:campaigns` mints a token with the full operator surface.
 - A reachable Fishhawk backend. `https://app.fishhawk.[tld]` for production installs; `http://localhost:8080` for local dev.
 - Claude Code installed (any version supporting `claude mcp add`).
 
@@ -88,7 +88,7 @@ The agent should call `fishhawk_get_run_status` and return the Run row + ordered
 
 Two audiences with different scopes:
 
-- **Operator-side** (your terminal Claude Code with an `fhk_*` apitoken): full lifecycle. Read tools work with `read:runs,read:audit`; the write tools need `write:runs,write:approvals,write:stages` per the table below.
+- **Operator-side** (your terminal Claude Code with an `fhk_*` apitoken): full lifecycle. Read tools work with `read:runs,read:audit`; the write tools need `write:runs,write:approvals,write:stages,write:deploy,write:campaigns` per the table below.
 - **Runner-side** (the agent inside a Fishhawk runner with an `fhm_*` mcptoken, scope `mcp:read`): read-only. Per ADR-021 / [ADR-022's addendum](https://github.com/kuhlman-labs/fishhawk/issues/388) — runner identity is read-only across all runner backends. The agent never approves its own work.
 
 ### Read tools
