@@ -711,38 +711,14 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	createParams := run.CreateRunParams{
-		Repo:          req.Repo,
-		WorkflowID:    req.WorkflowID,
-		WorkflowSHA:   req.WorkflowSHA,
-		TriggerSource: run.TriggerSource(req.TriggerSource),
-		TriggerRef:    req.TriggerRef,
-		// Empty req.RunnerKind → repo layer applies the default
-		// (RunnerKindGitHubActions). Explicit values are validated
-		// above; only known-good kinds reach the repo.
-		RunnerKind: req.RunnerKind,
-		// Best-effort App installation resolved above (#713). Nil when
-		// no App is installed on the repo (local / non-App setup); the
-		// runner then falls back to the operator's `gh` CLI token.
-		InstallationID: installationID,
-	}
-	if haveStageDefs {
-		// Cache the validated spec bytes on the row so the trace
-		// handler's policy re-evaluation reads constraints from
-		// storage instead of refetching (mirrors the dispatcher
-		// path; see dispatcher.createRun). specBytes is set by
-		// either the inline-spec or the GitHub-fetch path above.
-		createParams.WorkflowSpec = specBytes
-		createParams.MaxRetriesSnapshot = maxRetriesSnap
-		// Drive default from the workflow spec (#1023); the
-		// per-run override below wins when present.
-		createParams.Drive = workflowDef.Drive
-	}
-	if req.Drive != nil {
-		createParams.Drive = *req.Drive
-	}
+	// Map the request's issue context (#415) to the domain value, then
+	// hand the resolved inputs to CreateRunForTrigger — the single
+	// integrating seam for run + stage creation, reused by the
+	// campaign-driver ticker (E25.5 / #1444) so the create path lives in
+	// one place rather than being duplicated per trigger source.
+	var issueCtx *run.IssueContext
 	if req.IssueContext != nil {
-		createParams.IssueContext = &run.IssueContext{
+		issueCtx = &run.IssueContext{
 			Title:  req.IssueContext.Title,
 			Body:   req.IssueContext.Body,
 			URL:    req.IssueContext.URL,
@@ -757,36 +733,203 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 					CreatedAt: c.CreatedAt,
 				}
 			}
-			createParams.IssueContext.Comments = comments
+			issueCtx.Comments = comments
 		}
 	}
+	var idemp *string
 	if idempKey != "" {
 		k := idempKey
-		createParams.IdempotencyKey = &k
+		idemp = &k
 	}
 
-	created, err := s.cfg.RunRepo.CreateRun(r.Context(), createParams)
+	created, err := s.CreateRunForTrigger(r.Context(), CreateRunForTriggerParams{
+		Repo:               req.Repo,
+		WorkflowID:         req.WorkflowID,
+		WorkflowSHA:        req.WorkflowSHA,
+		TriggerSource:      run.TriggerSource(req.TriggerSource),
+		TriggerRef:         req.TriggerRef,
+		RunnerKind:         req.RunnerKind,
+		InstallationID:     installationID,
+		IssueContext:       issueCtx,
+		Drive:              req.Drive,
+		IdempotencyKey:     idemp,
+		HaveStageDefs:      haveStageDefs,
+		WorkflowDef:        workflowDef,
+		WorkflowSpec:       specBytes,
+		MaxRetriesSnapshot: maxRetriesSnap,
+	})
 	if err != nil {
+		// CreateRunForTrigger wraps the stage-creation failure with the
+		// "create stages failed" prefix and the run-row failure with
+		// "create run failed"; surface that verbatim in details so the
+		// existing diagnostic contract is preserved.
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"create run failed", map[string]any{"error": err.Error()})
 		return
 	}
 
+	s.writeJSON(w, r, http.StatusCreated, toRunResponse(created))
+}
+
+// StartRunForCampaignIssue resolves the workflow context for a campaign's
+// issue and starts a run for it through CreateRunForTrigger (E25.5 / #1444).
+// A campaign carries only its repo + the issue refs — no workflow context —
+// so this resolves the GitHub App installation, fetches + parses the workflow
+// spec at workflowRef (empty = the repo's default branch), and uses the
+// fetched blob SHA as the run's workflow_sha. The run is created with
+// trigger_source=github_issue and trigger_ref=issueRef so the runner's
+// prompt builder fetches the issue context; no issue context is cached here
+// because the campaign assembly retains only the issue ref.
+//
+// Requires a configured GitHub client (the campaign repo carries no inline
+// spec). Returns an error rather than starting a run when the installation or
+// spec can't be resolved — the driver leaves the item un-started and retries
+// next tick.
+func (s *Server) StartRunForCampaignIssue(ctx context.Context, repo, issueRef, workflowID, workflowRef string) (*run.Run, error) {
+	if s.cfg.GitHub == nil {
+		return nil, errors.New("campaign run start requires a configured GitHub client")
+	}
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok || owner == "" || name == "" {
+		return nil, fmt.Errorf("campaign repo %q is not in owner/name form", repo)
+	}
+	repoRef := githubclient.RepoRef{Owner: owner, Name: name}
+
+	instID, err := s.cfg.GitHub.GetRepoInstallation(ctx, repoRef)
+	if err != nil {
+		return nil, fmt.Errorf("resolve installation for %s: %w", repo, err)
+	}
+
+	fc, err := s.cfg.GitHub.GetWorkflowSpec(ctx, instID, repoRef, workflowRef)
+	if err != nil {
+		return nil, fmt.Errorf("fetch workflow spec for %s: %w", repo, err)
+	}
+	parsed, err := spec.ParseBytes(fc.Content)
+	if err != nil {
+		return nil, fmt.Errorf("parse workflow spec for %s: %w", repo, err)
+	}
+	wf, ok := parsed.Workflows[workflowID]
+	if !ok {
+		return nil, fmt.Errorf("workflow %q not defined in %s spec", workflowID, repo)
+	}
+	if len(wf.Stages) == 0 {
+		return nil, fmt.Errorf("workflow %q in %s spec has no stages", workflowID, repo)
+	}
+
+	triggerRef := issueRef
+	return s.CreateRunForTrigger(ctx, CreateRunForTriggerParams{
+		Repo:               repo,
+		WorkflowID:         workflowID,
+		WorkflowSHA:        fc.SHA,
+		TriggerSource:      run.TriggerGitHubIssue,
+		TriggerRef:         &triggerRef,
+		InstallationID:     &instID,
+		HaveStageDefs:      true,
+		WorkflowDef:        wf,
+		WorkflowSpec:       fc.Content,
+		MaxRetriesSnapshot: webhook.WorkflowMaxRetries(wf),
+	})
+}
+
+// CreateRunForTriggerParams carries the already-resolved inputs
+// CreateRunForTrigger needs to mint a run + its stages. The caller is
+// responsible for all validation, installation resolution, and workflow-spec
+// parsing — handleCreateRun does this from the HTTP request; the
+// campaign-driver adapter (E25.5 / #1444) does it from the campaign's repo +
+// issue ref. Splitting validation (caller) from creation (this struct) keeps
+// the create path in one place without coupling the driver to HTTP decoding.
+type CreateRunForTriggerParams struct {
+	Repo          string
+	WorkflowID    string
+	WorkflowSHA   string
+	TriggerSource run.TriggerSource
+	TriggerRef    *string
+	// RunnerKind is empty for "use the repo-layer default"
+	// (RunnerKindGitHubActions); callers pass a validated non-default
+	// explicitly (the API handler validates; the campaign adapter passes
+	// the operator-selected kind).
+	RunnerKind string
+	// InstallationID is the best-effort resolved GitHub App installation
+	// (#713); nil when no App is attributable.
+	InstallationID *int64
+	// IssueContext caches the triggering issue's title/body/url/number on
+	// the run row (#415); nil for non-issue triggers.
+	IssueContext *run.IssueContext
+	// Drive is the per-run advancement override (#1023). Nil → use the
+	// workflow spec's drive default; non-nil wins.
+	Drive *bool
+	// IdempotencyKey makes the create idempotent against (Repo, key) when
+	// non-nil.
+	IdempotencyKey *string
+
+	// HaveStageDefs reports whether WorkflowDef carries resolved stage
+	// definitions. When true the run row caches WorkflowSpec +
+	// MaxRetriesSnapshot and one Stage row is created per WorkflowDef.Stages.
+	HaveStageDefs bool
+	// WorkflowDef is the resolved workflow definition; consulted only when
+	// HaveStageDefs.
+	WorkflowDef spec.Workflow
+	// WorkflowSpec is the validated raw spec bytes cached on the run row so
+	// the trace handler's policy re-evaluation reads from storage.
+	WorkflowSpec []byte
+	// MaxRetriesSnapshot is the workflow's on_ci_failure.max_retries cap at
+	// create time (#280).
+	MaxRetriesSnapshot int
+}
+
+// CreateRunForTrigger mints a run and its stages from already-resolved
+// inputs, then runs the post-create hooks (deploy-first park, board
+// transition). It is the single integrating seam for run creation: the HTTP
+// handler (handleCreateRun) and the campaign-driver ticker both route through
+// it so stage seeding, the deploy-first Advance, and the run_started board
+// edge are never duplicated. Returns the created run; on failure the error is
+// prefixed "create run failed" or "create stages failed" so callers can
+// surface the existing diagnostic.
+func (s *Server) CreateRunForTrigger(ctx context.Context, p CreateRunForTriggerParams) (*run.Run, error) {
+	createParams := run.CreateRunParams{
+		Repo:          p.Repo,
+		WorkflowID:    p.WorkflowID,
+		WorkflowSHA:   p.WorkflowSHA,
+		TriggerSource: p.TriggerSource,
+		TriggerRef:    p.TriggerRef,
+		// Empty RunnerKind → repo layer applies the default
+		// (RunnerKindGitHubActions).
+		RunnerKind: p.RunnerKind,
+		// Best-effort App installation (#713). Nil when no App is
+		// installed; the runner then falls back to the operator's `gh` token.
+		InstallationID: p.InstallationID,
+		IssueContext:   p.IssueContext,
+		IdempotencyKey: p.IdempotencyKey,
+	}
+	if p.HaveStageDefs {
+		// Cache the validated spec bytes on the row so the trace handler's
+		// policy re-evaluation reads constraints from storage instead of
+		// refetching (mirrors dispatcher.createRun).
+		createParams.WorkflowSpec = p.WorkflowSpec
+		createParams.MaxRetriesSnapshot = p.MaxRetriesSnapshot
+		// Drive default from the workflow spec (#1023); the per-run override
+		// below wins when present.
+		createParams.Drive = p.WorkflowDef.Drive
+	}
+	if p.Drive != nil {
+		createParams.Drive = *p.Drive
+	}
+
+	created, err := s.cfg.RunRepo.CreateRun(ctx, createParams)
+	if err != nil {
+		return nil, fmt.Errorf("create run failed: %w", err)
+	}
+
 	// Create one Stage row per stage definition in the spec.
 	// Required-checks-snapshot capture is deliberately skipped for
-	// API-created runs — the snapshot lives behind GitHub's
-	// branch-protection API and the API path doesn't carry an
-	// installation token to query it. Local-runner runs don't need
-	// the snapshot (no PR merge gate enforcement); github_actions
-	// runs minted via this path can be backfilled by the webhook
-	// trace handler if needed.
+	// non-webhook creates — the snapshot lives behind GitHub's
+	// branch-protection API and these paths don't carry a token to query
+	// it; local-runner runs don't need it (no PR merge gate enforcement).
 	var createdStages []*run.Stage
-	if haveStageDefs {
-		createdStages, err = webhook.CreateStagesFromSpec(r.Context(), s.cfg.RunRepo, created.ID, workflowDef.Stages)
+	if p.HaveStageDefs {
+		createdStages, err = webhook.CreateStagesFromSpec(ctx, s.cfg.RunRepo, created.ID, p.WorkflowDef.Stages)
 		if err != nil {
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"create stages failed", map[string]any{"error": err.Error()})
-			return
+			return nil, fmt.Errorf("create stages failed: %w", err)
 		}
 	}
 
@@ -799,36 +942,27 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	// pending → running and parks the deploy stage pending → awaiting_deploy_approval
 	// (orchestrator.go's deploy guard), making the pre-execution approval gate
 	// reachable. Gated STRICTLY on the first stage being a deploy stage so
-	// agent-first runs keep their operator-driven entry — calling Advance for a
-	// plan-first run would prematurely dispatch the plan stage. Best-effort,
-	// consistent with the boardTransitionForRun posture below: an Advance error
-	// WARN-logs and never unwinds the created-run 201 (the run row exists; a
-	// status re-poll re-reaches the operator).
+	// agent-first runs keep their operator-driven entry. Best-effort: an Advance
+	// error WARN-logs and never unwinds the created run.
 	if len(createdStages) > 0 && createdStages[0].Type == run.StageTypeDeploy && s.cfg.Orchestrator != nil {
-		if _, aerr := s.cfg.Orchestrator.Advance(r.Context(), created.ID); aerr != nil {
+		if _, aerr := s.cfg.Orchestrator.Advance(ctx, created.ID); aerr != nil {
 			s.cfg.Logger.Warn("deploy-first creation Advance failed; deploy stage left pending (re-poll will re-reach the gate)",
 				"run_id", created.ID.String(), "error", aerr.Error())
 		} else {
-			s.recordDriveDeployInitialization(r.Context(), created, createdStages[0])
+			s.recordDriveDeployInitialization(ctx, created, createdStages[0])
 		}
 	}
 
 	// Emit the run_started board transition for the just-created run
-	// (#1123). This is the local-runner / API run-creation emit point
-	// that parallels the webhook dispatcher's run_started emit
-	// (dispatcher.go) — without it a local-runner/MCP run's card never
-	// leaves Backlog, and every later board edge then SKIPS on the
-	// never-fight-the-human expected-source gate. We call
-	// boardTransitionForRun directly with the already-fetched run (it
-	// carries TriggerRef/Repo/InstallationID) rather than
-	// notifyBoardTransition, avoiding a redundant GetRun. It is
-	// best-effort: the hook no-ops silently for a non-issue TriggerRef
-	// (ad-hoc CLI runs) and for unconfigured conventions, and board
-	// failures only WARN-log — they can never unwind the create-run
-	// response.
-	s.boardTransitionForRun(r.Context(), created, lifecycleRunStarted)
+	// (#1123) — the local-runner / API / campaign-driver run-creation emit
+	// point that parallels the webhook dispatcher's run_started emit. Without
+	// it a non-webhook run's card never leaves Backlog, and every later board
+	// edge then SKIPS on the never-fight-the-human expected-source gate.
+	// Best-effort: the hook no-ops for a non-issue TriggerRef and for
+	// unconfigured conventions, and board failures only WARN-log.
+	s.boardTransitionForRun(ctx, created, lifecycleRunStarted)
 
-	s.writeJSON(w, r, http.StatusCreated, toRunResponse(created))
+	return created, nil
 }
 
 // recordDriveDeployInitialization stamps the drive engine's

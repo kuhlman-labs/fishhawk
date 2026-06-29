@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // modelPolicySpecYAML is delegationSpecYAML's shape plus a workflow-level
@@ -330,4 +332,76 @@ func TestFixupModelForRun_DefensiveBranches(t *testing.T) {
 			t.Fatalf("got %+v, want {Model:\"\" Source:\"\" PassOrdinal:2}", *got)
 		}
 	})
+}
+
+// TestCreateRunForTrigger_CreatesRunAndStages covers the run-creation core
+// extracted from handleCreateRun (E25.5 / #1444): given already-resolved
+// inputs it mints the run with the requested trigger source/ref and seeds one
+// stage row per workflow stage definition. This is the seam the campaign
+// driver reuses, so its behavior is asserted directly (not only via the HTTP
+// handler).
+func TestCreateRunForTrigger_CreatesRunAndStages(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+
+	parsed, err := spec.ParseBytes([]byte(minimalSpecYAML))
+	if err != nil {
+		t.Fatalf("parse spec: %v", err)
+	}
+	wf := parsed.Workflows["trivial"]
+
+	ref := "issue:1444"
+	created, err := s.CreateRunForTrigger(context.Background(), CreateRunForTriggerParams{
+		Repo:          "x/y",
+		WorkflowID:    "trivial",
+		WorkflowSHA:   "abc",
+		TriggerSource: run.TriggerGitHubIssue,
+		TriggerRef:    &ref,
+		HaveStageDefs: true,
+		WorkflowDef:   wf,
+		WorkflowSpec:  []byte(minimalSpecYAML),
+	})
+	if err != nil {
+		t.Fatalf("CreateRunForTrigger: %v", err)
+	}
+	if created.TriggerSource != run.TriggerGitHubIssue {
+		t.Errorf("trigger source = %q, want github_issue", created.TriggerSource)
+	}
+	if created.TriggerRef == nil || *created.TriggerRef != ref {
+		t.Errorf("trigger ref = %v, want %q", created.TriggerRef, ref)
+	}
+	if created.State != run.StatePending {
+		t.Errorf("state = %q, want pending", created.State)
+	}
+	stages := repo.stagesFor(created.ID)
+	if len(stages) != 1 || stages[0].Type != run.StageTypeImplement {
+		t.Fatalf("stages = %+v, want one implement stage", stages)
+	}
+}
+
+// TestCreateRunForTrigger_StageCreateError surfaces a "create stages failed"
+// error so the HTTP handler's existing diagnostic contract is preserved after
+// the extraction.
+func TestCreateRunForTrigger_StageCreateError(t *testing.T) {
+	repo := newFakeRepo()
+	repo.createStageErr = errors.New("disk full")
+	s := newServer(t, repo)
+
+	parsed, err := spec.ParseBytes([]byte(minimalSpecYAML))
+	if err != nil {
+		t.Fatalf("parse spec: %v", err)
+	}
+	wf := parsed.Workflows["trivial"]
+
+	_, err = s.CreateRunForTrigger(context.Background(), CreateRunForTriggerParams{
+		Repo:          "x/y",
+		WorkflowID:    "trivial",
+		WorkflowSHA:   "abc",
+		TriggerSource: run.TriggerCLI,
+		HaveStageDefs: true,
+		WorkflowDef:   wf,
+	})
+	if err == nil || !strings.Contains(err.Error(), "create stages failed") {
+		t.Fatalf("err = %v, want it to contain 'create stages failed'", err)
+	}
 }

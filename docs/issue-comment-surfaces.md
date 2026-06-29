@@ -920,6 +920,23 @@ Notes:
   observable in `get_run_status` rather than implicit in whether the operator ran
   `scripts/dev post-merge`. Listed here only so a future reader grepping the
   audit categories doesn't mistake it for a comment surface.
+- The campaign-driver audit kinds — `campaign_issue_started`,
+  `campaign_issue_settled`, and `campaign_advanced` (E25.5 / #1444, ADR-047
+  Track C) — are **system-actor audit kinds with no dedicated Notifier method
+  and are NOT issue-comment surfaces**. Nothing in `issuecomment` posts them;
+  they have no Notifier method. They ride the GLOBAL audit chain
+  (`AppendGlobalChained`), not a per-run chain, because a campaign is not a run
+  — the run linkage travels in the payload's `run_id` field. The
+  campaign-driver ticker (`campaigndriver.Ticker.Tick`) is the SOLE writer,
+  best-effort (a marshal or append failure WARN-logs and never unwinds the
+  transition it records). `campaign_issue_started` (payload `{campaign_id,
+  issue_ref, run_id}`) records starting a run for a dependency-eligible
+  campaign issue; `campaign_issue_settled` (payload `{campaign_id, issue_ref,
+  run_id, outcome}`) records settling a campaign item to its mapped terminal
+  state once its linked run reached terminal; `campaign_advanced` (payload
+  `{campaign_id, from, to}`) records the campaign state re-derivation
+  (`campaign.DeriveState`) transition. Listed here only so a future reader
+  grepping the audit categories doesn't mistake them for a comment surface.
 
 ## Routing
 
