@@ -196,6 +196,28 @@ export type PausePolicy = 'pause_campaign' | 'pause_item';
 
 export type CampaignNextActionType = 'attention' | 'resume' | 'start_run' | 'wait' | 'complete';
 
+/**
+ * The campaign-level `operator_agent` delegation override (E25.12 / #1451).
+ * When present it is the effective delegation contract for EVERY issue-run the
+ * campaign drives — it wins WHOLESALE over each run's per-workflow
+ * `operator_agent` (campaign > gate > workflow, never merged). Mirrors
+ * spec.OperatorAgent / the OpenAPI Campaign.operator_agent object: each `may_*`
+ * knob is the single condition under which the action is delegated;
+ * `must_page_human` lists the events that always page; `model_policy` is the
+ * scenario-A model-selection block, typed loosely to avoid coupling to the full
+ * ModelPolicy schema. The OpenAPI shape is additionalProperties:true, so the
+ * known knobs need not be exhaustive.
+ */
+export interface OperatorAgentOverride {
+  may_approve?: string;
+  may_route_fixup?: string;
+  may_waive?: string;
+  may_retry?: string;
+  may_merge?: string;
+  must_page_human?: string[];
+  model_policy?: Record<string, unknown>;
+}
+
 export interface Campaign {
   id: string;
   repo: string;
@@ -203,6 +225,12 @@ export interface Campaign {
   epic_ref: string;
   state: CampaignState;
   pause_policy: PausePolicy;
+  /**
+   * The campaign-level operator_agent delegation override (E25.12 / #1451).
+   * Omitted when the campaign carries no override (each issue-run inherits its
+   * per-workflow contract).
+   */
+  operator_agent?: OperatorAgentOverride;
   created_at: string;
   updated_at: string;
 }

@@ -9,33 +9,12 @@ import type {
   CampaignNextAction,
   CampaignRollup,
   CampaignStatus,
+  OperatorAgentOverride,
 } from '@/api/types';
 import { cn } from '@/lib/cn';
 
-/**
- * The campaign-level `operator_agent` delegation override (E25.12 / #1451). When
- * present it is the effective delegation contract for EVERY issue-run the
- * campaign drives — it wins WHOLESALE over each run's per-workflow
- * `operator_agent` (campaign > gate > workflow, never merged).
- *
- * Read off the campaign payload via a narrow local shape rather than the shared
- * `Campaign` type: adding the field to `@/api/types` (the canonical home) is a
- * coupled change deferred to a follow-up; the wire JSON already carries it
- * (`client.ts` returns `res.json()` verbatim) so this surfaces it without the
- * type-file edit.
- */
-interface OperatorAgentOverride {
-  may_approve?: string;
-  may_route_fixup?: string;
-  may_waive?: string;
-  may_retry?: string;
-  may_merge?: string;
-  must_page_human?: string[];
-}
-
 function operatorAgentOverrideOf(campaign: Campaign): OperatorAgentOverride | null {
-  const override = (campaign as { operator_agent?: OperatorAgentOverride | null }).operator_agent;
-  return override ?? null;
+  return campaign.operator_agent ?? null;
 }
 
 export function CampaignDetail() {

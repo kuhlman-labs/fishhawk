@@ -819,6 +819,33 @@ func TestCreateCampaign_BodyMarshalingAndOmitempty(t *testing.T) {
 	if strings.Contains(string(gotBody), "pause_policy") {
 		t.Errorf("pause_policy present when empty: %s", gotBody)
 	}
+
+	// Nil OperatorAgent → key omitted (json.RawMessage omitempty drops a
+	// nil/zero-length value).
+	if strings.Contains(string(gotBody), "operator_agent") {
+		t.Errorf("operator_agent present when nil: %s", gotBody)
+	}
+
+	// Set OperatorAgent → forwarded verbatim.
+	if _, err := c.CreateCampaign(context.Background(), CreateCampaignInput{
+		Repo: "x/y", EpicRef: "issue:1439", OperatorAgent: json.RawMessage(`{"may_approve":"always"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(gotBody), `"operator_agent":{"may_approve":"always"}`) {
+		t.Errorf("operator_agent not forwarded verbatim: %s", gotBody)
+	}
+
+	// Explicit empty object → preserved on the wire (the wholesale-override
+	// with no delegated knobs; distinct from omitted).
+	if _, err := c.CreateCampaign(context.Background(), CreateCampaignInput{
+		Repo: "x/y", EpicRef: "issue:1439", OperatorAgent: json.RawMessage("{}"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(gotBody), `"operator_agent":{}`) {
+		t.Errorf("explicit empty operator_agent not preserved: %s", gotBody)
+	}
 }
 
 func TestCreateCampaign_APIError(t *testing.T) {

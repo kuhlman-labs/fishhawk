@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -200,6 +202,147 @@ func TestCampaignStart_DefaultPausePolicyOmitted(t *testing.T) {
 	}
 	if _, present := fb.createBody["pause_policy"]; present {
 		t.Errorf("pause_policy present when not supplied: %v", fb.createBody)
+	}
+}
+
+// TestCampaignStart_OperatorAgentLiteral asserts a literal JSON
+// --operator-agent value forwards onto the wire as operator_agent with
+// its knobs intact.
+func TestCampaignStart_OperatorAgentLiteral(t *testing.T) {
+	fb, srv := newCampaignFake(t)
+	withBackend(t, srv)
+	fb.createResp = httpclient.Campaign{ID: uuid.New(), State: "pending"}
+
+	got := run([]string{
+		"campaign", "start", "--repo", "x/y", "--epic", "1439",
+		"--operator-agent", `{"may_approve":"always","must_page_human":["deploy"]}`,
+	}, io.Discard, io.Discard)
+	if got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	oa, ok := fb.createBody["operator_agent"].(map[string]any)
+	if !ok {
+		t.Fatalf("operator_agent not an object on wire: %#v", fb.createBody["operator_agent"])
+	}
+	if oa["may_approve"] != "always" {
+		t.Errorf("operator_agent.may_approve = %v, want always", oa["may_approve"])
+	}
+}
+
+// TestCampaignStart_OperatorAgentFile asserts an @file --operator-agent
+// value is read from disk and forwarded onto the wire.
+func TestCampaignStart_OperatorAgentFile(t *testing.T) {
+	fb, srv := newCampaignFake(t)
+	withBackend(t, srv)
+	fb.createResp = httpclient.Campaign{ID: uuid.New(), State: "pending"}
+
+	path := filepath.Join(t.TempDir(), "oa.json")
+	if err := os.WriteFile(path, []byte(`{"may_merge":"clean_required_checks"}`), 0o600); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+
+	got := run([]string{
+		"campaign", "start", "--repo", "x/y", "--epic", "1439",
+		"--operator-agent", "@" + path,
+	}, io.Discard, io.Discard)
+	if got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	oa, ok := fb.createBody["operator_agent"].(map[string]any)
+	if !ok {
+		t.Fatalf("operator_agent not an object on wire: %#v", fb.createBody["operator_agent"])
+	}
+	if oa["may_merge"] != "clean_required_checks" {
+		t.Errorf("operator_agent.may_merge = %v, want clean_required_checks", oa["may_merge"])
+	}
+}
+
+// TestCampaignStart_OperatorAgentEmptyObject asserts an explicit {}
+// override is present on the wire as an empty object — the
+// wholesale-override-with-no-delegated-knobs case (#1470/#1475), distinct
+// from omitting the flag.
+func TestCampaignStart_OperatorAgentEmptyObject(t *testing.T) {
+	fb, srv := newCampaignFake(t)
+	withBackend(t, srv)
+	fb.createResp = httpclient.Campaign{ID: uuid.New(), State: "pending"}
+
+	got := run([]string{
+		"campaign", "start", "--repo", "x/y", "--epic", "1439",
+		"--operator-agent", "{}",
+	}, io.Discard, io.Discard)
+	if got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	oa, ok := fb.createBody["operator_agent"]
+	if !ok {
+		t.Fatalf("operator_agent absent from wire on explicit {}: %#v", fb.createBody)
+	}
+	m, isMap := oa.(map[string]any)
+	if !isMap || len(m) != 0 {
+		t.Errorf("operator_agent = %#v, want empty object", oa)
+	}
+}
+
+// TestCampaignStart_OperatorAgentOmitted asserts an unset --operator-agent
+// omits the key from the wire body so each issue-run inherits its workflow
+// default.
+func TestCampaignStart_OperatorAgentOmitted(t *testing.T) {
+	fb, srv := newCampaignFake(t)
+	withBackend(t, srv)
+	fb.createResp = httpclient.Campaign{ID: uuid.New(), State: "pending"}
+
+	got := run([]string{
+		"campaign", "start", "--repo", "x/y", "--epic", "1439",
+	}, io.Discard, io.Discard)
+	if got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	if _, present := fb.createBody["operator_agent"]; present {
+		t.Errorf("operator_agent present when not supplied: %v", fb.createBody)
+	}
+}
+
+// TestCampaignStart_OperatorAgentMalformed asserts a malformed JSON
+// --operator-agent fails exitUsage WITHOUT reaching the backend.
+func TestCampaignStart_OperatorAgentMalformed(t *testing.T) {
+	fb, srv := newCampaignFake(t)
+	withBackend(t, srv)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"campaign", "start", "--repo", "x/y", "--epic", "1439",
+		"--operator-agent", `{"may_approve":`,
+	}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "--operator-agent: not valid JSON") {
+		t.Errorf("stderr missing diagnostic: %s", stderr.String())
+	}
+	if fb.createHit {
+		t.Errorf("backend POST reached despite malformed --operator-agent")
+	}
+}
+
+// TestCampaignStart_OperatorAgentMissingFile asserts a missing @file
+// fails exitUsage WITHOUT reaching the backend.
+func TestCampaignStart_OperatorAgentMissingFile(t *testing.T) {
+	fb, srv := newCampaignFake(t)
+	withBackend(t, srv)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"campaign", "start", "--repo", "x/y", "--epic", "1439",
+		"--operator-agent", "@" + filepath.Join(t.TempDir(), "nope.json"),
+	}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "--operator-agent") {
+		t.Errorf("stderr missing diagnostic: %s", stderr.String())
+	}
+	if fb.createHit {
+		t.Errorf("backend POST reached despite missing @file")
 	}
 }
 
