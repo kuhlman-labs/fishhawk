@@ -97,6 +97,15 @@ type EpicChildrenRequest struct {
 type EpicChildrenResult struct {
 	Children []EpicChild
 	Edges    []DependsEdge
+	// DroppedEdges are the parsed depends_on edges whose target is NOT a
+	// fellow child of the queried epic — a dangling/mis-targeted reference
+	// (a typo'd number or a real cross-epic dependency). They are kept out of
+	// Edges (the wave DAG is over the epic's own children) but surfaced here
+	// rather than silently discarded, so campaign assembly (E25.3) can fail
+	// closed on a missing dependency instead of dropping it. Like Edges, it is
+	// deterministically sorted by (From, To). Empty when every depends_on
+	// reference points at a sibling.
+	DroppedEdges []DependsEdge
 }
 
 // EpicChild is one child issue of an epic: its number and title.
