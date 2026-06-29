@@ -196,6 +196,47 @@ func (f *fakeRunReader) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error
 	return r, nil
 }
 
+// setState mutates a seeded run's state — the e2e test uses it to simulate the
+// gate action (e.g. an auto-merge) driving the run toward terminal.
+func (f *fakeRunReader) setState(id uuid.UUID, s run.State) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r, ok := f.runs[id]; ok {
+		r.State = s
+	}
+}
+
+// --- gate actor fake --------------------------------------------------------
+
+// fakeGateActor records the runs handed to the GateActor seam and returns a
+// scripted outcome (or error). drive lets a test vary the outcome per call and
+// (in the e2e) advance the linked run to simulate the gate action's effect.
+type fakeGateActor struct {
+	mu    sync.Mutex
+	calls []uuid.UUID
+	err   error
+	drive func(runRow *run.Run) (GateActionOutcome, error)
+}
+
+func (f *fakeGateActor) DriveRunGate(_ context.Context, runRow *run.Run) (GateActionOutcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, runRow.ID)
+	if f.err != nil {
+		return GateActionOutcome{}, f.err
+	}
+	if f.drive != nil {
+		return f.drive(runRow)
+	}
+	return GateActionOutcome{Note: "observe-only"}, nil
+}
+
+func (f *fakeGateActor) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
+}
+
 // --- run starter fake -------------------------------------------------------
 
 type fakeStarter struct {
@@ -636,5 +677,194 @@ func TestTick_SettleTransitionError_NoSettle(t *testing.T) {
 	}
 	if au.count() != 0 {
 		t.Fatalf("expected no audit on settle transition error, got %d", au.count())
+	}
+}
+
+// --- E25.6 GATE ACTOR -------------------------------------------------------
+
+// The ticker hands every running item whose linked run is NON-terminal to the
+// GateActor seam during the ADVANCE pass, and records a campaign_gate_acted
+// marker when the actor took an action. The run stays non-terminal this tick,
+// so the item is NOT settled — that is the next tick's observation.
+func TestTick_DrivesGateForRunningNonTerminalItem(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	reader := newFakeRunReader()
+	r := reader.put(run.StateRunning) // non-terminal: parked at a gate
+	it := store.seedItem(c, "issue:21", campaign.ItemStateRunning, nil, &r.ID)
+	au := &fakeAudit{}
+	actor := &fakeGateActor{drive: func(_ *run.Run) (GateActionOutcome, error) {
+		return GateActionOutcome{Acted: true, Action: "approve", Note: "auto-approved plan gate"}, nil
+	}}
+	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
+	tk.GateActor = actor
+
+	tk.Tick(context.Background())
+
+	if len(actor.calls) != 1 || actor.calls[0] != r.ID {
+		t.Fatalf("actor calls = %v, want one call for run %s", actor.calls, r.ID)
+	}
+	if it.State != campaign.ItemStateRunning {
+		t.Fatalf("item state = %s, want running (run still non-terminal, not settled)", it.State)
+	}
+	acted := au.byCategory(categoryCampaignGateActed)
+	if len(acted) != 1 {
+		t.Fatalf("campaign_gate_acted entries = %d, want 1", len(acted))
+	}
+	if acted[0].payload["action"] != "approve" ||
+		acted[0].payload["run_id"] != r.ID.String() ||
+		acted[0].payload["issue_ref"] != "issue:21" {
+		t.Fatalf("campaign_gate_acted payload = %+v", acted[0].payload)
+	}
+}
+
+// Auto-drive DISABLED (nil GateActor): the running non-terminal item is left
+// parked — no actor call, no marker, no transition. The fail-closed
+// observe-only contract.
+func TestTick_AutoDriveDisabled_SkipsGate(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	reader := newFakeRunReader()
+	r := reader.put(run.StateRunning)
+	it := store.seedItem(c, "issue:22", campaign.ItemStateRunning, nil, &r.ID)
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4) // GateActor nil
+
+	tk.Tick(context.Background()) // must not panic
+
+	if it.State != campaign.ItemStateRunning {
+		t.Fatalf("item state = %s, want running (parked, observe-only)", it.State)
+	}
+	if got := len(au.byCategory(categoryCampaignGateActed)); got != 0 {
+		t.Fatalf("campaign_gate_acted entries = %d, want 0 with auto-drive disabled", got)
+	}
+	if au.count() != 0 {
+		t.Fatalf("expected no audit entries observe-only, got %d", au.count())
+	}
+}
+
+// A GateActor that PAGES (refused a must_page_human condition) makes the driver
+// record NO campaign_gate_acted — the actor already emitted campaign_gate_paged
+// on the run chain — and the item stays parked (not settled).
+func TestTick_GateActorPages_NoActNoSettle(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	reader := newFakeRunReader()
+	r := reader.put(run.StateRunning)
+	it := store.seedItem(c, "issue:23", campaign.ItemStateRunning, nil, &r.ID)
+	au := &fakeAudit{}
+	actor := &fakeGateActor{drive: func(_ *run.Run) (GateActionOutcome, error) {
+		return GateActionOutcome{Paged: true, PageEvent: "reviewer_reject", Note: "must_page_human: reviewer_reject"}, nil
+	}}
+	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
+	tk.GateActor = actor
+
+	tk.Tick(context.Background())
+
+	if it.State != campaign.ItemStateRunning {
+		t.Fatalf("item state = %s, want running (paged, not settled)", it.State)
+	}
+	if got := len(au.byCategory(categoryCampaignGateActed)); got != 0 {
+		t.Fatalf("campaign_gate_acted entries = %d, want 0 on a page", got)
+	}
+}
+
+// A GateActor error is a logged continue — no marker, the item stays parked and
+// retries next tick (mirrors the per-item transient-error posture).
+func TestTick_GateActorError_LeavesParked(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	reader := newFakeRunReader()
+	r := reader.put(run.StateRunning)
+	it := store.seedItem(c, "issue:24", campaign.ItemStateRunning, nil, &r.ID)
+	au := &fakeAudit{}
+	actor := &fakeGateActor{err: errors.New("dispatch boom")}
+	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
+	tk.GateActor = actor
+
+	tk.Tick(context.Background()) // must not panic
+
+	if it.State != campaign.ItemStateRunning {
+		t.Fatalf("item state = %s, want running (parked on actor error)", it.State)
+	}
+	if au.count() != 0 {
+		t.Fatalf("expected no audit on actor error, got %d", au.count())
+	}
+	if actor.callCount() != 1 {
+		t.Fatalf("actor calls = %d, want 1", actor.callCount())
+	}
+}
+
+// END-TO-END (driver -> gate actor -> marker -> terminal settle): a clean run is
+// auto-approved at its plan gate (tick 1), auto-merged at its review gate (tick
+// 2, which drives the run terminal), then settled with the campaign advanced to
+// succeeded (tick 3). An injected reviewer_reject on a SECOND campaign item does
+// NOT auto-act and leaves that item parked — the actor's campaign_gate_paged
+// hand-off is on the run chain, so the driver records no campaign_gate_acted for
+// it. Together this exercises the full advance->drive->record->settle path the
+// driver owns; the actor's real delegation->action crossing is covered in
+// server/autodrive_test.go and the serve wiring in serve_test.go.
+func TestTick_EndToEnd_AutoActsThenSettles_AndPagesReject(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	reader := newFakeRunReader()
+
+	cleanRun := reader.put(run.StateRunning)  // auto-driven to terminal
+	rejectRun := reader.put(run.StateRunning) // pages, stays parked
+	clean := store.seedItem(c, "issue:30", campaign.ItemStateRunning, nil, &cleanRun.ID)
+	reject := store.seedItem(c, "issue:31", campaign.ItemStateRunning, nil, &rejectRun.ID)
+	au := &fakeAudit{}
+
+	cleanCalls := 0
+	actor := &fakeGateActor{drive: func(rr *run.Run) (GateActionOutcome, error) {
+		if rr.ID == rejectRun.ID {
+			// reviewer_reject must_page_human: refuse, no action.
+			return GateActionOutcome{Paged: true, PageEvent: "reviewer_reject"}, nil
+		}
+		cleanCalls++
+		switch cleanCalls {
+		case 1:
+			return GateActionOutcome{Acted: true, Action: "approve"}, nil
+		case 2:
+			// auto-merge drives the run terminal; settled next tick.
+			reader.setState(rr.ID, run.StateSucceeded)
+			return GateActionOutcome{Acted: true, Action: "merge"}, nil
+		default:
+			return GateActionOutcome{Note: "observe-only"}, nil
+		}
+	}}
+	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
+	tk.GateActor = actor
+
+	tk.Tick(context.Background()) // tick 1: approve clean; page reject
+	tk.Tick(context.Background()) // tick 2: merge clean (-> terminal); page reject
+	tk.Tick(context.Background()) // tick 3: settle clean
+
+	// The clean run was auto-acted twice (approve, then merge).
+	acted := au.byCategory(categoryCampaignGateActed)
+	if len(acted) != 2 {
+		t.Fatalf("campaign_gate_acted entries = %d, want 2 (approve, merge)", len(acted))
+	}
+	if acted[0].payload["action"] != "approve" || acted[1].payload["action"] != "merge" {
+		t.Fatalf("acted actions = [%v, %v], want [approve, merge]", acted[0].payload["action"], acted[1].payload["action"])
+	}
+	for _, a := range acted {
+		if a.payload["run_id"] != cleanRun.ID.String() {
+			t.Fatalf("campaign_gate_acted run_id = %v, want clean run %s", a.payload["run_id"], cleanRun.ID)
+		}
+	}
+
+	// The clean item settled succeeded once the auto-merge drove the run terminal.
+	if clean.State != campaign.ItemStateSucceeded {
+		t.Fatalf("clean item state = %s, want succeeded", clean.State)
+	}
+	if settled := au.byCategory(categoryCampaignIssueSettled); len(settled) != 1 ||
+		settled[0].payload["run_id"] != cleanRun.ID.String() {
+		t.Fatalf("settled entries = %+v, want one for the clean run", settled)
+	}
+
+	// The reject item never auto-acted and stays parked (no settle, no marker).
+	if reject.State != campaign.ItemStateRunning {
+		t.Fatalf("reject item state = %s, want running (paged, parked)", reject.State)
 	}
 }

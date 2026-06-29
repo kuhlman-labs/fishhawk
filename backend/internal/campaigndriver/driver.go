@@ -25,12 +25,23 @@
 // dependent starts in the SAME tick rather than waiting a full interval — the
 // "a predecessor merging unblocks dependents" contract.
 //
-// This child implements ONLY mechanical advancement: acting on each run's
-// gates is E25.6 and pause/page is E25.7, so until those land the started runs
-// park at their plan/review gates for the operator-agent. The driver consumes
-// existing surfaces through narrow interfaces so it is independently
-// unit-testable with the campaign.fake and recording fakes, plus a
-// Postgres-backed end-to-end test over a 2-issue depends_on campaign.
+// On top of mechanical advancement, the driver AUTO-ACTS on each running
+// run's gate under the operator_agent contract (E25.6 / ADR-047 Track C):
+// during the ADVANCE pass, every running item whose linked run is NON-terminal
+// is handed to the optional GateActor seam BEFORE terminal observation. The
+// actor (server.Server.AutoDriveRunGate, bound in serve.go) re-evaluates the
+// run's delegation in-process and, for a delegated knob whose condition is met
+// AND whose real gate state matches, takes the gate action (approve/fixup/
+// retry/merge) under the campaign operator identity, recording the run-level
+// audit itself; the driver records a campaign-level campaign_gate_acted marker.
+// The GateActor is OPTIONAL: a nil seam (auto-drive disabled / merge client
+// unconfigured) leaves the run parked for the human operator-agent — the
+// driver then advances campaigns mechanically and observes only. pause/page is
+// E25.7; this child's actor only EMITS the campaign_gate_paged hand-off (on the
+// run chain, written by the actor) and takes no action on a must_page_human
+// gate. The driver consumes existing surfaces through narrow interfaces so it
+// is independently unit-testable with the campaign.fake and recording fakes,
+// plus a Postgres-backed end-to-end test over a 2-issue depends_on campaign.
 //
 // Per-item and per-campaign errors WARN-log and never abort the tick; a
 // transient error leaves the work for the next tick. Mirrors the
@@ -72,6 +83,13 @@ const (
 	categoryCampaignIssueStarted = "campaign_issue_started"
 	categoryCampaignIssueSettled = "campaign_issue_settled"
 	categoryCampaignAdvanced     = "campaign_advanced"
+	// categoryCampaignGateActed is the campaign-level marker the driver
+	// records on the GLOBAL chain when the GateActor took a delegated gate
+	// action on a running run (E25.6 / ADR-047). The run-level audit of the
+	// action itself (approval_submitted / stage_fixup_triggered / stage_retried
+	// / pr_merged, stamped ActorAgent operator-agent/campaign) is written by the
+	// actor on the run chain; this marker ties that action back to the campaign.
+	categoryCampaignGateActed = "campaign_gate_acted"
 )
 
 // CampaignStore is the slice of campaign.Repository the driver uses: list the
@@ -109,6 +127,38 @@ type AuditAppender interface {
 	AppendGlobalChained(ctx context.Context, p audit.GlobalChainAppendParams) (*audit.Entry, error)
 }
 
+// GateActionOutcome reports what the GateActor did at a run gate so the
+// driver can record the campaign-level marker. It mirrors the fields of
+// server.AutoDriveOutcome the driver needs; the serve.go adapter translates.
+// On an observe-only outcome both Acted and Paged are false.
+type GateActionOutcome struct {
+	// Acted is true when the actor dispatched a delegated gate action;
+	// Action then names the delegation verb taken (approve/route_fixup/
+	// retry/merge). The driver records a campaign_gate_acted marker.
+	Acted  bool
+	Action string
+	// Paged is true when the actor REFUSED a must_page_human condition and
+	// emitted the campaign_gate_paged hand-off (on the run chain) itself;
+	// PageEvent names the event. No gate action was taken and the driver
+	// records nothing extra (the run-level page entry is the hand-off).
+	Paged     bool
+	PageEvent string
+	// Note is a short human-readable summary for the driver log. Always set.
+	Note string
+}
+
+// GateActor auto-acts on a single running run's gate under the operator_agent
+// contract (E25.6 / ADR-047). The single seam between the campaign driver and
+// the gate-action machinery: the serve.go adapter satisfies it over
+// server.Server.AutoDriveRunGate (binding the campaign operator identity + the
+// GitHub merge client), while unit tests substitute a recording fake. Defined
+// HERE so the driver never imports server (avoiding an import cycle) and stays
+// decoupled from how a gate action is taken. OPTIONAL on the Ticker: a nil
+// GateActor disables auto-driving (the driver observes only).
+type GateActor interface {
+	DriveRunGate(ctx context.Context, runRow *run.Run) (GateActionOutcome, error)
+}
+
 // Ticker mechanically advances running campaigns. Run() blocks until ctx is
 // cancelled. All of Campaigns, Runs, Starter, and Audit are required; a nil
 // one is a configuration error caught by Run() and is a logged no-op in Tick()
@@ -119,6 +169,13 @@ type Ticker struct {
 	Runs      RunReader
 	Starter   RunStarter
 	Audit     AuditAppender
+
+	// GateActor auto-acts on each running run's gate under the operator_agent
+	// contract (E25.6 / ADR-047). OPTIONAL: a nil actor disables auto-driving
+	// and the ticker advances campaigns mechanically and observes only. Not
+	// among the required dependencies Run()/Tick() guard on — the driver is
+	// fully functional (mechanical advancement) without it.
+	GateActor GateActor
 
 	// Logger receives structured warnings about transient errors. nil →
 	// slog.Default().
@@ -249,6 +306,13 @@ func (t *Ticker) advance(ctx context.Context, logger *slog.Logger, c *campaign.C
 			continue
 		}
 		if !runRow.State.IsTerminal() {
+			// E25.6: auto-act on the run's gate under the operator_agent
+			// contract before terminal observation. A non-terminal run parked
+			// at a gate is the actor's opportunity to approve/fixup/retry/merge;
+			// any action it takes moves the run toward terminal, observed and
+			// settled on a subsequent tick (the 60s-latency posture). Disabled
+			// (nil actor) leaves the run parked for the human operator-agent.
+			t.driveGate(ctx, logger, c, it, runRow)
 			continue
 		}
 		target, ok := mapRunTerminalToItem(runRow.State)
@@ -282,6 +346,38 @@ func (t *Ticker) advance(ctx context.Context, logger *slog.Logger, c *campaign.C
 		})
 	}
 	return settledAny
+}
+
+// driveGate hands one running item's non-terminal run to the GateActor so it
+// can auto-act on the run's gate under the operator_agent contract (E25.6 /
+// ADR-047). A nil actor is observe-only — the run stays parked for the human
+// operator-agent. On an action (out.Acted) the driver records the
+// campaign-level campaign_gate_acted marker (the run-level audit of the action
+// is the actor's responsibility); a refusal (out.Paged) is the actor's
+// campaign_gate_paged hand-off on the run chain and the driver adds nothing.
+// Best-effort: an actor error WARN-logs and leaves the gate for the next tick,
+// never aborting the campaign (mirrors the per-item error posture).
+func (t *Ticker) driveGate(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, it *campaign.Item, runRow *run.Run) {
+	if t.GateActor == nil {
+		return
+	}
+	out, err := t.GateActor.DriveRunGate(ctx, runRow)
+	if err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: auto-drive run gate failed; left for next tick",
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("item_id", it.ID.String()),
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	if out.Acted {
+		t.emit(ctx, logger, categoryCampaignGateActed, map[string]any{
+			"campaign_id": c.ID.String(),
+			"issue_ref":   it.IssueRef,
+			"run_id":      runRow.ID.String(),
+			"action":      out.Action,
+		})
+	}
 }
 
 // deriveAndTransition re-derives the campaign state from its items and, when
