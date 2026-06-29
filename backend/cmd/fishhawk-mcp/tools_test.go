@@ -318,6 +318,36 @@ type fakeBackend struct {
 	integrateWaveResp     map[uuid.UUID]IntegrateWaveResult
 	integrateWaveStatus   int
 	integrateWaveCalledBy map[uuid.UUID]int
+
+	// E25.8 fixtures: the campaign endpoints (#1447).
+	// createCampaignBody captures the last decoded POST /v0/campaigns body so
+	// tests can assert repo/epic_ref/pause_policy round-trip. createCampaignResp
+	// drives the response (the fake fills ID/Repo/EpicRef/State/PausePolicy from
+	// the body when unset). createCampaignStatus drives the HTTP status (default
+	// 201). createCampaignErr, when set, is written verbatim for 4xx/5xx tests.
+	createCampaignBody   campaignCreateRequest
+	createCampaignResp   Campaign
+	createCampaignStatus int
+	createCampaignErr    string
+
+	// getCampaignStatusID captures the last GET /v0/campaigns/{id}/status path
+	// id so status tests can assert the path round-trip. campaignStatusByID
+	// seeds the per-id response; an unkeyed id returns a minimal running-campaign
+	// payload. campaignStatusStatus drives the HTTP status (default 200);
+	// campaignStatusErr, when set, is written verbatim for 4xx/5xx tests.
+	getCampaignStatusID  uuid.UUID
+	campaignStatusByID   map[uuid.UUID]CampaignStatus
+	campaignStatusStatus int
+	campaignStatusErr    string
+
+	// resumeCampaignID captures the last POST /v0/campaigns/{id}/resume path id.
+	// resumeCampaignResp seeds the resumed campaign (the fake fills
+	// ID/State=running when unset). resumeCampaignStatus drives the HTTP status
+	// (default 200); resumeCampaignErr, when set, is written verbatim.
+	resumeCampaignID     uuid.UUID
+	resumeCampaignResp   Campaign
+	resumeCampaignStatus int
+	resumeCampaignErr    string
 }
 
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
@@ -388,6 +418,10 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		integrateWaveResp:             map[uuid.UUID]IntegrateWaveResult{},
 		integrateWaveStatus:           http.StatusOK,
 		integrateWaveCalledBy:         map[uuid.UUID]int{},
+		createCampaignStatus:          http.StatusCreated,
+		campaignStatusByID:            map[uuid.UUID]CampaignStatus{},
+		campaignStatusStatus:          http.StatusOK,
+		resumeCampaignStatus:          http.StatusOK,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v0/stages/{stage_id}/approvals", func(w http.ResponseWriter, r *http.Request) {
@@ -767,6 +801,100 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		if resp.State == "" {
 			resp.State = "pending"
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("POST /v0/campaigns", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var body campaignCreateRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fb.mu.Lock()
+		fb.createCampaignBody = body
+		status := fb.createCampaignStatus
+		errBody := fb.createCampaignErr
+		resp := fb.createCampaignResp
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if resp.ID == "" {
+			resp.ID = uuid.NewString()
+		}
+		if resp.Repo == "" {
+			resp.Repo = body.Repo
+		}
+		if resp.EpicRef == "" {
+			resp.EpicRef = body.EpicRef
+		}
+		if resp.State == "" {
+			resp.State = "pending"
+		}
+		if resp.PausePolicy == "" {
+			if body.PausePolicy != "" {
+				resp.PausePolicy = body.PausePolicy
+			} else {
+				resp.PausePolicy = "pause_campaign"
+			}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("GET /v0/campaigns/{campaign_id}/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("campaign_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		fb.getCampaignStatusID = id
+		status := fb.campaignStatusStatus
+		errBody := fb.campaignStatusErr
+		resp, ok := fb.campaignStatusByID[id]
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if !ok {
+			// Default: a running campaign with one item waiting.
+			resp = CampaignStatus{
+				Campaign:   Campaign{ID: id.String(), Repo: "x/y", EpicRef: "#10", State: "running", PausePolicy: "pause_campaign"},
+				Items:      []CampaignItem{},
+				Rollup:     CampaignRollup{Eligible: []string{}, Blocked: []string{}, Running: []string{"#11"}, Done: []string{}, Failed: []string{}, Cancelled: []string{}, Paused: []string{}},
+				NextAction: CampaignNextAction{Action: "wait", Detail: "items are running or blocked on a dependency"},
+			}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("POST /v0/campaigns/{campaign_id}/resume", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("campaign_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		fb.resumeCampaignID = id
+		status := fb.resumeCampaignStatus
+		errBody := fb.resumeCampaignErr
+		resp := fb.resumeCampaignResp
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if resp.ID == "" {
+			resp.ID = id.String()
+		}
+		if resp.State == "" {
+			resp.State = "running"
+		}
+		if resp.PausePolicy == "" {
+			resp.PausePolicy = "pause_campaign"
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -1318,7 +1446,7 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	const minDescriptionLen = 80
 	// The registered tool set is the fishhawk_* tools swept in #778. Bump
 	// this and give the new tool a conformant description when adding one.
-	const wantToolCount = 33
+	const wantToolCount = 36
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

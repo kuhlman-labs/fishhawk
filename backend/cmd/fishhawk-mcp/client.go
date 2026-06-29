@@ -1129,6 +1129,150 @@ func (c *apiClient) RecoverRun(ctx context.Context, p RecoverRunParams) (*Run, b
 	return &run, status == http.StatusOK, nil
 }
 
+// Campaign mirrors the backend's `Campaign` wire schema
+// (`backend/internal/server/campaigns.go::campaignResponse`): the campaign
+// row POST /v0/campaigns and GET /v0/campaigns/{id}/status return. As with
+// the Run struct above, IDs are typed `string` (not uuid.UUID) so the MCP
+// SDK's reflection-built schema sees a string rather than a 16-byte array
+// (which would surface as type:array and fail the SDK's response validation);
+// tool handlers parse with uuid.Parse locally.
+type Campaign struct {
+	ID      string `json:"id"`
+	Repo    string `json:"repo"`
+	EpicRef string `json:"epic_ref"`
+	State   string `json:"state"`
+	// PausePolicy is the operator-chosen pause behavior on a gate hand-off
+	// (E25.7): pause_campaign (block the whole campaign, the default) or
+	// pause_item (continue-others). Always normalized on a persisted campaign.
+	PausePolicy string    `json:"pause_policy"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// CampaignPauseReason mirrors the backend's campaign.PauseReason: why a paused
+// item was handed off to a human (the page event + run/stage/gate). The
+// run_id/stage_id are typed `string` here (the backend carries *uuid.UUID, which
+// JSON-marshals to a string) for the same MCP-SDK reflection reason Campaign
+// documents.
+type CampaignPauseReason struct {
+	PageEvent string `json:"page_event,omitempty"`
+	RunID     string `json:"run_id,omitempty"`
+	StageID   string `json:"stage_id,omitempty"`
+	Gate      string `json:"gate,omitempty"`
+}
+
+// CampaignItem mirrors the backend's `CampaignItem` wire schema
+// (`campaignItemResponse`): one node in the campaign DAG. RunID is omitempty —
+// an unlinked (pre-dispatch) item carries no run_id.
+type CampaignItem struct {
+	ID          string               `json:"id"`
+	IssueRef    string               `json:"issue_ref"`
+	DependsOn   []string             `json:"depends_on"`
+	RunID       string               `json:"run_id,omitempty"`
+	State       string               `json:"state"`
+	PauseReason *CampaignPauseReason `json:"pause_reason,omitempty"`
+	CreatedAt   time.Time            `json:"created_at"`
+	UpdatedAt   time.Time            `json:"updated_at"`
+}
+
+// CampaignRollup mirrors the backend's `CampaignRollup` wire schema
+// (`campaignRollupPayload`): the engine's readiness partition over a campaign's
+// items. Every slice holds issue refs and an item appears in exactly one slice.
+type CampaignRollup struct {
+	Eligible  []string `json:"eligible"`
+	Blocked   []string `json:"blocked"`
+	Running   []string `json:"running"`
+	Done      []string `json:"done"`
+	Failed    []string `json:"failed"`
+	Cancelled []string `json:"cancelled"`
+	Paused    []string `json:"paused"`
+}
+
+// CampaignNextAction mirrors the backend's `campaignNextActionPayload`: the
+// single server-computed next step for the operator-agent, distilled from the
+// rollup partition. Action is drawn from the closed set
+// attention|resume|start_run|wait|complete (computeCampaignNextAction).
+type CampaignNextAction struct {
+	Action   string `json:"action"`
+	IssueRef string `json:"issue_ref,omitempty"`
+	Detail   string `json:"detail,omitempty"`
+}
+
+// CampaignStatus mirrors the GET /v0/campaigns/{id}/status response body: the
+// campaign + its items + the engine's readiness rollup + the distilled
+// next_action. This is the surface the operator-agent polls to drive a campaign.
+type CampaignStatus struct {
+	Campaign   Campaign           `json:"campaign"`
+	Items      []CampaignItem     `json:"items"`
+	Rollup     CampaignRollup     `json:"rollup"`
+	NextAction CampaignNextAction `json:"next_action"`
+}
+
+// campaignCreateRequest mirrors the backend's POST /v0/campaigns body
+// (`backend/internal/server/campaigns.go::createCampaignRequest`). Repeated
+// here for the same thin-local-copy reason as createRunRequest.
+type campaignCreateRequest struct {
+	Repo        string `json:"repo"`
+	EpicRef     string `json:"epic_ref"`
+	PausePolicy string `json:"pause_policy,omitempty"`
+}
+
+// CreateCampaign assembles a campaign from an epic ref via
+// `POST /v0/campaigns` (E25.4) and returns the created campaign (201 fresh).
+// pausePolicy is optional — empty normalizes to pause_campaign server-side.
+// A write tool: requires an operator token with write:campaigns scope. 4xx/5xx
+// surfaces as *apiError; the tool layer reads the code:
+//   - 400 validation_failed (repo not owner/name, empty epic_ref, bad
+//     pause_policy, or a dependency cycle)
+//   - 403 insufficient_scope (token lacks write:campaigns)
+//   - 422 repo_not_installed (the GitHub App is not on the target repo)
+//   - 422 campaign_dangling_dependency (a depends_on target is not a fellow child)
+//   - 503 campaign_repo_unconfigured (no campaign repository wired on the deploy)
+func (c *apiClient) CreateCampaign(ctx context.Context, repo, epicRef, pausePolicy string) (*Campaign, error) {
+	body, err := json.Marshal(campaignCreateRequest{Repo: repo, EpicRef: epicRef, PausePolicy: pausePolicy})
+	if err != nil {
+		return nil, fmt.Errorf("marshal create campaign: %w", err)
+	}
+	var camp Campaign
+	if _, err := c.doWithStatus(ctx, http.MethodPost, "/v0/campaigns", body, nil, &camp); err != nil {
+		return nil, err
+	}
+	return &camp, nil
+}
+
+// GetCampaignStatus reads the campaign rollup + distilled next_action via
+// `GET /v0/campaigns/{id}/status` (E25.4) — the surface the operator-agent
+// polls to drive a campaign. Read-only. 4xx/5xx surfaces:
+//   - 400 validation_failed (campaign_id not a UUID)
+//   - 404 campaign_not_found
+//   - 503 campaign_repo_unconfigured
+func (c *apiClient) GetCampaignStatus(ctx context.Context, id uuid.UUID) (*CampaignStatus, error) {
+	var st CampaignStatus
+	if err := c.do(ctx, http.MethodGet, "/v0/campaigns/"+id.String()+"/status", nil, &st); err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+// ResumeCampaign hands a paused campaign back to the auto-driver via
+// `POST /v0/campaigns/{id}/resume` (E25.7) — the operator's hand-back after the
+// driver paged a human at a run gate. It flips a paused campaign (and every
+// paused item) back to running. A write tool: requires write:campaigns. 4xx/5xx
+// surfaces:
+//   - 400 validation_failed (campaign_id not a UUID)
+//   - 403 insufficient_scope (token lacks write:campaigns)
+//   - 404 campaign_not_found
+//   - 409 campaign_not_paused (nothing is paused on either axis — no item and
+//     not the campaign — so there is nothing to resume)
+//   - 503 campaign_repo_unconfigured
+func (c *apiClient) ResumeCampaign(ctx context.Context, id uuid.UUID) (*Campaign, error) {
+	var camp Campaign
+	if err := c.do(ctx, http.MethodPost, "/v0/campaigns/"+id.String()+"/resume", nil, &camp); err != nil {
+		return nil, err
+	}
+	return &camp, nil
+}
+
 // FileWorkItemRequest mirrors the backend's POST /v0/work-items body
 // (`backend/internal/server/workitems.go::workItemRequest`). The
 // conventions layer turns this provider-neutral filing into a created
