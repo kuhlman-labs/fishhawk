@@ -44,6 +44,9 @@ func (r *postgresRepo) CreateCampaign(ctx context.Context, p CreateCampaignParam
 		// OperatorAgent is the OPTIONAL campaign-level delegation override
 		// (E25.12), stored opaquely. Nil persists as NULL — no override.
 		OperatorAgent: p.OperatorAgent,
+		// IdempotencyKey is the OPTIONAL create idempotency key (E25.13). Nil
+		// persists as NULL — no key; the partial unique index excludes NULLs.
+		IdempotencyKey: p.IdempotencyKey,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create campaign: %w", err)
@@ -59,6 +62,21 @@ func (r *postgresRepo) GetCampaign(ctx context.Context, id uuid.UUID) (*Campaign
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get campaign: %w", err)
+	}
+	return rowToCampaign(row), nil
+}
+
+func (r *postgresRepo) GetCampaignByIdempotencyKey(ctx context.Context, repo, key string) (*Campaign, error) {
+	q := campaigndb.New(r.pool)
+	row, err := q.GetCampaignByIdempotencyKey(ctx, campaigndb.GetCampaignByIdempotencyKeyParams{
+		Repo:           repo,
+		IdempotencyKey: &key,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get campaign by idempotency_key: %w", err)
 	}
 	return rowToCampaign(row), nil
 }
@@ -303,6 +321,9 @@ func rowToCampaign(c campaigndb.Campaign) *Campaign {
 	if len(c.OperatorAgent) > 0 {
 		out.OperatorAgent = c.OperatorAgent
 	}
+	// Nullable idempotency_key: a *string passthrough. NULL yields nil (no
+	// key) — the unchanged-behavior default.
+	out.IdempotencyKey = c.IdempotencyKey
 	return out
 }
 

@@ -13,18 +13,19 @@ import (
 
 const createCampaign = `-- name: CreateCampaign :one
 
-INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent)
-VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent
+INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key
 `
 
 type CreateCampaignParams struct {
-	ID            uuid.UUID `json:"id"`
-	Repo          string    `json:"repo"`
-	EpicRef       string    `json:"epic_ref"`
-	State         string    `json:"state"`
-	PausePolicy   string    `json:"pause_policy"`
-	OperatorAgent []byte    `json:"operator_agent"`
+	ID             uuid.UUID `json:"id"`
+	Repo           string    `json:"repo"`
+	EpicRef        string    `json:"epic_ref"`
+	State          string    `json:"state"`
+	PausePolicy    string    `json:"pause_policy"`
+	OperatorAgent  []byte    `json:"operator_agent"`
+	IdempotencyKey *string   `json:"idempotency_key"`
 }
 
 // Campaign / campaign-item queries consumed by the postgres adapter for the
@@ -39,6 +40,7 @@ func (q *Queries) CreateCampaign(ctx context.Context, arg CreateCampaignParams) 
 		arg.State,
 		arg.PausePolicy,
 		arg.OperatorAgent,
+		arg.IdempotencyKey,
 	)
 	var i Campaign
 	err := row.Scan(
@@ -50,6 +52,7 @@ func (q *Queries) CreateCampaign(ctx context.Context, arg CreateCampaignParams) 
 		&i.UpdatedAt,
 		&i.PausePolicy,
 		&i.OperatorAgent,
+		&i.IdempotencyKey,
 	)
 	return i, err
 }
@@ -92,7 +95,7 @@ func (q *Queries) CreateCampaignItem(ctx context.Context, arg CreateCampaignItem
 }
 
 const getCampaign = `-- name: GetCampaign :one
-SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent FROM campaigns WHERE id = $1
+SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key FROM campaigns WHERE id = $1
 `
 
 func (q *Queries) GetCampaign(ctx context.Context, id uuid.UUID) (Campaign, error) {
@@ -107,6 +110,39 @@ func (q *Queries) GetCampaign(ctx context.Context, id uuid.UUID) (Campaign, erro
 		&i.UpdatedAt,
 		&i.PausePolicy,
 		&i.OperatorAgent,
+		&i.IdempotencyKey,
+	)
+	return i, err
+}
+
+const getCampaignByIdempotencyKey = `-- name: GetCampaignByIdempotencyKey :one
+SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key FROM campaigns
+ WHERE repo = $1
+   AND idempotency_key = $2
+`
+
+type GetCampaignByIdempotencyKeyParams struct {
+	Repo           string  `json:"repo"`
+	IdempotencyKey *string `json:"idempotency_key"`
+}
+
+// Used by POST /v0/campaigns to resolve an Idempotency-Key header to a
+// previously-created campaign. Active scope is (repo, idempotency_key);
+// the partial unique index covers this lookup with no full scan. Mirrors
+// internal/run/queries.sql GetRunByIdempotencyKey.
+func (q *Queries) GetCampaignByIdempotencyKey(ctx context.Context, arg GetCampaignByIdempotencyKeyParams) (Campaign, error) {
+	row := q.db.QueryRow(ctx, getCampaignByIdempotencyKey, arg.Repo, arg.IdempotencyKey)
+	var i Campaign
+	err := row.Scan(
+		&i.ID,
+		&i.Repo,
+		&i.EpicRef,
+		&i.State,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.PausePolicy,
+		&i.OperatorAgent,
+		&i.IdempotencyKey,
 	)
 	return i, err
 }
@@ -210,7 +246,7 @@ func (q *Queries) ListCampaignItemsForRun(ctx context.Context, runID *uuid.UUID)
 }
 
 const listCampaigns = `-- name: ListCampaigns :many
-SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent FROM campaigns
+SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key FROM campaigns
  WHERE ($1::text = '' OR repo = $1)
    AND ($2::text = '' OR state = $2)
  ORDER BY created_at DESC, id DESC
@@ -250,6 +286,7 @@ func (q *Queries) ListCampaigns(ctx context.Context, arg ListCampaignsParams) ([
 			&i.UpdatedAt,
 			&i.PausePolicy,
 			&i.OperatorAgent,
+			&i.IdempotencyKey,
 		); err != nil {
 			return nil, err
 		}
@@ -262,7 +299,7 @@ func (q *Queries) ListCampaigns(ctx context.Context, arg ListCampaignsParams) ([
 }
 
 const lockCampaignForUpdate = `-- name: LockCampaignForUpdate :one
-SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent FROM campaigns WHERE id = $1 FOR UPDATE
+SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key FROM campaigns WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockCampaignForUpdate(ctx context.Context, id uuid.UUID) (Campaign, error) {
@@ -277,6 +314,7 @@ func (q *Queries) LockCampaignForUpdate(ctx context.Context, id uuid.UUID) (Camp
 		&i.UpdatedAt,
 		&i.PausePolicy,
 		&i.OperatorAgent,
+		&i.IdempotencyKey,
 	)
 	return i, err
 }
@@ -399,7 +437,7 @@ const updateCampaignState = `-- name: UpdateCampaignState :one
 UPDATE campaigns
    SET state = $2
  WHERE id = $1
-RETURNING id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent
+RETURNING id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key
 `
 
 type UpdateCampaignStateParams struct {
@@ -419,6 +457,7 @@ func (q *Queries) UpdateCampaignState(ctx context.Context, arg UpdateCampaignSta
 		&i.UpdatedAt,
 		&i.PausePolicy,
 		&i.OperatorAgent,
+		&i.IdempotencyKey,
 	)
 	return i, err
 }

@@ -242,6 +242,33 @@ func TestPersist_ThreadsOperatorAgent(t *testing.T) {
 	}
 }
 
+// TestPersist_ThreadsIdempotencyKey asserts the optional create idempotency key
+// (E25.13 / #1455) is threaded straight through Persist onto the
+// CreateCampaignParams. A nil key stays nil (the unchanged-behavior path); a
+// non-nil key passes through by value.
+func TestPersist_ThreadsIdempotencyKey(t *testing.T) {
+	// Nil key → nil params.
+	fNil := &capturingFake{}
+	if _, err := campaign.Persist(context.Background(), fNil, "kuhlman-labs/fishhawk",
+		&campaign.Assembly{EpicRef: "issue:1455"}); err != nil {
+		t.Fatalf("Persist (nil key): %v", err)
+	}
+	if fNil.got.IdempotencyKey != nil {
+		t.Errorf("nil key persisted as %v, want nil", fNil.got.IdempotencyKey)
+	}
+
+	// Non-nil key passes through by value.
+	key := "campaign-key-1"
+	f := &capturingFake{}
+	if _, err := campaign.Persist(context.Background(), f, "kuhlman-labs/fishhawk",
+		&campaign.Assembly{EpicRef: "issue:1455", IdempotencyKey: &key}); err != nil {
+		t.Fatalf("Persist (key): %v", err)
+	}
+	if f.got.IdempotencyKey == nil || *f.got.IdempotencyKey != key {
+		t.Errorf("key persisted as %v, want %q", f.got.IdempotencyKey, key)
+	}
+}
+
 // persistItemErrFake creates a campaign successfully but fails every item
 // insert, so Persist reaches the create-item error branch.
 type persistItemErrFake struct{ campaign.BaseFake }

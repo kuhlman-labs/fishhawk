@@ -981,6 +981,14 @@ components:
             issue-run's effective delegation contract. Omitted when the
             campaign carries no override: every issue-run then inherits its
             workflow's contract, byte-identical to pre-E25.12 behavior.
+        idempotent:
+          type: boolean
+          description: |
+            Present and `true` ONLY on an idempotent-replay response (E25.13):
+            a `POST /v0/campaigns` whose `Idempotency-Key` resolved to an
+            existing campaign, returned `200` instead of `201`. Omitted on a
+            fresh create (201) and on GET/list/status, so those are
+            byte-identical to pre-E25.13 output.
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -4023,13 +4031,24 @@ paths:
         to query the epic's children. A repo the App is not installed on fails
         closed with `422 repo_not_installed`.
 
-        This endpoint implements **no request idempotency**: the campaigns
-        table has no idempotency_key column and the repository exposes no
-        dedup lookup, so an `Idempotency-Key` header — if sent — is accepted
-        but NOT enforced; every call mints a distinct campaign. Real
-        idempotency (an `idempotency_key` column + repo lookup + migration) is
-        a deferred follow-up.
+        Pass `Idempotency-Key: <opaque-string>` to make the call retriable
+        (E25.13). If a campaign with the same `(repo, key)` exists it is
+        returned with a `200` carrying `idempotent: true` instead of minting a
+        duplicate at `201`. The scope is `(repo, key)` so two callers picking
+        the same key for different repos don't collide; no header = always
+        create. Mirrors the `POST /v0/runs` idempotency contract.
       tags: [campaigns]
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema:
+            type: string
+            description: |
+              Opaque caller-chosen string. Same key + same repo = the existing
+              campaign is returned (200, `idempotent: true`). Different key OR
+              different repo = a fresh campaign is created (201). No header =
+              always create.
       requestBody:
         required: true
         content:
@@ -4066,6 +4085,14 @@ paths:
                     for no override — each issue-run inherits its workflow's
                     contract.
       responses:
+        '200':
+          description: |
+            Idempotent replay — a campaign with the same `(repo,
+            Idempotency-Key)` already exists; it is returned unchanged with
+            `idempotent: true` instead of a fresh create.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Campaign' }
         '201':
           description: Campaign created.
           content:

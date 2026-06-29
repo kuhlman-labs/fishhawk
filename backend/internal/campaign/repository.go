@@ -28,6 +28,13 @@ type CreateCampaignParams struct {
 	// campaign package never interprets these bytes; the server validates them
 	// against spec.OperatorAgent before they reach here.
 	OperatorAgent []byte
+	// IdempotencyKey, when non-nil, makes the create idempotent against
+	// (Repo, *IdempotencyKey): a duplicate insert conflicts at the partial
+	// unique index. The server resolves an Idempotency-Key header to the
+	// existing campaign via GetCampaignByIdempotencyKey before insert (E25.13 /
+	// #1455). Nil = no key (the unchanged default); mirrors
+	// run.CreateRunParams.IdempotencyKey.
+	IdempotencyKey *string
 }
 
 // CreateCampaignItemParams are the inputs needed to insert a new campaign
@@ -61,6 +68,13 @@ type ListCampaignsFilter struct {
 type Repository interface {
 	CreateCampaign(ctx context.Context, p CreateCampaignParams) (*Campaign, error)
 	GetCampaign(ctx context.Context, id uuid.UUID) (*Campaign, error)
+
+	// GetCampaignByIdempotencyKey returns the existing campaign for
+	// (repo, key) if one exists. Used by POST /v0/campaigns to resolve an
+	// Idempotency-Key header to an already-created campaign. Returns
+	// ErrNotFound when no row matches. Mirrors
+	// run.Repository.GetRunByIdempotencyKey.
+	GetCampaignByIdempotencyKey(ctx context.Context, repo, key string) (*Campaign, error)
 
 	// ListCampaigns returns campaigns matching filter, ordered created_at
 	// DESC with an id tiebreak. Caller owns the pagination math; this

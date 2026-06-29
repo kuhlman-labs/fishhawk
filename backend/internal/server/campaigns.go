@@ -48,6 +48,13 @@ type campaignResponse struct {
 	OperatorAgent json.RawMessage `json:"operator_agent,omitempty"`
 	CreatedAt     time.Time       `json:"created_at"`
 	UpdatedAt     time.Time       `json:"updated_at"`
+	// Idempotent is set true ONLY on an idempotent-replay response: a POST
+	// /v0/campaigns whose Idempotency-Key resolved to an existing campaign,
+	// returned 200 instead of minting a duplicate at 201 (E25.13 / #1455).
+	// omitempty so a fresh create (201), GET, list, and status responses carry
+	// no idempotent key — same convention as the ship-artifact endpoints
+	// (plan/pull-request/deployment).
+	Idempotent bool `json:"idempotent,omitempty"`
 }
 
 // campaignItemResponse mirrors docs/api/v0.openapi.yaml's `CampaignItem`
@@ -227,10 +234,11 @@ func computeCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload
 // (the same path POST /v0/runs uses at runs.go:498), which the real GitHub
 // provider needs to mint an installation token for the children query.
 //
-// There is deliberately NO Idempotency-Key handling: the campaigns table
-// has no idempotency_key column and campaign.Repository exposes no
-// dedup lookup, so a header cannot be honoured here — see the OpenAPI note
-// and the PR Notes follow-up.
+// Idempotency-Key (E25.13 / #1455) is honoured, mirroring POST /v0/runs
+// (runs.go): when the header is set, a previously-created campaign with the
+// same (repo, key) is returned 200 with idempotent:true instead of minting a
+// duplicate at 201. An empty header is equivalent to "not idempotent" — every
+// call mints a new campaign.
 func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	if !s.requireWriteScope(w, r, "write:campaigns") {
 		return
@@ -284,6 +292,31 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 			"operator_agent must be a valid operator-agent block",
 			map[string]any{"field": "operator_agent"})
 		return
+	}
+
+	// Idempotency-Key (E25.13 / #1455). When set, a previously-created campaign
+	// with the same (repo, key) is returned 200 + idempotent:true instead of
+	// minting + dispatching a duplicate. Resolved BEFORE the installation +
+	// epic-children query so a replay does no GitHub work. Empty header is
+	// equivalent to "not idempotent" — every call mints a new campaign. The
+	// three-branch shape (hit / ErrNotFound / other error) mirrors runs.go.
+	idempKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if idempKey != "" {
+		existing, err := s.cfg.CampaignRepo.GetCampaignByIdempotencyKey(r.Context(), req.Repo, idempKey)
+		switch {
+		case err == nil:
+			// Replay: return the prior campaign with 200 + idempotent:true.
+			resp := toCampaignResponse(existing)
+			resp.Idempotent = true
+			s.writeJSON(w, r, http.StatusOK, resp)
+			return
+		case errors.Is(err, campaign.ErrNotFound):
+			// First call with this key — fall through to create.
+		default:
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"idempotency lookup failed", map[string]any{"error": err.Error()})
+			return
+		}
 	}
 
 	// Resolve the App installation for the target repo (#713 / runs.go:498).
@@ -380,6 +413,12 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	// assembly (E25.12). Nil = no override; the campaign inherits each
 	// issue-run's workflow contract unchanged.
 	assembly.OperatorAgent = operatorAgentBytes
+	// Thread the non-empty Idempotency-Key onto the assembly so it is stored on
+	// the campaign (E25.13), making a later replay resolvable. Empty = nil = no
+	// key (the unchanged default).
+	if idempKey != "" {
+		assembly.IdempotencyKey = &idempKey
+	}
 
 	created, err := campaign.Persist(r.Context(), s.cfg.CampaignRepo, req.Repo, assembly)
 	if err != nil {

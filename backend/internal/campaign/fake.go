@@ -27,6 +27,11 @@ func (BaseFake) GetCampaign(_ context.Context, _ uuid.UUID) (*Campaign, error) {
 	return nil, ErrNotFound
 }
 
+// GetCampaignByIdempotencyKey returns nil, ErrNotFound.
+func (BaseFake) GetCampaignByIdempotencyKey(_ context.Context, _, _ string) (*Campaign, error) {
+	return nil, ErrNotFound
+}
+
 // ListCampaigns returns nil, nil.
 func (BaseFake) ListCampaigns(_ context.Context, _ ListCampaignsFilter) ([]*Campaign, error) {
 	return nil, nil
