@@ -1,11 +1,12 @@
 import { NavLink, Outlet, useNavigate } from 'react-router';
-import { ListChecks, LogOut, ScrollText } from 'lucide-react';
+import { ListChecks, LogOut, Network, ScrollText } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { Button } from '@/components/ui/button';
 import { useAuth } from '@/auth/use-auth';
 
 const navItems = [
   { to: '/runs', label: 'Runs', icon: ListChecks },
+  { to: '/campaigns', label: 'Campaigns', icon: Network },
   { to: '/audit', label: 'Audit', icon: ScrollText },
 ];
 

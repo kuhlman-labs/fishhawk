@@ -6,6 +6,8 @@ import { Login } from './routes/login';
 import { Runs } from './routes/runs';
 import { RunDetail } from './routes/run-detail';
 import { StageDetail } from './routes/stage-detail';
+import { Campaigns } from './routes/campaigns';
+import { CampaignDetail } from './routes/campaign-detail';
 import { Audit } from './routes/audit';
 import { NotFound } from './routes/not-found';
 
@@ -26,6 +28,8 @@ export function App() {
           <Route path="runs" element={<Runs />} />
           <Route path="runs/:runId" element={<RunDetail />} />
           <Route path="runs/:runId/stages/:stageId" element={<StageDetail />} />
+          <Route path="campaigns" element={<Campaigns />} />
+          <Route path="campaigns/:campaignId" element={<CampaignDetail />} />
           <Route path="audit" element={<Audit />} />
         </Route>
         <Route path="*" element={<NotFound />} />

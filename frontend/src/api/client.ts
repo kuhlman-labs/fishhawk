@@ -4,6 +4,9 @@ import type {
   ApprovalRequest,
   Artifact,
   AuditEntry,
+  Campaign,
+  CampaignState,
+  CampaignStatus,
   PaginatedList,
   Run,
   Stage,
@@ -263,5 +266,37 @@ export const api = {
     if (params?.runId) q.set('run_id', params.runId);
     const qs = q.toString();
     return request(`/v0/audit${qs ? `?${qs}` : ''}`);
+  },
+
+  /**
+   * Campaign list (ADR-047 / #1437). Offset-cursor paginated, optional
+   * repo + state filters — mirrors listRuns. Empty params are dropped.
+   */
+  listCampaigns(params?: {
+    limit?: number;
+    cursor?: string;
+    repo?: string;
+    state?: CampaignState;
+  }): Promise<PaginatedList<Campaign>> {
+    const q = new URLSearchParams();
+    if (params?.limit) q.set('limit', String(params.limit));
+    if (params?.cursor) q.set('cursor', params.cursor);
+    if (params?.repo) q.set('repo', params.repo);
+    if (params?.state) q.set('state', params.state);
+    const qs = q.toString();
+    return request(`/v0/campaigns${qs ? `?${qs}` : ''}`);
+  },
+
+  getCampaign(campaignId: string): Promise<Campaign> {
+    return request(`/v0/campaigns/${encodeURIComponent(campaignId)}`);
+  },
+
+  /**
+   * The campaign rollup surface: campaign + items (DAG edges via
+   * depends_on, run links via run_id) + readiness rollup + the distilled
+   * next_action. One fetch drives the whole detail page.
+   */
+  getCampaignStatus(campaignId: string): Promise<CampaignStatus> {
+    return request(`/v0/campaigns/${encodeURIComponent(campaignId)}/status`);
   },
 };

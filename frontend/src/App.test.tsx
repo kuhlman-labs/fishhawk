@@ -77,6 +77,19 @@ describe('App routing + auth', () => {
       expect(await screen.findByRole('heading', { name: 'Audit log' })).toBeInTheDocument();
     });
 
+    it('renders the campaigns route', async () => {
+      renderAt('/campaigns');
+      expect(await screen.findByRole('heading', { name: 'Campaigns' })).toBeInTheDocument();
+    });
+
+    it('renders the Campaigns nav entry in the shell', async () => {
+      renderAt('/');
+      expect(await screen.findByRole('link', { name: /^campaigns$/i })).toHaveAttribute(
+        'href',
+        '/campaigns',
+      );
+    });
+
     it('shows the signed-in user in the shell', async () => {
       renderAt('/');
       expect(await screen.findByText('@kuhlman-labs')).toBeInTheDocument();
