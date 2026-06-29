@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -62,6 +63,10 @@ func campaignStart(args []string, stdout, stderr io.Writer) int {
 	epic := fs.String("epic", "", "epic issue ref: issue:N, #N, N, or .../issues/N URL (required)")
 	pausePolicy := fs.String("pause-policy", "",
 		"auto-driver gate pause behavior: pause_campaign | pause_item; empty uses the backend default")
+	operatorAgent := fs.String("operator-agent", "",
+		"campaign-level operator_agent override as JSON or @file; wholesale-replaces every "+
+			"issue-run's per-workflow contract. Explicit {} delegates no knobs (page on every "+
+			"action); omit to inherit the workflow default")
 	outputFmt := fs.String("output", "text", "output format: text | json")
 	fs.StringVar(outputFmt, "o", "text", "output format: text | json (shorthand)")
 	if err := fs.Parse(args); err != nil {
@@ -96,13 +101,38 @@ func campaignStart(args []string, stdout, stderr io.Writer) int {
 	}
 	epicRef := fmt.Sprintf("issue:%d", epicNum)
 
+	// Resolve --operator-agent: literal JSON, or @file. Leave nil when
+	// unset so the key is omitted (each issue-run inherits its workflow
+	// default); validated bytes — including an explicit "{}" — are
+	// forwarded verbatim, mirroring the start_campaign MCP param's
+	// explicit-empty-vs-omitted handling (#1470/#1475).
+	var operatorAgentBytes json.RawMessage
+	if *operatorAgent != "" {
+		raw := []byte(*operatorAgent)
+		if strings.HasPrefix(*operatorAgent, "@") {
+			path := (*operatorAgent)[1:]
+			data, readErr := os.ReadFile(path) //nolint:gosec // user-supplied path is the point
+			if readErr != nil {
+				_, _ = fmt.Fprintf(stderr, "%s: --operator-agent: %s: %v\n", name, path, readErr)
+				return exitUsage
+			}
+			raw = data
+		}
+		if !json.Valid(raw) {
+			_, _ = fmt.Fprintf(stderr, "%s: --operator-agent: not valid JSON\n", name)
+			return exitUsage
+		}
+		operatorAgentBytes = json.RawMessage(raw)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), *cf.timeout)
 	defer cancel()
 
 	camp, err := newClient(cf).CreateCampaign(ctx, httpclient.CreateCampaignInput{
-		Repo:        *repo,
-		EpicRef:     epicRef,
-		PausePolicy: *pausePolicy,
+		Repo:          *repo,
+		EpicRef:       epicRef,
+		PausePolicy:   *pausePolicy,
+		OperatorAgent: operatorAgentBytes,
 	})
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "%s: %v\n", name, err)

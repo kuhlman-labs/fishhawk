@@ -668,10 +668,21 @@ type CampaignStatus struct {
 // CreateCampaignInput is what CreateCampaign marshals into the POST
 // /v0/campaigns body. PausePolicy is optional — empty omits the field
 // so the backend applies its `pause_campaign` default.
+//
+// OperatorAgent is the OPTIONAL campaign-level operator_agent override
+// (E25.12 / #1451), mirroring the backend campaignCreateRequest and the
+// MCP apiClient request struct. It is carried as raw JSON bytes: a nil
+// field omits the key (each issue-run inherits its workflow default),
+// while an explicit `[]byte("{}")` is a valid wholesale override that
+// must reach the wire (page on every action). json.RawMessage's
+// omitempty drops only a nil/zero-length value, so this preserves the
+// explicit-empty-`{}` vs omitted distinction the MCP path carries after
+// #1470/#1475.
 type CreateCampaignInput struct {
-	Repo        string `json:"repo"`
-	EpicRef     string `json:"epic_ref"`
-	PausePolicy string `json:"pause_policy,omitempty"`
+	Repo          string          `json:"repo"`
+	EpicRef       string          `json:"epic_ref"`
+	PausePolicy   string          `json:"pause_policy,omitempty"`
+	OperatorAgent json.RawMessage `json:"operator_agent,omitempty"`
 }
 
 // CreateCampaign calls POST /v0/campaigns. The 201 body is the created
