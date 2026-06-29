@@ -6,7 +6,7 @@ Reference for `.fishhawk/workflows.yaml` at major version 1. The canonical schem
 
 ## Grammar
 
-Every v0 field is inherited unchanged. For the full base reference (top-level shape, stages, executors, inputs, produces, constraints, budgets, gates, operator-agent delegation, decomposition controls), see [`workflow-v0.md`](workflow-v0.md). The v1 additions are the [deploy stage](#deploy-stage-v1) members below. A minimal non-deploy v1 spec differs from a v0 spec only in its `version` value:
+Every v0 field is inherited unchanged. For the full base reference (top-level shape, stages, executors, inputs, produces, constraints, budgets, gates, operator-agent delegation — including the `operator_agent.model_policy` scenario-A model-selection contract (#1421), inherited verbatim and surfaced identically on the run-status delegation block — decomposition controls), see [`workflow-v0.md`](workflow-v0.md). The v1 additions are the [deploy stage](#deploy-stage-v1) members below. A minimal non-deploy v1 spec differs from a v0 spec only in its `version` value:
 
 ```yaml
 version: "1.0" # required; routes to workflow-v1.schema.json

@@ -258,6 +258,87 @@ func TestEvaluate_GateOnlyBlock_NotPending_FailClosed(t *testing.T) {
 	}
 }
 
+// --- model_policy passthrough (#1421) ----------------------------------------
+
+// samplePolicy is a fully-populated scenario-A model policy used by the
+// passthrough tests.
+func samplePolicy() *spec.ModelPolicy {
+	return &spec.ModelPolicy{
+		Strategy: spec.ModelPolicyExplicitDefaults,
+		Defaults: &spec.ModelPolicyDefaults{Plan: "claude-opus-4-8", Implement: "claude-sonnet-4-6", Review: "gpt-5.5"},
+		Allowed:  []string{"claude-opus-4-8", "claude-sonnet-4-6", "gpt-5.5"},
+	}
+}
+
+// TestEvaluate_ModelPolicy_Passthrough asserts Evaluate surfaces the
+// effective block's model_policy verbatim as static config (#1421) — no
+// condition is evaluated — across the main path, the parked
+// awaiting_input early-return path, and the wholesale gate override, and
+// that it stays nil when the effective block declares none.
+func TestEvaluate_ModelPolicy_Passthrough(t *testing.T) {
+	t.Run("main path surfaces the workflow block's policy", func(t *testing.T) {
+		block := allKnobs()
+		block.ModelPolicy = samplePolicy()
+		wf := testWorkflow(block, nil)
+		ev := &Evaluator{
+			Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateSucceeded)}},
+			Concerns: &fakeConcerns{},
+			Audit:    &fakeAudit{},
+		}
+		res := evaluate(t, ev, wf, newRun())
+		if res.ModelPolicy != block.ModelPolicy {
+			t.Fatalf("ModelPolicy = %+v, want the workflow block's policy passed through by pointer", res.ModelPolicy)
+		}
+	})
+
+	t.Run("parked awaiting_input still surfaces the policy", func(t *testing.T) {
+		block := allKnobs()
+		block.ModelPolicy = samplePolicy()
+		wf := testWorkflow(block, nil)
+		ev := &Evaluator{
+			Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingInput)}},
+			Concerns: &fakeConcerns{},
+			Audit:    &fakeAudit{},
+		}
+		res := evaluate(t, ev, wf, newRun())
+		if res.ModelPolicy != block.ModelPolicy {
+			t.Fatalf("ModelPolicy = %+v, want the policy surfaced on the parked path", res.ModelPolicy)
+		}
+	})
+
+	t.Run("gate override wins wholesale", func(t *testing.T) {
+		wfBlock := allKnobs()
+		wfBlock.ModelPolicy = samplePolicy()
+		gateBlock := &spec.OperatorAgent{
+			MayWaive:    spec.ConditionSoloLow,
+			ModelPolicy: &spec.ModelPolicy{Strategy: spec.ModelPolicyFollowPlanRecommendation},
+		}
+		wf := testWorkflow(wfBlock, gateBlock)
+		ev := &Evaluator{
+			Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
+			Concerns: &fakeConcerns{},
+			Audit:    &fakeAudit{},
+		}
+		res := evaluate(t, ev, wf, newRun())
+		if res.ModelPolicy != gateBlock.ModelPolicy {
+			t.Fatalf("ModelPolicy = %+v, want the gate block's policy (wholesale override, not the workflow's)", res.ModelPolicy)
+		}
+	})
+
+	t.Run("nil when the effective block declares none", func(t *testing.T) {
+		wf := testWorkflow(allKnobs(), nil) // allKnobs sets no ModelPolicy
+		ev := &Evaluator{
+			Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateSucceeded)}},
+			Concerns: &fakeConcerns{},
+			Audit:    &fakeAudit{},
+		}
+		res := evaluate(t, ev, wf, newRun())
+		if res.ModelPolicy != nil {
+			t.Fatalf("ModelPolicy = %+v, want nil for an absent model_policy", res.ModelPolicy)
+		}
+	})
+}
+
 // --- clean_dual_approval ------------------------------------------------------
 
 func cleanDualEvaluator(stages []*run.Stage, open []*concern.Concern, au *fakeAudit) *Evaluator {

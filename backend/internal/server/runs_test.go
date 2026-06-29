@@ -16,6 +16,126 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
+// modelPolicySpecYAML is delegationSpecYAML's shape plus a workflow-level
+// operator_agent.model_policy block (#1421) so the spec→delegation→wire
+// seam carries the scenario-A model-selection contract.
+const modelPolicySpecYAML = `version: "0.5"
+roles:
+  tech_lead:
+    members: ["@org/tech-leads"]
+workflows:
+  feature_change:
+    operator_agent:
+      may_approve: clean_dual_approval
+      must_page_human: [reviewer_reject]
+      model_policy:
+        strategy: explicit_defaults
+        defaults:
+          plan: claude-opus-4-8
+          implement: claude-sonnet-4-6
+          review: gpt-5.5
+        allowed:
+          - claude-opus-4-8
+          - claude-sonnet-4-6
+          - gpt-5.5
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 2
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// TestGetRun_Delegation_ModelPolicy_SpecToWire is the cross-boundary seam
+// test for #1421: a workflow spec declaring operator_agent.model_policy is
+// parsed, evaluated through delegation.Evaluate, and serialized — GET
+// /v0/runs/{id} echoes the strategy, per-stage defaults, and allowed set
+// on the delegation block. The fakes and run helpers live in
+// runs_get_test.go (same package).
+func TestGetRun_Delegation_ModelPolicy_SpecToWire(t *testing.T) {
+	s, repo, _, _ := newDelegationServer(t)
+	runID, _ := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": modelPolicySpecYAML,
+	})
+
+	resp, raw := getRunResponse(t, s, runID)
+	if resp.Delegation == nil {
+		t.Fatal("delegation block missing")
+	}
+	mp := resp.Delegation.ModelPolicy
+	if mp == nil {
+		t.Fatal("delegation.model_policy missing; want the spec-declared policy echoed")
+	}
+	if mp.Strategy != "explicit_defaults" {
+		t.Errorf("model_policy.strategy = %q, want explicit_defaults", mp.Strategy)
+	}
+	if mp.Defaults == nil {
+		t.Fatal("model_policy.defaults missing")
+	}
+	if mp.Defaults.Plan != "claude-opus-4-8" || mp.Defaults.Implement != "claude-sonnet-4-6" || mp.Defaults.Review != "gpt-5.5" {
+		t.Errorf("model_policy.defaults = %+v, want {plan:claude-opus-4-8 implement:claude-sonnet-4-6 review:gpt-5.5}", *mp.Defaults)
+	}
+	wantAllowed := []string{"claude-opus-4-8", "claude-sonnet-4-6", "gpt-5.5"}
+	if len(mp.Allowed) != len(wantAllowed) {
+		t.Fatalf("model_policy.allowed = %v, want %v", mp.Allowed, wantAllowed)
+	}
+	for i, want := range wantAllowed {
+		if mp.Allowed[i] != want {
+			t.Errorf("model_policy.allowed[%d] = %q, want %q", i, mp.Allowed[i], want)
+		}
+	}
+	// The key is present on the raw wire body (not merely a zero value).
+	deleg, ok := raw["delegation"].(map[string]any)
+	if !ok {
+		t.Fatalf("delegation block not an object in raw body: %v", raw["delegation"])
+	}
+	if _, present := deleg["model_policy"]; !present {
+		t.Errorf("model_policy key absent from the raw delegation block: %v", deleg)
+	}
+}
+
+// TestGetRun_Delegation_ModelPolicy_AbsentOmitted is the byte-identical
+// control for #1421: an operator_agent block with NO model_policy yields a
+// delegation block with the model_policy key omitted entirely.
+func TestGetRun_Delegation_ModelPolicy_AbsentOmitted(t *testing.T) {
+	s, repo, _, _ := newDelegationServer(t)
+	runID, _ := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": delegationSpecYAML,
+	})
+
+	resp, raw := getRunResponse(t, s, runID)
+	if resp.Delegation == nil {
+		t.Fatal("delegation block missing")
+	}
+	if resp.Delegation.ModelPolicy != nil {
+		t.Errorf("delegation.model_policy = %+v, want nil when the block declares none", resp.Delegation.ModelPolicy)
+	}
+	deleg, ok := raw["delegation"].(map[string]any)
+	if !ok {
+		t.Fatalf("delegation block not an object in raw body: %v", raw["delegation"])
+	}
+	if _, present := deleg["model_policy"]; present {
+		t.Errorf("model_policy key present on a spec with no model_policy: %v", deleg)
+	}
+}
+
 func TestErrorEnvelope_Shape(t *testing.T) {
 	// Decoding a known 400 confirms the envelope matches OpenAPI's
 	// error schema verbatim. If the field names drift, clients

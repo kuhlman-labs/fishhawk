@@ -228,6 +228,11 @@ type runDelegationPayload struct {
 	// agent-reviewer authority — preserving byte-identical responses for
 	// runs that resolve gateless.
 	ReviewerRejectClass string `json:"reviewer_reject_class,omitempty"`
+	// ModelPolicy is the effective operator_agent block's scenario-A
+	// model-selection contract (#1421), passed through as static config.
+	// Omitted when the block declares no model_policy, keeping
+	// unconfigured responses byte-identical to today.
+	ModelPolicy *runDelegationModelPolicyPayload `json:"model_policy,omitempty"`
 }
 
 // runDelegationActionPayload is one knob's evaluation on the wire.
@@ -237,6 +242,26 @@ type runDelegationActionPayload struct {
 	Condition   string `json:"condition"`
 	Met         bool   `json:"met"`
 	UnmetReason string `json:"unmet_reason,omitempty"`
+}
+
+// runDelegationModelPolicyPayload mirrors spec.ModelPolicy on the wire
+// (#1421): the scenario-A operator-agent model-selection contract,
+// surfaced as static config for the operator agent to read and apply via
+// #1416's per-stage override channels. Every field omitempty so an
+// unconfigured (or partially configured) policy stays minimal.
+type runDelegationModelPolicyPayload struct {
+	Strategy string                             `json:"strategy,omitempty"`
+	Defaults *runDelegationModelDefaultsPayload `json:"defaults,omitempty"`
+	Allowed  []string                           `json:"allowed,omitempty"`
+}
+
+// runDelegationModelDefaultsPayload mirrors spec.ModelPolicyDefaults on
+// the wire: the per-stage model the operator agent applies under the
+// explicit_defaults strategy.
+type runDelegationModelDefaultsPayload struct {
+	Plan      string `json:"plan,omitempty"`
+	Implement string `json:"implement,omitempty"`
+	Review    string `json:"review,omitempty"`
 }
 
 // issueContextPayload mirrors run.IssueContext on the wire. Kept
@@ -1099,6 +1124,20 @@ func (s *Server) buildDelegationPayload(ctx context.Context, runRow *run.Run) *r
 		Actions:             make([]runDelegationActionPayload, 0, len(res.Actions)),
 		MustPageHuman:       res.MustPageHuman,
 		ReviewerRejectClass: res.ReviewerRejectClass,
+	}
+	if res.ModelPolicy != nil {
+		mp := &runDelegationModelPolicyPayload{
+			Strategy: string(res.ModelPolicy.Strategy),
+			Allowed:  res.ModelPolicy.Allowed,
+		}
+		if res.ModelPolicy.Defaults != nil {
+			mp.Defaults = &runDelegationModelDefaultsPayload{
+				Plan:      res.ModelPolicy.Defaults.Plan,
+				Implement: res.ModelPolicy.Defaults.Implement,
+				Review:    res.ModelPolicy.Defaults.Review,
+			}
+		}
+		out.ModelPolicy = mp
 	}
 	for _, d := range res.Actions {
 		out.Actions = append(out.Actions, runDelegationActionPayload{
