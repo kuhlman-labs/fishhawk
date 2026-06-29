@@ -8,8 +8,8 @@ package campaign
 // Eligibility is the partition of a campaign's items by readiness, computed by
 // NextEligible. Every slice holds issue refs (Item.IssueRef). An item appears
 // in exactly one slice. Eligible items are the ones a scheduler may dispatch
-// next; Blocked items wait on an unsatisfied dependency; Running/Done/Failed
-// reflect items already linked to a run or terminal.
+// next; Blocked items wait on an unsatisfied dependency; Running/Done/Failed/
+// Cancelled reflect items already linked to a run or terminal.
 type Eligibility struct {
 	// Eligible items have no run yet and every dependency already succeeded —
 	// they are ready to dispatch.
@@ -24,6 +24,10 @@ type Eligibility struct {
 	Done []string
 	// Failed items have failed.
 	Failed []string
+	// Cancelled items reached the terminal cancelled state. Like Done/Failed
+	// they are never re-dispatched; tracked separately so a cancelled item with
+	// no run and no deps is not mistaken for Eligible.
+	Cancelled []string
 }
 
 // NextEligible partitions a campaign's items into eligible / blocked /
@@ -36,6 +40,10 @@ type Eligibility struct {
 // is not yet done. A dependency ref absent from the campaign is treated as
 // not-satisfied (defensive): a campaign referencing a missing sibling stays
 // blocked rather than dispatching against an unresolved edge.
+//
+// A cancelled item is terminal: it is reported in Cancelled and never Eligible,
+// even with no run and no deps (which would otherwise fall through to the
+// eligible default branch).
 func NextEligible(items []*Item) Eligibility {
 	var e Eligibility
 
@@ -54,6 +62,10 @@ func NextEligible(items []*Item) Eligibility {
 		switch {
 		case it.State == ItemStateFailed:
 			e.Failed = append(e.Failed, ref)
+		case it.State == ItemStateCancelled:
+			// Terminal: never eligible for dispatch, even with no run and no
+			// deps (which would otherwise fall through to the default branch).
+			e.Cancelled = append(e.Cancelled, ref)
 		case it.State == ItemStateSucceeded:
 			e.Done = append(e.Done, ref)
 		case it.State == ItemStateRunning || (it.RunID != nil && !it.State.IsTerminal()):

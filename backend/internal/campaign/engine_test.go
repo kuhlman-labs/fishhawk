@@ -70,6 +70,22 @@ func TestNextEligible_RunningByRunLinkage(t *testing.T) {
 	}
 }
 
+// TestNextEligible_CancelledIsTerminal covers the terminal cancelled branch: a
+// cancelled item with no run and no deps must NOT be reported as eligible (it
+// would otherwise fall through the default branch and could be re-dispatched).
+func TestNextEligible_CancelledIsTerminal(t *testing.T) {
+	items := []*campaign.Item{
+		item("issue:1", campaign.ItemStateCancelled, nil), // terminal, no run, no deps
+	}
+	got := campaign.NextEligible(items)
+	if len(got.Eligible) != 0 {
+		t.Errorf("eligible = %v, want none (cancelled is terminal)", got.Eligible)
+	}
+	if !reflect.DeepEqual(got.Cancelled, []string{"issue:1"}) {
+		t.Errorf("cancelled = %v, want [issue:1]", got.Cancelled)
+	}
+}
+
 // TestDeriveState exercises one assertion per derived branch: pending,
 // running, succeeded, failed. StateCancelled/paused are operator overlays and
 // are intentionally never derived.
