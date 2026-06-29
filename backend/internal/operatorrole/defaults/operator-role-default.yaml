@@ -60,6 +60,12 @@ conventions:
     follow-up issues are the operator's job, never the implement agent's;
     every deferred item gets a tracked issue before the PR opens
   retro: file friction issues with run IDs/sequences while fresh
+  campaign: >-
+    driving a campaign (ADR-047): poll fishhawk_get_campaign_status each tick
+    and act on its next_action; when the auto-driver pages on a
+    must_page_human gate, handle the distilled page (the underlying run's
+    verdict/arbitration) THEN fishhawk_resume_campaign — never resume to mask
+    an unresolved must_page_human cause
 
 forbidden:
   - hand-edits on run branches outside the fixup/amendment flow

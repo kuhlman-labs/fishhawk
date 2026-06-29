@@ -55,6 +55,13 @@ func TestDefaultRoundTrip(t *testing.T) {
 	if len(d.Conventions) == 0 {
 		t.Error("Conventions is empty")
 	}
+	// The campaign-scoped operator procedure (ADR-047 / #1450) lives as a
+	// conventions entry, not a gate_procedures key (thinness rule). Assert
+	// it is present and non-empty so a no-op/comment-only touch of the
+	// shipped default fails the done-means.
+	if strings.TrimSpace(d.Conventions["campaign"]) == "" {
+		t.Error(`Conventions["campaign"] is absent or empty`)
+	}
 	if len(d.Forbidden) == 0 {
 		t.Error("Forbidden is empty")
 	}
