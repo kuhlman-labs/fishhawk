@@ -943,7 +943,7 @@ components:
         (ADR-047 / #1437). It owns an ordered set of campaign items, one per
         issue under the epic. State is a reduction of its items' states (see
         `backend/internal/campaign/transition.go`).
-      required: [id, repo, epic_ref, state, created_at, updated_at]
+      required: [id, repo, epic_ref, state, pause_policy, created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/UUID' }
         repo:
@@ -955,7 +955,19 @@ components:
           example: "issue:1439"
         state:
           type: string
-          enum: [pending, running, succeeded, failed, cancelled]
+          enum: [pending, running, paused, succeeded, failed, cancelled]
+          description: |
+            `paused` is the E25.7 safety-boundary overlay: the auto-driver
+            paused the campaign when a run gate was handed off to a human.
+            It is non-terminal — `POST /resume` returns it to `running`.
+        pause_policy:
+          type: string
+          enum: [pause_campaign, pause_item]
+          description: |
+            What the auto-driver pauses on a gate hand-off (E25.7).
+            `pause_campaign` (the default) blocks the whole campaign;
+            `pause_item` pauses only the affected item (continue-others).
+            Always present and normalized on a persisted campaign.
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -983,7 +995,28 @@ components:
             (the pre-dispatch default).
         state:
           type: string
-          enum: [pending, blocked, running, succeeded, failed, cancelled]
+          enum: [pending, blocked, running, paused, succeeded, failed, cancelled]
+          description: |
+            `paused` (E25.7) means the auto-driver handed this item's gate off
+            to a human; it carries a `pause_reason` and re-engages on resume.
+        pause_reason:
+          type: object
+          description: |
+            Why a paused item was handed off to a human (E25.7). Present only
+            while the item is — or was — paused.
+          properties:
+            page_event:
+              type: string
+              description: The audit category that triggered the page (e.g. `campaign_gate_paged`).
+            run_id:
+              $ref: '#/components/schemas/UUID'
+              description: The run whose gate was handed off.
+            stage_id:
+              $ref: '#/components/schemas/UUID'
+              description: The gate's stage, if any.
+            gate:
+              type: string
+              description: The gate/decision the human must own.
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -994,7 +1027,7 @@ components:
         (`campaign.NextEligible`). Every slice holds issue refs; an item
         appears in exactly one slice. Each field is always an array (never
         null).
-      required: [eligible, blocked, running, done, failed, cancelled]
+      required: [eligible, blocked, running, done, failed, cancelled, paused]
       properties:
         eligible:
           type: array
@@ -1017,6 +1050,10 @@ components:
         cancelled:
           type: array
           items: { type: string }
+        paused:
+          type: array
+          items: { type: string }
+          description: Handed off to a human by the auto-driver (E25.7); resumes on `POST /resume`.
 
     CampaignNextAction:
       type: object
@@ -1029,10 +1066,13 @@ components:
       properties:
         action:
           type: string
-          enum: [attention, start_run, wait, complete]
+          enum: [attention, resume, start_run, wait, complete]
           description: |
             `attention` — a failed item needs operator intervention
             (retry/abandon); takes precedence over everything else.
+            `resume` — a paused item was handed off to a human at a run gate
+            (E25.7); handle the gate then `POST /resume`. Ranked above
+            `start_run` so a hand-off is surfaced before new dispatch.
             `start_run` — the next eligible item is ready to dispatch.
             `wait` — items are running or blocked; nothing to do yet.
             `complete` — every item reached a terminal state.
@@ -1040,8 +1080,8 @@ components:
           type: string
           description: |
             The item the action refers to — the first failed item for
-            `attention`, the first eligible item for `start_run`. Omitted for
-            `wait` / `complete`.
+            `attention`, the first paused item for `resume`, the first eligible
+            item for `start_run`. Omitted for `wait` / `complete`.
         detail:
           type: string
           description: Human-readable explanation of the action.
@@ -3992,6 +4032,14 @@ paths:
                   type: string
                   description: The epic to decompose, in `issue:N` form.
                   example: "issue:1439"
+                pause_policy:
+                  type: string
+                  enum: [pause_campaign, pause_item]
+                  description: |
+                    OPTIONAL pause behavior on an auto-driver gate hand-off
+                    (E25.7). Omit to take the default `pause_campaign` (block
+                    the whole campaign); `pause_item` pauses only the affected
+                    item (continue-others).
       responses:
         '201':
           description: Campaign created.
@@ -4001,8 +4049,8 @@ paths:
         '400':
           description: |
             `validation_failed` — `repo` not in owner/name form, `epic_ref`
-            missing, body malformed / unknown field, or a dependency cycle
-            among the epic's children.
+            missing, `pause_policy` not a recognized value, body malformed /
+            unknown field, or a dependency cycle among the epic's children.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: "`insufficient_scope` — bearer token missing `write:campaigns`."
@@ -4096,6 +4144,44 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404':
           description: "`campaign_not_found` — no campaign with that id."
+        '503':
+          description: "`campaign_repo_unconfigured` — no campaign repository wired."
+
+  /v0/campaigns/{campaign_id}/resume:
+    post:
+      operationId: resumeCampaign
+      summary: Resume a paused campaign
+      description: |
+        The operator's hand-back after the auto-driver paged a human at a run
+        gate (E25.7 / ADR-047 Track C). Flips the campaign `paused` → `running`
+        (when the campaign itself was paused under the `pause_campaign` policy)
+        AND every paused item `paused` → `running`, so the next driver tick
+        re-engages the campaign and the continuation proceeds.
+
+        Serves both pause policies: under `pause_campaign` the campaign and the
+        affected item are paused together; under `pause_item` only the item is
+        paused while the campaign stays running. "Nothing to resume" — the
+        campaign is not paused AND no item is paused — yields `409
+        campaign_not_paused`.
+      tags: [campaigns]
+      parameters:
+        - { name: campaign_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: The resumed campaign (now `running`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Campaign' }
+        '400':
+          description: "`validation_failed` — `campaign_id` is not a valid UUID."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: "`insufficient_scope` — bearer token missing `write:campaigns`."
+        '409':
+          description: |
+            `campaign_not_paused` — the campaign has no paused state to resume;
+            `invalid_transition` — a concurrent change made the resume
+            transition illegal.
         '503':
           description: "`campaign_repo_unconfigured` — no campaign repository wired."
 

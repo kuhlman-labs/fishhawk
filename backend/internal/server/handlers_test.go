@@ -112,3 +112,24 @@ func TestCostRouteRegistered(t *testing.T) {
 		t.Errorf("body = %s, want run_repo_unconfigured (handleGetRunCost reached)", rec.Body.String())
 	}
 }
+
+// TestResumeCampaignRouteRegistered guards the route table: POST
+// /v0/campaigns/{campaign_id}/resume (#1446) must reach handleResumeCampaign.
+// With no CampaignRepo configured the handler returns 503 — an UNregistered
+// route would instead 404 with a default not-found body, so a 503 here proves
+// the route is wired in handlers.go. (handleResumeCampaign checks the
+// nil-CampaignRepo guard BEFORE the write-scope check precisely so this idiom
+// reaches the handler.)
+func TestResumeCampaignRouteRegistered(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/campaigns/"+"00000000-0000-0000-0000-000000000000"+"/resume", nil)
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (route reaches handler with no CampaignRepo)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "campaign_repo_unconfigured") {
+		t.Errorf("body = %s, want campaign_repo_unconfigured (handleResumeCampaign reached)", rec.Body.String())
+	}
+}
