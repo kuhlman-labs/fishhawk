@@ -779,3 +779,199 @@ func TestRollbackDeployment_APIErrorPassthrough(t *testing.T) {
 		t.Errorf("Code = %q, want deploy_not_settled", apiErr.Code)
 	}
 }
+
+// --- campaigns (ADR-047 / #1437) ---
+
+func TestCreateCampaign_BodyMarshalingAndOmitempty(t *testing.T) {
+	var gotBody []byte
+	id := uuid.New()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/campaigns", func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(Campaign{ID: id, Repo: "x/y", EpicRef: "issue:1439", State: "pending", PausePolicy: "pause_item"})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := New(srv.URL, "tok")
+
+	// With pause_policy → serialized.
+	got, err := c.CreateCampaign(context.Background(), CreateCampaignInput{
+		Repo: "x/y", EpicRef: "issue:1439", PausePolicy: "pause_item",
+	})
+	if err != nil {
+		t.Fatalf("CreateCampaign: %v", err)
+	}
+	if got.ID != id || got.PausePolicy != "pause_item" {
+		t.Errorf("decoded mismatch: %+v", got)
+	}
+	for _, want := range []string{`"repo":"x/y"`, `"epic_ref":"issue:1439"`, `"pause_policy":"pause_item"`} {
+		if !strings.Contains(string(gotBody), want) {
+			t.Errorf("body missing %q: %s", want, gotBody)
+		}
+	}
+
+	// Without pause_policy → omitted (omitempty).
+	if _, err := c.CreateCampaign(context.Background(), CreateCampaignInput{Repo: "x/y", EpicRef: "issue:1439"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(gotBody), "pause_policy") {
+		t.Errorf("pause_policy present when empty: %s", gotBody)
+	}
+}
+
+func TestCreateCampaign_APIError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/campaigns", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"error":{"code":"insufficient_scope","message":"missing write:campaigns","details":{"required_scope":"write:campaigns"}}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := New(srv.URL, "")
+	_, err := c.CreateCampaign(context.Background(), CreateCampaignInput{Repo: "x/y", EpicRef: "issue:1439"})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "insufficient_scope" {
+		t.Fatalf("err = %v, want APIError insufficient_scope", err)
+	}
+}
+
+func TestGetCampaignStatus_DecodesNestedSurface(t *testing.T) {
+	id := uuid.New()
+	runID := uuid.New()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/campaigns/{campaign_id}/status", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.PathValue("campaign_id"); got != id.String() {
+			t.Errorf("campaign_id = %q, want %s", got, id)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(CampaignStatus{
+			Campaign: Campaign{ID: id, Repo: "x/y", EpicRef: "issue:1439", State: "running", PausePolicy: "pause_campaign"},
+			Items: []CampaignItem{
+				{ID: uuid.New(), IssueRef: "issue:1441", State: "running", RunID: &runID, DependsOn: []string{}},
+				{ID: uuid.New(), IssueRef: "issue:1442", State: "blocked", DependsOn: []string{"issue:1441"}},
+			},
+			Rollup:     CampaignRollup{Running: []string{"issue:1441"}, Blocked: []string{"issue:1442"}},
+			NextAction: CampaignNextAction{Action: "wait", Detail: "items running or blocked"},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := New(srv.URL, "")
+
+	got, err := c.GetCampaignStatus(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetCampaignStatus: %v", err)
+	}
+	if got.Campaign.ID != id || got.Campaign.State != "running" {
+		t.Errorf("campaign mismatch: %+v", got.Campaign)
+	}
+	if len(got.Items) != 2 || got.Items[0].RunID == nil || *got.Items[0].RunID != runID {
+		t.Errorf("items mismatch: %+v", got.Items)
+	}
+	if got.Items[1].RunID != nil {
+		t.Errorf("unlinked item should have nil RunID: %+v", got.Items[1])
+	}
+	if len(got.Rollup.Running) != 1 || got.NextAction.Action != "wait" {
+		t.Errorf("rollup/next_action mismatch: %+v / %+v", got.Rollup, got.NextAction)
+	}
+}
+
+func TestListCampaigns_QueryStringEncoding(t *testing.T) {
+	var gotQuery string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/campaigns", func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ListCampaignsResult{
+			Items:      []Campaign{{ID: uuid.New(), Repo: "x/y", EpicRef: "issue:1439", State: "running"}},
+			NextCursor: "cursor-abc",
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := New(srv.URL, "")
+
+	got, err := c.ListCampaigns(context.Background(), ListCampaignsFilter{
+		Repo: "x/y", State: "running", Limit: 25, Cursor: "abc",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"repo=x%2Fy", "state=running", "limit=25", "cursor=abc"} {
+		if !strings.Contains(gotQuery, want) {
+			t.Errorf("query %q missing %q", gotQuery, want)
+		}
+	}
+	if got.NextCursor != "cursor-abc" || len(got.Items) != 1 {
+		t.Errorf("decode mismatch: %+v", got)
+	}
+}
+
+func TestListCampaigns_EmptyFiltersDropped(t *testing.T) {
+	var gotQuery string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/campaigns", func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ListCampaignsResult{})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := New(srv.URL, "")
+	if _, err := c.ListCampaigns(context.Background(), ListCampaignsFilter{}); err != nil {
+		t.Fatal(err)
+	}
+	if gotQuery != "" {
+		t.Errorf("query = %q, want empty when no filters", gotQuery)
+	}
+}
+
+func TestResumeCampaign_NoBodyPost(t *testing.T) {
+	id := uuid.New()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/campaigns/{campaign_id}/resume", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.PathValue("campaign_id"); got != id.String() {
+			t.Errorf("campaign_id = %q, want %s", got, id)
+		}
+		body, _ := io.ReadAll(r.Body)
+		if len(body) != 0 {
+			t.Errorf("expected no request body, got %q", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(Campaign{ID: id, State: "running"})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := New(srv.URL, "")
+
+	got, err := c.ResumeCampaign(context.Background(), id)
+	if err != nil {
+		t.Fatalf("ResumeCampaign: %v", err)
+	}
+	if got.ID != id || got.State != "running" {
+		t.Errorf("decode mismatch: %+v", got)
+	}
+}
+
+func TestResumeCampaign_NotPaused409(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/campaigns/{campaign_id}/resume", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"error":{"code":"campaign_not_paused","message":"the campaign has no paused state to resume","details":null}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := New(srv.URL, "")
+	_, err := c.ResumeCampaign(context.Background(), uuid.New())
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v, want *APIError", err)
+	}
+	if apiErr.StatusCode != http.StatusConflict || apiErr.Code != "campaign_not_paused" {
+		t.Errorf("apiErr = %+v, want 409 campaign_not_paused", apiErr)
+	}
+}

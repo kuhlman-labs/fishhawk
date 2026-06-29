@@ -596,6 +596,168 @@ func (c *Client) RollbackDeployment(ctx context.Context, runID uuid.UUID) (*Roll
 	return &res, nil
 }
 
+// Campaign is the CLI-side projection of the OpenAPI Campaign schema
+// (ADR-047 / #1437): the parent record of an epic-driven multi-issue
+// run. Field names + types match the wire shape verbatim.
+type Campaign struct {
+	ID          uuid.UUID `json:"id"`
+	Repo        string    `json:"repo"`
+	EpicRef     string    `json:"epic_ref"`
+	State       string    `json:"state"`
+	PausePolicy string    `json:"pause_policy"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// CampaignPauseReason explains why a paused item was handed off to a
+// human by the auto-driver (E25.7). Present only while an item is — or
+// was — paused. Mirrors the OpenAPI CampaignItem.pause_reason sub-shape.
+type CampaignPauseReason struct {
+	PageEvent string     `json:"page_event,omitempty"`
+	RunID     *uuid.UUID `json:"run_id,omitempty"`
+	StageID   *uuid.UUID `json:"stage_id,omitempty"`
+	Gate      string     `json:"gate,omitempty"`
+}
+
+// CampaignItem is the CLI-side projection of the OpenAPI CampaignItem
+// schema: one issue within a campaign. RunID is nil until a run is
+// assigned; PauseReason is nil unless the item is/was paused (E25.7).
+type CampaignItem struct {
+	ID          uuid.UUID            `json:"id"`
+	IssueRef    string               `json:"issue_ref"`
+	DependsOn   []string             `json:"depends_on"`
+	RunID       *uuid.UUID           `json:"run_id,omitempty"`
+	State       string               `json:"state"`
+	PauseReason *CampaignPauseReason `json:"pause_reason,omitempty"`
+	CreatedAt   time.Time            `json:"created_at"`
+	UpdatedAt   time.Time            `json:"updated_at"`
+}
+
+// CampaignRollup is the engine's readiness partition over a campaign's
+// items. Every slice holds issue refs; an item appears in exactly one
+// slice. Each field is always an array (never null) on the wire.
+type CampaignRollup struct {
+	Eligible  []string `json:"eligible"`
+	Blocked   []string `json:"blocked"`
+	Running   []string `json:"running"`
+	Done      []string `json:"done"`
+	Failed    []string `json:"failed"`
+	Cancelled []string `json:"cancelled"`
+	Paused    []string `json:"paused"`
+}
+
+// CampaignNextAction is the single next step for the operator-agent,
+// distilled from the rollup. IssueRef + Detail are omitted for the
+// wait/complete actions per the OpenAPI shape.
+type CampaignNextAction struct {
+	Action   string `json:"action"`
+	IssueRef string `json:"issue_ref,omitempty"`
+	Detail   string `json:"detail,omitempty"`
+}
+
+// CampaignStatus is the campaign rollup surface: the campaign, its
+// items, the engine's readiness partition, and the distilled next
+// action. The surface the operator-agent polls to drive a campaign.
+type CampaignStatus struct {
+	Campaign   Campaign           `json:"campaign"`
+	Items      []CampaignItem     `json:"items"`
+	Rollup     CampaignRollup     `json:"rollup"`
+	NextAction CampaignNextAction `json:"next_action"`
+}
+
+// CreateCampaignInput is what CreateCampaign marshals into the POST
+// /v0/campaigns body. PausePolicy is optional — empty omits the field
+// so the backend applies its `pause_campaign` default.
+type CreateCampaignInput struct {
+	Repo        string `json:"repo"`
+	EpicRef     string `json:"epic_ref"`
+	PausePolicy string `json:"pause_policy,omitempty"`
+}
+
+// CreateCampaign calls POST /v0/campaigns. The 201 body is the created
+// Campaign. Server-side rejections (validation_failed 400,
+// insufficient_scope 403, repo_not_installed 422, …) surface as
+// *APIError with the envelope's code.
+func (c *Client) CreateCampaign(ctx context.Context, in CreateCampaignInput) (*Campaign, error) {
+	body, err := json.Marshal(in)
+	if err != nil {
+		return nil, fmt.Errorf("marshal: %w", err)
+	}
+	var camp Campaign
+	if err := c.do(ctx, http.MethodPost, "/v0/campaigns", body, &camp); err != nil {
+		return nil, err
+	}
+	return &camp, nil
+}
+
+// GetCampaignStatus calls GET /v0/campaigns/{id}/status, decoding the
+// campaign + items + rollup + next_action surface.
+func (c *Client) GetCampaignStatus(ctx context.Context, id uuid.UUID) (*CampaignStatus, error) {
+	var st CampaignStatus
+	if err := c.do(ctx, http.MethodGet, "/v0/campaigns/"+id.String()+"/status", nil, &st); err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+// ListCampaignsFilter scopes a ListCampaigns call. Empty values are
+// dropped from the query string; the repo and state filters AND
+// together server-side.
+type ListCampaignsFilter struct {
+	Repo   string
+	State  string
+	Limit  int
+	Cursor string
+}
+
+// ListCampaignsResult is the paginated response envelope (the same
+// {items, next_cursor} cursor-pagination shape as ListRuns).
+type ListCampaignsResult struct {
+	Items      []Campaign `json:"items"`
+	NextCursor string     `json:"next_cursor"`
+}
+
+// ListCampaigns calls GET /v0/campaigns with optional filters and
+// cursor. Campaigns come back ordered by created_at descending.
+func (c *Client) ListCampaigns(ctx context.Context, f ListCampaignsFilter) (*ListCampaignsResult, error) {
+	q := url.Values{}
+	if f.Repo != "" {
+		q.Set("repo", f.Repo)
+	}
+	if f.State != "" {
+		q.Set("state", f.State)
+	}
+	if f.Limit > 0 {
+		q.Set("limit", strconv.Itoa(f.Limit))
+	}
+	if f.Cursor != "" {
+		q.Set("cursor", f.Cursor)
+	}
+	path := "/v0/campaigns"
+	if encoded := q.Encode(); encoded != "" {
+		path = path + "?" + encoded
+	}
+	var res ListCampaignsResult
+	if err := c.do(ctx, http.MethodGet, path, nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// ResumeCampaign calls POST /v0/campaigns/{id}/resume (no request
+// body) — the operator's hand-back after the auto-driver paged a human
+// at a run gate (E25.7). The 200 body is the resumed Campaign (now
+// running). "Nothing to resume" surfaces as *APIError (409
+// campaign_not_paused); a token missing write:campaigns surfaces as 403
+// insufficient_scope.
+func (c *Client) ResumeCampaign(ctx context.Context, id uuid.UUID) (*Campaign, error) {
+	var camp Campaign
+	if err := c.do(ctx, http.MethodPost, "/v0/campaigns/"+id.String()+"/resume", nil, &camp); err != nil {
+		return nil, err
+	}
+	return &camp, nil
+}
+
 // do performs the request and decodes the JSON body into out (or
 // reads the error envelope on non-2xx and returns *APIError).
 func (c *Client) do(ctx context.Context, method, path string, body []byte, out any) error {

@@ -15,6 +15,10 @@
 //	fishhawk deploy approve  <run-id> [--reason ...] [--output text|json]
 //	fishhawk deploy reject   <run-id> [--reason ...] [--output text|json]
 //	fishhawk deploy rollback <run-id> [--output text|json]
+//	fishhawk campaign start  --repo R --epic E [--pause-policy P] [--output text|json]
+//	fishhawk campaign status <campaign-id> [--output text|json]
+//	fishhawk campaign list   [--repo R] [--state S] [--limit N] [--cursor X]
+//	fishhawk campaign resume <campaign-id> [--output text|json]
 //	fishhawk audit list   <run-id> [--category C] [--stage UUID] [--limit N] [--cursor X] [--output text|json]
 //	fishhawk audit tail   <run-id> [--interval D] [--output text|json] [--max-polls N]
 //	fishhawk file-issue   --repo R --type T --summary S [--body B] [--label L]... [--parent-epic E] [--run-id ID] [--output text|json]
@@ -66,6 +70,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runPlan(rest, stdout, stderr)
 	case "deploy":
 		return runDeploy(rest, stdout, stderr)
+	case "campaign":
+		return runCampaign(rest, stdout, stderr)
 	case "audit":
 		return runAudit(rest, stdout, stderr)
 	case "validate":
@@ -128,6 +134,10 @@ func printUsage(w io.Writer) {
 		"  deploy approve  Approve the deploy stage's pre-execution gate (needs write:deploy).",
 		"  deploy reject   Reject the deploy stage's pre-execution gate (category-D failure).",
 		"  deploy rollback Roll back a settled deploy (re-dispatches the rollback path).",
+		"  campaign start  Create a campaign from an epic ref.",
+		"  campaign status Show a campaign's rollup status and next action.",
+		"  campaign list   List campaigns with optional filters.",
+		"  campaign resume Resume a paused campaign (hand back to the auto-driver).",
 		"  audit list   List audit entries for a run.",
 		"  audit tail   Follow the audit log of a run in real time.",
 		"  validate     Validate a workflow spec file locally.",
