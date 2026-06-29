@@ -173,6 +173,103 @@ export interface AuditEntry {
   entry_hash: string;
 }
 
+/*
+ * Campaign surface (ADR-047 / #1437). Mirrors the Campaign / CampaignItem /
+ * CampaignRollup / CampaignNextAction / CampaignStatus schemas in
+ * docs/api/v0.openapi.yaml, which in turn match the JSON tags on
+ * campaignResponse / campaignItemResponse / campaignRollupPayload /
+ * campaignNextActionPayload in backend/internal/server/campaigns.go and
+ * campaign.PauseReason in backend/internal/campaign/campaign.go verbatim.
+ */
+export type CampaignState = 'pending' | 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled';
+
+export type CampaignItemState =
+  | 'pending'
+  | 'blocked'
+  | 'running'
+  | 'paused'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled';
+
+export type PausePolicy = 'pause_campaign' | 'pause_item';
+
+export type CampaignNextActionType = 'attention' | 'resume' | 'start_run' | 'wait' | 'complete';
+
+export interface Campaign {
+  id: string;
+  repo: string;
+  /** The epic the campaign decomposes, in `issue:N` form. */
+  epic_ref: string;
+  state: CampaignState;
+  pause_policy: PausePolicy;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Why a paused item was handed off to a human (E25.7). Present only while
+ * the item is — or was — paused; every field is optional (omitempty on the
+ * Go side).
+ */
+export interface PauseReason {
+  /** The audit category that triggered the page (e.g. `campaign_gate_paged`). */
+  page_event?: string;
+  /** The run whose gate was handed off. */
+  run_id?: string | null;
+  /** The gate's stage, if any. */
+  stage_id?: string | null;
+  /** The gate/decision the human must own. */
+  gate?: string;
+}
+
+export interface CampaignItem {
+  id: string;
+  issue_ref: string;
+  /** Sibling issue refs this item depends on — the DAG edges (possibly empty). */
+  depends_on: string[];
+  /** The run executing this item. Omitted while the item is unlinked. */
+  run_id?: string | null;
+  state: CampaignItemState;
+  /** Present only while the item is — or was — paused. */
+  pause_reason?: PauseReason | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * The engine's readiness partition over a campaign's items. Every slice
+ * holds issue refs; an item appears in exactly one slice. Each field is
+ * always an array (never null).
+ */
+export interface CampaignRollup {
+  eligible: string[];
+  blocked: string[];
+  running: string[];
+  done: string[];
+  failed: string[];
+  cancelled: string[];
+  paused: string[];
+}
+
+export interface CampaignNextAction {
+  action: CampaignNextActionType;
+  /** The item the action refers to. Omitted for `wait` / `complete`. */
+  issue_ref?: string;
+  detail?: string;
+}
+
+/**
+ * GET /v0/campaigns/{id}/status — the campaign + its items + the engine's
+ * readiness rollup + the distilled next action, in one payload.
+ */
+export interface CampaignStatus {
+  campaign: Campaign;
+  items: CampaignItem[];
+  rollup: CampaignRollup;
+  next_action: CampaignNextAction;
+}
+
 export type ApprovalDecision = 'approve' | 'reject';
 
 export interface ApprovalRequest {

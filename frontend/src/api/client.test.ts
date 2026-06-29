@@ -169,6 +169,71 @@ describe('api.getStagePromptRender (#215)', () => {
   });
 });
 
+describe('api.listCampaigns (ADR-047 / #1437)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('hits /v0/campaigns with a GET and no query string when no params are passed', async () => {
+    const fetchMock = mockFetch();
+    await api.listCampaigns();
+    const url = fetchMock.mock.calls.at(-1)?.[0] as string;
+    expect(url).toMatch(/\/v0\/campaigns$/);
+    const init = lastInit(fetchMock);
+    expect((init.method ?? 'GET').toUpperCase()).toBe('GET');
+  });
+
+  it('serialises every filter into the query string', async () => {
+    const fetchMock = mockFetch();
+    await api.listCampaigns({
+      limit: 25,
+      cursor: 'abc',
+      repo: 'kuhlman-labs/fishhawk',
+      state: 'running',
+    });
+    const url = fetchMock.mock.calls.at(-1)?.[0] as string;
+    expect(url).toContain('limit=25');
+    expect(url).toContain('cursor=abc');
+    expect(url).toContain('repo=kuhlman-labs%2Ffishhawk');
+    expect(url).toContain('state=running');
+  });
+
+  it('omits empty / undefined params from the query string', async () => {
+    const fetchMock = mockFetch();
+    await api.listCampaigns({ limit: 50 });
+    const url = fetchMock.mock.calls.at(-1)?.[0] as string;
+    expect(url).toContain('limit=50');
+    expect(url).not.toContain('cursor=');
+    expect(url).not.toContain('repo=');
+    expect(url).not.toContain('state=');
+  });
+});
+
+describe('api.getCampaignStatus (ADR-047 / #1437)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('hits /v0/campaigns/{id}/status with a GET and url-encodes the id', async () => {
+    const fetchMock = mockFetch();
+    await api.getCampaignStatus('cccccccc-1111-1111-1111-111111111111');
+    const url = fetchMock.mock.calls.at(-1)?.[0] as string;
+    expect(url).toBe('/v0/campaigns/cccccccc-1111-1111-1111-111111111111/status');
+    const init = lastInit(fetchMock);
+    expect((init.method ?? 'GET').toUpperCase()).toBe('GET');
+  });
+});
+
+describe('api.getCampaign (ADR-047 / #1437)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('hits /v0/campaigns/{id} with a GET', async () => {
+    const fetchMock = mockFetch();
+    await api.getCampaign('cccccccc-1111-1111-1111-111111111111');
+    const url = fetchMock.mock.calls.at(-1)?.[0] as string;
+    expect(url).toBe('/v0/campaigns/cccccccc-1111-1111-1111-111111111111');
+  });
+});
+
 describe('api.listStageChecks (#228)', () => {
   beforeEach(() => vi.unstubAllGlobals());
   afterEach(() => vi.unstubAllGlobals());
