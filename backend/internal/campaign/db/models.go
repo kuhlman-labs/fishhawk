@@ -54,13 +54,14 @@ type AuditEntry struct {
 }
 
 type Campaign struct {
-	ID          uuid.UUID          `json:"id"`
-	Repo        string             `json:"repo"`
-	EpicRef     string             `json:"epic_ref"`
-	State       string             `json:"state"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
-	PausePolicy string             `json:"pause_policy"`
+	ID            uuid.UUID          `json:"id"`
+	Repo          string             `json:"repo"`
+	EpicRef       string             `json:"epic_ref"`
+	State         string             `json:"state"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	PausePolicy   string             `json:"pause_policy"`
+	OperatorAgent []byte             `json:"operator_agent"`
 }
 
 type CampaignItem struct {

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
@@ -34,9 +36,18 @@ type campaignResponse struct {
 	// (E25.7): pause_campaign (block the whole campaign, the default) or
 	// pause_item (continue-others). Always normalized (never empty) on a
 	// persisted campaign.
-	PausePolicy string    `json:"pause_policy"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	PausePolicy string `json:"pause_policy"`
+	// OperatorAgent is the OPTIONAL campaign-level operator_agent delegation
+	// override (E25.12 / #1451): when present it wins WHOLESALE as the
+	// outermost rung of the resolution ladder (campaign > gate > workflow) for
+	// every issue-run of the campaign. Surfaced as the raw JSON block the
+	// campaign was created with (omitted when the campaign carries no override,
+	// the unchanged-behavior default). Because it wins wholesale for every
+	// issue-run, the campaign block IS each issue-run's effective contract when
+	// present.
+	OperatorAgent json.RawMessage `json:"operator_agent,omitempty"`
+	CreatedAt     time.Time       `json:"created_at"`
+	UpdatedAt     time.Time       `json:"updated_at"`
 }
 
 // campaignItemResponse mirrors docs/api/v0.openapi.yaml's `CampaignItem`
@@ -93,6 +104,14 @@ type createCampaignRequest struct {
 	// (continue-others). Empty normalizes to pause_campaign inside
 	// campaign.Persist, so omitting it yields the conservative default.
 	PausePolicy string `json:"pause_policy,omitempty"`
+	// OperatorAgent is the OPTIONAL campaign-level operator_agent override
+	// (E25.12 / #1451): a delegation block that tightens or relaxes the
+	// per-workflow contract for ALL the campaign's issue-runs, winning
+	// wholesale over the gate/workflow blocks. Carried as raw JSON and
+	// validated against spec.OperatorAgent (unknown fields rejected) in the
+	// handler before it is stored opaquely. Omit it for no override (each
+	// issue-run inherits its workflow's contract — the unchanged default).
+	OperatorAgent json.RawMessage `json:"operator_agent,omitempty"`
 }
 
 func toCampaignResponse(c *campaign.Campaign) campaignResponse {
@@ -102,8 +121,11 @@ func toCampaignResponse(c *campaign.Campaign) campaignResponse {
 		EpicRef:     c.EpicRef,
 		State:       string(c.State),
 		PausePolicy: string(c.PausePolicy),
-		CreatedAt:   c.CreatedAt,
-		UpdatedAt:   c.UpdatedAt,
+		// Raw JSON passthrough: nil bytes → omitted (omitempty), so a campaign
+		// with no override carries no operator_agent key.
+		OperatorAgent: json.RawMessage(c.OperatorAgent),
+		CreatedAt:     c.CreatedAt,
+		UpdatedAt:     c.UpdatedAt,
 	}
 }
 
@@ -250,6 +272,19 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"field": "pause_policy", "got": req.PausePolicy})
 		return
 	}
+	// operator_agent is OPTIONAL. When present, it must be a well-formed
+	// spec.OperatorAgent block (unknown fields rejected) — validated HERE so a
+	// malformed override surfaces a 400 at create rather than being stored
+	// opaquely and failing later at the auto-driver consumer (slice B). The
+	// validated raw bytes are stored verbatim; the campaign package stays
+	// spec-free. A JSON `null` (or omission) is treated as "no override".
+	operatorAgentBytes, ok := validateOperatorAgent(req.OperatorAgent)
+	if !ok {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"operator_agent must be a valid operator-agent block",
+			map[string]any{"field": "operator_agent"})
+		return
+	}
 
 	// Resolve the App installation for the target repo (#713 / runs.go:498).
 	// A runless create has no run row to carry the id, so resolve it directly:
@@ -341,6 +376,10 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	// the persisted campaign (the call-site update deferred from slice 1; a
 	// zero value is normalized to pause_campaign inside campaign.Persist).
 	assembly.PausePolicy = campaign.PausePolicy(req.PausePolicy)
+	// Thread the validated campaign-level operator_agent override onto the
+	// assembly (E25.12). Nil = no override; the campaign inherits each
+	// issue-run's workflow contract unchanged.
+	assembly.OperatorAgent = operatorAgentBytes
 
 	created, err := campaign.Persist(r.Context(), s.cfg.CampaignRepo, req.Repo, assembly)
 	if err != nil {
@@ -431,6 +470,32 @@ var validCampaignStates = map[string]struct{}{
 var validPausePolicies = map[string]bool{
 	string(campaign.PausePolicyPauseCampaign): true,
 	string(campaign.PausePolicyPauseItem):     true,
+}
+
+// validateOperatorAgent validates the OPTIONAL campaign-level operator_agent
+// override carried as raw JSON. It returns the bytes to store plus ok:
+//   - empty/absent (len 0) or a JSON `null` literal -> (nil, true): no override
+//     (each issue-run inherits its workflow contract — the unchanged default).
+//   - a well-formed spec.OperatorAgent block (unknown fields rejected) ->
+//     (raw, true): stored verbatim, opaque to the campaign package.
+//   - anything else — malformed JSON, an unknown field, or a non-object —
+//     -> (nil, false): the handler answers 400 validation_failed.
+//
+// Validating against the spec.OperatorAgent Go type with DisallowUnknownFields
+// IS the v0 validation (no separate JSON schema), consistent with how
+// pause_policy is validated in Go. The reused spec type is why no
+// docs/spec/*.schema.json change — and so no schema-sync gate — is triggered.
+func validateOperatorAgent(raw json.RawMessage) ([]byte, bool) {
+	if len(raw) == 0 || string(bytes.TrimSpace(raw)) == "null" {
+		return nil, true
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var oa spec.OperatorAgent
+	if err := dec.Decode(&oa); err != nil {
+		return nil, false
+	}
+	return raw, true
 }
 
 // handleGetCampaign implements GET /v0/campaigns/{campaign_id}.

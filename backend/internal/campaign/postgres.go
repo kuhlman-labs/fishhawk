@@ -41,6 +41,9 @@ func (r *postgresRepo) CreateCampaign(ctx context.Context, p CreateCampaignParam
 		// column CHECK an empty string. campaign.Persist normalizes too; this
 		// is the defensive last line for any other repository caller.
 		PausePolicy: string(normalizePausePolicy(p.PausePolicy)),
+		// OperatorAgent is the OPTIONAL campaign-level delegation override
+		// (E25.12), stored opaquely. Nil persists as NULL — no override.
+		OperatorAgent: p.OperatorAgent,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create campaign: %w", err)
@@ -285,7 +288,7 @@ func marshalDependsOn(deps []string) ([]byte, error) {
 }
 
 func rowToCampaign(c campaigndb.Campaign) *Campaign {
-	return &Campaign{
+	out := &Campaign{
 		ID:          c.ID,
 		Repo:        c.Repo,
 		EpicRef:     c.EpicRef,
@@ -294,6 +297,13 @@ func rowToCampaign(c campaigndb.Campaign) *Campaign {
 		CreatedAt:   c.CreatedAt.Time,
 		UpdatedAt:   c.UpdatedAt.Time,
 	}
+	// JSONB → raw []byte passthrough. A NULL/empty column yields nil (no
+	// override) rather than an empty slice, so the unchanged-behavior path is
+	// nil-clean — same len()>0 tolerance posture as the pause_reason carrier.
+	if len(c.OperatorAgent) > 0 {
+		out.OperatorAgent = c.OperatorAgent
+	}
+	return out
 }
 
 func rowToCampaignItem(i campaigndb.CampaignItem) *Item {

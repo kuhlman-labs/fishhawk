@@ -149,8 +149,19 @@ type Campaign struct {
 	// PausePolicy governs what the auto-driver pauses on a gate hand-off.
 	// Always normalized (never empty) on a persisted campaign.
 	PausePolicy PausePolicy
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// OperatorAgent is the OPTIONAL campaign-level delegation override
+	// (Track E / E25.12): the raw JSONB operator_agent block that, when
+	// present, wins WHOLESALE as the outermost rung of the resolution ladder
+	// (campaign > gate > workflow) for every issue-run of the campaign. It is
+	// stored opaquely as raw bytes here — the campaign package stays spec-free,
+	// mirroring how a run carries WorkflowSpec []byte; the server validates it
+	// against spec.OperatorAgent at create time and the auto-driver (slice B)
+	// parses it at consumption. Nil (NULL column) means no override: each
+	// issue-run inherits its workflow's operator_agent contract, byte-identical
+	// to pre-E25.12 behavior.
+	OperatorAgent []byte
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // Item is one issue within a campaign.

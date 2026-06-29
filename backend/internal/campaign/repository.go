@@ -23,6 +23,11 @@ type CreateCampaignParams struct {
 	Repo        string
 	EpicRef     string
 	PausePolicy PausePolicy
+	// OperatorAgent is the OPTIONAL campaign-level delegation override, carried
+	// as raw JSONB bytes (E25.12). Nil persists as NULL — no override. The
+	// campaign package never interprets these bytes; the server validates them
+	// against spec.OperatorAgent before they reach here.
+	OperatorAgent []byte
 }
 
 // CreateCampaignItemParams are the inputs needed to insert a new campaign
