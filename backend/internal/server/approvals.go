@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/budget"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -416,134 +417,228 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// still rendered on the review page via GET /v0/stages/{id}/
 	// checks — it's informational, not a gate.
 
-	res, err := s.cfg.ApprovalRepo.Submit(r.Context(), approval.SubmitParams{
-		StageID:         stageID,
-		ApproverSubject: subject,
-		Decision:        decision,
-		Comment:         commentPtr,
-		Surface:         approval.SurfaceAPI,
+	// Gate-action core (E25.6 / ADR-047): the approval Submit + audit +
+	// model-resolution emission + state advance + orchestrator handoff +
+	// drive stamp + notifications are factored into approveStageAs, an
+	// identity-parameterised service method the in-process campaign
+	// auto-driver also calls. The HTTP handler owns every pre-Submit gate
+	// above; the result/error it returns is rendered to HTTP here exactly as
+	// the prior inline core did (duplicate 200, InvalidTransition 409, and
+	// the two distinct submit/advance 500 messages).
+	result, err := s.approveStageAs(r.Context(), ident, approveActionParams{
+		Stage:               stage,
+		Decision:            decision,
+		Comment:             req.Comment,
+		CommentPtr:          commentPtr,
+		ApproverGithubLogin: req.ApproverGithubLogin,
+		AddScopeFiles:       req.AddScopeFiles,
+		BindingAssertions:   req.BindingAssertions,
+		DelegatedRule:       delegatedRule,
+		ResolvedModel:       resolvedModel,
+		PlanModel:           req.PlanModel,
+		ReviewModel:         req.ReviewModel,
 	})
 	if err != nil {
+		var aerr *approveActionError
+		if errors.As(err, &aerr) && aerr.failedAt == gateActionAdvance {
+			var inv run.InvalidTransitionError
+			if errors.As(aerr.err, &inv) {
+				s.writeError(w, r, http.StatusConflict, "invalid_state_transition",
+					aerr.err.Error(),
+					map[string]any{"stage_id": stageID.String(),
+						"from": inv.From, "to": inv.To})
+				return
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"transition stage failed", map[string]any{"error": aerr.err.Error()})
+			return
+		}
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"submit approval failed", map[string]any{"error": err.Error()})
 		return
 	}
 
-	// Only the FIRST submission for this approver triggers a stage
-	// transition. A concurrent second submission that lost the race
-	// past the duplicate pre-check gets the same labeled duplicate
-	// 200 the pre-check produces.
-	if !res.Inserted {
-		s.writeJSON(w, r, http.StatusOK, duplicateApprovalResponse(stage, res.Approval))
+	if result.Duplicate != nil {
+		s.writeJSON(w, r, http.StatusOK, duplicateApprovalResponse(stage, result.Duplicate))
 		return
+	}
+
+	s.writeJSON(w, r, http.StatusOK, toStageResponse(result.Stage))
+}
+
+// gateActionStage names where in approveStageAs a failure occurred, so the
+// HTTP handler can reproduce the two distinct 500 messages (Submit vs
+// advance) plus the advance-only InvalidTransition → 409 mapping.
+type gateActionStage int
+
+const (
+	gateActionSubmit gateActionStage = iota
+	gateActionAdvance
+)
+
+// approveActionError wraps a failure from the advance step of approveStageAs
+// so the caller can distinguish it from a Submit failure (the two map to
+// different HTTP responses). A Submit failure is returned UNWRAPPED, so
+// errors.As against *approveActionError is the discriminator.
+type approveActionError struct {
+	failedAt gateActionStage
+	err      error
+}
+
+func (e *approveActionError) Error() string { return e.err.Error() }
+func (e *approveActionError) Unwrap() error { return e.err }
+
+// approveActionParams carries the resolved inputs for approveStageAs. The
+// HTTP handler computes them from the request body + every pre-Submit gate;
+// the in-process campaign auto-driver (E25.6) supplies them directly.
+type approveActionParams struct {
+	Stage               *run.Stage
+	Decision            approval.Decision
+	Comment             string
+	CommentPtr          *string
+	ApproverGithubLogin string
+	AddScopeFiles       []string
+	BindingAssertions   []bindingAssertion
+	DelegatedRule       string
+	ResolvedModel       *ResolvedModel
+	PlanModel           string
+	ReviewModel         string
+}
+
+// approveActionResult is approveStageAs's success outcome: either the
+// advanced stage, or — when the (stage, subject) approval already existed —
+// the prior approval row labelling a duplicate submission (no audit, no
+// advance; the first decision stands).
+type approveActionResult struct {
+	Stage     *run.Stage
+	Duplicate *approval.Approval
+}
+
+// approveStageAs performs the gate-action core of POST
+// /v0/stages/{id}/approvals under the given identity: ApprovalRepo.Submit,
+// the approval_submitted audit write, the model_resolved emissions
+// (#1013/#1416), the state advance (advanceForDecision, which special-cases
+// the deploy pre-execution gate), the orchestrator handoff on approve AND
+// reject, the drive plan-approved stamp, and the plan-comment + sticky-status
+// notifications. It is identity-parameterised so the HTTP handler and the
+// in-process campaign auto-driver (E25.6 / ADR-047) drive the identical path
+// and stamp identical audit.
+//
+// Ordering is preserved from the prior inline core: the audit + model writes
+// precede advance (#1351) so a dispatch racing the transition observes them;
+// the pre-advance Stage row is used for those writes (advance mutates only
+// State, not the ID/RunID they read), and the advanced row drives the
+// orchestrator/drive/notify steps. A Submit failure is returned unwrapped; an
+// advance failure is wrapped in *approveActionError so the caller maps
+// InvalidTransition → 409 and the two distinct 500 messages.
+func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActionParams) (*approveActionResult, error) {
+	// Resolve the acting subject from the identity with the same
+	// "anonymous" fallback the handler applies, so the recorded
+	// ApproverSubject (and the actor kind derived from it) is byte-identical
+	// to the HTTP path.
+	subject := id.Subject
+	if subject == "" {
+		subject = "anonymous"
+	}
+	res, err := s.cfg.ApprovalRepo.Submit(ctx, approval.SubmitParams{
+		StageID:         p.Stage.ID,
+		ApproverSubject: subject,
+		Decision:        p.Decision,
+		Comment:         p.CommentPtr,
+		Surface:         approval.SurfaceAPI,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Only the FIRST submission for this approver triggers a stage
+	// transition. A concurrent second submission that lost the race past the
+	// duplicate pre-check gets the same labeled duplicate 200 the pre-check
+	// produces.
+	if !res.Inserted {
+		return &approveActionResult{Duplicate: res.Approval}, nil
 	}
 
 	// Persist the approval audits BEFORE advancing the stage (#1351). The
-	// stage transition below is the dispatch-gating signal: BOTH the
-	// synchronous Orchestrator.Advance handoff AND an asynchronous reconciler
-	// that observes a succeeded plan stage with a still-pending implement stage
-	// can dispatch the implement stage — and the runner can fetch its prompt —
-	// the instant the plan stage flips to succeeded. That prompt-fetch reads
-	// these audits: loadApprovalAddScopeFiles folds approval_submitted's
-	// add_scope_files into the implement agent's enforced scope, and the
-	// runner-spawn router reads model_resolved. With the writes AFTER the
-	// transition (the prior ordering), the initial dispatch's fetch raced the
-	// write and lost — the operator-declared add_scope_files paths were absent
-	// from the enforced scope on the first dispatch, forcing a redundant
-	// mid-stage amendment for the very files already declared (reproduced in
-	// runs 03f6e28a/#1349 and e6e379fd/#1352). Writing them first makes them
-	// durably visible before any dispatch path can observe the transition. The
-	// `stage` here is the pre-advance row; advanceStage mutates only its State,
-	// not the ID/RunID these audits read, so the persisted payloads are
-	// byte-identical to the prior ordering — only their commit point moves
-	// earlier. Both writes are best-effort (a logged append failure never
-	// unwinds the approval the gate already recorded via Submit).
-	s.writeApprovalAudit(r, stage, res.Approval, req.Comment, req.ApproverGithubLogin, req.AddScopeFiles, req.BindingAssertions, delegatedRule)
+	// stage transition below is the dispatch-gating signal, and the runner's
+	// prompt-fetch reads these audits (loadApprovalAddScopeFiles folds
+	// approval_submitted's add_scope_files into the enforced scope; the
+	// runner-spawn router reads model_resolved), so they must be durably
+	// visible before any dispatch path can observe the transition. The
+	// pre-advance row is used here; advanceStage mutates only its State, not
+	// the ID/RunID these audits read. Best-effort: a logged append failure
+	// never unwinds the approval the gate already recorded via Submit.
+	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.BindingAssertions, p.DelegatedRule)
 
 	// Model resolution (#1013, extended #1416): emit the source-tagged
-	// model_resolved audit entries the gate computed on this plan-stage approve
-	// — the INTRODUCTION of the model_resolved kind (CategoryModelResolved). The
-	// implement entry routes the runner spawn's --model (gateResolvedModel reads
-	// it); #1416 adds per-stage plan and review entries (each keyed to its
-	// target stage so the observability slice reads a stage's model by StageID,
-	// and tagged with stage_type so the implement runner-spawn reader filters to
-	// the implement entry). Emitted even when a resolution is empty
-	// (ModelSourceNone): the readers return it as a deliberate "use the default
-	// spawn" decision, byte-identical to today's no---model spawn. Like the
-	// approval audit above, they must precede advanceStage so the runner-spawn
-	// router cannot read an empty model_resolved on a dispatch that races the
-	// transition. A nil resolvedModel (GetRun fail-open) emits NOTHING.
-	if resolvedModel != nil {
-		s.writeStageModelResolutions(r, stage, res.Approval, *resolvedModel, req.PlanModel, req.ReviewModel)
+	// model_resolved audit entries the gate computed on this plan-stage
+	// approve. Emitted even when a resolution is empty (the readers treat it
+	// as a deliberate default spawn); must precede advance for the same race
+	// reason as the approval audit. A nil ResolvedModel (GetRun fail-open, or
+	// a non-plan/reject path) emits NOTHING.
+	if p.ResolvedModel != nil {
+		s.writeStageModelResolutions(ctx, p.Stage, res.Approval, *p.ResolvedModel, p.PlanModel, p.ReviewModel)
 	}
 
-	stage, err = s.advanceForDecision(r.Context(), stage, decision)
+	advanced, err := s.advanceForDecision(ctx, p.Stage, p.Decision)
 	if err != nil {
-		var inv run.InvalidTransitionError
-		if errors.As(err, &inv) {
-			s.writeError(w, r, http.StatusConflict, "invalid_state_transition",
-				err.Error(),
-				map[string]any{"stage_id": stageID.String(),
-					"from": inv.From, "to": inv.To})
-			return
-		}
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"transition stage failed", map[string]any{"error": err.Error()})
-		return
+		return nil, &approveActionError{failedAt: gateActionAdvance, err: err}
 	}
 
-	// Hand off to the orchestrator on both approve AND reject
-	// — approve dispatches the next stage; reject walks the
-	// run's state machine to terminal (pending → running →
-	// failed). Without the reject path the run would stay in
-	// pending forever once an approver rejected.
+	// Hand off to the orchestrator on both approve AND reject — approve
+	// dispatches the next stage; reject walks the run's state machine to
+	// terminal. Best-effort: the gate already passed/rejected and the audit
+	// row is in place, so an orchestration failure logs and lets a follow-up
+	// call recover.
 	if s.cfg.Orchestrator != nil {
-		if _, err := s.cfg.Orchestrator.Advance(r.Context(), stage.RunID); err != nil {
-			// Don't fail the approval: the gate did pass /
-			// reject, the audit row is in place. Surface
-			// the orchestration failure in logs and let a
-			// follow-up call recover.
-			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError,
+		if _, err := s.cfg.Orchestrator.Advance(ctx, advanced.RunID); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
 				"orchestrator advance failed",
-				slog.String("run_id", stage.RunID.String()),
-				slog.String("stage_id", stage.ID.String()),
+				slog.String("run_id", advanced.RunID.String()),
+				slog.String("stage_id", advanced.ID.String()),
 				slog.String("error", err.Error()),
 			)
 		}
 	}
 
 	// Drive (#1023): a plan-gate approval on a drive-enabled run is the
-	// plan_approved_dispatch transition point — the orchestrator handoff
-	// above IS the auto-advance (workflow_dispatch for runner_kind
-	// github_actions), so stamp the run_auto_advanced entry that makes
-	// it attributable; runner_kind local parks with a ready-to-run next
-	// action instead (ADR-024: the runner is host-spawned, the backend
-	// has no execution channel to it). After the orchestrator block so
-	// the entry documents an advance that was actually attempted.
-	if decision == approval.DecisionApprove && stage.Type == run.StageTypePlan {
-		s.recordDrivePlanApproved(r.Context(), stage)
+	// plan_approved_dispatch transition point — stamp it after the
+	// orchestrator block so the entry documents an advance that was actually
+	// attempted.
+	if p.Decision == approval.DecisionApprove && advanced.Type == run.StageTypePlan {
+		s.recordDrivePlanApproved(ctx, advanced)
 	}
 
-	// Plan-comment re-render (#377): a plan-stage approve or
-	// reject re-fires the plan-on-issue hook, which edits the
-	// existing comment in place (when the spec opts in to
-	// `update_on_change`) and appends a `_Status:_` footer
-	// naming the actor. The retired NotifyPlanApproved
-	// broadcast (#274) used to live here; it duplicated what
-	// the plan-comment edit + sticky status comment already
-	// surface. Best-effort: notifyPlanReady logs but never
+	// Plan-comment re-render (#377): a plan-stage approve or reject re-fires
+	// the plan-on-issue hook. Best-effort: notifyPlanReady logs but never
 	// unwinds the approval.
-	if stage.Type == run.StageTypePlan {
-		s.notifyPlanReady(r.Context(), stage.RunID, stage)
+	if advanced.Type == run.StageTypePlan {
+		s.notifyPlanReady(ctx, advanced.RunID, advanced)
 	}
 
-	// Sticky status comment (E20.4 / #330). Every approval —
-	// approve or reject, plan stage or otherwise — changes the
-	// run's surface state and is worth surfacing in the issue
-	// thread.
-	s.notifyStatusUpdate(r.Context(), stage.RunID, "approval_submit")
+	// Sticky status comment (E20.4 / #330). Every approval changes the run's
+	// surface state and is worth surfacing in the issue thread.
+	s.notifyStatusUpdate(ctx, advanced.RunID, "approval_submit")
 
-	s.writeJSON(w, r, http.StatusOK, toStageResponse(stage))
+	return &approveActionResult{Stage: advanced}, nil
+}
+
+// campaignOperatorIdentity builds the in-process Identity the campaign
+// auto-driver (E25.6 / ADR-047) acts under when it takes a delegated gate
+// action via the extracted approveStageAs/fixupStageAs/retryStageAs methods.
+// The subject is the stable operator-agent attribution
+// (operatorrole.CampaignActorSubject), which actorKindForSubject stamps as
+// audit.ActorAgent, and the scope set is the gate-action write scopes the
+// handlers enforce. TokenID is set NON-empty so requireWriteScope applies the
+// same scope check it applies to an HTTP bearer token (scope-acceptance
+// parity) rather than the cookie-session bypass — the in-process actor must
+// hold the scopes, not be waved through.
+func campaignOperatorIdentity() Identity {
+	return Identity{
+		Subject: operatorrole.CampaignActorSubject,
+		TokenID: "operator-agent-campaign",
+		Scopes:  operatorrole.CampaignActorScopes(),
+	}
 }
 
 // recordDrivePlanApproved stamps the drive engine's
@@ -819,7 +914,7 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // delegated path (#1026) and the payload records `delegated: "<rule>"`
 // — the condition checkDelegation re-evaluated and found met. Token-
 // subject attribution for the operator agent is #1027's scope.
-func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles []string, bindingAssertions []bindingAssertion, delegatedRule string) {
+func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles []string, bindingAssertions []bindingAssertion, delegatedRule string) {
 	// ADR-040 D4 (#1027): the acting subject selects the kind — an
 	// operator-agent token records agent, every other subject (human
 	// tokens, GitHub logins from the PR-review-event path) stays user.
@@ -862,7 +957,7 @@ func (s *Server) writeApprovalAudit(r *http.Request, stage *run.Stage, app *appr
 	payload, _ := json.Marshal(auditPayload)
 
 	approver := app.ApproverSubject
-	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        stage.RunID,
 		StageID:      &stage.ID,
 		Timestamp:    time.Now().UTC(),
@@ -1096,9 +1191,7 @@ func specPlanExecutorAgent(specBytes []byte, workflowID string) string {
 // keying (the implement entry on the plan stage) or skips the per-stage entries
 // rather than unwinding the approval. The implement entry is ALWAYS emitted
 // (even on a stage-lookup miss) so the runner-spawn route is never starved.
-func (s *Server) writeStageModelResolutions(r *http.Request, planStage *run.Stage, app *approval.Approval, implementRM ResolvedModel, planOverride, reviewOverride string) {
-	ctx := r.Context()
-
+func (s *Server) writeStageModelResolutions(ctx context.Context, planStage *run.Stage, app *approval.Approval, implementRM ResolvedModel, planOverride, reviewOverride string) {
 	// Default the implement entry's key to the plan stage (the legacy #1013
 	// keying) so a stage-lookup failure still routes the runner spawn; upgrade
 	// to the implement stage's id when the lookup succeeds.
@@ -1116,7 +1209,7 @@ func (s *Server) writeStageModelResolutions(r *http.Request, planStage *run.Stag
 		)
 	}
 
-	s.writeModelResolvedAudit(r, planStage.RunID, implStageID, app, implementRM, string(run.StageTypeImplement))
+	s.writeModelResolvedAudit(ctx, planStage.RunID, implStageID, app, implementRM, string(run.StageTypeImplement))
 
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, planStage.RunID)
 	if err != nil {
@@ -1140,12 +1233,12 @@ func (s *Server) writeStageModelResolutions(r *http.Request, planStage *run.Stag
 	// carrying exactly the single implement entry (#1013's surface), rather than
 	// shadow plan/review rows the readers would resolve identically.
 	if planRM := s.gateResolvePlanModel(runRow, planOverride); planRM.Value != "" {
-		s.writeModelResolvedAudit(r, planStage.RunID, planStage.ID, app, planRM, string(run.StageTypePlan))
+		s.writeModelResolvedAudit(ctx, planStage.RunID, planStage.ID, app, planRM, string(run.StageTypePlan))
 	}
 
 	if reviewStageID, ok := findStageIDByType(stages, run.StageTypeReview); ok {
 		if reviewRM := s.gateResolveReviewModel(runRow, reviewOverride); reviewRM.Value != "" {
-			s.writeModelResolvedAudit(r, planStage.RunID, reviewStageID, app, reviewRM, string(run.StageTypeReview))
+			s.writeModelResolvedAudit(ctx, planStage.RunID, reviewStageID, app, reviewRM, string(run.StageTypeReview))
 		}
 	}
 }
@@ -1172,11 +1265,11 @@ func findStageIDByType(stages []*run.Stage, t run.StageType) (uuid.UUID, bool) {
 // reads a stage's model by the entry's StageID. Actor attribution mirrors
 // writeApprovalAudit (the acting subject selects agent vs user). Best-effort: a
 // logged append failure never unwinds the approval the gate already recorded.
-func (s *Server) writeModelResolvedAudit(r *http.Request, runID, targetStageID uuid.UUID, app *approval.Approval, rm ResolvedModel, stageType string) {
+func (s *Server) writeModelResolvedAudit(ctx context.Context, runID, targetStageID uuid.UUID, app *approval.Approval, rm ResolvedModel, stageType string) {
 	actorKind := actorKindForSubject(app.ApproverSubject)
 	approver := app.ApproverSubject
 	payload, _ := json.Marshal(modelResolvedPayload{ResolvedModel: rm, StageType: stageType})
-	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        runID,
 		StageID:      &targetStageID,
 		Timestamp:    time.Now().UTC(),
