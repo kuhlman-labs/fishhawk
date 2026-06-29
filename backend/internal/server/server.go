@@ -23,6 +23,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
@@ -69,6 +70,13 @@ type Config struct {
 	// Tests inject in-memory fakes; production wires the Postgres
 	// adapter (run.NewPostgresRepository).
 	RunRepo run.Repository
+
+	// CampaignRepo persists campaigns and campaign items (ADR-047 /
+	// #1437). Wired by the /v0/campaigns handlers; nil leaves those
+	// handlers returning 503, mirroring nil RunRepo. Tests inject
+	// in-memory fakes; production wires the Postgres adapter
+	// (campaign.NewPostgresRepository).
+	CampaignRepo campaign.Repository
 
 	// SigningRepo issues + persists per-run Ed25519 keys for the
 	// trace bundle signing flow. Wired by the

@@ -26,6 +26,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/childcompletion"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
@@ -622,6 +623,7 @@ func runServe(args []string, logSink io.Writer) int {
 		}
 		defer pool.Close()
 		cfg.RunRepo = runpkg.NewPostgresRepository(pool)
+		cfg.CampaignRepo = campaign.NewPostgresRepository(pool)
 		cfg.SigningRepo = signing.NewPostgresRepository(pool)
 		cfg.AuditRepo = audit.NewPostgresRepository(pool)
 		cfg.ApprovalRepo = approval.NewPostgresRepository(pool)
