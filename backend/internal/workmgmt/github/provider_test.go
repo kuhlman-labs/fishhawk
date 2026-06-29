@@ -372,7 +372,8 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 			t.Errorf("children[%d].Number = %d, want %d", i, c.Number, wantChildren[i])
 		}
 	}
-	// Edges: 42->41, 43->41, 43->42. The #999 reference is not a child → dropped.
+	// Edges: 42->41, 43->41, 43->42. The #999 reference is not a child → it is
+	// kept out of Edges and surfaced in DroppedEdges (not silently discarded).
 	want := []workmgmt.DependsEdge{{From: 42, To: 41}, {From: 43, To: 41}, {From: 43, To: 42}}
 	if len(res.Edges) != len(want) {
 		t.Fatalf("edges = %+v, want %+v (#999 must be dropped)", res.Edges, want)
@@ -380,6 +381,17 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 	for i, e := range res.Edges {
 		if e != want[i] {
 			t.Errorf("edge[%d] = %+v, want %+v", i, e, want[i])
+		}
+	}
+	// The mis-targeted #999 reference lands in DroppedEdges so assembly can
+	// fail closed on it rather than the provider silently dropping it.
+	wantDropped := []workmgmt.DependsEdge{{From: 43, To: 999}}
+	if len(res.DroppedEdges) != len(wantDropped) {
+		t.Fatalf("dropped edges = %+v, want %+v (#999 must be surfaced)", res.DroppedEdges, wantDropped)
+	}
+	for i, e := range res.DroppedEdges {
+		if e != wantDropped[i] {
+			t.Errorf("dropped edge[%d] = %+v, want %+v", i, e, wantDropped[i])
 		}
 	}
 }

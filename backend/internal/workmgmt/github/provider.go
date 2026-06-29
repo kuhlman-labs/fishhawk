@@ -440,10 +440,12 @@ func (p *Provider) linkEpic(ctx context.Context, inst int64, repo githubclient.R
 // among them (ADR-047 / #1437, the campaign DAG source). It resolves the epic
 // reference to a node id, reads the sub-issues connection, parses each child
 // body for the depends_on marker, and builds a DependsEdge for every
-// referenced number that is itself in the children set — a reference to a
-// non-child is DROPPED, because the campaign wave DAG (plan.Waves) is over the
-// epic's own children. Children are returned ascending by number and edges
-// deterministically sorted (by From, then To) so the result is stable.
+// referenced number that is itself in the children set. A reference to a
+// non-child is kept OUT of Edges (the campaign wave DAG, plan.Waves, is over
+// the epic's own children) but surfaced in DroppedEdges rather than silently
+// discarded, so campaign assembly can fail closed on a dangling/mis-targeted
+// dependency. Children are returned ascending by number and both edge slices
+// are deterministically sorted (by From, then To) so the result is stable.
 //
 // It validates the target repo + installation (fail closed with File's
 // actionable style). It is the optional workmgmt.EpicChildrenQuerier
@@ -481,23 +483,33 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 	}
 
 	children := make([]workmgmt.EpicChild, 0, len(subs))
-	var edges []workmgmt.DependsEdge
+	var edges, dropped []workmgmt.DependsEdge
 	for _, s := range subs {
 		children = append(children, workmgmt.EpicChild{Number: s.Number, Title: s.Title})
 		for _, dep := range parseDependsOnMarker(s.Body) {
 			if isChild[dep] {
 				edges = append(edges, workmgmt.DependsEdge{From: s.Number, To: dep})
+			} else {
+				// A depends_on reference to a non-child: a typo'd number or a
+				// real cross-epic dependency. Surface it as a dropped edge
+				// (campaign assembly fails closed on it) rather than silently
+				// discarding it.
+				dropped = append(dropped, workmgmt.DependsEdge{From: s.Number, To: dep})
 			}
 		}
 	}
 	sort.Slice(children, func(i, j int) bool { return children[i].Number < children[j].Number })
-	sort.Slice(edges, func(i, j int) bool {
-		if edges[i].From != edges[j].From {
-			return edges[i].From < edges[j].From
-		}
-		return edges[i].To < edges[j].To
-	})
-	return &workmgmt.EpicChildrenResult{Children: children, Edges: edges}, nil
+	sortEdges := func(es []workmgmt.DependsEdge) {
+		sort.Slice(es, func(i, j int) bool {
+			if es[i].From != es[j].From {
+				return es[i].From < es[j].From
+			}
+			return es[i].To < es[j].To
+		})
+	}
+	sortEdges(edges)
+	sortEdges(dropped)
+	return &workmgmt.EpicChildrenResult{Children: children, Edges: edges, DroppedEdges: dropped}, nil
 }
 
 // dependsOnMarkerRE matches the depends_on body marker line and captures the
