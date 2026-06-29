@@ -754,6 +754,14 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Warn("FISHHAWKD_GITHUB_APP_ID not set; webhook dispatch and GitHub-side actions will be disabled")
 	}
 
+	// campaignNotifier is the issue-comment notifier the campaign driver fires
+	// the human page through (E25.7). Hoisted to runServe scope so the
+	// campaign-driver wiring below reuses the SAME notifier the webhook
+	// dispatcher builds; nil when the GitHub/Run/Audit deps are unconfigured,
+	// which makes the driver's Paged branch observe-only (pause recorded, no
+	// page).
+	var campaignNotifier *issuecomment.Notifier
+
 	// Webhook dispatcher requires both the GitHub REST client (for
 	// fetching the workflow spec + firing workflow_dispatch) and a
 	// run repository (for creating Run records). Without either,
@@ -785,6 +793,8 @@ func runServe(args []string, logSink io.Writer) int {
 			// degrades to a no-op via the Router's nil-channel skipping, so
 			// the empty-ExternalURL posture is unchanged.
 			IssueNotifier: issuecomment.NewRouter(notifier),
+			// (campaignNotifier reuses this same notifier for the campaign
+			// driver's page seam — assigned just below.)
 			// PlanReviewerConfigured mirrors the run-create guard's
 			// default-reviewer check (#574) so the webhook-dispatcher
 			// path refuses an agent-gated plan stage with no reviewer
@@ -804,6 +814,10 @@ func runServe(args []string, logSink io.Writer) int {
 			// repo, etc.).
 		}
 		logger.Info("webhook dispatcher configured")
+		// Reuse this notifier as the campaign driver's page seam (E25.7). It is
+		// the *Notifier directly (not the Channel router) so it satisfies the
+		// driver's NotifyStatusUpdateForRun seam.
+		campaignNotifier = notifier
 	}
 
 	// Orchestrator wires the run repository to the GitHub client
@@ -1225,7 +1239,7 @@ func runServe(args []string, logSink io.Writer) int {
 	// resolve the workflow spec). MECHANICAL advancement only — started runs
 	// park at their gates for the operator-agent until E25.6/E25.7 land.
 	if start, skipReason := campaignDriverStartDecision(*enableCampaignDriver, cfg); start {
-		ticker := newCampaignDriver(cfg, srv, logger, *campaignDriverInterval, *campaignDriverWorkflowID, *campaignDriverWorkflowRef)
+		ticker := newCampaignDriver(cfg, srv, logger, campaignNotifier, *campaignDriverInterval, *campaignDriverWorkflowID, *campaignDriverWorkflowRef)
 		go func() {
 			if err := ticker.Run(ctx); err != nil {
 				logger.Error("campaign driver exited with error", slog.String("error", err.Error()))
@@ -1468,8 +1482,8 @@ func campaignDriverStartDecision(enabled bool, cfg server.Config) (start bool, s
 // newCampaignDriver builds the campaign-driver ticker from cfg + the server
 // (the run-starter adapter binds to it). Extracted from runServe so the wiring
 // is unit-testable. Callers must gate on campaignDriverStartDecision first.
-func newCampaignDriver(cfg server.Config, srv *server.Server, logger *slog.Logger, interval time.Duration, workflowID, workflowRef string) *campaigndriver.Ticker {
-	return &campaigndriver.Ticker{
+func newCampaignDriver(cfg server.Config, srv *server.Server, logger *slog.Logger, notifier *issuecomment.Notifier, interval time.Duration, workflowID, workflowRef string) *campaigndriver.Ticker {
+	t := &campaigndriver.Ticker{
 		Campaigns: cfg.CampaignRepo,
 		Runs:      cfg.RunRepo,
 		Starter:   campaignRunStarter{srv: srv, workflowID: workflowID, workflowRef: workflowRef},
@@ -1478,6 +1492,14 @@ func newCampaignDriver(cfg server.Config, srv *server.Server, logger *slog.Logge
 		Logger:    logger,
 		Interval:  interval,
 	}
+	// Only set the Notifier seam when a concrete notifier was built. Assigning a
+	// typed nil *issuecomment.Notifier would make the interface field non-nil
+	// (the typed-nil trap), so the Paged branch would call a nil pointer instead
+	// of taking the observe-only path. A genuine nil notifier → nil seam.
+	if notifier != nil {
+		t.Notifier = notifier
+	}
+	return t
 }
 
 // campaignOperatorIdentity builds the in-process Identity the campaign

@@ -278,6 +278,82 @@ func TestClarificationQuestionPhrase(t *testing.T) {
 	}
 }
 
+// campaignGatePagedEntry builds a campaign_gate_paged audit entry matching
+// what server.emitCampaignGatePaged writes on the run chain (E25.7).
+func campaignGatePagedEntry(seq int64, pageEvent string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"page_event": pageEvent,
+		"run_id":     "00000000-0000-0000-0000-000000000000",
+		"reason":     "campaign auto-driver refused a must_page_human condition; handing the gate off to a human (E25.7)",
+	})
+	return &audit.Entry{Sequence: seq, Category: "campaign_gate_paged", Payload: payload}
+}
+
+// TestPageClassEvents_CampaignGatePagedPagesHuman covers the E25.7 hand-off: a
+// campaign_gate_paged entry is a must_page_human page class (the auto-driver
+// paused the issue and a human must own the gate) and surfaces exactly one NEW
+// ping naming the gate/decision needed, keyed on the source Sequence so a
+// re-render dedups it.
+func TestPageClassEvents_CampaignGatePagedPagesHuman(t *testing.T) {
+	entries := []*audit.Entry{
+		{Sequence: 1, Category: "run_dispatched"},
+		campaignGatePagedEntry(2, "reviewer_reject"),
+	}
+	got := pageClassEvents(entries, nil)
+	if len(got) != 1 {
+		t.Fatalf("expected one campaign_gate_paged page event; got %+v", got)
+	}
+	if got[0].kind != "campaign_gate_paged" || got[0].sequence != 2 {
+		t.Errorf("got %+v, want campaign_gate_paged at seq 2 (the dedup key)", got[0])
+	}
+	if !strings.Contains(got[0].message, "🛑") {
+		t.Errorf("message = %q, want the campaign-paused glyph", got[0].message)
+	}
+	if !strings.Contains(got[0].message, "reviewer flagged a blocking concern") {
+		t.Errorf("message = %q, want it to name the reviewer-reject gate", got[0].message)
+	}
+
+	// Dedup-on-re-render: the event keys on its source Sequence, so once the
+	// notifier records that sequence on CategoryAnchorPingPosted, a re-projection
+	// of the SAME chain yields the same sequence and firePings skips it. Assert
+	// the projection is stable (idempotent) across a re-render.
+	again := pageClassEvents(entries, nil)
+	if len(again) != 1 || again[0].sequence != 2 {
+		t.Errorf("re-render projection = %+v, want a stable single event at seq 2", again)
+	}
+}
+
+// TestCampaignGatePagedPhrase covers the known page-event tokens plus the
+// generic fallback so an empty/unknown payload never renders a bare token.
+func TestCampaignGatePagedPhrase(t *testing.T) {
+	cases := map[string]string{
+		"reviewer_reject":         "a reviewer flagged a blocking concern that needs your decision",
+		"gating_reviewer_reject":  "a reviewer flagged a blocking concern that needs your decision",
+		"requirement_arbitration": "a requirement needs your arbitration",
+		"":                        "a gate decision",
+		"something_unknown":       "a gate decision",
+	}
+	for token, want := range cases {
+		if got := campaignGatePagedPhrase(token); got != want {
+			t.Errorf("campaignGatePagedPhrase(%q) = %q, want %q", token, got, want)
+		}
+	}
+}
+
+// TestPagePageEvent reads the page_event off the payload and degrades to "" for
+// an absent/garbled body (→ the generic phrase).
+func TestPagePageEvent(t *testing.T) {
+	if ev := pagePageEvent(campaignGatePagedEntry(1, "reviewer_reject").Payload); ev != "reviewer_reject" {
+		t.Errorf("page_event = %q, want reviewer_reject", ev)
+	}
+	if ev := pagePageEvent(nil); ev != "" {
+		t.Errorf("nil payload page_event = %q, want empty", ev)
+	}
+	if ev := pagePageEvent([]byte("{not json")); ev != "" {
+		t.Errorf("garbled payload page_event = %q, want empty", ev)
+	}
+}
+
 // TestClarificationQuestionCount reads the question count off the nested
 // payload and degrades to 0 (→ count-free phrase) for an absent/garbled body.
 func TestClarificationQuestionCount(t *testing.T) {

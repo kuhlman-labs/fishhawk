@@ -26,15 +26,23 @@ type fakeCampaignStore struct {
 	campaigns map[uuid.UUID]*campaign.Campaign
 	items     map[uuid.UUID][]*campaign.Item // keyed by campaign id
 
-	listErr  error
-	itemsErr error
-	linkErr  error
-	transErr error // injected error for TransitionCampaignItem (settle and start paths)
+	listErr      error
+	itemsErr     error
+	linkErr      error
+	transErr     error // injected error for TransitionCampaignItem (settle and start paths)
+	pauseErr     error // injected error for PauseCampaignItem (page path)
+	campTransErr error // injected error for TransitionCampaign (campaign-pause path)
 
 	// recorded mutations
 	itemTransitions []itemTransition
 	campTransitions []campTransition
 	links           []linkRecord
+	pauses          []pauseRecord
+}
+
+type pauseRecord struct {
+	itemID uuid.UUID
+	reason campaign.PauseReason
 }
 
 type itemTransition struct {
@@ -138,6 +146,9 @@ func (f *fakeCampaignStore) TransitionCampaignItem(_ context.Context, id uuid.UU
 func (f *fakeCampaignStore) TransitionCampaign(_ context.Context, id uuid.UUID, to campaign.State) (*campaign.Campaign, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.campTransErr != nil {
+		return nil, f.campTransErr
+	}
 	c, ok := f.campaigns[id]
 	if !ok {
 		return nil, campaign.ErrNotFound
@@ -148,6 +159,26 @@ func (f *fakeCampaignStore) TransitionCampaign(_ context.Context, id uuid.UUID, 
 	f.campTransitions = append(f.campTransitions, campTransition{campaignID: id, to: to})
 	c.State = to
 	return c, nil
+}
+
+func (f *fakeCampaignStore) PauseCampaignItem(_ context.Context, id uuid.UUID, reason campaign.PauseReason) (*campaign.Item, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.pauseErr != nil {
+		return nil, f.pauseErr
+	}
+	it := f.findItemLocked(id)
+	if it == nil {
+		return nil, campaign.ErrNotFound
+	}
+	if !campaign.ValidCampaignItemTransition(it.State, campaign.ItemStatePaused) {
+		return nil, campaign.InvalidTransitionError{Kind: "campaign_item", From: string(it.State), To: string(campaign.ItemStatePaused)}
+	}
+	f.pauses = append(f.pauses, pauseRecord{itemID: id, reason: reason})
+	r := reason
+	it.State = campaign.ItemStatePaused
+	it.PauseReason = &r
+	return it, nil
 }
 
 func (f *fakeCampaignStore) findItemLocked(id uuid.UUID) *campaign.Item {
@@ -232,6 +263,29 @@ func (f *fakeGateActor) DriveRunGate(_ context.Context, runRow *run.Run) (GateAc
 }
 
 func (f *fakeGateActor) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
+}
+
+// --- notifier fake ----------------------------------------------------------
+
+// fakeNotifier records the run ids the driver fired a page for via the Notifier
+// seam (NotifyStatusUpdateForRun) and can inject an error.
+type fakeNotifier struct {
+	mu    sync.Mutex
+	calls []uuid.UUID
+	err   error
+}
+
+func (f *fakeNotifier) NotifyStatusUpdateForRun(_ context.Context, runID uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, runID)
+	return f.err
+}
+
+func (f *fakeNotifier) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.calls)
@@ -743,29 +797,254 @@ func TestTick_AutoDriveDisabled_SkipsGate(t *testing.T) {
 	}
 }
 
-// A GateActor that PAGES (refused a must_page_human condition) makes the driver
-// record NO campaign_gate_acted — the actor already emitted campaign_gate_paged
-// on the run chain — and the item stays parked (not settled).
-func TestTick_GateActorPages_NoActNoSettle(t *testing.T) {
+// pagingActor returns a GateActor that always pages with the given event — the
+// must_page_human refusal the E25.7 pause/page branch acts on.
+func pagingActor(event string) *fakeGateActor {
+	return &fakeGateActor{drive: func(_ *run.Run) (GateActionOutcome, error) {
+		return GateActionOutcome{Paged: true, PageEvent: event, Note: "must_page_human: " + event}, nil
+	}}
+}
+
+// --- E25.7 PAUSE / PAGE -----------------------------------------------------
+
+// (a) pause_campaign policy (the default): a must_page_human hand-off pauses
+// the affected item AND the whole campaign, records exactly one campaign_paused
+// marker (and NO campaign_gate_acted), and fires the human page once through
+// the Notifier seam for the run.
+func TestTick_GateActorPages_PauseCampaign_PausesItemAndCampaignAndPages(t *testing.T) {
 	store := newFakeStore()
 	c := store.seedCampaign(campaign.StateRunning)
+	c.PausePolicy = campaign.PausePolicyPauseCampaign
 	reader := newFakeRunReader()
 	r := reader.put(run.StateRunning)
 	it := store.seedItem(c, "issue:23", campaign.ItemStateRunning, nil, &r.ID)
 	au := &fakeAudit{}
-	actor := &fakeGateActor{drive: func(_ *run.Run) (GateActionOutcome, error) {
-		return GateActionOutcome{Paged: true, PageEvent: "reviewer_reject", Note: "must_page_human: reviewer_reject"}, nil
-	}}
+	notif := &fakeNotifier{}
 	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
-	tk.GateActor = actor
+	tk.GateActor = pagingActor("reviewer_reject")
+	tk.Notifier = notif
 
 	tk.Tick(context.Background())
 
-	if it.State != campaign.ItemStateRunning {
-		t.Fatalf("item state = %s, want running (paged, not settled)", it.State)
+	if it.State != campaign.ItemStatePaused {
+		t.Fatalf("item state = %s, want paused", it.State)
+	}
+	if it.PauseReason == nil || it.PauseReason.PageEvent != "reviewer_reject" || it.PauseReason.RunID == nil || *it.PauseReason.RunID != r.ID {
+		t.Fatalf("item PauseReason = %+v, want page_event=reviewer_reject run_id=%s", it.PauseReason, r.ID)
+	}
+	if c.State != campaign.StatePaused {
+		t.Fatalf("campaign state = %s, want paused (pause_campaign policy)", c.State)
 	}
 	if got := len(au.byCategory(categoryCampaignGateActed)); got != 0 {
 		t.Fatalf("campaign_gate_acted entries = %d, want 0 on a page", got)
+	}
+	paused := au.byCategory(categoryCampaignPaused)
+	if len(paused) != 1 {
+		t.Fatalf("campaign_paused entries = %d, want 1", len(paused))
+	}
+	if paused[0].payload["issue_ref"] != "issue:23" ||
+		paused[0].payload["run_id"] != r.ID.String() ||
+		paused[0].payload["page_event"] != "reviewer_reject" ||
+		paused[0].payload["policy"] != string(campaign.PausePolicyPauseCampaign) {
+		t.Fatalf("campaign_paused payload = %+v", paused[0].payload)
+	}
+	if notif.callCount() != 1 || notif.calls[0] != r.ID {
+		t.Fatalf("notifier calls = %v, want one page for run %s", notif.calls, r.ID)
+	}
+}
+
+// (b) pause_item policy (continue-others): the affected item pauses but the
+// campaign stays RUNNING so sibling items keep advancing.
+func TestTick_GateActorPages_PauseItem_LeavesCampaignRunning(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	c.PausePolicy = campaign.PausePolicyPauseItem
+	reader := newFakeRunReader()
+	r := reader.put(run.StateRunning)
+	it := store.seedItem(c, "issue:24", campaign.ItemStateRunning, nil, &r.ID)
+	au := &fakeAudit{}
+	notif := &fakeNotifier{}
+	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
+	tk.GateActor = pagingActor("requirement_arbitration")
+	tk.Notifier = notif
+
+	tk.Tick(context.Background())
+
+	if it.State != campaign.ItemStatePaused {
+		t.Fatalf("item state = %s, want paused", it.State)
+	}
+	if c.State != campaign.StateRunning {
+		t.Fatalf("campaign state = %s, want running (pause_item policy keeps the campaign going)", c.State)
+	}
+	if len(store.campTransitions) != 0 {
+		t.Fatalf("campaign must not transition under pause_item, got %d transitions", len(store.campTransitions))
+	}
+	paused := au.byCategory(categoryCampaignPaused)
+	if len(paused) != 1 || paused[0].payload["policy"] != string(campaign.PausePolicyPauseItem) {
+		t.Fatalf("campaign_paused entries = %+v, want one with pause_item policy", paused)
+	}
+	if notif.callCount() != 1 {
+		t.Fatalf("notifier calls = %d, want 1", notif.callCount())
+	}
+}
+
+// (c) nil Notifier (observe-only): the pause is still recorded but no page is
+// fired — the seam is optional.
+func TestTick_GateActorPages_NilNotifier_PausesWithoutPaging(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning) // zero policy → pause_campaign default
+	reader := newFakeRunReader()
+	r := reader.put(run.StateRunning)
+	it := store.seedItem(c, "issue:25", campaign.ItemStateRunning, nil, &r.ID)
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
+	tk.GateActor = pagingActor("reviewer_reject")
+	// tk.Notifier intentionally nil.
+
+	tk.Tick(context.Background()) // must not panic
+
+	if it.State != campaign.ItemStatePaused {
+		t.Fatalf("item state = %s, want paused (recorded even with no notifier)", it.State)
+	}
+	if c.State != campaign.StatePaused {
+		t.Fatalf("campaign state = %s, want paused (zero policy defaults to pause_campaign)", c.State)
+	}
+	if len(store.pauses) != 1 {
+		t.Fatalf("pause records = %d, want 1", len(store.pauses))
+	}
+	if got := len(au.byCategory(categoryCampaignPaused)); got != 1 {
+		t.Fatalf("campaign_paused entries = %d, want 1", got)
+	}
+}
+
+// (c') a PauseCampaignItem error aborts the hand-off BEFORE the campaign pause
+// and page — the safe outcome leaves the item running to retry next tick, the
+// campaign untouched, and no page fired.
+func TestTick_GateActorPages_PauseItemError_NoCampaignPauseNoPage(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	store.pauseErr = errors.New("pause boom")
+	reader := newFakeRunReader()
+	r := reader.put(run.StateRunning)
+	it := store.seedItem(c, "issue:26", campaign.ItemStateRunning, nil, &r.ID)
+	au := &fakeAudit{}
+	notif := &fakeNotifier{}
+	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
+	tk.GateActor = pagingActor("reviewer_reject")
+	tk.Notifier = notif
+
+	tk.Tick(context.Background()) // must not panic
+
+	if it.State != campaign.ItemStateRunning {
+		t.Fatalf("item state = %s, want running (pause failed, retries next tick)", it.State)
+	}
+	if c.State != campaign.StateRunning {
+		t.Fatalf("campaign state = %s, want running (no campaign pause after item-pause error)", c.State)
+	}
+	if len(store.campTransitions) != 0 {
+		t.Fatalf("campaign must not transition after a pause error, got %d", len(store.campTransitions))
+	}
+	if got := len(au.byCategory(categoryCampaignPaused)); got != 0 {
+		t.Fatalf("campaign_paused entries = %d, want 0 on a pause error", got)
+	}
+	if notif.callCount() != 0 {
+		t.Fatalf("notifier calls = %d, want 0 on a pause error", notif.callCount())
+	}
+}
+
+// (d) sticky-paused: when one item pages (pause_campaign) and a SIBLING settles
+// terminal in the SAME tick, the just-paused campaign must NOT be auto-unpaused
+// by the re-derivation — resume is an explicit operator action.
+func TestTick_GateActorPages_StickyPaused_NoAutoUnpause(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	c.PausePolicy = campaign.PausePolicyPauseCampaign
+	reader := newFakeRunReader()
+	// Pager: running item with a non-terminal run that pages.
+	pageRun := reader.put(run.StateRunning)
+	pager := store.seedItem(c, "issue:40", campaign.ItemStateRunning, nil, &pageRun.ID)
+	// Sibling: running item whose run reached terminal this tick → settles.
+	doneRun := reader.put(run.StateSucceeded)
+	sibling := store.seedItem(c, "issue:41", campaign.ItemStateRunning, nil, &doneRun.ID)
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
+	tk.GateActor = pagingActor("reviewer_reject")
+	tk.Notifier = &fakeNotifier{}
+
+	tk.Tick(context.Background())
+
+	if pager.State != campaign.ItemStatePaused {
+		t.Fatalf("pager item state = %s, want paused", pager.State)
+	}
+	if sibling.State != campaign.ItemStateSucceeded {
+		t.Fatalf("sibling item state = %s, want succeeded (still settles)", sibling.State)
+	}
+	if c.State != campaign.StatePaused {
+		t.Fatalf("campaign state = %s, want paused (sticky, not auto-unpaused by the sibling settle)", c.State)
+	}
+	if got := len(au.byCategory(categoryCampaignAdvanced)); got != 0 {
+		t.Fatalf("campaign_advanced entries = %d, want 0 (a paused campaign is not re-derived)", got)
+	}
+}
+
+// (e) campaign-pause transition error (pause_campaign): the item already paused,
+// so the failed campaign transition only degrades — it does NOT unwind the item
+// pause, the campaign_paused marker is still recorded, and the page still fires.
+func TestTick_GateActorPages_CampaignPauseError_ItemPausedPagesFired(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	c.PausePolicy = campaign.PausePolicyPauseCampaign
+	store.campTransErr = errors.New("campaign pause boom")
+	reader := newFakeRunReader()
+	r := reader.put(run.StateRunning)
+	it := store.seedItem(c, "issue:27", campaign.ItemStateRunning, nil, &r.ID)
+	au := &fakeAudit{}
+	notif := &fakeNotifier{}
+	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
+	tk.GateActor = pagingActor("reviewer_reject")
+	tk.Notifier = notif
+
+	tk.Tick(context.Background()) // must not panic
+
+	if it.State != campaign.ItemStatePaused {
+		t.Fatalf("item state = %s, want paused (item pause must not unwind on a campaign-pause error)", it.State)
+	}
+	if c.State != campaign.StateRunning {
+		t.Fatalf("campaign state = %s, want running (the campaign transition failed)", c.State)
+	}
+	if got := len(au.byCategory(categoryCampaignPaused)); got != 1 {
+		t.Fatalf("campaign_paused entries = %d, want 1 (recorded despite the campaign-pause error)", got)
+	}
+	if notif.callCount() != 1 {
+		t.Fatalf("notifier calls = %d, want 1 (page still fires)", notif.callCount())
+	}
+}
+
+// (f) Notifier error: a page failure WARN-logs and does NOT unwind the recorded
+// pause — the safe outcome (the pause) survives a transient page error.
+func TestTick_GateActorPages_NotifierError_PauseSurvives(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	c.PausePolicy = campaign.PausePolicyPauseItem
+	reader := newFakeRunReader()
+	r := reader.put(run.StateRunning)
+	it := store.seedItem(c, "issue:28", campaign.ItemStateRunning, nil, &r.ID)
+	au := &fakeAudit{}
+	notif := &fakeNotifier{err: errors.New("page post boom")}
+	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
+	tk.GateActor = pagingActor("reviewer_reject")
+	tk.Notifier = notif
+
+	tk.Tick(context.Background()) // must not panic
+
+	if it.State != campaign.ItemStatePaused {
+		t.Fatalf("item state = %s, want paused (pause survives a page error)", it.State)
+	}
+	if got := len(au.byCategory(categoryCampaignPaused)); got != 1 {
+		t.Fatalf("campaign_paused entries = %d, want 1", got)
+	}
+	if notif.callCount() != 1 {
+		t.Fatalf("notifier calls = %d, want 1 (the page was attempted)", notif.callCount())
 	}
 }
 
@@ -807,6 +1086,9 @@ func TestTick_GateActorError_LeavesParked(t *testing.T) {
 func TestTick_EndToEnd_AutoActsThenSettles_AndPagesReject(t *testing.T) {
 	store := newFakeStore()
 	c := store.seedCampaign(campaign.StateRunning)
+	// pause_item so the reject's hand-off pauses only that item; the campaign
+	// keeps running and the clean item auto-acts across the three ticks.
+	c.PausePolicy = campaign.PausePolicyPauseItem
 	reader := newFakeRunReader()
 
 	cleanRun := reader.put(run.StateRunning)  // auto-driven to terminal
@@ -863,8 +1145,13 @@ func TestTick_EndToEnd_AutoActsThenSettles_AndPagesReject(t *testing.T) {
 		t.Fatalf("settled entries = %+v, want one for the clean run", settled)
 	}
 
-	// The reject item never auto-acted and stays parked (no settle, no marker).
-	if reject.State != campaign.ItemStateRunning {
-		t.Fatalf("reject item state = %s, want running (paged, parked)", reject.State)
+	// The reject item never auto-acted; it was paused on the hand-off (E25.7)
+	// and recorded NO campaign_gate_acted. With pause_item policy the campaign
+	// itself stayed running so the clean item could finish.
+	if reject.State != campaign.ItemStatePaused {
+		t.Fatalf("reject item state = %s, want paused (gate handed off)", reject.State)
+	}
+	if got := len(au.byCategory(categoryCampaignPaused)); got != 1 {
+		t.Fatalf("campaign_paused entries = %d, want 1 (one hand-off)", got)
 	}
 }
