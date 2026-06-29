@@ -4,12 +4,21 @@
 -- internal/run/queries.sql.
 
 -- name: CreateCampaign :one
-INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 RETURNING *;
 
 -- name: GetCampaign :one
 SELECT * FROM campaigns WHERE id = $1;
+
+-- name: GetCampaignByIdempotencyKey :one
+-- Used by POST /v0/campaigns to resolve an Idempotency-Key header to a
+-- previously-created campaign. Active scope is (repo, idempotency_key);
+-- the partial unique index covers this lookup with no full scan. Mirrors
+-- internal/run/queries.sql GetRunByIdempotencyKey.
+SELECT * FROM campaigns
+ WHERE repo = $1
+   AND idempotency_key = $2;
 
 -- name: ListCampaigns :many
 -- Empty string in any filter means "no constraint." created_at DESC + id

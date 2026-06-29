@@ -52,6 +52,10 @@ type Assembly struct {
 	// server sets it from the validated create request; the campaign package
 	// never interprets it.
 	OperatorAgent []byte
+	// IdempotencyKey is the OPTIONAL create idempotency key (E25.13), threaded
+	// straight through Persist onto the campaign. Nil = no key (the unchanged
+	// default). The server sets it from a non-empty Idempotency-Key header.
+	IdempotencyKey *string
 }
 
 // AssembledItem is one campaign item produced by Assemble: its issue ref, the
@@ -172,6 +176,9 @@ func Persist(ctx context.Context, repo Repository, repoName string, a *Assembly)
 		// Thread the optional campaign-level operator_agent override straight
 		// through (E25.12): nil = no override.
 		OperatorAgent: a.OperatorAgent,
+		// Thread the optional create idempotency key straight through (E25.13):
+		// nil = no key.
+		IdempotencyKey: a.IdempotencyKey,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("campaign: create campaign for %s: %w", a.EpicRef, err)

@@ -160,8 +160,15 @@ type Campaign struct {
 	// issue-run inherits its workflow's operator_agent contract, byte-identical
 	// to pre-E25.12 behavior.
 	OperatorAgent []byte
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// IdempotencyKey scopes a create to be safely retriable: a second POST
+	// /v0/campaigns with the same (repo, idempotency_key) returns the existing
+	// campaign instead of minting a duplicate (E25.13 / #1455). Nil (NULL
+	// column) means the campaign was created without a key — the unchanged
+	// default — and the partial unique index excludes NULLs so keyless
+	// campaigns never collide. Mirrors run.Run.IdempotencyKey.
+	IdempotencyKey *string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // Item is one issue within a campaign.

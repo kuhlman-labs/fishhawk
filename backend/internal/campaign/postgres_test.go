@@ -523,6 +523,95 @@ func TestPostgres_CreateCampaign_OperatorAgent(t *testing.T) {
 	}
 }
 
+// TestPostgres_GetCampaignByIdempotencyKey_HappyPath covers the E25.13 (#1455)
+// idempotency lookup + the idempotency_key round-trip through CreateCampaign: a
+// campaign created with a key is found by (repo, key) and reads back the same
+// key. Mirrors run TestPostgres_GetRunByIdempotencyKey_HappyPath.
+func TestPostgres_GetCampaignByIdempotencyKey_HappyPath(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	key := "abc123"
+	created, err := repo.CreateCampaign(ctx, campaign.CreateCampaignParams{
+		Repo:           "kuhlman-labs/fishhawk",
+		EpicRef:        "issue:1455",
+		IdempotencyKey: &key,
+	})
+	if err != nil {
+		t.Fatalf("CreateCampaign: %v", err)
+	}
+	if created.IdempotencyKey == nil || *created.IdempotencyKey != key {
+		t.Errorf("created IdempotencyKey = %v, want %q", created.IdempotencyKey, key)
+	}
+	got, err := repo.GetCampaignByIdempotencyKey(ctx, "kuhlman-labs/fishhawk", key)
+	if err != nil {
+		t.Fatalf("GetCampaignByIdempotencyKey: %v", err)
+	}
+	if got.ID != created.ID {
+		t.Errorf("got %s, want %s", got.ID, created.ID)
+	}
+	if got.IdempotencyKey == nil || *got.IdempotencyKey != key {
+		t.Errorf("read-back IdempotencyKey round-trip failed: %v", got.IdempotencyKey)
+	}
+}
+
+// TestPostgres_GetCampaignByIdempotencyKey_NotFound: an unknown key yields
+// ErrNotFound (the handler's fall-through-to-create signal).
+func TestPostgres_GetCampaignByIdempotencyKey_NotFound(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	_, err := repo.GetCampaignByIdempotencyKey(context.Background(), "kuhlman-labs/fishhawk", "nope")
+	if !errors.Is(err, campaign.ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestPostgres_DuplicateCampaignIdempotencyKey_ConflictsAtDB pins the DB-level
+// guarantee behind the handler's lookup-then-create: the partial unique index
+// over (repo, idempotency_key) WHERE idempotency_key IS NOT NULL means a race
+// between two callers picking the same key can't both insert. Mirrors run
+// TestPostgres_DuplicateIdempotencyKey_ConflictsAtDB.
+func TestPostgres_DuplicateCampaignIdempotencyKey_ConflictsAtDB(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	key := "shared"
+	if _, err := repo.CreateCampaign(ctx, campaign.CreateCampaignParams{
+		Repo:           "kuhlman-labs/fishhawk",
+		EpicRef:        "issue:1",
+		IdempotencyKey: &key,
+	}); err != nil {
+		t.Fatalf("first CreateCampaign: %v", err)
+	}
+	_, err := repo.CreateCampaign(ctx, campaign.CreateCampaignParams{
+		Repo:           "kuhlman-labs/fishhawk",
+		EpicRef:        "issue:2",
+		IdempotencyKey: &key,
+	})
+	if err == nil {
+		t.Fatal("expected duplicate-key error from DB")
+	}
+}
+
+// TestPostgres_NullCampaignIdempotencyKey_DoesNotCollide: two campaigns with no
+// key (nil) both succeed — the partial index excludes NULLs so keyless
+// campaigns never conflict.
+func TestPostgres_NullCampaignIdempotencyKey_DoesNotCollide(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if _, err := repo.CreateCampaign(ctx, campaign.CreateCampaignParams{
+			Repo:    "kuhlman-labs/fishhawk",
+			EpicRef: "issue:1",
+		}); err != nil {
+			t.Fatalf("CreateCampaign #%d: %v", i, err)
+		}
+	}
+}
+
 // TestPostgres_TransitionCampaign_Paused covers the campaign-level paused
 // overlay edges admitted by 0040: running → paused, then resume paused →
 // running. The insert succeeding proves the widened campaigns_state_check.

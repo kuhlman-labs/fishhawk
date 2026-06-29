@@ -40,6 +40,7 @@ type fakeCampaignRepo struct {
 	// error injections so the 5xx surfaces are reachable.
 	createErr    error
 	getErr       error
+	getIdempErr  error
 	listErr      error
 	itemsErr     error
 	transCmpErr  error
@@ -61,17 +62,36 @@ func (f *fakeCampaignRepo) CreateCampaign(_ context.Context, p campaign.CreateCa
 	}
 	now := time.Now().UTC()
 	c := &campaign.Campaign{
-		ID:            uuid.New(),
-		Repo:          p.Repo,
-		EpicRef:       p.EpicRef,
-		State:         campaign.StatePending,
-		PausePolicy:   p.PausePolicy,
-		OperatorAgent: p.OperatorAgent,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		ID:             uuid.New(),
+		Repo:           p.Repo,
+		EpicRef:        p.EpicRef,
+		State:          campaign.StatePending,
+		PausePolicy:    p.PausePolicy,
+		OperatorAgent:  p.OperatorAgent,
+		IdempotencyKey: p.IdempotencyKey,
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
 	f.campaigns[c.ID] = c
 	return c, nil
+}
+
+// GetCampaignByIdempotencyKey scans for a campaign matching (repo, key),
+// mirroring the Postgres adapter's ErrNotFound-on-miss contract. getIdempErr
+// injects a non-NotFound error so the handler's 500 lookup-failed branch is
+// reachable.
+func (f *fakeCampaignRepo) GetCampaignByIdempotencyKey(_ context.Context, repo, key string) (*campaign.Campaign, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getIdempErr != nil {
+		return nil, f.getIdempErr
+	}
+	for _, c := range f.campaigns {
+		if c.Repo == repo && c.IdempotencyKey != nil && *c.IdempotencyKey == key {
+			return c, nil
+		}
+	}
+	return nil, campaign.ErrNotFound
 }
 
 // TransitionCampaign moves a campaign to the target state, mirroring the
@@ -313,6 +333,18 @@ func postCampaign(t *testing.T, s *Server, body string) *httptest.ResponseRecord
 	return w
 }
 
+// postCampaignWithKey POSTs a create body carrying an Idempotency-Key header
+// (E25.13), otherwise identical to postCampaign.
+func postCampaignWithKey(t *testing.T, s *Server, body, key string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v0/campaigns", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", key)
+	w := httptest.NewRecorder()
+	s.handleCreateCampaign(w, withAuth(req))
+	return w
+}
+
 func decodeCampaignError(t *testing.T, w *httptest.ResponseRecorder) string {
 	t.Helper()
 	var env errorEnvelope
@@ -445,6 +477,120 @@ func TestCreateCampaign_OperatorAgent_CrossBoundary_E2E(t *testing.T) {
 	}
 	if !jsonValueEqual(t, status.Campaign.OperatorAgent, []byte(override)) {
 		t.Errorf("status campaign operator_agent = %s, want value-equal to %s", status.Campaign.OperatorAgent, override)
+	}
+}
+
+// TestCreateCampaign_Idempotency_Replay_E2E is the cross-boundary done-means
+// for E25.13 (#1455): two POST /v0/campaigns with the SAME Idempotency-Key
+// against a real Postgres CampaignRepo return the SAME campaign id, the second
+// with HTTP 200 + idempotent:true, and EXACTLY ONE campaign row is persisted —
+// duplicate suppression that fails if the dedup is a no-op. The replay also
+// short-circuits before the GitHub install resolution.
+func TestCreateCampaign_Idempotency_Replay_E2E(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+
+	rec := &installRecorder{}
+	gh := recordingInstallGitHubClient(t, 7788, rec)
+	s := New(Config{CampaignRepo: repo, GitHub: gh})
+
+	body := `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`
+
+	// First POST: fresh create at 201, no idempotent flag.
+	w1 := postCampaignWithKey(t, s, body, "campaign-key-1")
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("first create status = %d, want 201 (body=%s)", w1.Code, w1.Body.String())
+	}
+	var first campaignResponse
+	if err := json.Unmarshal(w1.Body.Bytes(), &first); err != nil {
+		t.Fatalf("decode first: %v", err)
+	}
+	if first.Idempotent {
+		t.Error("first create carried idempotent:true, want false on a fresh create")
+	}
+
+	// Second POST same key: replay at 200 + idempotent:true, same id.
+	w2 := postCampaignWithKey(t, s, body, "campaign-key-1")
+	if w2.Code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200 (body=%s)", w2.Code, w2.Body.String())
+	}
+	var second campaignResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &second); err != nil {
+		t.Fatalf("decode second: %v", err)
+	}
+	if second.ID != first.ID {
+		t.Errorf("replay id = %s, want %s (same campaign)", second.ID, first.ID)
+	}
+	if !second.Idempotent {
+		t.Error("replay missing idempotent:true")
+	}
+
+	// EXACTLY ONE campaign row for the repo — the duplicate was suppressed.
+	rows, err := repo.ListCampaigns(context.Background(), campaign.ListCampaignsFilter{
+		Repo:  "kuhlman-labs/fishhawk",
+		Limit: 100,
+	})
+	if err != nil {
+		t.Fatalf("list campaigns: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("persisted campaign count = %d, want 1 (duplicate suppressed)", len(rows))
+	}
+
+	// The replay short-circuited before the GitHub install resolution: only the
+	// first create hit it.
+	rec.mu.Lock()
+	hits := rec.hits
+	rec.mu.Unlock()
+	if hits != 1 {
+		t.Errorf("install endpoint hits = %d, want 1 (replay must not do GitHub work)", hits)
+	}
+}
+
+// TestCreateCampaign_Idempotency_FirstCall_201_NoFlag pins the ErrNotFound
+// fall-through branch: the FIRST POST carrying a key (no prior campaign)
+// creates at 201 and the response carries NO idempotent key (omitempty over
+// false), so a fresh create is byte-identical to a keyless one.
+func TestCreateCampaign_Idempotency_FirstCall_201_NoFlag(t *testing.T) {
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
+
+	w := postCampaignWithKey(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`, "fresh-key")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, present := raw["idempotent"]; present {
+		t.Errorf("idempotent key present on a fresh create, want omitted (body=%s)", w.Body.String())
+	}
+}
+
+// TestCreateCampaign_Idempotency_LookupError_500 covers the third idempotency
+// branch: a non-NotFound error from GetCampaignByIdempotencyKey surfaces 500
+// internal_error and never dispatches the provider.
+func TestCreateCampaign_Idempotency_LookupError_500(t *testing.T) {
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+	repo := newFakeCampaignRepo()
+	repo.getIdempErr = fmt.Errorf("boom")
+	s := New(Config{CampaignRepo: repo})
+
+	w := postCampaignWithKey(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`, "key-x")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "internal_error" {
+		t.Errorf("code = %q, want internal_error", code)
+	}
+	if fp.called {
+		t.Error("provider dispatched despite an idempotency lookup error")
 	}
 }
 
@@ -655,24 +801,23 @@ func TestCreateCampaign_InstallationError_502(t *testing.T) {
 	}
 }
 
-// TestCreateCampaign_NoDedup_DistinctIDs is the IDEMPOTENCY-HONESTY pin: two
-// POSTs of the same {repo, epic_ref} WITH an Idempotency-Key header set must
-// BOTH return 201 with DISTINCT campaign ids (the header is ignored, not
-// honoured). No dedup is implementable — migration 0039 has no
-// idempotency_key column and campaign.Repository has no dedup lookup.
-func TestCreateCampaign_NoDedup_DistinctIDs(t *testing.T) {
+// TestCreateCampaign_Idempotency_Dedup_SameID is the enforced-dedup pin over
+// the fake repo (E25.13 / #1455, superseding the prior "header ignored, not
+// honoured" pin): two POSTs of the same {repo, epic_ref} WITH the same
+// Idempotency-Key return the SAME campaign id — the first at 201, the replay at
+// 200. A different key mints a distinct campaign. The Postgres-backed
+// duplicate-suppression done-means lives in
+// TestCreateCampaign_Idempotency_Replay_E2E.
+func TestCreateCampaign_Idempotency_Dedup_SameID(t *testing.T) {
 	fp := &fakeEpicProvider{result: smallDAG()}
 	registerEpicProvider(t, fp)
 	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install resolution skipped
 
-	post := func() campaignResponse {
-		req := httptest.NewRequest(http.MethodPost, "/v0/campaigns",
-			strings.NewReader(`{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
-		req.Header.Set("Idempotency-Key", "the-same-key")
-		w := httptest.NewRecorder()
-		s.handleCreateCampaign(w, withAuth(req))
-		if w.Code != http.StatusCreated {
-			t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	body := `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`
+	post := func(key string, wantCode int) campaignResponse {
+		w := postCampaignWithKey(t, s, body, key)
+		if w.Code != wantCode {
+			t.Fatalf("key %q status = %d, want %d (body=%s)", key, w.Code, wantCode, w.Body.String())
 		}
 		var c campaignResponse
 		if err := json.Unmarshal(w.Body.Bytes(), &c); err != nil {
@@ -681,10 +826,14 @@ func TestCreateCampaign_NoDedup_DistinctIDs(t *testing.T) {
 		return c
 	}
 
-	first := post()
-	second := post()
-	if first.ID == second.ID {
-		t.Errorf("both POSTs returned the same id %s; the Idempotency-Key header must NOT dedup", first.ID)
+	first := post("the-same-key", http.StatusCreated)
+	replay := post("the-same-key", http.StatusOK)
+	if first.ID != replay.ID {
+		t.Errorf("replay id %s != first id %s; same Idempotency-Key must dedup", replay.ID, first.ID)
+	}
+	other := post("a-different-key", http.StatusCreated)
+	if other.ID == first.ID {
+		t.Errorf("different key returned the same id %s; a distinct key must mint a distinct campaign", other.ID)
 	}
 }
 
