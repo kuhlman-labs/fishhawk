@@ -105,6 +105,37 @@ type Evaluator struct {
 	Audit    AuditLister
 }
 
+// Decision returns the already-computed Decision for the named action
+// (one of the Action* constants) and true, or a zero Decision and
+// false when the Result evaluated no knob for that action — a nil
+// Result is treated as "nothing delegated" and returns false.
+//
+// This is a READ-ONLY lookup over the Result a single Evaluate
+// produced: it performs no repository reads, evaluates no condition,
+// and does not mutate the receiver. The campaign auto-driver actor
+// (E25.6 / ADR-047) uses it to find the knob governing the current
+// gate from one Evaluate call without re-deriving any predicate
+// client-side — the same fail-closed discipline checkDelegation
+// applies at the HTTP action handlers.
+func (r *Result) Decision(action string) (Decision, bool) {
+	if r == nil {
+		return Decision{}, false
+	}
+	for _, d := range r.Actions {
+		if d.Action == action {
+			return d, true
+		}
+	}
+	return Decision{}, false
+}
+
+// MergeCondition is the delegation condition the may_merge knob names
+// (ConditionGatesResolvedCIGreen). Exposed so the auto-driver actor can
+// reference the merge knob's required condition without re-importing the
+// spec constant — keeping the actor's knob→condition knowledge sourced
+// from the delegation package that owns the mapping.
+func MergeCondition() spec.DelegationCondition { return spec.ConditionGatesResolvedCIGreen }
+
 // Configured reports whether the workflow declares an operator_agent
 // block anywhere — workflow level or on any stage gate. A false answer
 // lets callers skip Evaluate entirely (no repository reads), keeping

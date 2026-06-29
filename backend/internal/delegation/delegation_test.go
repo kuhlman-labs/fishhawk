@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -906,5 +907,96 @@ func TestEvaluate_RepoFailuresPropagate(t *testing.T) {
 				t.Errorf("Evaluate error = %v, want the injected store failure", err)
 			}
 		})
+	}
+}
+
+// --- Decision lookup helper (E25.6 / ADR-047) ---------------------------------
+
+// allKnobsEvaluator wires a gated-plan-stage evaluation so every may_*
+// knob in allKnobs() produces a Decision the lookup helper can resolve.
+func allKnobsEvaluator() (*Evaluator, *spec.Workflow, *run.Run) {
+	wf := testWorkflow(allKnobs(), nil)
+	ev := &Evaluator{
+		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
+		Concerns: &fakeConcerns{open: []*concern.Concern{openConcern("low")}},
+		Audit:    &fakeAudit{},
+	}
+	return ev, wf, newRun()
+}
+
+// TestResultDecision_PerKnob: the lookup returns the right Decision for
+// every configured knob and false for an action with no knob.
+func TestResultDecision_PerKnob(t *testing.T) {
+	ev, wf, runRow := allKnobsEvaluator()
+	res := evaluate(t, ev, wf, runRow)
+
+	for _, action := range []string{ActionApprove, ActionRouteFixup, ActionWaive, ActionRetry, ActionMerge} {
+		d, ok := res.Decision(action)
+		if !ok {
+			t.Errorf("Decision(%q) ok = false, want true (knob configured)", action)
+			continue
+		}
+		if d.Action != action {
+			t.Errorf("Decision(%q).Action = %q, want %q", action, d.Action, action)
+		}
+		// The returned Decision must match the one in Actions verbatim.
+		if want := decisionFor(t, res, action); d != want {
+			t.Errorf("Decision(%q) = %+v, want %+v", action, d, want)
+		}
+	}
+
+	if d, ok := res.Decision("not_a_knob"); ok {
+		t.Errorf("Decision(unknown) = (%+v, true), want (zero, false)", d)
+	}
+}
+
+// TestResultDecision_NilReceiver: a nil Result is "nothing delegated".
+func TestResultDecision_NilReceiver(t *testing.T) {
+	var res *Result
+	if d, ok := res.Decision(ActionApprove); ok || d != (Decision{}) {
+		t.Errorf("(*Result)(nil).Decision = (%+v, %v), want (zero, false)", d, ok)
+	}
+}
+
+// TestResultDecision_ReadOnlyOverEvaluate is the slice's required
+// assertion (binding plan step 5): the helper does not mutate the Result,
+// and two Evaluate calls over the same state return identical Results — so
+// the actor consulting the helper observes the same answer the advisory
+// read surface does, with no side effects.
+func TestResultDecision_ReadOnlyOverEvaluate(t *testing.T) {
+	ev, wf, runRow := allKnobsEvaluator()
+
+	res1, err := ev.Evaluate(context.Background(), runRow, wf)
+	if err != nil {
+		t.Fatalf("Evaluate #1: %v", err)
+	}
+	// Snapshot before any helper call.
+	before := *res1
+	beforeActions := append([]Decision(nil), res1.Actions...)
+
+	// Exercising the lookup must not mutate the Result.
+	for _, action := range []string{ActionApprove, ActionRouteFixup, ActionWaive, ActionRetry, ActionMerge, "missing"} {
+		res1.Decision(action)
+	}
+	if !reflect.DeepEqual(*res1, before) || !reflect.DeepEqual(res1.Actions, beforeActions) {
+		t.Errorf("Decision mutated the Result:\n before = %+v\n after  = %+v", before, *res1)
+	}
+
+	// A second Evaluate over the same state returns an identical Result —
+	// Evaluate (and therefore the helper that reads its output) is
+	// read-only over run state.
+	res2, err := ev.Evaluate(context.Background(), runRow, wf)
+	if err != nil {
+		t.Fatalf("Evaluate #2: %v", err)
+	}
+	if !reflect.DeepEqual(res1, res2) {
+		t.Errorf("two Evaluate calls diverged:\n first  = %+v\n second = %+v", res1, res2)
+	}
+}
+
+// TestMergeCondition: the exposed merge condition is the may_merge knob's.
+func TestMergeCondition(t *testing.T) {
+	if got := MergeCondition(); got != spec.ConditionGatesResolvedCIGreen {
+		t.Errorf("MergeCondition() = %q, want %q", got, spec.ConditionGatesResolvedCIGreen)
 	}
 }
