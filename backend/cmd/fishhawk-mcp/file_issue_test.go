@@ -79,6 +79,7 @@ func TestFileIssue_HappyPath_ThreadsFieldsAndRelations(t *testing.T) {
 		Relations: &FileIssueRelations{
 			ParentEpic:   "#1005",
 			EvidenceRuns: []string{"run-abc"},
+			DependsOn:    []string{"#41", "42"},
 		},
 	})
 	if err != nil {
@@ -101,6 +102,9 @@ func TestFileIssue_HappyPath_ThreadsFieldsAndRelations(t *testing.T) {
 	}
 	if fb.lastBody.Relations == nil || fb.lastBody.Relations.ParentEpic != "#1005" {
 		t.Errorf("body relations = %+v", fb.lastBody.Relations)
+	}
+	if got := fb.lastBody.Relations.DependsOn; len(got) != 2 || got[0] != "#41" || got[1] != "42" {
+		t.Errorf("body relations depends_on = %v, want [#41 42]", got)
 	}
 }
 

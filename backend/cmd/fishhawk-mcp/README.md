@@ -492,7 +492,7 @@ Inputs:
 | `body` | no | Verbatim body; when omitted the body is assembled from the type's skeleton + `sections`. |
 | `sections` / `title_vars` | no | Per-skeleton-section content and extra title placeholders (e.g. `epic`, `n`). An unresolved title placeholder fails the filing. |
 | `labels` / `complexity` / `status` | no | Merged on / overriding the type's defaults; `complexity` must be a declared level. |
-| `relations` | no | `{parent_epic, supersedes[], companion_to[], evidence_runs[]}` — resolved into the provider's link operations. |
+| `relations` | no | `{parent_epic, supersedes[], companion_to[], evidence_runs[], depends_on[]}` — resolved into the provider's link operations. `depends_on` is the issue-level dependency edge (issue refs among the epic's children) a campaign reads to assemble its wave DAG (ADR-047); it is persisted as a `Depends on: #X, #Y` body marker and validated format-only at file time (cycle/existence checks deferred to campaign-assembly time). |
 | `existing_numbers` | no | Numbers already in use for a numbered type (e.g. `adr`), so the next sequential number can be allocated. |
 | `run_id` | falls back to env | Optional in-flight run UUID; defaults to `FISHHAWK_RUN_ID`. When set and non-terminal a best-effort `work_item_filed` audit entry is appended to it. |
 

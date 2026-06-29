@@ -12,6 +12,7 @@ type fakeProvider struct {
 	name    string
 	got     ProviderRequest
 	gotTran TransitionRequest
+	gotEpic EpicChildrenRequest
 }
 
 func (f *fakeProvider) Name() string { return f.name }
@@ -24,6 +25,14 @@ func (f *fakeProvider) File(_ context.Context, req ProviderRequest) (*CreatedIte
 func (f *fakeProvider) Transition(_ context.Context, req TransitionRequest) (*TransitionResult, error) {
 	f.gotTran = req
 	return &TransitionResult{Moved: true, From: "Backlog", To: "In Progress"}, nil
+}
+
+func (f *fakeProvider) EpicChildren(_ context.Context, req EpicChildrenRequest) (*EpicChildrenResult, error) {
+	f.gotEpic = req
+	return &EpicChildrenResult{
+		Children: []EpicChild{{Number: 41, Title: "slice A"}, {Number: 42, Title: "slice B"}},
+		Edges:    []DependsEdge{{From: 42, To: 41}},
+	}, nil
 }
 
 func TestRegistry_RegisterAndGet(t *testing.T) {
@@ -119,5 +128,34 @@ func TestRegistry_DispatchTransition(t *testing.T) {
 	}
 	if fp.gotTran.IssueNumber != 1012 || fp.gotTran.CanonicalState != CanonicalStateInProgress {
 		t.Errorf("provider did not receive transition request: %+v", fp.gotTran)
+	}
+}
+
+func TestRegistry_DispatchEpicChildren(t *testing.T) {
+	fp := &fakeProvider{name: "test_provider_epic_children"}
+	Register(fp)
+	p, err := Get("test_provider_epic_children")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	q, ok := p.(EpicChildrenQuerier)
+	if !ok {
+		t.Fatalf("provider does not implement EpicChildrenQuerier")
+	}
+	res, err := q.EpicChildren(context.Background(), EpicChildrenRequest{
+		Target: Target{InstallationID: 7, Repo: Repo{Owner: "o", Name: "r"}},
+		Epic:   "#1440",
+	})
+	if err != nil {
+		t.Fatalf("EpicChildren: %v", err)
+	}
+	if len(res.Children) != 2 || res.Children[0].Number != 41 {
+		t.Errorf("children = %+v", res.Children)
+	}
+	if len(res.Edges) != 1 || res.Edges[0] != (DependsEdge{From: 42, To: 41}) {
+		t.Errorf("edges = %+v", res.Edges)
+	}
+	if fp.gotEpic.Epic != "#1440" {
+		t.Errorf("provider did not receive epic-children request: %+v", fp.gotEpic)
 	}
 }

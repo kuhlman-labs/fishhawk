@@ -110,10 +110,20 @@ type TransitionResult struct {
 // Relations links a work item to other work. ParentEpic is the epic this
 // item rolls up to (an issue reference); Supersedes and CompanionTo are
 // peer links; EvidenceRuns names the run IDs that motivated the item (the
-// operator-agent follow-up-filing path attaches the originating run).
+// operator-agent follow-up-filing path attaches the originating run);
+// DependsOn is the issue-level dependency edge.
 type Relations struct {
 	ParentEpic   string   `json:"parent_epic,omitempty"`
 	Supersedes   []string `json:"supersedes,omitempty"`
 	CompanionTo  []string `json:"companion_to,omitempty"`
 	EvidenceRuns []string `json:"evidence_runs,omitempty"`
+	// DependsOn is the issue-level dependency edge a campaign derives its
+	// wave DAG from (ADR-047 / #1437). Entries are issue references (`#N`
+	// or `N`) among the epic's children; the campaign's epic-children query
+	// (EpicChildren) returns the depends_on edges over that sibling set,
+	// which E25.3 assembles into plan.Waves. File-time validation is
+	// format-only — cycle and existence checks are deferred to
+	// campaign-assembly time (E25.3), not file time, because Apply is pure
+	// (no I/O) and cycle detection needs the full assembled DAG.
+	DependsOn []string `json:"depends_on,omitempty"`
 }

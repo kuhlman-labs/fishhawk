@@ -536,6 +536,82 @@ func (c *Client) AddSubIssue(ctx context.Context, installationID int64, parentNo
 	}, nil)
 }
 
+// SubIssue is the slice of a sub-issue connection node the work-management
+// epic-children query consumes: the child issue's human Number, GraphQL
+// NodeID, Title, and Body (the depends_on body marker is parsed from Body).
+type SubIssue struct {
+	Number int
+	NodeID string
+	Title  string
+	Body   string
+}
+
+// listSubIssuesFirst is the sub-issues connection page size. v0 reads a
+// single first:100 page — an epic with more than 100 children is out of
+// scope for the campaign DAG source (ADR-047 / #1437) and the cap is noted
+// here so a >100-child epic silently reads only the first 100.
+const listSubIssuesFirst = 100
+
+// ListSubIssues returns the sub-issues (children) of the issue identified by
+// parentNodeID — its number, node id, title, and body.
+//
+//	query node(id: $parentId) { ... on Issue { subIssues(first: 100) { nodes { number title body id } } } }
+//
+// It reads a SINGLE first:100 page (listSubIssuesFirst); a parent with more
+// than 100 sub-issues is truncated to the first 100 — out of scope for the
+// v0 campaign DAG source. The `subIssues` connection is the same GraphQL
+// surface the AddSubIssue mutation operates on, so the children read and the
+// parent-epic link agree on one relation. Honors the user-owned-projects
+// token opt-in (WithProjectsToken) like the other GraphQL calls, since it
+// routes through doGraphQL; sub-issues are repo-scoped, so the installation
+// token reaches them. Returns ErrForbidden on auth issues, ErrValidation
+// when GraphQL reports an application error.
+func (c *Client) ListSubIssues(ctx context.Context, installationID int64, parentNodeID string) ([]SubIssue, error) {
+	if parentNodeID == "" {
+		return nil, errors.New("githubclient: parent node id required")
+	}
+	const query = `query ListSubIssues($parentId: ID!, $first: Int!) {
+  node(id: $parentId) {
+    ... on Issue {
+      subIssues(first: $first) {
+        nodes {
+          number
+          title
+          body
+          id
+        }
+      }
+    }
+  }
+}`
+	var data struct {
+		Node *struct {
+			SubIssues struct {
+				Nodes []struct {
+					Number int    `json:"number"`
+					Title  string `json:"title"`
+					Body   string `json:"body"`
+					ID     string `json:"id"`
+				} `json:"nodes"`
+			} `json:"subIssues"`
+		} `json:"node"`
+	}
+	if err := c.doGraphQL(ctx, installationID, query, map[string]any{
+		"parentId": parentNodeID,
+		"first":    listSubIssuesFirst,
+	}, &data); err != nil {
+		return nil, err
+	}
+	if data.Node == nil {
+		return nil, nil
+	}
+	results := make([]SubIssue, 0, len(data.Node.SubIssues.Nodes))
+	for _, n := range data.Node.SubIssues.Nodes {
+		results = append(results, SubIssue{Number: n.Number, NodeID: n.ID, Title: n.Title, Body: n.Body})
+	}
+	return results, nil
+}
+
 // projectsTokenKey is the unexported context-key type for the
 // request-scoped flag that asks doGraphQL to authenticate with the
 // static projects token (Client.ProjectsToken) instead of the

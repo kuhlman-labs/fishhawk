@@ -56,6 +56,10 @@ type fakeAPI struct {
 	subParent, subChild string
 	subErr              error
 
+	listSubParent  string
+	listSubResults []githubclient.SubIssue
+	listSubErr     error
+
 	searchQuery   string
 	searchResults []githubclient.IssueTitleResult
 	searchErr     error
@@ -112,6 +116,14 @@ func (f *fakeAPI) SetProjectItemSingleSelect(_ context.Context, _ int64, project
 func (f *fakeAPI) AddSubIssue(_ context.Context, _ int64, parentNodeID, childNodeID string) error {
 	f.subParent, f.subChild = parentNodeID, childNodeID
 	return f.subErr
+}
+
+func (f *fakeAPI) ListSubIssues(_ context.Context, _ int64, parentNodeID string) ([]githubclient.SubIssue, error) {
+	f.listSubParent = parentNodeID
+	if f.listSubErr != nil {
+		return nil, f.listSubErr
+	}
+	return f.listSubResults, nil
 }
 
 func (f *fakeAPI) SearchIssuesByTitle(_ context.Context, _ int64, query string) ([]githubclient.IssueTitleResult, error) {
@@ -270,6 +282,173 @@ func TestProvider_File_CreateIssueErrorPropagates(t *testing.T) {
 	_, err := New(api).File(context.Background(), baseRequest())
 	if err == nil || !strings.Contains(err.Error(), "create issue") {
 		t.Fatalf("want create-issue error, got %v", err)
+	}
+}
+
+// TestProvider_File_StampsDependsOnMarker asserts File renders the depends_on
+// body marker into the created issue body (the persist half of the campaign
+// DAG round trip).
+func TestProvider_File_StampsDependsOnMarker(t *testing.T) {
+	api := &fakeAPI{created: &githubclient.CreatedIssue{Number: 7, NodeID: "N", HTMLURL: "u"}}
+	req := baseRequest()
+	req.Target.Project = nil // skip boarding; assert only the create body
+	req.Item.Relations = workmgmt.Relations{DependsOn: []string{"#41", "42"}}
+
+	if _, err := New(api).File(context.Background(), req); err != nil {
+		t.Fatalf("File: %v", err)
+	}
+	if !strings.Contains(api.createParams.Body, "Depends on: #41, #42") {
+		t.Errorf("created body missing depends_on marker:\n%s", api.createParams.Body)
+	}
+}
+
+// TestProvider_File_DependsOnMarkerIdempotent asserts a body already carrying
+// a marker is not double-stamped (the ensureDependsOnMarker idempotency
+// branch).
+func TestProvider_File_DependsOnMarkerIdempotent(t *testing.T) {
+	api := &fakeAPI{created: &githubclient.CreatedIssue{Number: 7, NodeID: "N", HTMLURL: "u"}}
+	req := baseRequest()
+	req.Target.Project = nil
+	req.Item.Body = "## Summary\n\nx\n\nDepends on: #41\n"
+	req.Item.Relations = workmgmt.Relations{DependsOn: []string{"#41", "#42"}}
+
+	if _, err := New(api).File(context.Background(), req); err != nil {
+		t.Fatalf("File: %v", err)
+	}
+	if got := strings.Count(api.createParams.Body, "Depends on:"); got != 1 {
+		t.Errorf("marker stamped %d times, want 1 (idempotent):\n%s", got, api.createParams.Body)
+	}
+}
+
+// TestProvider_File_NoDependsOnNoMarker asserts an item without depends_on
+// carries no marker (the empty-refs branch).
+func TestProvider_File_NoDependsOnNoMarker(t *testing.T) {
+	api := &fakeAPI{created: &githubclient.CreatedIssue{Number: 7, NodeID: "N", HTMLURL: "u"}}
+	req := baseRequest()
+	req.Target.Project = nil
+	req.Item.Relations = workmgmt.Relations{}
+
+	if _, err := New(api).File(context.Background(), req); err != nil {
+		t.Fatalf("File: %v", err)
+	}
+	if strings.Contains(api.createParams.Body, "Depends on:") {
+		t.Errorf("body should carry no marker when depends_on is empty:\n%s", api.createParams.Body)
+	}
+}
+
+// TestProvider_EpicChildren_ResolvesChildrenAndEdges drives EpicChildren
+// against a fake sub-issues list: children are returned ascending, the
+// depends_on edges parsed from a child body are restricted to the sibling
+// set, and a reference to a NON-child is dropped.
+func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
+	api := &fakeAPI{
+		parentNode: "EPIC_NODE",
+		listSubResults: []githubclient.SubIssue{
+			// out-of-order on purpose: EpicChildren sorts ascending.
+			{Number: 42, NodeID: "N42", Title: "slice B", Body: "## Summary\n\nDepends on: #41\n"},
+			{Number: 41, NodeID: "N41", Title: "slice A", Body: "## Summary\n\nno deps\n"},
+			{Number: 43, NodeID: "N43", Title: "slice C", Body: "Depends on: #41, #42, #999\n"},
+		},
+	}
+	res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+		Target: workmgmt.Target{InstallationID: 99, Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Epic:   "#1005",
+	})
+	if err != nil {
+		t.Fatalf("EpicChildren: %v", err)
+	}
+	if api.nodeIDNumber != 1005 {
+		t.Errorf("epic resolved number = %d, want 1005", api.nodeIDNumber)
+	}
+	if api.listSubParent != "EPIC_NODE" {
+		t.Errorf("list sub-issues parent = %q, want EPIC_NODE", api.listSubParent)
+	}
+	wantChildren := []int{41, 42, 43}
+	if len(res.Children) != len(wantChildren) {
+		t.Fatalf("children = %+v, want ascending 41,42,43", res.Children)
+	}
+	for i, c := range res.Children {
+		if c.Number != wantChildren[i] {
+			t.Errorf("children[%d].Number = %d, want %d", i, c.Number, wantChildren[i])
+		}
+	}
+	// Edges: 42->41, 43->41, 43->42. The #999 reference is not a child → dropped.
+	want := []workmgmt.DependsEdge{{From: 42, To: 41}, {From: 43, To: 41}, {From: 43, To: 42}}
+	if len(res.Edges) != len(want) {
+		t.Fatalf("edges = %+v, want %+v (#999 must be dropped)", res.Edges, want)
+	}
+	for i, e := range res.Edges {
+		if e != want[i] {
+			t.Errorf("edge[%d] = %+v, want %+v", i, e, want[i])
+		}
+	}
+}
+
+// TestProvider_EpicChildren_FailClosed covers the defensive branches: a nil
+// API, a missing repo, a zero installation, a malformed epic ref, and a
+// ListSubIssues error each return an error rather than a partial result.
+func TestProvider_EpicChildren_FailClosed(t *testing.T) {
+	good := workmgmt.EpicChildrenRequest{
+		Target: workmgmt.Target{InstallationID: 99, Repo: workmgmt.Repo{Owner: "o", Name: "r"}},
+		Epic:   "#1005",
+	}
+	t.Run("nil api", func(t *testing.T) {
+		if _, err := (&Provider{}).EpicChildren(context.Background(), good); err == nil || !strings.Contains(err.Error(), "missing API client") {
+			t.Fatalf("want missing-API error, got %v", err)
+		}
+	})
+	t.Run("missing repo", func(t *testing.T) {
+		req := good
+		req.Target.Repo = workmgmt.Repo{}
+		if _, err := New(&fakeAPI{}).EpicChildren(context.Background(), req); err == nil || !strings.Contains(err.Error(), "repo owner and name required") {
+			t.Fatalf("want repo-required error, got %v", err)
+		}
+	})
+	t.Run("zero installation", func(t *testing.T) {
+		req := good
+		req.Target.InstallationID = 0
+		if _, err := New(&fakeAPI{}).EpicChildren(context.Background(), req); err == nil || !strings.Contains(err.Error(), "no installation id available") {
+			t.Fatalf("want missing-installation error, got %v", err)
+		}
+	})
+	t.Run("malformed epic ref", func(t *testing.T) {
+		req := good
+		req.Epic = "not-a-ref"
+		if _, err := New(&fakeAPI{}).EpicChildren(context.Background(), req); err == nil || !strings.Contains(err.Error(), "not a numeric issue reference") {
+			t.Fatalf("want malformed-epic error, got %v", err)
+		}
+	})
+	t.Run("list sub-issues error", func(t *testing.T) {
+		api := &fakeAPI{parentNode: "EPIC_NODE", listSubErr: errors.New("graphql rejected the query")}
+		if _, err := New(api).EpicChildren(context.Background(), good); err == nil || !strings.Contains(err.Error(), "list epic #1005 children") {
+			t.Fatalf("want list-sub-issues error, got %v", err)
+		}
+	})
+	t.Run("node id error", func(t *testing.T) {
+		api := &fakeAPI{nodeIDErr: errors.New("issue not found")}
+		if _, err := New(api).EpicChildren(context.Background(), good); err == nil || !strings.Contains(err.Error(), "resolve epic #1005") {
+			t.Fatalf("want node-id error, got %v", err)
+		}
+	})
+}
+
+// TestDependsOnMarker_RoundTrip asserts the render/parse helper pair is a
+// faithful round trip (the single-source-of-truth drift guard) and that an
+// empty ref list renders no marker.
+func TestDependsOnMarker_RoundTrip(t *testing.T) {
+	if got := renderDependsOnMarker(nil); got != "" {
+		t.Errorf("empty refs rendered %q, want empty", got)
+	}
+	if got := renderDependsOnMarker([]string{"#41", "42", "  "}); got != "Depends on: #41, #42" {
+		t.Errorf("render = %q", got)
+	}
+	body := "## Summary\n\nx\n\n" + renderDependsOnMarker([]string{"41", "#42"})
+	nums := parseDependsOnMarker(body)
+	if len(nums) != 2 || nums[0] != 41 || nums[1] != 42 {
+		t.Errorf("parse round trip = %v, want [41 42]", nums)
+	}
+	if parseDependsOnMarker("## Summary\n\nno marker here\n") != nil {
+		t.Errorf("parse of a body with no marker should be nil")
 	}
 }
 

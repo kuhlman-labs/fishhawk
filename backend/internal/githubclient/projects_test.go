@@ -301,6 +301,49 @@ func TestAddSubIssue(t *testing.T) {
 	}
 }
 
+func TestListSubIssues_PopulatedMapsNodes(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["ListSubIssues"] = `{"data":{"node":{"subIssues":{"nodes":[
+		{"number":41,"title":"slice A","body":"## Summary","id":"N41"},
+		{"number":42,"title":"slice B","body":"Depends on: #41","id":"N42"}
+	]}}}}`
+	subs, err := c.ListSubIssues(context.Background(), 7, "EPIC_NODE")
+	if err != nil {
+		t.Fatalf("ListSubIssues: %v", err)
+	}
+	if len(subs) != 2 {
+		t.Fatalf("subs = %+v, want 2", subs)
+	}
+	if subs[0].Number != 41 || subs[0].NodeID != "N41" || subs[0].Title != "slice A" {
+		t.Errorf("subs[0] = %+v", subs[0])
+	}
+	if subs[1].Body != "Depends on: #41" {
+		t.Errorf("subs[1].Body = %q", subs[1].Body)
+	}
+	if vars := pf.gotGraphQLVars["ListSubIssues"]; vars["parentId"] != "EPIC_NODE" {
+		t.Errorf("vars = %+v, want parentId=EPIC_NODE", vars)
+	}
+}
+
+func TestListSubIssues_EmptyReturnsNil(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["ListSubIssues"] = `{"data":{"node":{"subIssues":{"nodes":[]}}}}`
+	subs, err := c.ListSubIssues(context.Background(), 7, "EPIC_NODE")
+	if err != nil {
+		t.Fatalf("ListSubIssues: %v", err)
+	}
+	if len(subs) != 0 {
+		t.Errorf("subs = %+v, want empty", subs)
+	}
+}
+
+func TestListSubIssues_MissingParentRejected(t *testing.T) {
+	_, c := newProjectsFake(t)
+	if _, err := c.ListSubIssues(context.Background(), 7, ""); err == nil || !strings.Contains(err.Error(), "parent node id required") {
+		t.Fatalf("want parent-required error, got %v", err)
+	}
+}
+
 func TestAddProjectItem_MissingItemID(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.graphqlByOp["AddItem"] = `{"data":{"addProjectV2ItemById":{"item":{"id":""}}}}`

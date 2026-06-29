@@ -1159,6 +1159,7 @@ type WorkItemRelations struct {
 	Supersedes   []string `json:"supersedes,omitempty"`
 	CompanionTo  []string `json:"companion_to,omitempty"`
 	EvidenceRuns []string `json:"evidence_runs,omitempty"`
+	DependsOn    []string `json:"depends_on,omitempty"`
 }
 
 // FiledWorkItem mirrors the backend's WorkItemResponse: the created item,
