@@ -14,6 +14,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
@@ -408,7 +409,13 @@ func TestNewCampaignDriver_WiresDependencies(t *testing.T) {
 		GitHub:       &githubclient.Client{},
 	}
 	srv := server.New(cfg)
-	tk := newCampaignDriver(cfg, srv, slog.Default(), time.Minute, "feature_change", "")
+	notifier := issuecomment.New(issuecomment.Deps{
+		GitHub:      cfg.GitHub,
+		Runs:        cfg.RunRepo,
+		Audit:       cfg.AuditRepo,
+		ExternalURL: "https://app.fishhawk.test",
+	})
+	tk := newCampaignDriver(cfg, srv, slog.Default(), notifier, time.Minute, "feature_change", "")
 	if tk == nil {
 		t.Fatal("newCampaignDriver returned nil")
 	}
@@ -422,6 +429,30 @@ func TestNewCampaignDriver_WiresDependencies(t *testing.T) {
 	// GateActor so the driver auto-acts on each run gate.
 	if tk.GateActor == nil {
 		t.Error("ticker GateActor is nil despite a configured GitHub client; auto-drive would never run")
+	}
+	// E25.7: a concrete notifier is bound as the page seam so the Paged branch
+	// fires the human page.
+	if tk.Notifier == nil {
+		t.Error("ticker Notifier is nil despite a configured notifier; the Paged branch would never page")
+	}
+}
+
+// TestNewCampaignDriver_NilNotifier_ObserveOnly guards the typed-nil trap: a nil
+// *issuecomment.Notifier (the unconfigured-deps case) must leave the seam a true
+// nil interface so the driver's Paged branch takes the observe-only path rather
+// than calling a nil pointer.
+func TestNewCampaignDriver_NilNotifier_ObserveOnly(t *testing.T) {
+	cfg := server.Config{
+		Addr:         "127.0.0.1:0",
+		CampaignRepo: campaign.BaseFake{},
+		RunRepo:      runpkg.BaseFake{},
+		AuditRepo:    audit.BaseFake{},
+		GitHub:       &githubclient.Client{},
+	}
+	srv := server.New(cfg)
+	tk := newCampaignDriver(cfg, srv, slog.Default(), nil, time.Minute, "feature_change", "")
+	if tk.Notifier != nil {
+		t.Errorf("ticker Notifier = %#v, want a true nil interface (observe-only)", tk.Notifier)
 	}
 }
 

@@ -10,7 +10,7 @@ it.
 | Surface | Audit category | Audit kind | Caller (production) | First posted | Edits in place? |
 |---|---|---|---|---|---|
 | Living anchor | `status_comment_posted` | `status_update` | `Dispatcher.Handle` (run create); `Server.notifyStatusUpdate` (every stage transition); `Server.notifyPlanReady` (plan-stage terminal) | run dispatch | Yes — one comment per run, every transition rebuilds + edits the same comment id |
-| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, advisory-reject arbitrated, must_page_human, clarification request / awaiting_input park, CI failure) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor |
+| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, advisory-reject arbitrated, must_page_human, clarification request / awaiting_input park, CI failure, campaign gate hand-off) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor |
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
 | Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688, #1371) | crossing of an advisory periodic-budget ladder rung — `warn` / `over` / `ack_required` (≥2x) / `page` (≥3x) | No (per-`(period_start, tier)` dedup; each tier posts once per calendar period) |
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
@@ -114,6 +114,14 @@ Notes:
     payload; a malformed payload degrades to a count-free phrase). Deduped on
     the `clarification_requested` `Sequence`.
   - **CI failure** — `ci_failure_retry_dispatched` / `ci_retry_exhausted`.
+  - **Campaign gate hand-off (E25.7, #1446)** — `campaign_gate_paged`. The
+    campaign auto-driver REFUSED a must_page_human gate (reviewer_reject /
+    requirement_arbitration), paused the affected issue, and handed the gate to
+    a human. The run-chained `campaign_gate_paged` entry is otherwise silent on
+    anchor edits, so it gets a page-class ping: "🛑 The campaign auto-driver
+    paused this issue and needs you: <gate/decision>." (the gate phrase is read
+    from the `page_event` field; an unknown/absent value degrades to "a gate
+    decision"). Deduped on the `campaign_gate_paged` `Sequence`.
 
   Each ping records its source audit `Sequence` so a re-render never
   double-pings.
@@ -937,6 +945,17 @@ Notes:
   `{campaign_id, from, to}`) records the campaign state re-derivation
   (`campaign.DeriveState`) transition. Listed here only so a future reader
   grepping the audit categories doesn't mistake them for a comment surface.
+- The campaign **pause** marker — `campaign_paused` (E25.7 / #1446, ADR-047
+  Track C) — is also a **system-actor GLOBAL-chain audit kind, NOT an
+  issue-comment surface**. The campaign-driver ticker
+  (`campaigndriver.Ticker.pageGate`) is the SOLE writer: when the `GateActor`
+  REFUSES a `must_page_human` gate (`out.Paged`), the driver pauses the affected
+  item (`PauseCampaignItem`, recording the `PauseReason`) and — unless the
+  campaign's `pause_policy` is `pause_item` (continue-others) — pauses the whole
+  campaign, then records `campaign_paused` (payload `{campaign_id, issue_ref,
+  run_id, page_event, policy}`). The human page itself is fired separately
+  through the `Notifier` seam (see `campaign_gate_paged` below), not by this
+  marker. Best-effort like the other driver kinds.
 - The campaign auto-driver audit kinds — `campaign_gate_acted` and
   `campaign_gate_paged` (E25.6 / #1445, ADR-047 Track C) — are **audit-only
   kinds with no dedicated Notifier method and are NOT issue-comment surfaces**.
@@ -956,10 +975,14 @@ Notes:
     `operator-agent/campaign`) by the gate actor
     (`server.Server.emitCampaignGatePaged`) when it REFUSES a `must_page_human`
     condition (`reviewer_reject`, `requirement_arbitration`): it takes no gate
-    action and emits this hand-off so the E25.7 pause/page consumer can route
-    the gate to a human. Both are best-effort (an append failure WARN/ERROR-logs
-    and never unwinds the gate decision). Listed here only so a future reader
-    grepping the audit categories doesn't mistake them for a comment surface.
+    action and emits this hand-off. Both are best-effort (an append failure
+    WARN/ERROR-logs and never unwinds the gate decision). As of E25.7 (#1446),
+    `campaign_gate_paged` is the consumed *trigger* for the campaign pause/page:
+    the campaign-driver (`campaigndriver.Ticker.pageGate`) pauses on the hand-off
+    and calls the `Notifier` seam (`NotifyStatusUpdateForRun`), which posts a
+    page-class `anchor_ping_posted` ping for this event (see the page-class ping
+    list above). The `campaign_gate_paged` entry itself stays audit-only —
+    `campaign_gate_acted` has no comment surface at all.
 
 ## Routing
 
