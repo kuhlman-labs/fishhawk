@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -444,14 +445,16 @@ func (g *stubGitHub) CreateRef(_ context.Context, _ int64,
 }
 
 func (g *stubGitHub) MergeBranch(_ context.Context, _ int64,
-	_ githubclient.RepoRef, base, head, msg string) error {
+	_ githubclient.RepoRef, base, head, msg string) (string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.mergeCalls = append(g.mergeCalls, mergeBranchCall{Base: base, Head: head, Msg: msg})
 	if err, ok := g.mergeErrByHead[head]; ok {
-		return err
+		return "", err
 	}
-	return nil
+	// Deterministic per-head merge commit SHA so tests can assert the
+	// slices_integrated integration_commit_shas payload (#1459).
+	return "mergesha-" + head, nil
 }
 
 func newOrchestrator(t *testing.T) (*Orchestrator, *stubRuns, *stubGitHub) {
@@ -1879,7 +1882,27 @@ func TestIntegrateSlices_Success_MergesInSliceOrder(t *testing.T) {
 	if p["consolidated_branch"] != consolidated {
 		t.Errorf("slices_integrated consolidated_branch = %v, want %q", p["consolidated_branch"], consolidated)
 	}
+	// integration_commit_shas records each fan-in merge commit in ascending
+	// slice order, so the ADR-035 lineage guard attributes them (#1459).
+	wantSHAs := []string{"mergesha-" + wantHead0, "mergesha-" + wantHead1}
+	if got := integrationSHAsFromPayload(p); !reflect.DeepEqual(got, wantSHAs) {
+		t.Errorf("slices_integrated integration_commit_shas = %v, want %v", got, wantSHAs)
+	}
 	_ = child1
+}
+
+// integrationSHAsFromPayload extracts the integration_commit_shas []string
+// from a decoded slices_integrated audit payload (JSON arrays decode to
+// []interface{}).
+func integrationSHAsFromPayload(p map[string]any) []string {
+	raw, _ := p["integration_commit_shas"].([]any)
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // TestIntegrateSlices_CreatesConsolidatedRef_WithPrefixSharingSlices is the
@@ -2071,6 +2094,15 @@ func TestIntegrateSlices_PaginatesToCompletion(t *testing.T) {
 	p := auditPayload(t, au, "slices_integrated")
 	if got, _ := p["slice_count"].(float64); int(got) != 3 {
 		t.Errorf("slice_count = %v, want 3", p["slice_count"])
+	}
+	// All three integration merges recorded, ascending slice order (#1459).
+	wantSHAs := []string{
+		"mergesha-" + sliceBranch(parent.ID, 0),
+		"mergesha-" + sliceBranch(parent.ID, 1),
+		"mergesha-" + sliceBranch(parent.ID, 2),
+	}
+	if got := integrationSHAsFromPayload(p); !reflect.DeepEqual(got, wantSHAs) {
+		t.Errorf("integration_commit_shas = %v, want %v", got, wantSHAs)
 	}
 }
 
