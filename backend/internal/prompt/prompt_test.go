@@ -1037,6 +1037,43 @@ func TestBuild_Plan_CouplingDiscoveryChecklist(t *testing.T) {
 	}
 }
 
+// TestBuild_Plan_SingleOwnerFileRule pins the decomposition single-owner-file
+// guidance (#1472): every file path must appear in exactly one sub-plan's
+// scope.files, with the validator's reject message and the compile-shim
+// resolution stated. The done-means here is the rendered prose — a dropped or
+// comment-only edit to the bullet fails this assertion.
+func TestBuild_Plan_SingleOwnerFileRule(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 1472,
+		IssueTitle:  "Plan a decomposed change",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"Single-owner file rule",
+		"EXACTLY ONE sub-plan's scope.files",
+		"scoped by multiple slices",
+		"re-slice along file boundaries",
+		"so the slice compiles",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing single-owner-file guidance %q\n---\n%s", w, got)
+		}
+	}
+
+	// Plan-stage only — it must not bleed into the implement prompt.
+	impl, err := Build("implement", Trigger{Repo: "x/y", ApprovedPlan: fixturePlan()})
+	if err != nil {
+		t.Fatalf("Build implement: %v", err)
+	}
+	if strings.Contains(impl, "Single-owner file rule") {
+		t.Errorf("single-owner file rule must not render in the implement prompt:\n%s", impl)
+	}
+}
+
 func TestBuild_Plan_ContainsIncrementalVerification(t *testing.T) {
 	got, err := Build("plan", Trigger{
 		Source:      "github_issue",

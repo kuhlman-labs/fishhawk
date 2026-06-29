@@ -944,16 +944,43 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 		return false
 	}
 
-	// Parse plan for the self-review guard (GeneratedBy.Model) and
-	// for the plan_review prompt builder. Validation already passed
-	// earlier in handleShipPlan; parse failure here is an internal
-	// inconsistency — log and skip reviews.
+	// Parse plan for the self-review guard (GeneratedBy.Model) and for the
+	// plan_review prompt builder. handleShipPlan validated SCHEMA only
+	// (plan.Validate); plan.Parse additionally runs semanticCheck, so a
+	// schema-valid plan can still fail here — most commonly a decomposition
+	// that scopes one file into two slices (checkCrossSliceSharedFiles, #1472).
+	// Without surfacing, the stage parks at awaiting_approval, no audit entry
+	// is emitted, and reviewStatusFor resolves to 'none' — a silently-hung
+	// review. Emit a terminal plan_review_failed entry carrying the validator
+	// message (mirroring the plan_review_skipped emission above) so
+	// reviewStatusFor maps it to 'failed' and decodeFailedReviews surfaces the
+	// re-slice instruction to the operator without log-diving.
 	parsedPlan, err := plan.Parse(planBody)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: parse plan failed",
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
+		if s.cfg.AuditRepo != nil {
+			payload, _ := json.Marshal(planreview.ReviewFailedPayload{
+				Reason:    err.Error(),
+				Authority: authority,
+			})
+			systemKind := audit.ActorKind("system")
+			if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+				RunID:     runID,
+				StageID:   &stageID,
+				Timestamp: time.Now().UTC(),
+				Category:  "plan_review_failed",
+				ActorKind: &systemKind,
+				Payload:   payload,
+			}); aerr != nil {
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: append plan_review_failed audit entry failed",
+					slog.String("run_id", runID.String()),
+					slog.String("error", aerr.Error()),
+				)
+			}
+		}
 		return false
 	}
 
