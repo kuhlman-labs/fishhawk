@@ -16,14 +16,24 @@ func TestCampaignTransitions_AllowedAndForbidden(t *testing.T) {
 		{StatePending, StateCancelled, true},
 		{StatePending, StateFailed, true},
 		{StatePending, StateSucceeded, false}, // can't skip running
-		// running → succeeded | failed | cancelled
+		// running → succeeded | failed | cancelled | paused
 		{StateRunning, StateSucceeded, true},
 		{StateRunning, StateFailed, true},
 		{StateRunning, StateCancelled, true},
+		{StateRunning, StatePaused, true},
 		{StateRunning, StatePending, false}, // no going back
+		// paused → running | cancelled (the resume / halt-while-paused edges)
+		{StatePaused, StateRunning, true},
+		{StatePaused, StateCancelled, true},
+		{StatePaused, StateSucceeded, false}, // can't succeed straight from paused
+		{StatePaused, StateFailed, false},    // can't fail straight from paused
+		{StatePaused, StatePending, false},   // no going back to pending
+		// paused is non-terminal: pending can't reach it directly (only running can)
+		{StatePending, StatePaused, false},
 		// same-state idempotent no-ops
 		{StatePending, StatePending, true},
 		{StateRunning, StateRunning, true},
+		{StatePaused, StatePaused, true},
 		{StateSucceeded, StateSucceeded, true},
 		{StateFailed, StateFailed, true},
 		{StateCancelled, StateCancelled, true},
@@ -67,16 +77,27 @@ func TestCampaignItemTransitions_AllowedAndForbidden(t *testing.T) {
 		{ItemStateBlocked, ItemStateCancelled, true},
 		{ItemStateBlocked, ItemStateFailed, false},    // a blocked item fails via pending/running, not directly
 		{ItemStateBlocked, ItemStateSucceeded, false}, // can't succeed while blocked
-		// running → succeeded | failed | cancelled
+		// running → succeeded | failed | cancelled | paused
 		{ItemStateRunning, ItemStateSucceeded, true},
 		{ItemStateRunning, ItemStateFailed, true},
 		{ItemStateRunning, ItemStateCancelled, true},
+		{ItemStateRunning, ItemStatePaused, true},
 		{ItemStateRunning, ItemStatePending, false}, // no going back to pending
 		{ItemStateRunning, ItemStateBlocked, false}, // running can't re-block
+		// paused → running | cancelled (resume / halt-while-paused)
+		{ItemStatePaused, ItemStateRunning, true},
+		{ItemStatePaused, ItemStateCancelled, true},
+		{ItemStatePaused, ItemStateSucceeded, false}, // can't succeed straight from paused
+		{ItemStatePaused, ItemStateFailed, false},    // can't fail straight from paused
+		{ItemStatePaused, ItemStateBlocked, false},   // can't re-block from paused
+		// only running can reach paused (not pending/blocked directly)
+		{ItemStatePending, ItemStatePaused, false},
+		{ItemStateBlocked, ItemStatePaused, false},
 		// same-state idempotent no-ops
 		{ItemStatePending, ItemStatePending, true},
 		{ItemStateBlocked, ItemStateBlocked, true},
 		{ItemStateRunning, ItemStateRunning, true},
+		{ItemStatePaused, ItemStatePaused, true},
 		{ItemStateSucceeded, ItemStateSucceeded, true},
 		{ItemStateFailed, ItemStateFailed, true},
 		{ItemStateCancelled, ItemStateCancelled, true},

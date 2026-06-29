@@ -426,6 +426,224 @@ func TestPostgres_ConcurrentTransitionCampaignItem_ExactlyOneWins(t *testing.T) 
 	}
 }
 
+// TestPostgres_CreateCampaign_PausePolicy covers the pause_policy column added
+// by 0040: makeCampaign (no policy set) defaults to the conservative
+// pause_campaign, and an explicit pause_item round-trips through create + read.
+func TestPostgres_CreateCampaign_PausePolicy(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	// Zero policy normalizes to the block-the-campaign default.
+	def := makeCampaign(t, repo)
+	if def.PausePolicy != campaign.PausePolicyPauseCampaign {
+		t.Errorf("default PausePolicy = %q, want pause_campaign", def.PausePolicy)
+	}
+
+	// Explicit pause_item is preserved end-to-end.
+	c, err := repo.CreateCampaign(ctx, campaign.CreateCampaignParams{
+		Repo:        "kuhlman-labs/fishhawk",
+		EpicRef:     "issue:1439",
+		PausePolicy: campaign.PausePolicyPauseItem,
+	})
+	if err != nil {
+		t.Fatalf("create campaign with pause_item: %v", err)
+	}
+	if c.PausePolicy != campaign.PausePolicyPauseItem {
+		t.Errorf("created PausePolicy = %q, want pause_item", c.PausePolicy)
+	}
+	got, err := repo.GetCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("get campaign: %v", err)
+	}
+	if got.PausePolicy != campaign.PausePolicyPauseItem {
+		t.Errorf("read-back PausePolicy = %q, want pause_item", got.PausePolicy)
+	}
+}
+
+// TestPostgres_TransitionCampaign_Paused covers the campaign-level paused
+// overlay edges admitted by 0040: running → paused, then resume paused →
+// running. The insert succeeding proves the widened campaigns_state_check.
+func TestPostgres_TransitionCampaign_Paused(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c := makeCampaign(t, repo)
+	if _, err := repo.TransitionCampaign(ctx, c.ID, campaign.StateRunning); err != nil {
+		t.Fatalf("→running: %v", err)
+	}
+	paused, err := repo.TransitionCampaign(ctx, c.ID, campaign.StatePaused)
+	if err != nil {
+		t.Fatalf("running→paused: %v", err)
+	}
+	if paused.State != campaign.StatePaused {
+		t.Errorf("state after pause = %q, want paused", paused.State)
+	}
+	// Resume.
+	running, err := repo.TransitionCampaign(ctx, c.ID, campaign.StateRunning)
+	if err != nil {
+		t.Fatalf("paused→running (resume): %v", err)
+	}
+	if running.State != campaign.StateRunning {
+		t.Errorf("state after resume = %q, want running", running.State)
+	}
+}
+
+// TestPostgres_PauseCampaignItem is the round-trip done-means for the item
+// pause carrier: a running item paused via PauseCampaignItem persists state
+// 'paused' (proving the widened campaign_items_state_check) with the
+// PauseReason JSONB intact on both the returned row and an independent read.
+// A re-pause is an idempotent no-op preserving the first reason, and the item
+// resumes paused → running.
+func TestPostgres_PauseCampaignItem(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c := makeCampaign(t, repo)
+	item, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID,
+		IssueRef:   "issue:1441",
+	})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+	if item.PauseReason != nil {
+		t.Errorf("new item PauseReason = %v, want nil", item.PauseReason)
+	}
+	// Only running → paused is valid; advance the item first.
+	if _, err := repo.TransitionCampaignItem(ctx, item.ID, campaign.ItemStateRunning); err != nil {
+		t.Fatalf("→running: %v", err)
+	}
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	reason := campaign.PauseReason{
+		PageEvent: "campaign_gate_paged",
+		RunID:     &runID,
+		StageID:   &stageID,
+		Gate:      "implement_review",
+	}
+	paused, err := repo.PauseCampaignItem(ctx, item.ID, reason)
+	if err != nil {
+		t.Fatalf("pause item: %v", err)
+	}
+	if paused.State != campaign.ItemStatePaused {
+		t.Errorf("state after pause = %q, want paused", paused.State)
+	}
+	assertReason := func(label string, pr *campaign.PauseReason) {
+		t.Helper()
+		if pr == nil {
+			t.Fatalf("%s: PauseReason = nil, want round-tripped reason", label)
+		}
+		if pr.PageEvent != "campaign_gate_paged" || pr.Gate != "implement_review" {
+			t.Errorf("%s: PauseReason = %+v, want page=campaign_gate_paged gate=implement_review", label, pr)
+		}
+		if pr.RunID == nil || *pr.RunID != runID {
+			t.Errorf("%s: PauseReason.RunID = %v, want %s", label, pr.RunID, runID)
+		}
+		if pr.StageID == nil || *pr.StageID != stageID {
+			t.Errorf("%s: PauseReason.StageID = %v, want %s", label, pr.StageID, stageID)
+		}
+	}
+	assertReason("returned", paused.PauseReason)
+
+	// Independent read-back carries the same reason.
+	got, err := repo.GetCampaignItem(ctx, item.ID)
+	if err != nil {
+		t.Fatalf("get paused item: %v", err)
+	}
+	assertReason("read-back", got.PauseReason)
+
+	// Idempotent re-pause: unchanged item, first reason preserved.
+	re, err := repo.PauseCampaignItem(ctx, item.ID, campaign.PauseReason{PageEvent: "different"})
+	if err != nil {
+		t.Fatalf("re-pause: %v", err)
+	}
+	assertReason("idempotent-repause", re.PauseReason)
+
+	// Resume re-engages the item.
+	resumed, err := repo.TransitionCampaignItem(ctx, item.ID, campaign.ItemStateRunning)
+	if err != nil {
+		t.Fatalf("paused→running (resume): %v", err)
+	}
+	if resumed.State != campaign.ItemStateRunning {
+		t.Errorf("state after resume = %q, want running", resumed.State)
+	}
+}
+
+// TestPostgres_CampaignItem_MalformedPauseReason_Tolerated asserts the
+// rowToCampaignItem tolerance branch for pause_reason: a JSONB blob that is
+// valid JSONB but not a PauseReason object (so json.Unmarshal fails) is
+// DROPPED to a nil *PauseReason rather than failing the read — same posture as
+// the depends_on tolerance. Written via raw SQL because the repo write path
+// always marshals a well-formed object.
+func TestPostgres_CampaignItem_MalformedPauseReason_Tolerated(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c := makeCampaign(t, repo)
+	item, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID,
+		IssueRef:   "issue:1441",
+	})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+
+	// Overwrite pause_reason with valid JSONB that is NOT a PauseReason object.
+	if _, err := pool.Exec(ctx,
+		`UPDATE campaign_items SET pause_reason = '["not","an-object"]'::jsonb WHERE id = $1`,
+		item.ID,
+	); err != nil {
+		t.Fatalf("write malformed pause_reason: %v", err)
+	}
+
+	got, err := repo.GetCampaignItem(ctx, item.ID)
+	if err != nil {
+		t.Fatalf("get item with malformed pause_reason should not error: %v", err)
+	}
+	if got.PauseReason != nil {
+		t.Errorf("malformed pause_reason = %+v, want nil (dropped, not surfaced)", got.PauseReason)
+	}
+}
+
+// TestPostgres_PauseCampaignItem_InvalidAndMissing covers the two error
+// branches of PauseCampaignItem: pausing a non-running (pending) item is
+// refused with InvalidTransitionError (only running → paused is valid), and a
+// missing item is ErrNotFound.
+func TestPostgres_PauseCampaignItem_InvalidAndMissing(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c := makeCampaign(t, repo)
+	item, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID,
+		IssueRef:   "issue:1441",
+	})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+
+	// pending → paused is refused (item must be running first).
+	_, err = repo.PauseCampaignItem(ctx, item.ID, campaign.PauseReason{PageEvent: "x"})
+	var ite campaign.InvalidTransitionError
+	if !errors.As(err, &ite) {
+		t.Fatalf("pause(pending) err = %v, want InvalidTransitionError", err)
+	}
+	if ite.Kind != "campaign_item" || ite.To != "paused" {
+		t.Errorf("InvalidTransitionError = %+v, want campaign_item →paused", ite)
+	}
+
+	// A missing item is ErrNotFound.
+	if _, err := repo.PauseCampaignItem(ctx, uuid.New(), campaign.PauseReason{}); !errors.Is(err, campaign.ErrNotFound) {
+		t.Errorf("pause(missing) err = %v, want ErrNotFound", err)
+	}
+}
+
 // TestPostgres_RunLinkage_EndToEnd spans domain → persistence → run linkage:
 // it inserts a REAL runs row (via the run repo, exercising the cross-package
 // boundary), attaches it to a campaign item, and asserts both forward

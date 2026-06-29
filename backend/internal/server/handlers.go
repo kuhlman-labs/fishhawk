@@ -41,6 +41,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/campaigns/{campaign_id}", s.handleGetCampaign)
 	mux.HandleFunc("GET /v0/campaigns/{campaign_id}/items", s.handleListCampaignItems)
 	mux.HandleFunc("GET /v0/campaigns/{campaign_id}/status", s.handleGetCampaignStatus)
+	mux.HandleFunc("POST /v0/campaigns/{campaign_id}/resume", s.handleResumeCampaign)
 	mux.HandleFunc("POST /v0/work-items", s.handleFileWorkItem)
 	mux.HandleFunc("GET /v0/calibration", s.handleGetCalibration)
 	mux.HandleFunc("POST /v0/runs/{run_id}/signing-key", s.handleIssueSigningKey)

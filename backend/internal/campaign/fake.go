@@ -66,3 +66,8 @@ func (BaseFake) SetCampaignItemRun(_ context.Context, _ uuid.UUID, _ *uuid.UUID)
 func (BaseFake) TransitionCampaignItem(_ context.Context, _ uuid.UUID, _ ItemState) (*Item, error) {
 	return nil, ErrNotFound
 }
+
+// PauseCampaignItem returns nil, ErrNotFound.
+func (BaseFake) PauseCampaignItem(_ context.Context, _ uuid.UUID, _ PauseReason) (*Item, error) {
+	return nil, ErrNotFound
+}

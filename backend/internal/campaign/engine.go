@@ -28,6 +28,12 @@ type Eligibility struct {
 	// they are never re-dispatched; tracked separately so a cancelled item with
 	// no run and no deps is not mistaken for Eligible.
 	Cancelled []string
+	// Paused items were handed off to a human by the auto-driver (E25.7). A
+	// paused item carries a RunID and a non-terminal state, so it must be
+	// classified BEFORE the Running catch-all — otherwise it would be mistaken
+	// for Running. It is never re-dispatched until a resume flips it back to
+	// running.
+	Paused []string
 }
 
 // NextEligible partitions a campaign's items into eligible / blocked /
@@ -66,6 +72,11 @@ func NextEligible(items []*Item) Eligibility {
 			// Terminal: never eligible for dispatch, even with no run and no
 			// deps (which would otherwise fall through to the default branch).
 			e.Cancelled = append(e.Cancelled, ref)
+		case it.State == ItemStatePaused:
+			// Paused (E25.7): carries a RunID and a non-terminal state, so it
+			// MUST be classified before the Running catch-all below or it would
+			// be mis-counted as Running. Never re-dispatched until resumed.
+			e.Paused = append(e.Paused, ref)
 		case it.State == ItemStateSucceeded:
 			e.Done = append(e.Done, ref)
 		case it.State == ItemStateRunning || (it.RunID != nil && !it.State.IsTerminal()):
@@ -102,10 +113,12 @@ func depsSatisfied(deps []string, done map[string]bool) bool {
 //   - any item running, or partial progress (some succeeded, not all) => running;
 //   - otherwise (all pending, or pending/blocked with no progress) => pending.
 //
-// StateCancelled (and the proposal's "paused") are NOT derived here: the item
-// state enum has no `paused` member and no item state implies a campaign
-// pause/cancel. Those are operator-set overlays owned by Track C / E25.4;
-// derivation never emits them.
+// StateCancelled and StatePaused are NOT derived here: they are operator/
+// driver-set overlays (cancel = manual halt; paused = the E25.7 gate hand-off),
+// and no item state implies them. A paused item is treated as
+// non-succeeding/non-failing — it contributes to none of anyFailed/anyRunning/
+// anySucceeded and makes allSucceeded false, exactly like a still-pending item
+// — so derivation never emits StatePaused (the driver overlays it).
 func DeriveState(items []*Item) State {
 	if len(items) == 0 {
 		return StatePending

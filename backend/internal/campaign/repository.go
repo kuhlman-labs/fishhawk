@@ -13,9 +13,16 @@ import (
 var ErrNotFound = errors.New("not found")
 
 // CreateCampaignParams are the inputs needed to insert a new campaign.
+//
+// PausePolicy is OPTIONAL: a zero value is normalized to
+// PausePolicyPauseCampaign by the adapter before insert (and by
+// campaign.Persist before it builds these params), so callers that do not set
+// a policy get the conservative block-the-campaign default and the column
+// CHECK is never handed an empty string.
 type CreateCampaignParams struct {
-	Repo    string
-	EpicRef string
+	Repo        string
+	EpicRef     string
+	PausePolicy PausePolicy
 }
 
 // CreateCampaignItemParams are the inputs needed to insert a new campaign
@@ -84,4 +91,13 @@ type Repository interface {
 	// target is not reachable. Same-state (idempotent) calls return the
 	// unchanged item.
 	TransitionCampaignItem(ctx context.Context, id uuid.UUID, to ItemState) (*Item, error)
+
+	// PauseCampaignItem transitions an item running → paused and records the
+	// PauseReason, atomically under the same FOR UPDATE lock as the other
+	// transitions. Returns InvalidTransitionError if the item is not in a
+	// state from which paused is reachable (only running → paused is valid),
+	// and ErrNotFound for a missing item. An already-paused item is an
+	// idempotent no-op returning the unchanged item (its first PauseReason is
+	// preserved). This is the driver's gate-handoff entry point (E25.7).
+	PauseCampaignItem(ctx context.Context, id uuid.UUID, reason PauseReason) (*Item, error)
 }

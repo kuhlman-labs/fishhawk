@@ -36,6 +36,11 @@ func (r *postgresRepo) CreateCampaign(ctx context.Context, p CreateCampaignParam
 		Repo:    p.Repo,
 		EpicRef: p.EpicRef,
 		State:   string(StatePending),
+		// Normalize a zero policy to the conservative block-the-campaign
+		// default so a direct caller that omits PausePolicy never hands the
+		// column CHECK an empty string. campaign.Persist normalizes too; this
+		// is the defensive last line for any other repository caller.
+		PausePolicy: string(normalizePausePolicy(p.PausePolicy)),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create campaign: %w", err)
@@ -223,6 +228,46 @@ func (r *postgresRepo) TransitionCampaignItem(ctx context.Context, id uuid.UUID,
 	return result, nil
 }
 
+func (r *postgresRepo) PauseCampaignItem(ctx context.Context, id uuid.UUID, reason PauseReason) (*Item, error) {
+	payload, err := json.Marshal(reason)
+	if err != nil {
+		return nil, fmt.Errorf("marshal pause_reason: %w", err)
+	}
+	var result *Item
+	err = pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := campaigndb.New(tx)
+		current, err := q.LockCampaignItemForUpdate(ctx, id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock campaign item: %w", err)
+		}
+		from := ItemState(current.State)
+		// Already paused: idempotent no-op preserving the first PauseReason.
+		if from == ItemStatePaused {
+			result = rowToCampaignItem(current)
+			return nil
+		}
+		if !ValidCampaignItemTransition(from, ItemStatePaused) {
+			return InvalidTransitionError{Kind: "campaign_item", From: string(from), To: string(ItemStatePaused)}
+		}
+		updated, err := q.SetCampaignItemPause(ctx, campaigndb.SetCampaignItemPauseParams{
+			ID:          id,
+			PauseReason: payload,
+		})
+		if err != nil {
+			return fmt.Errorf("set campaign item pause: %w", err)
+		}
+		result = rowToCampaignItem(updated)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // --- Conversions between DB and domain types ---
 
 // marshalDependsOn renders the depends_on edge slice as a JSONB array. A nil
@@ -241,12 +286,13 @@ func marshalDependsOn(deps []string) ([]byte, error) {
 
 func rowToCampaign(c campaigndb.Campaign) *Campaign {
 	return &Campaign{
-		ID:        c.ID,
-		Repo:      c.Repo,
-		EpicRef:   c.EpicRef,
-		State:     State(c.State),
-		CreatedAt: c.CreatedAt.Time,
-		UpdatedAt: c.UpdatedAt.Time,
+		ID:          c.ID,
+		Repo:        c.Repo,
+		EpicRef:     c.EpicRef,
+		State:       State(c.State),
+		PausePolicy: PausePolicy(c.PausePolicy),
+		CreatedAt:   c.CreatedAt.Time,
+		UpdatedAt:   c.UpdatedAt.Time,
 	}
 }
 
@@ -269,6 +315,15 @@ func rowToCampaignItem(i campaigndb.CampaignItem) *Item {
 		var deps []string
 		if err := json.Unmarshal(i.DependsOn, &deps); err == nil {
 			out.DependsOn = deps
+		}
+	}
+	// JSONB → *PauseReason. NULL/empty yields nil (item never paused). A
+	// malformed blob is dropped to nil rather than failing the read, same
+	// tolerance posture as depends_on above.
+	if len(i.PauseReason) > 0 {
+		var pr PauseReason
+		if err := json.Unmarshal(i.PauseReason, &pr); err == nil {
+			out.PauseReason = &pr
 		}
 	}
 	return out

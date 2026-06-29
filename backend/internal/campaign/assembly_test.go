@@ -171,6 +171,50 @@ func TestPersist_CreateCampaignError(t *testing.T) {
 	}
 }
 
+// capturingFake records the CreateCampaignParams Persist builds so a test can
+// assert the PausePolicy normalization without a database. It creates the
+// campaign successfully; tests pass an Assembly with no items so the item loop
+// is a no-op (BaseFake.CreateCampaignItem would otherwise return ErrNotFound).
+type capturingFake struct {
+	campaign.BaseFake
+	got campaign.CreateCampaignParams
+}
+
+func (f *capturingFake) CreateCampaign(_ context.Context, p campaign.CreateCampaignParams) (*campaign.Campaign, error) {
+	f.got = p
+	return &campaign.Campaign{EpicRef: p.EpicRef, PausePolicy: p.PausePolicy}, nil
+}
+
+// TestPersist_NormalizesZeroPausePolicy is the backward-compat done-means: an
+// Assembly with a ZERO PausePolicy (what the existing, unchanged server call
+// site produces under slice 1) must persist as the block-the-campaign default
+// pause_campaign — never an empty string. Tested via the captured params so
+// the normalization is asserted in Persist itself.
+func TestPersist_NormalizesZeroPausePolicy(t *testing.T) {
+	f := &capturingFake{}
+	a := &campaign.Assembly{EpicRef: "issue:40"} // zero PausePolicy, no items
+	if _, err := campaign.Persist(context.Background(), f, "kuhlman-labs/fishhawk", a); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	if f.got.PausePolicy != campaign.PausePolicyPauseCampaign {
+		t.Errorf("zero PausePolicy persisted as %q, want %q", f.got.PausePolicy, campaign.PausePolicyPauseCampaign)
+	}
+}
+
+// TestPersist_PreservesExplicitPausePolicy asserts the other half: an explicit
+// pause_item policy survives Persist unchanged (slice 3 sets it from the create
+// request), so normalization defaults only the zero value.
+func TestPersist_PreservesExplicitPausePolicy(t *testing.T) {
+	f := &capturingFake{}
+	a := &campaign.Assembly{EpicRef: "issue:40", PausePolicy: campaign.PausePolicyPauseItem}
+	if _, err := campaign.Persist(context.Background(), f, "kuhlman-labs/fishhawk", a); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	if f.got.PausePolicy != campaign.PausePolicyPauseItem {
+		t.Errorf("explicit PausePolicy persisted as %q, want %q", f.got.PausePolicy, campaign.PausePolicyPauseItem)
+	}
+}
+
 // persistItemErrFake creates a campaign successfully but fails every item
 // insert, so Persist reaches the create-item error branch.
 type persistItemErrFake struct{ campaign.BaseFake }

@@ -11,6 +11,7 @@ func TestState_IsTerminal(t *testing.T) {
 	}{
 		{StatePending, false},
 		{StateRunning, false},
+		{StatePaused, false}, // paused is a non-terminal overlay; a human resumes it
 		{StateSucceeded, true},
 		{StateFailed, true},
 		{StateCancelled, true},
@@ -35,6 +36,7 @@ func TestItemState_IsTerminal(t *testing.T) {
 		{ItemStatePending, false},
 		{ItemStateBlocked, false},
 		{ItemStateRunning, false},
+		{ItemStatePaused, false}, // paused is a non-terminal overlay
 		{ItemStateSucceeded, true},
 		{ItemStateFailed, true},
 		{ItemStateCancelled, true},

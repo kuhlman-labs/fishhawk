@@ -86,9 +86,31 @@ func TestNextEligible_CancelledIsTerminal(t *testing.T) {
 	}
 }
 
+// TestNextEligible_PausedBucketed covers the E25.7 classification: a paused
+// item carries a RunID and a non-terminal state, so without an explicit case
+// it would fall into the Running catch-all. Assert it lands in Paused — NOT
+// Running and NOT Eligible — so a paused item is never counted as in-flight or
+// re-dispatched until a resume flips it back to running.
+func TestNextEligible_PausedBucketed(t *testing.T) {
+	run := uuid.New()
+	items := []*campaign.Item{
+		item("issue:1", campaign.ItemStatePaused, &run), // paused, run still linked
+	}
+	got := campaign.NextEligible(items)
+	if !reflect.DeepEqual(got.Paused, []string{"issue:1"}) {
+		t.Errorf("paused = %v, want [issue:1]", got.Paused)
+	}
+	if len(got.Running) != 0 {
+		t.Errorf("running = %v, want none (paused must not be counted Running)", got.Running)
+	}
+	if len(got.Eligible) != 0 {
+		t.Errorf("eligible = %v, want none (paused must not be re-dispatched)", got.Eligible)
+	}
+}
+
 // TestDeriveState exercises one assertion per derived branch: pending,
-// running, succeeded, failed. StateCancelled/paused are operator overlays and
-// are intentionally never derived.
+// running, succeeded, failed. StateCancelled/StatePaused are operator overlays
+// and are intentionally never derived.
 func TestDeriveState(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -139,6 +161,35 @@ func TestDeriveState(t *testing.T) {
 				item("issue:2", campaign.ItemStateFailed, nil),
 			},
 			want: campaign.StateFailed,
+		},
+		{
+			// A paused item is never derived to StatePaused; with a succeeded
+			// sibling the campaign reads running (partial progress), proving
+			// derivation overlays nothing and treats paused as non-succeeding.
+			name: "paused with progress is running, never paused",
+			items: []*campaign.Item{
+				item("issue:1", campaign.ItemStateSucceeded, nil),
+				item("issue:2", campaign.ItemStatePaused, nil),
+			},
+			want: campaign.StateRunning,
+		},
+		{
+			// A paused item is non-succeeding: it must NOT flip the campaign to
+			// succeeded even when every other item succeeded.
+			name: "paused blocks all-succeeded",
+			items: []*campaign.Item{
+				item("issue:1", campaign.ItemStateSucceeded, nil),
+				item("issue:2", campaign.ItemStatePaused, nil),
+			},
+			want: campaign.StateRunning,
+		},
+		{
+			// All paused (no other progress) derives pending, never StatePaused.
+			name: "all paused is pending, never paused",
+			items: []*campaign.Item{
+				item("issue:1", campaign.ItemStatePaused, nil),
+			},
+			want: campaign.StatePending,
 		},
 	}
 	for _, tt := range tests {

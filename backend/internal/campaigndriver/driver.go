@@ -90,6 +90,14 @@ const (
 	// / pr_merged, stamped ActorAgent operator-agent/campaign) is written by the
 	// actor on the run chain; this marker ties that action back to the campaign.
 	categoryCampaignGateActed = "campaign_gate_acted"
+	// categoryCampaignPaused is the campaign-level marker the driver records on
+	// the GLOBAL chain when the GateActor REFUSED a must_page_human gate
+	// (out.Paged) and the driver paused the affected item — and, under the
+	// pause_campaign policy, the whole campaign — and fired the page (E25.7 /
+	// ADR-047 Track C). The run-chained campaign_gate_paged hand-off entry the
+	// actor wrote is the page trigger; this marker records the pause action on
+	// the campaign side.
+	categoryCampaignPaused = "campaign_paused"
 )
 
 // CampaignStore is the slice of campaign.Repository the driver uses: list the
@@ -102,6 +110,11 @@ type CampaignStore interface {
 	SetCampaignItemRun(ctx context.Context, itemID uuid.UUID, runID *uuid.UUID) (*campaign.Item, error)
 	TransitionCampaignItem(ctx context.Context, id uuid.UUID, to campaign.ItemState) (*campaign.Item, error)
 	TransitionCampaign(ctx context.Context, id uuid.UUID, to campaign.State) (*campaign.Campaign, error)
+	// PauseCampaignItem transitions a running item to paused, recording the
+	// PauseReason (the page event + run/stage) under the same FOR UPDATE lock
+	// as the other item transitions (E25.7). Used by the Paged branch when the
+	// GateActor hands a must_page_human gate off to a human.
+	PauseCampaignItem(ctx context.Context, id uuid.UUID, reason campaign.PauseReason) (*campaign.Item, error)
 }
 
 // RunReader reads a run row for terminal detection. A narrow capability —
@@ -159,6 +172,19 @@ type GateActor interface {
 	DriveRunGate(ctx context.Context, runRow *run.Run) (GateActionOutcome, error)
 }
 
+// Notifier fires the human page when the auto-driver hands a gate off (E25.7).
+// The single seam between the campaign driver and the issue-comment notifier:
+// serve.go binds it to the existing issuecomment notifier's
+// NotifyStatusUpdateForRun, which re-renders the run's status anchor and posts
+// the page-class campaign_gate_paged ping (issuecomment/ping.go) on the run's
+// issue — where the operator is already watching. Defined HERE so the driver
+// never imports the notifier package (avoiding an import cycle). OPTIONAL on
+// the Ticker: a nil Notifier makes the Paged branch observe-only — the pause is
+// still recorded but no page is fired.
+type Notifier interface {
+	NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID) error
+}
+
 // Ticker mechanically advances running campaigns. Run() blocks until ctx is
 // cancelled. All of Campaigns, Runs, Starter, and Audit are required; a nil
 // one is a configuration error caught by Run() and is a logged no-op in Tick()
@@ -176,6 +202,12 @@ type Ticker struct {
 	// among the required dependencies Run()/Tick() guard on — the driver is
 	// fully functional (mechanical advancement) without it.
 	GateActor GateActor
+
+	// Notifier fires the human page when the GateActor refuses a
+	// must_page_human gate (E25.7). OPTIONAL: a nil Notifier makes the Paged
+	// branch observe-only — the pause is still recorded but no page is posted.
+	// Not among the required dependencies Run()/Tick() guard on.
+	Notifier Notifier
 
 	// Logger receives structured warnings about transient errors. nil →
 	// slog.Default().
@@ -281,7 +313,13 @@ func (t *Ticker) processCampaign(ctx context.Context, logger *slog.Logger, c *ca
 		t.deriveAndTransition(ctx, logger, c, items)
 	}
 
-	t.start(ctx, logger, c, items)
+	// Skip the START pass once the campaign left the running state this tick —
+	// a mid-tick pause (E25.7) or a derived terminal state must not dispatch new
+	// runs. A paused campaign re-engages only on resume (paused->running), and a
+	// terminal one has nothing to start.
+	if c.State == campaign.StateRunning {
+		t.start(ctx, logger, c, items)
+	}
 }
 
 // advance settles every running item whose linked run has reached a terminal
@@ -377,7 +415,85 @@ func (t *Ticker) driveGate(ctx context.Context, logger *slog.Logger, c *campaign
 			"run_id":      runRow.ID.String(),
 			"action":      out.Action,
 		})
+		return
 	}
+	if out.Paged {
+		t.pageGate(ctx, logger, c, it, runRow, out.PageEvent)
+	}
+}
+
+// pageGate handles a must_page_human hand-off (out.Paged) the GateActor
+// refused (E25.7 / ADR-047 Track C): it pauses the affected item — recording
+// the PauseReason (the page event + run) — and, unless the campaign's
+// PausePolicy is pause_item (continue-others), pauses the whole campaign; it
+// records a campaign_paused marker on the global chain and fires the human page
+// through the Notifier seam (which posts the campaign_gate_paged page-class
+// ping on the run's issue). The actor already wrote the run-chained
+// campaign_gate_paged hand-off entry — the page trigger — so this method only
+// pauses and pings. Best-effort and ordered so the SAFE outcome (the pause)
+// always lands: a PauseCampaignItem error aborts (no campaign pause, no page);
+// a campaign-pause or page error after the item paused only WARN-logs, leaving
+// the recorded pause intact. A nil Notifier records the pause and skips the
+// page (observe-only).
+func (t *Ticker) pageGate(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, it *campaign.Item, runRow *run.Run, pageEvent string) {
+	runID := runRow.ID
+	reason := campaign.PauseReason{PageEvent: pageEvent, RunID: &runID}
+	if _, err := t.Campaigns.PauseCampaignItem(ctx, it.ID, reason); err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: pause item on gate hand-off failed; left for next tick",
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("item_id", it.ID.String()),
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+
+	// pause_item (continue-others) pauses only the affected item; any other
+	// policy (including the normalized default pause_campaign, and an unset
+	// zero value defensively) blocks the whole campaign.
+	if c.PausePolicy != campaign.PausePolicyPauseItem {
+		if campaign.ValidCampaignTransition(c.State, campaign.StatePaused) {
+			if _, err := t.Campaigns.TransitionCampaign(ctx, c.ID, campaign.StatePaused); err != nil {
+				logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: pause campaign on gate hand-off failed; item paused, campaign left for next tick",
+					slog.String("campaign_id", c.ID.String()),
+					slog.String("error", err.Error()))
+			} else {
+				// Reflect the pause on the in-memory campaign so the same tick's
+				// deriveAndTransition sees it as already-paused (sticky) and the
+				// START pass is skipped — the postgres TransitionCampaign returns
+				// a fresh row and does not mutate c.
+				c.State = campaign.StatePaused
+			}
+		}
+	}
+
+	t.emit(ctx, logger, categoryCampaignPaused, map[string]any{
+		"campaign_id": c.ID.String(),
+		"issue_ref":   it.IssueRef,
+		"run_id":      runID.String(),
+		"page_event":  pageEvent,
+		"policy":      string(normalizedPolicy(c.PausePolicy)),
+	})
+
+	if t.Notifier == nil {
+		return
+	}
+	if err := t.Notifier.NotifyStatusUpdateForRun(ctx, runID); err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: fire page on gate hand-off failed; pause recorded",
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+	}
+}
+
+// normalizedPolicy reports the effective pause policy for the audit marker,
+// defaulting a zero value to pause_campaign (a persisted campaign is never
+// empty, but the marker should record the effective policy even for a
+// hand-built campaign).
+func normalizedPolicy(p campaign.PausePolicy) campaign.PausePolicy {
+	if p == campaign.PausePolicyPauseItem {
+		return campaign.PausePolicyPauseItem
+	}
+	return campaign.PausePolicyPauseCampaign
 }
 
 // deriveAndTransition re-derives the campaign state from its items and, when
@@ -385,6 +501,14 @@ func (t *Ticker) driveGate(ctx context.Context, logger *slog.Logger, c *campaign
 // emits a campaign_advanced entry. Idempotent: a no-change derivation emits
 // nothing.
 func (t *Ticker) deriveAndTransition(ctx context.Context, logger *slog.Logger, c *campaign.Campaign, items []*campaign.Item) {
+	if c.State == campaign.StatePaused {
+		// Sticky-paused (E25.7): a campaign the driver/operator paused must not
+		// be auto-unpaused by a sibling settling this tick. paused->running is a
+		// valid transition (the resume verb uses it), so without this guard an
+		// un-paused re-derive could silently resume a paused campaign. Resuming
+		// is an explicit operator action (POST /resume), never a derivation.
+		return
+	}
 	newState := campaign.DeriveState(items)
 	if newState == c.State {
 		return

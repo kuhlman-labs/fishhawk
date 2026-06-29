@@ -148,6 +148,19 @@ func pageClassEvents(entries []*audit.Entry, stages []*run.Stage) []pageEvent {
 				message: fmt.Sprintf("❓ The planner parked this issue for direction — %s your answer before planning resumes.",
 					clarificationQuestionPhrase(clarificationQuestionCount(e.Payload))),
 			})
+		case "campaign_gate_paged":
+			// must_page_human hand-off (E25.7, server.CategoryCampaignGatePaged):
+			// the campaign auto-driver REFUSED a gate a human must own
+			// (reviewer_reject / requirement_arbitration) and paused the item —
+			// see backend/internal/campaigndriver. The run-chained entry the
+			// auto-driver wrote is otherwise silent on anchor edits, so it gets a
+			// page-class ping naming the gate/decision the human must act on.
+			out = append(out, pageEvent{
+				sequence: e.Sequence,
+				kind:     "campaign_gate_paged",
+				message: fmt.Sprintf("🛑 The campaign auto-driver paused this issue and needs you: %s.",
+					campaignGatePagedPhrase(pagePageEvent(e.Payload))),
+			})
 		case "ci_failure_retry_dispatched":
 			out = append(out, pageEvent{
 				sequence: e.Sequence,
@@ -257,6 +270,38 @@ func clarificationQuestionPhrase(n int) string {
 		return fmt.Sprintf("%d questions need", n)
 	default:
 		return "your parked questions need"
+	}
+}
+
+// pagePageEvent reads the `page_event` field from a campaign_gate_paged audit
+// payload (server.emitCampaignGatePaged writes it) — the must_page_human event
+// the auto-driver refused (e.g. "reviewer_reject"). Empty when absent or
+// unparseable; campaignGatePagedPhrase degrades to a generic phrase.
+func pagePageEvent(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	var p struct {
+		PageEvent string `json:"page_event"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return ""
+	}
+	return p.PageEvent
+}
+
+// campaignGatePagedPhrase renders the human-readable gate/decision fragment for
+// the campaign-paused ping from the raw page_event token. A known token gets a
+// specific phrase; anything else (including an empty/unparseable payload)
+// degrades to a generic "a gate decision" rather than a bare token or "”".
+func campaignGatePagedPhrase(pageEvent string) string {
+	switch pageEvent {
+	case "reviewer_reject", "gating_reviewer_reject":
+		return "a reviewer flagged a blocking concern that needs your decision"
+	case "requirement_arbitration":
+		return "a requirement needs your arbitration"
+	default:
+		return "a gate decision"
 	}
 }
 

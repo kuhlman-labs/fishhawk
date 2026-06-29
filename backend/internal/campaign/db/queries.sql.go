@@ -13,16 +13,17 @@ import (
 
 const createCampaign = `-- name: CreateCampaign :one
 
-INSERT INTO campaigns (id, repo, epic_ref, state)
-VALUES ($1, $2, $3, $4)
-RETURNING id, repo, epic_ref, state, created_at, updated_at
+INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, repo, epic_ref, state, created_at, updated_at, pause_policy
 `
 
 type CreateCampaignParams struct {
-	ID      uuid.UUID `json:"id"`
-	Repo    string    `json:"repo"`
-	EpicRef string    `json:"epic_ref"`
-	State   string    `json:"state"`
+	ID          uuid.UUID `json:"id"`
+	Repo        string    `json:"repo"`
+	EpicRef     string    `json:"epic_ref"`
+	State       string    `json:"state"`
+	PausePolicy string    `json:"pause_policy"`
 }
 
 // Campaign / campaign-item queries consumed by the postgres adapter for the
@@ -35,6 +36,7 @@ func (q *Queries) CreateCampaign(ctx context.Context, arg CreateCampaignParams) 
 		arg.Repo,
 		arg.EpicRef,
 		arg.State,
+		arg.PausePolicy,
 	)
 	var i Campaign
 	err := row.Scan(
@@ -44,6 +46,7 @@ func (q *Queries) CreateCampaign(ctx context.Context, arg CreateCampaignParams) 
 		&i.State,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PausePolicy,
 	)
 	return i, err
 }
@@ -51,7 +54,7 @@ func (q *Queries) CreateCampaign(ctx context.Context, arg CreateCampaignParams) 
 const createCampaignItem = `-- name: CreateCampaignItem :one
 INSERT INTO campaign_items (id, campaign_id, issue_ref, depends_on, state)
 VALUES ($1, $2, $3, $4, $5)
-RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at
+RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason
 `
 
 type CreateCampaignItemParams struct {
@@ -80,12 +83,13 @@ func (q *Queries) CreateCampaignItem(ctx context.Context, arg CreateCampaignItem
 		&i.State,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PauseReason,
 	)
 	return i, err
 }
 
 const getCampaign = `-- name: GetCampaign :one
-SELECT id, repo, epic_ref, state, created_at, updated_at FROM campaigns WHERE id = $1
+SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy FROM campaigns WHERE id = $1
 `
 
 func (q *Queries) GetCampaign(ctx context.Context, id uuid.UUID) (Campaign, error) {
@@ -98,12 +102,13 @@ func (q *Queries) GetCampaign(ctx context.Context, id uuid.UUID) (Campaign, erro
 		&i.State,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PausePolicy,
 	)
 	return i, err
 }
 
 const getCampaignItem = `-- name: GetCampaignItem :one
-SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at FROM campaign_items WHERE id = $1
+SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason FROM campaign_items WHERE id = $1
 `
 
 func (q *Queries) GetCampaignItem(ctx context.Context, id uuid.UUID) (CampaignItem, error) {
@@ -118,12 +123,13 @@ func (q *Queries) GetCampaignItem(ctx context.Context, id uuid.UUID) (CampaignIt
 		&i.State,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PauseReason,
 	)
 	return i, err
 }
 
 const listCampaignItemsForCampaign = `-- name: ListCampaignItemsForCampaign :many
-SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at FROM campaign_items
+SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason FROM campaign_items
  WHERE campaign_id = $1
  ORDER BY created_at ASC, id ASC
 `
@@ -148,6 +154,7 @@ func (q *Queries) ListCampaignItemsForCampaign(ctx context.Context, campaignID u
 			&i.State,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.PauseReason,
 		); err != nil {
 			return nil, err
 		}
@@ -160,7 +167,7 @@ func (q *Queries) ListCampaignItemsForCampaign(ctx context.Context, campaignID u
 }
 
 const listCampaignItemsForRun = `-- name: ListCampaignItemsForRun :many
-SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at FROM campaign_items
+SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason FROM campaign_items
  WHERE run_id = $1
  ORDER BY created_at ASC, id ASC
 `
@@ -186,6 +193,7 @@ func (q *Queries) ListCampaignItemsForRun(ctx context.Context, runID *uuid.UUID)
 			&i.State,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.PauseReason,
 		); err != nil {
 			return nil, err
 		}
@@ -198,7 +206,7 @@ func (q *Queries) ListCampaignItemsForRun(ctx context.Context, runID *uuid.UUID)
 }
 
 const listCampaigns = `-- name: ListCampaigns :many
-SELECT id, repo, epic_ref, state, created_at, updated_at FROM campaigns
+SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy FROM campaigns
  WHERE ($1::text = '' OR repo = $1)
    AND ($2::text = '' OR state = $2)
  ORDER BY created_at DESC, id DESC
@@ -236,6 +244,7 @@ func (q *Queries) ListCampaigns(ctx context.Context, arg ListCampaignsParams) ([
 			&i.State,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.PausePolicy,
 		); err != nil {
 			return nil, err
 		}
@@ -248,7 +257,7 @@ func (q *Queries) ListCampaigns(ctx context.Context, arg ListCampaignsParams) ([
 }
 
 const lockCampaignForUpdate = `-- name: LockCampaignForUpdate :one
-SELECT id, repo, epic_ref, state, created_at, updated_at FROM campaigns WHERE id = $1 FOR UPDATE
+SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy FROM campaigns WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockCampaignForUpdate(ctx context.Context, id uuid.UUID) (Campaign, error) {
@@ -261,12 +270,13 @@ func (q *Queries) LockCampaignForUpdate(ctx context.Context, id uuid.UUID) (Camp
 		&i.State,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PausePolicy,
 	)
 	return i, err
 }
 
 const lockCampaignItemForUpdate = `-- name: LockCampaignItemForUpdate :one
-SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at FROM campaign_items WHERE id = $1 FOR UPDATE
+SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason FROM campaign_items WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockCampaignItemForUpdate(ctx context.Context, id uuid.UUID) (CampaignItem, error) {
@@ -281,6 +291,39 @@ func (q *Queries) LockCampaignItemForUpdate(ctx context.Context, id uuid.UUID) (
 		&i.State,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PauseReason,
+	)
+	return i, err
+}
+
+const setCampaignItemPause = `-- name: SetCampaignItemPause :one
+UPDATE campaign_items
+   SET state = 'paused', pause_reason = $2
+ WHERE id = $1
+RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason
+`
+
+type SetCampaignItemPauseParams struct {
+	ID          uuid.UUID `json:"id"`
+	PauseReason []byte    `json:"pause_reason"`
+}
+
+// Pauses an item: sets state='paused' and records the pause_reason JSONB,
+// applied under the existing LockCampaignItemForUpdate FOR UPDATE lock so the
+// running→paused transition is serialized like the other state moves (E25.7).
+func (q *Queries) SetCampaignItemPause(ctx context.Context, arg SetCampaignItemPauseParams) (CampaignItem, error) {
+	row := q.db.QueryRow(ctx, setCampaignItemPause, arg.ID, arg.PauseReason)
+	var i CampaignItem
+	err := row.Scan(
+		&i.ID,
+		&i.CampaignID,
+		&i.IssueRef,
+		&i.DependsOn,
+		&i.RunID,
+		&i.State,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.PauseReason,
 	)
 	return i, err
 }
@@ -289,7 +332,7 @@ const setCampaignItemRun = `-- name: SetCampaignItemRun :one
 UPDATE campaign_items
    SET run_id = $2
  WHERE id = $1
-RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at
+RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason
 `
 
 type SetCampaignItemRunParams struct {
@@ -312,6 +355,7 @@ func (q *Queries) SetCampaignItemRun(ctx context.Context, arg SetCampaignItemRun
 		&i.State,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PauseReason,
 	)
 	return i, err
 }
@@ -320,7 +364,7 @@ const updateCampaignItemState = `-- name: UpdateCampaignItemState :one
 UPDATE campaign_items
    SET state = $2
  WHERE id = $1
-RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at
+RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason
 `
 
 type UpdateCampaignItemStateParams struct {
@@ -340,6 +384,7 @@ func (q *Queries) UpdateCampaignItemState(ctx context.Context, arg UpdateCampaig
 		&i.State,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PauseReason,
 	)
 	return i, err
 }
@@ -348,7 +393,7 @@ const updateCampaignState = `-- name: UpdateCampaignState :one
 UPDATE campaigns
    SET state = $2
  WHERE id = $1
-RETURNING id, repo, epic_ref, state, created_at, updated_at
+RETURNING id, repo, epic_ref, state, created_at, updated_at, pause_policy
 `
 
 type UpdateCampaignStateParams struct {
@@ -366,6 +411,7 @@ func (q *Queries) UpdateCampaignState(ctx context.Context, arg UpdateCampaignSta
 		&i.State,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PausePolicy,
 	)
 	return i, err
 }
