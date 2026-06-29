@@ -1,0 +1,29 @@
+{
+  "outcome": "diff_produced",
+  "tool_sequence": [
+    "Bash",
+    "Read",
+    "Bash",
+    "Read",
+    "Edit",
+    "Edit",
+    "Edit",
+    "Bash",
+    "Read",
+    "Edit",
+    "Bash",
+    "Bash",
+    "Bash",
+    "Bash",
+    "Edit",
+    "Read",
+    "Edit",
+    "Write"
+  ],
+  "tool_calls": 18,
+  "unnecessary_retries": 0,
+  "loop_detected": false,
+  "evidence_before_edit": true,
+  "out_of_tree_writes": [],
+  "scope_drift_paths": []
+}
