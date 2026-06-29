@@ -15,6 +15,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -416,6 +417,112 @@ func TestNewCampaignDriver_WiresDependencies(t *testing.T) {
 	}
 	if tk.Interval != time.Minute {
 		t.Errorf("interval = %v, want 1m", tk.Interval)
+	}
+	// E25.6: with the GitHub client wired the constructor binds a live
+	// GateActor so the driver auto-acts on each run gate.
+	if tk.GateActor == nil {
+		t.Error("ticker GateActor is nil despite a configured GitHub client; auto-drive would never run")
+	}
+}
+
+// TestCampaignOperatorIdentity asserts the in-process actor identity carries
+// the operator-agent attribution, the gate-action write scopes, and a non-empty
+// TokenID (scope-acceptance parity — the handler scope check must apply rather
+// than the cookie-session bypass). E25.6 / ADR-047 slice 3.
+func TestCampaignOperatorIdentity(t *testing.T) {
+	id := campaignOperatorIdentity()
+	if id.Subject != operatorrole.CampaignActorSubject {
+		t.Errorf("Subject = %q, want %q", id.Subject, operatorrole.CampaignActorSubject)
+	}
+	if id.TokenID == "" {
+		t.Error("TokenID is empty; the handler scope check would be bypassed (cookie-session path) instead of enforced")
+	}
+	want := operatorrole.CampaignActorScopes()
+	if len(id.Scopes) != len(want) {
+		t.Fatalf("Scopes = %v, want %v", id.Scopes, want)
+	}
+	have := map[string]bool{}
+	for _, s := range id.Scopes {
+		have[s] = true
+	}
+	for _, s := range want {
+		if !have[s] {
+			t.Errorf("Scopes missing %q (have %v)", s, id.Scopes)
+		}
+	}
+}
+
+// TestNewCampaignGateActor covers the serve-wiring construction AND the
+// fail-closed observe-only path (E25.6 / ADR-047 slice 3): a configured GitHub
+// client yields a live actor binding the campaign identity + GitHub merger; an
+// unconfigured client returns nil so the driver runs observe-only.
+func TestNewCampaignGateActor(t *testing.T) {
+	srv := server.New(server.Config{Addr: "127.0.0.1:0"})
+
+	// Configured: GitHub client present → a non-nil actor binding the campaign
+	// identity and a GitHubMerger.
+	actor := newCampaignGateActor(server.Config{GitHub: &githubclient.Client{}}, srv, slog.Default())
+	if actor == nil {
+		t.Fatal("newCampaignGateActor returned nil with a configured GitHub client; auto-drive would never run")
+	}
+	cga, ok := actor.(campaignGateActor)
+	if !ok {
+		t.Fatalf("actor concrete = %T, want campaignGateActor", actor)
+	}
+	if cga.id.Subject != operatorrole.CampaignActorSubject {
+		t.Errorf("actor identity subject = %q, want %q", cga.id.Subject, operatorrole.CampaignActorSubject)
+	}
+	if cga.merger == nil {
+		t.Error("actor GitHubMerger is nil; a delegated may_merge could not be honoured")
+	}
+
+	// Fail-closed: no GitHub client → nil actor (the driver runs observe-only).
+	if got := newCampaignGateActor(server.Config{GitHub: nil}, srv, slog.Default()); got != nil {
+		t.Errorf("newCampaignGateActor(nil GitHub) = %T, want nil (observe-only fail-closed)", got)
+	}
+}
+
+// TestGithubAutoMerger_FailsClosed asserts the merger refuses — before any
+// HTTP call — a run that lacks the installation id or PR url the merge needs,
+// or whose PR url is unparseable. These are the defensive guards the merge seam
+// adds; each returns an error the actor surfaces rather than a silent no-op.
+func TestGithubAutoMerger_FailsClosed(t *testing.T) {
+	m := githubAutoMerger{gh: &githubclient.Client{}}
+	ctx := context.Background()
+	inst := int64(42)
+	prURL := "https://github.com/x/y/pull/7"
+	bad := "not-a-url"
+
+	cases := []struct {
+		name string
+		run  *runpkg.Run
+	}{
+		{"no installation id", &runpkg.Run{ID: uuid.New(), PullRequestURL: &prURL}},
+		{"no pull request url", &runpkg.Run{ID: uuid.New(), InstallationID: &inst}},
+		{"unparseable pull request url", &runpkg.Run{ID: uuid.New(), InstallationID: &inst, PullRequestURL: &bad}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := m.MergePullRequest(ctx, tc.run); err == nil {
+				t.Fatalf("MergePullRequest(%s) = nil, want an error (fail-closed before HTTP)", tc.name)
+			}
+		})
+	}
+}
+
+// TestParseCampaignPRURL covers the PR-url parser's accept + reject branches.
+func TestParseCampaignPRURL(t *testing.T) {
+	repo, n, err := parseCampaignPRURL("https://github.com/owner/name/pull/123")
+	if err != nil {
+		t.Fatalf("valid url: unexpected error %v", err)
+	}
+	if repo.Owner != "owner" || repo.Name != "name" || n != 123 {
+		t.Errorf("parsed = %+v #%d, want owner/name #123", repo, n)
+	}
+	for _, bad := range []string{"", "https://github.com/owner/name", "https://github.com/owner/name/issues/1", "https://github.com/owner/name/pull/abc"} {
+		if _, _, err := parseCampaignPRURL(bad); err == nil {
+			t.Errorf("parseCampaignPRURL(%q) = nil error, want a reject", bad)
+		}
 	}
 }
 

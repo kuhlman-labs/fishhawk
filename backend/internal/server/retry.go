@@ -193,7 +193,18 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 		delegatedRule = rule
 	}
 
-	dec, err := run.RetryStage(r.Context(), s.cfg.RunRepo, stageID, run.RetryOptions{OverrideB: reqBody.Override})
+	// Gate-action core (E25.6 / ADR-047): the transition + audit + run
+	// un-terminal + orchestrator handoff + drive stamp + status notify is
+	// factored into retryStageAs, an identity-parameterised service method
+	// the in-process campaign auto-driver also calls. run.RetryStage's
+	// sentinel errors are returned verbatim and mapped to HTTP here exactly
+	// as before.
+	stageOut, err := s.retryStageAs(r.Context(), id, retryActionParams{
+		StageID:        stageID,
+		Override:       reqBody.Override,
+		OverrideReason: reqBody.Reason,
+		DelegatedRule:  delegatedRule,
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, run.ErrNotFound):
@@ -216,14 +227,49 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.writeJSON(w, r, http.StatusOK, toStageResponse(stageOut))
+}
+
+// retryActionParams carries the resolved inputs for retryStageAs. The HTTP
+// handler computes them from the request body + identity; the in-process
+// campaign auto-driver (E25.6) supplies them directly.
+type retryActionParams struct {
+	StageID        uuid.UUID
+	Override       bool
+	OverrideReason string
+	DelegatedRule  string
+}
+
+// retryStageAs performs the gate-action core of POST /v0/stages/{id}/retry
+// under the given identity: run.RetryStage, the audit write (ordinary
+// stage_retried receipt or the distinct stage_override_retried entry), the
+// failed→running run un-terminal, the orchestrator handoff, the drive
+// stamp, and the status notify. It is identity-parameterised so the HTTP
+// handler and the in-process campaign auto-driver (E25.6 / ADR-047) drive
+// the identical path and stamp identical audit. run.RetryStage's sentinel
+// errors are returned verbatim for the caller to map; every post-transition
+// step is best-effort exactly as in the prior inline handler.
+func (s *Server) retryStageAs(ctx context.Context, id Identity, p retryActionParams) (*run.Stage, error) {
+	// Enforce the retry gate's write scope on the acting identity (write:stages
+	// OR write:retries, matching the handler's inline check). A no-op on the HTTP
+	// path that already gated; the authz check for the in-process campaign
+	// auto-driver, which reaches this method directly (#1445).
+	if !identityHasGateScope(id, "write:stages", "write:retries") {
+		return nil, &gateActionScopeError{scope: "write:stages or write:retries"}
+	}
+	dec, err := run.RetryStage(ctx, s.cfg.RunRepo, p.StageID, run.RetryOptions{OverrideB: p.Override})
+	if err != nil {
+		return nil, err
+	}
+
 	// Best-effort fetch run for budget info in the audit receipt.
 	// A failure here is logged and the audit receipt omits the budget
 	// fields rather than failing the request.
 	var runRow *run.Run
-	if fetched, fetchErr := s.cfg.RunRepo.GetRun(r.Context(), dec.Stage.RunID); fetchErr == nil {
+	if fetched, fetchErr := s.cfg.RunRepo.GetRun(ctx, dec.Stage.RunID); fetchErr == nil {
 		runRow = fetched
 	} else {
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"get run for retry receipt failed",
 			slog.String("run_id", dec.Stage.RunID.String()),
 			slog.String("error", fetchErr.Error()))
@@ -235,9 +281,9 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 	// gets the distinct stage_override_retried entry (who/why) instead
 	// of the ordinary stage_retried receipt.
 	if dec.Overridden {
-		s.writeOverrideRetryAudit(r, dec, reqBody.Reason)
+		s.writeOverrideRetryAudit(ctx, id, dec, p.OverrideReason)
 	} else {
-		s.writeRetryAudit(r, dec, runRow, delegatedRule)
+		s.writeRetryAudit(ctx, id, dec, runRow, p.DelegatedRule)
 	}
 
 	// Un-terminal the run (failed → running) before the orchestrator
@@ -259,8 +305,8 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 	// run.RetryStage, so a RetryRun error here logs and does not fail
 	// the request — same audit-first posture as the Advance handoff.
 	if runRow != nil && runRow.State == run.StateFailed {
-		if _, err := s.cfg.RunRepo.RetryRun(r.Context(), dec.Stage.RunID, run.StateRunning); err != nil {
-			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError,
+		if _, err := s.cfg.RunRepo.RetryRun(ctx, dec.Stage.RunID, run.StateRunning); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
 				"reopen run failed → running for retry failed",
 				slog.String("run_id", dec.Stage.RunID.String()),
 				slog.String("stage_id", dec.Stage.ID.String()),
@@ -284,8 +330,8 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 	// awaiting_approval and don't need the orchestrator (no
 	// dispatch to fire — the gate just re-opens).
 	if dec.Stage.State == run.StageStatePending && s.cfg.Orchestrator != nil {
-		if _, err := s.cfg.Orchestrator.Advance(r.Context(), dec.Stage.RunID); err != nil {
-			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError,
+		if _, err := s.cfg.Orchestrator.Advance(ctx, dec.Stage.RunID); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
 				"orchestrator advance failed for retry",
 				slog.String("run_id", dec.Stage.RunID.String()),
 				slog.String("stage_id", dec.Stage.ID.String()),
@@ -298,7 +344,7 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 		}
 		// Re-fetch the stage post-orchestrator so the response
 		// reflects dispatched / awaiting_approval, not pending.
-		if updated, err := s.cfg.RunRepo.GetStage(r.Context(), dec.Stage.ID); err == nil {
+		if updated, err := s.cfg.RunRepo.GetStage(ctx, dec.Stage.ID); err == nil {
 			dec.Stage = updated
 		}
 	}
@@ -315,15 +361,15 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 	// only for the retryable A/C re-opens, never the D-timeout
 	// awaiting_approval re-open.
 	if reopenedToPending {
-		s.recordDriveRetryStage(r.Context(), retriedStageType, retriedStageID, retriedRunID)
+		s.recordDriveRetryStage(ctx, retriedStageType, retriedStageID, retriedRunID)
 	}
 
 	// Sticky status comment (E20.4 / #330). A retry flips a failed
 	// stage back to pending / dispatched / awaiting_approval; the
 	// status comment should reflect the new shape.
-	s.notifyStatusUpdate(r.Context(), dec.Stage.RunID, "stage_retry")
+	s.notifyStatusUpdate(ctx, dec.Stage.RunID, "stage_retry")
 
-	s.writeJSON(w, r, http.StatusOK, toStageResponse(dec.Stage))
+	return dec.Stage, nil
 }
 
 // recordDriveRetryStage stamps the drive engine's retry_reopen rule
@@ -374,8 +420,7 @@ func (s *Server) recordDriveRetryStage(ctx context.Context, stageType run.StageT
 // the retry landed via the ADR-040 delegated path (#1026) and the
 // payload records `delegated: "<rule>"`. Best-effort — the transition
 // is already committed, so a failure here logs but doesn't unwind.
-func (s *Server) writeRetryAudit(r *http.Request, dec *run.RetryDecision, runRow *run.Run, delegatedRule string) {
-	id := IdentityFrom(r.Context())
+func (s *Server) writeRetryAudit(ctx context.Context, id Identity, dec *run.RetryDecision, runRow *run.Run, delegatedRule string) {
 	subject := id.Subject
 	if subject == "" {
 		subject = "anonymous"
@@ -409,7 +454,7 @@ func (s *Server) writeRetryAudit(r *http.Request, dec *run.RetryDecision, runRow
 
 	payload, _ := json.Marshal(fields)
 
-	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        dec.Stage.RunID,
 		StageID:      &dec.Stage.ID,
 		Timestamp:    time.Now().UTC(),
@@ -435,8 +480,7 @@ func (s *Server) writeRetryAudit(r *http.Request, dec *run.RetryDecision, runRow
 // accept the B-violating diff or bypass the gate. Best-effort: the
 // transition is already committed, so a failure here logs but doesn't
 // unwind.
-func (s *Server) writeOverrideRetryAudit(r *http.Request, dec *run.RetryDecision, reason string) {
-	id := IdentityFrom(r.Context())
+func (s *Server) writeOverrideRetryAudit(ctx context.Context, id Identity, dec *run.RetryDecision, reason string) {
 	subject := id.Subject
 	if subject == "" {
 		subject = "anonymous"
@@ -462,7 +506,7 @@ func (s *Server) writeOverrideRetryAudit(r *http.Request, dec *run.RetryDecision
 
 	payload, _ := json.Marshal(fields)
 
-	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        dec.Stage.RunID,
 		StageID:      &dec.Stage.ID,
 		Timestamp:    time.Now().UTC(),

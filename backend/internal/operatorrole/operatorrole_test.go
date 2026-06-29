@@ -242,6 +242,48 @@ func TestEmbeddedSchemaHash(t *testing.T) {
 	}
 }
 
+// TestCampaignActorIdentity pins the campaign auto-driver's (E25.6)
+// in-process audit identity: a stable subject that classifies as the
+// role instance acting (audit.ActorAgent via IsTokenSubject), the
+// closed write-scope set the gate-action handlers enforce, and the
+// fresh-slice guarantee so a caller cannot mutate the shared set.
+func TestCampaignActorIdentity(t *testing.T) {
+	if CampaignActorSubject != "operator-agent/campaign" {
+		t.Fatalf("CampaignActorSubject = %q, want %q", CampaignActorSubject, "operator-agent/campaign")
+	}
+	// Subject must carry the operator-agent prefix so it is classified as
+	// the role instance acting (ActorAgent), not a human user.
+	if !IsTokenSubject(CampaignActorSubject) {
+		t.Errorf("IsTokenSubject(%q) = false, want true (campaign actions must stamp ActorAgent)", CampaignActorSubject)
+	}
+
+	scopes := CampaignActorScopes()
+	want := map[string]bool{
+		"write:approvals": false,
+		"write:stages":    false,
+		"write:fixups":    false,
+		"write:retries":   false,
+	}
+	for _, s := range scopes {
+		if _, ok := want[s]; !ok {
+			t.Errorf("CampaignActorScopes() has unexpected scope %q", s)
+			continue
+		}
+		want[s] = true
+	}
+	for s, seen := range want {
+		if !seen {
+			t.Errorf("CampaignActorScopes() missing required scope %q", s)
+		}
+	}
+
+	// Fresh slice on each call: mutating one return must not affect the next.
+	scopes[0] = "mutated"
+	if again := CampaignActorScopes(); again[0] != "write:approvals" {
+		t.Errorf("CampaignActorScopes() returned a shared backing array: got %q after mutation", again[0])
+	}
+}
+
 func TestValidateOverlayReadError(t *testing.T) {
 	readErr := errors.New("disk on fire")
 	err := ValidateOverlay(errReader{err: readErr})

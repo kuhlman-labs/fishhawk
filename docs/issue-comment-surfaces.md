@@ -937,6 +937,29 @@ Notes:
   `{campaign_id, from, to}`) records the campaign state re-derivation
   (`campaign.DeriveState`) transition. Listed here only so a future reader
   grepping the audit categories doesn't mistake them for a comment surface.
+- The campaign auto-driver audit kinds — `campaign_gate_acted` and
+  `campaign_gate_paged` (E25.6 / #1445, ADR-047 Track C) — are **audit-only
+  kinds with no dedicated Notifier method and are NOT issue-comment surfaces**.
+  Nothing in `issuecomment` posts them. They record the backend auto-acting on
+  a run gate under the operator_agent contract:
+  - `campaign_gate_acted` (payload `{campaign_id, issue_ref, run_id, action}`)
+    is the **campaign-level marker** the campaign-driver
+    (`campaigndriver.Ticker.driveGate`) writes on the **GLOBAL** chain
+    (`AppendGlobalChained`, `system` actor) when the `GateActor` took a
+    delegated gate action; `action` names the delegation verb
+    (`approve`/`route_fixup`/`retry`/`merge`). The run-level audit of the action
+    itself (`approval_submitted` / `stage_fixup_triggered` / `stage_retried` /
+    `pr_merged`) is written separately on the **run** chain, stamped
+    `audit.ActorAgent` under the `operator-agent/campaign` subject.
+  - `campaign_gate_paged` (payload `{page_event, run_id, reason}`) is written on
+    the **run** chain (`AppendChained`, `audit.ActorAgent` /
+    `operator-agent/campaign`) by the gate actor
+    (`server.Server.emitCampaignGatePaged`) when it REFUSES a `must_page_human`
+    condition (`reviewer_reject`, `requirement_arbitration`): it takes no gate
+    action and emits this hand-off so the E25.7 pause/page consumer can route
+    the gate to a human. Both are best-effort (an append failure WARN/ERROR-logs
+    and never unwinds the gate decision). Listed here only so a future reader
+    grepping the audit categories doesn't mistake them for a comment surface.
 
 ## Routing
 

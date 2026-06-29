@@ -492,11 +492,31 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	dec, err := run.FixupStage(r.Context(), s.cfg.RunRepo, stageID, run.FixupOptions{
-		PriorPassCount:      priorPasses,
-		MaxPasses:           defaultMaxFixupPasses + refundedPasses,
-		ForceAdditionalPass: reqBody.ForceAdditionalPass,
-		HardCeiling:         defaultFixupCeiling,
+	// Gate-action core (E25.6 / ADR-047): the transition + audit + concern
+	// marking + orchestrator handoff + drive stamp + status notify is
+	// factored into fixupStageAs, an identity-parameterised service method
+	// the in-process campaign auto-driver also calls. The HTTP handler owns
+	// the request validation, the model/budget gates above, and the sentinel
+	// error → HTTP mapping below; run.FixupStage's errors are returned
+	// verbatim and mapped here exactly as before.
+	dec, err := s.fixupStageAs(r.Context(), id, fixupActionParams{
+		StageID: stageID,
+		Options: run.FixupOptions{
+			PriorPassCount:      priorPasses,
+			MaxPasses:           defaultMaxFixupPasses + refundedPasses,
+			ForceAdditionalPass: reqBody.ForceAdditionalPass,
+			HardCeiling:         defaultFixupCeiling,
+		},
+		Selected:        selected,
+		ConcernIDs:      concernIDs,
+		Indices:         reqBody.Concerns,
+		Reason:          reqBody.Reason,
+		AllowCreate:     allowCreate,
+		PriorPasses:     priorPasses,
+		RefundedPasses:  refundedPasses,
+		DelegatedRule:   delegatedRule,
+		PinModel:        pinModel,
+		OperatorConcern: operatorConcern,
 	})
 	if err != nil {
 		switch {
@@ -539,19 +559,64 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.writeJSON(w, r, http.StatusOK, toStageResponse(dec.Stage))
+}
+
+// fixupActionParams carries the resolved inputs for fixupStageAs. The HTTP
+// handler computes them from the request (concern resolution, pass-budget
+// accounting, model gate); the in-process campaign auto-driver (E25.6)
+// supplies them directly.
+type fixupActionParams struct {
+	StageID         uuid.UUID
+	Options         run.FixupOptions
+	Selected        []planreview.Concern
+	ConcernIDs      []uuid.UUID
+	Indices         []int
+	Reason          string
+	AllowCreate     []string
+	PriorPasses     int
+	RefundedPasses  int
+	DelegatedRule   string
+	PinModel        *ResolvedModel
+	OperatorConcern string
+}
+
+// fixupStageAs performs the gate-action core of POST /v0/stages/{id}/fixup
+// under the given identity: run.FixupStage, the stage_fixup_triggered audit
+// write, the durable-concern addressed_pending marking, the orchestrator
+// handoff, the drive re-park stamp, and the status notify. It is
+// identity-parameterised so the HTTP handler and the in-process campaign
+// auto-driver (E25.6 / ADR-047) drive the identical path and stamp identical
+// audit. run.FixupStage's sentinel errors are returned verbatim for the
+// caller to map (HTTP status with budget/ceiling detail in the handler);
+// every post-transition step is best-effort exactly as in the prior inline
+// handler.
+func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionParams) (*run.FixupDecision, error) {
+	// Enforce the fixup gate's write scope on the acting identity (write:stages
+	// OR write:fixups, matching the handler's inline check). A no-op on the HTTP
+	// path that already gated; the authz check for the in-process campaign
+	// auto-driver, which reaches this method directly (#1445).
+	if !identityHasGateScope(id, "write:stages", "write:fixups") {
+		return nil, &gateActionScopeError{scope: "write:stages or write:fixups"}
+	}
+	dec, err := run.FixupStage(ctx, s.cfg.RunRepo, p.StageID, p.Options)
+	if err != nil {
+		return nil, err
+	}
+
 	// Audit first so the fix-up intent (and the selected concerns the
 	// prompt renderer reads back) is recorded even if the orchestrator
 	// handoff below fails. Same posture as the retry handler.
-	s.writeFixupAudit(r, dec, selected, concernIDs, reqBody.Concerns, reqBody.Reason, allowCreate, priorPasses, refundedPasses, delegatedRule, pinModel, operatorConcern)
+	s.writeFixupAudit(ctx, id, dec, p.Selected, p.ConcernIDs, p.Indices, p.Reason, p.AllowCreate, p.PriorPasses, p.RefundedPasses, p.DelegatedRule, p.PinModel, p.OperatorConcern)
 
 	// Mark the routed concerns addressed_pending in the durable store
 	// (#964), recording the operator's reason. AFTER the audit append so
 	// the trigger entry is the durable record; best-effort like the
 	// append — a failure warn-logs and never unwinds the committed
 	// transition.
-	if len(concernIDs) > 0 && s.cfg.ConcernRepo != nil {
-		if merr := s.cfg.ConcernRepo.MarkAddressedPending(r.Context(), concernIDs, reqBody.Reason); merr != nil {
-			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+	if len(p.ConcernIDs) > 0 && s.cfg.ConcernRepo != nil {
+		if merr := s.cfg.ConcernRepo.MarkAddressedPending(ctx, p.ConcernIDs, p.Reason); merr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 				"fixup: mark concerns addressed_pending failed",
 				slog.String("run_id", dec.Stage.RunID.String()),
 				slog.String("stage_id", dec.Stage.ID.String()),
@@ -565,14 +630,14 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 	// the request: the audit row recorded the intent and the stage is in
 	// pending, so an operator can re-fire Advance manually.
 	if dec.Stage.State == run.StageStatePending && s.cfg.Orchestrator != nil {
-		if _, err := s.cfg.Orchestrator.Advance(r.Context(), dec.Stage.RunID); err != nil {
-			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError,
+		if _, err := s.cfg.Orchestrator.Advance(ctx, dec.Stage.RunID); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
 				"orchestrator advance failed for fixup",
 				slog.String("run_id", dec.Stage.RunID.String()),
 				slog.String("stage_id", dec.Stage.ID.String()),
 				slog.String("error", err.Error()))
 		}
-		if updated, err := s.cfg.RunRepo.GetStage(r.Context(), dec.Stage.ID); err == nil {
+		if updated, err := s.cfg.RunRepo.GetStage(ctx, dec.Stage.ID); err == nil {
 			dec.Stage = updated
 		}
 	}
@@ -584,14 +649,14 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 	// rule. Keyed to the re-parked REVIEW stage (the stage whose state
 	// changed), not the implement stage being re-opened.
 	if dec.ReparkedReview != nil {
-		s.recordDriveFixupRepark(r.Context(), dec)
+		s.recordDriveFixupRepark(ctx, dec)
 	}
 
 	// Sticky status comment (E20.4 / #330): a fix-up flips the stage back
 	// to pending / dispatched; the status comment should reflect that.
-	s.notifyStatusUpdate(r.Context(), dec.Stage.RunID, "stage_fixup")
+	s.notifyStatusUpdate(ctx, dec.Stage.RunID, "stage_fixup")
 
-	s.writeJSON(w, r, http.StatusOK, toStageResponse(dec.Stage))
+	return dec, nil
 }
 
 // recordDriveFixupRepark stamps the drive engine's
@@ -787,8 +852,7 @@ func selectConcerns(all []planreview.Concern, indices []int) ([]planreview.Conce
 // concern it became already rides the `concerns` field the prompt renderer
 // reads). Best-effort: the transition is already committed, so a failure here
 // logs but doesn't unwind.
-func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string, pinModel *ResolvedModel, operatorConcern string) {
-	id := IdentityFrom(r.Context())
+func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string, pinModel *ResolvedModel, operatorConcern string) {
 	subject := id.Subject
 	if subject == "" {
 		subject = "anonymous"
@@ -868,7 +932,7 @@ func (s *Server) writeFixupAudit(r *http.Request, dec *run.FixupDecision, select
 
 	payload, _ := json.Marshal(fields)
 
-	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        dec.Stage.RunID,
 		StageID:      &dec.Stage.ID,
 		Timestamp:    time.Now().UTC(),
