@@ -85,6 +85,14 @@ type Result struct {
 	// change the page/auto decision, which stays resolved from
 	// implementReviewAuthority.
 	ReviewerRejectClass string
+	// ModelPolicy is the effective operator_agent block's scenario-A
+	// model-selection contract (#1421), surfaced as unevaluated static
+	// config alongside MustPageHuman so the operator agent reads its full
+	// envelope in one response. Passthrough only — no condition is
+	// evaluated here; the operator agent applies it via #1416's per-stage
+	// override channels, bounded by the deployment allow-list. nil when
+	// the effective block declares no model_policy.
+	ModelPolicy *spec.ModelPolicy
 }
 
 // Evaluator answers delegation conditions over the server's existing
@@ -150,7 +158,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 	// genuinely blocked on operator answers.
 	rejectClass := reviewerRejectClass(wf)
 	if parkedAwaitingInput(stages) {
-		return &Result{MustPageHuman: effective.MustPageHuman, ReviewerRejectClass: rejectClass}, nil
+		return &Result{MustPageHuman: effective.MustPageHuman, ReviewerRejectClass: rejectClass, ModelPolicy: effective.ModelPolicy}, nil
 	}
 
 	open, err := e.Concerns.ListOpenByRun(ctx, runRow.ID)
@@ -158,7 +166,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 		return nil, fmt.Errorf("list open concerns: %w", err)
 	}
 
-	res := &Result{MustPageHuman: effective.MustPageHuman, ReviewerRejectClass: rejectClass}
+	res := &Result{MustPageHuman: effective.MustPageHuman, ReviewerRejectClass: rejectClass, ModelPolicy: effective.ModelPolicy}
 	type knob struct {
 		action    string
 		condition spec.DelegationCondition

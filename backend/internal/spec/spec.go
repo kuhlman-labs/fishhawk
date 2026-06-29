@@ -256,6 +256,57 @@ type OperatorAgent struct {
 	MayRetry      DelegationCondition `json:"may_retry,omitempty" yaml:"may_retry,omitempty"`
 	MayMerge      DelegationCondition `json:"may_merge,omitempty" yaml:"may_merge,omitempty"`
 	MustPageHuman []string            `json:"must_page_human,omitempty" yaml:"must_page_human,omitempty"`
+	// ModelPolicy is the scenario-A operator-agent model-selection
+	// contract (#1421). It is part of the operator_agent block and so is
+	// inherited under the SAME wholesale-override semantics as the may_*
+	// knobs — a gate-level operator_agent block replaces the
+	// workflow-level one entirely; model_policy is never merged across
+	// levels. Declarative only: surfaced on the run-status delegation
+	// block for the operator agent to read and apply via #1416's per-stage
+	// override channels, bounded by the deployment per-adapter allow-list.
+	// No backend resolution/enforcement code reads it.
+	ModelPolicy *ModelPolicy `json:"model_policy,omitempty" yaml:"model_policy,omitempty"`
+}
+
+// ModelPolicyStrategy selects how the operator agent decides each
+// stage's model under the operator_agent.model_policy contract (#1421,
+// scenario A). The values are a closed set mirrored by the schema enum.
+type ModelPolicyStrategy string
+
+const (
+	// ModelPolicyFollowPlanRecommendation has the operator agent follow the
+	// plan artifact's per-stage model recommendation.
+	ModelPolicyFollowPlanRecommendation ModelPolicyStrategy = "follow_plan_recommendation"
+	// ModelPolicyExplicitDefaults has the operator agent apply the
+	// model_policy.defaults map, falling back to the deployment default for
+	// any unset stage.
+	ModelPolicyExplicitDefaults ModelPolicyStrategy = "explicit_defaults"
+)
+
+// ModelPolicyDefaults names the per-stage model the operator agent
+// applies under the explicit_defaults strategy. Each field is optional;
+// an unset stage falls back to the deployment default.
+type ModelPolicyDefaults struct {
+	Plan      string `json:"plan,omitempty" yaml:"plan,omitempty"`
+	Implement string `json:"implement,omitempty" yaml:"implement,omitempty"`
+	Review    string `json:"review,omitempty" yaml:"review,omitempty"`
+}
+
+// ModelPolicy is the scenario-A operator-agent model-selection contract
+// (#1421): an operator agent pinned to a frontier model decides each
+// stage's model from this spec-declared, per-repo-configurable policy
+// rather than from ad-hoc per-gate overrides. It is declarative only —
+// this issue adds NO backend resolution/enforcement code; the existing
+// resolveImplementModel/resolvePlanModel/resolveReviewModel ladders are
+// untouched. The operator agent reads the resolved policy from the
+// run-status delegation block and applies it through #1416's existing
+// per-stage override channels, bounded by — never widening — the
+// deployment per-adapter allow-list. All sub-fields are optional; an
+// absent ModelPolicy leaves behavior byte-identical to today.
+type ModelPolicy struct {
+	Strategy ModelPolicyStrategy  `json:"strategy,omitempty" yaml:"strategy,omitempty"`
+	Defaults *ModelPolicyDefaults `json:"defaults,omitempty" yaml:"defaults,omitempty"`
+	Allowed  []string             `json:"allowed,omitempty" yaml:"allowed,omitempty"`
 }
 
 // EffectiveOperatorAgent resolves the operator_agent block that

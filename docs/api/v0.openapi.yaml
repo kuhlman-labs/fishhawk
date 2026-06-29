@@ -843,6 +843,54 @@ components:
             authority-resolved class legible; it does not change the
             page/auto decision.
           example: gating_reviewer_reject
+        model_policy:
+          $ref: '#/components/schemas/RunDelegationModelPolicy'
+
+    RunDelegationModelPolicy:
+      type: object
+      description: |
+        The effective `operator_agent` block's scenario-A
+        model-selection contract (#1421), passed through as static
+        config for the operator agent to read and apply via the existing
+        per-stage model override channels (#1416), bounded by — never
+        widening — the deployment per-adapter allow-list. Declarative
+        only: no backend resolution code reads it. Omitted entirely when
+        the effective block declares no `model_policy`, keeping
+        unconfigured responses byte-identical. Inherited under the same
+        wholesale-override semantics as the `may_*` knobs (a gate-level
+        block replaces the workflow-level one; never merged).
+      properties:
+        strategy:
+          type: string
+          enum: [follow_plan_recommendation, explicit_defaults]
+          description: |
+            How the operator agent picks each stage's model.
+            `follow_plan_recommendation` follows the plan artifact's
+            per-stage recommendation; `explicit_defaults` applies the
+            `defaults` map, falling back to the deployment default for
+            any unset stage.
+          example: explicit_defaults
+        defaults:
+          type: object
+          description: |
+            Per-stage model applied under the `explicit_defaults`
+            strategy. Each field optional; an unset stage falls back to
+            the deployment default.
+          properties:
+            plan:
+              type: string
+            implement:
+              type: string
+            review:
+              type: string
+        allowed:
+          type: array
+          items:
+            type: string
+          description: |
+            The models the operator agent may select. Composes with —
+            never widens — the deployment per-adapter allow-list.
+          example: [claude-opus-4-8, claude-sonnet-4-6, gpt-5.5]
 
     RunDelegationAction:
       type: object

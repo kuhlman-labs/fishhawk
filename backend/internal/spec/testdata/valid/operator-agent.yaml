@@ -16,6 +16,16 @@ workflows:
       may_retry: infra_flake
       may_merge: gates_resolved_ci_green
       must_page_human: [reviewer_reject, budget_override]
+      model_policy:
+        strategy: explicit_defaults
+        defaults:
+          plan: claude-opus-4-8
+          implement: claude-sonnet-4-6
+          review: gpt-5.5
+        allowed:
+          - claude-opus-4-8
+          - claude-sonnet-4-6
+          - gpt-5.5
     stages:
       - id: plan
         type: plan

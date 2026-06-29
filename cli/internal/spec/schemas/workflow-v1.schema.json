@@ -685,6 +685,34 @@
               "clarification_request"
             ]
           }
+        },
+        "model_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Scenario-A operator-agent model-selection contract (#1421): declares how the operator agent picks each stage's model, spec-declared and per-repo configurable rather than left to ad-hoc per-gate overrides. Declarative only — the operator agent reads the resolved policy from the run-status delegation block and applies it through the existing per-stage model override channels (#1416), bounded by — never widening — the deployment per-adapter allow-list; this contract adds no new backend resolution code. Part of the operator_agent block, so inherited under the SAME wholesale-override semantics as the may_* knobs (a gate-level operator_agent block replaces the workflow-level one entirely — model_policy is never merged across levels). All sub-fields optional; an absent model_policy is byte-identical to today. Requires version 0.5+.",
+          "properties": {
+            "strategy": {
+              "type": "string",
+              "enum": ["follow_plan_recommendation", "explicit_defaults"],
+              "description": "follow_plan_recommendation: the operator agent follows the plan artifact's per-stage model recommendation. explicit_defaults: the operator agent applies the defaults map, falling back to the deployment default for any unset stage."
+            },
+            "defaults": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Per-stage model the operator agent applies under the explicit_defaults strategy. Each field optional; an unset stage falls back to the deployment default.",
+              "properties": {
+                "plan": { "type": "string", "minLength": 1 },
+                "implement": { "type": "string", "minLength": 1 },
+                "review": { "type": "string", "minLength": 1 }
+              }
+            },
+            "allowed": {
+              "type": "array",
+              "uniqueItems": true,
+              "description": "Models the operator agent may select. Composes with — never widens — the deployment per-adapter allow-list.",
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
         }
       }
     },

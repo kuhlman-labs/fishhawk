@@ -431,6 +431,30 @@ The class a run currently resolves to is surfaced on the wire as `reviewer_rejec
 | Plan design-fork / clarification gate (plan parked at `awaiting_input`) | page | `clarification_request`, `requirement_arbitration`, `exception_request` |
 | Merge (gates resolved, CI green) | auto | `may_merge` / `gates_resolved_ci_green` (surfaced-only in v0; no enforce endpoint) |
 
+**`model_policy` — operator-agent model selection (#1421).** An optional object on the `operator_agent` block declaring how the operator agent picks each stage's model (scenario A: an operator agent pinned to a frontier model decides each stage's model). Spec-declared and per-repo configurable rather than left to ad-hoc per-gate overrides.
+
+```yaml
+operator_agent:
+  model_policy:
+    strategy: explicit_defaults     # follow_plan_recommendation | explicit_defaults
+    defaults:                        # applied under explicit_defaults; each stage optional
+      plan: claude-opus-4-8
+      implement: claude-sonnet-4-6
+      review: gpt-5.5
+    allowed:                         # composes with — never widens — the deployment allow-list
+      - claude-opus-4-8
+      - claude-sonnet-4-6
+      - gpt-5.5
+```
+
+- **`strategy`** — `follow_plan_recommendation` (the operator agent follows the plan artifact's per-stage model recommendation) or `explicit_defaults` (it applies the `defaults` map, falling back to the deployment default for any unset stage).
+- **`defaults`** — optional per-stage model (`plan` / `implement` / `review`), each optional.
+- **`allowed`** — the models the operator agent may select; it **composes with, never widens,** the deployment per-adapter allow-list.
+
+**Declarative only.** `model_policy` adds **no** new backend resolution code in v0 — the existing `resolvePlanModel` / `resolveImplementModel` / `resolveReviewModel` ladders are untouched. The operator agent **reads** the resolved policy from the `GET /v0/runs/{id}` delegation block (surfaced as `delegation.model_policy`) and **applies** it through the existing per-stage model override channels (#1416), still bounded by the deployment allow-list. An absent `model_policy` is byte-identical to today (omitted from the wire). Requires version `0.5+`.
+
+**Precedence.** `model_policy` is part of the `operator_agent` block, so it inherits the **same wholesale-override semantics** as the `may_*` knobs: a gate-level `operator_agent` block replaces the workflow-level one entirely — `model_policy` is never merged across levels.
+
 ## Decomposition controls (v0.6+)
 
 A workflow-level `decomposition` block (E24.6 / #1146) holding decomposition controls. v0.6 ships a single knob:
@@ -510,6 +534,7 @@ workflows:
 | Approvers shape             | `any_of: [<role_id>...]` xor `all_of: [<role_id>...]`                        | one shape per gate                                                                                  |
 | `operator_agent.may_*`      | one closed condition per knob (see ## Operator agent delegation)             | v0.5+; workflow level + approval-gate override (gate wins wholesale); absent → fail-closed          |
 | `operator_agent.must_page_human` | `reviewer_reject`, `advisory_reviewer_reject`, `gating_reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`, `clarification_request` | closed set; always pages the human regardless of `may_*` knobs. The explicit reject classes (v0.7+) make the taxonomy self-documenting; legacy `reviewer_reject` resolves to the gating sense |
+| `operator_agent.model_policy` | `strategy` (`follow_plan_recommendation` \| `explicit_defaults`), `defaults.{plan,implement,review}`, `allowed[]` | v0.5+; declarative scenario-A model-selection contract (#1421); inherited under the same wholesale-override semantics; surfaced on the run-status delegation block; absent → byte-identical to today |
 
 ## Validation rules beyond the schema
 

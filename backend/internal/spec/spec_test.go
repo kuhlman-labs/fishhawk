@@ -1269,6 +1269,31 @@ func TestParse_OperatorAgent_RoundTrip(t *testing.T) {
 	if len(wfBlock.MustPageHuman) != 2 || wfBlock.MustPageHuman[0] != wantPage[0] || wfBlock.MustPageHuman[1] != wantPage[1] {
 		t.Errorf("workflow MustPageHuman = %v, want %v", wfBlock.MustPageHuman, wantPage)
 	}
+	// model_policy (#1421) round-trips into ModelPolicy with the exact
+	// declared strategy/defaults/allowed — asserts the SHIPPED contract,
+	// not just that the field parsed.
+	mp := wfBlock.ModelPolicy
+	if mp == nil {
+		t.Fatal("workflow-level ModelPolicy should be non-nil")
+	}
+	if mp.Strategy != spec.ModelPolicyExplicitDefaults {
+		t.Errorf("ModelPolicy.Strategy = %q, want explicit_defaults", mp.Strategy)
+	}
+	if mp.Defaults == nil {
+		t.Fatal("ModelPolicy.Defaults should be non-nil")
+	}
+	if mp.Defaults.Plan != "claude-opus-4-8" || mp.Defaults.Implement != "claude-sonnet-4-6" || mp.Defaults.Review != "gpt-5.5" {
+		t.Errorf("ModelPolicy.Defaults = %+v, want {plan:claude-opus-4-8 implement:claude-sonnet-4-6 review:gpt-5.5}", *mp.Defaults)
+	}
+	wantAllowed := []string{"claude-opus-4-8", "claude-sonnet-4-6", "gpt-5.5"}
+	if len(mp.Allowed) != len(wantAllowed) {
+		t.Fatalf("ModelPolicy.Allowed = %v, want %v", mp.Allowed, wantAllowed)
+	}
+	for i, want := range wantAllowed {
+		if mp.Allowed[i] != want {
+			t.Errorf("ModelPolicy.Allowed[%d] = %q, want %q", i, mp.Allowed[i], want)
+		}
+	}
 
 	planGate := &wf.Stages[0].Gates[0]
 	if planGate.OperatorAgent == nil {
@@ -1287,6 +1312,13 @@ func TestParse_OperatorAgent_RoundTrip(t *testing.T) {
 	// not carry it.
 	if eff.MayRetry != "" {
 		t.Errorf("gate-effective MayRetry = %q, want empty (no cross-level merge)", eff.MayRetry)
+	}
+	// model_policy (#1421) inherits the same wholesale-override semantics:
+	// the gate block declares no model_policy, so the workflow-level
+	// policy is NOT merged into the effective view — fails if model_policy
+	// were ever inherited across levels.
+	if eff.ModelPolicy != nil {
+		t.Errorf("gate-effective ModelPolicy = %+v, want nil (no cross-level merge)", eff.ModelPolicy)
 	}
 
 	implGate := &wf.Stages[1].Gates[0]
@@ -1375,6 +1407,114 @@ workflows:
   feature_change:
     operator_agent:
       must_page_human: [solar_flare]
+    stages:
+      - id: x
+        type: plan
+        executor: { agent: claude-code }
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
+func TestParse_OperatorAgent_ModelPolicy_Absent_Nil(t *testing.T) {
+	// An operator_agent block WITHOUT model_policy (#1421) parses with a
+	// nil ModelPolicy — the byte-identical-to-today absence posture. The
+	// minimal fixtures have no operator_agent at all, so declare one here
+	// that omits only model_policy.
+	s, err := spec.ParseBytes([]byte(`
+version: "0.5"
+workflows:
+  feature_change:
+    operator_agent:
+      may_approve: clean_dual_approval
+    stages:
+      - id: x
+        type: plan
+        executor: { agent: claude-code }
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	wf := s.Workflows["feature_change"]
+	if wf.OperatorAgent == nil {
+		t.Fatal("OperatorAgent should be non-nil")
+	}
+	if wf.OperatorAgent.ModelPolicy != nil {
+		t.Errorf("ModelPolicy = %+v, want nil for an absent model_policy", wf.OperatorAgent.ModelPolicy)
+	}
+}
+
+func TestParse_OperatorAgent_ModelPolicy_UnknownStrategy_Rejected(t *testing.T) {
+	// strategy is a closed enum (#1421); an unknown value is refused at
+	// parse with a JSON Pointer into the offending field.
+	_, err := spec.ParseBytes([]byte(`
+version: "0.5"
+workflows:
+  feature_change:
+    operator_agent:
+      model_policy:
+        strategy: vibes
+    stages:
+      - id: x
+        type: plan
+        executor: { agent: claude-code }
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+	if !strings.Contains(se.Path, "model_policy/strategy") {
+		t.Errorf("Path = %q, want a JSON Pointer into model_policy/strategy", se.Path)
+	}
+}
+
+func TestParse_OperatorAgent_ModelPolicy_UnknownSubKey_Rejected(t *testing.T) {
+	// additionalProperties:false closes the model_policy object (#1421) —
+	// an unknown sub-key must never parse.
+	_, err := spec.ParseBytes([]byte(`
+version: "0.5"
+workflows:
+  feature_change:
+    operator_agent:
+      model_policy:
+        strategy: explicit_defaults
+        cheapest: true
+    stages:
+      - id: x
+        type: plan
+        executor: { agent: claude-code }
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
+func TestParse_OperatorAgent_ModelPolicy_UnknownDefaultsKey_Rejected(t *testing.T) {
+	// additionalProperties:false closes the defaults object too (#1421):
+	// only plan/implement/review are addressable stages.
+	_, err := spec.ParseBytes([]byte(`
+version: "0.5"
+workflows:
+  feature_change:
+    operator_agent:
+      model_policy:
+        defaults:
+          deploy: claude-opus-4-8
     stages:
       - id: x
         type: plan
