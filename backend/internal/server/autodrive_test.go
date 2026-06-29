@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // autodrive_test.go is owned solely by E25.6 slice 2 (the gate-actor
@@ -326,7 +327,7 @@ func TestAutoDriveRunGate_Retry(t *testing.T) {
 	assertOperatorActor(t, auditEntry(t, au, CategoryStageRetried))
 }
 
-// --- (d) may_merge(gates_resolved_ci_green) -> auto-merge + settle -----------
+// --- (d) may_merge(gates_resolved_ci_green) -> enable auto-merge, NO settle --
 
 func TestAutoDriveRunGate_Merge(t *testing.T) {
 	s, repo, au, _ := newAutoDriveServer(t)
@@ -356,8 +357,12 @@ func TestAutoDriveRunGate_Merge(t *testing.T) {
 	if merger.gotRun == nil || merger.gotRun.ID != runID {
 		t.Errorf("merger got run %v, want %v", merger.gotRun, runID)
 	}
-	if countAudit(au, CategoryPRMerged) == 0 {
-		t.Errorf("no %q entry; post-merge settle did not run", CategoryPRMerged)
+	// may_merge only ENABLES GitHub auto-merge; the actor must NOT settle
+	// the run in-process. pr_merged + completion are left to the
+	// pull_request-closed webhook that fires when GitHub actually merges, so
+	// no pr_merged entry is written on the auto-drive path itself.
+	if countAudit(au, CategoryPRMerged) != 0 {
+		t.Errorf("%q entry written; the actor settled the run before GitHub merged (auto-merge is only enabled, not confirmed)", CategoryPRMerged)
 	}
 }
 
@@ -390,6 +395,32 @@ func TestAutoDriveRunGate_Page_ReviewerReject(t *testing.T) {
 	}
 	e := auditEntry(t, au, CategoryCampaignGatePaged)
 	assertOperatorActor(t, e)
+}
+
+// TestGatingImplementRejectPresent_ReadErrorPages is concern #1445's low-
+// severity defense-in-depth fix: an audit-read failure on the implement-review
+// categories (while the upstream Evaluate succeeded) makes the page detector
+// return true — fail TOWARD paging — matching activePageEvent's documented
+// "when in doubt the actor pages" contract. Before the fix it returned false
+// (silent not-paging), the opposite of the stated intent.
+func TestGatingImplementRejectPresent_ReadErrorPages(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, _ := startAutoDriveRun(t, s, repo)
+	runRow := getRun(t, repo, runID)
+
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	wf := parsed.Workflows[runRow.WorkflowID]
+
+	// The implement stage has agent-only reviewers (gating authority), so the
+	// detector reaches the audit read rather than short-circuiting on
+	// authority. Injecting a read error must now page, not silently pass.
+	au.listByCategoryErr = errors.New("audit read boom")
+	if !s.gatingImplementRejectPresent(context.Background(), runRow, &wf) {
+		t.Error("gatingImplementRejectPresent = false on an audit read error; want true (fail-toward-paging)")
+	}
 }
 
 // --- (f) must_page_human requirement_arbitration -> NO action, page ---------

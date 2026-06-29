@@ -488,6 +488,45 @@ type approveActionError struct {
 func (e *approveActionError) Error() string { return e.err.Error() }
 func (e *approveActionError) Unwrap() error { return e.err }
 
+// gateActionScopeError is returned by the extracted gate-action service
+// methods (approveStageAs / fixupStageAs / retryStageAs) when the acting
+// identity lacks the write scope the matching HTTP handler enforces. The
+// HTTP path never produces it — the handler's requireWriteScope / inline
+// hasScope check runs first and 401/403s before the service method is
+// reached — but the in-process campaign auto-driver (E25.6 / ADR-047) calls
+// the service methods directly, so the authz check must also live here or
+// the auto-driver would act with an under-scoped identity (the authz
+// regression #1445 flagged). The error is non-nil and surfaces to the
+// driver as a dispatch failure; the actor never silently acts unauthorized.
+type gateActionScopeError struct {
+	scope string
+}
+
+func (e *gateActionScopeError) Error() string {
+	return "identity is missing required scope: " + e.scope
+}
+
+// identityHasGateScope reports whether id is authorized for a gate action
+// gated on any of scopes, mirroring the handler scope checks exactly: an
+// anonymous identity is never authorized; a cookie-session identity
+// (TokenID == "") is exempt from scope enforcement (OAuth callers carry no
+// scope list, matching requireWriteScope and the fixup/retry inline checks);
+// a token identity must carry at least one of scopes.
+func identityHasGateScope(id Identity, scopes ...string) bool {
+	if id.IsAnonymous() {
+		return false
+	}
+	if id.TokenID == "" {
+		return true
+	}
+	for _, sc := range scopes {
+		if hasScope(id, sc) {
+			return true
+		}
+	}
+	return false
+}
+
 // approveActionParams carries the resolved inputs for approveStageAs. The
 // HTTP handler computes them from the request body + every pre-Submit gate;
 // the in-process campaign auto-driver (E25.6) supplies them directly.
@@ -532,6 +571,13 @@ type approveActionResult struct {
 // advance failure is wrapped in *approveActionError so the caller maps
 // InvalidTransition → 409 and the two distinct 500 messages.
 func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActionParams) (*approveActionResult, error) {
+	// Enforce the approve gate's write scope on the acting identity. The HTTP
+	// handler already gated via requireWriteScope, so this is a no-op on that
+	// path; it is the authz check for the in-process campaign auto-driver,
+	// which reaches this method directly (#1445).
+	if !identityHasGateScope(id, "write:approvals") {
+		return nil, &gateActionScopeError{scope: "write:approvals"}
+	}
 	// Resolve the acting subject from the identity with the same
 	// "anonymous" fallback the handler applies, so the recorded
 	// ApproverSubject (and the actor kind derived from it) is byte-identical

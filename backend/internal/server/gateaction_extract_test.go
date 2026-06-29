@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -191,6 +192,38 @@ func TestGateActionExtract_ScopeAcceptanceParity(t *testing.T) {
 	missing := Identity{Subject: op.Subject, TokenID: op.TokenID, Scopes: []string{"read:runs"}}
 	if scopeCheckAccepts(s, missing, "write:approvals") {
 		t.Error("requireWriteScope accepted an operator-shaped identity missing write:approvals; the scope check is being bypassed")
+	}
+}
+
+// TestGateActionExtract_ScopeEnforcedInServiceMethods is the authz half of
+// the extraction (#1445): the in-process service methods MUST enforce the same
+// write scope their HTTP handlers do, because the campaign auto-driver reaches
+// them WITHOUT passing through requireWriteScope / the fixup-retry inline
+// check. An identity missing the gate's write scope is rejected with a
+// gateActionScopeError before any repository mutation; the campaign operator
+// identity (which carries every gate scope) clears all three guards.
+func TestGateActionExtract_ScopeEnforcedInServiceMethods(t *testing.T) {
+	s, _, _, _ := newApprovalServer(t)
+	underScoped := Identity{Subject: "github:x", TokenID: "tok", Scopes: []string{"read:runs"}}
+
+	var scopeErr *gateActionScopeError
+	if _, err := s.approveStageAs(context.Background(), underScoped, approveActionParams{}); !errors.As(err, &scopeErr) {
+		t.Errorf("approveStageAs under an identity missing write:approvals: err = %v, want gateActionScopeError", err)
+	}
+	if _, err := s.fixupStageAs(context.Background(), underScoped, fixupActionParams{}); !errors.As(err, &scopeErr) {
+		t.Errorf("fixupStageAs under an identity missing write:stages/write:fixups: err = %v, want gateActionScopeError", err)
+	}
+	if _, err := s.retryStageAs(context.Background(), underScoped, retryActionParams{}); !errors.As(err, &scopeErr) {
+		t.Errorf("retryStageAs under an identity missing write:stages/write:retries: err = %v, want gateActionScopeError", err)
+	}
+
+	// The campaign operator identity carries all gate scopes, so none of the
+	// guards reject it (parity with an equivalently-scoped HTTP token).
+	op := campaignOperatorIdentity()
+	if !identityHasGateScope(op, "write:approvals") ||
+		!identityHasGateScope(op, "write:stages", "write:fixups") ||
+		!identityHasGateScope(op, "write:stages", "write:retries") {
+		t.Error("campaign operator identity fails a gate scope guard; the auto-driver would be wrongly rejected")
 	}
 }
 

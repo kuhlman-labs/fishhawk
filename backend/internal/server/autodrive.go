@@ -182,12 +182,14 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 			if merr := merger.MergePullRequest(ctx, runRow); merr != nil {
 				return AutoDriveOutcome{Action: delegation.ActionMerge, Note: "merge dispatch failed"}, merr
 			}
-			// The merge happened on GitHub; settle the review stage through
-			// the SAME path the webhook / reconciler use so pr_merged is
-			// recorded and the run completes. Idempotent with a later webhook
-			// redelivery (TransitionStage short-circuits on same-state).
-			s.settleAfterAutoMerge(ctx, runRow, id)
-			return AutoDriveOutcome{Acted: true, Action: delegation.ActionMerge, Note: "auto-merged pull request"}, nil
+			// may_merge ENABLES/queues GitHub auto-merge; it does NOT prove
+			// the PR has landed. The settle (pr_merged + run completion) is
+			// deliberately left to the existing pull_request-closed webhook /
+			// resolveReviewStageOnMerge path that fires when GitHub actually
+			// merges — the actor must not record a merge GitHub may still
+			// block (failing checks) or defer (queued). Recording pr_merged
+			// here would complete the run before the merge is real.
+			return AutoDriveOutcome{Acted: true, Action: delegation.ActionMerge, Note: "enabled auto-merge; webhook settles on merge"}, nil
 		}
 	}
 
@@ -278,7 +280,13 @@ func (s *Server) gatingImplementRejectPresent(ctx context.Context, runRow *run.R
 	}
 	started, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, "implement_review_started")
 	if err != nil {
-		return false
+		// Fail TOWARD paging: we have a gating reviewer and cannot confirm the
+		// review round is clean, so the actor pages rather than risk
+		// auto-acting through an unread reject (matches activePageEvent's
+		// "when in doubt the actor pages" contract).
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: list implement_review_started failed; fail-toward-paging",
+			slog.String("run_id", runRow.ID.String()), slog.String("error", err.Error()))
+		return true
 	}
 	var latestStarted int64 = -1
 	for _, e := range started {
@@ -288,7 +296,9 @@ func (s *Server) gatingImplementRejectPresent(ctx context.Context, runRow *run.R
 	}
 	reviewed, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, "implement_reviewed")
 	if err != nil {
-		return false
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: list implement_reviewed failed; fail-toward-paging",
+			slog.String("run_id", runRow.ID.String()), slog.String("error", err.Error()))
+		return true
 	}
 	for _, e := range reviewed {
 		if e.Sequence <= latestStarted {
@@ -404,22 +414,6 @@ func (s *Server) autoFixup(ctx context.Context, id Identity, runRow *run.Run, st
 		return false, err
 	}
 	return true, nil
-}
-
-// settleAfterAutoMerge runs the post-merge settle in-process after the
-// actor merged the PR, so pr_merged is recorded and the run completes
-// without waiting on the GitHub webhook. Routes through the shared
-// resolveReviewStageOnMerge path the webhook/reconciler use.
-func (s *Server) settleAfterAutoMerge(ctx context.Context, runRow *run.Run, id Identity) {
-	prURL := ""
-	if runRow.PullRequestURL != nil {
-		prURL = *runRow.PullRequestURL
-	}
-	s.resolveReviewStageOnMerge(ctx, runRow, true, reviewMergeMeta{
-		prURL:      prURL,
-		actorLogin: id.Subject,
-		actorKind:  actorKindForSubject(id.Subject),
-	})
 }
 
 // --- double-gate state derivations (independent of the evaluator) -----------

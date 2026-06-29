@@ -592,6 +592,13 @@ type fixupActionParams struct {
 // every post-transition step is best-effort exactly as in the prior inline
 // handler.
 func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionParams) (*run.FixupDecision, error) {
+	// Enforce the fixup gate's write scope on the acting identity (write:stages
+	// OR write:fixups, matching the handler's inline check). A no-op on the HTTP
+	// path that already gated; the authz check for the in-process campaign
+	// auto-driver, which reaches this method directly (#1445).
+	if !identityHasGateScope(id, "write:stages", "write:fixups") {
+		return nil, &gateActionScopeError{scope: "write:stages or write:fixups"}
+	}
 	dec, err := run.FixupStage(ctx, s.cfg.RunRepo, p.StageID, p.Options)
 	if err != nil {
 		return nil, err

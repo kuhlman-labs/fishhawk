@@ -250,6 +250,13 @@ type retryActionParams struct {
 // errors are returned verbatim for the caller to map; every post-transition
 // step is best-effort exactly as in the prior inline handler.
 func (s *Server) retryStageAs(ctx context.Context, id Identity, p retryActionParams) (*run.Stage, error) {
+	// Enforce the retry gate's write scope on the acting identity (write:stages
+	// OR write:retries, matching the handler's inline check). A no-op on the HTTP
+	// path that already gated; the authz check for the in-process campaign
+	// auto-driver, which reaches this method directly (#1445).
+	if !identityHasGateScope(id, "write:stages", "write:retries") {
+		return nil, &gateActionScopeError{scope: "write:stages or write:retries"}
+	}
 	dec, err := run.RetryStage(ctx, s.cfg.RunRepo, p.StageID, run.RetryOptions{OverrideB: p.Override})
 	if err != nil {
 		return nil, err
