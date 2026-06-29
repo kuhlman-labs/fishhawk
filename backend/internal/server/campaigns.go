@@ -26,12 +26,17 @@ const (
 // runResponse (runs.go) so there's never a translation step between the
 // OpenAPI doc and the wire format.
 type campaignResponse struct {
-	ID        uuid.UUID `json:"id"`
-	Repo      string    `json:"repo"`
-	EpicRef   string    `json:"epic_ref"`
-	State     string    `json:"state"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID      uuid.UUID `json:"id"`
+	Repo    string    `json:"repo"`
+	EpicRef string    `json:"epic_ref"`
+	State   string    `json:"state"`
+	// PausePolicy is the operator-chosen pause behavior on a gate hand-off
+	// (E25.7): pause_campaign (block the whole campaign, the default) or
+	// pause_item (continue-others). Always normalized (never empty) on a
+	// persisted campaign.
+	PausePolicy string    `json:"pause_policy"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // campaignItemResponse mirrors docs/api/v0.openapi.yaml's `CampaignItem`
@@ -43,8 +48,12 @@ type campaignItemResponse struct {
 	DependsOn []string   `json:"depends_on"`
 	RunID     *uuid.UUID `json:"run_id,omitempty"`
 	State     string     `json:"state"`
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
+	// PauseReason records why a paused item was handed off to a human (the
+	// page event + run/stage/gate). Omitted (omitempty) unless the item is —
+	// or was — paused; mirrors the domain *PauseReason.
+	PauseReason *campaign.PauseReason `json:"pause_reason,omitempty"`
+	CreatedAt   time.Time             `json:"created_at"`
+	UpdatedAt   time.Time             `json:"updated_at"`
 }
 
 // campaignRollupPayload is the engine's readiness partition over a
@@ -59,6 +68,9 @@ type campaignRollupPayload struct {
 	Done      []string `json:"done"`
 	Failed    []string `json:"failed"`
 	Cancelled []string `json:"cancelled"`
+	// Paused holds items the auto-driver handed off to a human (E25.7). Like
+	// the other slices it is always an array (never null).
+	Paused []string `json:"paused"`
 }
 
 // campaignNextActionPayload tells the operator-agent what to do next with
@@ -76,16 +88,22 @@ type campaignNextActionPayload struct {
 type createCampaignRequest struct {
 	Repo    string `json:"repo"`
 	EpicRef string `json:"epic_ref"`
+	// PausePolicy is the OPTIONAL pause behavior for a gate hand-off (E25.7):
+	// "pause_campaign" (block the whole campaign, the default) or "pause_item"
+	// (continue-others). Empty normalizes to pause_campaign inside
+	// campaign.Persist, so omitting it yields the conservative default.
+	PausePolicy string `json:"pause_policy,omitempty"`
 }
 
 func toCampaignResponse(c *campaign.Campaign) campaignResponse {
 	return campaignResponse{
-		ID:        c.ID,
-		Repo:      c.Repo,
-		EpicRef:   c.EpicRef,
-		State:     string(c.State),
-		CreatedAt: c.CreatedAt,
-		UpdatedAt: c.UpdatedAt,
+		ID:          c.ID,
+		Repo:        c.Repo,
+		EpicRef:     c.EpicRef,
+		State:       string(c.State),
+		PausePolicy: string(c.PausePolicy),
+		CreatedAt:   c.CreatedAt,
+		UpdatedAt:   c.UpdatedAt,
 	}
 }
 
@@ -95,13 +113,14 @@ func toCampaignItemResponse(it *campaign.Item) campaignItemResponse {
 		deps = []string{}
 	}
 	return campaignItemResponse{
-		ID:        it.ID,
-		IssueRef:  it.IssueRef,
-		DependsOn: deps,
-		RunID:     it.RunID,
-		State:     string(it.State),
-		CreatedAt: it.CreatedAt,
-		UpdatedAt: it.UpdatedAt,
+		ID:          it.ID,
+		IssueRef:    it.IssueRef,
+		DependsOn:   deps,
+		RunID:       it.RunID,
+		State:       string(it.State),
+		PauseReason: it.PauseReason,
+		CreatedAt:   it.CreatedAt,
+		UpdatedAt:   it.UpdatedAt,
 	}
 }
 
@@ -122,6 +141,7 @@ func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 		Done:      nz(e.Done),
 		Failed:    nz(e.Failed),
 		Cancelled: nz(e.Cancelled),
+		Paused:    nz(e.Paused),
 	}
 }
 
@@ -134,9 +154,13 @@ func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 //     whether eligible items also exist — this check is FIRST and
 //     unconditional, with NO "start_run whenever eligible is non-empty"
 //     short-circuit ahead of it.
-//  2. else any eligible item -> "start_run" on the first eligible ref.
-//  3. else any running or blocked item -> "wait".
-//  4. else (every item terminal done/cancelled) -> "complete".
+//  2. else any paused item -> "resume" on the first paused ref. The
+//     auto-driver handed a gate off to a human (E25.7); the campaign is
+//     stalled until the gate is handled and the operator resumes it. Ranked
+//     above start_run so a paused hand-off is surfaced before new dispatch.
+//  3. else any eligible item -> "start_run" on the first eligible ref.
+//  4. else any running or blocked item -> "wait".
+//  5. else (every item terminal done/cancelled) -> "complete".
 func computeCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload {
 	switch {
 	case len(e.Failed) > 0:
@@ -144,6 +168,12 @@ func computeCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload
 			Action:   "attention",
 			IssueRef: e.Failed[0],
 			Detail:   "a campaign item failed; retry or abandon it before the campaign can proceed",
+		}
+	case len(e.Paused) > 0:
+		return campaignNextActionPayload{
+			Action:   "resume",
+			IssueRef: e.Paused[0],
+			Detail:   "the auto-driver paged a human at a run gate; handle the gate then POST /resume to continue the campaign",
 		}
 	case len(e.Eligible) > 0:
 		return campaignNextActionPayload{
@@ -209,6 +239,15 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(req.EpicRef) == "" {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"epic_ref is required", map[string]any{"field": "epic_ref"})
+		return
+	}
+	// pause_policy is optional; an empty value normalizes to pause_campaign in
+	// campaign.Persist. A non-empty value must be a recognized policy, caught
+	// here so a typo surfaces a 400 rather than a DB CHECK violation at insert.
+	if req.PausePolicy != "" && !validPausePolicies[req.PausePolicy] {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"pause_policy must be one of pause_campaign, pause_item",
+			map[string]any{"field": "pause_policy", "got": req.PausePolicy})
 		return
 	}
 
@@ -298,6 +337,11 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Thread the create request's pause_policy onto the assembly so it reaches
+	// the persisted campaign (the call-site update deferred from slice 1; a
+	// zero value is normalized to pause_campaign inside campaign.Persist).
+	assembly.PausePolicy = campaign.PausePolicy(req.PausePolicy)
+
 	created, err := campaign.Persist(r.Context(), s.cfg.CampaignRepo, req.Repo, assembly)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -332,7 +376,7 @@ func (s *Server) handleListCampaigns(w http.ResponseWriter, r *http.Request) {
 	if stateFilter != "" {
 		if _, ok := validCampaignStates[stateFilter]; !ok {
 			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-				"state must be one of pending, running, succeeded, failed, cancelled",
+				"state must be one of pending, running, paused, succeeded, failed, cancelled",
 				map[string]any{"field": "state", "got": stateFilter})
 			return
 		}
@@ -373,9 +417,20 @@ func (s *Server) handleListCampaigns(w http.ResponseWriter, r *http.Request) {
 var validCampaignStates = map[string]struct{}{
 	string(campaign.StatePending):   {},
 	string(campaign.StateRunning):   {},
+	string(campaign.StatePaused):    {},
 	string(campaign.StateSucceeded): {},
 	string(campaign.StateFailed):    {},
 	string(campaign.StateCancelled): {},
+}
+
+// validPausePolicies pins the closed set of create-request pause_policy values
+// per docs/api/v0.openapi.yaml, defense-in-depth at the handler so a typo
+// surfaces a 400 rather than reaching the column CHECK at insert. The empty
+// value is intentionally NOT here — it is the "omit, take the default" signal
+// normalized to pause_campaign inside campaign.Persist.
+var validPausePolicies = map[string]bool{
+	string(campaign.PausePolicyPauseCampaign): true,
+	string(campaign.PausePolicyPauseItem):     true,
 }
 
 // handleGetCampaign implements GET /v0/campaigns/{campaign_id}.
@@ -493,4 +548,116 @@ func (s *Server) handleGetCampaignStatus(w http.ResponseWriter, r *http.Request)
 		"rollup":      toCampaignRollupPayload(elig),
 		"next_action": computeCampaignNextAction(elig),
 	})
+}
+
+// handleResumeCampaign implements POST /v0/campaigns/{campaign_id}/resume: the
+// operator's hand-back after the auto-driver paged a human at a run gate
+// (E25.7 / ADR-047 Track C). It flips the campaign paused → running (when the
+// campaign itself was paused — the pause_campaign policy) AND every paused item
+// paused → running, so the next driver tick re-engages the campaign and the
+// continuation proceeds.
+//
+// It serves BOTH pause policies: under pause_campaign the campaign and the
+// affected item are paused together; under pause_item only the item is paused
+// while the campaign stays running. So "nothing to resume" is the joint
+// condition — the campaign is not paused AND no item is paused — which yields
+// 409 campaign_not_paused; a resume with any paused item proceeds even when the
+// campaign is already running.
+//
+// The nil-CampaignRepo guard is checked BEFORE the write-scope check so an
+// unconfigured deployment answers 503 (not 401), matching the read handlers and
+// the 503-vs-404 route-registration idiom.
+func (s *Server) handleResumeCampaign(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.CampaignRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "campaign_repo_unconfigured",
+			"campaigns endpoint requires a configured campaign repository", nil)
+		return
+	}
+	if !s.requireWriteScope(w, r, "write:campaigns") {
+		return
+	}
+	id, err := uuid.Parse(r.PathValue("campaign_id"))
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"campaign_id must be a valid UUID",
+			map[string]any{"field": "campaign_id", "got": r.PathValue("campaign_id")})
+		return
+	}
+
+	c, err := s.cfg.CampaignRepo.GetCampaign(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, campaign.ErrNotFound) {
+			s.writeError(w, r, http.StatusNotFound, "campaign_not_found",
+				"no campaign with that id", map[string]any{"campaign_id": id.String()})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get campaign failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	items, err := s.cfg.CampaignRepo.ListCampaignItemsForCampaign(r.Context(), id)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"list campaign items failed", map[string]any{"error": err.Error()})
+		return
+	}
+	var pausedItems []*campaign.Item
+	for _, it := range items {
+		if it.State == campaign.ItemStatePaused {
+			pausedItems = append(pausedItems, it)
+		}
+	}
+
+	// Nothing is paused on either axis — there is nothing to resume.
+	if c.State != campaign.StatePaused && len(pausedItems) == 0 {
+		s.writeError(w, r, http.StatusConflict, "campaign_not_paused",
+			"campaign has no paused state to resume",
+			map[string]any{"campaign_id": id.String(), "state": string(c.State)})
+		return
+	}
+
+	// Resume the campaign first (pause_campaign policy). A same-state running
+	// campaign (pause_item policy) is left untouched — only paused items move.
+	if c.State == campaign.StatePaused {
+		if _, err := s.cfg.CampaignRepo.TransitionCampaign(r.Context(), id, campaign.StateRunning); err != nil {
+			var inv campaign.InvalidTransitionError
+			if errors.As(err, &inv) {
+				s.writeError(w, r, http.StatusConflict, "invalid_transition",
+					err.Error(), map[string]any{"campaign_id": id.String()})
+				return
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"resume campaign failed", map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	// Resume each paused item. Best-effort retryability: a transition error
+	// surfaces 500, and because a retry re-enters with the still-paused items
+	// (the joint condition above), it is not stranded by the campaign already
+	// being running.
+	for _, it := range pausedItems {
+		if _, err := s.cfg.CampaignRepo.TransitionCampaignItem(r.Context(), it.ID, campaign.ItemStateRunning); err != nil {
+			var inv campaign.InvalidTransitionError
+			if errors.As(err, &inv) {
+				s.writeError(w, r, http.StatusConflict, "invalid_transition",
+					err.Error(), map[string]any{"item_id": it.ID.String()})
+				return
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"resume campaign item failed",
+				map[string]any{"error": err.Error(), "item_id": it.ID.String()})
+			return
+		}
+	}
+
+	// Return the freshest campaign state.
+	updated, err := s.cfg.CampaignRepo.GetCampaign(r.Context(), id)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get campaign after resume failed", map[string]any{"error": err.Error()})
+		return
+	}
+	s.writeJSON(w, r, http.StatusOK, toCampaignResponse(updated))
 }

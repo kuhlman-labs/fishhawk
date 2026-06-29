@@ -13,9 +13,12 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/campaigndriver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
@@ -34,10 +37,12 @@ type fakeCampaignRepo struct {
 	itemsByCmp map[uuid.UUID][]*campaign.Item
 
 	// error injections so the 5xx surfaces are reachable.
-	createErr error
-	getErr    error
-	listErr   error
-	itemsErr  error
+	createErr    error
+	getErr       error
+	listErr      error
+	itemsErr     error
+	transCmpErr  error
+	transItemErr error
 }
 
 func newFakeCampaignRepo() *fakeCampaignRepo {
@@ -55,15 +60,60 @@ func (f *fakeCampaignRepo) CreateCampaign(_ context.Context, p campaign.CreateCa
 	}
 	now := time.Now().UTC()
 	c := &campaign.Campaign{
-		ID:        uuid.New(),
-		Repo:      p.Repo,
-		EpicRef:   p.EpicRef,
-		State:     campaign.StatePending,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:          uuid.New(),
+		Repo:        p.Repo,
+		EpicRef:     p.EpicRef,
+		State:       campaign.StatePending,
+		PausePolicy: p.PausePolicy,
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 	f.campaigns[c.ID] = c
 	return c, nil
+}
+
+// TransitionCampaign moves a campaign to the target state, mirroring the
+// Postgres adapter's idempotent same-state + InvalidTransitionError contract.
+func (f *fakeCampaignRepo) TransitionCampaign(_ context.Context, id uuid.UUID, to campaign.State) (*campaign.Campaign, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.transCmpErr != nil {
+		return nil, f.transCmpErr
+	}
+	c, ok := f.campaigns[id]
+	if !ok {
+		return nil, campaign.ErrNotFound
+	}
+	if !campaign.ValidCampaignTransition(c.State, to) {
+		return nil, campaign.InvalidTransitionError{Kind: "campaign", From: string(c.State), To: string(to)}
+	}
+	c.State = to
+	c.UpdatedAt = time.Now().UTC()
+	return c, nil
+}
+
+// TransitionCampaignItem moves an item (found by id across all campaigns) to
+// the target state with the same idempotent/InvalidTransition contract.
+func (f *fakeCampaignRepo) TransitionCampaignItem(_ context.Context, id uuid.UUID, to campaign.ItemState) (*campaign.Item, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.transItemErr != nil {
+		return nil, f.transItemErr
+	}
+	for _, items := range f.itemsByCmp {
+		for _, it := range items {
+			if it.ID != id {
+				continue
+			}
+			if !campaign.ValidCampaignItemTransition(it.State, to) {
+				return nil, campaign.InvalidTransitionError{Kind: "campaign_item", From: string(it.State), To: string(to)}
+			}
+			it.State = to
+			it.UpdatedAt = time.Now().UTC()
+			return it, nil
+		}
+	}
+	return nil, campaign.ErrNotFound
 }
 
 func (f *fakeCampaignRepo) CreateCampaignItem(_ context.Context, p campaign.CreateCampaignItemParams) (*campaign.Item, error) {
@@ -665,6 +715,26 @@ func TestComputeCampaignNextAction_Precedence(t *testing.T) {
 			wantRef: "issue:5",
 		},
 		{
+			// FAILED still wins over a PAUSED item (failed is the strict-first check).
+			name:    "failed and paused both present -> attention",
+			elig:    campaign.Eligibility{Failed: []string{"issue:5"}, Paused: []string{"issue:6"}},
+			want:    "attention",
+			wantRef: "issue:5",
+		},
+		{
+			// PAUSED outranks ELIGIBLE: a gate hand-off is surfaced before dispatch.
+			name:    "paused and eligible both present -> resume",
+			elig:    campaign.Eligibility{Paused: []string{"issue:7"}, Eligible: []string{"issue:8"}},
+			want:    "resume",
+			wantRef: "issue:7",
+		},
+		{
+			name:    "paused only -> resume",
+			elig:    campaign.Eligibility{Paused: []string{"issue:9"}},
+			want:    "resume",
+			wantRef: "issue:9",
+		},
+		{
 			name:    "eligible only -> start_run",
 			elig:    campaign.Eligibility{Eligible: []string{"issue:6"}},
 			want:    "start_run",
@@ -972,5 +1042,558 @@ func TestListCampaigns_NilRepo_503(t *testing.T) {
 	s.handleListCampaigns(w, withAuth(req))
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", w.Code)
+	}
+}
+
+// --- resume handler tests ---
+
+// postResume POSTs to handleResumeCampaign with an operator identity (scope
+// bypass via withAuth) for the given campaign id.
+func postResume(t *testing.T, s *Server, id string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v0/campaigns/"+id+"/resume", nil)
+	req.SetPathValue("campaign_id", id)
+	w := httptest.NewRecorder()
+	s.handleResumeCampaign(w, withAuth(req))
+	return w
+}
+
+// seedPausedCampaign seeds a campaign in StatePaused with one paused item
+// carrying a PauseReason (the pause_campaign policy shape), plus a succeeded
+// sibling so a later resume has work to continue.
+func seedPausedCampaign(f *fakeCampaignRepo) (*campaign.Campaign, *campaign.Item) {
+	paused := &campaign.Item{
+		IssueRef:    "issue:200",
+		State:       campaign.ItemStatePaused,
+		PauseReason: &campaign.PauseReason{PageEvent: "campaign_gate_paged"},
+	}
+	c := f.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		{IssueRef: "issue:201", State: campaign.ItemStateSucceeded},
+		paused,
+	})
+	c.State = campaign.StatePaused
+	c.PausePolicy = campaign.PausePolicyPauseCampaign
+	return c, paused
+}
+
+// TestResumeCampaign_HappyPath asserts a paused campaign + paused item flip
+// back to running on resume (the pause_campaign policy shape).
+func TestResumeCampaign_HappyPath(t *testing.T) {
+	repo := newFakeCampaignRepo()
+	c, paused := seedPausedCampaign(repo)
+	s := New(Config{CampaignRepo: repo})
+
+	w := postResume(t, s, c.ID.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	var got campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.State != string(campaign.StateRunning) {
+		t.Errorf("campaign state = %q, want running", got.State)
+	}
+	// The paused item is now running again.
+	resumed := getItemByID(t, repo, c.ID, paused.ID)
+	if resumed.State != campaign.ItemStateRunning {
+		t.Errorf("item state = %q, want running", resumed.State)
+	}
+}
+
+// TestResumeCampaign_PauseItemPolicy_ResumesItemOnly asserts the pause_item
+// shape: the campaign was never paused (only the item), so resume leaves the
+// campaign running and flips just the paused item — and is NOT a 409.
+func TestResumeCampaign_PauseItemPolicy_ResumesItemOnly(t *testing.T) {
+	repo := newFakeCampaignRepo()
+	paused := &campaign.Item{IssueRef: "issue:300", State: campaign.ItemStatePaused}
+	c := repo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		{IssueRef: "issue:301", State: campaign.ItemStateRunning},
+		paused,
+	})
+	// pause_item leaves the campaign running (seedCampaignWithItems default).
+	c.PausePolicy = campaign.PausePolicyPauseItem
+	s := New(Config{CampaignRepo: repo})
+
+	w := postResume(t, s, c.ID.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	var got campaignResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if got.State != string(campaign.StateRunning) {
+		t.Errorf("campaign state = %q, want running (was never paused)", got.State)
+	}
+	if resumed := getItemByID(t, repo, c.ID, paused.ID); resumed.State != campaign.ItemStateRunning {
+		t.Errorf("item state = %q, want running", resumed.State)
+	}
+}
+
+// TestResumeCampaign_NotPaused_409 asserts a running campaign with no paused
+// item has nothing to resume -> 409 campaign_not_paused.
+func TestResumeCampaign_NotPaused_409(t *testing.T) {
+	repo := newFakeCampaignRepo()
+	c := repo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		{IssueRef: "issue:400", State: campaign.ItemStateRunning},
+	})
+	s := New(Config{CampaignRepo: repo})
+
+	w := postResume(t, s, c.ID.String())
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "campaign_not_paused" {
+		t.Errorf("code = %q, want campaign_not_paused", code)
+	}
+}
+
+// TestResumeCampaign_NotFound_404 asserts an unknown campaign id -> 404.
+func TestResumeCampaign_NotFound_404(t *testing.T) {
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+	w := postResume(t, s, uuid.New().String())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "campaign_not_found" {
+		t.Errorf("code = %q, want campaign_not_found", code)
+	}
+}
+
+// TestResumeCampaign_BadUUID_400 asserts a malformed campaign id -> 400.
+func TestResumeCampaign_BadUUID_400(t *testing.T) {
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+	w := postResume(t, s, "not-a-uuid")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", code)
+	}
+}
+
+// TestResumeCampaign_RequireWriteScope_403 asserts a bearer token missing
+// write:campaigns is rejected 403.
+func TestResumeCampaign_RequireWriteScope_403(t *testing.T) {
+	repo := newFakeCampaignRepo()
+	c, _ := seedPausedCampaign(repo)
+	s := New(Config{CampaignRepo: repo})
+	id := Identity{Subject: "github:op", TokenID: "tok_no_campaigns", Scopes: []string{"write:runs"}}
+	req := httptest.NewRequest(http.MethodPost, "/v0/campaigns/"+c.ID.String()+"/resume", nil)
+	req.SetPathValue("campaign_id", c.ID.String())
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
+	w := httptest.NewRecorder()
+	s.handleResumeCampaign(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "insufficient_scope" {
+		t.Errorf("code = %q, want insufficient_scope", code)
+	}
+}
+
+// TestResumeCampaign_NilRepo_503 asserts the nil-CampaignRepo guard fires
+// BEFORE the write-scope check (so an unconfigured deploy answers 503).
+func TestResumeCampaign_NilRepo_503(t *testing.T) {
+	s := New(Config{})
+	w := postResume(t, s, uuid.New().String())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "campaign_repo_unconfigured" {
+		t.Errorf("code = %q, want campaign_repo_unconfigured", code)
+	}
+}
+
+// TestResumeCampaign_ItemTransitionError_500 asserts an item-transition
+// failure surfaces a 500 (the defensive item-resume branch).
+func TestResumeCampaign_ItemTransitionError_500(t *testing.T) {
+	repo := newFakeCampaignRepo()
+	c, _ := seedPausedCampaign(repo)
+	repo.transItemErr = fmt.Errorf("boom")
+	s := New(Config{CampaignRepo: repo})
+
+	w := postResume(t, s, c.ID.String())
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "internal_error" {
+		t.Errorf("code = %q, want internal_error", code)
+	}
+}
+
+func getItemByID(t *testing.T, repo *fakeCampaignRepo, campaignID, itemID uuid.UUID) *campaign.Item {
+	t.Helper()
+	items, err := repo.ListCampaignItemsForCampaign(context.Background(), campaignID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	for _, it := range items {
+		if it.ID == itemID {
+			return it
+		}
+	}
+	t.Fatalf("item %s not found", itemID)
+	return nil
+}
+
+// TestGetCampaignStatus_PausedRollupAndNextAction asserts a paused item lands
+// in rollup.paused and drives the resume next_action (E25.7).
+func TestGetCampaignStatus_PausedRollupAndNextAction(t *testing.T) {
+	repo := newFakeCampaignRepo()
+	c := repo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		{IssueRef: "issue:500", State: campaign.ItemStatePaused},
+		{IssueRef: "issue:501", State: campaign.ItemStateSucceeded},
+	})
+	s := New(Config{CampaignRepo: repo})
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+c.ID.String()+"/status", nil)
+	req.SetPathValue("campaign_id", c.ID.String())
+	w := httptest.NewRecorder()
+	s.handleGetCampaignStatus(w, withAuth(req))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	var status struct {
+		Rollup     campaignRollupPayload     `json:"rollup"`
+		NextAction campaignNextActionPayload `json:"next_action"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &status)
+	if len(status.Rollup.Paused) != 1 || status.Rollup.Paused[0] != "issue:500" {
+		t.Errorf("rollup.Paused = %v, want [issue:500]", status.Rollup.Paused)
+	}
+	if status.NextAction.Action != "resume" || status.NextAction.IssueRef != "issue:500" {
+		t.Errorf("next_action = %+v, want resume issue:500", status.NextAction)
+	}
+}
+
+// TestCreateCampaign_PausePolicyRoundTrip is the binding-condition-2 guard:
+// pause_policy survives request -> assembly -> persist -> response across the
+// real Postgres boundary. POST with pause_policy=pause_item, then GET and
+// assert it round-trips as pause_item (not silently defaulted to
+// pause_campaign).
+func TestCreateCampaign_PausePolicyRoundTrip(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+	gh := recordingInstallGitHubClient(t, 9911, &installRecorder{})
+	s := New(Config{CampaignRepo: repo, GitHub: gh})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","pause_policy":"pause_item"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created: %v", err)
+	}
+	// The create response already carries the persisted policy.
+	if created.PausePolicy != string(campaign.PausePolicyPauseItem) {
+		t.Errorf("create response pause_policy = %q, want pause_item", created.PausePolicy)
+	}
+
+	// And it round-trips through a fresh GET (read from Postgres, not the
+	// in-memory create result).
+	getReq := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+created.ID.String(), nil)
+	getReq.SetPathValue("campaign_id", created.ID.String())
+	gw := httptest.NewRecorder()
+	s.handleGetCampaign(gw, withAuth(getReq))
+	if gw.Code != http.StatusOK {
+		t.Fatalf("get status = %d, want 200 (body=%s)", gw.Code, gw.Body.String())
+	}
+	var got campaignResponse
+	_ = json.Unmarshal(gw.Body.Bytes(), &got)
+	if got.PausePolicy != string(campaign.PausePolicyPauseItem) {
+		t.Errorf("GET pause_policy = %q, want pause_item (round-trip), got silently defaulted", got.PausePolicy)
+	}
+}
+
+// TestCreateCampaign_BadPausePolicy_400 asserts an unrecognized pause_policy
+// fails closed at the handler with a 400 rather than reaching the column CHECK.
+func TestCreateCampaign_BadPausePolicy_400(t *testing.T) {
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","pause_policy":"pause_everything"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", code)
+	}
+}
+
+// pagingGateActor is a campaigndriver.GateActor that forces the Paged outcome
+// on the first running run it sees (a deterministic stand-in for a
+// must_page_human reviewer_reject gate; the real autodrive reviewer_reject ->
+// Paged path is covered by autodrive_test.go and driver_test.go). It pages
+// exactly once so a re-tick after resume re-engages mechanically.
+type pagingGateActor struct{ paged bool }
+
+func (a *pagingGateActor) DriveRunGate(_ context.Context, _ *run.Run) (campaigndriver.GateActionOutcome, error) {
+	if a.paged {
+		return campaigndriver.GateActionOutcome{Note: "already paged"}, nil
+	}
+	a.paged = true
+	return campaigndriver.GateActionOutcome{Paged: true, PageEvent: "campaign_gate_paged", Note: "must page human"}, nil
+}
+
+// recordingPageNotifier is a campaigndriver.Notifier that records the run ids
+// it was asked to page, so the e2e can assert the page fired.
+type recordingPageNotifier struct{ runs []uuid.UUID }
+
+func (n *recordingPageNotifier) NotifyStatusUpdateForRun(_ context.Context, runID uuid.UUID) error {
+	n.runs = append(n.runs, runID)
+	return nil
+}
+
+// e2eRunStarter mints real run rows so the driver's terminal detection reads
+// genuine persisted state, recording the run id per issue ref.
+type e2eRunStarter struct {
+	runs  run.Repository
+	byRef map[string]uuid.UUID
+}
+
+func (s *e2eRunStarter) StartCampaignRun(ctx context.Context, item *campaign.Item, c *campaign.Campaign) (*run.Run, error) {
+	ref := item.IssueRef
+	r, err := s.runs.CreateRun(ctx, run.CreateRunParams{
+		Repo:          c.Repo,
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: run.TriggerGitHubIssue,
+		TriggerRef:    &ref,
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.byRef[ref] = r.ID
+	return r, nil
+}
+
+// TestResumeCampaign_CrossBoundary_E2E is the done-means of #1446: over a real
+// Postgres, the auto-driver pages a human at a run gate (pause_campaign
+// policy), pausing the affected item AND the campaign and firing the page;
+// the operator then POSTs /resume; and the next driver tick re-engages the
+// campaign and the continuation proceeds. This crosses driver -> persistence
+// -> notifier -> REST resume -> driver, where a per-layer unit would pass while
+// the seam breaks (#618).
+func TestResumeCampaign_CrossBoundary_E2E(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	ctx := context.Background()
+
+	campaigns := campaign.NewPostgresRepository(pool)
+	runs := run.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+
+	// A single-issue campaign in state running with the item already running on
+	// a non-terminal run — the gate the auto-driver will page.
+	c, err := campaigns.CreateCampaign(ctx, campaign.CreateCampaignParams{
+		Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:1000",
+		PausePolicy: campaign.PausePolicyPauseCampaign,
+	})
+	if err != nil {
+		t.Fatalf("create campaign: %v", err)
+	}
+	item, err := campaigns.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID, IssueRef: "issue:1",
+	})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+	if _, err := campaigns.TransitionCampaign(ctx, c.ID, campaign.StateRunning); err != nil {
+		t.Fatalf("transition campaign to running: %v", err)
+	}
+	// Mint the item's run and link it; drive it to running (non-terminal) so the
+	// driver hands it to the GateActor rather than settling it.
+	starter := &e2eRunStarter{runs: runs, byRef: map[string]uuid.UUID{}}
+	runRow, err := starter.StartCampaignRun(ctx, item, c)
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	if _, err := campaigns.SetCampaignItemRun(ctx, item.ID, &runRow.ID); err != nil {
+		t.Fatalf("link item run: %v", err)
+	}
+	if _, err := campaigns.TransitionCampaignItem(ctx, item.ID, campaign.ItemStateRunning); err != nil {
+		t.Fatalf("transition item to running: %v", err)
+	}
+	if _, err := runs.TransitionRun(ctx, runRow.ID, run.StateRunning); err != nil {
+		t.Fatalf("transition run to running: %v", err)
+	}
+
+	notifier := &recordingPageNotifier{}
+	tk := &campaigndriver.Ticker{
+		Campaigns:   campaigns,
+		Runs:        runs,
+		Starter:     starter,
+		Audit:       auditRepo,
+		GateActor:   &pagingGateActor{},
+		Notifier:    notifier,
+		MaxParallel: 4,
+	}
+
+	// --- tick 1: the gate is paged -> item paused, campaign paused, page fired ---
+	tk.Tick(ctx)
+
+	pausedItem := e2eGetItem(t, campaigns, c.ID, item.ID)
+	if pausedItem.State != campaign.ItemStatePaused {
+		t.Fatalf("after page: item = %s, want paused", pausedItem.State)
+	}
+	if pausedItem.PauseReason == nil || pausedItem.PauseReason.PageEvent != "campaign_gate_paged" {
+		t.Errorf("after page: pause_reason = %+v, want campaign_gate_paged", pausedItem.PauseReason)
+	}
+	gotC, err := campaigns.GetCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("get campaign: %v", err)
+	}
+	if gotC.State != campaign.StatePaused {
+		t.Fatalf("after page: campaign = %s, want paused (pause_campaign policy)", gotC.State)
+	}
+	if len(notifier.runs) != 1 || notifier.runs[0] != runRow.ID {
+		t.Errorf("page notifier runs = %v, want [%s]", notifier.runs, runRow.ID)
+	}
+	assertCampaignPausedAudit(t, auditRepo, c.ID)
+
+	// --- operator resumes via the REST handler ---
+	s := New(Config{CampaignRepo: campaigns})
+	rw := postResume(t, s, c.ID.String())
+	if rw.Code != http.StatusOK {
+		t.Fatalf("resume status = %d, want 200 (body=%s)", rw.Code, rw.Body.String())
+	}
+	resumedC, err := campaigns.GetCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("get campaign after resume: %v", err)
+	}
+	if resumedC.State != campaign.StateRunning {
+		t.Fatalf("after resume: campaign = %s, want running", resumedC.State)
+	}
+	if it := e2eGetItem(t, campaigns, c.ID, item.ID); it.State != campaign.ItemStateRunning {
+		t.Fatalf("after resume: item = %s, want running", it.State)
+	}
+
+	// --- tick 2: the run reaches terminal-succeeded; the driver re-engages and
+	// the campaign continues to succeeded (the resumed item settles) ---
+	if _, err := runs.TransitionRun(ctx, runRow.ID, run.StateSucceeded); err != nil {
+		t.Fatalf("transition run to succeeded: %v", err)
+	}
+	tk.Tick(ctx)
+
+	finalC, err := campaigns.GetCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("get campaign final: %v", err)
+	}
+	if finalC.State != campaign.StateSucceeded {
+		t.Fatalf("after resume+tick: campaign = %s, want succeeded (continued)", finalC.State)
+	}
+}
+
+func e2eGetItem(t *testing.T, repo campaign.Repository, campaignID, itemID uuid.UUID) *campaign.Item {
+	t.Helper()
+	items, err := repo.ListCampaignItemsForCampaign(context.Background(), campaignID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	for _, it := range items {
+		if it.ID == itemID {
+			return it
+		}
+	}
+	t.Fatalf("item %s not found", itemID)
+	return nil
+}
+
+func assertCampaignPausedAudit(t *testing.T, au audit.Repository, campaignID uuid.UUID) {
+	t.Helper()
+	entries, err := au.ListGlobal(context.Background())
+	if err != nil {
+		t.Fatalf("list global audit: %v", err)
+	}
+	for _, e := range entries {
+		if e.Category == "campaign_paused" && strings.Contains(string(e.Payload), campaignID.String()) {
+			return
+		}
+	}
+	t.Fatalf("no campaign_paused audit entry found for campaign %s", campaignID)
+}
+
+// TestResumeCampaign_GetError_500 asserts a GetCampaign error (not
+// ErrNotFound) surfaces a 500 — the campaign-load defensive branch.
+func TestResumeCampaign_GetError_500(t *testing.T) {
+	repo := newFakeCampaignRepo()
+	repo.getErr = fmt.Errorf("db down")
+	s := New(Config{CampaignRepo: repo})
+	w := postResume(t, s, uuid.New().String())
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "internal_error" {
+		t.Errorf("code = %q, want internal_error", code)
+	}
+}
+
+// TestResumeCampaign_ListItemsError_500 asserts a ListCampaignItemsForCampaign
+// error surfaces a 500 — the items-load defensive branch.
+func TestResumeCampaign_ListItemsError_500(t *testing.T) {
+	repo := newFakeCampaignRepo()
+	c, _ := seedPausedCampaign(repo)
+	repo.itemsErr = fmt.Errorf("db down")
+	s := New(Config{CampaignRepo: repo})
+	w := postResume(t, s, c.ID.String())
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "internal_error" {
+		t.Errorf("code = %q, want internal_error", code)
+	}
+}
+
+// TestResumeCampaign_CampaignTransitionInvalid_409 asserts an
+// InvalidTransitionError from the campaign transition surfaces 409
+// invalid_transition (the concurrent-change defensive branch).
+func TestResumeCampaign_CampaignTransitionInvalid_409(t *testing.T) {
+	repo := newFakeCampaignRepo()
+	c, _ := seedPausedCampaign(repo)
+	repo.transCmpErr = campaign.InvalidTransitionError{Kind: "campaign", From: "paused", To: "running"}
+	s := New(Config{CampaignRepo: repo})
+	w := postResume(t, s, c.ID.String())
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "invalid_transition" {
+		t.Errorf("code = %q, want invalid_transition", code)
+	}
+}
+
+// TestResumeCampaign_CampaignTransitionError_500 asserts a non-transition
+// error from the campaign transition surfaces a 500.
+func TestResumeCampaign_CampaignTransitionError_500(t *testing.T) {
+	repo := newFakeCampaignRepo()
+	c, _ := seedPausedCampaign(repo)
+	repo.transCmpErr = fmt.Errorf("db down")
+	s := New(Config{CampaignRepo: repo})
+	w := postResume(t, s, c.ID.String())
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "internal_error" {
+		t.Errorf("code = %q, want internal_error", code)
+	}
+}
+
+// TestResumeCampaign_ItemTransitionInvalid_409 asserts an
+// InvalidTransitionError from the item transition surfaces 409
+// invalid_transition.
+func TestResumeCampaign_ItemTransitionInvalid_409(t *testing.T) {
+	repo := newFakeCampaignRepo()
+	c, _ := seedPausedCampaign(repo)
+	repo.transItemErr = campaign.InvalidTransitionError{Kind: "campaign_item", From: "paused", To: "running"}
+	s := New(Config{CampaignRepo: repo})
+	w := postResume(t, s, c.ID.String())
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "invalid_transition" {
+		t.Errorf("code = %q, want invalid_transition", code)
 	}
 }
