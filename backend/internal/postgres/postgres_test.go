@@ -249,6 +249,26 @@ func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
 		t.Errorf("stages_state_check after MigrateUp does not admit 'awaiting_deployment': %s", stageStateCheckDef)
 	}
 
+	// 0039 (#1437) added the campaigns + campaign_items tables (the
+	// campaign keystone). Confirm both exist after a full MigrateUp.
+	var campaignsTable, campaignItemsTable int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'campaigns'`,
+	).Scan(&campaignsTable); err != nil {
+		t.Fatalf("query campaigns table: %v", err)
+	}
+	if campaignsTable != 1 {
+		t.Errorf("'campaigns' table count after MigrateUp = %d, want 1", campaignsTable)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'campaign_items'`,
+	).Scan(&campaignItemsTable); err != nil {
+		t.Fatalf("query campaign_items table: %v", err)
+	}
+	if campaignItemsTable != 1 {
+		t.Errorf("'campaign_items' table count after MigrateUp = %d, want 1", campaignItemsTable)
+	}
+
 	// Second application is a no-op.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Errorf("second MigrateUp returned %v, want nil (idempotent)", err)
@@ -277,15 +297,33 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0038 (#1400) is now the latest
-	// migration: it widened stages_type_check to admit 'deploy' and
-	// stages_state_check to admit the two deploy states; its down migration
-	// narrows both back. Confirm those two CHECKs no longer admit the deploy
-	// values, but every PRIOR migration's effect is still present — notably
-	// 0037's (#1385) artifacts_kind_check 'deployment', 0036's (#1346)
+	// MigrateDown rolls back one step. 0039 (#1437) is now the latest
+	// migration: it created the campaigns + campaign_items tables (the
+	// campaign keystone); its down migration drops both. Confirm the two
+	// campaign tables are gone, but every PRIOR migration's effect is still
+	// present — notably 0038's (#1400) widened stages_type_check ('deploy')
+	// and stages_state_check (the two deploy states), 0037's (#1385)
+	// artifacts_kind_check 'deployment', 0036's (#1346)
 	// runs.runner_kind_resolved column, 0035's (#1231)
 	// stages.scope_completeness_park column and widened stages_state_check,
 	// 0034's (#1141) runs.slice_index column, etc.
+	var campaignsTable, campaignItemsTable int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'campaigns'`,
+	).Scan(&campaignsTable); err != nil {
+		t.Fatalf("query campaigns table: %v", err)
+	}
+	if campaignsTable != 0 {
+		t.Errorf("'campaigns' table count after MigrateDown = %d, want 0 (0039 rolled back)", campaignsTable)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'campaign_items'`,
+	).Scan(&campaignItemsTable); err != nil {
+		t.Fatalf("query campaign_items table: %v", err)
+	}
+	if campaignItemsTable != 0 {
+		t.Errorf("'campaign_items' table count after MigrateDown = %d, want 0 (0039 rolled back)", campaignItemsTable)
+	}
 	var artifactsKindCheckDef string
 	if err := pool.QueryRow(context.Background(),
 		`SELECT pg_get_constraintdef(oid) FROM pg_constraint
@@ -294,12 +332,11 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query artifacts_kind_check constraint def: %v", err)
 	}
 	if !strings.Contains(artifactsKindCheckDef, "deployment") {
-		t.Errorf("artifacts_kind_check after MigrateDown dropped 'deployment' (0037 still applied; only 0038 rolled back): %s", artifactsKindCheckDef)
+		t.Errorf("artifacts_kind_check after MigrateDown dropped 'deployment' (0037 still applied; only 0039 rolled back): %s", artifactsKindCheckDef)
 	}
-	// 0038 (the only migration rolled back) narrowed stages_type_check back
-	// to plan/implement/review and stages_state_check back to the 0035 set:
-	// the deploy type and the two deploy states must be gone, while the
-	// prior 0035/0032 states survive.
+	// 0038 (#1400) is now a PRIOR migration (only 0039 rolled back), so its
+	// widened stages_type_check ('deploy') and stages_state_check (the two
+	// deploy states) must still be present.
 	var stageTypeCheckDef string
 	if err := pool.QueryRow(context.Background(),
 		`SELECT pg_get_constraintdef(oid) FROM pg_constraint
@@ -307,8 +344,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&stageTypeCheckDef); err != nil {
 		t.Fatalf("query stages_type_check constraint def: %v", err)
 	}
-	if strings.Contains(stageTypeCheckDef, "deploy") {
-		t.Errorf("stages_type_check after MigrateDown still admits 'deploy' (0038 down should have narrowed it): %s", stageTypeCheckDef)
+	if !strings.Contains(stageTypeCheckDef, "deploy") {
+		t.Errorf("stages_type_check after MigrateDown dropped 'deploy' (0038 still applied; only 0039 rolled back): %s", stageTypeCheckDef)
 	}
 	var runnerKindResolvedCol int
 	if err := pool.QueryRow(context.Background(),
@@ -318,7 +355,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query runs.runner_kind_resolved column: %v", err)
 	}
 	if runnerKindResolvedCol != 1 {
-		t.Errorf("runs.runner_kind_resolved count after MigrateDown = %d, want 1 (0036 still applied; only 0038 rolled back)", runnerKindResolvedCol)
+		t.Errorf("runs.runner_kind_resolved count after MigrateDown = %d, want 1 (0036 still applied; only 0039 rolled back)", runnerKindResolvedCol)
 	}
 	var scopeParkCol int
 	if err := pool.QueryRow(context.Background(),
@@ -328,7 +365,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query stages.scope_completeness_park column: %v", err)
 	}
 	if scopeParkCol != 1 {
-		t.Errorf("stages.scope_completeness_park count after MigrateDown = %d, want 1 (0035 still applied; only 0038 rolled back)", scopeParkCol)
+		t.Errorf("stages.scope_completeness_park count after MigrateDown = %d, want 1 (0035 still applied; only 0039 rolled back)", scopeParkCol)
 	}
 	var sliceIndexCol int
 	if err := pool.QueryRow(context.Background(),
@@ -338,7 +375,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query runs.slice_index column: %v", err)
 	}
 	if sliceIndexCol != 1 {
-		t.Errorf("runs.slice_index count after MigrateDown = %d, want 1 (0034 still applied; only 0038 rolled back)", sliceIndexCol)
+		t.Errorf("runs.slice_index count after MigrateDown = %d, want 1 (0034 still applied; only 0039 rolled back)", sliceIndexCol)
 	}
 	var suggestedPatchCol int
 	if err := pool.QueryRow(context.Background(),
@@ -348,7 +385,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query review_concerns.suggested_patch column: %v", err)
 	}
 	if suggestedPatchCol != 1 {
-		t.Errorf("review_concerns.suggested_patch count after MigrateDown = %d, want 1 (0033 still applied; only 0038 rolled back)", suggestedPatchCol)
+		t.Errorf("review_concerns.suggested_patch count after MigrateDown = %d, want 1 (0033 still applied; only 0039 rolled back)", suggestedPatchCol)
 	}
 	var stageStateCheckDef string
 	if err := pool.QueryRow(context.Background(),
@@ -357,18 +394,18 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&stageStateCheckDef); err != nil {
 		t.Fatalf("query stages_state_check constraint def: %v", err)
 	}
-	// 0038 (the only migration rolled back) narrowed stages_state_check back
-	// to the 0035 set: the two deploy states must be gone, while 0035's
-	// 'awaiting_scope_decision', 0032's 'awaiting_input' and 'awaiting_children'
-	// survive.
-	if strings.Contains(stageStateCheckDef, "awaiting_deploy_approval") {
-		t.Errorf("stages_state_check after MigrateDown still admits 'awaiting_deploy_approval' (0038 down should have narrowed it): %s", stageStateCheckDef)
+	// 0038 (#1400) is a PRIOR migration now (only 0039 rolled back), so its
+	// widened stages_state_check still admits the two deploy states, and
+	// 0035's 'awaiting_scope_decision', 0032's 'awaiting_input' and
+	// 'awaiting_children' survive too.
+	if !strings.Contains(stageStateCheckDef, "awaiting_deploy_approval") {
+		t.Errorf("stages_state_check after MigrateDown dropped 'awaiting_deploy_approval' (0038 still applied; only 0039 rolled back): %s", stageStateCheckDef)
 	}
-	if strings.Contains(stageStateCheckDef, "awaiting_deployment") {
-		t.Errorf("stages_state_check after MigrateDown still admits 'awaiting_deployment' (0038 down should have narrowed it): %s", stageStateCheckDef)
+	if !strings.Contains(stageStateCheckDef, "awaiting_deployment") {
+		t.Errorf("stages_state_check after MigrateDown dropped 'awaiting_deployment' (0038 still applied; only 0039 rolled back): %s", stageStateCheckDef)
 	}
 	if !strings.Contains(stageStateCheckDef, "awaiting_scope_decision") {
-		t.Errorf("stages_state_check after MigrateDown dropped 'awaiting_scope_decision' (0035 still applied; only 0038 should roll back): %s", stageStateCheckDef)
+		t.Errorf("stages_state_check after MigrateDown dropped 'awaiting_scope_decision' (0035 still applied; only 0039 should roll back): %s", stageStateCheckDef)
 	}
 	if !strings.Contains(stageStateCheckDef, "awaiting_input") {
 		t.Errorf("stages_state_check after MigrateDown dropped 'awaiting_input' (0032 still applied; only 0038 should roll back): %s", stageStateCheckDef)
