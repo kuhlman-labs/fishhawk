@@ -4934,6 +4934,89 @@ func TestApproveDeploy_MissingEnvironment_FailsLocally(t *testing.T) {
 	}
 }
 
+// TestApproveDeploy_FreezeFlagSmuggledViaEnvironment_FailsLocally pins the
+// injection guard (#1432 review): because the backend pre-flight parses
+// whitespace-delimited tokens from the WHOLE comment, an Environment such as
+// "production --override-freeze" would otherwise compose a standalone
+// --override-freeze token and bypass the explicit OverrideFreeze control.
+// The guard rejects an environment carrying embedded whitespace locally,
+// before any HTTP call.
+func TestApproveDeploy_FreezeFlagSmuggledViaEnvironment_FailsLocally(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedDeployStage(fb, runID)
+
+	_, _, err := r.approveDeploy(context.Background(), nil, ApproveDeployInput{
+		RunID:       runID.String(),
+		Environment: "production --override-freeze", // smuggle attempt
+		// OverrideFreeze deliberately left false.
+	})
+	if err == nil {
+		t.Fatal("expected local validation error for whitespace-bearing environment")
+	}
+	if !strings.Contains(err.Error(), "single whitespace-free token") {
+		t.Errorf("err = %v, want 'single whitespace-free token'", err)
+	}
+	// The smuggling attempt must never reach the backend.
+	if len(fb.approvalsCalledByID) != 0 {
+		t.Errorf("approvals called %d times after smuggling guard, want 0", len(fb.approvalsCalledByID))
+	}
+}
+
+// TestApproveDeploy_FreezeFlagSmuggledViaReason_FailsLocally pins that a
+// standalone --override-freeze token slipped through the free-form Reason
+// is rejected when OverrideFreeze is false — closing the second injection
+// vector named in the #1432 review.
+func TestApproveDeploy_FreezeFlagSmuggledViaReason_FailsLocally(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedDeployStage(fb, runID)
+
+	_, _, err := r.approveDeploy(context.Background(), nil, ApproveDeployInput{
+		RunID:       runID.String(),
+		Environment: "production",
+		Reason:      "ship it --override-freeze now", // smuggle attempt
+		// OverrideFreeze deliberately left false.
+	})
+	if err == nil {
+		t.Fatal("expected local validation error for --override-freeze in reason")
+	}
+	if !strings.Contains(err.Error(), "override_freeze is set") {
+		t.Errorf("err = %v, want 'override_freeze is set'", err)
+	}
+	if len(fb.approvalsCalledByID) != 0 {
+		t.Errorf("approvals called %d times after smuggling guard, want 0", len(fb.approvalsCalledByID))
+	}
+}
+
+// TestApproveDeploy_ReasonMentionsFlagSubstring_WhenOverrideSet allows a
+// reason that legitimately references the flag once OverrideFreeze is set:
+// the operator HAS requested the override, so the standalone token in reason
+// is harmless and the call proceeds. This guards against the smuggling check
+// over-rejecting the sanctioned case.
+func TestApproveDeploy_ReasonMentionsFlagSubstring_WhenOverrideSet(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedDeployStage(fb, runID)
+	withFakeGhMissing(t)
+
+	_, _, err := r.approveDeploy(context.Background(), nil, ApproveDeployInput{
+		RunID:          runID.String(),
+		Environment:    "production",
+		Reason:         "using --override-freeze for the hotfix",
+		OverrideFreeze: true,
+	})
+	if err != nil {
+		t.Fatalf("approveDeploy: %v", err)
+	}
+	if len(fb.approvalsCalledByID) != 1 {
+		t.Errorf("approvals called %d times, want 1", len(fb.approvalsCalledByID))
+	}
+}
+
 // TestApproveDeploy_EnvironmentNotAllowed_SurfacesAsToolError pins that a
 // backend deploy_environment_not_allowed 422 propagates as a typed,
 // operator-readable tool error.

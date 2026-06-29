@@ -2487,6 +2487,20 @@ func (r *runResolver) rejectPlan(ctx context.Context, _ *mcp.CallToolRequest, in
 	}, nil
 }
 
+// commentHasStandaloneToken reports whether tok appears as a
+// whitespace-delimited standalone token in s. It mirrors the backend's
+// commentHasFlag parse (server/approvals.go) so the MCP-side smuggling
+// guard treats a token exactly as the deploy pre-flight will — an
+// embedded substring ("see --override-freeze-docs") is NOT a match.
+func commentHasStandaloneToken(s, tok string) bool {
+	for _, f := range strings.Fields(s) {
+		if f == tok {
+			return true
+		}
+	}
+	return false
+}
+
 // approveDeploy is the fishhawk_approve_deploy tool handler (E23.15 /
 // #1432). Resolves the deploy stage, composes the deploy environment
 // (and optional freeze override) into the approval comment the backend
@@ -2496,8 +2510,25 @@ func (r *runResolver) approveDeploy(ctx context.Context, _ *mcp.CallToolRequest,
 	// gets a clean tool error rather than a backend 422 round-trip. The
 	// backend re-validates (the comment may omit --environment for any
 	// reason), so this is a convenience, not the authority.
-	if strings.TrimSpace(in.Environment) == "" {
+	env := strings.TrimSpace(in.Environment)
+	if env == "" {
 		return nil, ApproveDeployOutput{}, fmt.Errorf("environment is required for a deploy approval — pass one of the deploy stage's allowed_environments (it is composed into the approval comment as --environment=<env>, which the backend deploy pre-flight parses)")
+	}
+	// Guard against flag smuggling (#1432 review). The backend deploy
+	// pre-flight parses whitespace-delimited tokens from the WHOLE comment
+	// (parseEnvironmentFlag / commentHasFlag), so an untrusted Environment
+	// or Reason carrying a standalone --override-freeze token would bypass
+	// the explicit OverrideFreeze control. An environment name is a single
+	// token: reject embedded whitespace outright (this also stops e.g.
+	// "production --override-freeze"). Reason is free-form but must not
+	// introduce the freeze-override flag the operator did not request, so
+	// --override-freeze appears in the comment ONLY when OverrideFreeze set.
+	if len(strings.Fields(env)) != 1 {
+		return nil, ApproveDeployOutput{}, fmt.Errorf("environment %q must be a single whitespace-free token — it is composed verbatim into the approval comment as --environment=<env>, and embedded whitespace could smuggle a flag token (e.g. --override-freeze) past the deploy pre-flight", in.Environment)
+	}
+	reason := strings.TrimSpace(in.Reason)
+	if !in.OverrideFreeze && commentHasStandaloneToken(reason, "--override-freeze") {
+		return nil, ApproveDeployOutput{}, fmt.Errorf("reason must not contain a standalone --override-freeze token unless override_freeze is set — pass override_freeze:true to override an active change freeze; the backend treats it as an explicit flag wherever it appears in the comment")
 	}
 	deployStage, err := r.resolveDeployStage(ctx, in.RunID)
 	if err != nil {
@@ -2512,11 +2543,11 @@ func (r *runResolver) approveDeploy(ctx context.Context, _ *mcp.CallToolRequest,
 	// standalone --override-freeze token (commentHasFlag), then the
 	// trimmed operator rationale. Order is deterministic so the flag
 	// tokens are always whitespace-delimited at the head.
-	comment := "--environment=" + strings.TrimSpace(in.Environment)
+	comment := "--environment=" + env
 	if in.OverrideFreeze {
 		comment += " --override-freeze"
 	}
-	if reason := strings.TrimSpace(in.Reason); reason != "" {
+	if reason != "" {
 		comment += " " + reason
 	}
 	// Resolve the operator's real GitHub login best-effort (#751); see
