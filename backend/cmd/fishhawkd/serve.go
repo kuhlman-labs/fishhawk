@@ -44,6 +44,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergereconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -64,6 +65,7 @@ import (
 
 	"os"
 	"strconv"
+	"strings"
 )
 
 // defaultPlanReviewTimeout is the #606 code default for the per-invocation
@@ -1472,8 +1474,114 @@ func newCampaignDriver(cfg server.Config, srv *server.Server, logger *slog.Logge
 		Runs:      cfg.RunRepo,
 		Starter:   campaignRunStarter{srv: srv, workflowID: workflowID, workflowRef: workflowRef},
 		Audit:     cfg.AuditRepo,
+		GateActor: newCampaignGateActor(cfg, srv, logger),
 		Logger:    logger,
 		Interval:  interval,
+	}
+}
+
+// campaignOperatorIdentity builds the in-process Identity the campaign
+// auto-driver (E25.6 / ADR-047) acts under when it takes a delegated gate
+// action via Server.AutoDriveRunGate. The subject is the stable operator-agent
+// attribution (operatorrole.CampaignActorSubject, stamped audit.ActorAgent) and
+// the scope set is the gate-action write scopes the handlers enforce. TokenID
+// is set NON-empty so the handler scope check applies the same gate it applies
+// to an HTTP bearer token (scope-acceptance parity) rather than the
+// cookie-session bypass — the in-process actor must HOLD the scopes.
+func campaignOperatorIdentity() server.Identity {
+	return server.Identity{
+		Subject: operatorrole.CampaignActorSubject,
+		TokenID: "operator-agent-campaign",
+		Scopes:  operatorrole.CampaignActorScopes(),
+	}
+}
+
+// githubAutoMerger satisfies server.GitHubMerger over the GitHub App client:
+// may_merge dispatches a run's pull request through GitHub's auto-merge
+// (EnableAutoMerge, squash), and the existing webhook / resolveReviewStageOnMerge
+// path settles the review stage. Fails before any HTTP call when the run lacks
+// the installation id or PR url the merge needs.
+type githubAutoMerger struct {
+	gh *githubclient.Client
+}
+
+func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.Run) error {
+	if runRow.InstallationID == nil {
+		return fmt.Errorf("campaign auto-merge: run %s has no installation id", runRow.ID)
+	}
+	if runRow.PullRequestURL == nil || *runRow.PullRequestURL == "" {
+		return fmt.Errorf("campaign auto-merge: run %s has no pull request url", runRow.ID)
+	}
+	repo, number, err := parseCampaignPRURL(*runRow.PullRequestURL)
+	if err != nil {
+		return fmt.Errorf("campaign auto-merge: %w", err)
+	}
+	return m.gh.EnableAutoMerge(ctx, *runRow.InstallationID, repo, number, githubclient.MergeMethodSquash)
+}
+
+// parseCampaignPRURL splits a GitHub PR html_url into its repo ref and number.
+// Mirrors mergereconciler.parsePRURL (kept local to avoid importing that
+// package for one helper).
+func parseCampaignPRURL(prURL string) (githubclient.RepoRef, int, error) {
+	s := strings.TrimSpace(prURL)
+	for _, prefix := range []string{"https://github.com/", "http://github.com/"} {
+		s = strings.TrimPrefix(s, prefix)
+	}
+	parts := strings.Split(strings.Trim(s, "/"), "/")
+	if len(parts) != 4 || parts[2] != "pull" {
+		return githubclient.RepoRef{}, 0, fmt.Errorf("not a github PR html_url: %q", prURL)
+	}
+	owner, name, num := parts[0], parts[1], parts[3]
+	if owner == "" || name == "" {
+		return githubclient.RepoRef{}, 0, fmt.Errorf("PR url missing owner/name: %q", prURL)
+	}
+	n, err := strconv.Atoi(num)
+	if err != nil || n <= 0 {
+		return githubclient.RepoRef{}, 0, fmt.Errorf("PR url has non-numeric number %q: %q", num, prURL)
+	}
+	return githubclient.RepoRef{Owner: owner, Name: name}, n, nil
+}
+
+// campaignGateActor adapts *server.Server to campaigndriver.GateActor: it drives
+// a run gate via Server.AutoDriveRunGate under the campaign operator identity,
+// dispatching may_merge through the GitHub auto-merge client. Translates the
+// server outcome to the driver's GateActionOutcome shape.
+type campaignGateActor struct {
+	srv    *server.Server
+	id     server.Identity
+	merger server.GitHubMerger
+}
+
+func (a campaignGateActor) DriveRunGate(ctx context.Context, runRow *runpkg.Run) (campaigndriver.GateActionOutcome, error) {
+	out, err := a.srv.AutoDriveRunGate(ctx, runRow, a.id, a.merger)
+	return campaigndriver.GateActionOutcome{
+		Acted:     out.Acted,
+		Action:    out.Action,
+		Paged:     out.Paged,
+		PageEvent: out.PageEvent,
+		Note:      out.Note,
+	}, err
+}
+
+// newCampaignGateActor builds the campaigndriver.GateActor that auto-acts on
+// each run gate under the campaign operator identity (E25.6 / ADR-047), or
+// returns nil — the driver then runs OBSERVE-ONLY — when the GitHub client is
+// unconfigured. The merge knob needs a GitHub client to enable auto-merge; with
+// no client the actor could not honour a delegated may_merge, so rather than
+// auto-act on the other knobs while silently dropping merges we fail the whole
+// actor closed and leave every gate parked for the human operator-agent.
+// campaignDriverStartDecision already refuses to start the driver without a
+// GitHub client, so in practice this returns a live actor whenever the driver
+// runs; the nil path is the defensive fail-closed contract.
+func newCampaignGateActor(cfg server.Config, srv *server.Server, logger *slog.Logger) campaigndriver.GateActor {
+	if cfg.GitHub == nil {
+		logger.Warn("campaign auto-drive disabled: GitHub merge client unconfigured; driver runs observe-only")
+		return nil
+	}
+	return campaignGateActor{
+		srv:    srv,
+		id:     campaignOperatorIdentity(),
+		merger: githubAutoMerger{gh: cfg.GitHub},
 	}
 }
 
