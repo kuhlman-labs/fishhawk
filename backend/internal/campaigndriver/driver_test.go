@@ -29,6 +29,7 @@ type fakeCampaignStore struct {
 	listErr  error
 	itemsErr error
 	linkErr  error
+	transErr error // injected error for TransitionCampaignItem (settle and start paths)
 
 	// recorded mutations
 	itemTransitions []itemTransition
@@ -119,6 +120,9 @@ func (f *fakeCampaignStore) SetCampaignItemRun(_ context.Context, itemID uuid.UU
 func (f *fakeCampaignStore) TransitionCampaignItem(_ context.Context, id uuid.UUID, to campaign.ItemState) (*campaign.Item, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.transErr != nil {
+		return nil, f.transErr
+	}
 	it := f.findItemLocked(id)
 	if it == nil {
 		return nil, campaign.ErrNotFound
@@ -555,5 +559,82 @@ func TestTick_LinkError_NoRunningTransition(t *testing.T) {
 	}
 	if au.count() != 0 {
 		t.Fatalf("expected no started audit on link error, got %d", au.count())
+	}
+}
+
+// start: a TransitionCampaignItem(running) failure AFTER the link committed
+// must not strand the item. The driver rolls the link back (SetCampaignItemRun
+// nil) so the next tick re-partitions the item as Eligible and retries, rather
+// than leaving it linked-but-not-running — which NextEligible would classify as
+// Running forever (never settled, never re-dispatched).
+func TestTick_RunningTransitionError_RollsBackLinkAndRetries(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	it := store.seedItem(c, "issue:11", campaign.ItemStatePending, nil, nil)
+	reader := newFakeRunReader()
+	starter := &fakeStarter{reader: reader}
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, starter, au, 4)
+
+	// First tick: the link commits but the running transition fails.
+	store.transErr = errors.New("transition boom")
+	tk.Tick(context.Background()) // must not panic
+
+	if it.State != campaign.ItemStatePending {
+		t.Fatalf("item state = %s, want pending (running transition failed)", it.State)
+	}
+	if it.RunID != nil {
+		t.Fatal("item must be unlinked after a failed running transition so it stays retryable")
+	}
+	if au.count() != 0 {
+		t.Fatalf("expected no started audit on transition failure, got %d", au.count())
+	}
+	if len(starter.calls) != 1 {
+		t.Fatalf("expected exactly one start attempt on the first tick, got %d", len(starter.calls))
+	}
+
+	// Next tick with the transient error cleared: the now-Eligible item
+	// re-dispatches and links cleanly.
+	store.transErr = nil
+	tk.Tick(context.Background())
+
+	if it.State != campaign.ItemStateRunning {
+		t.Fatalf("item state = %s, want running after retry", it.State)
+	}
+	if it.RunID == nil {
+		t.Fatal("item must be linked after a successful retry")
+	}
+	if len(starter.calls) != 2 {
+		t.Fatalf("expected a second start attempt on retry, got %d total", len(starter.calls))
+	}
+	if got := len(au.byCategory(categoryCampaignIssueStarted)); got != 1 {
+		t.Fatalf("started audit entries after retry = %d, want 1", got)
+	}
+}
+
+// advance: a TransitionCampaignItem failure while settling a terminal run is a
+// logged continue — the item is NOT settled, settledAny stays false (so the
+// campaign is not re-derived), and nothing is emitted. Symmetric with the
+// GetRun / link / starter error branches; the item retries next tick.
+func TestTick_SettleTransitionError_NoSettle(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	reader := newFakeRunReader()
+	doneRun := reader.put(run.StateSucceeded)
+	it := store.seedItem(c, "issue:4", campaign.ItemStateRunning, nil, &doneRun.ID)
+	store.transErr = errors.New("settle transition boom")
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
+
+	tk.Tick(context.Background()) // must not panic
+
+	if it.State != campaign.ItemStateRunning {
+		t.Fatalf("item state = %s, want running (unsettled on transition error)", it.State)
+	}
+	if len(store.campTransitions) != 0 {
+		t.Fatalf("campaign must not be re-derived when nothing settled, got %d transitions", len(store.campTransitions))
+	}
+	if au.count() != 0 {
+		t.Fatalf("expected no audit on settle transition error, got %d", au.count())
 	}
 }

@@ -374,10 +374,28 @@ func (t *Ticker) start(ctx context.Context, logger *slog.Logger, c *campaign.Cam
 			continue
 		}
 		if _, err := t.Campaigns.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateRunning); err != nil {
-			logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: transition item to running failed",
+			logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: transition item to running failed; unlinking run so the item retries next tick",
 				slog.String("campaign_id", c.ID.String()),
 				slog.String("item_id", it.ID.String()),
+				slog.String("run_id", runRow.ID.String()),
 				slog.String("error", err.Error()))
+			// The link committed but the running transition did not, leaving the
+			// item linked-but-not-running. NextEligible classifies that item as
+			// Running (RunID set, non-terminal), so without a rollback it is
+			// never settled (advance requires state running) nor re-dispatched
+			// (start only acts on Eligible) — it is permanently stranded against
+			// the contract that a transient per-item error stays retryable. Roll
+			// the link back so the next tick re-partitions it as Eligible and
+			// retries. Best-effort: an unlink failure is logged and the item
+			// then waits for manual repair rather than being silently
+			// half-started.
+			if _, uerr := t.Campaigns.SetCampaignItemRun(ctx, it.ID, nil); uerr != nil {
+				logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: unlink after failed running transition also failed; item left linked-but-not-running",
+					slog.String("campaign_id", c.ID.String()),
+					slog.String("item_id", it.ID.String()),
+					slog.String("run_id", runRow.ID.String()),
+					slog.String("error", uerr.Error()))
+			}
 			continue
 		}
 		budget--
