@@ -325,6 +325,26 @@ func (w *Workflow) EffectiveOperatorAgent(g *Gate) *OperatorAgent {
 	return nil
 }
 
+// ResolveOperatorAgent resolves the effective operator_agent block
+// across the full three-level ladder, OUTERMOST first: a campaign-level
+// override (E25.12 / #1451) wins over the gate-level block, which wins
+// over the workflow-level block — campaign > gate > workflow. The win is
+// WHOLESALE at every level: a higher level's block replaces the lower
+// one entirely; knobs are never merged across levels (matching
+// EffectiveOperatorAgent's gate-vs-workflow semantics, now extended with
+// the campaign rung). campaignOverride is nil when the run has no
+// campaign context or the campaign declares no override; in that case
+// resolution falls through to EffectiveOperatorAgent(g) unchanged, so a
+// run with no campaign override resolves byte-identically to today.
+// Returns nil when no level declares a block — fail-closed: nothing is
+// delegated and every judgment pages the human.
+func ResolveOperatorAgent(campaignOverride *OperatorAgent, w *Workflow, g *Gate) *OperatorAgent {
+	if campaignOverride != nil {
+		return campaignOverride
+	}
+	return w.EffectiveOperatorAgent(g)
+}
+
 // PeriodicBudget is a workflow-level recurring cost ceiling (ADR-030).
 // It caps total USD spend across all runs of the workflow within a
 // calendar period (weekly or monthly), resetting at the period

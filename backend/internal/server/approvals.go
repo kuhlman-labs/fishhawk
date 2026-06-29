@@ -1940,7 +1940,11 @@ func (s *Server) checkDelegation(w http.ResponseWriter, r *http.Request, runID u
 		Concerns: s.cfg.ConcernRepo,
 		Audit:    s.cfg.AuditRepo,
 	}
-	res, err := ev.Evaluate(r.Context(), runRow, &wf)
+	// Delegated-action enforcement runs outside any campaign context: pass a
+	// nil campaign override so resolution falls through to the workflow
+	// contract (the campaign-level override is applied only by the campaign
+	// auto-driver, E25.12).
+	res, err := ev.Evaluate(r.Context(), runRow, &wf, nil)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"delegation condition evaluation failed", map[string]any{"action": action, "error": err.Error()})

@@ -1574,8 +1574,17 @@ type campaignGateActor struct {
 	merger server.GitHubMerger
 }
 
+// DriveRunGate satisfies the base campaigndriver.GateActor seam (no campaign
+// override — the run resolves on its own workflow contract).
 func (a campaignGateActor) DriveRunGate(ctx context.Context, runRow *runpkg.Run) (campaigndriver.GateActionOutcome, error) {
-	out, err := a.srv.AutoDriveRunGate(ctx, runRow, a.id, a.merger)
+	return a.DriveRunGateWithCampaign(ctx, runRow, nil)
+}
+
+// DriveRunGateWithCampaign satisfies the campaign-aware extension
+// (campaigndriver.CampaignGateActor): it threads the owning campaign's
+// operator_agent override bytes (E25.12 / #1451) into AutoDriveRunGate.
+func (a campaignGateActor) DriveRunGateWithCampaign(ctx context.Context, runRow *runpkg.Run, campaignOverride []byte) (campaigndriver.GateActionOutcome, error) {
+	out, err := a.srv.AutoDriveRunGate(ctx, runRow, a.id, a.merger, campaignOverride)
 	return campaigndriver.GateActionOutcome{
 		Acted:     out.Acted,
 		Action:    out.Action,

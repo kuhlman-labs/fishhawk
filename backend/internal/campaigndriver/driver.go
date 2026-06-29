@@ -172,6 +172,20 @@ type GateActor interface {
 	DriveRunGate(ctx context.Context, runRow *run.Run) (GateActionOutcome, error)
 }
 
+// CampaignGateActor is the optional campaign-aware extension of GateActor
+// (E25.12 / #1451): a GateActor that also accepts the owning campaign's
+// operator_agent override bytes. driveGate prefers it when the bound actor
+// implements it, threading c.OperatorAgent so the run resolves its delegation
+// against the campaign block applied as the outermost rung of the delegation
+// ladder (campaign > gate > workflow, wholesale); nil/empty leaves the run on
+// its own workflow contract. Kept separate from GateActor so observe-only
+// actors (and existing tests) that only implement the base seam still satisfy
+// Ticker.GateActor without taking on the campaign-override parameter.
+type CampaignGateActor interface {
+	GateActor
+	DriveRunGateWithCampaign(ctx context.Context, runRow *run.Run, campaignOverride []byte) (GateActionOutcome, error)
+}
+
 // Notifier fires the human page when the auto-driver hands a gate off (E25.7).
 // The single seam between the campaign driver and the issue-comment notifier:
 // serve.go binds it to the existing issuecomment notifier's
@@ -399,7 +413,19 @@ func (t *Ticker) driveGate(ctx context.Context, logger *slog.Logger, c *campaign
 	if t.GateActor == nil {
 		return
 	}
-	out, err := t.GateActor.DriveRunGate(ctx, runRow)
+	// Thread the campaign's operator_agent override bytes (E25.12 / #1451) so
+	// the actor resolves this run's delegation against the campaign block
+	// wholesale when present; nil/empty leaves the run on its workflow contract.
+	// A base-only GateActor (observe-only/legacy) ignores the override.
+	var (
+		out GateActionOutcome
+		err error
+	)
+	if ca, ok := t.GateActor.(CampaignGateActor); ok {
+		out, err = ca.DriveRunGateWithCampaign(ctx, runRow, c.OperatorAgent)
+	} else {
+		out, err = t.GateActor.DriveRunGate(ctx, runRow)
+	}
 	if err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: auto-drive run gate failed; left for next tick",
 			slog.String("campaign_id", c.ID.String()),

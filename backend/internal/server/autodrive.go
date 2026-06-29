@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -88,8 +89,16 @@ func observeOnly(note string) AutoDriveOutcome { return AutoDriveOutcome{Note: n
 // failure (the action was attempted and the service method errored) is
 // returned as a non-nil error alongside the no-action outcome so the
 // driver can log it; it is NOT swallowed as observe-only.
-func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Identity, merger GitHubMerger) (AutoDriveOutcome, error) {
-	res, wf, ok := s.evaluateRunDelegation(ctx, runRow)
+//
+// campaignOverride carries the campaign-level operator_agent block bytes
+// (E25.12 / #1451) the campaign driver threads from the campaign row.
+// When non-empty it resolves as the effective delegation contract
+// WHOLESALE (campaign > gate > workflow); empty/nil leaves each run on
+// its own workflow contract, byte-identical to today. Malformed override
+// bytes fail CLOSED to observe-only (the override cannot be trusted, so
+// the actor takes no action) — handled in evaluateRunDelegation.
+func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Identity, merger GitHubMerger, campaignOverride []byte) (AutoDriveOutcome, error) {
+	res, wf, ok := s.evaluateRunDelegation(ctx, runRow, campaignOverride)
 	if !ok || res == nil {
 		return observeOnly("delegation not evaluable (fail-closed); observe-only"), nil
 	}
@@ -208,11 +217,18 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 // evaluateRunDelegation resolves the run's effective delegation Result
 // in-process via the same Evaluator path buildDelegationPayload uses
 // (read-only). Returns ok=false on ANY failure — missing repositories,
-// no cached spec, a parse failure, the workflow absent from the spec, or
-// an evaluation error — so the caller fails closed. A successful call
-// with no effective operator_agent block returns (nil, wf, true): the
-// caller treats a nil Result as nothing-delegated / observe-only.
-func (s *Server) evaluateRunDelegation(ctx context.Context, runRow *run.Run) (*delegation.Result, spec.Workflow, bool) {
+// no cached spec, a parse failure, the workflow absent from the spec, a
+// malformed campaign override, or an evaluation error — so the caller
+// fails closed. A successful call with no effective operator_agent block
+// returns (nil, wf, true): the caller treats a nil Result as
+// nothing-delegated / observe-only.
+//
+// campaignOverride is the campaign-level operator_agent block bytes
+// (E25.12). Empty/nil falls through to the workflow contract; well-formed
+// bytes resolve as the effective block WHOLESALE; malformed bytes fail
+// CLOSED (ok=false) so the actor never auto-acts through an unparseable
+// override.
+func (s *Server) evaluateRunDelegation(ctx context.Context, runRow *run.Run, campaignOverride []byte) (*delegation.Result, spec.Workflow, bool) {
 	if s.cfg.RunRepo == nil || s.cfg.ConcernRepo == nil || s.cfg.AuditRepo == nil {
 		return nil, spec.Workflow{}, false
 	}
@@ -231,14 +247,42 @@ func (s *Server) evaluateRunDelegation(ctx context.Context, runRow *run.Run) (*d
 			slog.String("run_id", runRow.ID.String()), slog.String("workflow_id", runRow.WorkflowID))
 		return nil, spec.Workflow{}, false
 	}
+	override, ok := parseCampaignOverride(campaignOverride)
+	if !ok {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: parse campaign operator_agent override failed; observe-only",
+			slog.String("run_id", runRow.ID.String()))
+		return nil, wf, false
+	}
 	ev := &delegation.Evaluator{Stages: s.cfg.RunRepo, Concerns: s.cfg.ConcernRepo, Audit: s.cfg.AuditRepo}
-	res, err := ev.Evaluate(ctx, runRow, &wf)
+	res, err := ev.Evaluate(ctx, runRow, &wf, override)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: delegation evaluate failed; observe-only",
 			slog.String("run_id", runRow.ID.String()), slog.String("error", err.Error()))
 		return nil, wf, false
 	}
 	return res, wf, true
+}
+
+// parseCampaignOverride decodes the campaign-level operator_agent override
+// bytes the campaign driver threads from the campaign row (E25.12 / #1451).
+// Empty/nil bytes mean NO override — ok=true with a nil block, so the run
+// falls through to its workflow contract (the unchanged-behavior path).
+// Well-formed JSON yields the parsed block. Malformed bytes (or an unknown
+// field — defensive belt-and-suspenders over the create-time
+// DisallowUnknownFields validation) return ok=false so the caller fails
+// closed to observe-only rather than auto-acting through an unparseable
+// contract.
+func parseCampaignOverride(raw []byte) (*spec.OperatorAgent, bool) {
+	if len(raw) == 0 {
+		return nil, true
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var oa spec.OperatorAgent
+	if err := dec.Decode(&oa); err != nil {
+		return nil, false
+	}
+	return &oa, true
 }
 
 // activePageEvent returns the configured must_page_human event that is
