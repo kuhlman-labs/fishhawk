@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -58,6 +59,61 @@ func TestStartCampaign_OmittedPausePolicy_LeavesBodyEmpty(t *testing.T) {
 	}
 	if fb.createCampaignBody.PausePolicy != "" {
 		t.Errorf("pause_policy = %q, want empty (omit takes the server default)", fb.createCampaignBody.PausePolicy)
+	}
+}
+
+// TestStartCampaign_OperatorAgentOverride_CarriedAndReturned proves the OPTIONAL
+// campaign-level operator_agent override (E25.12 / #1451) travels in the POST
+// body as opaque JSON AND round-trips back on the created Campaign mirror — the
+// surface that lets the rollup show the contract governing every issue-run.
+func TestStartCampaign_OperatorAgentOverride_CarriedAndReturned(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	id := uuid.New()
+	override := map[string]any{"may_approve": "always", "must_page_human": []any{"deploy"}}
+	fb.createCampaignResp = Campaign{
+		ID: id.String(), Repo: "x/y", EpicRef: "#25", State: "pending", PausePolicy: "pause_campaign",
+		OperatorAgent: override,
+	}
+	r := newResolver(srv, nil)
+
+	_, out, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+		Repo:          "x/y",
+		EpicRef:       "#25",
+		OperatorAgent: override,
+	})
+	if err != nil {
+		t.Fatalf("startCampaign: %v", err)
+	}
+	// The request body carried the override as a JSON object.
+	if len(fb.createCampaignBody.OperatorAgent) == 0 {
+		t.Fatalf("operator_agent absent from POST body: %+v", fb.createCampaignBody)
+	}
+	var sent map[string]any
+	if err := json.Unmarshal(fb.createCampaignBody.OperatorAgent, &sent); err != nil {
+		t.Fatalf("operator_agent body not valid JSON: %v", err)
+	}
+	if sent["may_approve"] != "always" {
+		t.Errorf("sent operator_agent.may_approve = %v, want always", sent["may_approve"])
+	}
+	// The response round-tripped the block back onto the Campaign mirror.
+	if out.Campaign.OperatorAgent["may_approve"] != "always" {
+		t.Errorf("returned Campaign.OperatorAgent = %+v", out.Campaign.OperatorAgent)
+	}
+}
+
+// TestStartCampaign_OmittedOperatorAgent_LeavesBodyEmpty pins the optional
+// operator_agent: omitting it sends NO operator_agent key (the byte-identical
+// default — each issue-run inherits its workflow contract).
+func TestStartCampaign_OmittedOperatorAgent_LeavesBodyEmpty(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#1"})
+	if err != nil {
+		t.Fatalf("startCampaign: %v", err)
+	}
+	if len(fb.createCampaignBody.OperatorAgent) != 0 {
+		t.Errorf("operator_agent present when not supplied: %s", fb.createCampaignBody.OperatorAgent)
 	}
 }
 
@@ -191,6 +247,33 @@ func TestGetCampaignStatus_HappyPath_ReturnsRollupAndNextActions(t *testing.T) {
 	}
 	if got := out.NextActions.Actions[0].Params["trigger_ref"]; got != "#26" {
 		t.Errorf("classified start_run trigger_ref = %q, want #26", got)
+	}
+}
+
+// TestGetCampaignStatus_OperatorAgentOverride_Returned proves a campaign-level
+// operator_agent override decodes back onto the status surface's Campaign mirror
+// (E25.12 / #1451) so the rollup can display the contract governing every
+// issue-run wholesale.
+func TestGetCampaignStatus_OperatorAgentOverride_Returned(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	id := uuid.New()
+	fb.campaignStatusByID[id] = CampaignStatus{
+		Campaign: Campaign{
+			ID: id.String(), Repo: "x/y", EpicRef: "#25", State: "running", PausePolicy: "pause_campaign",
+			OperatorAgent: map[string]any{"may_retry": "infra_flake"},
+		},
+		Items:      []CampaignItem{},
+		Rollup:     CampaignRollup{Eligible: []string{}, Blocked: []string{}, Running: []string{}, Done: []string{}, Failed: []string{}, Cancelled: []string{}, Paused: []string{}},
+		NextAction: CampaignNextAction{Action: "wait", Detail: "items are running or blocked"},
+	}
+	r := newResolver(srv, nil)
+
+	_, out, err := r.getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: id.String()})
+	if err != nil {
+		t.Fatalf("getCampaignStatus: %v", err)
+	}
+	if out.Campaign.OperatorAgent["may_retry"] != "infra_flake" {
+		t.Errorf("status Campaign.OperatorAgent = %+v", out.Campaign.OperatorAgent)
 	}
 }
 

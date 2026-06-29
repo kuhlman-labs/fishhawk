@@ -27,6 +27,14 @@ const statusWire = {
     epic_ref: 'issue:1439',
     state: 'running',
     pause_policy: 'pause_campaign',
+    // The campaign-level operator_agent override (E25.12 / #1451) — opaque on
+    // the shared Campaign type but present on the wire; the detail view reads it
+    // off the payload and renders the Delegation override block.
+    operator_agent: {
+      may_approve: 'always',
+      may_retry: 'infra_flake',
+      must_page_human: ['reviewer_reject'],
+    },
     created_at: '2026-06-29T20:00:00Z',
     updated_at: '2026-06-29T20:05:00Z',
   },
@@ -167,6 +175,51 @@ describe('<CampaignDetail> (cross-boundary: fetch → client → render)', () =>
     expect(screen.getByText('campaign_gate_paged')).toBeInTheDocument();
     // issue_ref of the paged item appears (in the paged-issues list).
     expect(screen.getAllByText('issue:1442').length).toBeGreaterThan(0);
+  });
+
+  it('renders the campaign-level operator_agent override (governs every issue-run wholesale)', async () => {
+    stubFetch(statusWire);
+    renderDetail();
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /delegation override/i })).toBeInTheDocument();
+    });
+    // The set may_* knobs and their conditions render.
+    expect(screen.getByText('may_approve')).toBeInTheDocument();
+    expect(screen.getByText('always')).toBeInTheDocument();
+    expect(screen.getByText('may_retry')).toBeInTheDocument();
+    expect(screen.getByText('infra_flake')).toBeInTheDocument();
+    // must_page_human is surfaced.
+    expect(screen.getByText('must_page_human')).toBeInTheDocument();
+    expect(screen.getByText('reviewer_reject')).toBeInTheDocument();
+    // The wholesale-override semantics are stated for the operator.
+    expect(screen.getByText(/replaces, never merges with/i)).toBeInTheDocument();
+  });
+
+  it('renders the override block with a "no knobs set" note when operator_agent is present but empty (every action pages)', async () => {
+    const emptyOverride = {
+      ...statusWire,
+      campaign: { ...statusWire.campaign, operator_agent: {} },
+    };
+    stubFetch(emptyOverride);
+    renderDetail();
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /delegation override/i })).toBeInTheDocument();
+    });
+    expect(screen.getByText(/no knobs set/i)).toBeInTheDocument();
+  });
+
+  it('omits the delegation override block when the campaign has no operator_agent (the inherit-the-workflow default)', async () => {
+    const noOverride = {
+      ...statusWire,
+      campaign: { ...statusWire.campaign, operator_agent: undefined },
+    };
+    stubFetch(noOverride);
+    renderDetail();
+    // Wait for the page to render past loading (the rollup heading always shows).
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /rollup/i })).toBeInTheDocument();
+    });
+    expect(screen.queryByRole('heading', { name: /delegation override/i })).not.toBeInTheDocument();
   });
 
   it('shows the loading state before the fetch resolves', () => {
