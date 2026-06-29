@@ -1654,6 +1654,102 @@ func TestShipPlan_ReviewAgents_ReviewerError_EmitsPlanReviewFailed(t *testing.T)
 	}
 }
 
+// TestShipPlan_ReviewParseFailure_EmitsPlanReviewFailed covers #1472 defect 2:
+// a schema-valid plan whose decomposition scopes one file into two slices ships
+// (handleShipPlan validates schema only, not semanticCheck), parks at
+// awaiting_approval, and only fails at plan.Parse inside runPlanReviews. Before
+// this fix that parse failure WARN-logged and returned with no audit entry, so
+// reviewStatusFor resolved to 'none' and fishhawk_await_review returned a
+// silently-hung review. Assert exactly one terminal plan_review_failed entry
+// whose Reason carries the validator's re-slice message, and zero plan_reviewed
+// entries. The end-to-end 'failed' surfacing is pinned by the MCP-side
+// reviewStatusFallback test (review_test.go) over an audit log holding only this
+// entry.
+func TestShipPlan_ReviewParseFailure_EmitsPlanReviewFailed(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	// A wired reviewer that WOULD approve — proving the failed entry comes from
+	// the parse guard, not the reviewer. It must never be reached.
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, sf, _, au, _ := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewers)
+	priv, _ := sf.issue(t, runID)
+
+	// Schema-valid plan whose two sub-plans both scope shared.go — rejected by
+	// checkCrossSliceSharedFiles inside plan.Parse but NOT by plan.Validate.
+	const shared = "backend/internal/server/server.go"
+	m := planfixture.Valid(func(m map[string]any) {
+		m["decomposition"] = map[string]any{
+			"rationale": "split by layer",
+			"sub_plans": []any{
+				map[string]any{
+					"title":      "slice 1",
+					"scope_hint": "first",
+					"scope": map[string]any{"files": []any{
+						map[string]any{"path": shared, "operation": "modify"},
+						map[string]any{"path": "backend/internal/server/a.go", "operation": "modify"},
+					}},
+					"predicted_runtime_minutes":    10,
+					"predicted_runtime_confidence": "medium",
+				},
+				map[string]any{
+					"title":      "slice 2",
+					"scope_hint": "second",
+					"scope": map[string]any{"files": []any{
+						map[string]any{"path": shared, "operation": "modify"},
+						map[string]any{"path": "backend/internal/server/b.go", "operation": "modify"},
+					}},
+					"predicted_runtime_minutes":    10,
+					"predicted_runtime_confidence": "medium",
+				},
+			},
+		}
+	})
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	// Upload still returns 201 — the plan artifact is stored; schema validation
+	// passed. The semantic failure surfaces only via the review status.
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// Exactly one plan_review_failed entry whose Reason carries the validator
+	// message; zero plan_reviewed entries (the reviewer never ran).
+	var failedEntries []planreview.ReviewFailedPayload
+	for _, e := range au.appended {
+		switch e.Category {
+		case "plan_review_failed":
+			var p planreview.ReviewFailedPayload
+			if uerr := json.Unmarshal(e.Payload, &p); uerr != nil {
+				t.Fatalf("decode plan_review_failed payload: %v", uerr)
+			}
+			failedEntries = append(failedEntries, p)
+		case "plan_reviewed":
+			t.Errorf("unexpected plan_reviewed entry on the parse-failure path")
+		case "plan_review_started":
+			t.Errorf("unexpected plan_review_started entry: parse fails before the started proxy is emitted")
+		}
+	}
+	if len(failedEntries) != 1 {
+		t.Fatalf("plan_review_failed entries = %d, want 1", len(failedEntries))
+	}
+	got := failedEntries[0]
+	if !strings.Contains(got.Reason, "scoped by multiple slices") {
+		t.Errorf("reason = %q, want it to contain 'scoped by multiple slices'", got.Reason)
+	}
+	if !strings.Contains(got.Reason, "re-slice along file boundaries") {
+		t.Errorf("reason = %q, want it to contain 're-slice along file boundaries'", got.Reason)
+	}
+	if got.Authority != planreview.AuthorityGating {
+		t.Errorf("authority = %q, want gating", got.Authority)
+	}
+}
+
 // deadlineWaitingReviewer blocks each Review call until the invocation context
 // deadline (the size-aware #747 budget applied at the server call site) fires,
 // then returns ctx.Err(). It models a reviewer killed mid-inference by the

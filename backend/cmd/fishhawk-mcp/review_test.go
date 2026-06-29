@@ -190,6 +190,44 @@ func TestReviewStatusFor_Failed_WinsOverStarted(t *testing.T) {
 	}
 }
 
+// TestReviewStatusFor_Fallback_FailedOnly_NoStartedEntry is the #1472
+// end-to-end surfacing test for the plan-decomposition parse failure. The
+// server's runPlanReviews emits a plan_review_failed entry at the plan.Parse
+// guard — BEFORE any plan_review_started entry (started is emitted later, only
+// when a reviewer actually dispatches). So a single plan_review_failed entry
+// with NO started entry must resolve to 'failed' via reviewStatusFallback
+// (review.go:421-428, the any-failed->failed path), NOT the count-gated default
+// at review.go:411 (which is unreachable here because configured<=0 routes to
+// the fallback first; were the gate reached with configured>=2 it would strand
+// on 'pending'). This pins that the operator-visible status cannot regress to
+// 'none' or 'pending' for the silently-hung-review case the PR fixes.
+func TestReviewStatusFor_Fallback_FailedOnly_NoStartedEntry(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	// Only a plan_review_failed entry — no plan_review_started (the parse
+	// failure fires before the started proxy is emitted), so configured<=0 and
+	// the fallback predicate owns the resolution.
+	seedReviewFailedAudit(fb, runID, "plan_review_failed",
+		"decomposition.sub_plans: file backend/internal/server/server.go is scoped by multiple slices (\"slice 1\", \"slice 2\"); keep all edits to one file in a single slice or re-slice along file boundaries",
+		"", "gating")
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "plan")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "failed" {
+		t.Errorf("Status = %q, want failed (any-failed->failed via reviewStatusFallback, not none/pending)", st.Status)
+	}
+	if len(st.Reviews) != 1 || st.Reviews[0].Verdict != "failed" {
+		t.Fatalf("Reviews = %+v, want one failed verdict", st.Reviews)
+	}
+	if !strings.Contains(st.Reviews[0].Reason, "scoped by multiple slices") ||
+		!strings.Contains(st.Reviews[0].Reason, "re-slice along file boundaries") {
+		t.Errorf("Reason = %q, want the validator's re-slice message surfaced to the operator", st.Reviews[0].Reason)
+	}
+}
+
 // TestReviewStatusFor_Complete_WinsOverFailed pins the precedence ordering
 // complete > failed: when a real verdict AND a failed entry both exist (e.g.
 // a multi-agent stage where one reviewer succeeded and another timed out),
