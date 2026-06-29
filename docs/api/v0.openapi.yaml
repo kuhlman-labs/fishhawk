@@ -936,6 +936,131 @@ components:
             with the condition name. Omitted when met.
           example: "clean_dual_approval: 1 of 2 reviewer verdicts received"
 
+    Campaign:
+      type: object
+      description: |
+        A campaign: the parent record of an epic-driven multi-issue run
+        (ADR-047 / #1437). It owns an ordered set of campaign items, one per
+        issue under the epic. State is a reduction of its items' states (see
+        `backend/internal/campaign/transition.go`).
+      required: [id, repo, epic_ref, state, created_at, updated_at]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        repo:
+          type: string
+          example: kuhlman-labs/fishhawk
+        epic_ref:
+          type: string
+          description: The epic the campaign decomposes, in `issue:N` form.
+          example: "issue:1439"
+        state:
+          type: string
+          enum: [pending, running, succeeded, failed, cancelled]
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CampaignItem:
+      type: object
+      description: |
+        One issue within a campaign. `depends_on` holds the sibling issue
+        refs this item waits on (the campaign DAG edges); `run_id` is the
+        nullable link to the run executing the item, absent until a run is
+        assigned.
+      required: [id, issue_ref, depends_on, state, created_at, updated_at]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        issue_ref:
+          type: string
+          example: "issue:1441"
+        depends_on:
+          type: array
+          items: { type: string }
+          description: Sibling issue refs this item depends on (possibly empty).
+        run_id:
+          $ref: '#/components/schemas/UUID'
+          description: |
+            The run executing this item. Omitted while the item is unlinked
+            (the pre-dispatch default).
+        state:
+          type: string
+          enum: [pending, blocked, running, succeeded, failed, cancelled]
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CampaignRollup:
+      type: object
+      description: |
+        The engine's readiness partition over a campaign's items
+        (`campaign.NextEligible`). Every slice holds issue refs; an item
+        appears in exactly one slice. Each field is always an array (never
+        null).
+      required: [eligible, blocked, running, done, failed, cancelled]
+      properties:
+        eligible:
+          type: array
+          items: { type: string }
+          description: No run yet and every dependency succeeded — ready to dispatch.
+        blocked:
+          type: array
+          items: { type: string }
+          description: No run yet, but at least one dependency is not yet done.
+        running:
+          type: array
+          items: { type: string }
+          description: Linked to a run that has not reached a terminal item state.
+        done:
+          type: array
+          items: { type: string }
+        failed:
+          type: array
+          items: { type: string }
+        cancelled:
+          type: array
+          items: { type: string }
+
+    CampaignNextAction:
+      type: object
+      description: |
+        The single next step for the operator-agent, distilled from the
+        rollup partition. PRECEDENCE is FAILED-wins and strict: a failed item
+        yields `attention` REGARDLESS of whether eligible items also exist;
+        only with zero failed items does an eligible item yield `start_run`.
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [attention, start_run, wait, complete]
+          description: |
+            `attention` — a failed item needs operator intervention
+            (retry/abandon); takes precedence over everything else.
+            `start_run` — the next eligible item is ready to dispatch.
+            `wait` — items are running or blocked; nothing to do yet.
+            `complete` — every item reached a terminal state.
+        issue_ref:
+          type: string
+          description: |
+            The item the action refers to — the first failed item for
+            `attention`, the first eligible item for `start_run`. Omitted for
+            `wait` / `complete`.
+        detail:
+          type: string
+          description: Human-readable explanation of the action.
+
+    CampaignStatus:
+      type: object
+      description: |
+        The campaign rollup surface: the campaign, its items, the engine's
+        readiness partition, and the distilled next action. This is the
+        surface the operator-agent polls to drive a campaign.
+      required: [campaign, items, rollup, next_action]
+      properties:
+        campaign: { $ref: '#/components/schemas/Campaign' }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/CampaignItem' }
+        rollup: { $ref: '#/components/schemas/CampaignRollup' }
+        next_action: { $ref: '#/components/schemas/CampaignNextAction' }
+
     WaivedConcern:
       type: object
       description: |
@@ -3793,6 +3918,186 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '503':
           description: Audit repository not configured on this instance.
+
+  # ---------------------------------------------------------------------
+  # Campaigns (ADR-047 / #1437)
+  # ---------------------------------------------------------------------
+  /v0/campaigns:
+    get:
+      operationId: listCampaigns
+      summary: List campaigns
+      description: |
+        Cursor-paginated list ordered by `created_at` descending. Optional
+        `repo` and `state` filters AND together.
+      tags: [campaigns]
+      parameters:
+        - { name: repo, in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string, enum: [pending, running, succeeded, failed, cancelled] } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: Page of campaigns.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Pagination'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: '#/components/schemas/Campaign' }
+        '400':
+          description: |
+            `validation_failed` — `limit` out of range or `state` not a known
+            value; `cursor_invalid` — opaque cursor failed to decode.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503':
+          description: "`campaign_repo_unconfigured` — no campaign repository wired."
+    post:
+      operationId: createCampaign
+      summary: Create a campaign from an epic ref
+      description: |
+        Assembles a campaign from an epic: queries the epic's child issues
+        and their `depends_on` edges via the work-management provider,
+        wave-orders them with the campaign DAG engine, and persists the
+        campaign + its items.
+
+        This is a runless create with no run row, so it resolves the repo's
+        GitHub App installation directly (`GET /repos/{owner}/{repo}/installation`)
+        — the same path `POST /v0/runs` uses — which the GitHub provider needs
+        to query the epic's children. A repo the App is not installed on fails
+        closed with `422 repo_not_installed`.
+
+        This endpoint implements **no request idempotency**: the campaigns
+        table has no idempotency_key column and the repository exposes no
+        dedup lookup, so an `Idempotency-Key` header — if sent — is accepted
+        but NOT enforced; every call mints a distinct campaign. Real
+        idempotency (an `idempotency_key` column + repo lookup + migration) is
+        a deferred follow-up.
+      tags: [campaigns]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [repo, epic_ref]
+              properties:
+                repo:
+                  type: string
+                  example: kuhlman-labs/fishhawk
+                epic_ref:
+                  type: string
+                  description: The epic to decompose, in `issue:N` form.
+                  example: "issue:1439"
+      responses:
+        '201':
+          description: Campaign created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Campaign' }
+        '400':
+          description: |
+            `validation_failed` — `repo` not in owner/name form, `epic_ref`
+            missing, body malformed / unknown field, or a dependency cycle
+            among the epic's children.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: "`insufficient_scope` — bearer token missing `write:campaigns`."
+        '422':
+          description: |
+            `repo_not_installed` — the GitHub App is not installed on the
+            target repo; `campaign_dangling_dependency` — a child's
+            `depends_on` targets an issue that is not a fellow child of the
+            epic (assembly fails closed rather than dropping the edge).
+        '501':
+          description: |
+            `provider_unimplemented` — the conventions name an unregistered
+            provider; `epic_children_unsupported` — the provider cannot query
+            epic children.
+        '502':
+          description: |
+            `installation_resolution_failed` — a transient failure resolving
+            the App installation; `epic_children_query_failed` — the provider
+            could not query the epic's children.
+        '503':
+          description: "`campaign_repo_unconfigured` — no campaign repository wired."
+
+  /v0/campaigns/{campaign_id}:
+    get:
+      operationId: getCampaign
+      summary: Get a campaign
+      tags: [campaigns]
+      parameters:
+        - { name: campaign_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: The campaign.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Campaign' }
+        '400':
+          description: "`validation_failed` — `campaign_id` is not a valid UUID."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: "`campaign_not_found` — no campaign with that id."
+        '503':
+          description: "`campaign_repo_unconfigured` — no campaign repository wired."
+
+  /v0/campaigns/{campaign_id}/items:
+    get:
+      operationId: listCampaignItems
+      summary: List a campaign's items
+      tags: [campaigns]
+      parameters:
+        - { name: campaign_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: The campaign's items, in insertion order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/CampaignItem' }
+        '400':
+          description: "`validation_failed` — `campaign_id` is not a valid UUID."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: "`campaign_not_found` — no campaign with that id."
+        '503':
+          description: "`campaign_repo_unconfigured` — no campaign repository wired."
+
+  /v0/campaigns/{campaign_id}/status:
+    get:
+      operationId: getCampaignStatus
+      summary: Get a campaign's rollup status + next action
+      description: |
+        The campaign, its items, the engine's readiness rollup, and the
+        distilled `next_action`. This is the surface the operator-agent polls
+        to drive a campaign. `next_action` precedence is FAILED-wins: a failed
+        item yields `attention` regardless of whether eligible items exist.
+      tags: [campaigns]
+      parameters:
+        - { name: campaign_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: Campaign rollup status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CampaignStatus' }
+        '400':
+          description: "`validation_failed` — `campaign_id` is not a valid UUID."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: "`campaign_not_found` — no campaign with that id."
+        '503':
+          description: "`campaign_repo_unconfigured` — no campaign repository wired."
 
   # ---------------------------------------------------------------------
   # Work-item filing
@@ -6985,6 +7290,8 @@ tags:
     description: Append-only audit log read paths.
   - name: work-items
     description: Provider-agnostic work-item filing via per-repo conventions.
+  - name: campaigns
+    description: Epic-driven multi-issue campaigns and their rollup status.
   - name: runner
     description: Endpoints called by the fishhawk/runner GitHub Action.
   - name: webhooks
