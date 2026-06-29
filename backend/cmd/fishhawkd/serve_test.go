@@ -11,8 +11,12 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
+	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 )
 
@@ -349,6 +353,69 @@ func TestNewChildCompletionSweeper_WiresDispatchBackstop(t *testing.T) {
 	}
 	if sw.Integrate == nil {
 		t.Error("sweeper Integrate adapter is nil")
+	}
+}
+
+// TestCampaignDriverStartDecision is the binding-condition serve-level test
+// (E25.5 / #1444): the fail-closed switch does NOT construct/start the ticker
+// when the flag is false, and skips with a reason when a required dependency
+// is unwired. Each branch of campaignDriverStartDecision is asserted (mode a:
+// DISABLED in serve.go).
+func TestCampaignDriverStartDecision(t *testing.T) {
+	wired := server.Config{
+		CampaignRepo: campaign.BaseFake{},
+		RunRepo:      runpkg.BaseFake{},
+		AuditRepo:    audit.BaseFake{},
+		GitHub:       &githubclient.Client{},
+	}
+
+	// (a) DISABLED: the flag is false → the ticker is NOT started and there is
+	// no warn reason (a flag-off skip is silent, not a misconfiguration).
+	if start, reason := campaignDriverStartDecision(false, wired); start || reason != "" {
+		t.Fatalf("flag-off: start=%v reason=%q; want false + empty (ticker must NOT be constructed/started)", start, reason)
+	}
+
+	// Enabled + fully wired → started, no reason.
+	if start, reason := campaignDriverStartDecision(true, wired); !start || reason != "" {
+		t.Fatalf("wired: start=%v reason=%q; want true + empty", start, reason)
+	}
+
+	// Enabled but a required repo missing → fail-closed skip with a reason.
+	missingRepo := wired
+	missingRepo.CampaignRepo = nil
+	if start, reason := campaignDriverStartDecision(true, missingRepo); start || reason == "" {
+		t.Fatalf("missing campaign repo: start=%v reason=%q; want false + a reason", start, reason)
+	}
+
+	// Enabled but the GitHub client is missing → fail-closed skip (the
+	// run-starter needs it to resolve the workflow spec the campaign lacks).
+	missingGitHub := wired
+	missingGitHub.GitHub = nil
+	if start, reason := campaignDriverStartDecision(true, missingGitHub); start || reason == "" {
+		t.Fatalf("missing github: start=%v reason=%q; want false + a reason", start, reason)
+	}
+}
+
+// TestNewCampaignDriver_WiresDependencies asserts the constructor binds every
+// required dependency (a nil Starter/Audit would make Run() refuse to start).
+func TestNewCampaignDriver_WiresDependencies(t *testing.T) {
+	cfg := server.Config{
+		Addr:         "127.0.0.1:0",
+		CampaignRepo: campaign.BaseFake{},
+		RunRepo:      runpkg.BaseFake{},
+		AuditRepo:    audit.BaseFake{},
+		GitHub:       &githubclient.Client{},
+	}
+	srv := server.New(cfg)
+	tk := newCampaignDriver(cfg, srv, slog.Default(), time.Minute, "feature_change", "")
+	if tk == nil {
+		t.Fatal("newCampaignDriver returned nil")
+	}
+	if tk.Campaigns == nil || tk.Runs == nil || tk.Starter == nil || tk.Audit == nil {
+		t.Fatalf("ticker has a nil required dependency: %+v", tk)
+	}
+	if tk.Interval != time.Minute {
+		t.Errorf("interval = %v, want 1m", tk.Interval)
 	}
 }
 

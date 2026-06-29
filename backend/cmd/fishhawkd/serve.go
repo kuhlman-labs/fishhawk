@@ -27,6 +27,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/campaigndriver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/childcompletion"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
@@ -395,6 +396,18 @@ func runServe(args []string, logSink io.Writer) int {
 	childCompletionInterval := fs.Duration("child-completion-interval",
 		60*time.Second,
 		"child-completion sweeper scan interval; 60s is the upper bound on parent latency after the last child terminates")
+	enableCampaignDriver := fs.Bool("enable-campaign-driver",
+		envOr("FISHHAWKD_ENABLE_CAMPAIGN_DRIVER", "false") == "true",
+		"start the campaign-driver ticker (E25.5 / #1444 / ADR-047 Track C); mechanically advances each running campaign — starts runs for dependency-eligible issues and settles items when their runs reach terminal. Off by default to match the other tickers' dev-loop posture.")
+	campaignDriverInterval := fs.Duration("campaign-driver-interval",
+		campaigndriver.DefaultInterval,
+		"campaign-driver scan interval; 60s is the upper bound on campaign-advancement latency after a run terminates")
+	campaignDriverWorkflowID := fs.String("campaign-driver-workflow-id",
+		envOr("FISHHAWKD_CAMPAIGN_DRIVER_WORKFLOW_ID", "feature_change"),
+		"workflow id the campaign driver starts for each eligible campaign issue. A campaign carries no workflow context (E25.2), so the driver fetches this workflow from the repo's spec at --campaign-driver-workflow-ref.")
+	campaignDriverWorkflowRef := fs.String("campaign-driver-workflow-ref",
+		envOr("FISHHAWKD_CAMPAIGN_DRIVER_WORKFLOW_REF", ""),
+		"git ref the campaign driver fetches the workflow spec at (empty = the repo's default branch). The fetched blob SHA becomes each started run's workflow_sha.")
 	enableInvariantMonitor := fs.Bool("enable-invariant-monitor",
 		envOr("FISHHAWKD_ENABLE_INVARIANT_MONITOR", "false") == "true",
 		"start the self-consistency invariant monitor (#764); periodically auto-reconciles the safe {all stages terminal, run non-terminal} class and surfaces (audit + WARN log) the unrecoverable {review awaiting_approval, null pull_request_url on a push-and-open-pr run} class. Off by default to match the other tickers' dev-loop posture.")
@@ -1200,6 +1213,29 @@ func runServe(args []string, logSink io.Writer) int {
 		}
 	}
 
+	// Campaign-driver ticker (E25.5 / #1444 / ADR-047 Track C). Mechanically
+	// advances each running campaign: starts runs for dependency-eligible
+	// issues (bounded by a concurrency cap) and settles items when their runs
+	// reach terminal, re-deriving the campaign state. Off by default to match
+	// the other tickers' dev-loop posture. The fail-closed switch refuses to
+	// start when a required dependency is unwired (the started runs are minted
+	// through srv.StartRunForCampaignIssue, which needs the GitHub client to
+	// resolve the workflow spec). MECHANICAL advancement only — started runs
+	// park at their gates for the operator-agent until E25.6/E25.7 land.
+	if start, skipReason := campaignDriverStartDecision(*enableCampaignDriver, cfg); start {
+		ticker := newCampaignDriver(cfg, srv, logger, *campaignDriverInterval, *campaignDriverWorkflowID, *campaignDriverWorkflowRef)
+		go func() {
+			if err := ticker.Run(ctx); err != nil {
+				logger.Error("campaign driver exited with error", slog.String("error", err.Error()))
+			}
+		}()
+		logger.Info("campaign driver started",
+			slog.Duration("interval", *campaignDriverInterval),
+			slog.String("workflow_id", *campaignDriverWorkflowID))
+	} else if *enableCampaignDriver {
+		logger.Warn(skipReason)
+	}
+
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Start() }()
 
@@ -1384,6 +1420,58 @@ func newChildCompletionSweeper(cfg server.Config, logger *slog.Logger, interval 
 		Advance:   adapter,
 		Integrate: adapter,
 		Dispatch:  adapter,
+		Logger:    logger,
+		Interval:  interval,
+	}
+}
+
+// campaignRunStarter adapts *server.Server to campaigndriver.RunStarter: it
+// starts a run for an eligible campaign issue through
+// Server.StartRunForCampaignIssue (which resolves the workflow spec and routes
+// through CreateRunForTrigger). Tiny by design — the driver defines the
+// interface so it never imports server, and the run-creation work lives in the
+// server package next to handleCreateRun.
+type campaignRunStarter struct {
+	srv         *server.Server
+	workflowID  string
+	workflowRef string
+}
+
+func (a campaignRunStarter) StartCampaignRun(ctx context.Context, item *campaign.Item, c *campaign.Campaign) (*runpkg.Run, error) {
+	return a.srv.StartRunForCampaignIssue(ctx, c.Repo, item.IssueRef, a.workflowID, a.workflowRef)
+}
+
+// campaignDriverStartDecision reports whether the campaign-driver ticker
+// should start, and a human reason when it should not. Extracted from
+// runServe so the fail-closed gating is unit-testable (serve_test.go): the
+// flag-off case must NOT construct/start the ticker, and a missing required
+// dependency must be a logged skip rather than a nil-deref at tick time. The
+// driver needs the campaign/run/audit repos (it advances campaigns) plus the
+// GitHub client (the run-starter resolves the workflow spec the campaign does
+// not carry).
+func campaignDriverStartDecision(enabled bool, cfg server.Config) (start bool, skipReason string) {
+	if !enabled {
+		return false, ""
+	}
+	switch {
+	case cfg.CampaignRepo == nil || cfg.RunRepo == nil || cfg.AuditRepo == nil:
+		return false, "--enable-campaign-driver set but CampaignRepo, RunRepo, or AuditRepo unconfigured; ticker not started"
+	case cfg.GitHub == nil:
+		return false, "--enable-campaign-driver set but GitHub client unconfigured (campaigns carry no inline spec to start runs from); ticker not started"
+	default:
+		return true, ""
+	}
+}
+
+// newCampaignDriver builds the campaign-driver ticker from cfg + the server
+// (the run-starter adapter binds to it). Extracted from runServe so the wiring
+// is unit-testable. Callers must gate on campaignDriverStartDecision first.
+func newCampaignDriver(cfg server.Config, srv *server.Server, logger *slog.Logger, interval time.Duration, workflowID, workflowRef string) *campaigndriver.Ticker {
+	return &campaigndriver.Ticker{
+		Campaigns: cfg.CampaignRepo,
+		Runs:      cfg.RunRepo,
+		Starter:   campaignRunStarter{srv: srv, workflowID: workflowID, workflowRef: workflowRef},
+		Audit:     cfg.AuditRepo,
 		Logger:    logger,
 		Interval:  interval,
 	}
