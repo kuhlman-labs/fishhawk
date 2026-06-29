@@ -514,7 +514,7 @@ func TestNextActions_DeployStage(t *testing.T) {
 		wantState   string
 		wantAction  string // first action
 	}{
-		{"awaiting_deploy_approval -> approve", "awaiting_deploy_approval", "deploy_gate_parked", "fishhawk_approve_plan"},
+		{"awaiting_deploy_approval -> approve", "awaiting_deploy_approval", "deploy_gate_parked", "fishhawk_approve_deploy"},
 		{"awaiting_deployment -> poll", "awaiting_deployment", "deploy_in_flight", "fishhawk_get_run_status"},
 		{"defensive pending -> poll", "pending", "deploy_initializing", "fishhawk_get_run_status"},
 		{"defensive running -> poll", "running", "deploy_in_flight", "fishhawk_get_run_status"},
@@ -542,12 +542,28 @@ func TestNextActions_DeployStage(t *testing.T) {
 				t.Errorf("actions[0] = %q, want %q (full: %v)", na.Actions[0].Action, tc.wantAction, actionNames(na))
 			}
 			// The approve action targets the run and consumes an approval slot.
-			if tc.wantAction == "fishhawk_approve_plan" {
+			if tc.wantAction == "fishhawk_approve_deploy" {
 				if na.Actions[0].Params["run_id"] != run.ID {
 					t.Errorf("approve params = %v, want run_id=%s", na.Actions[0].Params, run.ID)
 				}
 				if na.Actions[0].Consumes != consumesApprovalSlot {
 					t.Errorf("approve consumes = %q, want %q", na.Actions[0].Consumes, consumesApprovalSlot)
+				}
+				// The deploy gate must surface the required environment and the
+				// write:deploy scope in the precondition, and the deploy approve
+				// arm must offer a reject counterpart (E23.15 / #1432).
+				if _, ok := na.Actions[0].Params["environment"]; !ok {
+					t.Errorf("approve_deploy params missing 'environment' key: %v", na.Actions[0].Params)
+				}
+				if !strings.Contains(na.Actions[0].Precondition, "--environment") {
+					t.Errorf("approve_deploy precondition should mention --environment; got %q", na.Actions[0].Precondition)
+				}
+				if !strings.Contains(na.Actions[0].Precondition, "write:deploy") {
+					t.Errorf("approve_deploy precondition should mention write:deploy; got %q", na.Actions[0].Precondition)
+				}
+				reject := findAction(t, na, "fishhawk_reject_deploy")
+				if reject.Params["run_id"] != run.ID {
+					t.Errorf("reject_deploy params = %v, want run_id=%s", reject.Params, run.ID)
 				}
 			}
 			// Every action carries the structured fields.

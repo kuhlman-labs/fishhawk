@@ -373,18 +373,31 @@ func deployStageNextActions(run *Run, deploy *Stage) *NextActions {
 	switch deploy.State {
 	case "awaiting_deploy_approval":
 		// The pre-execution approval gate (the operator judgment point). The
-		// deploy gate is approved via the generic approval verb — the approval
-		// handler special-cases stage.Type==deploy (checkDeployPreflight); there
-		// is no separate fishhawk_approve_deploy tool.
+		// deploy gate is approved via fishhawk_approve_deploy (E23.15 / #1432),
+		// which resolves the type=deploy stage and composes the required
+		// --environment=<env> (and optional --override-freeze) into the
+		// approval comment the backend deploy pre-flight parses. The older
+		// fishhawk_approve_plan hint failed here: it resolves a type=plan stage
+		// first and errors on a plan-less release run before reaching the
+		// approval endpoint. fishhawk_reject_deploy is the reject counterpart.
 		return &NextActions{
 			State: "deploy_gate_parked",
-			Actions: []SuggestedAction{{
-				Action:       "fishhawk_approve_plan",
-				Params:       map[string]string{"run_id": run.ID},
-				Precondition: "the deploy stage is parked at its pre-execution approval gate (awaiting_deploy_approval); confirm the corresponding change merged and the pre-flight deploy constraints (allowed_environments, change_freeze) hold before approving",
-				Consumes:     consumesApprovalSlot,
-				Reason:       "approve the deploy INTENT (ADR-038: a deploy stage's effect is the side effect, so the gate is pre-execution) — approval triggers the external pipeline; a production deploy pages the human regardless of runner kind",
-			}},
+			Actions: []SuggestedAction{
+				{
+					Action:       "fishhawk_approve_deploy",
+					Params:       map[string]string{"run_id": run.ID, "environment": "<one of the deploy stage's allowed_environments>"},
+					Precondition: "the deploy stage is parked at its pre-execution approval gate (awaiting_deploy_approval); requires an operator token with write:deploy (ADR-038/#1390) and a required environment that is one of the deploy stage's allowed_environments (composed into the approval comment as --environment=<env>); pass override_freeze=true when the stage declares change_freeze. Confirm the corresponding change merged and the pre-flight deploy constraints (allowed_environments, change_freeze, required_upstream) hold before approving",
+					Consumes:     consumesApprovalSlot,
+					Reason:       "approve the deploy INTENT (ADR-038: a deploy stage's effect is the side effect, so the gate is pre-execution) — approval triggers the external pipeline; a production deploy pages the human regardless of runner kind",
+				},
+				{
+					Action:       "fishhawk_reject_deploy",
+					Params:       map[string]string{"run_id": run.ID},
+					Precondition: "the deploy stage is parked at its pre-execution approval gate (awaiting_deploy_approval) and the deploy should NOT proceed; reject routes through advanceStage so it needs neither write:deploy nor an environment",
+					Consumes:     consumesApprovalSlot,
+					Reason:       "reject the deploy INTENT, failing the deploy gate without triggering the external pipeline",
+				},
+			},
 		}
 	case "awaiting_deployment":
 		// Approved and triggered: the backend deployreconciler is polling the

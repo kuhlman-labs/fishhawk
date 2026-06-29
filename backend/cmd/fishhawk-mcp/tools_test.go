@@ -1318,7 +1318,7 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	const minDescriptionLen = 80
 	// The registered tool set is the fishhawk_* tools swept in #778. Bump
 	// this and give the new tool a conformant description when adding one.
-	const wantToolCount = 31
+	const wantToolCount = 33
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -4810,6 +4810,292 @@ func TestRejectPlan_NoReason_PassesEmptyComment(t *testing.T) {
 	}
 	if fb.approvalsBody.Comment != "" {
 		t.Errorf("comment = %q, want empty", fb.approvalsBody.Comment)
+	}
+}
+
+// --- fishhawk_approve_deploy / fishhawk_reject_deploy (E23.15 / #1432) ---
+
+// seedDeployStage installs a deploy stage (plus an upstream implement
+// stage so the run looks plausible) on the fakeBackend's stages-for-run
+// map so resolveDeployStage finds it. Returns the deploy stage id.
+func seedDeployStage(fb *fakeBackend, runID uuid.UUID) uuid.UUID {
+	stageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Type: "implement", State: "succeeded", Sequence: 0},
+		{ID: stageID.String(), RunID: runID.String(), Type: "deploy", State: "awaiting_deploy_approval", Sequence: 1},
+	}
+	return stageID
+}
+
+// TestApproveDeploy_HappyPath_ComposesEnvironmentIntoComment pins the core
+// seam (#1432): environment is threaded to the backend only through the
+// approval comment as --environment=<env>, which the deploy pre-flight
+// parses. No --override-freeze unless OverrideFreeze is set.
+func TestApproveDeploy_HappyPath_ComposesEnvironmentIntoComment(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	stageID := seedDeployStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	_, out, err := r.approveDeploy(context.Background(), nil, ApproveDeployInput{
+		RunID:       runID.String(),
+		Environment: "production",
+		Reason:      "change merged, CI green",
+	})
+	if err != nil {
+		t.Fatalf("approveDeploy: %v", err)
+	}
+	if fb.approvalsBody.Decision != "approve" {
+		t.Errorf("decision = %q, want approve", fb.approvalsBody.Decision)
+	}
+	if !strings.Contains(fb.approvalsBody.Comment, "--environment=production") {
+		t.Errorf("comment = %q, want it to contain --environment=production", fb.approvalsBody.Comment)
+	}
+	// --override-freeze must NOT appear when OverrideFreeze is unset.
+	if strings.Contains(fb.approvalsBody.Comment, "--override-freeze") {
+		t.Errorf("comment = %q, must NOT contain --override-freeze when OverrideFreeze is unset", fb.approvalsBody.Comment)
+	}
+	if !strings.Contains(fb.approvalsBody.Comment, "change merged, CI green") {
+		t.Errorf("comment = %q, want it to carry the trimmed reason", fb.approvalsBody.Comment)
+	}
+	if fb.approvalsBody.ApproverGithubLogin != "kuhlman-labs" {
+		t.Errorf("approver_github_login = %q, want kuhlman-labs", fb.approvalsBody.ApproverGithubLogin)
+	}
+	if out.StageID != stageID.String() {
+		t.Errorf("resolved StageID = %q, want %s", out.StageID, stageID.String())
+	}
+	if fb.approvalsCalledByID[stageID] != 1 {
+		t.Errorf("approvals call count = %d, want 1", fb.approvalsCalledByID[stageID])
+	}
+}
+
+// TestApproveDeploy_OverrideFreeze_AppendsFlag asserts the override_freeze
+// flag composes --override-freeze into the comment the backend's
+// commentHasFlag matches (the binding-condition-1 wiring: the backend
+// parses --override-freeze the same whitespace-delimited-token way as
+// --environment=).
+func TestApproveDeploy_OverrideFreeze_AppendsFlag(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedDeployStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	_, _, err := r.approveDeploy(context.Background(), nil, ApproveDeployInput{
+		RunID:          runID.String(),
+		Environment:    "production",
+		OverrideFreeze: true,
+	})
+	if err != nil {
+		t.Fatalf("approveDeploy: %v", err)
+	}
+	if !strings.Contains(fb.approvalsBody.Comment, "--override-freeze") {
+		t.Errorf("comment = %q, want it to contain --override-freeze when OverrideFreeze is set", fb.approvalsBody.Comment)
+	}
+	// The flag must be a standalone, whitespace-delimited token (the
+	// backend's commentHasFlag does an exact token match, not substring).
+	var sawToken bool
+	for _, tok := range strings.Fields(fb.approvalsBody.Comment) {
+		if tok == "--override-freeze" {
+			sawToken = true
+			break
+		}
+	}
+	if !sawToken {
+		t.Errorf("comment = %q, --override-freeze must be a standalone whitespace-delimited token", fb.approvalsBody.Comment)
+	}
+}
+
+// TestApproveDeploy_MissingEnvironment_FailsLocally pins the local
+// validation guard: an empty environment fails before any HTTP call.
+func TestApproveDeploy_MissingEnvironment_FailsLocally(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedDeployStage(fb, runID)
+
+	_, _, err := r.approveDeploy(context.Background(), nil, ApproveDeployInput{
+		RunID:       runID.String(),
+		Environment: "   ", // whitespace-only is still empty
+	})
+	if err == nil {
+		t.Fatal("expected local validation error for empty environment")
+	}
+	if !strings.Contains(err.Error(), "environment is required") {
+		t.Errorf("err = %v, want 'environment is required'", err)
+	}
+	// No stages list and no approvals call should have fired.
+	if len(fb.approvalsCalledByID) != 0 {
+		t.Errorf("approvals called %d times after local validation failure, want 0", len(fb.approvalsCalledByID))
+	}
+	if len(fb.stagesCalledByID) != 0 {
+		t.Errorf("list-stages called %d times after local validation failure, want 0", len(fb.stagesCalledByID))
+	}
+}
+
+// TestApproveDeploy_EnvironmentNotAllowed_SurfacesAsToolError pins that a
+// backend deploy_environment_not_allowed 422 propagates as a typed,
+// operator-readable tool error.
+func TestApproveDeploy_EnvironmentNotAllowed_SurfacesAsToolError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.approvalsStatus = http.StatusUnprocessableEntity
+	fb.approvalsErrBody = `{"error":{"code":"deploy_environment_not_allowed","message":"requested deploy environment \"staging\" is not in the deploy stage's allowed_environments [production]"}}`
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedDeployStage(fb, runID)
+	withFakeGhMissing(t)
+
+	_, _, err := r.approveDeploy(context.Background(), nil, ApproveDeployInput{
+		RunID:       runID.String(),
+		Environment: "staging",
+	})
+	if err == nil {
+		t.Fatal("expected error from backend 422 deploy_environment_not_allowed")
+	}
+	if !strings.Contains(err.Error(), "deploy_environment_not_allowed") {
+		t.Errorf("err = %v, want deploy_environment_not_allowed code", err)
+	}
+}
+
+// TestApproveDeploy_WriteDeployScope403_SurfacesAsToolError pins that the
+// write:deploy 403 scope refusal (ADR-038/#1390) propagates as a tool
+// error rather than being swallowed.
+func TestApproveDeploy_WriteDeployScope403_SurfacesAsToolError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.approvalsStatus = http.StatusForbidden
+	fb.approvalsErrBody = `{"error":{"code":"insufficient_scope","message":"deploy approval requires the write:deploy scope"}}`
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedDeployStage(fb, runID)
+	withFakeGhMissing(t)
+
+	_, _, err := r.approveDeploy(context.Background(), nil, ApproveDeployInput{
+		RunID:       runID.String(),
+		Environment: "production",
+	})
+	if err == nil {
+		t.Fatal("expected error from backend 403 write:deploy")
+	}
+	if !strings.Contains(err.Error(), "write:deploy") {
+		t.Errorf("err = %v, want it to surface the write:deploy scope refusal", err)
+	}
+}
+
+// TestApproveDeploy_NoDeployStage_FailsWithCleanError pins the typed
+// missing-deploy-stage error from resolveDeployStage: a plan-only run
+// (no deploy stage) surfaces an operator-readable message.
+func TestApproveDeploy_NoDeployStage_FailsWithCleanError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	// Seed only plan + implement — no deploy stage.
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: runID.String(), Type: "implement", State: "succeeded"},
+	}
+
+	_, _, err := r.approveDeploy(context.Background(), nil, ApproveDeployInput{
+		RunID:       runID.String(),
+		Environment: "production",
+	})
+	if err == nil {
+		t.Fatal("expected error for run without deploy stage")
+	}
+	if !strings.Contains(err.Error(), "no deploy stage") {
+		t.Errorf("err = %v, want it to mention 'no deploy stage'", err)
+	}
+	if len(fb.approvalsCalledByID) != 0 {
+		t.Errorf("approvals called %d times after resolver failure, want 0", len(fb.approvalsCalledByID))
+	}
+}
+
+// TestRejectDeploy_HappyPath_NoEnvironmentInComment pins that a deploy
+// reject posts decision=reject with no --environment in the comment — it
+// routes through advanceStage, not the approve-only deploy pre-flight, so
+// it needs neither write:deploy nor an environment.
+func TestRejectDeploy_HappyPath_NoEnvironmentInComment(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	stageID := seedDeployStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	_, out, err := r.rejectDeploy(context.Background(), nil, RejectDeployInput{
+		RunID:  runID.String(),
+		Reason: "deploy window closed",
+	})
+	if err != nil {
+		t.Fatalf("rejectDeploy: %v", err)
+	}
+	if fb.approvalsBody.Decision != "reject" {
+		t.Errorf("decision = %q, want reject", fb.approvalsBody.Decision)
+	}
+	if strings.Contains(fb.approvalsBody.Comment, "--environment") {
+		t.Errorf("comment = %q, must NOT contain --environment on a reject", fb.approvalsBody.Comment)
+	}
+	if fb.approvalsBody.Comment != "deploy window closed" {
+		t.Errorf("comment = %q, want the raw reason", fb.approvalsBody.Comment)
+	}
+	if out.StageID != stageID.String() {
+		t.Errorf("resolved StageID = %q, want %s", out.StageID, stageID.String())
+	}
+}
+
+// TestRejectDeploy_NoDeployStage_FailsWithCleanError pins the typed
+// missing-deploy-stage error on the reject path too.
+func TestRejectDeploy_NoDeployStage_FailsWithCleanError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+
+	_, _, err := r.rejectDeploy(context.Background(), nil, RejectDeployInput{RunID: runID.String()})
+	if err == nil {
+		t.Fatal("expected error for run without deploy stage")
+	}
+	if !strings.Contains(err.Error(), "no deploy stage") {
+		t.Errorf("err = %v, want it to mention 'no deploy stage'", err)
+	}
+}
+
+// TestResolveDeployStage_PicksDeployType pins the resolver returns the
+// type=deploy stage out of a mixed stage list.
+func TestResolveDeployStage_PicksDeployType(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	stageID := seedDeployStage(fb, runID)
+
+	got, err := r.resolveDeployStage(context.Background(), runID.String())
+	if err != nil {
+		t.Fatalf("resolveDeployStage: %v", err)
+	}
+	if got.Type != "deploy" {
+		t.Errorf("resolved stage type = %q, want deploy", got.Type)
+	}
+	if got.ID != stageID.String() {
+		t.Errorf("resolved stage id = %q, want %s", got.ID, stageID.String())
+	}
+}
+
+// TestResolveDeployStage_InvalidUUID_FailsLocally pins the fast-path
+// UUID parse on the input before the HTTP hop.
+func TestResolveDeployStage_InvalidUUID_FailsLocally(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, err := r.resolveDeployStage(context.Background(), "not-a-uuid")
+	if err == nil {
+		t.Fatal("expected validation error for bad UUID")
+	}
+	if !strings.Contains(err.Error(), "not a valid UUID") {
+		t.Errorf("err = %v, want UUID parse error", err)
+	}
+	if len(fb.stagesCalledByID) != 0 {
+		t.Errorf("list-stages called %d times, want 0", len(fb.stagesCalledByID))
 	}
 }
 

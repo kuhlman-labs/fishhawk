@@ -59,6 +59,8 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerDecideScopeCompleteness(srv, resolver)
 	registerApprovePlan(srv, resolver)
 	registerRejectPlan(srv, resolver)
+	registerApproveDeploy(srv, resolver)
+	registerRejectDeploy(srv, resolver)
 	registerRevisePlan(srv, resolver)
 	registerListRuns(srv, resolver)
 	registerRunStage(srv, resolver)
@@ -2175,6 +2177,61 @@ type RejectPlanOutput struct {
 	PriorDecision       string `json:"prior_decision,omitempty" jsonschema:"on a duplicate submission, the existing approval row's decision (approve|reject) — the decision that actually stands"`
 }
 
+// ApproveDeployInput is the fishhawk_approve_deploy tool's input
+// schema (E23.15 / #1432). Takes a run id; the resolver finds the
+// type=deploy stage internally, mirroring fishhawk_approve_plan.
+//
+// The deploy target environment is conveyed to the backend ONLY
+// through the approval comment (the backend's parseEnvironmentFlag
+// scans whitespace-delimited tokens for --environment=<env>; there is
+// no structured environment field on the approval request body), so
+// the handler composes --environment=<env> into the comment.
+type ApproveDeployInput struct {
+	RunID string `json:"run_id" jsonschema:"the Fishhawk run UUID whose deploy stage is being approved"`
+	// Environment is REQUIRED: the backend deploy pre-flight reads the
+	// target environment from a --environment=<env> token in the approval
+	// comment and 422s deploy_environment_not_allowed when it is absent or
+	// not one of the deploy stage's allowed_environments. The handler
+	// composes --environment=<environment> into the comment.
+	Environment string `json:"environment" jsonschema:"REQUIRED target deploy environment; must be one of the deploy stage's allowed_environments (read them from the stage spec). Composed into the approval comment as --environment=<env>, which the backend deploy pre-flight parses; an absent or disallowed value is rejected 422 deploy_environment_not_allowed"`
+	// OverrideFreeze appends --override-freeze to the comment. The backend
+	// only consults it when the deploy stage declares change_freeze (#1384);
+	// the token is a standalone, whitespace-delimited flag the backend's
+	// commentHasFlag matches exactly.
+	OverrideFreeze bool   `json:"override_freeze,omitempty" jsonschema:"when true, appends --override-freeze to the approval comment so the backend permits a deploy during an active change freeze. Only meaningful when the deploy stage declares change_freeze; absent it the backend 422s deploy_change_freeze_active"`
+	Reason         string `json:"reason,omitempty" jsonschema:"optional operator rationale appended to the approval comment after the --environment / --override-freeze flags; recorded on the approval row"`
+}
+
+// ApproveDeployOutput surfaces the post-approve Stage row plus the
+// resolved deploy-stage id (the caller passed a run id). Duplicate
+// labeling (#986) mirrors ApprovePlanOutput.
+type ApproveDeployOutput struct {
+	Stage   Stage  `json:"stage"`
+	StageID string `json:"stage_id" jsonschema:"the resolved deploy-stage UUID the approval was posted to"`
+	// Duplicate labeling (#986): set when this call was a no-op because the
+	// same subject already submitted a decision for this stage.
+	DuplicateSubmission bool   `json:"duplicate_submission,omitempty" jsonschema:"true when this submission was a no-op duplicate: the same subject already decided this stage, the prior decision stands, the stage state is unchanged, and NO gates re-ran and NO audit entries were emitted"`
+	PriorDecision       string `json:"prior_decision,omitempty" jsonschema:"on a duplicate submission, the existing approval row's decision (approve|reject) — the decision that actually stands"`
+}
+
+// RejectDeployInput mirrors RejectPlanInput for the deploy gate. A
+// deploy reject routes through the backend advanceStage path (NOT the
+// approve-only deploy pre-flight), so it needs neither write:deploy
+// scope nor an environment.
+type RejectDeployInput struct {
+	RunID  string `json:"run_id" jsonschema:"the Fishhawk run UUID whose deploy stage is being rejected"`
+	Reason string `json:"reason,omitempty" jsonschema:"reviewer rationale; recommended on rejects. Recorded on the approval row as 'comment'"`
+}
+
+// RejectDeployOutput mirrors RejectPlanOutput.
+type RejectDeployOutput struct {
+	Stage   Stage  `json:"stage"`
+	StageID string `json:"stage_id" jsonschema:"the resolved deploy-stage UUID the rejection was posted to"`
+	// Duplicate labeling (#986): see ApproveDeployOutput.
+	DuplicateSubmission bool   `json:"duplicate_submission,omitempty" jsonschema:"true when this submission was a no-op duplicate: the same subject already decided this stage, the prior decision stands, the stage state is unchanged, and NO gates re-ran and NO audit entries were emitted"`
+	PriorDecision       string `json:"prior_decision,omitempty" jsonschema:"on a duplicate submission, the existing approval row's decision (approve|reject) — the decision that actually stands"`
+}
+
 // registerApprovePlan wires the fishhawk_approve_plan tool (E22.4
 // / #393). Resolves the plan stage from the run id, then posts an
 // approve decision via the existing /v0/stages/{id}/approvals
@@ -2268,6 +2325,90 @@ Same resolver + error shapes as fishhawk_approve_plan.
 	}, resolver.rejectPlan)
 }
 
+// registerApproveDeploy wires the fishhawk_approve_deploy tool (E23.15
+// / #1432). The deploy-gate counterpart to fishhawk_approve_plan:
+// resolves the run's type=deploy stage and posts an approve decision
+// via the existing /v0/stages/{id}/approvals endpoint. A deploy stage's
+// gate is PRE-execution (ADR-038: its effect IS the side effect), so an
+// approve here triggers the external pipeline.
+//
+// Auth: write tool requiring an operator token with write:deploy
+// (ADR-038/#1390) — a runner-side fhm_* token surfaces 403.
+func registerApproveDeploy(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_approve_deploy",
+		Description: strings.TrimSpace(`
+Approve a run's deploy stage at its pre-execution approval gate, triggering
+the external deploy pipeline. Use this when a release run's deploy stage is
+parked at awaiting_deploy_approval (the next_actions deploy arm points here) —
+the deploy-gate counterpart to fishhawk_approve_plan, which fails on a
+plan-less release run.
+
+Takes a run id; the tool resolves the type=deploy stage internally by
+listing the run's stages. The deploy gate is PRE-execution (ADR-038: a
+deploy stage's effect is the side effect), so approving triggers the
+external pipeline — a production deploy pages the human regardless of
+runner kind.
+
+Inputs:
+  - run_id        — the run whose deploy stage to approve
+  - environment   — REQUIRED; must be one of the deploy stage's
+                    allowed_environments. Composed into the approval
+                    comment as --environment=<env>, which the backend
+                    deploy pre-flight parses
+  - override_freeze — optional; appends --override-freeze so a deploy
+                    during a spec-declared change_freeze is permitted
+  - reason        — optional operator rationale
+
+Auth: a write tool requiring an operator token with write:deploy
+(ADR-038/#1390); a runner-side fhm_* token surfaces 403.
+
+Common error shapes (surfaced as tool errors):
+  - local validation — environment is required; an empty value fails
+    before the HTTP hop
+  - "no deploy stage" — the run has no deploy stage (a feature_change
+    workflow, or a malformed run)
+  - 422 deploy_environment_not_allowed — the environment is absent or
+    not in allowed_environments
+  - 422 deploy_change_freeze_active — the stage declares change_freeze
+    and override_freeze was not set
+  - 422 deploy_upstream_not_satisfied — a required_upstream pre-flight
+    signal (ci_green / review_merged) is not satisfied
+  - 403 — the caller's token lacks write:deploy
+
+Duplicate labeling (#986, NOT an error — a 200): a re-submission by the
+same subject is a no-op carrying duplicate_submission=true and
+prior_decision; never read a duplicate as an effective approval.
+`),
+	}, resolver.approveDeploy)
+}
+
+// registerRejectDeploy wires the fishhawk_reject_deploy tool (E23.15 /
+// #1432). The reject counterpart to fishhawk_approve_deploy. A deploy
+// reject routes through the backend advanceStage path, NOT the
+// approve-only deploy pre-flight, so it needs neither write:deploy nor
+// an environment.
+func registerRejectDeploy(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_reject_deploy",
+		Description: strings.TrimSpace(`
+Reject a run's deploy stage, failing the deploy gate. Use this when a
+release run's deploy stage is parked at awaiting_deploy_approval and the
+deploy should NOT proceed — the reject counterpart to
+fishhawk_approve_deploy.
+
+Takes a run id; the tool resolves the type=deploy stage internally.
+Unlike approve, a deploy reject routes through the backend advanceStage
+path (not the pre-execution deploy pre-flight block), so it needs neither
+write:deploy scope nor an environment.
+
+The reason is recorded on the approval row as 'comment'. Reason is
+optional but recommended. Same resolver + "no deploy stage" error shape
+as fishhawk_approve_deploy.
+`),
+	}, resolver.rejectDeploy)
+}
+
 // approvePlan is the tool handler.
 func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, in ApprovePlanInput) (*mcp.CallToolResult, ApprovePlanOutput, error) {
 	planStage, err := r.resolvePlanStage(ctx, in.RunID)
@@ -2346,6 +2487,84 @@ func (r *runResolver) rejectPlan(ctx context.Context, _ *mcp.CallToolRequest, in
 	}, nil
 }
 
+// approveDeploy is the fishhawk_approve_deploy tool handler (E23.15 /
+// #1432). Resolves the deploy stage, composes the deploy environment
+// (and optional freeze override) into the approval comment the backend
+// pre-flight parses, and posts an approve decision.
+func (r *runResolver) approveDeploy(ctx context.Context, _ *mcp.CallToolRequest, in ApproveDeployInput) (*mcp.CallToolResult, ApproveDeployOutput, error) {
+	// Fail fast locally on the missing-environment case so the operator
+	// gets a clean tool error rather than a backend 422 round-trip. The
+	// backend re-validates (the comment may omit --environment for any
+	// reason), so this is a convenience, not the authority.
+	if strings.TrimSpace(in.Environment) == "" {
+		return nil, ApproveDeployOutput{}, fmt.Errorf("environment is required for a deploy approval — pass one of the deploy stage's allowed_environments (it is composed into the approval comment as --environment=<env>, which the backend deploy pre-flight parses)")
+	}
+	deployStage, err := r.resolveDeployStage(ctx, in.RunID)
+	if err != nil {
+		return nil, ApproveDeployOutput{}, err
+	}
+	stageID, err := uuid.Parse(deployStage.ID)
+	if err != nil {
+		return nil, ApproveDeployOutput{}, fmt.Errorf("resolved deploy stage has invalid id %q: %w", deployStage.ID, err)
+	}
+	// Compose the comment the backend deploy pre-flight parses: the
+	// --environment=<env> token (parseEnvironmentFlag) plus an optional
+	// standalone --override-freeze token (commentHasFlag), then the
+	// trimmed operator rationale. Order is deterministic so the flag
+	// tokens are always whitespace-delimited at the head.
+	comment := "--environment=" + strings.TrimSpace(in.Environment)
+	if in.OverrideFreeze {
+		comment += " --override-freeze"
+	}
+	if reason := strings.TrimSpace(in.Reason); reason != "" {
+		comment += " " + reason
+	}
+	// Resolve the operator's real GitHub login best-effort (#751); see
+	// approvePlan. Empty on gh failure, never fatal.
+	login, warn := resolveApproverGithubLogin()
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", comment, login, nil, nil, "")
+	if err != nil {
+		// The deploy pre-flight 422s (deploy_environment_not_allowed,
+		// deploy_change_freeze_active, deploy_upstream_not_satisfied) and the
+		// write:deploy 403 already carry operator-readable code+message via
+		// apiError.Error(); surface them with a stable wrap so the operator
+		// loop can match on the code.
+		return nil, ApproveDeployOutput{}, fmt.Errorf("submit deploy approval: %w", err)
+	}
+	return approvalSubmitResult(updated, warn), ApproveDeployOutput{
+		Stage:               updated.Stage,
+		StageID:             updated.ID,
+		DuplicateSubmission: updated.DuplicateSubmission,
+		PriorDecision:       updated.PriorDecision,
+	}, nil
+}
+
+// rejectDeploy is the fishhawk_reject_deploy tool handler (E23.15 /
+// #1432). Mirrors rejectPlan: a deploy reject routes through the
+// backend advanceStage path, so it needs no environment and no
+// write:deploy scope.
+func (r *runResolver) rejectDeploy(ctx context.Context, _ *mcp.CallToolRequest, in RejectDeployInput) (*mcp.CallToolResult, RejectDeployOutput, error) {
+	deployStage, err := r.resolveDeployStage(ctx, in.RunID)
+	if err != nil {
+		return nil, RejectDeployOutput{}, err
+	}
+	stageID, err := uuid.Parse(deployStage.ID)
+	if err != nil {
+		return nil, RejectDeployOutput{}, fmt.Errorf("resolved deploy stage has invalid id %q: %w", deployStage.ID, err)
+	}
+	login, warn := resolveApproverGithubLogin()
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, "")
+	if err != nil {
+		return nil, RejectDeployOutput{}, fmt.Errorf("submit deploy rejection: %w", err)
+	}
+	return approvalSubmitResult(updated, warn), RejectDeployOutput{
+		Stage:               updated.Stage,
+		StageID:             updated.ID,
+		DuplicateSubmission: updated.DuplicateSubmission,
+		PriorDecision:       updated.PriorDecision,
+	}, nil
+}
+
 // resolveApproverGithubLogin wraps resolveGitHubLoginViaGh for the
 // approve/reject tools (#751). It is strictly best-effort: any gh
 // failure (binary missing, unauthed, error) yields an empty login and
@@ -2412,6 +2631,34 @@ func (r *runResolver) resolvePlanStage(ctx context.Context, runIDStr string) (*S
 		}
 	}
 	return nil, fmt.Errorf("no plan stage on run %s; this run's workflow may not have a plan stage (e.g. routine_change)", runIDStr)
+}
+
+// resolveDeployStage walks the run's stages and returns the one with
+// type=deploy. The deploy analogue of resolvePlanStage, shared by
+// fishhawk_approve_deploy and fishhawk_reject_deploy (E23.15 / #1432)
+// so both surface a run id (not a stage id) and discover the deploy
+// stage server-side.
+//
+// Returns a typed error for the missing-deploy-stage case so a
+// plan-only run (a feature_change with no deploy stage) surfaces an
+// operator-readable message rather than a generic not-found. Local
+// UUID parse on the input is a fast-path that catches obvious typos
+// before the HTTP hop.
+func (r *runResolver) resolveDeployStage(ctx context.Context, runIDStr string) (*Stage, error) {
+	runID, err := uuid.Parse(runIDStr)
+	if err != nil {
+		return nil, fmt.Errorf("run_id %q is not a valid UUID: %w", runIDStr, err)
+	}
+	stages, err := r.api.ListRunStages(ctx, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list run stages: %w", err)
+	}
+	for i := range stages {
+		if stages[i].Type == "deploy" {
+			return &stages[i], nil
+		}
+	}
+	return nil, fmt.Errorf("no deploy stage on run %s; this run's workflow may not have a deploy stage", runIDStr)
 }
 
 // listRunsLimitDefault / listRunsLimitMax bound the
