@@ -118,7 +118,7 @@ func allKnobs() *spec.OperatorAgent {
 
 func evaluate(t *testing.T, ev *Evaluator, wf *spec.Workflow, runRow *run.Run) *Result {
 	t.Helper()
-	res, err := ev.Evaluate(context.Background(), runRow, wf)
+	res, err := ev.Evaluate(context.Background(), runRow, wf, nil)
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestEvaluate_NoBlock_FailClosed(t *testing.T) {
 		Concerns: &fakeConcerns{err: errors.New("must not be called")},
 		Audit:    &fakeAudit{err: errors.New("must not be called")},
 	}
-	res, err := ev.Evaluate(context.Background(), newRun(), testWorkflow(nil, nil))
+	res, err := ev.Evaluate(context.Background(), newRun(), testWorkflow(nil, nil), nil)
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
@@ -250,13 +250,132 @@ func TestEvaluate_GateOnlyBlock_NotPending_FailClosed(t *testing.T) {
 		Concerns: &fakeConcerns{},
 		Audit:    &fakeAudit{},
 	}
-	res, err := ev.Evaluate(context.Background(), newRun(), wf)
+	res, err := ev.Evaluate(context.Background(), newRun(), wf, nil)
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
 	}
 	if res != nil {
 		t.Fatalf("Result = %+v, want nil (the implement gate carries no block and the workflow level has none)", res)
 	}
+}
+
+// --- campaign-level override precedence (E25.12 / #1451) ---------------------
+
+// actionSet returns the set of delegated action names in a Result, so a
+// precedence test can assert WHICH block's knobs govern without depending on
+// per-knob met-ness.
+func actionSet(res *Result) map[string]bool {
+	got := make(map[string]bool, len(res.Actions))
+	for _, d := range res.Actions {
+		got[d.Action] = true
+	}
+	return got
+}
+
+// TestEvaluate_CampaignOverridePrecedence is the binding-condition assertion
+// (E25.12): the campaign-level operator_agent override is the OUTERMOST rung of
+// the resolution ladder — campaign > gate > workflow — and wins WHOLESALE
+// (knobs are never merged across levels, matching EffectiveOperatorAgent). It
+// also pins the unchanged-behavior contract: absent a campaign override, the
+// per-workflow contract (gate-over-workflow) is inherited byte-identically.
+//
+// Each level carries a DISTINGUISHABLE single page-event + knob fingerprint so
+// the asserted Result uniquely identifies which level governed:
+//   - workflow level: all five knobs + reviewer_reject
+//   - gate level:     only may_waive   + plan_rejection
+//   - campaign level: only may_retry   + requirement_arbitration
+func TestEvaluate_CampaignOverridePrecedence(t *testing.T) {
+	gateBlock := &spec.OperatorAgent{
+		MayWaive:      spec.ConditionSoloLow,
+		MustPageHuman: []string{spec.PageEventPlanRejection},
+	}
+	campaignBlock := &spec.OperatorAgent{
+		MayRetry:      spec.ConditionInfraFlake,
+		MustPageHuman: []string{spec.PageEventRequirementArbitration},
+	}
+	// A plan stage parked at its approval gate, so the plan gate is the pending
+	// gate and gateBlock is the workflow's EffectiveOperatorAgent absent a
+	// campaign override.
+	newEvaluator := func() *Evaluator {
+		return &Evaluator{
+			Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
+			Concerns: &fakeConcerns{},
+			Audit:    &fakeAudit{},
+		}
+	}
+
+	t.Run("campaign override wins over gate and workflow wholesale", func(t *testing.T) {
+		wf := testWorkflow(allKnobs(), gateBlock)
+		res, err := newEvaluator().Evaluate(context.Background(), newRun(), wf, campaignBlock)
+		if err != nil {
+			t.Fatalf("Evaluate: %v", err)
+		}
+		if res == nil {
+			t.Fatal("Result is nil, want the campaign block's evaluation")
+		}
+		got := actionSet(res)
+		if len(got) != 1 || !got[ActionRetry] {
+			t.Errorf("actions = %v, want only the campaign block's retry knob (campaign wins wholesale, never merged)", got)
+		}
+		if len(res.MustPageHuman) != 1 || res.MustPageHuman[0] != spec.PageEventRequirementArbitration {
+			t.Errorf("MustPageHuman = %v, want the campaign block's list", res.MustPageHuman)
+		}
+	})
+
+	t.Run("nil campaign override inherits gate-over-workflow unchanged", func(t *testing.T) {
+		wf := testWorkflow(allKnobs(), gateBlock)
+		res, err := newEvaluator().Evaluate(context.Background(), newRun(), wf, nil)
+		if err != nil {
+			t.Fatalf("Evaluate: %v", err)
+		}
+		if res == nil {
+			t.Fatal("Result is nil, want the gate block's evaluation")
+		}
+		got := actionSet(res)
+		if len(got) != 1 || !got[ActionWaive] {
+			t.Errorf("actions = %v, want only the gate block's waive knob (gate-over-workflow preserved when no campaign override)", got)
+		}
+		if len(res.MustPageHuman) != 1 || res.MustPageHuman[0] != spec.PageEventPlanRejection {
+			t.Errorf("MustPageHuman = %v, want the gate block's list", res.MustPageHuman)
+		}
+	})
+
+	t.Run("nil campaign override and no gate block inherits workflow contract unchanged", func(t *testing.T) {
+		wf := testWorkflow(allKnobs(), nil)
+		res, err := newEvaluator().Evaluate(context.Background(), newRun(), wf, nil)
+		if err != nil {
+			t.Fatalf("Evaluate: %v", err)
+		}
+		if res == nil {
+			t.Fatal("Result is nil, want the workflow block's evaluation")
+		}
+		if got := actionSet(res); len(got) != 5 {
+			t.Errorf("actions = %v, want all five workflow-level knobs (per-workflow contract inherited unchanged)", got)
+		}
+		if len(res.MustPageHuman) != 1 || res.MustPageHuman[0] != spec.PageEventReviewerReject {
+			t.Errorf("MustPageHuman = %v, want the workflow block's list", res.MustPageHuman)
+		}
+	})
+
+	t.Run("campaign override governs a workflow with no block of its own", func(t *testing.T) {
+		// The campaign override must apply even when the workflow declares
+		// nothing (Configured(wf) == false) — the cheap short-circuit must not
+		// suppress a campaign-governed run.
+		wf := testWorkflow(nil, nil)
+		res, err := newEvaluator().Evaluate(context.Background(), newRun(), wf, campaignBlock)
+		if err != nil {
+			t.Fatalf("Evaluate: %v", err)
+		}
+		if res == nil {
+			t.Fatal("Result is nil, want the campaign block to govern a blockless workflow")
+		}
+		if got := actionSet(res); len(got) != 1 || !got[ActionRetry] {
+			t.Errorf("actions = %v, want only the campaign block's retry knob", got)
+		}
+		if len(res.MustPageHuman) != 1 || res.MustPageHuman[0] != spec.PageEventRequirementArbitration {
+			t.Errorf("MustPageHuman = %v, want the campaign block's list", res.MustPageHuman)
+		}
+	})
 }
 
 // --- model_policy passthrough (#1421) ----------------------------------------
@@ -903,7 +1022,7 @@ func TestEvaluate_RepoFailuresPropagate(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := tt.ev.Evaluate(context.Background(), newRun(), wf); !errors.Is(err, boom) {
+			if _, err := tt.ev.Evaluate(context.Background(), newRun(), wf, nil); !errors.Is(err, boom) {
 				t.Errorf("Evaluate error = %v, want the injected store failure", err)
 			}
 		})
@@ -966,7 +1085,7 @@ func TestResultDecision_NilReceiver(t *testing.T) {
 func TestResultDecision_ReadOnlyOverEvaluate(t *testing.T) {
 	ev, wf, runRow := allKnobsEvaluator()
 
-	res1, err := ev.Evaluate(context.Background(), runRow, wf)
+	res1, err := ev.Evaluate(context.Background(), runRow, wf, nil)
 	if err != nil {
 		t.Fatalf("Evaluate #1: %v", err)
 	}
@@ -985,7 +1104,7 @@ func TestResultDecision_ReadOnlyOverEvaluate(t *testing.T) {
 	// A second Evaluate over the same state returns an identical Result —
 	// Evaluate (and therefore the helper that reads its output) is
 	// read-only over run state.
-	res2, err := ev.Evaluate(context.Background(), runRow, wf)
+	res2, err := ev.Evaluate(context.Background(), runRow, wf, nil)
 	if err != nil {
 		t.Fatalf("Evaluate #2: %v", err)
 	}

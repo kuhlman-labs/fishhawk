@@ -2,7 +2,9 @@ package campaign_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -12,6 +14,21 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
+
+// jsonEqual reports whether two raw JSON blobs are semantically equal,
+// tolerating the whitespace + key-order normalization Postgres applies when it
+// stores a value in a JSONB column (the override survives by VALUE, not bytes).
+func jsonEqual(t *testing.T, a, b []byte) bool {
+	t.Helper()
+	var av, bv any
+	if err := json.Unmarshal(a, &av); err != nil {
+		t.Fatalf("unmarshal %q: %v", a, err)
+	}
+	if err := json.Unmarshal(b, &bv); err != nil {
+		t.Fatalf("unmarshal %q: %v", b, err)
+	}
+	return reflect.DeepEqual(av, bv)
+}
 
 // makeCampaign creates a campaign with sensible defaults.
 func makeCampaign(t *testing.T, repo campaign.Repository) *campaign.Campaign {
@@ -458,6 +475,51 @@ func TestPostgres_CreateCampaign_PausePolicy(t *testing.T) {
 	}
 	if got.PausePolicy != campaign.PausePolicyPauseItem {
 		t.Errorf("read-back PausePolicy = %q, want pause_item", got.PausePolicy)
+	}
+}
+
+// TestPostgres_CreateCampaign_OperatorAgent covers the operator_agent column
+// added by 0041 (E25.12): a campaign created with no override round-trips as
+// nil (the unchanged-behavior done-means), and a non-nil raw JSONB block
+// survives create + read byte-for-byte (opaque passthrough, the campaign
+// package never interprets it).
+func TestPostgres_CreateCampaign_OperatorAgent(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	// No override → nil on create AND read-back (the unchanged-behavior path).
+	def := makeCampaign(t, repo)
+	if def.OperatorAgent != nil {
+		t.Errorf("default OperatorAgent = %q, want nil (no override)", def.OperatorAgent)
+	}
+	gotDef, err := repo.GetCampaign(ctx, def.ID)
+	if err != nil {
+		t.Fatalf("get campaign (no override): %v", err)
+	}
+	if gotDef.OperatorAgent != nil {
+		t.Errorf("read-back OperatorAgent = %q, want nil (no override)", gotDef.OperatorAgent)
+	}
+
+	// Explicit override is preserved end-to-end, byte-for-byte.
+	override := []byte(`{"may_approve":"solo_low","must_page_human":["reviewer_reject"]}`)
+	c, err := repo.CreateCampaign(ctx, campaign.CreateCampaignParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		EpicRef:       "issue:1451",
+		OperatorAgent: override,
+	})
+	if err != nil {
+		t.Fatalf("create campaign with operator_agent: %v", err)
+	}
+	if !jsonEqual(t, c.OperatorAgent, override) {
+		t.Errorf("created OperatorAgent = %q, want value-equal to %q", c.OperatorAgent, override)
+	}
+	got, err := repo.GetCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("get campaign: %v", err)
+	}
+	if !jsonEqual(t, got.OperatorAgent, override) {
+		t.Errorf("read-back OperatorAgent = %q, want value-equal to %q", got.OperatorAgent, override)
 	}
 }
 

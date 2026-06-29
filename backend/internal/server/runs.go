@@ -1245,7 +1245,9 @@ func (s *Server) buildDelegationPayload(ctx context.Context, runRow *run.Run) *r
 		Concerns: s.cfg.ConcernRepo,
 		Audit:    s.cfg.AuditRepo,
 	}
-	res, err := ev.Evaluate(ctx, runRow, &wf)
+	// No campaign context on the single-run read: pass a nil campaign
+	// override so resolution falls through to the workflow contract.
+	res, err := ev.Evaluate(ctx, runRow, &wf, nil)
 	if err != nil {
 		s.cfg.Logger.Warn("delegation: evaluate failed; omitting delegation block",
 			"run_id", runRow.ID.String(), "error", err.Error())

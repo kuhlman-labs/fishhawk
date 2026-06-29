@@ -246,7 +246,7 @@ func TestAutoDriveRunGate_Approve(t *testing.T) {
 	seedReviewEntry(t, au, runID, 2, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
 	seedReviewEntry(t, au, runID, 3, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
 
-	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil)
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
 	if err != nil {
 		t.Fatalf("AutoDriveRunGate: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestAutoDriveRunGate_RouteFixup(t *testing.T) {
 	seedReviewEntry(t, au, runID, 3, "implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApproveWithConcerns})
 	seedOpenConcern(t, cr, runID, impl.ID, concern.StageKindImplement, "medium", "scope", "tighten the seam")
 
-	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil)
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
 	if err != nil {
 		t.Fatalf("AutoDriveRunGate: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestAutoDriveRunGate_Retry(t *testing.T) {
 		t.Fatalf("TransitionRun -> failed: %v", err)
 	}
 
-	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil)
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
 	if err != nil {
 		t.Fatalf("AutoDriveRunGate: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestAutoDriveRunGate_Merge(t *testing.T) {
 	seedReviewEntry(t, au, runID, 5, drive.Category, drive.Advance{Rule: drive.RuleChecksGreenAwaitingMerge})
 
 	merger := &fakeMerger{}
-	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), merger)
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), merger, nil)
 	if err != nil {
 		t.Fatalf("AutoDriveRunGate: %v", err)
 	}
@@ -380,7 +380,7 @@ func TestAutoDriveRunGate_Page_ReviewerReject(t *testing.T) {
 	seedReviewEntry(t, au, runID, 2, "implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
 	seedReviewEntry(t, au, runID, 3, "implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictReject})
 
-	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil)
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
 	if err != nil {
 		t.Fatalf("AutoDriveRunGate: %v", err)
 	}
@@ -440,7 +440,7 @@ func TestAutoDriveRunGate_Page_RequirementArbitration(t *testing.T) {
 	seedReviewEntry(t, au, runID, 3, "implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApproveWithConcerns})
 	seedOpenConcern(t, cr, runID, impl.ID, concern.StageKindImplement, "high", requirementConcernCategory, "the requirement itself is disputed")
 
-	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil)
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
 	if err != nil {
 		t.Fatalf("AutoDriveRunGate: %v", err)
 	}
@@ -461,7 +461,7 @@ func TestAutoDriveRunGate_FailClosed_KnobUnmet(t *testing.T) {
 	runID, stages := startAutoDriveRun(t, s, repo)
 	plan := stages[0] // awaiting_approval, but no verdicts seeded
 
-	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil)
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
 	if err != nil {
 		t.Fatalf("AutoDriveRunGate: %v", err)
 	}
@@ -483,7 +483,7 @@ func TestAutoDriveRunGate_FailClosed_EvalError(t *testing.T) {
 	plan := stages[0]
 	au.listByCategoryErr = errBoom
 
-	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil)
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
 	if err != nil {
 		t.Fatalf("AutoDriveRunGate returned error, want fail-closed observe-only: %v", err)
 	}
@@ -503,7 +503,7 @@ func TestAutoDriveRunGate_FailClosed_NotConfigured(t *testing.T) {
 		"trigger_source": "cli", "workflow_spec": gatedSpecYAML, // no operator_agent block
 	})
 
-	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil)
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
 	if err != nil {
 		t.Fatalf("AutoDriveRunGate: %v", err)
 	}
@@ -521,7 +521,7 @@ func TestAutoDriveRunGate_FailClosed_WaiveUnmapped(t *testing.T) {
 	// Exactly one low-severity open concern -> solo_low met; no other knob is.
 	seedOpenConcern(t, cr, runID, stages[1].ID, concern.StageKindImplement, string(planreview.SeverityLow), "style", "minor nit")
 
-	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil)
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
 	if err != nil {
 		t.Fatalf("AutoDriveRunGate: %v", err)
 	}
@@ -547,7 +547,7 @@ func TestAutoDriveRunGate_FailClosed_MergeSeamUnconfigured(t *testing.T) {
 	}
 	seedReviewEntry(t, au, runID, 5, drive.Category, drive.Advance{Rule: drive.RuleChecksGreenAwaitingMerge})
 
-	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil)
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
 	if err != nil {
 		t.Fatalf("AutoDriveRunGate: %v", err)
 	}
@@ -575,7 +575,7 @@ func TestAutoDriveRunGate_MergeDispatchError(t *testing.T) {
 	seedReviewEntry(t, au, runID, 5, drive.Category, drive.Advance{Rule: drive.RuleChecksGreenAwaitingMerge})
 
 	merger := &fakeMerger{err: errBoom}
-	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), merger)
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), merger, nil)
 	if err == nil {
 		t.Fatalf("AutoDriveRunGate err = nil, want the merge dispatch error; outcome=%+v", out)
 	}
@@ -584,6 +584,126 @@ func TestAutoDriveRunGate_MergeDispatchError(t *testing.T) {
 	}
 	if countAudit(au, CategoryPRMerged) != 0 {
 		t.Error("post-merge settle ran despite a merge failure")
+	}
+}
+
+// --- (h) campaign-level operator_agent override (E25.12 / #1451) -------------
+
+// seedRequirementArbitrationState parks the implement stage at its approval
+// gate with a COMPLETE review round (no gating reject) and one open
+// requirement-category concern. Against the default autoDriveSpecYAML this is
+// exactly TestAutoDriveRunGate_Page_RequirementArbitration's state: the workflow
+// block PAGES (requirement_arbitration ∈ must_page_human) instead of routing the
+// fix-up. The campaign-override tests reuse this single state and vary ONLY the
+// campaign block, so the change in outcome is attributable to the override
+// alone — the wholesale-override contract at the auto-driver.
+func seedRequirementArbitrationState(t *testing.T, s *Server, repo *autoDriveRepo, au *auditFake, cr *fakeConcernRepo) uuid.UUID {
+	t.Helper()
+	runID, stages := startAutoDriveRun(t, s, repo)
+	plan, impl := stages[0], stages[1]
+	plan.State = run.StageStateSucceeded
+	impl.State = run.StageStateAwaitingApproval
+	seedReviewEntry(t, au, runID, 1, "implement_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	seedReviewEntry(t, au, runID, 2, "implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApproveWithConcerns})
+	seedReviewEntry(t, au, runID, 3, "implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApproveWithConcerns})
+	seedOpenConcern(t, cr, runID, impl.ID, concern.StageKindImplement, "high", requirementConcernCategory, "the requirement itself is disputed")
+	return runID
+}
+
+// A RELAXING campaign override auto-acts where the workflow would PAGE: the
+// override delegates may_route_fixup but does NOT list requirement_arbitration
+// as a must_page_human event, so the open requirement concern is routed back as
+// a fix-up instead of paging the human — the campaign block governs wholesale,
+// never merged with the workflow block's must_page_human.
+func TestAutoDriveRunGate_CampaignOverride_RelaxingAutoActs(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID := seedRequirementArbitrationState(t, s, repo, au, cr)
+
+	override := []byte(`{"may_route_fixup":"convergent_concerns"}`)
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, override)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionRouteFixup {
+		t.Fatalf("outcome = %+v, want acted route_fixup (relaxing override auto-acts where the workflow would page)", out)
+	}
+	if countAudit(au, CategoryCampaignGatePaged) != 0 {
+		t.Error("paged despite a campaign override that does not list requirement_arbitration")
+	}
+	e := auditEntry(t, au, CategoryStageFixupTriggered)
+	assertOperatorActor(t, e)
+}
+
+// A TIGHTENING campaign override pages where the workflow would AUTO-ACT: on the
+// SAME state as the relaxing case (where the override would otherwise auto-route
+// the fix-up), adding requirement_arbitration to the override's must_page_human
+// makes the actor refuse and page — proving the campaign block's must_page_human
+// replaces, and is honoured over, the per-workflow contract wholesale.
+func TestAutoDriveRunGate_CampaignOverride_TighteningPages(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID := seedRequirementArbitrationState(t, s, repo, au, cr)
+
+	override := []byte(`{"may_route_fixup":"convergent_concerns","must_page_human":["requirement_arbitration"]}`)
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, override)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Acted || !out.Paged || out.PageEvent != "requirement_arbitration" {
+		t.Fatalf("outcome = %+v, want paged requirement_arbitration (tightening override pages where the workflow would auto-act)", out)
+	}
+	if countAudit(au, CategoryStageFixupTriggered) != 0 {
+		t.Error("auto-routed a fix-up despite a tightening campaign override that pages")
+	}
+	auditEntry(t, au, CategoryCampaignGatePaged)
+}
+
+// Malformed campaign override bytes fail CLOSED to observe-only: on a state the
+// workflow contract would auto-approve, an unparseable override makes the actor
+// take NO action rather than auto-acting through a contract it cannot trust.
+func TestAutoDriveRunGate_CampaignOverride_Malformed_FailClosed(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRun(t, s, repo)
+	plan := stages[0]
+	// Clean dual approval: the workflow contract WOULD auto-approve here.
+	seedReviewEntry(t, au, runID, 1, "plan_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	seedReviewEntry(t, au, runID, 2, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	seedReviewEntry(t, au, runID, 3, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, []byte("{not json"))
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate returned error, want fail-closed observe-only: %v", err)
+	}
+	if out.Acted || out.Paged {
+		t.Fatalf("outcome = %+v, want observe-only on a malformed campaign override", out)
+	}
+	if plan.State != run.StageStateAwaitingApproval {
+		t.Errorf("plan stage = %q, want unchanged (no action on a malformed override)", plan.State)
+	}
+	if countAudit(au, "approval_submitted") != 0 {
+		t.Error("auto-approved through a malformed campaign override")
+	}
+}
+
+// Empty (zero-length) campaign override bytes fall through to the workflow
+// contract — byte-identical to no override: the clean-dual-approval state
+// auto-approves exactly as TestAutoDriveRunGate_Approve does.
+func TestAutoDriveRunGate_CampaignOverride_Empty_FallsThrough(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRun(t, s, repo)
+	plan := stages[0]
+	seedReviewEntry(t, au, runID, 1, "plan_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	seedReviewEntry(t, au, runID, 2, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	seedReviewEntry(t, au, runID, 3, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, []byte{})
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionApprove {
+		t.Fatalf("outcome = %+v, want acted approve (empty override falls through to the workflow contract)", out)
+	}
+	if plan.State != run.StageStateSucceeded {
+		t.Errorf("plan stage = %q, want succeeded (auto-advanced via the workflow contract)", plan.State)
 	}
 }
 
