@@ -54,23 +54,25 @@ type AuditEntry struct {
 }
 
 type Campaign struct {
-	ID        uuid.UUID          `json:"id"`
-	Repo      string             `json:"repo"`
-	EpicRef   string             `json:"epic_ref"`
-	State     string             `json:"state"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+	ID          uuid.UUID          `json:"id"`
+	Repo        string             `json:"repo"`
+	EpicRef     string             `json:"epic_ref"`
+	State       string             `json:"state"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+	PausePolicy string             `json:"pause_policy"`
 }
 
 type CampaignItem struct {
-	ID         uuid.UUID          `json:"id"`
-	CampaignID uuid.UUID          `json:"campaign_id"`
-	IssueRef   string             `json:"issue_ref"`
-	DependsOn  []byte             `json:"depends_on"`
-	RunID      *uuid.UUID         `json:"run_id"`
-	State      string             `json:"state"`
-	CreatedAt  pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+	ID          uuid.UUID          `json:"id"`
+	CampaignID  uuid.UUID          `json:"campaign_id"`
+	IssueRef    string             `json:"issue_ref"`
+	DependsOn   []byte             `json:"depends_on"`
+	RunID       *uuid.UUID         `json:"run_id"`
+	State       string             `json:"state"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+	PauseReason []byte             `json:"pause_reason"`
 }
 
 type McpToken struct {

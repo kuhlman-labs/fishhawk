@@ -4,8 +4,8 @@
 -- internal/run/queries.sql.
 
 -- name: CreateCampaign :one
-INSERT INTO campaigns (id, repo, epic_ref, state)
-VALUES ($1, $2, $3, $4)
+INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy)
+VALUES ($1, $2, $3, $4, $5)
 RETURNING *;
 
 -- name: GetCampaign :one
@@ -68,5 +68,14 @@ RETURNING *;
 -- name: UpdateCampaignItemState :one
 UPDATE campaign_items
    SET state = $2
+ WHERE id = $1
+RETURNING *;
+
+-- name: SetCampaignItemPause :one
+-- Pauses an item: sets state='paused' and records the pause_reason JSONB,
+-- applied under the existing LockCampaignItemForUpdate FOR UPDATE lock so the
+-- running→paused transition is serialized like the other state moves (E25.7).
+UPDATE campaign_items
+   SET state = 'paused', pause_reason = $2
  WHERE id = $1
 RETURNING *;

@@ -40,6 +40,12 @@ type Assembly struct {
 	// Waves is the topological dispatch order: Waves[w] holds the issue refs
 	// eligible in wave w. Wave 0 holds every item with no dependency.
 	Waves [][]string
+	// PausePolicy is the operator-chosen pause behavior carried through to the
+	// persisted campaign (E25.7). OPTIONAL: a zero value is normalized to
+	// PausePolicyPauseCampaign in Persist before the campaign is created, so
+	// the existing call site (which does not set it) yields the conservative
+	// block-the-campaign default. Slice 3 sets this from the create request.
+	PausePolicy PausePolicy
 }
 
 // AssembledItem is one campaign item produced by Assemble: its issue ref, the
@@ -153,6 +159,10 @@ func Persist(ctx context.Context, repo Repository, repoName string, a *Assembly)
 	c, err := repo.CreateCampaign(ctx, CreateCampaignParams{
 		Repo:    repoName,
 		EpicRef: a.EpicRef,
+		// Normalize the optional policy to the block-the-campaign default
+		// BEFORE building the params, so the existing call site (which leaves
+		// PausePolicy zero) persists as pause_campaign and compiles unchanged.
+		PausePolicy: normalizePausePolicy(a.PausePolicy),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("campaign: create campaign for %s: %w", a.EpicRef, err)
