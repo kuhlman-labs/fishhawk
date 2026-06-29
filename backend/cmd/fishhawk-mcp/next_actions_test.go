@@ -947,3 +947,114 @@ func TestMergeObservedIn(t *testing.T) {
 		t.Error("mergeObservedIn(nil) = true, want false")
 	}
 }
+
+// --- campaign next-actions arm (E25.8 / #1447) ---
+
+// caRollup is a small helper: a campaign rollup with one issue in the named
+// slice (the slice name is not load-bearing for campaignNextActionsFor, which
+// keys off the next_action — the rollup is carried for completeness).
+func caNextAction(action, issueRef string) CampaignNextAction {
+	return CampaignNextAction{Action: action, IssueRef: issueRef, Detail: "detail for " + action}
+}
+
+func TestCampaignNextActionsFor_Attention(t *testing.T) {
+	na := campaignNextActionsFor(CampaignRollup{Failed: []string{"#27"}}, caNextAction("attention", "#27"))
+	if na.State != "campaign_attention" {
+		t.Errorf("State = %q, want campaign_attention", na.State)
+	}
+	if len(na.Actions) == 0 {
+		t.Fatal("attention must carry at least one action")
+	}
+	got := na.Actions[0]
+	if got.Action != "fishhawk_get_run_status" {
+		t.Errorf("action = %q, want fishhawk_get_run_status", got.Action)
+	}
+	if got.Consumes != consumesNone {
+		t.Errorf("consumes = %q, want none", got.Consumes)
+	}
+	if got.Params["issue_ref"] != "#27" {
+		t.Errorf("issue_ref param = %q, want #27", got.Params["issue_ref"])
+	}
+}
+
+func TestCampaignNextActionsFor_Resume(t *testing.T) {
+	na := campaignNextActionsFor(CampaignRollup{Paused: []string{"#28"}}, caNextAction("resume", "#28"))
+	if na.State != "campaign_paused" {
+		t.Errorf("State = %q, want campaign_paused", na.State)
+	}
+	got := na.Actions[0]
+	if got.Action != "fishhawk_resume_campaign" {
+		t.Errorf("action = %q, want fishhawk_resume_campaign", got.Action)
+	}
+	if got.Consumes != consumesNone {
+		t.Errorf("consumes = %q, want none", got.Consumes)
+	}
+}
+
+func TestCampaignNextActionsFor_StartRun(t *testing.T) {
+	na := campaignNextActionsFor(CampaignRollup{Eligible: []string{"#26"}}, caNextAction("start_run", "#26"))
+	if na.State != "campaign_start_run" {
+		t.Errorf("State = %q, want campaign_start_run", na.State)
+	}
+	got := na.Actions[0]
+	if got.Action != "fishhawk_start_run" {
+		t.Errorf("action = %q, want fishhawk_start_run", got.Action)
+	}
+	if got.Consumes != consumesNewRun {
+		t.Errorf("consumes = %q, want new_run", got.Consumes)
+	}
+	if got.Params["trigger_ref"] != "#26" {
+		t.Errorf("trigger_ref param = %q, want #26", got.Params["trigger_ref"])
+	}
+}
+
+func TestCampaignNextActionsFor_Wait(t *testing.T) {
+	na := campaignNextActionsFor(CampaignRollup{Running: []string{"#29"}}, caNextAction("wait", ""))
+	if na.State != "campaign_wait" {
+		t.Errorf("State = %q, want campaign_wait", na.State)
+	}
+	got := na.Actions[0]
+	if got.Action != "fishhawk_get_campaign_status" {
+		t.Errorf("action = %q, want fishhawk_get_campaign_status", got.Action)
+	}
+	if got.Consumes != consumesNone {
+		t.Errorf("consumes = %q, want none", got.Consumes)
+	}
+}
+
+func TestCampaignNextActionsFor_Complete_TerminalNoActions(t *testing.T) {
+	na := campaignNextActionsFor(CampaignRollup{Done: []string{"#26", "#27"}}, caNextAction("complete", ""))
+	if na.State != "campaign_complete" {
+		t.Errorf("State = %q, want campaign_complete", na.State)
+	}
+	if len(na.Actions) != 0 {
+		t.Errorf("complete is terminal; want nil actions, got %+v", na.Actions)
+	}
+}
+
+// TestCampaignNextActionsFor_UnknownAction_Unclassified pins the "never
+// unclassified" invariant: a future backend-added action value lands in the
+// labeled fallback with a NON-empty actions list — proving the classifier
+// never returns an empty/unrouted result for a non-complete campaign.
+func TestCampaignNextActionsFor_UnknownAction_Unclassified(t *testing.T) {
+	na := campaignNextActionsFor(CampaignRollup{}, caNextAction("teleport", "#99"))
+	if na.State != "campaign_unclassified" {
+		t.Errorf("State = %q, want campaign_unclassified", na.State)
+	}
+	if len(na.Actions) == 0 {
+		t.Fatal("the unclassified fallback must return a non-empty actions list")
+	}
+	names := actionNames(na)
+	var sawPoll, sawFile bool
+	for _, n := range names {
+		switch n {
+		case "fishhawk_get_campaign_status":
+			sawPoll = true
+		case "file_product_issue":
+			sawFile = true
+		}
+	}
+	if !sawPoll || !sawFile {
+		t.Errorf("unclassified actions = %v, want both a re-poll and file_product_issue", names)
+	}
+}

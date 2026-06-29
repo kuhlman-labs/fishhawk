@@ -858,3 +858,110 @@ func reviewVerdictSummary(rs *ReviewStatus) string {
 	}
 	return " — reviews settled: " + strings.Join(parts, ", ")
 }
+
+// campaignNextActionsFor (E25.8 / #1447) is the campaign arm of the
+// next-actions classifier: a pure function mapping a campaign's
+// server-computed next_action (computeCampaignNextAction, server/campaigns.go)
+// onto a legal MCP operator action. It mirrors EXACTLY the backend's closed
+// action set — attention | resume | start_run | wait | complete — so a future
+// backend-added action value lands in the labeled campaign_unclassified
+// fallback rather than crashing. fishhawk_get_campaign_status embeds the result
+// in its output so the operator-agent never reads an unclassified campaign
+// state.
+//
+// Structural invariant (the "never unclassified" done-means): this NEVER
+// returns an empty actions list for a non-complete campaign. Only the terminal
+// "complete" arm returns nil actions; every other arm — including the
+// unknown-action fallback — carries at least one entry, the same structural
+// guarantee nextActionsFor upholds for runs.
+func campaignNextActionsFor(_ CampaignRollup, na CampaignNextAction) *NextActions {
+	switch na.Action {
+	case "attention":
+		// A campaign item failed terminally (FAILED-wins precedence in
+		// computeCampaignNextAction): the operator must retry or abandon it
+		// before the campaign can proceed. There is no single MCP verb for this
+		// — point at fishhawk_get_run_status on the failed item's run, then
+		// retry-or-abandon by hand.
+		return &NextActions{
+			State: "campaign_attention",
+			Actions: []SuggestedAction{{
+				Action:       "fishhawk_get_run_status",
+				Params:       map[string]string{"issue_ref": na.IssueRef},
+				Precondition: "a campaign item failed terminally (its issue_ref is on the next_action); resolve the failed run on that item (fishhawk_list_runs / fishhawk_get_run_status) first",
+				Consumes:     consumesNone,
+				Reason:       "campaign item " + na.IssueRef + " failed — read its run, then retry the stage or abandon the item before the campaign can advance; a failed item blocks dispatch regardless of other eligible items",
+			}},
+		}
+	case "resume":
+		// The auto-driver paged a human at a run gate (E25.7) and the campaign
+		// (or an item) is paused. Hand it back with fishhawk_resume_campaign
+		// once the gate is handled.
+		return &NextActions{
+			State: "campaign_paused",
+			Actions: []SuggestedAction{{
+				Action:       "fishhawk_resume_campaign",
+				Precondition: "the auto-driver paged a human at a run gate and the campaign (or an item) is paused; handle the gate first",
+				Consumes:     consumesNone,
+				Reason:       "paused item " + na.IssueRef + " was handed off at a run gate — once you have handled the gate, fishhawk_resume_campaign flips the campaign and every paused item back to running so the driver re-engages",
+			}},
+		}
+	case "start_run":
+		// An eligible item's dependencies are satisfied and it has no run yet:
+		// open one with fishhawk_start_run on its issue ref.
+		return &NextActions{
+			State: "campaign_start_run",
+			Actions: []SuggestedAction{{
+				Action:       "fishhawk_start_run",
+				Params:       map[string]string{"trigger_ref": na.IssueRef},
+				Precondition: "this campaign item's dependencies are all satisfied (it is in the rollup's eligible slice) and it has no run yet",
+				Consumes:     consumesNewRun,
+				Reason:       "dispatch the next eligible campaign item " + na.IssueRef + " — start a run on its issue ref to advance the campaign",
+			}},
+		}
+	case "wait":
+		// Items are running or blocked on a dependency; nothing to dispatch.
+		// Re-poll until an item becomes eligible, paused, or failed.
+		return &NextActions{
+			State: "campaign_wait",
+			Actions: []SuggestedAction{{
+				Action:       "fishhawk_get_campaign_status",
+				Precondition: "always legal (read-only)",
+				Consumes:     consumesNone,
+				Reason:       "items are running or blocked on a dependency; nothing to dispatch yet — re-poll fishhawk_get_campaign_status until an item becomes eligible, pauses, or fails",
+			}},
+		}
+	case "complete":
+		// Every item reached a terminal state: the campaign is done. Terminal —
+		// no actions (the block still names the state), mirroring a terminal run.
+		return &NextActions{State: "campaign_complete"}
+	default:
+		return campaignUnclassifiedNextActions(na)
+	}
+}
+
+// campaignUnclassifiedNextActions is the labeled fallback for any campaign
+// next_action value the arm above does not recognize (a future backend-added
+// action): re-poll (always legal) plus a pointer to file a product issue naming
+// the action so the classifier gains an arm. It ALWAYS returns a non-empty
+// actions list — the campaign analogue of unclassifiedNextActions, upholding
+// the "never unclassified" invariant for a non-complete campaign.
+func campaignUnclassifiedNextActions(na CampaignNextAction) *NextActions {
+	desc := fmt.Sprintf("campaign next_action %q", na.Action)
+	return &NextActions{
+		State: "campaign_unclassified",
+		Actions: []SuggestedAction{
+			{
+				Action:       "fishhawk_get_campaign_status",
+				Precondition: "always legal (read-only)",
+				Consumes:     consumesNone,
+				Reason:       desc + " did not match the campaign next-actions classifier — re-poll while the campaign settles",
+			},
+			{
+				Action:       "file_product_issue",
+				Precondition: "the action persists across polls",
+				Consumes:     consumesNone,
+				Reason:       "the campaign classifier has no arm for " + desc + "; file a Fishhawk issue naming it so the classifier gains one",
+			},
+		},
+	}
+}
