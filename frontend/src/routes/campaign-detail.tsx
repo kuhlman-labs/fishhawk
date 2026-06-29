@@ -1,7 +1,9 @@
+import { Fragment } from 'react';
 import { Link, useParams } from 'react-router';
 import { api } from '@/api/client';
 import { useAsync } from '@/api/use-async';
 import type {
+  Campaign,
   CampaignItem,
   CampaignItemState,
   CampaignNextAction,
@@ -9,6 +11,32 @@ import type {
   CampaignStatus,
 } from '@/api/types';
 import { cn } from '@/lib/cn';
+
+/**
+ * The campaign-level `operator_agent` delegation override (E25.12 / #1451). When
+ * present it is the effective delegation contract for EVERY issue-run the
+ * campaign drives — it wins WHOLESALE over each run's per-workflow
+ * `operator_agent` (campaign > gate > workflow, never merged).
+ *
+ * Read off the campaign payload via a narrow local shape rather than the shared
+ * `Campaign` type: adding the field to `@/api/types` (the canonical home) is a
+ * coupled change deferred to a follow-up; the wire JSON already carries it
+ * (`client.ts` returns `res.json()` verbatim) so this surfaces it without the
+ * type-file edit.
+ */
+interface OperatorAgentOverride {
+  may_approve?: string;
+  may_route_fixup?: string;
+  may_waive?: string;
+  may_retry?: string;
+  may_merge?: string;
+  must_page_human?: string[];
+}
+
+function operatorAgentOverrideOf(campaign: Campaign): OperatorAgentOverride | null {
+  const override = (campaign as { operator_agent?: OperatorAgentOverride | null }).operator_agent;
+  return override ?? null;
+}
 
 export function CampaignDetail() {
   const { campaignId } = useParams<{ campaignId: string }>();
@@ -66,6 +94,7 @@ function formatTimestamp(iso: string): string {
 function CampaignDetailView({ status }: { status: CampaignStatus }) {
   const { campaign, items, rollup, next_action } = status;
   const pausedItems = items.filter((it) => it.state === 'paused');
+  const operatorAgent = operatorAgentOverrideOf(campaign);
 
   return (
     <section className="space-y-6">
@@ -93,6 +122,8 @@ function CampaignDetailView({ status }: { status: CampaignStatus }) {
         </dl>
       </header>
 
+      {operatorAgent && <DelegationOverride override={operatorAgent} />}
+
       <PendingDecision nextAction={next_action} pausedItems={pausedItems} />
 
       <RollupSection rollup={rollup} />
@@ -101,6 +132,57 @@ function CampaignDetailView({ status }: { status: CampaignStatus }) {
 
       <RunGrid items={items} />
     </section>
+  );
+}
+
+const OPERATOR_AGENT_KNOBS: Array<{ key: keyof OperatorAgentOverride; label: string }> = [
+  { key: 'may_approve', label: 'may_approve' },
+  { key: 'may_route_fixup', label: 'may_route_fixup' },
+  { key: 'may_waive', label: 'may_waive' },
+  { key: 'may_retry', label: 'may_retry' },
+  { key: 'may_merge', label: 'may_merge' },
+];
+
+/**
+ * The campaign-level operator_agent delegation override (E25.12 / #1451),
+ * rendered only when the campaign carries one. It surfaces the effective
+ * delegation contract that governs EVERY issue-run wholesale — each set may_*
+ * knob (the single condition under which the action is delegated) plus the
+ * must_page_human events. The caption states the wholesale-override semantics so
+ * the operator reads it as REPLACING, not merging with, each run's per-workflow
+ * contract.
+ */
+function DelegationOverride({ override }: { override: OperatorAgentOverride }) {
+  const knobs = OPERATOR_AGENT_KNOBS.filter(({ key }) => override[key]);
+  const mustPage = override.must_page_human ?? [];
+  return (
+    <div className="space-y-2">
+      <h2 className="text-sm font-medium tracking-wide text-neutral-600 uppercase dark:text-neutral-400">
+        Delegation override
+      </h2>
+      <p className="text-xs text-neutral-500">
+        A campaign-level <span className="font-mono">operator_agent</span> contract. It governs
+        every issue-run wholesale — it replaces, never merges with, each run&apos;s per-workflow
+        delegation.
+      </p>
+      <dl className="grid grid-cols-[12rem_1fr] gap-y-1 rounded-md border border-neutral-200 p-3 font-mono text-xs dark:border-neutral-800">
+        {knobs.length === 0 && mustPage.length === 0 && (
+          <div className="text-neutral-500">no knobs set (every action pages the human)</div>
+        )}
+        {knobs.map(({ key, label }) => (
+          <Fragment key={key}>
+            <dt className="text-neutral-500">{label}</dt>
+            <dd>{override[key] as string}</dd>
+          </Fragment>
+        ))}
+        {mustPage.length > 0 && (
+          <>
+            <dt className="text-neutral-500">must_page_human</dt>
+            <dd>{mustPage.join(', ')}</dd>
+          </>
+        )}
+      </dl>
+    </div>
   );
 }
 

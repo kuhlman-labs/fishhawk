@@ -1144,9 +1144,20 @@ type Campaign struct {
 	// PausePolicy is the operator-chosen pause behavior on a gate hand-off
 	// (E25.7): pause_campaign (block the whole campaign, the default) or
 	// pause_item (continue-others). Always normalized on a persisted campaign.
-	PausePolicy string    `json:"pause_policy"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	PausePolicy string `json:"pause_policy"`
+	// OperatorAgent is the OPTIONAL campaign-level operator_agent delegation
+	// override (E25.12 / #1451). When present it is the effective delegation
+	// contract for EVERY issue-run the campaign drives — it wins WHOLESALE over
+	// the per-run workflow operator_agent (campaign > gate > workflow, never
+	// merged). Typed map[string]any (not json.RawMessage) so the MCP SDK's
+	// reflection-built output schema sees an unconstrained object rather than a
+	// []byte array (which would surface as type:array and fail response
+	// validation) — the same reason the CalibrationResult.ConfidenceBandAccuracy
+	// field documents. Omitted on a campaign with no override (the byte-identical
+	// default — each issue-run inherits its workflow contract).
+	OperatorAgent map[string]any `json:"operator_agent,omitempty"`
+	CreatedAt     time.Time      `json:"created_at"`
+	UpdatedAt     time.Time      `json:"updated_at"`
 }
 
 // CampaignPauseReason mirrors the backend's campaign.PauseReason: why a paused
@@ -1215,21 +1226,32 @@ type campaignCreateRequest struct {
 	Repo        string `json:"repo"`
 	EpicRef     string `json:"epic_ref"`
 	PausePolicy string `json:"pause_policy,omitempty"`
+	// OperatorAgent is the OPTIONAL campaign-level operator_agent override
+	// (E25.12 / #1451), carried as opaque JSON the backend validates against
+	// spec.OperatorAgent (unknown fields rejected -> 400 validation_failed).
+	// json.RawMessage (not map[string]any) here because this is an HTTP request
+	// body, not an MCP tool schema — omitempty drops a nil/empty value so a
+	// campaign without an override sends no operator_agent key.
+	OperatorAgent json.RawMessage `json:"operator_agent,omitempty"`
 }
 
 // CreateCampaign assembles a campaign from an epic ref via
 // `POST /v0/campaigns` (E25.4) and returns the created campaign (201 fresh).
 // pausePolicy is optional — empty normalizes to pause_campaign server-side.
-// A write tool: requires an operator token with write:campaigns scope. 4xx/5xx
-// surfaces as *apiError; the tool layer reads the code:
+// operatorAgent is the OPTIONAL campaign-level operator_agent override (E25.12 /
+// #1451) carried as opaque JSON; empty/nil omits the field so the campaign
+// inherits each issue-run's workflow contract. A write tool: requires an
+// operator token with write:campaigns scope. 4xx/5xx surfaces as *apiError; the
+// tool layer reads the code:
 //   - 400 validation_failed (repo not owner/name, empty epic_ref, bad
-//     pause_policy, or a dependency cycle)
+//     pause_policy, a malformed/unknown-field operator_agent, or a dependency
+//     cycle)
 //   - 403 insufficient_scope (token lacks write:campaigns)
 //   - 422 repo_not_installed (the GitHub App is not on the target repo)
 //   - 422 campaign_dangling_dependency (a depends_on target is not a fellow child)
 //   - 503 campaign_repo_unconfigured (no campaign repository wired on the deploy)
-func (c *apiClient) CreateCampaign(ctx context.Context, repo, epicRef, pausePolicy string) (*Campaign, error) {
-	body, err := json.Marshal(campaignCreateRequest{Repo: repo, EpicRef: epicRef, PausePolicy: pausePolicy})
+func (c *apiClient) CreateCampaign(ctx context.Context, repo, epicRef, pausePolicy string, operatorAgent json.RawMessage) (*Campaign, error) {
+	body, err := json.Marshal(campaignCreateRequest{Repo: repo, EpicRef: epicRef, PausePolicy: pausePolicy, OperatorAgent: operatorAgent})
 	if err != nil {
 		return nil, fmt.Errorf("marshal create campaign: %w", err)
 	}

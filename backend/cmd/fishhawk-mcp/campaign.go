@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -19,6 +20,14 @@ type StartCampaignInput struct {
 	Repo        string `json:"repo" jsonschema:"GitHub repo as owner/name to assemble the campaign in"`
 	EpicRef     string `json:"epic_ref" jsonschema:"the epic reference to decompose into the campaign DAG (e.g. an issue ref like '#25' or 'owner/name#25')"`
 	PausePolicy string `json:"pause_policy,omitempty" jsonschema:"OPTIONAL pause behavior on a gate hand-off: 'pause_campaign' (block the whole campaign, the default) or 'pause_item' (continue-others). Omit to take the conservative pause_campaign default"`
+	// OperatorAgent is the OPTIONAL campaign-level operator_agent override. Typed
+	// map[string]any so the MCP SDK's reflection-built tool input schema sees an
+	// unconstrained object (the agent passes the operator_agent block as JSON);
+	// the backend validates it against spec.OperatorAgent (unknown fields ->
+	// 400). When present it wins WHOLESALE over each issue-run's workflow
+	// operator_agent contract; omit to leave every issue-run on its workflow
+	// default.
+	OperatorAgent map[string]any `json:"operator_agent,omitempty" jsonschema:"OPTIONAL campaign-level operator_agent delegation override. A JSON object with the operator_agent knobs (may_approve, may_route_fixup, may_waive, may_retry, may_merge, must_page_human, model_policy). When set it REPLACES (wins wholesale over) every issue-run's per-workflow operator_agent contract for the whole campaign — it is never merged. Omit to leave each issue-run on its workflow default"`
 }
 
 // StartCampaignOutput carries the created campaign row.
@@ -72,11 +81,15 @@ fishhawk_resume_campaign.
 
 repo (owner/name) and epic_ref are required. pause_policy is optional —
 pause_campaign (the default, block the whole campaign at a gate hand-off) or
-pause_item (continue the other items). A write tool: needs an operator token
-with write:campaigns scope (a runner-bound token is rejected 403). An epic
-whose dependency edges point outside its own children fails
-campaign_dangling_dependency; a repo without the GitHub App installed fails
-repo_not_installed.
+pause_item (continue the other items). operator_agent is optional — a
+campaign-level operator_agent delegation block that REPLACES (wins wholesale
+over) every issue-run's per-workflow operator_agent contract for the whole
+campaign; omit to leave each issue-run on its workflow default. A write tool:
+needs an operator token with write:campaigns scope (a runner-bound token is
+rejected 403). An epic whose dependency edges point outside its own children
+fails campaign_dangling_dependency; a repo without the GitHub App installed
+fails repo_not_installed; a malformed or unknown-field operator_agent fails
+validation_failed.
 `),
 	}, resolver.startCampaign)
 }
@@ -91,7 +104,21 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 		return nil, StartCampaignOutput{}, errors.New("epic_ref is required")
 	}
 
-	created, err := r.api.CreateCampaign(ctx, repo, in.EpicRef, in.PausePolicy)
+	// Marshal the OPTIONAL campaign-level operator_agent override back to opaque
+	// JSON for the request body. An absent override (nil map) stays nil so
+	// CreateCampaign omits the field and the campaign inherits each issue-run's
+	// workflow contract. The backend is the validation authority (it rejects a
+	// malformed / unknown-field block 400); we only carry the bytes.
+	var operatorAgent json.RawMessage
+	if len(in.OperatorAgent) > 0 {
+		b, err := json.Marshal(in.OperatorAgent)
+		if err != nil {
+			return nil, StartCampaignOutput{}, fmt.Errorf("operator_agent is not encodable as JSON: %w", err)
+		}
+		operatorAgent = b
+	}
+
+	created, err := r.api.CreateCampaign(ctx, repo, in.EpicRef, in.PausePolicy, operatorAgent)
 	if err != nil {
 		// Map the backend's gate codes onto operator-actionable tool errors.
 		var ae *apiError
