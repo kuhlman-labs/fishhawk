@@ -160,6 +160,35 @@ func recognizedVersionList() string {
 	return strings.Join(versions, ", ")
 }
 
+// CampaignActorSubject is the stable audit subject the campaign
+// auto-driver (E25.6 / ADR-047) acts under when it takes a delegated
+// gate action in-process. It carries the operator-agent token prefix,
+// so IsTokenSubject (and the server's actorKindForSubject built on it)
+// classify it as the role instance acting — audit.ActorAgent — tying
+// every auto-action back to the operator_agent contract.
+//
+// The suffix names the campaign driver, not a role-spec version: the
+// in-process actor is the product acting on the contract, not a
+// token-issued role instance, so this subject is NEVER presented as a
+// real token subject (ValidateTokenSubject still gates token issuance to
+// a recognized role-spec version). It is audit attribution only.
+const CampaignActorSubject = TokenSubjectPrefix + "campaign"
+
+// CampaignActorScopes returns the write scopes the campaign auto-driver's
+// in-process gate actions require, matching the per-handler scope checks
+// the HTTP path enforces: write:approvals (the approve gate),
+// write:stages (accepted by both the fixup and retry gates), plus the
+// gate-specific write:fixups and write:retries. A fresh slice is returned
+// on every call so a caller cannot mutate a shared backing array.
+func CampaignActorScopes() []string {
+	return []string{
+		"write:approvals",
+		"write:stages",
+		"write:fixups",
+		"write:retries",
+	}
+}
+
 // EmbeddedSchemaHash returns the hex-encoded SHA-256 of the canonical
 // JSON bytes of the embedded operator-role-v0 schema (the full role
 // schema; the overlay schema derives from it). Callers use this to
