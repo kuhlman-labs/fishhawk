@@ -215,6 +215,33 @@ func TestPersist_PreservesExplicitPausePolicy(t *testing.T) {
 	}
 }
 
+// TestPersist_ThreadsOperatorAgent asserts the campaign-level operator_agent
+// override (E25.12) is threaded straight through Persist onto the
+// CreateCampaignParams, byte-for-byte. A nil override stays nil (the
+// unchanged-behavior path); a non-nil block passes through unchanged.
+func TestPersist_ThreadsOperatorAgent(t *testing.T) {
+	// Nil override → nil params.
+	fNil := &capturingFake{}
+	if _, err := campaign.Persist(context.Background(), fNil, "kuhlman-labs/fishhawk",
+		&campaign.Assembly{EpicRef: "issue:1451"}); err != nil {
+		t.Fatalf("Persist (nil override): %v", err)
+	}
+	if fNil.got.OperatorAgent != nil {
+		t.Errorf("nil override persisted as %q, want nil", fNil.got.OperatorAgent)
+	}
+
+	// Non-nil override passes through byte-for-byte.
+	override := []byte(`{"may_approve":"solo_low"}`)
+	f := &capturingFake{}
+	if _, err := campaign.Persist(context.Background(), f, "kuhlman-labs/fishhawk",
+		&campaign.Assembly{EpicRef: "issue:1451", OperatorAgent: override}); err != nil {
+		t.Fatalf("Persist (override): %v", err)
+	}
+	if string(f.got.OperatorAgent) != string(override) {
+		t.Errorf("override persisted as %q, want %q", f.got.OperatorAgent, override)
+	}
+}
+
 // persistItemErrFake creates a campaign successfully but fails every item
 // insert, so Persist reaches the create-item error branch.
 type persistItemErrFake struct{ campaign.BaseFake }

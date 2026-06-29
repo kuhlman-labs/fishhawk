@@ -46,6 +46,12 @@ type Assembly struct {
 	// the existing call site (which does not set it) yields the conservative
 	// block-the-campaign default. Slice 3 sets this from the create request.
 	PausePolicy PausePolicy
+	// OperatorAgent is the OPTIONAL campaign-level delegation override (E25.12),
+	// raw JSONB bytes threaded straight through Persist onto the campaign.
+	// Nil = no override (each issue-run inherits its workflow's contract). The
+	// server sets it from the validated create request; the campaign package
+	// never interprets it.
+	OperatorAgent []byte
 }
 
 // AssembledItem is one campaign item produced by Assemble: its issue ref, the
@@ -163,6 +169,9 @@ func Persist(ctx context.Context, repo Repository, repoName string, a *Assembly)
 		// BEFORE building the params, so the existing call site (which leaves
 		// PausePolicy zero) persists as pause_campaign and compiles unchanged.
 		PausePolicy: normalizePausePolicy(a.PausePolicy),
+		// Thread the optional campaign-level operator_agent override straight
+		// through (E25.12): nil = no override.
+		OperatorAgent: a.OperatorAgent,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("campaign: create campaign for %s: %w", a.EpicRef, err)

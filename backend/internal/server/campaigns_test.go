@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -60,13 +61,14 @@ func (f *fakeCampaignRepo) CreateCampaign(_ context.Context, p campaign.CreateCa
 	}
 	now := time.Now().UTC()
 	c := &campaign.Campaign{
-		ID:          uuid.New(),
-		Repo:        p.Repo,
-		EpicRef:     p.EpicRef,
-		State:       campaign.StatePending,
-		PausePolicy: p.PausePolicy,
-		CreatedAt:   now,
-		UpdatedAt:   now,
+		ID:            uuid.New(),
+		Repo:          p.Repo,
+		EpicRef:       p.EpicRef,
+		State:         campaign.StatePending,
+		PausePolicy:   p.PausePolicy,
+		OperatorAgent: p.OperatorAgent,
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}
 	f.campaigns[c.ID] = c
 	return c, nil
@@ -396,6 +398,174 @@ func TestCreateCampaign_CrossBoundary_E2E(t *testing.T) {
 	if blocked == nil || len(blocked.DependsOn) != 1 || blocked.DependsOn[0] != "issue:100" {
 		t.Errorf("issue:101 depends_on = %+v, want [issue:100]", blocked)
 	}
+}
+
+// TestCreateCampaign_OperatorAgent_CrossBoundary_E2E is the slice-A cross-layer
+// done-means for the campaign-level operator_agent override (E25.12): a POST
+// carrying an operator_agent block flows payload -> domain -> JSONB persistence
+// -> response, and GET /status echoes it back value-for-value (crossing the
+// handler, campaign.Persist, the Postgres column, and rowToCampaign).
+func TestCreateCampaign_OperatorAgent_CrossBoundary_E2E(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+
+	gh := recordingInstallGitHubClient(t, 7799, &installRecorder{})
+	s := New(Config{CampaignRepo: repo, GitHub: gh})
+
+	override := `{"may_approve":"solo_low","must_page_human":["reviewer_reject"]}`
+	body := `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","operator_agent":` + override + `}`
+	w := postCampaign(t, s, body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created campaign: %v", err)
+	}
+	if !jsonValueEqual(t, created.OperatorAgent, []byte(override)) {
+		t.Errorf("created operator_agent = %s, want value-equal to %s", created.OperatorAgent, override)
+	}
+
+	// GET /status re-reads from the column and echoes the override.
+	statusReq := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+created.ID.String()+"/status", nil)
+	statusReq.SetPathValue("campaign_id", created.ID.String())
+	sw := httptest.NewRecorder()
+	s.handleGetCampaignStatus(sw, withAuth(statusReq))
+	if sw.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want 200 (body=%s)", sw.Code, sw.Body.String())
+	}
+	var status struct {
+		Campaign campaignResponse `json:"campaign"`
+	}
+	if err := json.Unmarshal(sw.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decode status: %v (body=%s)", err, sw.Body.String())
+	}
+	if !jsonValueEqual(t, status.Campaign.OperatorAgent, []byte(override)) {
+		t.Errorf("status campaign operator_agent = %s, want value-equal to %s", status.Campaign.OperatorAgent, override)
+	}
+}
+
+// TestCreateCampaign_NoOperatorAgent_Omitted is the unchanged-behavior pin: a
+// create with no operator_agent yields a response with NO operator_agent key
+// (omitempty over nil bytes), so existing campaigns and clients see byte-
+// identical output to pre-E25.12.
+func TestCreateCampaign_NoOperatorAgent_Omitted(t *testing.T) {
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, present := raw["operator_agent"]; present {
+		t.Errorf("operator_agent key present with no override, want omitted (body=%s)", w.Body.String())
+	}
+}
+
+// TestCreateCampaign_OperatorAgent_Echoed_201 asserts a well-formed override is
+// accepted (201) and echoed on the response — the happy path of the new
+// validateOperatorAgent branch over the fake repo.
+func TestCreateCampaign_OperatorAgent_Echoed_201(t *testing.T) {
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
+
+	override := `{"may_retry":"infra_flake"}`
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","operator_agent":`+override+`}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var c campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &c); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !jsonValueEqual(t, c.OperatorAgent, []byte(override)) {
+		t.Errorf("operator_agent = %s, want value-equal to %s", c.OperatorAgent, override)
+	}
+}
+
+// TestCreateCampaign_MalformedOperatorAgent_400 covers the validateOperatorAgent
+// reject branch for a syntactically-valid but type-wrong block (a JSON string,
+// not an operator-agent object): 400 validation_failed, before any provider
+// dispatch.
+func TestCreateCampaign_MalformedOperatorAgent_400(t *testing.T) {
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","operator_agent":"not-an-object"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", code)
+	}
+	if fp.called {
+		t.Error("provider dispatched despite a malformed operator_agent")
+	}
+}
+
+// TestCreateCampaign_UnknownFieldOperatorAgent_400 covers the
+// DisallowUnknownFields reject branch: an operator_agent block carrying an
+// unrecognized knob is rejected 400, not stored opaquely.
+func TestCreateCampaign_UnknownFieldOperatorAgent_400(t *testing.T) {
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","operator_agent":{"bogus_knob":"x"}}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", code)
+	}
+	if fp.called {
+		t.Error("provider dispatched despite an unknown operator_agent field")
+	}
+}
+
+// TestCreateCampaign_NullOperatorAgent_201 pins the "JSON null is not an
+// override" branch: an explicit `null` is treated as absent (201, no
+// operator_agent echoed), never stored as the literal bytes "null".
+func TestCreateCampaign_NullOperatorAgent_201(t *testing.T) {
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","operator_agent":null}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, present := raw["operator_agent"]; present {
+		t.Errorf("operator_agent key present for a null override, want omitted (body=%s)", w.Body.String())
+	}
+}
+
+// jsonValueEqual reports whether two raw JSON blobs are semantically equal,
+// tolerating whitespace/key-order normalization (Postgres JSONB storage).
+func jsonValueEqual(t *testing.T, a, b []byte) bool {
+	t.Helper()
+	var av, bv any
+	if err := json.Unmarshal(a, &av); err != nil {
+		t.Fatalf("unmarshal %q: %v", a, err)
+	}
+	if err := json.Unmarshal(b, &bv); err != nil {
+		t.Fatalf("unmarshal %q: %v", b, err)
+	}
+	return reflect.DeepEqual(av, bv)
 }
 
 // TestCreateCampaign_ResolvesInstallation asserts the create handler CALLS

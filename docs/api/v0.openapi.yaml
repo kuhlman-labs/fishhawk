@@ -968,6 +968,19 @@ components:
             `pause_campaign` (the default) blocks the whole campaign;
             `pause_item` pauses only the affected item (continue-others).
             Always present and normalized on a persisted campaign.
+        operator_agent:
+          type: object
+          additionalProperties: true
+          description: |
+            OPTIONAL campaign-level `operator_agent` delegation override
+            (E25.12). The same block shape the workflow spec carries
+            (`may_approve`, `may_route_fixup`, `may_waive`, `may_retry`,
+            `may_merge`, `must_page_human`, `model_policy`). When present it
+            wins WHOLESALE as the outermost rung of the resolution ladder —
+            campaign > gate > workflow, never merged — so it is each
+            issue-run's effective delegation contract. Omitted when the
+            campaign carries no override: every issue-run then inherits its
+            workflow's contract, byte-identical to pre-E25.12 behavior.
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
@@ -4040,6 +4053,18 @@ paths:
                     (E25.7). Omit to take the default `pause_campaign` (block
                     the whole campaign); `pause_item` pauses only the affected
                     item (continue-others).
+                operator_agent:
+                  type: object
+                  additionalProperties: true
+                  description: |
+                    OPTIONAL campaign-level `operator_agent` delegation
+                    override (E25.12) that tightens or relaxes the per-workflow
+                    contract for ALL the campaign's issue-runs, winning
+                    wholesale over the gate/workflow blocks. Same shape as the
+                    workflow spec's `operator_agent` block; validated against it
+                    (unknown fields rejected) at create. Omit (or send `null`)
+                    for no override — each issue-run inherits its workflow's
+                    contract.
       responses:
         '201':
           description: Campaign created.
@@ -4049,8 +4074,10 @@ paths:
         '400':
           description: |
             `validation_failed` — `repo` not in owner/name form, `epic_ref`
-            missing, `pause_policy` not a recognized value, body malformed /
-            unknown field, or a dependency cycle among the epic's children.
+            missing, `pause_policy` not a recognized value, `operator_agent`
+            not a valid operator-agent block (malformed or an unknown knob),
+            body malformed / unknown field, or a dependency cycle among the
+            epic's children.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: "`insufficient_scope` — bearer token missing `write:campaigns`."
