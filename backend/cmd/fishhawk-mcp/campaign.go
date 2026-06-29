@@ -24,10 +24,11 @@ type StartCampaignInput struct {
 	// map[string]any so the MCP SDK's reflection-built tool input schema sees an
 	// unconstrained object (the agent passes the operator_agent block as JSON);
 	// the backend validates it against spec.OperatorAgent (unknown fields ->
-	// 400). When present it wins WHOLESALE over each issue-run's workflow
-	// operator_agent contract; omit to leave every issue-run on its workflow
-	// default.
-	OperatorAgent map[string]any `json:"operator_agent,omitempty" jsonschema:"OPTIONAL campaign-level operator_agent delegation override. A JSON object with the operator_agent knobs (may_approve, may_route_fixup, may_waive, may_retry, may_merge, must_page_human, model_policy). When set it REPLACES (wins wholesale over) every issue-run's per-workflow operator_agent contract for the whole campaign — it is never merged. Omit to leave each issue-run on its workflow default"`
+	// 400). When present (including an explicit empty {}) it wins WHOLESALE over
+	// each issue-run's workflow operator_agent contract. An explicit {} means the
+	// wholesale override with no delegated knobs — page on every action. Omit
+	// (nil map) to leave every issue-run on its workflow default.
+	OperatorAgent map[string]any `json:"operator_agent,omitempty" jsonschema:"OPTIONAL campaign-level operator_agent delegation override. A JSON object with the operator_agent knobs (may_approve, may_route_fixup, may_waive, may_retry, may_merge, must_page_human, model_policy). When set it REPLACES (wins wholesale over) every issue-run's per-workflow operator_agent contract for the whole campaign — it is never merged. An explicit empty {} is a valid wholesale override with no delegated knobs (page on every action). Omit to leave each issue-run on its workflow default"`
 }
 
 // StartCampaignOutput carries the created campaign row.
@@ -84,7 +85,9 @@ pause_campaign (the default, block the whole campaign at a gate hand-off) or
 pause_item (continue the other items). operator_agent is optional — a
 campaign-level operator_agent delegation block that REPLACES (wins wholesale
 over) every issue-run's per-workflow operator_agent contract for the whole
-campaign; omit to leave each issue-run on its workflow default. A write tool:
+campaign; an explicit empty {} is a valid wholesale override with no delegated
+knobs (page on every action); omit to leave each issue-run on its workflow
+default. A write tool:
 needs an operator token with write:campaigns scope (a runner-bound token is
 rejected 403). An epic whose dependency edges point outside its own children
 fails campaign_dangling_dependency; a repo without the GitHub App installed
@@ -105,12 +108,19 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 	}
 
 	// Marshal the OPTIONAL campaign-level operator_agent override back to opaque
-	// JSON for the request body. An absent override (nil map) stays nil so
-	// CreateCampaign omits the field and the campaign inherits each issue-run's
-	// workflow contract. The backend is the validation authority (it rejects a
-	// malformed / unknown-field block 400); we only carry the bytes.
+	// JSON for the request body. Presence (non-nil map) is the discriminator:
+	// encoding/json leaves an omitted field as a nil map but unmarshals an
+	// explicit {} into a non-nil empty map, so != nil correctly distinguishes the
+	// two. An omitted override (nil) stays nil so CreateCampaign omits the field
+	// and the campaign inherits each issue-run's workflow contract. A present
+	// override — even the empty map {} (wholesale override: no delegated knobs,
+	// page on every action) — is marshaled and carried verbatim to the REST
+	// layer; an empty map marshals to the two-byte "{}", which the request
+	// body's json.RawMessage omitempty field preserves (omitempty drops only nil
+	// and zero-length byte slices, not a populated "{}"). The backend is the
+	// validation authority; we only carry the bytes.
 	var operatorAgent json.RawMessage
-	if len(in.OperatorAgent) > 0 {
+	if in.OperatorAgent != nil {
 		b, err := json.Marshal(in.OperatorAgent)
 		if err != nil {
 			return nil, StartCampaignOutput{}, fmt.Errorf("operator_agent is not encodable as JSON: %w", err)

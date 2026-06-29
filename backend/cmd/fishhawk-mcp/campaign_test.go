@@ -117,6 +117,71 @@ func TestStartCampaign_OmittedOperatorAgent_LeavesBodyEmpty(t *testing.T) {
 	}
 }
 
+// TestStartCampaign_EmptyOperatorAgent_CarriedAsEmptyObject exercises the
+// JSON-UNMARSHAL boundary for the omitted-vs-explicit-{} discriminator. It
+// unmarshals two distinct tool-input JSON payloads into StartCampaignInput and
+// asserts that (a) an omitted operator_agent leaves the field as a nil map and
+// (b) an explicit "operator_agent":{} produces a non-nil empty map — and that
+// startCampaign forwards the empty map to the REST layer as the JSON object
+// "{}" while dropping the omitted case. This guards the regression path where
+// `len(...) > 0` incorrectly collapses both cases.
+func TestStartCampaign_EmptyOperatorAgent_CarriedAsEmptyObject(t *testing.T) {
+	// Part (a): omitted operator_agent → nil map → no operator_agent key in body.
+	{
+		var omittedIn StartCampaignInput
+		if err := json.Unmarshal([]byte(`{"repo":"x/y","epic_ref":"#1"}`), &omittedIn); err != nil {
+			t.Fatalf("unmarshal omitted: %v", err)
+		}
+		if omittedIn.OperatorAgent != nil {
+			t.Errorf("omitted operator_agent: got non-nil map %v, want nil", omittedIn.OperatorAgent)
+		}
+
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		_, _, err := r.startCampaign(context.Background(), nil, omittedIn)
+		if err != nil {
+			t.Fatalf("startCampaign (omitted): %v", err)
+		}
+		if len(fb.createCampaignBody.OperatorAgent) != 0 {
+			t.Errorf("omitted operator_agent: body has operator_agent %s, want absent", fb.createCampaignBody.OperatorAgent)
+		}
+	}
+
+	// Part (b): explicit "operator_agent":{} → non-nil empty map → body carries "{}".
+	{
+		var emptyIn StartCampaignInput
+		if err := json.Unmarshal([]byte(`{"repo":"x/y","epic_ref":"#1","operator_agent":{}}`), &emptyIn); err != nil {
+			t.Fatalf("unmarshal empty {}: %v", err)
+		}
+		if emptyIn.OperatorAgent == nil {
+			t.Fatal("explicit {}: got nil map, want non-nil empty map")
+		}
+		if len(emptyIn.OperatorAgent) != 0 {
+			t.Errorf("explicit {}: map should be empty, got %v", emptyIn.OperatorAgent)
+		}
+
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		_, _, err := r.startCampaign(context.Background(), nil, emptyIn)
+		if err != nil {
+			t.Fatalf("startCampaign (empty {}): %v", err)
+		}
+		if len(fb.createCampaignBody.OperatorAgent) == 0 {
+			t.Fatal("explicit {}: operator_agent absent from POST body, want {}")
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(fb.createCampaignBody.OperatorAgent, &decoded); err != nil {
+			t.Fatalf("operator_agent body not valid JSON: %v", err)
+		}
+		if decoded == nil || len(decoded) != 0 {
+			t.Errorf("explicit {}: body operator_agent decoded to %v, want non-nil empty map", decoded)
+		}
+		if got := string(fb.createCampaignBody.OperatorAgent); got != "{}" {
+			t.Errorf("explicit {}: body operator_agent bytes = %q, want {}", got)
+		}
+	}
+}
+
 // TestStartCampaign_MissingRepo_FailsLocally proves the empty-repo guard
 // rejects before any HTTP call.
 func TestStartCampaign_MissingRepo_FailsLocally(t *testing.T) {
