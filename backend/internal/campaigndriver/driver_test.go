@@ -1,6 +1,7 @@
 package campaigndriver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -243,16 +244,27 @@ func (f *fakeRunReader) setState(id uuid.UUID, s run.State) {
 // scripted outcome (or error). drive lets a test vary the outcome per call and
 // (in the e2e) advance the linked run to simulate the gate action's effect.
 type fakeGateActor struct {
-	mu    sync.Mutex
-	calls []uuid.UUID
-	err   error
-	drive func(runRow *run.Run) (GateActionOutcome, error)
+	mu        sync.Mutex
+	calls     []uuid.UUID
+	overrides [][]byte // campaign operator_agent override bytes per call (E25.12)
+	err       error
+	drive     func(runRow *run.Run) (GateActionOutcome, error)
 }
 
-func (f *fakeGateActor) DriveRunGate(_ context.Context, runRow *run.Run) (GateActionOutcome, error) {
+// DriveRunGate is the base GateActor seam; driveGate only reaches it for a
+// base-only actor. fakeGateActor implements the campaign-aware extension, so the
+// driver calls DriveRunGateWithCampaign instead — this records a nil override.
+func (f *fakeGateActor) DriveRunGate(ctx context.Context, runRow *run.Run) (GateActionOutcome, error) {
+	return f.DriveRunGateWithCampaign(ctx, runRow, nil)
+}
+
+// DriveRunGateWithCampaign records the run and the campaign override bytes the
+// driver threaded, so a test can assert driveGate passed c.OperatorAgent.
+func (f *fakeGateActor) DriveRunGateWithCampaign(_ context.Context, runRow *run.Run, campaignOverride []byte) (GateActionOutcome, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, runRow.ID)
+	f.overrides = append(f.overrides, campaignOverride)
 	if f.err != nil {
 		return GateActionOutcome{}, f.err
 	}
@@ -260,6 +272,17 @@ func (f *fakeGateActor) DriveRunGate(_ context.Context, runRow *run.Run) (GateAc
 		return f.drive(runRow)
 	}
 	return GateActionOutcome{Note: "observe-only"}, nil
+}
+
+// lastOverride returns the campaign override bytes the most recent DriveRunGate
+// call received, so a test can assert driveGate threaded c.OperatorAgent.
+func (f *fakeGateActor) lastOverride() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.overrides) == 0 {
+		return nil
+	}
+	return f.overrides[len(f.overrides)-1]
 }
 
 func (f *fakeGateActor) callCount() int {
@@ -769,6 +792,55 @@ func TestTick_DrivesGateForRunningNonTerminalItem(t *testing.T) {
 		acted[0].payload["run_id"] != r.ID.String() ||
 		acted[0].payload["issue_ref"] != "issue:21" {
 		t.Fatalf("campaign_gate_acted payload = %+v", acted[0].payload)
+	}
+}
+
+// E25.12: driveGate threads the campaign's operator_agent override bytes to the
+// GateActor seam so a campaign's issue-runs resolve their delegation against the
+// campaign block. The bytes the actor receives must be exactly c.OperatorAgent.
+func TestTick_DriveGate_ThreadsCampaignOperatorOverride(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	override := []byte(`{"may_retry":"infra_flake"}`)
+	c.OperatorAgent = override
+	reader := newFakeRunReader()
+	r := reader.put(run.StateRunning) // non-terminal: parked at a gate
+	store.seedItem(c, "issue:31", campaign.ItemStateRunning, nil, &r.ID)
+	au := &fakeAudit{}
+	actor := &fakeGateActor{}
+	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
+	tk.GateActor = actor
+
+	tk.Tick(context.Background())
+
+	if actor.callCount() != 1 {
+		t.Fatalf("actor calls = %d, want 1", actor.callCount())
+	}
+	if got := actor.lastOverride(); !bytes.Equal(got, override) {
+		t.Fatalf("override passed to actor = %q, want %q (driveGate must thread c.OperatorAgent)", got, override)
+	}
+}
+
+// E25.12: a campaign with NO operator_agent override threads nil to the actor —
+// the run then resolves on its own workflow contract (unchanged behavior).
+func TestTick_DriveGate_NilCampaignOverride(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning) // OperatorAgent left nil
+	reader := newFakeRunReader()
+	r := reader.put(run.StateRunning)
+	store.seedItem(c, "issue:32", campaign.ItemStateRunning, nil, &r.ID)
+	au := &fakeAudit{}
+	actor := &fakeGateActor{}
+	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
+	tk.GateActor = actor
+
+	tk.Tick(context.Background())
+
+	if actor.callCount() != 1 {
+		t.Fatalf("actor calls = %d, want 1", actor.callCount())
+	}
+	if got := actor.lastOverride(); got != nil {
+		t.Fatalf("override passed to actor = %q, want nil (no campaign override)", got)
 	}
 }
 

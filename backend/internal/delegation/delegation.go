@@ -163,8 +163,20 @@ func Configured(wf *spec.Workflow) bool {
 // nothing is delegated and the caller omits the surface. Any
 // repository read failure returns an error so the caller can apply its
 // best-effort degradation (warn-log + omit), never a partial answer.
-func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Workflow) (*Result, error) {
-	if !Configured(wf) {
+//
+// campaignOverride is the OPTIONAL campaign-level operator_agent block
+// (E25.12 / #1451): when non-nil it becomes the effective block
+// WHOLESALE — the outermost rung of the campaign > gate > workflow
+// ladder (spec.ResolveOperatorAgent) — so a campaign's issue-runs
+// resolve their delegation against the campaign block, never merged with
+// the per-workflow contract. nil means no campaign context (or the
+// campaign declares no override): resolution falls through to the
+// workflow's own EffectiveOperatorAgent, byte-identical to today.
+func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Workflow, campaignOverride *spec.OperatorAgent) (*Result, error) {
+	// A campaign override governs even a workflow that declares no block of
+	// its own, so the cheap Configured short-circuit only applies when there
+	// is no override to consider.
+	if campaignOverride == nil && !Configured(wf) {
 		return nil, nil
 	}
 
@@ -173,7 +185,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 		return nil, fmt.Errorf("list stages: %w", err)
 	}
 	gated := currentGatedStage(stages)
-	effective := wf.EffectiveOperatorAgent(approvalGateForStage(wf, gated))
+	effective := spec.ResolveOperatorAgent(campaignOverride, wf, approvalGateForStage(wf, gated))
 	if effective == nil {
 		return nil, nil
 	}
