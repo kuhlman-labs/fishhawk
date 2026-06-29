@@ -30,6 +30,7 @@ type campaignFake struct {
 	statusStatus  int
 	statusErrCode string
 	statusResp    httpclient.CampaignStatus
+	statusHit     bool
 
 	listStatus int
 	listResp   httpclient.ListCampaignsResult
@@ -89,6 +90,9 @@ func newCampaignFake(t *testing.T) (*campaignFake, *httptest.Server) {
 		_ = json.NewEncoder(w).Encode(fb.listResp)
 	})
 	mux.HandleFunc("GET /v0/campaigns/{campaign_id}/status", func(w http.ResponseWriter, r *http.Request) {
+		fb.mu.Lock()
+		fb.statusHit = true
+		fb.mu.Unlock()
 		if fb.statusStatus >= 400 {
 			writeErr(w, fb.statusStatus, orDefault(fb.statusErrCode, "campaign_not_found"))
 			return
@@ -404,8 +408,8 @@ func TestCampaignStatus_BadUUID(t *testing.T) {
 	if !strings.Contains(stderr.String(), "not a UUID") {
 		t.Errorf("stderr missing 'not a UUID': %s", stderr.String())
 	}
-	if fb.resumeID != "" {
-		t.Errorf("backend reached despite local UUID validation failure")
+	if fb.statusHit {
+		t.Errorf("status backend reached despite local UUID validation failure")
 	}
 }
 
