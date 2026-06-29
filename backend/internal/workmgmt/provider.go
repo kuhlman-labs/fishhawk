@@ -63,6 +63,55 @@ type NumberDiscoverer interface {
 	DiscoverNumbers(ctx context.Context, req DiscoverNumbersRequest) ([]int, error)
 }
 
+// EpicChildrenQuerier is the optional epic-children query capability
+// (ADR-047 / #1437, the campaign DAG source): given an epic reference, list
+// the epic's child issues and return the depends_on edges among them. Like
+// Transitioner and NumberDiscoverer it is a SEPARATE capability interface
+// rather than folded into Provider, because not every provider can resolve
+// a sub-issue graph (jira is interface-only in v0) and widening Provider
+// would force every registered fake to grow the method. The campaign-
+// assembly path (E25.3) resolves a provider via Get and type-asserts this
+// capability; a provider that does not implement it yields no children.
+//
+// EpicChildren returns the children and the depends_on edges restricted to
+// the sibling (children) set — a child body's reference to an issue that is
+// NOT a child of the queried epic is dropped, because the campaign wave DAG
+// (plan.Waves) is over the epic's own children. The result is the input
+// E25.3 feeds to plan.Waves.
+type EpicChildrenQuerier interface {
+	EpicChildren(ctx context.Context, req EpicChildrenRequest) (*EpicChildrenResult, error)
+}
+
+// EpicChildrenRequest is the resolved input to EpicChildren: the filing
+// Target (repo + installation) and the epic issue reference (`#N` or `N`)
+// whose children and depends_on edges are queried.
+type EpicChildrenRequest struct {
+	Target Target
+	Epic   string
+}
+
+// EpicChildrenResult is the epic-children query output: the epic's child
+// issues and the depends_on edges among them. Children are ordered
+// ascending by number; Edges are deterministically sorted. It is the input
+// E25.3 assembles into the campaign wave DAG (plan.Waves).
+type EpicChildrenResult struct {
+	Children []EpicChild
+	Edges    []DependsEdge
+}
+
+// EpicChild is one child issue of an epic: its number and title.
+type EpicChild struct {
+	Number int
+	Title  string
+}
+
+// DependsEdge is one depends_on edge over the sibling set: From depends on
+// To. Both are child issue numbers of the queried epic.
+type DependsEdge struct {
+	From int
+	To   int
+}
+
 // DiscoverNumbersRequest is the resolved input to NumberDiscoverer: the
 // filing Target (repo + installation), and the numbered type's Prefix (e.g.
 // "ADR-") and TitleFormat (e.g. "[ADR-{number}] {summary}") so the provider

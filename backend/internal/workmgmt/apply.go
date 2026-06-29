@@ -244,7 +244,11 @@ func renderTitle(format, summary string, number, pad int, vars map[string]string
 
 // resolveRelations validates the caller's relations against the type's
 // epic_link rule: "required" rejects a missing parent epic, "none"
-// rejects a supplied one, "optional" (and empty) accepts either.
+// rejects a supplied one, "optional" (and empty) accepts either. It also
+// format-validates each depends_on entry as a well-formed issue reference
+// (`#N` or `N`, positive integer); existence and cycle checks are NOT done
+// here (Apply is pure, and cycle detection needs the full assembled DAG) —
+// they are deferred to campaign-assembly time (E25.3 / #1437).
 func resolveRelations(typeName, epicLink string, rel Relations) (Relations, error) {
 	hasEpic := strings.TrimSpace(rel.ParentEpic) != ""
 	switch epicLink {
@@ -257,7 +261,25 @@ func resolveRelations(typeName, epicLink string, rel Relations) (Relations, erro
 			return Relations{}, &SemanticError{Msg: fmt.Sprintf("type %q does not take a parent epic relation", typeName)}
 		}
 	}
+	for _, dep := range rel.DependsOn {
+		if !isWellFormedIssueRef(dep) {
+			return Relations{}, &SemanticError{Msg: fmt.Sprintf(
+				"depends_on entry %q is not a well-formed issue reference (expected #N or N, a positive integer)", dep)}
+		}
+	}
 	return rel, nil
+}
+
+// issueRefRE matches a well-formed issue reference: an optional leading `#`
+// then a positive integer, surrounding whitespace tolerated. It mirrors the
+// github provider's parseIssueRef so a depends_on edge validates at file
+// time the same way the parent-epic ref resolves at provider time.
+var issueRefRE = regexp.MustCompile(`^\s*#?([1-9]\d*)\s*$`)
+
+// isWellFormedIssueRef reports whether ref is a `#N` or `N` positive-integer
+// issue reference.
+func isWellFormedIssueRef(ref string) bool {
+	return issueRefRE.MatchString(ref)
 }
 
 // assembleBody renders a markdown skeleton when the caller supplies no

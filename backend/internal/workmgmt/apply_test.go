@@ -171,6 +171,40 @@ func TestApply_ChoreAssemblesBodyFromSkeleton(t *testing.T) {
 	}
 }
 
+func TestApply_DependsOnPreservedOnRelations(t *testing.T) {
+	conv := testConventions(t)
+	item, _, err := Apply(FilingRequest{
+		Type:      "chore",
+		Summary:   "depends on siblings",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+		// Mixed `#N` and bare `N` forms both validate at file time.
+		Relations: Relations{DependsOn: []string{"#41", "42"}},
+	}, conv)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if got := strings.Join(item.Relations.DependsOn, ","); got != "#41,42" {
+		t.Errorf("depends_on not carried through Apply: %q", got)
+	}
+}
+
+func TestApply_DependsOnMalformedRejected(t *testing.T) {
+	conv := testConventions(t)
+	_, _, err := Apply(FilingRequest{
+		Type:      "chore",
+		Summary:   "bad dep",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+		Relations: Relations{DependsOn: []string{"#41", "not-a-ref"}},
+	}, conv)
+	var se *SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("want *SemanticError for malformed depends_on, got %v", err)
+	}
+	if !strings.Contains(se.Error(), "depends_on entry") || !strings.Contains(se.Error(), "not-a-ref") {
+		t.Errorf("error should name the malformed value: %q", se.Error())
+	}
+}
+
 func TestApply_UnknownTypeFailsClosed(t *testing.T) {
 	conv := testConventions(t)
 	_, _, err := Apply(FilingRequest{Type: "epic", Summary: "x"}, conv)

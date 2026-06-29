@@ -183,6 +183,16 @@ components:
             supersedes: { type: array, items: { type: string } }
             companion_to: { type: array, items: { type: string } }
             evidence_runs: { type: array, items: { type: string } }
+            depends_on:
+              type: array
+              items: { type: string }
+              description: >-
+                Issue references (`#N` or `N`) this item depends on, among the
+                epic's children. Persisted as a `Depends on: #X, #Y` body
+                marker (GitHub has no native depends_on relation) and read by
+                the campaign epic-children query to assemble its wave DAG
+                (ADR-047). File-time validation is format-only; cycle and
+                existence checks are deferred to campaign-assembly time.
         existing_numbers:
           type: array
           items: { type: integer }

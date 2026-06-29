@@ -18,6 +18,7 @@ type FileIssueRelations struct {
 	Supersedes   []string `json:"supersedes,omitempty" jsonschema:"items this one supersedes"`
 	CompanionTo  []string `json:"companion_to,omitempty" jsonschema:"items this one is a companion to"`
 	EvidenceRuns []string `json:"evidence_runs,omitempty" jsonschema:"Fishhawk run ids that motivated this item, recorded as evidence"`
+	DependsOn    []string `json:"depends_on,omitempty" jsonschema:"issue references (#N or N) this item depends on, among the epic's children; persisted as a body marker and read by the campaign epic-children query to assemble its wave DAG (ADR-047). File-time validation is format-only — cycle/existence checks are deferred to campaign-assembly time"`
 }
 
 // FileIssueInput is the fishhawk_file_issue tool's input schema (#1005).
@@ -74,7 +75,11 @@ body is optional — when omitted the body is assembled from the type's
 skeleton plus per-section content; sections keys must match the type's body
 skeleton exactly (an off-skeleton key fails work_item_invalid rather than
 being silently dropped). relations carries the parent epic, supersedes,
-companion, and evidence-run links. For a child type whose title_format is
+companion, evidence-run, and depends_on links (depends_on is the issue-level
+dependency edge a campaign reads to assemble its wave DAG; its entries are
+issue references among the epic's children, validated for format at file time
+with cycle/existence checks deferred to campaign-assembly time). For a child
+type whose title_format is
 [E{epic}.{n}], the {epic} placeholder is auto-derived from the parent_epic
 relation, so title_vars need only supply {n}; a 422 work_item_invalid lists
 the still-missing placeholders in details.missing_placeholders.
@@ -153,6 +158,7 @@ func (r *runResolver) fileIssue(ctx context.Context, _ *mcp.CallToolRequest, in 
 			Supersedes:   in.Relations.Supersedes,
 			CompanionTo:  in.Relations.CompanionTo,
 			EvidenceRuns: in.Relations.EvidenceRuns,
+			DependsOn:    in.Relations.DependsOn,
 		}
 	}
 

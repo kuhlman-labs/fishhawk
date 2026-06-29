@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/jiraclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
+	workmgmtgithub "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
 	workmgmtjira "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/jira"
 )
 
@@ -236,6 +237,55 @@ func TestFileWorkItem_NoRun_FilesWithoutAudit(t *testing.T) {
 	defer au.mu.Unlock()
 	if len(au.appended) != 0 {
 		t.Errorf("appended %d audit entries, want 0", len(au.appended))
+	}
+}
+
+// TestFileWorkItem_DependsOn_ThreadsToProviderRequest asserts the HTTP
+// relations.depends_on threads through the request -> filing.Relations ->
+// Apply -> the dispatched ProviderRequest (the request->domain half).
+func TestFileWorkItem_DependsOn_ThreadsToProviderRequest(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+
+	s := New(Config{AuditRepo: newAuditFake()})
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "depends on siblings",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+		Relations: &workItemRelations{DependsOn: []string{"#41", "42"}},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	got := fp.captured.Item.Relations.DependsOn
+	if len(got) != 2 || got[0] != "#41" || got[1] != "42" {
+		t.Errorf("provider Item.Relations.DependsOn = %v, want [#41 42]", got)
+	}
+}
+
+// TestFileWorkItem_DependsOn_MalformedRejected asserts a malformed
+// depends_on entry is rejected with 422 work_item_invalid (the file-time
+// format-validation branch in Apply, surfaced through the handler).
+func TestFileWorkItem_DependsOn_MalformedRejected(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+
+	s := New(Config{AuditRepo: newAuditFake()})
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "bad dep",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+		Relations: &workItemRelations{DependsOn: []string{"not-a-ref"}},
+	}, "github:operator")
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "work_item_invalid") {
+		t.Errorf("body should carry work_item_invalid: %s", rec.Body.String())
 	}
 }
 
@@ -1430,5 +1480,127 @@ func TestFileWorkItem_Anonymous_Unauthorized(t *testing.T) {
 	}, "anonymous")
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401 (body=%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// fakeGithubAPI implements github.API so the depends_on end-to-end test can
+// drive the REAL workmgmt/github.Provider — exercising its actual
+// renderDependsOnMarker write at File time and parseDependsOnMarker read at
+// EpicChildren time, not a re-implementation. createdBody captures the body
+// the provider handed CreateIssue (where the depends_on marker is stamped);
+// subIssues is what ListSubIssues returns for the EpicChildren readback.
+type fakeGithubAPI struct {
+	createdBody string
+	subIssues   []githubclient.SubIssue
+}
+
+func (f *fakeGithubAPI) CreateIssue(_ context.Context, _ int64, _ githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
+	f.createdBody = p.Body
+	return &githubclient.CreatedIssue{Number: 4242, NodeID: "CHILD_NODE", HTMLURL: "https://github.com/kuhlman-labs/fishhawk/issues/4242"}, nil
+}
+
+func (f *fakeGithubAPI) IssueNodeID(_ context.Context, _ int64, _ githubclient.RepoRef, _ int) (string, error) {
+	return "EPIC_NODE", nil
+}
+
+func (f *fakeGithubAPI) ProjectFields(_ context.Context, _ int64, _ githubclient.ProjectCoord, _ string) (*githubclient.ProjectMeta, error) {
+	return &githubclient.ProjectMeta{ProjectID: "PROJ", FieldID: "FIELD", StatusOptions: map[string]string{"Backlog": "OPT"}}, nil
+}
+
+func (f *fakeGithubAPI) ProjectItemStatus(_ context.Context, _ int64, _, _, _ string) (*githubclient.ProjectItemStatus, error) {
+	return &githubclient.ProjectItemStatus{OnBoard: true, ItemID: "ITEM"}, nil
+}
+
+func (f *fakeGithubAPI) AddProjectItem(_ context.Context, _ int64, _, _ string) (string, error) {
+	return "ITEM", nil
+}
+
+func (f *fakeGithubAPI) SetProjectItemSingleSelect(_ context.Context, _ int64, _, _, _, _ string) error {
+	return nil
+}
+
+func (f *fakeGithubAPI) AddSubIssue(_ context.Context, _ int64, _, _ string) error { return nil }
+
+func (f *fakeGithubAPI) ListSubIssues(_ context.Context, _ int64, _ string) ([]githubclient.SubIssue, error) {
+	return f.subIssues, nil
+}
+
+func (f *fakeGithubAPI) SearchIssuesByTitle(_ context.Context, _ int64, _ string) ([]githubclient.IssueTitleResult, error) {
+	return nil, nil
+}
+
+func (f *fakeGithubAPI) ProjectsTokenConfigured() bool { return true }
+
+// TestFileWorkItem_DependsOn_EndToEnd is the binding-condition end-to-end
+// test: a SERIALIZED work-item filing request carrying relations.depends_on
+// flows request -> handleFileWorkItem/Apply -> the real github.Provider.File
+// (which stamps the depends_on body marker) -> EpicChildren readback (which
+// parses the marker back into edges). It integration-tests the
+// request->domain->persist->read seam in one test rather than the two halves
+// separately, and asserts a reference to a NON-child is dropped from the edge
+// set.
+func TestFileWorkItem_DependsOn_EndToEnd(t *testing.T) {
+	api := &fakeGithubAPI{}
+	provider := workmgmtgithub.New(api)
+	workmgmt.Register(provider) // registers under "github_projects" (Default().Provider)
+
+	au := newAuditFake()
+	rr := newPromptRunRepo()
+	runID := uuid.New()
+	inst := int64(99)
+	rr.getRuns[runID] = &run.Run{
+		ID:             runID,
+		Repo:           "kuhlman-labs/fishhawk",
+		State:          run.StateRunning,
+		InstallationID: &inst,
+	}
+	s := New(Config{AuditRepo: au, RunRepo: rr})
+
+	// Serialized request: a child carrying depends_on among its epic's
+	// siblings (#41, #42) plus a reference to a NON-child (#999) that the
+	// readback must drop.
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "slice C depends on A and B",
+		TitleVars: map[string]string{"epic": "22", "n": "3"},
+		Relations: &workItemRelations{ParentEpic: "#1005", DependsOn: []string{"#41", "42", "#999"}},
+		RunID:     runID.String(),
+	}, "mcp:run:"+runID.String())
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	// Persist: the provider stamped the depends_on marker into the created
+	// issue body.
+	if !strings.Contains(api.createdBody, "Depends on: #41, #42, #999") {
+		t.Fatalf("created body missing depends_on marker:\n%s", api.createdBody)
+	}
+
+	// Read: EpicChildren parses the stamped body back. The children set is
+	// {41, 42, 4242}; #999 is not a child and must be dropped.
+	api.subIssues = []githubclient.SubIssue{
+		{Number: 41, NodeID: "N41", Title: "slice A", Body: "## Summary\n\nslice A\n"},
+		{Number: 42, NodeID: "N42", Title: "slice B", Body: "## Summary\n\nslice B\n"},
+		{Number: 4242, NodeID: "CHILD_NODE", Title: "slice C", Body: api.createdBody},
+	}
+	res, err := provider.EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+		Target: workmgmt.Target{InstallationID: inst, Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Epic:   "#1005",
+	})
+	if err != nil {
+		t.Fatalf("EpicChildren: %v", err)
+	}
+	if len(res.Children) != 3 || res.Children[0].Number != 41 || res.Children[2].Number != 4242 {
+		t.Fatalf("children = %+v, want ascending 41,42,4242", res.Children)
+	}
+	wantEdges := []workmgmt.DependsEdge{{From: 4242, To: 41}, {From: 4242, To: 42}}
+	if len(res.Edges) != len(wantEdges) {
+		t.Fatalf("edges = %+v, want %+v (the #999 non-child reference must be dropped)", res.Edges, wantEdges)
+	}
+	for i, e := range res.Edges {
+		if e != wantEdges[i] {
+			t.Fatalf("edge[%d] = %+v, want %+v", i, e, wantEdges[i])
+		}
 	}
 }

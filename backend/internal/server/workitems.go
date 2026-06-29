@@ -70,6 +70,7 @@ type workItemRelations struct {
 	Supersedes   []string `json:"supersedes,omitempty"`
 	CompanionTo  []string `json:"companion_to,omitempty"`
 	EvidenceRuns []string `json:"evidence_runs,omitempty"`
+	DependsOn    []string `json:"depends_on,omitempty"`
 }
 
 // workItemResponse echoes exactly what landed: the created item's
@@ -187,6 +188,7 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 			Supersedes:   req.Relations.Supersedes,
 			CompanionTo:  req.Relations.CompanionTo,
 			EvidenceRuns: req.Relations.EvidenceRuns,
+			DependsOn:    req.Relations.DependsOn,
 		}
 	}
 

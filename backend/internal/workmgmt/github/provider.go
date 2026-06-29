@@ -39,6 +39,7 @@ type API interface {
 	AddProjectItem(ctx context.Context, installationID int64, projectID, contentID string) (string, error)
 	SetProjectItemSingleSelect(ctx context.Context, installationID int64, projectID, itemID, fieldID, optionID string) error
 	AddSubIssue(ctx context.Context, installationID int64, parentNodeID, childNodeID string) error
+	ListSubIssues(ctx context.Context, installationID int64, parentNodeID string) ([]githubclient.SubIssue, error)
 	SearchIssuesByTitle(ctx context.Context, installationID int64, query string) ([]githubclient.IssueTitleResult, error)
 	ProjectsTokenConfigured() bool
 }
@@ -47,6 +48,15 @@ type API interface {
 type Provider struct {
 	api API
 }
+
+// Compile-time capability assertions: the GitHub provider implements the
+// optional board-transition, number-discovery, and epic-children capability
+// interfaces in addition to the base Provider.
+var (
+	_ workmgmt.Transitioner        = (*Provider)(nil)
+	_ workmgmt.NumberDiscoverer    = (*Provider)(nil)
+	_ workmgmt.EpicChildrenQuerier = (*Provider)(nil)
+)
 
 // New returns a Provider backed by api (in production *githubclient.Client).
 func New(api API) *Provider { return &Provider{api: api} }
@@ -83,9 +93,17 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 		return nil, errors.New("workmgmt/github: no installation id available; GitHub Projects filing is run-scoped in v0 — file with a run_id whose run carries an installation, or use a provider that needs no installation token")
 	}
 
+	// GitHub has no native issue-to-issue depends_on relation, so a campaign
+	// dependency edge is persisted as a parsed body marker line (ADR-047 /
+	// #1437) — the only derivable mechanism, mirroring the existing
+	// `Parent epic: #N` body convention. ensureDependsOnMarker is idempotent:
+	// it appends the marker only when DependsOn is non-empty and no marker is
+	// already present, so re-filing a body that already carries it is a no-op.
+	body := ensureDependsOnMarker(req.Item.Body, req.Item.Relations.DependsOn)
+
 	issue, err := p.api.CreateIssue(ctx, inst, repo, githubclient.CreateIssueParams{
 		Title:  req.Item.Title,
-		Body:   req.Item.Body,
+		Body:   body,
 		Labels: req.Item.Classification.Labels,
 	})
 	if err != nil {
@@ -416,6 +434,146 @@ func (p *Provider) linkEpic(ctx context.Context, inst int64, repo githubclient.R
 		return fmt.Errorf("workmgmt/github: link parent epic #%d: %w", number, err)
 	}
 	return nil
+}
+
+// EpicChildren lists an epic's child issues and returns the depends_on edges
+// among them (ADR-047 / #1437, the campaign DAG source). It resolves the epic
+// reference to a node id, reads the sub-issues connection, parses each child
+// body for the depends_on marker, and builds a DependsEdge for every
+// referenced number that is itself in the children set — a reference to a
+// non-child is DROPPED, because the campaign wave DAG (plan.Waves) is over the
+// epic's own children. Children are returned ascending by number and edges
+// deterministically sorted (by From, then To) so the result is stable.
+//
+// It validates the target repo + installation (fail closed with File's
+// actionable style). It is the optional workmgmt.EpicChildrenQuerier
+// capability E25.3 calls during campaign assembly.
+func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRequest) (*workmgmt.EpicChildrenResult, error) {
+	if p.api == nil {
+		return nil, errors.New("workmgmt/github: provider missing API client")
+	}
+	if req.Target.Repo.Owner == "" || req.Target.Repo.Name == "" {
+		return nil, errors.New("workmgmt/github: target repo owner and name required")
+	}
+	inst := req.Target.InstallationID
+	if inst == 0 {
+		return nil, errors.New("workmgmt/github: no installation id available; epic-children query is run-scoped in v0 — file with a run_id whose run carries an installation")
+	}
+	number, err := parseIssueRef(req.Epic)
+	if err != nil {
+		return nil, fmt.Errorf("workmgmt/github: epic %q: %w", req.Epic, err)
+	}
+	repo := githubclient.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}
+	epicNodeID, err := p.api.IssueNodeID(ctx, inst, repo, number)
+	if err != nil {
+		return nil, fmt.Errorf("workmgmt/github: resolve epic #%d: %w", number, err)
+	}
+	subs, err := p.api.ListSubIssues(ctx, inst, epicNodeID)
+	if err != nil {
+		return nil, fmt.Errorf("workmgmt/github: list epic #%d children: %w", number, err)
+	}
+
+	// The sibling set: a depends_on reference is an edge only when it points
+	// at another child of this epic.
+	isChild := make(map[int]bool, len(subs))
+	for _, s := range subs {
+		isChild[s.Number] = true
+	}
+
+	children := make([]workmgmt.EpicChild, 0, len(subs))
+	var edges []workmgmt.DependsEdge
+	for _, s := range subs {
+		children = append(children, workmgmt.EpicChild{Number: s.Number, Title: s.Title})
+		for _, dep := range parseDependsOnMarker(s.Body) {
+			if isChild[dep] {
+				edges = append(edges, workmgmt.DependsEdge{From: s.Number, To: dep})
+			}
+		}
+	}
+	sort.Slice(children, func(i, j int) bool { return children[i].Number < children[j].Number })
+	sort.Slice(edges, func(i, j int) bool {
+		if edges[i].From != edges[j].From {
+			return edges[i].From < edges[j].From
+		}
+		return edges[i].To < edges[j].To
+	})
+	return &workmgmt.EpicChildrenResult{Children: children, Edges: edges}, nil
+}
+
+// dependsOnMarkerRE matches the depends_on body marker line and captures the
+// comma-separated reference list. It is the single source of truth for the
+// marker shape paired with renderDependsOnMarker, so a write and a read can
+// never drift. The `(?im)` flags make it case-insensitive and line-anchored
+// so the marker is found wherever it sits in the body.
+var dependsOnMarkerRE = regexp.MustCompile(`(?im)^Depends on:\s*(.+)$`)
+
+// dependsOnRefRE extracts a positive integer issue number from one
+// comma-separated marker token (`#12` or `12`), tolerating surrounding
+// whitespace. Tokens that are not a positive-integer reference are skipped.
+var dependsOnRefRE = regexp.MustCompile(`^\s*#?([1-9]\d*)\s*$`)
+
+// renderDependsOnMarker renders the depends_on body marker line for refs as
+// `Depends on: #X, #Y`. Each ref is normalized to `#N` (a bare `N` gains the
+// `#`). It is the single source of truth for the marker format, paired with
+// parseDependsOnMarker so write and read cannot drift. Returns "" when refs is
+// empty, so an item with no depends_on carries no marker.
+func renderDependsOnMarker(refs []string) string {
+	var parts []string
+	for _, r := range refs {
+		s := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(r), "#"))
+		if s == "" {
+			continue
+		}
+		parts = append(parts, "#"+s)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "Depends on: " + strings.Join(parts, ", ")
+}
+
+// ensureDependsOnMarker appends the depends_on marker line to body when refs
+// is non-empty and body does not already carry a marker. Idempotent: a body
+// that already has a `Depends on:` line is returned unchanged, so re-filing
+// never double-stamps the marker.
+func ensureDependsOnMarker(body string, refs []string) string {
+	marker := renderDependsOnMarker(refs)
+	if marker == "" {
+		return body
+	}
+	if dependsOnMarkerRE.MatchString(body) {
+		return body
+	}
+	if strings.TrimSpace(body) == "" {
+		return marker
+	}
+	return strings.TrimRight(body, "\n") + "\n\n" + marker
+}
+
+// parseDependsOnMarker parses the depends_on body marker line into the
+// referenced issue numbers. It reads the FIRST `Depends on:` line, splits the
+// captured list on commas, and parses each token as a positive-integer issue
+// reference; non-matching tokens are skipped. Returns nil when no marker is
+// present. Paired with renderDependsOnMarker as the single source of truth for
+// the marker round trip.
+func parseDependsOnMarker(body string) []int {
+	m := dependsOnMarkerRE.FindStringSubmatch(body)
+	if m == nil {
+		return nil
+	}
+	var nums []int
+	for _, tok := range strings.Split(m[1], ",") {
+		rm := dependsOnRefRE.FindStringSubmatch(tok)
+		if rm == nil {
+			continue
+		}
+		n, err := strconv.Atoi(rm[1])
+		if err != nil {
+			continue
+		}
+		nums = append(nums, n)
+	}
+	return nums
 }
 
 // parseIssueRef parses "#123" or "123" into the issue number.
