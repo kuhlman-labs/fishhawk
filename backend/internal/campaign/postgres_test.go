@@ -3,6 +3,7 @@ package campaign_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -157,6 +158,66 @@ func TestPostgres_TransitionCampaign(t *testing.T) {
 	}
 }
 
+// TestPostgres_ConcurrentTransitionCampaign_ExactlyOneWins exercises the
+// SELECT … FOR UPDATE serialization that repository.go documents as a
+// load-bearing contract ("two concurrent transition calls observing the same
+// prior state cannot both succeed"). Two goroutines race two DIFFERENT
+// terminal targets from running; exactly one must win and the loser must
+// observe the now-terminal post-transition state and fail with
+// InvalidTransitionError (terminal → terminal is forbidden). Mirrors
+// run.TestPostgres_ConcurrentDifferentTargets_ExactlyOneWins.
+func TestPostgres_ConcurrentTransitionCampaign_ExactlyOneWins(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c := makeCampaign(t, repo)
+	if _, err := repo.TransitionCampaign(ctx, c.ID, campaign.StateRunning); err != nil {
+		t.Fatalf("→running: %v", err)
+	}
+
+	results := make([]error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, err := repo.TransitionCampaign(ctx, c.ID, campaign.StateSucceeded)
+		results[0] = err
+	}()
+	go func() {
+		defer wg.Done()
+		_, err := repo.TransitionCampaign(ctx, c.ID, campaign.StateFailed)
+		results[1] = err
+	}()
+	wg.Wait()
+
+	winners, losers := 0, 0
+	for _, err := range results {
+		if err == nil {
+			winners++
+			continue
+		}
+		var ite campaign.InvalidTransitionError
+		if !errors.As(err, &ite) {
+			t.Errorf("non-winner err = %v, want InvalidTransitionError", err)
+			continue
+		}
+		losers++
+	}
+	if winners != 1 || losers != 1 {
+		t.Errorf("winners=%d losers=%d, want 1 of each", winners, losers)
+	}
+
+	// The campaign settled in exactly one terminal state.
+	final, err := repo.GetCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("get final campaign: %v", err)
+	}
+	if !final.State.IsTerminal() {
+		t.Errorf("final state = %q, want a terminal state", final.State)
+	}
+}
+
 func TestPostgres_CampaignItem_RoundTripAndDependsOn(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := campaign.NewPostgresRepository(pool)
@@ -298,6 +359,70 @@ func TestPostgres_TransitionCampaignItem(t *testing.T) {
 
 	if _, err := repo.TransitionCampaignItem(ctx, uuid.New(), campaign.ItemStateRunning); !errors.Is(err, campaign.ErrNotFound) {
 		t.Errorf("transition(missing) err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestPostgres_ConcurrentTransitionCampaignItem_ExactlyOneWins is the
+// campaign_item analogue of the campaign concurrency test: it covers the
+// LockCampaignItemForUpdate serialization path that CI cannot infer from the
+// sequential happy-path cases. Two goroutines race succeeded vs failed from
+// running; exactly one wins and the loser observes the now-terminal state via
+// InvalidTransitionError.
+func TestPostgres_ConcurrentTransitionCampaignItem_ExactlyOneWins(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c := makeCampaign(t, repo)
+	item, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID,
+		IssueRef:   "issue:1441",
+	})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+	if _, err := repo.TransitionCampaignItem(ctx, item.ID, campaign.ItemStateRunning); err != nil {
+		t.Fatalf("→running: %v", err)
+	}
+
+	results := make([]error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, err := repo.TransitionCampaignItem(ctx, item.ID, campaign.ItemStateSucceeded)
+		results[0] = err
+	}()
+	go func() {
+		defer wg.Done()
+		_, err := repo.TransitionCampaignItem(ctx, item.ID, campaign.ItemStateFailed)
+		results[1] = err
+	}()
+	wg.Wait()
+
+	winners, losers := 0, 0
+	for _, err := range results {
+		if err == nil {
+			winners++
+			continue
+		}
+		var ite campaign.InvalidTransitionError
+		if !errors.As(err, &ite) {
+			t.Errorf("non-winner err = %v, want InvalidTransitionError", err)
+			continue
+		}
+		losers++
+	}
+	if winners != 1 || losers != 1 {
+		t.Errorf("winners=%d losers=%d, want 1 of each", winners, losers)
+	}
+
+	final, err := repo.GetCampaignItem(ctx, item.ID)
+	if err != nil {
+		t.Fatalf("get final item: %v", err)
+	}
+	if !final.State.IsTerminal() {
+		t.Errorf("final item state = %q, want a terminal state", final.State)
 	}
 }
 
