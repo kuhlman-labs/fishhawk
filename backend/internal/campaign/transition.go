@@ -12,6 +12,9 @@ import "fmt"
 // running → succeeded:  every item reached succeeded.
 // running → failed:     a terminal item failure ended the campaign.
 // running → cancelled:  manually halted mid-flight.
+// running → paused:     the auto-driver handed a gate off to a human (E25.7).
+// paused  → running:    a human resumed the campaign after handling the gate.
+// paused  → cancelled:  manually halted while paused.
 var campaignTransitions = map[State]map[State]struct{}{
 	StatePending: {
 		StateRunning:   {},
@@ -21,6 +24,11 @@ var campaignTransitions = map[State]map[State]struct{}{
 	StateRunning: {
 		StateSucceeded: {},
 		StateFailed:    {},
+		StateCancelled: {},
+		StatePaused:    {},
+	},
+	StatePaused: {
+		StateRunning:   {},
 		StateCancelled: {},
 	},
 }
@@ -53,6 +61,9 @@ func ValidCampaignTransition(from, to State) bool {
 // running → succeeded: the item's run succeeded.
 // running → failed:    the item's run failed.
 // running → cancelled: manually halted mid-flight.
+// running → paused:    the auto-driver handed the item's gate off to a human.
+// paused  → running:   resumed after the gate was handled (re-engages next tick).
+// paused  → cancelled: manually halted while paused.
 var campaignItemTransitions = map[ItemState]map[ItemState]struct{}{
 	ItemStatePending: {
 		ItemStateBlocked:   {},
@@ -68,6 +79,11 @@ var campaignItemTransitions = map[ItemState]map[ItemState]struct{}{
 	ItemStateRunning: {
 		ItemStateSucceeded: {},
 		ItemStateFailed:    {},
+		ItemStateCancelled: {},
+		ItemStatePaused:    {},
+	},
+	ItemStatePaused: {
+		ItemStateRunning:   {},
 		ItemStateCancelled: {},
 	},
 }

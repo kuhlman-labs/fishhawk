@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -269,6 +270,45 @@ func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
 		t.Errorf("'campaign_items' table count after MigrateUp = %d, want 1", campaignItemsTable)
 	}
 
+	// 0040 (#1446) widened campaigns_state_check + campaign_items_state_check
+	// to admit 'paused', added campaigns.pause_policy, and added the nullable
+	// campaign_items.pause_reason JSONB. Confirm the columns exist and a
+	// 'paused' campaign + item row insert succeeds (the widened CHECK) —
+	// without the widening a paused row is uninsertable (SQLSTATE 23514).
+	var pausePolicyCol, pauseReasonCol int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'campaigns' AND column_name = 'pause_policy'`,
+	).Scan(&pausePolicyCol); err != nil {
+		t.Fatalf("query campaigns.pause_policy column: %v", err)
+	}
+	if pausePolicyCol != 1 {
+		t.Errorf("campaigns.pause_policy count after MigrateUp = %d, want 1", pausePolicyCol)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'campaign_items' AND column_name = 'pause_reason'`,
+	).Scan(&pauseReasonCol); err != nil {
+		t.Fatalf("query campaign_items.pause_reason column: %v", err)
+	}
+	if pauseReasonCol != 1 {
+		t.Errorf("campaign_items.pause_reason count after MigrateUp = %d, want 1", pauseReasonCol)
+	}
+	campaignID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO campaigns (id, repo, epic_ref, state) VALUES ($1, 'r', 'issue:1', 'paused')`,
+		campaignID,
+	); err != nil {
+		t.Errorf("insert 'paused' campaign after MigrateUp failed (widened CHECK?): %v", err)
+	}
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO campaign_items (id, campaign_id, issue_ref, state, pause_reason)
+		 VALUES ($1, $2, 'issue:2', 'paused', '{"page_event":"campaign_gate_paged"}'::jsonb)`,
+		uuid.New(), campaignID,
+	); err != nil {
+		t.Errorf("insert 'paused' campaign_item after MigrateUp failed (widened CHECK?): %v", err)
+	}
+
 	// Second application is a no-op.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Errorf("second MigrateUp returned %v, want nil (idempotent)", err)
@@ -297,32 +337,59 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0039 (#1437) is now the latest
-	// migration: it created the campaigns + campaign_items tables (the
-	// campaign keystone); its down migration drops both. Confirm the two
-	// campaign tables are gone, but every PRIOR migration's effect is still
-	// present — notably 0038's (#1400) widened stages_type_check ('deploy')
-	// and stages_state_check (the two deploy states), 0037's (#1385)
-	// artifacts_kind_check 'deployment', 0036's (#1346)
-	// runs.runner_kind_resolved column, 0035's (#1231)
-	// stages.scope_completeness_park column and widened stages_state_check,
-	// 0034's (#1141) runs.slice_index column, etc.
+	// MigrateDown rolls back one step. 0040 (#1446) is now the latest
+	// migration: it is an ALTER (widened the campaign state CHECKs to admit
+	// 'paused' and added campaigns.pause_policy + campaign_items.pause_reason),
+	// NOT a table create. So its rollback removes the two added columns and
+	// re-narrows the CHECK (a 'paused' insert is rejected again), while 0039's
+	// (#1437) campaigns + campaign_items tables themselves still EXIST. Every
+	// prior migration's effect is likewise still present — notably 0038's
+	// (#1400) widened stages_type_check ('deploy') and stages_state_check (the
+	// two deploy states), 0037's (#1385) artifacts_kind_check 'deployment',
+	// 0036's (#1346) runs.runner_kind_resolved column, etc.
 	var campaignsTable, campaignItemsTable int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'campaigns'`,
 	).Scan(&campaignsTable); err != nil {
 		t.Fatalf("query campaigns table: %v", err)
 	}
-	if campaignsTable != 0 {
-		t.Errorf("'campaigns' table count after MigrateDown = %d, want 0 (0039 rolled back)", campaignsTable)
+	if campaignsTable != 1 {
+		t.Errorf("'campaigns' table count after MigrateDown = %d, want 1 (0040 is an ALTER; 0039's table survives)", campaignsTable)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'campaign_items'`,
 	).Scan(&campaignItemsTable); err != nil {
 		t.Fatalf("query campaign_items table: %v", err)
 	}
-	if campaignItemsTable != 0 {
-		t.Errorf("'campaign_items' table count after MigrateDown = %d, want 0 (0039 rolled back)", campaignItemsTable)
+	if campaignItemsTable != 1 {
+		t.Errorf("'campaign_items' table count after MigrateDown = %d, want 1 (0040 is an ALTER; 0039's table survives)", campaignItemsTable)
+	}
+	// 0040's two added columns are gone after its rollback.
+	var pausePolicyCol, pauseReasonCol int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'campaigns' AND column_name = 'pause_policy'`,
+	).Scan(&pausePolicyCol); err != nil {
+		t.Fatalf("query campaigns.pause_policy column: %v", err)
+	}
+	if pausePolicyCol != 0 {
+		t.Errorf("campaigns.pause_policy count after MigrateDown = %d, want 0 (0040 rolled back)", pausePolicyCol)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'campaign_items' AND column_name = 'pause_reason'`,
+	).Scan(&pauseReasonCol); err != nil {
+		t.Fatalf("query campaign_items.pause_reason column: %v", err)
+	}
+	if pauseReasonCol != 0 {
+		t.Errorf("campaign_items.pause_reason count after MigrateDown = %d, want 0 (0040 rolled back)", pauseReasonCol)
+	}
+	// The re-narrowed CHECK rejects a 'paused' campaign insert again.
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO campaigns (id, repo, epic_ref, state) VALUES ($1, 'r', 'issue:1', 'paused')`,
+		uuid.New(),
+	); err == nil {
+		t.Error("insert 'paused' campaign after MigrateDown succeeded, want rejection (0040's widened CHECK rolled back)")
 	}
 	var artifactsKindCheckDef string
 	if err := pool.QueryRow(context.Background(),
@@ -691,6 +758,65 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	if runsCount != 1 {
 		t.Errorf("'runs' count after one MigrateDown = %d, want 1 (still present)", runsCount)
+	}
+}
+
+// TestMigrateDown_NormalizesPausedRows is the binding-condition-#1
+// rollback-realism guard: 0040's down migration must NOT fail when live
+// 'paused' rows exist. Before re-adding the narrower state CHECK constraints
+// the down migration normalizes any paused campaign/item to 'running', so the
+// re-add validates instead of raising SQLSTATE 23514. Insert a paused campaign
+// + item, MigrateDown, and assert it succeeds AND the rows were normalized to
+// running (the campaign tables survive — 0040 is an ALTER).
+func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
+	url := startContainer(t)
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// Seed a live paused campaign and a paused item (admitted by 0040).
+	campaignID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO campaigns (id, repo, epic_ref, state) VALUES ($1, 'r', 'issue:1', 'paused')`,
+		campaignID,
+	); err != nil {
+		t.Fatalf("seed paused campaign: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO campaign_items (id, campaign_id, issue_ref, state) VALUES ($1, $2, 'issue:2', 'paused')`,
+		uuid.New(), campaignID,
+	); err != nil {
+		t.Fatalf("seed paused item: %v", err)
+	}
+	pool.Close()
+
+	// The down migration must succeed despite the live paused rows.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown with a paused row present failed (normalization missing?): %v", err)
+	}
+
+	pool, err = postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("re-Connect: %v", err)
+	}
+	defer pool.Close()
+
+	// The paused campaign was normalized to running (not dropped — 0040 is an
+	// ALTER, so 0039's table survives the one-step down).
+	var campaignState string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT state FROM campaigns WHERE id = $1`, campaignID,
+	).Scan(&campaignState); err != nil {
+		t.Fatalf("read campaign state after MigrateDown: %v", err)
+	}
+	if campaignState != "running" {
+		t.Errorf("campaign state after MigrateDown = %q, want running (paused normalized)", campaignState)
 	}
 }
 

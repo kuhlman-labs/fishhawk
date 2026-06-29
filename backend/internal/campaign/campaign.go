@@ -32,9 +32,17 @@ type State string
 
 // Campaign states. Terminal states (Succeeded, Failed, Cancelled) admit no
 // further transitions; see transition.go for the table.
+//
+// `paused` is the safety-boundary overlay (Track C / E25.7): the backend
+// auto-driver pauses a campaign when a run gate refuses a hand-off a human
+// must own (reviewer_reject / requirement_arbitration). It is NON-terminal —
+// a human/operator-agent resumes it (paused → running) once the gate is
+// handled — and is never derived from item states (DeriveState never emits
+// it); only the driver/operator set it.
 const (
 	StatePending   State = "pending"
 	StateRunning   State = "running"
+	StatePaused    State = "paused"
 	StateSucceeded State = "succeeded"
 	StateFailed    State = "failed"
 	StateCancelled State = "cancelled"
@@ -61,10 +69,16 @@ type ItemState string
 
 // Campaign item states. Terminal states (Succeeded, Failed, Cancelled)
 // admit no further transitions; see transition.go for the table.
+//
+// `paused` mirrors the campaign-level overlay: an item whose gate the
+// auto-driver handed off to a human is paused (running → paused) carrying a
+// PauseReason. It is NON-terminal — resuming flips it back to running — and
+// is never derived; only the driver/operator set it.
 const (
 	ItemStatePending   ItemState = "pending"
 	ItemStateBlocked   ItemState = "blocked"
 	ItemStateRunning   ItemState = "running"
+	ItemStatePaused    ItemState = "paused"
 	ItemStateSucceeded ItemState = "succeeded"
 	ItemStateFailed    ItemState = "failed"
 	ItemStateCancelled ItemState = "cancelled"
@@ -80,14 +94,63 @@ func (s ItemState) IsTerminal() bool {
 	}
 }
 
+// PausePolicy governs what the auto-driver pauses when a run gate is handed
+// off to a human (Track C / E25.7). It is an operator-configurable choice set
+// at campaign creation; the zero value normalizes to PausePolicyPauseCampaign
+// (the conservative block-the-campaign safety default for backend auto-drive)
+// — see normalizePausePolicy and campaign.Persist.
+type PausePolicy string
+
+// Pause policies.
+const (
+	// PausePolicyPauseCampaign blocks the whole campaign on a page: the
+	// affected item AND the campaign pause until a human resumes. The default.
+	PausePolicyPauseCampaign PausePolicy = "pause_campaign"
+	// PausePolicyPauseItem pauses only the affected item; sibling items keep
+	// running (continue-others).
+	PausePolicyPauseItem PausePolicy = "pause_item"
+)
+
+// normalizePausePolicy defaults a zero PausePolicy to PausePolicyPauseCampaign
+// so an unset policy persists as the conservative block-the-campaign default
+// and never as an empty string (which would violate the column CHECK). It is
+// the single normalization point shared by campaign.Persist (domain) and the
+// Postgres adapter (defensive, for direct repository callers).
+func normalizePausePolicy(p PausePolicy) PausePolicy {
+	if p == "" {
+		return PausePolicyPauseCampaign
+	}
+	return p
+}
+
+// PauseReason records why an item was paused: the page event (the audit
+// category that triggered the hand-off, e.g. campaign_gate_paged) plus the
+// run/stage and gate the human must act on. Persisted as JSONB on
+// campaign_items.pause_reason and surfaced so the operator sees where the
+// campaign stalled.
+type PauseReason struct {
+	// PageEvent is the audit category that triggered the page (the run-chained
+	// hand-off marker, e.g. "campaign_gate_paged").
+	PageEvent string `json:"page_event,omitempty"`
+	// RunID is the run whose gate was handed off, if any.
+	RunID *uuid.UUID `json:"run_id,omitempty"`
+	// StageID is the gate's stage, if any.
+	StageID *uuid.UUID `json:"stage_id,omitempty"`
+	// Gate names the gate/decision the human must own (e.g. the gate kind).
+	Gate string `json:"gate,omitempty"`
+}
+
 // Campaign is the persisted record of an epic-driven multi-issue campaign.
 type Campaign struct {
-	ID        uuid.UUID
-	Repo      string
-	EpicRef   string // e.g. "issue:1439" — the epic the campaign decomposes
-	State     State
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID      uuid.UUID
+	Repo    string
+	EpicRef string // e.g. "issue:1439" — the epic the campaign decomposes
+	State   State
+	// PausePolicy governs what the auto-driver pauses on a gate hand-off.
+	// Always normalized (never empty) on a persisted campaign.
+	PausePolicy PausePolicy
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 // Item is one issue within a campaign.
@@ -100,8 +163,11 @@ type Item struct {
 	// this item (campaign_items.run_id, ON DELETE SET NULL). Nil until a
 	// run is assigned; nulled (not deleted) if that run is later removed,
 	// preserving campaign history.
-	RunID     *uuid.UUID
-	State     ItemState
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	RunID *uuid.UUID
+	State ItemState
+	// PauseReason carries why a paused item was handed off to a human. Nil
+	// unless the item is (or was) paused. Persisted as JSONB.
+	PauseReason *PauseReason
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
