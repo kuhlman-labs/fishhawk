@@ -57,17 +57,17 @@ func (g *consolidateGitHub) CreateRef(_ context.Context, _ int64, _ githubclient
 	return nil
 }
 
-func (g *consolidateGitHub) MergeBranch(_ context.Context, _ int64, _ githubclient.RepoRef, _, head, _ string) error {
+func (g *consolidateGitHub) MergeBranch(_ context.Context, _ int64, _ githubclient.RepoRef, _, head, _ string) (string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.mergeHeads = append(g.mergeHeads, head)
 	if g.mergeErr != nil {
-		return g.mergeErr
+		return "", g.mergeErr
 	}
 	if g.conflictOnHeadSuffix != "" && strings.HasSuffix(head, g.conflictOnHeadSuffix) {
-		return githubclient.ErrMergeConflict
+		return "", githubclient.ErrMergeConflict
 	}
-	return nil
+	return "mergesha-" + head, nil
 }
 
 func (g *consolidateGitHub) CreatePullRequest(_ context.Context, _ int64, _ githubclient.RepoRef, _, _, _, _ string) (*githubclient.PullRequest, error) {

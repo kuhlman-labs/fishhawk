@@ -638,12 +638,12 @@ func (g *recordingGitHub) CreateRef(_ context.Context, _ int64,
 }
 
 func (g *recordingGitHub) MergeBranch(_ context.Context, _ int64,
-	_ githubclient.RepoRef, base, head, _ string) error {
+	_ githubclient.RepoRef, base, head, _ string) (string, error) {
 	g.mergeCalls = append(g.mergeCalls, head)
 	if err, ok := g.mergeErrByHead[head]; ok {
-		return err
+		return "", err
 	}
-	return nil
+	return "mergesha-" + head, nil
 }
 
 // TestDecomposition_E2E_ConsolidatedPR exercises the #714 / ADR-032 seam

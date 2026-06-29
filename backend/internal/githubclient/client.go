@@ -1234,21 +1234,29 @@ func (c *Client) CreateRef(ctx context.Context, installationID int64,
 //	POST /repos/{owner}/{repo}/merges
 //	{ "base": "<base>", "head": "<head>", "commit_message": "<msg>" }
 //
-// Status mapping (GitHub REST "Merge a branch"): 201 = merged (nil),
-// 204 = nothing to merge / base already contains head (nil, idempotent),
+// Status mapping (GitHub REST "Merge a branch"): 201 = merged — returns the
+// resulting merge commit SHA decoded from the response body's `sha` field;
+// 204 = nothing to merge / base already contains head ("", nil, idempotent);
 // 409 = ErrMergeConflict, 404 = ErrNotFound (base or head missing),
-// 422 = ErrValidation. The 204 case makes a re-entrant settle a clean
-// no-op once a slice is already integrated.
+// 422 = ErrValidation (each returns an empty SHA). The 204 case makes a
+// re-entrant settle a clean no-op once a slice is already integrated.
+//
+// The returned merge commit SHA is recorded by the fan-in caller in the
+// slices_integrated audit payload (#1459) so a later boundary's ADR-035
+// lineage guard attributes the integration merges instead of flagging them
+// foreign. Decode is defensive: an unparseable or absent `sha` in a 201 body
+// returns ("", nil) so a body-shape quirk never wedges an otherwise clean
+// fan-in — the merge still happened; only its SHA goes unrecorded.
 func (c *Client) MergeBranch(ctx context.Context, installationID int64,
-	repo RepoRef, base, head, commitMessage string) error {
+	repo RepoRef, base, head, commitMessage string) (string, error) {
 	if c.Tokens == nil {
-		return errors.New("githubclient: client missing TokenProvider")
+		return "", errors.New("githubclient: client missing TokenProvider")
 	}
 	if repo.Owner == "" || repo.Name == "" {
-		return errors.New("githubclient: repo owner and name required")
+		return "", errors.New("githubclient: repo owner and name required")
 	}
 	if base == "" || head == "" {
-		return errors.New("githubclient: merge base and head required")
+		return "", errors.New("githubclient: merge base and head required")
 	}
 
 	body := map[string]string{"base": base, "head": head}
@@ -1257,20 +1265,20 @@ func (c *Client) MergeBranch(ctx context.Context, installationID int64,
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("githubclient: marshal merge branch: %w", err)
+		return "", fmt.Errorf("githubclient: marshal merge branch: %w", err)
 	}
 
 	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
 		"/" + url.PathEscape(repo.Name) + "/merges")
 	req, err := c.buildRequest(ctx, http.MethodPost, endpoint, bytes.NewReader(raw), installationID)
 	if err != nil {
-		return err
+		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("githubclient: merge branch: %w", err)
+		return "", fmt.Errorf("githubclient: merge branch: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -1279,14 +1287,26 @@ func (c *Client) MergeBranch(ctx context.Context, installationID int64,
 	// before classifyStatus (which has no 409 case).
 	if resp.StatusCode == http.StatusConflict {
 		brief := readBriefBody(resp.Body)
-		return fmt.Errorf("%w: merge %s into %s: %s", ErrMergeConflict, head, base, brief)
+		return "", fmt.Errorf("%w: merge %s into %s: %s", ErrMergeConflict, head, base, brief)
 	}
 	// 204 = base already contains head (nothing to merge) — idempotent
-	// success for a re-entrant fan-in pass.
+	// success for a re-entrant fan-in pass; no merge commit was created.
 	if resp.StatusCode == http.StatusNoContent {
-		return nil
+		return "", nil
 	}
-	return classifyStatus("merge branch", resp)
+	if err := classifyStatus("merge branch", resp); err != nil {
+		return "", err
+	}
+	// 201 Created — decode the merge commit SHA. Defensive: a decode error or
+	// an absent sha returns ("", nil), never an error, so a body-shape quirk
+	// cannot wedge a fan-in whose merge already succeeded.
+	var mergeBody struct {
+		SHA string `json:"sha"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&mergeBody); err != nil {
+		return "", nil
+	}
+	return mergeBody.SHA, nil
 }
 
 // CreatePullRequest opens a pull request from head into base (#714 /

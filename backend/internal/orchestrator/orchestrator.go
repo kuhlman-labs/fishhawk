@@ -74,11 +74,13 @@ type GitHubAPI interface {
 	CreateRef(ctx context.Context, installationID int64,
 		repo githubclient.RepoRef, branch, sha string) error
 	// MergeBranch performs a server-side merge of head into base,
-	// returning ErrMergeConflict on a 409. The fan-in step merges each
+	// returning the resulting merge commit SHA (empty on a 204 nothing-to-
+	// merge) and ErrMergeConflict on a 409. The fan-in step merges each
 	// succeeded slice branch onto the consolidated branch in slice order
-	// (ADR-041 / #1142).
+	// (ADR-041 / #1142) and records each merge SHA in slices_integrated so
+	// the ADR-035 lineage guard attributes the integration merges (#1459).
 	MergeBranch(ctx context.Context, installationID int64,
-		repo githubclient.RepoRef, base, head, commitMessage string) error
+		repo githubclient.RepoRef, base, head, commitMessage string) (string, error)
 }
 
 // ConsolidatedReviewDispatcher dispatches the gating agent implement
@@ -777,15 +779,22 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 	}
 
 	// Merge each succeeded slice in ascending order. A 204 (already merged)
-	// is an idempotent no-op so a resumed pass is clean.
+	// is an idempotent no-op so a resumed pass is clean. Each 201 returns the
+	// integration merge commit SHA, accumulated so slices_integrated records
+	// them for the ADR-035 lineage guard (#1459); a 204 returns "" and is
+	// skipped — the SHA was recorded on the original 201 pass.
 	childIDs := make([]string, 0, len(succeeded))
+	integrationCommitSHAs := make([]string, 0, len(succeeded))
 	for _, c := range succeeded {
 		head := sliceBranch(parent.ID, *c.SliceIndex)
 		msg := fmt.Sprintf("Integrate slice %d (run %s) into %s", *c.SliceIndex, shortRunID(c.ID), consolidated)
-		err := o.GitHub.MergeBranch(ctx, *parent.InstallationID, repo, consolidated, head, msg)
+		mergeSHA, err := o.GitHub.MergeBranch(ctx, *parent.InstallationID, repo, consolidated, head, msg)
 		switch {
 		case err == nil:
 			childIDs = append(childIDs, c.ID.String())
+			if mergeSHA != "" {
+				integrationCommitSHAs = append(integrationCommitSHAs, mergeSHA)
+			}
 		case errors.Is(err, githubclient.ErrMergeConflict):
 			detail := fmt.Sprintf("slice integration conflict: slice %d (child run %s) could not merge onto %s",
 				*c.SliceIndex, c.ID, consolidated)
@@ -799,7 +808,7 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 		}
 	}
 
-	o.emitSlicesIntegrated(ctx, parent.ID, childIDs, consolidated)
+	o.emitSlicesIntegrated(ctx, parent.ID, childIDs, consolidated, integrationCommitSHAs)
 	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator integrated decomposed slices",
 		slog.String("parent_run_id", parent.ID.String()),
 		slog.String("consolidated_branch", consolidated),
@@ -867,16 +876,25 @@ func SliceBranch(parentID uuid.UUID, sliceIndex int) string {
 // branch (#1142). Consumed by E24.7. Best-effort, mirroring
 // emitChildrenSettled: nil-Audit guard, WARN-on-error, never unwinds the
 // settle.
-func (o *Orchestrator) emitSlicesIntegrated(ctx context.Context, parentRunID uuid.UUID, childIDs []string, consolidatedBranch string) {
+//
+// integrationCommitSHAs are the merge commit SHAs the fan-in created on the
+// consolidated branch (one per 201 merge). Recorded additively as
+// integration_commit_shas so the server-side ADR-035 lineage guard can
+// attribute the "Integrate slice N" merges instead of flagging them foreign
+// at a later report boundary (#1459). The existing child_run_ids /
+// consolidated_branch / slice_count fields are unchanged so downstream
+// consumers (children_status, consolidatedBranchFromAudit) are unaffected.
+func (o *Orchestrator) emitSlicesIntegrated(ctx context.Context, parentRunID uuid.UUID, childIDs []string, consolidatedBranch string, integrationCommitSHAs []string) {
 	if o.Audit == nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping slices_integrated entry",
 			slog.String("parent_run_id", parentRunID.String()))
 		return
 	}
 	payload, err := json.Marshal(map[string]any{
-		"child_run_ids":       childIDs,
-		"consolidated_branch": consolidatedBranch,
-		"slice_count":         len(childIDs),
+		"child_run_ids":           childIDs,
+		"consolidated_branch":     consolidatedBranch,
+		"slice_count":             len(childIDs),
+		"integration_commit_shas": integrationCommitSHAs,
 	})
 	if err != nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal slices_integrated payload failed",

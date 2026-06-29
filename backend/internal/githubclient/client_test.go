@@ -2762,10 +2762,15 @@ func TestMergeBranch_Merged(t *testing.T) {
 	cap.mergeStatus = http.StatusCreated
 	cap.mergeRespBody = `{"sha":"mergecommit"}`
 
-	err := c.MergeBranch(context.Background(), 42,
+	sha, err := c.MergeBranch(context.Background(), 42,
 		RepoRef{Owner: "x", Name: "y"}, "fishhawk/run-abc", "fishhawk/run-abc/slice-0", "Integrate slice 0")
 	if err != nil {
 		t.Fatalf("MergeBranch: %v", err)
+	}
+	// The 201 body's sha is the integration merge commit recorded for the
+	// ADR-035 lineage ledger (#1459).
+	if sha != "mergecommit" {
+		t.Errorf("merge sha = %q, want mergecommit", sha)
 	}
 	if cap.mergeBody.Base != "fishhawk/run-abc" || cap.mergeBody.Head != "fishhawk/run-abc/slice-0" {
 		t.Errorf("merge body base/head = %q/%q", cap.mergeBody.Base, cap.mergeBody.Head)
@@ -2775,16 +2780,37 @@ func TestMergeBranch_Merged(t *testing.T) {
 	}
 }
 
+func TestMergeBranch_MergedMissingSHAIsBenign(t *testing.T) {
+	c, cap := fanInClient(t)
+	cap.mergeStatus = http.StatusCreated
+	// A 201 whose body lacks/garbles the sha must NOT wedge a fan-in whose
+	// merge already happened — decode defensively to ("", nil) (#1459).
+	cap.mergeRespBody = `{"not_a_sha":true}`
+
+	sha, err := c.MergeBranch(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, "base", "head", "msg")
+	if err != nil {
+		t.Fatalf("MergeBranch 201 with absent sha should be nil error, got %v", err)
+	}
+	if sha != "" {
+		t.Errorf("merge sha = %q, want empty when 201 body has no sha", sha)
+	}
+}
+
 func TestMergeBranch_NothingToMerge(t *testing.T) {
 	c, cap := fanInClient(t)
 	cap.mergeStatus = http.StatusNoContent
 
 	// 204 = base already contains head — idempotent success for a
-	// re-entrant fan-in pass over an already-integrated slice.
-	err := c.MergeBranch(context.Background(), 42,
+	// re-entrant fan-in pass over an already-integrated slice; no merge
+	// commit was created, so the SHA is empty.
+	sha, err := c.MergeBranch(context.Background(), 42,
 		RepoRef{Owner: "x", Name: "y"}, "base", "head", "msg")
 	if err != nil {
 		t.Fatalf("MergeBranch 204 should be nil, got %v", err)
+	}
+	if sha != "" {
+		t.Errorf("merge sha = %q, want empty on 204", sha)
 	}
 }
 
@@ -2793,10 +2819,13 @@ func TestMergeBranch_Conflict(t *testing.T) {
 	cap.mergeStatus = http.StatusConflict
 	cap.mergeRespBody = `{"message":"Merge conflict"}`
 
-	err := c.MergeBranch(context.Background(), 42,
+	sha, err := c.MergeBranch(context.Background(), 42,
 		RepoRef{Owner: "x", Name: "y"}, "base", "head", "msg")
 	if err == nil || !errors.Is(err, ErrMergeConflict) {
 		t.Errorf("err = %v, want ErrMergeConflict on 409", err)
+	}
+	if sha != "" {
+		t.Errorf("merge sha = %q, want empty on conflict", sha)
 	}
 }
 
@@ -2805,10 +2834,13 @@ func TestMergeBranch_NotFound(t *testing.T) {
 	cap.mergeStatus = http.StatusNotFound
 	cap.mergeRespBody = `{"message":"Not Found"}`
 
-	err := c.MergeBranch(context.Background(), 42,
+	sha, err := c.MergeBranch(context.Background(), 42,
 		RepoRef{Owner: "x", Name: "y"}, "base", "missing", "msg")
 	if err == nil || !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound on 404", err)
+	}
+	if sha != "" {
+		t.Errorf("merge sha = %q, want empty on not found", sha)
 	}
 }
 
@@ -2817,9 +2849,12 @@ func TestMergeBranch_Validation(t *testing.T) {
 	cap.mergeStatus = http.StatusUnprocessableEntity
 	cap.mergeRespBody = `{"message":"Validation Failed"}`
 
-	err := c.MergeBranch(context.Background(), 42,
+	sha, err := c.MergeBranch(context.Background(), 42,
 		RepoRef{Owner: "x", Name: "y"}, "base", "head", "msg")
 	if err == nil || !errors.Is(err, ErrValidation) {
 		t.Errorf("err = %v, want ErrValidation on 422", err)
+	}
+	if sha != "" {
+		t.Errorf("merge sha = %q, want empty on validation error", sha)
 	}
 }

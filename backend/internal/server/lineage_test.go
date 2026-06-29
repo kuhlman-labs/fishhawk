@@ -1305,3 +1305,164 @@ func mustFixupBody(t *testing.T, headSHA string) []byte {
 	}
 	return b
 }
+
+// mustSlicesIntegratedPayload renders a slices_integrated audit payload
+// byte-shaped exactly as Orchestrator.emitSlicesIntegrated writes it (#1459):
+// the four fields child_run_ids / consolidated_branch / slice_count /
+// integration_commit_shas. Only integration_commit_shas drives the lineage
+// ledger, but the test seeds the real shape so a future field rename in the
+// emitter surfaces here.
+func mustSlicesIntegratedPayload(t *testing.T, integrationSHAs []string) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{
+		"child_run_ids":           []string{},
+		"consolidated_branch":     "fishhawk/run-abc",
+		"slice_count":             len(integrationSHAs),
+		"integration_commit_shas": integrationSHAs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestVerifyBranchLineage_ConsolidatedParentFixup_IntegrationMergesAttributed
+// is the #1459 cross-boundary regression: a fix-up on a decomposed parent that
+// has already consolidated. The parent's branch carries the "Integrate slice N"
+// merge commits the fan-in created, recorded in the slices_integrated entry's
+// integration_commit_shas. Before the fix the reported-head ledger had no
+// knowledge of those merges, so CompareCommits(base, head) read them as foreign
+// and the fix-up failed category-B. With the integration-aware ledger every
+// commit attributes and the guard passes. The fix-up head is the only commit
+// the seed covers; the integration merges attribute ONLY via slices_integrated,
+// so this is the load-bearing assertion that the new ledger union works.
+func TestVerifyBranchLineage_ConsolidatedParentFixup_IntegrationMergesAttributed(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	const i0 = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a" // integrate slice 0 merge
+	const i1 = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b" // integrate slice 1 merge
+	const f1 = "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c" // prior fix-up head
+	const f2 = "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d" // current fix-up head (report)
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {i0, i1, f1, f2}},
+	}
+	gh := newLineageGitHubClient(t, stub)
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning, InstallationID: instID(99)}
+	stage := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement,
+		State: run.StageStateRunning, RequiresApproval: true}
+	s, _, au, rr := newLineageServer(t, gh, runRow, stage)
+	// A prior fix-up head on the parent's own chain (attributes f1).
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &runID,
+		Category: "fixup_pushed",
+		Payload:  json.RawMessage(fmt.Sprintf(`{"head_sha":%q}`, f1)),
+	})
+	// The fan-in's slices_integrated entry naming the two integration merges —
+	// the ONLY provenance for i0/i1.
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &runID,
+		Category: "slices_integrated",
+		Payload:  mustSlicesIntegratedPayload(t, []string{i0, i1}),
+	})
+
+	if ok := s.verifyBranchLineage(context.Background(), runID, stage, f2, 42); !ok {
+		t.Fatal("expected ok=true: the integration merges must attribute via slices_integrated")
+	}
+	if v := foreignViolation(au); v != nil {
+		t.Fatalf("unexpected violation on a consolidated-parent fix-up: %+v", v)
+	}
+	if transitionedTo(rr, run.StageStateFailed) {
+		t.Error("stage was failed despite a clean consolidated-parent fix-up")
+	}
+}
+
+// TestVerifyBranchLineage_UnrecordedIntegrationCommitStillFlags is the
+// fail-CLOSED guard for #1459: the integration-aware ledger must NOT whitelist
+// every integration-shaped commit. A commit on the consolidated branch that no
+// slices_integrated entry records still fires foreign_commit_on_branch with
+// that SHA and fails the stage category-B.
+func TestVerifyBranchLineage_UnrecordedIntegrationCommitStillFlags(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	const i0 = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"      // recorded integration merge
+	const foreign = "ffffffffffffffffffffffffffffffffffffffff" // NOT in any slices_integrated entry
+	const f2 = "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"      // fix-up head (report)
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {i0, foreign, f2}},
+	}
+	gh := newLineageGitHubClient(t, stub)
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning, InstallationID: instID(99)}
+	stage := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement,
+		State: run.StageStateRunning, RequiresApproval: true}
+	s, _, au, rr := newLineageServer(t, gh, runRow, stage)
+	// slices_integrated records ONLY i0 — foreign has no provenance anywhere.
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &runID,
+		Category: "slices_integrated",
+		Payload:  mustSlicesIntegratedPayload(t, []string{i0}),
+	})
+
+	if ok := s.verifyBranchLineage(context.Background(), runID, stage, f2, 42); ok {
+		t.Fatal("expected ok=false: an integration-shaped commit absent from slices_integrated is foreign")
+	}
+	v := foreignViolation(au)
+	if v == nil {
+		t.Fatal("expected a foreign_commit_on_branch invariant_violation, got none")
+	}
+	var payload struct {
+		OffendingSHA string `json:"offending_sha"`
+	}
+	if err := json.Unmarshal(v.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal violation payload: %v", err)
+	}
+	if payload.OffendingSHA != foreign {
+		t.Errorf("offending_sha = %q, want %q", payload.OffendingSHA, foreign)
+	}
+	if !transitionedTo(rr, run.StageStateFailed) {
+		t.Error("stage was not failed for an unattributable integration-shaped commit")
+	}
+}
+
+// TestVerifyBranchLineage_SlicesIntegratedReadErrorFailsOpen is the fail-OPEN
+// guard for #1459: a ListForRunByCategory error on the slices_integrated
+// category marks the ledger incomplete, so the guard SKIPS (returns ok=true)
+// rather than enforcing against a partial ledger and false-blocking a clean
+// run. The branch carries a commit that WOULD flag against a complete ledger,
+// proving the pass is the incomplete-ledger skip and not coincidental
+// attribution. Mirrors the existing head/vouch/child read-error fail-open
+// contract.
+func TestVerifyBranchLineage_SlicesIntegratedReadErrorFailsOpen(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	const i0 = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+	const foreign = "ffffffffffffffffffffffffffffffffffffffff" // would flag if the ledger were complete
+	const f2 = "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {i0, foreign, f2}},
+	}
+	gh := newLineageGitHubClient(t, stub)
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning, InstallationID: instID(99)}
+	stage := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement,
+		State: run.StageStateRunning, RequiresApproval: true}
+	s, _, au, rr := newLineageServer(t, gh, runRow, stage)
+	// Fail ONLY the slices_integrated read; every other category delegates to
+	// au and stays readable, so the ledger is incomplete solely because of the
+	// integration-category read error.
+	s.cfg.AuditRepo = &categoryErrAudit{
+		auditFake: au,
+		errFor:    map[string]error{lineageIntegrationLedgerCategory: errors.New("slices_integrated read boom")},
+	}
+
+	if ok := s.verifyBranchLineage(context.Background(), runID, stage, f2, 42); !ok {
+		t.Fatal("expected ok=true: an incomplete ledger must fail open (skip), never false-block")
+	}
+	if v := foreignViolation(au); v != nil {
+		t.Fatalf("fail-open path must not emit a violation: %+v", v)
+	}
+	if transitionedTo(rr, run.StageStateFailed) {
+		t.Error("fail-open path must not fail the stage")
+	}
+}
