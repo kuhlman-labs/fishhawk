@@ -882,6 +882,56 @@ func TestResolveStageTimeout(t *testing.T) {
 	}
 }
 
+// TestResolveReviewTimeout asserts the review-budget-floor resolution ladder
+// (#1494): a non-empty, parseable spec reviewers.review_timeout WINS over the
+// deployment default; an empty string, an unparseable string, a zero duration,
+// and a nil reviewers block all fall back to the default. The unparseable and
+// zero branches are the fail-closed guards — they must yield the default, never
+// a zero Floor (which would silently kill reviewers on tiny prompts).
+func TestResolveReviewTimeout(t *testing.T) {
+	const def = 300 * time.Second
+
+	cases := []struct {
+		name      string
+		reviewers *spec.ReviewersConfig
+		want      time.Duration
+	}{
+		{
+			name:      "spec review_timeout wins over the deployment default",
+			reviewers: &spec.ReviewersConfig{ReviewTimeout: "47s"},
+			want:      47 * time.Second,
+		},
+		{
+			name:      "empty review_timeout falls back to the default",
+			reviewers: &spec.ReviewersConfig{ReviewTimeout: ""},
+			want:      def,
+		},
+		{
+			name:      "unparseable review_timeout falls back to the default",
+			reviewers: &spec.ReviewersConfig{ReviewTimeout: "not-a-duration"},
+			want:      def,
+		},
+		{
+			name:      "zero-duration review_timeout falls back to the default",
+			reviewers: &spec.ReviewersConfig{ReviewTimeout: "0s"},
+			want:      def,
+		},
+		{
+			name:      "nil reviewers block falls back to the default",
+			reviewers: nil,
+			want:      def,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := spec.ResolveReviewTimeout(tc.reviewers, def)
+			if got != tc.want {
+				t.Errorf("ResolveReviewTimeout = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // --- agent_self_retry (ADR-023 / #533) ---
 
 func TestParse_AgentSelfRetry_Absent(t *testing.T) {
@@ -1255,6 +1305,95 @@ workflows:
 	var se *spec.SchemaError
 	if !errors.As(err, &se) {
 		t.Fatalf("err = %v, want *SchemaError for out-of-enum reasoning_effort", err)
+	}
+}
+
+func TestParse_Reviewers_ReviewTimeout_RoundTrip(t *testing.T) {
+	// #1494: a workflow-v1 reviewers.review_timeout parses onto
+	// ReviewersConfig.ReviewTimeout under DisallowUnknownFields and survives a
+	// re-marshal. The field is workflow-v1-only, so the spec is pinned at
+	// version "1.0". An absent field stays empty (falls back to the deployment
+	// default at the seam).
+	withTimeout := []byte(`
+version: "1.0"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agent: 1
+          review_timeout: 5m
+`)
+	s, err := spec.ParseBytes(withTimeout)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	rv := s.Workflows["trivial"].Stages[0].Reviewers
+	if rv == nil || rv.ReviewTimeout != "5m" {
+		t.Fatalf("Reviewers.ReviewTimeout = %+v, want \"5m\"", rv)
+	}
+	out, err := yaml.Marshal(rv)
+	if err != nil {
+		t.Fatalf("re-marshal: %v", err)
+	}
+	if !strings.Contains(string(out), "review_timeout: 5m") {
+		t.Errorf("re-marshalled reviewers = %q, want it to preserve review_timeout: 5m", out)
+	}
+
+	absent := []byte(`
+version: "1.0"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agent: 1
+`)
+	sa, err := spec.ParseBytes(absent)
+	if err != nil {
+		t.Fatalf("Parse absent: %v", err)
+	}
+	if rv := sa.Workflows["trivial"].Stages[0].Reviewers; rv == nil || rv.ReviewTimeout != "" {
+		t.Errorf("absent review_timeout = %+v, want empty string", rv)
+	}
+}
+
+func TestParse_Reviewers_ReviewTimeout_InvalidPattern_Rejected(t *testing.T) {
+	// #1494: the schema duration pattern (^([0-9]+(ns|us|ms|s|m|h))+$) is the
+	// guard at parse time, so a malformed duration string must be rejected by
+	// spec validation rather than reaching ResolveReviewTimeout.
+	yml := []byte(`
+version: "1.0"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agent: 1
+          review_timeout: 5minutes
+`)
+	_, err := spec.ParseBytes(yml)
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError for malformed review_timeout", err)
 	}
 }
 

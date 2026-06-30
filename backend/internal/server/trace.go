@@ -2845,20 +2845,27 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	authorModel := approvedPlan.GeneratedBy.Model
 	reviewCtx := context.WithoutCancel(ctx)
 
+	// Per-stage review-budget floor (#1494): the implement stage's
+	// reviewers.review_timeout OVERRIDES the FISHHAWKD_PLAN_REVIEW_TIMEOUT
+	// deployment default (s.cfg.ReviewBudget.Floor). Only the Floor rung is
+	// overridden; PerKB and Cap stay deployment-level.
+	stageBudget := s.cfg.ReviewBudget
+	stageBudget.Floor = spec.ResolveReviewTimeout(reviewersCfg, s.cfg.ReviewBudget.Floor)
+
 	// Advisory: dispatch detached so the terminal transition can proceed
 	// without waiting on the reviewer.
 	if authority != planreview.AuthorityGating {
 		s.bgReviews.Add(1)
 		go func() {
 			defer s.bgReviews.Done()
-			s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "")
+			s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "", stageBudget)
 		}()
 		return false
 	}
 
 	// Gating: run synchronously so the caller can fail the stage as
 	// category-B before the terminal transition.
-	return s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "")
+	return s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "", stageBudget)
 }
 
 // amendedScopeFilesForReview computes the approval-time scope folds that the
@@ -2964,10 +2971,10 @@ func (s *Server) approvedAmendmentScopePaths(ctx context.Context, runID uuid.UUI
 // supplemental caller passes Origin="base_rebase_reinvoke" + the re-landed
 // head SHA so the additive verdict is labelable and the dispatch idempotent
 // on (stage_id, Origin, HeadSHA).
-func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel, origin, headSHA string) bool {
+func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel, origin, headSHA string, reviewBudget planreview.ReviewBudget) bool {
 	systemKind := audit.ActorKind("system")
 	hasRejection := false
-	budget := s.cfg.ReviewBudget.Budget(len(promptText))
+	budget := reviewBudget.Budget(len(promptText))
 	for i, inv := range invocations {
 		// An unresolvable provider (#955) is handled like a failed
 		// invocation: terminal *_review_failed entry, loop continues,
@@ -3229,6 +3236,13 @@ func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stage
 	authorModel := approvedPlan.GeneratedBy.Model
 	reviewCtx := context.WithoutCancel(ctx)
 
+	// Per-stage review-budget floor (#1494): same resolution as the first
+	// implement review — the stage's reviewers.review_timeout overrides the
+	// FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default; PerKB and Cap stay
+	// deployment-level.
+	stageBudget := s.cfg.ReviewBudget
+	stageBudget.Floor = spec.ResolveReviewTimeout(reviewersCfg, s.cfg.ReviewBudget.Floor)
+
 	// Advisory: dispatch detached so the PR-upload response is not blocked on
 	// the reviewer. Stamp the provenance markers so the additive verdict is
 	// labelable and idempotent. Deliberately no emitReviewStarted (see the
@@ -3237,14 +3251,14 @@ func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stage
 		s.bgReviews.Add(1)
 		go func() {
 			defer s.bgReviews.Done()
-			s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA)
+			s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA, stageBudget)
 		}()
 		return false
 	}
 
 	// Gating: run synchronously so the caller can fail the stage category-B
 	// before responding. Same no-started-emission discipline.
-	return s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA)
+	return s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA, stageBudget)
 }
 
 // supplementalReinvokeReviewAlreadyRecorded reports whether a base-rebase

@@ -35,7 +35,7 @@ func (s *Server) runImplementReviewLoop(ctx context.Context, runID, stageID uuid
 	for i := range invocations {
 		invocations[i] = reviewerInvocation{reviewer: s.defaultPlanReviewer()}
 	}
-	return s.runImplementReviewInvocations(ctx, runID, stageID, invocations, authority, promptText, authorModel, "", "")
+	return s.runImplementReviewInvocations(ctx, runID, stageID, invocations, authority, promptText, authorModel, "", "", s.cfg.ReviewBudget)
 }
 
 // Implement-stage workflow specs with reviewers config. The implement
@@ -80,6 +80,31 @@ workflows:
         reviewers:
           agent: 1
           human: 1
+`)
+
+	// specImplementGatingReviewersV1ReviewTimeout is a workflow-v1 spec whose
+	// implement-stage gating reviewers block declares a per-stage review_timeout
+	// (47s) — observably distinct from the deployment-default floor the #1494
+	// e2e test pins.
+	specImplementGatingReviewersV1ReviewTimeout = []byte(`version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 1
+          human: 0
+          review_timeout: 47s
 `)
 )
 
@@ -771,6 +796,68 @@ func TestShipTrace_ImplementReview_BudgetTimeout_EmitsTimeoutTrue(t *testing.T) 
 	}
 	if !failedEntries[0].Timeout {
 		t.Errorf("timeout = false, want true for a budget-deadline kill")
+	}
+}
+
+// TestShipTrace_ImplementReview_StageReviewTimeoutOverridesDefault is the
+// #1494 cross-boundary seam test for the implement stage, mirroring the
+// plan-stage arm: a spec carrying reviewers.review_timeout drives the
+// review-wait budget FLOOR off that spec value (47s) rather than the
+// FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default (11s). It crosses
+// schema-decode -> ResolveReviewTimeout -> planreview.Budget at the real
+// gating implement-review dispatch site; PerKB/Cap are zeroed so the applied
+// budget equals the resolved Floor, read off the reviewer's invocation deadline.
+func TestShipTrace_ImplementReview_StageReviewTimeoutOverridesDefault(t *testing.T) {
+	rev := &budgetCapturingReviewer{}
+	s, sf, _, _, runRow, implStage := newImplementReviewServer(t, rev, specImplementGatingReviewersV1ReviewTimeout)
+	s.cfg.ReviewBudget = planreview.ReviewBudget{Floor: 11 * time.Second}
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementDiffBundle(t, []map[string]string{
+		{"path": "backend/internal/foo/foo.go", "status": "M"},
+	})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	rev.mu.Lock()
+	budget, hadDeadline := rev.budget, rev.hadDeadline
+	rev.mu.Unlock()
+	if !hadDeadline {
+		t.Fatal("reviewer invocation carried no deadline; budget was not applied")
+	}
+	if budget <= 45*time.Second || budget > 47*time.Second {
+		t.Errorf("review budget = %v, want ~47s (implement stage review_timeout wins over the 11s deployment default)", budget)
+	}
+}
+
+// TestShipTrace_ImplementReview_NoReviewTimeoutUsesDefault is the converse
+// #1494 implement-stage seam test: absent reviewers.review_timeout, the budget
+// FLOOR falls back to the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default. It
+// reuses the v0.3 gating spec (no review_timeout) so the fallback is exercised.
+func TestShipTrace_ImplementReview_NoReviewTimeoutUsesDefault(t *testing.T) {
+	rev := &budgetCapturingReviewer{}
+	s, sf, _, _, runRow, implStage := newImplementReviewServer(t, rev, specImplementGatingReviewers)
+	s.cfg.ReviewBudget = planreview.ReviewBudget{Floor: 11 * time.Second}
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementDiffBundle(t, []map[string]string{
+		{"path": "backend/internal/foo/foo.go", "status": "M"},
+	})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	rev.mu.Lock()
+	budget, hadDeadline := rev.budget, rev.hadDeadline
+	rev.mu.Unlock()
+	if !hadDeadline {
+		t.Fatal("reviewer invocation carried no deadline; budget was not applied")
+	}
+	if budget <= 9*time.Second || budget > 11*time.Second {
+		t.Errorf("review budget = %v, want ~11s (deployment default floor when review_timeout is absent)", budget)
 	}
 }
 
@@ -1468,7 +1555,7 @@ func TestImplementReviewLoop_PersistsConcernsWithOriginSequence(t *testing.T) {
 
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
 		[]reviewerInvocation{{reviewer: rev1}, {reviewer: rev2}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget)
 
 	reviewed := au.entriesByCategory("implement_reviewed")
 	if len(reviewed) != 2 {
@@ -1533,7 +1620,7 @@ func TestImplementReviewLoop_FailedAppendSkipsConcernPersistence(t *testing.T) {
 		model: "claude-opus-4-8",
 	}
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "")
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget)
 
 	rows, _ := cr.ListByRun(context.Background(), runID)
 	if len(rows) != 0 {
@@ -1559,7 +1646,7 @@ func TestImplementReviewLoop_ConcernInsertFailureDoesNotFailLoop(t *testing.T) {
 		model: "claude-opus-4-8",
 	}
 	hasRejection := s.runImplementReviewInvocations(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "")
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget)
 
 	if !hasRejection {
 		t.Error("hasRejection = false, want true (insert failure must not mask the verdict)")
@@ -1599,7 +1686,7 @@ func TestImplementReviewLoop_ConfirmedResolutionTransitionsToAddressed(t *testin
 		model: "claude-opus-4-8",
 	}
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "")
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget)
 
 	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
 	if rows[0].State != concern.StateAddressed {
@@ -1665,7 +1752,7 @@ func TestImplementReviewLoop_ReopenWinsBothOrders(t *testing.T) {
 			}
 			s.runImplementReviewInvocations(context.Background(), runID, stageID,
 				[]reviewerInvocation{{reviewer: revA}, {reviewer: revB}},
-				planreview.AuthorityAdvisory, "prompt", "author", "", "")
+				planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget)
 
 			rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
 			if rows[0].State != concern.StateReopened {
@@ -1706,7 +1793,7 @@ func TestImplementReviewLoop_SloppyResolutionsWarnSkip(t *testing.T) {
 		model: "claude-opus-4-8",
 	}
 	hasRejection := s.runImplementReviewInvocations(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "")
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget)
 	if hasRejection {
 		t.Error("hasRejection = true, want false (sloppy resolutions must not affect the verdict)")
 	}

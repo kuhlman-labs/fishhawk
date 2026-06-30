@@ -1071,6 +1071,13 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	authorModel := parsedPlan.GeneratedBy.Model
 	reviewCtx := context.WithoutCancel(ctx)
 
+	// Per-stage review-budget floor (#1494): the spec's reviewers.review_timeout
+	// OVERRIDES the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default (carried as
+	// s.cfg.ReviewBudget.Floor). Only the Floor rung is overridden; PerKB and Cap
+	// stay deployment-level.
+	stageBudget := s.cfg.ReviewBudget
+	stageBudget.Floor = spec.ResolveReviewTimeout(reviewersCfg, s.cfg.ReviewBudget.Floor)
+
 	// Advisory: dispatch detached so the upload returns promptly. The
 	// goroutine closes over only already-resolved values (built prompt,
 	// IDs, authority, author model) — never r or request-scoped state.
@@ -1078,14 +1085,14 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 		s.bgReviews.Add(1)
 		go func() {
 			defer s.bgReviews.Done()
-			s.runPlanReviewLoop(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel)
+			s.runPlanReviewLoop(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, stageBudget)
 		}()
 		return false
 	}
 
 	// Gating: run synchronously so the failed-B transition lands before
 	// the trace handler advances the stage.
-	hasRejection := s.runPlanReviewLoop(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel)
+	hasRejection := s.runPlanReviewLoop(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, stageBudget)
 	if hasRejection {
 		cat := run.FailureB
 		reason := "plan_review_rejected: agent review verdict reject under gating authority"
@@ -1302,10 +1309,10 @@ func (s *Server) emitReviewFailed(ctx context.Context, runID, stageID uuid.UUID,
 // ctx is the detached review context: per-invocation errors (including a
 // reviewer whose provider failed to resolve) are WARN-logged and skipped
 // so a transient reviewer failure doesn't strand the loop.
-func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel string) bool {
+func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel string, reviewBudget planreview.ReviewBudget) bool {
 	systemKind := audit.ActorKind("system")
 	hasRejection := false
-	budget := s.cfg.ReviewBudget.Budget(len(promptText))
+	budget := reviewBudget.Budget(len(promptText))
 	for i, inv := range invocations {
 		// An unresolvable provider (#955) is handled like a failed
 		// invocation: terminal *_review_failed entry, loop continues,

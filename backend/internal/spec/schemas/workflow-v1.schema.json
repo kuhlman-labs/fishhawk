@@ -795,6 +795,11 @@
           "type": "integer",
           "minimum": 0,
           "description": "Number of human approvers required. 0 means no human approval gate for this plan stage."
+        },
+        "review_timeout": {
+          "type": "string",
+          "pattern": "^([0-9]+(ns|us|ms|s|m|h))+$",
+          "description": "Per-stage review-budget floor (#1494). The stage's review_timeout OVERRIDES the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default — it sets the Floor rung of the size-aware review-wait budget (Floor + PerKB*ceil(promptKB), clamped to [Floor,Cap]) for this stage's agent reviews; the deployment-level PerKB and Cap are unchanged. Parsed by time.ParseDuration; an unparseable or absent value falls back to the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default. Resolved by spec.ResolveReviewTimeout on the backend. Additive optional field within workflow-v1.x — accepted at every advertised version."
         }
       }
     }

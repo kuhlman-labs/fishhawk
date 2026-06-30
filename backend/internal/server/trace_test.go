@@ -4476,6 +4476,63 @@ func TestRunSupplementalReinvokeReview_NoReviewerBackend_Skips(t *testing.T) {
 	}
 }
 
+// TestRunSupplementalReinvokeReview_StageReviewTimeoutOverridesDefault is the
+// #1494 budget-floor seam test for the base-rebase re-invoke dispatch path,
+// mirroring the first-review arm
+// (TestShipTrace_ImplementReview_StageReviewTimeoutOverridesDefault): a spec
+// carrying reviewers.review_timeout (47s) drives the supplemental review's wait
+// budget FLOOR off that spec value rather than the FISHHAWKD_PLAN_REVIEW_TIMEOUT
+// deployment default (11s). The gating spec runs the supplemental review
+// synchronously, so the captured budget is read off the reviewer's invocation
+// deadline immediately. PerKB/Cap are zeroed so the applied budget equals the
+// resolved Floor.
+func TestRunSupplementalReinvokeReview_StageReviewTimeoutOverridesDefault(t *testing.T) {
+	rev := &budgetCapturingReviewer{}
+	s, _, _, _, runRow, implStage := newImplementReviewServer(t, rev, specImplementGatingReviewersV1ReviewTimeout)
+	s.cfg.ReviewBudget = planreview.ReviewBudget{Floor: 11 * time.Second}
+
+	if reject := s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, "feed00dfeed00dfeed00dfeed00dfeed00dfeed0", supplementalExemptions()); reject {
+		t.Fatal("gating supplemental approve must return false")
+	}
+
+	rev.mu.Lock()
+	budget, hadDeadline := rev.budget, rev.hadDeadline
+	rev.mu.Unlock()
+	if !hadDeadline {
+		t.Fatal("reviewer invocation carried no deadline; budget was not applied on the supplemental reinvoke path")
+	}
+	if budget <= 45*time.Second || budget > 47*time.Second {
+		t.Errorf("supplemental review budget = %v, want ~47s (implement stage review_timeout wins over the 11s deployment default)", budget)
+	}
+}
+
+// TestRunSupplementalReinvokeReview_NoReviewTimeoutUsesDefault is the converse
+// #1494 budget-floor seam test for the base-rebase re-invoke dispatch path:
+// absent reviewers.review_timeout, the supplemental review's wait budget FLOOR
+// falls back to the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default. It reuses
+// the v0.3 gating spec (no review_timeout) so the fallback is exercised on the
+// same path TestRunSupplementalReinvokeReview_StageReviewTimeoutOverridesDefault
+// drives.
+func TestRunSupplementalReinvokeReview_NoReviewTimeoutUsesDefault(t *testing.T) {
+	rev := &budgetCapturingReviewer{}
+	s, _, _, _, runRow, implStage := newImplementReviewServer(t, rev, specImplementGatingReviewers)
+	s.cfg.ReviewBudget = planreview.ReviewBudget{Floor: 11 * time.Second}
+
+	if reject := s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, "feed00dfeed00dfeed00dfeed00dfeed00dfeed0", supplementalExemptions()); reject {
+		t.Fatal("gating supplemental approve must return false")
+	}
+
+	rev.mu.Lock()
+	budget, hadDeadline := rev.budget, rev.hadDeadline
+	rev.mu.Unlock()
+	if !hadDeadline {
+		t.Fatal("reviewer invocation carried no deadline; budget was not applied on the supplemental reinvoke path")
+	}
+	if budget <= 9*time.Second || budget > 11*time.Second {
+		t.Errorf("supplemental review budget = %v, want ~11s (deployment default floor when review_timeout is absent)", budget)
+	}
+}
+
 // seedApprovedAmendment creates a pending amendment for the run/stage then
 // approves it, so the fake repo's ListByRun returns an approved row carrying
 // the given path — the second operator-add provenance channel the #1407

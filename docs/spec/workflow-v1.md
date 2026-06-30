@@ -118,6 +118,48 @@ deployment default (FISHHAWKD_CODEX_REASONING_EFFORT)  <  reviewers.agents[i].re
 
 The schema `enum` (`low | medium | high | xhigh | max`) is the sole guard before the value reaches the codex CLI — an out-of-enum value is rejected at spec validation. This mirrors the `executor.model` per-stage override (#1013) and the model-resolution ladder (#1416); it moves what was a single deployment-global `FISHHAWKD_CODEX_REASONING_EFFORT` knob into the versioned, per-reviewer spec.
 
+### `reviewers.review_timeout` (#1494)
+
+The `reviewers` block gains a second **additive optional** field in v1.x: `review_timeout`, a duration string (`time.ParseDuration` form, e.g. `5m`, `600s`). It sets the **Floor** rung of the size-aware review-wait budget (`Floor + PerKB*ceil(promptKB)`, clamped to `[Floor, Cap]`) for **this stage's** agent reviews, so plan and implement stages can carry different review timeouts.
+
+```yaml
+version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agent: 1
+          human: 0
+          review_timeout: 5m # this stage's review-budget floor
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 1
+          human: 0
+          review_timeout: 10m # implement diffs are larger — a longer floor
+```
+
+`review_timeout` is resolved through a two-rung ladder, lowest precedence to highest:
+
+```
+deployment default (FISHHAWKD_PLAN_REVIEW_TIMEOUT)  <  reviewers.review_timeout
+```
+
+- A **non-empty**, parseable spec `review_timeout` **overrides** the `FISHHAWKD_PLAN_REVIEW_TIMEOUT` deployment default for that stage's review budget floor.
+- An **empty/absent** (or unparseable) value falls back to the `FISHHAWKD_PLAN_REVIEW_TIMEOUT` deployment default exactly as before this field existed.
+- Only the **Floor** rung is per-stage; the size-aware `PerKB` and `Cap` rungs (`FISHHAWKD_REVIEW_BUDGET_PER_KB` / `FISHHAWKD_REVIEW_BUDGET_CAP`) stay deployment-level.
+
+The schema `pattern` (`^([0-9]+(ns|us|ms|s|m|h))+$`) is the guard at spec validation; the value is resolved by `spec.ResolveReviewTimeout`, mirroring `spec.ResolveStageTimeout`'s spec-wins precedence.
+
 ## Version routing
 
 The backend (`backend/internal/spec`) and the CLI (`cli/internal/spec`) compile **both** the workflow-v0 and workflow-v1 schemas at init and dispatch a spec to one of them by its `version` **major** component:

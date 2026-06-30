@@ -1844,6 +1844,133 @@ func TestShipPlan_ReviewAgents_BudgetTimeout_EmitsTimeoutTrue(t *testing.T) {
 	}
 }
 
+// budgetCapturingReviewer records the remaining review budget (time.Until the
+// invocation context deadline) observed at the start of its Review call, then
+// returns an approve verdict immediately. It lets a server-level seam test
+// observe the per-invocation budget the dispatch site computed (#1494) without
+// the timing-sensitive blocking of deadlineWaitingReviewer.
+type budgetCapturingReviewer struct {
+	mu          sync.Mutex
+	budget      time.Duration
+	hadDeadline bool
+	model       string
+}
+
+func (b *budgetCapturingReviewer) Review(ctx context.Context, _ string) (*planreview.ReviewVerdict, string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if dl, ok := ctx.Deadline(); ok {
+		b.hadDeadline = true
+		b.budget = time.Until(dl)
+	}
+	model := b.model
+	if model == "" {
+		model = "claude-sonnet-4-6"
+	}
+	return &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model, nil
+}
+
+// specGatingReviewersV1ReviewTimeout is a workflow-v1 plan spec whose gating
+// reviewers block declares a per-stage review_timeout (47s) — observably
+// distinct from the deployment-default floor the e2e test pins.
+var specGatingReviewersV1ReviewTimeout = []byte(`version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 1
+          human: 0
+          review_timeout: 47s
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+
+// specGatingReviewersV1NoReviewTimeout is the same workflow-v1 plan spec with
+// NO review_timeout — the converse case that must fall back to the deployment
+// default floor.
+var specGatingReviewersV1NoReviewTimeout = []byte(`version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 1
+          human: 0
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+
+// TestShipPlan_ReviewBudget_StageReviewTimeoutOverridesDefault is the #1494
+// cross-boundary seam test for the plan stage: a spec carrying
+// reviewers.review_timeout must drive the review-wait budget FLOOR off that
+// spec value (47s) rather than the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment
+// default (11s). It crosses schema-decode -> ResolveReviewTimeout ->
+// planreview.Budget at the real gating dispatch site: PerKB/Cap are zeroed so
+// the applied per-invocation budget equals the resolved Floor exactly, which a
+// budget-capturing reviewer reads off its invocation context deadline.
+func TestShipPlan_ReviewBudget_StageReviewTimeoutOverridesDefault(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	rev := &budgetCapturingReviewer{}
+	s, sf, _, _, _ := newPlanServerWithReviewer(t, runID, stageID, rev, specGatingReviewersV1ReviewTimeout)
+	// Collapse PerKB/Cap so the applied budget == Floor exactly; pin the
+	// deployment-default floor well away from the spec's 47s so the two are
+	// unambiguously distinguishable.
+	s.cfg.ReviewBudget = planreview.ReviewBudget{Floor: 11 * time.Second}
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, validPlanBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	rev.mu.Lock()
+	budget, hadDeadline := rev.budget, rev.hadDeadline
+	rev.mu.Unlock()
+	if !hadDeadline {
+		t.Fatal("reviewer invocation carried no deadline; budget was not applied")
+	}
+	// budget == 47s (spec) minus negligible elapsed; window excludes the 11s
+	// default so a regression to the default fails the test.
+	if budget <= 45*time.Second || budget > 47*time.Second {
+		t.Errorf("review budget = %v, want ~47s (spec review_timeout wins over the 11s deployment default)", budget)
+	}
+}
+
+// TestShipPlan_ReviewBudget_NoReviewTimeoutUsesDefault is the converse #1494
+// seam test: absent reviewers.review_timeout, the budget FLOOR falls back to
+// the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default.
+func TestShipPlan_ReviewBudget_NoReviewTimeoutUsesDefault(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	rev := &budgetCapturingReviewer{}
+	s, sf, _, _, _ := newPlanServerWithReviewer(t, runID, stageID, rev, specGatingReviewersV1NoReviewTimeout)
+	s.cfg.ReviewBudget = planreview.ReviewBudget{Floor: 11 * time.Second}
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, validPlanBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	rev.mu.Lock()
+	budget, hadDeadline := rev.budget, rev.hadDeadline
+	rev.mu.Unlock()
+	if !hadDeadline {
+		t.Fatal("reviewer invocation carried no deadline; budget was not applied")
+	}
+	if budget <= 9*time.Second || budget > 11*time.Second {
+		t.Errorf("review budget = %v, want ~11s (deployment default floor when review_timeout is absent)", budget)
+	}
+}
+
 // TestShipPlan_ReviewAgents_SelfReviewLogsWarn verifies that when the
 // reviewer model matches the plan author model, the server logs a WARN
 // but still records the verdict (no block).
@@ -2521,7 +2648,7 @@ func TestPlanReviewLoop_PersistsConcernsWithOriginSequence(t *testing.T) {
 		model: "gpt-5.5",
 	}
 	s.runPlanReviewLoop(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author-model")
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author-model", planreview.DefaultReviewBudget)
 
 	reviewed := au.entriesByCategory("plan_reviewed")
 	if len(reviewed) != 1 {
