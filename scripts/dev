@@ -472,10 +472,64 @@ _diff_touches_mcp() {
   return 1
 }
 
+# Pure: extract the integer MAJOR component of the `version:` line from raw
+# `.fishhawk/workflows.yaml` text. Echoes the major (the substring before the
+# first '.', with surrounding quotes/whitespace stripped) or nothing when no
+# `version:` line is present. Git-free so scripts/test-dev can drive it with
+# crafted input, mirroring _diff_touches_mcp. Used by _workflow_major_changed
+# to fire the reconnect banner on a schema-MAJOR bump (#1422) — the exact state
+# change that requires the live MCP server to support the new major.
+_extract_workflow_version_major() {
+  local spec_text="$1"
+  local line
+  line="$(print -r -- "$spec_text" | grep -E '^[[:space:]]*version:' | head -n 1)"
+  if [[ -z "$line" ]]; then
+    return 0
+  fi
+  # Take everything after the first colon, strip quotes and whitespace.
+  local val="${line#*:}"
+  val="${val//\"/}"
+  val="${val//\'/}"
+  val="${val//[[:space:]]/}"
+  if [[ -z "$val" ]]; then
+    return 0
+  fi
+  # Major is the substring before the first '.' (or the whole value if none).
+  print -r -- "${val%%.*}"
+}
+
+# Pure: compare the workflow-spec version MAJOR between two raw spec texts.
+# Echoes 1 when the major changed (fire the reconnect banner) or 0 when it did
+# not. A schema-MAJOR bump (e.g. version "0.7" -> "1.0", #1419) is precisely the
+# state that breaks the loop until the live fishhawk-mcp is reconnected (#1422),
+# independent of the merge-aware diff window that today suppresses the banner.
+# Exactly-one-side-present (first introduction / removal of the version line)
+# echoes 1 conservatively; both-empty echoes 0.
+_workflow_major_changed() {
+  local old_text="$1"
+  local new_text="$2"
+  local old_major new_major
+  old_major="$(_extract_workflow_version_major "$old_text")"
+  new_major="$(_extract_workflow_version_major "$new_text")"
+  if [[ -z "$old_major" && -z "$new_major" ]]; then
+    print 0
+    return
+  fi
+  if [[ "$old_major" == "$new_major" ]]; then
+    print 0
+  else
+    print 1
+  fi
+}
+
 # Pure decision helper for the MCP reconnect banner — extracted so the
-# three-branch logic is hermetically testable. The caller runs the git diff and
+# branch logic is hermetically testable. The caller runs the git diff and
 # passes the result in. Echoes 1 (fire the banner) or 0 (stay quiet).
-# Args: <mcp_rebuilt 0|1> <force_all 0|1> <reflog_ok 0|1> <merge_diff_text>
+# Args: <mcp_rebuilt 0|1> <force_all 0|1> <reflog_ok 0|1> <merge_diff_text> [<workflow_major_changed 0|1>]
+#   - workflow major changed       -> 1 (#1422: a schema-major bump requires the
+#                                        live MCP to support the new major; fires
+#                                        even on a plain `up` that did not rebuild
+#                                        mcp, BEFORE the mcp-not-rebuilt return)
 #   - mcp not rebuilt              -> 0
 #   - rebuilt under --all, reflog ok -> consult merge diff (touches mcp ? 1 : 0)
 #   - rebuilt under --all, no reflog -> 1 (safe fallback; never a silent stale mcp)
@@ -486,6 +540,17 @@ _decide_mcp_signal() {
   local force_all="$2"
   local reflog_ok="$3"
   local merge_diff="$4"
+  local workflow_major_changed="${5:-0}"
+
+  # A schema-MAJOR bump (#1422) forces the banner even when mcp was not rebuilt
+  # and even when the merge diff misses mcp source: the LIVE stdio MCP server
+  # validates the spec locally, so a new major it doesn't recognize breaks every
+  # start_run until the operator reconnects. This OR is BEFORE the
+  # mcp-not-rebuilt early return on purpose.
+  if (( workflow_major_changed )); then
+    print 1
+    return
+  fi
 
   if (( ! mcp_rebuilt )); then
     print 0
@@ -510,20 +575,38 @@ _decide_mcp_signal() {
 
 # Emits the MCP reconnect signal — must be the LAST thing printed by up/reload
 # so it is unmissable. Arg 1: 1 if a /mcp reconnect is required this run, else 0.
-# scripts/dev cannot restart the MCP server (the Claude Code harness owns that
-# process), so on a rebuild the only lever is to tell the operator, unmissably,
-# that a manual /mcp reconnect is required or the new binary stays inert.
+# Arg 2 (optional): the reason — "schema_major" prints a distinct, louder line
+# naming the workflow-spec MAJOR bump (#1422) as the trigger; anything else (or
+# unset) keeps the plain-rebuild text. scripts/dev cannot restart the MCP server
+# (the Claude Code harness owns that process), so on a rebuild OR a schema-major
+# bump the only lever is to tell the operator, unmissably, that a manual /mcp
+# reconnect is required or the new binary / new schema major stays inert.
 _signal_mcp_activation() {
   local rebuilt="${1:-0}"
+  local reason="${2:-}"
   if (( rebuilt )); then
-    print ""
-    print "================================================================"
-    print "  ACTION REQUIRED: bin/fishhawk-mcp was rebuilt this run."
-    print ""
-    print "  scripts/dev cannot restart the MCP server — the Claude Code"
-    print "  harness owns that process. Run /mcp to reconnect, or the"
-    print "  rebuilt fishhawk-mcp binary stays inert in this session."
-    print "================================================================"
+    if [[ "$reason" == "schema_major" ]]; then
+      print ""
+      print "################################################################"
+      print "  ACTION REQUIRED: the .fishhawk/workflows.yaml schema MAJOR"
+      print "  changed in this pull (#1422)."
+      print ""
+      print "  The LIVE fishhawk-mcp validates the spec locally. Until you"
+      print "  reconnect, every fishhawk_start_run will fail against the new"
+      print "  major. scripts/dev cannot restart the MCP server — the Claude"
+      print "  Code harness owns that process. Run /mcp to reconnect NOW, or"
+      print "  the loop stays broken in this session."
+      print "################################################################"
+    else
+      print ""
+      print "================================================================"
+      print "  ACTION REQUIRED: bin/fishhawk-mcp was rebuilt this run."
+      print ""
+      print "  scripts/dev cannot restart the MCP server — the Claude Code"
+      print "  harness owns that process. Run /mcp to reconnect, or the"
+      print "  rebuilt fishhawk-mcp binary stays inert in this session."
+      print "================================================================"
+    fi
   else
     print "no MCP reconnect needed (bin/fishhawk-mcp unchanged)"
   fi
@@ -679,8 +762,25 @@ cmd_up() {
   if merge_diff="$(git diff --name-only 'HEAD@{1}' HEAD 2>/dev/null)"; then
     reflog_ok=1
   fi
+
+  # Schema-MAJOR bump detection (#1422): a `.fishhawk/workflows.yaml` version
+  # MAJOR change breaks every fishhawk_start_run because the live stdio MCP
+  # validates the spec locally on the (now stale) binary. This is independent of
+  # the mcp-rebuild / merge-diff signal above — a plain `up` that rebuilt nothing
+  # still needs a reconnect when the pulled spec's major moved. Read the pre-pull
+  # and post-pull spec text via git show; each as an if-condition so a missing
+  # file / unresolvable reflog branches to empty text (treated as no-version)
+  # rather than aborting cmd_up under set -e.
+  local old_spec_text="" new_spec_text=""
+  if ! old_spec_text="$(git show 'HEAD@{1}:.fishhawk/workflows.yaml' 2>/dev/null)"; then old_spec_text=""; fi
+  if ! new_spec_text="$(git show 'HEAD:.fishhawk/workflows.yaml' 2>/dev/null)"; then new_spec_text=""; fi
+  local workflow_major_changed
+  workflow_major_changed="$(_workflow_major_changed "$old_spec_text" "$new_spec_text")"
+
   local mcp_signal
-  mcp_signal="$(_decide_mcp_signal "$mcp_rebuilt" "$force_all" "$reflog_ok" "$merge_diff")"
+  mcp_signal="$(_decide_mcp_signal "$mcp_rebuilt" "$force_all" "$reflog_ok" "$merge_diff" "$workflow_major_changed")"
+  local mcp_reason=""
+  if (( workflow_major_changed )); then mcp_reason="schema_major"; fi
 
   # Migrate
   print "applying migrations..."
@@ -747,8 +847,10 @@ cmd_up() {
 
   print "fishhawkd started (pid ${pid}) — logs: ${LOG_FILE}"
 
-  # Last line(s): tell the operator whether a /mcp reconnect is required.
-  _signal_mcp_activation "$mcp_signal"
+  # Last line(s): tell the operator whether a /mcp reconnect is required. The
+  # reason distinguishes a schema-MAJOR bump (#1422, louder banner) from a plain
+  # rebuild.
+  _signal_mcp_activation "$mcp_signal" "$mcp_reason"
 }
 
 cmd_down() {

@@ -206,6 +206,76 @@ else
   fail "_decide_mcp_signal: branch-diff up rebuild should be 1"
 fi
 
+# 5b. Schema-MAJOR bump signal (#1422). The 5th arg forces the banner even when
+# mcp was not rebuilt and even when the merge diff misses mcp source — the exact
+# false-negative #1422 reported. A 0 (no major change) preserves every prior
+# branch result.
+if [[ "$(_decide_mcp_signal 0 0 1 'runner/internal/plan/coerce.go' 1)" == 1 ]]; then
+  pass "_decide_mcp_signal: schema-major bump forces 1 even when mcp not rebuilt"
+else
+  fail "_decide_mcp_signal: schema-major bump should force 1 when mcp not rebuilt"
+fi
+if [[ "$(_decide_mcp_signal 1 1 1 'runner/internal/plan/coerce.go' 1)" == 1 ]]; then
+  pass "_decide_mcp_signal: schema-major bump forces 1 even when --all diff misses mcp"
+else
+  fail "_decide_mcp_signal: schema-major bump should force 1 when diff misses mcp"
+fi
+if [[ "$(_decide_mcp_signal 0 1 1 'backend/cmd/fishhawk-mcp/main.go' 0)" == 0 ]]; then
+  pass "_decide_mcp_signal: major-changed=0 preserves the mcp-not-rebuilt -> 0 branch"
+else
+  fail "_decide_mcp_signal: major-changed=0 should preserve mcp-not-rebuilt -> 0"
+fi
+if [[ "$(_decide_mcp_signal 1 1 1 'runner/internal/plan/coerce.go' 0)" == 0 ]]; then
+  pass "_decide_mcp_signal: major-changed=0 preserves the --all diff-misses-mcp -> 0 branch"
+else
+  fail "_decide_mcp_signal: major-changed=0 should preserve --all diff-misses-mcp -> 0"
+fi
+# Default 5th arg (omitted) is treated as 0 — backward-compatible with old callers.
+if [[ "$(_decide_mcp_signal 0 1 1 'backend/cmd/fishhawk-mcp/main.go')" == 0 ]]; then
+  pass "_decide_mcp_signal: omitted 5th arg defaults to no-force (0)"
+else
+  fail "_decide_mcp_signal: omitted 5th arg should default to no-force"
+fi
+
+# 5c. _extract_workflow_version_major: pulls the integer major from a version line.
+if [[ "$(_extract_workflow_version_major $'version: "0.7"\nworkflows: {}\n')" == 0 ]]; then
+  pass "_extract_workflow_version_major: 0.7 -> 0"
+else
+  fail "_extract_workflow_version_major: 0.7 should yield 0"
+fi
+if [[ "$(_extract_workflow_version_major $'version: "1.0"\nworkflows: {}\n')" == 1 ]]; then
+  pass "_extract_workflow_version_major: 1.0 -> 1"
+else
+  fail "_extract_workflow_version_major: 1.0 should yield 1"
+fi
+if [[ -z "$(_extract_workflow_version_major $'workflows: {}\n')" ]]; then
+  pass "_extract_workflow_version_major: no version line -> empty"
+else
+  fail "_extract_workflow_version_major: missing version line should yield empty"
+fi
+
+# 5d. _workflow_major_changed: 1 on a major bump, 0 on same major / same minor.
+if [[ "$(_workflow_major_changed $'version: "0.7"\n' $'version: "1.0"\n')" == 1 ]]; then
+  pass "_workflow_major_changed: 0.7 -> 1.0 (major bump) -> 1"
+else
+  fail "_workflow_major_changed: 0.7 -> 1.0 should be 1"
+fi
+if [[ "$(_workflow_major_changed $'version: "0.3"\n' $'version: "0.7"\n')" == 0 ]]; then
+  pass "_workflow_major_changed: 0.3 -> 0.7 (same major) -> 0"
+else
+  fail "_workflow_major_changed: 0.3 -> 0.7 should be 0"
+fi
+if [[ "$(_workflow_major_changed '' $'version: "1.0"\n')" == 1 ]]; then
+  pass "_workflow_major_changed: one side empty (first spec) -> 1"
+else
+  fail "_workflow_major_changed: one-side-empty should be 1"
+fi
+if [[ "$(_workflow_major_changed '' '')" == 0 ]]; then
+  pass "_workflow_major_changed: both empty -> 0"
+else
+  fail "_workflow_major_changed: both-empty should be 0"
+fi
+
 # 7. _healthz_url: derives the port from FISHHAWKD_ADDR, default 8080.
 unset FISHHAWKD_ADDR
 if [[ "$(_healthz_url)" == "http://localhost:8080/healthz" ]]; then
