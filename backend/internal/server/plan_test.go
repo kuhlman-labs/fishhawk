@@ -451,7 +451,7 @@ type singleReviewerSet struct{ reviewer PlanReviewer }
 
 func (s singleReviewerSet) Default() PlanReviewer { return s.reviewer }
 
-func (s singleReviewerSet) For(provider, _ string) (PlanReviewer, error) {
+func (s singleReviewerSet) For(provider, _ string, _ ...string) (PlanReviewer, error) {
 	if s.reviewer == nil {
 		return nil, fmt.Errorf("reviewer provider %q is not configured", provider)
 	}
@@ -468,7 +468,7 @@ type fakeReviewerSet struct {
 
 func (s fakeReviewerSet) Default() PlanReviewer { return s.def }
 
-func (s fakeReviewerSet) For(provider, _ string) (PlanReviewer, error) {
+func (s fakeReviewerSet) For(provider, _ string, _ ...string) (PlanReviewer, error) {
 	r, ok := s.providers[provider]
 	if !ok {
 		return nil, fmt.Errorf("reviewer provider %q is not configured", provider)
@@ -476,18 +476,23 @@ func (s fakeReviewerSet) For(provider, _ string) (PlanReviewer, error) {
 	return r, nil
 }
 
-// capturingReviewerSet records every (provider, model) pair passed to For so a
-// test can assert which model the review-model override (#1416) threaded into the
-// adapter lookup.
+// capturingReviewerSet records every (provider, model, reasoningEffort) tuple
+// passed to For so a test can assert which model the review-model override
+// (#1416) and which reasoning effort the per-reviewer spec value (#1493)
+// threaded into the adapter lookup.
 type capturingReviewerSet struct {
 	reviewer PlanReviewer
-	calls    []struct{ provider, model string }
+	calls    []struct{ provider, model, reasoningEffort string }
 }
 
 func (s *capturingReviewerSet) Default() PlanReviewer { return s.reviewer }
 
-func (s *capturingReviewerSet) For(provider, model string) (PlanReviewer, error) {
-	s.calls = append(s.calls, struct{ provider, model string }{provider, model})
+func (s *capturingReviewerSet) For(provider, model string, reasoningEffort ...string) (PlanReviewer, error) {
+	effort := ""
+	if len(reasoningEffort) > 0 {
+		effort = reasoningEffort[0]
+	}
+	s.calls = append(s.calls, struct{ provider, model, reasoningEffort string }{provider, model, effort})
 	return s.reviewer, nil
 }
 
@@ -542,6 +547,43 @@ func TestResolveReviewerInvocations_ReviewModelOverride(t *testing.T) {
 			t.Fatalf("count form called For %d times, want 0 (Default-only)", len(set.calls))
 		}
 	})
+}
+
+// TestResolveReviewerInvocations_ReasoningEffort is the cross-boundary e2e
+// (#1493): a reviewers.agents entry's spec-declared reasoning_effort flows
+// through resolveReviewerInvocations into the ReviewerSet.For lookup (third
+// arg) and is recorded on the invocation, proving the spec value crosses the
+// spec/server/seam boundary. An absent reasoning_effort threads empty — the
+// seam then falls back to the deployment default (asserted deployment-side in
+// serve_test.go).
+func TestResolveReviewerInvocations_ReasoningEffort(t *testing.T) {
+	cfg := &spec.ReviewersConfig{Agents: []spec.AgentReviewer{
+		{Provider: "codex", Model: "spec-gpt", ReasoningEffort: "high"},
+		{Provider: "anthropic", Model: "spec-opus"},
+	}}
+	set := &capturingReviewerSet{reviewer: &fakePlanReviewer{}}
+	s := New(Config{PlanReviewers: set})
+
+	invs := s.resolveReviewerInvocations(cfg)
+	if len(invs) != 2 {
+		t.Fatalf("got %d invocations, want 2", len(invs))
+	}
+	// The codex reviewer's spec reasoning_effort reaches For verbatim...
+	if set.calls[0].reasoningEffort != "high" {
+		t.Errorf("For call 0 reasoningEffort = %q, want high", set.calls[0].reasoningEffort)
+	}
+	// ...and is recorded on the invocation (symmetry with specModel).
+	if invs[0].reasoningEffort != "high" {
+		t.Errorf("invs[0].reasoningEffort = %q, want high", invs[0].reasoningEffort)
+	}
+	// The reviewer with no declared effort threads empty (env-default fallback
+	// happens at the seam, not here).
+	if set.calls[1].reasoningEffort != "" {
+		t.Errorf("For call 1 reasoningEffort = %q, want empty (absent → seam fallback)", set.calls[1].reasoningEffort)
+	}
+	if invs[1].reasoningEffort != "" {
+		t.Errorf("invs[1].reasoningEffort = %q, want empty", invs[1].reasoningEffort)
+	}
 }
 
 // blockingPlanReviewer blocks each Review call until release is closed,

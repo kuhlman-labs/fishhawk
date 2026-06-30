@@ -144,14 +144,16 @@ func (p *planReviewerSet) newClaudeCode(model string) server.PlanReviewer {
 	return reviewer
 }
 
-func (p *planReviewerSet) newCodex(model string) server.PlanReviewer {
+func (p *planReviewerSet) newCodex(model, reasoningEffort string) server.PlanReviewer {
 	reviewer := codex.NewReviewer(codex.Config{
 		Binary: p.opts.codexBinary,
 		APIKey: p.opts.openAIAPIKey,
 		Model:  model,
-		// Reasoning effort stays a deployment-level knob; the spec carries
-		// provider+model only (#955).
-		ReasoningEffort: p.opts.codexEffort,
+		// Reasoning effort is now a per-reviewer ladder (#1493): the spec's
+		// reviewers.agents[i].reasoning_effort wins over the deployment default
+		// (FISHHAWKD_CODEX_REASONING_EFFORT). The caller resolves the rung; this
+		// constructor carries the resolved value verbatim.
+		ReasoningEffort: reasoningEffort,
 		MaxTokens:       p.opts.planReviewMaxTokens,
 		Timeout:         p.opts.planReviewTimeout,
 	})
@@ -171,18 +173,40 @@ func (p *planReviewerSet) Default() server.PlanReviewer {
 	case p.opts.enableLocalClaudeReviewer:
 		return p.newClaudeCode(p.opts.localClaudeModel)
 	case p.opts.enableCodexReviewer:
-		return p.newCodex(p.opts.codexModel)
+		// Bare count form carries no spec reasoning_effort — resolve to the
+		// deployment default (#1493), byte-identical to today.
+		return p.newCodex(p.opts.codexModel, p.resolveCodexEffort(""))
 	default:
 		return nil
 	}
 }
 
+// resolveCodexEffort applies the per-reviewer reasoning-effort ladder for the
+// codex adapter (#1493): the spec-declared value wins over the deployment
+// default (FISHHAWKD_CODEX_REASONING_EFFORT), an empty spec value falls back to
+// the env default, and both-empty carries no override (the codex CLI then
+// inherits the host ~/.codex config, byte-identical to today). It routes
+// through the exported server chokepoint so the env-default rung resolves the
+// same way the spec rung does.
+func (p *planReviewerSet) resolveCodexEffort(specEffort string) string {
+	return server.ResolveReviewerReasoningEffort(p.opts.codexEffort, specEffort).Value
+}
+
 // For resolves one spec-declared reviewer (reviewers.agents[i]) to its
 // adapter, constructed with the requested model. An empty model falls back
-// to that provider's deployment-configured default model. Errors when the
-// provider is not configured in this deployment, naming the env knob that
-// enables it.
-func (p *planReviewerSet) For(provider, model string) (server.PlanReviewer, error) {
+// to that provider's deployment-configured default model. The optional
+// reasoningEffort (first variadic value, empty when omitted) is codex-only
+// (#1493): the codex branch resolves it through the per-reviewer
+// ladder (deployment default FISHHAWKD_CODEX_REASONING_EFFORT < spec value), so
+// an empty spec value falls back to the env default exactly as today; the
+// anthropic/claudecode branches accept and ignore it (their adapters take no
+// reasoning-effort parameter). Errors when the provider is not configured in
+// this deployment, naming the env knob that enables it.
+func (p *planReviewerSet) For(provider, model string, reasoningEffort ...string) (server.PlanReviewer, error) {
+	effort := ""
+	if len(reasoningEffort) > 0 {
+		effort = reasoningEffort[0]
+	}
 	switch provider {
 	case "anthropic":
 		if p.opts.anthropicAPIKey == "" {
@@ -207,7 +231,7 @@ func (p *planReviewerSet) For(provider, model string) (server.PlanReviewer, erro
 		if model == "" {
 			model = p.opts.codexModel
 		}
-		return p.newCodex(model), nil
+		return p.newCodex(model, p.resolveCodexEffort(effort)), nil
 	default:
 		return nil, fmt.Errorf("unknown reviewer provider %q (expected anthropic, claudecode, or codex)", provider)
 	}

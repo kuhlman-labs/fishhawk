@@ -1649,7 +1649,7 @@ func (s *Server) gatingReviewerProblem(reviewers *spec.ReviewersConfig) string {
 			return "workflow declares agent-gated review with a reviewers.agents list but fishhawkd has no reviewer set wired; set FISHHAWKD_ANTHROPIC_API_KEY, FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER, or FISHHAWKD_ENABLE_CODEX_REVIEWER, or remove reviewers.agents"
 		}
 		for _, a := range reviewers.Agents {
-			if _, err := s.cfg.PlanReviewers.For(a.Provider, a.Model); err != nil {
+			if _, err := s.cfg.PlanReviewers.For(a.Provider, a.Model, a.ReasoningEffort); err != nil {
 				return fmt.Sprintf("workflow declares agent-gated review naming reviewer provider %q but it does not resolve (%s); enable it (%s) or remove the reviewers.agents entry",
 					a.Provider, err.Error(), reviewerProviderEnvKnob(a.Provider))
 			}

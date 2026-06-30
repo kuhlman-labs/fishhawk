@@ -83,6 +83,41 @@ workflows:
 
 See [ADR-038 (#925)](https://github.com/kuhlman-labs/fishhawk/issues/925) for the delegating-only deploy decision and epic [#924](https://github.com/kuhlman-labs/fishhawk/issues/924) for the deploy workstream.
 
+## Reviewer policy (v1)
+
+The inherited `reviewers.agents[]` heterogeneous reviewer list (#955) gains one **additive optional** field in v1.x: `reasoning_effort` (#1493). It is a **codex-only** per-reviewer knob — the anthropic and claudecode adapters take no reasoning-effort parameter and ignore it.
+
+```yaml
+version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agents:
+            - provider: codex
+              reasoning_effort: high # low | medium | high | xhigh | max
+            - provider: anthropic # no reasoning_effort — ignored anyway
+          human: 1
+```
+
+`reasoning_effort` is resolved through a two-rung ladder, lowest precedence to highest:
+
+```
+deployment default (FISHHAWKD_CODEX_REASONING_EFFORT)  <  reviewers.agents[i].reasoning_effort
+```
+
+- A **non-empty** spec value wins and is passed to the codex adapter as a `-c model_reasoning_effort=<effort>` CLI override.
+- An **empty/absent** spec value falls back to the deployment default exactly as before this field existed; when both are empty the codex CLI inherits the host `~/.codex` config.
+
+The schema `enum` (`low | medium | high | xhigh | max`) is the sole guard before the value reaches the codex CLI — an out-of-enum value is rejected at spec validation. This mirrors the `executor.model` per-stage override (#1013) and the model-resolution ladder (#1416); it moves what was a single deployment-global `FISHHAWKD_CODEX_REASONING_EFFORT` knob into the versioned, per-reviewer spec.
+
 ## Version routing
 
 The backend (`backend/internal/spec`) and the CLI (`cli/internal/spec`) compile **both** the workflow-v0 and workflow-v1 schemas at init and dispatch a spec to one of them by its `version` **major** component:
