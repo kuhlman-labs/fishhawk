@@ -2769,7 +2769,13 @@ paths:
                     non-deploy default) leaves the gate evaluating the
                     current run. DISTINCT from `parent_run_id` (#216) —
                     a deploy-gate safety reference, not a follow-up /
-                    lineage link. Persisted on the run row and echoed
+                    lineage link. Because it controls a safety-critical
+                    deploy gate, the gate validates the reference's
+                    provenance at evaluation time: the upstream must be a
+                    `feature_change` run in the SAME REPO as the deploy
+                    run; a cross-repo or non-`feature_change` reference is
+                    treated as unresolved and fails the gate closed.
+                    Persisted on the run row and echoed
                     back as `upstream_run_id` on the Run resource.
       responses:
         '200':

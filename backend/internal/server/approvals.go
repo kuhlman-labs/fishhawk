@@ -2231,6 +2231,16 @@ func sliceContains(xs []string, want string) bool {
 // the self-vs-upstream decision and its fail-closed semantics live in one
 // place. NOTE: the cross-run reference is upstream_run_id, NOT parent_run_id
 // (#216) — a deploy-gate safety pointer kept off the follow-up/lineage column.
+//
+// PROVENANCE VALIDATION (#1417 review): the FK guarantees upstream_run_id names
+// a real run, but not an APPROPRIATE one. The deploy safety gate keys off this
+// run's ci_green / review_merged, so the resolved upstream must be the kind of
+// run the plan/docs describe — a feature_change run IN THE SAME REPO. Without
+// these checks a release run in repo A could be pointed at an unrelated green/
+// merged run in repo B (or a non-feature_change workflow whose ci_green means
+// something else), satisfying a safety-critical gate against the wrong run's CI
+// state. A mismatch is treated as UNRESOLVED (return nil) so the caller fails
+// the gate closed — the safe direction for a pre-execution deploy gate.
 func (s *Server) deployEvalRun(ctx context.Context, runRow *run.Run) *run.Run {
 	if runRow.UpstreamRunID == nil {
 		return runRow
@@ -2241,6 +2251,23 @@ func (s *Server) deployEvalRun(ctx context.Context, runRow *run.Run) *run.Run {
 			slog.String("run_id", runRow.ID.String()),
 			slog.String("upstream_run_id", runRow.UpstreamRunID.String()),
 			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	if up.Repo != runRow.Repo {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "deploy gate: upstream run is in a different repo; treating as unresolved (fail-closed)",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("upstream_run_id", up.ID.String()),
+			slog.String("repo", runRow.Repo),
+			slog.String("upstream_repo", up.Repo),
+		)
+		return nil
+	}
+	if up.WorkflowID != "feature_change" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "deploy gate: upstream run is not a feature_change run; treating as unresolved (fail-closed)",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("upstream_run_id", up.ID.String()),
+			slog.String("upstream_workflow_id", up.WorkflowID),
 		)
 		return nil
 	}

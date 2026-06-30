@@ -4567,6 +4567,50 @@ func TestDeployGate_UpstreamReviewMerged_NoSucceededReview_Refuses(t *testing.T)
 	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
 }
 
+// FAIL-CLOSED mode (e) — WRONG REPO (#1417 review): the upstream resolves and
+// is otherwise fully green, but it belongs to a DIFFERENT repo than the deploy
+// run. deployEvalRun's provenance guard treats it as unresolved so the gate
+// refuses — a release run in repo A must not gate on repo B's CI state.
+func TestDeployGate_UpstreamWrongRepo_Refuses(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	scs := newFakeStageCheckRepo()
+	s.cfg.StageCheckRepo = scs
+	stage, deployRun := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
+	up := seedUpstreamRun(rr, deployRun)
+	// Make the upstream otherwise-satisfiable so ONLY the repo mismatch refuses.
+	up.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
+	implStage := rr.seedStageOnRun(up.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	success := "success"
+	scs.byKey[scs.keyFor(implStage.ID, "ci/build")] = &stagecheck.Check{
+		StageID: implStage.ID, Name: "ci/build", Status: "completed", Conclusion: &success,
+	}
+	up.Repo = "other-org/other-repo" // cross-repo reference → unresolved → fail closed
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+}
+
+// FAIL-CLOSED mode (f) — WRONG WORKFLOW (#1417 review): the upstream resolves,
+// is same-repo, and is otherwise fully green, but its workflow is NOT
+// feature_change. deployEvalRun's provenance guard treats it as unresolved so
+// the gate refuses — ci_green on a non-feature_change run is not the signal the
+// plan/docs describe.
+func TestDeployGate_UpstreamWrongWorkflow_Refuses(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	scs := newFakeStageCheckRepo()
+	s.cfg.StageCheckRepo = scs
+	stage, deployRun := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
+	up := seedUpstreamRun(rr, deployRun)
+	up.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
+	implStage := rr.seedStageOnRun(up.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	success := "success"
+	scs.byKey[scs.keyFor(implStage.ID, "ci/build")] = &stagecheck.Check{
+		StageID: implStage.ID, Name: "ci/build", Status: "completed", Conclusion: &success,
+	}
+	up.WorkflowID = "release" // not a feature_change run → unresolved → fail closed
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+}
+
 // (g) all constraints satisfied → happy path proceeds to dispatch.
 func TestDeployGate_AllConstraintsSatisfied(t *testing.T) {
 	s, _, rr, _ := newApprovalServer(t)
