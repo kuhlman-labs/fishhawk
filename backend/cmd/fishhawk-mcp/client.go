@@ -1295,6 +1295,60 @@ func (c *apiClient) ResumeCampaign(ctx context.Context, id uuid.UUID) (*Campaign
 	return &camp, nil
 }
 
+// startCampaignItemRunRequest mirrors the backend's POST
+// /v0/campaigns/{campaign_id}/runs body
+// (`backend/internal/server/campaigns.go::startCampaignItemRunRequest`).
+// Repeated here for the same thin-local-copy reason as createRunRequest. There
+// is deliberately NO idempotency_key field — the backend does not dedup this
+// create-link-transition sequence, so the request shape advertises none (#1443
+// honesty).
+type startCampaignItemRunRequest struct {
+	IssueRef    string `json:"issue_ref"`
+	WorkflowID  string `json:"workflow_id"`
+	WorkflowRef string `json:"workflow_ref,omitempty"`
+	RunnerKind  string `json:"runner_kind,omitempty"`
+}
+
+// StartCampaignItemRunResult mirrors the backend's POST
+// /v0/campaigns/{campaign_id}/runs 201 body: the minted run plus the linked
+// campaign item (now running, with run_id set).
+type StartCampaignItemRunResult struct {
+	Run  Run          `json:"run"`
+	Item CampaignItem `json:"item"`
+}
+
+// StartCampaignItemRun starts a run for an eligible campaign item via
+// `POST /v0/campaigns/{campaign_id}/runs` (E26.2 / #1481) — the operator-driven,
+// campaign-aware run start that DAG-gates each run and links it to the campaign
+// so the rollup advances as the operator drives the loop. workflowRef empty =
+// the repo's default branch; runnerKind empty = github_actions ("local" for the
+// local dogfood loop). A write tool: requires write:campaigns. 4xx/5xx surfaces:
+//   - 400 validation_failed (campaign_id not a UUID, empty issue_ref/workflow_id,
+//     bad runner_kind, unknown fields)
+//   - 403 insufficient_scope (token lacks write:campaigns)
+//   - 404 campaign_not_found / campaign_item_not_found
+//   - 409 campaign_not_startable (the campaign is paused or terminal)
+//   - 409 item_not_eligible (the item is blocked on a dependency, already
+//     running, or terminal — the detail names the blocker)
+//   - 502 campaign_run_start_failed (the installation/spec could not be resolved)
+//   - 503 campaign_repo_unconfigured
+func (c *apiClient) StartCampaignItemRun(ctx context.Context, campaignID uuid.UUID, issueRef, workflowID, workflowRef, runnerKind string) (*StartCampaignItemRunResult, error) {
+	body, err := json.Marshal(startCampaignItemRunRequest{
+		IssueRef:    issueRef,
+		WorkflowID:  workflowID,
+		WorkflowRef: workflowRef,
+		RunnerKind:  runnerKind,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal start campaign item run: %w", err)
+	}
+	var res StartCampaignItemRunResult
+	if err := c.do(ctx, http.MethodPost, "/v0/campaigns/"+campaignID.String()+"/runs", body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // FileWorkItemRequest mirrors the backend's POST /v0/work-items body
 // (`backend/internal/server/workitems.go::workItemRequest`). The
 // conventions layer turns this provider-neutral filing into a created

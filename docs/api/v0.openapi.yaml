@@ -1122,6 +1122,40 @@ components:
         rollup: { $ref: '#/components/schemas/CampaignRollup' }
         next_action: { $ref: '#/components/schemas/CampaignNextAction' }
 
+    StartCampaignItemRunRequest:
+      type: object
+      description: |
+        The POST /v0/campaigns/{campaign_id}/runs body (E26.2 / #1481): start a
+        run for one eligible campaign item. There is deliberately NO
+        idempotency_key — the backend does not dedup this create-link-transition
+        sequence, and the DAG eligibility gate already refuses a re-start
+        against an already-running item.
+      required: [issue_ref, workflow_id]
+      properties:
+        issue_ref:
+          type: string
+          description: The campaign item's issue ref to start (must be a campaign item and currently eligible per the DAG).
+        workflow_id:
+          type: string
+          description: The workflow id to run for this issue (e.g. `feature_change`).
+        workflow_ref:
+          type: string
+          description: OPTIONAL git ref to fetch the workflow spec at; omit for the repo's default branch.
+        runner_kind:
+          type: string
+          enum: [github_actions, local]
+          description: OPTIONAL execution backend; defaults to `github_actions`. Pass `local` for the local dogfood loop.
+
+    StartCampaignItemRunResult:
+      type: object
+      description: |
+        The 201 body of POST /v0/campaigns/{campaign_id}/runs: the minted run
+        plus the linked campaign item (now `running`, with `run_id` set).
+      required: [run, item]
+      properties:
+        run: { $ref: '#/components/schemas/Run' }
+        item: { $ref: '#/components/schemas/CampaignItem' }
+
     WaivedConcern:
       type: object
       description: |
@@ -4181,6 +4215,14 @@ paths:
         distilled `next_action`. This is the surface the operator-agent polls
         to drive a campaign. `next_action` precedence is FAILED-wins: a failed
         item yields `attention` regardless of whether eligible items exist.
+
+        Reconcile-on-read (E26.2 / #1481): this GET also settles any running
+        item whose linked run reached a terminal state and re-derives the
+        campaign — mirroring the auto-driver's advance pass — so the rollup +
+        `next_action` advance in DAG order as the operator drives each run to
+        merge, with no auto-driver and no GitHub Actions. Best-effort and
+        idempotent: the reconcile never fails the read, and a re-poll over an
+        already-settled item performs no further transition.
       tags: [campaigns]
       parameters:
         - { name: campaign_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -4195,6 +4237,66 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404':
           description: "`campaign_not_found` — no campaign with that id."
+        '503':
+          description: "`campaign_repo_unconfigured` — no campaign repository wired."
+
+  /v0/campaigns/{campaign_id}/runs:
+    post:
+      operationId: startCampaignItemRun
+      summary: Start a run for an eligible campaign item
+      description: |
+        The operator-driven, campaign-aware run start (E26.2 / #1481): mint a
+        run for one campaign item and link it to the campaign so the rollup +
+        `next_action` track + DAG-gate it as the operator drives the run to
+        merge — without the backend auto-driver and without GitHub Actions.
+
+        For the `issue_ref` it refuses unless the item is **eligible** per the
+        campaign engine (every dependency has succeeded), naming the blocking
+        dependency on refusal. On an eligible item it mints the run via the
+        same seam the auto-driver uses (carrying `runner_kind` so the local
+        loop gets `local`), links it to the item, transitions the item
+        `pending`/`blocked` → `running`, and advances a `pending` campaign to
+        `running`.
+
+        Pair this with `GET /v0/campaigns/{campaign_id}/status`, which is
+        reconcile-on-read: it settles any running item whose linked run reached
+        terminal and re-derives the campaign, so the rollup advances in DAG
+        order as each run is driven to merge.
+      tags: [campaigns]
+      parameters:
+        - { name: campaign_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StartCampaignItemRunRequest' }
+      responses:
+        '201':
+          description: The minted run and the linked campaign item.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StartCampaignItemRunResult' }
+        '400':
+          description: |
+            `validation_failed` — `campaign_id` is not a valid UUID, `issue_ref`
+            or `workflow_id` is empty, `runner_kind` is unrecognized, or the
+            body carries unknown fields.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: "`insufficient_scope` — bearer token missing `write:campaigns`."
+        '404':
+          description: |
+            `campaign_not_found` — no campaign with that id;
+            `campaign_item_not_found` — no campaign item with that `issue_ref`.
+        '409':
+          description: |
+            `campaign_not_startable` — the campaign is paused (resume it first)
+            or terminal; `item_not_eligible` — the item is blocked on a
+            dependency (the detail names it), already running, or terminal;
+            `invalid_transition` — a concurrent change made the running
+            transition illegal.
+        '502':
+          description: "`campaign_run_start_failed` — the installation or workflow spec could not be resolved."
         '503':
           description: "`campaign_repo_unconfigured` — no campaign repository wired."
 

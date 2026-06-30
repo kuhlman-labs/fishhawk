@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -10,8 +11,10 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -641,6 +644,26 @@ func (s *Server) handleGetCampaignStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Reconcile-on-read (E26.2 / #1481): settle any running item whose linked
+	// run reached terminal and re-derive the campaign, mirroring the
+	// campaigndriver ADVANCE pass. This is the local-native, driver-independent
+	// advance trigger — the operator-agent already polls this surface to drive
+	// the loop, so the rollup + next_action move in DAG order as each run is
+	// driven to merge, with no auto-driver and no GHA. Best-effort and
+	// idempotent: it NEVER fails the read (errors are logged and swallowed) and
+	// a re-poll over an already-settled item performs no further transition
+	// (the item/campaign transitions are state-guarded under the repo's SELECT
+	// FOR UPDATE). When it settled anything, re-read so the rollup reflects the
+	// fresh item + campaign state.
+	if s.reconcileCampaignItemsOnRead(r.Context(), c, items) {
+		if fresh, ferr := s.cfg.CampaignRepo.ListCampaignItemsForCampaign(r.Context(), id); ferr == nil {
+			items = fresh
+		}
+		if fc, ferr := s.cfg.CampaignRepo.GetCampaign(r.Context(), id); ferr == nil {
+			c = fc
+		}
+	}
+
 	elig := campaign.NextEligible(items)
 	out := make([]campaignItemResponse, 0, len(items))
 	for _, it := range items {
@@ -764,4 +787,408 @@ func (s *Server) handleResumeCampaign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, r, http.StatusOK, toCampaignResponse(updated))
+}
+
+// Campaign audit categories the operator-driven start + reconcile-on-read path
+// emits on the GLOBAL audit chain (E26.2 / #1481). They are the SAME free-form
+// category strings the campaigndriver emits (campaigndriver/driver.go) — a
+// campaign-linked run started/settled/advanced is the same surface whether the
+// auto-driver or the operator-agent drove it — documented in
+// docs/issue-comment-surfaces.md. They ride the global chain
+// (AppendGlobalChained) because a campaign is not a run; the run linkage travels
+// in the payload's run_id field.
+const (
+	categoryCampaignIssueStarted = "campaign_issue_started"
+	categoryCampaignIssueSettled = "campaign_issue_settled"
+	categoryCampaignAdvanced     = "campaign_advanced"
+)
+
+// startCampaignItemRunRequest is the POST /v0/campaigns/{campaign_id}/runs body.
+// issue_ref + workflow_id are required; workflow_ref (empty = the repo's default
+// branch) and runner_kind (empty = github_actions; pass "local" for the local
+// dogfood loop) are optional. There is deliberately NO idempotency_key field:
+// the server does not dedup this create-link-transition sequence, so advertising
+// one would be a field the server ignores (#1443 honesty). A caller that needs
+// idempotency gates on the DAG eligibility instead — a re-POST against an
+// already-running item is refused item_not_eligible.
+type startCampaignItemRunRequest struct {
+	IssueRef    string `json:"issue_ref"`
+	WorkflowID  string `json:"workflow_id"`
+	WorkflowRef string `json:"workflow_ref,omitempty"`
+	RunnerKind  string `json:"runner_kind,omitempty"`
+}
+
+// handleStartCampaignItemRun implements POST /v0/campaigns/{campaign_id}/runs:
+// the operator-driven, campaign-aware run start (E26.2 / #1481). For an
+// issue_ref in the campaign it refuses unless the item is eligible per
+// campaign.NextEligible (naming the blocking dependency on refusal), mints the
+// run via Server.StartRunForCampaignIssue (carrying runner_kind so the local
+// loop gets runner_kind:local), links it with SetCampaignItemRun, transitions
+// the item pending → running, and derives/advances the campaign so a
+// pending campaign moves to running on its first dispatch.
+//
+// The nil-CampaignRepo guard is checked BEFORE the write-scope check so an
+// unconfigured deployment answers 503 (not 401), matching the other campaign
+// write handlers and the 503-vs-404 route-registration idiom.
+func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.CampaignRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "campaign_repo_unconfigured",
+			"campaigns endpoint requires a configured campaign repository", nil)
+		return
+	}
+	if !s.requireWriteScope(w, r, "write:campaigns") {
+		return
+	}
+	id, err := uuid.Parse(r.PathValue("campaign_id"))
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"campaign_id must be a valid UUID",
+			map[string]any{"field": "campaign_id", "got": r.PathValue("campaign_id")})
+		return
+	}
+
+	var req startCampaignItemRunRequest
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"request body is not valid JSON or contains unknown fields",
+			map[string]any{"error": err.Error()})
+		return
+	}
+	if strings.TrimSpace(req.IssueRef) == "" {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"issue_ref is required", map[string]any{"field": "issue_ref"})
+		return
+	}
+	if strings.TrimSpace(req.WorkflowID) == "" {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"workflow_id is required", map[string]any{"field": "workflow_id"})
+		return
+	}
+	if req.RunnerKind != "" {
+		if _, ok := run.ValidRunnerKinds[req.RunnerKind]; !ok {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"runner_kind must be one of github_actions, local",
+				map[string]any{"field": "runner_kind", "got": req.RunnerKind})
+			return
+		}
+	}
+
+	c, err := s.cfg.CampaignRepo.GetCampaign(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, campaign.ErrNotFound) {
+			s.writeError(w, r, http.StatusNotFound, "campaign_not_found",
+				"no campaign with that id", map[string]any{"campaign_id": id.String()})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"get campaign failed", map[string]any{"error": err.Error()})
+		return
+	}
+	// Only a pending or running campaign can dispatch a new item run. A paused
+	// campaign (resume it first), or a terminal one, refuses 409.
+	if c.State != campaign.StatePending && c.State != campaign.StateRunning {
+		s.writeError(w, r, http.StatusConflict, "campaign_not_startable",
+			"campaign is not in a state that can start an item run",
+			map[string]any{"campaign_id": id.String(), "state": string(c.State)})
+		return
+	}
+
+	items, err := s.cfg.CampaignRepo.ListCampaignItemsForCampaign(r.Context(), id)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"list campaign items failed", map[string]any{"error": err.Error()})
+		return
+	}
+	var item *campaign.Item
+	for _, it := range items {
+		if it.IssueRef == req.IssueRef {
+			item = it
+			break
+		}
+	}
+	if item == nil {
+		s.writeError(w, r, http.StatusNotFound, "campaign_item_not_found",
+			"no campaign item with that issue_ref",
+			map[string]any{"campaign_id": id.String(), "issue_ref": req.IssueRef})
+		return
+	}
+
+	// DAG gate: refuse unless the item is eligible per the pure engine. On
+	// refusal, name the precise blocker — the first unmet dependency for a
+	// blocked item, otherwise the item's current state — so the operator-agent
+	// knows what to wait on.
+	elig := campaign.NextEligible(items)
+	if !containsRef(elig.Eligible, req.IssueRef) {
+		s.writeError(w, r, http.StatusConflict, "item_not_eligible",
+			ineligibilityDetail(item, items), map[string]any{
+				"campaign_id": id.String(),
+				"issue_ref":   req.IssueRef,
+				"item_state":  string(item.State),
+			})
+		return
+	}
+	// Defensive re-check: NextEligible already excludes linked/terminal/running
+	// items, but confirm the running transition is reachable before minting a
+	// run we could not link.
+	if !campaign.ValidCampaignItemTransition(item.State, campaign.ItemStateRunning) {
+		s.writeError(w, r, http.StatusConflict, "item_not_eligible",
+			ineligibilityDetail(item, items), map[string]any{
+				"campaign_id": id.String(),
+				"issue_ref":   req.IssueRef,
+				"item_state":  string(item.State),
+			})
+		return
+	}
+
+	// Mint the run via the reused seam, carrying runner_kind so the local loop
+	// gets runner_kind:local. A resolution failure (installation/spec) surfaces
+	// 502 — the same upstream-dependency class as the create handler's
+	// epic_children_query_failed — leaving the item un-started for a retry.
+	runRow, err := s.StartRunForCampaignIssue(r.Context(), c.Repo, req.IssueRef, req.WorkflowID, req.WorkflowRef, req.RunnerKind)
+	if err != nil {
+		s.writeError(w, r, http.StatusBadGateway, "campaign_run_start_failed",
+			"could not start a run for the campaign item",
+			map[string]any{"error": err.Error(), "issue_ref": req.IssueRef})
+		return
+	}
+
+	// Link the item to its run, then transition it to running. On a transition
+	// failure after the link committed, roll the link back so the item
+	// re-partitions as Eligible and the operator can retry — mirroring the
+	// driver's start() rollback (a linked-but-not-running item is classified
+	// Running by NextEligible and would otherwise be stranded).
+	if _, err := s.cfg.CampaignRepo.SetCampaignItemRun(r.Context(), item.ID, &runRow.ID); err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"link campaign item to run failed",
+			map[string]any{"error": err.Error(), "item_id": item.ID.String(), "run_id": runRow.ID.String()})
+		return
+	}
+	updatedItem, err := s.cfg.CampaignRepo.TransitionCampaignItem(r.Context(), item.ID, campaign.ItemStateRunning)
+	if err != nil {
+		if _, uerr := s.cfg.CampaignRepo.SetCampaignItemRun(r.Context(), item.ID, nil); uerr != nil {
+			s.cfg.Logger.Warn("campaign item-run unlink after failed running transition also failed; item left linked-but-not-running",
+				"campaign_id", id.String(), "item_id", item.ID.String(), "run_id", runRow.ID.String(), "error", uerr.Error())
+		}
+		var inv campaign.InvalidTransitionError
+		if errors.As(err, &inv) {
+			s.writeError(w, r, http.StatusConflict, "invalid_transition",
+				err.Error(), map[string]any{"item_id": item.ID.String()})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"transition campaign item to running failed",
+			map[string]any{"error": err.Error(), "item_id": item.ID.String()})
+		return
+	}
+
+	// Emit the campaign_issue_started marker (best-effort, global chain).
+	s.emitCampaignAudit(r.Context(), categoryCampaignIssueStarted, map[string]any{
+		"campaign_id": id.String(),
+		"issue_ref":   item.IssueRef,
+		"run_id":      runRow.ID.String(),
+	})
+
+	// Derive the campaign forward: a pending campaign becomes running on its
+	// first dispatch. Best-effort — a derivation/transition failure does not
+	// unwind the started run (the run + link + item transition already
+	// committed); the next status-read reconcile re-derives.
+	if c.State == campaign.StatePending {
+		refreshed, lerr := s.cfg.CampaignRepo.ListCampaignItemsForCampaign(r.Context(), id)
+		if lerr != nil {
+			s.cfg.Logger.Warn("re-list items for campaign derivation failed; campaign left pending (status-read reconcile re-derives)",
+				"campaign_id", id.String(), "error", lerr.Error())
+		} else {
+			s.deriveCampaignAfterChange(r.Context(), c, refreshed)
+		}
+	}
+
+	s.writeJSON(w, r, http.StatusCreated, map[string]any{
+		"run":  toRunResponse(runRow),
+		"item": toCampaignItemResponse(updatedItem),
+	})
+}
+
+// containsRef reports whether ref is in refs.
+func containsRef(refs []string, ref string) bool {
+	for _, r := range refs {
+		if r == ref {
+			return true
+		}
+	}
+	return false
+}
+
+// ineligibilityDetail returns a precise, operator-actionable reason an item is
+// not eligible to start. A blocked item (pending/blocked with an unmet
+// dependency) names the first depends_on ref not yet succeeded; any other state
+// reports the item's current state.
+func ineligibilityDetail(item *campaign.Item, items []*campaign.Item) string {
+	switch item.State {
+	case campaign.ItemStatePending, campaign.ItemStateBlocked:
+		if dep, ok := firstUnmetDependency(item, items); ok {
+			return "blocked on dependency " + dep + "; it must succeed before this item can start"
+		}
+		// No unmet dependency but still not eligible — almost always an
+		// already-linked item (RunID set). Report the state.
+		return "item is not eligible to start in state " + string(item.State)
+	default:
+		return "item is already in state " + string(item.State) + "; only an eligible (unstarted, dependencies-satisfied) item can be started"
+	}
+}
+
+// firstUnmetDependency returns the item's first depends_on ref whose target
+// item has not succeeded (or is absent from the campaign), and ok=false when
+// every dependency is satisfied.
+func firstUnmetDependency(item *campaign.Item, items []*campaign.Item) (string, bool) {
+	done := make(map[string]bool, len(items))
+	for _, it := range items {
+		if it.State == campaign.ItemStateSucceeded {
+			done[it.IssueRef] = true
+		}
+	}
+	for _, dep := range item.DependsOn {
+		if !done[dep] {
+			return dep, true
+		}
+	}
+	return "", false
+}
+
+// reconcileCampaignItemsOnRead settles any running item whose linked run reached
+// a terminal run state and re-derives the campaign (E26.2 / #1481), mirroring
+// the campaigndriver ADVANCE pass exactly. It returns whether it settled
+// anything so the caller can re-read the fresh item + campaign state.
+//
+// It is BEST-EFFORT and NEVER fails the read: every error is logged and
+// swallowed. It is IDEMPOTENT: the item/campaign transitions go through the
+// campaign repo's state-guarded SELECT FOR UPDATE transitions, so a concurrent
+// re-poll cannot double-transition — a second pass over an already-settled item
+// is a no-op (its state is no longer running) and emits nothing. No-ops when no
+// run repository is wired (the local-native trigger needs to read run state).
+func (s *Server) reconcileCampaignItemsOnRead(ctx context.Context, c *campaign.Campaign, items []*campaign.Item) bool {
+	if s.cfg.RunRepo == nil {
+		return false
+	}
+	settledAny := false
+	for _, it := range items {
+		if it.State != campaign.ItemStateRunning || it.RunID == nil {
+			continue
+		}
+		runRow, err := s.cfg.RunRepo.GetRun(ctx, *it.RunID)
+		if err != nil {
+			s.cfg.Logger.Warn("reconcile-on-read: get linked run failed; item left running",
+				"campaign_id", c.ID.String(), "item_id", it.ID.String(), "run_id", it.RunID.String(), "error", err.Error())
+			continue
+		}
+		if !runRow.State.IsTerminal() {
+			continue
+		}
+		target, ok := mapRunTerminalToItemState(runRow.State)
+		if !ok {
+			s.cfg.Logger.Warn("reconcile-on-read: unmapped terminal run state; item left running",
+				"campaign_id", c.ID.String(), "item_id", it.ID.String(), "run_state", string(runRow.State))
+			continue
+		}
+		if !campaign.ValidCampaignItemTransition(it.State, target) {
+			continue
+		}
+		if _, err := s.cfg.CampaignRepo.TransitionCampaignItem(ctx, it.ID, target); err != nil {
+			s.cfg.Logger.Warn("reconcile-on-read: settle item transition failed; left for next read",
+				"campaign_id", c.ID.String(), "item_id", it.ID.String(), "target", string(target), "error", err.Error())
+			continue
+		}
+		settledAny = true
+		s.emitCampaignAudit(ctx, categoryCampaignIssueSettled, map[string]any{
+			"campaign_id": c.ID.String(),
+			"issue_ref":   it.IssueRef,
+			"run_id":      it.RunID.String(),
+			"outcome":     string(target),
+		})
+	}
+	if !settledAny {
+		return false
+	}
+	// Re-derive the campaign over the freshly-settled items, unless it is
+	// paused (sticky — a paused campaign re-engages only on resume, never on a
+	// derivation; mirrors the driver's deriveAndTransition guard).
+	if c.State != campaign.StatePaused {
+		refreshed, err := s.cfg.CampaignRepo.ListCampaignItemsForCampaign(ctx, c.ID)
+		if err != nil {
+			s.cfg.Logger.Warn("reconcile-on-read: re-list items after settle failed; campaign not re-derived",
+				"campaign_id", c.ID.String(), "error", err.Error())
+		} else {
+			s.deriveCampaignAfterChange(ctx, c, refreshed)
+		}
+	}
+	return true
+}
+
+// deriveCampaignAfterChange re-derives the campaign state from its items and,
+// when it differs and the transition is valid, transitions the campaign and
+// emits a campaign_advanced marker. Best-effort and idempotent: a no-change
+// derivation, an invalid transition, or a transition error emits nothing and
+// never unwinds the caller. Shared by the operator-driven start (pending →
+// running on first dispatch) and reconcile-on-read (running → succeeded/failed
+// as items settle).
+func (s *Server) deriveCampaignAfterChange(ctx context.Context, c *campaign.Campaign, items []*campaign.Item) {
+	newState := campaign.DeriveState(items)
+	if newState == c.State || !campaign.ValidCampaignTransition(c.State, newState) {
+		return
+	}
+	if _, err := s.cfg.CampaignRepo.TransitionCampaign(ctx, c.ID, newState); err != nil {
+		s.cfg.Logger.Warn("campaign derivation transition failed; left for next read",
+			"campaign_id", c.ID.String(), "from", string(c.State), "to", string(newState), "error", err.Error())
+		return
+	}
+	s.emitCampaignAudit(ctx, categoryCampaignAdvanced, map[string]any{
+		"campaign_id": c.ID.String(),
+		"from":        string(c.State),
+		"to":          string(newState),
+	})
+}
+
+// mapRunTerminalToItemState maps a terminal run state to the campaign item's
+// terminal state (ok=false for a non-terminal or unmapped state). It replicates
+// campaigndriver.mapRunTerminalToItem rather than importing the driver package
+// (an unusual server → driver import edge); the run enum's terminal set is
+// exactly {succeeded, failed, cancelled}.
+func mapRunTerminalToItemState(st run.State) (campaign.ItemState, bool) {
+	switch st {
+	case run.StateSucceeded:
+		return campaign.ItemStateSucceeded, true
+	case run.StateFailed:
+		return campaign.ItemStateFailed, true
+	case run.StateCancelled:
+		return campaign.ItemStateCancelled, true
+	default:
+		return "", false
+	}
+}
+
+// emitCampaignAudit appends one campaign-level audit entry on the global chain,
+// mirroring the campaigndriver emit posture. Best-effort: a nil AuditRepo, a
+// marshal error, or an append error logs and never unwinds the transition it
+// records.
+func (s *Server) emitCampaignAudit(ctx context.Context, category string, payload map[string]any) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		s.cfg.Logger.Warn("marshal campaign audit payload failed",
+			"category", category, "error", err.Error())
+		return
+	}
+	systemKind := audit.ActorSystem
+	if _, err := s.cfg.AuditRepo.AppendGlobalChained(ctx, audit.GlobalChainAppendParams{
+		Timestamp: time.Now().UTC(),
+		Category:  category,
+		ActorKind: &systemKind,
+		Payload:   body,
+	}); err != nil {
+		s.cfg.Logger.Warn("append campaign audit entry failed",
+			"category", category, "error", err.Error())
+	}
 }

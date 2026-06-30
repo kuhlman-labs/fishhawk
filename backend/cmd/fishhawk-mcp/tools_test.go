@@ -348,6 +348,18 @@ type fakeBackend struct {
 	resumeCampaignResp   Campaign
 	resumeCampaignStatus int
 	resumeCampaignErr    string
+
+	// E26.2 fixtures: POST /v0/campaigns/{id}/runs (#1481).
+	// startCampaignItemRunBody captures the last decoded request body so tests
+	// can assert issue_ref/workflow_id/workflow_ref/runner_kind round-trip;
+	// startCampaignItemRunID captures the path id. startCampaignItemRunResp seeds
+	// the {run,item} response; startCampaignItemRunStatus drives the HTTP status
+	// (default 201); startCampaignItemRunErr, when set, is written verbatim.
+	startCampaignItemRunBody   startCampaignItemRunRequest
+	startCampaignItemRunID     uuid.UUID
+	startCampaignItemRunResp   StartCampaignItemRunResult
+	startCampaignItemRunStatus int
+	startCampaignItemRunErr    string
 }
 
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
@@ -419,6 +431,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		integrateWaveStatus:           http.StatusOK,
 		integrateWaveCalledBy:         map[uuid.UUID]int{},
 		createCampaignStatus:          http.StatusCreated,
+		startCampaignItemRunStatus:    http.StatusCreated,
 		campaignStatusByID:            map[uuid.UUID]CampaignStatus{},
 		campaignStatusStatus:          http.StatusOK,
 		resumeCampaignStatus:          http.StatusOK,
@@ -895,6 +908,35 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		}
 		if resp.PausePolicy == "" {
 			resp.PausePolicy = "pause_campaign"
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("POST /v0/campaigns/{campaign_id}/runs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("campaign_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var body startCampaignItemRunRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fb.mu.Lock()
+		fb.startCampaignItemRunID = id
+		fb.startCampaignItemRunBody = body
+		status := fb.startCampaignItemRunStatus
+		errBody := fb.startCampaignItemRunErr
+		resp := fb.startCampaignItemRunResp
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if resp.Run.ID == "" {
+			resp.Run = Run{ID: uuid.NewString(), Repo: "x/y", State: "pending", RunnerKind: body.RunnerKind}
+		}
+		if resp.Item.ID == "" {
+			resp.Item = CampaignItem{ID: uuid.NewString(), IssueRef: body.IssueRef, State: "running", RunID: resp.Run.ID}
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -1446,7 +1488,7 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	const minDescriptionLen = 80
 	// The registered tool set is the fishhawk_* tools swept in #778. Bump
 	// this and give the new tool a conformant description when adding one.
-	const wantToolCount = 36
+	const wantToolCount = 37
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
