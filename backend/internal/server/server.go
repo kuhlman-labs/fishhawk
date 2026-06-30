@@ -234,8 +234,8 @@ type Config struct {
 	// PlanReviewers resolves the review-agent adapters invoked when a
 	// stage's workflow spec declares agent review (ADR-027 / #955).
 	// Default() is the precedence-selected adapter the bare `agent: N`
-	// count form repeats; For(provider, model) resolves one entry of the
-	// heterogeneous `agents` list. A nil set — or a set whose Default()
+	// count form repeats; For(provider, model, reasoningEffort) resolves one
+	// entry of the heterogeneous `agents` list. A nil set — or a set whose Default()
 	// returns nil — means no reviewer backend is configured: agent review
 	// degrades to the *_review_skipped path regardless of the spec config.
 	// Production wires the serve.go adapter set; tests inject a stub.
@@ -485,7 +485,7 @@ type soleReviewerSet struct{ reviewer PlanReviewer }
 
 func (s soleReviewerSet) Default() PlanReviewer { return s.reviewer }
 
-func (soleReviewerSet) For(provider, _ string) (PlanReviewer, error) {
+func (soleReviewerSet) For(provider, _ string, _ ...string) (PlanReviewer, error) {
 	return nil, fmt.Errorf("reviewer provider %q is not resolvable from the single-reviewer configuration: wire Config.PlanReviewers", provider)
 }
 

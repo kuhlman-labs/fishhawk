@@ -284,6 +284,44 @@ func TestResolveImplementModel_LadderPrecedence(t *testing.T) {
 	}
 }
 
+// TestResolveReviewerReasoningEffort covers the #1493 per-reviewer
+// reasoning-effort ladder — one assertion per branch: spec non-empty wins over
+// the deployment default; spec empty with a non-empty default falls back to the
+// default; both empty returns the empty value with ModelSourceNone.
+func TestResolveReviewerReasoningEffort(t *testing.T) {
+	tests := []struct {
+		name        string
+		deflt, spec string
+		wantValue   string
+		wantSource  ModelSource
+	}{
+		{
+			name:  "spec wins over the deployment default",
+			deflt: "low", spec: "high",
+			wantValue: "high", wantSource: ModelSourceSpec,
+		},
+		{
+			name:  "spec empty falls back to the deployment default",
+			deflt: "medium", spec: "",
+			wantValue: "medium", wantSource: ModelSourceDefault,
+		},
+		{
+			name:  "both empty yields none (today's host-config inheritance)",
+			deflt: "", spec: "",
+			wantValue: "", wantSource: ModelSourceNone,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ResolveReviewerReasoningEffort(tt.deflt, tt.spec)
+			if got.Value != tt.wantValue || got.Source != tt.wantSource {
+				t.Fatalf("ResolveReviewerReasoningEffort(%q,%q) = {%q,%q}, want {%q,%q}",
+					tt.deflt, tt.spec, got.Value, got.Source, tt.wantValue, tt.wantSource)
+			}
+		})
+	}
+}
+
 func TestAllowedModels_IsAllowed(t *testing.T) {
 	policy := AllowedModels{
 		"claudecode": {"claude-opus-4-8": true, "claude-sonnet-4-6": true},

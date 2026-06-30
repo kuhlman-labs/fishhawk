@@ -776,6 +776,17 @@
               "model": {
                 "type": "string",
                 "description": "Model identifier passed to the adapter. Empty/absent falls back to the provider's deployment-configured default model."
+              },
+              "reasoning_effort": {
+                "type": "string",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high",
+                  "xhigh",
+                  "max"
+                ],
+                "description": "Codex-only reviewer reasoning-effort override (#1493). One rung of the per-reviewer reasoning-effort ladder: deployment default (FISHHAWKD_CODEX_REASONING_EFFORT) < this reasoning_effort. Empty/absent falls back to the deployment default exactly as today; the resolved value is passed to the codex adapter as a `-c model_reasoning_effort=<effort>` CLI override. Ignored by the anthropic and claudecode adapters, which take no reasoning-effort parameter. Additive optional field within workflow-v1.x — accepted at every advertised version."
               }
             }
           }

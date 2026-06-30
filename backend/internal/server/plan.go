@@ -37,11 +37,14 @@ type PlanReviewer interface {
 // count form invokes — nil when no reviewer backend is configured at all.
 // For returns the adapter for one spec-declared heterogeneous reviewer
 // (reviewers.agents[i]), constructed with the given model override (empty
-// model falls back to the provider's deployment-configured default); it
+// model falls back to the provider's deployment-configured default) and the
+// spec-declared reasoningEffort (#1493, codex-only — empty falls back to the
+// deployment default FISHHAWKD_CODEX_REASONING_EFFORT; ignored by the
+// anthropic/claudecode adapters, which take no reasoning-effort parameter); it
 // errors when the provider is not configured in this deployment.
 type ReviewerSet interface {
 	Default() PlanReviewer
-	For(provider, model string) (PlanReviewer, error)
+	For(provider, model string, reasoningEffort ...string) (PlanReviewer, error)
 }
 
 // defaultPlanReviewer returns the precedence-selected default adapter, or
@@ -64,11 +67,17 @@ func (s *Server) defaultPlanReviewer() PlanReviewer {
 // between the dispatch pre-check and execution) — the loop treats that as
 // a failed invocation: emit *_review_failed, continue, hasRejection
 // untouched.
+//
+// reasoningEffort records the spec-declared per-reviewer reasoning effort
+// (#1493, symmetry with specModel) passed through to For for the codex
+// adapter; empty for the count form (no provider) and for non-codex
+// reviewers, which ignore it.
 type reviewerInvocation struct {
-	reviewer   PlanReviewer
-	provider   string
-	specModel  string
-	resolveErr error
+	reviewer        PlanReviewer
+	provider        string
+	specModel       string
+	reasoningEffort string
+	resolveErr      error
 }
 
 // resolveReviewerInvocations maps a stage's ReviewersConfig to its
@@ -102,12 +111,17 @@ func (s *Server) resolveReviewerInvocationsWithReviewModel(reviewersCfg *spec.Re
 			if reviewModelOverride != "" {
 				model = reviewModelOverride
 			}
-			reviewer, err := s.cfg.PlanReviewers.For(a.Provider, model)
+			// Reasoning effort is provider-agnostic at the seam — only the
+			// codex adapter consumes it; non-codex For branches accept and
+			// ignore it (#1493). The spec value is the highest rung; the env
+			// default fallback is applied deployment-side in planReviewerSet.For.
+			reviewer, err := s.cfg.PlanReviewers.For(a.Provider, model, a.ReasoningEffort)
 			invocations = append(invocations, reviewerInvocation{
-				reviewer:   reviewer,
-				provider:   a.Provider,
-				specModel:  a.Model,
-				resolveErr: err,
+				reviewer:        reviewer,
+				provider:        a.Provider,
+				specModel:       a.Model,
+				reasoningEffort: a.ReasoningEffort,
+				resolveErr:      err,
 			})
 		}
 		return invocations

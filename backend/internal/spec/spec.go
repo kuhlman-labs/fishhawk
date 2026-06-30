@@ -425,6 +425,14 @@ type ReviewersConfig struct {
 type AgentReviewer struct {
 	Provider string `json:"provider" yaml:"provider"`
 	Model    string `json:"model,omitempty" yaml:"model,omitempty"`
+	// ReasoningEffort is the optional per-reviewer reasoning-effort override
+	// (#1493). It is CODEX-ONLY: one rung of the per-reviewer ladder
+	// (deployment default FISHHAWKD_CODEX_REASONING_EFFORT < this value).
+	// Empty falls back to the deployment default. The anthropic and claudecode
+	// adapters take no reasoning-effort parameter and ignore it. The schema
+	// enum (low|medium|high|xhigh|max) is the sole guard before the value
+	// reaches the codex CLI as -c model_reasoning_effort=<effort>.
+	ReasoningEffort string `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
 }
 
 // AgentCount returns the effective number of agent reviewers: len(Agents)

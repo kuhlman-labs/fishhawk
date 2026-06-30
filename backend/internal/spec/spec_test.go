@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
@@ -1168,6 +1170,91 @@ workflows:
 	var se *spec.SchemaError
 	if !errors.As(err, &se) {
 		t.Fatalf("err = %v, want *SchemaError for unknown provider", err)
+	}
+}
+
+func TestParse_Reviewers_AgentsList_ReasoningEffort_RoundTrip(t *testing.T) {
+	// #1493: a workflow-v1 reviewers.agents entry carrying reasoning_effort
+	// parses into AgentReviewer.ReasoningEffort and survives a re-marshal. The
+	// field is workflow-v1-only, so the spec is pinned at version "1.0".
+	yml := []byte(`
+version: "1.0"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agents:
+            - provider: codex
+              reasoning_effort: high
+            - provider: anthropic
+          human: 1
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	rv := s.Workflows["trivial"].Stages[0].Reviewers
+	if rv == nil || len(rv.Agents) != 2 {
+		t.Fatalf("Reviewers.Agents = %+v, want 2 entries", rv)
+	}
+	if rv.Agents[0].Provider != "codex" || rv.Agents[0].ReasoningEffort != "high" {
+		t.Errorf("Agents[0] = %+v, want {codex reasoning_effort=high}", rv.Agents[0])
+	}
+	// An absent reasoning_effort stays empty (falls back to the deployment
+	// default at the seam).
+	if rv.Agents[1].ReasoningEffort != "" {
+		t.Errorf("Agents[1].ReasoningEffort = %q, want empty (absent)", rv.Agents[1].ReasoningEffort)
+	}
+
+	// Re-marshal preserves the field (omitempty keeps the absent one absent).
+	out, err := yaml.Marshal(rv.Agents[0])
+	if err != nil {
+		t.Fatalf("re-marshal: %v", err)
+	}
+	if !strings.Contains(string(out), "reasoning_effort: high") {
+		t.Errorf("re-marshalled agent = %q, want it to preserve reasoning_effort: high", out)
+	}
+	absent, err := yaml.Marshal(rv.Agents[1])
+	if err != nil {
+		t.Fatalf("re-marshal absent: %v", err)
+	}
+	if strings.Contains(string(absent), "reasoning_effort") {
+		t.Errorf("re-marshalled agent with no effort = %q, want reasoning_effort omitted", absent)
+	}
+}
+
+func TestParse_Reviewers_AgentsList_ReasoningEffort_InvalidEnum_Rejected(t *testing.T) {
+	// #1493: the schema enum (low|medium|high|xhigh|max) is the sole guard
+	// before the value reaches the codex CLI as -c model_reasoning_effort, so
+	// an out-of-enum value must be rejected by spec validation.
+	yml := []byte(`
+version: "1.0"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agents:
+            - provider: codex
+              reasoning_effort: turbo
+`)
+	_, err := spec.ParseBytes(yml)
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError for out-of-enum reasoning_effort", err)
 	}
 }
 

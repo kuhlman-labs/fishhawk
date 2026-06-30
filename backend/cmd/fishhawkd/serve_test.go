@@ -258,6 +258,46 @@ func TestResolveImplementModelConfig(t *testing.T) {
 	})
 }
 
+// TestPlanReviewerSet_CodexReasoningEffort covers the #1493 per-reviewer
+// reasoning-effort ladder applied deployment-side: the spec value wins over the
+// FISHHAWKD_CODEX_REASONING_EFFORT default; an empty spec value falls back to
+// the env default; both empty carries no override; and For("codex", ...) routes
+// the resolved value into a constructed codex reviewer.
+func TestPlanReviewerSet_CodexReasoningEffort(t *testing.T) {
+	t.Run("spec value overrides the deployment default", func(t *testing.T) {
+		set := &planReviewerSet{opts: planReviewerOptions{codexEffort: "low"}}
+		if got := set.resolveCodexEffort("high"); got != "high" {
+			t.Errorf("resolveCodexEffort = %q, want high (spec overrides env default)", got)
+		}
+	})
+	t.Run("empty spec value falls back to the deployment default", func(t *testing.T) {
+		set := &planReviewerSet{opts: planReviewerOptions{codexEffort: "medium"}}
+		if got := set.resolveCodexEffort(""); got != "medium" {
+			t.Errorf("resolveCodexEffort = %q, want medium (env default is the lowest rung)", got)
+		}
+	})
+	t.Run("both empty carries no override", func(t *testing.T) {
+		set := &planReviewerSet{opts: planReviewerOptions{codexEffort: ""}}
+		if got := set.resolveCodexEffort(""); got != "" {
+			t.Errorf("resolveCodexEffort = %q, want empty (host config inherited)", got)
+		}
+	})
+	t.Run("For codex constructs a reviewer with the resolved effort", func(t *testing.T) {
+		set := &planReviewerSet{opts: planReviewerOptions{
+			enableCodexReviewer: true,
+			codexModel:          "gpt-5.5",
+			codexEffort:         "low",
+		}}
+		reviewer, err := set.For("codex", "", "high")
+		if err != nil {
+			t.Fatalf("For(codex): %v", err)
+		}
+		if reviewer == nil {
+			t.Fatal("For(codex) returned a nil reviewer")
+		}
+	})
+}
+
 // TestResolveMaxParallelChildren covers the FISHHAWKD_MAX_PARALLEL_CHILDREN
 // resolution branches: the default applies when unset, the env value wins
 // over the default, an explicit env 0 is honored as the unlimited semantic

@@ -134,6 +134,43 @@ func resolveReviewModel(deflt, spec, operator string) ResolvedModel {
 	}
 }
 
+// ResolvedEffort is the source-tagged outcome of the per-reviewer
+// reasoning-effort ladder (#1493). Value is the resolved reasoning-effort
+// string (empty == "carry no effort override", today's behavior where the
+// codex adapter inherits the host ~/.codex config); Source names the winning
+// rung, reusing the ModelSource enum (ModelSourceDefault / ModelSourceSpec /
+// ModelSourceNone) so the resolver mirrors resolveReviewModel exactly.
+type ResolvedEffort struct {
+	Value  string      `json:"reasoning_effort"`
+	Source ModelSource `json:"reasoning_effort_source"`
+}
+
+// ResolveReviewerReasoningEffort applies the per-reviewer reasoning-effort
+// ladder, lowest to highest precedence:
+//
+//	deployment default (FISHHAWKD_CODEX_REASONING_EFFORT)  <  spec reviewers.agents[i].reasoning_effort
+//
+// It mirrors resolveReviewModel's source-tagged shape but carries only the two
+// rungs the reasoning-effort knob has: the codex deployment default and the
+// per-reviewer spec value (there is no operator gate override for effort). The
+// highest non-empty rung wins and its name is the source; an all-empty ladder
+// returns {Value: "", Source: ModelSourceNone}, so the reviewer carries no
+// effort override and the codex adapter inherits its host config byte-for-byte
+// as today. Pure — no IO. Codex-only at the seam: the anthropic/claudecode
+// adapters ignore the resolved value. Exported so the deployment's codex
+// reviewer construction (serve.go) resolves the env-default rung through the
+// same chokepoint.
+func ResolveReviewerReasoningEffort(deflt, spec string) ResolvedEffort {
+	switch {
+	case spec != "":
+		return ResolvedEffort{Value: spec, Source: ModelSourceSpec}
+	case deflt != "":
+		return ResolvedEffort{Value: deflt, Source: ModelSourceDefault}
+	default:
+		return ResolvedEffort{Value: "", Source: ModelSourceNone}
+	}
+}
+
 // modelResolvedPayload is the model_resolved audit payload (#1416): the
 // source-tagged ResolvedModel plus a StageType discriminator. Once the plan
 // gate stamps a model_resolved entry for MORE THAN ONE stage (implement, plan,
