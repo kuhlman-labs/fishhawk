@@ -107,6 +107,33 @@ var specValidate = func(data []byte) error {
 	return err
 }
 
+// annotateStaleSpecError (proposal 3 of #1422) self-diagnoses the
+// silent-broken-loop cutover: a `.fishhawk/workflows.yaml` schema-major
+// bump breaks every fishhawk_start_run because the live stdio
+// fishhawk-mcp validates the spec locally on a STALE pre-bump binary
+// that doesn't recognize the new `version`. When the local pre-parse
+// fails with a *spec.SchemaError whose Path is "/version" — the shape
+// both the pre-ADR-046 enum violation and the ADR-046 unsupported-major
+// routing produce (see backend/internal/spec/parse.go) — wrap it with a
+// staleness hint pointing at a /mcp reconnect, so even a missed
+// reconnect banner is self-diagnosing. %w preserves the original error
+// for errors.As/errors.Is. Any other error (a non-version SchemaError,
+// a YAMLError, or a plain error) passes through unchanged: an
+// unsupported version is the only failure a stale binary uniquely
+// causes, so a fuzzy match would risk false hints.
+func annotateStaleSpecError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var se *spec.SchemaError
+	if errors.As(err, &se) && se.Path == "/version" {
+		return fmt.Errorf(
+			"%w (this fishhawk-mcp binary may be stale — its embedded spec schema predates this version; run /mcp to reconnect and pick up the rebuilt binary)",
+			err)
+	}
+	return err
+}
+
 // gitBlobSHA returns the SHA-1 of the git blob object that wraps
 // the given file contents: `"blob <len>\0<contents>"`. Matches
 // what GitHub returns as the file's blob SHA, which is the

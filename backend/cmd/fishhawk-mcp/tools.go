@@ -1709,7 +1709,7 @@ func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in S
 			// Pre-parse so a YAML/schema typo is a fast local
 			// failure instead of a backend round-trip.
 			if perr := specValidate(specBytes); perr != nil {
-				return nil, StartRunOutput{}, fmt.Errorf("%s: %w", found.Path, perr)
+				return nil, StartRunOutput{}, fmt.Errorf("%s: %w", found.Path, annotateStaleSpecError(perr))
 			}
 		}
 	} else if len(specBytes) > 0 {
@@ -1718,7 +1718,7 @@ func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in S
 		// against, and validate so a bad inline body fails locally.
 		computedSHA = gitBlobSHA(specBytes)
 		if perr := specValidate(specBytes); perr != nil {
-			return nil, StartRunOutput{}, fmt.Errorf("workflow_spec: %w", perr)
+			return nil, StartRunOutput{}, fmt.Errorf("workflow_spec: %w", annotateStaleSpecError(perr))
 		}
 	}
 

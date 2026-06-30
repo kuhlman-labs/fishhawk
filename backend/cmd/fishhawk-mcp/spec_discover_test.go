@@ -1,10 +1,14 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // TestDiscoverSpec_FromExplicitFile exercises the explicit-path
@@ -117,6 +121,70 @@ func TestDiscoverSpec_NoSpecAnywhere(t *testing.T) {
 	if got != nil {
 		t.Errorf("got = %#v, want nil", got)
 	}
+}
+
+// TestAnnotateStaleSpecError covers proposal 3 of #1422: a local
+// pre-parse failure on an unsupported `version` (a *spec.SchemaError
+// at Path "/version") gains a staleness/`/mcp` hint, while every other
+// error passes through byte-for-byte. Each defensive branch — the
+// version-error hit, the non-version SchemaError miss, the non-schema
+// error miss, and the nil pass-through — has its own assertion.
+func TestAnnotateStaleSpecError(t *testing.T) {
+	const hintMarker = "/mcp"
+
+	t.Run("version SchemaError gains the hint and stays unwrappable", func(t *testing.T) {
+		orig := &spec.SchemaError{
+			Path:    "/version",
+			Message: `unsupported spec version "1.0": major 1 is not recognized`,
+		}
+		got := annotateStaleSpecError(orig)
+		if got == nil {
+			t.Fatal("annotateStaleSpecError returned nil")
+		}
+		if !strings.Contains(got.Error(), hintMarker) {
+			t.Errorf("version error should gain the %q hint: %v", hintMarker, got)
+		}
+		// The original SchemaError must remain reachable via errors.As
+		// so the typed error contract is preserved through the wrap.
+		var se *spec.SchemaError
+		if !errors.As(got, &se) {
+			t.Fatalf("wrapped error no longer unwraps to *spec.SchemaError: %v", got)
+		}
+		if se.Path != "/version" {
+			t.Errorf("unwrapped Path = %q, want /version", se.Path)
+		}
+	})
+
+	t.Run("non-version SchemaError passes through unchanged", func(t *testing.T) {
+		orig := &spec.SchemaError{
+			Path:    "/workflows",
+			Message: "additional properties 'allowed_environments' not allowed",
+		}
+		got := annotateStaleSpecError(orig)
+		if got != error(orig) {
+			t.Errorf("non-version SchemaError should be returned unchanged: got %v", got)
+		}
+		if strings.Contains(got.Error(), hintMarker) {
+			t.Errorf("non-version SchemaError must NOT gain the hint: %v", got)
+		}
+	})
+
+	t.Run("plain non-schema error passes through unchanged", func(t *testing.T) {
+		orig := fmt.Errorf("spec: yaml: not valid")
+		got := annotateStaleSpecError(orig)
+		if got != orig {
+			t.Errorf("plain error should be returned unchanged: got %v", got)
+		}
+		if strings.Contains(got.Error(), hintMarker) {
+			t.Errorf("plain error must NOT gain the hint: %v", got)
+		}
+	})
+
+	t.Run("nil passes through as nil", func(t *testing.T) {
+		if got := annotateStaleSpecError(nil); got != nil {
+			t.Errorf("annotateStaleSpecError(nil) = %v, want nil", got)
+		}
+	})
 }
 
 // TestGitBlobSHA_KnownValue locks in the formula so the MCP

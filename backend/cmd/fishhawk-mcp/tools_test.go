@@ -3981,6 +3981,32 @@ func TestStartRun_InlineSpec_InvalidYAMLFailsLocally(t *testing.T) {
 	}
 }
 
+// TestStartRun_InlineSpec_UnsupportedVersion_GainsStaleHint exercises
+// proposal 3 of #1422 at the startRun call site: an inline spec whose
+// version major is unsupported by the live binary surfaces the schema
+// error WITH the staleness/`/mcp` hint (the self-diagnosing path for a
+// silently-stale fishhawk-mcp), while the outer `workflow_spec:` prefix
+// from the call-site wrap is preserved.
+func TestStartRun_InlineSpec_UnsupportedVersion_GainsStaleHint(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:         "x/y",
+		WorkflowID:   "trivial",
+		WorkflowSpec: "version: \"2.0\"\nworkflows: {}\n",
+	})
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "workflow_spec") {
+		t.Errorf("err should retain the workflow_spec prefix: %v", err)
+	}
+	if !strings.Contains(err.Error(), "/mcp") {
+		t.Errorf("unsupported-version error should gain the /mcp staleness hint: %v", err)
+	}
+}
+
 // TestStartRun_RunnerKindLocal_ForwardedToBackend covers the
 // ADR-022 dimension: an agent minting a local-runner run passes
 // runner_kind=local, the MCP forwards it verbatim.
