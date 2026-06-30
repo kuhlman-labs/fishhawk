@@ -1553,6 +1553,14 @@ type StartRunInput struct {
 	// ADR-030). Ignored unless a blocking budget would otherwise
 	// refuse the run with 402 budget_exhausted.
 	BudgetOverride bool `json:"budget_override,omitempty" jsonschema:"force the run past a blocking periodic cost budget that is over its limit for the current period; ignored when no blocking budget is over"`
+
+	// UpstreamRunID names the upstream feature_change run whose
+	// ci_green / review_merged a standalone deploy-only release
+	// run's required_upstream pre-flight gate evaluates (E23.11 /
+	// #1417). Distinct from parent_run_id — a deploy-gate safety
+	// reference, not a follow-up/lineage link. Optional; omit for
+	// non-deploy-gate runs.
+	UpstreamRunID string `json:"upstream_run_id,omitempty" jsonschema:"optional UUID of the upstream feature_change run whose ci_green/review_merged a deploy-only release run's required_upstream pre-flight gate evaluates (E23.11/#1417); distinct from parent_run_id — a deploy-gate safety reference, not a lineage link"`
 }
 
 // StartRunOutput is the response shape. Run is the canonical Run
@@ -1789,6 +1797,14 @@ func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in S
 			"issue_context is only valid with trigger_source=github_issue (got %q)", triggerSource)
 	}
 
+	// Validate upstream_run_id locally so a malformed value surfaces a
+	// clean error rather than an opaque backend 400.
+	if in.UpstreamRunID != "" {
+		if _, perr := uuid.Parse(in.UpstreamRunID); perr != nil {
+			return nil, StartRunOutput{}, fmt.Errorf("upstream_run_id %q is not a valid UUID: %w", in.UpstreamRunID, perr)
+		}
+	}
+
 	// (8) Hand off to the backend.
 	created, idempotent, err := r.api.StartRun(ctx, StartRunParams{
 		Repo:           in.Repo,
@@ -1801,6 +1817,7 @@ func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in S
 		WorkflowSpec:   string(specBytes),
 		IssueContext:   issueContext,
 		BudgetOverride: in.BudgetOverride,
+		UpstreamRunID:  in.UpstreamRunID,
 	})
 	if err != nil {
 		return nil, StartRunOutput{}, fmt.Errorf("start run: %w", err)

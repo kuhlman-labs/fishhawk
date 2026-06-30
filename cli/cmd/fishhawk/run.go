@@ -115,6 +115,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		"GitHub issue number, #N, or .../issues/N URL; CLI fetches via `gh` and ships inline")
 	overrideBudget := fs.Bool("override-budget", false,
 		"force the run past a blocking periodic cost budget that is over its limit for the current period (#688)")
+	upstreamRunID := fs.String("upstream-run-id", "",
+		"UUID of the upstream feature_change run whose ci_green/review_merged a deploy-only release run's required_upstream pre-flight gate evaluates (E23.11/#1417); distinct from parent_run_id")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -122,6 +124,12 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintln(stderr, "fishhawk run start: --repo and --workflow are required")
 		fs.Usage()
 		return exitUsage
+	}
+	if *upstreamRunID != "" {
+		if _, err := uuid.Parse(*upstreamRunID); err != nil {
+			_, _ = fmt.Fprintf(stderr, "fishhawk run start: --upstream-run-id %q is not a valid UUID\n", *upstreamRunID)
+			return exitUsage
+		}
 	}
 
 	// Parse the explicit --issue argument up front so a typo
@@ -200,6 +208,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	}
 	if *triggerRef != "" {
 		in.TriggerRef = triggerRef
+	}
+	if *upstreamRunID != "" {
+		in.UpstreamRunID = upstreamRunID
 	}
 
 	// Fetch the issue locally via gh and bundle the payload.
@@ -476,6 +487,9 @@ func printRun(w io.Writer, r *httpclient.Run) {
 	_, _ = fmt.Fprintf(w, "state:          %s\n", r.State)
 	if r.RunnerKind != "" {
 		_, _ = fmt.Fprintf(w, "runner_kind:    %s\n", r.RunnerKind)
+	}
+	if r.UpstreamRunID != nil {
+		_, _ = fmt.Fprintf(w, "upstream_run_id: %s\n", r.UpstreamRunID)
 	}
 	_, _ = fmt.Fprintf(w, "created_at:     %s\n", r.CreatedAt.Format(time.RFC3339))
 	_, _ = fmt.Fprintf(w, "updated_at:     %s\n", r.UpdatedAt.Format(time.RFC3339))

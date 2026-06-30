@@ -79,6 +79,7 @@ type Run struct {
 	TriggerRef         *string       `json:"trigger_ref"`
 	State              string        `json:"state"`
 	ParentRunID        *uuid.UUID    `json:"parent_run_id"`
+	UpstreamRunID      *uuid.UUID    `json:"upstream_run_id,omitempty"`
 	DecomposedFrom     *uuid.UUID    `json:"decomposed_from,omitempty"`
 	PullRequestURL     *string       `json:"pull_request_url"`
 	RetryAttempt       int           `json:"retry_attempt"`
@@ -143,6 +144,12 @@ type CreateRunInput struct {
 	// ADR-030). Ignored when no blocking budget is over. Set by the
 	// CLI's `--override-budget` flag.
 	BudgetOverride bool `json:"budget_override,omitempty"`
+	// UpstreamRunID names the upstream feature_change run whose
+	// ci_green / review_merged a standalone deploy-only release
+	// run's required_upstream pre-flight gate evaluates (E23.11 /
+	// #1417). Distinct from parent_run_id. Set by the CLI's
+	// `-upstream-run-id` flag.
+	UpstreamRunID *string `json:"upstream_run_id,omitempty"`
 }
 
 // StartRun calls POST /v0/runs.
