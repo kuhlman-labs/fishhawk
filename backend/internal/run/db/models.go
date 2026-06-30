@@ -53,6 +53,30 @@ type AuditEntry struct {
 	EntryHash    string             `json:"entry_hash"`
 }
 
+type Campaign struct {
+	ID             uuid.UUID          `json:"id"`
+	Repo           string             `json:"repo"`
+	EpicRef        string             `json:"epic_ref"`
+	State          string             `json:"state"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	PausePolicy    string             `json:"pause_policy"`
+	OperatorAgent  []byte             `json:"operator_agent"`
+	IdempotencyKey *string            `json:"idempotency_key"`
+}
+
+type CampaignItem struct {
+	ID          uuid.UUID          `json:"id"`
+	CampaignID  uuid.UUID          `json:"campaign_id"`
+	IssueRef    string             `json:"issue_ref"`
+	DependsOn   []byte             `json:"depends_on"`
+	RunID       *uuid.UUID         `json:"run_id"`
+	State       string             `json:"state"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+	PauseReason []byte             `json:"pause_reason"`
+}
+
 type McpToken struct {
 	ID         uuid.UUID          `json:"id"`
 	RunID      uuid.UUID          `json:"run_id"`
@@ -107,6 +131,7 @@ type Run struct {
 	Drive                  bool               `json:"drive"`
 	SliceIndex             *int32             `json:"slice_index"`
 	RunnerKindResolved     bool               `json:"runner_kind_resolved"`
+	UpstreamRunID          *uuid.UUID         `json:"upstream_run_id"`
 }
 
 type ScopeAmendment struct {

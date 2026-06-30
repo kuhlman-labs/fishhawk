@@ -386,6 +386,21 @@ components:
             semantic — both can be non-nil on a child whose CI failed
             and re-dispatched. SPA breadcrumb: "decomposed sub-plan of
             <parent short id>".
+        upstream_run_id:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            The upstream `feature_change` run whose `ci_green` /
+            `review_merged` a standalone deploy-only `release` run's
+            `required_upstream` pre-flight gate evaluates (E23.11 /
+            #1417). A deploy-only run has no implement/review stage of
+            its own, so the gate evaluates the referenced upstream
+            instead; null (the appended-deploy / non-deploy default)
+            leaves the gate evaluating the current run. DISTINCT from
+            `parent_run_id` (#216): a deploy-gate safety reference, NOT
+            a follow-up/lineage link — it carries none of the
+            get_plan-resolution / resume-retry / decomposition
+            provenance semantics `parent_run_id` does.
         pull_request_url:
           type: [string, "null"]
           description: |
@@ -2740,6 +2755,28 @@ paths:
                     matters at the moment a budget would block. There
                     is no override on the webhook-dispatch path
                     (webhook triggers can't carry one).
+                upstream_run_id:
+                  type: [string, "null"]
+                  format: uuid
+                  description: |
+                    Optional. The upstream `feature_change` run whose
+                    `ci_green` / `review_merged` a standalone
+                    deploy-only `release` run's `required_upstream`
+                    pre-flight gate should evaluate (E23.11 / #1417). A
+                    deploy-only run has no implement/review stage of its
+                    own; set this so the gate evaluates the referenced
+                    upstream instead. Omitted (the appended-deploy /
+                    non-deploy default) leaves the gate evaluating the
+                    current run. DISTINCT from `parent_run_id` (#216) —
+                    a deploy-gate safety reference, not a follow-up /
+                    lineage link. Because it controls a safety-critical
+                    deploy gate, the gate validates the reference's
+                    provenance at evaluation time: the upstream must be a
+                    `feature_change` run in the SAME REPO as the deploy
+                    run; a cross-repo or non-`feature_change` reference is
+                    treated as unresolved and fails the gate closed.
+                    Persisted on the run row and echoed
+                    back as `upstream_run_id` on the Run resource.
       responses:
         '200':
           description: Idempotent replay — existing run returned unchanged.

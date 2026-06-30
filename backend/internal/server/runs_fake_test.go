@@ -90,6 +90,7 @@ func (f *fakeRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		WorkflowSpec:       p.WorkflowSpec,
 		MaxRetriesSnapshot: p.MaxRetriesSnapshot,
 		IssueContext:       p.IssueContext,
+		UpstreamRunID:      p.UpstreamRunID,
 		State:              run.StatePending,
 		CreatedAt:          now,
 		UpdatedAt:          now,

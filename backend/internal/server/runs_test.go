@@ -405,3 +405,75 @@ func TestCreateRunForTrigger_StageCreateError(t *testing.T) {
 		t.Fatalf("err = %v, want it to contain 'create stages failed'", err)
 	}
 }
+
+// TestCreateRun_UpstreamRunID_CrossBoundary pins the deploy-gate cross-run
+// reference (E23.11 / #1417) end-to-end across the create path: request
+// payload -> handleCreateRun -> CreateRunForTrigger -> run.CreateRunParams ->
+// persisted run row -> toRunResponse echo (cf. #618). A POST carrying
+// upstream_run_id must land in the CreateRun params, be stored on the run,
+// and be echoed on the response.
+func TestCreateRun_UpstreamRunID_CrossBoundary(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+
+	upstreamID := uuid.New()
+	body := `{
+		"repo": "kuhlman-labs/fishhawk",
+		"workflow_id": "release",
+		"workflow_sha": "abc123",
+		"trigger_source": "cli",
+		"upstream_run_id": "` + upstreamID.String() + `"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	// (1) It reached the repo create params.
+	if got := repo.lastCreateRunParams.UpstreamRunID; got == nil || *got != upstreamID {
+		t.Errorf("CreateRunParams.UpstreamRunID = %v, want %v", got, upstreamID)
+	}
+	// (2) It is echoed on the response (which the fake stores on the run row).
+	var resp runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if resp.UpstreamRunID == nil || *resp.UpstreamRunID != upstreamID {
+		t.Errorf("response UpstreamRunID = %v, want %v", resp.UpstreamRunID, upstreamID)
+	}
+}
+
+// TestCreateRun_UpstreamRunID_OmittedStaysNil confirms the appended-deploy /
+// non-deploy default: a create request omitting upstream_run_id leaves the
+// params nil and the response field absent (#1417).
+func TestCreateRun_UpstreamRunID_OmittedStaysNil(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+
+	body := `{
+		"repo": "kuhlman-labs/fishhawk",
+		"workflow_id": "feature_change",
+		"workflow_sha": "abc123",
+		"trigger_source": "cli"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := repo.lastCreateRunParams.UpstreamRunID; got != nil {
+		t.Errorf("CreateRunParams.UpstreamRunID = %v, want nil", got)
+	}
+	var resp runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if resp.UpstreamRunID != nil {
+		t.Errorf("response UpstreamRunID = %v, want nil", resp.UpstreamRunID)
+	}
+}

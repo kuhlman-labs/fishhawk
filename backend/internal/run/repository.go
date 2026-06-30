@@ -31,6 +31,14 @@ type CreateRunParams struct {
 	// fresh trigger lands for a (repo, trigger_ref) tuple that
 	// already has a non-terminal run.
 	ParentRunID *uuid.UUID
+	// UpstreamRunID, when non-nil, names the upstream feature_change run
+	// the deploy stage's required_upstream pre-flight gate evaluates
+	// (E23.11 / #1417). NOT parent_run_id (#216): a deploy-gate safety
+	// pointer kept off the follow-up/lineage column so the get_plan
+	// resolution walk, resume/retry recovery, and decomposition
+	// provenance consumers are unaffected. Nil → the gate evaluates the
+	// current run (the appended-deploy path).
+	UpstreamRunID *uuid.UUID
 	// RequiredChecksSnapshot is the GitHub branch protection /
 	// ruleset snapshot the dispatcher captured at run-create time
 	// (#251 / ADR-017). Nil for non-dispatcher creates and for
