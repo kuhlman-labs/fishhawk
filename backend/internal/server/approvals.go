@@ -1221,8 +1221,11 @@ func specPlanExecutorAgent(specBytes []byte, workflowID string) string {
 //   - plan: gateResolvePlanModel(planOverride), keyed to the approved plan stage —
 //     only when the plan ladder resolves to a non-empty model.
 //   - review: gateResolveReviewModel(reviewOverride), keyed to the review stage —
-//     only when the workflow has a review stage AND the review ladder resolves to
-//     a non-empty model.
+//     only when the workflow has a review stage, the review ladder resolves to a
+//     non-empty model, AND at least one agent reviewer provider exists
+//     (reviewProvidersForRun > 0) — the same condition checkStageModelsAllowed
+//     validates the review model against, so an entry is recorded only when the
+//     resolved review model would actually have been allow-list-validated (#1427).
 //
 // The plan/review entries are suppressed when their resolution is empty: their
 // readers (resolvePlanModelForRun, gateResolvedReviewModel) fall back to the
@@ -1282,9 +1285,21 @@ func (s *Server) writeStageModelResolutions(ctx context.Context, planStage *run.
 		s.writeModelResolvedAudit(ctx, planStage.RunID, planStage.ID, app, planRM, string(run.StageTypePlan))
 	}
 
+	// Gate the review entry on the SAME condition checkStageModelsAllowed
+	// validates against — at least one agent reviewer provider
+	// (reviewProvidersForRun, empty for a review stage with no declared agent
+	// reviewers, #1427). Without this, a workflow with a review stage + a
+	// non-empty review ladder but NO agent reviewers would record a
+	// review_model that the allow-list gate never validated (the validate side
+	// only loops over reviewProvidersForRun). Aligning emit with validate keeps
+	// the recorded review resolution to runs where the override would actually
+	// have been allow-list-checked. Fail-open and best-effort like the rest of
+	// this function: no approval unwind.
 	if reviewStageID, ok := findStageIDByType(stages, run.StageTypeReview); ok {
 		if reviewRM := s.gateResolveReviewModel(runRow, reviewOverride); reviewRM.Value != "" {
-			s.writeModelResolvedAudit(ctx, planStage.RunID, reviewStageID, app, reviewRM, string(run.StageTypeReview))
+			if len(s.reviewProvidersForRun(ctx, runRow)) > 0 {
+				s.writeModelResolvedAudit(ctx, planStage.RunID, reviewStageID, app, reviewRM, string(run.StageTypeReview))
+			}
 		}
 	}
 }

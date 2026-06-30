@@ -1320,10 +1320,7 @@ components:
             `model_resolved` audit entry keyed by this stage's id.
             Empty string when no resolution was recorded for the stage
             — the adapter-default spawn, and every stage of a run
-            approved before per-stage model selection landed. Optional
-            until the handler-side population lands (see Notes) — the
-            field is omitted on responses from a backend that does not
-            yet read the audit.
+            approved before per-stage model selection landed.
           example: claude-opus-4-8
         created_at:
           type: string

@@ -1740,10 +1740,123 @@ func TestSubmitApproval_ModelGate_GetRunError_FailsOpen(t *testing.T) {
 	}
 }
 
+// specPlanImplementReviewNoReviewers is specPlanImplementReview's twin with NO
+// agent reviewers on the implement stage (#1427): a review stage and a review
+// ladder that can resolve non-empty, but reviewProvidersForRun yields empty.
+// This is the branch the review model_resolved emit must SUPPRESS — the gate
+// would never have allow-list-validated the review model (the validate side
+// loops over reviewProvidersForRun, which is empty here).
+func specPlanImplementReviewNoReviewers(reviewModel string) []byte {
+	pin := ""
+	if reviewModel != "" {
+		pin = "\n          model: " + reviewModel
+	}
+	return []byte(`version: "0.3"
+workflows:
+  w:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+      - id: review
+        type: review
+        executor:
+          agent: claude-code` + pin + `
+`)
+}
+
+// countModelResolvedForStage returns how many model_resolved audit entries were
+// appended for the given stage type. Explicit Go counting (never grep -c on the
+// single-line JSON payloads, which collapses to 1) so a test can assert "exactly
+// one" vs "zero" review entries across the emit/suppress gating branches (#1427).
+func countModelResolvedForStage(t *testing.T, appended []audit.ChainAppendParams, stageType string) int {
+	t.Helper()
+	n := 0
+	for _, e := range appended {
+		if e.Category != CategoryModelResolved {
+			continue
+		}
+		var p modelResolvedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("unmarshal model_resolved payload: %v", err)
+		}
+		if p.StageType == stageType {
+			n++
+		}
+	}
+	return n
+}
+
+// TestSubmitApproval_ReviewModelResolvedGatedOnReviewers asserts the #1427
+// emit/validate alignment: writeStageModelResolutions records a review
+// model_resolved entry ONLY when the implement stage declares at least one agent
+// reviewer provider (reviewProvidersForRun > 0) — the same condition
+// checkStageModelsAllowed validates the review model against. Both branches:
+//   - with agent reviewers: the review entry IS recorded;
+//   - with a review stage + non-empty review ladder but NO agent reviewers: NO
+//     review entry is recorded, while the implement entry still is.
+func TestSubmitApproval_ReviewModelResolvedGatedOnReviewers(t *testing.T) {
+	t.Run("with agent reviewers: review entry recorded", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		s, rr, au, _ := newModelGateServer(t, art, nil, "")
+		r, planStage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+		implStage := rr.seedStage(r.ID, 1, run.StageStatePending)
+		implStage.Type = run.StageTypeImplement
+		reviewStage := rr.seedStage(r.ID, 2, run.StageStatePending)
+		reviewStage.Type = run.StageTypeReview
+		// specPlanImplementReview declares one agent reviewer on implement.
+		r.WorkflowSpec = specPlanImplementReview("", "", "")
+
+		w := submitApproval(t, s, planStage.ID, `{"decision":"approve","review_model":"op-review"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if got := countModelResolvedForStage(t, au.appended, "review"); got != 1 {
+			t.Errorf("review model_resolved entries = %d, want 1 (agent reviewer present)", got)
+		}
+		if got := countModelResolvedForStage(t, au.appended, "implement"); got != 1 {
+			t.Errorf("implement model_resolved entries = %d, want 1", got)
+		}
+	})
+
+	t.Run("no agent reviewers: review entry suppressed, implement still recorded", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		s, rr, au, _ := newModelGateServer(t, art, nil, "")
+		r, planStage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+		implStage := rr.seedStage(r.ID, 1, run.StageStatePending)
+		implStage.Type = run.StageTypeImplement
+		reviewStage := rr.seedStage(r.ID, 2, run.StageStatePending)
+		reviewStage.Type = run.StageTypeReview
+		// Review stage exists and the operator override makes the review ladder
+		// resolve non-empty, but the implement stage declares NO agent reviewers.
+		r.WorkflowSpec = specPlanImplementReviewNoReviewers("")
+
+		w := submitApproval(t, s, planStage.ID, `{"decision":"approve","review_model":"op-review"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if got := countModelResolvedForStage(t, au.appended, "review"); got != 0 {
+			t.Errorf("review model_resolved entries = %d, want 0 (no agent reviewers to validate against)", got)
+		}
+		// The implement entry is unaffected by the review gating.
+		if got := countModelResolvedForStage(t, au.appended, "implement"); got != 1 {
+			t.Errorf("implement model_resolved entries = %d, want 1", got)
+		}
+	})
+}
+
 // specPlanImplementReview builds a workflow "w" spec with plan + implement +
 // review stages, with optional plan/implement/review executor.model pins. Mirrors
 // specImplementAgentModel but adds the review stage so the per-stage
-// model_resolved emission (#1416) routes a review entry.
+// model_resolved emission (#1416) routes a review entry. The implement stage
+// declares one agent reviewer so reviewProvidersForRun is non-empty — the
+// condition the review model_resolved emit is gated on (#1427), aligning it with
+// checkStageModelsAllowed's review-allow-list validate side.
 func specPlanImplementReview(planModel, implModel, reviewModel string) []byte {
 	pin := func(m string) string {
 		if m == "" {
@@ -1763,6 +1876,11 @@ workflows:
         type: implement
         executor:
           agent: claude-code` + pin(implModel) + `
+        reviewers:
+          agents:
+            - provider: claudecode
+              model: placeholder
+          human: 1
       - id: review
         type: review
         executor:
