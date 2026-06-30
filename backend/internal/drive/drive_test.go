@@ -212,8 +212,8 @@ func TestEvaluateDeployInitialization(t *testing.T) {
 		if !out.Advance {
 			t.Fatalf("Advance = false, want true (the orchestrator already parked the deploy stage at its gate) [runner_kind=%s]", rk)
 		}
-		if out.NextAction == nil || out.NextAction.Action != "fishhawk_approve_plan" {
-			t.Fatalf("NextAction = %+v, want action fishhawk_approve_plan [runner_kind=%s]", out.NextAction, rk)
+		if out.NextAction == nil || out.NextAction.Action != "fishhawk_approve_deploy" {
+			t.Fatalf("NextAction = %+v, want action fishhawk_approve_deploy [runner_kind=%s]", out.NextAction, rk)
 		}
 	}
 }

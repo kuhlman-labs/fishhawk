@@ -218,6 +218,8 @@ A deploy stage's gate is **pre-execution** ([ADR-038](https://github.com/kuhlman
 
 The `next_actions` `deploy_gate_parked` arm points at `fishhawk_approve_deploy` (with the `environment` param and a precondition naming the `write:deploy` + `--environment` requirement) plus a `fishhawk_reject_deploy` action. Duplicate-submission labeling (#986) applies to both, identical to the plan-gate tools. Deploy **rollback** is out of scope here — there is no rollback approval endpoint; the CLI `fishhawk deploy rollback` already exists and a rollback verb is a separate follow-up.
 
+> **Operability note (stale local MCP token).** A local dev MCP server's `FISHHAWK_API_TOKEN` may have been issued before E23.10 added `write:deploy` to the operator default scope set, so `fishhawk_approve_deploy` returns `403 insufficient_scope` (`required_scope: write:deploy`) even for the operator. `operatorDefaultScopes` now includes `write:deploy`, so re-issuing the MCP token with the default scope set (`fishhawkd token issue --subject <s>`) fixes it.
+
 ## Implement-review fix-up (`fishhawk_fixup_stage`)
 
 `fishhawk_fixup_stage` (E22.X / [#762](https://github.com/kuhlman-labs/fishhawk/issues/762)) routes one or more **advisory implement-review concerns** ([ADR-027](https://github.com/kuhlman-labs/fishhawk/issues/703) `approve_with_concerns`) back to the implement agent for a single fix-up pass, instead of the operator hand-editing the PR branch. It wraps `POST /v0/stages/{stage_id}/fixup`.
