@@ -36,6 +36,15 @@ type stageResponse struct {
 	Gate            *stageGate    `json:"gate,omitempty"`
 	CreatedAt       time.Time     `json:"created_at"`
 	UpdatedAt       time.Time     `json:"updated_at"`
+	// ResolvedModel is the source-tagged model the approval gate resolved
+	// for this stage, read from the per-stage model_resolved audit entry
+	// (#1416 / #1427). Plain string (NOT omitempty) so the response always
+	// carries the field — empty string when no resolution was recorded
+	// (a legacy run, a stage the gate never stamped, or a fail-open audit
+	// read). Populated only by the two observability read handlers
+	// (handleGetStage, handleListRunStages); the action endpoints that
+	// build a stageResponse leave it at the empty default.
+	ResolvedModel string `json:"resolved_model"`
 }
 
 type stageExecutor struct {
@@ -93,6 +102,22 @@ func toStageResponse(s *run.Stage) stageResponse {
 	return resp
 }
 
+// resolvedModelForStage is the read-only bridge from a stage's per-stage
+// model_resolved audit entry to the Stage response's resolved_model field
+// (#1427). It delegates to gateResolvedModelForStage (modelpolicy.go), which
+// filters the run's model_resolved entries by the payload's stage_type
+// discriminator and is the same reader the runner-spawn route uses. Returns
+// the resolved value when an entry exists, else "" — so a legacy run, a stage
+// the approval gate never stamped, or a fail-open audit read all degrade to an
+// empty field, matching the OpenAPI "empty string when no resolution was
+// recorded" semantics. It is a pure read: no audit write, no approval unwind.
+func (s *Server) resolvedModelForStage(ctx context.Context, st *run.Stage) string {
+	if rm, ok := s.gateResolvedModelForStage(ctx, st.RunID, string(st.Type)); ok {
+		return rm.Value
+	}
+	return ""
+}
+
 // handleListRunStages implements GET /v0/runs/{run_id}/stages.
 // Returns stages ordered by sequence ascending; no pagination.
 // MVP_SPEC §4.2 caps stages-per-workflow at a small N, so flat
@@ -125,7 +150,9 @@ func (s *Server) handleListRunStages(w http.ResponseWriter, r *http.Request) {
 
 	items := make([]stageResponse, 0, len(stages))
 	for _, st := range stages {
-		items = append(items, toStageResponse(st))
+		resp := toStageResponse(st)
+		resp.ResolvedModel = s.resolvedModelForStage(r.Context(), st)
+		items = append(items, resp)
 	}
 	s.writeJSON(w, r, http.StatusOK, map[string]any{"items": items})
 }
@@ -156,7 +183,9 @@ func (s *Server) handleGetStage(w http.ResponseWriter, r *http.Request) {
 			"get stage failed", map[string]any{"error": err.Error()})
 		return
 	}
-	s.writeJSON(w, r, http.StatusOK, toStageResponse(got))
+	resp := toStageResponse(got)
+	resp.ResolvedModel = s.resolvedModelForStage(r.Context(), got)
+	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
 // artifactResponse mirrors docs/api/v0.openapi.yaml's `Artifact`

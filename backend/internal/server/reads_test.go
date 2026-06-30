@@ -214,6 +214,122 @@ func TestGetStage_HappyPath(t *testing.T) {
 	}
 }
 
+// TestStageResolvedModel_FromAudit drives the per-stage resolved_model
+// observability seam end to end (#1427): a model_resolved audit entry keyed
+// to the implement stage must surface as resolved_model on BOTH the single
+// stage read (GET /v0/stages/{id}) and the list read (GET /v0/runs/{id}/stages),
+// while a stage with no model_resolved entry carries the empty string. This is
+// the cross-boundary assertion the original slice omitted: audit persistence ->
+// read handler -> serialized JSON response.
+func TestStageResolvedModel_FromAudit(t *testing.T) {
+	repo := newStagesRunRepo()
+	runID := uuid.New()
+	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	planID, implID := uuid.New(), uuid.New()
+	repo.stages[runID] = []*run.Stage{
+		{ID: planID, RunID: runID, Sequence: 0, Type: run.StageTypePlan,
+			ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+			State: run.StageStateSucceeded, CreatedAt: now, UpdatedAt: now},
+		{ID: implID, RunID: runID, Sequence: 1, Type: run.StageTypeImplement,
+			ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+			State: run.StageStateRunning, CreatedAt: now, UpdatedAt: now},
+	}
+
+	// Seed a model_resolved entry tagged for the implement stage only.
+	a := newAuditReadFake()
+	payload, err := json.Marshal(modelResolvedPayload{
+		ResolvedModel: ResolvedModel{Value: "claude-opus-4-8", Source: ModelSourceOperator},
+		StageType:     string(run.StageTypeImplement),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.byCat[CategoryModelResolved] = []*audit.Entry{{
+		ID: uuid.New(), Sequence: 1, RunID: &runID, StageID: &implID,
+		Timestamp: now, Category: CategoryModelResolved, Payload: payload,
+		EntryHash: "hash-mr",
+	}}
+
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: &stageGetRepo{stagesRunRepo: repo}, AuditRepo: a})
+
+	// (a) Single stage read crosses audit -> handler -> JSON.
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/stages/%s", implID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET stage status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var single stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &single); err != nil {
+		t.Fatal(err)
+	}
+	if single.ResolvedModel != "claude-opus-4-8" {
+		t.Errorf("GET stage resolved_model = %q, want claude-opus-4-8", single.ResolvedModel)
+	}
+	// The field is always present (not omitempty): the raw body carries the key.
+	if !strings.Contains(w.Body.String(), `"resolved_model"`) {
+		t.Errorf("body should always carry resolved_model key, got:\n%s", w.Body.String())
+	}
+
+	// (b) List read surfaces the model on the implement item and "" on the
+	// plan item (no model_resolved entry tagged plan).
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s/stages", runID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET stages status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var list struct {
+		Items []stageResponse `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Items) != 2 {
+		t.Fatalf("got %d stages, want 2", len(list.Items))
+	}
+	byType := map[string]stageResponse{}
+	for _, it := range list.Items {
+		byType[it.Type] = it
+	}
+	if got := byType[string(run.StageTypeImplement)].ResolvedModel; got != "claude-opus-4-8" {
+		t.Errorf("implement resolved_model = %q, want claude-opus-4-8", got)
+	}
+	if got := byType[string(run.StageTypePlan)].ResolvedModel; got != "" {
+		t.Errorf("plan resolved_model = %q, want empty (no model_resolved entry)", got)
+	}
+}
+
+// TestStageResolvedModel_EmptyWhenNoAudit asserts the fail-open negative case:
+// a stage read with no AuditRepo wired (or no model_resolved entry) degrades
+// resolved_model to the empty string rather than erroring (#1427).
+func TestStageResolvedModel_EmptyWhenNoAudit(t *testing.T) {
+	repo := newStagesRunRepo()
+	runID, stageID := uuid.New(), uuid.New()
+	now := time.Date(2026, 6, 29, 12, 0, 0, 0, time.UTC)
+	repo.stages[runID] = []*run.Stage{{
+		ID: stageID, RunID: runID, Sequence: 1, Type: run.StageTypeImplement,
+		ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+		State: run.StageStateRunning, CreatedAt: now, UpdatedAt: now,
+	}}
+	// No AuditRepo: gateResolvedModelForStage returns ok=false, helper yields "".
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: &stageGetRepo{stagesRunRepo: repo}})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/stages/%s", stageID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var got stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ResolvedModel != "" {
+		t.Errorf("resolved_model = %q, want empty when no audit configured", got.ResolvedModel)
+	}
+}
+
 // TestGetStage_GateShapeOnWire verifies the persisted Gate (#213)
 // reaches the SPA via the HTTP response — this is what the
 // review-stage detail page reads to render blocking_checks +
