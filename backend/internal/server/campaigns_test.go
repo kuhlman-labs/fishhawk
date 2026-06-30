@@ -47,6 +47,13 @@ type fakeCampaignRepo struct {
 	transItemErr error
 	setRunErr    error
 
+	// itemsErrOnCall, when non-zero, fails ListCampaignItemsForCampaign on
+	// exactly that 1-based call number (others succeed), so a test can exercise
+	// reconcile's re-list-after-settle swallow path without also failing the
+	// read's initial list. itemsCalls counts the invocations it gates on.
+	itemsErrOnCall int
+	itemsCalls     int
+
 	// call counters so idempotency tests can assert a no-op re-poll performs no
 	// further mutation.
 	transItemCalls int
@@ -238,8 +245,12 @@ func (f *fakeCampaignRepo) ListCampaigns(_ context.Context, fil campaign.ListCam
 func (f *fakeCampaignRepo) ListCampaignItemsForCampaign(_ context.Context, id uuid.UUID) ([]*campaign.Item, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.itemsCalls++
 	if f.itemsErr != nil {
 		return nil, f.itemsErr
+	}
+	if f.itemsErrOnCall != 0 && f.itemsCalls == f.itemsErrOnCall {
+		return nil, errInjected
 	}
 	out := make([]*campaign.Item, len(f.itemsByCmp[id]))
 	copy(out, f.itemsByCmp[id])
@@ -2460,5 +2471,176 @@ func TestStartCampaignItemRun_LinkFails_500(t *testing.T) {
 	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500 (body=%s)", w.Code, w.Body.String())
+	}
+}
+
+// TestStartCampaignItemRun_TransitionInvalid_409 covers the start handler's
+// errors.As(err, &inv) arm: an InvalidTransitionError from the running
+// transition maps to 409 invalid_transition (not the generic 500) and STILL
+// rolls the item-run link back so the item re-partitions Eligible on retry.
+// TestStartCampaignItemRun_TransitionFailure_RollsBackLink injects a plain
+// error (the 500 arm); this pins the typed-conflict arm.
+func TestStartCampaignItemRun_TransitionInvalid_409(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, _, _ := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+	crepo.transItemErr = campaign.InvalidTransitionError{Kind: "campaign_item", From: "pending", To: "running"}
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "invalid_transition" {
+		t.Errorf("code = %q, want invalid_transition", code)
+	}
+	// The link was rolled back so the item re-partitions Eligible on retry.
+	if it := crepo.itemsByCmp[c.ID][0]; it.RunID != nil {
+		t.Errorf("item run_id = %v, want nil after rollback", it.RunID)
+	}
+}
+
+// TestStartCampaignItemRun_ReconcileOnRead_GetRunError_StillReturns200 covers
+// the reconcile GetRun-failure swallow path: a linked run whose GetRun errors is
+// logged-and-swallowed, the item is left running, NO settle audit is emitted,
+// and the status read still returns 200 (best-effort — never fails the read).
+func TestStartCampaignItemRun_ReconcileOnRead_GetRunError_StillReturns200(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, aud := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("start status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+
+	// GetRun now errors: reconcile logs-and-swallows, leaving the item running.
+	rrepo.getErr = errInjected
+	st := getCampaignStatusBody(t, s, c.ID) // asserts 200 internally
+	if len(st.Rollup.Running) != 1 || st.Rollup.Running[0] != "issue:100" {
+		t.Errorf("rollup.Running = %v, want [issue:100] (item left running on GetRun error)", st.Rollup.Running)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 0 {
+		t.Errorf("campaign_issue_settled = %d, want 0 (nothing settled on GetRun error)", n)
+	}
+}
+
+// TestStartCampaignItemRun_ReconcileOnRead_SettleTransitionError_StillReturns200
+// covers the reconcile settle-transition-failure swallow path: when the item's
+// terminal-run settle TransitionCampaignItem fails, the error is
+// logged-and-swallowed, the item is left running, no settle audit is emitted,
+// and the read still returns 200.
+func TestStartCampaignItemRun_ReconcileOnRead_SettleTransitionError_StillReturns200(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, aud := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("start status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var body startItemRunBody
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	if _, err := rrepo.TransitionRun(context.Background(), body.Run.ID, run.StateSucceeded); err != nil {
+		t.Fatalf("flip run terminal: %v", err)
+	}
+
+	// The settle transition now fails: reconcile logs-and-swallows, item stays running.
+	crepo.transItemErr = errInjected
+	st := getCampaignStatusBody(t, s, c.ID)
+	if len(st.Rollup.Running) != 1 || st.Rollup.Running[0] != "issue:100" {
+		t.Errorf("rollup.Running = %v, want [issue:100] (settle failed, item left running)", st.Rollup.Running)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 0 {
+		t.Errorf("campaign_issue_settled = %d, want 0 (settle transition failed)", n)
+	}
+}
+
+// TestStartCampaignItemRun_ReconcileOnRead_DeriveTransitionError_StillReturns200
+// covers the reconcile derive-failure swallow path: the item settles (done) but
+// the campaign derivation transition fails — logged-and-swallowed — leaving the
+// campaign un-advanced (still running) while the read still returns 200 and the
+// settle is not unwound.
+func TestStartCampaignItemRun_ReconcileOnRead_DeriveTransitionError_StillReturns200(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, aud := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("start status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var body startItemRunBody
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	if _, err := rrepo.TransitionRun(context.Background(), body.Run.ID, run.StateSucceeded); err != nil {
+		t.Fatalf("flip run terminal: %v", err)
+	}
+
+	// The item settle succeeds but the campaign derivation transition fails.
+	crepo.transCmpErr = errInjected
+	st := getCampaignStatusBody(t, s, c.ID)
+	if len(st.Rollup.Done) != 1 || st.Rollup.Done[0] != "issue:100" {
+		t.Errorf("rollup.Done = %v, want [issue:100] (item settled despite derive failure)", st.Rollup.Done)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 1 {
+		t.Errorf("campaign_issue_settled = %d, want 1 (item settled)", n)
+	}
+	if n := aud.count("campaign_advanced"); n != 0 {
+		t.Errorf("campaign_advanced = %d, want 0 (derive transition failed)", n)
+	}
+	// The campaign was left un-advanced; the failed transition did not unwind the
+	// settle and the read still returned 200 — the next read re-derives.
+	if got := crepo.campaigns[c.ID].State; got != campaign.StateRunning {
+		t.Errorf("campaign state = %q, want running (derive transition failed, left for next read)", got)
+	}
+}
+
+// TestStartCampaignItemRun_ReconcileOnRead_RelistError_StillReturns200 covers
+// the reconcile re-list-after-settle swallow path: the item settles but the
+// re-list that feeds campaign derivation fails — logged-and-swallowed — so the
+// campaign is not re-derived (no advance) yet the read still returns 200. The
+// read's initial list and the post-reconcile refresh still succeed (only the
+// reconcile re-list, the 2nd list of the read, is failed).
+func TestStartCampaignItemRun_ReconcileOnRead_RelistError_StillReturns200(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, aud := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("start status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var body startItemRunBody
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	if _, err := rrepo.TransitionRun(context.Background(), body.Run.ID, run.StateSucceeded); err != nil {
+		t.Fatalf("flip run terminal: %v", err)
+	}
+
+	// Reset the counter so it gates only the read's list calls, and fail the 2nd
+	// one (reconcile's re-list-after-settle). The initial list (1) and the
+	// handler's post-reconcile refresh (3) still succeed.
+	crepo.itemsCalls = 0
+	crepo.itemsErrOnCall = 2
+	_ = getCampaignStatusBody(t, s, c.ID) // asserts 200 internally
+	if n := aud.count("campaign_issue_settled"); n != 1 {
+		t.Errorf("campaign_issue_settled = %d, want 1 (item settled before the re-list failed)", n)
+	}
+	// Derivation was skipped because its re-list failed → no advance emitted.
+	if n := aud.count("campaign_advanced"); n != 0 {
+		t.Errorf("campaign_advanced = %d, want 0 (re-list failed, derivation skipped)", n)
 	}
 }
