@@ -5,6 +5,7 @@ package anthropic
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -61,7 +62,10 @@ func NewClient(cfg Config, opts ...option.RequestOption) *Client {
 // (#681/#1343) — so the caller can attribute reviewer agent cost including
 // cache-aware pricing. The SDK always returns a Usage block on a successful
 // Messages call, so the token counts are authoritative on the happy path.
-// The error / no-text paths return zero for all four counts.
+// Refusal, max_tokens truncation, and no-text-block responses return a typed
+// error rather than ("", nil); token counts are surfaced on these paths (not
+// zeroed) so cost attribution is preserved. A transport-level error (non-nil
+// err from Messages.New) zeros all four counts.
 //
 // When c.schema is non-nil the request carries OutputConfig.Format =
 // json_schema with that per-client schema (#1324/#1326): the Messages API
@@ -110,10 +114,23 @@ func (c *Client) Messages(ctx context.Context, systemText, userText string) (res
 	// the discount and cache-write at the premium instead of discarding them.
 	cacheReadTok := int(msg.Usage.CacheReadInputTokens)
 	cacheWriteTok := int(msg.Usage.CacheCreationInputTokens)
+	// Inspect stop_reason before the content loop. A truncated or refusing
+	// response may carry a partial text block, but a JSON-schema-constrained
+	// verdict truncated mid-object is unparseable — failing loud is strictly
+	// better than surfacing an unparseable fragment as ("", nil).
+	if msg.StopReason == anthropicsdk.StopReasonRefusal {
+		return "", msg.Model, inTok, outTok, cacheReadTok, cacheWriteTok,
+			fmt.Errorf("anthropic: model refused to respond (stop_reason=refusal)")
+	}
+	if msg.StopReason == anthropicsdk.StopReasonMaxTokens {
+		return "", msg.Model, inTok, outTok, cacheReadTok, cacheWriteTok,
+			fmt.Errorf("anthropic: response truncated at max_tokens (%d tokens); increase max_tokens", outTok)
+	}
 	for _, block := range msg.Content {
 		if block.Type == "text" {
 			return block.Text, msg.Model, inTok, outTok, cacheReadTok, cacheWriteTok, nil
 		}
 	}
-	return "", msg.Model, inTok, outTok, cacheReadTok, cacheWriteTok, nil
+	return "", msg.Model, inTok, outTok, cacheReadTok, cacheWriteTok,
+		fmt.Errorf("anthropic: response carried no text block (stop_reason=%s)", msg.StopReason)
 }
