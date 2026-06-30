@@ -412,6 +412,78 @@ func TestRunStart_RunnerKindShownInTextOutput(t *testing.T) {
 	}
 }
 
+func TestRunStart_UpstreamRunIDForwarded(t *testing.T) {
+	// A valid UUID passed as --upstream-run-id must land in the
+	// server-decoded CreateRunInput, crossing the flag ->
+	// CreateRunInput -> marshaled wire body -> server decode seam.
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	upstreamID := uuid.New().String()
+	fb.startResp = httpclient.Run{ID: uuid.New(), State: "pending"}
+
+	if rc := run([]string{
+		"run", "start",
+		"--repo", "x/y", "--workflow", "w", "--workflow-sha", "abc",
+		"--upstream-run-id", upstreamID,
+	}, io.Discard, io.Discard); rc != exitOK {
+		t.Fatalf("status = %d", rc)
+	}
+	if fb.startedRun == nil {
+		t.Fatal("backend not called")
+	}
+	if fb.startedRun.UpstreamRunID == nil || *fb.startedRun.UpstreamRunID != upstreamID {
+		got := "<nil>"
+		if fb.startedRun.UpstreamRunID != nil {
+			got = *fb.startedRun.UpstreamRunID
+		}
+		t.Errorf("UpstreamRunID = %q, want %q", got, upstreamID)
+	}
+}
+
+func TestRunStart_UpstreamRunIDInvalid_Usage(t *testing.T) {
+	// A malformed --upstream-run-id must return exitUsage and never
+	// call the backend.
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+
+	var stderr strings.Builder
+	if rc := run([]string{
+		"run", "start",
+		"--repo", "x/y", "--workflow", "w", "--workflow-sha", "abc",
+		"--upstream-run-id", "not-a-uuid",
+	}, io.Discard, &stderr); rc != exitUsage {
+		t.Fatalf("status = %d, want exitUsage", rc)
+	}
+	if fb.startedRun != nil {
+		t.Error("backend was called despite invalid upstream-run-id")
+	}
+	if !strings.Contains(stderr.String(), "not a valid UUID") {
+		t.Errorf("expected 'not a valid UUID' in stderr: %s", stderr.String())
+	}
+}
+
+func TestRunStart_UpstreamRunIDOmitted_Unset(t *testing.T) {
+	// When --upstream-run-id is not set the field must be nil in the
+	// decoded CreateRunInput, confirming omitempty drops it from the
+	// wire JSON so the backend default applies.
+	fb, srv := newFakeBackend(t)
+	withBackend(t, srv)
+	fb.startResp = httpclient.Run{ID: uuid.New(), State: "pending"}
+
+	if rc := run([]string{
+		"run", "start",
+		"--repo", "x/y", "--workflow", "w", "--workflow-sha", "abc",
+	}, io.Discard, io.Discard); rc != exitOK {
+		t.Fatalf("status = %d", rc)
+	}
+	if fb.startedRun == nil {
+		t.Fatal("backend not called")
+	}
+	if fb.startedRun.UpstreamRunID != nil {
+		t.Errorf("UpstreamRunID = %v, want nil (omitted)", fb.startedRun.UpstreamRunID)
+	}
+}
+
 func TestRunStart_MissingRequiredFlags(t *testing.T) {
 	_, srv := newFakeBackend(t)
 	withBackend(t, srv)

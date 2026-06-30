@@ -4092,6 +4092,55 @@ func TestStartRun_BudgetOverride_ForwardedToBackend(t *testing.T) {
 	}
 }
 
+// TestStartRun_UpstreamRunID_ForwardedToBackend asserts that a valid
+// upstream_run_id UUID set on StartRunInput reaches the fake backend's
+// captured createRunBody, crossing the MCP input -> StartRunParams ->
+// createRunRequest -> JSON request body seam end-to-end.
+func TestStartRun_UpstreamRunID_ForwardedToBackend(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	upstreamID := uuid.New().String()
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:          "x/y",
+		WorkflowID:    "trivial",
+		WorkflowSpec:  validTrivialSpec,
+		UpstreamRunID: upstreamID,
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if fb.createRunBody.UpstreamRunID != upstreamID {
+		t.Errorf("UpstreamRunID = %q, want %q", fb.createRunBody.UpstreamRunID, upstreamID)
+	}
+}
+
+// TestStartRun_UpstreamRunID_InvalidUUID_Errors asserts that a
+// malformed upstream_run_id returns an error before calling the backend
+// (local validation catches it, so the backend is never reached).
+func TestStartRun_UpstreamRunID_InvalidUUID_Errors(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	prevBody := fb.createRunBody
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:          "x/y",
+		WorkflowID:    "trivial",
+		WorkflowSpec:  validTrivialSpec,
+		UpstreamRunID: "not-a-uuid",
+	})
+	if err == nil {
+		t.Fatal("startRun: expected error for invalid UUID, got nil")
+	}
+	if !strings.Contains(err.Error(), "not a valid UUID") {
+		t.Errorf("error %q does not mention 'not a valid UUID'", err.Error())
+	}
+	// Backend must not have been called (createRunBody unchanged).
+	if fb.createRunBody != prevBody {
+		t.Error("backend was called despite invalid upstream_run_id")
+	}
+}
+
 // TestStartRun_IssueFetch_AutoFlipsTriggerSource exercises the
 // gh-fetch convenience: when the agent passes issue, the MCP
 // server fetches via gh and ships the payload inline, AND flips

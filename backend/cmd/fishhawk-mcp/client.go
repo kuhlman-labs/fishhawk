@@ -78,6 +78,7 @@ type Run struct {
 	TriggerRef         *string `json:"trigger_ref"`
 	State              string  `json:"state"`
 	ParentRunID        *string `json:"parent_run_id"`
+	UpstreamRunID      *string `json:"upstream_run_id,omitempty"`
 	PullRequestURL     *string `json:"pull_request_url"`
 	RetryAttempt       int     `json:"retry_attempt"`
 	MaxRetriesSnapshot int     `json:"max_retries_snapshot"`
@@ -340,6 +341,7 @@ type createRunRequest struct {
 	WorkflowSpec   string        `json:"workflow_spec,omitempty"`
 	IssueContext   *IssueContext `json:"issue_context,omitempty"`
 	BudgetOverride bool          `json:"budget_override,omitempty"`
+	UpstreamRunID  string        `json:"upstream_run_id,omitempty"`
 }
 
 // StartRunParams is the typed input the apiClient takes for run
@@ -363,6 +365,7 @@ type StartRunParams struct {
 	WorkflowSpec   string
 	IssueContext   *IssueContext
 	BudgetOverride bool
+	UpstreamRunID  string
 }
 
 // approvalRequest mirrors the backend's
@@ -1036,6 +1039,7 @@ func (c *apiClient) StartRun(ctx context.Context, p StartRunParams) (*Run, bool,
 		WorkflowSpec:   p.WorkflowSpec,
 		IssueContext:   p.IssueContext,
 		BudgetOverride: p.BudgetOverride,
+		UpstreamRunID:  p.UpstreamRunID,
 	}
 	if p.TriggerRef != "" {
 		ref := p.TriggerRef
