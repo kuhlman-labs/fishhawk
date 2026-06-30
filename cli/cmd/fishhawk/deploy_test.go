@@ -302,7 +302,7 @@ func TestDeployApprove_HappyPath(t *testing.T) {
 	}
 
 	var stdout strings.Builder
-	got := run([]string{"deploy", "approve", "--reason", "ship it", runID.String()}, &stdout, io.Discard)
+	got := run([]string{"deploy", "approve", "--environment", "staging", runID.String()}, &stdout, io.Discard)
 	if got != exitOK {
 		t.Fatalf("status = %d, want exitOK", got)
 	}
@@ -312,12 +312,130 @@ func TestDeployApprove_HappyPath(t *testing.T) {
 	if fb.approvalBody.Decision != httpclient.ApprovalApprove {
 		t.Errorf("decision = %q, want approve", fb.approvalBody.Decision)
 	}
-	if fb.approvalBody.Comment != "ship it" {
-		t.Errorf("comment = %q, want 'ship it'", fb.approvalBody.Comment)
+	// The composed comment crosses the CLI->HTTP seam intact: just the
+	// --environment token, no reason.
+	if fb.approvalBody.Comment != "--environment=staging" {
+		t.Errorf("comment = %q, want '--environment=staging'", fb.approvalBody.Comment)
 	}
 	if !strings.Contains(stdout.String(), "awaiting_deployment") {
 		t.Errorf("stdout missing post-approve state: %s", stdout.String())
 	}
+}
+
+// TestDeployApprove_EnvOverrideReason composes all three inputs and asserts the
+// exact comment byte-shape that crosses the CLI->HTTP seam matches the MCP
+// fishhawk_approve_deploy tool's composition ("--environment=<env>
+// [ --override-freeze] [ <reason>]").
+func TestDeployApprove_EnvOverrideReason(t *testing.T) {
+	fb, srv := newDeployFake(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	stages := deployStages(runID, "awaiting_deploy_approval")
+	deployStageID := stages[1].ID
+	fb.stages = stages
+	fb.approvalResp = httpclient.Stage{
+		ID: deployStageID, RunID: runID, Sequence: 2, Type: "deploy", State: "awaiting_deployment",
+		Executor: httpclient.StageExecutor{Kind: "delegate", Ref: "github_actions"},
+	}
+
+	var stdout strings.Builder
+	got := run([]string{"deploy", "approve", "--environment", "staging", "--override-freeze", "--reason", "ship it", runID.String()}, &stdout, io.Discard)
+	if got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	if fb.approvalBody.Comment != "--environment=staging --override-freeze ship it" {
+		t.Errorf("comment = %q, want '--environment=staging --override-freeze ship it'", fb.approvalBody.Comment)
+	}
+}
+
+// TestDeployApprove_MissingEnvironment is the fail-closed environment-required
+// guard: approve with no -environment exits exitUsage and never submits.
+func TestDeployApprove_MissingEnvironment(t *testing.T) {
+	fb, srv := newDeployFake(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	fb.stages = deployStages(runID, "awaiting_deploy_approval")
+
+	var stderr strings.Builder
+	got := run([]string{"deploy", "approve", runID.String()}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "--environment is required") {
+		t.Errorf("stderr missing diagnostic: %s", stderr.String())
+	}
+	if fb.approvedID != "" {
+		t.Errorf("approvals endpoint reached despite missing environment; stage_id=%s", fb.approvedID)
+	}
+}
+
+// TestDeployApprove_EnvironmentSmuggling is the fail-closed single-token guard:
+// an -environment carrying embedded whitespace (a flag smuggle attempt) exits
+// exitUsage and never submits.
+func TestDeployApprove_EnvironmentSmuggling(t *testing.T) {
+	fb, srv := newDeployFake(t)
+	withBackend(t, srv)
+	runID := uuid.New()
+	fb.stages = deployStages(runID, "awaiting_deploy_approval")
+
+	var stderr strings.Builder
+	got := run([]string{"deploy", "approve", "--environment", "staging --override-freeze", runID.String()}, io.Discard, &stderr)
+	if got != exitUsage {
+		t.Errorf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "single whitespace-free token") {
+		t.Errorf("stderr missing single-token diagnostic: %s", stderr.String())
+	}
+	if fb.approvedID != "" {
+		t.Errorf("approvals endpoint reached despite whitespace-smuggling environment; stage_id=%s", fb.approvedID)
+	}
+}
+
+// TestDeployApprove_ReasonSmuggling is the fail-closed reason-smuggling guard: a
+// -reason carrying a standalone --override-freeze token WITHOUT -override-freeze
+// exits exitUsage and never submits; the SAME reason WITH -override-freeze
+// submits, composing the operator's explicitly-requested flag verbatim.
+func TestDeployApprove_ReasonSmuggling(t *testing.T) {
+	runID := uuid.New()
+
+	t.Run("without override-freeze fails closed", func(t *testing.T) {
+		fb, srv := newDeployFake(t)
+		withBackend(t, srv)
+		fb.stages = deployStages(runID, "awaiting_deploy_approval")
+
+		var stderr strings.Builder
+		got := run([]string{"deploy", "approve", "--environment", "staging", "--reason", "--override-freeze", runID.String()}, io.Discard, &stderr)
+		if got != exitUsage {
+			t.Errorf("status = %d, want exitUsage", got)
+		}
+		if !strings.Contains(stderr.String(), "standalone --override-freeze token") {
+			t.Errorf("stderr missing reason-smuggling diagnostic: %s", stderr.String())
+		}
+		if fb.approvedID != "" {
+			t.Errorf("approvals endpoint reached despite reason-smuggling; stage_id=%s", fb.approvedID)
+		}
+	})
+
+	t.Run("with override-freeze submits", func(t *testing.T) {
+		fb, srv := newDeployFake(t)
+		withBackend(t, srv)
+		stages := deployStages(runID, "awaiting_deploy_approval")
+		deployStageID := stages[1].ID
+		fb.stages = stages
+		fb.approvalResp = httpclient.Stage{
+			ID: deployStageID, RunID: runID, Sequence: 2, Type: "deploy", State: "awaiting_deployment",
+			Executor: httpclient.StageExecutor{Kind: "delegate", Ref: "github_actions"},
+		}
+
+		var stdout strings.Builder
+		got := run([]string{"deploy", "approve", "--environment", "staging", "--override-freeze", "--reason", "--override-freeze", runID.String()}, &stdout, io.Discard)
+		if got != exitOK {
+			t.Fatalf("status = %d, want exitOK", got)
+		}
+		if fb.approvalBody.Comment != "--environment=staging --override-freeze --override-freeze" {
+			t.Errorf("comment = %q, want '--environment=staging --override-freeze --override-freeze'", fb.approvalBody.Comment)
+		}
+	})
 }
 
 func TestDeployReject_MissingReasonWarns(t *testing.T) {
@@ -358,7 +476,7 @@ func TestDeployDecide_NoAwaitingDeployStage(t *testing.T) {
 	fb.stages = deployStages(runID, "succeeded")
 
 	var stderr strings.Builder
-	got := run([]string{"deploy", "approve", runID.String()}, io.Discard, &stderr)
+	got := run([]string{"deploy", "approve", "--environment", "staging", runID.String()}, io.Discard, &stderr)
 	if got != exitFailure {
 		t.Errorf("status = %d, want exitFailure", got)
 	}
@@ -423,7 +541,7 @@ func TestDeployApprove_InsufficientScope403(t *testing.T) {
 	fb.approvalErrCode = "insufficient_scope"
 
 	var stderr strings.Builder
-	got := run([]string{"deploy", "approve", "--reason", "go", runID.String()}, io.Discard, &stderr)
+	got := run([]string{"deploy", "approve", "--environment", "staging", "--reason", "go", runID.String()}, io.Discard, &stderr)
 	if got != exitFailure {
 		t.Errorf("status = %d, want exitFailure", got)
 	}
@@ -445,7 +563,7 @@ func TestDeployApprove_JSONOutput(t *testing.T) {
 	}
 
 	var stdout strings.Builder
-	got := run([]string{"deploy", "approve", "--output", "json", runID.String()}, &stdout, io.Discard)
+	got := run([]string{"deploy", "approve", "--environment", "staging", "--output", "json", runID.String()}, &stdout, io.Discard)
 	if got != exitOK {
 		t.Fatalf("status = %d", got)
 	}

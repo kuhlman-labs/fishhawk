@@ -310,15 +310,18 @@ func EvaluateChildrenDispatch(runnerKind string) Outcome {
 // operator approves the deploy intent, ADR-038), so the outcome is the same
 // regardless of runner kind — Advance true (the orchestrator already parked the
 // stage at the gate) with a next action telling the operator to approve the
-// deploy intent. The deploy gate is approved via the generic approval verb
-// (fishhawk_approve_plan special-cases stage.Type==deploy in the approval
-// handler); there is no separate deploy-approval tool.
+// deploy intent. The deploy gate is approved via fishhawk_approve_deploy
+// (E23.15 / #1432), which resolves the type=deploy stage and composes the
+// required --environment=<allowed_env> (and optional --override-freeze) into
+// the approval comment the backend deploy pre-flight parses — the older
+// fishhawk_approve_plan hint failed here because it resolves a type=plan stage
+// first and errors on a plan-less release run.
 func EvaluateDeployInitialization() Outcome {
 	return Outcome{
 		Advance: true,
 		NextAction: &NextAction{
-			Action: "fishhawk_approve_plan",
-			Detail: "deploy stage parked at its pre-execution approval gate; approve the deploy intent (fishhawk_approve_plan on the deploy stage) — a deploy approval pages the human regardless of runner kind",
+			Action: "fishhawk_approve_deploy",
+			Detail: "deploy stage parked at its pre-execution approval gate; approve the deploy intent (fishhawk_approve_deploy) with --environment=<allowed_env> (one of the deploy stage's allowed_environments) — a deploy approval pages the human regardless of runner kind",
 		},
 	}
 }
