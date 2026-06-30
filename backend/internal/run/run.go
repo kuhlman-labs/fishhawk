@@ -293,6 +293,17 @@ type Run struct {
 	// recent run. Lets the SPA render "follow-up to <short-id>"
 	// + a thread of related runs without a recursive walk.
 	ParentRunID *uuid.UUID
+	// UpstreamRunID, when non-nil, names the upstream feature_change run
+	// whose ci_green / review_merged the deploy stage's required_upstream
+	// pre-flight gate evaluates (E23.11 / #1417). DISTINCT from ParentRunID
+	// (#216) by deliberate design: a standalone deploy-only release run has
+	// no implement/review stage of its own, so the gate needs a cross-run
+	// reference to evaluate — but that reference must NOT carry the
+	// follow-up/lineage semantics ParentRunID's get_plan plan-resolution
+	// walk, resume/retry recovery, and decomposition provenance consumers
+	// key on. Nil → the deploy gate evaluates the CURRENT run (the
+	// appended-deploy path), byte-for-byte today's behavior.
+	UpstreamRunID *uuid.UUID
 	// PullRequestURL is set when the run's implement stage produces
 	// a pull_request artifact (#216). Denormalized so "show me
 	// every run on this PR" is a single equality query rather than

@@ -2219,47 +2219,90 @@ func sliceContains(xs []string, want string) bool {
 	return false
 }
 
+// deployEvalRun resolves WHICH run the deploy pre-flight gate evaluates
+// (E23.11 / #1417). For an appended-deploy run (UpstreamRunID nil) the gate
+// evaluates the run itself — byte-for-byte today's behavior. For a standalone
+// deploy-only release run (UpstreamRunID set) the gate evaluates the
+// referenced upstream feature_change run's ci_green / review_merged instead:
+// such a run has no implement/review stage of its own, so the upstream is the
+// only thing the pre-flight can evaluate. Returns nil when a SET upstream
+// cannot be resolved (load error / not-found) — the caller fails the gate
+// closed (the safe direction for a pre-execution deploy gate). One resolver so
+// the self-vs-upstream decision and its fail-closed semantics live in one
+// place. NOTE: the cross-run reference is upstream_run_id, NOT parent_run_id
+// (#216) — a deploy-gate safety pointer kept off the follow-up/lineage column.
+func (s *Server) deployEvalRun(ctx context.Context, runRow *run.Run) *run.Run {
+	if runRow.UpstreamRunID == nil {
+		return runRow
+	}
+	up, err := s.cfg.RunRepo.GetRun(ctx, *runRow.UpstreamRunID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "deploy gate: resolve upstream run failed",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("upstream_run_id", runRow.UpstreamRunID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	return up
+}
+
 // deployCIGreen evaluates the required_upstream `ci_green` pre-flight signal
-// (#1384): every required status check has reported green on the run's
-// implement stage, reusing aggregateCIGreen over the run's
-// RequiredChecksSnapshot. Returns false (not satisfied) when the snapshot or
-// the stage-check repo is unwired, the implement stage is absent, the check
-// read errors, or the aggregate is nil/false — the safe direction for a
-// pre-execution deploy gate.
+// (#1384): every required status check has reported green on the evaluated
+// run's implement stage, reusing aggregateCIGreen over that run's
+// RequiredChecksSnapshot. The evaluated run is resolved by deployEvalRun
+// (E23.11 / #1417) — the current run for an appended deploy, or the referenced
+// upstream feature_change run for a standalone deploy-only release run.
+// Returns false (not satisfied) when the upstream is unresolvable, the
+// snapshot or the stage-check repo is unwired, the implement stage is absent,
+// the check read errors, or the aggregate is nil/false — the safe direction
+// for a pre-execution deploy gate.
 func (s *Server) deployCIGreen(ctx context.Context, runRow *run.Run) bool {
-	if runRow.RequiredChecksSnapshot == nil || s.cfg.StageCheckRepo == nil {
+	evalRun := s.deployEvalRun(ctx, runRow)
+	if evalRun == nil {
 		return false
 	}
-	implStage := s.findImplementStage(ctx, runRow.ID)
+	if evalRun.RequiredChecksSnapshot == nil || s.cfg.StageCheckRepo == nil {
+		return false
+	}
+	implStage := s.findImplementStage(ctx, evalRun.ID)
 	if implStage == nil {
 		return false
 	}
 	checks, err := s.cfg.StageCheckRepo.LatestForStage(ctx, implStage.ID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "deploy gate: list stage checks failed",
-			slog.String("run_id", runRow.ID.String()),
+			slog.String("run_id", evalRun.ID.String()),
 			slog.String("error", err.Error()),
 		)
 		return false
 	}
-	g := aggregateCIGreen(runRow.RequiredChecksSnapshot.Contexts, checks)
+	g := aggregateCIGreen(evalRun.RequiredChecksSnapshot.Contexts, checks)
 	return g != nil && *g
 }
 
 // deployReviewMerged evaluates the required_upstream `review_merged`
-// pre-flight signal (#1384): the run carries a pull_request_url AND a
-// succeeded review stage — a proxy for "the change merged", since merged
+// pre-flight signal (#1384): the evaluated run carries a pull_request_url AND
+// a succeeded review stage — a proxy for "the change merged", since merged
 // state is not tracked on the run row today (the precise signal tightens when
-// the deploy executor lands, E23.5/6/10). Returns false on a stage-list error
-// (the safe direction).
+// the deploy executor lands, E23.5/6/10). The evaluated run is resolved by
+// deployEvalRun (E23.11 / #1417) — the current run for an appended deploy, or
+// the referenced upstream feature_change run for a standalone deploy-only
+// release run. Returns false when the upstream is unresolvable, the evaluated
+// run has no pull_request_url, no succeeded review stage, or the stage-list
+// read errors — the safe direction.
 func (s *Server) deployReviewMerged(ctx context.Context, runRow *run.Run) bool {
-	if runRow.PullRequestURL == nil || *runRow.PullRequestURL == "" {
+	evalRun := s.deployEvalRun(ctx, runRow)
+	if evalRun == nil {
 		return false
 	}
-	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runRow.ID)
+	if evalRun.PullRequestURL == nil || *evalRun.PullRequestURL == "" {
+		return false
+	}
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, evalRun.ID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "deploy gate: list stages failed",
-			slog.String("run_id", runRow.ID.String()),
+			slog.String("run_id", evalRun.ID.String()),
 			slog.String("error", err.Error()),
 		)
 		return false

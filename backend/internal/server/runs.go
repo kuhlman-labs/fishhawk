@@ -30,15 +30,21 @@ import (
 // `Run` schema exactly so there's never a translation step between
 // the OpenAPI doc and the wire format.
 type runResponse struct {
-	ID                 uuid.UUID  `json:"id"`
-	Repo               string     `json:"repo"`
-	WorkflowID         string     `json:"workflow_id"`
-	WorkflowSHA        string     `json:"workflow_sha"`
-	TriggerSource      string     `json:"trigger_source"`
-	TriggerRef         *string    `json:"trigger_ref"`
-	State              string     `json:"state"`
-	ParentRunID        *uuid.UUID `json:"parent_run_id,omitempty"`
-	DecomposedFrom     *uuid.UUID `json:"decomposed_from,omitempty"`
+	ID             uuid.UUID  `json:"id"`
+	Repo           string     `json:"repo"`
+	WorkflowID     string     `json:"workflow_id"`
+	WorkflowSHA    string     `json:"workflow_sha"`
+	TriggerSource  string     `json:"trigger_source"`
+	TriggerRef     *string    `json:"trigger_ref"`
+	State          string     `json:"state"`
+	ParentRunID    *uuid.UUID `json:"parent_run_id,omitempty"`
+	DecomposedFrom *uuid.UUID `json:"decomposed_from,omitempty"`
+	// UpstreamRunID echoes the run's deploy-gate cross-run reference
+	// (E23.11 / #1417): the upstream feature_change run whose ci_green /
+	// review_merged a standalone deploy-only release run's required_upstream
+	// gate evaluates. Omitted when nil (appended-deploy / non-deploy runs).
+	// DISTINCT from parent_run_id (#216).
+	UpstreamRunID      *uuid.UUID `json:"upstream_run_id,omitempty"`
 	PullRequestURL     *string    `json:"pull_request_url,omitempty"`
 	RetryAttempt       int        `json:"retry_attempt"`
 	MaxRetriesSnapshot int        `json:"max_retries_snapshot"`
@@ -297,6 +303,7 @@ func toRunResponse(r *run.Run) runResponse {
 		State:              string(r.State),
 		ParentRunID:        r.ParentRunID,
 		DecomposedFrom:     r.DecomposedFrom,
+		UpstreamRunID:      r.UpstreamRunID,
 		PullRequestURL:     r.PullRequestURL,
 		RetryAttempt:       r.RetryAttempt,
 		MaxRetriesSnapshot: r.MaxRetriesSnapshot,
@@ -383,6 +390,14 @@ type createRunRequest struct {
 	// recorded. Ignored when no blocking budget is over — the field
 	// only matters at the moment a budget would block.
 	BudgetOverride bool `json:"budget_override,omitempty"`
+	// UpstreamRunID, when set, names the upstream feature_change run whose
+	// ci_green / review_merged a standalone deploy-only release run's
+	// required_upstream pre-flight gate evaluates (E23.11 / #1417). Optional;
+	// omitted (nil) leaves the deploy gate evaluating the CURRENT run (the
+	// appended-deploy path). DISTINCT from parent_run_id (#216) — a deploy-
+	// gate safety pointer, not a follow-up/lineage link. Persisted on the run
+	// row and echoed on the response.
+	UpstreamRunID *uuid.UUID `json:"upstream_run_id,omitempty"`
 }
 
 // validTriggerSources is the closed set per the workflow-spec and
@@ -753,6 +768,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		IssueContext:       issueCtx,
 		Drive:              req.Drive,
 		IdempotencyKey:     idemp,
+		UpstreamRunID:      req.UpstreamRunID,
 		HaveStageDefs:      haveStageDefs,
 		WorkflowDef:        workflowDef,
 		WorkflowSpec:       specBytes,
@@ -869,6 +885,11 @@ type CreateRunForTriggerParams struct {
 	// IdempotencyKey makes the create idempotent against (Repo, key) when
 	// non-nil.
 	IdempotencyKey *string
+	// UpstreamRunID names the upstream feature_change run whose ci_green /
+	// review_merged a standalone deploy-only release run's required_upstream
+	// pre-flight gate evaluates (E23.11 / #1417). Nil → the gate evaluates
+	// the current run (the appended-deploy path). NOT parent_run_id (#216).
+	UpstreamRunID *uuid.UUID
 
 	// HaveStageDefs reports whether WorkflowDef carries resolved stage
 	// definitions. When true the run row caches WorkflowSpec +
@@ -908,6 +929,7 @@ func (s *Server) CreateRunForTrigger(ctx context.Context, p CreateRunForTriggerP
 		InstallationID: p.InstallationID,
 		IssueContext:   p.IssueContext,
 		IdempotencyKey: p.IdempotencyKey,
+		UpstreamRunID:  p.UpstreamRunID,
 	}
 	if p.HaveStageDefs {
 		// Cache the validated spec bytes on the row so the trace handler's

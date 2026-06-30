@@ -406,17 +406,18 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0042 (#1455) is now the latest
+	// MigrateDown rolls back one step. 0043 (#1417) is now the latest
 	// migration: it is an additive ALTER that added the nullable
-	// campaigns.idempotency_key TEXT column + its partial unique index, NOT a
-	// table create. So its rollback drops ONLY that column + index, while
-	// 0041's (#1451) operator_agent column, 0040's (#1446) pause_policy +
-	// pause_reason columns and widened 'paused' state CHECK now SURVIVE the
-	// one-step down (they are prior migrations). 0039's (#1437) campaigns +
-	// campaign_items tables themselves likewise still EXIST, as does every
-	// earlier migration's effect — notably 0038's (#1400) widened
-	// stages_type_check ('deploy'), 0037's (#1385) artifacts_kind_check
-	// 'deployment', 0036's (#1346) runs.runner_kind_resolved column, etc.
+	// runs.upstream_run_id UUID column + its partial index, NOT a table
+	// create. So its rollback drops ONLY that column + index, while 0042's
+	// (#1455) campaigns.idempotency_key column + unique index, 0041's (#1451)
+	// operator_agent column, 0040's (#1446) pause_policy + pause_reason
+	// columns and widened 'paused' state CHECK now SURVIVE the one-step down
+	// (they are prior migrations). 0039's (#1437) campaigns + campaign_items
+	// tables themselves likewise still EXIST, as does every earlier
+	// migration's effect — notably 0038's (#1400) widened stages_type_check
+	// ('deploy'), 0037's (#1385) artifacts_kind_check 'deployment', 0036's
+	// (#1346) runs.runner_kind_resolved column, etc.
 	var campaignsTable, campaignItemsTable int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'campaigns'`,
@@ -434,7 +435,19 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if campaignItemsTable != 1 {
 		t.Errorf("'campaign_items' table count after MigrateDown = %d, want 1 (0041 is an ALTER; 0039's table survives)", campaignItemsTable)
 	}
-	// 0042's added column is gone after its rollback.
+	// 0043's added column is gone after its rollback (the latest migration).
+	var upstreamRunIDCol int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'runs' AND column_name = 'upstream_run_id'`,
+	).Scan(&upstreamRunIDCol); err != nil {
+		t.Fatalf("query runs.upstream_run_id column: %v", err)
+	}
+	if upstreamRunIDCol != 0 {
+		t.Errorf("runs.upstream_run_id count after MigrateDown = %d, want 0 (0043 rolled back)", upstreamRunIDCol)
+	}
+	// 0042's idempotency_key column now SURVIVES the one-step down (only 0043
+	// rolled back) — the binding TestMigrateDown flip.
 	var idempotencyKeyCol int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
@@ -442,11 +455,11 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&idempotencyKeyCol); err != nil {
 		t.Fatalf("query campaigns.idempotency_key column: %v", err)
 	}
-	if idempotencyKeyCol != 0 {
-		t.Errorf("campaigns.idempotency_key count after MigrateDown = %d, want 0 (0042 rolled back)", idempotencyKeyCol)
+	if idempotencyKeyCol != 1 {
+		t.Errorf("campaigns.idempotency_key count after MigrateDown = %d, want 1 (0042 still applied; only 0043 rolled back)", idempotencyKeyCol)
 	}
-	// 0041's operator_agent column now SURVIVES the one-step down (only 0042
-	// rolled back) — the binding TestMigrateDown flip.
+	// 0041's operator_agent column SURVIVES the one-step down (only 0043
+	// rolled back).
 	var operatorAgentCol int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
@@ -455,7 +468,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query campaigns.operator_agent column: %v", err)
 	}
 	if operatorAgentCol != 1 {
-		t.Errorf("campaigns.operator_agent count after MigrateDown = %d, want 1 (0041 still applied; only 0042 rolled back)", operatorAgentCol)
+		t.Errorf("campaigns.operator_agent count after MigrateDown = %d, want 1 (0041 still applied; only 0043 rolled back)", operatorAgentCol)
 	}
 	// 0040's two added columns SURVIVE the one-step down (only 0042 rolled
 	// back).
@@ -467,7 +480,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query campaigns.pause_policy column: %v", err)
 	}
 	if pausePolicyCol != 1 {
-		t.Errorf("campaigns.pause_policy count after MigrateDown = %d, want 1 (0040 still applied; only 0042 rolled back)", pausePolicyCol)
+		t.Errorf("campaigns.pause_policy count after MigrateDown = %d, want 1 (0040 still applied; only 0043 rolled back)", pausePolicyCol)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
@@ -476,15 +489,15 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query campaign_items.pause_reason column: %v", err)
 	}
 	if pauseReasonCol != 1 {
-		t.Errorf("campaign_items.pause_reason count after MigrateDown = %d, want 1 (0040 still applied; only 0042 rolled back)", pauseReasonCol)
+		t.Errorf("campaign_items.pause_reason count after MigrateDown = %d, want 1 (0040 still applied; only 0043 rolled back)", pauseReasonCol)
 	}
 	// 0040's widened CHECK survives, so a 'paused' campaign insert now SUCCEEDS
-	// after the one-step down (only 0042 rolled back).
+	// after the one-step down (only 0043 rolled back).
 	if _, err := pool.Exec(context.Background(),
 		`INSERT INTO campaigns (id, repo, epic_ref, state) VALUES ($1, 'r', 'issue:1', 'paused')`,
 		uuid.New(),
 	); err != nil {
-		t.Errorf("insert 'paused' campaign after MigrateDown failed, want success (0040's widened CHECK survives; only 0042 rolled back): %v", err)
+		t.Errorf("insert 'paused' campaign after MigrateDown failed, want success (0040's widened CHECK survives; only 0043 rolled back): %v", err)
 	}
 	var artifactsKindCheckDef string
 	if err := pool.QueryRow(context.Background(),
@@ -861,13 +874,13 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 // 'paused' rows exist. Before re-adding the narrower state CHECK constraints
 // the down migration normalizes any paused campaign/item to 'running', so the
 // re-add validates instead of raising SQLSTATE 23514. Insert a paused campaign
-// + item, then step DOWN THREE TIMES — 0042 (drop idempotency_key) then 0041
-// (drop operator_agent) then 0040 (the normalizing rollback under test) — and
-// assert the final step succeeds AND the rows were normalized to running. Three
-// steps are needed because 0042 (#1455) and 0041 (#1451) now sit above 0040, so
-// fewer MigrateDowns would only roll back the inert column drops and never
-// reach 0040's normalization (the campaign tables survive all — 0039 is the
-// table create).
+// + item, then step DOWN FOUR TIMES — 0043 (drop upstream_run_id) then 0042
+// (drop idempotency_key) then 0041 (drop operator_agent) then 0040 (the
+// normalizing rollback under test) — and assert the final step succeeds AND the
+// rows were normalized to running. Four steps are needed because 0043 (#1417),
+// 0042 (#1455) and 0041 (#1451) now sit above 0040, so fewer MigrateDowns would
+// only roll back the inert column drops and never reach 0040's normalization
+// (the campaign tables survive all — 0039 is the table create).
 func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	url := startContainer(t)
 
@@ -896,9 +909,13 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	}
 	pool.Close()
 
-	// Step down past 0042 (drop idempotency_key — inert) then 0041 (drop
-	// operator_agent — inert), both leaving the paused rows untouched, to reach
-	// 0040, the normalizing rollback under test.
+	// Step down past 0043 (drop upstream_run_id — inert) then 0042 (drop
+	// idempotency_key — inert) then 0041 (drop operator_agent — inert), all
+	// leaving the paused rows untouched, to reach 0040, the normalizing
+	// rollback under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0043) failed: %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0042) failed: %v", err)
 	}

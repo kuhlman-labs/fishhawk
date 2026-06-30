@@ -4434,6 +4434,139 @@ func TestDeployGate_RequiredUpstreamCIGreenMet(t *testing.T) {
 	}
 }
 
+// seedUpstreamRun points a deploy run's UpstreamRunID at a freshly-seeded
+// upstream feature_change run (E23.11 / #1417) and returns the upstream run so
+// the caller can furnish its ci_green / review_merged state. The deploy run
+// itself carries no implement/review stage — the gate must evaluate the
+// upstream instead.
+func seedUpstreamRun(rr *approvalRunRepo, deployRun *run.Run) *run.Run {
+	upstreamID := uuid.New()
+	deployRun.UpstreamRunID = &upstreamID
+	up := &run.Run{
+		ID:          upstreamID,
+		Repo:        deployRun.Repo,
+		WorkflowID:  "feature_change",
+		WorkflowSHA: "upstream-sha",
+	}
+	rr.seedRun(up)
+	return up
+}
+
+// CROSS-RUN (E23.11 / #1417): a standalone deploy-only release run with
+// upstream_run_id SET evaluates the referenced upstream run's ci_green. The
+// deploy run has no implement stage of its own; the upstream's implement
+// stage reports green, so the gate proceeds to dispatch.
+func TestDeployGate_UpstreamCIGreen_CrossRun_Met(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	scs := newFakeStageCheckRepo()
+	s.cfg.StageCheckRepo = scs
+
+	stage, deployRun := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
+	up := seedUpstreamRun(rr, deployRun)
+	up.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
+	implStage := rr.seedStageOnRun(up.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	success := "success"
+	scs.byKey[scs.keyFor(implStage.ID, "ci/build")] = &stagecheck.Check{
+		StageID: implStage.ID, Name: "ci/build", Status: "completed", Conclusion: &success,
+	}
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (upstream ci_green satisfied):\n%s", w.Code, w.Body.String())
+	}
+	if got := countAppendedCategory(au, "deploy_preflight_refused"); got != 0 {
+		t.Errorf("deploy_preflight_refused entries = %d, want 0 (upstream ci_green met)", got)
+	}
+	cur, _ := rr.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateDispatched {
+		t.Errorf("deploy stage state = %q, want dispatched", cur.State)
+	}
+}
+
+// CROSS-RUN (E23.11 / #1417): an upstream_run_id-SET deploy run evaluates the
+// referenced upstream run's review_merged proxy (PR url + succeeded review
+// stage), not its own. Both present on the upstream → proceeds to dispatch.
+func TestDeployGate_UpstreamReviewMerged_CrossRun_Met(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage, deployRun := seedDeployRun(rr, "release", deploySpecUpstreamReviewMerged)
+	up := seedUpstreamRun(rr, deployRun)
+	prURL := "https://github.com/kuhlman-labs/example/pull/9"
+	up.PullRequestURL = &prURL
+	rr.seedStageOnRun(up.ID, run.StageTypeReview, run.StageStateSucceeded)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (upstream review_merged satisfied):\n%s", w.Code, w.Body.String())
+	}
+	if got := countAppendedCategory(au, "deploy_preflight_refused"); got != 0 {
+		t.Errorf("deploy_preflight_refused entries = %d, want 0 (upstream review_merged met)", got)
+	}
+	cur, _ := rr.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateDispatched {
+		t.Errorf("deploy stage state = %q, want dispatched", cur.State)
+	}
+}
+
+// FAIL-CLOSED mode (a) — upstream_run_id SET but UNRESOLVABLE (GetRun
+// not-found): deployEvalRun returns nil → the gate refuses (#1417). The
+// reference points at a run that was never seeded.
+func TestDeployGate_UpstreamUnresolvable_Refuses(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	scs := newFakeStageCheckRepo()
+	s.cfg.StageCheckRepo = scs
+	stage, deployRun := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
+	missing := uuid.New() // never seeded → GetRun returns ErrNotFound
+	deployRun.UpstreamRunID = &missing
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+}
+
+// FAIL-CLOSED mode (b) — upstream resolves but its checks are NOT green: the
+// upstream's implement-stage check reports failure, so aggregateCIGreen folds
+// to false and the gate refuses (#1417).
+func TestDeployGate_UpstreamCIGreen_NotGreen_Refuses(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	scs := newFakeStageCheckRepo()
+	s.cfg.StageCheckRepo = scs
+	stage, deployRun := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
+	up := seedUpstreamRun(rr, deployRun)
+	up.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{Contexts: []string{"ci/build"}}
+	implStage := rr.seedStageOnRun(up.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	failure := "failure"
+	scs.byKey[scs.keyFor(implStage.ID, "ci/build")] = &stagecheck.Check{
+		StageID: implStage.ID, Name: "ci/build", Status: "completed", Conclusion: &failure,
+	}
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+}
+
+// FAIL-CLOSED mode (c) — upstream resolves but has NO pull_request_url: the
+// review_merged proxy's first guard fails and the gate refuses (#1417).
+func TestDeployGate_UpstreamReviewMerged_NoPRURL_Refuses(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage, deployRun := seedDeployRun(rr, "release", deploySpecUpstreamReviewMerged)
+	up := seedUpstreamRun(rr, deployRun)
+	// A succeeded review stage but NO PR url on the upstream.
+	rr.seedStageOnRun(up.ID, run.StageTypeReview, run.StageStateSucceeded)
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+}
+
+// FAIL-CLOSED mode (d) — upstream resolves and has a PR url but NO succeeded
+// review stage: the review_merged proxy's second guard fails and the gate
+// refuses (#1417).
+func TestDeployGate_UpstreamReviewMerged_NoSucceededReview_Refuses(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage, deployRun := seedDeployRun(rr, "release", deploySpecUpstreamReviewMerged)
+	up := seedUpstreamRun(rr, deployRun)
+	prURL := "https://github.com/kuhlman-labs/example/pull/11"
+	up.PullRequestURL = &prURL
+	// A review stage that has NOT succeeded (still awaiting approval).
+	rr.seedStageOnRun(up.ID, run.StageTypeReview, run.StageStateAwaitingApproval)
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+}
+
 // (g) all constraints satisfied → happy path proceeds to dispatch.
 func TestDeployGate_AllConstraintsSatisfied(t *testing.T) {
 	s, _, rr, _ := newApprovalServer(t)

@@ -161,6 +161,52 @@ func TestPostgres_SliceIndex_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestPostgres_UpstreamRunID_RoundTrip exercises migration 0043 (#1417): a
+// run created with UpstreamRunID set reads it back (proving the migration +
+// sqlc regen + rowToRun mapping agree), and a run created without one reads
+// back nil — the appended-deploy / legacy-row default. The upstream run is
+// created first because upstream_run_id is an FK to runs(id).
+func TestPostgres_UpstreamRunID_RoundTrip(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+
+	upstream := makeRun(t, repo)
+	deployRun, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "release",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: run.TriggerCLI,
+		UpstreamRunID: &upstream.ID,
+	})
+	if err != nil {
+		t.Fatalf("create deploy run: %v", err)
+	}
+	if deployRun.UpstreamRunID == nil || *deployRun.UpstreamRunID != upstream.ID {
+		t.Errorf("created UpstreamRunID = %v, want %v", deployRun.UpstreamRunID, upstream.ID)
+	}
+	got, err := repo.GetRun(context.Background(), deployRun.ID)
+	if err != nil {
+		t.Fatalf("get deploy run: %v", err)
+	}
+	if got.UpstreamRunID == nil || *got.UpstreamRunID != upstream.ID {
+		t.Errorf("read-back UpstreamRunID = %v, want %v", got.UpstreamRunID, upstream.ID)
+	}
+
+	// A run created without an UpstreamRunID (appended-deploy / non-deploy)
+	// reads back nil — today's current-run evaluation default.
+	plain := makeRun(t, repo)
+	if plain.UpstreamRunID != nil {
+		t.Errorf("default UpstreamRunID = %v, want nil", plain.UpstreamRunID)
+	}
+	gotPlain, err := repo.GetRun(context.Background(), plain.ID)
+	if err != nil {
+		t.Fatalf("get plain run: %v", err)
+	}
+	if gotPlain.UpstreamRunID != nil {
+		t.Errorf("read-back default UpstreamRunID = %v, want nil", gotPlain.UpstreamRunID)
+	}
+}
+
 func TestPostgres_GetRun_NotFound(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
