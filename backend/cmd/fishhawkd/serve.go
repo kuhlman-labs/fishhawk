@@ -1454,7 +1454,10 @@ type campaignRunStarter struct {
 }
 
 func (a campaignRunStarter) StartCampaignRun(ctx context.Context, item *campaign.Item, c *campaign.Campaign) (*runpkg.Run, error) {
-	return a.srv.StartRunForCampaignIssue(ctx, c.Repo, item.IssueRef, a.workflowID, a.workflowRef)
+	// Empty runnerKind → repo-layer github_actions default, the GHA auto-driver
+	// behavior. The operator-driven campaign start (E26.2 / #1481) passes
+	// "local" through its own call site (handleStartCampaignItemRun).
+	return a.srv.StartRunForCampaignIssue(ctx, c.Repo, item.IssueRef, a.workflowID, a.workflowRef, "")
 }
 
 // campaignDriverStartDecision reports whether the campaign-driver ticker

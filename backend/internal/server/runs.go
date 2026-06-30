@@ -785,7 +785,14 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 // spec). Returns an error rather than starting a run when the installation or
 // spec can't be resolved — the driver leaves the item un-started and retries
 // next tick.
-func (s *Server) StartRunForCampaignIssue(ctx context.Context, repo, issueRef, workflowID, workflowRef string) (*run.Run, error) {
+//
+// runnerKind selects the execution backend (ADR-022): empty applies the
+// repo-layer default (github_actions) — the GHA auto-driver path — while the
+// operator-driven campaign start (E26.2 / #1481) passes "local" so the
+// campaign's runs execute through the local dogfood loop. runner_kind affects
+// only execution dispatch, not spec resolution, so the GitHub fetch below is
+// unaffected by the choice.
+func (s *Server) StartRunForCampaignIssue(ctx context.Context, repo, issueRef, workflowID, workflowRef, runnerKind string) (*run.Run, error) {
 	if s.cfg.GitHub == nil {
 		return nil, errors.New("campaign run start requires a configured GitHub client")
 	}
@@ -823,6 +830,7 @@ func (s *Server) StartRunForCampaignIssue(ctx context.Context, repo, issueRef, w
 		WorkflowSHA:        fc.SHA,
 		TriggerSource:      run.TriggerGitHubIssue,
 		TriggerRef:         &triggerRef,
+		RunnerKind:         runnerKind,
 		InstallationID:     &instID,
 		HaveStageDefs:      true,
 		WorkflowDef:        wf,

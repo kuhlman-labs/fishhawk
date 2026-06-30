@@ -943,8 +943,19 @@ Notes:
   run_id, outcome}`) records settling a campaign item to its mapped terminal
   state once its linked run reached terminal; `campaign_advanced` (payload
   `{campaign_id, from, to}`) records the campaign state re-derivation
-  (`campaign.DeriveState`) transition. Listed here only so a future reader
-  grepping the audit categories doesn't mistake them for a comment surface.
+  (`campaign.DeriveState`) transition. **As of E26.2 / #1481 the
+  campaign-driver ticker is no longer the SOLE writer of these three kinds**:
+  the operator-driven campaign-linked start (`POST
+  /v0/campaigns/{id}/runs` → `handleStartCampaignItemRun`) emits
+  `campaign_issue_started` (and `campaign_advanced` on a pending→running
+  derivation), and the reconcile-on-read path (`GET
+  /v0/campaigns/{id}/status` → `reconcileCampaignItemsOnRead`) emits
+  `campaign_issue_settled` (and `campaign_advanced` as items settle) —
+  identical payload shapes + system actor, on the same GLOBAL chain, so the
+  campaign rollup advances when the operator-agent drives the loop locally
+  with no auto-driver. They remain best-effort and are still NOT
+  issue-comment surfaces. Listed here only so a future reader grepping the
+  audit categories doesn't mistake them for a comment surface.
 - The campaign **pause** marker — `campaign_paused` (E25.7 / #1446, ADR-047
   Track C) — is also a **system-actor GLOBAL-chain audit kind, NOT an
   issue-comment surface**. The campaign-driver ticker

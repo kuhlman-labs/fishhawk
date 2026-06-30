@@ -150,6 +150,101 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 	return nil, StartCampaignOutput{Campaign: *created}, nil
 }
 
+// --- fishhawk_start_campaign_item_run (E26.2 / #1481) ---
+
+// StartCampaignItemRunInput is the fishhawk_start_campaign_item_run tool's
+// input. campaign_id + issue_ref + workflow_id are required; workflow_ref and
+// runner_kind are optional. There is deliberately no idempotency_key — the
+// backend does not dedup this start, and the DAG eligibility gate already
+// refuses a re-start against an already-running item.
+type StartCampaignItemRunInput struct {
+	CampaignID  string `json:"campaign_id" jsonschema:"the campaign UUID (from fishhawk_start_campaign)"`
+	IssueRef    string `json:"issue_ref" jsonschema:"the campaign item's issue ref to start (must be one of the campaign's items and currently eligible per the DAG)"`
+	WorkflowID  string `json:"workflow_id" jsonschema:"the workflow id to run for this issue (e.g. 'feature_change')"`
+	WorkflowRef string `json:"workflow_ref,omitempty" jsonschema:"OPTIONAL git ref to fetch the workflow spec at; omit for the repo's default branch"`
+	RunnerKind  string `json:"runner_kind,omitempty" jsonschema:"OPTIONAL execution backend: 'github_actions' (default) or 'local'. Pass 'local' for the local dogfood loop so the run executes through the local runner"`
+}
+
+// StartCampaignItemRunOutput carries the minted run plus the linked campaign
+// item (now running, with run_id set).
+type StartCampaignItemRunOutput struct {
+	Run  Run          `json:"run"`
+	Item CampaignItem `json:"item"`
+}
+
+// registerStartCampaignItemRun wires the fishhawk_start_campaign_item_run tool
+// (E26.2 / #1481).
+//
+// Auth: a write tool — operator-side fhk_* tokens with scope write:campaigns
+// (the backend handler calls requireWriteScope("write:campaigns")). A
+// runner-bound fhm_* token surfaces a 403 as a tool error.
+func registerStartCampaignItemRun(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_start_campaign_item_run",
+		Description: strings.TrimSpace(`
+Start a run for one eligible campaign item and link it to the campaign. Use this
+when fishhawk_get_campaign_status reports next_action "start_run" — to drive a
+campaign locally yourself, instead of the backend auto-driver, so the campaign
+tracks + DAG-gates each run as you push it to merge. It refuses unless the item
+is eligible (its dependencies have all succeeded), naming the blocking
+dependency on refusal, then mints the run, links it, and moves the item to
+running. Poll fishhawk_get_campaign_status again after starting — the status
+read settles each run as it reaches terminal and advances the campaign in DAG
+order.
+
+campaign_id, issue_ref, and workflow_id are required. Pass runner_kind 'local'
+for the local dogfood loop. A write tool: needs an operator token with
+write:campaigns scope (a runner-bound token is rejected 403). A blocked item
+fails item_not_eligible (the detail names the unmet dependency); an unknown
+issue_ref fails campaign_item_not_found; a paused or terminal campaign fails
+campaign_not_startable.
+`),
+	}, resolver.startCampaignItemRun)
+}
+
+// startCampaignItemRun is the tool handler.
+func (r *runResolver) startCampaignItemRun(ctx context.Context, _ *mcp.CallToolRequest, in StartCampaignItemRunInput) (*mcp.CallToolResult, StartCampaignItemRunOutput, error) {
+	id, err := uuid.Parse(in.CampaignID)
+	if err != nil {
+		return nil, StartCampaignItemRunOutput{}, fmt.Errorf("campaign_id %q is not a valid UUID: %w", in.CampaignID, err)
+	}
+	if strings.TrimSpace(in.IssueRef) == "" {
+		return nil, StartCampaignItemRunOutput{}, errors.New("issue_ref is required")
+	}
+	if strings.TrimSpace(in.WorkflowID) == "" {
+		return nil, StartCampaignItemRunOutput{}, errors.New("workflow_id is required")
+	}
+
+	res, err := r.api.StartCampaignItemRun(ctx, id, in.IssueRef, in.WorkflowID, in.WorkflowRef, in.RunnerKind)
+	if err != nil {
+		var ae *apiError
+		if errors.As(err, &ae) {
+			switch ae.Code {
+			case "campaign_not_found":
+				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
+					"campaign_not_found: no campaign with id %s — pass the id fishhawk_start_campaign returned", id)
+			case "campaign_item_not_found":
+				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
+					"campaign_item_not_found: %s — no campaign item with issue_ref %q; read its items via fishhawk_get_campaign_status", ae.Message, in.IssueRef)
+			case "item_not_eligible":
+				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
+					"item_not_eligible: %s — only an eligible item can be started; poll fishhawk_get_campaign_status and start the ref its next_action names", ae.Message)
+			case "campaign_not_startable":
+				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
+					"campaign_not_startable: %s — a paused campaign must be resumed (fishhawk_resume_campaign) and a terminal one cannot start new runs", ae.Message)
+			case "campaign_run_start_failed":
+				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
+					"campaign_run_start_failed: %s — could not resolve the installation or workflow spec; ensure the GitHub App is installed and the workflow_id exists at workflow_ref", ae.Message)
+			case "campaign_repo_unconfigured":
+				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
+					"campaign_repo_unconfigured: %s — this deployment has no campaign repository wired", ae.Message)
+			}
+		}
+		return nil, StartCampaignItemRunOutput{}, fmt.Errorf("start campaign item run: %w", err)
+	}
+	return nil, StartCampaignItemRunOutput{Run: res.Run, Item: res.Item}, nil
+}
+
 // registerGetCampaignStatus wires the fishhawk_get_campaign_status tool (read-only).
 func registerGetCampaignStatus(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{

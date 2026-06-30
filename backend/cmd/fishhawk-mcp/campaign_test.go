@@ -424,3 +424,170 @@ func TestResumeCampaign_NotFound_MapsActionableError(t *testing.T) {
 		t.Fatalf("err = %v, want campaign_not_found mapping", err)
 	}
 }
+
+// --- fishhawk_start_campaign_item_run (E26.2 / #1481) ---
+
+// TestStartCampaignItemRun_HappyPath_PostsBodyDecodesRunItem drives the whole
+// tool→client→wire→decode chain: the input's issue_ref/workflow_id/workflow_ref/
+// runner_kind reach the POST body (at the campaign-id path), and the {run,item}
+// response decodes back out.
+func TestStartCampaignItemRun_HappyPath_PostsBodyDecodesRunItem(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	id := uuid.New()
+	runID := uuid.NewString()
+	fb.startCampaignItemRunResp = StartCampaignItemRunResult{
+		Run:  Run{ID: runID, Repo: "kuhlman-labs/fishhawk", State: "pending", RunnerKind: "local"},
+		Item: CampaignItem{ID: uuid.NewString(), IssueRef: "issue:100", State: "running", RunID: runID},
+	}
+	r := newResolver(srv, nil)
+
+	_, out, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+		CampaignID:  id.String(),
+		IssueRef:    "issue:100",
+		WorkflowID:  "feature_change",
+		WorkflowRef: "main",
+		RunnerKind:  "local",
+	})
+	if err != nil {
+		t.Fatalf("startCampaignItemRun: %v", err)
+	}
+	if fb.startCampaignItemRunID != id {
+		t.Errorf("path campaign_id = %s, want %s", fb.startCampaignItemRunID, id)
+	}
+	if fb.startCampaignItemRunBody.IssueRef != "issue:100" ||
+		fb.startCampaignItemRunBody.WorkflowID != "feature_change" ||
+		fb.startCampaignItemRunBody.WorkflowRef != "main" ||
+		fb.startCampaignItemRunBody.RunnerKind != "local" {
+		t.Errorf("backend got body = %+v", fb.startCampaignItemRunBody)
+	}
+	if out.Run.ID != runID || out.Run.RunnerKind != "local" {
+		t.Errorf("decoded run = %+v, want id=%s runner_kind=local", out.Run, runID)
+	}
+	if out.Item.IssueRef != "issue:100" || out.Item.State != "running" || out.Item.RunID != runID {
+		t.Errorf("decoded item = %+v, want issue:100 running linked to %s", out.Item, runID)
+	}
+}
+
+// TestStartCampaignItemRun_OmittedOptionalFields_LeavesBodyEmpty pins that
+// omitting workflow_ref/runner_kind sends empty values (the backend defaults
+// them: default branch + github_actions).
+func TestStartCampaignItemRun_OmittedOptionalFields_LeavesBodyEmpty(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+		CampaignID: uuid.NewString(),
+		IssueRef:   "issue:1",
+		WorkflowID: "feature_change",
+	})
+	if err != nil {
+		t.Fatalf("startCampaignItemRun: %v", err)
+	}
+	if fb.startCampaignItemRunBody.WorkflowRef != "" || fb.startCampaignItemRunBody.RunnerKind != "" {
+		t.Errorf("optional fields not empty: %+v", fb.startCampaignItemRunBody)
+	}
+}
+
+// TestStartCampaignItemRun_BadCampaignID_FailsLocally proves the UUID guard
+// rejects before any HTTP call.
+func TestStartCampaignItemRun_BadCampaignID_FailsLocally(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+		CampaignID: "not-a-uuid", IssueRef: "issue:1", WorkflowID: "feature_change",
+	})
+	if err == nil || !strings.Contains(err.Error(), "not a valid UUID") {
+		t.Fatalf("err = %v, want local UUID validation", err)
+	}
+	if fb.startCampaignItemRunBody.IssueRef != "" {
+		t.Errorf("backend was called despite bad campaign_id: %+v", fb.startCampaignItemRunBody)
+	}
+}
+
+// TestStartCampaignItemRun_MissingIssueRef_FailsLocally proves the empty
+// issue_ref guard rejects before any HTTP call.
+func TestStartCampaignItemRun_MissingIssueRef_FailsLocally(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+		CampaignID: uuid.NewString(), WorkflowID: "feature_change",
+	})
+	if err == nil || !strings.Contains(err.Error(), "issue_ref is required") {
+		t.Fatalf("err = %v, want local issue_ref-required validation", err)
+	}
+	if fb.startCampaignItemRunID != uuid.Nil {
+		t.Errorf("backend was called despite missing issue_ref")
+	}
+}
+
+// TestStartCampaignItemRun_MissingWorkflowID_FailsLocally proves the empty
+// workflow_id guard rejects before any HTTP call.
+func TestStartCampaignItemRun_MissingWorkflowID_FailsLocally(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+		CampaignID: uuid.NewString(), IssueRef: "issue:1",
+	})
+	if err == nil || !strings.Contains(err.Error(), "workflow_id is required") {
+		t.Fatalf("err = %v, want local workflow_id-required validation", err)
+	}
+}
+
+// TestStartCampaignItemRun_ItemNotEligible_MapsActionableError maps the DAG-gate
+// refusal onto an operator-actionable error naming the surface to poll.
+func TestStartCampaignItemRun_ItemNotEligible_MapsActionableError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.startCampaignItemRunStatus = http.StatusConflict
+	fb.startCampaignItemRunErr = `{"error":{"code":"item_not_eligible","message":"blocked on dependency issue:99; it must succeed before this item can start"}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+		CampaignID: uuid.NewString(), IssueRef: "issue:100", WorkflowID: "feature_change",
+	})
+	if err == nil {
+		t.Fatal("err = nil, want item_not_eligible mapping")
+	}
+	for _, want := range []string{"item_not_eligible", "issue:99", "fishhawk_get_campaign_status"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+// TestStartCampaignItemRun_CampaignNotStartable_MapsActionableError maps the
+// paused/terminal-campaign refusal.
+func TestStartCampaignItemRun_CampaignNotStartable_MapsActionableError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.startCampaignItemRunStatus = http.StatusConflict
+	fb.startCampaignItemRunErr = `{"error":{"code":"campaign_not_startable","message":"campaign is not in a state that can start an item run"}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+		CampaignID: uuid.NewString(), IssueRef: "issue:1", WorkflowID: "feature_change",
+	})
+	if err == nil || !strings.Contains(err.Error(), "campaign_not_startable") {
+		t.Fatalf("err = %v, want campaign_not_startable mapping", err)
+	}
+	if !strings.Contains(err.Error(), "fishhawk_resume_campaign") {
+		t.Errorf("err %q should point at the resume tool", err.Error())
+	}
+}
+
+// TestStartCampaignItemRun_ItemNotFound_MapsActionableError maps the
+// unknown-issue_ref refusal.
+func TestStartCampaignItemRun_ItemNotFound_MapsActionableError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.startCampaignItemRunStatus = http.StatusNotFound
+	fb.startCampaignItemRunErr = `{"error":{"code":"campaign_item_not_found","message":"no campaign item with that issue_ref"}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+		CampaignID: uuid.NewString(), IssueRef: "issue:nope", WorkflowID: "feature_change",
+	})
+	if err == nil || !strings.Contains(err.Error(), "campaign_item_not_found") {
+		t.Fatalf("err = %v, want campaign_item_not_found mapping", err)
+	}
+}
