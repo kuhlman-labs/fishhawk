@@ -416,6 +416,36 @@ type ReviewersConfig struct {
 	Agent  int             `json:"agent,omitempty" yaml:"agent,omitempty"`
 	Agents []AgentReviewer `json:"agents,omitempty" yaml:"agents,omitempty"`
 	Human  int             `json:"human,omitempty" yaml:"human,omitempty"`
+	// ReviewTimeout is the optional per-stage review-budget floor (#1494). A
+	// non-empty value OVERRIDES the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment
+	// default — it sets the Floor rung of the size-aware review-wait budget
+	// for this stage's agent reviews; the deployment-level PerKB and Cap are
+	// unchanged. Parsed by time.ParseDuration via ResolveReviewTimeout; an
+	// empty or unparseable value falls back to the deployment default. The
+	// schema's reviewers_config is additionalProperties:false, so this field
+	// MUST stay in lockstep with the schema's review_timeout property.
+	ReviewTimeout string `json:"review_timeout,omitempty" yaml:"review_timeout,omitempty"`
+}
+
+// ResolveReviewTimeout resolves the review-wait budget floor for a stage,
+// mirroring ResolveStageTimeout's precedence: the per-stage spec
+// review_timeout WINS over the deployment default. When reviewers is non-nil
+// and its ReviewTimeout parses via time.ParseDuration to a non-zero duration,
+// that value is returned; on a nil block, an empty string, a parse error, or a
+// zero duration, the supplied deflt (the FISHHAWKD_PLAN_REVIEW_TIMEOUT
+// deployment default) applies. This is the single source of truth for
+// review-timeout resolution. Returning deflt on a bad string (rather than zero)
+// guarantees the Floor never collapses to zero, which would silently kill
+// reviewers on tiny prompts.
+func ResolveReviewTimeout(reviewers *ReviewersConfig, deflt time.Duration) time.Duration {
+	if reviewers == nil || reviewers.ReviewTimeout == "" {
+		return deflt
+	}
+	dur, err := time.ParseDuration(reviewers.ReviewTimeout)
+	if err != nil || dur == 0 {
+		return deflt
+	}
+	return dur
 }
 
 // AgentReviewer is one declared reviewer in the heterogeneous `agents`
