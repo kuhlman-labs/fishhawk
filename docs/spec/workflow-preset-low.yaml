@@ -1,0 +1,136 @@
+# Low-autonomy workflow preset (ADR-048 / E29.1).
+#
+# Canonical, schema-valid workflow-v1 document seeding `fishhawk init`
+# and the App-PR onboarding path. This is the LOW tier: identical to the
+# medium preset EXCEPT the operator_agent block is omitted entirely, so
+# nothing is delegated — every judgment point (approve, fixup, retry,
+# waive, merge) pages the human (fail-closed delegation per ADR-040).
+#
+# See docs/spec/workflow-preset.md for the low/medium/high → METHODOLOGY
+# tier mapping and the delta surface.
+
+version: "1.0"
+
+roles:
+  founder:
+    members: ["@kuhlman-labs"]
+
+workflows:
+
+  # Low autonomy — human-led. No operator_agent delegation: every
+  # judgment point pages the human. Agent implements; human approves
+  # the plan and the PR.
+  feature_change:
+    description: >-
+      Default workflow for feature work and non-trivial changes.
+      Human approves plan and PR; agent does the implementation.
+    # Drive mode (#1023): fishhawkd auto-advances mechanical transitions
+    # (review settlement, fixup re-park, derived awaiting_merge) and
+    # surfaces next_action; judgment points still park for the human.
+    drive: true
+    policy:
+      max_stage_runtime: "30m"
+    # Periodic cost ceiling (ADR-030 / #688). Advisory — emits a
+    # budget_alert audit entry + originating-issue comment at warn_at
+    # (80%) and the 100% crossing; never blocks a run.
+    budgets:
+      - period: weekly
+        limit_usd: 50
+        warn_at: 0.8
+        enforcement: advisory
+    # Auto-retry once on CI failure (#276). The human approves the plan;
+    # the agent should self-heal on a routine test or lint regression
+    # without forcing the reviewer back into the loop.
+    on_ci_failure:
+      max_retries: 1
+
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        # Advisory plan review (ADR-027): agent reviewers surface
+        # verdicts before the human gate. Heterogeneous topology (#955):
+        # Claude and Codex review concurrently.
+        reviewers:
+          agents:
+            - provider: claudecode
+              model: claude-opus-4-8
+            - provider: codex
+              model: gpt-5.5
+          human: 1
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: plan
+            schema: standard_v1
+            persistence:
+              - target: originating_issue
+                mode: rendered_comment
+                update_on_change: true
+              - target: fishhawk_audit_log
+                mode: canonical
+        budget:
+          max_tokens: 200000
+          max_runtime_minutes: 15
+          enforcement: advisory
+        gates:
+          - type: approval
+            approvers:
+              any_of: [founder]
+
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          # #651 execution-grounded verifier: after the agent exits, run
+          # the project test command against the committed scope-only
+          # tree; on a test failure, feed the captured output back for a
+          # bounded fix loop, then re-verify, before the PR opens.
+          verify:
+            command: "scripts/test verify"
+            timeout: "15m"
+            max_iterations: 1
+        # Advisory implement-review (ADR-027 impl 2/2, #561): agent
+        # reviewers read the diff against the approved plan and surface
+        # verdicts (incl. scope-drift flag). Heterogeneous topology
+        # (#955): same Claude+Codex pair as the plan stage.
+        reviewers:
+          agents:
+            - provider: claudecode
+              model: claude-opus-4-8
+            - provider: codex
+              model: gpt-5.5
+          human: 1
+        inputs:
+          - artifact: plan
+            from_stage: plan
+        produces:
+          - artifact: pull_request
+        constraints:
+          - max_files_changed: 45
+          - forbidden_paths:
+              - ".github/workflows/**"
+              - ".fishhawk/**"
+              - "LICENSE"
+              - "NOTICE"
+          - required_outcomes:
+              - tests_added_or_updated
+              - ci_green
+        budget:
+          max_tokens: 500000
+          max_runtime_minutes: 30
+          enforcement: advisory
+
+      - id: review
+        type: review
+        executor:
+          human: true
+        inputs:
+          - artifact: pull_request
+            from_stage: implement
+        gates:
+          - type: approval
+            approvers:
+              any_of: [founder]
