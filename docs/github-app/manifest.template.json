@@ -35,6 +35,8 @@
     "check_run",
     "check_suite",
     "branch_protection_rule",
-    "repository_ruleset"
+    "repository_ruleset",
+    "installation",
+    "installation_repositories"
   ]
 }

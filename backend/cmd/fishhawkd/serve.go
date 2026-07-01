@@ -44,6 +44,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergereconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/onboarding"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -817,6 +818,10 @@ func runServe(args []string, logSink io.Writer) int {
 			// degrades to a no-op via the Router's nil-channel skipping, so
 			// the empty-ExternalURL posture is unchanged.
 			IssueNotifier: issuecomment.NewRouter(notifier),
+			// Scaffolder opens the App-PR onboarding scaffold when the App
+			// is installed on a repo or repos are added (ADR-048 / E29.7).
+			// Drives the Git Data API commit + PR through cfg.GitHub.
+			Scaffolder: onboarding.NewScaffolder(cfg.GitHub),
 			// (campaignNotifier reuses this same notifier for the campaign
 			// driver's page seam — assigned just below.)
 			// PlanReviewerConfigured mirrors the run-create guard's
