@@ -2472,6 +2472,179 @@ workflows:
 	}
 }
 
+// --- v1.1 acceptance surface (E31.2 / #1519, ADR-049) ---
+
+// TestParse_V1AcceptanceStage_AgentExecutor_Valid drives a version "1.1"
+// spec whose acceptance stage uses an agent executor through the real
+// ParseBytes path (version routing -> v1 JSON Schema -> YAML decode ->
+// semantic Validate). Acceptance is a runner-hosted advisory agent stage
+// (ADR-049 #3): it rides the ordinary agent executor branch with no
+// acceptance-specific binding, so the happy path is that it simply
+// parses and validates.
+func TestParse_V1AcceptanceStage_AgentExecutor_Valid(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`
+version: "1.1"
+workflows:
+  feature_change:
+    stages:
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+`))
+	if err != nil {
+		t.Fatalf("ParseBytes(v1.1 acceptance, agent): %v", err)
+	}
+	if s.Version != "1.1" {
+		t.Errorf("version = %q, want 1.1", s.Version)
+	}
+	st := s.Workflows["feature_change"].Stages[0]
+	if st.Type != spec.StageTypeAcceptance {
+		t.Errorf("stage type = %q, want acceptance", st.Type)
+	}
+	if st.Executor.Agent != "claude-code" {
+		t.Errorf("Executor.Agent = %q, want claude-code", st.Executor.Agent)
+	}
+}
+
+// TestParse_V1AcceptanceStage_HumanExecutor_Valid asserts an acceptance
+// stage may also use a human executor — acceptance is bound to the
+// agent/human executor branches, never the delegating one.
+func TestParse_V1AcceptanceStage_HumanExecutor_Valid(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`
+version: "1.1"
+workflows:
+  feature_change:
+    stages:
+      - id: acceptance
+        type: acceptance
+        executor:
+          human: true
+`))
+	if err != nil {
+		t.Fatalf("ParseBytes(v1.1 acceptance, human): %v", err)
+	}
+	st := s.Workflows["feature_change"].Stages[0]
+	if st.Type != spec.StageTypeAcceptance {
+		t.Errorf("stage type = %q, want acceptance", st.Type)
+	}
+	if !st.Executor.Human {
+		t.Error("Executor.Human = false, want true")
+	}
+}
+
+// TestParse_V1Acceptance_WithDelegate_Rejected asserts the type-generic
+// non-deploy executor branch fires for acceptance: a delegating executor
+// is valid only on a deploy stage, so an acceptance stage carrying one is
+// rejected with no acceptance-specific validator code.
+func TestParse_V1Acceptance_WithDelegate_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.1"
+workflows:
+  feature_change:
+    stages:
+      - id: acceptance
+        type: acceptance
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Message, "delegating executor") {
+		t.Errorf("message = %q, want it to flag the delegating executor on a non-deploy (acceptance) stage", ve.Message)
+	}
+}
+
+// TestParse_V1Acceptance_WithPreflightConstraint_Rejected asserts the
+// type-generic pre-flight-constraint branch fires for acceptance: a
+// pre-flight deploy constraint (change_freeze) is valid only on a deploy
+// stage, so an acceptance stage carrying one is rejected.
+func TestParse_V1Acceptance_WithPreflightConstraint_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.1"
+workflows:
+  feature_change:
+    stages:
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+        constraints:
+          - allowed_environments: [production]
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Message, "pre-flight deploy constraint") {
+		t.Errorf("message = %q, want it to flag the pre-flight constraint on a non-deploy (acceptance) stage", ve.Message)
+	}
+}
+
+// TestParse_V1Acceptance_WithDeploymentArtifact_Rejected asserts the
+// type-generic deployment-artifact branch fires for acceptance: the
+// deployment artifact is deploy-only, so an acceptance stage declaring it
+// is rejected.
+func TestParse_V1Acceptance_WithDeploymentArtifact_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.1"
+workflows:
+  feature_change:
+    stages:
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: deployment
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Message, "deployment artifact is valid only on a deploy stage") {
+		t.Errorf("message = %q, want it to flag the deployment artifact on a non-deploy (acceptance) stage", ve.Message)
+	}
+}
+
+// TestParse_V0Acceptance_Rejected proves the v0 enums stay frozen: a v0
+// spec (version 0.7, the current latest) carrying an acceptance stage is
+// rejected at the SCHEMA layer (a *SchemaError, before the semantic
+// validator), because acceptance is a v1-only type.
+func TestParse_V0Acceptance_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "0.7"
+workflows:
+  feature_change:
+    stages:
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError (v0 must reject the acceptance type at the schema layer)", err)
+	}
+}
+
+// TestParse_RoutesV11Spec proves a bare version "1.1" spec routes to the
+// v1 schema (minor is not routing-significant) and validates — the
+// additive-minor-bump routing done-means.
+func TestParse_RoutesV11Spec(t *testing.T) {
+	s, err := spec.ParseBytes(minimalSpecAtVersion("1.1"))
+	if err != nil {
+		t.Fatalf("ParseBytes(version 1.1): %v", err)
+	}
+	if s.Version != "1.1" {
+		t.Errorf("version = %q, want 1.1", s.Version)
+	}
+}
+
 // TestEmbeddedSchemaHashV1 proves the v1 hash advertised on /healthz is
 // a non-empty hex string distinct from the v0 hash (the two schemas
 // differ by $id/title/version enum, so their hashes must differ).

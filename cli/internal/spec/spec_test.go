@@ -276,6 +276,50 @@ workflows:
 	}
 }
 
+// TestValidateBytes_V1AcceptanceSpec_Accepted proves the cli's v1 schema
+// mirror picked up the E31.2 acceptance surface (#1519): a version "1.1"
+// spec whose acceptance stage uses an agent executor validates at the
+// schema level through the cli's embedded copy. This is the load-bearing
+// mirror-sync + version-minor-routing done-means for the cli surface — a
+// comment-only schema touch could not satisfy it (the enum member and the
+// 1.1 version value must actually be present in the mirror).
+func TestValidateBytes_V1AcceptanceSpec_Accepted(t *testing.T) {
+	yml := `
+version: "1.1"
+workflows:
+  feature_change:
+    stages:
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+`
+	if err := spec.ValidateBytes([]byte(yml)); err != nil {
+		t.Errorf("expected v1.1 acceptance spec to validate at the schema level, got: %v", err)
+	}
+}
+
+// TestValidateBytes_V0AcceptanceSpec_Rejected proves the cli's v0 mirror
+// stays frozen: a v0 spec (version 0.7) carrying an acceptance stage is
+// rejected at the schema layer, because acceptance is a v1-only type.
+func TestValidateBytes_V0AcceptanceSpec_Rejected(t *testing.T) {
+	yml := `
+version: "0.7"
+workflows:
+  feature_change:
+    stages:
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+`
+	err := spec.ValidateBytes([]byte(yml))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError (v0 must reject the acceptance type)", err)
+	}
+}
+
 // TestValidateBytes_V1Deploy_GitHubActionsMissingWorkflowRef_Rejected
 // proves the github_actions delegate target requires workflow_ref: the cli
 // mirror's nested oneOf rejects a spec that omits it.

@@ -507,14 +507,17 @@ type Stage struct {
 type StageType string
 
 // Stage types. plan/implement/review are the v0 closed set per
-// MVP_SPEC §4.1; deploy is the v1 delegating release stage (ADR-038 /
-// #925, E23.2). The v0 schema rejects deploy before Validate runs, so
-// the semantic binding rules in validate.go stay version-agnostic.
+// MVP_SPEC §4.1; deploy + acceptance are the v1 additions (deploy: the
+// delegating release stage, ADR-038 / #925, E23.2; acceptance: the
+// runner-hosted advisory acceptance stage, ADR-049 / #1519, E31.2). The
+// v0 schema rejects both before Validate runs, so the semantic binding
+// rules in validate.go stay version-agnostic.
 const (
-	StageTypePlan      StageType = "plan"
-	StageTypeImplement StageType = "implement"
-	StageTypeReview    StageType = "review"
-	StageTypeDeploy    StageType = "deploy"
+	StageTypePlan       StageType = "plan"
+	StageTypeImplement  StageType = "implement"
+	StageTypeReview     StageType = "review"
+	StageTypeDeploy     StageType = "deploy"
+	StageTypeAcceptance StageType = "acceptance"
 )
 
 // Executor describes what runs the stage. Exactly one of Agent, Human,

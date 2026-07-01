@@ -903,6 +903,65 @@ func TestPostgres_DeployStage_PersistRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPostgres_AcceptanceStage_PersistRoundTrip(t *testing.T) {
+	// #1519 done-means: a real acceptance stage row must be insertable and its
+	// type must round-trip through Postgres. This is the load-bearing test for
+	// the "constant + migration MUST ship together" acceptance criterion:
+	// before migration 0044 widened stages_type_check to admit 'acceptance',
+	// the CreateStage insert here fails with SQLSTATE 23514 (check_violation) —
+	// the Go fake doesn't enforce the CHECK, so only a real Postgres insert
+	// proves the pairing (the exact #1390/#1399 deploy failure mode). Unlike
+	// the deploy round-trip, acceptance adds NO new states: it walks the
+	// existing agent-stage lifecycle exactly like review.
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+	r := makeRun(t, repo)
+
+	s, err := repo.CreateStage(ctx, run.CreateStageParams{
+		RunID:        r.ID,
+		Sequence:     0,
+		Type:         run.StageTypeAcceptance,
+		ExecutorKind: run.ExecutorAgent,
+		ExecutorRef:  "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(acceptance): %v", err)
+	}
+	if s.Type != run.StageTypeAcceptance {
+		t.Errorf("CreateStage Type = %q, want %q", s.Type, run.StageTypeAcceptance)
+	}
+
+	// Walk the ordinary agent-stage lifecycle: pending → dispatched → running
+	// → succeeded. Each persisted state must satisfy the UNCHANGED
+	// stages_state_check (0044 widens only the type CHECK).
+	for _, to := range []run.StageState{
+		run.StageStateDispatched,
+		run.StageStateRunning,
+		run.StageStateSucceeded,
+	} {
+		got, err := repo.TransitionStage(ctx, s.ID, to, nil)
+		if err != nil {
+			t.Fatalf("→%s: %v", to, err)
+		}
+		if got.State != to {
+			t.Errorf("after transition State = %q, want %q", got.State, to)
+		}
+	}
+
+	// GetStage confirms the acceptance type survives a fresh read from Postgres.
+	got, err := repo.GetStage(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.Type != run.StageTypeAcceptance {
+		t.Errorf("GetStage Type = %q, want %q", got.Type, run.StageTypeAcceptance)
+	}
+	if got.State != run.StageStateSucceeded {
+		t.Errorf("GetStage State = %q, want %q", got.State, run.StageStateSucceeded)
+	}
+}
+
 // rollbackLister is the narrow type-assert for the rollback-pending listing,
 // which is off the broad run.Repository interface by design (#1398).
 type rollbackLister interface {

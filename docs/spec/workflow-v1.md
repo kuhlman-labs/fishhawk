@@ -2,11 +2,11 @@
 
 Reference for `.fishhawk/workflows.yaml` at major version 1. The canonical schema is [`workflow-v1.schema.json`](workflow-v1.schema.json) (JSON Schema Draft 2020-12).
 
-> **v1 began as a structural copy of v0 (ADR-046 / #1381) and now adds the deploy surface (E23.2 / #1382).** The inherited `$defs` and `properties` stay byte-for-byte identical to [`workflow-v0.schema.json`](workflow-v0.schema.json); v1 layers the delegating deploy grammar (per ADR-038 / #925) on top — the `deploy` stage type, the `deployment` artifact, the delegating executor, and three pre-flight constraint kinds. **v0 stays frozen** and rejects `deploy` via its closed enums, so a v0 spec carrying a deploy stage fails at the schema layer.
+> **v1 began as a structural copy of v0 (ADR-046 / #1381) and now adds the deploy surface (E23.2 / #1382).** The inherited `$defs` and `properties` stay byte-for-byte identical to [`workflow-v0.schema.json`](workflow-v0.schema.json); v1 layers the delegating deploy grammar (per ADR-038 / #925) on top — the `deploy` stage type, the `deployment` artifact, the delegating executor, and three pre-flight constraint kinds. **v1.1 adds the `acceptance` stage type (E31.2 / #1519, per ADR-049)** — a runner-hosted advisory acceptance stage on the ordinary agent/human executor branches (no delegate, no deploy-only constraints/artifact); an additive minor, so every 1.0 spec stays valid. **v0 stays frozen** and rejects both `deploy` and `acceptance` via its closed enums, so a v0 spec carrying either fails at the schema layer.
 
 ## Grammar
 
-Every v0 field is inherited unchanged. For the full base reference (top-level shape, stages, executors, inputs, produces, constraints, budgets, gates, operator-agent delegation — including the `operator_agent.model_policy` scenario-A model-selection contract (#1421), inherited verbatim and surfaced identically on the run-status delegation block — decomposition controls), see [`workflow-v0.md`](workflow-v0.md). The v1 additions are the [deploy stage](#deploy-stage-v1) members below. A minimal non-deploy v1 spec differs from a v0 spec only in its `version` value:
+Every v0 field is inherited unchanged. For the full base reference (top-level shape, stages, executors, inputs, produces, constraints, budgets, gates, operator-agent delegation — including the `operator_agent.model_policy` scenario-A model-selection contract (#1421), inherited verbatim and surfaced identically on the run-status delegation block — decomposition controls), see [`workflow-v0.md`](workflow-v0.md). The v1 additions are the [deploy stage](#deploy-stage-v1) (v1.0) and the [acceptance stage](#acceptance-stage-v11) (v1.1) members below. A minimal non-deploy v1 spec differs from a v0 spec only in its `version` value:
 
 ```yaml
 version: "1.0" # required; routes to workflow-v1.schema.json
@@ -82,6 +82,37 @@ workflows:
 ```
 
 See [ADR-038 (#925)](https://github.com/kuhlman-labs/fishhawk/issues/925) for the delegating-only deploy decision and epic [#924](https://github.com/kuhlman-labs/fishhawk/issues/924) for the deploy workstream.
+
+## Acceptance stage (v1.1)
+
+The `acceptance` stage type (ADR-049 / #1519) is a **runner-hosted advisory** acceptance stage: it runs a coding agent (or blocks on a human) to validate that a change meets its acceptance criteria, on the **same execution shape as `review`**. It deliberately adds **no new stage states** — it rides the existing agent-stage lifecycle (`pending → dispatched → running → awaiting_approval/succeeded/failed/cancelled`) — and no new artifact. That is the difference from `deploy`, whose two extra park states existed solely for its delegating pre-execution gate and external-pipeline poll.
+
+Because acceptance is an ordinary agent/human stage, it is bound by the **same type<->executor<->constraint rules the validator already applies to every non-deploy stage** (`backend/internal/spec/validate.go`), with no acceptance-specific code:
+
+- An **acceptance stage MUST** use an `agent` or `human` executor. `executor.delegate` is deploy-only, so a delegating executor on an acceptance stage is rejected.
+- The **pre-flight deploy constraint kinds** (`allowed_environments`, `change_freeze`, `required_upstream`) are **not** valid on an acceptance stage — they are deploy-only.
+- The **`deployment` artifact** is **not** valid on an acceptance stage — it is deploy-only.
+
+This slice adds the type to the spec, schema, and DB so an acceptance stage is **schema-valid and insertable**; the gate/orchestration/runner semantics that execute it are downstream (E31.6/E31.7). An acceptance stage is functionally inert until then.
+
+### Example — an acceptance stage
+
+```yaml
+version: "1.1"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code # or: human: true
+```
+
+See [ADR-049 (#1519)](https://github.com/kuhlman-labs/fishhawk/issues/1519) for the acceptance-stage decision and epic [#31](https://github.com/kuhlman-labs/fishhawk/issues/31) for the acceptance workstream.
 
 ## Reviewer policy (v1)
 
