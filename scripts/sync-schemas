@@ -42,4 +42,15 @@ cp "$REPO_ROOT/docs/spec/operator-role-default.yaml" \
 cp "$REPO_ROOT/docs/spec/work-management-default.yaml" \
   "$REPO_ROOT/backend/internal/workmgmt/defaults/work-management-default.yaml"
 
+# The workflow presets (ADR-048 / E29.1) are canonical product artifacts
+# — the low/medium/high onboarding seeds — mirrored into both module
+# sides so each embeds its own copy (the backend/cli module wall forbids
+# a cross-module import). The docs/spec/*.schema.json loop above does NOT
+# glob these .yaml files, so mirror them explicitly here.
+for preset in "$REPO_ROOT"/docs/spec/workflow-preset-*.yaml; do
+  base="$(basename "$preset")"
+  cp "$preset" "$REPO_ROOT/cli/internal/spec/presets/$base"
+  cp "$preset" "$REPO_ROOT/backend/internal/spec/presets/$base"
+done
+
 echo "schemas synced from docs/spec/"
