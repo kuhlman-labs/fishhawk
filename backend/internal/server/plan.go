@@ -78,6 +78,15 @@ type reviewerInvocation struct {
 	specModel       string
 	reasoningEffort string
 	resolveErr      error
+
+	// optional is the spec-declared per-reviewer degradation policy (#1495).
+	// When resolveErr is non-nil (the provider is unavailable on this
+	// deployment — a capability gap, NOT a reviewer error), the loop emits a
+	// capability-framed *_review_skipped audit instead of *_review_failed and
+	// uses optional to pick the surface: true → quiet graceful skip, false
+	// (default, including the bare count form which has no per-reviewer flag)
+	// → loud ERROR log + skipped audit. It never blocks the gate either way.
+	optional bool
 }
 
 // resolveReviewerInvocations maps a stage's ReviewersConfig to its
@@ -122,6 +131,7 @@ func (s *Server) resolveReviewerInvocationsWithReviewModel(reviewersCfg *spec.Re
 				specModel:       a.Model,
 				reasoningEffort: a.ReasoningEffort,
 				resolveErr:      err,
+				optional:        a.Optional,
 			})
 		}
 		return invocations
@@ -936,7 +946,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	if s.defaultPlanReviewer() == nil {
 		if s.cfg.AuditRepo != nil {
 			payload, _ := json.Marshal(planreview.ReviewSkippedPayload{
-				Reason:           "reviewer_not_configured",
+				Reason:           planreview.ReasonReviewerNotConfigured,
 				ConfiguredAgents: reviewersCfg.AgentCount(),
 				Authority:        authority,
 			})
@@ -1297,6 +1307,72 @@ func (s *Server) emitReviewFailed(ctx context.Context, runID, stageID uuid.UUID,
 	}
 }
 
+// emitReviewerUnavailable appends a capability-framed terminal
+// *_review_skipped audit entry when a spec-declared reviewer's provider is
+// unavailable on this deployment (#1495). It is the runtime degradation point
+// for the per-reviewer capability gap: the reviewer never ran because the
+// deployment lacks the capability (its FISHHAWKD_ENABLE_* / API-key gate is
+// off), NOT because the invocation errored — so this is deliberately distinct
+// from emitReviewFailed / *_review_failed. Shared by the plan-review (plan.go)
+// and implement-review (trace.go) resolveErr branches via the passed category
+// ("plan_review_skipped" / "implement_review_skipped").
+//
+// The optional flag picks the log surface, honoring the spec's declared
+// degradation policy: optional:false (default, the deployment SHOULD have run
+// it) logs at ERROR naming the env knob; optional:true logs at INFO as a
+// quiet graceful skip. Either way the gate is NOT blocked — *_review_skipped
+// counts as a terminal review entry (planreview.Settled), so the N-of-N
+// review-settled gate still resolves. ActorKind=system, best-effort,
+// WARN-log on append failure, mirroring emitReviewFailed.
+func (s *Server) emitReviewerUnavailable(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, provider string, optional bool, configuredAgents int, resolveErr error) {
+	knob := reviewerProviderEnvKnob(provider)
+	if optional {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"review: spec-declared optional reviewer unavailable on this deployment — graceful skip",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("category", category),
+			slog.String("provider", provider),
+			slog.String("enable_knob", knob),
+			slog.String("error", resolveErr.Error()),
+		)
+	} else {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
+			"review: spec-declared reviewer unavailable on this deployment (optional:false) — skipped, enable its capability to run it",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("category", category),
+			slog.String("provider", provider),
+			slog.String("enable_knob", knob),
+			slog.String("error", resolveErr.Error()),
+		)
+	}
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	payload, _ := json.Marshal(planreview.ReviewSkippedPayload{
+		Reason:           planreview.ReasonReviewerUnavailable,
+		ConfiguredAgents: configuredAgents,
+		Authority:        authority,
+		Provider:         provider,
+		Optional:         optional,
+	})
+	systemKind := audit.ActorKind("system")
+	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  category,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review: append "+category+" audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", aerr.Error()),
+		)
+	}
+}
+
 // runPlanReviewLoop runs the per-reviewer plan-review loop shared by the
 // synchronous (gating) and detached (advisory) dispatch paths. For each
 // resolved invocation it calls its reviewer's Review, logs WARN on
@@ -1314,18 +1390,15 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 	hasRejection := false
 	budget := reviewBudget.Budget(len(promptText))
 	for i, inv := range invocations {
-		// An unresolvable provider (#955) is handled like a failed
-		// invocation: terminal *_review_failed entry, loop continues,
-		// hasRejection untouched.
+		// An unresolvable provider is a deployment CAPABILITY gap, not a
+		// reviewer error (#1495, reframes #955): the spec-declared provider is
+		// unavailable on this deployment. Emit a capability-framed terminal
+		// *_review_skipped entry honoring the per-reviewer optional flag (loud
+		// for optional:false, quiet for optional:true), continue, hasRejection
+		// untouched. *_review_skipped counts as terminal (planreview.Settled),
+		// so the review-settled gate still resolves.
 		if inv.resolveErr != nil {
-			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: reviewer provider unresolved",
-				slog.String("run_id", runID.String()),
-				slog.String("stage_id", stageID.String()),
-				slog.Int("reviewer_index", i),
-				slog.String("provider", inv.provider),
-				slog.String("error", inv.resolveErr.Error()),
-			)
-			s.emitReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, inv.specModel, inv.resolveErr.Error(), false)
+			s.emitReviewerUnavailable(ctx, runID, stageID, "plan_review_skipped", authority, inv.provider, inv.optional, len(invocations), inv.resolveErr)
 			continue
 		}
 		// Apply the size-aware per-invocation budget (#747) as a context

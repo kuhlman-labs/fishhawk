@@ -171,6 +171,18 @@ Notes:
   `failed` resolution). Listed here only so a
   future reader grepping for `*_reviewed` doesn't mistake them for a comment
   surface.
+- The reviewer-capability audit kinds (#1495) — `reviewer_capability_unavailable`
+  (global-chain, written by `handleCreateRun` when a spec-declared reviewer's
+  provider is unavailable on the deployment but a backend IS wired, so the run
+  degrades and proceeds instead of hard-failing) and the capability-framed
+  `plan_review_skipped` / `implement_review_skipped` **reason** `reviewer_unavailable`
+  (the runtime degradation point, carrying `provider` + `optional`) — are
+  **internal, degrade-record audit kinds, not issue-comment surfaces**. Nothing
+  in `issuecomment` posts them to the issue thread. The coarse no-backend-at-all
+  gate still emits `run_rejected_misconfigured` + a customer comment via
+  `NotifyRunRejected` (below); the finer per-reviewer capability gap does not
+  reject and posts no comment. Listed here so a reader grepping for reviewer
+  audit kinds sees the full non-comment set.
 - The plan-approval completion-gate backstop audit kind —
   `plan_review_backstop_elapsed` (ADR-036 / #875), written by the approval
   handler (`server/approvals.go::checkPlanReviewSettled`) when a plan-stage

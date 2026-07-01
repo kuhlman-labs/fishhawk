@@ -760,6 +760,12 @@ type Dispatcher struct {
 	// run-create guard #574 added at handleCreateRun. The zero value
 	// (false) is the conservative default matching the production
 	// nil-by-default reviewer posture.
+	//
+	// #1495: this is the COARSE "no reviewer backend at all" gate. It is
+	// deliberately NOT reframed to the per-reviewer capability degradation
+	// #1495 applies to handleCreateRun — see the Step 3.4 comment for why the
+	// coarse no-backend hard-fail legitimately stays symmetric on both paths
+	// while the per-reviewer capability gap degrades at the runtime review loop.
 	PlanReviewerConfigured bool
 
 	// DefaultRef is the git ref to dispatch against when the
@@ -871,17 +877,33 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		return nil
 	}
 
-	// Step 3.4: plan-review wiring guard (#577 / ADR-027). The
-	// symmetric counterpart to the run-create guard #574 added at
-	// handleCreateRun. When the resolved spec declares an agent-gated
-	// plan review (reviewers.agent > 0, human == 0) but no
-	// PlanReviewer is wired, agent review would be silently skipped at
-	// plan-upload time — minting a GitHub-triggered run that can pass
-	// a gate that does not exist. Refuse before any run row is minted.
-	// Advisory mode (agent > 0, human > 0) is allowed through: the
-	// human gate remains authoritative. Because the dispatcher returns
-	// 202 to GitHub and can't surface a 400, the audit entry + WARN
-	// log are the rejection surface.
+	// Step 3.4: plan-review COARSE capability gate (#577 / ADR-027 / #1495).
+	// PlanReviewerConfigured is a single bool — "is ANY plan-review backend
+	// wired at all on this deployment". This guard fires ONLY for the coarse
+	// no-backend case: a gating plan stage (reviewers.agent > 0, human == 0)
+	// on a deployment with ZERO review infrastructure. That is a
+	// deployment-wide misconfiguration, GENUINELY DIFFERENT from and coarser
+	// than "a SPECIFIC spec-declared reviewer's provider is unavailable while
+	// other backends are wired" — and it legitimately remains a HARD-FAIL.
+	//
+	// #1495 binding-condition note (option b): the local run-create path
+	// (handleCreateRun.gatingReviewerProblem) hard-fails this SAME coarse
+	// no-backend case identically (defaultPlanReviewer() == nil), so the two
+	// run-create paths are CONSISTENT. The per-reviewer capability gap that
+	// #1495 reframes to graceful degradation never reaches this guard: when a
+	// backend IS wired, PlanReviewerConfigured is true, the guard is skipped,
+	// the run is created, and the unavailable provider degrades at the runtime
+	// review loop with a capability-framed *_review_skipped audit — the same
+	// degradation the local path now performs. The dispatcher cannot do
+	// per-provider resolution itself (it holds only this bool, not the
+	// server's ReviewerSet, to avoid an import cycle), but it does not need
+	// to: the runtime loop is the shared degradation point for both paths.
+	// So there is no residual asymmetry for the per-reviewer capability case,
+	// and the coarse no-backend hard-fail stays symmetric on both paths.
+	//
+	// Advisory mode (agent > 0, human > 0) is allowed through: the human gate
+	// remains authoritative. Because the dispatcher returns 202 to GitHub and
+	// can't surface a 400, the audit entry + WARN log are the rejection surface.
 	if !d.PlanReviewerConfigured {
 		for _, st := range workflow.Stages {
 			if st.Type != spec.StageTypePlan || st.Reviewers == nil {
