@@ -254,16 +254,48 @@ func Settled(configuredAgents, terminalEntries int) bool {
 	return configuredAgents > 0 && terminalEntries >= configuredAgents
 }
 
+// ReasonReviewerNotConfigured is the ReviewSkippedPayload.Reason for the
+// coarse degradation: the stage requested agent review but NO reviewer
+// backend was wired at all on the deployment (#574). It is distinct from
+// ReasonReviewerUnavailable, which is the per-reviewer capability gap.
+const ReasonReviewerNotConfigured = "reviewer_not_configured"
+
+// ReasonReviewerUnavailable is the ReviewSkippedPayload.Reason for the
+// per-reviewer capability gap (#1495): a deployment that HAS a reviewer
+// backend but cannot run THIS spec-declared reviewer's provider (its
+// FISHHAWKD_ENABLE_* / API-key capability gate is off). It is deliberately
+// distinct from a genuine reviewer error (plan_review_failed /
+// implement_review_failed) — the reviewer never ran because the deployment
+// lacks the capability, not because the invocation failed.
+const ReasonReviewerUnavailable = "reviewer_unavailable"
+
 // ReviewSkippedPayload is the JSON payload stored in an audit
-// entry with category "plan_review_skipped" (#574). It records that
-// the stage's reviewers config requested agent review (agent > 0) but
-// no PlanReviewer was wired, so the agent layer was skipped. Authority
-// captures whether the skip degraded a gating or advisory gate; in
-// advisory mode the human gate remains authoritative.
+// entry with category "plan_review_skipped" / "implement_review_skipped"
+// (#574). It records that an agent review the spec requested did not run.
+// Two degradation reasons share this payload:
+//   - ReasonReviewerNotConfigured: no reviewer backend wired at all (#574).
+//   - ReasonReviewerUnavailable: this specific spec-declared reviewer's
+//     provider is unavailable on the deployment — the capability-gate
+//     degradation honoring the per-reviewer optional flag (#1495).
+//
+// Authority captures whether the skip degraded a gating or advisory gate;
+// in advisory mode the human gate remains authoritative.
 type ReviewSkippedPayload struct {
 	Reason           string        `json:"reason"`
 	ConfiguredAgents int           `json:"configured_agents"`
 	Authority        AuthorityMode `json:"authority"`
+
+	// Provider is the spec-declared reviewer provider that could not be run
+	// (#1495). Populated only on the ReasonReviewerUnavailable per-reviewer
+	// capability skip; empty (omitempty) on the coarse not-configured skip,
+	// which has no single provider. Keeps pre-#1495 payloads byte-identical.
+	Provider string `json:"provider,omitempty"`
+
+	// Optional records the per-reviewer optional flag the skip honored
+	// (#1495): true for a graceful quiet advisory-skip, false (default) for a
+	// loud surface (the deployment SHOULD have run it). omitempty keeps
+	// optional:false (the common case) and pre-#1495 payloads byte-identical.
+	Optional bool `json:"optional,omitempty"`
 }
 
 // ReviewStartedPayload is the JSON payload stored in an audit entry with

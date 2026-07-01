@@ -644,17 +644,29 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Plan-review wiring guard (#574 / ADR-027 / #955). When the resolved
-	// spec declares an agent-gated plan review (effective agent count > 0,
-	// human == 0) that the wired reviewer set cannot satisfy — no default
-	// adapter for the bare count form, or an agents-list entry naming an
-	// unconfigured provider — agent review would be silently degraded at
-	// plan-upload time, minting a run that can never satisfy its own gate.
-	// Reject at create time with a run_rejected_misconfigured audit trail
-	// rather than letting the run proceed past a gate that does not exist.
-	// Advisory mode (human > 0) is allowed through: the human gate remains
-	// authoritative and the review loops emit plan_review_skipped /
-	// *_review_failed audit entries for the missing agent layer.
+	// Plan-review capability gate (#574 / ADR-027 / #955 / #1495). The spec is
+	// authoritative for WHICH reviewers a gating plan stage (effective agent
+	// count > 0, human == 0) runs; the FISHHAWKD_ENABLE_* / FISHHAWKD_ANTHROPIC_API_KEY
+	// flags are deployment CAPABILITY gates, not policy switches. Two cases:
+	//
+	//   - COARSE no-backend gate (gatingReviewerProblem): NO reviewer backend
+	//     is wired at all on this deployment. This is a deployment-wide
+	//     misconfiguration — zero review infrastructure — so it still HARD-FAILS
+	//     run creation with a run_rejected_misconfigured audit + 400,
+	//     irrespective of any per-reviewer optional flag. Symmetric with the
+	//     webhook dispatcher's coarse !PlanReviewerConfigured hard-fail so both
+	//     run-create paths behave identically (#1495 binding condition, opt. b).
+	//
+	//   - PER-REVIEWER capability gap (unavailableSpecReviewers): a backend IS
+	//     wired but a specific spec-declared reviewer's provider is unavailable.
+	//     Run creation NO LONGER hard-fails — the spec is valid, only the
+	//     deployment capability is missing. Emit a reviewer_capability_unavailable
+	//     audit per unavailable reviewer honoring its optional flag (loud for
+	//     optional:false, quiet for optional:true) and PROCEED; the reviewer
+	//     degrades again at the runtime review loop with a *_review_skipped entry.
+	//
+	// Advisory mode (human > 0) is allowed through entirely: the human gate
+	// remains authoritative and the runtime review loops record the degradation.
 	if haveStageDefs {
 		for _, st := range workflowDef.Stages {
 			if st.Type != spec.StageTypePlan || st.Reviewers == nil {
@@ -663,31 +675,34 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 			if planreview.ResolveAuthority(*st.Reviewers) != planreview.AuthorityGating {
 				continue
 			}
-			problem := s.gatingReviewerProblem(st.Reviewers)
-			if problem == "" {
-				continue
-			}
-			if s.cfg.AuditRepo != nil {
-				payload, _ := json.Marshal(map[string]any{
-					"reason":            "plan_reviewer_unconfigured",
-					"stage":             st.ID,
-					"workflow_id":       req.WorkflowID,
-					"repo":              req.Repo,
-					"configured_agents": st.Reviewers.AgentCount(),
-				})
-				systemKind := audit.ActorKind("system")
-				if _, aerr := s.cfg.AuditRepo.AppendGlobalChained(r.Context(), audit.GlobalChainAppendParams{
-					Timestamp: time.Now().UTC(),
-					Category:  "run_rejected_misconfigured",
-					ActorKind: &systemKind,
-					Payload:   payload,
-				}); aerr != nil {
-					s.cfg.Logger.Warn("append run_rejected_misconfigured audit entry failed",
-						"repo", req.Repo, "workflow_id", req.WorkflowID, "error", aerr.Error())
+			if problem := s.gatingReviewerProblem(st.Reviewers); problem != "" {
+				if s.cfg.AuditRepo != nil {
+					payload, _ := json.Marshal(map[string]any{
+						"reason":            "plan_reviewer_unconfigured",
+						"stage":             st.ID,
+						"workflow_id":       req.WorkflowID,
+						"repo":              req.Repo,
+						"configured_agents": st.Reviewers.AgentCount(),
+					})
+					systemKind := audit.ActorKind("system")
+					if _, aerr := s.cfg.AuditRepo.AppendGlobalChained(r.Context(), audit.GlobalChainAppendParams{
+						Timestamp: time.Now().UTC(),
+						Category:  "run_rejected_misconfigured",
+						ActorKind: &systemKind,
+						Payload:   payload,
+					}); aerr != nil {
+						s.cfg.Logger.Warn("append run_rejected_misconfigured audit entry failed",
+							"repo", req.Repo, "workflow_id", req.WorkflowID, "error", aerr.Error())
+					}
 				}
+				s.writeError(w, r, http.StatusBadRequest, "plan_reviewer_unconfigured", problem, nil)
+				return
 			}
-			s.writeError(w, r, http.StatusBadRequest, "plan_reviewer_unconfigured", problem, nil)
-			return
+			// Capability-gate graceful degradation (#1495): a wired backend
+			// missing this specific reviewer's provider does not reject the run.
+			for _, u := range s.unavailableSpecReviewers(st.Reviewers) {
+				s.emitReviewerCapabilityUnavailable(r.Context(), req.Repo, req.WorkflowID, st.ID, st.Reviewers.AgentCount(), u)
+			}
 		}
 	}
 
@@ -1637,33 +1652,109 @@ func (s *Server) handlePostStatusComment(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusCreated)
 }
 
-// gatingReviewerProblem reports why a gating reviewers config cannot be
-// satisfied by the wired reviewer set (#574 / #955): the bare count form
-// with no default adapter, or an agents-list entry naming a provider that
-// does not resolve. Empty string means every declared reviewer is
-// dispatchable. Used by handleCreateRun's run-create fail-fast; advisory
-// stages keep the skip-with-audit degradation path instead.
+// gatingReviewerProblem reports the COARSE deployment-capability problem
+// that still HARD-FAILS run creation: NO reviewer backend is wired at all on
+// this deployment (defaultPlanReviewer() == nil) while a gating plan stage
+// (agent > 0, human == 0) needs one. This is a deployment-wide
+// misconfiguration — there is zero review infrastructure — distinct from the
+// finer-grained #1495 case of a SPECIFIC spec-declared reviewer's provider
+// being unavailable while OTHER backends are wired (collected by
+// unavailableSpecReviewers and degraded at the runtime review loop, not
+// rejected). It is symmetric with the webhook dispatcher's coarse
+// !PlanReviewerConfigured hard-fail (dispatcher.go), so both run-create paths
+// hard-fail the no-backend case identically and irrespective of the
+// per-reviewer optional flag. Empty string means a backend IS wired — any
+// residual per-reviewer capability gap degrades rather than rejecting.
 func (s *Server) gatingReviewerProblem(reviewers *spec.ReviewersConfig) string {
-	if len(reviewers.Agents) > 0 {
-		if s.cfg.PlanReviewers == nil {
-			return "workflow declares agent-gated review with a reviewers.agents list but fishhawkd has no reviewer set wired; set FISHHAWKD_ANTHROPIC_API_KEY, FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER, or FISHHAWKD_ENABLE_CODEX_REVIEWER, or remove reviewers.agents"
-		}
-		for _, a := range reviewers.Agents {
-			if _, err := s.cfg.PlanReviewers.For(a.Provider, a.Model, a.ReasoningEffort); err != nil {
-				return fmt.Sprintf("workflow declares agent-gated review naming reviewer provider %q but it does not resolve (%s); enable it (%s) or remove the reviewers.agents entry",
-					a.Provider, err.Error(), reviewerProviderEnvKnob(a.Provider))
-			}
-		}
+	if s.defaultPlanReviewer() != nil {
 		return ""
 	}
-	if s.defaultPlanReviewer() == nil {
-		return "workflow declares agent-gated plan review (reviewers.agent > 0, human == 0) but fishhawkd has no PlanReviewer wired; set FISHHAWKD_ANTHROPIC_API_KEY or remove reviewers.agent"
+	if len(reviewers.Agents) > 0 {
+		return "workflow declares agent-gated review (reviewers.agents, human == 0) but fishhawkd has no reviewer backend wired at all; set FISHHAWKD_ANTHROPIC_API_KEY, FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER, or FISHHAWKD_ENABLE_CODEX_REVIEWER, or remove the reviewers.agents gate"
 	}
-	return ""
+	return "workflow declares agent-gated plan review (reviewers.agent > 0, human == 0) but fishhawkd has no PlanReviewer wired; set FISHHAWKD_ANTHROPIC_API_KEY or remove reviewers.agent"
 }
 
-// reviewerProviderEnvKnob names the deployment env knob that enables a
-// given reviewer provider, for fail-fast error messages.
+// unavailableReviewer is one spec-declared reviewer whose provider cannot be
+// resolved on this deployment (#1495) — a per-reviewer capability gap that
+// degrades run creation rather than rejecting it.
+type unavailableReviewer struct {
+	provider string
+	optional bool
+	err      error
+}
+
+// unavailableSpecReviewers returns the agents-list reviewers whose provider
+// cannot be resolved on this deployment (#1495), for the capability-gate
+// graceful-degradation path. It is only meaningful once gatingReviewerProblem
+// has returned "" (a reviewer backend IS wired): each entry is a per-reviewer
+// capability gap that proceeds with a reviewer_capability_unavailable audit
+// honoring its optional flag. The bare count form names no provider and
+// resolves via the default adapter, so it yields no per-reviewer gaps here —
+// its only failure mode is the coarse no-backend gate above.
+func (s *Server) unavailableSpecReviewers(reviewers *spec.ReviewersConfig) []unavailableReviewer {
+	if s.cfg.PlanReviewers == nil || len(reviewers.Agents) == 0 {
+		return nil
+	}
+	var out []unavailableReviewer
+	for _, a := range reviewers.Agents {
+		if _, err := s.cfg.PlanReviewers.For(a.Provider, a.Model, a.ReasoningEffort); err != nil {
+			out = append(out, unavailableReviewer{provider: a.Provider, optional: a.Optional, err: err})
+		}
+	}
+	return out
+}
+
+// emitReviewerCapabilityUnavailable appends a global-chain
+// reviewer_capability_unavailable audit entry at run-create time when a
+// spec-declared reviewer's provider is unavailable on this deployment
+// (#1495). No run row exists yet at the create gate, so it uses
+// AppendGlobalChained (mirroring the run_rejected_misconfigured emission).
+// The spec is authoritative for WHICH reviewers run and the FISHHAWKD_ENABLE_*
+// flags are deployment capability gates, so this gap DEGRADES the run rather
+// than rejecting it: the entry records the gap and the caller proceeds (the
+// reviewer degrades again at the runtime review loop). The optional flag picks
+// the log surface honoring the spec's policy — ERROR for optional:false (the
+// deployment SHOULD have run it), INFO for optional:true (a quiet graceful
+// skip). Best-effort: a nil AuditRepo is a no-op, an append error WARN-logs.
+func (s *Server) emitReviewerCapabilityUnavailable(ctx context.Context, repo, workflowID, stage string, configuredAgents int, u unavailableReviewer) {
+	knob := reviewerProviderEnvKnob(u.provider)
+	if u.optional {
+		s.cfg.Logger.Info("run-create: spec-declared optional reviewer unavailable on this deployment — proceeding (graceful skip)",
+			"repo", repo, "workflow_id", workflowID, "stage", stage,
+			"provider", u.provider, "enable_knob", knob, "error", u.err.Error())
+	} else {
+		s.cfg.Logger.Error("run-create: spec-declared reviewer unavailable on this deployment (optional:false) — proceeding; enable its capability to run it",
+			"repo", repo, "workflow_id", workflowID, "stage", stage,
+			"provider", u.provider, "enable_knob", knob, "error", u.err.Error())
+	}
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"reason":            planreview.ReasonReviewerUnavailable,
+		"provider":          u.provider,
+		"optional":          u.optional,
+		"stage":             stage,
+		"workflow_id":       workflowID,
+		"repo":              repo,
+		"configured_agents": configuredAgents,
+	})
+	systemKind := audit.ActorKind("system")
+	if _, aerr := s.cfg.AuditRepo.AppendGlobalChained(ctx, audit.GlobalChainAppendParams{
+		Timestamp: time.Now().UTC(),
+		Category:  "reviewer_capability_unavailable",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); aerr != nil {
+		s.cfg.Logger.Warn("append reviewer_capability_unavailable audit entry failed",
+			"repo", repo, "workflow_id", workflowID, "error", aerr.Error())
+	}
+}
+
+// reviewerProviderEnvKnob names the deployment env knob whose capability gate
+// enables a given reviewer provider, for the #1495 capability-framed audit and
+// log messaging.
 func reviewerProviderEnvKnob(provider string) string {
 	switch provider {
 	case "anthropic":

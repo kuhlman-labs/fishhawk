@@ -2637,7 +2637,7 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	if s.defaultPlanReviewer() == nil {
 		if s.cfg.AuditRepo != nil {
 			payload, _ := json.Marshal(planreview.ReviewSkippedPayload{
-				Reason:           "reviewer_not_configured",
+				Reason:           planreview.ReasonReviewerNotConfigured,
 				ConfiguredAgents: reviewersCfg.AgentCount(),
 				Authority:        authority,
 			})
@@ -2976,18 +2976,15 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 	hasRejection := false
 	budget := reviewBudget.Budget(len(promptText))
 	for i, inv := range invocations {
-		// An unresolvable provider (#955) is handled like a failed
-		// invocation: terminal *_review_failed entry, loop continues,
-		// hasRejection untouched.
+		// An unresolvable provider is a deployment CAPABILITY gap, not a
+		// reviewer error (#1495, reframes #955): the spec-declared provider is
+		// unavailable on this deployment. Emit a capability-framed terminal
+		// implement_review_skipped entry honoring the per-reviewer optional
+		// flag (loud for optional:false, quiet for optional:true), continue,
+		// hasRejection untouched. implement_review_skipped counts as terminal
+		// (planreview.Settled), so the review-settled gate still resolves.
 		if inv.resolveErr != nil {
-			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: reviewer provider unresolved",
-				slog.String("run_id", runID.String()),
-				slog.String("stage_id", stageID.String()),
-				slog.Int("reviewer_index", i),
-				slog.String("provider", inv.provider),
-				slog.String("error", inv.resolveErr.Error()),
-			)
-			s.emitReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, inv.specModel, inv.resolveErr.Error(), false)
+			s.emitReviewerUnavailable(ctx, runID, stageID, "implement_review_skipped", authority, inv.provider, inv.optional, len(invocations), inv.resolveErr)
 			continue
 		}
 		// Apply the size-aware per-invocation budget (#747) as a context

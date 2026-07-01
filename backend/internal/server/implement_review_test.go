@@ -1451,14 +1451,62 @@ func TestRunImplementReviews_ReviewModelOverride_Threaded(t *testing.T) {
 	})
 }
 
-// TestShipTrace_ImplementReview_Heterogeneous_UnresolvableProvider_Gating
-// pins the implement-loop analog of the plan-side gating degradation test:
-// one of two declared gating reviewers is unconfigured (config drift on an
-// in-flight run — fresh gating runs are blocked at dispatch by the runs.go
-// pre-check). The resolve failure emits exactly one implement_review_failed
-// entry, leaves hasRejection untouched, and the resolvable reviewer's
-// approve verdict still governs: the stage must not fail.
-func TestShipTrace_ImplementReview_Heterogeneous_UnresolvableProvider_Gating(t *testing.T) {
+// specImplementHeterogeneousGatingV1Optional is specImplementHeterogeneousGating
+// as workflow-v1 with codex's optional flag settable (#1495 — v1-only field).
+func specImplementHeterogeneousGatingV1Optional(codexOptional bool) []byte {
+	return fmt.Appendf(nil, `version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+              model: claude-opus-4-8
+            - provider: codex
+              model: gpt-5.5
+              optional: %t
+          human: 0
+`, codexOptional)
+}
+
+// collectImplementReviewSkipped decodes every implement_review_skipped entry.
+func collectImplementReviewSkipped(t *testing.T, au *auditFake) []planreview.ReviewSkippedPayload {
+	t.Helper()
+	var out []planreview.ReviewSkippedPayload
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, e := range au.appended {
+		if e.Category != "implement_review_skipped" {
+			continue
+		}
+		var p planreview.ReviewSkippedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode implement_review_skipped payload: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// TestShipTrace_ImplementReview_Heterogeneous_UnavailableProvider_Gating_SkippedLoud
+// pins the implement-loop analog of the plan-side #1495 capability reframe (was
+// #955's implement_review_failed): an unavailable declared gating reviewer emits
+// exactly one capability-framed implement_review_skipped entry (reason
+// reviewer_unavailable, provider codex, optional=false loud) — NOT
+// implement_review_failed — leaves hasRejection untouched, and the resolvable
+// reviewer's approve verdict still governs: the stage must not fail.
+func TestShipTrace_ImplementReview_Heterogeneous_UnavailableProvider_Gating_SkippedLoud(t *testing.T) {
 	anthropicFake := &fakePlanReviewer{
 		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
 		model:   "claude-opus-4-8",
@@ -1478,24 +1526,19 @@ func TestShipTrace_ImplementReview_Heterogeneous_UnresolvableProvider_Gating(t *
 	}
 
 	var reviewed []planreview.ImplementReviewedPayload
-	var failedEntries []planreview.ReviewFailedPayload
 	au.mu.Lock()
 	for _, e := range au.appended {
-		switch e.Category {
-		case "implement_reviewed":
+		if e.Category == "implement_reviewed" {
 			var p planreview.ImplementReviewedPayload
 			if err := json.Unmarshal(e.Payload, &p); err != nil {
 				au.mu.Unlock()
 				t.Fatalf("decode implement_reviewed payload: %v", err)
 			}
 			reviewed = append(reviewed, p)
-		case "implement_review_failed":
-			var p planreview.ReviewFailedPayload
-			if err := json.Unmarshal(e.Payload, &p); err != nil {
-				au.mu.Unlock()
-				t.Fatalf("decode implement_review_failed payload: %v", err)
-			}
-			failedEntries = append(failedEntries, p)
+		}
+		if e.Category == "implement_review_failed" {
+			au.mu.Unlock()
+			t.Fatalf("capability gap must emit implement_review_skipped, NOT implement_review_failed")
 		}
 	}
 	au.mu.Unlock()
@@ -1507,20 +1550,62 @@ func TestShipTrace_ImplementReview_Heterogeneous_UnresolvableProvider_Gating(t *
 		t.Errorf("reviewed entry = model %q authority %q, want claude-opus-4-8 / gating",
 			reviewed[0].ReviewerModel, reviewed[0].Authority)
 	}
-	if len(failedEntries) != 1 {
-		t.Fatalf("implement_review_failed entries = %d, want 1 (the unresolvable codex reviewer)", len(failedEntries))
+
+	skipped := collectImplementReviewSkipped(t, au)
+	if len(skipped) != 1 {
+		t.Fatalf("implement_review_skipped entries = %d, want 1 (the unavailable codex reviewer)", len(skipped))
 	}
-	if !strings.Contains(failedEntries[0].Reason, "not configured") {
-		t.Errorf("failed reason = %q, want the resolve error", failedEntries[0].Reason)
+	if skipped[0].Reason != planreview.ReasonReviewerUnavailable || skipped[0].Provider != "codex" {
+		t.Errorf("skip entry = %+v, want reason reviewer_unavailable provider codex", skipped[0])
 	}
-	if failedEntries[0].Authority != planreview.AuthorityGating {
-		t.Errorf("failed authority = %q, want gating", failedEntries[0].Authority)
+	if skipped[0].Optional {
+		t.Errorf("skip optional = true, want false (loud, default)")
+	}
+	if skipped[0].Authority != planreview.AuthorityGating {
+		t.Errorf("skip authority = %q, want gating", skipped[0].Authority)
 	}
 
-	// A resolve failure must not count as a rejection: the resolvable
+	// A capability skip must not count as a rejection: the resolvable
 	// reviewer approved, so the gating implement stage must not fail.
 	if implStage.State == run.StageStateFailed {
-		t.Errorf("gating resolve failure must not fail the stage; state = %q", implStage.State)
+		t.Errorf("gating capability skip must not fail the stage; state = %q", implStage.State)
+	}
+}
+
+// TestShipTrace_ImplementReview_Heterogeneous_UnavailableProvider_Gating_OptionalTrue_SkippedQuiet
+// is the optional:true half: an unavailable codex marked optional:true emits an
+// implement_review_skipped entry carrying optional=true (quiet graceful skip),
+// still terminal, still no stage failure.
+func TestShipTrace_ImplementReview_Heterogeneous_UnavailableProvider_Gating_OptionalTrue_SkippedQuiet(t *testing.T) {
+	anthropicFake := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-8",
+	}
+	set := fakeReviewerSet{providers: map[string]PlanReviewer{
+		"anthropic": anthropicFake,
+	}, def: anthropicFake}
+	s, sf, au, _, runRow, implStage := newImplementReviewServerWithSet(t, set, specImplementHeterogeneousGatingV1Optional(true))
+	priv, _ := sf.issue(t, runRow.ID)
+
+	bundleBytes := implementDiffBundle(t,
+		[]map[string]string{{"path": "backend/internal/foo/foo.go", "status": "M"}})
+	w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	skipped := collectImplementReviewSkipped(t, au)
+	if len(skipped) != 1 {
+		t.Fatalf("implement_review_skipped entries = %d, want 1", len(skipped))
+	}
+	if !skipped[0].Optional {
+		t.Errorf("skip optional = false, want true (quiet graceful skip)")
+	}
+	if skipped[0].Reason != planreview.ReasonReviewerUnavailable || skipped[0].Provider != "codex" {
+		t.Errorf("skip entry = %+v, want reason reviewer_unavailable provider codex", skipped[0])
+	}
+	if implStage.State == run.StageStateFailed {
+		t.Errorf("optional:true capability skip must not fail the stage; state = %q", implStage.State)
 	}
 }
 

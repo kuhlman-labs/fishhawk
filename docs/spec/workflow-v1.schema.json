@@ -787,6 +787,11 @@
                   "max"
                 ],
                 "description": "Codex-only reviewer reasoning-effort override (#1493). One rung of the per-reviewer reasoning-effort ladder: deployment default (FISHHAWKD_CODEX_REASONING_EFFORT) < this reasoning_effort. Empty/absent falls back to the deployment default exactly as today; the resolved value is passed to the codex adapter as a `-c model_reasoning_effort=<effort>` CLI override. Ignored by the anthropic and claudecode adapters, which take no reasoning-effort parameter. Additive optional field within workflow-v1.x — accepted at every advertised version."
+              },
+              "optional": {
+                "type": "boolean",
+                "default": false,
+                "description": "Per-reviewer degradation policy (#1495). The spec is authoritative for WHICH reviewers run; the FISHHAWKD_ANTHROPIC_API_KEY / FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER / FISHHAWKD_ENABLE_CODEX_REVIEWER env flags are deployment CAPABILITY gates (is the provider available on this deployment), not policy switches. When this reviewer's provider is unavailable on this deployment, run creation NO LONGER hard-fails on the gap — the run is created and the reviewer degrades at the runtime review loop with a capability-framed *_review_skipped audit (distinct from a genuine reviewer error). false (default) means the deployment SHOULD run this reviewer: an unavailable provider surfaces LOUDLY (ERROR log + capability audit) but still does not block. true means a graceful, quiet advisory-skip when the provider is unavailable. The coarse case of NO reviewer backend configured at all on the deployment is a separate, deployment-wide misconfiguration and still hard-fails run creation irrespective of this flag. Additive optional field within workflow-v1.x — accepted at every advertised version."
               }
             }
           }

@@ -1280,6 +1280,64 @@ workflows:
 	}
 }
 
+func TestParse_Reviewers_AgentsList_Optional_RoundTrip(t *testing.T) {
+	// #1495: a workflow-v1 reviewers.agents entry carrying optional parses
+	// into AgentReviewer.Optional and survives a re-marshal; an absent optional
+	// defaults to false (the deployment SHOULD run it — loud degradation). The
+	// field is additive within workflow-v1.x; pinned at version "1.0".
+	yml := []byte(`
+version: "1.0"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agents:
+            - provider: codex
+              optional: true
+            - provider: anthropic
+          human: 1
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	rv := s.Workflows["trivial"].Stages[0].Reviewers
+	if rv == nil || len(rv.Agents) != 2 {
+		t.Fatalf("Reviewers.Agents = %+v, want 2 entries", rv)
+	}
+	if rv.Agents[0].Provider != "codex" || !rv.Agents[0].Optional {
+		t.Errorf("Agents[0] = %+v, want {codex optional=true}", rv.Agents[0])
+	}
+	// An absent optional defaults to false (the done-means: default-false is
+	// honored, not merely accepted).
+	if rv.Agents[1].Optional {
+		t.Errorf("Agents[1].Optional = true, want false (absent → default false)")
+	}
+
+	// Re-marshal preserves optional:true; omitempty keeps the absent one absent.
+	out, err := yaml.Marshal(rv.Agents[0])
+	if err != nil {
+		t.Fatalf("re-marshal: %v", err)
+	}
+	if !strings.Contains(string(out), "optional: true") {
+		t.Errorf("re-marshalled agent = %q, want it to preserve optional: true", out)
+	}
+	absent, err := yaml.Marshal(rv.Agents[1])
+	if err != nil {
+		t.Fatalf("re-marshal absent: %v", err)
+	}
+	if strings.Contains(string(absent), "optional") {
+		t.Errorf("re-marshalled agent with default optional = %q, want optional omitted", absent)
+	}
+}
+
 func TestParse_Reviewers_AgentsList_ReasoningEffort_InvalidEnum_Rejected(t *testing.T) {
 	// #1493: the schema enum (low|medium|high|xhigh|max) is the sole guard
 	// before the value reaches the codex CLI as -c model_reasoning_effort, so

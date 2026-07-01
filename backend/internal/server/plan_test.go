@@ -2233,6 +2233,49 @@ workflows:
 `, human)
 }
 
+// specHeterogeneousPlanReviewersV1Optional builds a workflow-v1 plan-stage
+// spec (version 1.0) declaring anthropic + codex reviewers where codex carries
+// the given optional flag (#1495 — the optional field is workflow-v1-only).
+func specHeterogeneousPlanReviewersV1Optional(human int, codexOptional bool) []byte {
+	return fmt.Appendf(nil, `version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+              model: claude-opus-4-8
+            - provider: codex
+              model: gpt-5.5
+              optional: %t
+          human: %d
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`, codexOptional, human)
+}
+
+// collectPlanReviewSkipped decodes every plan_review_skipped entry.
+func collectPlanReviewSkipped(t *testing.T, au *auditFake) []planreview.ReviewSkippedPayload {
+	t.Helper()
+	var out []planreview.ReviewSkippedPayload
+	for _, e := range au.appended {
+		if e.Category != "plan_review_skipped" {
+			continue
+		}
+		var p planreview.ReviewSkippedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode plan_review_skipped payload: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
 // newPlanServerWithReviewerSet mirrors newPlanServerWithReviewer for tests
 // that need full ReviewerSet control (heterogeneous providers, unresolvable
 // providers). logger may be nil (Config defaults it).
@@ -2510,12 +2553,14 @@ func (s *syncWriter) String() string {
 	return s.w.String()
 }
 
-// TestShipPlan_ReviewAgents_Heterogeneous_UnresolvableProvider_Advisory
-// pins the #955 degradation path: in advisory mode, an agents-list entry
-// whose provider is not configured emits a plan_review_failed entry with
-// the resolve error, the loop continues to the resolvable reviewer, and
-// the stage is never failed.
-func TestShipPlan_ReviewAgents_Heterogeneous_UnresolvableProvider_Advisory(t *testing.T) {
+// TestShipPlan_ReviewAgents_Heterogeneous_UnavailableProvider_Advisory_SkippedLoud
+// pins the #1495 capability-gate reframe of the runtime degradation path
+// (was #955's *_review_failed): in advisory mode, an agents-list entry whose
+// provider is unavailable on this deployment emits a capability-framed
+// plan_review_skipped entry (reason reviewer_unavailable, provider codex,
+// optional=false → loud) — NOT a plan_review_failed — the loop continues to the
+// resolvable reviewer, and the stage is never failed.
+func TestShipPlan_ReviewAgents_Heterogeneous_UnavailableProvider_Advisory_SkippedLoud(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	anthropicFake := &fakePlanReviewer{
 		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
@@ -2538,42 +2583,39 @@ func TestShipPlan_ReviewAgents_Heterogeneous_UnresolvableProvider_Advisory(t *te
 	if reviewed := collectPlanReviewed(t, au); len(reviewed) != 1 {
 		t.Fatalf("plan_reviewed entries = %d, want 1 (the resolvable anthropic reviewer)", len(reviewed))
 	}
-	var failedEntries []planreview.ReviewFailedPayload
 	for _, e := range au.appended {
-		if e.Category != "plan_review_failed" {
-			continue
+		if e.Category == "plan_review_failed" {
+			t.Errorf("capability gap must emit plan_review_skipped, NOT plan_review_failed")
 		}
-		var p planreview.ReviewFailedPayload
-		if err := json.Unmarshal(e.Payload, &p); err != nil {
-			t.Fatalf("decode plan_review_failed payload: %v", err)
-		}
-		failedEntries = append(failedEntries, p)
 	}
-	if len(failedEntries) != 1 {
-		t.Fatalf("plan_review_failed entries = %d, want 1 (the unresolvable codex reviewer)", len(failedEntries))
+	skipped := collectPlanReviewSkipped(t, au)
+	if len(skipped) != 1 {
+		t.Fatalf("plan_review_skipped entries = %d, want 1 (the unavailable codex reviewer)", len(skipped))
 	}
-	if !strings.Contains(failedEntries[0].Reason, "not configured") {
-		t.Errorf("failed reason = %q, want the resolve error", failedEntries[0].Reason)
+	if skipped[0].Reason != planreview.ReasonReviewerUnavailable {
+		t.Errorf("skip reason = %q, want %q", skipped[0].Reason, planreview.ReasonReviewerUnavailable)
 	}
-	if failedEntries[0].Timeout {
-		t.Error("resolve failure must not set the timeout discriminator")
+	if skipped[0].Provider != "codex" || skipped[0].Optional {
+		t.Errorf("skip entry = provider %q optional %v, want codex / false (loud)", skipped[0].Provider, skipped[0].Optional)
+	}
+	if skipped[0].Authority != planreview.AuthorityAdvisory {
+		t.Errorf("skip authority = %q, want advisory", skipped[0].Authority)
 	}
 
 	for _, call := range rr.transitionStageCalls {
 		if call.StageID == stageID && call.To == run.StageStateFailed {
-			t.Errorf("advisory resolve failure must not fail the stage")
+			t.Errorf("advisory capability skip must not fail the stage")
 		}
 	}
 }
 
-// TestShipPlan_ReviewAgents_Heterogeneous_UnresolvableProvider_Gating is the
-// gating analog of the advisory degradation test: when one of two declared
-// gating reviewers cannot be resolved (config drift on an in-flight run — the
-// runs.go dispatch pre-check blocks fresh gating runs from entering this
-// state), the resolve failure emits exactly one plan_review_failed entry,
-// leaves hasRejection untouched, and the resolvable reviewer's approve
-// verdict still governs: the stage advances rather than failing.
-func TestShipPlan_ReviewAgents_Heterogeneous_UnresolvableProvider_Gating(t *testing.T) {
+// TestShipPlan_ReviewAgents_Heterogeneous_UnavailableProvider_Gating_SkippedLoud
+// is the gating analog: an unavailable declared gating reviewer (config drift on
+// an in-flight run — the runs.go pre-check blocks fresh gating runs) emits
+// exactly one capability-framed plan_review_skipped entry (optional=false, loud),
+// leaves hasRejection untouched, and the resolvable reviewer's approve verdict
+// still governs: the stage advances rather than failing.
+func TestShipPlan_ReviewAgents_Heterogeneous_UnavailableProvider_Gating_SkippedLoud(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	anthropicFake := &fakePlanReviewer{
 		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
@@ -2600,32 +2642,69 @@ func TestShipPlan_ReviewAgents_Heterogeneous_UnresolvableProvider_Gating(t *test
 			reviewed[0].ReviewerModel, reviewed[0].Authority)
 	}
 
-	var failedEntries []planreview.ReviewFailedPayload
 	for _, e := range au.appended {
-		if e.Category != "plan_review_failed" {
-			continue
+		if e.Category == "plan_review_failed" {
+			t.Errorf("capability gap must emit plan_review_skipped, NOT plan_review_failed")
 		}
-		var p planreview.ReviewFailedPayload
-		if err := json.Unmarshal(e.Payload, &p); err != nil {
-			t.Fatalf("decode plan_review_failed payload: %v", err)
-		}
-		failedEntries = append(failedEntries, p)
 	}
-	if len(failedEntries) != 1 {
-		t.Fatalf("plan_review_failed entries = %d, want 1 (the unresolvable codex reviewer)", len(failedEntries))
+	skipped := collectPlanReviewSkipped(t, au)
+	if len(skipped) != 1 {
+		t.Fatalf("plan_review_skipped entries = %d, want 1 (the unavailable codex reviewer)", len(skipped))
 	}
-	if !strings.Contains(failedEntries[0].Reason, "not configured") {
-		t.Errorf("failed reason = %q, want the resolve error", failedEntries[0].Reason)
+	if skipped[0].Reason != planreview.ReasonReviewerUnavailable || skipped[0].Provider != "codex" {
+		t.Errorf("skip entry = %+v, want reason reviewer_unavailable provider codex", skipped[0])
 	}
-	if failedEntries[0].Authority != planreview.AuthorityGating {
-		t.Errorf("failed authority = %q, want gating", failedEntries[0].Authority)
+	if skipped[0].Optional {
+		t.Errorf("skip optional = true, want false (loud, default)")
+	}
+	if skipped[0].Authority != planreview.AuthorityGating {
+		t.Errorf("skip authority = %q, want gating", skipped[0].Authority)
 	}
 
-	// A resolve failure must not count as a rejection: with the resolvable
+	// A capability skip must not count as a rejection: with the resolvable
 	// reviewer approving, the gating stage must never transition to failed.
 	for _, call := range rr.transitionStageCalls {
 		if call.StageID == stageID && call.To == run.StageStateFailed {
-			t.Errorf("gating resolve failure must not fail the stage when the resolvable reviewer approves")
+			t.Errorf("gating capability skip must not fail the stage when the resolvable reviewer approves")
+		}
+	}
+}
+
+// TestShipPlan_ReviewAgents_Heterogeneous_UnavailableProvider_Gating_OptionalTrue_SkippedQuiet
+// is the optional:true half of the #1495 runtime degradation: an unavailable
+// codex marked optional:true emits a plan_review_skipped entry carrying
+// optional=true (the quiet graceful-skip branch), still terminal, still no
+// stage failure. Uses a workflow-v1 spec (the optional field is v1-only).
+func TestShipPlan_ReviewAgents_Heterogeneous_UnavailableProvider_Gating_OptionalTrue_SkippedQuiet(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	anthropicFake := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-8",
+	}
+	set := fakeReviewerSet{providers: map[string]PlanReviewer{
+		"anthropic": anthropicFake,
+	}, def: anthropicFake}
+	s, sf, _, au, rr := newPlanServerWithReviewerSet(t, runID, stageID, set, specHeterogeneousPlanReviewersV1Optional(0, true), nil)
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, validPlanBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	skipped := collectPlanReviewSkipped(t, au)
+	if len(skipped) != 1 {
+		t.Fatalf("plan_review_skipped entries = %d, want 1", len(skipped))
+	}
+	if !skipped[0].Optional {
+		t.Errorf("skip optional = false, want true (quiet graceful skip)")
+	}
+	if skipped[0].Reason != planreview.ReasonReviewerUnavailable || skipped[0].Provider != "codex" {
+		t.Errorf("skip entry = %+v, want reason reviewer_unavailable provider codex", skipped[0])
+	}
+	for _, call := range rr.transitionStageCalls {
+		if call.StageID == stageID && call.To == run.StageStateFailed {
+			t.Errorf("optional:true capability skip must not fail the stage")
 		}
 	}
 }

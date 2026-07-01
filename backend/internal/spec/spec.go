@@ -463,6 +463,20 @@ type AgentReviewer struct {
 	// enum (low|medium|high|xhigh|max) is the sole guard before the value
 	// reaches the codex CLI as -c model_reasoning_effort=<effort>.
 	ReasoningEffort string `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
+	// Optional is the per-reviewer degradation policy (#1495). It frames the
+	// FISHHAWKD_ENABLE_* / FISHHAWKD_ANTHROPIC_API_KEY env flags as deployment
+	// CAPABILITY gates (is this provider available here) rather than policy
+	// switches — the spec is authoritative for WHICH reviewers run. When this
+	// reviewer's provider is unavailable on the deployment, run creation does
+	// NOT hard-fail; the reviewer degrades at the runtime review loop with a
+	// capability-framed *_review_skipped audit. false (default) means the
+	// deployment SHOULD run it — an unavailable provider surfaces LOUDLY (ERROR
+	// log + capability audit) but still does not block; true means a quiet,
+	// graceful advisory-skip. The coarser case of NO reviewer backend wired at
+	// all is a deployment-wide misconfiguration that still hard-fails run
+	// creation irrespective of this flag (the run-create coarse gate, symmetric
+	// with the webhook dispatcher's !PlanReviewerConfigured hard-fail).
+	Optional bool `json:"optional,omitempty" yaml:"optional,omitempty"`
 }
 
 // AgentCount returns the effective number of agent reviewers: len(Agents)

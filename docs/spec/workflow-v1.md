@@ -85,7 +85,7 @@ See [ADR-038 (#925)](https://github.com/kuhlman-labs/fishhawk/issues/925) for th
 
 ## Reviewer policy (v1)
 
-The inherited `reviewers.agents[]` heterogeneous reviewer list (#955) gains one **additive optional** field in v1.x: `reasoning_effort` (#1493). It is a **codex-only** per-reviewer knob — the anthropic and claudecode adapters take no reasoning-effort parameter and ignore it.
+The inherited `reviewers.agents[]` heterogeneous reviewer list (#955) gains **additive optional** per-reviewer fields in v1.x: `reasoning_effort` (#1493) and `optional` (#1495). `reasoning_effort` is a **codex-only** knob — the anthropic and claudecode adapters take no reasoning-effort parameter and ignore it; `optional` is the per-reviewer capability-gap degradation policy (see below). The `reviewers` block itself also gains `review_timeout` (#1494).
 
 ```yaml
 version: "1.0"
@@ -159,6 +159,36 @@ deployment default (FISHHAWKD_PLAN_REVIEW_TIMEOUT)  <  reviewers.review_timeout
 - Only the **Floor** rung is per-stage; the size-aware `PerKB` and `Cap` rungs (`FISHHAWKD_REVIEW_BUDGET_PER_KB` / `FISHHAWKD_REVIEW_BUDGET_CAP`) stay deployment-level.
 
 The schema `pattern` (`^([0-9]+(ns|us|ms|s|m|h))+$`) is the guard at spec validation; the value is resolved by `spec.ResolveReviewTimeout`, mirroring `spec.ResolveStageTimeout`'s spec-wins precedence.
+
+### `reviewers.agents[i].optional` (#1495)
+
+Each `reviewers.agents[]` entry gains a third **additive optional** field in v1.x: `optional` (boolean, default `false`). It makes the **spec authoritative** for *which* reviewers run and reframes the deployment env flags (`FISHHAWKD_ANTHROPIC_API_KEY` / `FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER` / `FISHHAWKD_ENABLE_CODEX_REVIEWER`) as **capability gates** — "is this provider available on this deployment" — rather than policy switches that silently override the spec.
+
+```yaml
+        reviewers:
+          agents:
+            - provider: anthropic
+              model: claude-opus-4-8
+            - provider: codex
+              optional: true # unavailable codex degrades QUIETLY; run still proceeds
+          human: 0
+```
+
+`optional` is the **per-reviewer degradation policy** for the case where a spec-declared reviewer's provider is **unavailable on this deployment** (its capability gate is off):
+
+- `optional: false` (default) — the deployment **should** run this reviewer. An unavailable provider surfaces **loudly** (an `ERROR` log naming the env knob + a capability audit) but **does not block**.
+- `optional: true` — a **quiet, graceful advisory-skip** when the provider is unavailable.
+
+Either way run creation **no longer hard-fails** on the capability gap: the spec is valid, only the deployment capability is missing. The gap is recorded as a `reviewer_capability_unavailable` audit at run-create time and, when the review loop runs, as a capability-framed `*_review_skipped` audit (reason `reviewer_unavailable`, carrying `provider` + `optional`) — deliberately **distinct** from a genuine reviewer error (`*_review_failed`), because the reviewer never ran.
+
+**Before / after gating behavior:**
+
+| Deployment state (gating plan stage, `human: 0`) | Before #1495 | After #1495 |
+|---|---|---|
+| Spec-declared reviewer's provider unavailable, another backend **is** wired | run creation **rejected** (400, `plan_reviewer_unconfigured`) | run **created**; capability audit + `*_review_skipped`, honoring `optional` (loud/quiet); gate not blocked |
+| **No** reviewer backend wired at all | run creation rejected (400) | **still rejected** (400) — a deployment-wide misconfiguration, distinct from a per-reviewer gap, `optional` does not apply |
+
+The **coarse** "no reviewer backend wired at all" case remains a hard-fail on **both** run-create paths — the API create-run path (`handleCreateRun`) and the webhook dispatcher (`!PlanReviewerConfigured`) — so they stay symmetric. Only the finer per-reviewer capability gap degrades.
 
 ## Version routing
 

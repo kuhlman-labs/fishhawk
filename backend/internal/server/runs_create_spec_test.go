@@ -298,11 +298,15 @@ workflows:
             schema: standard_v1
 `
 
-// TestCreateRun_GatingReview_NilReviewer_Rejected verifies the #574
-// guard: a workflow declaring agent-gated plan review while the server
-// has no PlanReviewer wired is rejected with 400 +
-// plan_reviewer_unconfigured, a run_rejected_misconfigured global-chain
-// audit entry is written, and no run row is created.
+// TestCreateRun_GatingReview_NilReviewer_Rejected verifies the COARSE
+// no-backend capability gate is RETAINED under #1495 (option b): a bare-count
+// gating plan stage on a deployment with NO reviewer backend wired at all is
+// still rejected with 400 + plan_reviewer_unconfigured + a
+// run_rejected_misconfigured global-chain entry, and no run row is created.
+// This is a deployment-wide misconfiguration (zero review infrastructure),
+// distinct from the per-reviewer capability gap #1495 degrades — and it stays
+// symmetric with the webhook dispatcher's coarse !PlanReviewerConfigured
+// hard-fail, so both run-create paths reject the no-backend case identically.
 func TestCreateRun_GatingReview_NilReviewer_Rejected(t *testing.T) {
 	repo := newFakeRepo()
 	au := newAuditFake()
@@ -396,12 +400,79 @@ workflows:
             schema: standard_v1
 `
 
-// TestCreateRun_GatingReview_AgentsList_UnresolvableProvider_Rejected
-// verifies the #955 extension of the #574 fail-fast: a gating agents list
-// naming a provider the wired ReviewerSet cannot resolve is rejected at
-// create time with 400 + plan_reviewer_unconfigured naming the provider,
-// and a run_rejected_misconfigured global-chain entry is written.
-func TestCreateRun_GatingReview_AgentsList_UnresolvableProvider_Rejected(t *testing.T) {
+// heterogeneousGatingOptionalTrueSpecYAML carries a gating plan stage whose
+// codex reviewer is optional:true — an unavailable codex must degrade
+// QUIETLY at create time (workflow-v1; the optional field is v1-only).
+const heterogeneousGatingOptionalTrueSpecYAML = `version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+              model: claude-opus-4-8
+            - provider: codex
+              optional: true
+          human: 0
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`
+
+// heterogeneousGatingOptionalFalseSpecYAML carries a gating plan stage whose
+// codex reviewer is optional:false (explicit) — an unavailable codex must
+// degrade LOUDLY but still proceed (workflow-v1).
+const heterogeneousGatingOptionalFalseSpecYAML = `version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+              model: claude-opus-4-8
+            - provider: codex
+              optional: false
+          human: 0
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`
+
+// capabilityUnavailableEntries returns the reviewer_capability_unavailable
+// global-chain audit payloads written during a run-create (#1495).
+func capabilityUnavailableEntries(t *testing.T, au *auditFake) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, e := range au.globalAppended {
+		if e.Category != "reviewer_capability_unavailable" {
+			continue
+		}
+		var p map[string]any
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode reviewer_capability_unavailable payload: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// TestCreateRun_GatingReview_AgentsList_UnavailableProvider_OptionalFalse_ProceedsLoud
+// pins the #1495 capability-gate reframe (inverts the old #955/#574 fail-fast):
+// a gating agents list naming a provider the wired ReviewerSet cannot resolve
+// NO LONGER hard-fails run creation. A backend IS wired (anthropic), so the
+// coarse no-backend gate does not fire; the unavailable codex is optional:false,
+// so the run is created (201) and a loud reviewer_capability_unavailable
+// capability audit records the gap with optional=false — not silently passed,
+// and NOT a run_rejected_misconfigured rejection.
+func TestCreateRun_GatingReview_AgentsList_UnavailableProvider_OptionalFalse_ProceedsLoud(t *testing.T) {
 	repo := newFakeRepo()
 	au := newAuditFake()
 	// Only anthropic is configured; the spec also names codex.
@@ -414,33 +485,74 @@ func TestCreateRun_GatingReview_AgentsList_UnresolvableProvider_Rejected(t *test
 		"workflow_id":    "feature_change",
 		"workflow_sha":   "abc",
 		"trigger_source": "cli",
-		"workflow_spec":  heterogeneousGatingSpecYAML,
+		"workflow_spec":  heterogeneousGatingOptionalFalseSpecYAML,
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	s.handleCreateRun(w, withAuth(req))
 
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (capability gap no longer hard-fails):\n%s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), `"plan_reviewer_unconfigured"`) {
-		t.Errorf("body missing plan_reviewer_unconfigured code: %s", w.Body.String())
+	if len(repo.runs) != 1 {
+		t.Fatalf("expected exactly one run created, got %d", len(repo.runs))
 	}
-	if !strings.Contains(w.Body.String(), `codex`) {
-		t.Errorf("error must name the unresolvable provider: %s", w.Body.String())
-	}
-	if len(repo.runs) != 0 {
-		t.Errorf("expected zero runs created, got %d", len(repo.runs))
-	}
-	var found bool
 	for _, e := range au.globalAppended {
 		if e.Category == "run_rejected_misconfigured" {
-			found = true
+			t.Errorf("capability gap must NOT emit run_rejected_misconfigured (it degrades, not rejects)")
 		}
 	}
-	if !found {
-		t.Errorf("no run_rejected_misconfigured global-chain audit entry written: %#v", au.globalAppended)
+	caps := capabilityUnavailableEntries(t, au)
+	if len(caps) != 1 {
+		t.Fatalf("reviewer_capability_unavailable entries = %d, want 1 (the unavailable codex)", len(caps))
+	}
+	if caps[0]["provider"] != "codex" {
+		t.Errorf("capability audit provider = %v, want codex", caps[0]["provider"])
+	}
+	if caps[0]["optional"] != false {
+		t.Errorf("capability audit optional = %v, want false (loud)", caps[0]["optional"])
+	}
+	if caps[0]["reason"] != "reviewer_unavailable" {
+		t.Errorf("capability audit reason = %v, want reviewer_unavailable", caps[0]["reason"])
+	}
+}
+
+// TestCreateRun_GatingReview_AgentsList_UnavailableProvider_OptionalTrue_Proceeds
+// is the graceful-skip half of the #1495 reframe: an unavailable codex marked
+// optional:true proceeds (201) with a QUIET reviewer_capability_unavailable
+// audit carrying optional=true, and no rejection.
+func TestCreateRun_GatingReview_AgentsList_UnavailableProvider_OptionalTrue_Proceeds(t *testing.T) {
+	repo := newFakeRepo()
+	au := newAuditFake()
+	def := &fakePlanReviewer{model: "claude-opus-4-8"}
+	set := fakeReviewerSet{def: def, providers: map[string]PlanReviewer{"anthropic": def}}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au, PlanReviewers: set})
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"workflow_spec":  heterogeneousGatingOptionalTrueSpecYAML,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (optional:true graceful skip):\n%s", w.Code, w.Body.String())
+	}
+	if len(repo.runs) != 1 {
+		t.Fatalf("expected exactly one run created, got %d", len(repo.runs))
+	}
+	caps := capabilityUnavailableEntries(t, au)
+	if len(caps) != 1 {
+		t.Fatalf("reviewer_capability_unavailable entries = %d, want 1", len(caps))
+	}
+	if caps[0]["provider"] != "codex" || caps[0]["optional"] != true {
+		t.Errorf("capability audit = %v, want provider codex optional true", caps[0])
 	}
 }
 
