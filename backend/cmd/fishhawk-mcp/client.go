@@ -325,6 +325,78 @@ func (c *apiClient) GetRunCost(ctx context.Context, runID uuid.UUID) (*RunCost, 
 	return &rc, nil
 }
 
+// OnboardingReadinessReport mirrors the backend's GET
+// /v0/onboarding/readiness body
+// (`backend/internal/server/onboarding.go::onboardingReadinessResponse`, E29.4 /
+// #1511): the four server-side-only readiness checks a repo's first run needs —
+// GitHub App installation, the committed workflow spec's parse/validate state,
+// per-reviewer availability on this deployment, and the caller token's scope
+// adequacy. Repeated here rather than imported because the MCP server's
+// apiClient is a thin local copy (the import direction is `cli → backend`, not
+// the reverse). Every field is a scalar/string/slice — no UUID/raw-JSON field,
+// so the #371 reflection trap does not apply. MUST stay byte-identical with the
+// backend response's json tags.
+type OnboardingReadinessReport struct {
+	Repo      string               `json:"repo" jsonschema:"the target repo as owner/name that was probed"`
+	App       OnboardingApp        `json:"app" jsonschema:"GitHub App installation readiness"`
+	Spec      OnboardingSpec       `json:"spec" jsonschema:"committed workflow spec fetch/parse/validate readiness"`
+	Reviewers []OnboardingReviewer `json:"reviewers" jsonschema:"per spec-declared reviewer availability on this deployment; empty when the spec is unavailable or invalid"`
+	Scopes    OnboardingScopes     `json:"scopes" jsonschema:"caller-token run-driving scope adequacy"`
+}
+
+// OnboardingApp mirrors the backend appInstallReadiness sub-object: whether the
+// GitHub App is installed on the target repo, with reason set when it is not.
+type OnboardingApp struct {
+	Installed      bool   `json:"installed" jsonschema:"true when the GitHub App is installed on the target repo"`
+	InstallationID int64  `json:"installation_id,omitempty" jsonschema:"the resolved installation id when installed"`
+	Reason         string `json:"reason,omitempty" jsonschema:"why the app is not installed / could not be resolved"`
+}
+
+// OnboardingSpec mirrors the backend specReadiness sub-object: the committed
+// workflow spec's fetch + parse + validate state. Valid is only meaningful when
+// Source == "fetched".
+type OnboardingSpec struct {
+	Source string `json:"source" jsonschema:"'fetched' when the spec was read from the repo, else 'unavailable'"`
+	Valid  bool   `json:"valid" jsonschema:"true when the fetched spec parsed and validated; meaningful only when source is 'fetched'"`
+	Error  string `json:"error,omitempty" jsonschema:"the parse or validation failure when the spec is invalid"`
+	Note   string `json:"note,omitempty" jsonschema:"why the spec is unavailable (app not installed, spec not found, fetch error)"`
+}
+
+// OnboardingReviewer mirrors the backend reviewerReadiness sub-object: one
+// spec-declared reviewer's availability on this deployment, with the adapter's
+// missing-env-var hint when the provider cannot be resolved.
+type OnboardingReviewer struct {
+	Provider        string `json:"provider" jsonschema:"the reviewer provider (e.g. claudecode, codex)"`
+	Model           string `json:"model,omitempty" jsonschema:"the reviewer model"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty" jsonschema:"the reviewer reasoning-effort tier when set"`
+	Available       bool   `json:"available" jsonschema:"true when this reviewer can be resolved on this deployment"`
+	MissingHint     string `json:"missing_hint,omitempty" jsonschema:"the adapter's missing-env-var hint when the provider is unavailable"`
+}
+
+// OnboardingScopes mirrors the backend scopeReadiness sub-object: whether the
+// caller token holds the run-driving scope subset, listing any missing scopes.
+type OnboardingScopes struct {
+	Adequate bool     `json:"adequate" jsonschema:"true when the caller token holds every run-driving scope"`
+	Required []string `json:"required" jsonschema:"the run-driving scope subset the check requires"`
+	Missing  []string `json:"missing" jsonschema:"the required scopes the caller lacks; empty when adequate"`
+	Note     string   `json:"note,omitempty" jsonschema:"context, e.g. a cookie-session caller bypasses scope enforcement"`
+}
+
+// OnboardingReadiness fetches a repo's first-run readiness report via
+// `GET /v0/onboarding/readiness?repo=owner/name` (E29.4 / #1511). The endpoint
+// gates on AUTHENTICATION only (401 for anonymous) — scope adequacy is itself a
+// reported field, not a gate — so a token with a run-driving scope gap still
+// gets a 200 report naming its gap. 4xx surfaces as *apiError; the tool layer
+// maps authentication_required (401) and validation_failed (400, malformed
+// repo) onto clean tool errors.
+func (c *apiClient) OnboardingReadiness(ctx context.Context, repo string) (*OnboardingReadinessReport, error) {
+	var out OnboardingReadinessReport
+	if err := c.do(ctx, http.MethodGet, "/v0/onboarding/readiness?repo="+url.QueryEscape(repo), nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // createRunRequest mirrors the backend's `POST /v0/runs` request body
 // (`backend/internal/server/runs.go::createRunRequest`). Repeated here
 // rather than imported because the MCP server's apiClient is
