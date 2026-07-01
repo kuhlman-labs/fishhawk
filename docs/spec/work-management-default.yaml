@@ -131,3 +131,23 @@ types:
       # established [ADR-NNN] series ([ADR-041], not [ADR-41]) (#1148).
       pad: 3
     epic_link: none
+
+  epic:
+    title_format: "[E{number}] {summary}"
+    body_skeleton:
+      - Summary
+      - Scope
+      - Notes
+    default_labels:
+      - epic
+    default_fields:
+      status: Backlog
+      complexity: high
+    numbering:
+      scheme: sequential
+      prefix: E
+      # No zero-pad: epic titles are the bare [E29], not [E029]. The anchored
+      # discovery regexp built from title_format demands "] " immediately after
+      # the captured {number}, so a child title [E29.1] never matches (#1508).
+      pad: 0
+    epic_link: none

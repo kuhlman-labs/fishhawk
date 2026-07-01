@@ -19,7 +19,7 @@ This is a **new canonical artifact**, NOT a block inside `.fishhawk/workflows.ya
 | `complexity_levels` | no | object: `low`/`medium`/`high` → prose | The complexity prior: concrete file/coupling definitions for each level. Optional in a repo config; shipped in the default. |
 | `required_fields` | yes | non-empty unique string list | Fields every filed item must carry. Must include the mandatory trio Summary, Done-means, complexity (semantic check). |
 | `field_hints` | no | object: field name → prose | Per-field authoring hints. The Done-means hint states the condition must be testable. |
-| `types` | yes | object: type name → type config | Work-item types, keyed by snake_case name (bug, feature, chore, adr, …). |
+| `types` | yes | object: type name → type config | Work-item types, keyed by snake_case name (bug, feature, chore, adr, epic, …). |
 | `states` | no | object: canonical state → provider option | Canonical board-state map for run-lifecycle transitions (#1012). Keys from the closed set `backlog`/`in_progress`/`in_review`/`blocked`/`done`; values are provider option strings. |
 | `transitions` | no | object: lifecycle event → canonical state | Run-lifecycle-event → canonical-state map (#1012). Keys from the closed set `run_started`/`pr_opened`/`run_failed`/`run_merged`; each value must be a key declared in `states` (semantic check). |
 | `product_feedback` | no | object `{enabled: boolean}` | Per-repo kill-switch for upstream product-feedback egress (ADR-029, #1006). Absent means enabled (the default). `enabled: false` → `POST /v0/runs/{id}/product-reports` returns 403 `product_feedback_disabled` and files nothing. Set it as the object form (`product_feedback:` / `  enabled: false`), **not** a bare string. |
@@ -32,7 +32,7 @@ This is a **new canonical artifact**, NOT a block inside `.fishhawk/workflows.ya
 | `body_skeleton` | yes | non-empty string list | Ordered body section headings. Dual-audience: Feature = Summary/Proposal/Done-means/Notes/Relations; Bug = Summary/Observed/Proposal/Done-means/Notes/Relations; ADR = Context/Options/Recommendation/Decision/Consequences; Chore = Summary/Done-means. |
 | `default_labels` | no | unique label list | Labels applied before caller-supplied labels are merged. Each label is a bare token (`epic`, `adr`) or namespaced (`area:backend`, `type:feature`). |
 | `default_fields` | no | object | `status` (single-select Status value), `board_column`, and `complexity` (low/medium/high). |
-| `numbering` | conditional | object | `scheme` (`sequential`) + optional `prefix` + optional `pad` (zero-pad width for the rendered `{number}`, bounded 0..12; e.g. `3` → `041`, `0`/absent → no padding). Required when the type is `adr` (semantic check). |
+| `numbering` | conditional | object | `scheme` (`sequential`) + optional `prefix` + optional `pad` (zero-pad width for the rendered `{number}`, bounded 0..12; e.g. `3` → `041`, `0`/absent → no padding). Required when the type is `adr` (semantic check). The shipped default declares a second numbered type, `epic` (prefix `E`, `pad: 0` → the bare `[E29]`, not `[E029]`); its next number is discovered from existing `[E{number}]` titles, and the anchored discovery regexp skips child titles like `[E29.1]` because it demands `] ` immediately after the captured number. |
 | `epic_link` | no | enum `required` \| `optional` \| `none` | Whether items of this type link to a parent epic. |
 
 Every object level is `additionalProperties: false` — the surface is closed; new sections are additive schema changes within v0.

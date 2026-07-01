@@ -144,6 +144,49 @@ func TestApply_ADRSeedZeroYieldsOne(t *testing.T) {
 	}
 }
 
+// TestApply_EpicRendersUnpaddedNumberAndAllocatesNext is the #1508 done-means:
+// filing an epic through the SHIPPED Default() conventions must be ACCEPTED —
+// the exact previously-reported "unknown work-item type: epic" rejection is
+// gone — and render the unpadded [E29] title (numbering.pad: 0, contrasting the
+// adr pad:3 [ADR-041] case) with allocateNumber returning max+1 (28 → 29). The
+// explicit no-error assertion is the direct regression for the reported bug, at
+// the Apply layer where type acceptance is decided.
+func TestApply_EpicRendersUnpaddedNumberAndAllocatesNext(t *testing.T) {
+	conv := testConventions(t)
+	existing := make([]int, 0, 28)
+	for n := 1; n <= 28; n++ {
+		existing = append(existing, n)
+	}
+	item, num, err := Apply(FilingRequest{
+		Type:            "epic",
+		Summary:         "onboarding epic",
+		Body:            "## Summary\n\n…\n",
+		ExistingNumbers: existing,
+	}, conv)
+	// The reported bug was Apply rejecting type "epic" with "unknown
+	// work-item type: epic"; assert acceptance explicitly, not merely the
+	// rendered title.
+	if err != nil {
+		t.Fatalf("Apply(epic) = %v, want no error (epic is now a known type, #1508)", err)
+	}
+	if num != 29 {
+		t.Errorf("next epic number = %d, want 29 (allocateNumber max+1)", num)
+	}
+	// pad 0 → no zero-padding: the bare [E29], not [E029].
+	if want := "[E29] onboarding epic"; item.Title != want {
+		t.Errorf("title = %q, want %q", item.Title, want)
+	}
+	if got := strings.Join(item.Classification.Labels, ","); got != "epic" {
+		t.Errorf("labels = %q, want epic", got)
+	}
+	if item.BoardPlacement.Status != "Backlog" {
+		t.Errorf("status = %q, want Backlog", item.BoardPlacement.Status)
+	}
+	if item.Classification.Complexity != "high" {
+		t.Errorf("complexity = %q, want high (epic type default)", item.Classification.Complexity)
+	}
+}
+
 func TestApply_ChoreAssemblesBodyFromSkeleton(t *testing.T) {
 	conv := testConventions(t)
 	item, _, err := Apply(FilingRequest{
@@ -207,7 +250,8 @@ func TestApply_DependsOnMalformedRejected(t *testing.T) {
 
 func TestApply_UnknownTypeFailsClosed(t *testing.T) {
 	conv := testConventions(t)
-	_, _, err := Apply(FilingRequest{Type: "epic", Summary: "x"}, conv)
+	// "spike" is not a key in the shipped conventions (epic now IS, #1508).
+	_, _, err := Apply(FilingRequest{Type: "spike", Summary: "x"}, conv)
 	var se *SemanticError
 	if !errors.As(err, &se) {
 		t.Fatalf("want *SemanticError, got %v", err)

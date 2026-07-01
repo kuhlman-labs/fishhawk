@@ -933,6 +933,37 @@ func TestProvider_DiscoverNumbers_SkipsMalformedTitles(t *testing.T) {
 	}
 }
 
+// TestProvider_DiscoverNumbers_EpicSkipsChildTitles is the #1508 load-bearing
+// subtlety: the epic prefix "E" and title_format "[E{number}] {summary}" build
+// an anchored regexp (^\[E(\d+)\] .*?) that requires "] " immediately after the
+// captured number, so parent epic titles [E28]/[E29] parse while child titles
+// [E28.3]/[E29.1] — which the fuzzy in:title "[E" search ALSO surfaces — are
+// skipped by the re-parse. This crosses the title_format→regexp→number-parse
+// seam that the pure apply test does not exercise.
+func TestProvider_DiscoverNumbers_EpicSkipsChildTitles(t *testing.T) {
+	req := workmgmt.DiscoverNumbersRequest{
+		Target:      baseRequest().Target,
+		Prefix:      "E",
+		TitleFormat: "[E{number}] {summary}",
+	}
+	api := &fakeAPI{searchResults: []githubclient.IssueTitleResult{
+		{Number: 100, Title: "[E28] an epic"},
+		{Number: 101, Title: "[E29] another epic"},
+		{Number: 102, Title: "[E28.3] a child of E28"},
+		{Number: 103, Title: "[E29.1] a child of E29"},
+	}}
+	got, err := New(api).DiscoverNumbers(context.Background(), req)
+	if err != nil {
+		t.Fatalf("DiscoverNumbers: %v", err)
+	}
+	if len(got) != 2 || got[0] != 28 || got[1] != 29 {
+		t.Errorf("numbers = %v, want [28 29] (child titles skipped)", got)
+	}
+	if !strings.Contains(api.searchQuery, `in:title "[E"`) {
+		t.Errorf("search query = %q, want it to carry the literal [E in:title term", api.searchQuery)
+	}
+}
+
 func TestProvider_DiscoverNumbers_MissingInstallationRejected(t *testing.T) {
 	// Fail closed: a run-absent target leaves InstallationID 0; discovery must
 	// error rather than dispatch an untokened search.

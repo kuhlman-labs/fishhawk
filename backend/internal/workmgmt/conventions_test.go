@@ -36,7 +36,7 @@ func TestDefaultRoundTrip(t *testing.T) {
 		}
 	}
 
-	for _, typ := range []string{"feature", "bug", "chore", "adr"} {
+	for _, typ := range []string{"feature", "bug", "chore", "adr", "epic"} {
 		it, ok := d.Types[typ]
 		if !ok {
 			t.Errorf("types is missing %q", typ)
@@ -64,6 +64,40 @@ func TestDefaultRoundTrip(t *testing.T) {
 	}
 	if d.Types["feature"].EpicLink != "required" {
 		t.Errorf("types.feature.epic_link = %q, want required", d.Types["feature"].EpicLink)
+	}
+
+	// The epic type is the second numbered type (#1508): sequential numbering
+	// with the bare "E" prefix and pad 0 (unpadded [E29], not [E029]), no epic
+	// link, and the `epic` default label. Asserting the SHIPPED default values
+	// (the #1169 done-means gate) — a comment-only/no-op YAML touch fails here.
+	epic := d.Types["epic"]
+	if epic.Numbering == nil {
+		t.Fatal("types.epic.numbering is nil; epic is a numbered type")
+	}
+	if epic.Numbering.Scheme != "sequential" {
+		t.Errorf("types.epic.numbering.scheme = %q, want sequential", epic.Numbering.Scheme)
+	}
+	if epic.Numbering.Prefix != "E" {
+		t.Errorf("types.epic.numbering.prefix = %q, want E", epic.Numbering.Prefix)
+	}
+	// pad 0 → no zero-padding, so titles render [E29] not [E029] (#1508).
+	if epic.Numbering.Pad != 0 {
+		t.Errorf("types.epic.numbering.pad = %d, want 0 (unpadded [E29], #1508)", epic.Numbering.Pad)
+	}
+	if epic.EpicLink != "none" {
+		t.Errorf("types.epic.epic_link = %q, want none", epic.EpicLink)
+	}
+	if len(epic.DefaultLabels) != 1 || epic.DefaultLabels[0] != "epic" {
+		t.Errorf("types.epic.default_labels = %v, want [epic]", epic.DefaultLabels)
+	}
+	// Status=Backlog is load-bearing: a null Status breaks the Project #7
+	// kanban view, so the "conventions-complete" epic must ship it (opus LOW
+	// binding condition). complexity=high is the shipped epic default.
+	if epic.DefaultFields.Status != "Backlog" {
+		t.Errorf("types.epic.default_fields.status = %q, want Backlog", epic.DefaultFields.Status)
+	}
+	if epic.DefaultFields.Complexity != "high" {
+		t.Errorf("types.epic.default_fields.complexity = %q, want high", epic.DefaultFields.Complexity)
 	}
 }
 

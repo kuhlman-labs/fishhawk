@@ -27,7 +27,7 @@ type FileIssueRelations struct {
 // case), mirroring fishhawk_get_active_run's resolver. Everything else is
 // conventions-resolved server-side.
 type FileIssueInput struct {
-	Type            string              `json:"type" jsonschema:"work-item type; must be a key in the repo's conventions (e.g. feature, bug, chore, adr)"`
+	Type            string              `json:"type" jsonschema:"work-item type; must be a key in the repo's conventions (e.g. feature, bug, chore, adr, epic)"`
 	Summary         string              `json:"summary" jsonschema:"mandatory one-liner: fills the {summary} title placeholder and is the required Summary field"`
 	Body            string              `json:"body,omitempty" jsonschema:"verbatim body; when omitted the body is assembled from the type's skeleton plus sections"`
 	Repo            string              `json:"repo,omitempty" jsonschema:"target repo as owner/name; falls back to GITHUB_REPOSITORY env when omitted"`
@@ -37,7 +37,7 @@ type FileIssueInput struct {
 	Complexity      string              `json:"complexity,omitempty" jsonschema:"overrides the type's default complexity; must be a declared level (e.g. low, medium, high)"`
 	Status          string              `json:"status,omitempty" jsonschema:"overrides the type's default board status/column"`
 	Relations       *FileIssueRelations `json:"relations,omitempty" jsonschema:"provider-neutral relations: parent epic, supersedes, companion, evidence runs"`
-	ExistingNumbers []int               `json:"existing_numbers,omitempty" jsonschema:"OPTIONAL for a numbered type (e.g. adr): the backend now discovers the numbers already in use server-side from the tracker, so you do not need to supply them. Pass existing_numbers only to override/hint discovery, or seed existing_numbers:[0] (which yields 1) if discovery is unavailable for the target provider"`
+	ExistingNumbers []int               `json:"existing_numbers,omitempty" jsonschema:"OPTIONAL for a numbered type (e.g. adr, epic): the backend now discovers the numbers already in use server-side from the tracker, so you do not need to supply them. Pass existing_numbers only to override/hint discovery, or seed existing_numbers:[0] (which yields 1) if discovery is unavailable for the target provider"`
 	RunID           string              `json:"run_id,omitempty" jsonschema:"optional in-flight run UUID; when set and non-terminal a work_item_filed audit entry is appended to it. Falls back to FISHHAWK_RUN_ID env when omitted"`
 }
 
@@ -60,7 +60,7 @@ func registerFileIssue(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_file_issue",
 		Description: strings.TrimSpace(`
-Use this when you need to file a work item (issue, bug, chore, ADR) into a
+Use this when you need to file a work item (issue, bug, chore, ADR, epic) into a
 repository's tracker through its work-management conventions — the
 operator-agent follow-up-filing path (ADR-040) and the consistent
 cross-repo/cross-platform filing surface (#1005). It wraps
@@ -84,7 +84,7 @@ type whose title_format is
 relation, so title_vars need only supply {n}; a 422 work_item_invalid lists
 the still-missing placeholders in details.missing_placeholders.
 
-For a numbered type (e.g. adr) existing_numbers is OPTIONAL: the backend now
+For a numbered type (e.g. adr, epic) existing_numbers is OPTIONAL: the backend now
 discovers the numbers already in use server-side from the tracker (searching
 existing numbered titles, open and closed) and allocates the next one, so you
 do not need to scan and pass them. Supply existing_numbers only to
@@ -120,7 +120,7 @@ jira), work_item_filing_failed (502).
 // to the backend (server/workitems.go).
 func (r *runResolver) fileIssue(ctx context.Context, _ *mcp.CallToolRequest, in FileIssueInput) (*mcp.CallToolResult, FileIssueOutput, error) {
 	if strings.TrimSpace(in.Type) == "" {
-		return nil, FileIssueOutput{}, fmt.Errorf("type is required: name the work-item type (a key in the repo's conventions, e.g. feature, bug, chore, adr)")
+		return nil, FileIssueOutput{}, fmt.Errorf("type is required: name the work-item type (a key in the repo's conventions, e.g. feature, bug, chore, adr, epic)")
 	}
 	if strings.TrimSpace(in.Summary) == "" {
 		return nil, FileIssueOutput{}, fmt.Errorf("summary is required: the one-line summary fills the title and is the required Summary field")
