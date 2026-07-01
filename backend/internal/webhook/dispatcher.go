@@ -14,6 +14,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/onboarding"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -115,6 +116,12 @@ const (
 	// `ci_retry_exhausted`. Matching stays pure here; the real I/O
 	// lives in handleCIFailureRetry.
 	MatchActionCIFailureRetry MatchAction = "ci_failure_retry"
+	// MatchActionScaffold tags an installation / installation_repositories
+	// event that added one or more repos to the App (ADR-048 / E29.7). The
+	// handler (handleInstallation) opens a reviewable onboarding scaffold PR
+	// per newly-added repo. Matching stays pure; the Git Data API commit +
+	// PR I/O lives in the onboarding.Scaffolder the handler drives.
+	MatchActionScaffold MatchAction = "scaffold"
 )
 
 // DefaultWorkflowID is the workflow_id (a key under `workflows:`
@@ -185,6 +192,12 @@ type Match struct {
 	// runs.pull_request_url and uses CheckName + Conclusion for
 	// the audit-row payload.
 	CheckRunRef *CheckRunRef
+
+	// Repositories is the set of "owner/name" repos an installation /
+	// installation_repositories event added to the App (ADR-048 / E29.7).
+	// Set only for MatchActionScaffold — handleInstallation opens one
+	// onboarding scaffold PR per entry.
+	Repositories []string
 }
 
 // CheckRunRef is the subset of a check_run payload the CI-retry
@@ -233,6 +246,8 @@ func MatchEvent(ev Event) Match {
 		return matchWorkflowRun(ev)
 	case "check_run":
 		return matchCheckRun(ev)
+	case "installation", "installation_repositories":
+		return matchInstallation(ev)
 	case "branch_protection_rule", "repository_ruleset":
 		// Recognized for #251 / ADR-017: an upstream protection
 		// edit invalidates any cached snapshot for the repo. v0
@@ -620,6 +635,56 @@ func matchCheckRun(ev Event) Match {
 	}
 }
 
+// matchInstallation classifies an `installation` / `installation_repositories`
+// event for the App-PR onboarding path (ADR-048 / E29.7). Pure — the handler
+// (handleInstallation) does the per-repo scaffold I/O.
+//
+// Only the repo-ADDING actions trigger a scaffold:
+//
+//   - installation.created — the App was installed; `repositories[]` lists
+//     the repos it was granted.
+//   - installation_repositories.added — repos were added to an existing
+//     installation; `repositories_added[]` lists them.
+//
+// Every other action (installation.deleted / suspend / unsuspend /
+// new_permissions_accepted, installation_repositories.removed) is
+// acknowledged and skipped — there is nothing to scaffold. A payload that
+// parses but carries no repositories skips too.
+func matchInstallation(ev Event) Match {
+	adding := (ev.Type == "installation" && ev.Action == "created") ||
+		(ev.Type == "installation_repositories" && ev.Action == "added")
+	if !adding {
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("%s.%s is not a scaffold trigger action", ev.Type, ev.Action)}
+	}
+	var payload struct {
+		Repositories []struct {
+			FullName string `json:"full_name"`
+		} `json:"repositories"`
+		RepositoriesAdded []struct {
+			FullName string `json:"full_name"`
+		} `json:"repositories_added"`
+	}
+	if err := json.Unmarshal(ev.RawBody, &payload); err != nil {
+		return Match{Skip: true, Reason: "installation payload parse failed"}
+	}
+	src := payload.Repositories
+	if ev.Type == "installation_repositories" {
+		src = payload.RepositoriesAdded
+	}
+	repos := make([]string, 0, len(src))
+	for _, r := range src {
+		if r.FullName != "" {
+			repos = append(repos, r.FullName)
+		}
+	}
+	if len(repos) == 0 {
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("%s.%s carried no repositories", ev.Type, ev.Action)}
+	}
+	return Match{Action: MatchActionScaffold, Repositories: repos}
+}
+
 // GitHubAPI is the slice of githubclient.Client the dispatcher
 // uses. Defining it as an interface lets tests substitute a stub
 // without standing up an httptest.Server alongside the existing
@@ -676,6 +741,16 @@ type BoardSyncer interface {
 	// named run-lifecycle edge (run_started, …). Best-effort: failures log
 	// inside the implementation and never unwind the dispatch.
 	NotifyBoardTransition(ctx context.Context, runID uuid.UUID, event string)
+}
+
+// Scaffolder opens the App-PR onboarding scaffold for a repo (ADR-048 /
+// E29.7). Satisfied by *onboarding.Scaffolder; declared as an interface so
+// dispatcher tests substitute a recording stub without the Git Data API
+// round-trips. Nil leaves the installation-scaffold path off — the event is
+// acknowledged and skipped.
+type Scaffolder interface {
+	OpenScaffoldPR(ctx context.Context, installationID int64,
+		repo githubclient.RepoRef) (*onboarding.Result, error)
 }
 
 // ApprovalCommandHandler executes a slash-command approval / reject
@@ -747,6 +822,13 @@ type Dispatcher struct {
 	// silently skipped — useful in early dev or when the role
 	// resolver / approval repo aren't wired yet.
 	ApprovalHandler ApprovalCommandHandler
+
+	// Scaffolder opens the App-PR onboarding scaffold when the App is
+	// installed on a repo or repos are added (ADR-048 / E29.7). Nil leaves
+	// the installation-scaffold path off — the event is acknowledged and
+	// skipped. Best-effort per repo: a scaffold failure logs but never
+	// surfaces as a webhook 5xx.
+	Scaffolder Scaffolder
 
 	// PlanReviewerConfigured reports whether fishhawkd has a plan-
 	// review agent wired (#577 / ADR-027). It mirrors the server's
@@ -823,6 +905,8 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		return d.handleRunnerActionFailed(ctx, ev, m)
 	case MatchActionCIFailureRetry:
 		return d.handleCIFailureRetry(ctx, ev, m)
+	case MatchActionScaffold:
+		return d.handleInstallation(ctx, ev, m)
 	}
 
 	repo, err := parseRepo(ev.Repo)
@@ -1204,6 +1288,70 @@ func (d *Dispatcher) handleApprovalCommand(ctx context.Context, ev Event, m Matc
 			slog.Int("issue", m.IssueRef.Number),
 			slog.String("error", err.Error()),
 		)
+	}
+	return nil
+}
+
+// handleInstallation opens a reviewable onboarding scaffold PR for each
+// repo an installation / installation_repositories event added (ADR-048 /
+// E29.7). Best-effort per repo: a malformed repo name or a scaffold error
+// logs and moves to the next repo — one repo's failure never fails the
+// webhook (no 5xx) or blocks the others. A nil Scaffolder skips the whole
+// path safely (the pre-#E29.7 posture / a deployment without onboarding
+// wired).
+//
+// Dispatch is synchronous inside the webhook handler — there is no
+// background job infra yet — so a very large installation.created spanning
+// many repos runs the per-repo scaffolds inline. Moving this to a sweeper
+// is a follow-up; the per-repo best-effort logging bounds the blast radius
+// in the meantime.
+func (d *Dispatcher) handleInstallation(ctx context.Context, ev Event, m Match) error {
+	if d.Scaffolder == nil {
+		d.logger().LogAttrs(ctx, slog.LevelInfo,
+			"installation scaffold skipped: no scaffolder wired",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.Int("repo_count", len(m.Repositories)))
+		return nil
+	}
+	for _, fullName := range m.Repositories {
+		repo, err := parseRepo(fullName)
+		if err != nil {
+			d.logger().LogAttrs(ctx, slog.LevelWarn,
+				"installation scaffold: malformed repo name",
+				slog.String("delivery_id", ev.DeliveryID),
+				slog.String("repo", fullName))
+			continue
+		}
+		res, err := d.Scaffolder.OpenScaffoldPR(ctx, ev.InstallationID, repo)
+		if err != nil {
+			d.logger().LogAttrs(ctx, slog.LevelWarn,
+				"installation scaffold: open scaffold PR failed",
+				slog.String("delivery_id", ev.DeliveryID),
+				slog.String("repo", fullName),
+				slog.String("error", err.Error()))
+			continue
+		}
+		switch {
+		case res.Skipped:
+			d.logger().LogAttrs(ctx, slog.LevelInfo,
+				"installation scaffold skipped",
+				slog.String("delivery_id", ev.DeliveryID),
+				slog.String("repo", fullName),
+				slog.String("reason", res.Reason))
+		case res.PRAlreadyExisted:
+			d.logger().LogAttrs(ctx, slog.LevelInfo,
+				"installation scaffold: PR already open",
+				slog.String("delivery_id", ev.DeliveryID),
+				slog.String("repo", fullName),
+				slog.Bool("ref_force_updated", res.RefForceUpdated))
+		default:
+			d.logger().LogAttrs(ctx, slog.LevelInfo,
+				"installation scaffold: opened PR",
+				slog.String("delivery_id", ev.DeliveryID),
+				slog.String("repo", fullName),
+				slog.String("pull_request_url", res.PullRequestURL),
+				slog.Bool("ref_force_updated", res.RefForceUpdated))
+		}
 	}
 	return nil
 }

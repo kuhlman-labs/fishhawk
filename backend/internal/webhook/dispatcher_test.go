@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/onboarding"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
@@ -3085,5 +3089,362 @@ func TestHandle_CIFailureRetry_LocalRunner_MintsChildSkipsDispatch(t *testing.T)
 	}
 	if !strings.Contains(payload, `"outcome":"dispatched"`) {
 		t.Errorf("audit payload missing outcome:dispatched: %s", payload)
+	}
+}
+
+// --- installation / onboarding-scaffold dispatch (ADR-048 / E29.7) ---
+
+// installationBody builds an `installation` event payload with the given
+// action and repository full names, mirroring workflowRunBody/checkRunBody.
+func installationBody(t *testing.T, action string, fullNames ...string) []byte {
+	t.Helper()
+	repos := make([]map[string]any, 0, len(fullNames))
+	for _, fn := range fullNames {
+		repos = append(repos, map[string]any{"full_name": fn})
+	}
+	body, _ := json.Marshal(map[string]any{
+		"action":       action,
+		"installation": map[string]any{"id": 42},
+		"repositories": repos,
+		"sender":       map[string]any{"login": "alice", "type": "User"},
+	})
+	return body
+}
+
+// installationReposBody builds an `installation_repositories` payload with
+// repositories_added set to the given full names.
+func installationReposBody(t *testing.T, action string, addedFullNames ...string) []byte {
+	t.Helper()
+	added := make([]map[string]any, 0, len(addedFullNames))
+	for _, fn := range addedFullNames {
+		added = append(added, map[string]any{"full_name": fn})
+	}
+	body, _ := json.Marshal(map[string]any{
+		"action":               action,
+		"installation":         map[string]any{"id": 42},
+		"repositories_added":   added,
+		"repositories_removed": []any{},
+		"sender":               map[string]any{"login": "alice", "type": "User"},
+	})
+	return body
+}
+
+func TestMatchEvent_Installation_Created_Matches(t *testing.T) {
+	ev := Event{
+		Type: "installation", Action: "created", InstallationID: 42,
+		RawBody: installationBody(t, "created", "acme/api", "acme/web"),
+	}
+	got := MatchEvent(ev)
+	if got.Skip {
+		t.Fatalf("got = %+v, want scaffold match", got)
+	}
+	if got.Action != MatchActionScaffold {
+		t.Errorf("Action = %q, want scaffold", got.Action)
+	}
+	if strings.Join(got.Repositories, ",") != "acme/api,acme/web" {
+		t.Errorf("Repositories = %v, want [acme/api acme/web]", got.Repositories)
+	}
+}
+
+func TestMatchEvent_InstallationRepositories_Added_Matches(t *testing.T) {
+	ev := Event{
+		Type: "installation_repositories", Action: "added", InstallationID: 42,
+		RawBody: installationReposBody(t, "added", "acme/new"),
+	}
+	got := MatchEvent(ev)
+	if got.Skip {
+		t.Fatalf("got = %+v, want scaffold match", got)
+	}
+	if got.Action != MatchActionScaffold {
+		t.Errorf("Action = %q, want scaffold", got.Action)
+	}
+	if strings.Join(got.Repositories, ",") != "acme/new" {
+		t.Errorf("Repositories = %v, want [acme/new]", got.Repositories)
+	}
+}
+
+func TestMatchEvent_Installation_NonAddingActionsSkip(t *testing.T) {
+	cases := []struct {
+		evType string
+		action string
+		body   []byte
+	}{
+		{"installation", "deleted", installationBody(t, "deleted", "acme/api")},
+		{"installation", "suspend", installationBody(t, "suspend", "acme/api")},
+		{"installation_repositories", "removed", installationReposBody(t, "removed")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.evType+"."+tc.action, func(t *testing.T) {
+			ev := Event{Type: tc.evType, Action: tc.action, InstallationID: 42, RawBody: tc.body}
+			got := MatchEvent(ev)
+			if !got.Skip {
+				t.Errorf("got = %+v, want skip", got)
+			}
+		})
+	}
+}
+
+func TestMatchEvent_Installation_NoRepositoriesSkips(t *testing.T) {
+	ev := Event{
+		Type: "installation", Action: "created", InstallationID: 42,
+		RawBody: installationBody(t, "created"), // no repos
+	}
+	got := MatchEvent(ev)
+	if !got.Skip || !strings.Contains(got.Reason, "no repositories") {
+		t.Errorf("got = %+v, want skip with no-repositories reason", got)
+	}
+}
+
+func TestMatchEvent_Installation_BotSenderSkips(t *testing.T) {
+	ev := Event{
+		Type: "installation", Action: "created", InstallationID: 42,
+		Sender: "octobot[bot]", SenderType: "Bot",
+		RawBody: installationBody(t, "created", "acme/api"),
+	}
+	got := MatchEvent(ev)
+	if !got.Skip || !strings.Contains(got.Reason, "bot") {
+		t.Errorf("got = %+v, want skip with bot reason", got)
+	}
+}
+
+// stubScaffolder records the repos it was asked to scaffold and returns a
+// configurable result/error, per-repo.
+type stubScaffolder struct {
+	calls   []githubclient.RepoRef
+	result  *onboarding.Result
+	err     error
+	errRepo string // when set, only this repo's name errors
+}
+
+func (s *stubScaffolder) OpenScaffoldPR(_ context.Context, _ int64,
+	repo githubclient.RepoRef) (*onboarding.Result, error) {
+	s.calls = append(s.calls, repo)
+	if s.errRepo != "" && repo.Name == s.errRepo {
+		return nil, errors.New("scaffold boom")
+	}
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.result != nil {
+		return s.result, nil
+	}
+	return &onboarding.Result{PullRequestURL: "https://github.com/" + repo.String() + "/pull/1"}, nil
+}
+
+func newScaffoldDispatcher(sc Scaffolder) *Dispatcher {
+	return &Dispatcher{
+		Scaffolder: sc,
+		Now:        func() time.Time { return time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC) },
+	}
+}
+
+func TestHandleInstallation_ScaffoldsEachRepo(t *testing.T) {
+	sc := &stubScaffolder{}
+	d := newScaffoldDispatcher(sc)
+	ev, err := ParseEvent("installation", "deliv-inst",
+		installationBody(t, "created", "acme/api", "acme/web"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(sc.calls) != 2 {
+		t.Fatalf("scaffold calls = %d, want 2 (%v)", len(sc.calls), sc.calls)
+	}
+	if sc.calls[0].String() != "acme/api" || sc.calls[1].String() != "acme/web" {
+		t.Errorf("scaffolded repos = %v, want [acme/api acme/web]", sc.calls)
+	}
+}
+
+func TestHandleInstallation_ScaffolderErrorIsBestEffort(t *testing.T) {
+	// The first repo errors; the handler must still scaffold the second and
+	// return nil (no webhook 5xx).
+	sc := &stubScaffolder{errRepo: "api"}
+	d := newScaffoldDispatcher(sc)
+	buf := captureDispatcherLogs(d)
+	ev, err := ParseEvent("installation", "deliv-inst",
+		installationBody(t, "created", "acme/api", "acme/web"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle returned error, want nil (best-effort): %v", err)
+	}
+	if len(sc.calls) != 2 {
+		t.Errorf("scaffold calls = %d, want 2 (error on one repo must not abort the loop)", len(sc.calls))
+	}
+	if !strings.Contains(buf.String(), "open scaffold PR failed") {
+		t.Errorf("expected a scaffold-failure log line; got %s", buf.String())
+	}
+}
+
+func TestHandleInstallation_SkipAndPRExistsDoNotError(t *testing.T) {
+	cases := []struct {
+		name   string
+		result *onboarding.Result
+	}{
+		{"already onboarded", &onboarding.Result{Skipped: true, Reason: "already onboarded"}},
+		{"PR already open", &onboarding.Result{PRAlreadyExisted: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sc := &stubScaffolder{result: tc.result}
+			d := newScaffoldDispatcher(sc)
+			ev, err := ParseEvent("installation", "deliv-inst",
+				installationBody(t, "created", "acme/api"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := d.Handle(context.Background(), ev); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if len(sc.calls) != 1 {
+				t.Errorf("scaffold calls = %d, want 1", len(sc.calls))
+			}
+		})
+	}
+}
+
+func TestHandleInstallation_NilScaffolderSafeSkip(t *testing.T) {
+	d := newScaffoldDispatcher(nil) // no scaffolder wired
+	buf := captureDispatcherLogs(d)
+	ev, err := ParseEvent("installation", "deliv-inst",
+		installationBody(t, "created", "acme/api"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if !strings.Contains(buf.String(), "no scaffolder wired") {
+		t.Errorf("expected no-scaffolder-wired log; got %s", buf.String())
+	}
+}
+
+// e2eTokens is a minimal githubapp.TokenProvider for the cross-boundary
+// test — satisfied structurally, so no githubapp import is needed.
+type e2eTokens struct{}
+
+func (e2eTokens) Token(_ context.Context, _ int64) (string, error) { return "ghs_e2e", nil }
+
+// TestHandleInstallation_CrossBoundary feeds a golden installation.created
+// event through MatchEvent -> handleInstallation -> a REAL
+// onboarding.Scaffolder wired to a REAL *githubclient.Client backed by an
+// httptest GitHub. It asserts the chain terminates in POST /pulls whose head
+// branch tree carried all four scaffold paths — crossing the webhook,
+// onboarding, and githubclient layers that per-layer units each pass while
+// the seam could break (cf. #618).
+func TestHandleInstallation_CrossBoundary(t *testing.T) {
+	var (
+		createdPR   bool
+		treeEntries []string
+		baseTree    string
+	)
+	mux := http.NewServeMux()
+	// Idempotency probe: not onboarded yet.
+	mux.HandleFunc("GET /repos/{owner}/{repo}/contents/{path...}",
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"message":"Not Found"}`)
+		})
+	// Default branch.
+	mux.HandleFunc("GET /repos/{owner}/{repo}",
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"default_branch":"main"}`)
+		})
+	// Branch SHA probes: main resolves; fishhawk/onboarding is absent (404).
+	mux.HandleFunc("GET /repos/{owner}/{repo}/git/ref/heads/{branch...}",
+		func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, onboarding.OnboardingBranch) {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, `{"message":"Not Found"}`)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"object":{"sha":"basecommit"}}`)
+		})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/git/commits/{sha}",
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"sha":"basecommit","tree":{"sha":"basetree"}}`)
+		})
+	mux.HandleFunc("POST /repos/{owner}/{repo}/git/trees",
+		func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				BaseTree string `json:"base_tree"`
+				Tree     []struct {
+					Path string `json:"path"`
+				} `json:"tree"`
+			}
+			raw, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(raw, &body)
+			baseTree = body.BaseTree
+			for _, e := range body.Tree {
+				treeEntries = append(treeEntries, e.Path)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"sha":"newtree"}`)
+		})
+	mux.HandleFunc("POST /repos/{owner}/{repo}/git/commits",
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"sha":"newcommit"}`)
+		})
+	mux.HandleFunc("POST /repos/{owner}/{repo}/git/refs",
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"ref":"refs/heads/fishhawk/onboarding"}`)
+		})
+	mux.HandleFunc("POST /repos/{owner}/{repo}/pulls",
+		func(w http.ResponseWriter, _ *http.Request) {
+			createdPR = true
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"number":7,"html_url":"https://github.com/acme/api/pull/7","node_id":"n","state":"open"}`)
+		})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	client := &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  e2eTokens{},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+	}
+	d := newScaffoldDispatcher(onboarding.NewScaffolder(client))
+	ev, err := ParseEvent("installation", "deliv-e2e",
+		installationBody(t, "created", "acme/api"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if !createdPR {
+		t.Fatal("chain did not terminate in POST /pulls")
+	}
+	if baseTree != "basetree" {
+		t.Errorf("create-tree base_tree = %q, want basetree (a tree sha, not a commit sha)", baseTree)
+	}
+	want := map[string]bool{
+		".fishhawk/workflows.yaml":       false,
+		"AGENTS.md":                      false,
+		"CLAUDE.md":                      false,
+		".github/workflows/fishhawk.yml": false,
+	}
+	for _, p := range treeEntries {
+		if _, ok := want[p]; ok {
+			want[p] = true
+		}
+	}
+	for p, seen := range want {
+		if !seen {
+			t.Errorf("scaffold tree missing path %q (got %v)", p, treeEntries)
+		}
 	}
 }

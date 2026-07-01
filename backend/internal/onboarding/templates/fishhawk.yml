@@ -1,0 +1,103 @@
+# Fishhawk self-execution workflow.
+#
+# This is the customer-side GitHub Actions workflow the Fishhawk backend
+# fires `workflow_dispatch` against. When a Fishhawk-labeled issue lands
+# or someone comments `/fishhawk run`, the backend creates a run + stages
+# and dispatches this workflow with the run/stage UUIDs as inputs.
+#
+# Unlike Fishhawk's own in-repo workflow (which references the runner and
+# auth composite actions by local path), this template pins the PUBLISHED,
+# versioned actions so it works in any repository that installs the App.
+# Bump the pinned tags when you adopt a newer runner release.
+#
+# References:
+#   - kuhlman-labs/fishhawk/runner — the composite runner action
+#   - kuhlman-labs/fishhawk/auth — the OIDC → App-token exchange action
+name: Fishhawk
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Workflow run UUID (supplied by backend dispatcher)'
+        required: true
+        type: string
+      stage_id:
+        description: 'Stage UUID for this dispatch'
+        required: true
+        type: string
+      workflow_id:
+        description: 'Workflow ID from .fishhawk/workflows.yaml (e.g. feature_change)'
+        required: true
+        type: string
+      stage:
+        description: 'Stage executor ref / agent provider (claude-code|codex)'
+        required: false
+        type: string
+        default: claude-code
+      parent_run_id:
+        description: 'Decomposition-parent run UUID — set only for fan-out children; keys the runner-pool concurrency guard'
+        required: false
+        type: string
+        default: ''
+
+# Bound the runner pool under a decomposition fan-out: sibling children of
+# one fan-out share parent_run_id, so this group serializes them. A normal
+# run has an empty parent_run_id and falls back to the unique Actions run id,
+# so it is never serialized.
+concurrency:
+  group: fishhawk-run-${{ inputs.parent_run_id || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  # id-token: write — the auth action mints a GitHub Actions OIDC token and
+  # exchanges it at the Fishhawk backend for the App's installation token.
+  # That token is what checkout, push, and PR creation authenticate with —
+  # no long-lived secret in the workflow.
+  id-token: write
+  contents: read
+
+jobs:
+  run:
+    name: Run Fishhawk stage
+    runs-on: ubuntu-latest
+    steps:
+      # Mint the Fishhawk App installation token via OIDC before any git
+      # operation runs. The published auth action performs the OIDC exchange
+      # against the backend and exposes the token as an output.
+      - name: Fishhawk auth (mint App installation token via OIDC)
+        id: fishhawk-auth
+        uses: kuhlman-labs/fishhawk/auth@auth/v1
+        with:
+          backend-url: ${{ vars.FISHHAWK_BACKEND_URL }}
+          run-id: ${{ inputs.run_id }}
+          stage-id: ${{ inputs.stage_id }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.fishhawk-auth.outputs.token }}
+          # persist-credentials: false — let the runner be the sole source of
+          # push auth (avoids a duplicate Authorization header on push).
+          persist-credentials: false
+
+      - name: Run Fishhawk runner
+        uses: kuhlman-labs/fishhawk/runner@runner/v1
+        with:
+          run-id: ${{ inputs.run_id }}
+          stage-id: ${{ inputs.stage_id }}
+          backend-url: ${{ vars.FISHHAWK_BACKEND_URL }}
+          workflow: ${{ inputs.workflow_id }}
+          stage: ${{ inputs.stage }}
+          # agent: the executor ref selects the provider CLI (claude-code|codex).
+          agent: ${{ inputs.stage }}
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # openai-api-key: consumed only when agent=codex.
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          github-token: ${{ steps.fishhawk-auth.outputs.token }}
+          fetch-prompt: 'true'
+          upload-trace: 'true'
+          plan-out: '/tmp/fishhawk-plan.json'
+          # check-base-ref: the runner diffs against the repo's default branch
+          # and emits a git_diff event the backend's policy re-evaluation reads.
+          check-base-ref: 'origin/${{ github.event.repository.default_branch }}'

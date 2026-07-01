@@ -39,6 +39,7 @@ Webhook events:
 | `workflow_run` | Observe customer-side runner job state. |
 | `check_run`, `check_suite` | Required-status visibility on review-stage gates. |
 | `branch_protection_rule`, `repository_ruleset` | Acknowledged so a future cache layer can invalidate the per-run protection snapshot (ADR-017 / #251). v0 reads protection on every run-create — no cache to bust today. |
+| `installation`, `installation_repositories` | Auto-onboarding (ADR-048 / E29.7): when the App is installed (`installation.created`) or repos are added to an existing install (`installation_repositories.added`), the backend opens a reviewable scaffold PR per newly-added repo. Other actions (deleted / suspend / removed) are acknowledged and skipped. |
 
 ## Local development
 
@@ -205,6 +206,21 @@ Per ADR-005 (#69) and E13.4 (#61) the production secrets path is AWS Secrets Man
 ## Installing on a customer repo
 
 Customer-side: visit `https://github.com/apps/fishhawk` (or the App's settings page during private testing), pick the repo to install on, and grant access. Their installation triggers the backend's webhook receiver and is ready to run.
+
+### Auto-onboarding: the App-PR scaffold (ADR-048 / E29.7)
+
+Installing the App does more than register the webhook: the backend opens a **reviewable scaffold pull request** on each newly-added repo so a customer needs zero local setup to start. On `installation.created` (and `installation_repositories.added` for repos added later), the backend authors a single commit through the GitHub Git Data API — no working tree — that seeds four files, and opens a PR from the `fishhawk/onboarding` branch into the repo's default branch:
+
+- `.fishhawk/workflows.yaml` — the workflow spec, seeded from the **medium** autonomy preset. The reviewer changes the tier in the PR before merging if they want more or less automation.
+- `AGENTS.md` — the canonical, cross-agent instruction file, carrying Fishhawk's marker-delimited managed block.
+- `CLAUDE.md` — a bridge file importing `AGENTS.md` so Claude Code picks up the same instructions.
+- `.github/workflows/fishhawk.yml` — the customer-side execution workflow, referencing the **published** `kuhlman-labs/fishhawk/runner` + `kuhlman-labs/fishhawk/auth` actions (not local paths). Committing this file is why the App needs `workflows: write` (already granted).
+
+The human is the author/reviewer of record (autonomy:low): the scaffold lands as a PR they review and merge, never a direct push to the default branch. The content is byte-identical to what `fishhawk init` generates for the same preset.
+
+Idempotency: the scaffolder skips a repo that already carries `.fishhawk/workflows.yaml` (already onboarded) and treats an already-open scaffold PR as success. If a prior attempt left a stale `fishhawk/onboarding` branch, it is **force-updated** to the freshly-generated scaffold commit so the PR always reflects the current scaffold. Scaffolding is best-effort per repo — one repo's failure logs and moves on without failing the webhook.
+
+Subscribing to `installation` / `installation_repositories` is a manifest/registration concern: it takes effect only for freshly created or updated App registrations. An existing install must re-accept (or re-register) to receive these events.
 
 ### Making the audit gate block merges
 
