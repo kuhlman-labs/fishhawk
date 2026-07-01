@@ -2185,6 +2185,92 @@ components:
         email:
           type: [string, "null"]
 
+    OnboardingReadiness:
+      type: object
+      description: |
+        Aggregated first-run readiness for a repository (E29.4), consumed by
+        `fishhawk doctor` (E29.5). The four checks cascade: a not-installed
+        repo yields an unavailable spec and no reviewers, each with an
+        explanatory note. Read-only; performs no writes.
+      required: [repo, app, spec, reviewers, scopes]
+      properties:
+        repo:
+          type: string
+          example: kuhlman-labs/fishhawk
+        app:
+          type: object
+          description: GitHub App installation status for the target repo.
+          required: [installed]
+          properties:
+            installed:
+              type: boolean
+            installation_id:
+              type: integer
+              format: int64
+              description: Present only when installed.
+            reason:
+              type: string
+              description: Why the App is not installed (or could not be resolved).
+        spec:
+          type: object
+          description: The committed workflow spec's fetch + parse + validate state.
+          required: [source, valid]
+          properties:
+            source:
+              type: string
+              enum: [fetched, unavailable]
+            valid:
+              type: boolean
+              description: Meaningful only when source is "fetched".
+            error:
+              type: string
+              description: Parse or validation failure detail.
+            note:
+              type: string
+              description: Why the spec is unavailable (not installed, not found, fetch error).
+        reviewers:
+          type: array
+          description: |
+            Per-reviewer availability for each reviewer declared in the
+            repo's spec, resolved against this deployment's configured
+            backends. Empty when the spec is unavailable or invalid.
+          items:
+            type: object
+            required: [provider, available]
+            properties:
+              provider:
+                type: string
+                example: anthropic
+              model:
+                type: string
+              reasoning_effort:
+                type: string
+              available:
+                type: boolean
+              missing_hint:
+                type: string
+                description: How to enable the provider when unavailable (names the env knob).
+        scopes:
+          type: object
+          description: |
+            Whether the caller's token holds the run-driving scope subset.
+            Cookie-session (OAuth) callers bypass scope enforcement and are
+            adequate by construction.
+          required: [adequate, required, missing]
+          properties:
+            adequate:
+              type: boolean
+            required:
+              type: array
+              items:
+                type: string
+            missing:
+              type: array
+              items:
+                type: string
+            note:
+              type: string
+
     ApiToken:
       type: object
       required: [id, scopes, created_at]
@@ -2508,6 +2594,39 @@ paths:
           description: Session destroyed.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v0/onboarding/readiness:
+    get:
+      operationId: getOnboardingReadiness
+      summary: First-run readiness for a repository
+      description: |
+        Aggregates the four server-side-only checks a repo's first run needs
+        (E29.4), consumed by `fishhawk doctor` (E29.5): GitHub App
+        installation, the committed workflow spec's parse/validate state,
+        per-reviewer availability on this deployment, and the caller token's
+        scope adequacy against the run-driving scope subset. Read-only.
+
+        Gates on authentication only (401 for anonymous) — NOT a write scope,
+        because scope adequacy is itself a reported field: a write-scope gate
+        would lock out exactly the callers who need to discover their gap.
+        Mirrors `GET /v0/auth/me`.
+      tags: [onboarding]
+      parameters:
+        - name: repo
+          in: query
+          required: true
+          description: Target repository in owner/name form.
+          schema:
+            type: string
+          example: kuhlman-labs/fishhawk
+      responses:
+        '200':
+          description: Aggregated readiness for the repository.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OnboardingReadiness' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
 
   /v0/tokens:
     get:
@@ -7554,6 +7673,8 @@ tags:
     description: Liveness, readiness, build info.
   - name: auth
     description: GitHub OAuth flow + scoped API tokens (ADR-005).
+  - name: onboarding
+    description: First-run readiness introspection for a repository (E29.4).
   - name: runs
     description: Workflow run lifecycle.
   - name: stages
