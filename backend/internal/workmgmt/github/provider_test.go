@@ -62,7 +62,12 @@ type fakeAPI struct {
 
 	searchQuery   string
 	searchResults []githubclient.IssueTitleResult
-	searchErr     error
+	// searchResultsFn, when set, computes the results from the composed query so
+	// a test can return different result sets depending on whether the query
+	// carries a label: qualifier (the #1522 recency-burial regression guard). It
+	// takes precedence over searchResults.
+	searchResultsFn func(query string) []githubclient.IssueTitleResult
+	searchErr       error
 
 	projectsTokenConfigured bool
 }
@@ -130,6 +135,9 @@ func (f *fakeAPI) SearchIssuesByTitle(_ context.Context, _ int64, query string) 
 	f.searchQuery = query
 	if f.searchErr != nil {
 		return nil, f.searchErr
+	}
+	if f.searchResultsFn != nil {
+		return f.searchResultsFn(query), nil
 	}
 	return f.searchResults, nil
 }
@@ -942,9 +950,10 @@ func TestProvider_DiscoverNumbers_SkipsMalformedTitles(t *testing.T) {
 // seam that the pure apply test does not exercise.
 func TestProvider_DiscoverNumbers_EpicSkipsChildTitles(t *testing.T) {
 	req := workmgmt.DiscoverNumbersRequest{
-		Target:      baseRequest().Target,
-		Prefix:      "E",
-		TitleFormat: "[E{number}] {summary}",
+		Target:        baseRequest().Target,
+		Prefix:        "E",
+		TitleFormat:   "[E{number}] {summary}",
+		DefaultLabels: []string{"epic"}, // production epic path carries label:"epic" (#1522)
 	}
 	api := &fakeAPI{searchResults: []githubclient.IssueTitleResult{
 		{Number: 100, Title: "[E28] an epic"},
@@ -961,6 +970,152 @@ func TestProvider_DiscoverNumbers_EpicSkipsChildTitles(t *testing.T) {
 	}
 	if !strings.Contains(api.searchQuery, `in:title "[E"`) {
 		t.Errorf("search query = %q, want it to carry the literal [E in:title term", api.searchQuery)
+	}
+	if !strings.Contains(api.searchQuery, `label:"epic"`) {
+		t.Errorf("search query = %q, want it to carry the label:\"epic\" qualifier (#1522)", api.searchQuery)
+	}
+}
+
+// TestProvider_DiscoverNumbers_LabelQualifierFindsBuriedMaxUnderRecencyLimit is
+// the #1522 done-means test: GitHub's recency-ordered `in:title "[E"` search
+// buries the real max epic [E29] behind its own [E29.x] children, so a
+// title-only query returns a truncated recency slice the anchored re-parse
+// reduces to a wrong max (or empty → allocate 1). Adding the label:"epic"
+// qualifier returns exactly the epics (a small, complete set no recency window
+// truncates), so the buried max is found. The fake returns the full epic set
+// (buried max present) ONLY when the query carries label:"epic", and a
+// truncated recency slice (max omitted, [E29.x] children present) otherwise —
+// so this fails on the pre-fix title-only query AND on any regression that
+// drops the qualifier.
+func TestProvider_DiscoverNumbers_LabelQualifierFindsBuriedMaxUnderRecencyLimit(t *testing.T) {
+	req := workmgmt.DiscoverNumbersRequest{
+		Target:        baseRequest().Target,
+		Prefix:        "E",
+		TitleFormat:   "[E{number}] {summary}",
+		DefaultLabels: []string{"epic"},
+	}
+	fullEpicSet := []githubclient.IssueTitleResult{
+		{Number: 100, Title: "[E25] an epic"},
+		{Number: 101, Title: "[E29] the buried max epic"},
+		{Number: 102, Title: "[E27] another epic"},
+	}
+	// Recency-ordered title-only results: the newest items are the children of
+	// the most recently touched epic, burying [E29] out of the returned window.
+	truncatedRecencySlice := []githubclient.IssueTitleResult{
+		{Number: 200, Title: "[E29.1] a child of E29"},
+		{Number: 201, Title: "[E29.2] another child of E29"},
+		{Number: 202, Title: "[E25] an epic"},
+	}
+	api := &fakeAPI{searchResultsFn: func(query string) []githubclient.IssueTitleResult {
+		if strings.Contains(query, `label:"epic"`) {
+			return fullEpicSet
+		}
+		return truncatedRecencySlice
+	}}
+	got, err := New(api).DiscoverNumbers(context.Background(), req)
+	if err != nil {
+		t.Fatalf("DiscoverNumbers: %v", err)
+	}
+	max := 0
+	for _, n := range got {
+		if n > max {
+			max = n
+		}
+	}
+	if max != 29 {
+		t.Errorf("max discovered = %d, want 29 (buried max found via label qualifier → allocate 30); numbers=%v", max, got)
+	}
+	if !strings.Contains(api.searchQuery, `label:"epic"`) {
+		t.Errorf("search query = %q, want it to carry the label:\"epic\" qualifier", api.searchQuery)
+	}
+}
+
+// TestProvider_DiscoverNumbers_AdrPathUsesRealLabel drives the PRODUCTION adr
+// path with its REAL DefaultLabels:["adr"] (the operator's binding condition):
+// adr discovery now runs WITH label:"adr", not the synthetic no-label branch.
+// The label qualifier EXCLUDES title-fuzzy false positives that lack the adr
+// label (e.g. a cross-referencing issue whose title mentions an [ADR-N] token)
+// while returning the full ADR set, so the correct max is discovered — no
+// regression to the previously-working title-only adr discovery.
+func TestProvider_DiscoverNumbers_AdrPathUsesRealLabel(t *testing.T) {
+	req := discoverRequest()
+	req.DefaultLabels = []string{"adr"}
+	realADRs := []githubclient.IssueTitleResult{
+		{Number: 300, Title: "[ADR-047] a decided one"},
+		{Number: 301, Title: "[ADR-49] the max ADR"},
+	}
+	api := &fakeAPI{searchResultsFn: func(query string) []githubclient.IssueTitleResult {
+		if strings.Contains(query, `label:"adr"`) {
+			return realADRs
+		}
+		// A title-only query ALSO surfaces a fuzzy false positive lacking the
+		// adr label, which would over-allocate off a bogus high number.
+		return append([]githubclient.IssueTitleResult{
+			{Number: 400, Title: "[ADR-77] a mis-included title without the adr label"},
+		}, realADRs...)
+	}}
+	got, err := New(api).DiscoverNumbers(context.Background(), req)
+	if err != nil {
+		t.Fatalf("DiscoverNumbers: %v", err)
+	}
+	if !strings.Contains(api.searchQuery, `label:"adr"`) {
+		t.Errorf("search query = %q, want it to carry the label:\"adr\" qualifier (production adr path)", api.searchQuery)
+	}
+	max := 0
+	for _, n := range got {
+		if n > max {
+			max = n
+		}
+	}
+	if max != 49 {
+		t.Errorf("max discovered = %d, want 49 (full ADR set via label:\"adr\", fuzzy false positive excluded → allocate 50); numbers=%v", max, got)
+	}
+}
+
+// TestProvider_DiscoverNumbers_LabelQualifierHardened feeds a DefaultLabels
+// value carrying a double quote and backslash and asserts the composed query
+// keeps exactly the enclosing quotes of the label qualifier and no stray
+// backslash — the breakout hardening in labelSearchQualifier, mirroring the
+// in:title prefix hardening.
+func TestProvider_DiscoverNumbers_LabelQualifierHardened(t *testing.T) {
+	req := discoverRequest()
+	req.DefaultLabels = []string{`ab"c\d`}
+	api := &fakeAPI{searchResults: []githubclient.IssueTitleResult{
+		{Number: 5, Title: "[ADR-12] a decided one"},
+	}}
+	got, err := New(api).DiscoverNumbers(context.Background(), req)
+	if err != nil {
+		t.Fatalf("DiscoverNumbers: %v", err)
+	}
+	if !strings.Contains(api.searchQuery, `label:"abcd"`) {
+		t.Errorf("search query = %q, want a hardened label:\"abcd\" qualifier (quote/backslash stripped, enclosing quotes kept)", api.searchQuery)
+	}
+	if strings.Contains(api.searchQuery, `\`) {
+		t.Errorf("search query = %q must not carry a backslash that could escape the closing quote", api.searchQuery)
+	}
+	if len(got) != 1 || got[0] != 12 {
+		t.Errorf("numbers = %v, want [12] (regex still matches the real title)", got)
+	}
+}
+
+// TestProvider_DiscoverNumbers_NoDefaultLabelsOmitsLabelQualifier pins the
+// empty-DefaultLabels fall-through: a numbered type with no default label keeps
+// the title-only query (NO label: qualifier), so a labelless numbered type is
+// unaffected by the #1522 change.
+func TestProvider_DiscoverNumbers_NoDefaultLabelsOmitsLabelQualifier(t *testing.T) {
+	// discoverRequest() carries no DefaultLabels — the fall-through branch.
+	api := &fakeAPI{searchResults: []githubclient.IssueTitleResult{
+		{Number: 200, Title: "[ADR-041] a decision"},
+	}}
+	got, err := New(api).DiscoverNumbers(context.Background(), discoverRequest())
+	if err != nil {
+		t.Fatalf("DiscoverNumbers: %v", err)
+	}
+	if strings.Contains(api.searchQuery, "label:") {
+		t.Errorf("search query = %q, want NO label: qualifier when DefaultLabels is empty", api.searchQuery)
+	}
+	if len(got) != 1 || got[0] != 41 {
+		t.Errorf("numbers = %v, want [41]", got)
 	}
 }
 

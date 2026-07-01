@@ -497,6 +497,10 @@ func (*Server) discoverExistingNumbers(ctx context.Context, filing *workmgmt.Fil
 		Target:      target,
 		Prefix:      itemType.Numbering.Prefix,
 		TitleFormat: itemType.TitleFormat,
+		// Thread the type's default labels so the provider can narrow discovery
+		// by a `label:` qualifier — its first label is the recency-proof
+		// discovery key (#1522).
+		DefaultLabels: itemType.DefaultLabels,
 	})
 	if err != nil {
 		return &workItemError{
