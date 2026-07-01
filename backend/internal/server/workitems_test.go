@@ -439,6 +439,12 @@ func TestFileWorkItem_NumberedTypeDiscoversNextNumber(t *testing.T) {
 	if fp.discoverReq.Prefix != "ADR-" || fp.discoverReq.TitleFormat != "[ADR-{number}] {summary}" {
 		t.Errorf("discover request = %+v, want adr prefix/format", fp.discoverReq)
 	}
+	// The handler must thread the item type's default_labels into the discovery
+	// request so the provider can narrow discovery by a label: qualifier (#1522).
+	// The adr type carries default_labels [adr].
+	if len(fp.discoverReq.DefaultLabels) != 1 || fp.discoverReq.DefaultLabels[0] != "adr" {
+		t.Errorf("discover request DefaultLabels = %v, want [adr] (threaded from the type's conventions)", fp.discoverReq.DefaultLabels)
+	}
 	if fp.captured.Number != 80 {
 		t.Errorf("ProviderRequest.Number = %d, want 80 (max(65,70,79)+1)", fp.captured.Number)
 	}

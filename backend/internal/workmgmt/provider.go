@@ -126,10 +126,22 @@ type DependsEdge struct {
 // "ADR-") and TitleFormat (e.g. "[ADR-{number}] {summary}") so the provider
 // can compose the in:title search term and parse the number back out of each
 // matched title.
+//
+// DefaultLabels is the numbered type's default_labels from the conventions.
+// Its FIRST element (when present) is used by the provider as a `label:`
+// discovery qualifier so a recency-ordered title search cannot bury the real
+// max behind lower-ranked hits (#1522): an `[E{number}]` epic search is
+// otherwise buried under its own `[E{number}.x]` children, so the anchored
+// re-parse finds no valid epic and the fail-closed allocate mis-picks a
+// colliding low number. Narrowing by the type LABEL (which the children do
+// NOT carry) returns exactly the numbered items — a small, complete set no
+// recency window truncates. Empty for a type without a default label, in
+// which case the provider keeps the title-only query.
 type DiscoverNumbersRequest struct {
-	Target      Target
-	Prefix      string
-	TitleFormat string
+	Target        Target
+	Prefix        string
+	TitleFormat   string
+	DefaultLabels []string
 }
 
 // Repo is a provider-neutral repository coordinate. The GitHub provider
