@@ -423,6 +423,8 @@ func TestRunDoctor_DirtyTree_ExitZero(t *testing.T) {
 		switch {
 		case strings.HasSuffix(req.URL.Path, "/healthz"):
 			return fakeHTTPResponse(http.StatusOK, `{"status":"ok","version":"v0.0.0-test"}`), nil
+		case strings.HasSuffix(req.URL.Path, "/v0/onboarding/readiness"):
+			return fakeHTTPResponse(http.StatusOK, allGreenReadinessJSON), nil
 		default:
 			return fakeHTTPResponse(http.StatusOK, `{"items":[]}`), nil
 		}
@@ -696,11 +698,13 @@ func TestCheckCLIVersion_CLISufficient(t *testing.T) {
 // TestRunDoctor_AllPass verifies that runDoctor returns exitOK and prints
 // "ready for local loop" when all checks pass.
 func TestRunDoctor_AllPass(t *testing.T) {
-	// Stub HTTP: /healthz → 200, /v0/runs → 200.
+	// Stub HTTP: /healthz → 200, /v0/runs → 200, readiness → all-green.
 	withFakeDoctorHTTP(t, func(req *http.Request) (*http.Response, error) {
 		switch {
 		case strings.HasSuffix(req.URL.Path, "/healthz"):
 			return fakeHTTPResponse(http.StatusOK, `{"status":"ok","version":"v0.0.0-test"}`), nil
+		case strings.HasSuffix(req.URL.Path, "/v0/onboarding/readiness"):
+			return fakeHTTPResponse(http.StatusOK, allGreenReadinessJSON), nil
 		case strings.Contains(req.URL.Path, "/v0/runs"):
 			return fakeHTTPResponse(http.StatusOK, `{"items":[]}`), nil
 		default:

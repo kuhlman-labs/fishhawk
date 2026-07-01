@@ -50,8 +50,19 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	runnerBinary := fs.String("runner-binary", envOr("FISHHAWK_RUNNER_BIN", ""),
 		"path to fishhawk-runner binary; defaults to PATH lookup")
 	workingDir := fs.String("working-dir", ".", "repo checkout to inspect")
+	repo := fs.String("repo", "", "target repo owner/name for onboarding checks; auto-detected from git origin when empty")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
+	}
+
+	// Resolve the onboarding target repo: explicit --repo wins, else
+	// auto-detect from the working dir's git origin. An unresolved repo
+	// is not fatal — checkOnboardingReadiness degrades it to a single WARN.
+	resolvedRepo := *repo
+	if resolvedRepo == "" {
+		if detected, err := detectGitHubRepo(*workingDir); err == nil {
+			resolvedRepo = detected
+		}
 	}
 
 	checks := []checkResult{
@@ -61,6 +72,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		checkBackend(*cf.backendURL),
 		checkToken(*cf.backendURL, *cf.token),
 		checkSpec(*workingDir),
+		checkExecutionPath(*workingDir),
 		checkRunnerBinary(*runnerBinary, *workingDir),
 		checkMCPRegistration(),
 		checkGitOrigin(*workingDir),
@@ -70,6 +82,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		checkRunnerSchemaDrift(*cf.backendURL, *runnerBinary, *workingDir),
 		checkCLIVersion(*cf.backendURL),
 	}
+	checks = append(checks, checkOnboardingReadiness(*cf.backendURL, *cf.token, resolvedRepo)...)
 
 	useColor := isTerminal(stdout) && os.Getenv("NO_COLOR") == ""
 
