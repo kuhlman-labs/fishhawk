@@ -945,9 +945,11 @@ func TestProvider_DiscoverNumbers_SkipsMalformedTitles(t *testing.T) {
 // subtlety: the epic prefix "E" and title_format "[E{number}] {summary}" build
 // an anchored regexp (^\[E(\d+)\] .*?) that requires "] " immediately after the
 // captured number, so parent epic titles [E28]/[E29] parse while child titles
-// [E28.3]/[E29.1] — which the fuzzy in:title "[E" search ALSO surfaces — are
-// skipped by the re-parse. This crosses the title_format→regexp→number-parse
-// seam that the pure apply test does not exercise.
+// [E28.3]/[E29.1] — which the label:"epic" query may still surface if a child
+// carries the label — are skipped by the re-parse. This crosses the
+// title_format→regexp→number-parse seam that the pure apply test does not
+// exercise. The production epic query is label-only (#1522/#1523): it carries
+// label:"epic" and OMITS the in:title term.
 func TestProvider_DiscoverNumbers_EpicSkipsChildTitles(t *testing.T) {
 	req := workmgmt.DiscoverNumbersRequest{
 		Target:        baseRequest().Target,
@@ -968,8 +970,8 @@ func TestProvider_DiscoverNumbers_EpicSkipsChildTitles(t *testing.T) {
 	if len(got) != 2 || got[0] != 28 || got[1] != 29 {
 		t.Errorf("numbers = %v, want [28 29] (child titles skipped)", got)
 	}
-	if !strings.Contains(api.searchQuery, `in:title "[E"`) {
-		t.Errorf("search query = %q, want it to carry the literal [E in:title term", api.searchQuery)
+	if strings.Contains(api.searchQuery, "in:title") {
+		t.Errorf("search query = %q, want NO in:title term on the label-qualified epic query (#1523)", api.searchQuery)
 	}
 	if !strings.Contains(api.searchQuery, `label:"epic"`) {
 		t.Errorf("search query = %q, want it to carry the label:\"epic\" qualifier (#1522)", api.searchQuery)
@@ -977,16 +979,15 @@ func TestProvider_DiscoverNumbers_EpicSkipsChildTitles(t *testing.T) {
 }
 
 // TestProvider_DiscoverNumbers_LabelQualifierFindsBuriedMaxUnderRecencyLimit is
-// the #1522 done-means test: GitHub's recency-ordered `in:title "[E"` search
-// buries the real max epic [E29] behind its own [E29.x] children, so a
-// title-only query returns a truncated recency slice the anchored re-parse
-// reduces to a wrong max (or empty → allocate 1). Adding the label:"epic"
-// qualifier returns exactly the epics (a small, complete set no recency window
-// truncates), so the buried max is found. The fake returns the full epic set
-// (buried max present) ONLY when the query carries label:"epic", and a
-// truncated recency slice (max omitted, [E29.x] children present) otherwise —
-// so this fails on the pre-fix title-only query AND on any regression that
-// drops the qualifier.
+// the #1522/#1523 done-means test. The fake models the REAL search API's
+// emptying behavior: it returns the full epic set (buried max [E29] present)
+// ONLY for a label-qualified query that carries NO in:title term, and a
+// truncated recency slice (max omitted, [E29.x] children present) otherwise.
+// So it fails on the pre-#1522 title-only query, on #1523's broken
+// label+in:title query (whose in:title "[E" AND collapses the real search to
+// zero), AND on any regression that drops the label qualifier — passing only on
+// the correct label-only composition. This closes the query-agnostic-fake gap
+// that let #1523's broken query pass verification twice.
 func TestProvider_DiscoverNumbers_LabelQualifierFindsBuriedMaxUnderRecencyLimit(t *testing.T) {
 	req := workmgmt.DiscoverNumbersRequest{
 		Target:        baseRequest().Target,
@@ -1007,7 +1008,10 @@ func TestProvider_DiscoverNumbers_LabelQualifierFindsBuriedMaxUnderRecencyLimit(
 		{Number: 202, Title: "[E25] an epic"},
 	}
 	api := &fakeAPI{searchResultsFn: func(query string) []githubclient.IssueTitleResult {
-		if strings.Contains(query, `label:"epic"`) {
+		// Model the real search API's emptying: the full epic set comes back ONLY
+		// for a label-qualified query WITHOUT an in:title term. #1523's broken
+		// label+in:title query (in:title present) falls to the truncated slice.
+		if strings.Contains(query, `label:"epic"`) && !strings.Contains(query, "in:title") {
 			return fullEpicSet
 		}
 		return truncatedRecencySlice
@@ -1023,20 +1027,23 @@ func TestProvider_DiscoverNumbers_LabelQualifierFindsBuriedMaxUnderRecencyLimit(
 		}
 	}
 	if max != 29 {
-		t.Errorf("max discovered = %d, want 29 (buried max found via label qualifier → allocate 30); numbers=%v", max, got)
+		t.Errorf("max discovered = %d, want 29 (buried max found via label-only query → allocate 30); numbers=%v", max, got)
 	}
 	if !strings.Contains(api.searchQuery, `label:"epic"`) {
 		t.Errorf("search query = %q, want it to carry the label:\"epic\" qualifier", api.searchQuery)
+	}
+	if strings.Contains(api.searchQuery, "in:title") {
+		t.Errorf("search query = %q, want NO in:title term (label-only query, #1523)", api.searchQuery)
 	}
 }
 
 // TestProvider_DiscoverNumbers_AdrPathUsesRealLabel drives the PRODUCTION adr
 // path with its REAL DefaultLabels:["adr"] (the operator's binding condition):
-// adr discovery now runs WITH label:"adr", not the synthetic no-label branch.
-// The label qualifier EXCLUDES title-fuzzy false positives that lack the adr
-// label (e.g. a cross-referencing issue whose title mentions an [ADR-N] token)
-// while returning the full ADR set, so the correct max is discovered — no
-// regression to the previously-working title-only adr discovery.
+// adr discovery now runs WITH label:"adr" ALONE, not the synthetic no-label
+// branch. The fake models the real search API's emptying: it returns the full
+// ADR set ONLY for a label-qualified query WITHOUT an in:title term, so the
+// correct max is discovered — a strict improvement over the previous title-only
+// adr discovery (which also surfaced fuzzy false positives lacking the label).
 func TestProvider_DiscoverNumbers_AdrPathUsesRealLabel(t *testing.T) {
 	req := discoverRequest()
 	req.DefaultLabels = []string{"adr"}
@@ -1045,10 +1052,10 @@ func TestProvider_DiscoverNumbers_AdrPathUsesRealLabel(t *testing.T) {
 		{Number: 301, Title: "[ADR-49] the max ADR"},
 	}
 	api := &fakeAPI{searchResultsFn: func(query string) []githubclient.IssueTitleResult {
-		if strings.Contains(query, `label:"adr"`) {
+		if strings.Contains(query, `label:"adr"`) && !strings.Contains(query, "in:title") {
 			return realADRs
 		}
-		// A title-only query ALSO surfaces a fuzzy false positive lacking the
+		// A title-carrying query ALSO surfaces a fuzzy false positive lacking the
 		// adr label, which would over-allocate off a bogus high number.
 		return append([]githubclient.IssueTitleResult{
 			{Number: 400, Title: "[ADR-77] a mis-included title without the adr label"},
@@ -1060,6 +1067,9 @@ func TestProvider_DiscoverNumbers_AdrPathUsesRealLabel(t *testing.T) {
 	}
 	if !strings.Contains(api.searchQuery, `label:"adr"`) {
 		t.Errorf("search query = %q, want it to carry the label:\"adr\" qualifier (production adr path)", api.searchQuery)
+	}
+	if strings.Contains(api.searchQuery, "in:title") {
+		t.Errorf("search query = %q, want NO in:title term on the label-only adr query (#1523)", api.searchQuery)
 	}
 	max := 0
 	for _, n := range got {
@@ -1113,6 +1123,9 @@ func TestProvider_DiscoverNumbers_NoDefaultLabelsOmitsLabelQualifier(t *testing.
 	}
 	if strings.Contains(api.searchQuery, "label:") {
 		t.Errorf("search query = %q, want NO label: qualifier when DefaultLabels is empty", api.searchQuery)
+	}
+	if !strings.Contains(api.searchQuery, "in:title") {
+		t.Errorf("search query = %q, want the in:title term on the labelless fall-through branch", api.searchQuery)
 	}
 	if len(got) != 1 || got[0] != 41 {
 		t.Errorf("numbers = %v, want [41]", got)

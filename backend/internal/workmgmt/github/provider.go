@@ -275,14 +275,17 @@ func labelOrUnset(status string) string {
 // calls before Apply when a numbered filing omits existing_numbers.
 //
 // It validates the target repo + installation (fail closed with the same
-// actionable style File uses), derives the literal title prefix from
-// req.TitleFormat (the substring before {number}, e.g. "[ADR-") as the
-// in:title search term, adds a `label:"<first default label>"` qualifier when
-// req.DefaultLabels is non-empty so a recency-ordered title search cannot bury
-// the real max behind lower-ranked hits (#1522 — an epic search is otherwise
-// buried under its own `[E{n}.x]` children), composes a query with NO is:open
-// qualifier, and re-parses every returned title with a regex built from
-// req.TitleFormat —
+// actionable style File uses), then composes the search query by branch on
+// req.DefaultLabels. When the type carries a default label, it queries by
+// `label:"<first default label>"` ALONE — omitting the in:title term entirely
+// (#1522/#1523): against the live search API `in:title "[E"` matches nothing
+// (`[` is not indexed, `E` is too short for the fuzzy term), and AND-ed with
+// `label:epic` it collapses an otherwise-complete label result to zero, so
+// discovery mis-picks a colliding low number. A type WITHOUT a default label
+// keeps the selective in:title-only query derived from req.TitleFormat (the
+// substring before {number}, e.g. "[ADR-"). Either branch composes a query
+// with NO is:open qualifier and re-parses every returned title with a regex
+// built from req.TitleFormat —
 // GitHub's in:title search is fuzzy, so a search hit is not proof the title
 // carries the [PREFIX-N] token. Non-matching/malformed titles are skipped.
 // Returns the collected numbers (possibly empty, no error). It never invents
@@ -305,20 +308,27 @@ func (p *Provider) DiscoverNumbers(ctx context.Context, req workmgmt.DiscoverNum
 	}
 
 	repoQ := req.Target.Repo.Owner + "/" + req.Target.Repo.Name
-	// Narrow discovery by the type LABEL when the type carries a default label
-	// (#1522): GitHub's recency-ordered `in:title "[E"` search buries the real
-	// max epic behind its own `[E{n}.x]` children, so the anchored re-parse
-	// finds no valid `[E{n}]` and the fail-closed allocate mis-picks a colliding
-	// low number. `label:"epic"` returns exactly the epics (children carry
-	// type:feature/etc., never epic) — a small, complete set no recency window
-	// truncates — while the anchored titleNumberRegexp re-parse stays the sole
-	// value extractor. A type without a default label keeps the title-only
-	// query (adr behaviour unchanged; its `ADR-` prefix is already selective).
-	labelQualifier := ""
+	// Compose the discovery query by branch on the type's default label
+	// (#1522/#1523). When the type carries a default label, query by
+	// `label:"<label>"` ALONE — dropping the in:title term entirely. #1523
+	// added the label qualifier but kept the co-present in:title term, so the
+	// composed query was `repo:X label:"epic" in:title "[E"`; against the live
+	// search API the `in:title "[E"` term matches nothing (`[` is not indexed,
+	// `E` is too short for the fuzzy term) and, AND-ed with `label:epic`, it
+	// collapses the otherwise-complete label result to zero — the #1522 root
+	// cause #1523 left in place, so the fail-closed allocate mis-picks a
+	// colliding low number. `label:"epic"` returns exactly the epics (children
+	// carry type:feature/etc., never epic) — a small, complete set no recency
+	// window truncates — while the anchored titleNumberRegexp re-parse stays the
+	// sole value extractor. A type WITHOUT a default label keeps the selective
+	// in:title-only query (its literal prefix, e.g. `[ADR-`, still narrows the
+	// fuzzy search).
+	var query string
 	if len(req.DefaultLabels) > 0 {
-		labelQualifier = " label:" + labelSearchQualifier(req.DefaultLabels[0])
+		query = fmt.Sprintf(`repo:%s label:%s`, repoQ, labelSearchQualifier(req.DefaultLabels[0]))
+	} else {
+		query = fmt.Sprintf(`repo:%s in:title "%s"`, repoQ, titleNumberSearchPrefix(req.TitleFormat))
 	}
-	query := fmt.Sprintf(`repo:%s%s in:title "%s"`, repoQ, labelQualifier, titleNumberSearchPrefix(req.TitleFormat))
 	hits, err := p.api.SearchIssuesByTitle(ctx, inst, query)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: search issues by title: %w", err)
