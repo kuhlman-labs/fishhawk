@@ -13,7 +13,7 @@ This directory is its own Go module (`github.com/kuhlman-labs/fishhawk/cli`) so 
 
 ## Status
 
-E6.1 (#55), E6.2 (#33), E6.3 (#34), E6.4 (#35), E6.5 (#36) shipped: scaffold + `run start`, `run status`, `run list`, `run cancel`, `run open`, `validate`. E18.1 (#332), E18.2 (#333), E18.3 (#334), E18.4 (#335), E18.5 (#336) added `plan approve`, `plan reject`, `run retry`, `audit list`, `audit tail`. E23.8 (#1388) added `deploy status`, `deploy approve`, `deploy reject`, `deploy rollback`. E25.9 (#1448) added `campaign start`, `campaign status`, `campaign list`, `campaign resume`.
+E6.1 (#55), E6.2 (#33), E6.3 (#34), E6.4 (#35), E6.5 (#36) shipped: scaffold + `run start`, `run status`, `run list`, `run cancel`, `run open`, `validate`. E18.1 (#332), E18.2 (#333), E18.3 (#334), E18.4 (#335), E18.5 (#336) added `plan approve`, `plan reject`, `run retry`, `audit list`, `audit tail`. E23.8 (#1388) added `deploy status`, `deploy approve`, `deploy reject`, `deploy rollback`. E25.9 (#1448) added `campaign start`, `campaign status`, `campaign list`, `campaign resume`. E29.3 (#1504) added `init`.
 
 ## Subcommands
 
@@ -39,6 +39,7 @@ fishhawk audit list   <run-id> [--category C] [--stage UUID] [--limit N] [--curs
 fishhawk audit tail   <run-id> [--interval D] [--output text|json] [--max-polls N]
 fishhawk diagnose     <run-id> [--output text|json]
 fishhawk report-issue <run-id> [--kind bug|feature] [--description T] [--include-free-text] [--output text|json]
+fishhawk init         [--preset low|medium|high] [--working-dir D] [--budget-usd N] [--single-reviewer] [--human-gates ids] [--force] [--repo owner/name]
 fishhawk validate     [path]                   # default: .fishhawk/workflows.yaml
 fishhawk doctor       [--repo owner/name] [--working-dir D] [--runner-binary P]
 fishhawk version
@@ -47,6 +48,8 @@ fishhawk version
 `doctor` runs the local-loop preflight: it checks the Docker stack (daemon, postgres, minio), backend reachability + token acceptance, the committed workflow spec, the runner binary, MCP registration, the git remote/working tree, `gh` auth, and cross-binary version/schema drift. Each rung prints `ok` / `warn` / `fail` plus a remediation hint; the command exits non-zero if any rung fails (warnings alone still exit 0).
 
 Since E29.5 `doctor` also runs a per-repo **onboarding preflight** — the prerequisites that make a repo *look* onboarded but wedge on the first run. Four rungs are read from the backend readiness endpoint (`GET /v0/onboarding/readiness`): **app installed** (the Fishhawk GitHub App on the target repo), **reviewer available: `<provider>`** per spec-declared reviewer (carrying the adapter's missing-env hint), **token scope adequate** (the run-driving scope subset, with the missing scopes named), and **workflow spec (committed) valid** (the spec on the repo's default branch parses + validates). A fifth rung, **execution path configured**, is checked client-side against the discovered `.fishhawk/workflows.yaml`: it fails when *any* stage declares no executor, naming the unconfigured stage(s). The onboarding rungs target the repo named by `--repo owner/name`; when omitted it is auto-detected from the working dir's git origin, and an unresolved repo degrades to a single warning rather than failing the command. See `docs/onboarding.md` for the full check list and remediations.
+
+`init` is the primary onboarding surface: it scaffolds a repo for Fishhawk in one command. It resolves the repo root (walks up from `--working-dir` to the `.git` boundary), writes a schema-valid `.fishhawk/workflows.yaml` from `--preset` (low/medium/high, default medium) plus optional deltas (`--budget-usd` overrides the weekly advisory cost ceiling; `--single-reviewer` drops the Codex agent reviewer; `--human-gates id,id` keeps human gates only on the named stages), then ensures the managed agent-docs bridge (AGENTS.md block + CLAUDE.md `@AGENTS.md` import). It reuses the E29.1 preset generator (which validates its output and fails closed on an invalid delta) and the E29.2 bridge package (idempotent). The spec write is **non-destructive**: an existing `.fishhawk/workflows.yaml` is refused (exit non-zero, file untouched) unless `--force`. `init` then prints the three out-of-band prerequisites it does not perform — install the GitHub App, issue an operator token, and configure the execution path (`.github/workflows/fishhawk.yml`, `vars.FISHHAWK_BACKEND_URL`, reviewer API-key secrets) — and closes by running the `doctor` preflight. A `doctor` failure does not fail `init`: the scaffold succeeded, so `init` reports the issues and still exits 0. See `docs/onboarding.md` for the full flow.
 
 `diagnose` prints a run's **product-facts-only** diagnostic bundle (`GET /v0/runs/{id}/diagnostics`): run id, stage states, the failing stage's category + audit surface, audit sequence range, build versions + git SHAs, workflow spec hash, and runner kind. It is pure read — the bundle carries no diffs, paths, prompts, or free text, so it is safe to attach to an upstream Fishhawk product report.
 
