@@ -1147,12 +1147,13 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // as a drift guard: any byte change (an unintended edit, or a docs/spec
 // sync that did not land in the embedded copy) fails this test deliberately.
 // The hash is re-pinned only for a sanctioned additive-optional change within
-// standard_v1.x — most recently the #1013 model_recommendation field. A
-// standard_v1 plan that omits the new optional fields must still validate
-// unchanged through the plan-only Validate entry point (asserted below),
-// which is the proof the change did not break the schema in place.
+// standard_v1.x — most recently the #1529 verification.acceptance_criteria /
+// out_of_scope fields. A standard_v1 plan that omits the new optional fields
+// must still validate unchanged through the plan-only Validate entry point
+// (asserted below), which is the proof the change did not break the schema in
+// place.
 func TestPlanSchemaFrozen(t *testing.T) {
-	const wantHash = "ec31a64b33bd131bb8bc9cea4175bccf2ff9ac57f722d7baf88fd496dba2f9e3"
+	const wantHash = "5ad129d5c22737f2ed21291abb75f5e3129b010c4e991aa3918243d220371d28"
 	b, err := os.ReadFile("schemas/plan-standard-v1.schema.json")
 	if err != nil {
 		t.Fatalf("read embedded plan schema: %v", err)
@@ -1164,5 +1165,105 @@ func TestPlanSchemaFrozen(t *testing.T) {
 
 	if err := plan.Validate(readFixture(t, "valid/example.json")); err != nil {
 		t.Errorf("standard_v1 plan no longer validates through Validate: %v", err)
+	}
+}
+
+// --- verification.acceptance_criteria (#1529) ---
+
+// TestParse_AcceptanceCriteria_RoundTrips exercises the full seam (schema →
+// JSON-decode → semanticCheck) via plan.Parse on the well-formed fixture,
+// asserting the criteria decode faithfully — ids, source values, and the
+// *bool Blocking pointer that distinguishes an explicit false from omitted.
+func TestParse_AcceptanceCriteria_RoundTrips(t *testing.T) {
+	p, err := plan.Parse(readFixture(t, "valid/acceptance-criteria.json"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ac := p.Verification.AcceptanceCriteria
+	if got, want := len(ac), 2; got != want {
+		t.Fatalf("acceptance_criteria len = %d, want %d", got, want)
+	}
+	if got, want := ac[0].ID, "typed-criteria-parse"; got != want {
+		t.Errorf("criteria[0].ID = %q, want %q", got, want)
+	}
+	if got, want := ac[0].Source, plan.CriterionSourceExplicit; got != want {
+		t.Errorf("criteria[0].Source = %q, want %q", got, want)
+	}
+	if ac[0].Blocking != nil {
+		t.Errorf("criteria[0].Blocking = %v, want nil (omitted)", *ac[0].Blocking)
+	}
+	if got, want := ac[1].ID, "blocking-default-applied"; got != want {
+		t.Errorf("criteria[1].ID = %q, want %q", got, want)
+	}
+	if got, want := ac[1].Source, plan.CriterionSourceInferred; got != want {
+		t.Errorf("criteria[1].Source = %q, want %q", got, want)
+	}
+	if ac[1].Rationale == "" {
+		t.Error("criteria[1].Rationale should be populated for an inferred criterion")
+	}
+	if ac[1].Blocking == nil {
+		t.Fatal("criteria[1].Blocking should be non-nil (explicit false)")
+	}
+	if *ac[1].Blocking {
+		t.Errorf("criteria[1].Blocking = true, want false")
+	}
+	if got, want := len(ac[1].Preconditions), 1; got != want {
+		t.Errorf("criteria[1].Preconditions len = %d, want %d", got, want)
+	}
+	if got, want := len(p.Verification.OutOfScope), 1; got != want {
+		t.Errorf("out_of_scope len = %d, want %d", got, want)
+	}
+}
+
+// acceptanceCriteriaOption returns an Option that sets verification's
+// acceptance_criteria to the given list of criterion maps.
+func acceptanceCriteriaOption(criteria ...map[string]any) func(map[string]any) {
+	return func(m map[string]any) {
+		v := m["verification"].(map[string]any)
+		items := make([]any, len(criteria))
+		for i, c := range criteria {
+			items[i] = c
+		}
+		v["acceptance_criteria"] = items
+	}
+}
+
+// TestParse_AcceptanceCriteria_DuplicateID_IsSemanticError asserts the new
+// semanticCheck branch fires on a NON-decomposed plan — a regression guard
+// against re-introducing the pre-check early return.
+func TestParse_AcceptanceCriteria_DuplicateID_IsSemanticError(t *testing.T) {
+	m := planfixture.Valid(acceptanceCriteriaOption(
+		map[string]any{"id": "dup", "statement": "first", "source": "explicit"},
+		map[string]any{"id": "dup", "statement": "second", "source": "explicit"},
+	))
+	_, err := plan.Parse(marshalFixture(t, m))
+	var se *plan.SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SemanticError", err)
+	}
+	if !strings.Contains(se.Error(), "acceptance_criteria") || !strings.Contains(se.Error(), "duplicate id") {
+		t.Errorf("SemanticError should name acceptance_criteria and duplicate id, got %q", se.Error())
+	}
+}
+
+// TestParse_AcceptanceCriteria_InferredMissingRationale_IsSchemaError asserts
+// the schema if/then conditional (source=inferred → rationale required) — a
+// schema-level failure distinct from the semantic duplicate-id path.
+func TestParse_AcceptanceCriteria_InferredMissingRationale_IsSchemaError(t *testing.T) {
+	m := planfixture.Valid(acceptanceCriteriaOption(
+		map[string]any{"id": "no-rationale", "statement": "inferred but no rationale", "source": "inferred"},
+	))
+	err := plan.Validate(marshalFixture(t, m))
+	var se *plan.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+}
+
+// TestParse_NoAcceptanceCriteria_StillValidates is the additive proof: the
+// existing example.json fixture (no acceptance_criteria) validates unchanged.
+func TestParse_NoAcceptanceCriteria_StillValidates(t *testing.T) {
+	if err := plan.Validate(readFixture(t, "valid/example.json")); err != nil {
+		t.Fatalf("Validate: %v", err)
 	}
 }

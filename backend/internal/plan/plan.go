@@ -295,4 +295,44 @@ type ApproachStep struct {
 type Verification struct {
 	TestStrategy string `json:"test_strategy"`
 	RollbackPlan string `json:"rollback_plan"`
+	// AcceptanceCriteria is the optional structured acceptance-criteria
+	// contract (ADR-049 #3, E31 wave 0). Additive-optional within
+	// standard_v1; annotated x-intended-required in the schema to signal a
+	// future required-promotion soak. Nil/empty means the plan predates the
+	// typed contract (older plans validate unchanged).
+	AcceptanceCriteria []AcceptanceCriterion `json:"acceptance_criteria,omitempty"`
+	// OutOfScope lists what the change deliberately does NOT cover, so
+	// reviewers and downstream acceptance don't treat an omission as a gap.
+	OutOfScope []string `json:"out_of_scope,omitempty"`
 }
+
+// AcceptanceCriterion is one entry in Verification.AcceptanceCriteria. Its
+// ID is the unique join key threaded across plan → acceptance execution →
+// evidence → triage → feedback; semanticCheck enforces uniqueness within a
+// plan. JSON tags mirror the acceptance-criterion $def in the schema.
+type AcceptanceCriterion struct {
+	// ID is the slug join key — unique within a plan's acceptance_criteria —
+	// tying this criterion to its downstream execution, evidence, triage, and
+	// feedback records.
+	ID        string          `json:"id"`
+	Statement string          `json:"statement"`
+	Source    CriterionSource `json:"source"`
+	SourceRef string          `json:"source_ref,omitempty"`
+	Rationale string          `json:"rationale,omitempty"`
+	// Blocking is a pointer so an omitted value (nil) is distinguishable from
+	// an explicit false; consumers apply the schema default (true) when nil.
+	Blocking      *bool    `json:"blocking,omitempty"`
+	VerifyHint    string   `json:"verify_hint,omitempty"`
+	Preconditions []string `json:"preconditions,omitempty"`
+}
+
+// CriterionSource is the provenance of an acceptance criterion, drawn from a
+// closed set: explicit (stated in the ticket/spec) or inferred (derived by
+// the agent, which requires a rationale per the schema conditional).
+type CriterionSource string
+
+// Criterion provenance values per the schema.
+const (
+	CriterionSourceExplicit CriterionSource = "explicit"
+	CriterionSourceInferred CriterionSource = "inferred"
+)
