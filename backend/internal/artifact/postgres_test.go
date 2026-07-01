@@ -151,6 +151,64 @@ func TestPostgres_CreateAndGet_DeploymentKind(t *testing.T) {
 	}
 }
 
+// TestPostgres_CreateAndGet_AcceptanceKind pins E31.3 / #1531: the
+// `acceptance` artifact kind (ADR-049) round-trips through Create + Get +
+// ListForStage. This is the real-DB assertion that migration 0045 widened
+// artifacts_kind_check to admit it — the pgtest template auto-applies 0045,
+// so a Create with KindAcceptance that would fail SQLSTATE 23514 against the
+// un-migrated three-value CHECK succeeds here. The constant + migration
+// coupling gate: if either is missing, this test fails.
+func TestPostgres_CreateAndGet_AcceptanceKind(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := artifact.NewPostgresRepository(pool)
+	stageID := makeStage(t, pool)
+
+	body, err := json.Marshal(map[string]any{
+		"outcome": "accepted",
+		"criteria": []map[string]any{
+			{"id": "AC-1", "passed": true, "evidence_hash": "abc123"},
+			{"id": "AC-2", "passed": true, "evidence_hash": "def456"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := repo.Create(context.Background(), artifact.CreateParams{
+		StageID:     stageID,
+		Kind:        artifact.KindAcceptance,
+		Content:     body,
+		ContentHash: sha256Hex(body),
+	})
+	if err != nil {
+		t.Fatalf("Create acceptance artifact (migration 0045 must admit the kind): %v", err)
+	}
+	if created.Kind != artifact.KindAcceptance {
+		t.Errorf("Kind = %q, want acceptance", created.Kind)
+	}
+
+	got, err := repo.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Kind != artifact.KindAcceptance {
+		t.Errorf("round-tripped Kind = %q, want acceptance", got.Kind)
+	}
+
+	listed, err := repo.ListForStage(context.Background(), stageID)
+	if err != nil {
+		t.Fatalf("ListForStage: %v", err)
+	}
+	var found bool
+	for _, a := range listed {
+		if a.ID == created.ID && a.Kind == artifact.KindAcceptance {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("ListForStage did not return the acceptance artifact; got %d artifacts", len(listed))
+	}
+}
+
 func TestPostgres_GetArtifact_NotFound(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := artifact.NewPostgresRepository(pool)

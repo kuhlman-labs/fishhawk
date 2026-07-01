@@ -505,6 +505,31 @@ Notes:
   here so dispatch and outcome render consistently. The handler refreshes the
   sticky living-anchor comment via the separate `notifyStatusUpdate` hook (like
   the PR-upload handler), not by posting a dedicated comment.
+- The acceptance-stage evidence audit kinds — `acceptance_dispatched`,
+  `acceptance_outcome_recorded`, and `acceptance_triage_decided` (E31.3 / #1531,
+  ADR-049) — are **system-actor audit kinds with NO dedicated Notifier
+  method**, mirroring the deploy governance kinds above (and
+  `slices_integrated` / `model_resolved`): nothing in `issuecomment` posts them
+  via a dedicated method. Instead they render **data-drivenly** through the
+  `activityCategories` set in `status_template.go` (rendered as "Acceptance
+  dispatched" / "Acceptance recorded — `<outcome>` (`<passed>`/`<total>`
+  criteria passed)" / "Acceptance triage — class-`<class>`: `<disposition>`",
+  each degrading field-by-field to its bare verb when a payload field is
+  absent/undecodable), which both `RenderStatusBody` and `renderAnchorTimeline`
+  consume — so the acceptance dispatch, recorded outcome, and triage
+  disposition surface on the living anchor with no per-kind Notifier code (and
+  `notifier.go`'s actor `@`-mention render surface is genuinely uninvolved:
+  these are fixed system-actor verb phrases that never `@`-mention an
+  approver). They follow the same deployment-precedent exemption from the
+  notifier surface-sweep: adding a system-actor render-only audit kind adds no
+  Notifier method (the change that added the deploy kinds, PR #1395 / commit
+  f227dbb, likewise never touched the notifier source). The payload tags
+  (`{outcome, criteria_passed, criteria_total, class, disposition}`) DEFINE the
+  contract the future writers emit to: the E31.6 acceptance-outcome handler
+  writes `acceptance_dispatched` / `acceptance_outcome_recorded`, and the E31.8
+  triage writes `acceptance_triage_decided`. Both are forward references —
+  those handlers do not exist yet; this slice (E31.3) introduces the kinds as
+  render-only constants so the timeline is ready when the writers land.
 - The bounded-retry give-up audit kind — `slice_integration_failed` (#1243) —
   is a **system-actor audit kind with no dedicated Notifier method and is NOT
   an issue-comment surface**. The child-completion sweeper

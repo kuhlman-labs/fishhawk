@@ -618,11 +618,14 @@ type ArtifactKind string
 
 // Artifact kinds per the schema. plan/pull_request are the v0 set;
 // deployment is the v1 deploy-stage artifact (ADR-038 / #925) — valid
-// only on a deploy stage, enforced by Validate.
+// only on a deploy stage; acceptance is the v1.2 acceptance-stage
+// artifact (ADR-049 / #1531) — valid only on an acceptance stage. Both
+// stage-type bindings are enforced by Validate.
 const (
 	ArtifactPlan        ArtifactKind = "plan"
 	ArtifactPullRequest ArtifactKind = "pull_request"
 	ArtifactDeployment  ArtifactKind = "deployment"
+	ArtifactAcceptance  ArtifactKind = "acceptance"
 )
 
 // Persistence says where an artifact is stored.

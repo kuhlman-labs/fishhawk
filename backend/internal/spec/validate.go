@@ -169,6 +169,20 @@ func validateWorkflow(s *Spec, name string, wf *Workflow) error {
 					),
 				}
 			}
+			// The acceptance artifact (ADR-049 / #1531) is emitted only by
+			// an acceptance stage; declaring it elsewhere is a binding error.
+			// Mirror of the deployment binding above — the produces $def is
+			// shared across every stage type, so this stage-type pairing is a
+			// graph-shape rule enforced here rather than in the JSON Schema.
+			if p.Artifact == ArtifactAcceptance && stage.Type != StageTypeAcceptance {
+				return &ValidationError{
+					Path: stagePath(i, fmt.Sprintf("/produces/%d/artifact", j)),
+					Message: fmt.Sprintf(
+						"acceptance artifact is valid only on an acceptance stage, not a %q stage (ADR-049)",
+						stage.Type,
+					),
+				}
+			}
 		}
 
 		// Approver role refs must resolve.

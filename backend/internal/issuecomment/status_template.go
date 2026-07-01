@@ -152,6 +152,16 @@ var activityCategories = map[string]struct{}{
 	"deployment_outcome_recorded":   {},
 	"deployment_rollback_initiated": {},
 	"deployment_rollback_completed": {},
+	// Acceptance stage evidence trail (E31.3 / #1531, ADR-049). Like the
+	// deploy governance kinds above, these are system-actor audit kinds with
+	// NO dedicated Notifier method — they render data-drivenly through this
+	// set (and renderActivityLine below), so the acceptance dispatch, the
+	// recorded outcome, and the triage disposition surface on the living
+	// anchor / status comment timeline without per-kind Notifier code. The
+	// E31.6 outcome handler and E31.8 triage are the (future) writers.
+	"acceptance_dispatched":       {},
+	"acceptance_outcome_recorded": {},
+	"acceptance_triage_decided":   {},
 }
 
 // renderActivityLine returns a user-readable verb-phrase for an
@@ -200,6 +210,12 @@ func renderActivityLine(e *audit.Entry) string {
 		return renderDeployLine("Deploy rollback initiated", e.Payload)
 	case "deployment_rollback_completed":
 		return renderDeployLine("Deploy rollback completed", e.Payload)
+	case "acceptance_dispatched":
+		return renderAcceptanceLine("Acceptance dispatched")
+	case "acceptance_outcome_recorded":
+		return renderAcceptanceOutcomeLine(e.Payload)
+	case "acceptance_triage_decided":
+		return renderAcceptanceTriageLine(e.Payload)
 	default:
 		if actor == "" {
 			return e.Category
@@ -367,6 +383,89 @@ func decodeDeployActivity(payload json.RawMessage) (environment, outcome string)
 		return "", ""
 	}
 	return p.Environment, p.Outcome
+}
+
+// renderAcceptanceLine renders a bare acceptance activity verb (E31.3 /
+// #1531). The dispatch row carries no enrichable payload fields — unlike the
+// deploy dispatch's environment — so it renders as the verb alone; the helper
+// exists for symmetry with the outcome/triage renderers and as a stable place
+// to enrich later.
+func renderAcceptanceLine(verb string) string {
+	return verb
+}
+
+// renderAcceptanceOutcomeLine renders an acceptance_outcome_recorded row with
+// the settled outcome and the per-criterion pass tally, e.g. "Acceptance
+// recorded — accepted (3/4 criteria passed)". Degrades field-by-field like
+// renderDeployOutcomeLine: a missing outcome or an absent/zero criteria total
+// drops the corresponding clause, and an empty/undecodable payload degrades to
+// the bare verb.
+func renderAcceptanceOutcomeLine(payload json.RawMessage) string {
+	a := decodeAcceptanceActivity(payload)
+	switch {
+	case a.outcome != "" && a.criteriaTotal > 0:
+		return fmt.Sprintf("Acceptance recorded — %s (%d/%d criteria passed)", a.outcome, a.criteriaPassed, a.criteriaTotal)
+	case a.outcome != "":
+		return fmt.Sprintf("Acceptance recorded — %s", a.outcome)
+	case a.criteriaTotal > 0:
+		return fmt.Sprintf("Acceptance recorded — %d/%d criteria passed", a.criteriaPassed, a.criteriaTotal)
+	}
+	return "Acceptance recorded"
+}
+
+// renderAcceptanceTriageLine renders an acceptance_triage_decided row with the
+// finding class and its disposition, e.g. "Acceptance triage — class-3:
+// waived". Degrades field-by-field: a missing class or disposition drops that
+// clause, and an empty/undecodable payload degrades to the bare verb.
+func renderAcceptanceTriageLine(payload json.RawMessage) string {
+	a := decodeAcceptanceActivity(payload)
+	switch {
+	case a.class != "" && a.disposition != "":
+		return fmt.Sprintf("Acceptance triage — class-%s: %s", a.class, a.disposition)
+	case a.disposition != "":
+		return fmt.Sprintf("Acceptance triage — %s", a.disposition)
+	case a.class != "":
+		return fmt.Sprintf("Acceptance triage — class-%s", a.class)
+	}
+	return "Acceptance triage"
+}
+
+// acceptanceActivity carries the fields an acceptance audit payload may
+// contribute to a rendered activity line.
+type acceptanceActivity struct {
+	outcome        string
+	criteriaPassed int
+	criteriaTotal  int
+	class          string
+	disposition    string
+}
+
+// decodeAcceptanceActivity reads the {outcome, criteria_passed, criteria_total,
+// class, disposition} fields an acceptance audit payload carries — the E31.6
+// outcome / E31.8 triage payload tags, which these tags DEFINE the contract
+// those (future) handlers write to. Returns the zero value on any decode
+// failure so every acceptance activity line degrades to its bare verb.
+func decodeAcceptanceActivity(payload json.RawMessage) acceptanceActivity {
+	if len(payload) == 0 {
+		return acceptanceActivity{}
+	}
+	var p struct {
+		Outcome        string `json:"outcome"`
+		CriteriaPassed int    `json:"criteria_passed"`
+		CriteriaTotal  int    `json:"criteria_total"`
+		Class          string `json:"class"`
+		Disposition    string `json:"disposition"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return acceptanceActivity{}
+	}
+	return acceptanceActivity{
+		outcome:        p.Outcome,
+		criteriaPassed: p.CriteriaPassed,
+		criteriaTotal:  p.CriteriaTotal,
+		class:          p.Class,
+		disposition:    p.Disposition,
+	}
 }
 
 func retryAttemptSuffix(payload json.RawMessage) string {

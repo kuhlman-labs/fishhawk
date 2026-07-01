@@ -304,6 +304,125 @@ func TestRenderStatusBody_DeployActivity(t *testing.T) {
 	}
 }
 
+// TestRenderStatusBody_AcceptanceActivity pins E31.3 / #1531: the acceptance
+// audit kinds are admitted by pickActivity (not filtered as noise) and
+// rendered with brand-compliant verb phrases — the outcome row carries the
+// settled verdict + per-criterion tally, the triage row the class + disposition.
+func TestRenderStatusBody_AcceptanceActivity(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	cases := []struct {
+		name     string
+		category string
+		payload  map[string]any
+		want     string
+	}{
+		{
+			name:     "dispatched renders the bare verb",
+			category: "acceptance_dispatched",
+			payload:  nil,
+			want:     "Acceptance dispatched",
+		},
+		{
+			name:     "outcome carries verdict and criteria tally",
+			category: "acceptance_outcome_recorded",
+			payload:  map[string]any{"outcome": "accepted", "criteria_passed": 3, "criteria_total": 4},
+			want:     "Acceptance recorded — accepted (3/4 criteria passed)",
+		},
+		{
+			name:     "triage carries class and disposition",
+			category: "acceptance_triage_decided",
+			payload:  map[string]any{"class": "3", "disposition": "waived"},
+			want:     "Acceptance triage — class-3: waived",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := []*audit.Entry{
+				auditEntry(runID, 1, tc.category, "system", now.Add(-1*time.Minute), tc.payload),
+			}
+			body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+			if !strings.Contains(body, tc.want) {
+				t.Errorf("expected %q in the activity section\n---\n%s", tc.want, body)
+			}
+		})
+	}
+}
+
+// TestRenderStatusBody_AcceptanceActivity_Degrades covers the outcome and
+// triage renderers' degrade branches: an empty payload and a malformed-JSON
+// payload both fall back to the bare verb (never the enriched clause, never a
+// dropped row or panic) — the per-failure-mode coverage the deploy renderers
+// have.
+func TestRenderStatusBody_AcceptanceActivity_Degrades(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	cases := []struct {
+		name     string
+		category string
+		payload  json.RawMessage
+		want     string
+		notWant  string
+	}{
+		{"outcome empty payload", "acceptance_outcome_recorded", nil, "Acceptance recorded", "criteria passed"},
+		{"outcome malformed json", "acceptance_outcome_recorded", json.RawMessage("{not json"), "Acceptance recorded", "criteria passed"},
+		{"triage empty payload", "acceptance_triage_decided", nil, "Acceptance triage", "class-"},
+		{"triage malformed json", "acceptance_triage_decided", json.RawMessage("{not json"), "Acceptance triage", "class-"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &audit.Entry{
+				ID:        uuid.New(),
+				Sequence:  1,
+				RunID:     &runID,
+				Timestamp: now.Add(-1 * time.Minute),
+				Category:  tc.category,
+				Payload:   tc.payload,
+			}
+			body := issuecomment.RenderStatusBody(r, stages, []*audit.Entry{e}, "https://x", now)
+			if !strings.Contains(body, tc.want) {
+				t.Errorf("expected degrade to bare verb %q\n---\n%s", tc.want, body)
+			}
+			if strings.Contains(body, tc.notWant) {
+				t.Errorf("degrade should not render the enriched clause %q\n---\n%s", tc.notWant, body)
+			}
+		})
+	}
+}
+
+// TestRenderStatusBody_AcceptanceActivity_NotFilteredAsNoise proves the three
+// acceptance kinds survive pickActivity's noise filter (they are members of
+// activityCategories) — a comment-only touch of the set fails this — while a
+// genuine noise category (trace_uploaded) alongside them is dropped.
+func TestRenderStatusBody_AcceptanceActivity_NotFilteredAsNoise(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	entries := []*audit.Entry{
+		auditEntry(runID, 5, "acceptance_dispatched", "system", now.Add(-3*time.Minute), nil),
+		auditEntry(runID, 6, "acceptance_outcome_recorded", "system", now.Add(-2*time.Minute),
+			map[string]any{"outcome": "accepted", "criteria_passed": 2, "criteria_total": 2}),
+		auditEntry(runID, 7, "acceptance_triage_decided", "system", now.Add(-1*time.Minute),
+			map[string]any{"class": "3", "disposition": "waived"}),
+		auditEntry(runID, 8, "trace_uploaded", "system", now, nil),
+	}
+	body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+	for _, want := range []string{
+		"Acceptance dispatched",
+		"Acceptance recorded — accepted (2/2 criteria passed)",
+		"Acceptance triage — class-3: waived",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("acceptance kind dropped as noise; missing %q\n---\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "trace_uploaded") {
+		t.Errorf("noise category leaked into the activity section\n---\n%s", body)
+	}
+}
+
 func TestRenderStatusBody_NoActivity_OmitsLatestSection(t *testing.T) {
 	r, stages := statusRun(t, uuid.New())
 	body := issuecomment.RenderStatusBody(r, stages, nil, "https://x", time.Now())

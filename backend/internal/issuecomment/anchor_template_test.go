@@ -92,6 +92,29 @@ func TestRenderAnchorBody_DeployTimeline(t *testing.T) {
 	}
 }
 
+// TestRenderAnchorBody_AcceptanceTimeline pins E31.3 / #1531: the acceptance
+// evidence audit kinds surface on the living-anchor timeline (which reuses
+// pickActivity + renderActivityLine), so a rebuilt anchor's recent-activity
+// block shows the acceptance outcome with no anchor-specific rendering code —
+// the issue's "anchor rebuild from the audit chain shows the acceptance
+// outcome" criterion, exercised through the real anchor build path.
+func TestRenderAnchorBody_AcceptanceTimeline(t *testing.T) {
+	payload, _ := json.Marshal(map[string]any{"outcome": "accepted", "criteria_passed": 3, "criteria_total": 4})
+	entries := []*audit.Entry{
+		{Sequence: 8, Category: "acceptance_outcome_recorded", Payload: payload, Timestamp: time.Unix(8, 0).UTC()},
+	}
+	body := RenderAnchorBody(AnchorInput{
+		Run:         anchorRun(),
+		Stages:      []*run.Stage{{Type: run.StageTypeAcceptance, State: run.StageStateRunning}},
+		Audit:       entries,
+		ExternalURL: "https://app.example",
+		Now:         time.Unix(1000, 0).UTC(),
+	})
+	if !strings.Contains(body, "Acceptance recorded — accepted (3/4 criteria passed)") {
+		t.Errorf("anchor timeline missing the acceptance outcome:\n%s", body)
+	}
+}
+
 // TestRenderAnchorBody_ModelRecommendationAndResolved pins #1013: the anchor
 // renders the plan's model_recommendation (implement_model + rationale) under
 // the plan, and the gate's resolved model_resolved {value, source} as a
