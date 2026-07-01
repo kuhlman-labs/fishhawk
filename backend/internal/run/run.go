@@ -142,12 +142,18 @@ type StageType string
 // Stage types. plan/implement/review are the v0 closed set per MVP_SPEC
 // §4.1; `deploy` is the v1 delegating release stage (ADR-038 / #925, E23.4)
 // whose effect is the side effect — its gate is PRE-execution, see
-// StageStateAwaitingDeployApproval.
+// StageStateAwaitingDeployApproval. `acceptance` is the v1 runner-hosted
+// advisory acceptance stage (ADR-049 / #1519, E31.2): unlike deploy it adds
+// NO new stage states — it rides the existing agent-stage lifecycle exactly
+// like review (deploy's two park states were the exception for its
+// delegating pre-execution shape, not the pattern). The gate/orchestration/
+// runner semantics that consume the type land in E31.6/E31.7.
 const (
-	StageTypePlan      StageType = "plan"
-	StageTypeImplement StageType = "implement"
-	StageTypeReview    StageType = "review"
-	StageTypeDeploy    StageType = "deploy"
+	StageTypePlan       StageType = "plan"
+	StageTypeImplement  StageType = "implement"
+	StageTypeReview     StageType = "review"
+	StageTypeDeploy     StageType = "deploy"
+	StageTypeAcceptance StageType = "acceptance"
 )
 
 // ExecutorKind says who executes the stage.

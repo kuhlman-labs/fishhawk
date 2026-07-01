@@ -19,7 +19,13 @@ import "fmt"
 //     live in the JSON Schema because the executor/constraint $defs are
 //     shared across every stage type. The rules are version-agnostic —
 //     they never fire on a v0 spec because the v0 schema rejects the
-//     deploy members before Validate runs.
+//     deploy members before Validate runs. The `acceptance` stage type
+//     (ADR-049 / #1519, E31.2) is a non-deploy agent/human stage, so it
+//     is covered by the SAME non-deploy branches with no acceptance-
+//     specific code: a delegating executor, a pre-flight deploy
+//     constraint, or the deployment artifact on an acceptance stage each
+//     falls into the isDeploy==false else-branch below and is rejected
+//     exactly as on any other non-deploy stage.
 //
 // Validate is exported so tests and Spec-builder code can exercise
 // the semantic layer without the YAML→schema round trip.
@@ -77,7 +83,10 @@ func validateWorkflow(s *Spec, name string, wf *Workflow) error {
 				}
 			}
 		} else if stage.Executor.Delegate != nil {
-			// A delegating executor is meaningless off a deploy stage.
+			// A delegating executor is meaningless off a deploy stage. This
+			// else-branch is type-generic: it fires for an acceptance stage
+			// (ADR-049) exactly as for plan/implement/review — acceptance is an
+			// agent/human stage, never delegating.
 			return &ValidationError{
 				Path:    stagePath(i, "/executor/delegate"),
 				Message: fmt.Sprintf("delegating executor (executor.delegate) is valid only on a deploy stage, not a %q stage (ADR-038)", stage.Type),
