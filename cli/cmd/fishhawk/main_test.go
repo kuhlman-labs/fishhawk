@@ -63,6 +63,19 @@ func TestRun_Help_ListsDeployVerbs(t *testing.T) {
 	}
 }
 
+func TestRun_Help_ListsInit(t *testing.T) {
+	// E29.3 / #1504: the init verb must be discoverable in the usage
+	// listing, matching the TestRun_Help_ListsReportIssue (#1006) and
+	// TestRun_Help_ListsDeployVerbs (#1388) convention.
+	var stdout strings.Builder
+	if got := run([]string{"help"}, &stdout, io.Discard); got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	if !strings.Contains(stdout.String(), "init") {
+		t.Errorf("usage missing 'init' verb:\n%s", stdout.String())
+	}
+}
+
 func TestRun_Version(t *testing.T) {
 	var stdout strings.Builder
 	got := run([]string{"version"}, &stdout, io.Discard)

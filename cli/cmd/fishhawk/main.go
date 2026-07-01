@@ -21,6 +21,7 @@
 //	fishhawk campaign resume <campaign-id> [--output text|json]
 //	fishhawk audit list   <run-id> [--category C] [--stage UUID] [--limit N] [--cursor X] [--output text|json]
 //	fishhawk audit tail   <run-id> [--interval D] [--output text|json] [--max-polls N]
+//	fishhawk init         [--preset low|medium|high] [--working-dir D] [--budget-usd N] [--single-reviewer] [--human-gates ids] [--force] [--repo R]
 //	fishhawk file-issue   --repo R --type T --summary S [--body B] [--label L]... [--parent-epic E] [--run-id ID] [--output text|json]
 //	fishhawk diagnose     <run-id> [--output text|json]
 //	fishhawk report-issue <run-id> [--kind bug|feature] [--description T] [--include-free-text] [--output text|json]
@@ -74,6 +75,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runCampaign(rest, stdout, stderr)
 	case "audit":
 		return runAudit(rest, stdout, stderr)
+	case "init":
+		return runInit(rest, stdout, stderr)
 	case "validate":
 		return runValidate(rest, stdout, stderr)
 	case "runner":
@@ -140,6 +143,7 @@ func printUsage(w io.Writer) {
 		"  campaign resume Resume a paused campaign (hand back to the auto-driver).",
 		"  audit list   List audit entries for a run.",
 		"  audit tail   Follow the audit log of a run in real time.",
+		"  init         Scaffold a repo for Fishhawk (workflow spec + agent docs + preflight).",
 		"  validate     Validate a workflow spec file locally.",
 		"  doctor       Run local-loop install checks.",
 		"  file-issue   File a work item (issue/bug/chore/adr) via repo conventions.",
