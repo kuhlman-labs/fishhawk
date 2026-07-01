@@ -65,6 +65,11 @@ workflows:
           agent: claude-code
 `
 
+// onboardingMalformedSpecYAML is syntactically broken YAML (an unterminated
+// flow mapping) so spec.ParseBytes fails at the YAML-decode layer — a distinct
+// arm from onboardingInvalidSpecYAML, which parses but fails semantic Validate.
+const onboardingMalformedSpecYAML = "version: \"1.0\"\nworkflows: {unterminated"
+
 // newOnboardingServer builds a Server wired with an optional GitHub client
 // (pointing at ghSrv) and an optional reviewer set — the only two
 // dependencies the readiness endpoint touches. A nil ghSrv leaves cfg.GitHub
@@ -154,7 +159,7 @@ func TestOnboardingReadiness_AnonymousThroughHandler(t *testing.T) {
 func TestOnboardingReadiness_MalformedRepo(t *testing.T) {
 	s := newOnboardingServer(t, nil, nil)
 	id := testOperatorIdentity()
-	for _, repo := range []string{"noslash", "", "/name", "owner/"} {
+	for _, repo := range []string{"noslash", "", "/name", "owner/", "owner/name/extra"} {
 		w := httptest.NewRecorder()
 		s.handleGetOnboardingReadiness(w, onboardingReq(repo, &id))
 		if w.Code != http.StatusBadRequest {
@@ -362,6 +367,61 @@ func TestOnboardingReadiness_SpecInvalid(t *testing.T) {
 	}
 	if len(resp.Reviewers) != 0 {
 		t.Errorf("len(Reviewers) = %d, want 0 (invalid spec)", len(resp.Reviewers))
+	}
+}
+
+// TestOnboardingReadiness_SpecMalformed asserts a fetched but syntactically
+// malformed spec fails at the spec.ParseBytes (YAML-decode) arm — distinct from
+// the Validate arm SpecInvalid drives — surfacing Source=fetched, Valid=false,
+// Error set, and no reviewers enumerated (nil parsedSpec).
+func TestOnboardingReadiness_SpecMalformed(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingMalformedSpecYAML)
+	ghSrv := fake.server(t)
+	s := newOnboardingServer(t, ghSrv, fakeReviewerSet{providers: map[string]PlanReviewer{"anthropic": &fakePlanReviewer{}}})
+
+	id := testOperatorIdentity()
+	code, resp := decodeReadiness(t, s, onboardingReq("x/y", &id))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if resp.Spec.Source != "fetched" {
+		t.Errorf("Spec.Source = %q, want fetched", resp.Spec.Source)
+	}
+	if resp.Spec.Valid {
+		t.Errorf("Spec.Valid = true, want false (ParseBytes failure)")
+	}
+	if resp.Spec.Error == "" {
+		t.Errorf("Spec.Error empty, want the parse failure")
+	}
+	if len(resp.Reviewers) != 0 {
+		t.Errorf("len(Reviewers) = %d, want 0 (unparseable spec)", len(resp.Reviewers))
+	}
+}
+
+// TestOnboardingReadiness_SpecFetchError asserts a generic (non-ErrNotFound)
+// spec-fetch failure — here a 500 from the contents endpoint — degrades spec to
+// unavailable with the error as Note (the default switch arm), not a 404 note
+// and never a hard failure.
+func TestOnboardingReadiness_SpecFetchError(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	fake.specStatus = http.StatusInternalServerError
+	fake.specBody = `{"message":"boom"}`
+	ghSrv := fake.server(t)
+	s := newOnboardingServer(t, ghSrv, nil)
+
+	id := testOperatorIdentity()
+	code, resp := decodeReadiness(t, s, onboardingReq("x/y", &id))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (never 500 on fetch error)", code)
+	}
+	if !resp.App.Installed {
+		t.Fatalf("App.Installed = false, want true (installation OK)")
+	}
+	if resp.Spec.Source != "unavailable" || resp.Spec.Note == "" {
+		t.Errorf("Spec = %+v, want unavailable with the fetch-error note", resp.Spec)
+	}
+	if len(resp.Reviewers) != 0 {
+		t.Errorf("len(Reviewers) = %d, want 0 (spec unavailable)", len(resp.Reviewers))
 	}
 }
 

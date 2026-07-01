@@ -98,7 +98,10 @@ func (s *Server) handleGetOnboardingReadiness(w http.ResponseWriter, r *http.Req
 
 	repo := r.URL.Query().Get("repo")
 	owner, name, ok := strings.Cut(repo, "/")
-	if !ok || owner == "" || name == "" {
+	// strings.Cut splits on the FIRST "/", so a value like "owner/name/extra"
+	// would otherwise pass with name == "name/extra". Reject any residual
+	// slash: the contract is exactly one owner/name pair.
+	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"repo must be in owner/name format",
 			map[string]any{"field": "repo", "got": repo})
