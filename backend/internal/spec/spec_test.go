@@ -2632,6 +2632,109 @@ workflows:
 	}
 }
 
+// --- v1.2 acceptance artifact (E31.3 / #1531, ADR-049) ---
+
+// TestParse_V12AcceptanceArtifact_OnAcceptanceStage_Valid drives a version
+// "1.2" spec whose acceptance stage declares the acceptance produces
+// artifact through the real ParseBytes path (version routing -> v1 JSON
+// Schema with the widened produces enum -> YAML decode -> semantic
+// Validate). This is the spec-grammar-acceptance-artifact done-means: it
+// fails if the enum, the ArtifactAcceptance constant, or the mirror sync is
+// missing.
+func TestParse_V12AcceptanceArtifact_OnAcceptanceStage_Valid(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`
+version: "1.2"
+workflows:
+  feature_change:
+    stages:
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: acceptance
+`))
+	if err != nil {
+		t.Fatalf("ParseBytes(v1.2 acceptance artifact): %v", err)
+	}
+	if s.Version != "1.2" {
+		t.Errorf("version = %q, want 1.2", s.Version)
+	}
+	st := s.Workflows["feature_change"].Stages[0]
+	if st.Type != spec.StageTypeAcceptance {
+		t.Errorf("stage type = %q, want acceptance", st.Type)
+	}
+	if len(st.Produces) != 1 || st.Produces[0].Artifact != spec.ArtifactAcceptance {
+		t.Errorf("Produces = %+v, want a single acceptance artifact", st.Produces)
+	}
+}
+
+// TestParse_V12AcceptanceArtifact_OnImplementStage_Rejected asserts the new
+// binding fires: the acceptance artifact is acceptance-stage-only, so an
+// implement stage declaring it is rejected with the ADR-049 message.
+func TestParse_V12AcceptanceArtifact_OnImplementStage_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: acceptance
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Message, "acceptance artifact is valid only on an acceptance stage") {
+		t.Errorf("message = %q, want it to flag the acceptance artifact on a non-acceptance (implement) stage", ve.Message)
+	}
+}
+
+// TestParse_V12AcceptanceArtifact_OnDeployStage_Rejected asserts the same
+// binding fires on the other non-acceptance stage type: a deploy stage
+// (otherwise valid with its delegating executor) declaring the acceptance
+// artifact is rejected with the ADR-049 message.
+func TestParse_V12AcceptanceArtifact_OnDeployStage_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.2"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+        produces:
+          - artifact: acceptance
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Message, "acceptance artifact is valid only on an acceptance stage") {
+		t.Errorf("message = %q, want it to flag the acceptance artifact on a non-acceptance (deploy) stage", ve.Message)
+	}
+}
+
+// TestParse_RoutesV12Spec proves a bare version "1.2" spec routes to the v1
+// schema (minor is not routing-significant) and validates — the additive
+// 1.2 minor-bump routing done-means.
+func TestParse_RoutesV12Spec(t *testing.T) {
+	s, err := spec.ParseBytes(minimalSpecAtVersion("1.2"))
+	if err != nil {
+		t.Fatalf("ParseBytes(version 1.2): %v", err)
+	}
+	if s.Version != "1.2" {
+		t.Errorf("version = %q, want 1.2", s.Version)
+	}
+}
+
 // TestParse_RoutesV11Spec proves a bare version "1.1" spec routes to the
 // v1 schema (minor is not routing-significant) and validates — the
 // additive-minor-bump routing done-means.

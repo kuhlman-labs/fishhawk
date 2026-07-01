@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://fishhawk.dev/spec/workflow-v1.schema.json",
   "title": "Fishhawk workflow spec v1",
-  "description": "Schema for .fishhawk/workflows.yaml at major version 1. v1 began as a structural copy of workflow-v0 (ADR-046 / #1380) and now adds the deploy surface (E23.2 / #1382, per ADR-038 / #925): the `deploy` stage type, the `deployment` produces artifact, the delegating executor (executor.delegate -> github_actions workflow_ref / webhook url), and the three pre-flight deploy constraint kinds (allowed_environments, change_freeze, required_upstream). Deploy is delegating-only \u2014 Fishhawk holds no deploy logic or credentials. v1.1 adds the `acceptance` stage type (ADR-049 / #1519, E31.2): a runner-hosted advisory acceptance stage that rides the ordinary agent/human executor branches \u2014 no delegate, no deploy-only constraints/artifact. v0 stays frozen and rejects `deploy` and `acceptance` via its closed enums; the type<->executor<->constraint binding is enforced semantically by the version-agnostic validator. The version-routed validator dispatches on the version major (0.x -> this schema's sibling workflow-v0; 1.x -> this schema). Never break a published schema in place \u2014 bump the major instead.",
+  "description": "Schema for .fishhawk/workflows.yaml at major version 1. v1 began as a structural copy of workflow-v0 (ADR-046 / #1380) and now adds the deploy surface (E23.2 / #1382, per ADR-038 / #925): the `deploy` stage type, the `deployment` produces artifact, the delegating executor (executor.delegate -> github_actions workflow_ref / webhook url), and the three pre-flight deploy constraint kinds (allowed_environments, change_freeze, required_upstream). Deploy is delegating-only \u2014 Fishhawk holds no deploy logic or credentials. v1.1 adds the `acceptance` stage type (ADR-049 / #1519, E31.2): a runner-hosted advisory acceptance stage that rides the ordinary agent/human executor branches \u2014 no delegate, no deploy-only constraints. v1.2 (ADR-049 / #1531, E31.3) adds the `acceptance` produces artifact \u2014 the durable acceptance-evidence record, valid only on an acceptance stage. v0 stays frozen and rejects `deploy` and `acceptance` via its closed enums; the type<->executor<->constraint<->artifact binding is enforced semantically by the version-agnostic validator. The version-routed validator dispatches on the version major (0.x -> this schema's sibling workflow-v0; 1.x -> this schema). Never break a published schema in place \u2014 bump the major instead.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -14,9 +14,10 @@
       "type": "string",
       "enum": [
         "1.0",
-        "1.1"
+        "1.1",
+        "1.2"
       ],
-      "description": "Spec syntax version. workflow-v1 advertises 1.0 (the initial grammar plus the E23.2 deploy surface) and 1.1 (adds the `acceptance` stage type, ADR-049 / #1519). 1.1 is an additive minor — every 1.0 spec remains valid — mirroring v0's additive 0.3…0.7 minor chain. The validator routes a spec to this schema when its version major is 1 (minor is not routing-significant). Old specs in the audit log remain readable forever via their historical schemas; this enum gates *new* v1 specs only."
+      "description": "Spec syntax version. workflow-v1 advertises 1.0 (the initial grammar plus the E23.2 deploy surface), 1.1 (adds the `acceptance` stage type, ADR-049 / #1519), and 1.2 (adds the `acceptance` produces artifact, ADR-049 / #1531, E31.3). Each is an additive minor — every lower-minor spec remains valid — mirroring v0's additive 0.3…0.7 minor chain. The validator routes a spec to this schema when its version major is 1 (minor is not routing-significant). Old specs in the audit log remain readable forever via their historical schemas; this enum gates *new* v1 specs only."
     },
     "roles": {
       "type": "object",
@@ -412,9 +413,10 @@
           "enum": [
             "plan",
             "pull_request",
-            "deployment"
+            "deployment",
+            "acceptance"
           ],
-          "description": "Closed set. plan/pull_request are inherited from v0; deployment is the v1 runtime artifact a deploy stage emits (ADR-038 / #925) capturing the delegated release outcome {environment, ref/sha, external_run_url, outcome, rollback_handle}. The deployment artifact is valid ONLY on a deploy stage (enforced semantically by the validator). Custom artifacts remain deferred."
+          "description": "Closed set. plan/pull_request are inherited from v0; deployment is the v1 runtime artifact a deploy stage emits (ADR-038 / #925) capturing the delegated release outcome {environment, ref/sha, external_run_url, outcome, rollback_handle}, valid ONLY on a deploy stage; acceptance is the v1.2 artifact an acceptance stage emits (ADR-049 / #1531) capturing the acceptance-evidence record {verdict, per-criterion results, content_hash refs to evidence blobs}, valid ONLY on an acceptance stage. Both stage-type bindings are enforced semantically by the validator. Custom artifacts remain deferred."
         },
         "schema": {
           "type": "string",

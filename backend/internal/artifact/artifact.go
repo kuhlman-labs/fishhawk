@@ -29,8 +29,8 @@ type Artifact struct {
 }
 
 // Kind enumerates the artifact kinds. Closed set per the schema's
-// CHECK constraint (migration 0002, widened by 0037): plan,
-// pull_request, deployment.
+// CHECK constraint (migration 0002, widened by 0037 and 0045): plan,
+// pull_request, deployment, acceptance.
 type Kind string
 
 // Artifact kinds.
@@ -42,4 +42,12 @@ const (
 	// {environment, ref/sha, external_run_url, outcome, rollback_handle}.
 	// Admitted by migration 0037, which widens artifacts_kind_check.
 	KindDeployment Kind = "deployment"
+	// KindAcceptance is ADR-049's signed acceptance-evidence record
+	// (E31.3 / #1531): the durable artifact an acceptance stage emits
+	// capturing the structured verdict + per-criterion results +
+	// content_hash references to customer-side evidence blobs. Admitted by
+	// migration 0045, which widens artifacts_kind_check; the constant and
+	// migration ship together (a Create with this kind fails SQLSTATE 23514
+	// against the un-widened CHECK). Written by the E31.6 outcome handler.
+	KindAcceptance Kind = "acceptance"
 )
