@@ -514,6 +514,18 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// prompt's gate-evidence section.
 	regression := s.runScopeRegression(r.Context(), runID, stageID, regressionBase, body)
 
+	// Plan-gate acceptance pre-check (#1533, ADR-049 decision #4): when the
+	// run's workflow configures an acceptance stage, evaluate the plan's
+	// verification.acceptance_criteria (blocking coverage, source_ref /
+	// rationale presence, id integrity) and record an advisory
+	// plan_acceptance_precheck audit entry. Stage-conditional: a workflow
+	// with no acceptance stage yields no entry and no block. Run it
+	// alongside the sibling gates, before runPlanReviews, so the entry
+	// precedes any plan_reviewed entries. Advisory + fail-open: never blocks
+	// or unwinds the upload. The returned result (nil on fail-open) feeds
+	// the plan-review prompt's gate-evidence section like the gates above.
+	acceptance := s.runAcceptancePrecheck(r.Context(), runID, stageID, body)
+
 	// Plan review: invoke configured review agents after the artifact
 	// is stored and audited, before advancing the stage. The gate
 	// results computed above ride along so the review prompt carries
@@ -521,7 +533,7 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// is gating and at least one verdict is reject; in that case the
 	// stage has been transitioned to failed-B and stage advancement is
 	// blocked.
-	gatingRejected := s.runPlanReviews(r.Context(), runID, stageID, body, precheck, sweep, testSweep, regression)
+	gatingRejected := s.runPlanReviews(r.Context(), runID, stageID, body, precheck, sweep, testSweep, regression, acceptance)
 
 	// Plan-stage terminal advancement (#603). With a valid plan artifact
 	// now stored, this handler is the authoritative driver of the plan
@@ -907,12 +919,12 @@ func deref(s *string) string {
 // reviewer failure doesn't fail the upload response — the plan artifact
 // is already durably stored.
 //
-// precheck, sweep, testSweep, and regression are the plan-gate results
-// handleShipPlan's synchronous checks computed (nil when a gate failed
-// open or did not run); they are threaded into the plan-review prompt's
-// gate-evidence section (#963, #1257) and never alter dispatch, authority,
-// or verdict handling.
-func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, planBody []byte, precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload, testSweep *TestSweepPayload, regression *ScopeRegressionPayload) bool {
+// precheck, sweep, testSweep, regression, and acceptance are the plan-gate
+// results handleShipPlan's synchronous checks computed (nil when a gate
+// failed open or did not run); they are threaded into the plan-review
+// prompt's gate-evidence section (#963, #1257, #1533) and never alter
+// dispatch, authority, or verdict handling.
+func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, planBody []byte, precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload, testSweep *TestSweepPayload, regression *ScopeRegressionPayload, acceptance *AcceptancePrecheckPayload) bool {
 	// RunRepo is required to resolve the workflow spec; without it we
 	// can't tell whether agent review was even requested.
 	if s.cfg.RunRepo == nil {
@@ -1012,7 +1024,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	// machinery as the agent prompt handler. The gate evidence carries
 	// the resolved budget the approval gate will enforce (#994) so the
 	// reviewer cites the same number checkPlanBudget compares against.
-	gateEv := planGateEvidence(precheck, sweep, testSweep, regression)
+	gateEv := planGateEvidence(precheck, sweep, testSweep, regression, acceptance)
 	if bc := s.planBudgetEvidence(ctx, runRow, parsedPlan); bc != nil {
 		if gateEv == nil {
 			gateEv = &prompt.PlanGateEvidence{}
@@ -1130,8 +1142,8 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 // bundle structs into prompt fields. Returns nil when no gate produced a
 // result (all failed open) so the plan-review prompt stays byte-identical
 // to the pre-#963 output.
-func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload, testSweep *TestSweepPayload, regression *ScopeRegressionPayload) *prompt.PlanGateEvidence {
-	if precheck == nil && sweep == nil && testSweep == nil && regression == nil {
+func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload, testSweep *TestSweepPayload, regression *ScopeRegressionPayload, acceptance *AcceptancePrecheckPayload) *prompt.PlanGateEvidence {
+	if precheck == nil && sweep == nil && testSweep == nil && regression == nil && acceptance == nil {
 		return nil
 	}
 	ev := &prompt.PlanGateEvidence{}
@@ -1194,6 +1206,22 @@ func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload
 			AddedFiles:   regression.AddedFiles,
 			ScannedFiles: regression.ScannedFiles,
 		}
+	}
+	if acceptance != nil {
+		ap := &prompt.AcceptancePrecheckEvidence{
+			AcceptanceStageID: acceptance.AcceptanceStageID,
+			CriteriaCount:     acceptance.CriteriaCount,
+			BlockingCount:     acceptance.BlockingCount,
+			OutOfScopeCount:   acceptance.OutOfScopeCount,
+		}
+		for _, f := range acceptance.Findings {
+			ap.Findings = append(ap.Findings, prompt.AcceptanceFindingEvidence{
+				Rule:        f.Rule,
+				CriterionID: f.CriterionID,
+				Detail:      f.Detail,
+			})
+		}
+		ev.AcceptancePrecheck = ap
 	}
 	return ev
 }

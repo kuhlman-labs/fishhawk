@@ -528,11 +528,12 @@ type GatePolicyViolation struct {
 // only the available subsections render; all nil is equivalent to a nil
 // PlanGateEvidence (section omitted).
 type PlanGateEvidence struct {
-	ScopePrecheck   *ScopePrecheckEvidence
-	SurfaceSweep    *SurfaceSweepEvidence
-	TestSweep       *TestSweepEvidence
-	BudgetCheck     *BudgetCheckEvidence
-	ScopeRegression *ScopeRegressionEvidence
+	ScopePrecheck      *ScopePrecheckEvidence
+	SurfaceSweep       *SurfaceSweepEvidence
+	TestSweep          *TestSweepEvidence
+	BudgetCheck        *BudgetCheckEvidence
+	ScopeRegression    *ScopeRegressionEvidence
+	AcceptancePrecheck *AcceptancePrecheckEvidence
 }
 
 // ScopeRegressionEvidence is the plan_scope_regression result (#1257): on a
@@ -598,6 +599,32 @@ type GateViolation struct {
 	Constraint string
 	Detail     string
 	Files      []string
+}
+
+// AcceptancePrecheckEvidence is the plan_acceptance_precheck result
+// (#1533): the plan's verification.acceptance_criteria evaluated against
+// the run's configured acceptance stage. CriteriaCount/BlockingCount/
+// OutOfScopeCount carry the coverage counts; an empty Findings means
+// "checked and clean", which renders explicitly so the reviewer can tell
+// it apart from "never checked" (nil AcceptancePrecheck, i.e. no acceptance
+// stage configured).
+type AcceptancePrecheckEvidence struct {
+	AcceptanceStageID string
+	CriteriaCount     int
+	BlockingCount     int
+	OutOfScopeCount   int
+	Findings          []AcceptanceFindingEvidence
+}
+
+// AcceptanceFindingEvidence is one deterministic acceptance-criteria defect
+// the pre-check flagged. Rule is the classifier (no_blocking_criterion,
+// missing_source_ref, missing_rationale, empty_id, duplicate_id);
+// CriterionID names the offending criterion (empty for the plan-level
+// no_blocking_criterion presence finding); Detail is the explanation.
+type AcceptanceFindingEvidence struct {
+	Rule        string
+	CriterionID string
+	Detail      string
 }
 
 // SurfaceSweepEvidence is the plan_surface_sweep result: the plan's
@@ -1561,6 +1588,21 @@ func buildPlanReview(t Trigger) string {
 		"from scope.files, or if the test strategy is unit-only for a cross-boundary change. Scope this to genuinely " +
 		"cross-boundary changes; do not raise it for incidental multi-file changes.\n\n")
 
+	// Acceptance-criteria semantic checklist (#1533): applied only when the
+	// plan carries verification.acceptance_criteria (rendered above). Each
+	// item is one sentence to bound the added prompt cost (#606).
+	b.WriteString("When the plan carries verification.acceptance_criteria, also assess:\n\n")
+	b.WriteString("8. **Coverage**: the criteria cover every behavioral claim the issue and summary make; " +
+		"flag any behavior the change promises that no criterion verifies.\n")
+	b.WriteString("9. **Warrant of inferred criteria**: each inferred criterion's rationale is actually warranted " +
+		"by the issue or repository context, not invented.\n")
+	b.WriteString("10. **Testability**: each criterion is concretely verifiable — an executor could decide pass/fail; " +
+		"vague adjectives (\"robust\", \"clean\", \"handles edge cases\") flag.\n")
+	b.WriteString("11. **Independence**: criteria state observable outcomes, not restatements of the approach steps " +
+		"(a criterion that merely says 'the code in step N was written' flags).\n")
+	b.WriteString("12. **Falsifiability**: each criterion can concretely FAIL — a vacuously-true criterion (one no " +
+		"implementation could violate) flags.\n\n")
+
 	// Verdict decision rule.
 	b.WriteString("### Verdict decision rule\n\n")
 	b.WriteString("- `approve`: all criteria met or concerns cosmetic.\n")
@@ -1596,7 +1638,7 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 	// clean (or absent) regression result must not, on its own, trigger the
 	// section header.
 	regressionHasDrops := ev.ScopeRegression != nil && len(ev.ScopeRegression.RemovedFiles) > 0
-	if ev.ScopePrecheck == nil && ev.SurfaceSweep == nil && ev.TestSweep == nil && ev.BudgetCheck == nil && !regressionHasDrops {
+	if ev.ScopePrecheck == nil && ev.SurfaceSweep == nil && ev.TestSweep == nil && ev.BudgetCheck == nil && !regressionHasDrops && ev.AcceptancePrecheck == nil {
 		return
 	}
 	b.WriteString("### Gate evidence (machine-verified — outranks text-level findings)\n\n")
@@ -1636,6 +1678,24 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 					fmt.Fprintf(b, " [%s]", strings.Join(v.Files, ", "))
 				}
 				b.WriteString("\n")
+			}
+		}
+		b.WriteString("\n")
+	}
+
+	if ap := ev.AcceptancePrecheck; ap != nil {
+		b.WriteString("Acceptance pre-check (verification.acceptance_criteria evaluated against the configured acceptance stage):\n\n")
+		fmt.Fprintf(b, "- criteria: %d (blocking: %d)\n", ap.CriteriaCount, ap.BlockingCount)
+		fmt.Fprintf(b, "- out_of_scope entries: %d\n", ap.OutOfScopeCount)
+		if len(ap.Findings) == 0 {
+			b.WriteString("- findings: none (checked and clean)\n")
+		} else {
+			for _, f := range ap.Findings {
+				if f.CriterionID != "" {
+					fmt.Fprintf(b, "- FINDING %s (criterion: %s): %s\n", f.Rule, f.CriterionID, f.Detail)
+				} else {
+					fmt.Fprintf(b, "- FINDING %s: %s\n", f.Rule, f.Detail)
+				}
 			}
 		}
 		b.WriteString("\n")
@@ -2399,6 +2459,12 @@ func writePlanForReview(b *strings.Builder, p *plan.Plan) {
 		b.WriteString("\n")
 	}
 
+	// Acceptance criteria (#1533): render the typed criteria so the reviewer
+	// can judge the semantic checklist (coverage, warrant-of-inferred,
+	// testability, independence, falsifiability). Guarded so a plan without
+	// criteria (and without out_of_scope) renders byte-identical to today.
+	writeAcceptanceCriteriaForReview(b, p.Verification)
+
 	if len(p.RisksAndAssumptions) > 0 {
 		b.WriteString("Risks & assumptions:\n")
 		for _, r := range p.RisksAndAssumptions {
@@ -2410,6 +2476,46 @@ func writePlanForReview(b *strings.Builder, p *plan.Plan) {
 	if p.PredictedRuntimeMinutes > 0 {
 		fmt.Fprintf(b, "Runtime prediction: %d minutes (%s confidence)\n\n",
 			p.PredictedRuntimeMinutes, p.PredictedRuntimeConfidence)
+	}
+}
+
+// writeAcceptanceCriteriaForReview renders a plan's typed
+// verification.acceptance_criteria (and out_of_scope) for the review-agent
+// prompt (#1533). One line per criterion carries id, statement, source
+// (+source_ref), rationale (when present), the effective blocking value
+// (applying the nil->true schema default), and verify_hint (when present),
+// so the reviewer can decide the semantic checklist. Renders nothing when
+// the plan carries neither criteria nor out_of_scope, keeping older plans
+// byte-identical to the pre-#1533 output.
+func writeAcceptanceCriteriaForReview(b *strings.Builder, v plan.Verification) {
+	if len(v.AcceptanceCriteria) == 0 && len(v.OutOfScope) == 0 {
+		return
+	}
+	if len(v.AcceptanceCriteria) > 0 {
+		b.WriteString("Acceptance criteria:\n")
+		for _, c := range v.AcceptanceCriteria {
+			blocking := c.Blocking == nil || *c.Blocking
+			fmt.Fprintf(b, "- [%s] %s (source: %s", c.ID, c.Statement, c.Source)
+			if c.SourceRef != "" {
+				fmt.Fprintf(b, ", source_ref: %s", c.SourceRef)
+			}
+			fmt.Fprintf(b, ", blocking: %t)", blocking)
+			if c.Rationale != "" {
+				fmt.Fprintf(b, " rationale: %s", c.Rationale)
+			}
+			if c.VerifyHint != "" {
+				fmt.Fprintf(b, " verify_hint: %s", c.VerifyHint)
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+	if len(v.OutOfScope) > 0 {
+		b.WriteString("Out of scope:\n")
+		for _, o := range v.OutOfScope {
+			fmt.Fprintf(b, "- %s\n", o)
+		}
+		b.WriteString("\n")
 	}
 }
 
