@@ -1,0 +1,46 @@
+{
+  "plan_version": "standard_v1",
+  "ticket_reference": {
+    "type": "github_issue",
+    "url": "https://github.com/kuhlman-labs/fishhawk/issues/1529",
+    "id": "kuhlman-labs/fishhawk#1529"
+  },
+  "generated_by": {
+    "agent": "claude-code",
+    "model": "claude-opus-4-8",
+    "timestamp": "2026-07-01T09:00:00Z"
+  },
+  "summary": "Typed verification.acceptance_criteria in the plan artifact.",
+  "scope": {
+    "files": [
+      { "path": "docs/spec/plan-standard-v1.schema.json", "operation": "modify" }
+    ]
+  },
+  "approach": [
+    { "step": 1, "description": "Add the acceptance_criteria and out_of_scope fields to the verification block." }
+  ],
+  "verification": {
+    "test_strategy": "End-to-end plan.Parse over a fixture carrying acceptance_criteria.",
+    "rollback_plan": "Revert the PR. Every field is additive and optional within standard_v1.",
+    "acceptance_criteria": [
+      {
+        "id": "typed-criteria-parse",
+        "statement": "A plan whose verification carries acceptance_criteria parses and round-trips the criteria.",
+        "source": "explicit",
+        "source_ref": "kuhlman-labs/fishhawk#1529"
+      },
+      {
+        "id": "blocking-default-applied",
+        "statement": "A non-blocking criterion with preconditions decodes with blocking=false.",
+        "source": "inferred",
+        "rationale": "Inferred from ADR-049 #3's default-true blocking semantics; must prove an explicit false round-trips.",
+        "blocking": false,
+        "verify_hint": "Assert the decoded Blocking pointer is non-nil and false.",
+        "preconditions": ["The acceptance executor has run at least once."]
+      }
+    ],
+    "out_of_scope": ["Downstream acceptance execution (E31.5/E31.7) is not implemented here."]
+  },
+  "predicted_runtime_minutes": 22,
+  "predicted_runtime_confidence": "medium"
+}

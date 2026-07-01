@@ -250,6 +250,19 @@ func Parse(data []byte) (*Plan, error) {
 //     scope-drift detection, so a path claimed by two slices would have the
 //     non-owning slice's edit drift-excluded, silently shipping inert code.
 func semanticCheck(p *Plan) error {
+	// acceptance_criteria ids must be unique — they are the join key across
+	// plan → acceptance execution → evidence → triage → feedback, so a
+	// duplicate is ambiguous. This runs BEFORE the decomposition early return
+	// because acceptance_criteria are valid on a non-decomposed plan too.
+	seenCriteria := make(map[string]struct{}, len(p.Verification.AcceptanceCriteria))
+	for _, c := range p.Verification.AcceptanceCriteria {
+		if _, dup := seenCriteria[c.ID]; dup {
+			return &SemanticError{
+				Message: fmt.Sprintf("verification.acceptance_criteria: duplicate id %q", c.ID),
+			}
+		}
+		seenCriteria[c.ID] = struct{}{}
+	}
 	if p.Decomposition == nil {
 		return nil
 	}

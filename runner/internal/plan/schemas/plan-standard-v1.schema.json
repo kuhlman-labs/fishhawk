@@ -199,6 +199,72 @@
           "type": "string",
           "minLength": 1,
           "description": "How a regression would be undone. \"Revert PR\" is a valid answer for purely-additive changes; data migrations need more."
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/acceptance-criterion" },
+          "x-intended-required": true,
+          "description": "Optional (ADR-049 #3, E31 wave 0). The structured, provenance-tagged acceptance-criteria contract. Each criterion's id is the join key threaded across plan → acceptance execution → evidence → triage → feedback. Annotated x-intended-required: a future standard version promotes this to required after an E31 soak; additive-optional today."
+        },
+        "out_of_scope": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Optional. Statements of what this change deliberately does NOT cover, so reviewers and downstream acceptance don't treat an omission as a gap."
+        }
+      }
+    },
+
+    "acceptance-criterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "statement", "source"],
+      "description": "One acceptance criterion within verification.acceptance_criteria. The id is the unique join key across plan → acceptance execution → evidence → triage → feedback.",
+      "allOf": [
+        {
+          "if": {
+            "properties": { "source": { "const": "inferred" } },
+            "required": ["source"]
+          },
+          "then": { "required": ["rationale"] }
+        }
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "description": "Slug identifier, unique within acceptance_criteria. The join key that ties this criterion to its downstream execution, evidence, triage, and feedback records."
+        },
+        "statement": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The acceptance criterion itself — what must hold for the change to be accepted."
+        },
+        "source": {
+          "type": "string",
+          "enum": ["explicit", "inferred"],
+          "description": "Provenance: explicit = stated in the ticket/spec; inferred = the agent derived it. An inferred criterion must carry a rationale."
+        },
+        "source_ref": {
+          "type": "string",
+          "description": "Optional. Pointer to where an explicit criterion came from (e.g. an issue anchor or spec section)."
+        },
+        "rationale": {
+          "type": "string",
+          "description": "Why the agent inferred this criterion. Required when source = inferred (enforced by the if/then conditional); optional otherwise."
+        },
+        "blocking": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether failing this criterion blocks acceptance. Defaults to true; downstream consumers apply the default when omitted."
+        },
+        "verify_hint": {
+          "type": "string",
+          "description": "Optional. A hint to the acceptance executor on how to verify this criterion."
+        },
+        "preconditions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Optional. Preconditions that must hold before this criterion can be verified."
         }
       }
     },

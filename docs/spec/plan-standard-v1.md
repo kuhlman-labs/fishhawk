@@ -141,6 +141,54 @@ Ordered list of steps. Each step has a 1-indexed `step` number and a `descriptio
 
 Reviewers expect concrete tests, not "add tests." Rollback plans flag whether a change is purely additive or has data migration consequences.
 
+`verification` also carries two optional, additive fields within `standard_v1` (ADR-049 #3, E31 wave 0):
+
+```json
+{
+  "test_strategy": "...",
+  "rollback_plan": "...",
+  "acceptance_criteria": [
+    {
+      "id": "bulk-export-paginates",
+      "statement": "GET /v0/audit/export returns a stable cursor across pages.",
+      "source": "explicit",
+      "source_ref": "kuhlman-labs/fishhawk#1247"
+    },
+    {
+      "id": "large-range-bounded",
+      "statement": "A very large date range is bounded by a per-page row limit.",
+      "source": "inferred",
+      "rationale": "The ticket implies unbounded ranges are a risk; inferred to guard memory.",
+      "blocking": false,
+      "verify_hint": "Assert the response caps at the per-page limit for a 1-year range.",
+      "preconditions": ["The audit table is seeded with > 1 page of entries."]
+    }
+  ],
+  "out_of_scope": ["Streaming compression is not addressed by this change."]
+}
+```
+
+#### `verification.acceptance_criteria`
+
+Optional array. Each entry is a provenance-tagged acceptance criterion. The `id` is the **join key** threaded across plan → acceptance execution → evidence → triage → feedback, so it must be unique within a plan (enforced beyond the schema in `plan.semanticCheck`; a duplicate is a `*SemanticError`).
+
+| Field | Required | Meaning |
+|---|---|---|
+| `id` | yes | Slug (`^[a-z0-9][a-z0-9-]*$`), unique within `acceptance_criteria`. The plan→execution→evidence→feedback join key. |
+| `statement` | yes | What must hold for the change to be accepted. |
+| `source` | yes | `explicit` (stated in the ticket/spec) or `inferred` (derived by the agent). |
+| `source_ref` | no | Where an explicit criterion came from (issue anchor, spec section). |
+| `rationale` | only when `source = inferred` | Why the agent inferred the criterion. A schema `if/then` conditional makes it required for inferred criteria (an inferred criterion without a rationale is a `*SchemaError`). |
+| `blocking` | no | Whether failing the criterion blocks acceptance. **Defaults to `true`**; downstream consumers apply the default when omitted. |
+| `verify_hint` | no | A hint to the acceptance executor on how to verify. |
+| `preconditions` | no | Conditions that must hold before the criterion can be verified. |
+
+`acceptance_criteria` is annotated `x-intended-required: true` in the schema: it is additive-optional today, but a future `standard` version promotes it to required after an E31 soak period (see `AGENTS.md` → Schema change checklist). Downstream consumers are later E31 waves — **E31.5** (`plan_acceptance_precheck`) and **E31.7** (the runner acceptance agent) — which is why the field is optional now and no consumer depends on it yet.
+
+#### `verification.out_of_scope`
+
+Optional array of non-empty strings stating what the change deliberately does NOT cover, so reviewers and downstream acceptance don't treat an omission as a gap. Additive-optional within `standard_v1`.
+
 ### Verification with tiered checkpoints
 
 Plans that include expensive test gates must allocate wall-clock time for them in `predicted_runtime_minutes`. The agent should name cheap per-batch checks separately from the expensive final pass:
