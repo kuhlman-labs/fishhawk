@@ -79,6 +79,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/auth/github/manifest-flow-start", s.handleGitHubManifestFlowStart)
 	mux.HandleFunc("GET /v0/auth/github/manifest-callback", s.handleGitHubManifestCallback)
 	mux.HandleFunc("GET /v0/auth/me", s.handleGetMe)
+	mux.HandleFunc("GET /v0/onboarding/readiness", s.handleGetOnboardingReadiness)
 	mux.HandleFunc("POST /v0/auth/logout", s.handleLogout)
 	mux.HandleFunc("POST /webhooks/github", s.handleWebhook)
 }
