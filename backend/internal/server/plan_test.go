@@ -710,6 +710,34 @@ workflows:
           - forbidden_paths:
               - ".github/workflows/**"
 `)
+
+	// specGatingReviewersWithAcceptance adds an acceptance stage to the
+	// gating-reviewers shape (v1.1, the acceptance surface), so the plan-gate
+	// acceptance pre-check produces a result the #1533 gate-evidence threading
+	// test can observe in the review prompt.
+	specGatingReviewersWithAcceptance = []byte(`version: "1.1"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 1
+          human: 0
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+`)
 )
 
 // newPlanServerWithReviewer builds a plan server that also wires a
@@ -1364,6 +1392,61 @@ func TestShipPlan_ReviewAgents_GateEvidenceReachesReviewPrompt(t *testing.T) {
 	for _, want := range wants {
 		if !strings.Contains(got, want) {
 			t.Errorf("plan-review prompt missing gate-evidence element %q — threading seam broken:\n%s", want, got)
+		}
+	}
+}
+
+// TestShipPlan_ReviewAgents_AcceptancePrecheckReachesReviewPrompt is the
+// #1533 cross-boundary seam check: a plan shipped to an acceptance-stage
+// workflow with a criteria defect (no blocking criterion, no out_of_scope)
+// must (a) persist the plan_acceptance_precheck audit entry with the
+// finding AND (b) render the SAME finding in the captured plan-review
+// prompt's acceptance gate-evidence block — crossing the audit-persist ->
+// planGateEvidence -> prompt-render consumer boundary the per-layer tests
+// cannot exercise.
+func TestShipPlan_ReviewAgents_AcceptancePrecheckReachesReviewPrompt(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, sf, _, au, _ := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewersWithAcceptance)
+	priv, _ := sf.issue(t, runID)
+	// A schema-valid plan with NO acceptance_criteria and NO out_of_scope:
+	// the pre-check flags no_blocking_criterion.
+	body := validPlanBytes(t)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	// Gating review (human: 0) runs synchronously; the captured prompt is
+	// ready as soon as the upload returns.
+
+	// (a) The audit entry persists the finding.
+	entry := lastAcceptancePrecheckEntry(t, au)
+	if hasAcceptanceFinding(entry, acceptanceRuleNoBlockingCriterion) == nil {
+		t.Fatalf("want a persisted no_blocking_criterion finding; got %+v", entry.Findings)
+	}
+	if entry.AcceptanceStageID != "acceptance" {
+		t.Errorf("AcceptanceStageID = %q, want acceptance", entry.AcceptanceStageID)
+	}
+
+	// (b) The SAME finding renders in the plan-review prompt.
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer calls = %d, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	wants := []string{
+		"### Gate evidence (machine-verified — outranks text-level findings)",
+		"Acceptance pre-check (verification.acceptance_criteria evaluated against the configured acceptance stage)",
+		"FINDING no_blocking_criterion",
+	}
+	for _, want := range wants {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan-review prompt missing acceptance gate-evidence element %q — threading seam broken:\n%s", want, got)
 		}
 	}
 }
@@ -2142,7 +2225,7 @@ func TestShipPlan_ReviewAgents_Advisory_ContextDetached(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	// Advisory → dispatches a detached goroutine and returns false.
-	if s.runPlanReviews(ctx, runID, stageID, body, nil, nil, nil, nil) {
+	if s.runPlanReviews(ctx, runID, stageID, body, nil, nil, nil, nil, nil) {
 		t.Fatal("advisory runPlanReviews returned true (advisory must never gate)")
 	}
 

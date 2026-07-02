@@ -2786,6 +2786,195 @@ func TestBuild_PlanReview_CrossBoundaryTestCriterion(t *testing.T) {
 	}
 }
 
+// TestBuild_PlanReview_GateEvidence_AcceptanceRenders pins the #1533
+// acceptance pre-check gate-evidence block: the header, the criteria/blocking/
+// out_of_scope counts, and one FINDING line per finding (with the criterion id
+// when present, without it for the plan-level no_blocking_criterion finding).
+func TestBuild_PlanReview_GateEvidence_AcceptanceRenders(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			AcceptancePrecheck: &AcceptancePrecheckEvidence{
+				AcceptanceStageID: "acceptance",
+				CriteriaCount:     2,
+				BlockingCount:     0,
+				OutOfScopeCount:   0,
+				Findings: []AcceptanceFindingEvidence{
+					{Rule: "no_blocking_criterion", Detail: "no blocking acceptance criterion and no verification.out_of_scope justification"},
+					{Rule: "missing_source_ref", CriterionID: "a1", Detail: "explicit criterion is missing source_ref"},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Gate evidence (machine-verified — outranks text-level findings)",
+		"Acceptance pre-check (verification.acceptance_criteria evaluated against the configured acceptance stage)",
+		"- criteria: 2 (blocking: 0)",
+		"- out_of_scope entries: 0",
+		"- FINDING no_blocking_criterion: no blocking acceptance criterion",
+		"- FINDING missing_source_ref (criterion: a1): explicit criterion is missing source_ref",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing acceptance gate-evidence element %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_PlanReview_GateEvidence_AcceptanceCleanRenders verifies the
+// "checked and clean" rendering: an empty Findings shows the explicit clean
+// line so the reviewer can tell it apart from "never checked".
+func TestBuild_PlanReview_GateEvidence_AcceptanceCleanRenders(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			AcceptancePrecheck: &AcceptancePrecheckEvidence{
+				AcceptanceStageID: "acceptance",
+				CriteriaCount:     1,
+				BlockingCount:     1,
+				OutOfScopeCount:   2,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"Acceptance pre-check",
+		"- criteria: 1 (blocking: 1)",
+		"- out_of_scope entries: 2",
+		"- findings: none (checked and clean)",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing acceptance clean-result line %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_PlanReview_GateEvidence_AcceptanceNilByteIdentical pins the
+// additive property: evidence carrying only a pre-existing sub-result renders
+// byte-identically with AcceptancePrecheck nil, so prompts for runs without an
+// acceptance stage are unchanged.
+func TestBuild_PlanReview_GateEvidence_AcceptanceNilByteIdentical(t *testing.T) {
+	mk := func(ap *AcceptancePrecheckEvidence) string {
+		t.Helper()
+		got, err := Build("plan_review", Trigger{
+			Repo:         "x/y",
+			ApprovedPlan: fixturePlan(),
+			PlanGateEvidence: &PlanGateEvidence{
+				ScopePrecheck:      &ScopePrecheckEvidence{ScannedFiles: 2},
+				AcceptancePrecheck: ap,
+			},
+		})
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		return got
+	}
+	withNil := mk(nil)
+	if strings.Contains(withNil, "Acceptance pre-check") {
+		t.Errorf("Acceptance pre-check block must be absent when AcceptancePrecheck is nil:\n%s", withNil)
+	}
+	withAcc := mk(&AcceptancePrecheckEvidence{AcceptanceStageID: "acceptance", CriteriaCount: 1, BlockingCount: 1})
+	if !strings.Contains(withAcc, "Acceptance pre-check") {
+		t.Errorf("Acceptance pre-check block missing when AcceptancePrecheck is set:\n%s", withAcc)
+	}
+	// Additive insertion: stripping the acceptance block reproduces the
+	// nil-AcceptancePrecheck prompt byte-for-byte.
+	block := "Acceptance pre-check (verification.acceptance_criteria evaluated against the configured acceptance stage):\n\n" +
+		"- criteria: 1 (blocking: 1)\n" +
+		"- out_of_scope entries: 0\n" +
+		"- findings: none (checked and clean)\n\n"
+	if strings.Replace(withAcc, block, "", 1) != withNil {
+		t.Errorf("acceptance block is not a clean additive insertion over the nil-AcceptancePrecheck prompt")
+	}
+}
+
+// planWithAcceptanceCriteria returns fixturePlan with a criteria set and an
+// out_of_scope list added to Verification, for the criteria-rendering tests.
+func planWithAcceptanceCriteria() *plan.Plan {
+	p := fixturePlan()
+	blocking := true
+	nonBlocking := false
+	p.Verification.AcceptanceCriteria = []plan.AcceptanceCriterion{
+		{ID: "a1", Statement: "foo returns an error on nil input", Source: plan.CriterionSourceExplicit, SourceRef: "#42", Blocking: &blocking, VerifyHint: "table test"},
+		{ID: "a2", Statement: "existing callers still compile", Source: plan.CriterionSourceInferred, Rationale: "derived from the interface change", Blocking: &nonBlocking},
+	}
+	p.Verification.OutOfScope = []string{"performance tuning deferred"}
+	return p
+}
+
+// TestBuild_PlanReview_AcceptanceCriteriaRendered verifies writePlanForReview
+// renders the typed criteria and out_of_scope so the reviewer can judge the
+// semantic checklist.
+func TestBuild_PlanReview_AcceptanceCriteriaRendered(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: planWithAcceptanceCriteria(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"Acceptance criteria:",
+		"- [a1] foo returns an error on nil input (source: explicit, source_ref: #42, blocking: true)",
+		"verify_hint: table test",
+		"- [a2] existing callers still compile (source: inferred, blocking: false) rationale: derived from the interface change",
+		"Out of scope:",
+		"- performance tuning deferred",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing acceptance-criteria element %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_PlanReview_AcceptanceCriteriaAbsentByteIdentical pins the additive
+// property for the criteria rendering: a plan carrying neither criteria nor
+// out_of_scope renders byte-identical to the pre-#1533 output.
+func TestBuild_PlanReview_AcceptanceCriteriaAbsentByteIdentical(t *testing.T) {
+	base := fixturePlan() // no acceptance_criteria, no out_of_scope
+	got, err := Build("plan_review", Trigger{Repo: "x/y", ApprovedPlan: base})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "Acceptance criteria:") {
+		t.Errorf("Acceptance criteria block must be absent for a plan without criteria:\n%s", got)
+	}
+	if strings.Contains(got, "Out of scope:") {
+		t.Errorf("Out of scope block must be absent for a plan without out_of_scope:\n%s", got)
+	}
+}
+
+// TestBuild_PlanReview_AcceptanceChecklistItems pins the five semantic
+// checklist items 8-12 added to the ### Review criteria block (#1533).
+func TestBuild_PlanReview_AcceptanceChecklistItems(t *testing.T) {
+	got, err := Build("plan_review", Trigger{Repo: "x/y", ApprovedPlan: fixturePlan()})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"When the plan carries verification.acceptance_criteria, also assess:",
+		"8. **Coverage**",
+		"9. **Warrant of inferred criteria**",
+		"10. **Testability**",
+		"11. **Independence**",
+		"12. **Falsifiability**",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing acceptance checklist item %q:\n%s", w, got)
+		}
+	}
+}
+
 func TestBuild_PlanReview_TrimmedBelowBaseline(t *testing.T) {
 	// #606: the verbose verdict-schema / review-criteria / decision-rule
 	// preamble was trimmed to lower the per-call token cost on the local
@@ -2807,7 +2996,12 @@ func TestBuild_PlanReview_TrimmedBelowBaseline(t *testing.T) {
 	// the JSON-only contract block adds: that sentence is in the current
 	// (trimmed) prompt AND would be in the untrimmed version, so the baseline
 	// must move with it to keep the trim-margin guard meaningful.
-	const preTrimBaselineLen = 3999
+	//
+	// #1533 raised it by the 838 bytes the acceptance-criteria semantic
+	// checklist (items 8-12 + intro) adds: like criterion #7, this block is in
+	// the current (trimmed) prompt AND would be in the untrimmed version, so the
+	// baseline moves with it (3999 + 838).
+	const preTrimBaselineLen = 4837
 	got := buildPlanReview(Trigger{
 		Repo:         "kuhlman-labs/example",
 		IssueNumber:  42,

@@ -225,6 +225,27 @@ Notes:
   sees a "scope hits forbidden_paths — wrong workflow?" advisory before approving.
   Listed here only so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
+- The plan-gate acceptance pre-check audit kind — `plan_acceptance_precheck`
+  (#1533, ADR-049 decision #4), written by the plan upload handler
+  (`server/acceptance_precheck.go::runAcceptancePrecheck`) between
+  `plan_scope_regression` and plan review — is an **internal, advisory audit
+  kind, not an issue-comment surface**. Nothing in `issuecomment` posts it to
+  the issue thread. It runs **only when the run's workflow configures an
+  acceptance stage** (stage-conditional off-switch), decodes
+  `verification.acceptance_criteria` from the raw plan body (NOT `plan.Parse`,
+  so a duplicate-id plan is flagged rather than fail-open), and evaluates the
+  deterministic rules `no_blocking_criterion` (no effectively-blocking
+  criterion and no `verification.out_of_scope` justification),
+  `missing_source_ref` (explicit criterion without `source_ref`),
+  `missing_rationale` (inferred criterion without `rationale`), `empty_id`, and
+  `duplicate_id`, with payload `{workflow_id, acceptance_stage_id, findings,
+  criteria_count, blocking_count, out_of_scope_count}`. Advisory + fail-open —
+  nil repos, a missing/unparseable spec, no acceptance stage, or an unmarshal
+  error writes no entry and never blocks the upload — and written even when
+  clean (empty `findings`) so a reader can distinguish "checked and clean" from
+  "never checked". Threaded into the plan-review prompt's gate-evidence section
+  as a machine-verified finding. Listed here only so a future reader grepping
+  the audit categories doesn't mistake it for a comment surface.
 - The plan-gate test-sweep audit kind — `plan_test_sweep` (#942), written by
   the plan upload handler (`server/test_sweep.go::runTestSweep`) immediately
   after `plan_surface_sweep` and before plan review — is an **internal,
