@@ -290,6 +290,8 @@ func TestShipAcceptance_InvalidPayload_400(t *testing.T) {
 		"criterion invalid result":    []byte(`{"verdict":"passed","criteria":[{"id":"x","result":"maybe"}]}`),
 		"non-http target_url":         []byte(`{"verdict":"passed","target_url":"ssh://x"}`),
 		"unknown field":               []byte(`{"verdict":"passed","extra":true}`),
+		"trailing object":             []byte(`{"verdict":"passed"}{"verdict":"failed","failure_mode":"error"}`),
+		"trailing garbage":            []byte(`{"verdict":"passed"} garbage`),
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -406,6 +408,46 @@ func TestShipAcceptance_InvalidSignature_401(t *testing.T) {
 	}
 	if len(ar.all) != 0 {
 		t.Errorf("artifacts = %d, want 0 on bad signature", len(ar.all))
+	}
+}
+
+// TestShipAcceptance_SigningKeyNotFound_404 pins the signature branch's
+// ErrNotFound mapping: no signing key issued for the run is a 404
+// signing_key_not_found (a distinct branch copied from the deploy precedent,
+// so guard against a future refactor swapping its status/code).
+func TestShipAcceptance_SigningKeyNotFound_404(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, _, _ := newAcceptanceServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	sf.verifyErr = signing.ErrNotFound
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), "")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "signing_key_not_found") {
+		t.Errorf("body missing signing_key_not_found:\n%s", w.Body.String())
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("artifacts = %d, want 0 on missing key", len(ar.all))
+	}
+}
+
+// TestShipAcceptance_SigningKeyExpired_401 pins the signature branch's
+// ErrExpired mapping: a lapsed signing-key TTL is a 401 signing_key_expired.
+func TestShipAcceptance_SigningKeyExpired_401(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, _, _ := newAcceptanceServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	sf.verifyErr = signing.ErrExpired
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), "")
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "signing_key_expired") {
+		t.Errorf("body missing signing_key_expired:\n%s", w.Body.String())
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("artifacts = %d, want 0 on expired key", len(ar.all))
 	}
 }
 

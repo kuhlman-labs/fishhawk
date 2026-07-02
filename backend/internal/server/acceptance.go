@@ -249,6 +249,15 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"error": err.Error()})
 		return
 	}
+	// Reject trailing data after the single acceptance object. Without this an
+	// EOF-unverified Decode would accept the first object of a concatenated body
+	// (e.g. {"verdict":"passed"}{"verdict":"failed",...}) while the stored
+	// artifact bytes are not the single AcceptanceArtifactBody object documented.
+	if dec.More() {
+		s.writeError(w, r, http.StatusBadRequest, "acceptance_invalid",
+			"acceptance body must contain a single JSON object", nil)
+		return
+	}
 	if err := acc.validate(); err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "acceptance_invalid",
 			"acceptance body missing or malformed fields",
