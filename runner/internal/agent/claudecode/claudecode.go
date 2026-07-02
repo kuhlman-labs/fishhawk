@@ -313,7 +313,13 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	// Compose env so a Cmd builder (e.g. tests) can pre-set
 	// vars on cmd.Env and we layer the API key on top. nil means
 	// "child will inherit our env", so seed with os.Environ() in
-	// that case to keep PATH, HOME, etc. for the agent process.
+	// that case to keep PATH, HOME, etc. for the agent process —
+	// UNLESS the invocation carries a BaseEnv (ADR-050 / #1535),
+	// which replaces the os.Environ() seed with a minimized set so
+	// the child never sees runner-env secrets. A nil BaseEnv is
+	// byte-identical to the pre-BaseEnv behavior; a non-nil empty
+	// one seeds an empty env (default-deny). Copied so the caller's
+	// slice is never aliased by the overlay appends below.
 	//
 	// A subprocess resolves a variable to the FIRST matching entry, so a
 	// plain append would be shadowed by any inherited ANTHROPIC_API_KEY —
@@ -321,7 +327,14 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	// one so i.APIKey actually wins (#899). An empty i.APIKey is skipped,
 	// leaving the inherited env untouched.
 	if cmd.Env == nil {
-		cmd.Env = os.Environ()
+		if inv.BaseEnv != nil {
+			// append to a non-nil empty slice, NOT []string(nil): an empty
+			// BaseEnv must yield a non-nil cmd.Env, because os/exec treats
+			// nil as inherit-parent-env — the opposite of default-deny.
+			cmd.Env = append([]string{}, inv.BaseEnv...)
+		} else {
+			cmd.Env = os.Environ()
+		}
 	}
 	if i.APIKey != "" {
 		cmd.Env = agent.AppendEnvOverride(cmd.Env, "ANTHROPIC_API_KEY", i.APIKey)
