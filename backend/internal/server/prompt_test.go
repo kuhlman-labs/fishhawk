@@ -6089,3 +6089,147 @@ workflows:
 		t.Errorf("acceptance prompt still renders the not-declared line with a declared egress host:\n%s", resp.Prompt)
 	}
 }
+
+// acceptanceEgressSpec is the workflow spec the E31.7 wire tests declare: an
+// acceptance stage with a two-host egress allowance, so the FULL-list contract
+// (vs the prompt text's first-host-only render) is distinguishable.
+const acceptanceEgressSpec = `
+version: "1.3"
+workflows:
+  feature_change:
+    stages:
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+        egress:
+          target_hosts:
+            - staging.example.com:8443
+            - second.example.com
+`
+
+// TestGetStagePrompt_Acceptance_ServesEgressHostsAndCriteriaIDs pins the E31.7
+// (#1535) acceptance-stage wire fields: egress_target_hosts carries ALL
+// spec-declared hosts (the runner's ADR-050 proxy allow-list — not just the
+// first host the prompt text renders) and acceptance_criteria_ids carries the
+// approved plan's criterion ids in plan order (the runner's verdict join-key
+// validation set). The raw-body checks pin the json tags byte-identical to the
+// runner's upload.FetchedPrompt decoder.
+func TestGetStagePrompt_Acceptance_ServesEgressHostsAndCriteriaIDs(t *testing.T) {
+	s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+	runRow, err := s.cfg.RunRepo.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	runRow.WorkflowSpec = []byte(acceptanceEgressSpec)
+	w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if want := []string{"staging.example.com:8443", "second.example.com"}; !reflect.DeepEqual(resp.EgressTargetHosts, want) {
+		t.Errorf("EgressTargetHosts = %v, want %v (ALL declared hosts)", resp.EgressTargetHosts, want)
+	}
+	if want := []string{"ac-create", "ac-list"}; !reflect.DeepEqual(resp.AcceptanceCriteriaIDs, want) {
+		t.Errorf("AcceptanceCriteriaIDs = %v, want %v", resp.AcceptanceCriteriaIDs, want)
+	}
+	for _, tag := range []string{
+		`"egress_target_hosts":["staging.example.com:8443","second.example.com"]`,
+		`"acceptance_criteria_ids":["ac-create","ac-list"]`,
+	} {
+		if !strings.Contains(w.Body.String(), tag) {
+			t.Errorf("response missing wire tag %s:\n%s", tag, w.Body.String())
+		}
+	}
+}
+
+// TestGetStagePrompt_Acceptance_NoEgressSpec_HostsOmitted pins the fail-closed
+// posture for a spec with no egress block (or no spec at all): the
+// egress_target_hosts field is OMITTED — the runner's proxy then admits only
+// model + backend hosts — while acceptance_criteria_ids still serves the
+// approved plan's ids.
+func TestGetStagePrompt_Acceptance_NoEgressSpec_HostsOmitted(t *testing.T) {
+	s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+	w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), `"egress_target_hosts":`) {
+		t.Errorf("egress_target_hosts must be omitted for a no-egress spec:\n%s", w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if want := []string{"ac-create", "ac-list"}; !reflect.DeepEqual(resp.AcceptanceCriteriaIDs, want) {
+		t.Errorf("AcceptanceCriteriaIDs = %v, want %v", resp.AcceptanceCriteriaIDs, want)
+	}
+}
+
+// TestGetStagePrompt_NonAcceptanceStages_OmitAcceptanceFields pins the
+// omitempty contract: plan and implement prompt responses carry NEITHER
+// egress_target_hosts NOR acceptance_criteria_ids, so every pre-E31.7 response
+// stays byte-identical.
+func TestGetStagePrompt_NonAcceptanceStages_OmitAcceptanceFields(t *testing.T) {
+	for _, stageType := range []run.StageType{run.StageTypePlan, run.StageTypeImplement} {
+		t.Run(string(stageType), func(t *testing.T) {
+			s, rr, sf, gh := newPromptServer(t)
+			runID, stageID := uuid.New(), uuid.New()
+			priv, _ := sf.issue(t, runID)
+			installation := int64(99)
+			triggerRef := "issue:42"
+			rr.runRow = &run.Run{
+				ID:             runID,
+				Repo:           "kuhlman-labs/example",
+				WorkflowID:     "feature_change",
+				TriggerSource:  run.TriggerGitHubIssue,
+				TriggerRef:     &triggerRef,
+				InstallationID: &installation,
+			}
+			rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: stageType}
+			gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "Body text", State: "open"}
+			w := promptRequest(t, s, runID, stageID, priv, "")
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			for _, banned := range []string{`"egress_target_hosts":`, `"acceptance_criteria_ids":`} {
+				if strings.Contains(w.Body.String(), banned) {
+					t.Errorf("%s response must not carry %s:\n%s", stageType, banned, w.Body.String())
+				}
+			}
+		})
+	}
+}
+
+// TestGetStagePromptRender_Acceptance_ServesEgressHostsAndCriteriaIDs pins the
+// SPA render handler carries the SAME acceptance wire fields — the two
+// handlers duplicate response construction, so the acceptance block must land
+// in both (or the rendered view silently diverges from the runner path).
+func TestGetStagePromptRender_Acceptance_ServesEgressHostsAndCriteriaIDs(t *testing.T) {
+	s, runID, acceptanceStageID, _, _ := newAcceptancePromptServer(t)
+	runRow, err := s.cfg.RunRepo.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	runRow.WorkflowSpec = []byte(acceptanceEgressSpec)
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt-render", acceptanceStageID), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if want := []string{"staging.example.com:8443", "second.example.com"}; !reflect.DeepEqual(resp.EgressTargetHosts, want) {
+		t.Errorf("EgressTargetHosts = %v, want %v", resp.EgressTargetHosts, want)
+	}
+	if want := []string{"ac-create", "ac-list"}; !reflect.DeepEqual(resp.AcceptanceCriteriaIDs, want) {
+		t.Errorf("AcceptanceCriteriaIDs = %v, want %v", resp.AcceptanceCriteriaIDs, want)
+	}
+}

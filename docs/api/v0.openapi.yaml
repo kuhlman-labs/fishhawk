@@ -1761,6 +1761,18 @@ components:
               observed: { type: string }
               expected: { type: string }
               steps_taken: { type: string }
+              expectation_basis:
+                type: string
+                description: |
+                  Where the expectation came from — the criterion statement,
+                  the issue text, a spec section — so a failed assertion is
+                  auditable against its source (E31.7 / #1535). Optional.
+              repro_handle:
+                type: string
+                description: |
+                  A re-run pointer for the observation — the command, request,
+                  or script the validator used — so a human can reproduce the
+                  evidence (E31.7 / #1535). Optional.
         target_url:
           type: string
           format: uri
@@ -4933,6 +4945,31 @@ paths:
                       (older backend, or backend-side resolution failure)
                       means the runner proceeds with checkout only, skipping
                       the comparison.
+                  egress_target_hosts:
+                    type: array
+                    items: { type: string }
+                    description: |
+                      The acceptance stage's FULL spec-declared egress
+                      target-host list (the E31.4/#1532 grammar), each a host
+                      or host:port, served ONLY on acceptance stages (E31.7 /
+                      #1535). The runner feeds it into the ADR-050 egress
+                      proxy's allow-list before spawning the acceptance agent.
+                      Distinct from the prompt text's target-instance line,
+                      which renders only the first host. Absent on every other
+                      stage type, and on an acceptance stage whose spec
+                      declares no egress block — the proxy then admits only
+                      model + backend hosts (fail-closed).
+                  acceptance_criteria_ids:
+                    type: array
+                    items: { type: string }
+                    description: |
+                      The approved plan's `verification.acceptance_criteria`
+                      id list (the E31.1 join keys) in plan order, served ONLY
+                      on acceptance stages (E31.7 / #1535). The runner
+                      validates the acceptance verdict's `criteria[].id` join
+                      keys against this set before shipping, failing closed on
+                      an unknown id. Absent on every other stage type, and
+                      when the approved plan carries no criteria.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -5067,6 +5104,14 @@ paths:
                   fixup_expected_head_sha:
                     type: string
                     description: The run's recorded head SHA — the newest `head_sha` across the run's reported-head ledger entries (`pull_request_opened` / `child_pushed` / `fixup_pushed`), the ADR-035 lineage source. Present only when `fixup` is true and resolution succeeded; the runner verifies the fetched `fixup_branch` tip against it before invoking the agent (#967).
+                  egress_target_hosts:
+                    type: array
+                    items: { type: string }
+                    description: The acceptance stage's FULL spec-declared egress target-host list (E31.4/#1532 grammar), served ONLY on acceptance stages (E31.7 / #1535) — the runner's ADR-050 egress-proxy allow-list input. Absent on every other stage type and on an acceptance stage whose spec declares no egress block.
+                  acceptance_criteria_ids:
+                    type: array
+                    items: { type: string }
+                    description: The approved plan's `verification.acceptance_criteria` id list (the E31.1 join keys) in plan order, served ONLY on acceptance stages (E31.7 / #1535) — the runner's verdict join-key validation set. Absent on every other stage type and when the approved plan carries no criteria.
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
