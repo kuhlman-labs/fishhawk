@@ -901,6 +901,290 @@ else
   fail "cmd_down should rm the NONCE_FILE"
 fi
 
+# 15. Acceptance preview (E31.18 / #1569) — pure DB derivation. The preview
+# database name must be the base name with an `_preview` suffix and can NEVER
+# equal the base name, so a preview start can never DROP the dev database.
+base_db_url='postgres://fishhawk:fishhawk@localhost:5432/fishhawk?sslmode=disable'
+out="$(_preview_db_name "$base_db_url")"
+if [[ "$out" == "fishhawk_preview" ]]; then
+  pass "_preview_db_name suffixes the database name with _preview"
+else
+  fail "_preview_db_name should yield fishhawk_preview (got: $out)"
+fi
+if [[ "$out" != "fishhawk" ]]; then
+  pass "_preview_db_name never equals the base database name"
+else
+  fail "_preview_db_name must never equal the base name"
+fi
+out="$(_preview_db_name 'postgres://u:p@h:5432/mydb')"
+if [[ "$out" == "mydb_preview" ]]; then
+  pass "_preview_db_name handles a query-less URL"
+else
+  fail "_preview_db_name should yield mydb_preview for a query-less URL (got: $out)"
+fi
+if _preview_db_name 'postgres://u:p@h:5432' >/dev/null; then
+  fail "_preview_db_name should return non-zero for a URL with no database name"
+else
+  pass "_preview_db_name rejects a URL with no database name"
+fi
+out="$(_preview_db_url "$base_db_url")"
+if [[ "$out" == 'postgres://fishhawk:fishhawk@localhost:5432/fishhawk_preview?sslmode=disable' ]]; then
+  pass "_preview_db_url swaps the database name and preserves the query string"
+else
+  fail "_preview_db_url should swap in fishhawk_preview keeping ?sslmode (got: $out)"
+fi
+out="$(_preview_db_url 'postgres://u:p@h:5432/mydb')"
+if [[ "$out" == 'postgres://u:p@h:5432/mydb_preview' ]]; then
+  pass "_preview_db_url handles a query-less URL"
+else
+  fail "_preview_db_url should yield .../mydb_preview (got: $out)"
+fi
+
+# 15a. Preview address/port derivation: default localhost:8090 (distinct from
+# the orchestrating 8080), FISHHAWK_PREVIEW_ADDR override honored.
+unset FISHHAWK_PREVIEW_ADDR
+if [[ "$(_preview_port)" == "8090" ]]; then
+  pass "_preview_port defaults to 8090 when FISHHAWK_PREVIEW_ADDR unset"
+else
+  fail "_preview_port should default to 8090 (got: $(_preview_port))"
+fi
+if [[ "$(_preview_healthz_url)" == "http://localhost:8090/healthz" ]]; then
+  pass "_preview_healthz_url defaults to port 8090"
+else
+  fail "_preview_healthz_url should default to 8090 (got: $(_preview_healthz_url))"
+fi
+FISHHAWK_PREVIEW_ADDR='localhost:9191'
+if [[ "$(_preview_port)" == "9191" ]]; then
+  pass "_preview_port respects the FISHHAWK_PREVIEW_ADDR override"
+else
+  fail "_preview_port should yield 9191 for 'localhost:9191' (got: $(_preview_port))"
+fi
+unset FISHHAWK_PREVIEW_ADDR
+
+# 15b. _git_sha_from_healthz_body: compact Go-marshaled shape (same seam
+# discipline as _nonce_from_healthz_body), and the field-absent case.
+full_sha_body='{"status":"ok","version":"dev","git_sha":"abc1234","min_runner_version":"dev","start_nonce":"feedbeef"}'
+if [[ "$(_git_sha_from_healthz_body "$full_sha_body")" == "abc1234" ]]; then
+  pass "_git_sha_from_healthz_body extracts git_sha from a full healthz body"
+else
+  fail "_git_sha_from_healthz_body should extract abc1234 (got: $(_git_sha_from_healthz_body "$full_sha_body"))"
+fi
+if [[ -z "$(_git_sha_from_healthz_body '{"status":"ok","version":"dev"}')" ]]; then
+  pass "_git_sha_from_healthz_body prints nothing when git_sha is absent"
+else
+  fail "_git_sha_from_healthz_body should print nothing for a sha-less body"
+fi
+
+# 15c. _await_preview_healthz behavior: the git_sha-gated readiness poll.
+# Dead pid → prompt non-zero (spawn-then-die fails fast, mirroring section 8).
+( exit 0 ) &
+dead_pid=$!
+wait "$dead_pid" 2>/dev/null
+if _await_preview_healthz "$dead_pid" "http://localhost:1/healthz" "abc1234" 10; then
+  fail "_await_preview_healthz should return non-zero for an already-exited pid"
+else
+  pass "_await_preview_healthz returns non-zero promptly for a dead pid"
+fi
+# Matching git_sha → 0 (one-shot responder; our own live pid stands in for the
+# spawned daemon).
+np="$(_find_free_port)"
+if [[ -z "$np" ]]; then
+  fail "could not find a free port for the preview-readiness responder"
+else
+  _serve_healthz_once "$np" '{"status":"ok","git_sha":"abc1234"}'
+  if _await_preview_healthz "$$" "http://localhost:${np}/healthz" "abc1234" 5; then
+    pass "_await_preview_healthz returns 0 when /healthz echoes the expected git_sha"
+  else
+    fail "_await_preview_healthz should verify a matching git_sha"
+  fi
+  wait "$responder_pid" 2>/dev/null
+fi
+# Mismatched git_sha → non-zero at deadline: serving is not enough, the
+# listener must BE the expected build (identity-gated readiness).
+np="$(_find_free_port)"
+if [[ -z "$np" ]]; then
+  fail "could not find a free port for the preview-mismatch responder"
+else
+  _serve_healthz_once "$np" '{"status":"ok","git_sha":"aaaa111"}'
+  if _await_preview_healthz "$$" "http://localhost:${np}/healthz" "bbb2222" 1; then
+    fail "_await_preview_healthz should NOT verify a mismatched git_sha"
+  else
+    pass "_await_preview_healthz returns non-zero for a wrong-identity listener"
+  fi
+  wait "$responder_pid" 2>/dev/null
+fi
+
+# 15d. _preview_kill_tracked: behavioral TERM leg + idempotent no-op paths
+# (tempdir-parameterized like _clean_stray_pid_files); the KILL escalation leg
+# is locked by body-grep below (a TERM-immune fixture would cost 5s per run).
+pv_dir="$(mktemp -d -t test-dev-preview.XXXXXX)"
+sleep 60 &
+pv_pid=$!
+print "$pv_pid" > "$pv_dir/preview.pid"
+pv_out="$(_preview_kill_tracked "$pv_dir/preview.pid")"
+if ! kill -0 "$pv_pid" 2>/dev/null; then
+  pass "_preview_kill_tracked terminates the tracked pid"
+else
+  fail "_preview_kill_tracked should have killed pid ${pv_pid}"
+  kill -KILL "$pv_pid" 2>/dev/null
+fi
+wait "$pv_pid" 2>/dev/null
+if [[ ! -f "$pv_dir/preview.pid" ]]; then
+  pass "_preview_kill_tracked removes the pid file"
+else
+  fail "_preview_kill_tracked should remove the pid file"
+fi
+if _preview_kill_tracked "$pv_dir/preview.pid" >/dev/null; then
+  pass "_preview_kill_tracked is a clean no-op when no pid file exists"
+else
+  fail "_preview_kill_tracked should return 0 for a missing pid file"
+fi
+kt_body="$(typeset -f _preview_kill_tracked)"
+if print -r -- "$kt_body" | grep -q 'kill -TERM' && print -r -- "$kt_body" | grep -q 'kill -KILL'; then
+  pass "_preview_kill_tracked escalates TERM -> KILL"
+else
+  fail "_preview_kill_tracked should carry the TERM -> KILL ladder"
+fi
+
+# 15e. _preview_remove_worktree: an unregistered leftover directory is removed
+# via the rm -rf fallback; a missing directory is a clean no-op.
+mkdir -p "$pv_dir/wt"
+touch "$pv_dir/wt/marker"
+_preview_remove_worktree "$pv_dir/wt" >/dev/null 2>&1
+if [[ ! -d "$pv_dir/wt" ]]; then
+  pass "_preview_remove_worktree removes an unregistered leftover directory"
+else
+  fail "_preview_remove_worktree should remove the directory (fallback rm -rf)"
+fi
+if _preview_remove_worktree "$pv_dir/wt" >/dev/null 2>&1; then
+  pass "_preview_remove_worktree is a clean no-op when the directory is absent"
+else
+  fail "_preview_remove_worktree should return 0 for a missing directory"
+fi
+rw_body="$(typeset -f _preview_remove_worktree)"
+if print -r -- "$rw_body" | grep -q 'worktree remove --force'; then
+  pass "_preview_remove_worktree uses git worktree remove --force"
+else
+  fail "_preview_remove_worktree should call git worktree remove --force"
+fi
+rm -rf "$pv_dir"
+
+# 15f. cmd_preview wiring body-greps (section-13b style): detached worktree,
+# GitSHA-stamped build, DB reset, git_sha-gated readiness, fail-loud contract.
+preview_body="$(typeset -f cmd_preview)"
+if print -r -- "$preview_body" | grep -q 'worktree add' && print -r -- "$preview_body" | grep -q -- '--detach'; then
+  pass "cmd_preview checks out the merge candidate in a detached worktree"
+else
+  fail "cmd_preview should git worktree add --detach"
+fi
+if print -r -- "$preview_body" | grep -q '_build_ldflags'; then
+  pass "cmd_preview stamps the preview build via _build_ldflags"
+else
+  fail "cmd_preview should stamp GitSHA via _build_ldflags"
+fi
+if print -r -- "$preview_body" | grep -q '_preview_db_reset'; then
+  pass "cmd_preview resets the isolated preview database"
+else
+  fail "cmd_preview should call _preview_db_reset"
+fi
+if print -r -- "$preview_body" | grep -q '_await_preview_healthz'; then
+  pass "cmd_preview gates readiness on the git_sha-verified healthz poll"
+else
+  fail "cmd_preview should call _await_preview_healthz"
+fi
+if print -r -- "$preview_body" | grep -q 'migrate up'; then
+  pass "cmd_preview migrates the preview database with the preview binary"
+else
+  fail "cmd_preview should run migrate up against the preview database"
+fi
+if print -r -- "$preview_body" | grep -q 'tail -n 15'; then
+  pass "cmd_preview tails the preview log on a failed readiness gate"
+else
+  fail "cmd_preview should tail the log on readiness-gate failure"
+fi
+if print -r -- "$preview_body" | grep -q 'exit 1'; then
+  pass "cmd_preview exits non-zero on failure"
+else
+  fail "cmd_preview should exit 1 on failure"
+fi
+if print -r -- "$preview_body" | grep -q 'FISHHAWK_PREVIEW_SHA'; then
+  pass "cmd_preview defaults its arg to \$FISHHAWK_PREVIEW_SHA (runner-hook bare invocation)"
+else
+  fail "cmd_preview should default to FISHHAWK_PREVIEW_SHA"
+fi
+# Fail-loud guard legs (body-greps; the parameterized helpers behind them are
+# behaviorally covered above, and the DB-reset-failure teardown was validated
+# live): empty ref, missing DB URL, unresolvable ref, port squatter, and
+# teardown-on-failure (worktree removal on the post-worktree failure paths).
+if print -r -- "$preview_body" | grep -q 'no SHA to preview'; then
+  pass "cmd_preview dies loud when neither arg nor FISHHAWK_PREVIEW_SHA is set"
+else
+  fail "cmd_preview should _die on an empty ref"
+fi
+if print -r -- "$preview_body" | grep -q 'FISHHAWKD_DATABASE_URL is not set'; then
+  pass "cmd_preview dies loud when FISHHAWKD_DATABASE_URL is unset"
+else
+  fail "cmd_preview should _die on a missing FISHHAWKD_DATABASE_URL"
+fi
+if print -r -- "$preview_body" | grep -q 'could not resolve'; then
+  pass "cmd_preview dies loud on an unresolvable ref (after the direct-fetch retry)"
+else
+  fail "cmd_preview should _die when the ref resolves to no commit"
+fi
+if print -r -- "$preview_body" | grep -q '_port_listeners'; then
+  pass "cmd_preview preflights the preview port for squatters"
+else
+  fail "cmd_preview should preflight the preview port via _port_listeners"
+fi
+if print -r -- "$preview_body" | grep -q '_preview_remove_worktree'; then
+  pass "cmd_preview removes the preview worktree on its post-worktree failure paths"
+else
+  fail "cmd_preview should call _preview_remove_worktree on failure"
+fi
+db_reset_body="$(typeset -f _preview_db_reset)"
+if print -r -- "$db_reset_body" | grep -q 'DROP DATABASE IF EXISTS' && print -r -- "$db_reset_body" | grep -q 'CREATE DATABASE'; then
+  pass "_preview_db_reset DROP/CREATEs the preview database"
+else
+  fail "_preview_db_reset should DROP DATABASE IF EXISTS + CREATE DATABASE"
+fi
+if print -r -- "$db_reset_body" | grep -q 'docker exec fishhawk-postgres'; then
+  pass "_preview_db_reset degrades to psql inside the compose container when the host has none"
+else
+  fail "_preview_db_reset should carry the docker-exec psql fallback"
+fi
+pd_body="$(typeset -f cmd_preview_down)"
+if print -r -- "$pd_body" | grep -q '_preview_kill_tracked' && print -r -- "$pd_body" | grep -q '_preview_remove_worktree'; then
+  pass "cmd_preview_down composes the kill + worktree-removal ladder"
+else
+  fail "cmd_preview_down should call _preview_kill_tracked and _preview_remove_worktree"
+fi
+
+# 15h. _preview_branch_env: the credential-stripped prefix that runs the
+# UNTRUSTED merge-candidate binary (#1569 security fixup). It must be an
+# `env -i` boundary (default-deny) and never forward a .env-sourced secret,
+# while preserving PATH so the branch binary can still boot.
+ANTHROPIC_API_KEY="leaked-model-key" FISHHAWK_GITHUB_TOKEN="leaked-gh-token" FISHHAWK_API_TOKEN="leaked-api-token" _preview_branch_env
+if [[ "${reply[1]}" == "env" && "${reply[2]}" == "-i" ]]; then
+  pass "_preview_branch_env clears the inherited env via env -i"
+else
+  fail "_preview_branch_env should start with 'env -i' (got: ${reply[1]} ${reply[2]})"
+fi
+if print -r -- "${reply[@]}" | grep -q 'leaked-'; then
+  fail "_preview_branch_env leaked a secret into the branch-exec env: ${reply[*]}"
+else
+  pass "_preview_branch_env forwards no runner/.env secret to branch code"
+fi
+if print -r -- "${reply[@]}" | grep -q "PATH=${PATH}"; then
+  pass "_preview_branch_env preserves PATH so the branch binary can boot"
+else
+  fail "_preview_branch_env should preserve PATH"
+fi
+if print -r -- "$preview_body" | grep -q '_preview_branch_env'; then
+  pass "cmd_preview runs the branch binary through the credential-stripped _preview_branch_env"
+else
+  fail "cmd_preview should exec migrate up / serve via _preview_branch_env"
+fi
+
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then
   pass "scripts/dev parses clean (zsh -n)"

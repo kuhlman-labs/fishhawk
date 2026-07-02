@@ -10,6 +10,17 @@ K8S_JAEGER_PF_PID_FILE="${REPO_ROOT}/.fishhawk/k8s-jaeger-pf.pid"
 LOG_DIR="${REPO_ROOT}/logs"
 LOG_FILE="${LOG_DIR}/fishhawkd.log"
 BIN="${REPO_ROOT}/bin/fishhawkd"
+# Acceptance preview (E31.18 / #1569): a second fishhawkd built from the run's
+# merge-candidate SHA in a detached worktree, serving on its own port against
+# its own database. The binary lives INSIDE the worktree so preview-down's
+# worktree removal cleans it up with everything else. The worktree sits under
+# the already-gitignored .fishhawk/cache/ — a live preview must never show as
+# untracked in the main repo, or `git status` goes dirty and _dev_git_sha
+# starts stamping dev builds -dirty (which the runner's fail-closed staleness
+# probe would then correctly reject).
+PREVIEW_PID_FILE="${REPO_ROOT}/.fishhawk/preview.pid"
+PREVIEW_WORKTREE="${REPO_ROOT}/.fishhawk/cache/preview-worktree"
+PREVIEW_LOG_FILE="${LOG_DIR}/fishhawkd-preview.log"
 
 cmd="${1:-}"
 
@@ -1096,8 +1107,342 @@ cmd_k8s_down() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Acceptance preview (E31.18 / #1569): `scripts/dev preview [<sha-or-ref>]`
+# builds the run's merge candidate in a detached worktree and serves it on its
+# own port against an isolated database, so the acceptance agent validates the
+# PR branch instead of the orchestrating fishhawkd's main build. The runner's
+# FISHHAWK_ACCEPTANCE_PREVIEW_CMD hook invokes it bare (the SHA arrives via
+# FISHHAWK_PREVIEW_SHA); FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD invokes
+# `scripts/dev preview-down`.
+# ---------------------------------------------------------------------------
+
+# Pure: the isolated preview database name — the base URL's database name with
+# an `_preview` suffix, so it can NEVER equal (and thus never destroy) the dev
+# database. Non-zero with no output when the URL carries no database name.
+# Git-free/env-free so scripts/test-dev can drive it with crafted input.
+_preview_db_name() {
+  local url="$1"
+  local base="${url%%\?*}"      # drop ?query
+  local rest="${base#*://}"     # drop scheme, so :// can't satisfy the / check
+  if [[ "$rest" != */* ]]; then
+    return 1
+  fi
+  local dbname="${rest##*/}"
+  if [[ -z "$dbname" ]]; then
+    return 1
+  fi
+  print -r -- "${dbname}_preview"
+}
+
+# Pure: the base database URL with its database name swapped for the
+# _preview-suffixed one, query string preserved. Non-zero when the URL
+# carries no database name (mirrors _preview_db_name).
+_preview_db_url() {
+  local url="$1"
+  local base="${url%%\?*}"
+  local query=""
+  if [[ "$url" == *\?* ]]; then query="?${url#*\?}"; fi
+  local dbname
+  if ! dbname="$(_preview_db_name "$url")"; then
+    return 1
+  fi
+  print -r -- "${base%/*}/${dbname}${query}"
+}
+
+# Preview listen address / port / healthz URL, from FISHHAWK_PREVIEW_ADDR
+# (default localhost:8090 — deliberately distinct from the orchestrating
+# fishhawkd's 8080). Mirrors the _healthz_port/_healthz_url derivation.
+_preview_addr() {
+  print -r -- "${FISHHAWK_PREVIEW_ADDR:-localhost:8090}"
+}
+
+_preview_port() {
+  local addr
+  addr="$(_preview_addr)"
+  local port="${addr##*:}"
+  if [[ -z "$port" || "$port" == "$addr" ]]; then port=8090; fi
+  print "$port"
+}
+
+_preview_healthz_url() {
+  print "http://localhost:$(_preview_port)/healthz"
+}
+
+# Extract the git_sha value from a /healthz JSON body; prints the sha or
+# nothing when the field is absent. Same compact Go-marshaled `"key":"value"`
+# shape (and the same always-return-0 contract) as _nonce_from_healthz_body.
+_git_sha_from_healthz_body() {
+  local body="$1"
+  local match=""
+  if match="$(print -r -- "$body" | grep -Eo '"git_sha":"[^"]*"' | head -n 1)"; then
+    print -r -- "$match" | cut -d'"' -f4
+  fi
+}
+
+# Poll <url> until fishhawkd <pid> answers GET /healthz with git_sha exactly
+# <want> (the stamped short SHA — the build-identity readiness gate; the
+# runner's probeTargetIdentity then verifies the same value against the full
+# expected head SHA), for up to <deadline> seconds. Returns 1 early if the
+# process died, or when the deadline elapses without an identity match — a
+# healthy body with the WRONG git_sha keeps polling, so a slow-to-exit prior
+# listener can't fail the gate spuriously. #631 discipline: every check runs
+# in a tested context.
+_await_preview_healthz() {
+  local pid="$1"
+  local url="$2"
+  local want="$3"
+  local deadline="${4:-30}"
+  local i=0 body="" got=""
+  while (( i < deadline )); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return 1
+    fi
+    if body="$(curl --silent --fail --max-time 2 "$url" 2>/dev/null)"; then
+      got="$(_git_sha_from_healthz_body "$body")"
+      if [[ -n "$got" && "$got" == "$want" ]]; then
+        return 0
+      fi
+    fi
+    sleep 1
+    (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (#631)
+  done
+  return 1
+}
+
+# DROP/CREATE the preview database at every preview start — deterministic
+# isolation: PR-branch migrations run only ever against a throwaway database,
+# never the dev one. WITH (FORCE) (postgres 13+; the dev compose pins 16)
+# terminates any straggler connection from a just-killed prior preview.
+# Statements run against the BASE database URL (you cannot drop the database
+# you are connected to). Prefers a host psql; degrades to psql inside the
+# fishhawk-postgres compose container when the host has none.
+_preview_db_reset() {
+  local base_url="$1"
+  local preview_db="$2"
+  local drop_sql="DROP DATABASE IF EXISTS \"${preview_db}\" WITH (FORCE)"
+  local create_sql="CREATE DATABASE \"${preview_db}\""
+  if command -v psql &>/dev/null; then
+    psql "$base_url" -v ON_ERROR_STOP=1 -q -c "$drop_sql" -c "$create_sql"
+  else
+    docker exec fishhawk-postgres psql "$base_url" -v ON_ERROR_STOP=1 -q -c "$drop_sql" -c "$create_sql"
+  fi
+}
+
+# TERM→5s→KILL the pid tracked in <pid_file>, then remove the file. Idempotent:
+# a missing file or an already-dead pid is a clean no-op. Parameterized on the
+# pid file so scripts/test-dev can drive it against a tempdir fixture.
+_preview_kill_tracked() {
+  local pid_file="$1"
+  if [[ ! -f "$pid_file" ]]; then
+    print "preview fishhawkd is not running (no pid file)"
+    return 0
+  fi
+  local pid
+  pid="$(cat "$pid_file")"
+  if ! kill -0 "$pid" 2>/dev/null; then
+    print "preview fishhawkd already stopped"
+    rm -f "$pid_file"
+    return 0
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  local i=0
+  while kill -0 "$pid" 2>/dev/null && (( i < 5 )); do
+    sleep 1
+    (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (#631)
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+    print "preview fishhawkd killed (SIGKILL after 5s)"
+  else
+    print "preview fishhawkd stopped"
+  fi
+  rm -f "$pid_file"
+}
+
+# Remove the preview worktree at <dir>. `git worktree remove --force` handles
+# the registered case; an unregistered leftover directory (or a repo state git
+# refuses to touch) degrades to rm -rf — the path is our own fixed
+# .fishhawk/preview-worktree, never operator data. Prune afterwards so a stale
+# registration can't block the next `git worktree add`. Idempotent.
+_preview_remove_worktree() {
+  local dir="$1"
+  if [[ ! -d "$dir" ]]; then
+    git -C "${REPO_ROOT}" worktree prune 2>/dev/null || true
+    return 0
+  fi
+  if git -C "${REPO_ROOT}" worktree remove --force "$dir" 2>/dev/null; then
+    print "preview worktree removed"
+  else
+    rm -rf "$dir"
+    print "preview worktree removed (rm -rf fallback)"
+  fi
+  git -C "${REPO_ROOT}" worktree prune 2>/dev/null || true
+}
+
+# Credential-stripped exec prefix (E31.18 / #1569 security fixup, ADR-029
+# default-deny posture) for the UNTRUSTED merge-candidate binary. cmd_preview
+# sources .env — which in the dogfood carries the runner's model/GitHub/backend
+# tokens (ANTHROPIC_API_KEY, FISHHAWK_GITHUB_TOKEN, FISHHAWK_API_TOKEN, …) — so
+# before it BUILDS-then-RUNS branch fishhawkd (`migrate up` / `serve`) those
+# secrets must not reach branch code with network egress (the lethal-trifecta
+# shape). `env -i` clears the inherited environment and re-exports ONLY the
+# non-secret essentials the Go binary needs to boot: PATH/HOME plus locale/TZ.
+# Per-call FISHHAWKD_* config (the isolated DATABASE_URL, the ADDR) is appended
+# by the caller. The prefix words land in the global array `reply` so the call
+# sites can splice them and scripts/test-dev can assert the containment.
+_preview_branch_env() {
+  reply=(env -i "PATH=${PATH}" "HOME=${HOME}")
+  if [[ -n "${LANG:-}" ]]; then reply+=("LANG=${LANG}"); fi
+  if [[ -n "${TZ:-}" ]]; then reply+=("TZ=${TZ}"); fi
+}
+
+# `scripts/dev preview [<sha-or-ref>]` — build and serve the merge candidate.
+# The positional arg defaults to $FISHHAWK_PREVIEW_SHA so the runner's
+# provisioning hook can invoke the command bare.
+cmd_preview() {
+  print "preview: starting"
+
+  # Environment (same posture as cmd_up): FISHHAWKD_DATABASE_URL and the
+  # FISHHAWK_PREVIEW_* overrides may live only in .env.
+  if [[ -f "${REPO_ROOT}/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${REPO_ROOT}/.env"
+    set +a
+  else
+    print "warning: .env not found — using current shell environment"
+  fi
+
+  local ref="${1:-${FISHHAWK_PREVIEW_SHA:-}}"
+  if [[ -z "$ref" ]]; then
+    _die "no SHA to preview — pass one (scripts/dev preview <sha-or-ref>) or set FISHHAWK_PREVIEW_SHA"
+  fi
+  local base_url="${FISHHAWKD_DATABASE_URL:-}"
+  if [[ -z "$base_url" ]]; then
+    _die "FISHHAWKD_DATABASE_URL is not set — the preview needs it to derive its isolated _preview database"
+  fi
+  local preview_db="" preview_url=""
+  if ! preview_db="$(_preview_db_name "$base_url")"; then
+    _die "FISHHAWKD_DATABASE_URL carries no database name — cannot derive the _preview database"
+  fi
+  preview_url="$(_preview_db_url "$base_url")"
+
+  # Fetch, then resolve the ref. A PR-head SHA may not be reachable from any
+  # already-fetched branch, so an unresolved ref gets one direct-fetch retry
+  # before failing. Offline fetch degrades with a warning — the ref may
+  # already be local.
+  if ! git -C "${REPO_ROOT}" fetch origin --quiet 2>/dev/null; then
+    print "warning: git fetch origin failed — resolving ${ref} against local objects only"
+  fi
+  local sha=""
+  if ! sha="$(git -C "${REPO_ROOT}" rev-parse --verify --quiet "${ref}^{commit}")"; then
+    if git -C "${REPO_ROOT}" fetch origin "$ref" --quiet 2>/dev/null; then
+      sha="$(git -C "${REPO_ROOT}" rev-parse --verify --quiet "${ref}^{commit}")" || sha=""
+    fi
+  fi
+  if [[ -z "$sha" ]]; then
+    _die "could not resolve '${ref}' to a commit (after git fetch origin) — is the run branch pushed?"
+  fi
+  local short_sha
+  short_sha="$(git -C "${REPO_ROOT}" rev-parse --short "$sha")"
+
+  # Deterministic restart: tear down any prior preview (tracked pid + worktree)
+  # before this one — the runner hook re-provisions per acceptance stage.
+  _preview_kill_tracked "$PREVIEW_PID_FILE"
+  _preview_remove_worktree "$PREVIEW_WORKTREE"
+
+  # Port preflight (#965 posture): a foreign listener on the preview port means
+  # the spawn below would bind-fail while the squatter answers the readiness
+  # probe with the wrong (or right!) identity. Fail loud before any work.
+  local pport
+  pport="$(_preview_port)"
+  if command -v lsof &>/dev/null; then
+    local squatters=""
+    if ! squatters="$(_port_listeners "$pport")"; then squatters=""; fi
+    if [[ -n "$squatters" ]]; then
+      local spid scomm sdesc=""
+      while IFS= read -r spid; do
+        if [[ -z "$spid" ]]; then continue; fi
+        scomm="?"
+        if ! scomm="$(ps -p "$spid" -o comm= 2>/dev/null)"; then scomm="?"; fi
+        sdesc+="pid ${spid} (${scomm:t}) "
+      done <<< "$squatters"
+      _die "preview port ${pport} already has a listener: ${sdesc}— run 'scripts/dev preview-down', or kill the pid, then retry"
+    fi
+  else
+    print "warning: lsof not found — skipping preview port preflight (degraded)"
+  fi
+
+  # Detached preview worktree at the merge candidate. A clean detached
+  # checkout, so the GitSHA stamp below carries no -dirty suffix — a dirty
+  # stamp would (correctly) fail the runner's fail-closed staleness probe.
+  mkdir -p "${PREVIEW_WORKTREE:h}"
+  print "preview: adding worktree at ${short_sha}..."
+  git -C "${REPO_ROOT}" worktree add --quiet --detach "$PREVIEW_WORKTREE" "$sha"
+
+  # Build fishhawkd from the preview tree, stamped with the preview SHA via
+  # the same _build_ldflags path the dev build uses (#1007). The binary lands
+  # inside the worktree so preview-down's removal cleans it up.
+  print "preview: building fishhawkd (GitSHA=${short_sha})..."
+  local pbin="${PREVIEW_WORKTREE}/bin/fishhawkd"
+  if ! (cd "$PREVIEW_WORKTREE" && mkdir -p bin && go build -ldflags "$(_build_ldflags fishhawkd "$short_sha")" -o bin/fishhawkd ./backend/cmd/fishhawkd/); then
+    print -u2 "error: preview fishhawkd build failed at ${short_sha}"
+    _preview_remove_worktree "$PREVIEW_WORKTREE"
+    exit 1
+  fi
+
+  # Isolated database: DROP/CREATE <dbname>_preview, then run the PREVIEW
+  # binary's migrations against it — PR-branch migrations never touch the dev
+  # database.
+  print "preview: resetting database ${preview_db}..."
+  if ! _preview_db_reset "$base_url" "$preview_db"; then
+    print -u2 "error: could not DROP/CREATE ${preview_db} — is postgres up (docker compose up -d)?"
+    _preview_remove_worktree "$PREVIEW_WORKTREE"
+    exit 1
+  fi
+  print "preview: applying migrations..."
+  _preview_branch_env
+  if ! "${reply[@]}" "FISHHAWKD_DATABASE_URL=$preview_url" "$pbin" migrate up; then
+    print -u2 "error: preview migrations failed against ${preview_db}"
+    _preview_remove_worktree "$PREVIEW_WORKTREE"
+    exit 1
+  fi
+
+  # Spawn on the preview address and gate readiness on /healthz echoing the
+  # stamped git_sha — serving is not enough; the listener must BE the merge
+  # candidate (the same identity the runner's probe then re-verifies).
+  local paddr
+  paddr="$(_preview_addr)"
+  mkdir -p "$LOG_DIR"
+  _preview_branch_env
+  "${reply[@]}" "FISHHAWKD_DATABASE_URL=$preview_url" "FISHHAWKD_ADDR=$paddr" "$pbin" serve >> "$PREVIEW_LOG_FILE" 2>&1 &
+  local pid=$!
+  disown
+  print "$pid" > "$PREVIEW_PID_FILE"
+
+  if ! _await_preview_healthz "$pid" "$(_preview_healthz_url)" "$short_sha" 30; then
+    print -u2 "error: preview fishhawkd did not serve git_sha=${short_sha} on $(_preview_healthz_url) within 30s"
+    print -u2 "last ${PREVIEW_LOG_FILE} lines:"
+    tail -n 15 "$PREVIEW_LOG_FILE" >&2
+    _preview_kill_tracked "$PREVIEW_PID_FILE"
+    _preview_remove_worktree "$PREVIEW_WORKTREE"
+    exit 1
+  fi
+
+  print "preview fishhawkd started (pid ${pid}, git_sha ${short_sha}) on ${paddr} — db ${preview_db}, logs: ${PREVIEW_LOG_FILE}"
+}
+
+# `scripts/dev preview-down` — TERM→KILL the tracked preview daemon, remove
+# the preview worktree (and the binary inside it), drop the pid file. The
+# preview database is left in place; the next preview start DROP/CREATEs it.
+cmd_preview_down() {
+  _preview_kill_tracked "$PREVIEW_PID_FILE"
+  _preview_remove_worktree "$PREVIEW_WORKTREE"
+}
+
 _usage() {
-  print -u2 "usage: scripts/dev <up [--all] [--start-deps]|reload [--all] [--start-deps]|post-merge [<issue>] [--start-deps]|k8s|k8s-down|down>"
+  print -u2 "usage: scripts/dev <up [--all] [--start-deps]|reload [--all] [--start-deps]|post-merge [<issue>] [--start-deps]|preview [<sha-or-ref>]|preview-down|k8s|k8s-down|down>"
   print -u2 ""
   print -u2 "  post-merge runs the full per-PR post-merge walk: git pull --ff-only,"
   print -u2 "  scripts/cleanup-merged, an optional issue-closed check (<issue>), then"
@@ -1105,6 +1450,12 @@ _usage() {
   print -u2 ""
   print -u2 "  reload is the down-then-up stack primitive post-merge composes; plain up"
   print -u2 "  no-ops when fishhawkd is already running and so never rebuilds."
+  print -u2 ""
+  print -u2 "  preview builds fishhawkd from <sha-or-ref> (default \$FISHHAWK_PREVIEW_SHA) in"
+  print -u2 "  a detached worktree, serves it on FISHHAWK_PREVIEW_ADDR (default"
+  print -u2 "  localhost:8090) against an isolated <dbname>_preview database, and gates"
+  print -u2 "  readiness on /healthz echoing the stamped git_sha; preview-down tears it"
+  print -u2 "  down. This is the acceptance-stage provisioning hook (E31.18 / #1569)."
   print -u2 ""
   print -u2 "  k8s builds the fishhawkd image, helm-installs the chart with values-local"
   print -u2 "  against the Docker-Desktop cluster, and gates on /healthz; k8s-down kills"
@@ -1123,6 +1474,8 @@ if [[ -z "${DEV_LIB_ONLY:-}" ]]; then
     up)         cmd_up "${@:2}" ;;
     reload)     cmd_reload "${@:2}" ;;
     post-merge) cmd_post_merge "${@:2}" ;;
+    preview)      cmd_preview "${@:2}" ;;
+    preview-down) cmd_preview_down ;;
     k8s)        cmd_k8s_up "${@:2}" ;;
     k8s-down)   cmd_k8s_down ;;
     down)       cmd_down ;;

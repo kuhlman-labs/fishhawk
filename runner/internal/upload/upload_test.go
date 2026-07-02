@@ -1777,7 +1777,9 @@ func TestShipAcceptance_RejectsEmptyBodyAndBadKey(t *testing.T) {
 
 // TestFetchPrompt_DecodesAcceptanceFields locks the E31.7 / #1535 wire
 // contract: egress_target_hosts + acceptance_criteria_ids round-trip
-// the acceptance-stage prompt response onto FetchedPrompt by tag.
+// the acceptance-stage prompt response onto FetchedPrompt by tag, plus
+// the E31.18 / #1569 acceptance_expected_head_sha merge-candidate
+// identity the pre-spawn target gate consumes.
 func TestFetchPrompt_DecodesAcceptanceFields(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	priv, _ := makeKey(t, fb)
@@ -1787,7 +1789,8 @@ func TestFetchPrompt_DecodesAcceptanceFields(t *testing.T) {
 		"prompt": "validate the thing",
 		"prompt_hash": "beef",
 		"egress_target_hosts": ["staging.example.com", "staging.example.com:8443"],
-		"acceptance_criteria_ids": ["AC1", "AC2"]
+		"acceptance_criteria_ids": ["AC1", "AC2"],
+		"acceptance_expected_head_sha": "bbbb111111111111111111111111111111111111"
 	}`
 	c := quickClient(srv)
 	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{StageID: "stage-abc", PrivateKey: priv})
@@ -1801,10 +1804,41 @@ func TestFetchPrompt_DecodesAcceptanceFields(t *testing.T) {
 	if len(got.AcceptanceCriteriaIDs) != 2 || got.AcceptanceCriteriaIDs[0] != "AC1" || got.AcceptanceCriteriaIDs[1] != "AC2" {
 		t.Errorf("AcceptanceCriteriaIDs = %v, want [AC1 AC2]", got.AcceptanceCriteriaIDs)
 	}
+	if want := "bbbb111111111111111111111111111111111111"; got.AcceptanceExpectedHeadSHA != want {
+		t.Errorf("AcceptanceExpectedHeadSHA = %q, want %q", got.AcceptanceExpectedHeadSHA, want)
+	}
 }
 
-// TestFetchPrompt_AcceptanceFieldsAbsentByDefault confirms the two new
-// fields decode to nil on every response that omits them — the
+// TestFetchPrompt_AcceptanceExpectedHeadSHATagLockstep pins the wire tag by
+// marshaling through the backend's field name: a response whose key is
+// byte-identical to the backend's promptResponse.AcceptanceExpectedHeadSHA
+// tag must land on the runner field, and a drifted key must NOT — the
+// EgressTargetHosts lockstep discipline. A silent tag drift would drop the
+// expectation and degrade the identity gate to unverifiable-warn forever.
+func TestFetchPrompt_AcceptanceExpectedHeadSHATagLockstep(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	// Drifted key: decodes to empty, proving the field is bound by tag, not
+	// by field-name luck.
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "acceptance",
+		"prompt": "p",
+		"prompt_hash": "beef",
+		"acceptance_expected_head": "bbbb111111111111111111111111111111111111"
+	}`
+	c := quickClient(srv)
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{StageID: "stage-abc", PrivateKey: priv})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.AcceptanceExpectedHeadSHA != "" {
+		t.Errorf("drifted key must not populate AcceptanceExpectedHeadSHA, got %q", got.AcceptanceExpectedHeadSHA)
+	}
+}
+
+// TestFetchPrompt_AcceptanceFieldsAbsentByDefault confirms the acceptance
+// fields decode to nil/empty on every response that omits them — the
 // byte-identical default for all existing stage types.
 func TestFetchPrompt_AcceptanceFieldsAbsentByDefault(t *testing.T) {
 	fb, srv := newFakeBackend(t)
@@ -1817,5 +1851,9 @@ func TestFetchPrompt_AcceptanceFieldsAbsentByDefault(t *testing.T) {
 	if got.EgressTargetHosts != nil || got.AcceptanceCriteriaIDs != nil {
 		t.Errorf("acceptance fields must default nil, got %v / %v",
 			got.EgressTargetHosts, got.AcceptanceCriteriaIDs)
+	}
+	if got.AcceptanceExpectedHeadSHA != "" {
+		t.Errorf("AcceptanceExpectedHeadSHA must default empty (older backend), got %q",
+			got.AcceptanceExpectedHeadSHA)
 	}
 }
