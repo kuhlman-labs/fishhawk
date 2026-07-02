@@ -156,6 +156,8 @@ workflows:
           - artifact: acceptance
 ```
 
+The three inline snippets above are minimal fragments. For a full runnable spec — a complete `feature_change` workflow whose `acceptance` stage exercises all three v1 minors together (type v1.1, artifact v1.2, egress v1.3) — see [`examples/workflow-v1-acceptance.yaml`](examples/workflow-v1-acceptance.yaml). That file is also the verbatim stanza the operator hand-applies to the live `.fishhawk/workflows.yaml` (the implement agent cannot touch `.fishhawk/**` — it is in `forbidden_paths`).
+
 See [ADR-049 (#1519)](https://github.com/kuhlman-labs/fishhawk/issues/1519) for the acceptance-stage decision, [ADR-050 (#1540)](https://github.com/kuhlman-labs/fishhawk/issues/1540) for the egress + credential posture, and epic [#31](https://github.com/kuhlman-labs/fishhawk/issues/31) for the acceptance workstream.
 
 ## Reviewer policy (v1)

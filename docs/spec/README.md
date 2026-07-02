@@ -7,7 +7,7 @@ Machine-readable schemas and reference docs for the v0 surfaces that span the ru
 | Spec | Reference doc | JSON Schema | Example(s) |
 |---|---|---|---|
 | Workflow spec v0 (`.fishhawk/workflows.yaml`) | [`workflow-v0.md`](workflow-v0.md) | [`workflow-v0.schema.json`](workflow-v0.schema.json) | [`examples/workflow-v0-feature-change.yaml`](examples/workflow-v0-feature-change.yaml), [`examples/workflow-v0-routine-change.yaml`](examples/workflow-v0-routine-change.yaml) |
-| Workflow spec v1 (`.fishhawk/workflows.yaml`, ADR-046) | [`workflow-v1.md`](workflow-v1.md) | [`workflow-v1.schema.json`](workflow-v1.schema.json) | structural copy of v0 (no deploy content yet; see [`workflow-v0.md`](workflow-v0.md) for the grammar) |
+| Workflow spec v1 (`.fishhawk/workflows.yaml`, ADR-046) | [`workflow-v1.md`](workflow-v1.md) | [`workflow-v1.schema.json`](workflow-v1.schema.json) | [`examples/workflow-v1-acceptance.yaml`](examples/workflow-v1-acceptance.yaml) (feature_change with a v1.3 acceptance stage — the verbatim operator companion-commit stanza); base grammar in [`workflow-v0.md`](workflow-v0.md) |
 | Plan artifact `standard_v1` | [`plan-standard-v1.md`](plan-standard-v1.md) | [`plan-standard-v1.schema.json`](plan-standard-v1.schema.json) | [`examples/plan-standard-v1-example.json`](examples/plan-standard-v1-example.json) |
 | Clarification request artifact (`standard_v1` sibling) | [`clarification-request-v1.md`](clarification-request-v1.md) | [`clarification-request-v1.schema.json`](clarification-request-v1.schema.json) | inline in [`clarification-request-v1.md`](clarification-request-v1.md#example) |
 | Operator role spec v0 (shipped default + `.fishhawk/operator.yaml` overlay, ADR-040) | [`operator-role.md`](operator-role.md) | [`operator-role.schema.json`](operator-role.schema.json), [`operator-role-overlay.schema.json`](operator-role-overlay.schema.json) | [`operator-role-default.yaml`](operator-role-default.yaml) (shipped default — a product artifact, synced like the schemas), [`examples/operator-role-overlay-example.yaml`](examples/operator-role-overlay-example.yaml) |
@@ -28,6 +28,9 @@ check-jsonschema --schemafile docs/spec/workflow-v0.schema.json \
     docs/spec/examples/workflow-v0-feature-change.yaml \
     docs/spec/examples/workflow-v0-routine-change.yaml \
     .fishhawk/workflows.yaml
+
+check-jsonschema --schemafile docs/spec/workflow-v1.schema.json \
+    docs/spec/examples/workflow-v1-acceptance.yaml
 
 check-jsonschema --schemafile docs/spec/plan-standard-v1.schema.json \
     docs/spec/examples/plan-standard-v1-example.json

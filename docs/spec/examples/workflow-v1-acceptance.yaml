@@ -1,0 +1,175 @@
+# Workflow-v1 example — feature_change with an acceptance stage (E31, ADR-049 / ADR-050).
+#
+# Validates against ../workflow-v1.schema.json. Used as a regression fixture
+# AND as the driving spec for the cross-boundary acceptance seam test
+# (backend/internal/server/acceptance_integration_test.go, which spec.Parse()s
+# this file), so a schema-invalid or drifted example fails that test, not just a
+# manual check-jsonschema run.
+#
+# THIS IS THE VERBATIM STANZA FOR THE OPERATOR'S COMPANION COMMIT.
+# The `.fishhawk/workflows.yaml` `acceptance` stage is in the feature_change
+# implement stage's `forbidden_paths` (`.fishhawk/**`), so an implement agent
+# cannot edit the live spec — a category-B post-hoc constraint violation. The
+# operator hand-applies the `- id: acceptance` stanza below to the live
+# feature_change workflow as a base companion commit (the established
+# human-led-config pattern), mirroring this block verbatim.
+#
+# `version: "1.3"` exercises every acceptance minor in one spec:
+#   v1.1 — the `acceptance` stage type (ADR-049 / #1519)
+#   v1.2 — the `acceptance` produces artifact (ADR-049 / #1531)
+#   v1.3 — the acceptance-stage `egress` allowance (ADR-050 / #1532)
+
+version: "1.3"
+
+roles:
+  founder:
+    members: ["@kuhlman-labs"]
+
+workflows:
+  # Medium autonomy — the default for most product work.
+  # Agent implements; human approves the plan; human approves the PR; the
+  # acceptance agent validates the merged-candidate against the plan's
+  # acceptance_criteria before the human-gated merge.
+  feature_change:
+    description: >-
+      Default workflow for feature work and non-trivial changes, extended with
+      a runner-hosted advisory acceptance stage (ADR-049). Human approves plan
+      and PR; agent implements; the acceptance agent validates the running
+      instance against the approved plan's acceptance_criteria.
+    drive: true
+    operator_agent:
+      may_approve: clean_dual_approval
+      may_route_fixup: convergent_concerns
+      may_retry: infra_flake
+      must_page_human:
+        - reviewer_reject
+        - plan_rejection
+        - scope_amendment
+        - budget_override
+        - policy_override
+        - exception_request
+        - requirement_arbitration
+    policy:
+      max_stage_runtime: "30m"
+    on_ci_failure:
+      max_retries: 1
+
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: claudecode
+              model: claude-opus-4-8
+            - provider: codex
+              model: gpt-5.5
+          human: 1
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: plan
+            schema: standard_v1
+            persistence:
+              - target: originating_issue
+                mode: rendered_comment
+                update_on_change: true
+              - target: fishhawk_audit_log
+                mode: canonical
+        budget:
+          max_tokens: 200000
+          max_runtime_minutes: 15
+          enforcement: advisory
+        gates:
+          - type: approval
+            approvers:
+              any_of: [founder]
+
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          verify:
+            command: "scripts/test verify"
+            timeout: "15m"
+            max_iterations: 1
+        reviewers:
+          agents:
+            - provider: claudecode
+              model: claude-opus-4-8
+            - provider: codex
+              model: gpt-5.5
+          human: 1
+        inputs:
+          - artifact: plan
+            from_stage: plan
+        produces:
+          - artifact: pull_request
+        constraints:
+          - max_files_changed: 45
+          - forbidden_paths:
+              - ".github/workflows/**"
+              - ".fishhawk/**"
+              - "LICENSE"
+              - "NOTICE"
+          - required_outcomes:
+              - tests_added_or_updated
+              - ci_green
+        budget:
+          max_tokens: 500000
+          max_runtime_minutes: 30
+          enforcement: advisory
+
+      - id: review
+        type: review
+        executor:
+          human: true
+        inputs:
+          - artifact: pull_request
+            from_stage: implement
+        gates:
+          - type: approval
+            approvers:
+              any_of: [founder]
+
+      # ── ACCEPTANCE STANZA (operator companion commit target) ──────────────
+      # Runner-hosted advisory acceptance stage (ADR-049 / #1519). It rides the
+      # ordinary agent executor branch — never `delegate` (deploy-only) — and
+      # carries no pre-flight deploy constraint or `deployment` artifact.
+      #
+      # The acceptance agent validates the RUNNING preview instance against the
+      # approved plan's `verification.acceptance_criteria` and ships a signed
+      # verdict to POST /v0/runs/{run_id}/acceptance. A failed verdict leaves the
+      # stage `succeeded` and routes through deterministic server-side triage
+      # (class 1 → fix-up, class 2 → acceptance re-run, class 3/4 → paged); the
+      # merge stays gated on the acceptance_passed condition (ADR-049 decision
+      # #6, operator-loop next_actions — not a hard spec gate).
+      - id: acceptance
+        type: acceptance
+        executor:
+          # An acceptance stage MUST use an agent (or human) executor.
+          agent: claude-code
+        inputs:
+          - artifact: plan
+            from_stage: plan
+          - artifact: pull_request
+            from_stage: implement
+        # Egress allowance (v1.3, ADR-050 / #1532): the single customer-declared
+        # slot of the acceptance agent's default-deny egress allow-list. Points
+        # at the local dogfood preview (scripts/dev k8s / docker-compose). The
+        # runner adds the model API endpoint and the Fishhawk backend itself;
+        # they are not declarable here. Hosts, not URLs — no scheme, no path.
+        egress:
+          target_hosts:
+            - localhost:8080
+        # Durable acceptance-evidence record (v1.2, ADR-049 / #1531): the
+        # verdict + per-criterion results + content-hash refs to evidence blobs.
+        # Valid ONLY on an acceptance stage.
+        produces:
+          - artifact: acceptance
+        budget:
+          max_tokens: 200000
+          max_runtime_minutes: 20
+          enforcement: advisory

@@ -97,6 +97,41 @@ Two invariants hold at every tier (ADR-027 authority unchanged):
 
 ---
 
+## The acceptance agent (medium autonomy, advisory validator)
+
+The acceptance stage (ADR-049 / ADR-050; `docs/spec/workflow-v1.md`) runs under
+the **medium-autonomy** `feature_change` workflow, after the human PR review
+settles and before merge. It is deliberately the *narrowest*-authority agent in
+the system: it validates the running preview instance against the approved
+plan's `verification.acceptance_criteria` and emits a **signed verdict** — and
+nothing else. It is **advisory and zero-write**: it holds no repo, MCP, or
+Fishhawk backend credentials (evidence ships signature-authed, not
+token-authed), so a fully prompt-injected acceptance agent can at worst emit a
+*wrong verdict*, never mutate a repo, a run, or the audit log (ADR-050; the
+containment posture — default-deny egress, credential minimization, zero-write
+authority — is the §6 Rule-of-Two "acceptance" row of `ARCHITECTURE.md`).
+
+Where judgment is load-bearing here, it is **not** the agent's:
+
+- A **failed verdict** is routed by **deterministic server-side triage**, not by
+  agent discretion. Class 1 (an error, or all failed criteria trace to explicit
+  issue-stated sources) auto-routes an implement fix-up; class 2 (no failed
+  criterion, a skip/flake) auto-reruns the acceptance stage. Both are bounded —
+  a spent rerun/fix-up budget pages the human.
+- The **non-convergent and ambiguous classes always page the human**: class 3 (a
+  failed *inferred*-source criterion — the acceptance signal disagrees with what
+  the plan inferred, so the miss belongs to plan review, recorded as a
+  `plan_review_miss`) and class 4 (an unitemized failure) route to a human with
+  no auto-transition.
+- The **merge gate stays with the human/operator**. `acceptance_passed` is an
+  operator-loop `next_actions` condition, not a delegated `may_merge`: the
+  acceptance agent's verdict informs the merge decision but never makes it.
+
+So the acceptance agent adds an automated *check*, not automated *authority* —
+consistent with the medium tier, where agents do the work and humans approve it.
+
+---
+
 ## What "agents do the work, humans approve the work" means here
 
 Fishhawk's product thesis is that humans setting direction and approving outcomes is the durable model — not transitional scaffolding. The autonomy tiers above reflect that. Even at high autonomy, humans authored the workflow that decided what the agent could do; the workflow itself is reviewed and approved by humans. Accountability never disappears, even when the keystrokes do.
