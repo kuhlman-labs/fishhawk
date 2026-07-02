@@ -110,3 +110,21 @@ func TestStageWaitStatusFor(t *testing.T) {
 		t.Errorf("review = %+v, want nil (no review stage)", review)
 	}
 }
+
+// TestStageWaitStatusFor_Acceptance pins the E31.9 resolution: stageWaitStatusFor
+// resolves an acceptance-typed stage row via the same generic helper, and omits
+// it (nil) when the run declares none.
+func TestStageWaitStatusFor_Acceptance(t *testing.T) {
+	stages := []Stage{
+		{Type: "implement", State: "succeeded"},
+		{Type: "acceptance", State: "running"},
+	}
+	acc := stageWaitStatusFor(stages, "acceptance", "running")
+	if acc == nil || acc.Stage != "acceptance" || acc.Status != "running" || acc.PollIntervalSeconds != 30 {
+		t.Errorf("acceptance = %+v, want acceptance/running/30", acc)
+	}
+
+	if none := stageWaitStatusFor([]Stage{{Type: "implement", State: "running"}}, "acceptance", "running"); none != nil {
+		t.Errorf("acceptance = %+v, want nil (no acceptance stage)", none)
+	}
+}

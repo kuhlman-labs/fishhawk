@@ -71,6 +71,67 @@ budget and wedges the run. Before approving a fixup, cross-check the
 files-changed against the plan scope; if a pass would be a no-op, abandon and
 start a fresh run instead.
 
+### Acceptance stage
+
+Some workflows declare an **acceptance stage** (E31.9 / ADR-049) after the
+implement review: an advisory, runner-hosted validator that drives the change
+against a **running instance you provision** and ships a structured verdict.
+The default placement is a **pre-merge preview** built from the PR ref;
+release-acceptance against a staging or release instance is the documented
+variant. The preview/target instance is customer-provisioned — Fishhawk does
+not stand it up.
+
+**Dispatch it like implement.** After the implement review settles with no open
+concerns, `fishhawk_dispatch_stage` (acceptance) — non-blocking is the default
+because acceptance runs long against the live instance, and it keeps the session
+free. `fishhawk_run_stage` (acceptance) is the blocking opt-in. The stage takes
+no new argv (no `--plan-out`, no `--check-base-ref`); its egress target hosts and
+criteria ids arrive via `--fetch-prompt`.
+
+**Await the verdict.** Poll `fishhawk_get_run_status` — `acceptance_stage_wait_status`
+tracks the stage's execution — or `fishhawk_await_audit` anchored at the
+`acceptance_dispatched` sequence. `fishhawk_await_review` does **not** fit: it is
+shaped around configured-reviewer verdicts and the acceptance stage has no
+reviewers; its settle signal is the audit trail.
+
+**Verdict vs. stage state (load-bearing).** A **failed** acceptance verdict
+leaves the STAGE `succeeded` — the stage settles through the ordinary agent
+trace-bundle path regardless of pass/fail. Read the `verdict` from the
+`acceptance_outcome_recorded` audit entry, never from the stage state. Merge only
+on the `acceptance_passed` next-actions state (ADR-049 decision #6: the merge is
+gated on the acceptance_passed evidence condition).
+
+**Deterministic triage of a failure** (ADR-049 decision #2, server-side, bounded
+at **2 auto re-runs** per run):
+
+| Class | Failure | Auto disposition |
+|---|---|---|
+| 1 | the code errors, or every failed criterion is explicit-source | `fixup_dispatched` — re-opens the implement stage as a fix-up pass |
+| 2 | no criterion failed but ≥1 skipped (environment/flake) | `retry_dispatched` — re-opens the acceptance stage for a re-run |
+| 3 | a failed criterion is inferred-source/unresolvable (bad/ambiguous criterion) | `paged` — no transition, you arbitrate |
+| 4 | unitemized / provenance-ungroundable (works-as-planned, disputed) | `paged` — no transition, you arbitrate |
+
+At the re-run budget, or when the fix-up/retry route is unavailable, the
+disposition degrades to a paged variant (`rerun_budget_exhausted`,
+`fixup_unavailable_paged`, `retry_unavailable_paged`, `unsettled_paged`) so
+non-convergence always lands on the human.
+
+**LOCAL-runner re-open rule.** An auto-routed re-open (`fixup_dispatched` or
+`retry_dispatched`) re-opens the stage server-side but **never spawns the local
+runner** — the same rule as local-drive fixup above, generalized. You MUST
+`fishhawk_dispatch_stage` the re-opened stage explicitly: the **implement** stage
+after `fixup_dispatched`, the **acceptance** stage after `retry_dispatched`.
+`next_actions` surfaces this as the `acceptance_triage_rerouting` state; on the
+next snapshot the re-opened stage's own dispatch arm serves the move.
+
+**Paged arbitration.** For a paged-family disposition, `next_actions` gives the
+`acceptance_triage_paged` arm: read the evidence first (`fishhawk_list_audit` on
+`acceptance_outcome_recorded` for the criteria results and
+`acceptance_triage_decided` for the class + reason), then arbitrate —
+`fishhawk_fixup_stage` (a manual fix-up pass, consumes the shared fix-up budget),
+`merge_and_file_follow_up` (accept-and-ship, e.g. a class-3 bad criterion), or
+`fishhawk_cancel_run`.
+
 ### Late CI/SAST finding after the fix-up ceiling
 
 The bounded fix-up budget is hard-capped at 3 total passes per implement stage

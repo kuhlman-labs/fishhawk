@@ -29,7 +29,7 @@ package main
 // the stage can no longer progress, so advertising an unbounded poll would
 // strand the caller.
 type StageWaitStatus struct {
-	Stage               string `json:"stage" jsonschema:"the stage type: 'plan', 'implement', or 'review'"`
+	Stage               string `json:"stage" jsonschema:"the stage type: 'plan', 'implement', 'review', or 'acceptance'"`
 	Status              string `json:"status" jsonschema:"one of pending, running, succeeded, failed, cancelled"`
 	PollIntervalSeconds int    `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for re-polling fishhawk_get_run_status while status is non-terminal (pending/running); present only while non-terminal, omitted on terminal. Poll get_run_status on this cadence as the authoritative path to a terminal stage status"`
 }

@@ -1736,3 +1736,50 @@ func TestRunStage_BlocksHostDispatchAgainstActionsLockedRun(t *testing.T) {
 		t.Errorf("a blocked run_stage must spawn ZERO runners, got argv %v", *argv)
 	}
 }
+
+// TestRunStage_ArgvComposition_AcceptanceStage pins the E31.9 runner-argv
+// contract: an acceptance stage carries --stage acceptance and, like a review
+// stage, neither --plan-out (plan-only) nor --check-base-ref (implement-only) —
+// its egress hosts + criteria ids arrive via --fetch-prompt, not argv, so no
+// new flag is required.
+func TestRunStage_ArgvComposition_AcceptanceStage(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	var capturedArgs []string
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, args ...string) *exec.Cmd {
+		capturedArgs = args
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() {
+		runStageCommand = origCmd
+		runStageLookPath = exec.LookPath
+	})
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "acceptance", "succeeded")
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "feature_change",
+		Stage:      "acceptance",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	joined := strings.Join(capturedArgs, " ")
+	if !strings.Contains(joined, "--stage acceptance") {
+		t.Errorf("acceptance stage missing --stage acceptance\nfull: %s", joined)
+	}
+	if strings.Contains(joined, "--plan-out") {
+		t.Errorf("acceptance stage must not include --plan-out: %v", capturedArgs)
+	}
+	if strings.Contains(joined, "--check-base-ref") {
+		t.Errorf("acceptance stage must not include --check-base-ref: %v", capturedArgs)
+	}
+}

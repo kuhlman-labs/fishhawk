@@ -590,3 +590,44 @@ func TestDispatchStage_CallToolRoundTrip(t *testing.T) {
 		t.Error("LogPath did not round-trip")
 	}
 }
+
+// TestDispatchStage_AcceptanceStage_ResolvesAndSpawns pins the E31.9 dispatch
+// surface: dispatching a stage-type acceptance resolves the acceptance stage id
+// from (run_id, "acceptance") and spawns the detached runner (fake binary),
+// returning the durable handle with a non-terminal StageWaitStatus — exactly
+// like an implement dispatch, no new argv path.
+func TestDispatchStage_AcceptanceStage_ResolvesAndSpawns(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	calls := captureAllArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "acceptance", "running")
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID:      runID.String(),
+		Workflow:   "feature_change",
+		Stage:      "acceptance",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	if out.StageID != stageID.String() {
+		t.Errorf("StageID = %q, want resolved %q", out.StageID, stageID.String())
+	}
+	if out.StageWaitStatus == nil || out.StageWaitStatus.Status != "running" {
+		t.Fatalf("StageWaitStatus = %+v, want status running", out.StageWaitStatus)
+	}
+	if len(*calls) == 0 {
+		t.Fatal("expected the detached runner to be spawned")
+	}
+	joined := strings.Join((*calls)[0], " ")
+	if !strings.Contains(joined, "--stage acceptance") {
+		t.Errorf("dispatched argv missing --stage acceptance\nfull: %s", joined)
+	}
+	if strings.Contains(joined, "--plan-out") || strings.Contains(joined, "--check-base-ref") {
+		t.Errorf("acceptance dispatch must not carry --plan-out/--check-base-ref: %s", joined)
+	}
+}
