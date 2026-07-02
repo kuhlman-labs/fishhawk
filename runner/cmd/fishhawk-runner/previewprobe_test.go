@@ -201,6 +201,35 @@ func TestRunPreviewCommand_EnvAndSuccess(t *testing.T) {
 	}
 }
 
+// (g2) The hook — which builds and runs untrusted merge-candidate code — must
+// NOT inherit the runner's secrets (#1569 security fixup): runPreviewCommand
+// hands it the default-deny sanitizedGateEnv, so a runner secret (whether on
+// the explicit denylist or dropped by omission) is absent while PATH survives
+// for the Go build the hook performs.
+func TestRunPreviewCommand_StripsRunnerSecrets(t *testing.T) {
+	t.Setenv("FISHHAWK_API_TOKEN", "denylisted-secret") // explicit denylist
+	t.Setenv("SOME_UNLISTED_SECRET", "omitted-secret")  // dropped by default-deny
+	marker := markerPath(t)
+	cmd := `printf '%s|%s|%s' "$FISHHAWK_API_TOKEN" "$SOME_UNLISTED_SECRET" "$PATH" > ` + marker
+	if err := runPreviewCommand(context.Background(), cmd, testExpectedSHA, "h", 30*time.Second); err != nil {
+		t.Fatalf("runPreviewCommand: %v", err)
+	}
+	got, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.SplitN(string(got), "|", 3)
+	if len(fields) != 3 {
+		t.Fatalf("marker = %q, want three |-separated fields", got)
+	}
+	if fields[0] != "" || fields[1] != "" {
+		t.Errorf("hook saw runner secrets FISHHAWK_API_TOKEN=%q SOME_UNLISTED_SECRET=%q, want both empty", fields[0], fields[1])
+	}
+	if fields[2] == "" {
+		t.Error("hook PATH is empty; the Go build the hook runs would break")
+	}
+}
+
 // (h) non-zero exit → error carrying exit code and output tail.
 func TestRunPreviewCommand_NonZeroExit(t *testing.T) {
 	err := runPreviewCommand(context.Background(), "echo boom-tail; exit 3", testExpectedSHA, "h", 30*time.Second)

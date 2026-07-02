@@ -1280,6 +1280,23 @@ _preview_remove_worktree() {
   git -C "${REPO_ROOT}" worktree prune 2>/dev/null || true
 }
 
+# Credential-stripped exec prefix (E31.18 / #1569 security fixup, ADR-029
+# default-deny posture) for the UNTRUSTED merge-candidate binary. cmd_preview
+# sources .env — which in the dogfood carries the runner's model/GitHub/backend
+# tokens (ANTHROPIC_API_KEY, FISHHAWK_GITHUB_TOKEN, FISHHAWK_API_TOKEN, …) — so
+# before it BUILDS-then-RUNS branch fishhawkd (`migrate up` / `serve`) those
+# secrets must not reach branch code with network egress (the lethal-trifecta
+# shape). `env -i` clears the inherited environment and re-exports ONLY the
+# non-secret essentials the Go binary needs to boot: PATH/HOME plus locale/TZ.
+# Per-call FISHHAWKD_* config (the isolated DATABASE_URL, the ADDR) is appended
+# by the caller. The prefix words land in the global array `reply` so the call
+# sites can splice them and scripts/test-dev can assert the containment.
+_preview_branch_env() {
+  reply=(env -i "PATH=${PATH}" "HOME=${HOME}")
+  if [[ -n "${LANG:-}" ]]; then reply+=("LANG=${LANG}"); fi
+  if [[ -n "${TZ:-}" ]]; then reply+=("TZ=${TZ}"); fi
+}
+
 # `scripts/dev preview [<sha-or-ref>]` — build and serve the merge candidate.
 # The positional arg defaults to $FISHHAWK_PREVIEW_SHA so the runner's
 # provisioning hook can invoke the command bare.
@@ -1385,7 +1402,8 @@ cmd_preview() {
     exit 1
   fi
   print "preview: applying migrations..."
-  if ! FISHHAWKD_DATABASE_URL="$preview_url" "$pbin" migrate up; then
+  _preview_branch_env
+  if ! "${reply[@]}" "FISHHAWKD_DATABASE_URL=$preview_url" "$pbin" migrate up; then
     print -u2 "error: preview migrations failed against ${preview_db}"
     _preview_remove_worktree "$PREVIEW_WORKTREE"
     exit 1
@@ -1397,7 +1415,8 @@ cmd_preview() {
   local paddr
   paddr="$(_preview_addr)"
   mkdir -p "$LOG_DIR"
-  FISHHAWKD_DATABASE_URL="$preview_url" FISHHAWKD_ADDR="$paddr" "$pbin" serve >> "$PREVIEW_LOG_FILE" 2>&1 &
+  _preview_branch_env
+  "${reply[@]}" "FISHHAWKD_DATABASE_URL=$preview_url" "FISHHAWKD_ADDR=$paddr" "$pbin" serve >> "$PREVIEW_LOG_FILE" 2>&1 &
   local pid=$!
   disown
   print "$pid" > "$PREVIEW_PID_FILE"

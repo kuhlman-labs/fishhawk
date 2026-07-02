@@ -1159,6 +1159,32 @@ else
   fail "cmd_preview_down should call _preview_kill_tracked and _preview_remove_worktree"
 fi
 
+# 15h. _preview_branch_env: the credential-stripped prefix that runs the
+# UNTRUSTED merge-candidate binary (#1569 security fixup). It must be an
+# `env -i` boundary (default-deny) and never forward a .env-sourced secret,
+# while preserving PATH so the branch binary can still boot.
+ANTHROPIC_API_KEY="leaked-model-key" FISHHAWK_GITHUB_TOKEN="leaked-gh-token" FISHHAWK_API_TOKEN="leaked-api-token" _preview_branch_env
+if [[ "${reply[1]}" == "env" && "${reply[2]}" == "-i" ]]; then
+  pass "_preview_branch_env clears the inherited env via env -i"
+else
+  fail "_preview_branch_env should start with 'env -i' (got: ${reply[1]} ${reply[2]})"
+fi
+if print -r -- "${reply[@]}" | grep -q 'leaked-'; then
+  fail "_preview_branch_env leaked a secret into the branch-exec env: ${reply[*]}"
+else
+  pass "_preview_branch_env forwards no runner/.env secret to branch code"
+fi
+if print -r -- "${reply[@]}" | grep -q "PATH=${PATH}"; then
+  pass "_preview_branch_env preserves PATH so the branch binary can boot"
+else
+  fail "_preview_branch_env should preserve PATH"
+fi
+if print -r -- "$preview_body" | grep -q '_preview_branch_env'; then
+  pass "cmd_preview runs the branch binary through the credential-stripped _preview_branch_env"
+else
+  fail "cmd_preview should exec migrate up / serve via _preview_branch_env"
+fi
+
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then
   pass "scripts/dev parses clean (zsh -n)"

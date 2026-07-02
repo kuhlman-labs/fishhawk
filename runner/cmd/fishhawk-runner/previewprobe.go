@@ -253,14 +253,26 @@ func envSeconds(name string, def time.Duration) time.Duration {
 }
 
 // runPreviewCommand executes an operator hook via `sh -c` in the runner's
-// cwd with the runner's env plus FISHHAWK_PREVIEW_SHA / FISHHAWK_PREVIEW_TARGET_HOST.
-// On a non-zero exit or timeout it returns an error carrying the exit
-// state and an output tail.
+// cwd with a CREDENTIAL-STRIPPED env plus FISHHAWK_PREVIEW_SHA /
+// FISHHAWK_PREVIEW_TARGET_HOST. On a non-zero exit or timeout it returns an
+// error carrying the exit state and an output tail.
+//
+// The provisioning hook (in the dogfood spec, `scripts/dev preview`) builds
+// and RUNS the merge candidate's fishhawkd (`migrate up` / `serve`) — i.e.
+// untrusted, committed, agent-authored code — before the ADR-050 acceptance
+// proxy contains anything. If that hook inherited os.Environ() it would run
+// branch code while holding the runner's secrets (FISHHAWK_GITHUB_TOKEN /
+// GITHUB_TOKEN / GH_TOKEN, ANTHROPIC_API_KEY / OPENAI_API_KEY,
+// FISHHAWK_API_TOKEN) with ordinary network egress — the lethal-trifecta
+// shape. sanitizedGateEnv() (ADR-029 item 4, shared with the compile/test/
+// verify gates) applies the default-deny allow-list, so those secrets never
+// reach the hook or the branch binary it spawns while PATH/HOME/GO* survive
+// for the Go build.
 func runPreviewCommand(ctx context.Context, command, expectedSHA, host string, timeout time.Duration) error {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "sh", "-c", command)
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sanitizedGateEnv(),
 		"FISHHAWK_PREVIEW_SHA="+expectedSHA,
 		"FISHHAWK_PREVIEW_TARGET_HOST="+host,
 	)
