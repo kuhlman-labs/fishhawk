@@ -984,3 +984,278 @@ func TestRetryStage_OperatorAgentActorAttribution(t *testing.T) {
 		t.Errorf("ActorSubject = %v, want %q", entry.ActorSubject, operatorAgentSubject)
 	}
 }
+
+// --- Acceptance-reopen arm (E31.16 / #1567) ---
+
+// reopenAuditFake wraps approvalAuditFake to make ListForRunByCategory
+// seedable/erroring for the acceptance-reopen retry tests, without touching the
+// shared fake. Every other audit.Repository method delegates to the embedded
+// fake (field promotion), so au.appended still captures the acceptance_reopened
+// write.
+type reopenAuditFake struct {
+	*approvalAuditFake
+	byCategory    map[string][]*audit.Entry
+	byCategoryErr error
+}
+
+func (a *reopenAuditFake) ListForRunByCategory(_ context.Context, _ uuid.UUID, category string) ([]*audit.Entry, error) {
+	if a.byCategoryErr != nil {
+		return nil, a.byCategoryErr
+	}
+	return a.byCategory[category], nil
+}
+
+// reopenRetryServer wires the retry handler with a reopenAuditFake so the
+// acceptance-reopen branch's ListForRunByCategory existence check is
+// controllable.
+func reopenRetryServer(t *testing.T) (*Server, *approvalRunRepo, *reopenAuditFake) {
+	t.Helper()
+	repo := newApprovalRunRepo()
+	au := &reopenAuditFake{approvalAuditFake: newApprovalAuditFake()}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      repo,
+		AuditRepo:    au,
+		ApprovalRepo: newFakeApprovalRepo(),
+	})
+	return s, repo, au
+}
+
+// seedSucceededAcceptanceStage seeds an acceptance stage settled `succeeded`
+// with a non-terminal run so run.ReopenAcceptanceStage's type/state/run-terminal
+// gate passes on the admitted path. runState lets a test seed a terminal run
+// (b5) to exercise the reopen refusal.
+func seedSucceededAcceptanceStage(repo *approvalRunRepo, runState run.State) *run.Stage {
+	st := repo.seedStage(run.StageStateSucceeded)
+	repo.mu.Lock()
+	st.Type = run.StageTypeAcceptance
+	repo.mu.Unlock()
+	repo.seedRun(&run.Run{ID: st.RunID, State: runState})
+	return st
+}
+
+// acceptanceOutcomeEntryFor builds an acceptance_outcome_recorded audit entry
+// carrying the given stage id — the existence signal the reopen guard checks.
+func acceptanceOutcomeEntryFor(stageID uuid.UUID) *audit.Entry {
+	sid := stageID
+	return &audit.Entry{
+		ID:       uuid.New(),
+		StageID:  &sid,
+		Category: CategoryAcceptanceOutcomeRecorded,
+	}
+}
+
+// b1: a succeeded acceptance stage with NO recorded outcome re-opens to pending,
+// writes an acceptance_reopened audit entry with prior_state=succeeded, and
+// leaves the stage pending (no orchestrator wired → the handoff is skipped).
+func TestRetryStage_AcceptanceReopen_HappyPath(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var body stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.State != string(run.StageStatePending) {
+		t.Errorf("body.State = %q, want pending after reopen", body.State)
+	}
+	if len(au.appended) != 1 || au.appended[0].Category != CategoryAcceptanceReopened {
+		t.Fatalf("audit chain = %+v, want one acceptance_reopened entry", au.appended)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	if payload["prior_state"] != string(run.StageStateSucceeded) {
+		t.Errorf("payload.prior_state = %v, want succeeded", payload["prior_state"])
+	}
+	if payload["stage_id"] != stage.ID.String() {
+		t.Errorf("payload.stage_id = %v, want %s", payload["stage_id"], stage.ID)
+	}
+}
+
+// b1b: with an orchestrator wired, the reopen hands off to it — the reopened
+// pending acceptance stage walks pending → dispatched (the agent dispatch path;
+// fireDispatch no-ops with no GitHub client) and the response reflects the
+// POST-advance GetStage refresh (dispatched), not the intermediate pending
+// state. This is the recovery behavior b1 leaves untested by running with no
+// orchestrator: both the Orchestrator.Advance call and the dec.Stage = updated
+// refresh only execute when an orchestrator is present.
+func TestRetryStage_AcceptanceReopen_OrchestratorAdvances(t *testing.T) {
+	repo := newApprovalRunRepo()
+	au := &reopenAuditFake{approvalAuditFake: newApprovalAuditFake()}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      repo,
+		AuditRepo:    au,
+		ApprovalRepo: newFakeApprovalRepo(),
+		// No GitHub: the agent dispatch's workflow_dispatch is skipped, but the
+		// pending → dispatched state transition still happens.
+		Orchestrator: &orchestrator.Orchestrator{Runs: repo},
+	})
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var body stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// The orchestrator advanced the reopened stage; the response reflects the
+	// post-advance refresh. Without the Advance handoff OR the GetStage
+	// re-fetch, this would still read pending.
+	if body.State != string(run.StageStateDispatched) {
+		t.Errorf("body.State = %q, want dispatched (orchestrator advance + post-advance refresh)", body.State)
+	}
+	// The stage genuinely moved in the repo, not just in the response.
+	if got, _ := repo.GetStage(context.Background(), stage.ID); got.State != run.StageStateDispatched {
+		t.Errorf("stage state = %q, want dispatched after orchestrator advance", got.State)
+	}
+	// The acceptance_reopened audit entry is still written (audit-first, before
+	// the handoff).
+	if len(au.appended) != 1 || au.appended[0].Category != CategoryAcceptanceReopened {
+		t.Fatalf("audit chain = %+v, want one acceptance_reopened entry", au.appended)
+	}
+}
+
+// b2: an acceptance_outcome_recorded entry EXISTS for the stage → 422
+// retry_not_applicable, no transition, no audit write (verdict-ful routing
+// belongs to the deterministic triage).
+func TestRetryStage_AcceptanceReopen_VerdictRecorded_422(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	au.byCategory = map[string][]*audit.Entry{
+		CategoryAcceptanceOutcomeRecorded: {acceptanceOutcomeEntryFor(stage.ID)},
+	}
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "retry_not_applicable") {
+		t.Errorf("body missing retry_not_applicable:\n%s", w.Body.String())
+	}
+	if got, _ := repo.GetStage(context.Background(), stage.ID); got.State != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want unchanged succeeded", got.State)
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit chain = %+v, want no write on the 422 refusal", au.appended)
+	}
+}
+
+// b2b: an acceptance_outcome_recorded entry for a DIFFERENT stage does NOT block
+// the reopen — the guard filters by stage id (locks the StageID membership
+// check, not a bare category-non-empty check).
+func TestRetryStage_AcceptanceReopen_OtherStageOutcome_Reopens(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	au.byCategory = map[string][]*audit.Entry{
+		CategoryAcceptanceOutcomeRecorded: {acceptanceOutcomeEntryFor(uuid.New())},
+	}
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (other-stage outcome must not block):\n%s", w.Code, w.Body.String())
+	}
+	if len(au.appended) != 1 || au.appended[0].Category != CategoryAcceptanceReopened {
+		t.Fatalf("audit chain = %+v, want one acceptance_reopened entry", au.appended)
+	}
+}
+
+// b3: an mcp:run:* subject (agent) token invoking the reopen → 403
+// agent_token_forbidden (operator-only verb).
+func TestRetryStage_AcceptanceReopen_AgentTokenForbidden(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+
+	w := postRetryMCP(t, s, stage.ID, stage.RunID) // mcp:run:<runID> subject
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "agent_token_forbidden") {
+		t.Errorf("body missing agent_token_forbidden:\n%s", w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit chain = %+v, want no write on the 403 refusal", au.appended)
+	}
+}
+
+// b4: an audit ListForRunByCategory error → 500, no transition (fail closed on
+// unknown evidence state — never reopen when we can't prove the stage is
+// outcome-less).
+func TestRetryStage_AcceptanceReopen_AuditListError_500(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	au.byCategoryErr = errors.New("audit read down")
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if got, _ := repo.GetStage(context.Background(), stage.ID); got.State != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want unchanged succeeded (fail closed)", got.State)
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit chain = %+v, want no write on the 500 fail-closed path", au.appended)
+	}
+}
+
+// b5: a terminal run makes run.ReopenAcceptanceStage refuse with
+// ErrAcceptanceReopenNotApplicable → 422.
+func TestRetryStage_AcceptanceReopen_TerminalRun_422(t *testing.T) {
+	s, repo, _ := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateSucceeded) // terminal run
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "retry_not_applicable") {
+		t.Errorf("body missing retry_not_applicable:\n%s", w.Body.String())
+	}
+}
+
+// b5b: a non-sentinel error from run.ReopenAcceptanceStage (here a
+// TransitionStage failure) maps to 500, not 422 — only
+// ErrAcceptanceReopenNotApplicable is a 422; any other reopen error surfaces
+// as internal_error without a transition.
+func TestRetryStage_AcceptanceReopen_ReopenError_500(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	repo.transitionErr = errors.New("transition boom")
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit chain = %+v, want no write when the reopen errored", au.appended)
+	}
+}
+
+// b6: a SUCCEEDED non-acceptance stage is NOT caught by the reopen branch — it
+// falls through to run.RetryStage and 422s (failed-stages-only invariant intact).
+func TestRetryStage_SucceededNonAcceptance_Still422(t *testing.T) {
+	s, repo, _ := retryServer(t)
+	stage := repo.seedStage(run.StageStateSucceeded) // Type=plan, succeeded
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Errorf("status = %d, want 422 (non-acceptance succeeded stage rides the retry path):\n%s", w.Code, w.Body.String())
+	}
+}

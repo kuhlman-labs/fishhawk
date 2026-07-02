@@ -81,7 +81,8 @@ const acceptanceVerdictJSONSchema = `{
       }
     },
     "target_url": {"type": "string"},
-    "evidence_hashes": {"type": "array", "items": {"type": "string"}}
+    "evidence_hashes": {"type": "array", "items": {"type": "string"}},
+    "notes": {"type": "string"}
   }
 }`
 
@@ -111,6 +112,12 @@ type acceptanceVerdict struct {
 	Criteria       []acceptanceCriterionResult `json:"criteria,omitempty"`
 	TargetURL      string                      `json:"target_url,omitempty"`
 	EvidenceHashes []string                    `json:"evidence_hashes,omitempty"`
+	// Notes is a declared home for the agent's free-text overflow (#1567):
+	// a top-level remark that would otherwise fail closed against
+	// DisallowUnknownFields. Declaring it makes a benign aside validate
+	// while every UNdeclared field still fails the stage. Load-bearing on
+	// the file-fallback transport, which carries no JSON schema at all.
+	Notes string `json:"notes,omitempty"`
 }
 
 // captureAcceptanceVerdict returns the agent's verdict bytes.

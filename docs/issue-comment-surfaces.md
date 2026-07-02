@@ -575,6 +575,18 @@ Notes:
   render-only edit surfaces; the paged variants ALSO fire the page-class ping
   registered above. The class-3 entry keyed by `criterion_ids` is the durable
   per-criterion disposition record E31.11 consumes.
+- The operator-gated acceptance re-open audit kind — `acceptance_reopened`
+  (E31.16 / #1567) — is a **system-/user-actor audit kind with NO dedicated
+  Notifier method and NO dedicated timeline render**, following the same
+  posture as the deploy governance kinds and the acceptance triage kinds above.
+  It is WRITTEN by the retry handler's acceptance-reopen branch
+  (`server/retry.go::retryAcceptanceOutcomeUnknown`) when an operator re-opens
+  an acceptance stage that settled `succeeded` with no recorded verdict
+  (payload `{stage_id, prior_state, reason}`); it has no page-class ping of its
+  own — the status refresh rides the `notifyStatusUpdate` hook (like the
+  PR-upload handler), not a dedicated comment. Listed here so a future reader
+  grepping the acceptance audit categories doesn't mistake it for a comment
+  surface.
 - The bounded-retry give-up audit kind — `slice_integration_failed` (#1243) —
   is a **system-actor audit kind with no dedicated Notifier method and is NOT
   an issue-comment surface**. The child-completion sweeper

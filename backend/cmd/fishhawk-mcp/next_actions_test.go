@@ -1244,25 +1244,54 @@ func TestNextActions_AcceptanceTriagePaged_EveryDisposition(t *testing.T) {
 }
 
 // TestNextActions_AcceptanceOutcomeUnknown covers mode (8): a settled
-// acceptance stage with NO verdict visible in the recent window (verdict=="")
-// routes to the defensive read arm and, load-bearing, NEVER offers the merge
-// ritual (fail toward read, not toward merge).
+// acceptance stage with an unknown verdict routes to the defensive read arm
+// and, load-bearing, NEVER offers the merge ritual (fail toward read, not
+// toward merge). It also asserts the #1567 fishhawk_retry_stage recovery verb
+// carries the acceptance stage id. BOTH acceptanceOutcomeUnknownActions call
+// sites are exercised: the verdict-aged-out arm (verdict=="") and the
+// unrecognized-verdict default arm.
 func TestNextActions_AcceptanceOutcomeUnknown(t *testing.T) {
 	prURL := "https://github.com/x/y/pull/42"
-	run := naLocalRun("running")
-	run.PullRequestURL = &prURL
-	na := nextActionsFor(run, naAcceptanceStages("succeeded"), nil,
-		naReviewStatus("implement", "complete"), nil, nil, false, "", "")
-	if na == nil || na.State != "acceptance_settled_outcome_unknown" {
-		t.Fatalf("state = %+v, want acceptance_settled_outcome_unknown", na)
+
+	cases := []struct {
+		name    string
+		verdict string // "" hits the aged-out arm; a bogus value hits the switch-default arm
+	}{
+		{name: "verdict aged out of window", verdict: ""},
+		{name: "unrecognized verdict value", verdict: "not-a-verdict"},
 	}
-	if na.Actions[0].Action != "fishhawk_list_audit" {
-		t.Errorf("actions[0] = %q, want fishhawk_list_audit", na.Actions[0].Action)
-	}
-	for _, a := range na.Actions {
-		if a.Action == "approve_pr" || a.Action == "merge_pr" {
-			t.Fatalf("merge ritual action %q surfaced on an unknown acceptance outcome — must fail toward read, not merge", a.Action)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			run := naLocalRun("running")
+			run.PullRequestURL = &prURL
+			stages := naAcceptanceStages("succeeded")
+			acceptanceID := stages[2].ID // naAcceptanceStages orders plan, implement, acceptance
+
+			na := nextActionsFor(run, stages, nil,
+				naReviewStatus("implement", "complete"), nil, nil, false, tc.verdict, "")
+			if na == nil || na.State != "acceptance_settled_outcome_unknown" {
+				t.Fatalf("state = %+v, want acceptance_settled_outcome_unknown", na)
+			}
+			if na.Actions[0].Action != "fishhawk_list_audit" {
+				t.Errorf("actions[0] = %q, want fishhawk_list_audit", na.Actions[0].Action)
+			}
+			var retry *SuggestedAction
+			for i := range na.Actions {
+				a := na.Actions[i]
+				if a.Action == "approve_pr" || a.Action == "merge_pr" {
+					t.Fatalf("merge ritual action %q surfaced on an unknown acceptance outcome — must fail toward read, not merge", a.Action)
+				}
+				if a.Action == "fishhawk_retry_stage" {
+					retry = &na.Actions[i]
+				}
+			}
+			if retry == nil {
+				t.Fatalf("no fishhawk_retry_stage recovery action in %+v", na.Actions)
+			}
+			if retry.Params["stage_id"] != acceptanceID {
+				t.Errorf("retry stage_id = %q, want the acceptance stage id %q", retry.Params["stage_id"], acceptanceID)
+			}
+		})
 	}
 }
 

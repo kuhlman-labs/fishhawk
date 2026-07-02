@@ -240,6 +240,42 @@ func TestAcceptanceSeam_ExampleDrivenHappyPath(t *testing.T) {
 	}
 }
 
+// TestAcceptanceSeam_NotesCrossesSeam is a7 (#1567): a notes-carrying verdict
+// crosses the full wire→domain→persist seam — HTTP ship → validate → artifact
+// persist → acceptance_outcome_recorded audit — with the free-text overflow
+// field stored verbatim rather than failing closed at the DisallowUnknownFields
+// decode.
+func TestAcceptanceSeam_NotesCrossesSeam(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	seam := buildExampleAcceptanceSeam(t, exampleBytes, run.StageStateSucceeded)
+
+	const notes = "preview took ~40s to boot; all criteria passed once up"
+	body, err := json.Marshal(acceptanceBody{
+		Verdict: "passed",
+		Criteria: []acceptanceCriterionResult{
+			{ID: "ac-create", Result: "passed", Observed: "201 returned"},
+			{ID: "ac-list", Result: "passed"},
+		},
+		Notes: notes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv, body, "")
+	if w.Code != 201 {
+		t.Fatalf("ship notes-carrying verdict status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if len(seam.ar.all) != 2 { // plan artifact + acceptance artifact
+		t.Fatalf("artifacts = %d, want 2 (plan + acceptance)", len(seam.ar.all))
+	}
+	if stored := string(seam.ar.all[1].Content); !strings.Contains(stored, `"notes":"`+notes+`"`) {
+		t.Errorf("persisted acceptance artifact missing notes verbatim:\n%s", stored)
+	}
+	if n := countByCategory(seam.au, CategoryAcceptanceOutcomeRecorded); n != 1 {
+		t.Fatalf("acceptance_outcome_recorded entries = %d, want 1", n)
+	}
+}
+
 // TestAcceptanceSeam_Class1Error_FixupAndAnchor: a failed{error} verdict
 // re-opens implement+review+acceptance to pending (class 1 → fixup_dispatched)
 // and the triage decision anchor-renders from the shared store.

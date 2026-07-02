@@ -1786,6 +1786,13 @@ components:
             Content-hash references to the customer-side evidence blobs
             (ADR-049 #5 default residency customer-side). Optional.
           items: { type: string }
+        notes:
+          type: string
+          description: |
+            A declared home for the acceptance agent's free-text overflow
+            (E31.16 / #1567): a benign top-level remark that would otherwise
+            fail closed against the strict-unknown-fields decode. Free text,
+            stored verbatim. Optional.
 
     AcceptanceUploadResponse:
       type: object
@@ -6007,6 +6014,20 @@ paths:
         prior category B), kept separate from the ordinary `stage_retried`
         receipt. Without an override the body may be omitted entirely and
         default per-category semantics apply, writing `stage_retried`.
+
+        **Acceptance-reopen arm (E31.16 / #1567).** A failed acceptance
+        VERDICT leaves the acceptance STAGE `succeeded` (E31.7), so a
+        `succeeded` acceptance stage that recorded NO
+        `acceptance_outcome_recorded` verdict (the agent shipped a
+        non-schema field and the verdict failed closed) has no other
+        re-run verb. Posting to this endpoint for such a stage re-opens it
+        `succeeded → pending` via the E31.8 class-2 mechanic and writes an
+        `acceptance_reopened` audit entry. This arm is **operator-token
+        only** — an agent (`mcp:run:*`) token is refused 403
+        (`agent_token_forbidden`) — and 422s (`retry_not_applicable`) when
+        a verdict IS recorded (verdict-ful routing belongs to the
+        deterministic triage) or when the re-open is otherwise
+        inapplicable (terminal run). An audit read error fails closed 500.
       tags: [stages]
       parameters:
         - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -6077,7 +6098,10 @@ paths:
             effective `operator_agent` block delegates the retry action
             (fail-closed), `delegation_condition_unmet` when the
             `infra_flake` condition is not satisfied — `details` names
-            the exact failed predicate in `unmet_reason`.
+            the exact failed predicate in `unmet_reason`. (4) the
+            acceptance-reopen arm (#1567) invoked by an agent
+            (`mcp:run:*`) token — body `error` is `agent_token_forbidden`
+            (operator-only verb).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -6086,7 +6110,10 @@ paths:
           description: |
             Retry not applicable for the stage's current state /
             failure category. Body's `error` is `retry_not_applicable`
-            and `message` explains the specific reason.
+            and `message` explains the specific reason. Also returned by
+            the acceptance-reopen arm (#1567) when a verdict IS already
+            recorded for the stage, or the re-open is otherwise
+            inapplicable (terminal run).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

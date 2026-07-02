@@ -1326,6 +1326,12 @@ func buildAcceptance(t Trigger) string {
 		"expectation came from — the criterion statement, the issue text, a spec section) and " +
 		"`repro_handle` (the command or request a human can re-run to reproduce the " +
 		"observation).\n\n")
+	b.WriteString("- `notes` (OPTIONAL): a single top-level string for any free-text remark " +
+		"that does not belong in a criterion result. Put stray prose here.\n\n")
+	b.WriteString("The verdict may contain ONLY these fields: `verdict`, `failure_mode`, " +
+		"`criteria[]` (with its enumerated sub-fields), `target_url`, `evidence_hashes`, and " +
+		"`notes`. Any OTHER field is rejected fail-closed by the runner's validator and fails " +
+		"the stage — do not invent fields; put overflow prose in `notes`.\n\n")
 	b.WriteString("Emit the verdict as structured output when your harness supports it. " +
 		"Otherwise, write the verdict as a single JSON object to " + AcceptanceVerdictPath +
 		" — the runner falls back to reading that file.\n\n")
