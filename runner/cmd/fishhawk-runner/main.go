@@ -352,6 +352,17 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		acceptanceCriteriaIDs []string
 	)
 
+	// acceptanceExpectedHeadSHA is the run's merge-candidate identity
+	// (E31.18 / #1569): the newest reported head SHA the backend resolved
+	// from its lineage ledger, served only on acceptance-stage prompt
+	// responses. The pre-spawn target-identity gate below compares the
+	// declared target's /healthz git_sha against it so acceptance validates
+	// the merge candidate, not whatever build answers at the declared host.
+	// Empty (older backend, ledger gap, or no --fetch-prompt) degrades the
+	// gate to unverifiable-warn. Function-scoped like fixupExpectedHeadSHA:
+	// produced and consumed within run().
+	var acceptanceExpectedHeadSHA string
+
 	// If --fetch-prompt is set and no --prompt-file was supplied,
 	// pull the constructed prompt from the backend and write it to
 	// a temp file. Sets cfg.promptFile so the rest of the path is
@@ -372,7 +383,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -424,6 +435,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// every non-acceptance stage.
 		egressTargetHosts = promptEgressTargetHosts
 		acceptanceCriteriaIDs = promptAcceptanceCriteriaIDs
+		acceptanceExpectedHeadSHA = promptAcceptanceExpectedHeadSHA
 		stageType = sType
 		// Hand the resolved scope.files to the out-of-process CLI
 		// auto-PR path (#581) the same way the PR description is
@@ -723,6 +735,31 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		defer func() { _ = proxy.Close() }()
+
+		// Pre-spawn target-identity gate + preview provisioning hook
+		// (E31.18 / #1569): provision (FISHHAWK_ACCEPTANCE_PREVIEW_CMD) →
+		// readiness poll → /healthz git_sha identity check against the
+		// backend-resolved merge-candidate head. Stale, unreachable, or a
+		// provision failure fails the stage category-C BEFORE any spawn —
+		// acceptance must never validate the wrong build. Unverifiable
+		// (no build identifier, or no expectation from an older backend)
+		// warns and proceeds; no declared hosts skips the gate. The
+		// teardown hook is deferred IMMEDIATELY so it runs on every
+		// post-provision return — the failure paths right below AND the
+		// happy path after the verdict ships (binding approval condition).
+		// The probe dials direct from the runner process, not through the
+		// egress proxy — the proxy contains the agent, not the runner.
+		gateTeardown, gateFailReason, gateFailDetail := acceptanceTargetGate(
+			ctx, previewGateConfigFromEnv(), egressTargetHosts, acceptanceExpectedHeadSHA, cfg.runID, logSink)
+		if gateTeardown != nil {
+			defer gateTeardown()
+		}
+		if gateFailReason != "" {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":%q,"category":"C","detail":%q}`+"\n",
+				gateFailReason, gateFailDetail)
+			return exitFailure
+		}
 
 		baseEnv, refused := acceptenv.Env(os.Environ(), proxy.URL())
 		if len(refused) > 0 {
@@ -2258,16 +2295,19 @@ func reissueSigningKeyForTerminalUpload(ctx context.Context, client uploadClient
 // the open PR rather than opening a new one. fixupExpectedHeadSHA (#967) is
 // the run's recorded head the pre-invoke fix-up base establishment verifies
 // the fetched branch tip against; empty skips the comparison.
+// acceptanceExpectedHeadSHA (E31.18 / #1569) is the merge-candidate head the
+// acceptance pre-spawn target-identity gate compares the declared target's
+// /healthz git_sha against; empty degrades the gate to unverifiable-warn.
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, fetchErr
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -2275,20 +2315,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
