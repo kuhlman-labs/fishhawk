@@ -451,12 +451,13 @@ func TestGetStage_NilRepo(t *testing.T) {
 // Create + GetByHash are usable so plan_test.go can exercise the
 // idempotent re-upload path without standing up Postgres.
 type fakeArtifactRepo struct {
-	mu        sync.Mutex
-	all       []*artifact.Artifact
-	listErr   error
-	getErr    error
-	createErr error
-	notFound  bool
+	mu           sync.Mutex
+	all          []*artifact.Artifact
+	listErr      error
+	getErr       error
+	createErr    error
+	getByHashErr error
+	notFound     bool
 }
 
 func newFakeArtifactRepo() *fakeArtifactRepo {
@@ -517,6 +518,9 @@ func (f *fakeArtifactRepo) ListForStage(_ context.Context, stageID uuid.UUID) ([
 func (f *fakeArtifactRepo) GetByHash(_ context.Context, stageID uuid.UUID, contentHash string) (*artifact.Artifact, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.getByHashErr != nil {
+		return nil, f.getByHashErr
+	}
 	for _, a := range f.all {
 		if a.StageID == stageID && a.ContentHash == contentHash {
 			return a, nil

@@ -589,6 +589,52 @@ func TestShipAcceptance_AuditAppendFails_500(t *testing.T) {
 	}
 }
 
+// TestShipAcceptance_GetByHashError_500 pins the fail-closed idempotency-check
+// branch: a non-ErrNotFound error from ArtifactRepo.GetByHash must return 500
+// internal_error with the "check existing acceptance failed" message and must
+// not create an artifact (#1556).
+func TestShipAcceptance_GetByHashError_500(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, _, _ := newAcceptanceServer(t, runID, stageID)
+	ar.getByHashErr = errors.New("artifact read down")
+	priv, _ := sf.issue(t, runID)
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), "")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "check existing acceptance failed") {
+		t.Errorf("body missing expected message:\n%s", w.Body.String())
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("artifact created on fail-closed path: %d artifacts", len(ar.all))
+	}
+}
+
+// TestShipAcceptance_CreateError_500 pins the fail-closed persist branch: an
+// error from ArtifactRepo.Create must return 500 internal_error with the
+// "create acceptance artifact failed" message and must not append an
+// acceptance_outcome_recorded audit entry — Create fails before the audit
+// append, so the governance chain gains no entry for a never-persisted
+// artifact (#1556).
+func TestShipAcceptance_CreateError_500(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, _ := newAcceptanceServer(t, runID, stageID)
+	ar.createErr = errors.New("artifact write down")
+	priv, _ := sf.issue(t, runID)
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), "")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "create acceptance artifact failed") {
+		t.Errorf("body missing expected message:\n%s", w.Body.String())
+	}
+	for _, ap := range au.appended {
+		if ap.Category == CategoryAcceptanceOutcomeRecorded {
+			t.Errorf("acceptance_outcome_recorded appended on fail-closed create path: %+v", ap)
+		}
+	}
+}
+
 // TestShipAcceptance_CrossBoundary_WireToRender is the #618 cross-boundary
 // integration test spanning wire -> persist -> audit -> render: GET the
 // acceptance-stage prompt (criteria ids present, diff withheld), POST the signed
