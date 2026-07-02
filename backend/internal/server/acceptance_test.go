@@ -290,6 +290,7 @@ func TestShipAcceptance_InvalidPayload_400(t *testing.T) {
 		"criterion invalid result":    []byte(`{"verdict":"passed","criteria":[{"id":"x","result":"maybe"}]}`),
 		"non-http target_url":         []byte(`{"verdict":"passed","target_url":"ssh://x"}`),
 		"unknown field":               []byte(`{"verdict":"passed","extra":true}`),
+		"criterion unknown field":     []byte(`{"verdict":"passed","criteria":[{"id":"x","result":"passed","extra":true}]}`),
 		"trailing object":             []byte(`{"verdict":"passed"}{"verdict":"failed","failure_mode":"error"}`),
 		"trailing garbage":            []byte(`{"verdict":"passed"} garbage`),
 	}
@@ -309,6 +310,51 @@ func TestShipAcceptance_InvalidPayload_400(t *testing.T) {
 				t.Errorf("artifacts = %d, want 0", len(ar.all))
 			}
 		})
+	}
+}
+
+// TestShipAcceptance_CriterionEvidenceFields_RoundTrip pins the E31.7 verdict
+// shape (#1535): a body carrying the optional per-criterion expectation_basis
+// + repro_handle fields is ACCEPTED (the handler decodes with
+// DisallowUnknownFields, so this would 400 without the struct fields) and the
+// artifact stores them verbatim. The sibling "criterion unknown field" case in
+// TestShipAcceptance_InvalidPayload_400 pins that a genuinely unknown
+// criterion field still rejects.
+func TestShipAcceptance_CriterionEvidenceFields_RoundTrip(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, _, _ := newAcceptanceServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	body, err := json.Marshal(acceptanceBody{
+		Verdict:     "failed",
+		FailureMode: "assertion_fail",
+		Criteria: []acceptanceCriterionResult{{
+			ID:               "ac-create",
+			Result:           "failed",
+			Observed:         "409 returned",
+			Expected:         "201 with the created widget",
+			StepsTaken:       "POSTed a widget payload",
+			ExpectationBasis: "criterion statement (issue #1534)",
+			ReproHandle:      "curl -X POST https://preview.example.test/widgets -d '{}'",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if len(ar.all) != 1 {
+		t.Fatalf("artifacts = %d, want 1", len(ar.all))
+	}
+	stored := string(ar.all[0].Content)
+	for _, want := range []string{
+		`"expectation_basis":"criterion statement (issue #1534)"`,
+		`"repro_handle":"curl -X POST https://preview.example.test/widgets -d '{}'"`,
+	} {
+		if !strings.Contains(stored, want) {
+			t.Errorf("stored artifact missing %s:\n%s", want, stored)
+		}
 	}
 }
 

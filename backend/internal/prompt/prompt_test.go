@@ -4919,10 +4919,31 @@ func TestBuild_Acceptance_RendersCriteriaAndOutOfScope(t *testing.T) {
 		"we need a widget endpoint",
 		"verdict",
 		"assertion_fail",
+		"`expectation_basis`",
+		"`repro_handle`",
+		AcceptanceVerdictPath,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("acceptance prompt missing %q\n---\n%s", want, got)
 		}
+	}
+}
+
+// TestBuild_Acceptance_OutputContractFileFallback pins the transport-fallback
+// line (E31.7 / #1535): the output contract names /tmp/fishhawk-acceptance.json
+// as the single-JSON-object fallback for adapters without a structured-output
+// channel (the codex path), mirroring the plan prompt's PlanArtifactPath
+// convention.
+func TestBuild_Acceptance_OutputContractFileFallback(t *testing.T) {
+	got, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	if !strings.Contains(got, "write the verdict as a single JSON object to "+AcceptanceVerdictPath) {
+		t.Errorf("acceptance prompt missing the %s file-fallback contract line:\n%s", AcceptanceVerdictPath, got)
+	}
+	if AcceptanceVerdictPath != "/tmp/fishhawk-acceptance.json" {
+		t.Errorf("AcceptanceVerdictPath = %q, want /tmp/fishhawk-acceptance.json (the runner mirrors this exact path)", AcceptanceVerdictPath)
 	}
 }
 
