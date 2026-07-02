@@ -314,6 +314,19 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 
 	out, err := o.dispatchStage(ctx, r, next)
 
+	// Acceptance dispatch audit (E31.6 / #1534, ADR-049): when an
+	// acceptance-typed stage was successfully advanced (the agent fireDispatch
+	// path OR the human awaiting_approval walk, both via dispatchStage), emit an
+	// acceptance_dispatched entry so the living anchor renders the dispatch line
+	// (E31.3 already registered the category + renderer). Unlike deploy,
+	// acceptance rides the ordinary pending→dispatched agent path — no
+	// pre-execution park branch — so this is placed AFTER a successful dispatch,
+	// not before. Best-effort: emitAcceptanceDispatched never unwinds the
+	// dispatch.
+	if err == nil && next.Type == run.StageTypeAcceptance {
+		o.emitAcceptanceDispatched(ctx, r.ID, next.ID, next.Sequence, string(next.ExecutorKind))
+	}
+
 	// ADR-032 / #1060: once the decomposed parent's review stage is
 	// dispatched WITH the consolidated PR present, dispatch the gating
 	// implement review against the whole consolidated diff (the diff that
@@ -647,6 +660,42 @@ func (o *Orchestrator) emitConsolidatedPROpened(ctx context.Context, runID, stag
 		Payload:   payload,
 	}); err != nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append consolidated_pr_opened failed",
+			slog.String("error", err.Error()))
+	}
+}
+
+// emitAcceptanceDispatched writes an acceptance_dispatched audit entry
+// (system actor) when the orchestrator dispatches an acceptance stage (E31.6 /
+// #1534, ADR-049). Best-effort, mirroring emitConsolidatedPROpened: nil-Audit
+// guard, WARN-on-error, never unwinds the dispatch. The rendered payload
+// carries stage_id/sequence/executor so a downstream surface can correlate the
+// dispatch with the later acceptance_outcome_recorded entry.
+func (o *Orchestrator) emitAcceptanceDispatched(ctx context.Context, runID, stageID uuid.UUID, sequence int, executor string) {
+	if o.Audit == nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping acceptance_dispatched entry",
+			slog.String("run_id", runID.String()))
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"stage_id": stageID.String(),
+		"sequence": sequence,
+		"executor": executor,
+	})
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal acceptance_dispatched payload failed",
+			slog.String("error", err.Error()))
+		return
+	}
+	systemKind := audit.ActorSystem
+	if _, err := o.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "acceptance_dispatched",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append acceptance_dispatched failed",
 			slog.String("error", err.Error()))
 	}
 }

@@ -1718,6 +1718,79 @@ components:
         outcome: { type: string, enum: [succeeded, failed, partial, rolled_back] }
         idempotent: { type: boolean }
 
+    AcceptanceArtifactBody:
+      type: object
+      description: |
+        Wire shape posted to /v0/runs/{run_id}/acceptance (E31.6 / #1534).
+        ADR-049's signed acceptance-evidence record. Stored verbatim as the
+        artifact's content; v0 carries no schema_version because the field
+        shape isn't yet schema-stable. Evidence blobs stay customer-side
+        (ADR-049 decision #5) — only the structured verdict + per-criterion
+        results + `content_hash` references cross to Fishhawk.
+      required: [verdict]
+      properties:
+        verdict:
+          type: string
+          enum: [passed, failed]
+          description: The settled acceptance disposition.
+        failure_mode:
+          type: string
+          enum: [error, assertion_fail]
+          description: |
+            Splits a failure for E31.8 triage: `error` = the instance
+            crashed / returned a 500 / threw an exception; `assertion_fail`
+            = it behaved without erroring but produced an unexpected result.
+            REQUIRED when `verdict` is `failed`; rejected when present on a
+            pass.
+        criteria:
+          type: array
+          description: |
+            One result per plan acceptance criterion, keyed by the criterion
+            `id` (the E31.1 plan-criterion join key). Optional — a verdict can
+            settle before per-criterion evidence is itemized.
+          items:
+            type: object
+            required: [id, result]
+            properties:
+              id:
+                type: string
+                description: The plan acceptance-criterion id this result maps to.
+              result:
+                type: string
+                enum: [passed, failed, skipped]
+              observed: { type: string }
+              expected: { type: string }
+              steps_taken: { type: string }
+        target_url:
+          type: string
+          format: uri
+          description: |
+            The running instance the validator drove, when declared. The
+            value source (the workflow-spec egress-allowance grammar) is owned
+            by E31.4/#1532; optional here.
+        evidence_hashes:
+          type: array
+          description: |
+            Content-hash references to the customer-side evidence blobs
+            (ADR-049 #5 default residency customer-side). Optional.
+          items: { type: string }
+
+    AcceptanceUploadResponse:
+      type: object
+      description: |
+        Echoed by `POST /v0/runs/{run_id}/acceptance`. `idempotent` is true
+        when the upload matched an existing artifact for the stage.
+      required: [id, stage_id, content_hash, verdict, idempotent]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        content_hash:
+          type: string
+          description: Hex sha256 of the canonical acceptance bytes shipped.
+        verdict: { type: string, enum: [passed, failed] }
+        failure_mode: { type: string, enum: [error, assertion_fail] }
+        idempotent: { type: boolean }
+
     PlanUploadResponse:
       type: object
       description: |
@@ -6905,6 +6978,106 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '413':
           description: Deployment body exceeds the per-stage size cap (32 KiB).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/acceptance:
+    post:
+      operationId: shipAcceptance
+      summary: Record an acceptance-evidence artifact for an acceptance stage
+      description: |
+        Records ADR-049's signed `acceptance` artifact (E31.6 / #1534) — the
+        durable evidence an independent acceptance validator emits after
+        driving the running target instance. Modeled on
+        `POST /v0/runs/{run_id}/deployment`: the handler stores the artifact
+        (`artifact.kind = acceptance`) and writes an
+        `acceptance_outcome_recorded` chained audit entry carrying the
+        `verdict` + `failure_mode` (the E31.8 error-vs-assertion_fail
+        carry-through). The outcome surfaces on the run's living-anchor issue
+        timeline. NO stage-state transition happens here — the acceptance
+        stage settles through the ordinary agent trace-bundle path.
+
+        The body carries `{ verdict, failure_mode?, criteria?, target_url?,
+        evidence_hashes? }`. `verdict` is `passed` / `failed`; `failure_mode`
+        (`error` / `assertion_fail`) is required when `verdict` is `failed`
+        and rejected on a pass. Evidence blobs stay customer-side — only the
+        structured verdict + `content_hash` references cross.
+
+        Two auth paths are accepted, mirroring the deployment upload:
+
+        - **Ed25519 signature** (canonical acceptance-validator path, ADR-050
+          decision #2 — the acceptance agent ships via signature auth with no
+          MCP token): supply `X-Fishhawk-Signature` — the hex-encoded 64-byte
+          Ed25519 signature over sha256(body). NOT scope-gated.
+        - **Bearer token** (operator path): supply `Authorization: Bearer
+          <token>` with `write:runs` scope. Unlike deploy, acceptance adds NO
+          dedicated scope — the evidence write is advisory.
+
+        When both are present the signature path wins. The audit payload's
+        `auth_method` field records `ed25519` or `bearer`.
+
+        Returns 401 `signature_or_bearer_required` when neither is present.
+
+        Idempotent on (stage_id, content_hash): a re-delivery of the same
+        acceptance record returns the existing artifact unchanged rather than
+        inserting a duplicate or writing a second audit entry.
+
+        v0 has no formal JSON Schema for the body — required-field checks
+        happen in the handler.
+      tags: [runner]
+      security: []
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - { name: stage_id, in: query, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - name: X-Fishhawk-Signature
+          in: header
+          required: false
+          schema:
+            type: string
+            description: Hex-encoded 64-byte Ed25519 signature over sha256(body).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AcceptanceArtifactBody' }
+      responses:
+        '201':
+          description: Acceptance evidence accepted; new artifact row created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptanceUploadResponse' }
+        '200':
+          description: |
+            An acceptance artifact with this content_hash already exists for
+            the stage (idempotent re-upload returns the existing artifact
+            unchanged).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptanceUploadResponse' }
+        '400':
+          description: |
+            Body missing required fields or malformed
+            (`code: acceptance_invalid`) — for example an absent/unknown
+            `verdict`, a `failed` verdict missing `failure_mode`, a `passed`
+            verdict carrying `failure_mode`, a criterion with an empty `id` or
+            an invalid `result`, a non-http `target_url`, or an unknown JSON
+            field — or path/query parameters were malformed, or the stage is
+            not an acceptance stage (`validation_failed`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            Auth failed. Possible codes:
+            - `signature_invalid` — `X-Fishhawk-Signature` did not verify against the run's public key.
+            - `signature_or_bearer_required` — request included neither `X-Fishhawk-Signature` nor an authenticated bearer token with `write:runs` scope.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413':
+          description: Acceptance body exceeds the per-stage size cap (32 KiB).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
