@@ -1505,3 +1505,278 @@ func TestFetchPrompt_OpenPRFromHeldCommitOmittedWhenAbsent(t *testing.T) {
 			got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch)
 	}
 }
+
+// acceptanceFakeBackend mounts a /v0/runs/{run_id}/acceptance handler
+// with configurable response shape (E31.7 / #1535). Separate from
+// fakeBackend so the per-test plumbing stays focused, mirroring
+// planFakeBackend.
+type acceptanceFakeBackend struct {
+	mu sync.Mutex
+
+	// status drives the response code once errCount is exhausted.
+	status int
+	// body overrides the response body. Empty + 201/200 synthesizes
+	// a plausible ShipAcceptanceResult.
+	body string
+	// errCount forces N consecutive 500s before falling through to
+	// status — for testing retry behavior.
+	errCount int
+	// idempotent is set on the synthesized body when status==200.
+	idempotent bool
+
+	receivedBody []byte
+	receivedSig  string
+	receivedPath string
+	calls        int
+}
+
+func newAcceptanceFakeBackend(t *testing.T) (*acceptanceFakeBackend, *httptest.Server) {
+	t.Helper()
+	af := &acceptanceFakeBackend{status: http.StatusCreated}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/acceptance", func(w http.ResponseWriter, r *http.Request) {
+		af.mu.Lock()
+		af.calls++
+		if af.errCount > 0 {
+			af.errCount--
+			af.mu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		s := af.status
+		body := af.body
+		idem := af.idempotent
+		raw, _ := io.ReadAll(r.Body)
+		af.receivedBody = raw
+		af.receivedSig = r.Header.Get("X-Fishhawk-Signature")
+		af.receivedPath = r.URL.Path
+		af.mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(s)
+		if (s == http.StatusCreated || s == http.StatusOK) && body == "" {
+			var acc struct {
+				Verdict     string `json:"verdict"`
+				FailureMode string `json:"failure_mode"`
+			}
+			_ = json.Unmarshal(raw, &acc)
+			_ = json.NewEncoder(w).Encode(ShipAcceptanceResult{
+				ID:          "00000000-0000-0000-0000-000000000ccc",
+				StageID:     r.URL.Query().Get("stage_id"),
+				ContentHash: hex.EncodeToString(func() []byte { d := sha256.Sum256(raw); return d[:] }()),
+				Verdict:     acc.Verdict,
+				FailureMode: acc.FailureMode,
+				Idempotent:  idem,
+			})
+		} else if body != "" {
+			_, _ = io.WriteString(w, body)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return af, srv
+}
+
+func TestShipAcceptance_HappyPath_Created(t *testing.T) {
+	af, srv := newAcceptanceFakeBackend(t)
+	c := quickClient(srv)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed"}]}`)
+
+	res, err := c.ShipAcceptance(context.Background(), ShipAcceptanceArgs{
+		RunID:      "run-abc",
+		StageID:    "stage-xyz",
+		Body:       body,
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("ShipAcceptance: %v", err)
+	}
+	if res.Verdict != "passed" {
+		t.Errorf("verdict = %q, want passed", res.Verdict)
+	}
+	if res.Idempotent {
+		t.Error("expected Idempotent=false on 201")
+	}
+	if !bytes.Equal(af.receivedBody, body) {
+		t.Errorf("backend received body %q, want %q", af.receivedBody, body)
+	}
+	if af.receivedPath != "/v0/runs/run-abc/acceptance" {
+		t.Errorf("path = %q", af.receivedPath)
+	}
+	// The signature must verify against sha256(body) with the run key —
+	// the same message the backend's signing.ComputeMessage derives.
+	sig, err := hex.DecodeString(af.receivedSig)
+	if err != nil {
+		t.Fatalf("signature not hex: %v", err)
+	}
+	digest := sha256.Sum256(body)
+	if !ed25519.Verify(priv.Public().(ed25519.PublicKey), digest[:], sig) {
+		t.Error("X-Fishhawk-Signature does not verify against sha256(body)")
+	}
+}
+
+func TestShipAcceptance_Idempotent200(t *testing.T) {
+	af, srv := newAcceptanceFakeBackend(t)
+	af.status = http.StatusOK
+	af.idempotent = true
+	c := quickClient(srv)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+
+	res, err := c.ShipAcceptance(context.Background(), ShipAcceptanceArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Body:       []byte(`{"verdict":"passed"}`),
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("ShipAcceptance: %v", err)
+	}
+	if !res.Idempotent {
+		t.Error("expected Idempotent=true on 200 replay")
+	}
+}
+
+func TestShipAcceptance_AcceptanceInvalid_400(t *testing.T) {
+	af, srv := newAcceptanceFakeBackend(t)
+	af.status = http.StatusBadRequest
+	af.body = `{"error":"acceptance_invalid","message":"acceptance body missing or malformed fields"}`
+	c := quickClient(srv)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+
+	_, err := c.ShipAcceptance(context.Background(), ShipAcceptanceArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Body:       []byte(`{"verdict":"nope"}`),
+		PrivateKey: priv,
+	})
+	if !errors.Is(err, ErrAcceptanceInvalid) {
+		t.Fatalf("err = %v, want ErrAcceptanceInvalid", err)
+	}
+	if af.calls != 1 {
+		t.Errorf("calls = %d, want 1 (400 is permanent, never retried)", af.calls)
+	}
+}
+
+func TestShipAcceptance_PlainBadRequest_NotTyped(t *testing.T) {
+	af, srv := newAcceptanceFakeBackend(t)
+	af.status = http.StatusBadRequest
+	af.body = `{"error":"validation_failed","message":"stage_id query parameter must be a valid UUID"}`
+	c := quickClient(srv)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+
+	_, err := c.ShipAcceptance(context.Background(), ShipAcceptanceArgs{
+		RunID: "run-abc", StageID: "not-a-uuid",
+		Body:       []byte(`{"verdict":"passed"}`),
+		PrivateKey: priv,
+	})
+	if err == nil || errors.Is(err, ErrAcceptanceInvalid) {
+		t.Fatalf("err = %v, want a plain (non-ErrAcceptanceInvalid) error", err)
+	}
+	_ = af
+}
+
+func TestShipAcceptance_RetriesOn5xxThenSucceeds(t *testing.T) {
+	af, srv := newAcceptanceFakeBackend(t)
+	af.errCount = 2
+	c := quickClient(srv)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+
+	res, err := c.ShipAcceptance(context.Background(), ShipAcceptanceArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Body:       []byte(`{"verdict":"passed"}`),
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("ShipAcceptance after transient 5xx: %v", err)
+	}
+	if res.Verdict != "passed" {
+		t.Errorf("verdict = %q", res.Verdict)
+	}
+	if af.calls != 3 {
+		t.Errorf("calls = %d, want 3 (two 500s then success)", af.calls)
+	}
+}
+
+func TestShipAcceptance_5xxExhaustedIsError(t *testing.T) {
+	af, srv := newAcceptanceFakeBackend(t)
+	af.errCount = 100 // more than MaxRetries+1
+	c := quickClient(srv)
+	c.MaxRetries = 2
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+
+	_, err := c.ShipAcceptance(context.Background(), ShipAcceptanceArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Body:       []byte(`{"verdict":"passed"}`),
+		PrivateKey: priv,
+	})
+	if err == nil || !strings.Contains(err.Error(), "exhausted retries") {
+		t.Fatalf("err = %v, want exhausted-retries error", err)
+	}
+	if af.calls != 3 {
+		t.Errorf("calls = %d, want 3 (initial + 2 retries)", af.calls)
+	}
+}
+
+func TestShipAcceptance_RejectsEmptyBodyAndBadKey(t *testing.T) {
+	_, srv := newAcceptanceFakeBackend(t)
+	c := quickClient(srv)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+
+	if _, err := c.ShipAcceptance(context.Background(), ShipAcceptanceArgs{
+		RunID: "r", StageID: "s", Body: nil, PrivateKey: priv,
+	}); err == nil {
+		t.Error("empty body must be rejected")
+	}
+	if _, err := c.ShipAcceptance(context.Background(), ShipAcceptanceArgs{
+		RunID: "r", StageID: "s", Body: []byte(`{"verdict":"passed"}`), PrivateKey: []byte("short"),
+	}); err == nil {
+		t.Error("bad key length must be rejected")
+	}
+}
+
+// TestFetchPrompt_DecodesAcceptanceFields locks the E31.7 / #1535 wire
+// contract: egress_target_hosts + acceptance_criteria_ids round-trip
+// the acceptance-stage prompt response onto FetchedPrompt by tag.
+func TestFetchPrompt_DecodesAcceptanceFields(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "acceptance",
+		"prompt": "validate the thing",
+		"prompt_hash": "beef",
+		"egress_target_hosts": ["staging.example.com", "staging.example.com:8443"],
+		"acceptance_criteria_ids": ["AC1", "AC2"]
+	}`
+	c := quickClient(srv)
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{StageID: "stage-abc", PrivateKey: priv})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	wantHosts := []string{"staging.example.com", "staging.example.com:8443"}
+	if len(got.EgressTargetHosts) != 2 || got.EgressTargetHosts[0] != wantHosts[0] || got.EgressTargetHosts[1] != wantHosts[1] {
+		t.Errorf("EgressTargetHosts = %v, want %v", got.EgressTargetHosts, wantHosts)
+	}
+	if len(got.AcceptanceCriteriaIDs) != 2 || got.AcceptanceCriteriaIDs[0] != "AC1" || got.AcceptanceCriteriaIDs[1] != "AC2" {
+		t.Errorf("AcceptanceCriteriaIDs = %v, want [AC1 AC2]", got.AcceptanceCriteriaIDs)
+	}
+}
+
+// TestFetchPrompt_AcceptanceFieldsAbsentByDefault confirms the two new
+// fields decode to nil on every response that omits them — the
+// byte-identical default for all existing stage types.
+func TestFetchPrompt_AcceptanceFieldsAbsentByDefault(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	c := quickClient(srv)
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{StageID: "stage-abc", PrivateKey: priv})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.EgressTargetHosts != nil || got.AcceptanceCriteriaIDs != nil {
+		t.Errorf("acceptance fields must default nil, got %v / %v",
+			got.EgressTargetHosts, got.AcceptanceCriteriaIDs)
+	}
+}

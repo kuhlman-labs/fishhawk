@@ -36,10 +36,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/runner/internal/acceptenv"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/claudecode"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/egressproxy"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitdiff"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/otelemit"
@@ -88,6 +90,7 @@ type uploadClient interface {
 	IssueKey(ctx context.Context, runID string, ttl time.Duration) (*upload.IssuedKey, error)
 	ShipTrace(ctx context.Context, args upload.ShipArgs) (*upload.ShipResult, error)
 	ShipPlan(ctx context.Context, args upload.ShipPlanArgs) (*upload.ShipPlanResult, error)
+	ShipAcceptance(ctx context.Context, args upload.ShipAcceptanceArgs) (*upload.ShipAcceptanceResult, error)
 	ShipPullRequest(ctx context.Context, args upload.ShipPullRequestArgs) (*upload.ShipPullRequestResult, error)
 	FetchPrompt(ctx context.Context, args upload.FetchPromptArgs) (*upload.FetchedPrompt, error)
 	FetchInstallationToken(ctx context.Context, args upload.FetchInstallationTokenArgs) (*upload.FetchInstallationTokenResult, error)
@@ -336,6 +339,19 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// run, keeping the strict gate byte-identical.
 	var operatorExemptions []scopeExemption
 
+	// egressTargetHosts / acceptanceCriteriaIDs are the acceptance-stage
+	// prompt-response fields (E31.7 / #1535): the spec-declared egress
+	// target hosts feed the ADR-050 proxy allow-list; the approved plan's
+	// criterion ids are the join-key set the shipped verdict's
+	// criteria[].id entries are validated against. Both empty on every
+	// non-acceptance stage (the backend serves them only there) and on
+	// local replay without --fetch-prompt. Function-scoped like
+	// fixupExpectedHeadSHA: produced and consumed within run().
+	var (
+		egressTargetHosts     []string
+		acceptanceCriteriaIDs []string
+	)
+
 	// If --fetch-prompt is set and no --prompt-file was supplied,
 	// pull the constructed prompt from the backend and write it to
 	// a temp file. Sets cfg.promptFile so the rest of the path is
@@ -356,7 +372,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, promptImplementModel, promptPlanModel, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -402,6 +418,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// stage. Empty (no ladder rung supplied a model) leaves the spawn
 		// unchanged.
 		planModel = promptPlanModel
+		// Acceptance-stage inputs (E31.7 / #1535): held for the acceptance
+		// containment branch (proxy allow-list) and the post-agent verdict
+		// validation (criteria join-key membership) below. Both empty on
+		// every non-acceptance stage.
+		egressTargetHosts = promptEgressTargetHosts
+		acceptanceCriteriaIDs = promptAcceptanceCriteriaIDs
 		stageType = sType
 		// Hand the resolved scope.files to the out-of-process CLI
 		// auto-PR path (#581) the same way the PR description is
@@ -616,7 +638,18 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// fetch failed or never ran; the refresh then skips and the
 	// original scope stays authoritative.
 	mcpBearerToken := ""
-	if issuedKey != nil {
+	switch {
+	case stageType == "acceptance":
+		// ADR-050 decision #2: the acceptance agent gets NO Fishhawk MCP
+		// token — its verdict ships via the signature-authed evidence
+		// upload after the invocation, and withholding FISHHAWK_API_TOKEN
+		// removes the credential leg an injected agent could turn against
+		// the run's own control plane. The explicit event makes the
+		// omission deliberate-and-visible in the stage log.
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"acceptance_no_mcp_token","run_id":%q,"stage_id":%q}`+"\n",
+			cfg.runID, cfg.stageID)
+	case issuedKey != nil:
 		mcpTok, err := client.FetchMCPToken(ctx, upload.FetchMCPTokenArgs{
 			RunID:      cfg.runID,
 			PrivateKey: issuedKey.PrivateKey,
@@ -633,6 +666,73 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				`{"event":"mcp_token_issued","run_id":%q,"token_id":%q,"expires_at":%q}`+"\n",
 				cfg.runID, mcpTok.TokenID, mcpTok.ExpiresAt.Format(time.RFC3339))
 		}
+	}
+
+	// Acceptance-agent containment (E31.7 / #1535, ADR-050 / ADR-049 #4).
+	// The acceptance agent validates the RUNNING INSTANCE from intent +
+	// criteria, never the diff, and is treated as potentially
+	// prompt-injected — so before it spawns:
+	//
+	//   1. WorkingDir moves to a fresh empty temp dir. This is
+	//      diff-withholding (ADR-049 #4: the tree must not leak into the
+	//      independent validation) plus accidental-write hygiene ONLY —
+	//      it does NOT remove repo write access or authority, since a
+	//      child process can still write by absolute path. The real
+	//      authority boundary is that the invocation env carries no
+	//      repo-write credential of any kind (acceptenv denies
+	//      GITHUB_TOKEN / GH_TOKEN / FISHHAWK_GITHUB_TOKEN and the
+	//      MCP-token block above never runs), the acceptance stage
+	//      performs no git add/commit/push and never opens a PR (every
+	//      commit/PR path below is stage-gated to implement), and
+	//      hostile filesystem writes remain the documented OS-sandbox
+	//      residual (ADR-050; runner README residual note; #611-class).
+	//   2. The ADR-050 egress proxy starts with the composed allow-list
+	//      (spec-declared target hosts + model APIs + backend). A start
+	//      error fails the stage category-C BEFORE any agent spawn — the
+	//      acceptance agent never runs uncontained.
+	//   3. The invocation env is REPLACED with the acceptenv minimized
+	//      set (BaseEnv): default-deny essentials + model key +
+	//      operator-declared FISHHAWK_ACCEPTANCE_ENV_* passthrough, with
+	//      HTTP(S)_PROXY pointed at the proxy. Refused passthrough names
+	//      are logged, never honored.
+	//   4. The verdict schema constrains claudecode structured output;
+	//      other backends fall back to the /tmp/fishhawk-acceptance.json
+	//      file transport named in the prompt's output contract.
+	if stageType == "acceptance" {
+		tmpDir, err := os.MkdirTemp("", "fishhawk-acceptance-*")
+		if err != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"acceptance_workdir","category":"C","detail":%q}`+"\n",
+				err.Error())
+			return exitFailure
+		}
+		inv.WorkingDir = tmpDir
+
+		proxy, err := egressproxy.Start(egressproxy.Config{
+			AllowHosts: egressproxy.BuildAllowlist(egressTargetHosts, cfg.backendURL),
+			Logf: func(format string, args ...any) {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"acceptance_egress","run_id":%q,"detail":%q}`+"\n",
+					cfg.runID, fmt.Sprintf(format, args...))
+			},
+		})
+		if err != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"acceptance_egress_proxy","category":"C","detail":%q}`+"\n",
+				err.Error())
+			return exitFailure
+		}
+		defer func() { _ = proxy.Close() }()
+
+		baseEnv, refused := acceptenv.Env(os.Environ(), proxy.URL())
+		if len(refused) > 0 {
+			refusedJSON, _ := json.Marshal(refused)
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"acceptance_env_refused","run_id":%q,"names":%s}`+"\n",
+				cfg.runID, refusedJSON)
+		}
+		inv.BaseEnv = baseEnv
+		inv.JSONSchema = acceptanceVerdictJSONSchema
 	}
 
 	invoker, selErr := selectInvoker(cfg.agent, apiKeyForAgent(cfg.agent))
@@ -1256,6 +1356,53 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		res.Events = append(res.Events, fixupApplyEvents...)
 	}
 
+	// Acceptance verdict capture + validation (E31.7 / #1535). On a
+	// successful acceptance invocation, capture the structured verdict
+	// (StructuredOutput preferred, /tmp/fishhawk-acceptance.json file
+	// fallback), validate it against the backend-mirrored rules + the
+	// served criteria-id set, and redact it BEFORE it is embedded in the
+	// trace bundle (acceptance_evidence event) or shipped. A missing or
+	// invalid verdict demotes to category-B: the agent ran but did not
+	// produce the contracted artifact. A VALID verdict of "failed" is NOT
+	// a runner failure — res.OK stays true; the validation completed and
+	// routing the failure is E31.8's scope. acceptanceVerdictRedacted
+	// carries the redacted bytes to the post-trace ShipAcceptance below.
+	var acceptanceVerdictRedacted []byte
+	if stageType == "acceptance" && res.OK {
+		rawVerdict, capErr := captureAcceptanceVerdict(res, acceptanceVerdictPath)
+		if capErr != nil {
+			res.OK = false
+			res.FailureCategory = "B"
+			res.FailureReason = "acceptance_verdict_missing: " + capErr.Error()
+			invokeErr = capErr
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"acceptance_verdict_missing","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+				cfg.runID, cfg.stageID, capErr.Error())
+		} else if valErr := validateAcceptanceVerdict(rawVerdict, acceptanceCriteriaIDs); valErr != nil {
+			res.OK = false
+			res.FailureCategory = "B"
+			res.FailureReason = "acceptance_verdict_invalid: " + valErr.Error()
+			invokeErr = valErr
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"acceptance_verdict_invalid","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+				cfg.runID, cfg.stageID, valErr.Error())
+		} else {
+			redacted, hits := redactAcceptanceVerdict(rawVerdict)
+			acceptanceVerdictRedacted = redacted
+			if len(hits) > 0 {
+				hitsJSON, _ := json.Marshal(hits)
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"acceptance_verdict_redacted","run_id":%q,"stage_id":%q,"hits":%s}`+"\n",
+					cfg.runID, cfg.stageID, hitsJSON)
+			}
+			// Appended before EITHER PackBytes below so both bundle
+			// variants carry the evidence event; pre-redacted because
+			// consumers dispatch on the raw variant too (the same posture
+			// as composeGateEvidence, #963/#793).
+			res.Events = append(res.Events, composeAcceptanceEvidence(redacted))
+		}
+	}
+
 	// Mid-stage scope-amendment refresh (E22.X / #961). Immediately before
 	// the commit phase — and crucially BEFORE the committed-tree verify
 	// gates and every StageScoped call below — fetch the run's scope
@@ -1709,6 +1856,41 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			}
 		}
 
+		// Acceptance-stage post-processing (E31.7 / #1535): ship the
+		// redacted, validated verdict to POST /v0/runs/{run_id}/acceptance
+		// with the re-issued signing key. Mirrors the uploadPlan slot's
+		// classification contract: ErrAcceptanceInvalid (the backend
+		// rejected the verdict shape) is category-B — the agent's output
+		// is bad; everything else (network, 5xx-exhausted) is category-C
+		// infra. Gated on res.OK, so a missing/invalid verdict (already
+		// demoted to B above) never ships, and only fires on the
+		// acceptance stage type.
+		if res.OK && stageType == "acceptance" {
+			shipRes, err := client.ShipAcceptance(ctx, upload.ShipAcceptanceArgs{
+				RunID:      cfg.runID,
+				StageID:    cfg.stageID,
+				Body:       acceptanceVerdictRedacted,
+				PrivateKey: issuedKey.PrivateKey,
+			})
+			if err != nil {
+				res.OK = false
+				if errors.Is(err, upload.ErrAcceptanceInvalid) {
+					res.FailureCategory = "B"
+				} else {
+					res.FailureCategory = "C"
+				}
+				res.FailureReason = err.Error()
+				invokeErr = err
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"runner_failed","reason":"acceptance_upload","detail":%q}`+"\n", err.Error())
+				logCompletion(logSink, res, invokeErr)
+				return exitFailure
+			}
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"acceptance_shipped","run_id":%q,"stage_id":%q,"artifact_id":%q,"verdict":%q,"content_hash":%q,"idempotent":%t}`+"\n",
+				cfg.runID, cfg.stageID, shipRes.ID, shipRes.Verdict, shipRes.ContentHash, shipRes.Idempotent)
+		}
+
 		// Implement-stage post-processing: commit + push + open PR
 		// + ship the pull_request artifact. (E5.X / #195.) Mirrors
 		// the plan-stage upload chain: same signing key, same
@@ -2056,13 +2238,13 @@ func reissueSigningKeyForTerminalUpload(ctx context.Context, client uploadClient
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, implementModel string, planModel string, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", fetchErr
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -2070,20 +2252,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.ImplementModel, got.PlanModel, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
