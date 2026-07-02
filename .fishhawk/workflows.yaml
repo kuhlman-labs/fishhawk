@@ -214,7 +214,7 @@ workflows:
         # they are not declarable here. Hosts, not URLs — no scheme, no path.
         egress:
           target_hosts:
-            - localhost:8080
+            - localhost:8090
         # Durable acceptance-evidence record (v1.2, ADR-049 / #1531): the
         # verdict + per-criterion results + content-hash refs to evidence blobs.
         # Valid ONLY on an acceptance stage.
