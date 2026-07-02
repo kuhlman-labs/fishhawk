@@ -209,6 +209,26 @@ type promptResponse struct {
 	// (runner/internal/upload/upload.go). A tag drift here silently disables
 	// the runner's verdict join-key validation.
 	AcceptanceCriteriaIDs []string `json:"acceptance_criteria_ids,omitempty"`
+	// AcceptanceExpectedHeadSHA is the run's merge-candidate identity — the
+	// newest head_sha across the run's reported-head ledger entries
+	// (pull_request_opened / child_pushed / fixup_pushed, the same ADR-035
+	// lineage source FixupExpectedHeadSHA resolves from) — served ONLY on
+	// acceptance stages (E31.18 / #1569). The runner's pre-spawn
+	// target-identity gate compares the declared target's /healthz git_sha
+	// against it before spawning the acceptance agent, so acceptance
+	// validates the merge candidate rather than whatever build answers at
+	// the declared host. Empty/omitted when resolution fails (empty ledger
+	// or read error, WARN-and-omit) — the runner then treats the target as
+	// unverifiable and warns-and-proceeds rather than blocking the stage.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag
+	// (`acceptance_expected_head_sha`) MUST stay byte-identical to the
+	// runner's upload.FetchedPrompt.AcceptanceExpectedHeadSHA decoder
+	// (runner/internal/upload/upload.go) — the same independent-struct-by-tag
+	// convention as EgressTargetHosts above. A tag drift here silently drops
+	// the expectation and the runner's identity gate degrades to
+	// unverifiable-warn on every dispatch.
+	AcceptanceExpectedHeadSHA string `json:"acceptance_expected_head_sha,omitempty"`
 }
 
 // scopeExemption is one operator scope exemption: a DECLARED scope.files path
@@ -900,11 +920,14 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	// Acceptance-stage containment inputs (E31.7 / #1535): the FULL egress
 	// target-host list (the runner's ADR-050 proxy allow-list) and the approved
 	// plan's criterion ids (the runner's verdict join-key validation set).
-	// trigger.ApprovedPlan was loaded by the acceptance branch above. Both
+	// trigger.ApprovedPlan was loaded by the acceptance branch above. Plus the
+	// merge-candidate identity (E31.18 / #1569) the runner's pre-spawn
+	// target-identity gate verifies the declared target against. All
 	// omitempty, so every non-acceptance response is byte-identical to today.
 	if stage.Type == run.StageTypeAcceptance {
 		resp.EgressTargetHosts = s.resolveAcceptanceEgressTargetHosts(r.Context(), runRow)
 		resp.AcceptanceCriteriaIDs = acceptanceCriteriaIDsFromPlan(trigger.ApprovedPlan)
+		resp.AcceptanceExpectedHeadSHA = s.resolveAcceptanceExpectedHeadSHA(r.Context(), runRow.ID, stage.ID)
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
@@ -1206,11 +1229,13 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		rm := s.resolvePlanModelForRun(r.Context(), runRow)
 		resp.PlanModel = rm.Value
 	}
-	// Acceptance-stage containment inputs (E31.7 / #1535), same derivation as
-	// the dispatch path so the rendered response stays byte-consistent.
+	// Acceptance-stage containment inputs (E31.7 / #1535) and the E31.18
+	// merge-candidate identity, same derivation as the dispatch path so the
+	// rendered response stays byte-consistent.
 	if stage.Type == run.StageTypeAcceptance {
 		resp.EgressTargetHosts = s.resolveAcceptanceEgressTargetHosts(r.Context(), runRow)
 		resp.AcceptanceCriteriaIDs = acceptanceCriteriaIDsFromPlan(trigger.ApprovedPlan)
+		resp.AcceptanceExpectedHeadSHA = s.resolveAcceptanceExpectedHeadSHA(r.Context(), runRow.ID, stage.ID)
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
@@ -2264,6 +2289,28 @@ func (s *Server) resolveFixupPriorDiff(ctx context.Context, runID, stageID uuid.
 // posture as the other prompt resolvers. The runner then skips the SHA
 // comparison (checkout only) rather than blocking the pass.
 func (s *Server) resolveFixupExpectedHeadSHA(ctx context.Context, runID, stageID uuid.UUID) string {
+	return s.resolveNewestReportedHeadSHA(ctx, runID, stageID, "fixup_expected_head_sha")
+}
+
+// resolveAcceptanceExpectedHeadSHA returns the run's merge-candidate
+// identity — the same newest-reported-head walk resolveFixupExpectedHeadSHA
+// performs — advertised on acceptance dispatches as
+// `acceptance_expected_head_sha` (E31.18 / #1569) so the runner's pre-spawn
+// target-identity gate can verify the declared acceptance target serves the
+// merge candidate (its /healthz git_sha) rather than a stale build.
+//
+// Same "" posture: unconfigured AuditRepo, empty ledger, or read error all
+// WARN-and-omit, and the runner degrades to unverifiable-warn.
+func (s *Server) resolveAcceptanceExpectedHeadSHA(ctx context.Context, runID, stageID uuid.UUID) string {
+	return s.resolveNewestReportedHeadSHA(ctx, runID, stageID, "acceptance_expected_head_sha")
+}
+
+// resolveNewestReportedHeadSHA is the shared reported-head ledger walk behind
+// resolveFixupExpectedHeadSHA and resolveAcceptanceExpectedHeadSHA: the newest
+// head_sha across lineageLedgerCategories, "" (WARN-and-omit, logging forField
+// as the omitted wire field) when the AuditRepo is unconfigured, no entry
+// carries a head_sha, or on any read error.
+func (s *Server) resolveNewestReportedHeadSHA(ctx context.Context, runID, stageID uuid.UUID, forField string) string {
 	if s.cfg.AuditRepo == nil {
 		return ""
 	}
@@ -2273,7 +2320,8 @@ func (s *Server) resolveFixupExpectedHeadSHA(ctx context.Context, runID, stageID
 		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
 		if err != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-				"prompt: list reported-head audit entries for fixup_expected_head_sha failed; omitting field",
+				"prompt: list reported-head audit entries failed; omitting field",
+				slog.String("field", forField),
 				slog.String("run_id", runID.String()),
 				slog.String("stage_id", stageID.String()),
 				slog.String("category", cat),
@@ -2297,7 +2345,8 @@ func (s *Server) resolveFixupExpectedHeadSHA(ctx context.Context, runID, stageID
 	}
 	if newest == nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"prompt: no reported-head audit entry found for fixup_expected_head_sha; omitting field",
+			"prompt: no reported-head audit entry found; omitting field",
+			slog.String("field", forField),
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
 		)

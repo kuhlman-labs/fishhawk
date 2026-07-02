@@ -5065,6 +5065,23 @@ paths:
                       keys against this set before shipping, failing closed on
                       an unknown id. Absent on every other stage type, and
                       when the approved plan carries no criteria.
+                  acceptance_expected_head_sha:
+                    type: string
+                    description: |
+                      The run's merge-candidate identity — the newest
+                      `head_sha` across the run's reported-head ledger
+                      entries (`pull_request_opened` / `child_pushed` /
+                      `fixup_pushed`, the same ADR-035 lineage source as
+                      `fixup_expected_head_sha`) — served ONLY on acceptance
+                      stages (E31.18 / #1569). The runner's pre-spawn
+                      target-identity gate compares the declared acceptance
+                      target's `/healthz` `git_sha` against it before
+                      spawning the acceptance agent, so acceptance validates
+                      the merge candidate rather than whatever build answers
+                      at the declared host. Absent on every other stage type
+                      and when backend-side ledger resolution fails — the
+                      runner then treats the target as unverifiable and
+                      warns-and-proceeds.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -5207,6 +5224,9 @@ paths:
                     type: array
                     items: { type: string }
                     description: The approved plan's `verification.acceptance_criteria` id list (the E31.1 join keys) in plan order, served ONLY on acceptance stages (E31.7 / #1535) — the runner's verdict join-key validation set. Absent on every other stage type and when the approved plan carries no criteria.
+                  acceptance_expected_head_sha:
+                    type: string
+                    description: The run's merge-candidate identity — the newest `head_sha` across the run's reported-head ledger entries (the ADR-035 lineage source, same as `fixup_expected_head_sha`), served ONLY on acceptance stages (E31.18 / #1569) — the runner's pre-spawn target-identity gate compares the declared target's `/healthz` `git_sha` against it. Absent on every other stage type and when ledger resolution fails (the runner then warns-and-proceeds as unverifiable).
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':

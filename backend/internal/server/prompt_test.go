@@ -2917,6 +2917,21 @@ func TestResolveFixupExpectedHeadSHA_ReadErrorOmitsField(t *testing.T) {
 	}
 }
 
+// TestResolveAcceptanceExpectedHeadSHA_ReadErrorOmitsField: the E31.18
+// merge-candidate resolver shares the best-effort posture — a
+// ListForRunByCategory failure must WARN and return "" (the runner's
+// identity gate then degrades to unverifiable-warn) rather than failing
+// the acceptance dispatch.
+func TestResolveAcceptanceExpectedHeadSHA_ReadErrorOmitsField(t *testing.T) {
+	s := New(Config{
+		Addr:      "127.0.0.1:0",
+		AuditRepo: &feedbackAuditRepo{listErr: errors.New("audit store unavailable")},
+	})
+	if got := s.resolveAcceptanceExpectedHeadSHA(context.Background(), uuid.New(), uuid.New()); got != "" {
+		t.Errorf("resolveAcceptanceExpectedHeadSHA = %q, want empty on a ledger read error", got)
+	}
+}
+
 // TestGetStagePrompt_Implement_FixupDecomposedChild_SliceBranch covers the
 // decomposed-child fix-up branch form after ADR-041 (#1246): a child's work
 // lives on its per-slice sole-writer branch
@@ -6169,9 +6184,83 @@ func TestGetStagePrompt_Acceptance_NoEgressSpec_HostsOmitted(t *testing.T) {
 	}
 }
 
+// TestGetStagePrompt_Acceptance_ServesExpectedHeadSHA pins the E31.18 (#1569)
+// merge-candidate wire field: an acceptance-stage prompt response carries
+// acceptance_expected_head_sha resolved as the NEWEST head_sha across the
+// run's reported-head ledger categories (here the fixup_pushed head, not the
+// older pull_request_opened one — the same newest-entry pick as
+// fixup_expected_head_sha, #967). The raw-body check pins the json tag
+// byte-identical to the runner's upload.FetchedPrompt decoder.
+func TestGetStagePrompt_Acceptance_ServesExpectedHeadSHA(t *testing.T) {
+	s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+	au := s.cfg.AuditRepo.(*auditFake)
+	au.seeded = append(au.seeded,
+		makeReportedHeadEntry(runID, acceptanceStageID, "pull_request_opened",
+			"aaaa000000000000000000000000000000000000", time.Now().Add(-2*time.Hour)),
+		makeReportedHeadEntry(runID, acceptanceStageID, "fixup_pushed",
+			"bbbb111111111111111111111111111111111111", time.Now().Add(-1*time.Hour)),
+	)
+	w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if want := "bbbb111111111111111111111111111111111111"; resp.AcceptanceExpectedHeadSHA != want {
+		t.Errorf("acceptance_expected_head_sha = %q, want %q (the newest reported head)",
+			resp.AcceptanceExpectedHeadSHA, want)
+	}
+	// Pin the wire tag byte-identical to the runner decoder.
+	if want := `"acceptance_expected_head_sha":"bbbb111111111111111111111111111111111111"`; !strings.Contains(w.Body.String(), want) {
+		t.Errorf("response missing wire tag %s:\n%s", want, w.Body.String())
+	}
+}
+
+// TestGetStagePrompt_Acceptance_EmptyLedger_ExpectedHeadSHAOmitted pins the
+// WARN-and-omit posture: an acceptance stage on a run with NO reported-head
+// ledger entries omits acceptance_expected_head_sha entirely (omitempty), so
+// the runner's identity gate degrades to unverifiable-warn rather than
+// comparing against an empty expectation.
+func TestGetStagePrompt_Acceptance_EmptyLedger_ExpectedHeadSHAOmitted(t *testing.T) {
+	s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+	w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), `"acceptance_expected_head_sha":`) {
+		t.Errorf("acceptance_expected_head_sha must be omitted on an empty reported-head ledger:\n%s", w.Body.String())
+	}
+}
+
+// TestGetStagePromptRender_Acceptance_ServesExpectedHeadSHA pins the SPA
+// render handler carries the SAME merge-candidate field — the two handlers
+// duplicate response construction, so the E31.18 resolution must land in both
+// (or the rendered view silently diverges from the runner path).
+func TestGetStagePromptRender_Acceptance_ServesExpectedHeadSHA(t *testing.T) {
+	s, runID, acceptanceStageID, _, _ := newAcceptancePromptServer(t)
+	au := s.cfg.AuditRepo.(*auditFake)
+	au.seeded = append(au.seeded,
+		makeReportedHeadEntry(runID, acceptanceStageID, "pull_request_opened",
+			"cccc222222222222222222222222222222222222", time.Now().Add(-1*time.Hour)),
+	)
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt-render", acceptanceStageID), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if want := `"acceptance_expected_head_sha":"cccc222222222222222222222222222222222222"`; !strings.Contains(w.Body.String(), want) {
+		t.Errorf("rendered response missing wire tag %s:\n%s", want, w.Body.String())
+	}
+}
+
 // TestGetStagePrompt_NonAcceptanceStages_OmitAcceptanceFields pins the
 // omitempty contract: plan and implement prompt responses carry NEITHER
-// egress_target_hosts NOR acceptance_criteria_ids, so every pre-E31.7 response
+// egress_target_hosts NOR acceptance_criteria_ids (nor the E31.18
+// acceptance_expected_head_sha), so every pre-E31.7 response
 // stays byte-identical.
 func TestGetStagePrompt_NonAcceptanceStages_OmitAcceptanceFields(t *testing.T) {
 	for _, stageType := range []run.StageType{run.StageTypePlan, run.StageTypeImplement} {
@@ -6195,7 +6284,7 @@ func TestGetStagePrompt_NonAcceptanceStages_OmitAcceptanceFields(t *testing.T) {
 			if w.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 			}
-			for _, banned := range []string{`"egress_target_hosts":`, `"acceptance_criteria_ids":`} {
+			for _, banned := range []string{`"egress_target_hosts":`, `"acceptance_criteria_ids":`, `"acceptance_expected_head_sha":`} {
 				if strings.Contains(w.Body.String(), banned) {
 					t.Errorf("%s response must not carry %s:\n%s", stageType, banned, w.Body.String())
 				}
