@@ -2748,6 +2748,155 @@ func TestParse_RoutesV11Spec(t *testing.T) {
 	}
 }
 
+// TestParse_V13Egress_OnAcceptanceStage_Valid asserts the v1.3 egress
+// allowance (ADR-050 / #1532) parses and validates on an acceptance stage
+// and that the declared hosts decode faithfully — including a host:port
+// entry — through the typed StageEgress.
+func TestParse_V13Egress_OnAcceptanceStage_Valid(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`
+version: "1.3"
+workflows:
+  feature_change:
+    stages:
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+        egress:
+          target_hosts:
+            - staging.example.com
+            - preview.internal.example.com:8443
+`))
+	if err != nil {
+		t.Fatalf("ParseBytes(v1.3 egress): %v", err)
+	}
+	st := s.Workflows["feature_change"].Stages[0]
+	if st.Egress == nil {
+		t.Fatal("Egress = nil, want decoded StageEgress")
+	}
+	want := []string{"staging.example.com", "preview.internal.example.com:8443"}
+	if len(st.Egress.TargetHosts) != len(want) {
+		t.Fatalf("TargetHosts = %v, want %v", st.Egress.TargetHosts, want)
+	}
+	for i, h := range want {
+		if st.Egress.TargetHosts[i] != h {
+			t.Errorf("TargetHosts[%d] = %q, want %q", i, st.Egress.TargetHosts[i], h)
+		}
+	}
+}
+
+// TestParse_V13Egress_OnImplementStage_Rejected asserts the new binding
+// fires: the egress allowance is acceptance-stage-only, so an implement
+// stage declaring it is rejected with the ADR-050 message.
+func TestParse_V13Egress_OnImplementStage_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.3"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        egress:
+          target_hosts:
+            - staging.example.com
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Message, "egress allowance is valid only on an acceptance stage") {
+		t.Errorf("message = %q, want it to flag egress on a non-acceptance (implement) stage", ve.Message)
+	}
+}
+
+// TestParse_V13Egress_OnDeployStage_Rejected asserts the same binding on
+// the other non-acceptance stage type: a deploy stage (otherwise valid
+// with its delegating executor) declaring egress is rejected.
+func TestParse_V13Egress_OnDeployStage_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.3"
+workflows:
+  release:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+        egress:
+          target_hosts:
+            - staging.example.com
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Message, "egress allowance is valid only on an acceptance stage") {
+		t.Errorf("message = %q, want it to flag egress on a non-acceptance (deploy) stage", ve.Message)
+	}
+}
+
+// TestParse_V13Egress_EmptyHosts_SchemaRejected asserts the schema floor:
+// a declared egress block must carry at least one host (minItems 1) — an
+// empty allowance is a contradiction, not a default-deny declaration.
+func TestParse_V13Egress_EmptyHosts_SchemaRejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.3"
+workflows:
+  feature_change:
+    stages:
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+        egress:
+          target_hosts: []
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError (minItems)", err)
+	}
+}
+
+// TestParse_V13Egress_URLEntry_SchemaRejected asserts entries are hosts,
+// not URLs: a scheme-carrying entry fails the schema pattern so egress
+// declarations cannot smuggle scheme/path semantics into the allow-list.
+func TestParse_V13Egress_URLEntry_SchemaRejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.3"
+workflows:
+  feature_change:
+    stages:
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+        egress:
+          target_hosts:
+            - https://staging.example.com
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError (host pattern)", err)
+	}
+}
+
+// TestParse_RoutesV13Spec proves a bare version "1.3" spec routes to the
+// v1 schema (minor is not routing-significant) and validates — the
+// additive 1.3 minor-bump routing done-means.
+func TestParse_RoutesV13Spec(t *testing.T) {
+	s, err := spec.ParseBytes(minimalSpecAtVersion("1.3"))
+	if err != nil {
+		t.Fatalf("ParseBytes(version 1.3): %v", err)
+	}
+	if s.Version != "1.3" {
+		t.Errorf("version = %q, want 1.3", s.Version)
+	}
+}
+
 // TestEmbeddedSchemaHashV1 proves the v1 hash advertised on /healthz is
 // a non-empty hex string distinct from the v0 hash (the two schemas
 // differ by $id/title/version enum, so their hashes must differ).

@@ -1286,11 +1286,12 @@ func buildAcceptance(t Trigger) string {
 	// checklist the validator judges the running instance against.
 	writeAcceptanceCriteriaForAcceptance(&b, t.ApprovedPlan)
 
-	// Target instance section. The URL's value source (the workflow-spec
-	// egress-allowance grammar) is owned by the unlanded human-led E31.4/#1532
-	// (ADR-050 decision #1). Until that lands TargetInstanceURL is empty and we
+	// Target instance section. The value is the acceptance stage's first
+	// spec-declared egress target host (the E31.4/#1532 egress-allowance
+	// grammar, ADR-050 decision #1), rendered verbatim as host or host:port.
+	// A spec with no egress block leaves TargetInstanceURL empty and we
 	// render an explicit not-declared line rather than a silent omission, so
-	// the interim state is self-diagnosing.
+	// that state is self-diagnosing.
 	b.WriteString("### Target instance\n\n")
 	if t.TargetInstanceURL != "" {
 		b.WriteString("Target instance URL: ")
