@@ -1307,6 +1307,43 @@ func TestLatestAcceptanceSignals(t *testing.T) {
 		t.Errorf("latestAcceptanceTriageDisposition = %q, want paged", d)
 	}
 
+	// Cross-attempt correlation (the #1537 fix-up edge): with multiple
+	// acceptance attempts in the window, a FRESH failed verdict whose triage
+	// has not landed yet must NOT inherit the STALE disposition of an earlier
+	// failure. Time-descending: newest failed outcome (attempt B), then the
+	// older attempt A's triage + outcome. The stale "paged" sits BELOW the
+	// newest verdict, so it belongs to attempt A and must be ignored -> "".
+	staleTriage := []AuditEntry{
+		outcome("failed"), // attempt B: fresh verdict, no triage yet
+		triage("paged"),   // attempt A: older triage — must NOT win
+		outcome("failed"), // attempt A: older verdict
+	}
+	if v := latestAcceptanceVerdict(staleTriage); v != "failed" {
+		t.Errorf("verdict over stale triage = %q, want failed (newest)", v)
+	}
+	if d := latestAcceptanceTriageDisposition(staleTriage); d != "" {
+		t.Errorf("disposition over stale triage = %q, want empty (uncorrelated, older attempt)", d)
+	}
+
+	// Correlation picks the triage NEWER than the newest verdict, skipping an
+	// older attempt's triage: attempt B has both a fresh verdict and a fresh
+	// retry_dispatched triage; attempt A's stale "paged" must be ignored.
+	correlated := []AuditEntry{
+		triage("retry_dispatched"), // attempt B: fresh triage — must win
+		outcome("failed"),          // attempt B: fresh verdict
+		triage("paged"),            // attempt A: older triage
+		outcome("failed"),          // attempt A: older verdict
+	}
+	if d := latestAcceptanceTriageDisposition(correlated); d != "retry_dispatched" {
+		t.Errorf("correlated disposition = %q, want retry_dispatched (newest attempt)", d)
+	}
+
+	// A triage entry with NO verdict in the window is uncorrelated -> "" (the
+	// classifier is in its defensive read arm when the verdict is absent).
+	if d := latestAcceptanceTriageDisposition([]AuditEntry{triage("paged")}); d != "" {
+		t.Errorf("disposition with no verdict = %q, want empty", d)
+	}
+
 	// Absent categories -> "".
 	if v := latestAcceptanceVerdict([]AuditEntry{{Category: "pr_merged"}}); v != "" {
 		t.Errorf("verdict on absent category = %q, want empty", v)
@@ -1326,8 +1363,12 @@ func TestLatestAcceptanceSignals(t *testing.T) {
 			t.Errorf("malformed[%d] verdict = %q, want empty", i, v)
 		}
 	}
+	// A correlated triage (newer than the verdict) with a malformed payload must
+	// still yield "" without panic — the verdict entry keeps it past the
+	// correlation short-circuit into the payload parse.
 	if d := latestAcceptanceTriageDisposition([]AuditEntry{
 		{Category: "acceptance_triage_decided", Payload: []any{1, 2, 3}},
+		{Category: "acceptance_outcome_recorded", Payload: map[string]any{"verdict": "failed"}},
 	}); d != "" {
 		t.Errorf("malformed disposition = %q, want empty", d)
 	}

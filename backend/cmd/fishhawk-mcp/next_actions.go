@@ -1045,13 +1045,39 @@ func latestAcceptanceVerdict(recent []AuditEntry) string {
 	return ""
 }
 
-// latestAcceptanceTriageDisposition returns the disposition on the newest
-// acceptance_triage_decided audit entry in the recent slice, or "" when none is
-// present or the payload is malformed.
+// latestAcceptanceTriageDisposition returns the triage disposition CORRELATED
+// with the newest acceptance_outcome_recorded verdict — NOT merely the newest
+// acceptance_triage_decided entry. The backend WRITES the triage decision AFTER
+// the outcome it triages, so for a given attempt the triage entry sits ABOVE
+// (newer than / a lower index than) its verdict in the time-descending recent
+// slice. This function therefore finds the newest verdict entry and returns the
+// newest triage disposition that is strictly NEWER than it (index <
+// verdictIdx); a triage entry at or below the newest verdict belongs to an
+// OLDER acceptance attempt and is deliberately ignored.
+//
+// This correlation is load-bearing: with multiple acceptance attempts in the
+// recent window, a fresh failed verdict whose triage decision has not landed
+// yet would otherwise inherit the STALE disposition of an earlier failure —
+// surfacing acceptance_triage_paged / acceptance_triage_rerouting off the wrong
+// attempt. Refusing the stale entry makes acceptanceStageNextActions fall to
+// the poll/read arm (empty disposition on a failed verdict → rerouting) until
+// the matching triage entry appears. Returns "" when no verdict is present
+// (the classifier is in its defensive read arm anyway), no correlated triage
+// exists yet, or the payload is malformed.
 func latestAcceptanceTriageDisposition(recent []AuditEntry) string {
-	for _, e := range recent {
-		if e.Category == auditCategoryAcceptanceTriageDecided {
-			return acceptancePayloadString(e.Payload, "disposition")
+	verdictIdx := -1
+	for i, e := range recent {
+		if e.Category == auditCategoryAcceptanceOutcomeRecorded {
+			verdictIdx = i
+			break
+		}
+	}
+	if verdictIdx < 0 {
+		return ""
+	}
+	for i := 0; i < verdictIdx; i++ {
+		if recent[i].Category == auditCategoryAcceptanceTriageDecided {
+			return acceptancePayloadString(recent[i].Payload, "disposition")
 		}
 	}
 	return ""

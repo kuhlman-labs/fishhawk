@@ -1170,11 +1170,14 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	// off the same `recent` slice and gates the succeeded_merged state.
 	mergeObserved := mergeObservedIn(recent)
 	// Acceptance signals (E31.9): the newest acceptance_outcome_recorded verdict
-	// and acceptance_triage_decided disposition, read off the SAME recent slice
-	// (the mergeObservedIn idiom) — a FAILED verdict leaves the acceptance stage
-	// succeeded, so the classifier must read the audit payloads, not the stage
-	// state. Empty when the run declares no acceptance stage or the entries aged
-	// out of the window (the defensive arm covers that).
+	// and the acceptance_triage_decided disposition CORRELATED with it (the
+	// triage entry newer than that verdict — see latestAcceptanceTriageDisposition;
+	// a stale disposition from an earlier attempt must NOT pair with a fresh
+	// verdict), read off the SAME recent slice (the mergeObservedIn idiom) — a
+	// FAILED verdict leaves the acceptance stage succeeded, so the classifier
+	// must read the audit payloads, not the stage state. Empty when the run
+	// declares no acceptance stage or the entries aged out of the window (the
+	// defensive arm covers that).
 	acceptanceVerdict := latestAcceptanceVerdict(recent)
 	acceptanceTriageDisposition := latestAcceptanceTriageDisposition(recent)
 	nextActions := nextActionsFor(runRow, stages, planReviewStatus, implementReviewStatus, reviewActionHint, view.driveStatus(), mergeObserved, acceptanceVerdict, acceptanceTriageDisposition)
