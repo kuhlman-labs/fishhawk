@@ -48,13 +48,29 @@ type Invocation struct {
 	// defaults; the workflow spec can override them per stage.
 	Budget Budget
 
+	// BaseEnv, when non-nil, REPLACES the os.Environ() seed for the
+	// child process env: adapters seed cmd.Env from exactly these
+	// "KEY=value" entries instead of inheriting the runner's full
+	// environment. The API-key overlay and the Env overlays below
+	// still apply on top, in the existing order, so the model key
+	// keeps working. A NIL BaseEnv preserves today's
+	// inherit-parent-env behavior byte-for-byte; a non-nil EMPTY
+	// slice means "start from an empty env" — the default-deny
+	// posture. Used by the acceptance stage (ADR-050 / #1535) to
+	// hand the agent the minimized runner/internal/acceptenv set
+	// instead of the full runner env. It applies only at the seed
+	// point: a Cmd builder that pre-sets a non-nil cmd.Env (the
+	// test seam) keeps its env, exactly as with the os.Environ()
+	// seed today. Adapters must not mutate the slice.
+	BaseEnv []string
+
 	// Env carries additional environment variables to layer onto
 	// the child process. The harness seeds the child env from
-	// os.Environ() first, then overlays these; later keys win.
-	// Used by the runner (E19.8 / #348) to pass the MCP token +
-	// backend URL so the agent can call the Fishhawk MCP server
-	// mid-execution. Empty / nil is fine — the child inherits the
-	// parent env unchanged.
+	// os.Environ() (or BaseEnv when non-nil) first, then overlays
+	// these; later keys win. Used by the runner (E19.8 / #348) to
+	// pass the MCP token + backend URL so the agent can call the
+	// Fishhawk MCP server mid-execution. Empty / nil is fine — the
+	// child inherits the seed env unchanged.
 	Env map[string]string
 
 	// Model is the resolved implement model id the backend chose via the
