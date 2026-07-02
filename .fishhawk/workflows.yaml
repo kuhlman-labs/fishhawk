@@ -11,7 +11,7 @@
 # When the product can execute this spec, the syntax may be revised to
 # match the frozen v0 schema. The intent expressed here will not change.
 
-version: "1.0"
+version: "1.3"
 
 roles:
   founder:
@@ -21,11 +21,15 @@ roles:
 workflows:
 
   # Medium autonomy — the default for most product work.
-  # Agent implements; human approves the plan; human approves the PR.
+  # Agent implements; human approves the plan; human approves the PR; the
+  # acceptance agent validates the merged-candidate against the plan's
+  # acceptance_criteria before the human-gated merge (ADR-049, E31).
   feature_change:
     description: >-
-      Default workflow for feature work and non-trivial changes.
-      Human approves plan and PR; agent does the implementation.
+      Default workflow for feature work and non-trivial changes, extended with
+      a runner-hosted advisory acceptance stage (ADR-049). Human approves plan
+      and PR; agent implements; the acceptance agent validates the running
+      instance against the approved plan's acceptance_criteria.
     # Drive mode (#1023): fishhawkd auto-advances mechanical transitions
     # (review settlement, fixup re-park, derived awaiting_merge) and
     # surfaces next_action; judgment points still park for the human.
@@ -181,6 +185,45 @@ workflows:
           - type: approval
             approvers:
               any_of: [founder]
+
+      # Runner-hosted advisory acceptance stage (ADR-049 / #1519, E31). It
+      # rides the ordinary agent executor branch — never `delegate` (deploy-
+      # only) — and carries no pre-flight deploy constraint or `deployment`
+      # artifact. The acceptance agent validates the RUNNING preview instance
+      # against the approved plan's `verification.acceptance_criteria` and ships
+      # a signed verdict to POST /v0/runs/{run_id}/acceptance. A failed verdict
+      # leaves the stage `succeeded` and routes through deterministic server-
+      # side triage (class 1 → fix-up, class 2 → acceptance re-run, class 3/4 →
+      # paged); the merge stays gated on the acceptance_passed condition
+      # (ADR-049 decision #6, operator-loop next_actions — not a hard spec gate).
+      # Verbatim from docs/spec/examples/workflow-v1-acceptance.yaml (E31.10).
+      - id: acceptance
+        type: acceptance
+        executor:
+          # An acceptance stage MUST use an agent (or human) executor.
+          agent: claude-code
+        inputs:
+          - artifact: plan
+            from_stage: plan
+          - artifact: pull_request
+            from_stage: implement
+        # Egress allowance (v1.3, ADR-050 / #1532): the single customer-declared
+        # slot of the acceptance agent's default-deny egress allow-list. Points
+        # at the local dogfood preview (scripts/dev k8s / docker-compose). The
+        # runner adds the model API endpoint and the Fishhawk backend itself;
+        # they are not declarable here. Hosts, not URLs — no scheme, no path.
+        egress:
+          target_hosts:
+            - localhost:8080
+        # Durable acceptance-evidence record (v1.2, ADR-049 / #1531): the
+        # verdict + per-criterion results + content-hash refs to evidence blobs.
+        # Valid ONLY on an acceptance stage.
+        produces:
+          - artifact: acceptance
+        budget:
+          max_tokens: 200000
+          max_runtime_minutes: 20
+          enforcement: advisory
 
   # Low autonomy — human-led work.
   # Used for cryptographic, policy, and audit-integrity surfaces.
