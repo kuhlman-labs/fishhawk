@@ -367,3 +367,48 @@ func TestClarificationQuestionCount(t *testing.T) {
 		t.Errorf("garbled payload count = %d, want 0", n)
 	}
 }
+
+// acceptanceTriageEntry builds an acceptance_triage_decided audit entry with
+// the given class + disposition.
+func acceptanceTriageEntry(seq int64, class, disposition string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{"class": class, "disposition": disposition})
+	return &audit.Entry{Sequence: seq, Category: "acceptance_triage_decided", Payload: payload}
+}
+
+// TestPageClassEvents_AcceptanceTriage covers the E31.8 (#1536) page-class
+// ping: the human-needed dispositions each fire exactly one ping naming the
+// class + disposition, while the auto-routed dispositions fire none.
+func TestPageClassEvents_AcceptanceTriage(t *testing.T) {
+	pagedDispositions := []string{
+		"paged", "rerun_budget_exhausted",
+		"fixup_unavailable_paged", "retry_unavailable_paged", "unsettled_paged",
+	}
+	for _, disp := range pagedDispositions {
+		entries := []*audit.Entry{acceptanceTriageEntry(9, "3", disp)}
+		got := pageClassEvents(entries, nil)
+		if len(got) != 1 {
+			t.Fatalf("disposition %q: events = %d, want 1", disp, len(got))
+		}
+		if got[0].kind != "acceptance_triage" {
+			t.Errorf("disposition %q: kind = %q, want acceptance_triage", disp, got[0].kind)
+		}
+		for _, want := range []string{"class-3", disp} {
+			if !strings.Contains(got[0].message, want) {
+				t.Errorf("disposition %q: message %q missing %q", disp, got[0].message, want)
+			}
+		}
+	}
+
+	// Auto-routed dispositions stay edit-only (the fixup/retry surfaces render).
+	for _, disp := range []string{"fixup_dispatched", "retry_dispatched"} {
+		entries := []*audit.Entry{acceptanceTriageEntry(9, "1", disp)}
+		if got := pageClassEvents(entries, nil); len(got) != 0 {
+			t.Errorf("disposition %q must not page; got %+v", disp, got)
+		}
+	}
+
+	// A malformed / empty payload fires no ping.
+	if got := pageClassEvents([]*audit.Entry{{Sequence: 9, Category: "acceptance_triage_decided"}}, nil); len(got) != 0 {
+		t.Errorf("empty payload must not page; got %+v", got)
+	}
+}

@@ -173,6 +173,21 @@ func pageClassEvents(entries []*audit.Entry, stages []*run.Stage) []pageEvent {
 				kind:     "ci_retry_exhausted",
 				message:  "❌ CI failed and the auto-retry budget is exhausted — needs a human.",
 			})
+		case "acceptance_triage_decided":
+			// E31.8 (#1536): a failed acceptance verdict was triaged. Ping ONLY
+			// for the human-needed dispositions (a paged variant) — the
+			// auto-routed fixup_dispatched / retry_dispatched dispositions stay
+			// edit-only, since the fixup/retry surfaces already render. Otherwise
+			// silent on anchor edits, so a paged disposition gets a ping naming
+			// the class + disposition the human must act on.
+			if class, disposition, ok := acceptanceTriageNeedsHuman(e.Payload); ok {
+				out = append(out, pageEvent{
+					sequence: e.Sequence,
+					kind:     "acceptance_triage",
+					message: fmt.Sprintf("🔎 Acceptance triage — class-%s: %s — your decision is needed.",
+						class, disposition),
+				})
+			}
 		}
 	}
 	// Deterministic, oldest-first ordering regardless of the order the
@@ -302,6 +317,33 @@ func campaignGatePagedPhrase(pageEvent string) string {
 		return "a requirement needs your arbitration"
 	default:
 		return "a gate decision"
+	}
+}
+
+// acceptanceTriageNeedsHuman reads {class, disposition} from an
+// acceptance_triage_decided payload (E31.8 / #1536) and reports whether the
+// disposition is one that needs a human — the paged variants (paged,
+// rerun_budget_exhausted, and the *_paged routing-refusal fallbacks). The
+// auto-routed fixup_dispatched / retry_dispatched dispositions return ok=false
+// (they stay edit-only). ok=false on any decode failure or an unrecognized
+// disposition, so a malformed payload never fires a page-class ping.
+func acceptanceTriageNeedsHuman(payload []byte) (class, disposition string, ok bool) {
+	if len(payload) == 0 {
+		return "", "", false
+	}
+	var p struct {
+		Class       string `json:"class"`
+		Disposition string `json:"disposition"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return "", "", false
+	}
+	switch p.Disposition {
+	case "paged", "rerun_budget_exhausted",
+		"fixup_unavailable_paged", "retry_unavailable_paged", "unsettled_paged":
+		return p.Class, p.Disposition, true
+	default:
+		return "", "", false
 	}
 }
 

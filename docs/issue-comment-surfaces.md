@@ -10,7 +10,7 @@ it.
 | Surface | Audit category | Audit kind | Caller (production) | First posted | Edits in place? |
 |---|---|---|---|---|---|
 | Living anchor | `status_comment_posted` | `status_update` | `Dispatcher.Handle` (run create); `Server.notifyStatusUpdate` (every stage transition); `Server.notifyPlanReady` (plan-stage terminal) | run dispatch | Yes — one comment per run, every transition rebuilds + edits the same comment id |
-| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, advisory-reject arbitrated, must_page_human, clarification request / awaiting_input park, CI failure, campaign gate hand-off) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor |
+| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, advisory-reject arbitrated, must_page_human, clarification request / awaiting_input park, CI failure, acceptance triage paged, campaign gate hand-off) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor |
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
 | Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688, #1371) | crossing of an advisory periodic-budget ladder rung — `warn` / `over` / `ack_required` (≥2x) / `page` (≥3x) | No (per-`(period_start, tier)` dedup; each tier posts once per calendar period) |
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
@@ -114,6 +114,18 @@ Notes:
     payload; a malformed payload degrades to a count-free phrase). Deduped on
     the `clarification_requested` `Sequence`.
   - **CI failure** — `ci_failure_retry_dispatched` / `ci_retry_exhausted`.
+  - **Acceptance triage decision (E31.8, #1536)** — `acceptance_triage_decided`.
+    A failed acceptance verdict was triaged (`server/acceptance.go::triageAcceptanceFailure`)
+    and the disposition needs a human — the paged variants only (`paged`,
+    `rerun_budget_exhausted`, `fixup_unavailable_paged`, `retry_unavailable_paged`,
+    `unsettled_paged`). The auto-routed dispositions (`fixup_dispatched`,
+    `retry_dispatched`) stay **edit-only** — the fixup/retry surfaces already
+    render, so a ping there would double-notify. The paged variants are
+    otherwise silent on anchor edits, so they get a page-class ping: "🔎
+    Acceptance triage — class-`<class>`: `<disposition>` — your decision is
+    needed." (`ping.go::acceptanceTriageNeedsHuman` gates the ping on the
+    disposition; a malformed/empty payload fires none). Deduped on the
+    `acceptance_triage_decided` `Sequence`.
   - **Campaign gate hand-off (E25.7, #1446)** — `campaign_gate_paged`. The
     campaign auto-driver REFUSED a must_page_human gate (reviewer_reject /
     requirement_arbitration), paused the affected issue, and handed the gate to
@@ -546,11 +558,23 @@ Notes:
   Notifier method (the change that added the deploy kinds, PR #1395 / commit
   f227dbb, likewise never touched the notifier source). The payload tags
   (`{outcome, criteria_passed, criteria_total, class, disposition}`) DEFINE the
-  contract the future writers emit to: the E31.6 acceptance-outcome handler
-  writes `acceptance_dispatched` / `acceptance_outcome_recorded`, and the E31.8
-  triage writes `acceptance_triage_decided`. Both are forward references —
-  those handlers do not exist yet; this slice (E31.3) introduces the kinds as
-  render-only constants so the timeline is ready when the writers land.
+  contract the writers emit to: the E31.6 acceptance-outcome handler writes
+  `acceptance_dispatched` / `acceptance_outcome_recorded`, and the E31.8 triage
+  (`server/acceptance.go::triageAcceptanceFailure`, #1536) writes
+  `acceptance_triage_decided`. **`acceptance_triage_decided` is now WRITTEN by
+  E31.8** — one chained entry per triaged failed verdict, payload
+  `{run_id, stage_id, artifact_id, class, disposition, criterion_ids,
+  failure_mode, prior_routed_passes, reason}`. The **disposition vocabulary**
+  is a closed set: the auto-routed `fixup_dispatched` (class-1 → bounded
+  implement fix-up) / `retry_dispatched` (class-2 → acceptance-stage reopen);
+  and the human-paged `paged` (class-3/class-4) / `rerun_budget_exhausted` (the
+  per-run re-run cap of 2 hit) / `fixup_unavailable_paged` (a class-1 fix-up
+  route refused — budget/ceiling/not-applicable) / `retry_unavailable_paged` (a
+  class-2 reopen refused) / `unsettled_paged` (the acceptance stage was not yet
+  settled `succeeded` at ship time). The auto-routed dispositions stay
+  render-only edit surfaces; the paged variants ALSO fire the page-class ping
+  registered above. The class-3 entry keyed by `criterion_ids` is the durable
+  per-criterion disposition record E31.11 consumes.
 - The bounded-retry give-up audit kind — `slice_integration_failed` (#1243) —
   is a **system-actor audit kind with no dedicated Notifier method and is NOT
   an issue-comment surface**. The child-completion sweeper
