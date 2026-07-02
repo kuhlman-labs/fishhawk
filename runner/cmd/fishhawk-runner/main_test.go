@@ -3572,7 +3572,7 @@ func withPRDescriptionPath(t *testing.T) string {
 
 func TestPRTitleAndBody_AgentAuthored_HappyPath(t *testing.T) {
 	path := withPRDescriptionPath(t)
-	if err := os.WriteFile(path, []byte("Add make minio-init target\n\n## Why\n\nLocal stack needed a bucket-init step.\n\nCloses #184\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("feat(make): add minio-init target\n\n## Why\n\nLocal stack needed a bucket-init step.\n\nCloses #184\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config{
@@ -3582,7 +3582,7 @@ func TestPRTitleAndBody_AgentAuthored_HappyPath(t *testing.T) {
 	}
 	var stderr strings.Builder
 	title, body := prTitleAndBody(cfg, "fishhawk/run-x/stage-y", &stderr)
-	if title != "Add make minio-init target" {
+	if title != "feat(make): add minio-init target" {
 		t.Errorf("title = %q, want agent's first line", title)
 	}
 	if !strings.Contains(body, "## Why") {
@@ -3655,8 +3655,8 @@ func TestPRTitleAndBody_FallbackWhenFileMissing(t *testing.T) {
 		stageID:    "22222222-3333-4444-5555-666666666666",
 		backendURL: "https://api.fishhawk.test",
 	}, "fishhawk/run-x/stage-y", &stderr)
-	if !strings.HasPrefix(title, "Fishhawk: implement stage") {
-		t.Errorf("fallback title should use the generic template, got %q", title)
+	if !strings.HasPrefix(title, "chore: fishhawk implement stage") {
+		t.Errorf("fallback title should use the conventional-shaped template, got %q", title)
 	}
 	if !strings.Contains(body, "Opened by Fishhawk for run") {
 		t.Errorf("fallback body should use the generic template:\n%s", body)
@@ -3676,7 +3676,7 @@ func TestPRTitleAndBody_FallbackWhenFileEmpty(t *testing.T) {
 	title, _ := prTitleAndBody(config{
 		runID: "r", stageID: "s", backendURL: "https://x",
 	}, "branch", &stderr)
-	if !strings.HasPrefix(title, "Fishhawk:") {
+	if !strings.HasPrefix(title, "chore: fishhawk implement stage") {
 		t.Errorf("empty file should fall back, got title %q", title)
 	}
 	if !strings.Contains(stderr.String(), "pr_template_invalid") {
@@ -3694,7 +3694,7 @@ func TestPRTitleAndBody_FallbackWhenTitleEmpty(t *testing.T) {
 	title, _ := prTitleAndBody(config{
 		runID: "r", stageID: "s", backendURL: "https://x",
 	}, "branch", &stderr)
-	if !strings.HasPrefix(title, "Fishhawk:") {
+	if !strings.HasPrefix(title, "chore: fishhawk implement stage") {
 		t.Errorf("empty-title file should fall back, got title %q", title)
 	}
 	if !strings.Contains(stderr.String(), "pr_template_invalid") {
@@ -5192,6 +5192,11 @@ func TestRun_ImplementStage_Fixup_CommitsToExistingBranch(t *testing.T) {
 	if !fp.gotArgs.RebaseFromRemote {
 		t.Error("RebaseFromRemote = false, want true (fix-up rebases the existing PR branch)")
 	}
+	// The agent wrote no commit-message sidecar, so the fix-up commit falls back
+	// to the conventional per-pass fallback keyed by the pass's base tip (#1572).
+	if !strings.HasPrefix(fp.gotArgs.CommitMessage, "chore: fishhawk fixup stage 22222222 (base ") {
+		t.Errorf("fix-up commit message should use the conventional per-pass fallback, got %q", fp.gotArgs.CommitMessage)
+	}
 	// A fix-up updates the open PR; it must not open a new one or ship a
 	// fresh pull_request artifact.
 	if fpr.gotArgs != nil {
@@ -5218,6 +5223,70 @@ func TestRun_ImplementStage_Fixup_CommitsToExistingBranch(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), `"event":"implement_fixup_push_reported"`) {
 		t.Errorf("missing implement_fixup_push_reported log line:\n%s", stderr.String())
+	}
+}
+
+// TestRun_ImplementStage_Fixup_ConsumesCommitMessageSidecar (#1572, mode 1 e2e):
+// the fix-up agent writes the per-pass commit-message sidecar DURING its invoke
+// (after the pre-invoke sweep); the runner plumbs its subject+body onto the
+// fix-up commit and deletes the file after read.
+func TestRun_ImplementStage_Fixup_ConsumesCommitMessageSidecar(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+
+	dir := t.TempDir()
+	origDir := fixupCommitMessageDir
+	fixupCommitMessageDir = dir
+	t.Cleanup(func() { fixupCommitMessageDir = origDir })
+	const runID = "11111111-2222-3333-4444-555555555555"
+	const stageID = "22222222-3333-4444-5555-666666666666"
+	msgPath := fixupCommitMessagePath(runID, stageID)
+	inv := &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(_ int, _ agent.Invocation) {
+			// The real agent writes this DURING the invoke, after the runner's
+			// pre-invoke sweep — model that here.
+			if err := os.WriteFile(msgPath,
+				[]byte("fix(runner): tighten the bound check\n\nGuards the off-by-one.\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	withFakeInvoker(t, inv)
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:     stageID,
+		StageType:   "implement",
+		Prompt:      "implement",
+		PromptHash:  "h",
+		Fixup:       true,
+		FixupBranch: "fishhawk/run-11111111/stage-22222222",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", runID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", stageID,
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush not called")
+	}
+	want := "fix(runner): tighten the bound check\n\nGuards the off-by-one."
+	if fp.gotArgs.CommitMessage != want {
+		t.Errorf("fix-up commit message = %q, want the sidecar's subject+body %q", fp.gotArgs.CommitMessage, want)
+	}
+	// Delete-after-read: the sidecar must be consumed.
+	if _, err := os.Stat(msgPath); !os.IsNotExist(err) {
+		t.Errorf("commit-message sidecar must be deleted after read, stat err = %v", err)
 	}
 }
 
@@ -12748,6 +12817,244 @@ func TestSweepStaleFixupSelfReport(t *testing.T) {
 	sweepStaleFixupSelfReport(cfg, &logSink2)
 	if logSink2.Len() != 0 {
 		t.Errorf("absent-sidecar sweep must be silent, got %q", logSink2.String())
+	}
+}
+
+// --- #1572 fix-up per-pass commit message --------------------------------
+
+func fixupCommitMsgCfg() config {
+	return config{runID: "run-cccc", stageID: "stage-dddd"}
+}
+
+// writeFixupCommitMsgSidecar redirects fixupCommitMessageDir to a temp dir and
+// writes raw text to cfg's keyed fix-up commit-message path.
+func writeFixupCommitMsgSidecar(t *testing.T, cfg config, raw string) string {
+	t.Helper()
+	dir := t.TempDir()
+	orig := fixupCommitMessageDir
+	fixupCommitMessageDir = dir
+	t.Cleanup(func() { fixupCommitMessageDir = orig })
+	path := fixupCommitMessagePath(cfg.runID, cfg.stageID)
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestFixupCommitMessagePath_Format asserts the LITERAL runner-side path string
+// so a one-sided edit to either module's format string is caught (mirrors the
+// backend's TestFixupCommitMessagePath_Format — the prompt→runner seam).
+func TestFixupCommitMessagePath_Format(t *testing.T) {
+	orig := fixupCommitMessageDir
+	fixupCommitMessageDir = "/tmp"
+	t.Cleanup(func() { fixupCommitMessageDir = orig })
+	const runID = "11112222333344445555666677778888"
+	const stageID = "99990000aaaabbbbccccddddeeeeffff"
+	got := fixupCommitMessagePath(runID, stageID)
+	want := "/tmp/fishhawk-fixup-commitmsg-" + runID + "-" + stageID + ".txt"
+	if got != want {
+		t.Errorf("fixupCommitMessagePath = %q, want %q", got, want)
+	}
+}
+
+// TestLoadFixupCommitMessage_Absent (#1572): no sidecar → ok=false, no log.
+func TestLoadFixupCommitMessage_Absent(t *testing.T) {
+	cfg := fixupCommitMsgCfg()
+	dir := t.TempDir()
+	orig := fixupCommitMessageDir
+	fixupCommitMessageDir = dir
+	t.Cleanup(func() { fixupCommitMessageDir = orig })
+
+	var logSink strings.Builder
+	if _, _, ok := loadFixupCommitMessage(cfg, &logSink); ok {
+		t.Errorf("absent sidecar must yield ok=false")
+	}
+	if logSink.Len() != 0 {
+		t.Errorf("absent sidecar must not log, got %q", logSink.String())
+	}
+}
+
+// TestLoadFixupCommitMessage_Present (#1572, mode 1): a present sidecar yields
+// (subject, body) split on the first newline AND is deleted after read.
+func TestLoadFixupCommitMessage_Present(t *testing.T) {
+	cfg := fixupCommitMsgCfg()
+	path := writeFixupCommitMsgSidecar(t, cfg,
+		"fix: guard nil pool in retry path\n\nThe retry path dereferenced a nil pool.\n")
+	var logSink strings.Builder
+	subject, body, ok := loadFixupCommitMessage(cfg, &logSink)
+	if !ok {
+		t.Fatalf("present sidecar must yield ok=true")
+	}
+	if subject != "fix: guard nil pool in retry path" {
+		t.Errorf("subject = %q", subject)
+	}
+	if body != "The retry path dereferenced a nil pool." {
+		t.Errorf("body = %q", body)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("consumed sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadFixupCommitMessage_EmptyWhitespace (#1572, mode 4): an empty or
+// whitespace-only sidecar is treated as missing (ok=false) + fixup_commitmsg_empty,
+// and is removed.
+func TestLoadFixupCommitMessage_EmptyWhitespace(t *testing.T) {
+	for _, raw := range []string{"", "   \n\t\n"} {
+		cfg := fixupCommitMsgCfg()
+		path := writeFixupCommitMsgSidecar(t, cfg, raw)
+		var logSink strings.Builder
+		subject, body, ok := loadFixupCommitMessage(cfg, &logSink)
+		if ok || subject != "" || body != "" {
+			t.Errorf("empty sidecar %q must yield ok=false, got (%q,%q,%v)", raw, subject, body, ok)
+		}
+		if !strings.Contains(logSink.String(), `"event":"fixup_commitmsg_empty"`) {
+			t.Errorf("expected fixup_commitmsg_empty for %q, got %q", raw, logSink.String())
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("empty sidecar must be removed for %q, stat err = %v", raw, err)
+		}
+	}
+}
+
+// TestSweepStaleFixupCommitMessage (#1572, mode 2): a pre-existing keyed sidecar
+// is removed and fixup_commitmsg_swept logged; an absent one is a silent no-op.
+// This is the pre-invoke freshness defense that stops a prior pass's message
+// being reused by a pass whose agent writes no sidecar.
+func TestSweepStaleFixupCommitMessage(t *testing.T) {
+	cfg := fixupCommitMsgCfg()
+	path := writeFixupCommitMsgSidecar(t, cfg, "chore: leftover from a prior pass\n")
+
+	var logSink strings.Builder
+	sweepStaleFixupCommitMessage(cfg, &logSink)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("pre-existing sidecar must be swept, stat err = %v", err)
+	}
+	if !strings.Contains(logSink.String(), `"event":"fixup_commitmsg_swept"`) {
+		t.Errorf("expected fixup_commitmsg_swept, got %q", logSink.String())
+	}
+
+	var logSink2 strings.Builder
+	sweepStaleFixupCommitMessage(cfg, &logSink2)
+	if logSink2.Len() != 0 {
+		t.Errorf("absent-sidecar sweep must be silent, got %q", logSink2.String())
+	}
+}
+
+// TestFixupCommitMessage_SidecarPresent (#1572, mode 1): the resolver composes
+// subject + blank line + body from the sidecar.
+func TestFixupCommitMessage_SidecarPresent(t *testing.T) {
+	cfg := fixupCommitMsgCfg()
+	writeFixupCommitMsgSidecar(t, cfg, "fix(runner): guard nil pool\n\nDetail line.\n")
+	var logSink strings.Builder
+	got := fixupCommitMessage(cfg, "abcdef0123456789", &logSink)
+	want := "fix(runner): guard nil pool\n\nDetail line."
+	if got != want {
+		t.Errorf("fixupCommitMessage = %q, want %q", got, want)
+	}
+}
+
+// TestFixupCommitMessage_SidecarSubjectOnly (#1572): a subject-only sidecar
+// yields just the subject (no trailing blank line).
+func TestFixupCommitMessage_SidecarSubjectOnly(t *testing.T) {
+	cfg := fixupCommitMsgCfg()
+	writeFixupCommitMsgSidecar(t, cfg, "fix(runner): guard nil pool\n")
+	var logSink strings.Builder
+	got := fixupCommitMessage(cfg, "abcdef0123456789", &logSink)
+	if got != "fix(runner): guard nil pool" {
+		t.Errorf("fixupCommitMessage = %q, want subject only", got)
+	}
+}
+
+// TestFixupCommitMessage_FallbackMissing (#1572, mode 3): with no sidecar the
+// fallback is `chore: fishhawk fixup stage <id> (base <sha>)`, and two passes on
+// DIFFERENT base tips produce DISTINCT messages (per-pass uniqueness).
+func TestFixupCommitMessage_FallbackMissing(t *testing.T) {
+	dir := t.TempDir()
+	orig := fixupCommitMessageDir
+	fixupCommitMessageDir = dir
+	t.Cleanup(func() { fixupCommitMessageDir = orig })
+
+	cfg := config{runID: "run-cccc", stageID: "stage-dddd"}
+	const baseA = "aaaaaaaaaaaaaaaa"
+	const baseB = "bbbbbbbbbbbbbbbb"
+	var logSink strings.Builder
+	gotA := fixupCommitMessage(cfg, baseA, &logSink)
+	gotB := fixupCommitMessage(cfg, baseB, &logSink)
+	wantA := "chore: fishhawk fixup stage " + shortID(cfg.stageID) + " (base " + shortID(baseA) + ")"
+	if gotA != wantA {
+		t.Errorf("fallback A = %q, want %q", gotA, wantA)
+	}
+	if gotA == gotB {
+		t.Errorf("two passes on different base tips must produce distinct fallback messages, both = %q", gotA)
+	}
+}
+
+// TestFixupCommitMessage_FallbackOnEmpty (#1572, mode 4): an empty/whitespace
+// sidecar falls back to the conventional-shaped message (not the empty string).
+func TestFixupCommitMessage_FallbackOnEmpty(t *testing.T) {
+	cfg := config{runID: "run-cccc", stageID: "stage-dddd"}
+	const baseTip = "abcdef0123456789"
+	writeFixupCommitMsgSidecar(t, cfg, "   \n")
+	var logSink strings.Builder
+	got := fixupCommitMessage(cfg, baseTip, &logSink)
+	want := "chore: fishhawk fixup stage " + shortID(cfg.stageID) + " (base " + shortID(baseTip) + ")"
+	if got != want {
+		t.Errorf("empty sidecar fallback = %q, want %q", got, want)
+	}
+}
+
+// TestFixupCommitMessage_FallbackEmptyBaseTip (#1572): when the base tip is
+// unresolvable (the gitRevParseHEAD-failure degrade in openPRAndShipArtifact
+// passes ""), the fallback still renders a valid conventional header with an
+// empty base component rather than panicking or blocking.
+func TestFixupCommitMessage_FallbackEmptyBaseTip(t *testing.T) {
+	dir := t.TempDir()
+	orig := fixupCommitMessageDir
+	fixupCommitMessageDir = dir
+	t.Cleanup(func() { fixupCommitMessageDir = orig })
+
+	cfg := config{runID: "run-cccc", stageID: "stage-dddd"}
+	var logSink strings.Builder
+	got := fixupCommitMessage(cfg, "", &logSink)
+	want := "chore: fishhawk fixup stage " + shortID(cfg.stageID) + " (base )"
+	if got != want {
+		t.Errorf("empty-base-tip fallback = %q, want %q", got, want)
+	}
+}
+
+// TestPRTitleAndBody_NonConventionalTitle_WarnsAndUsesVerbatim (#1572, mode 5):
+// a non-conventional agent title emits pr_template_warning AND is used verbatim.
+func TestPRTitleAndBody_NonConventionalTitle_WarnsAndUsesVerbatim(t *testing.T) {
+	path := withPRDescriptionPath(t)
+	if err := os.WriteFile(path, []byte("Add a thing without a type prefix\n\n## Summary\n\nBody.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	title, _ := prTitleAndBody(config{runID: "r", stageID: "s", backendURL: "https://x"}, "branch", &stderr)
+	if title != "Add a thing without a type prefix" {
+		t.Errorf("non-conventional title must be used VERBATIM, got %q", title)
+	}
+	if !strings.Contains(stderr.String(), `"event":"pr_template_warning"`) ||
+		!strings.Contains(stderr.String(), "title is not a conventional-commit header") {
+		t.Errorf("expected conventional-header pr_template_warning, got %q", stderr.String())
+	}
+}
+
+// TestPRTitleAndBody_ConventionalTitle_NoWarning (#1572, mode 6): a conventional
+// agent title emits NO pr_template_warning.
+func TestPRTitleAndBody_ConventionalTitle_NoWarning(t *testing.T) {
+	path := withPRDescriptionPath(t)
+	if err := os.WriteFile(path, []byte("fix(runner): guard nil pool\n\n## Summary\n\nBody.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	title, _ := prTitleAndBody(config{runID: "r", stageID: "s", backendURL: "https://x"}, "branch", &stderr)
+	if title != "fix(runner): guard nil pool" {
+		t.Errorf("conventional title = %q", title)
+	}
+	if strings.Contains(stderr.String(), "pr_template_warning") {
+		t.Errorf("conventional title must not warn, got %q", stderr.String())
 	}
 }
 

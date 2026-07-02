@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -49,6 +50,14 @@ var autoGhCommand = exec.Command
 
 const autoPRFooter = "---\n*Opened automatically by Fishhawk.*"
 
+// conventionalCommitHeaderRe matches a Conventional Commits v1.0.0 header
+// (#1572): a lowercase type from the allowed set, an optional lowercase scope in
+// parens, an optional breaking-change `!`, then `: ` and a non-empty
+// description. Applied WARN-ONLY to the agent-authored PR title — a non-match
+// emits pr_template_warning and the title is used verbatim; it never rewrites
+// the title or fails. Mirrors the runner's conventionalCommitHeaderRe.
+var conventionalCommitHeaderRe = regexp.MustCompile(`^(feat|fix|docs|refactor|test|chore|perf|build)(\([a-z0-9/._-]+\))?!?: .+$`)
+
 // shortID strips hyphens from id.String() and returns the leading 8
 // hex characters. Matches the runner/internal/gitops convention.
 func shortID(id uuid.UUID) string {
@@ -80,9 +89,11 @@ type autoOpenPRResult struct {
 // path and returns the title and body. The first non-blank line is the
 // title; everything after the first blank separator line is the body.
 //
-// Falls back to a generated title ("Fishhawk: implement stage
+// Falls back to a generated title ("chore: fishhawk implement stage
 // <shortRunID>") and empty body when the file is missing or the first
 // line is whitespace-only. The attribution footer is always appended.
+// A non-conventional agent title is used verbatim but flagged with a
+// warn-only pr_template_warning (#1572).
 func parsePRDescriptionFile(path, runID string) (title, body string, err error) {
 	data, readErr := os.ReadFile(path)
 	if readErr != nil {
@@ -98,6 +109,16 @@ func parsePRDescriptionFile(path, runID string) (title, body string, err error) 
 	}
 
 	title = strings.TrimSpace(lines[0])
+
+	// Warn-only conventional-commit header check (#1572): the title doubles as
+	// the commit subject, so nudge agents toward the Conventional Commits v1.0.0
+	// shape. A non-match is advisory — emit pr_template_warning and use the title
+	// VERBATIM. Never a hard failure, never a rewrite. Mirrors the runner.
+	if !conventionalCommitHeaderRe.MatchString(title) {
+		_, _ = fmt.Fprintf(os.Stderr,
+			`{"event":"pr_template_warning","reason":%q,"path":%q}`+"\n",
+			"title is not a conventional-commit header", path)
+	}
 
 	// Skip the blank separator line following the title.
 	start := 1
@@ -122,7 +143,7 @@ func prFallbackTitle(runID string) string {
 	if len(s) > 8 {
 		s = s[:8]
 	}
-	return "Fishhawk: implement stage " + s
+	return "chore: fishhawk implement stage " + s
 }
 
 // autoOpenPR orchestrates the implement-stage PR flow:

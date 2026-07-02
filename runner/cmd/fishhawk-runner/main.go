@@ -884,6 +884,13 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// cannot bleed a stale claim into a fresh attempt. No-ops on every
 		// non-fix-up implement stage (the sidecar is fix-up-only).
 		sweepStaleFixupSelfReport(cfg, logSink)
+		// Pre-invoke fix-up commit-message sweep (#1572): delete any leftover
+		// commit-message sidecar at THIS run/stage's keyed path before the agent
+		// runs, so a pass whose agent never re-writes the file falls back to the
+		// conventional-shaped fallback rather than reusing the PRIOR pass's
+		// message. No-ops on every non-fix-up implement stage (the sidecar is
+		// fix-up-only).
+		sweepStaleFixupCommitMessage(cfg, logSink)
 	}
 
 	// Run()-level restore net (#953, the #941 residual): the restore defers
@@ -4881,6 +4888,23 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 
 	title, body := prTitleAndBody(cfg, branch, logSink)
 	commitMessage := title + "\n\n" + body
+	if isFixup {
+		// Per-pass fix-up commit message (#1572): a fix-up gets its own commit
+		// subject/body from the run/stage-keyed sidecar the fix-up agent wrote
+		// — NOT the PR title/body (the PR already exists and must not be
+		// clobbered). Falls back to a conventional-shaped, per-pass-unique
+		// subject keyed by the pass's base tip when the agent wrote no sidecar.
+		// HEAD here is the fix-up branch tip (checkoutFixupBase moved onto it and
+		// the agent commits nothing), so it is the base tip; a rev-parse failure
+		// degrades to an empty base component rather than blocking the commit.
+		baseTipSHA, rpErr := gitRevParseHEAD(ctx, repoDir)
+		if rpErr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"fixup_base_tip_unresolved","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+				cfg.runID, cfg.stageID, rpErr.Error())
+		}
+		commitMessage = fixupCommitMessage(cfg, baseTipSHA, logSink)
+	}
 
 	// Compile-gate the scope-only committed tree before push (#728), on every
 	// implement push including decomposed children (#766). A scope-bounded
@@ -6184,6 +6208,96 @@ func loadFixupSelfReport(cfg config, logSink io.Writer) string {
 	return doc.VerifyStatus
 }
 
+// fixupCommitMessageDir is the directory the run/stage-keyed fix-up commit-
+// message sidecar lives in (#1572). var (not const) so tests can redirect it to
+// a t.TempDir, avoiding /tmp pollution / parallel-test races — the same seam
+// pattern as fixupSelfReportDir.
+var fixupCommitMessageDir = "/tmp"
+
+// fixupCommitMessagePath mirrors prompt.FixupCommitMessagePath in the backend:
+// the run/stage-keyed path a fix-up agent writes its per-pass Conventional-
+// Commits commit message to and the runner reads it from (#1572). The format
+// string is hardcoded in both independent modules by design — the same
+// coordination as fixupSelfReportPath / FixupSelfReportPath.
+func fixupCommitMessagePath(runID, stageID string) string {
+	return filepath.Join(fixupCommitMessageDir, fmt.Sprintf("fishhawk-fixup-commitmsg-%s-%s.txt", runID, stageID))
+}
+
+// sweepStaleFixupCommitMessage deletes any leftover fix-up commit-message
+// sidecar at this run/stage's keyed path before the agent is invoked (#1572) —
+// the pre-invoke freshness defense mirroring sweepStaleFixupSelfReport. Without
+// it, a pass whose agent never re-writes the file would silently reuse the
+// PRIOR pass's message. Best-effort: a not-exist (the common case, including
+// every non-fix-up implement stage) is silent; a leftover actually removed
+// emits fixup_commitmsg_swept.
+func sweepStaleFixupCommitMessage(cfg config, logSink io.Writer) {
+	path := fixupCommitMessagePath(cfg.runID, cfg.stageID)
+	if rerr := os.Remove(path); rerr == nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"fixup_commitmsg_swept","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
+			cfg.runID, cfg.stageID, path)
+	}
+}
+
+// loadFixupCommitMessage reads the agent's fix-up commit-message sidecar (#1572)
+// and splits it into (subject, body). It deletes the file on EVERY return path
+// (delete-after-read) so a stale sidecar can never bleed into a later pass.
+// Returns ok=false when the sidecar is absent, unreadable, or empty/whitespace-
+// only — the fallback cases the caller resolves to a conventional-shaped
+// synthetic subject. On success the first line is the subject (the Conventional-
+// Commits header) and the remainder after it is the body.
+func loadFixupCommitMessage(cfg config, logSink io.Writer) (subject, body string, ok bool) {
+	path := fixupCommitMessagePath(cfg.runID, cfg.stageID)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		// Absent sidecar is the common no-op (the agent wrote nothing); any
+		// other read error is fail-closed too. Only an existing file's content
+		// can supply a message, so no log on the not-exist path.
+		return "", "", false
+	}
+	// A present sidecar is consumed regardless of outcome: remove it on every
+	// return path so a stale sidecar is never reused by a later pass.
+	defer func() { _ = os.Remove(path) }()
+
+	// TrimSpace strips leading/trailing whitespace (incl. leading blank lines),
+	// so an empty/whitespace-only sidecar is treated as missing (fallback wins).
+	text := strings.TrimSpace(strings.ReplaceAll(string(raw), "\r\n", "\n"))
+	if text == "" {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"fixup_commitmsg_empty","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
+			cfg.runID, cfg.stageID, path)
+		return "", "", false
+	}
+	// First line is the subject; the remainder after the first newline (leading
+	// blank lines trimmed) is the body. text is already TrimSpace'd, so the
+	// first line is non-empty.
+	lines := strings.SplitN(text, "\n", 2)
+	subject = strings.TrimSpace(lines[0])
+	if len(lines) == 2 {
+		body = strings.TrimSpace(lines[1])
+	}
+	return subject, body, true
+}
+
+// fixupCommitMessage resolves the commit message for a fix-up pass (#1572): the
+// agent-authored per-pass message from the run/stage-keyed sidecar (consumed +
+// deleted by loadFixupCommitMessage), falling back to a conventional-shaped,
+// per-pass-unique `chore: fishhawk fixup stage <id> (base <sha>)` when the
+// sidecar is absent/empty. baseTipSHA is the pass's base tip (HEAD before the
+// fix-up commit) — its short form makes the fallback unique per pass, since each
+// fix-up pass starts from a different base tip, so two passes never carry an
+// identical fallback subject.
+func fixupCommitMessage(cfg config, baseTipSHA string, logSink io.Writer) string {
+	if subject, body, ok := loadFixupCommitMessage(cfg, logSink); ok {
+		if body == "" {
+			return subject
+		}
+		return subject + "\n\n" + body
+	}
+	return fmt.Sprintf("chore: fishhawk fixup stage %s (base %s)",
+		shortID(cfg.stageID), shortID(baseTipSHA))
+}
+
 // terminalVerifyOutcome returns the committed-tree verify verdict already on the
 // bundle for this stage (#1210): the verify_summary.Outcome when a verify_summary
 // event is present (the fix-loop's authoritative terminal outcome), else the LAST
@@ -6338,6 +6452,14 @@ func isBinaryArtifactDrift(repoDir, path string) (bool, int64) {
 // and avoid /tmp pollution / parallel-test races.
 var pullRequestDescriptionPath = "/tmp/fishhawk-pr.md"
 
+// conventionalCommitHeaderRe matches a Conventional Commits v1.0.0 header
+// (#1572): a lowercase type from the allowed set, an optional lowercase scope in
+// parens, an optional breaking-change `!`, then `: ` and a non-empty
+// description. Applied WARN-ONLY to the agent-authored PR title — a non-match
+// emits pr_template_warning and the title is used verbatim; it never rewrites
+// the title or fails the stage.
+var conventionalCommitHeaderRe = regexp.MustCompile(`^(feat|fix|docs|refactor|test|chore|perf|build)(\([a-z0-9/._-]+\))?!?: .+$`)
+
 // prTitleAndBody assembles the PR title and body for the implement
 // stage. Tries the agent-authored file first; falls back to the
 // generic Fishhawk template when missing or malformed.
@@ -6354,7 +6476,7 @@ func prTitleAndBody(cfg config, branch string, logSink io.Writer) (title, body s
 		title = agentTitle
 		body = agentBody
 	case prSourceFallback:
-		title = fmt.Sprintf("Fishhawk: implement stage %s", shortID(cfg.stageID))
+		title = fmt.Sprintf("chore: fishhawk implement stage %s", shortID(cfg.stageID))
 		body = fmt.Sprintf(
 			"Opened by Fishhawk for run `%s`, stage `%s`.\n\nBranch: `%s`\nAudit log: see `%s/v0/runs/%s/audit`.\n",
 			cfg.runID, cfg.stageID, branch,
@@ -6427,6 +6549,17 @@ func loadAgentAuthoredPR(logSink io.Writer) (title, body string, kind prSource) 
 			`{"event":"pr_template_invalid","reason":%q,"path":%q}`+"\n",
 			"empty title line", pullRequestDescriptionPath)
 		return "", "", prSourceFallback
+	}
+
+	// Warn-only conventional-commit header check (#1572): the title doubles as
+	// the commit subject, so we nudge agents toward the Conventional Commits
+	// v1.0.0 shape. A non-match is advisory — emit pr_template_warning and use
+	// the title VERBATIM. Never a hard failure, never a rewrite. Runs before
+	// both prSourceAgent return paths (title-only and title+body).
+	if !conventionalCommitHeaderRe.MatchString(title) {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"pr_template_warning","reason":%q,"path":%q}`+"\n",
+			"title is not a conventional-commit header", pullRequestDescriptionPath)
 	}
 
 	if len(lines) < 2 {
