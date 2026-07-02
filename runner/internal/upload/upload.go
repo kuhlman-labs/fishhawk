@@ -531,6 +531,25 @@ type FetchedPrompt struct {
 	// (backend/internal/server/prompt.go), the same convention as
 	// EgressTargetHosts above.
 	AcceptanceCriteriaIDs []string `json:"acceptance_criteria_ids,omitempty"`
+	// AcceptanceExpectedHeadSHA is the run's merge-candidate identity — the
+	// newest reported head_sha in the backend's lineage ledger (the same
+	// source as FixupExpectedHeadSHA) — served ONLY on acceptance-stage
+	// prompt responses (E31.18 / #1569). The pre-spawn target-identity gate
+	// compares the declared target's /healthz git_sha against it before
+	// spawning the acceptance agent, so acceptance validates the merge
+	// candidate rather than whatever build answers at the declared host.
+	// Empty (older backend, or backend-side ledger resolution failure) means
+	// the gate treats the target as unverifiable and warns-and-proceeds
+	// rather than blocking the stage. Decoded here; the gate consumer in
+	// main.go's acceptance pre-spawn block is the E31.18 sibling slice.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag
+	// (acceptance_expected_head_sha) MUST stay byte-identical to the
+	// backend's promptResponse.AcceptanceExpectedHeadSHA
+	// (backend/internal/server/prompt.go), the same convention as
+	// EgressTargetHosts above. A tag drift silently drops the expectation
+	// and the identity gate degrades to unverifiable-warn on every dispatch.
+	AcceptanceExpectedHeadSHA string `json:"acceptance_expected_head_sha,omitempty"`
 }
 
 // FixupApplyPatch is one entry in FetchedPrompt.FixupApplyPatches: a single
