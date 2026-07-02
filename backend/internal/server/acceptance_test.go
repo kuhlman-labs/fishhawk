@@ -316,6 +316,39 @@ func TestShipAcceptance_InvalidPayload_400(t *testing.T) {
 	}
 }
 
+// TestShipAcceptance_Notes_RoundTrip is a5 (#1567): a body carrying the
+// optional top-level notes overflow field is ACCEPTED (the handler decodes
+// with DisallowUnknownFields, so this would 400 without the struct field) and
+// the artifact stores it verbatim. The sibling "unknown field" case in
+// TestShipAcceptance_InvalidPayload_400 (a6) pins that a genuinely undeclared
+// top-level field still rejects fail-closed.
+func TestShipAcceptance_Notes_RoundTrip(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, _, _ := newAcceptanceServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	body, err := json.Marshal(acceptanceBody{
+		Verdict: "passed",
+		Criteria: []acceptanceCriterionResult{
+			{ID: "ac-create", Result: "passed"},
+		},
+		Notes: "preview was slow to boot but every criterion passed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if len(ar.all) != 1 {
+		t.Fatalf("artifacts = %d, want 1", len(ar.all))
+	}
+	stored := string(ar.all[0].Content)
+	if !strings.Contains(stored, `"notes":"preview was slow to boot but every criterion passed"`) {
+		t.Errorf("stored artifact missing notes verbatim:\n%s", stored)
+	}
+}
+
 // TestShipAcceptance_CriterionEvidenceFields_RoundTrip pins the E31.7 verdict
 // shape (#1535): a body carrying the optional per-criterion expectation_basis
 // + repro_handle fields is ACCEPTED (the handler decodes with

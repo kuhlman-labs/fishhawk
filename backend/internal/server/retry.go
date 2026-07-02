@@ -142,6 +142,22 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Acceptance-reopen branch (E31.16 / #1567). A failed acceptance VERDICT
+	// leaves the acceptance STAGE `succeeded` (E31.7), so the ordinary
+	// failed-stages-only retry path below can never re-run an acceptance stage
+	// that settled succeeded but recorded NO verdict (the run-f7a4b71b hole:
+	// the agent emitted a non-schema field, the ship failed closed, and the
+	// stage settled with no outcome). This operator-gated verb re-opens such a
+	// stage to pending via run.ReopenAcceptanceStage — the E31.8 class-2
+	// mechanic — WITHOUT widening the failed-stages-only run.RetryStage
+	// invariant. Handled entirely here, before the subject-binding guard and
+	// retryStageAs, so the verdict-ful acceptance failure keeps routing through
+	// the deterministic triage untouched.
+	if stage.Type == run.StageTypeAcceptance && stage.State == run.StageStateSucceeded {
+		s.retryAcceptanceOutcomeUnknown(w, r, id, stage)
+		return
+	}
+
 	// Subject-binding guard: MCP tokens may only retry stages within
 	// their own run. Subject format is "mcp:run:<uuid>" (set by
 	// bearerAuth middleware at middleware.go).
@@ -228,6 +244,122 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, r, http.StatusOK, toStageResponse(stageOut))
+}
+
+// retryAcceptanceOutcomeUnknown handles the acceptance-reopen arm of POST
+// /v0/stages/{stage_id}/retry (E31.16 / #1567): a SUCCEEDED acceptance stage
+// with NO recorded outcome re-opens to pending for a re-run. It is
+// operator-gated (agent tokens refused), guards against reopening a
+// verdict-ful stage (that routing belongs to the deterministic triage), and
+// fails closed on an audit read error so a re-open never fires on unknown
+// evidence state. On success it re-opens via run.ReopenAcceptanceStage, writes
+// an acceptance_reopened chained audit entry audit-first, then mirrors
+// routeAcceptanceClass2's post-steps (orchestrator Advance, status notify).
+func (s *Server) retryAcceptanceOutcomeUnknown(w http.ResponseWriter, r *http.Request, id Identity, stage *run.Stage) {
+	ctx := r.Context()
+
+	// (i) Operator-gated: an agent (mcp:run:*-subject) token may not invoke
+	// the reopen — mirroring the category-B override guard. Reopening a
+	// settled acceptance gate is a human decision.
+	if strings.HasPrefix(id.Subject, "mcp:run:") {
+		s.writeError(w, r, http.StatusForbidden, "agent_token_forbidden",
+			"the acceptance-reopen retry is an operator-only action; agent tokens may not invoke it",
+			nil)
+		return
+	}
+
+	// (ii) Fail closed on the evidence state: only a stage with NO
+	// acceptance_outcome_recorded verdict may reopen. A recorded verdict means
+	// the deterministic triage owns the routing (422); a read error means we
+	// cannot prove the stage is outcome-less, so refuse rather than reopen.
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, stage.RunID, CategoryAcceptanceOutcomeRecorded)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"list acceptance outcome audit entries failed",
+			map[string]any{"error": err.Error()})
+		return
+	}
+	for _, e := range entries {
+		if e.StageID != nil && *e.StageID == stage.ID {
+			s.writeError(w, r, http.StatusUnprocessableEntity, "retry_not_applicable",
+				"a verdict was already recorded for this acceptance stage; verdict-ful routing belongs to the deterministic triage, not a re-open",
+				map[string]any{"stage_id": stage.ID.String()})
+			return
+		}
+	}
+
+	// (iii) Re-open succeeded → pending via the class-2 verb. A refusal
+	// (wrong type, not succeeded, terminal run) maps to 422.
+	dec, err := run.ReopenAcceptanceStage(ctx, s.cfg.RunRepo, stage.ID)
+	if err != nil {
+		if errors.Is(err, run.ErrAcceptanceReopenNotApplicable) {
+			s.writeError(w, r, http.StatusUnprocessableEntity, "retry_not_applicable",
+				err.Error(), nil)
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"reopen acceptance stage failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	// (iv) Audit-first: record the reopen before the orchestrator handoff so
+	// the intent is durable even if Advance below fails.
+	s.writeAcceptanceReopenAudit(ctx, id, dec)
+
+	// (v) Hand off to the orchestrator so it walks pending → dispatched and
+	// rebuilds a fresh preview. WARN-on-error: the stage stays pending for a
+	// manual re-fire, mirroring routeAcceptanceClass2 / the retry handler.
+	if dec.Stage.State == run.StageStatePending && s.cfg.Orchestrator != nil {
+		if _, aerr := s.cfg.Orchestrator.Advance(ctx, stage.RunID); aerr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
+				"acceptance reopen: orchestrator advance failed",
+				slog.String("run_id", stage.RunID.String()),
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("error", aerr.Error()))
+		}
+		if updated, gerr := s.cfg.RunRepo.GetStage(ctx, stage.ID); gerr == nil {
+			dec.Stage = updated
+		}
+	}
+
+	s.notifyStatusUpdate(ctx, stage.RunID, "acceptance_reopened")
+
+	s.writeJSON(w, r, http.StatusOK, toStageResponse(dec.Stage))
+}
+
+// writeAcceptanceReopenAudit appends the acceptance_reopened chained entry for
+// an operator-gated re-open of a settled-outcome-unknown acceptance stage
+// (#1567). Records the actor, the prior state (always succeeded on the
+// admitted path), and the reason. Best-effort: the transition is already
+// committed, so a failure here logs but doesn't unwind.
+func (s *Server) writeAcceptanceReopenAudit(ctx context.Context, id Identity, dec *run.AcceptanceReopenDecision) {
+	subject := id.Subject
+	if subject == "" {
+		subject = "anonymous"
+	}
+	actorKind := actorKindForSubject(subject)
+
+	payload, _ := json.Marshal(map[string]any{
+		"stage_id":    dec.Stage.ID.String(),
+		"prior_state": string(dec.PriorState),
+		"reason":      "acceptance stage settled succeeded with no recorded outcome; operator re-opened for a re-run",
+	})
+
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        dec.Stage.RunID,
+		StageID:      &dec.Stage.ID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryAcceptanceReopened,
+		ActorKind:    &actorKind,
+		ActorSubject: &subject,
+		Payload:      payload,
+	}); err != nil {
+		s.cfg.Logger.Error("audit append failed for acceptance reopen",
+			"run_id", dec.Stage.RunID,
+			"stage_id", dec.Stage.ID,
+			"error", err.Error(),
+		)
+	}
 }
 
 // retryActionParams carries the resolved inputs for retryStageAs. The HTTP

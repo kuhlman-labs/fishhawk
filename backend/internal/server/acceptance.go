@@ -55,6 +55,14 @@ const (
 	// consumes. Open-set string — audit_entries.category has no CHECK, so no
 	// migration (same posture as acceptance_outcome_recorded).
 	CategoryAcceptanceTriageDecided = "acceptance_triage_decided"
+	// CategoryAcceptanceReopened records an operator-gated re-open of an
+	// acceptance stage that settled `succeeded` with NO
+	// acceptance_outcome_recorded verdict for that stage (E31.16 / #1567).
+	// Written by the retry handler's acceptance-reopen branch
+	// (server/retry.go) before the orchestrator handoff; no notifier ping of
+	// its own — the status refresh rides notifyStatusUpdate. Open-set string
+	// (audit_entries.category has no CHECK), so no migration.
+	CategoryAcceptanceReopened = "acceptance_reopened"
 )
 
 // Acceptance triage class values (E31.8). Strings, matching
@@ -157,6 +165,12 @@ type acceptanceBody struct {
 	// EvidenceHashes references the customer-side evidence blobs by content
 	// hash (ADR-049 #5 default residency customer-side). Optional.
 	EvidenceHashes []string `json:"evidence_hashes,omitempty"`
+	// Notes is a declared home for the agent's free-text overflow (#1567):
+	// a benign top-level remark that would otherwise fail closed against
+	// DisallowUnknownFields. Free text, no validate() rule; stored verbatim
+	// in the artifact and covered by the existing whole-verdict redaction on
+	// the runner side. The wire twin of acceptanceVerdict.Notes.
+	Notes string `json:"notes,omitempty"`
 }
 
 // validate returns a human-readable error if any field is missing or

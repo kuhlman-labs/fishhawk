@@ -158,6 +158,20 @@ func TestValidateAcceptanceVerdict_Table(t *testing.T) {
 			wantErr: "not in the served acceptance_criteria_ids set",
 		},
 		{
+			// a1 (#1567): a declared top-level notes overflow validates.
+			name:   "top-level notes validates",
+			raw:    `{"verdict":"passed","criteria":[{"id":"AC1","result":"passed"}],"notes":"instance came up slowly but passed"}`,
+			served: served,
+		},
+		{
+			// a2 (#1567): an UNdeclared top-level field still fails closed
+			// (the fail-closed direction is preserved — only notes is tolerated).
+			name:    "undeclared top-level field still fails closed",
+			raw:     `{"verdict":"passed","criteria":[{"id":"AC1","result":"passed"}],"summary":"extra prose"}`,
+			served:  served,
+			wantErr: "could not be decoded",
+		},
+		{
 			name:    "unknown field rejected (backend DisallowUnknownFields mirror)",
 			raw:     `{"verdict":"passed","bogus":true}`,
 			served:  served,
@@ -216,7 +230,7 @@ func TestAcceptanceVerdictSchema_LockstepWithValidator(t *testing.T) {
 	if len(schema.Required) != 1 || schema.Required[0] != "verdict" {
 		t.Errorf("schema required = %v, want [verdict] (the backend's only required field)", schema.Required)
 	}
-	wantProps := []string{"verdict", "failure_mode", "criteria", "target_url", "evidence_hashes"}
+	wantProps := []string{"verdict", "failure_mode", "criteria", "target_url", "evidence_hashes", "notes"}
 	if len(schema.Properties) != len(wantProps) {
 		t.Errorf("schema has %d properties, want %d (%v)", len(schema.Properties), len(wantProps), wantProps)
 	}
@@ -278,7 +292,8 @@ func TestAcceptanceVerdictSchema_LockstepWithValidator(t *testing.T) {
 			"repro_handle": "curl -X POST http://target/orders -d @cart.json"
 		}],
 		"target_url": "http://target.example.com",
-		"evidence_hashes": ["deadbeef"]
+		"evidence_hashes": ["deadbeef"],
+		"notes": "overall the instance behaved but AC1 regressed"
 	}`
 	if err := validateAcceptanceVerdict([]byte(maximal), []string{"AC1"}); err != nil {
 		t.Errorf("maximal schema-shaped verdict rejected by validator: %v", err)
@@ -605,6 +620,40 @@ func TestRun_AcceptanceStage_FileFallback_Ships(t *testing.T) {
 	var shipped acceptanceVerdict
 	if err := json.Unmarshal(fu.gotAcceptanceArgs.Body, &shipped); err != nil || shipped.Verdict != "passed" {
 		t.Errorf("shipped verdict = %+v (err %v)", shipped, err)
+	}
+}
+
+// TestRun_AcceptanceStage_FileFallback_NotesShips is a4 (#1567): the
+// FALLBACK FILE — the transport that bypasses --json-schema entirely, so
+// no schema is in play at all — carries a top-level notes field, and the
+// runner validates + ships it end-to-end. This is the exact run-f7a4b71b
+// hole: on this path a benign top-level overflow field must validate
+// (declared) rather than fail closed.
+func TestRun_AcceptanceStage_FileFallback_NotesShips(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	invoker := &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(_ int, _ agent.Invocation) {
+			mustWrite(t, acceptanceVerdictPath,
+				`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed"}],"notes":"preview was slow to boot but all criteria passed"}`)
+		},
+	}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK (notes on the schemaless file path must validate):\n%s", got, stderr.String())
+	}
+	if fu.gotAcceptanceArgs == nil {
+		t.Fatal("ShipAcceptance not called on the notes-carrying file-fallback path")
+	}
+	var shipped acceptanceVerdict
+	if err := json.Unmarshal(fu.gotAcceptanceArgs.Body, &shipped); err != nil {
+		t.Fatalf("unmarshal shipped verdict: %v", err)
+	}
+	if shipped.Verdict != "passed" || shipped.Notes != "preview was slow to boot but all criteria passed" {
+		t.Errorf("shipped verdict = %+v, want passed with notes preserved", shipped)
 	}
 }
 

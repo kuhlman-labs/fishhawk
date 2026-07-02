@@ -1537,6 +1537,54 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 }
 
+// TestRetryStageDescription_DocumentsAcceptanceReopenArm pins the #1567
+// description change: the fishhawk_retry_stage tool must document the second
+// admitted shape — a SUCCEEDED acceptance stage with no recorded verdict
+// re-opens for a re-run (operator token only) — so a driving agent knows the
+// verb covers the settled-outcome-unknown recovery, not only failed stages.
+func TestRetryStageDescription_DocumentsAcceptanceReopenArm(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+
+	var desc string
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_retry_stage" {
+			desc = tool.Description
+			break
+		}
+	}
+	if desc == "" {
+		t.Fatal("fishhawk_retry_stage not registered/visible over ListTools")
+	}
+	lower := strings.ToLower(desc)
+	for _, want := range []string{"acceptance", "operator", "no acceptance_outcome_recorded verdict"} {
+		if !strings.Contains(lower, strings.ToLower(want)) {
+			t.Errorf("fishhawk_retry_stage description missing %q (acceptance-reopen arm, #1567):\n%s", want, desc)
+		}
+	}
+}
+
 // --- get_plan (E19.4 / #344) ---
 
 // samplePlanContent returns a small but complete standard_v1

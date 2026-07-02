@@ -4947,6 +4947,30 @@ func TestBuild_Acceptance_OutputContractFileFallback(t *testing.T) {
 	}
 }
 
+// TestBuild_Acceptance_OutputContractClosedFieldSet is a8 (#1567): the output
+// contract must name the optional `notes` overflow field AND state the
+// closed-field-set / unknown-fields-rejected rule — the only authorship
+// control on the schemaless file-fallback transport, which no compile step
+// enforces.
+func TestBuild_Acceptance_OutputContractClosedFieldSet(t *testing.T) {
+	got, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	if !strings.Contains(got, "`notes`") {
+		t.Errorf("acceptance output contract must name the notes overflow field:\n%s", got)
+	}
+	for _, want := range []string{
+		"may contain ONLY these fields",
+		"Any OTHER field is rejected fail-closed",
+		"fails the stage",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("acceptance output contract missing closed-field-set clause %q:\n%s", want, got)
+		}
+	}
+}
+
 // TestBuild_Acceptance_IndependenceNoDiffOrScope pins ADR-049 decision #4: the
 // acceptance prompt withholds the diff and the implement-only scope-files
 // sections, so a reviewer's independence assumption holds (grep-negative for

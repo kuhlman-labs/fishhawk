@@ -132,6 +132,22 @@ next snapshot the re-opened stage's own dispatch arm serves the move.
 `merge_and_file_follow_up` (accept-and-ship, e.g. a class-3 bad criterion), or
 `fishhawk_cancel_run`.
 
+**Settled-outcome-unknown recovery (E31.16 / #1567).** A different failure from
+the paged case: the acceptance stage settled `succeeded` but **no**
+`acceptance_outcome_recorded` verdict shipped at all — the agent emitted a
+non-schema field and the verdict failed closed before it reached the backend
+(the run-f7a4b71b hole). `next_actions` surfaces this as the
+`acceptance_settled_outcome_unknown` state — deliberately NEVER the merge ritual
+(fail toward read, not toward merge). First `fishhawk_list_audit` on
+`acceptance_outcome_recorded` to CONFIRM no verdict exists for the stage (the
+default `audit_limit` is 5, so a real verdict can merely have aged out of the
+window). Once confirmed, `fishhawk_retry_stage` on the **acceptance stage id**
+re-opens it `succeeded → pending` (operator token only; an agent token is
+refused 403, and the server 422s `retry_not_applicable` if a verdict IS
+recorded). The reopen lands the stage in pending, so on the local runner
+`fishhawk_dispatch_stage` (acceptance) — surfaced by the `acceptance_pending`
+arm on the next snapshot — spawns the actual re-run.
+
 ### Late CI/SAST finding after the fix-up ceiling
 
 The bounded fix-up budget is hard-capped at 3 total passes per implement stage

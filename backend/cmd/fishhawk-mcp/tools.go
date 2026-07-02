@@ -2095,7 +2095,7 @@ func (r *runResolver) resetRunBranch(ctx context.Context, _ *mcp.CallToolRequest
 // RetryStageInput is the fishhawk_retry_stage tool's input schema
 // (E22.3 / #392). Mirrors `POST /v0/stages/{stage_id}/retry`.
 type RetryStageInput struct {
-	StageID string `json:"stage_id" jsonschema:"the Fishhawk stage UUID to retry; must be a stage in a failed state"`
+	StageID string `json:"stage_id" jsonschema:"the Fishhawk stage UUID to retry; must be a failed stage, OR a SUCCEEDED acceptance stage that recorded no verdict (the acceptance-reopen arm, #1567 — operator token only)"`
 }
 
 // RetryStageOutput surfaces the post-retry Stage row. Category-A/C
@@ -2126,6 +2126,14 @@ Retry a FAILED stage. Use this when a stage has failed and you want the
 orchestrator to re-run it fresh — distinct from fishhawk_fixup_stage,
 which re-opens a HEALTHY implement-review gate on the same PR branch.
 Precondition: the stage must be in a failed state.
+
+Second admitted shape (#1567): a SUCCEEDED acceptance stage that recorded
+NO acceptance_outcome_recorded verdict re-opens to pending for a re-run
+(the settled-outcome-unknown recovery, e.g. the agent shipped a non-schema
+field and the verdict failed closed). This arm is OPERATOR-token only
+(agent tokens are refused 403) and 422s retry_not_applicable if a verdict
+IS recorded — verdict-ful routing belongs to the deterministic triage.
+Everything else still requires a failed stage.
 
 Mirrors the CLI's "fishhawk run retry <stage-id>" verb. The backend's
 state machine decides whether the stage is retryable per its failure

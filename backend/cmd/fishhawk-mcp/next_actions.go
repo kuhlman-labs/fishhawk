@@ -755,7 +755,7 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, verdict, dispositio
 	// defensive read arm — deliberately NEVER the merge ritual (fail toward
 	// read, not toward merge).
 	if acceptance.State != "succeeded" || verdict == "" {
-		return acceptanceOutcomeUnknownActions(run)
+		return acceptanceOutcomeUnknownActions(run, acceptance)
 	}
 
 	switch verdict {
@@ -781,7 +781,7 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, verdict, dispositio
 				"the acceptance verdict failed and deterministic server-side triage auto-routed it (fixup_dispatched re-opens implement; retry_dispatched re-opens acceptance) — re-poll; the re-opened stage's dispatch arm serves the next move. On the local runner an auto-routed re-open never spawns the runner, so fishhawk_dispatch_stage the re-opened implement (after fixup_dispatched) or acceptance (after retry_dispatched) stage")},
 		}
 	default:
-		return acceptanceOutcomeUnknownActions(run)
+		return acceptanceOutcomeUnknownActions(run, acceptance)
 	}
 }
 
@@ -789,8 +789,12 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, verdict, dispositio
 // acceptance stage whose verdict is not visible in the recent-audit window (it
 // aged out, or the payload was malformed). It points at the full audit trail
 // and, load-bearing, NEVER offers the merge ritual — an unknown acceptance
-// outcome must fail toward read, not toward merge (E31.9).
-func acceptanceOutcomeUnknownActions(run *Run) *NextActions {
+// outcome must fail toward read, not toward merge (E31.9). It also offers the
+// fishhawk_retry_stage recovery verb keyed to the acceptance stage id (#1567):
+// when the audit confirms NO acceptance_outcome_recorded entry exists for the
+// stage, the reopen lands it in pending so the acceptance_pending arm's
+// fishhawk_dispatch_stage serves the actual re-run.
+func acceptanceOutcomeUnknownActions(run *Run, acceptance *Stage) *NextActions {
 	return &NextActions{
 		State: "acceptance_settled_outcome_unknown",
 		Actions: []SuggestedAction{
@@ -800,6 +804,13 @@ func acceptanceOutcomeUnknownActions(run *Run) *NextActions {
 				Precondition: "the acceptance stage settled but no acceptance_outcome_recorded verdict is visible in the recent-audit window (the default audit_limit is 5 — the entry can age out)",
 				Consumes:     consumesNone,
 				Reason:       "read the acceptance verdict + triage disposition from the full audit trail before acting — deliberately NOT the merge ritual (fail toward read, not toward merge)",
+			},
+			{
+				Action:       "fishhawk_retry_stage",
+				Params:       map[string]string{"stage_id": acceptance.ID},
+				Precondition: "ONLY after fishhawk_list_audit confirms NO acceptance_outcome_recorded entry exists for this acceptance stage (the stage settled succeeded but shipped no verdict — the run-f7a4b71b hole). The arm also fires when the verdict merely aged out of the recent-audit window; the server re-checks and 422s retry_not_applicable if a verdict IS recorded",
+				Consumes:     consumesNone,
+				Reason:       "re-open the settled-outcome-unknown acceptance stage for a re-run (operator token only): the reopen lands the stage in pending, so on the local runner the acceptance_pending arm's fishhawk_dispatch_stage then spawns the actual re-run",
 			},
 			pollAction(run, suggestedStageWaitPollIntervalSeconds,
 				"re-poll fishhawk_get_run_status with a larger audit_limit to surface the acceptance_outcome_recorded / acceptance_triage_decided entries"),
