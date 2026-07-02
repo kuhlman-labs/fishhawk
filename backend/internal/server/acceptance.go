@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/agenteval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -659,6 +660,16 @@ func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, s
 
 	class, criterionIDs, reason := classifyAcceptanceFailure(acc, criteria)
 
+	// E31.11 (#1539, ADR-049 decision #4): a class-3 decision is a
+	// plan-review miss — a bad criterion the plan gate approved. Build the
+	// durable per-criterion record ONCE here so every disposition branch
+	// below (paged, unsettled, budget-exhausted) carries it. nil for
+	// classes 1/2/4, so the payload field stays omitted there.
+	var misses []agenteval.PlanReviewMiss
+	if class == acceptanceClass3 {
+		misses = buildPlanReviewMisses(acc, criteria, criterionIDs)
+	}
+
 	// Count prior auto-routed decisions from the audit chain (the durable
 	// mirror of countFixupPasses). A count failure means we cannot bound
 	// safely — degrade to paged without acting.
@@ -670,7 +681,7 @@ func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, s
 			slog.String("error", err.Error()))
 		s.writeAcceptanceTriageAudit(ctx, runID, stage.ID, artifactID, class,
 			acceptanceDispositionPaged, criterionIDs, acc.FailureMode, prior,
-			"triage route count failed; paging without action")
+			"triage route count failed; paging without action", misses)
 		return
 	}
 
@@ -680,7 +691,7 @@ func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, s
 	if stage.State != run.StageStateSucceeded {
 		s.writeAcceptanceTriageAudit(ctx, runID, stage.ID, artifactID, class,
 			acceptanceDispositionUnsettled, criterionIDs, acc.FailureMode, prior,
-			fmt.Sprintf("acceptance stage not yet settled (state %q); recording classification without acting", stage.State))
+			fmt.Sprintf("acceptance stage not yet settled (state %q); recording classification without acting", stage.State), misses)
 		return
 	}
 
@@ -689,7 +700,7 @@ func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, s
 	if prior >= defaultMaxAcceptanceReruns {
 		s.writeAcceptanceTriageAudit(ctx, runID, stage.ID, artifactID, class,
 			acceptanceDispositionRerunBudget, criterionIDs, acc.FailureMode, prior,
-			fmt.Sprintf("re-run budget exhausted (%d of %d auto-routed passes used); paging", prior, defaultMaxAcceptanceReruns))
+			fmt.Sprintf("re-run budget exhausted (%d of %d auto-routed passes used); paging", prior, defaultMaxAcceptanceReruns), misses)
 		return
 	}
 
@@ -705,7 +716,46 @@ func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, s
 	}
 
 	s.writeAcceptanceTriageAudit(ctx, runID, stage.ID, artifactID, class,
-		disposition, criterionIDs, acc.FailureMode, prior, reason)
+		disposition, criterionIDs, acc.FailureMode, prior, reason, misses)
+}
+
+// buildPlanReviewMisses joins each class-3 criterion id with the approved
+// plan criterion's provenance fields and the shipped verdict's per-criterion
+// evidence for that id (E31.11 / #1539). An id that does not resolve against
+// the plan still yields a record keyed by the id with empty provenance
+// fields — unresolvable is itself the miss. Uses the shared
+// agenteval.PlanReviewMiss wire type so the server marshal, the
+// distill-corpus tool unmarshal, and the corpus loader cannot drift.
+func buildPlanReviewMisses(acc acceptanceBody, criteria []plan.AcceptanceCriterion, criterionIDs []string) []agenteval.PlanReviewMiss {
+	planByID := make(map[string]plan.AcceptanceCriterion, len(criteria))
+	for _, c := range criteria {
+		planByID[c.ID] = c
+	}
+	resultByID := make(map[string]acceptanceCriterionResult, len(acc.Criteria))
+	for _, c := range acc.Criteria {
+		resultByID[c.ID] = c
+	}
+
+	out := make([]agenteval.PlanReviewMiss, 0, len(criterionIDs))
+	for _, id := range criterionIDs {
+		m := agenteval.PlanReviewMiss{CriterionID: id}
+		if pc, ok := planByID[id]; ok {
+			m.Statement = pc.Statement
+			m.Source = string(pc.Source)
+			m.SourceRef = pc.SourceRef
+			m.Rationale = pc.Rationale
+		}
+		if r, ok := resultByID[id]; ok {
+			m.Observed = r.Observed
+			m.Expected = r.Expected
+			m.StepsTaken = r.StepsTaken
+			m.ExpectationBasis = r.ExpectationBasis
+			m.ReproHandle = r.ReproHandle
+			m.Result = r.Result
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // routeAcceptanceClass1 synthesizes the behavioral evidence into
@@ -940,13 +990,17 @@ func acceptanceTriageDispositionOf(payload []byte) string {
 // chained entry recording the class + realized disposition + criterion_ids +
 // bound accounting. Written AFTER acting so the disposition records what
 // actually happened. Best-effort: a failure here WARN-logs (the ship is
-// already committed).
-func (s *Server) writeAcceptanceTriageAudit(ctx context.Context, runID, stageID uuid.UUID, artifactID, class, disposition string, criterionIDs []string, failureMode string, priorRoutedPasses int, reason string) {
+// already committed). misses is the E31.11 per-criterion plan-review-miss
+// record — additive: emitted as the plan_review_miss payload field only when
+// non-empty (class 3), omitted entirely otherwise, so existing consumers
+// (issuecomment decodeAcceptanceActivity, acceptanceTriageDispositionOf)
+// that decode named fields are untouched.
+func (s *Server) writeAcceptanceTriageAudit(ctx context.Context, runID, stageID uuid.UUID, artifactID, class, disposition string, criterionIDs []string, failureMode string, priorRoutedPasses int, reason string, misses []agenteval.PlanReviewMiss) {
 	if criterionIDs == nil {
 		criterionIDs = []string{}
 	}
 	systemKind := audit.ActorSystem
-	payload, _ := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"run_id":              runID.String(),
 		"stage_id":            stageID.String(),
 		"artifact_id":         artifactID,
@@ -956,7 +1010,11 @@ func (s *Server) writeAcceptanceTriageAudit(ctx context.Context, runID, stageID 
 		"failure_mode":        failureMode,
 		"prior_routed_passes": priorRoutedPasses,
 		"reason":              reason,
-	})
+	}
+	if len(misses) > 0 {
+		fields["plan_review_miss"] = misses
+	}
+	payload, _ := json.Marshal(fields)
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:     runID,
 		StageID:   &stageID,

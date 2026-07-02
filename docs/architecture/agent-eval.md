@@ -218,6 +218,65 @@ stream-json + bundle event-kind wire format so the scorer exercises the
 real parse path, but the trajectories themselves are invented. Each
 `case.md` states this plainly.
 
+## Plan-review-miss corpus (E31.11)
+
+A second, sibling corpus under
+`backend/internal/agenteval/testdata/planreview-miss-corpus/<case>/`
+closes the ADR-049 decision #4 feedback loop: when acceptance triage
+(E31.8) concludes **class 3** — a failed criterion that is
+inferred-source or unresolvable against the approved plan, i.e. a bad
+criterion the plan gate approved — that decision is a *plan-review
+miss*, and the corpus accumulates the cases the plan reviewer should
+have challenged.
+
+The feed pipeline:
+
+1. **Class-3 audit record.** `triageAcceptanceFailure`
+   (`backend/internal/server/acceptance.go`) enriches the class-3
+   `acceptance_triage_decided` payload with an additive
+   `plan_review_miss` field: one `agenteval.PlanReviewMiss` per class-3
+   criterion id, joining the plan criterion's provenance
+   (`statement`/`source`/`source_ref`/`rationale`) with the verdict's
+   observed behavior
+   (`observed`/`expected`/`steps_taken`/`expectation_basis`/
+   `repro_handle`/`result`). An unresolvable id still yields a record
+   keyed by the id with empty provenance. Omitted for classes 1/2/4.
+2. **Distill.** `fishhawk-distill-corpus --plan-review-miss` (backed by
+   `corpusdistill.DistillPlanReviewMiss` / `PreviewPlanReviewMiss` and
+   `FetchRunTriageAudit`, which follows `next_cursor` pages past the
+   audit endpoint's 500-entry limit cap) scaffolds one candidate case
+   per class-3 decision under the corpus dir: `miss.json` (the
+   `agenteval.PlanReviewMissCase` shape) + a provenance `case.md`.
+3. **Operator-labeled case.** Selection, labeling, and committing stay
+   operator curation (#819 / ADR-040); the tool produces a CANDIDATE
+   with a TODO(operator) distilled-signal prompt (or an inline
+   `--narrative`).
+
+The `miss.json` shape is `agenteval.PlanReviewMissCase`
+(`planreviewmiss.go`): the triage envelope (`run_id`, `artifact_id`,
+`triage_sequence`, `class`, `disposition`, `reason`, `decided_at`), the
+`misses` array, and a `synthetic` marker.
+`LoadPlanReviewMissCorpus(dir)` reads the corpus back — empty slice on
+an absent dir, fail-closed (error naming the case) on malformed JSON, a
+missing `miss.json`, an empty `misses` list, or an empty
+`criterion_id`. The **same** `PlanReviewMiss` type is used by the
+server marshal, the tool unmarshal, and the loader, so the three
+surfaces cannot drift (pinned by a corpusdistill round-trip seam test).
+
+**Redaction posture:** the feed is redacted-by-construction. Per
+ADR-049 decision refinement #5, evidence blobs (logs, screenshots,
+traces) stay customer-side — only the structured verdict + per-criterion
+prose fields cross to Fishhawk — so a distilled candidate carries no raw
+evidence. `case.md` still requires the operator to confirm the prose
+fields before a case lands. The committed
+`seed-synthetic-inferred-criterion` case is a hand-authored shape
+demonstration (`synthetic: true`), per the same synthetic-seed
+discipline as the Tier-A/Tier-B seeds.
+
+The queryable metric lives on the API: `GET /v0/acceptance-triage/stats`
+reports `plan_review_miss_rate` (class-3 decisions / all triage
+decisions, per DECISION not per run) — see `docs/api/v0.md`.
+
 ## Deferred to follow-up
 
 These are surfaced for the operator to triage (the implementer does not

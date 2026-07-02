@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/agenteval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
@@ -1106,5 +1107,120 @@ func TestTriageAcceptance_PlanLoadFailure_StillShips(t *testing.T) {
 	payload := triagePayload(t, au)
 	if !strings.Contains(payload, `"class":"3"`) {
 		t.Errorf("triage payload missing class 3 (unresolvable without plan):\n%s", payload)
+	}
+}
+
+// decodePlanReviewMisses unmarshals the plan_review_miss field from a triage
+// payload via the SAME shared agenteval.PlanReviewMiss type the server
+// marshals — the server half of the E31.11 lossless-decode seam pin.
+func decodePlanReviewMisses(t *testing.T, payload string) []agenteval.PlanReviewMiss {
+	t.Helper()
+	var p struct {
+		Misses []agenteval.PlanReviewMiss `json:"plan_review_miss"`
+	}
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		t.Fatalf("decode plan_review_miss from triage payload: %v\n%s", err, payload)
+	}
+	return p.Misses
+}
+
+// TestTriageAcceptance_Class3_PlanReviewMissRecord is the E31.11 issue-AC#1
+// done-means: a class-3-shaped failed verdict (assertion_fail on the
+// inferred-source ac-list) persists an acceptance_triage_decided payload
+// whose plan_review_miss entries join the plan criterion's provenance
+// (statement/source/rationale) with the verdict's observed behavior, and
+// that field decodes losslessly into []agenteval.PlanReviewMiss.
+func TestTriageAcceptance_Class3_PlanReviewMissRecord(t *testing.T) {
+	s, _, _, au, _, runID, _, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	body := failedAcceptanceBytes(t, "assertion_fail", []acceptanceCriterionResult{
+		{ID: "ac-create", Result: "passed"},
+		{ID: "ac-list", Result: "failed", Observed: "returned an unpaginated array",
+			Expected: "a widget list", StepsTaken: "GET /widgets",
+			ExpectationBasis: "criterion ac-list", ReproHandle: "curl $TARGET/widgets"},
+	})
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	misses := decodePlanReviewMisses(t, triagePayload(t, au))
+	if len(misses) != 1 {
+		t.Fatalf("plan_review_miss entries = %d, want 1", len(misses))
+	}
+	m := misses[0]
+	// Plan-side provenance (from acceptancePlanArtifactContent's ac-list).
+	if m.CriterionID != "ac-list" || m.Statement != "GET /widgets lists widgets" ||
+		m.Source != "inferred" || m.Rationale != "listing implied" {
+		t.Errorf("plan provenance not joined: %+v", m)
+	}
+	// Verdict-side observed behavior.
+	if m.Observed != "returned an unpaginated array" || m.Expected != "a widget list" ||
+		m.StepsTaken != "GET /widgets" || m.ExpectationBasis != "criterion ac-list" ||
+		m.ReproHandle != "curl $TARGET/widgets" || m.Result != "failed" {
+		t.Errorf("verdict evidence not joined: %+v", m)
+	}
+}
+
+// TestTriageAcceptance_PlanReviewMiss_UnresolvableID: a failed criterion id
+// absent from the plan still yields a miss record keyed by that id, with
+// empty provenance fields but the observed behavior carried.
+func TestTriageAcceptance_PlanReviewMiss_UnresolvableID(t *testing.T) {
+	s, _, _, au, _, runID, _, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	body := failedAcceptanceBytes(t, "assertion_fail", []acceptanceCriterionResult{
+		{ID: "ac-ghost", Result: "failed", Observed: "wrong shape"},
+	})
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	misses := decodePlanReviewMisses(t, triagePayload(t, au))
+	if len(misses) != 1 {
+		t.Fatalf("plan_review_miss entries = %d, want 1", len(misses))
+	}
+	m := misses[0]
+	if m.CriterionID != "ac-ghost" {
+		t.Errorf("criterion id = %q, want ac-ghost", m.CriterionID)
+	}
+	if m.Statement != "" || m.Source != "" || m.SourceRef != "" || m.Rationale != "" {
+		t.Errorf("unresolvable id must carry empty provenance, got %+v", m)
+	}
+	if m.Observed != "wrong shape" || m.Result != "failed" {
+		t.Errorf("observed behavior not carried for unresolvable id: %+v", m)
+	}
+}
+
+// TestTriageAcceptance_NonClass3_NoPlanReviewMissField: classes 1 (error and
+// explicit-assertion), 2 (skip-only), and 4 (unitemized) each produce a
+// triage payload with NO plan_review_miss field — the record is additive and
+// class-3-only.
+func TestTriageAcceptance_NonClass3_NoPlanReviewMissField(t *testing.T) {
+	tests := []struct {
+		name        string
+		failureMode string
+		criteria    []acceptanceCriterionResult
+		wantClass   string
+	}{
+		{"class 1 error", "error", []acceptanceCriterionResult{{ID: "ac-create", Result: "failed"}}, "1"},
+		{"class 1 assertion explicit", "assertion_fail", []acceptanceCriterionResult{{ID: "ac-create", Result: "failed"}}, "1"},
+		{"class 2 skip only", "assertion_fail", []acceptanceCriterionResult{{ID: "ac-create", Result: "passed"}, {ID: "ac-list", Result: "skipped"}}, "2"},
+		{"class 4 unitemized", "assertion_fail", nil, "4"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _, au, _, runID, _, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+			body := failedAcceptanceBytes(t, tc.failureMode, tc.criteria)
+			w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+			payload := triagePayload(t, au)
+			if !strings.Contains(payload, fmt.Sprintf(`"class":%q`, tc.wantClass)) {
+				t.Fatalf("class != %s:\n%s", tc.wantClass, payload)
+			}
+			if strings.Contains(payload, "plan_review_miss") {
+				t.Errorf("non-class-3 payload must omit plan_review_miss:\n%s", payload)
+			}
+		})
 	}
 }

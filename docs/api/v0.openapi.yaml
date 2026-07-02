@@ -2256,6 +2256,52 @@ components:
               samples: { type: integer }
               within_1.5x: { type: integer }
 
+    AcceptanceTriageStats:
+      type: object
+      description: |
+        Aggregated acceptance-triage statistics derived from
+        `acceptance_triage_decided` audit entries (E31.11 / ADR-049
+        decision #4). Zero `samples` is normal before any acceptance
+        failure has been triaged.
+      required: [samples, class_counts, disposition_counts, plan_review_misses, plan_review_miss_rate]
+      properties:
+        workflow_id:
+          type: string
+          description: Workflow ID filter applied, if any.
+        samples:
+          type: integer
+          description: |
+            Number of triage decisions included — per DECISION, not per
+            run. Entries whose payload fails to decode still count (under
+            class `""`), so the denominator never silently shrinks.
+        class_counts:
+          type: object
+          description: |
+            Per-class decision counts. Keys are the E31.8 triage classes
+            (`1`–`4`; `""` for an undecodable payload).
+          additionalProperties: { type: integer }
+        disposition_counts:
+          type: object
+          description: |
+            Per-disposition decision counts (the E31.8 disposition
+            vocabulary: `fixup_dispatched`, `retry_dispatched`, `paged`,
+            the paged degradation variants; `""` for an undecodable
+            payload).
+          additionalProperties: { type: integer }
+        plan_review_misses:
+          type: integer
+          description: |
+            Count of class-3 decisions — plan-review-miss events (a failed
+            criterion that was inferred-source or unresolvable against the
+            approved plan).
+        plan_review_miss_rate:
+          type: number
+          format: double
+          description: |
+            `plan_review_misses / samples`. 0 when `samples` is 0 (never
+            NaN). Per triage decision — a run re-triaged after a re-run
+            counts each decision.
+
     User:
       type: object
       required: [id, github_login, name]
@@ -4724,6 +4770,48 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '503':
           description: Audit repository not configured on this instance.
+
+  /v0/acceptance-triage/stats:
+    get:
+      operationId: getAcceptanceTriageStats
+      summary: Get acceptance-triage statistics
+      description: |
+        Aggregates `acceptance_triage_decided` audit entries (E31.8) by class
+        and disposition and reports `plan_review_miss_rate` — the ADR-049
+        decision #4 feedback metric: class-3 decisions (a failed criterion
+        that was inferred-source or unresolvable against the approved plan —
+        a bad criterion the plan gate approved) over all triage decisions
+        (E31.11).
+
+        Rate semantics are per triage DECISION, not per run: a run
+        re-triaged after a re-run counts each decision. An entry whose
+        payload fails to decode is counted under class `""` so the
+        denominator never silently shrinks. Zero `samples` is a valid
+        response (rate 0, never NaN).
+      tags: [calibration]
+      parameters:
+        - name: workflow_id
+          in: query
+          description: |
+            Scope results to a specific workflow ID (best-effort per-entry
+            run resolution; entries whose run cannot be resolved are
+            skipped).
+          schema: { type: string }
+        - name: since
+          in: query
+          description: RFC 3339 lower bound; omit for all-time stats.
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Acceptance-triage statistics (samples may be 0).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptanceTriageStats' }
+        '400':
+          description: "`validation_failed` — `since` is not a valid RFC 3339 timestamp."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '503':
+          description: "`acceptance_stats_unconfigured` — audit repository not configured on this instance."
 
   # ---------------------------------------------------------------------
   # Stages, artifacts, approvals
