@@ -105,6 +105,26 @@ func FixupSelfReportPath(runID, stageID string) string {
 	return fmt.Sprintf("/tmp/fishhawk-fixup-selfreport-%s-%s.json", runID, stageID)
 }
 
+// FixupCommitMessagePath is the run/stage-keyed path a fix-up agent writes the
+// Conventional-Commits commit message for THAT pass to, and the runner reads
+// the fix-up commit's subject+body from (#1572). Deliberately NOT reusing
+// /tmp/fishhawk-pr.md: the fix-up prompt renders no PR-description block (the
+// PR already exists), so a fix-up must never clobber the PR's title/body, and a
+// stale PR file from the original implement pass can never masquerade as this
+// pass's commit message. Keyed by the FULL run id + stage id (same rationale as
+// FixupSelfReportPath) so a leftover sidecar from a different run/stage can
+// never collide — the first of three freshness defenses (the others being the
+// pre-invoke delete and the delete-after-read in the runner).
+//
+// The runner mirrors this EXACT format string in fixupCommitMessagePath
+// (runner/cmd/fishhawk-runner/main.go) — the same independent-module
+// coordination as FixupSelfReportPath / fixupSelfReportPath. A one-sided edit
+// to either format string is caught by the prompt-render test (asserts the
+// literal substituted path) plus the runner load test.
+func FixupCommitMessagePath(runID, stageID string) string {
+	return fmt.Sprintf("/tmp/fishhawk-fixup-commitmsg-%s-%s.txt", runID, stageID)
+}
+
 // CalibrationBand holds accuracy statistics for a single confidence level
 // (high / medium / low) within a calibration window.
 type CalibrationBand struct {
@@ -927,7 +947,7 @@ func buildImplement(t Trigger) string {
 	b.WriteString(PullRequestDescriptionPath)
 	b.WriteString("`. Format:\n")
 	b.WriteString("\n")
-	b.WriteString("- The first line is the PR title. Write a task-specific summary of what you changed (e.g. `Add make minio-init target`). Keep it ≤72 characters and do not prefix it with `Fishhawk:` — the runner adds attribution separately.\n")
+	b.WriteString("- The first line is a Conventional Commits v1.0.0 header of the form `type(scope): description` — it becomes BOTH the PR title and the commit subject. `type` MUST be lowercase and one of `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `perf`, `build`; the `(scope)` is optional (a lowercase area name in parentheses); then `: ` and an imperative, task-specific description of what you changed (e.g. `feat(runner): add minio-init target`). Be specific — vague subjects like `fix bug` or `update code` are not acceptable. Aim for ≤50 characters and never exceed 72. Mark a breaking change with a `!` before the colon (`feat!: …`) or a `BREAKING CHANGE:` footer. Do not prefix it with `Fishhawk:` — the runner adds attribution separately.\n")
 	b.WriteString("- Leave one blank line.\n")
 	b.WriteString("- The rest is the PR body in markdown. Use these sections (and only these), in this order:\n")
 	b.WriteString("  - `## Summary` — 1–3 bullets covering the motivation and the load-bearing changes. Don't restate the diff line-by-line.\n")
@@ -1177,6 +1197,32 @@ func writeFixupSelfReport(b *strings.Builder, t Trigger) {
 		"`failed` (it did not). Any other value, or an absent sidecar, is ignored — no divergence is reported.\n\n")
 }
 
+// writeFixupCommitMessage renders the "### Write this pass's commit message"
+// block for the slim fix-up prompt (#1572): the agent writes a Conventional
+// Commits v1.0.0 message describing THIS fix-up pass's change to a run/stage-
+// keyed sidecar (FixupCommitMessagePath) the runner consumes for the fix-up
+// commit's subject+body. Deliberately a commit message ONLY — NOT a PR
+// description: the PR already exists on a fix-up, so the pass must never clobber
+// its title/body (hence the dedicated sidecar rather than /tmp/fishhawk-pr.md).
+// Guarded on populated run/stage ids by the caller so a trigger missing them
+// omits the section rather than rendering a malformed (unkeyed) path the runner
+// would never read. Fix-up-only: NOT rendered by the full buildImplement prompt.
+func writeFixupCommitMessage(b *strings.Builder, t Trigger) {
+	path := FixupCommitMessagePath(t.ImplementRunID, t.ImplementStageID)
+	b.WriteString("### Write this pass's commit message\n\n")
+	b.WriteString("This fix-up pass gets its OWN commit. After you have made your change, write a commit " +
+		"message describing what THIS pass changed (not the original implementation) as a Conventional " +
+		"Commits v1.0.0 message.\n\n")
+	fmt.Fprintf(b, "Write the message to `%s`:\n\n", path)
+	b.WriteString("- The first line is a Conventional Commits header `type(scope): description`, with `type` " +
+		"one of `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `perf`, `build`, an optional `(scope)`, " +
+		"and an imperative description of this pass's change (e.g. `fix: guard nil pool in retry path`). " +
+		"Aim for ≤50 characters and never exceed 72.\n")
+	b.WriteString("- Optionally leave one blank line and add a body explaining the fix-up.\n")
+	b.WriteString("- Do NOT write a PR description here — the pull request already exists; this file is the " +
+		"commit message for THIS fix-up pass only.\n\n")
+}
+
 // writeGitOpsProhibition renders the line forbidding the agent from running
 // any branch/commit-mutating git command — the runner owns all version
 // control and the shared checkout. Shared by the full implement prompt and
@@ -1249,6 +1295,17 @@ func buildImplementFixup(t Trigger) string {
 	// a malformed (run/stage-unkeyed) sidecar path the runner would never read.
 	if t.ImplementRunID != "" && t.ImplementStageID != "" {
 		writeFixupSelfReport(&b, t)
+	}
+
+	// Per-pass commit message (#1572): instruct the fix-up agent to write a
+	// Conventional-Commits message describing THIS pass's change to a run/stage-
+	// keyed sidecar the runner consumes for the fix-up commit. Guarded on the
+	// populated run/stage ids (same shape as the self-report section) so a
+	// trigger missing them omits the section rather than rendering a malformed
+	// (unkeyed) sidecar path. Deliberately NOT the PR-description block — the
+	// PR already exists on a fix-up.
+	if t.ImplementRunID != "" && t.ImplementStageID != "" {
+		writeFixupCommitMessage(&b, t)
 	}
 
 	writeGitOpsProhibition(&b)

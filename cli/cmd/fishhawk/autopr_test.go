@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -51,7 +52,7 @@ func TestParsePRDescriptionFile_MissingFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	wantTitle := "Fishhawk: implement stage aabbccdd"
+	wantTitle := "chore: fishhawk implement stage aabbccdd"
 	if title != wantTitle {
 		t.Errorf("title = %q, want %q", title, wantTitle)
 	}
@@ -75,9 +76,88 @@ func TestParsePRDescriptionFile_BlankFirstLineFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	wantTitle := "Fishhawk: implement stage 11111111"
+	wantTitle := "chore: fishhawk implement stage 11111111"
 	if title != wantTitle {
 		t.Errorf("title = %q, want %q", title, wantTitle)
+	}
+}
+
+// captureStderr redirects os.Stderr to a pipe for the duration of fn and
+// returns everything written to it.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	defer func() { os.Stderr = orig }()
+	fn()
+	if cerr := w.Close(); cerr != nil {
+		t.Fatal(cerr)
+	}
+	out, rerr := io.ReadAll(r)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	return string(out)
+}
+
+// TestParsePRDescriptionFile_NonConventionalTitleWarns (#1572): a non-conventional
+// agent title emits pr_template_warning AND is used verbatim.
+func TestParsePRDescriptionFile_NonConventionalTitleWarns(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "pr-*.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, werr := f.WriteString("Add widget support\n\n## Summary\n- adds widgets\n"); werr != nil {
+		t.Fatal(werr)
+	}
+	f.Close()
+
+	var title string
+	stderr := captureStderr(t, func() {
+		var perr error
+		title, _, perr = parsePRDescriptionFile(f.Name(), "11111111-2222-3333-4444-555555555555")
+		if perr != nil {
+			t.Fatalf("unexpected error: %v", perr)
+		}
+	})
+	if title != "Add widget support" {
+		t.Errorf("non-conventional title must be used VERBATIM, got %q", title)
+	}
+	if !strings.Contains(stderr, `"event":"pr_template_warning"`) ||
+		!strings.Contains(stderr, "title is not a conventional-commit header") {
+		t.Errorf("expected conventional-header pr_template_warning, got %q", stderr)
+	}
+}
+
+// TestParsePRDescriptionFile_ConventionalTitleNoWarn (#1572): a conventional
+// agent title emits NO pr_template_warning.
+func TestParsePRDescriptionFile_ConventionalTitleNoWarn(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "pr-*.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, werr := f.WriteString("feat(widget): add widget support\n\n## Summary\n- adds widgets\n"); werr != nil {
+		t.Fatal(werr)
+	}
+	f.Close()
+
+	var title string
+	stderr := captureStderr(t, func() {
+		var perr error
+		title, _, perr = parsePRDescriptionFile(f.Name(), "11111111-2222-3333-4444-555555555555")
+		if perr != nil {
+			t.Fatalf("unexpected error: %v", perr)
+		}
+	})
+	if title != "feat(widget): add widget support" {
+		t.Errorf("conventional title = %q", title)
+	}
+	if strings.Contains(stderr, "pr_template_warning") {
+		t.Errorf("conventional title must not warn, got %q", stderr)
 	}
 }
 
