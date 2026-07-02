@@ -1079,6 +1079,53 @@ func TestRetryStage_AcceptanceReopen_HappyPath(t *testing.T) {
 	}
 }
 
+// b1b: with an orchestrator wired, the reopen hands off to it — the reopened
+// pending acceptance stage walks pending → dispatched (the agent dispatch path;
+// fireDispatch no-ops with no GitHub client) and the response reflects the
+// POST-advance GetStage refresh (dispatched), not the intermediate pending
+// state. This is the recovery behavior b1 leaves untested by running with no
+// orchestrator: both the Orchestrator.Advance call and the dec.Stage = updated
+// refresh only execute when an orchestrator is present.
+func TestRetryStage_AcceptanceReopen_OrchestratorAdvances(t *testing.T) {
+	repo := newApprovalRunRepo()
+	au := &reopenAuditFake{approvalAuditFake: newApprovalAuditFake()}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      repo,
+		AuditRepo:    au,
+		ApprovalRepo: newFakeApprovalRepo(),
+		// No GitHub: the agent dispatch's workflow_dispatch is skipped, but the
+		// pending → dispatched state transition still happens.
+		Orchestrator: &orchestrator.Orchestrator{Runs: repo},
+	})
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var body stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// The orchestrator advanced the reopened stage; the response reflects the
+	// post-advance refresh. Without the Advance handoff OR the GetStage
+	// re-fetch, this would still read pending.
+	if body.State != string(run.StageStateDispatched) {
+		t.Errorf("body.State = %q, want dispatched (orchestrator advance + post-advance refresh)", body.State)
+	}
+	// The stage genuinely moved in the repo, not just in the response.
+	if got, _ := repo.GetStage(context.Background(), stage.ID); got.State != run.StageStateDispatched {
+		t.Errorf("stage state = %q, want dispatched after orchestrator advance", got.State)
+	}
+	// The acceptance_reopened audit entry is still written (audit-first, before
+	// the handoff).
+	if len(au.appended) != 1 || au.appended[0].Category != CategoryAcceptanceReopened {
+		t.Fatalf("audit chain = %+v, want one acceptance_reopened entry", au.appended)
+	}
+}
+
 // b2: an acceptance_outcome_recorded entry EXISTS for the stage → 422
 // retry_not_applicable, no transition, no audit write (verdict-ful routing
 // belongs to the deterministic triage).
