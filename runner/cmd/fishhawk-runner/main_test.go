@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -187,6 +188,7 @@ type fakeUploader struct {
 	instTokenErr   error
 	mcpTokenErr    error
 	retryStageErr  error
+	acceptanceErr  error
 
 	// Recorded calls.
 	gotIssueRunID string
@@ -198,13 +200,14 @@ type fakeUploader struct {
 	gotShipArgs *upload.ShipArgs
 	// gotShipCalls captures every ShipTrace call in order so tests
 	// can assert that both variants ship per stage.
-	gotShipCalls     []upload.ShipArgs
-	gotPromptArgs    *upload.FetchPromptArgs
-	gotPlanArgs      *upload.ShipPlanArgs
-	gotPRArgs        *upload.ShipPullRequestArgs
-	gotInstTokenArgs *upload.FetchInstallationTokenArgs
-	gotMCPTokenArgs  *upload.FetchMCPTokenArgs
-	gotRetryArgs     []upload.RetryStageArgs
+	gotShipCalls      []upload.ShipArgs
+	gotPromptArgs     *upload.FetchPromptArgs
+	gotPlanArgs       *upload.ShipPlanArgs
+	gotPRArgs         *upload.ShipPullRequestArgs
+	gotInstTokenArgs  *upload.FetchInstallationTokenArgs
+	gotMCPTokenArgs   *upload.FetchMCPTokenArgs
+	gotRetryArgs      []upload.RetryStageArgs
+	gotAcceptanceArgs *upload.ShipAcceptanceArgs
 
 	// Lineage-completion read seam (#1137): lineageComplete maps a run id
 	// to its reported completion; lineageCompleteErr forces an error;
@@ -355,6 +358,32 @@ func (f *fakeUploader) ShipPlan(_ context.Context, args upload.ShipPlanArgs) (*u
 		StageID:       args.StageID,
 		ContentHash:   "deadbeef",
 		SchemaVersion: "standard_v1",
+	}, nil
+}
+
+// ShipAcceptance stubs the E31.7 / #1535 evidence-ship endpoint.
+// Records the args (body + signing key) so tests can assert the runner
+// shipped the redacted verdict with the issued run key.
+func (f *fakeUploader) ShipAcceptance(_ context.Context, args upload.ShipAcceptanceArgs) (*upload.ShipAcceptanceResult, error) {
+	a := args
+	f.gotAcceptanceArgs = &a
+	if err := f.rejectIfStaleKey(args.PrivateKey); err != nil {
+		return nil, err
+	}
+	if f.acceptanceErr != nil {
+		return nil, f.acceptanceErr
+	}
+	var acc struct {
+		Verdict     string `json:"verdict"`
+		FailureMode string `json:"failure_mode"`
+	}
+	_ = json.Unmarshal(args.Body, &acc)
+	return &upload.ShipAcceptanceResult{
+		ID:          "00000000-0000-0000-0000-000000000ccc",
+		StageID:     args.StageID,
+		ContentHash: "feedface",
+		Verdict:     acc.Verdict,
+		FailureMode: acc.FailureMode,
 	}, nil
 }
 
@@ -13093,4 +13122,250 @@ func mustOutput(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %v: %v", args, err)
 	}
 	return string(out)
+}
+
+// TestRun_AcceptanceStage_EndToEnd crosses every acceptance-stage seam
+// in one pass (E31.7 / #1535): prompt-response wire (egress_target_hosts
+// + acceptance_criteria_ids) → runner decode → contained invocation
+// composition (no MCP/repo token, temp working dir, proxy-routed env,
+// verdict schema) → verdict capture → signed ship + evidence event.
+//
+// Authority-boundary assertions (binding approval conditions):
+//   - the invocation env contains NONE of FISHHAWK_API_TOKEN,
+//     GITHUB_TOKEN, GH_TOKEN, FISHHAWK_GITHUB_TOKEN — even though all
+//     four are present in the runner's own environment;
+//   - the repo checkout is untouched after the stage: working tree
+//     clean and HEAD unchanged — proving the no-commit-path claim
+//     behaviorally, not by cwd comparison.
+//
+// Egress containment: the fake agent drives real HTTP through the
+// started proxy — the spec-declared target host is admitted (200), a
+// non-allow-listed host is refused (403).
+func TestRun_AcceptanceStage_EndToEnd(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "README.md"), "hello\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "initial")
+	headBefore := gitHead(t, repo)
+
+	// The "running target instance" (allow-listed) and a second server
+	// standing in for an exfiltration destination (NOT allow-listed).
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "target instance ok")
+	}))
+	t.Cleanup(target.Close)
+	denied := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "should never be reachable")
+	}))
+	t.Cleanup(denied.Close)
+	targetHost := strings.TrimPrefix(target.URL, "http://")
+
+	// Seed the runner env with every credential class the acceptance
+	// invocation must NOT inherit (binding condition 2) — plus a
+	// legitimate operator passthrough that MUST arrive.
+	t.Setenv("FISHHAWK_API_TOKEN", "fhm_must_not_leak")
+	t.Setenv("GITHUB_TOKEN", "ghp_must_not_leak")
+	t.Setenv("GH_TOKEN", "gho_must_not_leak")
+	t.Setenv("FISHHAWK_GITHUB_TOKEN", "ghs_must_not_leak")
+	t.Setenv("FISHHAWK_ACCEPTANCE_ENV_TARGET_BASIC_AUTH", "user:pass")
+
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:               "22222222-3333-4444-5555-666666666666",
+		StageType:             "acceptance",
+		Prompt:                "Validate the running instance against the criteria.",
+		PromptHash:            "deadbeef",
+		EgressTargetHosts:     []string{targetHost},
+		AcceptanceCriteriaIDs: []string{"AC1", "AC2"},
+	}
+	withFakeUploader(t, fu)
+
+	// Keep the file-fallback path out of the real shared /tmp file.
+	origPath := acceptanceVerdictPath
+	acceptanceVerdictPath = filepath.Join(t.TempDir(), "fishhawk-acceptance.json")
+	t.Cleanup(func() { acceptanceVerdictPath = origPath })
+
+	verdict := `{"verdict":"passed","criteria":[` +
+		`{"id":"AC1","result":"passed","observed":"200 with body","expected":"200","steps_taken":"GET /","expectation_basis":"criterion AC1","repro_handle":"curl ` + target.URL + `"},` +
+		`{"id":"AC2","result":"skipped"}],"target_url":"` + target.URL + `"}`
+
+	forbidden := []string{"FISHHAWK_API_TOKEN", "GITHUB_TOKEN", "GH_TOKEN", "FISHHAWK_GITHUB_TOKEN"}
+	invoker := &fakeInvoker{
+		canned: agent.Result{OK: true, StructuredOutput: []byte(verdict)},
+		onInvoke: func(_ int, inv agent.Invocation) {
+			// (a) Credential containment: none of the forbidden keys in
+			// the seed env (BaseEnv) nor the overlay (Env).
+			if inv.BaseEnv == nil {
+				t.Error("BaseEnv must be set on an acceptance invocation")
+			}
+			baseKeys := map[string]string{}
+			for _, kv := range inv.BaseEnv {
+				if i := strings.IndexByte(kv, '='); i > 0 {
+					baseKeys[kv[:i]] = kv[i+1:]
+				}
+			}
+			for _, k := range forbidden {
+				if _, ok := baseKeys[k]; ok {
+					t.Errorf("forbidden env %s present in BaseEnv", k)
+				}
+				if _, ok := inv.Env[k]; ok {
+					t.Errorf("forbidden env %s present in Env overlay", k)
+				}
+			}
+			if got := baseKeys["TARGET_BASIC_AUTH"]; got != "user:pass" {
+				t.Errorf("operator passthrough TARGET_BASIC_AUTH = %q, want user:pass", got)
+			}
+
+			// (b) The working dir is a fresh temp dir, not the repo
+			// checkout (diff-withholding), and it is empty.
+			if inv.WorkingDir == repo || strings.HasPrefix(inv.WorkingDir, repo+string(filepath.Separator)) {
+				t.Errorf("acceptance working dir %q must not be the repo checkout %q", inv.WorkingDir, repo)
+			}
+			if !strings.Contains(filepath.Base(inv.WorkingDir), "fishhawk-acceptance-") {
+				t.Errorf("working dir %q not the acceptance temp dir", inv.WorkingDir)
+			}
+			if entries, err := os.ReadDir(inv.WorkingDir); err != nil {
+				t.Errorf("working dir unreadable: %v", err)
+			} else if len(entries) != 0 {
+				t.Errorf("working dir not empty: %d entries", len(entries))
+			}
+
+			// (c) The verdict schema constrains structured output.
+			if inv.JSONSchema != acceptanceVerdictJSONSchema {
+				t.Error("Invocation.JSONSchema is not the acceptance verdict schema")
+			}
+
+			// (d) Egress containment through the routed proxy: the
+			// declared target host is admitted, the other host refused.
+			proxyURL := baseKeys["HTTPS_PROXY"]
+			if proxyURL == "" || proxyURL != baseKeys["HTTP_PROXY"] {
+				t.Fatalf("proxy env not routed: HTTPS_PROXY=%q HTTP_PROXY=%q",
+					baseKeys["HTTPS_PROXY"], baseKeys["HTTP_PROXY"])
+			}
+			pu, err := url.Parse(proxyURL)
+			if err != nil {
+				t.Fatalf("proxy URL %q: %v", proxyURL, err)
+			}
+			httpc := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(pu)}}
+			resp, err := httpc.Get(target.URL)
+			if err != nil {
+				t.Fatalf("GET target via proxy: %v", err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "target instance ok") {
+				t.Errorf("target via proxy = %d %q, want 200 with target body", resp.StatusCode, body)
+			}
+			resp, err = httpc.Get(denied.URL)
+			if err != nil {
+				t.Fatalf("GET denied host via proxy: %v", err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden {
+				t.Errorf("non-allow-listed host = %d, want 403 (default-deny)", resp.StatusCode)
+			}
+		},
+	}
+	withFakeInvoker(t, invoker)
+
+	bundlePath := filepath.Join(t.TempDir(), "bundle.jsonl.gz")
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change",
+		"--stage", "acceptance",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+		"--working-dir", repo,
+		"--upload-trace",
+		"--bundle-out", bundlePath,
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if invoker.callIdx != 1 {
+		t.Fatalf("agent invoked %d times, want 1", invoker.callIdx)
+	}
+
+	// No MCP token was minted for the acceptance agent, deliberately and
+	// visibly (ADR-050 #2).
+	if fu.gotMCPTokenArgs != nil {
+		t.Error("FetchMCPToken must not be called for an acceptance stage")
+	}
+	if !strings.Contains(stderr.String(), `"event":"acceptance_no_mcp_token"`) {
+		t.Errorf("missing acceptance_no_mcp_token event: %s", stderr.String())
+	}
+
+	// The signed ship carried a valid acceptanceBody keyed by the served
+	// criterion ids, signed with the issued run key (the fake uploader
+	// stands in for the HTTP layer; the signature-over-sha256(body)
+	// wire contract is locked by upload's TestShipAcceptance_HappyPath).
+	if fu.gotAcceptanceArgs == nil {
+		t.Fatal("ShipAcceptance not called")
+	}
+	if fu.gotAcceptanceArgs.RunID != "11111111-2222-3333-4444-555555555555" ||
+		fu.gotAcceptanceArgs.StageID != "22222222-3333-4444-5555-666666666666" {
+		t.Errorf("ShipAcceptance run/stage = %q/%q",
+			fu.gotAcceptanceArgs.RunID, fu.gotAcceptanceArgs.StageID)
+	}
+	if !fu.gotAcceptanceArgs.PrivateKey.Equal(fu.priv) {
+		t.Error("ShipAcceptance must sign with the issued run key")
+	}
+	if err := validateAcceptanceVerdict(fu.gotAcceptanceArgs.Body, []string{"AC1", "AC2"}); err != nil {
+		t.Errorf("shipped body fails the served-criteria validation: %v", err)
+	}
+	var shipped acceptanceVerdict
+	if err := json.Unmarshal(fu.gotAcceptanceArgs.Body, &shipped); err != nil {
+		t.Fatalf("shipped body does not decode: %v", err)
+	}
+	if shipped.Verdict != "passed" || len(shipped.Criteria) != 2 ||
+		shipped.Criteria[0].ID != "AC1" || shipped.Criteria[1].ID != "AC2" {
+		t.Errorf("shipped verdict = %+v", shipped)
+	}
+	if shipped.Criteria[0].ExpectationBasis == "" || shipped.Criteria[0].ReproHandle == "" {
+		t.Error("optional per-criterion fields dropped from the shipped body")
+	}
+	if !strings.Contains(stderr.String(), `"event":"acceptance_shipped"`) {
+		t.Errorf("missing acceptance_shipped event: %s", stderr.String())
+	}
+
+	// The packed bundle carries the acceptance_evidence event.
+	bundleBytes, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatalf("read bundle: %v", err)
+	}
+	_, lines, _, err := openBundleForTest(bundleBytes)
+	if err != nil {
+		t.Fatalf("open bundle: %v", err)
+	}
+	foundEvidence := false
+	for _, ln := range lines {
+		if ln.Kind == "acceptance_evidence" {
+			foundEvidence = true
+			var payload acceptanceVerdict
+			if err := json.Unmarshal(ln.Data, &payload); err != nil || payload.Verdict != "passed" {
+				t.Errorf("acceptance_evidence payload = %s (err %v)", ln.Data, err)
+			}
+		}
+	}
+	if !foundEvidence {
+		t.Error("bundle missing acceptance_evidence event")
+	}
+
+	// The repo checkout is untouched: working tree clean, HEAD unchanged
+	// (binding condition 2 — behavioral proof of the no-commit-path claim).
+	if headAfter := gitHead(t, repo); headAfter != headBefore {
+		t.Errorf("repo HEAD moved: %s -> %s", headBefore, headAfter)
+	}
+	statusOut, err := exec.Command("git", "-C", repo, "status", "--porcelain").Output()
+	if err != nil {
+		t.Fatalf("git status: %v", err)
+	}
+	if len(bytes.TrimSpace(statusOut)) != 0 {
+		t.Errorf("repo working tree dirty after acceptance stage:\n%s", statusOut)
+	}
 }

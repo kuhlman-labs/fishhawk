@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
@@ -69,6 +70,14 @@ type acceptanceCriterionResult struct {
 	Observed   string `json:"observed,omitempty"`
 	Expected   string `json:"expected,omitempty"`
 	StepsTaken string `json:"steps_taken,omitempty"`
+	// ExpectationBasis cites where the expectation came from (the criterion's
+	// statement, the issue text, a spec section) so a failed assertion is
+	// auditable against its source. Optional (E31.7 verdict shape, #1535).
+	ExpectationBasis string `json:"expectation_basis,omitempty"`
+	// ReproHandle is a re-run pointer for the observation — the command,
+	// request, or script the validator used — so a human can reproduce the
+	// evidence. Optional (E31.7 verdict shape, #1535).
+	ReproHandle string `json:"repro_handle,omitempty"`
 }
 
 // acceptanceBody is the wire shape the acceptance validator (E31.7 runner) or
@@ -440,11 +449,42 @@ func (s *Server) authorizeAcceptance(w http.ResponseWriter, r *http.Request, run
 // on the documented interim posture) yields the empty string and
 // buildAcceptance renders its explicit not-declared line.
 func (s *Server) resolveAcceptanceTargetURL(ctx context.Context, runRow *run.Run) string {
-	st, ok := s.resolveAcceptanceStageSpec(ctx, runRow)
-	if !ok || st.Egress == nil || len(st.Egress.TargetHosts) == 0 {
+	hosts := s.resolveAcceptanceEgressTargetHosts(ctx, runRow)
+	if len(hosts) == 0 {
 		return ""
 	}
-	return st.Egress.TargetHosts[0]
+	return hosts[0]
+}
+
+// resolveAcceptanceEgressTargetHosts returns ALL of the acceptance stage's
+// spec-declared egress target hosts (the E31.4/#1532 grammar), in declaration
+// order. The full list — not just the first host the prompt-text seam renders
+// — is served on the acceptance-stage prompt response as egress_target_hosts:
+// the runner's ADR-050 egress-proxy allow-list input (E31.7 / #1535). nil for
+// a spec with no egress block, so the response field stays omitted.
+func (s *Server) resolveAcceptanceEgressTargetHosts(ctx context.Context, runRow *run.Run) []string {
+	st, ok := s.resolveAcceptanceStageSpec(ctx, runRow)
+	if !ok || st.Egress == nil || len(st.Egress.TargetHosts) == 0 {
+		return nil
+	}
+	return st.Egress.TargetHosts
+}
+
+// acceptanceCriteriaIDsFromPlan extracts the approved plan's
+// verification.acceptance_criteria ids, in plan order. Served on the
+// acceptance-stage prompt response as acceptance_criteria_ids so the runner
+// can validate the shipped verdict's criteria[].id join keys against the
+// served set (E31.7 / #1535). nil for a nil plan or an empty criteria set,
+// so the response field stays omitted.
+func acceptanceCriteriaIDsFromPlan(p *plan.Plan) []string {
+	if p == nil || len(p.Verification.AcceptanceCriteria) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(p.Verification.AcceptanceCriteria))
+	for _, c := range p.Verification.AcceptanceCriteria {
+		ids = append(ids, c.ID)
+	}
+	return ids
 }
 
 // acceptanceResponse echoes the persisted artifact's identity back to the

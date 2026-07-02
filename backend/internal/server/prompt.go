@@ -180,6 +180,35 @@ type promptResponse struct {
 	// convention as ImplementModel. A tag drift here silently drops the model and
 	// the runner falls back to today's spawn.
 	PlanModel string `json:"plan_model,omitempty"`
+	// EgressTargetHosts is the acceptance stage's FULL spec-declared egress
+	// target-host list (the E31.4/#1532 grammar), served ONLY on acceptance
+	// stages (E31.7 / #1535). The runner feeds it into the ADR-050 egress
+	// proxy's allow-list before spawning the acceptance agent. Distinct from
+	// the prompt TEXT's target-instance line, which renders only the first
+	// host. Absent on every other stage type, and on an acceptance stage whose
+	// spec declares no egress block — the proxy then admits only model + backend
+	// hosts (fail-closed).
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (`egress_target_hosts`) MUST
+	// stay byte-identical to the runner's upload.FetchedPrompt.EgressTargetHosts
+	// decoder (runner/internal/upload/upload.go) — the same independent-struct-
+	// by-tag convention as ImplementModel/ScopeExemptions. A tag drift here
+	// silently empties the proxy allow-list and the agent cannot reach the
+	// target instance.
+	EgressTargetHosts []string `json:"egress_target_hosts,omitempty"`
+	// AcceptanceCriteriaIDs is the approved plan's
+	// verification.acceptance_criteria id list (the E31.1 join keys), served
+	// ONLY on acceptance stages (E31.7 / #1535). The runner validates the
+	// acceptance verdict's criteria[].id join keys against this set before
+	// shipping, failing closed on an unknown id. Absent on every other stage
+	// type, and when the approved plan carries no criteria.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (`acceptance_criteria_ids`)
+	// MUST stay byte-identical to the runner's
+	// upload.FetchedPrompt.AcceptanceCriteriaIDs decoder
+	// (runner/internal/upload/upload.go). A tag drift here silently disables
+	// the runner's verdict join-key validation.
+	AcceptanceCriteriaIDs []string `json:"acceptance_criteria_ids,omitempty"`
 }
 
 // scopeExemption is one operator scope exemption: a DECLARED scope.files path
@@ -868,6 +897,15 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		resp.PlanModel = rm.Value
 		s.logModelResolution(r.Context(), runRow.ID, rm)
 	}
+	// Acceptance-stage containment inputs (E31.7 / #1535): the FULL egress
+	// target-host list (the runner's ADR-050 proxy allow-list) and the approved
+	// plan's criterion ids (the runner's verdict join-key validation set).
+	// trigger.ApprovedPlan was loaded by the acceptance branch above. Both
+	// omitempty, so every non-acceptance response is byte-identical to today.
+	if stage.Type == run.StageTypeAcceptance {
+		resp.EgressTargetHosts = s.resolveAcceptanceEgressTargetHosts(r.Context(), runRow)
+		resp.AcceptanceCriteriaIDs = acceptanceCriteriaIDsFromPlan(trigger.ApprovedPlan)
+	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
@@ -1167,6 +1205,12 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	if stage.Type == run.StageTypePlan {
 		rm := s.resolvePlanModelForRun(r.Context(), runRow)
 		resp.PlanModel = rm.Value
+	}
+	// Acceptance-stage containment inputs (E31.7 / #1535), same derivation as
+	// the dispatch path so the rendered response stays byte-consistent.
+	if stage.Type == run.StageTypeAcceptance {
+		resp.EgressTargetHosts = s.resolveAcceptanceEgressTargetHosts(r.Context(), runRow)
+		resp.AcceptanceCriteriaIDs = acceptanceCriteriaIDsFromPlan(trigger.ApprovedPlan)
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }

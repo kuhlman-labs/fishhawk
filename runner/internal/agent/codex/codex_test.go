@@ -85,6 +85,16 @@ func TestHelperProcess(t *testing.T) {
 			fmt.Printf(`{"type":"env","key":%q,"value":%q}`+"\n", k, os.Getenv(k))
 		}
 		fmt.Println(`{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}`)
+	case "echo_env_base":
+		// Echo the vars the BaseEnv tests assert on: a parent-process
+		// secret (must be ABSENT when BaseEnv replaces the os.Environ()
+		// seed, PRESENT when nil BaseEnv inherits it), the API-key
+		// overlay, and an Invocation.Env overlay — proving the overlays
+		// still apply on top of a BaseEnv seed.
+		for _, k := range []string{"FISHHAWK_TEST_HOST_SECRET", "OPENAI_API_KEY", "FISHHAWK_BACKEND_URL"} {
+			fmt.Printf(`{"type":"env","key":%q,"value":%q}`+"\n", k, os.Getenv(k))
+		}
+		fmt.Println(`{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}`)
 	case "spaced":
 		// Emit several events spaced apart so a shortened heartbeat interval
 		// fires multiple times, with usage advancing across turns so the
@@ -504,6 +514,135 @@ func TestInvoke_ForwardedEnvOverridesInherited(t *testing.T) {
 	}
 	if got["FISHHAWK_API_TOKEN"] != "fhm_configured_wins" {
 		t.Errorf("FISHHAWK_API_TOKEN = %q, want fhm_configured_wins (per-run Env must override inherited)", got["FISHHAWK_API_TOKEN"])
+	}
+}
+
+// envEvents collects the helper's kind=env echoes into a key->value map.
+func envEvents(t *testing.T, events []agent.Event) map[string]string {
+	t.Helper()
+	got := map[string]string{}
+	for _, ev := range events {
+		if ev.Kind != "env" {
+			continue
+		}
+		var e struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		}
+		if err := json.Unmarshal(ev.Payload, &e); err != nil {
+			t.Fatalf("env event not JSON: %v: %s", err, ev.Payload)
+		}
+		got[e.Key] = e.Value
+	}
+	if len(got) == 0 {
+		t.Fatal("no kind=env events captured")
+	}
+	return got
+}
+
+// nilEnvHelperCommand builds the helper re-exec but deliberately leaves
+// cmd.Env nil, so the adapter's own seed logic (os.Environ() vs BaseEnv)
+// runs — unlike helperCommand, which pre-sets cmd.Env and therefore
+// bypasses the seed point. The helper-process selectors
+// (GO_HELPER_PROCESS/HELPER_MODE) must reach the child via that seed:
+// BaseEnv entries in the replacement test, inherited t.Setenv vars in the
+// nil-preservation test.
+func nilEnvHelperCommand() func(ctx context.Context, name string, args ...string) *exec.Cmd {
+	return func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess")
+	}
+}
+
+// TestInvoke_BaseEnvReplacesEnvironSeed proves the BaseEnv seam (ADR-050 /
+// #1535): a non-nil Invocation.BaseEnv REPLACES the os.Environ() seed, so a
+// runner-env secret not in BaseEnv is invisible to the child, while the
+// API-key and Invocation.Env overlays still apply on top in the existing
+// order. Mirrors the claudecode adapter's test so the two adapters can't
+// drift on the seed contract.
+func TestInvoke_BaseEnvReplacesEnvironSeed(t *testing.T) {
+	// A parent-process secret that must NOT leak into the child.
+	t.Setenv("FISHHAWK_TEST_HOST_SECRET", "leaked-host-secret")
+	inv := &Invoker{
+		APIKey: "sk-base-overlay",
+		Cmd:    nilEnvHelperCommand(),
+		Now:    frozenNow(),
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{
+		BaseEnv: []string{
+			"GO_HELPER_PROCESS=1",
+			"HELPER_MODE=echo_env_base",
+		},
+		Env: map[string]string{"FISHHAWK_BACKEND_URL": "https://api.fishhawk.test"},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false: %s", res.FailureReason)
+	}
+	got := envEvents(t, res.Events)
+	if got["FISHHAWK_TEST_HOST_SECRET"] != "" {
+		t.Errorf("FISHHAWK_TEST_HOST_SECRET = %q, want empty (BaseEnv must replace the os.Environ() seed, not extend it)", got["FISHHAWK_TEST_HOST_SECRET"])
+	}
+	if got["OPENAI_API_KEY"] != "sk-base-overlay" {
+		t.Errorf("OPENAI_API_KEY = %q, want sk-base-overlay (API-key overlay must still apply on a BaseEnv seed)", got["OPENAI_API_KEY"])
+	}
+	if got["FISHHAWK_BACKEND_URL"] != "https://api.fishhawk.test" {
+		t.Errorf("FISHHAWK_BACKEND_URL = %q, want https://api.fishhawk.test (Invocation.Env overlay must still apply on a BaseEnv seed)", got["FISHHAWK_BACKEND_URL"])
+	}
+}
+
+// TestInvoke_EmptyBaseEnvSeedsEmptyEnv pins the default-deny corner: a
+// non-nil EMPTY BaseEnv (with no overlays) must seed an EMPTY child env,
+// not fall back to inherit-parent-env. os/exec treats a nil cmd.Env as
+// "inherit", so a copy that yields nil (e.g. append onto a nil slice)
+// would silently leak the whole runner env. The helper selectors are set
+// on the PARENT env only: if the child inherited anything it would enter
+// helper mode and echo the secret; with the correct empty seed it never
+// enters helper mode and emits no kind=env event.
+func TestInvoke_EmptyBaseEnvSeedsEmptyEnv(t *testing.T) {
+	t.Setenv("GO_HELPER_PROCESS", "1")
+	t.Setenv("HELPER_MODE", "echo_env_base")
+	t.Setenv("FISHHAWK_TEST_HOST_SECRET", "leaked-host-secret")
+	inv := &Invoker{Cmd: nilEnvHelperCommand(), Now: frozenNow()}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{BaseEnv: []string{}})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false: %s", res.FailureReason)
+	}
+	for _, ev := range res.Events {
+		if ev.Kind == "env" {
+			t.Fatalf("child entered helper mode on an inherited env: %s (empty BaseEnv must seed an EMPTY env, not inherit)", ev.Payload)
+		}
+	}
+}
+
+// TestInvoke_NilBaseEnvInheritsParentEnv pins the nil-preservation
+// contract: with BaseEnv nil AND no pre-set cmd.Env, the adapter seeds the
+// child from os.Environ() exactly as before BaseEnv existed — an inherited
+// parent-env var is visible to the child.
+func TestInvoke_NilBaseEnvInheritsParentEnv(t *testing.T) {
+	// The helper-process selectors AND the canary all travel via the
+	// inherited parent env — the very mechanism under test.
+	t.Setenv("GO_HELPER_PROCESS", "1")
+	t.Setenv("HELPER_MODE", "echo_env_base")
+	t.Setenv("FISHHAWK_TEST_HOST_SECRET", "inherited-visible")
+	inv := &Invoker{
+		Cmd: nilEnvHelperCommand(),
+		Now: frozenNow(),
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !res.OK {
+		t.Fatalf("OK = false: %s", res.FailureReason)
+	}
+	got := envEvents(t, res.Events)
+	if got["FISHHAWK_TEST_HOST_SECRET"] != "inherited-visible" {
+		t.Errorf("FISHHAWK_TEST_HOST_SECRET = %q, want inherited-visible (nil BaseEnv must preserve the os.Environ() seed)", got["FISHHAWK_TEST_HOST_SECRET"])
 	}
 }
 

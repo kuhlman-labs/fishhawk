@@ -64,6 +64,15 @@ const PlanArtifactPath = "/tmp/fishhawk-plan.json"
 // Hardcoded for v0 — same rationale as PlanArtifactPath. (#206.)
 const PullRequestDescriptionPath = "/tmp/fishhawk-pr.md"
 
+// AcceptanceVerdictPath is the absolute file-fallback path the acceptance
+// agent writes its structured verdict to when the driving adapter has no
+// structured-output channel (the codex path; claudecode agents emit the
+// verdict via --json-schema structured output, which the runner prefers).
+// Embedded in the acceptance prompt's output contract and read by the E31.7
+// runner executor's capture fallback. Hardcoded for v0 — same rationale as
+// PlanArtifactPath.
+const AcceptanceVerdictPath = "/tmp/fishhawk-acceptance.json"
+
 // ScopeJustificationPath is the run/stage-keyed path the implement agent
 // writes its scope self-exempt sidecar to (#1153) and the runner reads it
 // from. The path is keyed by the FULL run id + stage id (not shortened) so
@@ -1313,7 +1322,13 @@ func buildAcceptance(t Trigger) string {
 		"behaved without erroring but produced an unexpected result. Omit on a pass.\n")
 	b.WriteString("- `criteria`: one result per acceptance criterion above, keyed by the " +
 		"criterion `id`, each with `result` (`passed`/`failed`/`skipped`) and, where useful, " +
-		"`steps_taken` / `observed` / `expected`.\n\n")
+		"`steps_taken` / `observed` / `expected`, plus `expectation_basis` (where the " +
+		"expectation came from — the criterion statement, the issue text, a spec section) and " +
+		"`repro_handle` (the command or request a human can re-run to reproduce the " +
+		"observation).\n\n")
+	b.WriteString("Emit the verdict as structured output when your harness supports it. " +
+		"Otherwise, write the verdict as a single JSON object to " + AcceptanceVerdictPath +
+		" — the runner falls back to reading that file.\n\n")
 	b.WriteString("The result is shipped via the signed evidence bundle — keep evidence blobs " +
 		"customer-side and reference them by content hash; only the structured verdict + hashes " +
 		"cross to Fishhawk.\n")
