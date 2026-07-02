@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
@@ -42,7 +44,60 @@ const (
 	// artifact + its settled verdict. Written by handleShipAcceptance on every
 	// successful artifact persist.
 	CategoryAcceptanceOutcomeRecorded = "acceptance_outcome_recorded"
+	// CategoryAcceptanceTriageDecided records the deterministic triage of a
+	// failed acceptance verdict (E31.8 / #1536, ADR-049 decision #2). One
+	// chained entry per triage, written AFTER acting so the disposition records
+	// what actually happened. The class/disposition/criterion_ids payload tags
+	// match the render contract issuecomment/status_template.go already ships
+	// (renderAcceptanceTriageLine, E31.3) and the class-3 entry keyed by
+	// criterion_ids is the durable per-criterion disposition record E31.11
+	// consumes. Open-set string — audit_entries.category has no CHECK, so no
+	// migration (same posture as acceptance_outcome_recorded).
+	CategoryAcceptanceTriageDecided = "acceptance_triage_decided"
 )
+
+// Acceptance triage class values (E31.8). Strings, matching
+// renderAcceptanceTriageLine's "class-%s" contract:
+//   - class 1: the code attempts the behavior and objectively fails
+//     (failure_mode=error, or assertion_fail where every failed criterion is
+//     explicit-source) → bounded fix-up pass.
+//   - class 2: assertion_fail where no criterion failed but ≥1 was skipped —
+//     validation could not complete (environment/flake) → re-open + re-run.
+//   - class 3: a failed criterion is inferred-source or unresolvable against
+//     the plan (bad/ambiguous criterion) → page the human, no transition.
+//   - class 4: unitemized or provenance-ungroundable failure (works-as-planned,
+//     disputed) → page the human, no transition.
+const (
+	acceptanceClass1 = "1"
+	acceptanceClass2 = "2"
+	acceptanceClass3 = "3"
+	acceptanceClass4 = "4"
+)
+
+// Acceptance triage disposition vocabulary (E31.8). The tags
+// decodeAcceptanceActivity reads for the issue-comment render, and the tokens
+// issuecomment/ping.go's page-class gate keys the must_page_human ping on.
+const (
+	acceptanceDispositionFixupDispatched  = "fixup_dispatched"
+	acceptanceDispositionRetryDispatched  = "retry_dispatched"
+	acceptanceDispositionPaged            = "paged"
+	acceptanceDispositionRerunBudget      = "rerun_budget_exhausted"
+	acceptanceDispositionFixupUnavailable = "fixup_unavailable_paged"
+	acceptanceDispositionRetryUnavailable = "retry_unavailable_paged"
+	acceptanceDispositionUnsettled        = "unsettled_paged"
+)
+
+// defaultMaxAcceptanceReruns bounds the number of auto-routed acceptance
+// triage decisions (fixup_dispatched | retry_dispatched) per run before the
+// disposition degrades to rerun_budget_exhausted (paged, no action) so
+// non-convergence always lands on the human. Package const, no new env var:
+// #1536 bounds re-runs at 1–2.
+const defaultMaxAcceptanceReruns = 2
+
+// acceptanceTriageSystemSubject is the token-less system identity the class-1
+// fix-up routes under: non-anonymous with TokenID=="" passes
+// identityHasGateScope (the shape fixupStageAs admits for in-process callers).
+const acceptanceTriageSystemSubject = "system:acceptance-triage"
 
 // Acceptance verdict + failure-mode values. Server-local open-set strings
 // (like the deploy audit categories) — the audit category has no DB CHECK and
@@ -376,6 +431,16 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	// data-drivenly through issuecomment's activityCategories set).
 	s.notifyStatusUpdate(r.Context(), runID, "acceptance_recorded")
 
+	// E31.8 (#1536): route a freshly persisted verdict:failed artifact through
+	// deterministic triage. ONLY on this fresh-create path — the idempotent
+	// replay branch above returns before here, so a re-delivered identical
+	// verdict cannot double-route. Best-effort relative to the ship: any
+	// internal error WARN-logs inside and never unwinds the 201 / artifact /
+	// outcome audit already committed.
+	if acc.Verdict == acceptanceVerdictFailed {
+		s.triageAcceptanceFailure(r.Context(), runID, stage, acc, created.ID.String())
+	}
+
 	s.writeJSON(w, r, http.StatusCreated, acceptanceResponse{
 		ID:          created.ID,
 		StageID:     created.StageID,
@@ -485,6 +550,427 @@ func acceptanceCriteriaIDsFromPlan(p *plan.Plan) []string {
 		ids = append(ids, c.ID)
 	}
 	return ids
+}
+
+// classifyAcceptanceFailure is the pure triage classifier (E31.8 / #1536): it
+// maps a failed verdict's failure_mode plus per-criterion results, resolved
+// against the approved plan's acceptance-criteria provenance (explicit vs
+// inferred), onto one of four classes. criteria is the approved plan's
+// acceptance_criteria (nil/empty when the plan predates the typed contract or
+// could not be loaded — provenance cannot be grounded). Returns the class,
+// the criterion ids that key the disposition (the E31.11 per-criterion join
+// key), and a one-line human-readable reason embedded in the audit payload.
+func classifyAcceptanceFailure(acc acceptanceBody, criteria []plan.AcceptanceCriterion) (class string, criterionIDs []string, reason string) {
+	// Provenance lookup by criterion id.
+	provenance := make(map[string]plan.CriterionSource, len(criteria))
+	for _, c := range criteria {
+		provenance[c.ID] = c.Source
+	}
+
+	// failure_mode=error: the code errored attempting the behavior — it
+	// objectively fails, so route to a bounded fix-up pass (class 1). Carry
+	// the failed criteria ids when the verdict itemized them.
+	if acc.FailureMode == acceptanceFailureError {
+		return acceptanceClass1, failedCriterionIDs(acc.Criteria),
+			"failure_mode=error: the code errored attempting the behavior; routing to a bounded fix-up pass"
+	}
+
+	// assertion_fail (validate() guarantees failure_mode is error or
+	// assertion_fail on a failed verdict). Partition the criteria results.
+	var failed []string
+	skipped := 0
+	for _, c := range acc.Criteria {
+		switch c.Result {
+		case acceptanceResultFailed:
+			failed = append(failed, c.ID)
+		case acceptanceResultSkipped:
+			skipped++
+		}
+	}
+
+	if len(failed) > 0 {
+		// Resolve every failed id against the plan provenance.
+		var inferredOrUnresolvable []string
+		allExplicit := true
+		for _, id := range failed {
+			src, ok := provenance[id]
+			if !ok || src != plan.CriterionSourceExplicit {
+				allExplicit = false
+				inferredOrUnresolvable = append(inferredOrUnresolvable, id)
+			}
+		}
+		if allExplicit {
+			// Every failed criterion is explicit-source — the code objectively
+			// fails a stated criterion (class 1).
+			return acceptanceClass1, failed,
+				"assertion_fail: every failed criterion is explicit-source; the code objectively fails a stated criterion"
+		}
+		// At least one failed criterion is inferred-source or unresolvable — a
+		// bad/ambiguous criterion (class 3). The criterion_ids record the
+		// per-criterion disposition E31.11 consumes.
+		return acceptanceClass3, inferredOrUnresolvable,
+			"assertion_fail: a failed criterion is inferred-source or unresolvable against the plan (bad/ambiguous criterion)"
+	}
+
+	// No failed criteria. A skip with no failure is an environment/flake
+	// signal: validation could not complete (class 2).
+	if skipped > 0 {
+		return acceptanceClass2, nil,
+			"assertion_fail: no criterion failed but at least one was skipped; validation could not complete (environment/flake signal)"
+	}
+
+	// F empty and no skips, OR the plan carries no acceptance_criteria to
+	// ground provenance: unitemized / provenance-ungroundable failure —
+	// works-as-planned, disputed (class 4).
+	return acceptanceClass4, nil,
+		"unitemized or provenance-ungroundable failure; works-as-planned/disputed — paging the human"
+}
+
+// failedCriterionIDs returns the ids of criteria whose result is failed, in
+// order.
+func failedCriterionIDs(criteria []acceptanceCriterionResult) []string {
+	var ids []string
+	for _, c := range criteria {
+		if c.Result == acceptanceResultFailed {
+			ids = append(ids, c.ID)
+		}
+	}
+	return ids
+}
+
+// triageAcceptanceFailure routes a freshly persisted verdict:failed artifact
+// (E31.8 / #1536). Called from handleShipAcceptance ONLY on the fresh-create
+// path (never the idempotent replay) and only when acc.Verdict==failed. It is
+// best-effort relative to the ship: every internal error WARN-logs and never
+// unwinds the 201 / artifact / outcome audit. It ALWAYS ends by writing ONE
+// acceptance_triage_decided chained entry recording what actually happened.
+func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, stage *run.Stage, acc acceptanceBody, artifactID string) {
+	// Load the approved plan for provenance grounding (nil-tolerant → the
+	// classifier grounds class 4).
+	var criteria []plan.AcceptanceCriterion
+	if p, err := s.loadApprovedPlanForRun(ctx, runID); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"acceptance triage: load approved plan failed; grounding provenance as absent",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+	} else if p != nil {
+		criteria = p.Verification.AcceptanceCriteria
+	}
+
+	class, criterionIDs, reason := classifyAcceptanceFailure(acc, criteria)
+
+	// Count prior auto-routed decisions from the audit chain (the durable
+	// mirror of countFixupPasses). A count failure means we cannot bound
+	// safely — degrade to paged without acting.
+	prior, err := s.countAcceptanceTriageRoutes(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"acceptance triage: count prior routed decisions failed; paging without action",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		s.writeAcceptanceTriageAudit(ctx, runID, stage.ID, artifactID, class,
+			acceptanceDispositionPaged, criterionIDs, acc.FailureMode, prior,
+			"triage route count failed; paging without action")
+		return
+	}
+
+	// Defensive settle check: an operator-bearer ship may race the trace-bundle
+	// settle. If the acceptance stage row is not yet succeeded, record the
+	// classification with unsettled_paged instead of acting.
+	if stage.State != run.StageStateSucceeded {
+		s.writeAcceptanceTriageAudit(ctx, runID, stage.ID, artifactID, class,
+			acceptanceDispositionUnsettled, criterionIDs, acc.FailureMode, prior,
+			fmt.Sprintf("acceptance stage not yet settled (state %q); recording classification without acting", stage.State))
+		return
+	}
+
+	// Re-run bound: at the cap keep the classified class but degrade to a paged
+	// variant so non-convergence lands on the human.
+	if prior >= defaultMaxAcceptanceReruns {
+		s.writeAcceptanceTriageAudit(ctx, runID, stage.ID, artifactID, class,
+			acceptanceDispositionRerunBudget, criterionIDs, acc.FailureMode, prior,
+			fmt.Sprintf("re-run budget exhausted (%d of %d auto-routed passes used); paging", prior, defaultMaxAcceptanceReruns))
+		return
+	}
+
+	// Route by class. Class 3 / class 4 take NO state transition — page.
+	var disposition string
+	switch class {
+	case acceptanceClass1:
+		disposition = s.routeAcceptanceClass1(ctx, runID, stage, acc, criteria, criterionIDs, reason)
+	case acceptanceClass2:
+		disposition = s.routeAcceptanceClass2(ctx, runID, stage)
+	default:
+		disposition = acceptanceDispositionPaged
+	}
+
+	s.writeAcceptanceTriageAudit(ctx, runID, stage.ID, artifactID, class,
+		disposition, criterionIDs, acc.FailureMode, prior, reason)
+}
+
+// routeAcceptanceClass1 synthesizes the behavioral evidence into
+// implement-stage fix-up concerns and routes them via the existing
+// fixupStageAs under a token-less system identity, with the triggering
+// acceptance stage re-opened (FixupOptions.AcceptanceStageID). Returns the
+// disposition: fixup_dispatched on success, fixup_unavailable_paged on ANY
+// routing refusal (implement stage not found, budget/ceiling exhausted, stage
+// not applicable) so the disposition always lands on the human at the cap.
+func (s *Server) routeAcceptanceClass1(ctx context.Context, runID uuid.UUID, stage *run.Stage, acc acceptanceBody, criteria []plan.AcceptanceCriterion, criterionIDs []string, reason string) string {
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"acceptance triage class-1: list stages failed; paging",
+			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
+		return acceptanceDispositionFixupUnavailable
+	}
+	var implement *run.Stage
+	for _, st := range stages {
+		if st.Type == run.StageTypeImplement {
+			implement = st
+			break
+		}
+	}
+	if implement == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"acceptance triage class-1: no implement stage on run; paging",
+			slog.String("run_id", runID.String()))
+		return acceptanceDispositionFixupUnavailable
+	}
+
+	selected := synthesizeAcceptanceConcerns(acc, criteria, criterionIDs, reason)
+
+	priorPasses, err := s.countFixupPasses(ctx, runID, implement.ID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"acceptance triage class-1: count fixup passes failed; paging",
+			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
+		return acceptanceDispositionFixupUnavailable
+	}
+
+	acceptanceStageID := stage.ID
+	dec, ferr := s.fixupStageAs(ctx, Identity{Subject: acceptanceTriageSystemSubject}, fixupActionParams{
+		StageID: implement.ID,
+		Options: run.FixupOptions{
+			PriorPassCount:    priorPasses,
+			MaxPasses:         defaultMaxFixupPasses,
+			HardCeiling:       defaultFixupCeiling,
+			AcceptanceStageID: &acceptanceStageID,
+		},
+		Selected:    selected,
+		PriorPasses: priorPasses,
+		Reason:      reason,
+	})
+	if ferr != nil {
+		// A refusal (ErrFixupBudgetExhausted / ErrFixupCeilingReached /
+		// ErrFixupNotApplicable) or any other error degrades to a paged
+		// disposition — the implement fixup budget therefore ALSO bounds
+		// acceptance-driven passes.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"acceptance triage class-1: fixup route refused; paging",
+			slog.String("run_id", runID.String()),
+			slog.String("implement_stage_id", implement.ID.String()),
+			slog.String("error", ferr.Error()))
+		return acceptanceDispositionFixupUnavailable
+	}
+	// Read the acceptance-driven decision field (E31.8): the fixup helper
+	// passed AcceptanceStageID through unchanged and re-opened the settled
+	// acceptance stage. A nil here means the re-open did not fire as expected
+	// (the acceptance stage was not settled at fixup time) — the fix-up still
+	// dispatched, so log and proceed.
+	if dec != nil && dec.ReopenedAcceptance == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"acceptance triage class-1: fix-up dispatched but acceptance stage was not re-opened",
+			slog.String("run_id", runID.String()),
+			slog.String("acceptance_stage_id", acceptanceStageID.String()))
+	}
+	return acceptanceDispositionFixupDispatched
+}
+
+// routeAcceptanceClass2 re-opens the settled acceptance stage (class-2:
+// environment/flake) via run.ReopenAcceptanceStage, then runs the retry-shaped
+// post-transition steps (orchestrator Advance, WARN-on-error; status notify).
+// Returns retry_dispatched on success, retry_unavailable_paged on a reopen
+// refusal.
+func (s *Server) routeAcceptanceClass2(ctx context.Context, runID uuid.UUID, stage *run.Stage) string {
+	dec, err := run.ReopenAcceptanceStage(ctx, s.cfg.RunRepo, stage.ID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"acceptance triage class-2: acceptance re-open refused; paging",
+			slog.String("run_id", runID.String()),
+			slog.String("acceptance_stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+		return acceptanceDispositionRetryUnavailable
+	}
+	// Hand off to the orchestrator so it walks pending → dispatched and
+	// rebuilds a fresh preview. WARN-on-error: the stage stays pending for a
+	// manual re-fire, mirroring the retry handler.
+	if dec.Stage.State == run.StageStatePending && s.cfg.Orchestrator != nil {
+		if _, aerr := s.cfg.Orchestrator.Advance(ctx, runID); aerr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
+				"acceptance triage class-2: orchestrator advance failed",
+				slog.String("run_id", runID.String()),
+				slog.String("error", aerr.Error()))
+		}
+	}
+	s.notifyStatusUpdate(ctx, runID, "acceptance_triage_reopen")
+	return acceptanceDispositionRetryDispatched
+}
+
+// synthesizeAcceptanceConcerns builds the []planreview.Concern the class-1
+// fix-up routes back to the implement agent: one per failed criterion with the
+// behavioral evidence (observed/expected/steps_taken/expectation_basis/
+// repro_handle) the verdict carried, composed with the plan criterion
+// statement. When the verdict itemized nothing (an error verdict with no
+// per-criterion results), a single concern is synthesized from the
+// failure_mode / target_url / criteria tally.
+func synthesizeAcceptanceConcerns(acc acceptanceBody, criteria []plan.AcceptanceCriterion, criterionIDs []string, reason string) []planreview.Concern {
+	statementByID := make(map[string]string, len(criteria))
+	for _, c := range criteria {
+		statementByID[c.ID] = c.Statement
+	}
+	failedByID := make(map[string]acceptanceCriterionResult, len(acc.Criteria))
+	for _, c := range acc.Criteria {
+		if c.Result == acceptanceResultFailed {
+			failedByID[c.ID] = c
+		}
+	}
+
+	var out []planreview.Concern
+	for _, id := range criterionIDs {
+		c, ok := failedByID[id]
+		if !ok {
+			continue
+		}
+		out = append(out, planreview.Concern{
+			Severity: planreview.SeverityHigh,
+			Category: "acceptance",
+			Note:     composeAcceptanceConcernNote(c, statementByID[id]),
+		})
+	}
+	if len(out) == 0 {
+		out = append(out, planreview.Concern{
+			Severity: planreview.SeverityHigh,
+			Category: "acceptance",
+			Note:     composeAcceptanceFallbackNote(acc, reason),
+		})
+	}
+	return out
+}
+
+// composeAcceptanceConcernNote renders one failed criterion's behavioral
+// evidence into a fix-up concern note.
+func composeAcceptanceConcernNote(c acceptanceCriterionResult, statement string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Acceptance criterion %q failed validation.", c.ID)
+	if statement != "" {
+		fmt.Fprintf(&b, " Criterion: %s", statement)
+	}
+	if c.Observed != "" {
+		fmt.Fprintf(&b, " Observed: %s", c.Observed)
+	}
+	if c.Expected != "" {
+		fmt.Fprintf(&b, " Expected: %s", c.Expected)
+	}
+	if c.StepsTaken != "" {
+		fmt.Fprintf(&b, " Steps taken: %s", c.StepsTaken)
+	}
+	if c.ExpectationBasis != "" {
+		fmt.Fprintf(&b, " Expectation basis: %s", c.ExpectationBasis)
+	}
+	if c.ReproHandle != "" {
+		fmt.Fprintf(&b, " Repro: %s", c.ReproHandle)
+	}
+	return b.String()
+}
+
+// composeAcceptanceFallbackNote renders a single fix-up concern from the
+// verdict envelope when no per-criterion evidence was itemized.
+func composeAcceptanceFallbackNote(acc acceptanceBody, reason string) string {
+	var b strings.Builder
+	b.WriteString("Acceptance validation failed and requires a fix-up.")
+	if acc.FailureMode != "" {
+		fmt.Fprintf(&b, " Failure mode: %s.", acc.FailureMode)
+	}
+	if acc.TargetURL != "" {
+		fmt.Fprintf(&b, " Target: %s.", acc.TargetURL)
+	}
+	passed, failed, skipped, total := acceptanceCriteriaTally(acc.Criteria)
+	fmt.Fprintf(&b, " Criteria tally: %d passed / %d failed / %d skipped of %d.", passed, failed, skipped, total)
+	if reason != "" {
+		fmt.Fprintf(&b, " Triage: %s", reason)
+	}
+	return b.String()
+}
+
+// countAcceptanceTriageRoutes counts the run's prior acceptance_triage_decided
+// entries whose disposition auto-routed (fixup_dispatched | retry_dispatched)
+// — the durable mirror of countFixupPasses that bounds re-runs across
+// restarts.
+func (s *Server) countAcceptanceTriageRoutes(ctx context.Context, runID uuid.UUID) (int, error) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryAcceptanceTriageDecided)
+	if err != nil {
+		return 0, fmt.Errorf("list %s audit entries: %w", CategoryAcceptanceTriageDecided, err)
+	}
+	n := 0
+	for _, e := range entries {
+		switch acceptanceTriageDispositionOf(e.Payload) {
+		case acceptanceDispositionFixupDispatched, acceptanceDispositionRetryDispatched:
+			n++
+		}
+	}
+	return n, nil
+}
+
+// acceptanceTriageDispositionOf reads the `disposition` field from an
+// acceptance_triage_decided payload. Empty on any decode failure.
+func acceptanceTriageDispositionOf(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	var p struct {
+		Disposition string `json:"disposition"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return ""
+	}
+	return p.Disposition
+}
+
+// writeAcceptanceTriageAudit appends the single acceptance_triage_decided
+// chained entry recording the class + realized disposition + criterion_ids +
+// bound accounting. Written AFTER acting so the disposition records what
+// actually happened. Best-effort: a failure here WARN-logs (the ship is
+// already committed).
+func (s *Server) writeAcceptanceTriageAudit(ctx context.Context, runID, stageID uuid.UUID, artifactID, class, disposition string, criterionIDs []string, failureMode string, priorRoutedPasses int, reason string) {
+	if criterionIDs == nil {
+		criterionIDs = []string{}
+	}
+	systemKind := audit.ActorSystem
+	payload, _ := json.Marshal(map[string]any{
+		"run_id":              runID.String(),
+		"stage_id":            stageID.String(),
+		"artifact_id":         artifactID,
+		"class":               class,
+		"disposition":         disposition,
+		"criterion_ids":       criterionIDs,
+		"failure_mode":        failureMode,
+		"prior_routed_passes": priorRoutedPasses,
+		"reason":              reason,
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryAcceptanceTriageDecided,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"acceptance triage: append acceptance_triage_decided audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
 }
 
 // acceptanceResponse echoes the persisted artifact's identity back to the

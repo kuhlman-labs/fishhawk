@@ -17,7 +17,9 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
@@ -639,5 +641,470 @@ func TestShipAcceptance_CrossBoundary_WireToRender(t *testing.T) {
 	rendered := issuecomment.RenderStatusBody(runRow, stages, entries, "https://x", time.Now())
 	if !strings.Contains(rendered, "Acceptance recorded — accepted (2/2 criteria passed)") {
 		t.Errorf("status body missing acceptance outcome line:\n%s", rendered)
+	}
+}
+
+// --- E31.8 acceptance failure triage (#1536) ---
+
+// TestClassifyAcceptanceFailure is the pure classifier table test covering
+// every branch: error → 1; assertion_fail all-failed-explicit → 1;
+// any-failed-inferred → 3; failed-id-unresolvable → 3; no-failed-with-skips →
+// 2; no-failed-no-skips → 4; nil plan / no plan criteria → 4.
+func TestClassifyAcceptanceFailure(t *testing.T) {
+	explicit := plan.CriterionSourceExplicit
+	inferred := plan.CriterionSourceInferred
+	criteria := []plan.AcceptanceCriterion{
+		{ID: "ac-create", Statement: "POST /widgets returns 201", Source: explicit},
+		{ID: "ac-list", Statement: "GET /widgets lists", Source: inferred},
+	}
+	crit := func(id, result string) acceptanceCriterionResult {
+		return acceptanceCriterionResult{ID: id, Result: result}
+	}
+
+	tests := []struct {
+		name      string
+		acc       acceptanceBody
+		criteria  []plan.AcceptanceCriterion
+		wantClass string
+		wantIDs   []string
+	}{
+		{
+			name:      "error verdict → class 1",
+			acc:       acceptanceBody{Verdict: "failed", FailureMode: "error", Criteria: []acceptanceCriterionResult{crit("ac-create", "failed")}},
+			criteria:  criteria,
+			wantClass: "1",
+			wantIDs:   []string{"ac-create"},
+		},
+		{
+			name:      "assertion_fail all failed explicit → class 1",
+			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", Criteria: []acceptanceCriterionResult{crit("ac-create", "failed")}},
+			criteria:  criteria,
+			wantClass: "1",
+			wantIDs:   []string{"ac-create"},
+		},
+		{
+			name:      "assertion_fail a failed criterion inferred → class 3",
+			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", Criteria: []acceptanceCriterionResult{crit("ac-create", "passed"), crit("ac-list", "failed")}},
+			criteria:  criteria,
+			wantClass: "3",
+			wantIDs:   []string{"ac-list"},
+		},
+		{
+			name:      "assertion_fail a failed criterion unresolvable → class 3",
+			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", Criteria: []acceptanceCriterionResult{crit("ac-ghost", "failed")}},
+			criteria:  criteria,
+			wantClass: "3",
+			wantIDs:   []string{"ac-ghost"},
+		},
+		{
+			name:      "assertion_fail no failed but a skip → class 2",
+			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", Criteria: []acceptanceCriterionResult{crit("ac-create", "passed"), crit("ac-list", "skipped")}},
+			criteria:  criteria,
+			wantClass: "2",
+			wantIDs:   nil,
+		},
+		{
+			name:      "assertion_fail no failed no skip → class 4",
+			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", Criteria: []acceptanceCriterionResult{crit("ac-create", "passed")}},
+			criteria:  criteria,
+			wantClass: "4",
+			wantIDs:   nil,
+		},
+		{
+			name:      "assertion_fail nil plan → class 4 (unitemized)",
+			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail"},
+			criteria:  nil,
+			wantClass: "4",
+			wantIDs:   nil,
+		},
+		{
+			name:      "assertion_fail failed criterion with no plan criteria → class 3 (unresolvable)",
+			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", Criteria: []acceptanceCriterionResult{crit("ac-create", "failed")}},
+			criteria:  nil,
+			wantClass: "3",
+			wantIDs:   []string{"ac-create"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			class, ids, reason := classifyAcceptanceFailure(tc.acc, tc.criteria)
+			if class != tc.wantClass {
+				t.Errorf("class = %q, want %q", class, tc.wantClass)
+			}
+			if !equalStrings(ids, tc.wantIDs) {
+				t.Errorf("criterionIDs = %v, want %v", ids, tc.wantIDs)
+			}
+			if reason == "" {
+				t.Error("reason must not be empty")
+			}
+		})
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// newAcceptanceTriageServer wires a full acceptance-time run (plan +
+// implement + review + acceptance stages all succeeded, a running non-terminal
+// run) with the approved plan artifact (ac-create explicit, ac-list inferred).
+func newAcceptanceTriageServer(t *testing.T) (s *Server, rr *promptRunRepo, ar *fakeArtifactRepo, au *auditFake, sf *signingFake, runID, implementStageID, reviewStageID, acceptanceStageID uuid.UUID, priv ed25519.PrivateKey) {
+	t.Helper()
+	runID = uuid.New()
+	planStageID := uuid.New()
+	implementStageID = uuid.New()
+	reviewStageID = uuid.New()
+	acceptanceStageID = uuid.New()
+
+	rr = newPromptRunRepo()
+	sf = newSigningFake()
+	ar = newFakeArtifactRepo()
+	au = newAuditFake()
+
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", State: run.StateRunning}
+	planStage := &run.Stage{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateSucceeded}
+	implementStage := &run.Stage{ID: implementStageID, RunID: runID, Type: run.StageTypeImplement, State: run.StageStateSucceeded}
+	reviewStage := &run.Stage{ID: reviewStageID, RunID: runID, Type: run.StageTypeReview, State: run.StageStateSucceeded}
+	acceptanceStage := &run.Stage{ID: acceptanceStageID, RunID: runID, Type: run.StageTypeAcceptance, State: run.StageStateSucceeded}
+	rr.getStages[planStageID] = planStage
+	rr.getStages[implementStageID] = implementStage
+	rr.getStages[reviewStageID] = reviewStage
+	rr.getStages[acceptanceStageID] = acceptanceStage
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {planStage, implementStage, reviewStage, acceptanceStage}}
+
+	v := "standard_v1"
+	ar.all = append(ar.all, &artifact.Artifact{
+		ID:            uuid.New(),
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &v,
+		Content:       acceptancePlanArtifactContent(t),
+		CreatedAt:     time.Now().UTC(),
+	})
+
+	s = New(Config{Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, ArtifactRepo: ar, AuditRepo: au})
+	priv, _ = sf.issue(t, runID)
+	return
+}
+
+func failedAcceptanceBytes(t *testing.T, failureMode string, criteria []acceptanceCriterionResult) []byte {
+	t.Helper()
+	b, err := json.Marshal(acceptanceBody{Verdict: "failed", FailureMode: failureMode, Criteria: criteria})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func triagePayload(t *testing.T, au *auditFake) string {
+	t.Helper()
+	e := findAppendedByCategory(t, au, CategoryAcceptanceTriageDecided)
+	return string(e.Payload)
+}
+
+// TestTriageAcceptance_Class1_Error_FixupDispatched is the issue AC#1 done-means
+// cross-boundary test: a failed{error} verdict re-opens implement + review +
+// acceptance to pending, writes a stage_fixup_triggered entry carrying the
+// behavioral evidence, and an acceptance_triage_decided class "1" /
+// fixup_dispatched entry.
+func TestTriageAcceptance_Class1_Error_FixupDispatched(t *testing.T) {
+	s, rr, _, au, _, runID, implementStageID, reviewStageID, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	body := failedAcceptanceBytes(t, "error", []acceptanceCriterionResult{
+		{ID: "ac-create", Result: "failed", Observed: "500 returned", Expected: "201 returned", StepsTaken: "POST /widgets", ExpectationBasis: "criterion ac-create", ReproHandle: "curl -XPOST /widgets"},
+	})
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	if got := rr.getStages[implementStageID].State; got != run.StageStatePending {
+		t.Errorf("implement state = %q, want pending", got)
+	}
+	if got := rr.getStages[reviewStageID].State; got != run.StageStatePending {
+		t.Errorf("review state = %q, want pending", got)
+	}
+	if got := rr.getStages[acceptanceStageID].State; got != run.StageStatePending {
+		t.Errorf("acceptance state = %q, want pending", got)
+	}
+
+	fixup := findAppendedByCategory(t, au, CategoryStageFixupTriggered)
+	for _, want := range []string{"500 returned", "201 returned", "POST /widgets", "curl -XPOST /widgets"} {
+		if !strings.Contains(string(fixup.Payload), want) {
+			t.Errorf("stage_fixup_triggered payload missing evidence %q:\n%s", want, fixup.Payload)
+		}
+	}
+
+	payload := triagePayload(t, au)
+	for _, want := range []string{`"class":"1"`, `"disposition":"fixup_dispatched"`, `"ac-create"`, `"failure_mode":"error"`} {
+		if !strings.Contains(payload, want) {
+			t.Errorf("triage payload missing %s:\n%s", want, payload)
+		}
+	}
+}
+
+// TestTriageAcceptance_Class1_AssertionExplicit_FixupDispatched: assertion_fail
+// where every failed criterion is explicit-source routes to class-1 fix-up.
+func TestTriageAcceptance_Class1_AssertionExplicit_FixupDispatched(t *testing.T) {
+	s, rr, _, au, _, runID, implementStageID, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	body := failedAcceptanceBytes(t, "assertion_fail", []acceptanceCriterionResult{
+		{ID: "ac-create", Result: "failed", Observed: "returned 404"},
+	})
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.getStages[implementStageID].State; got != run.StageStatePending {
+		t.Errorf("implement state = %q, want pending", got)
+	}
+	payload := triagePayload(t, au)
+	for _, want := range []string{`"class":"1"`, `"disposition":"fixup_dispatched"`} {
+		if !strings.Contains(payload, want) {
+			t.Errorf("triage payload missing %s:\n%s", want, payload)
+		}
+	}
+}
+
+// TestTriageAcceptance_Class3_Inferred_Paged: assertion_fail where a failed
+// criterion is inferred-source pages the human with the criterion id, no
+// transition.
+func TestTriageAcceptance_Class3_Inferred_Paged(t *testing.T) {
+	s, rr, _, au, _, runID, implementStageID, reviewStageID, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	body := failedAcceptanceBytes(t, "assertion_fail", []acceptanceCriterionResult{
+		{ID: "ac-create", Result: "passed"},
+		{ID: "ac-list", Result: "failed", Observed: "wrong shape"},
+	})
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	// No state transitioned.
+	if got := rr.getStages[implementStageID].State; got != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want unchanged (succeeded)", got)
+	}
+	if got := rr.getStages[reviewStageID].State; got != run.StageStateSucceeded {
+		t.Errorf("review state = %q, want unchanged (succeeded)", got)
+	}
+	if got := rr.getStages[acceptanceStageID].State; got != run.StageStateSucceeded {
+		t.Errorf("acceptance state = %q, want unchanged (succeeded)", got)
+	}
+	if n := countAppendedByCategory(au, CategoryStageFixupTriggered); n != 0 {
+		t.Errorf("stage_fixup_triggered entries = %d, want 0", n)
+	}
+	payload := triagePayload(t, au)
+	for _, want := range []string{`"class":"3"`, `"disposition":"paged"`, `"ac-list"`} {
+		if !strings.Contains(payload, want) {
+			t.Errorf("triage payload missing %s:\n%s", want, payload)
+		}
+	}
+}
+
+// TestTriageAcceptance_Class2_Skip_ReopensAcceptance is the binding-condition-2
+// reopen-not-retry pin: a flake/env classification (no failed criterion, a
+// skip) REOPENS the succeeded acceptance stage rather than routing through the
+// failed-stage retry path, recording retry_dispatched. Implement + review stay
+// untouched.
+func TestTriageAcceptance_Class2_Skip_ReopensAcceptance(t *testing.T) {
+	s, rr, _, au, _, runID, implementStageID, reviewStageID, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	body := failedAcceptanceBytes(t, "assertion_fail", []acceptanceCriterionResult{
+		{ID: "ac-create", Result: "passed"},
+		{ID: "ac-list", Result: "skipped"},
+	})
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	// The SUCCEEDED acceptance stage was re-opened to pending — NOT via a
+	// failed-stage retry (the stage never failed).
+	if got := rr.getStages[acceptanceStageID].State; got != run.StageStatePending {
+		t.Errorf("acceptance state = %q, want pending (re-opened)", got)
+	}
+	// Implement + review untouched.
+	if got := rr.getStages[implementStageID].State; got != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want unchanged (succeeded)", got)
+	}
+	if got := rr.getStages[reviewStageID].State; got != run.StageStateSucceeded {
+		t.Errorf("review state = %q, want unchanged (succeeded)", got)
+	}
+	if n := countAppendedByCategory(au, CategoryStageFixupTriggered); n != 0 {
+		t.Errorf("stage_fixup_triggered entries = %d, want 0 (class-2 is a reopen, not a fixup)", n)
+	}
+	payload := triagePayload(t, au)
+	for _, want := range []string{`"class":"2"`, `"disposition":"retry_dispatched"`} {
+		if !strings.Contains(payload, want) {
+			t.Errorf("triage payload missing %s:\n%s", want, payload)
+		}
+	}
+}
+
+// TestTriageAcceptance_Class4_Unitemized_Paged: an unitemized assertion_fail
+// pages the human, no transition.
+func TestTriageAcceptance_Class4_Unitemized_Paged(t *testing.T) {
+	s, rr, _, au, _, runID, implementStageID, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	body := failedAcceptanceBytes(t, "assertion_fail", nil)
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.getStages[implementStageID].State; got != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want unchanged (succeeded)", got)
+	}
+	if got := rr.getStages[acceptanceStageID].State; got != run.StageStateSucceeded {
+		t.Errorf("acceptance state = %q, want unchanged (succeeded)", got)
+	}
+	payload := triagePayload(t, au)
+	for _, want := range []string{`"class":"4"`, `"disposition":"paged"`} {
+		if !strings.Contains(payload, want) {
+			t.Errorf("triage payload missing %s:\n%s", want, payload)
+		}
+	}
+}
+
+// TestTriageAcceptance_RerunBudgetExhausted: a third failed verdict after two
+// prior auto-routed decisions degrades to rerun_budget_exhausted, no transition.
+func TestTriageAcceptance_RerunBudgetExhausted(t *testing.T) {
+	s, rr, _, au, _, runID, implementStageID, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	routed, _ := json.Marshal(map[string]any{"disposition": "fixup_dispatched"})
+	au.seeded = append(au.seeded,
+		&audit.Entry{RunID: &runID, Category: CategoryAcceptanceTriageDecided, Payload: routed},
+		&audit.Entry{RunID: &runID, Category: CategoryAcceptanceTriageDecided, Payload: routed},
+	)
+	body := failedAcceptanceBytes(t, "error", []acceptanceCriterionResult{{ID: "ac-create", Result: "failed"}})
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.getStages[implementStageID].State; got != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want unchanged (succeeded) at the cap", got)
+	}
+	payload := triagePayload(t, au)
+	for _, want := range []string{`"class":"1"`, `"disposition":"rerun_budget_exhausted"`, `"prior_routed_passes":2`} {
+		if !strings.Contains(payload, want) {
+			t.Errorf("triage payload missing %s:\n%s", want, payload)
+		}
+	}
+}
+
+// TestTriageAcceptance_FixupBudgetExhausted: a class-1 route whose implement
+// fixup budget is already spent degrades to fixup_unavailable_paged, no
+// transition.
+func TestTriageAcceptance_FixupBudgetExhausted(t *testing.T) {
+	s, rr, _, au, _, runID, implementStageID, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	// One prior fix-up pass already consumed against the default budget of 1.
+	fixupPayload, _ := json.Marshal(map[string]any{"stage_id": implementStageID.String()})
+	au.seeded = append(au.seeded, &audit.Entry{RunID: &runID, StageID: &implementStageID, Category: CategoryStageFixupTriggered, Payload: fixupPayload})
+	body := failedAcceptanceBytes(t, "error", []acceptanceCriterionResult{{ID: "ac-create", Result: "failed"}})
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.getStages[implementStageID].State; got != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want unchanged (succeeded); the budget was spent", got)
+	}
+	payload := triagePayload(t, au)
+	if !strings.Contains(payload, `"disposition":"fixup_unavailable_paged"`) {
+		t.Errorf("triage payload missing fixup_unavailable_paged:\n%s", payload)
+	}
+}
+
+// TestTriageAcceptance_Unsettled: a ship racing the settle (acceptance stage
+// not yet succeeded) records unsettled_paged and transitions nothing.
+func TestTriageAcceptance_Unsettled(t *testing.T) {
+	s, rr, _, au, _, runID, implementStageID, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	rr.getStages[acceptanceStageID].State = run.StageStateRunning // not yet settled
+	body := failedAcceptanceBytes(t, "error", []acceptanceCriterionResult{{ID: "ac-create", Result: "failed"}})
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.getStages[implementStageID].State; got != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want unchanged (succeeded)", got)
+	}
+	payload := triagePayload(t, au)
+	if !strings.Contains(payload, `"disposition":"unsettled_paged"`) {
+		t.Errorf("triage payload missing unsettled_paged:\n%s", payload)
+	}
+}
+
+// TestTriageAcceptance_Idempotent: re-delivering an identical failed verdict
+// triages exactly once (the idempotent replay branch never re-routes).
+func TestTriageAcceptance_Idempotent(t *testing.T) {
+	s, _, _, au, _, runID, _, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	body := failedAcceptanceBytes(t, "assertion_fail", nil) // class 4, no transition
+
+	if w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("first ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, ""); w.Code != http.StatusOK {
+		t.Fatalf("second ship status = %d, want 200 (idempotent):\n%s", w.Code, w.Body.String())
+	}
+	if n := countAppendedByCategory(au, CategoryAcceptanceTriageDecided); n != 1 {
+		t.Errorf("acceptance_triage_decided entries = %d, want exactly 1", n)
+	}
+}
+
+// TestTriageAcceptance_PassedVerdict_NoTriage: a passed verdict writes no
+// triage entry.
+func TestTriageAcceptance_PassedVerdict_NoTriage(t *testing.T) {
+	s, _, _, au, _, runID, _, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	if w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, validAcceptanceBytes(t), ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if n := countAppendedByCategory(au, CategoryAcceptanceTriageDecided); n != 0 {
+		t.Errorf("acceptance_triage_decided entries = %d, want 0 on a passed verdict", n)
+	}
+}
+
+// TestTriageAcceptance_CountFailure_StillShips: an injected audit-list failure
+// (triage route count) degrades to a paged disposition but never unwinds the
+// 201 / artifact / outcome audit.
+func TestTriageAcceptance_CountFailure_StillShips(t *testing.T) {
+	s, _, _, au, _, runID, _, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	au.listByCategoryErr = errors.New("audit list boom")
+	body := failedAcceptanceBytes(t, "error", []acceptanceCriterionResult{{ID: "ac-create", Result: "failed"}})
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (triage never blocks the ship):\n%s", w.Code, w.Body.String())
+	}
+	if n := countAppendedByCategory(au, CategoryAcceptanceOutcomeRecorded); n != 1 {
+		t.Errorf("acceptance_outcome_recorded entries = %d, want 1 (outcome audit intact)", n)
+	}
+	payload := triagePayload(t, au)
+	if !strings.Contains(payload, `"disposition":"paged"`) {
+		t.Errorf("triage payload missing paged (count-failure degrade):\n%s", payload)
+	}
+}
+
+// TestTriageAcceptance_PlanLoadFailure_StillShips: a plan-load failure grounds
+// provenance as absent (a failed criterion becomes unresolvable → class 3) and
+// still returns 201.
+func TestTriageAcceptance_PlanLoadFailure_StillShips(t *testing.T) {
+	s, _, ar, au, _, runID, _, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	ar.listErr = errors.New("artifact list boom") // breaks plan load only
+	body := failedAcceptanceBytes(t, "assertion_fail", []acceptanceCriterionResult{{ID: "ac-create", Result: "failed"}})
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := triagePayload(t, au)
+	if !strings.Contains(payload, `"class":"3"`) {
+		t.Errorf("triage payload missing class 3 (unresolvable without plan):\n%s", payload)
 	}
 }

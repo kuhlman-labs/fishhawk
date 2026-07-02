@@ -523,3 +523,158 @@ func TestFixupStage_NotForcedAtBudgetStillBudgetExhausted(t *testing.T) {
 		t.Errorf("err = %v, want budget_exhausted, not the ceiling error", err)
 	}
 }
+
+// implementReviewAcceptance builds the acceptance-time shape (E31.8 / #1536):
+// an implement stage, a review stage, and an acceptance stage sharing one
+// RunID. It is what an acceptance-driven fix-up walks.
+func implementReviewAcceptance(t *testing.T, implState, reviewState, acceptanceState run.StageState) (*fixupRepo, *run.Stage, *run.Stage, *run.Stage) {
+	t.Helper()
+	runID := uuid.New()
+	impl := newStage(implState)
+	impl.Type = run.StageTypeImplement
+	impl.RunID = runID
+	impl.Sequence = 1
+	review := newStage(reviewState)
+	review.Type = run.StageTypeReview
+	review.RunID = runID
+	review.Sequence = 2
+	acc := newStage(acceptanceState)
+	acc.Type = run.StageTypeAcceptance
+	acc.RunID = runID
+	acc.Sequence = 3
+	repo := newFixupRepo(impl, review, acc)
+	return repo, impl, review, acc
+}
+
+func TestFixupStage_AcceptanceMode_ReparksSucceededReviewAndReopensAcceptance(t *testing.T) {
+	// Canonical acceptance-time shape: implement + review + acceptance all
+	// succeeded. The fix-up re-parks the succeeded review, re-opens the
+	// succeeded acceptance stage, and re-opens the implement stage.
+	repo, impl, review, acc := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStateSucceeded, run.StageStateSucceeded)
+	ctx := context.Background()
+
+	dec, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{
+		MaxPasses:         1,
+		HardCeiling:       3,
+		AcceptanceStageID: &acc.ID,
+	})
+	if err != nil {
+		t.Fatalf("FixupStage: %v", err)
+	}
+	if dec.Stage.State != run.StageStatePending {
+		t.Errorf("implement state = %q, want pending", dec.Stage.State)
+	}
+	if dec.ReparkedReview == nil || dec.ReparkedReview.ID != review.ID || dec.ReparkedReview.State != run.StageStatePending {
+		t.Errorf("ReparkedReview = %+v, want review %s at pending", dec.ReparkedReview, review.ID)
+	}
+	if dec.ReopenedAcceptance == nil || dec.ReopenedAcceptance.ID != acc.ID || dec.ReopenedAcceptance.State != run.StageStatePending {
+		t.Errorf("ReopenedAcceptance = %+v, want acceptance %s at pending", dec.ReopenedAcceptance, acc.ID)
+	}
+	if cur, _ := repo.GetStage(ctx, acc.ID); cur.State != run.StageStatePending {
+		t.Errorf("acceptance stage in repo = %q, want pending", cur.State)
+	}
+}
+
+func TestFixupStage_AcceptanceMode_ReparksAwaitingApprovalReview(t *testing.T) {
+	repo, impl, review, acc := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStateAwaitingApproval, run.StageStateSucceeded)
+	ctx := context.Background()
+
+	dec, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{
+		MaxPasses: 1, HardCeiling: 3, AcceptanceStageID: &acc.ID,
+	})
+	if err != nil {
+		t.Fatalf("FixupStage: %v", err)
+	}
+	if dec.ReparkedReview == nil || dec.ReparkedReview.ID != review.ID || dec.ReparkedReview.State != run.StageStatePending {
+		t.Errorf("ReparkedReview = %+v, want review re-parked to pending", dec.ReparkedReview)
+	}
+}
+
+func TestFixupStage_AcceptanceMode_ReviewAlreadyPendingUntouched(t *testing.T) {
+	repo, impl, review, acc := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStatePending, run.StageStateSucceeded)
+	ctx := context.Background()
+
+	dec, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{
+		MaxPasses: 1, HardCeiling: 3, AcceptanceStageID: &acc.ID,
+	})
+	if err != nil {
+		t.Fatalf("FixupStage: %v", err)
+	}
+	// An already-pending review is not re-parked.
+	if dec.ReparkedReview != nil {
+		t.Errorf("ReparkedReview = %+v, want nil (review already pending)", dec.ReparkedReview)
+	}
+	if cur, _ := repo.GetStage(ctx, review.ID); cur.State != run.StageStatePending {
+		t.Errorf("review state = %q, want unchanged (pending)", cur.State)
+	}
+	if dec.ReopenedAcceptance == nil || dec.ReopenedAcceptance.State != run.StageStatePending {
+		t.Errorf("ReopenedAcceptance = %+v, want acceptance re-opened to pending", dec.ReopenedAcceptance)
+	}
+}
+
+func TestFixupStage_AcceptanceMode_NoReviewStageProceeds(t *testing.T) {
+	// Implement + acceptance only, no review stage: the fix-up proceeds with
+	// no re-park (the acceptance re-open still forces re-validation).
+	runID := uuid.New()
+	impl := newStage(run.StageStateSucceeded)
+	impl.Type = run.StageTypeImplement
+	impl.RunID = runID
+	acc := newStage(run.StageStateSucceeded)
+	acc.Type = run.StageTypeAcceptance
+	acc.RunID = runID
+	repo := newFixupRepo(impl, acc)
+	ctx := context.Background()
+
+	dec, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{
+		MaxPasses: 1, HardCeiling: 3, AcceptanceStageID: &acc.ID,
+	})
+	if err != nil {
+		t.Fatalf("FixupStage: %v", err)
+	}
+	if dec.ReparkedReview != nil {
+		t.Errorf("ReparkedReview = %+v, want nil (no review stage)", dec.ReparkedReview)
+	}
+	if dec.Stage.State != run.StageStatePending {
+		t.Errorf("implement state = %q, want pending", dec.Stage.State)
+	}
+	if dec.ReopenedAcceptance == nil || dec.ReopenedAcceptance.State != run.StageStatePending {
+		t.Errorf("ReopenedAcceptance = %+v, want acceptance re-opened to pending", dec.ReopenedAcceptance)
+	}
+}
+
+func TestFixupStage_AcceptanceMode_AcceptanceReopenFailureLeavesImplementSucceeded(t *testing.T) {
+	// Partial-failure ordering (E31.8): the acceptance re-open runs BEFORE the
+	// implement re-open, so an acceptance-reopen failure returns before the
+	// implement stage is touched — it stays succeeded.
+	repo, impl, _, acc := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStatePending, run.StageStateSucceeded)
+	repo.failTransition(acc.ID, errors.New("acceptance re-open boom"))
+	ctx := context.Background()
+
+	_, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{
+		MaxPasses: 1, HardCeiling: 3, AcceptanceStageID: &acc.ID,
+	})
+	if err == nil {
+		t.Fatal("FixupStage returned nil error on acceptance re-open failure")
+	}
+	if cur, _ := repo.GetStage(ctx, impl.ID); cur.State != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want unchanged (succeeded) on acceptance re-open failure", cur.State)
+	}
+}
+
+func TestFixupStage_NilAcceptanceStageID_ClassicBehavior(t *testing.T) {
+	// A nil AcceptanceStageID preserves the classic implement-review fix-up:
+	// no acceptance re-open, and ReopenedAcceptance stays nil.
+	repo, impl, review := implementWithReview(t, run.StageStateSucceeded, run.StageStateAwaitingApproval)
+	ctx := context.Background()
+
+	dec, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 3})
+	if err != nil {
+		t.Fatalf("FixupStage: %v", err)
+	}
+	if dec.ReopenedAcceptance != nil {
+		t.Errorf("ReopenedAcceptance = %+v, want nil on the classic path", dec.ReopenedAcceptance)
+	}
+	if dec.ReparkedReview == nil || dec.ReparkedReview.ID != review.ID {
+		t.Errorf("ReparkedReview = %+v, want the classic re-park", dec.ReparkedReview)
+	}
+}
