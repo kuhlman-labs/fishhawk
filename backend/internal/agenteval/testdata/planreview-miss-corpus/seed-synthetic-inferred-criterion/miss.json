@@ -1,0 +1,24 @@
+{
+  "run_id": "00000000-0000-0000-0000-000000000000",
+  "artifact_id": "00000000-0000-0000-0000-000000000001",
+  "triage_sequence": 42,
+  "class": "3",
+  "disposition": "paged",
+  "reason": "assertion_fail: a failed criterion is inferred-source or unresolvable against the plan (bad/ambiguous criterion)",
+  "decided_at": "2026-07-01T12:00:00Z",
+  "misses": [
+    {
+      "criterion_id": "ac-list-pagination",
+      "statement": "GET /widgets paginates at 100 items",
+      "source": "inferred",
+      "rationale": "Inferred from the sibling list endpoints; the issue text never states a page size.",
+      "observed": "GET /widgets returned all 250 items in one page",
+      "expected": "a paginated response capped at 100 items",
+      "steps_taken": "seeded 250 widgets, GET /widgets, counted items",
+      "expectation_basis": "criterion ac-list-pagination",
+      "repro_handle": "curl -s $TARGET/widgets | jq '.items | length'",
+      "result": "failed"
+    }
+  ],
+  "synthetic": true
+}
