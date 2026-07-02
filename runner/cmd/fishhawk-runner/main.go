@@ -733,6 +733,22 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 		inv.BaseEnv = baseEnv
 		inv.JSONSchema = acceptanceVerdictJSONSchema
+
+		// Clear any stale fallback verdict from a PRIOR run BEFORE the
+		// acceptance agent runs. acceptanceVerdictPath is a fixed shared
+		// path (/tmp/fishhawk-acceptance.json); without this removal, an
+		// agent that produces neither structured output nor a fresh file
+		// would let captureAcceptanceVerdict read and ship a previous run's
+		// stale verdict instead of failing acceptance_verdict_missing
+		// (#1535 fix-up). A remove error other than not-exist means we
+		// cannot guarantee a clean transport — fail category-C before any
+		// agent spawn rather than risk shipping stale evidence.
+		if err := os.Remove(acceptanceVerdictPath); err != nil && !os.IsNotExist(err) {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"acceptance_stale_verdict_clear","category":"C","detail":%q}`+"\n",
+				err.Error())
+			return exitFailure
+		}
 	}
 
 	invoker, selErr := selectInvoker(cfg.agent, apiKeyForAgent(cfg.agent))

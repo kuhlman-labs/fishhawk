@@ -59,6 +59,26 @@ func TestCaptureAcceptanceVerdict_EmptyFileIsMissing(t *testing.T) {
 	}
 }
 
+// TestCaptureAcceptanceVerdict_ReadErrorNotMissing covers the
+// non-os.IsNotExist read-error branch (#1535 fix-up): a fallback path
+// that exists but cannot be read as a file (here a directory, EISDIR)
+// must return the distinct wrapped "fallback read" error rather than
+// errAcceptanceVerdictMissing, so a genuine read fault is not
+// misattributed to a missing verdict.
+func TestCaptureAcceptanceVerdict_ReadErrorNotMissing(t *testing.T) {
+	dir := t.TempDir() // a directory: os.ReadFile fails with a non-not-exist error
+	_, err := captureAcceptanceVerdict(agent.Result{}, dir)
+	if err == nil {
+		t.Fatal("expected a read error when the fallback path is a directory")
+	}
+	if errors.Is(err, errAcceptanceVerdictMissing) {
+		t.Errorf("a non-not-exist read error must NOT be errAcceptanceVerdictMissing, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "acceptance verdict fallback read") {
+		t.Errorf("err = %v, want the wrapped fallback-read error", err)
+	}
+}
+
 // --- validateAcceptanceVerdict -------------------------------------------
 
 func TestValidateAcceptanceVerdict_Table(t *testing.T) {
@@ -585,6 +605,36 @@ func TestRun_AcceptanceStage_FileFallback_Ships(t *testing.T) {
 	var shipped acceptanceVerdict
 	if err := json.Unmarshal(fu.gotAcceptanceArgs.Body, &shipped); err != nil || shipped.Verdict != "passed" {
 		t.Errorf("shipped verdict = %+v (err %v)", shipped, err)
+	}
+}
+
+// TestRun_AcceptanceStage_StaleFallbackCleared: a stale verdict left at
+// the fixed fallback path by a PRIOR run must be removed BEFORE the
+// acceptance agent runs. Here the agent produces neither StructuredOutput
+// nor a fresh file; without the pre-run clear, captureAcceptanceVerdict
+// would read and ship the stale bytes. With the clear (#1535 fix-up) the
+// stage instead demotes to category-B acceptance_verdict_missing and
+// nothing ships.
+func TestRun_AcceptanceStage_StaleFallbackCleared(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	// Simulate a stale verdict from a previous run at the shared path.
+	mustWrite(t, acceptanceVerdictPath,
+		`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed"}]}`)
+	// The agent settles OK but writes NO fresh verdict (no StructuredOutput,
+	// no onInvoke file write).
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure (stale verdict must not resurrect):\n%s", got, stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, `"event":"acceptance_verdict_missing"`) {
+		t.Errorf("stale fallback must be cleared → acceptance_verdict_missing, got: %s", out)
+	}
+	if fu.gotAcceptanceArgs != nil {
+		t.Error("ShipAcceptance must not ship a prior run's stale verdict")
 	}
 }
 

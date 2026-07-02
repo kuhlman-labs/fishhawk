@@ -1677,6 +1677,45 @@ func TestShipAcceptance_PlainBadRequest_NotTyped(t *testing.T) {
 	_ = af
 }
 
+func TestShipAcceptance_SignatureRejected_401(t *testing.T) {
+	af, srv := newAcceptanceFakeBackend(t)
+	af.status = http.StatusUnauthorized
+	af.body = `{"error":"signature_invalid","message":"X-Fishhawk-Signature did not verify"}`
+	c := quickClient(srv)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+
+	_, err := c.ShipAcceptance(context.Background(), ShipAcceptanceArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Body:       []byte(`{"verdict":"passed"}`),
+		PrivateKey: priv,
+	})
+	if !errors.Is(err, ErrSignatureRejected) {
+		t.Fatalf("err = %v, want ErrSignatureRejected", err)
+	}
+	if af.calls != 1 {
+		t.Errorf("calls = %d, want 1 (401 is permanent, never retried)", af.calls)
+	}
+}
+
+func TestShipAcceptance_NotFound_404(t *testing.T) {
+	af, srv := newAcceptanceFakeBackend(t)
+	af.status = http.StatusNotFound
+	c := quickClient(srv)
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+
+	_, err := c.ShipAcceptance(context.Background(), ShipAcceptanceArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Body:       []byte(`{"verdict":"passed"}`),
+		PrivateKey: priv,
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if af.calls != 1 {
+		t.Errorf("calls = %d, want 1 (404 is permanent, never retried)", af.calls)
+	}
+}
+
 func TestShipAcceptance_RetriesOn5xxThenSucceeds(t *testing.T) {
 	af, srv := newAcceptanceFakeBackend(t)
 	af.errCount = 2
