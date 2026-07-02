@@ -182,6 +182,24 @@ The acceptance stage is the one agent invocation that holds code execution, netw
 - **Default-deny egress proxy.** The invocation's `HTTP(S)_PROXY` points at a runner-embedded filtering proxy whose allow-list is exactly the workflow spec's `egress.target_hosts` (the only customer-controlled entries), the model API endpoint, and the Fishhawk backend. Anything else is refused `403`. Hostname resolutions are DNS-pinned for the proxy's lifetime and a public hostname resolving into loopback/private space is refused (anti-rebinding). Residual: the proxy env binds cooperating HTTP clients — raw-socket bypass needs the OS sandbox (same residual class as the write detector above).
 - **`FISHHAWK_ACCEPTANCE_ENV_<NAME>` (operator input).** The explicit channel for customer-supplied target-instance test credentials: set `FISHHAWK_ACCEPTANCE_ENV_APP_PASSWORD=…` on the runner env and the acceptance invocation sees `APP_PASSWORD=…`. Everything else is default-denied; the model API keys are the one secret class that survives. The acceptance invocation NEVER carries `FISHHAWK_API_TOKEN` (its evidence ships signature-authed, no MCP token — ADR-050) or any repo/deploy token, and a passthrough whose stripped name collides with a denied key or a proxy variable is refused and logged, never honored.
 
+### Acceptance target-identity gate + preview provisioning (E31.18 / #1569)
+
+Before the acceptance agent spawns, the runner verifies that the first spec-declared `egress.target_hosts` entry actually serves the run's merge candidate — otherwise acceptance validates whatever build happens to answer there (typically current `main`). The backend sends the expected head SHA on the acceptance prompt response (`acceptance_expected_head_sha`); the runner probes `<host>/healthz` (http first for loopback/IP-literal hosts, https first otherwise, always falling back to the other scheme) and compares the body's `git_sha` build identifier:
+
+- **verified** — `git_sha` is a ≥7-char prefix of the expected head. Logged `acceptance_target_verified`; the agent spawns.
+- **stale** — a `git_sha` is exposed but mismatched, **including any `-dirty`-suffixed value** (a dirty build is not the committed merge candidate — fail closed). Stage fails pre-spawn, category C, reason `acceptance_target_stale`, expected-vs-got in the detail.
+- **unreachable** — no scheme produced an HTTP response. Stage fails pre-spawn, category C, reason `acceptance_target_unreachable`.
+- **unverifiable** — reachable but no comparable identity (non-200, non-JSON, missing/`unknown` `git_sha`, or an older backend sent no expectation). Logged `acceptance_target_unverified` and the agent **proceeds** — mixed-version compat, never a hard fail on a missing identifier.
+
+No declared target hosts skips the gate entirely. The probe dials direct from the runner process — the egress proxy contains the agent, not the runner.
+
+Operator env vars (runner-process config; acceptenv excludes all of them from the agent env):
+
+- **`FISHHAWK_ACCEPTANCE_PREVIEW_CMD`** — optional provisioning hook, run via `sh -c` in the runner's cwd **before** the identity gate, with `FISHHAWK_PREVIEW_SHA` (the expected head) and `FISHHAWK_PREVIEW_TARGET_HOST` (the first declared target host) added to its env. The dogfood value is `scripts/dev preview`. A non-zero exit or timeout fails the stage pre-spawn, category C, reason `acceptance_preview_provision_failed` (exit state + output tail in the detail). After a successful provision the runner readiness-polls the probe every 2s until verified or the ready budget expires; without a provision command the gate is single-shot (3 quick attempts absorb connection blips, definitive answers gate immediately).
+- **`FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD`** — optional teardown hook (same `sh -c` + env contract), deferred so it runs on **every** post-provision exit: after the verdict ships on the happy path, and before the stage failure returns on readiness-timeout/stale/any pre-spawn gate failure. Best-effort — a teardown failure logs `acceptance_preview_teardown_failed` and never changes the stage outcome.
+- **`FISHHAWK_ACCEPTANCE_PREVIEW_TIMEOUT_SECS`** — provision/teardown command budget (default 300; the command typically includes a Go build).
+- **`FISHHAWK_ACCEPTANCE_PREVIEW_READY_TIMEOUT_SECS`** — post-provision readiness budget (default 60).
+
 ### OTel trace export (#649 / #679)
 
 `internal/otelemit` emits one OpenTelemetry GenAI trace per stage invocation. Emission is **gated by `OTEL_EXPORTER_OTLP_ENDPOINT`**: when unset (the default), `Bootstrap` returns a disabled Emitter whose methods are no-ops, so the implement loop is completely unaffected. When set, an OTLP/HTTP exporter (`otlptracehttp`) POSTs spans to `{endpoint}/v1/traces`, honouring the standard `OTEL_EXPORTER_OTLP_*` env vars.

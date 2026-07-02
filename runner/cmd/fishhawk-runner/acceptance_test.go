@@ -1,14 +1,22 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/kuhlman-labs/fishhawk/runner/internal/acceptenv"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
@@ -729,5 +737,402 @@ func TestRun_AcceptanceStage_RedactionInShipAndBundle(t *testing.T) {
 		if strings.Contains(string(plain), secret) {
 			t.Errorf("credential survived into the %s bundle", call.Variant)
 		}
+	}
+}
+
+// --- E31.18 / #1569: pre-spawn target-identity gate wiring ------------------
+
+// passedVerdict is a criteria-valid canned StructuredOutput for gate tests
+// that reach the agent (acceptanceStageSetup serves AC1/AC2).
+const passedVerdict = `{"verdict":"passed","criteria":[{"id":"AC1","result":"passed"}]}`
+
+// TestRun_AcceptanceStage_TargetStale_FailsPreSpawn: the declared target
+// answers with a git_sha that is not the expected merge-candidate head —
+// the stage fails category-C acceptance_target_stale BEFORE any agent
+// spawn, with expected-vs-got in the detail.
+func TestRun_AcceptanceStage_TargetStale_FailsPreSpawn(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	ts, _ := healthzServer(t, 200, `{"git_sha":"0000000"}`)
+	fu.promptResp.EgressTargetHosts = []string{hostOf(ts)}
+	fu.promptResp.AcceptanceExpectedHeadSHA = testExpectedSHA
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, `"reason":"acceptance_target_stale"`) ||
+		!strings.Contains(out, `"category":"C"`) {
+		t.Errorf("missing category-C acceptance_target_stale failure: %s", out)
+	}
+	if !strings.Contains(out, testExpectedSHA) || !strings.Contains(out, "0000000") {
+		t.Errorf("failure detail must carry expected vs got: %s", out)
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("agent invoked %d times, want 0 (stale target must never be validated)", invoker.callIdx)
+	}
+	if fu.gotAcceptanceArgs != nil {
+		t.Error("ShipAcceptance must not be called on a stale-target failure")
+	}
+}
+
+// TestRun_AcceptanceStage_TargetUnreachable_FailsPreSpawn: nothing answers
+// at the declared target on either scheme — category-C
+// acceptance_target_unreachable, no spawn.
+func TestRun_AcceptanceStage_TargetUnreachable_FailsPreSpawn(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	fu.promptResp.EgressTargetHosts = []string{closedPortHost(t)}
+	fu.promptResp.AcceptanceExpectedHeadSHA = testExpectedSHA
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"reason":"acceptance_target_unreachable"`) ||
+		!strings.Contains(stderr.String(), `"category":"C"`) {
+		t.Errorf("missing category-C acceptance_target_unreachable failure: %s", stderr.String())
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("agent invoked %d times, want 0", invoker.callIdx)
+	}
+}
+
+// TestRun_AcceptanceStage_ProvisionFailure_FailsPreSpawn: the operator's
+// preview provision hook exits non-zero — category-C
+// acceptance_preview_provision_failed carrying the exit state and output
+// tail, no spawn.
+func TestRun_AcceptanceStage_ProvisionFailure_FailsPreSpawn(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	fu.promptResp.EgressTargetHosts = []string{closedPortHost(t)}
+	fu.promptResp.AcceptanceExpectedHeadSHA = testExpectedSHA
+	t.Setenv(previewCmdEnv, "echo provision-broke; exit 7")
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, `"reason":"acceptance_preview_provision_failed"`) ||
+		!strings.Contains(out, `"category":"C"`) {
+		t.Errorf("missing category-C acceptance_preview_provision_failed failure: %s", out)
+	}
+	if !strings.Contains(out, "exit status 7") || !strings.Contains(out, "provision-broke") {
+		t.Errorf("detail must carry exit code and output tail: %s", out)
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("agent invoked %d times, want 0", invoker.callIdx)
+	}
+}
+
+// TestRun_AcceptanceStage_PostProvisionFailure_TeardownRuns (binding
+// approval condition 2): a failure AFTER a successful provision — here a
+// stale-target gate failure — must still run the preview teardown before
+// the stage failure returns, so no preview instance is left behind.
+func TestRun_AcceptanceStage_PostProvisionFailure_TeardownRuns(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	ts, _ := healthzServer(t, 200, `{"git_sha":"0000000"}`)
+	fu.promptResp.EgressTargetHosts = []string{hostOf(ts)}
+	fu.promptResp.AcceptanceExpectedHeadSHA = testExpectedSHA
+	marker := markerPath(t)
+	t.Setenv(previewCmdEnv, "true")
+	t.Setenv(previewTeardownCmdEnv, "echo torn > "+marker)
+	t.Setenv(previewReadyTimeoutSecsEnv, "1")
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"reason":"acceptance_target_stale"`) {
+		t.Errorf("missing acceptance_target_stale failure: %s", stderr.String())
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("teardown must run on a post-provision gate failure (no preview left behind): %v", err)
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("agent invoked %d times, want 0", invoker.callIdx)
+	}
+}
+
+// TestRun_AcceptanceStage_ReadinessTimeout_TeardownRuns (binding approval
+// condition 2, second enumerated path): provision succeeds but the preview
+// never becomes ready — the stage fails category-C and the teardown still
+// runs before the failure returns.
+func TestRun_AcceptanceStage_ReadinessTimeout_TeardownRuns(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	fu.promptResp.EgressTargetHosts = []string{closedPortHost(t)}
+	fu.promptResp.AcceptanceExpectedHeadSHA = testExpectedSHA
+	marker := markerPath(t)
+	t.Setenv(previewCmdEnv, "true")
+	t.Setenv(previewTeardownCmdEnv, "echo torn > "+marker)
+	t.Setenv(previewReadyTimeoutSecsEnv, "1")
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, `"reason":"acceptance_target_unreachable"`) ||
+		!strings.Contains(out, "not ready within") {
+		t.Errorf("missing not-ready acceptance_target_unreachable failure: %s", out)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("teardown must run on a readiness timeout (no preview left behind): %v", err)
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("agent invoked %d times, want 0", invoker.callIdx)
+	}
+}
+
+// TestRun_AcceptanceStage_TargetUnverifiable_WarnsAndSpawns: the target is
+// reachable but exposes no git_sha build identifier — the gate warns
+// acceptance_target_unverified and the agent still spawns (mixed-version
+// compat posture).
+func TestRun_AcceptanceStage_TargetUnverifiable_WarnsAndSpawns(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	ts, _ := healthzServer(t, 200, `{"status":"ok"}`)
+	fu.promptResp.EgressTargetHosts = []string{hostOf(ts)}
+	fu.promptResp.AcceptanceExpectedHeadSHA = testExpectedSHA
+	invoker := &fakeInvoker{canned: agent.Result{
+		OK:               true,
+		StructuredOutput: []byte(passedVerdict),
+	}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"acceptance_target_unverified"`) {
+		t.Errorf("missing acceptance_target_unverified warn: %s", stderr.String())
+	}
+	if invoker.callIdx != 1 {
+		t.Errorf("agent invoked %d times, want 1 (unverifiable proceeds)", invoker.callIdx)
+	}
+}
+
+// TestRun_AcceptanceStage_NoTargetHosts_SkipsProbe: a spec with no
+// declared egress target hosts preserves the existing behavior — no
+// probe, no gate events, agent spawns.
+func TestRun_AcceptanceStage_NoTargetHosts_SkipsProbe(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	fu.promptResp.AcceptanceExpectedHeadSHA = testExpectedSHA // expectation without hosts
+	invoker := &fakeInvoker{canned: agent.Result{
+		OK:               true,
+		StructuredOutput: []byte(passedVerdict),
+	}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "acceptance_target_") {
+		t.Errorf("no-hosts stage must skip the probe entirely: %s", stderr.String())
+	}
+	if invoker.callIdx != 1 {
+		t.Errorf("agent invoked %d times, want 1", invoker.callIdx)
+	}
+}
+
+// TestRun_AcceptanceStage_TargetVerified_SpawnsAndTearsDownAfterVerdict:
+// the happy path — the target serves the expected head SHA, the gate logs
+// acceptance_target_verified, the agent runs, the verdict ships, and the
+// deferred teardown has run by the time run() returns.
+func TestRun_AcceptanceStage_TargetVerified_SpawnsAndTearsDownAfterVerdict(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	ts, _ := healthzServer(t, 200, `{"git_sha":"abc1234"}`)
+	fu.promptResp.EgressTargetHosts = []string{hostOf(ts)}
+	fu.promptResp.AcceptanceExpectedHeadSHA = testExpectedSHA
+	marker := markerPath(t)
+	t.Setenv(previewTeardownCmdEnv, "echo torn > "+marker)
+	invoker := &fakeInvoker{canned: agent.Result{
+		OK:               true,
+		StructuredOutput: []byte(passedVerdict),
+	}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"acceptance_target_verified"`) ||
+		!strings.Contains(stderr.String(), `"git_sha":"abc1234"`) {
+		t.Errorf("missing acceptance_target_verified{git_sha}: %s", stderr.String())
+	}
+	if fu.gotAcceptanceArgs == nil {
+		t.Fatal("verdict must ship on the verified path")
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("teardown must have run by stage end: %v", err)
+	}
+	if invoker.callIdx != 1 {
+		t.Errorf("agent invoked %d times, want 1", invoker.callIdx)
+	}
+}
+
+// TestRun_AcceptanceStage_PreviewEnvExcludedFromAgent: the
+// FISHHAWK_ACCEPTANCE_PREVIEW_* variables are runner-process config —
+// acceptenv's default-deny allow-list must drop them from the agent
+// invocation env by omission (no acceptenv change was needed for #1569).
+func TestRun_AcceptanceStage_PreviewEnvExcludedFromAgent(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	ts, _ := healthzServer(t, 200, `{"git_sha":"abc1234"}`)
+	fu.promptResp.EgressTargetHosts = []string{hostOf(ts)}
+	fu.promptResp.AcceptanceExpectedHeadSHA = testExpectedSHA
+	t.Setenv(previewCmdEnv, "true")
+	t.Setenv(previewTeardownCmdEnv, "true")
+	t.Setenv(previewProvisionTimeoutSecsEnv, "30")
+	t.Setenv(previewReadyTimeoutSecsEnv, "5")
+	invoker := &fakeInvoker{canned: agent.Result{
+		OK:               true,
+		StructuredOutput: []byte(passedVerdict),
+	}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if invoker.gotInv == nil {
+		t.Fatal("invocation not captured")
+	}
+	for _, kv := range invoker.gotInv.BaseEnv {
+		if strings.HasPrefix(kv, "FISHHAWK_ACCEPTANCE_PREVIEW") {
+			t.Errorf("preview config leaked into the agent env: %s", kv)
+		}
+	}
+}
+
+// TestAcceptenv_ExcludesPreviewVars pins the exclusion at the acceptenv
+// layer directly: every FISHHAWK_ACCEPTANCE_PREVIEW_* knob is dropped by
+// the default-deny allow-list (they carry no passthrough prefix).
+func TestAcceptenv_ExcludesPreviewVars(t *testing.T) {
+	base := []string{
+		"PATH=/usr/bin",
+		previewCmdEnv + "=scripts/dev preview",
+		previewTeardownCmdEnv + "=scripts/dev preview-down",
+		previewProvisionTimeoutSecsEnv + "=300",
+		previewReadyTimeoutSecsEnv + "=60",
+	}
+	env, refused := acceptenv.Env(base, "http://127.0.0.1:9")
+	if len(refused) != 0 {
+		t.Errorf("refused = %v, want none (excluded by omission, not by deny)", refused)
+	}
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "FISHHAWK_ACCEPTANCE_PREVIEW") {
+			t.Errorf("preview var survived acceptenv: %s", kv)
+		}
+	}
+}
+
+// TestRun_AcceptanceStage_ExpectedHeadSHASeam_JSONToGate (binding approval
+// condition 1 — the seam through-test): the expected head SHA travels from
+// the backend's fetched-prompt JSON, through the runner's real prompt
+// decode (upload.FetchPrompt against an httptest backend — no fake
+// uploader struct), INTO the pre-spawn gate consumer, whose stale failure
+// detail must echo that exact SHA. A wiring break anywhere between decode
+// and gate use fails this test.
+func TestRun_AcceptanceStage_ExpectedHeadSHASeam_JSONToGate(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "README.md"), "hello\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "initial")
+
+	const seamSHA = "feedf00dfeedf00dfeedf00dfeedf00dfeedf00d"
+	healthz, _ := healthzServer(t, 200, `{"git_sha":"1234567"}`) // stale vs seamSHA
+
+	promptJSON := `{
+		"stage_id": "22222222-3333-4444-5555-666666666666",
+		"stage_type": "acceptance",
+		"prompt": "Validate the running instance against the criteria.",
+		"prompt_hash": "deadbeef",
+		"acceptance_criteria_ids": ["AC1"],
+		"egress_target_hosts": ["` + hostOf(healthz) + `"],
+		"acceptance_expected_head_sha": "` + seamSHA + `"
+	}`
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/signing-key"):
+			_, priv, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Error(err)
+				http.Error(w, "keygen", 500)
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"run_id":      "11111111-2222-3333-4444-555555555555",
+				"public_key":  base64.StdEncoding.EncodeToString(priv.Public().(ed25519.PublicKey)),
+				"private_key": base64.StdEncoding.EncodeToString(priv),
+				"issued_at":   time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC),
+				"expires_at":  time.Date(2026, 7, 2, 12, 30, 0, 0, time.UTC),
+			})
+		case strings.HasSuffix(r.URL.Path, "/prompt"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(promptJSON))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(backend.Close)
+
+	// REAL wire client — the prompt JSON above goes through the production
+	// upload.FetchPrompt decode, not a canned struct.
+	origClient := newUploadClient
+	newUploadClient = func(string) uploadClient { return upload.New(backend.URL) }
+	t.Cleanup(func() { newUploadClient = origClient })
+
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", backend.URL,
+		"--workflow", "feature_change",
+		"--stage", "acceptance",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+		"--working-dir", repo,
+		"--upload-trace",
+	}, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure (stale gate):\n%s", got, stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, `"reason":"acceptance_target_stale"`) ||
+		!strings.Contains(out, `"category":"C"`) {
+		t.Fatalf("missing category-C acceptance_target_stale failure: %s", out)
+	}
+	// The load-bearing seam assertion: the gate's failure detail carries
+	// the exact SHA that entered as fetched-prompt JSON.
+	if !strings.Contains(out, seamSHA) {
+		t.Errorf("gate detail must echo the wire-decoded expected head SHA %s: %s", seamSHA, out)
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("agent invoked %d times, want 0", invoker.callIdx)
 	}
 }
