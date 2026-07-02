@@ -6341,3 +6341,115 @@ func TestGetRunStatus_ChildrenStatus_DecodeError_StillSnapshots(t *testing.T) {
 		t.Errorf("Run.ID = %s, want %s", out.Run.ID, parent)
 	}
 }
+
+// TestGetRunStatus_AcceptanceStageWaitStatus_PresentAndOmitted pins the E31.9
+// surface field: a run declaring an acceptance stage carries
+// acceptance_stage_wait_status (via the generic stageWaitStatusFor helper), and
+// a run WITHOUT one omits it (nil) so non-acceptance runs are byte-identical.
+func TestGetRunStatus_AcceptanceStageWaitStatus_PresentAndOmitted(t *testing.T) {
+	t.Run("present on an acceptance-stage run", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+		fb.stagesByRun[runID] = []Stage{
+			{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+			{ID: uuid.NewString(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "succeeded"},
+			{ID: uuid.NewString(), RunID: runID.String(), Sequence: 3, Type: "acceptance", State: "running"},
+		}
+
+		r := newResolver(srv, nil)
+		_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		if out.AcceptanceStageWaitStatus == nil {
+			t.Fatal("AcceptanceStageWaitStatus is nil; expected it on a run declaring an acceptance stage")
+		}
+		if out.AcceptanceStageWaitStatus.Stage != "acceptance" {
+			t.Errorf("Stage = %q, want acceptance", out.AcceptanceStageWaitStatus.Stage)
+		}
+		if out.AcceptanceStageWaitStatus.Status != "running" {
+			t.Errorf("Status = %q, want running", out.AcceptanceStageWaitStatus.Status)
+		}
+		if out.AcceptanceStageWaitStatus.PollIntervalSeconds != suggestedStageWaitPollIntervalSeconds {
+			t.Errorf("PollIntervalSeconds = %d, want %d", out.AcceptanceStageWaitStatus.PollIntervalSeconds, suggestedStageWaitPollIntervalSeconds)
+		}
+	})
+
+	t.Run("omitted on a run without an acceptance stage", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+		fb.stagesByRun[runID] = []Stage{
+			{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+			{ID: uuid.NewString(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "running"},
+		}
+
+		r := newResolver(srv, nil)
+		_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		if out.AcceptanceStageWaitStatus != nil {
+			t.Errorf("AcceptanceStageWaitStatus = %+v, want nil on a run with no acceptance stage", out.AcceptanceStageWaitStatus)
+		}
+	})
+}
+
+// TestGetRunStatus_AcceptancePassed_ThreadsRecentAudit exercises the REAL
+// getRunStatus path end-to-end (wire JSON -> payload parse -> classifier ->
+// next_actions) for the cross-boundary seam (#875): the backend writes the
+// acceptance_outcome_recorded verdict, the MCP reads it off the recent-audit
+// slice, and the classifier yields acceptance_passed with the merge ritual. A
+// FAILED verdict leaves the STAGE succeeded, so this proves the classifier reads
+// the audit payload, not the stage state.
+func TestGetRunStatus_AcceptancePassed_ThreadsRecentAudit(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	prURL := "https://github.com/x/y/pull/77"
+	fb.getRunByID[runID] = Run{
+		ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change",
+		State: "running", PullRequestURL: &prURL,
+	}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 3, Type: "acceptance", State: "succeeded"},
+	}
+	// The acceptance_outcome_recorded verdict=passed entry, as a map payload so
+	// it round-trips through the fake's JSON encode -> client decode as an object
+	// (not base64 bytes), exactly like the production /v0/audit endpoint.
+	fb.auditByRun[runID] = []AuditEntry{
+		{
+			ID: uuid.New().String(), Sequence: 2, RunID: runID.String(),
+			Category:  "acceptance_outcome_recorded",
+			Payload:   map[string]any{"verdict": "passed", "outcome": "accepted"},
+			EntryHash: "h",
+		},
+		{
+			ID: uuid.New().String(), Sequence: 1, RunID: runID.String(),
+			Category: "acceptance_dispatched", Payload: map[string]any{}, EntryHash: "g",
+		},
+	}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.NextActions == nil || out.NextActions.State != "acceptance_passed" {
+		t.Fatalf("next_actions = %+v, want state acceptance_passed", out.NextActions)
+	}
+	names := make([]string, 0, len(out.NextActions.Actions))
+	for _, a := range out.NextActions.Actions {
+		names = append(names, a.Action)
+	}
+	if len(names) != 3 || names[0] != "approve_pr" || names[1] != "merge_pr" || names[2] != "post_merge" {
+		t.Errorf("acceptance_passed actions = %v, want [approve_pr merge_pr post_merge]", names)
+	}
+	// And the stage-execution surface tracks execution (succeeded), distinct
+	// from the verdict.
+	if out.AcceptanceStageWaitStatus == nil || out.AcceptanceStageWaitStatus.Status != "succeeded" {
+		t.Errorf("AcceptanceStageWaitStatus = %+v, want status succeeded", out.AcceptanceStageWaitStatus)
+	}
+}

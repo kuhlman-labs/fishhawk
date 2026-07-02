@@ -64,7 +64,7 @@ type NextActions struct {
 // every input except run and stages may be nil. For drive-enabled runs
 // with a distilled NextAction, that action is folded in FIRST so drive
 // and next_actions never point different ways.
-func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, drive *DriveStatus, mergeObserved bool) *NextActions {
+func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, drive *DriveStatus, mergeObserved bool, acceptanceVerdict, acceptanceTriageDisposition string) *NextActions {
 	if run == nil {
 		return nil
 	}
@@ -81,7 +81,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		return na
 	}
 
-	na := classifyNextActions(run, stages, planReviewStatus, implementReviewStatus, hint, mergeObserved)
+	na := classifyNextActions(run, stages, planReviewStatus, implementReviewStatus, hint, mergeObserved, acceptanceVerdict, acceptanceTriageDisposition)
 
 	if drive != nil && drive.NextAction != nil {
 		na.Actions = append([]SuggestedAction{driveAction(run, drive.NextAction)}, na.Actions...)
@@ -99,10 +99,11 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 
 // classifyNextActions is the state table. Each arm returns a labeled
 // state with >= 1 action; only terminal arms return nil actions.
-func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, mergeObserved bool) *NextActions {
+func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, mergeObserved bool, acceptanceVerdict, acceptanceTriageDisposition string) *NextActions {
 	plan := stageByType(stages, "plan")
 	impl := stageByType(stages, "implement")
 	review := stageByType(stages, "review")
+	acceptance := stageByType(stages, "acceptance")
 	implReviewPending := implementReviewStatus != nil && implementReviewStatus.Status == "pending"
 
 	// Run already succeeded: the wedge arm, then the merge ritual.
@@ -183,7 +184,7 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 	// Implement stage arms (the plan gate is behind us, or no plan stage
 	// exists — the resume_run recovery-child shape).
 	if impl != nil && (plan == nil || plan.State == "succeeded") {
-		if a := implementStageNextActions(run, impl, implementReviewStatus, hint); a != nil {
+		if a := implementStageNextActions(run, impl, acceptance, implementReviewStatus, hint, acceptanceVerdict, acceptanceTriageDisposition); a != nil {
 			return a
 		}
 	}
@@ -290,8 +291,13 @@ func planStageNextActions(run *Run, plan *Stage, planReviewStatus *ReviewStatus)
 
 // implementStageNextActions covers the implement stage's post-plan
 // states. Returns nil when no arm matches (the caller falls through to
-// the unclassified fallback).
-func implementStageNextActions(run *Run, impl *Stage, implementReviewStatus *ReviewStatus, hint *ReviewActionHint) *NextActions {
+// the unclassified fallback). acceptance is the run's acceptance stage
+// (nil when the workflow declares none, E31.9); when present it gates
+// the merge, so the settled path branches to the acceptance arm before
+// the merge ritual. acceptanceVerdict / acceptanceTriageDisposition are
+// the signals extracted from the acceptance_outcome_recorded /
+// acceptance_triage_decided audit payloads.
+func implementStageNextActions(run *Run, impl, acceptance *Stage, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, acceptanceVerdict, acceptanceTriageDisposition string) *NextActions {
 	switch impl.State {
 	case "pending", "dispatched":
 		return &NextActions{State: "implement_pending", Actions: dispatchOrPollActions(run, "implement")}
@@ -353,8 +359,13 @@ func implementStageNextActions(run *Run, impl *Stage, implementReviewStatus *Rev
 			// construction.
 			return &NextActions{State: "implement_concerns_open", Actions: hint.suggestedActions(run, impl.ID)}
 		}
-		// Review settled with nothing to route back: the PR is the next
-		// surface — approve and merge.
+		// Review settled with nothing to route back. When the workflow
+		// declares an acceptance stage (E31.9 / ADR-049), it gates the merge
+		// — branch to the acceptance arm BEFORE the merge ritual.
+		if acceptance != nil {
+			return acceptanceStageNextActions(run, acceptance, acceptanceVerdict, acceptanceTriageDisposition)
+		}
+		// No acceptance stage: the PR is the next surface — approve and merge.
 		return &NextActions{State: "implement_gate_settled", Actions: mergeRitualActions(run, "the implement review is settled with no open concerns")}
 	default:
 		return nil
@@ -679,6 +690,31 @@ func dispatchOrPollActions(run *Run, stageType string) []SuggestedAction {
 			},
 		}
 	}
+	if stageType == "acceptance" {
+		// The acceptance stage (E31.9) also defaults to the non-blocking
+		// fishhawk_dispatch_stage: it validates the change against a running
+		// preview/target instance and runs long, so the operator wants the
+		// session free while it executes. fishhawk_run_stage stays the blocking
+		// opt-in. The acceptance stage files no scope amendments, but the
+		// long-run + free-session rationale is the same one that makes dispatch
+		// the implement default (#1247).
+		return []SuggestedAction{
+			{
+				Action:       "fishhawk_dispatch_stage",
+				Params:       map[string]string{"run_id": run.ID, "stage": "acceptance"},
+				Precondition: "the implement review is settled and the customer-provisioned preview/target instance the acceptance stage validates against is up; the working tree on the operator host is clean (git status first). Acceptance runs long against the running instance, so dispatch (non-blocking) is the default",
+				Consumes:     consumesNone,
+				Reason:       "dispatch returns the durable (run_id, stage_id) handle immediately and polls to terminal; the validator drives the preview and ships a verdict — a FAILED verdict leaves the stage succeeded and routes through deterministic server-side triage (ADR-049 decision #2), so read the acceptance_outcome_recorded entry rather than inferring from stage state",
+			},
+			{
+				Action:       "fishhawk_run_stage",
+				Params:       map[string]string{"run_id": run.ID, "stage": "acceptance"},
+				Precondition: "the preview/target instance is up and the working tree is clean; explicit opt-in to BLOCK the session to terminal",
+				Consumes:     consumesNone,
+				Reason:       "blocks to terminal and returns the full events list in one call — choose this only when you do not need the session free while acceptance runs",
+			},
+		}
+	}
 	reason := fmt.Sprintf("the %s stage is waiting for the operator host to dispatch it (runner_kind local)", stageType)
 	precondition := "the run's runner_kind is local and the stage has not started"
 	return []SuggestedAction{{
@@ -688,6 +724,125 @@ func dispatchOrPollActions(run *Run, stageType string) []SuggestedAction {
 		Consumes:     consumesNone,
 		Reason:       reason,
 	}}
+}
+
+// acceptanceStageNextActions is the acceptance-stage arm of the classifier
+// (E31.9 / ADR-049). Reached from implementStageNextActions' settled path when
+// the workflow declares an acceptance stage — it gates the merge. A failed
+// acceptance VERDICT leaves the STAGE 'succeeded' (backend run/acceptance.go),
+// so the arm reads the acceptance_outcome_recorded verdict + the
+// acceptance_triage_decided disposition (passed as acceptanceVerdict /
+// acceptanceTriageDisposition), NEVER the stage state, to decide the move.
+func acceptanceStageNextActions(run *Run, acceptance *Stage, verdict, disposition string) *NextActions {
+	// A non-terminal acceptance stage dispatches (local) or polls
+	// (github_actions), mirroring the plan/implement pending arms. A
+	// running stage is validating against the preview — poll.
+	if !stageStateIsTerminal(acceptance.State) {
+		if acceptance.State == "running" {
+			return &NextActions{
+				State: "acceptance_running",
+				Actions: []SuggestedAction{pollAction(run,
+					suggestedStageWaitPollIntervalSeconds,
+					"the acceptance stage is validating the change against the running preview — re-poll until acceptance_stage_wait_status goes terminal, then read the acceptance_outcome_recorded verdict")},
+			}
+		}
+		return &NextActions{State: "acceptance_pending", Actions: dispatchOrPollActions(run, "acceptance")}
+	}
+
+	// A terminal acceptance stage that never recorded a verdict in the recent
+	// window (verdict==""; the default audit_limit is 5, so the entry can age
+	// out), or a stage that failed/cancelled its own execution, falls to the
+	// defensive read arm — deliberately NEVER the merge ritual (fail toward
+	// read, not toward merge).
+	if acceptance.State != "succeeded" || verdict == "" {
+		return acceptanceOutcomeUnknownActions(run)
+	}
+
+	switch verdict {
+	case acceptanceVerdictPassed:
+		// ADR-049 decision #6: the merge is gated on the acceptance_passed
+		// evidence condition. The stage passed — the PR is the next surface.
+		return &NextActions{State: "acceptance_passed", Actions: mergeRitualActions(run,
+			"the acceptance stage passed (ADR-049 decision #6: the merge is gated on the acceptance_passed evidence condition)")}
+	case acceptanceVerdictFailed:
+		if isAcceptancePagedDisposition(disposition) {
+			return &NextActions{State: "acceptance_triage_paged", Actions: acceptanceTriagePagedActions(run)}
+		}
+		// fixup_dispatched / retry_dispatched (or a triage decision not yet
+		// recorded): the deterministic server-side triage (E31.8) re-opens the
+		// implement stage (class 1) or the acceptance stage (class 2), so on the
+		// NEXT snapshot the existing implement_pending / acceptance_pending
+		// stage-state arms serve the move — nothing to duplicate here. Poll
+		// until the re-opened stage surfaces.
+		return &NextActions{
+			State: "acceptance_triage_rerouting",
+			Actions: []SuggestedAction{pollAction(run,
+				suggestedStageWaitPollIntervalSeconds,
+				"the acceptance verdict failed and deterministic server-side triage auto-routed it (fixup_dispatched re-opens implement; retry_dispatched re-opens acceptance) — re-poll; the re-opened stage's dispatch arm serves the next move. On the local runner an auto-routed re-open never spawns the runner, so fishhawk_dispatch_stage the re-opened implement (after fixup_dispatched) or acceptance (after retry_dispatched) stage")},
+		}
+	default:
+		return acceptanceOutcomeUnknownActions(run)
+	}
+}
+
+// acceptanceOutcomeUnknownActions is the defensive read arm for a settled
+// acceptance stage whose verdict is not visible in the recent-audit window (it
+// aged out, or the payload was malformed). It points at the full audit trail
+// and, load-bearing, NEVER offers the merge ritual — an unknown acceptance
+// outcome must fail toward read, not toward merge (E31.9).
+func acceptanceOutcomeUnknownActions(run *Run) *NextActions {
+	return &NextActions{
+		State: "acceptance_settled_outcome_unknown",
+		Actions: []SuggestedAction{
+			{
+				Action:       "fishhawk_list_audit",
+				Params:       map[string]string{"run_id": run.ID, "category": "acceptance_outcome_recorded"},
+				Precondition: "the acceptance stage settled but no acceptance_outcome_recorded verdict is visible in the recent-audit window (the default audit_limit is 5 — the entry can age out)",
+				Consumes:     consumesNone,
+				Reason:       "read the acceptance verdict + triage disposition from the full audit trail before acting — deliberately NOT the merge ritual (fail toward read, not toward merge)",
+			},
+			pollAction(run, suggestedStageWaitPollIntervalSeconds,
+				"re-poll fishhawk_get_run_status with a larger audit_limit to surface the acceptance_outcome_recorded / acceptance_triage_decided entries"),
+		},
+	}
+}
+
+// acceptanceTriagePagedActions is the human-arbitration arm for a failed
+// acceptance verdict whose deterministic triage disposition landed on the
+// human (paged / rerun_budget_exhausted / *_unavailable_paged / unsettled_paged
+// — ADR-049 decision #2). It leads with reading the evidence, then the operator
+// arbitrates: a manual fix-up pass, accept-and-ship, or cancel.
+func acceptanceTriagePagedActions(run *Run) []SuggestedAction {
+	return []SuggestedAction{
+		{
+			Action:       "fishhawk_list_audit",
+			Params:       map[string]string{"run_id": run.ID, "category": "acceptance_triage_decided"},
+			Precondition: "a failed acceptance verdict landed on a paged triage disposition (paged / rerun_budget_exhausted / *_unavailable_paged / unsettled_paged) — the human arbitrates. Read the acceptance_outcome_recorded criteria results and the acceptance_triage_decided class + reason first",
+			Consumes:     consumesNone,
+			Reason:       "the deterministic triage classified the failure as page-the-human (class 3/4, an exhausted re-run budget, or an unavailable fix-up/retry route); read the evidence before arbitrating",
+		},
+		{
+			Action:       "fishhawk_fixup_stage",
+			Params:       map[string]string{"run_id": run.ID, "concern_ids": "run.concerns.items[].id"},
+			Precondition: "you judge the failure is a real, fixable code defect worth a manual fix-up pass (checkout the run branch first)",
+			Consumes:     consumesFixupBudget,
+			Reason:       "route the acceptance failure back to the implement agent as a manual fix-up pass — consumes the shared fix-up budget the auto-triage also draws on",
+		},
+		{
+			Action:       "merge_and_file_follow_up",
+			Params:       prParams(run),
+			Precondition: "you judge the failure is a bad/ambiguous acceptance criterion (class 3) or otherwise works-as-planned — accept and ship",
+			Consumes:     consumesNone,
+			Reason:       "accept the change despite the failed acceptance verdict (e.g. a class-3 bad criterion): approve + merge the PR and file a follow-up issue for the disputed criterion",
+		},
+		{
+			Action:       "fishhawk_cancel_run",
+			Params:       map[string]string{"run_id": run.ID},
+			Precondition: "the change should not ship and no fix-up is warranted",
+			Consumes:     consumesNone,
+			Reason:       "cancel the run — the acceptance failure is neither fixable in-loop nor acceptable",
+		},
+	}
 }
 
 // mergeRitualActions is the ordered operator merge ritual for a run
@@ -826,6 +981,120 @@ func stageByType(stages []Stage, stageType string) *Stage {
 // slice_integration_conflict audit payload, not parsed from this string.
 // MUST match orchestrator.sliceIntegrationConflictReasonPrefix.
 const sliceIntegrationConflictReasonPrefix = "slice integration conflict"
+
+// Acceptance audit categories + verdict/disposition vocabulary (E31.9 /
+// ADR-049). These strings are the cross-module seam between the backend, which
+// WRITES the acceptance_outcome_recorded / acceptance_triage_decided audit
+// payloads, and this classifier, which READS them. fishhawk-mcp deliberately
+// does NOT import backend/internal/server (the #875 compile trap; same idiom as
+// sliceIntegrationConflictReasonPrefix above), so the literals are copied
+// verbatim and pinned by the literal-table test. A backend rename that is not
+// mirrored here lands the failure in the labeled defensive
+// acceptance_settled_outcome_unknown / acceptance_triage_rerouting arms (safe:
+// read, never merge), not a wrong action.
+//
+// MUST match backend/internal/server/acceptance.go: the CategoryAcceptance*
+// consts (lines ~42/46/56) and the acceptanceVerdict* / acceptanceDisposition*
+// consts (lines ~77-89).
+const (
+	auditCategoryAcceptanceOutcomeRecorded = "acceptance_outcome_recorded"
+	auditCategoryAcceptanceTriageDecided   = "acceptance_triage_decided"
+
+	acceptanceVerdictPassed = "passed"
+	acceptanceVerdictFailed = "failed"
+
+	// Auto-routed dispositions (a state transition fired): NOT paged.
+	acceptanceDispositionFixupDispatched = "fixup_dispatched"
+	acceptanceDispositionRetryDispatched = "retry_dispatched"
+
+	// Paged-family dispositions (no transition — the human arbitrates).
+	acceptanceDispositionPaged            = "paged"
+	acceptanceDispositionRerunBudget      = "rerun_budget_exhausted"
+	acceptanceDispositionFixupUnavailable = "fixup_unavailable_paged"
+	acceptanceDispositionRetryUnavailable = "retry_unavailable_paged"
+	acceptanceDispositionUnsettled        = "unsettled_paged"
+)
+
+// isAcceptancePagedDisposition reports whether a triage disposition is a
+// page-the-human variant (ADR-049 decision #2). The two auto-routed
+// dispositions (fixup_dispatched / retry_dispatched) return false — they fired
+// a state transition and the re-opened stage's own arm serves the next move.
+func isAcceptancePagedDisposition(d string) bool {
+	switch d {
+	case acceptanceDispositionPaged,
+		acceptanceDispositionRerunBudget,
+		acceptanceDispositionFixupUnavailable,
+		acceptanceDispositionRetryUnavailable,
+		acceptanceDispositionUnsettled:
+		return true
+	default:
+		return false
+	}
+}
+
+// latestAcceptanceVerdict returns the verdict on the newest
+// acceptance_outcome_recorded audit entry in the recent slice (time-descending,
+// item 0 newest — the same slice mergeObservedIn scans), or "" when none is
+// present or the payload is malformed.
+func latestAcceptanceVerdict(recent []AuditEntry) string {
+	for _, e := range recent {
+		if e.Category == auditCategoryAcceptanceOutcomeRecorded {
+			return acceptancePayloadString(e.Payload, "verdict")
+		}
+	}
+	return ""
+}
+
+// latestAcceptanceTriageDisposition returns the triage disposition CORRELATED
+// with the newest acceptance_outcome_recorded verdict — NOT merely the newest
+// acceptance_triage_decided entry. The backend WRITES the triage decision AFTER
+// the outcome it triages, so for a given attempt the triage entry sits ABOVE
+// (newer than / a lower index than) its verdict in the time-descending recent
+// slice. This function therefore finds the newest verdict entry and returns the
+// newest triage disposition that is strictly NEWER than it (index <
+// verdictIdx); a triage entry at or below the newest verdict belongs to an
+// OLDER acceptance attempt and is deliberately ignored.
+//
+// This correlation is load-bearing: with multiple acceptance attempts in the
+// recent window, a fresh failed verdict whose triage decision has not landed
+// yet would otherwise inherit the STALE disposition of an earlier failure —
+// surfacing acceptance_triage_paged / acceptance_triage_rerouting off the wrong
+// attempt. Refusing the stale entry makes acceptanceStageNextActions fall to
+// the poll/read arm (empty disposition on a failed verdict → rerouting) until
+// the matching triage entry appears. Returns "" when no verdict is present
+// (the classifier is in its defensive read arm anyway), no correlated triage
+// exists yet, or the payload is malformed.
+func latestAcceptanceTriageDisposition(recent []AuditEntry) string {
+	verdictIdx := -1
+	for i, e := range recent {
+		if e.Category == auditCategoryAcceptanceOutcomeRecorded {
+			verdictIdx = i
+			break
+		}
+	}
+	if verdictIdx < 0 {
+		return ""
+	}
+	for i := 0; i < verdictIdx; i++ {
+		if recent[i].Category == auditCategoryAcceptanceTriageDecided {
+			return acceptancePayloadString(recent[i].Payload, "disposition")
+		}
+	}
+	return ""
+}
+
+// acceptancePayloadString reads a string field from a decoded-JSON audit
+// payload. AuditEntry.Payload is `any` (a map[string]any after JSON decode);
+// any non-object payload or missing/non-string field yields "" — a malformed
+// payload never panics and lands the caller in the defensive arm.
+func acceptancePayloadString(payload any, field string) string {
+	m, ok := payload.(map[string]any)
+	if !ok {
+		return ""
+	}
+	s, _ := m[field].(string)
+	return s
+}
 
 // citedFlakeEvent returns the known flake trace-event name the stage's
 // failure reason cites, or "" when none does.

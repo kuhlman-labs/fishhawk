@@ -81,7 +81,7 @@ type RunStageInput struct {
 	RunID         string `json:"run_id" jsonschema:"Fishhawk run UUID minted by fishhawk_start_run"`
 	StageID       string `json:"stage_id,omitempty" jsonschema:"stage UUID inside the run; optional — when omitted it is auto-resolved from (run_id, stage type). Pass explicitly only to disambiguate, or for back-compat; when supplied it must match the resolved stage of the requested type"`
 	Workflow      string `json:"workflow" jsonschema:"workflow ID matching the run's workflow"`
-	Stage         string `json:"stage" jsonschema:"stage type: plan | implement | review"`
+	Stage         string `json:"stage" jsonschema:"stage type: plan | implement | review | acceptance. The acceptance stage (E31.9) validates the merged change against a running preview/target instance; prefer fishhawk_dispatch_stage for it (it runs long, non-blocking) and it takes neither --plan-out nor --check-base-ref"`
 	WorkingDir    string `json:"working_dir,omitempty" jsonschema:"checkout the agent runs in; defaults to the MCP server's cwd"`
 	GitHubRepo    string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
 	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR (no effect when push_and_open_pr is false); defaults to main"`
@@ -589,7 +589,12 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		// A run_stage call executes the plan or implement stage and can
 		// never observe a post-merge (the PR is not even open yet at
 		// implement-stage exit), so mergeObserved is the literal false (#1370).
-		nextActions = nextActionsFor(&runView.Run, postStages, planReviewStatus, implementReviewStatus, reviewActionHint, runView.driveStatus(), false)
+		// It holds no recent-audit slice (its own audit read is limit=1 for the
+		// pointer), so the acceptance verdict/disposition signals are empty here
+		// — safe: run_stage never runs the acceptance stage, and the defensive
+		// acceptance_settled_outcome_unknown arm covers an already-settled
+		// acceptance stage (E31.9).
+		nextActions = nextActionsFor(&runView.Run, postStages, planReviewStatus, implementReviewStatus, reviewActionHint, runView.driveStatus(), false, "", "")
 	}
 
 	out := RunStageOutput{

@@ -24,12 +24,14 @@ Happy-path loop (one issue, one run):
 3. fishhawk_approve_plan — read the plan AND its advisory reviews first; approve, or fishhawk_reject_plan with a reason to replan.
 4. fishhawk_dispatch_stage (implement) — execute the approved plan. On the local runner this is what spawns the runner; it does not auto-start.
 5. fishhawk_await_review — wait for the implement review to reach a terminal verdict.
-6. Approve the PR, then merge it, then run your post-merge step.
+6. When the workflow declares an acceptance stage: fishhawk_dispatch_stage (acceptance) after the review settles, await the verdict (fishhawk_get_run_status acceptance_stage_wait_status, or fishhawk_await_audit on acceptance_outcome_recorded), and merge only on the acceptance_passed state.
+7. Approve the PR, then merge it, then run your post-merge step.
 
 Gate semantics (these decide when a verb is legal):
 - Do not approve a plan while its review is still pending — wait for plan_review to clear.
 - Wait for ALL configured reviewers. A feature_change run is reviewed by two agents concurrently; expect two verdicts and treat advisory disagreement as normal — you arbitrate.
 - A mid-implement scope amendment is operator-gated: the agent requests paths, you decide. Name added files as dir/file.ext.
+- A failed acceptance verdict leaves the stage 'succeeded' and routes through deterministic server-side triage (auto fix-up / re-run, bounded); paged dispositions are yours to arbitrate. Read the verdict from the acceptance_outcome_recorded audit entry, not the stage state.
 - next_actions on the run status is the authoritative "what to do next" — prefer it over guessing.
 
 Read the fishhawk://runbook resource for the full procedure and the edge-case playbook (local-drive dispatch, fixup re-dispatch, scope amendments, heterogeneous-review waits, post-failure clean-tree).`

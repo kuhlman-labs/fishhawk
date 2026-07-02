@@ -405,7 +405,7 @@ func TestNextActions_StateTable(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			na := nextActionsFor(tc.run, tc.stages, tc.planRS, tc.implRS, tc.hint, nil, false)
+			na := nextActionsFor(tc.run, tc.stages, tc.planRS, tc.implRS, tc.hint, nil, false, "", "")
 			if na == nil {
 				t.Fatal("nextActionsFor returned nil; the block must always be present")
 			}
@@ -450,7 +450,7 @@ func TestNextActions_ImplementLocalDispatchDefault(t *testing.T) {
 	run := naRun("running")
 	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "pending")}
 
-	na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, "", "")
 	if na == nil || na.State != "implement_pending" {
 		t.Fatalf("state = %+v, want implement_pending", na)
 	}
@@ -475,7 +475,7 @@ func TestNextActions_PlanLocalDispatchUnchanged(t *testing.T) {
 	run := naRun("pending")
 	stages := []Stage{naStage("plan", "pending")}
 
-	na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, "", "")
 	if got := actionNames(na); len(got) != 1 || got[0] != "fishhawk_run_stage" {
 		t.Fatalf("plan-local actions = %v, want exactly [fishhawk_run_stage]", got)
 	}
@@ -489,7 +489,7 @@ func TestNextActions_AwaitingChildren_FanOutArm(t *testing.T) {
 	run := naRun("running")
 	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_children")}
 
-	na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, "", "")
 	if na == nil || na.State != "implement_awaiting_children" {
 		t.Fatalf("state = %+v, want implement_awaiting_children", na)
 	}
@@ -525,7 +525,7 @@ func TestNextActions_DeployStage(t *testing.T) {
 			run.WorkflowID = "release"
 			stages := []Stage{naStage("deploy", tc.deployState)}
 
-			na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
+			na := nextActionsFor(run, stages, nil, nil, nil, nil, false, "", "")
 			if na == nil {
 				t.Fatal("nextActionsFor = nil")
 			}
@@ -585,7 +585,7 @@ func TestNextActions_DeployStage_TerminalFallsThrough(t *testing.T) {
 	run.WorkflowID = "release"
 	stages := []Stage{naStage("deploy", "succeeded")}
 
-	na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, "", "")
 	if na == nil {
 		t.Fatal("nextActionsFor = nil")
 	}
@@ -602,7 +602,7 @@ func TestNextActions_AwaitingScopeDecision_DecideArm(t *testing.T) {
 	run := naRun("running")
 	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_scope_decision")}
 
-	na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, "", "")
 	if na == nil || na.State != "implement_awaiting_scope_decision" {
 		t.Fatalf("state = %+v, want implement_awaiting_scope_decision", na)
 	}
@@ -629,7 +629,7 @@ func TestNextActions_UnclassifiedFallback(t *testing.T) {
 	// run is non-terminal — the synthetic unmatched fixture.
 	stages := []Stage{naStage("review", "succeeded")}
 
-	na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, "", "")
 	if na == nil {
 		t.Fatal("nextActionsFor returned nil")
 	}
@@ -663,7 +663,7 @@ func TestNextActions_DriveActionFoldsFirst(t *testing.T) {
 		NextAction: &RunNextAction{Action: "merge_pr", Detail: "all gates resolved", PRURL: prURL},
 	}
 
-	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, drive, false)
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, drive, false, "", "")
 	if na == nil || len(na.Actions) == 0 {
 		t.Fatalf("nextActionsFor = %+v, want the drive action folded in first", na)
 	}
@@ -685,14 +685,14 @@ func TestNextActions_DriveActionFoldsFirst(t *testing.T) {
 func TestNextActions_CategoryAFlakeCitation(t *testing.T) {
 	run := naRun("failed")
 	cited := nextActionsFor(run, []Stage{naStage("plan", "succeeded"),
-		naFailedImplement("A", "verify aborted after verify_infra_flake_retry")}, nil, nil, nil, nil, false)
+		naFailedImplement("A", "verify aborted after verify_infra_flake_retry")}, nil, nil, nil, nil, false, "", "")
 	retry := findAction(t, cited, "fishhawk_retry_stage")
 	if !strings.Contains(retry.Reason, "verify_infra_flake_retry") {
 		t.Errorf("retry reason should cite the flake trace event; got %q", retry.Reason)
 	}
 
 	uncited := nextActionsFor(run, []Stage{naStage("plan", "succeeded"),
-		naFailedImplement("A", "agent crashed")}, nil, nil, nil, nil, false)
+		naFailedImplement("A", "agent crashed")}, nil, nil, nil, nil, false, "", "")
 	retry = findAction(t, uncited, "fishhawk_retry_stage")
 	if strings.Contains(retry.Reason, "verify_infra_flake_retry") {
 		t.Errorf("retry reason cites a flake event the failure detail does not carry: %q", retry.Reason)
@@ -706,7 +706,7 @@ func TestNextActions_CategoryAFlakeCitation(t *testing.T) {
 func TestNextActions_ResumeRunNamesThisRunAsParent(t *testing.T) {
 	run := naRun("failed")
 	na := nextActionsFor(run, []Stage{naStage("plan", "succeeded"),
-		naFailedImplement("B", "undeclared created file")}, nil, nil, nil, nil, false)
+		naFailedImplement("B", "undeclared created file")}, nil, nil, nil, nil, false, "", "")
 	resume := findAction(t, na, "fishhawk_resume_run")
 	if resume.Params["parent_run_id"] != run.ID {
 		t.Errorf("resume_run params.parent_run_id = %q, want this run's id %s", resume.Params["parent_run_id"], run.ID)
@@ -725,7 +725,7 @@ func TestNextActions_AwaitingParentConsolidationPointsAtParent(t *testing.T) {
 	parent := uuid.NewString()
 	r.ParentRunID = &parent
 	na := nextActionsFor(r, []Stage{naStage("implement", "succeeded")},
-		nil, naReviewStatus("implement", "pending"), nil, nil, false)
+		nil, naReviewStatus("implement", "pending"), nil, nil, false, "", "")
 	if na.State != "awaiting_parent_consolidation" {
 		t.Fatalf("state = %q, want awaiting_parent_consolidation", na.State)
 	}
@@ -737,8 +737,8 @@ func TestNextActions_AwaitingParentConsolidationPointsAtParent(t *testing.T) {
 
 // TestNextActions_NilRun pins the nil guard.
 func TestNextActions_NilRun(t *testing.T) {
-	if na := nextActionsFor(nil, nil, nil, nil, nil, nil, false); na != nil {
-		t.Errorf("nextActionsFor(nil run, false) = %+v, want nil", na)
+	if na := nextActionsFor(nil, nil, nil, nil, nil, nil, false, "", ""); na != nil {
+		t.Errorf("nextActionsFor(nil run) = %+v, want nil", na)
 	}
 }
 
@@ -748,7 +748,7 @@ func TestNextActions_NilRun(t *testing.T) {
 func TestNextActions_PlanReviewPendingDoesNotOfferApproval(t *testing.T) {
 	run := naRun("running")
 	na := nextActionsFor(run, []Stage{naStage("plan", "awaiting_approval")},
-		naReviewStatus("plan", "pending"), nil, nil, nil, false)
+		naReviewStatus("plan", "pending"), nil, nil, nil, false, "", "")
 	for _, a := range na.Actions {
 		if a.Action == "fishhawk_approve_plan" {
 			t.Error("approve_plan offered while the plan review is still pending — the verdict must be read first")
@@ -771,7 +771,7 @@ func TestNextActions_CIFailedRoutable(t *testing.T) {
 	drive := &DriveStatus{Drive: true, DerivedStatus: "ci_failed"}
 	hint := &ReviewActionHint{Concerns: 2, RemainingFixupBudget: 1}
 
-	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), hint, drive, false)
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), hint, drive, false, "", "")
 	if na.State != "ci_failed_routable" {
 		t.Fatalf("state = %q, want ci_failed_routable", na.State)
 	}
@@ -803,7 +803,7 @@ func TestNextActions_CIFailedUnroutable(t *testing.T) {
 	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_approval")}
 	drive := &DriveStatus{Drive: true, DerivedStatus: "ci_failed"}
 
-	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, drive, false)
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, drive, false, "", "")
 	if na.State != "ci_failed_unroutable" {
 		t.Fatalf("state = %q, want ci_failed_unroutable", na.State)
 	}
@@ -831,7 +831,7 @@ func TestNextActions_CIFailedFoldsDriveNextActionFirst(t *testing.T) {
 		NextAction:    &RunNextAction{Action: "classify_ci_failure", Detail: "required PR checks red", PRURL: prURL},
 	}
 
-	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, drive, false)
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, drive, false, "", "")
 	if na.Actions[0].Action != "classify_ci_failure" {
 		t.Errorf("actions[0] = %q, want the drive next_action classify_ci_failure folded first", na.Actions[0].Action)
 	}
@@ -853,7 +853,7 @@ func TestNextActions_SliceIntegrationConflict(t *testing.T) {
 		naStage("review", "pending"),
 	}
 
-	na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, "", "")
 	if na.State != "slices_integration_conflict" {
 		t.Fatalf("state = %q, want slices_integration_conflict", na.State)
 	}
@@ -873,7 +873,7 @@ func TestNextActions_OrdinaryCategoryBParentUnaffected(t *testing.T) {
 	run := naRun("failed")
 	stages := []Stage{naStage("plan", "succeeded"), naFailedImplement("B", "undeclared created file")}
 
-	na := nextActionsFor(run, stages, nil, nil, nil, nil, false)
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, "", "")
 	if na.State != "implement_failed_category_b" {
 		t.Errorf("state = %q, want implement_failed_category_b for an ordinary category-B failure", na.State)
 	}
@@ -890,7 +890,7 @@ func TestNextActions_SucceededMerged(t *testing.T) {
 	run.PullRequestURL = &prURL
 	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
 
-	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, true)
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, true, "", "")
 	if na == nil || na.State != "succeeded_merged" {
 		t.Fatalf("state = %+v, want succeeded_merged", na)
 	}
@@ -918,7 +918,7 @@ func TestNextActions_SucceededPROpenUnchangedWhenMergeNotObserved(t *testing.T) 
 	run.PullRequestURL = &prURL
 	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
 
-	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false)
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, "", "")
 	if na == nil || na.State != "succeeded_pr_open" {
 		t.Fatalf("state = %+v, want succeeded_pr_open", na)
 	}
@@ -1056,5 +1056,372 @@ func TestCampaignNextActionsFor_UnknownAction_Unclassified(t *testing.T) {
 	}
 	if !sawPoll || !sawFile {
 		t.Errorf("unclassified actions = %v, want both a re-poll and file_product_issue", names)
+	}
+}
+
+// --- acceptance-stage next-actions arm (E31.9 / ADR-049) -------------------
+
+// naAcceptanceStages builds the settled-implement stage list plus an
+// acceptance stage in the given state: [plan succeeded, implement succeeded,
+// acceptance <state>]. The implement review is complete + no concerns, so the
+// classifier reaches the settled implement path where the acceptance arm lives.
+func naAcceptanceStages(acceptanceState string) []Stage {
+	return []Stage{
+		naStage("plan", "succeeded"),
+		naStage("implement", "succeeded"),
+		naStage("acceptance", acceptanceState),
+	}
+}
+
+func naLocalRun(state string) *Run {
+	r := naRun(state)
+	r.RunnerKind = "local"
+	return r
+}
+
+// TestNextActions_AcceptanceStateTable drives every acceptance-arm mode the
+// issue names (dispatch -> await -> triage -> merge), one behavioral assertion
+// per enumerated failure mode (#1199). Each case pins the exact state label and
+// the ordered first action(s).
+func TestNextActions_AcceptanceStateTable(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	withPR := func(r *Run) *Run { r.PullRequestURL = &prURL; return r }
+
+	cases := []struct {
+		name        string
+		run         *Run
+		stages      []Stage
+		verdict     string
+		disposition string
+		wantState   string
+		wantActions []string // prefix-exact (first N actions), full when short
+	}{
+		{
+			// (1) acceptance pending + runner_kind local -> dispatch arm, dispatch first.
+			name:        "1_acceptance_pending_local_dispatch",
+			run:         naLocalRun("running"),
+			stages:      naAcceptanceStages("pending"),
+			wantState:   "acceptance_pending",
+			wantActions: []string{"fishhawk_dispatch_stage", "fishhawk_run_stage"},
+		},
+		{
+			// (2) acceptance pending + github_actions -> poll.
+			name: "2_acceptance_pending_github_actions_poll",
+			run: func() *Run {
+				r := naRun("running")
+				r.RunnerKind = "github_actions"
+				return r
+			}(),
+			stages:      naAcceptanceStages("pending"),
+			wantState:   "acceptance_pending",
+			wantActions: []string{"fishhawk_get_run_status"},
+		},
+		{
+			// (3) acceptance running -> poll.
+			name:        "3_acceptance_running_poll",
+			run:         naLocalRun("running"),
+			stages:      naAcceptanceStages("running"),
+			wantState:   "acceptance_running",
+			wantActions: []string{"fishhawk_get_run_status"},
+		},
+		{
+			// (4) acceptance succeeded + verdict passed -> acceptance_passed + merge ritual.
+			name:        "4_acceptance_passed_merge_ritual",
+			run:         withPR(naLocalRun("running")),
+			stages:      naAcceptanceStages("succeeded"),
+			verdict:     "passed",
+			wantState:   "acceptance_passed",
+			wantActions: []string{"approve_pr", "merge_pr", "post_merge"},
+		},
+		{
+			// (6) fixup_dispatched with the implement stage re-opened -> the
+			// existing implement_pending dispatch arm wins (acceptance still
+			// succeeded, but implement pending short-circuits earlier).
+			name: "6_fixup_dispatched_implement_reopened",
+			run:  naLocalRun("running"),
+			stages: []Stage{
+				naStage("plan", "succeeded"),
+				naStage("implement", "pending"),
+				naStage("acceptance", "succeeded"),
+			},
+			verdict:     "failed",
+			disposition: "fixup_dispatched",
+			wantState:   "implement_pending",
+			wantActions: []string{"fishhawk_dispatch_stage", "fishhawk_run_stage"},
+		},
+		{
+			// (7) retry_dispatched with the acceptance stage re-opened -> the
+			// acceptance dispatch arm (acceptance pending).
+			name:        "7_retry_dispatched_acceptance_reopened",
+			run:         naLocalRun("running"),
+			stages:      naAcceptanceStages("pending"),
+			verdict:     "failed",
+			disposition: "retry_dispatched",
+			wantState:   "acceptance_pending",
+			wantActions: []string{"fishhawk_dispatch_stage", "fishhawk_run_stage"},
+		},
+		{
+			// (d-transient) fixup_dispatched but the implement stage is NOT yet
+			// re-opened in this snapshot (still succeeded) -> defensive poll,
+			// never the merge ritual.
+			name:        "d_fixup_dispatched_transient_reroute_poll",
+			run:         naLocalRun("running"),
+			stages:      naAcceptanceStages("succeeded"),
+			verdict:     "failed",
+			disposition: "fixup_dispatched",
+			wantState:   "acceptance_triage_rerouting",
+			wantActions: []string{"fishhawk_get_run_status"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			na := nextActionsFor(tc.run, tc.stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, tc.verdict, tc.disposition)
+			if na == nil {
+				t.Fatal("nextActionsFor returned nil")
+			}
+			if na.State != tc.wantState {
+				t.Fatalf("state = %q, want %q", na.State, tc.wantState)
+			}
+			got := actionNames(na)
+			if len(got) < len(tc.wantActions) {
+				t.Fatalf("actions = %v, want prefix %v", got, tc.wantActions)
+			}
+			for i := range tc.wantActions {
+				if got[i] != tc.wantActions[i] {
+					t.Errorf("actions[%d] = %q, want %q (full: %v)", i, got[i], tc.wantActions[i], got)
+				}
+			}
+			// Every action carries the structured fields.
+			for i, a := range na.Actions {
+				if a.Precondition == "" || a.Consumes == "" || a.Reason == "" {
+					t.Errorf("actions[%d] (%s) missing precondition/consumes/reason: %+v", i, a.Action, a)
+				}
+			}
+		})
+	}
+}
+
+// TestNextActions_AcceptanceTriagePaged_EveryDisposition covers mode (5): each
+// paged-family disposition routes to acceptance_triage_paged with the
+// read-evidence-then-arbitrate arm. Table-driven over the vocabulary, pinning
+// the literal strings mirrored from backend/internal/server/acceptance.go.
+func TestNextActions_AcceptanceTriagePaged_EveryDisposition(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	pagedDispositions := []string{
+		"paged",
+		"rerun_budget_exhausted",
+		"fixup_unavailable_paged",
+		"retry_unavailable_paged",
+		"unsettled_paged",
+	}
+	for _, disp := range pagedDispositions {
+		t.Run(disp, func(t *testing.T) {
+			run := naLocalRun("running")
+			run.PullRequestURL = &prURL
+			na := nextActionsFor(run, naAcceptanceStages("succeeded"), nil,
+				naReviewStatus("implement", "complete"), nil, nil, false, "failed", disp)
+			if na == nil || na.State != "acceptance_triage_paged" {
+				t.Fatalf("state = %+v, want acceptance_triage_paged for disposition %q", na, disp)
+			}
+			got := actionNames(na)
+			want := []string{"fishhawk_list_audit", "fishhawk_fixup_stage", "merge_and_file_follow_up", "fishhawk_cancel_run"}
+			if len(got) != len(want) {
+				t.Fatalf("actions = %v, want %v", got, want)
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Errorf("actions[%d] = %q, want %q", i, got[i], want[i])
+				}
+			}
+			// The manual fix-up route consumes the fix-up budget; the rest none.
+			fixup := findAction(t, na, "fishhawk_fixup_stage")
+			if fixup.Consumes != consumesFixupBudget {
+				t.Errorf("fixup consumes = %q, want fixup_budget", fixup.Consumes)
+			}
+		})
+	}
+}
+
+// TestNextActions_AcceptanceOutcomeUnknown covers mode (8): a settled
+// acceptance stage with NO verdict visible in the recent window (verdict=="")
+// routes to the defensive read arm and, load-bearing, NEVER offers the merge
+// ritual (fail toward read, not toward merge).
+func TestNextActions_AcceptanceOutcomeUnknown(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	run := naLocalRun("running")
+	run.PullRequestURL = &prURL
+	na := nextActionsFor(run, naAcceptanceStages("succeeded"), nil,
+		naReviewStatus("implement", "complete"), nil, nil, false, "", "")
+	if na == nil || na.State != "acceptance_settled_outcome_unknown" {
+		t.Fatalf("state = %+v, want acceptance_settled_outcome_unknown", na)
+	}
+	if na.Actions[0].Action != "fishhawk_list_audit" {
+		t.Errorf("actions[0] = %q, want fishhawk_list_audit", na.Actions[0].Action)
+	}
+	for _, a := range na.Actions {
+		if a.Action == "approve_pr" || a.Action == "merge_pr" {
+			t.Fatalf("merge ritual action %q surfaced on an unknown acceptance outcome — must fail toward read, not merge", a.Action)
+		}
+	}
+}
+
+// TestNextActions_NoAcceptanceStage_MergeRitualUnchanged covers mode (9): a run
+// with no acceptance stage keeps the prior implement_gate_settled + merge
+// ritual behavior byte-identical.
+func TestNextActions_NoAcceptanceStage_MergeRitualUnchanged(t *testing.T) {
+	run := naRun("running")
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, "", "")
+	if na == nil || na.State != "implement_gate_settled" {
+		t.Fatalf("state = %+v, want implement_gate_settled", na)
+	}
+	if got := actionNames(na); len(got) != 3 || got[0] != "approve_pr" || got[1] != "merge_pr" || got[2] != "post_merge" {
+		t.Fatalf("actions = %v, want [approve_pr merge_pr post_merge]", got)
+	}
+}
+
+// TestLatestAcceptanceSignals covers the extraction helpers over the recent
+// audit slice (the mergeObservedIn idiom): newest-wins, category matching, and
+// mode (10) malformed payloads (non-object, missing key) yielding "" without
+// panic.
+func TestLatestAcceptanceSignals(t *testing.T) {
+	outcome := func(verdict string) AuditEntry {
+		return AuditEntry{Category: "acceptance_outcome_recorded", Payload: map[string]any{"verdict": verdict}}
+	}
+	triage := func(disp string) AuditEntry {
+		return AuditEntry{Category: "acceptance_triage_decided", Payload: map[string]any{"disposition": disp}}
+	}
+
+	// Newest wins: the recent slice is time-descending (item 0 newest), so the
+	// FIRST matching entry is authoritative.
+	recent := []AuditEntry{
+		triage("paged"),
+		outcome("failed"),
+		outcome("passed"), // older; must NOT win
+	}
+	if v := latestAcceptanceVerdict(recent); v != "failed" {
+		t.Errorf("latestAcceptanceVerdict = %q, want failed (newest)", v)
+	}
+	if d := latestAcceptanceTriageDisposition(recent); d != "paged" {
+		t.Errorf("latestAcceptanceTriageDisposition = %q, want paged", d)
+	}
+
+	// Cross-attempt correlation (the #1537 fix-up edge): with multiple
+	// acceptance attempts in the window, a FRESH failed verdict whose triage
+	// has not landed yet must NOT inherit the STALE disposition of an earlier
+	// failure. Time-descending: newest failed outcome (attempt B), then the
+	// older attempt A's triage + outcome. The stale "paged" sits BELOW the
+	// newest verdict, so it belongs to attempt A and must be ignored -> "".
+	staleTriage := []AuditEntry{
+		outcome("failed"), // attempt B: fresh verdict, no triage yet
+		triage("paged"),   // attempt A: older triage — must NOT win
+		outcome("failed"), // attempt A: older verdict
+	}
+	if v := latestAcceptanceVerdict(staleTriage); v != "failed" {
+		t.Errorf("verdict over stale triage = %q, want failed (newest)", v)
+	}
+	if d := latestAcceptanceTriageDisposition(staleTriage); d != "" {
+		t.Errorf("disposition over stale triage = %q, want empty (uncorrelated, older attempt)", d)
+	}
+
+	// Correlation picks the triage NEWER than the newest verdict, skipping an
+	// older attempt's triage: attempt B has both a fresh verdict and a fresh
+	// retry_dispatched triage; attempt A's stale "paged" must be ignored.
+	correlated := []AuditEntry{
+		triage("retry_dispatched"), // attempt B: fresh triage — must win
+		outcome("failed"),          // attempt B: fresh verdict
+		triage("paged"),            // attempt A: older triage
+		outcome("failed"),          // attempt A: older verdict
+	}
+	if d := latestAcceptanceTriageDisposition(correlated); d != "retry_dispatched" {
+		t.Errorf("correlated disposition = %q, want retry_dispatched (newest attempt)", d)
+	}
+
+	// A triage entry with NO verdict in the window is uncorrelated -> "" (the
+	// classifier is in its defensive read arm when the verdict is absent).
+	if d := latestAcceptanceTriageDisposition([]AuditEntry{triage("paged")}); d != "" {
+		t.Errorf("disposition with no verdict = %q, want empty", d)
+	}
+
+	// Absent categories -> "".
+	if v := latestAcceptanceVerdict([]AuditEntry{{Category: "pr_merged"}}); v != "" {
+		t.Errorf("verdict on absent category = %q, want empty", v)
+	}
+	if d := latestAcceptanceTriageDisposition(nil); d != "" {
+		t.Errorf("disposition on nil = %q, want empty", d)
+	}
+
+	// Mode (10): malformed payloads must not panic and must yield "".
+	malformed := []AuditEntry{
+		{Category: "acceptance_outcome_recorded", Payload: "not-an-object"},
+		{Category: "acceptance_outcome_recorded", Payload: map[string]any{"other": "field"}}, // missing verdict key
+		{Category: "acceptance_outcome_recorded", Payload: nil},
+	}
+	for i, e := range malformed {
+		if v := latestAcceptanceVerdict([]AuditEntry{e}); v != "" {
+			t.Errorf("malformed[%d] verdict = %q, want empty", i, v)
+		}
+	}
+	// A correlated triage (newer than the verdict) with a malformed payload must
+	// still yield "" without panic — the verdict entry keeps it past the
+	// correlation short-circuit into the payload parse.
+	if d := latestAcceptanceTriageDisposition([]AuditEntry{
+		{Category: "acceptance_triage_decided", Payload: []any{1, 2, 3}},
+		{Category: "acceptance_outcome_recorded", Payload: map[string]any{"verdict": "failed"}},
+	}); d != "" {
+		t.Errorf("malformed disposition = %q, want empty", d)
+	}
+}
+
+// TestAcceptanceVocabularyMatchesBackend is the cross-module literal-pinning
+// table (approval condition 2 + the #875 no-import seam). The verdict /
+// disposition / audit-category strings are copied verbatim from
+// backend/internal/server/acceptance.go and MUST match it. A backend rename
+// that is not mirrored here greps to this test.
+func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
+	// MUST match backend/internal/server/acceptance.go verbatim.
+	want := map[string]string{
+		"CategoryAcceptanceOutcomeRecorded": auditCategoryAcceptanceOutcomeRecorded,
+		"CategoryAcceptanceTriageDecided":   auditCategoryAcceptanceTriageDecided,
+		"acceptanceVerdictPassed":           acceptanceVerdictPassed,
+		"acceptanceVerdictFailed":           acceptanceVerdictFailed,
+		"fixup_dispatched":                  acceptanceDispositionFixupDispatched,
+		"retry_dispatched":                  acceptanceDispositionRetryDispatched,
+		"paged":                             acceptanceDispositionPaged,
+		"rerun_budget_exhausted":            acceptanceDispositionRerunBudget,
+		"fixup_unavailable_paged":           acceptanceDispositionFixupUnavailable,
+		"retry_unavailable_paged":           acceptanceDispositionRetryUnavailable,
+		"unsettled_paged":                   acceptanceDispositionUnsettled,
+	}
+	expect := map[string]string{
+		"CategoryAcceptanceOutcomeRecorded": "acceptance_outcome_recorded",
+		"CategoryAcceptanceTriageDecided":   "acceptance_triage_decided",
+		"acceptanceVerdictPassed":           "passed",
+		"acceptanceVerdictFailed":           "failed",
+		"fixup_dispatched":                  "fixup_dispatched",
+		"retry_dispatched":                  "retry_dispatched",
+		"paged":                             "paged",
+		"rerun_budget_exhausted":            "rerun_budget_exhausted",
+		"fixup_unavailable_paged":           "fixup_unavailable_paged",
+		"retry_unavailable_paged":           "retry_unavailable_paged",
+		"unsettled_paged":                   "unsettled_paged",
+	}
+	for k, wantVal := range expect {
+		if want[k] != wantVal {
+			t.Errorf("%s mirror = %q, want %q (drifted from backend/internal/server/acceptance.go)", k, want[k], wantVal)
+		}
+	}
+
+	// The paged-family predicate: auto-routed dispositions are NOT paged.
+	for _, d := range []string{"paged", "rerun_budget_exhausted", "fixup_unavailable_paged", "retry_unavailable_paged", "unsettled_paged"} {
+		if !isAcceptancePagedDisposition(d) {
+			t.Errorf("isAcceptancePagedDisposition(%q) = false, want true", d)
+		}
+	}
+	for _, d := range []string{"fixup_dispatched", "retry_dispatched", ""} {
+		if isAcceptancePagedDisposition(d) {
+			t.Errorf("isAcceptancePagedDisposition(%q) = true, want false", d)
+		}
 	}
 }

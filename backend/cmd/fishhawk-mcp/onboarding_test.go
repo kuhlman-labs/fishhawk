@@ -63,6 +63,9 @@ func TestOnboarding_InstructionsDeliveredOnInitialize(t *testing.T) {
 		"fishhawk_start_run",
 		"fishhawk_approve_plan",
 		"fishhawk_dispatch_stage",
+		// E31.9: the acceptance happy-path line + gate-semantics bullet.
+		"acceptance_passed",
+		"acceptance stage",
 		runbookURI,
 	} {
 		if !strings.Contains(got, anchor) {
@@ -117,6 +120,10 @@ func TestOnboarding_RunbookResourceListedAndReadable(t *testing.T) {
 		"scope amendment",
 		"review",
 		"clean",
+		// E31.9 acceptance-stage playbook anchors.
+		"Acceptance stage",
+		"acceptance_passed",
+		"retry_dispatched",
 	} {
 		if !strings.Contains(c.Text, anchor) {
 			t.Errorf("runbook missing edge-case anchor %q", anchor)

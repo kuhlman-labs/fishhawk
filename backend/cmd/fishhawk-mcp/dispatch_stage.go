@@ -25,7 +25,7 @@ type DispatchStageInput struct {
 	RunID         string `json:"run_id" jsonschema:"Fishhawk run UUID minted by fishhawk_start_run"`
 	StageID       string `json:"stage_id,omitempty" jsonschema:"stage UUID inside the run; optional — when omitted it is auto-resolved from (run_id, stage type), same as fishhawk_run_stage"`
 	Workflow      string `json:"workflow" jsonschema:"workflow ID matching the run's workflow"`
-	Stage         string `json:"stage" jsonschema:"stage type: plan | implement | review"`
+	Stage         string `json:"stage" jsonschema:"stage type: plan | implement | review | acceptance. dispatch is the DEFAULT verb for a local acceptance stage (E31.9) — it validates against a running preview/target instance and runs long, so non-blocking dispatch keeps the session free; no new argv (composeRunnerArgv passes --stage through, and acceptance takes neither --plan-out nor --check-base-ref)"`
 	WorkingDir    string `json:"working_dir,omitempty" jsonschema:"checkout the agent runs in; defaults to the MCP server's cwd"`
 	GitHubRepo    string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
 	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR (no effect when push_and_open_pr is false); defaults to main"`

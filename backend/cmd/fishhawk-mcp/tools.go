@@ -883,6 +883,14 @@ type GetRunStatusOutput struct {
 	// Omitted (nil) when no stage of that type exists in the run.
 	PlanStageWaitStatus      *StageWaitStatus `json:"plan_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the plan stage: status is one of pending, running, succeeded, failed, cancelled. Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await a stage's terminal status; while non-terminal it carries a server-suggested poll_interval_seconds cadence. Omitted when no plan stage exists"`
 	ImplementStageWaitStatus *StageWaitStatus `json:"implement_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the implement stage: status is one of pending, running, succeeded, failed, cancelled. Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await a stage's terminal status; while non-terminal it carries a server-suggested poll_interval_seconds cadence. Omitted when no implement stage exists"`
+	// AcceptanceStageWaitStatus summarizes the acceptance stage's EXECUTION
+	// lifecycle (E31.9 / ADR-049), computed via the same generic
+	// stageWaitStatusFor helper. Omitted (nil) when the workflow declares no
+	// acceptance stage, so non-acceptance runs are byte-identical. NOTE: a
+	// FAILED acceptance VERDICT leaves the stage 'succeeded' — this field
+	// tracks stage EXECUTION, not the verdict; read the acceptance_outcome_recorded
+	// audit entry (and next_actions) for the verdict + triage disposition.
+	AcceptanceStageWaitStatus *StageWaitStatus `json:"acceptance_stage_wait_status,omitempty" jsonschema:"execution lifecycle for the acceptance stage (E31.9): status is one of pending, running, succeeded, failed, cancelled. Re-polling fishhawk_get_run_status is the AUTHORITATIVE way to await terminal; while non-terminal it carries a server-suggested poll_interval_seconds cadence. Omitted when no acceptance stage exists. A FAILED acceptance VERDICT leaves the stage succeeded — this tracks execution, not the verdict; read the acceptance_outcome_recorded audit entry and next_actions for the verdict + deterministic-triage disposition"`
 	// Budget is the workflow's current periodic-budget status (#693 /
 	// ADR-030), fetched best-effort. Omitted when the workflow declares
 	// no budget or the fetch failed — DISPLAY-ONLY, never gates a run.
@@ -998,6 +1006,15 @@ synchronous-with-progress call is the negotiated fallback for clients that
 prefer to block; a future native MCP Tasks (invocationMode:async) mode is
 deferred (ADR-033 transport + MCP Tasks GA).
 
+When the workflow declares an acceptance stage (E31.9 / ADR-049) the response
+also carries acceptance_stage_wait_status (same StageWaitStatus shape; omitted
+otherwise). It tracks the acceptance stage's EXECUTION — dispatch it after the
+implement review settles and poll it to terminal. A FAILED acceptance VERDICT
+leaves the stage 'succeeded', so read the verdict + the deterministic-triage
+disposition from the acceptance_outcome_recorded / acceptance_triage_decided
+audit entries (surfaced through next_actions), never from the stage state; merge
+only on the acceptance_passed state.
+
 Also returns plan_review_status + implement_review_status — each a
 ReviewStatus whose status is one of none/pending/complete/skipped/failed.
 Re-polling this tool is the AUTHORITATIVE way to reach a terminal review
@@ -1053,7 +1070,8 @@ entry names the tool to call (with key params), its precondition, what
 it consumes (none | fixup_budget | retry_budget | approval_slot |
 new_run), and a one-line reason. It generalizes review_action_hint
 across the lifecycle (plan dispatch/review/gate, implement failures by
-category, review pending, open concerns, the merge ritual, the
+category, review pending, open concerns, the acceptance stage
+(dispatch/await/triage-paged/passed, E31.9), the merge ritual, the
 #968-class wedge) and embeds the same hint computation for the
 concern state, so the two surfaces cannot disagree. On drive-enabled
 runs the drive next_action folds in as the first entry. Display-only —
@@ -1142,13 +1160,27 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	// round-trip. nil when no stage of that type exists in the run.
 	planStageWaitStatus := stageWaitStatusFor(stages, "plan", runRow.State)
 	implementStageWaitStatus := stageWaitStatusFor(stages, "implement", runRow.State)
+	// Acceptance stage-execution wait status (E31.9), via the same generic
+	// helper — nil (omitted) when the workflow declares no acceptance stage.
+	acceptanceStageWaitStatus := stageWaitStatusFor(stages, "acceptance", runRow.State)
 
 	// Server-suggested next actions (#1024): a pure function over the
 	// run/stage/review/hint/drive data fetched above — no extra
 	// round-trip, never fails the snapshot. mergeObserved (#1370) is read
 	// off the same `recent` slice and gates the succeeded_merged state.
 	mergeObserved := mergeObservedIn(recent)
-	nextActions := nextActionsFor(runRow, stages, planReviewStatus, implementReviewStatus, reviewActionHint, view.driveStatus(), mergeObserved)
+	// Acceptance signals (E31.9): the newest acceptance_outcome_recorded verdict
+	// and the acceptance_triage_decided disposition CORRELATED with it (the
+	// triage entry newer than that verdict — see latestAcceptanceTriageDisposition;
+	// a stale disposition from an earlier attempt must NOT pair with a fresh
+	// verdict), read off the SAME recent slice (the mergeObservedIn idiom) — a
+	// FAILED verdict leaves the acceptance stage succeeded, so the classifier
+	// must read the audit payloads, not the stage state. Empty when the run
+	// declares no acceptance stage or the entries aged out of the window (the
+	// defensive arm covers that).
+	acceptanceVerdict := latestAcceptanceVerdict(recent)
+	acceptanceTriageDisposition := latestAcceptanceTriageDisposition(recent)
+	nextActions := nextActionsFor(runRow, stages, planReviewStatus, implementReviewStatus, reviewActionHint, view.driveStatus(), mergeObserved, acceptanceVerdict, acceptanceTriageDisposition)
 
 	// Best-effort decomposed-parent children status (#1147). Cost-gated so an
 	// ordinary run pays nothing: only a decomposed parent (no parent_run_id,
@@ -1167,23 +1199,24 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	securityFindings := r.securityFindingsFor(ctx, runID)
 
 	return nil, GetRunStatusOutput{
-		Run:                      *runRow,
-		Stages:                   stages,
-		RecentAudit:              recent,
-		ImplementReviews:         implementReviews,
-		PlanReviewStatus:         planReviewStatus,
-		ImplementReviewStatus:    implementReviewStatus,
-		PlanStageWaitStatus:      planStageWaitStatus,
-		ImplementStageWaitStatus: implementStageWaitStatus,
-		Budget:                   budgetStatus,
-		CacheEfficiency:          cacheEfficiency,
-		Cost:                     runCost,
-		ReviewActionHint:         reviewActionHint,
-		ImplementReviewMergeHint: implementReviewMergeHint(implementReviewStatus),
-		DriveStatus:              view.driveStatus(),
-		NextActions:              nextActions,
-		ChildrenStatus:           childrenStatus,
-		SecurityFindings:         securityFindings,
+		Run:                       *runRow,
+		Stages:                    stages,
+		RecentAudit:               recent,
+		ImplementReviews:          implementReviews,
+		PlanReviewStatus:          planReviewStatus,
+		ImplementReviewStatus:     implementReviewStatus,
+		PlanStageWaitStatus:       planStageWaitStatus,
+		ImplementStageWaitStatus:  implementStageWaitStatus,
+		AcceptanceStageWaitStatus: acceptanceStageWaitStatus,
+		Budget:                    budgetStatus,
+		CacheEfficiency:           cacheEfficiency,
+		Cost:                      runCost,
+		ReviewActionHint:          reviewActionHint,
+		ImplementReviewMergeHint:  implementReviewMergeHint(implementReviewStatus),
+		DriveStatus:               view.driveStatus(),
+		NextActions:               nextActions,
+		ChildrenStatus:            childrenStatus,
+		SecurityFindings:          securityFindings,
 	}, nil
 }
 
