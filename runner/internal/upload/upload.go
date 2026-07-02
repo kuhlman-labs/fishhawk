@@ -59,8 +59,14 @@ var (
 	// Permanent at the protocol layer — the runner shipped the
 	// wrong fields; retrying won't help.
 	ErrPullRequestInvalid = errors.New("upload: pull-request rejected as invalid")
-	ErrAlreadyIssued      = errors.New("upload: signing key already issued for this run")
-	ErrNotFound           = errors.New("upload: run or signing key not found")
+	// ErrAcceptanceInvalid surfaces when the backend rejects the
+	// acceptance verdict body (400 acceptance_invalid) — missing or
+	// malformed fields per the ADR-049 evidence shape. Permanent at
+	// the protocol layer: the agent's verdict is bad, not the network,
+	// so the call site classifies it category-B (E31.7 / #1535).
+	ErrAcceptanceInvalid = errors.New("upload: acceptance verdict rejected as invalid")
+	ErrAlreadyIssued     = errors.New("upload: signing key already issued for this run")
+	ErrNotFound          = errors.New("upload: run or signing key not found")
 	// ErrUnsupportedStage means the backend has no prompt template
 	// for this stage type. Non-retryable; the runner should fail
 	// the stage rather than guess.
@@ -494,6 +500,37 @@ type FetchedPrompt struct {
 	// Non-empty only when OpenPRFromHeldCommit is true. The runner opens the PR
 	// with this branch as head.
 	HeldCommitBranch string `json:"held_commit_branch,omitempty"`
+	// EgressTargetHosts is the acceptance stage's full spec-declared
+	// egress.target_hosts list (E31.4 / #1532 grammar), served ONLY on
+	// acceptance-stage prompt responses (E31.7 / #1535). It is the
+	// customer-controlled slot of the ADR-050 egress-proxy allow-list:
+	// the runner composes egressproxy.BuildAllowlist(EgressTargetHosts,
+	// backendURL) before spawning the acceptance agent. Empty on every
+	// other stage type and on a spec with no egress block — the proxy
+	// then admits only the model + backend hosts (fail-closed posture).
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (egress_target_hosts) MUST
+	// stay byte-identical to the backend's promptResponse.EgressTargetHosts
+	// (backend/internal/server/prompt.go). Same independent-struct-by-tag
+	// convention as ImplementModel (#1013) and ScopeExemptions (#1229). A
+	// tag drift silently drops the hosts and the acceptance agent cannot
+	// reach its target — fail-closed, but loud only via the proxy denials.
+	EgressTargetHosts []string `json:"egress_target_hosts,omitempty"`
+	// AcceptanceCriteriaIDs is the approved plan's
+	// verification.acceptance_criteria ids in plan order, served ONLY on
+	// acceptance-stage prompt responses (E31.7 / #1535). The runner
+	// validates the shipped verdict's criteria[].id join keys against
+	// this served set — an unknown id fails closed (category-B) rather
+	// than pinning evidence to a criterion the plan never declared.
+	// Empty when the run has no approved plan or the plan declares no
+	// criteria; the runner then skips the membership check.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (acceptance_criteria_ids)
+	// MUST stay byte-identical to the backend's
+	// promptResponse.AcceptanceCriteriaIDs
+	// (backend/internal/server/prompt.go), the same convention as
+	// EgressTargetHosts above.
+	AcceptanceCriteriaIDs []string `json:"acceptance_criteria_ids,omitempty"`
 }
 
 // FixupApplyPatch is one entry in FetchedPrompt.FixupApplyPatches: a single
@@ -778,6 +815,134 @@ func (c *Client) ShipPlan(ctx context.Context, args ShipPlanArgs) (*ShipPlanResu
 		}
 	}
 	return nil, fmt.Errorf("upload: ship plan exhausted retries: %w", lastErr)
+}
+
+// ShipAcceptanceArgs collects everything ShipAcceptance needs.
+type ShipAcceptanceArgs struct {
+	RunID   string
+	StageID string
+	// Body is the JSON bytes of the acceptance verdict (the ADR-049
+	// evidence shape). The runner validates + redacts it locally
+	// before shipping; the bytes shipped here are the bytes the
+	// backend verifies the signature against and stores verbatim.
+	Body       []byte
+	PrivateKey ed25519.PrivateKey
+}
+
+// ShipAcceptanceResult is the (id, stage, content_hash, verdict,
+// idempotent) tuple the backend echoes on 201 / 200. Idempotent=true
+// means an acceptance record with this content_hash already existed
+// for this stage; the backend returned it unchanged.
+type ShipAcceptanceResult struct {
+	ID          string `json:"id"`
+	StageID     string `json:"stage_id"`
+	ContentHash string `json:"content_hash"`
+	Verdict     string `json:"verdict"`
+	FailureMode string `json:"failure_mode,omitempty"`
+	Idempotent  bool   `json:"idempotent"`
+}
+
+// ShipAcceptance signs the verdict bytes and POSTs them to
+// /v0/runs/{run_id}/acceptance?stage_id=… (E31.7 / #1535). Modeled on
+// ShipPlan: retries transient failures (5xx, network errors) with the
+// ShipTrace backoff policy. Permanent failures bubble up:
+//
+//   - 400 acceptance_invalid → ErrAcceptanceInvalid (bad verdict shape;
+//     category-B at the call site)
+//   - 401 signature_*        → ErrSignatureRejected
+//   - 404 stage/key          → ErrNotFound
+//
+// On 201 the backend created a fresh artifact; on 200 the upload
+// matched an existing one (Result.Idempotent==true).
+func (c *Client) ShipAcceptance(ctx context.Context, args ShipAcceptanceArgs) (*ShipAcceptanceResult, error) {
+	if len(args.Body) == 0 {
+		return nil, errors.New("upload: empty acceptance body")
+	}
+	if len(args.PrivateKey) != ed25519.PrivateKeySize {
+		return nil, errors.New("upload: invalid private key length")
+	}
+
+	digest := sha256.Sum256(args.Body)
+	signature := ed25519.Sign(args.PrivateKey, digest[:])
+	sigHex := hex.EncodeToString(signature)
+
+	endpoint := fmt.Sprintf("%s/v0/runs/%s/acceptance?stage_id=%s",
+		c.BaseURL,
+		url.PathEscape(args.RunID),
+		url.PathEscape(args.StageID),
+	)
+
+	maxRetries := c.MaxRetries
+	if maxRetries == 0 {
+		maxRetries = DefaultMaxRetries
+	}
+	backoff := c.Backoff
+	if backoff == 0 {
+		backoff = DefaultBackoff
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(args.Body))
+		if err != nil {
+			return nil, fmt.Errorf("upload: build acceptance request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Fishhawk-Signature", sigHex)
+		req.Header.Set("Accept", "application/json")
+		req.ContentLength = int64(len(args.Body))
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("upload: ship acceptance: %w", err)
+			continue
+		}
+
+		switch {
+		case resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK:
+			var out ShipAcceptanceResult
+			err := json.NewDecoder(resp.Body).Decode(&out)
+			_ = resp.Body.Close()
+			if err != nil {
+				return nil, fmt.Errorf("upload: decode acceptance response: %w", err)
+			}
+			return &out, nil
+		case resp.StatusCode == http.StatusBadRequest:
+			detail := readBriefBody(resp)
+			_ = resp.Body.Close()
+			// 400s are permanent; the body distinguishes acceptance_invalid
+			// (bad verdict shape) from validation_failed (path/query issues).
+			if strings.Contains(detail, "acceptance_invalid") {
+				return nil, fmt.Errorf("%w: %s", ErrAcceptanceInvalid, detail)
+			}
+			return nil, fmt.Errorf("upload: ship acceptance: 400: %s", detail)
+		case resp.StatusCode == http.StatusUnauthorized:
+			detail := readBriefBody(resp)
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("%w: %s", ErrSignatureRejected, detail)
+		case resp.StatusCode == http.StatusNotFound:
+			_ = resp.Body.Close()
+			return nil, ErrNotFound
+		case resp.StatusCode >= 500:
+			lastErr = statusError("ship acceptance", resp)
+			_ = resp.Body.Close()
+			continue
+		default:
+			lastErr = statusError("ship acceptance", resp)
+			_ = resp.Body.Close()
+			return nil, lastErr
+		}
+	}
+	return nil, fmt.Errorf("upload: ship acceptance exhausted retries: %w", lastErr)
 }
 
 // ShipPullRequestArgs collects everything ShipPullRequest needs.
