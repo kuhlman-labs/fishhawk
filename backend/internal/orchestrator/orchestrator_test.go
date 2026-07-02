@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"reflect"
 	"sort"
@@ -16,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -2321,5 +2323,98 @@ workflows:
 				t.Errorf("effective_max_parallel = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestAdvance_AcceptanceStage_DispatchesAndEmits pins E31.6 / #1534: unlike
+// deploy, an acceptance-typed stage rides the ordinary agent dispatch path
+// (pending → dispatched, NOT a pre-execution park) AND the orchestrator emits
+// an acceptance_dispatched audit entry with a stage_id/sequence/executor
+// payload so the living anchor renders the dispatch line.
+func TestAdvance_AcceptanceStage_DispatchesAndEmits(t *testing.T) {
+	rs := newStubRuns()
+	gh := &stubGitHub{}
+	ra := &recordingAudit{}
+	o := &Orchestrator{Runs: rs, GitHub: gh, Audit: ra}
+	_, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+
+	out, err := o.Advance(context.Background(), stages[0].RunID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out != OutcomeDispatched {
+		t.Errorf("Outcome = %q, want dispatched", out)
+	}
+	// Ordinary agent path, NOT a deploy-style park.
+	if stages[1].State != run.StageStateDispatched {
+		t.Errorf("acceptance stage state = %q, want dispatched (no park)", stages[1].State)
+	}
+	if stages[1].State == run.StageStateAwaitingDeployApproval {
+		t.Errorf("acceptance stage must not park at a deploy gate")
+	}
+
+	var dispatched []audit.ChainAppendParams
+	for _, p := range ra.appended {
+		if p.Category == "acceptance_dispatched" {
+			dispatched = append(dispatched, p)
+		}
+	}
+	if len(dispatched) != 1 {
+		t.Fatalf("acceptance_dispatched entries = %d, want 1", len(dispatched))
+	}
+	entry := dispatched[0]
+	if entry.StageID == nil || *entry.StageID != stages[1].ID {
+		t.Errorf("acceptance_dispatched stage_id = %v, want %s", entry.StageID, stages[1].ID)
+	}
+	for _, want := range []string{
+		fmt.Sprintf(`"stage_id":%q`, stages[1].ID.String()),
+		`"executor":"agent"`,
+		`"sequence":`,
+	} {
+		if !strings.Contains(string(entry.Payload), want) {
+			t.Errorf("acceptance_dispatched payload missing %s: %s", want, entry.Payload)
+		}
+	}
+}
+
+// TestAdvance_AcceptanceStage_NilAudit_StillDispatches pins the best-effort
+// emit: a nil-Audit orchestrator still dispatches the acceptance stage (the
+// emit WARN-logs and never unwinds the dispatch).
+func TestAdvance_AcceptanceStage_NilAudit_StillDispatches(t *testing.T) {
+	o, rs, _ := newOrchestrator(t) // Audit is nil
+	_, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	out, err := o.Advance(context.Background(), stages[0].RunID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out != OutcomeDispatched || stages[1].State != run.StageStateDispatched {
+		t.Errorf("nil-audit acceptance dispatch: out=%q state=%q", out, stages[1].State)
+	}
+}
+
+// TestAdvance_ImplementStage_NoAcceptanceEmit pins that a non-acceptance
+// dispatch appends no acceptance_dispatched entry (the emit is stage-typed).
+func TestAdvance_ImplementStage_NoAcceptanceEmit(t *testing.T) {
+	rs := newStubRuns()
+	gh := &stubGitHub{}
+	ra := &recordingAudit{}
+	o := &Orchestrator{Runs: rs, GitHub: gh, Audit: ra}
+	r, _ := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	if _, err := o.Advance(context.Background(), r.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	for _, p := range ra.appended {
+		if p.Category == "acceptance_dispatched" {
+			t.Errorf("implement dispatch wrongly emitted acceptance_dispatched: %s", p.Payload)
+		}
 	}
 }

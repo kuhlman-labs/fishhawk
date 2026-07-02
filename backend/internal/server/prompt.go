@@ -751,6 +751,25 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Acceptance stage (E31.6 / #1534): the independent validator judges the
+	// running instance against the approved plan's acceptance criteria. Feed the
+	// approved plan (the criteria source) and the target-instance URL seam.
+	// Unlike the implement branch, do NOT attach ScopeFiles / BindingAssertions
+	// / diff-adjacent fields — the diff is deliberately withheld for
+	// independence (ADR-049 decision #4). resolveAcceptanceTargetURL returns the
+	// empty string until E31.4/#1532's egress-allowance grammar lands, and
+	// buildAcceptance then renders an explicit not-declared line.
+	if stage.Type == run.StageTypeAcceptance {
+		approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), runRow.ID)
+		if err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"load approved plan failed", map[string]any{"error": err.Error()})
+			return
+		}
+		trigger.ApprovedPlan = approvedPlan
+		trigger.TargetInstanceURL = s.resolveAcceptanceTargetURL(r.Context(), runRow)
+	}
+
 	// Decompose-required hint: when the run's last plan approval was
 	// rejected with --decompose, tell the agent it must populate
 	// decomposition.sub_plans in the next plan attempt.
@@ -1033,6 +1052,25 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			// agent path) when any concern lacks a patch.
 			fixupApplyPatches = s.resolveFixupApplyPatches(r.Context(), runRow.ID, stage.ID)
 		}
+	}
+
+	// Acceptance stage (E31.6 / #1534): the independent validator judges the
+	// running instance against the approved plan's acceptance criteria. Feed the
+	// approved plan (the criteria source) and the target-instance URL seam.
+	// Unlike the implement branch, do NOT attach ScopeFiles / BindingAssertions
+	// / diff-adjacent fields — the diff is deliberately withheld for
+	// independence (ADR-049 decision #4). resolveAcceptanceTargetURL returns the
+	// empty string until E31.4/#1532's egress-allowance grammar lands, and
+	// buildAcceptance then renders an explicit not-declared line.
+	if stage.Type == run.StageTypeAcceptance {
+		approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), runRow.ID)
+		if err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"load approved plan failed", map[string]any{"error": err.Error()})
+			return
+		}
+		trigger.ApprovedPlan = approvedPlan
+		trigger.TargetInstanceURL = s.resolveAcceptanceTargetURL(r.Context(), runRow)
 	}
 
 	// Decompose-required hint: when the run's last plan approval was

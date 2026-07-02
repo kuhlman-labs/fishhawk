@@ -190,6 +190,16 @@ type Trigger struct {
 	// Repo is the "owner/name" the run is operating on, surfaced in
 	// the prompt so the agent's reasoning can reference it.
 	Repo string
+	// TargetInstanceURL is the running-instance URL the acceptance stage's
+	// independent validator drives (ADR-049 decision #4). Populated ONLY on
+	// the acceptance-stage prompt, from the server-side
+	// resolveAcceptanceTargetURL seam. Its value SOURCE — the workflow-spec
+	// egress-allowance grammar — is owned by the unlanded human-led
+	// E31.4/#1532 (ADR-050 decision #1), so this stays empty until that lands:
+	// when empty, buildAcceptance renders an explicit "not declared" line
+	// rather than silently omitting the target section, making the interim
+	// state self-diagnosing. Empty for every non-acceptance build.
+	TargetInstanceURL string
 	// ApprovedPlan is the standard_v1 plan that the human approved
 	// during the plan stage. When set on an implement-stage prompt,
 	// the plan becomes the binding instruction the agent must
@@ -726,6 +736,8 @@ func Build(stageType string, t Trigger) (string, error) {
 		return buildPlanReview(t), nil
 	case "implement_review":
 		return buildImplementReview(t), nil
+	case "acceptance":
+		return buildAcceptance(t), nil
 	default:
 		return "", fmt.Errorf("%w: %q", ErrUnsupportedStage, stageType)
 	}
@@ -1232,6 +1244,126 @@ func buildImplementFixup(t Trigger) string {
 
 	writeGitOpsProhibition(&b)
 	return b.String()
+}
+
+// buildAcceptance renders the acceptance-stage prompt (ADR-049 / E31.6).
+//
+// The acceptance agent is an INDEPENDENT validator: it drives the running
+// target instance and judges it against the approved plan's intent. The diff
+// is deliberately withheld (ADR-049 decision #4) so the validator reasons from
+// the criteria and observed behavior, not from how the change was implemented.
+//
+// Section order: role preamble → issue context → acceptance criteria (from the
+// approved plan's verification.acceptance_criteria) + out_of_scope → target
+// instance section → output contract. A nil ApprovedPlan or empty criteria set
+// renders an explicit no-criteria warning (the plan_acceptance_precheck gate
+// normally prevents this — fail loud, not silent).
+func buildAcceptance(t Trigger) string {
+	var b strings.Builder
+	b.WriteString("You are the acceptance validator for a change in the repository ")
+	b.WriteString(quoteRepo(t.Repo))
+	b.WriteString(".\n\n")
+
+	// Independent-validator role preamble (ADR-049 decision #4).
+	b.WriteString("Your job is to validate the RUNNING target instance against the change's " +
+		"intent — not to read or judge the code. You are NOT the implementer, and you are " +
+		"NOT reviewing the diff: the diff is deliberately withheld so your judgment stays " +
+		"independent of how the change was built. Exercise the running instance and decide, " +
+		"criterion by criterion, whether it behaves as intended.\n\n")
+
+	// Issue context: the ground-truth intent the validator checks against.
+	// Rendered via the shared issue-section writers (number/title/body/comments)
+	// plus the canonical URL so the validator can fetch current detail.
+	b.WriteString("### Originating issue\n\n")
+	writeIssueContext(&b, t)
+	if t.IssueURL != "" {
+		b.WriteString("Issue URL: ")
+		b.WriteString(t.IssueURL)
+		b.WriteString("\n\n")
+	}
+
+	// Acceptance criteria from the approved plan. This is the binding
+	// checklist the validator judges the running instance against.
+	writeAcceptanceCriteriaForAcceptance(&b, t.ApprovedPlan)
+
+	// Target instance section. The URL's value source (the workflow-spec
+	// egress-allowance grammar) is owned by the unlanded human-led E31.4/#1532
+	// (ADR-050 decision #1). Until that lands TargetInstanceURL is empty and we
+	// render an explicit not-declared line rather than a silent omission, so
+	// the interim state is self-diagnosing.
+	b.WriteString("### Target instance\n\n")
+	if t.TargetInstanceURL != "" {
+		b.WriteString("Target instance URL: ")
+		b.WriteString(t.TargetInstanceURL)
+		b.WriteString("\n\n")
+	} else {
+		b.WriteString("Target instance URL: not declared in the workflow spec " +
+			"(egress-allowance grammar ships with #1532); obtain the preview URL from the " +
+			"operator before driving the instance.\n\n")
+	}
+
+	// Output contract (transport — the signed evidence bundle — is E31.7's
+	// runner scope; the prompt states the shape the agent must produce).
+	b.WriteString("### Output contract\n\n")
+	b.WriteString("Emit a structured acceptance verdict:\n\n")
+	b.WriteString("- `verdict`: `passed` or `failed`.\n")
+	b.WriteString("- `failure_mode` (REQUIRED when verdict is `failed`): `error` when the " +
+		"instance crashed / returned a 500 / threw an exception; `assertion_fail` when it " +
+		"behaved without erroring but produced an unexpected result. Omit on a pass.\n")
+	b.WriteString("- `criteria`: one result per acceptance criterion above, keyed by the " +
+		"criterion `id`, each with `result` (`passed`/`failed`/`skipped`) and, where useful, " +
+		"`steps_taken` / `observed` / `expected`.\n\n")
+	b.WriteString("The result is shipped via the signed evidence bundle — keep evidence blobs " +
+		"customer-side and reference them by content hash; only the structured verdict + hashes " +
+		"cross to Fishhawk.\n")
+
+	return b.String()
+}
+
+// writeAcceptanceCriteriaForAcceptance renders the approved plan's typed
+// verification.acceptance_criteria as the acceptance validator's binding
+// checklist — one block per criterion carrying id, statement, source
+// (+source_ref/rationale), the effective blocking value (nil->true schema
+// default), verify_hint, and preconditions. verification.out_of_scope renders
+// as the explicit not-covered list. A nil plan or an empty criteria set is a
+// loud warning line (the plan_acceptance_precheck gate normally prevents it).
+func writeAcceptanceCriteriaForAcceptance(b *strings.Builder, p *plan.Plan) {
+	b.WriteString("### Acceptance criteria\n\n")
+	if p == nil || len(p.Verification.AcceptanceCriteria) == 0 {
+		b.WriteString("WARNING: no acceptance criteria are available for this run. The " +
+			"approved plan carries no verification.acceptance_criteria — this should have been " +
+			"caught by the plan acceptance pre-check. Surface this gap rather than fabricating " +
+			"criteria; validate the change against the originating issue's intent and report the " +
+			"missing-criteria condition in your verdict.\n\n")
+		return
+	}
+	v := p.Verification
+	for _, c := range v.AcceptanceCriteria {
+		blocking := c.Blocking == nil || *c.Blocking
+		fmt.Fprintf(b, "- [%s] %s\n", c.ID, c.Statement)
+		fmt.Fprintf(b, "  source: %s", c.Source)
+		if c.SourceRef != "" {
+			fmt.Fprintf(b, ", source_ref: %s", c.SourceRef)
+		}
+		fmt.Fprintf(b, ", blocking: %t\n", blocking)
+		if c.Rationale != "" {
+			fmt.Fprintf(b, "  rationale: %s\n", c.Rationale)
+		}
+		if c.VerifyHint != "" {
+			fmt.Fprintf(b, "  verify_hint: %s\n", c.VerifyHint)
+		}
+		for _, pre := range c.Preconditions {
+			fmt.Fprintf(b, "  precondition: %s\n", pre)
+		}
+	}
+	b.WriteString("\n")
+	if len(v.OutOfScope) > 0 {
+		b.WriteString("Explicitly NOT covered (out of scope — do not fail the change for these):\n")
+		for _, o := range v.OutOfScope {
+			fmt.Fprintf(b, "- %s\n", o)
+		}
+		b.WriteString("\n")
+	}
 }
 
 func buildPlan(t Trigger) string {

@@ -5909,3 +5909,143 @@ func TestGetStagePrompt_FixupApplyPatches_OmittedWhenAnyMissing(t *testing.T) {
 		t.Errorf("FixupApplyPatches = %+v, want empty when a concern lacks a patch", resp.FixupApplyPatches)
 	}
 }
+
+// acceptancePlanArtifactContent returns a standard_v1 plan JSON carrying two
+// blocking acceptance criteria + an out_of_scope entry, used to seed the
+// approved-plan artifact the acceptance-stage prompt reads.
+func acceptancePlanArtifactContent(t *testing.T) json.RawMessage {
+	t.Helper()
+	blocking := true
+	p := plan.Plan{
+		PlanVersion: "standard_v1",
+		Summary:     "Ship the widget endpoint.",
+		Verification: plan.Verification{
+			TestStrategy: "unit + integration",
+			RollbackPlan: "revert the PR",
+			AcceptanceCriteria: []plan.AcceptanceCriterion{
+				{ID: "ac-create", Statement: "POST /widgets returns 201", Source: plan.CriterionSourceExplicit, SourceRef: "#1534", Blocking: &blocking},
+				{ID: "ac-list", Statement: "GET /widgets lists widgets", Source: plan.CriterionSourceInferred, Rationale: "listing implied", Blocking: &blocking},
+			},
+			OutOfScope: []string{"deletion not covered"},
+		},
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// newAcceptancePromptServer wires a server for acceptance-stage prompt fetches:
+// a plan stage + an acceptance stage on the run, an ArtifactRepo holding the
+// approved plan artifact under the plan stage, the signing fake, and the issue
+// stub. Returns the server, run id, acceptance stage id, the run's signing
+// private key, and the issue stub.
+func newAcceptancePromptServer(t *testing.T) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey, *stubIssueGetter) {
+	t.Helper()
+	runID := uuid.New()
+	planStageID := uuid.New()
+	acceptanceStageID := uuid.New()
+
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	ar := newFakeArtifactRepo()
+	au := newAuditFake()
+	gh := &stubIssueGetter{issue: &githubclient.Issue{Number: 1534, Title: "Widget endpoint", Body: "we need a widget endpoint", State: "open"}}
+
+	triggerRef := "issue:1534"
+	installation := int64(7)
+	runRow := &run.Run{
+		ID:             runID,
+		Repo:           "kuhlman-labs/fishhawk",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     &triggerRef,
+		InstallationID: &installation,
+	}
+	planStage := &run.Stage{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateSucceeded}
+	acceptanceStage := &run.Stage{ID: acceptanceStageID, RunID: runID, Type: run.StageTypeAcceptance, State: run.StageStateRunning}
+	rr.getRuns[runID] = runRow
+	rr.getStages[planStageID] = planStage
+	rr.getStages[acceptanceStageID] = acceptanceStage
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {planStage, acceptanceStage}}
+
+	v := "standard_v1"
+	ar.all = append(ar.all, &artifact.Artifact{
+		ID:            uuid.New(),
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &v,
+		Content:       acceptancePlanArtifactContent(t),
+		CreatedAt:     time.Now().UTC(),
+	})
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		SigningRepo:  sf,
+		ArtifactRepo: ar,
+		AuditRepo:    au,
+	})
+	s.promptIssueGetterOverride = gh
+	priv, _ := sf.issue(t, runID)
+	return s, runID, acceptanceStageID, priv, gh
+}
+
+// TestGetStagePrompt_Acceptance_PopulatesCriteria pins that the /prompt handler
+// loads the approved plan's acceptance criteria for an acceptance stage and
+// renders them, while withholding the diff / scope-files sections (ADR-049
+// decision #4 independence).
+func TestGetStagePrompt_Acceptance_PopulatesCriteria(t *testing.T) {
+	s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+	w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.StageType != "acceptance" {
+		t.Errorf("StageType = %q, want acceptance", resp.StageType)
+	}
+	for _, want := range []string{"ac-create", "ac-list", "POST /widgets returns 201", "deletion not covered"} {
+		if !strings.Contains(resp.Prompt, want) {
+			t.Errorf("acceptance prompt missing %q\n---\n%s", want, resp.Prompt)
+		}
+	}
+	// Independence: no diff / scope-files sections.
+	for _, banned := range []string{"Files in scope:", "### Diff under review"} {
+		if strings.Contains(resp.Prompt, banned) {
+			t.Errorf("acceptance prompt must not contain %q:\n%s", banned, resp.Prompt)
+		}
+	}
+	// The E31.4 seam renders the not-declared line until #1532 lands.
+	if !strings.Contains(resp.Prompt, "not declared in the workflow spec") {
+		t.Errorf("acceptance prompt missing the target-URL not-declared line:\n%s", resp.Prompt)
+	}
+}
+
+// TestGetStagePromptRender_Acceptance_PopulatesCriteria pins the SPA render
+// handler carries the SAME acceptance criteria — the two handlers duplicate
+// trigger construction, so the acceptance branch must land in both (or the SPA
+// view silently diverges from the runner path).
+func TestGetStagePromptRender_Acceptance_PopulatesCriteria(t *testing.T) {
+	s, _, acceptanceStageID, _, _ := newAcceptancePromptServer(t)
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt-render", acceptanceStageID), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range []string{"ac-create", "ac-list", "not declared in the workflow spec"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("rendered acceptance prompt missing %q\n---\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "### Diff under review") {
+		t.Errorf("rendered acceptance prompt must withhold the diff:\n%s", body)
+	}
+}

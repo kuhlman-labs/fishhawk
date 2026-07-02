@@ -4877,3 +4877,46 @@ func TestDeployGate_Scope_RejectWithoutWriteDeploy_Proceeds(t *testing.T) {
 		t.Errorf("failure category = %v, want D", cur.FailureCategory)
 	}
 }
+
+// TestAdvanceForDecision_AcceptanceStage_GenericGate pins the acceptance gate
+// semantics (E31.6 / #1534, ADR-049): an operator-gated acceptance stage rides
+// the GENERIC advanceStage path — approve → succeeded (NOT the deploy-specific
+// triggerDeploy dispatch), reject → failed category D. This is the regression
+// test the plan calls for INSTEAD of adding an approvals.go special-case: the
+// generic semantics are already correct for a runner-hosted stage whose work is
+// done at gate time (unlike deploy, whose approve means "now fire the external
+// pipeline").
+func TestAdvanceForDecision_AcceptanceStage_GenericGate(t *testing.T) {
+	rr := newApprovalRunRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr})
+
+	// Approve → succeeded via the generic path (NOT triggerDeploy, which would
+	// leave the stage at dispatched / awaiting_deployment).
+	approveStage := rr.seedStage(run.StageStateAwaitingApproval)
+	rr.mu.Lock()
+	approveStage.Type = run.StageTypeAcceptance
+	rr.mu.Unlock()
+	got, err := s.advanceForDecision(context.Background(), approveStage, approval.DecisionApprove)
+	if err != nil {
+		t.Fatalf("advanceForDecision(approve): %v", err)
+	}
+	if got.State != run.StageStateSucceeded {
+		t.Errorf("acceptance approve state = %q, want succeeded (generic gate, not triggerDeploy)", got.State)
+	}
+
+	// Reject → failed category D.
+	rejectStage := rr.seedStage(run.StageStateAwaitingApproval)
+	rr.mu.Lock()
+	rejectStage.Type = run.StageTypeAcceptance
+	rr.mu.Unlock()
+	rejected, err := s.advanceForDecision(context.Background(), rejectStage, approval.DecisionReject)
+	if err != nil {
+		t.Fatalf("advanceForDecision(reject): %v", err)
+	}
+	if rejected.State != run.StageStateFailed {
+		t.Errorf("acceptance reject state = %q, want failed", rejected.State)
+	}
+	if rejected.FailureCategory == nil || *rejected.FailureCategory != run.FailureD {
+		t.Errorf("acceptance reject failure category = %v, want D", rejected.FailureCategory)
+	}
+}

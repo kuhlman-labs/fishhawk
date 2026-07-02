@@ -4843,3 +4843,159 @@ func TestBuild_ScopeAmendmentSection_ImplementOnly(t *testing.T) {
 		}
 	}
 }
+
+// acceptanceFixturePlan returns a standard_v1 plan carrying two blocking
+// acceptance criteria (one explicit, one inferred) plus an out_of_scope entry,
+// used by the acceptance-prompt tests.
+func acceptanceFixturePlan() *plan.Plan {
+	blocking := true
+	return &plan.Plan{
+		PlanVersion: "standard_v1",
+		Summary:     "Ship the widget endpoint.",
+		Verification: plan.Verification{
+			TestStrategy: "unit + integration",
+			RollbackPlan: "revert the PR",
+			AcceptanceCriteria: []plan.AcceptanceCriterion{
+				{
+					ID:            "ac-create",
+					Statement:     "POST /widgets returns 201 with the created widget",
+					Source:        plan.CriterionSourceExplicit,
+					SourceRef:     "#1534",
+					Blocking:      &blocking,
+					VerifyHint:    "curl the running instance",
+					Preconditions: []string{"an authenticated session exists"},
+				},
+				{
+					ID:        "ac-list",
+					Statement: "GET /widgets lists created widgets",
+					Source:    plan.CriterionSourceInferred,
+					Rationale: "listing is implied by creation",
+					Blocking:  &blocking,
+				},
+			},
+			OutOfScope: []string{"widget deletion is not covered"},
+		},
+	}
+}
+
+// TestBuild_Acceptance_Supported pins that the acceptance stage type is wired
+// into Build (no longer ErrUnsupportedStage).
+func TestBuild_Acceptance_Supported(t *testing.T) {
+	_, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+}
+
+// TestBuild_Acceptance_RendersCriteriaAndOutOfScope pins the criteria block:
+// each criterion id + statement, the source/source_ref/rationale/verify_hint/
+// precondition detail, and the out_of_scope not-covered list all render.
+func TestBuild_Acceptance_RendersCriteriaAndOutOfScope(t *testing.T) {
+	got, err := Build("acceptance", Trigger{
+		Source:       "github_issue",
+		IssueNumber:  1534,
+		IssueTitle:   "Widget endpoint",
+		IssueBody:    "we need a widget endpoint",
+		IssueURL:     "https://github.com/kuhlman-labs/fishhawk/issues/1534",
+		Repo:         "kuhlman-labs/fishhawk",
+		ApprovedPlan: acceptanceFixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	for _, want := range []string{
+		"acceptance validator",
+		"diff is deliberately withheld",
+		"ac-create",
+		"POST /widgets returns 201 with the created widget",
+		"source_ref: #1534",
+		"ac-list",
+		"rationale: listing is implied by creation",
+		"verify_hint: curl the running instance",
+		"precondition: an authenticated session exists",
+		"Explicitly NOT covered",
+		"widget deletion is not covered",
+		"https://github.com/kuhlman-labs/fishhawk/issues/1534",
+		"we need a widget endpoint",
+		"verdict",
+		"assertion_fail",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("acceptance prompt missing %q\n---\n%s", want, got)
+		}
+	}
+}
+
+// TestBuild_Acceptance_IndependenceNoDiffOrScope pins ADR-049 decision #4: the
+// acceptance prompt withholds the diff and the implement-only scope-files
+// sections, so a reviewer's independence assumption holds (grep-negative for
+// the implement-only section headers).
+func TestBuild_Acceptance_IndependenceNoDiffOrScope(t *testing.T) {
+	got, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	for _, banned := range []string{
+		"Files in scope:",
+		"### Diff under review",
+		"SCOPE CONSTRAINT",
+		"Approved plan (binding instruction)",
+	} {
+		if strings.Contains(got, banned) {
+			t.Errorf("acceptance prompt must not contain %q (independence):\n%s", banned, got)
+		}
+	}
+}
+
+// TestBuild_Acceptance_TargetURLRendered pins the target-instance section: a
+// non-empty TargetInstanceURL renders verbatim.
+func TestBuild_Acceptance_TargetURLRendered(t *testing.T) {
+	got, err := Build("acceptance", Trigger{
+		Repo:              "x/y",
+		ApprovedPlan:      acceptanceFixturePlan(),
+		TargetInstanceURL: "https://preview.example.test",
+	})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	if !strings.Contains(got, "Target instance URL: https://preview.example.test") {
+		t.Errorf("acceptance prompt missing target URL:\n%s", got)
+	}
+	if strings.Contains(got, "not declared in the workflow spec") {
+		t.Errorf("acceptance prompt should not render the not-declared line when a URL is set:\n%s", got)
+	}
+}
+
+// TestBuild_Acceptance_TargetURLNotDeclared pins the E31.4 seam: an empty
+// TargetInstanceURL renders the explicit not-declared line rather than a silent
+// omission.
+func TestBuild_Acceptance_TargetURLNotDeclared(t *testing.T) {
+	got, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	if !strings.Contains(got, "not declared in the workflow spec") ||
+		!strings.Contains(got, "#1532") {
+		t.Errorf("acceptance prompt missing the not-declared seam line:\n%s", got)
+	}
+}
+
+// TestBuild_Acceptance_NoCriteriaWarnsLoud pins the fail-loud branch: a nil
+// ApprovedPlan (or empty criteria) renders an explicit warning rather than a
+// silent empty checklist.
+func TestBuild_Acceptance_NoCriteriaWarnsLoud(t *testing.T) {
+	for name, tr := range map[string]Trigger{
+		"nil plan":       {Repo: "x/y"},
+		"empty criteria": {Repo: "x/y", ApprovedPlan: &plan.Plan{PlanVersion: "standard_v1"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := Build("acceptance", tr)
+			if err != nil {
+				t.Fatalf("Build(acceptance): %v", err)
+			}
+			if !strings.Contains(got, "WARNING: no acceptance criteria") {
+				t.Errorf("acceptance prompt missing the no-criteria warning:\n%s", got)
+			}
+		})
+	}
+}
