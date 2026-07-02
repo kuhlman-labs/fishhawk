@@ -175,6 +175,13 @@ This makes a previously invisible boundary crossing (the #601 class) visible in 
 - **Residual gap.** It catches writes through the Write/Edit **tools** only. **Bash-mediated writes** (shell `>` redirects) are NOT visible to it. Closing that gap, and confining writes rather than merely surfacing them, is the OS-sandbox ADR's domain.
 - Containment is resolved against the target's deepest **existing** ancestor (the common case is a brand-new file that doesn't exist yet) and canonicalises symlinks first, so e.g. macOS's `/tmp` → `/private/tmp` symlink does not cause false positives.
 
+### Acceptance-stage egress containment + target credentials (E31.4 / #1532, ADR-050)
+
+The acceptance stage is the one agent invocation that holds code execution, network access, and credentials at once, so the runner contains it (packages `internal/egressproxy` + `internal/acceptenv`; consumed by the E31.7 acceptance executor):
+
+- **Default-deny egress proxy.** The invocation's `HTTP(S)_PROXY` points at a runner-embedded filtering proxy whose allow-list is exactly the workflow spec's `egress.target_hosts` (the only customer-controlled entries), the model API endpoint, and the Fishhawk backend. Anything else is refused `403`. Hostname resolutions are DNS-pinned for the proxy's lifetime and a public hostname resolving into loopback/private space is refused (anti-rebinding). Residual: the proxy env binds cooperating HTTP clients — raw-socket bypass needs the OS sandbox (same residual class as the write detector above).
+- **`FISHHAWK_ACCEPTANCE_ENV_<NAME>` (operator input).** The explicit channel for customer-supplied target-instance test credentials: set `FISHHAWK_ACCEPTANCE_ENV_APP_PASSWORD=…` on the runner env and the acceptance invocation sees `APP_PASSWORD=…`. Everything else is default-denied; the model API keys are the one secret class that survives. The acceptance invocation NEVER carries `FISHHAWK_API_TOKEN` (its evidence ships signature-authed, no MCP token — ADR-050) or any repo/deploy token, and a passthrough whose stripped name collides with a denied key or a proxy variable is refused and logged, never honored.
+
 ### OTel trace export (#649 / #679)
 
 `internal/otelemit` emits one OpenTelemetry GenAI trace per stage invocation. Emission is **gated by `OTEL_EXPORTER_OTLP_ENDPOINT`**: when unset (the default), `Bootstrap` returns a disabled Emitter whose methods are no-ops, so the implement loop is completely unaffected. When set, an OTLP/HTTP exporter (`otlptracehttp`) POSTs spans to `{endpoint}/v1/traces`, honouring the standard `OTEL_EXPORTER_OTLP_*` env vars.

@@ -185,6 +185,22 @@ func validateWorkflow(s *Spec, name string, wf *Workflow) error {
 			}
 		}
 
+		// The egress allowance (ADR-050 / #1532, v1.3) declares the target
+		// host(s) an acceptance agent may reach through the runner's
+		// default-deny proxy; only an acceptance stage runs under that proxy,
+		// so declaring it elsewhere is a binding error. Mirror of the
+		// artifact bindings above — the stage $def is shared across every
+		// stage type, so this pairing is enforced here, not in the schema.
+		if stage.Egress != nil && stage.Type != StageTypeAcceptance {
+			return &ValidationError{
+				Path: stagePath(i, "/egress"),
+				Message: fmt.Sprintf(
+					"egress allowance is valid only on an acceptance stage, not a %q stage (ADR-050)",
+					stage.Type,
+				),
+			}
+		}
+
 		// Approver role refs must resolve.
 		for j, g := range stage.Gates {
 			if g.Approvers == nil {

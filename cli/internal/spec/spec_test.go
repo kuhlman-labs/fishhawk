@@ -299,6 +299,31 @@ workflows:
 	}
 }
 
+// TestValidateBytes_V13EgressSpec_Accepted proves the cli's embedded v1
+// mirror picked up the E31.4 egress allowance (ADR-050 / #1532): a version
+// "1.3" acceptance stage declaring egress.target_hosts validates at the
+// schema level through the cli's embedded copy — the mirror-sync +
+// version-minor done-means for the 1.3 surface (the egress $def and the
+// 1.3 version value must actually be present in the mirror).
+func TestValidateBytes_V13EgressSpec_Accepted(t *testing.T) {
+	yml := `
+version: "1.3"
+workflows:
+  feature_change:
+    stages:
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+        egress:
+          target_hosts:
+            - staging.example.com:8443
+`
+	if err := spec.ValidateBytes([]byte(yml)); err != nil {
+		t.Errorf("expected v1.3 egress spec to validate at the schema level, got: %v", err)
+	}
+}
+
 // TestValidateBytes_V0AcceptanceSpec_Rejected proves the cli's v0 mirror
 // stays frozen: a v0 spec (version 0.7) carrying an acceptance stage is
 // rejected at the schema layer, because acceptance is a v1-only type.

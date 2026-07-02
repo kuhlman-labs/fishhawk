@@ -431,22 +431,20 @@ func (s *Server) authorizeAcceptance(w http.ResponseWriter, r *http.Request, run
 }
 
 // resolveAcceptanceTargetURL is the single named wiring seam for the
-// acceptance stage's target-instance URL (ADR-050 decision #1). The URL's
-// VALUE SOURCE — the workflow-spec egress-allowance grammar — is owned by the
-// unlanded, human-led E31.4/#1532. Until that grammar lands and adds the
-// declared host to spec.Stage, this helper locates the acceptance stage via
-// the existing resolveAcceptanceStage spec-read and returns the empty string;
-// buildAcceptance then renders an explicit not-declared line. When #1532
-// lands, activate URL delivery by reading the stage's spec-declared host HERE —
-// this is the one place the grammar wires into prompt assembly.
+// acceptance stage's target-instance URL (ADR-050 decision #1), activated by
+// the E31.4/#1532 egress-allowance grammar: it returns the acceptance
+// stage's first spec-declared egress target host. The value is a host or
+// host:port, deliberately rendered verbatim — the grammar declares hosts,
+// not URLs, and fabricating a scheme here would assert something the spec
+// does not say. A spec with no egress block (a pre-1.3 spec, or one relying
+// on the documented interim posture) yields the empty string and
+// buildAcceptance renders its explicit not-declared line.
 func (s *Server) resolveAcceptanceTargetURL(ctx context.Context, runRow *run.Run) string {
-	if _, ok := s.resolveAcceptanceStage(ctx, runRow); !ok {
+	st, ok := s.resolveAcceptanceStageSpec(ctx, runRow)
+	if !ok || st.Egress == nil || len(st.Egress.TargetHosts) == 0 {
 		return ""
 	}
-	// #1532 wiring point: return the acceptance stage's spec-declared target
-	// host once the egress-allowance grammar adds it to spec.Stage. Empty until
-	// then — the prompt's not-declared line keeps the interim self-diagnosing.
-	return ""
+	return st.Egress.TargetHosts[0]
 }
 
 // acceptanceResponse echoes the persisted artifact's identity back to the

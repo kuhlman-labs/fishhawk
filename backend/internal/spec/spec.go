@@ -501,6 +501,20 @@ type Stage struct {
 	Budget      *Budget          `json:"budget,omitempty" yaml:"budget,omitempty"`
 	Gates       []Gate           `json:"gates,omitempty" yaml:"gates,omitempty"`
 	Reviewers   *ReviewersConfig `json:"reviewers,omitempty" yaml:"reviewers,omitempty"`
+	// Egress is the acceptance-stage egress allowance (v1.3, ADR-050 /
+	// #1532): the declared target-instance host(s) the acceptance agent may
+	// reach through the runner's default-deny egress proxy. Valid only on an
+	// acceptance stage — Validate rejects it on any other type.
+	Egress *StageEgress `json:"egress,omitempty" yaml:"egress,omitempty"`
+}
+
+// StageEgress declares the customer-controlled slot of the acceptance
+// agent's egress allow-list (ADR-050 decision #1). Entries are host or
+// host:port — never URLs — because scheme and path are not egress-relevant.
+// The runner adds the model API endpoint and the Fishhawk backend itself;
+// they are not declarable here.
+type StageEgress struct {
+	TargetHosts []string `json:"target_hosts" yaml:"target_hosts"`
 }
 
 // StageType is the stage's kind, drawn from a closed set.

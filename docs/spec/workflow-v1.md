@@ -2,11 +2,11 @@
 
 Reference for `.fishhawk/workflows.yaml` at major version 1. The canonical schema is [`workflow-v1.schema.json`](workflow-v1.schema.json) (JSON Schema Draft 2020-12).
 
-> **v1 began as a structural copy of v0 (ADR-046 / #1381) and now adds the deploy surface (E23.2 / #1382).** The inherited `$defs` and `properties` stay byte-for-byte identical to [`workflow-v0.schema.json`](workflow-v0.schema.json); v1 layers the delegating deploy grammar (per ADR-038 / #925) on top — the `deploy` stage type, the `deployment` artifact, the delegating executor, and three pre-flight constraint kinds. **v1.1 adds the `acceptance` stage type (E31.2 / #1519, per ADR-049)** — a runner-hosted advisory acceptance stage on the ordinary agent/human executor branches (no delegate, no deploy-only constraints); an additive minor, so every 1.0 spec stays valid. **v1.2 adds the `acceptance` produces artifact (E31.3 / #1531, per ADR-049)** — the durable acceptance-evidence record, valid only on an acceptance stage; also an additive minor. **v0 stays frozen** and rejects both `deploy` and `acceptance` via its closed enums, so a v0 spec carrying either fails at the schema layer.
+> **v1 began as a structural copy of v0 (ADR-046 / #1381) and now adds the deploy surface (E23.2 / #1382).** The inherited `$defs` and `properties` stay byte-for-byte identical to [`workflow-v0.schema.json`](workflow-v0.schema.json); v1 layers the delegating deploy grammar (per ADR-038 / #925) on top — the `deploy` stage type, the `deployment` artifact, the delegating executor, and three pre-flight constraint kinds. **v1.1 adds the `acceptance` stage type (E31.2 / #1519, per ADR-049)** — a runner-hosted advisory acceptance stage on the ordinary agent/human executor branches (no delegate, no deploy-only constraints); an additive minor, so every 1.0 spec stays valid. **v1.2 adds the `acceptance` produces artifact (E31.3 / #1531, per ADR-049)** — the durable acceptance-evidence record, valid only on an acceptance stage; also an additive minor. **v1.3 adds the acceptance-stage `egress` allowance (E31.4 / #1532, per ADR-050)** — the declared target host(s) the acceptance agent may reach through the runner's default-deny egress proxy; also an additive minor. **v0 stays frozen** and rejects both `deploy` and `acceptance` via its closed enums, so a v0 spec carrying either fails at the schema layer.
 
 ## Grammar
 
-Every v0 field is inherited unchanged. For the full base reference (top-level shape, stages, executors, inputs, produces, constraints, budgets, gates, operator-agent delegation — including the `operator_agent.model_policy` scenario-A model-selection contract (#1421), inherited verbatim and surfaced identically on the run-status delegation block — decomposition controls), see [`workflow-v0.md`](workflow-v0.md). The v1 additions are the [deploy stage](#deploy-stage-v1) (v1.0), the [acceptance stage](#acceptance-stage-v11) (v1.1), and the [acceptance artifact](#acceptance-artifact-v12) (v1.2) members below. A minimal non-deploy v1 spec differs from a v0 spec only in its `version` value:
+Every v0 field is inherited unchanged. For the full base reference (top-level shape, stages, executors, inputs, produces, constraints, budgets, gates, operator-agent delegation — including the `operator_agent.model_policy` scenario-A model-selection contract (#1421), inherited verbatim and surfaced identically on the run-status delegation block — decomposition controls), see [`workflow-v0.md`](workflow-v0.md). The v1 additions are the [deploy stage](#deploy-stage-v1) (v1.0), the [acceptance stage](#acceptance-stage-v11) (v1.1), the [acceptance artifact](#acceptance-artifact-v12) (v1.2), and the [egress allowance](#egress-allowance-v13) (v1.3) members below. A minimal non-deploy v1 spec differs from a v0 spec only in its `version` value:
 
 ```yaml
 version: "1.0" # required; routes to workflow-v1.schema.json
@@ -130,7 +130,33 @@ workflows:
           - artifact: acceptance
 ```
 
-See [ADR-049 (#1519)](https://github.com/kuhlman-labs/fishhawk/issues/1519) for the acceptance-stage decision and epic [#31](https://github.com/kuhlman-labs/fishhawk/issues/31) for the acceptance workstream.
+### egress allowance (v1.3)
+
+The `egress` block (E31.4 / #1532, per ADR-050) declares the **target-instance host(s)** the acceptance agent may reach. It is valid **only** on an acceptance stage — the validator rejects it on any other stage type, the same binding shape as the acceptance artifact.
+
+- `egress.target_hosts` (required, min 1): each entry is `host` or `host:port` — never a URL (the schema pattern rejects scheme/path/wildcard). An entry without a port permits the default HTTP/HTTPS ports (80, 443) only; an entry with a port permits exactly that port.
+- These entries are the **single customer-controlled slot** of the acceptance agent's default-deny egress allow-list. The runner adds the model API endpoint and the Fishhawk backend itself; they are not declarable here.
+- Enforcement is the runner-embedded egress proxy (`runner/internal/egressproxy`, ADR-050 decision #1): the acceptance invocation is forced through it via `HTTP(S)_PROXY`, destinations outside the composed allow-list are refused `403`, hostname resolutions are DNS-pinned against rebinding, and a public hostname resolving into loopback/private space is refused outright.
+- The first `target_hosts` entry is also rendered verbatim into the acceptance prompt's Target instance section (`resolveAcceptanceTargetURL`); a spec with no `egress` block renders an explicit not-declared line instead.
+
+```yaml
+version: "1.3"
+workflows:
+  feature_change:
+    stages:
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+        egress:
+          target_hosts:
+            - staging.example.com
+            - preview.internal.example.com:8443
+        produces:
+          - artifact: acceptance
+```
+
+See [ADR-049 (#1519)](https://github.com/kuhlman-labs/fishhawk/issues/1519) for the acceptance-stage decision, [ADR-050 (#1540)](https://github.com/kuhlman-labs/fishhawk/issues/1540) for the egress + credential posture, and epic [#31](https://github.com/kuhlman-labs/fishhawk/issues/31) for the acceptance workstream.
 
 ## Reviewer policy (v1)
 

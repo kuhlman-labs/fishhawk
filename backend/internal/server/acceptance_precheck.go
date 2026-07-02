@@ -251,8 +251,20 @@ func criterionBlocking(c plan.AcceptanceCriterion) bool {
 // off-switch — a run whose workflow configures no acceptance stage yields
 // ok=false, so runAcceptancePrecheck writes no entry and never blocks.
 func (s *Server) resolveAcceptanceStage(ctx context.Context, runRow *run.Run) (string, bool) {
-	if runRow.WorkflowSpec == nil {
+	st, ok := s.resolveAcceptanceStageSpec(ctx, runRow)
+	if !ok {
 		return "", false
+	}
+	return st.ID, true
+}
+
+// resolveAcceptanceStageSpec is resolveAcceptanceStage's stage-returning
+// core: the same fail-open spec read, yielding the full spec.Stage so
+// consumers that need more than the ID (the E31.4 egress allowance read in
+// resolveAcceptanceTargetURL) share one spec-read contract.
+func (s *Server) resolveAcceptanceStageSpec(ctx context.Context, runRow *run.Run) (spec.Stage, bool) {
+	if runRow.WorkflowSpec == nil {
+		return spec.Stage{}, false
 	}
 	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
 	if err != nil {
@@ -260,16 +272,16 @@ func (s *Server) resolveAcceptanceStage(ctx context.Context, runRow *run.Run) (s
 			slog.String("run_id", runRow.ID.String()),
 			slog.String("error", err.Error()),
 		)
-		return "", false
+		return spec.Stage{}, false
 	}
 	wf, ok := parsed.Workflows[runRow.WorkflowID]
 	if !ok {
-		return "", false
+		return spec.Stage{}, false
 	}
 	for _, st := range wf.Stages {
 		if st.Type == spec.StageTypeAcceptance {
-			return st.ID, true
+			return st, true
 		}
 	}
-	return "", false
+	return spec.Stage{}, false
 }
