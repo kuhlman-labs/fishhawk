@@ -398,6 +398,63 @@ func TestAcceptancePrecheck_NilRepos_ReturnsNil(t *testing.T) {
 	}
 }
 
+// (11) Malformed raw plan body -> json.Unmarshal error -> fail-open: nil
+// result and NO audit entry. The plan Risks section claimed this branch was
+// covered by a malformed-body unit test; this pins it. The workflow DOES
+// configure an acceptance stage (so resolveAcceptanceStage returns ok and the
+// decode is reached), but the body is not valid JSON, so the raw-decode fails
+// and the pre-check degrades exactly like the other fail-open paths.
+func TestAcceptancePrecheck_MalformedBody_ReturnsNil(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := []byte("{not valid json")
+
+	got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+
+	if got != nil {
+		t.Fatalf("want nil result on an unmarshal error; got %+v", got)
+	}
+	if n := countAcceptancePrecheckEntries(au); n != 0 {
+		t.Fatalf("want no entry on the unmarshal fail-open path; got %d", n)
+	}
+}
+
+// (12) RunRepo.GetRun error -> fail-open: nil result and NO audit entry. An
+// unseeded run id makes the fake's GetRun return run.ErrNotFound, exercising
+// the GetRun error branch (the FIRST fail-open path after the nil-repo guard).
+func TestAcceptancePrecheck_GetRunError_ReturnsNil(t *testing.T) {
+	s, au, _ := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBody(t, nil, nil)
+
+	// A run id that was never seeded -> GetRun returns run.ErrNotFound.
+	got := s.runAcceptancePrecheck(context.Background(), uuid.New(), uuid.New(), body)
+
+	if got != nil {
+		t.Fatalf("want nil result when GetRun fails; got %+v", got)
+	}
+	if n := countAcceptancePrecheckEntries(au); n != 0 {
+		t.Fatalf("want no entry when GetRun fails; got %d", n)
+	}
+}
+
+// (13) Unparseable workflow spec -> resolveAcceptanceStage's spec.ParseBytes
+// error branch -> ok=false -> fail-open: nil result and NO audit entry. This
+// pins the parse-error degradation independent of the "no acceptance stage"
+// path (TestAcceptancePrecheck_NoAcceptanceStage_NoEntry), which reaches
+// resolveAcceptanceStage with a spec that parses cleanly.
+func TestAcceptancePrecheck_UnparseableSpec_ReturnsNil(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, []byte("version: \"1.1\"\nworkflows: [unterminated"))
+	body := acceptancePlanBody(t, nil, nil)
+
+	got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+
+	if got != nil {
+		t.Fatalf("want nil result when the workflow spec is unparseable; got %+v", got)
+	}
+	if n := countAcceptancePrecheckEntries(au); n != 0 {
+		t.Fatalf("want no entry when the workflow spec is unparseable; got %d", n)
+	}
+}
+
 // TestPlanGateEvidence_AcceptanceMapping asserts the server->prompt mapping:
 // a nil acceptance payload leaves the prompt field absent, and a populated
 // payload maps every field and finding through to the prompt evidence struct.
