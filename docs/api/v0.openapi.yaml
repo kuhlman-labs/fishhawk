@@ -1895,6 +1895,68 @@ components:
           type: string
           description: Hex sha256 of the canonical hash inputs.
 
+    AuditExport:
+      type: object
+      description: |
+        The verifier's `Export v1` wire contract (ADR-008 / ADR-054),
+        produced by `GET /v0/audit/export`. The exact three-field body
+        shape is BINDING: the verifier's `ParseExport` rejects any
+        unknown field anywhere in the object, so continuation/partiality
+        markers ride response headers, not the body. Mirrors
+        `verifier/internal/audit/export.go`.
+      required: [schema, exported_at, runs]
+      additionalProperties: false
+      properties:
+        schema:
+          type: string
+          enum: [v1]
+          description: Export format version. The verifier rejects anything but `v1`.
+        exported_at:
+          type: string
+          format: date-time
+          description: Server time (UTC) the export was assembled.
+        runs:
+          type: object
+          description: |
+            Map keyed by run UUID. The reserved nil-UUID key
+            `00000000-0000-0000-0000-000000000000` holds the global
+            (run-less) chain partition, whose entries carry
+            `run_id: null`.
+          additionalProperties: { $ref: '#/components/schemas/AuditExportRunData' }
+
+    AuditExportRunData:
+      type: object
+      description: One run's portion of an export — its signing key plus the full audit chain.
+      required: [audit_entries]
+      additionalProperties: false
+      properties:
+        signing_key:
+          $ref: '#/components/schemas/AuditExportSigningKey'
+          description: |
+            The run's public signing key. Absent when the run never
+            issued a key (e.g. local runs); the verifier's chain walk
+            does not require it.
+        audit_entries:
+          type: array
+          description: Sequence-ascending chain for the run (empty array when none).
+          items: { $ref: '#/components/schemas/AuditEntry' }
+
+    AuditExportSigningKey:
+      type: object
+      description: The persisted public-half signing record (ADR-008).
+      required: [public_key, issued_at, expires_at]
+      additionalProperties: false
+      properties:
+        public_key:
+          type: string
+          description: Base64-encoded Ed25519 public key (32 bytes).
+        issued_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+
     StatusCommentResponse:
       type: object
       description: |
@@ -4304,6 +4366,90 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '503':
           description: Audit repository not configured on this instance.
+
+  /v0/audit/export:
+    get:
+      operationId: exportAudit
+      summary: Compliance export in the verifier's Export v1 wire shape
+      description: |
+        Producer half of the audit-grade compliance contract (ADR-008 /
+        ADR-054). Assembles the EXACT `Export v1` shape the external
+        verifier consumes: `{ schema, exported_at, runs }`, where each
+        run is keyed by UUID and carries its `signing_key` plus the full
+        sequence-ascending `audit_entries` chain.
+
+        **Whole-run page bounding.** The `limit` bounds the number of
+        RUNS per page, never splitting a run's chain — so every page
+        independently passes the verifier's `VerifyExport` from each
+        run's nil-`prev_hash` genesis entry. When more runs remain the
+        response is partial; partiality and the opaque keyset
+        continuation cursor ride RESPONSE HEADERS
+        (`X-Fishhawk-Export-Complete`, `X-Fishhawk-Export-Next-Cursor`)
+        — NEVER the body, because the verifier's `ParseExport` uses
+        `DisallowUnknownFields`, making the exact three-field body shape
+        binding. Every page byte-parses through `ParseExport`.
+
+        **Global (run-less) chain partition.** Entries not tied to a run
+        (token issue/revoke, OAuth events) are exported under the
+        reserved nil-UUID key `00000000-0000-0000-0000-000000000000`,
+        their `run_id` serialized as `null` — exactly the value their
+        hashes were computed over, so the partition chain-verifies with
+        no verifier change. It is emitted on the FIRST page only (empty
+        cursor), even when empty (as an empty `audit_entries` array) so
+        consumers distinguish "no global entries" from "not included" —
+        never silently dropped. Opt out with `include_global=false`.
+
+        **Filtering (mutually exclusive shapes).** Either an explicit
+        `run_id` set (repeatable; a requested run that does not exist is
+        a `404`, never silently omitted) OR the filter shape (`repo` via
+        the runs join, and `from`/`to` on run `created_at`). Combining
+        `run_id` with `repo`/`from`/`to` is a `400`.
+
+        Authorization scope enforcement (`read:audit-export`) and
+        raw-pointer redaction are deferred to a sibling change per the
+        ADR-054 rollout; this endpoint ships under the existing
+        read-endpoint identity posture.
+      tags: [audit]
+      parameters:
+        - name: run_id
+          in: query
+          description: |
+            Explicit run to export. Repeatable. Mutually exclusive with
+            `repo`/`from`/`to`. A requested run that does not exist is a
+            `404 run_not_found`.
+          schema: { $ref: '#/components/schemas/UUID' }
+        - { name: repo, in: query, description: "Filter by repository (owner/name), resolved through the runs join.", schema: { type: string } }
+        - { name: from, in: query, description: "Lower bound (inclusive) on run created_at, RFC3339.", schema: { type: string, format: date-time } }
+        - { name: to, in: query, description: "Upper bound (inclusive) on run created_at, RFC3339.", schema: { type: string, format: date-time } }
+        - { name: include_global, in: query, description: "Include the reserved nil-UUID global-chain partition on the first page. Default true; set false to omit.", schema: { type: boolean, default: true } }
+        - { name: limit, in: query, description: "Maximum RUNS per page (whole-run bounded).", schema: { type: integer, default: 50, maximum: 200 } }
+        - { name: cursor, in: query, description: "Opaque keyset continuation cursor from a prior page's X-Fishhawk-Export-Next-Cursor header.", schema: { type: string } }
+      responses:
+        '200':
+          description: |
+            One page of the Export v1 wire contract. Byte-parses through
+            the verifier's `ParseExport`; whole-run bounded so it also
+            passes `VerifyExport` independently.
+          headers:
+            X-Fishhawk-Export-Complete:
+              description: "`true` when this is the final page; `false` when more runs remain."
+              schema: { type: boolean }
+            X-Fishhawk-Export-Next-Cursor:
+              description: Opaque keyset cursor for the next page. Present only when the export is partial.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuditExport' }
+        '400':
+          description: |
+            `validation_failed` — malformed `run_id`/`from`/`to`/`limit`,
+            `from` after `to`, or `run_id` combined with `repo`/`from`/`to`;
+            `cursor_invalid` — opaque cursor failed to decode.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: "`run_not_found` — an explicitly requested run does not exist (fail-closed)."
+        '503':
+          description: "`audit_export_unconfigured` — the audit, run, or signing repository is not configured on this instance."
 
   # ---------------------------------------------------------------------
   # Campaigns (ADR-047 / #1437)
