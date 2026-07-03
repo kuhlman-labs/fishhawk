@@ -48,6 +48,26 @@ sql:
               pointer: true
 
   - engine: "postgresql"
+    queries: "internal/refinement/queries.sql"
+    schema: "internal/postgres/migrations"
+    gen:
+      go:
+        package: "refinementdb"
+        out: "internal/refinement/db"
+        sql_package: "pgx/v5"
+        emit_pointers_for_null_types: true
+        emit_json_tags: true
+        json_tags_case_style: "snake"
+        overrides:
+          - db_type: "uuid"
+            go_type: "github.com/google/uuid.UUID"
+          - db_type: "uuid"
+            nullable: true
+            go_type:
+              type: "uuid.UUID"
+              pointer: true
+
+  - engine: "postgresql"
     queries: "internal/artifact/queries.sql"
     schema: "internal/postgres/migrations"
     gen:

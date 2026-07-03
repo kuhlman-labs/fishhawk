@@ -526,12 +526,24 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if !strings.Contains(artifactsKindCheckDef, "deployment") {
 		t.Errorf("artifacts_kind_check after MigrateDown dropped 'deployment' (0037 still applied; only 0045 rolled back): %s", artifactsKindCheckDef)
 	}
-	// 0045 (#1531) IS the migration just rolled back, so its widening — the
-	// 'acceptance' artifact kind — must be GONE from artifacts_kind_check,
-	// while 0037's 'deployment' (a prior migration, asserted just above) must
-	// still be present.
-	if strings.Contains(artifactsKindCheckDef, "acceptance") {
-		t.Errorf("artifacts_kind_check after MigrateDown still admits 'acceptance' (0045 should have rolled it back): %s", artifactsKindCheckDef)
+	// 0046 (#1592) is now the latest migration: it creates the refinement_drafts
+	// table and touches no CHECK constraint. So its one-step rollback drops that
+	// table (asserted below) and leaves every prior migration's effect intact —
+	// including 0045's (#1531) 'acceptance' artifact-kind widening, which now
+	// SURVIVES the one-step down (it is no longer the migration rolled back).
+	if !strings.Contains(artifactsKindCheckDef, "acceptance") {
+		t.Errorf("artifacts_kind_check after MigrateDown dropped 'acceptance' (0045 still applied; only 0046 rolled back): %s", artifactsKindCheckDef)
+	}
+	// 0046 (#1592) IS the migration just rolled back, so its table —
+	// refinement_drafts — must be GONE after the one-step down.
+	var refinementDraftsTable int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'refinement_drafts'`,
+	).Scan(&refinementDraftsTable); err != nil {
+		t.Fatalf("query refinement_drafts table: %v", err)
+	}
+	if refinementDraftsTable != 0 {
+		t.Errorf("'refinement_drafts' table count after MigrateDown = %d, want 0 (0046 should have rolled it back)", refinementDraftsTable)
 	}
 	// 0044 (#1519) is now a PRIOR migration (only 0045 rolled back), so its
 	// widening — the 'acceptance' stage type — must STILL be present in
@@ -939,11 +951,15 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	}
 	pool.Close()
 
-	// Step down past 0045 (narrow artifacts_kind_check — inert re: campaigns)
-	// then 0044 (narrow stages_type_check — inert re: campaigns) then 0043 (drop
-	// upstream_run_id — inert) then 0042 (drop idempotency_key — inert) then 0041
-	// (drop operator_agent — inert), all leaving the paused rows untouched, to
-	// reach 0040, the normalizing rollback under test.
+	// Step down past 0046 (drop refinement_drafts — inert re: campaigns) then
+	// 0045 (narrow artifacts_kind_check — inert re: campaigns) then 0044 (narrow
+	// stages_type_check — inert re: campaigns) then 0043 (drop upstream_run_id —
+	// inert) then 0042 (drop idempotency_key — inert) then 0041 (drop
+	// operator_agent — inert), all leaving the paused rows untouched, to reach
+	// 0040, the normalizing rollback under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0046) failed: %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0045) failed: %v", err)
 	}
