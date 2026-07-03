@@ -950,6 +950,20 @@ Notes:
   `500` with nothing persisted — no gate action is ever unaudited. Listed here so
   a future reader grepping the audit categories doesn't mistake them for comment
   surfaces.
+- The refinement filing-executor kind — `refinement_filing_completed` (#1594,
+  ADR-052 filing half, E34.3) — is likewise an **internal, global-chain
+  audit-only category, not an issue-comment surface**. Nothing in `issuecomment`
+  posts it; it has no Notifier method. It is written by the acting caller
+  (`actor_kind` = `user`) in `server/refinement_file.go`'s filing handler via
+  `AuditRepo.AppendGlobalChained` once the approved draft's epic + children have
+  all filed and the epic passed the epic-children round-trip. The entry carries
+  `{session_id, draft_id, content_hash, repo, epic_number, child_numbers,
+  verified}`. Like the decision/edit kinds the write is NOT best-effort: it is
+  appended BEFORE the filing session's `completed_at` is flipped
+  (durable-before-state-change), so an append failure fails the request `500`
+  with the session left open for a retry — the session close is never unaudited.
+  Listed here so a future reader grepping the audit categories doesn't mistake it
+  for a comment surface.
 - The board-state-sync kind — `work_item_transitioned` (#1012) — is an
   **internal, audit-only category, not an issue-comment surface**. Nothing in
   `issuecomment` posts it; it has no Notifier method. It is written under its

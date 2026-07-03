@@ -1,6 +1,7 @@
 package refinement
 
 import (
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -205,6 +206,71 @@ func TestRenderDraft_EpicThenChildren(t *testing.T) {
 	// The dependent child carries the draft-ordinal marker.
 	if !strings.Contains(items[2].Body, "Depends on: #1") {
 		t.Errorf("child two body missing 'Depends on: #1' marker:\n%s", items[2].Body)
+	}
+}
+
+// TestFilingRequestForChild_SentinelParity is the builder-parity pin: the
+// exported FilingRequestForChild builder, called with the preview sentinel
+// epic/parent refs and nil dependsOnRefs, reproduces EXACTLY the FilingRequest
+// the pre-extraction RenderChild built (equivalentChildRequest) — so "what was
+// previewed is what files" holds by construction and the preview stays
+// byte-identical across the extraction.
+func TestFilingRequestForChild_SentinelParity(t *testing.T) {
+	child := ChildDraft{
+		Summary:            "dependent child",
+		Proposal:           "does a thing after others",
+		DoneMeans:          "thing done",
+		AcceptanceCriteria: []string{"ok"},
+		Labels:             []string{"area:backend", "autonomy:low"},
+		DependsOn:          []int{1, 3},
+	}
+	opts := RenderOptions{}
+	got := FilingRequestForChild(child, 2, opts.epicNumber(), opts.parentEpicRef(), nil)
+	want := equivalentChildRequest(child, 2, opts)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("FilingRequestForChild sentinel parity mismatch.\ngot:  %+v\nwant: %+v", got, want)
+	}
+}
+
+// TestFilingRequestForEpic_SentinelParity pins the epic builder: with the
+// preview sentinel existing-numbers seed it reproduces the epic FilingRequest
+// RenderEpic built pre-extraction (epic type, summary, folded scope, seeded
+// numbering).
+func TestFilingRequestForEpic_SentinelParity(t *testing.T) {
+	epic := EpicSpec{Summary: "stand up X", Scope: "X and wiring", OutOfScope: "the Y subsystem"}
+	got := FilingRequestForEpic(epic, sentinelEpicExistingNumbers)
+	want := workmgmt.FilingRequest{
+		Type:    "epic",
+		Summary: epic.Summary,
+		Sections: map[string]string{
+			"Summary": epic.Summary,
+			"Scope":   "X and wiring\n\n### Out of scope\n\nthe Y subsystem",
+		},
+		ExistingNumbers: sentinelEpicExistingNumbers,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("FilingRequestForEpic sentinel parity mismatch.\ngot:  %+v\nwant: %+v", got, want)
+	}
+}
+
+// TestFilingRequestForChild_RealValues shows the executor path: real epic
+// number, real `#N` parent ref, and real `#N` depends_on refs land on the
+// request so the github provider's ensureDependsOnMarker renders the marker.
+func TestFilingRequestForChild_RealValues(t *testing.T) {
+	child := ChildDraft{
+		Summary: "c", Proposal: "p", DoneMeans: "d",
+		AcceptanceCriteria: []string{"ok"}, Labels: []string{"area:backend"},
+		DependsOn: []int{1},
+	}
+	got := FilingRequestForChild(child, 3, "34", "#1601", []string{"#1607"})
+	if got.TitleVars["epic"] != "34" || got.TitleVars["n"] != "3" {
+		t.Errorf("title vars = %v, want epic=34 n=3", got.TitleVars)
+	}
+	if got.Relations.ParentEpic != "#1601" {
+		t.Errorf("parent epic = %q, want #1601", got.Relations.ParentEpic)
+	}
+	if len(got.Relations.DependsOn) != 1 || got.Relations.DependsOn[0] != "#1607" {
+		t.Errorf("depends_on = %v, want [#1607]", got.Relations.DependsOn)
 	}
 }
 

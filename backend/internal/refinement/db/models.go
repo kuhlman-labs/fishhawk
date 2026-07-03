@@ -109,6 +109,23 @@ type RefinementDraft struct {
 	Origin    string             `json:"origin"`
 }
 
+type RefinementFiledItem struct {
+	ID          uuid.UUID          `json:"id"`
+	DraftID     uuid.UUID          `json:"draft_id"`
+	Ordinal     int32              `json:"ordinal"`
+	IssueNumber int32              `json:"issue_number"`
+	IssueUrl    string             `json:"issue_url"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+type RefinementFilingSession struct {
+	DraftID     uuid.UUID          `json:"draft_id"`
+	SessionID   uuid.UUID          `json:"session_id"`
+	Repo        string             `json:"repo"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	CompletedAt pgtype.Timestamptz `json:"completed_at"`
+}
+
 type ReviewConcern struct {
 	ID                   uuid.UUID          `json:"id"`
 	RunID                uuid.UUID          `json:"run_id"`

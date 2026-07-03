@@ -526,16 +526,16 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if !strings.Contains(artifactsKindCheckDef, "deployment") {
 		t.Errorf("artifacts_kind_check after MigrateDown dropped 'deployment' (0037 still applied; only 0045 rolled back): %s", artifactsKindCheckDef)
 	}
-	// 0047 (#1593) is now the latest migration: it creates the
-	// refinement_decisions table and adds refinement_drafts.origin, touching no
-	// CHECK constraint outside those. So its one-step rollback drops that table +
-	// column (asserted below) and leaves every prior migration's effect intact —
+	// 0048 (#1594) is now the latest migration: it creates the
+	// refinement_filing_sessions + refinement_filed_items ledger tables,
+	// touching no CHECK constraint. So its one-step rollback drops those two
+	// tables (asserted below) and leaves every prior migration's effect intact —
 	// including 0045's (#1531) 'acceptance' artifact-kind widening, which
 	// SURVIVES the one-step down (it is no longer the migration rolled back).
 	if !strings.Contains(artifactsKindCheckDef, "acceptance") {
-		t.Errorf("artifacts_kind_check after MigrateDown dropped 'acceptance' (0045 still applied; only 0047 rolled back): %s", artifactsKindCheckDef)
+		t.Errorf("artifacts_kind_check after MigrateDown dropped 'acceptance' (0045 still applied; only 0048 rolled back): %s", artifactsKindCheckDef)
 	}
-	// 0046 (#1592) is now a PRIOR migration (only 0047 rolled back), so its
+	// 0046 (#1592) is now a PRIOR migration (only 0048 rolled back), so its
 	// refinement_drafts table SURVIVES the one-step down.
 	var refinementDraftsTable int
 	if err := pool.QueryRow(context.Background(),
@@ -544,19 +544,19 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query refinement_drafts table: %v", err)
 	}
 	if refinementDraftsTable != 1 {
-		t.Errorf("'refinement_drafts' table count after MigrateDown = %d, want 1 (0046 still applied; only 0047 rolled back)", refinementDraftsTable)
+		t.Errorf("'refinement_drafts' table count after MigrateDown = %d, want 1 (0046 still applied; only 0048 rolled back)", refinementDraftsTable)
 	}
-	// 0047 (#1593) IS the migration just rolled back, so its table —
-	// refinement_decisions — must be GONE, and the refinement_drafts.origin
-	// column it added must be GONE, after the one-step down.
+	// 0047 (#1593) is now a PRIOR migration (only 0048 rolled back), so its
+	// refinement_decisions table and the refinement_drafts.origin column it added
+	// both SURVIVE the one-step down.
 	var refinementDecisionsTable int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'refinement_decisions'`,
 	).Scan(&refinementDecisionsTable); err != nil {
 		t.Fatalf("query refinement_decisions table: %v", err)
 	}
-	if refinementDecisionsTable != 0 {
-		t.Errorf("'refinement_decisions' table count after MigrateDown = %d, want 0 (0047 should have rolled it back)", refinementDecisionsTable)
+	if refinementDecisionsTable != 1 {
+		t.Errorf("'refinement_decisions' table count after MigrateDown = %d, want 1 (0047 still applied; only 0048 rolled back)", refinementDecisionsTable)
 	}
 	var refinementDraftsOriginCol int
 	if err := pool.QueryRow(context.Background(),
@@ -565,8 +565,29 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&refinementDraftsOriginCol); err != nil {
 		t.Fatalf("query refinement_drafts.origin column: %v", err)
 	}
-	if refinementDraftsOriginCol != 0 {
-		t.Errorf("refinement_drafts.origin count after MigrateDown = %d, want 0 (0047 should have rolled it back)", refinementDraftsOriginCol)
+	if refinementDraftsOriginCol != 1 {
+		t.Errorf("refinement_drafts.origin count after MigrateDown = %d, want 1 (0047 still applied; only 0048 rolled back)", refinementDraftsOriginCol)
+	}
+	// 0048 (#1594) IS the migration just rolled back, so its two ledger tables —
+	// refinement_filing_sessions and refinement_filed_items — must both be GONE
+	// after the one-step down.
+	var refinementFilingSessionsTable int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'refinement_filing_sessions'`,
+	).Scan(&refinementFilingSessionsTable); err != nil {
+		t.Fatalf("query refinement_filing_sessions table: %v", err)
+	}
+	if refinementFilingSessionsTable != 0 {
+		t.Errorf("'refinement_filing_sessions' table count after MigrateDown = %d, want 0 (0048 should have rolled it back)", refinementFilingSessionsTable)
+	}
+	var refinementFiledItemsTable int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'refinement_filed_items'`,
+	).Scan(&refinementFiledItemsTable); err != nil {
+		t.Fatalf("query refinement_filed_items table: %v", err)
+	}
+	if refinementFiledItemsTable != 0 {
+		t.Errorf("'refinement_filed_items' table count after MigrateDown = %d, want 0 (0048 should have rolled it back)", refinementFiledItemsTable)
 	}
 	// 0044 (#1519) is now a PRIOR migration (only 0045 rolled back), so its
 	// widening — the 'acceptance' stage type — must STILL be present in
@@ -974,13 +995,17 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	}
 	pool.Close()
 
-	// Step down past 0047 (drop refinement_decisions + refinement_drafts.origin —
+	// Step down past 0048 (drop the refinement filing ledger — inert re:
+	// campaigns) then 0047 (drop refinement_decisions + refinement_drafts.origin —
 	// inert re: campaigns) then 0046 (drop refinement_drafts — inert re:
 	// campaigns) then 0045 (narrow artifacts_kind_check — inert re: campaigns)
 	// then 0044 (narrow stages_type_check — inert re: campaigns) then 0043 (drop
 	// upstream_run_id — inert) then 0042 (drop idempotency_key — inert) then 0041
 	// (drop operator_agent — inert), all leaving the paused rows untouched, to
 	// reach 0040, the normalizing rollback under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0048) failed: %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0047) failed: %v", err)
 	}

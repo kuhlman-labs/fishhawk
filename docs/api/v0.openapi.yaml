@@ -5564,6 +5564,101 @@ paths:
         '500': { description: "`audit_append_failed` — the decision's audit entry could not be durably recorded; nothing was persisted." }
         '503': { description: "`refinement_repo_unconfigured`." }
 
+  /v0/refinement/sessions/{session_id}/file:
+    post:
+      operationId: fileRefinementSession
+      summary: File an approved refinement draft into tracker items
+      description: |
+        The E34.3 filing executor (ADR-052 filing half): turns the session's
+        approved, hash-pinned draft into real tracker items over the same
+        conventions/provider pipeline hand-filed items use — the epic first,
+        then the children in dependency (wave) order. Parent links, sub-issue
+        attachment, and `Depends on: #N` markers come from the provider's filing;
+        sibling `depends_on` ordinals resolve to filed `#numbers` as filing
+        proceeds. After all items file, the executor asserts the filed epic
+        round-trips through the provider's epic-children query + campaign
+        assembly (no dangling, no cycle) — reported as `verified`.
+
+        The draft must be approved (`409 refinement_not_approved` otherwise) and
+        un-drifted (`409 refinement_draft_drifted` — its content no longer
+        matches the approval hash).
+
+        **Idempotent.** A per-draft filing session pins the target `repo` at
+        first invoke (a re-invoke naming a different repo is
+        `409 refinement_filing_repo_mismatch`) and one durable row per filed item
+        is recorded IMMEDIATELY after each provider create. A mid-sequence
+        provider failure is `502 refinement_filing_failed` with the filed-so-far
+        items and the failing ordinal in `details`; re-invoking resumes at the
+        first unfiled ordinal and never re-files a recorded one. A fully
+        completed session replays the recorded result as `200` with
+        `already_completed=true` and files/audits nothing.
+
+        Concurrent invocations for the same draft are serialized by a per-draft
+        advisory lock, so two callers cannot both file — the second observes the
+        first's recorded progress. The residual at-least-once seam (a crash
+        between the external create and the durable record) can re-file exactly
+        one item on resume; GitHub's issue-create API offers no idempotency key
+        to close it, and the unique `(draft_id, ordinal)` constraint prevents
+        double-recording.
+
+        The `refinement_filing_completed` audit entry is written on the global
+        chain BEFORE the filing session's `completed_at` is set
+        (durable-before-state-change): an audit-append failure is a `500` with
+        the session left open so a re-invoke retries the close.
+
+        Requires `write:approvals` scope (no new scope — the E34.2 precedent).
+      tags: [refinement]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [repo]
+              properties:
+                repo: { type: string, description: "Target repository in `owner/name` form." }
+      responses:
+        '200':
+          description: The filing result (fresh, resumed, or an already-completed replay).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session_id: { type: string, format: uuid }
+                  draft_id: { type: string, format: uuid }
+                  repo: { type: string }
+                  epic:
+                    type: object
+                    properties:
+                      number: { type: integer }
+                      url: { type: string }
+                  children:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        ordinal: { type: integer, description: "1-based draft child ordinal." }
+                        number: { type: integer }
+                        url: { type: string }
+                  resumed: { type: boolean, description: "True when this invocation resumed a partially-filed session." }
+                  already_completed: { type: boolean, description: "True when replaying a fully-completed session (no writes performed)." }
+                  verified: { type: boolean, description: "True when the filed epic passed the epic-children + campaign-assembly round-trip. False when the provider lacks the read-back capability (fail-open) or on a replay." }
+        '400': { description: "`validation_failed` — malformed JSON, unknown fields, non-UUID `session_id`, or `repo` not in `owner/name` form." }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: "`insufficient_scope` — token lacks `write:approvals`." }
+        '404': { description: "`refinement_session_not_found`." }
+        '409': { description: "`refinement_not_approved` / `refinement_draft_drifted` / `refinement_filing_repo_mismatch`." }
+        '500': { description: "`internal_error` — e.g. `audit_append_failed`: the completion audit could not be recorded; items are durable but the session stays open for a retry." }
+        '502': { description: "`refinement_filing_failed` (a provider create failed mid-sequence; resumable) or `refinement_filing_verification_failed` (the filed epic did not round-trip; items are durable, re-invoke re-verifies)." }
+        '503': { description: "`refinement_repo_unconfigured`." }
+
   /v0/calibration:
     get:
       operationId: getCalibration
