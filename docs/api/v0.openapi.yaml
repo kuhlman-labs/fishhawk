@@ -4546,10 +4546,13 @@ paths:
         the runs join, and `from`/`to` on run `created_at`). Combining
         `run_id` with `repo`/`from`/`to` is a `400`.
 
-        Authorization scope enforcement (`read:audit-export`) and
-        raw-pointer redaction are deferred to a sibling change per the
-        ADR-054 rollout; this endpoint ships under the existing
-        read-endpoint identity posture.
+        Requires the `read:audit-export` scope (E9.5/#1608, ADR-054):
+        anonymous callers are `401`, tokens without the scope `403`
+        (`insufficient_scope`, `details.required_scope` named);
+        cookie-session operators bypass scope checks per the standard
+        contract. The export carries entry payloads and content-hash
+        POINTERS only — trace bundle bytes are never inlined; the
+        raw-variant bundle stays behind the existing compliance gate.
       tags: [audit]
       parameters:
         - name: run_id
@@ -4587,6 +4590,7 @@ paths:
             `from` after `to`, or `run_id` combined with `repo`/`from`/`to`;
             `cursor_invalid` — opaque cursor failed to decode.
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404':
           description: "`run_not_found` — an explicitly requested run does not exist (fail-closed)."
         '503':
@@ -4632,10 +4636,10 @@ paths:
         `X-Fishhawk-Export-Complete` is `false` — cursor semantics are
         run-level and unchanged.
 
-        Authorization scope enforcement (`read:audit-export`) and
-        raw-pointer redaction are deferred to a sibling change per the
-        ADR-054 rollout, exactly as the JSON endpoint states; this
-        endpoint ships under the existing read-endpoint identity posture.
+        Requires the `read:audit-export` scope (E9.5/#1608), exactly as
+        the JSON endpoint: anonymous `401`, token without the scope
+        `403`, cookie-session bypass. Pointer-only — bundle bytes are
+        never inlined.
       tags: [audit]
       parameters:
         - name: run_id
@@ -4679,6 +4683,7 @@ paths:
             `from` after `to`, or `run_id` combined with `repo`/`from`/`to`;
             `cursor_invalid` — opaque cursor failed to decode.
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404':
           description: "`run_not_found` — an explicitly requested run does not exist (fail-closed)."
         '500':
@@ -4729,9 +4734,10 @@ paths:
         posture). These continuation fields are report-only; they do not
         appear on `GET /v0/audit/export`.
 
-        Authorization scope enforcement (`read:audit-export`) is deferred
-        to a sibling change (E9.5/#1608) per the ADR-054 rollout, exactly
-        as the export endpoints state.
+        Requires the `read:audit-export` scope (E9.5/#1608), exactly as
+        the export endpoints: anonymous `401`, token without the scope
+        `403`, cookie-session bypass. Evidence links stay redacted-tier
+        pointers; bundle bytes are never inlined.
       tags: [audit]
       parameters:
         - name: run_id
@@ -4765,6 +4771,7 @@ paths:
             `from` after `to`, or `run_id` combined with `repo`/`from`/`to`;
             `cursor_invalid` — opaque cursor failed to decode.
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404':
           description: "`run_not_found` — an explicitly requested run does not exist (fail-closed)."
         '503':
@@ -4819,6 +4826,7 @@ paths:
             `from` after `to`, or `run_id` combined with `repo`/`from`/`to`;
             `cursor_invalid` — opaque cursor failed to decode.
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404':
           description: "`run_not_found` — an explicitly requested run does not exist (fail-closed)."
         '503':

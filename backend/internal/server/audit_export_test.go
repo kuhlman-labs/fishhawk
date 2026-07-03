@@ -249,10 +249,21 @@ func seedExportRun(fr *fakeRepo, repo string, createdAt time.Time) uuid.UUID {
 	return seedRun(fr, repo, "", run.StatePending, createdAt).ID
 }
 
+// exportTestIdentity is the scoped operator identity the export test
+// helpers inject: read:audit-export is enforced ahead of everything else
+// (E9.5/#1608), so every behavioral test authenticates through it. The
+// auth matrix itself (401/403/cookie-bypass, full middleware chain) is
+// covered separately in audit_export_auth_test.go.
+func exportTestIdentity() Identity {
+	return Identity{Subject: "github:op", TokenID: "tok_export_test",
+		Scopes: []string{"read:audit-export"}}
+}
+
 func doExport(s *Server, query string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v0/audit/export"+query, nil)
-	s.Handler().ServeHTTP(rec, req)
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, exportTestIdentity()))
+	s.handleAuditExport(rec, req)
 	return rec
 }
 
@@ -370,16 +381,20 @@ func TestAuditExport_Unconfigured(t *testing.T) {
 	}
 }
 
-// (12) route-registered guard: all-nil Config reaches handleAuditExport
-// (503), proving the mux wiring. An UNregistered route would 404.
+// (12) route-registered guard: an anonymous request through the FULL
+// middleware chain reaches handleAuditExport's auth gate (401
+// authentication_required, E9.5/#1608), proving the mux wiring. An
+// UNregistered route would 404.
 func TestAuditExportRouteRegistered(t *testing.T) {
 	s := New(Config{})
-	rec := doExport(s, "")
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503 (route reaches handler)", rec.Code)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/audit/export", nil)
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (route reaches the handler's auth gate)", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "audit_export_unconfigured") {
-		t.Errorf("body = %s, want audit_export_unconfigured", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "authentication_required") {
+		t.Errorf("body = %s, want authentication_required", rec.Body.String())
 	}
 }
 

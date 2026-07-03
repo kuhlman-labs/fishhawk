@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -83,7 +84,10 @@ func chainCSVEntries(t *testing.T, runID *uuid.UUID, specs ...csvSeedEntry) []*a
 func doExportCSV(s *Server, query string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v0/audit/export.csv"+query, nil)
-	s.Handler().ServeHTTP(rec, req)
+	// Inject the read:audit-export identity (E9.5/#1608) and call the
+	// handler directly; the auth matrix lives in audit_export_auth_test.go.
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, exportTestIdentity()))
+	s.handleAuditExportCSV(rec, req)
 	return rec
 }
 
@@ -737,12 +741,14 @@ func TestAuditExportCSV_Headers(t *testing.T) {
 
 func TestAuditExportCSVRouteRegistered(t *testing.T) {
 	s := New(Config{})
-	rec := doExportCSV(s, "")
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503 (route reaches handler)", rec.Code)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/audit/export.csv", nil)
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (route reaches the handler's auth gate)", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "audit_export_unconfigured") {
-		t.Errorf("body = %s, want audit_export_unconfigured", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "authentication_required") {
+		t.Errorf("body = %s, want authentication_required", rec.Body.String())
 	}
 }
 

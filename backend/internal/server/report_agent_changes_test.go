@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -95,17 +96,23 @@ func seedReportRun(fr *fakeRepo, repo, workflowID, triggerRef string, createdAt 
 	return r
 }
 
+// Both helpers inject the read:audit-export identity (E9.5/#1608) and
+// call the handler directly; the auth matrix (401/403/cookie-bypass,
+// full middleware chain) lives in audit_export_auth_test.go.
+
 func doReport(s *Server, query string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v0/reports/agent-changes"+query, nil)
-	s.Handler().ServeHTTP(rec, req)
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, exportTestIdentity()))
+	s.handleAgentChangesReport(rec, req)
 	return rec
 }
 
 func doReportMarkdown(s *Server, query string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v0/reports/agent-changes.md"+query, nil)
-	s.Handler().ServeHTTP(rec, req)
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, exportTestIdentity()))
+	s.handleAgentChangesReportMarkdown(rec, req)
 	return rec
 }
 
@@ -672,12 +679,15 @@ func TestAgentChangesReport_JSONMarkdownParity(t *testing.T) {
 
 func TestAgentChangesReport_RoutesRegistered(t *testing.T) {
 	s := New(Config{})
-	for _, rec := range []*httptest.ResponseRecorder{doReport(s, ""), doReportMarkdown(s, "")} {
-		if rec.Code != http.StatusServiceUnavailable {
-			t.Fatalf("status = %d, want 503 (route reaches handler)", rec.Code)
+	for _, path := range []string{"/v0/reports/agent-changes", "/v0/reports/agent-changes.md"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s: status = %d, want 401 (route reaches the handler's auth gate)", path, rec.Code)
 		}
-		if !strings.Contains(rec.Body.String(), "audit_export_unconfigured") {
-			t.Errorf("body = %s, want audit_export_unconfigured", rec.Body.String())
+		if !strings.Contains(rec.Body.String(), "authentication_required") {
+			t.Errorf("%s: body = %s, want authentication_required", path, rec.Body.String())
 		}
 	}
 }

@@ -24,9 +24,10 @@ package server
 // /v0/audit/export (documented in audit_export.go); it never parses this
 // report, so the extra body fields are safe here.
 //
-// Auth-scope enforcement (read:audit-export) is deliberately NOT added here —
-// E9.5/#1608 owns it for all export surfaces. This endpoint inherits the same
-// fail-closed 503 posture as both export handlers (all three repos required).
+// Auth: both handlers enforce the read:audit-export scope (E9.5/#1608, the
+// gate shared by all export surfaces — see scopeAuditExport in
+// audit_export.go). This endpoint inherits the same fail-closed 503 posture
+// as both export handlers (all three repos required).
 
 import (
 	"context"
@@ -211,6 +212,11 @@ type acceptanceOutcomePayload struct {
 
 // handleAgentChangesReport implements GET /v0/reports/agent-changes (JSON).
 func (s *Server) handleAgentChangesReport(w http.ResponseWriter, r *http.Request) {
+	// read:audit-export gate (E9.5 / #1608): the report is rendered from
+	// the same evidence the exports carry. Auth before the config probe.
+	if !s.requireWriteScope(w, r, scopeAuditExport) {
+		return
+	}
 	// Fail closed: a compliance report must not silently omit its inputs
 	// (identical posture to both export handlers).
 	if s.cfg.AuditRepo == nil || s.cfg.RunRepo == nil || s.cfg.SigningRepo == nil {
@@ -244,6 +250,9 @@ func (s *Server) handleAgentChangesReport(w http.ResponseWriter, r *http.Request
 // human-readable markdown with a download filename stamped from nowFunc (the
 // CSV precedent).
 func (s *Server) handleAgentChangesReportMarkdown(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWriteScope(w, r, scopeAuditExport) {
+		return
+	}
 	if s.cfg.AuditRepo == nil || s.cfg.RunRepo == nil || s.cfg.SigningRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "audit_export_unconfigured",
 			"agent-changes report requires configured audit, run, and signing repositories", nil)

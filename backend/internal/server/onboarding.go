@@ -15,9 +15,10 @@ import (
 // that a caller's token must carry to drive a repo's first run end to end:
 // read the run + its audit chain, and write the run/approval/stage
 // transitions the plan → implement → review loop performs. It deliberately
-// EXCLUDES write:campaigns and write:deploy — those gate the campaign
-// primitive and the deploy stage, neither of which is exercised on a repo's
-// first feature_change run, so requiring them here would over-report a scope
+// EXCLUDES write:campaigns, write:deploy, and read:audit-export — those gate
+// the campaign primitive, the deploy stage, and the bulk compliance-export
+// surfaces (E9.5/#1608), none of which is exercised on a repo's first
+// feature_change run, so requiring them here would over-report a scope
 // gap for exactly the onboarding caller this endpoint serves. Keep this in
 // lockstep with operatorDefaultScopes if the run-drive contract changes.
 var requiredRunScopes = []string{

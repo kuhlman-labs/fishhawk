@@ -40,6 +40,19 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
 
+// scopeAuditExport gates every bulk-export surface: this endpoint, the
+// CSV projection, and the canned agent-changes report (E9.5 / #1608,
+// ADR-054). Bulk evidence export is the exfiltration-shaped operation —
+// a different risk class than the per-run reads the UI performs — so a
+// dedicated scope keeps export-capable tokens enumerable and revocable
+// independently. Cookie-session operators (GitHub OAuth, no scope list)
+// bypass per requireWriteScope's established contract; anonymous
+// callers are 401, tokens without the scope 403. The scope is in
+// operatorDefaultScopes (backend/cmd/fishhawkd/token.go), so new
+// operator tokens carry it and `token migrate --apply` promotes
+// existing subset tokens.
+const scopeAuditExport = "read:audit-export"
+
 // exportSchemaV1 is the schema string the verifier's ExportSchemaV1
 // recognizes. Duplicated as a literal (not imported) because the
 // verifier package is internal to the verifier module; drift is caught
@@ -232,6 +245,11 @@ func (s *Server) resolveExportPage(w http.ResponseWriter, r *http.Request) (*exp
 
 // handleAuditExport implements GET /v0/audit/export.
 func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
+	// Authorization before anything else: an unauthenticated caller
+	// learns nothing, not even whether export is configured.
+	if !s.requireWriteScope(w, r, scopeAuditExport) {
+		return
+	}
 	// Fail closed: a compliance artifact must not silently omit its
 	// inputs. All three repositories are required.
 	if s.cfg.AuditRepo == nil || s.cfg.RunRepo == nil || s.cfg.SigningRepo == nil {
