@@ -124,16 +124,29 @@ type exportCursor struct {
 	ID        uuid.UUID `json:"id"`
 }
 
-// handleAuditExport implements GET /v0/audit/export.
-func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
-	// Fail closed: a compliance artifact must not silently omit its
-	// inputs. All three repositories are required.
-	if s.cfg.AuditRepo == nil || s.cfg.RunRepo == nil || s.cfg.SigningRepo == nil {
-		s.writeError(w, r, http.StatusServiceUnavailable, "audit_export_unconfigured",
-			"audit export requires configured audit, run, and signing repositories", nil)
-		return
-	}
+// exportPage is the resolved run-selection page shared by the JSON and
+// CSV export handlers. It is the single run-selection code path: query
+// parsing, run_id XOR repo/date mutual exclusion, limit/cursor
+// validation, created_at DESC keyset paging. Both handlers project the
+// SAME page — the CSV endpoint is a projection over this shared layer,
+// never a parallel query path.
+type exportPage struct {
+	page          []*run.Run
+	includeGlobal bool
+	firstPage     bool // this is the first page (empty cursor)
+	complete      bool
+	nextCursor    string
+}
 
+// resolveExportPage performs the shared run-selection and keyset paging
+// for both export handlers. It parses the query, enforces the ADR-054
+// run_id/repo-date mutual exclusion, validates limit and cursor,
+// materializes the selected run set, sorts it created_at DESC / id DESC,
+// and returns the bounded page. On any validation or selection error it
+// writes the error response itself and returns ok=false, so the caller
+// must return immediately without writing anything more. The nil-repo
+// fail-closed 503 check stays in each handler (before this call).
+func (s *Server) resolveExportPage(w http.ResponseWriter, r *http.Request) (*exportPage, bool) {
 	q := r.URL.Query()
 	rawRunIDs := q["run_id"]
 	explicitMode := len(rawRunIDs) > 0
@@ -147,14 +160,14 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"run_id cannot be combined with repo, from, or to",
 			map[string]any{"field": "run_id"})
-		return
+		return nil, false
 	}
 
 	limit, err := parseLimit(q.Get("limit"), exportDefaultRunLimit, exportMaxRunLimit)
 	if err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			err.Error(), map[string]any{"field": "limit"})
-		return
+		return nil, false
 	}
 
 	includeGlobal := q.Get("include_global") != "false"
@@ -162,7 +175,7 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 	cursor, err := decodeExportCursor(q.Get("cursor"))
 	if err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "cursor_invalid", err.Error(), nil)
-		return
+		return nil, false
 	}
 
 	var selected []*run.Run
@@ -170,12 +183,12 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 		selected, err = s.selectExplicitRuns(r.Context(), w, r, rawRunIDs)
 		if err != nil {
 			// selectExplicitRuns already wrote the error response.
-			return
+			return nil, false
 		}
 	} else {
 		selected, err = s.selectFilteredRuns(r.Context(), w, r, repo, rawFrom, rawTo)
 		if err != nil {
-			return
+			return nil, false
 		}
 	}
 
@@ -208,12 +221,37 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 		nextCursor = encodeExportCursor(exportCursor{CreatedAt: last.CreatedAt, ID: last.ID})
 	}
 
+	return &exportPage{
+		page:          page,
+		includeGlobal: includeGlobal,
+		firstPage:     cursor == nil,
+		complete:      complete,
+		nextCursor:    nextCursor,
+	}, true
+}
+
+// handleAuditExport implements GET /v0/audit/export.
+func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
+	// Fail closed: a compliance artifact must not silently omit its
+	// inputs. All three repositories are required.
+	if s.cfg.AuditRepo == nil || s.cfg.RunRepo == nil || s.cfg.SigningRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "audit_export_unconfigured",
+			"audit export requires configured audit, run, and signing repositories", nil)
+		return
+	}
+
+	ep, ok := s.resolveExportPage(w, r)
+	if !ok {
+		// resolveExportPage already wrote the error response.
+		return
+	}
+
 	resp := exportResponse{
 		Schema:     exportSchemaV1,
 		ExportedAt: s.nowFunc().UTC(),
-		Runs:       make(map[string]exportRunData, len(page)+1),
+		Runs:       make(map[string]exportRunData, len(ep.page)+1),
 	}
-	for _, rn := range page {
+	for _, rn := range ep.page {
 		rd, aerr := s.assembleRunData(r.Context(), rn.ID)
 		if aerr != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -229,7 +267,7 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 	// silently dropped (ADR-054 consequence). Absent on continuation
 	// pages (whole-chain bounding: it can't be split) and when
 	// include_global=false.
-	if includeGlobal && cursor == nil {
+	if ep.includeGlobal && ep.firstPage {
 		globalEntries, gerr := s.cfg.AuditRepo.ListGlobal(r.Context())
 		if gerr != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -241,9 +279,9 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 
 	// Continuation rides headers because ParseExport's
 	// DisallowUnknownFields forbids any extra body field.
-	w.Header().Set("X-Fishhawk-Export-Complete", strconv.FormatBool(complete))
-	if !complete {
-		w.Header().Set("X-Fishhawk-Export-Next-Cursor", nextCursor)
+	w.Header().Set("X-Fishhawk-Export-Complete", strconv.FormatBool(ep.complete))
+	if !ep.complete {
+		w.Header().Set("X-Fishhawk-Export-Next-Cursor", ep.nextCursor)
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
