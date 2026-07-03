@@ -4451,6 +4451,100 @@ paths:
         '503':
           description: "`audit_export_unconfigured` — the audit, run, or signing repository is not configured on this instance."
 
+  /v0/audit/export.csv:
+    get:
+      operationId: exportAuditCSV
+      summary: Flat CSV rendering of the compliance export for spreadsheet workflows
+      description: |
+        A flat CSV PROJECTION of `GET /v0/audit/export` (E9.1 / #1604)
+        for spreadsheet-driven compliance teams. It is a projection over
+        the SAME run-selection and per-run assembly layer the JSON export
+        uses — never a parallel query path — so the CSV rows are a
+        field-for-field projection of the JSON `Export v1` body for the
+        same run-level filter set (pinned by a parity test).
+
+        **Columns.** One audit entry per row:
+        `ts,run_id,repo,category,actor_kind,actor_subject,sequence,entry_hash,payload_summary`.
+        `ts` is RFC3339 UTC; nil `actor_kind`/`actor_subject` and the
+        global partition's `run_id`/`repo` render as empty cells;
+        `sequence` is a base-10 integer; `payload_summary` is the
+        compacted payload JSON bounded at 256 runes (rune-boundary safe)
+        with a `...(truncated)` suffix when cut. Full payloads remain
+        JSON-export-only.
+
+        **Entry-level filters (CSV-only).** `approver` keeps only
+        `approval_submitted` entries whose `actor_subject` equals the
+        value; `category` keeps only entries of that exact category. The
+        two filters compose (ANDed) with each other and with the
+        inherited run-level filters. Entry-level filtering is CSV-only by
+        design: dropping entries from the JSON `Export v1` body would
+        break the verifier's hash-chain walk (each entry's `prev_hash`
+        binds its predecessor), so `approver`/`category` are not offered
+        on `GET /v0/audit/export`.
+
+        **Bounding & continuation.** Identical to the JSON export: the
+        `limit` bounds the number of RUNS per page (whole-run bounded,
+        not rows), and partiality/continuation ride the same
+        `X-Fishhawk-Export-Complete` / `X-Fishhawk-Export-Next-Cursor`
+        response headers. Because bounding is whole-run, an
+        entry-filtered page may legitimately contain zero data rows while
+        `X-Fishhawk-Export-Complete` is `false` — cursor semantics are
+        run-level and unchanged.
+
+        Authorization scope enforcement (`read:audit-export`) and
+        raw-pointer redaction are deferred to a sibling change per the
+        ADR-054 rollout, exactly as the JSON endpoint states; this
+        endpoint ships under the existing read-endpoint identity posture.
+      tags: [audit]
+      parameters:
+        - name: run_id
+          in: query
+          description: |
+            Explicit run to export. Repeatable. Mutually exclusive with
+            `repo`/`from`/`to`. A requested run that does not exist is a
+            `404 run_not_found`.
+          schema: { $ref: '#/components/schemas/UUID' }
+        - { name: repo, in: query, description: "Filter by repository (owner/name), resolved through the runs join.", schema: { type: string } }
+        - { name: from, in: query, description: "Lower bound (inclusive) on run created_at, RFC3339.", schema: { type: string, format: date-time } }
+        - { name: to, in: query, description: "Upper bound (inclusive) on run created_at, RFC3339.", schema: { type: string, format: date-time } }
+        - { name: include_global, in: query, description: "Include the global-chain partition rows (empty run_id/repo cells) on the first page. Default true; set false to omit.", schema: { type: boolean, default: true } }
+        - { name: limit, in: query, description: "Maximum RUNS per page (whole-run bounded, not rows).", schema: { type: integer, default: 50, maximum: 200 } }
+        - { name: cursor, in: query, description: "Opaque keyset continuation cursor from a prior page's X-Fishhawk-Export-Next-Cursor header.", schema: { type: string } }
+        - { name: approver, in: query, description: "CSV-only entry filter: keep only approval_submitted entries whose actor_subject equals this value. ANDed with category and the run-level filters.", schema: { type: string } }
+        - { name: category, in: query, description: "CSV-only entry filter: keep only entries of this exact category. ANDed with approver and the run-level filters.", schema: { type: string } }
+      responses:
+        '200':
+          description: |
+            One page of the compliance export as CSV. Rows are a
+            field-for-field projection of the JSON `Export v1` body for
+            the same run-level filter set. Served as an attachment
+            download.
+          headers:
+            Content-Disposition:
+              description: "`attachment; filename=\"fishhawk-audit-export-<UTC timestamp>.csv\"` — download semantics."
+              schema: { type: string }
+            X-Fishhawk-Export-Complete:
+              description: "`true` when this is the final page; `false` when more runs remain."
+              schema: { type: boolean }
+            X-Fishhawk-Export-Next-Cursor:
+              description: Opaque keyset cursor for the next page. Present only when the export is partial.
+              schema: { type: string }
+          content:
+            text/csv:
+              schema: { type: string }
+        '400':
+          description: |
+            `validation_failed` — malformed `run_id`/`from`/`to`/`limit`,
+            `from` after `to`, or `run_id` combined with `repo`/`from`/`to`;
+            `cursor_invalid` — opaque cursor failed to decode.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: "`run_not_found` — an explicitly requested run does not exist (fail-closed)."
+        '500':
+          description: "`internal_error` — run assembly failed; no partial CSV is emitted (the whole page is buffered before any bytes are written)."
+        '503':
+          description: "`audit_export_unconfigured` — the audit, run, or signing repository is not configured on this instance."
+
   # ---------------------------------------------------------------------
   # Campaigns (ADR-047 / #1437)
   # ---------------------------------------------------------------------

@@ -37,6 +37,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/runs/{run_id}/status-comment", s.handlePostStatusComment)
 	mux.HandleFunc("GET /v0/audit", s.handleListGlobalAudit)
 	mux.HandleFunc("GET /v0/audit/export", s.handleAuditExport)
+	mux.HandleFunc("GET /v0/audit/export.csv", s.handleAuditExportCSV)
 	mux.HandleFunc("GET /v0/campaigns", s.handleListCampaigns)
 	mux.HandleFunc("POST /v0/campaigns", s.handleCreateCampaign)
 	mux.HandleFunc("GET /v0/campaigns/{campaign_id}", s.handleGetCampaign)
