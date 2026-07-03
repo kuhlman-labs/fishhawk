@@ -787,6 +787,42 @@ func TestGetIssue_HappyPath(t *testing.T) {
 	}
 }
 
+// TestGetIssue_DecodesLabels is the #1616 label-decode pin: GitHub's REST
+// issue payload carries `labels` as an array whose entries are label objects
+// ({name,color,…}) or plain strings; GetIssue must decode BOTH forms into the
+// bare names (the area-derivation path reads issue.Labels). The fixture mixes
+// two object-form entries with one string-form entry.
+func TestGetIssue_DecodesLabels(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getIssueBody = `{"number":42,"title":"[E22] epic","state":"open",` +
+		`"labels":[{"name":"epic","color":"ededed"},{"name":"area:backend"},"autonomy:low"]}`
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.GetIssue(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 42)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if want := []string{"epic", "area:backend", "autonomy:low"}; strings.Join(got.Labels, ",") != strings.Join(want, ",") {
+		t.Errorf("labels = %v, want %v (object + string forms)", got.Labels, want)
+	}
+}
+
+// TestGetIssue_NoLabels pins the labelless issue to a nil Labels slice — the
+// area-derivation path treats it as "no area to derive".
+func TestGetIssue_NoLabels(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getIssueBody = `{"number":42,"title":"Add foo","state":"open"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.GetIssue(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 42)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if got.Labels != nil {
+		t.Errorf("labels = %v, want nil for a labelless issue", got.Labels)
+	}
+}
+
 func TestGetIssue_NotFound(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	fg.getIssueStatus = http.StatusNotFound

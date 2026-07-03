@@ -32,9 +32,14 @@ func TestApply_FeatureRendersTitleLabelsAndStatus(t *testing.T) {
 	if want := "[E22.7] do the thing"; item.Title != want {
 		t.Errorf("title = %q, want %q", item.Title, want)
 	}
-	// default_labels first, then caller labels.
-	if got := strings.Join(item.Classification.Labels, ","); got != "type:feature,area:server" {
+	// default_labels first, then caller labels, then the autonomy:medium
+	// namespace default the completeness pass appends (no autonomy label was
+	// supplied); area was supplied so no area default fires (#1616).
+	if got := strings.Join(item.Classification.Labels, ","); got != "type:feature,area:server,autonomy:medium" {
 		t.Errorf("labels = %q", got)
+	}
+	if got := strings.Join(item.Classification.DefaultedLabels, ","); got != "autonomy:medium" {
+		t.Errorf("defaulted labels = %q, want autonomy:medium", got)
 	}
 	if item.Classification.Complexity != "medium" {
 		t.Errorf("complexity = %q, want medium (type default)", item.Classification.Complexity)
@@ -699,4 +704,167 @@ func TestMergeLabels_DedupsPreservingOrder(t *testing.T) {
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("mergeLabels = %v, want %v", got, want)
 	}
+}
+
+// TestApply_AutonomyDefaultApplied is the done-means core (#1616,
+// verification 1): a feature/bug/chore filing with NO autonomy label yields a
+// merged label set containing autonomy:medium AND DefaultedLabels ==
+// [autonomy:medium]. Table-driven over the three types using the SHIPPED
+// Default() conventions, so the YAML label_defaults value itself is asserted.
+func TestApply_AutonomyDefaultApplied(t *testing.T) {
+	conv := Default()
+	for _, typ := range []string{"feature", "bug", "chore"} {
+		t.Run(typ, func(t *testing.T) {
+			// Supply an area label so the filing is otherwise complete; only the
+			// autonomy namespace is left to the default.
+			item, _, err := Apply(FilingRequest{
+				Type:      typ,
+				Summary:   "x",
+				Body:      "## Summary\n\nx\n",
+				TitleVars: map[string]string{"epic": "1", "n": "1"},
+				Labels:    []string{"area:backend"},
+				Relations: Relations{ParentEpic: "#1"},
+			}, conv)
+			if err != nil {
+				t.Fatalf("Apply(%s): %v", typ, err)
+			}
+			if !hasLabelInNamespace(item.Classification.Labels, "autonomy") {
+				t.Errorf("%s labels %v missing an autonomy label", typ, item.Classification.Labels)
+			}
+			if got := strings.Join(item.Classification.DefaultedLabels, ","); got != "autonomy:medium" {
+				t.Errorf("%s DefaultedLabels = %q, want autonomy:medium", typ, got)
+			}
+			if len(item.Classification.MissingLabelNamespaces) != 0 {
+				t.Errorf("%s MissingLabelNamespaces = %v, want none", typ, item.Classification.MissingLabelNamespaces)
+			}
+		})
+	}
+}
+
+// TestApply_AutonomyPassthroughSuppressesDefault is the passthrough pin
+// (#1616, verification 2): a filing supplying autonomy:high keeps exactly
+// autonomy:high, adds no autonomy:medium, and reports nothing defaulted for the
+// autonomy namespace. Suppression is by namespace prefix, not exact string.
+func TestApply_AutonomyPassthroughSuppressesDefault(t *testing.T) {
+	conv := Default()
+	item, _, err := Apply(FilingRequest{
+		Type:      "feature",
+		Summary:   "x",
+		Body:      "## Summary\n\nx\n",
+		TitleVars: map[string]string{"epic": "1", "n": "1"},
+		Labels:    []string{"area:backend", "autonomy:high"},
+		Relations: Relations{ParentEpic: "#1"},
+	}, conv)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	for _, l := range item.Classification.Labels {
+		if l == "autonomy:medium" {
+			t.Errorf("autonomy:medium was appended despite explicit autonomy:high; labels = %v", item.Classification.Labels)
+		}
+	}
+	if !containsString(item.Classification.Labels, "autonomy:high") {
+		t.Errorf("autonomy:high not preserved; labels = %v", item.Classification.Labels)
+	}
+	for _, d := range item.Classification.DefaultedLabels {
+		if strings.HasPrefix(d, "autonomy:") {
+			t.Errorf("DefaultedLabels reports an autonomy default despite passthrough: %v", item.Classification.DefaultedLabels)
+		}
+	}
+}
+
+// TestApply_ExplicitLabelsRegressionPin proves the completeness pass ONLY
+// consults prefixes and never rewrites or reorders existing labels (#1616,
+// verification 2): a filing with explicit area:* + autonomy:* produces the
+// identical merged set (content AND order) as mergeLabels alone would have —
+// nothing appended, nothing defaulted, nothing missing.
+func TestApply_ExplicitLabelsRegressionPin(t *testing.T) {
+	conv := Default()
+	item, _, err := Apply(FilingRequest{
+		Type:      "feature",
+		Summary:   "x",
+		Body:      "## Summary\n\nx\n",
+		TitleVars: map[string]string{"epic": "1", "n": "1"},
+		Labels:    []string{"area:cli", "autonomy:low"},
+		Relations: Relations{ParentEpic: "#1"},
+	}, conv)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	// Byte-identical to the pre-change merge: default_labels first, then caller
+	// labels, in order, with no completeness additions.
+	want := "type:feature,area:cli,autonomy:low"
+	if got := strings.Join(item.Classification.Labels, ","); got != want {
+		t.Errorf("labels = %q, want %q (no reorder/rewrite)", got, want)
+	}
+	if len(item.Classification.DefaultedLabels) != 0 {
+		t.Errorf("DefaultedLabels = %v, want none", item.Classification.DefaultedLabels)
+	}
+	if len(item.Classification.MissingLabelNamespaces) != 0 {
+		t.Errorf("MissingLabelNamespaces = %v, want none", item.Classification.MissingLabelNamespaces)
+	}
+}
+
+// TestApply_TypeExemption is the type-exemption pin (#1616, verification 3):
+// epic and adr filings via the shipped Default() gain NO autonomy label and
+// report nothing defaulted — they carry their own conventions and declare no
+// label_defaults / required_label_namespaces.
+func TestApply_TypeExemption(t *testing.T) {
+	conv := Default()
+	cases := map[string]FilingRequest{
+		"epic": {Type: "epic", Summary: "x", Body: "## Summary\n\nx\n", ExistingNumbers: []int{0}},
+		"adr":  {Type: "adr", Summary: "x", Body: "## Context\n\nx\n", ExistingNumbers: []int{0}},
+	}
+	for name, req := range cases {
+		t.Run(name, func(t *testing.T) {
+			item, _, err := Apply(req, conv)
+			if err != nil {
+				t.Fatalf("Apply(%s): %v", name, err)
+			}
+			if hasLabelInNamespace(item.Classification.Labels, "autonomy") {
+				t.Errorf("%s gained an autonomy label: %v", name, item.Classification.Labels)
+			}
+			if len(item.Classification.DefaultedLabels) != 0 {
+				t.Errorf("%s DefaultedLabels = %v, want none", name, item.Classification.DefaultedLabels)
+			}
+			if len(item.Classification.MissingLabelNamespaces) != 0 {
+				t.Errorf("%s MissingLabelNamespaces = %v, want none", name, item.Classification.MissingLabelNamespaces)
+			}
+		})
+	}
+}
+
+// TestApply_MissingNamespaceReportedNeverRejected is the fail-open pin (#1616,
+// verification 4): a feature filing with no area label SUCCEEDS (never a
+// rejection) with area listed in MissingLabelNamespaces. Apply is pure — it
+// performs no parent-epic area derivation — so an area-less filing reports the
+// gap; the handler's deriveAreaLabel is what fills it before Apply.
+func TestApply_MissingNamespaceReportedNeverRejected(t *testing.T) {
+	conv := Default()
+	item, _, err := Apply(FilingRequest{
+		Type:      "feature",
+		Summary:   "x",
+		Body:      "## Summary\n\nx\n",
+		TitleVars: map[string]string{"epic": "1", "n": "1"},
+		Relations: Relations{ParentEpic: "#1"},
+	}, conv)
+	if err != nil {
+		t.Fatalf("Apply must not reject on a missing label namespace: %v", err)
+	}
+	if got := strings.Join(item.Classification.MissingLabelNamespaces, ","); got != "area" {
+		t.Errorf("MissingLabelNamespaces = %q, want area", got)
+	}
+	// autonomy was defaulted, so it is NOT reported missing.
+	if !hasLabelInNamespace(item.Classification.Labels, "autonomy") {
+		t.Errorf("autonomy should have been defaulted; labels = %v", item.Classification.Labels)
+	}
+}
+
+func containsString(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }

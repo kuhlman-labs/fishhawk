@@ -823,6 +823,10 @@ type DeferFiledIssue struct {
 	URL           string   `json:"url"`
 	Provider      string   `json:"provider"`
 	AppliedLabels []string `json:"applied_labels,omitempty"`
+	// DefaultedLabels / MissingLabelNamespaces mirror the work-item filing's
+	// LOUD label-completeness report (#1616) on the deferred follow-up.
+	DefaultedLabels        []string `json:"defaulted_labels,omitempty"`
+	MissingLabelNamespaces []string `json:"missing_label_namespaces,omitempty"`
 }
 
 // DeferredConcernResult mirrors the backend defer 200 body: the filed
@@ -1482,6 +1486,13 @@ type FiledWorkItem struct {
 	BoardingError string `json:"boarding_error,omitempty"`
 	EpicLinkError string `json:"epic_link_error,omitempty"`
 	Audited       bool   `json:"audited"`
+	// DefaultedLabels / MissingLabelNamespaces surface the backend's LOUD
+	// label-completeness report (#1616): every label the system added that the
+	// caller did not supply (namespace defaults + handler-derived area), and
+	// any required namespace still absent after merge/derivation/defaulting. A
+	// missing namespace is reported, never a rejection.
+	DefaultedLabels        []string `json:"defaulted_labels,omitempty"`
+	MissingLabelNamespaces []string `json:"missing_label_namespaces,omitempty"`
 }
 
 // FileWorkItem files a provider-agnostic work item via

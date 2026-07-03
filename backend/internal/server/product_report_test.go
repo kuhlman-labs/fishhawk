@@ -523,3 +523,63 @@ func assertProductReportAudit(t *testing.T, af *scAuditFake, runID uuid.UUID, fi
 		t.Errorf("no product_report_filed audit entry; appended=%d", len(af.appendedParams))
 	}
 }
+
+// TestReportLabels_IncludeAutonomyDefault is the reportLabels unit assertion
+// for #1616 (verification 9): the product-report path bypasses workmgmt.Apply,
+// so the autonomy:medium default is applied at the label source here — for BOTH
+// kinds — so no product report is ever filed autonomy-unset.
+func TestReportLabels_IncludeAutonomyDefault(t *testing.T) {
+	for _, kind := range []string{"feature", "bug"} {
+		labels := reportLabels(kind)
+		var hasType, hasAutonomy bool
+		for _, l := range labels {
+			if l == "type:"+kind {
+				hasType = true
+			}
+			if l == "autonomy:medium" {
+				hasAutonomy = true
+			}
+		}
+		if !hasType {
+			t.Errorf("reportLabels(%q) = %v, want it to include type:%s", kind, labels, kind)
+		}
+		if !hasAutonomy {
+			t.Errorf("reportLabels(%q) = %v, want it to include autonomy:medium", kind, labels)
+		}
+	}
+}
+
+// TestProductReport_FiledLabelsIncludeAutonomy is the provider-capture
+// assertion for #1616 (verification 9): the labels that actually reach the
+// feedback provider on a dedup-miss File include autonomy:medium, for both a
+// default (bug) and an explicit feature report.
+func TestProductReport_FiledLabelsIncludeAutonomy(t *testing.T) {
+	cases := map[string]string{
+		"bug default": "",
+		"feature":     `{"kind":"feature"}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			fp := &fakeFeedbackProvider{}
+			af := &scAuditFake{}
+			s, runID := productReportFixture(t, fp, af)
+
+			rec := postProductReport(s, runID, "mcp:run:"+runID.String(), body)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+			}
+			if !fp.filed {
+				t.Fatal("provider.File was not called on a dedup miss")
+			}
+			var hasAutonomy bool
+			for _, l := range fp.filedReport.Labels {
+				if l == "autonomy:medium" {
+					hasAutonomy = true
+				}
+			}
+			if !hasAutonomy {
+				t.Errorf("filed report labels = %v, want it to include autonomy:medium", fp.filedReport.Labels)
+			}
+		})
+	}
+}

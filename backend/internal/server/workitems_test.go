@@ -1610,3 +1610,196 @@ func TestFileWorkItem_DependsOn_EndToEnd(t *testing.T) {
 		}
 	}
 }
+
+// newLabeledEpicGitHubClient serves GetRepoInstallation + GetIssue where the
+// parent epic issue carries the given labels (object form) — the stub for the
+// area-derivation path (#1616). The title carries an [E22] token so {epic}
+// derivation is unaffected; labels drive area derivation.
+func newLabeledEpicGitHubClient(t *testing.T, installID int64, labels []string, getIssueErr bool) *githubclient.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{name}/installation", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"id":%d}`, installID)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{name}/issues/{number}", func(w http.ResponseWriter, _ *http.Request) {
+		if getIssueErr {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		labelObjs := make([]map[string]any, 0, len(labels))
+		for _, l := range labels {
+			labelObjs = append(labelObjs, map[string]any{"name": l})
+		}
+		body, _ := json.Marshal(map[string]any{"number": 389, "title": "[E22] The parent epic", "state": "open", "labels": labelObjs})
+		_, _ = w.Write(body)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}
+}
+
+// TestFileWorkItem_LabelCompleteness_Integration is the cross-boundary seam
+// for #1616 (verification 6): a feature filing with NO autonomy label and no
+// area (no GitHub client to derive it) drives request -> conventions Apply ->
+// provider -> response + audit. The response carries defaulted_labels
+// [autonomy:medium] and missing_label_namespaces [area]; the filed item's
+// labels include autonomy:medium; and the run-bound work_item_filed audit
+// payload carries both fields.
+func TestFileWorkItem_LabelCompleteness_Integration(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+
+	au := newAuditFake()
+	rr := newPromptRunRepo()
+	runID := uuid.New()
+	inst := int64(99)
+	rr.getRuns[runID] = &run.Run{
+		ID:             runID,
+		Repo:           "kuhlman-labs/fishhawk",
+		State:          run.StateRunning,
+		InstallationID: &inst,
+	}
+	s := New(Config{AuditRepo: au, RunRepo: rr})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Add the widget endpoint",
+		TitleVars: map[string]string{"epic": "22", "n": "5"},
+		Relations: &workItemRelations{ParentEpic: "#1005"},
+		RunID:     runID.String(),
+	}, "mcp:run:"+runID.String())
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	if strings.Join(resp.DefaultedLabels, ",") != "autonomy:medium" {
+		t.Errorf("response defaulted_labels = %v, want [autonomy:medium]", resp.DefaultedLabels)
+	}
+	if strings.Join(resp.MissingLabelNamespaces, ",") != "area" {
+		t.Errorf("response missing_label_namespaces = %v, want [area]", resp.MissingLabelNamespaces)
+	}
+	// The filed item's labels (as the provider received them) include the default.
+	if !containsString(fp.captured.Item.Classification.Labels, "autonomy:medium") {
+		t.Errorf("provider Item labels %v missing autonomy:medium", fp.captured.Item.Classification.Labels)
+	}
+
+	// Audit seam: the work_item_filed payload carries both completeness fields.
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var found bool
+	for _, e := range au.appended {
+		if e.Category != categoryWorkItemFiled {
+			continue
+		}
+		found = true
+		var payload map[string]any
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			t.Fatalf("audit payload: %v", err)
+		}
+		dl, _ := payload["defaulted_labels"].([]any)
+		if !containsStr(dl, "autonomy:medium") {
+			t.Errorf("audit defaulted_labels = %v, want it to include autonomy:medium", payload["defaulted_labels"])
+		}
+		mn, _ := payload["missing_label_namespaces"].([]any)
+		if !containsStr(mn, "area") {
+			t.Errorf("audit missing_label_namespaces = %v, want it to include area", payload["missing_label_namespaces"])
+		}
+	}
+	if !found {
+		t.Fatalf("no work_item_filed audit entry; appended=%d", len(au.appended))
+	}
+}
+
+// TestFileWorkItem_AreaDerivedFromParentEpic is the area-derivation happy path
+// (#1616, verification 7): with a stub GitHub client whose parent-epic
+// GetIssue returns labels [epic, area:backend], the filed item's labels
+// include area:backend, it appears in the response defaulted_labels, and
+// missing_label_namespaces omits area.
+func TestFileWorkItem_AreaDerivedFromParentEpic(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+
+	gh := newLabeledEpicGitHubClient(t, 7788, []string{"epic", "area:backend"}, false)
+	s := New(Config{GitHub: gh})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Fix the widget",
+		TitleVars: map[string]string{"n": "1"}, // epic auto-derived too
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	if !containsString(fp.captured.Item.Classification.Labels, "area:backend") {
+		t.Errorf("filed item labels %v missing derived area:backend", fp.captured.Item.Classification.Labels)
+	}
+	if !containsString(resp.DefaultedLabels, "area:backend") {
+		t.Errorf("response defaulted_labels = %v, want it to include area:backend", resp.DefaultedLabels)
+	}
+	for _, ns := range resp.MissingLabelNamespaces {
+		if ns == "area" {
+			t.Errorf("missing_label_namespaces = %v, must omit area (it was derived)", resp.MissingLabelNamespaces)
+		}
+	}
+}
+
+// TestFileWorkItem_AreaDerivation_FailsOpen is the area-derivation fail-open
+// sibling (#1616, verification 7): a GetIssue error must NOT fail the filing —
+// it succeeds with area listed in missing_label_namespaces (derivation derived
+// nothing). Uses a feature type whose title_format needs no {epic}, so the
+// GetIssue failure does not also fail title rendering.
+func TestFileWorkItem_AreaDerivation_FailsOpen(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+
+	// A conventions type that requires area + autonomy but whose title needs no
+	// {epic}, so a GetIssue error only affects area derivation.
+	conv := workmgmt.Conventions{
+		Provider: workmgmt.Default().Provider,
+		Types: map[string]workmgmt.ItemType{
+			"feature": {
+				TitleFormat:             "{summary}",
+				BodySkeleton:            []string{"Summary"},
+				DefaultLabels:           []string{"type:feature"},
+				LabelDefaults:           map[string]string{"autonomy": "autonomy:medium"},
+				RequiredLabelNamespaces: []string{"area", "autonomy"},
+				DefaultFields:           workmgmt.DefaultFields{Status: "Backlog", Complexity: "medium"},
+				EpicLink:                "optional",
+			},
+		},
+	}
+	prev := conventionsLoader
+	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	gh := newLabeledEpicGitHubClient(t, 7788, nil, true) // GetIssue 500s
+	s := New(Config{GitHub: gh})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Ship it",
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — area derivation must fail OPEN (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	if strings.Join(resp.MissingLabelNamespaces, ",") != "area" {
+		t.Errorf("missing_label_namespaces = %v, want [area] (derivation failed open)", resp.MissingLabelNamespaces)
+	}
+}

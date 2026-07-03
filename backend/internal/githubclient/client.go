@@ -317,6 +317,13 @@ type Issue struct {
 	Title  string
 	Body   string
 	State  string
+	// Labels is the issue's label names. GitHub's REST issue payload
+	// carries `labels` as an array whose entries are label objects
+	// ({name, color, …}) or, for some responses, plain strings; GetIssue
+	// decodes both forms into the bare names. Consumed by the area-label
+	// derivation (#1616): a child's parent epic's area:* label is copied
+	// onto the filing.
+	Labels []string
 }
 
 // GetIssue fetches a single issue by number.
@@ -362,6 +369,9 @@ func (c *Client) GetIssue(ctx context.Context, installationID int64, repo RepoRe
 		Title  string `json:"title"`
 		Body   string `json:"body"`
 		State  string `json:"state"`
+		// labels entries are string-or-object per the REST Issues schema;
+		// json.RawMessage defers the shape decision to decodeLabelNames.
+		Labels []json.RawMessage `json:"labels"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return nil, fmt.Errorf("githubclient: decode issue: %w", err)
@@ -371,7 +381,34 @@ func (c *Client) GetIssue(ctx context.Context, installationID int64, repo RepoRe
 		Title:  body.Title,
 		Body:   body.Body,
 		State:  body.State,
+		Labels: decodeLabelNames(body.Labels),
 	}, nil
+}
+
+// decodeLabelNames tolerantly parses a GitHub issue payload's `labels`
+// array, whose entries are label objects ({name, color, …}) or plain
+// strings per the REST Issues schema. It returns the bare names, skipping
+// any entry that is neither form or whose name is empty. Returns nil for an
+// empty/absent array so a labelless issue carries a nil Labels slice.
+func decodeLabelNames(raw []json.RawMessage) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var names []string
+	for _, entry := range raw {
+		var obj struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(entry, &obj); err == nil && obj.Name != "" {
+			names = append(names, obj.Name)
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(entry, &s); err == nil && s != "" {
+			names = append(names, s)
+		}
+	}
+	return names
 }
 
 // BranchProtection is the slice of a branch-protection API response

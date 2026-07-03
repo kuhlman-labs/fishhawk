@@ -57,3 +57,44 @@ func TestCreateCampaign_OperatorAgentBytes_CarriedVerbatim(t *testing.T) {
 		t.Errorf("decoded Campaign.OperatorAgent = %+v", got.OperatorAgent)
 	}
 }
+
+// TestFiledWorkItem_DecodesLabelCompleteness pins the MCP-side wire contract
+// for the #1616 LOUD label-completeness report: a work-items response carrying
+// defaulted_labels + missing_label_namespaces decodes into FiledWorkItem so the
+// tool result surfaces them verbatim to the operator.
+func TestFiledWorkItem_DecodesLabelCompleteness(t *testing.T) {
+	const body = `{"type":"feature","title":"[E22.1] x","number":7,` +
+		`"url":"https://example/7","provider":"github_projects",` +
+		`"applied_labels":["type:feature","autonomy:medium"],` +
+		`"defaulted_labels":["autonomy:medium"],` +
+		`"missing_label_namespaces":["area"],"boarded":true,"epic_linked":true,"audited":false}`
+	var got FiledWorkItem
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("decode FiledWorkItem: %v", err)
+	}
+	if len(got.DefaultedLabels) != 1 || got.DefaultedLabels[0] != "autonomy:medium" {
+		t.Errorf("DefaultedLabels = %v, want [autonomy:medium]", got.DefaultedLabels)
+	}
+	if len(got.MissingLabelNamespaces) != 1 || got.MissingLabelNamespaces[0] != "area" {
+		t.Errorf("MissingLabelNamespaces = %v, want [area]", got.MissingLabelNamespaces)
+	}
+}
+
+// TestDeferFiledIssue_DecodesLabelCompleteness pins the same wire contract on
+// the defer path's filed-issue block (#1616).
+func TestDeferFiledIssue_DecodesLabelCompleteness(t *testing.T) {
+	const body = `{"type":"chore","title":"[E22.4] x","number":9,` +
+		`"url":"https://example/9","provider":"github_projects",` +
+		`"applied_labels":["type:chore","autonomy:medium"],` +
+		`"defaulted_labels":["autonomy:medium"],"missing_label_namespaces":["area"]}`
+	var got DeferFiledIssue
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("decode DeferFiledIssue: %v", err)
+	}
+	if len(got.DefaultedLabels) != 1 || got.DefaultedLabels[0] != "autonomy:medium" {
+		t.Errorf("DefaultedLabels = %v, want [autonomy:medium]", got.DefaultedLabels)
+	}
+	if len(got.MissingLabelNamespaces) != 1 || got.MissingLabelNamespaces[0] != "area" {
+		t.Errorf("MissingLabelNamespaces = %v, want [area]", got.MissingLabelNamespaces)
+	}
+}

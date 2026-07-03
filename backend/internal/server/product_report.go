@@ -372,12 +372,17 @@ func redactedFreeText(req productReportRequest) string {
 	return string(scrubbed)
 }
 
-// reportLabels maps the report kind onto upstream labels.
+// reportLabels maps the report kind onto upstream labels. This path files
+// through the feedback provider (workmgmt.GetFeedback), NOT workmgmt.Apply, so
+// the label-completeness guarantee (#1616) cannot reach it there — the
+// autonomy:medium default is applied HERE, at the label source, so no product
+// report (feature or bug) is ever filed autonomy-unset, matching the Apply-pass
+// guarantee for the file_issue / defer_concern paths.
 func reportLabels(kind string) []string {
 	if kind == "feature" {
-		return []string{"type:feature"}
+		return []string{"type:feature", "autonomy:medium"}
 	}
-	return []string{"type:bug"}
+	return []string{"type:bug", "autonomy:medium"}
 }
 
 // renderReportTitle builds a product-facts-only title. No operator free
