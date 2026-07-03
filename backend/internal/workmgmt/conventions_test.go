@@ -114,6 +114,49 @@ func TestDefaultDoneMeansHintIsTestable(t *testing.T) {
 	}
 }
 
+// TestDefaultBodySkeletons locks the SHIPPED feature/bug/chore body_skeleton
+// values (#1614, E34.7): a comment-only or mis-positioned YAML touch fails
+// here even though a mere scope-presence check would pass (the #1169
+// done-means discipline). "Acceptance criteria" sits after Done-means and
+// before Notes on feature/bug; chore is deliberately unchanged (optional for
+// chore per the issue).
+func TestDefaultBodySkeletons(t *testing.T) {
+	d := Default()
+
+	wantFeature := []string{"Summary", "Proposal", "Done-means", "Acceptance criteria", "Notes", "Relations"}
+	if got := d.Types["feature"].BodySkeleton; strings.Join(got, ",") != strings.Join(wantFeature, ",") {
+		t.Errorf("feature body_skeleton = %v, want %v", got, wantFeature)
+	}
+
+	wantBug := []string{"Summary", "Observed", "Proposal", "Done-means", "Acceptance criteria", "Notes", "Relations"}
+	if got := d.Types["bug"].BodySkeleton; strings.Join(got, ",") != strings.Join(wantBug, ",") {
+		t.Errorf("bug body_skeleton = %v, want %v", got, wantBug)
+	}
+
+	wantChore := []string{"Summary", "Done-means"}
+	if got := d.Types["chore"].BodySkeleton; strings.Join(got, ",") != strings.Join(wantChore, ",") {
+		t.Errorf("chore body_skeleton = %v, want %v (unchanged; Acceptance criteria is optional for chore)", got, wantChore)
+	}
+}
+
+// TestDefaultAcceptanceCriteriaHint is the binding coverage condition on
+// #1614: field_hints["Acceptance criteria"] must be non-empty and state the
+// behavioral-contract distinction from Done-means (observable/falsifiable
+// behaviors, not the change-complete checklist).
+func TestDefaultAcceptanceCriteriaHint(t *testing.T) {
+	hint := Default().FieldHints["Acceptance criteria"]
+	if hint == "" {
+		t.Fatal("field_hints[Acceptance criteria] is empty")
+	}
+	lower := strings.ToLower(hint)
+	if !strings.Contains(lower, "observable") && !strings.Contains(lower, "falsifiable") {
+		t.Errorf("Acceptance criteria hint %q does not state the behaviors must be observable/falsifiable", hint)
+	}
+	if !strings.Contains(hint, "Done-means") {
+		t.Errorf("Acceptance criteria hint %q does not distinguish itself from Done-means", hint)
+	}
+}
+
 // TestDefaultRequiresMandatoryTrio asserts the shipped default carries the
 // mandatory required-field trio.
 func TestDefaultRequiresMandatoryTrio(t *testing.T) {

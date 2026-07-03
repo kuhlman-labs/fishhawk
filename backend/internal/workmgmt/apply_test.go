@@ -420,6 +420,115 @@ func TestApply_MissingPlaceholderCarriesDetails(t *testing.T) {
 	}
 }
 
+// TestApply_FeatureAcceptanceCriteriaRendersInPosition is the #1614 (E34.7)
+// new-key done-means: filing a feature with an "Acceptance criteria"
+// Sections entry through the SHIPPED Default() conventions succeeds and the
+// content lands under "## Acceptance criteria", positioned after
+// "## Done-means" and before "## Notes".
+func TestApply_FeatureAcceptanceCriteriaRendersInPosition(t *testing.T) {
+	conv := testConventions(t)
+	item, _, err := Apply(FilingRequest{
+		Type:      "feature",
+		Summary:   "add the thing",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+		Sections: map[string]string{
+			"Summary":             "add the thing",
+			"Done-means":          "the thing exists",
+			"Acceptance criteria": "- a user can see the thing",
+		},
+		Relations: Relations{ParentEpic: "#1005"},
+	}, conv)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if !strings.Contains(item.Body, "## Acceptance criteria") {
+		t.Fatalf("assembled body missing ## Acceptance criteria heading:\n%s", item.Body)
+	}
+	if !strings.Contains(item.Body, "- a user can see the thing") {
+		t.Errorf("assembled body missing acceptance criteria content:\n%s", item.Body)
+	}
+	doneIdx := strings.Index(item.Body, "## Done-means")
+	acIdx := strings.Index(item.Body, "## Acceptance criteria")
+	notesIdx := strings.Index(item.Body, "## Notes")
+	if doneIdx == -1 || acIdx == -1 || notesIdx == -1 {
+		t.Fatalf("missing expected headings; body:\n%s", item.Body)
+	}
+	if doneIdx >= acIdx || acIdx >= notesIdx {
+		t.Errorf("Acceptance criteria not positioned between Done-means and Notes: doneIdx=%d acIdx=%d notesIdx=%d\nbody:\n%s", doneIdx, acIdx, notesIdx, item.Body)
+	}
+}
+
+// TestApply_BugAcceptanceCriteriaRendersInPosition mirrors the feature case
+// for the bug skeleton.
+func TestApply_BugAcceptanceCriteriaRendersInPosition(t *testing.T) {
+	conv := testConventions(t)
+	item, _, err := Apply(FilingRequest{
+		Type:      "bug",
+		Summary:   "fix the thing",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+		Sections: map[string]string{
+			"Summary":             "fix the thing",
+			"Done-means":          "the bug is fixed",
+			"Acceptance criteria": "- the error no longer occurs",
+		},
+	}, conv)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	doneIdx := strings.Index(item.Body, "## Done-means")
+	acIdx := strings.Index(item.Body, "## Acceptance criteria")
+	notesIdx := strings.Index(item.Body, "## Notes")
+	if doneIdx == -1 || acIdx == -1 || notesIdx == -1 {
+		t.Fatalf("missing expected headings; body:\n%s", item.Body)
+	}
+	if doneIdx >= acIdx || acIdx >= notesIdx {
+		t.Errorf("Acceptance criteria not positioned between Done-means and Notes: doneIdx=%d acIdx=%d notesIdx=%d\nbody:\n%s", doneIdx, acIdx, notesIdx, item.Body)
+	}
+	if !strings.Contains(item.Body, "- the error no longer occurs") {
+		t.Errorf("assembled body missing acceptance criteria content:\n%s", item.Body)
+	}
+}
+
+// TestApply_FeatureOldKeySetStillValidates is the #1614 (E34.7) additive
+// done-means: a feature filed with only the pre-change section keys (no
+// "Acceptance criteria" entry) still succeeds — validateSections rejects
+// only off-skeleton keys, not missing ones — and the assembled body carries
+// an empty "## Acceptance criteria" heading in position (assembleBody
+// renders every skeleton heading unconditionally; see apply.go).
+func TestApply_FeatureOldKeySetStillValidates(t *testing.T) {
+	conv := testConventions(t)
+	item, _, err := Apply(FilingRequest{
+		Type:      "feature",
+		Summary:   "add the thing",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+		Sections: map[string]string{
+			"Summary":    "add the thing",
+			"Proposal":   "do it this way",
+			"Done-means": "the thing exists",
+			"Notes":      "n/a",
+		},
+		Relations: Relations{ParentEpic: "#1005"},
+	}, conv)
+	if err != nil {
+		t.Fatalf("Apply(old key set) = %v, want nil (additive: missing Acceptance criteria key still validates)", err)
+	}
+	doneIdx := strings.Index(item.Body, "## Done-means")
+	acIdx := strings.Index(item.Body, "## Acceptance criteria")
+	notesIdx := strings.Index(item.Body, "## Notes")
+	if doneIdx == -1 || acIdx == -1 || notesIdx == -1 {
+		t.Fatalf("missing expected headings; body:\n%s", item.Body)
+	}
+	if doneIdx >= acIdx || acIdx >= notesIdx {
+		t.Errorf("empty Acceptance criteria heading not positioned between Done-means and Notes: doneIdx=%d acIdx=%d notesIdx=%d\nbody:\n%s", doneIdx, acIdx, notesIdx, item.Body)
+	}
+	// Nothing was supplied for Acceptance criteria, so the heading renders
+	// with no content before the next heading.
+	between := item.Body[acIdx:notesIdx]
+	if strings.TrimSpace(strings.TrimPrefix(between, "## Acceptance criteria")) != "" {
+		t.Errorf("expected an empty Acceptance criteria section, got %q", between)
+	}
+}
+
 func TestMergeLabels_DedupsPreservingOrder(t *testing.T) {
 	got := mergeLabels([]string{"type:bug", "x"}, []string{"x", "y", ""})
 	want := []string{"type:bug", "x", "y"}
