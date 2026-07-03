@@ -88,6 +88,17 @@ type McpToken struct {
 	Scopes     []string           `json:"scopes"`
 }
 
+type RefinementDecision struct {
+	ID               uuid.UUID          `json:"id"`
+	SessionID        uuid.UUID          `json:"session_id"`
+	DraftID          uuid.UUID          `json:"draft_id"`
+	Decision         string             `json:"decision"`
+	Reason           string             `json:"reason"`
+	DraftContentHash string             `json:"draft_content_hash"`
+	DecidedBy        *string            `json:"decided_by"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
 type RefinementDraft struct {
 	ID        uuid.UUID          `json:"id"`
 	SessionID uuid.UUID          `json:"session_id"`
@@ -95,6 +106,7 @@ type RefinementDraft struct {
 	Draft     []byte             `json:"draft"`
 	Model     *string            `json:"model"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	Origin    string             `json:"origin"`
 }
 
 type ReviewConcern struct {

@@ -128,3 +128,136 @@ func TestPostgres_ListForSessionIsolates(t *testing.T) {
 		t.Errorf("session B list = %d drafts, want 1", len(listB))
 	}
 }
+
+func TestPostgres_OriginRoundTrip(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+
+	// An explicit non-default origin round-trips; an empty origin normalizes to
+	// OriginBrief.
+	amended, err := repo.CreateDraft(context.Background(), CreateParams{
+		SessionID: uuid.New(), Brief: "b", Draft: validDraft(), Origin: OriginAmendment,
+	})
+	if err != nil {
+		t.Fatalf("CreateDraft amendment: %v", err)
+	}
+	if amended.Origin != OriginAmendment {
+		t.Errorf("origin = %q, want %q", amended.Origin, OriginAmendment)
+	}
+	got, err := repo.GetDraft(context.Background(), amended.ID)
+	if err != nil {
+		t.Fatalf("GetDraft: %v", err)
+	}
+	if got.Origin != OriginAmendment {
+		t.Errorf("reloaded origin = %q, want %q", got.Origin, OriginAmendment)
+	}
+
+	defaulted, err := repo.CreateDraft(context.Background(), CreateParams{
+		SessionID: uuid.New(), Brief: "b", Draft: validDraft(),
+	})
+	if err != nil {
+		t.Fatalf("CreateDraft default origin: %v", err)
+	}
+	if defaulted.Origin != OriginBrief {
+		t.Errorf("empty origin normalized to %q, want %q", defaulted.Origin, OriginBrief)
+	}
+}
+
+func TestPostgres_DecisionRoundTrip(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+
+	sessionID := uuid.New()
+	draft := validDraft()
+	stored, err := repo.CreateDraft(context.Background(), CreateParams{
+		SessionID: sessionID, Brief: "b", Draft: draft,
+	})
+	if err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	hash, err := ContentHash(draft)
+	if err != nil {
+		t.Fatalf("ContentHash: %v", err)
+	}
+
+	dec, err := repo.RecordDecision(context.Background(), DecisionParams{
+		SessionID:        sessionID,
+		DraftID:          stored.ID,
+		Decision:         DecisionApproved,
+		Reason:           "looks good",
+		DraftContentHash: hash,
+		DecidedBy:        "github:operator",
+	})
+	if err != nil {
+		t.Fatalf("RecordDecision: %v", err)
+	}
+	if dec.ID == uuid.Nil || dec.CreatedAt.IsZero() {
+		t.Errorf("decision missing id/created_at: %+v", dec)
+	}
+
+	list, err := repo.ListDecisions(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("ListDecisions: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("ListDecisions = %d, want 1", len(list))
+	}
+	got := list[0]
+	if got.DraftID != stored.ID || got.Decision != DecisionApproved ||
+		got.Reason != "looks good" || got.DraftContentHash != hash || got.DecidedBy != "github:operator" {
+		t.Errorf("reloaded decision = %+v, want fields preserved", got)
+	}
+}
+
+func TestPostgres_DecisionFKToDraft(t *testing.T) {
+	// A decision referencing a draft id that does not exist violates the FK and
+	// fails at insert rather than persisting a dangling decision.
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+
+	_, err := repo.RecordDecision(context.Background(), DecisionParams{
+		SessionID:        uuid.New(),
+		DraftID:          uuid.New(), // no such draft
+		Decision:         DecisionApproved,
+		Reason:           "r",
+		DraftContentHash: "h",
+	})
+	if err == nil {
+		t.Fatal("RecordDecision against a nonexistent draft succeeded; want FK violation")
+	}
+}
+
+func TestPostgres_ContentHashSurvivesJSONBRoundTrip(t *testing.T) {
+	// Hash-determinism guard: the content hash is computed over the DECODED
+	// EpicDraft struct, so a persist -> read-back-through-JSONB -> re-hash must
+	// yield the SAME digest. This fails if the struct-marshal determinism
+	// assumption (or the JSONB round-trip) is ever wrong.
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+
+	draft := validDraft()
+	draft.Children[1].DependsOn = []int{1}
+	draft.Children[0].AcceptanceCriteria = []string{"crit A", "crit B"}
+	written, err := ContentHash(draft)
+	if err != nil {
+		t.Fatalf("ContentHash written: %v", err)
+	}
+
+	stored, err := repo.CreateDraft(context.Background(), CreateParams{
+		SessionID: uuid.New(), Brief: "b", Draft: draft,
+	})
+	if err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	reloaded, err := repo.GetDraft(context.Background(), stored.ID)
+	if err != nil {
+		t.Fatalf("GetDraft: %v", err)
+	}
+	readBack, err := ContentHash(reloaded.Draft)
+	if err != nil {
+		t.Fatalf("ContentHash read-back: %v", err)
+	}
+	if written != readBack {
+		t.Errorf("content hash drifted across JSONB round-trip: written %s != read-back %s", written, readBack)
+	}
+}

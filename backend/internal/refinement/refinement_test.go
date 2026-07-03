@@ -144,3 +144,93 @@ func TestValidate_EmptyChildProposalRejected(t *testing.T) {
 		t.Fatalf("Validate on empty child proposal = %v, want proposal error", err)
 	}
 }
+
+// childN returns a draft of n independent conventions-complete children (no
+// edges), for composing Waves() shape tests.
+func childN(n int) EpicDraft {
+	d := EpicDraft{Epic: EpicSpec{Summary: "e", Scope: "s"}}
+	for i := 0; i < n; i++ {
+		d.Children = append(d.Children, validChild("child"))
+	}
+	return d
+}
+
+func TestWaves_LinearChain(t *testing.T) {
+	// 1 <- 2 <- 3: each wave holds exactly the next ordinal.
+	d := childN(3)
+	d.Children[1].DependsOn = []int{1}
+	d.Children[2].DependsOn = []int{2}
+	waves, err := d.Waves()
+	if err != nil {
+		t.Fatalf("Waves: %v", err)
+	}
+	want := [][]int{{1}, {2}, {3}}
+	if !equalWaves(waves, want) {
+		t.Errorf("linear-chain waves = %v, want %v", waves, want)
+	}
+}
+
+func TestWaves_Diamond(t *testing.T) {
+	// 1 <- {2,3} <- 4: three waves, the middle holding two ordinals.
+	d := childN(4)
+	d.Children[1].DependsOn = []int{1}
+	d.Children[2].DependsOn = []int{1}
+	d.Children[3].DependsOn = []int{2, 3}
+	waves, err := d.Waves()
+	if err != nil {
+		t.Fatalf("Waves: %v", err)
+	}
+	want := [][]int{{1}, {2, 3}, {4}}
+	if !equalWaves(waves, want) {
+		t.Errorf("diamond waves = %v, want %v", waves, want)
+	}
+}
+
+func TestWaves_IndependentChildren(t *testing.T) {
+	// No edges: every child dispatches in wave 0.
+	d := childN(3)
+	waves, err := d.Waves()
+	if err != nil {
+		t.Fatalf("Waves: %v", err)
+	}
+	want := [][]int{{1, 2, 3}}
+	if !equalWaves(waves, want) {
+		t.Errorf("independent-children waves = %v, want %v", waves, want)
+	}
+}
+
+func TestWaves_CyclicFailsClosed(t *testing.T) {
+	d := childN(2)
+	d.Children[0].DependsOn = []int{2}
+	d.Children[1].DependsOn = []int{1}
+	if _, err := d.Waves(); !errors.Is(err, campaign.ErrCycle) {
+		t.Fatalf("Waves on a cyclic graph = %v, want wrapped campaign.ErrCycle", err)
+	}
+}
+
+func TestWaves_DanglingFailsClosed(t *testing.T) {
+	d := childN(2)
+	d.Children[0].DependsOn = []int{5}
+	if _, err := d.Waves(); !errors.Is(err, campaign.ErrDanglingDependency) {
+		t.Fatalf("Waves on a dangling edge = %v, want wrapped campaign.ErrDanglingDependency", err)
+	}
+}
+
+// equalWaves compares two wave slices for exact ordinal equality (order within
+// a wave is deterministic — ascending index — from campaign.Assemble).
+func equalWaves(a, b [][]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if len(a[i]) != len(b[i]) {
+			return false
+		}
+		for j := range a[i] {
+			if a[i][j] != b[i][j] {
+				return false
+			}
+		}
+	}
+	return true
+}

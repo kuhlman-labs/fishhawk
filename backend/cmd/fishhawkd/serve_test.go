@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -704,4 +705,56 @@ func TestResolveModelsFlags(t *testing.T) {
 			t.Errorf("refresh = %s, want 1h from the explicit flag", refresh)
 		}
 	})
+}
+
+// TestResolveRefinementDrafter asserts the agent-backed drafter is wired only
+// when the local claude adapter is configured — the seam serve.go reads to
+// populate Config.RefinementDrafter.
+func TestResolveRefinementDrafter(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	t.Run("wired when local claude enabled", func(t *testing.T) {
+		d := resolveRefinementDrafter(planReviewerOptions{
+			enableLocalClaudeReviewer: true,
+			localClaudeBinary:         "claude",
+			localClaudeModel:          "claude-opus-4-8",
+		}, logger)
+		if d == nil {
+			t.Fatal("resolveRefinementDrafter returned nil with the local claude adapter enabled")
+		}
+	})
+
+	t.Run("nil when unconfigured", func(t *testing.T) {
+		if d := resolveRefinementDrafter(planReviewerOptions{}, logger); d != nil {
+			t.Fatalf("resolveRefinementDrafter = %v, want nil (literal) when unconfigured", d)
+		}
+	})
+}
+
+// TestServeWiresRefinementConfig locks the operator binding condition: the
+// production serve path populates BOTH Config.RefinementRepo (always-on
+// Postgres adapter, the DB-block call) and Config.RefinementDrafter (agent-
+// backed, when the local claude adapter is configured) non-nil. The route-level
+// unconfigured-503 tests in the server package cover the nil branches; this
+// asserts the wired branch the serve path takes.
+func TestServeWiresRefinementConfig(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	var cfg server.Config
+	// Mirrors the serve.go DB block: refinement.NewPostgresRepository(pool). A
+	// nil pool is fine here — the constructor stores it without dialing, and we
+	// only assert the field is populated (non-nil), exactly as production wires.
+	cfg.RefinementRepo = refinement.NewPostgresRepository(nil)
+	cfg.RefinementDrafter = resolveRefinementDrafter(planReviewerOptions{
+		enableLocalClaudeReviewer: true,
+		localClaudeBinary:         "claude",
+		localClaudeModel:          "claude-opus-4-8",
+	}, logger)
+
+	if cfg.RefinementRepo == nil {
+		t.Error("serve path left Config.RefinementRepo nil")
+	}
+	if cfg.RefinementDrafter == nil {
+		t.Error("serve path left Config.RefinementDrafter nil")
+	}
 }

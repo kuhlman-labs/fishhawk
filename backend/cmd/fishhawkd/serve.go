@@ -50,6 +50,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reactionpoller"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -284,6 +285,29 @@ func resolvePlanReviewers(opts planReviewerOptions, logger *slog.Logger) server.
 		logger.Warn("plan-review agent not configured (set FISHHAWKD_ANTHROPIC_API_KEY, or FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER, or FISHHAWKD_ENABLE_CODEX_REVIEWER for local mode, to enable); any workflow declaring reviewers.agent > 0 will fail dispatch in gating mode and skip with a plan_review_skipped audit entry in advisory mode")
 	}
 	return set
+}
+
+// resolveRefinementDrafter builds the E34.2 refinement drafting agent
+// (server.RefinementDrafter) from the local-claude reviewer options. It returns
+// a *refinement.Drafter over a claudecode client + the default work-management
+// conventions when the local claude adapter is configured, and a literal nil
+// interface (never a typed-nil) otherwise — so the server's nil-Drafter guard
+// degrades ONLY the agent-backed gate arms (create-session, brief-amendment) to
+// 503 while GET / direct edit / decision keep working. It reuses the local
+// claude binary/model already resolved for the plan reviewer.
+func resolveRefinementDrafter(opts planReviewerOptions, logger *slog.Logger) server.RefinementDrafter {
+	if !opts.enableLocalClaudeReviewer {
+		return nil
+	}
+	client := claudecode.NewClient(claudecode.Config{
+		Binary: opts.localClaudeBinary,
+		Model:  opts.localClaudeModel,
+	})
+	logger.Info("refinement drafting agent configured",
+		slog.String("adapter", "claudecode"),
+		slog.String("binary", opts.localClaudeBinary),
+		slog.String("model", opts.localClaudeModel))
+	return refinement.NewDrafter(client, workmgmt.Default())
 }
 
 // buildModelProviders builds the provider→Fetcher map the live ModelOracle
@@ -649,6 +673,19 @@ func runServe(args []string, logSink io.Writer) int {
 		planReviewTimeout:         *planReviewTimeout,
 	}, logger)
 
+	// Refinement drafting agent (E34.2 / #1593). Reuses the local-claude
+	// reviewer options: when the local claude adapter is configured, the E34.1
+	// Drafter runs over the same claudecode client + the default work-management
+	// conventions. Nil when unconfigured — the agent-backed gate arms
+	// (create-session, brief-amendment) then degrade to 503 while GET / direct
+	// edit / decision keep working. The Postgres RefinementRepo is wired in the
+	// DB block below (always-on, mirroring CampaignRepo).
+	cfg.RefinementDrafter = resolveRefinementDrafter(planReviewerOptions{
+		enableLocalClaudeReviewer: *enableLocalClaudeReviewer,
+		localClaudeBinary:         *localClaudeBinary,
+		localClaudeModel:          *localClaudeModel,
+	}, logger)
+
 	// Wire the run repository when a DB URL is supplied. Without
 	// one the server still boots — /healthz works and any
 	// repository-dependent handler returns 503 — so operators can
@@ -673,6 +710,7 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.MCPTokenRepo = mcptoken.NewPostgresRepository(pool)
 		cfg.ScopeAmendmentRepo = scopeamendment.NewPostgresRepository(pool)
 		cfg.ConcernRepo = concern.NewPostgresRepository(pool)
+		cfg.RefinementRepo = refinement.NewPostgresRepository(pool)
 		cfg.AuthRepo = authpkg.NewPostgresRepository(pool)
 		logger.Info("repositories configured (run + signing + audit + approval + artifact + stagecheck + apitoken + auth)", slog.String("driver", "postgres"))
 	} else {

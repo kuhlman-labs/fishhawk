@@ -262,6 +262,87 @@ components:
             a filing is never failed on labels alone. Absent/empty when every required namespace
             is present.
 
+    EpicDraft:
+      type: object
+      additionalProperties: false
+      required: [epic, children]
+      description: >-
+        The structured decomposition drafted from a brief (E34.1): the epic plus
+        its children. It is the JSON contract the drafting agent emits, the value
+        persisted per revision, and the shape a direct field edit supplies.
+      properties:
+        epic:
+          type: object
+          additionalProperties: false
+          required: [summary, scope, out_of_scope]
+          properties:
+            summary: { type: string }
+            scope: { type: string }
+            out_of_scope: { type: string }
+        children:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            additionalProperties: false
+            required: [summary, proposal, done_means, acceptance_criteria, labels, depends_on]
+            properties:
+              summary: { type: string }
+              proposal: { type: string }
+              done_means: { type: string }
+              acceptance_criteria: { type: array, items: { type: string } }
+              labels: { type: array, items: { type: string } }
+              depends_on:
+                type: array
+                items: { type: integer }
+                description: 1-based sibling ordinals this child depends on (not issue numbers).
+
+    RefinementDecision:
+      type: object
+      required: [decision, reason, draft_id, draft_content_hash, created_at]
+      description: One append-only approve/reject verdict pinning a draft revision + its content hash.
+      properties:
+        decision: { type: string, enum: [approved, rejected] }
+        reason: { type: string }
+        draft_id: { type: string, format: uuid, description: The decided revision's id. }
+        draft_content_hash: { type: string, description: sha256 of the decoded EpicDraft the decision pinned. }
+        decided_by: { type: string, description: The deciding identity's subject; absent when unknown. }
+        created_at: { type: string, format: date-time }
+
+    RefinementSession:
+      type: object
+      required: [session_id, state, revision_count, latest_origin, latest_draft, preview, waves, decisions]
+      description: >-
+        The refinement gate's session view: derived approval state, revision
+        count, the latest draft, the full filing preview, the wave DAG, and the
+        decision history. State is DERIVED from revisions + decisions, never
+        stored — an edit after approval re-gates the session.
+      properties:
+        session_id: { type: string, format: uuid }
+        state:
+          type: string
+          enum: [awaiting_approval, approved, rejected]
+        drifted:
+          type: boolean
+          description: >-
+            True when the latest revision's decision pins a content hash that no
+            longer matches the recomputed hash (fail-closed to awaiting_approval).
+            Absent when false.
+        revision_count: { type: integer, description: Number of draft revisions in the session. }
+        latest_origin: { type: string, enum: [brief, amendment, edit], description: How the latest revision came to exist. }
+        latest_draft: { $ref: '#/components/schemas/EpicDraft' }
+        preview:
+          type: array
+          description: The full filing preview — the epic then each child, rendered exactly as it would file.
+          items: { type: object }
+        waves:
+          type: array
+          description: The topological dispatch order as waves of 1-based child ordinals.
+          items: { type: array, items: { type: integer } }
+        decisions:
+          type: array
+          items: { $ref: '#/components/schemas/RefinementDecision' }
+
     Pagination:
       type: object
       description: |
@@ -5294,6 +5375,195 @@ paths:
         '503':
           description: "`run_lookup_unconfigured` — `run_id` supplied but no run repository is wired."
 
+  /v0/refinement/sessions:
+    post:
+      operationId: createRefinementSession
+      summary: Draft an epic/children preview from a natural-language brief
+      description: |
+        Opens a refinement session (ADR-052 option A, E34.2): mints a session
+        id, runs the drafting agent over the `brief`, persists the initial draft
+        revision (`origin=brief`), and returns the session view — the derived
+        approval state, the revision count, the latest structured `EpicDraft`,
+        the full filing preview (epic + every child rendered exactly as it would
+        file), the topological wave DAG, and the (empty) decision history.
+
+        Nothing files here — the session is a draft artifact behind the E34.2
+        preview + approval gate; the E34.3 filing executor is what turns an
+        approved draft into provider work items.
+
+        Requires `write:approvals` scope. `503 refinement_drafting_unavailable`
+        when no agent-backed drafter is configured; `503
+        refinement_repo_unconfigured` when no refinement repository is wired.
+      tags: [refinement]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [brief]
+              properties:
+                brief: { type: string, description: The natural-language brief to decompose. }
+      responses:
+        '201':
+          description: Session created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RefinementSession' }
+        '400': { description: "`validation_failed` — malformed JSON or unknown fields." }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: "`insufficient_scope` — token lacks `write:approvals`." }
+        '422': { description: "`validation_failed` — `brief` is empty." }
+        '502': { description: "`refinement_drafting_failed` — the drafting agent did not produce a valid draft." }
+        '503':
+          description: |
+            `refinement_repo_unconfigured` — no refinement repository is wired;
+            `refinement_drafting_unavailable` — no agent-backed drafter configured.
+
+  /v0/refinement/sessions/{session_id}:
+    get:
+      operationId: getRefinementSession
+      summary: Get a refinement session's preview + approval state
+      description: |
+        Returns the session view: the derived approval `state`
+        (`awaiting_approval` / `approved` / `rejected`), `drifted` when the
+        latest revision's decision pins a content hash that no longer matches
+        (fail-closed), the revision count, the latest `EpicDraft`, the full
+        filing preview, the wave DAG, and the decision history.
+
+        Session state is DERIVED, never stored: a decision counts only when it
+        targets the latest revision and its pinned hash still matches — so an
+        edit after approval structurally re-gates the session.
+
+        Requires `write:approvals` scope.
+      tags: [refinement]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: The session view.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RefinementSession' }
+        '400': { description: "`validation_failed` — `session_id` is not a UUID." }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: "`insufficient_scope` — token lacks `write:approvals`." }
+        '404': { description: "`refinement_session_not_found` — no session with that id." }
+        '503': { description: "`refinement_repo_unconfigured`." }
+
+    patch:
+      operationId: editRefinementDraft
+      summary: Edit a refinement draft (agent amendment or direct field edit)
+      description: |
+        Appends a NEW draft revision — which is precisely what invalidates a
+        prior approval. Exactly one of the two arms:
+
+        - `brief_amendment` — composes the stored brief + amendment, re-runs the
+          drafting agent (`origin=amendment`), bounded by a per-session budget of
+          3 (a further amendment returns `409 amendment_budget_exhausted`).
+        - `draft` — a direct strict-decoded `EpicDraft` edit (`origin=edit`),
+          validated with no agent call.
+
+        Every successful edit writes a `refinement_draft_edited` audit entry on
+        the global chain BEFORE persisting the revision (durable-before-state-
+        change): an audit-append failure is a `500` and nothing is persisted.
+
+        Requires `write:approvals` scope.
+      tags: [refinement]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                brief_amendment:
+                  type: string
+                  description: An amendment composed onto the stored brief and re-drafted by the agent.
+                draft:
+                  $ref: '#/components/schemas/EpicDraft'
+      responses:
+        '200':
+          description: The updated session view (latest revision is the edit).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RefinementSession' }
+        '400': { description: "`validation_failed` — malformed JSON, unknown fields, or non-UUID `session_id`." }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: "`insufficient_scope` — token lacks `write:approvals`." }
+        '404': { description: "`refinement_session_not_found`." }
+        '409': { description: "`amendment_budget_exhausted` — the per-session brief-amendment budget is spent." }
+        '422':
+          description: |
+            `validation_failed` — neither or both arms supplied, or a `draft`
+            that fails strict decode / validation (an empty field, a dangling or
+            cyclic `depends_on` edge — the error names the offending edge).
+        '500': { description: "`audit_append_failed` — the edit's audit entry could not be durably recorded; nothing was persisted." }
+        '502': { description: "`refinement_drafting_failed` — the agent (brief-amendment arm) did not produce a valid draft." }
+        '503':
+          description: |
+            `refinement_repo_unconfigured`; `refinement_drafting_unavailable`
+            (brief-amendment arm only).
+
+  /v0/refinement/sessions/{session_id}/decision:
+    post:
+      operationId: decideRefinementSession
+      summary: Approve or reject the latest refinement draft revision
+      description: |
+        Records an append-only approve/reject verdict pinning the latest
+        revision's `draft_id` + a content hash of the decoded `EpicDraft`, so
+        "what was approved is what files". A missing/blank `reason` is `422`; a
+        second decision on the same revision is `409 decision_already_recorded`
+        (re-gate by editing, not by deciding twice).
+
+        The `refinement_draft_approved` / `refinement_draft_rejected` audit entry
+        is written on the global chain BEFORE the decision is persisted
+        (durable-before-state-change): the audit entry IS the gate's record, so
+        an audit-append failure is a `500` and no approval is recorded.
+
+        Requires `write:approvals` scope.
+      tags: [refinement]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [decision, reason]
+              properties:
+                decision: { type: string, enum: [approved, rejected] }
+                reason: { type: string, description: The required decision rationale (recorded and audited). }
+      responses:
+        '200':
+          description: The updated session view (state reflects the decision).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RefinementSession' }
+        '400': { description: "`validation_failed` — malformed JSON, unknown fields, or non-UUID `session_id`." }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: "`insufficient_scope` — token lacks `write:approvals`." }
+        '404': { description: "`refinement_session_not_found`." }
+        '409': { description: "`decision_already_recorded` — the latest revision already carries a decision." }
+        '422': { description: "`validation_failed` — `decision` not in {approved, rejected}, or a missing/blank `reason`." }
+        '500': { description: "`audit_append_failed` — the decision's audit entry could not be durably recorded; nothing was persisted." }
+        '503': { description: "`refinement_repo_unconfigured`." }
+
   /v0/calibration:
     get:
       operationId: getCalibration
@@ -8596,6 +8866,8 @@ tags:
     description: Append-only audit log read paths.
   - name: work-items
     description: Provider-agnostic work-item filing via per-repo conventions.
+  - name: refinement
+    description: Draft preview + approval gate over natural-language briefs (E34.2).
   - name: campaigns
     description: Epic-driven multi-issue campaigns and their rollup status.
   - name: runner

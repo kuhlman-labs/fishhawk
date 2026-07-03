@@ -21,6 +21,7 @@ package refinement
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
@@ -98,6 +99,63 @@ func (d EpicDraft) Validate() error {
 		}
 	}
 	return d.validateDependencies()
+}
+
+// Waves returns the draft's topological dispatch order as waves of 1-based
+// child ordinals: Waves()[w] holds the ordinals of the children whose
+// dependencies are all satisfied by earlier waves. It runs campaign.Assemble
+// over the SAME synthetic 1..N ordinal numbering validateDependencies uses (so
+// the preview wave DAG matches exactly what the campaign assembler produces at
+// filing time), then maps Assembly.Waves' synthetic `issue:N` refs back to the
+// 1-based ordinals. A dangling or cyclic edge surfaces the wrapped
+// campaign.ErrDanglingDependency / campaign.ErrCycle (errors.Is works through
+// the wrap), mirroring Validate — a preview of an invalid graph fails closed
+// rather than rendering a partial DAG.
+func (d EpicDraft) Waves() ([][]int, error) {
+	res := &workmgmt.EpicChildrenResult{
+		Children: make([]workmgmt.EpicChild, len(d.Children)),
+	}
+	for i := range d.Children {
+		res.Children[i] = workmgmt.EpicChild{Number: i + 1}
+	}
+	for i, c := range d.Children {
+		for _, dep := range c.DependsOn {
+			res.Edges = append(res.Edges, workmgmt.DependsEdge{From: i + 1, To: dep})
+		}
+	}
+	asm, err := campaign.Assemble("draft", res)
+	if err != nil {
+		return nil, fmt.Errorf("refinement: draft wave assembly failed: %w", err)
+	}
+	waves := make([][]int, len(asm.Waves))
+	for w, refs := range asm.Waves {
+		ordinals := make([]int, 0, len(refs))
+		for _, ref := range refs {
+			ord, perr := ordinalFromRef(ref)
+			if perr != nil {
+				return nil, perr
+			}
+			ordinals = append(ordinals, ord)
+		}
+		waves[w] = ordinals
+	}
+	return waves, nil
+}
+
+// ordinalFromRef parses a synthetic `issue:N` campaign ref back into the
+// 1-based child ordinal N. The refs come from campaign.Assemble over our own
+// synthetic numbering, so a malformed ref is an internal invariant break, not
+// user input — it surfaces as an error rather than a silent zero.
+func ordinalFromRef(ref string) (int, error) {
+	const prefix = "issue:"
+	if !strings.HasPrefix(ref, prefix) {
+		return 0, fmt.Errorf("refinement: unexpected wave ref %q (want issue:N)", ref)
+	}
+	n, err := strconv.Atoi(ref[len(prefix):])
+	if err != nil {
+		return 0, fmt.Errorf("refinement: unparseable wave ref %q: %w", ref, err)
+	}
+	return n, nil
 }
 
 // validateDependencies maps the children onto a synthetic 1..N EpicChild set
