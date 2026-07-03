@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -259,5 +260,188 @@ func TestPostgres_ContentHashSurvivesJSONBRoundTrip(t *testing.T) {
 	}
 	if written != readBack {
 		t.Errorf("content hash drifted across JSONB round-trip: written %s != read-back %s", written, readBack)
+	}
+}
+
+// ---- filing ledger (E34.3 / #1594) ----------------------------------------
+
+// seedFilingDraft persists a draft row (the FK target) and returns its id.
+func seedFilingDraft(t *testing.T, repo Repository) uuid.UUID {
+	t.Helper()
+	stored, err := repo.CreateDraft(context.Background(), CreateParams{
+		SessionID: uuid.New(), Brief: "b", Draft: validDraft(),
+	})
+	if err != nil {
+		t.Fatalf("CreateDraft: %v", err)
+	}
+	return stored.ID
+}
+
+func TestPostgres_FilingSession_CreateGetRepoPersisted(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+	draftID := seedFilingDraft(t, repo)
+	sessionID := uuid.New()
+
+	sess, err := repo.CreateFilingSession(context.Background(), FilingSessionParams{
+		DraftID: draftID, SessionID: sessionID, Repo: "kuhlman-labs/fishhawk",
+	})
+	if err != nil {
+		t.Fatalf("CreateFilingSession: %v", err)
+	}
+	if sess.Repo != "kuhlman-labs/fishhawk" || sess.SessionID != sessionID {
+		t.Errorf("created session = %+v, want repo + session persisted", sess)
+	}
+	if sess.CompletedAt != nil {
+		t.Errorf("fresh session CompletedAt = %v, want nil", sess.CompletedAt)
+	}
+
+	got, err := repo.GetFilingSession(context.Background(), draftID)
+	if err != nil {
+		t.Fatalf("GetFilingSession: %v", err)
+	}
+	if got.Repo != "kuhlman-labs/fishhawk" || got.CompletedAt != nil {
+		t.Errorf("reloaded session = %+v, want repo persisted + not completed", got)
+	}
+}
+
+func TestPostgres_FilingSession_GetNotFound(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+
+	if _, err := repo.GetFilingSession(context.Background(), uuid.New()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetFilingSession on unknown draft = %v, want ErrNotFound", err)
+	}
+}
+
+func TestPostgres_CompleteFilingSession_FlipsOnce(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+	draftID := seedFilingDraft(t, repo)
+	if _, err := repo.CreateFilingSession(context.Background(), FilingSessionParams{
+		DraftID: draftID, SessionID: uuid.New(), Repo: "o/r",
+	}); err != nil {
+		t.Fatalf("CreateFilingSession: %v", err)
+	}
+
+	if err := repo.CompleteFilingSession(context.Background(), draftID); err != nil {
+		t.Fatalf("CompleteFilingSession: %v", err)
+	}
+	first, err := repo.GetFilingSession(context.Background(), draftID)
+	if err != nil {
+		t.Fatalf("GetFilingSession: %v", err)
+	}
+	if first.CompletedAt == nil {
+		t.Fatal("CompletedAt is nil after CompleteFilingSession, want set")
+	}
+	completedAt := *first.CompletedAt
+
+	// A second CompleteFilingSession is a no-op (WHERE completed_at IS NULL), so
+	// the timestamp does not move.
+	if err := repo.CompleteFilingSession(context.Background(), draftID); err != nil {
+		t.Fatalf("second CompleteFilingSession: %v", err)
+	}
+	second, err := repo.GetFilingSession(context.Background(), draftID)
+	if err != nil {
+		t.Fatalf("GetFilingSession: %v", err)
+	}
+	if second.CompletedAt == nil || !second.CompletedAt.Equal(completedAt) {
+		t.Errorf("CompletedAt moved on the second complete: %v -> %v, want unchanged", completedAt, second.CompletedAt)
+	}
+}
+
+func TestPostgres_RecordFiledItem_DuplicateViolatesUnique(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+	draftID := seedFilingDraft(t, repo)
+	if _, err := repo.CreateFilingSession(context.Background(), FilingSessionParams{
+		DraftID: draftID, SessionID: uuid.New(), Repo: "o/r",
+	}); err != nil {
+		t.Fatalf("CreateFilingSession: %v", err)
+	}
+
+	if _, err := repo.RecordFiledItem(context.Background(), FiledItemParams{
+		DraftID: draftID, Ordinal: 0, IssueNumber: 100, IssueURL: "u",
+	}); err != nil {
+		t.Fatalf("RecordFiledItem: %v", err)
+	}
+	// A second record for the same (draft_id, ordinal) violates UNIQUE.
+	if _, err := repo.RecordFiledItem(context.Background(), FiledItemParams{
+		DraftID: draftID, Ordinal: 0, IssueNumber: 999, IssueURL: "u2",
+	}); err == nil {
+		t.Error("duplicate (draft_id, ordinal) record succeeded, want UNIQUE violation")
+	}
+}
+
+func TestPostgres_ListFiledItems_OrdinalOrdered(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+	draftID := seedFilingDraft(t, repo)
+	if _, err := repo.CreateFilingSession(context.Background(), FilingSessionParams{
+		DraftID: draftID, SessionID: uuid.New(), Repo: "o/r",
+	}); err != nil {
+		t.Fatalf("CreateFilingSession: %v", err)
+	}
+	// Record out of order; ListFiledItems returns ordinal ASC.
+	for _, ord := range []int{2, 0, 1} {
+		if _, err := repo.RecordFiledItem(context.Background(), FiledItemParams{
+			DraftID: draftID, Ordinal: ord, IssueNumber: 100 + ord, IssueURL: "u",
+		}); err != nil {
+			t.Fatalf("RecordFiledItem %d: %v", ord, err)
+		}
+	}
+	items, err := repo.ListFiledItems(context.Background(), draftID)
+	if err != nil {
+		t.Fatalf("ListFiledItems: %v", err)
+	}
+	if len(items) != 3 || items[0].Ordinal != 0 || items[1].Ordinal != 1 || items[2].Ordinal != 2 {
+		t.Errorf("ListFiledItems ordinals = %v, want [0 1 2]", items)
+	}
+	if items[1].IssueNumber != 101 {
+		t.Errorf("ordinal 1 issue number = %d, want 101", items[1].IssueNumber)
+	}
+}
+
+func TestPostgres_WithFilingLock_SerializesSameDraft(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+	draftID := uuid.New()
+
+	// Hold the lock in one goroutine, prove a second WithFilingLock for the same
+	// draft blocks until the first releases.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		_ = repo.WithFilingLock(context.Background(), draftID, func(_ context.Context) error {
+			close(entered)
+			<-release
+			return nil
+		})
+		close(done)
+	}()
+	<-entered
+
+	secondAcquired := make(chan struct{})
+	go func() {
+		_ = repo.WithFilingLock(context.Background(), draftID, func(_ context.Context) error {
+			close(secondAcquired)
+			return nil
+		})
+	}()
+
+	select {
+	case <-secondAcquired:
+		t.Fatal("second WithFilingLock acquired while the first held the lock")
+	case <-time.After(200 * time.Millisecond):
+		// Expected: still blocked.
+	}
+	close(release)
+	<-done
+	select {
+	case <-secondAcquired:
+		// Expected: acquired once the first released.
+	case <-time.After(2 * time.Second):
+		t.Fatal("second WithFilingLock never acquired after the first released")
 	}
 }

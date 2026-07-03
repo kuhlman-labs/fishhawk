@@ -51,6 +51,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/refinement/sessions/{session_id}", s.handleGetRefinementSession)
 	mux.HandleFunc("PATCH /v0/refinement/sessions/{session_id}/draft", s.handlePatchRefinementDraft)
 	mux.HandleFunc("POST /v0/refinement/sessions/{session_id}/decision", s.handleDecideRefinementSession)
+	mux.HandleFunc("POST /v0/refinement/sessions/{session_id}/file", s.handleFileRefinementSession)
 	mux.HandleFunc("POST /v0/work-items", s.handleFileWorkItem)
 	mux.HandleFunc("GET /v0/calibration", s.handleGetCalibration)
 	mux.HandleFunc("GET /v0/acceptance-triage/stats", s.handleGetAcceptanceTriageStats)

@@ -26,3 +26,30 @@ RETURNING *;
 SELECT * FROM refinement_decisions
 WHERE session_id = $1
 ORDER BY created_at ASC;
+
+-- E34.3 filing executor (#1594) — the idempotency ledger. A filing session
+-- pins the target repo per approved draft; a filed-item row records one
+-- ordinal->issue mapping recorded immediately after each provider File.
+
+-- name: CreateRefinementFilingSession :one
+INSERT INTO refinement_filing_sessions (draft_id, session_id, repo)
+VALUES ($1, $2, $3)
+RETURNING *;
+
+-- name: GetRefinementFilingSession :one
+SELECT * FROM refinement_filing_sessions WHERE draft_id = $1;
+
+-- name: CompleteRefinementFilingSession :exec
+UPDATE refinement_filing_sessions
+SET completed_at = now()
+WHERE draft_id = $1 AND completed_at IS NULL;
+
+-- name: CreateRefinementFiledItem :one
+INSERT INTO refinement_filed_items (id, draft_id, ordinal, issue_number, issue_url)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING *;
+
+-- name: ListRefinementFiledItems :many
+SELECT * FROM refinement_filed_items
+WHERE draft_id = $1
+ORDER BY ordinal ASC;

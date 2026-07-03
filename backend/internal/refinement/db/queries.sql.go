@@ -11,6 +11,17 @@ import (
 	"github.com/google/uuid"
 )
 
+const completeRefinementFilingSession = `-- name: CompleteRefinementFilingSession :exec
+UPDATE refinement_filing_sessions
+SET completed_at = now()
+WHERE draft_id = $1 AND completed_at IS NULL
+`
+
+func (q *Queries) CompleteRefinementFilingSession(ctx context.Context, draftID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, completeRefinementFilingSession, draftID)
+	return err
+}
+
 const createRefinementDecision = `-- name: CreateRefinementDecision :one
 INSERT INTO refinement_decisions (id, session_id, draft_id, decision, reason, draft_content_hash, decided_by)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -94,6 +105,69 @@ func (q *Queries) CreateRefinementDraft(ctx context.Context, arg CreateRefinemen
 	return i, err
 }
 
+const createRefinementFiledItem = `-- name: CreateRefinementFiledItem :one
+INSERT INTO refinement_filed_items (id, draft_id, ordinal, issue_number, issue_url)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, draft_id, ordinal, issue_number, issue_url, created_at
+`
+
+type CreateRefinementFiledItemParams struct {
+	ID          uuid.UUID `json:"id"`
+	DraftID     uuid.UUID `json:"draft_id"`
+	Ordinal     int32     `json:"ordinal"`
+	IssueNumber int32     `json:"issue_number"`
+	IssueUrl    string    `json:"issue_url"`
+}
+
+func (q *Queries) CreateRefinementFiledItem(ctx context.Context, arg CreateRefinementFiledItemParams) (RefinementFiledItem, error) {
+	row := q.db.QueryRow(ctx, createRefinementFiledItem,
+		arg.ID,
+		arg.DraftID,
+		arg.Ordinal,
+		arg.IssueNumber,
+		arg.IssueUrl,
+	)
+	var i RefinementFiledItem
+	err := row.Scan(
+		&i.ID,
+		&i.DraftID,
+		&i.Ordinal,
+		&i.IssueNumber,
+		&i.IssueUrl,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const createRefinementFilingSession = `-- name: CreateRefinementFilingSession :one
+
+INSERT INTO refinement_filing_sessions (draft_id, session_id, repo)
+VALUES ($1, $2, $3)
+RETURNING draft_id, session_id, repo, created_at, completed_at
+`
+
+type CreateRefinementFilingSessionParams struct {
+	DraftID   uuid.UUID `json:"draft_id"`
+	SessionID uuid.UUID `json:"session_id"`
+	Repo      string    `json:"repo"`
+}
+
+// E34.3 filing executor (#1594) — the idempotency ledger. A filing session
+// pins the target repo per approved draft; a filed-item row records one
+// ordinal->issue mapping recorded immediately after each provider File.
+func (q *Queries) CreateRefinementFilingSession(ctx context.Context, arg CreateRefinementFilingSessionParams) (RefinementFilingSession, error) {
+	row := q.db.QueryRow(ctx, createRefinementFilingSession, arg.DraftID, arg.SessionID, arg.Repo)
+	var i RefinementFilingSession
+	err := row.Scan(
+		&i.DraftID,
+		&i.SessionID,
+		&i.Repo,
+		&i.CreatedAt,
+		&i.CompletedAt,
+	)
+	return i, err
+}
+
 const getRefinementDraft = `-- name: GetRefinementDraft :one
 SELECT id, session_id, brief, draft, model, created_at, origin FROM refinement_drafts WHERE id = $1
 `
@@ -109,6 +183,23 @@ func (q *Queries) GetRefinementDraft(ctx context.Context, id uuid.UUID) (Refinem
 		&i.Model,
 		&i.CreatedAt,
 		&i.Origin,
+	)
+	return i, err
+}
+
+const getRefinementFilingSession = `-- name: GetRefinementFilingSession :one
+SELECT draft_id, session_id, repo, created_at, completed_at FROM refinement_filing_sessions WHERE draft_id = $1
+`
+
+func (q *Queries) GetRefinementFilingSession(ctx context.Context, draftID uuid.UUID) (RefinementFilingSession, error) {
+	row := q.db.QueryRow(ctx, getRefinementFilingSession, draftID)
+	var i RefinementFilingSession
+	err := row.Scan(
+		&i.DraftID,
+		&i.SessionID,
+		&i.Repo,
+		&i.CreatedAt,
+		&i.CompletedAt,
 	)
 	return i, err
 }
@@ -171,6 +262,39 @@ func (q *Queries) ListRefinementDraftsForSession(ctx context.Context, sessionID 
 			&i.Model,
 			&i.CreatedAt,
 			&i.Origin,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRefinementFiledItems = `-- name: ListRefinementFiledItems :many
+SELECT id, draft_id, ordinal, issue_number, issue_url, created_at FROM refinement_filed_items
+WHERE draft_id = $1
+ORDER BY ordinal ASC
+`
+
+func (q *Queries) ListRefinementFiledItems(ctx context.Context, draftID uuid.UUID) ([]RefinementFiledItem, error) {
+	rows, err := q.db.Query(ctx, listRefinementFiledItems, draftID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []RefinementFiledItem
+	for rows.Next() {
+		var i RefinementFiledItem
+		if err := rows.Scan(
+			&i.ID,
+			&i.DraftID,
+			&i.Ordinal,
+			&i.IssueNumber,
+			&i.IssueUrl,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}

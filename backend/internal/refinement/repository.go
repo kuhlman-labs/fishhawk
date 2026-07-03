@@ -89,10 +89,52 @@ type DecisionParams struct {
 	DecidedBy        string
 }
 
+// FilingSession is the per-approved-draft filing record (E34.3 / #1594). It
+// durably pins the target repo at first invoke (a re-invoke naming a different
+// repo fails closed) and its CompletedAt flip is the session-closing state
+// change. CompletedAt is nil until the executor finishes filing every item.
+type FilingSession struct {
+	DraftID     uuid.UUID
+	SessionID   uuid.UUID
+	Repo        string
+	CreatedAt   time.Time
+	CompletedAt *time.Time
+}
+
+// FilingSessionParams collects the inputs to open a filing session.
+type FilingSessionParams struct {
+	DraftID   uuid.UUID
+	SessionID uuid.UUID
+	Repo      string
+}
+
+// FiledItem is one durable ordinal->issue mapping recorded immediately after a
+// provider File returns (E34.3 / #1594). Ordinal 0 is the epic, 1..N the draft
+// children. The unique (DraftID, Ordinal) constraint is the DB-level
+// never-double-record backstop that pairs with the executor's record-after-file
+// ordering and the per-draft advisory lock.
+type FiledItem struct {
+	DraftID     uuid.UUID
+	Ordinal     int
+	IssueNumber int
+	IssueURL    string
+	CreatedAt   time.Time
+}
+
+// FiledItemParams collects the inputs to record one filed item.
+type FiledItemParams struct {
+	DraftID     uuid.UUID
+	Ordinal     int
+	IssueNumber int
+	IssueURL    string
+}
+
 // Repository persists refinement drafts + decisions and resolves them by id or
-// by refinement session. A draft is NEVER filed here — the repository stores
-// the draft artifact and the append-only decision record; the E34.3 filing
-// executor is what turns an approved draft into provider work items.
+// by refinement session, and (E34.3 / #1594) persists the filing idempotency
+// ledger the executor consumes. A draft is NEVER filed here — the repository
+// stores the draft artifact, the append-only decision record, and the durable
+// filing ledger; the E34.3 filing executor is what turns an approved draft into
+// provider work items.
 //
 // Both drafts and decisions are append-only: there is no update or delete path.
 // A new revision (an edit) is a new draft row that structurally invalidates a
@@ -108,4 +150,30 @@ type Repository interface {
 	RecordDecision(ctx context.Context, p DecisionParams) (*Decision, error)
 	// ListDecisions returns every decision for the session in append order.
 	ListDecisions(ctx context.Context, sessionID uuid.UUID) ([]*Decision, error)
+
+	// CreateFilingSession opens the per-draft filing session, pinning the
+	// target repo. The draft_id PK means a second open for the same draft
+	// fails at insert (surfaced wrapped), so the row is created exactly once.
+	CreateFilingSession(ctx context.Context, p FilingSessionParams) (*FilingSession, error)
+	// GetFilingSession returns the draft's filing session, or ErrNotFound when
+	// no filing has been started for it.
+	GetFilingSession(ctx context.Context, draftID uuid.UUID) (*FilingSession, error)
+	// CompleteFilingSession flips completed_at to now() when it is still NULL —
+	// the session-closing state change. A no-op on an already-completed row.
+	CompleteFilingSession(ctx context.Context, draftID uuid.UUID) error
+	// RecordFiledItem durably records one ordinal->issue mapping. The unique
+	// (draft_id, ordinal) constraint rejects a duplicate record (surfaced
+	// wrapped) — the residual at-least-once backstop.
+	RecordFiledItem(ctx context.Context, p FiledItemParams) (*FiledItem, error)
+	// ListFiledItems returns every recorded item for the draft, ordinal ASC.
+	ListFiledItems(ctx context.Context, draftID uuid.UUID) ([]*FiledItem, error)
+
+	// WithFilingLock runs fn while holding a per-draft mutual exclusion, so two
+	// concurrent filing invocations for the same draft cannot both observe an
+	// ordinal as unfiled (the gpt-5.5 concurrent-duplication guard, ADR-052).
+	// The Postgres adapter acquires a session-level pg_advisory_lock keyed on
+	// the draft UUID on a dedicated pooled connection and releases it when fn
+	// returns; the second caller blocks until the first releases, then observes
+	// the first's committed progress. fn's error is returned unchanged.
+	WithFilingLock(ctx context.Context, draftID uuid.UUID, fn func(context.Context) error) error
 }

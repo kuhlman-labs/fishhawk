@@ -100,7 +100,34 @@ func RenderDraft(draft EpicDraft, opts RenderOptions, conv workmgmt.Conventions)
 // #numbers). A child with no edges renders a body byte-identical to a direct
 // Apply call (the never-fold-the-marker byte-compat contract).
 func RenderChild(child ChildDraft, ordinal int, opts RenderOptions, conv workmgmt.Conventions) (workmgmt.WorkItem, error) {
-	req := workmgmt.FilingRequest{
+	// Preview: the sentinel epic number + parent-epic ref, and NO real
+	// depends_on refs on the request (the ordinal-placeholder marker is
+	// appended AFTER Apply, unchanged, below).
+	req := FilingRequestForChild(child, ordinal, opts.epicNumber(), opts.parentEpicRef(), nil)
+	item, _, err := workmgmt.Apply(req, conv)
+	if err != nil {
+		return workmgmt.WorkItem{}, err
+	}
+	item.Body = appendDependsOnMarker(item.Body, child.DependsOn)
+	return item, nil
+}
+
+// FilingRequestForChild builds the conventions FilingRequest for one child at
+// its 1-based ordinal. It is the single seam shared by the E34.2 preview
+// (RenderChild, which passes the sentinel epicNumber/parentEpicRef and nil
+// dependsOnRefs) and the E34.3 filing executor (which passes the real epic
+// number, real `#N` parent ref, and the child's depends_on refs resolved to
+// real `#N` numbers). By construction "what was previewed is what files": the
+// same builder produces both requests, differing only in the sentinel-vs-real
+// substitutions the executor is defined to make.
+//
+// dependsOnRefs sets Relations.DependsOn so the github provider's
+// ensureDependsOnMarker renders the marker in its exact `Depends on: #N` format
+// at File time. The preview passes nil (Relations.DependsOn empty) and appends
+// the draft-ordinal placeholder marker itself after Apply, so a preview body is
+// byte-identical whether or not this builder is used.
+func FilingRequestForChild(child ChildDraft, ordinal int, epicNumber, parentEpicRef string, dependsOnRefs []string) workmgmt.FilingRequest {
+	return workmgmt.FilingRequest{
 		Type:    "feature",
 		Summary: child.Summary,
 		Sections: map[string]string{
@@ -110,17 +137,11 @@ func RenderChild(child ChildDraft, ordinal int, opts RenderOptions, conv workmgm
 		},
 		Labels: child.Labels,
 		TitleVars: map[string]string{
-			"epic": opts.epicNumber(),
+			"epic": epicNumber,
 			"n":    strconv.Itoa(ordinal),
 		},
-		Relations: workmgmt.Relations{ParentEpic: opts.parentEpicRef()},
+		Relations: workmgmt.Relations{ParentEpic: parentEpicRef, DependsOn: dependsOnRefs},
 	}
-	item, _, err := workmgmt.Apply(req, conv)
-	if err != nil {
-		return workmgmt.WorkItem{}, err
-	}
-	item.Body = appendDependsOnMarker(item.Body, child.DependsOn)
-	return item, nil
 }
 
 // RenderEpic renders the epic into a conventions-complete WorkItem via
@@ -130,24 +151,36 @@ func RenderChild(child ChildDraft, ordinal int, opts RenderOptions, conv workmgm
 // as its own section. The epic is a numbered type, so ExistingNumbers is
 // seeded (sentinel [0] -> epic number 1 by default) or Apply fails closed.
 func RenderEpic(epic EpicSpec, opts RenderOptions, conv workmgmt.Conventions) (workmgmt.WorkItem, error) {
+	req := FilingRequestForEpic(epic, opts.epicExistingNumbers())
+	item, _, err := workmgmt.Apply(req, conv)
+	if err != nil {
+		return workmgmt.WorkItem{}, err
+	}
+	return item, nil
+}
+
+// FilingRequestForEpic builds the conventions FilingRequest for the epic. It is
+// the single seam shared by the E34.2 preview (RenderEpic, which passes the
+// sentinel existingNumbers seed [0]) and the E34.3 filing executor (which
+// passes nil so applyAndFileWorkItem's server-side #1269 discovery allocates
+// against the real tracker). OutOfScope is folded into the Scope section under
+// an `### Out of scope` sub-heading because the epic skeleton carries no
+// dedicated out-of-scope section and Apply fails closed on an unknown section
+// key.
+func FilingRequestForEpic(epic EpicSpec, existingNumbers []int) workmgmt.FilingRequest {
 	scope := epic.Scope
 	if strings.TrimSpace(epic.OutOfScope) != "" {
 		scope = strings.TrimRight(epic.Scope, "\n") + "\n\n### Out of scope\n\n" + strings.TrimSpace(epic.OutOfScope)
 	}
-	req := workmgmt.FilingRequest{
+	return workmgmt.FilingRequest{
 		Type:    "epic",
 		Summary: epic.Summary,
 		Sections: map[string]string{
 			"Summary": epic.Summary,
 			"Scope":   scope,
 		},
-		ExistingNumbers: opts.epicExistingNumbers(),
+		ExistingNumbers: existingNumbers,
 	}
-	item, _, err := workmgmt.Apply(req, conv)
-	if err != nil {
-		return workmgmt.WorkItem{}, err
-	}
-	return item, nil
 }
 
 // bulletize renders acceptance criteria as a markdown bullet list — one
