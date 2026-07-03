@@ -436,5 +436,12 @@ func decodeExportCursor(raw string) (*exportCursor, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, errors.New("cursor is not in the expected shape")
 	}
+	// Both keyset components are required: a decodable-but-incomplete
+	// cursor (e.g. base64("{}")) leaves a zero created_at / nil id that
+	// runAfterCursor would silently mis-order into an empty complete
+	// page. Reject it as malformed rather than reset to the first page.
+	if c.CreatedAt.IsZero() || c.ID == uuid.Nil {
+		return nil, errors.New("cursor is missing created_at or id")
+	}
 	return &c, nil
 }

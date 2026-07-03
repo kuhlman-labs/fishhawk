@@ -478,6 +478,31 @@ func TestAuditExport_BadLimitAndCursor(t *testing.T) {
 			t.Fatalf("status %d body %s, want 400 cursor_invalid", rec.Code, rec.Body.String())
 		}
 	})
+	// A decodable-but-incomplete cursor must be rejected, not silently
+	// treated as a zero-value keyset that mis-orders into an empty
+	// complete page. Both the empty object and each single-field shape
+	// leave one required component zero.
+	t.Run("empty-object cursor", func(t *testing.T) {
+		bogus := base64.URLEncoding.EncodeToString([]byte(`{}`))
+		rec := doExport(s, "?cursor="+bogus)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "cursor_invalid") {
+			t.Fatalf("status %d body %s, want 400 cursor_invalid", rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("missing-id cursor", func(t *testing.T) {
+		bogus := base64.URLEncoding.EncodeToString([]byte(`{"created_at":"2026-01-01T00:00:00Z"}`))
+		rec := doExport(s, "?cursor="+bogus)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "cursor_invalid") {
+			t.Fatalf("status %d body %s, want 400 cursor_invalid", rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("missing-created-at cursor", func(t *testing.T) {
+		bogus := base64.URLEncoding.EncodeToString([]byte(`{"id":"11111111-1111-1111-1111-111111111111"}`))
+		rec := doExport(s, "?cursor="+bogus)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "cursor_invalid") {
+			t.Fatalf("status %d body %s, want 400 cursor_invalid", rec.Code, rec.Body.String())
+		}
+	})
 }
 
 // (7) signing key ErrNotFound → run exported with signing_key omitted
