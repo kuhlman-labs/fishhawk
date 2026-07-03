@@ -129,6 +129,9 @@ func TestOnboarding_RunbookResourceListedAndReadable(t *testing.T) {
 		// E34.4 refinement intake loop anchors (incl. the rejection/re-draft path).
 		"Refinement intake loop",
 		"Rejection / re-draft path",
+		// E34.5 / #1597: the criteria-gate advisory surface must be documented in
+		// the runbook — a dropped or reworded-away criteria-pre-check edit fails here.
+		"criteria_precheck",
 	} {
 		if !strings.Contains(c.Text, anchor) {
 			t.Errorf("runbook missing edge-case anchor %q", anchor)

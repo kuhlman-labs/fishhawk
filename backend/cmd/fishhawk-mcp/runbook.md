@@ -239,6 +239,17 @@ Arm dispatch **fails closed with no HTTP call** when zero arms or an illegal
 combination is populated (e.g. `brief` + `decision`, or both edit arms) — the
 error enumerates the legal combinations.
 
+**Criteria pre-check is advisory (E34.5 / #1596).** The open, preview, and edit
+results — and the session view — carry a `criteria_precheck` block: a
+per-drafted-child acceptance-criteria screen run through the same deterministic
+rule set as the plan-stage acceptance pre-check. Each finding names the child
+**ordinal** (1-based) and the **rule** (`no_blocking_criterion` is the one that
+sets a child's `needs_attention`; a non-empty epic `out_of_scope` is the
+justified escape hatch that suppresses it across the draft). The `decide`
+guidance names any flagged ordinals so you see the defect before deciding. Read
+it before you approve — but it is **advisory only**: a flagged draft never blocks
+`decide approved` or `file`. It informs your verdict; it does not make it.
+
 **Rejection / re-draft path.** A `rejected` verdict does not end the session:
 re-draft via `brief_amendment` (bounded by a **per-session budget of 3**; a
 further amendment returns `amendment_budget_exhausted` — switch to a direct

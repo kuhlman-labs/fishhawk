@@ -132,6 +132,51 @@ consistent with the medium tier, where agents do the work and humans approve it.
 
 ---
 
+## The intake refinement stage (medium autonomy, human-gated filing)
+
+The intake refinement flow (ADR-052; `fishhawk_draft_epic`) turns a
+natural-language **brief** into a structured epic-plus-children draft, gated
+behind a preview and an operator approval before anything files. It runs at the
+**medium** tier, and — like the acceptance agent — it is deliberately arranged
+so the agent adds *work*, never *authority*.
+
+Where the agent does the work:
+
+- **Drafting is agent work.** The drafter decomposes the brief into an epic and
+  its children (summary, proposal, done-means, acceptance criteria, labels,
+  1-based `depends_on` sibling ordinals). This is the medium-tier pattern — the
+  agent produces the structured artifact from the human's intent.
+
+Where judgment is load-bearing, it is **not** the agent's:
+
+- **The criteria gate is a deterministic advisory check, never a block.** The
+  E34.5 criteria quality gate grades every drafted child's acceptance criteria
+  through the same deterministic rule set the plan-stage acceptance pre-check
+  runs, surfaced as the `criteria_precheck` block on the session view. A child
+  with an unjustified missing blocking criterion is flagged `needs_attention` —
+  but approval and filing remain legal. The gate informs the operator's verdict;
+  it does not make it.
+- **Approval is an operator gate.** The approve/reject decision requires a
+  `write:approvals` operator token (the intake analogue of the plan-approval
+  gate — no new scope), a required reason, and is decide-once per revision. An
+  edit after approval structurally re-gates via the pinned content hash (an
+  approval whose hash no longer matches fails closed to `awaiting_approval`), so
+  a stale approval can never carry a changed draft to filing.
+- **Filing is deterministic and idempotent, and runs only after that human
+  approval.** The drafter itself never files (ADR-052 decision 1). The filing
+  executor writes to the provider only over the resolved-and-approved,
+  hash-pinned draft, resuming at the first unfiled item on a retry and never
+  re-filing a recorded one.
+
+**The parity invariant.** Drafted children ride the *exact* hand-filed
+conventions pipeline (`workmgmt.Apply`, byte-compatible by construction), so an
+agent-drafted item is indistinguishable from a hand-filed one — the capstone's
+conventions-parity spot-check. Like the acceptance agent, intake adds automated
+*work*, not automated *authority*: the human still approves what files, and the
+filing itself is a deterministic executor, not agent discretion.
+
+---
+
 ## What "agents do the work, humans approve the work" means here
 
 Fishhawk's product thesis is that humans setting direction and approving outcomes is the durable model — not transitional scaffolding. The autonomy tiers above reflect that. Even at high autonomy, humans authored the workflow that decided what the agent could do; the workflow itself is reviewed and approved by humans. Accountability never disappears, even when the keystrokes do.
