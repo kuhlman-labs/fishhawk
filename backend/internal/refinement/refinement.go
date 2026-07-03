@@ -66,9 +66,12 @@ type ChildDraft struct {
 // already-decoded draft.
 //
 // Structural rules: non-empty epic summary and scope; at least one child; per
-// child a non-empty summary and proposal and at least one acceptance
-// criterion (the issue's 'criteria per child' done-means — E34.5's precheck
-// adds the quality screen later).
+// child a non-empty summary and proposal. Acceptance-criteria QUALITY is NOT a
+// hard rule — a criteria-less child is no longer a 422. E34.5's advisory
+// precheck (EvaluateDraftCriteria) is the quality screen, exactly as this
+// comment always deferred it: a criteria-less child must be able to REACH the
+// preview flagged no_blocking_criterion for the gate to be informational
+// rather than a hard rejection the operator can never see past.
 //
 // Dependency rules reuse campaign.Assemble over a synthetic 1..N ordinal
 // numbering, so a draft edge is checked with exactly the semantics the
@@ -93,9 +96,6 @@ func (d EpicDraft) Validate() error {
 		}
 		if strings.TrimSpace(c.Proposal) == "" {
 			return fmt.Errorf("refinement: child %d (%q) has an empty proposal", ordinal, c.Summary)
-		}
-		if len(c.AcceptanceCriteria) == 0 {
-			return fmt.Errorf("refinement: child %d (%q) has no acceptance criteria", ordinal, c.Summary)
 		}
 	}
 	return d.validateDependencies()

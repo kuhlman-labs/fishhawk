@@ -89,15 +89,22 @@ type refinementDecisionView struct {
 // full filing preview (epic + every child as it would file), the wave DAG, and
 // the decision history.
 type refinementSessionView struct {
-	SessionID     uuid.UUID                `json:"session_id"`
-	State         string                   `json:"state"`
-	Drifted       bool                     `json:"drifted,omitempty"`
-	RevisionCount int                      `json:"revision_count"`
-	LatestOrigin  string                   `json:"latest_origin"`
-	LatestDraft   refinement.EpicDraft     `json:"latest_draft"`
-	Preview       []workmgmt.WorkItem      `json:"preview"`
-	Waves         [][]int                  `json:"waves"`
-	Decisions     []refinementDecisionView `json:"decisions"`
+	SessionID     uuid.UUID            `json:"session_id"`
+	State         string               `json:"state"`
+	Drifted       bool                 `json:"drifted,omitempty"`
+	RevisionCount int                  `json:"revision_count"`
+	LatestOrigin  string               `json:"latest_origin"`
+	LatestDraft   refinement.EpicDraft `json:"latest_draft"`
+	Preview       []workmgmt.WorkItem  `json:"preview"`
+	Waves         [][]int              `json:"waves"`
+	// CriteriaPrecheck is the E34.5 advisory acceptance-criteria pre-check over
+	// the latest draft's children (#1596): per-child findings plus a
+	// needs_attention marker. Always present (derived per response, nothing
+	// persisted) so a clean draft is distinguishable (empty findings) from
+	// never-checked. A no_blocking_criterion flag is advisory — the operator can
+	// still approve.
+	CriteriaPrecheck refinement.CriteriaPrecheck `json:"criteria_precheck"`
+	Decisions        []refinementDecisionView    `json:"decisions"`
 }
 
 // ---- handlers -------------------------------------------------------------
@@ -527,15 +534,16 @@ func (s *Server) respondRefinementSession(w http.ResponseWriter, r *http.Request
 	}
 
 	view := refinementSessionView{
-		SessionID:     sessionID,
-		State:         string(res.State),
-		Drifted:       res.Drifted,
-		RevisionCount: len(drafts),
-		LatestOrigin:  latest.Origin,
-		LatestDraft:   latest.Draft,
-		Preview:       preview,
-		Waves:         waves,
-		Decisions:     make([]refinementDecisionView, 0, len(decisions)),
+		SessionID:        sessionID,
+		State:            string(res.State),
+		Drifted:          res.Drifted,
+		RevisionCount:    len(drafts),
+		LatestOrigin:     latest.Origin,
+		LatestDraft:      latest.Draft,
+		Preview:          preview,
+		Waves:            waves,
+		CriteriaPrecheck: refinement.EvaluateDraftCriteria(latest.Draft),
+		Decisions:        make([]refinementDecisionView, 0, len(decisions)),
 	}
 	for _, d := range decisions {
 		view.Decisions = append(view.Decisions, refinementDecisionView{

@@ -482,6 +482,160 @@ func TestRefinement_IntegrationFlow(t *testing.T) {
 	}
 }
 
+// ---- E34.5 intake criteria pre-check (#1596) ------------------------------
+
+// refinementFlaggedDraft returns a draft whose second child has NO acceptance
+// criteria and whose epic carries an EMPTY out_of_scope — so the intake
+// pre-check flags child 2 with no_blocking_criterion.
+func refinementFlaggedDraft() refinement.EpicDraft {
+	d := refinementValidDraft()
+	d.Epic.OutOfScope = ""
+	d.Children[1].AcceptanceCriteria = nil
+	return d
+}
+
+// A drafted child with no blocking criterion surfaces the finding in the
+// session view BEFORE any decision — the issue's core done-means.
+func TestRefinement_CriteriaPrecheck_FlagsBeforeDecision(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := refinement.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	drafter := &fakeRefinementDrafter{draft: refinementFlaggedDraft(), model: "claude-opus-4-8"}
+	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, RefinementDrafter: drafter})
+
+	rec := httptest.NewRecorder()
+	s.handleCreateRefinementSession(rec, refinementReq(http.MethodPost, "/v0/refinement/sessions", "", `{"brief":"build X"}`))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: status = %d, want 201 (body %s)", rec.Code, rec.Body.String())
+	}
+	var view refinementSessionView
+	if err := json.Unmarshal(rec.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// The precheck flags the draft and names child 2, all before a decision.
+	if !view.CriteriaPrecheck.NeedsAttention {
+		t.Fatalf("criteria_precheck.needs_attention must be true; got %+v", view.CriteriaPrecheck)
+	}
+	if len(view.CriteriaPrecheck.Children) != 2 {
+		t.Fatalf("want 2 per-child checks; got %+v", view.CriteriaPrecheck.Children)
+	}
+	child2 := view.CriteriaPrecheck.Children[1]
+	if child2.Ordinal != 2 || !child2.NeedsAttention {
+		t.Fatalf("child 2 must be flagged by ordinal; got %+v", child2)
+	}
+	var found bool
+	for _, f := range child2.Findings {
+		if f.Rule == "no_blocking_criterion" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("child 2 must carry a no_blocking_criterion finding; got %+v", child2.Findings)
+	}
+	// State is still awaiting a verdict — the finding is in the PREVIEW.
+	if view.State != string(refinement.StateAwaitingApproval) {
+		t.Errorf("state = %s, want awaiting_approval", view.State)
+	}
+}
+
+// A clean multi-child draft shows checked-and-clean per child: findings [] (not
+// null) and needs_attention false.
+func TestRefinement_CriteriaPrecheck_CleanIsCheckedAndClean(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := refinement.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	drafter := &fakeRefinementDrafter{draft: refinementValidDraft(), model: "claude-opus-4-8"}
+	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, RefinementDrafter: drafter})
+
+	rec := httptest.NewRecorder()
+	s.handleCreateRefinementSession(rec, refinementReq(http.MethodPost, "/v0/refinement/sessions", "", `{"brief":"build X"}`))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: status = %d, want 201 (body %s)", rec.Code, rec.Body.String())
+	}
+	var view refinementSessionView
+	if err := json.Unmarshal(rec.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if view.CriteriaPrecheck.NeedsAttention {
+		t.Fatalf("a clean draft must not need attention; got %+v", view.CriteriaPrecheck)
+	}
+	for _, c := range view.CriteriaPrecheck.Children {
+		if c.NeedsAttention || len(c.Findings) != 0 {
+			t.Errorf("child %d must be clean; got %+v", c.Ordinal, c)
+		}
+	}
+	// findings serialize as [] (not null) so a reader can distinguish
+	// checked-and-clean from never-checked.
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"findings":[]`)) {
+		t.Errorf("clean child findings must marshal as [] (not null): %s", rec.Body.String())
+	}
+}
+
+// A direct-edit PATCH with a zero-criteria child returns 200 with an advisory
+// finding where it returned 422 before — the behavioral done-means for the
+// Validate relaxation (a comment-only touch cannot fake this).
+func TestRefinement_CriteriaPrecheck_DirectEditZeroCriteria200(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := refinement.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo})
+
+	sessionID := uuid.New()
+	if _, err := repo.CreateDraft(context.Background(), refinement.CreateParams{
+		SessionID: sessionID, Brief: "b", Draft: refinementValidDraft(), Origin: refinement.OriginBrief,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	s.handlePatchRefinementDraft(rec, refinementReq(http.MethodPatch, "/x", sessionID.String(),
+		mustJSON(t, map[string]any{"draft": refinementFlaggedDraft()})))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("edit: status = %d, want 200 (a criteria-less child is now advisory, not a 422); body %s", rec.Code, rec.Body.String())
+	}
+	var view refinementSessionView
+	if err := json.Unmarshal(rec.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !view.CriteriaPrecheck.NeedsAttention {
+		t.Fatalf("the edited draft must carry the advisory finding; got %+v", view.CriteriaPrecheck)
+	}
+}
+
+// A decision on a flagged draft still succeeds — the flag is advisory, so the
+// operator can approve anyway.
+func TestRefinement_CriteriaPrecheck_ApproveFlaggedSucceeds(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := refinement.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo})
+
+	sessionID := uuid.New()
+	if _, err := repo.CreateDraft(context.Background(), refinement.CreateParams{
+		SessionID: sessionID, Brief: "b", Draft: refinementFlaggedDraft(), Origin: refinement.OriginBrief,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	s.handleDecideRefinementSession(rec, refinementReq(http.MethodPost, "/x", sessionID.String(),
+		`{"decision":"approved","reason":"the missing criterion is acceptable for this slice"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("approve flagged draft: status = %d, want 200 (advisory); body %s", rec.Code, rec.Body.String())
+	}
+	var view refinementSessionView
+	if err := json.Unmarshal(rec.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if view.State != string(refinement.StateApproved) {
+		t.Errorf("state after approving a flagged draft = %s, want approved", view.State)
+	}
+	// The advisory finding is STILL present on the approved view.
+	if !view.CriteriaPrecheck.NeedsAttention {
+		t.Errorf("the advisory finding must persist through approval; got %+v", view.CriteriaPrecheck)
+	}
+}
+
 // ---- decision reason required ---------------------------------------------
 
 func TestRefinement_DecisionMissingReason422(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -83,7 +84,7 @@ type SessionGuidance struct {
 // carries the RefinementFilingResult for the file arm; exactly one is set.
 // SessionGuidance always names the next invocation for the derived state.
 type DraftEpicOutput struct {
-	Session         *RefinementSession      `json:"session,omitempty" jsonschema:"the session view (state, drifted, revision_count, latest_origin, latest_draft, preview, waves, decisions) for the open/preview/edit/decide arms"`
+	Session         *RefinementSession      `json:"session,omitempty" jsonschema:"the session view (state, drifted, revision_count, latest_origin, latest_draft, preview, waves, criteria_precheck, decisions) for the open/preview/edit/decide arms"`
 	Filing          *RefinementFilingResult `json:"filing,omitempty" jsonschema:"the filing result (epic + children numbers/urls, resumed, already_completed, verified) for the file arm"`
 	SessionGuidance []SessionGuidance       `json:"session_guidance" jsonschema:"the legal next fishhawk_draft_epic moves for the current derived state, first is the suggested default"`
 }
@@ -134,13 +135,16 @@ Arm dispatch fails closed with NO HTTP call when zero arms or an illegal
 combination is populated, and the error enumerates the legal combinations.
 
 Every arm returns the session view (state, drifted, revision_count,
-latest_origin, latest_draft, preview, waves, decisions), or — for the file arm —
-the filing result (epic/children numbers + urls, resumed, already_completed,
-verified). Each result also carries session_guidance: the exact next
-fishhawk_draft_epic arm + arguments for the derived state (awaiting_approval ->
-decide; rejected -> re-draft via brief_amendment or a direct draft edit;
-approved -> file; drifted -> re-decide the latest revision; filed -> terminal),
-so you never guess the next verb.
+latest_origin, latest_draft, preview, waves, criteria_precheck, decisions), or —
+for the file arm — the filing result (epic/children numbers + urls, resumed,
+already_completed, verified). criteria_precheck is the E34.5 advisory
+acceptance-criteria screen over the draft's children: a child flagged
+no_blocking_criterion sets needs_attention (approval remains legal). Each result
+also carries session_guidance: the exact next fishhawk_draft_epic arm +
+arguments for the derived state (awaiting_approval -> decide, naming any
+criteria-flagged child ordinals; rejected -> re-draft via brief_amendment or a
+direct draft edit; approved -> file; drifted -> re-decide the latest revision;
+filed -> terminal), so you never guess the next verb.
 
 Tool errors surface the backend code verbatim: amendment_budget_exhausted (the
 per-session brief-amendment budget of 3 is spent — switch to a direct draft
@@ -347,12 +351,23 @@ func guidanceForSession(sess *RefinementSession) []SessionGuidance {
 			Reason:    "the latest revision was rejected — re-draft via a brief_amendment (budget of 3) or a direct draft edit; a new revision re-gates the session to awaiting_approval",
 		}}
 	default: // awaiting_approval
+		decideReason := "the latest revision is awaiting a verdict — approve or reject it"
+		if flagged := flaggedCriteriaOrdinals(sess); len(flagged) > 0 {
+			// The acceptance-criteria pre-check flagged one or more children with
+			// an unjustified missing blocking criterion. The flag is ADVISORY —
+			// approval remains legal — but name the offending ordinals so the
+			// operator sees the defect before deciding.
+			decideReason = fmt.Sprintf(
+				"the latest revision is awaiting a verdict — approve or reject it. Advisory: the acceptance-criteria pre-check flagged %s (no_blocking_criterion); approval is still legal, or edit the child(ren) first",
+				formatOrdinals(flagged),
+			)
+		}
 		return []SessionGuidance{
 			{
 				State:     "awaiting_approval",
 				Arm:       "decide",
 				Arguments: map[string]string{"session_id": sess.SessionID, "decision": "approved|rejected", "reason": "why"},
-				Reason:    "the latest revision is awaiting a verdict — approve or reject it",
+				Reason:    decideReason,
 			},
 			{
 				State:     "awaiting_approval",
@@ -362,6 +377,32 @@ func guidanceForSession(sess *RefinementSession) []SessionGuidance {
 			},
 		}
 	}
+}
+
+// flaggedCriteriaOrdinals returns the 1-based ordinals of the children the
+// acceptance-criteria pre-check flagged needs_attention (an unjustified
+// no_blocking_criterion). Empty when the pre-check is clean or absent.
+func flaggedCriteriaOrdinals(sess *RefinementSession) []int {
+	var out []int
+	for _, c := range sess.CriteriaPrecheck.Children {
+		if c.NeedsAttention {
+			out = append(out, c.Ordinal)
+		}
+	}
+	return out
+}
+
+// formatOrdinals renders flagged child ordinals as human-readable prose, e.g.
+// "child 2" or "children 1, 3".
+func formatOrdinals(ordinals []int) string {
+	if len(ordinals) == 1 {
+		return fmt.Sprintf("child %d", ordinals[0])
+	}
+	parts := make([]string, len(ordinals))
+	for i, o := range ordinals {
+		parts[i] = strconv.Itoa(o)
+	}
+	return "children " + strings.Join(parts, ", ")
 }
 
 // guidanceForFiling names the terminal 'filed' guidance for a successful file

@@ -1533,12 +1533,42 @@ type RefinementDecision struct {
 	CreatedAt        time.Time `json:"created_at"`
 }
 
+// RefinementAcceptanceFinding mirrors one deterministic acceptance-criteria
+// defect the intake pre-check flagged (backend plan.AcceptanceFinding): the
+// machine-readable rule name, the offending criterion id (the criterion text at
+// intake), and a human-readable detail.
+type RefinementAcceptanceFinding struct {
+	Rule        string `json:"rule" jsonschema:"the machine-readable rule: no_blocking_criterion, missing_source_ref, missing_rationale, empty_id, or duplicate_id"`
+	CriterionID string `json:"criterion_id,omitempty" jsonschema:"the offending criterion (its text at intake); absent for the presence-level no_blocking_criterion finding"`
+	Detail      string `json:"detail" jsonschema:"a short human-readable explanation of the defect"`
+}
+
+// ChildCriteriaCheck mirrors the backend's per-child intake acceptance-criteria
+// pre-check: the 1-based child ordinal, its needs_attention marker, and its
+// findings ([] when checked-and-clean).
+type ChildCriteriaCheck struct {
+	Ordinal        int                           `json:"ordinal" jsonschema:"the 1-based child ordinal this check is for"`
+	NeedsAttention bool                          `json:"needs_attention,omitempty" jsonschema:"true when this child has an unjustified no_blocking_criterion finding (advisory — approval remains legal)"`
+	Findings       []RefinementAcceptanceFinding `json:"findings" jsonschema:"the child's acceptance-criteria findings; [] when checked and clean"`
+}
+
+// CriteriaPrecheck mirrors the backend's E34.5 advisory acceptance-criteria
+// pre-check over the latest draft (#1596): per-child findings plus a
+// draft-level needs_attention marker. Advisory only — a flagged draft can still
+// be approved; the guidance names the flagged child ordinals so the operator
+// sees the defect before deciding.
+type CriteriaPrecheck struct {
+	NeedsAttention bool                 `json:"needs_attention" jsonschema:"true when any child has an unjustified no_blocking_criterion finding (advisory — approval remains legal)"`
+	Children       []ChildCriteriaCheck `json:"children" jsonschema:"the per-child acceptance-criteria checks (one per draft child)"`
+}
+
 // RefinementSession mirrors the backend's RefinementSession schema
 // (docs/api/v0.openapi.yaml): the refinement gate's session view — the DERIVED
 // approval state, the revision count, the latest EpicDraft, the full filing
-// preview, the wave DAG, and the decision history. State is derived, never
-// stored: a decision counts only when it targets the latest revision and its
-// pinned hash still matches, so an edit after approval re-gates the session.
+// preview, the wave DAG, the advisory acceptance-criteria pre-check, and the
+// decision history. State is derived, never stored: a decision counts only when
+// it targets the latest revision and its pinned hash still matches, so an edit
+// after approval re-gates the session.
 //
 // SessionID is a `string` (not uuid.UUID) so the MCP SDK's reflection-built
 // output schema sees a string (the #371 trap). Preview is []map[string]any —
@@ -1546,15 +1576,16 @@ type RefinementDecision struct {
 // []workmgmt.WorkItem), typed as map[string]any (not json.RawMessage) so the
 // SDK's schema reflection sees an object, not a base64 string.
 type RefinementSession struct {
-	SessionID     string               `json:"session_id"`
-	State         string               `json:"state" jsonschema:"awaiting_approval, approved, or rejected (derived)"`
-	Drifted       bool                 `json:"drifted,omitempty" jsonschema:"true when the latest revision's decision pins a content hash that no longer matches (fail-closed to awaiting_approval)"`
-	RevisionCount int                  `json:"revision_count" jsonschema:"number of draft revisions in the session"`
-	LatestOrigin  string               `json:"latest_origin" jsonschema:"how the latest revision came to exist: brief, amendment, or edit"`
-	LatestDraft   EpicDraft            `json:"latest_draft" jsonschema:"the latest structured epic/children draft"`
-	Preview       []map[string]any     `json:"preview" jsonschema:"the full filing preview — the epic then each child, rendered exactly as it would file"`
-	Waves         [][]int              `json:"waves" jsonschema:"the topological dispatch order as waves of 1-based child ordinals"`
-	Decisions     []RefinementDecision `json:"decisions" jsonschema:"the append-only decision history"`
+	SessionID        string               `json:"session_id"`
+	State            string               `json:"state" jsonschema:"awaiting_approval, approved, or rejected (derived)"`
+	Drifted          bool                 `json:"drifted,omitempty" jsonschema:"true when the latest revision's decision pins a content hash that no longer matches (fail-closed to awaiting_approval)"`
+	RevisionCount    int                  `json:"revision_count" jsonschema:"number of draft revisions in the session"`
+	LatestOrigin     string               `json:"latest_origin" jsonschema:"how the latest revision came to exist: brief, amendment, or edit"`
+	LatestDraft      EpicDraft            `json:"latest_draft" jsonschema:"the latest structured epic/children draft"`
+	Preview          []map[string]any     `json:"preview" jsonschema:"the full filing preview — the epic then each child, rendered exactly as it would file"`
+	Waves            [][]int              `json:"waves" jsonschema:"the topological dispatch order as waves of 1-based child ordinals"`
+	CriteriaPrecheck CriteriaPrecheck     `json:"criteria_precheck" jsonschema:"the advisory acceptance-criteria pre-check over the latest draft's children; needs_attention flags an unjustified missing blocking criterion (approval remains legal)"`
+	Decisions        []RefinementDecision `json:"decisions" jsonschema:"the append-only decision history"`
 }
 
 // RefinementFilingEpic mirrors the file response's `epic` sub-object.

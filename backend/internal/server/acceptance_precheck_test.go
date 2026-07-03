@@ -263,47 +263,12 @@ func TestAcceptancePrecheck_OmittedBlockingCounts(t *testing.T) {
 	}
 }
 
-// (5) Explicit criterion with empty source_ref -> missing_source_ref finding
-// naming the criterion id.
-func TestAcceptancePrecheck_ExplicitMissingSourceRef_Flags(t *testing.T) {
-	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
-	body := acceptancePlanBody(t, []map[string]any{
-		{"id": "a1", "statement": "does a thing", "source": "explicit", "blocking": true},
-	}, nil)
-
-	s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
-
-	entry := lastAcceptancePrecheckEntry(t, au)
-	f := hasAcceptanceFinding(entry, acceptanceRuleMissingSourceRef)
-	if f == nil {
-		t.Fatalf("want a missing_source_ref finding; got %+v", entry.Findings)
-	}
-	if f.CriterionID != "a1" {
-		t.Errorf("finding CriterionID = %q, want a1", f.CriterionID)
-	}
-}
-
-// (6) Inferred criterion with empty rationale -> missing_rationale finding.
-// The body is crafted directly (bypassing schema validation, which the
-// if/then conditional would reject) so the defense-in-depth rule is exercised
-// independent of upload order.
-func TestAcceptancePrecheck_InferredMissingRationale_Flags(t *testing.T) {
-	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
-	body := acceptancePlanBody(t, []map[string]any{
-		{"id": "a1", "statement": "does a thing", "source": "inferred", "blocking": true},
-	}, nil)
-
-	s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
-
-	entry := lastAcceptancePrecheckEntry(t, au)
-	f := hasAcceptanceFinding(entry, acceptanceRuleMissingRationale)
-	if f == nil {
-		t.Fatalf("want a missing_rationale finding; got %+v", entry.Findings)
-	}
-	if f.CriterionID != "a1" {
-		t.Errorf("finding CriterionID = %q, want a1", f.CriterionID)
-	}
-}
+// The per-rule behavioral coverage of missing_source_ref, missing_rationale,
+// and empty_id moved to backend/internal/plan/acceptance_check_test.go with the
+// shared evaluator (#1596); the server tests below keep the integration
+// coverage — that a finding flows into the PERSISTED audit payload, that the
+// raw-body decode reaches the rule where plan.Parse would reject the plan, and
+// the fail-open paths.
 
 // (7) Duplicate id -> duplicate_id finding, proving the raw-body decode path
 // works where plan.Parse (semanticCheck) would reject the plan outright.
@@ -323,21 +288,6 @@ func TestAcceptancePrecheck_DuplicateID_Flags(t *testing.T) {
 	}
 	if f.CriterionID != "dup" {
 		t.Errorf("finding CriterionID = %q, want dup", f.CriterionID)
-	}
-}
-
-// TestAcceptancePrecheck_EmptyID_Flags exercises the empty_id branch.
-func TestAcceptancePrecheck_EmptyID_Flags(t *testing.T) {
-	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
-	body := acceptancePlanBody(t, []map[string]any{
-		{"id": "", "statement": "does a thing", "source": "explicit", "source_ref": "#1", "blocking": true},
-	}, nil)
-
-	s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
-
-	entry := lastAcceptancePrecheckEntry(t, au)
-	if hasAcceptanceFinding(entry, acceptanceRuleEmptyID) == nil {
-		t.Fatalf("want an empty_id finding; got %+v", entry.Findings)
 	}
 }
 
