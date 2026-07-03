@@ -213,3 +213,56 @@ runner sweep leftovers into the commit and fail the stage on scope drift
 (category-B). Recover with `git checkout -f main` (or remove the untracked
 files) so each run starts from a clean base. The runner owns all commit /
 branch / push operations — never commit or switch branches yourself.
+
+### Refinement intake loop
+
+Distinct from the run loop above: `fishhawk_draft_epic` (E34.4 / ADR-052) turns
+a natural-language **brief** into a structured epic + children, gated behind a
+preview + approval step before anything files. It is **one tool with five
+mutually-exclusive arms** — approve and file are arms on it, not
+`fishhawk_approve_plan` (which is stage-gated and resolves a run/stage; a
+refinement session is neither a run nor a stage). Every result carries a
+`session_guidance` block naming the exact next arm + arguments for the derived
+state, so you never guess the next verb.
+
+The arms and the happy path (brief → draft → preview → edit → approve → file):
+
+| Arm | Input | Does |
+|---|---|---|
+| open | `brief` alone | drafts the epic + children, opens a session, returns `awaiting_approval` |
+| preview | `session_id` alone | reads the current draft + derived approval `state` |
+| edit | `session_id` + (`brief_amendment` \| `draft`) | appends a new revision — agent re-draft, or a direct `EpicDraft` field edit |
+| decide | `session_id` + `decision` (`approved`\|`rejected`) + `reason` | records the verdict on the latest revision |
+| file | `session_id` + `repo` | files the approved, un-drifted draft into the tracker |
+
+Arm dispatch **fails closed with no HTTP call** when zero arms or an illegal
+combination is populated (e.g. `brief` + `decision`, or both edit arms) — the
+error enumerates the legal combinations.
+
+**Rejection / re-draft path.** A `rejected` verdict does not end the session:
+re-draft via `brief_amendment` (bounded by a **per-session budget of 3**; a
+further amendment returns `amendment_budget_exhausted` — switch to a direct
+`draft` edit, which has no budget) or a direct `draft` edit. Either **appends a
+new revision and re-gates the session to `awaiting_approval`**. An edit **after
+approval** re-gates the same way — session state is derived, never stored.
+
+**Decide-reason + decide-once rules.** `reason` is required on every decision.
+A revision carries at most one decision: a second decision on the same revision
+is `decision_already_recorded` — **re-gate by editing, never decide twice.**
+
+**Drift is fail-closed.** If an edit lands after approval, the approval's pinned
+content hash no longer matches: the session view reports `drifted: true` and
+fail-closes to `awaiting_approval`. `session_guidance` says **re-decide the
+latest revision** — a premature `file` arm returns `refinement_draft_drifted`.
+
+**Idempotent filing resume.** The `file` arm pins the target `repo` at first
+invoke (a re-invoke naming a different repo is `refinement_filing_repo_mismatch`).
+A mid-sequence provider failure is `refinement_filing_failed` (502) carrying the
+filed-so-far items + failing ordinal — **re-invoke the `file` arm with the SAME
+repo**; it resumes at the first unfiled ordinal and never re-files a recorded
+one. A fully completed session replays as `already_completed: true` and files
+nothing.
+
+**Auth.** A write tool requiring `write:approvals` — **no new scope** (the E34.2
+precedent), so the operator token already driving `fishhawk_approve_plan` works
+unchanged.

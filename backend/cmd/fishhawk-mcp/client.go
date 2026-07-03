@@ -1520,6 +1520,213 @@ func (c *apiClient) FileWorkItem(ctx context.Context, req FileWorkItemRequest) (
 	return &out, nil
 }
 
+// RefinementDecision mirrors the backend's RefinementDecision schema: one
+// append-only approve/reject verdict pinning a draft revision + its content
+// hash. DraftID is a `string` (not uuid.UUID) so the MCP SDK's reflection-built
+// output schema sees a string, not a 16-byte array (the #371 trap).
+type RefinementDecision struct {
+	Decision         string    `json:"decision" jsonschema:"approved or rejected"`
+	Reason           string    `json:"reason"`
+	DraftID          string    `json:"draft_id" jsonschema:"the decided revision's id"`
+	DraftContentHash string    `json:"draft_content_hash" jsonschema:"sha256 of the decoded EpicDraft the decision pinned"`
+	DecidedBy        string    `json:"decided_by,omitempty" jsonschema:"the deciding identity's subject; absent when unknown"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
+// RefinementSession mirrors the backend's RefinementSession schema
+// (docs/api/v0.openapi.yaml): the refinement gate's session view — the DERIVED
+// approval state, the revision count, the latest EpicDraft, the full filing
+// preview, the wave DAG, and the decision history. State is derived, never
+// stored: a decision counts only when it targets the latest revision and its
+// pinned hash still matches, so an edit after approval re-gates the session.
+//
+// SessionID is a `string` (not uuid.UUID) so the MCP SDK's reflection-built
+// output schema sees a string (the #371 trap). Preview is []map[string]any —
+// each item is an opaque work-item render (the backend serializes
+// []workmgmt.WorkItem), typed as map[string]any (not json.RawMessage) so the
+// SDK's schema reflection sees an object, not a base64 string.
+type RefinementSession struct {
+	SessionID     string               `json:"session_id"`
+	State         string               `json:"state" jsonschema:"awaiting_approval, approved, or rejected (derived)"`
+	Drifted       bool                 `json:"drifted,omitempty" jsonschema:"true when the latest revision's decision pins a content hash that no longer matches (fail-closed to awaiting_approval)"`
+	RevisionCount int                  `json:"revision_count" jsonschema:"number of draft revisions in the session"`
+	LatestOrigin  string               `json:"latest_origin" jsonschema:"how the latest revision came to exist: brief, amendment, or edit"`
+	LatestDraft   EpicDraft            `json:"latest_draft" jsonschema:"the latest structured epic/children draft"`
+	Preview       []map[string]any     `json:"preview" jsonschema:"the full filing preview — the epic then each child, rendered exactly as it would file"`
+	Waves         [][]int              `json:"waves" jsonschema:"the topological dispatch order as waves of 1-based child ordinals"`
+	Decisions     []RefinementDecision `json:"decisions" jsonschema:"the append-only decision history"`
+}
+
+// RefinementFilingEpic mirrors the file response's `epic` sub-object.
+type RefinementFilingEpic struct {
+	Number int    `json:"number"`
+	URL    string `json:"url"`
+}
+
+// RefinementFilingChild mirrors one filed child in the file response.
+type RefinementFilingChild struct {
+	Ordinal int    `json:"ordinal" jsonschema:"1-based draft child ordinal"`
+	Number  int    `json:"number"`
+	URL     string `json:"url"`
+}
+
+// RefinementFilingResult mirrors the backend's POST .../file 200 body: the
+// outcome of filing an approved draft into tracker items (fresh, resumed, or an
+// already-completed replay). SessionID / DraftID are strings (the #371 trap).
+type RefinementFilingResult struct {
+	SessionID        string                  `json:"session_id"`
+	DraftID          string                  `json:"draft_id"`
+	Repo             string                  `json:"repo"`
+	Epic             RefinementFilingEpic    `json:"epic"`
+	Children         []RefinementFilingChild `json:"children"`
+	Resumed          bool                    `json:"resumed" jsonschema:"true when this invocation resumed a partially-filed session"`
+	AlreadyCompleted bool                    `json:"already_completed" jsonschema:"true when replaying a fully-completed session (no writes performed)"`
+	Verified         bool                    `json:"verified" jsonschema:"true when the filed epic passed the epic-children + campaign-assembly round-trip"`
+}
+
+// createRefinementSessionRequest mirrors the backend's POST
+// /v0/refinement/sessions body.
+type createRefinementSessionRequest struct {
+	Brief string `json:"brief"`
+}
+
+// editRefinementDraftRequest mirrors the backend's PATCH
+// /v0/refinement/sessions/{id}/draft body. Exactly one arm is serialized (both are
+// omitempty): brief_amendment (agent re-draft) XOR draft (direct edit). The
+// caller (the tool handler) guarantees the XOR before this is built.
+type editRefinementDraftRequest struct {
+	BriefAmendment string     `json:"brief_amendment,omitempty"`
+	Draft          *EpicDraft `json:"draft,omitempty"`
+}
+
+// decideRefinementSessionRequest mirrors the backend's POST .../decision body.
+type decideRefinementSessionRequest struct {
+	Decision string `json:"decision"`
+	Reason   string `json:"reason"`
+}
+
+// fileRefinementSessionRequest mirrors the backend's POST .../file body.
+type fileRefinementSessionRequest struct {
+	Repo string `json:"repo"`
+}
+
+// CreateRefinementSession opens a refinement session over a natural-language
+// brief via `POST /v0/refinement/sessions` (E34.2, ADR-052 option A): it drafts
+// the initial epic/children revision and returns the session view. Nothing
+// files here. Requires write:approvals. 4xx/5xx surface as *apiError:
+//   - 400 validation_failed (malformed JSON / unknown fields)
+//   - 403 insufficient_scope (token lacks write:approvals)
+//   - 422 validation_failed (brief is empty)
+//   - 502 refinement_drafting_failed (the drafting agent produced no valid draft)
+//   - 503 refinement_repo_unconfigured / refinement_drafting_unavailable
+func (c *apiClient) CreateRefinementSession(ctx context.Context, brief string) (*RefinementSession, error) {
+	body, err := json.Marshal(createRefinementSessionRequest{Brief: brief})
+	if err != nil {
+		return nil, fmt.Errorf("marshal create-refinement-session: %w", err)
+	}
+	var out RefinementSession
+	if err := c.do(ctx, http.MethodPost, "/v0/refinement/sessions", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// GetRefinementSession reads a session's preview + derived approval state via
+// `GET /v0/refinement/sessions/{id}` (E34.2). Requires write:approvals. 4xx/5xx
+// surface as *apiError: 400 validation_failed (non-UUID id), 403
+// insufficient_scope, 404 refinement_session_not_found, 503
+// refinement_repo_unconfigured.
+func (c *apiClient) GetRefinementSession(ctx context.Context, sessionID uuid.UUID) (*RefinementSession, error) {
+	var out RefinementSession
+	if err := c.do(ctx, http.MethodGet, "/v0/refinement/sessions/"+sessionID.String(), nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// EditRefinementDraft appends a new draft revision via `PATCH
+// /v0/refinement/sessions/{id}/draft` (E34.2) — which is precisely what
+// invalidates a prior approval. Exactly one arm: briefAmendment (non-empty -> agent re-draft,
+// origin=amendment, bounded by a per-session budget of 3) XOR draft (non-nil ->
+// a direct strict-decoded EpicDraft edit, origin=edit, no agent call). The
+// caller guarantees the XOR. Requires write:approvals. 4xx/5xx surface as
+// *apiError:
+//   - 400 validation_failed (malformed JSON / unknown fields / non-UUID id)
+//   - 403 insufficient_scope
+//   - 404 refinement_session_not_found
+//   - 409 amendment_budget_exhausted (the brief-amendment budget is spent)
+//   - 422 validation_failed (neither/both arms, or a draft that fails strict
+//     decode/validation — an empty field, a dangling or cyclic depends_on edge)
+//   - 500 audit_append_failed (the edit's audit entry could not be recorded)
+//   - 502 refinement_drafting_failed (brief-amendment arm)
+//   - 503 refinement_repo_unconfigured / refinement_drafting_unavailable
+func (c *apiClient) EditRefinementDraft(ctx context.Context, sessionID uuid.UUID, briefAmendment string, draft *EpicDraft) (*RefinementSession, error) {
+	body, err := json.Marshal(editRefinementDraftRequest{BriefAmendment: briefAmendment, Draft: draft})
+	if err != nil {
+		return nil, fmt.Errorf("marshal edit-refinement-draft: %w", err)
+	}
+	var out RefinementSession
+	if err := c.do(ctx, http.MethodPatch, "/v0/refinement/sessions/"+sessionID.String()+"/draft", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DecideRefinementSession records an append-only approve/reject verdict pinning
+// the latest revision's draft_id + content hash via `POST .../decision`
+// (E34.2). reason is REQUIRED. A second decision on the same revision is 409
+// (re-gate by editing, not by deciding twice). Requires write:approvals.
+// 4xx/5xx surface as *apiError:
+//   - 400 validation_failed (malformed JSON / unknown fields / non-UUID id)
+//   - 403 insufficient_scope
+//   - 404 refinement_session_not_found
+//   - 409 decision_already_recorded (the latest revision already carries a decision)
+//   - 422 validation_failed (decision not approved/rejected, or a blank reason)
+//   - 500 audit_append_failed
+//   - 503 refinement_repo_unconfigured
+func (c *apiClient) DecideRefinementSession(ctx context.Context, sessionID uuid.UUID, decision, reason string) (*RefinementSession, error) {
+	body, err := json.Marshal(decideRefinementSessionRequest{Decision: decision, Reason: reason})
+	if err != nil {
+		return nil, fmt.Errorf("marshal decide-refinement-session: %w", err)
+	}
+	var out RefinementSession
+	if err := c.do(ctx, http.MethodPost, "/v0/refinement/sessions/"+sessionID.String()+"/decision", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// FileRefinementSession files an approved, un-drifted draft into tracker items
+// (the epic then children in wave order) via `POST .../file` (E34.3). It is
+// IDEMPOTENT: the target repo is pinned at first invoke (a re-invoke naming a
+// different repo is 409 refinement_filing_repo_mismatch); a mid-sequence
+// provider failure is 502 refinement_filing_failed with the filed-so-far items
+// + failing ordinal in details, and re-invoking resumes at the first unfiled
+// ordinal; a fully completed session replays as 200 with already_completed.
+// Requires write:approvals (no new scope — the E34.2 precedent). 4xx/5xx
+// surface as *apiError:
+//   - 400 validation_failed (malformed JSON / unknown fields / non-UUID id /
+//     repo not owner/name)
+//   - 403 insufficient_scope
+//   - 404 refinement_session_not_found
+//   - 409 refinement_not_approved / refinement_draft_drifted /
+//     refinement_filing_repo_mismatch
+//   - 500 internal_error (audit_append_failed on the completion close)
+//   - 502 refinement_filing_failed (resumable) /
+//     refinement_filing_verification_failed
+//   - 503 refinement_repo_unconfigured
+func (c *apiClient) FileRefinementSession(ctx context.Context, sessionID uuid.UUID, repo string) (*RefinementFilingResult, error) {
+	body, err := json.Marshal(fileRefinementSessionRequest{Repo: repo})
+	if err != nil {
+		return nil, fmt.Errorf("marshal file-refinement-session: %w", err)
+	}
+	var out RefinementFilingResult
+	if err := c.do(ctx, http.MethodPost, "/v0/refinement/sessions/"+sessionID.String()+"/file", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // DiagnosticBundle mirrors the backend's product-facts-only diagnostic
 // bundle (GET /v0/runs/{run_id}/diagnostics, #1006). Thin local copy —
 // same import-direction rule as the other mirrored shapes here. Every
