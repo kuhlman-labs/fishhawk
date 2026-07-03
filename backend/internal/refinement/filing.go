@@ -46,6 +46,20 @@ var ErrFilingRepoMismatch = errors.New("refinement: filing session pins a differ
 // scripted fake with no provider wiring.
 type FileItemFunc func(ctx context.Context, req workmgmt.FilingRequest) (number int, url string, err error)
 
+// FinalizeFunc runs the session-closing side effects (round-trip verification,
+// the refinement_filing_completed audit append, and the completed_at flip) for
+// a fresh/resumed FULL fill, INSIDE the per-draft advisory lock and just before
+// it releases. Because it is serialized with filing under the same lock, a
+// concurrent second invocation that was blocked on the lock enters only after
+// this returns and CompleteFilingSession has flipped completed_at — so it
+// observes AlreadyCompleted=true and appends NO second completion audit. It is
+// NOT called for an already-completed replay (which performs no writes).
+// Returning an error aborts before completion is durable (the lock releases, the
+// items stay durable, a re-invoke retries) and propagates out of ExecuteFiling
+// unchanged. A nil FinalizeFunc skips finalization (the executor's unit tests,
+// which assert filing/recording only).
+type FinalizeFunc func(ctx context.Context, outcome *FilingOutcome) error
+
 // FiledResult is one filed item's ordinal -> (number, url) mapping in a
 // FilingOutcome (ordinal 0 is the epic, 1..N the children).
 type FiledResult struct {
@@ -127,10 +141,17 @@ func FilingOrder(draft EpicDraft) ([]int, error) {
 // child in FilingOrder — resolving depends_on ordinals through the running
 // filed map — recording each success IMMEDIATELY after File returns. A FileItem
 // failure returns a *FilingPartialError; the recorded rows persist.
-func ExecuteFiling(ctx context.Context, draft *StoredDraft, repo string, r Repository, file FileItemFunc) (*FilingOutcome, error) {
+//
+// On a fresh/resumed FULL fill it invokes finalize (the session-closing side
+// effects) BEFORE releasing the lock, so verification, the completion audit, and
+// the completed_at flip are serialized with filing against the same draft — a
+// concurrent second caller cannot slip between "all items recorded" and
+// "completed_at set" and append a duplicate completion audit. finalize is not
+// called for an already-completed replay; a nil finalize skips finalization.
+func ExecuteFiling(ctx context.Context, draft *StoredDraft, repo string, r Repository, file FileItemFunc, finalize FinalizeFunc) (*FilingOutcome, error) {
 	var outcome *FilingOutcome
 	if err := r.WithFilingLock(ctx, draft.ID, func(ctx context.Context) error {
-		o, err := executeFilingLocked(ctx, draft, repo, r, file)
+		o, err := executeFilingLocked(ctx, draft, repo, r, file, finalize)
 		if err != nil {
 			return err
 		}
@@ -142,7 +163,7 @@ func ExecuteFiling(ctx context.Context, draft *StoredDraft, repo string, r Repos
 	return outcome, nil
 }
 
-func executeFilingLocked(ctx context.Context, draft *StoredDraft, repo string, r Repository, file FileItemFunc) (*FilingOutcome, error) {
+func executeFilingLocked(ctx context.Context, draft *StoredDraft, repo string, r Repository, file FileItemFunc, finalize FinalizeFunc) (*FilingOutcome, error) {
 	// (1) Ensure the filing session, pinning the target repo at first invoke.
 	sess, err := r.GetFilingSession(ctx, draft.ID)
 	switch {
@@ -233,7 +254,17 @@ func executeFilingLocked(ctx context.Context, draft *StoredDraft, repo string, r
 		filedURL[ord] = url
 	}
 
-	return buildOutcome(draft, filed, filedURL, resumed, false), nil
+	// (5) A fresh/resumed full fill: run the session-closing side effects (verify
+	// + completion audit + completed_at flip) while STILL under the lock, so a
+	// concurrent second caller observes completed_at set on entry and never
+	// appends a duplicate completion audit.
+	outcome := buildOutcome(draft, filed, filedURL, resumed, false)
+	if finalize != nil {
+		if err := finalize(ctx, outcome); err != nil {
+			return nil, err
+		}
+	}
+	return outcome, nil
 }
 
 // buildOutcome assembles the FilingOutcome from the running filed map, with the

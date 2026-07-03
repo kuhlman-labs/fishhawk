@@ -403,6 +403,21 @@ func TestFileRefinementSession_ConcurrentFilesOnce(t *testing.T) {
 	if len(final) != 7 {
 		t.Errorf("recorded items = %d, want 7 (zero duplicate records)", len(final))
 	}
+	// The completion side effects run under the SAME per-draft lock as filing, so
+	// the loser sees completed_at set and appends NO second completion audit: the
+	// refinement_filing_completed entry lands EXACTLY once (high/concurrency fix —
+	// without it the loser enters after all rows are recorded but before
+	// completed_at is set, observes AlreadyCompleted=false, and double-audits).
+	if got := countGlobalCategory(t, auditRepo, "refinement_filing_completed"); got != 1 {
+		t.Errorf("refinement_filing_completed entries = %d, want 1 (no duplicate completion under concurrency)", got)
+	}
+	sess, err := repo.GetFilingSession(context.Background(), mustDraftID(t, repo, sessionID))
+	if err != nil {
+		t.Fatalf("GetFilingSession: %v", err)
+	}
+	if sess.CompletedAt == nil {
+		t.Error("completed_at is nil after a concurrent full fill, want set")
+	}
 }
 
 // ---- failure modes --------------------------------------------------------

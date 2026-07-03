@@ -13,11 +13,16 @@ package server
 // durable row per filed item lets a re-invoke resume at the first unfiled
 // ordinal. A per-draft advisory lock (refinement.ExecuteFiling -> WithFilingLock)
 // serializes concurrent invocations so two POST /file calls cannot both file.
+// The completion side effects run under that SAME lock (via the finalize
+// callback) so a second caller cannot slip in after the item rows are recorded
+// but before completed_at is set and append a duplicate completion audit.
 //
 // AUDIT ORDERING (the E34.2 durable-before-state-change discipline): the
 // refinement_filing_completed audit entry is appended on the GLOBAL chain
 // BEFORE CompleteFilingSession flips completed_at, so an audit-append failure is
-// a 500 with completed_at still NULL and the re-invoke retries the close.
+// a 500 with completed_at still NULL and the re-invoke retries the close. Both
+// happen inside the advisory lock (finalize), so the append-then-flip pair is
+// atomic against a concurrent filer of the same draft.
 
 import (
 	"context"
@@ -159,8 +164,62 @@ func (s *Server) handleFileRefinementSession(w http.ResponseWriter, r *http.Requ
 		return created.Number, created.URL, nil
 	}
 
-	outcome, err := refinement.ExecuteFiling(r.Context(), approved, req.Repo, s.cfg.RefinementRepo, fileItem)
+	// finalize runs the session-closing side effects (verify → completion audit →
+	// completed_at flip) INSIDE the executor's per-draft advisory lock, so a
+	// concurrent second POST /file cannot enter after the items are recorded but
+	// before completed_at is set and append a duplicate completion audit
+	// (high/concurrency review fix). It writes its own HTTP error response and
+	// records it in finalizeResp on failure; the handler returns without
+	// re-mapping. It is invoked only for a fresh/resumed full fill — never for an
+	// already-completed replay.
+	verified := false
+	var finalizeResponded bool
+	finalize := func(ctx context.Context, outcome *refinement.FilingOutcome) error {
+		v, verr := s.verifyFiledEpic(r, conv, target, outcome)
+		if verr != nil {
+			s.writeError(w, r, http.StatusBadGateway, "refinement_filing_verification_failed",
+				"the filed epic did not round-trip through provider verification; the items are durable — re-invoke to re-verify",
+				map[string]any{"epic_number": outcome.Epic.IssueNumber, "error": verr.Error()})
+			finalizeResponded = true
+			return verr
+		}
+		verified = v
+
+		hash, herr := refinement.ContentHash(approved.Draft)
+		if herr != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"could not hash the approved draft", map[string]any{"error": herr.Error()})
+			finalizeResponded = true
+			return herr
+		}
+		if err := s.appendRefinementAudit(r, "refinement_filing_completed", map[string]any{
+			"session_id":    sessionID.String(),
+			"draft_id":      approved.ID.String(),
+			"content_hash":  hash,
+			"repo":          req.Repo,
+			"epic_number":   outcome.Epic.IssueNumber,
+			"child_numbers": childNumbers(outcome),
+			"verified":      verified,
+		}); err != nil {
+			s.writeRefinementAuditFailure(w, r, err)
+			finalizeResponded = true
+			return err
+		}
+		if err := s.cfg.RefinementRepo.CompleteFilingSession(ctx, approved.ID); err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"could not close the filing session", map[string]any{"error": err.Error()})
+			finalizeResponded = true
+			return err
+		}
+		return nil
+	}
+
+	outcome, err := refinement.ExecuteFiling(r.Context(), approved, req.Repo, s.cfg.RefinementRepo, fileItem, finalize)
 	if err != nil {
+		if finalizeResponded {
+			// finalize already wrote the HTTP error response for its own failure.
+			return
+		}
 		var partial *refinement.FilingPartialError
 		switch {
 		case errors.Is(err, refinement.ErrFilingRepoMismatch):
@@ -179,46 +238,6 @@ func (s *Server) handleFileRefinementSession(w http.ResponseWriter, r *http.Requ
 				"could not execute filing", map[string]any{"error": err.Error()})
 		}
 		return
-	}
-
-	// On a fresh/resumed full fill (not a replay), verify the round-trip then
-	// close the session audit-before-state-change. A replay of an
-	// already-completed session performs no verification, audit, or complete —
-	// it just replays the recorded result.
-	verified := false
-	if !outcome.AlreadyCompleted {
-		var verr error
-		verified, verr = s.verifyFiledEpic(r, conv, target, outcome)
-		if verr != nil {
-			s.writeError(w, r, http.StatusBadGateway, "refinement_filing_verification_failed",
-				"the filed epic did not round-trip through provider verification; the items are durable — re-invoke to re-verify",
-				map[string]any{"epic_number": outcome.Epic.IssueNumber, "error": verr.Error()})
-			return
-		}
-
-		hash, herr := refinement.ContentHash(approved.Draft)
-		if herr != nil {
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"could not hash the approved draft", map[string]any{"error": herr.Error()})
-			return
-		}
-		if err := s.appendRefinementAudit(r, "refinement_filing_completed", map[string]any{
-			"session_id":    sessionID.String(),
-			"draft_id":      approved.ID.String(),
-			"content_hash":  hash,
-			"repo":          req.Repo,
-			"epic_number":   outcome.Epic.IssueNumber,
-			"child_numbers": childNumbers(outcome),
-			"verified":      verified,
-		}); err != nil {
-			s.writeRefinementAuditFailure(w, r, err)
-			return
-		}
-		if err := s.cfg.RefinementRepo.CompleteFilingSession(r.Context(), approved.ID); err != nil {
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"could not close the filing session", map[string]any{"error": err.Error()})
-			return
-		}
 	}
 
 	s.writeJSON(w, r, http.StatusOK, refinementFileResponse{

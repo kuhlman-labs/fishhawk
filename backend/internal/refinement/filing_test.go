@@ -167,7 +167,7 @@ func TestExecuteFiling_HappyPath_EpicThenChildrenWithResolvedDeps(t *testing.T) 
 	filer := newScriptedFiler(100, 0)
 	draft := storedDraft(d)
 
-	outcome, err := ExecuteFiling(context.Background(), draft, "kuhlman-labs/fishhawk", repo, filer.file)
+	outcome, err := ExecuteFiling(context.Background(), draft, "kuhlman-labs/fishhawk", repo, filer.file, nil)
 	if err != nil {
 		t.Fatalf("ExecuteFiling: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestExecuteFiling_PartialFailure_ThenResumesExactly(t *testing.T) {
 	draft := storedDraft(d)
 
 	filer1 := newScriptedFiler(200, 5) // fail on the 5th call
-	_, err := ExecuteFiling(context.Background(), draft, "o/r", repo, filer1.file)
+	_, err := ExecuteFiling(context.Background(), draft, "o/r", repo, filer1.file, nil)
 	var partial *FilingPartialError
 	if !errors.As(err, &partial) {
 		t.Fatalf("err = %v, want *FilingPartialError", err)
@@ -241,7 +241,7 @@ func TestExecuteFiling_PartialFailure_ThenResumesExactly(t *testing.T) {
 
 	// Re-invoke: files EXACTLY ordinals 4,5,6 (3 calls), no duplicates.
 	filer2 := newScriptedFiler(300, 0)
-	outcome, err := ExecuteFiling(context.Background(), draft, "o/r", repo, filer2.file)
+	outcome, err := ExecuteFiling(context.Background(), draft, "o/r", repo, filer2.file, nil)
 	if err != nil {
 		t.Fatalf("resume ExecuteFiling: %v", err)
 	}
@@ -275,7 +275,7 @@ func TestExecuteFiling_RecordAfterFileOrdering(t *testing.T) {
 	repo := &memFilingRepo{}
 	// epic (call1) ok, child1 (call2) ok, child2 (call3) fails.
 	filer := newScriptedFiler(10, 3)
-	_, err := ExecuteFiling(context.Background(), storedDraft(d), "o/r", repo, filer.file)
+	_, err := ExecuteFiling(context.Background(), storedDraft(d), "o/r", repo, filer.file, nil)
 	var partial *FilingPartialError
 	if !errors.As(err, &partial) {
 		t.Fatalf("err = %v, want *FilingPartialError", err)
@@ -297,7 +297,7 @@ func TestExecuteFiling_RepoMismatch_NoFileCalls(t *testing.T) {
 	repo := &memFilingRepo{session: &FilingSession{DraftID: draft.ID, SessionID: draft.SessionID, Repo: "a/b"}}
 	filer := newScriptedFiler(1, 0)
 
-	_, err := ExecuteFiling(context.Background(), draft, "c/d", repo, filer.file)
+	_, err := ExecuteFiling(context.Background(), draft, "c/d", repo, filer.file, nil)
 	if !errors.Is(err, ErrFilingRepoMismatch) {
 		t.Fatalf("err = %v, want ErrFilingRepoMismatch", err)
 	}
@@ -321,7 +321,7 @@ func TestExecuteFiling_CompletedSession_NoWritesNoFiles(t *testing.T) {
 	}
 	filer := newScriptedFiler(1, 0)
 
-	outcome, err := ExecuteFiling(context.Background(), draft, "o/r", repo, filer.file)
+	outcome, err := ExecuteFiling(context.Background(), draft, "o/r", repo, filer.file, nil)
 	if err != nil {
 		t.Fatalf("ExecuteFiling: %v", err)
 	}
