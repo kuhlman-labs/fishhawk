@@ -93,7 +93,9 @@ func IdentityFrom(ctx context.Context) Identity {
 // writes a 401 (anonymous caller) or 403 (authenticated but missing
 // scope) response when the check fails. Cookie-session callers
 // (TokenID == "") bypass scope enforcement — they authenticate via
-// GitHub OAuth and carry no explicit scope list.
+// GitHub OAuth and carry no explicit scope list. Despite the name the
+// check is scope-agnostic: the read:audit-export export gate
+// (E9.5 / #1608) enforces through it too.
 func (s *Server) requireWriteScope(w http.ResponseWriter, r *http.Request, scope string) bool {
 	id := IdentityFrom(r.Context())
 	if id.IsAnonymous() {

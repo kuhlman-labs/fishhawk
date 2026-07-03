@@ -33,6 +33,17 @@ var operatorDefaultScopes = []string{
 	// drive the campaign primitive. New tokens and `token migrate --apply`
 	// promotions carry it.
 	"write:campaigns",
+	// read:audit-export gates the bulk compliance-export surfaces —
+	// GET /v0/audit/export, /v0/audit/export.csv, and
+	// /v0/reports/agent-changes(.md) (E9.5 / #1608, ADR-054). Bulk
+	// evidence export is deliberately a distinct scope from per-run
+	// reads so export-capable tokens are enumerable and revocable
+	// independently; it is included in the operator default because the
+	// operator IS the compliance principal in the single-operator v0
+	// posture. New tokens and `token migrate --apply` promotions carry
+	// it; a token that must NOT export can be issued with an explicit
+	// --scopes list omitting it.
+	"read:audit-export",
 }
 
 // mcpCapabilityScopes lists the optional scopes that can be granted

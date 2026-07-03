@@ -73,6 +73,12 @@ func (f csvRowFilter) keep(e *exportEntry) bool {
 
 // handleAuditExportCSV implements GET /v0/audit/export.csv.
 func (s *Server) handleAuditExportCSV(w http.ResponseWriter, r *http.Request) {
+	// Same read:audit-export gate as the JSON handler (E9.5 / #1608):
+	// the CSV is a projection of the same evidence, so it carries the
+	// same exfiltration risk class. Auth before the config probe.
+	if !s.requireWriteScope(w, r, scopeAuditExport) {
+		return
+	}
 	// Fail closed: a compliance artifact must not silently omit its
 	// inputs. All three repositories are required (identical posture to
 	// the JSON handler).

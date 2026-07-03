@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -88,11 +89,22 @@ func TestAuditExport_RoundTripExternalVerify(t *testing.T) {
 		}
 	}
 
-	// The real handler stack over httptest. server.New serves the export
-	// endpoints without bearer-auth enforcement in this harness (as the
-	// existing Postgres-backed campaigns_test does), so the CLI runs with
-	// an empty --token.
-	s := New(Config{AuditRepo: auditRepo, RunRepo: runRepo, SigningRepo: signingRepo})
+	// The real handler stack over httptest, including the REAL
+	// Postgres-backed token authentication: the export surfaces enforce
+	// read:audit-export (E9.5/#1608), so the CLI authenticates with a
+	// genuinely-issued scoped token — the full production auth path
+	// (bearer header → apitoken.Authenticate → requireWriteScope).
+	tokenRepo := apitoken.NewPostgresRepository(pool)
+	exportToken, err := tokenRepo.Issue(ctx, "roundtrip-test", []string{"read:audit-export"})
+	if err != nil {
+		t.Fatalf("issue export token: %v", err)
+	}
+	s := New(Config{
+		AuditRepo:    auditRepo,
+		RunRepo:      runRepo,
+		SigningRepo:  signingRepo,
+		APITokenRepo: tokenRepo,
+	})
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 
@@ -109,12 +121,32 @@ func TestAuditExport_RoundTripExternalVerify(t *testing.T) {
 	exportPath := filepath.Join(t.TempDir(), "export.json")
 	exportOut, err := exec.Command(cliBin, "export",
 		"--backend-url", srv.URL,
+		"--token", exportToken.PlainText,
 		"--repo", repo,
 		"--limit", "1",
 		"--out", exportPath,
 	).CombinedOutput()
 	if err != nil {
 		t.Fatalf("fishhawk export failed: %v\n%s", err, exportOut)
+	}
+
+	// Auth negative through the same real stack: a tokenless CLI call is
+	// rejected (401 → non-zero exit) and leaves no partial --out file —
+	// the fail-loud contract holds for the auth failure mode too.
+	deniedPath := filepath.Join(t.TempDir(), "denied.json")
+	deniedOut, deniedErr := exec.Command(cliBin, "export",
+		"--backend-url", srv.URL,
+		"--repo", repo,
+		"--out", deniedPath,
+	).CombinedOutput()
+	if deniedErr == nil {
+		t.Fatalf("tokenless fishhawk export succeeded; want non-zero exit (read:audit-export enforced)\n%s", deniedOut)
+	}
+	if !strings.Contains(string(deniedOut), "authentication_required") {
+		t.Errorf("tokenless export stderr = %s, want authentication_required surfaced", deniedOut)
+	}
+	if _, statErr := os.Stat(deniedPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("tokenless export left a file at --out (stat err = %v); want absent", statErr)
 	}
 
 	// Happy path: the verifier accepts the assembled export at exit 0.
