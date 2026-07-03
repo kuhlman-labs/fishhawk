@@ -34,18 +34,64 @@ func (r *postgresRepo) CreateDraft(ctx context.Context, p CreateParams) (*Stored
 	if p.Model != "" {
 		model = &p.Model
 	}
+	origin := p.Origin
+	if origin == "" {
+		origin = OriginBrief
+	}
+	id := p.ID
+	if id == uuid.Nil {
+		id = uuid.New()
+	}
 	q := refinementdb.New(r.pool)
 	row, err := q.CreateRefinementDraft(ctx, refinementdb.CreateRefinementDraftParams{
-		ID:        uuid.New(),
+		ID:        id,
 		SessionID: p.SessionID,
 		Brief:     p.Brief,
 		Draft:     raw,
 		Model:     model,
+		Origin:    origin,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create refinement draft: %w", err)
 	}
 	return rowToStoredDraft(row)
+}
+
+// RecordDecision appends an approve/reject verdict. The FK on draft_id
+// (ON DELETE RESTRICT) means a decision referencing an unknown draft fails at
+// insert — surfaced as a wrapped error, not a silent no-op.
+func (r *postgresRepo) RecordDecision(ctx context.Context, p DecisionParams) (*Decision, error) {
+	var decidedBy *string
+	if p.DecidedBy != "" {
+		decidedBy = &p.DecidedBy
+	}
+	q := refinementdb.New(r.pool)
+	row, err := q.CreateRefinementDecision(ctx, refinementdb.CreateRefinementDecisionParams{
+		ID:               uuid.New(),
+		SessionID:        p.SessionID,
+		DraftID:          p.DraftID,
+		Decision:         p.Decision,
+		Reason:           p.Reason,
+		DraftContentHash: p.DraftContentHash,
+		DecidedBy:        decidedBy,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create refinement decision: %w", err)
+	}
+	return rowToDecision(row), nil
+}
+
+func (r *postgresRepo) ListDecisions(ctx context.Context, sessionID uuid.UUID) ([]*Decision, error) {
+	q := refinementdb.New(r.pool)
+	rows, err := q.ListRefinementDecisionsForSession(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("list refinement decisions: %w", err)
+	}
+	out := make([]*Decision, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, rowToDecision(row))
+	}
+	return out, nil
 }
 
 func (r *postgresRepo) GetDraft(ctx context.Context, id uuid.UUID) (*StoredDraft, error) {
@@ -94,8 +140,28 @@ func rowToStoredDraft(r refinementdb.RefinementDraft) (*StoredDraft, error) {
 		Brief:     r.Brief,
 		Draft:     draft,
 		Model:     model,
+		Origin:    r.Origin,
 		CreatedAt: r.CreatedAt.Time,
 	}, nil
+}
+
+// rowToDecision maps a refinement_decisions row to the domain Decision,
+// resolving the nullable decided_by column to a string ("" when NULL).
+func rowToDecision(r refinementdb.RefinementDecision) *Decision {
+	decidedBy := ""
+	if r.DecidedBy != nil {
+		decidedBy = *r.DecidedBy
+	}
+	return &Decision{
+		ID:               r.ID,
+		SessionID:        r.SessionID,
+		DraftID:          r.DraftID,
+		Decision:         r.Decision,
+		Reason:           r.Reason,
+		DraftContentHash: r.DraftContentHash,
+		DecidedBy:        decidedBy,
+		CreatedAt:        r.CreatedAt.Time,
+	}
 }
 
 // Compile-time check that postgresRepo implements Repository.

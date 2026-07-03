@@ -11,11 +11,51 @@ import (
 	"github.com/google/uuid"
 )
 
+const createRefinementDecision = `-- name: CreateRefinementDecision :one
+INSERT INTO refinement_decisions (id, session_id, draft_id, decision, reason, draft_content_hash, decided_by)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING id, session_id, draft_id, decision, reason, draft_content_hash, decided_by, created_at
+`
+
+type CreateRefinementDecisionParams struct {
+	ID               uuid.UUID `json:"id"`
+	SessionID        uuid.UUID `json:"session_id"`
+	DraftID          uuid.UUID `json:"draft_id"`
+	Decision         string    `json:"decision"`
+	Reason           string    `json:"reason"`
+	DraftContentHash string    `json:"draft_content_hash"`
+	DecidedBy        *string   `json:"decided_by"`
+}
+
+func (q *Queries) CreateRefinementDecision(ctx context.Context, arg CreateRefinementDecisionParams) (RefinementDecision, error) {
+	row := q.db.QueryRow(ctx, createRefinementDecision,
+		arg.ID,
+		arg.SessionID,
+		arg.DraftID,
+		arg.Decision,
+		arg.Reason,
+		arg.DraftContentHash,
+		arg.DecidedBy,
+	)
+	var i RefinementDecision
+	err := row.Scan(
+		&i.ID,
+		&i.SessionID,
+		&i.DraftID,
+		&i.Decision,
+		&i.Reason,
+		&i.DraftContentHash,
+		&i.DecidedBy,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const createRefinementDraft = `-- name: CreateRefinementDraft :one
 
-INSERT INTO refinement_drafts (id, session_id, brief, draft, model)
-VALUES ($1, $2, $3, $4, $5)
-RETURNING id, session_id, brief, draft, model, created_at
+INSERT INTO refinement_drafts (id, session_id, brief, draft, model, origin)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, session_id, brief, draft, model, created_at, origin
 `
 
 type CreateRefinementDraftParams struct {
@@ -24,11 +64,14 @@ type CreateRefinementDraftParams struct {
 	Brief     string    `json:"brief"`
 	Draft     []byte    `json:"draft"`
 	Model     *string   `json:"model"`
+	Origin    string    `json:"origin"`
 }
 
-// Refinement-draft queries consumed by the postgres adapter for the
-// refinement.Repository interface (E34.1 / #1592). A draft is keyed by its
-// refinement session id; nothing here files a provider work item.
+// Refinement queries consumed by the postgres adapter for the
+// refinement.Repository interface (E34.1 / #1592, E34.2 / #1593). A draft is
+// keyed by its refinement session id; nothing here files a provider work item.
+// A decision is an append-only approve/reject verdict pinning one draft
+// revision + its content hash (E34.2's gate record).
 func (q *Queries) CreateRefinementDraft(ctx context.Context, arg CreateRefinementDraftParams) (RefinementDraft, error) {
 	row := q.db.QueryRow(ctx, createRefinementDraft,
 		arg.ID,
@@ -36,6 +79,7 @@ func (q *Queries) CreateRefinementDraft(ctx context.Context, arg CreateRefinemen
 		arg.Brief,
 		arg.Draft,
 		arg.Model,
+		arg.Origin,
 	)
 	var i RefinementDraft
 	err := row.Scan(
@@ -45,12 +89,13 @@ func (q *Queries) CreateRefinementDraft(ctx context.Context, arg CreateRefinemen
 		&i.Draft,
 		&i.Model,
 		&i.CreatedAt,
+		&i.Origin,
 	)
 	return i, err
 }
 
 const getRefinementDraft = `-- name: GetRefinementDraft :one
-SELECT id, session_id, brief, draft, model, created_at FROM refinement_drafts WHERE id = $1
+SELECT id, session_id, brief, draft, model, created_at, origin FROM refinement_drafts WHERE id = $1
 `
 
 func (q *Queries) GetRefinementDraft(ctx context.Context, id uuid.UUID) (RefinementDraft, error) {
@@ -63,12 +108,48 @@ func (q *Queries) GetRefinementDraft(ctx context.Context, id uuid.UUID) (Refinem
 		&i.Draft,
 		&i.Model,
 		&i.CreatedAt,
+		&i.Origin,
 	)
 	return i, err
 }
 
+const listRefinementDecisionsForSession = `-- name: ListRefinementDecisionsForSession :many
+SELECT id, session_id, draft_id, decision, reason, draft_content_hash, decided_by, created_at FROM refinement_decisions
+WHERE session_id = $1
+ORDER BY created_at ASC
+`
+
+func (q *Queries) ListRefinementDecisionsForSession(ctx context.Context, sessionID uuid.UUID) ([]RefinementDecision, error) {
+	rows, err := q.db.Query(ctx, listRefinementDecisionsForSession, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []RefinementDecision
+	for rows.Next() {
+		var i RefinementDecision
+		if err := rows.Scan(
+			&i.ID,
+			&i.SessionID,
+			&i.DraftID,
+			&i.Decision,
+			&i.Reason,
+			&i.DraftContentHash,
+			&i.DecidedBy,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRefinementDraftsForSession = `-- name: ListRefinementDraftsForSession :many
-SELECT id, session_id, brief, draft, model, created_at FROM refinement_drafts
+SELECT id, session_id, brief, draft, model, created_at, origin FROM refinement_drafts
 WHERE session_id = $1
 ORDER BY created_at ASC
 `
@@ -89,6 +170,7 @@ func (q *Queries) ListRefinementDraftsForSession(ctx context.Context, sessionID 
 			&i.Draft,
 			&i.Model,
 			&i.CreatedAt,
+			&i.Origin,
 		); err != nil {
 			return nil, err
 		}

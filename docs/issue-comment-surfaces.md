@@ -934,6 +934,22 @@ Notes:
   append failure never fails the response since the item is already filed. No
   sticky status comment is refreshed. Listed here so a future reader grepping
   the audit categories doesn't mistake it for a comment surface.
+- The refinement-gate decision + edit kinds — `refinement_draft_approved`,
+  `refinement_draft_rejected`, and `refinement_draft_edited` (#1593, ADR-052
+  option A) — are **internal, global-chain audit-only categories, not
+  issue-comment surfaces**. Nothing in `issuecomment` posts them; they have no
+  Notifier method. They are written by the acting caller (`actor_kind` = `user`)
+  in `server/refinement.go`'s E34.2 preview + approval gate handlers via
+  `AuditRepo.AppendGlobalChained` (a refinement session is not a run, so the
+  entry rides the global chain with `run_id` NULL). The `_approved` / `_rejected`
+  entry carries `{session_id, draft_id, revision, content_hash, reason}`; the
+  `_edited` entry carries `{session_id, draft_id, revision, origin,
+  content_hash}`. Unlike `work_item_filed`, the write is NOT best-effort: the
+  audit entry IS the gate's record, so it is appended BEFORE the decision/edit is
+  persisted (durable-before-state-change) and an append failure fails the request
+  `500` with nothing persisted — no gate action is ever unaudited. Listed here so
+  a future reader grepping the audit categories doesn't mistake them for comment
+  surfaces.
 - The board-state-sync kind — `work_item_transitioned` (#1012) — is an
   **internal, audit-only category, not an issue-comment surface**. Nothing in
   `issuecomment` posts it; it has no Notifier method. It is written under its

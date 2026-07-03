@@ -34,6 +34,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
@@ -375,6 +376,21 @@ type Config struct {
 	// The server's own resolution code paths (ResolveReviewFromPollState) are
 	// unchanged; succeeded still means a verified GitHub merge.
 	ReviewResolution string
+
+	// RefinementRepo persists refinement drafts + decisions behind the E34.2
+	// preview + approval gate (ADR-052 / #1593). Wired by the
+	// /v0/refinement/sessions handlers; nil leaves ALL four routes returning
+	// 503, mirroring nil CampaignRepo. Tests inject the Postgres adapter over
+	// pgtest; production wires refinement.NewPostgresRepository.
+	RefinementRepo refinement.Repository
+
+	// RefinementDrafter runs the E34.1 drafting agent for a brief. Only the
+	// agent-backed arms (create-session, brief-amendment) need it; nil disables
+	// ONLY those with 503 refinement_drafting_unavailable while GET / direct
+	// edit / decision keep working against RefinementRepo. Satisfied
+	// structurally by *refinement.Drafter; nil in a deployment with no local
+	// claude adapter configured.
+	RefinementDrafter RefinementDrafter
 
 	// ModelOracle is the snapshot seam the model-id validity layer (#1339)
 	// queries to decide whether a model named in a workflow spec is a real,
