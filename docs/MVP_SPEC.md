@@ -489,7 +489,7 @@ The MVP is complete when all of the following are true:
 - [ ] Fishhawk itself ships every PR through a Fishhawk workflow run, with public audit log
 - [ ] At least 3 design partners are running real (non-toy) work through Fishhawk
 - [ ] At least 2 of those partners are in compliance-conscious environments
-- [ ] First compliance report export works end-to-end
+- [x] First compliance report export works end-to-end
 - [ ] Audit log integrity is verifiable: any external party can take an exported log + signing key chain and verify entries
 - [ ] Failure handling for all four categories is tested and documented
 - [ ] OSS repo is public, Apache 2.0 on core

@@ -8,6 +8,18 @@ This directory is its own Go module (`github.com/kuhlman-labs/fishhawk/verifier`
 
 The verifier deliberately re-implements `ComputeEntryHash` and the bundle signature check rather than importing `backend/internal/audit` and `backend/internal/signing`. If a compromised backend could ship a tampered hash function alongside a tampered audit log, "external verification" would mean nothing. The re-implementation lives in `internal/audit/chain.go` and is pinned to the backend's algorithm by a **canonical fixture test**: both packages assert the same `(input, expected hash)` pair. Update one without the other and CI fails on both sides.
 
+## Verify the published artifact
+
+Fishhawk publishes the audit log of its own development at
+[`docs/compliance/`](../docs/compliance/). To verify it from a repo checkout:
+
+    go build -o /tmp/fishhawk-verify ./cmd/fishhawk-verify
+    /tmp/fishhawk-verify --export ../docs/compliance/fishhawk-dev-audit-export.json
+
+Expect `PASS — verified N run(s), M audit entries; no issues found.` and exit
+`0`. See [`docs/compliance/README.md`](../docs/compliance/README.md) for
+provenance and the off-machine (`go install`) verification path.
+
 ## Usage
 
     fishhawk-verify --export <path>
@@ -50,7 +62,7 @@ The verifier consumes JSON of the shape:
 }
 ```
 
-The compliance-export path on the backend (E9, not yet built) will produce this shape directly. For now operators can hand-craft the file from a database dump.
+The compliance-export path on the backend (E9: `GET /v0/audit/export`, consumed by `fishhawk export`) produces this shape directly. A published instance — Fishhawk's own development audit log — lives at [`docs/compliance/`](../docs/compliance/); see the quickstart below.
 
 ## What the verifier checks
 
