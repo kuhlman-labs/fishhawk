@@ -159,6 +159,9 @@ func buildHappyPathFixture(t *testing.T) (*exportAuditFake, *fakeRepo, *run.Run,
 				payload: `{"reviewer_kind":"agent","reviewer_model":"gpt-5.5","authority":"advisory","verdict":"approve_with_concerns"}`},
 			reportSeedEntry{category: "approval_submitted", actorKind: audit.ActorUser, subject: "alice@acme",
 				payload: `{"decision":"approve","surface":"review","approver":"alice@acme"}`},
+			// A GitHub-side PR approval — no payload decode; subject/actor_kind
+			// come from the entry, decision/surface stay empty.
+			reportSeedEntry{category: CategoryPRApprovedOnGitHub, actorKind: audit.ActorUser, subject: "dave@acme", payload: `{}`},
 			reportSeedEntry{category: CategoryAcceptanceOutcomeRecorded, actorKind: audit.ActorAgent, subject: "agent@fishhawk", stageID: &acceptStage,
 				payload: `{"verdict":"passed","content_hash":"acc-hash-1","evidence_hashes":["ev-hash-a","ev-hash-b"]}`},
 			reportSeedEntry{category: CategoryPRMerged, actorKind: audit.ActorUser, subject: "bob@acme",
@@ -232,13 +235,26 @@ func TestAgentChangesReport_HappyPath(t *testing.T) {
 			got0.Merge.BaseSHA != "cafef00d" {
 			t.Errorf("merge = %+v", got0.Merge)
 		}
-		// who approved (subject + timestamp)
-		if len(got0.Approvals) != 1 || got0.Approvals[0].Subject != "alice@acme" ||
+		// who approved (subject + timestamp): the operator approval_submitted
+		// then the GitHub pr_approved_on_github, in chain order.
+		if len(got0.Approvals) != 2 {
+			t.Fatalf("approvals = %+v, want 2 (operator + github)", got0.Approvals)
+		}
+		if got0.Approvals[0].Subject != "alice@acme" ||
 			got0.Approvals[0].Decision != "approve" || got0.Approvals[0].ActorKind != "user" {
-			t.Errorf("approvals = %+v", got0.Approvals)
+			t.Errorf("operator approval = %+v", got0.Approvals[0])
 		}
 		if got0.Approvals[0].Timestamp.IsZero() {
 			t.Error("approval timestamp is zero")
+		}
+		// GitHub PR approval: subject/actor_kind mapped from the entry, and
+		// decision/surface empty because that branch does not decode a payload.
+		if got0.Approvals[1].Subject != "dave@acme" || got0.Approvals[1].ActorKind != "user" ||
+			got0.Approvals[1].Decision != "" || got0.Approvals[1].Surface != "" {
+			t.Errorf("github approval = %+v, want subject dave@acme with empty decision/surface", got0.Approvals[1])
+		}
+		if got0.Approvals[1].Timestamp.IsZero() {
+			t.Error("github approval timestamp is zero")
 		}
 		// what reviewed it (both reviewer models + verdicts)
 		gotReviews := map[string]string{}
@@ -259,9 +275,9 @@ func TestAgentChangesReport_HappyPath(t *testing.T) {
 		if strings.Join(got0.Acceptance.EvidenceHashes, ",") != "ev-hash-a,ev-hash-b" {
 			t.Errorf("evidence hashes = %v", got0.Acceptance.EvidenceHashes)
 		}
-		// audit-chain span: 7 entries, sequences 1..7.
-		if got0.AuditChain.EntryCount != 7 || got0.AuditChain.FirstSequence != 1 ||
-			got0.AuditChain.LastSequence != 7 {
+		// audit-chain span: 8 entries, sequences 1..8.
+		if got0.AuditChain.EntryCount != 8 || got0.AuditChain.FirstSequence != 1 ||
+			got0.AuditChain.LastSequence != 8 {
 			t.Errorf("audit_chain = %+v", got0.AuditChain)
 		}
 		if got0.AuditChain.FirstEntryHash == "" || got0.AuditChain.LastEntryHash == "" {
@@ -420,6 +436,34 @@ func TestAgentChangesReport_MarkdownGolden(t *testing.T) {
 	}
 }
 
+// A failed-acceptance item renders its failure_mode on the acceptance line —
+// the non-empty branch of renderChangeItem that the passed-verdict golden
+// fixture (verdict=passed, no failure_mode) never exercises.
+func TestAgentChangesReport_AcceptanceFailureModeRendered(t *testing.T) {
+	report := agentChangesReport{
+		Schema:      agentChangesReportSchema,
+		GeneratedAt: time.Date(2026, 7, 2, 14, 45, 0, 0, time.UTC),
+		Complete:    true,
+		AgentChanges: []agentChangeItem{{
+			RunID:      "44444444-4444-4444-4444-444444444444",
+			Repo:       "acme/app",
+			WorkflowID: "feature_change",
+			PR:         agentChangePR{URL: "https://github.com/acme/app/pull/99", Number: 99},
+			Acceptance: &agentChangeAcceptance{Verdict: "failed", FailureMode: "criteria_unmet",
+				Timestamp: time.Date(2026, 6, 10, 12, 5, 0, 0, time.UTC)},
+			EvidenceLinks: agentChangeEvidenceLinks{
+				Run:    "/v0/runs/44444444-4444-4444-4444-444444444444",
+				Audit:  "/v0/runs/44444444-4444-4444-4444-444444444444/audit",
+				Export: "/v0/audit/export?run_id=44444444-4444-4444-4444-444444444444",
+			},
+		}},
+	}
+	md := string(renderAgentChangesMarkdown(report))
+	if !strings.Contains(md, "- Acceptance: verdict=failed failure_mode=criteria_unmet") {
+		t.Errorf("markdown missing failed-acceptance failure_mode line:\n%s", md)
+	}
+}
+
 // ---------------------------------------------------------------------
 // (c) per-failure-mode tests, one behavioral assertion each.
 // ---------------------------------------------------------------------
@@ -513,13 +557,21 @@ func TestAgentChangesReport_PartialPage(t *testing.T) {
 		}
 	})
 
-	t.Run("markdown carries the PARTIAL banner", func(t *testing.T) {
+	t.Run("markdown banner carries the header's resume cursor", func(t *testing.T) {
 		rec := doReportMarkdown(s, "?limit=1")
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
 		}
-		if !strings.Contains(rec.Body.String(), "PARTIAL REPORT — resume with cursor ") {
-			t.Errorf("markdown missing PARTIAL banner:\n%s", rec.Body.String())
+		next := rec.Header().Get("X-Fishhawk-Export-Next-Cursor")
+		if next == "" {
+			t.Fatal("partial markdown page missing next-cursor header")
+		}
+		// Header/body/markdown cursor consistency: the banner must resume with
+		// the SAME cursor emitted in X-Fishhawk-Export-Next-Cursor, not just
+		// contain a PARTIAL marker.
+		wantBanner := "**PARTIAL REPORT — resume with cursor " + next + "**"
+		if !strings.Contains(rec.Body.String(), wantBanner) {
+			t.Errorf("markdown banner missing exact header cursor %q:\n%s", next, rec.Body.String())
 		}
 		if ct := rec.Header().Get("Content-Type"); ct != "text/markdown; charset=utf-8" {
 			t.Errorf("Content-Type = %q", ct)
