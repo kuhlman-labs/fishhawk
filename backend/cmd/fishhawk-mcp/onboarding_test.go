@@ -66,6 +66,8 @@ func TestOnboarding_InstructionsDeliveredOnInitialize(t *testing.T) {
 		// E31.9: the acceptance happy-path line + gate-semantics bullet.
 		"acceptance_passed",
 		"acceptance stage",
+		// E34.4: the refinement intake one-liner names the tool.
+		"fishhawk_draft_epic",
 		runbookURI,
 	} {
 		if !strings.Contains(got, anchor) {
@@ -124,6 +126,9 @@ func TestOnboarding_RunbookResourceListedAndReadable(t *testing.T) {
 		"Acceptance stage",
 		"acceptance_passed",
 		"retry_dispatched",
+		// E34.4 refinement intake loop anchors (incl. the rejection/re-draft path).
+		"Refinement intake loop",
+		"Rejection / re-draft path",
 	} {
 		if !strings.Contains(c.Text, anchor) {
 			t.Errorf("runbook missing edge-case anchor %q", anchor)

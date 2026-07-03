@@ -34,7 +34,9 @@ Gate semantics (these decide when a verb is legal):
 - A failed acceptance verdict leaves the stage 'succeeded' and routes through deterministic server-side triage (auto fix-up / re-run, bounded); paged dispositions are yours to arbitrate. Read the verdict from the acceptance_outcome_recorded audit entry, not the stage state.
 - next_actions on the run status is the authoritative "what to do next" — prefer it over guessing.
 
-Read the fishhawk://runbook resource for the full procedure and the edge-case playbook (local-drive dispatch, fixup re-dispatch, scope amendments, heterogeneous-review waits, post-failure clean-tree).`
+Refinement intake (separate from the run loop): when you have a natural-language brief to decompose into an epic + children, drive fishhawk_draft_epic — one tool with five arms (open, preview, edit, approve/reject, file); approve and file are ARMS on it, not fishhawk_approve_plan. Its session_guidance names the next arm at each step. See the runbook's "Refinement intake loop" section.
+
+Read the fishhawk://runbook resource for the full procedure and the edge-case playbook (local-drive dispatch, fixup re-dispatch, scope amendments, heterogeneous-review waits, post-failure clean-tree, refinement intake loop).`
 
 // runbookMarkdown is the long-form operator runbook, embedded as a
 // product file so the binary serves it without a filesystem dependency.
