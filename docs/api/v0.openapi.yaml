@@ -5455,6 +5455,8 @@ paths:
         '404': { description: "`refinement_session_not_found` — no session with that id." }
         '503': { description: "`refinement_repo_unconfigured`." }
 
+
+  /v0/refinement/sessions/{session_id}/draft:
     patch:
       operationId: editRefinementDraft
       summary: Edit a refinement draft (agent amendment or direct field edit)
