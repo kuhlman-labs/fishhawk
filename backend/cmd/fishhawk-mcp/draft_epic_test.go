@@ -141,7 +141,7 @@ func newRefineFakeBackend(t *testing.T) (*refineFakeBackend, *httptest.Server) {
 		_, _ = w.Write(fb.sessionViewJSON())
 	})
 
-	mux.HandleFunc("PATCH /v0/refinement/sessions/{id}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("PATCH /v0/refinement/sessions/{id}/draft", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fb.mu.Lock()
 		defer fb.mu.Unlock()
@@ -300,8 +300,8 @@ func TestDraftEpic_EditArm_BriefAmendment_WiresPatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("draftEpic edit(amendment): %v", err)
 	}
-	if fb.lastMethod != http.MethodPatch || fb.lastPath != "/v0/refinement/sessions/"+testSessionID {
-		t.Errorf("wire = %s %s, want PATCH /v0/refinement/sessions/{id}", fb.lastMethod, fb.lastPath)
+	if fb.lastMethod != http.MethodPatch || fb.lastPath != "/v0/refinement/sessions/"+testSessionID+"/draft" {
+		t.Errorf("wire = %s %s, want PATCH /v0/refinement/sessions/{id}/draft", fb.lastMethod, fb.lastPath)
 	}
 	var reqBody map[string]any
 	_ = json.Unmarshal(fb.lastBody, &reqBody)

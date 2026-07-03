@@ -51,7 +51,7 @@ type EpicDraftChild struct {
 //
 //   - open:    brief                          -> POST   /v0/refinement/sessions
 //   - preview: session_id (alone)             -> GET    /v0/refinement/sessions/{id}
-//   - edit:    session_id + (brief_amendment  -> PATCH  /v0/refinement/sessions/{id}
+//   - edit:    session_id + (brief_amendment  -> PATCH  /v0/refinement/sessions/{id}/draft
 //     XOR draft)
 //   - decide:  session_id + decision + reason -> POST   .../decision
 //   - file:    session_id + repo              -> POST   .../file

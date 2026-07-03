@@ -1591,7 +1591,7 @@ type createRefinementSessionRequest struct {
 }
 
 // editRefinementDraftRequest mirrors the backend's PATCH
-// /v0/refinement/sessions/{id} body. Exactly one arm is serialized (both are
+// /v0/refinement/sessions/{id}/draft body. Exactly one arm is serialized (both are
 // omitempty): brief_amendment (agent re-draft) XOR draft (direct edit). The
 // caller (the tool handler) guarantees the XOR before this is built.
 type editRefinementDraftRequest struct {
@@ -1645,8 +1645,8 @@ func (c *apiClient) GetRefinementSession(ctx context.Context, sessionID uuid.UUI
 }
 
 // EditRefinementDraft appends a new draft revision via `PATCH
-// /v0/refinement/sessions/{id}` (E34.2) — which is precisely what invalidates a
-// prior approval. Exactly one arm: briefAmendment (non-empty -> agent re-draft,
+// /v0/refinement/sessions/{id}/draft` (E34.2) — which is precisely what
+// invalidates a prior approval. Exactly one arm: briefAmendment (non-empty -> agent re-draft,
 // origin=amendment, bounded by a per-session budget of 3) XOR draft (non-nil ->
 // a direct strict-decoded EpicDraft edit, origin=edit, no agent call). The
 // caller guarantees the XOR. Requires write:approvals. 4xx/5xx surface as
@@ -1666,7 +1666,7 @@ func (c *apiClient) EditRefinementDraft(ctx context.Context, sessionID uuid.UUID
 		return nil, fmt.Errorf("marshal edit-refinement-draft: %w", err)
 	}
 	var out RefinementSession
-	if err := c.do(ctx, http.MethodPatch, "/v0/refinement/sessions/"+sessionID.String(), body, &out); err != nil {
+	if err := c.do(ctx, http.MethodPatch, "/v0/refinement/sessions/"+sessionID.String()+"/draft", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
