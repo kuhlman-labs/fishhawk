@@ -415,6 +415,123 @@ func (c *Client) ListRunAudit(ctx context.Context, runID uuid.UUID, f ListRunAud
 	return &res, nil
 }
 
+// ExportAuditParams scopes an audit export request (GET
+// /v0/audit/export and GET /v0/audit/export.csv). Empty scalar values
+// are dropped from the query string; the CLI passes the filter shape
+// through unchanged so the server-authoritative run_id-vs-repo/date
+// mutual exclusion (ADR-054) is enforced in one place. RunIDs is the
+// repeatable run_id parameter. Cursor drives the header-based
+// continuation; the export methods take one page per call and the
+// caller follows X-Fishhawk-Export-Next-Cursor.
+type ExportAuditParams struct {
+	From   string
+	To     string
+	Repo   string
+	RunIDs []string
+	Limit  int
+	Cursor string
+}
+
+// ExportPage is one page of an audit export: the raw response body
+// (bytes preserved verbatim — the JSON body must byte-parse through the
+// verifier's DisallowUnknownFields ParseExport, and the CSV body is
+// concatenated as-is) plus the parsed continuation pair. Complete is
+// the X-Fishhawk-Export-Complete header; NextCursor is
+// X-Fishhawk-Export-Next-Cursor (empty when Complete is true).
+type ExportPage struct {
+	Body       []byte
+	Complete   bool
+	NextCursor string
+}
+
+// ExportAudit calls GET /v0/audit/export for one page. It returns the
+// raw JSON body and the continuation headers; the caller follows
+// NextCursor until Complete. Non-2xx surfaces the *APIError envelope.
+func (c *Client) ExportAudit(ctx context.Context, p ExportAuditParams) (*ExportPage, error) {
+	return c.exportRaw(ctx, "/v0/audit/export", p)
+}
+
+// ExportAuditCSV calls GET /v0/audit/export.csv for one page. Same
+// continuation semantics as ExportAudit; the body is CSV text.
+func (c *Client) ExportAuditCSV(ctx context.Context, p ExportAuditParams) (*ExportPage, error) {
+	return c.exportRaw(ctx, "/v0/audit/export.csv", p)
+}
+
+// exportRaw builds the shared export query, performs the request, and
+// returns the raw body plus the continuation headers. Unlike do it does
+// not JSON-decode the body (JSON export bytes must stay verbatim for the
+// verifier; CSV is not JSON at all) and it reads the two continuation
+// headers, which do exposes to no caller.
+func (c *Client) exportRaw(ctx context.Context, basePath string, p ExportAuditParams) (*ExportPage, error) {
+	if c.BaseURL == "" {
+		return nil, errors.New("httpclient: BaseURL not set")
+	}
+	q := url.Values{}
+	if p.From != "" {
+		q.Set("from", p.From)
+	}
+	if p.To != "" {
+		q.Set("to", p.To)
+	}
+	if p.Repo != "" {
+		q.Set("repo", p.Repo)
+	}
+	for _, id := range p.RunIDs {
+		q.Add("run_id", id)
+	}
+	if p.Limit > 0 {
+		q.Set("limit", strconv.Itoa(p.Limit))
+	}
+	if p.Cursor != "" {
+		q.Set("cursor", p.Cursor)
+	}
+	path := basePath
+	if encoded := q.Encode(); encoded != "" {
+		path = path + "?" + encoded
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		apiErr := &APIError{StatusCode: resp.StatusCode}
+		var env errorEnvelope
+		if json.Unmarshal(raw, &env) == nil {
+			apiErr.Code = env.Error.Code
+			apiErr.Message = env.Error.Message
+			apiErr.Details = env.Error.Details
+		}
+		return nil, apiErr
+	}
+
+	// The continuation markers ride response headers because the JSON
+	// body is the strict three-field Export v1 shape (ParseExport
+	// DisallowUnknownFields). A missing/unparseable Complete header
+	// decodes as false; the caller's no-cursor guard then fails loud
+	// rather than looping.
+	complete, _ := strconv.ParseBool(resp.Header.Get("X-Fishhawk-Export-Complete"))
+	return &ExportPage{
+		Body:       raw,
+		Complete:   complete,
+		NextCursor: resp.Header.Get("X-Fishhawk-Export-Next-Cursor"),
+	}, nil
+}
+
 // RetryStage calls POST /v0/stages/{stage_id}/retry. The response is
 // the post-retry Stage — typically `dispatched` after orchestrator
 // handoff for category A/C, or `awaiting_approval` for the

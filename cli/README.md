@@ -39,6 +39,7 @@ fishhawk audit list   <run-id> [--category C] [--stage UUID] [--limit N] [--curs
 fishhawk audit tail   <run-id> [--interval D] [--output text|json] [--max-polls N]
 fishhawk diagnose     <run-id> [--output text|json]
 fishhawk report-issue <run-id> [--kind bug|feature] [--description T] [--include-free-text] [--output text|json]
+fishhawk export       [--from RFC3339] [--to RFC3339] [--repo owner/name] [--run UUID]... [--limit N] [--csv] [--out PATH]
 fishhawk init         [--preset low|medium|high] [--working-dir D] [--budget-usd N] [--single-reviewer] [--human-gates ids] [--force] [--repo owner/name]
 fishhawk validate     [path]                   # default: .fishhawk/workflows.yaml
 fishhawk doctor       [--repo owner/name] [--working-dir D] [--runner-binary P]
@@ -54,6 +55,17 @@ Since E29.5 `doctor` also runs a per-repo **onboarding preflight** — the prere
 `diagnose` prints a run's **product-facts-only** diagnostic bundle (`GET /v0/runs/{id}/diagnostics`): run id, stage states, the failing stage's category + audit surface, audit sequence range, build versions + git SHAs, workflow spec hash, and runner kind. It is pure read — the bundle carries no diffs, paths, prompts, or free text, so it is safe to attach to an upstream Fishhawk product report.
 
 `report-issue` files a deduped, audited **upstream Fishhawk product** bug or feature request (`POST /v0/runs/{id}/product-reports`), carrying the run's auto-collected diagnostic bundle. The destination is the fixed product repo, not the run's repo. By default the report carries **product facts only**; a dedup hit on the failure fingerprint appends an occurrence comment instead of opening a duplicate. Operator free text (`--description`) crosses the egress boundary **only** with the explicit `--include-free-text` consent flag, and is run through secret-redaction server-side first — without the flag the description is dropped with a warning. Egress requires the run's own run-bound token, and a per-repo `product_feedback` kill-switch returns `product_feedback_disabled`.
+
+`export` assembles a **complete** compliance export for external verification (`GET /v0/audit/export`, or `GET /v0/audit/export.csv` with `--csv`). The two endpoints bound each page to whole runs and ride the partiality signal on response headers (`X-Fishhawk-Export-Complete` / `X-Fishhawk-Export-Next-Cursor`) because the JSON body is the verifier's strict three-field Export v1 shape (`{schema, exported_at, runs}`, decoded with `DisallowUnknownFields`) and cannot carry a cursor field. `export` follows that continuation automatically: it fetches pages until the server reports complete, unions the per-page `runs` maps byte-for-byte (each run subtree is kept as raw JSON so the entry hashes and signatures still verify), and emits ONE assembled file that is exactly the verifier's Export v1 wire shape. The global (run-less) chain partition rides the first page only under the reserved nil-UUID key, so the union is disjoint; a run key appearing on two pages, or a page reporting incomplete with no continuation cursor, is a hard error rather than a silent merge or an infinite loop. `--csv` concatenates the CSV pages instead, keeping only the first page's header row. Filter selection is server-authoritative: pass `--run UUID` (repeatable) **or** the `--repo`/`--from`/`--to` filter shape — the two modes are mutually exclusive and the CLI renders the server's `validation_failed` verbatim rather than pre-checking. `--out PATH` writes the assembled file atomically (temp file + rename), so a mid-pagination failure never leaves a partial file at the destination; without `--out` the export streams to stdout.
+
+### External verification
+
+`export` is the producer half of the audit-grade external-verification flow (ADR-008 / ADR-054):
+
+1. Issue a `read:audit-export`-scoped token for the auditor (or run `export` yourself with an operator token).
+2. `fishhawk export --from <RFC3339> --to <RFC3339> --repo owner/name --out export.json` (or `--run <UUID>` for an explicit set; add `--csv` for the spreadsheet rendering).
+3. Hand `export.json` — which carries each run's public signing key and full chained audit trail — to the external party.
+4. The external party runs `fishhawk-verify --export export.json`. It recomputes every entry hash and chain link with no backend trust required and exits `0` (every chain verified), `1` (one or more issues, e.g. `kind=hash_mismatch` for a tampered entry), or `2` (usage error: missing flag, unreadable file, malformed JSON).
 
 `run retry` takes a **stage** id, not a run id — retry is stage-scoped per the state machine. Pick the failed stage from `fishhawk run status <run-id> --output json` (`.stages[].id`).
 
