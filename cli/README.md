@@ -13,7 +13,7 @@ This directory is its own Go module (`github.com/kuhlman-labs/fishhawk/cli`) so 
 
 ## Status
 
-E6.1 (#55), E6.2 (#33), E6.3 (#34), E6.4 (#35), E6.5 (#36) shipped: scaffold + `run start`, `run status`, `run list`, `run cancel`, `run open`, `validate`. E18.1 (#332), E18.2 (#333), E18.3 (#334), E18.4 (#335), E18.5 (#336) added `plan approve`, `plan reject`, `run retry`, `audit list`, `audit tail`. E23.8 (#1388) added `deploy status`, `deploy approve`, `deploy reject`, `deploy rollback`. E25.9 (#1448) added `campaign start`, `campaign status`, `campaign list`, `campaign resume`. E29.3 (#1504) added `init`.
+E6.1 (#55), E6.2 (#33), E6.3 (#34), E6.4 (#35), E6.5 (#36) shipped: scaffold + `run start`, `run status`, `run list`, `run cancel`, `run open`, `validate`. E18.1 (#332), E18.2 (#333), E18.3 (#334), E18.4 (#335), E18.5 (#336) added `plan approve`, `plan reject`, `run retry`, `audit list`, `audit tail`. E23.8 (#1388) added `deploy status`, `deploy approve`, `deploy reject`, `deploy rollback`. E25.9 (#1448) added `campaign start`, `campaign status`, `campaign list`, `campaign resume`. E29.3 (#1504) added `init`. E9.4 (#1607) added `export`.
 
 ## Subcommands
 
@@ -66,6 +66,10 @@ Since E29.5 `doctor` also runs a per-repo **onboarding preflight** — the prere
 2. `fishhawk export --from <RFC3339> --to <RFC3339> --repo owner/name --out export.json` (or `--run <UUID>` for an explicit set; add `--csv` for the spreadsheet rendering).
 3. Hand `export.json` — which carries each run's public signing key and full chained audit trail — to the external party.
 4. The external party runs `fishhawk-verify --export export.json`. It recomputes every entry hash and chain link with no backend trust required and exits `0` (every chain verified), `1` (one or more issues, e.g. `kind=hash_mismatch` for a tampered entry), or `2` (usage error: missing flag, unreadable file, malformed JSON).
+
+A worked example of this flow, run against Fishhawk's own development audit log
+and published with provenance + verification instructions, lives at
+[`docs/compliance/`](../docs/compliance/) (E9.6 / #1609).
 
 `run retry` takes a **stage** id, not a run id — retry is stage-scoped per the state machine. Pick the failed stage from `fishhawk run status <run-id> --output json` (`.stages[].id`).
 

@@ -10,14 +10,14 @@ Pre-alpha. The v0 build has largely landed, and Fishhawk now develops itself thr
 
 - **Backend control plane (`fishhawkd`)** — REST API, run/stage state machine on Postgres, signed audit log, policy evaluator, approval gating with SLA timeouts, retry semantics, GitHub App webhook receiver. ([`backend/`](backend/README.md))
 - **Runner action (`fishhawk/runner`)** — runs the agent (Claude Code or Codex) on the customer's CI, captures the signed trace, and validates the plan against its schema. Published as `kuhlman-labs/fishhawk/runner@runner/vX.Y.Z`; cosign-signed releases with SBOMs. ([`runner/`](runner/README.md))
-- **CLI (`fishhawk`)** — `validate`, `run` (start/status/open), `plan`, `audit`, `doctor`. ([`cli/`](cli/README.md))
+- **CLI (`fishhawk`)** — `validate`, `run` (start/status/open), `plan`, `audit`, `export`, `doctor`. ([`cli/`](cli/README.md))
 - **MCP server (`fishhawk-mcp`)** — exposes run, plan, and audit state to Claude Code (and any MCP client) over the Model Context Protocol; the surface self-hosted runs are driven through. ([`backend/cmd/fishhawk-mcp/`](backend/cmd/fishhawk-mcp))
 - **Web UI** — plan review, approval, audit log per run, retry on failures. ([`frontend/`](frontend/README.md))
 - **Audit-log verifier** — standalone binary that re-verifies an exported chain offline. ([`verifier/`](verifier/README.md))
 - **Hosted infrastructure** — Terraform on AWS (VPC, RDS, ECS Fargate, ALB, OIDC-based deploys; dev ~$15/mo and prod ~$85/mo profiles, [`infra/terraform/`](infra/terraform/README.md)) plus a Helm chart for Kubernetes ([`deploy/helm/fishhawk/`](deploy/helm/fishhawk), quickstart in [`docs/deploy/kubernetes.md`](docs/deploy/kubernetes.md)).
 - **CI/CD** — every push to `main` builds + signs the backend image; tagged releases auto-deploy via GitHub Actions OIDC.
 
-Fishhawk now ships its *own* changes through Fishhawk. Since Day 22 of the v0 build (2026-05-21), substantive changes flow through a workflow run defined by [`.fishhawk/workflows.yaml`](.fishhawk/workflows.yaml): a human approves the plan, constraints are enforced on the implementation, and the PR is opened by Fishhawk itself — stamped with its run and stage IDs (the *"Opened by Fishhawk for run …"* footer on recent PRs). This is the methodology commitment in [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md), today held by convention rather than enforced by the product. The audit log behind each run is captured but not yet published as a public artifact — that step is still ahead.
+Fishhawk now ships its *own* changes through Fishhawk. Since Day 22 of the v0 build (2026-05-21), substantive changes flow through a workflow run defined by [`.fishhawk/workflows.yaml`](.fishhawk/workflows.yaml): a human approves the plan, constraints are enforced on the implementation, and the PR is opened by Fishhawk itself — stamped with its run and stage IDs (the *"Opened by Fishhawk for run …"* footer on recent PRs). This is the methodology commitment in [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md), today held by convention rather than enforced by the product. The audit log behind Fishhawk's own development is published as a public artifact in [`docs/compliance/`](docs/compliance/) — a machine-verifiable export plus a human-readable agent-changes report, both re-verifiable offline with the standalone `fishhawk-verify` binary.
 
 For the canonical scope and the technical realization, see [`docs/MVP_SPEC.md`](docs/MVP_SPEC.md) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
@@ -85,7 +85,7 @@ Per-component details live in each subdirectory's README:
 | Backend (`fishhawkd`) | [`backend/README.md`](backend/README.md) — `serve`, `migrate`, `token issue`, env-var reference |
 | Web UI | [`frontend/README.md`](frontend/README.md) — `pnpm dev`, route layout, OAuth wiring |
 | Runner action | [`runner/README.md`](runner/README.md) — used in GitHub Actions, not typically run locally |
-| CLI | [`cli/README.md`](cli/README.md) — `fishhawk validate`, `run`, `plan`, `audit`, `doctor` |
+| CLI | [`cli/README.md`](cli/README.md) — `fishhawk validate`, `run`, `plan`, `audit`, `export`, `doctor` |
 | Verifier | [`verifier/README.md`](verifier/README.md) — `fishhawk-verify` against an exported audit log |
 | Infrastructure | [`infra/terraform/README.md`](infra/terraform/README.md) — bootstrap, dev vs prod profiles, CI deploy flow |
 
