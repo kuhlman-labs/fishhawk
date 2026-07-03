@@ -9,8 +9,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -43,6 +45,16 @@ type fakeGHAPI struct {
 	createCalls int
 	createErrOn int // fail the Nth CreateIssue (0 = never)
 	dropLinkFor int // AddSubIssue no-op when the child's issue number == this
+
+	// Concurrency gate (nil unless the concurrent-filing test wires it): the
+	// first CreateIssue closes createGateEntered then blocks on
+	// createGateRelease, pinning the winning goroutine INSIDE the filing
+	// critical section (holding the per-draft advisory lock) so a second
+	// concurrent POST deterministically blocks on that lock instead of racing
+	// the winner to completion first. Gating happens BEFORE f.mu is taken.
+	createGateEntered chan struct{}
+	createGateRelease chan struct{}
+	gateOnce          sync.Once
 }
 
 func newFakeGHAPI() *fakeGHAPI {
@@ -55,6 +67,15 @@ func newFakeGHAPI() *fakeGHAPI {
 }
 
 func (f *fakeGHAPI) CreateIssue(_ context.Context, _ int64, _ githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
+	// Concurrency gate: hold the winner inside the filing critical section on its
+	// FIRST create so a second concurrent POST provably blocks on the per-draft
+	// advisory lock. Done before f.mu so it never blocks other API calls.
+	if f.createGateRelease != nil {
+		f.gateOnce.Do(func() {
+			close(f.createGateEntered)
+			<-f.createGateRelease
+		})
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.createCalls++
@@ -363,10 +384,21 @@ func TestFileRefinementSession_KillAndResume(t *testing.T) {
 // condition: two goroutines POST /file for the same approved draft
 // simultaneously; the per-draft advisory lock guarantees exactly ONE epic + N
 // children are provider-created and zero duplicate records.
+//
+// The overlap is FORCED deterministically (no reliance on scheduler timing): the
+// winner is pinned inside the filing critical section by a provider-side gate on
+// its first CreateIssue (barrier 1), the loser is then launched and its arrival
+// is confirmed by observing a real non-granted advisory-lock waiter in pg_locks
+// (barrier 2), and only THEN is the winner released. This guarantees the two
+// requests genuinely overlap on the lock — the concurrent-observer race the
+// condition requires — rather than the winner completing before the loser starts
+// and the test passing through the already-completed replay path.
 func TestFileRefinementSession_ConcurrentFilesOnce(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := refinement.NewPostgresRepository(pool)
 	api := newFakeGHAPI()
+	api.createGateEntered = make(chan struct{})
+	api.createGateRelease = make(chan struct{})
 	installGHProvider(t, api)
 
 	sessionID := seedApprovedDraft(t, repo, sixChildDraft())
@@ -376,15 +408,36 @@ func TestFileRefinementSession_ConcurrentFilesOnce(t *testing.T) {
 
 	var wg sync.WaitGroup
 	codes := make([]int, 2)
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			rec := httptest.NewRecorder()
-			s.handleFileRefinementSession(rec, fileReq(sessionID, "o/r"))
-			codes[idx] = rec.Code
-		}(i)
+	post := func(idx int) {
+		defer wg.Done()
+		rec := httptest.NewRecorder()
+		s.handleFileRefinementSession(rec, fileReq(sessionID, "o/r"))
+		codes[idx] = rec.Code
 	}
+
+	// Goroutine 0 (the presumptive winner) acquires the advisory lock and enters
+	// the filing critical section; its first CreateIssue blocks on the gate.
+	wg.Add(1)
+	go post(0)
+
+	// Barrier 1: the winner is provably inside the critical section, holding the
+	// per-draft advisory lock, blocked on its first provider create.
+	select {
+	case <-api.createGateEntered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("winner never reached its first CreateIssue under the filing lock")
+	}
+
+	// Goroutine 1 (the loser) races in while the winner holds the lock.
+	wg.Add(1)
+	go post(1)
+
+	// Barrier 2: wait until the loser is provably BLOCKED acquiring the advisory
+	// lock (a non-granted advisory row appears in pg_locks). Only now release the
+	// winner — this forces the concurrent overlap instead of a serial replay.
+	waitForAdvisoryLockWaiter(t, pool)
+	close(api.createGateRelease)
+
 	wg.Wait()
 
 	for i, c := range codes {
@@ -417,6 +470,31 @@ func TestFileRefinementSession_ConcurrentFilesOnce(t *testing.T) {
 	}
 	if sess.CompletedAt == nil {
 		t.Error("completed_at is nil after a concurrent full fill, want set")
+	}
+}
+
+// waitForAdvisoryLockWaiter blocks until a session is waiting on (blocked
+// acquiring) a Postgres advisory lock — the signal that the loser goroutine has
+// reached WithFilingLock and is contending for the per-draft lock the winner
+// holds. The isolated pgtest database has no other advisory-lock activity during
+// the test, so a single non-granted advisory row is unambiguous.
+func waitForAdvisoryLockWaiter(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var waiters int
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`,
+		).Scan(&waiters); err != nil {
+			t.Fatalf("poll pg_locks for advisory waiter: %v", err)
+		}
+		if waiters > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("loser goroutine never blocked on the per-draft advisory lock")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
