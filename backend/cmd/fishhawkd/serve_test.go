@@ -17,7 +17,6 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -741,10 +740,12 @@ func TestServeWiresRefinementConfig(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	var cfg server.Config
-	// Mirrors the serve.go DB block: refinement.NewPostgresRepository(pool). A
-	// nil pool is fine here — the constructor stores it without dialing, and we
-	// only assert the field is populated (non-nil), exactly as production wires.
-	cfg.RefinementRepo = refinement.NewPostgresRepository(nil)
+	// Drive the SAME production helpers the serve DB block calls, rather than
+	// re-constructing the repo inline — a hand-rolled refinement.NewPostgresRepository
+	// here would stay green even if the DB block stopped populating the field. A
+	// nil pool is fine: the constructor stores it without dialing, and we only
+	// assert the field is populated (non-nil), exactly as production wires.
+	cfg.RefinementRepo = resolveRefinementRepo(nil)
 	cfg.RefinementDrafter = resolveRefinementDrafter(planReviewerOptions{
 		enableLocalClaudeReviewer: true,
 		localClaudeBinary:         "claude",

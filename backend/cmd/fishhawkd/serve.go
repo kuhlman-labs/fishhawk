@@ -310,6 +310,16 @@ func resolveRefinementDrafter(opts planReviewerOptions, logger *slog.Logger) ser
 	return refinement.NewDrafter(client, workmgmt.Default())
 }
 
+// resolveRefinementRepo builds the always-on Postgres refinement repository
+// (E34.2 / #1593) the serve DB block wires into Config.RefinementRepo. Extracted
+// as the single construction seam so the serve-wiring test drives the SAME
+// production call rather than duplicating refinement.NewPostgresRepository — a
+// hand-rolled duplicate would pass even if the DB block stopped populating the
+// field.
+func resolveRefinementRepo(pool *pgxpool.Pool) refinement.Repository {
+	return refinement.NewPostgresRepository(pool)
+}
+
 // buildModelProviders builds the provider→Fetcher map the live ModelOracle
 // (#1341) refreshes. A provider is registered ONLY when its API key is present:
 // an absent key leaves the provider UNREGISTERED, so its Snapshot reports
@@ -710,7 +720,7 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.MCPTokenRepo = mcptoken.NewPostgresRepository(pool)
 		cfg.ScopeAmendmentRepo = scopeamendment.NewPostgresRepository(pool)
 		cfg.ConcernRepo = concern.NewPostgresRepository(pool)
-		cfg.RefinementRepo = refinement.NewPostgresRepository(pool)
+		cfg.RefinementRepo = resolveRefinementRepo(pool)
 		cfg.AuthRepo = authpkg.NewPostgresRepository(pool)
 		logger.Info("repositories configured (run + signing + audit + approval + artifact + stagecheck + apitoken + auth)", slog.String("driver", "postgres"))
 	} else {

@@ -237,6 +237,62 @@ func TestRefinement_NilDrafter503OnAgentArmsOnly(t *testing.T) {
 	}
 }
 
+// ---- drafting agent failure (502) -----------------------------------------
+
+// TestRefinement_DraftingAgentFailure502 exercises the external-agent failure
+// path on BOTH agent-backed arms: when the Drafter returns an error, the
+// create-session and brief-amendment handlers must respond 502
+// refinement_drafting_failed and persist nothing (the error is returned before
+// any CreateDraft / audit append).
+func TestRefinement_DraftingAgentFailure502(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := refinement.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	drafter := &fakeRefinementDrafter{err: errors.New("agent boom")}
+	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, RefinementDrafter: drafter})
+
+	// Create arm: the drafter errors before the persist → 502, nothing stored.
+	rec := httptest.NewRecorder()
+	s.handleCreateRefinementSession(rec, refinementReq(http.MethodPost, "/v0/refinement/sessions", "", `{"brief":"build X"}`))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("create under drafter failure: status = %d, want 502 (body %s)", rec.Code, rec.Body.String())
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("refinement_drafting_failed")) {
+		t.Errorf("create body = %s, want refinement_drafting_failed", rec.Body.String())
+	}
+
+	// Brief-amendment arm: seed an initial revision, then a failing amendment must
+	// 502 and leave the session at its one initial revision with no edit audit
+	// entry (the 502 returns before the audit append AND the persist).
+	sessionID := uuid.New()
+	if _, err := repo.CreateDraft(context.Background(), refinement.CreateParams{
+		SessionID: sessionID, Brief: "b", Draft: refinementValidDraft(), Origin: refinement.OriginBrief,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	rec = httptest.NewRecorder()
+	s.handlePatchRefinementDraft(rec, refinementReq(http.MethodPatch, "/x", sessionID.String(), `{"brief_amendment":"more scope"}`))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("amendment under drafter failure: status = %d, want 502 (body %s)", rec.Code, rec.Body.String())
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("refinement_drafting_failed")) {
+		t.Errorf("amendment body = %s, want refinement_drafting_failed", rec.Body.String())
+	}
+	drafts, _ := repo.ListForSession(context.Background(), sessionID)
+	if len(drafts) != 1 {
+		t.Errorf("revisions after failed amendment = %d, want 1 (nothing persisted)", len(drafts))
+	}
+	if got := countGlobalCategory(t, auditRepo, "refinement_draft_edited"); got != 0 {
+		t.Errorf("edited audit entries after failed amendment = %d, want 0", got)
+	}
+
+	// Both arms reached and invoked the drafter — proving the 502 came from the
+	// agent call, not an earlier gate.
+	if drafter.calls != 2 {
+		t.Errorf("drafter calls = %d, want 2 (create + amendment)", drafter.calls)
+	}
+}
+
 // ---- auth -----------------------------------------------------------------
 
 func TestRefinement_AuthScopeEnforced(t *testing.T) {
