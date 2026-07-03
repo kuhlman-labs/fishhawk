@@ -29,7 +29,7 @@ This is a **new canonical artifact**, NOT a block inside `.fishhawk/workflows.ya
 | Field | Required | Shape | Meaning |
 |---|---|---|---|
 | `title_format` | no | template string | Title template with `{placeholder}` tokens (`{summary}`, `{epic}`, `{n}`, `{number}`). Rendering is the apply layer's concern. |
-| `body_skeleton` | yes | non-empty string list | Ordered body section headings. Dual-audience: Feature = Summary/Proposal/Done-means/Notes/Relations; Bug = Summary/Observed/Proposal/Done-means/Notes/Relations; ADR = Context/Options/Recommendation/Decision/Consequences; Chore = Summary/Done-means. |
+| `body_skeleton` | yes | non-empty string list | Ordered body section headings. Dual-audience: Feature = Summary/Proposal/Done-means/Acceptance criteria/Notes/Relations; Bug = Summary/Observed/Proposal/Done-means/Acceptance criteria/Notes/Relations; ADR = Context/Options/Recommendation/Decision/Consequences; Chore = Summary/Done-means. |
 | `default_labels` | no | unique label list | Labels applied before caller-supplied labels are merged. Each label is a bare token (`epic`, `adr`) or namespaced (`area:backend`, `type:feature`). |
 | `default_fields` | no | object | `status` (single-select Status value), `board_column`, and `complexity` (low/medium/high). |
 | `numbering` | conditional | object | `scheme` (`sequential`) + optional `prefix` + optional `pad` (zero-pad width for the rendered `{number}`, bounded 0..12; e.g. `3` → `041`, `0`/absent → no padding). Required when the type is `adr` (semantic check). The shipped default declares a second numbered type, `epic` (prefix `E`, `pad: 0` → the bare `[E29]`, not `[E029]`); its next number is discovered from existing `[E{number}]` titles, and the anchored discovery regexp skips child titles like `[E29.1]` because it demands `] ` immediately after the captured number. |
@@ -55,6 +55,15 @@ The mandatory trio is **Summary**, **Done-means**, **complexity** (#1005, operat
 
 - **Done-means** must be a *testable* condition — an observable outcome a reviewer can check, not a description of effort. The shipped default's `field_hints[Done-means]` states this.
 - **complexity** is picked from `complexity_levels` by the files and coupling a change touches (low = a few tightly-scoped edits; medium = one module or cross-package seam; high = spans wire/domain/persistence or a migration, needs an integration test for the seam).
+
+### Acceptance criteria vs Done-means
+
+The `feature` and `bug` skeletons carry both a **Done-means** and an **Acceptance criteria** section (E34.7, #1614) — they answer different questions and are not interchangeable:
+
+- **Done-means** is the change-complete checklist: what has to be true about the *change itself* (tests added, docs updated, mirrors synced) for the work to be considered finished. Example: "Filing a feature with an Acceptance criteria sections key succeeds; conventions docs updated; tests cover the old key set."
+- **Acceptance criteria** is the behavioral contract: observable, falsifiable behaviors the *issue* is done when exhibiting, independent of how the change was implemented. Example: "A feature filed with sections keyed Acceptance criteria renders the section between Done-means and Notes."
+
+`Acceptance criteria` is present on the `feature` and `bug` skeletons and optional on `chore` (the section is additive, not in `required_fields`, so it carries no retroactive requirement on existing issues filed under the old key set). It is the explicit/source_ref anchor the plan gate's `verification.acceptance_criteria` provenance expects; wiring a planner to read it automatically is out of scope here and tracked in #1543.
 
 ## Board states and transitions
 

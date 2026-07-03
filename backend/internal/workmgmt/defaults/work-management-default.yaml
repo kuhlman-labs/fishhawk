@@ -63,6 +63,14 @@ field_hints:
   Done-means: >-
     State the single testable condition that proves the item is complete —
     an observable outcome a reviewer can check, not a description of effort.
+  # E34.7 / #1614: the explicit-source anchor for plan criteria. Distinct
+  # from Done-means (the change-complete checklist) — this is the
+  # behavioral contract the acceptance stage validates.
+  Acceptance criteria: >-
+    A bulleted list of observable, falsifiable behaviors this issue is done
+    when exhibiting — the behavioral contract the acceptance stage
+    validates. Distinct from Done-means, which is the change-complete
+    checklist (tests/docs/mirrors), not a behavioral claim.
   complexity: >-
     Pick low/medium/high from complexity_levels by the files and coupling the
     change touches.
@@ -74,6 +82,7 @@ types:
       - Summary
       - Proposal
       - Done-means
+      - Acceptance criteria
       - Notes
       - Relations
     default_labels:
@@ -90,6 +99,7 @@ types:
       - Observed
       - Proposal
       - Done-means
+      - Acceptance criteria
       - Notes
       - Relations
     default_labels:

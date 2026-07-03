@@ -154,7 +154,7 @@
           "type": "array",
           "minItems": 1,
           "items": { "type": "string", "minLength": 1 },
-          "description": "Ordered list of body section headings. Dual-audience by design, e.g. Feature = Summary/Proposal/Done-means/Notes/Relations; Bug = Summary/Observed/Proposal/Done-means/Notes/Relations; ADR = Context/Options/Recommendation/Decision/Consequences; Chore = Summary/Done-means."
+          "description": "Ordered list of body section headings. Dual-audience by design, e.g. Feature = Summary/Proposal/Done-means/Acceptance criteria/Notes/Relations; Bug = Summary/Observed/Proposal/Done-means/Acceptance criteria/Notes/Relations; ADR = Context/Options/Recommendation/Decision/Consequences; Chore = Summary/Done-means."
         },
         "default_labels": {
           "type": "array",
