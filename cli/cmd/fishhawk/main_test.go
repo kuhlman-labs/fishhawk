@@ -63,6 +63,20 @@ func TestRun_Help_ListsDeployVerbs(t *testing.T) {
 	}
 }
 
+func TestRun_Help_ListsExport(t *testing.T) {
+	// E9.4 / #1607: the export verb must be discoverable in the usage
+	// listing, matching the TestRun_Help_ListsReportIssue (#1006) and
+	// TestRun_Help_ListsDeployVerbs (#1388) convention. Guards against a
+	// silent dispatch omission.
+	var stdout strings.Builder
+	if got := run([]string{"help"}, &stdout, io.Discard); got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	if !strings.Contains(stdout.String(), "export") {
+		t.Errorf("usage missing 'export' verb:\n%s", stdout.String())
+	}
+}
+
 func TestRun_Help_ListsInit(t *testing.T) {
 	// E29.3 / #1504: the init verb must be discoverable in the usage
 	// listing, matching the TestRun_Help_ListsReportIssue (#1006) and

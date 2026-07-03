@@ -1002,3 +1002,148 @@ func TestResumeCampaign_NotPaused409(t *testing.T) {
 		t.Errorf("apiErr = %+v, want 409 campaign_not_paused", apiErr)
 	}
 }
+
+// --- audit export (E9.4 / #1607) ---
+
+// TestExportAudit_QueryEncodingAndHeaders asserts the JSON export
+// method builds the shared query (repeatable run_id) and parses the
+// continuation headers on a complete=false page.
+func TestExportAudit_QueryEncodingAndHeaders(t *testing.T) {
+	var gotQuery string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/audit/export", func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("X-Fishhawk-Export-Complete", "false")
+		w.Header().Set("X-Fishhawk-Export-Next-Cursor", "next-tok")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"schema":"v1"}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "")
+	page, err := c.ExportAudit(context.Background(), ExportAuditParams{
+		From:   "2026-01-01T00:00:00Z",
+		To:     "2026-02-01T00:00:00Z",
+		Repo:   "x/y",
+		RunIDs: []string{"11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"},
+		Limit:  5,
+	})
+	if err != nil {
+		t.Fatalf("ExportAudit: %v", err)
+	}
+	// Repeatable run_id: both must be present as separate params.
+	for _, want := range []string{
+		"from=2026-01-01T00%3A00%3A00Z",
+		"to=2026-02-01T00%3A00%3A00Z",
+		"repo=x%2Fy",
+		"run_id=11111111-1111-1111-1111-111111111111",
+		"run_id=22222222-2222-2222-2222-222222222222",
+		"limit=5",
+	} {
+		if !strings.Contains(gotQuery, want) {
+			t.Errorf("query missing %q: %s", want, gotQuery)
+		}
+	}
+	if page.Complete {
+		t.Error("Complete = true, want false")
+	}
+	if page.NextCursor != "next-tok" {
+		t.Errorf("NextCursor = %q, want next-tok", page.NextCursor)
+	}
+	if string(page.Body) != `{"schema":"v1"}` {
+		t.Errorf("Body = %q", page.Body)
+	}
+}
+
+// TestExportAudit_CompleteTrueHeader asserts a complete=true page parses
+// with an empty NextCursor and forwards the cursor param when set.
+func TestExportAudit_CompleteTrueHeader(t *testing.T) {
+	var gotCursor string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/audit/export", func(w http.ResponseWriter, r *http.Request) {
+		gotCursor = r.URL.Query().Get("cursor")
+		w.Header().Set("X-Fishhawk-Export-Complete", "true")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"schema":"v1","runs":{}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "")
+	page, err := c.ExportAudit(context.Background(), ExportAuditParams{Cursor: "resume-here"})
+	if err != nil {
+		t.Fatalf("ExportAudit: %v", err)
+	}
+	if gotCursor != "resume-here" {
+		t.Errorf("forwarded cursor = %q, want resume-here", gotCursor)
+	}
+	if !page.Complete {
+		t.Error("Complete = false, want true")
+	}
+	if page.NextCursor != "" {
+		t.Errorf("NextCursor = %q, want empty on complete page", page.NextCursor)
+	}
+}
+
+// TestExportAuditCSV_HeadersAndBody asserts the CSV method hits the .csv
+// path and returns the body bytes verbatim with parsed headers.
+func TestExportAuditCSV_HeadersAndBody(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/audit/export.csv", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Fishhawk-Export-Complete", "false")
+		w.Header().Set("X-Fishhawk-Export-Next-Cursor", "csv-next")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ts,run_id\n2026-01-01,abc\n")
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "")
+	page, err := c.ExportAuditCSV(context.Background(), ExportAuditParams{Limit: 1})
+	if err != nil {
+		t.Fatalf("ExportAuditCSV: %v", err)
+	}
+	if page.Complete || page.NextCursor != "csv-next" {
+		t.Errorf("continuation = (%v,%q), want (false,csv-next)", page.Complete, page.NextCursor)
+	}
+	if string(page.Body) != "ts,run_id\n2026-01-01,abc\n" {
+		t.Errorf("Body = %q", page.Body)
+	}
+}
+
+// TestExportAudit_APIErrorPassThrough asserts a non-2xx surfaces the
+// typed *APIError envelope (validation_failed on the mutual-exclusion
+// path).
+func TestExportAudit_APIErrorPassThrough(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/audit/export", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"code":"validation_failed","message":"run_id cannot be combined with repo, from, or to","details":{"field":"run_id"}}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "")
+	_, err := c.ExportAudit(context.Background(), ExportAuditParams{
+		Repo:   "x/y",
+		RunIDs: []string{"11111111-1111-1111-1111-111111111111"},
+	})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v, want *APIError", err)
+	}
+	if apiErr.StatusCode != http.StatusBadRequest || apiErr.Code != "validation_failed" {
+		t.Errorf("apiErr = %+v, want 400 validation_failed", apiErr)
+	}
+}
+
+// TestExportAudit_BadBaseURL asserts the BaseURL guard fires before any
+// network call, mirroring TestDo_BadBaseURL.
+func TestExportAudit_BadBaseURL(t *testing.T) {
+	c := &Client{}
+	if _, err := c.ExportAudit(context.Background(), ExportAuditParams{}); err == nil {
+		t.Fatal("expected error for empty BaseURL")
+	}
+}
