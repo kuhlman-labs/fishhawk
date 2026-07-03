@@ -103,12 +103,18 @@ type JiraConnection struct {
 
 // ItemType is the conventions for one work-item type.
 type ItemType struct {
-	TitleFormat   string        `json:"title_format,omitempty"`
-	BodySkeleton  []string      `json:"body_skeleton"`
-	DefaultLabels []string      `json:"default_labels,omitempty"`
-	DefaultFields DefaultFields `json:"default_fields,omitempty"`
-	Numbering     *Numbering    `json:"numbering,omitempty"`
-	EpicLink      string        `json:"epic_link,omitempty"`
+	TitleFormat  string   `json:"title_format,omitempty"`
+	BodySkeleton []string `json:"body_skeleton"`
+	// OptionalSections names body_skeleton headings that render only when the
+	// filing supplies content for them (an absent Sections key omits the
+	// heading entirely; a present key — even empty — renders it in position).
+	// Every entry must appear in BodySkeleton (validateSemantics enforces,
+	// fail-closed). Sections not listed here render unconditionally.
+	OptionalSections []string      `json:"optional_sections,omitempty"`
+	DefaultLabels    []string      `json:"default_labels,omitempty"`
+	DefaultFields    DefaultFields `json:"default_fields,omitempty"`
+	Numbering        *Numbering    `json:"numbering,omitempty"`
+	EpicLink         string        `json:"epic_link,omitempty"`
 }
 
 // DefaultFields holds a type's default board placement and complexity.
@@ -281,10 +287,17 @@ func validateSemantics(c Conventions) error {
 
 	// Type keys are deterministically ordered so the first failure is
 	// stable across runs. A type named "adr" must carry a numbering rule;
-	// the schema can't express the conditional, so it's enforced here.
+	// the schema can't express the conditional, so it's enforced here. Each
+	// optional_sections entry must also name a section in that type's
+	// body_skeleton — otherwise the render skip would key on a heading that
+	// never exists, so it's rejected fail-closed.
 	for _, name := range sortedTypeNames(c.Types) {
-		if name == "adr" && c.Types[name].Numbering == nil {
+		it := c.Types[name]
+		if name == "adr" && it.Numbering == nil {
 			return &SemanticError{Msg: "type \"adr\" must declare a numbering rule"}
+		}
+		if err := validateOptionalSections(name, it); err != nil {
+			return err
 		}
 	}
 
@@ -299,6 +312,30 @@ func validateSemantics(c Conventions) error {
 		if _, ok := c.States[target]; !ok {
 			return &SemanticError{Msg: fmt.Sprintf(
 				"transition %q targets canonical state %q, which is not declared in states", event, target)}
+		}
+	}
+	return nil
+}
+
+// validateOptionalSections enforces the cross-field rule the JSON Schema
+// can't express: every optional_sections entry for a type must name a
+// section present (exact match) in that type's body_skeleton. A stray entry
+// would key the render skip on a heading assembleBody never emits, so it's
+// rejected fail-closed with a *SemanticError naming the type, the offending
+// entry, and the body_skeleton it is absent from.
+func validateOptionalSections(name string, it ItemType) error {
+	if len(it.OptionalSections) == 0 {
+		return nil
+	}
+	inSkeleton := make(map[string]bool, len(it.BodySkeleton))
+	for _, s := range it.BodySkeleton {
+		inSkeleton[s] = true
+	}
+	for _, opt := range it.OptionalSections {
+		if !inSkeleton[opt] {
+			return &SemanticError{Msg: fmt.Sprintf(
+				"type %q lists optional_section %q, which is absent from its body_skeleton [%s]",
+				name, opt, strings.Join(it.BodySkeleton, ", "))}
 		}
 	}
 	return nil

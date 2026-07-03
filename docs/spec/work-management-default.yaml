@@ -71,6 +71,14 @@ field_hints:
     when exhibiting — the behavioral contract the acceptance stage
     validates. Distinct from Done-means, which is the change-complete
     checklist (tests/docs/mirrors), not a behavioral claim.
+  # E34.8 / #1615: non-binding starting pointers for the planner, distinct
+  # from the approved plan's binding scope.files.
+  Where to look: >-
+    Starting pointers for the planner — files, symbols, precedent PRs/issues
+    that ground where the change is likely to land. NON-BINDING: the approved
+    plan owns binding scope.files; a pointer here neither folds into scope nor
+    obligates the plan to touch it. Give paths and names, never toolchain
+    commands (keep it language-agnostic).
   complexity: >-
     Pick low/medium/high from complexity_levels by the files and coupling the
     change touches.
@@ -81,10 +89,16 @@ types:
     body_skeleton:
       - Summary
       - Proposal
+      - Where to look
       - Done-means
       - Acceptance criteria
       - Notes
       - Relations
+    # 'Where to look' is optional: its heading renders only when the filing
+    # supplies content. Omitting it produces a body byte-identical to the
+    # pre-section skeleton (#1615).
+    optional_sections:
+      - Where to look
     default_labels:
       - type:feature
     default_fields:
@@ -98,10 +112,13 @@ types:
       - Summary
       - Observed
       - Proposal
+      - Where to look
       - Done-means
       - Acceptance criteria
       - Notes
       - Relations
+    optional_sections:
+      - Where to look
     default_labels:
       - type:bug
     default_fields:
