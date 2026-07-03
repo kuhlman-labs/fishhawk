@@ -448,6 +448,110 @@ func TestAuditExportCSV_Continuation(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------
+// (e2) continuation + entry filter: a non-final run page whose only
+// entries are filtered out emits ZERO data rows while
+// X-Fishhawk-Export-Complete=false and carries a next cursor. Whole-run
+// paging is entry-filter-blind — the page still advances one run — so
+// the union of matching rows across pages equals the single-page
+// filtered export even when interior pages are empty.
+// ---------------------------------------------------------------------
+
+func TestAuditExportCSV_ContinuationEmptyFilteredPage(t *testing.T) {
+	fr := newFakeRepo()
+	// Three runs, created_at DESC page order [first, middle, last].
+	first := seedExportRun(fr, "acme/app", time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+	middle := seedExportRun(fr, "acme/app", time.Date(2026, 5, 1, 11, 0, 0, 0, time.UTC))
+	last := seedExportRun(fr, "acme/app", time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC))
+	af := &exportAuditFake{perRun: map[uuid.UUID][]*audit.Entry{
+		// The first (non-final) page's only run has NO approval entry, so
+		// the category filter eliminates every row on it.
+		first: chainCSVEntries(t, &first,
+			csvSeedEntry{category: "plan_generated", subject: "alice@x", payload: `{"i":0}`},
+		),
+		// The middle run carries the single matching approval.
+		middle: chainCSVEntries(t, &middle,
+			csvSeedEntry{category: "approval_submitted", subject: "alice@x", payload: `{"i":1}`},
+		),
+		// The last (final) run is also filtered to empty.
+		last: chainCSVEntries(t, &last,
+			csvSeedEntry{category: "plan_generated", subject: "alice@x", payload: `{"i":2}`},
+		),
+	}}
+	s := New(Config{AuditRepo: af, RunRepo: fr, SigningRepo: &exportSigningFake{}})
+
+	// Single-page reference (large limit): exactly the one matching row.
+	fullRec := doExportCSV(s, "?category=approval_submitted&include_global=false")
+	if fullRec.Code != http.StatusOK {
+		t.Fatalf("full status %d: %s", fullRec.Code, fullRec.Body.String())
+	}
+	fullHeader, fullRows := parseCSV(t, fullRec.Body.Bytes())
+	if len(fullRows) != 1 {
+		t.Fatalf("single-page filtered export has %d rows, want 1", len(fullRows))
+	}
+	catCol := col(t, fullHeader, "category")
+	if fullRows[0][catCol] != "approval_submitted" {
+		t.Fatalf("reference row category = %q, want approval_submitted", fullRows[0][catCol])
+	}
+
+	// Walk limit=1 pages. Page 1 (first run) is the documented edge: a
+	// non-final page with zero data rows but Complete=false + a cursor.
+	var pagedRows [][]string
+	cursor := ""
+	pages := 0
+	sawEmptyNonFinalPage := false
+	for {
+		pages++
+		if pages > 10 {
+			t.Fatal("continuation did not terminate")
+		}
+		q := "?limit=1&category=approval_submitted&include_global=false"
+		if cursor != "" {
+			q += "&cursor=" + cursor
+		}
+		rec := doExportCSV(s, q)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("page %d status %d: %s", pages, rec.Code, rec.Body.String())
+		}
+		_, rows := parseCSV(t, rec.Body.Bytes())
+		pagedRows = append(pagedRows, rows...)
+
+		complete := rec.Header().Get("X-Fishhawk-Export-Complete")
+		next := rec.Header().Get("X-Fishhawk-Export-Next-Cursor")
+		if complete == "true" {
+			if next != "" {
+				t.Errorf("final page carries a next cursor %q", next)
+			}
+			break
+		}
+		if complete != "false" || next == "" {
+			t.Fatalf("partial page %d: complete=%q next=%q", pages, complete, next)
+		}
+		// The core assertion: a non-final page whose run had no matching
+		// entry emits zero data rows yet still advances (Complete=false,
+		// cursor present). Page 1 (the `first` run) is exactly that.
+		if len(rows) == 0 {
+			sawEmptyNonFinalPage = true
+		}
+		cursor = next
+	}
+	if pages != 3 {
+		t.Errorf("got %d pages, want 3 (limit=1 over 3 runs — paging is filter-blind)", pages)
+	}
+	if !sawEmptyNonFinalPage {
+		t.Error("expected at least one non-final page with zero data rows while Complete=false")
+	}
+	// Filter-blind paging still yields the full matching set: the union of
+	// per-page rows equals the single-page filtered export.
+	if len(pagedRows) != len(fullRows) {
+		t.Fatalf("paginated union has %d rows, single-page filtered export has %d", len(pagedRows), len(fullRows))
+	}
+	key := func(r []string) string { return strings.Join(r, "\x00") }
+	if key(pagedRows[0]) != key(fullRows[0]) {
+		t.Errorf("paginated row %q != single-page row %q", key(pagedRows[0]), key(fullRows[0]))
+	}
+}
+
+// ---------------------------------------------------------------------
 // (f) failure modes, one behavioral assertion each.
 // ---------------------------------------------------------------------
 
