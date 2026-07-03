@@ -39,6 +39,11 @@ type refineFakeBackend struct {
 	latestOrigin  string
 	latestDraft   json.RawMessage
 	decisions     []map[string]any
+
+	// flaggedOrdinal, when non-zero, marks that 1-based child as
+	// needs_attention in criteria_precheck (the E34.5 advisory flag); 0 means a
+	// clean, checked-and-clean pre-check over two children.
+	flaggedOrdinal int
 }
 
 func defaultDraftJSON() json.RawMessage {
@@ -62,14 +67,36 @@ func (fb *refineFakeBackend) sessionViewJSON() []byte {
 			map[string]any{"kind": "epic", "title": "E: widgets"},
 			map[string]any{"kind": "child", "title": "c1"},
 		},
-		"waves":     []any{[]any{1}, []any{2}},
-		"decisions": fb.decisions,
+		"waves":             []any{[]any{1}, []any{2}},
+		"criteria_precheck": fb.criteriaPrecheckJSON(),
+		"decisions":         fb.decisions,
 	}
 	if fb.drifted {
 		m["drifted"] = true
 	}
 	b, _ := json.Marshal(m)
 	return b
+}
+
+// criteriaPrecheckJSON builds the criteria_precheck sub-object for the session
+// view over two children, marking fb.flaggedOrdinal (when non-zero) as
+// needs_attention with a no_blocking_criterion finding.
+func (fb *refineFakeBackend) criteriaPrecheckJSON() map[string]any {
+	children := make([]any, 0, 2)
+	for _, ord := range []int{1, 2} {
+		child := map[string]any{"ordinal": ord, "findings": []any{}}
+		if ord == fb.flaggedOrdinal {
+			child["needs_attention"] = true
+			child["findings"] = []any{
+				map[string]any{"rule": "no_blocking_criterion", "detail": "no blocking acceptance criterion"},
+			}
+		}
+		children = append(children, child)
+	}
+	return map[string]any{
+		"needs_attention": fb.flaggedOrdinal != 0,
+		"children":        children,
+	}
 }
 
 func (fb *refineFakeBackend) record(r *http.Request) []byte {
@@ -261,8 +288,48 @@ func TestDraftEpic_OpenArm_WiresCreate(t *testing.T) {
 	if got := out.Session.LatestDraft.Children[1].DependsOn; len(got) != 1 || got[0] != 1 {
 		t.Errorf("child[1].depends_on = %v, want [1]", got)
 	}
+	// criteria_precheck round-trips into the mirror; a clean draft is
+	// checked-and-clean (needs_attention false, per-child findings []).
+	if out.Session.CriteriaPrecheck.NeedsAttention {
+		t.Errorf("clean draft criteria_precheck.needs_attention = true, want false")
+	}
+	if len(out.Session.CriteriaPrecheck.Children) != 2 {
+		t.Errorf("criteria_precheck children = %d, want 2", len(out.Session.CriteriaPrecheck.Children))
+	}
 	if len(out.SessionGuidance) == 0 || out.SessionGuidance[0].Arm != "decide" {
 		t.Errorf("guidance = %+v, want first arm 'decide'", out.SessionGuidance)
+	}
+}
+
+// TestDraftEpic_CriteriaPrecheck_GuidanceNamesFlaggedOrdinal round-trips a
+// flagged view through the tool: criteria_precheck decodes into the mirror and
+// the awaiting_approval decide guidance names the flagged child ordinal while
+// confirming approval remains legal.
+func TestDraftEpic_CriteriaPrecheck_GuidanceNamesFlaggedOrdinal(t *testing.T) {
+	fb, srv := newRefineFakeBackend(t)
+	fb.flaggedOrdinal = 2 // child 2 flagged no_blocking_criterion
+	r := newResolver(srv, nil)
+
+	_, out, err := r.draftEpic(context.Background(), nil, DraftEpicInput{Brief: "build widgets"})
+	if err != nil {
+		t.Fatalf("draftEpic open: %v", err)
+	}
+	if !out.Session.CriteriaPrecheck.NeedsAttention {
+		t.Fatalf("criteria_precheck.needs_attention must decode true; got %+v", out.Session.CriteriaPrecheck)
+	}
+	flagged := out.Session.CriteriaPrecheck.Children[1]
+	if flagged.Ordinal != 2 || !flagged.NeedsAttention {
+		t.Fatalf("child 2 must be flagged in the mirror; got %+v", flagged)
+	}
+	if len(out.SessionGuidance) == 0 || out.SessionGuidance[0].Arm != "decide" {
+		t.Fatalf("first guidance arm = %+v, want decide", out.SessionGuidance)
+	}
+	reason := out.SessionGuidance[0].Reason
+	if !strings.Contains(reason, "child 2") {
+		t.Errorf("decide guidance reason must name the flagged child 2; got %q", reason)
+	}
+	if !strings.Contains(reason, "still legal") {
+		t.Errorf("decide guidance reason must state approval is still legal (advisory); got %q", reason)
 	}
 }
 

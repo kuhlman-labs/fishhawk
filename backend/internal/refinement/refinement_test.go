@@ -88,16 +88,17 @@ func TestValidate_SelfEdgeRejected(t *testing.T) {
 	}
 }
 
-func TestValidate_ChildWithoutAcceptanceCriteriaNamesChild(t *testing.T) {
+// TestValidate_ChildWithoutAcceptanceCriteriaAccepted pins the E34.5
+// relaxation (#1596): a criteria-less child is no longer a hard 422 — Validate
+// ACCEPTS it so it can reach the preview, where EvaluateDraftCriteria flags the
+// advisory no_blocking_criterion finding (asserted in precheck_test.go). The
+// finding names the child by ordinal via ChildCriteriaCheck.Ordinal, which is
+// what the moved assertion checks.
+func TestValidate_ChildWithoutAcceptanceCriteriaAccepted(t *testing.T) {
 	d := validDraft()
 	d.Children[1].AcceptanceCriteria = nil
-	err := d.Validate()
-	if err == nil {
-		t.Fatal("Validate accepted a child with zero acceptance criteria")
-	}
-	// Named by ordinal (2) and summary so the operator can find the child.
-	if !strings.Contains(err.Error(), "child 2") || !strings.Contains(err.Error(), "child two") {
-		t.Errorf("error %q does not name the criteria-less child (ordinal 2, %q)", err.Error(), "child two")
+	if err := d.Validate(); err != nil {
+		t.Fatalf("Validate must accept a criteria-less child (advisory precheck screens quality now); got %v", err)
 	}
 }
 

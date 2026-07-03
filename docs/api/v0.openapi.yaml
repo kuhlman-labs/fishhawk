@@ -297,6 +297,56 @@ components:
                 items: { type: integer }
                 description: 1-based sibling ordinals this child depends on (not issue numbers).
 
+    AcceptanceFinding:
+      type: object
+      required: [rule, detail]
+      description: >-
+        One deterministic acceptance-criteria defect the pre-check flagged. rule
+        is the machine-readable classifier; criterion_id names the offending
+        criterion (its text at intake) and is absent for the presence-level
+        no_blocking_criterion finding; detail is a short human-readable
+        explanation.
+      properties:
+        rule:
+          type: string
+          enum: [no_blocking_criterion, missing_source_ref, missing_rationale, empty_id, duplicate_id]
+        criterion_id: { type: string, description: The offending criterion; absent for the no_blocking_criterion presence finding. }
+        detail: { type: string }
+
+    ChildCriteriaCheck:
+      type: object
+      required: [ordinal, findings]
+      description: >-
+        One child's intake acceptance-criteria pre-check: the 1-based child
+        ordinal, an advisory needs_attention marker (an unjustified missing
+        blocking criterion), and its findings ([] when checked and clean).
+      properties:
+        ordinal: { type: integer, description: The 1-based child ordinal this check is for. }
+        needs_attention:
+          type: boolean
+          description: >-
+            True when this child has an unjustified no_blocking_criterion
+            finding. Advisory — approval remains legal. Absent when false.
+        findings:
+          type: array
+          items: { $ref: '#/components/schemas/AcceptanceFinding' }
+
+    CriteriaPrecheck:
+      type: object
+      required: [needs_attention, children]
+      description: >-
+        The E34.5 advisory acceptance-criteria pre-check over the latest draft's
+        children (#1596): per-child findings plus a draft-level needs_attention
+        marker. Advisory only — a flagged draft can still be approved. Derived
+        per response; nothing is persisted.
+      properties:
+        needs_attention:
+          type: boolean
+          description: True when any child has an unjustified no_blocking_criterion finding (advisory).
+        children:
+          type: array
+          items: { $ref: '#/components/schemas/ChildCriteriaCheck' }
+
     RefinementDecision:
       type: object
       required: [decision, reason, draft_id, draft_content_hash, created_at]
@@ -311,12 +361,13 @@ components:
 
     RefinementSession:
       type: object
-      required: [session_id, state, revision_count, latest_origin, latest_draft, preview, waves, decisions]
+      required: [session_id, state, revision_count, latest_origin, latest_draft, preview, waves, criteria_precheck, decisions]
       description: >-
         The refinement gate's session view: derived approval state, revision
-        count, the latest draft, the full filing preview, the wave DAG, and the
-        decision history. State is DERIVED from revisions + decisions, never
-        stored — an edit after approval re-gates the session.
+        count, the latest draft, the full filing preview, the wave DAG, the
+        advisory acceptance-criteria pre-check, and the decision history. State
+        is DERIVED from revisions + decisions, never stored — an edit after
+        approval re-gates the session.
       properties:
         session_id: { type: string, format: uuid }
         state:
@@ -339,6 +390,12 @@ components:
           type: array
           description: The topological dispatch order as waves of 1-based child ordinals.
           items: { type: array, items: { type: integer } }
+        criteria_precheck:
+          allOf: [{ $ref: '#/components/schemas/CriteriaPrecheck' }]
+          description: >-
+            The advisory acceptance-criteria pre-check over the latest draft's
+            children. needs_attention flags an unjustified missing blocking
+            criterion — approval remains legal (advisory). Always present.
         decisions:
           type: array
           items: { $ref: '#/components/schemas/RefinementDecision' }
@@ -5509,7 +5566,10 @@ paths:
           description: |
             `validation_failed` — neither or both arms supplied, or a `draft`
             that fails strict decode / validation (an empty field, a dangling or
-            cyclic `depends_on` edge — the error names the offending edge).
+            cyclic `depends_on` edge — the error names the offending edge). A
+            child with NO acceptance criteria is NOT a validation failure (as of
+            E34.5 / #1596): it lands `200` and surfaces as an advisory
+            `criteria_precheck` `no_blocking_criterion` finding instead.
         '500': { description: "`audit_append_failed` — the edit's audit entry could not be durably recorded; nothing was persisted." }
         '502': { description: "`refinement_drafting_failed` — the agent (brief-amendment arm) did not produce a valid draft." }
         '503':

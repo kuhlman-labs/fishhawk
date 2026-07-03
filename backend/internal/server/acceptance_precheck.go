@@ -42,24 +42,22 @@ type AcceptancePrecheckPayload struct {
 }
 
 // AcceptanceFinding is one deterministic defect the acceptance pre-check
-// flagged. Rule is the machine-readable classifier (no_blocking_criterion,
-// missing_source_ref, missing_rationale, empty_id, duplicate_id).
-// CriterionID names the offending criterion; it is empty for the
-// plan-level no_blocking_criterion presence finding, which has no single
-// criterion to point at. Detail is a short human-readable explanation.
-type AcceptanceFinding struct {
-	Rule        string `json:"rule"`
-	CriterionID string `json:"criterion_id,omitempty"`
-	Detail      string `json:"detail"`
-}
+// flagged. It is a type ALIAS of plan.AcceptanceFinding (the rule set moved to
+// the plan package in #1596 so intake and the plan gate share ONE evaluator),
+// so AcceptancePrecheckPayload's JSON shape and every existing reference in
+// plan.go / plan_test.go / acceptance_integration_test.go compiles and
+// marshals unchanged.
+type AcceptanceFinding = plan.AcceptanceFinding
 
-// Acceptance pre-check finding rules.
+// Acceptance pre-check finding rules referenced by the server and its tests.
+// These alias the canonical plan-package constants (the single source), so the
+// server's callers keep their identifiers while the rule strings live in
+// exactly one place. The remaining rules (missing_rationale, empty_id) are
+// referenced only through plan.Rule* directly.
 const (
-	acceptanceRuleNoBlockingCriterion = "no_blocking_criterion"
-	acceptanceRuleMissingSourceRef    = "missing_source_ref"
-	acceptanceRuleMissingRationale    = "missing_rationale"
-	acceptanceRuleEmptyID             = "empty_id"
-	acceptanceRuleDuplicateID         = "duplicate_id"
+	acceptanceRuleNoBlockingCriterion = plan.RuleNoBlockingCriterion
+	acceptanceRuleMissingSourceRef    = plan.RuleMissingSourceRef
+	acceptanceRuleDuplicateID         = plan.RuleDuplicateID
 )
 
 // runAcceptancePrecheck evaluates an uploaded plan's
@@ -135,11 +133,11 @@ func (s *Server) runAcceptancePrecheck(ctx context.Context, runID, stageID uuid.
 	}
 
 	v := decoded.Verification
-	findings := evaluateAcceptanceCriteria(v)
+	findings := plan.EvaluateAcceptanceCriteria(v)
 
 	blockingCount := 0
 	for _, c := range v.AcceptanceCriteria {
-		if criterionBlocking(c) {
+		if plan.CriterionBlocking(c) {
 			blockingCount++
 		}
 	}
@@ -169,78 +167,6 @@ func (s *Server) runAcceptancePrecheck(ctx context.Context, runID, stageID uuid.
 		)
 	}
 	return result
-}
-
-// evaluateAcceptanceCriteria runs the deterministic acceptance-criteria
-// rules over a decoded Verification and returns the findings. It always
-// returns a non-nil slice so the audit payload records [] (not null) on a
-// clean-and-checked plan — the "checked and clean" contract shared with
-// the scope pre-check.
-//
-// Rules:
-//   - no_blocking_criterion — no criterion is effectively blocking AND
-//     out_of_scope is empty. A non-empty out_of_scope is the justified
-//     escape hatch: it declares what the change deliberately does not
-//     cover, so an absent blocking criterion is not necessarily a gap.
-//   - missing_source_ref — an explicit criterion with no source_ref.
-//   - missing_rationale — an inferred criterion with no rationale
-//     (defense-in-depth: the schema conditional normally rejects this
-//     upstream, but the pre-check stays order-independent).
-//   - empty_id / duplicate_id — id integrity for the join key.
-func evaluateAcceptanceCriteria(v plan.Verification) []AcceptanceFinding {
-	findings := []AcceptanceFinding{}
-
-	hasBlocking := false
-	seen := make(map[string]struct{}, len(v.AcceptanceCriteria))
-	for _, c := range v.AcceptanceCriteria {
-		if criterionBlocking(c) {
-			hasBlocking = true
-		}
-		if c.ID == "" {
-			findings = append(findings, AcceptanceFinding{
-				Rule:   acceptanceRuleEmptyID,
-				Detail: "acceptance criterion has an empty id (ids are the join key across execution, evidence, and feedback)",
-			})
-		} else if _, dup := seen[c.ID]; dup {
-			findings = append(findings, AcceptanceFinding{
-				Rule:        acceptanceRuleDuplicateID,
-				CriterionID: c.ID,
-				Detail:      "duplicate acceptance criterion id (ids must be unique within a plan)",
-			})
-		} else {
-			seen[c.ID] = struct{}{}
-		}
-		if c.Source == plan.CriterionSourceExplicit && c.SourceRef == "" {
-			findings = append(findings, AcceptanceFinding{
-				Rule:        acceptanceRuleMissingSourceRef,
-				CriterionID: c.ID,
-				Detail:      "explicit criterion is missing source_ref (an explicit criterion must cite where the ticket/spec states it)",
-			})
-		}
-		if c.Source == plan.CriterionSourceInferred && c.Rationale == "" {
-			findings = append(findings, AcceptanceFinding{
-				Rule:        acceptanceRuleMissingRationale,
-				CriterionID: c.ID,
-				Detail:      "inferred criterion is missing rationale (an inferred criterion must justify why it was derived)",
-			})
-		}
-	}
-
-	if !hasBlocking && len(v.OutOfScope) == 0 {
-		findings = append(findings, AcceptanceFinding{
-			Rule:   acceptanceRuleNoBlockingCriterion,
-			Detail: "no blocking acceptance criterion and no verification.out_of_scope justification (a plan must carry at least one blocking criterion or declare what is deliberately out of scope)",
-		})
-	}
-
-	return findings
-}
-
-// criterionBlocking applies the schema's blocking default: an omitted
-// (nil) blocking is true, matching the plan.AcceptanceCriterion.Blocking
-// pointer contract (backend/internal/plan/plan.go).
-func criterionBlocking(c plan.AcceptanceCriterion) bool {
-	return c.Blocking == nil || *c.Blocking
 }
 
 // resolveAcceptanceStage reads the run's workflow spec, looks up the active
