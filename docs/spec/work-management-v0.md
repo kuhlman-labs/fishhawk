@@ -107,6 +107,18 @@ Two per-type fields make label completeness a **conventions-level guarantee at f
 
 The `label_defaults` prefix rule is a semantic check (`workmgmt.Parse`): **every `label_defaults` value must begin with `<its key>:`** (e.g. key `autonomy` → value `autonomy:medium`). A misconfigured default (`autonomy → high`) is rejected fail-closed with a `*SemanticError` naming the type, key, and value.
 
+## Epic body conventions
+
+An epic's **Scope** section (2026-07-02 structure review, E34.10 / #1617) lists child issues as plain references — `- #NNN — one-line summary` — with **no task-list checkbox state** (no `- [ ]` / `- [x]`). GitHub sub-issue links already render live per-child progress on the epic, and the tracker's Status field is the authoritative state for each child; a hand-maintained checklist duplicates that state and rots (epic #924 shipped with all ten children unchecked while several were already closed). `field_hints["Scope"]` states this rule.
+
+This is **forward-only**: existing epic bodies are not rewritten. The E34.3 filing executor (not yet built) renders epic bodies through these same conventions, so its output is checkbox-free by construction. A provider hook that syncs check-state on child close is explicitly **not** built — removing the duplicate state is the fix, not keeping two copies in sync.
+
+## Comment-vs-body refinement channel
+
+Issue comments reach the planner **bot-filtered, sanitized, and budget-capped** (`backend/internal/prompt/prompt.go` `writeIssueComments`): each comment is capped at 2000 bytes, the total rendered block is capped at 12000 bytes, and when over budget the **oldest comments are dropped first**. A long refinement thread can therefore silently lose its early context by the time the planner sees it.
+
+Rule: a durable requirement change belongs in the issue **body** (edit it) — comments are for discussion, not the record of truth. E34.2's draft-edit flow (#1592) is the structured path for revising the body once it lands.
+
 ## Board states and transitions
 
 The `states` and `transitions` blocks (both optional, additive within v0) drive run-lifecycle board moves (#1012), the companion to the filing conventions above:
