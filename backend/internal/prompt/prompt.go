@@ -3077,6 +3077,10 @@ func writeIssueComments(b *strings.Builder, comments []IssueComment) {
 	// Per-comment cap so a single long comment can't dominate the
 	// budget. Same capped-injection style as PriorRejectionFeedback's
 	// maxFeedbackBytes.
+	//
+	// Keep in sync: these numbers are documented in
+	// docs/spec/work-management-v0.md ("Comment-vs-body refinement
+	// channel") — update that section if either cap changes.
 	const maxCommentBytes = 2000
 	rendered := make([]string, len(surviving))
 	for i, c := range surviving {
@@ -3095,6 +3099,8 @@ func writeIssueComments(b *strings.Builder, comments []IssueComment) {
 	// budget, drop everything older (recency is load-bearing). The
 	// newest comment always survives — the per-comment cap is below the
 	// total budget.
+	//
+	// Keep in sync: see the docs/spec/work-management-v0.md note above.
 	const maxTotalCommentBytes = 12000
 	start := 0
 	total := 0

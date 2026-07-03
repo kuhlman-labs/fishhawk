@@ -160,7 +160,7 @@ Because `--all` always rebuilds `fishhawk-mcp`, the `/mcp` reconnect banner is *
    - **For Fishhawk product friction** (a bug in the tooling itself hit during a run), prefer **`fishhawk_report_product_issue`** with the run's id — it attaches a redacted, fingerprint-deduped diagnostic bundle (#1006).
 6. Open PR — body uses `## Summary` / `## Test plan` / optional `## Notes` / `Closes #<issue>`. Match #80, #81.
 7. After merge, walk the dependents:
-   - Verify parent epic's task list checked off.
+   - Verify parent epic progress via its sub-issue links and the tracker Status field — epic bodies don't carry a hand-maintained checklist to check off (sub-issues + Status are the source of truth, E34.10 / #1617).
    - Update sibling issues if scope shifted (e.g., a CI fix bundled here means another sibling no longer needs it).
    - If an ADR was resolved, edit its body's Decision section and close.
 

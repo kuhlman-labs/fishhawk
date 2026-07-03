@@ -82,6 +82,14 @@ field_hints:
   complexity: >-
     Pick low/medium/high from complexity_levels by the files and coupling the
     change touches.
+  # 2026-07-02 structure review (E34.10 / #1617): retires hand-maintained
+  # epic-body checklists. Forward-only — existing epic bodies are not
+  # rewritten.
+  Scope: >-
+    List child issues as plain references — `- #NNN — one-line summary` —
+    with NO checkbox state (no `- [ ]` / `- [x]`). GitHub sub-issues already
+    render live per-child progress, plus the tracker Status field; a
+    hand-maintained checklist duplicates that state and rots.
 
 types:
   feature:

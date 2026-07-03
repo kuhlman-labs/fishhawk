@@ -186,6 +186,24 @@ func TestDefaultAcceptanceCriteriaHint(t *testing.T) {
 	}
 }
 
+// TestDefaultEpicScopeHint is the E34.10 (#1617) binding coverage condition:
+// field_hints["Scope"] must be non-empty, state that child references carry
+// no checkbox state, and carry the rationale that GitHub sub-issues are the
+// authoritative live progress view.
+func TestDefaultEpicScopeHint(t *testing.T) {
+	hint := Default().FieldHints["Scope"]
+	if hint == "" {
+		t.Fatal("field_hints[Scope] is empty")
+	}
+	lower := strings.ToLower(hint)
+	if !strings.Contains(lower, "no checkbox") {
+		t.Errorf("Scope hint %q does not state child references carry no checkbox state", hint)
+	}
+	if !strings.Contains(lower, "sub-issue") {
+		t.Errorf("Scope hint %q does not cite GitHub sub-issues as the live progress view", hint)
+	}
+}
+
 // TestDefaultRequiresMandatoryTrio asserts the shipped default carries the
 // mandatory required-field trio.
 func TestDefaultRequiresMandatoryTrio(t *testing.T) {
