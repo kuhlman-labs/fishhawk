@@ -1957,6 +1957,147 @@ components:
           type: string
           format: date-time
 
+    AgentChangesReport:
+      type: object
+      description: |
+        The E9.3 canned compliance report (#1606). A projection over the
+        E9.1 shared export assembly: one page of agent-authored changes in
+        the selected run range, the human-led changes in a separate
+        reduced-evidence section, and page totals. UNLIKE the verifier's
+        `Export v1` body, continuation markers (`complete`/`next_cursor`)
+        ride the BODY as well as the response headers — this endpoint is
+        not verifier-strict-decoded.
+      required: [schema, generated_at, filters, complete, agent_changes, human_led_changes, totals]
+      properties:
+        schema:
+          type: string
+          description: "Report format version, e.g. `agent-changes-report/v1`."
+        generated_at:
+          type: string
+          format: date-time
+          description: Server time (UTC) the report was assembled.
+        filters:
+          type: object
+          description: Echo of the run-selection filters so a saved report is self-describing.
+          properties:
+            repo: { type: string }
+            from: { type: string, format: date-time }
+            to: { type: string, format: date-time }
+        complete:
+          type: boolean
+          description: "`false` when more runs remain (report-only mirror of X-Fishhawk-Export-Complete)."
+        next_cursor:
+          type: string
+          description: Opaque keyset cursor for the next page. Present only when the report is partial.
+        agent_changes:
+          type: array
+          description: Agent-authored changes on this page, created_at-DESC.
+          items: { $ref: '#/components/schemas/AgentChangeItem' }
+        human_led_changes:
+          type: array
+          description: |
+            Changes on runs whose `workflow_id` is `human_led_change`,
+            with reduced evidence (`reviews`/`acceptance` omitted).
+          items: { $ref: '#/components/schemas/AgentChangeItem' }
+        totals:
+          type: object
+          description: Page totals. The three category counts partition `runs_in_range`.
+          required: [runs_in_range, agent_changes, human_led_changes, runs_without_change]
+          properties:
+            runs_in_range: { type: integer }
+            agent_changes: { type: integer }
+            human_led_changes: { type: integer }
+            runs_without_change:
+              type: integer
+              description: Runs that produced no PR — excluded from both lists, counted here.
+
+    AgentChangeItem:
+      type: object
+      description: |
+        One selected run that produced a change. Human-led items reuse
+        this shape with `reviews`/`acceptance` omitted (reduced evidence).
+      required: [run_id, repo, workflow_id, pr, audit_chain, evidence_links]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        repo: { type: string }
+        workflow_id: { type: string }
+        trigger_ref: { type: string, description: "e.g. `issue:1606`." }
+        pr:
+          type: object
+          description: What changed — from the `pull_request_opened` audit entry.
+          properties:
+            url: { type: string }
+            number: { type: integer, format: int64 }
+            branch: { type: string }
+            head_sha: { type: string }
+        merge:
+          type: object
+          description: Merge status — from `pr_merged`. Absent when the PR never merged.
+          properties:
+            merged: { type: boolean }
+            merger: { type: string }
+            head_sha: { type: string }
+            base_sha: { type: string }
+            merged_at: { type: string, format: date-time }
+        approvals:
+          type: array
+          description: Who approved — from `approval_submitted` + `pr_approved_on_github`.
+          items:
+            type: object
+            properties:
+              subject: { type: string }
+              actor_kind: { type: string }
+              decision: { type: string }
+              surface: { type: string }
+              timestamp: { type: string, format: date-time }
+        reviews:
+          type: array
+          description: |
+            What reviewed it — from `plan_reviewed` + `implement_reviewed`.
+            Omitted on human-led items (reduced evidence).
+          items:
+            type: object
+            properties:
+              stage: { type: string, enum: [plan, implement] }
+              reviewer_kind: { type: string }
+              reviewer_model: { type: string }
+              verdict: { type: string }
+              timestamp: { type: string, format: date-time }
+        acceptance:
+          type: object
+          description: |
+            What validated it — from `acceptance_outcome_recorded`. Absent
+            for runs predating the acceptance stage or that never ran it.
+            Omitted on human-led items (reduced evidence).
+          properties:
+            verdict: { type: string }
+            failure_mode: { type: string }
+            evidence_hashes: { type: array, items: { type: string } }
+            content_hash: { type: string }
+            timestamp: { type: string, format: date-time }
+        audit_chain:
+          type: object
+          description: The run's audit-chain span.
+          required: [first_sequence, last_sequence, first_entry_hash, last_entry_hash, entry_count]
+          properties:
+            first_sequence: { type: integer, format: int64 }
+            last_sequence: { type: integer, format: int64 }
+            first_entry_hash: { type: string }
+            last_entry_hash: { type: string }
+            entry_count: { type: integer }
+        evidence_links:
+          type: object
+          description: |
+            Redacted-tier pointers into the run/audit/export/artifact API
+            surfaces (ADR-054) — never inlined trace bundles.
+            ExternalURL-prefixed when configured, else relative `/v0/...`.
+          required: [run, audit, export]
+          properties:
+            run: { type: string }
+            audit: { type: string }
+            export: { type: string }
+            artifacts: { type: array, items: { type: string } }
+
     StatusCommentResponse:
       type: object
       description: |
@@ -4542,6 +4683,144 @@ paths:
           description: "`run_not_found` — an explicitly requested run does not exist (fail-closed)."
         '500':
           description: "`internal_error` — run assembly failed; no partial CSV is emitted (the whole page is buffered before any bytes are written)."
+        '503':
+          description: "`audit_export_unconfigured` — the audit, run, or signing repository is not configured on this instance."
+
+  /v0/reports/agent-changes:
+    get:
+      operationId: agentChangesReport
+      summary: Canned compliance report of all agent changes in a date range (JSON)
+      description: |
+        The E9.3 canned compliance report (#1606): every agent-authored
+        change in a run range, with who approved / what reviewed / what
+        validated each one, as machine-readable JSON. It is a PROJECTION
+        over the E9.1 shared export assembly (the SAME run selection and
+        per-run audit-chain assembly `GET /v0/audit/export` uses) — never
+        a parallel query path — so it inherits the identical run-level
+        filters (`repo`/`from`/`to`/`limit`/`cursor`, `run_id` mutually
+        exclusive with the filter shape) and `created_at`-DESC keyset
+        paging.
+
+        **What each change carries.** Per selected run that produced a
+        change (a `pull_request_opened` audit entry): the PR (`pr_url`,
+        `pr_number`, `branch`, `head_sha`); merge status (`merged`,
+        `merger`, `head_sha`, `base_sha`) from `pr_merged`; approvals
+        (subject, decision, timestamp) from `approval_submitted` +
+        `pr_approved_on_github`; reviews (stage, reviewer model, verdict)
+        from `plan_reviewed` + `implement_reviewed`; acceptance (verdict,
+        failure mode, evidence hashes, content hash) from
+        `acceptance_outcome_recorded`; the audit-chain span (first/last
+        sequence + entry hashes + entry count); and redacted-tier
+        evidence links (run/audit/export/artifact API pointers per
+        ADR-054 — never inlined trace bundles).
+
+        **Human-led changes.** Runs whose `workflow_id` is
+        `human_led_change` render in a SEPARATE `human_led_changes`
+        section with reduced evidence (approval + PR + chain span only —
+        reviews and acceptance are omitted). Runs that produced no PR are
+        excluded from both lists but counted in `totals.runs_without_change`.
+
+        **Continuation is in-band here.** Unlike the verifier-strict
+        `Export v1` body, this report is NOT strict-decoded by any
+        verifier, so `complete`/`next_cursor` appear BOTH in the response
+        headers (`X-Fishhawk-Export-Complete` /
+        `X-Fishhawk-Export-Next-Cursor`) AND in the report body — a
+        partial report declares itself partial in-band (ADR-054 size
+        posture). These continuation fields are report-only; they do not
+        appear on `GET /v0/audit/export`.
+
+        Authorization scope enforcement (`read:audit-export`) is deferred
+        to a sibling change (E9.5/#1608) per the ADR-054 rollout, exactly
+        as the export endpoints state.
+      tags: [audit]
+      parameters:
+        - name: run_id
+          in: query
+          description: |
+            Explicit run to report on. Repeatable. Mutually exclusive with
+            `repo`/`from`/`to`. A requested run that does not exist is a
+            `404 run_not_found`.
+          schema: { $ref: '#/components/schemas/UUID' }
+        - { name: repo, in: query, description: "Filter by repository (owner/name), resolved through the runs join.", schema: { type: string } }
+        - { name: from, in: query, description: "Lower bound (inclusive) on run created_at, RFC3339.", schema: { type: string, format: date-time } }
+        - { name: to, in: query, description: "Upper bound (inclusive) on run created_at, RFC3339.", schema: { type: string, format: date-time } }
+        - { name: limit, in: query, description: "Maximum RUNS per page (whole-run bounded).", schema: { type: integer, default: 50, maximum: 200 } }
+        - { name: cursor, in: query, description: "Opaque keyset continuation cursor from a prior page's X-Fishhawk-Export-Next-Cursor header.", schema: { type: string } }
+      responses:
+        '200':
+          description: One page of the agent-changes report.
+          headers:
+            X-Fishhawk-Export-Complete:
+              description: "`true` when this is the final page; `false` when more runs remain. Mirrored into the body `complete` field."
+              schema: { type: boolean }
+            X-Fishhawk-Export-Next-Cursor:
+              description: Opaque keyset cursor for the next page. Present only when the report is partial. Mirrored into the body `next_cursor` field.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentChangesReport' }
+        '400':
+          description: |
+            `validation_failed` — malformed `run_id`/`from`/`to`/`limit`,
+            `from` after `to`, or `run_id` combined with `repo`/`from`/`to`;
+            `cursor_invalid` — opaque cursor failed to decode.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: "`run_not_found` — an explicitly requested run does not exist (fail-closed)."
+        '503':
+          description: "`audit_export_unconfigured` — the audit, run, or signing repository is not configured on this instance."
+
+  /v0/reports/agent-changes.md:
+    get:
+      operationId: agentChangesReportMarkdown
+      summary: Canned compliance report of all agent changes (human-readable markdown)
+      description: |
+        The human-readable markdown rendering of `GET
+        /v0/reports/agent-changes` (#1606). Same resolve + build path,
+        same run-level filters and continuation semantics; ONE report
+        model feeds both renders (one-model-two-renders parity). A partial
+        report carries an explicit `PARTIAL REPORT — resume with cursor …`
+        banner in the markdown header, mirroring the `complete`/`next_cursor`
+        body fields and the continuation headers. Served as an attachment
+        download.
+      tags: [audit]
+      parameters:
+        - name: run_id
+          in: query
+          description: |
+            Explicit run to report on. Repeatable. Mutually exclusive with
+            `repo`/`from`/`to`. A requested run that does not exist is a
+            `404 run_not_found`.
+          schema: { $ref: '#/components/schemas/UUID' }
+        - { name: repo, in: query, description: "Filter by repository (owner/name), resolved through the runs join.", schema: { type: string } }
+        - { name: from, in: query, description: "Lower bound (inclusive) on run created_at, RFC3339.", schema: { type: string, format: date-time } }
+        - { name: to, in: query, description: "Upper bound (inclusive) on run created_at, RFC3339.", schema: { type: string, format: date-time } }
+        - { name: limit, in: query, description: "Maximum RUNS per page (whole-run bounded).", schema: { type: integer, default: 50, maximum: 200 } }
+        - { name: cursor, in: query, description: "Opaque keyset continuation cursor from a prior page's X-Fishhawk-Export-Next-Cursor header.", schema: { type: string } }
+      responses:
+        '200':
+          description: One page of the agent-changes report as markdown.
+          headers:
+            Content-Disposition:
+              description: "`attachment; filename=\"fishhawk-agent-changes-<UTC timestamp>.md\"` — download semantics."
+              schema: { type: string }
+            X-Fishhawk-Export-Complete:
+              description: "`true` when this is the final page; `false` when more runs remain."
+              schema: { type: boolean }
+            X-Fishhawk-Export-Next-Cursor:
+              description: Opaque keyset cursor for the next page. Present only when the report is partial.
+              schema: { type: string }
+          content:
+            text/markdown:
+              schema: { type: string }
+        '400':
+          description: |
+            `validation_failed` — malformed `run_id`/`from`/`to`/`limit`,
+            `from` after `to`, or `run_id` combined with `repo`/`from`/`to`;
+            `cursor_invalid` — opaque cursor failed to decode.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: "`run_not_found` — an explicitly requested run does not exist (fail-closed)."
         '503':
           description: "`audit_export_unconfigured` — the audit, run, or signing repository is not configured on this instance."
 
