@@ -196,7 +196,7 @@ func TestDefaultEpicScopeHint(t *testing.T) {
 		t.Fatal("field_hints[Scope] is empty")
 	}
 	lower := strings.ToLower(hint)
-	if !strings.Contains(lower, "checkbox") {
+	if !strings.Contains(lower, "no checkbox") {
 		t.Errorf("Scope hint %q does not state child references carry no checkbox state", hint)
 	}
 	if !strings.Contains(lower, "sub-issue") {
