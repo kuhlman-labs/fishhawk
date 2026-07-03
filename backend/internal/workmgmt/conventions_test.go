@@ -123,12 +123,12 @@ func TestDefaultDoneMeansHintIsTestable(t *testing.T) {
 func TestDefaultBodySkeletons(t *testing.T) {
 	d := Default()
 
-	wantFeature := []string{"Summary", "Proposal", "Done-means", "Acceptance criteria", "Notes", "Relations"}
+	wantFeature := []string{"Summary", "Proposal", "Where to look", "Done-means", "Acceptance criteria", "Notes", "Relations"}
 	if got := d.Types["feature"].BodySkeleton; strings.Join(got, ",") != strings.Join(wantFeature, ",") {
 		t.Errorf("feature body_skeleton = %v, want %v", got, wantFeature)
 	}
 
-	wantBug := []string{"Summary", "Observed", "Proposal", "Done-means", "Acceptance criteria", "Notes", "Relations"}
+	wantBug := []string{"Summary", "Observed", "Proposal", "Where to look", "Done-means", "Acceptance criteria", "Notes", "Relations"}
 	if got := d.Types["bug"].BodySkeleton; strings.Join(got, ",") != strings.Join(wantBug, ",") {
 		t.Errorf("bug body_skeleton = %v, want %v", got, wantBug)
 	}
@@ -136,6 +136,35 @@ func TestDefaultBodySkeletons(t *testing.T) {
 	wantChore := []string{"Summary", "Done-means"}
 	if got := d.Types["chore"].BodySkeleton; strings.Join(got, ",") != strings.Join(wantChore, ",") {
 		t.Errorf("chore body_skeleton = %v, want %v (unchanged; Acceptance criteria is optional for chore)", got, wantChore)
+	}
+
+	// 'Where to look' is listed in optional_sections on feature and bug (and
+	// nowhere else): a comment-only YAML touch that dropped the list would
+	// fail here (#1615, #1169 done-means discipline).
+	if got := d.Types["feature"].OptionalSections; strings.Join(got, ",") != "Where to look" {
+		t.Errorf("feature optional_sections = %v, want [Where to look]", got)
+	}
+	if got := d.Types["bug"].OptionalSections; strings.Join(got, ",") != "Where to look" {
+		t.Errorf("bug optional_sections = %v, want [Where to look]", got)
+	}
+	if got := d.Types["chore"].OptionalSections; len(got) != 0 {
+		t.Errorf("chore optional_sections = %v, want none", got)
+	}
+}
+
+// TestDefaultWhereToLookHint is the #1615 (E34.8) binding coverage condition:
+// field_hints["Where to look"] must be non-empty, mark the section NON-BINDING,
+// and draw the explicit contrast with the plan's binding scope.files.
+func TestDefaultWhereToLookHint(t *testing.T) {
+	hint := Default().FieldHints["Where to look"]
+	if hint == "" {
+		t.Fatal("field_hints[Where to look] is empty")
+	}
+	if !strings.Contains(strings.ToLower(hint), "non-binding") {
+		t.Errorf("Where to look hint %q does not mark the section non-binding", hint)
+	}
+	if !strings.Contains(hint, "scope.files") {
+		t.Errorf("Where to look hint %q does not contrast with binding scope.files", hint)
 	}
 }
 
@@ -393,6 +422,18 @@ transitions: {run_started: in_progress}
 `,
 			want: "not declared in states",
 		},
+		// #1615: an optional_sections entry that names a heading absent from
+		// the type's body_skeleton is rejected fail-closed.
+		"optional_section absent from body_skeleton": {
+			cfg: `
+spec_version: work-management-v0
+provider: github_projects
+project: {owner: a, number: 1}
+required_fields: [Summary, Done-means, complexity]
+types: {feature: {body_skeleton: [Summary, Proposal], optional_sections: [Where to look]}}
+`,
+			want: `optional_section "Where to look", which is absent`,
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -428,6 +469,33 @@ types: {feature: {body_skeleton: [Summary], default_fields: {complexity: medium}
 	}
 	if c.Types["feature"].DefaultFields.Complexity != "medium" {
 		t.Errorf("feature complexity = %q, want medium", c.Types["feature"].DefaultFields.Complexity)
+	}
+}
+
+// TestParseOptionalSections proves the additive optional_sections key
+// satisfies the schema AND round-trips through the DisallowUnknownFields JSON
+// decode into the typed ItemType.OptionalSections — the schema↔struct seam
+// (schema and struct must land together, or the DisallowUnknownFields decode
+// rejects the new key). A valid entry (on-skeleton) parses; the off-skeleton
+// rejection is covered by TestParseSemanticErrors.
+func TestParseOptionalSections(t *testing.T) {
+	cfg := `
+spec_version: work-management-v0
+provider: github_projects
+project: {owner: a, number: 1}
+required_fields: [Summary, Done-means, complexity]
+types:
+  feature:
+    body_skeleton: [Summary, Where to look, Done-means]
+    optional_sections: [Where to look]
+`
+	c, err := Parse(strings.NewReader(cfg))
+	if err != nil {
+		t.Fatalf("Parse(optional_sections) = %v, want nil", err)
+	}
+	got := c.Types["feature"].OptionalSections
+	if len(got) != 1 || got[0] != "Where to look" {
+		t.Errorf("OptionalSections = %v, want [Where to look]", got)
 	}
 }
 

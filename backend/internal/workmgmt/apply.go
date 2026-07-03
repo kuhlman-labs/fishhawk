@@ -109,7 +109,7 @@ func Apply(req FilingRequest, conv Conventions) (WorkItem, int, error) {
 		if err := validateSections(req.Sections, itemType.BodySkeleton); err != nil {
 			return WorkItem{}, 0, err
 		}
-		body = assembleBody(itemType.BodySkeleton, req.Sections)
+		body = assembleBody(itemType, req.Sections)
 	}
 
 	item := WorkItem{
@@ -285,12 +285,29 @@ func isWellFormedIssueRef(ref string) bool {
 // assembleBody renders a markdown skeleton when the caller supplies no
 // body: one `## Section` heading per body_skeleton entry, followed by the
 // matching Sections content (empty when absent).
-func assembleBody(skeleton []string, sections map[string]string) string {
+//
+// A section named in the type's optional_sections is skipped entirely — no
+// heading, no trailing blank block — when the Sections map has no key for it.
+// Presence with an empty value is NOT absence: a present-but-empty key renders
+// its heading in position exactly like a mandatory section. The blank-line
+// separator keys on whether a section has already been written (not the loop
+// index), so an omitted optional section produces output byte-identical to a
+// skeleton that never listed it — the additive guarantee (#1615).
+func assembleBody(it ItemType, sections map[string]string) string {
+	optional := make(map[string]bool, len(it.OptionalSections))
+	for _, s := range it.OptionalSections {
+		optional[s] = true
+	}
 	var b strings.Builder
-	for i, section := range skeleton {
-		if i > 0 {
+	wrote := false
+	for _, section := range it.BodySkeleton {
+		if _, ok := sections[section]; !ok && optional[section] {
+			continue
+		}
+		if wrote {
 			b.WriteString("\n")
 		}
+		wrote = true
 		b.WriteString("## ")
 		b.WriteString(section)
 		b.WriteString("\n\n")

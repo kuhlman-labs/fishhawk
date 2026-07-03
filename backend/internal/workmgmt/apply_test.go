@@ -529,6 +529,170 @@ func TestApply_FeatureOldKeySetStillValidates(t *testing.T) {
 	}
 }
 
+// TestApply_WhereToLookEndToEndFromDefault is the #1615 (E34.8) binding
+// coverage condition: starting from the PARSED shipped default (the embedded
+// YAML → schema → ItemType struct, via Default()), a supplied "Where to look"
+// renders in position AND an omitted one is byte-identical to the pre-section
+// output — proving the whole YAML→struct→render boundary in one test rather
+// than a hand-built Go struct.
+func TestApply_WhereToLookEndToEndFromDefault(t *testing.T) {
+	conv := testConventions(t) // Default(): parsed from the embedded default YAML.
+
+	// Supplied → the heading renders between Proposal and Done-means.
+	supplied, _, err := Apply(FilingRequest{
+		Type:      "feature",
+		Summary:   "add the thing",
+		TitleVars: map[string]string{"epic": "34", "n": "8"},
+		Sections: map[string]string{
+			"Where to look": "- backend/internal/workmgmt/apply.go: assembleBody",
+		},
+		Relations: Relations{ParentEpic: "#1615"},
+	}, conv)
+	if err != nil {
+		t.Fatalf("Apply(where-to-look supplied) = %v", err)
+	}
+	propIdx := strings.Index(supplied.Body, "## Proposal")
+	wtlIdx := strings.Index(supplied.Body, "## Where to look")
+	doneIdx := strings.Index(supplied.Body, "## Done-means")
+	if propIdx == -1 || wtlIdx == -1 || doneIdx == -1 {
+		t.Fatalf("missing expected headings; body:\n%s", supplied.Body)
+	}
+	if propIdx >= wtlIdx || wtlIdx >= doneIdx {
+		t.Errorf("Where to look not positioned between Proposal and Done-means: prop=%d wtl=%d done=%d\nbody:\n%s", propIdx, wtlIdx, doneIdx, supplied.Body)
+	}
+	if !strings.Contains(supplied.Body, "- backend/internal/workmgmt/apply.go: assembleBody") {
+		t.Errorf("supplied Where to look content missing:\n%s", supplied.Body)
+	}
+
+	// Omitted → byte-identical to the same filing over a skeleton that never
+	// listed the optional section (the additive guarantee). The golden is
+	// derived from the SHIPPED feature skeleton with 'Where to look' removed,
+	// rendered over the same Sections, so any accidental heading or spacing
+	// drift on the omit path fails loudly.
+	sections := map[string]string{
+		"Summary":    "add the thing",
+		"Proposal":   "do it this way",
+		"Done-means": "the thing exists",
+	}
+	omitted, _, err := Apply(FilingRequest{
+		Type:      "feature",
+		Summary:   "add the thing",
+		TitleVars: map[string]string{"epic": "34", "n": "8"},
+		Sections:  sections,
+		Relations: Relations{ParentEpic: "#1615"},
+	}, conv)
+	if err != nil {
+		t.Fatalf("Apply(where-to-look omitted) = %v", err)
+	}
+	if strings.Contains(omitted.Body, "## Where to look") {
+		t.Errorf("omitted optional section leaked its heading:\n%s", omitted.Body)
+	}
+	golden := ItemType{BodySkeleton: withoutSection(conv.Types["feature"].BodySkeleton, "Where to look")}
+	if want := assembleBody(golden, sections); omitted.Body != want {
+		t.Errorf("omitted body not byte-identical to the pre-section skeleton:\n got: %q\nwant: %q", omitted.Body, want)
+	}
+}
+
+// TestApply_WhereToLookBugRendersInPosition mirrors the supplied-render case
+// on the bug skeleton (the binding condition requires BOTH feature and bug).
+func TestApply_WhereToLookBugRendersInPosition(t *testing.T) {
+	conv := testConventions(t)
+	item, _, err := Apply(FilingRequest{
+		Type:      "bug",
+		Summary:   "fix the thing",
+		TitleVars: map[string]string{"epic": "34", "n": "8"},
+		Sections: map[string]string{
+			"Where to look": "- backend/internal/workmgmt/conventions.go: validateOptionalSections",
+		},
+	}, conv)
+	if err != nil {
+		t.Fatalf("Apply(bug where-to-look) = %v", err)
+	}
+	propIdx := strings.Index(item.Body, "## Proposal")
+	wtlIdx := strings.Index(item.Body, "## Where to look")
+	doneIdx := strings.Index(item.Body, "## Done-means")
+	if propIdx == -1 || wtlIdx == -1 || doneIdx == -1 {
+		t.Fatalf("missing expected headings; body:\n%s", item.Body)
+	}
+	if propIdx >= wtlIdx || wtlIdx >= doneIdx {
+		t.Errorf("Where to look not between Proposal and Done-means on bug: prop=%d wtl=%d done=%d\nbody:\n%s", propIdx, wtlIdx, doneIdx, item.Body)
+	}
+}
+
+// TestApply_WhereToLookPresentButEmptyRendersHeading pins the empty-vs-absent
+// distinction: a present-but-empty "Where to look" key is content, so its
+// heading still renders in position (contrast the omitted case above, which
+// skips it entirely).
+func TestApply_WhereToLookPresentButEmptyRendersHeading(t *testing.T) {
+	conv := testConventions(t)
+	item, _, err := Apply(FilingRequest{
+		Type:      "feature",
+		Summary:   "add the thing",
+		TitleVars: map[string]string{"epic": "34", "n": "8"},
+		Sections: map[string]string{
+			"Where to look": "", // present, empty — NOT absent.
+		},
+		Relations: Relations{ParentEpic: "#1615"},
+	}, conv)
+	if err != nil {
+		t.Fatalf("Apply(where-to-look present-but-empty) = %v", err)
+	}
+	propIdx := strings.Index(item.Body, "## Proposal")
+	wtlIdx := strings.Index(item.Body, "## Where to look")
+	doneIdx := strings.Index(item.Body, "## Done-means")
+	if propIdx == -1 || wtlIdx == -1 || doneIdx == -1 {
+		t.Fatalf("present-but-empty Where to look heading missing; body:\n%s", item.Body)
+	}
+	if propIdx >= wtlIdx || wtlIdx >= doneIdx {
+		t.Errorf("present-but-empty Where to look not between Proposal and Done-means: prop=%d wtl=%d done=%d\nbody:\n%s", propIdx, wtlIdx, doneIdx, item.Body)
+	}
+}
+
+// TestAssembleBody_OmittedOptionalIsByteIdenticalToAbsence is the direct
+// unit-level additive guarantee: for the same Sections, assembleBody over a
+// skeleton that lists an omitted optional section produces bytes identical to
+// a skeleton that never listed it — including when the optional section is
+// first (the separator keys on "already wrote", not the loop index).
+func TestAssembleBody_OmittedOptionalIsByteIdenticalToAbsence(t *testing.T) {
+	sections := map[string]string{"Summary": "s", "Proposal": "p", "Done-means": "d"}
+
+	// Optional section in the middle.
+	withMid := assembleBody(ItemType{
+		BodySkeleton:     []string{"Summary", "Proposal", "Where to look", "Done-means"},
+		OptionalSections: []string{"Where to look"},
+	}, sections)
+	wantMid := assembleBody(ItemType{BodySkeleton: []string{"Summary", "Proposal", "Done-means"}}, sections)
+	if withMid != wantMid {
+		t.Errorf("omitted middle optional section not byte-identical:\n got: %q\nwant: %q", withMid, wantMid)
+	}
+	if want := "## Summary\n\ns\n\n## Proposal\n\np\n\n## Done-means\n\nd\n"; withMid != want {
+		t.Errorf("assembled body drifted from literal golden:\n got: %q\nwant: %q", withMid, want)
+	}
+
+	// Optional section FIRST — the index-based separator would have leaked a
+	// leading "\n"; the wrote-based separator must not.
+	withFirst := assembleBody(ItemType{
+		BodySkeleton:     []string{"Where to look", "Summary"},
+		OptionalSections: []string{"Where to look"},
+	}, sections)
+	wantFirst := assembleBody(ItemType{BodySkeleton: []string{"Summary"}}, sections)
+	if withFirst != wantFirst {
+		t.Errorf("omitted leading optional section not byte-identical:\n got: %q\nwant: %q", withFirst, wantFirst)
+	}
+}
+
+// withoutSection returns skeleton with the first exact match of name removed.
+func withoutSection(skeleton []string, name string) []string {
+	out := make([]string, 0, len(skeleton))
+	for _, s := range skeleton {
+		if s == name {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
 func TestMergeLabels_DedupsPreservingOrder(t *testing.T) {
 	got := mergeLabels([]string{"type:bug", "x"}, []string{"x", "y", ""})
 	want := []string{"type:bug", "x", "y"}

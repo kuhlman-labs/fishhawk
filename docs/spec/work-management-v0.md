@@ -29,7 +29,8 @@ This is a **new canonical artifact**, NOT a block inside `.fishhawk/workflows.ya
 | Field | Required | Shape | Meaning |
 |---|---|---|---|
 | `title_format` | no | template string | Title template with `{placeholder}` tokens (`{summary}`, `{epic}`, `{n}`, `{number}`). Rendering is the apply layer's concern. |
-| `body_skeleton` | yes | non-empty string list | Ordered body section headings. Dual-audience: Feature = Summary/Proposal/Done-means/Acceptance criteria/Notes/Relations; Bug = Summary/Observed/Proposal/Done-means/Acceptance criteria/Notes/Relations; ADR = Context/Options/Recommendation/Decision/Consequences; Chore = Summary/Done-means. |
+| `body_skeleton` | yes | non-empty string list | Ordered body section headings. Dual-audience: Feature = Summary/Proposal/Where to look/Done-means/Acceptance criteria/Notes/Relations; Bug = Summary/Observed/Proposal/Where to look/Done-means/Acceptance criteria/Notes/Relations; ADR = Context/Options/Recommendation/Decision/Consequences; Chore = Summary/Done-means. |
+| `optional_sections` | no | unique string list | Subset of `body_skeleton` whose headings render only when the filing supplies content (see [Optional sections](#optional-sections)). Every entry must appear in `body_skeleton` (semantic check). |
 | `default_labels` | no | unique label list | Labels applied before caller-supplied labels are merged. Each label is a bare token (`epic`, `adr`) or namespaced (`area:backend`, `type:feature`). |
 | `default_fields` | no | object | `status` (single-select Status value), `board_column`, and `complexity` (low/medium/high). |
 | `numbering` | conditional | object | `scheme` (`sequential`) + optional `prefix` + optional `pad` (zero-pad width for the rendered `{number}`, bounded 0..12; e.g. `3` → `041`, `0`/absent → no padding). Required when the type is `adr` (semantic check). The shipped default declares a second numbered type, `epic` (prefix `E`, `pad: 0` → the bare `[E29]`, not `[E029]`); its next number is discovered from existing `[E{number}]` titles, and the anchored discovery regexp skips child titles like `[E29.1]` because it demands `] ` immediately after the captured number. |
@@ -65,6 +66,27 @@ The `feature` and `bug` skeletons carry both a **Done-means** and an **Acceptanc
 
 `Acceptance criteria` is present on the `feature` and `bug` skeletons and optional on `chore` (the section is additive, not in `required_fields`, so it carries no retroactive requirement on existing issues filed under the old key set). It is the explicit/source_ref anchor the plan gate's `verification.acceptance_criteria` provenance expects; wiring a planner to read it automatically is out of scope here and tracked in #1543.
 
+## Optional sections
+
+A type's `optional_sections` is a subset of its `body_skeleton` whose headings render **only when the filing supplies content for them** (E34.8, #1615). This is the mechanism that lets a skeleton carry a section that not every filing fills, without polluting every item with an empty heading:
+
+- **Absent** — the Sections map has no key for the section: the heading is skipped entirely (no `## Heading`, no trailing blank block). The assembled body is **byte-identical** to a skeleton that never listed the section, so adding an optional section to a type is a fully additive change.
+- **Present-but-empty** — the Sections map has the key with an empty string value: the heading renders in position exactly as a mandatory section with no content does. A present key is content, even when empty.
+- Sections **not** listed in `optional_sections` render unconditionally, as before.
+
+The cross-reference is a semantic rule (`workmgmt.Parse`): **every `optional_sections` entry must name a section present in that type's `body_skeleton`**. An entry that names an off-skeleton heading is rejected fail-closed with a `*SemanticError` — the render skip would otherwise key on a heading `assembleBody` never emits. The schema declares the property (it is an additive-optional field within v0), but only this check ties an entry back to the skeleton.
+
+### Where to look
+
+The `feature` and `bug` skeletons carry an optional **Where to look** section (E34.8, #1615): non-binding starting pointers for the planner — files, symbols, precedent PRs/issues that ground where the change is likely to land. It sits immediately after `Proposal` (the issue's motivation is that such pointers currently blur into Proposal prose) and before `Done-means`.
+
+**Where to look is explicitly NON-BINDING, and this is the load-bearing distinction from `scope.files`:**
+
+- The **approved plan** owns the binding `scope.files` — the closed set of paths the implement stage may touch, enforced at commit time.
+- A **Where to look** pointer neither folds into that scope nor obligates the plan to touch it. It grounds the planner; it does not constrain the plan. A path named here that the plan never touches is not a scope violation, and a plan may touch files no pointer named.
+
+Give paths and names, never toolchain commands — the register is language-agnostic (a pointer is `dir/file.ext` or a symbol name, not `go test …`). Because it is optional, an item filed with no Where-to-look content renders byte-identically to the pre-section skeleton, so the section carries no retroactive requirement on existing issues.
+
 ## Board states and transitions
 
 The `states` and `transitions` blocks (both optional, additive within v0) drive run-lifecycle board moves (#1012), the companion to the filing conventions above:
@@ -81,7 +103,7 @@ The cross-reference is a semantic rule (`workmgmt.Parse`): **every `transitions`
 `workmgmt.Parse` validates in two stages and returns a typed error:
 
 - `*SchemaError` — a structural violation (unknown key, wrong enum, malformed label, empty `body_skeleton`). Carries a JSON Pointer path.
-- `*SemanticError` — a cross-field rule the schema can't express: the mandatory trio is incomplete, `github_projects` is missing its `project` block, `jira` is missing its `jira` block, a type named `adr` has no `numbering` rule, or a `transitions` value names a canonical state not declared in `states`.
+- `*SemanticError` — a cross-field rule the schema can't express: the mandatory trio is incomplete, `github_projects` is missing its `project` block, `jira` is missing its `jira` block, a type named `adr` has no `numbering` rule, a type's `optional_sections` names a heading absent from its `body_skeleton`, or a `transitions` value names a canonical state not declared in `states`.
 - `*YAMLError` — unparseable, empty, or multi-document input (the config must be a single YAML document; a trailing document would bypass validation).
 
 The shipped default is validated against the schema at backend package init, so the product artifact can never drift from its own schema.
