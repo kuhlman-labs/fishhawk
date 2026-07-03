@@ -101,6 +101,13 @@ type workItemResponse struct {
 	BoardingError string `json:"boarding_error,omitempty"`
 	EpicLinkError string `json:"epic_link_error,omitempty"`
 	Audited       bool   `json:"audited"`
+	// DefaultedLabels / MissingLabelNamespaces are the LOUD label-completeness
+	// report (#1616): every label the system added that the caller did not
+	// supply (namespace defaults + handler-derived area), and any required
+	// namespace still absent after merge/derivation/defaulting. A missing
+	// namespace is reported, never a rejection (fail-open). Both omitempty.
+	DefaultedLabels        []string `json:"defaulted_labels,omitempty"`
+	MissingLabelNamespaces []string `json:"missing_label_namespaces,omitempty"`
 }
 
 // handleFileWorkItem implements POST /v0/work-items.
@@ -311,20 +318,22 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 	audited := s.auditWorkItemFiling(r, activeRun, *item, created, id.Subject)
 
 	s.writeJSON(w, r, http.StatusCreated, workItemResponse{
-		Type:          item.Type,
-		Title:         item.Title,
-		Number:        created.Number,
-		URL:           created.URL,
-		Provider:      created.Provider,
-		AppliedLabels: created.AppliedLabels,
-		Complexity:    item.Classification.Complexity,
-		Status:        created.Status,
-		BoardColumn:   created.BoardColumn,
-		Boarded:       created.Boarded,
-		EpicLinked:    created.EpicLinked,
-		BoardingError: created.BoardingError,
-		EpicLinkError: created.EpicLinkError,
-		Audited:       audited,
+		Type:                   item.Type,
+		Title:                  item.Title,
+		Number:                 created.Number,
+		URL:                    created.URL,
+		Provider:               created.Provider,
+		AppliedLabels:          created.AppliedLabels,
+		Complexity:             item.Classification.Complexity,
+		Status:                 created.Status,
+		BoardColumn:            created.BoardColumn,
+		Boarded:                created.Boarded,
+		EpicLinked:             created.EpicLinked,
+		BoardingError:          created.BoardingError,
+		EpicLinkError:          created.EpicLinkError,
+		Audited:                audited,
+		DefaultedLabels:        item.Classification.DefaultedLabels,
+		MissingLabelNamespaces: item.Classification.MissingLabelNamespaces,
 	})
 }
 
@@ -364,6 +373,14 @@ func (s *Server) applyAndFileWorkItem(ctx context.Context, filing workmgmt.Filin
 	// wrong title or a crash.
 	s.deriveEpicTitleVar(ctx, &filing, conv, target.InstallationID, owner, name)
 
+	// Derive the area:* label from the parent epic when the type wants an area
+	// namespace and none was supplied (#1616), mutating filing.Labels in place
+	// BEFORE Apply so the completeness pass sees area as present. Fails OPEN on
+	// every mode, leaving Apply to report 'area' in missing_label_namespaces.
+	// The returned labels are system-added, so they are appended to the item's
+	// DefaultedLabels after Apply for the single LOUD reporting field.
+	derivedArea := s.deriveAreaLabel(ctx, &filing, conv, target.InstallationID, owner, name)
+
 	// Discover the in-use sequential numbers server-side for a numbered type
 	// that omitted existing_numbers (#1269), so the caller no longer has to
 	// scan the tracker. Runs BEFORE the pure Apply (mirroring deriveEpicTitleVar)
@@ -396,6 +413,24 @@ func (s *Server) applyAndFileWorkItem(ctx context.Context, filing workmgmt.Filin
 			msg:     "could not apply work-management conventions",
 			details: map[string]any{"error": err.Error()},
 		}
+	}
+
+	// The handler-derived area labels are system-added (the caller did not
+	// supply them), so fold them into the ONE reporting field for everything
+	// the caller didn't supply (#1616). Apply already recorded namespace
+	// defaults there; derived area joins them.
+	if len(derivedArea) > 0 {
+		item.Classification.DefaultedLabels = append(item.Classification.DefaultedLabels, derivedArea...)
+	}
+	// Fail-open visibility: a required namespace that could be neither merged,
+	// derived, nor defaulted is WARN-logged (mirroring the #1107
+	// enrichment-incomplete precedent), never a rejection.
+	if len(item.Classification.MissingLabelNamespaces) > 0 {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "work item filed with missing required label namespaces",
+			slog.String("repo", owner+"/"+name),
+			slog.String("type", filing.Type),
+			slog.Any("missing_label_namespaces", item.Classification.MissingLabelNamespaces),
+		)
 	}
 
 	provider, err := workmgmt.Get(conv.Provider)
@@ -574,6 +609,83 @@ func (s *Server) deriveEpicTitleVar(ctx context.Context, filing *workmgmt.Filing
 	filing.TitleVars["epic"] = m[1]
 }
 
+// areaNamespace is the label namespace derived from the parent epic (#1616).
+const areaNamespace = "area"
+
+// deriveAreaLabel copies the parent epic's area:* label(s) onto the filing
+// when the resolved type wants an area namespace (declares 'area' in
+// required_label_namespaces or label_defaults), a parent epic is set, and no
+// area:* label is already present in the caller's labels or the type's
+// default_labels (#1616). It mutates filing.Labels in place (the caller passes
+// a pointer) and returns the labels it derived so the handler can fold them
+// into the item's DefaultedLabels for LOUD reporting.
+//
+// It fails OPEN on every failure mode — no GitHub client, no installation, an
+// unparseable parent ref, a GetIssue error, or a parent epic with no area:*
+// label — by deriving nothing, so Apply's completeness pass reports 'area' in
+// missing_label_namespaces rather than the filing failing. It issues its own
+// GetIssue (a second fetch alongside deriveEpicTitleVar) deliberately, to keep
+// that derivation's fail-closed {epic} contract untouched.
+func (s *Server) deriveAreaLabel(ctx context.Context, filing *workmgmt.FilingRequest, conv workmgmt.Conventions, installID int64, owner, name string) []string {
+	itemType, ok := conv.Types[filing.Type]
+	if !ok || !typeWantsAreaNamespace(itemType) {
+		return nil
+	}
+	if strings.TrimSpace(filing.Relations.ParentEpic) == "" {
+		return nil
+	}
+	if hasAreaLabel(filing.Labels) || hasAreaLabel(itemType.DefaultLabels) {
+		return nil
+	}
+	if s.cfg.GitHub == nil || installID == 0 {
+		return nil
+	}
+	number, err := parseEpicRef(filing.Relations.ParentEpic)
+	if err != nil {
+		return nil
+	}
+	issue, err := s.cfg.GitHub.GetIssue(ctx, installID, githubclient.RepoRef{Owner: owner, Name: name}, number)
+	if err != nil {
+		return nil
+	}
+	var derived []string
+	for _, l := range issue.Labels {
+		if strings.HasPrefix(l, areaNamespace+":") {
+			derived = append(derived, l)
+		}
+	}
+	if len(derived) == 0 {
+		return nil
+	}
+	filing.Labels = append(filing.Labels, derived...)
+	return derived
+}
+
+// typeWantsAreaNamespace reports whether the type declares 'area' in its
+// required_label_namespaces or label_defaults — the trigger for area
+// derivation from the parent epic.
+func typeWantsAreaNamespace(it workmgmt.ItemType) bool {
+	if _, ok := it.LabelDefaults[areaNamespace]; ok {
+		return true
+	}
+	for _, ns := range it.RequiredLabelNamespaces {
+		if ns == areaNamespace {
+			return true
+		}
+	}
+	return false
+}
+
+// hasAreaLabel reports whether any label carries the "area:" namespace prefix.
+func hasAreaLabel(labels []string) bool {
+	for _, l := range labels {
+		if strings.HasPrefix(l, areaNamespace+":") {
+			return true
+		}
+	}
+	return false
+}
+
 // parseEpicRef parses "#123" or "123" into the issue number, mirroring the
 // github provider's parser so a parent_epic relation resolves consistently.
 func parseEpicRef(ref string) (int, error) {
@@ -598,14 +710,16 @@ func (s *Server) auditWorkItemFiling(r *http.Request, activeRun *run.Run, item w
 		return false
 	}
 	payload, _ := json.Marshal(map[string]any{
-		"type":           item.Type,
-		"title":          item.Title,
-		"provider":       created.Provider,
-		"created_url":    created.URL,
-		"created_number": created.Number,
-		"applied_labels": created.AppliedLabels,
-		"board_column":   created.BoardColumn,
-		"status":         created.Status,
+		"type":                     item.Type,
+		"title":                    item.Title,
+		"provider":                 created.Provider,
+		"created_url":              created.URL,
+		"created_number":           created.Number,
+		"applied_labels":           created.AppliedLabels,
+		"board_column":             created.BoardColumn,
+		"status":                   created.Status,
+		"defaulted_labels":         item.Classification.DefaultedLabels,
+		"missing_label_namespaces": item.Classification.MissingLabelNamespaces,
 	})
 	kind := actorKindForSubject(subject)
 	subj := subject

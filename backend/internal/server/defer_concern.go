@@ -86,6 +86,12 @@ type deferFiledIssue struct {
 	URL           string   `json:"url"`
 	Provider      string   `json:"provider"`
 	AppliedLabels []string `json:"applied_labels,omitempty"`
+	// DefaultedLabels / MissingLabelNamespaces mirror the work-item filing's
+	// LOUD label-completeness report (#1616): the auto-draft flows through the
+	// same applyAndFileWorkItem core, so an autonomy default (or a missing
+	// required namespace) on a deferred follow-up is surfaced identically.
+	DefaultedLabels        []string `json:"defaulted_labels,omitempty"`
+	MissingLabelNamespaces []string `json:"missing_label_namespaces,omitempty"`
 }
 
 // deferConcernResponse is the 200 body: the filed follow-up work item
@@ -376,12 +382,14 @@ func (s *Server) handleDeferConcern(w http.ResponseWriter, r *http.Request) {
 			StateReason: updated.StateReason,
 		},
 		Issue: deferFiledIssue{
-			Type:          item.Type,
-			Title:         item.Title,
-			Number:        created.Number,
-			URL:           created.URL,
-			Provider:      created.Provider,
-			AppliedLabels: created.AppliedLabels,
+			Type:                   item.Type,
+			Title:                  item.Title,
+			Number:                 created.Number,
+			URL:                    created.URL,
+			Provider:               created.Provider,
+			AppliedLabels:          created.AppliedLabels,
+			DefaultedLabels:        item.Classification.DefaultedLabels,
+			MissingLabelNamespaces: item.Classification.MissingLabelNamespaces,
 		},
 	})
 }

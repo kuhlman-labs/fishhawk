@@ -242,3 +242,38 @@ func TestFileIssue_ProviderUnimplemented_PropagatesError(t *testing.T) {
 		t.Fatalf("err = %v, want provider_unimplemented", err)
 	}
 }
+
+// TestFileIssue_SurfacesLabelCompleteness proves the tool surfaces the backend's
+// #1616 LOUD report through to the tool output: a work-items response carrying
+// defaulted_labels + missing_label_namespaces reaches FileIssueOutput.Item so
+// the operator sees exactly what filing-time completeness added and what is
+// still missing.
+func TestFileIssue_SurfacesLabelCompleteness(t *testing.T) {
+	fb, srv := newFileIssueFakeBackend(t)
+	fb.resp = &FiledWorkItem{
+		Type:                   "feature",
+		Title:                  "Add the widget endpoint",
+		Number:                 1207,
+		URL:                    "https://example/1207",
+		Provider:               "github_projects",
+		AppliedLabels:          []string{"type:feature", "autonomy:medium"},
+		DefaultedLabels:        []string{"autonomy:medium"},
+		MissingLabelNamespaces: []string{"area"},
+	}
+	r := newResolver(srv, nil)
+
+	_, out, err := r.fileIssue(context.Background(), nil, FileIssueInput{
+		Repo:    "kuhlman-labs/fishhawk",
+		Type:    "feature",
+		Summary: "Add the widget endpoint",
+	})
+	if err != nil {
+		t.Fatalf("fileIssue: %v", err)
+	}
+	if strings.Join(out.Item.DefaultedLabels, ",") != "autonomy:medium" {
+		t.Errorf("DefaultedLabels = %v, want [autonomy:medium]", out.Item.DefaultedLabels)
+	}
+	if strings.Join(out.Item.MissingLabelNamespaces, ",") != "area" {
+		t.Errorf("MissingLabelNamespaces = %v, want [area]", out.Item.MissingLabelNamespaces)
+	}
+}

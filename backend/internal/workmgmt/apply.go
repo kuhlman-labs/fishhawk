@@ -112,13 +112,18 @@ func Apply(req FilingRequest, conv Conventions) (WorkItem, int, error) {
 		body = assembleBody(itemType, req.Sections)
 	}
 
+	labels := mergeLabels(itemType.DefaultLabels, req.Labels)
+	labels, defaulted, missing := applyLabelCompleteness(itemType, labels)
+
 	item := WorkItem{
 		Type:  req.Type,
 		Title: title,
 		Body:  body,
 		Classification: Classification{
-			Labels:     mergeLabels(itemType.DefaultLabels, req.Labels),
-			Complexity: complexity,
+			Labels:                 labels,
+			Complexity:             complexity,
+			DefaultedLabels:        defaulted,
+			MissingLabelNamespaces: missing,
 		},
 		BoardPlacement: BoardPlacement{
 			Status:      firstNonEmpty(req.Status, itemType.DefaultFields.Status),
@@ -356,6 +361,58 @@ func validateSections(sections map[string]string, skeleton []string) error {
 			"expected_sections": skeleton,
 		},
 	}
+}
+
+// applyLabelCompleteness runs the fail-open label-completeness pass over the
+// already-merged label set (#1616). It NEVER returns an error — a filing is
+// never rejected on labels alone.
+//
+//  1. For each label_defaults key (sorted), if the merged set has no label in
+//     that namespace (no label with the "<key>:" prefix), the configured
+//     default label is appended and recorded in defaulted.
+//  2. For each required_label_namespaces entry (sorted), if the
+//     default-augmented set still has no label in that namespace, the
+//     namespace is recorded in missing.
+//
+// The namespace match is prefix-based, not exact-string: a caller-supplied
+// label in the namespace (e.g. autonomy:high) suppresses the default entirely,
+// and existing labels are never rewritten or reordered.
+func applyLabelCompleteness(itemType ItemType, merged []string) (labels, defaulted, missing []string) {
+	labels = merged
+	for _, key := range sortedKeys(itemType.LabelDefaults) {
+		if hasLabelInNamespace(labels, key) {
+			continue
+		}
+		def := itemType.LabelDefaults[key]
+		labels = append(labels, def)
+		defaulted = append(defaulted, def)
+	}
+	for _, ns := range sortedStrings(itemType.RequiredLabelNamespaces) {
+		if !hasLabelInNamespace(labels, ns) {
+			missing = append(missing, ns)
+		}
+	}
+	return labels, defaulted, missing
+}
+
+// hasLabelInNamespace reports whether any label carries the "<ns>:" prefix.
+func hasLabelInNamespace(labels []string, ns string) bool {
+	prefix := ns + ":"
+	for _, l := range labels {
+		if strings.HasPrefix(l, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// sortedStrings returns a sorted copy of in, so a completeness pass over a
+// namespace list produces a stable order without mutating the shared config
+// slice.
+func sortedStrings(in []string) []string {
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
 }
 
 // mergeLabels concatenates default + extra labels, deduplicating while

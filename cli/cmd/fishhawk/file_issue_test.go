@@ -203,3 +203,48 @@ func TestFileIssue_ProviderUnimplemented_Failure(t *testing.T) {
 		t.Errorf("stderr missing provider_unimplemented: %s", stderr.String())
 	}
 }
+
+// TestPrintFiledWorkItem_LabelCompletenessLines pins the CLI text renderer for
+// the #1616 LOUD report: a filed item carrying defaulted_labels +
+// missing_label_namespaces prints the `defaulted:` and `missing ns:` lines next
+// to the existing `labels:` line, so the operator sees what completeness added
+// and what is still missing.
+func TestPrintFiledWorkItem_LabelCompletenessLines(t *testing.T) {
+	var w strings.Builder
+	printFiledWorkItem(&w, &filedWorkItem{
+		Type:                   "feature",
+		Title:                  "[E22.1] x",
+		Number:                 7,
+		URL:                    "https://example/7",
+		Provider:               "github_projects",
+		AppliedLabels:          []string{"type:feature", "autonomy:medium"},
+		DefaultedLabels:        []string{"autonomy:medium"},
+		MissingLabelNamespaces: []string{"area"},
+	})
+	out := w.String()
+	if !strings.Contains(out, "defaulted:  autonomy:medium") {
+		t.Errorf("output missing defaulted line:\n%s", out)
+	}
+	if !strings.Contains(out, "missing ns: area") {
+		t.Errorf("output missing missing-namespace line:\n%s", out)
+	}
+}
+
+// TestPrintFiledWorkItem_OmitsCompletenessLinesWhenEmpty proves the new lines
+// are omitted when nothing was defaulted or missing (a fully-supplied filing),
+// so the common case renders byte-identically to before.
+func TestPrintFiledWorkItem_OmitsCompletenessLinesWhenEmpty(t *testing.T) {
+	var w strings.Builder
+	printFiledWorkItem(&w, &filedWorkItem{
+		Type:          "feature",
+		Title:         "[E22.1] x",
+		Number:        7,
+		URL:           "https://example/7",
+		Provider:      "github_projects",
+		AppliedLabels: []string{"type:feature", "area:backend", "autonomy:high"},
+	})
+	out := w.String()
+	if strings.Contains(out, "defaulted:") || strings.Contains(out, "missing ns:") {
+		t.Errorf("completeness lines rendered despite empty fields:\n%s", out)
+	}
+}

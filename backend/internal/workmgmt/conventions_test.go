@@ -434,6 +434,18 @@ types: {feature: {body_skeleton: [Summary, Proposal], optional_sections: [Where 
 `,
 			want: `optional_section "Where to look", which is absent`,
 		},
+		// #1616: a label_defaults value whose namespace prefix does not match
+		// its key is rejected fail-closed (config fail-closed, verification 5).
+		"label_defaults value missing key namespace prefix": {
+			cfg: `
+spec_version: work-management-v0
+provider: github_projects
+project: {owner: a, number: 1}
+required_fields: [Summary, Done-means, complexity]
+types: {feature: {body_skeleton: [Summary], label_defaults: {autonomy: high}}}
+`,
+			want: `must begin with the namespace prefix "autonomy:"`,
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -496,6 +508,37 @@ types:
 	got := c.Types["feature"].OptionalSections
 	if len(got) != 1 || got[0] != "Where to look" {
 		t.Errorf("OptionalSections = %v, want [Where to look]", got)
+	}
+}
+
+// TestParseLabelCompletenessFields proves the additive label_defaults +
+// required_label_namespaces keys satisfy the schema AND round-trip through the
+// DisallowUnknownFields JSON decode into the typed ItemType — the schema↔struct
+// seam (#1616): the struct fields must land in the same commit as the schema
+// keys, or the DisallowUnknownFields decode rejects them. The prefix-mismatch
+// rejection is covered by TestParseSemanticErrors.
+func TestParseLabelCompletenessFields(t *testing.T) {
+	cfg := `
+spec_version: work-management-v0
+provider: github_projects
+project: {owner: a, number: 1}
+required_fields: [Summary, Done-means, complexity]
+types:
+  feature:
+    body_skeleton: [Summary]
+    label_defaults: {autonomy: autonomy:medium}
+    required_label_namespaces: [area, autonomy]
+`
+	c, err := Parse(strings.NewReader(cfg))
+	if err != nil {
+		t.Fatalf("Parse(label completeness fields) = %v, want nil", err)
+	}
+	ft := c.Types["feature"]
+	if got := ft.LabelDefaults["autonomy"]; got != "autonomy:medium" {
+		t.Errorf("LabelDefaults[autonomy] = %q, want autonomy:medium", got)
+	}
+	if got := strings.Join(ft.RequiredLabelNamespaces, ","); got != "area,autonomy" {
+		t.Errorf("RequiredLabelNamespaces = %q, want area,autonomy", got)
 	}
 }
 

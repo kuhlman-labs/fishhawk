@@ -49,6 +49,12 @@ type filedWorkItem struct {
 	Status        string   `json:"status,omitempty"`
 	BoardColumn   string   `json:"board_column,omitempty"`
 	Audited       bool     `json:"audited"`
+	// DefaultedLabels / MissingLabelNamespaces surface the backend's LOUD
+	// label-completeness report (#1616): system-added labels the caller did
+	// not supply, and any required namespace still absent (reported, never a
+	// rejection).
+	DefaultedLabels        []string `json:"defaulted_labels,omitempty"`
+	MissingLabelNamespaces []string `json:"missing_label_namespaces,omitempty"`
 }
 
 // stringSliceFlag accumulates a repeatable string flag (e.g. --label a
@@ -214,6 +220,12 @@ func printFiledWorkItem(w io.Writer, item *filedWorkItem) {
 	_, _ = fmt.Fprintf(w, "  provider:   %s\n", item.Provider)
 	if len(item.AppliedLabels) > 0 {
 		_, _ = fmt.Fprintf(w, "  labels:     %s\n", strings.Join(item.AppliedLabels, ", "))
+	}
+	if len(item.DefaultedLabels) > 0 {
+		_, _ = fmt.Fprintf(w, "  defaulted:  %s\n", strings.Join(item.DefaultedLabels, ", "))
+	}
+	if len(item.MissingLabelNamespaces) > 0 {
+		_, _ = fmt.Fprintf(w, "  missing ns: %s\n", strings.Join(item.MissingLabelNamespaces, ", "))
 	}
 	if item.Complexity != "" {
 		_, _ = fmt.Fprintf(w, "  complexity: %s\n", item.Complexity)

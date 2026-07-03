@@ -32,6 +32,8 @@ This is a **new canonical artifact**, NOT a block inside `.fishhawk/workflows.ya
 | `body_skeleton` | yes | non-empty string list | Ordered body section headings. Dual-audience: Feature = Summary/Proposal/Where to look/Done-means/Acceptance criteria/Notes/Relations; Bug = Summary/Observed/Proposal/Where to look/Done-means/Acceptance criteria/Notes/Relations; ADR = Context/Options/Recommendation/Decision/Consequences; Chore = Summary/Done-means. |
 | `optional_sections` | no | unique string list | Subset of `body_skeleton` whose headings render only when the filing supplies content (see [Optional sections](#optional-sections)). Every entry must appear in `body_skeleton` (semantic check). |
 | `default_labels` | no | unique label list | Labels applied before caller-supplied labels are merged. Each label is a bare token (`epic`, `adr`) or namespaced (`area:backend`, `type:feature`). |
+| `label_defaults` | no | object: namespace → default label | Per-namespace default labels applied as a fail-open completeness pass (see [Label completeness](#label-completeness)). Each value must begin with `<its key>:` (semantic check). |
+| `required_label_namespaces` | no | unique string list | Label namespaces that a filed item should carry after merge/derivation/defaulting; a still-absent namespace is reported in `missing_label_namespaces`, never rejected (see [Label completeness](#label-completeness)). |
 | `default_fields` | no | object | `status` (single-select Status value), `board_column`, and `complexity` (low/medium/high). |
 | `numbering` | conditional | object | `scheme` (`sequential`) + optional `prefix` + optional `pad` (zero-pad width for the rendered `{number}`, bounded 0..12; e.g. `3` → `041`, `0`/absent → no padding). Required when the type is `adr` (semantic check). The shipped default declares a second numbered type, `epic` (prefix `E`, `pad: 0` → the bare `[E29]`, not `[E029]`); its next number is discovered from existing `[E{number}]` titles, and the anchored discovery regexp skips child titles like `[E29.1]` because it demands `] ` immediately after the captured number. |
 | `epic_link` | no | enum `required` \| `optional` \| `none` | Whether items of this type link to a parent epic. |
@@ -87,6 +89,24 @@ The `feature` and `bug` skeletons carry an optional **Where to look** section (E
 
 Give paths and names, never toolchain commands — the register is language-agnostic (a pointer is `dir/file.ext` or a symbol name, not `go test …`). Because it is optional, an item filed with no Where-to-look content renders byte-identically to the pre-section skeleton, so the section carries no retroactive requirement on existing issues.
 
+## Label completeness
+
+Two per-type fields make label completeness a **conventions-level guarantee at filing time** (E34.9, #1616), so no filed item is ever missing a namespace it must carry:
+
+- **`label_defaults`** maps a label namespace to the full default label to apply when the merged label set carries nothing in that namespace. The shipped default gives `feature`, `bug`, and `chore` `{autonomy: autonomy:medium}`, so no filing of those types is ever left autonomy-unset. `epic` and `adr` carry no autonomy default — they have their own conventions.
+- **`required_label_namespaces`** names the namespaces a filed item *should* carry after merge, derivation, and defaulting. The shipped default declares `[area, autonomy]` on `feature`/`bug`/`chore`.
+
+`workmgmt.Apply` runs a **fail-open completeness pass** over the merged label set (type `default_labels` + caller labels):
+
+1. For each `label_defaults` key (sorted), if no merged label has the `<key>:` prefix, the default value is appended and recorded in the response's `defaulted_labels`. A caller-supplied label already in the namespace (e.g. `autonomy:high`) **suppresses** the default — the match is on the namespace prefix, not exact string, so existing labels are never rewritten or reordered.
+2. For each `required_label_namespaces` entry (sorted), if the now-default-augmented set still has no label in that namespace, the namespace is recorded in the response's `missing_label_namespaces`.
+
+**This pass never rejects a filing.** A required namespace that could be neither merged, derived, nor defaulted is reported loudly in `missing_label_namespaces` (and WARN-logged server-side), never turned into an error.
+
+**`area` derivation.** `area` has no universally-correct default (it is component-specific: `area:backend`, `area:cli`, …), so the shipped config declares NO area default. Instead, when a type requires `area`, a parent epic is set, and no `area:*` label is already present, the filing handler fetches the parent epic and copies its `area:*` label(s) onto the item before Apply runs — reported in `defaulted_labels` like any other system-added label. Derivation **fails open** on every failure mode (no client/installation, unparseable ref, fetch error, epic with no area label), leaving `area` to surface in `missing_label_namespaces`.
+
+The `label_defaults` prefix rule is a semantic check (`workmgmt.Parse`): **every `label_defaults` value must begin with `<its key>:`** (e.g. key `autonomy` → value `autonomy:medium`). A misconfigured default (`autonomy → high`) is rejected fail-closed with a `*SemanticError` naming the type, key, and value.
+
 ## Board states and transitions
 
 The `states` and `transitions` blocks (both optional, additive within v0) drive run-lifecycle board moves (#1012), the companion to the filing conventions above:
@@ -103,7 +123,7 @@ The cross-reference is a semantic rule (`workmgmt.Parse`): **every `transitions`
 `workmgmt.Parse` validates in two stages and returns a typed error:
 
 - `*SchemaError` — a structural violation (unknown key, wrong enum, malformed label, empty `body_skeleton`). Carries a JSON Pointer path.
-- `*SemanticError` — a cross-field rule the schema can't express: the mandatory trio is incomplete, `github_projects` is missing its `project` block, `jira` is missing its `jira` block, a type named `adr` has no `numbering` rule, a type's `optional_sections` names a heading absent from its `body_skeleton`, or a `transitions` value names a canonical state not declared in `states`.
+- `*SemanticError` — a cross-field rule the schema can't express: the mandatory trio is incomplete, `github_projects` is missing its `project` block, `jira` is missing its `jira` block, a type named `adr` has no `numbering` rule, a type's `optional_sections` names a heading absent from its `body_skeleton`, a type's `label_defaults` value does not begin with its key's namespace prefix, or a `transitions` value names a canonical state not declared in `states`.
 - `*YAMLError` — unparseable, empty, or multi-document input (the config must be a single YAML document; a trailing document would bypass validation).
 
 The shipped default is validated against the schema at backend package init, so the product artifact can never drift from its own schema.

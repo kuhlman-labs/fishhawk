@@ -110,11 +110,21 @@ type ItemType struct {
 	// heading entirely; a present key — even empty — renders it in position).
 	// Every entry must appear in BodySkeleton (validateSemantics enforces,
 	// fail-closed). Sections not listed here render unconditionally.
-	OptionalSections []string      `json:"optional_sections,omitempty"`
-	DefaultLabels    []string      `json:"default_labels,omitempty"`
-	DefaultFields    DefaultFields `json:"default_fields,omitempty"`
-	Numbering        *Numbering    `json:"numbering,omitempty"`
-	EpicLink         string        `json:"epic_link,omitempty"`
+	OptionalSections []string `json:"optional_sections,omitempty"`
+	DefaultLabels    []string `json:"default_labels,omitempty"`
+	// LabelDefaults maps a label namespace (e.g. "autonomy") to the full
+	// default label string applied at filing time when the merged label set
+	// carries nothing in that namespace (#1616). validateSemantics enforces
+	// that every value begins with "<key>:", fail-closed.
+	LabelDefaults map[string]string `json:"label_defaults,omitempty"`
+	// RequiredLabelNamespaces names the label namespaces a filed item should
+	// carry after merge, derivation, and defaulting (#1616). A still-absent
+	// namespace is reported loudly in Classification.MissingLabelNamespaces —
+	// never a rejection (fail-open).
+	RequiredLabelNamespaces []string      `json:"required_label_namespaces,omitempty"`
+	DefaultFields           DefaultFields `json:"default_fields,omitempty"`
+	Numbering               *Numbering    `json:"numbering,omitempty"`
+	EpicLink                string        `json:"epic_link,omitempty"`
 }
 
 // DefaultFields holds a type's default board placement and complexity.
@@ -299,6 +309,9 @@ func validateSemantics(c Conventions) error {
 		if err := validateOptionalSections(name, it); err != nil {
 			return err
 		}
+		if err := validateLabelDefaults(name, it); err != nil {
+			return err
+		}
 	}
 
 	// Every lifecycle transition must target a canonical state that the
@@ -336,6 +349,28 @@ func validateOptionalSections(name string, it ItemType) error {
 			return &SemanticError{Msg: fmt.Sprintf(
 				"type %q lists optional_section %q, which is absent from its body_skeleton [%s]",
 				name, opt, strings.Join(it.BodySkeleton, ", "))}
+		}
+	}
+	return nil
+}
+
+// validateLabelDefaults enforces the cross-field rule the JSON Schema can't
+// express: every label_defaults value must begin with its key's namespace
+// prefix "<key>:" (#1616). A key "autonomy" mapped to a bare "high" (missing
+// the "autonomy:" prefix) would apply a namespace-less label the completeness
+// pass could never suppress by a caller's own autonomy label, so it is
+// rejected fail-closed with a *SemanticError naming the type, key, and value.
+// Keys are iterated in sorted order so the first failure is stable across runs.
+func validateLabelDefaults(name string, it ItemType) error {
+	if len(it.LabelDefaults) == 0 {
+		return nil
+	}
+	for _, key := range sortedKeys(it.LabelDefaults) {
+		value := it.LabelDefaults[key]
+		if !strings.HasPrefix(value, key+":") {
+			return &SemanticError{Msg: fmt.Sprintf(
+				"type %q label_defaults[%q] = %q must begin with the namespace prefix %q",
+				name, key, value, key+":")}
 		}
 	}
 	return nil

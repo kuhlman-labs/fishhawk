@@ -102,7 +102,11 @@ Returns the created item: type, title, number, url, provider, the resolved
 applied_labels / complexity / status / board_column, boarded / epic_linked
 (whether the best-effort board placement and epic link landed; false with a
 boarding_error / epic_link_error when they did not — the issue is still
-filed), and audited. Board placement / epic linking are best-effort and no
+filed), and audited. It also reports label completeness (#1616):
+defaulted_labels lists every label the system added that you did not supply
+(namespace defaults like autonomy:medium, plus an area:* label derived from the
+parent epic), and missing_label_namespaces lists any required namespace still
+absent — reported loudly, never a filing rejection. Board placement / epic linking are best-effort and no
 longer fail the filing; work_item_filing_failed (502) is reserved for a
 create-issue or installation-resolution failure (no durable issue exists),
 and the provider cause is surfaced in the tool error. Tool errors:

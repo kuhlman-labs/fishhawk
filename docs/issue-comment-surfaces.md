@@ -926,7 +926,10 @@ Notes:
   `AuditRepo.AppendChained` after `POST /v0/work-items` files a work item, but
   ONLY when the request's `run_id` names a run that is in flight (non-terminal).
   The payload is `{type, title, provider, created_url, created_number,
-  applied_labels, board_column, status}`. The write is best-effort — filing
+  applied_labels, board_column, status, defaulted_labels,
+  missing_label_namespaces}` — the last two carrying the #1616 label-completeness
+  report (system-added labels the caller did not supply, and any required
+  namespace still absent). The write is best-effort — filing
   succeeds with no `run_id` (the operator-agent follow-up filing path), and an
   append failure never fails the response since the item is already filed. No
   sticky status comment is refreshed. Listed here so a future reader grepping

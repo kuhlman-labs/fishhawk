@@ -440,3 +440,38 @@ func containsStr2(xs []string, want string) bool {
 	}
 	return false
 }
+
+// TestDeferConcern_LabelCompleteness pins the defer path's share of the #1616
+// guarantee (verification 8): the auto-drafted follow-up flows through the same
+// applyAndFileWorkItem core, so its applied labels include the autonomy:medium
+// namespace default and the response issue surfaces it in defaulted_labels — no
+// deferred follow-up is ever filed autonomy-unset.
+func TestDeferConcern_LabelCompleteness(t *testing.T) {
+	s, repo, _, cr, fp := deferServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+	seedDeferRun(repo, runID)
+	row := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 100, "needs a backoff")
+
+	// Supply an area label so only the autonomy namespace is left to default.
+	w := postDefer(t, s, row.ID.String(), deferConcernRequest{
+		ParentEpic: "#389",
+		N:          "3",
+		Labels:     []string{"area:runner"},
+	}, withAuth)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp deferConcernResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !containsStr2(fp.captured.Item.Classification.Labels, "autonomy:medium") {
+		t.Errorf("filed item labels %v missing autonomy:medium", fp.captured.Item.Classification.Labels)
+	}
+	if !containsStr2(resp.Issue.DefaultedLabels, "autonomy:medium") {
+		t.Errorf("response issue defaulted_labels = %v, want it to include autonomy:medium", resp.Issue.DefaultedLabels)
+	}
+	if !containsStr2(resp.Issue.AppliedLabels, "autonomy:medium") {
+		t.Errorf("response issue applied_labels = %v, want it to include autonomy:medium", resp.Issue.AppliedLabels)
+	}
+}

@@ -168,6 +168,17 @@
           "items": { "$ref": "#/$defs/label" },
           "description": "Labels applied to every item of this type before caller-supplied labels are merged."
         },
+        "label_defaults": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/label" },
+          "description": "Per-namespace default labels applied at filing time as a fail-open completeness pass (#1616). Each key is a label namespace (e.g. 'autonomy', 'area'); each value is the FULL default label string for that namespace (e.g. 'autonomy:medium'). When the merged label set has no label in a key's namespace (no label with the `<key>:` prefix), the default value is appended and reported in the filing response's defaulted_labels. A caller-supplied label already in the namespace suppresses the default. Semantic check (fail-closed): every value must begin with `<its key>:`. Additive-optional within v0."
+        },
+        "required_label_namespaces": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Label namespaces (e.g. 'area', 'autonomy') that a filed item of this type should carry after merge, derivation, and defaulting (#1616). A namespace still absent after the completeness pass is reported LOUDLY in the filing response's missing_label_namespaces — never a rejection (fail-open). Additive-optional within v0."
+        },
         "default_fields": {
           "type": "object",
           "additionalProperties": false,

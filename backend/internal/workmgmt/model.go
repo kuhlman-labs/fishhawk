@@ -42,6 +42,16 @@ type WorkItem struct {
 type Classification struct {
 	Labels     []string `json:"labels,omitempty"`
 	Complexity string   `json:"complexity,omitempty"`
+	// DefaultedLabels is every label the SYSTEM added that the caller did not
+	// supply (#1616): namespace defaults from the type's label_defaults, plus
+	// handler-derived area labels appended after Apply. Reported loudly so the
+	// operator sees exactly what filing-time completeness added.
+	DefaultedLabels []string `json:"defaulted_labels,omitempty"`
+	// MissingLabelNamespaces is the required namespaces (from the type's
+	// required_label_namespaces) still absent after merge, derivation, and
+	// defaulting (#1616). Reported loudly, NEVER a rejection — a filing is
+	// never failed on labels alone.
+	MissingLabelNamespaces []string `json:"missing_label_namespaces,omitempty"`
 }
 
 // BoardPlacement holds an item's position on the project board. Status

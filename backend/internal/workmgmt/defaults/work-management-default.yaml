@@ -101,6 +101,16 @@ types:
       - Where to look
     default_labels:
       - type:feature
+    # Label completeness (#1616): autonomy defaults to autonomy:medium when the
+    # filing supplies no autonomy:* label, so no feature is ever filed
+    # autonomy-unset. area has no universally-correct default (it is
+    # component-specific), so it is required-or-DERIVED from the parent epic;
+    # an underivable area is reported loudly in missing_label_namespaces.
+    label_defaults:
+      autonomy: autonomy:medium
+    required_label_namespaces:
+      - area
+      - autonomy
     default_fields:
       status: Backlog
       complexity: medium
@@ -121,6 +131,11 @@ types:
       - Where to look
     default_labels:
       - type:bug
+    label_defaults:
+      autonomy: autonomy:medium
+    required_label_namespaces:
+      - area
+      - autonomy
     default_fields:
       status: Backlog
       complexity: medium
@@ -133,6 +148,11 @@ types:
       - Done-means
     default_labels:
       - type:chore
+    label_defaults:
+      autonomy: autonomy:medium
+    required_label_namespaces:
+      - area
+      - autonomy
     default_fields:
       status: Backlog
       complexity: low
