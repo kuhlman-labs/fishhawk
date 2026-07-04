@@ -1482,8 +1482,19 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// created-out-of-scope gate honors approved creates while staying
 	// fail-loud for anything NOT requested. Best-effort (ADR-021): a
 	// refresh failure logs and proceeds with the unamended scope.
+	//
+	// Capture whether the fold added any new scope path (length-delta):
+	// refreshScopeAmendments only GROWS cfg.scopeFiles (appends deduped
+	// approved paths, returns early with no mutation when nothing is added),
+	// so `len(cfg.scopeFiles) > before` is a sound fold signal. amendmentsFolded
+	// broadens the git_diff re-emit gate below (#1660) so a folded-and-committed
+	// path is not left out of the last git_diff when the verify-fix loop does
+	// NOT reinvoke the agent.
+	amendmentsFolded := false
 	if res.OK && stageType == "implement" && !cfg.noPR {
+		before := len(cfg.scopeFiles)
 		res.Events = append(res.Events, refreshScopeAmendments(ctx, client, &cfg, mcpBearerToken, logSink)...)
+		amendmentsFolded = len(cfg.scopeFiles) > before
 	}
 
 	// Committed-tree verify-fix loop (#651). On the implement push path,
@@ -1522,17 +1533,25 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 	}
 
-	// Re-emit a fresh scope-only git_diff event when the verify-fix loop actually
-	// reinvoked the agent (#870). computeAndEmitDiff emitted the FIRST git_diff
-	// before the loop, from the pre-reconcile tree; a reinvoke rewrites in-scope
-	// files, so that diff is stale. Re-emitting the reconciled scope-only diff
-	// here — and ExtractDiff's last-write-wins on the backend — keeps the implement
-	// review and policy re-eval bound to the committed scope-only tree the PR ships.
-	// Gated strictly on reinvoked, so the no-reinvoke path and the maxIterations==0
+	// Re-emit a fresh scope-only git_diff event when the last emitted git_diff is
+	// stale relative to the tree CommitAndPush will commit. computeAndEmitDiff
+	// emitted the FIRST git_diff before both the amendment fold and the verify-fix
+	// loop, from the pre-reconcile tree, so it goes stale on two triggers:
+	//   1. a verify-fix reinvoke (#870) rewrites in-scope files; and
+	//   2. an amendment fold (#1660) — refreshScopeAmendments folds an
+	//      operator-approved mid-stage scope path into cfg.scopeFiles AFTER
+	//      computeAndEmitDiff ran, and CommitAndPush stages that folded scope, so
+	//      the folded-and-committed path is absent from the first git_diff when
+	//      verify passes first-iteration (no reinvoke).
+	// Re-emitting the reconciled scope-only diff here — and ExtractDiff's
+	// last-write-wins on the backend — keeps the implement review, the policy
+	// re-eval, and the deterministic operator_scope_path_undelivered check bound
+	// to the committed scope-only tree the PR ships. Gated on (reinvoked ||
+	// amendmentsFolded), so the no-fold no-reinvoke path and the maxIterations==0
 	// single-shot gate (#802) still emit exactly one git_diff. checkBaseRef must be
 	// set too — it is the same condition that gated computeAndEmitDiff's original
 	// git_diff above, so without it there is no first event to supersede.
-	if res.OK && stageType == "implement" && !cfg.noPR && reinvoked && cfg.checkBaseRef != "" {
+	if res.OK && stageType == "implement" && !cfg.noPR && (reinvoked || amendmentsFolded) && cfg.checkBaseRef != "" {
 		res.Events = append(res.Events, reemitScopedGitDiff(cfg, logSink)...)
 	}
 
@@ -2640,13 +2659,17 @@ func categorizeDrift(ctx context.Context, repoDir string, drift []string, decomp
 }
 
 // reemitScopedGitDiff recomputes the scope-only git_diff from the reconciled
-// committed tree after a verify-fix loop reinvoked the agent (#870), returning a
-// single git_diff event to append AFTER computeAndEmitDiff's original. It mirrors
-// computeAndEmitDiff's diff-producing core but deliberately does NOT re-emit the
-// scope_drift / constraint policy_events: scope is unchanged across the reinvoke,
-// so the original drift list (and the constraint evaluation that already ran)
-// remains authoritative — re-emitting only the git_diff keeps drift and policy
-// accounting untouched while making the reconciled diff last-write-wins.
+// committed tree, returning a single git_diff event to append AFTER
+// computeAndEmitDiff's original. It fires on either of two staleness triggers:
+// a verify-fix loop reinvoke that rewrote in-scope files (#870), or an
+// operator-approved scope amendment folded into cfg.scopeFiles after the first
+// git_diff was emitted (#1660). It mirrors computeAndEmitDiff's diff-producing
+// core but deliberately does NOT re-emit the scope_drift / constraint
+// policy_events: the pre-fold scope_drift snapshot and the constraint evaluation
+// that already ran remain authoritative (the fold's own scope_amendments_folded
+// policy_event is emitted by refreshScopeAmendments) — re-emitting only the
+// git_diff keeps drift and policy accounting untouched while making the
+// reconciled diff last-write-wins.
 //
 // Re-emit is best-effort: on any infra error (stage / name-status / nothing to
 // re-stage) it logs a degradation line and returns nil. The original git_diff
