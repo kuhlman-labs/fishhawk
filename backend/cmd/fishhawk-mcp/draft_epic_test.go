@@ -3,11 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/google/uuid"
 )
 
 // --- fishhawk_draft_epic (E34.4 / #1595) ---
@@ -848,4 +852,77 @@ func TestDraftEpic_AuthHeaderForwardedOnEveryArm(t *testing.T) {
 			}
 		})
 	}
+}
+
+// newSleepingRefineBackend stands up a refinement backend whose every route
+// sleeps `delay` before responding 2xx. The routing test uses it to prove which
+// arms tolerate a slow drafting-agent-shaped response.
+func newSleepingRefineBackend(t *testing.T, delay time.Duration) *httptest.Server {
+	t.Helper()
+	sessionView := []byte(`{"session_id":"` + testSessionID + `","state":"awaiting_approval","revision_count":1,"latest_origin":"brief","latest_draft":` + string(defaultDraftJSON()) + `,"preview":[],"waves":[],"criteria_precheck":{"needs_attention":false,"children":[]},"decisions":[]}`)
+	sleepJSON := func(status int, body []byte) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(delay)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_, _ = w.Write(body)
+		}
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/refinement/sessions", sleepJSON(http.StatusCreated, sessionView))
+	mux.HandleFunc("GET /v0/refinement/sessions/{id}", sleepJSON(http.StatusOK, sessionView))
+	mux.HandleFunc("PATCH /v0/refinement/sessions/{id}/draft", sleepJSON(http.StatusOK, sessionView))
+	mux.HandleFunc("POST /v0/refinement/sessions/{id}/decision", sleepJSON(http.StatusOK, sessionView))
+	mux.HandleFunc("POST /v0/refinement/sessions/{id}/file", sleepJSON(http.StatusOK, []byte(`{"session_id":"`+testSessionID+`","draft_id":"22222222-2222-2222-2222-222222222222","repo":"o/n","epic":{"number":1,"url":"u"},"children":[],"resumed":false,"already_completed":false,"verified":true}`)))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestRefinement_ClientRouting_AgentArmsUseLongClient proves the per-arm client
+// routing: the two agent-backed arms (open, brief_amendment) go through the long
+// client and tolerate a multi-hundred-ms response, while the four fast arms
+// (preview, decide, file, direct draft edit) stay on the short client and time
+// out. Both timeouts are injected small (short=20ms, long=3s) against a server
+// that sleeps 120ms, so the test is fast and deterministic without a real 30s
+// wait.
+func TestRefinement_ClientRouting_AgentArmsUseLongClient(t *testing.T) {
+	srv := newSleepingRefineBackend(t, 120*time.Millisecond)
+	api := newAPIClient(config{backendURL: srv.URL, apiToken: "tok"})
+	// In-package override of the injected timeouts: short aborts before the 120ms
+	// server delay; long tolerates it.
+	api.http.Timeout = 20 * time.Millisecond
+	api.httpLong.Timeout = 3 * time.Second
+
+	sid := uuid.MustParse(testSessionID)
+	ctx := context.Background()
+
+	// --- long-client arms SUCCEED (routed through httpLong) ---
+	if _, err := api.CreateRefinementSession(ctx, "build widgets"); err != nil {
+		t.Errorf("open arm should use the long client and tolerate the delay, got: %v", err)
+	}
+	if _, err := api.EditRefinementDraft(ctx, sid, "add a child", nil); err != nil {
+		t.Errorf("brief_amendment arm should use the long client and tolerate the delay, got: %v", err)
+	}
+
+	// --- short-client arms TIME OUT (routed through the 20ms short client) ---
+	assertTimeout := func(name string, err error) {
+		if err == nil {
+			t.Errorf("%s arm should time out on the short client, got nil error", name)
+			return
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("%s arm error = %v, want a deadline-exceeded timeout", name, err)
+		}
+	}
+	_, err := api.GetRefinementSession(ctx, sid)
+	assertTimeout("preview", err)
+	_, err = api.DecideRefinementSession(ctx, sid, "approved", "ok")
+	assertTimeout("decide", err)
+	_, err = api.FileRefinementSession(ctx, sid, "o/n")
+	assertTimeout("file", err)
+	// The direct `draft` edit is a fast, no-agent arm and MUST stay on the short
+	// client — briefAmendment empty, draft non-nil.
+	_, err = api.EditRefinementDraft(ctx, sid, "", &EpicDraft{})
+	assertTimeout("direct-edit", err)
 }
