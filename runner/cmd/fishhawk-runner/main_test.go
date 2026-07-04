@@ -567,6 +567,8 @@ func TestClassifyErr(t *testing.T) {
 		{fmt.Errorf("wrapped: %w", agent.ErrAgentThinkingBlock), "agent_api_thinking_block"},
 		{agent.ErrLoopDetected, "loop_detected"},
 		{fmt.Errorf("wrapped: %w", agent.ErrLoopDetected), "loop_detected"},
+		{agent.ErrExternalAPI, "external_api"},
+		{fmt.Errorf("wrapped: %w", agent.ErrExternalAPI), "external_api"},
 		{agent.ErrAgentFailed, "agent_failed"},
 		{fmt.Errorf("wrapped: %w", agent.ErrAgentFailed), "agent_failed"},
 		{errors.New("anything else"), "other"},
@@ -617,6 +619,53 @@ func TestLogCompletion_Failure(t *testing.T) {
 			t.Errorf("missing %s in: %s", want, out)
 		}
 	}
+	// A plain agent-timeout failure carries no external-API status, so the
+	// omitempty api_error_status field must be ABSENT.
+	if strings.Contains(out, "api_error_status") {
+		t.Errorf("api_error_status must be absent when APIErrorStatus==0: %s", out)
+	}
+}
+
+// TestLogCompletion_ExternalAPIStatus asserts both branches of the
+// omitempty api_error_status field (#1548): present with the status when
+// Result.APIErrorStatus>0, absent when 0.
+func TestLogCompletion_ExternalAPIStatus(t *testing.T) {
+	t.Run("present when set", func(t *testing.T) {
+		var w strings.Builder
+		logCompletion(&w, agent.Result{
+			OK:              false,
+			FailureCategory: "A",
+			FailureReason:   "terminal external API error 529 (retries exhausted): exit status 1",
+			APIErrorStatus:  529,
+		}, fmt.Errorf("wrapped: %w", agent.ErrExternalAPI))
+		out := w.String()
+		for _, want := range []string{
+			`"outcome":"failed"`,
+			`"category":"A"`,
+			`"err_class":"external_api"`,
+			`"api_error_status":529`,
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("missing %s in: %s", want, out)
+			}
+		}
+	})
+	t.Run("absent when zero", func(t *testing.T) {
+		var w strings.Builder
+		logCompletion(&w, agent.Result{
+			OK:              false,
+			FailureCategory: "A",
+			FailureReason:   "agent exited with error: exit status 1",
+			APIErrorStatus:  0,
+		}, fmt.Errorf("wrapped: %w", agent.ErrAgentFailed))
+		out := w.String()
+		if strings.Contains(out, "api_error_status") {
+			t.Errorf("api_error_status must be omitted when 0: %s", out)
+		}
+		if !strings.Contains(out, `"err_class":"agent_failed"`) {
+			t.Errorf("missing err_class agent_failed: %s", out)
+		}
+	})
 }
 
 func TestRun_PromptInvokesAgentAndEmitsEvents(t *testing.T) {

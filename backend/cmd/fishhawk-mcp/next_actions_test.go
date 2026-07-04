@@ -699,6 +699,70 @@ func TestNextActions_CategoryAFlakeCitation(t *testing.T) {
 	}
 }
 
+// TestNextActions_CategoryAExternalAPICitation pins the #1548 incident
+// hint: a category-A failure whose reason carries the runner's stable
+// "terminal external API error <N>" phrase names the status code and points
+// the operator at status.claude.com to back off; a plain category-A failure
+// keeps the generic retry reason with no status code. This pair locks the
+// runner->next_actions FailureReason string contract across the module
+// boundary (the parse end; the emit end is locked in the runner's
+// claudecode/main tests).
+func TestNextActions_CategoryAExternalAPICitation(t *testing.T) {
+	run := naRun("failed")
+	cited := nextActionsFor(run, []Stage{naStage("plan", "succeeded"),
+		naFailedImplement("A", "terminal external API error 529 (retries exhausted): exit status 1")},
+		nil, nil, nil, nil, false, false, "", "")
+	retry := findAction(t, cited, "fishhawk_retry_stage")
+	if !strings.Contains(retry.Reason, "529") {
+		t.Errorf("retry reason should name the 529 status; got %q", retry.Reason)
+	}
+	if !strings.Contains(retry.Reason, "status.claude.com") {
+		t.Errorf("retry reason should point at status.claude.com; got %q", retry.Reason)
+	}
+
+	// A plain category-A failure keeps the generic reason and names no status.
+	uncited := nextActionsFor(run, []Stage{naStage("plan", "succeeded"),
+		naFailedImplement("A", "agent crashed")}, nil, nil, nil, nil, false, false, "", "")
+	retry = findAction(t, uncited, "fishhawk_retry_stage")
+	if strings.Contains(retry.Reason, "529") || strings.Contains(retry.Reason, "status.claude.com") {
+		t.Errorf("generic category-A retry reason must not cite an external-API incident: %q", retry.Reason)
+	}
+}
+
+// TestCitedExternalAPIStatus pins the best-effort parse helper: the status
+// after the stable phrase is extracted; a nil/absent/malformed reason yields
+// (0, false) so the caller keeps the generic hint.
+func TestCitedExternalAPIStatus(t *testing.T) {
+	mk := func(reason string) *Stage {
+		s := naStage("implement", "failed")
+		if reason != "__nil__" {
+			s.FailureReason = &reason
+		}
+		return &s
+	}
+	cases := []struct {
+		name       string
+		stage      *Stage
+		wantStatus int
+		wantOK     bool
+	}{
+		{"nil stage", nil, 0, false},
+		{"nil reason", mk("__nil__"), 0, false},
+		{"absent phrase", mk("agent exited with error: exit status 1"), 0, false},
+		{"529", mk("terminal external API error 529 (retries exhausted): x"), 529, true},
+		{"503 at end", mk("terminal external API error 503"), 503, true},
+		{"phrase but no digits", mk("terminal external API error : boom"), 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotStatus, gotOK := citedExternalAPIStatus(tc.stage)
+			if gotStatus != tc.wantStatus || gotOK != tc.wantOK {
+				t.Errorf("citedExternalAPIStatus = (%d, %v), want (%d, %v)", gotStatus, gotOK, tc.wantStatus, tc.wantOK)
+			}
+		})
+	}
+}
+
 // TestNextActions_ResumeRunNamesThisRunAsParent pins the #1022
 // structural fix: the category-B recovery action's parent_run_id is
 // THIS run's id (the failed run resume_run takes), so the remediation

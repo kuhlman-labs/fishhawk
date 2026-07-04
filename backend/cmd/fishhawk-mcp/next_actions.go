@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -562,7 +563,13 @@ func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextAction
 		}
 	case "A":
 		reason := "category-A (agent) failure — fishhawk_retry_stage retries it in place; read the trace first for transient harness errors"
-		if flake := citedFlakeEvent(impl); flake != "" {
+		// External-API incident is checked FIRST: a terminal 5xx (e.g. 529
+		// overloaded) is an upstream platform incident, not a task failure,
+		// so the operator should back off and check status.claude.com rather
+		// than immediately burning a retry slot re-hitting the same incident.
+		if status, ok := citedExternalAPIStatus(impl); ok {
+			reason = fmt.Sprintf("category-A failure from a terminal external API error %d (e.g. 529 overloaded) — likely an upstream incident, not a task failure; back off before fishhawk_retry_stage and check status.claude.com", status)
+		} else if flake := citedFlakeEvent(impl); flake != "" {
 			reason = fmt.Sprintf("category-A failure whose detail cites %s — an absorbed infra flake recurred; a retry is the cheapest next step", flake)
 		}
 		return &NextActions{
@@ -1137,6 +1144,45 @@ func acceptancePayloadString(payload any, field string) string {
 	}
 	s, _ := m[field].(string)
 	return s
+}
+
+// externalAPIReasonPhrase is the stable prefix the runner's claudecode
+// adapter embeds in a terminal-external-API-error failure reason
+// ("terminal external API error <N> (retries exhausted): …"). next_actions
+// parses the integer that follows it to name the status code in the retry
+// hint. It is a best-effort string contract — no backend Stage-field
+// plumbing — mirroring the citedFlakeEvent discipline (see flakeTraceEvents).
+const externalAPIReasonPhrase = "terminal external API error "
+
+// citedExternalAPIStatus best-effort parses the status code following the
+// stable externalAPIReasonPhrase in the stage's failure reason, returning
+// (status, true) when a terminal external-API error is cited and (0, false)
+// otherwise. Nil-safe and fail-soft: a nil reason, an absent phrase, or a
+// non-integer following token all yield (0, false), so a plain category-A
+// failure keeps its generic retry hint.
+func citedExternalAPIStatus(s *Stage) (int, bool) {
+	if s == nil || s.FailureReason == nil {
+		return 0, false
+	}
+	idx := strings.Index(*s.FailureReason, externalAPIReasonPhrase)
+	if idx < 0 {
+		return 0, false
+	}
+	rest := (*s.FailureReason)[idx+len(externalAPIReasonPhrase):]
+	// Consume the leading run of digits — the status code — stopping at the
+	// first non-digit (a space before "(retries exhausted)").
+	end := 0
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0, false
+	}
+	status, err := strconv.Atoi(rest[:end])
+	if err != nil {
+		return 0, false
+	}
+	return status, true
 }
 
 // citedFlakeEvent returns the known flake trace-event name the stage's

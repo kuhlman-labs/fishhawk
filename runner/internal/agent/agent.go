@@ -184,6 +184,15 @@ type Result struct {
 	// the run/audit trail. Empty when the agent didn't surface it.
 	Model string
 
+	// APIErrorStatus is the terminal result event's api_error_status when a
+	// 5xx external-API error (e.g. 529 overloaded) killed the invocation with
+	// the agent's in-run retries exhausted; 0 otherwise. It is lifted onto the
+	// Result (paired with agent.ErrExternalAPI) so the runner_completed event
+	// and the operator next_actions hint can name the real upstream cause
+	// instead of flattening it to a generic category-A agent error. Only the
+	// claudecode backend populates this.
+	APIErrorStatus int
+
 	// StructuredOutput is the schema-guaranteed object the agent emitted
 	// when the invocation carried a structured-output schema (#1325): the
 	// raw JSON bytes of the terminal result event's top-level
@@ -255,6 +264,20 @@ var (
 	// NOT retried — re-running the same prompt would just loop again — so
 	// it is returned on the first attempt with no in-driver retry.
 	ErrLoopDetected = errors.New("agent: loop detected")
+
+	// ErrExternalAPI marks a terminal external-API error that killed the
+	// agent invocation with the agent's own in-run retries exhausted — a
+	// 5xx api_error_status (e.g. 529 overloaded / 503 / 502 / 500) from
+	// the model provider during an upstream incident, as during the
+	// 2026-07-02 "Elevated errors on Opus 4.8" event. Like
+	// ErrAgentThinkingBlock and ErrLoopDetected it is a peer sentinel and
+	// does NOT wrap ErrAgentFailed, so err_class classification stays
+	// unambiguous; downstream category-A handling keys off
+	// Result.FailureCategory=="A" (still set on this path). The real
+	// status code is carried on Result.APIErrorStatus and embedded in the
+	// stable failure-reason phrase so the operator surface can name it
+	// without trace archaeology.
+	ErrExternalAPI = errors.New("agent: terminal external API error")
 )
 
 // MakePayload marshals v to a json.RawMessage or panics. Helper for
