@@ -5328,3 +5328,76 @@ func TestBuild_Acceptance_NoCriteriaWarnsLoud(t *testing.T) {
 		})
 	}
 }
+
+// TestBuild_Acceptance_CannotExhibitContract pins the #1612 contract block: the
+// sanctioned per-criterion behavior when the RUNNING target cannot exhibit a
+// criterion. Posture A (result=skipped + expectation_basis, do-not-improvise)
+// and posture B (verify_hint names an in-repository check -> bounded
+// repository-local validation permitted, REQUIRING a notes caveat +
+// evidence_hashes referenced by hash + naming exactly what was validated
+// against what) must both render, framed per criterion — not per run.
+func TestBuild_Acceptance_CannotExhibitContract(t *testing.T) {
+	got, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	for _, want := range []string{
+		// Section + per-criterion (not per-run) framing.
+		"When the target cannot exhibit a criterion",
+		"per criterion, NOT per run",
+		// Posture A: skipped-with-basis, do-not-improvise.
+		"Posture A",
+		"`result`=`skipped`",
+		"`expectation_basis`",
+		"Do NOT improvise",
+		// Posture B: verify_hint gate + bounded repository-local validation + the
+		// three mandatory evidence rules.
+		"Posture B",
+		"`verify_hint` names",
+		"bounded repository-local validation",
+		"state the caveat in the top-level `notes`",
+		"reference confirmable evidence",
+		"content hash in `evidence_hashes`",
+		"name exactly what was validated against what",
+		"`steps_taken`",
+		"`observed`",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("acceptance prompt missing cannot-exhibit contract string %q\n---\n%s", want, got)
+		}
+	}
+}
+
+// TestBuild_Acceptance_OutOfScopeNoCriteriaSanctionedPass pins the #1543/#1612
+// sanctioned 0-criteria case: a plan with NO acceptance_criteria but a populated
+// verification.out_of_scope renders the "Explicitly NOT covered" block AND the
+// trivial / not-applicable-pass instruction (verdict=passed + notes caveat), and
+// does NOT fall through to the loud "WARNING: no acceptance criteria" branch —
+// the branch that pushed the anchor agent into verdict=failed.
+func TestBuild_Acceptance_OutOfScopeNoCriteriaSanctionedPass(t *testing.T) {
+	got, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: &plan.Plan{
+		PlanVersion: "standard_v1",
+		Verification: plan.Verification{
+			OutOfScope: []string{"no runtime-observable behavior in this change"},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	for _, want := range []string{
+		"Explicitly NOT covered",
+		"no runtime-observable behavior in this change",
+		"nothing runtime-observable to validate",
+		"`verdict`=`passed`",
+		"trivial / not-applicable pass",
+		"`notes` caveat",
+		"Do NOT fabricate criteria",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("acceptance prompt (0-criteria + out_of_scope) missing %q\n---\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "WARNING: no acceptance criteria") {
+		t.Errorf("0-criteria + out_of_scope must NOT render the loud warning:\n%s", got)
+	}
+}

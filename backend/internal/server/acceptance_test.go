@@ -935,6 +935,81 @@ func TestClassifyAcceptanceFailure(t *testing.T) {
 	}
 }
 
+// TestAcceptanceBody_ValidateSanctionedContractShapes proves (a *acceptanceBody).
+// validate accepts the three verdict shapes the #1612 acceptance-prompt contract
+// instructs the agent to produce — the Done-means that no wire/validator change
+// is required for the new contract. Each shape corresponds to a sanctioned mode:
+//   - skipped-with-basis (posture A: target could not exhibit the criterion);
+//   - notes-caveat + evidence_hashes (posture B: bounded repository-local
+//     validation, referencing evidence by content hash);
+//   - trivial 0-criteria pass (the sanctioned out_of_scope-only plan), whose
+//     tally is 0/0/0/0 and whose outcome label is "accepted".
+func TestAcceptanceBody_ValidateSanctionedContractShapes(t *testing.T) {
+	t.Run("skipped-with-basis validates", func(t *testing.T) {
+		a := acceptanceBody{
+			Verdict: "passed",
+			Criteria: []acceptanceCriterionResult{
+				{ID: "ac-create", Result: "skipped", ExpectationBasis: "target could not exhibit the change"},
+			},
+		}
+		if err := a.validate(context.Background(), nil); err != nil {
+			t.Fatalf("validate skipped-with-basis: %v", err)
+		}
+		if _, _, skipped, total := acceptanceCriteriaTally(a.Criteria); skipped != 1 || total != 1 {
+			t.Errorf("tally skipped=%d total=%d, want 1/1", skipped, total)
+		}
+	})
+
+	t.Run("notes-caveat + evidence_hashes validates", func(t *testing.T) {
+		a := acceptanceBody{
+			Verdict:        "passed",
+			Notes:          "validated locally against the merge candidate; caveat: running target could not exhibit it",
+			EvidenceHashes: json.RawMessage(`["sha256:ab12","sha256:cd34"]`),
+		}
+		if err := a.validate(context.Background(), nil); err != nil {
+			t.Fatalf("validate notes-caveat + evidence_hashes: %v", err)
+		}
+		if want := []string{"sha256:ab12", "sha256:cd34"}; !reflect.DeepEqual(a.normalizedEvidenceHashes, want) {
+			t.Errorf("normalizedEvidenceHashes = %v, want flat slice %v", a.normalizedEvidenceHashes, want)
+		}
+	})
+
+	t.Run("trivial 0-criteria pass validates", func(t *testing.T) {
+		a := acceptanceBody{Verdict: "passed"}
+		if err := a.validate(context.Background(), nil); err != nil {
+			t.Fatalf("validate trivial 0-criteria pass: %v", err)
+		}
+		passed, failed, skipped, total := acceptanceCriteriaTally(a.Criteria)
+		if passed != 0 || failed != 0 || skipped != 0 || total != 0 {
+			t.Errorf("tally = %d/%d/%d/%d, want 0/0/0/0", passed, failed, skipped, total)
+		}
+		if got := acceptanceOutcomeLabel(a.Verdict); got != "accepted" {
+			t.Errorf("acceptanceOutcomeLabel = %q, want accepted", got)
+		}
+	})
+}
+
+// TestClassifyAcceptanceFailure_FailedZeroCriteria_RetainedBackstop documents
+// that the failed-0-criteria -> class 4 (paged) path is RETAINED as the
+// defensive backstop for a verdict that ignores the #1612 sanctioned trivial-
+// pass contract (a plan with nothing runtime-observable should emit
+// verdict=passed; a verdict=failed with no criteria is unitemized / provenance-
+// ungroundable and still pages the human). The anchor behavior is retired by
+// contract in the prompt, not removed from the classifier.
+func TestClassifyAcceptanceFailure_FailedZeroCriteria_RetainedBackstop(t *testing.T) {
+	acc := acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail"}
+	class, ids, reason := classifyAcceptanceFailure(acc, nil)
+	if class != acceptanceClass4 {
+		t.Errorf("class = %q, want %q (failed-0-criteria retained backstop)", class, acceptanceClass4)
+	}
+	if ids != nil {
+		t.Errorf("criterionIDs = %v, want nil", ids)
+	}
+	if reason == "" {
+		t.Error("reason must not be empty")
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

@@ -1401,7 +1401,31 @@ func buildAcceptance(t Trigger) string {
 		" — the runner falls back to reading that file.\n\n")
 	b.WriteString("The result is shipped via the signed evidence bundle — keep evidence blobs " +
 		"customer-side and reference them by content hash; only the structured verdict + hashes " +
-		"cross to Fishhawk.\n")
+		"cross to Fishhawk.\n\n")
+
+	// The sanctioned behavior when the running target cannot exhibit a criterion
+	// (#1612). Rendered AFTER the closed-field-set region above so its backtick
+	// tokens fall outside that region — the ClosedFieldSet count guard
+	// (TestBuild_Acceptance_ClosedFieldSet_LockstepWithValidator) counts only the
+	// tokens between the "may contain ONLY these fields" anchor and the next
+	// blank line, and this block adds NO new verdict field: it reuses only the
+	// already-enumerated result=skipped / expectation_basis / notes /
+	// evidence_hashes / steps_taken / observed fields.
+	b.WriteString("### When the target cannot exhibit a criterion\n\n")
+	b.WriteString("Decide this per criterion, NOT per run:\n\n")
+	b.WriteString("- Posture A (default): when a criterion requires the RUNNING target and it " +
+		"cannot be exercised — an identity mismatch (the target is not the build under test), " +
+		"the feature is absent, or a precondition is unmeetable — mark that criterion " +
+		"`result`=`skipped` and put the reason in its `expectation_basis`. Do NOT improvise " +
+		"alternative validation to manufacture a pass or a fail; leave the outcome for triage.\n")
+	b.WriteString("- Posture B (bounded, opt-in): ONLY when the criterion's `verify_hint` names " +
+		"an in-repository / repository-local check, bounded repository-local validation of the " +
+		"merge candidate IS sanctioned when the running target cannot exhibit it. If you take " +
+		"that path you MUST (i) state the caveat in the top-level `notes` — what could not be " +
+		"validated against the running target and why; (ii) reference confirmable evidence " +
+		"artifacts by content hash in `evidence_hashes`; and (iii) name exactly what was " +
+		"validated against what in that criterion's `steps_taken` / `observed` / " +
+		"`expectation_basis`.\n")
 
 	return b.String()
 }
@@ -1416,6 +1440,23 @@ func buildAcceptance(t Trigger) string {
 func writeAcceptanceCriteriaForAcceptance(b *strings.Builder, p *plan.Plan) {
 	b.WriteString("### Acceptance criteria\n\n")
 	if p == nil || len(p.Verification.AcceptanceCriteria) == 0 {
+		// Two distinct empty-criteria situations. A plan that declares
+		// verification.out_of_scope but authors NO acceptance_criteria is the
+		// SANCTIONED 0-criteria case (#1543/#1612): nothing is runtime-observable,
+		// so render the out_of_scope block and instruct a trivial / not-applicable
+		// PASS. This retires the loud-warning nudge that pushed the #1543 anchor
+		// agent (run f3b9bd50) into verdict=failed/assertion_fail and paged the
+		// operator. A nil plan, OR empty criteria with NO out_of_scope, remains a
+		// genuine gap the plan_acceptance_precheck should have caught — fail loud.
+		if p != nil && len(p.Verification.OutOfScope) > 0 {
+			writeAcceptanceOutOfScope(b, p.Verification.OutOfScope)
+			b.WriteString("This approved plan declares nothing runtime-observable to validate: " +
+				"verification.out_of_scope is populated and there are no acceptance_criteria. Emit " +
+				"`verdict`=`passed` as a trivial / not-applicable pass, with a `notes` caveat naming " +
+				"that there were no runtime-observable criteria to exercise. Do NOT fabricate " +
+				"criteria and do NOT emit `verdict`=`failed` — there is nothing to fail.\n\n")
+			return
+		}
 		b.WriteString("WARNING: no acceptance criteria are available for this run. The " +
 			"approved plan carries no verification.acceptance_criteria — this should have been " +
 			"caught by the plan acceptance pre-check. Surface this gap rather than fabricating " +
@@ -1443,13 +1484,22 @@ func writeAcceptanceCriteriaForAcceptance(b *strings.Builder, p *plan.Plan) {
 		}
 	}
 	b.WriteString("\n")
-	if len(v.OutOfScope) > 0 {
-		b.WriteString("Explicitly NOT covered (out of scope — do not fail the change for these):\n")
-		for _, o := range v.OutOfScope {
-			fmt.Fprintf(b, "- %s\n", o)
-		}
-		b.WriteString("\n")
+	writeAcceptanceOutOfScope(b, v.OutOfScope)
+}
+
+// writeAcceptanceOutOfScope renders verification.out_of_scope as the explicit
+// not-covered list. Shared by the populated-criteria path and the sanctioned
+// 0-criteria path (a plan with out_of_scope and no acceptance_criteria) so both
+// surface the same "do not fail the change for these" framing.
+func writeAcceptanceOutOfScope(b *strings.Builder, outOfScope []string) {
+	if len(outOfScope) == 0 {
+		return
 	}
+	b.WriteString("Explicitly NOT covered (out of scope — do not fail the change for these):\n")
+	for _, o := range outOfScope {
+		fmt.Fprintf(b, "- %s\n", o)
+	}
+	b.WriteString("\n")
 }
 
 func buildPlan(t Trigger) string {
