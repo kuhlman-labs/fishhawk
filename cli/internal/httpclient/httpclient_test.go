@@ -637,6 +637,78 @@ func TestListScopeAmendments_WaitOmittedWhenNonPositive(t *testing.T) {
 	}
 }
 
+func TestGetRunStageWait_WaitForwardedAndEnvelopeDecoded(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	var gotPath, gotQuery string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/runs/{run_id}/stages/{stage_id}", func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		// The backend embeds the canonical stage shape (which also carries
+		// a top-level `state`) AND the wait envelope's state/terminal plus
+		// failure fields. Serve both to prove the projection reads the
+		// envelope, not the embedded stage.
+		_, _ = io.WriteString(w, `{"id":"`+stageID.String()+`","run_id":"`+runID.String()+`",`+
+			`"type":"implement","failure_category":"category_b","failure_reason":"scope drift",`+
+			`"state":"failed","terminal":true}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "op-tok")
+	got, err := c.GetRunStageWait(context.Background(), runID, stageID, 25)
+	if err != nil {
+		t.Fatalf("GetRunStageWait: %v", err)
+	}
+	if wantPath := "/v0/runs/" + runID.String() + "/stages/" + stageID.String(); gotPath != wantPath {
+		t.Errorf("path = %q, want %q", gotPath, wantPath)
+	}
+	if !strings.Contains(gotQuery, "wait=25") {
+		t.Errorf("query missing wait=25: %q", gotQuery)
+	}
+	if got.ID != stageID || got.RunID != runID {
+		t.Errorf("id/run_id mismatch: %+v", got)
+	}
+	if got.State != "failed" || !got.Terminal {
+		t.Errorf("state/terminal decode mismatch: state=%q terminal=%v", got.State, got.Terminal)
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != "category_b" {
+		t.Errorf("failure_category decode mismatch: %v", got.FailureCategory)
+	}
+	if got.FailureReason == nil || *got.FailureReason != "scope drift" {
+		t.Errorf("failure_reason decode mismatch: %v", got.FailureReason)
+	}
+}
+
+func TestGetRunStageWait_WaitOmittedWhenNonPositive(t *testing.T) {
+	var gotQuery string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/runs/{run_id}/stages/{stage_id}", func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"state":"running","terminal":false}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "")
+	got, err := c.GetRunStageWait(context.Background(), uuid.New(), uuid.New(), 0)
+	if err != nil {
+		t.Fatalf("GetRunStageWait: %v", err)
+	}
+	if strings.Contains(gotQuery, "wait") {
+		t.Errorf("wait should be omitted for <=0: %q", gotQuery)
+	}
+	if got.State != "running" || got.Terminal {
+		t.Errorf("non-terminal decode mismatch: %+v", got)
+	}
+	if got.FailureCategory != nil {
+		t.Errorf("failure_category should be nil, got %v", got.FailureCategory)
+	}
+}
+
 func TestDecideScopeAmendment_RequestBodyShape(t *testing.T) {
 	runID := uuid.New()
 	amendID := uuid.New()

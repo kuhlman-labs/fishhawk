@@ -23,7 +23,7 @@ import (
 // token) live in newClient and are consumed by every subcommand.
 func runRun(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		_, _ = fmt.Fprintln(stderr, `fishhawk run: subcommand required (start|status|list|cancel|open|retry|auto-decide)`)
+		_, _ = fmt.Fprintln(stderr, `fishhawk run: subcommand required (start|status|list|cancel|open|retry|watch|auto-decide)`)
 		return exitUsage
 	}
 	sub, rest := args[0], args[1:]
@@ -40,6 +40,8 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		return runOpen(rest, stdout, stderr)
 	case "retry":
 		return runRetry(rest, stdout, stderr)
+	case "watch":
+		return runWatch(rest, stdout, stderr)
 	case "auto-decide":
 		return runAutoDecide(rest, stdout, stderr)
 	default:
