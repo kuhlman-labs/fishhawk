@@ -8,10 +8,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
 // Per-run working-tree isolation (E22.X / #1137).
@@ -418,6 +421,41 @@ func readLineageRunID(wtDir, root string) string {
 	return strings.TrimSpace(string(data))
 }
 
+// runIDRe matches a canonical-UUID-shaped run id (8-4-4-4-12 hex). It is
+// intentionally shape-only, not a strict RFC-4122 version/variant check:
+// the goal is to reject non-UUID fixture roots (e.g. "rid") before any
+// backend call, and every real fishhawk run id the sidecar records is a
+// canonical UUID.
+var runIDRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// looksLikeRunID reports whether s has the canonical-UUID shape a real run
+// id carries. A non-UUID sidecar value means the worktree is a leftover
+// test fixture, not a real run, so it must be pruned locally rather than
+// sent to the backend (which would 400 on an invalid run id).
+func looksLikeRunID(s string) bool {
+	return runIDRe.MatchString(s)
+}
+
+// pruneStaleWorktree removes a worktree the sweep has proven reclaimable
+// (a non-run fixture root, or a run the backend definitively reports
+// absent) and clears its sidecar + lock so the dir goes quiet. Best-effort:
+// on a `git worktree remove` failure it logs one worktree_sweep_degraded
+// line and leaves the entry; on success it removes the run-id sidecar and
+// the run-<root>.lock and logs exactly one lineage_worktree_pruned line.
+func pruneStaleWorktree(ctx context.Context, repoDir, wtDir, root, path, reason string, logSink io.Writer) {
+	if out, err := exec.CommandContext(ctx, "git", "-C", repoDir,
+		"worktree", "remove", "--force", path).CombinedOutput(); err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"worktree_sweep_degraded","root":%q,"reason":%q,"detail":%q}`+"\n",
+			root, reason, strings.TrimSpace(string(out)))
+		return
+	}
+	_ = os.Remove(lineageRunIDPath(wtDir, root))
+	_ = os.Remove(filepath.Join(wtDir, "run-"+root+".lock"))
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"lineage_worktree_pruned","root":%q,"reason":%q,"path":%q}`+"\n", root, reason, path)
+}
+
 // sweepTerminalWorktrees reclaims any lineage worktree whose root run the
 // backend reports terminal-with-all-children-terminal (lineage_complete),
 // the host-side half of the #1137 teardown contract: fishhawkd is the
@@ -467,8 +505,24 @@ func sweepTerminalWorktrees(ctx context.Context, repoDir string, client lineageS
 			// the worktree rather than guess.
 			continue
 		}
+		if !looksLikeRunID(fullID) {
+			// A non-UUID sidecar (e.g. a "rid" test fixture) can never be a
+			// real run — prune it locally and NEVER query the backend (a
+			// non-UUID run id would 400).
+			pruneStaleWorktree(ctx, repoDir, wtDir, root, p, "non_run_root", logSink)
+			continue
+		}
 		complete, err := client.RunLineageComplete(ctx, fullID)
 		if err != nil {
+			if errors.Is(err, upload.ErrNotFound) {
+				// The backend definitively reports this run absent (deleted or
+				// never created) → the worktree is orphaned. Prune once instead
+				// of re-degrading on every runner start.
+				pruneStaleWorktree(ctx, repoDir, wtDir, root, p, "run_not_found", logSink)
+				continue
+			}
+			// Any other error may be transient — best-effort: log and leave
+			// the worktree.
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"worktree_sweep_degraded","root":%q,"detail":%q}`+"\n", root, err.Error())
 			continue

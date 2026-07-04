@@ -33,6 +33,66 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
+// TestMain isolates the package-main run() tests from the operator's real
+// repo. Many run() invocations omit --working-dir, so cfg.workingDir
+// defaults to "." and the provision/sweep/writeLineageRunID path runs
+// against whatever git repo the test process is CWD'd into. Run unguarded
+// in a worktree of the operator's checkout, that plants run-<id> fixture
+// worktrees + sidecars (run-rid, run-11111111, run-aaaaaaaa …) under the
+// operator's SHARED gitdir, which the next real runner start then re-sweeps
+// and re-degrades over (#1552). TestMain chdirs into a seeded throwaway git
+// repo so those fixtures land in a temp dir that is torn down here instead.
+//
+// If git is unavailable OR any setup step fails, it falls back to running
+// the suite in the original CWD (pre-change behavior) rather than
+// hard-failing the whole binary.
+func TestMain(m *testing.M) {
+	os.Exit(runTestMain(m))
+}
+
+// runTestMain does TestMain's work in a func so its cleanup defer runs
+// before os.Exit (os.Exit skips deferred funcs).
+func runTestMain(m *testing.M) int {
+	if _, err := exec.LookPath("git"); err != nil {
+		return m.Run() // git unavailable — degrade to the original CWD.
+	}
+	dir, err := os.MkdirTemp("", "fishhawk-runner-main-test-*")
+	if err != nil {
+		return m.Run()
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	gitEnv := append(os.Environ(),
+		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e",
+		"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e")
+	runGit := func(args ...string) error {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = gitEnv
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+		return nil
+	}
+	setupErr := runGit("init", "-q")
+	if setupErr == nil {
+		setupErr = os.WriteFile(filepath.Join(dir, "seed.txt"), []byte("seed\n"), 0o644)
+	}
+	if setupErr == nil {
+		setupErr = runGit("add", "-A")
+	}
+	if setupErr == nil {
+		setupErr = runGit("commit", "-q", "-m", "seed")
+	}
+	if setupErr != nil {
+		return m.Run() // setup failed — degrade to the original CWD.
+	}
+	if err := os.Chdir(dir); err != nil {
+		return m.Run() // chdir failed — degrade to the original CWD.
+	}
+	return m.Run()
+}
+
 // openBundleForTest is a thin wrapper around bundle.Open so the
 // table-driven test reads cleanly. We round-trip in tests because
 // the runner is the producer; the canonical verifier path lives in

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
 // initRepo creates a throwaway git repo with one commit so HEAD exists
@@ -386,11 +389,14 @@ func TestSweepTerminalWorktrees_RemovesTerminalKeepsLive(t *testing.T) {
 	ctx := context.Background()
 
 	// Two lineages: "done" (terminal) and "live" (still running).
+	// The sidecar values are canonical-UUID-shaped (hex only) so the sweep's
+	// looksLikeRunID gate passes them through to the backend query; the short
+	// root directory names need not be hex.
 	const (
 		doneRoot = "done0000"
-		doneID   = "done0000-0000-0000-0000-000000000000"
+		doneID   = "d09e0000-0000-0000-0000-000000000000"
 		liveRoot = "live0000"
-		liveID   = "live0000-0000-0000-0000-000000000000"
+		liveID   = "11e70000-0000-0000-0000-000000000000"
 	)
 	donePath, err := provisionLineageWorktree(ctx, repo, doneRoot, io.Discard)
 	if err != nil {
@@ -455,7 +461,7 @@ func TestSweepTerminalWorktrees_BackendErrorIsBestEffort(t *testing.T) {
 	ctx := context.Background()
 	const (
 		root  = "errr0000"
-		runID = "errr0000-0000-0000-0000-000000000000"
+		runID = "e4440000-0000-0000-0000-000000000000"
 	)
 	path, err := provisionLineageWorktree(ctx, repo, root, io.Discard)
 	if err != nil {
@@ -467,6 +473,123 @@ func TestSweepTerminalWorktrees_BackendErrorIsBestEffort(t *testing.T) {
 	sweepTerminalWorktrees(ctx, repo, client, io.Discard)
 	if st, err := os.Stat(path); err != nil || !st.IsDir() {
 		t.Errorf("worktree removed despite backend error: %v", err)
+	}
+}
+
+func TestLooksLikeRunID(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"11111111-2222-3333-4444-555555555555", true},
+		{"abcd1234-5678-90ab-cdef-1234567890ab", true},
+		{"rid", false},
+		{"", false},
+		{"11111111", false},
+		{"11111111-2222-3333-4444-55555555555", false},   // 11 hex in last group
+		{"11111111-2222-3333-4444-5555555555555", false}, // 13 hex in last group
+		{"g1111111-2222-3333-4444-555555555555", false},  // non-hex
+	}
+	for _, c := range cases {
+		if got := looksLikeRunID(c.in); got != c.want {
+			t.Errorf("looksLikeRunID(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// TestSweepTerminalWorktrees_PrunesNonRunRoot asserts a worktree whose
+// sidecar records a NON-UUID value (a leftover test fixture like "rid") is
+// pruned locally, the backend is NEVER queried (so no 400), and exactly one
+// lineage_worktree_pruned line with reason non_run_root is emitted.
+func TestSweepTerminalWorktrees_PrunesNonRunRoot(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	const root = "rid00000"
+	path, err := provisionLineageWorktree(ctx, repo, root, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A non-UUID sidecar value — the runner recorded a fixture "run id".
+	writeLineageRunID(ctx, repo, root, "rid", io.Discard)
+
+	var log bytes.Buffer
+	client := &fakeLineageClient{complete: map[string]bool{}}
+	sweepTerminalWorktrees(ctx, repo, client, &log)
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("non-run worktree not pruned: stat err = %v", err)
+	}
+	wtDir, _ := worktreesDir(ctx, repo)
+	if got := readLineageRunID(wtDir, root); got != "" {
+		t.Errorf("non-run sidecar not removed: %q", got)
+	}
+	if len(client.queried) != 0 {
+		t.Errorf("backend queried for a non-UUID root: %v", client.queried)
+	}
+	if !strings.Contains(log.String(), `"event":"lineage_worktree_pruned"`) ||
+		!strings.Contains(log.String(), `"reason":"non_run_root"`) {
+		t.Errorf("missing lineage_worktree_pruned/non_run_root line:\n%s", log.String())
+	}
+}
+
+// TestSweepTerminalWorktrees_PrunesUnknownRun asserts that when the backend
+// definitively reports the run absent (upload.ErrNotFound / 404), the
+// orphaned worktree is pruned after exactly one query and a single
+// lineage_worktree_pruned line with reason run_not_found is emitted.
+func TestSweepTerminalWorktrees_PrunesUnknownRun(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	const (
+		root  = "gone0000"
+		runID = "9c9e0000-0000-0000-0000-000000000000"
+	)
+	path, err := provisionLineageWorktree(ctx, repo, root, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeLineageRunID(ctx, repo, root, runID, io.Discard)
+
+	var log bytes.Buffer
+	client := &fakeLineageClient{err: upload.ErrNotFound}
+	sweepTerminalWorktrees(ctx, repo, client, &log)
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("unknown-run worktree not pruned: stat err = %v", err)
+	}
+	if len(client.queried) != 1 {
+		t.Errorf("queried = %v, want exactly one query", client.queried)
+	}
+	if got := strings.Count(log.String(), `"event":"lineage_worktree_pruned"`); got != 1 {
+		t.Errorf("lineage_worktree_pruned lines = %d, want 1:\n%s", got, log.String())
+	}
+	if !strings.Contains(log.String(), `"reason":"run_not_found"`) {
+		t.Errorf("missing run_not_found reason:\n%s", log.String())
+	}
+}
+
+// TestSweepTerminalWorktrees_KeepsHealthyRun asserts a worktree whose run
+// exists but is not lineage-complete is KEPT after exactly one query.
+func TestSweepTerminalWorktrees_KeepsHealthyRun(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+	const (
+		root  = "helt0000"
+		runID = "be170000-0000-0000-0000-000000000000"
+	)
+	path, err := provisionLineageWorktree(ctx, repo, root, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeLineageRunID(ctx, repo, root, runID, io.Discard)
+
+	client := &fakeLineageClient{complete: map[string]bool{runID: false}}
+	sweepTerminalWorktrees(ctx, repo, client, io.Discard)
+
+	if st, err := os.Stat(path); err != nil || !st.IsDir() {
+		t.Errorf("healthy (not-complete) worktree was removed: %v", err)
+	}
+	if len(client.queried) != 1 {
+		t.Errorf("queried = %v, want exactly one query", client.queried)
 	}
 }
 
