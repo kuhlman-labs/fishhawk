@@ -1,6 +1,10 @@
 package planreview
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"strconv"
+)
 
 // InferFunc runs one inference roll for a reviewer adapter. It returns the raw
 // model response text (to be decoded into a verdict), the model name, the
@@ -39,6 +43,7 @@ func DecodeVerdictRetrying(ctx context.Context, maxRetries int, infer InferFunc)
 	}
 
 	var lastDecodeErr error
+	var lastResponseText string
 	for attempt := 1; ; attempt++ {
 		responseText, modelName, usage, err := infer(ctx)
 		if err != nil {
@@ -56,8 +61,32 @@ func DecodeVerdictRetrying(ctx context.Context, maxRetries int, infer InferFunc)
 		// Structurally-malformed verdict body. Re-roll for fresh sampling
 		// unless the budget is spent or the ctx is already done.
 		lastDecodeErr = decodeErr
+		lastResponseText = responseText
 		if attempt >= maxAttempts || ctx.Err() != nil {
-			return ReviewVerdict{}, "", Usage{}, lastDecodeErr
+			// Wrap the terminal decode error with a bounded, quoted snippet of
+			// the raw model output so the operator-visible *_review_failed reason
+			// is diagnosable without trace archaeology (#1576). The `%w` verb
+			// keeps the decode cause unwrappable (errors.Is / errors.Unwrap) and
+			// preserves the 'invalid character ...' text as a substring, so
+			// callers that match on the cause are unaffected.
+			return ReviewVerdict{}, "", Usage{}, fmt.Errorf("%w (raw output: %s)", lastDecodeErr, rawSnippet(lastResponseText, 200))
 		}
 	}
+}
+
+// rawSnippet returns a strconv.Quote-quoted, rune-bounded snippet of s for
+// embedding in a diagnostic error. Quoting renders control characters and
+// newlines safely inline; the content is truncated to at most max runes and a
+// trailing "…" marker (inside the quotes) is appended when s was longer, so the
+// resulting reason stays length-bounded regardless of how large the raw model
+// output was.
+func rawSnippet(s string, max int) string {
+	runes := []rune(s)
+	if len(runes) <= max {
+		return strconv.Quote(s)
+	}
+	// strconv.Quote first, then splice the marker inside the closing quote so
+	// the value reads as a truncated quoted string ("...…").
+	quoted := strconv.Quote(string(runes[:max]))
+	return quoted[:len(quoted)-1] + "…\""
 }

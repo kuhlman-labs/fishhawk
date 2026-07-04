@@ -53,6 +53,14 @@ func TestHelperProcess(t *testing.T) {
 		// #901 class strict-then-repair DecodeVerdict cannot rescue. The envelope
 		// itself is valid JSON; only the nested verdict body is malformed.
 		fmt.Println(`{"type":"result","subtype":"success","is_error":false,"result":"{\"verdict\":\"approve\" \"concerns\":[]}"}`)
+	case "prose_prefix":
+		// The #1576 bug end-to-end: a success envelope whose result text is
+		// PROSE followed by the JSON verdict — the E32.9 prose-prefix class that
+		// produced `decode verdict JSON: invalid character 'T'`. The envelope
+		// itself is valid JSON; after the envelope decode responseText carries
+		// the prose prefix, which the shared DecodeVerdict must now extract past
+		// via firstJSONObject.
+		fmt.Println(`{"type":"result","subtype":"success","is_error":false,"result":"The plan looks solid. Here is my verdict:\n{\"verdict\":\"approve\"}"}`)
 	case "invalid_escape_regex":
 		// The #739 bug end-to-end: a success envelope whose result text is a
 		// verdict JSON that quotes a regex containing a lone `\-`. The envelope
@@ -255,6 +263,49 @@ func TestReviewer_InvalidEscapeRegexDecodes(t *testing.T) {
 	}
 	if !strings.Contains(verdict.FreeForm, `ghs_[A-Za-z0-9_.\-]{36,}`) {
 		t.Errorf("FreeForm = %q, want it to contain the regex verbatim", verdict.FreeForm)
+	}
+}
+
+// TestReviewer_ProsePrefixVerdictDecodes drives the #1576 bug through the full
+// envelope-decode -> verdict-decode -> validVerdicts seam: a verdict emitted as
+// prose followed by the JSON object must yield a decoded verdict, not a "decode
+// verdict JSON" error — proving the shared firstJSONObject extraction reaches
+// the claudecode adapter (whose CLI has no response-schema flag).
+func TestReviewer_ProsePrefixVerdictDecodes(t *testing.T) {
+	verdict, _, err := reviewerWithMode("prose_prefix").Review(context.Background(), "review this plan")
+	if err != nil {
+		t.Fatalf("Review: got error for a prose-prefixed verdict, want a decoded verdict: %v", err)
+	}
+	if verdict.Verdict != planreview.VerdictApprove {
+		t.Errorf("verdict = %q, want %q", verdict.Verdict, planreview.VerdictApprove)
+	}
+}
+
+// TestReviewer_PersistentBadJSONCarriesRawSnippet asserts the terminal decode
+// error a persistently-undecodable reviewer surfaces now carries the raw-output
+// snippet (#1576): the operator-visible *_review_failed reason is diagnosable
+// (it names both 'decode verdict JSON' AND the offending raw output) without
+// trace archaeology.
+func TestReviewer_PersistentBadJSONCarriesRawSnippet(t *testing.T) {
+	var attempts int
+	r := NewReviewer(testConfig())
+	r.SetMaxRetries(1)
+	r.client.Cmd = countingHelperCommand("flaky_decode_bad", &attempts)
+
+	_, _, err := r.Review(context.Background(), "review this plan")
+	if err == nil {
+		t.Fatal("expected a terminal decode error from a persistently-malformed reviewer, got nil")
+	}
+	if !strings.Contains(err.Error(), "decode verdict JSON") {
+		t.Errorf("error = %q, want it to name the 'decode verdict JSON' failure", err)
+	}
+	if !strings.Contains(err.Error(), "raw output:") {
+		t.Errorf("error = %q, want it to carry a 'raw output:' snippet of the offending body", err)
+	}
+	// The flaky_decode_bad body is the missing-comma verdict; its distinctive
+	// text must appear in the quoted snippet.
+	if !strings.Contains(err.Error(), "concerns") {
+		t.Errorf("error = %q, want it to quote the offending raw verdict body", err)
 	}
 }
 

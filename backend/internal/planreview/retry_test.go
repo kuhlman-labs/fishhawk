@@ -3,6 +3,7 @@ package planreview
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -66,7 +67,11 @@ func TestDecodeVerdictRetrying_LateRollSucceeds(t *testing.T) {
 }
 
 // TestDecodeVerdictRetrying_Exhausts asserts a persistently-malformed reviewer
-// re-rolls up to maxRetries+1 rolls and returns the last decode error verbatim.
+// re-rolls up to maxRetries+1 rolls and returns a terminal error that (i) still
+// carries the DecodeVerdict cause (both as an unwrappable %w cause and as a
+// substring, preserving the 'invalid character ...' diagnostic) AND (ii) embeds
+// a quoted snippet of the raw model output so the *_review_failed reason is
+// diagnosable (#1576).
 func TestDecodeVerdictRetrying_Exhausts(t *testing.T) {
 	var calls int
 	_, _, _, err := DecodeVerdictRetrying(context.Background(), 2, stubInfer(&calls, badVerdict))
@@ -76,9 +81,47 @@ func TestDecodeVerdictRetrying_Exhausts(t *testing.T) {
 	if calls != 3 {
 		t.Errorf("infer calls = %d, want 3 (maxRetries=2 => 3 rolls)", calls)
 	}
-	// The error must be the raw DecodeVerdict failure, preserving its cause.
-	if _, decodeErr := DecodeVerdict([]byte(badVerdict)); decodeErr == nil || err.Error() != decodeErr.Error() {
-		t.Errorf("err = %v, want the verbatim DecodeVerdict error", err)
+	// The DecodeVerdict cause must remain both unwrappable (%w) and present as a
+	// substring so callers matching on the decode text are unaffected.
+	_, decodeErr := DecodeVerdict([]byte(badVerdict))
+	if decodeErr == nil {
+		t.Fatal("badVerdict must fail DecodeVerdict for this test to be meaningful")
+	}
+	if !errors.Is(err, decodeErr) && !strings.Contains(err.Error(), decodeErr.Error()) {
+		t.Errorf("err = %v, want it to retain the DecodeVerdict cause (%v)", err, decodeErr)
+	}
+	// The terminal error must embed a quoted snippet of the raw output.
+	if !strings.Contains(err.Error(), "raw output:") {
+		t.Errorf("err = %q, want it to carry a 'raw output:' snippet", err)
+	}
+	// The snippet is strconv.Quote-escaped, so match distinctive tokens of the
+	// badVerdict body rather than its raw (unescaped-quote) form.
+	if !strings.Contains(err.Error(), "verdict") || !strings.Contains(err.Error(), "concerns") {
+		t.Errorf("err = %q, want it to quote the offending badVerdict output", err)
+	}
+}
+
+// TestDecodeVerdictRetrying_ExhaustsBoundsSnippet asserts the raw-output snippet
+// wrapped onto the terminal error is length-bounded: a >200-char raw output is
+// truncated to at most 200 runes plus a marker, so the reason never balloons to
+// the full model output.
+func TestDecodeVerdictRetrying_ExhaustsBoundsSnippet(t *testing.T) {
+	// A long body with no '{' at all: firstJSONObject returns nil, the strict
+	// decode fails on the leading 'A', and the loop exhausts — exercising the
+	// snippet-truncation branch on the terminal error.
+	longRaw := strings.Repeat("A", 500)
+	var calls int
+	_, _, _, err := DecodeVerdictRetrying(context.Background(), 0, stubInfer(&calls, longRaw))
+	if err == nil {
+		t.Fatal("expected a terminal decode error from a long undecodable output, got nil")
+	}
+	if !strings.Contains(err.Error(), "…") {
+		t.Errorf("err = %q, want a truncation marker for an over-length snippet", err)
+	}
+	// The snippet caps the content at 200 runes, so the full 500-'A' body must
+	// NOT appear verbatim — proving the reason is bounded, not the whole output.
+	if strings.Contains(err.Error(), strings.Repeat("A", 300)) {
+		t.Errorf("err = %q, want the raw-output snippet bounded well under 300 chars", err)
 	}
 }
 
