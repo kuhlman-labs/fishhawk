@@ -13,6 +13,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 // jsonEqual reports whether two raw JSON blobs are semantically equal,
@@ -291,6 +292,102 @@ func TestPostgres_CampaignItem_RoundTripAndDependsOn(t *testing.T) {
 
 	if _, err := repo.GetCampaignItem(ctx, uuid.New()); !errors.Is(err, campaign.ErrNotFound) {
 		t.Errorf("GetCampaignItem(missing) err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestPostgres_CampaignItem_AutonomyRoundTrip asserts the autonomy tier
+// persists through CreateCampaignItem and reads back off the row (#1551): a
+// "low" item reads back human-led, empty/medium/high do not, and the
+// fail-closed column CHECK rejects a garbage tier.
+func TestPostgres_CampaignItem_AutonomyRoundTrip(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c := makeCampaign(t, repo)
+	for _, tier := range []string{"low", "medium", "high", ""} {
+		item, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+			CampaignID: c.ID,
+			IssueRef:   "issue:" + tier + "-ref",
+			Autonomy:   tier,
+		})
+		if err != nil {
+			t.Fatalf("create item autonomy=%q: %v", tier, err)
+		}
+		got, err := repo.GetCampaignItem(ctx, item.ID)
+		if err != nil {
+			t.Fatalf("get item autonomy=%q: %v", tier, err)
+		}
+		if got.Autonomy != tier {
+			t.Errorf("autonomy round-trip = %q, want %q", got.Autonomy, tier)
+		}
+		// Only the "low" tier is human-led — the shipped-behavior assertion.
+		if want := tier == "low"; campaign.IsHumanLed(got.Autonomy) != want {
+			t.Errorf("IsHumanLed(%q) = %v, want %v", got.Autonomy, campaign.IsHumanLed(got.Autonomy), want)
+		}
+	}
+
+	// The fail-closed CHECK rejects a tier outside {'','low','medium','high'}.
+	if _, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID,
+		IssueRef:   "issue:bogus",
+		Autonomy:   "bogus",
+	}); err == nil {
+		t.Error("create item with autonomy='bogus' succeeded, want CHECK violation")
+	}
+}
+
+// TestPostgres_AssembleThenPersist_SourcesAutonomy is the BINDING seam test
+// (approval condition #2): it starts from an EpicChild carrying an autonomy
+// tier, runs Assemble -> Persist against the real Postgres repo, and reads the
+// row back from campaign_items asserting the autonomy column holds the sourced
+// tier. This exercises the full label->assemble->persist path end-to-end, not
+// merely a CreateCampaignItem round-trip (#1551).
+func TestPostgres_AssembleThenPersist_SourcesAutonomy(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	// EpicChildren the provider would emit: a human-led (low) child and an
+	// agent-drivable (high) sibling that depends on it.
+	res := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 41, Title: "human-led", Autonomy: "low"},
+			{Number: 42, Title: "agent-drivable", Autonomy: "high"},
+		},
+		Edges: []workmgmt.DependsEdge{{From: 42, To: 41}},
+	}
+	assembly, err := campaign.Assemble("issue:40", res)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	c, err := campaign.Persist(ctx, repo, "kuhlman-labs/fishhawk", assembly)
+	if err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+
+	list, err := repo.ListCampaignItemsForCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	gotAutonomy := make(map[string]string, len(list))
+	for _, it := range list {
+		gotAutonomy[it.IssueRef] = it.Autonomy
+	}
+	if gotAutonomy["issue:41"] != "low" {
+		t.Errorf("issue:41 autonomy persisted = %q, want low", gotAutonomy["issue:41"])
+	}
+	if gotAutonomy["issue:42"] != "high" {
+		t.Errorf("issue:42 autonomy persisted = %q, want high", gotAutonomy["issue:42"])
+	}
+	// And the engine reads the persisted rows: the low item is HumanLed (not
+	// Eligible), while the high item is still Blocked on its dependency.
+	elig := campaign.NextEligible(list)
+	if len(elig.HumanLed) != 1 || elig.HumanLed[0] != "issue:41" {
+		t.Errorf("HumanLed = %v, want [issue:41]", elig.HumanLed)
+	}
+	if len(elig.Eligible) != 0 {
+		t.Errorf("Eligible = %v, want [] (issue:41 is human-led, issue:42 blocked)", elig.Eligible)
 	}
 }
 

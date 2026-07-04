@@ -529,7 +529,7 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 	children := make([]workmgmt.EpicChild, 0, len(subs))
 	var edges, dropped []workmgmt.DependsEdge
 	for _, s := range subs {
-		children = append(children, workmgmt.EpicChild{Number: s.Number, Title: s.Title})
+		children = append(children, workmgmt.EpicChild{Number: s.Number, Title: s.Title, Autonomy: autonomyFromLabels(s.Labels)})
 		for _, dep := range parseDependsOnMarker(s.Body) {
 			if isChild[dep] {
 				edges = append(edges, workmgmt.DependsEdge{From: s.Number, To: dep})
@@ -643,6 +643,25 @@ func parseIssueRef(ref string) (int, error) {
 		return 0, fmt.Errorf("issue number must be > 0")
 	}
 	return n, nil
+}
+
+// autonomyLabelPrefix is the label namespace the autonomy tier is sourced from
+// (repo convention: `autonomy:<tier>`, e.g. `autonomy:low`). It is the same
+// namespace workmgmt.conventions treats as a required label.
+const autonomyLabelPrefix = "autonomy:"
+
+// autonomyFromLabels returns the autonomy tier carried by the first
+// `autonomy:<tier>` label in labels (e.g. `autonomy:low` -> "low"), or ""
+// when no autonomy label is present. The campaign source stamps the result
+// onto EpicChild.Autonomy so the engine can route a human-led (low) item away
+// from autonomous dispatch (#1551).
+func autonomyFromLabels(labels []string) string {
+	for _, l := range labels {
+		if strings.HasPrefix(l, autonomyLabelPrefix) {
+			return strings.TrimPrefix(l, autonomyLabelPrefix)
+		}
+	}
+	return ""
 }
 
 // sortedKeys returns the sorted keys of a string-keyed map, for stable

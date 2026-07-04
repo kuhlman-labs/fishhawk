@@ -34,6 +34,23 @@ type Eligibility struct {
 	// for Running. It is never re-dispatched until a resume flips it back to
 	// running.
 	Paused []string
+	// HumanLed items are dependency-satisfied and un-run (they would otherwise
+	// be Eligible) but carry autonomy tier "low" — a human-led change
+	// METHODOLOGY.md reserves for human leadership. They are held OUT of
+	// Eligible so the auto-driver (which dispatches only Eligible) never mints
+	// an agent run for them; the operator is paged via the attend_human_led
+	// next_action instead (#1551). A human-led item whose deps are NOT yet
+	// satisfied stays Blocked exactly as before.
+	HumanLed []string
+}
+
+// IsHumanLed reports whether an autonomy tier denotes a human-led item — the
+// single authoritative place mapping the METHODOLOGY.md "low autonomy
+// (human-led)" tier to the engine's routing decision. A human-led item is
+// never auto-dispatched: NextEligible routes it into Eligibility.HumanLed
+// instead of Eligible, and the auto-driver keys on Eligible (#1551).
+func IsHumanLed(autonomy string) bool {
+	return autonomy == "low"
 }
 
 // NextEligible partitions a campaign's items into eligible / blocked /
@@ -82,12 +99,18 @@ func NextEligible(items []*Item) Eligibility {
 		case it.State == ItemStateRunning || (it.RunID != nil && !it.State.IsTerminal()):
 			e.Running = append(e.Running, ref)
 		default:
-			// Not yet run (RunID nil, state pending/blocked). Eligible only
-			// when every dependency has succeeded.
-			if depsSatisfied(it.DependsOn, done) {
-				e.Eligible = append(e.Eligible, ref)
-			} else {
+			// Not yet run (RunID nil, state pending/blocked). Dispatchable only
+			// when every dependency has succeeded — otherwise Blocked (a
+			// human-led item with unsatisfied deps is Blocked too, unchanged).
+			switch {
+			case !depsSatisfied(it.DependsOn, done):
 				e.Blocked = append(e.Blocked, ref)
+			case IsHumanLed(it.Autonomy):
+				// Dependency-satisfied but human-led: held OUT of Eligible so the
+				// auto-driver never dispatches it; surfaced for a human page.
+				e.HumanLed = append(e.HumanLed, ref)
+			default:
+				e.Eligible = append(e.Eligible, ref)
 			}
 		}
 	}

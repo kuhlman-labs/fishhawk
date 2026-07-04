@@ -55,6 +55,29 @@ func TestAssemble_MultiWaveDAG(t *testing.T) {
 	}
 }
 
+// TestAssemble_SourcesAutonomy asserts each EpicChild's Autonomy tier flows
+// onto the matching AssembledItem, so the sourced tier reaches Persist and the
+// campaign_items.autonomy column (#1551).
+func TestAssemble_SourcesAutonomy(t *testing.T) {
+	res := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 41, Autonomy: "low"},
+			{Number: 42, Autonomy: "high"},
+			{Number: 43}, // no autonomy label -> ""
+		},
+	}
+	a, err := campaign.Assemble("issue:40", res)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	want := map[string]string{"issue:41": "low", "issue:42": "high", "issue:43": ""}
+	for _, it := range a.Items {
+		if it.Autonomy != want[it.IssueRef] {
+			t.Errorf("%s Autonomy = %q, want %q", it.IssueRef, it.Autonomy, want[it.IssueRef])
+		}
+	}
+}
+
 // TestAssemble_CycleRejected asserts a cyclic depends_on graph fails closed
 // with ErrCycle.
 func TestAssemble_CycleRejected(t *testing.T) {

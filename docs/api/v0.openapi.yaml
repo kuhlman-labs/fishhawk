@@ -1189,6 +1189,14 @@ components:
           description: |
             `paused` (E25.7) means the auto-driver handed this item's gate off
             to a human; it carries a `pause_reason` and re-engages on resume.
+        autonomy:
+          type: string
+          enum: [low, medium, high]
+          description: |
+            The item's autonomy tier, sourced from the epic child's
+            `autonomy:<tier>` issue label. `low` is human-led — a human must
+            lead and author it, and the auto-driver never starts a run for it;
+            `medium`/`high` are agent-drivable. Omitted for an unlabelled item.
         pause_reason:
           type: object
           description: |
@@ -1217,7 +1225,7 @@ components:
         (`campaign.NextEligible`). Every slice holds issue refs; an item
         appears in exactly one slice. Each field is always an array (never
         null).
-      required: [eligible, blocked, running, done, failed, cancelled, paused]
+      required: [eligible, blocked, running, done, failed, cancelled, paused, human_led]
       properties:
         eligible:
           type: array
@@ -1244,6 +1252,13 @@ components:
           type: array
           items: { type: string }
           description: Handed off to a human by the auto-driver (E25.7); resumes on `POST /resume`.
+        human_led:
+          type: array
+          items: { type: string }
+          description: |
+            Dependency-satisfied, un-run items whose autonomy tier is `low` —
+            held out of `eligible` so the auto-driver never dispatches them; the
+            operator is paged via the `attend_human_led` next action instead.
 
     CampaignNextAction:
       type: object
@@ -1256,14 +1271,19 @@ components:
       properties:
         action:
           type: string
-          enum: [attention, resume, start_run, wait, complete]
+          enum: [attention, resume, start_run, attend_human_led, wait, complete]
           description: |
             `attention` — a failed item needs operator intervention
             (retry/abandon); takes precedence over everything else.
             `resume` — a paused item was handed off to a human at a run gate
             (E25.7); handle the gate then `POST /resume`. Ranked above
             `start_run` so a hand-off is surfaced before new dispatch.
-            `start_run` — the next eligible item is ready to dispatch.
+            `start_run` — the next eligible item is ready to dispatch. Wins over
+            `attend_human_led` so an autonomous item never stalls behind a
+            human-led one.
+            `attend_human_led` — the sole remaining dispatchable item is
+            `autonomy:low` (human-led); a human must lead and author it and the
+            auto-driver will not start a run for it.
             `wait` — items are running or blocked; nothing to do yet.
             `complete` — every item reached a terminal state.
         issue_ref:
@@ -1271,7 +1291,8 @@ components:
           description: |
             The item the action refers to — the first failed item for
             `attention`, the first paused item for `resume`, the first eligible
-            item for `start_run`. Omitted for `wait` / `complete`.
+            item for `start_run`, the first human-led item for
+            `attend_human_led`. Omitted for `wait` / `complete`.
         detail:
           type: string
           description: Human-readable explanation of the action.

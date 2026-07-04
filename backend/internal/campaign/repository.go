@@ -45,6 +45,11 @@ type CreateCampaignItemParams struct {
 	CampaignID uuid.UUID
 	IssueRef   string
 	DependsOn  []string
+	// Autonomy is the item's autonomy tier sourced from the epic child's
+	// `autonomy:<tier>` label ("low"/"medium"/"high", or "" when unlabelled).
+	// Persisted on campaign_items.autonomy; the column CHECK rejects any other
+	// value (#1551).
+	Autonomy string
 }
 
 // ListCampaignsFilter scopes a ListCampaigns query. Empty strings mean "no

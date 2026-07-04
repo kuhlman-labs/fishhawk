@@ -1128,6 +1128,37 @@ func TestComputeCampaignNextAction_Precedence(t *testing.T) {
 			elig: campaign.Eligibility{Cancelled: []string{"issue:11"}},
 			want: "complete",
 		},
+		{
+			// The new rung (#1551): the SOLE remaining dispatchable work is
+			// human-led -> attend_human_led on the first human-led ref.
+			name:    "human-led only -> attend_human_led",
+			elig:    campaign.Eligibility{HumanLed: []string{"issue:12"}},
+			want:    "attend_human_led",
+			wantRef: "issue:12",
+		},
+		{
+			// PRECEDENCE: start_run wins whenever ANY autonomous item is eligible,
+			// so a human-led item never stalls autonomous DAG-independent work.
+			name:    "eligible and human-led both present -> start_run",
+			elig:    campaign.Eligibility{Eligible: []string{"issue:13"}, HumanLed: []string{"issue:14"}},
+			want:    "start_run",
+			wantRef: "issue:13",
+		},
+		{
+			// attend_human_led outranks wait: a human-led item is surfaced for a
+			// page even while a sibling is still running.
+			name:    "human-led and running both present -> attend_human_led",
+			elig:    campaign.Eligibility{HumanLed: []string{"issue:15"}, Running: []string{"issue:16"}},
+			want:    "attend_human_led",
+			wantRef: "issue:15",
+		},
+		{
+			// FAILED still wins over a human-led item (strict-first check).
+			name:    "failed and human-led both present -> attention",
+			elig:    campaign.Eligibility{Failed: []string{"issue:17"}, HumanLed: []string{"issue:18"}},
+			want:    "attention",
+			wantRef: "issue:17",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1284,6 +1315,95 @@ func TestGetCampaignStatus_RollupAndNextAction(t *testing.T) {
 	// FAILED wins over the eligible item.
 	if status.NextAction.Action != "attention" || status.NextAction.IssueRef != "issue:100" {
 		t.Errorf("next_action = %+v, want attention issue:100", status.NextAction)
+	}
+}
+
+// TestGetCampaignStatus_HumanLedSeam is the cross-boundary handler seam test
+// (#1551): over items carrying autonomy, the status handler drives
+// NextEligible + toCampaignRollupPayload + computeCampaignNextAction in ONE
+// path, so it is where a per-layer unit would miss the seam. It asserts BOTH
+// the human_led rollup slice AND the attend_human_led-vs-start_run precedence
+// together — and the item's autonomy tier crossing the wire.
+func TestGetCampaignStatus_HumanLedSeam(t *testing.T) {
+	// A dependency-satisfied human-led (low) item and a dependency-satisfied
+	// autonomous (high) sibling: both would be Eligible on DAG alone, but the
+	// low one routes to HumanLed. With an autonomous item eligible, start_run
+	// wins (a human-led item must never stall autonomous work).
+	repo := newFakeCampaignRepo()
+	c := repo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: "low"},
+		{IssueRef: "issue:101", State: campaign.ItemStatePending, Autonomy: "high"},
+	})
+	s := New(Config{CampaignRepo: repo})
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+c.ID.String()+"/status", nil)
+	req.SetPathValue("campaign_id", c.ID.String())
+	w := httptest.NewRecorder()
+	s.handleGetCampaignStatus(w, withAuth(req))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	var status struct {
+		Items      []campaignItemResponse    `json:"items"`
+		Rollup     campaignRollupPayload     `json:"rollup"`
+		NextAction campaignNextActionPayload `json:"next_action"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &status); err != nil {
+		t.Fatalf("unmarshal status: %v", err)
+	}
+	if len(status.Rollup.HumanLed) != 1 || status.Rollup.HumanLed[0] != "issue:100" {
+		t.Errorf("rollup.human_led = %v, want [issue:100]", status.Rollup.HumanLed)
+	}
+	if len(status.Rollup.Eligible) != 1 || status.Rollup.Eligible[0] != "issue:101" {
+		t.Errorf("rollup.eligible = %v, want [issue:101]", status.Rollup.Eligible)
+	}
+	// start_run wins: the autonomous sibling is dispatched, the human-led item
+	// does not stall it.
+	if status.NextAction.Action != "start_run" || status.NextAction.IssueRef != "issue:101" {
+		t.Errorf("next_action = %+v, want start_run issue:101", status.NextAction)
+	}
+	// The autonomy tier crosses the wire on the item response.
+	autonomyByRef := map[string]string{}
+	for _, it := range status.Items {
+		autonomyByRef[it.IssueRef] = it.Autonomy
+	}
+	if autonomyByRef["issue:100"] != "low" || autonomyByRef["issue:101"] != "high" {
+		t.Errorf("item autonomy on wire = %v, want issue:100=low issue:101=high", autonomyByRef)
+	}
+}
+
+// TestGetCampaignStatus_SoleHumanLedPages asserts the attend_human_led rung
+// fires when the SOLE remaining dispatchable work is human-led (#1551): a
+// human-led item alongside a running sibling yields attend_human_led (not
+// start_run, since nothing autonomous is eligible).
+func TestGetCampaignStatus_SoleHumanLedPages(t *testing.T) {
+	run := uuid.New()
+	repo := newFakeCampaignRepo()
+	c := repo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		{IssueRef: "issue:100", State: campaign.ItemStateRunning, RunID: &run},
+		{IssueRef: "issue:101", State: campaign.ItemStatePending, Autonomy: "low"},
+	})
+	s := New(Config{CampaignRepo: repo})
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+c.ID.String()+"/status", nil)
+	req.SetPathValue("campaign_id", c.ID.String())
+	w := httptest.NewRecorder()
+	s.handleGetCampaignStatus(w, withAuth(req))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	var status struct {
+		Rollup     campaignRollupPayload     `json:"rollup"`
+		NextAction campaignNextActionPayload `json:"next_action"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &status); err != nil {
+		t.Fatalf("unmarshal status: %v", err)
+	}
+	if len(status.Rollup.HumanLed) != 1 || status.Rollup.HumanLed[0] != "issue:101" {
+		t.Errorf("rollup.human_led = %v, want [issue:101]", status.Rollup.HumanLed)
+	}
+	if status.NextAction.Action != "attend_human_led" || status.NextAction.IssueRef != "issue:101" {
+		t.Errorf("next_action = %+v, want attend_human_led issue:101", status.NextAction)
 	}
 }
 

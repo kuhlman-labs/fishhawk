@@ -69,6 +69,11 @@ type campaignItemResponse struct {
 	DependsOn []string   `json:"depends_on"`
 	RunID     *uuid.UUID `json:"run_id,omitempty"`
 	State     string     `json:"state"`
+	// Autonomy is the item's autonomy tier sourced from the epic child's
+	// `autonomy:<tier>` label ("low"/"medium"/"high"). Omitted (omitempty) for
+	// an unlabelled item; a "low" item is human-led and never auto-dispatched
+	// (#1551).
+	Autonomy string `json:"autonomy,omitempty"`
 	// PauseReason records why a paused item was handed off to a human (the
 	// page event + run/stage/gate). Omitted (omitempty) unless the item is —
 	// or was — paused; mirrors the domain *PauseReason.
@@ -92,6 +97,11 @@ type campaignRollupPayload struct {
 	// Paused holds items the auto-driver handed off to a human (E25.7). Like
 	// the other slices it is always an array (never null).
 	Paused []string `json:"paused"`
+	// HumanLed holds dependency-satisfied, un-run items whose autonomy tier is
+	// "low" — held out of Eligible so the auto-driver never dispatches them; the
+	// operator is paged via attend_human_led instead (#1551). Always an array
+	// (never null).
+	HumanLed []string `json:"human_led"`
 }
 
 // campaignNextActionPayload tells the operator-agent what to do next with
@@ -150,6 +160,7 @@ func toCampaignItemResponse(it *campaign.Item) campaignItemResponse {
 		DependsOn:   deps,
 		RunID:       it.RunID,
 		State:       string(it.State),
+		Autonomy:    it.Autonomy,
 		PauseReason: it.PauseReason,
 		CreatedAt:   it.CreatedAt,
 		UpdatedAt:   it.UpdatedAt,
@@ -174,6 +185,7 @@ func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 		Failed:    nz(e.Failed),
 		Cancelled: nz(e.Cancelled),
 		Paused:    nz(e.Paused),
+		HumanLed:  nz(e.HumanLed),
 	}
 }
 
@@ -190,9 +202,16 @@ func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 //     auto-driver handed a gate off to a human (E25.7); the campaign is
 //     stalled until the gate is handled and the operator resumes it. Ranked
 //     above start_run so a paused hand-off is surfaced before new dispatch.
-//  3. else any eligible item -> "start_run" on the first eligible ref.
-//  4. else any running or blocked item -> "wait".
-//  5. else (every item terminal done/cancelled) -> "complete".
+//  3. else any eligible item -> "start_run" on the first eligible ref. This
+//     wins over attend_human_led so start_run is recommended whenever ANY
+//     autonomously-drivable item is eligible — a human-led item never stalls
+//     autonomous DAG-independent work.
+//  4. else any human-led item -> "attend_human_led" on the first human-led ref.
+//     Reached only when the sole remaining dispatchable work is autonomy:low: a
+//     human must lead/author it, so the operator is paged rather than the
+//     auto-driver minting an agent run (#1551).
+//  5. else any running or blocked item -> "wait".
+//  6. else (every item terminal done/cancelled) -> "complete".
 func computeCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload {
 	switch {
 	case len(e.Failed) > 0:
@@ -212,6 +231,12 @@ func computeCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload
 			Action:   "start_run",
 			IssueRef: e.Eligible[0],
 			Detail:   "this item's dependencies are satisfied and it has no run yet",
+		}
+	case len(e.HumanLed) > 0:
+		return campaignNextActionPayload{
+			Action:   "attend_human_led",
+			IssueRef: e.HumanLed[0],
+			Detail:   "this item is autonomy:low (human-led); a human must lead and author it — the auto-driver will not start a run for it",
 		}
 	case len(e.Running) > 0 || len(e.Blocked) > 0:
 		return campaignNextActionPayload{

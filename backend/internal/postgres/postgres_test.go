@@ -391,6 +391,35 @@ func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
 		}
 	}
 
+	// 0049 (#1551) added the campaign_items.autonomy TEXT NOT NULL DEFAULT ''
+	// column with a fail-closed CHECK (autonomy IN '','low','medium','high').
+	// Confirm the column exists, a real tier round-trips, and the CHECK rejects
+	// a garbage tier.
+	var autonomyCol int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'campaign_items' AND column_name = 'autonomy'`,
+	).Scan(&autonomyCol); err != nil {
+		t.Fatalf("query campaign_items.autonomy column: %v", err)
+	}
+	if autonomyCol != 1 {
+		t.Errorf("campaign_items.autonomy count after MigrateUp = %d, want 1", autonomyCol)
+	}
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO campaign_items (id, campaign_id, issue_ref, state, autonomy)
+		 VALUES ($1, $2, 'issue:autonomy', 'pending', 'low')`,
+		uuid.New(), campaignID,
+	); err != nil {
+		t.Errorf("insert campaign_item with autonomy='low' after MigrateUp failed: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO campaign_items (id, campaign_id, issue_ref, state, autonomy)
+		 VALUES ($1, $2, 'issue:autonomy', 'pending', 'bogus')`,
+		uuid.New(), campaignID,
+	); err == nil {
+		t.Error("insert campaign_item with autonomy='bogus' succeeded, want CHECK violation")
+	}
+
 	// Second application is a no-op.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Errorf("second MigrateUp returned %v, want nil (idempotent)", err)
@@ -487,6 +516,20 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if operatorAgentCol != 1 {
 		t.Errorf("campaigns.operator_agent count after MigrateDown = %d, want 1 (0041 still applied; only 0045 rolled back)", operatorAgentCol)
 	}
+	// 0049 (#1551) added campaign_items.autonomy and is now the LATEST
+	// migration, so the one-step MigrateDown rolls IT back — the column must be
+	// GONE (the binding TestMigrateDown flip for this migration). Every prior
+	// campaign column asserted above still survives.
+	var autonomyCol int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'campaign_items' AND column_name = 'autonomy'`,
+	).Scan(&autonomyCol); err != nil {
+		t.Fatalf("query campaign_items.autonomy column: %v", err)
+	}
+	if autonomyCol != 0 {
+		t.Errorf("campaign_items.autonomy count after MigrateDown = %d, want 0 (0049 is the latest; its down drops the column)", autonomyCol)
+	}
 	// 0040's two added columns SURVIVE the one-step down (only 0042 rolled
 	// back).
 	var pausePolicyCol, pauseReasonCol int
@@ -568,17 +611,17 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if refinementDraftsOriginCol != 1 {
 		t.Errorf("refinement_drafts.origin count after MigrateDown = %d, want 1 (0047 still applied; only 0048 rolled back)", refinementDraftsOriginCol)
 	}
-	// 0048 (#1594) IS the migration just rolled back, so its two ledger tables —
-	// refinement_filing_sessions and refinement_filed_items — must both be GONE
-	// after the one-step down.
+	// 0048 (#1594) is now a PRIOR migration (0049 is the latest, and only 0049
+	// rolled back), so its two ledger tables — refinement_filing_sessions and
+	// refinement_filed_items — must both STILL exist after the one-step down.
 	var refinementFilingSessionsTable int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'refinement_filing_sessions'`,
 	).Scan(&refinementFilingSessionsTable); err != nil {
 		t.Fatalf("query refinement_filing_sessions table: %v", err)
 	}
-	if refinementFilingSessionsTable != 0 {
-		t.Errorf("'refinement_filing_sessions' table count after MigrateDown = %d, want 0 (0048 should have rolled it back)", refinementFilingSessionsTable)
+	if refinementFilingSessionsTable != 1 {
+		t.Errorf("'refinement_filing_sessions' table count after MigrateDown = %d, want 1 (0048 still applied; only 0049 rolled back)", refinementFilingSessionsTable)
 	}
 	var refinementFiledItemsTable int
 	if err := pool.QueryRow(context.Background(),
@@ -586,8 +629,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&refinementFiledItemsTable); err != nil {
 		t.Fatalf("query refinement_filed_items table: %v", err)
 	}
-	if refinementFiledItemsTable != 0 {
-		t.Errorf("'refinement_filed_items' table count after MigrateDown = %d, want 0 (0048 should have rolled it back)", refinementFiledItemsTable)
+	if refinementFiledItemsTable != 1 {
+		t.Errorf("'refinement_filed_items' table count after MigrateDown = %d, want 1 (0048 still applied; only 0049 rolled back)", refinementFiledItemsTable)
 	}
 	// 0044 (#1519) is now a PRIOR migration (only 0045 rolled back), so its
 	// widening — the 'acceptance' stage type — must STILL be present in
@@ -995,14 +1038,18 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	}
 	pool.Close()
 
-	// Step down past 0048 (drop the refinement filing ledger — inert re:
-	// campaigns) then 0047 (drop refinement_decisions + refinement_drafts.origin —
-	// inert re: campaigns) then 0046 (drop refinement_drafts — inert re:
+	// Step down past 0049 (drop campaign_items.autonomy — inert re: the paused
+	// rows) then 0048 (drop the refinement filing ledger — inert re: campaigns)
+	// then 0047 (drop refinement_decisions + refinement_drafts.origin — inert re:
+	// campaigns) then 0046 (drop refinement_drafts — inert re:
 	// campaigns) then 0045 (narrow artifacts_kind_check — inert re: campaigns)
 	// then 0044 (narrow stages_type_check — inert re: campaigns) then 0043 (drop
 	// upstream_run_id — inert) then 0042 (drop idempotency_key — inert) then 0041
 	// (drop operator_agent — inert), all leaving the paused rows untouched, to
 	// reach 0040, the normalizing rollback under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0049) failed: %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0048) failed: %v", err)
 	}

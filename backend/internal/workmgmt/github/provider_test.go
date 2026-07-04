@@ -404,6 +404,59 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 	}
 }
 
+// TestProvider_EpicChildren_DerivesAutonomy asserts each child's Autonomy is
+// sourced from its `autonomy:<tier>` label: a child carrying autonomy:low maps
+// to "low", one with no autonomy label maps to "" (#1551).
+func TestProvider_EpicChildren_DerivesAutonomy(t *testing.T) {
+	api := &fakeAPI{
+		parentNode: "EPIC_NODE",
+		listSubResults: []githubclient.SubIssue{
+			{Number: 41, NodeID: "N41", Title: "human-led", Body: "no deps", Labels: []string{"type:feature", "autonomy:low"}},
+			{Number: 42, NodeID: "N42", Title: "agent-drivable", Body: "no deps", Labels: []string{"autonomy:high"}},
+			{Number: 43, NodeID: "N43", Title: "unlabelled", Body: "no deps", Labels: nil},
+		},
+	}
+	res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+		Target: workmgmt.Target{InstallationID: 99, Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Epic:   "#1005",
+	})
+	if err != nil {
+		t.Fatalf("EpicChildren: %v", err)
+	}
+	want := map[int]string{41: "low", 42: "high", 43: ""}
+	if len(res.Children) != len(want) {
+		t.Fatalf("children = %+v, want %d", res.Children, len(want))
+	}
+	for _, c := range res.Children {
+		if c.Autonomy != want[c.Number] {
+			t.Errorf("child #%d Autonomy = %q, want %q", c.Number, c.Autonomy, want[c.Number])
+		}
+	}
+}
+
+// TestAutonomyFromLabels covers the helper directly: the first autonomy:<tier>
+// label wins, a non-autonomy label is ignored, and no autonomy label yields "".
+func TestAutonomyFromLabels(t *testing.T) {
+	cases := []struct {
+		name   string
+		labels []string
+		want   string
+	}{
+		{"low", []string{"area:server", "autonomy:low"}, "low"},
+		{"medium", []string{"autonomy:medium"}, "medium"},
+		{"high", []string{"autonomy:high", "type:feature"}, "high"},
+		{"absent", []string{"area:server", "type:feature"}, ""},
+		{"nil", nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := autonomyFromLabels(tc.labels); got != tc.want {
+				t.Errorf("autonomyFromLabels(%v) = %q, want %q", tc.labels, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestProvider_EpicChildren_FailClosed covers the defensive branches: a nil
 // API, a missing repo, a zero installation, a malformed epic ref, and a
 // ListSubIssues error each return an error rather than a partial result.

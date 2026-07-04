@@ -41,6 +41,53 @@ func TestNextEligible_PartiallyComplete(t *testing.T) {
 	}
 }
 
+// TestNextEligible_MixedAutonomy is the done-means-named engine test (#1551):
+// over a mixed-autonomy DAG, an eligible autonomy:low (human-led) item is
+// routed into HumanLed (never Eligible) while a medium/high sibling with the
+// same satisfied deps lands in Eligible, and a human-led item whose dependency
+// is NOT yet satisfied stays Blocked exactly as before.
+func TestNextEligible_MixedAutonomy(t *testing.T) {
+	// issue:1 succeeded (dep target). issue:2 (low) and issue:3 (medium) both
+	// depend only on issue:1 → deps satisfied. issue:4 (low) depends on the
+	// still-running issue:5 → deps unsatisfied.
+	run := uuid.New()
+	lowEligible := &campaign.Item{IssueRef: "issue:2", State: campaign.ItemStatePending, DependsOn: []string{"issue:1"}, Autonomy: "low"}
+	medEligible := &campaign.Item{IssueRef: "issue:3", State: campaign.ItemStatePending, DependsOn: []string{"issue:1"}, Autonomy: "medium"}
+	lowBlocked := &campaign.Item{IssueRef: "issue:4", State: campaign.ItemStatePending, DependsOn: []string{"issue:5"}, Autonomy: "low"}
+	items := []*campaign.Item{
+		item("issue:1", campaign.ItemStateSucceeded, nil),
+		lowEligible,
+		medEligible,
+		lowBlocked,
+		item("issue:5", campaign.ItemStateRunning, &run),
+	}
+
+	got := campaign.NextEligible(items)
+	if !reflect.DeepEqual(got.HumanLed, []string{"issue:2"}) {
+		t.Errorf("HumanLed = %v, want [issue:2] (eligible autonomy:low routes here, not Eligible)", got.HumanLed)
+	}
+	if !reflect.DeepEqual(got.Eligible, []string{"issue:3"}) {
+		t.Errorf("Eligible = %v, want [issue:3] (the medium sibling stays Eligible)", got.Eligible)
+	}
+	// The human-led item with an unsatisfied dep is Blocked, not HumanLed.
+	if !reflect.DeepEqual(got.Blocked, []string{"issue:4"}) {
+		t.Errorf("Blocked = %v, want [issue:4] (human-led with unsatisfied dep stays Blocked)", got.Blocked)
+	}
+	if contains(got.HumanLed, "issue:4") {
+		t.Errorf("HumanLed = %v, must not contain issue:4 (its dep is unsatisfied)", got.HumanLed)
+	}
+}
+
+// contains reports whether s is in xs.
+func contains(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
 // TestNextEligible_AbsentDepBlocks covers the defensive branch: a dependency
 // ref that is not present in the campaign is treated as not-satisfied, so the
 // item stays blocked rather than being dispatched against an unresolved edge.

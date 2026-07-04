@@ -26,6 +26,29 @@ func TestState_IsTerminal(t *testing.T) {
 	}
 }
 
+// TestIsHumanLed table-tests the autonomy-tier classifier that routes an
+// eligible item away from autonomous dispatch (#1551): only "low" (the
+// METHODOLOGY.md human-led tier) is human-led; medium/high/absent are not.
+func TestIsHumanLed(t *testing.T) {
+	cases := []struct {
+		autonomy string
+		want     bool
+	}{
+		{"low", true},
+		{"medium", false},
+		{"high", false},
+		{"", false},
+		{"bogus", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.autonomy, func(t *testing.T) {
+			if got := IsHumanLed(tc.autonomy); got != tc.want {
+				t.Errorf("IsHumanLed(%q) = %v, want %v", tc.autonomy, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestItemState_IsTerminal table-tests the item terminal classifier:
 // succeeded/failed/cancelled are terminal; pending/blocked/running are not.
 func TestItemState_IsTerminal(t *testing.T) {
