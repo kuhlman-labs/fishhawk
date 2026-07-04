@@ -489,6 +489,44 @@ func TestTick_StartPath(t *testing.T) {
 	}
 }
 
+// TestTick_StartPath_SkipsHumanLed asserts the #1551 contract at the driver
+// seam: the START pass keys on campaign.NextEligible's Eligible slice, so a
+// dependency-satisfied human-led (autonomy:low) item is NOT started (it lands
+// in HumanLed, not Eligible) while an autonomous (autonomy:medium) sibling IS
+// started in the same tick. The driver needs no code change — moving human-led
+// items out of Eligible auto-skips them — and this test locks that behavior.
+func TestTick_StartPath_SkipsHumanLed(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	humanLed := store.seedItem(c, "issue:41", campaign.ItemStatePending, nil, nil)
+	humanLed.Autonomy = "low"
+	autonomous := store.seedItem(c, "issue:42", campaign.ItemStatePending, nil, nil)
+	autonomous.Autonomy = "medium"
+	reader := newFakeRunReader()
+	starter := &fakeStarter{reader: reader}
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, starter, au, 4)
+
+	tk.Tick(context.Background())
+
+	if len(starter.calls) != 1 || starter.calls[0] != autonomous.ID {
+		t.Fatalf("expected exactly the autonomous item %s started, got %v", autonomous.ID, starter.calls)
+	}
+	if humanLed.RunID != nil {
+		t.Errorf("human-led item was started (RunID=%v), want it left un-started", humanLed.RunID)
+	}
+	if humanLed.State != campaign.ItemStatePending {
+		t.Errorf("human-led item state = %s, want pending (never dispatched)", humanLed.State)
+	}
+	if autonomous.State != campaign.ItemStateRunning {
+		t.Errorf("autonomous item state = %s, want running", autonomous.State)
+	}
+	started := au.byCategory(categoryCampaignIssueStarted)
+	if len(started) != 1 || started[0].payload["issue_ref"] != "issue:42" {
+		t.Fatalf("started audit = %+v, want exactly issue:42", started)
+	}
+}
+
 // --- (e) ADVANCE PATH (settle + campaign advance) ---------------------------
 
 func TestTick_AdvancePath_SettlesAndAdvancesCampaign(t *testing.T) {

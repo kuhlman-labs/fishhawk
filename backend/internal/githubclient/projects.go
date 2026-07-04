@@ -538,12 +538,15 @@ func (c *Client) AddSubIssue(ctx context.Context, installationID int64, parentNo
 
 // SubIssue is the slice of a sub-issue connection node the work-management
 // epic-children query consumes: the child issue's human Number, GraphQL
-// NodeID, Title, and Body (the depends_on body marker is parsed from Body).
+// NodeID, Title, Body (the depends_on body marker is parsed from Body), and
+// Labels (the child's issue-label names, from which the campaign source
+// derives the autonomy tier — #1551).
 type SubIssue struct {
 	Number int
 	NodeID string
 	Title  string
 	Body   string
+	Labels []string
 }
 
 // listSubIssuesFirst is the sub-issues connection page size. v0 reads a
@@ -579,6 +582,7 @@ func (c *Client) ListSubIssues(ctx context.Context, installationID int64, parent
           title
           body
           id
+          labels(first: 20) { nodes { name } }
         }
       }
     }
@@ -592,6 +596,11 @@ func (c *Client) ListSubIssues(ctx context.Context, installationID int64, parent
 					Title  string `json:"title"`
 					Body   string `json:"body"`
 					ID     string `json:"id"`
+					Labels struct {
+						Nodes []struct {
+							Name string `json:"name"`
+						} `json:"nodes"`
+					} `json:"labels"`
 				} `json:"nodes"`
 			} `json:"subIssues"`
 		} `json:"node"`
@@ -607,7 +616,11 @@ func (c *Client) ListSubIssues(ctx context.Context, installationID int64, parent
 	}
 	results := make([]SubIssue, 0, len(data.Node.SubIssues.Nodes))
 	for _, n := range data.Node.SubIssues.Nodes {
-		results = append(results, SubIssue{Number: n.Number, NodeID: n.ID, Title: n.Title, Body: n.Body})
+		var labels []string
+		for _, l := range n.Labels.Nodes {
+			labels = append(labels, l.Name)
+		}
+		results = append(results, SubIssue{Number: n.Number, NodeID: n.ID, Title: n.Title, Body: n.Body, Labels: labels})
 	}
 	return results, nil
 }

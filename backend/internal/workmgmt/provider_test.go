@@ -30,8 +30,11 @@ func (f *fakeProvider) Transition(_ context.Context, req TransitionRequest) (*Tr
 func (f *fakeProvider) EpicChildren(_ context.Context, req EpicChildrenRequest) (*EpicChildrenResult, error) {
 	f.gotEpic = req
 	return &EpicChildrenResult{
-		Children: []EpicChild{{Number: 41, Title: "slice A"}, {Number: 42, Title: "slice B"}},
-		Edges:    []DependsEdge{{From: 42, To: 41}},
+		Children: []EpicChild{
+			{Number: 41, Title: "slice A", Autonomy: "low"},
+			{Number: 42, Title: "slice B", Autonomy: "high"},
+		},
+		Edges: []DependsEdge{{From: 42, To: 41}},
 	}, nil
 }
 
@@ -154,6 +157,11 @@ func TestRegistry_DispatchEpicChildren(t *testing.T) {
 	}
 	if len(res.Edges) != 1 || res.Edges[0] != (DependsEdge{From: 42, To: 41}) {
 		t.Errorf("edges = %+v", res.Edges)
+	}
+	// The resolved autonomy tier travels on each EpicChild (#1551), so a
+	// consumer (campaign assembly) can source it without re-querying labels.
+	if res.Children[0].Autonomy != "low" || res.Children[1].Autonomy != "high" {
+		t.Errorf("children autonomy = [%q %q], want [low high]", res.Children[0].Autonomy, res.Children[1].Autonomy)
 	}
 	if fp.gotEpic.Epic != "#1440" {
 		t.Errorf("provider did not receive epic-children request: %+v", fp.gotEpic)

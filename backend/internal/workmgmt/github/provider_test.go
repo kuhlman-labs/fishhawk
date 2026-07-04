@@ -353,8 +353,8 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 		parentNode: "EPIC_NODE",
 		listSubResults: []githubclient.SubIssue{
 			// out-of-order on purpose: EpicChildren sorts ascending.
-			{Number: 42, NodeID: "N42", Title: "slice B", Body: "## Summary\n\nDepends on: #41\n"},
-			{Number: 41, NodeID: "N41", Title: "slice A", Body: "## Summary\n\nno deps\n"},
+			{Number: 42, NodeID: "N42", Title: "slice B", Body: "## Summary\n\nDepends on: #41\n", Labels: []string{"type:feature", "autonomy:medium"}},
+			{Number: 41, NodeID: "N41", Title: "slice A", Body: "## Summary\n\nno deps\n", Labels: []string{"autonomy:low", "area:server"}},
 			{Number: 43, NodeID: "N43", Title: "slice C", Body: "Depends on: #41, #42, #999\n"},
 		},
 	}
@@ -401,6 +401,42 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 		if e != wantDropped[i] {
 			t.Errorf("dropped edge[%d] = %+v, want %+v", i, e, wantDropped[i])
 		}
+	}
+	// Autonomy is sourced from each child's `autonomy:<tier>` label (#1551):
+	// #41 carries autonomy:low, #42 autonomy:medium, and #43 (no autonomy label)
+	// resolves to the empty tier. Children are ascending, so index 0/1/2 are
+	// 41/42/43.
+	wantAutonomy := []string{"low", "medium", ""}
+	for i, c := range res.Children {
+		if c.Autonomy != wantAutonomy[i] {
+			t.Errorf("children[%d] (#%d) Autonomy = %q, want %q", i, c.Number, c.Autonomy, wantAutonomy[i])
+		}
+	}
+}
+
+// TestAutonomyFromLabels covers the label→tier derivation directly, including
+// the no-autonomy-label case (empty tier), a bare `autonomy:` with no tier
+// (empty), and the first-match-wins behavior.
+func TestAutonomyFromLabels(t *testing.T) {
+	cases := []struct {
+		name   string
+		labels []string
+		want   string
+	}{
+		{"low tier", []string{"type:feature", "autonomy:low"}, "low"},
+		{"medium tier", []string{"autonomy:medium"}, "medium"},
+		{"high tier", []string{"autonomy:high", "area:server"}, "high"},
+		{"no autonomy label", []string{"type:feature", "area:server"}, ""},
+		{"nil labels", nil, ""},
+		{"bare autonomy prefix yields empty", []string{"autonomy:"}, ""},
+		{"first match wins", []string{"autonomy:low", "autonomy:high"}, "low"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := autonomyFromLabels(tc.labels); got != tc.want {
+				t.Errorf("autonomyFromLabels(%v) = %q, want %q", tc.labels, got, tc.want)
+			}
+		})
 	}
 }
 

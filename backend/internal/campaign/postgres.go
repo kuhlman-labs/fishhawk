@@ -154,6 +154,7 @@ func (r *postgresRepo) CreateCampaignItem(ctx context.Context, p CreateCampaignI
 		IssueRef:   p.IssueRef,
 		DependsOn:  dependsOn,
 		State:      string(ItemStatePending),
+		Autonomy:   p.Autonomy,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create campaign item: %w", err)
@@ -334,6 +335,7 @@ func rowToCampaignItem(i campaigndb.CampaignItem) *Item {
 		IssueRef:   i.IssueRef,
 		RunID:      i.RunID,
 		State:      ItemState(i.State),
+		Autonomy:   i.Autonomy,
 		CreatedAt:  i.CreatedAt.Time,
 		UpdatedAt:  i.UpdatedAt.Time,
 	}

@@ -59,11 +59,16 @@ type Assembly struct {
 }
 
 // AssembledItem is one campaign item produced by Assemble: its issue ref, the
-// sibling issue refs it depends on, and the wave it lands in.
+// sibling issue refs it depends on, the wave it lands in, and the autonomy
+// tier sourced from the child's `autonomy:<tier>` label (#1551).
 type AssembledItem struct {
 	IssueRef  string   // e.g. "issue:1441"
 	DependsOn []string // sibling issue refs this item waits on
 	Wave      int      // 0-based topological wave index
+	// Autonomy is the tier ("low"/"medium"/"high", empty when unlabeled) carried
+	// from EpicChild.Autonomy through Persist onto the campaign item, so the
+	// engine can keep a human-led item out of Eligible.
+	Autonomy string
 }
 
 // issueRef formats a child issue number into the campaign `issue:N` ref
@@ -151,6 +156,7 @@ func Assemble(epicRef string, res *workmgmt.EpicChildrenResult) (*Assembly, erro
 			IssueRef:  issueRef(c.Number),
 			DependsOn: deps,
 			Wave:      waveOf[i],
+			Autonomy:  c.Autonomy,
 		}
 	}
 
@@ -188,6 +194,7 @@ func Persist(ctx context.Context, repo Repository, repoName string, a *Assembly)
 			CampaignID: c.ID,
 			IssueRef:   it.IssueRef,
 			DependsOn:  it.DependsOn,
+			Autonomy:   it.Autonomy,
 		}); err != nil {
 			return nil, fmt.Errorf("campaign: create item %s: %w", it.IssueRef, err)
 		}

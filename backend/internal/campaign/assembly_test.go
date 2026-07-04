@@ -19,7 +19,7 @@ import (
 func TestAssemble_MultiWaveDAG(t *testing.T) {
 	res := &workmgmt.EpicChildrenResult{
 		Children: []workmgmt.EpicChild{
-			{Number: 41}, {Number: 42}, {Number: 43}, {Number: 44},
+			{Number: 41, Autonomy: "high"}, {Number: 42, Autonomy: "low"}, {Number: 43}, {Number: 44, Autonomy: "medium"},
 		},
 		// 43->41, 44->42, 44->43 (From depends on To).
 		Edges: []workmgmt.DependsEdge{
@@ -44,14 +44,73 @@ func TestAssemble_MultiWaveDAG(t *testing.T) {
 		t.Errorf("waves = %v, want %v", a.Waves, wantWaves)
 	}
 
+	// Each child's autonomy tier flows onto its AssembledItem (#1551); an
+	// unlabeled child (#43) yields the empty tier.
 	wantItems := []campaign.AssembledItem{
-		{IssueRef: "issue:41", DependsOn: nil, Wave: 0},
-		{IssueRef: "issue:42", DependsOn: nil, Wave: 0},
-		{IssueRef: "issue:43", DependsOn: []string{"issue:41"}, Wave: 1},
-		{IssueRef: "issue:44", DependsOn: []string{"issue:42", "issue:43"}, Wave: 2},
+		{IssueRef: "issue:41", DependsOn: nil, Wave: 0, Autonomy: "high"},
+		{IssueRef: "issue:42", DependsOn: nil, Wave: 0, Autonomy: "low"},
+		{IssueRef: "issue:43", DependsOn: []string{"issue:41"}, Wave: 1, Autonomy: ""},
+		{IssueRef: "issue:44", DependsOn: []string{"issue:42", "issue:43"}, Wave: 2, Autonomy: "medium"},
 	}
 	if !reflect.DeepEqual(a.Items, wantItems) {
 		t.Errorf("items = %+v, want %+v", a.Items, wantItems)
+	}
+}
+
+// TestPersist_AutonomySourcedAndPersistedEndToEnd is the BINDING seam test
+// (gpt-5.5 medium condition): it proves the full label→persist path. Starting
+// from EpicChildren carrying Autonomy tiers, it runs Assemble → Persist and
+// reads the rows back from campaign_items, asserting the autonomy COLUMN holds
+// the sourced tier per item. This exercises Persist writing EpicChild.Autonomy
+// (via AssembledItem) into campaign_items end-to-end, not merely a
+// CreateCampaignItem round-trip — satisfying the
+// autonomy-sourced-and-persisted-from-issue-label criterion (#1551).
+func TestPersist_AutonomySourcedAndPersistedEndToEnd(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	res := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 41, Autonomy: "low"},    // human-led
+			{Number: 42, Autonomy: "medium"}, // agent-drivable
+			{Number: 43},                     // unlabeled → empty tier
+		},
+		Edges: []workmgmt.DependsEdge{{From: 43, To: 41}},
+	}
+	a, err := campaign.Assemble("issue:40", res)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	c, err := campaign.Persist(ctx, repo, "kuhlman-labs/fishhawk", a)
+	if err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+
+	items, err := repo.ListCampaignItemsForCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("ListCampaignItemsForCampaign: %v", err)
+	}
+	wantAutonomy := map[string]string{"issue:41": "low", "issue:42": "medium", "issue:43": ""}
+	got := map[string]string{}
+	for _, it := range items {
+		got[it.IssueRef] = it.Autonomy
+	}
+	if !reflect.DeepEqual(got, wantAutonomy) {
+		t.Errorf("persisted item autonomy = %v, want %v", got, wantAutonomy)
+	}
+
+	// Read the autonomy column straight from the row (not just the domain
+	// mapping) to prove Persist WROTE it into campaign_items.
+	var col string
+	if err := pool.QueryRow(ctx,
+		`SELECT autonomy FROM campaign_items WHERE campaign_id = $1 AND issue_ref = 'issue:41'`,
+		c.ID,
+	).Scan(&col); err != nil {
+		t.Fatalf("read campaign_items.autonomy column: %v", err)
+	}
+	if col != "low" {
+		t.Errorf("campaign_items.autonomy column for issue:41 = %q, want low", col)
 	}
 }
 

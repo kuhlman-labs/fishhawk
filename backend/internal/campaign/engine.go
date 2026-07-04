@@ -34,6 +34,26 @@ type Eligibility struct {
 	// for Running. It is never re-dispatched until a resume flips it back to
 	// running.
 	Paused []string
+	// HumanLed items are eligible in every DAG sense (no run yet, every
+	// dependency satisfied) but carry a human-led autonomy tier (autonomy:low
+	// per METHODOLOGY.md), so they are NOT autonomously dispatchable (#1551).
+	// They are kept OUT of Eligible — which the auto-driver's start path and the
+	// start_run next_action both key on — so a human-led item never mints an
+	// agent run; a human leads/authors it instead. A human-led item with an
+	// UNSATISFIED dependency stays Blocked (it is not yet actionable by anyone),
+	// exactly as before.
+	HumanLed []string
+}
+
+// IsHumanLed reports whether an autonomy tier denotes human-led work — the
+// single authoritative place mapping the tier string to the human-led vs
+// agent-drivable split. METHODOLOGY.md defines 'Low autonomy (human-led)': the
+// human is author and reviewer of record, so autonomy:low is human-led while
+// medium/high are agent-drivable. An empty (unlabeled) or unrecognized tier is
+// NOT human-led — it falls through to the autonomous path, the additive-column
+// default that preserves pre-#1551 behavior for items carrying no autonomy.
+func IsHumanLed(autonomy string) bool {
+	return autonomy == "low"
 }
 
 // NextEligible partitions a campaign's items into eligible / blocked /
@@ -41,11 +61,16 @@ type Eligibility struct {
 // run linkage (RunID).
 //
 // An item is Eligible when it has no run yet (RunID nil and a non-terminal,
-// not-yet-running state) AND every dependency ref resolves to a Done
-// (succeeded) item. It is Blocked when not yet run but at least one dependency
-// is not yet done. A dependency ref absent from the campaign is treated as
-// not-satisfied (defensive): a campaign referencing a missing sibling stays
-// blocked rather than dispatching against an unresolved edge.
+// not-yet-running state), every dependency ref resolves to a Done (succeeded)
+// item, AND it is not human-led. A dependency-satisfied item that IS human-led
+// (autonomy:low) lands in HumanLed instead of Eligible, so the auto-driver and
+// the start_run next_action (both keyed on Eligible) never mint an agent run
+// for it — a human leads it. It is Blocked when not yet run but at least one
+// dependency is not yet done (autonomy is irrelevant here — an unactionable
+// item stays Blocked whether human-led or not). A dependency ref absent from
+// the campaign is treated as not-satisfied (defensive): a campaign referencing
+// a missing sibling stays blocked rather than dispatching against an unresolved
+// edge.
 //
 // A cancelled item is terminal: it is reported in Cancelled and never Eligible,
 // even with no run and no deps (which would otherwise fall through to the
@@ -82,12 +107,22 @@ func NextEligible(items []*Item) Eligibility {
 		case it.State == ItemStateRunning || (it.RunID != nil && !it.State.IsTerminal()):
 			e.Running = append(e.Running, ref)
 		default:
-			// Not yet run (RunID nil, state pending/blocked). Eligible only
-			// when every dependency has succeeded.
-			if depsSatisfied(it.DependsOn, done) {
-				e.Eligible = append(e.Eligible, ref)
-			} else {
+			// Not yet run (RunID nil, state pending/blocked). Actionable only
+			// when every dependency has succeeded; otherwise Blocked.
+			switch {
+			case !depsSatisfied(it.DependsOn, done):
+				// An unsatisfied dependency blocks the item regardless of
+				// autonomy — a human-led item is not yet actionable by anyone.
 				e.Blocked = append(e.Blocked, ref)
+			case IsHumanLed(it.Autonomy):
+				// Dependencies satisfied but human-led (autonomy:low): route to
+				// HumanLed, NOT Eligible, so it is never autonomously dispatched
+				// (#1551). The driver's start path keys on Eligible, so this
+				// auto-skips it while DAG-independent autonomous items keep
+				// starting.
+				e.HumanLed = append(e.HumanLed, ref)
+			default:
+				e.Eligible = append(e.Eligible, ref)
 			}
 		}
 	}
