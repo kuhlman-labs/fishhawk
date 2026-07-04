@@ -42,6 +42,18 @@ import (
 //     genuinely-malformed output keeps its precise diagnostic.
 func DecodeVerdict(raw []byte) (ReviewVerdict, error) {
 	raw = stripCodeFence(raw)
+	// Prose before and/or after the JSON object — a reviewer model routinely
+	// narrates ("The plan looks solid. Here is my verdict:") around the object,
+	// whose leading non-'{' byte fails strict decode before any escape repair
+	// can run. This is the E32.9 prose-prefix failure (#1576): claudecode's CLI
+	// exposes no response-schema flag, so the model is free to emit prose and
+	// the strict decoder gave up with `invalid character 'T'`. firstJSONObject
+	// extracts the first balanced top-level object; when it finds none raw is
+	// left unchanged so a genuinely-undecodable body keeps its precise strict
+	// error below.
+	if obj := firstJSONObject(raw); obj != nil {
+		raw = obj
+	}
 
 	var verdict ReviewVerdict
 	strictErr := json.Unmarshal(raw, &verdict)
@@ -154,4 +166,54 @@ func sanitizeEscapes(raw []byte) []byte {
 
 func isHex(b byte) bool {
 	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+}
+
+// firstJSONObject returns the first balanced top-level JSON object in b — from
+// the first '{' through its matching '}' — tolerating prose before and after
+// it. The scan is string-literal-aware and escape-aware: braces (and quotes)
+// inside a JSON string value do not affect the depth count, so an object whose
+// string values contain '{' or '}' is extracted whole. Returns nil when b holds
+// no '{' or the object is unbalanced (no matching close), in which case
+// DecodeVerdict falls back to strict-decoding the original body so the strict
+// error is preserved.
+//
+// This is a deliberate twin of refinement.firstJSONObject (backend/internal/
+// refinement/decode.go), which cites the same E32.9 prose-prefix lesson. The
+// two copies live in different packages; keep the string-literal/escape scan in
+// sync if either changes. The duplication is scoped by design (see #1576): a
+// small self-contained string utility, cross-referenced here to bound drift.
+func firstJSONObject(b []byte) []byte {
+	start := bytes.IndexByte(b, '{')
+	if start < 0 {
+		return nil
+	}
+	depth := 0
+	inStr := false
+	esc := false
+	for i := start; i < len(b); i++ {
+		c := b[i]
+		if inStr {
+			switch {
+			case esc:
+				esc = false
+			case c == '\\':
+				esc = true
+			case c == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return b[start : i+1]
+			}
+		}
+	}
+	return nil
 }

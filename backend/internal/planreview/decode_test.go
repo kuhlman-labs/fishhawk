@@ -208,6 +208,107 @@ func TestDecodeVerdict_UnicodeEscapeSurvivesSanitizer(t *testing.T) {
 	}
 }
 
+// TestDecodeVerdict_ProsePrefixDecodes covers the originating bug (#1576): a
+// verdict emitted as prose FOLLOWED by the JSON object (the E32.9 prose-prefix
+// class that produced `decode verdict JSON: invalid character 'T'`) decodes to
+// a real verdict — firstJSONObject extracts the object from the surrounding
+// prose before the strict decode.
+func TestDecodeVerdict_ProsePrefixDecodes(t *testing.T) {
+	raw := []byte("The plan looks solid and the tests are adequate.\n{\"reviewer_kind\":\"agent\",\"authority\":\"advisory\",\"verdict\":\"approve\"}")
+
+	verdict, err := DecodeVerdict(raw)
+	if err != nil {
+		t.Fatalf("DecodeVerdict: %v", err)
+	}
+	if verdict.Verdict != VerdictApprove {
+		t.Errorf("verdict = %q, want %q", verdict.Verdict, VerdictApprove)
+	}
+}
+
+// TestDecodeVerdict_ProseBothSidesDecodes covers prose on BOTH sides of the
+// object — the model narrates before and appends a sign-off after — which
+// firstJSONObject's balanced-brace scan must still extract whole.
+func TestDecodeVerdict_ProseBothSidesDecodes(t *testing.T) {
+	raw := []byte("Here is my verdict:\n{\"verdict\":\"reject\",\"free_form\":\"needs tests\"}\nLet me know if you have questions.")
+
+	verdict, err := DecodeVerdict(raw)
+	if err != nil {
+		t.Fatalf("DecodeVerdict: %v", err)
+	}
+	if verdict.Verdict != VerdictReject {
+		t.Errorf("verdict = %q, want %q", verdict.Verdict, VerdictReject)
+	}
+	if verdict.FreeForm != "needs tests" {
+		t.Errorf("FreeForm = %q, want %q", verdict.FreeForm, "needs tests")
+	}
+}
+
+// TestDecodeVerdict_BracesInStringExtractedWhole asserts the string-literal-aware
+// scan ignores '{' and '}' inside a JSON string value: a prose-wrapped verdict
+// whose free_form contains literal braces is extracted whole rather than being
+// truncated at the first in-string '}'.
+func TestDecodeVerdict_BracesInStringExtractedWhole(t *testing.T) {
+	const free = "use a map[string]struct{} and a block { here }"
+	inner := `{"verdict":"approve","free_form":"` + free + `"}`
+	raw := []byte("Verdict follows.\n" + inner + "\nThanks!")
+
+	verdict, err := DecodeVerdict(raw)
+	if err != nil {
+		t.Fatalf("DecodeVerdict: %v", err)
+	}
+	if verdict.Verdict != VerdictApprove {
+		t.Errorf("verdict = %q, want %q", verdict.Verdict, VerdictApprove)
+	}
+	if verdict.FreeForm != free {
+		t.Errorf("FreeForm = %q, want %q (braces inside the string must be preserved whole)", verdict.FreeForm, free)
+	}
+}
+
+// TestDecodeVerdict_NoBraceFallsBackToStrictError asserts an input with no '{'
+// at all leaves raw unchanged (firstJSONObject returns nil) and returns a
+// genuine strict decode error — the diagnostics-preserving fallback.
+func TestDecodeVerdict_NoBraceFallsBackToStrictError(t *testing.T) {
+	raw := []byte("This is entirely prose with no JSON object anywhere.")
+
+	_, err := DecodeVerdict(raw)
+	if err == nil {
+		t.Fatal("expected a decode error from a brace-free prose body, got nil")
+	}
+}
+
+// TestDecodeVerdict_UnbalancedObjectFallsBackToStrictError asserts an object
+// that never closes (unbalanced braces) also yields nil from firstJSONObject,
+// so the original strict error is preserved rather than a masked one.
+func TestDecodeVerdict_UnbalancedObjectFallsBackToStrictError(t *testing.T) {
+	raw := []byte(`Here: {"verdict":"approve","free_form":"never closed`)
+
+	_, err := DecodeVerdict(raw)
+	if err == nil {
+		t.Fatal("expected a decode error from an unbalanced object, got nil")
+	}
+}
+
+// TestDecodeVerdict_ProsePrefixWithRegexEscapeDecodes asserts extraction
+// composes with the existing sanitizeEscapes repair: a prose-prefixed verdict
+// whose free_form ALSO carries an illegal `\-` regex escape must both extract
+// (firstJSONObject) and repair (the sanitize retry) to decode.
+func TestDecodeVerdict_ProsePrefixWithRegexEscapeDecodes(t *testing.T) {
+	const regex = `ghs_[A-Za-z0-9_.\-]{36,}`
+	inner := `{"verdict":"reject","free_form":"redact ` + regex + `"}`
+	raw := []byte("My review is below.\n" + inner)
+
+	verdict, err := DecodeVerdict(raw)
+	if err != nil {
+		t.Fatalf("DecodeVerdict: %v", err)
+	}
+	if verdict.Verdict != VerdictReject {
+		t.Errorf("verdict = %q, want %q", verdict.Verdict, VerdictReject)
+	}
+	if !strings.Contains(verdict.FreeForm, regex) {
+		t.Errorf("FreeForm = %q, want it to contain the regex %q verbatim", verdict.FreeForm, regex)
+	}
+}
+
 // TestDecodeVerdict_ConcernResolutions_StrictPath asserts a verdict
 // carrying the #984 concern_resolutions array decodes on the strict path
 // with every member intact — the delta-verification re-review's wire
