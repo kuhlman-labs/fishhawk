@@ -276,6 +276,41 @@ func (c *Client) ListRunStages(ctx context.Context, runID uuid.UUID) (*ListStage
 	return &res, nil
 }
 
+// RunStageWait is the CLI-side projection of the GET
+// /v0/runs/{run_id}/stages/{stage_id} response's wait envelope (#1252).
+// Only the fields the `run watch` watcher needs are projected. It
+// deliberately does NOT embed Stage: the backend response embeds the
+// canonical stage shape (which carries its own `state` json tag) AND
+// adds a top-level `state`/`terminal` envelope; embedding Stage would
+// shadow-collide on the `state` key and hide the top-level `terminal`
+// flag. A purpose-built struct keeps both unambiguous.
+type RunStageWait struct {
+	ID              uuid.UUID `json:"id"`
+	RunID           uuid.UUID `json:"run_id"`
+	State           string    `json:"state"`
+	Terminal        bool      `json:"terminal"`
+	FailureCategory *string   `json:"failure_category"`
+	FailureReason   *string   `json:"failure_reason"`
+}
+
+// GetRunStageWait calls GET /v0/runs/{run_id}/stages/{stage_id},
+// decoding the top-level {state, terminal, failure_*} wait envelope
+// (#1252). waitSeconds>0 adds the opt-in bounded server-side long-poll
+// (?wait=<n>) so the call returns the moment the stage settles (terminal
+// OR parked); <=0 omits the query for an immediate single read. The
+// backend clamps ?wait above its own cap, so any positive value is safe.
+func (c *Client) GetRunStageWait(ctx context.Context, runID, stageID uuid.UUID, waitSeconds int) (*RunStageWait, error) {
+	path := "/v0/runs/" + runID.String() + "/stages/" + stageID.String()
+	if waitSeconds > 0 {
+		path += "?wait=" + strconv.Itoa(waitSeconds)
+	}
+	var res RunStageWait
+	if err := c.do(ctx, http.MethodGet, path, nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // ApprovalDecision is the typed enum the approvals endpoint accepts.
 type ApprovalDecision string
 
