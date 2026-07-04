@@ -274,6 +274,33 @@ func TestFilingRequestForChild_RealValues(t *testing.T) {
 	}
 }
 
+// TestFilingRequestForChild_OmitsEpicOnEmpty guards the omit-on-empty contract
+// the #1644 fix depends on: the executor passes epicNumber "" so the {epic}
+// title var is OMITTED entirely, letting the server-side deriveEpicTitleVar fill
+// in the epic's discovered ordinal from the parent-epic [E<n>] title. The `#N`
+// parent-epic RELATION and depends_on refs are still set from the epic ISSUE
+// number the executor supplies.
+func TestFilingRequestForChild_OmitsEpicOnEmpty(t *testing.T) {
+	child := ChildDraft{
+		Summary: "c", Proposal: "p", DoneMeans: "d",
+		AcceptanceCriteria: []string{"ok"}, Labels: []string{"area:backend"},
+		DependsOn: []int{1},
+	}
+	got := FilingRequestForChild(child, 3, "", "#1601", []string{"#1607"})
+	if _, ok := got.TitleVars["epic"]; ok {
+		t.Errorf("title vars = %v, want NO epic key on empty epicNumber", got.TitleVars)
+	}
+	if got.TitleVars["n"] != "3" {
+		t.Errorf("title vars = %v, want n=3", got.TitleVars)
+	}
+	if got.Relations.ParentEpic != "#1601" {
+		t.Errorf("parent epic = %q, want #1601 (issue-number relation still set)", got.Relations.ParentEpic)
+	}
+	if len(got.Relations.DependsOn) != 1 || got.Relations.DependsOn[0] != "#1607" {
+		t.Errorf("depends_on = %v, want [#1607]", got.Relations.DependsOn)
+	}
+}
+
 func containsLabel(labels []string, want string) bool {
 	for _, l := range labels {
 		if l == want {

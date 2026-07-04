@@ -114,12 +114,18 @@ func RenderChild(child ChildDraft, ordinal int, opts RenderOptions, conv workmgm
 
 // FilingRequestForChild builds the conventions FilingRequest for one child at
 // its 1-based ordinal. It is the single seam shared by the E34.2 preview
-// (RenderChild, which passes the sentinel epicNumber/parentEpicRef and nil
-// dependsOnRefs) and the E34.3 filing executor (which passes the real epic
-// number, real `#N` parent ref, and the child's depends_on refs resolved to
-// real `#N` numbers). By construction "what was previewed is what files": the
-// same builder produces both requests, differing only in the sentinel-vs-real
-// substitutions the executor is defined to make.
+// (RenderChild, which passes the non-empty sentinel epicNumber "X" and nil
+// dependsOnRefs) and the E34.3 filing executor (which passes epicNumber "" and
+// the child's depends_on refs resolved to real `#N` numbers).
+//
+// The {epic} title var is set ONLY when epicNumber is non-empty. When epicNumber
+// == "" the "epic" key is OMITTED entirely, which is the contract that lets the
+// server-side deriveEpicTitleVar (which short-circuits when title_vars already
+// carries "epic") derive the epic's DISCOVERED ordinal from the parent epic's
+// leading [E<n>] title at File time (#1644). The executor passes "" so the
+// ordinal is DERIVED rather than injected as the epic's ISSUE number; the E34.2
+// preview (RenderChild) passes the non-empty sentinel "X" and so still renders
+// [EX.n] directly through workmgmt.Apply (preview never runs deriveEpicTitleVar).
 //
 // dependsOnRefs sets Relations.DependsOn so the github provider's
 // ensureDependsOnMarker renders the marker in its exact `Depends on: #N` format
@@ -127,6 +133,10 @@ func RenderChild(child ChildDraft, ordinal int, opts RenderOptions, conv workmgm
 // the draft-ordinal placeholder marker itself after Apply, so a preview body is
 // byte-identical whether or not this builder is used.
 func FilingRequestForChild(child ChildDraft, ordinal int, epicNumber, parentEpicRef string, dependsOnRefs []string) workmgmt.FilingRequest {
+	titleVars := map[string]string{"n": strconv.Itoa(ordinal)}
+	if epicNumber != "" {
+		titleVars["epic"] = epicNumber
+	}
 	return workmgmt.FilingRequest{
 		Type:    "feature",
 		Summary: child.Summary,
@@ -135,11 +145,8 @@ func FilingRequestForChild(child ChildDraft, ordinal int, epicNumber, parentEpic
 			"Done-means":          child.DoneMeans,
 			"Acceptance criteria": bulletize(child.AcceptanceCriteria),
 		},
-		Labels: child.Labels,
-		TitleVars: map[string]string{
-			"epic": epicNumber,
-			"n":    strconv.Itoa(ordinal),
-		},
+		Labels:    child.Labels,
+		TitleVars: titleVars,
 		Relations: workmgmt.Relations{ParentEpic: parentEpicRef, DependsOn: dependsOnRefs},
 	}
 }

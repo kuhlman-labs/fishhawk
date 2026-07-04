@@ -216,9 +216,13 @@ func executeFilingLocked(ctx context.Context, draft *StoredDraft, repo string, r
 		filed[0] = num
 		filedURL[0] = url
 	}
-	// The epic number is the child {epic} title var AND their `#N` parent ref.
-	epicNumberStr := strconv.Itoa(filed[0])
-	epicRef := "#" + epicNumberStr
+	// The epic's ISSUE number is ONLY the children's `#N` parent-epic RELATION
+	// ref (and their depends_on refs). It is DELIBERATELY not the {epic} title
+	// var: the {epic} placeholder must carry the epic's DISCOVERED ordinal (the
+	// digits in its own [E<n>] title), which the server-side deriveEpicTitleVar
+	// derives downstream from the parent-epic relation — so the executor passes
+	// "" for the title var and lets that derivation run (#1644).
+	epicRef := "#" + strconv.Itoa(filed[0])
 
 	// (4) File each unrecorded child in wave order.
 	order, err := FilingOrder(draft.Draft)
@@ -240,7 +244,7 @@ func executeFilingLocked(ctx context.Context, draft *StoredDraft, repo string, r
 			}
 			deps = append(deps, "#"+strconv.Itoa(depNum))
 		}
-		req := FilingRequestForChild(child, ord, epicNumberStr, epicRef, deps)
+		req := FilingRequestForChild(child, ord, "", epicRef, deps)
 		num, url, ferr := file(ctx, req)
 		if ferr != nil {
 			return nil, &FilingPartialError{Filed: sortedFiled(filed, filedURL), FailedOrdinal: ord, Err: ferr}
