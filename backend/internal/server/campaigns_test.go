@@ -1103,6 +1103,45 @@ func TestComputeCampaignNextAction_Precedence(t *testing.T) {
 			wantRef: "issue:6",
 		},
 		{
+			// #1551: an autonomous eligible item and a human-led item both
+			// present -> start_run on the AUTONOMOUS ref. A human-led item must
+			// NOT stall DAG-independent autonomous work.
+			name:    "eligible and human_led both present -> start_run",
+			elig:    campaign.Eligibility{Eligible: []string{"issue:6"}, HumanLed: []string{"issue:12"}},
+			want:    "start_run",
+			wantRef: "issue:6",
+		},
+		{
+			// #1551: the sole remaining eligible work is human-led ->
+			// attend_human_led on the human-led ref (page a human).
+			name:    "human_led only -> attend_human_led",
+			elig:    campaign.Eligibility{HumanLed: []string{"issue:12"}},
+			want:    "attend_human_led",
+			wantRef: "issue:12",
+		},
+		{
+			// FAILED still wins over a human-led item (strict-first check).
+			name:    "failed and human_led both present -> attention",
+			elig:    campaign.Eligibility{Failed: []string{"issue:5"}, HumanLed: []string{"issue:12"}},
+			want:    "attention",
+			wantRef: "issue:5",
+		},
+		{
+			// PAUSED still outranks a human-led item.
+			name:    "paused and human_led both present -> resume",
+			elig:    campaign.Eligibility{Paused: []string{"issue:9"}, HumanLed: []string{"issue:12"}},
+			want:    "resume",
+			wantRef: "issue:9",
+		},
+		{
+			// A human-led item outranks a merely-running/blocked item: a human
+			// has something actionable to pick up, which beats "wait".
+			name:    "human_led and running both present -> attend_human_led",
+			elig:    campaign.Eligibility{HumanLed: []string{"issue:12"}, Running: []string{"issue:7"}},
+			want:    "attend_human_led",
+			wantRef: "issue:12",
+		},
+		{
 			name: "running only -> wait",
 			elig: campaign.Eligibility{Running: []string{"issue:7"}},
 			want: "wait",
@@ -1284,6 +1323,94 @@ func TestGetCampaignStatus_RollupAndNextAction(t *testing.T) {
 	// FAILED wins over the eligible item.
 	if status.NextAction.Action != "attention" || status.NextAction.IssueRef != "issue:100" {
 		t.Errorf("next_action = %+v, want attention issue:100", status.NextAction)
+	}
+}
+
+// TestGetCampaignStatus_HumanLedRollupAndNextAction is the #1551 handler seam
+// test: it drives the status handler end-to-end over items carrying autonomy
+// and asserts the human_led rollup slice AND the next_action are computed
+// TOGETHER (the handler runs engine.NextEligible + toCampaignRollupPayload +
+// computeCampaignNextAction in one path). It covers BOTH precedence cases:
+//   - mixed (autonomous + human-led eligible) -> the autonomous item is
+//     eligible and start_run wins, while the human-led item is surfaced in
+//     human_led (never eligible), so autonomous work is never stalled.
+//   - sole-human-led -> attend_human_led on the human-led ref.
+func TestGetCampaignStatus_HumanLedRollupAndNextAction(t *testing.T) {
+	// (1) Mixed: one autonomy:low (human-led) item and one autonomy:medium
+	// (autonomous) item, both dependency-free. start_run wins on the autonomous
+	// ref; the human-led item is surfaced in human_led, not eligible.
+	repo := newFakeCampaignRepo()
+	c := repo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: "low"},
+		{IssueRef: "issue:101", State: campaign.ItemStatePending, Autonomy: "medium"},
+	})
+	s := New(Config{CampaignRepo: repo})
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+c.ID.String()+"/status", nil)
+	req.SetPathValue("campaign_id", c.ID.String())
+	w := httptest.NewRecorder()
+	s.handleGetCampaignStatus(w, withAuth(req))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	var status struct {
+		Items []struct {
+			IssueRef string `json:"issue_ref"`
+			Autonomy string `json:"autonomy"`
+		} `json:"items"`
+		Rollup     campaignRollupPayload     `json:"rollup"`
+		NextAction campaignNextActionPayload `json:"next_action"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &status); err != nil {
+		t.Fatalf("unmarshal status: %v", err)
+	}
+	if !reflect.DeepEqual(status.Rollup.HumanLed, []string{"issue:100"}) {
+		t.Errorf("rollup.human_led = %v, want [issue:100]", status.Rollup.HumanLed)
+	}
+	if !reflect.DeepEqual(status.Rollup.Eligible, []string{"issue:101"}) {
+		t.Errorf("rollup.eligible = %v, want [issue:101] (human-led item must NOT be eligible)", status.Rollup.Eligible)
+	}
+	if status.NextAction.Action != "start_run" || status.NextAction.IssueRef != "issue:101" {
+		t.Errorf("next_action = %+v, want start_run issue:101 (autonomous work not stalled)", status.NextAction)
+	}
+	// The autonomy tier is echoed on each item response.
+	autByRef := map[string]string{}
+	for _, it := range status.Items {
+		autByRef[it.IssueRef] = it.Autonomy
+	}
+	if autByRef["issue:100"] != "low" || autByRef["issue:101"] != "medium" {
+		t.Errorf("item autonomy = %v, want issue:100=low issue:101=medium", autByRef)
+	}
+
+	// (2) Sole human-led: the only eligible work is autonomy:low -> the handler
+	// computes attend_human_led on it.
+	repo2 := newFakeCampaignRepo()
+	c2 := repo2.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:199", []*campaign.Item{
+		{IssueRef: "issue:200", State: campaign.ItemStatePending, Autonomy: "low"},
+	})
+	s2 := New(Config{CampaignRepo: repo2})
+	req2 := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+c2.ID.String()+"/status", nil)
+	req2.SetPathValue("campaign_id", c2.ID.String())
+	w2 := httptest.NewRecorder()
+	s2.handleGetCampaignStatus(w2, withAuth(req2))
+	if w2.Code != http.StatusOK {
+		t.Fatalf("status(2) = %d, want 200 (body=%s)", w2.Code, w2.Body.String())
+	}
+	var status2 struct {
+		Rollup     campaignRollupPayload     `json:"rollup"`
+		NextAction campaignNextActionPayload `json:"next_action"`
+	}
+	if err := json.Unmarshal(w2.Body.Bytes(), &status2); err != nil {
+		t.Fatalf("unmarshal status(2): %v", err)
+	}
+	if !reflect.DeepEqual(status2.Rollup.HumanLed, []string{"issue:200"}) {
+		t.Errorf("rollup.human_led(2) = %v, want [issue:200]", status2.Rollup.HumanLed)
+	}
+	if len(status2.Rollup.Eligible) != 0 {
+		t.Errorf("rollup.eligible(2) = %v, want empty", status2.Rollup.Eligible)
+	}
+	if status2.NextAction.Action != "attend_human_led" || status2.NextAction.IssueRef != "issue:200" {
+		t.Errorf("next_action(2) = %+v, want attend_human_led issue:200", status2.NextAction)
 	}
 }
 

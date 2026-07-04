@@ -183,6 +183,13 @@ type Item struct {
 	// preserving campaign history.
 	RunID *uuid.UUID
 	State ItemState
+	// Autonomy is the item's autonomy tier ("low"/"medium"/"high"), sourced from
+	// the epic child's `autonomy:<tier>` issue label at assembly time (#1551).
+	// Empty when the child carried no autonomy label. The engine (NextEligible)
+	// keys on it: a human-led (autonomy:low, per METHODOLOGY.md) item is routed
+	// to Eligibility.HumanLed instead of Eligible, so it is never
+	// autonomously dispatched. Persisted on campaign_items.autonomy.
+	Autonomy string
 	// PauseReason carries why a paused item was handed off to a human. Nil
 	// unless the item is (or was) paused. Persisted as JSONB.
 	PauseReason *PauseReason

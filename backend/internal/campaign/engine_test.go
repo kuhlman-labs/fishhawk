@@ -14,6 +14,60 @@ func item(ref string, state campaign.ItemState, runID *uuid.UUID, deps ...string
 	return &campaign.Item{IssueRef: ref, State: state, RunID: runID, DependsOn: deps}
 }
 
+// itemAuto is item plus an autonomy tier, for the mixed-autonomy engine tests.
+func itemAuto(ref string, state campaign.ItemState, autonomy string, deps ...string) *campaign.Item {
+	return &campaign.Item{IssueRef: ref, State: state, Autonomy: autonomy, DependsOn: deps}
+}
+
+// TestIsHumanLed pins the single authoritative tier→human-led mapping: only
+// autonomy:low is human-led; medium/high and the empty/unlabeled tier are
+// agent-drivable (the additive-column default preserving pre-#1551 behavior).
+func TestIsHumanLed(t *testing.T) {
+	cases := map[string]bool{"low": true, "medium": false, "high": false, "": false, "bogus": false}
+	for tier, want := range cases {
+		if got := campaign.IsHumanLed(tier); got != want {
+			t.Errorf("IsHumanLed(%q) = %v, want %v", tier, got, want)
+		}
+	}
+}
+
+// TestNextEligible_MixedAutonomy is the done-means engine test (#1551): over a
+// mixed-autonomy DAG, an eligible autonomy:low item lands in HumanLed (NOT
+// Eligible, NOT Running), a medium and a high sibling with satisfied deps stay
+// Eligible, and a human-led item whose dependency is unsatisfied stays Blocked
+// (autonomy does not override the DAG). An unlabeled eligible item is treated
+// as autonomous (Eligible), preserving pre-#1551 behavior.
+func TestNextEligible_MixedAutonomy(t *testing.T) {
+	items := []*campaign.Item{
+		itemAuto("issue:1", campaign.ItemStateSucceeded, "high"),            // done (predecessor)
+		itemAuto("issue:2", campaign.ItemStatePending, "low", "issue:1"),    // dep done + human-led → HumanLed
+		itemAuto("issue:3", campaign.ItemStatePending, "medium", "issue:1"), // dep done + agent → Eligible
+		itemAuto("issue:4", campaign.ItemStatePending, "high"),              // no dep + agent → Eligible
+		itemAuto("issue:5", campaign.ItemStatePending, ""),                  // no dep + unlabeled → Eligible
+		itemAuto("issue:6", campaign.ItemStatePending, "low", "issue:4"),    // human-led but dep NOT done → Blocked
+	}
+	got := campaign.NextEligible(items)
+
+	if !reflect.DeepEqual(got.HumanLed, []string{"issue:2"}) {
+		t.Errorf("humanled = %v, want [issue:2]", got.HumanLed)
+	}
+	if !reflect.DeepEqual(got.Eligible, []string{"issue:3", "issue:4", "issue:5"}) {
+		t.Errorf("eligible = %v, want [issue:3 issue:4 issue:5]", got.Eligible)
+	}
+	if !reflect.DeepEqual(got.Blocked, []string{"issue:6"}) {
+		t.Errorf("blocked = %v, want [issue:6] (human-led with unsatisfied dep stays blocked)", got.Blocked)
+	}
+	// A human-led item must NEVER leak into Eligible or Running.
+	for _, ref := range got.Eligible {
+		if ref == "issue:2" {
+			t.Errorf("human-led issue:2 leaked into Eligible: %v", got.Eligible)
+		}
+	}
+	if len(got.Running) != 0 {
+		t.Errorf("running = %v, want none", got.Running)
+	}
+}
+
 // TestNextEligible_PartiallyComplete asserts the eligible/blocked/running/
 // done/failed partition over a partially-complete campaign: one succeeded
 // (done), one running, one failed, one pending whose only dep succeeded

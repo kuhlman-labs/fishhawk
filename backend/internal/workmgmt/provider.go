@@ -108,10 +108,16 @@ type EpicChildrenResult struct {
 	DroppedEdges []DependsEdge
 }
 
-// EpicChild is one child issue of an epic: its number and title.
+// EpicChild is one child issue of an epic: its number, title, and resolved
+// autonomy tier. Autonomy is the tier sourced from the child's `autonomy:<tier>`
+// issue label (e.g. "low"/"medium"/"high"), empty when the child carries no
+// autonomy label. The campaign engine keys on it to keep a human-led
+// (autonomy:low) item out of the autonomously-dispatchable Eligible set
+// (#1551).
 type EpicChild struct {
-	Number int
-	Title  string
+	Number   int
+	Title    string
+	Autonomy string
 }
 
 // DependsEdge is one depends_on edge over the sibling set: From depends on

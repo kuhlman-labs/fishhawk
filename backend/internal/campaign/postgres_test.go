@@ -294,6 +294,59 @@ func TestPostgres_CampaignItem_RoundTripAndDependsOn(t *testing.T) {
 	}
 }
 
+// TestPostgres_CampaignItem_Autonomy round-trips the autonomy tier through
+// CreateCampaignItem / read-back (#1551): a low-tier item reads back "low" (the
+// engine treats it as human-led), a medium item reads back "medium", and an
+// item created with no autonomy reads back "" (the additive column's default,
+// NOT human-led). The last assertion proves the fail-closed CHECK
+// (campaign_items_autonomy_check) rejects a garbage tier with an error rather
+// than persisting an item the engine would misclassify.
+func TestPostgres_CampaignItem_Autonomy(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+	c := makeCampaign(t, repo)
+
+	cases := []struct {
+		ref  string
+		tier string
+	}{
+		{"issue:1", "low"},
+		{"issue:2", "medium"},
+		{"issue:3", "high"},
+		{"issue:4", ""}, // unlabeled child → empty tier, the column default
+	}
+	for _, tc := range cases {
+		it, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+			CampaignID: c.ID,
+			IssueRef:   tc.ref,
+			Autonomy:   tc.tier,
+		})
+		if err != nil {
+			t.Fatalf("create item %s (autonomy %q): %v", tc.ref, tc.tier, err)
+		}
+		if it.Autonomy != tc.tier {
+			t.Errorf("create-return autonomy for %s = %q, want %q", tc.ref, it.Autonomy, tc.tier)
+		}
+		got, err := repo.GetCampaignItem(ctx, it.ID)
+		if err != nil {
+			t.Fatalf("get item %s: %v", tc.ref, err)
+		}
+		if got.Autonomy != tc.tier {
+			t.Errorf("read-back autonomy for %s = %q, want %q", tc.ref, got.Autonomy, tc.tier)
+		}
+	}
+
+	// Fail-closed CHECK: a tier outside ('','low','medium','high') is rejected.
+	if _, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID,
+		IssueRef:   "issue:99",
+		Autonomy:   "bogus",
+	}); err == nil {
+		t.Error("CreateCampaignItem with autonomy 'bogus' succeeded, want CHECK-constraint error")
+	}
+}
+
 // TestPostgres_CampaignItem_MalformedDependsOn_Tolerated asserts the
 // rowToCampaignItem tolerance branch: a depends_on payload that is valid
 // JSONB but not a []string (so json.Unmarshal into []string fails) is
