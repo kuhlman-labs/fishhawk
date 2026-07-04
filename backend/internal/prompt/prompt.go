@@ -925,6 +925,13 @@ func buildImplement(t Trigger) string {
 	// the request mid-stage and have the agent resume WITH the decision.
 	writeScopeAmendments(&b)
 
+	// Workspace hygiene (#1610): a binding, language-agnostic contract that no
+	// build output / compiled artifact / downloaded dependency / temp file may
+	// remain untracked in the working tree at completion. Same scope-contract
+	// family as writeScopeAmendments — rendered here so the full implement path
+	// carries it, and identically in buildImplementFixup for the slim path.
+	writeWorkspaceHygiene(&b)
+
 	// Scope self-exempt (#1153): the standalone open-PR path's escape hatch for
 	// a declared scope.files path the agent DELIBERATELY leaves unchanged. The
 	// pre-push scope-completeness gate (#1151/#1154) is otherwise strict — every
@@ -1133,6 +1140,23 @@ func writeScopeAmendments(b *strings.Builder) {
 	b.WriteString("\n")
 }
 
+// writeWorkspaceHygiene renders the "### Workspace hygiene" block: a binding,
+// language-agnostic contract that no build output may be left in the working
+// tree when the agent finishes. Shared by the full implement prompt and the
+// slim fix-up prompt (mirroring writeScopeAmendments) so the wording is
+// byte-identical on both paths — the same net-new scope gate governs both
+// commits. Motivated by run 506111fa (#1539), which failed category-B because
+// the implement agent compiled a helper during verification and left a ~9.4MB
+// untracked binary in a package directory that the net-new scope gate refused
+// to commit. Phrased in generic terms (build outputs, compiled artifacts,
+// dependencies, temporary files) with NO toolchain, compiler, or build-tool
+// command names, so the contract holds across languages.
+func writeWorkspaceHygiene(b *strings.Builder) {
+	b.WriteString("### Workspace hygiene\n\n")
+	b.WriteString("Build outputs, compiled artifacts, downloaded dependencies, and temporary files you create while verifying MUST NOT remain in the working tree when you finish. Direct such output to a location outside the repository (for example a temporary directory) or remove it before completing. Any untracked file left behind that is not a declared scope creation fails the stage.\n")
+	b.WriteString("\n")
+}
+
 // writeScopeSelfExempt renders the "### Deliberately-unchanged declared scope
 // files" block (#1153): the in-band escape hatch for a declared scope.files
 // path the agent intentionally leaves unchanged. The agent writes a JSON
@@ -1287,6 +1311,11 @@ func buildImplementFixup(t Trigger) string {
 
 	// The same scope contract governs the fix-up commit.
 	writeScopeAmendments(&b)
+
+	// The same workspace-hygiene contract (#1610) governs the fix-up commit —
+	// rendered identically to the full implement path so a fix-up pass that
+	// compiles or downloads while verifying leaves no untracked build output.
+	writeWorkspaceHygiene(&b)
 
 	// Advisory verify-outcome self-report (#1210): fix-up-only honesty cross-
 	// check, surfaced to the reviewer via gate_evidence. Placed after the scope

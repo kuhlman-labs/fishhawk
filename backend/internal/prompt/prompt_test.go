@@ -2126,6 +2126,93 @@ func TestBuild_Implement_Fixup_OmitsFullScaffolding(t *testing.T) {
 	}
 }
 
+// workspaceHygieneSentinel is a stable substring of the #1610 workspace-hygiene
+// contract. Both the full implement path and the slim fix-up path must render
+// it verbatim, so the two render tests below anchor on the same literal.
+const workspaceHygieneSentinel = "Build outputs, compiled artifacts, downloaded dependencies, and temporary files you create while verifying MUST NOT remain in the working tree"
+
+// TestBuild_Implement_WorkspaceHygiene_Rendered proves the full implement path
+// (an approved-plan implement Trigger, no FixupConcerns) renders the #1610
+// workspace-hygiene contract. Fails on a no-op touch that never wires the
+// writer into buildImplement.
+func TestBuild_Implement_WorkspaceHygiene_Rendered(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		IssueNumber:  1610,
+		ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "### Workspace hygiene") {
+		t.Errorf("full implement prompt missing the workspace-hygiene heading\n---\n%s", got)
+	}
+	if !strings.Contains(got, workspaceHygieneSentinel) {
+		t.Errorf("full implement prompt missing the workspace-hygiene contract sentinel\n---\n%s", got)
+	}
+}
+
+// TestBuild_ImplementFixup_WorkspaceHygiene_Rendered proves the slim fix-up path
+// (FixupConcerns set → buildImplementFixup) renders the IDENTICAL #1610 contract,
+// so a fix-up pass that compiles or downloads while verifying is bound by the
+// same no-untracked-build-output rule.
+func TestBuild_ImplementFixup_WorkspaceHygiene_Rendered(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:          "o/r",
+		IssueNumber:   1610,
+		ApprovedPlan:  fixturePlan(),
+		FixupConcerns: []string{"[medium] tighten the bound check"},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "### Workspace hygiene") {
+		t.Errorf("slim fix-up prompt missing the workspace-hygiene heading\n---\n%s", got)
+	}
+	if !strings.Contains(got, workspaceHygieneSentinel) {
+		t.Errorf("slim fix-up prompt missing the workspace-hygiene contract sentinel\n---\n%s", got)
+	}
+}
+
+// TestBuild_Implement_WorkspaceHygiene_LanguageAgnostic is the Done-means guard:
+// the shipped wording must name NO toolchain-specific command, so the contract
+// holds across languages. The blocklist is keyed on command-shaped tokens (e.g.
+// `go build`, `pip install`) rather than the bare word "compile", so the
+// wording's own "compiled artifacts" does not self-trip.
+func TestBuild_Implement_WorkspaceHygiene_LanguageAgnostic(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		IssueNumber:  1610,
+		ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// Isolate the hygiene paragraph so the blocklist scans the contract wording
+	// itself, not unrelated prompt text.
+	start := strings.Index(got, "### Workspace hygiene")
+	if start < 0 {
+		t.Fatalf("workspace-hygiene section absent\n---\n%s", got)
+	}
+	section := got[start:]
+	if end := strings.Index(section[len("### Workspace hygiene"):], "\n### "); end >= 0 {
+		section = section[:len("### Workspace hygiene")+end]
+	}
+
+	banned := []string{
+		"go build", "go install", "go test",
+		"cargo", "npm", "yarn", "pnpm",
+		"make", "gcc", "clang", "javac", "mvn", "gradle",
+		"pip install", "python", "rustc", "tsc", "webpack",
+	}
+	lower := strings.ToLower(section)
+	for _, tok := range banned {
+		if strings.Contains(lower, tok) {
+			t.Errorf("workspace-hygiene wording leaks toolchain-specific command %q — must stay language-agnostic:\n%s", tok, section)
+		}
+	}
+}
+
 func TestBuild_PlanReview_ContainsVerdictSchema(t *testing.T) {
 	got, err := Build("plan_review", Trigger{
 		IssueNumber:  42,
