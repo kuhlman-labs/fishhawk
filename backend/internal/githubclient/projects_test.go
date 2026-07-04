@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -304,8 +305,8 @@ func TestAddSubIssue(t *testing.T) {
 func TestListSubIssues_PopulatedMapsNodes(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.graphqlByOp["ListSubIssues"] = `{"data":{"node":{"subIssues":{"nodes":[
-		{"number":41,"title":"slice A","body":"## Summary","id":"N41"},
-		{"number":42,"title":"slice B","body":"Depends on: #41","id":"N42"}
+		{"number":41,"title":"slice A","body":"## Summary","id":"N41","labels":{"nodes":[{"name":"autonomy:low"},{"name":"area:server"}]}},
+		{"number":42,"title":"slice B","body":"Depends on: #41","id":"N42","labels":{"nodes":[]}}
 	]}}}}`
 	subs, err := c.ListSubIssues(context.Background(), 7, "EPIC_NODE")
 	if err != nil {
@@ -319,6 +320,16 @@ func TestListSubIssues_PopulatedMapsNodes(t *testing.T) {
 	}
 	if subs[1].Body != "Depends on: #41" {
 		t.Errorf("subs[1].Body = %q", subs[1].Body)
+	}
+	// The labels connection is mapped onto SubIssue.Labels so the campaign
+	// source can derive each child's autonomy tier (#1551). An empty labels
+	// connection yields a nil/empty slice.
+	wantLabels := []string{"autonomy:low", "area:server"}
+	if !reflect.DeepEqual(subs[0].Labels, wantLabels) {
+		t.Errorf("subs[0].Labels = %v, want %v", subs[0].Labels, wantLabels)
+	}
+	if len(subs[1].Labels) != 0 {
+		t.Errorf("subs[1].Labels = %v, want empty", subs[1].Labels)
 	}
 	if vars := pf.gotGraphQLVars["ListSubIssues"]; vars["parentId"] != "EPIC_NODE" {
 		t.Errorf("vars = %+v, want parentId=EPIC_NODE", vars)

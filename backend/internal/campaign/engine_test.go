@@ -108,6 +108,37 @@ func TestNextEligible_PausedBucketed(t *testing.T) {
 	}
 }
 
+// TestNextEligible_AutonomyAware is the engine done-means-named test (#1551): an
+// eligible autonomy:low (human-led) item is routed into HumanLed — NOT Eligible —
+// while a medium sibling and an unlabeled sibling stay Eligible; and a human-led
+// item with an UNSATISFIED dependency stays Blocked (never HumanLed), exactly as
+// before. This proves human-led items are excluded from the auto-dispatchable set
+// (which the driver keys on) without stalling DAG-independent autonomous work.
+func TestNextEligible_AutonomyAware(t *testing.T) {
+	items := []*campaign.Item{
+		{IssueRef: "issue:1", State: campaign.ItemStateSucceeded},                                                // done (a dep target)
+		{IssueRef: "issue:2", State: campaign.ItemStatePending, Autonomy: "low"},                                 // eligible-but-human-led → HumanLed
+		{IssueRef: "issue:3", State: campaign.ItemStatePending, Autonomy: "medium"},                              // eligible (agent-drivable)
+		{IssueRef: "issue:4", State: campaign.ItemStatePending},                                                  // eligible (unlabeled → agent-drivable)
+		{IssueRef: "issue:5", State: campaign.ItemStatePending, Autonomy: "low", DependsOn: []string{"issue:6"}}, // human-led + unmet dep → Blocked
+		{IssueRef: "issue:6", State: campaign.ItemStatePending},                                                  // eligible (blocks issue:5)
+	}
+	got := campaign.NextEligible(items)
+
+	if !reflect.DeepEqual(got.HumanLed, []string{"issue:2"}) {
+		t.Errorf("human_led = %v, want [issue:2]", got.HumanLed)
+	}
+	// issue:3 (medium), issue:4 (unlabeled), issue:6 (unlabeled) stay eligible;
+	// the human-led issue:2 must NOT appear here.
+	if !reflect.DeepEqual(got.Eligible, []string{"issue:3", "issue:4", "issue:6"}) {
+		t.Errorf("eligible = %v, want [issue:3 issue:4 issue:6] (human-led issue:2 excluded)", got.Eligible)
+	}
+	// issue:5 is human-led but its dep is unmet → Blocked wins over HumanLed.
+	if !reflect.DeepEqual(got.Blocked, []string{"issue:5"}) {
+		t.Errorf("blocked = %v, want [issue:5] (unmet-dep human-led stays Blocked)", got.Blocked)
+	}
+}
+
 // TestDeriveState exercises one assertion per derived branch: pending,
 // running, succeeded, failed. StateCancelled/StatePaused are operator overlays
 // and are intentionally never derived.

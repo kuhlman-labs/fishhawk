@@ -55,6 +55,77 @@ func TestAssemble_MultiWaveDAG(t *testing.T) {
 	}
 }
 
+// TestAssemble_SourcesAutonomyOntoItem asserts EpicChild.Autonomy flows onto the
+// AssembledItem so the sourced tier is carried into persistence (#1551).
+func TestAssemble_SourcesAutonomyOntoItem(t *testing.T) {
+	res := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 41, Autonomy: "low"},
+			{Number: 42, Autonomy: "medium"},
+			{Number: 43}, // no autonomy label → ""
+		},
+	}
+	a, err := campaign.Assemble("issue:40", res)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	want := map[string]string{"issue:41": "low", "issue:42": "medium", "issue:43": ""}
+	for _, it := range a.Items {
+		if it.Autonomy != want[it.IssueRef] {
+			t.Errorf("item %s autonomy = %q, want %q", it.IssueRef, it.Autonomy, want[it.IssueRef])
+		}
+	}
+}
+
+// TestPersist_SourcesAndPersistsAutonomy is the BINDING seam test (approval
+// condition #2): starting from EpicChildren carrying autonomy labels, Assemble →
+// Persist must write EpicChild.Autonomy end-to-end into campaign_items.autonomy.
+// It reads the rows back from the Repository and asserts the persisted tier — not
+// merely a CreateCampaignItem round-trip — satisfying the
+// autonomy-sourced-and-persisted-from-issue-label criterion.
+func TestPersist_SourcesAndPersistsAutonomy(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	res := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 41, Autonomy: "low"},    // human-led
+			{Number: 42, Autonomy: "medium"}, // agent-drivable
+			{Number: 43},                     // unlabeled → ""
+		},
+	}
+	a, err := campaign.Assemble("issue:1528", res)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	c, err := campaign.Persist(ctx, repo, "kuhlman-labs/fishhawk", a)
+	if err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+
+	items, err := repo.ListCampaignItemsForCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("ListCampaignItemsForCampaign: %v", err)
+	}
+	wantAutonomy := map[string]string{"issue:41": "low", "issue:42": "medium", "issue:43": ""}
+	if len(items) != 3 {
+		t.Fatalf("persisted %d items, want 3", len(items))
+	}
+	for _, it := range items {
+		if it.Autonomy != wantAutonomy[it.IssueRef] {
+			t.Errorf("persisted item %s autonomy = %q, want %q", it.IssueRef, it.Autonomy, wantAutonomy[it.IssueRef])
+		}
+	}
+	// The low item reads back human-led — the eligibility engine will route it
+	// out of Eligible.
+	for _, it := range items {
+		if it.IssueRef == "issue:41" && !campaign.IsHumanLed(it.Autonomy) {
+			t.Errorf("issue:41 persisted autonomy %q not human-led", it.Autonomy)
+		}
+	}
+}
+
 // TestAssemble_CycleRejected asserts a cyclic depends_on graph fails closed
 // with ErrCycle.
 func TestAssemble_CycleRejected(t *testing.T) {

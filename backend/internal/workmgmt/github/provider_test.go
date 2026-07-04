@@ -404,6 +404,54 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 	}
 }
 
+// TestProvider_EpicChildren_SourcesAutonomy asserts EpicChildren derives each
+// child's autonomy tier from its issue labels (#1551): an `autonomy:low` label
+// yields "low", a child with no autonomy label yields "" (agent-drivable — the
+// unchanged default), and a non-autonomy label is ignored.
+func TestProvider_EpicChildren_SourcesAutonomy(t *testing.T) {
+	api := &fakeAPI{
+		parentNode: "EPIC_NODE",
+		listSubResults: []githubclient.SubIssue{
+			{Number: 41, NodeID: "N41", Title: "human-led slice", Labels: []string{"area:server", "autonomy:low"}},
+			{Number: 42, NodeID: "N42", Title: "agent slice", Labels: []string{"autonomy:medium"}},
+			{Number: 43, NodeID: "N43", Title: "unlabeled slice", Labels: []string{"type:feature"}},
+		},
+	}
+	res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+		Target: workmgmt.Target{InstallationID: 99, Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Epic:   "#1005",
+	})
+	if err != nil {
+		t.Fatalf("EpicChildren: %v", err)
+	}
+	want := map[int]string{41: "low", 42: "medium", 43: ""}
+	for _, c := range res.Children {
+		if c.Autonomy != want[c.Number] {
+			t.Errorf("child #%d autonomy = %q, want %q", c.Number, c.Autonomy, want[c.Number])
+		}
+	}
+}
+
+// TestAutonomyFromLabels covers the label→tier helper directly, including the
+// no-label (empty) and first-match branches.
+func TestAutonomyFromLabels(t *testing.T) {
+	cases := []struct {
+		labels []string
+		want   string
+	}{
+		{[]string{"autonomy:low"}, "low"},
+		{[]string{"area:server", "autonomy:high"}, "high"},
+		{[]string{"type:feature", "area:server"}, ""},
+		{nil, ""},
+		{[]string{"autonomy:medium", "autonomy:high"}, "medium"}, // first match wins
+	}
+	for _, tc := range cases {
+		if got := autonomyFromLabels(tc.labels); got != tc.want {
+			t.Errorf("autonomyFromLabels(%v) = %q, want %q", tc.labels, got, tc.want)
+		}
+	}
+}
+
 // TestProvider_EpicChildren_FailClosed covers the defensive branches: a nil
 // API, a missing repo, a zero installation, a malformed epic ref, and a
 // ListSubIssues error each return an error rather than a partial result.

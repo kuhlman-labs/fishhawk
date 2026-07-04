@@ -50,3 +50,27 @@ func TestItemState_IsTerminal(t *testing.T) {
 		})
 	}
 }
+
+// TestIsHumanLed table-tests the autonomy→human-led mapping (#1551): only the
+// low tier is human-led (METHODOLOGY.md "Low autonomy (human-led)"); every other
+// tier — including the empty/unlabeled default — is agent-drivable so a
+// would-be-eligible item stays auto-dispatchable.
+func TestIsHumanLed(t *testing.T) {
+	cases := []struct {
+		autonomy string
+		want     bool
+	}{
+		{"low", true},
+		{"medium", false},
+		{"high", false},
+		{"", false}, // unlabeled → agent-drivable (unchanged default)
+		{"bogus", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.autonomy, func(t *testing.T) {
+			if got := IsHumanLed(tc.autonomy); got != tc.want {
+				t.Errorf("IsHumanLed(%q) = %v, want %v", tc.autonomy, got, tc.want)
+			}
+		})
+	}
+}

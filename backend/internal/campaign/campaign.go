@@ -183,6 +183,13 @@ type Item struct {
 	// preserving campaign history.
 	RunID *uuid.UUID
 	State ItemState
+	// Autonomy is the item's autonomy tier, sourced from the issue's
+	// `autonomy:<tier>` label at assembly ("low"/"medium"/"high", empty when the
+	// issue carries no autonomy label). It is the tier NextEligible consults to
+	// route a human-led (autonomy:low) item out of the auto-dispatchable set so
+	// the auto-driver never mints an agent run for a change METHODOLOGY.md
+	// reserves for human leadership (#1551). Persisted on campaign_items.autonomy.
+	Autonomy string
 	// PauseReason carries why a paused item was handed off to a human. Nil
 	// unless the item is (or was) paused. Persisted as JSONB.
 	PauseReason *PauseReason

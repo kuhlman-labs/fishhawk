@@ -489,6 +489,42 @@ func TestTick_StartPath(t *testing.T) {
 	}
 }
 
+// TestTick_StartPath_SkipsHumanLed asserts the driver's START pass keys on
+// elig.Eligible, so an eligible-but-human-led (autonomy:low) item is NOT started
+// while an autonomous sibling in the same campaign IS — the "human-led items are
+// never auto-dispatched, autonomous DAG-independent work keeps starting" contract
+// (#1551). No code change to the driver: NextEligible routes the human-led item
+// out of Eligible, and start() only dispatches Eligible.
+func TestTick_StartPath_SkipsHumanLed(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	human := store.seedItem(c, "issue:1532", campaign.ItemStatePending, nil, nil)
+	human.Autonomy = "low"
+	auto := store.seedItem(c, "issue:1533", campaign.ItemStatePending, nil, nil)
+	auto.Autonomy = "medium"
+	reader := newFakeRunReader()
+	starter := &fakeStarter{reader: reader}
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, starter, au, 4)
+
+	tk.Tick(context.Background())
+
+	// Only the autonomous item was started.
+	if len(starter.calls) != 1 || starter.calls[0] != auto.ID {
+		t.Fatalf("expected one start for autonomous item %s, got %v", auto.ID, starter.calls)
+	}
+	if human.State != campaign.ItemStatePending || human.RunID != nil {
+		t.Fatalf("human-led item was dispatched: state=%s runID=%v, want pending/nil", human.State, human.RunID)
+	}
+	if auto.State != campaign.ItemStateRunning {
+		t.Fatalf("autonomous item state = %s, want running", auto.State)
+	}
+	started := au.byCategory(categoryCampaignIssueStarted)
+	if len(started) != 1 || started[0].payload["issue_ref"] != "issue:1533" {
+		t.Fatalf("started audit = %+v, want single issue:1533", started)
+	}
+}
+
 // --- (e) ADVANCE PATH (settle + campaign advance) ---------------------------
 
 func TestTick_AdvancePath_SettlesAndAdvancesCampaign(t *testing.T) {

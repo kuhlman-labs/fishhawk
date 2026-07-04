@@ -34,6 +34,25 @@ type Eligibility struct {
 	// for Running. It is never re-dispatched until a resume flips it back to
 	// running.
 	Paused []string
+	// HumanLed items have no run yet and every dependency satisfied — they would
+	// be Eligible — but their autonomy tier is human-led (autonomy:low), a change
+	// METHODOLOGY.md reserves for human authorship. They are routed here INSTEAD
+	// of Eligible so the auto-driver (which dispatches only Eligible) never mints
+	// an agent run for them, while a human is paged to lead/author the work
+	// (#1551). A human-led item with an UNSATISFIED dependency stays Blocked,
+	// exactly as before — only a would-be-eligible human-led item lands here.
+	HumanLed []string
+}
+
+// IsHumanLed reports whether an autonomy tier is human-led — the low tier, which
+// docs/METHODOLOGY.md ("Low autonomy (human-led)") reserves for human authorship
+// and review. It is the single authoritative mapping consulted by NextEligible
+// (to keep a human-led item out of the auto-dispatchable Eligible set) and by the
+// server's next_action rung. Every other tier (empty/medium/high) is
+// agent-drivable and returns false, so an item with no autonomy label is treated
+// as auto-dispatchable — the unchanged pre-#1551 behavior.
+func IsHumanLed(autonomy string) bool {
+	return autonomy == "low"
 }
 
 // NextEligible partitions a campaign's items into eligible / blocked /
@@ -83,11 +102,18 @@ func NextEligible(items []*Item) Eligibility {
 			e.Running = append(e.Running, ref)
 		default:
 			// Not yet run (RunID nil, state pending/blocked). Eligible only
-			// when every dependency has succeeded.
-			if depsSatisfied(it.DependsOn, done) {
-				e.Eligible = append(e.Eligible, ref)
-			} else {
+			// when every dependency has succeeded. A would-be-eligible item whose
+			// autonomy tier is human-led (autonomy:low) is routed to HumanLed
+			// instead of Eligible so the auto-driver never dispatches it (#1551);
+			// a human-led item with an unsatisfied dependency stays Blocked exactly
+			// as before.
+			switch {
+			case !depsSatisfied(it.DependsOn, done):
 				e.Blocked = append(e.Blocked, ref)
+			case IsHumanLed(it.Autonomy):
+				e.HumanLed = append(e.HumanLed, ref)
+			default:
+				e.Eligible = append(e.Eligible, ref)
 			}
 		}
 	}

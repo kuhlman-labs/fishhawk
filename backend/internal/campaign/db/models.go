@@ -75,6 +75,7 @@ type CampaignItem struct {
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 	PauseReason []byte             `json:"pause_reason"`
+	Autonomy    string             `json:"autonomy"`
 }
 
 type McpToken struct {

@@ -30,8 +30,13 @@ func (f *fakeProvider) Transition(_ context.Context, req TransitionRequest) (*Tr
 func (f *fakeProvider) EpicChildren(_ context.Context, req EpicChildrenRequest) (*EpicChildrenResult, error) {
 	f.gotEpic = req
 	return &EpicChildrenResult{
-		Children: []EpicChild{{Number: 41, Title: "slice A"}, {Number: 42, Title: "slice B"}},
-		Edges:    []DependsEdge{{From: 42, To: 41}},
+		// Slice A is human-led (autonomy:low), slice B agent-drivable — the
+		// EpicChild.Autonomy tier the campaign source threads onto items (#1551).
+		Children: []EpicChild{
+			{Number: 41, Title: "slice A", Autonomy: "low"},
+			{Number: 42, Title: "slice B", Autonomy: "medium"},
+		},
+		Edges: []DependsEdge{{From: 42, To: 41}},
 	}, nil
 }
 
@@ -151,6 +156,10 @@ func TestRegistry_DispatchEpicChildren(t *testing.T) {
 	}
 	if len(res.Children) != 2 || res.Children[0].Number != 41 {
 		t.Errorf("children = %+v", res.Children)
+	}
+	// The EpicChild carries the autonomy tier the campaign source consumes (#1551).
+	if res.Children[0].Autonomy != "low" || res.Children[1].Autonomy != "medium" {
+		t.Errorf("children autonomy = %q,%q, want low,medium", res.Children[0].Autonomy, res.Children[1].Autonomy)
 	}
 	if len(res.Edges) != 1 || res.Edges[0] != (DependsEdge{From: 42, To: 41}) {
 		t.Errorf("edges = %+v", res.Edges)

@@ -529,7 +529,7 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 	children := make([]workmgmt.EpicChild, 0, len(subs))
 	var edges, dropped []workmgmt.DependsEdge
 	for _, s := range subs {
-		children = append(children, workmgmt.EpicChild{Number: s.Number, Title: s.Title})
+		children = append(children, workmgmt.EpicChild{Number: s.Number, Title: s.Title, Autonomy: autonomyFromLabels(s.Labels)})
 		for _, dep := range parseDependsOnMarker(s.Body) {
 			if isChild[dep] {
 				edges = append(edges, workmgmt.DependsEdge{From: s.Number, To: dep})
@@ -630,6 +630,23 @@ func parseDependsOnMarker(body string) []int {
 		nums = append(nums, n)
 	}
 	return nums
+}
+
+// autonomyLabelPrefix is the required autonomy label namespace
+// (workmgmt.RequiredLabelNamespaces): an issue carries its autonomy tier as the
+// label `autonomy:<tier>` (e.g. `autonomy:low`). autonomyFromLabels returns the
+// <tier> of the FIRST such label, or "" when no autonomy label is present. It is
+// the single source that turns a child's label set into the EpicChild.Autonomy
+// tier the campaign eligibility engine keys on (#1551).
+const autonomyLabelPrefix = "autonomy:"
+
+func autonomyFromLabels(labels []string) string {
+	for _, l := range labels {
+		if strings.HasPrefix(l, autonomyLabelPrefix) {
+			return strings.TrimPrefix(l, autonomyLabelPrefix)
+		}
+	}
+	return ""
 }
 
 // parseIssueRef parses "#123" or "123" into the issue number.

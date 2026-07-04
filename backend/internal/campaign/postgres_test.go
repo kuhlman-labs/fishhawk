@@ -294,6 +294,68 @@ func TestPostgres_CampaignItem_RoundTripAndDependsOn(t *testing.T) {
 	}
 }
 
+// TestPostgres_CampaignItem_AutonomyRoundTrip is the fail-closed / default-value
+// done-means for the autonomy column (#1551): an item persisted with
+// autonomy:low reads back human-led, an unlabeled item reads back "" (the DEFAULT
+// ” — agent-drivable, the unchanged default), a medium item reads back its tier,
+// and the CHECK constraint rejects a garbage tier at insert.
+func TestPostgres_CampaignItem_AutonomyRoundTrip(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+	c := makeCampaign(t, repo)
+
+	// low → persisted and read back as human-led.
+	low, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID, IssueRef: "issue:1532", Autonomy: "low",
+	})
+	if err != nil {
+		t.Fatalf("create low item: %v", err)
+	}
+	if low.Autonomy != "low" || !campaign.IsHumanLed(low.Autonomy) {
+		t.Errorf("low item autonomy = %q (human-led=%v), want low/true", low.Autonomy, campaign.IsHumanLed(low.Autonomy))
+	}
+	got, err := repo.GetCampaignItem(ctx, low.ID)
+	if err != nil {
+		t.Fatalf("get low item: %v", err)
+	}
+	if got.Autonomy != "low" {
+		t.Errorf("low item autonomy read-back = %q, want low", got.Autonomy)
+	}
+
+	// Unlabeled (omitted) → DEFAULT '' — not human-led.
+	bare, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID, IssueRef: "issue:1533",
+	})
+	if err != nil {
+		t.Fatalf("create bare item: %v", err)
+	}
+	if bare.Autonomy != "" || campaign.IsHumanLed(bare.Autonomy) {
+		t.Errorf("bare item autonomy = %q (human-led=%v), want ''/false", bare.Autonomy, campaign.IsHumanLed(bare.Autonomy))
+	}
+
+	// medium → agent-drivable, not human-led.
+	med, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID, IssueRef: "issue:1534", Autonomy: "medium",
+	})
+	if err != nil {
+		t.Fatalf("create medium item: %v", err)
+	}
+	if med.Autonomy != "medium" || campaign.IsHumanLed(med.Autonomy) {
+		t.Errorf("medium item autonomy = %q (human-led=%v), want medium/false", med.Autonomy, campaign.IsHumanLed(med.Autonomy))
+	}
+
+	// A garbage tier violates campaign_items_autonomy_check — the fail-closed
+	// CHECK. Written via raw SQL because the repo path never produces a bad tier.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO campaign_items (id, campaign_id, issue_ref, state, autonomy)
+		 VALUES ($1, $2, 'issue:9999', 'pending', 'bogus')`,
+		uuid.New(), c.ID,
+	); err == nil {
+		t.Error("insert with garbage autonomy tier succeeded, want campaign_items_autonomy_check violation")
+	}
+}
+
 // TestPostgres_CampaignItem_MalformedDependsOn_Tolerated asserts the
 // rowToCampaignItem tolerance branch: a depends_on payload that is valid
 // JSONB but not a []string (so json.Unmarshal into []string fails) is
