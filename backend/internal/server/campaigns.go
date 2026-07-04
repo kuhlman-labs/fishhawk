@@ -1056,56 +1056,70 @@ func firstUnmetDependency(item *campaign.Item, items []*campaign.Item) (string, 
 	return "", false
 }
 
-// reconcileCampaignItemsOnRead settles any running item whose linked run reached
-// a terminal run state and re-derives the campaign (E26.2 / #1481), mirroring
-// the campaigndriver ADVANCE pass exactly. It returns whether it settled
-// anything so the caller can re-read the fresh item + campaign state.
+// reconcileCampaignItemsOnRead settles campaign items out of band and re-derives
+// the campaign (E26.2 / #1481), mirroring the campaigndriver ADVANCE pass. It
+// returns whether it settled anything so the caller can re-read the fresh item +
+// campaign state. Two passes run:
+//
+//  1. RUN-LINKED terminal settle: a running item whose linked run reached a
+//     terminal run state settles to the mapped item-terminal state. No-ops when
+//     no run repository is wired (the local-native trigger needs run state).
+//  2. RUN-LESS issue-closed settle (#1558): a run-less, deps-satisfied item whose
+//     GitHub issue is closed-as-completed settles succeeded — a human-led item
+//     that merged and closed OUTSIDE the run lifecycle, which pass 1 can never
+//     see because it has no linked run. See settleIssueClosedItems.
 //
 // It is BEST-EFFORT and NEVER fails the read: every error is logged and
 // swallowed. It is IDEMPOTENT: the item/campaign transitions go through the
 // campaign repo's state-guarded SELECT FOR UPDATE transitions, so a concurrent
 // re-poll cannot double-transition — a second pass over an already-settled item
-// is a no-op (its state is no longer running) and emits nothing. No-ops when no
-// run repository is wired (the local-native trigger needs to read run state).
+// is a no-op (its state is no longer running/pending) and emits nothing.
 func (s *Server) reconcileCampaignItemsOnRead(ctx context.Context, c *campaign.Campaign, items []*campaign.Item) bool {
-	if s.cfg.RunRepo == nil {
-		return false
-	}
 	settledAny := false
-	for _, it := range items {
-		if it.State != campaign.ItemStateRunning || it.RunID == nil {
-			continue
+	// Pass 1: run-linked terminal settle. Needs a run repository to read run
+	// state; skipped when unwired (the run-less pass 2 below is independent).
+	if s.cfg.RunRepo != nil {
+		for _, it := range items {
+			if it.State != campaign.ItemStateRunning || it.RunID == nil {
+				continue
+			}
+			runRow, err := s.cfg.RunRepo.GetRun(ctx, *it.RunID)
+			if err != nil {
+				s.cfg.Logger.Warn("reconcile-on-read: get linked run failed; item left running",
+					"campaign_id", c.ID.String(), "item_id", it.ID.String(), "run_id", it.RunID.String(), "error", err.Error())
+				continue
+			}
+			if !runRow.State.IsTerminal() {
+				continue
+			}
+			target, ok := mapRunTerminalToItemState(runRow.State)
+			if !ok {
+				s.cfg.Logger.Warn("reconcile-on-read: unmapped terminal run state; item left running",
+					"campaign_id", c.ID.String(), "item_id", it.ID.String(), "run_state", string(runRow.State))
+				continue
+			}
+			if !campaign.ValidCampaignItemTransition(it.State, target) {
+				continue
+			}
+			if _, err := s.cfg.CampaignRepo.TransitionCampaignItem(ctx, it.ID, target); err != nil {
+				s.cfg.Logger.Warn("reconcile-on-read: settle item transition failed; left for next read",
+					"campaign_id", c.ID.String(), "item_id", it.ID.String(), "target", string(target), "error", err.Error())
+				continue
+			}
+			settledAny = true
+			s.emitCampaignAudit(ctx, categoryCampaignIssueSettled, map[string]any{
+				"campaign_id": c.ID.String(),
+				"issue_ref":   it.IssueRef,
+				"run_id":      it.RunID.String(),
+				"outcome":     string(target),
+			})
 		}
-		runRow, err := s.cfg.RunRepo.GetRun(ctx, *it.RunID)
-		if err != nil {
-			s.cfg.Logger.Warn("reconcile-on-read: get linked run failed; item left running",
-				"campaign_id", c.ID.String(), "item_id", it.ID.String(), "run_id", it.RunID.String(), "error", err.Error())
-			continue
-		}
-		if !runRow.State.IsTerminal() {
-			continue
-		}
-		target, ok := mapRunTerminalToItemState(runRow.State)
-		if !ok {
-			s.cfg.Logger.Warn("reconcile-on-read: unmapped terminal run state; item left running",
-				"campaign_id", c.ID.String(), "item_id", it.ID.String(), "run_state", string(runRow.State))
-			continue
-		}
-		if !campaign.ValidCampaignItemTransition(it.State, target) {
-			continue
-		}
-		if _, err := s.cfg.CampaignRepo.TransitionCampaignItem(ctx, it.ID, target); err != nil {
-			s.cfg.Logger.Warn("reconcile-on-read: settle item transition failed; left for next read",
-				"campaign_id", c.ID.String(), "item_id", it.ID.String(), "target", string(target), "error", err.Error())
-			continue
-		}
+	}
+	// Pass 2: run-less issue-closed settle (#1558). Independent of the run
+	// repository — it reads GitHub issue state — so it runs even when RunRepo is
+	// unwired. Uses the item states as they stand after pass 1.
+	if s.settleIssueClosedItems(ctx, c, items) {
 		settledAny = true
-		s.emitCampaignAudit(ctx, categoryCampaignIssueSettled, map[string]any{
-			"campaign_id": c.ID.String(),
-			"issue_ref":   it.IssueRef,
-			"run_id":      it.RunID.String(),
-			"outcome":     string(target),
-		})
 	}
 	if !settledAny {
 		return false
@@ -1120,6 +1134,122 @@ func (s *Server) reconcileCampaignItemsOnRead(ctx context.Context, c *campaign.C
 				"campaign_id", c.ID.String(), "error", err.Error())
 		} else {
 			s.deriveCampaignAfterChange(ctx, c, refreshed)
+		}
+	}
+	return true
+}
+
+// settleIssueClosedItems is reconcile-on-read pass 2 (#1558): the run-less,
+// out-of-band settle for a campaign item completed OUTSIDE the run lifecycle —
+// a human-led (autonomy:low) issue merged and closed by a maintainer PR. For a
+// run-less item whose dependencies are satisfied, it reads the item's GitHub
+// issue and settles the item succeeded ONLY when the issue is CLOSED as
+// completed (state_reason=completed), emitting a campaign_issue_settled marker
+// tagged settled_via=issue_closed and carrying NO run_id. Returns whether it
+// settled anything so the caller re-derives and re-reads.
+//
+// BEST-EFFORT and FAIL-CLOSED: every guard leaves the item unsettled and NEVER
+// fails the read — a nil GitHub client, a repo not in owner/name form, an
+// installation-resolution error, a GetIssue error, an unparseable issue_ref, an
+// open issue, or a not_planned closure each logs (where useful) and skips. The
+// repo installation is resolved at most ONCE per reconcile (lazily, only when a
+// candidate item exists) and cached across items; the pass short-circuits
+// entirely when GitHub is unwired.
+func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaign, items []*campaign.Item) bool {
+	if s.cfg.GitHub == nil {
+		return false
+	}
+	owner, name, ok := splitRepoFullName(c.Repo)
+	if !ok {
+		s.cfg.Logger.Warn("reconcile-on-read: campaign repo not in owner/name form; run-less settle pass skipped",
+			"campaign_id", c.ID.String(), "repo", c.Repo)
+		return false
+	}
+
+	// Done-set: refs of items that have succeeded (the firstUnmetDependency /
+	// NextEligible idiom). A dependency is satisfied iff its ref is in this set;
+	// an absent ref is therefore not-satisfied for free. Computed once, single-
+	// hop within this read — a chain of run-less items converges over successive
+	// polls, which the operator already drives.
+	done := make(map[string]bool, len(items))
+	for _, it := range items {
+		if it.State == campaign.ItemStateSucceeded {
+			done[it.IssueRef] = true
+		}
+	}
+
+	settledAny := false
+	var instID int64
+	instResolved := false
+	for _, it := range items {
+		// Only a run-less item in a settleable pending/blocked state is a
+		// candidate — a linked or terminal item is pass 1's or already settled.
+		if it.RunID != nil {
+			continue
+		}
+		if it.State != campaign.ItemStatePending && it.State != campaign.ItemStateBlocked {
+			continue
+		}
+		// DAG ordering: an out-of-dependency-order human-merge (a dependency not
+		// yet satisfied) is deliberately NOT settled, preserving wave order.
+		if !depsSatisfiedRefs(it.DependsOn, done) {
+			continue
+		}
+		number, ok := parseIssueTriggerRef(it.IssueRef)
+		if !ok {
+			// A non issue:N ref (e.g. a Jira key) has no GitHub issue to read.
+			continue
+		}
+		// Resolve the installation lazily on the first candidate, then reuse it.
+		if !instResolved {
+			id, err := s.cfg.GitHub.GetRepoInstallation(ctx, githubclient.RepoRef{Owner: owner, Name: name})
+			if err != nil {
+				s.cfg.Logger.Warn("reconcile-on-read: resolve installation failed; run-less settle pass skipped",
+					"campaign_id", c.ID.String(), "repo", c.Repo, "error", err.Error())
+				return settledAny
+			}
+			instID = id
+			instResolved = true
+		}
+		issue, err := s.cfg.GitHub.GetIssue(ctx, instID, githubclient.RepoRef{Owner: owner, Name: name}, number)
+		if err != nil {
+			s.cfg.Logger.Warn("reconcile-on-read: get issue failed; item left unsettled",
+				"campaign_id", c.ID.String(), "item_id", it.ID.String(), "issue_ref", it.IssueRef, "error", err.Error())
+			continue
+		}
+		// Settle ONLY a genuine completion: closed AND state_reason=completed. An
+		// open issue or a not_planned closure is left unsettled.
+		if issue.State != "closed" || issue.StateReason != "completed" {
+			continue
+		}
+		if !campaign.ValidCampaignItemTransition(it.State, campaign.ItemStateSucceeded) {
+			continue
+		}
+		if _, err := s.cfg.CampaignRepo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateSucceeded); err != nil {
+			s.cfg.Logger.Warn("reconcile-on-read: run-less settle transition failed; left for next read",
+				"campaign_id", c.ID.String(), "item_id", it.ID.String(), "error", err.Error())
+			continue
+		}
+		settledAny = true
+		s.emitCampaignAudit(ctx, categoryCampaignIssueSettled, map[string]any{
+			"campaign_id":  c.ID.String(),
+			"issue_ref":    it.IssueRef,
+			"outcome":      string(campaign.ItemStateSucceeded),
+			"settled_via":  "issue_closed",
+			"state_reason": "completed",
+		})
+	}
+	return settledAny
+}
+
+// depsSatisfiedRefs reports whether every dep ref is in the done set. An empty
+// dep list is trivially satisfied; an absent ref is not-satisfied. Mirrors the
+// campaign engine's depsSatisfied (unexported there) for the run-less settle
+// pass's DAG-order gate.
+func depsSatisfiedRefs(deps []string, done map[string]bool) bool {
+	for _, d := range deps {
+		if !done[d] {
+			return false
 		}
 	}
 	return true

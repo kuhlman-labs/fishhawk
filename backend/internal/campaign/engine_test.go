@@ -200,3 +200,54 @@ func TestDeriveState(t *testing.T) {
 		})
 	}
 }
+
+// TestNextEligible_RunlessSucceededUnblocksDependents is the #1558 pure-engine
+// pin for run-less out-of-band settlement: a human-led item settled succeeded
+// WITHOUT a run (RunID nil) — its issue closed-as-completed and settled by the
+// reconcile-on-read pass — must be reported in Done, and its dependent whose
+// only unmet dependency was that item must move from Blocked to Eligible.
+// Proves the settlement unblocks descendants at the engine level, independent
+// of the GitHub-facing reconcile.
+func TestNextEligible_RunlessSucceededUnblocksDependents(t *testing.T) {
+	items := []*campaign.Item{
+		// A human-led item settled succeeded with NO run linkage.
+		item("issue:1", campaign.ItemStateSucceeded, nil),
+		// Its dependent — blocked until issue:1 succeeded, now eligible.
+		item("issue:2", campaign.ItemStatePending, nil, "issue:1"),
+	}
+	got := campaign.NextEligible(items)
+	if !reflect.DeepEqual(got.Done, []string{"issue:1"}) {
+		t.Errorf("done = %v, want [issue:1] (run-less succeeded still counts done)", got.Done)
+	}
+	if !reflect.DeepEqual(got.Eligible, []string{"issue:2"}) {
+		t.Errorf("eligible = %v, want [issue:2] (dependent unblocked by run-less predecessor)", got.Eligible)
+	}
+	if len(got.Blocked) != 0 {
+		t.Errorf("blocked = %v, want none", got.Blocked)
+	}
+}
+
+// TestDeriveState_RunlessMixedHumanLedDAG walks a mixed human-led DAG through
+// derivation (#1558): while some items remain unsettled the campaign reads
+// running (partial progress from a run-less succeeded item), and once every
+// item — including the run-less succeeded ones — is succeeded it reduces to
+// StateSucceeded. Together with the pending→succeeded transition edge this is
+// what lets an all-human-led campaign terminate without a single dispatch.
+func TestDeriveState_RunlessMixedHumanLedDAG(t *testing.T) {
+	// Partial: issue:1 settled run-less succeeded, issue:2 still pending.
+	partial := []*campaign.Item{
+		item("issue:1", campaign.ItemStateSucceeded, nil),
+		item("issue:2", campaign.ItemStatePending, nil, "issue:1"),
+	}
+	if got := campaign.DeriveState(partial); got != campaign.StateRunning {
+		t.Errorf("DeriveState(partial) = %q, want running (run-less succeeded is progress)", got)
+	}
+	// All settled run-less succeeded — the campaign reduces to succeeded.
+	allDone := []*campaign.Item{
+		item("issue:1", campaign.ItemStateSucceeded, nil),
+		item("issue:2", campaign.ItemStateSucceeded, nil, "issue:1"),
+	}
+	if got := campaign.DeriveState(allDone); got != campaign.StateSucceeded {
+		t.Errorf("DeriveState(allDone) = %q, want succeeded (all run-less settled)", got)
+	}
+}

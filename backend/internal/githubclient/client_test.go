@@ -823,6 +823,42 @@ func TestGetIssue_NoLabels(t *testing.T) {
 	}
 }
 
+// TestGetIssue_DecodesStateReason is the #1558 pin: GitHub's REST issue
+// payload carries `state_reason` (completed / not_planned / reopened) on a
+// closed issue; the campaign run-less settle pass gates on
+// State=="closed" AND StateReason=="completed". A closed-as-completed
+// issue must decode both fields.
+func TestGetIssue_DecodesStateReason(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getIssueBody = `{"number":42,"title":"done","state":"closed","state_reason":"completed"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.GetIssue(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 42)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if got.State != "closed" || got.StateReason != "completed" {
+		t.Errorf("state/state_reason = %q/%q, want closed/completed", got.State, got.StateReason)
+	}
+}
+
+// TestGetIssue_NoStateReason pins a payload with no state_reason to an empty
+// StateReason (an open issue, or an older payload) so the settle gate reads
+// "not completed" for free.
+func TestGetIssue_NoStateReason(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getIssueBody = `{"number":42,"title":"open","state":"open"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.GetIssue(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 42)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if got.StateReason != "" {
+		t.Errorf("state_reason = %q, want empty when absent", got.StateReason)
+	}
+}
+
 func TestGetIssue_NotFound(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	fg.getIssueStatus = http.StatusNotFound

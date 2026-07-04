@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -2642,5 +2644,375 @@ func TestStartCampaignItemRun_ReconcileOnRead_RelistError_StillReturns200(t *tes
 	// Derivation was skipped because its re-list failed → no advance emitted.
 	if n := aud.count("campaign_advanced"); n != 0 {
 		t.Errorf("campaign_advanced = %d, want 0 (re-list failed, derivation skipped)", n)
+	}
+}
+
+// --- run-less issue-closed settle pass (#1558) ---
+
+// runlessIssue is a configurable GitHub issue response for the run-less settle
+// pass tests: State/StateReason are echoed by the issues endpoint.
+type runlessIssue struct {
+	state       string
+	stateReason string
+}
+
+// runlessGitHub configures a GitHub stub serving GET .../installation and
+// GET .../issues/{number} for the run-less issue-closed settle pass. issues maps
+// issue number → response; issuesStatus, when non-zero, drives the issues
+// endpoint to that HTTP status (the GetIssue-error branch). installCalls /
+// issueCalls let a test assert the pass short-circuited (e.g. a non issue:N ref
+// makes no GitHub call at all).
+type runlessGitHub struct {
+	mu            sync.Mutex
+	installID     int64
+	installStatus int // when non-zero, the installation endpoint returns this status
+	issues        map[int]runlessIssue
+	issuesStatus  int
+	installCalls  int
+	issueCalls    int
+}
+
+func newRunlessGitHubClient(t *testing.T, gh *runlessGitHub) *githubclient.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{name}/installation", func(w http.ResponseWriter, _ *http.Request) {
+		gh.mu.Lock()
+		gh.installCalls++
+		id := gh.installID
+		status := gh.installStatus
+		gh.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if status != 0 {
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, `{"message":"boom"}`)
+			return
+		}
+		fmt.Fprintf(w, `{"id":%d}`, id)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{name}/issues/{number}", func(w http.ResponseWriter, r *http.Request) {
+		gh.mu.Lock()
+		gh.issueCalls++
+		status := gh.issuesStatus
+		num, _ := strconv.Atoi(r.PathValue("number"))
+		iss, known := gh.issues[num]
+		gh.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if status != 0 {
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, `{"message":"boom"}`)
+			return
+		}
+		if !known {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"message":"Not Found"}`)
+			return
+		}
+		fmt.Fprintf(w, `{"number":%d,"state":%q,"state_reason":%q}`, num, iss.state, iss.stateReason)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}
+}
+
+// settledAuditPayload decodes the first campaign_issue_settled audit payload the
+// recorder captured, so a test can assert the run-less variant's shape
+// (settled_via=issue_closed, no run_id).
+func settledAuditPayload(t *testing.T, aud *campaignAuditRecorder) map[string]any {
+	t.Helper()
+	aud.mu.Lock()
+	defer aud.mu.Unlock()
+	for _, e := range aud.entries {
+		if e.Category == categoryCampaignIssueSettled {
+			var p map[string]any
+			if err := json.Unmarshal(e.Payload, &p); err != nil {
+				t.Fatalf("decode settled payload: %v", err)
+			}
+			return p
+		}
+	}
+	t.Fatal("no campaign_issue_settled audit entry captured")
+	return nil
+}
+
+// TestReconcileOnRead_RunlessIssueClosed_SettlesAndUnblocks_E2E is the headline
+// cross-boundary path for the run-less settle (#1558): a run-less, deps-satisfied
+// item whose GitHub issue is closed-as-completed settles succeeded on a status
+// read, emits a campaign_issue_settled(settled_via=issue_closed, no run_id)
+// audit, and its dependent becomes eligible in the SAME response rollup +
+// next_action — GitHub issue state → item transition → engine rollup → next_action.
+func TestReconcileOnRead_RunlessIssueClosed_SettlesAndUnblocks_E2E(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "completed"},
+	}}
+	gh := newRunlessGitHubClient(t, ghState)
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: gh})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+		cItem("issue:101", []string{"issue:100"}, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if len(st.Rollup.Done) != 1 || st.Rollup.Done[0] != "issue:100" {
+		t.Errorf("rollup.Done = %v, want [issue:100] after run-less settle", st.Rollup.Done)
+	}
+	if len(st.Rollup.Eligible) != 1 || st.Rollup.Eligible[0] != "issue:101" {
+		t.Errorf("rollup.Eligible = %v, want [issue:101] (dependent unblocked)", st.Rollup.Eligible)
+	}
+	if st.NextAction.Action != "start_run" || st.NextAction.IssueRef != "issue:101" {
+		t.Errorf("next_action = %+v, want start_run issue:101", st.NextAction)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 1 {
+		t.Fatalf("campaign_issue_settled = %d, want 1", n)
+	}
+	// The run-less variant's payload: settled_via=issue_closed, state_reason,
+	// outcome succeeded, and NO run_id.
+	p := settledAuditPayload(t, aud)
+	if p["settled_via"] != "issue_closed" {
+		t.Errorf("settled_via = %v, want issue_closed", p["settled_via"])
+	}
+	if p["state_reason"] != "completed" {
+		t.Errorf("state_reason = %v, want completed", p["state_reason"])
+	}
+	if p["outcome"] != "succeeded" {
+		t.Errorf("outcome = %v, want succeeded", p["outcome"])
+	}
+	if _, ok := p["run_id"]; ok {
+		t.Errorf("payload carries run_id = %v, want absent for a run-less settle", p["run_id"])
+	}
+	// The dependent's dep was NOT satisfied when the pass computed its done-set,
+	// so only issue:100's issue was read (single-hop within one read).
+	if ghState.issueCalls != 1 {
+		t.Errorf("issueCalls = %d, want 1 (dependent skipped before GetIssue)", ghState.issueCalls)
+	}
+	if ghState.installCalls != 1 {
+		t.Errorf("installCalls = %d, want 1 (installation resolved once and cached)", ghState.installCalls)
+	}
+}
+
+// TestReconcileOnRead_RunlessAllHumanLed_CampaignSucceeds_E2E is the BINDING
+// condition (opus low): a fully run-less, ALL-human-led campaign whose every
+// item's issue is closed-as-completed rolls up to StateSucceeded through the GET
+// /status read path in ONE read — proving the new campaign pending→succeeded
+// edge terminates the campaign end-to-end with zero dispatched runs.
+func TestReconcileOnRead_RunlessAllHumanLed_CampaignSucceeds_E2E(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "completed"},
+		101: {state: "closed", stateReason: "completed"},
+	}}
+	gh := newRunlessGitHubClient(t, ghState)
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: gh})
+	// Two INDEPENDENT run-less items (no depends_on): both deps-satisfied against
+	// the initial done-set, so both settle in a single read.
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+		cItem("issue:101", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if len(st.Rollup.Done) != 2 {
+		t.Errorf("rollup.Done = %v, want both items done", st.Rollup.Done)
+	}
+	if st.Campaign.State != string(campaign.StateSucceeded) {
+		t.Errorf("campaign state = %q, want succeeded (pending→succeeded, run-less)", st.Campaign.State)
+	}
+	if st.NextAction.Action != "complete" {
+		t.Errorf("next_action = %+v, want complete", st.NextAction)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 2 {
+		t.Errorf("campaign_issue_settled = %d, want 2", n)
+	}
+	if n := aud.count("campaign_advanced"); n != 1 {
+		t.Errorf("campaign_advanced = %d, want 1 (pending→succeeded)", n)
+	}
+	if got := crepo.campaigns[c.ID].State; got != campaign.StateSucceeded {
+		t.Errorf("persisted campaign state = %q, want succeeded", got)
+	}
+}
+
+// TestReconcileOnRead_RunlessIssueOpen_NotSettled: an OPEN issue is not a
+// completion — the item is left unsettled and no settle audit is emitted.
+func TestReconcileOnRead_RunlessIssueOpen_NotSettled(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "open", stateReason: ""},
+	}}
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if len(st.Rollup.Done) != 0 {
+		t.Errorf("rollup.Done = %v, want empty (open issue not settled)", st.Rollup.Done)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 0 {
+		t.Errorf("campaign_issue_settled = %d, want 0 (open issue)", n)
+	}
+	if ghState.issueCalls != 1 {
+		t.Errorf("issueCalls = %d, want 1 (issue was read then rejected)", ghState.issueCalls)
+	}
+}
+
+// TestReconcileOnRead_RunlessIssueNotPlanned_NotSettled: a closed-as-not_planned
+// issue is an abandonment, not a completion — the item is left unsettled.
+func TestReconcileOnRead_RunlessIssueNotPlanned_NotSettled(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "not_planned"},
+	}}
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if len(st.Rollup.Done) != 0 {
+		t.Errorf("rollup.Done = %v, want empty (not_planned not settled)", st.Rollup.Done)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 0 {
+		t.Errorf("campaign_issue_settled = %d, want 0 (not_planned closure)", n)
+	}
+}
+
+// TestReconcileOnRead_RunlessNilGitHub_PassSkipped: with no GitHub client the
+// run-less pass short-circuits — the item stays pending and the read still 200s.
+func TestReconcileOnRead_RunlessNilGitHub_PassSkipped(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	s := New(Config{CampaignRepo: crepo, AuditRepo: aud}) // GitHub + RunRepo nil
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID) // asserts 200 internally
+	if len(st.Rollup.Done) != 0 {
+		t.Errorf("rollup.Done = %v, want empty (pass skipped, no GitHub)", st.Rollup.Done)
+	}
+	if it := crepo.itemsByCmp[c.ID][0]; it.State != campaign.ItemStatePending {
+		t.Errorf("item state = %q, want pending (pass skipped)", it.State)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 0 {
+		t.Errorf("campaign_issue_settled = %d, want 0 (GitHub unwired)", n)
+	}
+}
+
+// TestReconcileOnRead_RunlessGetIssueError_StillReturns200: a GetIssue HTTP 500
+// is logged-and-swallowed — the item is left pending and the read still 200s
+// (best-effort, never fails the read).
+func TestReconcileOnRead_RunlessGetIssueError_StillReturns200(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issuesStatus: http.StatusInternalServerError}
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID) // asserts 200 internally
+	if len(st.Rollup.Done) != 0 {
+		t.Errorf("rollup.Done = %v, want empty (GetIssue error swallowed)", st.Rollup.Done)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 0 {
+		t.Errorf("campaign_issue_settled = %d, want 0 (GetIssue error)", n)
+	}
+	if ghState.issueCalls != 1 {
+		t.Errorf("issueCalls = %d, want 1 (issue read attempted)", ghState.issueCalls)
+	}
+}
+
+// TestReconcileOnRead_RunlessBadRepo_PassSkipped: a campaign whose repo is not
+// in owner/name form is skipped before any GitHub call — the item is left
+// unsettled and the read still 200s.
+func TestReconcileOnRead_RunlessBadRepo_PassSkipped(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "completed"},
+	}}
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	// A repo string with no "/" fails splitRepoFullName.
+	c := crepo.seedCampaignWithItems("not-a-valid-repo", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID) // asserts 200 internally
+	if len(st.Rollup.Done) != 0 {
+		t.Errorf("rollup.Done = %v, want empty (bad repo, pass skipped)", st.Rollup.Done)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 0 {
+		t.Errorf("campaign_issue_settled = %d, want 0 (bad repo)", n)
+	}
+	if ghState.issueCalls != 0 || ghState.installCalls != 0 {
+		t.Errorf("GitHub calls = issue:%d install:%d, want 0/0 (skipped before any call)", ghState.issueCalls, ghState.installCalls)
+	}
+}
+
+// TestReconcileOnRead_RunlessInstallResolveError_StillReturns200: an
+// installation-resolution failure is logged-and-swallowed — the item is left
+// pending and the read still 200s (no GetIssue is attempted).
+func TestReconcileOnRead_RunlessInstallResolveError_StillReturns200(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installStatus: http.StatusInternalServerError, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "completed"},
+	}}
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID) // asserts 200 internally
+	if len(st.Rollup.Done) != 0 {
+		t.Errorf("rollup.Done = %v, want empty (install-resolve error swallowed)", st.Rollup.Done)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 0 {
+		t.Errorf("campaign_issue_settled = %d, want 0 (install-resolve error)", n)
+	}
+	if ghState.installCalls != 1 || ghState.issueCalls != 0 {
+		t.Errorf("GitHub calls = install:%d issue:%d, want install:1 issue:0 (no GetIssue after resolve failure)", ghState.installCalls, ghState.issueCalls)
+	}
+}
+
+// TestReconcileOnRead_RunlessNonIssueRef_Skipped: an item whose ref is not
+// issue:N (e.g. a Jira key) has no GitHub issue to read — it is skipped BEFORE
+// any GitHub call (no installation resolve, no GetIssue).
+func TestReconcileOnRead_RunlessNonIssueRef_Skipped(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242}
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("jira:ABC-1", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if len(st.Rollup.Done) != 0 {
+		t.Errorf("rollup.Done = %v, want empty (non issue:N ref skipped)", st.Rollup.Done)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 0 {
+		t.Errorf("campaign_issue_settled = %d, want 0 (non-issue ref)", n)
+	}
+	if ghState.issueCalls != 0 || ghState.installCalls != 0 {
+		t.Errorf("GitHub calls = issue:%d install:%d, want 0/0 (skipped before any call)", ghState.issueCalls, ghState.installCalls)
 	}
 }
