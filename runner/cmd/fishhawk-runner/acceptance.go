@@ -108,16 +108,20 @@ type acceptanceCriterionResult struct {
 }
 
 // acceptanceVerdict mirrors the backend's acceptanceBody by json tag.
-// EvidenceHashes is a json.RawMessage (not []string) so
+// EvidenceHashes and Criteria are both json.RawMessage (not typed) so
 // validateAcceptanceVerdict can losslessly coerce the historical
-// string-valued object-map variant before the fail-closed reject — the
-// backend twin decodes the same way (the #1574 class).
+// #1574-class shape variants before the fail-closed reject — a
+// string-valued object-map evidence_hashes, and a criteria object keyed by
+// criterion id — the backend twin decodes the same way. The strict decode
+// that rejects unknown fields INSIDE a criteria element is re-applied by
+// coerceAcceptanceCriteria's array path (the top-level DisallowUnknownFields
+// decoder does not descend into a RawMessage field).
 type acceptanceVerdict struct {
-	Verdict        string                      `json:"verdict"`
-	FailureMode    string                      `json:"failure_mode,omitempty"`
-	Criteria       []acceptanceCriterionResult `json:"criteria,omitempty"`
-	TargetURL      string                      `json:"target_url,omitempty"`
-	EvidenceHashes json.RawMessage             `json:"evidence_hashes,omitempty"`
+	Verdict        string          `json:"verdict"`
+	FailureMode    string          `json:"failure_mode,omitempty"`
+	Criteria       json.RawMessage `json:"criteria,omitempty"`
+	TargetURL      string          `json:"target_url,omitempty"`
+	EvidenceHashes json.RawMessage `json:"evidence_hashes,omitempty"`
 	// Notes is a declared home for the agent's free-text overflow (#1567):
 	// a top-level remark that would otherwise fail closed against
 	// DisallowUnknownFields. Declaring it makes a benign aside validate
@@ -200,11 +204,22 @@ func validateAcceptanceVerdict(raw []byte, servedCriteriaIDs []string, warn func
 		return nil, fmt.Errorf("verdict must be passed or failed, got %q", v.Verdict)
 	}
 
+	// Coerce criteria before the per-criterion fail-closed checks: an object
+	// keyed by criterion id folds into the schema-required flat array with each
+	// key written into the element id (the #1574 class); a non-object keyed
+	// value, a key/element-id conflict, or a scalar fails closed. A flat array
+	// passes through (strict-decoded so an unknown element field still fails
+	// closed).
+	criteria, coercedCriteria, err := coerceAcceptanceCriteria(v.Criteria)
+	if err != nil {
+		return nil, err
+	}
+
 	served := make(map[string]struct{}, len(servedCriteriaIDs))
 	for _, id := range servedCriteriaIDs {
 		served[id] = struct{}{}
 	}
-	for i, c := range v.Criteria {
+	for i, c := range criteria {
 		if c.ID == "" {
 			return nil, fmt.Errorf("criteria[%d].id is required (the plan-criterion join key)", i)
 		}
@@ -218,6 +233,17 @@ func validateAcceptanceVerdict(raw []byte, servedCriteriaIDs []string, warn func
 			if _, ok := served[c.ID]; !ok {
 				return nil, fmt.Errorf("criteria[%d].id %q is not in the served acceptance_criteria_ids set", i, c.ID)
 			}
+		}
+	}
+	if coercedCriteria {
+		normalized, merr := json.Marshal(criteria)
+		if merr != nil {
+			return nil, fmt.Errorf("re-marshal coerced criteria: %w", merr)
+		}
+		v.Criteria = normalized
+		if warn != nil {
+			warn("acceptance_verdict_criteria_coerced",
+				fmt.Sprintf("coerced object-keyed criteria to %d sorted flat-array elements", len(criteria)))
 		}
 	}
 
@@ -254,7 +280,7 @@ func validateAcceptanceVerdict(raw []byte, servedCriteriaIDs []string, warn func
 
 	// Re-marshal to the canonical shape only when a coercion fired, so the
 	// common path preserves the original bytes byte-for-byte.
-	if coercedHashes || coercedURL {
+	if coercedHashes || coercedURL || coercedCriteria {
 		out, merr := json.Marshal(v)
 		if merr != nil {
 			return nil, fmt.Errorf("re-marshal coerced acceptance verdict: %w", merr)
@@ -305,6 +331,87 @@ func coerceAcceptanceEvidenceHashes(raw json.RawMessage) ([]string, bool, error)
 	default:
 		return nil, false, errors.New("evidence_hashes must be a flat array of strings or a string-valued object map")
 	}
+}
+
+// coerceAcceptanceCriteria normalizes the verdict's criteria field. It returns
+// the flat typed slice, whether a coercion occurred, and an error on any lossy
+// or invalid shape. The twin of the backend coerceAcceptanceCriteria
+// (backend/internal/server/acceptance.go) — the two must stay identical or a
+// runner-accepted verdict could be backend-rejected on ship. Accepted:
+//   - absent / null / empty → nil, no coercion.
+//   - a JSON array → STRICT-decoded (DisallowUnknownFields) into the typed slice
+//     verbatim, no coercion. The strict decode re-applies the unknown-field
+//     rejection the top-level decoder no longer performs on this now-RawMessage
+//     field (an unknown element field fails closed).
+//   - a JSON object keyed by criterion id (the #1574 variant) → each value
+//     strict-decoded into an element with the object key folded into its id,
+//     the elements SORTED by id, marked coerced. A value that is not an object,
+//     or a value carrying a non-empty explicit id that conflicts with its key,
+//     fails closed.
+//   - anything else (a scalar) → fails closed.
+func coerceAcceptanceCriteria(raw json.RawMessage) ([]acceptanceCriterionResult, bool, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return nil, false, nil
+	}
+	switch trimmed[0] {
+	case '[':
+		arr, err := strictDecodeCriteriaArray(trimmed)
+		if err != nil {
+			return nil, false, err
+		}
+		return arr, false, nil
+	case '{':
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &m); err != nil {
+			return nil, false, fmt.Errorf("criteria object could not be decoded: %w", err)
+		}
+		out := make([]acceptanceCriterionResult, 0, len(m))
+		for key, rv := range m {
+			vt := bytes.TrimSpace(rv)
+			if len(vt) == 0 || vt[0] != '{' {
+				return nil, false, fmt.Errorf("criteria object value for %q must be an object (lossy coercion refused)", key)
+			}
+			c, err := strictDecodeCriterion(vt)
+			if err != nil {
+				return nil, false, err
+			}
+			if c.ID != "" && c.ID != key {
+				return nil, false, fmt.Errorf("criteria object key %q conflicts with element id %q", key, c.ID)
+			}
+			c.ID = key
+			out = append(out, c)
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+		return out, true, nil
+	default:
+		return nil, false, errors.New("criteria must be a flat array or an object keyed by criterion id")
+	}
+}
+
+// strictDecodeCriteriaArray decodes a criteria JSON array with
+// DisallowUnknownFields so an unknown field inside an element fails closed —
+// the strictness the top-level RawMessage field no longer enforces.
+func strictDecodeCriteriaArray(raw json.RawMessage) ([]acceptanceCriterionResult, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var arr []acceptanceCriterionResult
+	if err := dec.Decode(&arr); err != nil {
+		return nil, fmt.Errorf("criteria array could not be decoded: %w", err)
+	}
+	return arr, nil
+}
+
+// strictDecodeCriterion decodes a single criteria object value with
+// DisallowUnknownFields (the object-keyed variant path).
+func strictDecodeCriterion(raw json.RawMessage) (acceptanceCriterionResult, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var c acceptanceCriterionResult
+	if err := dec.Decode(&c); err != nil {
+		return acceptanceCriterionResult{}, fmt.Errorf("criteria object value could not be decoded: %w", err)
+	}
+	return c, nil
 }
 
 // coerceAcceptanceTargetURL normalizes the verdict's target_url in place. A

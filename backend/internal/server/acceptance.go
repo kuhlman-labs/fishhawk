@@ -159,8 +159,15 @@ type acceptanceBody struct {
 	FailureMode string `json:"failure_mode,omitempty"`
 	// Criteria carries one result per plan acceptance criterion, keyed by the
 	// criterion id (the E31.1 join key). Optional — a verdict can settle
-	// before per-criterion evidence is itemized.
-	Criteria []acceptanceCriterionResult `json:"criteria,omitempty"`
+	// before per-criterion evidence is itemized. Decoded as a RawMessage so
+	// validate() can losslessly coerce the historical object-keyed variant (a
+	// JSON object keyed by criterion id) to the schema-required flat array with
+	// each key folded into the element id (the #1574 class); see
+	// coerceAcceptanceCriteria. The normalized flat slice lands in
+	// normalizedCriteria. Moving off the typed slice means the top-level
+	// DisallowUnknownFields decoder no longer descends into criteria elements —
+	// coerceAcceptanceCriteria's array path re-applies that strictness.
+	Criteria json.RawMessage `json:"criteria,omitempty"`
 	// TargetURL is the running instance the validator drove, when declared.
 	// Optional; a schemeless host[:port] is coerced to an http:// URL by
 	// validate(), and any foreign scheme fails closed (the #1574 class).
@@ -184,6 +191,14 @@ type acceptanceBody struct {
 	// marshals into the stored artifact; buildOutcomePayload records it as the
 	// canonical shape.
 	normalizedEvidenceHashes []string
+
+	// normalizedCriteria is the coerced/validated flat typed slice, populated by
+	// validate() from Criteria (an object-keyed criteria field folds into it,
+	// each key written into the element id, sorted). Unexported (no json tag) so
+	// it never marshals into the stored artifact; every downstream consumer
+	// (tally, triage classifier, plan-review-miss + concern synthesis) reads it
+	// instead of the raw Criteria field.
+	normalizedCriteria []acceptanceCriterionResult
 }
 
 // validate returns a human-readable error if any field is missing or
@@ -220,7 +235,18 @@ func (a *acceptanceBody) validate(ctx context.Context, logger *slog.Logger) erro
 	default:
 		return fmt.Errorf("verdict must be passed or failed, got %q", a.Verdict)
 	}
-	for i, c := range a.Criteria {
+	// Coerce criteria before the per-criterion fail-closed checks: an object
+	// keyed by criterion id folds into the schema-required flat array with each
+	// key written into the element id (the #1574 class); a non-object keyed
+	// value, a key/element-id conflict, or a scalar fails closed. A flat array
+	// passes through (strict-decoded so an unknown element field still fails
+	// closed). The normalized slice is what every downstream consumer reads.
+	criteria, coercedCriteria, err := coerceAcceptanceCriteria(a.Criteria)
+	if err != nil {
+		return err
+	}
+	a.normalizedCriteria = criteria
+	for i, c := range criteria {
 		if c.ID == "" {
 			return fmt.Errorf("criteria[%d].id is required (the plan-criterion join key)", i)
 		}
@@ -230,6 +256,11 @@ func (a *acceptanceBody) validate(ctx context.Context, logger *slog.Logger) erro
 		default:
 			return fmt.Errorf("criteria[%d].result must be passed/failed/skipped, got %q", i, c.Result)
 		}
+	}
+	if coercedCriteria && logger != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn,
+			"acceptance verdict: coerced object-keyed criteria to a flat array",
+			slog.Int("count", len(criteria)))
 	}
 	// Coerce evidence_hashes before the fail-closed reject: a string-valued
 	// object map collapses to its sorted values (lossless); a non-string/
@@ -300,6 +331,87 @@ func coerceEvidenceHashes(raw json.RawMessage) ([]string, bool, error) {
 	default:
 		return nil, false, errors.New("evidence_hashes must be a flat array of strings or a string-valued object map")
 	}
+}
+
+// coerceAcceptanceCriteria normalizes the acceptance verdict's criteria field.
+// It returns the flat typed slice, whether a coercion occurred, and an error on
+// any lossy or invalid shape. The twin of the runner coerceAcceptanceCriteria
+// (runner/cmd/fishhawk-runner/acceptance.go) — the two must stay identical or a
+// runner-accepted verdict could be backend-rejected on ship. Accepted:
+//   - absent / null / empty → nil, no coercion.
+//   - a JSON array → STRICT-decoded (DisallowUnknownFields) into the typed slice
+//     verbatim, no coercion. The strict decode re-applies the unknown-field
+//     rejection the top-level decoder no longer performs on this now-RawMessage
+//     field (an unknown element field fails closed).
+//   - a JSON object keyed by criterion id (the #1574 variant) → each value
+//     strict-decoded into an element with the object key folded into its id,
+//     the elements SORTED by id, marked coerced. A value that is not an object,
+//     or a value carrying a non-empty explicit id that conflicts with its key,
+//     fails closed.
+//   - anything else (a scalar) → fails closed.
+func coerceAcceptanceCriteria(raw json.RawMessage) ([]acceptanceCriterionResult, bool, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return nil, false, nil
+	}
+	switch trimmed[0] {
+	case '[':
+		arr, err := strictDecodeCriteriaArray(trimmed)
+		if err != nil {
+			return nil, false, err
+		}
+		return arr, false, nil
+	case '{':
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &m); err != nil {
+			return nil, false, fmt.Errorf("criteria object could not be decoded: %w", err)
+		}
+		out := make([]acceptanceCriterionResult, 0, len(m))
+		for key, rv := range m {
+			vt := bytes.TrimSpace(rv)
+			if len(vt) == 0 || vt[0] != '{' {
+				return nil, false, fmt.Errorf("criteria object value for %q must be an object (lossy coercion refused)", key)
+			}
+			c, err := strictDecodeCriterion(vt)
+			if err != nil {
+				return nil, false, err
+			}
+			if c.ID != "" && c.ID != key {
+				return nil, false, fmt.Errorf("criteria object key %q conflicts with element id %q", key, c.ID)
+			}
+			c.ID = key
+			out = append(out, c)
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+		return out, true, nil
+	default:
+		return nil, false, errors.New("criteria must be a flat array or an object keyed by criterion id")
+	}
+}
+
+// strictDecodeCriteriaArray decodes a criteria JSON array with
+// DisallowUnknownFields so an unknown field inside an element fails closed —
+// the strictness the top-level RawMessage field no longer enforces.
+func strictDecodeCriteriaArray(raw json.RawMessage) ([]acceptanceCriterionResult, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var arr []acceptanceCriterionResult
+	if err := dec.Decode(&arr); err != nil {
+		return nil, fmt.Errorf("criteria array could not be decoded: %w", err)
+	}
+	return arr, nil
+}
+
+// strictDecodeCriterion decodes a single criteria object value with
+// DisallowUnknownFields (the object-keyed variant path).
+func strictDecodeCriterion(raw json.RawMessage) (acceptanceCriterionResult, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var c acceptanceCriterionResult
+	if err := dec.Decode(&c); err != nil {
+		return acceptanceCriterionResult{}, fmt.Errorf("criteria object value could not be decoded: %w", err)
+	}
+	return c, nil
 }
 
 // coerceAcceptanceTargetURL normalizes the verdict's target_url in place. A
@@ -456,7 +568,7 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	contentHash := sha256Hex(body)
-	passed, failed, skipped, total := acceptanceCriteriaTally(acc.Criteria)
+	passed, failed, skipped, total := acceptanceCriteriaTally(acc.normalizedCriteria)
 
 	// buildOutcomePayload renders the acceptance_outcome_recorded payload. The
 	// `outcome`/`criteria_passed`/`criteria_total` tags are the issue-comment
@@ -715,7 +827,7 @@ func classifyAcceptanceFailure(acc acceptanceBody, criteria []plan.AcceptanceCri
 	// objectively fails, so route to a bounded fix-up pass (class 1). Carry
 	// the failed criteria ids when the verdict itemized them.
 	if acc.FailureMode == acceptanceFailureError {
-		return acceptanceClass1, failedCriterionIDs(acc.Criteria),
+		return acceptanceClass1, failedCriterionIDs(acc.normalizedCriteria),
 			"failure_mode=error: the code errored attempting the behavior; routing to a bounded fix-up pass"
 	}
 
@@ -723,7 +835,7 @@ func classifyAcceptanceFailure(acc acceptanceBody, criteria []plan.AcceptanceCri
 	// assertion_fail on a failed verdict). Partition the criteria results.
 	var failed []string
 	skipped := 0
-	for _, c := range acc.Criteria {
+	for _, c := range acc.normalizedCriteria {
 		switch c.Result {
 		case acceptanceResultFailed:
 			failed = append(failed, c.ID)
@@ -874,8 +986,8 @@ func buildPlanReviewMisses(acc acceptanceBody, criteria []plan.AcceptanceCriteri
 	for _, c := range criteria {
 		planByID[c.ID] = c
 	}
-	resultByID := make(map[string]acceptanceCriterionResult, len(acc.Criteria))
-	for _, c := range acc.Criteria {
+	resultByID := make(map[string]acceptanceCriterionResult, len(acc.normalizedCriteria))
+	for _, c := range acc.normalizedCriteria {
 		resultByID[c.ID] = c
 	}
 
@@ -1021,8 +1133,8 @@ func synthesizeAcceptanceConcerns(acc acceptanceBody, criteria []plan.Acceptance
 	for _, c := range criteria {
 		statementByID[c.ID] = c.Statement
 	}
-	failedByID := make(map[string]acceptanceCriterionResult, len(acc.Criteria))
-	for _, c := range acc.Criteria {
+	failedByID := make(map[string]acceptanceCriterionResult, len(acc.normalizedCriteria))
+	for _, c := range acc.normalizedCriteria {
 		if c.Result == acceptanceResultFailed {
 			failedByID[c.ID] = c
 		}
@@ -1087,7 +1199,7 @@ func composeAcceptanceFallbackNote(acc acceptanceBody, reason string) string {
 	if acc.TargetURL != "" {
 		fmt.Fprintf(&b, " Target: %s.", acc.TargetURL)
 	}
-	passed, failed, skipped, total := acceptanceCriteriaTally(acc.Criteria)
+	passed, failed, skipped, total := acceptanceCriteriaTally(acc.normalizedCriteria)
 	fmt.Fprintf(&b, " Criteria tally: %d passed / %d failed / %d skipped of %d.", passed, failed, skipped, total)
 	if reason != "" {
 		fmt.Fprintf(&b, " Triage: %s", reason)

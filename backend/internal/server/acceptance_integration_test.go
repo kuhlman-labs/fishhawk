@@ -206,10 +206,10 @@ func TestAcceptanceSeam_ExampleDrivenHappyPath(t *testing.T) {
 	seam.rr.getStages[seam.acceptanceID].State = run.StageStateSucceeded
 	body, err := json.Marshal(acceptanceBody{
 		Verdict: "passed",
-		Criteria: []acceptanceCriterionResult{
-			{ID: "ac-create", Result: "passed", Observed: "201 returned"},
-			{ID: "ac-list", Result: "passed"},
-		},
+		Criteria: critRaw(
+			acceptanceCriterionResult{ID: "ac-create", Result: "passed", Observed: "201 returned"},
+			acceptanceCriterionResult{ID: "ac-list", Result: "passed"},
+		),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -252,10 +252,10 @@ func TestAcceptanceSeam_NotesCrossesSeam(t *testing.T) {
 	const notes = "preview took ~40s to boot; all criteria passed once up"
 	body, err := json.Marshal(acceptanceBody{
 		Verdict: "passed",
-		Criteria: []acceptanceCriterionResult{
-			{ID: "ac-create", Result: "passed", Observed: "201 returned"},
-			{ID: "ac-list", Result: "passed"},
-		},
+		Criteria: critRaw(
+			acceptanceCriterionResult{ID: "ac-create", Result: "passed", Observed: "201 returned"},
+			acceptanceCriterionResult{ID: "ac-list", Result: "passed"},
+		),
 		Notes: notes,
 	})
 	if err != nil {
@@ -331,6 +331,63 @@ func TestAcceptanceSeam_LegacyShapesCoerceAcrossSeam(t *testing.T) {
 		t.Errorf("recorded evidence_hashes = %v, want the sorted slice %v", got.EvidenceHashes, want)
 	}
 	_ = ctx
+}
+
+// TestAcceptanceSeam_ObjectKeyedCriteriaCoerceAcrossSeam is the E38.1 binding-
+// condition e2e (#1655, the third #1574-class shape variant): a verdict whose
+// `criteria` field is a JSON OBJECT keyed by criterion id crosses the full HTTP
+// ship → decode → validate/coerce → handler → outcome-record + triage seam and
+// is ACCEPTED (201, not a category-B 400). It proves the object-keyed shape
+// survives end-to-end exactly as #1646's target_url/evidence_hashes coercions
+// did:
+//   - the acceptance_outcome_recorded outcome reflects the coerced FLAT-ARRAY
+//     form — its criteria tally counts BOTH folded criteria; and
+//   - each object key folded into an element id, deterministically SORTED — the
+//     class-1 triage decision's criterion_ids echo the two folded ids in sorted
+//     order (a before b) even though the body lists them b-before-a. (Folding is
+//     load-bearing: an unfolded element would carry an empty id and validate()
+//     would 400 it category-B, so reaching 201 with both ids present is itself
+//     proof each key folded into a valid element.)
+func TestAcceptanceSeam_ObjectKeyedCriteriaCoerceAcrossSeam(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	seam := buildExampleAcceptanceSeam(t, exampleBytes, run.StageStateSucceeded)
+
+	// Object-keyed criteria with the distinctive ids, keys deliberately out of
+	// sorted order (b before a) so the sort is observable. failure_mode=error
+	// routes to class-1 triage, whose criterion_ids echo the folded, sorted ids.
+	body := []byte(`{"verdict":"failed","failure_mode":"error","criteria":{` +
+		`"e2e-obj-crit-b":{"result":"failed","observed":"500 on b"},` +
+		`"e2e-obj-crit-a":{"result":"failed","observed":"500 on a"}}}`)
+
+	w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv, body, "")
+	if w.Code != 201 {
+		t.Fatalf("ship object-keyed criteria status = %d, want 201 (accepted, not category-B):\n%s", w.Code, w.Body.String())
+	}
+
+	// (2a) The acceptance_outcome_recorded outcome reflects the coerced flat-array
+	//      form — the tally counts BOTH folded criteria.
+	if n := countByCategory(seam.au, CategoryAcceptanceOutcomeRecorded); n != 1 {
+		t.Fatalf("acceptance_outcome_recorded entries = %d, want 1", n)
+	}
+	outcome := findAppendedByCategory(t, seam.au, CategoryAcceptanceOutcomeRecorded)
+	for _, want := range []string{`"verdict":"failed"`, `"outcome":"rejected"`, `"criteria_failed":2`, `"criteria_total":2`} {
+		if !strings.Contains(string(outcome.Payload), want) {
+			t.Errorf("outcome payload missing %s:\n%s", want, outcome.Payload)
+		}
+	}
+
+	// (2b) Each object key folded into an element id AND the flat array is
+	//      deterministically sorted: the class-1 triage decision records the two
+	//      folded ids in sorted order (a before b, despite b-before-a in the body).
+	payload := triagePayload(t, seam.au)
+	if !strings.Contains(payload, `"criterion_ids":["e2e-obj-crit-a","e2e-obj-crit-b"]`) {
+		t.Errorf("triage criterion_ids must be the folded, deterministically sorted ids [a,b]:\n%s", payload)
+	}
+	for _, want := range []string{`"class":"1"`, `"disposition":"fixup_dispatched"`} {
+		if !strings.Contains(payload, want) {
+			t.Errorf("triage payload missing %s:\n%s", want, payload)
+		}
+	}
 }
 
 // reflectDeepEqualStrings is a tiny local slice-equality helper (the
