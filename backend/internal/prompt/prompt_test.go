@@ -2423,6 +2423,44 @@ func TestBuild_PlanReview_GateEvidence_Renders(t *testing.T) {
 	}
 }
 
+// TestBuild_PlanReview_GateEvidence_ContradictionClauseRenders pins the
+// #1611 escape valve: the always-rendered header must carry the
+// evidence_conflict contradiction clause so a reviewer whose artifact
+// plainly contradicts a (wrong) evidence claim can report the CONTRADICTION
+// instead of asserting the wrong claim as a defect. The normal outranking
+// sentences are regression-pinned unchanged alongside it.
+func TestBuild_PlanReview_GateEvidence_ContradictionClauseRenders(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			ScopePrecheck: &ScopePrecheckEvidence{
+				ImplementStageID: "implement",
+				ScannedFiles:     1,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		// The normal outranking rule stays intact (regression pin).
+		"high-severity concern and named FIRST",
+		"A clean result does NOT certify plan quality",
+		// The new contradiction clause.
+		"ground truth ABOUT WHAT THE GATES MEASURED",
+		"category `evidence_conflict`",
+		"record the CONTRADICTION",
+		"naming BOTH the evidence claim AND the contradicting observation",
+		"ONLY on a direct, verifiable contradiction",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing contradiction-clause element %q:\n%s", w, got)
+		}
+	}
+}
+
 // TestBuild_PlanReview_GateEvidence_CleanResultsRenderExplicitly verifies
 // the "checked and clean" rendering: empty violations/findings must show
 // as explicit clean lines, never as silently absent subsections, so the
@@ -4217,6 +4255,46 @@ func TestBuild_ImplementReview_GateEvidence_RendersAllFacts(t *testing.T) {
 	// marker must NOT appear — only an absorbed iteration carries it (#1205).
 	if strings.Contains(got, "— SUPERSEDED (absorbed by the verify-fix loop") {
 		t.Errorf("no run is superseded here; SUPERSEDED marker must be absent:\n%s", got)
+	}
+}
+
+// TestBuild_ImplementReview_GateEvidence_ContradictionClauseRenders pins the
+// #1611 escape valve on the implement-review builder: the always-rendered
+// BINDING rules block must carry the evidence_conflict contradiction bullet so
+// a reviewer whose committed diff plainly contradicts a (wrong) evidence claim
+// reports the CONTRADICTION instead of asserting the wrong claim as a defect.
+// The pre-existing binding rules are regression-pinned unchanged alongside it.
+func TestBuild_ImplementReview_GateEvidence_ContradictionClauseRenders(t *testing.T) {
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			VerifyRuns: []GateVerifyRun{
+				{Command: "scripts/test", ExitCode: 0, Outcome: "passed"},
+			},
+			VerifySummary: &GateVerifySummary{Outcome: "passed", Iterations: 1, MaxIterations: 3},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		// The pre-existing binding rules stay intact (regression pin).
+		"A TERMINAL (non-superseded) FAILED verify run",
+		"its failure MUST NOT be treated as a committed-tree blocker",
+		"A SKIPPED verify run means compile/test state is UNVERIFIED",
+		"does NOT certify test quality",
+		// The new contradiction clause.
+		"ground truth ABOUT WHAT THE GATES MEASURED",
+		"category `evidence_conflict`",
+		"report the CONTRADICTION",
+		"naming BOTH the evidence claim AND the contradicting observation",
+		"ONLY on a direct, verifiable contradiction",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement_review prompt missing contradiction-clause element %q:\n%s", w, got)
+		}
 	}
 }
 

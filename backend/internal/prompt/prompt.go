@@ -1970,6 +1970,13 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 		"high-severity concern and named FIRST among your concerns — it outranks any stylistic or " +
 		"text-level finding, and once recorded you may shortcut the remaining review criteria. " +
 		"A clean result does NOT certify plan quality: every review criterion below still applies.\n\n")
+	b.WriteString("Escape valve — gate evidence is ground truth ABOUT WHAT THE GATES MEASURED and normally " +
+		"outranks any text-level reading of the plan, but the evidence itself can be wrong. When the plan/artifact " +
+		"under review DIRECTLY and VERIFIABLY contradicts a specific evidence claim above (e.g. the plan plainly " +
+		"scopes a file the evidence reports dropped/undelivered), you MUST instead record the CONTRADICTION itself " +
+		"as a high-severity concern with category `evidence_conflict`, naming BOTH the evidence claim AND the " +
+		"contradicting observation — rather than asserting the (wrong) evidence claim as a defect. This clause " +
+		"fires ONLY on a direct, verifiable contradiction; absent one, the outranking rule above stands unchanged.\n\n")
 
 	if reg := ev.ScopeRegression; reg != nil && len(reg.RemovedFiles) > 0 {
 		b.WriteString("Scope regression (files dropped vs the revision base — HIGH severity):\n\n")
@@ -2602,7 +2609,14 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 		"CI-green; state the unverified status in a concern or in `free_form`.\n")
 	b.WriteString("- A PASSED verify run certifies ONLY that the named command exited 0 against the committed " +
 		"tree. It does NOT certify test quality — the test-vacuity and untested-path lenses still apply in " +
-		"full.\n\n")
+		"full.\n")
+	b.WriteString("- Escape valve: the evidence above is ground truth ABOUT WHAT THE GATES MEASURED and outranks " +
+		"text-level reading, but it can itself be wrong. When the committed diff under review DIRECTLY and " +
+		"VERIFIABLY contradicts a specific evidence claim above (e.g. the diff plainly contains an edit the " +
+		"evidence reports dropped/undelivered), you MUST report the CONTRADICTION as a `high`-severity concern " +
+		"with category `evidence_conflict` — naming BOTH the evidence claim AND the contradicting observation in " +
+		"the diff — instead of asserting the (wrong) evidence claim as a defect. This fires ONLY on a direct, " +
+		"verifiable contradiction; absent one, the binding rules above stand unchanged.\n\n")
 
 	if len(ev.VerifyRuns) > 0 {
 		b.WriteString("Verify runs (committed-tree gate):\n\n")
