@@ -144,7 +144,7 @@ func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) [
 			{
 				Action:       "fishhawk_fixup_stage",
 				Params:       fixupParams,
-				Precondition: "the implement stage is parked at its review gate (or succeeded with the PR open); checkout the run branch first",
+				Precondition: "the implement stage is parked at its review gate (or succeeded with the PR open); stay on a clean default branch — the runner owns the run branch in its lineage worktree",
 				Consumes:     consumesFixupBudget,
 				Reason:       fmt.Sprintf("%d open concern(s) from the implement review; %d normal fix-up pass(es) remain", h.Concerns, h.RemainingFixupBudget),
 			},

@@ -1028,7 +1028,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		tipSHA, coErr := checkoutFixupBase(ctx, repoDir, gitops.DefaultRemote, cfg.fixupBranch)
 		if coErr != nil {
 			_, _ = fmt.Fprintf(logSink,
-				`{"event":"runner_failed","reason":"fixup_base_checkout","detail":%q}`+"\n", coErr.Error())
+				`{"event":"runner_failed","reason":%q,"detail":%q}`+"\n", fixupCheckoutFailReason(coErr), coErr.Error())
 			return exitFailure
 		}
 		fixupCheckoutMoved = true
@@ -4245,6 +4245,19 @@ var (
 	resetFixupWorktree = gitResetHardClean
 	fixupVerifyGate    = runVerifyGateCommitted
 )
+
+// fixupCheckoutFailReason classifies a checkoutFixupBase failure into the
+// runner_failed reason token. A gitops.ErrBranchCheckedOutElsewhere failure
+// (the run branch is checked out in another worktree — typically the
+// operator's main tree) maps to the self-diagnosing "fixup_base_worktree_
+// conflict" whose wrapped message names the blocking path and recovery (#1549);
+// every other checkout failure keeps the generic "fixup_base_checkout".
+func fixupCheckoutFailReason(err error) string {
+	if errors.Is(err, gitops.ErrBranchCheckedOutElsewhere) {
+		return "fixup_base_worktree_conflict"
+	}
+	return "fixup_base_checkout"
+}
 
 // compileDiagnosticMarkers are substrings that positively identify a
 // Go compile / typecheck diagnostic in `go vet` output. Since #959 they

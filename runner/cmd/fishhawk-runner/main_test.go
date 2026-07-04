@@ -13820,3 +13820,33 @@ func TestRun_AcceptanceStage_EndToEnd(t *testing.T) {
 		t.Errorf("repo working tree dirty after acceptance stage:\n%s", statusOut)
 	}
 }
+
+// TestFixupCheckoutFailReason asserts both classification branches of the
+// #1549 reason mapper: a sentinel-wrapped ErrBranchCheckedOutElsewhere maps to
+// the self-diagnosing fixup_base_worktree_conflict token, and any other
+// checkout failure keeps the generic fixup_base_checkout.
+func TestFixupCheckoutFailReason(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "worktree conflict sentinel",
+			err:  fmt.Errorf("gitops: %w: run branch %q is checked out in worktree %q", gitops.ErrBranchCheckedOutElsewhere, "b", "/p"),
+			want: "fixup_base_worktree_conflict",
+		},
+		{
+			name: "other checkout failure",
+			err:  errors.New("gitops: fetch b from origin: exit status 128"),
+			want: "fixup_base_checkout",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := fixupCheckoutFailReason(tc.err); got != tc.want {
+				t.Errorf("fixupCheckoutFailReason(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
+	}
+}

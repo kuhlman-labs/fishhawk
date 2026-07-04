@@ -643,7 +643,7 @@ func ciFailedNextActions(run *Run, stages []Stage, hint *ReviewActionHint) *Next
 				{
 					Action:       "fishhawk_fixup_stage",
 					Params:       fixupParams,
-					Precondition: "open implement-review concerns exist and a required PR check is red; checkout the run branch first",
+					Precondition: "open implement-review concerns exist and a required PR check is red; stay on a clean default branch — the runner owns the run branch in its lineage worktree",
 					Consumes:     consumesFixupBudget,
 					Reason:       fmt.Sprintf("%d open concern(s) with a red required check — route them back so the fix-up addresses the defect and re-greens the checks", hint.Concerns),
 				},
@@ -854,7 +854,7 @@ func acceptanceTriagePagedActions(run *Run) []SuggestedAction {
 		{
 			Action:       "fishhawk_fixup_stage",
 			Params:       map[string]string{"run_id": run.ID, "concern_ids": "run.concerns.items[].id"},
-			Precondition: "you judge the failure is a real, fixable code defect worth a manual fix-up pass (checkout the run branch first)",
+			Precondition: "you judge the failure is a real, fixable code defect worth a manual fix-up pass (stay on a clean default branch — the runner owns the run branch in its lineage worktree)",
 			Consumes:     consumesFixupBudget,
 			Reason:       "route the acceptance failure back to the implement agent as a manual fix-up pass — consumes the shared fix-up budget the auto-triage also draws on",
 		},

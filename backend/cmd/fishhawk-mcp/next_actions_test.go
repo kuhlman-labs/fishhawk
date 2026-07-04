@@ -848,6 +848,18 @@ func TestNextActions_CIFailedRoutable(t *testing.T) {
 	if na.Actions[0].Params["stage_id"] != impl.ID {
 		t.Errorf("fixup stage_id = %q, want the implement stage id %q", na.Actions[0].Params["stage_id"], impl.ID)
 	}
+	// #1549: the fix-up precondition must not tell the operator to checkout the
+	// run branch (which CAUSES the worktree-conflict failure) and must name the
+	// runner's lineage worktree.
+	if na.Actions[0].Precondition == "" {
+		t.Error("fixup precondition must be non-empty")
+	}
+	if strings.Contains(na.Actions[0].Precondition, "checkout the run branch") {
+		t.Errorf("fixup precondition still says to checkout the run branch: %q", na.Actions[0].Precondition)
+	}
+	if !strings.Contains(na.Actions[0].Precondition, "lineage worktree") {
+		t.Errorf("fixup precondition should name the lineage worktree; got %q", na.Actions[0].Precondition)
+	}
 	findAction(t, na, "rerun_ci_checks")
 	for _, a := range na.Actions {
 		if a.Action == "merge_pr" || a.Action == "approve_pr" || a.Action == "merge_and_file_follow_up" {
@@ -1359,6 +1371,18 @@ func TestNextActions_AcceptanceTriagePaged_EveryDisposition(t *testing.T) {
 			fixup := findAction(t, na, "fishhawk_fixup_stage")
 			if fixup.Consumes != consumesFixupBudget {
 				t.Errorf("fixup consumes = %q, want fixup_budget", fixup.Consumes)
+			}
+			// #1549: the manual fix-up precondition must not tell the operator to
+			// checkout the run branch (which CAUSES the worktree-conflict failure)
+			// and must name the runner's lineage worktree.
+			if fixup.Precondition == "" {
+				t.Error("fixup precondition must be non-empty")
+			}
+			if strings.Contains(fixup.Precondition, "checkout the run branch") {
+				t.Errorf("fixup precondition still says to checkout the run branch: %q", fixup.Precondition)
+			}
+			if !strings.Contains(fixup.Precondition, "lineage worktree") {
+				t.Errorf("fixup precondition should name the lineage worktree; got %q", fixup.Precondition)
 			}
 		})
 	}
