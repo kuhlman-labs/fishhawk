@@ -2,6 +2,8 @@ package prompt
 
 import (
 	"errors"
+	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -582,6 +584,170 @@ func TestBuild_Plan_PerFailureModeTestRule(t *testing.T) {
 		if !strings.Contains(got, w) {
 			t.Errorf("plan prompt missing per-failure-mode test rule string %q\n---\n%s", w, got)
 		}
+	}
+}
+
+// jsonTagsFor mirrors the backend/internal/agenteval/schema_test.go
+// jsonTags(reflect.Type) idiom: the ordered json tag names of a struct's
+// fields, skipping "-" and empty tags. Local copy so the prompt/struct
+// lockstep below has compile-linked teeth without importing a foreign _test.go.
+func jsonTagsFor(t reflect.Type) []string {
+	var tags []string
+	for i := 0; i < t.NumField(); i++ {
+		name := strings.Split(t.Field(i).Tag.Get("json"), ",")[0]
+		if name == "" || name == "-" {
+			continue
+		}
+		tags = append(tags, name)
+	}
+	return tags
+}
+
+// TestBuild_Plan_AcceptanceCriteriaAuthoringContract pins the #1543 plan-prompt
+// contract: buildPlan must describe the verification.acceptance_criteria inner
+// element shape so the planner does not author schema-invalid ids (the observed
+// AC1 failure). Asserts the SHIPPED prompt output for the full contract
+// vocabulary — a done-means snapshot that fails on the observed omission and on
+// a comment-only no-op touch of the block.
+func TestBuild_Plan_AcceptanceCriteriaAuthoringContract(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "Plan a change",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"acceptance_criteria",
+		"^[a-z0-9][a-z0-9-]*$",      // the id slug pattern verbatim
+		"plan-validates-first-shot", // a concrete good-id example
+		"AC1",                       // the explicit anti-example (uppercase invalid)
+		"UNIQUE",                    // uniqueness rule
+		"source",
+		"explicit",
+		"inferred",
+		"REQUIRED when `source` is `inferred`", // rationale-when-inferred rule
+		"blocking",
+		"defaults to `true`", // blocking default
+		"source_ref",
+		"verify_hint",
+		"preconditions",
+		"out_of_scope", // the test/doc-only escape hatch
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing acceptance-criteria authoring contract string %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_Plan_CriterionInnerShape_LockstepWithStruct reflects
+// plan.AcceptanceCriterion's json tags and asserts every one is named in the
+// plan prompt. Compile-linked lockstep: adding a criterion field to the struct
+// fails this test until the buildPlan contract twin names it.
+func TestBuild_Plan_CriterionInnerShape_LockstepWithStruct(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "Plan a change",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, tag := range jsonTagsFor(reflect.TypeOf(plan.AcceptanceCriterion{})) {
+		if !strings.Contains(got, tag) {
+			t.Errorf("plan prompt must name AcceptanceCriterion json tag %q so a new criterion field cannot ship without the prompt twin\n---\n%s", tag, got)
+		}
+	}
+}
+
+// TestBuild_Plan_NamesEverySchemaRequiredField asserts every top-level
+// schema-required field of standard_v1 is named in the plan prompt. Cross-ref:
+// docs/spec/plan-standard-v1.schema.json "required".
+func TestBuild_Plan_NamesEverySchemaRequiredField(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "Plan a change",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// Mirrors docs/spec/plan-standard-v1.schema.json top-level "required".
+	required := []string{
+		"plan_version",
+		"ticket_reference",
+		"generated_by",
+		"summary",
+		"scope",
+		"approach",
+		"verification",
+		"predicted_runtime_minutes",
+		"predicted_runtime_confidence",
+	}
+	for _, f := range required {
+		if !strings.Contains(got, f) {
+			t.Errorf("plan prompt missing schema-required top-level field %q\n---\n%s", f, got)
+		}
+	}
+}
+
+// TestBuild_Acceptance_ClosedFieldSet_LockstepWithValidator pins buildAcceptance's
+// verdict/criterion-result closed field set against the authoritative validator
+// property sets. The sources are NOT importable across the boundary — the
+// runner's acceptanceVerdictJSONSchema is a const in package main
+// (runner/cmd/fishhawk-runner/acceptance.go) and backend/internal/server's
+// acceptanceBody/acceptanceCriterionResult are unexported structs whose package
+// would create an import cycle. So this want-list is a synchronized tripwire
+// (mirroring runner/cmd/fishhawk-runner/acceptance_test.go:341), not a
+// compile-time link: membership plus a backtick-token count guard so ADDING a
+// verdict field trips the test until the prompt twin is updated.
+func TestBuild_Acceptance_ClosedFieldSet_LockstepWithValidator(t *testing.T) {
+	got, err := Build("acceptance", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// Authoritative verdict property set (runner acceptanceVerdictJSONSchema /
+	// server.acceptanceBody). Kept in sync by hand — see the doc comment.
+	wantVerdictProps := []string{
+		"verdict", "failure_mode", "criteria", "target_url", "evidence_hashes", "notes",
+	}
+	// Authoritative criterion-result property set (server.acceptanceCriterionResult).
+	wantCriterionResultProps := []string{
+		"id", "result", "observed", "expected", "steps_taken", "expectation_basis", "repro_handle",
+	}
+	for _, f := range append(append([]string{}, wantVerdictProps...), wantCriterionResultProps...) {
+		tok := "`" + f + "`"
+		if !strings.Contains(got, tok) {
+			t.Errorf("acceptance prompt missing closed-field-set token %s\n---\n%s", tok, got)
+		}
+	}
+
+	// Count guard: the closed-field-set region ("... may contain ONLY these
+	// fields ...") must enumerate exactly len(wantVerdictProps) distinct
+	// backtick tokens, so adding a verdict field to the prompt without updating
+	// wantVerdictProps (or vice versa) trips this test.
+	const anchor = "The verdict may contain ONLY these fields"
+	i := strings.Index(got, anchor)
+	if i < 0 {
+		t.Fatalf("acceptance prompt missing closed-field-set region anchor %q\n---\n%s", anchor, got)
+	}
+	region := got[i:]
+	if end := strings.Index(region, "\n\n"); end >= 0 {
+		region = region[:end]
+	}
+	tokRe := regexp.MustCompile("`([^`]+)`")
+	distinct := map[string]struct{}{}
+	for _, m := range tokRe.FindAllStringSubmatch(region, -1) {
+		distinct[m[1]] = struct{}{}
+	}
+	if len(distinct) != len(wantVerdictProps) {
+		t.Errorf("closed-field-set region has %d distinct backtick tokens, want %d (adding a verdict field requires updating the prompt twin): %v",
+			len(distinct), len(wantVerdictProps), distinct)
 	}
 }
 
