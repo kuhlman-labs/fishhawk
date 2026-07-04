@@ -3948,6 +3948,121 @@ func TestGetStagePrompt_DecomposedChild_ScopeFiles(t *testing.T) {
 	})
 }
 
+// TestResolveDecomposedScope_DisjointSlices is the #1669 server-resolution
+// confinement guard: given a decomposed parent plan whose sub-plans declare
+// disjoint per-slice scope.files, each child's resolveDecomposedScopeFiles
+// narrows to exactly its slice (plus the coupled _test.go sibling), the
+// per-child narrowed sets are pairwise DISJOINT, the declared slice files
+// union back to the parent scope, and resolveDecomposedScopeConstraint carries
+// the same slice files. This is the primary regression that each fan-out child
+// is confined to its slice — not the whole plan.
+func TestResolveDecomposedScope_DisjointSlices(t *testing.T) {
+	parentRunID := uuid.New()
+	parentPlan := &plan.Plan{
+		PlanVersion: "standard_v1",
+		Summary:     "parent plan",
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{
+				{Path: "pkg/a/a.go", Operation: plan.FileOpModify},
+				{Path: "pkg/b/b.go", Operation: plan.FileOpModify},
+				{Path: "pkg/c/c.go", Operation: plan.FileOpModify},
+			},
+		},
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Decomposition: &plan.Decomposition{
+			Rationale: "scope split",
+			SubPlans: []plan.SubPlanSummary{
+				{Title: "Part A title", ScopeHint: "Implement Part A.", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/a/a.go", Operation: plan.FileOpModify}}}},
+				{Title: "Part B title", ScopeHint: "Implement Part B.", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/b/b.go", Operation: plan.FileOpModify}}}},
+				{Title: "Part C title", ScopeHint: "Implement Part C.", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/c/c.go", Operation: plan.FileOpModify}}}},
+			},
+		},
+	}
+
+	childFor := func(title string) *run.Run {
+		return &run.Run{
+			ID:             uuid.New(),
+			Repo:           "o/r",
+			ParentRunID:    &parentRunID,
+			DecomposedFrom: &parentRunID,
+			IssueContext: &run.IssueContext{
+				Title: title,
+				Body:  "## " + title + "\n\nslice body\n\n---\n*Decomposed sub-plan.*",
+			},
+		}
+	}
+
+	s := New(Config{Addr: "127.0.0.1:0"})
+	ctx := context.Background()
+
+	type slice struct {
+		title    string
+		wantFile string
+	}
+	slices := []slice{
+		{"Part A title", "pkg/a/a.go"},
+		{"Part B title", "pkg/b/b.go"},
+		{"Part C title", "pkg/c/c.go"},
+	}
+
+	narrowedSets := make([][]string, 0, len(slices))
+	unionDeclared := map[string]struct{}{}
+	for _, sl := range slices {
+		child := childFor(sl.title)
+
+		// (a) resolveDecomposedScopeFiles narrows to the slice + its coupled test.
+		gotFiles := scopePathsList(s.resolveDecomposedScopeFiles(ctx, child, parentPlan))
+		wantFiles := []string{sl.wantFile, coupledTestPath(sl.wantFile)}
+		if !reflect.DeepEqual(gotFiles, wantFiles) {
+			t.Errorf("%s: resolveDecomposedScopeFiles = %v, want its slice + coupled test %v", sl.title, gotFiles, wantFiles)
+		}
+		narrowedSets = append(narrowedSets, gotFiles)
+
+		// (c) resolveDecomposedScopeConstraint carries the declared slice files.
+		sc := s.resolveDecomposedScopeConstraint(ctx, child, parentPlan)
+		if sc == nil {
+			t.Fatalf("%s: resolveDecomposedScopeConstraint returned nil", sl.title)
+		}
+		if !reflect.DeepEqual(sc.ScopeFiles, []string{sl.wantFile}) {
+			t.Errorf("%s: constraint.ScopeFiles = %v, want %v", sl.title, sc.ScopeFiles, []string{sl.wantFile})
+		}
+		for _, f := range sc.ScopeFiles {
+			unionDeclared[f] = struct{}{}
+		}
+	}
+
+	// (b) the per-child narrowed sets are pairwise disjoint.
+	seen := map[string]string{}
+	for i, set := range narrowedSets {
+		for _, f := range set {
+			if prev, dup := seen[f]; dup {
+				t.Errorf("file %q appears in slice %q and slice %d — narrowed sets must be disjoint", f, prev, i)
+			}
+			seen[f] = slices[i].title
+		}
+	}
+
+	// (c cont.) the declared slice files union back to the parent scope.
+	wantUnion := map[string]struct{}{"pkg/a/a.go": {}, "pkg/b/b.go": {}, "pkg/c/c.go": {}}
+	if !reflect.DeepEqual(unionDeclared, wantUnion) {
+		t.Errorf("union of declared slice files = %v, want the parent scope %v", unionDeclared, wantUnion)
+	}
+}
+
+// scopePathsList extracts the ordered paths from a []scopeFile.
+func scopePathsList(sfs []scopeFile) []string {
+	out := make([]string, 0, len(sfs))
+	for _, f := range sfs {
+		out = append(out, f.Path)
+	}
+	return out
+}
+
+// coupledTestPath returns the _test.go sibling of a non-test .go path.
+func coupledTestPath(p string) string {
+	return strings.TrimSuffix(p, ".go") + "_test.go"
+}
+
 // TestCoupledTestSiblings exercises the pure stem-sibling derivation behind
 // the decomposed-child scope auto-fold (#1083): a non-test .go entry yields
 // its _test.go sibling, a _test.go entry yields nothing, non-.go and

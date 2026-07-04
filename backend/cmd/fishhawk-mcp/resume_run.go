@@ -111,6 +111,20 @@ func (r *runResolver) resumeRun(ctx context.Context, _ *mcp.CallToolRequest, in 
 				return nil, ResumeRunOutput{}, fmt.Errorf(
 					"run_not_found: no run with id %s — pass the FAILED run's id as parent_run_id (fishhawk_list_runs to find it)", parentID)
 			case "recovery_not_eligible":
+				// A decomposition child whose OWN implement SUCCEEDED is a
+				// distinct disposition from the child-failed-category-B path the
+				// generic message describes: the slice built cleanly but its
+				// branch could not merge onto the consolidated branch at fan-in
+				// (a parent slice_integration_conflict). In-place re-drive is
+				// correctly ineligible — there is nothing failed to re-drive —
+				// but the generic "requires the CHILD's implement FAILED
+				// category-B" text dead-ends the operator. Name the working
+				// recovery instead (#1669).
+				if implState, _ := ae.Details["implement_state"].(string); implState == "succeeded" {
+					return nil, ResumeRunOutput{}, fmt.Errorf(
+						"recovery_not_eligible: %s (implement_state=%v). This decomposition child's OWN implement stage SUCCEEDED, so there is nothing to re-drive in place — the failure is a parent slice_integration_conflict: the slice built cleanly but its branch could not merge onto the consolidated branch at fan-in. To recover: reset the conflicting slice branch onto the consolidated branch with fishhawk_reset_run_branch and re-drive that slice, or abandon this run and start a fresh run with fishhawk_start_run",
+						ae.Message, ae.Details["implement_state"])
+				}
 				return nil, ResumeRunOutput{}, fmt.Errorf(
 					"recovery_not_eligible: %s (plan_state=%v implement_state=%v failure_category=%v plan_resolved=%v). A top-level recovery requires the run's plan stage SUCCEEDED and its implement stage FAILED category-B; an in-place decomposition-child recovery requires the CHILD's own implement stage FAILED category-B and a plan resolvable via the parent walk. For category A/C/D use fishhawk_retry_stage instead",
 					ae.Message, ae.Details["plan_state"], ae.Details["implement_state"], ae.Details["failure_category"], ae.Details["plan_resolved"])

@@ -374,6 +374,11 @@ func TestParse_SubPlanScope_RoundTrips(t *testing.T) {
 				},
 				map[string]any{
 					"title": "Part B", "scope_hint": "second slice",
+					"scope": map[string]any{
+						"files": []any{
+							map[string]any{"path": "pkg/b/b.go", "operation": "modify"},
+						},
+					},
 					"predicted_runtime_minutes": 15, "predicted_runtime_confidence": "medium",
 				},
 			},
@@ -393,19 +398,43 @@ func TestParse_SubPlanScope_RoundTrips(t *testing.T) {
 	if got, want := subs[0].Scope.Files[0].Path, "pkg/a/a.go"; got != want {
 		t.Errorf("sub_plans[0].Scope.Files[0].Path = %q, want %q", got, want)
 	}
-	// Sub-plan without scope decodes to a nil pointer — the field is
-	// absent (additive optional), confirming backward compatibility.
-	if subs[1].Scope != nil {
-		t.Errorf("sub_plans[1].Scope = %+v, want nil (field omitted)", subs[1].Scope)
+	// Each slice carries its own disjoint scope — both round-trip into the
+	// typed SubPlanSummary.Scope (per-slice scope is now mandatory, #1669).
+	if subs[1].Scope == nil {
+		t.Fatal("sub_plans[1].Scope should be non-nil")
+	}
+	if got, want := subs[1].Scope.Files[0].Path, "pkg/b/b.go"; got != want {
+		t.Errorf("sub_plans[1].Scope.Files[0].Path = %q, want %q", got, want)
 	}
 }
 
-// TestParse_SubPlanWithoutScope_StillValidates confirms the additive field
-// did not become required: an existing decomposition shape lacking
-// sub-plan scope continues to validate.
-func TestParse_SubPlanWithoutScope_StillValidates(t *testing.T) {
-	if _, err := plan.Parse(marshalFixture(t, planfixture.Decomposed())); err != nil {
-		t.Fatalf("Parse decomposed fixture without sub-plan scope: %v", err)
+// TestParse_DecompositionOneSliceMissingScope_IsSemanticError covers the
+// #1669 gate at its narrowest: a two-slice decomposition where exactly ONE
+// slice omits scope.files is rejected, and the error names only the offending
+// slice (not the scoped sibling).
+func TestParse_DecompositionOneSliceMissingScope_IsSemanticError(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["decomposition"] = map[string]any{
+			"rationale": "split by layer",
+			"sub_plans": []any{
+				subPlanWithScope("alpha slice", "first", "backend/internal/server/a.go"),
+				map[string]any{
+					"title": "omega slice", "scope_hint": "second",
+					"predicted_runtime_minutes": 5, "predicted_runtime_confidence": "low",
+				},
+			},
+		}
+	})
+	_, err := plan.Parse(marshalFixture(t, m))
+	var se *plan.SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SemanticError", err)
+	}
+	if !strings.Contains(se.Error(), "omega slice") {
+		t.Errorf("SemanticError should name the unscoped slice, got %q", se.Error())
+	}
+	if strings.Contains(se.Error(), "alpha slice") {
+		t.Errorf("SemanticError should NOT name the already-scoped slice, got %q", se.Error())
 	}
 }
 
@@ -465,6 +494,9 @@ func TestParse_SubPlanModelRecommendation_RoundTrips(t *testing.T) {
 			"sub_plans": []any{
 				map[string]any{
 					"title": "Part A", "scope_hint": "first slice",
+					"scope": map[string]any{"files": []any{
+						map[string]any{"path": "pkg/a/a.go", "operation": "modify"},
+					}},
 					"predicted_runtime_minutes": 10, "predicted_runtime_confidence": "high",
 					"model_recommendation": map[string]any{
 						"implement_model":     "claude-sonnet-4-6",
@@ -474,6 +506,9 @@ func TestParse_SubPlanModelRecommendation_RoundTrips(t *testing.T) {
 				},
 				map[string]any{
 					"title": "Part B", "scope_hint": "second slice",
+					"scope": map[string]any{"files": []any{
+						map[string]any{"path": "pkg/b/b.go", "operation": "modify"},
+					}},
 					"predicted_runtime_minutes": 15, "predicted_runtime_confidence": "medium",
 				},
 			},
@@ -620,12 +655,59 @@ func TestParse_DecompositionDisjointSliceScopes_Succeeds(t *testing.T) {
 	}
 }
 
-// TestParse_DecompositionNoSubPlanScope_Succeeds confirms the check is
-// additive: sub-plans without a declared scope (inheriting the parent's full
-// scope.files) cannot partition unsoundly and must still parse.
-func TestParse_DecompositionNoSubPlanScope_Succeeds(t *testing.T) {
-	if _, err := plan.Parse(marshalFixture(t, planfixture.Decomposed())); err != nil {
-		t.Fatalf("Parse decomposed fixture without sub-plan scope: %v", err)
+// TestParse_DecompositionAllSlicesMissingScope_IsSemanticError is the #1669
+// gate: a decomposition where EVERY sub-plan omits scope.files (the old
+// full-scope-inheritance shape that made every fan-out child implement the
+// whole plan) is now rejected, and the error names each offending slice.
+func TestParse_DecompositionAllSlicesMissingScope_IsSemanticError(t *testing.T) {
+	// Build the old full-scope-inheritance shape directly: two slices, neither
+	// declaring scope.files (planfixture.Decomposed applies its opts inside
+	// Valid, before the decomposition is added, so it can't strip per-slice
+	// scope — hence the inline fixture).
+	m := planfixture.Valid(func(m map[string]any) {
+		m["decomposition"] = map[string]any{
+			"rationale": "scope exceeded single-stage budget",
+			"sub_plans": []any{
+				map[string]any{
+					"title": "Part A", "scope_hint": "a",
+					"predicted_runtime_minutes": 10, "predicted_runtime_confidence": "medium",
+				},
+				map[string]any{
+					"title": "Part B", "scope_hint": "b",
+					"predicted_runtime_minutes": 10, "predicted_runtime_confidence": "medium",
+				},
+			},
+		}
+	})
+	_, err := plan.Parse(marshalFixture(t, m))
+	var se *plan.SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SemanticError", err)
+	}
+	if !strings.Contains(se.Error(), "Part A") || !strings.Contains(se.Error(), "Part B") {
+		t.Errorf("SemanticError should name every unscoped slice, got %q", se.Error())
+	}
+	if !strings.Contains(se.Error(), "scope.files") {
+		t.Errorf("SemanticError should mention scope.files, got %q", se.Error())
+	}
+}
+
+// TestParse_DecompositionFullyScopedMultiSlice_Succeeds is the positive path:
+// a three-slice decomposition where every slice declares its own disjoint
+// scope.files parses cleanly under the #1669 gate.
+func TestParse_DecompositionFullyScopedMultiSlice_Succeeds(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["decomposition"] = map[string]any{
+			"rationale": "split by layer",
+			"sub_plans": []any{
+				subPlanWithScope("slice 1", "first", "backend/internal/a/a.go"),
+				subPlanWithScope("slice 2", "second", "backend/internal/b/b.go"),
+				subPlanWithScope("slice 3", "third", "backend/internal/c/c.go"),
+			},
+		}
+	})
+	if _, err := plan.Parse(marshalFixture(t, m)); err != nil {
+		t.Fatalf("Parse fully-scoped multi-slice decomposition: %v", err)
 	}
 }
 
@@ -651,10 +733,16 @@ func TestParse_DecompositionSingleSliceRepeatedPath_Succeeds(t *testing.T) {
 // --- depends_on / plan.Waves (#1258) ---
 
 // subPlanDep builds a minimal sub_plans entry with an optional depends_on.
-// A nil deps slice omits the field entirely (additive-optional path).
+// A nil deps slice omits the field entirely (additive-optional path). Each
+// entry declares a distinct per-slice scope.files (derived from the unique
+// title) so the decomposition satisfies the mandatory-per-slice-scope gate
+// (#1669); depends_on tests exercise Waves, not the scope check.
 func subPlanDep(title string, deps []int) map[string]any {
 	sp := map[string]any{
 		"title": title, "scope_hint": title,
+		"scope": map[string]any{"files": []any{
+			map[string]any{"path": "pkg/" + title + "/" + title + ".go", "operation": "modify"},
+		}},
 		"predicted_runtime_minutes": 5, "predicted_runtime_confidence": "low",
 	}
 	if deps != nil {
@@ -852,8 +940,8 @@ func TestWarnings_SubPlanSumLessThanParent_Explicit(t *testing.T) {
   "decomposition": {
     "rationale": "split",
     "sub_plans": [
-      {"title": "Part A", "scope_hint": "a", "predicted_runtime_minutes": 8, "predicted_runtime_confidence": "medium"},
-      {"title": "Part B", "scope_hint": "b", "predicted_runtime_minutes": 6, "predicted_runtime_confidence": "medium"}
+      {"title": "Part A", "scope_hint": "a", "scope": {"files": [{"path": "a.go", "operation": "create"}]}, "predicted_runtime_minutes": 8, "predicted_runtime_confidence": "medium"},
+      {"title": "Part B", "scope_hint": "b", "scope": {"files": [{"path": "b.go", "operation": "create"}]}, "predicted_runtime_minutes": 6, "predicted_runtime_confidence": "medium"}
     ]
   }
 }`))
@@ -880,8 +968,8 @@ func TestWarnings_SubPlanSumGeParent_NoWarnings(t *testing.T) {
   "decomposition": {
     "rationale": "split",
     "sub_plans": [
-      {"title": "Part A", "scope_hint": "a", "predicted_runtime_minutes": 8, "predicted_runtime_confidence": "medium"},
-      {"title": "Part B", "scope_hint": "b", "predicted_runtime_minutes": 6, "predicted_runtime_confidence": "medium"}
+      {"title": "Part A", "scope_hint": "a", "scope": {"files": [{"path": "a.go", "operation": "create"}]}, "predicted_runtime_minutes": 8, "predicted_runtime_confidence": "medium"},
+      {"title": "Part B", "scope_hint": "b", "scope": {"files": [{"path": "b.go", "operation": "create"}]}, "predicted_runtime_minutes": 6, "predicted_runtime_confidence": "medium"}
     ]
   }
 }`))

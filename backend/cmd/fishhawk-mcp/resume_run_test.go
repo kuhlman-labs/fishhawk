@@ -145,6 +145,40 @@ func TestResumeRun_NotEligible_MentionsDecompositionChild(t *testing.T) {
 	}
 }
 
+// TestResumeRun_NotEligible_SucceededChildSliceConflict_SurfacesRecovery pins
+// the #1669 recovery-gap fix: when the decomposition child's OWN implement
+// SUCCEEDED (implement_state=succeeded), the ineligibility is a parent
+// slice_integration_conflict — not the child-failed-category-B dead-end the
+// generic message describes. The mapping must name the WORKING recovery
+// (reset_run_branch + re-drive, or abandon + fresh run) instead of the generic
+// "requires the CHILD's implement FAILED category-B" text.
+func TestResumeRun_NotEligible_SucceededChildSliceConflict_SurfacesRecovery(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.recoverStatus = http.StatusConflict
+	fb.recoverErrBody = `{"error":{"code":"recovery_not_eligible","message":"in-place recovery of a decomposition child requires the child's own implement stage failed category-B and an approved plan resolvable via the parent walk","details":{"implement_state":"succeeded","failure_category":"","plan_resolved":true}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.resumeRun(context.Background(), nil, ResumeRunInput{ParentRunID: uuid.NewString()})
+	if err == nil {
+		t.Fatal("err = nil, want recovery_not_eligible mapping")
+	}
+	for _, want := range []string{
+		"recovery_not_eligible",
+		"implement_state=succeeded",
+		"slice_integration_conflict",
+		"fishhawk_reset_run_branch",
+		"fishhawk_start_run",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+	// The dead-end child-failed guidance must NOT be surfaced for this disposition.
+	if strings.Contains(err.Error(), "requires the CHILD's own implement stage FAILED category-B") {
+		t.Errorf("succeeded-child disposition must not surface the child-failed dead-end guidance: %q", err.Error())
+	}
+}
+
 func TestResumeRun_Unsupported_MapsActionableError(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	fb.recoverStatus = http.StatusUnprocessableEntity
