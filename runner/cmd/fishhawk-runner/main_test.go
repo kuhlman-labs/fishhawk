@@ -8150,6 +8150,79 @@ func TestRun_VerifyFixLoop_PassFirstIteration_SingleGitDiff(t *testing.T) {
 	}
 }
 
+// TestRun_VerifyFixLoop_AmendmentFolded_ReemitsGitDiff is the #1660 done-means
+// regression: an operator-approved mid-stage scope amendment folds a new path
+// into scope AFTER computeAndEmitDiff emitted the first git_diff, and the
+// committed-tree verify PASSES first iteration so the agent is NOT reinvoked.
+// The old strict-`reinvoked` gate left the folded-and-committed path out of the
+// last git_diff, so the backend's operator_scope_path_undelivered check
+// false-positived on the delivered file. The broadened `reinvoked ||
+// amendmentsFolded` gate must re-emit a fresh scope-only git_diff whose LAST
+// event carries the folded path — the delivered-not-undelivered proof.
+func TestRun_VerifyFixLoop_AmendmentFolded_ReemitsGitDiff(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	baseSHA := gitHead(t, repo)
+	// reg.go stays buggy (registry empty); the fix lives in seed.go, which is
+	// OUT of the initial scope (drift). Only after the amendment folds seed.go
+	// into scope does the committed scope-only tree carry the seeding init, so
+	// the first verify iteration PASSES without a reinvoke.
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetBuggy)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+	const seedMarker = `registry["x"] = 42`
+	mustWrite(t, filepath.Join(repo, "mod", "seed.go"),
+		"package mod\n\nfunc init() { "+seedMarker+" }\n")
+
+	// mirrorWorkingTreeFrom reflects the agent edits into the isolated worktree (#1137).
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "cd mod && go test ./...",
+		VerifyMaxIterations: 2,
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	// Approved amendment folding the out-of-scope seed.go into scope.
+	fu.amendments = []upload.ScopeAmendment{{
+		ID: "a1", Status: "approved",
+		Paths: []upload.ScopeAmendmentPath{{Path: "mod/seed.go", Operation: "create"}},
+	}}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	args := append(verifyFixRunArgs(repo, bundlePath), "--check-base-ref", baseSHA)
+	if got := run(args, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	// No reinvoke — verify passed first iteration once seed.go was folded.
+	if invoker.callIdx != 1 {
+		t.Errorf("Invoke call count = %d, want 1 (no fix reinvoke)", invoker.callIdx)
+	}
+
+	patches := gitDiffPatches(t, readBundleEvents(t, bundlePath))
+	if len(patches) != 2 {
+		t.Fatalf("git_diff event count = %d, want 2 (original + fold-triggered re-emit)", len(patches))
+	}
+	// The first git_diff predates the fold, so it must NOT carry seed.go; the
+	// re-emit — bound to the folded scope CommitAndPush will commit — must.
+	if strings.Contains(patches[0], "mod/seed.go") {
+		t.Errorf("first git_diff must PREDATE the fold (no seed.go), but it carries it:\n%s", patches[0])
+	}
+	last := patches[len(patches)-1]
+	if !strings.Contains(last, "mod/seed.go") || !strings.Contains(last, seedMarker) {
+		t.Errorf("last git_diff must carry the folded path mod/seed.go (%q), delivered-not-undelivered:\n%s", seedMarker, last)
+	}
+}
+
 // TestRun_VerifyGateCommitted_SingleShot_SingleGitDiff: the maxIterations==0
 // single-shot committed gate (#802) has no fix loop, so it never reinvokes and
 // must leave exactly one git_diff (computeAndEmitDiff's original) in the bundle.
