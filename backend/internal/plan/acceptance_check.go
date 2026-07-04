@@ -101,3 +101,23 @@ func EvaluateAcceptanceCriteria(v Verification) []AcceptanceFinding {
 func CriterionBlocking(c AcceptanceCriterion) bool {
 	return c.Blocking == nil || *c.Blocking
 }
+
+// AcceptanceSkippableOutOfScope reports whether a plan's verification declares
+// out_of_scope with ZERO acceptance_criteria — the single canonical condition
+// (#1657) under which the acceptance stage carries no observable criterion to
+// validate and can be auto-terminated rather than dispatched. It is the
+// out_of_scope escape hatch (the same justification that suppresses
+// no_blocking_criterion in EvaluateAcceptanceCriteria) applied to the acceptance
+// stage: a plan that declares what it deliberately does NOT cover AND enumerates
+// no acceptance criteria has nothing for a validator to check, so dispatching a
+// degenerate no-observable-change acceptance stage only stalls the run.
+//
+// This is the sole source of the skip condition. The pre-existing inlined
+// predicate at internal/prompt/prompt.go (the #1612 trivial-pass branch)
+// computes the identical condition; it is intentionally NOT refactored to call
+// this — prompt.go is out of this change's scope, and both compute the same
+// boolean, so the transient duplication is behavior-neutral and DRY-able in a
+// follow-up when prompt.go is legitimately in a run's scope.
+func AcceptanceSkippableOutOfScope(v Verification) bool {
+	return len(v.OutOfScope) > 0 && len(v.AcceptanceCriteria) == 0
+}

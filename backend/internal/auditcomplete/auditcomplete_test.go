@@ -62,6 +62,94 @@ func TestCompute_AllRulesPass(t *testing.T) {
 	}
 }
 
+// TestCompute_AcceptanceSkippedOutOfScope_ExemptsTraceRule pins the E38.3
+// (#1657) marker-gated exemption: an acceptance stage the orchestrator
+// auto-terminated (an acceptance_skipped_out_of_scope marker keyed to it) is
+// succeeded yet ships NO trace bundle — Compute must still pass it. The negative
+// control proves the exemption is MARKER-GATED, not blanket: the identical
+// succeeded acceptance stage WITHOUT the marker still fails trace_missing.
+func TestCompute_AcceptanceSkippedOutOfScope_ExemptsTraceRule(t *testing.T) {
+	build := func(t *testing.T, withMarker bool) (uuid.UUID, uuid.UUID, auditcomplete.Deps) {
+		t.Helper()
+		runID := uuid.New()
+		planS := mkStage(runID, 1, run.StageTypePlan, run.StageStateSucceeded)
+		impl := mkStage(runID, 2, run.StageTypeImplement, run.StageStateSucceeded)
+		rev := mkStage(runID, 3, run.StageTypeReview, run.StageStateAwaitingApproval)
+		acc := mkStage(runID, 4, run.StageTypeAcceptance, run.StageStateSucceeded)
+
+		runs := &fakeRuns{stages: []*run.Stage{planS, impl, rev, acc}}
+		arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+			planS.ID: {planArtifact(planS.ID, "standard_v1")},
+			impl.ID:  {pullRequestArtifact(impl.ID)},
+		}}
+		au := &fakeAudit{}
+		// Plan + implement ship both trace variants; the acceptance stage
+		// deliberately ships NONE (the auto-terminated stage runs no agent).
+		au.appendChained(t, runID, &planS.ID, "trace_uploaded", traceVariantPayload("raw"))
+		au.appendChained(t, runID, &planS.ID, "trace_uploaded", traceVariantPayload("redacted"))
+		au.appendChained(t, runID, &impl.ID, "trace_uploaded", traceVariantPayload("raw"))
+		au.appendChained(t, runID, &impl.ID, "trace_uploaded", traceVariantPayload("redacted"))
+		if withMarker {
+			au.appendChained(t, runID, &acc.ID, "acceptance_skipped_out_of_scope", json.RawMessage(`{"out_of_scope_count":1}`))
+		}
+		return runID, acc.ID, deps(runs, arts, au)
+	}
+
+	t.Run("with marker -> pass despite no acceptance trace", func(t *testing.T) {
+		runID, _, d := build(t, true)
+		state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+		if err != nil {
+			t.Fatalf("Compute: %v", err)
+		}
+		if state != stagecheck.StatePass {
+			t.Fatalf("state = %s, want pass; missing=%+v", state, missing)
+		}
+		if len(missing) != 0 {
+			t.Fatalf("want no missing items; got %+v", missing)
+		}
+	})
+
+	t.Run("without marker -> trace_missing for the acceptance stage", func(t *testing.T) {
+		runID, accID, d := build(t, false)
+		state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+		if err != nil {
+			t.Fatalf("Compute: %v", err)
+		}
+		if state != stagecheck.StateFail {
+			t.Fatalf("state = %s, want fail (an unmarked acceptance stage still needs its trace); missing=%+v", state, missing)
+		}
+		if !containsKind(missing, auditcomplete.MissingTrace) {
+			t.Fatalf("want a trace_missing item for the unmarked acceptance stage; got %+v", missing)
+		}
+		// The trace_missing must name the acceptance stage specifically.
+		named := false
+		for _, m := range missing {
+			if m.Kind == auditcomplete.MissingTrace && strings.Contains(m.Detail, "acceptance") {
+				named = true
+			}
+		}
+		if !named {
+			t.Errorf("trace_missing detail should name the acceptance stage (%s); got %+v", accID, missing)
+		}
+	})
+}
+
+// TestCompute_AcceptanceSkipMarkerReadError_Transient pins the E38.3 (#1657)
+// read-failure posture: a failure reading the acceptance_skipped_out_of_scope
+// markers is transient — Compute returns an error the caller retries, never a
+// silent under- or over-gate.
+func TestCompute_AcceptanceSkipMarkerReadError_Transient(t *testing.T) {
+	runID, runs, arts, ar := happyPath(t)
+	ar.catErr = map[string]error{"acceptance_skipped_out_of_scope": errors.New("boom")}
+	_, _, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err == nil {
+		t.Fatal("Compute must return a transient error when the skip-marker read fails")
+	}
+	if !strings.Contains(err.Error(), "acceptance skip markers") {
+		t.Errorf("error = %v, want it to name the acceptance skip markers read", err)
+	}
+}
+
 func TestCompute_PendingWhenStageMidFlight(t *testing.T) {
 	runID, runs, arts, ar := happyPath(t)
 	// Implement stage hasn't terminated yet.

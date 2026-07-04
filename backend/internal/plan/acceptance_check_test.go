@@ -124,6 +124,55 @@ func TestEvaluateAcceptanceCriteria_DuplicateID(t *testing.T) {
 	}
 }
 
+// (predicate: AcceptanceSkippableOutOfScope) The full truth table of the
+// out_of_scope-declared AND zero-acceptance_criteria skip condition (#1657):
+// true only when out_of_scope is non-empty and no criteria are present.
+func TestAcceptanceSkippableOutOfScope_TruthTable(t *testing.T) {
+	blocking := true
+	cases := []struct {
+		name string
+		v    Verification
+		want bool
+	}{
+		{
+			name: "out_of_scope + no criteria -> skippable",
+			v:    Verification{OutOfScope: []string{"deletion deferred"}},
+			want: true,
+		},
+		{
+			name: "out_of_scope + >=1 criteria -> NOT skippable",
+			v: Verification{
+				OutOfScope: []string{"deletion deferred"},
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{ID: "a1", Statement: "does a thing", Source: CriterionSourceExplicit, SourceRef: "#1", Blocking: &blocking},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "no out_of_scope + no criteria -> NOT skippable",
+			v:    Verification{},
+			want: false,
+		},
+		{
+			name: "no out_of_scope + >=1 criteria -> NOT skippable (both non-empty guard)",
+			v: Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{ID: "a1", Statement: "does a thing", Source: CriterionSourceExplicit, SourceRef: "#1", Blocking: &blocking},
+				},
+			},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := AcceptanceSkippableOutOfScope(tc.v); got != tc.want {
+				t.Errorf("AcceptanceSkippableOutOfScope = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // (clean contract) A fully clean criteria set returns a NON-NIL empty slice, so
 // a payload can distinguish "checked and clean" ([]) from "never checked".
 func TestEvaluateAcceptanceCriteria_CleanReturnsNonNilEmpty(t *testing.T) {

@@ -64,7 +64,7 @@ type NextActions struct {
 // every input except run and stages may be nil. For drive-enabled runs
 // with a distilled NextAction, that action is folded in FIRST so drive
 // and next_actions never point different ways.
-func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, drive *DriveStatus, mergeObserved bool, acceptanceVerdict, acceptanceTriageDisposition string) *NextActions {
+func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, drive *DriveStatus, mergeObserved, acceptanceSkippedOutOfScope bool, acceptanceVerdict, acceptanceTriageDisposition string) *NextActions {
 	if run == nil {
 		return nil
 	}
@@ -81,7 +81,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		return na
 	}
 
-	na := classifyNextActions(run, stages, planReviewStatus, implementReviewStatus, hint, mergeObserved, acceptanceVerdict, acceptanceTriageDisposition)
+	na := classifyNextActions(run, stages, planReviewStatus, implementReviewStatus, hint, mergeObserved, acceptanceSkippedOutOfScope, acceptanceVerdict, acceptanceTriageDisposition)
 
 	if drive != nil && drive.NextAction != nil {
 		na.Actions = append([]SuggestedAction{driveAction(run, drive.NextAction)}, na.Actions...)
@@ -99,7 +99,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 
 // classifyNextActions is the state table. Each arm returns a labeled
 // state with >= 1 action; only terminal arms return nil actions.
-func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, mergeObserved bool, acceptanceVerdict, acceptanceTriageDisposition string) *NextActions {
+func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, mergeObserved, acceptanceSkippedOutOfScope bool, acceptanceVerdict, acceptanceTriageDisposition string) *NextActions {
 	plan := stageByType(stages, "plan")
 	impl := stageByType(stages, "implement")
 	review := stageByType(stages, "review")
@@ -157,6 +157,18 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 			// approve_pr/merge_pr steps.
 			if mergeObserved {
 				return &NextActions{State: "succeeded_merged", Actions: []SuggestedAction{postMergeStep(run)}}
+			}
+			// E38.3 (#1657): the acceptance stage was auto-terminated because the
+			// approved plan declared verification.out_of_scope with no
+			// acceptance_criteria — the run stays MERGE-ELIGIBLE (the same
+			// merge-ritual actions), only the state label changes so the operator
+			// knows why no acceptance verdict was recorded. Graceful degradation:
+			// when the skip entry has aged out of the recent-audit window the flag
+			// is false and the arm falls back to plain succeeded_pr_open, itself
+			// merge-eligible.
+			if acceptanceSkippedOutOfScope {
+				return &NextActions{State: "succeeded_acceptance_skipped_out_of_scope", Actions: mergeRitualActions(run,
+					"the run succeeded with its PR open; the acceptance stage was auto-terminated because the approved plan declared verification.out_of_scope with no acceptance_criteria (E38.3 / #1657) — still merge-eligible")}
 			}
 			return &NextActions{State: "succeeded_pr_open", Actions: mergeRitualActions(run, "the run succeeded with its PR open")}
 		}
@@ -909,6 +921,22 @@ func mergeObservedIn(recent []AuditEntry) bool {
 	return false
 }
 
+// acceptanceSkippedOutOfScopeIn reports whether the recent-audit slice carries
+// an acceptance_skipped_out_of_scope entry (E38.3 / #1657) — the orchestrator's
+// marker that it auto-terminated a degenerate acceptance stage. getRunStatus
+// computes this off the same `recent` slice it already fetches (the
+// mergeObservedIn idiom) and threads it into nextActionsFor to relabel the
+// succeeded_acceptance_skipped_out_of_scope state; a marker aged out of the
+// window degrades to plain succeeded_pr_open (still merge-eligible).
+func acceptanceSkippedOutOfScopeIn(recent []AuditEntry) bool {
+	for _, e := range recent {
+		if e.Category == auditCategoryAcceptanceSkippedOutOfScope {
+			return true
+		}
+	}
+	return false
+}
+
 // unclassifiedNextActions is the labeled fallback for any non-terminal
 // state the table does not match: re-poll (always legal) plus a pointer
 // to file a product issue naming the state so the table gains an arm.
@@ -1010,6 +1038,10 @@ const sliceIntegrationConflictReasonPrefix = "slice integration conflict"
 const (
 	auditCategoryAcceptanceOutcomeRecorded = "acceptance_outcome_recorded"
 	auditCategoryAcceptanceTriageDecided   = "acceptance_triage_decided"
+	// auditCategoryAcceptanceSkippedOutOfScope is the marker the orchestrator
+	// emits when it auto-terminates a degenerate acceptance stage (E38.3 /
+	// #1657). MUST match backend/internal/server.CategoryAcceptanceSkippedOutOfScope.
+	auditCategoryAcceptanceSkippedOutOfScope = "acceptance_skipped_out_of_scope"
 
 	acceptanceVerdictPassed = "passed"
 	acceptanceVerdictFailed = "failed"

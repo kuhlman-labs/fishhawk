@@ -225,17 +225,41 @@ func Compute(ctx context.Context, runID uuid.UUID, deps Deps) (stagecheck.State,
 		return stagecheck.StatePending, nil, fmt.Errorf("auditcomplete: list stages: %w", err)
 	}
 
+	// E38.3 (#1657): an acceptance stage the orchestrator auto-terminated for an
+	// out_of_scope / zero-acceptance_criteria plan ships NO trace bundle yet is
+	// legitimately succeeded. Read the skip markers once and build the set of
+	// skipped stage ids so the partition below can exempt those stages from the
+	// trace-required rule the same way review stages are exempt. A read failure is
+	// transient (matching Rule 2's / Rule 6's I/O posture): return it so the caller
+	// retries rather than silently under- or over-gating. A normally-dispatched
+	// acceptance stage carries no marker and still requires its trace (the
+	// exemption is marker-gated, not blanket).
+	skipMarkers, err := deps.Audit.ListForRunByCategory(ctx, runID, "acceptance_skipped_out_of_scope")
+	if err != nil {
+		return stagecheck.StatePending, nil, fmt.Errorf("auditcomplete: acceptance skip markers: %w", err)
+	}
+	skippedStageIDs := make(map[uuid.UUID]struct{}, len(skipMarkers))
+	for _, e := range skipMarkers {
+		if e.StageID != nil {
+			skippedStageIDs[*e.StageID] = struct{}{}
+		}
+	}
+
 	// Sort the stages we care about by type. Review stages don't
 	// produce traces or artifacts of their own — they consume the
 	// implement stage's pull_request — so they're excluded from
-	// the "every non-review stage must have shipped a trace" rule.
+	// the "every non-review stage must have shipped a trace" rule. A
+	// skipped acceptance stage (E38.3) is excluded on the same footing:
+	// it is succeeded but ships no trace by design.
 	var (
 		planStage      *run.Stage
 		implementStage *run.Stage
 		nonReview      []*run.Stage
 	)
 	for _, s := range stages {
-		if s.Type != run.StageTypeReview {
+		_, isSkippedAcceptance := skippedStageIDs[s.ID]
+		isSkippedAcceptance = isSkippedAcceptance && s.Type == run.StageTypeAcceptance
+		if s.Type != run.StageTypeReview && !isSkippedAcceptance {
 			nonReview = append(nonReview, s)
 		}
 		switch s.Type {

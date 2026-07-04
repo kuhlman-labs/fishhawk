@@ -277,6 +277,49 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 		return OutcomeDispatched, nil
 	}
 
+	// E38.3 (#1657): auto-terminate a degenerate acceptance stage. When the
+	// approved plan declares verification.out_of_scope with ZERO
+	// acceptance_criteria, the acceptance stage has no observable criterion to
+	// validate — dispatching it would only stall the run waiting for an operator
+	// to run a no-op stage (the operator deadlock this closes, the #1612
+	// companion). Walk it straight to succeeded exactly like dispatchAutoMergeStage
+	// does for auto-merge (the state machine forbids pending → succeeded directly),
+	// emit an acceptance_skipped_out_of_scope marker so auditcomplete exempts it
+	// from the trace-required rule, then re-enter Advance so the now-terminal
+	// acceptance stage lets the run reach completeRun → succeeded in the SAME call.
+	// Guarded by o.Artifacts != nil (a harness without the artifact repo takes the
+	// unchanged dispatch path — decomposition children have no plan stage anyway,
+	// so loadApprovedPlan returns nil for them and this never fires). Placed BEFORE
+	// the decomposition / consolidated-PR / dispatch block so no workflow_dispatch
+	// can fire for the skipped stage. A load error surfaces (do NOT silently
+	// dispatch); a nil plan or a false predicate falls through to the unchanged
+	// operator-dispatched acceptance path.
+	if next.Type == run.StageTypeAcceptance && o.Artifacts != nil {
+		approvedPlan, _, err := o.loadApprovedPlan(ctx, stages)
+		if err != nil {
+			return OutcomeNoOp, fmt.Errorf("orchestrator: load approved plan for acceptance skip: %w", err)
+		}
+		if approvedPlan != nil && plan.AcceptanceSkippableOutOfScope(approvedPlan.Verification) {
+			for _, to := range []run.StageState{
+				run.StageStateDispatched,
+				run.StageStateRunning,
+				run.StageStateSucceeded,
+			} {
+				if _, err := o.Runs.TransitionStage(ctx, next.ID, to, nil); err != nil {
+					return OutcomeNoOp, fmt.Errorf("orchestrator: walk acceptance stage to %s for out-of-scope skip: %w", to, err)
+				}
+			}
+			o.emitAcceptanceSkippedOutOfScope(ctx, r.ID, next.ID, next.Sequence, len(approvedPlan.Verification.OutOfScope))
+			o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator auto-terminated acceptance stage (out_of_scope, zero acceptance_criteria)",
+				slog.String("run_id", r.ID.String()),
+				slog.String("stage_id", next.ID.String()),
+				slog.Int("sequence", next.Sequence),
+				slog.Int("out_of_scope_count", len(approvedPlan.Verification.OutOfScope)),
+			)
+			return o.Advance(ctx, runID)
+		}
+	}
+
 	// ADR-025 D4: when the approved plan declares decomposition,
 	// fan the parent's implement stage out into child runs rather
 	// than dispatching it. Only checked when the next pending stage
@@ -696,6 +739,48 @@ func (o *Orchestrator) emitAcceptanceDispatched(ctx context.Context, runID, stag
 		Payload:   payload,
 	}); err != nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append acceptance_dispatched failed",
+			slog.String("error", err.Error()))
+	}
+}
+
+// emitAcceptanceSkippedOutOfScope writes an acceptance_skipped_out_of_scope
+// audit entry (system actor) when the orchestrator auto-terminates a degenerate
+// acceptance stage — an approved plan that declares verification.out_of_scope
+// with zero acceptance_criteria (E38.3 / #1657). Best-effort, mirroring
+// emitAcceptanceDispatched: nil-Audit guard, WARN-on-error, never unwinds the
+// walk. The category literal is byte-identical to
+// server.CategoryAcceptanceSkippedOutOfScope — auditcomplete reads it to exempt
+// the skipped stage from the trace-required rule and the MCP next_actions surface
+// reads it to label the succeeded_acceptance_skipped_out_of_scope state. Appended
+// with AppendChained so Rule 4 chain-verify stays intact. The payload carries
+// stage_id/sequence/out_of_scope_count and the skip reason.
+func (o *Orchestrator) emitAcceptanceSkippedOutOfScope(ctx context.Context, runID, stageID uuid.UUID, sequence, outOfScopeCount int) {
+	if o.Audit == nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping acceptance_skipped_out_of_scope entry",
+			slog.String("run_id", runID.String()))
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"stage_id":           stageID.String(),
+		"sequence":           sequence,
+		"out_of_scope_count": outOfScopeCount,
+		"reason":             "approved plan declares verification.out_of_scope with zero acceptance_criteria; acceptance stage auto-terminated with no observable-change validation",
+	})
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal acceptance_skipped_out_of_scope payload failed",
+			slog.String("error", err.Error()))
+		return
+	}
+	systemKind := audit.ActorSystem
+	if _, err := o.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "acceptance_skipped_out_of_scope",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append acceptance_skipped_out_of_scope failed",
 			slog.String("error", err.Error()))
 	}
 }
