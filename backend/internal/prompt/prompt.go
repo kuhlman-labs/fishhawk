@@ -1380,12 +1380,14 @@ func buildAcceptance(t Trigger) string {
 	b.WriteString("- `failure_mode` (REQUIRED when verdict is `failed`): `error` when the " +
 		"instance crashed / returned a 500 / threw an exception; `assertion_fail` when it " +
 		"behaved without erroring but produced an unexpected result. Omit on a pass.\n")
-	b.WriteString("- `criteria`: one result per acceptance criterion above, keyed by the " +
-		"criterion `id`, each with `result` (`passed`/`failed`/`skipped`) and, where useful, " +
-		"`steps_taken` / `observed` / `expected`, plus `expectation_basis` (where the " +
-		"expectation came from — the criterion statement, the issue text, a spec section) and " +
-		"`repro_handle` (the command or request a human can re-run to reproduce the " +
-		"observation).\n\n")
+	b.WriteString("- `criteria`: a flat JSON array of per-criterion result objects, one per " +
+		"acceptance criterion above, each carrying its criterion `id` and a `result` " +
+		"(`passed`/`failed`/`skipped`) and, where useful, `steps_taken` / `observed` / " +
+		"`expected`, plus `expectation_basis` (where the expectation came from — the criterion " +
+		"statement, the issue text, a spec section) and `repro_handle` (the command or request " +
+		"a human can re-run to reproduce the observation); for example " +
+		"`[{\"id\":\"crit-1\",\"result\":\"passed\"},{\"id\":\"crit-2\",\"result\":\"failed\"}]` " +
+		"— never an id-keyed object like `{\"crit-1\":{...},\"crit-2\":{...}}`.\n\n")
 	b.WriteString("- `target_url` (OPTIONAL): a full http(s) URL of the running instance you " +
 		"drove, for example `http://localhost:8090` — never a bare host:port.\n")
 	b.WriteString("- `evidence_hashes` (OPTIONAL): a flat JSON array of content-hash strings, " +
