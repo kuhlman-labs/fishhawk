@@ -49,6 +49,14 @@ func TestHelperProcess(t *testing.T) {
 		fmt.Println(`{"type":"system","subtype":"init"}`)
 		fmt.Fprintln(os.Stderr, "agent: model rate-limited")
 		os.Exit(1)
+	case "external_api_529":
+		// Emit a terminal result event carrying a 5xx api_error_status
+		// (529 overloaded, the agent's in-run retries exhausted) then exit
+		// non-zero — the terminal external-API incident path.
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		fmt.Println(`{"type":"result","subtype":"error","is_error":true,"api_error_status":529,"result":"Overloaded"}`)
+		fmt.Fprintln(os.Stderr, "API Error: 529 Overloaded")
+		os.Exit(1)
 	case "raw_line":
 		// Non-JSON output should not crash the harness; it must
 		// still appear in the trace as kind=raw.
@@ -1119,6 +1127,100 @@ func TestInvoke_GenericExitNoRetry(t *testing.T) {
 	}
 	if starts != 1 {
 		t.Errorf("invocation_start count = %d, want 1 (no retry on generic failure)", starts)
+	}
+}
+
+// TestInvoke_ExternalAPIError asserts the terminal 5xx external-API arm
+// (#1548): a non-zero exit whose terminal result event carries a 5xx
+// api_error_status is classified category-A with the ErrExternalAPI
+// sentinel, lifts the status onto Result.APIErrorStatus, and embeds the
+// stable "terminal external API error <N>" phrase (naming the status) in
+// the failure reason — with no retry (single attempt).
+func TestInvoke_ExternalAPIError(t *testing.T) {
+	inv := &Invoker{
+		Cmd:                     helperCommand("external_api_529"),
+		Now:                     frozenNow(),
+		MaxThinkingBlockRetries: 1,
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{})
+	if !errors.Is(err, agent.ErrExternalAPI) {
+		t.Fatalf("err = %v, want wrapping ErrExternalAPI", err)
+	}
+	// A terminal external-API error is NOT the thinking-block fault and must
+	// not be classified as one.
+	if errors.Is(err, agent.ErrAgentThinkingBlock) {
+		t.Error("external-API error must not be classified as thinking-block")
+	}
+	if res.OK {
+		t.Error("OK = true on external-API error")
+	}
+	if res.FailureCategory != "A" {
+		t.Errorf("FailureCategory = %q, want A", res.FailureCategory)
+	}
+	if res.APIErrorStatus != 529 {
+		t.Errorf("APIErrorStatus = %d, want 529", res.APIErrorStatus)
+	}
+	if !strings.Contains(res.FailureReason, "529") {
+		t.Errorf("FailureReason = %q, want it to name status 529", res.FailureReason)
+	}
+	if !strings.Contains(res.FailureReason, "terminal external API error") {
+		t.Errorf("FailureReason = %q, want the stable phrase", res.FailureReason)
+	}
+	// No retry: exactly one attempt (a re-run would just re-hit the incident).
+	var starts int
+	for _, ev := range res.Events {
+		if ev.Kind == "invocation_start" {
+			starts++
+		}
+	}
+	if starts != 1 {
+		t.Errorf("invocation_start count = %d, want 1 (no retry on external-API error)", starts)
+	}
+}
+
+// TestInvoke_NonExternalAPIErrorStaysAgentError is the regression guard for
+// the arm ordering: a plain non-zero exit with NO api_error_status stays a
+// generic agent_error (ErrAgentFailed) with APIErrorStatus==0 — the >=500
+// arm must not swallow ordinary failures.
+func TestInvoke_NonExternalAPIErrorStaysAgentError(t *testing.T) {
+	inv := &Invoker{
+		Cmd: helperCommand("error"),
+		Now: frozenNow(),
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{})
+	if !errors.Is(err, agent.ErrAgentFailed) {
+		t.Fatalf("err = %v, want ErrAgentFailed", err)
+	}
+	if errors.Is(err, agent.ErrExternalAPI) {
+		t.Error("a status-less agent error must not be classified as external-API")
+	}
+	if res.APIErrorStatus != 0 {
+		t.Errorf("APIErrorStatus = %d, want 0 for a non-external-API failure", res.APIErrorStatus)
+	}
+}
+
+// TestTerminalAPIErrorStatus_TruthTable pins the helper's extraction: a 5xx
+// status is returned, an absent/unparseable/non-5xx payload yields 0 (the
+// arm ordering then keeps a non-5xx failure on the generic path).
+func TestTerminalAPIErrorStatus_TruthTable(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    int
+	}{
+		{"status_529", `{"type":"result","is_error":true,"api_error_status":529,"result":"Overloaded"}`, 529},
+		{"status_503", `{"type":"result","api_error_status":503}`, 503},
+		{"status_400_thinking", `{"type":"result","api_error_status":400,"result":"x"}`, 400},
+		{"no_status_field", `{"type":"result","is_error":true,"result":"boom"}`, 0},
+		{"unparseable", `not json`, 0},
+		{"empty", "", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := terminalAPIErrorStatus([]byte(tc.payload)); got != tc.want {
+				t.Errorf("terminalAPIErrorStatus(%q) = %d, want %d", tc.payload, got, tc.want)
+			}
+		})
 	}
 }
 

@@ -3,10 +3,53 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 )
+
+// TestAPIError_Error pins the apiError.Error() rendering (#1548): a
+// non-empty Details map appends a deterministic JSON suffix so callers that
+// format the error via %v (e.g. run_children's between-wave transport
+// warning) surface the real cause; an empty/nil Details map renders the
+// concise form with no "details:" suffix.
+func TestAPIError_Error(t *testing.T) {
+	t.Run("with details surfaces the cause", func(t *testing.T) {
+		e := &apiError{
+			StatusCode: 502,
+			Code:       "slice_integration_error",
+			Message:    "integrate-wave failed",
+			Details:    map[string]any{"error": "merge conflict in foo.go"},
+		}
+		got := e.Error()
+		if !strings.Contains(got, "slice_integration_error") {
+			t.Errorf("missing code in %q", got)
+		}
+		if !strings.Contains(got, "details:") {
+			t.Errorf("missing details suffix in %q", got)
+		}
+		if !strings.Contains(got, "merge conflict in foo.go") {
+			t.Errorf("details cause not surfaced in %q", got)
+		}
+	})
+	t.Run("empty details omits the suffix", func(t *testing.T) {
+		e := &apiError{StatusCode: 500, Code: "internal", Message: "boom"}
+		got := e.Error()
+		if strings.Contains(got, "details:") {
+			t.Errorf("empty Details must not render a details suffix: %q", got)
+		}
+		if got != "fishhawk: HTTP 500 (internal): boom" {
+			t.Errorf("unexpected concise render: %q", got)
+		}
+	})
+	t.Run("no code, no details", func(t *testing.T) {
+		e := &apiError{StatusCode: 503}
+		if got := e.Error(); got != "fishhawk: HTTP 503" {
+			t.Errorf("unexpected render: %q", got)
+		}
+	})
+}
 
 // TestCreateCampaign_OperatorAgentBytes_OmittedWhenNil pins the apiClient wire
 // contract for the OPTIONAL campaign-level operator_agent override (E25.12 /

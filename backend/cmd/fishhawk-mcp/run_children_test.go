@@ -9,6 +9,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -851,12 +853,36 @@ func TestRunChildren_IntegrateWaveTransportErrorStopsLoop(t *testing.T) {
 	seedChildRun(fb, child1, "pending")
 	seedPlanDecomposedWaves(fb, parent, []string{child0.String(), child1.String()}, 0, [][]int{{0}, {1}})
 
-	// A non-2xx status makes apiClient.IntegrateWave return an *apiError (ierr != nil).
-	// Deliberately do NOT seed integrateWaveResp: on the status-code error path the
-	// decoded body is irrelevant — the contrast with the slice_conflict test.
-	fb.mu.Lock()
-	fb.integrateWaveStatus = http.StatusBadGateway
-	fb.mu.Unlock()
+	// Wrap the fake with an interceptor that answers integrate-wave with a 502
+	// carrying a proper error envelope (details.error = the real cause) so
+	// apiClient.IntegrateWave returns an *apiError whose Details map is
+	// populated (ierr != nil). Every other route reverse-proxies to the fake
+	// unchanged. This exercises the #1548 apiError.Error() Details rendering:
+	// the between-wave warning must surface the cause, not just an opaque
+	// HTTP-status stop.
+	const cause = "consolidated branch fetch failed: connection reset"
+	fakeURL, perr := url.Parse(srv.URL)
+	if perr != nil {
+		t.Fatalf("parse fake url: %v", perr)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/integrate-wave", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"code":    "slice_integration_error",
+				"message": "integrate-wave failed",
+				"details": map[string]any{"error": cause},
+			},
+		})
+	})
+	mux.Handle("/", httputil.NewSingleHostReverseProxy(fakeURL))
+	wrapped := httptest.NewServer(mux)
+	defer wrapped.Close()
+	// Point the resolver's client at the wrapper; seeds still land on the fake
+	// via the proxy.
+	r.api = newAPIClient(config{backendURL: wrapped.URL, apiToken: "tok-test"})
 
 	spawn, baseByID, mu := captureBaseSpawn(nil)
 	withFakeSpawn(t, spawn)
@@ -881,6 +907,11 @@ func TestRunChildren_IntegrateWaveTransportErrorStopsLoop(t *testing.T) {
 	}
 	if !containsWarning(out.Warnings, "stopping before the next wave") {
 		t.Errorf("warnings = %v, want the transport-error branch wording (distinct from slice conflict)", out.Warnings)
+	}
+	// #1548: the warning now surfaces the real cause from the error envelope's
+	// details map (rendered by apiError.Error()), not an opaque HTTP-status stop.
+	if !containsWarning(out.Warnings, cause) {
+		t.Errorf("warnings = %v, want the details.error cause %q surfaced via apiError.Error()", out.Warnings, cause)
 	}
 }
 

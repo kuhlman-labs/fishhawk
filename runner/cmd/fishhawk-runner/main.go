@@ -2387,9 +2387,37 @@ func logCompletion(w io.Writer, res agent.Result, err error) {
 	if category == "" {
 		category = "A"
 	}
-	_, _ = fmt.Fprintf(w,
-		`{"event":"runner_completed","outcome":"failed","category":%q,"reason":%q,"tokens_used":%d,"err_class":%q}`+"\n",
-		category, reason, res.TokensUsed, classifyErr(err))
+	// Marshal the failure line via a struct so api_error_status is emitted
+	// with omitempty — present when a terminal 5xx external-API error lifted
+	// a status onto the Result (>0), absent otherwise (==0) — without hand
+	// managing comma placement. The field ordering is irrelevant to the
+	// substring-based log assertions.
+	line, mErr := json.Marshal(struct {
+		Event          string `json:"event"`
+		Outcome        string `json:"outcome"`
+		Category       string `json:"category"`
+		Reason         string `json:"reason"`
+		TokensUsed     int    `json:"tokens_used"`
+		ErrClass       string `json:"err_class"`
+		APIErrorStatus int    `json:"api_error_status,omitempty"`
+	}{
+		Event:          "runner_completed",
+		Outcome:        "failed",
+		Category:       category,
+		Reason:         reason,
+		TokensUsed:     res.TokensUsed,
+		ErrClass:       classifyErr(err),
+		APIErrorStatus: res.APIErrorStatus,
+	})
+	if mErr != nil {
+		// Should never happen (all fields are plain scalars); fall back to
+		// the pre-struct format so a failure line is never silently dropped.
+		_, _ = fmt.Fprintf(w,
+			`{"event":"runner_completed","outcome":"failed","category":%q,"reason":%q,"tokens_used":%d,"err_class":%q}`+"\n",
+			category, reason, res.TokensUsed, classifyErr(err))
+		return
+	}
+	_, _ = fmt.Fprintf(w, "%s\n", line)
 }
 
 // classifyErr returns a stable short label for the wrapped agent
@@ -2408,6 +2436,8 @@ func classifyErr(err error) string {
 		return "agent_api_thinking_block"
 	case errors.Is(err, agent.ErrLoopDetected):
 		return "loop_detected"
+	case errors.Is(err, agent.ErrExternalAPI):
+		return "external_api"
 	case errors.Is(err, agent.ErrAgentFailed):
 		return "agent_failed"
 	default:

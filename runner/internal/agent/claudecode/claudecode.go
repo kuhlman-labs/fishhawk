@@ -172,6 +172,10 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 			agg.OK = res.OK
 			agg.FailureCategory = res.FailureCategory
 			agg.FailureReason = res.FailureReason
+			// Carry the terminal external-API status (0 on every other path)
+			// through the aggregate so the runner_completed event and the
+			// operator next_actions hint can name it (#1548).
+			agg.APIErrorStatus = res.APIErrorStatus
 			return agg, err
 		}
 
@@ -621,6 +625,10 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	// A non-zero exit whose result payload or stderr carries the
 	// durable thinking-block marker is the one fault Invoke retries.
 	thinkingBlock := waitErr != nil && isThinkingBlock400(resultPayload, stderrBuf.String())
+	// apiStatus is the terminal result event's api_error_status (0 when
+	// absent). A 5xx value denotes a terminal external-API incident (the
+	// agent's in-run retries were exhausted), lifted below onto the Result.
+	apiStatus := terminalAPIErrorStatus(resultPayload)
 
 	switch {
 	case budgetHit:
@@ -651,6 +659,22 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 			fmt.Sprintf("transient thinking-block API 400: %v", waitErr),
 			"agent_api_thinking_block",
 		), true, fmt.Errorf("%w: %v", agent.ErrAgentThinkingBlock, waitErr)
+
+	case waitErr != nil && apiStatus >= 500:
+		// A terminal 5xx external-API error (overloaded/unavailable, e.g.
+		// 529 — the agent's in-run retries were exhausted). Still an
+		// agent-surface failure (category "A") but the ErrExternalAPI
+		// sentinel plus the stable "terminal external API error <N>" reason
+		// phrase carry the real upstream cause so the operator surface can
+		// name it without trace archaeology. Checked AFTER the 400
+		// thinking-block arm (status-disjoint) and BEFORE the generic
+		// agent_error arm; a non-5xx failure falls through with
+		// APIErrorStatus==0.
+		res.APIErrorStatus = apiStatus
+		return failureResult(res, now(), "A",
+			fmt.Sprintf("terminal external API error %d (retries exhausted): %v", apiStatus, waitErr),
+			"external_api",
+		), false, fmt.Errorf("%w: %v", agent.ErrExternalAPI, waitErr)
 
 	case waitErr != nil:
 		return failureResult(res, now(), "A",
@@ -701,6 +725,24 @@ func isThinkingBlock400(resultPayload []byte, stderr string) bool {
 		return *meta.APIErrorStatus == 400
 	}
 	return true
+}
+
+// terminalAPIErrorStatus extracts the terminal result event's
+// api_error_status integer from the retained result payload, returning 0
+// when the field is absent or the payload is unparseable. It reads the
+// SAME api_error_status field isThinkingBlock400 already inspects; here a
+// 5xx value classifies the failure as a terminal external-API incident
+// (see the apiStatus>=500 arm in invokeOnce). Fail-soft: any unmarshal
+// error or a missing field yields 0, so a non-5xx / no-status failure
+// falls through to the unchanged generic agent_error path.
+func terminalAPIErrorStatus(resultPayload []byte) int {
+	var meta struct {
+		APIErrorStatus *int `json:"api_error_status"`
+	}
+	if err := json.Unmarshal(resultPayload, &meta); err == nil && meta.APIErrorStatus != nil {
+		return *meta.APIErrorStatus
+	}
+	return 0
 }
 
 func (i *Invoker) now() time.Time {

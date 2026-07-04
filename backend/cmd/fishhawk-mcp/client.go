@@ -66,10 +66,23 @@ type apiError struct {
 }
 
 func (e *apiError) Error() string {
+	var base string
 	if e.Code == "" {
-		return fmt.Sprintf("fishhawk: HTTP %d", e.StatusCode)
+		base = fmt.Sprintf("fishhawk: HTTP %d", e.StatusCode)
+	} else {
+		base = fmt.Sprintf("fishhawk: HTTP %d (%s): %s", e.StatusCode, e.Code, e.Message)
 	}
-	return fmt.Sprintf("fishhawk: HTTP %d (%s): %s", e.StatusCode, e.Code, e.Message)
+	// Append the parsed Details map when present so callers that render the
+	// error via %v (e.g. run_children's between-wave integrate-wave transport
+	// warning) surface details.error — the real cause — instead of an opaque
+	// HTTP-status stop. encoding/json marshals map keys in sorted order, so
+	// the suffix is deterministic for tests. A nil/empty map appends nothing.
+	if len(e.Details) > 0 {
+		if b, err := json.Marshal(e.Details); err == nil {
+			base += "; details: " + string(b)
+		}
+	}
+	return base
 }
 
 // Run mirrors the OpenAPI Run schema's wire shape. Subset: the MCP
