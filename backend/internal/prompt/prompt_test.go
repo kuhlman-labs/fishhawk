@@ -5253,9 +5253,11 @@ func TestBuild_Acceptance_IndependenceNoDiffOrScope(t *testing.T) {
 
 // TestBuild_Acceptance_ShapePinnedFields pins the #1574-class output-contract
 // bullets: target_url must be pinned as a full http(s) URL with the
-// http://localhost:8090-form example, and evidence_hashes as a flat array with
-// its inline example — so the schemaless file-fallback agent emits the shapes
-// the twin decoders expect instead of the object-map / bare-host variants.
+// http://localhost:8090-form example, evidence_hashes as a flat array with its
+// inline example, and criteria as a flat array of per-criterion objects with a
+// positive example plus an id-keyed anti-example (#1656 / E38.2) — so the
+// schemaless file-fallback agent emits the shapes the twin decoders expect
+// instead of the object-map / bare-host / id-keyed-criteria variants.
 func TestBuild_Acceptance_ShapePinnedFields(t *testing.T) {
 	got, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
 	if err != nil {
@@ -5268,6 +5270,9 @@ func TestBuild_Acceptance_ShapePinnedFields(t *testing.T) {
 		"a flat JSON array of content-hash strings",
 		`["sha256:ab12...","sha256:cd34..."]`,
 		"never an object or map",
+		"a flat JSON array of per-criterion result objects",
+		`[{"id":"crit-1","result":"passed"},{"id":"crit-2","result":"failed"}]`,
+		"never an id-keyed object",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("acceptance output contract missing shape-pin %q:\n%s", want, got)
