@@ -189,11 +189,17 @@ func TestExecuteFiling_HappyPath_EpicThenChildrenWithResolvedDeps(t *testing.T) 
 	if filer.calls[0].Type != "epic" || len(filer.calls[0].ExistingNumbers) != 0 {
 		t.Errorf("epic call = %+v, want type=epic and empty ExistingNumbers", filer.calls[0])
 	}
-	// child2 (the last call) carries the epic number title var (100), the `#100`
-	// parent ref, and the resolved `#101` depends_on ref.
+	// child2 (the last call) carries n=2 but NO {epic} title var: the executor
+	// leaves it unset so the server-side deriveEpicTitleVar derives the epic's
+	// DISCOVERED ordinal downstream (#1644); the epic issue number is only the
+	// `#100` parent ref, never the title var. The scripted fake does NOT run
+	// deriveEpicTitleVar (that is the server layer), so the "epic" key is absent.
 	c2 := filer.calls[2]
-	if c2.TitleVars["epic"] != "100" || c2.TitleVars["n"] != "2" {
-		t.Errorf("child2 title vars = %v, want epic=100 n=2", c2.TitleVars)
+	if _, ok := c2.TitleVars["epic"]; ok {
+		t.Errorf("child2 title vars = %v, want NO epic key (derived downstream, not injected)", c2.TitleVars)
+	}
+	if c2.TitleVars["n"] != "2" {
+		t.Errorf("child2 title vars = %v, want n=2", c2.TitleVars)
 	}
 	if c2.Relations.ParentEpic != "#100" {
 		t.Errorf("child2 parent epic = %q, want #100", c2.Relations.ParentEpic)

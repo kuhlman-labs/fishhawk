@@ -154,8 +154,12 @@ func (s *Server) handleFileRefinementSession(w http.ResponseWriter, r *http.Requ
 	}
 
 	// The FileItem seam: draft items ride exactly the hand-filed pipeline. The
-	// executor passes TitleVars["epic"] explicitly (via FilingRequestForChild),
-	// so deriveEpicTitleVar short-circuits with no per-child GetIssue.
+	// executor leaves {epic} UNSET (FilingRequestForChild passes "" for the title
+	// var), so deriveEpicTitleVar derives the epic's DISCOVERED ordinal from the
+	// just-filed parent epic's [E<n>] title (one GetIssue per child) — fixing the
+	// #1644 issue-number-vs-ordinal bug. deriveEpicTitleVar already runs inside
+	// applyAndFileWorkItem and resolves via the ParentEpic relation the executor
+	// still sets; the seam itself is unchanged.
 	fileItem := func(ctx context.Context, filing workmgmt.FilingRequest) (int, string, error) {
 		_, created, werr := s.applyAndFileWorkItem(ctx, filing, conv, target, owner, name)
 		if werr != nil {

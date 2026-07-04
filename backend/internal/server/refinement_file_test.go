@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -45,6 +47,12 @@ type fakeGHAPI struct {
 	createCalls int
 	createErrOn int // fail the Nth CreateIssue (0 = never)
 	dropLinkFor int // AddSubIssue no-op when the child's issue number == this
+
+	// searchResults seeds SearchIssuesByTitle (default nil = empty tracker, so
+	// epic-number discovery allocates 1). Seed a prior [E<n>] epic to force the
+	// discovered ordinal ABOVE the issue-number counter, so the epic's title
+	// ordinal and its issue number diverge (the #1644 regression condition).
+	searchResults []githubclient.IssueTitleResult
 
 	// Concurrency gate (nil unless the concurrent-filing test wires it): the
 	// first CreateIssue closes createGateEntered then blocks on
@@ -141,8 +149,23 @@ func (f *fakeGHAPI) ListSubIssues(_ context.Context, _ int64, parentNodeID strin
 }
 
 func (f *fakeGHAPI) SearchIssuesByTitle(_ context.Context, _ int64, _ string) ([]githubclient.IssueTitleResult, error) {
-	// Empty tracker: epic number discovery allocates 1.
-	return nil, nil
+	// Default (nil searchResults): empty tracker, so epic number discovery
+	// allocates 1. A seeded searchResults forces a higher discovered ordinal.
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.searchResults, nil
+}
+
+// issueTitle returns the stored title for an issue number under the API lock,
+// so the GetIssue-serving integration stub can read titles concurrently.
+func (f *fakeGHAPI) issueTitle(number int) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	iss, ok := f.byNumber[number]
+	if !ok {
+		return "", false
+	}
+	return iss.title, true
 }
 
 func (f *fakeGHAPI) ProjectsTokenConfigured() bool { return true }
@@ -171,6 +194,50 @@ func installGHProvider(t *testing.T, api *fakeGHAPI) {
 	prev := conventionsLoader
 	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
 	t.Cleanup(func() { conventionsLoader = prev })
+}
+
+// newRefinementGHClient builds a *githubclient.Client for the refinement filing
+// path. Unlike newInstallationGitHubClient it serves BOTH
+// GET /repos/{owner}/{repo}/installation (installation resolution) AND
+// GET /repos/{owner}/{repo}/issues/{number} (GetIssue), the latter reading the
+// parent epic's stored title from the SAME in-memory api the provider wrote to.
+// The issue endpoint is required because the #1644 fix makes the executor leave
+// {epic} unset, so deriveEpicTitleVar issues one GetIssue per child to derive
+// the epic's discovered ordinal from its [E<n>] title.
+func newRefinementGHClient(t *testing.T, api *fakeGHAPI, installID int64) *githubclient.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/", func(w http.ResponseWriter, r *http.Request) {
+		// GET /repos/{owner}/{repo}/issues/{number} -> the stored issue title.
+		if i := strings.Index(r.URL.Path, "/issues/"); i >= 0 {
+			num, err := strconv.Atoi(r.URL.Path[i+len("/issues/"):])
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			title, ok := api.issueTitle(num)
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			body, _ := json.Marshal(map[string]any{"number": num, "title": title})
+			_, _ = w.Write(body)
+			return
+		}
+		// GET /repos/{owner}/{repo}/installation -> the installation id.
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"id":%d}`, installID)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}
 }
 
 // ---- draft seeding --------------------------------------------------------
@@ -245,11 +312,19 @@ func TestFileRefinementSession_Integration(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := refinement.NewPostgresRepository(pool)
 	api := newFakeGHAPI()
+	// Force the epic's DISCOVERED ordinal ABOVE its issue number: seed a prior
+	// [E35] epic so discovery parses 35 -> the new epic's title ordinal is 36,
+	// while its issue number stays #1 (the CreateIssue counter). Without this
+	// divergence the two coincide and the #1644 bug hides (the original test's
+	// gap).
+	api.searchResults = []githubclient.IssueTitleResult{{Number: 35, Title: "[E35] prior epic"}}
 	installGHProvider(t, api)
 
 	sessionID := seedApprovedDraft(t, repo, sixChildDraft())
 	auditRepo := audit.NewPostgresRepository(pool)
-	gh := newInstallationGitHubClient(t, 42, false)
+	// Serve GetIssue too: deriveEpicTitleVar fetches the parent epic to derive
+	// its ordinal now that the executor no longer injects the {epic} title var.
+	gh := newRefinementGHClient(t, api, 42)
 	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: gh})
 
 	rec := httptest.NewRecorder()
@@ -290,9 +365,42 @@ func TestFileRefinementSession_Integration(t *testing.T) {
 	if body := api.byNumber[7].body; !strings.Contains(body, "Depends on: #3") {
 		t.Errorf("child 6 (#7) body missing real-number marker 'Depends on: #3':\n%s", body)
 	}
-	// [E1.n] titles keyed on the epic issue number.
-	if title := api.byNumber[2].title; !strings.HasPrefix(title, "[E1.1]") {
-		t.Errorf("child ordinal 1 (#2) title = %q, want [E1.1] prefix", title)
+	// Child ordinal 1 (#2) is titled [E36.1] — keyed on the epic's DISCOVERED
+	// ordinal (36), NOT its issue number (1). This is the #1644 shipped behavior.
+	if title := api.byNumber[2].title; !strings.HasPrefix(title, "[E36.1]") {
+		t.Errorf("child ordinal 1 (#2) title = %q, want [E36.1] prefix (discovered ordinal, not issue number)", title)
+	}
+	// Round-trip consistency: parse the epic's ordinal from its own title and
+	// every child's (epic-ordinal, n) from theirs; assert all children agree on
+	// the discovered ordinal (36), their n values cover 1..6, and NO child uses
+	// the epic ISSUE number ([E1.n]) — the #1644 regression guard.
+	titleRE := regexp.MustCompile(`^\[E(\d+)(?:\.(\d+))?\]`)
+	epicM := titleRE.FindStringSubmatch(api.byNumber[1].title)
+	if epicM == nil {
+		t.Fatalf("epic title %q did not match [E<n>]", api.byNumber[1].title)
+	}
+	epicOrd := epicM[1]
+	if epicOrd != "36" {
+		t.Errorf("epic discovered ordinal = %s, want 36 (issue number 1 — the two must diverge)", epicOrd)
+	}
+	gotN := map[string]bool{}
+	for num := 2; num <= 7; num++ {
+		m := titleRE.FindStringSubmatch(api.byNumber[num].title)
+		if m == nil || m[2] == "" {
+			t.Fatalf("child #%d title %q did not match [E<ord>.<n>]", num, api.byNumber[num].title)
+		}
+		if m[1] != epicOrd {
+			t.Errorf("child #%d title %q uses epic ordinal %s, want %s (the epic's discovered ordinal)", num, api.byNumber[num].title, m[1], epicOrd)
+		}
+		if m[1] == "1" {
+			t.Errorf("child #%d title %q uses the epic ISSUE number (1), not its discovered ordinal — #1644 regression", num, api.byNumber[num].title)
+		}
+		gotN[m[2]] = true
+	}
+	for _, n := range []string{"1", "2", "3", "4", "5", "6"} {
+		if !gotN[n] {
+			t.Errorf("child n=%s missing from filed titles (got %v)", n, gotN)
+		}
 	}
 	// The completion audit landed exactly once and completed_at is set.
 	if got := countGlobalCategory(t, auditRepo, "refinement_filing_completed"); got != 1 {
@@ -328,7 +436,7 @@ func TestFileRefinementSession_KillAndResume(t *testing.T) {
 
 	sessionID := seedApprovedDraft(t, repo, sixChildDraft())
 	auditRepo := audit.NewPostgresRepository(pool)
-	gh := newInstallationGitHubClient(t, 42, false)
+	gh := newRefinementGHClient(t, api, 42)
 	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: gh})
 
 	// First POST: fails mid-sequence -> 502, partial rows durable.
@@ -403,7 +511,7 @@ func TestFileRefinementSession_ConcurrentFilesOnce(t *testing.T) {
 
 	sessionID := seedApprovedDraft(t, repo, sixChildDraft())
 	auditRepo := audit.NewPostgresRepository(pool)
-	gh := newInstallationGitHubClient(t, 42, false)
+	gh := newRefinementGHClient(t, api, 42)
 	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: gh})
 
 	var wg sync.WaitGroup
@@ -636,7 +744,7 @@ func TestFileRefinementSession_VerificationFailure502(t *testing.T) {
 	installGHProvider(t, api)
 	sessionID := seedApprovedDraft(t, repo, sixChildDraft())
 	auditRepo := audit.NewPostgresRepository(pool)
-	gh := newInstallationGitHubClient(t, 42, false)
+	gh := newRefinementGHClient(t, api, 42)
 	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: gh})
 
 	rec := httptest.NewRecorder()
@@ -668,7 +776,7 @@ func TestFileRefinementSession_AuditFailure500(t *testing.T) {
 	api := newFakeGHAPI()
 	installGHProvider(t, api)
 	sessionID := seedApprovedDraft(t, repo, sixChildDraft())
-	gh := newInstallationGitHubClient(t, 42, false)
+	gh := newRefinementGHClient(t, api, 42)
 	// erroringAuditRepo fails every AppendGlobalChained -> the completion audit fails.
 	s := New(Config{RefinementRepo: repo, AuditRepo: erroringAuditRepo{}, GitHub: gh})
 
@@ -695,7 +803,7 @@ func TestFileRefinementSession_AlreadyCompletedReplay(t *testing.T) {
 	installGHProvider(t, api)
 	sessionID := seedApprovedDraft(t, repo, sixChildDraft())
 	auditRepo := audit.NewPostgresRepository(pool)
-	gh := newInstallationGitHubClient(t, 42, false)
+	gh := newRefinementGHClient(t, api, 42)
 	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: gh})
 
 	// First POST completes the filing.
