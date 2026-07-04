@@ -1638,6 +1638,30 @@ func buildPlan(t Trigger) string {
 	b.WriteString("- Single-owner file rule (when decomposing): every file path appears in EXACTLY ONE sub-plan's scope.files. The decomposition validator rejects any plan where a file is scoped by two or more slices with 'file X is scoped by multiple slices (...); keep all edits to one file in a single slice or re-slice along file boundaries', so a file split across slices fails the plan gate (runs d0d78b93/#1445, b522fec1/#1446). The recurrent cause is an early slice that needs a file ONLY as a 'so the slice compiles' shim while a LATER slice owns its substantive change: prefer making the early change additive/backward-compatible so the shim edit is unnecessary and the file stays in the owning slice; otherwise move the WHOLE file into the slice that owns its substantive change. Do not scope the same file into two slices (#1472).\n")
 	b.WriteString("The validator rejects any plan where these fields contain bare strings instead of their required structured shapes.\n")
 	b.WriteString("\n")
+	b.WriteString("Acceptance-criteria authoring contract: verification.acceptance_criteria is an OPTIONAL array (additive / " +
+		"x-intended-required) that you SHOULD author for a feature change so the downstream acceptance stage has a binding, " +
+		"machine-checkable checklist. It is NOT in the required-fields list above — do NOT invent criteria for a test-only or " +
+		"doc-only change (use verification.out_of_scope, below, to declare that case). Describe criteria in language " +
+		"toolchain-agnostic prose (state what must hold, never a shell or Go command). Each entry is an object with this exact shape " +
+		"(mirrors docs/spec/plan-standard-v1.schema.json $defs.acceptance-criterion):\n")
+	b.WriteString("- `id` (REQUIRED): a lowercase slug matching the pattern `^[a-z0-9][a-z0-9-]*$` — start with a lowercase letter " +
+		"or digit, then only lowercase letters, digits, and hyphens. GOOD: `plan-validates-first-shot`. INVALID: `AC1`, `AC-1`, " +
+		"`Plan_Validates` — uppercase letters and underscores are rejected. The id MUST be UNIQUE within acceptance_criteria (it is " +
+		"the join key tying the criterion to its downstream execution, evidence, and triage records).\n")
+	b.WriteString("- `statement` (REQUIRED): a non-empty sentence stating what must hold for the change to be accepted.\n")
+	b.WriteString("- `source` (REQUIRED): an enum of EXACTLY `explicit` (stated in the ticket/spec) or `inferred` (you derived it). " +
+		"No other value is valid.\n")
+	b.WriteString("- `rationale`: REQUIRED when `source` is `inferred` (explain why you inferred the criterion); optional otherwise.\n")
+	b.WriteString("- `blocking`: an optional boolean; when omitted it defaults to `true` (a failing criterion blocks acceptance). " +
+		"Set it to `false` only for a non-blocking/advisory criterion.\n")
+	b.WriteString("- `source_ref`, `verify_hint`, `preconditions` are OPTIONAL: `source_ref` points at where an explicit criterion " +
+		"came from (an issue anchor or spec section); `verify_hint` hints how to verify it; `preconditions` is an array of strings " +
+		"that must hold before the criterion can be checked.\n")
+	b.WriteString("verification.out_of_scope escape hatch: an OPTIONAL array of non-empty strings stating what the change deliberately " +
+		"does NOT cover. It is the mechanism a test-only or doc-only change uses to declare it intentionally authors no " +
+		"acceptance_criteria — populate out_of_scope with the reason instead of leaving the intent unstated. Author " +
+		"acceptance_criteria for feature changes; reach for out_of_scope when concrete criteria genuinely do not apply.\n")
+	b.WriteString("\n")
 	b.WriteString("Cross-boundary test rule: when scope.files spans multiple architectural layers (request/response " +
 		"payload, domain type, persistence, render/consumer), verification.test_strategy MUST name an " +
 		"integration/end-to-end test that crosses those layers, not only per-layer unit tests. Per-layer units " +
