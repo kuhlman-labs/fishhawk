@@ -12,10 +12,12 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
 
 // This file is the E31.10 capstone cross-boundary seam test (#1538, per the
@@ -387,6 +389,150 @@ func TestAcceptanceSeam_ObjectKeyedCriteriaCoerceAcrossSeam(t *testing.T) {
 		if !strings.Contains(payload, want) {
 			t.Errorf("triage payload missing %s:\n%s", want, payload)
 		}
+	}
+}
+
+// TestAcceptanceSeam_OutOfScopeZeroCriteria_AutoTerminal is the E38.3 (#1657)
+// cross-boundary capstone: it crosses the orchestrator state machine → the audit
+// store → the audit-completeness rule engine — the seam the per-layer units
+// (plan predicate, orchestrator advance, auditcomplete rule, next_actions) cannot
+// cover alone. The orchestrator auto-terminates an out_of_scope / zero-criteria
+// acceptance stage and emits the skip marker; auditcomplete.Compute reads that
+// marker from the SAME store and exempts the traceless acceptance stage, reaching
+// StatePass. Both legs carry a negative control proving the behavior is gated
+// (criteria present → still dispatched; no marker → still trace_missing).
+//
+// It uses the functional orchestratorRepo (real TransitionStage/TransitionRun so
+// the run can reach succeeded) + the hash-chaining auditCompleteAuditFake (so
+// verifyChain accepts the store — the promptRunRepo/auditFake seam used by the
+// happy-path legs above cannot reach StatePass) + a fakeArtifactRepo holding the
+// approved plan.
+func TestAcceptanceSeam_OutOfScopeZeroCriteria_AutoTerminal(t *testing.T) {
+	ctx := context.Background()
+
+	// build seeds a plan(succ)+implement(succ)+review(succ)+acceptance(pending)
+	// run with the approved plan artifact under the plan stage.
+	build := func(t *testing.T, planJSON string) (runID, implID, accID uuid.UUID, rr *orchestratorRepo, ar *fakeArtifactRepo, au *auditCompleteAuditFake) {
+		t.Helper()
+		rr = newOrchestratorRepo()
+		r := rr.seedRun()
+		planS := rr.seedStage(r.ID, 0, run.StageStateSucceeded)
+		planS.Type = run.StageTypePlan
+		impl := rr.seedStage(r.ID, 1, run.StageStateSucceeded)
+		impl.Type = run.StageTypeImplement
+		rev := rr.seedStage(r.ID, 2, run.StageStateSucceeded)
+		rev.Type = run.StageTypeReview
+		acc := rr.seedStage(r.ID, 3, run.StageStatePending)
+		acc.Type = run.StageTypeAcceptance
+
+		ar = newFakeArtifactRepo()
+		v := "standard_v1"
+		ar.all = append(ar.all, &artifact.Artifact{
+			ID: uuid.New(), StageID: planS.ID, Kind: artifact.KindPlan,
+			SchemaVersion: &v, Content: json.RawMessage(planJSON), CreatedAt: time.Now().UTC(),
+		})
+		au = newAuditCompleteAuditFake()
+		return r.ID, impl.ID, acc.ID, rr, ar, au
+	}
+	countCat := func(t *testing.T, au *auditCompleteAuditFake, runID uuid.UUID, cat string) int {
+		t.Helper()
+		es, err := au.ListForRunByCategory(ctx, runID, cat)
+		if err != nil {
+			t.Fatalf("ListForRunByCategory: %v", err)
+		}
+		return len(es)
+	}
+	seedTraceEvidence := func(t *testing.T, au *auditCompleteAuditFake, ar *fakeArtifactRepo, runID, planID, implID uuid.UUID) {
+		t.Helper()
+		au.appendTrace(t, runID, planID, "raw")
+		au.appendTrace(t, runID, planID, "redacted")
+		au.appendTrace(t, runID, implID, "raw")
+		au.appendTrace(t, runID, implID, "redacted")
+		ar.all = append(ar.all, &artifact.Artifact{
+			ID: uuid.New(), StageID: implID, Kind: artifact.KindPullRequest,
+			Content: json.RawMessage(`{}`), CreatedAt: time.Now().UTC(),
+		})
+	}
+
+	const skipPlan = `{"plan_version":"standard_v1","summary":"x","verification":{"test_strategy":"unit","rollback_plan":"revert","out_of_scope":["deletion deferred to a follow-up"]}}`
+	const criteriaPlan = `{"plan_version":"standard_v1","summary":"x","verification":{"test_strategy":"unit","rollback_plan":"revert","out_of_scope":["deletion deferred"],"acceptance_criteria":[{"id":"ac-1","statement":"POST returns 201","source":"explicit","source_ref":"#1","blocking":true}]}}`
+
+	// --- Orchestrator leg: the skip path drives acceptance → succeeded and the
+	//     run → succeeded, emitting the skip marker (and NO acceptance_dispatched).
+	runID, implID, accID, rr, ar, au := build(t, skipPlan)
+	o := &orchestrator.Orchestrator{Runs: rr, Audit: au, Artifacts: ar}
+	out, err := o.Advance(ctx, runID)
+	if err != nil {
+		t.Fatalf("advance (skip): %v", err)
+	}
+	if out != orchestrator.OutcomeRunCompleted {
+		t.Errorf("advance outcome = %q, want run_completed", out)
+	}
+	if got := rr.stagesByID[accID].State; got != run.StageStateSucceeded {
+		t.Errorf("acceptance stage state = %q, want succeeded (auto-terminated, NOT dispatched)", got)
+	}
+	if got := rr.runs[runID].State; got != run.StateSucceeded {
+		t.Errorf("run state = %q, want succeeded", got)
+	}
+	if n := countCat(t, au, runID, CategoryAcceptanceSkippedOutOfScope); n != 1 {
+		t.Fatalf("acceptance_skipped_out_of_scope entries = %d, want 1", n)
+	}
+	if n := countCat(t, au, runID, CategoryAcceptanceDispatched); n != 0 {
+		t.Errorf("acceptance_dispatched entries = %d, want 0 on the skip path", n)
+	}
+
+	// --- Orchestrator control: a plan with a blocking criterion still DISPATCHES
+	//     the acceptance stage (predicate false → operator-dispatched path).
+	cRunID, _, cAccID, cRR, cAR, cAU := build(t, criteriaPlan)
+	cO := &orchestrator.Orchestrator{Runs: cRR, Audit: cAU, Artifacts: cAR}
+	if _, err := cO.Advance(ctx, cRunID); err != nil {
+		t.Fatalf("advance (control): %v", err)
+	}
+	if got := cRR.stagesByID[cAccID].State; got != run.StageStateDispatched {
+		t.Errorf("control acceptance stage state = %q, want dispatched (a criterion is present)", got)
+	}
+	if n := countCat(t, cAU, cRunID, CategoryAcceptanceDispatched); n != 1 {
+		t.Errorf("control acceptance_dispatched entries = %d, want 1", n)
+	}
+	if n := countCat(t, cAU, cRunID, CategoryAcceptanceSkippedOutOfScope); n != 0 {
+		t.Errorf("control acceptance_skipped_out_of_scope entries = %d, want 0", n)
+	}
+
+	// --- auditcomplete leg: seed the plan+implement trace evidence + the PR
+	//     artifact, then Compute over the SAME store the orchestrator wrote the
+	//     skip marker to. StatePass despite the acceptance stage having no trace.
+	planStageID := rr.stagesByRunID[runID][0].ID
+	seedTraceEvidence(t, au, ar, runID, planStageID, implID)
+	state, missing, err := auditcomplete.Compute(ctx, runID, auditcomplete.Deps{Runs: rr, Artifacts: ar, Audit: au})
+	if err != nil {
+		t.Fatalf("auditcomplete.Compute (skip): %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("auditcomplete state = %s, want pass (the skip marker exempts the traceless acceptance stage); missing=%+v", state, missing)
+	}
+
+	// --- auditcomplete control: the identical run WITHOUT the skip marker still
+	//     fails trace_missing for the traceless acceptance stage (marker-gated,
+	//     not blanket).
+	ctrlRunID, ctrlImplID, ctrlAccID, ctrlRR, ctrlAR, ctrlAU := build(t, skipPlan)
+	ctrlRR.stagesByID[ctrlAccID].State = run.StageStateSucceeded // succeeded, but NO skip marker emitted
+	ctrlPlanID := ctrlRR.stagesByRunID[ctrlRunID][0].ID
+	seedTraceEvidence(t, ctrlAU, ctrlAR, ctrlRunID, ctrlPlanID, ctrlImplID)
+	cState, cMissing, err := auditcomplete.Compute(ctx, ctrlRunID, auditcomplete.Deps{Runs: ctrlRR, Artifacts: ctrlAR, Audit: ctrlAU})
+	if err != nil {
+		t.Fatalf("auditcomplete.Compute (control): %v", err)
+	}
+	if cState != stagecheck.StateFail {
+		t.Fatalf("auditcomplete control state = %s, want fail (an unmarked acceptance stage still needs its trace); missing=%+v", cState, cMissing)
+	}
+	sawAcceptanceTraceMiss := false
+	for _, m := range cMissing {
+		if m.Kind == auditcomplete.MissingTrace && strings.Contains(m.Detail, "acceptance") {
+			sawAcceptanceTraceMiss = true
+		}
+	}
+	if !sawAcceptanceTraceMiss {
+		t.Errorf("want a trace_missing item naming the acceptance stage; got %+v", cMissing)
 	}
 }
 

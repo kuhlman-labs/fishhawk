@@ -1488,6 +1488,10 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	const minDescriptionLen = 80
 	// The registered tool set is the fishhawk_* tools swept in #778. Bump
 	// this and give the new tool a conformant description when adding one.
+	// This count is the surface-sweep invariant (#873/#867): the E38.3 (#1657)
+	// next_actions param-threading edit to tools.go registers NO new tool and
+	// removes/renames none, so the total is deliberately UNCHANGED at 40 — this
+	// assertion pins that a param-only tools.go edit did not perturb the surface.
 	const wantToolCount = 40
 
 	if len(res.Tools) != wantToolCount {

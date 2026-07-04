@@ -1181,7 +1181,12 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	// defensive arm covers that).
 	acceptanceVerdict := latestAcceptanceVerdict(recent)
 	acceptanceTriageDisposition := latestAcceptanceTriageDisposition(recent)
-	nextActions := nextActionsFor(runRow, stages, planReviewStatus, implementReviewStatus, reviewActionHint, view.driveStatus(), mergeObserved, acceptanceVerdict, acceptanceTriageDisposition)
+	// E38.3 (#1657): the orchestrator auto-terminated the acceptance stage for an
+	// out_of_scope / zero-acceptance_criteria plan — read off the SAME recent
+	// slice (the mergeObservedIn idiom) to relabel the merge-eligible
+	// succeeded_acceptance_skipped_out_of_scope state.
+	acceptanceSkippedOutOfScope := acceptanceSkippedOutOfScopeIn(recent)
+	nextActions := nextActionsFor(runRow, stages, planReviewStatus, implementReviewStatus, reviewActionHint, view.driveStatus(), mergeObserved, acceptanceSkippedOutOfScope, acceptanceVerdict, acceptanceTriageDisposition)
 
 	// Best-effort decomposed-parent children status (#1147). Cost-gated so an
 	// ordinary run pays nothing: only a decomposed parent (no parent_run_id,

@@ -43,6 +43,18 @@ const (
 	// not by this handler; the constant lives here so the outcome and the
 	// dispatch categories are defined together.
 	CategoryAcceptanceDispatched = "acceptance_dispatched"
+	// CategoryAcceptanceSkippedOutOfScope records that the orchestrator
+	// AUTO-TERMINATED an acceptance stage (E38.3 / #1657) because the approved
+	// plan declared verification.out_of_scope with zero acceptance_criteria —
+	// there is no observable criterion for a validator to check. EMITTED by the
+	// orchestrator (emitAcceptanceSkippedOutOfScope), which uses the raw string
+	// literal at its emit site (matching the acceptance_dispatched convention);
+	// this exported const is the single owner of the value. READ by auditcomplete
+	// (which exempts the marked stage from the trace-required rule) and by the MCP
+	// next_actions surface (which labels the succeeded_acceptance_skipped_out_of_scope
+	// state). Keep the literal and this const byte-identical. Open-set string —
+	// audit_entries.category has no CHECK, so no migration.
+	CategoryAcceptanceSkippedOutOfScope = "acceptance_skipped_out_of_scope"
 	// CategoryAcceptanceOutcomeRecorded records the persisted acceptance
 	// artifact + its settled verdict. Written by handleShipAcceptance on every
 	// successful artifact persist.

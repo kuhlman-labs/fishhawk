@@ -2398,6 +2398,190 @@ func TestAdvance_AcceptanceStage_NilAudit_StillDispatches(t *testing.T) {
 	}
 }
 
+// acceptanceSkipPlanBytes builds a standard_v1 plan body with the given
+// out_of_scope entries and acceptance_criteria (E38.3 / #1657 fixtures). Only
+// the verification block is load-bearing for the skip predicate.
+func acceptanceSkipPlanBytes(t *testing.T, outOfScope []string, criteria []map[string]any) []byte {
+	t.Helper()
+	verification := map[string]any{
+		"test_strategy": "unit",
+		"rollback_plan": "revert the PR",
+	}
+	if len(outOfScope) > 0 {
+		verification["out_of_scope"] = outOfScope
+	}
+	if len(criteria) > 0 {
+		verification["acceptance_criteria"] = criteria
+	}
+	b, err := json.Marshal(map[string]any{
+		"plan_version": "standard_v1",
+		"summary":      "ship the widget endpoint",
+		"verification": verification,
+	})
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	return b
+}
+
+// seedAcceptanceSkipRun seeds a plan(succeeded)+implement(succeeded)+review
+// (succeeded)+acceptance(pending) run with the plan artifact under the plan
+// stage, and returns the run, stages, and wired orchestrator (Artifacts +
+// recordingAudit). It is the shared scaffold for the E38.3 skip + control legs.
+func seedAcceptanceSkipRun(t *testing.T, planBytes []byte) (*run.Run, []*run.Stage, *stubRuns, *recordingAudit, *Orchestrator) {
+	t.Helper()
+	rs := newStubRuns()
+	ra := &recordingAudit{}
+	r, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, ExecutorRef: "human", State: run.StageStateSucceeded},
+		{Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	schemaV := "standard_v1"
+	arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		stages[0].ID: {{
+			ID:            uuid.New(),
+			StageID:       stages[0].ID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &schemaV,
+			Content:       planBytes,
+			CreatedAt:     time.Now().UTC(),
+		}},
+	}}
+	o := &Orchestrator{Runs: rs, GitHub: &stubGitHub{}, Audit: ra, Artifacts: arts}
+	return r, stages, rs, ra, o
+}
+
+func countAcceptanceCategory(ra *recordingAudit, category string) int {
+	n := 0
+	for _, p := range ra.appended {
+		if p.Category == category {
+			n++
+		}
+	}
+	return n
+}
+
+// TestAdvance_AcceptanceSkippedOutOfScope pins the E38.3 (#1657) auto-terminate:
+// when the approved plan declares verification.out_of_scope with ZERO
+// acceptance_criteria, Advance walks the acceptance stage straight to succeeded
+// (NOT dispatched), emits exactly one acceptance_skipped_out_of_scope entry (and
+// NO acceptance_dispatched), and drives the run to succeeded in the same call.
+// The two controls prove the predicate gates the behavior: a plan with a
+// blocking criterion, or one with no out_of_scope, still dispatches acceptance.
+func TestAdvance_AcceptanceSkippedOutOfScope(t *testing.T) {
+	t.Run("out_of_scope + zero criteria -> auto-terminated", func(t *testing.T) {
+		planBytes := acceptanceSkipPlanBytes(t, []string{"deletion deferred to a follow-up"}, nil)
+		r, stages, _, ra, o := seedAcceptanceSkipRun(t, planBytes)
+
+		out, err := o.Advance(context.Background(), r.ID)
+		if err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+		if out != OutcomeRunCompleted {
+			t.Errorf("Outcome = %q, want run_completed (the skip re-enters Advance to complete the run)", out)
+		}
+		if stages[3].State != run.StageStateSucceeded {
+			t.Errorf("acceptance stage state = %q, want succeeded (auto-terminated, NOT dispatched)", stages[3].State)
+		}
+		if r.State != run.StateSucceeded {
+			t.Errorf("run state = %q, want succeeded", r.State)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_skipped_out_of_scope"); n != 1 {
+			t.Fatalf("acceptance_skipped_out_of_scope entries = %d, want 1", n)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_dispatched"); n != 0 {
+			t.Errorf("acceptance_dispatched entries = %d, want 0 on the skip path", n)
+		}
+		// The marker payload carries the stage id + out_of_scope_count.
+		var marker audit.ChainAppendParams
+		for _, p := range ra.appended {
+			if p.Category == "acceptance_skipped_out_of_scope" {
+				marker = p
+			}
+		}
+		if marker.StageID == nil || *marker.StageID != stages[3].ID {
+			t.Errorf("skip marker stage_id = %v, want the acceptance stage %s", marker.StageID, stages[3].ID)
+		}
+		if !strings.Contains(string(marker.Payload), `"out_of_scope_count":1`) {
+			t.Errorf("skip marker payload missing out_of_scope_count: %s", marker.Payload)
+		}
+	})
+
+	t.Run("out_of_scope + a blocking criterion -> still dispatches", func(t *testing.T) {
+		planBytes := acceptanceSkipPlanBytes(t,
+			[]string{"deletion deferred"},
+			[]map[string]any{{"id": "ac-1", "statement": "POST returns 201", "source": "explicit", "source_ref": "#1", "blocking": true}})
+		r, stages, _, ra, o := seedAcceptanceSkipRun(t, planBytes)
+
+		if _, err := o.Advance(context.Background(), r.ID); err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+		if stages[3].State != run.StageStateDispatched {
+			t.Errorf("acceptance stage state = %q, want dispatched (criteria present -> not skippable)", stages[3].State)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_skipped_out_of_scope"); n != 0 {
+			t.Errorf("acceptance_skipped_out_of_scope entries = %d, want 0 when a criterion is present", n)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_dispatched"); n != 1 {
+			t.Errorf("acceptance_dispatched entries = %d, want 1 (operator-dispatched path)", n)
+		}
+	})
+
+	t.Run("no out_of_scope -> still dispatches", func(t *testing.T) {
+		planBytes := acceptanceSkipPlanBytes(t, nil, nil)
+		r, stages, _, ra, o := seedAcceptanceSkipRun(t, planBytes)
+
+		if _, err := o.Advance(context.Background(), r.ID); err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+		if stages[3].State != run.StageStateDispatched {
+			t.Errorf("acceptance stage state = %q, want dispatched (no out_of_scope -> not skippable)", stages[3].State)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_skipped_out_of_scope"); n != 0 {
+			t.Errorf("acceptance_skipped_out_of_scope entries = %d, want 0 with no out_of_scope", n)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_dispatched"); n != 1 {
+			t.Errorf("acceptance_dispatched entries = %d, want 1", n)
+		}
+	})
+
+	// Defensive branch: a plan artifact that cannot be decoded surfaces the
+	// load error rather than silently dispatching (or silently skipping) — the
+	// acceptance stage stays pending, no transition, no marker.
+	t.Run("unparseable plan artifact -> load error surfaces", func(t *testing.T) {
+		r, stages, _, ra, o := seedAcceptanceSkipRun(t, []byte(`{not valid json`))
+
+		if _, err := o.Advance(context.Background(), r.ID); err == nil {
+			t.Fatal("Advance must surface the plan-load error, not silently dispatch")
+		}
+		if stages[3].State != run.StageStatePending {
+			t.Errorf("acceptance stage state = %q, want pending (load error -> no transition)", stages[3].State)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_skipped_out_of_scope"); n != 0 {
+			t.Errorf("acceptance_skipped_out_of_scope entries = %d, want 0 on a load error", n)
+		}
+	})
+
+	// Defensive branch: a nil Audit is best-effort — the skip still walks the
+	// acceptance stage to succeeded and completes the run (the emit WARN-logs
+	// and never unwinds), mirroring emitAcceptanceDispatched's nil-Audit posture.
+	t.Run("nil audit -> still auto-terminates", func(t *testing.T) {
+		planBytes := acceptanceSkipPlanBytes(t, []string{"deletion deferred"}, nil)
+		r, stages, _, _, o := seedAcceptanceSkipRun(t, planBytes)
+		o.Audit = nil
+
+		out, err := o.Advance(context.Background(), r.ID)
+		if err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+		if out != OutcomeRunCompleted || stages[3].State != run.StageStateSucceeded || r.State != run.StateSucceeded {
+			t.Errorf("nil-audit skip: out=%q acceptance=%q run=%q, want run_completed/succeeded/succeeded", out, stages[3].State, r.State)
+		}
+	})
+}
+
 // TestAdvance_ImplementStage_NoAcceptanceEmit pins that a non-acceptance
 // dispatch appends no acceptance_dispatched entry (the emit is stage-typed).
 func TestAdvance_ImplementStage_NoAcceptanceEmit(t *testing.T) {
