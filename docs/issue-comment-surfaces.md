@@ -1080,8 +1080,16 @@ Notes:
   `campaign_issue_settled` (and `campaign_advanced` as items settle) —
   identical payload shapes + system actor, on the same GLOBAL chain, so the
   campaign rollup advances when the operator-agent drives the loop locally
-  with no auto-driver. They remain best-effort and are still NOT
-  issue-comment surfaces. Listed here only so a future reader grepping the
+  with no auto-driver. **As of #1558 `campaign_issue_settled` has a
+  run-less variant**: the reconcile-on-read `settleIssueClosedItems` arm
+  settles a run-less, deps-satisfied item whose GitHub issue is
+  closed-as-completed and emits `campaign_issue_settled` with payload
+  `{campaign_id, issue_ref, outcome:"succeeded", settled_via:"issue_closed",
+  state_reason:"completed"}` — it carries `settled_via`/`state_reason` and
+  OMITS `run_id` (there is no run), distinguishing it from the run-linked
+  settle whose payload carries `run_id` + `outcome` and no `settled_via`.
+  Same GLOBAL chain, same system actor, still best-effort. They remain
+  best-effort and are still NOT issue-comment surfaces. Listed here only so a future reader grepping the
   audit categories doesn't mistake them for a comment surface.
 - The campaign **pause** marker — `campaign_paused` (E25.7 / #1446, ADR-047
   Track C) — is also a **system-actor GLOBAL-chain audit kind, NOT an

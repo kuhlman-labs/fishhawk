@@ -11,11 +11,13 @@ func TestCampaignTransitions_AllowedAndForbidden(t *testing.T) {
 		from, to State
 		want     bool
 	}{
-		// pending → running | cancelled | failed
+		// pending → running | succeeded | cancelled | failed
 		{StatePending, StateRunning, true},
 		{StatePending, StateCancelled, true},
 		{StatePending, StateFailed, true},
-		{StatePending, StateSucceeded, false}, // can't skip running
+		// pending → succeeded: an all-human-led campaign whose every item settled
+		// out of band (run-less, #1558) terminates succeeded without a dispatch.
+		{StatePending, StateSucceeded, true},
 		// running → succeeded | failed | cancelled | paused
 		{StateRunning, StateSucceeded, true},
 		{StateRunning, StateFailed, true},
@@ -65,18 +67,22 @@ func TestCampaignItemTransitions_AllowedAndForbidden(t *testing.T) {
 		from, to ItemState
 		want     bool
 	}{
-		// pending → blocked | running | cancelled | failed
+		// pending → blocked | running | succeeded | cancelled | failed
 		{ItemStatePending, ItemStateBlocked, true},
 		{ItemStatePending, ItemStateRunning, true},
 		{ItemStatePending, ItemStateCancelled, true},
 		{ItemStatePending, ItemStateFailed, true},
-		{ItemStatePending, ItemStateSucceeded, false}, // can't succeed without running
-		// blocked → pending | running | cancelled
+		// pending → succeeded: a human-led item completed out of band — its issue
+		// closed-as-completed and the run-less settle pass settles it (#1558).
+		{ItemStatePending, ItemStateSucceeded, true},
+		// blocked → pending | running | succeeded | cancelled
 		{ItemStateBlocked, ItemStatePending, true},
 		{ItemStateBlocked, ItemStateRunning, true},
 		{ItemStateBlocked, ItemStateCancelled, true},
-		{ItemStateBlocked, ItemStateFailed, false},    // a blocked item fails via pending/running, not directly
-		{ItemStateBlocked, ItemStateSucceeded, false}, // can't succeed while blocked
+		{ItemStateBlocked, ItemStateFailed, false}, // a blocked item fails via pending/running, not directly
+		// blocked → succeeded: same run-less out-of-band settlement (#1558) once
+		// the item's deps have cleared.
+		{ItemStateBlocked, ItemStateSucceeded, true},
 		// running → succeeded | failed | cancelled | paused
 		{ItemStateRunning, ItemStateSucceeded, true},
 		{ItemStateRunning, ItemStateFailed, true},

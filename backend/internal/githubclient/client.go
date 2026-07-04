@@ -317,6 +317,13 @@ type Issue struct {
 	Title  string
 	Body   string
 	State  string
+	// StateReason is GitHub's issue `state_reason`: "completed",
+	// "not_planned", "reopened", or "" (empty when absent — e.g. an open
+	// issue, or an older payload). The campaign run-less settle pass (#1558)
+	// gates on State=="closed" AND StateReason=="completed" to distinguish a
+	// real completion (issue closed by a merged PR) from a not_planned
+	// abandonment. Additive — existing callers ignore it.
+	StateReason string
 	// Labels is the issue's label names. GitHub's REST issue payload
 	// carries `labels` as an array whose entries are label objects
 	// ({name, color, …}) or, for some responses, plain strings; GetIssue
@@ -365,10 +372,11 @@ func (c *Client) GetIssue(ctx context.Context, installationID int64, repo RepoRe
 	}
 
 	var body struct {
-		Number int    `json:"number"`
-		Title  string `json:"title"`
-		Body   string `json:"body"`
-		State  string `json:"state"`
+		Number      int    `json:"number"`
+		Title       string `json:"title"`
+		Body        string `json:"body"`
+		State       string `json:"state"`
+		StateReason string `json:"state_reason"`
 		// labels entries are string-or-object per the REST Issues schema;
 		// json.RawMessage defers the shape decision to decodeLabelNames.
 		Labels []json.RawMessage `json:"labels"`
@@ -377,11 +385,12 @@ func (c *Client) GetIssue(ctx context.Context, installationID int64, repo RepoRe
 		return nil, fmt.Errorf("githubclient: decode issue: %w", err)
 	}
 	return &Issue{
-		Number: body.Number,
-		Title:  body.Title,
-		Body:   body.Body,
-		State:  body.State,
-		Labels: decodeLabelNames(body.Labels),
+		Number:      body.Number,
+		Title:       body.Title,
+		Body:        body.Body,
+		State:       body.State,
+		StateReason: body.StateReason,
+		Labels:      decodeLabelNames(body.Labels),
 	}, nil
 }
 
