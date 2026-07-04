@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -36,7 +37,7 @@ func validAcceptanceBytes(t *testing.T) []byte {
 			{ID: "ac-list", Result: "passed"},
 		},
 		TargetURL:      "https://preview.example.test",
-		EvidenceHashes: []string{"sha256:abc"},
+		EvidenceHashes: json.RawMessage(`["sha256:abc"]`),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -292,6 +293,12 @@ func TestShipAcceptance_InvalidPayload_400(t *testing.T) {
 		"criterion empty id":          []byte(`{"verdict":"passed","criteria":[{"id":"","result":"passed"}]}`),
 		"criterion invalid result":    []byte(`{"verdict":"passed","criteria":[{"id":"x","result":"maybe"}]}`),
 		"non-http target_url":         []byte(`{"verdict":"passed","target_url":"ssh://x"}`),
+		"ftp target_url":              []byte(`{"verdict":"passed","target_url":"ftp://host"}`),
+		"httpx near-miss target_url":  []byte(`{"verdict":"passed","target_url":"httpx://host"}`),
+		"http+unix near-miss url":     []byte(`{"verdict":"passed","target_url":"http+unix://host"}`),
+		"evidence_hashes non-string":  []byte(`{"verdict":"passed","evidence_hashes":{"a":123}}`),
+		"evidence_hashes nested":      []byte(`{"verdict":"passed","evidence_hashes":{"a":{"b":"c"}}}`),
+		"evidence_hashes scalar":      []byte(`{"verdict":"passed","evidence_hashes":"sha256:abc"}`),
 		"unknown field":               []byte(`{"verdict":"passed","extra":true}`),
 		"criterion unknown field":     []byte(`{"verdict":"passed","criteria":[{"id":"x","result":"passed","extra":true}]}`),
 		"trailing object":             []byte(`{"verdict":"passed"}{"verdict":"failed","failure_mode":"error"}`),
@@ -313,6 +320,113 @@ func TestShipAcceptance_InvalidPayload_400(t *testing.T) {
 				t.Errorf("artifacts = %d, want 0", len(ar.all))
 			}
 		})
+	}
+}
+
+// TestAcceptanceBody_ValidateCoercions is the backend twin of the runner's
+// TestValidateAcceptanceVerdict_Coercions: a string-valued object-map
+// evidence_hashes collapses to its sorted values, and a schemeless target_url
+// gains an http:// prefix — the receiver is mutated so the recorded outcome
+// uses the normalized shape, and each coercion emits a WARN.
+func TestAcceptanceBody_ValidateCoercions(t *testing.T) {
+	t.Run("object-map evidence_hashes coerces to sorted slice", func(t *testing.T) {
+		a := acceptanceBody{
+			Verdict:        "passed",
+			EvidenceHashes: json.RawMessage(`{"log":"sha256:cc","shot":"sha256:aa","trace":"sha256:bb"}`),
+		}
+		if err := a.validate(context.Background(), nil); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		if want := []string{"sha256:aa", "sha256:bb", "sha256:cc"}; !reflect.DeepEqual(a.normalizedEvidenceHashes, want) {
+			t.Errorf("normalizedEvidenceHashes = %v, want sorted %v", a.normalizedEvidenceHashes, want)
+		}
+	})
+
+	t.Run("schemeless target_url coerces to http://", func(t *testing.T) {
+		a := acceptanceBody{Verdict: "passed", TargetURL: "localhost:8090"}
+		if err := a.validate(context.Background(), nil); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		if a.TargetURL != "http://localhost:8090" {
+			t.Errorf("coerced target_url = %q, want http://localhost:8090", a.TargetURL)
+		}
+	})
+
+	t.Run("https target_url passes through", func(t *testing.T) {
+		a := acceptanceBody{Verdict: "passed", TargetURL: "https://preview.example.test"}
+		if err := a.validate(context.Background(), nil); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		if a.TargetURL != "https://preview.example.test" {
+			t.Errorf("target_url must pass through unchanged, got %q", a.TargetURL)
+		}
+	})
+
+	t.Run("flat array evidence_hashes passes through", func(t *testing.T) {
+		a := acceptanceBody{Verdict: "passed", EvidenceHashes: json.RawMessage(`["sha256:zz","sha256:aa"]`)}
+		if err := a.validate(context.Background(), nil); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		// A flat array is not re-sorted — passed through verbatim.
+		if want := []string{"sha256:zz", "sha256:aa"}; !reflect.DeepEqual(a.normalizedEvidenceHashes, want) {
+			t.Errorf("normalizedEvidenceHashes = %v, want %v", a.normalizedEvidenceHashes, want)
+		}
+	})
+}
+
+// TestAcceptanceBody_ValidateFailClosed mirrors the runner fail-closed table:
+// each lossy shape (near-miss/foreign target_url scheme, non-string/nested/
+// scalar evidence_hashes) fails closed with no coercion. Condition #1 names
+// httpx://host and http+unix://host explicitly alongside ftp://host.
+func TestAcceptanceBody_ValidateFailClosed(t *testing.T) {
+	cases := map[string]acceptanceBody{
+		"ftp target_url":             {Verdict: "passed", TargetURL: "ftp://host"},
+		"httpx near-miss target_url": {Verdict: "passed", TargetURL: "httpx://host"},
+		"http+unix near-miss url":    {Verdict: "passed", TargetURL: "http+unix://host"},
+		"evidence_hashes non-string": {Verdict: "passed", EvidenceHashes: json.RawMessage(`{"a":123}`)},
+		"evidence_hashes nested":     {Verdict: "passed", EvidenceHashes: json.RawMessage(`{"a":{"b":"c"}}`)},
+		"evidence_hashes scalar":     {Verdict: "passed", EvidenceHashes: json.RawMessage(`"sha256:abc"`)},
+	}
+	for name, a := range cases {
+		t.Run(name, func(t *testing.T) {
+			a := a
+			if err := a.validate(context.Background(), nil); err == nil {
+				t.Fatalf("want a fail-closed error, got nil (target_url=%q hashes=%s)", a.TargetURL, a.EvidenceHashes)
+			}
+		})
+	}
+}
+
+// TestResolveAcceptanceTargetURL_CoercesToHTTP pins condition #2 against the
+// REAL *Server methods reading a spec-declared egress block (driven by the
+// committed workflow-v1 example, whose acceptance stage declares the
+// schemeless egress host localhost:8080): the prompt seam
+// resolveAcceptanceTargetURL returns it in http:// URL form, while the sibling
+// resolveAcceptanceEgressTargetHosts returns the SAME host verbatim (no
+// scheme) for the egress allow-list. A run with no egress block yields "".
+//
+// The https:// passthrough branch of resolveAcceptanceTargetURL is defensive:
+// the v1.3 grammar forbids a scheme in target_hosts (the schema pattern
+// rejects it), so a scheme'd host is unreachable through a valid spec. That
+// passthrough (an already-http(s) value stays unchanged) is exercised at the
+// coerce layer by TestAcceptanceBody_ValidateCoercions' https sub-case.
+func TestResolveAcceptanceTargetURL_CoercesToHTTP(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	seam := buildExampleAcceptanceSeam(t, exampleBytes, run.StageStateSucceeded)
+	ctx := context.Background()
+	runRow := seam.rr.getRuns[seam.runID]
+
+	if got := seam.s.resolveAcceptanceTargetURL(ctx, runRow); got != "http://localhost:8080" {
+		t.Errorf("resolveAcceptanceTargetURL = %q, want http://localhost:8080 (schemeless egress host coerced to URL form)", got)
+	}
+	if got := seam.s.resolveAcceptanceEgressTargetHosts(ctx, runRow); !reflect.DeepEqual(got, []string{"localhost:8080"}) {
+		t.Errorf("resolveAcceptanceEgressTargetHosts = %v, want [localhost:8080] verbatim (no scheme fabricated)", got)
+	}
+
+	// A run with no workflow spec (no egress block) yields the empty string so
+	// buildAcceptance renders its explicit not-declared line.
+	if got := seam.s.resolveAcceptanceTargetURL(ctx, &run.Run{ID: seam.runID}); got != "" {
+		t.Errorf("resolveAcceptanceTargetURL with no egress = %q, want empty", got)
 	}
 }
 

@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -106,12 +108,16 @@ type acceptanceCriterionResult struct {
 }
 
 // acceptanceVerdict mirrors the backend's acceptanceBody by json tag.
+// EvidenceHashes is a json.RawMessage (not []string) so
+// validateAcceptanceVerdict can losslessly coerce the historical
+// string-valued object-map variant before the fail-closed reject — the
+// backend twin decodes the same way (the #1574 class).
 type acceptanceVerdict struct {
 	Verdict        string                      `json:"verdict"`
 	FailureMode    string                      `json:"failure_mode,omitempty"`
 	Criteria       []acceptanceCriterionResult `json:"criteria,omitempty"`
 	TargetURL      string                      `json:"target_url,omitempty"`
-	EvidenceHashes []string                    `json:"evidence_hashes,omitempty"`
+	EvidenceHashes json.RawMessage             `json:"evidence_hashes,omitempty"`
 	// Notes is a declared home for the agent's free-text overflow (#1567):
 	// a top-level remark that would otherwise fail closed against
 	// DisallowUnknownFields. Declaring it makes a benign aside validate
@@ -152,35 +158,46 @@ func captureAcceptanceVerdict(res agent.Result, path string) ([]byte, error) {
 // an unknown id fails closed rather than pinning evidence to a
 // criterion the approved plan never declared. An empty served set skips
 // the membership check (no approved plan / no declared criteria).
-func validateAcceptanceVerdict(raw []byte, servedCriteriaIDs []string) error {
+//
+// It also applies the two lossless coercions of the #1574 class BEFORE
+// the fail-closed rejections — a string-valued object-map evidence_hashes
+// collapses to its sorted values, and a schemeless host[:port] target_url
+// gains an http:// prefix — mirroring the backend twin so the shapes that
+// wedged historical runs decode instead of failing. Anything lossy still
+// fails closed. On success it returns the NORMALIZED verdict bytes: when a
+// coercion fired the bytes are re-marshaled to the canonical shape so the
+// downstream redact + ship carry the normalized form; otherwise the
+// original bytes are returned unchanged. warn (nil-tolerant) receives an
+// (event, detail) pair per coercion for the runner log seam.
+func validateAcceptanceVerdict(raw []byte, servedCriteriaIDs []string, warn func(event, detail string)) ([]byte, error) {
 	var v acceptanceVerdict
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&v); err != nil {
-		return fmt.Errorf("acceptance verdict could not be decoded: %w", err)
+		return nil, fmt.Errorf("acceptance verdict could not be decoded: %w", err)
 	}
 	if dec.More() {
-		return errors.New("acceptance verdict must be a single JSON object")
+		return nil, errors.New("acceptance verdict must be a single JSON object")
 	}
 
 	switch v.Verdict {
 	case "passed":
 		if v.FailureMode != "" {
-			return fmt.Errorf("failure_mode must be omitted on a passed verdict, got %q", v.FailureMode)
+			return nil, fmt.Errorf("failure_mode must be omitted on a passed verdict, got %q", v.FailureMode)
 		}
 	case "failed":
 		switch v.FailureMode {
 		case "error", "assertion_fail":
 			// ok
 		case "":
-			return errors.New("failure_mode is required when verdict is failed (error | assertion_fail)")
+			return nil, errors.New("failure_mode is required when verdict is failed (error | assertion_fail)")
 		default:
-			return fmt.Errorf("failure_mode must be error or assertion_fail, got %q", v.FailureMode)
+			return nil, fmt.Errorf("failure_mode must be error or assertion_fail, got %q", v.FailureMode)
 		}
 	case "":
-		return errors.New("verdict is required")
+		return nil, errors.New("verdict is required")
 	default:
-		return fmt.Errorf("verdict must be passed or failed, got %q", v.Verdict)
+		return nil, fmt.Errorf("verdict must be passed or failed, got %q", v.Verdict)
 	}
 
 	served := make(map[string]struct{}, len(servedCriteriaIDs))
@@ -189,24 +206,127 @@ func validateAcceptanceVerdict(raw []byte, servedCriteriaIDs []string) error {
 	}
 	for i, c := range v.Criteria {
 		if c.ID == "" {
-			return fmt.Errorf("criteria[%d].id is required (the plan-criterion join key)", i)
+			return nil, fmt.Errorf("criteria[%d].id is required (the plan-criterion join key)", i)
 		}
 		switch c.Result {
 		case "passed", "failed", "skipped":
 			// ok
 		default:
-			return fmt.Errorf("criteria[%d].result must be passed/failed/skipped, got %q", i, c.Result)
+			return nil, fmt.Errorf("criteria[%d].result must be passed/failed/skipped, got %q", i, c.Result)
 		}
 		if len(served) > 0 {
 			if _, ok := served[c.ID]; !ok {
-				return fmt.Errorf("criteria[%d].id %q is not in the served acceptance_criteria_ids set", i, c.ID)
+				return nil, fmt.Errorf("criteria[%d].id %q is not in the served acceptance_criteria_ids set", i, c.ID)
 			}
 		}
 	}
-	if v.TargetURL != "" && !strings.HasPrefix(v.TargetURL, "http") {
-		return fmt.Errorf("target_url must be an http(s) URL when set, got %q", v.TargetURL)
+
+	// Coerce evidence_hashes before the fail-closed reject: a string-valued
+	// object map collapses to its sorted values (lossless); a non-string/
+	// nested value or a scalar fails closed.
+	hashes, coercedHashes, err := coerceAcceptanceEvidenceHashes(v.EvidenceHashes)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	if coercedHashes {
+		normalized, merr := json.Marshal(hashes)
+		if merr != nil {
+			return nil, fmt.Errorf("re-marshal coerced evidence_hashes: %w", merr)
+		}
+		v.EvidenceHashes = normalized
+		if warn != nil {
+			warn("acceptance_verdict_evidence_hashes_coerced",
+				fmt.Sprintf("coerced string-valued object-map evidence_hashes to %d sorted values", len(hashes)))
+		}
+	}
+
+	// Coerce target_url before the fail-closed reject: a schemeless host[:port]
+	// gains an http:// prefix; a foreign scheme (anything with "://" that is
+	// not exactly http:// or https://) fails closed.
+	coercedURL, err := coerceAcceptanceTargetURL(&v.TargetURL)
+	if err != nil {
+		return nil, err
+	}
+	if coercedURL && warn != nil {
+		warn("acceptance_verdict_target_url_coerced",
+			fmt.Sprintf("coerced schemeless target_url to %s", v.TargetURL))
+	}
+
+	// Re-marshal to the canonical shape only when a coercion fired, so the
+	// common path preserves the original bytes byte-for-byte.
+	if coercedHashes || coercedURL {
+		out, merr := json.Marshal(v)
+		if merr != nil {
+			return nil, fmt.Errorf("re-marshal coerced acceptance verdict: %w", merr)
+		}
+		return out, nil
+	}
+	return raw, nil
+}
+
+// coerceAcceptanceEvidenceHashes normalizes the verdict's evidence_hashes
+// field. It returns the flat slice, whether a coercion occurred, and an
+// error on any lossy shape. The twin of the backend coerceEvidenceHashes
+// (backend/internal/server/acceptance.go) — the two must stay identical or a
+// runner-accepted verdict could be backend-rejected on ship. Accepted:
+//   - absent / null / empty → nil, no coercion.
+//   - a JSON array of strings → the array verbatim, no coercion (a non-string
+//     element fails closed).
+//   - a string-valued JSON object map (the #1574 variant) → its values,
+//     SORTED, marked coerced; a non-string/nested value fails closed.
+//   - anything else (a scalar) → fails closed.
+func coerceAcceptanceEvidenceHashes(raw json.RawMessage) ([]string, bool, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return nil, false, nil
+	}
+	switch trimmed[0] {
+	case '[':
+		var arr []string
+		if err := json.Unmarshal(trimmed, &arr); err != nil {
+			return nil, false, fmt.Errorf("evidence_hashes must be a flat array of strings: %w", err)
+		}
+		return arr, false, nil
+	case '{':
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &m); err != nil {
+			return nil, false, fmt.Errorf("evidence_hashes object could not be decoded: %w", err)
+		}
+		vals := make([]string, 0, len(m))
+		for _, rv := range m {
+			var s string
+			if err := json.Unmarshal(rv, &s); err != nil {
+				return nil, false, errors.New("evidence_hashes object-map values must all be strings (lossy coercion refused)")
+			}
+			vals = append(vals, s)
+		}
+		sort.Strings(vals)
+		return vals, true, nil
+	default:
+		return nil, false, errors.New("evidence_hashes must be a flat array of strings or a string-valued object map")
+	}
+}
+
+// coerceAcceptanceTargetURL normalizes the verdict's target_url in place. A
+// schemeless host[:port] gains an http:// prefix (coerced=true). A value
+// already carrying an exact http:// or https:// prefix passes through. ANY
+// other value containing "://" (a foreign or near-miss scheme such as ftp://,
+// httpx://, or http+unix://) fails closed — the check matches ONLY the two
+// exact prefixes, never HasPrefix("http"). The twin of the backend helper of
+// the same name.
+func coerceAcceptanceTargetURL(target *string) (bool, error) {
+	v := *target
+	if v == "" {
+		return false, nil
+	}
+	if strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://") {
+		return false, nil
+	}
+	if strings.Contains(v, "://") {
+		return false, fmt.Errorf("target_url must be an http(s) URL when set, got %q", v)
+	}
+	*target = "http://" + v
+	return true, nil
 }
 
 // redactAcceptanceVerdict runs RedactDefault over the verdict bytes.

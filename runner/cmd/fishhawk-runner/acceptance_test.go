@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -197,10 +199,47 @@ func TestValidateAcceptanceVerdict_Table(t *testing.T) {
 			served:  served,
 			wantErr: "target_url must be an http(s) URL",
 		},
+		{
+			// Condition #1: a near-miss scheme a HasPrefix("http") check
+			// would wrongly admit must fail closed.
+			name:    "httpx target_url fails closed",
+			raw:     `{"verdict":"passed","target_url":"httpx://host"}`,
+			served:  served,
+			wantErr: "target_url must be an http(s) URL",
+		},
+		{
+			// Condition #1: another near-miss scheme (http+unix://).
+			name:    "http+unix target_url fails closed",
+			raw:     `{"verdict":"passed","target_url":"http+unix://host"}`,
+			served:  served,
+			wantErr: "target_url must be an http(s) URL",
+		},
+		{
+			// Lossy evidence_hashes: an object-map value that is not a
+			// string fails closed (no coercion).
+			name:    "evidence_hashes map with non-string value fails closed",
+			raw:     `{"verdict":"passed","evidence_hashes":{"a":123}}`,
+			served:  served,
+			wantErr: "object-map values must all be strings",
+		},
+		{
+			// Lossy evidence_hashes: a nested-object map value fails closed.
+			name:    "evidence_hashes map with nested value fails closed",
+			raw:     `{"verdict":"passed","evidence_hashes":{"a":{"b":"c"}}}`,
+			served:  served,
+			wantErr: "object-map values must all be strings",
+		},
+		{
+			// Lossy evidence_hashes: a scalar fails closed.
+			name:    "evidence_hashes scalar fails closed",
+			raw:     `{"verdict":"passed","evidence_hashes":"sha256:abc"}`,
+			served:  served,
+			wantErr: "flat array of strings or a string-valued object map",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateAcceptanceVerdict([]byte(tc.raw), tc.served)
+			_, err := validateAcceptanceVerdict([]byte(tc.raw), tc.served, nil)
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatalf("want valid, got %v", err)
@@ -212,6 +251,83 @@ func TestValidateAcceptanceVerdict_Table(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestValidateAcceptanceVerdict_Coercions covers the two lossless #1574-class
+// coercions: a string-valued object-map evidence_hashes collapses to a sorted
+// []string, and a schemeless target_url gains an http:// prefix — each emits a
+// warning through the warn seam and rewrites the returned bytes to the
+// normalized shape.
+func TestValidateAcceptanceVerdict_Coercions(t *testing.T) {
+	t.Run("object-map evidence_hashes coerces to sorted slice", func(t *testing.T) {
+		var events []string
+		raw := `{"verdict":"passed","evidence_hashes":{"log":"sha256:cc","shot":"sha256:aa","trace":"sha256:bb"}}`
+		out, err := validateAcceptanceVerdict([]byte(raw), nil, func(event, _ string) {
+			events = append(events, event)
+		})
+		if err != nil {
+			t.Fatalf("want valid, got %v", err)
+		}
+		var got acceptanceVerdict
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatalf("normalized bytes do not decode: %v", err)
+		}
+		var hashes []string
+		if err := json.Unmarshal(got.EvidenceHashes, &hashes); err != nil {
+			t.Fatalf("evidence_hashes not an array after coercion: %s (%v)", got.EvidenceHashes, err)
+		}
+		want := []string{"sha256:aa", "sha256:bb", "sha256:cc"}
+		if !reflect.DeepEqual(hashes, want) {
+			t.Errorf("coerced evidence_hashes = %v, want sorted %v", hashes, want)
+		}
+		if !slices.Contains(events, "acceptance_verdict_evidence_hashes_coerced") {
+			t.Errorf("missing evidence_hashes coercion warning, events = %v", events)
+		}
+		// The coerced bytes re-validate cleanly (idempotent — the backend twin
+		// will re-run the same validate on ship).
+		if _, err := validateAcceptanceVerdict(out, nil, nil); err != nil {
+			t.Errorf("normalized verdict fails re-validation: %v", err)
+		}
+	})
+
+	t.Run("schemeless target_url coerces to http://", func(t *testing.T) {
+		var events []string
+		raw := `{"verdict":"passed","target_url":"localhost:8090"}`
+		out, err := validateAcceptanceVerdict([]byte(raw), nil, func(event, _ string) {
+			events = append(events, event)
+		})
+		if err != nil {
+			t.Fatalf("want valid, got %v", err)
+		}
+		var got acceptanceVerdict
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatalf("normalized bytes do not decode: %v", err)
+		}
+		if got.TargetURL != "http://localhost:8090" {
+			t.Errorf("coerced target_url = %q, want http://localhost:8090", got.TargetURL)
+		}
+		if !slices.Contains(events, "acceptance_verdict_target_url_coerced") {
+			t.Errorf("missing target_url coercion warning, events = %v", events)
+		}
+	})
+
+	t.Run("https target_url passes through with no coercion warning", func(t *testing.T) {
+		var events []string
+		raw := `{"verdict":"passed","target_url":"https://preview.example.test"}`
+		out, err := validateAcceptanceVerdict([]byte(raw), nil, func(event, _ string) {
+			events = append(events, event)
+		})
+		if err != nil {
+			t.Fatalf("want valid, got %v", err)
+		}
+		// No coercion → the original bytes are returned unchanged.
+		if string(out) != raw {
+			t.Errorf("non-coerced verdict bytes changed:\n got %s\nwant %s", out, raw)
+		}
+		if len(events) != 0 {
+			t.Errorf("no coercion expected, got events %v", events)
+		}
+	})
 }
 
 // TestAcceptanceVerdictSchema_LockstepWithValidator guards the
@@ -303,7 +419,7 @@ func TestAcceptanceVerdictSchema_LockstepWithValidator(t *testing.T) {
 		"evidence_hashes": ["deadbeef"],
 		"notes": "overall the instance behaved but AC1 regressed"
 	}`
-	if err := validateAcceptanceVerdict([]byte(maximal), []string{"AC1"}); err != nil {
+	if _, err := validateAcceptanceVerdict([]byte(maximal), []string{"AC1"}, nil); err != nil {
 		t.Errorf("maximal schema-shaped verdict rejected by validator: %v", err)
 	}
 }

@@ -5085,8 +5085,33 @@ func TestBuild_Acceptance_IndependenceNoDiffOrScope(t *testing.T) {
 	}
 }
 
+// TestBuild_Acceptance_ShapePinnedFields pins the #1574-class output-contract
+// bullets: target_url must be pinned as a full http(s) URL with the
+// http://localhost:8090-form example, and evidence_hashes as a flat array with
+// its inline example — so the schemaless file-fallback agent emits the shapes
+// the twin decoders expect instead of the object-map / bare-host variants.
+func TestBuild_Acceptance_ShapePinnedFields(t *testing.T) {
+	got, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	for _, want := range []string{
+		"a full http(s) URL",
+		"`http://localhost:8090`",
+		"never a bare host:port",
+		"a flat JSON array of content-hash strings",
+		`["sha256:ab12...","sha256:cd34..."]`,
+		"never an object or map",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("acceptance output contract missing shape-pin %q:\n%s", want, got)
+		}
+	}
+}
+
 // TestBuild_Acceptance_TargetURLRendered pins the target-instance section: a
-// non-empty TargetInstanceURL renders verbatim.
+// non-empty TargetInstanceURL renders verbatim (the value arrives already in
+// URL form from resolveAcceptanceTargetURL).
 func TestBuild_Acceptance_TargetURLRendered(t *testing.T) {
 	got, err := Build("acceptance", Trigger{
 		Repo:              "x/y",

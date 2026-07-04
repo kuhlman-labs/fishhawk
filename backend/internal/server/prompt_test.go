@@ -6067,8 +6067,9 @@ func TestGetStagePromptRender_Acceptance_PopulatesCriteria(t *testing.T) {
 
 // TestGetStagePrompt_Acceptance_RendersDeclaredTargetHost pins the ACTIVATED
 // E31.4/#1532 seam: a run whose workflow spec declares an acceptance-stage
-// egress allowance renders the first target host verbatim in the prompt's
-// Target instance section, and the not-declared interim line is gone.
+// egress allowance renders the first target host in the prompt's Target
+// instance section in full http(s) URL form (a schemeless host:port gains an
+// http:// prefix, #1574), and the not-declared interim line is gone.
 func TestGetStagePrompt_Acceptance_RendersDeclaredTargetHost(t *testing.T) {
 	s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
 	runRow, err := s.cfg.RunRepo.GetRun(context.Background(), runID)
@@ -6097,8 +6098,8 @@ workflows:
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if !strings.Contains(resp.Prompt, "Target instance URL: staging.example.com:8443") {
-		t.Errorf("acceptance prompt missing the declared target host:\n%s", resp.Prompt)
+	if !strings.Contains(resp.Prompt, "Target instance URL: http://staging.example.com:8443") {
+		t.Errorf("acceptance prompt missing the declared target host in http:// URL form:\n%s", resp.Prompt)
 	}
 	if strings.Contains(resp.Prompt, "not declared in the workflow spec") {
 		t.Errorf("acceptance prompt still renders the not-declared line with a declared egress host:\n%s", resp.Prompt)

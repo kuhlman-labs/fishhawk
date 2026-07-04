@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -160,23 +162,45 @@ type acceptanceBody struct {
 	// before per-criterion evidence is itemized.
 	Criteria []acceptanceCriterionResult `json:"criteria,omitempty"`
 	// TargetURL is the running instance the validator drove, when declared.
-	// Optional; http(s)-prefixed when present.
+	// Optional; a schemeless host[:port] is coerced to an http:// URL by
+	// validate(), and any foreign scheme fails closed (the #1574 class).
 	TargetURL string `json:"target_url,omitempty"`
 	// EvidenceHashes references the customer-side evidence blobs by content
-	// hash (ADR-049 #5 default residency customer-side). Optional.
-	EvidenceHashes []string `json:"evidence_hashes,omitempty"`
+	// hash (ADR-049 #5 default residency customer-side). Optional. Decoded as
+	// a RawMessage so validate() can losslessly coerce the historical
+	// string-valued object-map variant to its sorted values (the #1574 class);
+	// see coerceEvidenceHashes. The normalized flat slice lands in
+	// normalizedEvidenceHashes.
+	EvidenceHashes json.RawMessage `json:"evidence_hashes,omitempty"`
 	// Notes is a declared home for the agent's free-text overflow (#1567):
 	// a benign top-level remark that would otherwise fail closed against
 	// DisallowUnknownFields. Free text, no validate() rule; stored verbatim
 	// in the artifact and covered by the existing whole-verdict redaction on
 	// the runner side. The wire twin of acceptanceVerdict.Notes.
 	Notes string `json:"notes,omitempty"`
+
+	// normalizedEvidenceHashes is the coerced/validated flat slice, populated
+	// by validate() from EvidenceHashes. Unexported (no json tag) so it never
+	// marshals into the stored artifact; buildOutcomePayload records it as the
+	// canonical shape.
+	normalizedEvidenceHashes []string
 }
 
 // validate returns a human-readable error if any field is missing or
 // malformed. An acceptance record is the governance trail of an independent
 // validation, so a 400 here means the producer shipped the wrong shape.
-func (a *acceptanceBody) validate() error {
+//
+// It also applies the two lossless coercions of the #1574 class BEFORE the
+// fail-closed rejections, mutating the receiver so the recorded outcome uses
+// the normalized shape: a string-valued object-map evidence_hashes collapses
+// to its sorted values, and a schemeless host[:port] target_url gains an
+// http:// prefix. Anything lossy (a non-string/nested map value, a scalar
+// evidence_hashes, or a foreign target_url scheme) still fails closed. The
+// coercion twin lives in the runner (validateAcceptanceVerdict) — the two
+// must stay behavior-identical or a runner-accepted verdict could be
+// backend-rejected on ship. logger (nil-tolerant) receives a WARN per
+// coercion so the shape drift is observable.
+func (a *acceptanceBody) validate(ctx context.Context, logger *slog.Logger) error {
 	switch a.Verdict {
 	case acceptanceVerdictPassed:
 		if a.FailureMode != "" {
@@ -207,10 +231,97 @@ func (a *acceptanceBody) validate() error {
 			return fmt.Errorf("criteria[%d].result must be passed/failed/skipped, got %q", i, c.Result)
 		}
 	}
-	if a.TargetURL != "" && !strings.HasPrefix(a.TargetURL, "http") {
-		return fmt.Errorf("target_url must be an http(s) URL when set, got %q", a.TargetURL)
+	// Coerce evidence_hashes before the fail-closed reject: a string-valued
+	// object map collapses to its sorted values (lossless); a non-string/
+	// nested value or a scalar fails closed. The normalized slice is what the
+	// outcome payload records.
+	hashes, coercedHashes, err := coerceEvidenceHashes(a.EvidenceHashes)
+	if err != nil {
+		return err
+	}
+	a.normalizedEvidenceHashes = hashes
+	if coercedHashes && logger != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn,
+			"acceptance verdict: coerced string-valued object-map evidence_hashes to sorted values",
+			slog.Int("count", len(hashes)))
+	}
+
+	// Coerce target_url before the fail-closed reject: a schemeless host[:port]
+	// gains an http:// prefix; a foreign scheme (anything with "://" that is
+	// not exactly http:// or https://) fails closed.
+	coercedURL, err := coerceAcceptanceTargetURL(&a.TargetURL)
+	if err != nil {
+		return err
+	}
+	if coercedURL && logger != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn,
+			"acceptance verdict: coerced schemeless target_url to an http:// URL",
+			slog.String("target_url", a.TargetURL))
 	}
 	return nil
+}
+
+// coerceEvidenceHashes normalizes the acceptance verdict's evidence_hashes
+// field. It returns the flat slice of hash strings, whether a coercion
+// occurred, and an error on any lossy shape. The accepted inputs:
+//   - absent / null / empty → nil, no coercion.
+//   - a JSON array of strings → the array verbatim, no coercion (a non-string
+//     element fails closed, matching the strict prior decode).
+//   - a string-valued JSON object map (the #1574 variant) → its values,
+//     SORTED, marked coerced; a non-string or nested value fails closed.
+//   - anything else (a scalar) → fails closed.
+func coerceEvidenceHashes(raw json.RawMessage) ([]string, bool, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return nil, false, nil
+	}
+	switch trimmed[0] {
+	case '[':
+		var arr []string
+		if err := json.Unmarshal(trimmed, &arr); err != nil {
+			return nil, false, fmt.Errorf("evidence_hashes must be a flat array of strings: %w", err)
+		}
+		return arr, false, nil
+	case '{':
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &m); err != nil {
+			return nil, false, fmt.Errorf("evidence_hashes object could not be decoded: %w", err)
+		}
+		vals := make([]string, 0, len(m))
+		for _, rv := range m {
+			var s string
+			if err := json.Unmarshal(rv, &s); err != nil {
+				return nil, false, errors.New("evidence_hashes object-map values must all be strings (lossy coercion refused)")
+			}
+			vals = append(vals, s)
+		}
+		sort.Strings(vals)
+		return vals, true, nil
+	default:
+		return nil, false, errors.New("evidence_hashes must be a flat array of strings or a string-valued object map")
+	}
+}
+
+// coerceAcceptanceTargetURL normalizes the verdict's target_url in place. A
+// schemeless host[:port] gains an http:// prefix (coerced=true). A value
+// already carrying an exact http:// or https:// prefix passes through
+// unchanged. ANY other value containing "://" (a foreign or near-miss scheme
+// such as ftp://, httpx://, or http+unix://) fails closed — the check matches
+// ONLY the two exact prefixes, never HasPrefix("http"), so a scheme a naive
+// prefix test would wrongly admit is rejected.
+func coerceAcceptanceTargetURL(target *string) (bool, error) {
+	v := *target
+	if v == "" {
+		return false, nil
+	}
+	if strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://") {
+		return false, nil
+	}
+	if strings.Contains(v, "://") {
+		return false, fmt.Errorf("target_url must be an http(s) URL when set, got %q", v)
+	}
+	*target = "http://" + v
+	return true, nil
 }
 
 // acceptanceCriteriaTally returns the passed count and the total, used both
@@ -337,7 +448,7 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 			"acceptance body must contain a single JSON object", nil)
 		return
 	}
-	if err := acc.validate(); err != nil {
+	if err := acc.validate(r.Context(), s.cfg.Logger); err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "acceptance_invalid",
 			"acceptance body missing or malformed fields",
 			map[string]any{"error": err.Error()})
@@ -365,6 +476,7 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 			"criteria_skipped": skipped,
 			"criteria_total":   total,
 			"target_url":       acc.TargetURL,
+			"evidence_hashes":  acc.normalizedEvidenceHashes,
 			"auth_method":      authMethod,
 		})
 		return p
@@ -522,18 +634,32 @@ func (s *Server) authorizeAcceptance(w http.ResponseWriter, r *http.Request, run
 // resolveAcceptanceTargetURL is the single named wiring seam for the
 // acceptance stage's target-instance URL (ADR-050 decision #1), activated by
 // the E31.4/#1532 egress-allowance grammar: it returns the acceptance
-// stage's first spec-declared egress target host. The value is a host or
-// host:port, deliberately rendered verbatim — the grammar declares hosts,
-// not URLs, and fabricating a scheme here would assert something the spec
-// does not say. A spec with no egress block (a pre-1.3 spec, or one relying
-// on the documented interim posture) yields the empty string and
-// buildAcceptance renders its explicit not-declared line.
+// stage's first spec-declared egress target host as a full http(s) URL. A
+// schemeless host or host:port gains an http:// prefix so buildAcceptance
+// renders a URL (e.g. http://localhost:8090) rather than a bare authority —
+// handing the validator the target already in URL form so its verdict's
+// target_url does not need the twin decoders' schemeless coercion (the #1574
+// class). An egress host that already carries a scheme passes through
+// unchanged. A spec with no egress block (a pre-1.3 spec, or one relying on
+// the documented interim posture) yields the empty string and buildAcceptance
+// renders its explicit not-declared line.
+//
+// This SUPERSEDES ADR-050 decision #1's verbatim-host posture FOR THE PROMPT
+// SEAM ONLY: the prompt text is the sole consumer, and #1574 showed a bare
+// host:port here nudges the agent toward emitting a schemeless target_url.
+// The sibling resolveAcceptanceEgressTargetHosts KEEPS the verbatim host:port
+// grammar unchanged — the egress-proxy allow-list declares hosts, not URLs,
+// so no scheme is fabricated there.
 func (s *Server) resolveAcceptanceTargetURL(ctx context.Context, runRow *run.Run) string {
 	hosts := s.resolveAcceptanceEgressTargetHosts(ctx, runRow)
 	if len(hosts) == 0 {
 		return ""
 	}
-	return hosts[0]
+	h := hosts[0]
+	if strings.Contains(h, "://") {
+		return h
+	}
+	return "http://" + h
 }
 
 // resolveAcceptanceEgressTargetHosts returns ALL of the acceptance stage's
@@ -541,7 +667,10 @@ func (s *Server) resolveAcceptanceTargetURL(ctx context.Context, runRow *run.Run
 // order. The full list — not just the first host the prompt-text seam renders
 // — is served on the acceptance-stage prompt response as egress_target_hosts:
 // the runner's ADR-050 egress-proxy allow-list input (E31.7 / #1535). nil for
-// a spec with no egress block, so the response field stays omitted.
+// a spec with no egress block, so the response field stays omitted. Unlike
+// resolveAcceptanceTargetURL (the prompt seam, which now prefixes http://),
+// this KEEPS the verbatim host:port grammar per ADR-050 decision #1 — the
+// allow-list matches authorities, not URLs, so no scheme is fabricated.
 func (s *Server) resolveAcceptanceEgressTargetHosts(ctx context.Context, runRow *run.Run) []string {
 	st, ok := s.resolveAcceptanceStageSpec(ctx, runRow)
 	if !ok || st.Egress == nil || len(st.Egress.TargetHosts) == 0 {

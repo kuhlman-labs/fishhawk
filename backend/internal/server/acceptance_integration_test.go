@@ -276,6 +276,77 @@ func TestAcceptanceSeam_NotesCrossesSeam(t *testing.T) {
 	}
 }
 
+// TestAcceptanceSeam_LegacyShapesCoerceAcrossSeam is the #1574-class capstone:
+// a verdict carrying BOTH historical field-shape variants — a string-valued
+// object-map evidence_hashes AND a schemeless host:port target_url — crosses
+// the full HTTP ship → validate/coerce → artifact persist → outcome-audit
+// seam and returns 201 (rather than failing closed at the decode as it did for
+// 7 of 10 historical acceptance runs). The single acceptance_outcome_recorded
+// entry records the coerced http:// target_url and the sorted evidence_hashes
+// slice — proof the coercion is what durably lands, not the raw legacy shape.
+func TestAcceptanceSeam_LegacyShapesCoerceAcrossSeam(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	seam := buildExampleAcceptanceSeam(t, exampleBytes, run.StageStateSucceeded)
+	ctx := context.Background()
+
+	// Both legacy shapes in one body: object-map evidence_hashes + schemeless
+	// target_url. Built as raw bytes (not via json.Marshal of acceptanceBody)
+	// so the object-map shape survives to the decoder.
+	body := []byte(`{"verdict":"passed",` +
+		`"criteria":[{"id":"ac-create","result":"passed","observed":"201 returned"},{"id":"ac-list","result":"passed"}],` +
+		`"target_url":"localhost:8090",` +
+		`"evidence_hashes":{"shot":"sha256:bb","log":"sha256:aa","trace":"sha256:cc"}}`)
+
+	w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv, body, "")
+	if w.Code != 201 {
+		t.Fatalf("ship legacy-shape verdict status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if n := countByCategory(seam.au, CategoryAcceptanceOutcomeRecorded); n != 1 {
+		t.Fatalf("acceptance_outcome_recorded entries = %d, want 1", n)
+	}
+
+	// The recorded outcome carries the coerced shapes.
+	var payload []byte
+	seam.au.mu.Lock()
+	for _, e := range seam.au.appended {
+		if e.Category == CategoryAcceptanceOutcomeRecorded {
+			payload = e.Payload
+		}
+	}
+	seam.au.mu.Unlock()
+	if payload == nil {
+		t.Fatal("no acceptance_outcome_recorded payload found")
+	}
+	var got struct {
+		TargetURL      string   `json:"target_url"`
+		EvidenceHashes []string `json:"evidence_hashes"`
+	}
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatalf("decode outcome payload: %v", err)
+	}
+	if got.TargetURL != "http://localhost:8090" {
+		t.Errorf("recorded target_url = %q, want the coerced http://localhost:8090", got.TargetURL)
+	}
+	if want := []string{"sha256:aa", "sha256:bb", "sha256:cc"}; !reflectDeepEqualStrings(got.EvidenceHashes, want) {
+		t.Errorf("recorded evidence_hashes = %v, want the sorted slice %v", got.EvidenceHashes, want)
+	}
+	_ = ctx
+}
+
+// reflectDeepEqualStrings is a tiny local slice-equality helper (the
+// integration file avoids a reflect import for one assertion).
+func reflectDeepEqualStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // TestAcceptanceSeam_Class1Error_FixupAndAnchor: a failed{error} verdict
 // re-opens implement+review+acceptance to pending (class 1 → fixup_dispatched)
 // and the triage decision anchor-renders from the shared store.

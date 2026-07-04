@@ -1438,7 +1438,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"acceptance_verdict_missing","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
 				cfg.runID, cfg.stageID, capErr.Error())
-		} else if valErr := validateAcceptanceVerdict(rawVerdict, acceptanceCriteriaIDs); valErr != nil {
+		} else if coercedVerdict, valErr := validateAcceptanceVerdict(rawVerdict, acceptanceCriteriaIDs,
+			func(event, detail string) {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":%q,"run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+					event, cfg.runID, cfg.stageID, detail)
+			}); valErr != nil {
 			res.OK = false
 			res.FailureCategory = "B"
 			res.FailureReason = "acceptance_verdict_invalid: " + valErr.Error()
@@ -1447,6 +1452,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				`{"event":"acceptance_verdict_invalid","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
 				cfg.runID, cfg.stageID, valErr.Error())
 		} else {
+			// Use the normalized (possibly coerced) verdict bytes for redaction
+			// and ship so downstream carries the canonical shape.
+			rawVerdict = coercedVerdict
 			redacted, hits := redactAcceptanceVerdict(rawVerdict)
 			acceptanceVerdictRedacted = redacted
 			if len(hits) > 0 {
