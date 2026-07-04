@@ -556,6 +556,28 @@ else
   fail "_clean_stray_pid_files should print a notice naming each removed stray (got: $sweep_out)"
 fi
 
+# 12b. _clean_stray_nonce_files: tempdir fixture — only the numbered
+# 'dev N.nonce' strays (#1623, macOS/iCloud duplicate-name shapes) are
+# removed, never the canonical dev.nonce, whose removal cmd_down defers until
+# after _down_port_fallback proves listener ownership (#1018).
+touch "$stray_dir/dev.nonce" "$stray_dir/dev 2.nonce" "$stray_dir/dev 3.nonce"
+nonce_sweep_out="$(_clean_stray_nonce_files "$stray_dir")"
+if [[ -f "$stray_dir/dev.nonce" ]]; then
+  pass "_clean_stray_nonce_files preserves dev.nonce"
+else
+  fail "_clean_stray_nonce_files must never remove dev.nonce"
+fi
+if [[ ! -f "$stray_dir/dev 2.nonce" && ! -f "$stray_dir/dev 3.nonce" ]]; then
+  pass "_clean_stray_nonce_files removes the numbered strays"
+else
+  fail "_clean_stray_nonce_files should remove 'dev 2.nonce' and 'dev 3.nonce'"
+fi
+if [[ "$nonce_sweep_out" == *"dev 2.nonce"* && "$nonce_sweep_out" == *"dev 3.nonce"* ]]; then
+  pass "_clean_stray_nonce_files prints a notice per removal"
+else
+  fail "_clean_stray_nonce_files should print a notice naming each removed stray (got: $nonce_sweep_out)"
+fi
+
 # 13. Listener-identity contract (#965), driven behaviorally with a REAL
 # squatter: an `nc -l` background listener on a random high port. lsof only
 # inspects (never connects), so nc stays listening for the section's duration.
@@ -677,6 +699,11 @@ if print -r -- "$up_body" | grep -q '_clean_stray_pid_files'; then
 else
   fail "cmd_up should call _clean_stray_pid_files"
 fi
+if print -r -- "$up_body" | grep -q '_clean_stray_nonce_files'; then
+  pass "cmd_up sweeps stray nonce files"
+else
+  fail "cmd_up should call _clean_stray_nonce_files"
+fi
 down_body="$(typeset -f cmd_down)"
 if print -r -- "$down_body" | grep -q '_down_port_fallback'; then
   pass "cmd_down composes the port fallback (_down_port_fallback)"
@@ -692,6 +719,11 @@ if print -r -- "$down_body" | grep -q '_clean_stray_pid_files'; then
   pass "cmd_down sweeps stray pid files"
 else
   fail "cmd_down should call _clean_stray_pid_files"
+fi
+if print -r -- "$down_body" | grep -q '_clean_stray_nonce_files'; then
+  pass "cmd_down sweeps stray nonce files"
+else
+  fail "cmd_down should call _clean_stray_nonce_files"
 fi
 # lsof-missing degraded mode: the identity layer must guard on `command -v
 # lsof` (warn-and-degrade, never a broken up/down on a host without it).

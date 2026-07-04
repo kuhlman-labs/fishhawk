@@ -286,6 +286,22 @@ _clean_stray_pid_files() {
   done
 }
 
+# Sweep numbered duplicate nonce files ('dev 2.nonce' … — the macOS/iCloud
+# duplicate-name pattern, same origin as the 'dev 2.pid' strays above, #1623)
+# so they can't dirty the tree or be mistaken for the live nonce file. Glob is
+# SPACE-prefixed and never matches the canonical dev.nonce — cmd_down defers
+# removing that one until after _down_port_fallback proves listener ownership
+# (#1018), and cmd_up writes it before spawn. (N) makes the glob expand to
+# nothing when there are no strays.
+_clean_stray_nonce_files() {
+  local dir="$1"
+  local f
+  for f in "${dir}"/dev\ *.nonce(N); do
+    rm -f "$f"
+    print "removed stray nonce file: ${f:t}"
+  done
+}
+
 # Local image tag the Docker-Desktop Kubernetes bring-up builds and the chart is
 # pointed at via `--set image.tag=dev-local`. Docker Desktop's k8s shares the host
 # Docker daemon image store, so a locally built image under this tag is resolvable
@@ -816,6 +832,7 @@ cmd_up() {
   disown
   print "$pid" > "$PID_FILE"
   _clean_stray_pid_files "${PID_FILE:h}"
+  _clean_stray_nonce_files "${PID_FILE:h}"
 
   # Readiness gate: the spawn above is fire-and-forget — without confirming the
   # process is alive and listening, a silent no-op reads as a false 'started'
@@ -907,6 +924,7 @@ cmd_down() {
   fi
 
   _clean_stray_pid_files "${PID_FILE:h}"
+  _clean_stray_nonce_files "${PID_FILE:h}"
 
   # Port fallback (#965): kill a stale fishhawkd squatter (orphaned by a lost
   # pid file), or report a foreign listener and refuse to claim success. The
