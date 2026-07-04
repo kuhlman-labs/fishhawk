@@ -62,21 +62,35 @@ func Invalid(field string, opts ...Option) map[string]any {
 }
 
 // Decomposed extends Valid with a two-sub-plan decomposition block.
-// Sub-plan titles are distinct so semantic duplicate-title checks pass.
+// Sub-plan titles are distinct so semantic duplicate-title checks pass, and
+// each slice declares its own disjoint scope.files (Part A -> a.go, Part B ->
+// b.go) so the fixture satisfies the mandatory-per-slice-scope plan gate
+// (#1669) — without per-slice scope, plan.Parse now rejects a decomposition
+// as an unscoped (full-scope-inheriting) shape.
 func Decomposed(opts ...Option) map[string]any {
 	m := Valid(opts...)
 	m["decomposition"] = map[string]any{
 		"rationale": "scope exceeded single-stage budget",
 		"sub_plans": []any{
 			map[string]any{
-				"title":                        "Part A",
-				"scope_hint":                   "first half",
+				"title":      "Part A",
+				"scope_hint": "first half",
+				"scope": map[string]any{
+					"files": []any{
+						map[string]any{"path": "a.go", "operation": "create"},
+					},
+				},
 				"predicted_runtime_minutes":    10,
 				"predicted_runtime_confidence": "medium",
 			},
 			map[string]any{
-				"title":                        "Part B",
-				"scope_hint":                   "second half",
+				"title":      "Part B",
+				"scope_hint": "second half",
+				"scope": map[string]any{
+					"files": []any{
+						map[string]any{"path": "b.go", "operation": "create"},
+					},
+				},
 				"predicted_runtime_minutes":    10,
 				"predicted_runtime_confidence": "medium",
 			},

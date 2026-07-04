@@ -1699,6 +1699,67 @@ func TestBuild_Implement_ScopeConstraint_SiblingHints(t *testing.T) {
 	}
 }
 
+// TestBuild_Implement_ScopeConstraint_ScopeFiles_BindsToSlice is the #1669
+// prompt-layer guard: a decomposed child (ScopeConstraint with ScopeFiles)
+// renders the explicit owned-files list AND the slice-only binding task text,
+// and does NOT carry the whole-plan "implement the approved plan above"
+// instruction that made every child implement the entire plan.
+func TestBuild_Implement_ScopeConstraint_ScopeFiles_BindsToSlice(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		ApprovedPlan: fixturePlan(),
+		ScopeConstraint: &ScopeConstraint{
+			ScopeHint:   "Implement Part A in pkg/a.",
+			ParentRunID: "00000000-0000-0000-0000-000000000010",
+			ScopeFiles:  []string{"pkg/a/a.go", "pkg/a/a_test.go"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"Files you own (implement ONLY these",
+		"- pkg/a/a.go",
+		"- pkg/a/a_test.go",
+		"implement ONLY the portion of the approved plan that falls within your scope",
+		"remaining slices are implemented by sibling child runs",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("decomposed-child prompt missing %q\n---\n%s", w, got)
+		}
+	}
+	if strings.Contains(got, "Your task: implement the approved plan above.") {
+		t.Errorf("decomposed-child prompt must NOT carry the whole-plan task instruction:\n%s", got)
+	}
+}
+
+// TestBuild_Implement_NonDecomposed_TaskTextByteStable locks replay stability:
+// a non-decomposed implement prompt (ScopeConstraint nil) keeps the original
+// "implement the approved plan above" binding text and renders no
+// slice-scoping framing, so the #1669 change is byte-identical for ordinary
+// runs.
+func TestBuild_Implement_NonDecomposed_TaskTextByteStable(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		ApprovedPlan: fixturePlan(),
+		// ScopeConstraint deliberately nil.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "Your task: implement the approved plan above. The plan is the binding instruction;") {
+		t.Errorf("non-decomposed prompt lost the original task text:\n%s", got)
+	}
+	for _, unexpected := range []string{
+		"Files you own (implement ONLY these",
+		"implement ONLY the portion of the approved plan that falls within your scope",
+	} {
+		if strings.Contains(got, unexpected) {
+			t.Errorf("non-decomposed prompt must not carry slice framing %q:\n%s", unexpected, got)
+		}
+	}
+}
+
 func TestBuild_Implement_ScopeConstraint_Nil_SectionAbsent(t *testing.T) {
 	got, err := Build("implement", Trigger{
 		Repo:         "o/r",

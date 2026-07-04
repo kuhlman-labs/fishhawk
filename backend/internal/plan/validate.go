@@ -245,6 +245,11 @@ func Parse(data []byte) (*Plan, error) {
 
 // semanticCheck enforces invariants that JSON Schema cannot express:
 //   - sub-plan titles must be unique within a decomposition;
+//   - every sub-plan MUST declare its own non-empty scope.files (#1669): the
+//     fan-out child for a slice is scoped (scope_handoff + scope-drift) and
+//     prompted to those files, so a slice that omitted scope inherited the
+//     parent's FULL scope.files and made every child implement the whole plan
+//     — the disjoint slice branches then conflicted wholesale at fan-in;
 //   - a file path may be scoped by at most one sub-plan (#1062): the
 //     orchestrator partitions per-slice scope.files for commit bounding and
 //     scope-drift detection, so a path claimed by two slices would have the
@@ -275,6 +280,9 @@ func semanticCheck(p *Plan) error {
 		}
 		seen[sp.Title] = struct{}{}
 	}
+	if err := checkSubPlanScopesDeclared(p.Decomposition); err != nil {
+		return err
+	}
 	if err := checkCrossSliceSharedFiles(p.Decomposition); err != nil {
 		return err
 	}
@@ -290,11 +298,39 @@ func semanticCheck(p *Plan) error {
 	return nil
 }
 
+// checkSubPlanScopesDeclared rejects a decomposition in which any sub-plan
+// omits its own non-empty scope.files (#1669). Every slice MUST declare the
+// files it owns: the fan-out child minted for a sub-plan is scoped
+// (scope_handoff + scope-drift) and prompted to those files, so a sub-plan
+// that inherited the parent's full scope.files silently made every child
+// implement the ENTIRE plan — the disjoint slice branches then conflicted
+// wholesale at fan-in and could not consolidate. The error names each
+// offending slice so the plan author can add the missing per-slice scope.
+func checkSubPlanScopesDeclared(d *Decomposition) error {
+	var missing []string
+	for _, sp := range d.SubPlans {
+		if sp.Scope == nil || len(sp.Scope.Files) == 0 {
+			missing = append(missing, strconv.Quote(sp.Title))
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	sort.Strings(missing)
+	return &SemanticError{
+		Message: fmt.Sprintf(
+			"decomposition.sub_plans: sub-plan(s) %s declare no scope.files; every slice must declare the files it owns so the fan-out child is scoped to its slice, not the whole plan",
+			strings.Join(missing, ", "),
+		),
+	}
+}
+
 // checkCrossSliceSharedFiles rejects a decomposition whose sub-plans
 // collectively scope the same file path across two or more distinct slices.
-// Only sub-plans that DECLARE a scope are considered — an undeclared scope
-// inherits the parent's full scope.files and so cannot partition unsoundly.
-// A single slice listing the same path twice is collapsed to one claimant.
+// Every sub-plan is guaranteed to declare a scope by the time this runs
+// (checkSubPlanScopesDeclared runs first); the nil guard below is retained
+// defensively. A single slice listing the same path twice is collapsed to
+// one claimant.
 func checkCrossSliceSharedFiles(d *Decomposition) error {
 	claimants := make(map[string]map[string]struct{})
 	for _, sp := range d.SubPlans {

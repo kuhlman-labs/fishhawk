@@ -2466,16 +2466,28 @@ func (s *Server) resolveDecomposedScopeConstraint(ctx context.Context, runRow *r
 			siblingHints = append(siblingHints, sub.ScopeHint)
 		}
 	}
+	// Narrow the child to its slice via the matched sub-plan's own scope.files
+	// (#1669). The plan gate now requires per-slice scope, so a matched child
+	// always carries these paths — the nil guard is defensive for an
+	// out-of-band plan constructed without the gate.
+	var scopeFiles []string
+	if matched.Scope != nil {
+		for _, f := range matched.Scope.Files {
+			scopeFiles = append(scopeFiles, f.Path)
+		}
+	}
 	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 		"prompt: injected scope constraint for decomposed child",
 		slog.String("child_run_id", runRow.ID.String()),
 		slog.String("parent_run_id", runRow.DecomposedFrom.String()),
 		slog.Int("sibling_count", len(siblingHints)),
+		slog.Int("scope_file_count", len(scopeFiles)),
 	)
 	return &prompt.ScopeConstraint{
 		ScopeHint:    matched.ScopeHint,
 		ParentRunID:  runRow.DecomposedFrom.String(),
 		SiblingHints: siblingHints,
+		ScopeFiles:   scopeFiles,
 	}
 }
 

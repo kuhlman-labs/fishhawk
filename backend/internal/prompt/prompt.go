@@ -169,6 +169,13 @@ type ScopeConstraint struct {
 	// SiblingHints are the scope_hints of all other sub-plans in the
 	// parent decomposition (all sub-plans except this child's).
 	SiblingHints []string
+	// ScopeFiles are the matched sub-plan's own scope.files paths (#1669).
+	// When non-empty, buildImplement renders them as an explicit "Files you
+	// own" list so the decomposed child has a concrete file boundary — not
+	// just the prose scope_hint — and binds the task to only those files.
+	// Empty for a child whose sub-plan carried no scope (defensive; the plan
+	// gate now requires per-slice scope).
+	ScopeFiles []string
 }
 
 // IssueComment is one issue comment in Trigger.IssueComments, a
@@ -818,6 +825,15 @@ func buildImplement(t Trigger) string {
 		b.WriteString("Your scope for this child run:\n\n")
 		b.WriteString(sc.ScopeHint)
 		b.WriteString("\n\n")
+		if len(sc.ScopeFiles) > 0 {
+			b.WriteString("Files you own (implement ONLY these — the rest of the plan is other slices):\n\n")
+			for _, f := range sc.ScopeFiles {
+				b.WriteString("- ")
+				b.WriteString(f)
+				b.WriteString("\n")
+			}
+			b.WriteString("\n")
+		}
 		if len(sc.SiblingHints) > 0 {
 			b.WriteString("do NOT modify code in sibling scope. Sibling scopes are owned by other child runs:\n\n")
 			for _, hint := range sc.SiblingHints {
@@ -876,8 +892,20 @@ func buildImplement(t Trigger) string {
 		b.WriteString("Originating issue (link only — fetch if you need detail):\n\n")
 		writeIssueLink(&b, t)
 
-		b.WriteString("Your task: implement the approved plan above. The plan is the binding instruction; the issue is linked for grounding when the plan is ambiguous — fetch it via your GitHub tooling if you need the body. Make the smallest set of changes that satisfies the plan.\n")
-		b.WriteString("\n")
+		if t.ScopeConstraint != nil {
+			// Decomposed child (#1669): the full plan is shown FOR CONTEXT, but
+			// the binding instruction is to implement ONLY this child's slice —
+			// the files named in the SCOPE CONSTRAINT block above. The remaining
+			// slices are implemented by sibling child runs and MUST NOT be
+			// touched; an edit outside the slice is dropped from the commit, so
+			// implementing the whole plan produces a branch that conflicts
+			// wholesale with its siblings at fan-in.
+			b.WriteString("Your task: implement ONLY the portion of the approved plan that falls within your scope — the files listed in the SCOPE CONSTRAINT block above. The full plan is shown for grounding, but the remaining slices are implemented by sibling child runs and MUST NOT be touched. Make the smallest set of changes that satisfies your slice.\n")
+			b.WriteString("\n")
+		} else {
+			b.WriteString("Your task: implement the approved plan above. The plan is the binding instruction; the issue is linked for grounding when the plan is ambiguous — fetch it via your GitHub tooling if you need the body. Make the smallest set of changes that satisfies the plan.\n")
+			b.WriteString("\n")
+		}
 		b.WriteString("If you discover the plan is wrong or infeasible — a file it names doesn't exist, an approach step is incompatible with the current code, the verification can't be implemented as specified — stop and surface that in your final response rather than diverging silently. The right path in that case is a follow-up run that re-plans, not an off-plan implementation.\n")
 		b.WriteString("\n")
 		b.WriteString("If the repository has materially changed since the plan was approved (files in the plan's scope have been heavily refactored, an approach step references code that no longer exists), surface that and pause.\n")

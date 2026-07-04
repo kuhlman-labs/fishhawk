@@ -2028,6 +2028,93 @@ func TestIntegrateSlices_Conflict_FailsParentRecoverable(t *testing.T) {
 	}
 }
 
+// TestIntegrateSlices_DisjointSlices_ConsolidateWithoutConflict is the #1669
+// fan-in half of done-means: when each fan-out child is scoped to its slice,
+// the slice branches touch non-overlapping file sets and consolidate cleanly.
+// The stubGitHub is the git-merge simulator — disjoint file sets are modeled
+// by MergeBranch returning success (no ErrMergeConflict programmed), which is
+// exactly what a real three-way merge of non-overlapping diffs produces. A
+// full live-agent fan-out is not unit-testable; this asserts the git
+// integration path returns NO SliceConflict and merges every slice onto the
+// consolidated branch in ascending order.
+func TestIntegrateSlices_DisjointSlices_ConsolidateWithoutConflict(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	au := &recordingAudit{}
+	o.Audit = au
+	gh.branchSHAs = map[string]string{"main": "basesha"} // consolidated absent
+
+	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+	// Three disjoint slices (no programmed merge conflict on any head).
+	_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+	_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 2)
+
+	conflict, err := o.IntegrateSlices(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("IntegrateSlices: %v", err)
+	}
+	if conflict != nil {
+		t.Fatalf("conflict = %+v, want nil for disjoint slices", conflict)
+	}
+
+	consolidated := consolidatedBranch(parent.ID)
+	if len(gh.mergeCalls) != 3 {
+		t.Fatalf("MergeBranch calls = %d, want 3 (one per disjoint slice)", len(gh.mergeCalls))
+	}
+	for i, m := range gh.mergeCalls {
+		if m.Base != consolidated {
+			t.Errorf("merge[%d] base = %q, want %q", i, m.Base, consolidated)
+		}
+		if m.Head != sliceBranch(parent.ID, i) {
+			t.Errorf("merge[%d] head = %q, want ascending slice %q", i, m.Head, sliceBranch(parent.ID, i))
+		}
+	}
+	// A clean fan-in records slices_integrated, never slice_integration_conflict.
+	p := auditPayload(t, au, "slices_integrated")
+	if got, _ := p["slice_count"].(float64); int(got) != 3 {
+		t.Errorf("slices_integrated slice_count = %v, want 3", p["slice_count"])
+	}
+}
+
+// TestIntegrateSlices_OverlappingSlice_ReturnsConflict is the counterpart to
+// the disjoint case: when a slice branch cannot merge onto the consolidated
+// branch (overlapping edits — the wholesale-conflict failure mode #1669
+// eliminates by scoping each child), IntegrateSlices returns a *SliceConflict
+// naming the conflicting slice index and child run id, rather than silently
+// dropping the slice. Asserts the return value directly (the maybe-advance
+// wrapper is covered by TestIntegrateSlices_Conflict_FailsParentRecoverable).
+func TestIntegrateSlices_OverlappingSlice_ReturnsConflict(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	au := &recordingAudit{}
+	o.Audit = au
+	gh.branchSHAs = map[string]string{"main": "basesha"}
+
+	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+	_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	child1 := seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+
+	// Slice-1's branch overlaps slice-0 and cannot merge.
+	gh.mergeErrByHead = map[string]error{
+		sliceBranch(parent.ID, 1): githubclient.ErrMergeConflict,
+	}
+
+	conflict, err := o.IntegrateSlices(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("IntegrateSlices: %v", err)
+	}
+	if conflict == nil {
+		t.Fatal("conflict = nil, want a *SliceConflict for the overlapping slice")
+	}
+	if conflict.SliceIndex != 1 {
+		t.Errorf("conflict.SliceIndex = %d, want 1", conflict.SliceIndex)
+	}
+	if conflict.ChildRunID != child1.ID {
+		t.Errorf("conflict.ChildRunID = %s, want %s", conflict.ChildRunID, child1.ID)
+	}
+}
+
 func TestIntegrateSlices_Idempotent_ExistingBranchAndMergedSlices(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
 	o.DefaultRef = "main"
