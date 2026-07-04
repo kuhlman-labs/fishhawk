@@ -27,14 +27,31 @@ import (
 type apiClient struct {
 	baseURL string
 	token   string
-	http    *http.Client
+	// http is the 30s short client for every read/decide/file/direct-edit
+	// arm — bodies return in well under a second.
+	http *http.Client
+	// httpLong is the minutes-long client for the two agent-backed refinement
+	// arms (create-session, brief-amendment). A drafting-agent call is a
+	// multi-minute LLM inference, so the 30s short client aborts it mid-flight
+	// (aborting the request context and, server-side, killing the drafter).
+	httpLong *http.Client
 }
+
+// refinementDraftClientTimeout bounds the MCP client's wait on the two
+// agent-backed refinement arms (open + brief_amendment). It is set a couple of
+// minutes ABOVE the server-side drafting budget (refinementDraftBudget, 20m in
+// backend/internal/server/refinement.go) so the client waits for the server's
+// own bounded response/error instead of aborting first. The 20m server budget
+// is anchored to planreview's review-budget Cap (1200s /
+// backend/internal/planreview/budget.go).
+const refinementDraftClientTimeout = 22 * time.Minute
 
 func newAPIClient(cfg config) *apiClient {
 	return &apiClient{
-		baseURL: cfg.backendURL,
-		token:   cfg.apiToken,
-		http:    &http.Client{Timeout: 30 * time.Second},
+		baseURL:  cfg.backendURL,
+		token:    cfg.apiToken,
+		http:     &http.Client{Timeout: 30 * time.Second},
+		httpLong: &http.Client{Timeout: refinementDraftClientTimeout},
 	}
 }
 
@@ -1656,7 +1673,10 @@ func (c *apiClient) CreateRefinementSession(ctx context.Context, brief string) (
 		return nil, fmt.Errorf("marshal create-refinement-session: %w", err)
 	}
 	var out RefinementSession
-	if err := c.do(ctx, http.MethodPost, "/v0/refinement/sessions", body, &out); err != nil {
+	// Agent-backed open arm: the drafter runs for minutes, so route through the
+	// long client (refinementDraftClientTimeout) — the 30s short client would
+	// abort mid-inference and cancel the request context.
+	if err := c.doLong(ctx, http.MethodPost, "/v0/refinement/sessions", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -1697,7 +1717,15 @@ func (c *apiClient) EditRefinementDraft(ctx context.Context, sessionID uuid.UUID
 		return nil, fmt.Errorf("marshal edit-refinement-draft: %w", err)
 	}
 	var out RefinementSession
-	if err := c.do(ctx, http.MethodPatch, "/v0/refinement/sessions/"+sessionID.String()+"/draft", body, &out); err != nil {
+	path := "/v0/refinement/sessions/" + sessionID.String() + "/draft"
+	// The brief-amendment arm re-runs the drafting agent (minutes), so route it
+	// through the long client; the direct `draft` edit is a fast strict-decode
+	// with no agent call and stays on the 30s short client.
+	doFn := c.do
+	if briefAmendment != "" {
+		doFn = c.doLong
+	}
+	if err := doFn(ctx, http.MethodPatch, path, body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -2211,12 +2239,27 @@ func (c *apiClient) do(ctx context.Context, method, path string, body []byte, ou
 	return err
 }
 
-// doWithStatus performs the request and decodes the JSON body into
-// out. On non-2xx the body is parsed as the OpenAPI error envelope
-// and returned as *apiError. `extraHeaders` is merged into the
-// request — used for E8.2's Idempotency-Key on POST /v0/runs. Same
-// posture as the CLI's httpclient.do.
+// doLong is the long-client analogue of do: it routes the request through
+// c.httpLong (refinementDraftClientTimeout) instead of the 30s short client,
+// for the two agent-backed refinement arms whose bodies take minutes.
+func (c *apiClient) doLong(ctx context.Context, method, path string, body []byte, out any) error {
+	_, err := c.doWithStatusUsing(c.httpLong, ctx, method, path, body, nil, out)
+	return err
+}
+
+// doWithStatus performs the request on the 30s short client. See
+// doWithStatusUsing for the mechanics.
 func (c *apiClient) doWithStatus(ctx context.Context, method, path string, body []byte, extraHeaders map[string]string, out any) (int, error) {
+	return c.doWithStatusUsing(c.http, ctx, method, path, body, extraHeaders, out)
+}
+
+// doWithStatusUsing performs the request on the supplied client and decodes the
+// JSON body into out. On non-2xx the body is parsed as the OpenAPI error
+// envelope and returned as *apiError. `extraHeaders` is merged into the
+// request — used for E8.2's Idempotency-Key on POST /v0/runs. Same posture as
+// the CLI's httpclient.do. The client parameter selects the per-arm timeout
+// (short vs refinementDraftClientTimeout).
+func (c *apiClient) doWithStatusUsing(client *http.Client, ctx context.Context, method, path string, body []byte, extraHeaders map[string]string, out any) (int, error) {
 	if c.baseURL == "" {
 		return 0, errors.New("apiClient: baseURL not set")
 	}
@@ -2238,7 +2281,7 @@ func (c *apiClient) doWithStatus(ctx context.Context, method, path string, body 
 	for k, v := range extraHeaders {
 		req.Header.Set(k, v)
 	}
-	resp, err := c.http.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("http: %w", err)
 	}

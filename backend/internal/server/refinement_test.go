@@ -26,14 +26,68 @@ type fakeRefinementDrafter struct {
 	model string
 	err   error
 	calls int
+
+	// Recorded at the most recent Draft invocation (disconnect-survival tests):
+	// the inbound context's cancellation error and its deadline. A detached,
+	// budgeted context observes sawCtxErr==nil and sawHadDeadline==true.
+	sawCtxErr      error
+	sawHadDeadline bool
+	sawDeadlineIn  time.Duration
 }
 
-func (f *fakeRefinementDrafter) Draft(_ context.Context, _ uuid.UUID, _ string) (refinement.EpicDraft, string, error) {
+func (f *fakeRefinementDrafter) Draft(ctx context.Context, _ uuid.UUID, _ string) (refinement.EpicDraft, string, error) {
 	f.calls++
+	f.sawCtxErr = ctx.Err()
+	if dl, ok := ctx.Deadline(); ok {
+		f.sawHadDeadline = true
+		f.sawDeadlineIn = time.Until(dl)
+	} else {
+		f.sawHadDeadline = false
+		f.sawDeadlineIn = 0
+	}
 	if f.err != nil {
 		return refinement.EpicDraft{}, "", f.err
 	}
 	return f.draft, f.model, nil
+}
+
+// disconnectRefinementRepo is an in-memory refinement repo for the
+// disconnect-survival tests. Its reads (ListForSession/ListDecisions) IGNORE
+// context cancellation so a load always succeeds — modelling the real flow
+// where the load completes before the client disconnects mid-drafting. Its
+// CreateDraft RESPECTS cancellation, so a test can prove that only a DETACHED
+// context reaches the persist: the amendment arm (detached) persists; the
+// direct-edit arm (still bound to the cancelled request context) does not.
+type disconnectRefinementRepo struct {
+	refinement.Repository
+	drafts []*refinement.StoredDraft
+}
+
+func (r *disconnectRefinementRepo) ListForSession(_ context.Context, _ uuid.UUID) ([]*refinement.StoredDraft, error) {
+	return r.drafts, nil
+}
+
+func (r *disconnectRefinementRepo) ListDecisions(_ context.Context, _ uuid.UUID) ([]*refinement.Decision, error) {
+	return nil, nil
+}
+
+func (r *disconnectRefinementRepo) CreateDraft(ctx context.Context, p refinement.CreateParams) (*refinement.StoredDraft, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	sd := &refinement.StoredDraft{
+		ID:        p.ID,
+		SessionID: p.SessionID,
+		Brief:     p.Brief,
+		Draft:     p.Draft,
+		Model:     p.Model,
+		Origin:    p.Origin,
+	}
+	if sd.ID == uuid.Nil {
+		sd.ID = uuid.New()
+	}
+	r.drafts = append(r.drafts, sd)
+	return sd, nil
 }
 
 // erroringAuditRepo fails every AppendGlobalChained, to exercise the
@@ -42,6 +96,15 @@ type erroringAuditRepo struct{ audit.BaseFake }
 
 func (erroringAuditRepo) AppendGlobalChained(context.Context, audit.GlobalChainAppendParams) (*audit.Entry, error) {
 	return nil, errors.New("injected audit failure")
+}
+
+// okAuditRepo succeeds on AppendGlobalChained regardless of context — used by
+// the disconnect-survival tests, which assert persistence detachment, not audit
+// behavior (audit.BaseFake returns ErrNotFound, which would mask the persist).
+type okAuditRepo struct{ audit.BaseFake }
+
+func (okAuditRepo) AppendGlobalChained(context.Context, audit.GlobalChainAppendParams) (*audit.Entry, error) {
+	return &audit.Entry{}, nil
 }
 
 // seededRefinementRepo is a read-only fake serving a fixed drafts + decisions
@@ -290,6 +353,115 @@ func TestRefinement_DraftingAgentFailure502(t *testing.T) {
 	// agent call, not an earlier gate.
 	if drafter.calls != 2 {
 		t.Errorf("drafter calls = %d, want 2 (create + amendment)", drafter.calls)
+	}
+}
+
+// ---- disconnect survival (#1637) ------------------------------------------
+
+// cancelledRefinementReq builds an authed refinement request whose context is
+// ALREADY cancelled — simulating a client that disconnected. The identity value
+// survives on the cancelled context (it is an ancestor value), so
+// context.WithoutCancel in the handler still resolves the subject.
+func cancelledRefinementReq(method, target, sessionID, bodyJSON string) *http.Request {
+	r := refinementReq(method, target, sessionID, bodyJSON)
+	ctx, cancel := context.WithCancel(r.Context())
+	cancel()
+	return r.WithContext(ctx)
+}
+
+// TestRefinement_OpenArm_SurvivesClientDisconnect drives handleCreateRefinementSession
+// with an already-cancelled inbound request context and asserts the drafter ran
+// on a DETACHED, budgeted context and the session persisted+readable — proving a
+// client disconnect neither kills the drafter nor strands the session.
+func TestRefinement_OpenArm_SurvivesClientDisconnect(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := refinement.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	drafter := &fakeRefinementDrafter{draft: refinementValidDraft(), model: "claude-opus-4-8"}
+	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, RefinementDrafter: drafter})
+
+	rec := httptest.NewRecorder()
+	s.handleCreateRefinementSession(rec, cancelledRefinementReq(http.MethodPost, "/v0/refinement/sessions", "", `{"brief":"build X"}`))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create under disconnected client: status = %d, want 201 (body %s)", rec.Code, rec.Body.String())
+	}
+
+	// The drafter saw a NON-cancelled (detached) context bearing a deadline
+	// (budgeted), despite the cancelled inbound request context.
+	if drafter.sawCtxErr != nil {
+		t.Errorf("drafter ctx.Err() = %v, want nil (detached from the cancelled request)", drafter.sawCtxErr)
+	}
+	if !drafter.sawHadDeadline {
+		t.Errorf("drafter ctx carried no deadline, want a refinementDraftBudget deadline (drafter is otherwise unbounded)")
+	}
+	// The deadline is ~= refinementDraftBudget (a couple of minutes' slack for
+	// the value being consumed since the handler set it).
+	if drafter.sawDeadlineIn < refinementDraftBudget-time.Minute || drafter.sawDeadlineIn > refinementDraftBudget+time.Minute {
+		t.Errorf("drafter deadline-in = %v, want ~%v", drafter.sawDeadlineIn, refinementDraftBudget)
+	}
+
+	// The session persisted despite the disconnect: a fresh GET returns 200 with
+	// the draft.
+	var created refinementSessionView
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	rec2 := httptest.NewRecorder()
+	s.handleGetRefinementSession(rec2, refinementReq(http.MethodGet, "/x", created.SessionID.String(), ""))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("get after disconnect: status = %d, want 200 (session persisted despite disconnect, body %s)", rec2.Code, rec2.Body.String())
+	}
+}
+
+// TestRefinement_AmendmentArm_SurvivesClientDisconnect drives handlePatchRefinementDraft's
+// brief_amendment arm with an already-cancelled inbound context and asserts the
+// re-draft ran detached+budgeted and the new revision persisted. The
+// disconnectRefinementRepo lets the pre-detach load succeed (modelling a
+// disconnect that happens mid-drafting, after the load) while making CreateDraft
+// respect cancellation, so a persisted revision proves the detach reached it.
+func TestRefinement_AmendmentArm_SurvivesClientDisconnect(t *testing.T) {
+	sessionID := uuid.New()
+	seed := &refinement.StoredDraft{ID: uuid.New(), SessionID: sessionID, Brief: "b", Draft: refinementValidDraft(), Origin: refinement.OriginBrief}
+	repo := &disconnectRefinementRepo{drafts: []*refinement.StoredDraft{seed}}
+	drafter := &fakeRefinementDrafter{draft: refinementValidDraft(), model: "claude-opus-4-8"}
+	s := New(Config{RefinementRepo: repo, AuditRepo: okAuditRepo{}, RefinementDrafter: drafter})
+
+	rec := httptest.NewRecorder()
+	s.handlePatchRefinementDraft(rec, cancelledRefinementReq(http.MethodPatch, "/x", sessionID.String(), `{"brief_amendment":"more scope"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("amendment under disconnected client: status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	if drafter.sawCtxErr != nil {
+		t.Errorf("drafter ctx.Err() = %v, want nil (detached from the cancelled request)", drafter.sawCtxErr)
+	}
+	if !drafter.sawHadDeadline {
+		t.Errorf("drafter ctx carried no deadline, want a refinementDraftBudget deadline")
+	}
+	// The new revision persisted (CreateDraft respects ctx, so it could only have
+	// succeeded on the detached, non-cancelled context).
+	if len(repo.drafts) != 2 {
+		t.Errorf("revisions after disconnected amendment = %d, want 2 (new revision persisted despite disconnect)", len(repo.drafts))
+	}
+}
+
+// TestRefinement_DirectEditArm_BoundToRequestContext proves the direct `draft`
+// edit arm is NOT detached — it stays bound to the (cancellable) request context
+// because it makes no agent call. Under a cancelled inbound context the persist
+// aborts and no revision is added, the inverse of the amendment arm above.
+func TestRefinement_DirectEditArm_BoundToRequestContext(t *testing.T) {
+	sessionID := uuid.New()
+	seed := &refinement.StoredDraft{ID: uuid.New(), SessionID: sessionID, Brief: "b", Draft: refinementValidDraft(), Origin: refinement.OriginBrief}
+	repo := &disconnectRefinementRepo{drafts: []*refinement.StoredDraft{seed}}
+	s := New(Config{RefinementRepo: repo, AuditRepo: okAuditRepo{}})
+
+	editBody := `{"draft":` + mustJSON(t, refinementValidDraft()) + `}`
+	rec := httptest.NewRecorder()
+	s.handlePatchRefinementDraft(rec, cancelledRefinementReq(http.MethodPatch, "/x", sessionID.String(), editBody))
+	if rec.Code == http.StatusOK {
+		t.Fatalf("direct edit under cancelled context = 200, want failure (the arm must stay bound to the request context)")
+	}
+	if len(repo.drafts) != 1 {
+		t.Errorf("revisions after cancelled direct edit = %d, want 1 (nothing persisted — arm not detached)", len(repo.drafts))
 	}
 }
 

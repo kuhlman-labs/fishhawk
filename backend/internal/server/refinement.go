@@ -55,6 +55,15 @@ const (
 	// refinementMaxBodyBytes bounds a refinement request body. Briefs and
 	// direct-edit drafts are prose-and-JSON, comfortably under 1 MiB.
 	refinementMaxBodyBytes = 1 << 20
+
+	// refinementDraftBudget bounds the detached agent-backed drafting arms
+	// (create-session, brief-amendment). The drafter's claudecode client has
+	// Timeout=0, so this WithTimeout deadline is what invokeOnce honors. It
+	// matches planreview's review-budget Cap (1200s /
+	// backend/internal/planreview/budget.go). The MCP client's long timeout
+	// (refinementDraftClientTimeout, 22m) sits above this so the server's own
+	// bounded error surfaces before the client aborts.
+	refinementDraftBudget = 20 * time.Minute
 )
 
 // ---- wire types -----------------------------------------------------------
@@ -134,6 +143,19 @@ func (s *Server) handleCreateRefinementSession(w http.ResponseWriter, r *http.Re
 			"brief is required", map[string]any{"field": "brief"})
 		return
 	}
+
+	// Detach drafting+persist from the request lifetime (#584 precedent,
+	// plan.go:1094). The drafting agent runs for minutes; if the MCP client
+	// disconnects, net/http cancels r.Context(), which would SIGKILL the drafter
+	// mid-inference AND — because the open arm persists only after Draft returns
+	// — strand a half-created session. context.WithoutCancel keeps the auth
+	// identity values (IdentityFrom still resolves) but is not cancelled with the
+	// parent; WithTimeout bounds the otherwise-unbounded drafter. Every
+	// downstream call reads r.Context(), so this single rebind covers Draft,
+	// CreateDraft, and the response render.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), refinementDraftBudget)
+	defer cancel()
+	r = r.WithContext(ctx)
 
 	sessionID := uuid.New()
 	draft, model, err := s.cfg.RefinementDrafter.Draft(r.Context(), sessionID, req.Brief)
@@ -229,6 +251,14 @@ func (s *Server) handlePatchRefinementDraft(w http.ResponseWriter, r *http.Reque
 			s.writeRefinementDraftingUnavailable(w, r)
 			return
 		}
+		// Detach the agent re-draft+persist from the request lifetime, exactly as
+		// the open arm does — same disconnect-survival rationale. Plain `r =`
+		// assignment so the shared audit+persist tail after the if/else inherits
+		// the detached, budgeted context. The direct-edit arm below keeps the
+		// original request context (no agent call, nothing to survive).
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), refinementDraftBudget)
+		defer cancel()
+		r = r.WithContext(ctx)
 		newBrief = strings.TrimRight(latest.Brief, "\n") + "\n\n" + strings.TrimSpace(req.BriefAmendment)
 		d, m, err := s.cfg.RefinementDrafter.Draft(r.Context(), sessionID, newBrief)
 		if err != nil {
