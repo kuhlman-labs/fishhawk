@@ -26,16 +26,28 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
 
+// critRaw marshals criteria into the json.RawMessage wire shape the
+// acceptanceBody.Criteria field now carries (the #1574-class coercion field).
+// Empty input yields nil so the omitempty field is omitted, matching the
+// pre-RawMessage typed-slice behavior.
+func critRaw(cs ...acceptanceCriterionResult) json.RawMessage {
+	if len(cs) == 0 {
+		return nil
+	}
+	b, _ := json.Marshal(cs)
+	return b
+}
+
 // validAcceptanceBytes returns a complete passed-verdict acceptanceBody payload
 // with two passing criteria.
 func validAcceptanceBytes(t *testing.T) []byte {
 	t.Helper()
 	body, err := json.Marshal(acceptanceBody{
 		Verdict: "passed",
-		Criteria: []acceptanceCriterionResult{
-			{ID: "ac-create", Result: "passed", Observed: "201 returned"},
-			{ID: "ac-list", Result: "passed"},
-		},
+		Criteria: critRaw(
+			acceptanceCriterionResult{ID: "ac-create", Result: "passed", Observed: "201 returned"},
+			acceptanceCriterionResult{ID: "ac-list", Result: "passed"},
+		),
 		TargetURL:      "https://preview.example.test",
 		EvidenceHashes: json.RawMessage(`["sha256:abc"]`),
 	})
@@ -141,10 +153,10 @@ func TestShipAcceptance_FailureModeCarryThrough(t *testing.T) {
 			body, err := json.Marshal(acceptanceBody{
 				Verdict:     "failed",
 				FailureMode: mode,
-				Criteria: []acceptanceCriterionResult{
-					{ID: "ac-create", Result: "failed", Observed: "500"},
-					{ID: "ac-list", Result: "skipped"},
-				},
+				Criteria: critRaw(
+					acceptanceCriterionResult{ID: "ac-create", Result: "failed", Observed: "500"},
+					acceptanceCriterionResult{ID: "ac-list", Result: "skipped"},
+				),
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -299,6 +311,9 @@ func TestShipAcceptance_InvalidPayload_400(t *testing.T) {
 		"evidence_hashes non-string":  []byte(`{"verdict":"passed","evidence_hashes":{"a":123}}`),
 		"evidence_hashes nested":      []byte(`{"verdict":"passed","evidence_hashes":{"a":{"b":"c"}}}`),
 		"evidence_hashes scalar":      []byte(`{"verdict":"passed","evidence_hashes":"sha256:abc"}`),
+		"criteria object non-object":  []byte(`{"verdict":"passed","criteria":{"ca":"passed"}}`),
+		"criteria object id conflict": []byte(`{"verdict":"passed","criteria":{"ca":{"id":"cb","result":"passed"}}}`),
+		"criteria scalar":             []byte(`{"verdict":"passed","criteria":"nope"}`),
 		"unknown field":               []byte(`{"verdict":"passed","extra":true}`),
 		"criterion unknown field":     []byte(`{"verdict":"passed","criteria":[{"id":"x","result":"passed","extra":true}]}`),
 		"trailing object":             []byte(`{"verdict":"passed"}{"verdict":"failed","failure_mode":"error"}`),
@@ -372,6 +387,37 @@ func TestAcceptanceBody_ValidateCoercions(t *testing.T) {
 			t.Errorf("normalizedEvidenceHashes = %v, want %v", a.normalizedEvidenceHashes, want)
 		}
 	})
+
+	t.Run("object-keyed criteria coerces to sorted flat array", func(t *testing.T) {
+		// Keys deliberately out of sorted order (cb before ca) so the sort is
+		// observable; the object keys fold into each element's id.
+		a := acceptanceBody{
+			Verdict:  "passed",
+			Criteria: json.RawMessage(`{"cb":{"result":"passed"},"ca":{"result":"skipped"}}`),
+		}
+		if err := a.validate(context.Background(), nil); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		want := []acceptanceCriterionResult{{ID: "ca", Result: "skipped"}, {ID: "cb", Result: "passed"}}
+		if !reflect.DeepEqual(a.normalizedCriteria, want) {
+			t.Errorf("normalizedCriteria = %+v, want sorted-by-id %+v", a.normalizedCriteria, want)
+		}
+	})
+
+	t.Run("flat array criteria passes through in order", func(t *testing.T) {
+		a := acceptanceBody{
+			Verdict:  "passed",
+			Criteria: json.RawMessage(`[{"id":"cz","result":"passed"},{"id":"ca","result":"passed"}]`),
+		}
+		if err := a.validate(context.Background(), nil); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		// A flat array is not re-sorted — passed through verbatim.
+		want := []acceptanceCriterionResult{{ID: "cz", Result: "passed"}, {ID: "ca", Result: "passed"}}
+		if !reflect.DeepEqual(a.normalizedCriteria, want) {
+			t.Errorf("normalizedCriteria = %+v, want %+v", a.normalizedCriteria, want)
+		}
+	})
 }
 
 // TestAcceptanceBody_ValidateFailClosed mirrors the runner fail-closed table:
@@ -380,12 +426,16 @@ func TestAcceptanceBody_ValidateCoercions(t *testing.T) {
 // httpx://host and http+unix://host explicitly alongside ftp://host.
 func TestAcceptanceBody_ValidateFailClosed(t *testing.T) {
 	cases := map[string]acceptanceBody{
-		"ftp target_url":             {Verdict: "passed", TargetURL: "ftp://host"},
-		"httpx near-miss target_url": {Verdict: "passed", TargetURL: "httpx://host"},
-		"http+unix near-miss url":    {Verdict: "passed", TargetURL: "http+unix://host"},
-		"evidence_hashes non-string": {Verdict: "passed", EvidenceHashes: json.RawMessage(`{"a":123}`)},
-		"evidence_hashes nested":     {Verdict: "passed", EvidenceHashes: json.RawMessage(`{"a":{"b":"c"}}`)},
-		"evidence_hashes scalar":     {Verdict: "passed", EvidenceHashes: json.RawMessage(`"sha256:abc"`)},
+		"ftp target_url":                   {Verdict: "passed", TargetURL: "ftp://host"},
+		"httpx near-miss target_url":       {Verdict: "passed", TargetURL: "httpx://host"},
+		"http+unix near-miss url":          {Verdict: "passed", TargetURL: "http+unix://host"},
+		"evidence_hashes non-string":       {Verdict: "passed", EvidenceHashes: json.RawMessage(`{"a":123}`)},
+		"evidence_hashes nested":           {Verdict: "passed", EvidenceHashes: json.RawMessage(`{"a":{"b":"c"}}`)},
+		"evidence_hashes scalar":           {Verdict: "passed", EvidenceHashes: json.RawMessage(`"sha256:abc"`)},
+		"criteria object key id conflict":  {Verdict: "passed", Criteria: json.RawMessage(`{"ca":{"id":"cb","result":"passed"}}`)},
+		"criteria object non-object value": {Verdict: "passed", Criteria: json.RawMessage(`{"ca":"passed"}`)},
+		"criteria element unknown field":   {Verdict: "passed", Criteria: json.RawMessage(`[{"id":"ca","result":"passed","bogus":true}]`)},
+		"criteria scalar":                  {Verdict: "passed", Criteria: json.RawMessage(`"nope"`)},
 	}
 	for name, a := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -442,9 +492,9 @@ func TestShipAcceptance_Notes_RoundTrip(t *testing.T) {
 	priv, _ := sf.issue(t, runID)
 	body, err := json.Marshal(acceptanceBody{
 		Verdict: "passed",
-		Criteria: []acceptanceCriterionResult{
-			{ID: "ac-create", Result: "passed"},
-		},
+		Criteria: critRaw(
+			acceptanceCriterionResult{ID: "ac-create", Result: "passed"},
+		),
 		Notes: "preview was slow to boot but every criterion passed",
 	})
 	if err != nil {
@@ -477,7 +527,7 @@ func TestShipAcceptance_CriterionEvidenceFields_RoundTrip(t *testing.T) {
 	body, err := json.Marshal(acceptanceBody{
 		Verdict:     "failed",
 		FailureMode: "assertion_fail",
-		Criteria: []acceptanceCriterionResult{{
+		Criteria: critRaw(acceptanceCriterionResult{
 			ID:               "ac-create",
 			Result:           "failed",
 			Observed:         "409 returned",
@@ -485,7 +535,7 @@ func TestShipAcceptance_CriterionEvidenceFields_RoundTrip(t *testing.T) {
 			StepsTaken:       "POSTed a widget payload",
 			ExpectationBasis: "criterion statement (issue #1534)",
 			ReproHandle:      "curl -X POST https://preview.example.test/widgets -d '{}'",
-		}},
+		}),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -809,10 +859,10 @@ func TestShipAcceptance_CrossBoundary_WireToRender(t *testing.T) {
 	shipPriv, _ := sf.issue(t, runID)
 	body, err := json.Marshal(acceptanceBody{
 		Verdict: "passed",
-		Criteria: []acceptanceCriterionResult{
-			{ID: "ac-create", Result: "passed"},
-			{ID: "ac-list", Result: "passed"},
-		},
+		Criteria: critRaw(
+			acceptanceCriterionResult{ID: "ac-create", Result: "passed"},
+			acceptanceCriterionResult{ID: "ac-list", Result: "passed"},
+		),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -864,42 +914,42 @@ func TestClassifyAcceptanceFailure(t *testing.T) {
 	}{
 		{
 			name:      "error verdict → class 1",
-			acc:       acceptanceBody{Verdict: "failed", FailureMode: "error", Criteria: []acceptanceCriterionResult{crit("ac-create", "failed")}},
+			acc:       acceptanceBody{Verdict: "failed", FailureMode: "error", normalizedCriteria: []acceptanceCriterionResult{crit("ac-create", "failed")}},
 			criteria:  criteria,
 			wantClass: "1",
 			wantIDs:   []string{"ac-create"},
 		},
 		{
 			name:      "assertion_fail all failed explicit → class 1",
-			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", Criteria: []acceptanceCriterionResult{crit("ac-create", "failed")}},
+			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", normalizedCriteria: []acceptanceCriterionResult{crit("ac-create", "failed")}},
 			criteria:  criteria,
 			wantClass: "1",
 			wantIDs:   []string{"ac-create"},
 		},
 		{
 			name:      "assertion_fail a failed criterion inferred → class 3",
-			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", Criteria: []acceptanceCriterionResult{crit("ac-create", "passed"), crit("ac-list", "failed")}},
+			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", normalizedCriteria: []acceptanceCriterionResult{crit("ac-create", "passed"), crit("ac-list", "failed")}},
 			criteria:  criteria,
 			wantClass: "3",
 			wantIDs:   []string{"ac-list"},
 		},
 		{
 			name:      "assertion_fail a failed criterion unresolvable → class 3",
-			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", Criteria: []acceptanceCriterionResult{crit("ac-ghost", "failed")}},
+			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", normalizedCriteria: []acceptanceCriterionResult{crit("ac-ghost", "failed")}},
 			criteria:  criteria,
 			wantClass: "3",
 			wantIDs:   []string{"ac-ghost"},
 		},
 		{
 			name:      "assertion_fail no failed but a skip → class 2",
-			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", Criteria: []acceptanceCriterionResult{crit("ac-create", "passed"), crit("ac-list", "skipped")}},
+			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", normalizedCriteria: []acceptanceCriterionResult{crit("ac-create", "passed"), crit("ac-list", "skipped")}},
 			criteria:  criteria,
 			wantClass: "2",
 			wantIDs:   nil,
 		},
 		{
 			name:      "assertion_fail no failed no skip → class 4",
-			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", Criteria: []acceptanceCriterionResult{crit("ac-create", "passed")}},
+			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", normalizedCriteria: []acceptanceCriterionResult{crit("ac-create", "passed")}},
 			criteria:  criteria,
 			wantClass: "4",
 			wantIDs:   nil,
@@ -913,7 +963,7 @@ func TestClassifyAcceptanceFailure(t *testing.T) {
 		},
 		{
 			name:      "assertion_fail failed criterion with no plan criteria → class 3 (unresolvable)",
-			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", Criteria: []acceptanceCriterionResult{crit("ac-create", "failed")}},
+			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", normalizedCriteria: []acceptanceCriterionResult{crit("ac-create", "failed")}},
 			criteria:  nil,
 			wantClass: "3",
 			wantIDs:   []string{"ac-create"},
@@ -948,14 +998,14 @@ func TestAcceptanceBody_ValidateSanctionedContractShapes(t *testing.T) {
 	t.Run("skipped-with-basis validates", func(t *testing.T) {
 		a := acceptanceBody{
 			Verdict: "passed",
-			Criteria: []acceptanceCriterionResult{
-				{ID: "ac-create", Result: "skipped", ExpectationBasis: "target could not exhibit the change"},
-			},
+			Criteria: critRaw(
+				acceptanceCriterionResult{ID: "ac-create", Result: "skipped", ExpectationBasis: "target could not exhibit the change"},
+			),
 		}
 		if err := a.validate(context.Background(), nil); err != nil {
 			t.Fatalf("validate skipped-with-basis: %v", err)
 		}
-		if _, _, skipped, total := acceptanceCriteriaTally(a.Criteria); skipped != 1 || total != 1 {
+		if _, _, skipped, total := acceptanceCriteriaTally(a.normalizedCriteria); skipped != 1 || total != 1 {
 			t.Errorf("tally skipped=%d total=%d, want 1/1", skipped, total)
 		}
 	})
@@ -979,7 +1029,7 @@ func TestAcceptanceBody_ValidateSanctionedContractShapes(t *testing.T) {
 		if err := a.validate(context.Background(), nil); err != nil {
 			t.Fatalf("validate trivial 0-criteria pass: %v", err)
 		}
-		passed, failed, skipped, total := acceptanceCriteriaTally(a.Criteria)
+		passed, failed, skipped, total := acceptanceCriteriaTally(a.normalizedCriteria)
 		if passed != 0 || failed != 0 || skipped != 0 || total != 0 {
 			t.Errorf("tally = %d/%d/%d/%d, want 0/0/0/0", passed, failed, skipped, total)
 		}
@@ -1066,7 +1116,7 @@ func newAcceptanceTriageServer(t *testing.T) (s *Server, rr *promptRunRepo, ar *
 
 func failedAcceptanceBytes(t *testing.T, failureMode string, criteria []acceptanceCriterionResult) []byte {
 	t.Helper()
-	b, err := json.Marshal(acceptanceBody{Verdict: "failed", FailureMode: failureMode, Criteria: criteria})
+	b, err := json.Marshal(acceptanceBody{Verdict: "failed", FailureMode: failureMode, Criteria: critRaw(criteria...)})
 	if err != nil {
 		t.Fatal(err)
 	}

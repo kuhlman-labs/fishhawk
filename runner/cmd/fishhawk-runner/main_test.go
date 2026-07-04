@@ -13633,11 +13633,17 @@ func TestRun_AcceptanceStage_EndToEnd(t *testing.T) {
 	if err := json.Unmarshal(fu.gotAcceptanceArgs.Body, &shipped); err != nil {
 		t.Fatalf("shipped body does not decode: %v", err)
 	}
-	if shipped.Verdict != "passed" || len(shipped.Criteria) != 2 ||
-		shipped.Criteria[0].ID != "AC1" || shipped.Criteria[1].ID != "AC2" {
-		t.Errorf("shipped verdict = %+v", shipped)
+	// Criteria is a json.RawMessage on the wire (the #1574-class coercion field);
+	// decode it into the typed slice before asserting the per-criterion shape.
+	var shippedCrits []acceptanceCriterionResult
+	if err := json.Unmarshal(shipped.Criteria, &shippedCrits); err != nil {
+		t.Fatalf("shipped criteria not a flat array: %s (%v)", shipped.Criteria, err)
 	}
-	if shipped.Criteria[0].ExpectationBasis == "" || shipped.Criteria[0].ReproHandle == "" {
+	if shipped.Verdict != "passed" || len(shippedCrits) != 2 ||
+		shippedCrits[0].ID != "AC1" || shippedCrits[1].ID != "AC2" {
+		t.Errorf("shipped verdict = %+v criteria = %+v", shipped, shippedCrits)
+	}
+	if shippedCrits[0].ExpectationBasis == "" || shippedCrits[0].ReproHandle == "" {
 		t.Error("optional per-criterion fields dropped from the shipped body")
 	}
 	// The object-map evidence_hashes was coerced to a sorted flat array in the

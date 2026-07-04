@@ -236,6 +236,38 @@ func TestValidateAcceptanceVerdict_Table(t *testing.T) {
 			served:  served,
 			wantErr: "flat array of strings or a string-valued object map",
 		},
+		{
+			// #1574-class criteria: an object key that conflicts with the
+			// element's explicit non-empty id fails closed.
+			name:    "criteria object key id conflict fails closed",
+			raw:     `{"verdict":"passed","criteria":{"AC1":{"id":"AC2","result":"passed"}}}`,
+			served:  served,
+			wantErr: "conflicts with element id",
+		},
+		{
+			// #1574-class criteria: a keyed value that is not an object fails
+			// closed (lossy coercion refused).
+			name:    "criteria object non-object value fails closed",
+			raw:     `{"verdict":"passed","criteria":{"AC1":"passed"}}`,
+			served:  served,
+			wantErr: "must be an object",
+		},
+		{
+			// An unknown field INSIDE a criteria element still fails closed after
+			// the RawMessage field-type change (the array path re-applies
+			// DisallowUnknownFields the top-level decoder no longer descends into).
+			name:    "criteria element unknown field fails closed",
+			raw:     `{"verdict":"passed","criteria":[{"id":"AC1","result":"passed","bogus":true}]}`,
+			served:  served,
+			wantErr: "unknown field",
+		},
+		{
+			// A scalar criteria fails closed.
+			name:    "criteria scalar fails closed",
+			raw:     `{"verdict":"passed","criteria":"nope"}`,
+			served:  served,
+			wantErr: "flat array or an object keyed by criterion id",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -308,6 +340,56 @@ func TestValidateAcceptanceVerdict_Coercions(t *testing.T) {
 		}
 		if !slices.Contains(events, "acceptance_verdict_target_url_coerced") {
 			t.Errorf("missing target_url coercion warning, events = %v", events)
+		}
+	})
+
+	t.Run("object-keyed criteria coerces to sorted flat array", func(t *testing.T) {
+		var events []string
+		// Keys deliberately out of sorted order (AC2 before AC1) so the sort is
+		// observable; both keys are in the served set.
+		raw := `{"verdict":"passed","criteria":{"AC2":{"result":"passed"},"AC1":{"result":"skipped"}}}`
+		out, err := validateAcceptanceVerdict([]byte(raw), []string{"AC1", "AC2"}, func(event, _ string) {
+			events = append(events, event)
+		})
+		if err != nil {
+			t.Fatalf("want valid, got %v", err)
+		}
+		var got acceptanceVerdict
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatalf("normalized bytes do not decode: %v", err)
+		}
+		var crits []acceptanceCriterionResult
+		if err := json.Unmarshal(got.Criteria, &crits); err != nil {
+			t.Fatalf("criteria not a flat array after coercion: %s (%v)", got.Criteria, err)
+		}
+		want := []acceptanceCriterionResult{{ID: "AC1", Result: "skipped"}, {ID: "AC2", Result: "passed"}}
+		if !reflect.DeepEqual(crits, want) {
+			t.Errorf("coerced criteria = %+v, want sorted-by-id %+v", crits, want)
+		}
+		if !slices.Contains(events, "acceptance_verdict_criteria_coerced") {
+			t.Errorf("missing criteria coercion warning, events = %v", events)
+		}
+		// The coerced bytes re-validate cleanly (the backend twin re-runs on ship).
+		if _, err := validateAcceptanceVerdict(out, []string{"AC1", "AC2"}, nil); err != nil {
+			t.Errorf("normalized verdict fails re-validation: %v", err)
+		}
+	})
+
+	t.Run("flat-array criteria passes through unchanged", func(t *testing.T) {
+		var events []string
+		raw := `{"verdict":"passed","criteria":[{"id":"AC1","result":"passed"}]}`
+		out, err := validateAcceptanceVerdict([]byte(raw), []string{"AC1"}, func(event, _ string) {
+			events = append(events, event)
+		})
+		if err != nil {
+			t.Fatalf("want valid, got %v", err)
+		}
+		// No coercion → the original bytes are returned unchanged.
+		if string(out) != raw {
+			t.Errorf("flat-array criteria must return bytes unchanged:\n got %s\nwant %s", out, raw)
+		}
+		if len(events) != 0 {
+			t.Errorf("no coercion expected, got events %v", events)
 		}
 	})
 
