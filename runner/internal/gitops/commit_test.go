@@ -1172,12 +1172,16 @@ func TestCheckoutRemoteBranch_RejectsEmptyBranch(t *testing.T) {
 }
 
 // TestCheckoutRemoteBranchDetached_NoBranchCollisionWithSiblingWorktree is the
-// core #1361 done-means: it reproduces the exact collision (the operator's
-// primary checkout holds `main` in a linked worktree) and proves the detached
-// child-base checkout SUCCEEDS where the on-branch `-B` checkout FAILS with
-// `already used by worktree`. A single branch may not be checked out in more
-// than one linked worktree of the same gitdir (git-worktree(1)); a detached
-// HEAD claims no branch name and so is immune.
+// core #1361 done-means AND the #1549 competing-checkout done-means: it
+// reproduces the exact collision (the operator's primary checkout holds `main`
+// in a linked worktree) and proves TWO things. (1) The on-branch `-B` checkout
+// FAILS — since #1549 via the CheckoutRemoteBranch preflight with the distinct,
+// self-diagnosing ErrBranchCheckedOutElsewhere (naming the competing worktree
+// path and the recovery), NOT the raw git-128 `already used by worktree` it
+// used to surface. (2) The detached child-base checkout SUCCEEDS in the same
+// setup. A single branch may not be checked out in more than one linked
+// worktree of the same gitdir (git-worktree(1)); a detached HEAD claims no
+// branch name and so is immune (and needs no preflight).
 func TestCheckoutRemoteBranchDetached_NoBranchCollisionWithSiblingWorktree(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
@@ -1215,12 +1219,20 @@ func TestCheckoutRemoteBranchDetached_NoBranchCollisionWithSiblingWorktree(t *te
 	child := filepath.Join(dir, "child")
 	mustGit(t, repo, "worktree", "add", "--detach", child, mainTip)
 
-	// The on-branch -B variant must FAIL with the worktree-collision error —
-	// proving the detach is what fixes the collision.
+	// The on-branch -B variant must FAIL — proving the detach is what fixes the
+	// collision. Since #1549 CheckoutRemoteBranch fails FIRST at its preflight
+	// (worktreeHoldingBranch detects the sibling `primary` worktree already
+	// holding `main`) with the distinct ErrBranchCheckedOutElsewhere sentinel,
+	// naming the competing worktree path and the `git checkout main` recovery —
+	// not the raw git-128 `already used by worktree` it used to surface.
 	if _, err := CheckoutRemoteBranch(context.Background(), child, "origin", "main"); err == nil {
 		t.Fatal("CheckoutRemoteBranch (-B main) unexpectedly succeeded with `main` held by a sibling worktree; the collision the detach fixes is gone")
-	} else if !strings.Contains(err.Error(), "already used by worktree") {
-		t.Fatalf("CheckoutRemoteBranch (-B main) failed with %v, want an `already used by worktree` collision", err)
+	} else if !errors.Is(err, ErrBranchCheckedOutElsewhere) {
+		t.Fatalf("CheckoutRemoteBranch (-B main) failed with %v, want errors.Is ErrBranchCheckedOutElsewhere", err)
+	} else if !strings.Contains(err.Error(), canonWorktreePath(primary)) && !strings.Contains(err.Error(), primary) {
+		t.Fatalf("CheckoutRemoteBranch (-B main) error %v must name the competing worktree path %q", err, primary)
+	} else if !strings.Contains(err.Error(), "git checkout main") {
+		t.Fatalf("CheckoutRemoteBranch (-B main) error %v must name the recovery (git checkout main)", err)
 	}
 
 	// The detached variant SUCCEEDS in the same setup.
@@ -1238,6 +1250,62 @@ func TestCheckoutRemoteBranchDetached_NoBranchCollisionWithSiblingWorktree(t *te
 	}
 	if got := mustGitOut(t, child, "rev-parse", "HEAD"); got != mainTip {
 		t.Errorf("detached HEAD sha = %q, want fetched tip %q", got, mainTip)
+	}
+}
+
+// TestWorktreeHoldingBranch drives every branch of the #1549 preflight
+// detector: it returns the competing sibling's path when the branch is held in
+// another linked worktree, "" when the branch is checked out nowhere else, and
+// "" when only the CURRENT worktree holds it (the exclusion — resetting the
+// branch in the current tree via `checkout -B` is legal and must not be
+// flagged).
+func TestWorktreeHoldingBranch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+
+	const branch = "fishhawk/run-aaaabbbb/stage-ccccdddd"
+	ctx := context.Background()
+	p := &Pusher{}
+
+	// Branch checked out nowhere: no competing worktree.
+	if got, err := worktreeHoldingBranch(ctx, p, repo, branch); err != nil {
+		t.Fatalf("worktreeHoldingBranch (branch absent): %v", err)
+	} else if got != "" {
+		t.Errorf("worktreeHoldingBranch (branch absent) = %q, want \"\"", got)
+	}
+
+	// A sibling linked worktree holds the branch: it must be detected.
+	sibling := filepath.Join(dir, "sibling")
+	mustGit(t, repo, "worktree", "add", "-b", branch, sibling)
+	got, err := worktreeHoldingBranch(ctx, p, repo, branch)
+	if err != nil {
+		t.Fatalf("worktreeHoldingBranch (sibling holds branch): %v", err)
+	}
+	if canonWorktreePath(got) != canonWorktreePath(sibling) {
+		t.Errorf("worktreeHoldingBranch (sibling holds branch) = %q, want the sibling path %q", got, sibling)
+	}
+
+	// Queried FROM the sibling itself (the current worktree holds the branch):
+	// the current-worktree exclusion means no competitor is reported.
+	if got, err := worktreeHoldingBranch(ctx, p, sibling, branch); err != nil {
+		t.Fatalf("worktreeHoldingBranch (current worktree holds branch): %v", err)
+	} else if got != "" {
+		t.Errorf("worktreeHoldingBranch (current worktree holds branch) = %q, want \"\" (self excluded)", got)
 	}
 }
 

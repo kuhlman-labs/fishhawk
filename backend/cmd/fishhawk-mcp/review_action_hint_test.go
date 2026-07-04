@@ -445,6 +445,18 @@ func TestReviewActionHint_SuggestedActions(t *testing.T) {
 		if _, forced := actions[0].Params["force_additional_pass"]; forced {
 			t.Error("below-budget fixup action must not carry force_additional_pass")
 		}
+		// #1549: the fix-up precondition must NOT tell the operator to check out
+		// the run branch (that CAUSES the worktree-conflict failure) and MUST
+		// name the runner's lineage worktree instead.
+		if actions[0].Precondition == "" {
+			t.Error("fixup precondition must be non-empty")
+		}
+		if strings.Contains(actions[0].Precondition, "checkout the run branch") {
+			t.Errorf("fixup precondition still says to checkout the run branch: %q", actions[0].Precondition)
+		}
+		if !strings.Contains(actions[0].Precondition, "lineage worktree") {
+			t.Errorf("fixup precondition should name the lineage worktree; got %q", actions[0].Precondition)
+		}
 	})
 
 	t.Run("budget spent, override available -> merge, defer, forced fixup", func(t *testing.T) {

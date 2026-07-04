@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"net/url"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -1067,6 +1068,20 @@ func CaptureHead(ctx context.Context, repoDir string) (ref string, detached bool
 	return strings.TrimSpace(sha), true, nil
 }
 
+// ErrBranchCheckedOutElsewhere is the fix-up preflight sentinel (#1549): the
+// run branch CheckoutRemoteBranch is about to `checkout -B` is already checked
+// out in ANOTHER linked worktree of the same gitdir (typically the operator's
+// main working tree). git-worktree(1) permits a given branch in at most one
+// linked worktree, so the on-branch `checkout -B` would fail with a raw
+// exit-128 `'<branch>' is already used by worktree at '<path>'` that names
+// neither the cause class nor the recovery. CheckoutRemoteBranch detects the
+// competing worktree BEFORE the checkout (and before the fetch) and returns a
+// message wrapping this sentinel naming the blocking path and the recovery, so
+// the runner call site can classify it via errors.Is and surface a
+// self-diagnosing reason token (fixup_base_worktree_conflict) instead of the
+// generic fixup_base_checkout.
+var ErrBranchCheckedOutElsewhere = errors.New("gitops: run branch already checked out in another worktree")
+
 // CheckoutRemoteBranch fetches refs/heads/<branch> from the named remote
 // and checks the local working tree out onto it, returning the fetched tip
 // SHA so the caller can run the ADR-035 lineage comparison against the
@@ -1074,6 +1089,19 @@ func CaptureHead(ctx context.Context, repoDir string) (ref string, detached bool
 // primitive: instead of inheriting the operator's incidental checkout, the
 // runner pins the working tree to the live PR-branch tip before the agent
 // is invoked.
+//
+// Before fetching, it runs a preflight (worktreeHoldingBranch) that detects a
+// COMPETING linked worktree already holding <branch>: the on-branch
+// `checkout -B <branch>` collides with such a worktree (git-worktree(1) allows
+// a branch in at most one linked worktree), so the preflight returns a
+// distinct, actionable error wrapping ErrBranchCheckedOutElsewhere rather than
+// letting the checkout fail with a raw git-128. The preflight runs FIRST — no
+// network round-trip needed and the conflict path is unit-testable without a
+// remote. Resetting <branch> in the CURRENT worktree via `checkout -B` is
+// legal (the operator's incidental checkout of the very run branch), so the
+// current worktree is excluded from the detection. CheckoutRemoteBranchDetached
+// needs no such preflight: a detached HEAD claims no branch name and never
+// collides (#1361).
 //
 // The fetch uses an explicit refspec `+refs/heads/<branch>:<trackingRef>`
 // where trackingRef is refs/remotes/<remote>/<branch> derived from the SAME
@@ -1098,6 +1126,13 @@ func CheckoutRemoteBranch(ctx context.Context, repoDir, remote, branch string) (
 		return "", errors.New("gitops: branch required")
 	}
 	p := &Pusher{}
+	competing, err := worktreeHoldingBranch(ctx, p, repoDir, branch)
+	if err != nil {
+		return "", err
+	}
+	if competing != "" {
+		return "", fmt.Errorf("gitops: %w: run branch %q is checked out in worktree %q — switch that tree off the branch (git checkout main) and re-dispatch; budget intact", ErrBranchCheckedOutElsewhere, branch, competing)
+	}
 	trackingRef, tip, err := fetchRemoteBranchTip(ctx, p, repoDir, remote, branch)
 	if err != nil {
 		return "", err
@@ -1106,6 +1141,58 @@ func CheckoutRemoteBranch(ctx context.Context, repoDir, remote, branch string) (
 		return "", fmt.Errorf("gitops: checkout -B %s %s: %w", branch, trackingRef, err)
 	}
 	return tip, nil
+}
+
+// worktreeHoldingBranch reports the path of any OTHER linked worktree of
+// repoDir's shared gitdir that currently has <branch> checked out, or "" when
+// none does. It identifies the CURRENT worktree via `git rev-parse
+// --show-toplevel` and excludes it (resetting the branch in the current
+// worktree via `checkout -B` is legal), then parses `git worktree list
+// --porcelain` — one record per worktree, a `worktree <abs-path>` line and,
+// for a branch checkout, a `branch refs/heads/<name>` line (a detached
+// worktree emits `detached` instead) — mirroring the porcelain parse in
+// runner/cmd/fishhawk-runner/worktree.go listWorktreePaths. Paths are compared
+// canonicalized (symlink-resolved) so a macOS /var vs /private/var mismatch
+// does not read a real match as a miss.
+func worktreeHoldingBranch(ctx context.Context, p *Pusher, repoDir, branch string) (string, error) {
+	top, err := p.runOut(ctx, repoDir, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", fmt.Errorf("gitops: rev-parse --show-toplevel: %w", err)
+	}
+	current := canonWorktreePath(strings.TrimSpace(top))
+
+	out, err := p.runOut(ctx, repoDir, "worktree", "list", "--porcelain")
+	if err != nil {
+		return "", fmt.Errorf("gitops: worktree list --porcelain: %w", err)
+	}
+	want := "branch refs/heads/" + branch
+	var wtPath string
+	for _, line := range strings.Split(out, "\n") {
+		if wt, ok := strings.CutPrefix(line, "worktree "); ok {
+			wtPath = strings.TrimSpace(wt)
+			continue
+		}
+		if strings.TrimSpace(line) == want && wtPath != "" {
+			if canonWorktreePath(wtPath) != current {
+				return wtPath, nil
+			}
+		}
+	}
+	return "", nil
+}
+
+// canonWorktreePath resolves symlinks where possible, falling back to an
+// absolute/cleaned path when the target cannot be resolved, so worktree paths
+// from `git worktree list` and `git rev-parse --show-toplevel` compare equal
+// despite a /var vs /private/var symlink split.
+func canonWorktreePath(pth string) string {
+	if r, err := filepath.EvalSymlinks(pth); err == nil {
+		return r
+	}
+	if abs, err := filepath.Abs(pth); err == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(pth)
 }
 
 // fetchRemoteBranchTip is the shared fetch+rev-parse prologue of
