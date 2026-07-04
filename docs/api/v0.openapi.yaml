@@ -1942,17 +1942,24 @@ components:
                   evidence (E31.7 / #1535). Optional.
         target_url:
           type: string
-          format: uri
           description: |
-            The running instance the validator drove, when declared. The
-            value source (the workflow-spec egress-allowance grammar) is owned
-            by E31.4/#1532; optional here.
+            The running instance the validator drove, when declared, as a full
+            http(s) URL (for example `http://localhost:8090`). A schemeless
+            host[:port] is coerced by prefixing `http://` (#1574); any other
+            scheme (a value with `://` that is not exactly `http://` or
+            `https://`) is rejected. Optional.
         evidence_hashes:
-          type: array
           description: |
             Content-hash references to the customer-side evidence blobs
-            (ADR-049 #5 default residency customer-side). Optional.
-          items: { type: string }
+            (ADR-049 #5 default residency customer-side). A flat array of hash
+            strings; a string-valued object map is coerced to its sorted values
+            (#1574), and any other shape (a scalar, or a map/array with a
+            non-string value) is rejected. Optional.
+          oneOf:
+            - type: array
+              items: { type: string }
+            - type: object
+              additionalProperties: { type: string }
         notes:
           type: string
           description: |

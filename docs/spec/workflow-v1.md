@@ -137,7 +137,7 @@ The `egress` block (E31.4 / #1532, per ADR-050) declares the **target-instance h
 - `egress.target_hosts` (required, min 1): each entry is `host` or `host:port` — never a URL (the schema pattern rejects scheme/path/wildcard). An entry without a port permits the default HTTP/HTTPS ports (80, 443) only; an entry with a port permits exactly that port.
 - These entries are the **single customer-controlled slot** of the acceptance agent's default-deny egress allow-list. The runner adds the model API endpoint and the Fishhawk backend itself; they are not declarable here.
 - Enforcement is the runner-embedded egress proxy (`runner/internal/egressproxy`, ADR-050 decision #1): the acceptance invocation is forced through it via `HTTP(S)_PROXY`, destinations outside the composed allow-list are refused `403`, hostname resolutions are DNS-pinned against rebinding, and a public hostname resolving into loopback/private space is refused outright.
-- The first `target_hosts` entry is also rendered verbatim into the acceptance prompt's Target instance section (`resolveAcceptanceTargetURL`); a spec with no `egress` block renders an explicit not-declared line instead.
+- The first `target_hosts` entry is also rendered into the acceptance prompt's Target instance section (`resolveAcceptanceTargetURL`) in full http(s) URL form — a schemeless `host`/`host:port` gains an `http://` prefix (e.g. `localhost:8080` → `http://localhost:8080`) so the validator is handed a URL (#1574). This URL-form prefix applies to the **prompt seam only**; the `egress.target_hosts` allow-list itself keeps the verbatim `host:port` grammar above. A spec with no `egress` block renders an explicit not-declared line instead.
 
 ```yaml
 version: "1.3"

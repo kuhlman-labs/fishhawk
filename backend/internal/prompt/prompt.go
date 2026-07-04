@@ -1354,10 +1354,13 @@ func buildAcceptance(t Trigger) string {
 
 	// Target instance section. The value is the acceptance stage's first
 	// spec-declared egress target host (the E31.4/#1532 egress-allowance
-	// grammar, ADR-050 decision #1), rendered verbatim as host or host:port.
-	// A spec with no egress block leaves TargetInstanceURL empty and we
-	// render an explicit not-declared line rather than a silent omission, so
-	// that state is self-diagnosing.
+	// grammar, ADR-050 decision #1), rendered in full http(s) URL form —
+	// resolveAcceptanceTargetURL prefixes http:// on a schemeless host so the
+	// agent is handed the target already as a URL (#1574), reducing the odds
+	// its verdict's target_url is a bare host:port. A spec with no egress
+	// block leaves TargetInstanceURL empty and we render an explicit
+	// not-declared line rather than a silent omission, so that state is
+	// self-diagnosing.
 	b.WriteString("### Target instance\n\n")
 	if t.TargetInstanceURL != "" {
 		b.WriteString("Target instance URL: ")
@@ -1383,6 +1386,10 @@ func buildAcceptance(t Trigger) string {
 		"expectation came from — the criterion statement, the issue text, a spec section) and " +
 		"`repro_handle` (the command or request a human can re-run to reproduce the " +
 		"observation).\n\n")
+	b.WriteString("- `target_url` (OPTIONAL): a full http(s) URL of the running instance you " +
+		"drove, for example `http://localhost:8090` — never a bare host:port.\n")
+	b.WriteString("- `evidence_hashes` (OPTIONAL): a flat JSON array of content-hash strings, " +
+		"for example `[\"sha256:ab12...\",\"sha256:cd34...\"]` — never an object or map.\n")
 	b.WriteString("- `notes` (OPTIONAL): a single top-level string for any free-text remark " +
 		"that does not belong in a criterion result. Put stray prose here.\n\n")
 	b.WriteString("The verdict may contain ONLY these fields: `verdict`, `failure_mode`, " +

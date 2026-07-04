@@ -13495,9 +13495,13 @@ func TestRun_AcceptanceStage_EndToEnd(t *testing.T) {
 	acceptanceVerdictPath = filepath.Join(t.TempDir(), "fishhawk-acceptance.json")
 	t.Cleanup(func() { acceptanceVerdictPath = origPath })
 
+	// evidence_hashes ships as the historical string-valued object-map variant
+	// (the #1574 class) so the main.go log seam + validateAcceptanceVerdict
+	// coercion is exercised end-to-end: the shipped body must carry the sorted
+	// flat array and a coercion warning must land on the log sink.
 	verdict := `{"verdict":"passed","criteria":[` +
 		`{"id":"AC1","result":"passed","observed":"200 with body","expected":"200","steps_taken":"GET /","expectation_basis":"criterion AC1","repro_handle":"curl ` + target.URL + `"},` +
-		`{"id":"AC2","result":"skipped"}],"target_url":"` + target.URL + `"}`
+		`{"id":"AC2","result":"skipped"}],"target_url":"` + target.URL + `","evidence_hashes":{"shot":"sha256:bb","log":"sha256:aa"}}`
 
 	forbidden := []string{"FISHHAWK_API_TOKEN", "GITHUB_TOKEN", "GH_TOKEN", "FISHHAWK_GITHUB_TOKEN"}
 	invoker := &fakeInvoker{
@@ -13622,7 +13626,7 @@ func TestRun_AcceptanceStage_EndToEnd(t *testing.T) {
 	if !fu.gotAcceptanceArgs.PrivateKey.Equal(fu.priv) {
 		t.Error("ShipAcceptance must sign with the issued run key")
 	}
-	if err := validateAcceptanceVerdict(fu.gotAcceptanceArgs.Body, []string{"AC1", "AC2"}); err != nil {
+	if _, err := validateAcceptanceVerdict(fu.gotAcceptanceArgs.Body, []string{"AC1", "AC2"}, nil); err != nil {
 		t.Errorf("shipped body fails the served-criteria validation: %v", err)
 	}
 	var shipped acceptanceVerdict
@@ -13635,6 +13639,18 @@ func TestRun_AcceptanceStage_EndToEnd(t *testing.T) {
 	}
 	if shipped.Criteria[0].ExpectationBasis == "" || shipped.Criteria[0].ReproHandle == "" {
 		t.Error("optional per-criterion fields dropped from the shipped body")
+	}
+	// The object-map evidence_hashes was coerced to a sorted flat array in the
+	// shipped body, and the main.go log seam emitted the coercion warning.
+	var shippedHashes []string
+	if err := json.Unmarshal(shipped.EvidenceHashes, &shippedHashes); err != nil {
+		t.Fatalf("shipped evidence_hashes not a flat array after coercion: %s (%v)", shipped.EvidenceHashes, err)
+	}
+	if want := []string{"sha256:aa", "sha256:bb"}; !reflect.DeepEqual(shippedHashes, want) {
+		t.Errorf("shipped evidence_hashes = %v, want sorted %v", shippedHashes, want)
+	}
+	if !strings.Contains(stderr.String(), `"event":"acceptance_verdict_evidence_hashes_coerced"`) {
+		t.Errorf("missing evidence_hashes coercion log-seam event: %s", stderr.String())
 	}
 	if !strings.Contains(stderr.String(), `"event":"acceptance_shipped"`) {
 		t.Errorf("missing acceptance_shipped event: %s", stderr.String())
