@@ -294,6 +294,61 @@ func TestPostgres_CampaignItem_RoundTripAndDependsOn(t *testing.T) {
 	}
 }
 
+// TestPostgres_CampaignItem_Autonomy_RoundTripAndFailClosed covers both the
+// happy path and the fail-closed CHECK for the campaign_items.autonomy column
+// (#1551 / E32.4). A known tier ("low") round-trips onto Item.Autonomy; an item
+// created with no autonomy reads back the empty (unknown/default) tier; and an
+// out-of-set value ("bogus") is REJECTED by campaign_items_autonomy_check rather
+// than silently persisting a tier the engine cannot interpret.
+func TestPostgres_CampaignItem_Autonomy_RoundTripAndFailClosed(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c := makeCampaign(t, repo)
+
+	// Known tier round-trips.
+	low, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID,
+		IssueRef:   "issue:1532",
+		Autonomy:   "low",
+	})
+	if err != nil {
+		t.Fatalf("create autonomy:low item: %v", err)
+	}
+	if low.Autonomy != "low" {
+		t.Errorf("created item autonomy = %q, want low", low.Autonomy)
+	}
+	got, err := repo.GetCampaignItem(ctx, low.ID)
+	if err != nil {
+		t.Fatalf("get autonomy:low item: %v", err)
+	}
+	if got.Autonomy != "low" {
+		t.Errorf("read-back autonomy = %q, want low", got.Autonomy)
+	}
+
+	// No autonomy → empty (unknown/default) tier, never NULL.
+	bare, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID,
+		IssueRef:   "issue:1533",
+	})
+	if err != nil {
+		t.Fatalf("create bare item: %v", err)
+	}
+	if bare.Autonomy != "" {
+		t.Errorf("bare item autonomy = %q, want empty", bare.Autonomy)
+	}
+
+	// Fail closed: an out-of-set tier is rejected by the CHECK constraint.
+	if _, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID,
+		IssueRef:   "issue:1534",
+		Autonomy:   "bogus",
+	}); err == nil {
+		t.Error("create item with autonomy='bogus' succeeded, want CHECK-constraint rejection")
+	}
+}
+
 // TestPostgres_CampaignItem_MalformedDependsOn_Tolerated asserts the
 // rowToCampaignItem tolerance branch: a depends_on payload that is valid
 // JSONB but not a []string (so json.Unmarshal into []string fails) is

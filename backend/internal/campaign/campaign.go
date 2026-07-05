@@ -177,6 +177,13 @@ type Item struct {
 	CampaignID uuid.UUID
 	IssueRef   string   // e.g. "issue:1441"
 	DependsOn  []string // sibling issue refs this item waits on (the campaign DAG edges)
+	// Autonomy is the item's autonomy tier (low|medium|high), threaded from the
+	// child issue's `autonomy:<tier>` label through EpicChild → AssembledItem →
+	// the campaign_items.autonomy column. Empty means unknown/default (the child
+	// carried no autonomy label), treated by the engine as non-human-led. A
+	// deps-satisfied autonomy:low item is diverted out of the auto-dispatch
+	// Eligible slice into HumanLed (#1551 / E32.4).
+	Autonomy string
 	// RunID is the run linkage: the nullable FK to the runs row executing
 	// this item (campaign_items.run_id, ON DELETE SET NULL). Nil until a
 	// run is assigned; nulled (not deleted) if that run is later removed,
