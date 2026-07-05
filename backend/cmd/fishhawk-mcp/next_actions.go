@@ -1231,9 +1231,10 @@ func reviewVerdictSummary(rs *ReviewStatus) string {
 // next-actions classifier: a pure function mapping a campaign's
 // server-computed next_action (computeCampaignNextAction, server/campaigns.go)
 // onto a legal MCP operator action. It mirrors EXACTLY the backend's closed
-// action set — attention | resume | start_run | wait | complete — so a future
-// backend-added action value lands in the labeled campaign_unclassified
-// fallback rather than crashing. fishhawk_get_campaign_status embeds the result
+// action set — attention | resume | start_run | attend_human_led | wait |
+// complete — so a future backend-added action value lands in the labeled
+// campaign_unclassified fallback rather than crashing.
+// fishhawk_get_campaign_status embeds the result
 // in its output so the operator-agent never reads an unclassified campaign
 // state.
 //
@@ -1284,6 +1285,21 @@ func campaignNextActionsFor(_ CampaignRollup, na CampaignNextAction) *NextAction
 				Precondition: "this campaign item's dependencies are all satisfied (it is in the rollup's eligible slice) and it has no run yet",
 				Consumes:     consumesNewRun,
 				Reason:       "dispatch the next eligible campaign item " + na.IssueRef + " — start a run on its issue ref to advance the campaign",
+			}},
+		}
+	case "attend_human_led":
+		// The only deps-satisfied item(s) remaining are autonomy:low (human-led):
+		// the methodology reserves this tier for human leadership, so the operator
+		// must pick it up by hand — do NOT mint an agent run. This arm fires only
+		// when no autonomous item is eligible (start_run wins otherwise), so
+		// surfacing it never stalls DAG-independent autonomous work.
+		return &NextActions{
+			State: "campaign_attend_human_led",
+			Actions: []SuggestedAction{{
+				Action:       "fishhawk_get_campaign_status",
+				Precondition: "the only deps-satisfied campaign item is autonomy:low (human-led); it is in the rollup's human_led slice, not eligible",
+				Consumes:     consumesNone,
+				Reason:       "campaign item " + na.IssueRef + " is deps-satisfied but autonomy:low — a human must lead it; do NOT start an agent run. Handle it out-of-band, then re-poll fishhawk_get_campaign_status to advance the campaign",
 			}},
 		}
 	case "wait":
