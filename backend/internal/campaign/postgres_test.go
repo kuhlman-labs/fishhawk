@@ -13,6 +13,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 // jsonEqual reports whether two raw JSON blobs are semantically equal,
@@ -346,6 +347,71 @@ func TestPostgres_CampaignItem_Autonomy_RoundTripAndFailClosed(t *testing.T) {
 		Autonomy:   "bogus",
 	}); err == nil {
 		t.Error("create item with autonomy='bogus' succeeded, want CHECK-constraint rejection")
+	}
+}
+
+// TestPostgres_Assemble_OutOfSetAutonomy_DegradesNotAborts is the routed
+// untested-path seam test (#1551 / E32.4 fix-up): it drives the FULL
+// Assemble→Persist path from an EpicChild carrying an OUT-OF-SET autonomy tier
+// (a typo'd label such as `autonomy:critical`) and asserts persistence
+// SUCCEEDS with the campaign_items.autonomy column stored as "" — the mislabeled
+// child degrades to the non-human-led default instead of aborting the entire
+// epic campaign with an SQLSTATE 23514 CHECK violation. This pins the campaign
+// package's half of the fix; the parse boundary's normalization of the label
+// itself is pinned by TestParseAutonomyLabel in the github provider package.
+func TestPostgres_Assemble_OutOfSetAutonomy_DegradesNotAborts(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	res := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 41, Autonomy: "critical"}, // out-of-set typo → must degrade to ""
+			{Number: 42, Autonomy: "low"},      // valid tier passes through
+		},
+	}
+	a, err := campaign.Assemble("issue:40", res)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	// Assemble normalizes the out-of-set tier to "" before it can reach the DB.
+	if a.Items[0].Autonomy != "" {
+		t.Errorf("assembled item[0] autonomy = %q, want empty (normalized)", a.Items[0].Autonomy)
+	}
+	if a.Items[1].Autonomy != "low" {
+		t.Errorf("assembled item[1] autonomy = %q, want low (passthrough)", a.Items[1].Autonomy)
+	}
+
+	// Persist must SUCCEED — no CHECK-constraint abort on the mislabeled child.
+	c, err := campaign.Persist(ctx, repo, "kuhlman-labs/fishhawk", a)
+	if err != nil {
+		t.Fatalf("Persist aborted on out-of-set tier (want success): %v", err)
+	}
+
+	items, err := repo.ListCampaignItemsForCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("ListCampaignItemsForCampaign: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("persisted %d items, want 2", len(items))
+	}
+	if items[0].IssueRef != "issue:41" || items[0].Autonomy != "" {
+		t.Errorf("item issue:41 autonomy = %q, want empty", items[0].Autonomy)
+	}
+	if items[1].IssueRef != "issue:42" || items[1].Autonomy != "low" {
+		t.Errorf("item issue:42 autonomy = %q, want low", items[1].Autonomy)
+	}
+
+	// Read the raw column too: prove campaign_items.autonomy itself holds "",
+	// satisfying the fail-closed 0049 CHECK rather than the rejected "critical".
+	var col string
+	if err := pool.QueryRow(ctx,
+		`SELECT autonomy FROM campaign_items WHERE id = $1`, items[0].ID,
+	).Scan(&col); err != nil {
+		t.Fatalf("read autonomy column: %v", err)
+	}
+	if col != "" {
+		t.Errorf("campaign_items.autonomy column = %q, want empty", col)
 	}
 }
 

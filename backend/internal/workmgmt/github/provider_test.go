@@ -415,8 +415,10 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 
 // TestParseAutonomyLabel covers the tier extraction: the first autonomy:<tier>
 // label's suffix wins, a non-autonomy label is ignored, no autonomy label
-// yields "" (unknown/default), and an out-of-set tier round-trips its raw
-// value (the engine's exact-"low" divert simply never fires on it).
+// yields "" (unknown/default), and an out-of-set tier normalizes to "" so a
+// mislabeled child degrades to the non-human-led default (matching the
+// fail-closed campaign_items.autonomy CHECK) rather than reaching Persist as a
+// value the CHECK rejects.
 func TestParseAutonomyLabel(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -429,7 +431,8 @@ func TestParseAutonomyLabel(t *testing.T) {
 		{"unlabeled", []string{"type:bug", "area:server"}, ""},
 		{"nil labels", nil, ""},
 		{"first autonomy wins", []string{"autonomy:high", "autonomy:low"}, "high"},
-		{"out-of-set tier round-trips raw", []string{"autonomy:bogus"}, "bogus"},
+		{"known tier passes through", []string{"autonomy:low"}, "low"},
+		{"out-of-set tier normalizes to empty", []string{"autonomy:bogus"}, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

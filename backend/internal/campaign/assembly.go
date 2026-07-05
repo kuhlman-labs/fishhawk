@@ -157,12 +157,31 @@ func Assemble(epicRef string, res *workmgmt.EpicChildrenResult) (*Assembly, erro
 			DependsOn: deps,
 			Wave:      waveOf[i],
 			// Carry the source child's autonomy tier through so Persist can
-			// stamp campaign_items.autonomy (#1551 / E32.4).
-			Autonomy: c.Autonomy,
+			// stamp campaign_items.autonomy (#1551 / E32.4). Normalize as a
+			// campaign-layer backstop to the fail-closed 0049 CHECK: the parse
+			// boundary already maps an unrecognized `autonomy:<tier>` label to ""
+			// (non-human-led default), but a raw out-of-set tier reaching Assemble
+			// from any other source degrades to "" here rather than aborting the
+			// entire epic campaign with a CHECK violation at Persist.
+			Autonomy: normalizeAutonomy(c.Autonomy),
 		}
 	}
 
 	return &Assembly{EpicRef: epicRef, Items: items, Waves: waves}, nil
+}
+
+// normalizeAutonomy maps an autonomy tier to the set the campaign_items.autonomy
+// CHECK (migration 0049) permits: "", "low", "medium", "high". Any other value
+// (an out-of-set tier that slipped past the label parse boundary) normalizes to
+// "" — the unknown/default tier the engine treats as non-human-led — so a single
+// mislabeled child can never abort persistence of the whole epic campaign.
+func normalizeAutonomy(tier string) string {
+	switch tier {
+	case "low", "medium", "high":
+		return tier
+	default:
+		return ""
+	}
 }
 
 // Persist materializes an Assembly into durable rows via the Repository: it

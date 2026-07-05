@@ -642,14 +642,22 @@ const autonomyLabelPrefix = "autonomy:"
 // the suffix of the first `autonomy:<tier>` label (e.g. "autonomy:low" ->
 // "low"). It returns "" when no autonomy label is present (unknown/default,
 // treated downstream as non-human-led) so the whole namespace lives in one
-// helper — a future tier is one edit. Keeping the parse here (not a regex over
-// the tier set) means an out-of-set tier still round-trips its raw value; the
-// engine's autonomy:low divert keys on the exact "low" string, so a typo'd
-// tier simply never diverts.
+// helper — a future tier is one edit. Only the recognized tiers ("", "low",
+// "medium", "high") pass through; an unrecognized tier (a typo like
+// "autonomy:critical") normalizes to "" = non-human-led. This keeps the parse
+// boundary in lockstep with the fail-closed campaign_items.autonomy CHECK
+// (migration 0049): a mislabeled child degrades to the autonomous default
+// rather than aborting the entire epic campaign with a CHECK violation when
+// Persist writes the row.
 func parseAutonomyLabel(labels []string) string {
 	for _, l := range labels {
 		if tier := strings.TrimPrefix(l, autonomyLabelPrefix); tier != l {
-			return tier
+			switch tier {
+			case "low", "medium", "high":
+				return tier
+			default:
+				return ""
+			}
 		}
 	}
 	return ""
