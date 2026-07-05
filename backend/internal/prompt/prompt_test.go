@@ -1279,6 +1279,45 @@ func TestBuild_Plan_SingleOwnerFileRule(t *testing.T) {
 	}
 }
 
+// TestBuild_Plan_ProducerConsumerDependsOnGuidance pins the decomposition
+// producer->consumer depends_on guidance (#1679): a consumer slice that
+// references a symbol an earlier producer slice introduces must declare
+// depends_on so run_children sequences ordered waves, instead of leaving
+// every sub_plan's depends_on empty and running all slices in parallel in
+// wave 0. The done-means here is the rendered prose — a dropped or
+// comment-only edit to the bullet fails this assertion.
+func TestBuild_Plan_ProducerConsumerDependsOnGuidance(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 1679,
+		IssueTitle:  "Plan a decomposed producer->consumer change",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"Producer->consumer ordering rule",
+		"depends_on",
+		"producer->consumer chain",
+		"ordered waves",
+		"translate",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing producer->consumer depends_on guidance %q\n---\n%s", w, got)
+		}
+	}
+
+	// Plan-stage only — it must not bleed into the implement prompt.
+	impl, err := Build("implement", Trigger{Repo: "x/y", ApprovedPlan: fixturePlan()})
+	if err != nil {
+		t.Fatalf("Build implement: %v", err)
+	}
+	if strings.Contains(impl, "Producer->consumer ordering rule") {
+		t.Errorf("producer->consumer ordering rule must not render in the implement prompt:\n%s", impl)
+	}
+}
+
 func TestBuild_Plan_ContainsIncrementalVerification(t *testing.T) {
 	got, err := Build("plan", Trigger{
 		Source:      "github_issue",

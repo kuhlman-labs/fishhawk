@@ -969,7 +969,7 @@ func TestWarnings_SubPlanSumGeParent_NoWarnings(t *testing.T) {
     "rationale": "split",
     "sub_plans": [
       {"title": "Part A", "scope_hint": "a", "scope": {"files": [{"path": "a.go", "operation": "create"}]}, "predicted_runtime_minutes": 8, "predicted_runtime_confidence": "medium"},
-      {"title": "Part B", "scope_hint": "b", "scope": {"files": [{"path": "b.go", "operation": "create"}]}, "predicted_runtime_minutes": 6, "predicted_runtime_confidence": "medium"}
+      {"title": "Part B", "scope_hint": "b", "scope": {"files": [{"path": "b.go", "operation": "create"}]}, "predicted_runtime_minutes": 6, "predicted_runtime_confidence": "medium", "depends_on": [0]}
     ]
   }
 }`))
@@ -978,6 +978,72 @@ func TestWarnings_SubPlanSumGeParent_NoWarnings(t *testing.T) {
 	}
 	if warns := plan.Warnings(p); len(warns) != 0 {
 		t.Errorf("expected no warnings when sub-plan sum >= parent, got %v", warns)
+	}
+}
+
+// TestWarnings_MultiSliceAllEmptyDependsOn covers the #1679 advisory: a
+// multi-slice decomposition where every sub_plan omits depends_on is flagged
+// as a soft warning (never a *SemanticError) because such a decomposition
+// dispatches every slice in parallel in wave 0, so a producer->consumer chain
+// would fail typecheck on the not-yet-integrated symbol.
+func TestWarnings_MultiSliceAllEmptyDependsOn(t *testing.T) {
+	data := decompositionWith(
+		subPlanWithScope("slice 1", "first", "backend/internal/a/a.go"),
+		subPlanWithScope("slice 2", "second", "backend/internal/b/b.go"),
+	)
+	p, err := plan.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	warns := plan.Warnings(p)
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w, "none declares depends_on") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected all-empty-depends_on advisory, got %v", warns)
+	}
+}
+
+// TestWarnings_MultiSliceWithDependsOnEdge_NoFire confirms the advisory does
+// not fire when at least one sub_plan declares depends_on.
+func TestWarnings_MultiSliceWithDependsOnEdge_NoFire(t *testing.T) {
+	data := decompositionWith(
+		subPlanDep("A", nil),
+		subPlanDep("B", []int{0}),
+	)
+	p, err := plan.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	for _, w := range plan.Warnings(p) {
+		if strings.Contains(w, "none declares depends_on") {
+			t.Errorf("advisory should not fire when a depends_on edge is present, got %v", w)
+		}
+	}
+}
+
+// TestWarnings_SingleSliceDecomposition_NoFire confirms the advisory does not
+// fire for a single-slice decomposition — there is no wave-ordering risk with
+// only one slice. The standard_v1 schema requires >= 2 sub_plans, so this
+// case is built directly against the Plan struct (as TestWaves_BackCompat_*
+// does above) rather than through Parse.
+func TestWarnings_SingleSliceDecomposition_NoFire(t *testing.T) {
+	p := &plan.Plan{
+		PredictedRuntimeMinutes: 5,
+		Decomposition: &plan.Decomposition{
+			SubPlans: []plan.SubPlanSummary{
+				{Title: "slice 1", PredictedRuntimeMinutes: 5},
+			},
+		},
+	}
+	for _, w := range plan.Warnings(p) {
+		if strings.Contains(w, "none declares depends_on") {
+			t.Errorf("advisory should not fire for a single-slice decomposition, got %v", w)
+		}
 	}
 }
 
