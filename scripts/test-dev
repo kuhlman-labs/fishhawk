@@ -1163,10 +1163,15 @@ if print -r -- "$preview_body" | grep -q 'could not resolve'; then
 else
   fail "cmd_preview should _die when the ref resolves to no commit"
 fi
-if print -r -- "$preview_body" | grep -q '_port_listeners'; then
-  pass "cmd_preview preflights the preview port for squatters"
+if print -r -- "$preview_body" | grep -q '_down_port_fallback'; then
+  pass "cmd_preview pre-empts a stale orphan via the port reclaim (_down_port_fallback)"
 else
-  fail "cmd_preview should preflight the preview port via _port_listeners"
+  fail "cmd_preview should compose _down_port_fallback for the preview-port preflight"
+fi
+if print -r -- "$preview_body" | grep -q "run 'scripts/dev preview-down'"; then
+  pass "cmd_preview retains the foreign-case _die guidance ('run scripts/dev preview-down')"
+else
+  fail "cmd_preview should retain the foreign-holder _die message (binding condition 2)"
 fi
 if print -r -- "$preview_body" | grep -q '_preview_remove_worktree'; then
   pass "cmd_preview removes the preview worktree on its post-worktree failure paths"
@@ -1185,10 +1190,118 @@ else
   fail "_preview_db_reset should carry the docker-exec psql fallback"
 fi
 pd_body="$(typeset -f cmd_preview_down)"
-if print -r -- "$pd_body" | grep -q '_preview_kill_tracked' && print -r -- "$pd_body" | grep -q '_preview_remove_worktree'; then
-  pass "cmd_preview_down composes the kill + worktree-removal ladder"
+if print -r -- "$pd_body" | grep -q '_preview_kill_tracked' && print -r -- "$pd_body" | grep -q '_down_port_fallback' && print -r -- "$pd_body" | grep -q '_preview_remove_worktree'; then
+  pass "cmd_preview_down composes kill + port reclaim + worktree-removal"
 else
-  fail "cmd_preview_down should call _preview_kill_tracked and _preview_remove_worktree"
+  fail "cmd_preview_down should call _preview_kill_tracked, _down_port_fallback, and _preview_remove_worktree"
+fi
+
+# 15g. Preview-port reclaim (#1675) — behavioral, driving BOTH enumerated modes
+# of the ownership heuristic through _down_port_fallback with NO nonce arg (the
+# comm-basename route preview daemons take, since they are git_sha-gated, not
+# nonce-stamped). This is exactly what cmd_preview_down and cmd_preview's
+# preflight compose to reclaim an orphaned :8090 whose pid file is already gone.
+if ! command -v nc &>/dev/null; then
+  print "skip: nc not found — skipping preview-port reclaim behavioral tests"
+else
+  reclaim_dir="$(mktemp -d -t test-dev-reclaim.XXXXXX)"
+  reclaim_bin="$(mktemp -d -t test-dev-reclaimbin.XXXXXX)"
+  absent_pid="$reclaim_dir/preview.pid"   # deliberately never created (#1675)
+
+  # -- Mode 1: reclaim KILL leg. A listener whose comm basename is 'fishhawkd'
+  # (nc launched via a 'fishhawkd'-named path) holding a port with the pid file
+  # ABSENT is the #1675 orphan; the reclaim must TERM→KILL it and free the
+  # port. We SYMLINK rather than cp: copying a signed binary invalidates its
+  # signature and macOS SIGKILLs the copy on exec (so the plan's literal cp
+  # would always skip here), while exec-via-symlink keeps nc alive AND yields
+  # comm=…/fishhawkd on both macOS and Linux. Guard still skips cleanly if even
+  # the symlinked listener cannot bind as comm=fishhawkd.
+  fhd_port=""
+  for _try in 1 2 3 4 5; do
+    cand=$(( 20000 + (RANDOM % 40000) ))
+    if [[ -z "$(_port_listeners "$cand")" ]]; then fhd_port="$cand"; break; fi
+  done
+  fhd_bin="$reclaim_bin/fishhawkd"
+  ln -s "$(command -v nc)" "$fhd_bin" 2>/dev/null || true
+  fhd_pid=""
+  if [[ -n "$fhd_port" && -x "$fhd_bin" ]]; then
+    "$fhd_bin" -l 127.0.0.1 "$fhd_port" >/dev/null 2>&1 &
+    fhd_pid=$!
+    i=0
+    while (( i < 20 )); do
+      if [[ -n "$(_port_listeners "$fhd_port")" ]]; then break; fi
+      sleep 0.1
+      (( ++i ))
+    done
+  fi
+  fhd_comm=""
+  if [[ -n "$fhd_pid" ]]; then fhd_comm="$(ps -p "$fhd_pid" -o comm= 2>/dev/null)"; fi
+  if [[ -z "$fhd_pid" ]] || ! kill -0 "$fhd_pid" 2>/dev/null \
+     || [[ -z "$(_port_listeners "$fhd_port")" ]] || [[ "${fhd_comm:t}" != fishhawkd ]]; then
+    print "skip: 'fishhawkd'-named nc copy could not bind as comm=fishhawkd — skipping the reclaim KILL-leg assertion"
+    if [[ -n "$fhd_pid" ]]; then kill "$fhd_pid" 2>/dev/null; wait "$fhd_pid" 2>/dev/null; fi
+  else
+    rout="$(_down_port_fallback "$fhd_port" "$absent_pid" 2>&1)"
+    rrc=$?
+    if (( rrc == 0 )); then
+      pass "reclaim returns 0 for a pid-file-absent fishhawkd orphan (#1675 done-means)"
+    else
+      fail "reclaim should return 0 after killing a stale fishhawkd orphan (got rc=$rrc, out: $rout)"
+    fi
+    if kill -0 "$fhd_pid" 2>/dev/null; then
+      fail "reclaim should have TERM→KILLed the fishhawkd orphan pid ${fhd_pid}"
+      kill -KILL "$fhd_pid" 2>/dev/null
+    else
+      pass "reclaim TERM→KILLs the pid-file-absent fishhawkd orphan"
+    fi
+    wait "$fhd_pid" 2>/dev/null
+    if [[ -z "$(_port_listeners "$fhd_port")" ]]; then
+      pass "reclaim frees the orphaned preview port"
+    else
+      fail "reclaim should free port ${fhd_port} (still held: $(_port_listeners "$fhd_port"))"
+    fi
+  fi
+
+  # -- Mode 2: reclaim FOREIGN-safety leg (binding condition 1). A plain nc
+  # listener (comm=nc) must be REPORTED and NOT killed, with the reclaim
+  # returning non-zero so preview-down/preflight cannot falsely claim success.
+  foreign_port=""
+  for _try in 1 2 3 4 5; do
+    cand=$(( 20000 + (RANDOM % 40000) ))
+    if [[ "$cand" != "$fhd_port" && -z "$(_port_listeners "$cand")" ]]; then foreign_port="$cand"; break; fi
+  done
+  if [[ -z "$foreign_port" ]]; then
+    fail "could not find a free port for the foreign-safety reclaim fixture"
+  else
+    nc -l 127.0.0.1 "$foreign_port" >/dev/null 2>&1 &
+    foreign_pid=$!
+    i=0
+    while (( i < 20 )); do
+      if [[ -n "$(_port_listeners "$foreign_port")" ]]; then break; fi
+      sleep 0.1
+      (( ++i ))
+    done
+    frout="$(_down_port_fallback "$foreign_port" "$absent_pid" 2>&1)"
+    frrc=$?
+    if (( frrc != 0 )); then
+      pass "reclaim refuses success (rc!=0) for a foreign :8090 holder"
+    else
+      fail "reclaim should return non-zero for a non-fishhawkd listener (got rc=$frrc)"
+    fi
+    if [[ "$frout" == *"$foreign_pid"* ]]; then
+      pass "reclaim reports the foreign holder's pid"
+    else
+      fail "reclaim should name the foreign pid ${foreign_pid} (got: $frout)"
+    fi
+    if kill -0 "$foreign_pid" 2>/dev/null; then
+      pass "reclaim never kills the foreign (comm=nc) listener"
+    else
+      fail "reclaim must NOT kill a non-fishhawkd process (pid ${foreign_pid})"
+    fi
+    kill "$foreign_pid" 2>/dev/null
+    wait "$foreign_pid" 2>/dev/null
+  fi
+  rm -rf "$reclaim_dir" "$reclaim_bin"
 fi
 
 # 15h. _preview_branch_env: the credential-stripped prefix that runs the

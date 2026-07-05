@@ -1370,26 +1370,20 @@ cmd_preview() {
   _preview_kill_tracked "$PREVIEW_PID_FILE"
   _preview_remove_worktree "$PREVIEW_WORKTREE"
 
-  # Port preflight (#965 posture): a foreign listener on the preview port means
-  # the spawn below would bind-fail while the squatter answers the readiness
-  # probe with the wrong (or right!) identity. Fail loud before any work.
+  # Port preflight (#965 posture): a listener on the preview port means the
+  # spawn below would bind-fail. Pre-empt a stale SAME-BINARY orphan from a
+  # cancelled/failed run (#1675) instead of failing loud: reuse the reclaim
+  # (_down_port_fallback, no nonce arg — preview daemons are git_sha-gated, not
+  # nonce-stamped, so it degrades to the comm-basename ownership heuristic),
+  # which TERM→KILLs a stale fishhawkd-named listener and returns 0. Only a
+  # genuine FOREIGN holder (reclaim returns non-zero, having already reported
+  # the pid to stderr) fails loud, with the operator-facing actionable message
+  # retained. lsof-missing / no-listeners are handled inside the reclaim
+  # (warn+return 0 / return 0), preserving today's degraded behavior.
   local pport
   pport="$(_preview_port)"
-  if command -v lsof &>/dev/null; then
-    local squatters=""
-    if ! squatters="$(_port_listeners "$pport")"; then squatters=""; fi
-    if [[ -n "$squatters" ]]; then
-      local spid scomm sdesc=""
-      while IFS= read -r spid; do
-        if [[ -z "$spid" ]]; then continue; fi
-        scomm="?"
-        if ! scomm="$(ps -p "$spid" -o comm= 2>/dev/null)"; then scomm="?"; fi
-        sdesc+="pid ${spid} (${scomm:t}) "
-      done <<< "$squatters"
-      _die "preview port ${pport} already has a listener: ${sdesc}— run 'scripts/dev preview-down', or kill the pid, then retry"
-    fi
-  else
-    print "warning: lsof not found — skipping preview port preflight (degraded)"
+  if ! _down_port_fallback "$pport" "$PREVIEW_PID_FILE"; then
+    _die "preview port ${pport} already has a foreign listener — run 'scripts/dev preview-down', or kill the pid, then retry"
   fi
 
   # Detached preview worktree at the merge candidate. A clean detached
@@ -1456,7 +1450,17 @@ cmd_preview() {
 # preview database is left in place; the next preview start DROP/CREATEs it.
 cmd_preview_down() {
   _preview_kill_tracked "$PREVIEW_PID_FILE"
+  # Reclaim an orphaned preview port (#1675): a cancelled/failed run can leave
+  # the preview fishhawkd LISTENing on the port with its pid file already gone,
+  # so the _preview_kill_tracked 'no pid file' no-op above leaves the squatter
+  # alive. Reuse the #965/#1018 ownership heuristic (no nonce arg — preview
+  # daemons are git_sha-gated, not nonce-stamped) to TERM→KILL a stale
+  # fishhawkd-named listener, or report + return non-zero for a FOREIGN one so
+  # preview-down never falsely claims a clean shutdown while :8090 is held.
+  local rc=0
+  _down_port_fallback "$(_preview_port)" "$PREVIEW_PID_FILE" || rc=$?
   _preview_remove_worktree "$PREVIEW_WORKTREE"
+  return $rc
 }
 
 _usage() {
