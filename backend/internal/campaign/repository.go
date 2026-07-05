@@ -45,6 +45,12 @@ type CreateCampaignItemParams struct {
 	CampaignID uuid.UUID
 	IssueRef   string
 	DependsOn  []string
+	// Autonomy is the item's autonomy tier (low|medium|high), persisted to the
+	// campaign_items.autonomy column. Empty is the unknown/default tier (the
+	// child carried no autonomy label). The column CHECK admits only the empty
+	// tier plus the three known tiers, so an out-of-set value fails closed at
+	// write time.
+	Autonomy string
 }
 
 // ListCampaignsFilter scopes a ListCampaigns query. Empty strings mean "no

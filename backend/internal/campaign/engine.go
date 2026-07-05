@@ -12,8 +12,17 @@ package campaign
 // Cancelled reflect items already linked to a run or terminal.
 type Eligibility struct {
 	// Eligible items have no run yet and every dependency already succeeded —
-	// they are ready to dispatch.
+	// they are ready to dispatch autonomously.
 	Eligible []string
+	// HumanLed items have no run yet and every dependency already succeeded
+	// (deps-satisfied, exactly like Eligible) but carry Autonomy=="low", the
+	// tier the methodology reserves for human leadership. They are a disjoint
+	// partition from Eligible: a deps-satisfied autonomy:low item is diverted
+	// here instead of Eligible so the auto-driver (which keys on Eligible) never
+	// mints an agent run on human-led work. A deps-UNsatisfied autonomy:low item
+	// stays in Blocked, not HumanLed — HumanLed is the deps-satisfied-but-human-
+	// led set only.
+	HumanLed []string
 	// Blocked items have no run yet but at least one dependency is not yet
 	// done (or references an item absent from the campaign).
 	Blocked []string
@@ -42,10 +51,13 @@ type Eligibility struct {
 //
 // An item is Eligible when it has no run yet (RunID nil and a non-terminal,
 // not-yet-running state) AND every dependency ref resolves to a Done
-// (succeeded) item. It is Blocked when not yet run but at least one dependency
-// is not yet done. A dependency ref absent from the campaign is treated as
-// not-satisfied (defensive): a campaign referencing a missing sibling stays
-// blocked rather than dispatching against an unresolved edge.
+// (succeeded) item AND its autonomy tier is not "low". A deps-satisfied item
+// carrying Autonomy=="low" is diverted to HumanLed instead — human-led work
+// the auto-driver must never dispatch. It is Blocked when not yet run but at
+// least one dependency is not yet done (regardless of autonomy tier). A
+// dependency ref absent from the campaign is treated as not-satisfied
+// (defensive): a campaign referencing a missing sibling stays blocked rather
+// than dispatching against an unresolved edge.
 //
 // A cancelled item is terminal: it is reported in Cancelled and never Eligible,
 // even with no run and no deps (which would otherwise fall through to the
@@ -83,11 +95,17 @@ func NextEligible(items []*Item) Eligibility {
 			e.Running = append(e.Running, ref)
 		default:
 			// Not yet run (RunID nil, state pending/blocked). Eligible only
-			// when every dependency has succeeded.
-			if depsSatisfied(it.DependsOn, done) {
-				e.Eligible = append(e.Eligible, ref)
-			} else {
+			// when every dependency has succeeded; a deps-satisfied autonomy:low
+			// item is human-led, diverted to HumanLed so the auto-driver never
+			// dispatches it. A deps-unsatisfied item stays Blocked regardless of
+			// its autonomy tier.
+			switch {
+			case !depsSatisfied(it.DependsOn, done):
 				e.Blocked = append(e.Blocked, ref)
+			case it.Autonomy == "low":
+				e.HumanLed = append(e.HumanLed, ref)
+			default:
+				e.Eligible = append(e.Eligible, ref)
 			}
 		}
 	}

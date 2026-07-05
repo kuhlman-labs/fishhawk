@@ -1217,12 +1217,19 @@ components:
         (`campaign.NextEligible`). Every slice holds issue refs; an item
         appears in exactly one slice. Each field is always an array (never
         null).
-      required: [eligible, blocked, running, done, failed, cancelled, paused]
+      required: [eligible, human_led, blocked, running, done, failed, cancelled, paused]
       properties:
         eligible:
           type: array
           items: { type: string }
-          description: No run yet and every dependency succeeded — ready to dispatch.
+          description: No run yet and every dependency succeeded — ready to dispatch autonomously.
+        human_led:
+          type: array
+          items: { type: string }
+          description: >-
+            No run yet and every dependency succeeded (deps-satisfied, like
+            `eligible`) but the item is `autonomy:low` — human-led work diverted
+            out of `eligible` so the auto-driver never dispatches it.
         blocked:
           type: array
           items: { type: string }
@@ -1256,14 +1263,21 @@ components:
       properties:
         action:
           type: string
-          enum: [attention, resume, start_run, wait, complete]
+          enum: [attention, resume, start_run, attend_human_led, wait, complete]
           description: |
             `attention` — a failed item needs operator intervention
             (retry/abandon); takes precedence over everything else.
             `resume` — a paused item was handed off to a human at a run gate
             (E25.7); handle the gate then `POST /resume`. Ranked above
             `start_run` so a hand-off is surfaced before new dispatch.
-            `start_run` — the next eligible item is ready to dispatch.
+            `start_run` — the next eligible (autonomous) item is ready to
+            dispatch. Wins over `attend_human_led`: whenever ANY autonomous item
+            is eligible it is surfaced first, so human-led items never stall
+            DAG-independent autonomous work.
+            `attend_human_led` — the only deps-satisfied item(s) remaining are
+            `autonomy:low` (human-led). Fires ONLY when `eligible` is empty and
+            `human_led` is non-empty; a human must lead the item — do NOT
+            dispatch an agent run.
             `wait` — items are running or blocked; nothing to do yet.
             `complete` — every item reached a terminal state.
         issue_ref:
@@ -1271,7 +1285,8 @@ components:
           description: |
             The item the action refers to — the first failed item for
             `attention`, the first paused item for `resume`, the first eligible
-            item for `start_run`. Omitted for `wait` / `complete`.
+            item for `start_run`, the first human-led item for
+            `attend_human_led`. Omitted for `wait` / `complete`.
         detail:
           type: string
           description: Human-readable explanation of the action.

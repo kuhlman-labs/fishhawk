@@ -1105,6 +1105,22 @@ func TestComputeCampaignNextAction_Precedence(t *testing.T) {
 			wantRef: "issue:6",
 		},
 		{
+			// start_run WINS over attend_human_led: an autonomous item is eligible
+			// even though a human-led item is ALSO deps-satisfied, so autonomous
+			// dispatch is surfaced first and human-led work never stalls it.
+			name:    "eligible and human-led both present -> start_run (autonomous wins)",
+			elig:    campaign.Eligibility{Eligible: []string{"issue:6"}, HumanLed: []string{"issue:12"}},
+			want:    "start_run",
+			wantRef: "issue:6",
+		},
+		{
+			// attend_human_led fires ONLY when no autonomous item is eligible.
+			name:    "human-led only -> attend_human_led",
+			elig:    campaign.Eligibility{HumanLed: []string{"issue:12"}},
+			want:    "attend_human_led",
+			wantRef: "issue:12",
+		},
+		{
 			name: "running only -> wait",
 			elig: campaign.Eligibility{Running: []string{"issue:7"}},
 			want: "wait",
@@ -1141,6 +1157,29 @@ func TestComputeCampaignNextAction_Precedence(t *testing.T) {
 				t.Errorf("issue_ref = %q, want %q", got.IssueRef, tc.wantRef)
 			}
 		})
+	}
+}
+
+// TestToCampaignRollupPayload_HumanLedNonNil asserts the new human_led slice is
+// normalized to a non-nil array (never JSON null) when empty, and passes a
+// populated HumanLed partition through.
+func TestToCampaignRollupPayload_HumanLedNonNil(t *testing.T) {
+	// Empty HumanLed → non-nil array on the wire.
+	empty := toCampaignRollupPayload(campaign.Eligibility{})
+	if empty.HumanLed == nil {
+		t.Errorf("HumanLed = nil, want non-nil empty slice")
+	}
+	b, err := json.Marshal(empty)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"human_led":[]`) {
+		t.Errorf("json = %s, want human_led as []", b)
+	}
+	// Populated HumanLed flows through unchanged.
+	got := toCampaignRollupPayload(campaign.Eligibility{HumanLed: []string{"issue:12"}})
+	if !reflect.DeepEqual(got.HumanLed, []string{"issue:12"}) {
+		t.Errorf("HumanLed = %v, want [issue:12]", got.HumanLed)
 	}
 }
 

@@ -75,6 +75,7 @@ type CampaignItem struct {
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 	PauseReason []byte             `json:"pause_reason"`
+	Autonomy    string             `json:"autonomy"`
 }
 
 type McpToken struct {
@@ -86,6 +87,44 @@ type McpToken struct {
 	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
 	RevokedAt  pgtype.Timestamptz `json:"revoked_at"`
 	Scopes     []string           `json:"scopes"`
+}
+
+type RefinementDecision struct {
+	ID               uuid.UUID          `json:"id"`
+	SessionID        uuid.UUID          `json:"session_id"`
+	DraftID          uuid.UUID          `json:"draft_id"`
+	Decision         string             `json:"decision"`
+	Reason           string             `json:"reason"`
+	DraftContentHash string             `json:"draft_content_hash"`
+	DecidedBy        *string            `json:"decided_by"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
+type RefinementDraft struct {
+	ID        uuid.UUID          `json:"id"`
+	SessionID uuid.UUID          `json:"session_id"`
+	Brief     string             `json:"brief"`
+	Draft     []byte             `json:"draft"`
+	Model     *string            `json:"model"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	Origin    string             `json:"origin"`
+}
+
+type RefinementFiledItem struct {
+	ID          uuid.UUID          `json:"id"`
+	DraftID     uuid.UUID          `json:"draft_id"`
+	Ordinal     int32              `json:"ordinal"`
+	IssueNumber int32              `json:"issue_number"`
+	IssueUrl    string             `json:"issue_url"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+type RefinementFilingSession struct {
+	DraftID     uuid.UUID          `json:"draft_id"`
+	SessionID   uuid.UUID          `json:"session_id"`
+	Repo        string             `json:"repo"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	CompletedAt pgtype.Timestamptz `json:"completed_at"`
 }
 
 type ReviewConcern struct {
@@ -131,6 +170,7 @@ type Run struct {
 	Drive                  bool               `json:"drive"`
 	SliceIndex             *int32             `json:"slice_index"`
 	RunnerKindResolved     bool               `json:"runner_kind_resolved"`
+	UpstreamRunID          *uuid.UUID         `json:"upstream_run_id"`
 }
 
 type ScopeAmendment struct {

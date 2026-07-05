@@ -353,8 +353,8 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 		parentNode: "EPIC_NODE",
 		listSubResults: []githubclient.SubIssue{
 			// out-of-order on purpose: EpicChildren sorts ascending.
-			{Number: 42, NodeID: "N42", Title: "slice B", Body: "## Summary\n\nDepends on: #41\n"},
-			{Number: 41, NodeID: "N41", Title: "slice A", Body: "## Summary\n\nno deps\n"},
+			{Number: 42, NodeID: "N42", Title: "slice B", Body: "## Summary\n\nDepends on: #41\n", Labels: []string{"type:feature", "autonomy:medium"}},
+			{Number: 41, NodeID: "N41", Title: "slice A", Body: "## Summary\n\nno deps\n", Labels: []string{"autonomy:low"}},
 			{Number: 43, NodeID: "N43", Title: "slice C", Body: "Depends on: #41, #42, #999\n"},
 		},
 	}
@@ -380,6 +380,15 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 			t.Errorf("children[%d].Number = %d, want %d", i, c.Number, wantChildren[i])
 		}
 	}
+	// Autonomy is parsed off each child's `autonomy:<tier>` label: #41 low,
+	// #42 medium (its non-autonomy type:feature label is ignored), #43 unlabeled
+	// -> "" (#1551).
+	wantAutonomy := map[int]string{41: "low", 42: "medium", 43: ""}
+	for _, c := range res.Children {
+		if c.Autonomy != wantAutonomy[c.Number] {
+			t.Errorf("child #%d Autonomy = %q, want %q", c.Number, c.Autonomy, wantAutonomy[c.Number])
+		}
+	}
 	// Edges: 42->41, 43->41, 43->42. The #999 reference is not a child → it is
 	// kept out of Edges and surfaced in DroppedEdges (not silently discarded).
 	want := []workmgmt.DependsEdge{{From: 42, To: 41}, {From: 43, To: 41}, {From: 43, To: 42}}
@@ -401,6 +410,36 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 		if e != wantDropped[i] {
 			t.Errorf("dropped edge[%d] = %+v, want %+v", i, e, wantDropped[i])
 		}
+	}
+}
+
+// TestParseAutonomyLabel covers the tier extraction: the first autonomy:<tier>
+// label's suffix wins, a non-autonomy label is ignored, no autonomy label
+// yields "" (unknown/default), and an out-of-set tier normalizes to "" so a
+// mislabeled child degrades to the non-human-led default (matching the
+// fail-closed campaign_items.autonomy CHECK) rather than reaching Persist as a
+// value the CHECK rejects.
+func TestParseAutonomyLabel(t *testing.T) {
+	cases := []struct {
+		name   string
+		labels []string
+		want   string
+	}{
+		{"low", []string{"type:feature", "autonomy:low"}, "low"},
+		{"medium", []string{"autonomy:medium"}, "medium"},
+		{"high", []string{"autonomy:high", "area:backend"}, "high"},
+		{"unlabeled", []string{"type:bug", "area:server"}, ""},
+		{"nil labels", nil, ""},
+		{"first autonomy wins", []string{"autonomy:high", "autonomy:low"}, "high"},
+		{"known tier passes through", []string{"autonomy:low"}, "low"},
+		{"out-of-set tier normalizes to empty", []string{"autonomy:bogus"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseAutonomyLabel(tc.labels); got != tc.want {
+				t.Errorf("parseAutonomyLabel(%v) = %q, want %q", tc.labels, got, tc.want)
+			}
+		})
 	}
 }
 

@@ -64,6 +64,11 @@ type AssembledItem struct {
 	IssueRef  string   // e.g. "issue:1441"
 	DependsOn []string // sibling issue refs this item waits on
 	Wave      int      // 0-based topological wave index
+	// Autonomy is the item's autonomy tier (low|medium|high), copied from the
+	// source EpicChild.Autonomy. Empty when the child carried no autonomy label.
+	// Persist threads it onto CreateCampaignItemParams so it reaches the
+	// campaign_items.autonomy column (#1551 / E32.4).
+	Autonomy string
 }
 
 // issueRef formats a child issue number into the campaign `issue:N` ref
@@ -151,10 +156,32 @@ func Assemble(epicRef string, res *workmgmt.EpicChildrenResult) (*Assembly, erro
 			IssueRef:  issueRef(c.Number),
 			DependsOn: deps,
 			Wave:      waveOf[i],
+			// Carry the source child's autonomy tier through so Persist can
+			// stamp campaign_items.autonomy (#1551 / E32.4). Normalize as a
+			// campaign-layer backstop to the fail-closed 0049 CHECK: the parse
+			// boundary already maps an unrecognized `autonomy:<tier>` label to ""
+			// (non-human-led default), but a raw out-of-set tier reaching Assemble
+			// from any other source degrades to "" here rather than aborting the
+			// entire epic campaign with a CHECK violation at Persist.
+			Autonomy: normalizeAutonomy(c.Autonomy),
 		}
 	}
 
 	return &Assembly{EpicRef: epicRef, Items: items, Waves: waves}, nil
+}
+
+// normalizeAutonomy maps an autonomy tier to the set the campaign_items.autonomy
+// CHECK (migration 0049) permits: "", "low", "medium", "high". Any other value
+// (an out-of-set tier that slipped past the label parse boundary) normalizes to
+// "" — the unknown/default tier the engine treats as non-human-led — so a single
+// mislabeled child can never abort persistence of the whole epic campaign.
+func normalizeAutonomy(tier string) string {
+	switch tier {
+	case "low", "medium", "high":
+		return tier
+	default:
+		return ""
+	}
 }
 
 // Persist materializes an Assembly into durable rows via the Repository: it
@@ -188,6 +215,9 @@ func Persist(ctx context.Context, repo Repository, repoName string, a *Assembly)
 			CampaignID: c.ID,
 			IssueRef:   it.IssueRef,
 			DependsOn:  it.DependsOn,
+			// Thread the autonomy tier onto the persisted item so the engine can
+			// read it back for the HumanLed partition (#1551 / E32.4).
+			Autonomy: it.Autonomy,
 		}); err != nil {
 			return nil, fmt.Errorf("campaign: create item %s: %w", it.IssueRef, err)
 		}

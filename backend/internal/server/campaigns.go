@@ -83,7 +83,11 @@ type campaignItemResponse struct {
 // docs/api/v0.openapi.yaml's `CampaignRollup` schema. Slices are
 // normalized to non-nil so the wire shape is always a JSON array.
 type campaignRollupPayload struct {
-	Eligible  []string `json:"eligible"`
+	Eligible []string `json:"eligible"`
+	// HumanLed holds deps-satisfied items carrying autonomy:low — human-led work
+	// diverted out of Eligible so the auto-driver never dispatches it. Like the
+	// other slices it is always an array (never null).
+	HumanLed  []string `json:"human_led"`
 	Blocked   []string `json:"blocked"`
 	Running   []string `json:"running"`
 	Done      []string `json:"done"`
@@ -168,6 +172,7 @@ func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 	}
 	return campaignRollupPayload{
 		Eligible:  nz(e.Eligible),
+		HumanLed:  nz(e.HumanLed),
 		Blocked:   nz(e.Blocked),
 		Running:   nz(e.Running),
 		Done:      nz(e.Done),
@@ -190,9 +195,16 @@ func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 //     auto-driver handed a gate off to a human (E25.7); the campaign is
 //     stalled until the gate is handled and the operator resumes it. Ranked
 //     above start_run so a paused hand-off is surfaced before new dispatch.
-//  3. else any eligible item -> "start_run" on the first eligible ref.
-//  4. else any running or blocked item -> "wait".
-//  5. else (every item terminal done/cancelled) -> "complete".
+//  3. else any eligible (autonomous) item -> "start_run" on the first eligible
+//     ref. start_run WINS over attend_human_led: whenever ANY autonomous item
+//     is dispatchable it is surfaced first, so a human-led item never stalls
+//     DAG-independent autonomous work.
+//  4. else any human-led item -> "attend_human_led" on the first human-led ref.
+//     Fires ONLY when len(Eligible)==0 && len(HumanLed)>0 — every deps-satisfied
+//     item that remains is autonomy:low, reserved for human leadership, so the
+//     operator (not an auto-driver) must pick it up.
+//  5. else any running or blocked item -> "wait".
+//  6. else (every item terminal done/cancelled) -> "complete".
 func computeCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload {
 	switch {
 	case len(e.Failed) > 0:
@@ -212,6 +224,12 @@ func computeCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload
 			Action:   "start_run",
 			IssueRef: e.Eligible[0],
 			Detail:   "this item's dependencies are satisfied and it has no run yet",
+		}
+	case len(e.HumanLed) > 0:
+		return campaignNextActionPayload{
+			Action:   "attend_human_led",
+			IssueRef: e.HumanLed[0],
+			Detail:   "this item's dependencies are satisfied but it is autonomy:low (human-led); a human must lead it — do not dispatch an agent run",
 		}
 	case len(e.Running) > 0 || len(e.Blocked) > 0:
 		return campaignNextActionPayload{

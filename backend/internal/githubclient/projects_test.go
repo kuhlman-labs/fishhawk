@@ -28,8 +28,9 @@ type projectsFake struct {
 	// graphqlByOp maps a marker substring of the query to its 200 body.
 	graphqlByOp map[string]string
 
-	gotCreateBody  []byte
-	gotGraphQLVars map[string]map[string]any // op marker -> variables
+	gotCreateBody   []byte
+	gotGraphQLVars  map[string]map[string]any // op marker -> variables
+	gotGraphQLQuery map[string]string         // op marker -> full query text
 
 	// gotGraphQLAuth records the Authorization header of the most recent
 	// GraphQL request, so token-selection tests can assert which token
@@ -39,7 +40,7 @@ type projectsFake struct {
 
 func newProjectsFake(t *testing.T) (*projectsFake, *Client) {
 	t.Helper()
-	pf := &projectsFake{graphqlByOp: map[string]string{}, gotGraphQLVars: map[string]map[string]any{}}
+	pf := &projectsFake{graphqlByOp: map[string]string{}, gotGraphQLVars: map[string]map[string]any{}, gotGraphQLQuery: map[string]string{}}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /repos/{owner}/{repo}/issues", func(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +67,7 @@ func newProjectsFake(t *testing.T) (*projectsFake, *Client) {
 		for marker, resp := range pf.graphqlByOp {
 			if strings.Contains(body.Query, marker) {
 				pf.gotGraphQLVars[marker] = body.Variables
+				pf.gotGraphQLQuery[marker] = body.Query
 				w.WriteHeader(http.StatusOK)
 				_, _ = io.WriteString(w, resp)
 				return
@@ -304,8 +306,8 @@ func TestAddSubIssue(t *testing.T) {
 func TestListSubIssues_PopulatedMapsNodes(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.graphqlByOp["ListSubIssues"] = `{"data":{"node":{"subIssues":{"nodes":[
-		{"number":41,"title":"slice A","body":"## Summary","id":"N41"},
-		{"number":42,"title":"slice B","body":"Depends on: #41","id":"N42"}
+		{"number":41,"title":"slice A","body":"## Summary","id":"N41","labels":{"nodes":[{"name":"type:feature"},{"name":"autonomy:low"}]}},
+		{"number":42,"title":"slice B","body":"Depends on: #41","id":"N42","labels":{"nodes":[]}}
 	]}}}}`
 	subs, err := c.ListSubIssues(context.Background(), 7, "EPIC_NODE")
 	if err != nil {
@@ -317,11 +319,65 @@ func TestListSubIssues_PopulatedMapsNodes(t *testing.T) {
 	if subs[0].Number != 41 || subs[0].NodeID != "N41" || subs[0].Title != "slice A" {
 		t.Errorf("subs[0] = %+v", subs[0])
 	}
+	// Labels decode alongside the existing number/title/body/id fields; an
+	// empty labels connection yields a nil Labels slice (#1551).
+	if got := strings.Join(subs[0].Labels, ","); got != "type:feature,autonomy:low" {
+		t.Errorf("subs[0].Labels = %q, want type:feature,autonomy:low", got)
+	}
+	if len(subs[1].Labels) != 0 {
+		t.Errorf("subs[1].Labels = %+v, want empty", subs[1].Labels)
+	}
 	if subs[1].Body != "Depends on: #41" {
 		t.Errorf("subs[1].Body = %q", subs[1].Body)
 	}
 	if vars := pf.gotGraphQLVars["ListSubIssues"]; vars["parentId"] != "EPIC_NODE" {
 		t.Errorf("vars = %+v, want parentId=EPIC_NODE", vars)
+	}
+	// The query must request the labels connection so the tier is on the wire.
+	if q := pf.gotGraphQLQuery["ListSubIssues"]; !strings.Contains(q, "labels(first:") {
+		t.Errorf("ListSubIssues query does not request labels: %q", q)
+	}
+}
+
+// TestListSubIssues_AutonomyLabelBeyondFirst20 proves the labels connection is
+// requested with a page size (first:100) large enough to capture an
+// autonomy:low tier that sits past the first 20 labels — GitHub caps an issue
+// at 100 labels, so first:100 is complete by construction and a beyond-20 tier
+// can never be silently dropped (which would resolve Autonomy="" and
+// auto-dispatch a human-led item, the exact risk #1551 closes).
+func TestListSubIssues_AutonomyLabelBeyondFirst20(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	// 24 filler labels, then autonomy:low as the 25th — past a first:20 page.
+	nodes := make([]string, 0, 25)
+	for i := 0; i < 24; i++ {
+		nodes = append(nodes, fmt.Sprintf(`{"name":"filler:%d"}`, i))
+	}
+	nodes = append(nodes, `{"name":"autonomy:low"}`)
+	pf.graphqlByOp["ListSubIssues"] = fmt.Sprintf(
+		`{"data":{"node":{"subIssues":{"nodes":[{"number":41,"title":"slice A","body":"b","id":"N41","labels":{"nodes":[%s]}}]}}}}`,
+		strings.Join(nodes, ","))
+	subs, err := c.ListSubIssues(context.Background(), 7, "EPIC_NODE")
+	if err != nil {
+		t.Fatalf("ListSubIssues: %v", err)
+	}
+	if len(subs) != 1 || len(subs[0].Labels) != 25 {
+		t.Fatalf("subs = %+v, want 1 child with 25 labels", subs)
+	}
+	// The autonomy tier past label 20 must survive the decode so the workmgmt
+	// provider resolves Autonomy=="low" rather than "".
+	var hasLow bool
+	for _, l := range subs[0].Labels {
+		if l == "autonomy:low" {
+			hasLow = true
+		}
+	}
+	if !hasLow {
+		t.Errorf("subs[0].Labels = %v, want it to contain autonomy:low", subs[0].Labels)
+	}
+	// The wire query must request first:100 labels — GitHub's per-issue max —
+	// so no label (and thus no autonomy tier) is ever paged out.
+	if vars := pf.gotGraphQLVars["ListSubIssues"]; vars["labelsFirst"] != float64(100) {
+		t.Errorf("labelsFirst = %v, want 100 (GitHub's max labels per issue)", vars["labelsFirst"])
 	}
 }
 

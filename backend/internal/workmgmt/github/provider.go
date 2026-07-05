@@ -529,7 +529,7 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 	children := make([]workmgmt.EpicChild, 0, len(subs))
 	var edges, dropped []workmgmt.DependsEdge
 	for _, s := range subs {
-		children = append(children, workmgmt.EpicChild{Number: s.Number, Title: s.Title})
+		children = append(children, workmgmt.EpicChild{Number: s.Number, Title: s.Title, Autonomy: parseAutonomyLabel(s.Labels)})
 		for _, dep := range parseDependsOnMarker(s.Body) {
 			if isChild[dep] {
 				edges = append(edges, workmgmt.DependsEdge{From: s.Number, To: dep})
@@ -630,6 +630,37 @@ func parseDependsOnMarker(body string) []int {
 		nums = append(nums, n)
 	}
 	return nums
+}
+
+// autonomyLabelPrefix is the label namespace the campaign autonomy tier is
+// read from. It mirrors the conventions' `autonomy:` namespace (LabelDefaults
+// keys on "autonomy"; the default value is "autonomy:medium") so the tier a
+// filing stamps at creation time is the tier the campaign source reads back.
+const autonomyLabelPrefix = "autonomy:"
+
+// parseAutonomyLabel extracts the autonomy tier from a child issue's labels:
+// the suffix of the first `autonomy:<tier>` label (e.g. "autonomy:low" ->
+// "low"). It returns "" when no autonomy label is present (unknown/default,
+// treated downstream as non-human-led) so the whole namespace lives in one
+// helper — a future tier is one edit. Only the recognized tiers ("", "low",
+// "medium", "high") pass through; an unrecognized tier (a typo like
+// "autonomy:critical") normalizes to "" = non-human-led. This keeps the parse
+// boundary in lockstep with the fail-closed campaign_items.autonomy CHECK
+// (migration 0049): a mislabeled child degrades to the autonomous default
+// rather than aborting the entire epic campaign with a CHECK violation when
+// Persist writes the row.
+func parseAutonomyLabel(labels []string) string {
+	for _, l := range labels {
+		if tier := strings.TrimPrefix(l, autonomyLabelPrefix); tier != l {
+			switch tier {
+			case "low", "medium", "high":
+				return tier
+			default:
+				return ""
+			}
+		}
+	}
+	return ""
 }
 
 // parseIssueRef parses "#123" or "123" into the issue number.

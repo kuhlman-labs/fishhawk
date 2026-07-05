@@ -153,6 +153,72 @@ func TestPersist_AssembleThenReadBack(t *testing.T) {
 	}
 }
 
+// TestPersist_ThreadsAutonomy_SeamReadBack is the BINDING autonomy seam test
+// (#1551 / E32.4, operator binding condition 1): it proves the FULL
+// label→assemble→persist→read path, not merely a CreateCampaignItem round-trip.
+// Starting from an EpicChild carrying Autonomy=="low" (the tier a sibling slice
+// parses off the child's `autonomy:low` label), it runs Assemble → Persist
+// against a real pgtest pool, then reads the campaign_items row back — both
+// through the Repository (asserting Item.Autonomy) AND via a raw column SELECT
+// (asserting the campaign_items.autonomy column itself holds "low"). A sibling
+// child carrying no autonomy label reads back the empty (unknown/default) tier.
+func TestPersist_ThreadsAutonomy_SeamReadBack(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	res := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 41, Autonomy: "low"}, // human-led
+			{Number: 42},                  // no autonomy label → "" default
+		},
+	}
+	a, err := campaign.Assemble("issue:40", res)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	// Assemble must have copied the source tier onto the assembled item before
+	// it ever reached the database (the label→domain hop of the seam).
+	if a.Items[0].Autonomy != "low" {
+		t.Errorf("assembled item[0] autonomy = %q, want low", a.Items[0].Autonomy)
+	}
+	if a.Items[1].Autonomy != "" {
+		t.Errorf("assembled item[1] autonomy = %q, want empty", a.Items[1].Autonomy)
+	}
+
+	c, err := campaign.Persist(ctx, repo, "kuhlman-labs/fishhawk", a)
+	if err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+
+	// Read back through the Repository: the persisted item carries the tier.
+	items, err := repo.ListCampaignItemsForCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("ListCampaignItemsForCampaign: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("persisted %d items, want 2", len(items))
+	}
+	if items[0].IssueRef != "issue:41" || items[0].Autonomy != "low" {
+		t.Errorf("item issue:41 autonomy = %q, want low", items[0].Autonomy)
+	}
+	if items[1].IssueRef != "issue:42" || items[1].Autonomy != "" {
+		t.Errorf("item issue:42 autonomy = %q, want empty", items[1].Autonomy)
+	}
+
+	// Read the raw column too: prove campaign_items.autonomy itself holds the
+	// tier, not merely that the row mapper reconstructs it.
+	var col string
+	if err := pool.QueryRow(ctx,
+		`SELECT autonomy FROM campaign_items WHERE id = $1`, items[0].ID,
+	).Scan(&col); err != nil {
+		t.Fatalf("read autonomy column: %v", err)
+	}
+	if col != "low" {
+		t.Errorf("campaign_items.autonomy column = %q, want low", col)
+	}
+}
+
 // TestPersist_NilAssembly covers the defensive nil-assembly guard.
 func TestPersist_NilAssembly(t *testing.T) {
 	if _, err := campaign.Persist(context.Background(), campaign.BaseFake{}, "repo", nil); err == nil {
