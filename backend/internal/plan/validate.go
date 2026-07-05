@@ -399,6 +399,25 @@ func Warnings(p *Plan) []string {
 				sum, p.PredictedRuntimeMinutes,
 			))
 		}
+
+		if len(p.Decomposition.SubPlans) >= 2 {
+			allEmpty := true
+			for _, sp := range p.Decomposition.SubPlans {
+				if len(sp.DependsOn) > 0 {
+					allEmpty = false
+					break
+				}
+			}
+			if allEmpty {
+				warns = append(warns, fmt.Sprintf(
+					"decomposition has %d sub-plans and none declares depends_on; if any slice forms a producer->consumer chain "+
+						"(a later slice references a symbol an earlier slice introduces), all slices will run in parallel in wave 0 "+
+						"and the consumer may fail typecheck against the not-yet-integrated symbol — declare depends_on edges or "+
+						"confirm the slices are independent (#1679)",
+					len(p.Decomposition.SubPlans),
+				))
+			}
+		}
 	}
 
 	strategy := p.Verification.TestStrategy
