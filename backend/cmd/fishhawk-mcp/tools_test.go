@@ -2936,6 +2936,141 @@ func TestGetPlan_TestSweep_AbsentWhenNoEntry(t *testing.T) {
 	}
 }
 
+// seedPlanWarningsAudit marshals a SERVER-side PlanWarningsPayload and
+// feeds it back through the fake backend as a plan_warnings audit entry.
+// Using the real server type is the point of the seam test (#1684): it
+// exercises the backend-write -> mcp-read JSON contract end to end, so a
+// drift in either side's struct tags fails here rather than silently in
+// production.
+func seedPlanWarningsAudit(fb *fakeBackend, runID uuid.UUID, payload server.PlanWarningsPayload) {
+	raw, _ := json.Marshal(payload)
+	var decoded any
+	_ = json.Unmarshal(raw, &decoded)
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		Category: "plan_warnings",
+		Payload:  decoded,
+	})
+	fb.mu.Unlock()
+}
+
+// TestGetPlan_PlanWarnings_CrossBoundarySeam pins the server -> MCP
+// plan_warnings seam (#1684, binding condition 4): a server-side
+// PlanWarningsPayload {warnings:[...]} round-trips through the audit log
+// and getPlan surfaces it in GetPlanOutput.PlanWarnings.
+func TestGetPlan_PlanWarnings_CrossBoundarySeam(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	seedPlanWarningsAudit(fb, runID, server.PlanWarningsPayload{
+		Warnings: []string{
+			"decomposition has 2 sub-plans and none declares depends_on; if any slice forms a producer->consumer chain",
+		},
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if len(out.PlanWarnings) != 1 {
+		t.Fatalf("len(PlanWarnings) = %d, want 1: %v", len(out.PlanWarnings), out.PlanWarnings)
+	}
+	if !strings.Contains(out.PlanWarnings[0], "none declares depends_on") {
+		t.Errorf("PlanWarnings[0] = %q, want it to mention depends_on", out.PlanWarnings[0])
+	}
+}
+
+// TestGetPlan_PlanWarnings_NewestEntryWins mirrors the sibling sweeps: a
+// schema-retry run writes two plan_warnings entries; the authoritative one
+// is the newest (last, sequence-ascending).
+func TestGetPlan_PlanWarnings_NewestEntryWins(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	seedPlanWarningsAudit(fb, runID, server.PlanWarningsPayload{Warnings: []string{"stale warning"}})
+	seedPlanWarningsAudit(fb, runID, server.PlanWarningsPayload{Warnings: []string{"fresh warning"}})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if len(out.PlanWarnings) != 1 || out.PlanWarnings[0] != "fresh warning" {
+		t.Errorf("PlanWarnings = %v, want [\"fresh warning\"] (newest entry)", out.PlanWarnings)
+	}
+}
+
+// TestGetPlan_PlanWarnings_AbsentWhenNoEntry is the no-fire surfacing
+// case (binding condition 4): a warning-free plan (or an older run
+// predating this pass) writes no plan_warnings entry, so PlanWarnings
+// must be nil/omitted.
+func TestGetPlan_PlanWarnings_AbsentWhenNoEntry(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.PlanWarnings != nil {
+		t.Errorf("PlanWarnings should be nil with no entry; got %v", out.PlanWarnings)
+	}
+}
+
+// TestLoadPlanWarnings_CorruptPayload_DecodesNil pins the corrupt-decode
+// degradation: a plan_warnings entry whose payload doesn't decode to the
+// {warnings:[...]} shape is treated as "not present" rather than an error.
+func TestLoadPlanWarnings_CorruptPayload_DecodesNil(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	// Corrupt entry: payload is a bare string, not an object carrying
+	// "warnings".
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: 1,
+		RunID:    runID.String(),
+		Category: "plan_warnings",
+		Payload:  "not an object",
+	})
+	fb.mu.Unlock()
+
+	r := newResolver(srv, nil)
+	got, err := r.loadPlanWarnings(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("loadPlanWarnings: %v", err)
+	}
+	if got != nil {
+		t.Errorf("got %v, want nil for a corrupt payload", got)
+	}
+}
+
 func TestGetPlan_ReviewAuditError_Surfaced(t *testing.T) {
 	// The per-run audit endpoint returns 500 → the error propagates
 	// through loadPlanReviews and surfaces as a getPlan error.
