@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -199,6 +200,42 @@ func TestRunPlanWarnings_SingleSlice_NoFire(t *testing.T) {
 	}
 	if entries := planWarningsEntries(t, au); len(entries) != 0 {
 		t.Fatalf("plan_warnings entries = %d, want 0", len(entries))
+	}
+	if rr.transitioned {
+		t.Error("runPlanWarnings must never transition the stage")
+	}
+}
+
+// TestRunPlanWarnings_AppendError_FailsOpen pins the fail-open contract on
+// the audit-append leg (binding condition 2 / fix-up concern): a fire case
+// (a >=2-slice all-empty-depends_on decomposition) whose AuditRepo.
+// AppendChained call fails still returns the computed non-nil payload and
+// never transitions the stage — the append error is WARN-logged and
+// swallowed, not propagated.
+func TestRunPlanWarnings_AppendError_FailsOpen(t *testing.T) {
+	s, au, rr := newPlanWarningsServer(t)
+	au.appendErr = errors.New("plan warnings: append boom")
+	body := warningsPlanBody(t, []warningsSubPlan{
+		{title: "Part A", files: []plan.ScopeFile{{Path: "a.go", Operation: plan.FileOpCreate}}},
+		{title: "Part B", files: []plan.ScopeFile{{Path: "b.go", Operation: plan.FileOpCreate}}},
+	})
+
+	got := s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), body)
+
+	if got == nil {
+		t.Fatal("want a non-nil result despite the append failure (fail-open)")
+	}
+	found := false
+	for _, w := range got.Warnings {
+		if strings.Contains(w, "none declares depends_on") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("warnings = %v, want one containing %q", got.Warnings, "none declares depends_on")
+	}
+	if entries := planWarningsEntries(t, au); len(entries) != 0 {
+		t.Fatalf("plan_warnings entries = %d, want 0 (append failed, nothing recorded)", len(entries))
 	}
 	if rr.transitioned {
 		t.Error("runPlanWarnings must never transition the stage")
