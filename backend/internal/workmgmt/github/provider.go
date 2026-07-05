@@ -529,7 +529,11 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 	children := make([]workmgmt.EpicChild, 0, len(subs))
 	var edges, dropped []workmgmt.DependsEdge
 	for _, s := range subs {
-		children = append(children, workmgmt.EpicChild{Number: s.Number, Title: s.Title})
+		children = append(children, workmgmt.EpicChild{
+			Number:   s.Number,
+			Title:    s.Title,
+			Autonomy: workmgmt.AutonomyFromLabels(s.Labels),
+		})
 		for _, dep := range parseDependsOnMarker(s.Body) {
 			if isChild[dep] {
 				edges = append(edges, workmgmt.DependsEdge{From: s.Number, To: dep})

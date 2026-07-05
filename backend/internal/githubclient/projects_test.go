@@ -304,8 +304,8 @@ func TestAddSubIssue(t *testing.T) {
 func TestListSubIssues_PopulatedMapsNodes(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.graphqlByOp["ListSubIssues"] = `{"data":{"node":{"subIssues":{"nodes":[
-		{"number":41,"title":"slice A","body":"## Summary","id":"N41"},
-		{"number":42,"title":"slice B","body":"Depends on: #41","id":"N42"}
+		{"number":41,"title":"slice A","body":"## Summary","id":"N41","labels":{"nodes":[{"name":"autonomy:low"},{"name":"type:feature"}]}},
+		{"number":42,"title":"slice B","body":"Depends on: #41","id":"N42","labels":{"nodes":[]}}
 	]}}}}`
 	subs, err := c.ListSubIssues(context.Background(), 7, "EPIC_NODE")
 	if err != nil {
@@ -316,6 +316,14 @@ func TestListSubIssues_PopulatedMapsNodes(t *testing.T) {
 	}
 	if subs[0].Number != 41 || subs[0].NodeID != "N41" || subs[0].Title != "slice A" {
 		t.Errorf("subs[0] = %+v", subs[0])
+	}
+	// Label names decode from the GraphQL labels.nodes connection so the
+	// campaign engine can read the autonomy:* tier (#1551).
+	if len(subs[0].Labels) != 2 || subs[0].Labels[0] != "autonomy:low" || subs[0].Labels[1] != "type:feature" {
+		t.Errorf("subs[0].Labels = %v, want [autonomy:low type:feature]", subs[0].Labels)
+	}
+	if len(subs[1].Labels) != 0 {
+		t.Errorf("subs[1].Labels = %v, want empty (no labels)", subs[1].Labels)
 	}
 	if subs[1].Body != "Depends on: #41" {
 		t.Errorf("subs[1].Body = %q", subs[1].Body)

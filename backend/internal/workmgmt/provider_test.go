@@ -131,6 +131,28 @@ func TestRegistry_DispatchTransition(t *testing.T) {
 	}
 }
 
+func TestAutonomyFromLabels(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		labels []string
+		want   string
+	}{
+		{"low", []string{"area:backend", "autonomy:low", "phase:mvp", "type:feature"}, "low"},
+		{"medium", []string{"autonomy:medium"}, "medium"},
+		{"high", []string{"type:bug", "autonomy:high"}, "high"},
+		{"unlabelled defaults empty", []string{"area:backend", "type:feature"}, ""},
+		{"nil labels defaults empty", nil, ""},
+		{"first autonomy label wins", []string{"autonomy:low", "autonomy:high"}, "low"},
+		{"prefix-only yields empty suffix", []string{"autonomy:"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := AutonomyFromLabels(tc.labels); got != tc.want {
+				t.Errorf("AutonomyFromLabels(%v) = %q, want %q", tc.labels, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRegistry_DispatchEpicChildren(t *testing.T) {
 	fp := &fakeProvider{name: "test_provider_epic_children"}
 	Register(fp)

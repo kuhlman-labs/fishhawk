@@ -108,10 +108,35 @@ type EpicChildrenResult struct {
 	DroppedEdges []DependsEdge
 }
 
-// EpicChild is one child issue of an epic: its number and title.
+// EpicChild is one child issue of an epic: its number, title, and autonomy
+// tier. Autonomy is the child's declared autonomy:* label suffix — "", "low",
+// "medium", or "high" (empty when the child carries no autonomy:* label). The
+// campaign engine reads it to route a dependency-satisfied autonomy:low child
+// to the human-led (page-the-human) slice rather than dispatching it (#1551).
 type EpicChild struct {
-	Number int
-	Title  string
+	Number   int
+	Title    string
+	Autonomy string
+}
+
+// autonomyPrefix is the conventional label prefix (AGENTS.md) carrying the
+// autonomy tier on every impl issue, e.g. "autonomy:low".
+const autonomyPrefix = "autonomy:"
+
+// AutonomyFromLabels returns the autonomy tier parsed from the first label
+// carrying the autonomy: prefix (the suffix after the colon — "low", "medium",
+// or "high"). It returns "" when no autonomy:* label is present, the conservative
+// non-human-led default that preserves the pre-#1551 behavior for an unlabelled
+// child. Only the tier value is returned; validation of the suffix against the
+// known set is the persistence layer's fail-closed CHECK, not this parse. It is
+// exported so the GitHub provider (a sibling package) can stamp EpicChild.Autonomy.
+func AutonomyFromLabels(labels []string) string {
+	for _, l := range labels {
+		if strings.HasPrefix(l, autonomyPrefix) {
+			return strings.TrimPrefix(l, autonomyPrefix)
+		}
+	}
+	return ""
 }
 
 // DependsEdge is one depends_on edge over the sibling set: From depends on

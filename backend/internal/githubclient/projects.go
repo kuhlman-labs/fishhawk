@@ -538,13 +538,21 @@ func (c *Client) AddSubIssue(ctx context.Context, installationID int64, parentNo
 
 // SubIssue is the slice of a sub-issue connection node the work-management
 // epic-children query consumes: the child issue's human Number, GraphQL
-// NodeID, Title, and Body (the depends_on body marker is parsed from Body).
+// NodeID, Title, Body (the depends_on body marker is parsed from Body), and
+// Labels (the campaign engine reads the autonomy:* label from them, #1551).
 type SubIssue struct {
 	Number int
 	NodeID string
 	Title  string
 	Body   string
+	Labels []string
 }
+
+// listSubIssuesLabels is the per-child labels connection page size read
+// alongside each sub-issue. The autonomy:* label the campaign engine keys on
+// sits among the four conventional labels (area/autonomy/phase/type), so 20 is
+// ample headroom; a child with more than 20 labels reads only the first 20.
+const listSubIssuesLabels = 20
 
 // listSubIssuesFirst is the sub-issues connection page size. v0 reads a
 // single first:100 page — an epic with more than 100 children is out of
@@ -553,9 +561,9 @@ type SubIssue struct {
 const listSubIssuesFirst = 100
 
 // ListSubIssues returns the sub-issues (children) of the issue identified by
-// parentNodeID — its number, node id, title, and body.
+// parentNodeID — its number, node id, title, body, and label names.
 //
-//	query node(id: $parentId) { ... on Issue { subIssues(first: 100) { nodes { number title body id } } } }
+//	query node(id: $parentId) { ... on Issue { subIssues(first: 100) { nodes { number title body id labels(first: 20) { nodes { name } } } } } }
 //
 // It reads a SINGLE first:100 page (listSubIssuesFirst); a parent with more
 // than 100 sub-issues is truncated to the first 100 — out of scope for the
@@ -570,7 +578,7 @@ func (c *Client) ListSubIssues(ctx context.Context, installationID int64, parent
 	if parentNodeID == "" {
 		return nil, errors.New("githubclient: parent node id required")
 	}
-	const query = `query ListSubIssues($parentId: ID!, $first: Int!) {
+	const query = `query ListSubIssues($parentId: ID!, $first: Int!, $labels: Int!) {
   node(id: $parentId) {
     ... on Issue {
       subIssues(first: $first) {
@@ -579,6 +587,11 @@ func (c *Client) ListSubIssues(ctx context.Context, installationID int64, parent
           title
           body
           id
+          labels(first: $labels) {
+            nodes {
+              name
+            }
+          }
         }
       }
     }
@@ -592,6 +605,11 @@ func (c *Client) ListSubIssues(ctx context.Context, installationID int64, parent
 					Title  string `json:"title"`
 					Body   string `json:"body"`
 					ID     string `json:"id"`
+					Labels struct {
+						Nodes []struct {
+							Name string `json:"name"`
+						} `json:"nodes"`
+					} `json:"labels"`
 				} `json:"nodes"`
 			} `json:"subIssues"`
 		} `json:"node"`
@@ -599,6 +617,7 @@ func (c *Client) ListSubIssues(ctx context.Context, installationID int64, parent
 	if err := c.doGraphQL(ctx, installationID, query, map[string]any{
 		"parentId": parentNodeID,
 		"first":    listSubIssuesFirst,
+		"labels":   listSubIssuesLabels,
 	}, &data); err != nil {
 		return nil, err
 	}
@@ -607,7 +626,13 @@ func (c *Client) ListSubIssues(ctx context.Context, installationID int64, parent
 	}
 	results := make([]SubIssue, 0, len(data.Node.SubIssues.Nodes))
 	for _, n := range data.Node.SubIssues.Nodes {
-		results = append(results, SubIssue{Number: n.Number, NodeID: n.ID, Title: n.Title, Body: n.Body})
+		var labels []string
+		for _, l := range n.Labels.Nodes {
+			if l.Name != "" {
+				labels = append(labels, l.Name)
+			}
+		}
+		results = append(results, SubIssue{Number: n.Number, NodeID: n.ID, Title: n.Title, Body: n.Body, Labels: labels})
 	}
 	return results, nil
 }

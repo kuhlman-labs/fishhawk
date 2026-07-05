@@ -404,6 +404,38 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 	}
 }
 
+// TestProvider_EpicChildren_StampsAutonomyFromLabels drives EpicChildren
+// against sub-issues carrying autonomy:* labels and asserts each
+// EpicChild.Autonomy is the parsed tier — an autonomy:low child yields "low"
+// and an unlabelled child yields "" (the conservative non-human-led default).
+// This is the source half of the #1551 autonomy plumbing.
+func TestProvider_EpicChildren_StampsAutonomyFromLabels(t *testing.T) {
+	api := &fakeAPI{
+		parentNode: "EPIC_NODE",
+		listSubResults: []githubclient.SubIssue{
+			{Number: 41, NodeID: "N41", Title: "human-led slice", Body: "no deps", Labels: []string{"area:backend", "autonomy:low", "type:feature"}},
+			{Number: 42, NodeID: "N42", Title: "autonomous slice", Body: "no deps", Labels: []string{"autonomy:high"}},
+			{Number: 43, NodeID: "N43", Title: "unlabelled slice", Body: "no deps", Labels: nil},
+		},
+	}
+	res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+		Target: workmgmt.Target{InstallationID: 99, Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Epic:   "#1005",
+	})
+	if err != nil {
+		t.Fatalf("EpicChildren: %v", err)
+	}
+	wantAutonomy := map[int]string{41: "low", 42: "high", 43: ""}
+	if len(res.Children) != len(wantAutonomy) {
+		t.Fatalf("children = %+v, want %d", res.Children, len(wantAutonomy))
+	}
+	for _, c := range res.Children {
+		if got := c.Autonomy; got != wantAutonomy[c.Number] {
+			t.Errorf("child #%d Autonomy = %q, want %q", c.Number, got, wantAutonomy[c.Number])
+		}
+	}
+}
+
 // TestProvider_EpicChildren_FailClosed covers the defensive branches: a nil
 // API, a missing repo, a zero installation, a malformed epic ref, and a
 // ListSubIssues error each return an error rather than a partial result.
