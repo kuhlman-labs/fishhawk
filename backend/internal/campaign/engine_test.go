@@ -108,6 +108,34 @@ func TestNextEligible_PausedBucketed(t *testing.T) {
 	}
 }
 
+// TestNextEligible_HumanLedDiverted is the E32.4 (#1551) done-means: over a
+// mixed-autonomy DAG, a deps-satisfied autonomy:low item is diverted to
+// HumanLed (never Eligible) while an autonomous sibling lands in Eligible, and
+// a deps-UNsatisfied autonomy:low item stays Blocked (not HumanLed).
+func TestNextEligible_HumanLedDiverted(t *testing.T) {
+	items := []*campaign.Item{
+		item("issue:1", campaign.ItemStateSucceeded, nil), // done — satisfies deps below
+		// deps satisfied, autonomy:low → human-led (diverted out of Eligible).
+		{IssueRef: "issue:2", State: campaign.ItemStatePending, DependsOn: []string{"issue:1"}, Autonomy: "low"},
+		// deps satisfied, autonomy:high → eligible (autonomous sibling).
+		{IssueRef: "issue:3", State: campaign.ItemStatePending, DependsOn: []string{"issue:1"}, Autonomy: "high"},
+		// deps satisfied, autonomy unset → eligible (unknown defaults to non-human-led).
+		{IssueRef: "issue:4", State: campaign.ItemStatePending, DependsOn: []string{"issue:1"}},
+		// deps UNsatisfied, autonomy:low → stays Blocked, NOT HumanLed.
+		{IssueRef: "issue:5", State: campaign.ItemStatePending, DependsOn: []string{"issue:999"}, Autonomy: "low"},
+	}
+	got := campaign.NextEligible(items)
+	want := campaign.Eligibility{
+		Eligible: []string{"issue:3", "issue:4"},
+		HumanLed: []string{"issue:2"},
+		Blocked:  []string{"issue:5"},
+		Done:     []string{"issue:1"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("NextEligible =\n  %+v\nwant\n  %+v", got, want)
+	}
+}
+
 // TestDeriveState exercises one assertion per derived branch: pending,
 // running, succeeded, failed. StateCancelled/StatePaused are operator overlays
 // and are intentionally never derived.

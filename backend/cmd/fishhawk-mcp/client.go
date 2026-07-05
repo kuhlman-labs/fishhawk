@@ -1300,7 +1300,10 @@ type CampaignItem struct {
 // (`campaignRollupPayload`): the engine's readiness partition over a campaign's
 // items. Every slice holds issue refs and an item appears in exactly one slice.
 type CampaignRollup struct {
-	Eligible  []string `json:"eligible"`
+	Eligible []string `json:"eligible"`
+	// HumanLed holds deps-satisfied autonomy:low items diverted out of Eligible
+	// (human-led work the auto-driver must never dispatch).
+	HumanLed  []string `json:"human_led"`
 	Blocked   []string `json:"blocked"`
 	Running   []string `json:"running"`
 	Done      []string `json:"done"`
@@ -1312,7 +1315,8 @@ type CampaignRollup struct {
 // CampaignNextAction mirrors the backend's `campaignNextActionPayload`: the
 // single server-computed next step for the operator-agent, distilled from the
 // rollup partition. Action is drawn from the closed set
-// attention|resume|start_run|wait|complete (computeCampaignNextAction).
+// attention|resume|start_run|attend_human_led|wait|complete
+// (computeCampaignNextAction).
 type CampaignNextAction struct {
 	Action   string `json:"action"`
 	IssueRef string `json:"issue_ref,omitempty"`

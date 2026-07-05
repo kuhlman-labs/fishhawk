@@ -1141,6 +1141,27 @@ func TestCampaignNextActionsFor_StartRun(t *testing.T) {
 	}
 }
 
+// TestCampaignNextActionsFor_AttendHumanLed asserts the attend_human_led arm
+// returns the classified campaign_attend_human_led state (NOT the unclassified
+// fallback) with a non-dispatch, page-the-human suggested action that consumes
+// nothing — the operator-agent must lead the item by hand, not mint a run.
+func TestCampaignNextActionsFor_AttendHumanLed(t *testing.T) {
+	na := campaignNextActionsFor(CampaignRollup{HumanLed: []string{"#12"}}, caNextAction("attend_human_led", "#12"))
+	if na.State != "campaign_attend_human_led" {
+		t.Errorf("State = %q, want campaign_attend_human_led", na.State)
+	}
+	if len(na.Actions) == 0 {
+		t.Fatalf("attend_human_led must carry at least one action")
+	}
+	got := na.Actions[0]
+	if got.Action == "fishhawk_start_run" {
+		t.Errorf("action = %q, human-led work must NOT recommend fishhawk_start_run", got.Action)
+	}
+	if got.Consumes != consumesNone {
+		t.Errorf("consumes = %q, want none (no run minted for human-led work)", got.Consumes)
+	}
+}
+
 func TestCampaignNextActionsFor_Wait(t *testing.T) {
 	na := campaignNextActionsFor(CampaignRollup{Running: []string{"#29"}}, caNextAction("wait", ""))
 	if na.State != "campaign_wait" {
