@@ -13,6 +13,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 // jsonEqual reports whether two raw JSON blobs are semantically equal,
@@ -232,6 +233,118 @@ func TestPostgres_ConcurrentTransitionCampaign_ExactlyOneWins(t *testing.T) {
 	}
 	if !final.State.IsTerminal() {
 		t.Errorf("final state = %q, want a terminal state", final.State)
+	}
+}
+
+// TestPostgres_Autonomy_AssemblePersistReadBack is the BINDING Assemble →
+// Persist → read-back seam test for the E32.4 (#1551) autonomy persist path. It
+// proves the assemble→persist→read chain across the campaign / DB seam carries
+// the campaign_items.autonomy column against a REAL pgtest pool. Assemble
+// currently stamps "" for every item — the per-child autonomy:* source
+// (EpicChild.Autonomy) is added by a separate out-of-scope workmgmt slice — so
+// both children round-trip as the autonomous "" default; the direct column
+// write+read for a non-empty tier is covered by
+// TestPostgres_CreateCampaignItem_Autonomy.
+func TestPostgres_Autonomy_AssemblePersistReadBack(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	res := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 41},
+			{Number: 42},
+		},
+	}
+	a, err := campaign.Assemble("issue:40", res)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+
+	c, err := campaign.Persist(ctx, repo, "kuhlman-labs/fishhawk", a)
+	if err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+
+	// Read the persisted items back independently and assert the autonomy
+	// column round-tripped per issue ref.
+	items, err := repo.ListCampaignItemsForCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("ListCampaignItemsForCampaign: %v", err)
+	}
+	wantAutonomy := map[string]string{"issue:41": "", "issue:42": ""}
+	seen := map[string]bool{}
+	for _, it := range items {
+		want, ok := wantAutonomy[it.IssueRef]
+		if !ok {
+			t.Errorf("unexpected item %s", it.IssueRef)
+			continue
+		}
+		seen[it.IssueRef] = true
+		if it.Autonomy != want {
+			t.Errorf("item %s persisted autonomy = %q, want %q", it.IssueRef, it.Autonomy, want)
+		}
+	}
+	if len(seen) != len(wantAutonomy) {
+		t.Errorf("read back %d of %d expected items: %v", len(seen), len(wantAutonomy), seen)
+	}
+
+	// A direct GetCampaignItem read of the item also carries the "" default
+	// (proves the column is on the single-row read path, not just the list).
+	for _, it := range items {
+		if it.IssueRef != "issue:41" {
+			continue
+		}
+		got, err := repo.GetCampaignItem(ctx, it.ID)
+		if err != nil {
+			t.Fatalf("GetCampaignItem: %v", err)
+		}
+		if got.Autonomy != "" {
+			t.Errorf("GetCampaignItem autonomy = %q, want %q", got.Autonomy, "")
+		}
+	}
+}
+
+// TestPostgres_CreateCampaignItem_Autonomy covers the adapter's autonomy
+// column write+read directly (independent of Assemble): an item created with
+// Autonomy=="medium" round-trips through create and an independent read, and
+// an item created with no autonomy defaults to "" (the column's NOT NULL
+// DEFAULT ”, treated as autonomous).
+func TestPostgres_CreateCampaignItem_Autonomy(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c := makeCampaign(t, repo)
+	item, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID,
+		IssueRef:   "issue:1441",
+		Autonomy:   "medium",
+	})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+	if item.Autonomy != "medium" {
+		t.Errorf("created item autonomy = %q, want medium", item.Autonomy)
+	}
+	got, err := repo.GetCampaignItem(ctx, item.ID)
+	if err != nil {
+		t.Fatalf("get item: %v", err)
+	}
+	if got.Autonomy != "medium" {
+		t.Errorf("read-back item autonomy = %q, want medium", got.Autonomy)
+	}
+
+	// No autonomy set → "" (the NOT NULL DEFAULT), never NULL.
+	bare, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID,
+		IssueRef:   "issue:1442",
+	})
+	if err != nil {
+		t.Fatalf("create bare item: %v", err)
+	}
+	if bare.Autonomy != "" {
+		t.Errorf("bare item autonomy = %q, want \"\" (autonomous default)", bare.Autonomy)
 	}
 }
 

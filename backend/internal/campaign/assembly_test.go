@@ -55,6 +55,33 @@ func TestAssemble_MultiWaveDAG(t *testing.T) {
 	}
 }
 
+// TestAssemble_DefaultsAutonomy asserts Assemble stamps each AssembledItem's
+// Autonomy as "" (the autonomous default the readiness partition treats as
+// eligible). The per-child autonomy:* tier is sourced by a separate workmgmt
+// slice that adds EpicChild.Autonomy (E32.4 / #1551), which is out of this
+// scope, so EpicChildrenResult carries no per-child tier and every assembled
+// item flows through as "". The persist half of the path (the
+// campaign_items.autonomy column) is exercised directly in postgres_test.go.
+func TestAssemble_DefaultsAutonomy(t *testing.T) {
+	res := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 41},
+			{Number: 42},
+			{Number: 43},
+			{Number: 44},
+		},
+	}
+	a, err := campaign.Assemble("issue:40", res)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	for _, it := range a.Items {
+		if got := it.Autonomy; got != "" {
+			t.Errorf("item %s Autonomy = %q, want %q (autonomous default)", it.IssueRef, got, "")
+		}
+	}
+}
+
 // TestAssemble_CycleRejected asserts a cyclic depends_on graph fails closed
 // with ErrCycle.
 func TestAssemble_CycleRejected(t *testing.T) {

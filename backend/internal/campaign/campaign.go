@@ -186,6 +186,13 @@ type Item struct {
 	// PauseReason carries why a paused item was handed off to a human. Nil
 	// unless the item is (or was) paused. Persisted as JSONB.
 	PauseReason *PauseReason
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// Autonomy is the item's autonomy tier sourced from the epic child's
+	// GitHub labels ("", "low", "medium", or "high"), persisted on
+	// campaign_items.autonomy (E32.4 / #1551). The readiness partition routes
+	// a "low" (human-led) item to a separate slice so the auto-driver never
+	// dispatches it; "" (unlabelled) is treated as autonomous — the
+	// non-regressing default that preserves pre-E32.4 behavior.
+	Autonomy  string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }

@@ -64,6 +64,11 @@ type AssembledItem struct {
 	IssueRef  string   // e.g. "issue:1441"
 	DependsOn []string // sibling issue refs this item waits on
 	Wave      int      // 0-based topological wave index
+	// Autonomy is the tier stamped from the source EpicChild's autonomy:*
+	// label ("", "low", "medium", or "high"), carried through Persist onto
+	// campaign_items.autonomy (E32.4 / #1551). "" (unlabelled) is the
+	// conservative default treated as autonomous by the readiness partition.
+	Autonomy string
 }
 
 // issueRef formats a child issue number into the campaign `issue:N` ref
@@ -151,6 +156,14 @@ func Assemble(epicRef string, res *workmgmt.EpicChildrenResult) (*Assembly, erro
 			IssueRef:  issueRef(c.Number),
 			DependsOn: deps,
 			Wave:      waveOf[i],
+			// Autonomy defaults to "" (the autonomous default) here. The
+			// per-child autonomy:* tier is sourced by a separate workmgmt
+			// slice that adds EpicChild.Autonomy (E32.4 / #1551); that field is
+			// not part of this scope, so EpicChildrenResult carries no per-child
+			// tier yet and every assembled item flows through as "". The
+			// persist/read-back plumbing below already carries the column, so it
+			// will stamp a real tier unchanged once the source field lands.
+			Autonomy: "",
 		}
 	}
 
@@ -188,6 +201,9 @@ func Persist(ctx context.Context, repo Repository, repoName string, a *Assembly)
 			CampaignID: c.ID,
 			IssueRef:   it.IssueRef,
 			DependsOn:  it.DependsOn,
+			// Thread the assembled autonomy tier straight onto the persisted
+			// item (E32.4 / #1551). "" for an unlabelled item.
+			Autonomy: it.Autonomy,
 		}); err != nil {
 			return nil, fmt.Errorf("campaign: create item %s: %w", it.IssueRef, err)
 		}

@@ -154,6 +154,10 @@ func (r *postgresRepo) CreateCampaignItem(ctx context.Context, p CreateCampaignI
 		IssueRef:   p.IssueRef,
 		DependsOn:  dependsOn,
 		State:      string(ItemStatePending),
+		// Autonomy tier ("", "low", "medium", "high") sourced from the epic
+		// child's labels (E32.4 / #1551). An unset value is "" — the column's
+		// NOT NULL DEFAULT '' matches, and the CHECK admits it.
+		Autonomy: p.Autonomy,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create campaign item: %w", err)
@@ -334,8 +338,12 @@ func rowToCampaignItem(i campaigndb.CampaignItem) *Item {
 		IssueRef:   i.IssueRef,
 		RunID:      i.RunID,
 		State:      ItemState(i.State),
-		CreatedAt:  i.CreatedAt.Time,
-		UpdatedAt:  i.UpdatedAt.Time,
+		// Autonomy tier column → domain, a plain passthrough. '' (the
+		// NOT NULL DEFAULT for pre-E32.4 rows and unlabelled items) round-trips
+		// as "", treated as autonomous by the readiness partition.
+		Autonomy:  i.Autonomy,
+		CreatedAt: i.CreatedAt.Time,
+		UpdatedAt: i.UpdatedAt.Time,
 	}
 	// JSONB → []string. An empty/NULL payload yields a nil slice (no
 	// dependencies). Tolerate a malformed blob by dropping it rather than
