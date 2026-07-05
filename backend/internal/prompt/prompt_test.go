@@ -4580,6 +4580,111 @@ func TestBuild_Implement_CommitMessage_AbsentOnFullImplement(t *testing.T) {
 	}
 }
 
+func TestImplementCommitMessagePath_Format(t *testing.T) {
+	// #1686 (format-drift, binding condition 1): assert the LITERAL path string
+	// with concrete ids — NOT the function output — so a one-sided edit to any of
+	// the three modules' format strings (backend prompt, runner, CLI) is caught.
+	// The runner's TestImplementCommitMessagePath_Format and the CLI's assert the
+	// byte-identical literal for the SAME ids.
+	const runID = "11112222333344445555666677778888"
+	const stageID = "99990000aaaabbbbccccddddeeeeffff"
+	got := ImplementCommitMessagePath(runID, stageID)
+	want := "/tmp/fishhawk-implement-commitmsg-" + runID + "-" + stageID + ".txt"
+	if got != want {
+		t.Errorf("ImplementCommitMessagePath = %q, want %q", got, want)
+	}
+}
+
+func TestBuild_Implement_CommitMessage_RendersKeyedPathAndInstruction(t *testing.T) {
+	// #1686: the FULL implement prompt renders the dedicated commit-message block
+	// with the run/stage-keyed sidecar path (asserted as the fully-substituted
+	// LITERAL, binding condition 1) and the Conventional-Commits instruction —
+	// while the PR-description block (title/body from /tmp/fishhawk-pr.md) stays
+	// unchanged (binding condition 4). No FixupConcerns → full buildImplement.
+	const runID = "11112222333344445555666677778888"
+	const stageID = "99990000aaaabbbbccccddddeeeeffff"
+	got, err := Build("implement", Trigger{
+		Repo:             "o/r",
+		ApprovedPlan:     fixturePlan(),
+		ImplementRunID:   runID,
+		ImplementStageID: stageID,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wantPath := "/tmp/fishhawk-implement-commitmsg-" + runID + "-" + stageID + ".txt"
+	for _, w := range []string{
+		"### Write the commit message",
+		"Conventional Commits v1.0.0 message",
+		wantPath,
+		"`type(scope): description`",
+		"`feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `perf`, `build`",
+		"the commit message ONLY",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement commit-message prompt missing %q\n---\n%s", w, got)
+		}
+	}
+	// Binding condition 4: the PR-description block is untouched — the PR title
+	// and body still come from PullRequestDescriptionPath with the same sections.
+	for _, w := range []string{
+		"write a pull-request description to `" + PullRequestDescriptionPath + "`",
+		"`## Summary`",
+		"`## Test plan`",
+		"it becomes BOTH the PR title and the commit subject",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("PR-description block must be unchanged, missing %q\n---\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_Implement_CommitMessage_AbsentWhenIDsUnset(t *testing.T) {
+	// #1686: a full implement trigger missing the run/stage ids omits the commit-
+	// message section rather than rendering a malformed (unkeyed) sidecar path —
+	// same guard-shape as the scope-self-exempt / self-report sections.
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		ApprovedPlan: fixturePlan(),
+		// ImplementRunID / ImplementStageID deliberately empty.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Write the commit message") {
+		t.Errorf("commit-message block must be absent when run/stage ids are unset:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementFixup_DoesNotRenderImplementCommitMessage(t *testing.T) {
+	// #1686 (binding condition 5): the slim fix-up prompt keeps its OWN per-pass
+	// commit-message block and must NOT render the full-implement one, so a fix-up
+	// never re-uses the initial-implement sidecar. FixupConcerns routes to
+	// buildImplementFixup.
+	const runID = "11112222333344445555666677778888"
+	const stageID = "99990000aaaabbbbccccddddeeeeffff"
+	got, err := Build("implement", Trigger{
+		Repo:             "o/r",
+		ApprovedPlan:     fixturePlan(),
+		FixupConcerns:    []string{"[medium] tighten the bound check"},
+		ImplementRunID:   runID,
+		ImplementStageID: stageID,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "### Write the commit message") {
+		t.Errorf("full-implement commit-message block must be absent on the fix-up path:\n%s", got)
+	}
+	if strings.Contains(got, ImplementCommitMessagePath(runID, stageID)) {
+		t.Errorf("fix-up prompt must NOT reference the initial-implement sidecar path:\n%s", got)
+	}
+	// The fix-up path keeps its own per-pass block (#1572).
+	if !strings.Contains(got, "### Write this pass's commit message") {
+		t.Errorf("fix-up prompt must still render its own per-pass commit-message block:\n%s", got)
+	}
+}
+
 func TestBuild_ImplementFixup_SelfReport_RendersKeyedPathAndLiterals(t *testing.T) {
 	// #1210: the slim fix-up prompt renders the verify-outcome self-report block
 	// with the run/stage-keyed sidecar path, the literal run_id/stage_id, and BOTH

@@ -65,6 +65,80 @@ func shortID(id uuid.UUID) string {
 	return s[:8]
 }
 
+// implementCommitMessageDir is the directory the run/stage-keyed INITIAL-implement
+// commit-message sidecar lives in (#1686). var (not const) so tests can redirect
+// it to a t.TempDir, avoiding /tmp pollution / parallel-test races — the same seam
+// pattern as prDescriptionPath.
+var implementCommitMessageDir = "/tmp"
+
+// implementCommitMessagePath mirrors prompt.ImplementCommitMessagePath in the
+// backend and the runner's implementCommitMessagePath: the run/stage-keyed path
+// the initial implement agent writes its clean Conventional-Commits commit message
+// to and the CLI reads it from on the local --no-pr commit path (#1686). The
+// format string is hardcoded in all three independent modules by design — a
+// one-sided edit is caught by the prompt-render test plus the runner and CLI load
+// tests, which each assert the byte-identical literal for the same ids.
+func implementCommitMessagePath(runID, stageID string) string {
+	return implementCommitMessageDir + "/" + fmt.Sprintf("fishhawk-implement-commitmsg-%s-%s.txt", runID, stageID)
+}
+
+// loadImplementCommitMessage reads the agent's initial-implement commit-message
+// sidecar (#1686) and splits it into (subject, body). It deletes the file on
+// EVERY return path (delete-after-read) so a stale sidecar can never bleed into a
+// later run/stage. Returns ok=false when the sidecar is absent, unreadable, or
+// empty/whitespace-only — the fallback cases the caller resolves to today's
+// title + "\n\n" + body. On success the first line is the subject and the
+// remainder after it is the body. The runner subprocess already swept a stale
+// sidecar pre-invoke, so this path only READS.
+func loadImplementCommitMessage(runID, stageID string) (subject, body string, ok bool) {
+	path := implementCommitMessagePath(runID, stageID)
+	raw, readErr := os.ReadFile(path)
+	if readErr != nil {
+		// Absent sidecar is the common no-op (an older agent wrote nothing); any
+		// other read error is fail-closed too.
+		return "", "", false
+	}
+	// A present sidecar is consumed regardless of outcome: remove it on every
+	// return path so a stale sidecar is never reused by a later run/stage.
+	defer func() { _ = os.Remove(path) }()
+
+	text := strings.TrimSpace(strings.ReplaceAll(string(raw), "\r\n", "\n"))
+	if text == "" {
+		_, _ = fmt.Fprintf(os.Stderr,
+			`{"event":"implement_commitmsg_empty","path":%q}`+"\n", path)
+		return "", "", false
+	}
+	lines := strings.SplitN(text, "\n", 2)
+	subject = strings.TrimSpace(lines[0])
+	if len(lines) == 2 {
+		body = strings.TrimSpace(lines[1])
+	}
+	return subject, body, true
+}
+
+// implementCommitMessage resolves the commit message for the INITIAL implement
+// commit on the local --no-pr path (#1686): the agent-authored clean sidecar
+// (consumed + deleted by loadImplementCommitMessage), falling back to EXACTLY
+// today's title + "\n\n" + body when the sidecar is absent/empty — no synthetic
+// subject, so an older agent that writes no sidecar sees no behavior change.
+// title/body are the PR title/body sourced unchanged from /tmp/fishhawk-pr.md.
+func implementCommitMessage(runID, stageID, title, body string) string {
+	if subject, sidecarBody, ok := loadImplementCommitMessage(runID, stageID); ok {
+		// Warn-only conventional-commit header check on the sidecar subject,
+		// matching the PR-title warn — advisory, never a rewrite or hard failure.
+		if !conventionalCommitHeaderRe.MatchString(subject) {
+			_, _ = fmt.Fprintf(os.Stderr,
+				`{"event":"implement_commitmsg_warning","reason":%q}`+"\n",
+				"sidecar subject is not a conventional-commit header")
+		}
+		if sidecarBody == "" {
+			return subject
+		}
+		return subject + "\n\n" + sidecarBody
+	}
+	return title + "\n\n" + body
+}
+
 // autoOpenPRArgs is the input bag for autoOpenPR.
 type autoOpenPRArgs struct {
 	WorkingDir string
@@ -235,7 +309,12 @@ func autoOpenPR(ctx context.Context, client *httpclient.Client, args autoOpenPRA
 		return nil, fmt.Errorf("autopr: git add -A: %w\n%s", addErr, out)
 	}
 
-	commitMsg := title + "\n\n" + body
+	// Initial implement commit message (#1686): prefer the agent's clean
+	// Conventional-Commits sidecar (delete-after-read), falling back to today's
+	// title + "\n\n" + body when absent — so the local --no-pr commit no longer
+	// stuffs the whole PR review body into its message. The PR title/body still
+	// come from /tmp/fishhawk-pr.md unchanged.
+	commitMsg := implementCommitMessage(args.RunID.String(), args.StageID.String(), title, body)
 	commitOut, commitErr := autoGitCommand("git", "-C", args.WorkingDir,
 		"commit", "--signoff", "-m", commitMsg).CombinedOutput()
 	if commitErr != nil {

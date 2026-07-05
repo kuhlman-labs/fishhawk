@@ -928,6 +928,13 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// message. No-ops on every non-fix-up implement stage (the sidecar is
 		// fix-up-only).
 		sweepStaleFixupCommitMessage(cfg, logSink)
+		// Pre-invoke initial-implement commit-message sweep (#1686): delete any
+		// leftover commit-message sidecar at THIS run/stage's keyed path before
+		// the agent runs, so a retry whose agent never re-writes the file falls
+		// back to today's title + body rather than reusing a PRIOR attempt's
+		// message. Fires on both the GHA and local paths (the runner subprocess
+		// always invokes the agent, even under --no-pr).
+		sweepStaleImplementCommitMessage(cfg, logSink)
 	}
 
 	// Run()-level restore net (#953, the #941 residual): the restore defers
@@ -5001,7 +5008,13 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	freshFetchBase := routing.freshFetchBase
 
 	title, body := prTitleAndBody(cfg, branch, logSink)
-	commitMessage := title + "\n\n" + body
+	// Initial (non-fix-up) implement commit message (#1686): prefer the agent's
+	// clean Conventional-Commits sidecar (consumed + deleted by
+	// loadImplementCommitMessage), falling back to today's title + "\n\n" + body
+	// when no sidecar is present — so the initial commit no longer stuffs the
+	// whole PR review body into its message. The PR title/body still come from
+	// /tmp/fishhawk-pr.md unchanged. Overridden below on the isFixup path.
+	commitMessage := implementCommitMessage(cfg, title, body, logSink)
 	if isFixup {
 		// Per-pass fix-up commit message (#1572): a fix-up gets its own commit
 		// subject/body from the run/stage-keyed sidecar the fix-up agent wrote
@@ -6410,6 +6423,101 @@ func fixupCommitMessage(cfg config, baseTipSHA string, logSink io.Writer) string
 	}
 	return fmt.Sprintf("chore: fishhawk fixup stage %s (base %s)",
 		shortID(cfg.stageID), shortID(baseTipSHA))
+}
+
+// implementCommitMessageDir is the directory the run/stage-keyed INITIAL-implement
+// commit-message sidecar lives in (#1686). var (not const) so tests can redirect
+// it to a t.TempDir, avoiding /tmp pollution / parallel-test races — the same
+// seam pattern as fixupCommitMessageDir.
+var implementCommitMessageDir = "/tmp"
+
+// implementCommitMessagePath mirrors prompt.ImplementCommitMessagePath in the
+// backend: the run/stage-keyed path the initial implement agent writes its clean
+// Conventional-Commits commit message to and the runner reads it from (#1686).
+// The format string is hardcoded in all three independent modules (backend
+// prompt, runner, CLI) by design — the same coordination as fixupCommitMessagePath
+// / FixupCommitMessagePath.
+func implementCommitMessagePath(runID, stageID string) string {
+	return filepath.Join(implementCommitMessageDir, fmt.Sprintf("fishhawk-implement-commitmsg-%s-%s.txt", runID, stageID))
+}
+
+// sweepStaleImplementCommitMessage deletes any leftover initial-implement commit-
+// message sidecar at this run/stage's keyed path before the agent is invoked
+// (#1686) — the pre-invoke freshness defense mirroring sweepStaleFixupCommitMessage.
+// Without it, a retry whose agent never re-writes the file would silently reuse a
+// PRIOR attempt's message. Best-effort: a not-exist (the common case) is silent;
+// a leftover actually removed emits implement_commitmsg_swept.
+func sweepStaleImplementCommitMessage(cfg config, logSink io.Writer) {
+	path := implementCommitMessagePath(cfg.runID, cfg.stageID)
+	if rerr := os.Remove(path); rerr == nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"implement_commitmsg_swept","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
+			cfg.runID, cfg.stageID, path)
+	}
+}
+
+// loadImplementCommitMessage reads the agent's initial-implement commit-message
+// sidecar (#1686) and splits it into (subject, body). It deletes the file on
+// EVERY return path (delete-after-read) so a stale sidecar can never bleed into a
+// later run/stage. Returns ok=false when the sidecar is absent, unreadable, or
+// empty/whitespace-only — the fallback cases the caller resolves to today's
+// title + "\n\n" + body. On success the first line is the subject (the
+// Conventional-Commits header) and the remainder after it is the body.
+func loadImplementCommitMessage(cfg config, logSink io.Writer) (subject, body string, ok bool) {
+	path := implementCommitMessagePath(cfg.runID, cfg.stageID)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		// Absent sidecar is the common no-op (an older agent wrote nothing); any
+		// other read error is fail-closed too. Only an existing file's content
+		// can supply a message, so no log on the not-exist path.
+		return "", "", false
+	}
+	// A present sidecar is consumed regardless of outcome: remove it on every
+	// return path so a stale sidecar is never reused by a later run/stage.
+	defer func() { _ = os.Remove(path) }()
+
+	// TrimSpace strips leading/trailing whitespace (incl. leading blank lines),
+	// so an empty/whitespace-only sidecar is treated as missing (fallback wins).
+	text := strings.TrimSpace(strings.ReplaceAll(string(raw), "\r\n", "\n"))
+	if text == "" {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"implement_commitmsg_empty","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
+			cfg.runID, cfg.stageID, path)
+		return "", "", false
+	}
+	// First line is the subject; the remainder after the first newline (leading
+	// blank lines trimmed) is the body. text is already TrimSpace'd, so the
+	// first line is non-empty.
+	lines := strings.SplitN(text, "\n", 2)
+	subject = strings.TrimSpace(lines[0])
+	if len(lines) == 2 {
+		body = strings.TrimSpace(lines[1])
+	}
+	return subject, body, true
+}
+
+// implementCommitMessage resolves the commit message for the INITIAL (non-fix-up)
+// implement commit (#1686): the agent-authored clean Conventional-Commits message
+// from the run/stage-keyed sidecar (consumed + deleted by loadImplementCommitMessage),
+// falling back to EXACTLY today's title + "\n\n" + body when the sidecar is
+// absent/empty — no synthetic subject, so an older agent that writes no sidecar
+// sees no behavior change. title/body are the PR title/body sourced unchanged
+// from /tmp/fishhawk-pr.md.
+func implementCommitMessage(cfg config, title, body string, logSink io.Writer) string {
+	if subject, sidecarBody, ok := loadImplementCommitMessage(cfg, logSink); ok {
+		// Warn-only conventional-commit header check on the sidecar subject,
+		// matching the PR-title warn — advisory, never a rewrite or hard failure.
+		if !conventionalCommitHeaderRe.MatchString(subject) {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"implement_commitmsg_warning","run_id":%q,"stage_id":%q,"reason":%q}`+"\n",
+				cfg.runID, cfg.stageID, "sidecar subject is not a conventional-commit header")
+		}
+		if sidecarBody == "" {
+			return subject
+		}
+		return subject + "\n\n" + sidecarBody
+	}
+	return title + "\n\n" + body
 }
 
 // terminalVerifyOutcome returns the committed-tree verify verdict already on the
