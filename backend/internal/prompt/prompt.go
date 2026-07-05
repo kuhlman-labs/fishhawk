@@ -125,6 +125,32 @@ func FixupCommitMessagePath(runID, stageID string) string {
 	return fmt.Sprintf("/tmp/fishhawk-fixup-commitmsg-%s-%s.txt", runID, stageID)
 }
 
+// ImplementCommitMessagePath is the run/stage-keyed path the INITIAL (non-fix-up)
+// implement agent writes a clean Conventional-Commits commit message to, and the
+// runner + CLI read the initial commit's subject+body from (#1686). Exactly
+// symmetric with FixupCommitMessagePath: the initial commit historically reused
+// the entire PR review artifact (/tmp/fishhawk-pr.md — conventional subject +
+// ## Summary/## Test plan/## Notes + approval-condition checklists + attribution
+// footer + sign-off) as its message, because both the runner and the CLI set
+// commitMessage = title + "\n\n" + body. This dedicated sidecar keeps the commit
+// message (a clean Conventional-Commits subject + concise plain-text body) SEPARATE
+// from the rich PR body, which stays sourced from PullRequestDescriptionPath.
+// Keyed by the FULL run id + stage id (same rationale as FixupCommitMessagePath)
+// so a leftover sidecar from a different run/stage can never collide — the first
+// of three freshness defenses (the others being the pre-invoke delete and the
+// delete-after-read in the runner + CLI).
+//
+// The runner (runner/cmd/fishhawk-runner/main.go) and the CLI
+// (cli/cmd/fishhawk/autopr.go) each mirror this EXACT format string in their own
+// implementCommitMessagePath — the same independent-module coordination as
+// FixupCommitMessagePath. A one-sided edit to any of the three copies is caught
+// by the prompt-render test (asserts the literal substituted path) plus the
+// runner and CLI load tests (each assert the byte-identical literal for the same
+// ids), so the three copies cannot silently drift.
+func ImplementCommitMessagePath(runID, stageID string) string {
+	return fmt.Sprintf("/tmp/fishhawk-implement-commitmsg-%s-%s.txt", runID, stageID)
+}
+
 // CalibrationBand holds accuracy statistics for a single confidence level
 // (high / medium / low) within a calibration window.
 type CalibrationBand struct {
@@ -974,6 +1000,19 @@ func buildImplement(t Trigger) string {
 		writeScopeSelfExempt(&b, t)
 	}
 
+	// Dedicated commit-message sidecar (#1686): instruct the initial implement
+	// agent to write a clean Conventional-Commits message to a run/stage-keyed
+	// sidecar the runner + CLI consume for the commit — kept SEPARATE from the
+	// rich PR body below so the initial commit no longer stuffs the whole PR
+	// review artifact into its message. Guarded on the populated run/stage ids
+	// (same shape as the writeScopeSelfExempt block) so a trigger missing them
+	// omits the section rather than rendering a malformed (unkeyed) path the
+	// runner/CLI would never read. Full-implement-only: buildImplementFixup
+	// renders writeFixupCommitMessage instead and never reaches here.
+	if t.ImplementRunID != "" && t.ImplementStageID != "" {
+		writeImplementCommitMessage(&b, t)
+	}
+
 	// PR description: write to a known path so the runner can lift
 	// it into the GitHub PR's title + body. Format is documented
 	// here in the prompt itself (rather than a separate spec doc)
@@ -1273,6 +1312,37 @@ func writeFixupCommitMessage(b *strings.Builder, t Trigger) {
 	b.WriteString("- Optionally leave one blank line and add a body explaining the fix-up.\n")
 	b.WriteString("- Do NOT write a PR description here — the pull request already exists; this file is the " +
 		"commit message for THIS fix-up pass only.\n\n")
+}
+
+// writeImplementCommitMessage renders the "### Write the commit message" block
+// for the FULL implement prompt (#1686): the agent writes a clean Conventional
+// Commits v1.0.0 message describing WHAT changed to a run/stage-keyed sidecar
+// (ImplementCommitMessagePath) the runner + CLI consume for the INITIAL commit's
+// subject+body — kept SEPARATE from the rich PR review body in
+// PullRequestDescriptionPath (which stays the PR title+body). Deliberately a
+// commit message ONLY: without it the initial commit reuses the entire PR
+// artifact (summary/test-plan/notes/checklists/footer) as its message. Guarded
+// on populated run/stage ids by the caller so a trigger missing them omits the
+// section rather than rendering a malformed (unkeyed) path the runner/CLI would
+// never read. Full-implement-only: NOT rendered by the slim buildImplementFixup
+// prompt (which renders writeFixupCommitMessage instead).
+func writeImplementCommitMessage(b *strings.Builder, t Trigger) {
+	path := ImplementCommitMessagePath(t.ImplementRunID, t.ImplementStageID)
+	b.WriteString("### Write the commit message\n\n")
+	b.WriteString("Separately from the pull-request description below, write a clean commit message " +
+		"for this change as a Conventional Commits v1.0.0 message.\n\n")
+	fmt.Fprintf(b, "Write the message to `%s`:\n\n", path)
+	b.WriteString("- The first line is a Conventional Commits header `type(scope): description` — the " +
+		"SAME conventional subject you use for the PR title below, with `type` one of `feat`, `fix`, " +
+		"`docs`, `refactor`, `test`, `chore`, `perf`, `build`, an optional `(scope)`, and an imperative " +
+		"description of what you changed (e.g. `feat(runner): add minio-init target`). Aim for ≤50 " +
+		"characters and never exceed 72.\n")
+	b.WriteString("- Leave one blank line, then a concise plain-text body describing WHAT changed and " +
+		"why — a few sentences or short bullets, NOT the full PR review body.\n")
+	b.WriteString("- This file is the commit message ONLY. Keep it SEPARATE from the rich PR review body " +
+		"you write to `" + PullRequestDescriptionPath + "` (the `## Summary` / `## Test plan` / `## Notes` " +
+		"sections, approval-condition and failure-mode checklists, and `Closes #…` line stay in the PR " +
+		"description, NOT here).\n\n")
 }
 
 // writeGitOpsProhibition renders the line forbidding the agent from running

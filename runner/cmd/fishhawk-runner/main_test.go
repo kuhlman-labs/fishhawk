@@ -13205,6 +13205,202 @@ func TestFixupCommitMessage_FallbackEmptyBaseTip(t *testing.T) {
 	}
 }
 
+// --- #1686 initial-implement commit message ------------------------------
+
+func implementCommitMsgCfg() config {
+	return config{runID: "run-cccc", stageID: "stage-dddd"}
+}
+
+// writeImplementCommitMsgSidecar redirects implementCommitMessageDir to a temp
+// dir and writes raw text to cfg's keyed initial-implement commit-message path.
+func writeImplementCommitMsgSidecar(t *testing.T, cfg config, raw string) string {
+	t.Helper()
+	dir := t.TempDir()
+	orig := implementCommitMessageDir
+	implementCommitMessageDir = dir
+	t.Cleanup(func() { implementCommitMessageDir = orig })
+	path := implementCommitMessagePath(cfg.runID, cfg.stageID)
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestImplementCommitMessagePath_Format (#1686, binding condition 1) asserts the
+// LITERAL runner-side path for KNOWN ids, byte-identical to the backend prompt-
+// render test and the CLI load test, so a one-sided edit to any of the three
+// hardcoded format strings fails a test (the pragmatic cross-module lock).
+func TestImplementCommitMessagePath_Format(t *testing.T) {
+	orig := implementCommitMessageDir
+	implementCommitMessageDir = "/tmp"
+	t.Cleanup(func() { implementCommitMessageDir = orig })
+	const runID = "11112222333344445555666677778888"
+	const stageID = "99990000aaaabbbbccccddddeeeeffff"
+	got := implementCommitMessagePath(runID, stageID)
+	want := "/tmp/fishhawk-implement-commitmsg-" + runID + "-" + stageID + ".txt"
+	if got != want {
+		t.Errorf("implementCommitMessagePath = %q, want %q", got, want)
+	}
+}
+
+// TestLoadImplementCommitMessage_Absent (#1686): no sidecar → ok=false, no log.
+func TestLoadImplementCommitMessage_Absent(t *testing.T) {
+	cfg := implementCommitMsgCfg()
+	dir := t.TempDir()
+	orig := implementCommitMessageDir
+	implementCommitMessageDir = dir
+	t.Cleanup(func() { implementCommitMessageDir = orig })
+
+	var logSink strings.Builder
+	if _, _, ok := loadImplementCommitMessage(cfg, &logSink); ok {
+		t.Errorf("absent sidecar must yield ok=false")
+	}
+	if logSink.Len() != 0 {
+		t.Errorf("absent sidecar must not log, got %q", logSink.String())
+	}
+}
+
+// TestLoadImplementCommitMessage_Present (#1686, mode 1): a present sidecar yields
+// (subject, body) split on the first newline AND is deleted after read.
+func TestLoadImplementCommitMessage_Present(t *testing.T) {
+	cfg := implementCommitMsgCfg()
+	path := writeImplementCommitMsgSidecar(t, cfg,
+		"feat(runner): add minio-init target\n\nAdds a make target that seeds the bucket.\n")
+	var logSink strings.Builder
+	subject, body, ok := loadImplementCommitMessage(cfg, &logSink)
+	if !ok {
+		t.Fatalf("present sidecar must yield ok=true")
+	}
+	if subject != "feat(runner): add minio-init target" {
+		t.Errorf("subject = %q", subject)
+	}
+	if body != "Adds a make target that seeds the bucket." {
+		t.Errorf("body = %q", body)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("consumed sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadImplementCommitMessage_EmptyWhitespace (#1686, mode 4): an empty or
+// whitespace-only sidecar is treated as missing (ok=false) + implement_commitmsg_empty,
+// and is removed on every return path.
+func TestLoadImplementCommitMessage_EmptyWhitespace(t *testing.T) {
+	for _, raw := range []string{"", "   \n\t\n"} {
+		cfg := implementCommitMsgCfg()
+		path := writeImplementCommitMsgSidecar(t, cfg, raw)
+		var logSink strings.Builder
+		subject, body, ok := loadImplementCommitMessage(cfg, &logSink)
+		if ok || subject != "" || body != "" {
+			t.Errorf("empty sidecar %q must yield ok=false, got (%q,%q,%v)", raw, subject, body, ok)
+		}
+		if !strings.Contains(logSink.String(), `"event":"implement_commitmsg_empty"`) {
+			t.Errorf("expected implement_commitmsg_empty for %q, got %q", raw, logSink.String())
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("empty sidecar must be removed for %q, stat err = %v", raw, err)
+		}
+	}
+}
+
+// TestSweepStaleImplementCommitMessage (#1686, mode 2): a pre-existing keyed
+// sidecar is removed and implement_commitmsg_swept logged; an absent one is a
+// silent no-op. The pre-invoke freshness defense that stops a prior attempt's
+// message being reused by a retry whose agent writes no sidecar.
+func TestSweepStaleImplementCommitMessage(t *testing.T) {
+	cfg := implementCommitMsgCfg()
+	path := writeImplementCommitMsgSidecar(t, cfg, "feat: leftover from a prior attempt\n")
+
+	var logSink strings.Builder
+	sweepStaleImplementCommitMessage(cfg, &logSink)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("pre-existing sidecar must be swept, stat err = %v", err)
+	}
+	if !strings.Contains(logSink.String(), `"event":"implement_commitmsg_swept"`) {
+		t.Errorf("expected implement_commitmsg_swept, got %q", logSink.String())
+	}
+
+	var logSink2 strings.Builder
+	sweepStaleImplementCommitMessage(cfg, &logSink2)
+	if logSink2.Len() != 0 {
+		t.Errorf("absent-sidecar sweep must be silent, got %q", logSink2.String())
+	}
+}
+
+// TestImplementCommitMessage_SidecarPresent (#1686, mode 1): the resolver composes
+// subject + blank line + body from the sidecar and deletes the file.
+func TestImplementCommitMessage_SidecarPresent(t *testing.T) {
+	cfg := implementCommitMsgCfg()
+	path := writeImplementCommitMsgSidecar(t, cfg, "feat(runner): add minio-init target\n\nDetail line.\n")
+	var logSink strings.Builder
+	got := implementCommitMessage(cfg, "feat(runner): PR TITLE", "PR BODY\n\n## Summary\n\nstuff", &logSink)
+	want := "feat(runner): add minio-init target\n\nDetail line."
+	if got != want {
+		t.Errorf("implementCommitMessage = %q, want %q (sidecar, not PR title/body)", got, want)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("consumed sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestImplementCommitMessage_SidecarSubjectOnly (#1686): a subject-only sidecar
+// yields just the subject (no trailing blank line).
+func TestImplementCommitMessage_SidecarSubjectOnly(t *testing.T) {
+	cfg := implementCommitMsgCfg()
+	writeImplementCommitMsgSidecar(t, cfg, "feat(runner): add minio-init target\n")
+	var logSink strings.Builder
+	got := implementCommitMessage(cfg, "feat(runner): PR TITLE", "PR BODY", &logSink)
+	if got != "feat(runner): add minio-init target" {
+		t.Errorf("implementCommitMessage = %q, want subject only", got)
+	}
+}
+
+// TestImplementCommitMessage_FallbackMissing (#1686, mode 3, binding condition 2):
+// with no sidecar the message is EXACTLY today's title + "\n\n" + body — no
+// synthetic subject, no behavior change for an older agent.
+func TestImplementCommitMessage_FallbackMissing(t *testing.T) {
+	dir := t.TempDir()
+	orig := implementCommitMessageDir
+	implementCommitMessageDir = dir
+	t.Cleanup(func() { implementCommitMessageDir = orig })
+
+	cfg := implementCommitMsgCfg()
+	var logSink strings.Builder
+	got := implementCommitMessage(cfg, "feat(x): do a thing", "## Summary\n\nbody bullet\n", &logSink)
+	want := "feat(x): do a thing" + "\n\n" + "## Summary\n\nbody bullet\n"
+	if got != want {
+		t.Errorf("fallback = %q, want exactly title + \\n\\n + body %q", got, want)
+	}
+}
+
+// TestImplementCommitMessage_FallbackOnEmpty (#1686, mode 4): an empty/whitespace
+// sidecar falls back to exactly title + "\n\n" + body (not the empty string).
+func TestImplementCommitMessage_FallbackOnEmpty(t *testing.T) {
+	cfg := implementCommitMsgCfg()
+	writeImplementCommitMsgSidecar(t, cfg, "   \n")
+	var logSink strings.Builder
+	got := implementCommitMessage(cfg, "fix: title", "body", &logSink)
+	if got != "fix: title\n\nbody" {
+		t.Errorf("empty-sidecar fallback = %q, want title + \\n\\n + body", got)
+	}
+}
+
+// TestImplementCommitMessage_NonConventionalSubjectWarns (#1686): a sidecar
+// subject that is not a conventional-commit header is used VERBATIM but emits a
+// warn-only implement_commitmsg_warning (never a rewrite or hard failure).
+func TestImplementCommitMessage_NonConventionalSubjectWarns(t *testing.T) {
+	cfg := implementCommitMsgCfg()
+	writeImplementCommitMsgSidecar(t, cfg, "just a plain subject\n\nbody\n")
+	var logSink strings.Builder
+	got := implementCommitMessage(cfg, "feat: title", "body", &logSink)
+	if got != "just a plain subject\n\nbody" {
+		t.Errorf("non-conventional sidecar subject must be used verbatim, got %q", got)
+	}
+	if !strings.Contains(logSink.String(), `"event":"implement_commitmsg_warning"`) {
+		t.Errorf("expected implement_commitmsg_warning, got %q", logSink.String())
+	}
+}
+
 // TestPRTitleAndBody_NonConventionalTitle_WarnsAndUsesVerbatim (#1572, mode 5):
 // a non-conventional agent title emits pr_template_warning AND is used verbatim.
 func TestPRTitleAndBody_NonConventionalTitle_WarnsAndUsesVerbatim(t *testing.T) {

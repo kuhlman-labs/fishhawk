@@ -161,6 +161,263 @@ func TestParsePRDescriptionFile_ConventionalTitleNoWarn(t *testing.T) {
 	}
 }
 
+// --- #1686 initial-implement commit message ------------------------------
+
+// writeImplementCommitMsgSidecar redirects implementCommitMessageDir to a temp
+// dir and writes raw text to the keyed initial-implement commit-message path.
+func writeImplementCommitMsgSidecar(t *testing.T, runID, stageID, raw string) string {
+	t.Helper()
+	dir := t.TempDir()
+	orig := implementCommitMessageDir
+	implementCommitMessageDir = dir
+	t.Cleanup(func() { implementCommitMessageDir = orig })
+	path := implementCommitMessagePath(runID, stageID)
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestImplementCommitMessagePath_Format (#1686, binding condition 1) asserts the
+// LITERAL CLI-side path for KNOWN ids, byte-identical to the backend prompt-render
+// test and the runner load test, so a one-sided edit to any of the three hardcoded
+// format strings fails a test (the pragmatic cross-module lock).
+func TestImplementCommitMessagePath_Format(t *testing.T) {
+	orig := implementCommitMessageDir
+	implementCommitMessageDir = "/tmp"
+	t.Cleanup(func() { implementCommitMessageDir = orig })
+	const runID = "11112222333344445555666677778888"
+	const stageID = "99990000aaaabbbbccccddddeeeeffff"
+	got := implementCommitMessagePath(runID, stageID)
+	want := "/tmp/fishhawk-implement-commitmsg-" + runID + "-" + stageID + ".txt"
+	if got != want {
+		t.Errorf("implementCommitMessagePath = %q, want %q", got, want)
+	}
+}
+
+// TestLoadImplementCommitMessage_Present (#1686, mode 1): a present sidecar yields
+// (subject, body) split on the first newline AND is deleted after read.
+func TestLoadImplementCommitMessage_Present(t *testing.T) {
+	const runID, stageID = "run-cccc", "stage-dddd"
+	path := writeImplementCommitMsgSidecar(t, runID, stageID,
+		"feat(cli): add a flag\n\nAdds a --thing flag to autopr.\n")
+	subject, body, ok := loadImplementCommitMessage(runID, stageID)
+	if !ok {
+		t.Fatalf("present sidecar must yield ok=true")
+	}
+	if subject != "feat(cli): add a flag" {
+		t.Errorf("subject = %q", subject)
+	}
+	if body != "Adds a --thing flag to autopr." {
+		t.Errorf("body = %q", body)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("consumed sidecar must be removed, stat err = %v", err)
+	}
+}
+
+// TestLoadImplementCommitMessage_Absent (#1686): no sidecar → ok=false.
+func TestLoadImplementCommitMessage_Absent(t *testing.T) {
+	dir := t.TempDir()
+	orig := implementCommitMessageDir
+	implementCommitMessageDir = dir
+	t.Cleanup(func() { implementCommitMessageDir = orig })
+	if _, _, ok := loadImplementCommitMessage("run-cccc", "stage-dddd"); ok {
+		t.Errorf("absent sidecar must yield ok=false")
+	}
+}
+
+// TestLoadImplementCommitMessage_EmptyWhitespace (#1686, mode 4): an empty or
+// whitespace-only sidecar is treated as missing (ok=false) and is removed.
+func TestLoadImplementCommitMessage_EmptyWhitespace(t *testing.T) {
+	for _, raw := range []string{"", "   \n\t\n"} {
+		path := writeImplementCommitMsgSidecar(t, "run-cccc", "stage-dddd", raw)
+		subject, body, ok := loadImplementCommitMessage("run-cccc", "stage-dddd")
+		if ok || subject != "" || body != "" {
+			t.Errorf("empty sidecar %q must yield ok=false, got (%q,%q,%v)", raw, subject, body, ok)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("empty sidecar must be removed for %q, stat err = %v", raw, err)
+		}
+	}
+}
+
+// TestImplementCommitMessage_FallbackMissing (#1686, mode 3, binding condition 2):
+// with no sidecar the message is EXACTLY today's title + "\n\n" + body — no
+// synthetic subject, no behavior change for an older agent.
+func TestImplementCommitMessage_FallbackMissing(t *testing.T) {
+	dir := t.TempDir()
+	orig := implementCommitMessageDir
+	implementCommitMessageDir = dir
+	t.Cleanup(func() { implementCommitMessageDir = orig })
+	got := implementCommitMessage("run-cccc", "stage-dddd", "feat(x): do a thing", "## Summary\n\nbody\n")
+	want := "feat(x): do a thing" + "\n\n" + "## Summary\n\nbody\n"
+	if got != want {
+		t.Errorf("fallback = %q, want exactly title + \\n\\n + body %q", got, want)
+	}
+}
+
+// TestImplementCommitMessage_SidecarPresent (#1686, mode 1): the resolver returns
+// the sidecar content (subject + blank line + body), NOT the PR title/body.
+func TestImplementCommitMessage_SidecarPresent(t *testing.T) {
+	writeImplementCommitMsgSidecar(t, "run-cccc", "stage-dddd", "feat(cli): add a flag\n\nDetail.\n")
+	got := implementCommitMessage("run-cccc", "stage-dddd", "feat(cli): PR TITLE", "PR BODY\n\n## Summary\n\nx")
+	if got != "feat(cli): add a flag\n\nDetail." {
+		t.Errorf("implementCommitMessage = %q, want sidecar content", got)
+	}
+}
+
+// TestAutoOpenPR_ImplementCommitMessageSidecar (#1686) is the end-to-end mirror:
+// with a sidecar present the pushed commit's message is the SIDECAR content (not
+// the PR title/body), and the sidecar file is deleted after read.
+func TestAutoOpenPR_ImplementCommitMessageSidecar(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, _ := autoOpenPRTestRepo(t)
+
+	prFile := filepath.Join(t.TempDir(), "pr.md")
+	if err := os.WriteFile(prFile, []byte("feat(cli): PR TITLE\n\n## Summary\n\nRich PR body.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origPath := prDescriptionPath
+	prDescriptionPath = prFile
+	t.Cleanup(func() { prDescriptionPath = origPath })
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	sidecarPath := writeImplementCommitMsgSidecar(t, runID.String(), stageID.String(),
+		"feat(cli): add minio-init target\n\nConcise commit body.\n")
+
+	origGh := autoGhCommand
+	autoGhCommand = func(_ string, _ ...string) *exec.Cmd {
+		return exec.Command("sh", "-c", "echo https://github.com/owner/repo/pull/7")
+	}
+	t.Cleanup(func() { autoGhCommand = origGh })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(httpclient.ShipLocalPullRequestResult{
+			PRNumber: 7, PRURL: "https://github.com/owner/repo/pull/7",
+		})
+	}))
+	defer srv.Close()
+
+	if _, err := autoOpenPR(context.Background(),
+		httpclient.New(srv.URL, "test-token"),
+		autoOpenPRArgs{
+			WorkingDir: repo,
+			RunID:      runID,
+			StageID:    stageID,
+			GitHubRepo: "owner/repo",
+			BaseBranch: "main",
+		}); err != nil {
+		t.Fatalf("autoOpenPR: %v", err)
+	}
+
+	msg := mustGitOutCLI(t, repo, "show", "--format=%B", "--no-patch", "HEAD")
+	if !strings.Contains(msg, "add minio-init target") || !strings.Contains(msg, "Concise commit body.") {
+		t.Errorf("commit message must be the sidecar content, got %q", msg)
+	}
+	if strings.Contains(msg, "Rich PR body.") {
+		t.Errorf("commit message must NOT contain the PR body, got %q", msg)
+	}
+	if _, err := os.Stat(sidecarPath); !os.IsNotExist(err) {
+		t.Errorf("sidecar must be deleted after read, stat err = %v", err)
+	}
+}
+
+// TestAutoOpenPR_ImplementCommitMessageFallback (#1686, binding condition 2) is
+// the absent-sidecar end-to-end mirror: with no sidecar the pushed commit's
+// message is EXACTLY the PR title + "\n\n" + body (older-agent no-behavior-change).
+func TestAutoOpenPR_ImplementCommitMessageFallback(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, _ := autoOpenPRTestRepo(t)
+
+	// Point implementCommitMessageDir at an empty temp dir so no sidecar exists.
+	origDir := implementCommitMessageDir
+	implementCommitMessageDir = t.TempDir()
+	t.Cleanup(func() { implementCommitMessageDir = origDir })
+
+	prFile := filepath.Join(t.TempDir(), "pr.md")
+	if err := os.WriteFile(prFile, []byte("feat(cli): PR TITLE\n\n## Summary\n\nRich PR body.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origPath := prDescriptionPath
+	prDescriptionPath = prFile
+	t.Cleanup(func() { prDescriptionPath = origPath })
+
+	origGh := autoGhCommand
+	autoGhCommand = func(_ string, _ ...string) *exec.Cmd {
+		return exec.Command("sh", "-c", "echo https://github.com/owner/repo/pull/7")
+	}
+	t.Cleanup(func() { autoGhCommand = origGh })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(httpclient.ShipLocalPullRequestResult{
+			PRNumber: 7, PRURL: "https://github.com/owner/repo/pull/7",
+		})
+	}))
+	defer srv.Close()
+
+	if _, err := autoOpenPR(context.Background(),
+		httpclient.New(srv.URL, "test-token"),
+		autoOpenPRArgs{
+			WorkingDir: repo,
+			RunID:      uuid.New(),
+			StageID:    uuid.New(),
+			GitHubRepo: "owner/repo",
+			BaseBranch: "main",
+		}); err != nil {
+		t.Fatalf("autoOpenPR: %v", err)
+	}
+
+	// git --signoff appends a Signed-off-by trailer, so assert the message BEGINS
+	// with exactly title + "\n\n" + body (the fallback), not equality.
+	msg := mustGitOutCLI(t, repo, "show", "--format=%B", "--no-patch", "HEAD")
+	want := "feat(cli): PR TITLE\n\n## Summary\n\nRich PR body." + "\n\n" + autoPRFooter
+	if !strings.HasPrefix(msg, want) {
+		t.Errorf("fallback commit message = %q, want prefix title + \\n\\n + body %q", msg, want)
+	}
+}
+
+// autoOpenPRTestRepo builds a real git repo with a bare origin and one pending
+// tracked change, returning the working dir and the bare origin path. Shared by
+// the #1686 end-to-end commit-message tests.
+func autoOpenPRTestRepo(t *testing.T) (repo, bare string) {
+	t.Helper()
+	dir := t.TempDir()
+	repo = filepath.Join(dir, "src")
+	bare = filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGitCLI(t, repo, "init", "--initial-branch=main")
+	mustGitCLI(t, repo, "config", "user.name", "init")
+	mustGitCLI(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGitCLI(t, repo, "add", "-A")
+	mustGitCLI(t, repo, "commit", "-m", "initial")
+	mustGitCLI(t, dir, "init", "--bare", "origin.git")
+	mustGitCLI(t, repo, "remote", "add", "origin", bare)
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Point scopeFilePath at a nonexistent path so staging falls back to
+	// `git add -A` (the default /tmp/fishhawk-scope.json may exist on the host).
+	origScope := scopeFilePath
+	scopeFilePath = filepath.Join(dir, "no-such-scope.json")
+	t.Cleanup(func() { scopeFilePath = origScope })
+	return repo, bare
+}
+
 func TestShortID_8HexChars(t *testing.T) {
 	id := uuid.MustParse("abcdef12-3456-7890-abcd-ef1234567890")
 	s := shortID(id)
