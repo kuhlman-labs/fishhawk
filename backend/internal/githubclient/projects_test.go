@@ -28,8 +28,9 @@ type projectsFake struct {
 	// graphqlByOp maps a marker substring of the query to its 200 body.
 	graphqlByOp map[string]string
 
-	gotCreateBody  []byte
-	gotGraphQLVars map[string]map[string]any // op marker -> variables
+	gotCreateBody   []byte
+	gotGraphQLVars  map[string]map[string]any // op marker -> variables
+	gotGraphQLQuery map[string]string         // op marker -> full query text
 
 	// gotGraphQLAuth records the Authorization header of the most recent
 	// GraphQL request, so token-selection tests can assert which token
@@ -39,7 +40,7 @@ type projectsFake struct {
 
 func newProjectsFake(t *testing.T) (*projectsFake, *Client) {
 	t.Helper()
-	pf := &projectsFake{graphqlByOp: map[string]string{}, gotGraphQLVars: map[string]map[string]any{}}
+	pf := &projectsFake{graphqlByOp: map[string]string{}, gotGraphQLVars: map[string]map[string]any{}, gotGraphQLQuery: map[string]string{}}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /repos/{owner}/{repo}/issues", func(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +67,7 @@ func newProjectsFake(t *testing.T) (*projectsFake, *Client) {
 		for marker, resp := range pf.graphqlByOp {
 			if strings.Contains(body.Query, marker) {
 				pf.gotGraphQLVars[marker] = body.Variables
+				pf.gotGraphQLQuery[marker] = body.Query
 				w.WriteHeader(http.StatusOK)
 				_, _ = io.WriteString(w, resp)
 				return
@@ -304,8 +306,8 @@ func TestAddSubIssue(t *testing.T) {
 func TestListSubIssues_PopulatedMapsNodes(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.graphqlByOp["ListSubIssues"] = `{"data":{"node":{"subIssues":{"nodes":[
-		{"number":41,"title":"slice A","body":"## Summary","id":"N41"},
-		{"number":42,"title":"slice B","body":"Depends on: #41","id":"N42"}
+		{"number":41,"title":"slice A","body":"## Summary","id":"N41","labels":{"nodes":[{"name":"type:feature"},{"name":"autonomy:low"}]}},
+		{"number":42,"title":"slice B","body":"Depends on: #41","id":"N42","labels":{"nodes":[]}}
 	]}}}}`
 	subs, err := c.ListSubIssues(context.Background(), 7, "EPIC_NODE")
 	if err != nil {
@@ -317,11 +319,23 @@ func TestListSubIssues_PopulatedMapsNodes(t *testing.T) {
 	if subs[0].Number != 41 || subs[0].NodeID != "N41" || subs[0].Title != "slice A" {
 		t.Errorf("subs[0] = %+v", subs[0])
 	}
+	// Labels decode alongside the existing number/title/body/id fields; an
+	// empty labels connection yields a nil Labels slice (#1551).
+	if got := strings.Join(subs[0].Labels, ","); got != "type:feature,autonomy:low" {
+		t.Errorf("subs[0].Labels = %q, want type:feature,autonomy:low", got)
+	}
+	if len(subs[1].Labels) != 0 {
+		t.Errorf("subs[1].Labels = %+v, want empty", subs[1].Labels)
+	}
 	if subs[1].Body != "Depends on: #41" {
 		t.Errorf("subs[1].Body = %q", subs[1].Body)
 	}
 	if vars := pf.gotGraphQLVars["ListSubIssues"]; vars["parentId"] != "EPIC_NODE" {
 		t.Errorf("vars = %+v, want parentId=EPIC_NODE", vars)
+	}
+	// The query must request the labels connection so the tier is on the wire.
+	if q := pf.gotGraphQLQuery["ListSubIssues"]; !strings.Contains(q, "labels(first:") {
+		t.Errorf("ListSubIssues query does not request labels: %q", q)
 	}
 }
 
