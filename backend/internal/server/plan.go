@@ -501,6 +501,18 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// plan-review prompt's gate-evidence section like the gates above.
 	testSweep := s.runTestSweep(r.Context(), runID, stageID, body)
 
+	// Plan-gate warnings advisory (#1684): run plan.Warnings() against the
+	// uploaded plan — notably the multi-slice decomposition with every
+	// sub_plan omitting depends_on (the shape that wedged #1551's first
+	// attempt), plus the pre-existing sub-plan runtime-sum and
+	// expensive-gate-vs-budget advisories — and record a plan_warnings
+	// audit entry ONLY when it fires. Advisory + fail-open like the
+	// sibling gates above; the result is not yet threaded into the
+	// plan-review prompt's gate-evidence section (out of scope for this
+	// slice) — the operator-facing surface is fishhawk_get_plan's
+	// plan_warnings field.
+	_ = s.runPlanWarnings(r.Context(), runID, stageID, body)
+
 	// Plan-gate scope-regression sweep (#1257): on a revise pass, diff the
 	// new plan's scoped paths (top-level scope.files UNION every
 	// decomposition sub-plan's scope.files) against the revision-base plan

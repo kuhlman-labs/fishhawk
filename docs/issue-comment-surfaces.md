@@ -280,6 +280,25 @@ Notes:
   prompt's gate-evidence section as a reviewer-judged advisory. Listed here
   only so a future reader grepping the audit categories doesn't mistake it
   for a comment surface.
+- The plan-gate warnings audit kind — `plan_warnings` (#1684), written by
+  the plan upload handler (`server/plan_warnings.go::runPlanWarnings`)
+  immediately after `plan_test_sweep` and before plan review — is an
+  **internal, advisory audit kind, not an issue-comment surface**. Nothing
+  in `issuecomment` posts it to the issue thread. It gives
+  `plan.Warnings()` (previously unit-tested but uncalled in production) its
+  first production caller: notably a multi-slice decomposition where every
+  sub-plan omits `depends_on` (the shape that wedged #1551's first
+  attempt), plus a sub-plan runtime-sum compression signal and an
+  expensive-test-strategy-vs-budget signal — with payload `{warnings}`.
+  Advisory + fail-open (an unparseable plan or an audit-append failure
+  writes no entry and never blocks the upload) and — the one divergence
+  from the sibling plan-gate sweeps — written ONLY when `Warnings()`
+  returns at least one string; a warning-free plan gets no entry (there is
+  no actionable "never checked" state for this advisory, and writing
+  always would break the pre-existing warning-free happy-path assertion).
+  Read back by the MCP surface (`fishhawk_get_plan` `plan_warnings`, newest
+  entry wins). Listed here only so a future reader grepping the audit
+  categories doesn't mistake it for a comment surface.
 - The operator-scope-undelivered audit kind — `operator_scope_path_undelivered`
   (#1407), written by the implement-review assembly path
   (`trace.go::runImplementReviews`) before any reviewer verdict — is an

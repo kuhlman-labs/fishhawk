@@ -342,6 +342,12 @@ type GetPlanOutput struct {
 	// scope.files evaluated against the repository's existing *_test.go
 	// files via the Contents API.
 	TestSweep *TestSweep `json:"test_sweep,omitempty" jsonschema:"plan-gate test sweep (#942): heuristic advisory flagging EXISTING test files the plan omitted — a stem-sibling test of a scoped production .go file, existing tests in a package where the plan creates a new test file, or a path-trigger rule's pinned test (migration_walk: a scoped migrations/*.sql requires the postgres_test.go that pins the latest migration). Judge whether the changed behavior's tests or shared harness live in the flagged files; if so the plan must scope them or the runner will scope_drift-exclude the agent's edits to them. Present (possibly with empty findings) when the plan stage ran the sweep; absent on older runs, non-GitHub triggers, and fail-open paths. listed_dirs below scanned directories means some listings failed and findings may be incomplete"`
+	// PlanWarnings surfaces the plan-gate soft-advisory pass (#1684):
+	// plan.Warnings() evaluated against the uploaded plan — notably the
+	// multi-slice decomposition with every sub_plan omitting depends_on
+	// (the shape that wedged #1551's first attempt), plus the sub-plan
+	// runtime-sum and expensive-gate-vs-budget advisories.
+	PlanWarnings []string `json:"plan_warnings,omitempty" jsonschema:"plan-gate soft advisories (#1684): notably flags a multi-slice decomposition where every sub_plan omits depends_on — if any slice forms a producer->consumer chain, all slices run in parallel in wave 0 and the consumer can fail typecheck against the not-yet-integrated symbol (the shape that wedged #1551's first attempt). Also flags a sub-plan predicted_runtime_minutes sum less than the parent's (possible scope compression) and an expensive test_strategy gate paired with an under-budgeted predicted_runtime_minutes. Advisory, never blocks approval. Absent when no advisory fired or on older runs predating this pass"`
 }
 
 // TestSweepFinding is one test-sweep result decoded from a plan_test_sweep
@@ -514,6 +520,10 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 			if err != nil {
 				return nil, GetPlanOutput{}, fmt.Errorf("load test sweep: %w", err)
 			}
+			planWarnings, err := r.loadPlanWarnings(ctx, current)
+			if err != nil {
+				return nil, GetPlanOutput{}, fmt.Errorf("load plan warnings: %w", err)
+			}
 			return nil, GetPlanOutput{
 				Status:           "available",
 				Plan:             p,
@@ -523,6 +533,7 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 				ScopePrecheck:    scopePrecheck,
 				SurfaceSweep:     surfaceSweep,
 				TestSweep:        testSweep,
+				PlanWarnings:     planWarnings,
 			}, nil
 		}
 		runRow, err := r.api.GetRun(ctx, current)
@@ -758,6 +769,43 @@ func (r *runResolver) loadTestSweep(ctx context.Context, runID uuid.UUID) (*Test
 		return nil, nil
 	}
 	return &ts, nil
+}
+
+// loadPlanWarnings fetches the NEWEST plan_warnings audit entry (#1684)
+// for the run and decodes its payload's warnings array. As with the
+// sibling sweep loaders the backend's per-run audit endpoint returns
+// entries sequence-ascending, so the authoritative entry is the last one.
+// Returns nil when no entry exists (a warning-free plan, an older run
+// predating this pass, or a fail-open no-op) so the field is omitted from
+// the response. A corrupt payload is treated as "not checked" rather than
+// failing the whole plan fetch, mirroring the sibling loaders'
+// degradation contract.
+func (r *runResolver) loadPlanWarnings(ctx context.Context, runID uuid.UUID) ([]string, error) {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: "plan_warnings",
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	newest := entries[len(entries)-1]
+	if newest.Payload == nil {
+		return nil, nil
+	}
+	raw, merr := json.Marshal(newest.Payload)
+	if merr != nil {
+		return nil, nil
+	}
+	var payload struct {
+		Warnings []string `json:"warnings"`
+	}
+	if uerr := json.Unmarshal(raw, &payload); uerr != nil {
+		return nil, nil
+	}
+	return payload.Warnings, nil
 }
 
 // auditLimitDefault is the default value for the get_run_status
