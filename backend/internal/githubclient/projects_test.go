@@ -339,6 +339,48 @@ func TestListSubIssues_PopulatedMapsNodes(t *testing.T) {
 	}
 }
 
+// TestListSubIssues_AutonomyLabelBeyondFirst20 proves the labels connection is
+// requested with a page size (first:100) large enough to capture an
+// autonomy:low tier that sits past the first 20 labels — GitHub caps an issue
+// at 100 labels, so first:100 is complete by construction and a beyond-20 tier
+// can never be silently dropped (which would resolve Autonomy="" and
+// auto-dispatch a human-led item, the exact risk #1551 closes).
+func TestListSubIssues_AutonomyLabelBeyondFirst20(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	// 24 filler labels, then autonomy:low as the 25th — past a first:20 page.
+	nodes := make([]string, 0, 25)
+	for i := 0; i < 24; i++ {
+		nodes = append(nodes, fmt.Sprintf(`{"name":"filler:%d"}`, i))
+	}
+	nodes = append(nodes, `{"name":"autonomy:low"}`)
+	pf.graphqlByOp["ListSubIssues"] = fmt.Sprintf(
+		`{"data":{"node":{"subIssues":{"nodes":[{"number":41,"title":"slice A","body":"b","id":"N41","labels":{"nodes":[%s]}}]}}}}`,
+		strings.Join(nodes, ","))
+	subs, err := c.ListSubIssues(context.Background(), 7, "EPIC_NODE")
+	if err != nil {
+		t.Fatalf("ListSubIssues: %v", err)
+	}
+	if len(subs) != 1 || len(subs[0].Labels) != 25 {
+		t.Fatalf("subs = %+v, want 1 child with 25 labels", subs)
+	}
+	// The autonomy tier past label 20 must survive the decode so the workmgmt
+	// provider resolves Autonomy=="low" rather than "".
+	var hasLow bool
+	for _, l := range subs[0].Labels {
+		if l == "autonomy:low" {
+			hasLow = true
+		}
+	}
+	if !hasLow {
+		t.Errorf("subs[0].Labels = %v, want it to contain autonomy:low", subs[0].Labels)
+	}
+	// The wire query must request first:100 labels — GitHub's per-issue max —
+	// so no label (and thus no autonomy tier) is ever paged out.
+	if vars := pf.gotGraphQLVars["ListSubIssues"]; vars["labelsFirst"] != float64(100) {
+		t.Errorf("labelsFirst = %v, want 100 (GitHub's max labels per issue)", vars["labelsFirst"])
+	}
+}
+
 func TestListSubIssues_EmptyReturnsNil(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.graphqlByOp["ListSubIssues"] = `{"data":{"node":{"subIssues":{"nodes":[]}}}}`

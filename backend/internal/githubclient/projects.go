@@ -555,17 +555,18 @@ type SubIssue struct {
 // here so a >100-child epic silently reads only the first 100.
 const listSubIssuesFirst = 100
 
-// listSubIssuesLabelsFirst caps the per-child labels connection page. An
-// issue's label set is small (the repo's conventions apply a handful of
-// namespaced labels), so a single first:20 page covers every child's labels
-// without pagination; the `autonomy:` tier the campaign source reads is
-// always within it.
-const listSubIssuesLabelsFirst = 20
+// listSubIssuesLabelsFirst caps the per-child labels connection page. 100 is
+// GitHub's documented maximum number of labels per issue, so a single
+// first:100 page is complete by construction — it retrieves every possible
+// label on any child with no pagination loop, guaranteeing the `autonomy:`
+// tier the campaign source reads is captured regardless of where it sits in
+// the label set (#1551).
+const listSubIssuesLabelsFirst = 100
 
 // ListSubIssues returns the sub-issues (children) of the issue identified by
 // parentNodeID — its number, node id, title, body, and labels.
 //
-//	query node(id: $parentId) { ... on Issue { subIssues(first: 100) { nodes { number title body id labels(first: 20){ nodes{ name } } } } } }
+//	query node(id: $parentId) { ... on Issue { subIssues(first: 100) { nodes { number title body id labels(first: 100){ nodes{ name } } } } } }
 //
 // It reads a SINGLE first:100 page (listSubIssuesFirst); a parent with more
 // than 100 sub-issues is truncated to the first 100 — out of scope for the
