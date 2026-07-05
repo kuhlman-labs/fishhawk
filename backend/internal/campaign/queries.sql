@@ -40,8 +40,8 @@ UPDATE campaigns
 RETURNING *;
 
 -- name: CreateCampaignItem :one
-INSERT INTO campaign_items (id, campaign_id, issue_ref, depends_on, state)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO campaign_items (id, campaign_id, issue_ref, depends_on, state, autonomy)
+VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING *;
 
 -- name: GetCampaignItem :one

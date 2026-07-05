@@ -154,6 +154,9 @@ func (r *postgresRepo) CreateCampaignItem(ctx context.Context, p CreateCampaignI
 		IssueRef:   p.IssueRef,
 		DependsOn:  dependsOn,
 		State:      string(ItemStatePending),
+		// Autonomy tier (#1551 / E32.4). Empty is the unknown/default tier; the
+		// column CHECK rejects any out-of-set value.
+		Autonomy: p.Autonomy,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create campaign item: %w", err)
@@ -334,8 +337,11 @@ func rowToCampaignItem(i campaigndb.CampaignItem) *Item {
 		IssueRef:   i.IssueRef,
 		RunID:      i.RunID,
 		State:      ItemState(i.State),
-		CreatedAt:  i.CreatedAt.Time,
-		UpdatedAt:  i.UpdatedAt.Time,
+		// Autonomy tier read straight back from the column (#1551 / E32.4).
+		// Empty is the unknown/default tier.
+		Autonomy:  i.Autonomy,
+		CreatedAt: i.CreatedAt.Time,
+		UpdatedAt: i.UpdatedAt.Time,
 	}
 	// JSONB → []string. An empty/NULL payload yields a nil slice (no
 	// dependencies). Tolerate a malformed blob by dropping it rather than
