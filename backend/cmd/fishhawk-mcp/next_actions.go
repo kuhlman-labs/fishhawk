@@ -840,14 +840,15 @@ func acceptanceOutcomeUnknownActions(run *Run, acceptance *Stage) *NextActions {
 // acceptanceTriagePagedActions is the human-arbitration arm for a failed
 // acceptance verdict whose deterministic triage disposition landed on the
 // human (paged / rerun_budget_exhausted / *_unavailable_paged / unsettled_paged
-// — ADR-049 decision #2). It leads with reading the evidence, then the operator
-// arbitrates: a manual fix-up pass, accept-and-ship, or cancel.
+// / externally_unvalidatable_paged — ADR-049 decision #2, #1671). It leads with
+// reading the evidence, then the operator arbitrates: a manual fix-up pass,
+// accept-and-ship, or cancel.
 func acceptanceTriagePagedActions(run *Run) []SuggestedAction {
 	return []SuggestedAction{
 		{
 			Action:       "fishhawk_list_audit",
 			Params:       map[string]string{"run_id": run.ID, "category": "acceptance_triage_decided"},
-			Precondition: "a failed acceptance verdict landed on a paged triage disposition (paged / rerun_budget_exhausted / *_unavailable_paged / unsettled_paged) — the human arbitrates. Read the acceptance_outcome_recorded criteria results and the acceptance_triage_decided class + reason first",
+			Precondition: "a failed acceptance verdict landed on a paged triage disposition (paged / rerun_budget_exhausted / *_unavailable_paged / unsettled_paged / externally_unvalidatable_paged) — the human arbitrates. Read the acceptance_outcome_recorded criteria results and the acceptance_triage_decided class + reason first",
 			Consumes:     consumesNone,
 			Reason:       "the deterministic triage classified the failure as page-the-human (class 3/4, an exhausted re-run budget, or an unavailable fix-up/retry route); read the evidence before arbitrating",
 		},
@@ -1063,19 +1064,28 @@ const (
 	acceptanceDispositionFixupUnavailable = "fixup_unavailable_paged"
 	acceptanceDispositionRetryUnavailable = "retry_unavailable_paged"
 	acceptanceDispositionUnsettled        = "unsettled_paged"
+	// acceptanceDispositionUnvalidatable is the class-5 all-skip
+	// externally-unvalidatable terminal page (#1671): the acceptance stage stays
+	// succeeded (no re-open), so it is a paged-family disposition the human
+	// arbitrates via the acceptance_triage_paged arm. MUST match
+	// backend/internal/server.acceptanceDispositionUnvalidatable.
+	acceptanceDispositionUnvalidatable = "externally_unvalidatable_paged"
 )
 
 // isAcceptancePagedDisposition reports whether a triage disposition is a
 // page-the-human variant (ADR-049 decision #2). The two auto-routed
 // dispositions (fixup_dispatched / retry_dispatched) return false — they fired
 // a state transition and the re-opened stage's own arm serves the next move.
+// The class-5 externally_unvalidatable_paged disposition (#1671) returns true:
+// it is terminal (no re-open), so the human arbitrates via the paged arm.
 func isAcceptancePagedDisposition(d string) bool {
 	switch d {
 	case acceptanceDispositionPaged,
 		acceptanceDispositionRerunBudget,
 		acceptanceDispositionFixupUnavailable,
 		acceptanceDispositionRetryUnavailable,
-		acceptanceDispositionUnsettled:
+		acceptanceDispositionUnsettled,
+		acceptanceDispositionUnvalidatable:
 		return true
 	default:
 		return false

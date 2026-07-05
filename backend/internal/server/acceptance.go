@@ -90,11 +90,18 @@ const (
 //     the plan (bad/ambiguous criterion) → page the human, no transition.
 //   - class 4: unitemized or provenance-ungroundable failure (works-as-planned,
 //     disputed) → page the human, no transition.
+//   - class 5: all-skip / externally-unvalidatable — every skipped criterion is
+//     a posture-A can't-exhibit skip carrying expectation_basis; the trigger
+//     requires an external event the default-deny egress sandbox cannot produce,
+//     so retry is deterministically futile → terminal page, no state transition
+//     (split off from class 2 so the acceptance stage stays succeeded/terminal
+//     and fishhawk_audit_complete can clear; #1671).
 const (
 	acceptanceClass1 = "1"
 	acceptanceClass2 = "2"
 	acceptanceClass3 = "3"
 	acceptanceClass4 = "4"
+	acceptanceClass5 = "5"
 )
 
 // Acceptance triage disposition vocabulary (E31.8). The tags
@@ -108,6 +115,14 @@ const (
 	acceptanceDispositionFixupUnavailable = "fixup_unavailable_paged"
 	acceptanceDispositionRetryUnavailable = "retry_unavailable_paged"
 	acceptanceDispositionUnsettled        = "unsettled_paged"
+	// acceptanceDispositionUnvalidatable is the terminal, non-re-opening paged
+	// disposition for a class-5 all-skip externally-unvalidatable verdict
+	// (#1671): the acceptance stage stays succeeded so fishhawk_audit_complete
+	// clears and the operator arbitrates via the normal gate. Re-declared
+	// verbatim in backend/internal/issuecomment/ping.go (string literal) and
+	// backend/cmd/fishhawk-mcp/next_actions.go (const) — the three copies are
+	// pinned byte-for-byte by a per-package assertion.
+	acceptanceDispositionUnvalidatable = "externally_unvalidatable_paged"
 )
 
 // defaultMaxAcceptanceReruns bounds the number of auto-routed acceptance
@@ -880,9 +895,20 @@ func classifyAcceptanceFailure(acc acceptanceBody, criteria []plan.AcceptanceCri
 			"assertion_fail: a failed criterion is inferred-source or unresolvable against the plan (bad/ambiguous criterion)"
 	}
 
-	// No failed criteria. A skip with no failure is an environment/flake
-	// signal: validation could not complete (class 2).
+	// No failed criteria but ≥1 skip. Normally an environment/flake signal
+	// (class 2, bounded re-run). Split off the posture-A can't-exhibit shape:
+	// when EVERY skipped criterion carries a non-empty expectation_basis (the
+	// #1612 signal that the egress-sandboxed acceptance agent could not produce
+	// the external trigger — e.g. closing a GitHub issue), the re-run is
+	// deterministically futile (the sandbox still can't reach the external
+	// service). Route to the terminal class 5 that pages WITHOUT re-opening the
+	// stage. A skip that lacks expectation_basis is genuinely ambiguous and
+	// keeps the bounded class-2 flake path unchanged (#1671).
 	if skipped > 0 {
+		if allSkipsCarryExpectationBasis(acc.normalizedCriteria) {
+			return acceptanceClass5, nil,
+				"assertion_fail: no criterion failed and every skipped criterion is a posture-A can't-exhibit skip with expectation_basis; the external trigger cannot be produced in the default-deny egress sandbox — routing to a terminal page rather than a futile flake retry"
+		}
 		return acceptanceClass2, nil,
 			"assertion_fail: no criterion failed but at least one was skipped; validation could not complete (environment/flake signal)"
 	}
@@ -904,6 +930,21 @@ func failedCriterionIDs(criteria []acceptanceCriterionResult) []string {
 		}
 	}
 	return ids
+}
+
+// allSkipsCarryExpectationBasis reports whether every skipped criterion in the
+// verdict carries a non-empty expectation_basis — the #1612 posture-A
+// can't-exhibit discriminator that separates a deterministically-futile
+// externally-unvalidatable skip (class 5) from a genuinely ambiguous flake
+// skip (class 2). Callers gate on skipped>0 first, so an all-passed set (which
+// makes this vacuously true) never reaches here.
+func allSkipsCarryExpectationBasis(criteria []acceptanceCriterionResult) bool {
+	for _, c := range criteria {
+		if c.Result == acceptanceResultSkipped && strings.TrimSpace(c.ExpectationBasis) == "" {
+			return false
+		}
+	}
+	return true
 }
 
 // triageAcceptanceFailure routes a freshly persisted verdict:failed artifact
@@ -971,13 +1012,20 @@ func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, s
 		return
 	}
 
-	// Route by class. Class 3 / class 4 take NO state transition — page.
+	// Route by class. Class 3 / class 4 take NO state transition — page. Class 5
+	// (all-skip externally-unvalidatable) is ALSO terminal, no transition: it
+	// pages under the distinct externally_unvalidatable_paged token so the
+	// acceptance stage stays succeeded and never enters the futile class-2 retry
+	// loop (#1671). Because it never re-opens the stage it never contributes to
+	// the auto-routed count defaultMaxAcceptanceReruns bounds.
 	var disposition string
 	switch class {
 	case acceptanceClass1:
 		disposition = s.routeAcceptanceClass1(ctx, runID, stage, acc, criteria, criterionIDs, reason)
 	case acceptanceClass2:
 		disposition = s.routeAcceptanceClass2(ctx, runID, stage)
+	case acceptanceClass5:
+		disposition = acceptanceDispositionUnvalidatable
 	default:
 		disposition = acceptanceDispositionPaged
 	}

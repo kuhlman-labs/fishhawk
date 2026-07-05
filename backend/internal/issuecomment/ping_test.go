@@ -382,6 +382,7 @@ func TestPageClassEvents_AcceptanceTriage(t *testing.T) {
 	pagedDispositions := []string{
 		"paged", "rerun_budget_exhausted",
 		"fixup_unavailable_paged", "retry_unavailable_paged", "unsettled_paged",
+		"externally_unvalidatable_paged", // #1671 class-5 terminal page
 	}
 	for _, disp := range pagedDispositions {
 		entries := []*audit.Entry{acceptanceTriageEntry(9, "3", disp)}
@@ -410,5 +411,21 @@ func TestPageClassEvents_AcceptanceTriage(t *testing.T) {
 	// A malformed / empty payload fires no ping.
 	if got := pageClassEvents([]*audit.Entry{{Sequence: 9, Category: "acceptance_triage_decided"}}, nil); len(got) != 0 {
 		t.Errorf("empty payload must not page; got %+v", got)
+	}
+}
+
+// TestAcceptanceTriageNeedsHuman_Class5 pins the #1671 class-5 disposition: a
+// class-5 externally_unvalidatable_paged payload needs a human (ok=true), and
+// the exact literal is asserted per-package (binding condition 3) so a silent
+// value drift from the server const is test-caught here.
+func TestAcceptanceTriageNeedsHuman_Class5(t *testing.T) {
+	const disposition = "externally_unvalidatable_paged"
+	payload, _ := json.Marshal(map[string]any{"class": "5", "disposition": disposition})
+	class, got, ok := acceptanceTriageNeedsHuman(payload)
+	if !ok {
+		t.Fatalf("acceptanceTriageNeedsHuman ok = false, want true for %q", disposition)
+	}
+	if class != "5" || got != disposition {
+		t.Errorf("class/disposition = %q/%q, want 5/%q", class, got, disposition)
 	}
 }

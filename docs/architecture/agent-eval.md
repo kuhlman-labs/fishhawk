@@ -240,7 +240,7 @@ The feed pipeline:
    observed behavior
    (`observed`/`expected`/`steps_taken`/`expectation_basis`/
    `repro_handle`/`result`). An unresolvable id still yields a record
-   keyed by the id with empty provenance. Omitted for classes 1/2/4.
+   keyed by the id with empty provenance. Omitted for classes 1/2/4/5.
 2. **Distill.** `fishhawk-distill-corpus --plan-review-miss` (backed by
    `corpusdistill.DistillPlanReviewMiss` / `PreviewPlanReviewMiss` and
    `FetchRunTriageAudit`, which follows `next_cursor` pages past the
@@ -276,6 +276,37 @@ discipline as the Tier-A/Tier-B seeds.
 The queryable metric lives on the API: `GET /v0/acceptance-triage/stats`
 reports `plan_review_miss_rate` (class-3 decisions / all triage
 decisions, per DECISION not per run) — see `docs/api/v0.md`.
+
+## Acceptance triage class 5 (externally-unvalidatable, #1671)
+
+`classifyAcceptanceFailure`
+(`backend/internal/server/acceptance.go`) splits the historical class-2
+"no criterion failed but ≥1 was skipped" partition into two. The
+acceptance agent runs under a default-deny egress sandbox against the
+localhost preview only, so a criterion whose trigger requires an
+external event it cannot produce (closing a GitHub issue, firing a
+webhook) is correctly marked `skipped` with the reason in
+`expectation_basis` (posture-A can't-exhibit, #1612).
+
+- **Class 2 (bounded flake retry, unchanged).** An all-skip verdict
+  where at least one skipped criterion LACKS `expectation_basis` is
+  genuinely ambiguous → re-open the acceptance stage and re-run, bounded
+  by `defaultMaxAcceptanceReruns`.
+- **Class 5 (terminal externally-unvalidatable page).** An all-skip
+  verdict where EVERY skipped criterion carries a non-empty
+  `expectation_basis` → the disposition
+  `externally_unvalidatable_paged`, which takes **no state transition**.
+  The acceptance stage stays `succeeded`/terminal so
+  `fishhawk_audit_complete` can clear and the operator arbitrates via
+  the normal gate. This removes the deterministically-futile class-2
+  retry loop (the sandbox still cannot reach the external service) that
+  otherwise wedged the merge gate. Class 5 never re-opens the stage, so
+  it never contributes to the auto-routed re-run count.
+
+`externally_unvalidatable_paged` is a paged-family disposition: it fires
+the `must_page_human` anchor ping (`issuecomment/ping.go`) and routes
+the MCP `next_actions` to the `acceptance_triage_paged` arbitration arm
+(`cmd/fishhawk-mcp/next_actions.go`).
 
 ## Deferred to follow-up
 

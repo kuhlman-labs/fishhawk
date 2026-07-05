@@ -1770,6 +1770,14 @@ func buildPlan(t Trigger) string {
 		"does NOT cover. It is the mechanism a test-only or doc-only change uses to declare it intentionally authors no " +
 		"acceptance_criteria — populate out_of_scope with the reason instead of leaving the intent unstated. Author " +
 		"acceptance_criteria for feature changes; reach for out_of_scope when concrete criteria genuinely do not apply.\n")
+	b.WriteString("Externally-triggered criteria rule: the acceptance stage runs the acceptance agent under a DEFAULT-DENY egress " +
+		"sandbox against the localhost preview ONLY — it CANNOT reach GitHub or any third-party service to close an issue, push a " +
+		"commit, or fire a webhook. So a criterion whose trigger requires an external event the sandboxed acceptance agent cannot " +
+		"produce MUST be authored up front as EITHER (a) an explicit skip-expected criterion whose statement/verify_hint names the " +
+		"expectation basis and points at the integration / end-to-end test that actually validates the behavior with a fake, OR (b) " +
+		"covered by verification.out_of_scope with that reason — so it never enters the failed/retry path. Do NOT author it as a " +
+		"live-service criterion: the acceptance agent will correctly skip it (posture-A can't-exhibit) and, absent this guidance, " +
+		"that skip can wedge the merge gate.\n")
 	b.WriteString("\n")
 	b.WriteString("Cross-boundary test rule: when scope.files spans multiple architectural layers (request/response " +
 		"payload, domain type, persistence, render/consumer), verification.test_strategy MUST name an " +

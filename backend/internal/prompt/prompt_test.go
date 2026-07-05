@@ -642,6 +642,38 @@ func TestBuild_Plan_AcceptanceCriteriaAuthoringContract(t *testing.T) {
 	}
 }
 
+// TestBuild_Plan_ExternallyTriggeredCriteriaGuidance pins the #1671
+// externally-triggered-criteria rule: the plan prompt must teach that a
+// criterion whose trigger needs an external event the egress-sandboxed
+// acceptance agent cannot produce should be authored as a skip-expected /
+// integration-test-backed criterion (or out_of_scope) up front, so it never
+// enters the failed/retry path and wedges the merge gate.
+func TestBuild_Plan_ExternallyTriggeredCriteriaGuidance(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "Plan a change",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"Externally-triggered criteria rule",
+		"DEFAULT-DENY egress",
+		"localhost preview",
+		"external event",
+		"integration",
+		"skip-expected",
+		"posture-A",
+		"wedge the merge gate",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing externally-triggered-criteria guidance string %q\n---\n%s", w, got)
+		}
+	}
+}
+
 // TestBuild_Plan_CriterionInnerShape_LockstepWithStruct reflects
 // plan.AcceptanceCriterion's json tags and asserts every one is named in the
 // plan prompt. Compile-linked lockstep: adding a criterion field to the struct

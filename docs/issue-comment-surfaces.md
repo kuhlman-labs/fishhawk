@@ -118,7 +118,8 @@ Notes:
     A failed acceptance verdict was triaged (`server/acceptance.go::triageAcceptanceFailure`)
     and the disposition needs a human — the paged variants only (`paged`,
     `rerun_budget_exhausted`, `fixup_unavailable_paged`, `retry_unavailable_paged`,
-    `unsettled_paged`). The auto-routed dispositions (`fixup_dispatched`,
+    `unsettled_paged`, `externally_unvalidatable_paged` — the class-5 all-skip
+    externally-unvalidatable terminal page, #1671). The auto-routed dispositions (`fixup_dispatched`,
     `retry_dispatched`) stay **edit-only** — the fixup/retry surfaces already
     render, so a ping there would double-notify. The paged variants are
     otherwise silent on anchor edits, so they get a page-class ping: "🔎
