@@ -141,6 +141,96 @@ func TestShipAcceptance_HappyPath(t *testing.T) {
 	}
 }
 
+// seedHeadEntry adds a seeded head-report / dispatch audit entry for a run so
+// the acceptance head-binding tests can drive the dispatch anchor + head
+// precedence deterministically.
+func seedHeadEntry(au *auditFake, runID uuid.UUID, stageID *uuid.UUID, category string, seq int64, payload map[string]any) {
+	rid := runID
+	p, _ := json.Marshal(payload)
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: stageID, Category: category, Sequence: seq, Payload: p,
+	})
+}
+
+// TestShipAcceptance_RecordsValidatedHeadSHA proves binding condition 2: the
+// recorded head_sha is the head the stage was DISPATCHED against (dispatch-
+// anchored), so a fixup_pushed that landed AFTER dispatch does NOT re-bind the
+// verdict.
+func TestShipAcceptance_RecordsValidatedHeadSHA(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+	// The PR-open head is what the acceptance stage validated; a fix-up pushed a
+	// NEW head AFTER dispatch, which must be excluded by the dispatch anchor.
+	seedHeadEntry(au, runID, nil, "pull_request_opened", 5, map[string]any{"head_sha": "validatedhead"})
+	seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 10, map[string]any{"stage_id": stageID.String()})
+	seedHeadEntry(au, runID, nil, "fixup_pushed", 20, map[string]any{"head_sha": "posthead"})
+
+	priv, _ := sf.issue(t, runID)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := decodeAcceptanceOutcome(t, au)
+	if got := payload["head_sha"]; got != "validatedhead" {
+		t.Errorf("head_sha = %v, want the dispatch-anchored validated head %q (a post-dispatch fixup must not re-bind)", got, "validatedhead")
+	}
+}
+
+// TestShipAcceptance_HeadSHA_FixupBeforeDispatch binds to a fix-up head that
+// landed BEFORE dispatch (precedence: fixup_pushed > pull_request_opened).
+func TestShipAcceptance_HeadSHA_FixupBeforeDispatch(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+	seedHeadEntry(au, runID, nil, "pull_request_opened", 2, map[string]any{"head_sha": "prhead"})
+	seedHeadEntry(au, runID, nil, "fixup_pushed", 5, map[string]any{"head_sha": "fixhead"})
+	seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 10, map[string]any{"stage_id": stageID.String()})
+
+	priv, _ := sf.issue(t, runID)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := decodeAcceptanceOutcome(t, au)["head_sha"]; got != "fixhead" {
+		t.Errorf("head_sha = %v, want fixup head %q (a pre-dispatch fixup is what was validated)", got, "fixhead")
+	}
+}
+
+// TestShipAcceptance_HeadSHA_NoDispatchAnchor records an empty head_sha when the
+// stage has no acceptance_dispatched entry (a bare ship) — Option C then fails
+// closed to the 422 for that entry.
+func TestShipAcceptance_HeadSHA_NoDispatchAnchor(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+	seedHeadEntry(au, runID, nil, "pull_request_opened", 5, map[string]any{"head_sha": "prhead"})
+	// No acceptance_dispatched entry seeded.
+
+	priv, _ := sf.issue(t, runID)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := decodeAcceptanceOutcome(t, au)["head_sha"]; got != "" {
+		t.Errorf("head_sha = %v, want empty (no dispatch anchor → unbound)", got)
+	}
+}
+
+// acceptanceOutcomePayload decodes the single acceptance_outcome_recorded
+// payload the fake appended.
+func decodeAcceptanceOutcome(t *testing.T, au *auditFake) map[string]any {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, e := range au.appended {
+		if e.Category != CategoryAcceptanceOutcomeRecorded {
+			continue
+		}
+		var p map[string]any
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("unmarshal outcome payload: %v", err)
+		}
+		return p
+	}
+	t.Fatal("no acceptance_outcome_recorded entry appended")
+	return nil
+}
+
 // TestShipAcceptance_FailureModeCarryThrough is the E31.8 done-means: a failed
 // verdict persists the failure_mode verbatim in the audit payload for BOTH
 // error and assertion_fail, and maps the render outcome to "rejected".

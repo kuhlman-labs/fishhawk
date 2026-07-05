@@ -206,6 +206,61 @@ func ReviewPresent(in ReviewPresenceInputs) (present, backstopElapsed bool) {
 // Compute outright (GitHub flap shouldn't break the audit signal).
 type PRHeadFetcher func(ctx context.Context, installationID int64, repo githubclient.RepoRef, prNumber int) (headSHA string, err error)
 
+// HeadReportCategoriesByPrecedence lists a run's own-chain head-reporting
+// audit categories in DESCENDING precedence (#1682): the newest fixup_pushed
+// head (the most recently pushed commit) wins over a child_pushed head, which
+// wins over the pull_request_opened (PR-open) head. Within a category the
+// winner is the highest-sequence entry.
+//
+// This single ordering is the shared enabler consumed by BOTH the server-side
+// resolver (server.latestRunHeadSHA — acceptance head binding + Option C's
+// head-aware retry) AND the audit-check publisher (auditcheckpublisher's
+// findHeadSHA — the fishhawk_audit_complete Check Run target). Divergent head
+// resolution between the acceptance/retry path and audit_complete publishing is
+// exactly the failure this centralization prevents: both import this package so
+// they cannot drift.
+var HeadReportCategoriesByPrecedence = []string{"fixup_pushed", "child_pushed", "pull_request_opened"}
+
+// LatestReportedHeadSHA applies HeadReportCategoriesByPrecedence to a run's
+// chained audit entries: for the highest-precedence category that carries at
+// least one entry with a non-empty head_sha payload field, it returns the
+// head_sha of that category's highest-sequence entry. Returns ("", false) when
+// no entry carries a head_sha.
+//
+// Pure over the passed entries — the caller fetches them (the entry set may
+// mix categories; only the head-report categories are considered). Sequence is
+// the monotonic per-table INSERT position, so "highest sequence" is
+// unambiguously "most recently recorded".
+func LatestReportedHeadSHA(entries []*audit.Entry) (string, bool) {
+	type winner struct {
+		seq int64
+		sha string
+		set bool
+	}
+	byCategory := map[string]winner{}
+	for _, e := range entries {
+		if e == nil {
+			continue
+		}
+		var p struct {
+			HeadSHA string `json:"head_sha"`
+		}
+		if json.Unmarshal(e.Payload, &p) != nil || p.HeadSHA == "" {
+			continue
+		}
+		w := byCategory[e.Category]
+		if !w.set || e.Sequence > w.seq {
+			byCategory[e.Category] = winner{seq: e.Sequence, sha: p.HeadSHA, set: true}
+		}
+	}
+	for _, cat := range HeadReportCategoriesByPrecedence {
+		if w, ok := byCategory[cat]; ok && w.set {
+			return w.sha, true
+		}
+	}
+	return "", false
+}
+
 // Compute returns the audit-completeness state for the run plus a
 // list of structured missing items. Both are returned together so
 // the SPA can render "fail because: plan_missing, trace_missing
@@ -714,6 +769,30 @@ func gatherForeignCommitInputs(ctx context.Context, deps Deps, runID uuid.UUID) 
 				// is authoritative for the PR number.
 				if prNumber == 0 && num > 0 {
 					prNumber = num
+				}
+			}
+		}
+
+		// #1682: a fix-up push places a NEW head on the PR branch that
+		// the stale PR-open artifact does not record. Union in this run's
+		// own head-report audit entries (fixup_pushed / child_pushed /
+		// pull_request_opened head_shas) so a post-fixup live HEAD is
+		// recognized as Fishhawk-authored rather than flagged
+		// foreign_commit by rule 5. Additive to the artifact-derived set;
+		// a read failure is transient I/O (matching the artifact-read
+		// posture above), so it aborts the gather rather than silently
+		// under-populating known and false-flagging a legitimate head.
+		for _, cat := range HeadReportCategoriesByPrecedence {
+			entries, err := deps.Audit.ListForRunByCategory(ctx, r.ID, cat)
+			if err != nil {
+				return foreignCommitInputs{}, false, fmt.Errorf("list %s heads for %s: %w", cat, shortID(r.ID), err)
+			}
+			for _, e := range entries {
+				var p struct {
+					HeadSHA string `json:"head_sha"`
+				}
+				if json.Unmarshal(e.Payload, &p) == nil && p.HeadSHA != "" {
+					known[p.HeadSHA] = struct{}{}
 				}
 			}
 		}

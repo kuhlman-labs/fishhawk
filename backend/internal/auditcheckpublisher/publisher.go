@@ -37,6 +37,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -63,12 +64,21 @@ type CheckRunCreator interface {
 	CreateCheckRun(ctx context.Context, installationID int64, repo githubclient.RepoRef, p githubclient.CreateCheckRunParams) (*githubclient.CreateCheckRunResult, error)
 }
 
+// AuditReader is the slice of audit.Repository the publisher needs to prefer
+// the run's newest fixup_pushed head over the stale PR-open artifact head
+// (#1682). A narrow interface (not the full audit.Repository) keeps the test
+// fake trivial. Optional — a nil AuditReader falls back to the artifact head.
+type AuditReader interface {
+	ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error)
+}
+
 // Publisher publishes audit-complete state to GitHub. Construct
 // once with New and share — concurrent calls to Publish are safe.
 type Publisher struct {
 	github      CheckRunCreator
 	runs        run.Repository
 	artifacts   artifact.Repository
+	audit       AuditReader
 	externalURL string
 	onDegraded  func(ctx context.Context, runID uuid.UUID, headSHA string, attempts int, lastErr error)
 	onRecovered func(ctx context.Context, runID uuid.UUID, headSHA string, attempts int)
@@ -94,6 +104,14 @@ type Deps struct {
 	Runs        run.Repository
 	Artifacts   artifact.Repository
 	ExternalURL string
+
+	// Audit, when set, lets findHeadSHA prefer the run's newest fixup_pushed
+	// head over the stale PR-open artifact head (#1682) — resolved through the
+	// SAME auditcomplete.LatestReportedHeadSHA ordering the server-side
+	// resolver uses, so audit_complete publishing and acceptance/retry head
+	// binding cannot diverge. Nil (legacy / dev posture) falls back to the
+	// artifact head, preserving the pre-#1682 behavior.
+	Audit AuditReader
 
 	// OnDegraded, when non-nil, is invoked exactly once per failure
 	// episode (#993): the moment a (run, head_sha) pair accumulates
@@ -133,6 +151,7 @@ func New(d Deps) *Publisher {
 		github:      d.GitHub,
 		runs:        d.Runs,
 		artifacts:   d.Artifacts,
+		audit:       d.Audit,
 		externalURL: strings.TrimRight(d.ExternalURL, "/"),
 		onDegraded:  d.OnDegraded,
 		onRecovered: d.OnRecovered,
@@ -296,16 +315,43 @@ func (p *Publisher) detailsURL(runID uuid.UUID) string {
 	return p.externalURL + "/runs/" + runID.String()
 }
 
-// findHeadSHA walks the run's stages, locates the implement stage,
-// and pulls head_sha out of its pull_request artifact body. Returns
-// (sha, true, nil) on success, ("", false, nil) when the run has no
-// implement stage or no PR artifact (still dispatching, or a
+// findHeadSHA resolves the head the fishhawk_audit_complete Check Run targets.
+//
+// #1682: it FIRST prefers the run's newest recorded head from the audit chain
+// (fixup_pushed > child_pushed > pull_request_opened, via the shared
+// auditcomplete.LatestReportedHeadSHA), so a fix-up push retargets the check
+// onto the new commit instead of leaving it pinned to the stale PR-open head.
+// This is the SAME ordering server.latestRunHeadSHA uses, so audit_complete
+// publishing and the acceptance/retry head binding cannot resolve divergent
+// heads for the same audit history. When the audit reader is not wired (nil
+// Audit dep) or records no head, it falls back to the pull_request artifact
+// head — the pre-#1682 behavior.
+//
+// Returns (sha, true, nil) on success, ("", false, nil) when the run has no
+// recorded head and no implement-stage PR artifact (still dispatching, or a
 // workflow shape with no implement stage yet).
 //
 // We re-decode the artifact content rather than reaching into the
 // server.pullRequestBody type to avoid an import cycle (the server
 // package depends on this one in production).
 func (p *Publisher) findHeadSHA(ctx context.Context, runID uuid.UUID) (string, bool, error) {
+	// Prefer the newest audit-recorded head (#1682). A read error is returned
+	// so the caller surfaces it rather than silently publishing to a stale
+	// head; a clean miss falls through to the artifact head below.
+	if p.audit != nil {
+		var entries []*audit.Entry
+		for _, cat := range auditcomplete.HeadReportCategoriesByPrecedence {
+			es, err := p.audit.ListForRunByCategory(ctx, runID, cat)
+			if err != nil {
+				return "", false, fmt.Errorf("auditcheckpublisher: list %s heads: %w", cat, err)
+			}
+			entries = append(entries, es...)
+		}
+		if sha, ok := auditcomplete.LatestReportedHeadSHA(entries); ok {
+			return sha, true, nil
+		}
+	}
+
 	stages, err := p.runs.ListStagesForRun(ctx, runID)
 	if err != nil {
 		return "", false, err

@@ -550,6 +550,11 @@ func New(cfg Config) *Server {
 			Runs:        cfg.RunRepo,
 			Artifacts:   cfg.ArtifactRepo,
 			ExternalURL: cfg.ExternalURL,
+			// #1682: the audit reader lets findHeadSHA prefer the run's
+			// newest fixup_pushed head over the stale PR-open artifact head,
+			// via the same auditcomplete ordering the server-side resolver
+			// uses. Nil-tolerant in the publisher, but always wired here.
+			Audit: cfg.AuditRepo,
 			// Persistent-failure surfacing (#993): a sustained
 			// CreateCheckRun failure streak / its eventual recovery
 			// land as paired run-chain audit entries.

@@ -433,6 +433,88 @@ func TestCompute_Rule5_NilPRHead_SkipsCleanly(t *testing.T) {
 	}
 }
 
+// TestCompute_Rule5_FixupPushedHead_NotForeign proves the #1682 knownSHAs
+// extension: a live PR HEAD present ONLY in a fixup_pushed audit entry (not in
+// the stale PR-open artifact) is recognized as Fishhawk-authored, not flagged
+// foreign_commit. Without the extension the recomputed audit_complete would go
+// red after a fix-up repost.
+func TestCompute_Rule5_FixupPushedHead_NotForeign(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	const fixupHead = "feedface2222feedface2222feedface22222222"
+	// Only the fix-up push records the new head; the PR-open artifact still
+	// carries the stale head from foreignCommitSetup.
+	implID := runs.stages[1].ID
+	ar.appendChained(t, runID, &implID, "fixup_pushed",
+		json.RawMessage(`{"head_sha":"`+fixupHead+`"}`))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, fixupHead, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (fixup head must not be foreign); missing=%+v", state, missing)
+	}
+	if containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("fixup_pushed head should be a known SHA, not foreign_commit; got %+v", missing)
+	}
+}
+
+// TestLatestReportedHeadSHA covers the shared resolver's precedence + ordering
+// (#1682): fixup_pushed wins over child_pushed wins over pull_request_opened;
+// within a category the highest-sequence entry wins; no head → (_, false).
+func TestLatestReportedHeadSHA(t *testing.T) {
+	entry := func(cat, sha string, seq int64) *audit.Entry {
+		return &audit.Entry{Category: cat, Sequence: seq,
+			Payload: json.RawMessage(`{"head_sha":"` + sha + `"}`)}
+	}
+	cases := []struct {
+		name    string
+		entries []*audit.Entry
+		want    string
+		wantOK  bool
+	}{
+		{"empty", nil, "", false},
+		{"pr only", []*audit.Entry{entry("pull_request_opened", "pr", 1)}, "pr", true},
+		{"fixup beats pr", []*audit.Entry{
+			entry("pull_request_opened", "pr", 1),
+			entry("fixup_pushed", "fix", 5),
+		}, "fix", true},
+		{"child beats pr", []*audit.Entry{
+			entry("pull_request_opened", "pr", 1),
+			entry("child_pushed", "child", 3),
+		}, "child", true},
+		{"fixup beats child and pr", []*audit.Entry{
+			entry("pull_request_opened", "pr", 1),
+			entry("child_pushed", "child", 3),
+			entry("fixup_pushed", "fix", 2),
+		}, "fix", true},
+		{"newest fixup by sequence", []*audit.Entry{
+			entry("fixup_pushed", "old", 2),
+			entry("fixup_pushed", "new", 9),
+			entry("fixup_pushed", "mid", 5),
+		}, "new", true},
+		{"non-head category ignored", []*audit.Entry{
+			entry("acceptance_outcome_recorded", "acc", 10),
+			entry("pull_request_opened", "pr", 1),
+		}, "pr", true},
+		{"empty head_sha skipped", []*audit.Entry{
+			entry("fixup_pushed", "", 9),
+			entry("pull_request_opened", "pr", 1),
+		}, "pr", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := auditcomplete.LatestReportedHeadSHA(tc.entries)
+			if got != tc.want || ok != tc.wantOK {
+				t.Errorf("LatestReportedHeadSHA = (%q, %v); want (%q, %v)", got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+}
+
 // --- Rule 6 (review-pending presence gate, #947) ---
 
 func TestReviewPresent(t *testing.T) {

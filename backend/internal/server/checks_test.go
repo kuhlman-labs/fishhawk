@@ -12,6 +12,9 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
@@ -264,5 +267,73 @@ func TestListStageChecks_Unconfigured_503(t *testing.T) {
 	s.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", w.Code)
+	}
+}
+
+// TestFixupHeadResolution_ServerAndPublisherAgree is the #1682 binding
+// condition 1 cross-boundary assertion: the server-side resolver
+// (s.latestRunHeadSHA) and the publisher-side resolver (findHeadSHA, exercised
+// through Publish's posted head) resolve the IDENTICAL head for the SAME audit
+// history — a newest fixup_pushed head that supersedes the stale PR-open
+// artifact head. Both delegate to auditcomplete.LatestReportedHeadSHA, so they
+// cannot diverge; this proves it end-to-end across the two packages.
+func TestFixupHeadResolution_ServerAndPublisherAgree(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+	impl := rr.seedStage(r.ID, 1, run.StageStateSucceeded)
+	impl.Type = run.StageTypeImplement
+
+	arts := newFakeArtifactRepo()
+	// The PR-open artifact carries the STALE head; a fix-up pushed a newer one.
+	arts.all = append(arts.all, &artifact.Artifact{
+		ID: uuid.New(), StageID: impl.ID,
+		Kind:    artifact.KindPullRequest,
+		Content: pullRequestArtifactBody("stalehead"),
+	})
+
+	au := newAuditFake()
+	rid := r.ID
+	fixPayload, _ := json.Marshal(map[string]any{"head_sha": "freshfixhead"})
+	prPayload, _ := json.Marshal(map[string]any{"head_sha": "stalehead"})
+	au.seeded = []*audit.Entry{
+		{RunID: &rid, Category: "pull_request_opened", Sequence: 1, Payload: prPayload},
+		{RunID: &rid, Category: "fixup_pushed", Sequence: 9, Payload: fixPayload},
+	}
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ArtifactRepo: arts,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	// Server-side resolution.
+	serverHead, ok, err := s.latestRunHeadSHA(context.Background(), r.ID)
+	if err != nil || !ok {
+		t.Fatalf("latestRunHeadSHA = (%q, %v, %v)", serverHead, ok, err)
+	}
+
+	// Publisher-side resolution (through Publish's posted head).
+	gh := newPublisherFakeGitHub()
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, Runs: rr, Artifacts: arts, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	if pub == nil {
+		t.Fatal("publisher nil")
+	}
+	if _, err := pub.Publish(context.Background(), r.ID, stagecheck.StatePass, nil); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if len(gh.calls()) != 1 {
+		t.Fatalf("expected 1 publish, got %d", len(gh.calls()))
+	}
+	publisherHead := gh.calls()[0].params.HeadSHA
+
+	if serverHead != "freshfixhead" {
+		t.Errorf("server head = %q, want freshfixhead", serverHead)
+	}
+	if serverHead != publisherHead {
+		t.Errorf("head divergence: server = %q, publisher = %q (must be identical)", serverHead, publisherHead)
 	}
 }

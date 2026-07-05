@@ -268,10 +268,22 @@ func (s *Server) retryAcceptanceOutcomeUnknown(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// (ii) Fail closed on the evidence state: only a stage with NO
-	// acceptance_outcome_recorded verdict may reopen. A recorded verdict means
-	// the deterministic triage owns the routing (422); a read error means we
-	// cannot prove the stage is outcome-less, so refuse rather than reopen.
+	// (ii) Head-aware admit (E31.16 #1567 + #1682 Option C). The base rule: a
+	// stage with NO acceptance_outcome_recorded verdict may reopen (the #1567
+	// outcome-unknown hole); a verdict-ful stage normally belongs to the
+	// deterministic triage (422). The #1682 exception threads through here:
+	// when a fix-up push landed a NEW head AFTER the verdict was recorded, the
+	// verdict is bound to a STALE commit — admit the re-open so acceptance
+	// re-validates the final commit, rather than a blanket 422. Staleness is
+	// exactly recorded_head != current_head.
+	//
+	// Fail closed to today's 422 on every uncertainty so a re-open never fires
+	// on ambiguous evidence: the recorded verdict has no head_sha (a pre-#1682
+	// entry), the current head cannot be resolved, or the two heads are equal.
+	// A read error means we cannot prove the stage state, so refuse (500). This
+	// arm is genuinely reachable independent of Option A (binding condition 3):
+	// it admits a stale-head verdict reached via ANY route, keyed only on the
+	// recorded-vs-current head mismatch, not on a pre-reopen timing window.
 	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, stage.RunID, CategoryAcceptanceOutcomeRecorded)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -279,13 +291,24 @@ func (s *Server) retryAcceptanceOutcomeUnknown(w http.ResponseWriter, r *http.Re
 			map[string]any{"error": err.Error()})
 		return
 	}
-	for _, e := range entries {
-		if e.StageID != nil && *e.StageID == stage.ID {
+	recordedHead, hasVerdict := latestAcceptanceVerdictHead(entries, stage.ID)
+	if hasVerdict {
+		currentHead, currentOK, headErr := s.latestRunHeadSHA(ctx, stage.RunID)
+		if headErr != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"resolve current head for acceptance retry failed",
+				map[string]any{"error": headErr.Error()})
+			return
+		}
+		staleHead := recordedHead != "" && currentOK && currentHead != "" && recordedHead != currentHead
+		if !staleHead {
 			s.writeError(w, r, http.StatusUnprocessableEntity, "retry_not_applicable",
-				"a verdict was already recorded for this acceptance stage; verdict-ful routing belongs to the deterministic triage, not a re-open",
+				"a verdict was already recorded for this acceptance stage and it corresponds to the run's current head; verdict-ful routing belongs to the deterministic triage, not a re-open",
 				map[string]any{"stage_id": stage.ID.String()})
 			return
 		}
+		// Stale-head verdict: the recorded head differs from the run's current
+		// head, so a fix-up push invalidated it. Fall through to the re-open.
 	}
 
 	// (iii) Re-open succeeded → pending via the class-2 verb. A refusal
@@ -325,6 +348,34 @@ func (s *Server) retryAcceptanceOutcomeUnknown(w http.ResponseWriter, r *http.Re
 	s.notifyStatusUpdate(ctx, stage.RunID, "acceptance_reopened")
 
 	s.writeJSON(w, r, http.StatusOK, toStageResponse(dec.Stage))
+}
+
+// latestAcceptanceVerdictHead returns the head_sha payload field of the
+// highest-sequence acceptance_outcome_recorded entry scoped to stageID, and
+// whether any verdict exists for the stage (#1682 Option C). A verdict entry
+// with no head_sha (a pre-#1682 record) yields ("", true) — the caller then
+// fails closed to the 422 because an empty recorded head cannot prove staleness.
+func latestAcceptanceVerdictHead(entries []*audit.Entry, stageID uuid.UUID) (string, bool) {
+	var (
+		seq   int64
+		head  string
+		found bool
+	)
+	for _, e := range entries {
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		if !found || e.Sequence > seq {
+			var p struct {
+				HeadSHA string `json:"head_sha"`
+			}
+			_ = json.Unmarshal(e.Payload, &p)
+			head = p.HeadSHA
+			seq = e.Sequence
+			found = true
+		}
+	}
+	return head, found
 }
 
 // writeAcceptanceReopenAudit appends the acceptance_reopened chained entry for

@@ -859,6 +859,148 @@ func TestShipPullRequest_FixupPushOutcome_IsIdempotent(t *testing.T) {
 	}
 }
 
+// --- Option A: fix-up-driven acceptance invalidation (#1682) ---
+//
+// reopenAcceptanceOnFixupPush is exercised directly (white-box) rather than
+// through the fix-up push HTTP path: the acceptance re-open uses the
+// succeeded → pending fix-up edge (run.ValidStageFixupTransition), and the
+// orchestratorRepo test fake newPRServerWithOrch wires validates ONLY the
+// normal transition table — so the reopen must ride the approvalRunRepo (via
+// reopenRetryServer), which mirrors the production repo's fix-up edge.
+
+// acceptanceReopenedCount returns how many acceptance_reopened audit entries the
+// reopen fake recorded.
+func acceptanceReopenedCount(au *reopenAuditFake) int {
+	var n int
+	for _, e := range au.appended {
+		if e.Category == CategoryAcceptanceReopened {
+			n++
+		}
+	}
+	return n
+}
+
+// seedAcceptanceVerdict wires a recorded acceptance_outcome_recorded verdict for
+// stageID into the reopen fake's category history.
+func seedAcceptanceVerdict(au *reopenAuditFake, stageID uuid.UUID) {
+	if au.byCategory == nil {
+		au.byCategory = map[string][]*audit.Entry{}
+	}
+	au.byCategory[CategoryAcceptanceOutcomeRecorded] = append(
+		au.byCategory[CategoryAcceptanceOutcomeRecorded], acceptanceOutcomeEntryFor(stageID))
+}
+
+// A fix-up push AFTER a settled, verdict-ful acceptance stage re-opens that
+// stage (succeeded → pending) and appends an acceptance_reopened invalidation.
+func TestReopenAcceptanceOnFixupPush_ReopensSettledVerdictfulStage(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	runID := uuid.New()
+	repo.seedRun(&run.Run{ID: runID, State: run.StateRunning})
+	acc := repo.seedStageOnRun(runID, run.StageTypeAcceptance, run.StageStateSucceeded)
+	seedAcceptanceVerdict(au, acc.ID)
+
+	s.reopenAcceptanceOnFixupPush(context.Background(), runID, "newhead")
+
+	got, _ := repo.GetStage(context.Background(), acc.ID)
+	if got.State != run.StageStatePending {
+		t.Errorf("acceptance stage state = %q, want pending after fix-up invalidation", got.State)
+	}
+	if n := acceptanceReopenedCount(au); n != 1 {
+		t.Errorf("acceptance_reopened entries = %d, want 1", n)
+	}
+}
+
+// A fix-up push with the acceptance stage NOT yet succeeded (a PRE-acceptance
+// fix-up) must NOT re-open anything.
+func TestReopenAcceptanceOnFixupPush_PreAcceptance_LeavesStageAlone(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	runID := uuid.New()
+	repo.seedRun(&run.Run{ID: runID, State: run.StateRunning})
+	acc := repo.seedStageOnRun(runID, run.StageTypeAcceptance, run.StageStatePending)
+	seedAcceptanceVerdict(au, acc.ID)
+
+	s.reopenAcceptanceOnFixupPush(context.Background(), runID, "newhead")
+
+	got, _ := repo.GetStage(context.Background(), acc.ID)
+	if got.State != run.StageStatePending {
+		t.Errorf("acceptance stage state = %q, want unchanged pending", got.State)
+	}
+	if n := acceptanceReopenedCount(au); n != 0 {
+		t.Errorf("acceptance_reopened entries = %d, want 0 (pre-acceptance fix-up must not reopen)", n)
+	}
+}
+
+// A fix-up push on a run with NO acceptance stage is unaffected.
+func TestReopenAcceptanceOnFixupPush_NoAcceptanceStage_Unaffected(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	runID := uuid.New()
+	repo.seedRun(&run.Run{ID: runID, State: run.StateRunning})
+	repo.seedStageOnRun(runID, run.StageTypeImplement, run.StageStateRunning)
+
+	s.reopenAcceptanceOnFixupPush(context.Background(), runID, "newhead")
+
+	if n := acceptanceReopenedCount(au); n != 0 {
+		t.Errorf("acceptance_reopened entries = %d, want 0", n)
+	}
+}
+
+// A succeeded acceptance stage with NO recorded verdict is the #1567
+// operator-reopen hole, not a fix-up invalidation — leave it untouched.
+func TestReopenAcceptanceOnFixupPush_SucceededNoVerdict_NotReopened(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	runID := uuid.New()
+	repo.seedRun(&run.Run{ID: runID, State: run.StateRunning})
+	acc := repo.seedStageOnRun(runID, run.StageTypeAcceptance, run.StageStateSucceeded)
+	// No acceptance_outcome_recorded seeded.
+
+	s.reopenAcceptanceOnFixupPush(context.Background(), runID, "newhead")
+
+	got, _ := repo.GetStage(context.Background(), acc.ID)
+	if got.State != run.StageStateSucceeded {
+		t.Errorf("acceptance stage state = %q, want unchanged succeeded (no verdict → #1567 owns it)", got.State)
+	}
+	if n := acceptanceReopenedCount(au); n != 0 {
+		t.Errorf("acceptance_reopened entries = %d, want 0", n)
+	}
+}
+
+// A verdict read error fails closed — the reopen is skipped (never fires on
+// unknown evidence state).
+func TestReopenAcceptanceOnFixupPush_VerdictReadError_Skips(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	runID := uuid.New()
+	repo.seedRun(&run.Run{ID: runID, State: run.StateRunning})
+	acc := repo.seedStageOnRun(runID, run.StageTypeAcceptance, run.StageStateSucceeded)
+	au.byCategoryErr = errors.New("audit read down")
+
+	s.reopenAcceptanceOnFixupPush(context.Background(), runID, "newhead")
+
+	got, _ := repo.GetStage(context.Background(), acc.ID)
+	if got.State != run.StageStateSucceeded {
+		t.Errorf("acceptance stage state = %q, want unchanged succeeded (fail closed on read error)", got.State)
+	}
+	if n := acceptanceReopenedCount(au); n != 0 {
+		t.Errorf("acceptance_reopened entries = %d, want 0", n)
+	}
+}
+
+// Idempotency: a second call after the stage is already pending is a no-op —
+// the reopen cannot double-fire (the guard rejects a non-succeeded stage).
+func TestReopenAcceptanceOnFixupPush_Idempotent(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	runID := uuid.New()
+	repo.seedRun(&run.Run{ID: runID, State: run.StateRunning})
+	acc := repo.seedStageOnRun(runID, run.StageTypeAcceptance, run.StageStateSucceeded)
+	seedAcceptanceVerdict(au, acc.ID)
+
+	s.reopenAcceptanceOnFixupPush(context.Background(), runID, "newhead")
+	s.reopenAcceptanceOnFixupPush(context.Background(), runID, "newhead") // re-delivery
+
+	if n := acceptanceReopenedCount(au); n != 1 {
+		t.Errorf("acceptance_reopened entries = %d, want 1 (second call must not double-reopen)", n)
+	}
+}
+
 // TestShipPullRequest_FixupPushOutcome_RejectsMissingCoords pins the #794
 // validation: the fixup_pushed variant requires branch + head_sha + base_sha
 // (no new PR was opened, so those coordinates are the only record of what
