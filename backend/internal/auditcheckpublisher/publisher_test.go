@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -885,6 +886,137 @@ func (r *episodeCalls) recoveredCalls() []episodeCall {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]episodeCall{}, r.recovered...)
+}
+
+// TestPublish_PrefersFixupPushedHeadOverArtifact proves the #1682 head
+// resolver: with an Audit dep wired, findHeadSHA targets the newest
+// fixup_pushed head, NOT the stale PR-open artifact head.
+func TestPublish_PrefersFixupPushedHeadOverArtifact(t *testing.T) {
+	runID := uuid.New()
+	implID := uuid.New()
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "x/y", InstallationID: int64Ptr(42),
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: implID, Type: run.StageTypeImplement, RunID: runID},
+		}},
+	}
+	// The PR-open artifact records the STALE head; a later fix-up pushed a new one.
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		implID: {prArtifact(implID, "stalehead")},
+	}}
+	aud := &fakeAuditReader{byCat: map[string][]*audit.Entry{
+		"pull_request_opened": {headEntry("pull_request_opened", "stalehead", 1)},
+		"fixup_pushed":        {headEntry("fixup_pushed", "freshhead", 5)},
+	}}
+	gh := &fakeGitHub{}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, Runs: repoRuns, Artifacts: repoArts, Audit: aud,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	if pub == nil {
+		t.Fatal("publisher nil")
+	}
+	if _, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(gh.calls))
+	}
+	if got := gh.calls[0].params.HeadSHA; got != "freshhead" {
+		t.Errorf("head_sha = %q; want the newest fixup_pushed head %q", got, "freshhead")
+	}
+}
+
+// TestPublish_NoAuditHead_FallsBackToArtifact proves the fallback branch: an
+// Audit dep that records no head_sha degrades to the PR-open artifact head.
+func TestPublish_NoAuditHead_FallsBackToArtifact(t *testing.T) {
+	runID := uuid.New()
+	implID := uuid.New()
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "x/y", InstallationID: int64Ptr(42),
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: implID, Type: run.StageTypeImplement, RunID: runID},
+		}},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		implID: {prArtifact(implID, "abc123")},
+	}}
+	aud := &fakeAuditReader{byCat: map[string][]*audit.Entry{}} // no head entries
+	gh := &fakeGitHub{}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, Runs: repoRuns, Artifacts: repoArts, Audit: aud,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	if pub == nil {
+		t.Fatal("publisher nil")
+	}
+	if _, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(gh.calls))
+	}
+	if got := gh.calls[0].params.HeadSHA; got != "abc123" {
+		t.Errorf("head_sha = %q; want artifact fallback %q", got, "abc123")
+	}
+}
+
+// TestPublish_AuditReadError_Propagates proves the defensive branch: a read
+// error resolving the audit head surfaces as a Publish error (never a silent
+// publish to a stale head).
+func TestPublish_AuditReadError_Propagates(t *testing.T) {
+	runID := uuid.New()
+	implID := uuid.New()
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "x/y", InstallationID: int64Ptr(42),
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: implID, Type: run.StageTypeImplement, RunID: runID},
+		}},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		implID: {prArtifact(implID, "abc123")},
+	}}
+	aud := &fakeAuditReader{err: errors.New("boom")}
+	gh := &fakeGitHub{}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, Runs: repoRuns, Artifacts: repoArts, Audit: aud,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	if pub == nil {
+		t.Fatal("publisher nil")
+	}
+	if _, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil); err == nil {
+		t.Fatal("expected a Publish error from the audit read failure")
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("expected no GitHub call on a head-resolution error, got %d", len(gh.calls))
+	}
+}
+
+// headEntry builds a head-report audit entry carrying a head_sha payload.
+func headEntry(category, headSHA string, seq int64) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{"head_sha": headSHA})
+	return &audit.Entry{Category: category, Sequence: seq, Payload: payload}
+}
+
+// fakeAuditReader is a minimal auditcheckpublisher.AuditReader for the #1682
+// head-resolution tests.
+type fakeAuditReader struct {
+	byCat map[string][]*audit.Entry
+	err   error
+}
+
+func (f *fakeAuditReader) ListForRunByCategory(_ context.Context, _ uuid.UUID, category string) ([]*audit.Entry, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.byCat[category], nil
 }
 
 func int64Ptr(v int64) *int64 { return &v }

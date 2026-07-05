@@ -996,13 +996,41 @@ type reopenAuditFake struct {
 	*approvalAuditFake
 	byCategory    map[string][]*audit.Entry
 	byCategoryErr error
+	// catErr injects a read error on exactly one category (the #1682 Option C
+	// tests drive a head-category read failure while the outcome read succeeds).
+	catErr map[string]error
 }
 
 func (a *reopenAuditFake) ListForRunByCategory(_ context.Context, _ uuid.UUID, category string) ([]*audit.Entry, error) {
+	if err := a.catErr[category]; err != nil {
+		return nil, err
+	}
 	if a.byCategoryErr != nil {
 		return nil, a.byCategoryErr
 	}
 	return a.byCategory[category], nil
+}
+
+// acceptanceOutcomeEntryWithHead builds an acceptance_outcome_recorded entry
+// carrying the given stage id AND a head_sha payload (the #1682 binding the
+// verdict to the head it validated).
+func acceptanceOutcomeEntryWithHead(stageID uuid.UUID, headSHA string) *audit.Entry {
+	sid := stageID
+	payload, _ := json.Marshal(map[string]any{"head_sha": headSHA})
+	return &audit.Entry{
+		ID:       uuid.New(),
+		StageID:  &sid,
+		Category: CategoryAcceptanceOutcomeRecorded,
+		Payload:  payload,
+		Sequence: 1,
+	}
+}
+
+// headReportEntry builds a head-report audit entry (fixup_pushed /
+// child_pushed / pull_request_opened) carrying a head_sha payload.
+func headReportEntry(category, headSHA string, seq int64) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{"head_sha": headSHA})
+	return &audit.Entry{ID: uuid.New(), Category: category, Payload: payload, Sequence: seq}
 }
 
 // reopenRetryServer wires the retry handler with a reopenAuditFake so the
@@ -1244,6 +1272,125 @@ func TestRetryStage_AcceptanceReopen_ReopenError_500(t *testing.T) {
 	}
 	if len(au.appended) != 0 {
 		t.Errorf("audit chain = %+v, want no write when the reopen errored", au.appended)
+	}
+}
+
+// --- Option C: head-aware retry admit (#1682) ---
+
+// C1: a verdict recorded against a STALE head (recorded head != run's current
+// head, because a fix-up push landed a new commit) ADMITS the re-open, on
+// Option C's own logic — constructed by seeding the stale-head state directly
+// (recorded H1, current head H2), NOT via a pre-reopen timing window that
+// Option A would have closed (binding condition 3).
+func TestRetryStage_AcceptanceReopen_StaleHead_Admits(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	au.byCategory = map[string][]*audit.Entry{
+		CategoryAcceptanceOutcomeRecorded: {acceptanceOutcomeEntryWithHead(stage.ID, "H1oldhead")},
+		// A fix-up pushed a NEW head after the verdict — the run's current head.
+		"fixup_pushed": {headReportEntry("fixup_pushed", "H2newhead", 5)},
+	}
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (stale-head verdict admits):\n%s", w.Code, w.Body.String())
+	}
+	if got, _ := repo.GetStage(context.Background(), stage.ID); got.State != run.StageStatePending {
+		t.Errorf("stage state = %q, want pending after stale-head reopen", got.State)
+	}
+	if len(au.appended) != 1 || au.appended[0].Category != CategoryAcceptanceReopened {
+		t.Fatalf("audit chain = %+v, want one acceptance_reopened entry", au.appended)
+	}
+}
+
+// C2: a verdict recorded against the run's CURRENT head (recorded == current)
+// keeps the 422 — the verdict still corresponds to the head, so deterministic
+// triage owns it, not a re-open.
+func TestRetryStage_AcceptanceReopen_CurrentHead_422(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	au.byCategory = map[string][]*audit.Entry{
+		CategoryAcceptanceOutcomeRecorded: {acceptanceOutcomeEntryWithHead(stage.ID, "H1same")},
+		"pull_request_opened":             {headReportEntry("pull_request_opened", "H1same", 1)},
+	}
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (verdict matches current head):\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "retry_not_applicable") {
+		t.Errorf("body missing retry_not_applicable:\n%s", w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit chain = %+v, want no write on the 422", au.appended)
+	}
+}
+
+// C3: a verdict with NO head_sha (a pre-#1682 record) fails closed to the 422
+// even when a current head resolves — an empty recorded head cannot prove
+// staleness, so the conservative refusal holds.
+func TestRetryStage_AcceptanceReopen_NoRecordedHead_422(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	au.byCategory = map[string][]*audit.Entry{
+		CategoryAcceptanceOutcomeRecorded: {acceptanceOutcomeEntryFor(stage.ID)}, // no head_sha payload
+		"fixup_pushed":                    {headReportEntry("fixup_pushed", "H2newhead", 5)},
+	}
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (empty recorded head fails closed):\n%s", w.Code, w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit chain = %+v, want no write on the 422", au.appended)
+	}
+}
+
+// C4: a verdict with a recorded head but NO resolvable current head (no
+// head-report entries) fails closed to the 422 — an unresolvable current head
+// cannot prove staleness.
+func TestRetryStage_AcceptanceReopen_CurrentHeadUnresolvable_422(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	au.byCategory = map[string][]*audit.Entry{
+		CategoryAcceptanceOutcomeRecorded: {acceptanceOutcomeEntryWithHead(stage.ID, "H1oldhead")},
+		// No fixup_pushed / child_pushed / pull_request_opened entries seeded.
+	}
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (current head unresolvable fails closed):\n%s", w.Code, w.Body.String())
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit chain = %+v, want no write on the 422", au.appended)
+	}
+}
+
+// C5: a read error resolving the CURRENT head (the outcome read succeeds, but a
+// head-category read errors) surfaces as 500 — never a spurious admit on an
+// unreadable head.
+func TestRetryStage_AcceptanceReopen_CurrentHeadReadError_500(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	au.byCategory = map[string][]*audit.Entry{
+		CategoryAcceptanceOutcomeRecorded: {acceptanceOutcomeEntryWithHead(stage.ID, "H1oldhead")},
+	}
+	au.catErr = map[string]error{"fixup_pushed": errors.New("head read down")}
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (head read error):\n%s", w.Code, w.Body.String())
+	}
+	if got, _ := repo.GetStage(context.Background(), stage.ID); got.State != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want unchanged succeeded (fail closed)", got.State)
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit chain = %+v, want no write on the 500", au.appended)
 	}
 }
 

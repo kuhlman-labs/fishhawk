@@ -126,6 +126,60 @@ func newLineageServer(t *testing.T, gh *githubclient.Client, runRow *run.Run, st
 
 func instID(v int64) *int64 { return &v }
 
+// seedRunHeadEntry adds a seeded head-report audit entry for latestRunHeadSHA
+// tests.
+func seedRunHeadEntry(au *auditFake, runID uuid.UUID, category, headSHA string, seq int64) {
+	rid := runID
+	payload, _ := json.Marshal(map[string]any{"head_sha": headSHA})
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, Category: category, Sequence: seq, Payload: payload,
+	})
+}
+
+// TestLatestRunHeadSHA covers the server-side resolver (#1682): it returns the
+// newest fixup_pushed head, falls back to the PR-open head with no fix-up,
+// returns (_, false) with no head recorded, and surfaces a read error.
+func TestLatestRunHeadSHA(t *testing.T) {
+	t.Run("prefers newest fixup_pushed", func(t *testing.T) {
+		runID := uuid.New()
+		au := newAuditFake()
+		seedRunHeadEntry(au, runID, "pull_request_opened", "prhead", 1)
+		seedRunHeadEntry(au, runID, "fixup_pushed", "oldfix", 3)
+		seedRunHeadEntry(au, runID, "fixup_pushed", "newfix", 7)
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		got, ok, err := s.latestRunHeadSHA(context.Background(), runID)
+		if err != nil || !ok || got != "newfix" {
+			t.Errorf("latestRunHeadSHA = (%q, %v, %v); want (newfix, true, nil)", got, ok, err)
+		}
+	})
+	t.Run("falls back to PR-open head", func(t *testing.T) {
+		runID := uuid.New()
+		au := newAuditFake()
+		seedRunHeadEntry(au, runID, "pull_request_opened", "prhead", 1)
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		got, ok, err := s.latestRunHeadSHA(context.Background(), runID)
+		if err != nil || !ok || got != "prhead" {
+			t.Errorf("latestRunHeadSHA = (%q, %v, %v); want (prhead, true, nil)", got, ok, err)
+		}
+	})
+	t.Run("no head recorded", func(t *testing.T) {
+		au := newAuditFake()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		got, ok, err := s.latestRunHeadSHA(context.Background(), uuid.New())
+		if err != nil || ok || got != "" {
+			t.Errorf("latestRunHeadSHA = (%q, %v, %v); want (\"\", false, nil)", got, ok, err)
+		}
+	})
+	t.Run("read error surfaces", func(t *testing.T) {
+		au := newAuditFake()
+		au.listByCategoryErr = errors.New("audit down")
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		if _, _, err := s.latestRunHeadSHA(context.Background(), uuid.New()); err == nil {
+			t.Error("expected a read error to surface")
+		}
+	})
+}
+
 // foreignViolation finds the invariant_violation audit entry the guard
 // emits for a foreign commit, if any.
 func foreignViolation(au *auditFake) *audit.ChainAppendParams {

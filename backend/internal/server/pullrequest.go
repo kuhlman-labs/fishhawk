@@ -989,6 +989,19 @@ func (s *Server) succeedFixupPushStage(w http.ResponseWriter, r *http.Request, r
 			slog.String("error", err.Error()))
 	}
 
+	// #1682 Option A: a fix-up routed AFTER acceptance already settled pushes a
+	// new head, so the recorded acceptance verdict now corresponds to a stale
+	// commit. Invalidate + re-open the settled acceptance stage so the operator
+	// re-validates against the final commit rather than merging with stale
+	// evidence. No-op for a pre-acceptance fix-up (guarded inside).
+	s.reopenAcceptanceOnFixupPush(r.Context(), runID, pr.HeadSHA)
+
+	// #1682 AC3: re-post fishhawk_audit_complete for the NEW head. The local
+	// runner does not round-trip a GitHub `synchronize` webhook, so without
+	// this the required Check Run stays pinned to the stale PR-open head. The
+	// publisher's head resolver now prefers the newest fixup_pushed head.
+	s.recomputeAndPublishAuditComplete(r.Context(), runID)
+
 	s.notifyStatusUpdate(r.Context(), runID, "fixup_pushed")
 
 	s.writeJSON(w, r, http.StatusOK, pullRequestFixupPushResponse{

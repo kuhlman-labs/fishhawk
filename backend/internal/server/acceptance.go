@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/agenteval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -597,10 +598,22 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	contentHash := sha256Hex(body)
 	passed, failed, skipped, total := acceptanceCriteriaTally(acc.normalizedCriteria)
 
+	// Bind the verdict to the head the acceptance stage ACTUALLY validated
+	// (#1682, binding condition 2): the run's newest recorded head at the
+	// moment the stage was DISPATCHED, not the run's latest head at
+	// verdict-record time. A post-dispatch fixup_pushed / child_pushed must NOT
+	// re-bind this verdict — otherwise Option C's head comparison (retry.go)
+	// would see recorded==current for a verdict the fixup already invalidated.
+	// Empty ("", false) for a pre-anchor / dispatch-less ship — Option C then
+	// fails closed to today's 422 for that entry.
+	validatedHead, _ := s.acceptanceValidatedHeadSHA(r.Context(), runID, stageID)
+
 	// buildOutcomePayload renders the acceptance_outcome_recorded payload. The
 	// `outcome`/`criteria_passed`/`criteria_total` tags are the issue-comment
 	// render contract (issuecomment/status_template.go); verdict/failure_mode +
-	// the per-result counts are the E31.8 triage carry-through.
+	// the per-result counts are the E31.8 triage carry-through. head_sha is the
+	// #1682 additive field (internal chained-audit map — no docs/spec schema
+	// change); older entries simply lack it and Option C fails closed on absence.
 	buildOutcomePayload := func(artifactID string) []byte {
 		p, _ := json.Marshal(map[string]any{
 			"run_id":           runID.String(),
@@ -617,6 +630,7 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 			"target_url":       acc.TargetURL,
 			"evidence_hashes":  acc.normalizedEvidenceHashes,
 			"auth_method":      authMethod,
+			"head_sha":         validatedHead,
 		})
 		return p
 	}
@@ -715,6 +729,184 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 		FailureMode: acc.FailureMode,
 		Idempotent:  false,
 	})
+}
+
+// reopenAcceptanceOnFixupPush invalidates a stale acceptance verdict when a
+// fix-up push lands a NEW head AFTER the acceptance stage already settled
+// (#1682, Option A — the automatic in-band defense). It locates the run's
+// acceptance stage; if that stage is StageStateSucceeded AND carries a recorded
+// acceptance_outcome_recorded verdict, it re-opens the stage (succeeded →
+// pending) via run.ReopenAcceptanceStage and appends an acceptance_reopened
+// invalidation audit entry — the SAME kind the operator-gated #1567 re-open
+// uses (no new issue-comment surface). next_actions then routes to
+// acceptance_pending so the operator re-dispatches acceptance against the final
+// commit.
+//
+// No-op (everything untouched) when: the run has no acceptance stage; the
+// acceptance stage is not succeeded (a PRE-acceptance fix-up must not reopen
+// anything); or the succeeded stage has NO recorded verdict (that outcome-less
+// hole is the retry handler's #1567 operator-reopen path, not this one).
+// Idempotent against a re-delivered fixup_pushed: the caller's (stage_id,
+// head_sha) dedup short-circuits before this runs, and ReopenAcceptanceStage
+// refuses a non-succeeded (already-pending) stage, so a second delivery cannot
+// double-reopen. Best-effort: every failure WARN-logs and never unwinds the
+// fix-up push success.
+func (s *Server) reopenAcceptanceOnFixupPush(ctx context.Context, runID uuid.UUID, newHeadSHA string) {
+	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
+		return
+	}
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup acceptance invalidation: list stages failed; skipping reopen",
+			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
+		return
+	}
+	var acceptance *run.Stage
+	for _, st := range stages {
+		if st.Type == run.StageTypeAcceptance {
+			acceptance = st
+			break
+		}
+	}
+	// A pre-acceptance fix-up (no acceptance stage, or one not yet succeeded)
+	// leaves the gate alone — only a SETTLED acceptance stage can carry a stale
+	// verdict to invalidate.
+	if acceptance == nil || acceptance.State != run.StageStateSucceeded {
+		return
+	}
+	hasVerdict, err := s.acceptanceStageHasVerdict(ctx, runID, acceptance.ID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup acceptance invalidation: verdict lookup failed; skipping reopen",
+			slog.String("run_id", runID.String()),
+			slog.String("acceptance_stage_id", acceptance.ID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	if !hasVerdict {
+		// Outcome-less succeeded acceptance stage — the #1567 operator-reopen
+		// path owns it, not a fix-up invalidation.
+		return
+	}
+
+	dec, err := run.ReopenAcceptanceStage(ctx, s.cfg.RunRepo, acceptance.ID)
+	if err != nil {
+		// A concurrent/re-delivered reopen (already pending) or a terminal run
+		// refuses here — benign; the stage is already (being) re-opened.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup acceptance invalidation: reopen refused; leaving stage as-is",
+			slog.String("run_id", runID.String()),
+			slog.String("acceptance_stage_id", acceptance.ID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+
+	subject := "system:fixup-acceptance-invalidation"
+	actorKind := audit.ActorSystem
+	payload, _ := json.Marshal(map[string]any{
+		"stage_id":    dec.Stage.ID.String(),
+		"prior_state": string(dec.PriorState),
+		"head_sha":    newHeadSHA,
+		"reason":      "a fix-up push landed a new head after the acceptance stage settled; the prior acceptance verdict is invalidated and the stage re-opened for re-validation against the final commit",
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      &dec.Stage.ID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryAcceptanceReopened,
+		ActorKind:    &actorKind,
+		ActorSubject: &subject,
+		Payload:      payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup acceptance invalidation: append acceptance_reopened audit failed",
+			slog.String("run_id", runID.String()),
+			slog.String("acceptance_stage_id", dec.Stage.ID.String()),
+			slog.String("error", err.Error()))
+	}
+	s.notifyStatusUpdate(ctx, runID, "acceptance_reopened")
+}
+
+// acceptanceStageHasVerdict reports whether the run's audit chain carries an
+// acceptance_outcome_recorded entry scoped to stageID — i.e. the acceptance
+// stage settled WITH a recorded verdict. Distinguishes the #1682 fix-up
+// invalidation target (verdict-ful) from the #1567 outcome-less operator-reopen
+// hole. Propagates the read error so the caller fails closed (skips the reopen)
+// on an unreadable chain rather than acting on unknown evidence state.
+func (s *Server) acceptanceStageHasVerdict(ctx context.Context, runID, stageID uuid.UUID) (bool, error) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryAcceptanceOutcomeRecorded)
+	if err != nil {
+		return false, err
+	}
+	for _, e := range entries {
+		if e.StageID != nil && *e.StageID == stageID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// acceptanceValidatedHeadSHA resolves the head the acceptance stage actually
+// validated (#1682, binding condition 2): the run's newest recorded head at
+// the moment the stage was DISPATCHED. Head-report entries with sequence
+// at-or-before the latest acceptance_dispatched entry for THIS stage are the
+// candidates; the precedence winner among them (via the shared
+// auditcomplete.LatestReportedHeadSHA) is the validated head. Anchoring on the
+// dispatch sequence excludes a fixup_pushed / child_pushed that lands AFTER
+// dispatch, so the verdict binds to the commit the validator checked out —
+// never a later commit that has not been validated.
+//
+// A re-opened acceptance stage carries more than one acceptance_dispatched
+// entry; the highest-sequence one is the current validation episode. Returns
+// ("", false) when no head is recorded at-or-before dispatch, or when the stage
+// has no dispatch entry (a bare operator ship with no orchestrator dispatch, or
+// a read error) — the caller records an empty head_sha and Option C fails
+// closed to today's 422 for such an unanchored verdict.
+func (s *Server) acceptanceValidatedHeadSHA(ctx context.Context, runID, stageID uuid.UUID) (string, bool) {
+	if s.cfg.AuditRepo == nil {
+		return "", false
+	}
+	dispatchSeq, haveAnchor := s.latestAcceptanceDispatchSeq(ctx, runID, stageID)
+	if !haveAnchor {
+		return "", false
+	}
+	var candidates []*audit.Entry
+	for _, cat := range auditcomplete.HeadReportCategoriesByPrecedence {
+		es, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
+		if err != nil {
+			return "", false
+		}
+		for _, e := range es {
+			if e.Sequence <= dispatchSeq {
+				candidates = append(candidates, e)
+			}
+		}
+	}
+	return auditcomplete.LatestReportedHeadSHA(candidates)
+}
+
+// latestAcceptanceDispatchSeq returns the highest audit sequence among the
+// run's acceptance_dispatched entries scoped to stageID, and whether any exist.
+// The dispatch anchor for acceptanceValidatedHeadSHA. A read error is reported
+// as (0, false) so the caller treats an unreadable anchor as "no anchor" and
+// records an empty head_sha (fail-closed for Option C), never a wrong head.
+func (s *Server) latestAcceptanceDispatchSeq(ctx context.Context, runID, stageID uuid.UUID) (int64, bool) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryAcceptanceDispatched)
+	if err != nil {
+		return 0, false
+	}
+	var seq int64
+	found := false
+	for _, e := range entries {
+		if e.StageID != nil && *e.StageID == stageID {
+			if !found || e.Sequence > seq {
+				seq = e.Sequence
+				found = true
+			}
+		}
+	}
+	return seq, found
 }
 
 // authorizeAcceptance resolves the request's auth method + actor, mirroring

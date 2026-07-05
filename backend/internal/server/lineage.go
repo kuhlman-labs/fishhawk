@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/invariantmonitor"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -710,6 +711,36 @@ func (s *Server) emitForeignCommitInvariant(ctx context.Context, runID uuid.UUID
 		slog.String("run_id", runID.String()),
 		slog.String("stage_id", stageIDStr),
 		slog.String("offending_sha", offendingSHA))
+}
+
+// latestRunHeadSHA resolves the run's newest recorded head SHA (#1682): the
+// canonical "current head" the acceptance verdict binds to (acceptance.go),
+// the head Option C's retry compares against (retry.go), and the head the
+// audit-check publisher targets — all resolved through the ONE shared ordering
+// in auditcomplete.LatestReportedHeadSHA (fixup_pushed > child_pushed >
+// pull_request_opened, each by highest audit sequence). Sharing that resolver
+// with auditcheckpublisher.findHeadSHA is the load-bearing guarantee that the
+// acceptance/retry path and audit_complete publishing never resolve divergent
+// heads for the same audit history.
+//
+// Returns ("", false, nil) when the run has recorded no head yet. A read error
+// on any head-report category is returned so the caller can fail closed (the
+// retry admit path treats an unresolvable head as "keep the 422", never as a
+// spurious admit).
+func (s *Server) latestRunHeadSHA(ctx context.Context, runID uuid.UUID) (string, bool, error) {
+	if s.cfg.AuditRepo == nil {
+		return "", false, nil
+	}
+	var entries []*audit.Entry
+	for _, cat := range auditcomplete.HeadReportCategoriesByPrecedence {
+		es, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
+		if err != nil {
+			return "", false, err
+		}
+		entries = append(entries, es...)
+	}
+	sha, ok := auditcomplete.LatestReportedHeadSHA(entries)
+	return sha, ok, nil
 }
 
 // parsePRNumberFromURL extracts the integer PR number from a GitHub PR
