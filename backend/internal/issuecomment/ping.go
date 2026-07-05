@@ -323,10 +323,13 @@ func campaignGatePagedPhrase(pageEvent string) string {
 // acceptanceTriageNeedsHuman reads {class, disposition} from an
 // acceptance_triage_decided payload (E31.8 / #1536) and reports whether the
 // disposition is one that needs a human — the paged variants (paged,
-// rerun_budget_exhausted, and the *_paged routing-refusal fallbacks). The
+// rerun_budget_exhausted, the *_paged routing-refusal fallbacks, and the
+// class-5 externally_unvalidatable_paged terminal page, #1671). The
 // auto-routed fixup_dispatched / retry_dispatched dispositions return ok=false
 // (they stay edit-only). ok=false on any decode failure or an unrecognized
-// disposition, so a malformed payload never fires a page-class ping.
+// disposition, so a malformed payload never fires a page-class ping. This
+// package uses string literals, not the server consts — the value is pinned
+// byte-for-byte by the ping_test assertion.
 func acceptanceTriageNeedsHuman(payload []byte) (class, disposition string, ok bool) {
 	if len(payload) == 0 {
 		return "", "", false
@@ -340,7 +343,8 @@ func acceptanceTriageNeedsHuman(payload []byte) (class, disposition string, ok b
 	}
 	switch p.Disposition {
 	case "paged", "rerun_budget_exhausted",
-		"fixup_unavailable_paged", "retry_unavailable_paged", "unsettled_paged":
+		"fixup_unavailable_paged", "retry_unavailable_paged", "unsettled_paged",
+		"externally_unvalidatable_paged":
 		return p.Class, p.Disposition, true
 	default:
 		return "", "", false

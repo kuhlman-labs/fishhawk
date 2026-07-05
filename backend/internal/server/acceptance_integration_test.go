@@ -624,6 +624,47 @@ func TestAcceptanceSeam_Class2Skip_ReopensAcceptance(t *testing.T) {
 	}
 }
 
+// TestAcceptanceSeam_Class5_ExternallyUnvalidatable_Terminal is the #1671
+// end-to-end done-means, crossing ship→classify→route→stage-state: an all-skip
+// verdict whose every skip carries expectation_basis leaves the acceptance
+// stage terminal/succeeded (no re-open, no re-dispatch) and writes an
+// acceptance_triage_decided entry with disposition externally_unvalidatable_paged
+// and class "5" — proving the merge gate is no longer wedged by a futile
+// class-2 retry loop and fishhawk_audit_complete can clear.
+func TestAcceptanceSeam_Class5_ExternallyUnvalidatable_Terminal(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	seam := buildExampleAcceptanceSeam(t, exampleBytes, run.StageStateSucceeded)
+
+	body := failedAcceptanceBytes(t, "assertion_fail", []acceptanceCriterionResult{
+		{ID: "ac-create", Result: "skipped", ExpectationBasis: "closing the issue needs GitHub; the egress sandbox is default-deny"},
+		{ID: "ac-list", Result: "skipped", ExpectationBasis: "webhook trigger unreachable from the localhost preview"},
+	})
+	w := shipAcceptanceRequest(t, seam.s, seam.runID, seam.acceptanceID, seam.priv, body, "")
+	if w.Code != 201 {
+		t.Fatalf("ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// The stage stays terminal/succeeded — NOT re-opened to pending. This is
+	// the anti-wedge regression: fishhawk_audit_complete can clear.
+	if got := seam.rr.getStages[seam.acceptanceID].State; got != run.StageStateSucceeded {
+		t.Errorf("acceptance state = %q, want unchanged (succeeded) — class 5 must NOT re-open the stage", got)
+	}
+	for name, id := range map[string]uuid.UUID{"implement": seam.implementID, "review": seam.reviewID} {
+		if got := seam.rr.getStages[id].State; got != run.StageStateSucceeded {
+			t.Errorf("%s state = %q, want unchanged (succeeded)", name, got)
+		}
+	}
+	if n := countAppendedByCategory(seam.au, CategoryStageFixupTriggered); n != 0 {
+		t.Errorf("stage_fixup_triggered entries = %d, want 0 (no re-dispatch on class-5)", n)
+	}
+	payload := triagePayload(t, seam.au)
+	for _, want := range []string{`"class":"5"`, `"disposition":"externally_unvalidatable_paged"`} {
+		if !strings.Contains(payload, want) {
+			t.Errorf("triage payload missing %s:\n%s", want, payload)
+		}
+	}
+}
+
 // TestAcceptanceSeam_Class3Inferred_PagedWithPlanReviewMiss: a failed
 // inferred-source criterion (ac-list) pages the human (class 3) with no state
 // transition and joins the plan criterion's provenance into a plan_review_miss

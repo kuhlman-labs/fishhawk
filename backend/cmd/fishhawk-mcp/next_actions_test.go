@@ -1347,6 +1347,7 @@ func TestNextActions_AcceptanceTriagePaged_EveryDisposition(t *testing.T) {
 		"fixup_unavailable_paged",
 		"retry_unavailable_paged",
 		"unsettled_paged",
+		"externally_unvalidatable_paged", // #1671 class-5 terminal page
 	}
 	for _, disp := range pagedDispositions {
 		t.Run(disp, func(t *testing.T) {
@@ -1355,7 +1356,7 @@ func TestNextActions_AcceptanceTriagePaged_EveryDisposition(t *testing.T) {
 			na := nextActionsFor(run, naAcceptanceStages("succeeded"), nil,
 				naReviewStatus("implement", "complete"), nil, nil, false, false, "failed", disp)
 			if na == nil || na.State != "acceptance_triage_paged" {
-				t.Fatalf("state = %+v, want acceptance_triage_paged for disposition %q", na, disp)
+				t.Fatalf("state = %+v, want acceptance_triage_paged (not acceptance_triage_rerouting) for disposition %q", na, disp)
 			}
 			got := actionNames(na)
 			want := []string{"fishhawk_list_audit", "fishhawk_fixup_stage", "merge_and_file_follow_up", "fishhawk_cancel_run"}
@@ -1567,6 +1568,7 @@ func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 		"fixup_unavailable_paged":           acceptanceDispositionFixupUnavailable,
 		"retry_unavailable_paged":           acceptanceDispositionRetryUnavailable,
 		"unsettled_paged":                   acceptanceDispositionUnsettled,
+		"externally_unvalidatable_paged":    acceptanceDispositionUnvalidatable,
 	}
 	expect := map[string]string{
 		"CategoryAcceptanceOutcomeRecorded": "acceptance_outcome_recorded",
@@ -1580,6 +1582,7 @@ func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 		"fixup_unavailable_paged":           "fixup_unavailable_paged",
 		"retry_unavailable_paged":           "retry_unavailable_paged",
 		"unsettled_paged":                   "unsettled_paged",
+		"externally_unvalidatable_paged":    "externally_unvalidatable_paged",
 	}
 	for k, wantVal := range expect {
 		if want[k] != wantVal {
@@ -1588,7 +1591,7 @@ func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 	}
 
 	// The paged-family predicate: auto-routed dispositions are NOT paged.
-	for _, d := range []string{"paged", "rerun_budget_exhausted", "fixup_unavailable_paged", "retry_unavailable_paged", "unsettled_paged"} {
+	for _, d := range []string{"paged", "rerun_budget_exhausted", "fixup_unavailable_paged", "retry_unavailable_paged", "unsettled_paged", "externally_unvalidatable_paged"} {
 		if !isAcceptancePagedDisposition(d) {
 			t.Errorf("isAcceptancePagedDisposition(%q) = false, want true", d)
 		}

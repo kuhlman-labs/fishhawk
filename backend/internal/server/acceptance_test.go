@@ -948,6 +948,32 @@ func TestClassifyAcceptanceFailure(t *testing.T) {
 			wantIDs:   nil,
 		},
 		{
+			// #1671: all-skip where EVERY skipped criterion carries a
+			// non-empty expectation_basis (posture-A can't-exhibit) → class 5
+			// (terminal externally-unvalidatable page), not the flake retry.
+			name: "assertion_fail all skips carry expectation_basis → class 5",
+			acc: acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", normalizedCriteria: []acceptanceCriterionResult{
+				{ID: "ac-create", Result: "skipped", ExpectationBasis: "closing the issue needs GitHub; sandbox is egress-denied"},
+				{ID: "ac-list", Result: "skipped", ExpectationBasis: "webhook trigger unreachable from the preview sandbox"},
+			}},
+			criteria:  criteria,
+			wantClass: "5",
+			wantIDs:   nil,
+		},
+		{
+			// #1671 binding condition 2 regression guard: an all-skip verdict
+			// where even ONE skip lacks expectation_basis stays class 2 (the
+			// bounded flake path), never short-circuiting to class 5.
+			name: "assertion_fail one skip lacks expectation_basis → class 2",
+			acc: acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", normalizedCriteria: []acceptanceCriterionResult{
+				{ID: "ac-create", Result: "skipped", ExpectationBasis: "closing the issue needs GitHub; sandbox is egress-denied"},
+				{ID: "ac-list", Result: "skipped"}, // no expectation_basis → ambiguous
+			}},
+			criteria:  criteria,
+			wantClass: "2",
+			wantIDs:   nil,
+		},
+		{
 			name:      "assertion_fail no failed no skip → class 4",
 			acc:       acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", normalizedCriteria: []acceptanceCriterionResult{crit("ac-create", "passed")}},
 			criteria:  criteria,
@@ -1288,6 +1314,56 @@ func TestTriageAcceptance_Class4_Unitemized_Paged(t *testing.T) {
 		if !strings.Contains(payload, want) {
 			t.Errorf("triage payload missing %s:\n%s", want, payload)
 		}
+	}
+}
+
+// TestTriageAcceptance_Class5_ExternallyUnvalidatable_Paged is the #1671
+// binding-condition-1 pin: an all-skip verdict where every skip carries
+// expectation_basis routes to the terminal externally_unvalidatable_paged
+// disposition (class "5") and — the load-bearing regression — does NOT re-open
+// the acceptance stage. The stage stays succeeded/terminal so
+// fishhawk_audit_complete can clear; no class-2 retry loop, no fresh dispatch.
+func TestTriageAcceptance_Class5_ExternallyUnvalidatable_Paged(t *testing.T) {
+	s, rr, _, au, _, runID, implementStageID, reviewStageID, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	body := failedAcceptanceBytes(t, "assertion_fail", []acceptanceCriterionResult{
+		{ID: "ac-create", Result: "skipped", ExpectationBasis: "closing the issue needs GitHub; the egress sandbox is default-deny"},
+		{ID: "ac-list", Result: "skipped", ExpectationBasis: "webhook trigger unreachable from the localhost preview"},
+	})
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	// The load-bearing regression: the acceptance stage is NOT re-opened — it
+	// stays succeeded/terminal so fishhawk_audit_complete can clear.
+	if got := rr.getStages[acceptanceStageID].State; got != run.StageStateSucceeded {
+		t.Errorf("acceptance state = %q, want unchanged (succeeded) — class 5 must NOT re-open the stage", got)
+	}
+	// Implement + review untouched (no fix-up route either).
+	if got := rr.getStages[implementStageID].State; got != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want unchanged (succeeded)", got)
+	}
+	if got := rr.getStages[reviewStageID].State; got != run.StageStateSucceeded {
+		t.Errorf("review state = %q, want unchanged (succeeded)", got)
+	}
+	if n := countAppendedByCategory(au, CategoryStageFixupTriggered); n != 0 {
+		t.Errorf("stage_fixup_triggered entries = %d, want 0 (class-5 is a terminal page, not a fixup)", n)
+	}
+	payload := triagePayload(t, au)
+	for _, want := range []string{`"class":"5"`, `"disposition":"externally_unvalidatable_paged"`} {
+		if !strings.Contains(payload, want) {
+			t.Errorf("triage payload missing %s:\n%s", want, payload)
+		}
+	}
+}
+
+// TestAcceptanceDispositionUnvalidatable_Value pins the exact class-5
+// disposition token in the server package (#1671 binding condition 3: the
+// token is declared in three packages and each pins the literal so silent
+// value drift is compile-or-test-caught here).
+func TestAcceptanceDispositionUnvalidatable_Value(t *testing.T) {
+	if acceptanceDispositionUnvalidatable != "externally_unvalidatable_paged" {
+		t.Errorf("acceptanceDispositionUnvalidatable = %q, want externally_unvalidatable_paged", acceptanceDispositionUnvalidatable)
 	}
 }
 
