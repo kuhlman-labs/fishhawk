@@ -1133,13 +1133,40 @@ cmd_k8s_down() {
 # FISHHAWK_ACCEPTANCE_PREVIEW_CMD hook invokes it bare (the SHA arrives via
 # FISHHAWK_PREVIEW_SHA); FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD invokes
 # `scripts/dev preview-down`.
+#
+# Least-privilege containment (E31.19 / #1577): the merge candidate is UNTRUSTED
+# agent-authored committed code, and it BUILDS-then-RUNS with a live
+# FISHHAWKD_DATABASE_URL. If that URL carried the operator's dev-Postgres
+# superuser credential (fishhawk:fishhawk) with only the database NAME swapped,
+# branch code could connect to a DIFFERENT database name and reach the
+# operator's dev data. So the preview binary receives a dedicated non-superuser
+# role (default fishhawk_preview) that OWNS only the throwaway <db>_preview
+# database and is DENIED CONNECT to the dev database; the operator's admin URL
+# (superuser creds) is used ONLY for the privileged role/DB provisioning the
+# preview role cannot itself perform, and is NEVER handed to branch code.
+# _preview_role_setup NORMALIZES the role on every provision (guarded CREATE
+# then an unconditional ALTER ROLE … NOSUPERUSER NOCREATEDB NOCREATEROLE
+# NOREPLICATION NOBYPASSRLS), so a pre-existing role with elevated attributes or
+# a stale password is forced back to the least-privilege contract each start.
+# The role is a stable, idempotently-(re)created local-dev artifact — NOT
+# dropped at preview-down, because it OWNS the persisted preview database (a
+# DROP ROLE would fail on that dependency); the next start DROP/CREATEs the DB.
+#
+# Durable dev-DB side effect + rollback: REVOKE CONNECT … FROM PUBLIC changes
+# the dev database's ACL durably (the operator's superuser role bypasses it, so
+# `scripts/dev up` is unaffected). To undo the Postgres-side effects on a dev DB
+# that already ran the new preview:
+#   psql "$FISHHAWKD_DATABASE_URL" -c 'GRANT CONNECT ON DATABASE "fishhawk" TO PUBLIC;'
+# then, after DROPping any preview database the role owns:
+#   psql "$FISHHAWKD_DATABASE_URL" -c 'DROP ROLE IF EXISTS fishhawk_preview;'
 # ---------------------------------------------------------------------------
 
-# Pure: the isolated preview database name — the base URL's database name with
-# an `_preview` suffix, so it can NEVER equal (and thus never destroy) the dev
-# database. Non-zero with no output when the URL carries no database name.
-# Git-free/env-free so scripts/test-dev can drive it with crafted input.
-_preview_db_name() {
+# Pure: the bare database name from a connection URL — drop ?query, drop the
+# scheme (so :// can't satisfy the / check), take the segment after the last
+# '/'. Non-zero with no output when the URL carries no database name. Shared by
+# _preview_db_name (preview DB) and cmd_preview (the dev DB, for the CONNECT
+# revoke). Git-free/env-free so scripts/test-dev can drive it with crafted input.
+_db_name_from_url() {
   local url="$1"
   local base="${url%%\?*}"      # drop ?query
   local rest="${base#*://}"     # drop scheme, so :// can't satisfy the / check
@@ -1150,12 +1177,38 @@ _preview_db_name() {
   if [[ -z "$dbname" ]]; then
     return 1
   fi
+  print -r -- "$dbname"
+}
+
+# Pure: the isolated preview database name — the base URL's database name with
+# an `_preview` suffix, so it can NEVER equal (and thus never destroy) the dev
+# database. Non-zero with no output when the URL carries no database name.
+_preview_db_name() {
+  local dbname
+  if ! dbname="$(_db_name_from_url "$1")"; then
+    return 1
+  fi
   print -r -- "${dbname}_preview"
 }
 
-# Pure: the base database URL with its database name swapped for the
-# _preview-suffixed one, query string preserved. Non-zero when the URL
-# carries no database name (mirrors _preview_db_name).
+# Pure: the least-privilege preview role name (default fishhawk_preview) and its
+# password (default fishhawk_preview — a fixed LOCAL-dev credential). Both
+# overridable; an overridden password MUST be URL-safe (it is spliced into the
+# preview DATABASE_URL by _preview_db_url — the default is safe).
+_preview_db_role() {
+  print -r -- "${FISHHAWK_PREVIEW_DB_ROLE:-fishhawk_preview}"
+}
+
+_preview_db_password() {
+  print -r -- "${FISHHAWK_PREVIEW_DB_PASSWORD:-fishhawk_preview}"
+}
+
+# Pure: the DATABASE_URL handed to the UNTRUSTED preview binary — the base URL
+# with BOTH its database name swapped for the _preview-suffixed one AND its
+# userinfo swapped for the least-privilege role's credentials (NOT the
+# operator's), query string preserved. Non-zero when the URL carries no database
+# name (mirrors _preview_db_name). The rebuild isolates userinfo from hostport by
+# splitting the authority (before the first '/') at its LAST '@'.
 _preview_db_url() {
   local url="$1"
   local base="${url%%\?*}"
@@ -1165,7 +1218,17 @@ _preview_db_url() {
   if ! dbname="$(_preview_db_name "$url")"; then
     return 1
   fi
-  print -r -- "${base%/*}/${dbname}${query}"
+  local scheme="" rest="$base"
+  if [[ "$base" == *://* ]]; then
+    scheme="${base%%://*}://"
+    rest="${base#*://}"
+  fi
+  local authority="${rest%%/*}"       # userinfo@hostport
+  local hostport="${authority##*@}"   # after the LAST '@' — userinfo is dropped
+  local role password
+  role="$(_preview_db_role)"
+  password="$(_preview_db_password)"
+  print -r -- "${scheme}${role}:${password}@${hostport}/${dbname}${query}"
 }
 
 # Preview listen address / port / healthz URL, from FISHHAWK_PREVIEW_ADDR
@@ -1228,18 +1291,54 @@ _await_preview_healthz() {
   return 1
 }
 
+# Provision + NORMALIZE the least-privilege preview role, and deny it the dev
+# database (E31.19 / #1577). Runs privileged SQL against the BASE (operator,
+# superuser) URL — the preview role cannot grant itself these. Idempotent across
+# repeated preview starts (the runner re-provisions per acceptance stage):
+#   1. Guarded CREATE ROLE … LOGIN (only WHEN NOT EXISTS) — a plain login role,
+#      no elevated attributes at birth.
+#   2. UNCONDITIONAL ALTER ROLE … NOSUPERUSER NOCREATEDB NOCREATEROLE
+#      NOREPLICATION NOBYPASSRLS + reset password (binding condition 1,
+#      normalize-always): forces a pre-existing role with elevated attributes or
+#      a stale password back to the least-privilege contract every provision.
+#   3. REVOKE CONNECT ON DATABASE <dev_db> FROM PUBLIC *and* explicitly FROM the
+#      role (binding condition 2): a pre-existing per-role CONNECT grant survives
+#      a PUBLIC-only revoke, so both are revoked. The operator's superuser role
+#      bypasses the ACL, so its own dev access is unaffected.
+# Mirrors _preview_db_reset's host-psql / docker-exec execution shape.
+_preview_role_setup() {
+  local base_url="$1"
+  local dev_db="$2"
+  local role="$3"
+  local password="$4"
+  local create_sql="DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${role}') THEN CREATE ROLE ${role} LOGIN PASSWORD '${password}'; END IF; END \$\$"
+  local normalize_sql="ALTER ROLE ${role} WITH LOGIN PASSWORD '${password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS"
+  local revoke_public_sql="REVOKE CONNECT ON DATABASE \"${dev_db}\" FROM PUBLIC"
+  local revoke_role_sql="REVOKE CONNECT ON DATABASE \"${dev_db}\" FROM ${role}"
+  if command -v psql &>/dev/null; then
+    psql "$base_url" -v ON_ERROR_STOP=1 -q -c "$create_sql" -c "$normalize_sql" -c "$revoke_public_sql" -c "$revoke_role_sql"
+  else
+    docker exec fishhawk-postgres psql "$base_url" -v ON_ERROR_STOP=1 -q -c "$create_sql" -c "$normalize_sql" -c "$revoke_public_sql" -c "$revoke_role_sql"
+  fi
+}
+
 # DROP/CREATE the preview database at every preview start — deterministic
 # isolation: PR-branch migrations run only ever against a throwaway database,
-# never the dev one. WITH (FORCE) (postgres 13+; the dev compose pins 16)
-# terminates any straggler connection from a just-killed prior preview.
-# Statements run against the BASE database URL (you cannot drop the database
-# you are connected to). Prefers a host psql; degrades to psql inside the
-# fishhawk-postgres compose container when the host has none.
+# never the dev one. The database is CREATEd OWNER <role> (the least-privilege
+# preview role) so that role can create objects in the public schema (PG15+:
+# public is owned by pg_database_owner, of which the DB owner is implicitly a
+# member) and run `migrate up` in its OWN database. WITH (FORCE) (postgres 13+;
+# the dev compose pins 16) terminates any straggler connection from a
+# just-killed prior preview. Statements run against the BASE database URL
+# (operator creds — you cannot drop the database you are connected to, and only
+# the superuser can hand ownership to another role). Prefers a host psql;
+# degrades to psql inside the fishhawk-postgres compose container.
 _preview_db_reset() {
   local base_url="$1"
   local preview_db="$2"
+  local role="$3"
   local drop_sql="DROP DATABASE IF EXISTS \"${preview_db}\" WITH (FORCE)"
-  local create_sql="CREATE DATABASE \"${preview_db}\""
+  local create_sql="CREATE DATABASE \"${preview_db}\" OWNER ${role}"
   if command -v psql &>/dev/null; then
     psql "$base_url" -v ON_ERROR_STOP=1 -q -c "$drop_sql" -c "$create_sql"
   else
@@ -1307,8 +1406,12 @@ _preview_remove_worktree() {
 # shape). `env -i` clears the inherited environment and re-exports ONLY the
 # non-secret essentials the Go binary needs to boot: PATH/HOME plus locale/TZ.
 # Per-call FISHHAWKD_* config (the isolated DATABASE_URL, the ADDR) is appended
-# by the caller. The prefix words land in the global array `reply` so the call
-# sites can splice them and scripts/test-dev can assert the containment.
+# by the caller. The per-call FISHHAWKD_DATABASE_URL the caller appends is the
+# LEAST-PRIVILEGE preview URL (_preview_db_url): a non-superuser role scoped to
+# the throwaway <db>_preview database and DENIED CONNECT to the dev database, so
+# even the credential the branch binary DOES receive cannot reach dev data.
+# The prefix words land in the global array `reply` so the call sites can splice
+# them and scripts/test-dev can assert the containment.
 _preview_branch_env() {
   reply=(env -i "PATH=${PATH}" "HOME=${HOME}")
   if [[ -n "${LANG:-}" ]]; then reply+=("LANG=${LANG}"); fi
@@ -1340,11 +1443,19 @@ cmd_preview() {
   if [[ -z "$base_url" ]]; then
     _die "FISHHAWKD_DATABASE_URL is not set — the preview needs it to derive its isolated _preview database"
   fi
-  local preview_db="" preview_url=""
+  local preview_db="" preview_url="" dev_db=""
   if ! preview_db="$(_preview_db_name "$base_url")"; then
     _die "FISHHAWKD_DATABASE_URL carries no database name — cannot derive the _preview database"
   fi
+  dev_db="$(_db_name_from_url "$base_url")"
+  # The least-privilege preview URL (role creds, NOT the operator's) is the ONLY
+  # database credential handed to the untrusted branch binary. base_url
+  # (operator/superuser creds) is used ONLY for the privileged role-setup + DB
+  # reset below, and is NEVER spliced into a branch-exec env.
   preview_url="$(_preview_db_url "$base_url")"
+  local role password
+  role="$(_preview_db_role)"
+  password="$(_preview_db_password)"
 
   # Fetch, then resolve the ref. A PR-head SHA may not be reachable from any
   # already-fetched branch, so an unresolved ref gets one direct-fetch retry
@@ -1404,11 +1515,21 @@ cmd_preview() {
     exit 1
   fi
 
-  # Isolated database: DROP/CREATE <dbname>_preview, then run the PREVIEW
-  # binary's migrations against it — PR-branch migrations never touch the dev
-  # database.
+  # Least-privilege role provisioning FIRST (against operator creds): create +
+  # normalize the non-superuser preview role and deny it CONNECT to the dev DB,
+  # so the preview URL handed to branch code below cannot reach dev data.
+  print "preview: provisioning least-privilege role ${role}..."
+  if ! _preview_role_setup "$base_url" "$dev_db" "$role" "$password"; then
+    print -u2 "error: could not provision the least-privilege preview role ${role} — is postgres up (docker compose up -d)?"
+    _preview_remove_worktree "$PREVIEW_WORKTREE"
+    exit 1
+  fi
+
+  # Isolated database: DROP/CREATE <dbname>_preview OWNED by the preview role,
+  # then run the PREVIEW binary's migrations against it under that role's creds —
+  # PR-branch migrations never touch the dev database.
   print "preview: resetting database ${preview_db}..."
-  if ! _preview_db_reset "$base_url" "$preview_db"; then
+  if ! _preview_db_reset "$base_url" "$preview_db" "$role"; then
     print -u2 "error: could not DROP/CREATE ${preview_db} — is postgres up (docker compose up -d)?"
     _preview_remove_worktree "$PREVIEW_WORKTREE"
     exit 1
