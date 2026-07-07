@@ -47,11 +47,24 @@ func itemsOf(t *testing.T, props map[string]any, key string) map[string]any {
 	return items
 }
 
-// assertTagsPresent asserts every reflected json tag of structType appears as a
-// property key in the schema object node — the field-shape drift guard.
+// schemaExcludedTags are struct json tags DELIBERATELY absent from the
+// reviewer-facing verdict schema. Concern.Provenance (ADR-050 / E31.8 / #1613)
+// is a server-internal trust marker stamped only at synthesis; it must never
+// appear in VerdictSchema()'s closed concern object, so a review agent cannot
+// populate it. TestVerdictSchema_OmitsProvenance (review_test.go) pins its
+// absence positively; this set keeps the struct-vs-schema drift guard from
+// flagging that intentional omission.
+var schemaExcludedTags = map[string]bool{"provenance": true}
+
+// assertTagsPresent asserts every reflected json tag of structType (except the
+// deliberately schema-excluded server-internal ones) appears as a property key
+// in the schema object node — the field-shape drift guard.
 func assertTagsPresent(t *testing.T, structType reflect.Type, props map[string]any, where string) {
 	t.Helper()
 	for _, tag := range jsonTags(structType) {
+		if schemaExcludedTags[tag] {
+			continue
+		}
 		if _, ok := props[tag]; !ok {
 			t.Errorf("%s: struct json tag %q has no matching schema property (field-shape drift)", where, tag)
 		}

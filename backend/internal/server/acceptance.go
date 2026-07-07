@@ -1402,13 +1402,20 @@ func synthesizeAcceptanceConcerns(acc acceptanceBody, criteria []plan.Acceptance
 			Severity: planreview.SeverityHigh,
 			Category: "acceptance",
 			Note:     composeAcceptanceConcernNote(c, statementByID[id]),
+			// Provenance marks this concern as synthesized from the acceptance
+			// agent's attacker-influenceable free-text so the fix-up renderer
+			// quarantines it (ADR-050 / E31.8 / #1613). Category stays the
+			// display classifier; Provenance is the authoritative structured
+			// marker rather than the fragile Category-string coupling.
+			Provenance: planreview.ConcernProvenanceAcceptance,
 		})
 	}
 	if len(out) == 0 {
 		out = append(out, planreview.Concern{
-			Severity: planreview.SeverityHigh,
-			Category: "acceptance",
-			Note:     composeAcceptanceFallbackNote(acc, reason),
+			Severity:   planreview.SeverityHigh,
+			Category:   "acceptance",
+			Note:       composeAcceptanceFallbackNote(acc, reason),
+			Provenance: planreview.ConcernProvenanceAcceptance,
 		})
 	}
 	return out

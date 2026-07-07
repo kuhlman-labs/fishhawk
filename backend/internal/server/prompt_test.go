@@ -3168,7 +3168,7 @@ func TestResolveFixupConcerns(t *testing.T) {
 		}
 	})
 
-	t.Run("happy path renders concern lines", func(t *testing.T) {
+	t.Run("happy path renders concern lines as trusted FixupConcerns", func(t *testing.T) {
 		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
 			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntry(runID, stageID, concerns)}},
 		}})
@@ -3176,11 +3176,42 @@ func TestResolveFixupConcerns(t *testing.T) {
 		if len(rendered) != 2 {
 			t.Fatalf("rendered len = %d, want 2: %v", len(rendered), rendered)
 		}
-		if rendered[0] != "[medium/security] check authz" {
-			t.Errorf("rendered[0] = %q", rendered[0])
+		if rendered[0].Text != "[medium/security] check authz" {
+			t.Errorf("rendered[0].Text = %q", rendered[0].Text)
 		}
-		if rendered[1] != "[low/scope] touch pkg/a/file.go" {
-			t.Errorf("rendered[1] = %q", rendered[1])
+		if rendered[1].Text != "[low/scope] touch pkg/a/file.go" {
+			t.Errorf("rendered[1].Text = %q", rendered[1].Text)
+		}
+		// Concerns without Provenance (operator/reviewer-authored) stay trusted.
+		for i, c := range rendered {
+			if c.AcceptanceDerived {
+				t.Errorf("rendered[%d].AcceptanceDerived = true, want false (no provenance marker)", i)
+			}
+		}
+	})
+
+	t.Run("acceptance-provenance concern decodes as AcceptanceDerived", func(t *testing.T) {
+		// This is the synthesize -> stage_fixup_triggered audit payload ->
+		// resolveFixupConcerns seam (ADR-050 / E31.8 / #1613): a persisted concern
+		// carrying Provenance=acceptance must decode to AcceptanceDerived=true so
+		// the prompt renderer quarantines it, while a sibling without the marker
+		// stays trusted. Per-layer units miss this JSON round-trip.
+		mixed := []planreview.Concern{
+			{Severity: planreview.SeverityHigh, Category: "acceptance", Note: "criterion c1 failed", Provenance: planreview.ConcernProvenanceAcceptance},
+			{Severity: planreview.SeverityMedium, Category: "scope", Note: "operator concern"},
+		}
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntry(runID, stageID, mixed)}},
+		}})
+		rendered := s.resolveFixupConcerns(context.Background(), runID, stageID)
+		if len(rendered) != 2 {
+			t.Fatalf("rendered len = %d, want 2: %v", len(rendered), rendered)
+		}
+		if !rendered[0].AcceptanceDerived {
+			t.Errorf("rendered[0].AcceptanceDerived = false, want true (Provenance=acceptance)")
+		}
+		if rendered[1].AcceptanceDerived {
+			t.Errorf("rendered[1].AcceptanceDerived = true, want false (no provenance marker)")
 		}
 	})
 

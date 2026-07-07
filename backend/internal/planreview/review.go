@@ -96,7 +96,32 @@ type Concern struct {
 	// output predating the field byte-identical, and encoding/json ignores
 	// the absent member in both directions so old verdicts decode unchanged.
 	SuggestedPatch string `json:"suggested_patch,omitempty"`
+
+	// Provenance is a SERVER-INTERNAL marker recording that this concern was
+	// synthesized from an ADR-050-attacker-influenced source rather than
+	// authored by an operator or a review agent (ADR-050 / E31.8 / #1613).
+	// When set to ConcernProvenanceAcceptance the fix-up prompt renderer
+	// routes the concern's free-text through the sanitizeUntrustedComment
+	// quarantine envelope (structure-neutralized, DATA-not-instructions
+	// framing) instead of the trusted MANDATORY / win-on-conflict framing,
+	// closing the injected-acceptance-agent -> binding-implement-instruction
+	// chain. It is NEVER populated by a review agent — VerdictSchema()
+	// deliberately omits `provenance`, so a reviewer cannot smuggle it in via
+	// the closed (additionalProperties:false) verdict schema; it is stamped
+	// only server-side at synthesis. omitempty keeps every reviewer-emitted
+	// verdict and every already-persisted concern byte-identical, and
+	// encoding/json ignores the absent member in both directions so a concern
+	// without provenance decodes with the zero value (empty string) and
+	// renders on the unchanged trusted path.
+	Provenance string `json:"provenance,omitempty"`
 }
+
+// ConcernProvenanceAcceptance marks a Concern synthesized from the acceptance
+// agent's attacker-influenceable free-text verdict (the E31.8 class-1
+// acceptance-failure triage path). A concern carrying this provenance is
+// rendered by the implement fix-up prompt through the untrusted-comment
+// quarantine envelope rather than as trusted binding fix-up text (#1613).
+const ConcernProvenanceAcceptance = "acceptance"
 
 // Usage is the token usage a reviewer backend reports for one review
 // invocation (#681). It is captured at the reviewer CONTRACT boundary so
