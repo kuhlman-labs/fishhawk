@@ -446,3 +446,81 @@ func TestSettled(t *testing.T) {
 		})
 	}
 }
+
+// TestConcern_Provenance_JSONRoundTrip proves the server-internal Provenance
+// marker (ADR-050 / E31.8 / #1613) survives the JSON round-trip through the
+// stage_fixup_triggered audit payload when set, and — being json:omitempty — is
+// absent from the wire and decodes to the zero value when unset, so an
+// already-persisted concern (predating the field) renders on the unchanged
+// trusted path.
+func TestConcern_Provenance_JSONRoundTrip(t *testing.T) {
+	t.Run("present when set", func(t *testing.T) {
+		c := planreview.Concern{
+			Severity:   planreview.SeverityHigh,
+			Category:   "acceptance",
+			Note:       "criterion failed",
+			Provenance: planreview.ConcernProvenanceAcceptance,
+		}
+		b, err := json.Marshal(c)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		if !strings.Contains(string(b), `"provenance":"acceptance"`) {
+			t.Errorf("marshaled concern = %s, want it to carry \"provenance\":\"acceptance\"", b)
+		}
+		var got planreview.Concern
+		if err := json.Unmarshal(b, &got); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if got.Provenance != planreview.ConcernProvenanceAcceptance {
+			t.Errorf("round-tripped Provenance = %q, want %q", got.Provenance, planreview.ConcernProvenanceAcceptance)
+		}
+	})
+
+	t.Run("omitted when empty", func(t *testing.T) {
+		c := planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "n"}
+		b, err := json.Marshal(c)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		if strings.Contains(string(b), "provenance") {
+			t.Errorf("marshaled concern = %s, want no \"provenance\" key (json:omitempty)", b)
+		}
+		var got planreview.Concern
+		if err := json.Unmarshal(b, &got); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if got.Provenance != "" {
+			t.Errorf("Provenance decoded to %q, want empty (trusted path)", got.Provenance)
+		}
+	})
+}
+
+// TestVerdictSchema_OmitsProvenance is the binding guard for the plan's CRITICAL
+// condition: the reviewer-facing verdict schema must NOT expose `provenance`, so
+// a review agent cannot smuggle the server-internal trust marker in through the
+// closed (additionalProperties:false) verdict schema. If VerdictSchema() were
+// reflection-generated from the Concern struct this assertion would fail and the
+// field would have to be excluded explicitly.
+func TestVerdictSchema_OmitsProvenance(t *testing.T) {
+	schema := planreview.VerdictSchema()
+	props, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("schema has no properties object")
+	}
+	concerns, ok := props["concerns"].(map[string]any)
+	if !ok {
+		t.Fatalf("schema has no concerns property")
+	}
+	items, ok := concerns["items"].(map[string]any)
+	if !ok {
+		t.Fatalf("concerns has no items object")
+	}
+	concernProps, ok := items["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("concerns.items has no properties object")
+	}
+	if _, exists := concernProps["provenance"]; exists {
+		t.Errorf("VerdictSchema() concern properties include \"provenance\"; it MUST stay server-internal so a reviewer cannot populate it")
+	}
+}

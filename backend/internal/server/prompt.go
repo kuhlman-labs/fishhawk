@@ -2078,13 +2078,19 @@ func (s *Server) loadPriorSchemaValidationError(ctx context.Context, runID uuid.
 // []planreview.Concern set the operator selected; they are formatted as
 // "[severity/category] note" so the agent sees the full reviewer context.
 //
+// Each returned prompt.FixupConcern carries AcceptanceDerived = (the persisted
+// concern's Provenance == planreview.ConcernProvenanceAcceptance), so the
+// prompt renderer routes acceptance-synthesized concerns (ADR-050 / E31.8 /
+// #1613) through the untrusted-DATA quarantine envelope while operator/reviewer
+// concerns (empty Provenance) render on the unchanged trusted path.
+//
 // Returns nil when the AuditRepo is unconfigured, the stage carries no fix-up
 // trigger (the common, non-fix-up case), or on any error — best-effort, same
 // WARN-and-proceed posture as the other prompt resolvers. The concern-scrape
 // that the prior #1162 narrowing fed off was removed in #1314: a fix-up now
 // retains the full approved plan scope, so the joined concern text no longer
 // feeds scope computation.
-func (s *Server) resolveFixupConcerns(ctx context.Context, runID, stageID uuid.UUID) (rendered []string) {
+func (s *Server) resolveFixupConcerns(ctx context.Context, runID, stageID uuid.UUID) (rendered []prompt.FixupConcern) {
 	if s.cfg.AuditRepo == nil {
 		return nil
 	}
@@ -2118,9 +2124,12 @@ func (s *Server) resolveFixupConcerns(ctx context.Context, runID, stageID uuid.U
 		if len(payload.Concerns) == 0 {
 			continue
 		}
-		rendered = make([]string, 0, len(payload.Concerns))
+		rendered = make([]prompt.FixupConcern, 0, len(payload.Concerns))
 		for _, c := range payload.Concerns {
-			rendered = append(rendered, fmt.Sprintf("[%s/%s] %s", c.Severity, c.Category, c.Note))
+			rendered = append(rendered, prompt.FixupConcern{
+				Text:              fmt.Sprintf("[%s/%s] %s", c.Severity, c.Category, c.Note),
+				AcceptanceDerived: c.Provenance == planreview.ConcernProvenanceAcceptance,
+			})
 		}
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 			"prompt: loaded fix-up concerns into implement prompt",
