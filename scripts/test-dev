@@ -959,17 +959,55 @@ if _preview_db_name 'postgres://u:p@h:5432' >/dev/null; then
 else
   pass "_preview_db_name rejects a URL with no database name"
 fi
+# _preview_db_url now swaps BOTH the database name AND the userinfo for the
+# least-privilege role (E31.19 / #1577) — the credential handed to the untrusted
+# branch binary must NOT be the operator's fishhawk:fishhawk superuser.
 out="$(_preview_db_url "$base_db_url")"
-if [[ "$out" == 'postgres://fishhawk:fishhawk@localhost:5432/fishhawk_preview?sslmode=disable' ]]; then
-  pass "_preview_db_url swaps the database name and preserves the query string"
+if [[ "$out" == 'postgres://fishhawk_preview:fishhawk_preview@localhost:5432/fishhawk_preview?sslmode=disable' ]]; then
+  pass "_preview_db_url swaps role+database and preserves the query string"
 else
-  fail "_preview_db_url should swap in fishhawk_preview keeping ?sslmode (got: $out)"
+  fail "_preview_db_url should yield the least-privilege URL keeping ?sslmode (got: $out)"
+fi
+# Done-means behavioral assertion (#1577): the preview URL must NOT bear the
+# operator's superuser credential.
+if [[ "$out" != *'fishhawk:fishhawk@'* ]]; then
+  pass "_preview_db_url does NOT carry the operator's fishhawk:fishhawk credential"
+else
+  fail "_preview_db_url leaked the operator credential into the branch-exec URL (got: $out)"
 fi
 out="$(_preview_db_url 'postgres://u:p@h:5432/mydb')"
-if [[ "$out" == 'postgres://u:p@h:5432/mydb_preview' ]]; then
+if [[ "$out" == 'postgres://fishhawk_preview:fishhawk_preview@h:5432/mydb_preview' ]]; then
   pass "_preview_db_url handles a query-less URL"
 else
-  fail "_preview_db_url should yield .../mydb_preview (got: $out)"
+  fail "_preview_db_url should yield .../mydb_preview with role creds (got: $out)"
+fi
+if _preview_db_url 'postgres://u:p@h:5432' >/dev/null; then
+  fail "_preview_db_url should return non-zero for a URL with no database name"
+else
+  pass "_preview_db_url rejects a URL with no database name"
+fi
+# Role/password override knobs (default + FISHHAWK_PREVIEW_DB_* overrides).
+if [[ "$(_preview_db_role)" == "fishhawk_preview" && "$(_preview_db_password)" == "fishhawk_preview" ]]; then
+  pass "_preview_db_role/_preview_db_password default to fishhawk_preview"
+else
+  fail "_preview_db_role/_preview_db_password should default to fishhawk_preview"
+fi
+out="$(FISHHAWK_PREVIEW_DB_ROLE='pv_role' FISHHAWK_PREVIEW_DB_PASSWORD='pv_pw' _preview_db_url "$base_db_url")"
+if [[ "$out" == 'postgres://pv_role:pv_pw@localhost:5432/fishhawk_preview?sslmode=disable' ]]; then
+  pass "_preview_db_url honors the FISHHAWK_PREVIEW_DB_ROLE/PASSWORD overrides"
+else
+  fail "_preview_db_url should splice the role/password overrides (got: $out)"
+fi
+# _db_name_from_url: the shared bare-name parser (used for the dev DB too).
+if [[ "$(_db_name_from_url "$base_db_url")" == "fishhawk" ]]; then
+  pass "_db_name_from_url extracts the bare database name (query dropped)"
+else
+  fail "_db_name_from_url should yield fishhawk (got: $(_db_name_from_url "$base_db_url"))"
+fi
+if _db_name_from_url 'postgres://u:p@h:5432' >/dev/null; then
+  fail "_db_name_from_url should return non-zero for a URL with no database name"
+else
+  pass "_db_name_from_url rejects a URL with no database name"
 fi
 
 # 15a. Preview address/port derivation: default localhost:8090 (distinct from
@@ -1184,10 +1222,89 @@ if print -r -- "$db_reset_body" | grep -q 'DROP DATABASE IF EXISTS' && print -r 
 else
   fail "_preview_db_reset should DROP DATABASE IF EXISTS + CREATE DATABASE"
 fi
+# The preview DB is OWNED by the least-privilege role (#1577) so it can run
+# migrate up in its own database (PG15+ public-schema ownership).
+if print -r -- "$db_reset_body" | grep -q 'OWNER'; then
+  pass "_preview_db_reset CREATEs the preview database OWNED by the preview role"
+else
+  fail "_preview_db_reset should carry the OWNER clause"
+fi
 if print -r -- "$db_reset_body" | grep -q 'docker exec fishhawk-postgres'; then
   pass "_preview_db_reset degrades to psql inside the compose container when the host has none"
 else
   fail "_preview_db_reset should carry the docker-exec psql fallback"
+fi
+
+# 15i. _preview_role_setup body-greps (E31.19 / #1577): least-privilege role
+# provisioning + dev-DB CONNECT denial. Pins the binding approval conditions.
+role_setup_body="$(typeset -f _preview_role_setup)"
+if print -r -- "$role_setup_body" | grep -q 'CREATE ROLE' \
+   && print -r -- "$role_setup_body" | grep -q 'IF NOT EXISTS' \
+   && print -r -- "$role_setup_body" | grep -q 'pg_roles'; then
+  pass "_preview_role_setup guards CREATE ROLE with WHEN NOT EXISTS (idempotent)"
+else
+  fail "_preview_role_setup should CREATE ROLE only IF NOT EXISTS (pg_roles)"
+fi
+if print -r -- "$role_setup_body" | grep -q 'LOGIN'; then
+  pass "_preview_role_setup creates a LOGIN role"
+else
+  fail "_preview_role_setup should create a LOGIN role"
+fi
+# Binding condition 1: normalize-always via an UNCONDITIONAL ALTER ROLE with the
+# least-privilege NOSUPERUSER/NOCREATEROLE attributes, and NO granted SUPERUSER.
+if print -r -- "$role_setup_body" | grep -q 'ALTER ROLE' \
+   && print -r -- "$role_setup_body" | grep -q 'NOSUPERUSER' \
+   && print -r -- "$role_setup_body" | grep -q 'NOCREATEROLE'; then
+  pass "_preview_role_setup normalizes via ALTER ROLE … NOSUPERUSER NOCREATEROLE (binding condition 1)"
+else
+  fail "_preview_role_setup should ALTER ROLE … NOSUPERUSER NOCREATEROLE"
+fi
+if print -r -- "$role_setup_body" | grep -qE '[[:space:]]SUPERUSER'; then
+  fail "_preview_role_setup must NOT grant SUPERUSER"
+else
+  pass "_preview_role_setup grants no SUPERUSER attribute"
+fi
+# Binding condition 2: REVOKE CONNECT from PUBLIC *and* explicitly from the role.
+if print -r -- "$role_setup_body" | grep -q 'REVOKE CONNECT ON DATABASE' \
+   && print -r -- "$role_setup_body" | grep -q 'FROM PUBLIC'; then
+  pass "_preview_role_setup revokes CONNECT on the dev DB FROM PUBLIC"
+else
+  fail "_preview_role_setup should REVOKE CONNECT … FROM PUBLIC"
+fi
+if print -r -- "$role_setup_body" | grep -q 'FROM ${role}'; then
+  pass "_preview_role_setup ALSO revokes CONNECT explicitly FROM the role (binding condition 2)"
+else
+  fail "_preview_role_setup should REVOKE CONNECT … FROM \${role} in addition to PUBLIC"
+fi
+if print -r -- "$role_setup_body" | grep -q 'docker exec fishhawk-postgres'; then
+  pass "_preview_role_setup degrades to psql inside the compose container when the host has none"
+else
+  fail "_preview_role_setup should carry the docker-exec psql fallback"
+fi
+
+# 15j. cmd_preview wiring (#1577): role setup precedes db reset; both privileged
+# ops use base_url (operator creds); the branch binary gets preview_url only.
+if print -r -- "$preview_body" | grep -q '_preview_role_setup "$base_url"'; then
+  pass "cmd_preview provisions the least-privilege role against base_url (operator creds)"
+else
+  fail "cmd_preview should call _preview_role_setup with base_url"
+fi
+if print -r -- "$preview_body" | grep -q '_preview_db_reset "$base_url"'; then
+  pass "cmd_preview resets the preview DB against base_url (operator creds)"
+else
+  fail "cmd_preview should call _preview_db_reset with base_url"
+fi
+if print -r -- "$preview_body" | grep -q 'FISHHAWKD_DATABASE_URL=$preview_url'; then
+  pass "cmd_preview hands the branch binary the least-privilege preview_url"
+else
+  fail "cmd_preview should exec migrate/serve with FISHHAWKD_DATABASE_URL=\$preview_url"
+fi
+# base_url (operator superuser creds) must NEVER be spliced into a branch-exec
+# FISHHAWKD_DATABASE_URL — only the privileged role-setup/db-reset ops see it.
+if print -r -- "$preview_body" | grep -q 'FISHHAWKD_DATABASE_URL=$base_url'; then
+  fail "cmd_preview must NOT hand base_url to the branch binary"
+else
+  pass "cmd_preview never hands base_url to the branch binary"
 fi
 pd_body="$(typeset -f cmd_preview_down)"
 if print -r -- "$pd_body" | grep -q '_preview_kill_tracked' && print -r -- "$pd_body" | grep -q '_down_port_fallback' && print -r -- "$pd_body" | grep -q '_preview_remove_worktree'; then
@@ -1328,6 +1445,61 @@ if print -r -- "$preview_body" | grep -q '_preview_branch_env'; then
   pass "cmd_preview runs the branch binary through the credential-stripped _preview_branch_env"
 else
   fail "cmd_preview should exec migrate up / serve via _preview_branch_env"
+fi
+
+# 15k. OPTIONAL live containment test (E31.19 / #1577) — gated on a host psql
+# AND a reachable dev Postgres (skips cleanly like the 15g nc block otherwise).
+# Drives BOTH enumerated failure modes end-to-end against a real Postgres:
+#   mode 1 — the least-privilege preview role CAN connect to its throwaway
+#            preview database and create an object (the PG15+ ownership path
+#            `migrate up` relies on);
+#   mode 2 — that same role CANNOT connect to the dev database (REVOKE CONNECT).
+# The block provisions against a UNIQUE throwaway role/DB and RESTORES the dev
+# DB's PUBLIC CONNECT grant + drops the role/DB on exit, so a test run leaves no
+# durable dev-DB side effect.
+if ! command -v psql &>/dev/null; then
+  print "skip: psql not found — skipping the live preview-containment test"
+elif ! psql "$base_db_url" -v ON_ERROR_STOP=1 -tAc 'SELECT 1' >/dev/null 2>&1; then
+  print "skip: dev Postgres unreachable at the base URL — skipping the live preview-containment test"
+else
+  live_role="fishhawk_preview_selftest_$$"
+  live_pw="selftest_pw"
+  live_dev_db="$(_db_name_from_url "$base_db_url")"
+  live_preview_db="${live_role}_db"
+  live_base="${base_db_url%%\?*}"
+  live_query=""
+  if [[ "$base_db_url" == *\?* ]]; then live_query="?${base_db_url#*\?}"; fi
+  live_rest="${live_base#*://}"
+  live_authority="${live_rest%%/*}"
+  live_hostport="${live_authority##*@}"
+  live_scheme="${live_base%%://*}://"
+  dev_as_role_url="${live_scheme}${live_role}:${live_pw}@${live_hostport}/${live_dev_db}${live_query}"
+  preview_as_role_url="${live_scheme}${live_role}:${live_pw}@${live_hostport}/${live_preview_db}${live_query}"
+
+  # Provision (revokes dev CONNECT) + create the throwaway preview DB owned by
+  # the role. Reuses the exact functions under test.
+  _preview_role_setup "$base_db_url" "$live_dev_db" "$live_role" "$live_pw" >/dev/null 2>&1
+  _preview_db_reset "$base_db_url" "$live_preview_db" "$live_role" >/dev/null 2>&1
+
+  # Mode 1: the preview role connects to its own DB and creates an object.
+  if psql "$preview_as_role_url" -v ON_ERROR_STOP=1 -q \
+       -c 'CREATE TABLE _fishhawk_selftest(id int)' -c 'DROP TABLE _fishhawk_selftest' >/dev/null 2>&1; then
+    pass "live: preview role CAN connect to its preview DB and create objects (mode 1)"
+  else
+    fail "live: preview role should own its preview DB and run DDL (mode 1)"
+  fi
+
+  # Mode 2: the same role is REFUSED a connection to the dev database.
+  if psql "$dev_as_role_url" -v ON_ERROR_STOP=1 -tAc 'SELECT 1' >/dev/null 2>&1; then
+    fail "live: preview role must NOT be able to connect to the dev DB (mode 2)"
+  else
+    pass "live: preview role is REFUSED connection to the dev DB (mode 2)"
+  fi
+
+  # Cleanup: drop the throwaway DB + role, restore the dev DB PUBLIC CONNECT ACL.
+  psql "$base_db_url" -q -c "DROP DATABASE IF EXISTS \"${live_preview_db}\" WITH (FORCE)" >/dev/null 2>&1
+  psql "$base_db_url" -q -c "GRANT CONNECT ON DATABASE \"${live_dev_db}\" TO PUBLIC" >/dev/null 2>&1
+  psql "$base_db_url" -q -c "DROP ROLE IF EXISTS ${live_role}" >/dev/null 2>&1
 fi
 
 # 6. Parse check: scripts/dev is valid zsh.
