@@ -12,7 +12,7 @@ is the operator-facing companion to the E29.4 readiness endpoint
 command exits non-zero if any rung **fails**; warnings alone still exit 0.
 
 ```
-fishhawk doctor [--repo owner/name] [--working-dir D] [--runner-binary P]
+fishhawk doctor [--repo owner/name] [--working-dir D] [--runner-binary P] [--spec-only]
 ```
 
 Beyond the local-loop rungs (Docker stack, backend reachability, token
@@ -20,6 +20,18 @@ acceptance, spec presence, runner binary, MCP registration, git remote/tree,
 `gh` auth, version/schema drift), `doctor` runs the **onboarding preflight**:
 the per-repo prerequisites that make a repo *look* onboarded but wedge on the
 first run.
+
+### `--spec-only`
+
+`--spec-only` restricts `doctor` to the two environment-free rungs —
+**workflow spec present** (schema validity) and **execution path configured**
+(every stage declares an executor) — and skips every docker/backend/token/MCP/
+git/gh/onboarding rung. It is the fresh-repo quick-validate path: a repo whose
+sole Fishhawk artifact is a freshly-scaffolded `.fishhawk/workflows.yaml` exits
+0 with **no** local Fishhawk environment (no Docker, no backend, no token),
+while a missing or schema-invalid spec still fails closed (exit non-zero). Run
+it right after `fishhawk init` to confirm the scaffolded spec is valid to the
+plan gate before wiring up the backend, token, and execution path.
 
 ### `--repo`
 
@@ -95,6 +107,18 @@ fishhawk init [--preset low|medium|high] [--working-dir D] \
    - `--human-gates id,id` keeps the human gate only on the named stages; any
      stage with a gate whose id is not listed has it removed (omit the flag to
      leave every gate as authored).
+   The generated spec is a **generic template**: it carries no
+   fishhawk-repo-specific defaults. Two values are placeholders you must
+   replace before your first run:
+   - `roles.founder.members: ["@your-github-handle"]` → your GitHub handle
+     (`@user`) or team (`@org/team`).
+   - the implement stage's `executor.verify.command: "make test"` → your
+     repository's test command (run via `sh -c` after the agent exits), or
+     remove the whole `verify` block if your project has no test entrypoint.
+
+   Both placeholders are schema-valid as shipped, so `fishhawk doctor
+   --spec-only` passes on the freshly-scaffolded spec before you customize
+   them. See `docs/spec/workflow-preset.md` for the full placeholder table.
 3. **Ensures the agent-docs bridge** via the E29.2 `bridge` package: the
    Fishhawk managed block in AGENTS.md and the `@AGENTS.md` import in CLAUDE.md.
    Both are idempotent and preserve content outside the managed markers, and
