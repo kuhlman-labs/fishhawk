@@ -2183,6 +2183,52 @@ func TestRunImplementReviews_FirstReview_UsesFullDiff(t *testing.T) {
 	assertFullDiffRetained(t, reviewer.calls[0])
 }
 
+// TestRunImplementReviews_ReReview_WaivedOnlyUsesFullDiff (waived-only edge
+// path, #1725): a re-review whose only prior concerns are WAIVED — none routed
+// for fix-up (no addressed_pending row) — must NOT collapse to the ComparePatch
+// delta. priorConcernsForReview threads waived concerns as not-re-litigable
+// context, so gating the delta on len(PriorConcerns) alone would wrongly fire
+// here; the addressed_pending discriminator keeps the full bundle diff and no
+// delta framing renders even with a GitHub client + PR + prior head all wired.
+func TestRunImplementReviews_ReReview_WaivedOnlyUsesFullDiff(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	// Seed the full delta preconditions (GitHub client, PR, prior head) EXCEPT
+	// the routed concern: the sole prior concern is waived, never addressed_pending.
+	cr := newFakeConcernRepo()
+	s.cfg.ConcernRepo = cr
+	waived := seedConcernRow(t, cr, runRow.ID, implStage.ID, concern.StageKindImplement, 100, "accepted trade-off")
+	if _, err := cr.ApplyResolution(context.Background(), waived.ID, concern.StateWaived, "operator waived"); err != nil {
+		t.Fatalf("seed waived: %v", err)
+	}
+	s.cfg.GitHub = cannedComparePatchClient(t, deltaCompareBody)
+	inst := int64(55)
+	runRow.InstallationID = &inst
+	prURL := "https://github.com/kuhlman-labs/example/pull/7"
+	runRow.PullRequestURL = &prURL
+	sid := implStage.ID
+	seedHeadEntry(au, runRow.ID, &sid, "implement_reviewed", 50, map[string]any{"head_sha": "priorhead"})
+
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, fullReReviewBundleDiff(), nil, "currenthead", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	// The waived concern must still ride in the prior-concerns section (#984)…
+	for _, want := range []string{"### Prior concerns (delta verification)", "state: waived"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("waived-only re-review prompt missing prior-concerns fidelity %q:\n%s", want, got)
+		}
+	}
+	// …but the diff must be the FULL bundle diff, NOT the ComparePatch delta.
+	assertFullDiffRetained(t, got)
+}
+
 // TestRunImplementReviews_ReReview_UsesComparePatchDelta (cases b + c): a
 // post-fix-up re-review substitutes the ComparePatch delta for the full diff,
 // renders the delta framing, AND preserves the "### Prior concerns (delta

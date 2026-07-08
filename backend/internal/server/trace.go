@@ -2739,17 +2739,25 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	}
 
 	// Delta re-review (#1725). On a post-fix-up re-review — detected by the
-	// presence of prior concerns (the addressed_pending rows the fix-up trigger
-	// wrote) — replace the full base..head PR diff with ONLY the fix-up delta
-	// since the head the previous review ran against, so the reviewer focuses on
-	// whether the routed concerns are resolved and the stable prefix caches
-	// across rounds. resolveFixupDeltaDiff fails closed to the full diff on ANY
-	// miss (not wired, no PR, unresolvable/degenerate prior head, compare error),
-	// so first-review coverage is unchanged. A first review has no prior concerns
-	// and never enters this branch. The routed concerns and the reviewer's
+	// presence of an addressed_pending prior concern (the rows the fix-up trigger
+	// wrote when it routed concerns back to the agent) — replace the full
+	// base..head PR diff with ONLY the fix-up delta since the head the previous
+	// review ran against, so the reviewer focuses on whether the routed concerns
+	// are resolved and the stable prefix caches across rounds. resolveFixupDeltaDiff
+	// fails closed to the full diff on ANY miss (not wired, no PR,
+	// unresolvable/degenerate prior head, compare error), so first-review coverage
+	// is unchanged. A first review has no prior concerns and never enters this
+	// branch.
+	//
+	// The trigger is specifically a ROUTED concern (addressed_pending), NOT any
+	// prior concern: priorConcernsForReview also threads WAIVED concerns as
+	// not-re-litigable context (#984), but a waived concern was never routed for
+	// fix-up, so a run whose only prior concerns are waived must keep the full
+	// review diff rather than collapse to a delta with delta framing when no
+	// fix-up round actually happened. The routed concerns and the reviewer's
 	// concern_resolutions delta-verification mechanism are preserved either way —
 	// they ride on trig.PriorConcerns, which is already set above.
-	if len(trig.PriorConcerns) > 0 {
+	if hasFixupRoutedConcern(trig.PriorConcerns) {
 		if delta, ok := s.resolveFixupDeltaDiff(ctx, runRow, runID, stageID, headSHA); ok {
 			trig.Diff = renderDiffForReview(delta)
 			trig.DiffPatch = delta.Patch
@@ -3360,6 +3368,24 @@ func (s *Server) priorConcernsForReview(ctx context.Context, runID, stageID uuid
 		})
 	}
 	return out
+}
+
+// hasFixupRoutedConcern reports whether any prior concern was actually routed
+// back to the agent for fix-up — i.e. transitioned to addressed_pending by the
+// fix-up trigger. This is the discriminator for a post-fix-up delta re-review
+// (#1725): priorConcernsForReview also threads WAIVED concerns as
+// not-re-litigable context, so gating the delta collapse on len(PriorConcerns)
+// alone would wrongly fire on a run whose only prior concerns are waived (no
+// fix-up round ever happened) — replacing the full review diff with a
+// ComparePatch delta and rendering delta framing. Requiring an addressed_pending
+// concern keeps the full diff in the waived-only case.
+func hasFixupRoutedConcern(prior []prompt.PriorConcern) bool {
+	for _, c := range prior {
+		if c.State == string(concern.StateAddressedPending) {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveFixupDeltaDiff computes the fix-up delta for a post-fix-up re-review of
