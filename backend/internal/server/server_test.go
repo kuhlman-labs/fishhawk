@@ -16,6 +16,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -56,6 +57,29 @@ func TestServer_FullStack(t *testing.T) {
 	}
 	if body.Version == "" {
 		t.Error("version must not be empty")
+	}
+}
+
+// TestServer_DefaultsNoOpIdentityProvider asserts New defaults a nil
+// Config.IdentityProvider to the deny-by-default NoOp (so every existing
+// server test that omits the field stays green and an OAuth-unconfigured
+// backend fails closed) and preserves an explicitly injected provider.
+func TestServer_DefaultsNoOpIdentityProvider(t *testing.T) {
+	// Nil → NoOp default.
+	s := New(Config{})
+	if s.cfg.IdentityProvider == nil {
+		t.Fatal("New left Config.IdentityProvider nil; want NoOp default")
+	}
+	if _, ok := s.cfg.IdentityProvider.(*identity.NoOpIdentityProvider); !ok {
+		t.Errorf("default IdentityProvider = %T, want *identity.NoOpIdentityProvider", s.cfg.IdentityProvider)
+	}
+
+	// Explicit injection is preserved (not overwritten by the default).
+	injected := identity.NewGitHubIdentityProvider("client-id", nil)
+	s2 := New(Config{IdentityProvider: injected})
+	if s2.cfg.IdentityProvider != injected {
+		t.Errorf("New overwrote an injected IdentityProvider: got %#v, want %#v",
+			s2.cfg.IdentityProvider, injected)
 	}
 }
 

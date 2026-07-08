@@ -29,6 +29,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
@@ -146,6 +147,16 @@ type Config struct {
 	// workflow_dispatch). Built on top of GitHubTokens. Nil when
 	// GitHubTokens is nil.
 	GitHub *githubclient.Client
+
+	// IdentityProvider resolves an operator's forge-neutral identity:
+	// device-flow verification, repository permission tier, and
+	// org/team membership. Nil is tolerated — New defaults it to
+	// identity.NewNoOp(), the deny-by-default provider, so an
+	// OAuth-unconfigured backend fails closed rather than granting
+	// access. serve.go constructs the GitHub implementation only when
+	// OAuth client config is present (E39.1 / #1706). No handler
+	// consumes it yet; this issue stands up the seam.
+	IdentityProvider identity.IdentityProvider
 
 	// OIDCVerifier authenticates GitHub Actions OIDC tokens on
 	// the signing-key endpoint per `githubOIDC` in the OpenAPI
@@ -518,6 +529,13 @@ func New(cfg Config) *Server {
 	}
 	if cfg.ShutdownTimeout == 0 {
 		cfg.ShutdownTimeout = 15 * time.Second
+	}
+	// Default a nil identity provider to the deny-by-default NoOp so an
+	// OAuth-unconfigured backend never grants access through the
+	// identity surface (#1706) — and every existing server test that
+	// omits the field stays green.
+	if cfg.IdentityProvider == nil {
+		cfg.IdentityProvider = identity.NewNoOp()
 	}
 	// Default a zero-value review budget to the documented policy (#747) so a
 	// server constructed without explicit budget config still bounds reviewer

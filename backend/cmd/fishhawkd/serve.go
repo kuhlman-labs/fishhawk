@@ -38,6 +38,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/invariantmonitor"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/jiraclient"
@@ -318,6 +319,19 @@ func resolveRefinementDrafter(opts planReviewerOptions, logger *slog.Logger) ser
 // field.
 func resolveRefinementRepo(pool *pgxpool.Pool) refinement.Repository {
 	return refinement.NewPostgresRepository(pool)
+}
+
+// resolveIdentityProvider is the OAuth-config gate for the forge-neutral
+// identity provider (E39.1 / #1706): with an OAuth client_id present it
+// constructs the GitHub device-flow + REST implementation; absent it
+// returns nil so server.New falls back to the deny-by-default NoOp. token
+// is the optional REST-read accessor (nil → anonymous reads). Extracted so
+// the config-gated wiring seam is unit-testable without booting the server.
+func resolveIdentityProvider(oauthClientID string, token func(context.Context) (string, error)) identity.IdentityProvider {
+	if oauthClientID == "" {
+		return nil
+	}
+	return identity.NewGitHubIdentityProvider(oauthClientID, token)
 }
 
 // buildModelProviders builds the provider→Fetcher map the live ModelOracle
@@ -989,11 +1003,20 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.GitHubOAuth = authpkg.NewGitHubOAuth(
 			*oauthClientID, *oauthClientSecret, *oauthCallbackURL, authpkg.OAuthURLs{})
 		cfg.AuthRedirectAfterLogin = *oauthRedirectAfterLogin
+		// Forge-neutral identity provider (E39.1 / #1706). Gated on the
+		// same OAuth client config: with a client_id present we construct
+		// the GitHub device-flow + REST implementation; leaving the field
+		// nil on the else branch lets server.New fall back to the
+		// deny-by-default NoOp. REST reads go out anonymously for now (no
+		// token accessor wired) — the seam accepts one when a later issue
+		// needs authenticated permission/membership reads.
+		cfg.IdentityProvider = resolveIdentityProvider(*oauthClientID, nil)
 		logger.Info("github oauth sign-in configured",
 			slog.String("callback_url", *oauthCallbackURL),
-			slog.String("redirect_after_login", *oauthRedirectAfterLogin))
+			slog.String("redirect_after_login", *oauthRedirectAfterLogin),
+			slog.Bool("github_identity_provider", cfg.IdentityProvider != nil))
 	} else {
-		logger.Warn("FISHHAWKD_OAUTH_CLIENT_ID not set; /v0/auth/github/login + /callback respond 503")
+		logger.Warn("FISHHAWKD_OAUTH_CLIENT_ID not set; /v0/auth/github/login + /callback respond 503; identity provider defaults to NoOp (deny-by-default)")
 	}
 
 	// GitHub App manifest-flow client (E4.7). No credentials needed —
