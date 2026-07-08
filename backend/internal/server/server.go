@@ -193,9 +193,11 @@ type Config struct {
 	// refused, so an OAuth-minted token can never exceed the operator
 	// default surface. Wired from the fishhawkd operatorDefaultScopes set
 	// in serve.go (the same set `fishhawkd token issue` applies), keeping
-	// the two mint paths' scope ceilings identical. Empty disables the
-	// scope-rejection check (any requested scope accepted) — a deployment
-	// that leaves it unset gets no ceiling, so serve.go always wires it.
+	// the two mint paths' scope ceilings identical. The check is
+	// deny-by-default: an empty set admits no explicitly-requested scope
+	// (an empty scopes list still defaults to this set, i.e. mints nothing
+	// extra), so a deployment that wires OAuth but leaves this unset cannot
+	// mint an arbitrary scope. serve.go always wires it in production.
 	OperatorDefaultScopes []string
 
 	// OIDCVerifier authenticates GitHub Actions OIDC tokens on

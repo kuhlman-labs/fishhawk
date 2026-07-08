@@ -32,9 +32,16 @@ type tokenLoginDiscoveryResponse struct {
 // the scopes to mint. An empty scopes list defaults to the operator
 // default set (mirroring `fishhawkd token issue`); any explicitly listed
 // scope must fall within that set.
+//
+// Provider is accepted (the CLI sends it, and the request decoder rejects
+// unknown fields) but is not the source of truth: v0 has exactly one
+// provider and the backend authoritatively stamps oauthProvider on the
+// minted row. When present it must name the supported provider — a
+// mismatch is refused rather than silently minting a github token.
 type tokenLoginRequest struct {
 	AccessToken string   `json:"access_token"`
 	Scopes      []string `json:"scopes"`
+	Provider    string   `json:"provider"`
 }
 
 // handleTokenLoginDiscovery implements GET /v0/tokens/login. It returns
@@ -100,6 +107,11 @@ func (s *Server) handleTokenLoginMint(w http.ResponseWriter, r *http.Request) {
 	if req.AccessToken == "" {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"access_token is required", map[string]any{"field": "access_token"})
+		return
+	}
+	if req.Provider != "" && req.Provider != oauthProvider {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"unsupported provider", map[string]any{"field": "provider", "got": req.Provider, "want": oauthProvider})
 		return
 	}
 
@@ -170,14 +182,14 @@ func (s *Server) handleTokenLoginMint(w http.ResponseWriter, r *http.Request) {
 }
 
 // scopesOutside returns the first requested scope not present in the
-// allow set, or "" when every requested scope is allowed. An empty allow
-// set imposes no ceiling (returns "") — serve.go always wires the
-// operator default set, so this is the "unconfigured, no ceiling" escape
-// hatch, not the production path.
+// allow set, or "" when every requested scope is allowed. It is
+// deny-by-default: an empty allow set admits no explicit scope, so the
+// first requested scope is reported as outside. This matches the rest of
+// the mint handler's fail-closed gates — a deployment that wires OAuth but
+// leaves OperatorDefaultScopes empty cannot mint an arbitrary explicit
+// scope. serve.go always wires a non-empty operator default set, so the
+// production path never relies on this posture.
 func scopesOutside(requested, allow []string) string {
-	if len(allow) == 0 {
-		return ""
-	}
 	allowed := make(map[string]bool, len(allow))
 	for _, s := range allow {
 		allowed[s] = true

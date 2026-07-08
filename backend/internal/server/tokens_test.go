@@ -532,8 +532,12 @@ func TestTokenLoginMint_PersistsOAuthRow(t *testing.T) {
 	idp := &fakeIdentityProvider{subject: "github:octocat", perm: identity.PermissionAdmin}
 	s := New(loginConfig(repo, idp))
 
+	// Post the CLI's real body shape, which includes the provider field
+	// (`fishhawk token login` always sends it). The mint request decoder
+	// uses DisallowUnknownFields, so this also guards against a regression
+	// where the request type omits provider and rejects a real CLI login.
 	w := tokenRequest(t, s, http.MethodPost, "/v0/tokens/login", "",
-		map[string]any{"access_token": "gho_cli", "scopes": []string{"read:runs", "write:runs"}})
+		map[string]any{"access_token": "gho_cli", "provider": "github", "scopes": []string{"read:runs", "write:runs"}})
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
 	}
