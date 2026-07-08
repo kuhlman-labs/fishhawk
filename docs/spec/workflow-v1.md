@@ -267,6 +267,48 @@ Either way run creation **no longer hard-fails** on the capability gap: the spec
 
 The **coarse** "no reviewer backend wired at all" case remains a hard-fail on **both** run-create paths — the API create-run path (`handleCreateRun`) and the webhook dispatcher (`!PlanReviewerConfigured`) — so they stay symmetric. Only the finer per-reviewer capability gap degrades.
 
+## Approval gate predicate (v1)
+
+An `approval` gate declares who must approve before it clears. v1 offers **two mutually exclusive** forms; a gate declares **exactly one**:
+
+- `approvers` — the inherited GitHub-handle allow-list: named `roles` whose members (`@user` / `@org/team`) can satisfy the gate. Unchanged from v0.
+- `approvals` — a **forge-neutral** approval predicate (E39.2 / #1707): the gate states its requirement without any repo-specific `@`-handle or top-level `roles` map.
+
+The change is **strictly additive**: every existing `approvers`-only gate stays valid. An `approvals`-only gate is now legal too. The mutual exclusion is enforced **in the schema itself** (the gate approval-branch's inner `oneOf`), not merely in prose — a gate carrying **both** `approvers` and `approvals`, or **neither**, is rejected, so an approval gate is never a no-op and never ambiguously double-declared.
+
+### `approvals` fields
+
+| Field | Required | Shape | Meaning |
+|---|---|---|---|
+| `count` | **yes** | integer ≥ 1 | Number of distinct approvals to collect before the gate clears. Always explicit (ADR-055), so `approvals: {}` is rejected as a no-op. |
+| `not` | no | array, unique, items `author` \| `agent` | Relationship classes barred from satisfying the gate — the change's own `author`, and any automated `agent` identity. Forge-neutral relationship classes, not handles. |
+| `min_permission` | no (`x-intended-required`) | string enum `read` \| `triage` \| `write` \| `maintain` \| `admin` | Minimum forge-neutral repository permission tier an approver must hold, mirroring `backend/internal/identity.Permission` (the `none` tier is omitted — a `min_permission` of none is meaningless). |
+| `member_of` | no (`x-intended-required`) | string (min 1) | A forge-neutral group (org or `org/team`) an approver must belong to. |
+| `members` | no | array of strings (min 1) | Explicit approver subjects as **plain** forge-neutral strings — **not** the `@`-prefixed GitHub member-ref used by the legacy `roles.members` path — keeping the block forge-neutral. |
+
+`min_permission` and `member_of` are annotated [`x-intended-required`](../../AGENTS.md#schema-change-checklist): optional now, intended to become required in a future major. `approvals` is accepted at every advertised v1 version (an additive optional field).
+
+The three canonical presets (`docs/spec/workflow-preset-{low,medium,high}.yaml`) ship this handle-free form — their approval gates use `approvals: {count: 1, not: [author, agent]}` (ADR-055's ratified preset default), so a freshly-scaffolded repo has no `@your-github-handle` placeholder to replace.
+
+```yaml
+version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              not: [author, agent]
+              min_permission: write
+              member_of: my-org/reviewers
+              members: [alice, bob]
+```
+
 ## Version routing
 
 The backend (`backend/internal/spec`) and the CLI (`cli/internal/spec`) compile **both** the workflow-v0 and workflow-v1 schemas at init and dispatch a spec to one of them by its `version` **major** component:

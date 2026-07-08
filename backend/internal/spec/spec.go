@@ -740,6 +740,15 @@ const (
 type Gate struct {
 	Type      GateType   `json:"type" yaml:"type"`
 	Approvers *Approvers `json:"approvers,omitempty" yaml:"approvers,omitempty"`
+	// Approvals is the forge-neutral approval predicate (E39.2 / #1707),
+	// the additive alternative to the GitHub-handle Approvers allow-list.
+	// An approval gate declares EXACTLY ONE of Approvers or Approvals; the
+	// schema's inner oneOf enforces the mutual exclusion, so both-nil or
+	// both-set never reaches a validated Spec. Nil when the gate uses the
+	// legacy Approvers form. The re-decode into Spec uses
+	// DisallowUnknownFields, so this field MUST stay in lockstep with the
+	// schema's gate approval-branch `approvals` property.
+	Approvals *Approvals `json:"approvals,omitempty" yaml:"approvals,omitempty"`
 	SLA       string     `json:"sla,omitempty" yaml:"sla,omitempty"`
 	// OperatorAgent is the per-gate delegation override (ADR-040 /
 	// #1026, approval gates only — the schema rejects it on check
@@ -763,4 +772,28 @@ const (
 type Approvers struct {
 	AnyOf []string `json:"any_of,omitempty" yaml:"any_of,omitempty"`
 	AllOf []string `json:"all_of,omitempty" yaml:"all_of,omitempty"`
+}
+
+// Approvals is the forge-neutral approval predicate for an approval gate
+// (E39.2 / #1707) — the additive alternative to the GitHub-handle
+// Approvers allow-list. It carries no repo-specific @-handle, so a gate
+// can declare its approval requirement without a per-repo role map.
+//
+// Count is REQUIRED by the schema (integer >= 1, always explicit per
+// ADR-055) so an empty `approvals: {}` is rejected as a no-op; it is a
+// *int here only so the decoded value is observable and testable, never
+// to model absence (a schema-valid Approvals always carries it). The
+// other predicates are optional: Not excludes relationship classes
+// (author / agent); MinPermission is the forge-neutral minimum
+// repository permission tier (identity.Permission vocabulary, sans
+// none); MemberOf is a forge-neutral org/team; Members are plain
+// forge-neutral subject strings (NOT the @-prefixed GitHub member-ref).
+// MinPermission and MemberOf are annotated x-intended-required in the
+// schema — optional now, intended to become required in a future major.
+type Approvals struct {
+	Count         *int     `json:"count,omitempty" yaml:"count,omitempty"`
+	Not           []string `json:"not,omitempty" yaml:"not,omitempty"`
+	MinPermission string   `json:"min_permission,omitempty" yaml:"min_permission,omitempty"`
+	MemberOf      string   `json:"member_of,omitempty" yaml:"member_of,omitempty"`
+	Members       []string `json:"members,omitempty" yaml:"members,omitempty"`
 }

@@ -108,17 +108,19 @@ fishhawk init [--preset low|medium|high] [--working-dir D] \
      stage with a gate whose id is not listed has it removed (omit the flag to
      leave every gate as authored).
    The generated spec is a **generic template**: it carries no
-   fishhawk-repo-specific defaults. Two values are placeholders you must
+   fishhawk-repo-specific defaults. Its approval gates use the
+   forge-neutral `approvals` block (`approvals: {count: 1, not: [author,
+   agent]}`), so there is **no** `@your-github-handle` handle and **no**
+   top-level `roles` map to fill in. One value is a placeholder you must
    replace before your first run:
-   - `roles.founder.members: ["@your-github-handle"]` → your GitHub handle
-     (`@user`) or team (`@org/team`).
    - the implement stage's `executor.verify.command: "make test"` → your
      repository's test command (run via `sh -c` after the agent exits), or
      remove the whole `verify` block if your project has no test entrypoint.
 
-   Both placeholders are schema-valid as shipped, so `fishhawk doctor
+   The placeholder is schema-valid as shipped, so `fishhawk doctor
    --spec-only` passes on the freshly-scaffolded spec before you customize
-   them. See `docs/spec/workflow-preset.md` for the full placeholder table.
+   it. See `docs/spec/workflow-preset.md` for the placeholder table and
+   `docs/spec/workflow-v1.md` for the `approvals` predicate.
 3. **Ensures the agent-docs bridge** via the E29.2 `bridge` package: the
    Fishhawk managed block in AGENTS.md and the `@AGENTS.md` import in CLAUDE.md.
    Both are idempotent and preserve content outside the managed markers, and

@@ -1,6 +1,9 @@
 package spec
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // allPresets is the closed set the library ships.
 var allPresets = []Preset{PresetLow, PresetMedium, PresetHigh}
@@ -126,6 +129,68 @@ func assertPageEvents(t *testing.T, oa *OperatorAgent) {
 		if oa.MustPageHuman[i] != w {
 			t.Errorf("must_page_human[%d] = %q, want %q", i, oa.MustPageHuman[i], w)
 		}
+	}
+}
+
+// TestPresetApprovalsGateHandleFree is the E39.2 / #1707 done-means: every
+// preset's feature_change approval gates ship the forge-neutral approvals
+// predicate (Count==1, Not==[author,agent]) and NONE carries the legacy
+// approvers form, the @your-github-handle placeholder, or a top-level
+// roles map. A comment-only / no-op preset touch that left the handle or
+// the approvers gate in place fails here even though the scope path was
+// touched.
+func TestPresetApprovalsGateHandleFree(t *testing.T) {
+	for _, p := range allPresets {
+		p := p
+		t.Run(string(p), func(t *testing.T) {
+			// Byte-level: the placeholder handle and the top-level roles
+			// key must be gone from the shipped document.
+			data, err := PresetBytes(p)
+			if err != nil {
+				t.Fatalf("PresetBytes(%q): %v", p, err)
+			}
+			text := string(data)
+			if strings.Contains(text, "@your-github-handle") {
+				t.Errorf("preset %q still carries the @your-github-handle placeholder:\n%s", p, text)
+			}
+			for _, line := range strings.Split(text, "\n") {
+				if strings.HasPrefix(line, "roles:") {
+					t.Errorf("preset %q still declares a top-level roles map:\n%s", p, text)
+				}
+			}
+
+			// Struct-level: each approval gate carries the forge-neutral
+			// approvals predicate and no legacy approvers form.
+			wf, ok := parsePreset(t, p).Workflows["feature_change"]
+			if !ok {
+				t.Fatalf("preset %q has no feature_change workflow", p)
+			}
+			gates := 0
+			for _, st := range wf.Stages {
+				for _, g := range st.Gates {
+					if g.Type != GateTypeApproval {
+						continue
+					}
+					gates++
+					if g.Approvers != nil {
+						t.Errorf("preset %q stage %q: approval gate still uses legacy approvers %+v", p, st.ID, g.Approvers)
+					}
+					a := g.Approvals
+					if a == nil {
+						t.Fatalf("preset %q stage %q: approval gate missing approvals block", p, st.ID)
+					}
+					if a.Count == nil || *a.Count != 1 {
+						t.Errorf("preset %q stage %q: approvals.count = %v, want 1", p, st.ID, a.Count)
+					}
+					if len(a.Not) != 2 || a.Not[0] != "author" || a.Not[1] != "agent" {
+						t.Errorf("preset %q stage %q: approvals.not = %v, want [author agent]", p, st.ID, a.Not)
+					}
+				}
+			}
+			if gates == 0 {
+				t.Errorf("preset %q has no approval gates to assert on", p)
+			}
+		})
 	}
 }
 

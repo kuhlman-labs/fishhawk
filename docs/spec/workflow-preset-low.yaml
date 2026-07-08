@@ -11,11 +11,6 @@
 
 version: "1.0"
 
-roles:
-  founder:
-    # Replace with your GitHub handle (@user) or team (@org/team).
-    members: ["@your-github-handle"]
-
 workflows:
 
   # Low autonomy — human-led. No operator_agent delegation: every
@@ -77,9 +72,13 @@ workflows:
           max_runtime_minutes: 15
           enforcement: advisory
         gates:
+          # Forge-neutral approval predicate (E39.2 / #1707): one
+          # approval, excluding the change's author and any agent
+          # identity. No repo-specific handle to fill in.
           - type: approval
-            approvers:
-              any_of: [founder]
+            approvals:
+              count: 1
+              not: [author, agent]
 
       - id: implement
         type: implement
@@ -135,6 +134,10 @@ workflows:
           - artifact: pull_request
             from_stage: implement
         gates:
+          # Forge-neutral approval predicate (E39.2 / #1707): one
+          # approval, excluding the change's author and any agent
+          # identity. No repo-specific handle to fill in.
           - type: approval
-            approvers:
-              any_of: [founder]
+            approvals:
+              count: 1
+              not: [author, agent]

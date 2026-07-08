@@ -6,19 +6,14 @@
 # is delegated approve/fixup/retry under their named conditions while
 # waive and merge stay human (the ADR-040 D2 medium preset).
 #
-# The feature_change workflow here is a generic template: the
-# `roles.founder.members` handle and the implement `verify.command` are
-# placeholders every operator must replace for their own repo. The low
-# and high presets are this document minus / plus the operator_agent
-# knobs the METHODOLOGY autonomy tiers imply. See
-# docs/spec/workflow-preset.md.
+# The feature_change workflow here is a generic template: its approval
+# gates use the forge-neutral `approvals` block (no repo-specific handle
+# to replace), and the implement `verify.command` is the one placeholder
+# every operator must replace for their own repo. The low and high
+# presets are this document minus / plus the operator_agent knobs the
+# METHODOLOGY autonomy tiers imply. See docs/spec/workflow-preset.md.
 
 version: "1.0"
-
-roles:
-  founder:
-    # Replace with your GitHub handle (@user) or team (@org/team).
-    members: ["@your-github-handle"]
 
 workflows:
 
@@ -95,9 +90,13 @@ workflows:
           max_runtime_minutes: 15
           enforcement: advisory
         gates:
+          # Forge-neutral approval predicate (E39.2 / #1707): one
+          # approval, excluding the change's author and any agent
+          # identity. No repo-specific handle to fill in.
           - type: approval
-            approvers:
-              any_of: [founder]
+            approvals:
+              count: 1
+              not: [author, agent]
 
       - id: implement
         type: implement
@@ -153,6 +152,10 @@ workflows:
           - artifact: pull_request
             from_stage: implement
         gates:
+          # Forge-neutral approval predicate (E39.2 / #1707): one
+          # approval, excluding the change's author and any agent
+          # identity. No repo-specific handle to fill in.
           - type: approval
-            approvers:
-              any_of: [founder]
+            approvals:
+              count: 1
+              not: [author, agent]
