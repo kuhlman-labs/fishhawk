@@ -165,6 +165,65 @@ func TestReviewer_HappyPath(t *testing.T) {
 	}
 }
 
+// TestSplitPrompt_ImplementReview_CollisionSelectsDiffBoundary locks the #1725
+// binding condition: an implement-review prompt contains BOTH the plan-review
+// marker "### Plan artifact" (now in the cached approved-plan section of the
+// stable prefix) AND the implement marker "### Diff under review" — and the plan
+// marker appears FIRST. splitPrompt must nonetheless split at the diff boundary
+// (by review-kind discriminator, not marker-order precedence), so the whole
+// stable prefix — including the plan artifact — lands in the cached system block.
+func TestSplitPrompt_ImplementReview_CollisionSelectsDiffBoundary(t *testing.T) {
+	// Reordered implement-review layout: stable prefix (schema + plan artifact,
+	// plan marker present) THEN the diff boundary THEN the variable diff body.
+	stablePrefix := "ROLE CONSTRAINT preamble\n\n### Verdict schema\n\nshape\n" +
+		prompt.PlanReviewSplitMarker + "plan body\n\n### Originating issue\n\nissue text\n"
+	variableTail := prompt.ImplementReviewSplitMarker + "diff body hunks"
+	promptText := stablePrefix + variableTail
+
+	// Sanity: both markers are present and the plan marker precedes the diff
+	// marker, so a naive "split at whichever marker" would land at the wrong one.
+	planIdx := strings.Index(promptText, prompt.PlanReviewSplitMarker)
+	diffIdx := strings.Index(promptText, prompt.ImplementReviewSplitMarker)
+	if planIdx < 0 || diffIdx < 0 || planIdx >= diffIdx {
+		t.Fatalf("fixture must have both markers with plan before diff (planIdx=%d diffIdx=%d)", planIdx, diffIdx)
+	}
+
+	systemText, userText := splitPrompt(promptText)
+	if systemText != stablePrefix {
+		t.Errorf("system block should be the full stable prefix up to the diff boundary\n got: %q\nwant: %q", systemText, stablePrefix)
+	}
+	if userText != variableTail {
+		t.Errorf("user block should start at the diff boundary\n got: %q\nwant: %q", userText, variableTail)
+	}
+	// The cached system block MUST include the plan artifact (a co-present plan
+	// marker must NOT pull the split to the plan boundary) and MUST NOT include
+	// the diff body.
+	if !strings.Contains(systemText, "### Plan artifact") {
+		t.Errorf("cached system block should contain the plan artifact:\n%q", systemText)
+	}
+	if strings.Contains(systemText, "### Diff under review") {
+		t.Errorf("cached system block must NOT contain the diff section:\n%q", systemText)
+	}
+	if !strings.Contains(userText, "### Diff under review") || !strings.Contains(userText, "diff body hunks") {
+		t.Errorf("user block should carry the diff section and body:\n%q", userText)
+	}
+}
+
+// TestSplitPrompt_PlanReview_SplitsAtPlanBoundary confirms a plan-review prompt
+// (no "### Diff under review" marker) still splits at the plan-artifact boundary,
+// unchanged by the #1725 discriminator.
+func TestSplitPrompt_PlanReview_SplitsAtPlanBoundary(t *testing.T) {
+	system := "ROLE CONSTRAINT plan-review preamble"
+	tail := prompt.PlanReviewSplitMarker + "plan artifact body"
+	systemText, userText := splitPrompt(system + tail)
+	if systemText != system {
+		t.Errorf("plan-review system block = %q, want %q", systemText, system)
+	}
+	if userText != tail {
+		t.Errorf("plan-review user block = %q, want %q", userText, tail)
+	}
+}
+
 // TestReviewer_TransportFailure asserts that a 500 response causes Review
 // to return a non-nil error.
 func TestReviewer_TransportFailure(t *testing.T) {

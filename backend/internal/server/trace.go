@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -2737,6 +2738,36 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		}
 	}
 
+	// Delta re-review (#1725). On a post-fix-up re-review — detected by the
+	// presence of prior concerns (the addressed_pending rows the fix-up trigger
+	// wrote) — replace the full base..head PR diff with ONLY the fix-up delta
+	// since the head the previous review ran against, so the reviewer focuses on
+	// whether the routed concerns are resolved and the stable prefix caches
+	// across rounds. resolveFixupDeltaDiff fails closed to the full diff on ANY
+	// miss (not wired, no PR, unresolvable/degenerate prior head, compare error),
+	// so first-review coverage is unchanged. A first review has no prior concerns
+	// and never enters this branch. The routed concerns and the reviewer's
+	// concern_resolutions delta-verification mechanism are preserved either way —
+	// they ride on trig.PriorConcerns, which is already set above.
+	if len(trig.PriorConcerns) > 0 {
+		if delta, ok := s.resolveFixupDeltaDiff(ctx, runRow, runID, stageID, headSHA); ok {
+			trig.Diff = renderDiffForReview(delta)
+			trig.DiffPatch = delta.Patch
+			trig.DeltaReReview = true
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "implement review: re-review diff mode",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("mode", "delta"),
+			)
+		} else {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "implement review: re-review diff mode",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("mode", "full"),
+			)
+		}
+	}
+
 	// Operator-scope-undelivered pre-review signal (#1407): the operator may
 	// have DELIBERATELY added a scope path — either an add_scope_files path
 	// folded at plan approval (already computed as trig.AmendedScopeFiles) or
@@ -3329,6 +3360,189 @@ func (s *Server) priorConcernsForReview(ctx context.Context, runID, stageID uuid
 		})
 	}
 	return out
+}
+
+// resolveFixupDeltaDiff computes the fix-up delta for a post-fix-up re-review of
+// the implement stage (#1725): the base..head compare between the head the
+// PREVIOUS review ran against and the current head, via githubclient.ComparePatch
+// — the same seam DispatchConsolidatedReview reuses, mapped through
+// consolidatedReviewDiff. It returns the delta as a policy.Diff and ok=true ONLY
+// when every precondition holds: a GitHub client is wired, the run has an
+// installation and an open PR, the current head is present, the prior-reviewed
+// head resolves AND differs from the current head, the repo parses, and
+// ComparePatch succeeds. On ANY miss it returns ok=false (best-effort
+// WARN/degrade, mirroring the other resolvers) so the caller keeps the full
+// bundle diff — fail-closed to the pre-#1725 behavior, preserving first-review
+// and no-GitHub coverage unchanged.
+//
+// The "missing PR number" degrade the ticket names maps to runRow.PullRequestURL
+// being nil: ComparePatch itself operates on commit SHAs, not a PR number, but a
+// fix-up re-review only happens on a run that reached the PR stage, so a nil
+// PullRequestURL (no PR opened) is treated as "compare unavailable" alongside the
+// no-client / no-installation cases.
+func (s *Server) resolveFixupDeltaDiff(ctx context.Context, runRow *run.Run, runID, stageID uuid.UUID, currentHead string) (policy.Diff, bool) {
+	// GitHub compare unavailable: no client, no installation, or no PR opened.
+	// ComparePatch runs against the App installation over the run's PR, so all
+	// three are hard preconditions (and the nil InstallationID guard prevents a
+	// nil-pointer dereference below).
+	if s.cfg.GitHub == nil {
+		return policy.Diff{}, false
+	}
+	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
+		return policy.Diff{}, false
+	}
+	if runRow.PullRequestURL == nil {
+		return policy.Diff{}, false
+	}
+	// No current head to diff against (the no-verify / head_sha-less bundle).
+	if currentHead == "" {
+		return policy.Diff{}, false
+	}
+	// The head the previous review ran against. Unresolvable ("") — or equal to
+	// the current head, a degenerate no-op compare that would starve the reviewer
+	// of any diff — keeps the full diff.
+	priorHead := s.resolvePriorReviewedHeadSHA(ctx, runID, stageID)
+	if priorHead == "" || priorHead == currentHead {
+		return policy.Diff{}, false
+	}
+	repo, err := parseRepoOwnerName(runRow.Repo)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: parse repo for fixup delta failed — keeping full diff",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return policy.Diff{}, false
+	}
+	cmp, err := s.cfg.GitHub.ComparePatch(ctx, *runRow.InstallationID, repo, priorHead, currentHead)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: compare patch for fixup delta failed — keeping full diff",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("prior_head", priorHead),
+			slog.String("current_head", currentHead),
+			slog.String("error", err.Error()),
+		)
+		return policy.Diff{}, false
+	}
+	return consolidatedReviewDiff(cmp), true
+}
+
+// resolvePriorReviewedHeadSHA returns the head_sha the PREVIOUS implement review
+// of this stage ran against, for the delta re-review (#1725). It looks, in order:
+//
+//  1. the newest prior implement_reviewed entry for the stage carrying a head_sha;
+//  2. else the newest prior implement_review_started entry for the stage carrying
+//     a head_sha (both are stamped with the review round's head_sha per #797/#1250);
+//  3. else the second-newest DISTINCT head across the reported-head ledger
+//     (pull_request_opened / child_pushed / fixup_pushed) — the head before the
+//     current fix-up head — for the head_sha-less prior-review case.
+//
+// Returns "" on any miss (nil AuditRepo, no entry, read error) — best-effort
+// WARN-and-proceed, mirroring resolveNewestReportedHeadSHA. The caller then keeps
+// the full diff. This runs BEFORE the current round emits its own
+// implement_review_started entry, so every review entry it sees is from a prior
+// round.
+func (s *Server) resolvePriorReviewedHeadSHA(ctx context.Context, runID, stageID uuid.UUID) string {
+	if s.cfg.AuditRepo == nil {
+		return ""
+	}
+	// (1) and (2): the newest review entry for THIS stage that carries a head_sha.
+	for _, cat := range []string{"implement_reviewed", "implement_review_started"} {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: list review entries for prior head failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("category", cat),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+		var newest *audit.Entry
+		var newestSHA string
+		for _, e := range entries {
+			if e.StageID == nil || *e.StageID != stageID {
+				continue
+			}
+			var payload struct {
+				HeadSHA string `json:"head_sha"`
+			}
+			if uerr := json.Unmarshal(e.Payload, &payload); uerr != nil || payload.HeadSHA == "" {
+				continue
+			}
+			if newest == nil || e.Timestamp.After(newest.Timestamp) ||
+				(e.Timestamp.Equal(newest.Timestamp) && e.Sequence > newest.Sequence) {
+				newest = e
+				newestSHA = payload.HeadSHA
+			}
+		}
+		if newestSHA != "" {
+			return newestSHA
+		}
+	}
+	// (3) second-newest distinct reported-head ledger entry.
+	return s.resolveSecondNewestReportedHeadSHA(ctx, runID, stageID)
+}
+
+// resolveSecondNewestReportedHeadSHA returns the second-newest DISTINCT head_sha
+// across the reported-head ledger (lineageLedgerCategories) — the head before the
+// current one. It is the #1725 fallback behind resolvePriorReviewedHeadSHA for
+// the case where the prior review recorded no head_sha (a head_sha-less bundle):
+// the newest ledger head is the current fix-up head, so the prior head is the
+// second-newest. Returns "" (best-effort WARN-and-omit) when the AuditRepo is
+// unconfigured, fewer than two distinct heads exist, or on any read error.
+func (s *Server) resolveSecondNewestReportedHeadSHA(ctx context.Context, runID, stageID uuid.UUID) string {
+	if s.cfg.AuditRepo == nil {
+		return ""
+	}
+	type headEntry struct {
+		ts  time.Time
+		seq int64
+		sha string
+	}
+	var heads []headEntry
+	for _, cat := range lineageLedgerCategories {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: list reported-head ledger for prior head failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("category", cat),
+				slog.String("error", err.Error()),
+			)
+			return ""
+		}
+		for _, e := range entries {
+			var payload struct {
+				HeadSHA string `json:"head_sha"`
+			}
+			if uerr := json.Unmarshal(e.Payload, &payload); uerr != nil || payload.HeadSHA == "" {
+				continue
+			}
+			heads = append(heads, headEntry{ts: e.Timestamp, seq: e.Sequence, sha: payload.HeadSHA})
+		}
+	}
+	// Newest-first by (timestamp, sequence).
+	sort.Slice(heads, func(i, j int) bool {
+		if heads[i].ts.Equal(heads[j].ts) {
+			return heads[i].seq > heads[j].seq
+		}
+		return heads[i].ts.After(heads[j].ts)
+	})
+	// Return the second DISTINCT head (dedupe consecutive equal heads so an
+	// unchanged head reported twice does not masquerade as the prior head).
+	var newestSHA string
+	for _, h := range heads {
+		if newestSHA == "" {
+			newestSHA = h.sha
+			continue
+		}
+		if h.sha != newestSHA {
+			return h.sha
+		}
+	}
+	return ""
 }
 
 // applyConcernResolutions applies one reviewer's delta-verification

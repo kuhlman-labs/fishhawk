@@ -118,11 +118,31 @@ func (r *Reviewer) Review(ctx context.Context, promptText string) (*planreview.R
 	return &verdict, modelName, nil
 }
 
-// splitPrompt splits promptText at prompt.PlanReviewSplitMarker. The text
-// before the marker becomes the system block (stable preamble); everything
-// from the marker onward becomes the user message. Falls back to placing the
-// full text in the user message when the marker is absent.
+// splitPrompt splits promptText into a cached system block (the stable prefix
+// before the marker) and the variable user message (the marker onward). The
+// same Reviewer serves BOTH plan-review and implement-review prompts, so it
+// must pick the right boundary per review kind. It uses an UNAMBIGUOUS
+// review-kind discriminator rather than relying on which marker appears first
+// (#1725): the implement-review split marker "### Diff under review"
+// (prompt.ImplementReviewSplitMarker) is emitted ONLY by buildImplementReview —
+// buildPlanReview never renders it — so its PRESENCE identifies an
+// implement-review prompt. An implement-review prompt ALSO contains the
+// plan-review marker "### Plan artifact" (prompt.PlanReviewSplitMarker) in the
+// now-leading cached approved-plan section, so selecting the implement boundary
+// by presence — never by textual order — is what keeps the split at the diff
+// boundary and the full stable prefix (verdict schema, review criteria,
+// approved plan, issue, approval conditions) inside the cached system block.
+// Plan-review prompts (which lack the implement marker) fall through to the
+// plan-artifact boundary. A prompt with neither marker places its full text in
+// the user message.
 func splitPrompt(promptText string) (systemText, userText string) {
+	// Implement-review prompts: split at the diff boundary. Checked first and
+	// by presence so a co-present "### Plan artifact" (now in the cached
+	// prefix) can never pull the split to the wrong boundary.
+	if idx := strings.Index(promptText, prompt.ImplementReviewSplitMarker); idx >= 0 {
+		return promptText[:idx], promptText[idx:]
+	}
+	// Plan-review prompts: split at the plan-artifact boundary.
 	idx := strings.Index(promptText, prompt.PlanReviewSplitMarker)
 	if idx < 0 {
 		return "", promptText
