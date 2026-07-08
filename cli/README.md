@@ -13,7 +13,7 @@ This directory is its own Go module (`github.com/kuhlman-labs/fishhawk/cli`) so 
 
 ## Status
 
-E6.1 (#55), E6.2 (#33), E6.3 (#34), E6.4 (#35), E6.5 (#36) shipped: scaffold + `run start`, `run status`, `run list`, `run cancel`, `run open`, `validate`. E18.1 (#332), E18.2 (#333), E18.3 (#334), E18.4 (#335), E18.5 (#336) added `plan approve`, `plan reject`, `run retry`, `audit list`, `audit tail`. E23.8 (#1388) added `deploy status`, `deploy approve`, `deploy reject`, `deploy rollback`. E25.9 (#1448) added `campaign start`, `campaign status`, `campaign list`, `campaign resume`. E29.3 (#1504) added `init`. E9.4 (#1607) added `export`. E32.3 (#1550) added `run watch`.
+E6.1 (#55), E6.2 (#33), E6.3 (#34), E6.4 (#35), E6.5 (#36) shipped: scaffold + `run start`, `run status`, `run list`, `run cancel`, `run open`, `validate`. E18.1 (#332), E18.2 (#333), E18.3 (#334), E18.4 (#335), E18.5 (#336) added `plan approve`, `plan reject`, `run retry`, `audit list`, `audit tail`. E23.8 (#1388) added `deploy status`, `deploy approve`, `deploy reject`, `deploy rollback`. E25.9 (#1448) added `campaign start`, `campaign status`, `campaign list`, `campaign resume`. E29.3 (#1504) added `init`. E9.4 (#1607) added `export`. E32.3 (#1550) added `run watch`. E39.3 (#1708) added `token login` / `token list` (OAuth device-flow, user-bound tokens) and the local credential store.
 
 ## Subcommands
 
@@ -28,6 +28,8 @@ fishhawk run watch    <run-id> [--stage TYPE] [--until terminal|amendment|any] [
 fishhawk run auto-decide <run-id> [--poll N] [--max-duration D] [--dry-run]   # INTERIM (#1233)
 fishhawk plan approve <run-id> [--reason R] [--output text|json]
 fishhawk plan reject  <run-id> [--reason R] [--output text|json]
+fishhawk token login  [--provider github] [--client-id ID]
+fishhawk token list
 fishhawk deploy status   <run-id> [--output text|json]
 fishhawk deploy approve  <run-id> --environment ENV [--override-freeze] [--reason R] [--output text|json]
 fishhawk deploy reject   <run-id> [--reason R] [--output text|json]
@@ -82,6 +84,10 @@ and published with provenance + verification instructions, lives at
 
 `campaign` drives a campaign — the parent record of an epic-driven multi-issue run (ADR-047 / #1437) — from the terminal. `campaign start --repo R --epic E` mints a campaign from an epic ref (`issue:N`, `#N`, `N`, or a `.../issues/N` URL; normalized to the canonical `issue:N` the API expects) by decomposing the epic's child issues into a wave-ordered DAG; `--pause-policy pause_campaign|pause_item` (validated locally before the round-trip) sets what the auto-driver pauses on a gate hand-off, omitted to take the backend default. `--operator-agent <json|@file>` sets an optional campaign-level `operator_agent` delegation override (literal JSON, or `@path` to read it from a file; validated as JSON locally) that wholesale-replaces — never merges with — every issue-run's per-workflow `operator_agent` contract for the whole campaign; an explicit `{}` is a valid override that delegates no knobs (page on every action), and omitting the flag leaves each issue-run on its workflow default. `campaign status <campaign-id>` renders the campaign block, the distilled `next_action` (action + issue ref + detail), and a per-issue run grid (one line per item: issue ref, state, and its run id or `-` when unlinked). `campaign list` pages campaigns (`created_at` descending) with optional `--repo` / `--state` filters. `campaign resume <campaign-id>` hands a paused campaign back to the auto-driver after a human owned a run gate; a campaign with nothing to resume surfaces `409 campaign_not_paused`, and a token missing `write:campaigns` (required by `start` and `resume`) surfaces `403 insufficient_scope` verbatim.
 
+`token` mints and inspects **user-bound** Fishhawk tokens via the GitHub OAuth device flow (E39.3 / #1708). `token login` (a) resolves the OAuth App `client_id` — from `--client-id` / `FISHHAWK_OAUTH_CLIENT_ID` when set, otherwise from the backend's discovery endpoint `GET /v0/tokens/login` (a backend with no OAuth configured answers `503 tokens_unconfigured`, surfaced verbatim); (b) drives the device flow, printing the `user_code` + `verification_uri` to stderr and polling until you authorize in the browser (handling `authorization_pending` / `slow_down` / `expired_token` / `access_denied`); (c) POSTs the resulting GitHub access token to the backend mint endpoint `POST /v0/tokens/login`, which **re-verifies** it server-side, applies the operator-permission gate, and issues a token stamped `auth_method=oauth`; and (d) stores the minted token in the local credential store, then prints the provider-qualified subject (`github:<login>`), the granted scope, and an expiry hint (v0 tokens do not expire). `--provider` defaults to `github` and is the only provider supported today (any other value is rejected before a network call). `token list` prints the stored credentials — one block per backend URL, showing subject / scope / provider / expiry — without contacting any backend, and never prints the bearer secret itself.
+
+The credential store is a single JSON file at `$XDG_CONFIG_HOME/fishhawk/credentials` (falling back to `~/.config/fishhawk/credentials`), written mode `0600` (the directory `0700`) because it holds live bearer secrets. It maps a backend URL to the credential minted for it, so one store can hold tokens for several backends. **Token precedence:** every subcommand resolves its bearer token as `--token` / `FISHHAWK_TOKEN` first — an explicit flag/env value **always wins** — and only falls back to the stored credential (keyed by `--backend-url`) when that is empty. A missing or unreadable store degrades silently to no token, so dev backends with stubbed auth keep working.
+
 `run watch` is the operator's **blocking wait-for-a-stage-to-settle** verb (E32.3 / #1550). Launch it (typically detached) alongside a `fishhawk_dispatch_stage` to block until a stage settles instead of grepping the per-run runner log for a guessed event name — the fragile contract that silently stalled runs when the guessed name never appeared. It resolves the stage id from `--stage <type>` (default `implement`; the operator passes a stage TYPE, not a raw id), then polls two already-existing long-poll endpoints: the durable `(run_id, stage_id)` stage-wait (`GET /v0/runs/{run_id}/stages/{stage_id}?wait`, #1252) and, when `--until` is `amendment` or `any`, the run's pending scope amendments (`GET /v0/runs/{run_id}/scope-amendments?wait`, #1035). `--until terminal|amendment|any` (default `any`) selects the settle condition. It exits with a distinct code per outcome class — `0` terminal-ok (the stage settled succeeded or a parked `awaiting_*` state), `1` failed (state `failed` or a non-nil `failure_category`) OR a transport/lookup error, `3` amendment-pending, `4` timeout (`--max-duration` elapsed, default 50m) — and writes **exactly one** JSON summary line to stdout (`{run_id, stage_id, stage_type, until, outcome, state, exit_code}`, `outcome` one of `terminal_ok|failed|amendment_pending|timeout|error`) so a caller can `jq` the last stdout line regardless of exit class. A settled stage ends the wait for **every** `--until` mode, including `amendment` — once the stage is terminal no amendment can arrive, so `--until amendment` returns the terminal outcome rather than hanging. `--poll` is the per-iteration stage-wait long-poll seconds (default 15, clamped to the backend's 30s cap). It changes no backend or runner code; it reuses endpoints that already exist.
 
 `run auto-decide` is an **INTERIM** second-channel auto-decider for known-safe mid-stage scope amendments (#1233), to be **removed when #1232 (durable non-blocking dispatch) ships**. Launch it detached alongside a blocking `fishhawk_run_stage` so a known-safe amendment can be decided in-band while the driving MCP session is blocked. It polls the run's pending amendments (reusing the `?wait` long-poll, #1035) and **auto-approves only** amendments whose every path is a coupled `*_test.go` sibling — i.e. a `<dir>/<stem>_test.go` whose production sibling `<dir>/<stem>.go` is already in the run's approved-plan `scope.files`. Everything else (any non-test path, any production file, or a test whose production sibling is out of scope) is left undecided → today's fail-and-retry. It changes no backend or runner code; it reuses endpoints that already exist. Run it with the **operator/operator-agent token** (the decision endpoint rejects run-bound `fhm_` tokens). `--poll` is the per-iteration long-poll seconds (default 25, clamped to the backend's 30s cap); `--max-duration` bounds the overall loop (default 50m); `--dry-run` logs verdicts without POSTing.
@@ -98,7 +104,9 @@ and published with provenance + verification instructions, lives at
 | `--token` | `FISHHAWK_TOKEN` | `""` (dev backends with stubbed auth) |
 | `--timeout` | — | `60s` |
 
-`--token` will become required once `/v0/tokens` lands; for now most backends accept anonymous calls via the `authStub` middleware.
+`--token` will become required once auth is enforced everywhere; for now most dev backends accept anonymous calls via the `authStub` middleware. When `--token` / `FISHHAWK_TOKEN` is empty, subcommands fall back to a stored credential minted by `fishhawk token login` (keyed by `--backend-url`); an explicit flag/env token always wins over the stored one.
+
+`token login` reads one extra input, `--client-id` / `FISHHAWK_OAUTH_CLIENT_ID` (the OAuth App `client_id`); when unset it is discovered from the backend, so most operators never set it.
 
 ## Build and test
 
@@ -129,6 +137,11 @@ Or from this directory directly:
 
     # List recent runs
     fishhawk run list --state running --limit 25
+
+    # Mint a user-bound token via the OAuth device flow, then reuse it
+    # implicitly (stored per backend URL; no --token needed afterwards)
+    fishhawk token login --backend-url http://localhost:8080
+    fishhawk token list
 
     # Approve the plan stage on a run from the terminal (ADR-019 / #320)
     fishhawk plan approve <run-id> --reason "scope looks right"
