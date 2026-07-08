@@ -368,6 +368,25 @@ func TestTokenLogin_UnsupportedProvider(t *testing.T) {
 	}
 }
 
+// `token login --help` describes the OAuth device flow (not just a bare
+// flag list) and lists the per-command flags, and exits 0. This pins the
+// blocking `fishhawk token login --help` acceptance path.
+func TestTokenLogin_HelpDescribesDeviceFlow(t *testing.T) {
+	for _, arg := range []string{"--help", "-h"} {
+		var stdout, stderr bytes.Buffer
+		code := run([]string{"token", "login", arg}, &stdout, &stderr)
+		if code != exitOK {
+			t.Fatalf("%s: exit = %d, want %d; stderr=%s", arg, code, exitOK, stderr.String())
+		}
+		out := stderr.String()
+		for _, want := range []string{"device flow", "authorize", "--provider", "--client-id"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("%s: help missing %q:\n%s", arg, want, out)
+			}
+		}
+	}
+}
+
 func TestTokenList_Empty(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	var stdout, stderr bytes.Buffer

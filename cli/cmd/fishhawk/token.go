@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -118,7 +119,25 @@ func tokenLogin(args []string, stdout, stderr io.Writer) int {
 	clientID := fs.String("client-id",
 		envOr("FISHHAWK_OAUTH_CLIENT_ID", ""),
 		"OAuth App client_id; overrides backend discovery")
+	fs.Usage = func() {
+		_, _ = fmt.Fprintln(stderr, "Usage: fishhawk token login [--provider github] [--client-id ID]")
+		_, _ = fmt.Fprintln(stderr, "")
+		_, _ = fmt.Fprintln(stderr, "Log in via the GitHub OAuth device flow and mint a user-bound Fishhawk token.")
+		_, _ = fmt.Fprintln(stderr, "")
+		_, _ = fmt.Fprintln(stderr, "The command prints a short user code and a github.com verification URL, waits")
+		_, _ = fmt.Fprintln(stderr, "for you to authorize in the browser, then hands the resulting access token to")
+		_, _ = fmt.Fprintln(stderr, "the backend, which re-verifies it server-side and mints a token scoped to the")
+		_, _ = fmt.Fprintln(stderr, "operator default set. The minted token is saved in the local credential store")
+		_, _ = fmt.Fprintln(stderr, "(see `fishhawk token list`) and used automatically when --token / FISHHAWK_TOKEN")
+		_, _ = fmt.Fprintln(stderr, "is empty.")
+		_, _ = fmt.Fprintln(stderr, "")
+		_, _ = fmt.Fprintln(stderr, "Flags:")
+		fs.PrintDefaults()
+	}
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
 		return exitUsage
 	}
 	if *provider != "github" {

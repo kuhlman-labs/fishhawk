@@ -587,6 +587,22 @@ func TestTokenLoginMint_PersistsOAuthRow(t *testing.T) {
 	}
 }
 
+// A posted provider that names something other than the one supported
+// provider is refused at the backend with 400 unsupported provider — the
+// guard is independent of the CLI's own pre-flight rejection, so a
+// regression that loosened or dropped it is caught server-side.
+func TestTokenLoginMint_ProviderMismatch_400(t *testing.T) {
+	s := newFakeLoginServer(t, &fakeIdentityProvider{subject: "github:octocat", perm: identity.PermissionAdmin}, nil)
+	w := tokenRequest(t, s, http.MethodPost, "/v0/tokens/login", "",
+		map[string]any{"access_token": "gho_cli", "provider": "gitlab"})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "unsupported provider") {
+		t.Errorf("body missing unsupported provider:\n%s", w.Body.String())
+	}
+}
+
 func TestTokenLoginMint_APITokenRepoNil_503(t *testing.T) {
 	s := New(Config{Addr: "127.0.0.1:0",
 		IdentityProvider: &fakeIdentityProvider{subject: "github:octocat", perm: identity.PermissionAdmin},
