@@ -12,11 +12,51 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const createOAuthToken = `-- name: CreateOAuthToken :one
+INSERT INTO api_tokens (id, subject, token_hash, scopes, auth_method, provider)
+VALUES ($1, $2, $3, $4, 'oauth', $5)
+RETURNING id, subject, token_hash, scopes, last_used_at, created_at, revoked_at, auth_method, provider
+`
+
+type CreateOAuthTokenParams struct {
+	ID        uuid.UUID   `json:"id"`
+	Subject   string      `json:"subject"`
+	TokenHash string      `json:"token_hash"`
+	Scopes    []string    `json:"scopes"`
+	Provider  pgtype.Text `json:"provider"`
+}
+
+// OAuth device-flow path (E39.3 / #1708): stamp auth_method='oauth'
+// and the originating provider explicitly. The static Issue path
+// uses CreateToken and relies on the auth_method DEFAULT.
+func (q *Queries) CreateOAuthToken(ctx context.Context, arg CreateOAuthTokenParams) (ApiToken, error) {
+	row := q.db.QueryRow(ctx, createOAuthToken,
+		arg.ID,
+		arg.Subject,
+		arg.TokenHash,
+		arg.Scopes,
+		arg.Provider,
+	)
+	var i ApiToken
+	err := row.Scan(
+		&i.ID,
+		&i.Subject,
+		&i.TokenHash,
+		&i.Scopes,
+		&i.LastUsedAt,
+		&i.CreatedAt,
+		&i.RevokedAt,
+		&i.AuthMethod,
+		&i.Provider,
+	)
+	return i, err
+}
+
 const createToken = `-- name: CreateToken :one
 
 INSERT INTO api_tokens (id, subject, token_hash, scopes)
 VALUES ($1, $2, $3, $4)
-RETURNING id, subject, token_hash, scopes, last_used_at, created_at, revoked_at
+RETURNING id, subject, token_hash, scopes, last_used_at, created_at, revoked_at, auth_method, provider
 `
 
 type CreateTokenParams struct {
@@ -26,8 +66,8 @@ type CreateTokenParams struct {
 	Scopes    []string  `json:"scopes"`
 }
 
-// API token queries (E4.5 / #51). sqlc generates typed Go into
-// ./db per backend/sqlc.yaml.
+// Static operator-token path. auth_method is left to the column
+// DEFAULT 'static' and provider stays NULL.
 func (q *Queries) CreateToken(ctx context.Context, arg CreateTokenParams) (ApiToken, error) {
 	row := q.db.QueryRow(ctx, createToken,
 		arg.ID,
@@ -44,12 +84,14 @@ func (q *Queries) CreateToken(ctx context.Context, arg CreateTokenParams) (ApiTo
 		&i.LastUsedAt,
 		&i.CreatedAt,
 		&i.RevokedAt,
+		&i.AuthMethod,
+		&i.Provider,
 	)
 	return i, err
 }
 
 const getTokenByHash = `-- name: GetTokenByHash :one
-SELECT id, subject, token_hash, scopes, last_used_at, created_at, revoked_at FROM api_tokens
+SELECT id, subject, token_hash, scopes, last_used_at, created_at, revoked_at, auth_method, provider FROM api_tokens
  WHERE token_hash = $1
    AND revoked_at IS NULL
 `
@@ -68,12 +110,14 @@ func (q *Queries) GetTokenByHash(ctx context.Context, tokenHash string) (ApiToke
 		&i.LastUsedAt,
 		&i.CreatedAt,
 		&i.RevokedAt,
+		&i.AuthMethod,
+		&i.Provider,
 	)
 	return i, err
 }
 
 const getTokenByID = `-- name: GetTokenByID :one
-SELECT id, subject, token_hash, scopes, last_used_at, created_at, revoked_at FROM api_tokens
+SELECT id, subject, token_hash, scopes, last_used_at, created_at, revoked_at, auth_method, provider FROM api_tokens
  WHERE id = $1
 `
 
@@ -91,12 +135,14 @@ func (q *Queries) GetTokenByID(ctx context.Context, id uuid.UUID) (ApiToken, err
 		&i.LastUsedAt,
 		&i.CreatedAt,
 		&i.RevokedAt,
+		&i.AuthMethod,
+		&i.Provider,
 	)
 	return i, err
 }
 
 const listTokensForSubject = `-- name: ListTokensForSubject :many
-SELECT id, subject, token_hash, scopes, last_used_at, created_at, revoked_at FROM api_tokens
+SELECT id, subject, token_hash, scopes, last_used_at, created_at, revoked_at, auth_method, provider FROM api_tokens
  WHERE subject = $1
    AND revoked_at IS NULL
  ORDER BY created_at DESC
@@ -121,6 +167,8 @@ func (q *Queries) ListTokensForSubject(ctx context.Context, subject string) ([]A
 			&i.LastUsedAt,
 			&i.CreatedAt,
 			&i.RevokedAt,
+			&i.AuthMethod,
+			&i.Provider,
 		); err != nil {
 			return nil, err
 		}
@@ -136,7 +184,7 @@ const revokeToken = `-- name: RevokeToken :one
 UPDATE api_tokens
    SET revoked_at = COALESCE(revoked_at, $2)
  WHERE id = $1
-RETURNING id, subject, token_hash, scopes, last_used_at, created_at, revoked_at
+RETURNING id, subject, token_hash, scopes, last_used_at, created_at, revoked_at, auth_method, provider
 `
 
 type RevokeTokenParams struct {
@@ -157,6 +205,8 @@ func (q *Queries) RevokeToken(ctx context.Context, arg RevokeTokenParams) (ApiTo
 		&i.LastUsedAt,
 		&i.CreatedAt,
 		&i.RevokedAt,
+		&i.AuthMethod,
+		&i.Provider,
 	)
 	return i, err
 }

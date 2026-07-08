@@ -1,6 +1,14 @@
 package main
 
-import "testing"
+import (
+	"bytes"
+	"context"
+	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+)
 
 // TestOperatorDefaultScopes_IncludesWriteDeploy pins #1390: the deploy gate
 // (deploy approval + deploy ship/rollback operator bearer paths) requires the
@@ -43,4 +51,39 @@ func containsScope(scopes []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestRunTokenIssue_DefaultsAuthMethodStatic pins #1708: `fishhawkd token
+// issue` mints a token through the static apitoken.Issue path, so the persisted
+// row must record auth_method='static' (via the column DEFAULT — condition (1):
+// the static path is not changed) with a NULL provider. The OAuth
+// (auth_method='oauth') path is minted by the login endpoint, not this command.
+func TestRunTokenIssue_DefaultsAuthMethodStatic(t *testing.T) {
+	url := pgtest.NewURL(t) // freshly migrated per-test database
+
+	var logSink bytes.Buffer
+	code := runTokenIssue([]string{"--db", url, "--subject", "github:42"}, &logSink)
+	if code != exitOK {
+		t.Fatalf("runTokenIssue exit = %d, want %d; log:\n%s", code, exitOK, logSink.String())
+	}
+
+	pool, err := pgxpool.New(context.Background(), url)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+
+	var authMethod string
+	var provider *string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT auth_method, provider FROM api_tokens WHERE subject = $1`, "github:42",
+	).Scan(&authMethod, &provider); err != nil {
+		t.Fatalf("read back issued token: %v", err)
+	}
+	if authMethod != "static" {
+		t.Errorf("issued token auth_method = %q, want static", authMethod)
+	}
+	if provider != nil {
+		t.Errorf("issued token provider = %q, want NULL for a static token", *provider)
+	}
 }
