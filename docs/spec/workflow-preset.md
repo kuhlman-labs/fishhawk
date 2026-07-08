@@ -15,8 +15,26 @@ the stages, reviewers, budgets, constraints, and gates are identical.
 | Preset | METHODOLOGY tier | `operator_agent` delegation |
 |---|---|---|
 | `workflow-preset-low.yaml` | Low (human-led) | No `operator_agent` block. Fail-closed: every judgment point (approve, fixup, retry, waive, merge) pages the human. |
-| `workflow-preset-medium.yaml` | Medium (default) | `may_approve: clean_dual_approval`, `may_route_fixup: convergent_concerns`, `may_retry: infra_flake` + the 7-event `must_page_human` list. Waive and merge stay human. Byte-for-byte the current `.fishhawk/workflows.yaml` `feature_change` block. |
+| `workflow-preset-medium.yaml` | Medium (default) | `may_approve: clean_dual_approval`, `may_route_fixup: convergent_concerns`, `may_retry: infra_flake` + the 7-event `must_page_human` list. Waive and merge stay human. A generic template with placeholder `roles.founder.members` and implement `verify.command` values (see below); it is NOT tied to this repo's own `.fishhawk/workflows.yaml`. |
 | `workflow-preset-high.yaml` | High (agent merges) | Medium's three knobs plus `may_waive: solo_low` and `may_merge: gates_resolved_ci_green`. |
+
+### Placeholder values every operator must replace
+
+The presets carry NO fishhawk-repo-specific defaults. Two values are
+generic placeholders a freshly-scaffolded repo must fill in before its
+first run:
+
+| Placeholder | Where | Replace with |
+|---|---|---|
+| `@your-github-handle` | `roles.founder.members` | Your GitHub handle (`@user`) or team (`@org/team`). The `member-ref` pattern accepts either; `members` requires at least one entry. |
+| `make test` | implement stage `executor.verify.command` | Your repository's test command (run via `sh -c` after the agent exits). `verify` is optional — remove the whole block if your project has no test entrypoint — but if present, `command` must be a non-empty string. |
+
+Both placeholders are schema-valid as shipped, so a generated preset
+passes validation (and `fishhawk doctor --spec-only`) before the operator
+customizes them. `fishhawk doctor --spec-only` runs only the two
+environment-free rungs (spec schema-validity + execution-path coverage),
+so a fresh repo can be validated to the plan gate with no local Fishhawk
+environment.
 
 `medium` is authoritative: `low` is `medium` with the `operator_agent`
 block removed, `high` is `medium` with the two extra knobs added. The

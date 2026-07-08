@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/kuhlman-labs/fishhawk/cli/internal/spec"
 )
 
 // withFakeDoctorHTTP stubs doctorHTTPDo for the duration of the test.
@@ -456,6 +458,96 @@ func TestRunDoctor_DirtyTree_ExitZero(t *testing.T) {
 	if !strings.Contains(stdout.String(), "ready for local loop") {
 		t.Errorf("stdout missing 'ready for local loop': %q", stdout.String())
 	}
+}
+
+// TestRunDoctor_SpecOnly_ExitZero verifies that `doctor --spec-only` on a
+// fresh repo whose only Fishhawk artifact is a generated workflows.yaml
+// exits exitOK WITHOUT any local environment: no docker/backend/token/MCP
+// seams are stubbed, and the infra rung labels must be absent from the
+// output because those rungs are skipped entirely in spec-only mode.
+func TestRunDoctor_SpecOnly_ExitZero(t *testing.T) {
+	dir := t.TempDir()
+	hidden := filepath.Join(dir, ".fishhawk")
+	if err := os.MkdirAll(hidden, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	genned, err := spec.Generate(spec.PresetMedium, spec.Deltas{})
+	if err != nil {
+		t.Fatalf("Generate(medium): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(hidden, "workflows.yaml"), genned, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Deliberately DO NOT stub the docker/backend/gh/MCP seams: spec-only
+	// mode must never reach them. Point at an unreachable backend to prove it.
+	var stdout, stderr strings.Builder
+	got := run([]string{
+		"doctor", "--spec-only",
+		"--backend-url", "http://127.0.0.1:0",
+		"--working-dir", dir,
+	}, &stdout, &stderr)
+
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK; stdout:\n%s", got, stdout.String())
+	}
+	out := stdout.String()
+	// The two spec rungs must be present.
+	for _, want := range []string{"workflow spec present", "ready for local loop"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stdout missing %q: %q", want, out)
+		}
+	}
+	// Every infra/backend/MCP/git/gh rung label must be ABSENT.
+	for _, notWant := range []string{
+		"docker daemon running", "postgres container", "minio container",
+		"backend reachable", "token valid", "runner binary found",
+		"MCP registered", "git remote origin", "gh CLI authenticated",
+		"backend SHA drift", "runner schema drift", "CLI version",
+	} {
+		if strings.Contains(out, notWant) {
+			t.Errorf("spec-only output must not contain infra rung %q: %q", notWant, out)
+		}
+	}
+}
+
+// TestRunDoctor_SpecOnly_FailsClosed verifies the fail-closed branch: with
+// --spec-only and a missing (or schema-invalid) workflows.yaml, checkSpec
+// returns "fail" and runDoctor exits non-zero even though no environment
+// rungs run.
+func TestRunDoctor_SpecOnly_FailsClosed(t *testing.T) {
+	t.Run("missing spec", func(t *testing.T) {
+		dir := t.TempDir() // no .fishhawk/workflows.yaml
+		var stdout, stderr strings.Builder
+		got := run([]string{
+			"doctor", "--spec-only", "--working-dir", dir,
+		}, &stdout, &stderr)
+		if got != exitFailure {
+			t.Fatalf("run = %d, want exitFailure; stdout:\n%s", got, stdout.String())
+		}
+		if !strings.Contains(stdout.String(), "check(s) failed") {
+			t.Errorf("stdout missing failure summary: %q", stdout.String())
+		}
+	})
+
+	t.Run("schema-invalid spec", func(t *testing.T) {
+		dir := t.TempDir()
+		hidden := filepath.Join(dir, ".fishhawk")
+		if err := os.MkdirAll(hidden, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// Well-formed YAML that is not a valid workflow-v1 document.
+		if err := os.WriteFile(filepath.Join(hidden, "workflows.yaml"), []byte("version: \"1.0\"\nnot_a_workflows_key: true\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var stdout, stderr strings.Builder
+		got := run([]string{
+			"doctor", "--spec-only", "--working-dir", dir,
+		}, &stdout, &stderr)
+		if got != exitFailure {
+			t.Fatalf("run = %d, want exitFailure; stdout:\n%s", got, stdout.String())
+		}
+	})
 }
 
 // TestCheckBackendSHADrift_Unknown returns ok when backend SHA is "unknown"

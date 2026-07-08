@@ -43,11 +43,13 @@ fishhawk report-issue <run-id> [--kind bug|feature] [--description T] [--include
 fishhawk export       [--from RFC3339] [--to RFC3339] [--repo owner/name] [--run UUID]... [--limit N] [--csv] [--out PATH]
 fishhawk init         [--preset low|medium|high] [--working-dir D] [--budget-usd N] [--single-reviewer] [--human-gates ids] [--force] [--repo owner/name]
 fishhawk validate     [path]                   # default: .fishhawk/workflows.yaml
-fishhawk doctor       [--repo owner/name] [--working-dir D] [--runner-binary P]
+fishhawk doctor       [--repo owner/name] [--working-dir D] [--runner-binary P] [--spec-only]
 fishhawk version
 ```
 
 `doctor` runs the local-loop preflight: it checks the Docker stack (daemon, postgres, minio), backend reachability + token acceptance, the committed workflow spec, the runner binary, MCP registration, the git remote/working tree, `gh` auth, and cross-binary version/schema drift. Each rung prints `ok` / `warn` / `fail` plus a remediation hint; the command exits non-zero if any rung fails (warnings alone still exit 0).
+
+`--spec-only` runs just the two environment-free rungs — **workflow spec present** (schema validity) and **execution path configured** (every stage declares an executor) — and skips every docker/backend/token/MCP/git/gh/onboarding rung. It is the fresh-repo quick-validate path: a repo whose sole Fishhawk artifact is a generated `.fishhawk/workflows.yaml` exits 0 with no local Fishhawk environment, while a missing or schema-invalid spec still fails closed (exit non-zero). Use it right after `fishhawk init` to confirm the scaffolded spec is valid before wiring up the backend, token, and execution path.
 
 Since E29.5 `doctor` also runs a per-repo **onboarding preflight** — the prerequisites that make a repo *look* onboarded but wedge on the first run. Four rungs are read from the backend readiness endpoint (`GET /v0/onboarding/readiness`): **app installed** (the Fishhawk GitHub App on the target repo), **reviewer available: `<provider>`** per spec-declared reviewer (carrying the adapter's missing-env hint), **token scope adequate** (the run-driving scope subset, with the missing scopes named), and **workflow spec (committed) valid** (the spec on the repo's default branch parses + validates). A fifth rung, **execution path configured**, is checked client-side against the discovered `.fishhawk/workflows.yaml`: it fails when *any* stage declares no executor, naming the unconfigured stage(s). The onboarding rungs target the repo named by `--repo owner/name`; when omitted it is auto-detected from the working dir's git origin, and an unresolved repo degrades to a single warning rather than failing the command. See `docs/onboarding.md` for the full check list and remediations.
 

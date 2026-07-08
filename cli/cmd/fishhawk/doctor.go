@@ -51,38 +51,56 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		"path to fishhawk-runner binary; defaults to PATH lookup")
 	workingDir := fs.String("working-dir", ".", "repo checkout to inspect")
 	repo := fs.String("repo", "", "target repo owner/name for onboarding checks; auto-detected from git origin when empty")
+	specOnly := fs.Bool("spec-only", false,
+		"run only the environment-free spec rungs (schema validity + execution-path coverage); "+
+			"skips all docker/backend/token/MCP/git/gh/onboarding checks. Use to validate a freshly "+
+			"scaffolded repo with no local Fishhawk environment.")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
 
-	// Resolve the onboarding target repo: explicit --repo wins, else
-	// auto-detect from the working dir's git origin. An unresolved repo
-	// is not fatal — checkOnboardingReadiness degrades it to a single WARN.
-	resolvedRepo := *repo
-	if resolvedRepo == "" {
-		if detected, err := detectGitHubRepo(*workingDir); err == nil {
-			resolvedRepo = detected
+	// --spec-only: the two rungs that read only local bytes (no docker,
+	// network, backend, token, MCP, or git state). This is the fresh-repo
+	// quick-validate path — a repo whose sole workflows.yaml is
+	// schema-valid and declares an executor for every stage exits 0
+	// without any local Fishhawk environment; a missing/invalid spec
+	// still fails closed via checkSpec.
+	var checks []checkResult
+	if *specOnly {
+		checks = []checkResult{
+			checkSpec(*workingDir),
+			checkExecutionPath(*workingDir),
 		}
-	}
+	} else {
+		// Resolve the onboarding target repo: explicit --repo wins, else
+		// auto-detect from the working dir's git origin. An unresolved repo
+		// is not fatal — checkOnboardingReadiness degrades it to a single WARN.
+		resolvedRepo := *repo
+		if resolvedRepo == "" {
+			if detected, err := detectGitHubRepo(*workingDir); err == nil {
+				resolvedRepo = detected
+			}
+		}
 
-	checks := []checkResult{
-		checkDockerDaemon(),
-		checkPostgresContainer(),
-		checkMinioContainer(),
-		checkBackend(*cf.backendURL),
-		checkToken(*cf.backendURL, *cf.token),
-		checkSpec(*workingDir),
-		checkExecutionPath(*workingDir),
-		checkRunnerBinary(*runnerBinary, *workingDir),
-		checkMCPRegistration(),
-		checkGitOrigin(*workingDir),
-		checkGitWorkingTree(*workingDir),
-		checkGhCLI(),
-		checkBackendSHADrift(*cf.backendURL, *workingDir),
-		checkRunnerSchemaDrift(*cf.backendURL, *runnerBinary, *workingDir),
-		checkCLIVersion(*cf.backendURL),
+		checks = []checkResult{
+			checkDockerDaemon(),
+			checkPostgresContainer(),
+			checkMinioContainer(),
+			checkBackend(*cf.backendURL),
+			checkToken(*cf.backendURL, *cf.token),
+			checkSpec(*workingDir),
+			checkExecutionPath(*workingDir),
+			checkRunnerBinary(*runnerBinary, *workingDir),
+			checkMCPRegistration(),
+			checkGitOrigin(*workingDir),
+			checkGitWorkingTree(*workingDir),
+			checkGhCLI(),
+			checkBackendSHADrift(*cf.backendURL, *workingDir),
+			checkRunnerSchemaDrift(*cf.backendURL, *runnerBinary, *workingDir),
+			checkCLIVersion(*cf.backendURL),
+		}
+		checks = append(checks, checkOnboardingReadiness(*cf.backendURL, *cf.token, resolvedRepo)...)
 	}
-	checks = append(checks, checkOnboardingReadiness(*cf.backendURL, *cf.token, resolvedRepo)...)
 
 	useColor := isTerminal(stdout) && os.Getenv("NO_COLOR") == ""
 

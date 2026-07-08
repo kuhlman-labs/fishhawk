@@ -13,7 +13,8 @@ version: "1.0"
 
 roles:
   founder:
-    members: ["@kuhlman-labs"]
+    # Replace with your GitHub handle (@user) or team (@org/team).
+    members: ["@your-github-handle"]
 
 workflows:
 
@@ -89,7 +90,10 @@ workflows:
           # tree; on a test failure, feed the captured output back for a
           # bounded fix loop, then re-verify, before the PR opens.
           verify:
-            command: "scripts/test verify"
+            # Replace with your repository's test command (run via
+            # sh -c after the agent exits). This is optional — remove the
+            # whole verify block if your project has no test entrypoint.
+            command: "make test"
             timeout: "15m"
             max_iterations: 1
         # Advisory implement-review (ADR-027 impl 2/2, #561): agent
