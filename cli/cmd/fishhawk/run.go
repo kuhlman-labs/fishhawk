@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/cli/internal/credstore"
 	"github.com/kuhlman-labs/fishhawk/cli/internal/ghcomment"
 	"github.com/kuhlman-labs/fishhawk/cli/internal/httpclient"
 )
@@ -72,8 +73,22 @@ func bindCommonFlags(fs *flag.FlagSet) commonFlags {
 	}
 }
 
+// newClient builds the API client, resolving the bearer token across
+// tiers: an explicit --token / FISHHAWK_TOKEN (already folded into
+// *cf.token by bindCommonFlags) ALWAYS wins; when that is empty the
+// CLI falls back to a stored credential minted by `fishhawk token
+// login` and keyed by the backend URL. A missing or unreadable store
+// degrades silently to an empty token (dev backends with stubbed
+// auth still work). We resolve the token here rather than in
+// httpclient so the fallback lives in one seam.
 func newClient(cf commonFlags) *httpclient.Client {
-	c := httpclient.New(*cf.backendURL, *cf.token)
+	token := *cf.token
+	if token == "" {
+		if cred, err := credstore.Load(*cf.backendURL); err == nil {
+			token = cred.Token
+		}
+	}
+	c := httpclient.New(*cf.backendURL, token)
 	c.HTTP.Timeout = *cf.timeout
 	return c
 }

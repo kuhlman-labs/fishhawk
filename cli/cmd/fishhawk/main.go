@@ -11,6 +11,9 @@
 //	fishhawk run retry    <stage-id> [--output text|json]
 //	fishhawk plan approve <run-id> [--reason ...] [--output text|json]
 //	fishhawk plan reject  <run-id> [--reason ...] [--output text|json]
+//	fishhawk token login  [--provider github] [--client-id ID]
+//	fishhawk token list
+
 //	fishhawk deploy status   <run-id> [--output text|json]
 //	fishhawk deploy approve  <run-id> [--reason ...] [--output text|json]
 //	fishhawk deploy reject   <run-id> [--reason ...] [--output text|json]
@@ -29,9 +32,11 @@
 //
 // Auth is the same `bearerToken` scheme defined in the OpenAPI:
 // CLI sends `Authorization: Bearer <token>` from --token /
-// FISHHAWK_TOKEN. Tokens are minted via the (forthcoming)
-// /v0/tokens endpoint; until that lands the CLI works against a
-// dev backend with auth stubbed (current state).
+// FISHHAWK_TOKEN. A user-bound token can be minted with `fishhawk
+// token login` (OAuth device flow), which stores it in the local
+// credential store; subcommands then fall back to that stored token
+// when --token / FISHHAWK_TOKEN is empty. An explicit flag/env token
+// always wins over the stored credential.
 //
 // `fishhawk validate` (E6.2 / #33) is intentionally absent from
 // this PR: it requires a local copy of the workflow-spec parser,
@@ -70,6 +75,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runRun(rest, stdout, stderr)
 	case "plan":
 		return runPlan(rest, stdout, stderr)
+	case "token":
+		return runToken(rest, stdout, stderr)
 	case "deploy":
 		return runDeploy(rest, stdout, stderr)
 	case "campaign":
@@ -136,6 +143,8 @@ func printUsage(w io.Writer) {
 		"  run retry    Retry a failed stage (takes a stage id, not a run id).",
 		"  plan approve Approve the plan stage on a run.",
 		"  plan reject  Reject the plan stage on a run (category-D failure).",
+		"  token login  Log in via the OAuth device flow; mint + store a user-bound token.",
+		"  token list   List locally stored credentials (per backend URL).",
 		"  deploy status   Show the deploy stage state and the deployment artifact.",
 		"  deploy approve  Approve the deploy stage's pre-execution gate (needs write:deploy).",
 		"  deploy reject   Reject the deploy stage's pre-execution gate (category-D failure).",
