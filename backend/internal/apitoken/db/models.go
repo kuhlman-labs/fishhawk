@@ -17,6 +17,8 @@ type ApiToken struct {
 	LastUsedAt pgtype.Timestamptz `json:"last_used_at"`
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 	RevokedAt  pgtype.Timestamptz `json:"revoked_at"`
+	AuthMethod pgtype.Text        `json:"auth_method"`
+	Provider   pgtype.Text        `json:"provider"`
 }
 
 type Approval struct {

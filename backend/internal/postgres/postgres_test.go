@@ -430,6 +430,67 @@ func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
 		t.Error("insert campaign_item with autonomy='bogus' succeeded, want CHECK-constraint rejection")
 	}
 
+	// 0050 (#1708) added the nullable api_tokens.auth_method (DEFAULT 'static',
+	// CHECK IN ('static','oauth')) and provider TEXT columns. Confirm both
+	// columns exist, a row inserted without auth_method reads back the 'static'
+	// default with a NULL provider, an explicit ('oauth','github') row round-
+	// trips, and an out-of-set auth_method is rejected by the fail-closed CHECK
+	// (SQLSTATE 23514).
+	var authMethodCol, providerCol int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'api_tokens' AND column_name = 'auth_method'`,
+	).Scan(&authMethodCol); err != nil {
+		t.Fatalf("query api_tokens.auth_method column: %v", err)
+	}
+	if authMethodCol != 1 {
+		t.Errorf("api_tokens.auth_method count after MigrateUp = %d, want 1", authMethodCol)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'api_tokens' AND column_name = 'provider'`,
+	).Scan(&providerCol); err != nil {
+		t.Fatalf("query api_tokens.provider column: %v", err)
+	}
+	if providerCol != 1 {
+		t.Errorf("api_tokens.provider count after MigrateUp = %d, want 1", providerCol)
+	}
+	staticTokenID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO api_tokens (id, subject, token_hash, scopes)
+		 VALUES ($1, 'github:1', 'hash-static', '{}')`,
+		staticTokenID,
+	); err != nil {
+		t.Errorf("insert api_token without auth_method after MigrateUp failed: %v", err)
+	}
+	var staticMethod string
+	var staticProvider *string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT auth_method, provider FROM api_tokens WHERE id = $1`, staticTokenID,
+	).Scan(&staticMethod, &staticProvider); err != nil {
+		t.Fatalf("read back api_token auth_method/provider: %v", err)
+	}
+	if staticMethod != "static" {
+		t.Errorf("api_tokens.auth_method default = %q, want static", staticMethod)
+	}
+	if staticProvider != nil {
+		t.Errorf("api_tokens.provider default = %q, want NULL", *staticProvider)
+	}
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO api_tokens (id, subject, token_hash, scopes, auth_method, provider)
+		 VALUES ($1, 'github:2', 'hash-oauth', '{}', 'oauth', 'github')`,
+		uuid.New(),
+	); err != nil {
+		t.Errorf("insert oauth api_token after MigrateUp failed (widened CHECK?): %v", err)
+	}
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO api_tokens (id, subject, token_hash, scopes, auth_method)
+		 VALUES ($1, 'github:3', 'hash-bogus', '{}', 'bogus')`,
+		uuid.New(),
+	); err == nil {
+		t.Error("insert api_token with auth_method='bogus' succeeded, want CHECK-constraint rejection")
+	}
+
 	// Second application is a no-op.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Errorf("second MigrateUp returned %v, want nil (idempotent)", err)
@@ -565,14 +626,14 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if !strings.Contains(artifactsKindCheckDef, "deployment") {
 		t.Errorf("artifacts_kind_check after MigrateDown dropped 'deployment' (0037 still applied; only 0045 rolled back): %s", artifactsKindCheckDef)
 	}
-	// 0049 (#1551) is now the latest migration: it adds the
-	// campaign_items.autonomy column + a fail-closed CHECK, touching no other
-	// object. So its one-step rollback drops only that column (asserted below)
-	// and leaves every prior migration's effect intact — including 0045's (#1531)
-	// 'acceptance' artifact-kind widening, which SURVIVES the one-step down (it is
-	// no longer the migration rolled back).
+	// 0050 (#1708) is now the latest migration: it adds the nullable
+	// api_tokens.auth_method (DEFAULT 'static', fail-closed CHECK) + provider
+	// columns, touching no other object. So its one-step rollback drops only those
+	// two columns (asserted below) and leaves every prior migration's effect
+	// intact — including 0045's (#1531) 'acceptance' artifact-kind widening, which
+	// SURVIVES the one-step down (it is no longer the migration rolled back).
 	if !strings.Contains(artifactsKindCheckDef, "acceptance") {
-		t.Errorf("artifacts_kind_check after MigrateDown dropped 'acceptance' (0045 still applied; only 0049 rolled back): %s", artifactsKindCheckDef)
+		t.Errorf("artifacts_kind_check after MigrateDown dropped 'acceptance' (0045 still applied; only 0050 rolled back): %s", artifactsKindCheckDef)
 	}
 	// 0046 (#1592) is now a PRIOR migration (only 0049 rolled back), so its
 	// refinement_drafts table SURVIVES the one-step down.
@@ -628,10 +689,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if refinementFiledItemsTable != 1 {
 		t.Errorf("'refinement_filed_items' table count after MigrateDown = %d, want 1 (0048 still applied; only 0049 rolled back)", refinementFiledItemsTable)
 	}
-	// 0049 (#1551) IS the migration just rolled back: it added the
-	// campaign_items.autonomy column + its fail-closed CHECK. So the column must
-	// be GONE after the one-step down — the binding TestMigrateDown flip for this
-	// migration.
+	// 0049 (#1551) is now a PRIOR migration (only 0050 rolled back), so its
+	// campaign_items.autonomy column SURVIVES the one-step down.
 	var autonomyCol int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
@@ -639,8 +698,31 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&autonomyCol); err != nil {
 		t.Fatalf("query campaign_items.autonomy column: %v", err)
 	}
-	if autonomyCol != 0 {
-		t.Errorf("campaign_items.autonomy count after MigrateDown = %d, want 0 (0049 should have rolled it back)", autonomyCol)
+	if autonomyCol != 1 {
+		t.Errorf("campaign_items.autonomy count after MigrateDown = %d, want 1 (0049 still applied; only 0050 rolled back)", autonomyCol)
+	}
+	// 0050 (#1708) IS the migration just rolled back: it added the nullable
+	// api_tokens.auth_method + provider columns. So both must be GONE after the
+	// one-step down — the binding TestMigrateDown flip for this migration. The
+	// api_tokens table itself (0008) survives, verified further below.
+	var authMethodCol, providerCol int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'api_tokens' AND column_name = 'auth_method'`,
+	).Scan(&authMethodCol); err != nil {
+		t.Fatalf("query api_tokens.auth_method column: %v", err)
+	}
+	if authMethodCol != 0 {
+		t.Errorf("api_tokens.auth_method count after MigrateDown = %d, want 0 (0050 should have rolled it back)", authMethodCol)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'api_tokens' AND column_name = 'provider'`,
+	).Scan(&providerCol); err != nil {
+		t.Fatalf("query api_tokens.provider column: %v", err)
+	}
+	if providerCol != 0 {
+		t.Errorf("api_tokens.provider count after MigrateDown = %d, want 0 (0050 should have rolled it back)", providerCol)
 	}
 	// 0044 (#1519) is now a PRIOR migration (only 0045 rolled back), so its
 	// widening — the 'acceptance' stage type — must STILL be present in
@@ -1048,9 +1130,10 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	}
 	pool.Close()
 
-	// Step down past 0049 (drop campaign_items.autonomy — additive column,
-	// inert re: the paused rows) then 0048 (drop the refinement filing ledger —
-	// inert re: campaigns) then 0047 (drop refinement_decisions +
+	// Step down past 0050 (drop api_tokens.auth_method + provider — additive
+	// columns, inert re: campaigns) then 0049 (drop campaign_items.autonomy —
+	// additive column, inert re: the paused rows) then 0048 (drop the refinement
+	// filing ledger — inert re: campaigns) then 0047 (drop refinement_decisions +
 	// refinement_drafts.origin — inert re: campaigns) then 0046 (drop
 	// refinement_drafts — inert re: campaigns) then 0045 (narrow
 	// artifacts_kind_check — inert re: campaigns) then 0044 (narrow
@@ -1058,6 +1141,9 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	// inert) then 0042 (drop idempotency_key — inert) then 0041 (drop
 	// operator_agent — inert), all leaving the paused rows untouched, to reach
 	// 0040, the normalizing rollback under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0050) failed: %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0049) failed: %v", err)
 	}

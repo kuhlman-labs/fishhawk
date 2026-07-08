@@ -69,6 +69,17 @@ type Token struct {
 	CreatedAt  time.Time
 	RevokedAt  *time.Time
 
+	// AuthMethod records how the token was authenticated at issue
+	// time: "static" for operator-minted tokens (fishhawkd token
+	// issue, via the column default) or "oauth" for tokens minted
+	// through the OAuth device flow. Empty only for a row predating
+	// the auth_method column (NULL); callers treat "" as "static".
+	AuthMethod string
+
+	// Provider is the identity provider that authenticated an OAuth
+	// token (e.g. "github"). Empty for static tokens.
+	Provider string
+
 	// PlainText is the bearer string the caller stores. Set only
 	// on Issue's return value; empty for tokens loaded from the
 	// repository.
@@ -85,7 +96,8 @@ func (t Token) IsRevoked() bool {
 // hash and never has the plaintext.
 type Repository interface {
 	// Issue mints a fresh token for subject with the given scopes
-	// and returns the populated Token (including PlainText).
+	// and returns the populated Token (including PlainText). The row
+	// carries auth_method='static' via the column default.
 	Issue(ctx context.Context, subject string, scopes []string) (*Token, error)
 
 	// Authenticate hashes plaintext, looks up the row, and returns
@@ -107,6 +119,25 @@ type Repository interface {
 	// GetByID returns the token (including revoked rows) so the
 	// HTTP handlers can map ID → 404 / 403 cleanly.
 	GetByID(ctx context.Context, id uuid.UUID) (*Token, error)
+}
+
+// OAuthIssuer is the additive capability seam for minting tokens
+// authenticated through the OAuth device flow (E39.3 / #1708). It is a
+// strict superset of Repository, kept SEPARATE from it so the base
+// interface stays unchanged and every existing Repository implementer
+// (including the in-memory handler-test fakes) keeps compiling without an
+// edit — the "additive, no existing caller needs any edit" property the
+// design requires. The OAuth mint endpoint type-asserts its Repository to
+// OAuthIssuer; the production *postgresRepo satisfies it, and tests that
+// exercise the OAuth path use the real repository (which does too).
+type OAuthIssuer interface {
+	Repository
+
+	// IssueOAuth mints a token stamping auth_method='oauth' and the
+	// originating provider (e.g. "github"). It is additive to Issue: the
+	// static path is unchanged and keeps stamping 'static' via the column
+	// default. subject and provider must be non-empty.
+	IssueOAuth(ctx context.Context, subject string, scopes []string, provider string) (*Token, error)
 }
 
 // generatePlaintext produces a fresh random bearer string with
