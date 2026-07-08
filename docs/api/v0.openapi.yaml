@@ -6750,11 +6750,22 @@ paths:
       responses:
         '200':
           description: |
-            Two distinct outcomes share this status (#986):
+            Three distinct outcomes share this status (#986, #1709):
 
             - **Approval recorded; stage state advanced.** The body is
               the bare `Stage` shape; the three duplicate fields are
               omitted.
+            - **Approval recorded; quorum pending** (E39.4 / #1709) —
+              when the stage's gate declares a forge-neutral `approvals`
+              block, an `approve` transitions the stage only once
+              `approvals.count` DISTINCT eligible approvers have voted.
+              An eligible `approve` below that threshold is recorded but
+              the returned `Stage` is still `awaiting_approval`; a
+              delegated/agent-kind `approve` is recorded (audit
+              `channel: delegated`) and NEVER counts toward the quorum.
+              Every `approval_submitted` audit row on such a gate carries
+              a `predicate_snapshot` (the evaluation inputs + outcome);
+              gates with no `approvals` block omit it.
             - **Duplicate submission** — the same authenticated subject
               already submitted a decision for this stage. The prior
               decision stands, the stage state is unchanged, NO gates
@@ -6797,6 +6808,14 @@ paths:
               and the subject is not in the gate's approvers list. For an
               `all_of` deploy gate this fires unless the subject belongs to
               EVERY named role.
+            - `approver_is_change_author` — E39.4 / #1709: the stage's
+              gate declares a forge-neutral `approvals` block and the
+              submitting subject is the change author (the run's earliest
+              user-kind actor). Author separation-of-duties is enforced
+              PRE-Submit, so no approval row is recorded and the quorum
+              count is not incremented. Runs with no recorded human actor
+              skip this check (author-SoD is unenforceable) while the
+              agent-SoD and distinct-count quorum still apply.
             - `insufficient_scope` — a **deploy-stage** `approve` from an
               operator bearer that holds `write:approvals` but is missing
               `write:deploy` (ADR-038 / #1390). `details.required_scope` is

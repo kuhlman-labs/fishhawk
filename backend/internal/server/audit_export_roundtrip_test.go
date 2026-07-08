@@ -75,6 +75,39 @@ func TestAuditExport_RoundTripExternalVerify(t *testing.T) {
 				t.Fatalf("append chained (run %d, %s): %v", i, cat, err)
 			}
 		}
+		// E39.4 (#1709): the first run's trail also carries BOTH
+		// approval_submitted row shapes, so the round-trip proves the
+		// additive payload enrichment (identity/channel/predicate_snapshot,
+		// riding inside the hashed payload JSONB) does not break the hash
+		// chain or the strict Export v1 decode:
+		//   - a LEGACY-gate row: identity{provider,subject} + channel +
+		//     auth_method, NO predicate_snapshot (operator binding conditions
+		//     1 & 2);
+		//   - an ENRICHED quorum-gate row: adds the predicate_snapshot object.
+		if i == 0 {
+			user := audit.ActorUser
+			legacy := `{"stage_id":"s1","decision":"approve","surface":"api","approver":"github:alice",` +
+				`"auth_method":"static","identity":{"provider":"github","subject":"github:alice"},"channel":"api"}`
+			enriched := `{"stage_id":"s1","decision":"approve","surface":"api","approver":"github:bob",` +
+				`"auth_method":"oauth","identity":{"provider":"github","subject":"github:bob"},"channel":"api",` +
+				`"predicate_snapshot":{"count_required":2,"count_eligible":2,` +
+				`"identity":{"provider":"github","subject":"github:bob"},"submitter_class":"eligible",` +
+				`"auth_method":"oauth","channel":"api","min_permission":"write","member_of":"acme/reviewers",` +
+				`"quorum_reached":true}}`
+			for k, payload := range []string{legacy, enriched} {
+				subject := "github:approver"
+				if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
+					RunID:        r.ID,
+					Timestamp:    base.Add(time.Duration(i*10+len(runCats)+k) * time.Minute),
+					Category:     "approval_submitted",
+					ActorKind:    &user,
+					ActorSubject: &subject,
+					Payload:      json.RawMessage(payload),
+				}); err != nil {
+					t.Fatalf("append approval row %d: %v", k, err)
+				}
+			}
+		}
 	}
 
 	// Global (run-less) chain partition: two genuinely-chained entries.
@@ -158,12 +191,13 @@ func TestAuditExport_RoundTripExternalVerify(t *testing.T) {
 		t.Errorf("verify stdout missing PASS:\n%s", vout)
 	}
 	// Deterministic counts: 2 runs + the global partition = 3 verified;
-	// 3+3 run entries + 2 global entries = 8 audit entries.
+	// (3+2 approval) run-0 entries + 3 run-1 entries + 2 global entries =
+	// 10 audit entries.
 	if !strings.Contains(vout, "3 run(s)") {
 		t.Errorf("verify stdout missing '3 run(s)':\n%s", vout)
 	}
-	if !strings.Contains(vout, "8 audit entries") {
-		t.Errorf("verify stdout missing '8 audit entries':\n%s", vout)
+	if !strings.Contains(vout, "10 audit entries") {
+		t.Errorf("verify stdout missing '10 audit entries':\n%s", vout)
 	}
 
 	// Tamper case: flip one character of one entry's entry_hash and prove
