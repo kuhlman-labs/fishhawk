@@ -482,3 +482,102 @@ func TestRenderAnchorBody_NilRun(t *testing.T) {
 		t.Errorf("nil run should render empty; got %q", got)
 	}
 }
+
+// TestRenderAnchorBody_Economics pins #1702: a wired economics rollup renders
+// the block (above the footer) in a normal-size anchor body.
+func TestRenderAnchorBody_Economics(t *testing.T) {
+	econ := fullEconomics()
+	body := RenderAnchorBody(AnchorInput{
+		Run:         anchorRun(),
+		Stages:      []*run.Stage{{Type: run.StageTypeReview, State: run.StageStateSucceeded}},
+		Economics:   &econ,
+		ExternalURL: "https://app.example",
+		Now:         time.Unix(1000, 0).UTC(),
+	})
+	for _, want := range []string{
+		"**Economics**",
+		"**Total cost**: $0.42",
+		"**Wait on human**: 1h 30m",
+		"plan approval: 45m",
+		"**Cache net savings**: $0.12",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("anchor missing economics content %q:\n%s", want, body)
+		}
+	}
+	// The block sits above the footer (dashboard deep-link).
+	if econIdx, footIdx := strings.Index(body, "**Economics**"), strings.Index(body, "[View run →]"); econIdx < 0 || footIdx < 0 || econIdx > footIdx {
+		t.Errorf("economics block must render above the footer (econ=%d foot=%d):\n%s", econIdx, footIdx, body)
+	}
+}
+
+// TestRenderAnchorBody_EconomicsNilOmitted asserts a nil economics rollup
+// omits the block entirely (graceful degradation — the anchor renders
+// everything else).
+func TestRenderAnchorBody_EconomicsNilOmitted(t *testing.T) {
+	body := RenderAnchorBody(AnchorInput{
+		Run:         anchorRun(),
+		Stages:      []*run.Stage{{Type: run.StageTypeReview, State: run.StageStateRunning}},
+		Economics:   nil,
+		ExternalURL: "https://app.example",
+		Now:         time.Unix(1000, 0).UTC(),
+	})
+	if strings.Contains(body, "**Economics**") {
+		t.Errorf("nil economics must omit the block:\n%s", body)
+	}
+}
+
+// TestAssembleAnchor_EconomicsDroppedFirst pins the #1702 degradation ordering
+// directly on the ladder: the economics block is the FIRST droppable section
+// shed under the comment cap, before the timeline and superseded plans. The
+// header, what-now line, current plan, and footer are never dropped.
+func TestAssembleAnchor_EconomicsDroppedFirst(t *testing.T) {
+	s := anchorSections{
+		header:          "HEADER",
+		whatNow:         "WHATNOW",
+		stages:          "STAGES",
+		timeline:        "TIMELINE",
+		reviews:         "REVIEWS",
+		currentPlan:     "CURRENTPLAN",
+		modelResolved:   "MODEL",
+		supersededPlans: "SUPERSEDED",
+		economics:       "ECONOMICS",
+		footer:          "FOOTER",
+	}
+
+	l0 := assembleAnchor(s, 0)
+	for _, want := range []string{"ECONOMICS", "TIMELINE", "SUPERSEDED", "HEADER", "CURRENTPLAN", "FOOTER"} {
+		if !strings.Contains(l0, want) {
+			t.Errorf("level 0 must contain %q:\n%s", want, l0)
+		}
+	}
+
+	// Level 1 sheds economics FIRST — timeline and superseded still present.
+	l1 := assembleAnchor(s, 1)
+	if strings.Contains(l1, "ECONOMICS") {
+		t.Errorf("economics must be dropped at level 1 (first):\n%s", l1)
+	}
+	if !strings.Contains(l1, "TIMELINE") || !strings.Contains(l1, "SUPERSEDED") {
+		t.Errorf("timeline and superseded must survive level 1 (dropped after economics):\n%s", l1)
+	}
+
+	// Level 2 sheds the timeline; superseded still present.
+	l2 := assembleAnchor(s, 2)
+	if strings.Contains(l2, "TIMELINE") {
+		t.Errorf("timeline must be dropped at level 2:\n%s", l2)
+	}
+	if !strings.Contains(l2, "SUPERSEDED") {
+		t.Errorf("superseded must survive level 2:\n%s", l2)
+	}
+
+	// Level 3 sheds superseded plans; the never-dropped sections remain.
+	l3 := assembleAnchor(s, 3)
+	if strings.Contains(l3, "SUPERSEDED") {
+		t.Errorf("superseded must be dropped at level 3:\n%s", l3)
+	}
+	for _, want := range []string{"HEADER", "WHATNOW", "CURRENTPLAN", "FOOTER"} {
+		if !strings.Contains(l3, want) {
+			t.Errorf("level 3 must still contain the never-dropped section %q:\n%s", want, l3)
+		}
+	}
+}

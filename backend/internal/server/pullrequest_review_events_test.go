@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +15,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -148,12 +153,15 @@ func (r *prEventsRunRepo) seedStateLocked(id uuid.UUID) run.StageState {
 }
 
 // prEventsAuditRepo captures AppendChained calls so tests can assert
-// on category + payload shape.
+// on category + payload shape. It also serves a seeded chain via ListForRun
+// for the merge-time economics stamp (#1702).
 type prEventsAuditRepo struct {
 	audit.Repository
-	mu       sync.Mutex
-	appended []audit.ChainAppendParams
-	err      error
+	mu            sync.Mutex
+	appended      []audit.ChainAppendParams
+	err           error
+	listForRun    []*audit.Entry
+	listForRunErr error
 }
 
 func (r *prEventsAuditRepo) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
@@ -164,6 +172,15 @@ func (r *prEventsAuditRepo) AppendChained(_ context.Context, p audit.ChainAppend
 	}
 	r.appended = append(r.appended, p)
 	return &audit.Entry{ID: uuid.New()}, nil
+}
+
+// ListForRun serves the seeded chain the economics stamp folds. Returns
+// (nil, nil) by default so tests that never wire GitHub (and thus never reach
+// the stamp) are unaffected.
+func (r *prEventsAuditRepo) ListForRun(_ context.Context, _ uuid.UUID) ([]*audit.Entry, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.listForRun, r.listForRunErr
 }
 
 func prEventsTestServer(t *testing.T, rr *prEventsRunRepo, ar *prEventsAuditRepo) *Server {
@@ -1006,4 +1023,362 @@ func auditCategories(rows []audit.ChainAppendParams) []string {
 		out = append(out, r.Category)
 	}
 	return out
+}
+
+// --- economics stamp (#1702) ---
+
+// stampGitHub is a minimal GitHub stub for the merge-time economics stamp: it
+// serves the PR body on GET and captures the PATCH body on edit.
+type stampGitHub struct {
+	mu          sync.Mutex
+	getBody     string
+	getStatus   int
+	getCalled   bool
+	patchStatus int
+	patchCalled bool
+	patchBody   string
+}
+
+func newStampGitHubClient(t *testing.T, stub *stampGitHub) *githubclient.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}",
+		func(w http.ResponseWriter, _ *http.Request) {
+			stub.mu.Lock()
+			stub.getCalled = true
+			body, st := stub.getBody, stub.getStatus
+			stub.mu.Unlock()
+			if st != 0 && st != http.StatusOK {
+				w.WriteHeader(st)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			raw, _ := json.Marshal(map[string]any{
+				"node_id": "PR_x", "state": "closed", "merged": true,
+				"body": body,
+				"head": map[string]any{"sha": "h"},
+				"base": map[string]any{"ref": "main"},
+			})
+			_, _ = w.Write(raw)
+		})
+	mux.HandleFunc("PATCH /repos/{owner}/{repo}/pulls/{number}",
+		func(w http.ResponseWriter, r *http.Request) {
+			raw, _ := io.ReadAll(r.Body)
+			var p struct {
+				Body string `json:"body"`
+			}
+			_ = json.Unmarshal(raw, &p)
+			stub.mu.Lock()
+			stub.patchCalled = true
+			stub.patchBody = p.Body
+			st := stub.patchStatus
+			stub.mu.Unlock()
+			if st != 0 && st != http.StatusOK {
+				w.WriteHeader(st)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+	}
+}
+
+// stampChain seeds a run chain with a cost_recorded row and the plan-approval
+// gate boundary + a pr_merged terminal, so the derived economics block is
+// non-empty.
+func stampChain(runID uuid.UUID) []*audit.Entry {
+	mk := func(seq int64, cat string, ts int64, payload map[string]any) *audit.Entry {
+		var raw json.RawMessage
+		if payload != nil {
+			raw, _ = json.Marshal(payload)
+		}
+		rid := runID
+		return &audit.Entry{RunID: &rid, Sequence: seq, Category: cat, Timestamp: time.Unix(ts, 0).UTC(), Payload: raw}
+	}
+	return []*audit.Entry{
+		mk(1, "plan_generated", 100, nil),
+		mk(2, "approval_submitted", 2800, map[string]any{"decision": "approve"}), // plan approval = 2700
+		mk(3, "cost_recorded", 2900, map[string]any{"usd": 0.30, "model": "claude-opus-4-8", "input_tokens": 500}),
+		mk(4, "pr_merged", 7900, nil), // wall clock = 7800
+	}
+}
+
+func stampMergedPayload(prURL string) []byte {
+	payload, _ := json.Marshal(map[string]any{
+		"pull_request": map[string]any{
+			"html_url":  prURL,
+			"number":    42,
+			"merged":    true,
+			"merged_by": map[string]any{"login": "alice"},
+			"head":      map[string]any{"sha": "headsha"},
+			"base":      map[string]any{"sha": "basesha"},
+		},
+		"sender": map[string]any{"login": "alice"},
+	})
+	return payload
+}
+
+// TestEconomicsStamp_EditsPRBodyOnMerge is the happy path: an observed merge
+// splices the economics section into the PR body via EditPullRequest.
+func TestEconomicsStamp_EditsPRBodyOnMerge(t *testing.T) {
+	runID := uuid.New()
+	reviewStageID := uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	instID := int64(99)
+	runRow := &run.Run{
+		ID:             runID,
+		Repo:           "x/y",
+		PullRequestURL: &prURL,
+		InstallationID: &instID,
+		CreatedAt:      time.Unix(100, 0).UTC(),
+		CostUSDTotal:   0.30,
+	}
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{runRow},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {
+				{ID: uuid.New(), RunID: runID, Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+				{ID: reviewStageID, RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval},
+			},
+		},
+	}
+	ar := &prEventsAuditRepo{listForRun: stampChain(runID)}
+	stub := &stampGitHub{}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: ar, GitHub: newStampGitHubClient(t, stub)})
+
+	s.handlePullRequestClosed(context.Background(), stampMergedPayload(prURL))
+
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	if !stub.patchCalled {
+		t.Fatal("EditPullRequest was not called on merge")
+	}
+	for _, want := range []string{economicsMarkerBegin, economicsMarkerEnd, "**Economics**", "Total cost"} {
+		if !strings.Contains(stub.patchBody, want) {
+			t.Errorf("PATCH body missing %q:\n%s", want, stub.patchBody)
+		}
+	}
+}
+
+// TestEconomicsStamp_EditErrorDoesNotBlockResolution is the best-effort
+// defensive branch: an EditPullRequest failure must NOT unwind the review-gate
+// resolution — the review stage still transitions to succeeded.
+func TestEconomicsStamp_EditErrorDoesNotBlockResolution(t *testing.T) {
+	runID := uuid.New()
+	reviewStageID := uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	instID := int64(99)
+	runRow := &run.Run{
+		ID:             runID,
+		Repo:           "x/y",
+		PullRequestURL: &prURL,
+		InstallationID: &instID,
+		CreatedAt:      time.Unix(100, 0).UTC(),
+		CostUSDTotal:   0.30,
+	}
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{runRow},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {
+				{ID: reviewStageID, RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval},
+			},
+		},
+	}
+	ar := &prEventsAuditRepo{listForRun: stampChain(runID)}
+	stub := &stampGitHub{patchStatus: http.StatusInternalServerError}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: ar, GitHub: newStampGitHubClient(t, stub)})
+
+	s.handlePullRequestClosed(context.Background(), stampMergedPayload(prURL))
+
+	// Despite the PATCH failure, the review stage resolved to succeeded.
+	if len(rr.transitions) != 1 || rr.transitions[0].StageID != reviewStageID || rr.transitions[0].To != run.StageStateSucceeded {
+		t.Fatalf("review stage did not resolve to succeeded despite best-effort stamp failure: %+v", rr.transitions)
+	}
+	// The pr_merged audit row is still present.
+	if findCategory(ar.appended, CategoryPRMerged) == nil {
+		t.Errorf("pr_merged audit row missing; stamp failure must not unwind the merge")
+	}
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	if !stub.patchCalled {
+		t.Error("expected EditPullRequest to have been attempted")
+	}
+}
+
+// TestEconomicsStamp_IdempotentOnReObservedMerge asserts a re-observed merge
+// whose PR body already carries the identical economics section skips the
+// PATCH entirely — replace-not-duplicate.
+func TestEconomicsStamp_IdempotentOnReObservedMerge(t *testing.T) {
+	runID := uuid.New()
+	reviewStageID := uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	instID := int64(99)
+	runRow := &run.Run{
+		ID:             runID,
+		Repo:           "x/y",
+		PullRequestURL: &prURL,
+		InstallationID: &instID,
+		CreatedAt:      time.Unix(100, 0).UTC(),
+		CostUSDTotal:   0.30,
+	}
+	chain := stampChain(runID)
+	// Precompute the block the stamp would derive, and seed the PR body as if
+	// a prior stamp already wrote it.
+	block := issuecomment.RenderEconomicsBlock(*issuecomment.BuildRunEconomics(runRow, chain))
+	if block == "" {
+		t.Fatal("precondition: derived block must be non-empty")
+	}
+	existing := spliceEconomicsSection("Original description.", block)
+
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{runRow},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {{ID: reviewStageID, RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval}},
+		},
+	}
+	ar := &prEventsAuditRepo{listForRun: chain}
+	stub := &stampGitHub{getBody: existing}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: ar, GitHub: newStampGitHubClient(t, stub)})
+
+	s.handlePullRequestClosed(context.Background(), stampMergedPayload(prURL))
+
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	if stub.patchCalled {
+		t.Errorf("re-observed merge with identical section must skip the PATCH; got body:\n%s", stub.patchBody)
+	}
+}
+
+// TestSpliceEconomicsSection covers the splice branches directly: append into
+// a plain body, replace an existing section (idempotent identity), append into
+// an empty body, and recover from a corrupted begin-marker-without-end.
+func TestSpliceEconomicsSection(t *testing.T) {
+	block := "FIRSTBLK"
+	section := economicsMarkerBegin + "\n" + block + "\n" + economicsMarkerEnd
+
+	// Append into a plain body.
+	appended := spliceEconomicsSection("Hello.", block)
+	if !strings.Contains(appended, "Hello.") || !strings.Contains(appended, section) {
+		t.Errorf("append lost original or section:\n%s", appended)
+	}
+
+	// Idempotent: re-splicing the already-stamped body yields the identical body.
+	again := spliceEconomicsSection(appended, block)
+	if again != appended {
+		t.Errorf("re-splice not idempotent:\nfirst:  %q\nsecond: %q", appended, again)
+	}
+
+	// A changed block replaces the section in place (single section, no dup).
+	replaced := spliceEconomicsSection(appended, "SECONDBLK")
+	if strings.Count(replaced, economicsMarkerBegin) != 1 {
+		t.Errorf("replace must keep exactly one section:\n%s", replaced)
+	}
+	if !strings.Contains(replaced, "SECONDBLK") || strings.Contains(replaced, "FIRSTBLK") {
+		t.Errorf("replace did not swap the block content:\n%s", replaced)
+	}
+
+	// Empty body → just the section.
+	if got := spliceEconomicsSection("", block); got != section {
+		t.Errorf("empty body should render just the section; got %q", got)
+	}
+
+	// Corrupted: begin marker without an end. The splice truncates from the
+	// begin marker so a single well-formed section results.
+	corrupted := "Body.\n\n" + economicsMarkerBegin + "\nleftover"
+	fixed := spliceEconomicsSection(corrupted, block)
+	if strings.Count(fixed, economicsMarkerBegin) != 1 || !strings.Contains(fixed, economicsMarkerEnd) {
+		t.Errorf("corrupted body should recover to one well-formed section:\n%s", fixed)
+	}
+	if strings.Contains(fixed, "leftover") {
+		t.Errorf("corrupted trailing content should be dropped:\n%s", fixed)
+	}
+}
+
+// TestEconomicsStamp_EmptyBlockSkipsGitHub is the empty-block guard: a run with
+// no economics signal derives an empty block, so the stamp returns before any
+// GitHub call.
+func TestEconomicsStamp_EmptyBlockSkipsGitHub(t *testing.T) {
+	runID := uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	instID := int64(99)
+	runRow := &run.Run{
+		ID: runID, Repo: "x/y", PullRequestURL: &prURL, InstallationID: &instID,
+		CreatedAt: time.Unix(100, 0).UTC(),
+	}
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{runRow},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {{ID: uuid.New(), RunID: runID, Type: run.StageTypeImplement, State: run.StageStateSucceeded}},
+		},
+	}
+	// A chain with no cost / gate signal → empty block.
+	ar := &prEventsAuditRepo{listForRun: []*audit.Entry{{Sequence: 1, Category: "stage_dispatched", Timestamp: time.Unix(200, 0).UTC()}}}
+	stub := &stampGitHub{}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: ar, GitHub: newStampGitHubClient(t, stub)})
+
+	s.handlePullRequestClosed(context.Background(), stampMergedPayload(prURL))
+
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	if stub.getCalled || stub.patchCalled {
+		t.Errorf("empty block must skip all GitHub calls; get=%v patch=%v", stub.getCalled, stub.patchCalled)
+	}
+}
+
+// TestEconomicsStamp_GetPRErrorDoesNotBlock is the read-failure branch: a
+// GetPullRequest error warn-logs and returns without a PATCH, and the
+// review-gate resolution is unaffected.
+func TestEconomicsStamp_GetPRErrorDoesNotBlock(t *testing.T) {
+	runID := uuid.New()
+	reviewStageID := uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	instID := int64(99)
+	runRow := &run.Run{
+		ID: runID, Repo: "x/y", PullRequestURL: &prURL, InstallationID: &instID,
+		CreatedAt: time.Unix(100, 0).UTC(), CostUSDTotal: 0.30,
+	}
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{runRow},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {{ID: reviewStageID, RunID: runID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval}},
+		},
+	}
+	ar := &prEventsAuditRepo{listForRun: stampChain(runID)}
+	stub := &stampGitHub{getStatus: http.StatusInternalServerError}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: ar, GitHub: newStampGitHubClient(t, stub)})
+
+	s.handlePullRequestClosed(context.Background(), stampMergedPayload(prURL))
+
+	if len(rr.transitions) != 1 || rr.transitions[0].To != run.StageStateSucceeded {
+		t.Fatalf("GET failure must not block resolution: %+v", rr.transitions)
+	}
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	if stub.patchCalled {
+		t.Error("PATCH must not fire after a GET failure")
+	}
+}
+
+// TestStampEconomicsIntoPRBody_MissingPRURLSkips is the missing-coordinates
+// guard: a run without a PR URL never touches GitHub.
+func TestStampEconomicsIntoPRBody_MissingPRURLSkips(t *testing.T) {
+	runID := uuid.New()
+	instID := int64(99)
+	runRow := &run.Run{ID: runID, Repo: "x/y", InstallationID: &instID, CreatedAt: time.Unix(100, 0).UTC(), CostUSDTotal: 0.30}
+	ar := &prEventsAuditRepo{listForRun: stampChain(runID)}
+	stub := &stampGitHub{}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: &prEventsRunRepo{}, AuditRepo: ar, GitHub: newStampGitHubClient(t, stub)})
+
+	s.stampEconomicsIntoPRBody(context.Background(), runRow)
+
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	if stub.getCalled || stub.patchCalled {
+		t.Errorf("run without PR URL must skip GitHub; get=%v patch=%v", stub.getCalled, stub.patchCalled)
+	}
 }
