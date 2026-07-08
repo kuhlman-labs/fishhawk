@@ -14,6 +14,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
@@ -757,5 +758,34 @@ func TestServeWiresRefinementConfig(t *testing.T) {
 	}
 	if cfg.RefinementDrafter == nil {
 		t.Error("serve path left Config.RefinementDrafter nil")
+	}
+}
+
+// TestResolveIdentityProvider exercises the OAuth-config-gated wiring
+// seam the serve OAuth block calls (E39.1 / #1706, binding condition):
+// an OAuth client_id present → the constructed Config carries a GitHub
+// identity provider; absent → the field is left nil so server.New falls
+// back to its NoOp default. Driving the SAME resolveIdentityProvider
+// helper the serve block calls (not a hand-rolled construction) keeps
+// the assertion honest if the gate ever changes.
+func TestResolveIdentityProvider(t *testing.T) {
+	// Present: a GitHub provider is constructed.
+	present := resolveIdentityProvider("client-id", nil)
+	if present == nil {
+		t.Fatal("resolveIdentityProvider with a client_id returned nil; want a GitHub provider")
+	}
+	if _, ok := present.(*identity.GitHubIdentityProvider); !ok {
+		t.Errorf("provider = %T, want *identity.GitHubIdentityProvider", present)
+	}
+
+	// Absent: nil so server.New defaults to NoOp. Feeding it through
+	// server.New proves the end-to-end fallback the seam relies on.
+	absent := resolveIdentityProvider("", nil)
+	if absent != nil {
+		t.Fatalf("resolveIdentityProvider with no client_id = %#v, want nil", absent)
+	}
+	srv := server.New(server.Config{IdentityProvider: absent})
+	if srv == nil {
+		t.Fatal("server.New returned nil")
 	}
 }
