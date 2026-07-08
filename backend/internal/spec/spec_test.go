@@ -1511,6 +1511,196 @@ workflows:
 	}
 }
 
+// --- approvals gate predicate (E39.2 / #1707) ---
+
+// TestApprovalsGateParsesAndValidates is the cross-layer done-means: the
+// approvals fixture (all five predicate fields populated) round-trips
+// through the backend embedded workflow-v1 schema AND the semantic
+// Validate pass, and every decoded Approvals field carries its declared
+// value. Proves the block is wired end-to-end (schema accept -> JSON
+// coerce -> struct decode), not merely structurally present.
+func TestApprovalsGateParsesAndValidates(t *testing.T) {
+	s, err := spec.ParseBytes(readFixture(t, "valid/approvals.yaml"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	wf, ok := s.Workflows["feature_change"]
+	if !ok {
+		t.Fatal(`workflows["feature_change"] missing`)
+	}
+	if len(wf.Stages) != 1 || len(wf.Stages[0].Gates) != 1 {
+		t.Fatalf("want 1 stage with 1 gate, got %d stages", len(wf.Stages))
+	}
+	g := wf.Stages[0].Gates[0]
+	if g.Type != spec.GateTypeApproval {
+		t.Errorf("gate type = %q, want approval", g.Type)
+	}
+	// The legacy approvers form is nil — this gate uses approvals.
+	if g.Approvers != nil {
+		t.Errorf("Approvers = %+v, want nil for an approvals-only gate", g.Approvers)
+	}
+	a := g.Approvals
+	if a == nil {
+		t.Fatal("Approvals should be non-nil for an approvals gate")
+	}
+	if a.Count == nil || *a.Count != 2 {
+		t.Errorf("Approvals.Count = %v, want 2", a.Count)
+	}
+	if len(a.Not) != 2 || a.Not[0] != "author" || a.Not[1] != "agent" {
+		t.Errorf("Approvals.Not = %v, want [author agent]", a.Not)
+	}
+	if a.MinPermission != "write" {
+		t.Errorf("Approvals.MinPermission = %q, want write", a.MinPermission)
+	}
+	if a.MemberOf != "my-org/reviewers" {
+		t.Errorf("Approvals.MemberOf = %q, want my-org/reviewers", a.MemberOf)
+	}
+	if len(a.Members) != 2 || a.Members[0] != "alice" || a.Members[1] != "bob" {
+		t.Errorf("Approvals.Members = %v, want [alice bob]", a.Members)
+	}
+}
+
+// TestParse_ApprovalGate_NeitherPredicate_Rejected asserts the relaxed
+// required invariant: an approval gate declaring NEITHER approvers nor
+// approvals is rejected by the schema (the gate approval-branch inner
+// oneOf must match exactly one). Guards against the gate becoming a
+// no-op when `required` dropped `approvers`.
+func TestParse_ApprovalGate_NeitherPredicate_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError for an approval gate with no predicate", err)
+	}
+}
+
+// TestParse_ApprovalGate_EmptyApprovals_Rejected pins binding condition
+// (1): count is REQUIRED inside the approvals object, so `approvals: {}`
+// fails validation. An empty predicate is a no-op and must be refused.
+func TestParse_ApprovalGate_EmptyApprovals_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+            approvals: {}
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError for approvals:{} (missing required count)", err)
+	}
+}
+
+// TestParse_ApprovalGate_BothPredicates_Rejected pins binding condition
+// (2): a single gate must not declare BOTH the legacy approvers form and
+// the new approvals block. The mutual exclusion is enforced in the schema
+// (the gate approval-branch inner oneOf), so a both-declared gate matches
+// two subschemas and is rejected.
+func TestParse_ApprovalGate_BothPredicates_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.0"
+roles:
+  founder:
+    members: ["@kuhlman-labs"]
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+            approvers:
+              any_of: [founder]
+            approvals:
+              count: 1
+              not: [author, agent]
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError for a gate declaring both approvers and approvals", err)
+	}
+}
+
+// TestParse_ApprovalGate_ApproversOnly_BackCompat is the back-compat
+// proof: the legacy approvers-only form still validates under the v1
+// schema after approvals was added — no new required field was
+// introduced. A count-only approvals gate (the ADR-055 minimum) also
+// validates, confirming the other predicates stay optional.
+func TestParse_ApprovalGate_ApproversOnly_BackCompat(t *testing.T) {
+	approversOnly := []byte(`
+version: "1.0"
+roles:
+  founder:
+    members: ["@kuhlman-labs"]
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+            approvers:
+              any_of: [founder]
+`)
+	s, err := spec.ParseBytes(approversOnly)
+	if err != nil {
+		t.Fatalf("Parse approvers-only: %v", err)
+	}
+	g := s.Workflows["feature_change"].Stages[0].Gates[0]
+	if g.Approvers == nil || len(g.Approvers.AnyOf) != 1 || g.Approvers.AnyOf[0] != "founder" {
+		t.Errorf("Approvers = %+v, want any_of=[founder]", g.Approvers)
+	}
+	if g.Approvals != nil {
+		t.Errorf("Approvals = %+v, want nil for an approvers-only gate", g.Approvals)
+	}
+
+	countOnly := []byte(`
+version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+`)
+	sc, err := spec.ParseBytes(countOnly)
+	if err != nil {
+		t.Fatalf("Parse count-only approvals: %v", err)
+	}
+	a := sc.Workflows["feature_change"].Stages[0].Gates[0].Approvals
+	if a == nil || a.Count == nil || *a.Count != 1 {
+		t.Fatalf("count-only Approvals = %+v, want Count=1 with optional predicates absent", a)
+	}
+	if len(a.Not) != 0 || a.MinPermission != "" || a.MemberOf != "" || len(a.Members) != 0 {
+		t.Errorf("count-only Approvals should leave optional predicates empty, got %+v", a)
+	}
+}
+
 // --- operator_agent delegation knobs (ADR-040 / #1026) ---
 
 func TestParse_OperatorAgent_RoundTrip(t *testing.T) {

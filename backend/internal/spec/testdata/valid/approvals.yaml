@@ -1,0 +1,22 @@
+# Forge-neutral approval predicate (E39.2 / #1707). The approval gate
+# declares `approvals` instead of the legacy GitHub-handle `approvers`
+# allow-list, populating ALL predicate fields (count, not, min_permission,
+# member_of, members) so the cross-layer decode (schema accept -> JSON
+# coerce -> struct decode) is exercised end-to-end. No top-level roles
+# map is needed — the block carries no repo-specific @-handle.
+version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+            approvals:
+              count: 2
+              not: [author, agent]
+              min_permission: write
+              member_of: my-org/reviewers
+              members: [alice, bob]

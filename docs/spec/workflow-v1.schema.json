@@ -620,10 +620,9 @@
       ],
       "oneOf": [
         {
-          "description": "Approval gate \u2014 blocks until an approver acts.",
+          "description": "Approval gate \u2014 blocks until an approver acts. It declares EXACTLY ONE approval predicate: either the legacy `approvers` role allow-list (GitHub-handle based) or the forge-neutral `approvals` block (E39.2 / #1707). The inner oneOf enforces the mutual exclusion in the schema itself \u2014 a gate carrying both, or neither, is rejected \u2014 so an approval gate is never a no-op and never ambiguously double-declared.",
           "required": [
-            "type",
-            "approvers"
+            "type"
           ],
           "properties": {
             "type": {
@@ -632,6 +631,9 @@
             "approvers": {
               "$ref": "#/$defs/approvers"
             },
+            "approvals": {
+              "$ref": "#/$defs/approvals"
+            },
             "sla": {
               "type": "string",
               "description": "SLA before timeout fires a category-D failure (e.g. '4_business_hours', '24_hours')."
@@ -639,7 +641,19 @@
             "operator_agent": {
               "$ref": "#/$defs/operator_agent"
             }
-          }
+          },
+          "oneOf": [
+            {
+              "required": [
+                "approvers"
+              ]
+            },
+            {
+              "required": [
+                "approvals"
+              ]
+            }
+          ]
         },
         {
           "description": "Check gate \u2014 placeholder for workflows that delegate to GitHub branch protection (ADR-017 / #249). Carries no fields in v0.2; the merge-readiness signal lives in branch protection / rulesets, not in the spec.",
@@ -768,6 +782,59 @@
             "type": "string",
             "pattern": "^[a-z][a-z0-9_]*$"
           }
+        }
+      }
+    },
+    "approvals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "count"
+      ],
+      "description": "Forge-neutral approval predicate for an approval gate (E39.2 / #1707). An additive, optional alternative to the legacy GitHub-handle `approvers` allow-list: a gate declares EXACTLY ONE of the two (the gate's inner oneOf enforces the mutual exclusion), so every existing approvers-only gate stays valid. `count` is REQUIRED (matching ADR-055's ratified preset default `approvals: {count: 1, not: [author, agent]}`, where count is always explicit) so an empty `approvals: {}` is a no-op and fails validation. The predicate fields carry no repo-specific @-handle, keeping the block forge-neutral; `min_permission` and `member_of` are annotated `x-intended-required` (optional now, intended to become required in a future major). Accepted at every advertised v1 version.",
+      "properties": {
+        "count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "REQUIRED. The number of distinct approvals that must be collected before the gate clears. Always explicit (ADR-055); an integer >= 1, so `approvals: {}` (a no-op empty predicate) is rejected."
+        },
+        "not": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "author",
+              "agent"
+            ]
+          },
+          "description": "Relationships excluded from satisfying the gate. `author` bars the change's own author; `agent` bars any automated agent identity. Forge-neutral: these are relationship classes, not handles."
+        },
+        "min_permission": {
+          "type": "string",
+          "enum": [
+            "read",
+            "triage",
+            "write",
+            "maintain",
+            "admin"
+          ],
+          "x-intended-required": true,
+          "description": "Minimum forge-neutral repository permission tier an approver must hold, mirroring backend/internal/identity.Permission (the `none` tier is omitted — a min_permission of none is meaningless). Optional now; annotated x-intended-required for promotion to required in a future major."
+        },
+        "member_of": {
+          "type": "string",
+          "minLength": 1,
+          "x-intended-required": true,
+          "description": "A forge-neutral group (org or org/team) an approver must belong to. Optional now; annotated x-intended-required for promotion to required in a future major."
+        },
+        "members": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Explicit approver subjects as plain forge-neutral strings (NOT the GitHub-specific @-prefixed member-ref used by the legacy roles.members path), keeping the approvals block forge-neutral."
         }
       }
     },
