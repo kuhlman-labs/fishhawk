@@ -439,6 +439,17 @@ type Trigger struct {
 	// paths as in-scope — the reviewer must NOT flag them as drift. Empty/nil
 	// when no amendment was folded or for any non-implement-review build.
 	AmendedScopeFiles []string
+	// RemovedScopeFiles is the list of paths REMOVED from the effective scope
+	// at approval time via the #1726 remove_scope_files edit. The
+	// implement-stage prompt subtracts these from the enforced scope, but
+	// writeApprovedPlan still renders the immutable plan artifact's scope.files
+	// — which still lists a removed path — so without surfacing this a
+	// defensive agent would treat a removed path as in-scope and either touch
+	// it or file a redundant amendment. writeRemovedScopeFilesForImplement
+	// renders a section telling the agent these paths are NO LONGER in scope
+	// (the #1406 lockstep fix in reverse). Empty/nil when no path was removed
+	// or for any non-implement build; keeps the prompt byte-identical to today.
+	RemovedScopeFiles []string
 	// PriorConcerns carries the stage's previously recorded review
 	// concerns for the implement-review prompt's delta-verification
 	// section (E22.X / #984): open-state concerns the reviewer must
@@ -953,6 +964,10 @@ func buildImplement(t Trigger) string {
 		// Guarded by len>0 inside the helper so a run with no additions keeps
 		// the prompt byte-identical (audit prompt-hash replay stability).
 		writeAmendedScopeFilesForImplement(&b, t)
+		// #1726 lockstep-in-reverse: name paths the operator REMOVED from scope
+		// at approval time, since writeApprovedPlan still renders the immutable
+		// plan artifact's scope.files (which still lists them).
+		writeRemovedScopeFilesForImplement(&b, t)
 		b.WriteString("Originating issue (link only — fetch if you need detail):\n\n")
 		writeIssueLink(&b, t)
 
@@ -3224,6 +3239,33 @@ func writeAmendedScopeFilesForImplement(b *strings.Builder, t Trigger) {
 		"as the plan requires. Do NOT file a mid-stage scope amendment requesting any of them — they are " +
 		"already approved:\n\n")
 	for _, p := range t.AmendedScopeFiles {
+		fmt.Fprintf(b, "- %s\n", p)
+	}
+	b.WriteString("\n")
+}
+
+// writeRemovedScopeFilesForImplement renders the operator-removed scope files
+// section on the implement prompt (#1726). The paths in t.RemovedScopeFiles
+// were subtracted from the effective scope at approval time via the
+// remove_scope_files edit, but writeApprovedPlan renders the immutable plan
+// artifact's scope.files — which STILL lists a removed path — so without this
+// section a defensive agent reads the shown scope, concludes a removed path is
+// in scope, and either edits it (a drift-excluded change) or files a redundant
+// amendment. This is the #1406 add-visibility fix in reverse. Guarded by len>0
+// so a run with no removals keeps the prompt byte-identical, preserving
+// deterministic prompt-hash replay. Input order is preserved.
+func writeRemovedScopeFilesForImplement(b *strings.Builder, t Trigger) {
+	if len(t.RemovedScopeFiles) == 0 {
+		return
+	}
+	b.WriteString("Operator-removed scope files (NO LONGER in scope — do NOT touch)\n")
+	b.WriteString("===============================================================\n\n")
+	b.WriteString("The paths below were REMOVED from the effective scope at approval time via the " +
+		"operator's remove_scope_files edit. They still appear in the plan's Files-in-scope above " +
+		"because that section renders only the immutable plan artifact, but they are NO LONGER in " +
+		"scope. Do NOT modify or create them, and do NOT file a scope amendment to re-add them — the " +
+		"operator removed them deliberately:\n\n")
+	for _, p := range t.RemovedScopeFiles {
 		fmt.Fprintf(b, "- %s\n", p)
 	}
 	b.WriteString("\n")

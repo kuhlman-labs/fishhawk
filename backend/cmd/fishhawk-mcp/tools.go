@@ -2257,6 +2257,14 @@ type ApprovePlanInput struct {
 	// misses directories, extensionless/repo-root files, and described-not-spelled
 	// paths.
 	AddScopeFiles []string `json:"add_scope_files,omitempty" jsonschema:"optional authoritative list of repo-relative paths to fold into the implement stage's scope.files; preferred over naming paths in 'reason'. A trailing slash marks a directory (e.g. 'pkg/testdata/corpus/') whose created files all stage; handles extensionless and repo-root files (e.g. 'go.work') the prose fallback misses"`
+	// RemoveScopeFiles is the structured, authoritative way to REMOVE files
+	// from the implement stage's scope at approval time (#1726) — the inverse
+	// of AddScopeFiles. Combined with AddScopeFiles in the SAME approve call it
+	// expresses a scope REPLACE (remove old + add new) with zero planner
+	// invocations; there is no separate replace field. Each path is refused
+	// (400) when it is not repo-relative, is absent from the current effective
+	// scope, or would empty a non-empty scope.
+	RemoveScopeFiles []string `json:"remove_scope_files,omitempty" jsonschema:"optional authoritative list of repo-relative paths to REMOVE from the implement stage's scope.files at approval time (the inverse of add_scope_files). Express a scope REPLACE by passing remove_scope_files AND add_scope_files in the SAME approve call — there is no separate replace field. A path is rejected 400 when it is not repo-relative, is not currently in the effective scope, or would empty a non-empty scope (an empty scope disables scope enforcement)"`
 	// BindingAssertions is the OPTIONAL list of operator-declared,
 	// deterministic binding-assertion checks (#1171) — the machine-checkable
 	// half of an approval condition. Each is evaluated by the runner
@@ -2562,7 +2570,7 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 	// warning on the tool result and an empty login — never a blocked
 	// approval.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles, in.BindingAssertions, in.ImplementModel)
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles, in.RemoveScopeFiles, in.BindingAssertions, in.ImplementModel)
 	if err != nil {
 		// ADR-036 (#875): the backend refuses the approve while a
 		// configured agent plan review is still in-flight. Surface this
@@ -2612,7 +2620,7 @@ func (r *runResolver) rejectPlan(ctx context.Context, _ *mcp.CallToolRequest, in
 	// Resolve the operator's real GitHub login best-effort (#751); see
 	// approvePlan for the rationale. Empty on gh failure, never fatal.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, "")
 	if err != nil {
 		return nil, RejectPlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}
@@ -2690,7 +2698,7 @@ func (r *runResolver) approveDeploy(ctx context.Context, _ *mcp.CallToolRequest,
 	// Resolve the operator's real GitHub login best-effort (#751); see
 	// approvePlan. Empty on gh failure, never fatal.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", comment, login, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", comment, login, nil, nil, nil, "")
 	if err != nil {
 		// The deploy pre-flight 422s (deploy_environment_not_allowed,
 		// deploy_change_freeze_active, deploy_upstream_not_satisfied) and the
@@ -2721,7 +2729,7 @@ func (r *runResolver) rejectDeploy(ctx context.Context, _ *mcp.CallToolRequest, 
 		return nil, RejectDeployOutput{}, fmt.Errorf("resolved deploy stage has invalid id %q: %w", deployStage.ID, err)
 	}
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, "")
 	if err != nil {
 		return nil, RejectDeployOutput{}, fmt.Errorf("submit deploy rejection: %w", err)
 	}

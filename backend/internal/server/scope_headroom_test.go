@@ -79,6 +79,47 @@ func TestEffectiveScopeHeadroom_DedupeParityWithFoldScopePaths(t *testing.T) {
 	}
 }
 
+// TestEffectiveScopeHeadroom_SubtractsRemovals is the #1726
+// cap-overflow-reconciled-at-the-gate done-means: a plan whose scope is one
+// file over the max_files_changed cap (4 files, cap 3) drops back under the
+// cap once a single path is removed via remove_scope_files, so the count the
+// scope-cap gate reads passes without a re-plan.
+func TestEffectiveScopeHeadroom_SubtractsRemovals(t *testing.T) {
+	scopeFiles := []plan.ScopeFile{
+		{Path: "backend/a.go", Operation: plan.FileOpModify},
+		{Path: "backend/b.go", Operation: plan.FileOpModify},
+		{Path: "backend/c.go", Operation: plan.FileOpModify},
+		{Path: "backend/d.go", Operation: plan.FileOpModify},
+	}
+	s, _, _, runRow, _ := newHeadroomServer(t, specImplementPathConstraints, scopeFiles)
+
+	// Over cap (4 > 3) with no removal.
+	count, maxFiles, ok := s.effectiveScopeHeadroom(context.Background(), runRow.ID, nil)
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if count != 4 || maxFiles != 3 {
+		t.Fatalf("count/maxFiles = %d/%d, want 4/3", count, maxFiles)
+	}
+	if count <= maxFiles {
+		t.Fatalf("expected over-cap without removal: count %d <= max %d", count, maxFiles)
+	}
+
+	// Removing one declared path drops the count to the cap. The scope-cap
+	// gate reads this through effectiveScopePathSet (the shared helper), so
+	// assert against it directly.
+	paths, _, ok := s.effectiveScopePathSet(context.Background(), runRow.ID, nil, []string{"backend/d.go"})
+	if !ok {
+		t.Fatal("ok = false with removal, want true")
+	}
+	if len(paths) != 3 {
+		t.Errorf("count with one removal = %d, want 3 (reconciled to cap)", len(paths))
+	}
+	if len(paths) > maxFiles {
+		t.Errorf("still over cap after removal: count %d > max %d", len(paths), maxFiles)
+	}
+}
+
 // TestEffectiveScopeHeadroom_FailOpenMissingSpec asserts the
 // checkPlanBudget-mirroring fail-open contract: no cached workflow
 // spec → ok=false, caller skips the check.

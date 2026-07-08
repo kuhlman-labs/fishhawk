@@ -6725,6 +6725,34 @@ paths:
                     path matching `forbidden_paths` still fails category-B
                     against the produced diff. Honored only on `approve`;
                     ignored on `reject`.
+                remove_scope_files:
+                  type: array
+                  items:
+                    type: string
+                  description: |
+                    Optional, authoritative list of repo-relative paths to
+                    REMOVE from the implement stage's `scope.files` on approve
+                    (#1726) — the inverse of `add_scope_files`. Combined with
+                    `add_scope_files` in the SAME approve call it expresses a
+                    scope REPLACE (remove old + add new) at the plan gate with
+                    zero planner invocations; there is no separate replace
+                    field. The removal is subtracted from the effective scope
+                    the prompt builder hands the runner, so every runner gate
+                    (created-out-of-scope, commit-in-scope, category-B) and the
+                    scope-cap gate honor it, and it applies to per-slice scope on
+                    decomposed plans via the same fan-out fallback
+                    `add_scope_files` uses. Recorded on the `approval_submitted`
+                    audit payload alongside `remove_scope_files`,
+                    `scope_files_before`, and `scope_files_after` (the deduped
+                    effective-scope file lists). Each path is refused
+                    `400 validation_failed` (field `remove_scope_files`) when it
+                    is not repo-relative (leading `/` or `..`), is absent from
+                    the current effective scope, or would empty a non-empty
+                    scope (an empty scope re-enables the runner's `git add -A`
+                    fallback and disables scope enforcement). Refused BEFORE any
+                    approval row is recorded, so a corrected retry flows
+                    normally. Honored only on `approve`; ignored on `reject`.
+                    Omitting the field is byte-identical to today.
                 binding_assertions:
                   type: array
                   items:
@@ -7010,14 +7038,19 @@ paths:
             - `plan_violates_scope_cap` — #983: the effective scope —
               the plan's `scope.files` unioned with the request's
               `add_scope_files`, prior approve-time folds, and
-              already-approved scope amendments, deduped by exact
+              already-approved scope amendments, MINUS the request's
+              `remove_scope_files` (#1726), deduped by exact
               path — exceeds the implement stage's resolved
               `max_files_changed` and the comment lacks an
-              `--override-scope-cap` marker. Refused BEFORE any
+              `--override-scope-cap` marker. Because removals are
+              subtracted before the count, an over-cap plan can be
+              reconciled entirely at the gate by removing (or
+              replacing) paths. Refused BEFORE any
               approval row is recorded, so a retry after re-scoping
               (or carrying the override) flows normally. `details`
-              includes `scoped_files`, `max_files_changed`, and
-              `add_scope_files_count`; the refusal appends a
+              includes `scoped_files`, `max_files_changed`,
+              `add_scope_files_count`, and `remove_scope_files_count`;
+              the refusal appends a
               `plan_violates_scope_cap` audit entry, the override a
               `plan_scope_cap_override_acknowledged` entry. Declared
               scope is an upper bound on the eventual diff, so the

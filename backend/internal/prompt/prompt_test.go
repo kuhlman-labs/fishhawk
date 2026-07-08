@@ -4457,6 +4457,65 @@ func TestBuild_Implement_AmendedScope_AbsentWhenEmpty(t *testing.T) {
 	}
 }
 
+func TestBuild_Implement_RemovedScope_RendersSection(t *testing.T) {
+	// #1726: when the operator removes scope paths at approval time, the handler
+	// threads them onto Trigger.RemovedScopeFiles. The fresh implement prompt
+	// names them as NO LONGER in scope so a defensive agent — which still sees
+	// them in writeApprovedPlan's immutable scope.files — neither touches them
+	// nor files a redundant amendment to re-add them.
+	got, err := Build("implement", Trigger{
+		Repo:              "kuhlman-labs/example",
+		ApprovedPlan:      fixturePlan(),
+		RemovedScopeFiles: []string{"backend/internal/server/approvals.go", "docs/gone.md"},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"Operator-removed scope files (NO LONGER in scope — do NOT touch)",
+		"backend/internal/server/approvals.go",
+		"docs/gone.md",
+		"NO LONGER in scope",
+		"do NOT file a scope amendment to re-add them",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("operator-removed-scope prompt missing %q:\n%s", w, got)
+		}
+	}
+	// Deterministic input order is preserved.
+	if i, j := strings.Index(got, "server/approvals.go"), strings.Index(got, "docs/gone.md"); i < 0 || j < 0 || i > j {
+		t.Errorf("operator-removed-scope paths rendered out of input order:\n%s", got)
+	}
+}
+
+func TestBuild_Implement_RemovedScope_AbsentWhenEmpty(t *testing.T) {
+	// #1726: the operator-removed-scope section is guarded by len>0, so an
+	// implement prompt with no removals is byte-identical to today (prompt-hash
+	// replay / audit stability). Build twice (explicit-nil and omitting the
+	// field) and assert the section never appears and the two renders match.
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+	}
+	withNil := base
+	withNil.RemovedScopeFiles = nil
+
+	gotBase, err := Build("implement", base)
+	if err != nil {
+		t.Fatalf("Build base: %v", err)
+	}
+	gotNil, err := Build("implement", withNil)
+	if err != nil {
+		t.Fatalf("Build nil: %v", err)
+	}
+	if strings.Contains(gotBase, "Operator-removed scope files") {
+		t.Errorf("operator-removed-scope section should be absent when RemovedScopeFiles is empty:\n%s", gotBase)
+	}
+	if gotBase != gotNil {
+		t.Errorf("explicit-nil RemovedScopeFiles must be byte-identical to omitting it")
+	}
+}
+
 func TestBuild_Implement_AmendedScope_OmittedOnFixupFork(t *testing.T) {
 	// #1406: the operator-added-scope section renders only on the fresh
 	// (non-fix-up) implement prompt — the bug's locus. buildImplement returns

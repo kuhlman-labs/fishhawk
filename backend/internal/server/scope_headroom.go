@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"log/slog"
+	"sort"
 
 	"github.com/google/uuid"
 
@@ -31,8 +32,31 @@ import (
 // the resolved cap; 0 means no cap is configured (callers treat that as
 // nothing to enforce).
 func (s *Server) effectiveScopeHeadroom(ctx context.Context, runID uuid.UUID, extraPaths []string) (effectiveCount, maxFiles int, ok bool) {
-	if s.cfg.RunRepo == nil || s.cfg.ArtifactRepo == nil {
+	paths, maxFiles, ok := s.effectiveScopePathSet(ctx, runID, extraPaths, nil)
+	if !ok {
 		return 0, 0, false
+	}
+	return len(paths), maxFiles, true
+}
+
+// effectiveScopePathSet is the single source of truth for the run's effective
+// implement-scope file set (#1726). It builds the deduped path set from the
+// newest plan artifact's scope.files ∪ approval add_scope_files ∪ approved
+// scope-amendment paths ∪ extraAdd, then SUBTRACTS removePaths (compare-by-
+// Path), and returns the sorted deduped result. Both the scope-cap gate (via
+// effectiveScopeHeadroom, which counts this set) and the plan-gate removal
+// validations (which need the before/after lists) share it, so the count the
+// gate computes equals the effective scope the prompt builder assembles for
+// identical inputs.
+//
+// removePaths not present in the set are a no-op here — presence is validated
+// separately by the plan-stage approve gate before this is trusted. maxFiles
+// is the resolved cap; 0 means no cap configured. Fail-open contract matching
+// effectiveScopeHeadroom: any read failure, an absent spec, or a run with no
+// plan artifact returns ok=false.
+func (s *Server) effectiveScopePathSet(ctx context.Context, runID uuid.UUID, extraAdd, removePaths []string) (paths []string, maxFiles int, ok bool) {
+	if s.cfg.RunRepo == nil || s.cfg.ArtifactRepo == nil {
+		return nil, 0, false
 	}
 
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
@@ -41,12 +65,12 @@ func (s *Server) effectiveScopeHeadroom(ctx context.Context, runID uuid.UUID, ex
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
-		return 0, 0, false
+		return nil, 0, false
 	}
 
 	constraints, _, resolved := s.resolveImplementConstraints(ctx, runRow)
 	if !resolved {
-		return 0, 0, false
+		return nil, 0, false
 	}
 
 	approvedPlan, err := s.loadApprovedPlanForRun(ctx, runID)
@@ -57,10 +81,10 @@ func (s *Server) effectiveScopeHeadroom(ctx context.Context, runID uuid.UUID, ex
 				slog.String("error", err.Error()),
 			)
 		}
-		return 0, 0, false
+		return nil, 0, false
 	}
 
-	seen := make(map[string]struct{}, len(approvedPlan.Scope.Files)+len(extraPaths))
+	seen := make(map[string]struct{}, len(approvedPlan.Scope.Files)+len(extraAdd))
 	for _, f := range approvedPlan.Scope.Files {
 		seen[f.Path] = struct{}{}
 	}
@@ -75,7 +99,7 @@ func (s *Server) effectiveScopeHeadroom(ctx context.Context, runID uuid.UUID, ex
 				slog.String("run_id", runID.String()),
 				slog.String("error", err.Error()),
 			)
-			return 0, 0, false
+			return nil, 0, false
 		}
 		for _, a := range items {
 			if a.Status != scopeamendment.StatusApproved {
@@ -87,9 +111,20 @@ func (s *Server) effectiveScopeHeadroom(ctx context.Context, runID uuid.UUID, ex
 		}
 	}
 
-	for _, p := range extraPaths {
+	for _, p := range extraAdd {
 		seen[p] = struct{}{}
 	}
 
-	return len(seen), constraints.MaxFilesChanged, true
+	// Subtract the removals last so the returned set (and the count the cap
+	// gate reads from it) already reflects a gate-time removal (#1726).
+	for _, p := range removePaths {
+		delete(seen, p)
+	}
+
+	out := make([]string, 0, len(seen))
+	for p := range seen {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out, constraints.MaxFilesChanged, true
 }

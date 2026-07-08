@@ -55,6 +55,21 @@ type approvalRequest struct {
 	// the #730 prose fold remains as a fallback. Declared here so the
 	// DisallowUnknownFields decode accepts it; callers omit it (omitempty).
 	AddScopeFiles []string `json:"add_scope_files,omitempty"`
+	// RemoveScopeFiles is an explicit list of repo-relative paths to REMOVE
+	// from the implement stage's effective scope.files on approve (#1726). It
+	// is the inverse of AddScopeFiles: combined with it in the same approve
+	// call, an operator expresses a scope REPLACE (remove old + add new) at
+	// the plan gate with zero planner invocations. Removal subtracts from the
+	// effective scope the prompt builder hands the runner, so every runner
+	// gate (created-out-of-scope, category-B, scope-cap) honors it. Recorded
+	// on the approval audit payload with before/after effective-scope lists.
+	// Validated pre-Submit: each path must be repo-relative, present in the
+	// current effective scope, and a removal that would empty a non-empty
+	// scope is refused (an empty scope re-enables the runner's `git add -A`
+	// fallback, disabling enforcement). Declared here so the
+	// DisallowUnknownFields decode accepts it; callers omit it (omitempty) and
+	// stay byte-identical to today.
+	RemoveScopeFiles []string `json:"remove_scope_files,omitempty"`
 	// BindingAssertions is an OPTIONAL list of operator-declared,
 	// deterministic binding-assertion checks (#1171). Each is a typed
 	// substring assertion (file_contains | test_asserts) the operator
@@ -353,14 +368,31 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		if !s.checkPlanReviewSettled(w, r, stage) {
 			return
 		}
+		// Gate-time scope removal (#1726): validate the remove_scope_files
+		// shape and the two semantic fail-closed modes (path not in the
+		// current effective scope; a removal that would empty a non-empty
+		// scope) PRE-Submit, before the cap gate reads the post-removal count.
+		// A refused approval inserts no row, so a corrected retry flows
+		// normally. No-removal approves skip this entirely (empty slice).
+		trimmedRemove, ok := s.checkRemoveScopeFiles(w, r, stage, req.AddScopeFiles, req.RemoveScopeFiles)
+		if !ok {
+			return
+		}
+		// Thread the trimmed removal paths back into the request so every
+		// downstream consumer (checkPlanScopeCap, writeApprovalAudit, the
+		// prompt-builder subtraction) subtracts the normalized scope path rather
+		// than the raw whitespace-padded input (#1726). Without this a value like
+		// " backend/b.go " passes the trimmed presence/empty checks yet fails to
+		// subtract the actual scope entry backend/b.go downstream.
+		req.RemoveScopeFiles = trimmedRemove
 		// Scope-cap gate (#983): refuse an approve whose effective scope
-		// (plan scope.files ∪ add_scope_files) exceeds the implement
-		// stage's max_files_changed, unless the comment carries
+		// (plan scope.files ∪ add_scope_files ∖ remove_scope_files) exceeds
+		// the implement stage's max_files_changed, unless the comment carries
 		// --override-scope-cap. PRE-Submit for the same ADR-036 reason as
 		// checkPlanReviewSettled: a refused approval must insert no row so
 		// a retry after re-scope or with the override flows normally
 		// (post-Submit, the idempotent-first-wins retry would skip gates).
-		if !s.checkPlanScopeCap(w, r, stage, req.Comment, req.AddScopeFiles) {
+		if !s.checkPlanScopeCap(w, r, stage, req.Comment, req.AddScopeFiles, req.RemoveScopeFiles) {
 			return
 		}
 		// Budget gate (#986): refuse an approve whose plan predicts a
@@ -471,6 +503,7 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		CommentPtr:          commentPtr,
 		ApproverGithubLogin: req.ApproverGithubLogin,
 		AddScopeFiles:       req.AddScopeFiles,
+		RemoveScopeFiles:    req.RemoveScopeFiles,
 		BindingAssertions:   req.BindingAssertions,
 		DelegatedRule:       delegatedRule,
 		ResolvedModel:       resolvedModel,
@@ -577,6 +610,7 @@ type approveActionParams struct {
 	CommentPtr          *string
 	ApproverGithubLogin string
 	AddScopeFiles       []string
+	RemoveScopeFiles    []string
 	BindingAssertions   []bindingAssertion
 	DelegatedRule       string
 	ResolvedModel       *ResolvedModel
@@ -675,7 +709,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		// enrichment (ADR-055 record leg) on the approval_submitted row. No
 		// predicate_snapshot — the gate declares no approvals block
 		// (operator binding condition 2).
-		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.BindingAssertions, p.DelegatedRule, id.AuthMethod, channel, nil)
+		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.DelegatedRule, id.AuthMethod, channel, nil)
 		return s.finishApprovalAdvance(ctx, p, res)
 	}
 
@@ -722,7 +756,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 	}
 	// Persist the enriched approval audit BEFORE any advance (#1351) so a
 	// dispatch racing the transition observes it. Best-effort append.
-	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.BindingAssertions, p.DelegatedRule, id.AuthMethod, channel, snapshot)
+	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.DelegatedRule, id.AuthMethod, channel, snapshot)
 
 	if !reached {
 		// Recorded but below quorum (or a delegated/agent submission that
@@ -1224,7 +1258,7 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // gates with no approvals block. All new keys ride INSIDE the existing
 // hashed payload JSONB — no new top-level audit.Entry / Export v1 field — so
 // the hash chain and the E9 verifier's strict decode are unaffected.
-func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles []string, bindingAssertions []bindingAssertion, delegatedRule, authMethod, channel string, snapshot *predicateSnapshot) {
+func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, bindingAssertions []bindingAssertion, delegatedRule, authMethod, channel string, snapshot *predicateSnapshot) {
 	// ADR-040 D4 (#1027): the acting subject selects the kind — an
 	// operator-agent token records agent, every other subject (human
 	// tokens, GitHub logins from the PR-review-event path) stays user.
@@ -1272,6 +1306,24 @@ func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *
 	// the prompt builder reads this back via loadApprovalAddScopeFiles.
 	if app.Decision == approval.DecisionApprove && len(addScopeFiles) > 0 {
 		auditPayload["add_scope_files"] = addScopeFiles
+	}
+	// Gate-time scope removal (#1726): record the authoritative paths removed
+	// from the implement scope, plus the before/after effective-scope file
+	// lists so the removal is durably auditable. Only on approve with a
+	// non-empty removal set; the prompt builder reads remove_scope_files back
+	// via loadApprovalRemoveScopeFiles. The before/after lists come from the
+	// single-source effectiveScopePathSet helper (remove=nil vs
+	// remove=removeScopeFiles), the same set the cap gate counts and the
+	// prompt builder assembles. A fail-open unresolved set (ok=false) omits
+	// the before/after keys but still records remove_scope_files.
+	if app.Decision == approval.DecisionApprove && len(removeScopeFiles) > 0 {
+		auditPayload["remove_scope_files"] = removeScopeFiles
+		if before, _, ok := s.effectiveScopePathSet(ctx, stage.RunID, addScopeFiles, nil); ok {
+			auditPayload["scope_files_before"] = before
+			if after, _, ok := s.effectiveScopePathSet(ctx, stage.RunID, addScopeFiles, removeScopeFiles); ok {
+				auditPayload["scope_files_after"] = after
+			}
+		}
 	}
 	// Binding-assertion declaration (#1171): record the operator's declared
 	// assertions so the prompt builder reads them back via
@@ -1963,6 +2015,107 @@ func (s *Server) checkPeriodicBudgetTier(w http.ResponseWriter, r *http.Request,
 	return false
 }
 
+// validateRemoveScopeFiles trims and validates the remove_scope_files paths
+// (#1726), mirroring recover.go's validateExemptScopeFiles: each must be
+// non-empty after trim and repo-relative (no leading '/' or ".." traversal —
+// the containment contract isRepoRelativePath enforces). Returns the trimmed
+// paths or an error describing the first bad entry; empty input yields nil
+// with no error.
+func validateRemoveScopeFiles(in []string) ([]string, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		p := strings.TrimSpace(raw)
+		if p == "" {
+			return nil, errors.New("remove_scope_files entries must name a non-empty repo-relative path")
+		}
+		if !isRepoRelativePath(p) {
+			return nil, fmt.Errorf("remove_scope_files path %q must be repo-relative (no leading '/' or '..')", p)
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// checkRemoveScopeFiles validates a plan-stage approve's remove_scope_files
+// (#1726) PRE-Submit. It enforces three fail-closed modes, each with a
+// dedicated test:
+//
+//	(shape)   a non-repo-relative / empty path → 400 validation_failed
+//	          field=remove_scope_files (validateRemoveScopeFiles).
+//	(present) a removal path absent from the CURRENT effective scope (plan
+//	          scope.files ∪ prior add folds ∪ approved amendments ∪ THIS
+//	          call's add_scope_files) → 400 (catches operator typos).
+//	(empty)   a removal that would empty a NON-empty effective scope → 400
+//	          (an empty scope re-enables the runner's `git add -A` fallback,
+//	          disabling enforcement).
+//
+// Returns (trimmed, true) to proceed — the trimmed slice the caller MUST
+// thread back into the request so every downstream consumer (checkPlanScopeCap,
+// writeApprovalAudit, the prompt-builder subtraction) subtracts the actual
+// normalized path rather than the raw whitespace-padded input. An empty removal
+// set returns (nil, true) — byte-identical to today. On any refusal it returns
+// (nil, false) after writing the response.
+//
+// Read-error posture matches the sibling plan gates: if the effective scope
+// cannot be computed (fail-open ok=false), the semantic presence/empty checks
+// are skipped with a WARN so a transient backend hiccup never bricks the gate;
+// the shape check still applies, and the prompt-builder subtraction is a
+// no-op on a non-present path regardless.
+func (s *Server) checkRemoveScopeFiles(w http.ResponseWriter, r *http.Request, stage *run.Stage, addScopeFiles, removeScopeFiles []string) ([]string, bool) {
+	trimmed, err := validateRemoveScopeFiles(removeScopeFiles)
+	if err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			err.Error(), map[string]any{"field": "remove_scope_files"})
+		return nil, false
+	}
+	if len(trimmed) == 0 {
+		return nil, true
+	}
+
+	before, _, ok := s.effectiveScopePathSet(r.Context(), stage.RunID, addScopeFiles, nil)
+	if !ok {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"remove-scope gate: effective scope unresolved; skipping presence/empty checks",
+			slog.String("stage_id", stage.ID.String()),
+		)
+		return trimmed, true
+	}
+	present := make(map[string]struct{}, len(before))
+	for _, p := range before {
+		present[p] = struct{}{}
+	}
+	for _, p := range trimmed {
+		if _, in := present[p]; !in {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				fmt.Sprintf("remove_scope_files path %q is not in the current effective scope; nothing to remove", p),
+				map[string]any{
+					"field":           "remove_scope_files",
+					"path":            p,
+					"effective_scope": before,
+				})
+			return nil, false
+		}
+		delete(present, p)
+	}
+	// A removal that empties a non-empty effective scope is refused: an empty
+	// scope silently re-enables the runner's `git add -A` fallback, disabling
+	// scope enforcement (foldScopePaths / effectiveFixupScope short-circuit on
+	// an empty scope).
+	if len(before) > 0 && len(present) == 0 {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"remove_scope_files would empty the effective scope; an empty scope disables scope enforcement — keep at least one path or re-plan",
+			map[string]any{
+				"field":              "remove_scope_files",
+				"remove_scope_files": trimmed,
+			})
+		return nil, false
+	}
+	return trimmed, true
+}
+
 // checkPlanScopeCap enforces the scope-cap gate on plan-stage approvals
 // (#983). Returns true when the approval should proceed; returns false
 // (and writes the 422 plan_violates_scope_cap response) when the
@@ -1983,17 +2136,24 @@ func (s *Server) checkPeriodicBudgetTier(w http.ResponseWriter, r *http.Request,
 // missing plan skips the check (effectiveScopeHeadroom WARN-logs), so a
 // degraded backend can never brick the approval gate. A cap of 0 means
 // no cap is configured — nothing to enforce.
-func (s *Server) checkPlanScopeCap(w http.ResponseWriter, r *http.Request, stage *run.Stage, comment string, addScopeFiles []string) bool {
-	effectiveCount, maxFiles, ok := s.effectiveScopeHeadroom(r.Context(), stage.RunID, addScopeFiles)
+func (s *Server) checkPlanScopeCap(w http.ResponseWriter, r *http.Request, stage *run.Stage, comment string, addScopeFiles, removeScopeFiles []string) bool {
+	// Subtract the gate-time removals (#1726) so a cap overflow can be
+	// reconciled entirely at the gate (remove or remove+add-replace) without a
+	// re-plan. Use the shared effectiveScopePathSet directly (the same helper
+	// effectiveScopeHeadroom wraps) so the removal is threaded without widening
+	// effectiveScopeHeadroom's signature for its other callers.
+	paths, maxFiles, ok := s.effectiveScopePathSet(r.Context(), stage.RunID, addScopeFiles, removeScopeFiles)
+	effectiveCount := len(paths)
 	if !ok || maxFiles <= 0 || effectiveCount <= maxFiles {
 		return true
 	}
 
 	auditPayload, _ := json.Marshal(map[string]any{
-		"stage_id":              stage.ID.String(),
-		"scoped_files":          effectiveCount,
-		"max_files_changed":     maxFiles,
-		"add_scope_files_count": len(addScopeFiles),
+		"stage_id":                 stage.ID.String(),
+		"scoped_files":             effectiveCount,
+		"max_files_changed":        maxFiles,
+		"add_scope_files_count":    len(addScopeFiles),
+		"remove_scope_files_count": len(removeScopeFiles),
 	})
 	systemKind := audit.ActorKind("system")
 
@@ -2029,12 +2189,13 @@ func (s *Server) checkPlanScopeCap(w http.ResponseWriter, r *http.Request, stage
 	}
 
 	s.writeError(w, r, http.StatusUnprocessableEntity, "plan_violates_scope_cap",
-		"effective scope.files (plan scope plus add_scope_files) exceeds the implement stage's max_files_changed; re-scope the plan or include --override-scope-cap in the comment",
+		"effective scope.files (plan scope plus add_scope_files minus remove_scope_files) exceeds the implement stage's max_files_changed; re-scope the plan, remove paths via remove_scope_files, or include --override-scope-cap in the comment",
 		map[string]any{
-			"stage_id":              stage.ID.String(),
-			"scoped_files":          effectiveCount,
-			"max_files_changed":     maxFiles,
-			"add_scope_files_count": len(addScopeFiles),
+			"stage_id":                 stage.ID.String(),
+			"scoped_files":             effectiveCount,
+			"max_files_changed":        maxFiles,
+			"add_scope_files_count":    len(addScopeFiles),
+			"remove_scope_files_count": len(removeScopeFiles),
 		})
 	return false
 }

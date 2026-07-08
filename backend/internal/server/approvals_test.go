@@ -1208,6 +1208,166 @@ func TestSubmitApproval_BindingAssertions_OmittedWhenEmpty(t *testing.T) {
 	}
 }
 
+// TestSubmitApproval_RemoveScopeFiles_NonRepoRelativeRejected pins the #1726
+// SHAPE fail-closed mode: a remove_scope_files path that is not repo-relative
+// (here a ".." traversal) is refused 400 validation_failed field=
+// remove_scope_files BEFORE any approval row is inserted, so a corrected retry
+// flows normally. The shape check runs before the effective-scope resolution,
+// so it fires even on a server with no plan artifact wired.
+func TestSubmitApproval_RemoveScopeFiles_NonRepoRelativeRejected(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","remove_scope_files":["../etc/passwd"]}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 on non-repo-relative removal:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"field":"remove_scope_files"`) {
+		t.Errorf("response missing field=remove_scope_files: %s", w.Body.String())
+	}
+	for _, e := range au.appended {
+		if e.Category == "approval_submitted" {
+			t.Errorf("approval_submitted recorded despite invalid removal: %v", e)
+		}
+	}
+}
+
+// removeScopeGateReq builds a POST request + recorder for a direct
+// checkRemoveScopeFiles call (the presence/empty semantic modes need a plan
+// artifact wired, which newHeadroomServer provides but the handler-level
+// approval fixture does not).
+func removeScopeGateReq() (*httptest.ResponseRecorder, *http.Request) {
+	return httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/", nil)
+}
+
+// TestCheckRemoveScopeFiles_PathNotInScopeRejected pins the #1726 PRESENCE
+// fail-closed mode: a removal path absent from the current effective scope
+// (an operator typo) is refused 400 validation_failed field=remove_scope_files.
+func TestCheckRemoveScopeFiles_PathNotInScopeRejected(t *testing.T) {
+	s, _, _, runRow, planStage := newHeadroomServer(t, specImplementPathConstraints, []plan.ScopeFile{
+		{Path: "backend/a.go", Operation: plan.FileOpModify},
+		{Path: "backend/b.go", Operation: plan.FileOpModify},
+	})
+	planStage.RunID = runRow.ID
+	w, r := removeScopeGateReq()
+	if _, ok := s.checkRemoveScopeFiles(w, r, planStage, nil, []string{"backend/zzz.go"}); ok {
+		t.Fatal("checkRemoveScopeFiles = true for a path not in scope, want false")
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a removal not in scope:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"field":"remove_scope_files"`) {
+		t.Errorf("response missing field=remove_scope_files: %s", w.Body.String())
+	}
+}
+
+// TestCheckRemoveScopeFiles_WouldEmptyScopeRejected pins the #1726 EMPTY
+// fail-closed mode: a removal that would empty a non-empty effective scope is
+// refused 400 — an empty scope re-enables the runner's `git add -A` fallback,
+// disabling scope enforcement.
+func TestCheckRemoveScopeFiles_WouldEmptyScopeRejected(t *testing.T) {
+	s, _, _, runRow, planStage := newHeadroomServer(t, specImplementPathConstraints, []plan.ScopeFile{
+		{Path: "backend/a.go", Operation: plan.FileOpModify},
+	})
+	planStage.RunID = runRow.ID
+	w, r := removeScopeGateReq()
+	if _, ok := s.checkRemoveScopeFiles(w, r, planStage, nil, []string{"backend/a.go"}); ok {
+		t.Fatal("checkRemoveScopeFiles = true for a scope-emptying removal, want false")
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a scope-emptying removal:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "would empty the effective scope") {
+		t.Errorf("response missing empty-scope reason: %s", w.Body.String())
+	}
+}
+
+// TestCheckRemoveScopeFiles_ValidRemovalProceeds is the positive case: removing
+// one of several in-scope paths (leaving a non-empty scope) proceeds.
+func TestCheckRemoveScopeFiles_ValidRemovalProceeds(t *testing.T) {
+	s, _, _, runRow, planStage := newHeadroomServer(t, specImplementPathConstraints, []plan.ScopeFile{
+		{Path: "backend/a.go", Operation: plan.FileOpModify},
+		{Path: "backend/b.go", Operation: plan.FileOpModify},
+	})
+	planStage.RunID = runRow.ID
+	w, r := removeScopeGateReq()
+	trimmed, ok := s.checkRemoveScopeFiles(w, r, planStage, nil, []string{"backend/b.go"})
+	if !ok {
+		t.Fatalf("checkRemoveScopeFiles = false for a valid removal, want true:\n%s", w.Body.String())
+	}
+	if len(trimmed) != 1 || trimmed[0] != "backend/b.go" {
+		t.Fatalf("checkRemoveScopeFiles returned %v, want [backend/b.go]", trimmed)
+	}
+}
+
+// TestCheckRemoveScopeFiles_TrimmedPathThreadedBack pins the #1726 accepted
+// trimmed-input edge: a whitespace-padded removal path passes the presence /
+// would-empty checks against its trimmed form AND the returned slice carries
+// the trimmed path, so every downstream consumer (checkPlanScopeCap,
+// writeApprovalAudit, the prompt-builder subtraction) subtracts the real scope
+// path rather than the padded input.
+func TestCheckRemoveScopeFiles_TrimmedPathThreadedBack(t *testing.T) {
+	s, _, _, runRow, planStage := newHeadroomServer(t, specImplementPathConstraints, []plan.ScopeFile{
+		{Path: "backend/a.go", Operation: plan.FileOpModify},
+		{Path: "backend/b.go", Operation: plan.FileOpModify},
+	})
+	planStage.RunID = runRow.ID
+	w, r := removeScopeGateReq()
+	trimmed, ok := s.checkRemoveScopeFiles(w, r, planStage, nil, []string{"  backend/b.go  "})
+	if !ok {
+		t.Fatalf("checkRemoveScopeFiles = false for a padded valid removal, want true:\n%s", w.Body.String())
+	}
+	if len(trimmed) != 1 || trimmed[0] != "backend/b.go" {
+		t.Fatalf("checkRemoveScopeFiles returned %v, want [backend/b.go] (trimmed)", trimmed)
+	}
+}
+
+// TestWriteApprovalAudit_RemoveScopeFiles_RecordsBeforeAfter pins the #1726
+// persistence seam: an approve carrying remove_scope_files records the removal
+// plus the before/after effective-scope file lists on the approval_submitted
+// payload, computed from the single-source effectiveScopePathSet helper.
+func TestWriteApprovalAudit_RemoveScopeFiles_RecordsBeforeAfter(t *testing.T) {
+	s, _, _, runRow, planStage := newHeadroomServer(t, specImplementPathConstraints, []plan.ScopeFile{
+		{Path: "backend/a.go", Operation: plan.FileOpModify},
+		{Path: "backend/b.go", Operation: plan.FileOpModify},
+	})
+	planStage.RunID = runRow.ID
+	app := &approval.Approval{
+		StageID:         planStage.ID,
+		ApproverSubject: "op",
+		Decision:        approval.DecisionApprove,
+		Surface:         approval.SurfaceAPI,
+	}
+	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, []string{"backend/b.go"}, nil, "", "", "", nil)
+
+	au := s.cfg.AuditRepo.(*auditFake)
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if got := toStringSlice(payload["remove_scope_files"]); !reflect.DeepEqual(got, []string{"backend/b.go"}) {
+		t.Errorf("remove_scope_files = %v, want [backend/b.go]", got)
+	}
+	if got := toStringSlice(payload["scope_files_before"]); !reflect.DeepEqual(got, []string{"backend/a.go", "backend/b.go"}) {
+		t.Errorf("scope_files_before = %v, want [backend/a.go backend/b.go]", got)
+	}
+	if got := toStringSlice(payload["scope_files_after"]); !reflect.DeepEqual(got, []string{"backend/a.go"}) {
+		t.Errorf("scope_files_after = %v, want [backend/a.go]", got)
+	}
+}
+
+// toStringSlice coerces a JSON-decoded []any of strings to []string for
+// payload assertions.
+func toStringSlice(v any) []string {
+	raw, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, len(raw))
+	for i, e := range raw {
+		out[i], _ = e.(string)
+	}
+	return out
+}
+
 // fakeStageCheckRepo lets the approval-handler tests exercise the
 // blocking-check enforcement without touching Postgres. Returns
 // canned states keyed by (stage_id, check_name).
