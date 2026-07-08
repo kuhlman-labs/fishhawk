@@ -2404,6 +2404,140 @@ func TestGetStagePrompt_Implement_FixupConcerns_RetainsFullPlanScope(t *testing.
 	}
 }
 
+// TestGetStagePrompt_Implement_FixupConcerns_TargetedPatchPromptServed is the
+// #1724 cross-boundary (resolver -> renderer) test: the slim fix-up prompt the
+// endpoint returns must carry the routed concerns AND the concern-relevant
+// changed-file list AND omit the full-implementation corpus, and report
+// fixup:true. It seeds BOTH a stage_fixup_triggered entry (so the fix-up fork
+// engages) and a redacted trace bundle with a git_diff event (so
+// resolveFixupPriorDiff returns a file list), then asserts the served prompt
+// stitches them into the always-present focus block. It fails if the fork
+// silently fell back to the full prompt (corpus present, fixup:false) or if the
+// resolver's file list never reached the renderer.
+func TestGetStagePrompt_Implement_FixupConcerns_TargetedPatchPromptServed(t *testing.T) {
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{
+				{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify},
+				{Path: "backend/internal/prompt/prompt.go", Operation: plan.FileOpModify},
+			},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {
+			{ID: planStageID, RunID: runID, Type: run.StageTypePlan},
+			{ID: implStageID, RunID: runID, Type: run.StageTypeImplement},
+		},
+	}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+	concerns := []planreview.Concern{
+		{Severity: planreview.SeverityHigh, Category: "correctness",
+			Note: "guard the nil pool in the retry path"},
+	}
+	// Seed the fix-up trigger AND a redacted trace_uploaded entry pointing at the
+	// bundle the store returns, so resolveFixupConcerns and resolveFixupPriorDiff
+	// both fire for this stage.
+	hash := strings.Repeat("c", 64)
+	const patch = "diff --git a/backend/internal/prompt/prompt.go b/backend/internal/prompt/prompt.go\n@@ -1 +1 @@\n+guard\n"
+	auditByRun := map[uuid.UUID][]*audit.Entry{
+		runID: {
+			makeFixupEntry(runID, implStageID, concerns),
+			makeTraceUploadedEntry(t, 2, runID, implStageID, "redacted", hash),
+		},
+	}
+	ts := &priorDiffTraceStore{
+		body: makeRedactedDiffBundle(t, patch, []map[string]string{
+			{"path": "backend/internal/prompt/prompt.go", "status": "modified"},
+			{"path": "backend/internal/server/prompt.go", "status": "modified"},
+		}),
+	}
+
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		SigningRepo:  sf,
+		ArtifactRepo: art,
+		AuditRepo:    &feedbackAuditRepo{byRunID: auditByRun},
+		TraceStore:   ts,
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, runID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// The response reports the fix-up wire flag — proof the slim fork engaged
+	// rather than falling back to the full implement prompt.
+	if !resp.Fixup {
+		t.Errorf("fixup = false, want true for a stage with an unconsumed stage_fixup_triggered entry")
+	}
+
+	// (a) Routed concern present.
+	for _, want := range []string{
+		"### Fix-up concerns",
+		"[high/correctness]",
+		"guard the nil pool in the retry path",
+	} {
+		if !strings.Contains(resp.Prompt, want) {
+			t.Errorf("served slim prompt missing concern content %q\n---\n%s", want, resp.Prompt)
+		}
+	}
+
+	// (b) Concern-relevant changed-file list present (resolver -> renderer seam).
+	if !strings.Contains(resp.Prompt, "### Files changed by the change you are amending") {
+		t.Errorf("served slim prompt missing the concern-relevant file focus block\n---\n%s", resp.Prompt)
+	}
+	for _, f := range []string{"backend/internal/prompt/prompt.go", "backend/internal/server/prompt.go"} {
+		if !strings.Contains(resp.Prompt, f) {
+			t.Errorf("served slim prompt missing concern-relevant file %q\n---\n%s", f, resp.Prompt)
+		}
+	}
+
+	// (c) Full-implementation corpus ABSENT.
+	for _, corpus := range []string{
+		"Approved plan (binding instruction)",
+		"### Budget context",
+		"write a pull-request description",
+	} {
+		if strings.Contains(resp.Prompt, corpus) {
+			t.Errorf("served slim prompt must omit full-corpus marker %q\n---\n%s", corpus, resp.Prompt)
+		}
+	}
+}
+
 // TestGetStagePrompt_Implement_FixupConcerns_FoldsCoupledTestSibling is the
 // done-means test for #1214 under the #1314 full-retention base (mode 5): a
 // fix-up whose plan scope contains a production .go file must land the agent's
@@ -3656,7 +3790,12 @@ func makeRedactedDiffBundleManifestOnly(t *testing.T) []byte {
 }
 
 // TestResolveFixupPriorDiff_HappyPath_ReturnsPatchAndFileList: a redacted bundle
-// with a git_diff event yields the patch and the rendered changed-file list.
+// with a git_diff event yields the patch and the rendered changed-file list. The
+// patch here is well within maxFixupPriorDiffBytes (the inline-diff path, NOT the
+// oversize/absent fallback), so this pins #1724's contract that the changed-file
+// list (trigger.FixupPriorDiffFiles) is populated ALONGSIDE the inline patch —
+// not only on the fallback — which is what lets writeFixupPriorDiff render the
+// concern-relevant focus block on every fix-up dispatch.
 func TestResolveFixupPriorDiff_HappyPath_ReturnsPatchAndFileList(t *testing.T) {
 	runID := uuid.New()
 	stageID := uuid.New()
@@ -3678,8 +3817,13 @@ func TestResolveFixupPriorDiff_HappyPath_ReturnsPatchAndFileList(t *testing.T) {
 	if gotPatch != patch {
 		t.Errorf("patch = %q, want %q", gotPatch, patch)
 	}
+	// The patch is small enough to inline, yet the file list is STILL returned —
+	// the always-populated (not fallback-only) contract #1724 depends on.
+	if len(patch) > 24*1024 {
+		t.Fatalf("fixture patch unexpectedly over the inline cap: %d", len(patch))
+	}
 	if !strings.Contains(gotFiles, "x.go") {
-		t.Errorf("file list = %q, want it to contain %q", gotFiles, "x.go")
+		t.Errorf("file list = %q, want it to contain %q even on the inline-patch path", gotFiles, "x.go")
 	}
 }
 
