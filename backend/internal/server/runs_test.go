@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,10 +11,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
@@ -475,5 +478,118 @@ func TestCreateRun_UpstreamRunID_OmittedStaysNil(t *testing.T) {
 	}
 	if resp.UpstreamRunID != nil {
 		t.Errorf("response UpstreamRunID = %v, want nil", resp.UpstreamRunID)
+	}
+}
+
+// campaignHydrationGitHub builds an httptest GitHub server serving the four
+// endpoints StartRunForCampaignIssue's #1721 hydration path exercises:
+// installation + workflow-spec (to reach CreateRunForTrigger) and issue +
+// comments (the IssueContext hydration). issueStatus/commentsStatus let a test
+// force a fetch failure to prove the best-effort degradation.
+func campaignHydrationGitHub(t *testing.T, issueStatus, commentsStatus int) *githubclient.Client {
+	t.Helper()
+	specJSON := `{"path":".fishhawk/workflows.yaml","sha":"spec_sha","content":"` +
+		base64.StdEncoding.EncodeToString([]byte(gatedSpecYAML)) + `","encoding":"base64","type":"file"}`
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/installation", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"id":12345,"app_id":1}`)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/contents/", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, specJSON)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/{number}/comments", func(w http.ResponseWriter, _ *http.Request) {
+		if commentsStatus != http.StatusOK {
+			w.WriteHeader(commentsStatus)
+			return
+		}
+		_, _ = io.WriteString(w, `[{"user":{"login":"octocat"},"body":"first comment","created_at":"2026-07-01T00:00:00Z"}]`)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/issues/{number}", func(w http.ResponseWriter, _ *http.Request) {
+		if issueStatus != http.StatusOK {
+			w.WriteHeader(issueStatus)
+			return
+		}
+		_, _ = io.WriteString(w, `{"number":100,"title":"Campaign parent issue","body":"parent body","state":"open"}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &ghTokensStub{tok: "ghs_test"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "gha_app_jwt", nil },
+	}
+}
+
+// TestStartRunForCampaignIssue_HydratesIssueContext pins leg 3 of #1721: a
+// campaign-minted run carries the fetched issue title/body/url/number (+ mapped
+// comments) so a decomposed parent's fan-out children inherit real context.
+func TestStartRunForCampaignIssue_HydratesIssueContext(t *testing.T) {
+	rrepo := newFakeRepo()
+	gh := campaignHydrationGitHub(t, http.StatusOK, http.StatusOK)
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rrepo, GitHub: gh})
+
+	if _, err := s.StartRunForCampaignIssue(context.Background(),
+		"kuhlman-labs/fishhawk", "issue:100", "feature_change", "", "local"); err != nil {
+		t.Fatalf("StartRunForCampaignIssue: %v", err)
+	}
+
+	ic := rrepo.lastCreateRunParams.IssueContext
+	if ic == nil {
+		t.Fatal("created run row carries no IssueContext; want hydrated context")
+	}
+	if ic.Title != "Campaign parent issue" || ic.Body != "parent body" || ic.Number != 100 {
+		t.Errorf("IssueContext = {Title:%q Body:%q Number:%d}, want the fetched issue", ic.Title, ic.Body, ic.Number)
+	}
+	if ic.URL != "https://github.com/kuhlman-labs/fishhawk/issues/100" {
+		t.Errorf("IssueContext.URL = %q, want the canonical github.com issue URL", ic.URL)
+	}
+	if len(ic.Comments) != 1 || ic.Comments[0].Author != "octocat" || ic.Comments[0].Body != "first comment" {
+		t.Errorf("IssueContext.Comments = %+v, want the single fetched comment", ic.Comments)
+	}
+}
+
+// TestStartRunForCampaignIssue_HydrationDegradesOnFetchError pins the best-effort
+// posture: a GetIssue failure logs a warn and starts the run with a nil
+// IssueContext rather than blocking the campaign run start (#1721).
+func TestStartRunForCampaignIssue_HydrationDegradesOnFetchError(t *testing.T) {
+	rrepo := newFakeRepo()
+	gh := campaignHydrationGitHub(t, http.StatusInternalServerError, http.StatusOK)
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rrepo, GitHub: gh})
+
+	created, err := s.StartRunForCampaignIssue(context.Background(),
+		"kuhlman-labs/fishhawk", "issue:100", "feature_change", "", "local")
+	if err != nil {
+		t.Fatalf("StartRunForCampaignIssue must still start the run on a GetIssue error: %v", err)
+	}
+	if created == nil {
+		t.Fatal("created run is nil; want a started run despite the hydration failure")
+	}
+	if rrepo.lastCreateRunParams.IssueContext != nil {
+		t.Errorf("IssueContext = %+v, want nil after the GetIssue failure", rrepo.lastCreateRunParams.IssueContext)
+	}
+}
+
+// TestStartRunForCampaignIssue_HydrationDegradesOnCommentError pins the partial-
+// degradation branch: a comment-list fetch failure keeps title+body and leaves
+// the comments slice nil rather than discarding the whole context (#1721).
+func TestStartRunForCampaignIssue_HydrationDegradesOnCommentError(t *testing.T) {
+	rrepo := newFakeRepo()
+	gh := campaignHydrationGitHub(t, http.StatusOK, http.StatusInternalServerError)
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rrepo, GitHub: gh})
+
+	if _, err := s.StartRunForCampaignIssue(context.Background(),
+		"kuhlman-labs/fishhawk", "issue:100", "feature_change", "", "local"); err != nil {
+		t.Fatalf("StartRunForCampaignIssue: %v", err)
+	}
+	ic := rrepo.lastCreateRunParams.IssueContext
+	if ic == nil {
+		t.Fatal("IssueContext nil; want title+body retained despite the comment-fetch failure")
+	}
+	if ic.Title != "Campaign parent issue" || ic.Body != "parent body" {
+		t.Errorf("IssueContext title/body = {%q,%q}, want retained", ic.Title, ic.Body)
+	}
+	if len(ic.Comments) != 0 {
+		t.Errorf("IssueContext.Comments = %+v, want empty after the comment-fetch failure", ic.Comments)
 	}
 }

@@ -76,18 +76,34 @@ func (a advancerAdapter) IntegrateSlices(ctx context.Context, parentRunID uuid.U
 // orchestrator/fanout_test.go.
 func decomposedPlanContent(t *testing.T) []byte {
 	t.Helper()
+	// Each sub-plan carries its OWN per-slice scope.files. The #1676 plan gate
+	// requires this on every decomposition, and the prompt handler now fails a
+	// decomposed child closed (409 decomposed_scope_unresolved, #1721) rather
+	// than inheriting the parent's full scope when its matched slice declares no
+	// scope — so a scope-less sub-plan here would 409 the recovery-child prompt
+	// render in TestDecomposition_E2E_CategoryBChildRecoverInPlace.
 	subs := []map[string]any{
 		{
 			"title":                        "Part A",
 			"scope_hint":                   "scope hint for Part A",
 			"predicted_runtime_minutes":    10,
 			"predicted_runtime_confidence": "high",
+			"scope": map[string]any{
+				"files": []map[string]any{
+					{"path": "a.go", "operation": "create"},
+				},
+			},
 		},
 		{
 			"title":                        "Part B",
 			"scope_hint":                   "scope hint for Part B",
 			"predicted_runtime_minutes":    10,
 			"predicted_runtime_confidence": "high",
+			"scope": map[string]any{
+				"files": []map[string]any{
+					{"path": "x.go", "operation": "create"},
+				},
+			},
 		},
 	}
 	body := map[string]any{

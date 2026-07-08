@@ -16,11 +16,13 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaigndriver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -3053,5 +3055,153 @@ func TestReconcileOnRead_RunlessNonIssueRef_Skipped(t *testing.T) {
 	}
 	if ghState.issueCalls != 0 || ghState.installCalls != 0 {
 		t.Errorf("GitHub calls = issue:%d install:%d, want 0/0 (skipped before any call)", ghState.issueCalls, ghState.installCalls)
+	}
+}
+
+// TestCampaignDecomposedParent_ChildrenBindOwnSlice_E2E is the #1721 cross-
+// boundary regression pinning THIS run's shape. It spans two files: run creation
+// in runs.go (StartRunForCampaignIssue mints a campaign parent whose IssueContext
+// is nil — the GitHub fake serves the install + spec but not the issue, so
+// hydration degrades to nil) and the prompt-serving handler in prompt.go (each
+// decomposed child's implement prompt narrows to its OWN slice by the persisted
+// SliceIndex). Before the fix, a nil-IssueContext parent broke the sub-plan title
+// match and every child silently inherited the parent's full scope (reopening
+// #1669); the assertion is that no child's served scope_files equal the parent
+// union.
+//
+// The fan-out children are inserted directly (the in-memory promptRunRepo cannot
+// run the real orchestrator, which the fanout_test.go SliceIndex pin covers) with
+// the exact fields orchestrator.fanoutIfDecomposed persists: DecomposedFrom +
+// ParentRunID + a distinct SliceIndex, and a nil IssueContext.
+func TestCampaignDecomposedParent_ChildrenBindOwnSlice_E2E(t *testing.T) {
+	rr := newPromptRunRepo()
+	art := newFakeArtifactRepo()
+	sf := newSigningFake()
+	// GitHub fake serves installation + workflow spec (so StartRunForCampaignIssue
+	// reaches CreateRunForTrigger) but NOT the issue endpoint — so the #1721
+	// hydration degrades to a nil IssueContext, the campaign-minted regression
+	// shape.
+	fake := newFakeGitHubForRuns(gatedSpecYAML)
+	ghSrv := fake.server(t)
+	gh := &githubclient.Client{
+		BaseURL: ghSrv.URL,
+		Tokens:  &ghTokensStub{tok: "ghs_test"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "gha_app_jwt", nil },
+	}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, ArtifactRepo: art, SigningRepo: sf, GitHub: gh})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	// runs.go boundary: mint the campaign parent run.
+	parent, err := s.StartRunForCampaignIssue(context.Background(),
+		"kuhlman-labs/fishhawk", "issue:100", "feature_change", "", "local")
+	if err != nil {
+		t.Fatalf("StartRunForCampaignIssue: %v", err)
+	}
+	if parent.IssueContext != nil {
+		t.Fatalf("parent.IssueContext = %+v, want nil (campaign-minted regression shape)", parent.IssueContext)
+	}
+
+	// Locate the parent's plan stage (seeded from gatedSpecYAML's feature_change).
+	var planStageID uuid.UUID
+	for _, st := range rr.stagesByRunID[parent.ID] {
+		if st.Type == run.StageTypePlan {
+			planStageID = st.ID
+		}
+	}
+	if planStageID == uuid.Nil {
+		t.Fatalf("parent has no plan stage; stages=%+v", rr.stagesByRunID[parent.ID])
+	}
+
+	// Seed the approved decomposed plan: full union of three disjoint slices.
+	parentPlan := &plan.Plan{
+		PlanVersion: "standard_v1",
+		Summary:     "parent plan",
+		Scope: plan.Scope{Files: []plan.ScopeFile{
+			{Path: "pkg/a/a.go", Operation: plan.FileOpModify},
+			{Path: "pkg/b/b.go", Operation: plan.FileOpModify},
+			{Path: "pkg/c/c.go", Operation: plan.FileOpModify},
+		}},
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Decomposition: &plan.Decomposition{
+			Rationale: "scope split",
+			SubPlans: []plan.SubPlanSummary{
+				{Title: "Part A", ScopeHint: "A", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/a/a.go", Operation: plan.FileOpModify}}}},
+				{Title: "Part B", ScopeHint: "B", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/b/b.go", Operation: plan.FileOpModify}}}},
+				{Title: "Part C", ScopeHint: "C", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/c/c.go", Operation: plan.FileOpModify}}}},
+			},
+		},
+	}
+	planBytes, err := json.Marshal(parentPlan)
+	if err != nil {
+		t.Fatalf("marshal parent plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	parentUnion := map[string]bool{"pkg/a/a.go": true, "pkg/b/b.go": true, "pkg/c/c.go": true}
+	wantSlice := []string{"pkg/a/a.go", "pkg/b/b.go", "pkg/c/c.go"}
+
+	// Simulate the fan-out: mint one implement-only child per slice with the exact
+	// linkage fields the orchestrator persists — DecomposedFrom + ParentRunID + a
+	// distinct SliceIndex, nil IssueContext.
+	for i := range parentPlan.Decomposition.SubPlans {
+		childID := uuid.New()
+		implID := uuid.New()
+		idx := i
+		parentID := parent.ID
+		rr.getRuns[childID] = &run.Run{
+			ID:             childID,
+			Repo:           parent.Repo,
+			WorkflowID:     "feature_change",
+			TriggerSource:  run.TriggerGitHubIssue,
+			ParentRunID:    &parentID,
+			DecomposedFrom: &parentID,
+			SliceIndex:     &idx,
+			IssueContext:   nil, // inherited from the nil-IssueContext parent
+		}
+		implStage := &run.Stage{ID: implID, RunID: childID, Type: run.StageTypeImplement, State: run.StageStatePending}
+		rr.stagesByRunID[childID] = []*run.Stage{implStage}
+		rr.getStages[implID] = implStage
+
+		// prompt.go boundary: fetch the child's implement prompt.
+		priv, _ := sf.issue(t, childID)
+		w := promptRequest(t, s, childID, implID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("slice %d: prompt status = %d, want 200:\n%s", i, w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("slice %d: decode: %v", i, err)
+		}
+		got := make([]string, 0, len(resp.ScopeFiles))
+		for _, f := range resp.ScopeFiles {
+			got = append(got, f.Path)
+		}
+		// The child owns exactly its one slice file plus the coupled _test.go.
+		want := []string{wantSlice[i], strings.TrimSuffix(wantSlice[i], ".go") + "_test.go"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("slice %d: scope_files = %v, want its own slice %v", i, got, want)
+		}
+		// And crucially: the served scope is NEVER the parent's full union.
+		if len(got) == len(parentUnion) {
+			allInUnion := true
+			for _, p := range got {
+				if !parentUnion[p] {
+					allInUnion = false
+					break
+				}
+			}
+			if allInUnion {
+				t.Errorf("slice %d: child served the parent's full union %v — the #1721 regression", i, got)
+			}
+		}
 	}
 }

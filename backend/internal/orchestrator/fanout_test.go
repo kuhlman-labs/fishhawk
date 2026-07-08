@@ -281,11 +281,20 @@ func TestAdvance_FanoutDecomposedPlan(t *testing.T) {
 		t.Errorf("Advance outcome = %q, want %q", out, OutcomeDecomposed)
 	}
 
+	// This parent carries a nil IssueContext (seed leaves it unset) — the
+	// campaign-minted shape (#1721). Child scope linkage now rests on the
+	// persisted SliceIndex, set independently of IssueContext, so the pin
+	// below asserts a distinct 0-based SliceIndex on every child regardless.
+	if parent.IssueContext != nil {
+		t.Fatalf("test precondition: parent.IssueContext = %+v, want nil (campaign-minted shape)", parent.IssueContext)
+	}
+
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	if got, want := len(rs.createdRuns), 3; got != want {
 		t.Fatalf("createdRuns = %d, want %d", got, want)
 	}
+	seenSlice := map[int]bool{}
 	for i, child := range rs.createdRuns {
 		if child.ParentRunID == nil || *child.ParentRunID != parent.ID {
 			t.Errorf("child %d parent_run_id = %v, want %s", i, child.ParentRunID, parent.ID)
@@ -299,6 +308,19 @@ func TestAdvance_FanoutDecomposedPlan(t *testing.T) {
 		if !bytes.Equal(child.WorkflowSpec, parentSpec) {
 			t.Errorf("child %d workflow_spec = %q, want inherited parent spec %q", i, child.WorkflowSpec, parentSpec)
 		}
+		// SliceIndex linkage pin (#1721): every child carries a distinct
+		// 0-based sub_plan index even though the parent's IssueContext is nil.
+		if child.SliceIndex == nil {
+			t.Errorf("child %d slice_index = nil, want a 0-based index", i)
+			continue
+		}
+		if *child.SliceIndex != i {
+			t.Errorf("child %d slice_index = %d, want %d (ordered fan-out)", i, *child.SliceIndex, i)
+		}
+		if seenSlice[*child.SliceIndex] {
+			t.Errorf("child %d slice_index = %d duplicated; want distinct per child", i, *child.SliceIndex)
+		}
+		seenSlice[*child.SliceIndex] = true
 	}
 	if got := len(rs.createdStages); got != 3 {
 		t.Errorf("createdStages = %d, want 3 (one implement per child)", got)
