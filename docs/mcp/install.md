@@ -97,7 +97,7 @@ Two audiences with different scopes:
 |---|---|
 | `fishhawk_get_active_run` | Resolves "the run for the current context" from `pr_number`, `trigger_ref`, or `FISHHAWK_RUN_ID` env. |
 | `fishhawk_get_plan` | Returns the approved standard_v1 plan; walks `parent_run_id` for CI-retry chains. |
-| `fishhawk_get_run_status` | Bundles Run + ordered stages + recent audit (time-descending) into one tool call. |
+| `fishhawk_get_run_status` | Bundles Run + ordered stages + recent audit (time-descending) into one tool call. Compact by default ([#1727](https://github.com/kuhlman-labs/fishhawk/issues/1727)): the heavy `issue_context` (issue body + all comments) and reviewer free-text prose (`free_form` + concern notes) are omitted to stay within the tool-result token cap, while every operator-playbook field (`next_actions`, wait statuses, `run.concerns`, review verdicts/severities/concern keys) is retained; pass `include_issue_context: true` and/or `include_review_prose: true` to restore the full payload. |
 | `fishhawk_list_audit` | Filtered audit access (`category`, `stage_id`) with cursor pagination. |
 | `fishhawk_verify_run` | Verify audit chain integrity for a run — checks every entry hash and chain link. `verified=false` is a halt condition before opening a PR. |
 

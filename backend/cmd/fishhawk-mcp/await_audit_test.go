@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -65,6 +66,86 @@ func TestAwaitAudit_ImmediateHit(t *testing.T) {
 	if out.LatestSequence != 4 {
 		t.Errorf("LatestSequence = %d, want 4 (the matched entry's sequence)", out.LatestSequence)
 	}
+}
+
+// seedAuditEntryWithPayload appends one audit entry carrying a decoded-JSON
+// payload, for the #1727 compact-projection await_audit test.
+func seedAuditEntryWithPayload(fb *fakeBackend, runID uuid.UUID, category string, seq int64, payload map[string]any) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	raw, _ := json.Marshal(payload)
+	var decoded any
+	_ = json.Unmarshal(raw, &decoded)
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: seq,
+		RunID:    runID.String(),
+		Category: category,
+		Payload:  decoded,
+	})
+}
+
+// TestAwaitAudit_CompactProjection is the #1727 await_audit projection proof:
+// a found entry whose payload carries free_form + body + a verdict returns,
+// by default, a payload with free_form/body stripped and the verdict kept;
+// the include flags restore the full payload.
+func TestAwaitAudit_CompactProjection(t *testing.T) {
+	payload := func() map[string]any {
+		return map[string]any{
+			"verdict":   "approve_with_concerns",
+			"free_form": "reviewer prose",
+			"body":      "issue body",
+		}
+	}
+
+	t.Run("default strips free_form and body, keeps verdict", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		seedAuditEntryWithPayload(fb, runID, "implement_reviewed", 4, payload())
+		r := newResolver(srv, nil)
+
+		_, out, err := r.awaitAudit(context.Background(), nil, AwaitAuditInput{
+			RunID: runID.String(), Category: "implement_reviewed", SinceSequence: 2,
+		})
+		if err != nil {
+			t.Fatalf("awaitAudit: %v", err)
+		}
+		if out.Status != "found" || out.Entry == nil {
+			t.Fatalf("Status = %q, Entry = %+v, want found with entry", out.Status, out.Entry)
+		}
+		m, ok := out.Entry.Payload.(map[string]any)
+		if !ok {
+			t.Fatalf("payload is not a map: %T", out.Entry.Payload)
+		}
+		if _, present := m["free_form"]; present {
+			t.Errorf("free_form should be stripped by default, got %+v", m)
+		}
+		if _, present := m["body"]; present {
+			t.Errorf("body should be stripped by default, got %+v", m)
+		}
+		if m["verdict"] != "approve_with_concerns" {
+			t.Errorf("verdict must survive, got %+v", m)
+		}
+	})
+
+	t.Run("include flags restore the full payload", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		seedAuditEntryWithPayload(fb, runID, "implement_reviewed", 4, payload())
+		r := newResolver(srv, nil)
+
+		_, out, err := r.awaitAudit(context.Background(), nil, AwaitAuditInput{
+			RunID: runID.String(), Category: "implement_reviewed", SinceSequence: 2,
+			IncludeReviewProse: true, IncludeIssueContext: true,
+		})
+		if err != nil {
+			t.Fatalf("awaitAudit: %v", err)
+		}
+		m := out.Entry.Payload.(map[string]any)
+		if m["free_form"] != "reviewer prose" || m["body"] != "issue body" {
+			t.Errorf("full payload should be restored under include flags, got %+v", m)
+		}
+	})
 }
 
 func TestAwaitAudit_PollsThenLands(t *testing.T) {
