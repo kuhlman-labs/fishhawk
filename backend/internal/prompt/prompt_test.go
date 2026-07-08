@@ -238,15 +238,20 @@ func TestBuild_Implement_NeverReingestsUntrustedComments(t *testing.T) {
 
 func TestBuild_ImplementFixup_PriorDiff_Rendered(t *testing.T) {
 	// #1163: a within-cap FixupPriorDiff renders the "### The change you are
-	// amending" section with a ```diff fence containing the hunks.
+	// amending" section with a ```diff fence containing the hunks. #1724: the
+	// concern-relevant changed-file focus block renders IN ADDITION to the inline
+	// diff whenever FixupPriorDiffFiles is populated (which the resolver does on
+	// every fix-up dispatch alongside the patch).
 	const hunk = "diff --git a/pkg/bar/foo.go b/pkg/bar/foo.go\n@@ -1,3 +1,4 @@\n+added line\n"
+	const fileList = "- M pkg/bar/foo.go\n"
 	got, err := Build("implement", Trigger{
-		Repo:           "kuhlman-labs/example",
-		IssueNumber:    7,
-		IssueURL:       "https://github.com/kuhlman-labs/example/issues/7",
-		ApprovedPlan:   fixturePlan(),
-		FixupConcerns:  []FixupConcern{{Text: "[high/correctness] fix the nil deref"}},
-		FixupPriorDiff: hunk,
+		Repo:                "kuhlman-labs/example",
+		IssueNumber:         7,
+		IssueURL:            "https://github.com/kuhlman-labs/example/issues/7",
+		ApprovedPlan:        fixturePlan(),
+		FixupConcerns:       []FixupConcern{{Text: "[high/correctness] fix the nil deref"}},
+		FixupPriorDiff:      hunk,
+		FixupPriorDiffFiles: fileList,
 	})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
@@ -260,11 +265,22 @@ func TestBuild_ImplementFixup_PriorDiff_Rendered(t *testing.T) {
 	if !strings.Contains(got, "+added line") {
 		t.Errorf("expected the hunk text inside the fence:\n%s", got)
 	}
+	// #1724: the always-present concern-relevant file focus block accompanies the
+	// inline diff.
+	if !strings.Contains(got, "### Files changed by the change you are amending") {
+		t.Errorf("expected the concern-relevant file focus block alongside the inline diff:\n%s", got)
+	}
+	if !strings.Contains(got, "- M pkg/bar/foo.go") {
+		t.Errorf("expected the changed-file list in the focus block:\n%s", got)
+	}
 }
 
 func TestBuild_ImplementFixup_PriorDiff_OversizeFallsBackToFileList(t *testing.T) {
 	// #1163: a FixupPriorDiff over maxFixupPriorDiffBytes falls back to the
-	// changed-file list and the fenced hunks are ABSENT.
+	// changed-file list and the fenced hunks are ABSENT. #1724: that changed-file
+	// list is now rendered under the always-present concern-relevant focus block
+	// ("### Files changed by the change you are amending"), plus a read-the-files
+	// caveat; the inline-diff heading is absent because no patch is inlined.
 	oversize := "diff --git a/x b/x\n" + strings.Repeat("+padding line\n", maxFixupPriorDiffBytes/13+1)
 	if len(oversize) <= maxFixupPriorDiffBytes {
 		t.Fatalf("test fixture not over the cap: %d <= %d", len(oversize), maxFixupPriorDiffBytes)
@@ -282,8 +298,13 @@ func TestBuild_ImplementFixup_PriorDiff_OversizeFallsBackToFileList(t *testing.T
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if !strings.Contains(got, "### The change you are amending") {
-		t.Errorf("expected the change-under-amendment section:\n%s", got)
+	if !strings.Contains(got, "### Files changed by the change you are amending") {
+		t.Errorf("expected the concern-relevant file focus block:\n%s", got)
+	}
+	// No patch is inlined on the oversize path, so the inline-diff heading and
+	// fence are both absent.
+	if strings.Contains(got, "### The change you are amending") {
+		t.Errorf("oversize patch must NOT render the inline-diff heading:\n%s", got)
 	}
 	if strings.Contains(got, "```diff") {
 		t.Errorf("oversize patch must NOT render a fenced diff block:\n%s", got)
@@ -300,7 +321,8 @@ func TestBuild_ImplementFixup_PriorDiff_OversizeFallsBackToFileList(t *testing.T
 
 func TestBuild_ImplementFixup_PriorDiff_EmptyOmitsSection(t *testing.T) {
 	// #1163: both prior-diff fields empty omits the section entirely — the
-	// pre-#1163 slim fix-up prompt is preserved.
+	// pre-#1163 slim fix-up prompt is preserved. #1724: the concern-relevant focus
+	// block is likewise absent when there is no changed-file list to render.
 	got, err := Build("implement", Trigger{
 		Repo:          "kuhlman-labs/example",
 		IssueNumber:   7,
@@ -313,6 +335,9 @@ func TestBuild_ImplementFixup_PriorDiff_EmptyOmitsSection(t *testing.T) {
 	}
 	if strings.Contains(got, "### The change you are amending") {
 		t.Errorf("empty prior diff must omit the change-under-amendment section:\n%s", got)
+	}
+	if strings.Contains(got, "### Files changed by the change you are amending") {
+		t.Errorf("empty prior diff must omit the concern-relevant file focus block:\n%s", got)
 	}
 	if strings.Contains(got, "```diff") {
 		t.Errorf("empty prior diff must not render a fenced diff block:\n%s", got)
@@ -2375,6 +2400,67 @@ func TestBuild_Implement_Fixup_OmitsFullScaffolding(t *testing.T) {
 	for _, a := range absent {
 		if strings.Contains(got, a) {
 			t.Errorf("slim fix-up prompt should omit %q\n---\n%s", a, got)
+		}
+	}
+}
+
+// TestBuild_Implement_Fixup_TargetedPatch_ContainsConcernsAndFilesNotCorpus is
+// the #1724 done-means test: the slim fix-up prompt for a single-concern pass
+// must carry the three targeted-patch properties TOGETHER — (a) the routed
+// concern text, (b) the concern-relevant changed-file list, (c) the full-
+// implementation corpus ABSENT. It reuses the exact corpus markers
+// TestBuild_Implement_Fixup_OmitsFullScaffolding keys on, so the two stay in
+// lockstep on what "the corpus" means.
+func TestBuild_Implement_Fixup_TargetedPatch_ContainsConcernsAndFilesNotCorpus(t *testing.T) {
+	concern := FixupConcern{Text: "[high/correctness] guard the nil pool in the retry path"}
+	// The changed-file list carries the ONLY file paths in the trigger — the
+	// concern text names none — so asserting these paths appear proves they came
+	// from the concern-relevant focus block, not incidentally from the concern.
+	const fileList = "- M backend/internal/server/prompt.go\n- M backend/internal/prompt/prompt.go\n"
+	got, err := Build("implement", Trigger{
+		Repo:                "kuhlman-labs/fishhawk",
+		IssueNumber:         1724,
+		IssueURL:            "https://github.com/kuhlman-labs/fishhawk/issues/1724",
+		ApprovedPlan:        fixturePlan(),
+		PredictionContext:   &PredictionContext{PredictedMinutes: 18, PredictedConfidence: "medium", StageBudgetMinutes: 50},
+		FixupConcerns:       []FixupConcern{concern},
+		FixupPriorDiff:      "diff --git a/backend/internal/prompt/prompt.go b/backend/internal/prompt/prompt.go\n@@ -1 +1 @@\n+guard\n",
+		FixupPriorDiffFiles: fileList,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	// (a) The routed concern is present under the binding fix-up-concerns section.
+	if !strings.Contains(got, "### Fix-up concerns") {
+		t.Errorf("targeted-patch prompt missing the binding fix-up-concerns section\n---\n%s", got)
+	}
+	if !strings.Contains(got, concern.Text) {
+		t.Errorf("targeted-patch prompt missing the routed concern %q\n---\n%s", concern.Text, got)
+	}
+
+	// (b) The concern-relevant changed-file list is present under the focus block.
+	if !strings.Contains(got, "### Files changed by the change you are amending") {
+		t.Errorf("targeted-patch prompt missing the concern-relevant file focus block\n---\n%s", got)
+	}
+	for _, f := range []string{"backend/internal/server/prompt.go", "backend/internal/prompt/prompt.go"} {
+		if !strings.Contains(got, f) {
+			t.Errorf("targeted-patch prompt missing concern-relevant file %q\n---\n%s", f, got)
+		}
+	}
+
+	// (c) The full-implementation corpus is ABSENT — the exact markers
+	// TestBuild_Implement_Fixup_OmitsFullScaffolding keys on (approved-plan render
+	// heading, budget-context scaffolding, PR-description scaffolding).
+	corpus := []string{
+		"Approved plan (binding instruction)",
+		"### Budget context",
+		"write a pull-request description",
+		PullRequestDescriptionPath,
+	}
+	for _, c := range corpus {
+		if strings.Contains(got, c) {
+			t.Errorf("targeted-patch prompt must omit full-corpus marker %q\n---\n%s", c, got)
 		}
 	}
 }

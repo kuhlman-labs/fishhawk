@@ -378,12 +378,18 @@ type Trigger struct {
 	// any non-fix-up build.
 	FixupPriorDiff string
 	// FixupPriorDiffFiles is the pre-rendered changed-file summary (path + git
-	// status per file) for the slim fix-up prompt's oversize/absent-patch
-	// fallback (#1163), produced by the same renderDiffForReview the implement-
-	// review prompt's Diff uses. Populated alongside FixupPriorDiff from the
-	// stage's newest redacted trace bundle. buildImplementFixup renders it (with
-	// a read-the-files caveat) when FixupPriorDiff is empty or over the cap.
-	// Empty for any non-fix-up build.
+	// status per file) for the slim fix-up prompt (#1163), produced by the same
+	// renderDiffForReview the implement-review prompt's Diff uses. Populated
+	// alongside FixupPriorDiff from the stage's newest redacted trace bundle by
+	// resolveFixupPriorDiff, so it is present on every fix-up dispatch that has a
+	// prior diff to amend — NOT only on the oversize/absent-patch fallback.
+	// writeFixupPriorDiff renders it as an explicit concern-relevant focus block
+	// ("### Files changed by the change you are amending") whenever it is
+	// non-empty (#1724), delivering the issue's "carry only the concern-relevant
+	// files" language WITHOUT narrowing scope.files (#1314 keeps the effective
+	// fix-up scope whole) — rendered IN ADDITION to the inline FixupPriorDiff, or
+	// as the sole file-level detail (with a read-the-files caveat) when
+	// FixupPriorDiff is empty or over the cap. Empty for any non-fix-up build.
 	FixupPriorDiffFiles string
 	// Diff is the rendered changed-files summary for the implement-review
 	// prompt (ADR-027 impl 2/2). Populated by the trace handler from
@@ -1244,20 +1250,42 @@ func writeAcceptanceFixupConcerns(b *strings.Builder, concerns []FixupConcern) {
 // prompt stays cheap; a patch over this cap falls back to the changed-file list.
 const maxFixupPriorDiffBytes = 24 * 1024
 
-// writeFixupPriorDiff renders the "### The change you are amending" section for
-// the slim fix-up prompt (#1163): the prior implement commit's diff so the fresh
-// fix-up agent sees the change it is amending without cold-re-exploring the repo.
-// Modeled on writeFixupConcerns' cap pattern and buildImplementReview's diff
-// switch, but framed as AMENDING (not reviewing) to keep it distinct.
+// writeFixupPriorDiff renders the prior implement commit's change for the slim
+// fix-up prompt (#1163) so the fresh fix-up agent sees what it is amending
+// without cold-re-exploring the repo. Modeled on writeFixupConcerns' cap pattern
+// and buildImplementReview's diff switch, but framed as AMENDING (not reviewing).
 //
-// When FixupPriorDiff is non-empty AND within maxFixupPriorDiffBytes, the hunks
-// are rendered in a ```diff fence (newline-normalized like buildImplementReview).
-// Otherwise, when FixupPriorDiffFiles is non-empty, the changed-file list renders
-// with a read-the-files caveat (the oversize/absent-patch fallback). When neither
-// is available the section is omitted entirely — the pre-#1163 slim prompt. The
-// source is strictly the REDACTED trace bundle (repo code only), so this upholds
-// the never-re-ingest invariant.
+// It renders up to two blocks, in order:
+//
+//  1. Concern-relevant focus list (#1724): whenever FixupPriorDiffFiles is
+//     non-empty — which, because resolveFixupPriorDiff populates it alongside the
+//     patch, is every fix-up dispatch that has a prior diff — an explicit
+//     "### Files changed by the change you are amending" block names exactly the
+//     files the amended change touched. This is a concrete, testable anchor that
+//     reinforces the slim prompt's "read only the files each concern references"
+//     scope instruction and delivers #1724's "carry only the concern-relevant
+//     files" language WITHOUT narrowing scope.files (#1314 keeps the effective
+//     fix-up scope whole).
+//  2. The change detail: when FixupPriorDiff is non-empty AND within
+//     maxFixupPriorDiffBytes, the hunks render in a ```diff fence (newline-
+//     normalized like buildImplementReview). When the patch is empty or over the
+//     cap, the focus list above already names the files, so only a read-the-files
+//     caveat is added.
+//
+// When FixupPriorDiffFiles AND FixupPriorDiff are both empty the section is
+// omitted entirely — the pre-#1163 slim prompt. The source is strictly the
+// REDACTED trace bundle (repo code only), so this upholds the never-re-ingest
+// invariant.
 func writeFixupPriorDiff(b *strings.Builder, t Trigger) {
+	if t.FixupPriorDiffFiles != "" {
+		b.WriteString("### Files changed by the change you are amending\n\n")
+		b.WriteString("The change you already wrote on this branch touched exactly these files. The concerns above are about them — focus your reading and edits on these files rather than re-exploring the repository:\n\n")
+		b.WriteString(t.FixupPriorDiffFiles)
+		if !strings.HasSuffix(t.FixupPriorDiffFiles, "\n") {
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
 	switch {
 	case t.FixupPriorDiff != "" && len(t.FixupPriorDiff) <= maxFixupPriorDiffBytes:
 		b.WriteString("### The change you are amending\n\n")
@@ -1269,13 +1297,9 @@ func writeFixupPriorDiff(b *strings.Builder, t Trigger) {
 		}
 		b.WriteString("```\n\n")
 	case t.FixupPriorDiffFiles != "":
-		b.WriteString("### The change you are amending\n\n")
-		b.WriteString("The change you already wrote on this branch touched the files below (the full diff was too large to inline). Read these files for the line-level detail before resolving the concerns above against them:\n\n")
-		b.WriteString(t.FixupPriorDiffFiles)
-		if !strings.HasSuffix(t.FixupPriorDiffFiles, "\n") {
-			b.WriteString("\n")
-		}
-		b.WriteString("\n")
+		// Patch empty or over maxFixupPriorDiffBytes: the focus list above already
+		// names the files, so add only a caveat directing the agent to read them.
+		b.WriteString("The full diff was too large to inline here. Read the files listed above for the line-level detail before resolving the concerns above against them.\n\n")
 	}
 }
 
@@ -1485,11 +1509,12 @@ func buildImplementFixup(t Trigger) string {
 	b.WriteString("### Scope of this fix-up\n\n")
 	b.WriteString("Resolve ONLY the concerns above. The code already exists on the branch — do NOT re-implement the plan from scratch and do NOT re-explore the whole repository. Read only the files each concern references and make the smallest change that resolves it. If a concern is infeasible, or genuinely needs a file it does not name, surface that in your final response rather than diverging from the concerns.\n\n")
 
-	// The change under amendment (#1163): inline the prior implement commit's
-	// diff (or its changed-file list when oversized) so the agent sees what it
-	// is amending without cold-re-exploring the repo. Sourced from the REDACTED
-	// trace bundle, so it carries no untrusted issue text. Placed after the
-	// scope block and before the issue link: concerns → scope → change → issue.
+	// The change under amendment (#1163, #1724): render an explicit concern-
+	// relevant changed-file focus list (always, when known) plus the inline diff
+	// so the agent sees what it is amending — and which files to focus on —
+	// without cold-re-exploring the repo. Sourced from the REDACTED trace bundle,
+	// so it carries no untrusted issue text. Placed after the scope block and
+	// before the issue link: concerns → scope → change → issue.
 	writeFixupPriorDiff(&b, t)
 
 	// Issue LINK only (never IssueBody / IssueComments) for grounding —

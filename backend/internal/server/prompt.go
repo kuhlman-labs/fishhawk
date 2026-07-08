@@ -2267,6 +2267,14 @@ func (s *Server) resolveFixupApplyPatches(ctx context.Context, runID, stageID uu
 // fix-up prompt so the fresh fix-up agent sees the change it is amending without
 // cold-re-exploring the repo.
 //
+// Both return values are populated together on the success path — the changed-
+// file list (the second value, trigger.FixupPriorDiffFiles) is ALWAYS returned
+// alongside the patch whenever the bundle carries a diff, NOT only when the patch
+// is oversize/absent. writeFixupPriorDiff renders that list as an explicit
+// concern-relevant focus block on every fix-up dispatch (#1724), IN ADDITION to
+// the inline patch, so the slim prompt always carries the concern-relevant files
+// without narrowing scope.files (#1314 keeps the effective fix-up scope whole).
+//
 // The redacted bundle is pre-redacted by the runner and carries only repo-code
 // diff — never IssueBody / IssueComments — so feeding it to the network-and-
 // state-capable implement agent upholds the never-re-ingest invariant (ADR-029).
