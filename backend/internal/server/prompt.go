@@ -516,11 +516,18 @@ func (s *Server) foldScopePaths(ctx context.Context, scopeFiles []scopeFile, pat
 // gate-time remove_scope_files edit — the runner reads cfg.scopeFiles solely
 // from the prompt-response ScopeFiles, so subtracting here makes every runner
 // gate (created-out-of-scope, commit-in-scope, category-B) honor the removal
-// with no runner change. Empty paths is a no-op. A subtraction that would empty
-// a non-empty scope is refused at the plan gate (checkRemoveScopeFiles), so
-// this helper does not re-guard it; if the resulting set is empty it simply
-// returns empty (the runner's git add -A fallback), matching the fold's
-// empty-scope contract.
+// with no runner change. Empty paths is a no-op.
+//
+// A subtraction that would empty a non-empty scope is refused at the plan gate
+// (checkRemoveScopeFiles). This helper reasserts that non-empty invariant as
+// defense-in-depth (#1726): when the gate's presence/would-empty checks were
+// skipped in a fail-open window (effectiveScopePathSet returned ok=false), an
+// operator removal could otherwise empty the scope here and silently re-enable
+// the runner's `git add -A` fallback, disabling enforcement. If the subtraction
+// would drop every entry of a non-empty scope, the removal is refused (the
+// original scope is returned unchanged, WARN-logged) — preserving enforcement
+// is strictly safer than an unguarded empty. In normal operation the gate
+// already prevents this, so the guard never fires.
 func (s *Server) subtractScopePaths(ctx context.Context, scopeFiles []scopeFile, paths []string, source string) []scopeFile {
 	if len(paths) == 0 || len(scopeFiles) == 0 {
 		return scopeFiles
@@ -537,6 +544,19 @@ func (s *Server) subtractScopePaths(ctx context.Context, scopeFiles []scopeFile,
 			continue
 		}
 		out = append(out, f)
+	}
+	// Defense-in-depth: refuse a subtraction that would empty a non-empty
+	// scope (the gate's would-empty check may have been skipped in a fail-open
+	// window). An empty scope disables enforcement; keeping the full scope is
+	// the safer failure mode.
+	if len(out) == 0 {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: refusing scope subtraction that would empty a non-empty scope; retaining full scope",
+			slog.String("source", source),
+			slog.Int("scope_count", len(scopeFiles)),
+			slog.String("paths", strings.Join(removed, ",")),
+		)
+		return scopeFiles
 	}
 	if len(removed) > 0 {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,

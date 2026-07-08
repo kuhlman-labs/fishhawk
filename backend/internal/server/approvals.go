@@ -374,9 +374,17 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		// scope) PRE-Submit, before the cap gate reads the post-removal count.
 		// A refused approval inserts no row, so a corrected retry flows
 		// normally. No-removal approves skip this entirely (empty slice).
-		if !s.checkRemoveScopeFiles(w, r, stage, req.AddScopeFiles, req.RemoveScopeFiles) {
+		trimmedRemove, ok := s.checkRemoveScopeFiles(w, r, stage, req.AddScopeFiles, req.RemoveScopeFiles)
+		if !ok {
 			return
 		}
+		// Thread the trimmed removal paths back into the request so every
+		// downstream consumer (checkPlanScopeCap, writeApprovalAudit, the
+		// prompt-builder subtraction) subtracts the normalized scope path rather
+		// than the raw whitespace-padded input (#1726). Without this a value like
+		// " backend/b.go " passes the trimmed presence/empty checks yet fails to
+		// subtract the actual scope entry backend/b.go downstream.
+		req.RemoveScopeFiles = trimmedRemove
 		// Scope-cap gate (#983): refuse an approve whose effective scope
 		// (plan scope.files ∪ add_scope_files ∖ remove_scope_files) exceeds
 		// the implement stage's max_files_changed, unless the comment carries
@@ -2044,21 +2052,27 @@ func validateRemoveScopeFiles(in []string) ([]string, error) {
 //	          (an empty scope re-enables the runner's `git add -A` fallback,
 //	          disabling enforcement).
 //
-// Returns true (proceed) for an empty removal set — byte-identical to today.
+// Returns (trimmed, true) to proceed — the trimmed slice the caller MUST
+// thread back into the request so every downstream consumer (checkPlanScopeCap,
+// writeApprovalAudit, the prompt-builder subtraction) subtracts the actual
+// normalized path rather than the raw whitespace-padded input. An empty removal
+// set returns (nil, true) — byte-identical to today. On any refusal it returns
+// (nil, false) after writing the response.
+//
 // Read-error posture matches the sibling plan gates: if the effective scope
 // cannot be computed (fail-open ok=false), the semantic presence/empty checks
 // are skipped with a WARN so a transient backend hiccup never bricks the gate;
 // the shape check still applies, and the prompt-builder subtraction is a
 // no-op on a non-present path regardless.
-func (s *Server) checkRemoveScopeFiles(w http.ResponseWriter, r *http.Request, stage *run.Stage, addScopeFiles, removeScopeFiles []string) bool {
+func (s *Server) checkRemoveScopeFiles(w http.ResponseWriter, r *http.Request, stage *run.Stage, addScopeFiles, removeScopeFiles []string) ([]string, bool) {
 	trimmed, err := validateRemoveScopeFiles(removeScopeFiles)
 	if err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			err.Error(), map[string]any{"field": "remove_scope_files"})
-		return false
+		return nil, false
 	}
 	if len(trimmed) == 0 {
-		return true
+		return nil, true
 	}
 
 	before, _, ok := s.effectiveScopePathSet(r.Context(), stage.RunID, addScopeFiles, nil)
@@ -2067,7 +2081,7 @@ func (s *Server) checkRemoveScopeFiles(w http.ResponseWriter, r *http.Request, s
 			"remove-scope gate: effective scope unresolved; skipping presence/empty checks",
 			slog.String("stage_id", stage.ID.String()),
 		)
-		return true
+		return trimmed, true
 	}
 	present := make(map[string]struct{}, len(before))
 	for _, p := range before {
@@ -2082,7 +2096,7 @@ func (s *Server) checkRemoveScopeFiles(w http.ResponseWriter, r *http.Request, s
 					"path":            p,
 					"effective_scope": before,
 				})
-			return false
+			return nil, false
 		}
 		delete(present, p)
 	}
@@ -2097,9 +2111,9 @@ func (s *Server) checkRemoveScopeFiles(w http.ResponseWriter, r *http.Request, s
 				"field":              "remove_scope_files",
 				"remove_scope_files": trimmed,
 			})
-		return false
+		return nil, false
 	}
-	return true
+	return trimmed, true
 }
 
 // checkPlanScopeCap enforces the scope-cap gate on plan-stage approvals

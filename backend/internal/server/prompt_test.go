@@ -5545,6 +5545,30 @@ func TestGetStagePrompt_Implement_AddScopeFilesFoldedIntoScope(t *testing.T) {
 	})
 }
 
+// TestSubtractScopePaths_RefusesEmptyingNonEmptyScope pins the #1726
+// defense-in-depth guard: when a removal would drop every entry of a non-empty
+// scope (the plan gate's would-empty check having been skipped in a fail-open
+// window), subtractScopePaths retains the FULL scope rather than returning an
+// empty set — an empty scope re-enables the runner's `git add -A` fallback and
+// disables enforcement.
+func TestSubtractScopePaths_RefusesEmptyingNonEmptyScope(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	in := []scopeFile{
+		{Path: "backend/a.go", Operation: "modify"},
+		{Path: "backend/b.go", Operation: "modify"},
+	}
+	got := s.subtractScopePaths(context.Background(), in, []string{"backend/a.go", "backend/b.go"}, "test")
+	if len(got) != 2 {
+		t.Fatalf("subtractScopePaths emptied a non-empty scope: got %#v, want the full scope retained", got)
+	}
+
+	// A partial subtraction that leaves at least one entry still applies.
+	got = s.subtractScopePaths(context.Background(), in, []string{"backend/a.go"}, "test")
+	if len(got) != 1 || got[0].Path != "backend/b.go" {
+		t.Fatalf("partial subtraction = %#v, want [backend/b.go]", got)
+	}
+}
+
 // TestGetStagePrompt_Implement_RemoveScopeFilesSubtractedFromScope crosses the
 // full #1726 subtraction seam: persisted approval_submitted.remove_scope_files
 // -> resolveApprovalRemoveScopeFiles -> subtractScopePaths ->

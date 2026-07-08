@@ -1251,7 +1251,7 @@ func TestCheckRemoveScopeFiles_PathNotInScopeRejected(t *testing.T) {
 	})
 	planStage.RunID = runRow.ID
 	w, r := removeScopeGateReq()
-	if ok := s.checkRemoveScopeFiles(w, r, planStage, nil, []string{"backend/zzz.go"}); ok {
+	if _, ok := s.checkRemoveScopeFiles(w, r, planStage, nil, []string{"backend/zzz.go"}); ok {
 		t.Fatal("checkRemoveScopeFiles = true for a path not in scope, want false")
 	}
 	if w.Code != http.StatusBadRequest {
@@ -1272,7 +1272,7 @@ func TestCheckRemoveScopeFiles_WouldEmptyScopeRejected(t *testing.T) {
 	})
 	planStage.RunID = runRow.ID
 	w, r := removeScopeGateReq()
-	if ok := s.checkRemoveScopeFiles(w, r, planStage, nil, []string{"backend/a.go"}); ok {
+	if _, ok := s.checkRemoveScopeFiles(w, r, planStage, nil, []string{"backend/a.go"}); ok {
 		t.Fatal("checkRemoveScopeFiles = true for a scope-emptying removal, want false")
 	}
 	if w.Code != http.StatusBadRequest {
@@ -1292,8 +1292,34 @@ func TestCheckRemoveScopeFiles_ValidRemovalProceeds(t *testing.T) {
 	})
 	planStage.RunID = runRow.ID
 	w, r := removeScopeGateReq()
-	if ok := s.checkRemoveScopeFiles(w, r, planStage, nil, []string{"backend/b.go"}); !ok {
+	trimmed, ok := s.checkRemoveScopeFiles(w, r, planStage, nil, []string{"backend/b.go"})
+	if !ok {
 		t.Fatalf("checkRemoveScopeFiles = false for a valid removal, want true:\n%s", w.Body.String())
+	}
+	if len(trimmed) != 1 || trimmed[0] != "backend/b.go" {
+		t.Fatalf("checkRemoveScopeFiles returned %v, want [backend/b.go]", trimmed)
+	}
+}
+
+// TestCheckRemoveScopeFiles_TrimmedPathThreadedBack pins the #1726 accepted
+// trimmed-input edge: a whitespace-padded removal path passes the presence /
+// would-empty checks against its trimmed form AND the returned slice carries
+// the trimmed path, so every downstream consumer (checkPlanScopeCap,
+// writeApprovalAudit, the prompt-builder subtraction) subtracts the real scope
+// path rather than the padded input.
+func TestCheckRemoveScopeFiles_TrimmedPathThreadedBack(t *testing.T) {
+	s, _, _, runRow, planStage := newHeadroomServer(t, specImplementPathConstraints, []plan.ScopeFile{
+		{Path: "backend/a.go", Operation: plan.FileOpModify},
+		{Path: "backend/b.go", Operation: plan.FileOpModify},
+	})
+	planStage.RunID = runRow.ID
+	w, r := removeScopeGateReq()
+	trimmed, ok := s.checkRemoveScopeFiles(w, r, planStage, nil, []string{"  backend/b.go  "})
+	if !ok {
+		t.Fatalf("checkRemoveScopeFiles = false for a padded valid removal, want true:\n%s", w.Body.String())
+	}
+	if len(trimmed) != 1 || trimmed[0] != "backend/b.go" {
+		t.Fatalf("checkRemoveScopeFiles returned %v, want [backend/b.go] (trimmed)", trimmed)
 	}
 }
 
