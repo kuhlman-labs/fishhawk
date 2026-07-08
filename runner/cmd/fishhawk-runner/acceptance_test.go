@@ -412,6 +412,36 @@ func TestValidateAcceptanceVerdict_Coercions(t *testing.T) {
 	})
 }
 
+// TestAcceptanceVerdictSchema_NoDialectOrVendorKeys pins the strict-CLI
+// compatibility of the hand-authored verdict schema (#1741 acceptance-side
+// sibling): claude CLI 2.1.205's strict --json-schema validator resolves a
+// "$schema" dialect URI (and hard-rejects unknown x-* keywords), so neither
+// may appear anywhere in the constant. The plan path gets this from its
+// derivation strip; this constant must hold the invariant by hand.
+func TestAcceptanceVerdictSchema_NoDialectOrVendorKeys(t *testing.T) {
+	var tree any
+	if err := json.Unmarshal([]byte(acceptanceVerdictJSONSchema), &tree); err != nil {
+		t.Fatalf("acceptanceVerdictJSONSchema does not parse: %v", err)
+	}
+	var walk func(node any)
+	walk = func(node any) {
+		switch n := node.(type) {
+		case map[string]any:
+			for k, v := range n {
+				if k == "$schema" || k == "$id" || strings.HasPrefix(k, "x-") {
+					t.Errorf("verdict schema contains strict-CLI-rejected key %q (claude 2.1.205 --json-schema, #1741)", k)
+				}
+				walk(v)
+			}
+		case []any:
+			for _, v := range n {
+				walk(v)
+			}
+		}
+	}
+	walk(tree)
+}
+
 // TestAcceptanceVerdictSchema_LockstepWithValidator guards the
 // three-way shape lockstep (JSON schema ↔ runner validator ↔ backend
 // acceptanceBody): the schema must parse, its enums/required must match

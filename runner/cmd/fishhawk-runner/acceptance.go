@@ -57,8 +57,16 @@ var acceptanceVerdictPath = "/tmp/fishhawk-acceptance.json"
 // TestAcceptanceVerdictSchema_LockstepWithValidator: a verdict this
 // schema admits must pass validateAcceptanceVerdict, whose rules mirror
 // the backend validator.
+//
+// Deliberately carries NO "$schema" dialect declaration: claude CLI
+// 2.1.205's strict --json-schema validator tries to RESOLVE the dialect
+// URI and fails ("no schema with key or ref ..."), killing the stage
+// pre-spawn — the acceptance-side sibling of the #1741/#1742 plan-stage
+// outage. The plan path strips $schema in its derivation
+// (structuredOutputDroppedKeywords); this hand-authored constant must
+// stay dialect-free for the same reason, pinned by
+// TestAcceptanceVerdictSchema_NoDialectOrVendorKeys.
 const acceptanceVerdictJSONSchema = `{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
   "required": ["verdict"],
