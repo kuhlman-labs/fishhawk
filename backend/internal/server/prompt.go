@@ -701,19 +701,27 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		scopeFiles = scopeFilesFromPlan(approvedPlan)
-		// Decomposition fan-out (#676, fail-loud #1721): when the loaded plan
-		// declares a decomposition, a decomposed child narrows its scope to its
-		// own sub-plan slice, linked by the persisted SliceIndex. A child whose
-		// slice scope cannot be resolved (unmatched/out-of-range index, or a
-		// matched slice with empty scope) now FAILS CLOSED (409
-		// decomposed_scope_unresolved) rather than silently inheriting the
-		// parent's full scope — the #1669 regression that reopened when
-		// campaign-minted parents fanned out children with a nil IssueContext.
-		// The guard requires a decomposition to be present: a missing plan
-		// (already routed through emitPlanMissingForImplement) or a decomposed
-		// child whose loaded plan carries no slices has nothing to narrow to and
-		// keeps the plan's top-level scope. Non-decomposed runs are untouched.
-		if runRow.DecomposedFrom != nil && approvedPlan != nil && approvedPlan.Decomposition != nil {
+		// Decomposition fan-out (#676, fail-loud #1721): a genuine fan-out slice
+		// child carries BOTH DecomposedFrom and a persisted SliceIndex (the
+		// orchestrator stamps the index on every fan-out child). Such a child
+		// narrows its scope to its own sub-plan slice, linked by that index. A
+		// child whose slice scope cannot be resolved — no linked sub-plan
+		// (INCLUDING a loaded plan whose Decomposition is nil, via
+		// matchDecomposedSubPlan's nil-plan degrade), an unmatched/out-of-range
+		// index, or a matched slice with empty scope — now FAILS CLOSED (409
+		// decomposed_scope_unresolved) rather than silently inheriting the parent's
+		// full scope — the #1669 regression that reopened when campaign-minted
+		// parents fanned out children with a nil IssueContext. The guard
+		// deliberately does NOT require approvedPlan.Decomposition to be non-nil: a
+		// slice child whose loaded plan carries no decomposition has nothing
+		// legitimate to narrow to, so it must fail closed rather than fall back to
+		// top-level scope (the silent full-scope fallback the approval condition
+		// required gone). It DOES require a persisted SliceIndex: a decomposed run
+		// with no SliceIndex is not a fan-out slice child (matchDecomposedSubPlan
+		// treats a nil index as unlinked), so it keeps the plan's top-level scope
+		// rather than failing closed. A missing plan is handled above
+		// (emitPlanMissingForImplement). Non-decomposed runs are untouched.
+		if runRow.DecomposedFrom != nil && runRow.SliceIndex != nil && approvedPlan != nil {
 			childScope, childConstraint, scopeErr := s.requireDecomposedScope(r.Context(), runRow, approvedPlan)
 			if scopeErr != nil {
 				s.writeDecomposedScopeUnresolved(w, r, scopeErr)
@@ -1047,19 +1055,27 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			}
 		}
 		scopeFiles = scopeFilesFromPlan(approvedPlan)
-		// Decomposition fan-out (#676, fail-loud #1721): when the loaded plan
-		// declares a decomposition, a decomposed child narrows its scope to its
-		// own sub-plan slice, linked by the persisted SliceIndex. A child whose
-		// slice scope cannot be resolved (unmatched/out-of-range index, or a
-		// matched slice with empty scope) now FAILS CLOSED (409
-		// decomposed_scope_unresolved) rather than silently inheriting the
-		// parent's full scope — the #1669 regression that reopened when
-		// campaign-minted parents fanned out children with a nil IssueContext.
-		// The guard requires a decomposition to be present: a missing plan
-		// (already routed through emitPlanMissingForImplement) or a decomposed
-		// child whose loaded plan carries no slices has nothing to narrow to and
-		// keeps the plan's top-level scope. Non-decomposed runs are untouched.
-		if runRow.DecomposedFrom != nil && approvedPlan != nil && approvedPlan.Decomposition != nil {
+		// Decomposition fan-out (#676, fail-loud #1721): a genuine fan-out slice
+		// child carries BOTH DecomposedFrom and a persisted SliceIndex (the
+		// orchestrator stamps the index on every fan-out child). Such a child
+		// narrows its scope to its own sub-plan slice, linked by that index. A
+		// child whose slice scope cannot be resolved — no linked sub-plan
+		// (INCLUDING a loaded plan whose Decomposition is nil, via
+		// matchDecomposedSubPlan's nil-plan degrade), an unmatched/out-of-range
+		// index, or a matched slice with empty scope — now FAILS CLOSED (409
+		// decomposed_scope_unresolved) rather than silently inheriting the parent's
+		// full scope — the #1669 regression that reopened when campaign-minted
+		// parents fanned out children with a nil IssueContext. The guard
+		// deliberately does NOT require approvedPlan.Decomposition to be non-nil: a
+		// slice child whose loaded plan carries no decomposition has nothing
+		// legitimate to narrow to, so it must fail closed rather than fall back to
+		// top-level scope (the silent full-scope fallback the approval condition
+		// required gone). It DOES require a persisted SliceIndex: a decomposed run
+		// with no SliceIndex is not a fan-out slice child (matchDecomposedSubPlan
+		// treats a nil index as unlinked), so it keeps the plan's top-level scope
+		// rather than failing closed. A missing plan is handled above
+		// (emitPlanMissingForImplement). Non-decomposed runs are untouched.
+		if runRow.DecomposedFrom != nil && runRow.SliceIndex != nil && approvedPlan != nil {
 			childScope, childConstraint, scopeErr := s.requireDecomposedScope(r.Context(), runRow, approvedPlan)
 			if scopeErr != nil {
 				s.writeDecomposedScopeUnresolved(w, r, scopeErr)
