@@ -313,6 +313,25 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Approval-gate predicate resolution (E39.5 / #1710): when the stage's
+	// gate carries an approvals block that sets min_permission and/or
+	// member_of, and the submitter is a real human (not a delegated / agent
+	// submission), resolve the predicate against the forge PRE-Submit. An
+	// insufficient permission or non-membership rejects the approver (403,
+	// no row inserted); an unresolvable forge (error / rate-limit / empty
+	// repo) fails the gate closed with a retryable 503. On success the
+	// resolved values thread into the approval_submitted row's
+	// predicate_snapshot. Reject / legacy-gate / count-only paths skip this
+	// entirely (predicateRes stays nil), byte-identical to today.
+	var predicateRes *predicateResolution
+	if decision == approval.DecisionApprove {
+		res, ok := s.checkApprovalPredicates(w, r, stage, subject, req.Delegated)
+		if !ok {
+			return
+		}
+		predicateRes = res
+	}
+
 	// ADR-036 (#875): refuse a plan-stage approve while a configured
 	// agent plan review is still in-flight. Placed BEFORE
 	// ApprovalRepo.Submit (not in the res.Inserted block) so a refused
@@ -457,6 +476,7 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		ResolvedModel:       resolvedModel,
 		PlanModel:           req.PlanModel,
 		ReviewModel:         req.ReviewModel,
+		PredicateResolution: predicateRes,
 	})
 	if err != nil {
 		var aerr *approveActionError
@@ -562,6 +582,13 @@ type approveActionParams struct {
 	ResolvedModel       *ResolvedModel
 	PlanModel           string
 	ReviewModel         string
+	// PredicateResolution, when non-nil, carries the forge-resolved
+	// min_permission / member_of values a satisfied approval-gate predicate
+	// resolution produced (E39.5 / #1710). The HTTP handler stashes it from
+	// checkApprovalPredicates; the in-process campaign auto-driver leaves it
+	// nil (its snapshot records only the required values). Threaded into the
+	// quorum-path predicate_snapshot's resolved fields.
+	PredicateResolution *predicateResolution
 }
 
 // approveActionResult is approveStageAs's success outcome: either the
@@ -684,6 +711,15 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		MemberOf:       approvals.MemberOf,
 		QuorumReached:  reached,
 	}
+	// Record the forge-resolved predicate outcome on the counted-approver
+	// row when the handler resolved it (E39.5 / #1710). The campaign
+	// auto-driver / agent path leaves PredicateResolution nil, so its
+	// snapshot records only the required values — byte-identical to today.
+	if p.PredicateResolution != nil {
+		snapshot.ResolvedPermission = p.PredicateResolution.ResolvedPermission
+		snapshot.MemberResolved = p.PredicateResolution.MemberResolved
+		snapshot.PredicateResult = "satisfied"
+	}
 	// Persist the enriched approval audit BEFORE any advance (#1351) so a
 	// dispatch racing the transition observes it. Best-effort append.
 	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.BindingAssertions, p.DelegatedRule, id.AuthMethod, channel, snapshot)
@@ -759,6 +795,127 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 	s.notifyStatusUpdate(ctx, advanced.RunID, "approval_submit")
 
 	return &approveActionResult{Stage: advanced}, nil
+}
+
+// checkApprovalPredicates resolves the stage gate's forge predicates
+// (min_permission / member_of) against the submitter PRE-Submit (E39.5 /
+// #1710). It returns (resolution, true) to continue to Submit — the
+// resolution is non-nil and carries the resolved values ONLY when a
+// predicate was actually evaluated and satisfied; it is nil when the gate is
+// not predicate-guarded (no approvals block, no predicate fields) or the
+// submission is a delegated / agent one that is recorded-but-never-counted
+// and so not forge-gated. It returns (nil, false) after writing the response
+// on a rejection (403 approver_predicate_unmet) or an unresolvable forge
+// (503 forge_unavailable) — in both cases no approval row is inserted, so a
+// corrected retry (or a retry once the forge is reachable) flows normally.
+//
+// Fail-open on the gate READ: a nil approvals block or a spec-read error
+// falls through to today's path (matching checkApproverAuthorization's
+// best-effort posture), NOT on the forge RESOLUTION, which fails closed.
+func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request, stage *run.Stage, subject string, delegated bool) (*predicateResolution, bool) {
+	approvals, err := s.fetchApprovalsForStage(r.Context(), stage)
+	if err != nil || approvals == nil {
+		return nil, true
+	}
+	// Only the two forge predicates gate here. A count-only approvals block
+	// keeps the pure-quorum path.
+	if approvals.MinPermission == "" && approvals.MemberOf == "" {
+		return nil, true
+	}
+	// A delegated / agent-kind submission is recorded but never counted
+	// toward the human quorum, so it is not forge-gated either.
+	if delegated || actorKindForSubject(subject) == audit.ActorAgent {
+		return nil, true
+	}
+
+	// Resolve the run's target repo ("owner/name"). A read failure or an
+	// empty repo leaves resolvePredicates to fail closed (unavailable)
+	// rather than wave the approver through.
+	var repo string
+	if runRow, rerr := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID); rerr == nil {
+		repo = runRow.Repo
+	}
+
+	outcome, resolution, predicate := s.resolvePredicates(r.Context(), repo, subject, approvals)
+	switch outcome {
+	case predicateSatisfied:
+		return resolution, true
+	case predicateRejected:
+		// Durably record the rejection in a predicate_snapshot audit entry
+		// even though no approval row is inserted.
+		s.writePredicateRejectionAudit(r.Context(), stage, subject, approvals, resolution)
+		s.writeError(w, r, http.StatusForbidden, "approver_predicate_unmet",
+			"the approver does not meet the gate's forge predicate (permission tier or membership)",
+			map[string]any{
+				"stage_id":            stage.ID.String(),
+				"subject":             subject,
+				"required_permission": approvals.MinPermission,
+				"resolved_permission": resolution.ResolvedPermission,
+				"member_of":           approvals.MemberOf,
+				"member_resolved":     resolution.MemberResolved,
+				"result":              "rejected",
+			})
+		return nil, false
+	default: // predicateUnavailable
+		s.writeError(w, r, http.StatusServiceUnavailable, "forge_unavailable",
+			"the forge permission/membership API was unavailable; the approval gate failed closed",
+			map[string]any{
+				"stage_id":  stage.ID.String(),
+				"retryable": true,
+				"predicate": predicate,
+				"ref":       approvals.MemberOf,
+				"next_actions": []string{
+					"Retry the approval once the forge is reachable; the forge permission/membership API was unavailable",
+				},
+			})
+		return nil, false
+	}
+}
+
+// writePredicateRejectionAudit appends a best-effort audit entry recording a
+// rejected forge-predicate evaluation (E39.5 / #1710) so the rejection is
+// durably captured in a predicate_snapshot even though no approval row is
+// inserted. The category "approval_predicate_rejected" is a new string value
+// (no closed-set category validator exists in package server) and posts no
+// issue comment. Best-effort: a failure logs but never unwinds the 403.
+func (s *Server) writePredicateRejectionAudit(ctx context.Context, stage *run.Stage, subject string, approvals *spec.Approvals, resolution *predicateResolution) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	snapshot := map[string]any{
+		"result": "rejected",
+	}
+	if approvals.MinPermission != "" {
+		snapshot["min_permission"] = approvals.MinPermission
+		snapshot["resolved_permission"] = resolution.ResolvedPermission
+	}
+	if approvals.MemberOf != "" {
+		snapshot["member_of"] = approvals.MemberOf
+		snapshot["member_resolved"] = resolution.MemberResolved
+	}
+	actorKind := actorKindForSubject(subject)
+	subj := subject
+	payload, _ := json.Marshal(map[string]any{
+		"stage_id":           stage.ID.String(),
+		"subject":            subject,
+		"predicate_snapshot": snapshot,
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        stage.RunID,
+		StageID:      &stage.ID,
+		Timestamp:    time.Now().UTC(),
+		Category:     "approval_predicate_rejected",
+		ActorKind:    &actorKind,
+		ActorSubject: &subj,
+		Payload:      payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"approval: predicate rejection audit append failed",
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("subject", subject),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 // campaignOperatorIdentity builds the in-process Identity the campaign

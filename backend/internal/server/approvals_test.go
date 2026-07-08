@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
@@ -414,16 +415,32 @@ func (a *approvalAuditFake) ListForRunByCategory(context.Context, uuid.UUID, str
 // returning each so tests can assert on captured state.
 func newApprovalServer(t *testing.T) (*Server, *fakeApprovalRepo, *approvalRunRepo, *approvalAuditFake) {
 	t.Helper()
+	// Default to a SATISFYING identity provider (admin + member) so quorum
+	// gates that declare min_permission/member_of resolve as satisfied and
+	// the quorum-counting behavior stays under test. The predicate
+	// rejection / unavailability paths (E39.5 / #1710) wire their own fake
+	// via newApprovalServerWithIdentity.
+	s, ar, rr, au, _ := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{perm: identity.PermissionAdmin, member: true})
+	return s, ar, rr, au
+}
+
+// newApprovalServerWithIdentity is newApprovalServer parameterized by the
+// identity provider, returning it too so predicate tests can set
+// perm/member/errors and assert call counts.
+func newApprovalServerWithIdentity(t *testing.T, idp *fakeIdentityProvider) (*Server, *fakeApprovalRepo, *approvalRunRepo, *approvalAuditFake, *fakeIdentityProvider) {
+	t.Helper()
 	ar := newFakeApprovalRepo()
 	rr := newApprovalRunRepo()
 	au := newApprovalAuditFake()
 	s := New(Config{
-		Addr:         "127.0.0.1:0",
-		ApprovalRepo: ar,
-		RunRepo:      rr,
-		AuditRepo:    au,
+		Addr:             "127.0.0.1:0",
+		ApprovalRepo:     ar,
+		RunRepo:          rr,
+		AuditRepo:        au,
+		IdentityProvider: idp,
 	})
-	return s, ar, rr, au
+	return s, ar, rr, au, idp
 }
 
 func submitApproval(t *testing.T, s *Server, stageID uuid.UUID, body string) *httptest.ResponseRecorder {
@@ -5027,6 +5044,7 @@ func seedQuorumStage(rr *approvalRunRepo, au *approvalAuditFake, count int, auth
 	rr.mu.Unlock()
 	rr.seedRun(&run.Run{
 		ID:           stage.RunID,
+		Repo:         "acme/repo",
 		WorkflowID:   "feature_change",
 		WorkflowSpec: quorumApprovalsSpec(count),
 	})
@@ -5279,5 +5297,372 @@ func TestSubmitApproval_BackCompat_NoApprovalsBlock(t *testing.T) {
 		if _, ok := payload[k]; !ok {
 			t.Errorf("legacy payload dropped pre-existing field %q: %v", k, payload)
 		}
+	}
+}
+
+// -------- E39.5 (#1710) approval-gate predicate tests --------
+
+// quorumPredicateSpec builds a version 1.0 acceptance-stage approvals block
+// with the given distinct-approver count and OPTIONAL min_permission /
+// member_of predicates (each emitted only when non-empty), isolating one
+// forge predicate per test.
+func quorumPredicateSpec(count int, minPerm, memberOf string) []byte {
+	var b strings.Builder
+	fmt.Fprintf(&b, `version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: gate
+        type: acceptance
+        executor:
+          human: true
+        gates:
+          - type: approval
+            approvals:
+              count: %d
+              not: [author, agent]
+`, count)
+	if minPerm != "" {
+		fmt.Fprintf(&b, "              min_permission: %s\n", minPerm)
+	}
+	if memberOf != "" {
+		fmt.Fprintf(&b, "              member_of: %s\n", memberOf)
+	}
+	return []byte(b.String())
+}
+
+// seedPredicateStage seeds an acceptance stage awaiting approval on a run
+// carrying quorumPredicateSpec(count, minPerm, memberOf), a non-empty Repo,
+// and (when author != "") a user-kind change-author audit entry.
+func seedPredicateStage(rr *approvalRunRepo, au *approvalAuditFake, count int, minPerm, memberOf, author string) *run.Stage {
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	rr.mu.Lock()
+	stage.Type = run.StageTypeAcceptance
+	rr.mu.Unlock()
+	rr.seedRun(&run.Run{
+		ID:           stage.RunID,
+		Repo:         "acme/repo",
+		WorkflowID:   "feature_change",
+		WorkflowSpec: quorumPredicateSpec(count, minPerm, memberOf),
+	})
+	if author != "" {
+		k := audit.ActorUser
+		s := author
+		au.seedRunEntries(stage.RunID, &audit.Entry{ActorKind: &k, ActorSubject: &s})
+	}
+	return stage
+}
+
+// predicateRejectionSnapshot returns the predicate_snapshot object of the
+// approval_predicate_rejected audit entry for subject, failing if none exists.
+func predicateRejectionSnapshot(t *testing.T, au *approvalAuditFake, subject string) map[string]any {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, e := range au.appended {
+		if e.Category != "approval_predicate_rejected" || e.ActorSubject == nil || *e.ActorSubject != subject {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal rejection payload: %v", err)
+		}
+		snap, _ := payload["predicate_snapshot"].(map[string]any)
+		return snap
+	}
+	t.Fatalf("no approval_predicate_rejected entry for %q in %+v", subject, au.appended)
+	return nil
+}
+
+// TestSubmitApproval_Predicate_MinPermissionRejected pins mode (1): a
+// min_permission:maintain gate + a submitter resolving to write is refused
+// 403 approver_predicate_unmet, the gate is NOT advanced, and a rejection
+// predicate_snapshot records resolved=write / required=maintain /
+// result=rejected. No approval row is inserted.
+func TestSubmitApproval_Predicate_MinPermissionRejected(t *testing.T) {
+	s, ar, rr, au, _ := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{perm: identity.PermissionWrite})
+	stage := seedPredicateStage(rr, au, 1, "maintain", "", "github:author")
+
+	w := submitApprovalAs(t, s, stage.ID, "github:r1", `{"decision":"approve"}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "approver_predicate_unmet") {
+		t.Errorf("body missing approver_predicate_unmet: %s", w.Body.String())
+	}
+	rows, _ := ar.ListForStage(context.Background(), stage.ID)
+	if len(rows) != 0 {
+		t.Errorf("rejected approve inserted %d rows, want 0", len(rows))
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (no advance)", got)
+	}
+	snap := predicateRejectionSnapshot(t, au, "github:r1")
+	if snap["result"] != "rejected" || snap["min_permission"] != "maintain" || snap["resolved_permission"] != "write" {
+		t.Errorf("rejection snapshot = %v, want result=rejected min=maintain resolved=write", snap)
+	}
+}
+
+// TestSubmitApproval_Predicate_MemberOfRejected pins mode (2): a
+// member_of:acme/reviewers gate + a non-member submitter is refused 403, and
+// the rejection snapshot records the ref + result.
+func TestSubmitApproval_Predicate_MemberOfRejected(t *testing.T) {
+	s, ar, rr, au, _ := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{member: false})
+	stage := seedPredicateStage(rr, au, 1, "", "acme/reviewers", "github:author")
+
+	w := submitApprovalAs(t, s, stage.ID, "github:r1", `{"decision":"approve"}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "approver_predicate_unmet") {
+		t.Errorf("body missing approver_predicate_unmet: %s", w.Body.String())
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("rejected approve inserted %d rows, want 0", len(ar.all))
+	}
+	snap := predicateRejectionSnapshot(t, au, "github:r1")
+	if snap["result"] != "rejected" || snap["member_of"] != "acme/reviewers" || snap["member_resolved"] != false {
+		t.Errorf("rejection snapshot = %v, want result=rejected member_of=acme/reviewers member_resolved=false", snap)
+	}
+}
+
+// TestSubmitApproval_Predicate_PermissionUnavailable pins mode (3): a
+// PermissionLevel forge error fails the gate closed with a retryable 503
+// forge_unavailable (next_actions non-empty), inserts no approval row, and
+// does not transition the gate.
+func TestSubmitApproval_Predicate_PermissionUnavailable(t *testing.T) {
+	s, ar, rr, au, _ := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{permErr: identity.ErrRateLimited})
+	stage := seedPredicateStage(rr, au, 1, "write", "", "github:author")
+
+	w := submitApprovalAs(t, s, stage.ID, "github:r1", `{"decision":"approve"}`)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal error body: %v\n%s", err, w.Body.String())
+	}
+	if body.Error.Code != "forge_unavailable" {
+		t.Errorf("code = %q, want forge_unavailable", body.Error.Code)
+	}
+	if body.Error.Details["retryable"] != true {
+		t.Errorf("details.retryable = %v, want true", body.Error.Details["retryable"])
+	}
+	if na, _ := body.Error.Details["next_actions"].([]any); len(na) == 0 {
+		t.Errorf("details.next_actions is empty: %v", body.Error.Details)
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("unavailable approve inserted %d rows, want 0", len(ar.all))
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (no advance)", got)
+	}
+}
+
+// TestSubmitApproval_Predicate_MembershipUnavailable pins mode (4): a
+// ResolveMembership forge error drives the same 503 unavailability path.
+func TestSubmitApproval_Predicate_MembershipUnavailable(t *testing.T) {
+	s, ar, rr, au, _ := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{perm: identity.PermissionAdmin, memberErr: errors.New("timeout")})
+	stage := seedPredicateStage(rr, au, 1, "write", "acme/reviewers", "github:author")
+
+	w := submitApprovalAs(t, s, stage.ID, "github:r1", `{"decision":"approve"}`)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal error body: %v\n%s", err, w.Body.String())
+	}
+	if body.Error.Code != "forge_unavailable" {
+		t.Errorf("code = %q, want forge_unavailable", body.Error.Code)
+	}
+	// The membership predicate is the one that failed (permission satisfied).
+	if body.Error.Details["predicate"] != "member_of" {
+		t.Errorf("details.predicate = %v, want member_of", body.Error.Details["predicate"])
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("unavailable approve inserted %d rows, want 0", len(ar.all))
+	}
+}
+
+// TestSubmitApproval_Predicate_SatisfiedRecordsSnapshot pins mode (5): a
+// satisfied predicate (perm=admin + member=true) lets the approve proceed;
+// the approval_submitted predicate_snapshot records resolved_permission=admin,
+// member_resolved=true, predicate_result=satisfied, and the gate advances at
+// the distinct count.
+func TestSubmitApproval_Predicate_SatisfiedRecordsSnapshot(t *testing.T) {
+	s, _, rr, au, _ := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{perm: identity.PermissionAdmin, member: true})
+	stage := seedPredicateStage(rr, au, 1, "write", "acme/reviewers", "github:author")
+
+	w := submitApprovalAs(t, s, stage.ID, "github:r1", `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want succeeded (count=1 quorum reached)", got)
+	}
+	payload := approvalPayloadFor(t, au, "github:r1")
+	snap, _ := payload["predicate_snapshot"].(map[string]any)
+	if snap["resolved_permission"] != "admin" {
+		t.Errorf("resolved_permission = %v, want admin", snap["resolved_permission"])
+	}
+	if snap["member_resolved"] != true {
+		t.Errorf("member_resolved = %v, want true", snap["member_resolved"])
+	}
+	if snap["predicate_result"] != "satisfied" {
+		t.Errorf("predicate_result = %v, want satisfied", snap["predicate_result"])
+	}
+}
+
+// TestSubmitApproval_Predicate_NoCacheAcrossEvents pins mode (6): two
+// approval events each make their own forge calls — the fake's per-method
+// counters increment exactly once per event (proving no result is cached or
+// reused between requests).
+func TestSubmitApproval_Predicate_NoCacheAcrossEvents(t *testing.T) {
+	s, _, rr, au, idp := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{perm: identity.PermissionAdmin, member: true})
+	stage := seedPredicateStage(rr, au, 2, "write", "acme/reviewers", "github:author")
+
+	for i, subject := range []string{"github:r1", "github:r2"} {
+		w := submitApprovalAs(t, s, stage.ID, subject, `{"decision":"approve"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200:\n%s", subject, w.Code, w.Body.String())
+		}
+		wantCalls := i + 1
+		if idp.permCalls != wantCalls || idp.memberCalls != wantCalls {
+			t.Errorf("after %s: perm %d / member %d, want %d/%d",
+				subject, idp.permCalls, idp.memberCalls, wantCalls, wantCalls)
+		}
+	}
+}
+
+// TestSubmitApproval_Predicate_AgentSubmitterSkipped pins mode (7): an
+// agent-kind submitter against a predicate gate SKIPS forge resolution
+// (permCalls==0) — recorded-but-never-counted as today, no 403.
+func TestSubmitApproval_Predicate_AgentSubmitterSkipped(t *testing.T) {
+	s, _, rr, au, idp := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{perm: identity.PermissionNone, member: false})
+	stage := seedPredicateStage(rr, au, 2, "write", "acme/reviewers", "github:author")
+
+	agent := operatorrole.CampaignActorSubject
+	w := submitApprovalAs(t, s, stage.ID, agent, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("agent status = %d, want 200 (recorded, not forge-gated):\n%s", w.Code, w.Body.String())
+	}
+	if idp.permCalls != 0 || idp.memberCalls != 0 {
+		t.Errorf("agent submission called forge (perm %d / member %d), want 0/0", idp.permCalls, idp.memberCalls)
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (agent not counted)", got)
+	}
+}
+
+// TestSubmitApproval_Predicate_BackCompatNoBlock pins mode (8): a gate with
+// no approvals block (legacy) makes ZERO IdentityProvider calls and keeps
+// first-vote-advances.
+func TestSubmitApproval_Predicate_BackCompatNoBlock(t *testing.T) {
+	s, _, rr, au, idp := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{perm: identity.PermissionNone, member: false})
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	rr.mu.Lock()
+	stage.Type = run.StageTypeImplement
+	rr.mu.Unlock()
+	rr.seedRun(&run.Run{
+		ID:           stage.RunID,
+		Repo:         "acme/repo",
+		WorkflowID:   "feature_change",
+		WorkflowSpec: []byte(approvalGateSpec),
+	})
+	_ = au
+
+	w := submitApprovalAs(t, s, stage.ID, "github:r1", `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if idp.permCalls != 0 || idp.memberCalls != 0 {
+		t.Errorf("legacy gate called forge (perm %d / member %d), want 0/0", idp.permCalls, idp.memberCalls)
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want succeeded (first vote advances)", got)
+	}
+}
+
+// TestSubmitApproval_Predicate_RealGitHubProvider_EndToEnd is the binding
+// approval condition: it wires the REAL identity.GitHubIdentityProvider —
+// pointed at an httptest mock GitHub — through the POST .../approvals
+// handler, exercising the full HTTP-to-gate path over actual HTTP once. A
+// min_permission:maintain gate whose collaborator-permission endpoint
+// resolves to "write" must reject the approver 403 approver_predicate_unmet
+// and record the resolved tier (write) in the predicate_snapshot.
+func TestSubmitApproval_Predicate_RealGitHubProvider_EndToEnd(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/acme/repo/collaborators/octocat/permission",
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"role_name":"write"}`))
+		})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	idp := identity.NewGitHubIdentityProvider("test-client", nil,
+		identity.WithBaseURLs(srv.URL, srv.URL))
+
+	ar := newFakeApprovalRepo()
+	rr := newApprovalRunRepo()
+	au := newApprovalAuditFake()
+	s := New(Config{
+		Addr:             "127.0.0.1:0",
+		ApprovalRepo:     ar,
+		RunRepo:          rr,
+		AuditRepo:        au,
+		IdentityProvider: idp,
+	})
+
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	rr.mu.Lock()
+	stage.Type = run.StageTypeAcceptance
+	rr.mu.Unlock()
+	rr.seedRun(&run.Run{
+		ID:           stage.RunID,
+		Repo:         "acme/repo",
+		WorkflowID:   "feature_change",
+		WorkflowSpec: quorumPredicateSpec(1, "maintain", ""),
+	})
+	k := audit.ActorUser
+	author := "github:author"
+	au.seedRunEntries(stage.RunID, &audit.Entry{ActorKind: &k, ActorSubject: &author})
+
+	w := submitApprovalAs(t, s, stage.ID, "github:octocat", `{"decision":"approve"}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "approver_predicate_unmet") {
+		t.Errorf("body missing approver_predicate_unmet: %s", w.Body.String())
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (rejected, no advance)", got)
+	}
+	// The resolved tier came over real HTTP from the mock GitHub.
+	snap := predicateRejectionSnapshot(t, au, "github:octocat")
+	if snap["resolved_permission"] != "write" {
+		t.Errorf("resolved_permission = %v, want write (mapped over real HTTP)", snap["resolved_permission"])
+	}
+	if snap["min_permission"] != "maintain" {
+		t.Errorf("min_permission = %v, want maintain", snap["min_permission"])
 	}
 }

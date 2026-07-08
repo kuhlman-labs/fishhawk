@@ -309,6 +309,24 @@ workflows:
               members: [alice, bob]
 ```
 
+### Forge resolution (E39.5 / #1710)
+
+When an `approvals` gate sets `min_permission` and/or `member_of`, the backend resolves the predicate against the forge at **each** approval event (via the forge-neutral `identity.IdentityProvider` seam) before recording the vote — no forge result is cached between requests. A real human submitter whose resolved permission is below `min_permission`, or who is not a member of `member_of`, is refused `403 approver_predicate_unmet` (no approval row is inserted). A forge failure (error / rate-limit / timeout, or an ad-hoc run with no repository to resolve against) **fails the gate closed** with a retryable `503 forge_unavailable`. `agent` and delegated submissions are recorded-but-never-counted and are not forge-gated. See the POST `.../approvals` responses in `docs/api/v0.openapi.yaml`.
+
+#### Forge permission mapping
+
+The `min_permission` tier vocabulary is forge-neutral. GitHub maps its own `role_name` tiers directly onto it:
+
+| `min_permission` | GitHub `role_name` |
+|---|---|
+| `read` | `read` |
+| `triage` | `triage` |
+| `write` | `write` |
+| `maintain` | `maintain` |
+| `admin` | `admin` |
+
+A future forge maps its own tiers onto the same ordered vocabulary (`none` < `read` < `triage` < `write` < `maintain` < `admin`) — e.g. GitLab **Maintainer** → `maintain`, **Owner** → `admin` — without a schema change. The vocabulary lives in `backend/internal/identity.Permission`; the concrete GitHub mapping is confined to `backend/internal/identity/github.go`.
+
 ## Version routing
 
 The backend (`backend/internal/spec`) and the CLI (`cli/internal/spec`) compile **both** the workflow-v0 and workflow-v1 schemas at init and dispatch a spec to one of them by its `version` **major** component:

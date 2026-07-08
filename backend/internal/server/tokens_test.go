@@ -429,6 +429,13 @@ type fakeIdentityProvider struct {
 	verifyErr error
 	perm      identity.Permission
 	permErr   error
+	// member/memberErr back ResolveMembership; permCalls/memberCalls count
+	// invocations so the approval-predicate tests (E39.5 / #1710) can assert
+	// no forge result is cached or reused across approval events.
+	member      bool
+	memberErr   error
+	permCalls   int
+	memberCalls int
 }
 
 func (f *fakeIdentityProvider) VerifyUser(context.Context, identity.DeviceCodePrompt) (string, error) {
@@ -443,6 +450,7 @@ func (f *fakeIdentityProvider) VerifyAccessToken(context.Context, string) (strin
 }
 
 func (f *fakeIdentityProvider) PermissionLevel(context.Context, string, string) (identity.Permission, error) {
+	f.permCalls++
 	if f.permErr != nil {
 		return identity.PermissionNone, f.permErr
 	}
@@ -450,7 +458,11 @@ func (f *fakeIdentityProvider) PermissionLevel(context.Context, string, string) 
 }
 
 func (f *fakeIdentityProvider) ResolveMembership(context.Context, string, string) (bool, error) {
-	return false, nil
+	f.memberCalls++
+	if f.memberErr != nil {
+		return false, f.memberErr
+	}
+	return f.member, nil
 }
 
 // repoWithoutOAuth wraps a Repository but promotes only the base

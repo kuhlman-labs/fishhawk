@@ -79,13 +79,31 @@ type GitHubIdentityProvider struct {
 	now          func() time.Time
 }
 
+// Option customizes a GitHubIdentityProvider at construction. Options are
+// applied after the production defaults, so a test can point the provider at
+// an httptest mock server. Additive and backward-compatible: existing
+// two-arg callers pass no options and are unchanged.
+type Option func(*GitHubIdentityProvider)
+
+// WithBaseURLs overrides the REST API and OAuth base URLs. Intended for
+// tests that exercise the real provider end-to-end against an httptest mock
+// server (E39.5 / #1710) — production callers omit it and keep the GitHub
+// hosts.
+func WithBaseURLs(apiBase, oauthBase string) Option {
+	return func(p *GitHubIdentityProvider) {
+		p.apiBaseURL = apiBase
+		p.oauthBaseURL = oauthBase
+	}
+}
+
 // NewGitHubIdentityProvider constructs a GitHub identity provider from
 // the OAuth App client_id and an optional REST token accessor (nil →
 // anonymous REST reads). It returns the interface, following the
 // githuboidc.New idiom; the production defaults (GitHub hosts, a 30s
-// HTTP client, a ctx-aware sleep, time.Now) are filled in here.
-func NewGitHubIdentityProvider(clientID string, token func(context.Context) (string, error)) IdentityProvider {
-	return &GitHubIdentityProvider{
+// HTTP client, a ctx-aware sleep, time.Now) are filled in here. Optional
+// Options (e.g. WithBaseURLs) are applied last, overriding the defaults.
+func NewGitHubIdentityProvider(clientID string, token func(context.Context) (string, error), opts ...Option) IdentityProvider {
+	p := &GitHubIdentityProvider{
 		clientID:     clientID,
 		apiBaseURL:   DefaultAPIBaseURL,
 		oauthBaseURL: DefaultOAuthBaseURL,
@@ -94,6 +112,10 @@ func NewGitHubIdentityProvider(clientID string, token func(context.Context) (str
 		sleep:        sleepCtx,
 		now:          time.Now,
 	}
+	for _, o := range opts {
+		o(p)
+	}
+	return p
 }
 
 // Compile-time assertion that GitHubIdentityProvider satisfies the
