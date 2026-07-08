@@ -3,14 +3,116 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
+
+func TestResolvePredicates(t *testing.T) {
+	ptr := func(i int) *int { return &i }
+	one := ptr(1)
+
+	t.Run("satisfied: both predicates pass, each called once", func(t *testing.T) {
+		idp := &fakeIdentityProvider{perm: identity.PermissionAdmin, member: true}
+		s := New(Config{IdentityProvider: idp})
+		outcome, res, _ := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+			&spec.Approvals{Count: one, MinPermission: "write", MemberOf: "acme/reviewers"})
+		if outcome != predicateSatisfied {
+			t.Fatalf("outcome = %v, want satisfied", outcome)
+		}
+		if res.ResolvedPermission != "admin" {
+			t.Errorf("resolved permission = %q, want admin", res.ResolvedPermission)
+		}
+		if res.MemberResolved == nil || !*res.MemberResolved {
+			t.Errorf("member resolved = %v, want true", res.MemberResolved)
+		}
+		if idp.permCalls != 1 || idp.memberCalls != 1 {
+			t.Errorf("calls = perm %d/member %d, want 1/1", idp.permCalls, idp.memberCalls)
+		}
+	})
+
+	t.Run("rejected: permission below required tier", func(t *testing.T) {
+		idp := &fakeIdentityProvider{perm: identity.PermissionWrite}
+		s := New(Config{IdentityProvider: idp})
+		outcome, res, predicate := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+			&spec.Approvals{Count: one, MinPermission: "maintain"})
+		if outcome != predicateRejected {
+			t.Fatalf("outcome = %v, want rejected", outcome)
+		}
+		if res.ResolvedPermission != "write" {
+			t.Errorf("resolved permission = %q, want write", res.ResolvedPermission)
+		}
+		if predicate != "min_permission" {
+			t.Errorf("predicate = %q, want min_permission", predicate)
+		}
+	})
+
+	t.Run("rejected: non-member", func(t *testing.T) {
+		idp := &fakeIdentityProvider{member: false}
+		s := New(Config{IdentityProvider: idp})
+		outcome, res, predicate := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+			&spec.Approvals{Count: one, MemberOf: "acme/reviewers"})
+		if outcome != predicateRejected {
+			t.Fatalf("outcome = %v, want rejected", outcome)
+		}
+		if res.MemberResolved == nil || *res.MemberResolved {
+			t.Errorf("member resolved = %v, want false", res.MemberResolved)
+		}
+		if predicate != "member_of" {
+			t.Errorf("predicate = %q, want member_of", predicate)
+		}
+	})
+
+	t.Run("unavailable: PermissionLevel error", func(t *testing.T) {
+		idp := &fakeIdentityProvider{permErr: identity.ErrRateLimited}
+		s := New(Config{IdentityProvider: idp})
+		outcome, _, _ := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+			&spec.Approvals{Count: one, MinPermission: "write"})
+		if outcome != predicateUnavailable {
+			t.Fatalf("outcome = %v, want unavailable", outcome)
+		}
+	})
+
+	t.Run("unavailable: ResolveMembership error", func(t *testing.T) {
+		idp := &fakeIdentityProvider{perm: identity.PermissionAdmin, memberErr: errors.New("boom")}
+		s := New(Config{IdentityProvider: idp})
+		outcome, _, _ := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+			&spec.Approvals{Count: one, MinPermission: "write", MemberOf: "acme/reviewers"})
+		if outcome != predicateUnavailable {
+			t.Fatalf("outcome = %v, want unavailable", outcome)
+		}
+	})
+
+	t.Run("unavailable: empty repo when permission required (fail closed)", func(t *testing.T) {
+		idp := &fakeIdentityProvider{perm: identity.PermissionAdmin, member: true}
+		s := New(Config{IdentityProvider: idp})
+		outcome, _, _ := s.resolvePredicates(context.Background(), "", "github:op",
+			&spec.Approvals{Count: one, MinPermission: "write"})
+		if outcome != predicateUnavailable {
+			t.Fatalf("outcome = %v, want unavailable (empty repo)", outcome)
+		}
+		if idp.permCalls != 0 {
+			t.Errorf("permCalls = %d, want 0 (short-circuit before the forge call)", idp.permCalls)
+		}
+	})
+
+	t.Run("unavailable: unparseable min_permission (fail closed)", func(t *testing.T) {
+		idp := &fakeIdentityProvider{perm: identity.PermissionAdmin}
+		s := New(Config{IdentityProvider: idp})
+		outcome, _, _ := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+			&spec.Approvals{Count: one, MinPermission: "superuser"})
+		if outcome != predicateUnavailable {
+			t.Fatalf("outcome = %v, want unavailable (unparseable tier)", outcome)
+		}
+	})
+}
 
 func TestSplitProviderSubject(t *testing.T) {
 	cases := []struct {
@@ -265,5 +367,43 @@ func TestPredicateSnapshotMarshaling(t *testing.T) {
 	}
 	if _, ok := mb["min_permission"]; ok {
 		t.Errorf("min_permission must be omitted when empty: %s", rawBelow)
+	}
+	// The additive forge-resolution fields drop when unset (byte-identical
+	// to a #1709 count-only snapshot).
+	for _, k := range []string{"resolved_permission", "member_resolved", "predicate_result"} {
+		if _, ok := mb[k]; ok {
+			t.Errorf("%s must be omitted when unset: %s", k, rawBelow)
+		}
+	}
+
+	// A resolved snapshot carries resolved_permission, member_resolved, and
+	// predicate_result.
+	member := true
+	resolved := &predicateSnapshot{
+		CountRequired:      1,
+		CountEligible:      1,
+		Identity:           snapshotIdentityFor("github:op"),
+		SubmitterClass:     "eligible",
+		Channel:            "api",
+		MinPermission:      "write",
+		MemberOf:           "acme/reviewers",
+		QuorumReached:      true,
+		ResolvedPermission: "admin",
+		MemberResolved:     &member,
+		PredicateResult:    "satisfied",
+	}
+	rawResolved, _ := json.Marshal(resolved)
+	var mr map[string]any
+	if err := json.Unmarshal(rawResolved, &mr); err != nil {
+		t.Fatalf("unmarshal resolved: %v", err)
+	}
+	if mr["resolved_permission"] != "admin" {
+		t.Errorf("resolved_permission = %v, want admin", mr["resolved_permission"])
+	}
+	if mr["member_resolved"] != true {
+		t.Errorf("member_resolved = %v, want true", mr["member_resolved"])
+	}
+	if mr["predicate_result"] != "satisfied" {
+		t.Errorf("predicate_result = %v, want satisfied", mr["predicate_result"])
 	}
 }

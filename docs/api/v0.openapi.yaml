@@ -6832,6 +6832,16 @@ paths:
               `action`, `condition`, and `unmet_reason` naming the exact
               failed predicate (e.g. `clean_dual_approval: 1 of 2
               reviewer verdicts received`).
+            - `approver_predicate_unmet` — E39.5 / #1710: the stage's
+              gate declares an `approvals` block with `min_permission`
+              and/or `member_of`, and the submitter's forge-resolved
+              permission tier is below the required tier OR the
+              submitter is not a member of the required group. Resolved
+              PRE-Submit against the forge, so no approval row is
+              recorded. `details` carries `required_permission`,
+              `resolved_permission`, `member_of`, `member_resolved`, and
+              `result` (`rejected`). `agent` / delegated submissions are
+              recorded-but-never-counted and skip this check.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -6933,6 +6943,24 @@ paths:
               retry with an allowed `implement_model` (or after widening the
               allow-list) flows normally. An empty/unconfigured allow-list
               fails OPEN — any model is accepted, byte-identical to today.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            Possible error codes:
+
+            - `forge_unavailable` — E39.5 / #1710: the stage's gate
+              declares an `approvals` block with `min_permission` and/or
+              `member_of`, but the forge permission/membership API could
+              not be resolved (an error / rate-limit / timeout, or an
+              ad-hoc run with no repository to resolve against). The gate
+              **fails closed**: no approval row is inserted and the gate
+              does not transition. `details` carries `retryable: true`,
+              `predicate` (`min_permission` | `member_of`), `ref` (the
+              `member_of` group when set), and a human-readable
+              `next_actions` array instructing the caller to retry once
+              the forge is reachable.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

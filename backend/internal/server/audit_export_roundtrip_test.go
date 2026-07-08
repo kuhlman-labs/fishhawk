@@ -75,15 +75,21 @@ func TestAuditExport_RoundTripExternalVerify(t *testing.T) {
 				t.Fatalf("append chained (run %d, %s): %v", i, cat, err)
 			}
 		}
-		// E39.4 (#1709): the first run's trail also carries BOTH
-		// approval_submitted row shapes, so the round-trip proves the
-		// additive payload enrichment (identity/channel/predicate_snapshot,
-		// riding inside the hashed payload JSONB) does not break the hash
-		// chain or the strict Export v1 decode:
+		// E39.4 (#1709) + E39.5 (#1710): the first run's trail also carries
+		// BOTH approval_submitted row shapes AND a predicate-rejection row, so
+		// the round-trip proves the additive payload enrichment
+		// (identity/channel/predicate_snapshot with its forge-resolution
+		// fields, riding inside the hashed payload JSONB) and the NEW
+		// approval_predicate_rejected category do not break the hash chain or
+		// the strict Export v1 decode:
 		//   - a LEGACY-gate row: identity{provider,subject} + channel +
 		//     auth_method, NO predicate_snapshot (operator binding conditions
 		//     1 & 2);
-		//   - an ENRICHED quorum-gate row: adds the predicate_snapshot object.
+		//   - an ENRICHED quorum-gate row: adds the predicate_snapshot object
+		//     including the #1710 resolved_permission / member_resolved /
+		//     predicate_result forge-resolution fields;
+		//   - a REJECTED-predicate row under the new approval_predicate_rejected
+		//     category (a plain category string, no closed-set validator).
 		if i == 0 {
 			user := audit.ActorUser
 			legacy := `{"stage_id":"s1","decision":"approve","surface":"api","approver":"github:alice",` +
@@ -93,7 +99,8 @@ func TestAuditExport_RoundTripExternalVerify(t *testing.T) {
 				`"predicate_snapshot":{"count_required":2,"count_eligible":2,` +
 				`"identity":{"provider":"github","subject":"github:bob"},"submitter_class":"eligible",` +
 				`"auth_method":"oauth","channel":"api","min_permission":"write","member_of":"acme/reviewers",` +
-				`"quorum_reached":true}}`
+				`"quorum_reached":true,"resolved_permission":"admin","member_resolved":true,` +
+				`"predicate_result":"satisfied"}}`
 			for k, payload := range []string{legacy, enriched} {
 				subject := "github:approver"
 				if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -106,6 +113,22 @@ func TestAuditExport_RoundTripExternalVerify(t *testing.T) {
 				}); err != nil {
 					t.Fatalf("append approval row %d: %v", k, err)
 				}
+			}
+			// The #1710 rejection row: a new category with a nested
+			// predicate_snapshot recording the failed forge predicate.
+			rejectSubject := "github:carol"
+			rejected := `{"stage_id":"s1","subject":"github:carol",` +
+				`"predicate_snapshot":{"result":"rejected","min_permission":"maintain",` +
+				`"resolved_permission":"write"}}`
+			if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
+				RunID:        r.ID,
+				Timestamp:    base.Add(time.Duration(i*10+len(runCats)+2) * time.Minute),
+				Category:     "approval_predicate_rejected",
+				ActorKind:    &user,
+				ActorSubject: &rejectSubject,
+				Payload:      json.RawMessage(rejected),
+			}); err != nil {
+				t.Fatalf("append predicate-rejection row: %v", err)
 			}
 		}
 	}
@@ -191,13 +214,13 @@ func TestAuditExport_RoundTripExternalVerify(t *testing.T) {
 		t.Errorf("verify stdout missing PASS:\n%s", vout)
 	}
 	// Deterministic counts: 2 runs + the global partition = 3 verified;
-	// (3+2 approval) run-0 entries + 3 run-1 entries + 2 global entries =
-	// 10 audit entries.
+	// (3 base + 2 approval_submitted + 1 approval_predicate_rejected) run-0
+	// entries + 3 run-1 entries + 2 global entries = 11 audit entries.
 	if !strings.Contains(vout, "3 run(s)") {
 		t.Errorf("verify stdout missing '3 run(s)':\n%s", vout)
 	}
-	if !strings.Contains(vout, "10 audit entries") {
-		t.Errorf("verify stdout missing '10 audit entries':\n%s", vout)
+	if !strings.Contains(vout, "11 audit entries") {
+		t.Errorf("verify stdout missing '11 audit entries':\n%s", vout)
 	}
 
 	// Tamper case: flip one character of one entry's entry_hash and prove

@@ -12,6 +12,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
@@ -201,6 +202,15 @@ type predicateSnapshot struct {
 	MinPermission  string           `json:"min_permission,omitempty"`
 	MemberOf       string           `json:"member_of,omitempty"`
 	QuorumReached  bool             `json:"quorum_reached"`
+	// Forge-resolution fields (E39.5 / #1710). MinPermission/MemberOf above
+	// carry the REQUIRED tier + ref; these record what the forge RESOLVED
+	// for the submitter and the predicate verdict. Additive + omitempty so a
+	// snapshot with no forge resolution (the campaign auto-driver / agent
+	// path, and legacy count-only gates) is byte-identical to today, keeping
+	// the E9 Export v1 hash chain and strict decode unaffected (#1709).
+	ResolvedPermission string `json:"resolved_permission,omitempty"`
+	MemberResolved     *bool  `json:"member_resolved,omitempty"`
+	PredicateResult    string `json:"predicate_result,omitempty"`
 }
 
 // submitterClass labels the submitter relative to the quorum: "author" when
@@ -252,4 +262,87 @@ func (s *Server) fetchApprovalsForStage(ctx context.Context, stage *run.Stage) (
 		return nil, nil
 	}
 	return nil, fmt.Errorf("stage_type %q not in workflow %q", stage.Type, runRow.WorkflowID)
+}
+
+// predicateOutcome is the discriminated result of resolvePredicates.
+type predicateOutcome int
+
+const (
+	// predicateSatisfied: every configured predicate resolved and passed.
+	predicateSatisfied predicateOutcome = iota
+	// predicateRejected: a predicate resolved but the submitter did NOT
+	// meet it (insufficient permission tier or non-membership).
+	predicateRejected
+	// predicateUnavailable: a predicate could not be resolved (a forge
+	// error / rate-limit, an empty repo, or an unparseable required tier)
+	// — the gate fails CLOSED and the caller returns a retryable 503.
+	predicateUnavailable
+)
+
+// predicateResolution carries the forge-resolved values for the snapshot on
+// a satisfied evaluation: the resolved permission tier (when min_permission
+// was configured) and the resolved membership (when member_of was
+// configured; nil otherwise).
+type predicateResolution struct {
+	ResolvedPermission string
+	MemberResolved     *bool
+}
+
+// resolvePredicates evaluates the approvals block's forge predicates against
+// the submitter, calling IdentityProvider.PermissionLevel when MinPermission
+// is set and ResolveMembership when MemberOf is set. Each configured
+// predicate is evaluated EXACTLY ONCE per call (no caching / memoization) so
+// mock call-count assertions hold and every approval event makes its own
+// forge calls. It returns one of three discriminated outcomes:
+//
+//   - predicateUnavailable: any non-nil forge error (including
+//     identity.ErrRateLimited), an empty repo when a permission tier is
+//     required, or an unparseable MinPermission (fail-closed — never waved
+//     through). The returned *predicateResolution carries whatever resolved
+//     before the failure (best-effort provenance).
+//   - predicateRejected: a resolved permission below the required tier OR a
+//     resolved membership of false. The resolution carries the resolved
+//     value(s) for the rejection snapshot.
+//   - predicateSatisfied: every configured predicate passed; the resolution
+//     carries the resolved value(s) for the approval snapshot.
+//
+// The returned predicate string names which predicate produced a
+// rejected/unavailable outcome ("min_permission" | "member_of"); it is empty
+// on satisfied.
+func (s *Server) resolvePredicates(ctx context.Context, repo, subject string, approvals *spec.Approvals) (predicateOutcome, *predicateResolution, string) {
+	res := &predicateResolution{}
+	if approvals.MinPermission != "" {
+		// A repo permission tier cannot be resolved without a repo (a
+		// non-GitHub / ad-hoc trigger leaves run.Repo empty). Fail closed
+		// rather than wave the approver through.
+		if repo == "" {
+			return predicateUnavailable, res, "min_permission"
+		}
+		required, ok := identity.ParsePermission(approvals.MinPermission)
+		if !ok {
+			// Should not happen post-schema-validation (the enum is closed);
+			// treat an unparseable required tier as unavailable, never
+			// satisfied.
+			return predicateUnavailable, res, "min_permission"
+		}
+		perm, err := s.cfg.IdentityProvider.PermissionLevel(ctx, repo, subject)
+		if err != nil {
+			return predicateUnavailable, res, "min_permission"
+		}
+		res.ResolvedPermission = string(perm)
+		if !perm.AtLeast(required) {
+			return predicateRejected, res, "min_permission"
+		}
+	}
+	if approvals.MemberOf != "" {
+		member, err := s.cfg.IdentityProvider.ResolveMembership(ctx, approvals.MemberOf, subject)
+		if err != nil {
+			return predicateUnavailable, res, "member_of"
+		}
+		res.MemberResolved = &member
+		if !member {
+			return predicateRejected, res, "member_of"
+		}
+	}
+	return predicateSatisfied, res, ""
 }
