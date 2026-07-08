@@ -60,6 +60,41 @@ func (r *postgresRepo) Issue(ctx context.Context, subject string, scopes []strin
 	return tok, nil
 }
 
+func (r *postgresRepo) IssueOAuth(ctx context.Context, subject string, scopes []string, provider string) (*Token, error) {
+	if subject == "" {
+		return nil, errors.New("apitoken: subject required")
+	}
+	if provider == "" {
+		return nil, errors.New("apitoken: provider required")
+	}
+	plaintext, err := generatePlaintext()
+	if err != nil {
+		return nil, err
+	}
+	hash, err := HashPlaintext(plaintext)
+	if err != nil {
+		return nil, err
+	}
+
+	if scopes == nil {
+		scopes = []string{}
+	}
+	q := tokendb.New(r.pool)
+	row, err := q.CreateOAuthToken(ctx, tokendb.CreateOAuthTokenParams{
+		ID:        uuid.New(),
+		Subject:   subject,
+		TokenHash: hash,
+		Scopes:    scopes,
+		Provider:  pgtype.Text{String: provider, Valid: true},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("apitoken: create oauth: %w", err)
+	}
+	tok := rowToToken(row)
+	tok.PlainText = plaintext
+	return tok, nil
+}
+
 func (r *postgresRepo) Authenticate(ctx context.Context, plaintext string) (*Token, error) {
 	hash, err := HashPlaintext(plaintext)
 	if err != nil {
@@ -136,6 +171,12 @@ func rowToToken(r tokendb.ApiToken) *Token {
 		Scopes:    r.Scopes,
 		CreatedAt: r.CreatedAt.Time,
 	}
+	if r.AuthMethod.Valid {
+		out.AuthMethod = r.AuthMethod.String
+	}
+	if r.Provider.Valid {
+		out.Provider = r.Provider.String
+	}
 	if r.LastUsedAt.Valid {
 		t := r.LastUsedAt.Time
 		out.LastUsedAt = &t
@@ -147,5 +188,9 @@ func rowToToken(r tokendb.ApiToken) *Token {
 	return out
 }
 
-// Compile-time check.
-var _ Repository = (*postgresRepo)(nil)
+// Compile-time checks: the production repo satisfies both the base
+// Repository and the additive OAuthIssuer capability seam.
+var (
+	_ Repository  = (*postgresRepo)(nil)
+	_ OAuthIssuer = (*postgresRepo)(nil)
+)

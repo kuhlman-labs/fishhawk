@@ -21,6 +21,14 @@ func (*NoOpIdentityProvider) VerifyUser(context.Context, DeviceCodePrompt) (stri
 	return "", ErrNotConfigured
 }
 
+// VerifyAccessToken always fails closed: with no forge to verify the
+// token against, it returns ErrNotConfigured — so a token-mint endpoint
+// on an OAuth-unconfigured backend degrades to 503 rather than minting
+// against an unverifiable subject.
+func (*NoOpIdentityProvider) VerifyAccessToken(context.Context, string) (string, error) {
+	return "", ErrNotConfigured
+}
+
 // PermissionLevel always returns PermissionNone (nil error): an
 // unconfigured provider grants no permission to anyone.
 func (*NoOpIdentityProvider) PermissionLevel(context.Context, string, string) (Permission, error) {

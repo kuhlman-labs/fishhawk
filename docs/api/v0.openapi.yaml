@@ -2819,6 +2819,20 @@ components:
         revoked_at:
           type: [string, "null"]
           format: date-time
+        auth_method:
+          type: string
+          enum: [static, oauth]
+          description: |
+            How the token was authenticated at issue time: `static` for
+            operator-minted tokens (`fishhawkd token issue`), `oauth` for
+            tokens minted through the OAuth device flow
+            (`POST /v0/tokens/login`, E39.3). Omitted for legacy rows
+            predating the column; callers treat an absent value as `static`.
+        provider:
+          type: string
+          description: |
+            The identity provider that authenticated an OAuth token (e.g.
+            `github`). Omitted for static tokens.
 
   responses:
     BadRequest:
@@ -3213,6 +3227,102 @@ paths:
                           retrievable later.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v0/tokens/login:
+    get:
+      operationId: tokenLoginDiscovery
+      summary: OAuth token-login discovery
+      description: |
+        Returns the GitHub OAuth App `client_id` the CLI drives the device
+        flow with, so `fishhawk token login` can authenticate a user
+        without a pre-shared token (E39.3). Unauthenticated — this is the
+        entry point of the login flow. `503 tokens_unconfigured` when no
+        OAuth client_id is wired.
+      tags: [auth]
+      security: []
+      responses:
+        '200':
+          description: OAuth discovery document.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [provider, client_id]
+                properties:
+                  provider:
+                    type: string
+                    description: The identity provider (v0 always `github`).
+                  client_id:
+                    type: string
+                    description: The GitHub OAuth App client_id for the device flow.
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+    post:
+      operationId: tokenLoginMint
+      summary: Mint a user-bound token from an OAuth device-flow access token
+      description: |
+        The CLI drives the GitHub device flow itself (using the `client_id`
+        from the discovery endpoint) and posts the resulting user access
+        token here. The backend re-verifies the token server-side to a
+        provider-qualified subject (`github:<login>`), enforces mint authz —
+        the subject must hold at least the configured minimum permission on
+        the operator repo AND request only scopes within the operator
+        default set — then mints a token stamped `auth_method=oauth`,
+        `provider=github` and returns the plaintext ONCE (E39.3). The access
+        token in the body IS the credential; the endpoint is unauthenticated
+        at the bearer layer.
+      tags: [auth]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [access_token]
+              properties:
+                access_token:
+                  type: string
+                  description: The GitHub user access token obtained by the CLI's device flow.
+                scopes:
+                  type: array
+                  items: { type: string }
+                  description: |
+                    Requested scopes. Each must fall within the operator
+                    default set or the request is rejected. An empty/omitted
+                    list defaults to the operator default set.
+      responses:
+        '201':
+          description: Token created. The plaintext value is in the response.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiToken'
+                  - type: object
+                    required: [token]
+                    properties:
+                      token:
+                        type: string
+                        description: |
+                          The bearer token. Store immediately — not
+                          retrievable later.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: |
+            The presented access token could not be verified
+            (`error: token_verification_failed`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: |
+            The verified subject lacks the minimum repository permission
+            (`error: insufficient_permission`) or requested a scope outside
+            the operator default set (`error: scope_not_allowed`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   /v0/tokens/{token_id}:
     delete:

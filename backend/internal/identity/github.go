@@ -200,6 +200,20 @@ func (p *GitHubIdentityProvider) VerifyUser(ctx context.Context, prompt DeviceCo
 	}
 }
 
+// VerifyAccessToken re-verifies a CLI-obtained GitHub user access token
+// server-side and returns the provider-qualified subject
+// ("github:<login>"). It reuses resolveLogin — the same GET {api}/user
+// exchange VerifyUser performs after the device flow authorizes — so a
+// token minted through the CLI's own device flow (E39.3 / #1708)
+// resolves to the identical subject the interactive path would. An
+// empty token is rejected before any HTTP call.
+func (p *GitHubIdentityProvider) VerifyAccessToken(ctx context.Context, accessToken string) (string, error) {
+	if accessToken == "" {
+		return "", fmt.Errorf("identity: access token is empty")
+	}
+	return p.resolveLogin(ctx, accessToken)
+}
+
 // requestDeviceCode performs POST {oauth}/login/device/code.
 func (p *GitHubIdentityProvider) requestDeviceCode(ctx context.Context) (*deviceCodeResponse, error) {
 	body, err := json.Marshal(map[string]string{

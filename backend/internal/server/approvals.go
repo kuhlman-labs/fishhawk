@@ -614,7 +614,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 	// pre-advance row is used here; advanceStage mutates only its State, not
 	// the ID/RunID these audits read. Best-effort: a logged append failure
 	// never unwinds the approval the gate already recorded via Submit.
-	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.BindingAssertions, p.DelegatedRule)
+	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.BindingAssertions, p.DelegatedRule, id.AuthMethod)
 
 	// Model resolution (#1013, extended #1416): emit the source-tagged
 	// model_resolved audit entries the gate computed on this plan-stage
@@ -960,7 +960,13 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // delegated path (#1026) and the payload records `delegated: "<rule>"`
 // — the condition checkDelegation re-evaluated and found met. Token-
 // subject attribution for the operator agent is #1027's scope.
-func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles []string, bindingAssertions []bindingAssertion, delegatedRule string) {
+// authMethod records how the acting bearer api_token was authenticated
+// (E39.3 / #1708): "static" for operator-minted tokens, "oauth" for
+// device-flow tokens. Recorded under auth_method when non-empty so a
+// decision's audit provenance names the credential kind; empty for
+// cookie-session / MCP-token / operator-agent-driver identities, where
+// the key is omitted (byte-identical to pre-#1708 payloads).
+func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles []string, bindingAssertions []bindingAssertion, delegatedRule, authMethod string) {
 	// ADR-040 D4 (#1027): the acting subject selects the kind — an
 	// operator-agent token records agent, every other subject (human
 	// tokens, GitHub logins from the PR-review-event path) stays user.
@@ -970,6 +976,9 @@ func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *
 		"decision": string(app.Decision),
 		"surface":  string(app.Surface),
 		"approver": app.ApproverSubject,
+	}
+	if authMethod != "" {
+		auditPayload["auth_method"] = authMethod
 	}
 	if approverGithubLogin != "" {
 		auditPayload["approver_github_login"] = approverGithubLogin

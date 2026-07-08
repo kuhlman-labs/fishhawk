@@ -2,8 +2,18 @@
 -- ./db per backend/sqlc.yaml.
 
 -- name: CreateToken :one
+-- Static operator-token path. auth_method is left to the column
+-- DEFAULT 'static' and provider stays NULL.
 INSERT INTO api_tokens (id, subject, token_hash, scopes)
 VALUES ($1, $2, $3, $4)
+RETURNING *;
+
+-- name: CreateOAuthToken :one
+-- OAuth device-flow path (E39.3 / #1708): stamp auth_method='oauth'
+-- and the originating provider explicitly. The static Issue path
+-- uses CreateToken and relies on the auth_method DEFAULT.
+INSERT INTO api_tokens (id, subject, token_hash, scopes, auth_method, provider)
+VALUES ($1, $2, $3, $4, 'oauth', $5)
 RETURNING *;
 
 -- name: GetTokenByHash :one
