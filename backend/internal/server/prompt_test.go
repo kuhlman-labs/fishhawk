@@ -129,8 +129,53 @@ func (r *promptRunRepo) AddRunCost(_ context.Context, id uuid.UUID, deltaUSD flo
 	return rn, nil
 }
 
-func (r *promptRunRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
-	return nil, errors.New("not used")
+// CreateRun mints a run row into getRuns, threading the decomposition-linkage
+// fields (DecomposedFrom / ParentRunID / SliceIndex) and IssueContext so the
+// campaign-mint → prompt cross-boundary test (#1721) can drive
+// StartRunForCampaignIssue against this same fake the prompt handler reads.
+func (r *promptRunRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run, error) {
+	runnerKind := p.RunnerKind
+	if runnerKind == "" {
+		runnerKind = run.RunnerKindGitHubActions
+	}
+	rn := &run.Run{
+		ID:             uuid.New(),
+		Repo:           p.Repo,
+		WorkflowID:     p.WorkflowID,
+		WorkflowSHA:    p.WorkflowSHA,
+		TriggerSource:  p.TriggerSource,
+		TriggerRef:     p.TriggerRef,
+		InstallationID: p.InstallationID,
+		IssueContext:   p.IssueContext,
+		DecomposedFrom: p.DecomposedFrom,
+		ParentRunID:    p.ParentRunID,
+		SliceIndex:     p.SliceIndex,
+		WorkflowSpec:   p.WorkflowSpec,
+		RunnerKind:     runnerKind,
+		State:          run.StatePending,
+	}
+	r.getRuns[rn.ID] = rn
+	return rn, nil
+}
+
+// CreateStage appends a stage row into stagesByRunID + getStages so a run
+// minted through CreateRun is later resolvable by the prompt handler.
+func (r *promptRunRepo) CreateStage(_ context.Context, p run.CreateStageParams) (*run.Stage, error) {
+	st := &run.Stage{
+		ID:           uuid.New(),
+		RunID:        p.RunID,
+		Sequence:     p.Sequence,
+		Type:         p.Type,
+		ExecutorKind: p.ExecutorKind,
+		ExecutorRef:  p.ExecutorRef,
+		State:        run.StageStatePending,
+	}
+	if r.stagesByRunID == nil {
+		r.stagesByRunID = map[uuid.UUID][]*run.Stage{}
+	}
+	r.stagesByRunID[p.RunID] = append(r.stagesByRunID[p.RunID], st)
+	r.getStages[st.ID] = st
+	return st, nil
 }
 func (r *promptRunRepo) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
 	return nil, run.ErrNotFound
@@ -179,9 +224,6 @@ func (r *promptRunRepo) SetRunPullRequestURL(_ context.Context, id uuid.UUID, ur
 	// Run not seeded — return a synthetic row so the handler's
 	// best-effort log path still works.
 	return &run.Run{ID: id}, nil
-}
-func (r *promptRunRepo) CreateStage(context.Context, run.CreateStageParams) (*run.Stage, error) {
-	return nil, errors.New("not used")
 }
 func (r *promptRunRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
 	if r.stagesByRunID == nil {
@@ -293,6 +335,17 @@ func promptRequest(t *testing.T, s *Server, runID, stageID uuid.UUID, priv ed255
 		req.Header.Set("X-Fishhawk-Signature", hex.EncodeToString(sig))
 	}
 	_ = runID
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	return w
+}
+
+// promptRenderRequest exercises the unsigned /prompt-render preview endpoint,
+// the sibling surface of promptRequest's signed /prompt dispatch endpoint.
+func promptRenderRequest(t *testing.T, s *Server, stageID uuid.UUID) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt-render", stageID), nil)
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, req)
 	return w
@@ -2943,98 +2996,122 @@ func TestResolveAcceptanceExpectedHeadSHA_ReadErrorOmitsField(t *testing.T) {
 // a nil SliceIndex falls back to slice-0 (matching the runner's slice-0
 // default).
 func TestGetStagePrompt_Implement_FixupDecomposedChild_SliceBranch(t *testing.T) {
+	// A decomposed child fix-up lands on its per-slice sole-writer branch
+	// fishhawk/run-<parent>/slice-<n>. Post-#1721 the child resolves its slice
+	// via the persisted SliceIndex against the parent plan's decomposition, so
+	// the fixture carries a matching decomposition (slice 2 scoped). A
+	// nil-SliceIndex decomposed child can no longer link to a slice and fails
+	// closed at scope resolution before the fix-up branch is derived; the branch
+	// helper's nil->0 default is unit-tested directly in
+	// TestFixupBranchFor_DecomposedChild.
 	sliceIdx := 2
-	cases := []struct {
-		name       string
-		sliceIndex *int
-		wantSuffix string
-	}{
-		{name: "SliceIndexSet", sliceIndex: &sliceIdx, wantSuffix: "/slice-2"},
-		{name: "SliceIndexNilFallsBackToZero", sliceIndex: nil, wantSuffix: "/slice-0"},
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+
+	parentRunID := uuid.New()
+	childRunID := uuid.New()
+	planStageID := uuid.New()
+	implStageID := uuid.New()
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{
+				{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify},
+			},
+		},
+		Decomposition: &plan.Decomposition{
+			Rationale: "scope split",
+			SubPlans: []plan.SubPlanSummary{
+				{Title: "Part A", ScopeHint: "A", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/a/a.go", Operation: plan.FileOpModify}}}},
+				{Title: "Part B", ScopeHint: "B", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/b/b.go", Operation: plan.FileOpModify}}}},
+				{Title: "Part C", ScopeHint: "C", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify}}}},
+			},
+		},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			rr := newPromptRunRepo()
-			sf := newSigningFake()
-			art := newFakeArtifactRepo()
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
 
-			parentRunID := uuid.New()
-			childRunID := uuid.New()
-			planStageID := uuid.New()
-			implStageID := uuid.New()
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		childRunID: {
+			{ID: planStageID, RunID: childRunID, Type: run.StageTypePlan},
+			{ID: implStageID, RunID: childRunID, Type: run.StageTypeImplement},
+		},
+	}
+	rr.getRuns[childRunID] = &run.Run{
+		ID:             childRunID,
+		Repo:           "o/r",
+		WorkflowID:     "feature_change",
+		DecomposedFrom: &parentRunID,
+		SliceIndex:     &sliceIdx,
+	}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: childRunID, Type: run.StageTypeImplement}
 
-			p := &plan.Plan{
-				PlanVersion:  "standard_v1",
-				Summary:      "scoped plan",
-				Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
-				Scope: plan.Scope{
-					Files: []plan.ScopeFile{
-						{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpModify},
-					},
-				},
-			}
-			planBytes, err := json.Marshal(p)
-			if err != nil {
-				t.Fatalf("marshal plan: %v", err)
-			}
-			sv := "standard_v1"
-			if _, err := art.Create(context.Background(), artifact.CreateParams{
-				StageID:       planStageID,
-				Kind:          artifact.KindPlan,
-				SchemaVersion: &sv,
-				Content:       planBytes,
-			}); err != nil {
-				t.Fatalf("seed plan artifact: %v", err)
-			}
+	concerns := []planreview.Concern{
+		{Severity: planreview.SeverityHigh, Category: "coverage", Note: "tighten the bound"},
+	}
+	auditByRun := map[uuid.UUID][]*audit.Entry{
+		childRunID: {makeFixupEntry(childRunID, implStageID, concerns)},
+	}
 
-			rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
-				childRunID: {
-					{ID: planStageID, RunID: childRunID, Type: run.StageTypePlan},
-					{ID: implStageID, RunID: childRunID, Type: run.StageTypeImplement},
-				},
-			}
-			rr.getRuns[childRunID] = &run.Run{
-				ID:             childRunID,
-				Repo:           "o/r",
-				WorkflowID:     "feature_change",
-				DecomposedFrom: &parentRunID,
-				SliceIndex:     tc.sliceIndex,
-			}
-			rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: childRunID, Type: run.StageTypeImplement}
+	priv, _ := sf.issue(t, childRunID)
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		SigningRepo:  sf,
+		ArtifactRepo: art,
+		AuditRepo:    &feedbackAuditRepo{byRunID: auditByRun},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
 
-			concerns := []planreview.Concern{
-				{Severity: planreview.SeverityHigh, Category: "coverage", Note: "tighten the bound"},
-			}
-			auditByRun := map[uuid.UUID][]*audit.Entry{
-				childRunID: {makeFixupEntry(childRunID, implStageID, concerns)},
-			}
+	w := promptRequest(t, s, childRunID, implStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Fixup {
+		t.Fatalf("fixup = false, want true")
+	}
+	wantBranch := "fishhawk/run-" + parentRunID.String()[:8] + "/slice-2"
+	if resp.FixupBranch != wantBranch {
+		t.Errorf("fixup_branch = %q, want slice branch %q", resp.FixupBranch, wantBranch)
+	}
+}
 
-			priv, _ := sf.issue(t, childRunID)
-			s := New(Config{
-				Addr:         "127.0.0.1:0",
-				RunRepo:      rr,
-				SigningRepo:  sf,
-				ArtifactRepo: art,
-				AuditRepo:    &feedbackAuditRepo{byRunID: auditByRun},
-			})
-			s.promptIssueGetterOverride = &stubIssueGetter{}
+// TestFixupBranchFor_DecomposedChild pins the decomposed-child fix-up branch
+// helper directly. A SliceIndex-set child lands on slice-<n>; a nil SliceIndex
+// defaults to slice-0 (matching the runner's slice-0 default). The nil->0 path
+// is exercised here rather than through the prompt handler because a
+// nil-SliceIndex decomposed child now fails closed at scope resolution (#1721)
+// before the fix-up branch is ever derived.
+func TestFixupBranchFor_DecomposedChild(t *testing.T) {
+	parentRunID := uuid.New()
+	stage := &run.Stage{ID: uuid.New()}
+	prefix := "fishhawk/run-" + parentRunID.String()[:8]
 
-			w := promptRequest(t, s, childRunID, implStageID, priv, "")
-			if w.Code != http.StatusOK {
-				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
-			}
-			var resp promptResponse
-			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-				t.Fatalf("decode: %v", err)
-			}
-			if !resp.Fixup {
-				t.Fatalf("fixup = false, want true")
-			}
-			wantBranch := "fishhawk/run-" + parentRunID.String()[:8] + tc.wantSuffix
-			if resp.FixupBranch != wantBranch {
-				t.Errorf("fixup_branch = %q, want slice branch %q", resp.FixupBranch, wantBranch)
-			}
-		})
+	idx := 2
+	if got := fixupBranchFor(&run.Run{ID: uuid.New(), DecomposedFrom: &parentRunID, SliceIndex: &idx}, stage); got != prefix+"/slice-2" {
+		t.Errorf("SliceIndex=2: fixupBranchFor = %q, want %q", got, prefix+"/slice-2")
+	}
+	if got := fixupBranchFor(&run.Run{ID: uuid.New(), DecomposedFrom: &parentRunID}, stage); got != prefix+"/slice-0" {
+		t.Errorf("SliceIndex=nil: fixupBranchFor = %q, want %q", got, prefix+"/slice-0")
 	}
 }
 
@@ -3750,8 +3827,8 @@ func TestGetStagePrompt_DecomposedChild_ScopeConstraintInjected(t *testing.T) {
 		Decomposition: &plan.Decomposition{
 			Rationale: "scope split",
 			SubPlans: []plan.SubPlanSummary{
-				{Title: "Part A title", ScopeHint: "Implement Part A in pkg/a."},
-				{Title: "Part B title", ScopeHint: "Implement Part B in pkg/b."},
+				{Title: "Part A title", ScopeHint: "Implement Part A in pkg/a.", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/a/a.go", Operation: plan.FileOpModify}}}},
+				{Title: "Part B title", ScopeHint: "Implement Part B in pkg/b.", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/b/b.go", Operation: plan.FileOpModify}}}},
 			},
 		},
 	}
@@ -3780,7 +3857,10 @@ func TestGetStagePrompt_DecomposedChild_ScopeConstraintInjected(t *testing.T) {
 		Repo: "o/r",
 	}
 
-	// Child run: DecomposedFrom=parentRunID, IssueContext.Body matches Part A.
+	// Child run: DecomposedFrom=parentRunID, linked to Part A by SliceIndex=0
+	// (the durable linkage, #1721) — the IssueContext.Body header is no longer
+	// what binds the child to its sub-plan.
+	sliceIdx := 0
 	childBody := "## Part A title\n\nImplement Part A in pkg/a.\n\n---\n*Decomposed sub-plan.*"
 	rr.getRuns[childRunID] = &run.Run{
 		ID:             childRunID,
@@ -3789,6 +3869,7 @@ func TestGetStagePrompt_DecomposedChild_ScopeConstraintInjected(t *testing.T) {
 		TriggerSource:  run.TriggerCLI,
 		ParentRunID:    &parentRunID,
 		DecomposedFrom: &parentRunID,
+		SliceIndex:     &sliceIdx,
 		IssueContext: &run.IssueContext{
 			Title: "Part A title",
 			Body:  childBody,
@@ -3836,12 +3917,13 @@ func TestGetStagePrompt_DecomposedChild_ScopeConstraintInjected(t *testing.T) {
 // validation -> backend plan domain type -> the prompt-response wire payload
 // (the field the runner's scope_handoff/scope_drift consumer reads), and
 // asserts the child's prompt response carries the MATCHED sub-plan's slice,
-// not the parent's full union. The fallback subtest asserts a sub-plan
-// without scope inherits the parent's full scope.files (backward compat).
+// not the parent's full union. The fail-loud subtest asserts a sub-plan
+// without scope now returns 409 decomposed_scope_unresolved rather than
+// silently inheriting the parent's full scope.files (#1721).
 func TestGetStagePrompt_DecomposedChild_ScopeFiles(t *testing.T) {
 	// Parent decomposed plan: full scope is the union (a.go, b.go), but each
 	// sub-plan carries its own narrower slice. Part B intentionally omits
-	// scope to exercise the parent-scope fallback.
+	// scope to exercise the fail-loud path.
 	newParentPlan := func() *plan.Plan {
 		return &plan.Plan{
 			PlanVersion: "standard_v1",
@@ -3876,9 +3958,9 @@ func TestGetStagePrompt_DecomposedChild_ScopeFiles(t *testing.T) {
 	}
 
 	// seedChildPrompt seeds a parent plan artifact + a decomposed child run
-	// whose IssueContext.Body matches the sub-plan named by childTitle, then
-	// fetches the child's implement-stage prompt response.
-	seedChildPrompt := func(t *testing.T, childTitle, childHint string) promptResponse {
+	// linked to sub-plan sliceIdx (the durable SliceIndex linkage, #1721),
+	// then fetches the child's implement-stage prompt response recorder.
+	seedChildPrompt := func(t *testing.T, sliceIdx int) *httptest.ResponseRecorder {
 		t.Helper()
 		rr := newPromptRunRepo()
 		sf := newSigningFake()
@@ -3910,7 +3992,7 @@ func TestGetStagePrompt_DecomposedChild_ScopeFiles(t *testing.T) {
 		}
 		rr.getRuns[parentRunID] = &run.Run{ID: parentRunID, Repo: "o/r"}
 
-		childBody := "## " + childTitle + "\n\n" + childHint + "\n\n---\n*Decomposed sub-plan.*"
+		idx := sliceIdx
 		rr.getRuns[childRunID] = &run.Run{
 			ID:             childRunID,
 			Repo:           "o/r",
@@ -3918,10 +4000,7 @@ func TestGetStagePrompt_DecomposedChild_ScopeFiles(t *testing.T) {
 			TriggerSource:  run.TriggerCLI,
 			ParentRunID:    &parentRunID,
 			DecomposedFrom: &parentRunID,
-			IssueContext: &run.IssueContext{
-				Title: childTitle,
-				Body:  childBody,
-			},
+			SliceIndex:     &idx,
 		}
 		rr.getStages[childStageID] = &run.Stage{
 			ID:    childStageID,
@@ -3938,15 +4017,7 @@ func TestGetStagePrompt_DecomposedChild_ScopeFiles(t *testing.T) {
 		})
 		s.promptIssueGetterOverride = &stubIssueGetter{}
 
-		w := promptRequest(t, s, childRunID, childStageID, priv, "")
-		if w.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
-		}
-		var resp promptResponse
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		return resp
+		return promptRequest(t, s, childRunID, childStageID, priv, "")
 	}
 
 	scopePaths := func(sfs []scopeFile) []string {
@@ -3961,7 +4032,14 @@ func TestGetStagePrompt_DecomposedChild_ScopeFiles(t *testing.T) {
 		// Part A's slice is {pkg/a/a.go (create)}; the fold (#1083) must add
 		// pkg/a/a_test.go so the coupled unit tests are in-scope for the slice
 		// that owns the code, while still excluding the parent union's pkg/b.
-		resp := seedChildPrompt(t, "Part A title", "Implement Part A in pkg/a.")
+		w := seedChildPrompt(t, 0)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
 		got := scopePaths(resp.ScopeFiles)
 		want := []string{"pkg/a/a.go", "pkg/a/a_test.go"}
 		if !reflect.DeepEqual(got, want) {
@@ -3969,8 +4047,332 @@ func TestGetStagePrompt_DecomposedChild_ScopeFiles(t *testing.T) {
 		}
 	})
 
-	t.Run("sub-plan without scope falls back to parent full scope", func(t *testing.T) {
-		resp := seedChildPrompt(t, "Part B title", "Implement Part B in pkg/b.")
+	t.Run("sub-plan without scope fails closed with 409", func(t *testing.T) {
+		// Part B (slice 1) carries no scope. Under #1721 the child no longer
+		// inherits the parent's full scope — it fails closed at the dispatch
+		// surface rather than fanning out an unscoped child.
+		w := seedChildPrompt(t, 1)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		assertDecomposedScopeUnresolved(t, w, 1)
+	})
+}
+
+// assertDecomposedScopeUnresolved asserts a prompt-endpoint recorder carries a
+// 409 decomposed_scope_unresolved error naming a non-empty run_id, the given
+// slice_index, and a parent_run_id detail (#1721).
+func assertDecomposedScopeUnresolved(t *testing.T, w *httptest.ResponseRecorder, wantSlice int) {
+	t.Helper()
+	var body struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error body: %v\n%s", err, w.Body.String())
+	}
+	if body.Error.Code != "decomposed_scope_unresolved" {
+		t.Errorf("error.code = %q, want decomposed_scope_unresolved\n%s", body.Error.Code, w.Body.String())
+	}
+	if rid, _ := body.Error.Details["run_id"].(string); rid == "" {
+		t.Errorf("error.details.run_id empty, want the child run id\n%s", w.Body.String())
+	}
+	if _, ok := body.Error.Details["parent_run_id"]; !ok {
+		t.Errorf("error.details missing parent_run_id\n%s", w.Body.String())
+	}
+	// JSON numbers decode to float64.
+	if got, _ := body.Error.Details["slice_index"].(float64); int(got) != wantSlice {
+		t.Errorf("error.details.slice_index = %v, want %d\n%s", body.Error.Details["slice_index"], wantSlice, w.Body.String())
+	}
+}
+
+// TestGetStagePrompt_DecomposedScope_FailLoud is the #1721 fail-loud guard: a
+// decomposed child whose slice scope cannot be resolved returns 409
+// decomposed_scope_unresolved at BOTH prompt endpoints rather than silently
+// inheriting the parent's full scope. It also pins the campaign-minted shape
+// (nil IssueContext, SliceIndex set) narrowing correctly, and a non-decomposed
+// control keeping full scope with no 409.
+func TestGetStagePrompt_DecomposedScope_FailLoud(t *testing.T) {
+	// Parent plan: two scoped sub-plans (union a.go, b.go) plus a top-level
+	// scope for the non-decomposed control.
+	newParentPlan := func() *plan.Plan {
+		return &plan.Plan{
+			PlanVersion: "standard_v1",
+			Summary:     "parent plan",
+			Scope: plan.Scope{
+				Files: []plan.ScopeFile{
+					{Path: "pkg/a/a.go", Operation: plan.FileOpModify},
+					{Path: "pkg/b/b.go", Operation: plan.FileOpModify},
+				},
+			},
+			Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+			Decomposition: &plan.Decomposition{
+				Rationale: "scope split",
+				SubPlans: []plan.SubPlanSummary{
+					{Title: "Part A title", ScopeHint: "Implement Part A.", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/a/a.go", Operation: plan.FileOpModify}}}},
+					{Title: "Part B title", ScopeHint: "Implement Part B.", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/b/b.go", Operation: plan.FileOpModify}}}},
+				},
+			},
+		}
+	}
+
+	// seed wires a parent plan artifact + a child run whose shape the caller
+	// mutates, and returns the server + child stage id for hitting either
+	// prompt endpoint. childMut receives the child run row and its parent id.
+	seed := func(t *testing.T, childMut func(child *run.Run, parentRunID uuid.UUID)) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey) {
+		t.Helper()
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+
+		parentRunID := uuid.New()
+		childRunID := uuid.New()
+		parentPlanStageID := uuid.New()
+		childStageID := uuid.New()
+
+		planBytes, err := json.Marshal(newParentPlan())
+		if err != nil {
+			t.Fatalf("marshal parent plan: %v", err)
+		}
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{
+			StageID:       parentPlanStageID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &sv,
+			Content:       planBytes,
+		}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+			parentRunID: {{ID: parentPlanStageID, RunID: parentRunID, Type: run.StageTypePlan}},
+		}
+		rr.getRuns[parentRunID] = &run.Run{ID: parentRunID, Repo: "o/r"}
+
+		child := &run.Run{
+			ID:            childRunID,
+			Repo:          "o/r",
+			WorkflowID:    "feature_change",
+			TriggerSource: run.TriggerCLI,
+			// ParentRunID lets loadApprovedPlanForRun walk up to the parent's
+			// decomposed plan artifact (real fan-out children set both this and
+			// DecomposedFrom). childMut supplies DecomposedFrom + SliceIndex.
+			ParentRunID: &parentRunID,
+		}
+		childMut(child, parentRunID)
+		rr.getRuns[childRunID] = child
+		rr.getStages[childStageID] = &run.Stage{ID: childStageID, RunID: childRunID, Type: run.StageTypeImplement}
+
+		priv, _ := sf.issue(t, childRunID)
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, ArtifactRepo: art})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+		return s, childRunID, childStageID, priv
+	}
+
+	scopePaths := func(sfs []scopeFile) []string {
+		out := make([]string, 0, len(sfs))
+		for _, f := range sfs {
+			out = append(out, f.Path)
+		}
+		return out
+	}
+
+	t.Run("campaign-minted shape (nil IssueContext) narrows to its slice", func(t *testing.T) {
+		// This is the exact regression shape (#1721): DecomposedFrom set,
+		// SliceIndex set, IssueContext nil — which previously fell through to
+		// the parent's full scope.
+		s, _, childStageID, priv := seed(t, func(child *run.Run, parentRunID uuid.UUID) {
+			idx := 0
+			child.DecomposedFrom = &parentRunID
+			child.SliceIndex = &idx
+			child.IssueContext = nil
+		})
+		w := promptRequest(t, s, uuid.Nil, childStageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		got := scopePaths(resp.ScopeFiles)
+		want := []string{"pkg/a/a.go", "pkg/a/a_test.go"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("scope_files = %v, want the slice-0 narrowing %v (NOT the parent union)", got, want)
+		}
+	})
+
+	t.Run("out-of-range SliceIndex fails closed on /prompt", func(t *testing.T) {
+		s, _, childStageID, priv := seed(t, func(child *run.Run, parentRunID uuid.UUID) {
+			idx := 7 // only 2 sub-plans exist
+			child.DecomposedFrom = &parentRunID
+			child.SliceIndex = &idx
+		})
+		w := promptRequest(t, s, uuid.Nil, childStageID, priv, "")
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		assertDecomposedScopeUnresolved(t, w, 7)
+	})
+
+	t.Run("out-of-range SliceIndex fails closed on /prompt-render", func(t *testing.T) {
+		s, _, childStageID, _ := seed(t, func(child *run.Run, parentRunID uuid.UUID) {
+			idx := 7
+			child.DecomposedFrom = &parentRunID
+			child.SliceIndex = &idx
+		})
+		w := promptRenderRequest(t, s, childStageID)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("render status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		assertDecomposedScopeUnresolved(t, w, 7)
+	})
+
+	t.Run("nil-scope slice fails closed on /prompt-render", func(t *testing.T) {
+		// Slice 1 (Part B) is scoped in newParentPlan, so build a bespoke
+		// parent whose slice-1 carries nil Scope to prove the render surface
+		// also fails closed on an empty-scope match.
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+		parentRunID := uuid.New()
+		childRunID := uuid.New()
+		parentPlanStageID := uuid.New()
+		childStageID := uuid.New()
+		p := &plan.Plan{
+			PlanVersion:  "standard_v1",
+			Summary:      "parent plan",
+			Scope:        plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/a/a.go", Operation: plan.FileOpModify}}},
+			Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+			Decomposition: &plan.Decomposition{
+				Rationale: "scope split",
+				SubPlans: []plan.SubPlanSummary{
+					{Title: "Part A title", ScopeHint: "A", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/a/a.go", Operation: plan.FileOpModify}}}},
+					{Title: "Part B title", ScopeHint: "B"}, // nil Scope
+				},
+			},
+		}
+		planBytes, _ := json.Marshal(p)
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{StageID: parentPlanStageID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: planBytes}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{parentRunID: {{ID: parentPlanStageID, RunID: parentRunID, Type: run.StageTypePlan}}}
+		rr.getRuns[parentRunID] = &run.Run{ID: parentRunID, Repo: "o/r"}
+		idx := 1
+		rr.getRuns[childRunID] = &run.Run{ID: childRunID, Repo: "o/r", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI, ParentRunID: &parentRunID, DecomposedFrom: &parentRunID, SliceIndex: &idx}
+		rr.getStages[childStageID] = &run.Stage{ID: childStageID, RunID: childRunID, Type: run.StageTypeImplement}
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, ArtifactRepo: art})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+
+		w := promptRenderRequest(t, s, childStageID)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("render status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		assertDecomposedScopeUnresolved(t, w, 1)
+	})
+
+	t.Run("decomposed child of a decomposition-less plan fails closed at both endpoints", func(t *testing.T) {
+		// A decomposed child (DecomposedFrom + SliceIndex set) whose loadable
+		// parent plan carries NO decomposition. matchDecomposedSubPlan returns
+		// (nil, -1) for the nil-decomposition plan, so the guard must fail closed
+		// rather than fall through to the plan's top-level scope — the silent
+		// full-scope fallback the approval condition required gone (#1721).
+		seedNoDecomp := func(t *testing.T) (*Server, uuid.UUID, ed25519.PrivateKey) {
+			t.Helper()
+			rr := newPromptRunRepo()
+			sf := newSigningFake()
+			art := newFakeArtifactRepo()
+			parentRunID := uuid.New()
+			childRunID := uuid.New()
+			parentPlanStageID := uuid.New()
+			childStageID := uuid.New()
+			// Parent plan with a top-level scope but NO Decomposition block.
+			p := &plan.Plan{
+				PlanVersion:  "standard_v1",
+				Summary:      "parent plan without decomposition",
+				Scope:        plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/a/a.go", Operation: plan.FileOpModify}, {Path: "pkg/b/b.go", Operation: plan.FileOpModify}}},
+				Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+			}
+			planBytes, _ := json.Marshal(p)
+			sv := "standard_v1"
+			if _, err := art.Create(context.Background(), artifact.CreateParams{StageID: parentPlanStageID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: planBytes}); err != nil {
+				t.Fatalf("seed plan artifact: %v", err)
+			}
+			rr.stagesByRunID = map[uuid.UUID][]*run.Stage{parentRunID: {{ID: parentPlanStageID, RunID: parentRunID, Type: run.StageTypePlan}}}
+			rr.getRuns[parentRunID] = &run.Run{ID: parentRunID, Repo: "o/r"}
+			idx := 0
+			rr.getRuns[childRunID] = &run.Run{ID: childRunID, Repo: "o/r", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI, ParentRunID: &parentRunID, DecomposedFrom: &parentRunID, SliceIndex: &idx}
+			rr.getStages[childStageID] = &run.Stage{ID: childStageID, RunID: childRunID, Type: run.StageTypeImplement}
+			priv, _ := sf.issue(t, childRunID)
+			s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, ArtifactRepo: art})
+			s.promptIssueGetterOverride = &stubIssueGetter{}
+			return s, childStageID, priv
+		}
+
+		s, childStageID, priv := seedNoDecomp(t)
+		w := promptRequest(t, s, uuid.Nil, childStageID, priv, "")
+		if w.Code != http.StatusConflict {
+			t.Fatalf("/prompt status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		assertDecomposedScopeUnresolved(t, w, 0)
+
+		s2, childStageID2, _ := seedNoDecomp(t)
+		wr := promptRenderRequest(t, s2, childStageID2)
+		if wr.Code != http.StatusConflict {
+			t.Fatalf("/prompt-render status = %d, want 409:\n%s", wr.Code, wr.Body.String())
+		}
+		assertDecomposedScopeUnresolved(t, wr, 0)
+	})
+
+	t.Run("nil-SliceIndex child of a decomposed plan fails closed at both endpoints", func(t *testing.T) {
+		// A decomposed child (DecomposedFrom set) with NO persisted SliceIndex
+		// that resolves — via the parent walk — to a plan carrying a
+		// Decomposition is a fan-out child that lost its slice link:
+		// matchDecomposedSubPlan treats a nil index as unlinked, so the guard
+		// fails closed (slice_index -1) rather than falling through to the
+		// parent's full top-level scope — the silent full-scope fallback the
+		// approval condition required gone, not merely bypassed (#1721). The
+		// orchestrator stamps SliceIndex on every real fan-out child, so this
+		// shape is unreachable in production, but the handler must fail closed if
+		// it ever appears rather than reopen the #1669 full-scope binding. (A
+		// nil-SliceIndex child whose resolved plan has NO decomposition is a
+		// standalone child with its own top-level plan — see seed's ParentRunID
+		// walk lands on a decomposed plan here — and keeps that scope instead.)
+		s, _, childStageID, priv := seed(t, func(child *run.Run, parentRunID uuid.UUID) {
+			child.DecomposedFrom = &parentRunID
+			// SliceIndex intentionally left nil.
+		})
+		w := promptRequest(t, s, uuid.Nil, childStageID, priv, "")
+		if w.Code != http.StatusConflict {
+			t.Fatalf("/prompt status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		assertDecomposedScopeUnresolved(t, w, -1)
+
+		s2, _, childStageID2, _ := seed(t, func(child *run.Run, parentRunID uuid.UUID) {
+			child.DecomposedFrom = &parentRunID
+		})
+		wr := promptRenderRequest(t, s2, childStageID2)
+		if wr.Code != http.StatusConflict {
+			t.Fatalf("/prompt-render status = %d, want 409:\n%s", wr.Code, wr.Body.String())
+		}
+		assertDecomposedScopeUnresolved(t, wr, -1)
+	})
+
+	t.Run("non-decomposed control keeps full scope, no 409", func(t *testing.T) {
+		s, _, childStageID, priv := seed(t, func(child *run.Run, _ uuid.UUID) {
+			// DecomposedFrom nil → ordinary run; never touches the require path.
+		})
+		w := promptRequest(t, s, uuid.Nil, childStageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
 		got := scopePaths(resp.ScopeFiles)
 		want := []string{"pkg/a/a.go", "pkg/b/b.go"}
 		if !reflect.DeepEqual(got, want) {
@@ -4010,12 +4412,14 @@ func TestResolveDecomposedScope_DisjointSlices(t *testing.T) {
 		},
 	}
 
-	childFor := func(title string) *run.Run {
+	childFor := func(title string, idx int) *run.Run {
+		sliceIdx := idx
 		return &run.Run{
 			ID:             uuid.New(),
 			Repo:           "o/r",
 			ParentRunID:    &parentRunID,
 			DecomposedFrom: &parentRunID,
+			SliceIndex:     &sliceIdx,
 			IssueContext: &run.IssueContext{
 				Title: title,
 				Body:  "## " + title + "\n\nslice body\n\n---\n*Decomposed sub-plan.*",
@@ -4038,8 +4442,8 @@ func TestResolveDecomposedScope_DisjointSlices(t *testing.T) {
 
 	narrowedSets := make([][]string, 0, len(slices))
 	unionDeclared := map[string]struct{}{}
-	for _, sl := range slices {
-		child := childFor(sl.title)
+	for i, sl := range slices {
+		child := childFor(sl.title, i)
 
 		// (a) resolveDecomposedScopeFiles narrows to the slice + its coupled test.
 		gotFiles := scopePathsList(s.resolveDecomposedScopeFiles(ctx, child, parentPlan))
@@ -4422,8 +4826,9 @@ func TestGetStagePrompt_Implement_RecoveryScopeExemptionsAndReason(t *testing.T)
 func TestGetStagePrompt_ApprovalConditions_DecompositionFallback(t *testing.T) {
 	const parentCondition = "Use the orthogonal-lens reviewer; do NOT touch the legacy adapter."
 
-	// parentPlan carries a two-sub-plan decomposition so the child can match
-	// a sub-plan via its IssueContext.Body prefix (matchDecomposedSubPlan).
+	// parentPlan carries a two-sub-plan decomposition; the child links to a
+	// sub-plan by SliceIndex (matchDecomposedSubPlan, #1721). Each sub-plan
+	// declares its own scope so the child resolves rather than failing closed.
 	newParentPlan := func() *plan.Plan {
 		return &plan.Plan{
 			PlanVersion:  "standard_v1",
@@ -4432,16 +4837,16 @@ func TestGetStagePrompt_ApprovalConditions_DecompositionFallback(t *testing.T) {
 			Decomposition: &plan.Decomposition{
 				Rationale: "scope split",
 				SubPlans: []plan.SubPlanSummary{
-					{Title: "Part A title", ScopeHint: "Implement Part A in pkg/a."},
-					{Title: "Part B title", ScopeHint: "Implement Part B in pkg/b."},
+					{Title: "Part A title", ScopeHint: "Implement Part A in pkg/a.", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/a/a.go", Operation: plan.FileOpModify}}}},
+					{Title: "Part B title", ScopeHint: "Implement Part B in pkg/b.", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/b/b.go", Operation: plan.FileOpModify}}}},
 				},
 			},
 		}
 	}
 
 	// seedDecomposedChild wires a parent plan artifact + a decomposed child run
-	// whose IssueContext.Body matches Part A, with the supplied audit entries
-	// keyed by run ID, and returns the child's implement-stage prompt response.
+	// linked to Part A by SliceIndex=0, with the supplied audit entries keyed
+	// by run ID, and returns the child's implement-stage prompt response.
 	seedDecomposedChild := func(t *testing.T, auditByRun map[uuid.UUID][]*audit.Entry, parentRunID uuid.UUID) promptResponse {
 		t.Helper()
 		rr := newPromptRunRepo()
@@ -4473,6 +4878,7 @@ func TestGetStagePrompt_ApprovalConditions_DecompositionFallback(t *testing.T) {
 		}
 		rr.getRuns[parentRunID] = &run.Run{ID: parentRunID, Repo: "o/r"}
 
+		sliceIdx := 0
 		childBody := "## Part A title\n\nImplement Part A in pkg/a.\n\n---\n*Decomposed sub-plan.*"
 		rr.getRuns[childRunID] = &run.Run{
 			ID:             childRunID,
@@ -4481,6 +4887,7 @@ func TestGetStagePrompt_ApprovalConditions_DecompositionFallback(t *testing.T) {
 			TriggerSource:  run.TriggerCLI,
 			ParentRunID:    &parentRunID,
 			DecomposedFrom: &parentRunID,
+			SliceIndex:     &sliceIdx,
 			IssueContext: &run.IssueContext{
 				Title: "Part A title",
 				Body:  childBody,
@@ -4897,15 +5304,25 @@ func TestGetStagePrompt_Implement_AddScopeFilesFoldedIntoScope(t *testing.T) {
 		parentPlanStageID := uuid.New()
 		childStageID := uuid.New()
 
-		// Parent plan declares a scope file so the child's resolved scope is
-		// non-empty (the fold guard requires it) — the child matches no
-		// sub-plan, so it falls back to the parent's top-level scope.
+		// Parent plan declares a decomposition whose slice-0 sub-plan scopes the
+		// same file, so the child resolves its slice to a non-empty scope. Post
+		// #1721 a decomposed child MUST link to a slice — a decomposition-less
+		// parent plan now fails closed rather than inheriting the parent's
+		// top-level scope. add_scope_files is keyed to the PARENT run, so the fold
+		// must still walk up and land the inherited paths in the child's resolved
+		// slice scope.
 		parentPlan := &plan.Plan{
 			PlanVersion:  "standard_v1",
 			Summary:      "parent plan",
 			Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
 			Scope: plan.Scope{
 				Files: []plan.ScopeFile{{Path: plannedFile, Operation: plan.FileOpModify}},
+			},
+			Decomposition: &plan.Decomposition{
+				Rationale: "scope split",
+				SubPlans: []plan.SubPlanSummary{
+					{Title: "Part A", ScopeHint: "A", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: plannedFile, Operation: plan.FileOpModify}}}},
+				},
 			},
 		}
 		planBytes, err := json.Marshal(parentPlan)
@@ -4926,6 +5343,7 @@ func TestGetStagePrompt_Implement_AddScopeFilesFoldedIntoScope(t *testing.T) {
 			parentRunID: {{ID: parentPlanStageID, RunID: parentRunID, Type: run.StageTypePlan}},
 		}
 		rr.getRuns[parentRunID] = &run.Run{ID: parentRunID, Repo: "o/r"}
+		childSliceIdx := 0
 		rr.getRuns[childRunID] = &run.Run{
 			ID:             childRunID,
 			Repo:           "o/r",
@@ -4933,6 +5351,7 @@ func TestGetStagePrompt_Implement_AddScopeFilesFoldedIntoScope(t *testing.T) {
 			TriggerSource:  run.TriggerCLI,
 			ParentRunID:    &parentRunID,
 			DecomposedFrom: &parentRunID,
+			SliceIndex:     &childSliceIdx,
 		}
 		rr.getStages[childStageID] = &run.Stage{ID: childStageID, RunID: childRunID, Type: run.StageTypeImplement}
 

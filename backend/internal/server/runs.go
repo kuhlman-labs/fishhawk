@@ -809,8 +809,17 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 // spec at workflowRef (empty = the repo's default branch), and uses the
 // fetched blob SHA as the run's workflow_sha. The run is created with
 // trigger_source=github_issue and trigger_ref=issueRef so the runner's
-// prompt builder fetches the issue context; no issue context is cached here
-// because the campaign assembly retains only the issue ref.
+// prompt builder fetches the issue context.
+//
+// It also best-effort hydrates the run row's IssueContext (title/body/url/
+// number + comments) from GitHub at mint time (#1721). This matters for a
+// decomposed parent: its fan-out children inherit the parent's IssueContext to
+// build their headers and degraded prompt context, and a nil parent context
+// previously left every child headerless. Correctness of child scope narrowing
+// now rests on the persisted SliceIndex linkage (see matchDecomposedSubPlan),
+// not on this context; hydration is purely additive. A parse or fetch failure
+// logs a warn and proceeds with IssueContext=nil so hydration NEVER blocks a
+// run start.
 //
 // Requires a configured GitHub client (the campaign repo carries no inline
 // spec). Returns an error rather than starting a run when the installation or
@@ -855,6 +864,13 @@ func (s *Server) StartRunForCampaignIssue(ctx context.Context, repo, issueRef, w
 	}
 
 	triggerRef := issueRef
+	// Best-effort IssueContext hydration (#1721): parse the issue number and
+	// fetch title/body/url/number + comments so campaign-minted parents carry
+	// the same cached context as CLI/webhook runs. A decomposed parent's
+	// children inherit this to build their headers + degraded prompt context.
+	// Degrades to nil on a parse or fetch failure — hydration never blocks the
+	// start; child scope correctness rests on the SliceIndex linkage instead.
+	issueCtx := s.hydrateCampaignIssueContext(ctx, instID, repoRef, issueRef)
 	return s.CreateRunForTrigger(ctx, CreateRunForTriggerParams{
 		Repo:               repo,
 		WorkflowID:         workflowID,
@@ -863,11 +879,53 @@ func (s *Server) StartRunForCampaignIssue(ctx context.Context, repo, issueRef, w
 		TriggerRef:         &triggerRef,
 		RunnerKind:         runnerKind,
 		InstallationID:     &instID,
+		IssueContext:       issueCtx,
 		HaveStageDefs:      true,
 		WorkflowDef:        wf,
 		WorkflowSpec:       fc.Content,
 		MaxRetriesSnapshot: webhook.WorkflowMaxRetries(wf),
 	})
+}
+
+// hydrateCampaignIssueContext best-effort fetches a campaign item's issue into
+// a *run.IssueContext for caching on the run row (#1721). Returns nil (and
+// warn-logs) when the ref can't be parsed as issue:N or the GitHub fetch
+// fails, so hydration never blocks a campaign run start. A comment-list fetch
+// failure degrades to title+body (the comments slice stays nil) rather than
+// discarding the whole context.
+func (s *Server) hydrateCampaignIssueContext(ctx context.Context, instID int64, repoRef githubclient.RepoRef, issueRef string) *run.IssueContext {
+	number, ok := parseIssueRef(issueRef)
+	if !ok {
+		s.cfg.Logger.Warn("campaign run start: issue ref not parseable; proceeding without issue context",
+			"repo", repoRef.Owner+"/"+repoRef.Name, "issue_ref", issueRef)
+		return nil
+	}
+	issue, err := s.cfg.GitHub.GetIssue(ctx, instID, repoRef, number)
+	if err != nil {
+		s.cfg.Logger.Warn("campaign run start: hydrate issue context failed; proceeding without",
+			"repo", repoRef.Owner+"/"+repoRef.Name, "issue", number, "error", err.Error())
+		return nil
+	}
+	ic := &run.IssueContext{
+		Title:  issue.Title,
+		Body:   issue.Body,
+		URL:    fmt.Sprintf("https://github.com/%s/%s/issues/%d", repoRef.Owner, repoRef.Name, number),
+		Number: number,
+	}
+	comments, err := s.cfg.GitHub.ListIssueComments(ctx, instID, repoRef, number)
+	if err != nil {
+		s.cfg.Logger.Warn("campaign run start: list issue comments failed; proceeding with title+body",
+			"repo", repoRef.Owner+"/"+repoRef.Name, "issue", number, "error", err.Error())
+		return ic
+	}
+	for _, c := range comments {
+		ic.Comments = append(ic.Comments, run.IssueComment{
+			Author:    c.Author,
+			Body:      c.Body,
+			CreatedAt: c.CreatedAt,
+		})
+	}
+	return ic
 }
 
 // CreateRunForTriggerParams carries the already-resolved inputs

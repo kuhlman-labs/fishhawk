@@ -6091,16 +6091,17 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: Stage is not in a runnable state (awaiting_approval, awaiting_children, succeeded, failed, or cancelled).
+          description: |
+            Stage is not in a runnable state, or a decomposed child's slice scope could not be resolved.
           content:
             application/json:
               schema:
                 allOf:
                   - { $ref: '#/components/schemas/Error' }
                   - description: |
-                      `error.code` is `stage_not_runnable`.
-                      `error.details.current_state` holds the stage's current state string.
-                      `error.details.stage_id` holds the stage UUID.
+                      `error.code` is one of:
+                      - `stage_not_runnable` — the stage is awaiting_approval, awaiting_children, succeeded, failed, or cancelled. `error.details.current_state` holds the stage's current state string and `error.details.stage_id` holds the stage UUID.
+                      - `decomposed_scope_unresolved` — the run is a decomposed child of a plan that declares a decomposition, but its slice scope could not be resolved (its persisted `slice_index` is out of range for the parent plan's sub_plans, or the matched sub-plan declares no scope files). The dispatch fails closed rather than serving the parent's full scope (#1721). `error.details.run_id` holds the child run UUID, `error.details.slice_index` the child's 0-based slice index (`-1` when the row carries none), and `error.details.parent_run_id` the parent (decomposed_from) run UUID.
         '501':
           description: Prompt construction not implemented for this stage type.
           content:
@@ -6235,16 +6236,17 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: Stage is not in a runnable state (awaiting_approval, awaiting_children, succeeded, failed, or cancelled).
+          description: |
+            Stage is not in a runnable state, or a decomposed child's slice scope could not be resolved.
           content:
             application/json:
               schema:
                 allOf:
                   - { $ref: '#/components/schemas/Error' }
                   - description: |
-                      `error.code` is `stage_not_runnable`.
-                      `error.details.current_state` holds the stage's current state string.
-                      `error.details.stage_id` holds the stage UUID.
+                      `error.code` is one of:
+                      - `stage_not_runnable` — the stage is awaiting_approval, awaiting_children, succeeded, failed, or cancelled. `error.details.current_state` holds the stage's current state string and `error.details.stage_id` holds the stage UUID.
+                      - `decomposed_scope_unresolved` — the run is a decomposed child of a plan that declares a decomposition, but its slice scope could not be resolved (its persisted `slice_index` is out of range for the parent plan's sub_plans, or the matched sub-plan declares no scope files). The dispatch fails closed rather than serving the parent's full scope (#1721). `error.details.run_id` holds the child run UUID, `error.details.slice_index` the child's 0-based slice index (`-1` when the row carries none), and `error.details.parent_run_id` the parent (decomposed_from) run UUID.
         '501':
           description: Prompt construction not implemented for this stage type.
           content:

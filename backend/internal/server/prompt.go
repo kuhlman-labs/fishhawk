@@ -701,15 +701,39 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		scopeFiles = scopeFilesFromPlan(approvedPlan)
-		// Decomposition fan-out (#676): a child run narrows its scope to
-		// the matched sub-plan's own scope.files when present, so the
-		// runner's scope_handoff + scope-drift bound to this slice rather
-		// than the parent's full scope. Falls back to the parent scope
-		// when the sub-plan omits scope or the run isn't a decomposed child.
-		if childScope := s.resolveDecomposedScopeFiles(r.Context(), runRow, approvedPlan); len(childScope) > 0 {
+		// Decomposition fan-out (#676, fail-loud #1721): a genuine fan-out slice
+		// child carries DecomposedFrom and narrows its scope to its own sub-plan
+		// slice, linked by the SliceIndex the orchestrator stamps on every
+		// fan-out child. A fan-out child whose slice scope cannot be resolved —
+		// no linked sub-plan (INCLUDING a loaded plan whose Decomposition is nil,
+		// via matchDecomposedSubPlan's nil-plan degrade), a NIL SliceIndex against
+		// a decomposed plan, an unmatched/out-of-range index, or a matched slice
+		// with empty scope — FAILS CLOSED (409 decomposed_scope_unresolved) rather
+		// than silently inheriting the parent's full scope — the #1669 regression
+		// that reopened when campaign-minted parents fanned out children with a
+		// nil IssueContext.
+		//
+		// The guard fires for a decomposed child that either claims a slice
+		// (SliceIndex != nil) OR resolves to a plan that actually carries a
+		// Decomposition to narrow to. It deliberately does NOT require
+		// approvedPlan.Decomposition to be non-nil once a SliceIndex is present
+		// (a slice child whose loaded plan carries no decomposition has nothing
+		// legitimate to narrow to → still fails closed). But a decomposed child
+		// with a NIL SliceIndex AND a resolved plan with no Decomposition is not a
+		// fan-out slice at all — it is a standalone child with its own top-level
+		// plan — so it keeps that plan's scope rather than failing closed. A
+		// missing plan is handled above (emitPlanMissingForImplement).
+		// Non-decomposed runs are untouched.
+		if runRow.DecomposedFrom != nil && approvedPlan != nil &&
+			(runRow.SliceIndex != nil || approvedPlan.Decomposition != nil) {
+			childScope, childConstraint, scopeErr := s.requireDecomposedScope(r.Context(), runRow, approvedPlan)
+			if scopeErr != nil {
+				s.writeDecomposedScopeUnresolved(w, r, scopeErr)
+				return
+			}
 			scopeFiles = childScope
+			trigger.ScopeConstraint = childConstraint
 		}
-		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow, approvedPlan)
 		trigger.ApprovalConditions = s.resolveApprovalConditions(r.Context(), runRow)
 		// Part D (#1229): a recovery run's resume_run reason rides the existing
 		// #558 binding-conditions channel so the operator's steer at recovery
@@ -1035,15 +1059,39 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			}
 		}
 		scopeFiles = scopeFilesFromPlan(approvedPlan)
-		// Decomposition fan-out (#676): a child run narrows its scope to
-		// the matched sub-plan's own scope.files when present, so the
-		// runner's scope_handoff + scope-drift bound to this slice rather
-		// than the parent's full scope. Falls back to the parent scope
-		// when the sub-plan omits scope or the run isn't a decomposed child.
-		if childScope := s.resolveDecomposedScopeFiles(r.Context(), runRow, approvedPlan); len(childScope) > 0 {
+		// Decomposition fan-out (#676, fail-loud #1721): a genuine fan-out slice
+		// child carries DecomposedFrom and narrows its scope to its own sub-plan
+		// slice, linked by the SliceIndex the orchestrator stamps on every
+		// fan-out child. A fan-out child whose slice scope cannot be resolved —
+		// no linked sub-plan (INCLUDING a loaded plan whose Decomposition is nil,
+		// via matchDecomposedSubPlan's nil-plan degrade), a NIL SliceIndex against
+		// a decomposed plan, an unmatched/out-of-range index, or a matched slice
+		// with empty scope — FAILS CLOSED (409 decomposed_scope_unresolved) rather
+		// than silently inheriting the parent's full scope — the #1669 regression
+		// that reopened when campaign-minted parents fanned out children with a
+		// nil IssueContext.
+		//
+		// The guard fires for a decomposed child that either claims a slice
+		// (SliceIndex != nil) OR resolves to a plan that actually carries a
+		// Decomposition to narrow to. It deliberately does NOT require
+		// approvedPlan.Decomposition to be non-nil once a SliceIndex is present
+		// (a slice child whose loaded plan carries no decomposition has nothing
+		// legitimate to narrow to → still fails closed). But a decomposed child
+		// with a NIL SliceIndex AND a resolved plan with no Decomposition is not a
+		// fan-out slice at all — it is a standalone child with its own top-level
+		// plan — so it keeps that plan's scope rather than failing closed. A
+		// missing plan is handled above (emitPlanMissingForImplement).
+		// Non-decomposed runs are untouched.
+		if runRow.DecomposedFrom != nil && approvedPlan != nil &&
+			(runRow.SliceIndex != nil || approvedPlan.Decomposition != nil) {
+			childScope, childConstraint, scopeErr := s.requireDecomposedScope(r.Context(), runRow, approvedPlan)
+			if scopeErr != nil {
+				s.writeDecomposedScopeUnresolved(w, r, scopeErr)
+				return
+			}
 			scopeFiles = childScope
+			trigger.ScopeConstraint = childConstraint
 		}
-		trigger.ScopeConstraint = s.resolveDecomposedScopeConstraint(r.Context(), runRow, approvedPlan)
 		trigger.ApprovalConditions = s.resolveApprovalConditions(r.Context(), runRow)
 		// Part D (#1229): a recovery run's resume_run reason rides the existing
 		// #558 binding-conditions channel so the operator's steer at recovery
@@ -2425,44 +2473,131 @@ func (s *Server) resolveFixupAllowCreate(ctx context.Context, runID, stageID uui
 	return nil
 }
 
-// matchDecomposedSubPlan returns the sub-plan whose title prefixes the
-// child run's IssueContext.Body, plus its index within the decomposition's
-// sub_plans. Returns (nil, -1) when:
+// matchDecomposedSubPlan returns the sub-plan a decomposed child run owns,
+// plus its index within the decomposition's sub_plans. Linkage is by the
+// child run row's SliceIndex — the 0-based sub_plan position the orchestrator
+// persists on every fan-out child (orchestrator.fanoutIfDecomposed sets
+// CreateRunParams.SliceIndex, round-tripped through the runs.slice_index
+// column). This durable index replaces the earlier string-prefix match
+// against IssueContext.Body, which returned nil for a campaign-minted parent:
+// its nil IssueContext yielded a headerless child body, so every prefix match
+// failed and each child silently inherited the parent's full scope (#1721,
+// reopening #1669).
+//
+// Returns (nil, -1) when:
 //   - the run is not decomposed (DecomposedFrom == nil)
-//   - the run has no cached IssueContext (can't match a sub-plan without it)
+//   - the run carries no SliceIndex (not a fan-out child)
 //   - parentPlan is nil or carries no decomposition (degrade gracefully)
-//   - no sub-plan title matches the child's IssueContext.Body prefix
-//     (defensive — a wrong match is worse than none)
+//   - *SliceIndex is out of range for the decomposition's sub_plans
+//     (defensive — an out-of-band plan whose sub_plans no longer cover the
+//     persisted index)
 //
 // parentPlan is the already-loaded approved plan for the child run; for a
 // decomposed child loadApprovedPlanForRun walks ParentRunID up to the
 // parent's decomposed plan, so the caller's single load is reused here
 // instead of re-reading the artifact.
-//
-// Matching uses strings.HasPrefix(body, "## "+title+"\n\n"), which is the
-// invariant enforced by childIssueContextFromSubPlan in orchestrator.go.
 func matchDecomposedSubPlan(runRow *run.Run, parentPlan *plan.Plan) (*plan.SubPlanSummary, int) {
-	if runRow.DecomposedFrom == nil || runRow.IssueContext == nil {
+	if runRow.DecomposedFrom == nil || runRow.SliceIndex == nil {
 		return nil, -1
 	}
 	if parentPlan == nil || parentPlan.Decomposition == nil {
 		return nil, -1
 	}
-	body := runRow.IssueContext.Body
-	for i := range parentPlan.Decomposition.SubPlans {
-		sub := &parentPlan.Decomposition.SubPlans[i]
-		if strings.HasPrefix(body, "## "+sub.Title+"\n\n") {
-			return sub, i
+	idx := *runRow.SliceIndex
+	if idx < 0 || idx >= len(parentPlan.Decomposition.SubPlans) {
+		return nil, -1
+	}
+	return &parentPlan.Decomposition.SubPlans[idx], idx
+}
+
+// decomposedScopeError is returned by requireDecomposedScope when a decomposed
+// child's slice scope cannot be resolved. It is the fail-loud (#1721)
+// replacement for the pre-fix silent full-parent-scope fallback: the prompt
+// handlers render it as a 409 decomposed_scope_unresolved naming the child,
+// its slice index, and the parent, rather than serving the parent's full
+// scope to a child that would then conflict permanently at fan-in.
+type decomposedScopeError struct {
+	childRunID  string
+	sliceIndex  int // -1 when the run carries no SliceIndex
+	parentRunID string
+	reason      string
+}
+
+func (e *decomposedScopeError) Error() string {
+	return fmt.Sprintf("decomposed child %s (slice %d, parent %s): %s",
+		e.childRunID, e.sliceIndex, e.parentRunID, e.reason)
+}
+
+// requireDecomposedScope resolves the narrowed scope for a decomposed child
+// run, failing closed rather than degrading to the parent's full scope
+// (#1721). It requires matchDecomposedSubPlan to link the child to a sub-plan
+// (by the persisted SliceIndex) whose Scope declares >=1 file; any miss —
+// no linkage, out-of-range index, or a matched slice with nil/empty scope —
+// returns a *decomposedScopeError naming the child, its slice index, and the
+// parent. On success it returns the slice's own scope.files (with coupled
+// *_test.go siblings folded, matching the narrowing) plus the per-slice
+// ScopeConstraint.
+//
+// Callers MUST invoke this only for a decomposed child (runRow.DecomposedFrom
+// != nil); a non-decomposed run keeps the parent plan's full scope and a nil
+// constraint at the call site.
+func (s *Server) requireDecomposedScope(ctx context.Context, runRow *run.Run, parentPlan *plan.Plan) ([]scopeFile, *prompt.ScopeConstraint, error) {
+	sliceIdx := -1
+	if runRow.SliceIndex != nil {
+		sliceIdx = *runRow.SliceIndex
+	}
+	parentRunID := ""
+	if runRow.DecomposedFrom != nil {
+		parentRunID = runRow.DecomposedFrom.String()
+	}
+	matched, matchIdx := matchDecomposedSubPlan(runRow, parentPlan)
+	if matched == nil {
+		return nil, nil, &decomposedScopeError{
+			childRunID:  runRow.ID.String(),
+			sliceIndex:  sliceIdx,
+			parentRunID: parentRunID,
+			reason:      "no sub-plan linked to the child's slice index",
 		}
 	}
-	return nil, -1
+	files := s.resolveDecomposedScopeFiles(ctx, runRow, parentPlan)
+	if len(files) == 0 {
+		return nil, nil, &decomposedScopeError{
+			childRunID:  runRow.ID.String(),
+			sliceIndex:  matchIdx,
+			parentRunID: parentRunID,
+			reason:      "linked sub-plan declares no scope files",
+		}
+	}
+	return files, s.resolveDecomposedScopeConstraint(ctx, runRow, parentPlan), nil
+}
+
+// writeDecomposedScopeUnresolved renders a requireDecomposedScope failure as a
+// 409 decomposed_scope_unresolved with run_id / slice_index / parent_run_id
+// details. Shared by both prompt endpoints (handleGetStagePrompt and
+// handleGetStagePromptRender) so the dispatch and preview/render surfaces fail
+// closed identically (#1721).
+func (s *Server) writeDecomposedScopeUnresolved(w http.ResponseWriter, r *http.Request, err error) {
+	var scopeErr *decomposedScopeError
+	if errors.As(err, &scopeErr) {
+		s.writeError(w, r, http.StatusConflict, "decomposed_scope_unresolved", scopeErr.Error(),
+			map[string]any{
+				"run_id":        scopeErr.childRunID,
+				"slice_index":   scopeErr.sliceIndex,
+				"parent_run_id": scopeErr.parentRunID,
+			})
+		return
+	}
+	// Defensive: any non-typed error from the require path still fails closed.
+	s.writeError(w, r, http.StatusConflict, "decomposed_scope_unresolved", err.Error(), nil)
 }
 
 // resolveDecomposedScopeConstraint builds a *prompt.ScopeConstraint for
 // child runs of a decomposed plan. Returns nil when the child doesn't
-// match a sub-plan (see matchDecomposedSubPlan). parentPlan is the
-// caller's already-loaded approved plan — for a decomposed child this is
-// the parent's decomposed plan — so no additional artifact read happens.
+// match a sub-plan (see matchDecomposedSubPlan) — for a decomposed child
+// requireDecomposedScope now turns that nil into a fail-loud 409 rather than
+// letting the caller degrade to the parent's full scope (#1721). parentPlan
+// is the caller's already-loaded approved plan — for a decomposed child this
+// is the parent's decomposed plan — so no additional artifact read happens.
 func (s *Server) resolveDecomposedScopeConstraint(ctx context.Context, runRow *run.Run, parentPlan *plan.Plan) *prompt.ScopeConstraint {
 	matched, matchIdx := matchDecomposedSubPlan(runRow, parentPlan)
 	if matched == nil {
@@ -2503,10 +2638,11 @@ func (s *Server) resolveDecomposedScopeConstraint(ctx context.Context, runRow *r
 // resolveDecomposedScopeFiles returns the matched sub-plan's own
 // scope.files for a decomposed child, converted to the prompt-response
 // wire shape. Returns nil when the child doesn't match a sub-plan or the
-// matched sub-plan omits scope — in which case the caller keeps the
-// parent plan's full scope.files (backward-compatible fallback).
-// parentPlan is the caller's already-loaded approved plan, reused here
-// rather than re-read.
+// matched sub-plan omits scope. For a decomposed child this nil is no
+// longer a silent full-scope fallback: requireDecomposedScope treats it as
+// a fail-closed condition and the caller returns 409
+// decomposed_scope_unresolved (#1721). parentPlan is the caller's already-
+// loaded approved plan, reused here rather than re-read.
 func (s *Server) resolveDecomposedScopeFiles(ctx context.Context, runRow *run.Run, parentPlan *plan.Plan) []scopeFile {
 	matched, _ := matchDecomposedSubPlan(runRow, parentPlan)
 	if matched == nil || matched.Scope == nil {
