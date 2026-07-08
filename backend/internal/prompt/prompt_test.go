@@ -4355,7 +4355,7 @@ func TestBuild_ImplementReview_AmendedScope_RendersSection(t *testing.T) {
 		"docs/extra.md",
 		"Do NOT record a scope-drift concern for any",
 		// Criterion 4 must reference the amended list.
-		"Scope amended at approval' section above (when present) ARE in-scope",
+		"Scope amended at approval' section below (when present) ARE in-scope",
 		"in NEITHER scope.files NOR the amended-scope list are drift",
 	} {
 		if !strings.Contains(got, w) {
@@ -4728,7 +4728,7 @@ func TestBuild_ImplementReview_GateEvidence_RendersAllFacts(t *testing.T) {
 		"- check: constraints (constraint: forbidden_paths) — path matches forbidden glob",
 		"files: .github/workflows/ci.yml",
 		// The softened non-goals preamble defers to the evidence section.
-		"Mechanical correctness is reported by the deterministic gates in the 'Gate evidence' section above",
+		"Mechanical correctness is reported by the deterministic gates in the 'Gate evidence' section below",
 	} {
 		if !strings.Contains(got, w) {
 			t.Errorf("gate-evidence prompt missing %q:\n%s", w, got)

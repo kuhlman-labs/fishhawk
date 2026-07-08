@@ -2437,7 +2437,7 @@ func buildImplementReview(t Trigger) string {
 	if len(t.PriorConcerns) > 0 {
 		b.WriteString("  \"concern_resolutions\": [\n")
 		b.WriteString("    {\n")
-		b.WriteString("      \"id\": \"<the concern id from the Prior concerns section above>\",\n")
+		b.WriteString("      \"id\": \"<the concern id from the Prior concerns section below>\",\n")
 		b.WriteString("      \"resolution\": \"confirmed\" | \"reopened\" | \"superseded\",\n")
 		b.WriteString("      \"note\": \"<optional short justification>\"\n")
 		b.WriteString("    }\n")
@@ -2459,7 +2459,7 @@ func buildImplementReview(t Trigger) string {
 		// the run-07bce059 reviewer to ignore build truth. Point at the
 		// evidence section instead.
 		b.WriteString("**Non-goals — do NOT spend the review on these.** Mechanical correctness is reported by " +
-			"the deterministic gates in the 'Gate evidence' section above — read THAT section for the actual " +
+			"the deterministic gates in the 'Gate evidence' section below — read THAT section for the actual " +
 			"build/test/scope state rather than assuming the gates passed. A failed or skipped gate there is " +
 			"ground truth and overrides any presumption that the change is well-formed. Beyond reading that " +
 			"section:\n")
@@ -2491,7 +2491,7 @@ func buildImplementReview(t Trigger) string {
 	b.WriteString("Three standing criteria orthogonal to the lenses above also apply:\n\n")
 	b.WriteString("4. **Scope adherence (flag-only)**: Does the diff touch files outside the plan's scope.files? " +
 		"If so, record a `{category: \"scope\"}` concern naming the out-of-scope files. " +
-		"Files listed in the 'Scope amended at approval' section above (when present) ARE in-scope — they were " +
+		"Files listed in the 'Scope amended at approval' section below (when present) ARE in-scope — they were " +
 		"operator-authorized at approval time — and must NOT be flagged as drift. Only files the diff touches " +
 		"that are in NEITHER scope.files NOR the amended-scope list are drift. " +
 		"Do NOT reject solely for scope drift — drift is a flag, not a blocker.\n")
@@ -2503,7 +2503,7 @@ func buildImplementReview(t Trigger) string {
 	b.WriteString("6. **Style is out of scope**: Subjective style judgments (comment length, naming aesthetics, " +
 		"formatting) are out of scope for review — that is lint's job. Focus on the security / authz, " +
 		"test-vacuity, and untested-path lenses, plus scope drift (flag-only).\n")
-	b.WriteString("7. **Do NOT reject on an unconfirmable absence (standing rule)**: The diff shown above is " +
+	b.WriteString("7. **Do NOT reject on an unconfirmable absence (standing rule)**: The diff shown below is " +
 		"scope-bounded — it excludes any scope-drift paths the operator may stage into the final commit (see the " +
 		"Scope drift section when present). So a required test, doc, or other file appearing absent from the diff " +
 		"is NOT proof it is missing: it may be a drift path or otherwise outside this scoped view. Do NOT reject on " +

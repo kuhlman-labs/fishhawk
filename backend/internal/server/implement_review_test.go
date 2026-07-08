@@ -392,7 +392,7 @@ func TestShipTrace_ImplementReview_GateEvidenceThreadedIntoPrompt(t *testing.T) 
 		"- backend/internal/foo/helper.go (category A: agent edit to a tracked file EXCLUDED from the commit — " +
 			"the pushed head may be missing a required change)",
 		// The softened non-goals preamble defers to the evidence section.
-		"Mechanical correctness is reported by the deterministic gates in the 'Gate evidence' section above",
+		"Mechanical correctness is reported by the deterministic gates in the 'Gate evidence' section below",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("reviewer prompt missing %q from threaded gate evidence:\n%s", want, got)
