@@ -405,6 +405,19 @@ type Trigger struct {
 	// the Diff file-list rendering with the original #561 read-the-files
 	// caveat. Empty for any non-implement-review build.
 	DiffPatch string
+	// DeltaReReview marks the implement-review prompt as a post-fix-up DELTA
+	// re-review (#1725): Diff/DiffPatch carry ONLY the fix-up changes since the
+	// head the previous review ran against (the githubclient.ComparePatch delta),
+	// not the full base..head PR diff. When true, buildImplementReview renders a
+	// short framing line in the "### Diff under review" section telling the
+	// reviewer the shown diff is the fix-up delta and that it should focus on
+	// whether the routed prior concerns are resolved via concern_resolutions;
+	// the full prior diff was already reviewed. runImplementReviews sets it true
+	// ONLY on the delta path — every first review and every fail-closed degrade
+	// (no GitHub client, unresolvable prior head, compare error) leaves it false,
+	// keeping the "### Diff under review" section byte-identical to today's
+	// first-review rendering.
+	DeltaReReview bool
 	// ScopeDrift is the runner-reported list of paths that the implement
 	// stage created/modified but that were EXCLUDED from the scope-bounded
 	// diff above — paths the operator may stage into the final commit
@@ -2392,10 +2405,186 @@ func buildImplementReview(t Trigger) string {
 		return b.String()
 	}
 
-	// Diff under review — the primary input. The split marker leads this
-	// section so caching adapters can split the stable preamble from the
-	// variable diff/plan/issue content.
+	// Cache-stable prefix ordering (#1725). The stable / per-run-stable content
+	// leads: the verdict schema, review criteria + decision rule, the approved
+	// plan, issue context, and approval conditions. Across the fix-up re-review
+	// rounds of a stage these are unchanged, so leading with them — ahead of the
+	// single split boundary at "### Diff under review" (ImplementReviewSplitMarker)
+	// — maximizes the cached prefix that accumulates across rounds (the Anthropic
+	// adapter caches the system block ending at the boundary; codex/gpt-5.5 sends
+	// the whole prompt as one positional arg and relies on OpenAI automatic
+	// prefix caching). The per-round-variable payload (diff, scope drift, gate
+	// evidence, security findings, amended scope, prior concerns) trails behind
+	// the boundary. Every section's internal text is unchanged from before the
+	// reorder — only the order of the blocks changed.
+
+	// Verdict schema — inline so the reviewer doesn't need to fetch it.
+	// The concern_resolutions member renders only when prior concerns are
+	// listed below (#984): a first review has nothing to resolve, and the
+	// omission keeps that prompt byte-identical to the pre-#984 output.
+	b.WriteString("### Verdict schema\n\n")
+	b.WriteString("Emit exactly this JSON shape. All fields shown; omit `concerns` and `free_form` when empty:\n\n")
+	b.WriteString("{\n")
+	b.WriteString("  \"verdict\": \"approve\" | \"approve_with_concerns\" | \"reject\",\n")
+	b.WriteString("  \"concerns\": [\n")
+	b.WriteString("    {\n")
+	b.WriteString("      \"severity\": \"high\" | \"medium\" | \"low\",\n")
+	b.WriteString("      \"category\": \"<short classifier, e.g. scope | correctness | regression | verification>\",\n")
+	b.WriteString("      \"note\": \"<free-form explanation of the concern>\",\n")
+	b.WriteString("      \"suggested_patch\": \"<optional unified diff that applies to the PR branch>\"\n")
+	b.WriteString("    }\n")
+	b.WriteString("  ],\n")
+	if len(t.PriorConcerns) > 0 {
+		b.WriteString("  \"concern_resolutions\": [\n")
+		b.WriteString("    {\n")
+		b.WriteString("      \"id\": \"<the concern id from the Prior concerns section below>\",\n")
+		b.WriteString("      \"resolution\": \"confirmed\" | \"reopened\" | \"superseded\",\n")
+		b.WriteString("      \"note\": \"<optional short justification>\"\n")
+		b.WriteString("    }\n")
+		b.WriteString("  ],\n")
+	}
+	b.WriteString("  \"free_form\": \"<optional overall commentary>\"\n")
+	b.WriteString("}\n\n")
+	b.WriteString("Populate `suggested_patch` ONLY for a mechanical concern whose fix is a small, self-contained " +
+		"unified diff that applies cleanly to the PR branch (a missing nil-check, a typo, a one-line guard); " +
+		"leave it absent for any concern whose resolution needs judgement or touches multiple call sites.\n\n")
+
+	// Review criteria — what the agent should assess. The lens is aimed at
+	// what the deterministic gates CANNOT see (#703); see the non-goals below.
+	b.WriteString("### Review criteria\n\n")
+	if t.GateEvidence != nil {
+		// Deferral variant (#963): when gate evidence is present, the
+		// non-goals preamble must NOT assert that mechanical correctness
+		// "is already gated" — that unconditional claim is what licensed
+		// the run-07bce059 reviewer to ignore build truth. Point at the
+		// evidence section instead.
+		b.WriteString("**Non-goals — do NOT spend the review on these.** Mechanical correctness is reported by " +
+			"the deterministic gates in the 'Gate evidence' section below — read THAT section for the actual " +
+			"build/test/scope state rather than assuming the gates passed. A failed or skipped gate there is " +
+			"ground truth and overrides any presumption that the change is well-formed. Beyond reading that " +
+			"section:\n")
+	} else {
+		b.WriteString("**Non-goals — do NOT spend the review on these.** Mechanical correctness is already gated " +
+			"upstream: the policy gate, the test suite the implement agent ran, build/lint, and CI all check that " +
+			"the change is present and well-formed. Therefore:\n")
+	}
+	b.WriteString("- Do NOT re-verify plan adherence. Whether the diff mechanically implements the plan's approach " +
+		"steps is covered by the policy gate, the tests, and CI — re-stating it here adds no signal.\n")
+	b.WriteString("- Do NOT generic-bug-hunt. Hunting for arbitrary bugs overlaps the test suite and CI and is the " +
+		"lowest-orthogonality lens; spend the review on the three lenses below instead.\n\n")
+	b.WriteString("Apply these three orthogonal lenses — the gaps the deterministic gates are blind to. " +
+		"Record a concern for each gap found:\n\n")
+	b.WriteString("1. **Security / authz**: Does the diff widen the attack surface, mishandle a token or secret, " +
+		"skip an authz / scope / audience check, or trust untrusted input? Anchor this to Fishhawk's " +
+		"code-execution threat model — an agent that runs arbitrary commands against a repo, where the live risk " +
+		"is the lethal trifecta (untrusted input + sensitive data + exfiltration egress) and uncontrolled " +
+		"network egress (ADR-029 / #650). " +
+		"**Self-gate (risk-gate):** if the diff touches NO sensitive surface — no auth, policy, crypto, network, " +
+		"untrusted-input, token, or secret handling — state that briefly in `free_form` and stop; do NOT " +
+		"manufacture a security concern for a low-risk diff (e.g. a one-line config or doc change).\n")
+	b.WriteString("2. **Test vacuity**: For each added or changed test, does it actually ASSERT the behavior it " +
+		"claims to cover, or is it a tautology that passes regardless of what the code does? CI passes a vacuous " +
+		"test; only a reviewer reading the test body catches it. Flag tests that assert nothing load-bearing.\n")
+	b.WriteString("3. **Untested error / edge / concurrency paths**: Does the change add happy-path code plus a " +
+		"happy-path test that silently skips the error branch, a boundary condition, or a race / concurrency " +
+		"path the change introduces? Flag the specific untested path.\n\n")
+	b.WriteString("Three standing criteria orthogonal to the lenses above also apply:\n\n")
+	b.WriteString("4. **Scope adherence (flag-only)**: Does the diff touch files outside the plan's scope.files? " +
+		"If so, record a `{category: \"scope\"}` concern naming the out-of-scope files. " +
+		"Files listed in the 'Scope amended at approval' section below (when present) ARE in-scope — they were " +
+		"operator-authorized at approval time — and must NOT be flagged as drift. Only files the diff touches " +
+		"that are in NEITHER scope.files NOR the amended-scope list are drift. " +
+		"Do NOT reject solely for scope drift — drift is a flag, not a blocker.\n")
+	b.WriteString("5. **Grounded citations**: Any rule you cite — from CLAUDE.md, a style guide, or a project " +
+		"convention — MUST be one you can quote verbatim from the context provided in this prompt or from a " +
+		"repository file you actually read during this review. Do NOT assert rules from memory. If you cannot " +
+		"verify the rule exists, do NOT raise the concern. Ground every concern in the plan, issue, and diff " +
+		"actually provided.\n")
+	b.WriteString("6. **Style is out of scope**: Subjective style judgments (comment length, naming aesthetics, " +
+		"formatting) are out of scope for review — that is lint's job. Focus on the security / authz, " +
+		"test-vacuity, and untested-path lenses, plus scope drift (flag-only).\n")
+	b.WriteString("7. **Do NOT reject on an unconfirmable absence (standing rule)**: The diff shown below is " +
+		"scope-bounded — it excludes any scope-drift paths the operator may stage into the final commit (see the " +
+		"Scope drift section when present). So a required test, doc, or other file appearing absent from the diff " +
+		"is NOT proof it is missing: it may be a drift path or otherwise outside this scoped view. Do NOT reject on " +
+		"the grounds that such a file is 'missing from the committed diff/artifact' unless you positively confirmed " +
+		"its absence by reading the repository. Treat an absence you cannot positively confirm as unverifiable and " +
+		"downgrade to approve_with_concerns — do not assert the absence of a file you could not actually inspect. " +
+		"(This is distinct from lens 2: a test that is PRESENT but vacuous is still a valid reject; this rule only " +
+		"forbids rejecting on a test that merely APPEARS absent.)\n\n")
+
+	// Verdict decision rule.
+	b.WriteString("### Verdict decision rule\n\n")
+	b.WriteString("- `approve`: low-risk diff; the lenses are clear (or the security lens self-gated as no " +
+		"sensitive surface) and any concerns are cosmetic.\n")
+	b.WriteString("- `approve_with_concerns`: diff is acceptable but has non-blocking gaps (including any scope drift); " +
+		"record each gap as a concern with appropriate severity.\n")
+	b.WriteString("- `reject`: diff has one or more blocking problems — a security / authz regression, a vacuous test " +
+		"that does not assert the behavior it claims, or an unhandled error / edge path the change introduces — " +
+		"that must be resolved; record each blocker as a `high`-severity concern. " +
+		"Scope drift ALONE is never grounds for reject; emit approve_with_concerns instead. " +
+		"A required file merely APPEARING absent from the scope-bounded diff is ALSO never grounds for reject (it " +
+		"may be a drift path the operator stages); per standing rule 7, treat an absence you cannot positively " +
+		"confirm as unverifiable and emit approve_with_concerns, not a confirmed-missing reject.\n\n")
+
+	// Approved plan section — what the diff is being measured against.
+	if t.ApprovedPlan != nil {
+		writePlanForReview(&b, t.ApprovedPlan)
+	} else {
+		b.WriteString("### Plan artifact\n\n")
+		b.WriteString("(no approved plan available — review the diff for obvious regressions only)\n\n")
+	}
+
+	// Issue context: the originating motivation.
+	writeReviewIssueContext(&b, t)
+
+	// Approval-conditions section (#1021). The operator's approve-with-notes
+	// text AMENDS the plan (#558) and the implement agent is bound to follow
+	// it, so the reviewer must judge the diff against the amended plan —
+	// without this section a diff correctly implementing a condition that
+	// superseded the plan text reads as a plan deviation (runs 338d6b0f,
+	// 256032f6). Placed at the tail of the stable prefix — after the approved-plan
+	// and issue-context sections and immediately before the diff boundary — so the
+	// conditions still sit adjacent to the plan text they amend AND cache across
+	// re-review rounds. Nil omits the section, keeping the prompt byte-identical
+	// to today.
+	if t.ApprovalConditions != nil {
+		ac := *t.ApprovalConditions
+		const maxConditionBytes = 4000
+		if len(ac) > maxConditionBytes {
+			ac = ac[:maxConditionBytes] + "...[truncated]"
+		}
+		b.WriteString("### Approval conditions (binding — AMEND the plan, win on conflict)\n\n")
+		b.WriteString("The operator approved the plan with the conditions below. They AMEND the plan, are MANDATORY " +
+			"for the implement agent, and WIN on conflict with the plan text. When the diff implements one of these " +
+			"conditions in a way that contradicts the original plan text, that is NOT a plan deviation — the condition " +
+			"is the controlling instruction; do not record a concern or reject for following it.\n\n")
+		b.WriteString(ac)
+		b.WriteString("\n\n")
+	}
+
+	// === Split boundary: the per-round-variable payload trails below (#1725). ===
+
+	// Diff under review — the primary input. Its header ("### Diff under review",
+	// ImplementReviewSplitMarker) is the single split boundary the caching
+	// adapters key on: everything above is the stable, cacheable prefix; this
+	// section and everything below it is the per-round-variable payload.
 	b.WriteString("### Diff under review\n\n")
+	if t.DeltaReReview {
+		// Delta re-review framing (#1725). On the post-fix-up delta path the diff
+		// below is ONLY the fix-up changes since the previous review's head — not
+		// the full base..head PR diff — so tell the reviewer to focus on whether
+		// the routed prior concerns are resolved rather than re-reviewing the
+		// already-reviewed prior work. Rendered ONLY on the delta path; when
+		// false this block is skipped and the section is byte-identical to the
+		// first-review rendering.
+		b.WriteString("This is a DELTA re-review after a fix-up. The diff below shows ONLY the fix-up changes made " +
+			"since the head the previous review ran against — the full prior diff was ALREADY reviewed and its " +
+			"verdict recorded, so it is not repeated here. Focus on whether the routed prior concerns (see the " +
+			"'### Prior concerns (delta verification)' section below) are resolved — emit a `concern_resolutions` " +
+			"entry for each — and judge only the changes shown here. Do NOT re-review or re-litigate the unchanged " +
+			"prior work.\n\n")
+	}
 	switch {
 	case t.DiffPatch != "":
 		// Patch-present path (#585): the full unified-diff hunks are
@@ -2520,149 +2709,6 @@ func buildImplementReview(t Trigger) string {
 		}
 		b.WriteString("\n")
 	}
-
-	// Approval-conditions section (#1021). The operator's approve-with-notes
-	// text AMENDS the plan (#558) and the implement agent is bound to follow
-	// it, so the reviewer must judge the diff against the amended plan —
-	// without this section a diff correctly implementing a condition that
-	// superseded the plan text reads as a plan deviation (runs 338d6b0f,
-	// 256032f6). Placed immediately before the approved-plan section so the
-	// conditions sit adjacent to the plan text they amend. Nil omits the
-	// section, keeping the prompt byte-identical to today.
-	if t.ApprovalConditions != nil {
-		ac := *t.ApprovalConditions
-		const maxConditionBytes = 4000
-		if len(ac) > maxConditionBytes {
-			ac = ac[:maxConditionBytes] + "...[truncated]"
-		}
-		b.WriteString("### Approval conditions (binding — AMEND the plan, win on conflict)\n\n")
-		b.WriteString("The operator approved the plan with the conditions below. They AMEND the plan, are MANDATORY " +
-			"for the implement agent, and WIN on conflict with the plan text. When the diff implements one of these " +
-			"conditions in a way that contradicts the original plan text, that is NOT a plan deviation — the condition " +
-			"is the controlling instruction; do not record a concern or reject for following it.\n\n")
-		b.WriteString(ac)
-		b.WriteString("\n\n")
-	}
-
-	// Approved plan section — what the diff is being measured against.
-	if t.ApprovedPlan != nil {
-		writePlanForReview(&b, t.ApprovedPlan)
-	} else {
-		b.WriteString("### Plan artifact\n\n")
-		b.WriteString("(no approved plan available — review the diff for obvious regressions only)\n\n")
-	}
-
-	// Issue context: the originating motivation.
-	writeReviewIssueContext(&b, t)
-
-	// Verdict schema — inline so the reviewer doesn't need to fetch it.
-	// The concern_resolutions member renders only when prior concerns are
-	// listed above (#984): a first review has nothing to resolve, and the
-	// omission keeps that prompt byte-identical to the pre-#984 output.
-	b.WriteString("### Verdict schema\n\n")
-	b.WriteString("Emit exactly this JSON shape. All fields shown; omit `concerns` and `free_form` when empty:\n\n")
-	b.WriteString("{\n")
-	b.WriteString("  \"verdict\": \"approve\" | \"approve_with_concerns\" | \"reject\",\n")
-	b.WriteString("  \"concerns\": [\n")
-	b.WriteString("    {\n")
-	b.WriteString("      \"severity\": \"high\" | \"medium\" | \"low\",\n")
-	b.WriteString("      \"category\": \"<short classifier, e.g. scope | correctness | regression | verification>\",\n")
-	b.WriteString("      \"note\": \"<free-form explanation of the concern>\",\n")
-	b.WriteString("      \"suggested_patch\": \"<optional unified diff that applies to the PR branch>\"\n")
-	b.WriteString("    }\n")
-	b.WriteString("  ],\n")
-	if len(t.PriorConcerns) > 0 {
-		b.WriteString("  \"concern_resolutions\": [\n")
-		b.WriteString("    {\n")
-		b.WriteString("      \"id\": \"<the concern id from the Prior concerns section above>\",\n")
-		b.WriteString("      \"resolution\": \"confirmed\" | \"reopened\" | \"superseded\",\n")
-		b.WriteString("      \"note\": \"<optional short justification>\"\n")
-		b.WriteString("    }\n")
-		b.WriteString("  ],\n")
-	}
-	b.WriteString("  \"free_form\": \"<optional overall commentary>\"\n")
-	b.WriteString("}\n\n")
-	b.WriteString("Populate `suggested_patch` ONLY for a mechanical concern whose fix is a small, self-contained " +
-		"unified diff that applies cleanly to the PR branch (a missing nil-check, a typo, a one-line guard); " +
-		"leave it absent for any concern whose resolution needs judgement or touches multiple call sites.\n\n")
-
-	// Review criteria — what the agent should assess. The lens is aimed at
-	// what the deterministic gates CANNOT see (#703); see the non-goals below.
-	b.WriteString("### Review criteria\n\n")
-	if t.GateEvidence != nil {
-		// Deferral variant (#963): when gate evidence is present, the
-		// non-goals preamble must NOT assert that mechanical correctness
-		// "is already gated" — that unconditional claim is what licensed
-		// the run-07bce059 reviewer to ignore build truth. Point at the
-		// evidence section instead.
-		b.WriteString("**Non-goals — do NOT spend the review on these.** Mechanical correctness is reported by " +
-			"the deterministic gates in the 'Gate evidence' section above — read THAT section for the actual " +
-			"build/test/scope state rather than assuming the gates passed. A failed or skipped gate there is " +
-			"ground truth and overrides any presumption that the change is well-formed. Beyond reading that " +
-			"section:\n")
-	} else {
-		b.WriteString("**Non-goals — do NOT spend the review on these.** Mechanical correctness is already gated " +
-			"upstream: the policy gate, the test suite the implement agent ran, build/lint, and CI all check that " +
-			"the change is present and well-formed. Therefore:\n")
-	}
-	b.WriteString("- Do NOT re-verify plan adherence. Whether the diff mechanically implements the plan's approach " +
-		"steps is covered by the policy gate, the tests, and CI — re-stating it here adds no signal.\n")
-	b.WriteString("- Do NOT generic-bug-hunt. Hunting for arbitrary bugs overlaps the test suite and CI and is the " +
-		"lowest-orthogonality lens; spend the review on the three lenses below instead.\n\n")
-	b.WriteString("Apply these three orthogonal lenses — the gaps the deterministic gates are blind to. " +
-		"Record a concern for each gap found:\n\n")
-	b.WriteString("1. **Security / authz**: Does the diff widen the attack surface, mishandle a token or secret, " +
-		"skip an authz / scope / audience check, or trust untrusted input? Anchor this to Fishhawk's " +
-		"code-execution threat model — an agent that runs arbitrary commands against a repo, where the live risk " +
-		"is the lethal trifecta (untrusted input + sensitive data + exfiltration egress) and uncontrolled " +
-		"network egress (ADR-029 / #650). " +
-		"**Self-gate (risk-gate):** if the diff touches NO sensitive surface — no auth, policy, crypto, network, " +
-		"untrusted-input, token, or secret handling — state that briefly in `free_form` and stop; do NOT " +
-		"manufacture a security concern for a low-risk diff (e.g. a one-line config or doc change).\n")
-	b.WriteString("2. **Test vacuity**: For each added or changed test, does it actually ASSERT the behavior it " +
-		"claims to cover, or is it a tautology that passes regardless of what the code does? CI passes a vacuous " +
-		"test; only a reviewer reading the test body catches it. Flag tests that assert nothing load-bearing.\n")
-	b.WriteString("3. **Untested error / edge / concurrency paths**: Does the change add happy-path code plus a " +
-		"happy-path test that silently skips the error branch, a boundary condition, or a race / concurrency " +
-		"path the change introduces? Flag the specific untested path.\n\n")
-	b.WriteString("Three standing criteria orthogonal to the lenses above also apply:\n\n")
-	b.WriteString("4. **Scope adherence (flag-only)**: Does the diff touch files outside the plan's scope.files? " +
-		"If so, record a `{category: \"scope\"}` concern naming the out-of-scope files. " +
-		"Files listed in the 'Scope amended at approval' section above (when present) ARE in-scope — they were " +
-		"operator-authorized at approval time — and must NOT be flagged as drift. Only files the diff touches " +
-		"that are in NEITHER scope.files NOR the amended-scope list are drift. " +
-		"Do NOT reject solely for scope drift — drift is a flag, not a blocker.\n")
-	b.WriteString("5. **Grounded citations**: Any rule you cite — from CLAUDE.md, a style guide, or a project " +
-		"convention — MUST be one you can quote verbatim from the context provided in this prompt or from a " +
-		"repository file you actually read during this review. Do NOT assert rules from memory. If you cannot " +
-		"verify the rule exists, do NOT raise the concern. Ground every concern in the plan, issue, and diff " +
-		"actually provided.\n")
-	b.WriteString("6. **Style is out of scope**: Subjective style judgments (comment length, naming aesthetics, " +
-		"formatting) are out of scope for review — that is lint's job. Focus on the security / authz, " +
-		"test-vacuity, and untested-path lenses, plus scope drift (flag-only).\n")
-	b.WriteString("7. **Do NOT reject on an unconfirmable absence (standing rule)**: The diff shown above is " +
-		"scope-bounded — it excludes any scope-drift paths the operator may stage into the final commit (see the " +
-		"Scope drift section when present). So a required test, doc, or other file appearing absent from the diff " +
-		"is NOT proof it is missing: it may be a drift path or otherwise outside this scoped view. Do NOT reject on " +
-		"the grounds that such a file is 'missing from the committed diff/artifact' unless you positively confirmed " +
-		"its absence by reading the repository. Treat an absence you cannot positively confirm as unverifiable and " +
-		"downgrade to approve_with_concerns — do not assert the absence of a file you could not actually inspect. " +
-		"(This is distinct from lens 2: a test that is PRESENT but vacuous is still a valid reject; this rule only " +
-		"forbids rejecting on a test that merely APPEARS absent.)\n\n")
-
-	// Verdict decision rule.
-	b.WriteString("### Verdict decision rule\n\n")
-	b.WriteString("- `approve`: low-risk diff; the lenses are clear (or the security lens self-gated as no " +
-		"sensitive surface) and any concerns are cosmetic.\n")
-	b.WriteString("- `approve_with_concerns`: diff is acceptable but has non-blocking gaps (including any scope drift); " +
-		"record each gap as a concern with appropriate severity.\n")
-	b.WriteString("- `reject`: diff has one or more blocking problems — a security / authz regression, a vacuous test " +
-		"that does not assert the behavior it claims, or an unhandled error / edge path the change introduces — " +
-		"that must be resolved; record each blocker as a `high`-severity concern. " +
-		"Scope drift ALONE is never grounds for reject; emit approve_with_concerns instead. " +
-		"A required file merely APPEARING absent from the scope-bounded diff is ALSO never grounds for reject (it " +
-		"may be a drift path the operator stages); per standing rule 7, treat an absence you cannot positively " +
-		"confirm as unverifiable and emit approve_with_concerns, not a confirmed-missing reject.\n\n")
 
 	b.WriteString("Emit your verdict now. Remember: JSON only, no surrounding prose.\n")
 	return b.String()

@@ -3797,6 +3797,153 @@ func TestBuild_ImplementReview_FullContext(t *testing.T) {
 	}
 }
 
+// TestBuild_ImplementReview_CacheStablePrefixOrdering pins the #1725 cache-stable
+// ordering invariant: the stable prefix — the verdict schema and review criteria
+// (plus the approved plan and approval conditions) — leads, and the
+// per-round-variable "### Diff under review" section (the split boundary) trails.
+// This is what lets caching adapters cache the stable prefix across re-review
+// rounds while only the diff tail changes.
+func TestBuild_ImplementReview_CacheStablePrefixOrdering(t *testing.T) {
+	cond := "also rename the flag to --check-base-ref"
+	got, err := Build("implement_review", Trigger{
+		Repo:               "kuhlman-labs/example",
+		IssueNumber:        42,
+		IssueTitle:         "Add foo",
+		IssueBody:          "We need a foo function in pkg/bar.",
+		ApprovedPlan:       fixturePlan(),
+		ApprovalConditions: &cond,
+		Diff:               "- M pkg/bar/bar.go\n",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	schemaIdx := strings.Index(got, "### Verdict schema")
+	criteriaIdx := strings.Index(got, "### Review criteria")
+	planIdx := strings.Index(got, "### Plan artifact")
+	condIdx := strings.Index(got, "### Approval conditions")
+	diffIdx := strings.Index(got, "### Diff under review")
+	for name, idx := range map[string]int{
+		"### Verdict schema": schemaIdx, "### Review criteria": criteriaIdx,
+		"### Plan artifact": planIdx, "### Approval conditions": condIdx,
+		"### Diff under review": diffIdx,
+	} {
+		if idx < 0 {
+			t.Fatalf("missing section %q:\n%s", name, got)
+		}
+	}
+	// Stable prefix (schema, criteria, plan, conditions) all precede the diff
+	// boundary; the diff is the trailing variable payload.
+	if schemaIdx >= diffIdx || criteriaIdx >= diffIdx || planIdx >= diffIdx || condIdx >= diffIdx {
+		t.Errorf("stable prefix must precede the diff boundary (schema=%d criteria=%d plan=%d cond=%d diff=%d):\n%s",
+			schemaIdx, criteriaIdx, planIdx, condIdx, diffIdx, got)
+	}
+	// The split marker is exactly the diff header, so the diff boundary is the
+	// single split point at the end of the stable prefix.
+	if markerIdx := strings.Index(got, ImplementReviewSplitMarker); markerIdx < 0 || markerIdx+1 != diffIdx {
+		t.Errorf("ImplementReviewSplitMarker should sit at the diff boundary (markerIdx=%d diffIdx=%d)", markerIdx, diffIdx)
+	}
+}
+
+// TestBuild_ImplementReview_DeltaReReviewFraming asserts the #1725 delta framing
+// renders in the diff section ONLY when Trigger.DeltaReReview is set, and that
+// the false path is byte-identical to omitting the flag (first-review rendering
+// unchanged).
+func TestBuild_ImplementReview_DeltaReReviewFraming(t *testing.T) {
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		PriorConcerns: []PriorConcern{
+			{ID: "c1", State: "addressed_pending", Severity: "high", Category: "correctness", Note: "unhandled error path"},
+		},
+	}
+	gotFull, err := Build("implement_review", base)
+	if err != nil {
+		t.Fatalf("Build full: %v", err)
+	}
+	const framing = "This is a DELTA re-review after a fix-up."
+	if strings.Contains(gotFull, framing) {
+		t.Errorf("DeltaReReview=false must NOT render the delta framing:\n%s", gotFull)
+	}
+
+	delta := base
+	delta.DeltaReReview = true
+	gotDelta, err := Build("implement_review", delta)
+	if err != nil {
+		t.Fatalf("Build delta: %v", err)
+	}
+	for _, w := range []string{
+		framing,
+		"ONLY the fix-up changes made since the head the previous review ran against",
+		"emit a `concern_resolutions` entry for each",
+	} {
+		if !strings.Contains(gotDelta, w) {
+			t.Errorf("DeltaReReview=true prompt missing %q:\n%s", w, gotDelta)
+		}
+	}
+	// The framing sits inside the diff section (after the diff header, before the
+	// changed-files body) so it frames the delta the reviewer is about to read.
+	diffIdx := strings.Index(gotDelta, "### Diff under review")
+	framingIdx := strings.Index(gotDelta, framing)
+	bodyIdx := strings.Index(gotDelta, "- M pkg/bar/bar.go")
+	if diffIdx >= framingIdx || framingIdx >= bodyIdx {
+		t.Errorf("delta framing should sit between the diff header and the diff body (diff=%d framing=%d body=%d)",
+			diffIdx, framingIdx, bodyIdx)
+	}
+	// The default (flag omitted) equals the explicit-false rendering.
+	explicitFalse := base
+	explicitFalse.DeltaReReview = false
+	gotExplicitFalse, err := Build("implement_review", explicitFalse)
+	if err != nil {
+		t.Fatalf("Build explicit-false: %v", err)
+	}
+	if gotFull != gotExplicitFalse {
+		t.Errorf("explicit DeltaReReview=false must be byte-identical to omitting it")
+	}
+}
+
+// TestBuild_ImplementReview_DeltaVerificationSectionGuardedByPriorConcerns pins
+// that the concern_resolutions verdict-schema member and the "### Prior concerns
+// (delta verification)" section render iff PriorConcerns is non-empty — the #984
+// fidelity the #1725 reorder preserves.
+func TestBuild_ImplementReview_DeltaVerificationSectionGuardedByPriorConcerns(t *testing.T) {
+	without, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+	})
+	if err != nil {
+		t.Fatalf("Build without: %v", err)
+	}
+	if strings.Contains(without, "### Prior concerns (delta verification)") {
+		t.Errorf("no prior concerns must omit the delta-verification section:\n%s", without)
+	}
+	if strings.Contains(without, "concern_resolutions") {
+		t.Errorf("no prior concerns must omit the concern_resolutions schema member:\n%s", without)
+	}
+
+	with, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		PriorConcerns: []PriorConcern{
+			{ID: "c1", State: "addressed_pending", Severity: "high", Category: "correctness", Note: "unhandled error path"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build with: %v", err)
+	}
+	for _, w := range []string{
+		"### Prior concerns (delta verification)",
+		"concern_resolutions",
+		"state: addressed_pending",
+	} {
+		if !strings.Contains(with, w) {
+			t.Errorf("prior concerns present must render %q:\n%s", w, with)
+		}
+	}
+}
+
 func TestBuild_ImplementReview_SupplementalReinvoke_RendersFramingAndExemptions(t *testing.T) {
 	// #1250: with SupplementalReinvoke=true the prompt renders the bounded
 	// supplemental framing AND the exemption delta in the gate_evidence section,
@@ -4208,7 +4355,7 @@ func TestBuild_ImplementReview_AmendedScope_RendersSection(t *testing.T) {
 		"docs/extra.md",
 		"Do NOT record a scope-drift concern for any",
 		// Criterion 4 must reference the amended list.
-		"Scope amended at approval' section above (when present) ARE in-scope",
+		"Scope amended at approval' section below (when present) ARE in-scope",
 		"in NEITHER scope.files NOR the amended-scope list are drift",
 	} {
 		if !strings.Contains(got, w) {
@@ -4441,13 +4588,16 @@ func TestBuild_ImplementReview_ApprovalConditions_Rendered(t *testing.T) {
 			t.Errorf("approval-conditions review prompt missing %q:\n%s", w, got)
 		}
 	}
-	// Conditions must sit immediately before the plan artifact they amend so
-	// the reviewer reads the controlling instruction adjacent to the plan text.
-	condIdx := strings.Index(got, "### Approval conditions")
+	// After the #1725 cache-stable reorder the conditions sit at the tail of the
+	// stable prefix — after the approved-plan and issue-context sections, still
+	// adjacent to the plan text they amend, and BEFORE the "### Diff under review"
+	// split boundary so they cache across re-review rounds.
 	planIdx := strings.Index(got, "### Plan artifact")
-	if condIdx < 0 || planIdx < 0 || condIdx > planIdx {
-		t.Errorf("approval conditions should appear before the plan artifact (condIdx=%d planIdx=%d):\n%s",
-			condIdx, planIdx, got)
+	condIdx := strings.Index(got, "### Approval conditions")
+	diffIdx := strings.Index(got, "### Diff under review")
+	if planIdx < 0 || condIdx < 0 || diffIdx < 0 || planIdx >= condIdx || condIdx >= diffIdx {
+		t.Errorf("approval conditions should appear after the plan artifact and before the diff boundary (planIdx=%d condIdx=%d diffIdx=%d):\n%s",
+			planIdx, condIdx, diffIdx, got)
 	}
 }
 
@@ -4578,7 +4728,7 @@ func TestBuild_ImplementReview_GateEvidence_RendersAllFacts(t *testing.T) {
 		"- check: constraints (constraint: forbidden_paths) — path matches forbidden glob",
 		"files: .github/workflows/ci.yml",
 		// The softened non-goals preamble defers to the evidence section.
-		"Mechanical correctness is reported by the deterministic gates in the 'Gate evidence' section above",
+		"Mechanical correctness is reported by the deterministic gates in the 'Gate evidence' section below",
 	} {
 		if !strings.Contains(got, w) {
 			t.Errorf("gate-evidence prompt missing %q:\n%s", w, got)

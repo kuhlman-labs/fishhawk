@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
@@ -391,7 +392,7 @@ func TestShipTrace_ImplementReview_GateEvidenceThreadedIntoPrompt(t *testing.T) 
 		"- backend/internal/foo/helper.go (category A: agent edit to a tracked file EXCLUDED from the commit — " +
 			"the pushed head may be missing a required change)",
 		// The softened non-goals preamble defers to the evidence section.
-		"Mechanical correctness is reported by the deterministic gates in the 'Gate evidence' section above",
+		"Mechanical correctness is reported by the deterministic gates in the 'Gate evidence' section below",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("reviewer prompt missing %q from threaded gate evidence:\n%s", want, got)
@@ -2059,4 +2060,374 @@ func TestWaiveConcern_SuppressedFromOpenConcernsButThreadedIntoPrompt(t *testing
 			t.Errorf("reviewer prompt missing %q:\n%s", want, got)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// #1725: delta re-reviews after fix-up. On a post-fix-up re-review (prior
+// concerns present), runImplementReviews replaces the full base..head PR diff
+// with ONLY the fix-up delta since the previous review's head, via
+// githubclient.ComparePatch. First reviews and every named fail-closed degrade
+// keep the full diff. These cross-boundary tests drive runImplementReviews
+// directly (the same seam the #1407 integration tests use) so the current head
+// SHA is controllable, and assert on the prompt the reviewer actually received.
+// ---------------------------------------------------------------------------
+
+// deltaCompareBody is a ComparePatch response DISTINCT from the full bundle
+// diff, so a test can prove the fix-up delta (not the full PR diff) reached the
+// reviewer. Its head SHA matches the current head passed to runImplementReviews.
+const deltaCompareBody = `{
+	"total_commits": 1,
+	"commits": [{"sha":"currenthead"}],
+	"files": [{"filename":"delta/only.go","status":"modified","changes":2,"patch":"@@ -1 +1 @@\n-a\n+DELTA_MARKER"}]
+}`
+
+// fullReReviewBundleDiff is the full base..head diff handed to
+// runImplementReviews; a delta re-review must REPLACE it with the ComparePatch
+// delta, and every degrade path must RETAIN it.
+func fullReReviewBundleDiff() policy.Diff {
+	return policy.Diff{
+		ChangedFiles: []policy.ChangedFile{{Path: "full/only.go", Status: policy.StatusModified}},
+		Patch:        "diff --git a/full/only.go b/full/only.go\n@@ -1 +1 @@\n-x\n+FULL_MARKER\n",
+	}
+}
+
+// failingComparePatchClient builds a githubclient.Client whose compare endpoint
+// returns 500, so ComparePatch returns an error — the #1725 compare-error
+// degrade mode.
+func failingComparePatchClient(t *testing.T) *githubclient.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}
+}
+
+// seedReReview wires the re-review preconditions onto a fresh implement-review
+// server: a concern store with one addressed_pending concern for the stage (so
+// priorConcernsForReview is non-empty → the re-review branch), an installation +
+// open PR on the run, and (when priorHead != "") a prior implement_review_started
+// head entry so resolvePriorReviewedHeadSHA resolves. Returns the concern repo.
+func seedReReview(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID, priorHead string) *fakeConcernRepo {
+	t.Helper()
+	cr := newFakeConcernRepo()
+	s.cfg.ConcernRepo = cr
+	c := seedConcernRow(t, cr, runRow.ID, stageID, concern.StageKindImplement, 100, "unhandled error path")
+	if err := cr.MarkAddressedPending(context.Background(), []uuid.UUID{c.ID}, "routed"); err != nil {
+		t.Fatalf("seed addressed_pending: %v", err)
+	}
+	inst := int64(55)
+	runRow.InstallationID = &inst
+	prURL := "https://github.com/kuhlman-labs/example/pull/7"
+	runRow.PullRequestURL = &prURL
+	if priorHead != "" {
+		// Seed the prior head as the previous round's implement_reviewed entry
+		// (resolvePriorReviewedHeadSHA priority 1). Deliberately NOT as
+		// implement_review_started: the #797 pre-dispatch dedup keys on
+		// (stage_id, implement_review_started.head_sha), so seeding a started
+		// entry whose head_sha equals the current head would suppress the whole
+		// re-review instead of exercising the delta/degrade path under test.
+		sid := stageID
+		seedHeadEntry(au, runRow.ID, &sid, "implement_reviewed", 50, map[string]any{"head_sha": priorHead})
+	}
+	return cr
+}
+
+// assertFullDiffRetained asserts the reviewer prompt carries the FULL bundle
+// diff (the degrade fallback) and NOT the ComparePatch delta or the delta
+// framing.
+func assertFullDiffRetained(t *testing.T, prompt string) {
+	t.Helper()
+	for _, want := range []string{"FULL_MARKER", "full/only.go"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("degrade must retain the full diff, missing %q:\n%s", want, prompt)
+		}
+	}
+	for _, absent := range []string{"DELTA_MARKER", "delta/only.go", "This is a DELTA re-review after a fix-up."} {
+		if strings.Contains(prompt, absent) {
+			t.Errorf("degrade must NOT carry the delta marker/framing %q:\n%s", absent, prompt)
+		}
+	}
+}
+
+// TestRunImplementReviews_FirstReview_UsesFullDiff (case a): a first review (no
+// prior concerns) never enters the delta branch — the full bundle diff reaches
+// the reviewer and no delta framing renders, even with a GitHub client wired.
+func TestRunImplementReviews_FirstReview_UsesFullDiff(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	// A GitHub client + PR + prior head are present, but with NO prior concerns
+	// the re-review branch is never entered.
+	s.cfg.ConcernRepo = newFakeConcernRepo()
+	s.cfg.GitHub = cannedComparePatchClient(t, deltaCompareBody)
+	inst := int64(55)
+	runRow.InstallationID = &inst
+	prURL := "https://github.com/kuhlman-labs/example/pull/7"
+	runRow.PullRequestURL = &prURL
+	sid := implStage.ID
+	seedHeadEntry(au, runRow.ID, &sid, "implement_review_started", 50, map[string]any{"head_sha": "priorhead"})
+
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, fullReReviewBundleDiff(), nil, "currenthead", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	assertFullDiffRetained(t, reviewer.calls[0])
+}
+
+// TestRunImplementReviews_ReReview_WaivedOnlyUsesFullDiff (waived-only edge
+// path, #1725): a re-review whose only prior concerns are WAIVED — none routed
+// for fix-up (no addressed_pending row) — must NOT collapse to the ComparePatch
+// delta. priorConcernsForReview threads waived concerns as not-re-litigable
+// context, so gating the delta on len(PriorConcerns) alone would wrongly fire
+// here; the addressed_pending discriminator keeps the full bundle diff and no
+// delta framing renders even with a GitHub client + PR + prior head all wired.
+func TestRunImplementReviews_ReReview_WaivedOnlyUsesFullDiff(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	// Seed the full delta preconditions (GitHub client, PR, prior head) EXCEPT
+	// the routed concern: the sole prior concern is waived, never addressed_pending.
+	cr := newFakeConcernRepo()
+	s.cfg.ConcernRepo = cr
+	waived := seedConcernRow(t, cr, runRow.ID, implStage.ID, concern.StageKindImplement, 100, "accepted trade-off")
+	if _, err := cr.ApplyResolution(context.Background(), waived.ID, concern.StateWaived, "operator waived"); err != nil {
+		t.Fatalf("seed waived: %v", err)
+	}
+	s.cfg.GitHub = cannedComparePatchClient(t, deltaCompareBody)
+	inst := int64(55)
+	runRow.InstallationID = &inst
+	prURL := "https://github.com/kuhlman-labs/example/pull/7"
+	runRow.PullRequestURL = &prURL
+	sid := implStage.ID
+	seedHeadEntry(au, runRow.ID, &sid, "implement_reviewed", 50, map[string]any{"head_sha": "priorhead"})
+
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, fullReReviewBundleDiff(), nil, "currenthead", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	// The waived concern must still ride in the prior-concerns section (#984)…
+	for _, want := range []string{"### Prior concerns (delta verification)", "state: waived"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("waived-only re-review prompt missing prior-concerns fidelity %q:\n%s", want, got)
+		}
+	}
+	// …but the diff must be the FULL bundle diff, NOT the ComparePatch delta.
+	assertFullDiffRetained(t, got)
+}
+
+// TestRunImplementReviews_ReReview_UsesComparePatchDelta (cases b + c): a
+// post-fix-up re-review substitutes the ComparePatch delta for the full diff,
+// renders the delta framing, AND preserves the "### Prior concerns (delta
+// verification)" block + the concern_resolutions verdict-schema member (#984
+// fidelity).
+func TestRunImplementReviews_ReReview_UsesComparePatchDelta(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	seedReReview(t, s, au, runRow, implStage.ID, "priorhead")
+	s.cfg.GitHub = cannedComparePatchClient(t, deltaCompareBody)
+
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, fullReReviewBundleDiff(), nil, "currenthead", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	// (b) the ComparePatch delta replaced the full bundle diff.
+	for _, want := range []string{"DELTA_MARKER", "delta/only.go", "This is a DELTA re-review after a fix-up."} {
+		if !strings.Contains(got, want) {
+			t.Errorf("re-review prompt missing delta content %q:\n%s", want, got)
+		}
+	}
+	for _, absent := range []string{"FULL_MARKER", "full/only.go"} {
+		if strings.Contains(got, absent) {
+			t.Errorf("re-review prompt must NOT carry the full diff %q:\n%s", absent, got)
+		}
+	}
+	// (c) prior-concerns delta-verification fidelity is preserved.
+	for _, want := range []string{
+		"### Prior concerns (delta verification)",
+		"concern_resolutions",
+		"state: addressed_pending",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("re-review prompt missing delta-verification fidelity %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestRunImplementReviews_ReReview_DegradesToFullDiff table-drives every named
+// #1725 fail-closed mode, each asserting fallback to the full diff. A delta
+// GitHub client is wired in every case EXCEPT the no-client one, so a fallback
+// proves the guard (not a missing client) forced it.
+func TestRunImplementReviews_ReReview_DegradesToFullDiff(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID)
+		curHead string
+	}{
+		{
+			name: "no_github_client",
+			mutate: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) {
+				seedReReview(t, s, au, runRow, stageID, "priorhead")
+				s.cfg.GitHub = nil
+			},
+			curHead: "currenthead",
+		},
+		{
+			name: "no_installation",
+			mutate: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) {
+				seedReReview(t, s, au, runRow, stageID, "priorhead")
+				s.cfg.GitHub = cannedComparePatchClient(t, deltaCompareBody)
+				runRow.InstallationID = nil
+			},
+			curHead: "currenthead",
+		},
+		{
+			name: "missing_pr_number",
+			mutate: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) {
+				seedReReview(t, s, au, runRow, stageID, "priorhead")
+				s.cfg.GitHub = cannedComparePatchClient(t, deltaCompareBody)
+				runRow.PullRequestURL = nil
+			},
+			curHead: "currenthead",
+		},
+		{
+			name: "empty_current_head",
+			mutate: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) {
+				seedReReview(t, s, au, runRow, stageID, "priorhead")
+				s.cfg.GitHub = cannedComparePatchClient(t, deltaCompareBody)
+			},
+			curHead: "", // no current head to diff against
+		},
+		{
+			name: "prior_head_unresolvable",
+			mutate: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) {
+				// priorHead="" seeds no head entry and no ledger, so the resolver
+				// returns "".
+				seedReReview(t, s, au, runRow, stageID, "")
+				s.cfg.GitHub = cannedComparePatchClient(t, deltaCompareBody)
+			},
+			curHead: "currenthead",
+		},
+		{
+			name: "prior_head_equals_current",
+			mutate: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) {
+				// The prior-reviewed head equals the current head — a degenerate
+				// no-op compare that would starve the reviewer of any diff.
+				seedReReview(t, s, au, runRow, stageID, "currenthead")
+				s.cfg.GitHub = cannedComparePatchClient(t, deltaCompareBody)
+			},
+			curHead: "currenthead",
+		},
+		{
+			name: "repo_parse_error",
+			mutate: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) {
+				seedReReview(t, s, au, runRow, stageID, "priorhead")
+				s.cfg.GitHub = cannedComparePatchClient(t, deltaCompareBody)
+				runRow.Repo = "no-slash-here" // parseRepoOwnerName fails
+			},
+			curHead: "currenthead",
+		},
+		{
+			name: "compare_error",
+			mutate: func(t *testing.T, s *Server, au *auditFake, runRow *run.Run, stageID uuid.UUID) {
+				seedReReview(t, s, au, runRow, stageID, "priorhead")
+				s.cfg.GitHub = failingComparePatchClient(t)
+			},
+			curHead: "currenthead",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+			s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+			tc.mutate(t, s, au, runRow, implStage.ID)
+
+			if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, fullReReviewBundleDiff(), nil, tc.curHead, nil) {
+				t.Fatal("gating approve must not gate")
+			}
+			reviewer.mu.Lock()
+			defer reviewer.mu.Unlock()
+			if len(reviewer.calls) != 1 {
+				t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+			}
+			assertFullDiffRetained(t, reviewer.calls[0])
+		})
+	}
+}
+
+// TestResolvePriorReviewedHeadSHA covers the #1725 prior-head resolver's
+// source precedence: (1) newest implement_reviewed head, (2) newest
+// implement_review_started head when no reviewed head, (3) second-newest
+// DISTINCT reported-head ledger entry when no review entry carries a head, and
+// the "" miss.
+func TestResolvePriorReviewedHeadSHA(t *testing.T) {
+	stageID := uuid.New()
+	other := uuid.New()
+
+	t.Run("prefers newest implement_reviewed head", func(t *testing.T) {
+		au := newAuditFake()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		runID := uuid.New()
+		sid := stageID
+		seedHeadEntry(au, runID, &sid, "implement_reviewed", 10, map[string]any{"head_sha": "reviewed-old"})
+		seedHeadEntry(au, runID, &sid, "implement_reviewed", 20, map[string]any{"head_sha": "reviewed-new"})
+		seedHeadEntry(au, runID, &sid, "implement_review_started", 30, map[string]any{"head_sha": "started"})
+		// A different stage's reviewed head must be ignored.
+		osid := other
+		seedHeadEntry(au, runID, &osid, "implement_reviewed", 40, map[string]any{"head_sha": "other-stage"})
+		if got := s.resolvePriorReviewedHeadSHA(context.Background(), runID, stageID); got != "reviewed-new" {
+			t.Errorf("resolvePriorReviewedHeadSHA = %q, want reviewed-new", got)
+		}
+	})
+
+	t.Run("falls back to implement_review_started head", func(t *testing.T) {
+		au := newAuditFake()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		runID := uuid.New()
+		sid := stageID
+		// No implement_reviewed head carries a SHA; the started head does.
+		seedHeadEntry(au, runID, &sid, "implement_reviewed", 10, map[string]any{}) // head_sha absent
+		seedHeadEntry(au, runID, &sid, "implement_review_started", 20, map[string]any{"head_sha": "started-head"})
+		if got := s.resolvePriorReviewedHeadSHA(context.Background(), runID, stageID); got != "started-head" {
+			t.Errorf("resolvePriorReviewedHeadSHA = %q, want started-head", got)
+		}
+	})
+
+	t.Run("falls back to second-newest ledger head", func(t *testing.T) {
+		au := newAuditFake()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		runID := uuid.New()
+		// No review entry carries a head; the ledger has PR-open then fixup.
+		seedHeadEntry(au, runID, nil, "pull_request_opened", 10, map[string]any{"head_sha": "prior-ledger-head"})
+		seedHeadEntry(au, runID, nil, "fixup_pushed", 20, map[string]any{"head_sha": "current-ledger-head"})
+		if got := s.resolvePriorReviewedHeadSHA(context.Background(), runID, stageID); got != "prior-ledger-head" {
+			t.Errorf("resolvePriorReviewedHeadSHA = %q, want prior-ledger-head (second-newest)", got)
+		}
+	})
+
+	t.Run("returns empty on total miss", func(t *testing.T) {
+		au := newAuditFake()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		if got := s.resolvePriorReviewedHeadSHA(context.Background(), uuid.New(), stageID); got != "" {
+			t.Errorf("resolvePriorReviewedHeadSHA = %q, want empty on no entries", got)
+		}
+	})
 }
