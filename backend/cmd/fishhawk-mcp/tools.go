@@ -953,6 +953,11 @@ type GetRunStatusOutput struct {
 	// and derived from the run's cost_recorded ledger. Omitted when the run has
 	// no cost data or the fetch failed — DISPLAY-ONLY, never gates a run.
 	Cost *RunCost `json:"cost,omitempty" jsonschema:"per-run estimated cost derived from the cost ledger (#1372): total_cost_usd, a per-stage (agent|plan_review|implement_review) breakdown, and — when the run resolved to a merged PR — a cost-per-merged-PR rollup (cost_per_merged_pr_usd summed across every run on that PR plus run_count). Omitted when the run has no cost data. Display-only — never blocks the run"`
+	// Latency is the run's gate-latency (wait-on-human) rollup (#1702),
+	// fetched best-effort and derived from the run's audit-chain timestamps.
+	// Omitted when no gate interval has resolved yet or the fetch failed —
+	// DISPLAY-ONLY, never gates a run.
+	Latency *RunLatency `json:"latency,omitempty" jsonschema:"per-run gate-latency (wait-on-human) rollup derived from the audit-chain timestamps (#1702): a gates[] breakdown of the time parked at each human gate (plan_approval, implement_review_to_dispatch, checks_green_to_merge) with each gate's opened_at/closed_at/wait_seconds, plus total_wait_on_human_seconds and the run's end-to-end wall_clock_seconds. Omitted when no gate interval has resolved. Display-only — never blocks the run"`
 	// ReviewActionHint is a display-only next-action pointer (#777) surfaced
 	// when the implement review has landed with unresolved approve_with_concerns
 	// concerns and the bounded fix-up budget is not yet spent. It points at
@@ -1193,6 +1198,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	budgetStatus, _ := r.fetchBudgetStatus(ctx, runID)
 	cacheEfficiency, _ := r.fetchCacheEfficiency(ctx, runID)
 	runCost, _ := r.fetchRunCost(ctx, runID)
+	runLatency, _ := r.fetchRunLatency(ctx, runID)
 
 	// Best-effort review-action hint (#777). Derived from the SAME
 	// implementReviewStatus computed above (single audit read — the hint
@@ -1265,6 +1271,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 		Budget:                    budgetStatus,
 		CacheEfficiency:           cacheEfficiency,
 		Cost:                      runCost,
+		Latency:                   runLatency,
 		ReviewActionHint:          reviewActionHint,
 		ImplementReviewMergeHint:  implementReviewMergeHint(implementReviewStatus),
 		DriveStatus:               view.driveStatus(),
@@ -1702,6 +1709,18 @@ func (r *runResolver) fetchRunCost(ctx context.Context, runID uuid.UUID) (*RunCo
 		return nil, fmt.Sprintf("run cost unavailable: %v", err)
 	}
 	return rc, ""
+}
+
+// fetchRunLatency retrieves the run's gate-latency rollup best-effort,
+// mirroring fetchRunCost. It NEVER fails the caller: on any error it returns
+// (nil, <warning>); on a no-data response it returns (nil, ""). get_run_status
+// discards the warning and omits the field.
+func (r *runResolver) fetchRunLatency(ctx context.Context, runID uuid.UUID) (*RunLatency, string) {
+	rl, err := r.api.GetRunLatency(ctx, runID)
+	if err != nil {
+		return nil, fmt.Sprintf("run latency unavailable: %v", err)
+	}
+	return rl, ""
 }
 
 // registerStartRun wires the fishhawk_start_run tool (E22.1 / #390;

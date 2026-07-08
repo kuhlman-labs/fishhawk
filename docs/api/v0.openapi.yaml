@@ -2607,6 +2607,62 @@ components:
               type: integer
               description: Number of runs contributing to the rollup.
 
+    RunLatency:
+      type: object
+      description: |
+        Per-run gate-latency (wait-on-human) rollup derived at read time from
+        the run's audit-chain timestamps (#1702). **Display-only** — never
+        gates or blocks a run.
+
+        When no gate interval has resolved (a run that hasn't reached its
+        first gate) the endpoint returns an **empty object** (none of the
+        fields below present); clients detect "no data" by the absence of a
+        field. The fields below are present only when at least one gate
+        resolved.
+      properties:
+        gates:
+          type: array
+          description: |
+            Per-gate wait breakdown, in a fixed order (`plan_approval`,
+            `implement_review_to_dispatch`, `checks_green_to_merge`). A gate
+            whose opening OR closing audit marker is absent is omitted
+            (partial rollup); a present pair whose closing timestamp precedes
+            its opening timestamp reports a `wait_seconds` of `0` (clamped,
+            never negative).
+          items:
+            type: object
+            properties:
+              gate:
+                type: string
+                description: |
+                  Gate name: `plan_approval` (first `plan_generated` → the
+                  first following `approval_submitted`),
+                  `implement_review_to_dispatch` (the latest
+                  `implement_reviewed` → the first following
+                  `acceptance_dispatched`, falling back to `pr_merged` when the
+                  workflow has no acceptance stage), or `checks_green_to_merge`
+                  (the latest checks-green auto-advance → `pr_merged`).
+              opened_at:
+                type: string
+                format: date-time
+                description: Timestamp of the gate's opening audit marker.
+              closed_at:
+                type: string
+                format: date-time
+                description: Timestamp of the gate's closing audit marker.
+              wait_seconds:
+                type: number
+                description: '`closed_at − opened_at` in seconds, clamped to `0`.'
+        total_wait_on_human_seconds:
+          type: number
+          description: Sum of `wait_seconds` across the present gates.
+        wall_clock_seconds:
+          type: number
+          description: |
+            The run's end-to-end wall clock in seconds — the run's creation
+            time to its newest terminal audit marker (`pr_merged` /
+            `post_merge_observed`), clamped to `0`.
+
     CalibrationResult:
       type: object
       description: |
@@ -4617,6 +4673,43 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/RunCost' }
+        '400':
+          description: "`validation_failed` — `run_id` not a UUID."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { description: Run repository unavailable. }
+
+  /v0/runs/{run_id}/latency:
+    get:
+      operationId: getRunLatency
+      summary: Per-run gate-latency (wait-on-human) rollup
+      description: |
+        Returns the run's gate-latency rollup, derived purely from the run's
+        audit-chain timestamps (#1702): the time parked at each human gate
+        (`plan_approval`, `implement_review_to_dispatch`,
+        `checks_green_to_merge`), the total wait on human decisions, and the
+        run's end-to-end wall clock. A gate whose opening or closing audit
+        marker is absent is omitted (partial rollup); a negative (clock-skewed)
+        interval reports a `0` wait.
+
+        **Display-only.** This endpoint never gates or blocks a run; it exists
+        so the MCP loop can surface where a change spent its wall-clock time.
+        It has no write path and no migration — it reads existing audit and
+        run data.
+
+        When no gate interval has resolved the response is **200 with an empty
+        object** (`{}`) rather than a 404, so clients branch on the presence of
+        a field.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: |
+            Gate-latency rollup, or an empty object when no gate has resolved.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunLatency' }
         '400':
           description: "`validation_failed` — `run_id` not a UUID."
         '401': { $ref: '#/components/responses/Unauthorized' }
