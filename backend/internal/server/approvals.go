@@ -293,6 +293,26 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Author separation-of-duties (E39.4 / #1709): when the stage's gate
+	// carries a forge-neutral approvals block, the change author may not
+	// approve their own change. PRE-Submit like the sibling gates so a
+	// refused approval inserts no row and the quorum count is not
+	// incremented. Guarded strictly by "gate has an Approvals block AND
+	// decision == approve" — a legacy Approvers / no-approvals gate skips
+	// this entirely (byte-identical to today). Fail-open on an unresolved
+	// author (no user-kind actor yet) or an unreadable spec: author-SoD is
+	// skipped while agent-SoD and quorum still apply.
+	if decision == approval.DecisionApprove {
+		if approvals, aerr := s.fetchApprovalsForStage(r.Context(), stage); aerr == nil && approvals != nil {
+			if author, ok := s.resolveChangeAuthor(r.Context(), stage.RunID); ok && author == subject {
+				s.writeError(w, r, http.StatusForbidden, "approver_is_change_author",
+					"the change author cannot approve their own change on a quorum gate",
+					map[string]any{"stage_id": stageID.String(), "subject": subject})
+				return
+			}
+		}
+	}
+
 	// ADR-036 (#875): refuse a plan-stage approve while a configured
 	// agent plan review is still in-flight. Placed BEFORE
 	// ApprovalRepo.Submit (not in the res.Inserted block) so a refused
@@ -605,17 +625,89 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		return &approveActionResult{Duplicate: res.Approval}, nil
 	}
 
-	// Persist the approval audits BEFORE advancing the stage (#1351). The
-	// stage transition below is the dispatch-gating signal, and the runner's
-	// prompt-fetch reads these audits (loadApprovalAddScopeFiles folds
-	// approval_submitted's add_scope_files into the enforced scope; the
-	// runner-spawn router reads model_resolved), so they must be durably
-	// visible before any dispatch path can observe the transition. The
-	// pre-advance row is used here; advanceStage mutates only its State, not
-	// the ID/RunID these audits read. Best-effort: a logged append failure
-	// never unwinds the approval the gate already recorded via Submit.
-	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.BindingAssertions, p.DelegatedRule, id.AuthMethod)
+	// Quorum evaluation (E39.4 / #1709): only an APPROVE against a gate
+	// carrying a forge-neutral approvals block engages distinct-approver
+	// quorum. Every other path — a reject, or a legacy Approvers /
+	// no-approvals gate — keeps today's first-vote-advances semantics. The
+	// fetch fails open to the legacy path on any spec-read error, matching
+	// checkApproverAuthorization's best-effort posture.
+	var approvals *spec.Approvals
+	if p.Decision == approval.DecisionApprove {
+		if a, ferr := s.fetchApprovalsForStage(ctx, p.Stage); ferr == nil {
+			approvals = a
+		}
+	}
 
+	// Channel is recorded on every approval row (ADR-055 additive
+	// enrichment), independent of whether quorum applies.
+	channel := approvalChannel(id, p.DelegatedRule != "")
+
+	if approvals == nil {
+		// Legacy / no-approvals path: first vote advances, unchanged from
+		// today except the additive identity{provider,subject}/channel
+		// enrichment (ADR-055 record leg) on the approval_submitted row. No
+		// predicate_snapshot — the gate declares no approvals block
+		// (operator binding condition 2).
+		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.BindingAssertions, p.DelegatedRule, id.AuthMethod, channel, nil)
+		return s.finishApprovalAdvance(ctx, p, res)
+	}
+
+	// Quorum path. Resolve the change author (fail-open: skipped when no
+	// user-kind actor exists yet), then classify this submitter. A delegated
+	// / agent-kind submission is recorded but never counts toward the human
+	// quorum, and its channel is forced to "delegated".
+	changeAuthor, _ := s.resolveChangeAuthor(ctx, p.Stage.RunID)
+	submitterAgent := actorKindForSubject(res.Approval.ApproverSubject) == audit.ActorAgent
+	delegated := submitterAgent || p.DelegatedRule != ""
+	if delegated {
+		channel = "delegated"
+	}
+
+	eligibleCount := s.countDistinctEligibleApprovers(ctx, p.Stage.RunID, p.Stage.ID, changeAuthor)
+	required := 1
+	if approvals.Count != nil {
+		required = *approvals.Count
+	}
+	// A delegated/agent submission never advances the gate even if the count
+	// otherwise suffices — it does not itself count and no human vote is
+	// implied by it.
+	reached := !delegated && eligibleCount >= required
+
+	snapshot := &predicateSnapshot{
+		CountRequired:  required,
+		CountEligible:  eligibleCount,
+		Identity:       snapshotIdentityFor(res.Approval.ApproverSubject),
+		SubmitterClass: submitterClass(res.Approval.ApproverSubject, changeAuthor, submitterAgent),
+		AuthMethod:     id.AuthMethod,
+		Channel:        channel,
+		MinPermission:  approvals.MinPermission,
+		MemberOf:       approvals.MemberOf,
+		QuorumReached:  reached,
+	}
+	// Persist the enriched approval audit BEFORE any advance (#1351) so a
+	// dispatch racing the transition observes it. Best-effort append.
+	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.BindingAssertions, p.DelegatedRule, id.AuthMethod, channel, snapshot)
+
+	if !reached {
+		// Recorded but below quorum (or a delegated/agent submission that
+		// never counts): surface the state change but do NOT advance — the
+		// stage stays awaiting_approval until approvals.count distinct
+		// eligible approvers vote.
+		s.notifyStatusUpdate(ctx, p.Stage.RunID, "approval_submit")
+		return &approveActionResult{Stage: p.Stage}, nil
+	}
+	return s.finishApprovalAdvance(ctx, p, res)
+}
+
+// finishApprovalAdvance performs the post-audit tail shared by the legacy
+// first-vote path and the quorum-reached path: the model_resolved emissions
+// (#1013/#1416), the state advance (advanceForDecision, which special-cases
+// the deploy pre-execution gate), the orchestrator handoff on approve AND
+// reject, the drive plan-approved stamp, and the plan-comment + sticky-status
+// notifications. The approval_submitted audit row is already written by the
+// caller. An advance failure is wrapped in *approveActionError so the caller
+// maps InvalidTransition → 409 and the two distinct 500 messages.
+func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParams, res *approval.SubmitResult) (*approveActionResult, error) {
 	// Model resolution (#1013, extended #1416): emit the source-tagged
 	// model_resolved audit entries the gate computed on this plan-stage
 	// approve. Emitted even when a resolution is empty (the readers treat it
@@ -966,7 +1058,16 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // decision's audit provenance names the credential kind; empty for
 // cookie-session / MCP-token / operator-agent-driver identities, where
 // the key is omitted (byte-identical to pre-#1708 payloads).
-func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles []string, bindingAssertions []bindingAssertion, delegatedRule, authMethod string) {
+//
+// ADR-055 additive enrichment (E39.4 / #1709): EVERY approval_submitted row
+// — legacy gates included — additionally records identity{provider,subject}
+// (the submitter's provider-qualified identity) and channel
+// (interactive|api|delegated). snapshot, when non-nil, records the quorum
+// predicate evaluation under predicate_snapshot; it is nil (key omitted) for
+// gates with no approvals block. All new keys ride INSIDE the existing
+// hashed payload JSONB — no new top-level audit.Entry / Export v1 field — so
+// the hash chain and the E9 verifier's strict decode are unaffected.
+func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles []string, bindingAssertions []bindingAssertion, delegatedRule, authMethod, channel string, snapshot *predicateSnapshot) {
 	// ADR-040 D4 (#1027): the acting subject selects the kind — an
 	// operator-agent token records agent, every other subject (human
 	// tokens, GitHub logins from the PR-review-event path) stays user.
@@ -979,6 +1080,23 @@ func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *
 	}
 	if authMethod != "" {
 		auditPayload["auth_method"] = authMethod
+	}
+	// ADR-055 additive identity enrichment (#1709): recorded on every
+	// approval_submitted row, legacy gates included. The subject stays the
+	// full provider-qualified subject (provenance); provider is the parsed
+	// prefix ("" for a bare / prefixless subject).
+	provider, _ := splitProviderSubject(app.ApproverSubject)
+	auditPayload["identity"] = map[string]any{
+		"provider": provider,
+		"subject":  app.ApproverSubject,
+	}
+	if channel != "" {
+		auditPayload["channel"] = channel
+	}
+	// predicate_snapshot is present IFF the gate declares an approvals block
+	// (operator binding condition 2); legacy-gate rows pass a nil snapshot.
+	if snapshot != nil {
+		auditPayload["predicate_snapshot"] = snapshot
 	}
 	if approverGithubLogin != "" {
 		auditPayload["approver_github_login"] = approverGithubLogin

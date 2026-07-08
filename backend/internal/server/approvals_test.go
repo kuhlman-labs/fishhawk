@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -340,6 +341,9 @@ type approvalAuditFake struct {
 	appended   []audit.ChainAppendParams
 	appendErr  error
 	allEntries []*audit.Entry
+	// runEntries seeds ListForRun, which resolveChangeAuthor (#1709)
+	// scans for the run's earliest user-kind actor. Keyed by run id.
+	runEntries map[uuid.UUID][]*audit.Entry
 }
 
 func (a *approvalAuditFake) seedAll(entries ...*audit.Entry) {
@@ -348,7 +352,18 @@ func (a *approvalAuditFake) seedAll(entries ...*audit.Entry) {
 	a.allEntries = append(a.allEntries, entries...)
 }
 
-func newApprovalAuditFake() *approvalAuditFake { return &approvalAuditFake{} }
+// seedRunEntries records the ordered (sequence-ascending) audit entries a
+// run's ListForRun returns, so the quorum author-resolution path (#1709) can
+// find the originating user-kind actor.
+func (a *approvalAuditFake) seedRunEntries(runID uuid.UUID, entries ...*audit.Entry) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.runEntries[runID] = append(a.runEntries[runID], entries...)
+}
+
+func newApprovalAuditFake() *approvalAuditFake {
+	return &approvalAuditFake{runEntries: map[uuid.UUID][]*audit.Entry{}}
+}
 
 func (a *approvalAuditFake) Append(context.Context, audit.AppendParams) (*audit.Entry, error) {
 	return nil, errors.New("not used")
@@ -383,8 +398,10 @@ func (a *approvalAuditFake) ListAll(context.Context, audit.ListAllParams) ([]*au
 func (a *approvalAuditFake) Get(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
-func (a *approvalAuditFake) ListForRun(context.Context, uuid.UUID) ([]*audit.Entry, error) {
-	return nil, errors.New("not used")
+func (a *approvalAuditFake) ListForRun(_ context.Context, runID uuid.UUID) ([]*audit.Entry, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.runEntries[runID], nil
 }
 func (a *approvalAuditFake) LastForRun(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("not used")
@@ -4970,5 +4987,297 @@ func TestAdvanceForDecision_AcceptanceStage_GenericGate(t *testing.T) {
 	}
 	if rejected.FailureCategory == nil || *rejected.FailureCategory != run.FailureD {
 		t.Errorf("acceptance reject failure category = %v, want D", rejected.FailureCategory)
+	}
+}
+
+// --- E39.4 (#1709): quorum evaluation + additive approval enrichment -------
+
+// quorumApprovalsSpec builds a version 1.0 workflow whose acceptance stage
+// carries a forge-neutral approvals block with the given distinct-approver
+// count. The acceptance stage type routes through the generic approve/advance
+// path (not the plan/review/deploy special cases), isolating the quorum
+// behavior under test.
+func quorumApprovalsSpec(count int) []byte {
+	return []byte(fmt.Sprintf(`version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: gate
+        type: acceptance
+        executor:
+          human: true
+        gates:
+          - type: approval
+            approvals:
+              count: %d
+              not: [author, agent]
+              min_permission: write
+              member_of: acme/reviewers
+`, count))
+}
+
+// seedQuorumStage seeds an acceptance stage awaiting approval, a run carrying
+// the quorum spec (count) + WorkflowID feature_change, and (when author != "")
+// a user-kind audit entry naming the change author so resolveChangeAuthor
+// finds it.
+func seedQuorumStage(rr *approvalRunRepo, au *approvalAuditFake, count int, author string) *run.Stage {
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	rr.mu.Lock()
+	stage.Type = run.StageTypeAcceptance
+	rr.mu.Unlock()
+	rr.seedRun(&run.Run{
+		ID:           stage.RunID,
+		WorkflowID:   "feature_change",
+		WorkflowSpec: quorumApprovalsSpec(count),
+	})
+	if author != "" {
+		k := audit.ActorUser
+		s := author
+		au.seedRunEntries(stage.RunID, &audit.Entry{ActorKind: &k, ActorSubject: &s})
+	}
+	return stage
+}
+
+// approvalPayloadFor returns the approval_submitted audit payload whose
+// approver is subject, failing if none was appended.
+func approvalPayloadFor(t *testing.T, au *approvalAuditFake, subject string) map[string]any {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, e := range au.appended {
+		if e.Category != "approval_submitted" {
+			continue
+		}
+		if e.ActorSubject == nil || *e.ActorSubject != subject {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal audit payload: %v", err)
+		}
+		return payload
+	}
+	t.Fatalf("no approval_submitted entry for %q in %+v", subject, au.appended)
+	return nil
+}
+
+// TestSubmitApproval_Quorum_AuthorRejected pins step 7a: the change author's
+// approve on a quorum gate is refused 403 approver_is_change_author PRE-Submit
+// (no row inserted, so the count is not incremented).
+func TestSubmitApproval_Quorum_AuthorRejected(t *testing.T) {
+	s, ar, rr, au := newApprovalServer(t)
+	const author = "github:author"
+	stage := seedQuorumStage(rr, au, 2, author)
+
+	w := submitApprovalAs(t, s, stage.ID, author, `{"decision":"approve"}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "approver_is_change_author") {
+		t.Errorf("body missing approver_is_change_author: %s", w.Body.String())
+	}
+	rows, _ := ar.ListForStage(context.Background(), stage.ID)
+	if len(rows) != 0 {
+		t.Errorf("author-approve inserted %d approval rows, want 0", len(rows))
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (no advance)", got)
+	}
+}
+
+// TestSubmitApproval_Quorum_TransitionsAtDistinctCount pins step 7b: a count=2
+// gate stays awaiting_approval after one eligible approve and after a
+// delegated/agent approve (recorded channel=delegated, never counted), then
+// transitions to succeeded on a second DISTINCT eligible approve.
+func TestSubmitApproval_Quorum_TransitionsAtDistinctCount(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := seedQuorumStage(rr, au, 2, "github:author")
+
+	// First eligible approve → recorded, still awaiting_approval.
+	w := submitApprovalAs(t, s, stage.ID, "github:r1", `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("r1 status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Fatalf("after r1 state = %q, want awaiting_approval (below quorum)", got)
+	}
+
+	// Agent-kind approve → recorded channel=delegated, never counted.
+	agent := operatorrole.CampaignActorSubject
+	w = submitApprovalAs(t, s, stage.ID, agent, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("agent status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Fatalf("after agent state = %q, want awaiting_approval (agent not counted)", got)
+	}
+	agentPayload := approvalPayloadFor(t, au, agent)
+	if agentPayload["channel"] != "delegated" {
+		t.Errorf("agent channel = %v, want delegated", agentPayload["channel"])
+	}
+	if snap, _ := agentPayload["predicate_snapshot"].(map[string]any); snap["submitter_class"] != "agent" {
+		t.Errorf("agent submitter_class = %v, want agent", snap["submitter_class"])
+	}
+
+	// Second DISTINCT eligible approve → quorum reached, transitions.
+	w = submitApprovalAs(t, s, stage.ID, "github:r2", `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("r2 status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateSucceeded {
+		t.Errorf("after r2 state = %q, want succeeded (quorum reached)", got)
+	}
+	r2Payload := approvalPayloadFor(t, au, "github:r2")
+	snap, _ := r2Payload["predicate_snapshot"].(map[string]any)
+	if snap["quorum_reached"] != true {
+		t.Errorf("r2 quorum_reached = %v, want true; snap=%v", snap["quorum_reached"], snap)
+	}
+	if snap["count_eligible"].(float64) != 2 {
+		t.Errorf("r2 count_eligible = %v, want 2", snap["count_eligible"])
+	}
+}
+
+// TestSubmitApproval_Quorum_DelegatedHumanNotCounted pins the fix-up for the
+// delegated-but-non-agent path: a prior DELEGATED human approval (github:r1,
+// recorded in the audit log with a `delegated` rule but with an approval row
+// indistinguishable from a normal human approve) must NOT count toward the
+// human quorum. On a count=2 gate a following normal approve (github:r2) is
+// then the only eligible vote, so the stage stays awaiting_approval rather than
+// advancing. Without the fix, r1 would be counted and the gate would advance
+// with a single eligible human approval.
+func TestSubmitApproval_Quorum_DelegatedHumanNotCounted(t *testing.T) {
+	s, ar, rr, au := newApprovalServer(t)
+	stage := seedQuorumStage(rr, au, 2, "github:author")
+
+	// Reproduce the state left by a prior delegated human approval: an
+	// approval row for github:r1 plus its approval_submitted audit entry
+	// carrying a non-empty `delegated` rule.
+	ar.all = append(ar.all, &approval.Approval{
+		StageID: stage.ID, ApproverSubject: "github:r1", Decision: approval.DecisionApprove,
+	})
+	uk := audit.ActorUser
+	r1 := "github:r1"
+	au.seedRunEntries(stage.RunID, &audit.Entry{
+		Category:     "approval_submitted",
+		ActorKind:    &uk,
+		ActorSubject: &r1,
+		Payload:      json.RawMessage(`{"decision":"approve","delegated":"clean_dual_approval"}`),
+	})
+
+	// A second DISTINCT eligible approve by a NON-delegated human: only this
+	// vote counts, so the gate stays below the count=2 quorum.
+	w := submitApprovalAs(t, s, stage.ID, "github:r2", `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("r2 status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Fatalf("after r2 state = %q, want awaiting_approval (delegated r1 not counted)", got)
+	}
+	r2Payload := approvalPayloadFor(t, au, "github:r2")
+	snap, _ := r2Payload["predicate_snapshot"].(map[string]any)
+	if snap["quorum_reached"] != false {
+		t.Errorf("r2 quorum_reached = %v, want false (delegated r1 excluded)", snap["quorum_reached"])
+	}
+	if snap["count_eligible"].(float64) != 1 {
+		t.Errorf("r2 count_eligible = %v, want 1 (only r2 counts)", snap["count_eligible"])
+	}
+}
+
+// TestSubmitApproval_Quorum_EnrichedAuditFields pins step 7c: a quorum-gate
+// approval_submitted payload carries identity{provider,subject}, auth_method,
+// channel, and predicate_snapshot, and the audit row carries a timestamp.
+func TestSubmitApproval_Quorum_EnrichedAuditFields(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := seedQuorumStage(rr, au, 2, "github:author")
+
+	id := Identity{Subject: "github:r1", TokenID: "tok-1",
+		Scopes: []string{"write:approvals"}, AuthMethod: "static"}
+	w := submitApprovalWithIdentity(t, s, stage.ID, &id, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	payload := approvalPayloadFor(t, au, "github:r1")
+	identity, _ := payload["identity"].(map[string]any)
+	if identity["provider"] != "github" || identity["subject"] != "github:r1" {
+		t.Errorf("identity = %v, want {github, github:r1}", identity)
+	}
+	if payload["auth_method"] != "static" {
+		t.Errorf("auth_method = %v, want static", payload["auth_method"])
+	}
+	if payload["channel"] != "api" {
+		t.Errorf("channel = %v, want api", payload["channel"])
+	}
+	snap, ok := payload["predicate_snapshot"].(map[string]any)
+	if !ok {
+		t.Fatalf("predicate_snapshot missing/not an object: %v", payload)
+	}
+	if snap["quorum_reached"] != false {
+		t.Errorf("quorum_reached = %v, want false (below count=2)", snap["quorum_reached"])
+	}
+	if snap["min_permission"] != "write" || snap["member_of"] != "acme/reviewers" {
+		t.Errorf("snapshot declared predicates = %v", snap)
+	}
+	// The audit row carries a timestamp.
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, e := range au.appended {
+		if e.Category == "approval_submitted" && e.ActorSubject != nil && *e.ActorSubject == "github:r1" {
+			if e.Timestamp.IsZero() {
+				t.Errorf("approval_submitted row has zero timestamp")
+			}
+		}
+	}
+}
+
+// TestSubmitApproval_BackCompat_NoApprovalsBlock pins step 7d + operator
+// binding conditions 1 & 2: a gate with NO approvals block advances to
+// succeeded on the first approve (semantics unchanged), its enriched payload
+// carries identity + channel (and auth_method), omits predicate_snapshot, and
+// preserves every pre-existing field name.
+func TestSubmitApproval_BackCompat_NoApprovalsBlock(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	// A legacy Approvers-form gate on an implement stage: fetchApprovalsForStage
+	// returns nil (no approvals block) → first-vote-advances path.
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	rr.mu.Lock()
+	stage.Type = run.StageTypeImplement
+	rr.mu.Unlock()
+	rr.seedRun(&run.Run{
+		ID:           stage.RunID,
+		WorkflowID:   "feature_change",
+		WorkflowSpec: []byte(approvalGateSpec),
+	})
+
+	id := Identity{Subject: "github:r1", TokenID: "tok-1",
+		Scopes: []string{"write:approvals"}, AuthMethod: "static"}
+	w := submitApprovalWithIdentity(t, s, stage.ID, &id, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	// Decision flow unchanged: first vote advances to succeeded.
+	if got := rr.stages[stage.ID].State; got != run.StageStateSucceeded {
+		t.Errorf("legacy-gate state = %q, want succeeded (first vote advances)", got)
+	}
+
+	payload := approvalPayloadFor(t, au, "github:r1")
+	if _, ok := payload["predicate_snapshot"]; ok {
+		t.Errorf("legacy-gate payload must omit predicate_snapshot: %v", payload)
+	}
+	identity, _ := payload["identity"].(map[string]any)
+	if identity["provider"] != "github" || identity["subject"] != "github:r1" {
+		t.Errorf("legacy identity = %v, want {github, github:r1}", identity)
+	}
+	if payload["channel"] != "api" {
+		t.Errorf("legacy channel = %v, want api", payload["channel"])
+	}
+	if payload["auth_method"] != "static" {
+		t.Errorf("legacy auth_method = %v, want static", payload["auth_method"])
+	}
+	// Pre-existing field names preserved.
+	for _, k := range []string{"stage_id", "decision", "surface", "approver"} {
+		if _, ok := payload[k]; !ok {
+			t.Errorf("legacy payload dropped pre-existing field %q: %v", k, payload)
+		}
 	}
 }
