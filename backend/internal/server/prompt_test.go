@@ -5304,6 +5304,18 @@ func makeApproveWithScopeFilesEntry(runID uuid.UUID, addScopeFiles []string) *au
 	return &audit.Entry{ID: uuid.New(), Category: "approval_submitted", RunID: &rid, Payload: payload}
 }
 
+// makeApproveWithRemoveScopeFilesEntry builds an approval_submitted audit entry
+// with decision=approve carrying the structured remove_scope_files slice (#1726)
+// that loadApprovalRemoveScopeFiles reads back.
+func makeApproveWithRemoveScopeFilesEntry(runID uuid.UUID, removeScopeFiles []string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"decision":           "approve",
+		"remove_scope_files": removeScopeFiles,
+	})
+	rid := runID
+	return &audit.Entry{ID: uuid.New(), Category: "approval_submitted", RunID: &rid, Payload: payload}
+}
+
 // TestGetStagePrompt_Implement_AddScopeFilesFoldedIntoScope crosses the full
 // #824 seam: persisted approval_submitted.add_scope_files ->
 // resolveApprovalAddScopeFiles -> mergeStructuredScopeFiles ->
@@ -5529,6 +5541,190 @@ func TestGetStagePrompt_Implement_AddScopeFilesFoldedIntoScope(t *testing.T) {
 			if !got[want] {
 				t.Errorf("child resp.ScopeFiles missing inherited %q; got %#v", want, resp.ScopeFiles)
 			}
+		}
+	})
+}
+
+// TestGetStagePrompt_Implement_RemoveScopeFilesSubtractedFromScope crosses the
+// full #1726 subtraction seam: persisted approval_submitted.remove_scope_files
+// -> resolveApprovalRemoveScopeFiles -> subtractScopePaths ->
+// promptResponse.ScopeFiles. An approved plan declares two scope files; the
+// structured remove_scope_files names one, and the rendered implement-prompt
+// scope must EXCLUDE it while retaining the other — for a top-level run and for
+// a decomposed child resolving the removal via the parent fan-out fallback.
+func TestGetStagePrompt_Implement_RemoveScopeFilesSubtractedFromScope(t *testing.T) {
+	const keptFile = "backend/internal/server/prompt.go"
+	const removedFile = "backend/internal/server/approvals.go"
+
+	t.Run("removed path subtracted from top-level scope", func(t *testing.T) {
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+
+		runID := uuid.New()
+		planStageID := uuid.New()
+		implStageID := uuid.New()
+
+		p := &plan.Plan{
+			PlanVersion:  "standard_v1",
+			Summary:      "scoped plan",
+			Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+			Scope: plan.Scope{
+				Files: []plan.ScopeFile{
+					{Path: keptFile, Operation: plan.FileOpModify},
+					{Path: removedFile, Operation: plan.FileOpModify},
+				},
+			},
+		}
+		planBytes, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal plan: %v", err)
+		}
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{
+			StageID:       planStageID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &sv,
+			Content:       planBytes,
+		}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+			runID: {{ID: planStageID, RunID: runID, Type: run.StageTypePlan}},
+		}
+		rr.getRuns[runID] = &run.Run{
+			ID:            runID,
+			Repo:          "o/r",
+			WorkflowID:    "feature_change",
+			TriggerSource: run.TriggerCLI,
+		}
+		rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+		priv, _ := sf.issue(t, runID)
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			RunRepo:      rr,
+			SigningRepo:  sf,
+			ArtifactRepo: art,
+			AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+				runID: {makeApproveWithRemoveScopeFilesEntry(runID, []string{removedFile})},
+			}},
+		})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+
+		w := promptRequest(t, s, runID, implStageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		got := make(map[string]bool, len(resp.ScopeFiles))
+		for _, f := range resp.ScopeFiles {
+			got[f.Path] = true
+		}
+		if !got[keptFile] {
+			t.Errorf("resp.ScopeFiles missing kept %q; got %#v", keptFile, resp.ScopeFiles)
+		}
+		if got[removedFile] {
+			t.Errorf("resp.ScopeFiles still contains removed %q; got %#v", removedFile, resp.ScopeFiles)
+		}
+	})
+
+	t.Run("decomposed child inherits parent remove_scope_files", func(t *testing.T) {
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+
+		parentRunID := uuid.New()
+		childRunID := uuid.New()
+		parentPlanStageID := uuid.New()
+		childStageID := uuid.New()
+
+		// The slice-0 sub-plan scopes both files; remove_scope_files is keyed to
+		// the PARENT run, so the subtraction must walk up the fan-out fallback and
+		// drop the removed path from the child's resolved slice scope.
+		parentPlan := &plan.Plan{
+			PlanVersion:  "standard_v1",
+			Summary:      "parent plan",
+			Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+			Scope: plan.Scope{
+				Files: []plan.ScopeFile{
+					{Path: keptFile, Operation: plan.FileOpModify},
+					{Path: removedFile, Operation: plan.FileOpModify},
+				},
+			},
+			Decomposition: &plan.Decomposition{
+				Rationale: "scope split",
+				SubPlans: []plan.SubPlanSummary{
+					{Title: "Part A", ScopeHint: "A", Scope: &plan.Scope{Files: []plan.ScopeFile{
+						{Path: keptFile, Operation: plan.FileOpModify},
+						{Path: removedFile, Operation: plan.FileOpModify},
+					}}},
+				},
+			},
+		}
+		planBytes, err := json.Marshal(parentPlan)
+		if err != nil {
+			t.Fatalf("marshal parent plan: %v", err)
+		}
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{
+			StageID:       parentPlanStageID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &sv,
+			Content:       planBytes,
+		}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+			parentRunID: {{ID: parentPlanStageID, RunID: parentRunID, Type: run.StageTypePlan}},
+		}
+		rr.getRuns[parentRunID] = &run.Run{ID: parentRunID, Repo: "o/r"}
+		childSliceIdx := 0
+		rr.getRuns[childRunID] = &run.Run{
+			ID:             childRunID,
+			Repo:           "o/r",
+			WorkflowID:     "feature_change",
+			TriggerSource:  run.TriggerCLI,
+			ParentRunID:    &parentRunID,
+			DecomposedFrom: &parentRunID,
+			SliceIndex:     &childSliceIdx,
+		}
+		rr.getStages[childStageID] = &run.Stage{ID: childStageID, RunID: childRunID, Type: run.StageTypeImplement}
+
+		priv, _ := sf.issue(t, childRunID)
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			RunRepo:      rr,
+			SigningRepo:  sf,
+			ArtifactRepo: art,
+			AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+				parentRunID: {makeApproveWithRemoveScopeFilesEntry(parentRunID, []string{removedFile})},
+			}},
+		})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+
+		w := promptRequest(t, s, childRunID, childStageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		got := make(map[string]bool, len(resp.ScopeFiles))
+		for _, f := range resp.ScopeFiles {
+			got[f.Path] = true
+		}
+		if !got[keptFile] {
+			t.Errorf("child resp.ScopeFiles missing kept %q; got %#v", keptFile, resp.ScopeFiles)
+		}
+		if got[removedFile] {
+			t.Errorf("child resp.ScopeFiles still contains removed %q; got %#v", removedFile, resp.ScopeFiles)
 		}
 	})
 }

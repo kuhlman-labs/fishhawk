@@ -4822,6 +4822,58 @@ func TestApprovePlan_AddScopeFiles_PlumbedToSubmitApproval(t *testing.T) {
 	}
 }
 
+// TestApprovePlan_RemoveScopeFiles_PlumbedToSubmitApproval pins the #1726 wire
+// seam: ApprovePlanInput.RemoveScopeFiles must reach the approvals request body
+// the backend decodes (MCP input -> client approvalRequest -> HTTP body),
+// including the replace idiom (remove + add in the same call).
+func TestApprovePlan_RemoveScopeFiles_PlumbedToSubmitApproval(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	removePaths := []string{"backend/old.go"}
+	addPaths := []string{"backend/new.go"}
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:            runID.String(),
+		Reason:           "replace old with new",
+		AddScopeFiles:    addPaths,
+		RemoveScopeFiles: removePaths,
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if !reflect.DeepEqual(fb.approvalsBody.RemoveScopeFiles, removePaths) {
+		t.Errorf("remove_scope_files = %v, want %v", fb.approvalsBody.RemoveScopeFiles, removePaths)
+	}
+	if !reflect.DeepEqual(fb.approvalsBody.AddScopeFiles, addPaths) {
+		t.Errorf("add_scope_files = %v, want %v (replace idiom)", fb.approvalsBody.AddScopeFiles, addPaths)
+	}
+}
+
+// TestApprovePlan_NoRemoveScopeFiles_OmitsFieldOnTheWire confirms the
+// byte-identical no-removal path: an approve without remove_scope_files leaves
+// the field nil on the request body the backend decodes (omitempty).
+func TestApprovePlan_NoRemoveScopeFiles_OmitsFieldOnTheWire(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:  runID.String(),
+		Reason: "looks good",
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if fb.approvalsBody.RemoveScopeFiles != nil {
+		t.Errorf("remove_scope_files = %v, want nil when no removal declared", fb.approvalsBody.RemoveScopeFiles)
+	}
+}
+
 // TestApprovePlan_ImplementModel_PlumbedToSubmitApproval pins the #1013 wire
 // seam: ApprovePlanInput.ImplementModel must reach the approvals request body
 // the backend decodes (MCP input -> client approvalRequest -> HTTP body).

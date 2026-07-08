@@ -532,6 +532,13 @@ type approvalRequest struct {
 	// decoder on the backend requires the field be declared here too; reject
 	// and conditionless approve callers pass nil (omitempty).
 	AddScopeFiles []string `json:"add_scope_files,omitempty"`
+	// RemoveScopeFiles is the structured scope removal (#1726): repo-relative
+	// paths to subtract from the implement stage's scope.files on approve — the
+	// inverse of AddScopeFiles. Combined with it in the same approve call it
+	// expresses a scope REPLACE. The DisallowUnknownFields decoder on the
+	// backend requires the field be declared here too; reject and removal-less
+	// approve callers pass nil (omitempty).
+	RemoveScopeFiles []string `json:"remove_scope_files,omitempty"`
 	// BindingAssertions is the operator-declared binding-assertion list (#1171)
 	// the backend validates pre-Submit and records on the approval audit
 	// payload. The DisallowUnknownFields decoder requires the field be declared
@@ -570,7 +577,11 @@ type approvalResult struct {
 // for issue-thread `@`-mention rendering while keeping the token
 // subject as the provenance identity. `addScopeFiles` is the structured
 // scope amendment (#824) folded into the implement stage's scope.files on
-// approve; nil on reject and conditionless approve. `bindingAssertions` is the
+// approve; nil on reject and conditionless approve. `removeScopeFiles` is the
+// inverse structured scope removal (#1726) subtracted from the implement
+// stage's scope.files on approve (a scope REPLACE = addScopeFiles +
+// removeScopeFiles in one call); nil on reject and removal-less approve.
+// `bindingAssertions` is the
 // operator-declared binding-assertion list (#1171) the backend validates
 // pre-Submit and records on the approval audit payload; nil on reject and
 // assertion-less approve. Returns the updated Stage. 4xx
@@ -603,12 +614,13 @@ type approvalResult struct {
 //     deployment's per-adapter allow-list; details carry model,
 //     model_source, and adapter. Pre-insert: retry with an allowed
 //     implement_model, or widen the allow-list)
-func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles []string, bindingAssertions []BindingAssertion, implementModel string) (*approvalResult, error) {
+func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, bindingAssertions []BindingAssertion, implementModel string) (*approvalResult, error) {
 	body, err := json.Marshal(approvalRequest{
 		Decision:            decision,
 		Comment:             comment,
 		ApproverGithubLogin: approverGithubLogin,
 		AddScopeFiles:       addScopeFiles,
+		RemoveScopeFiles:    removeScopeFiles,
 		BindingAssertions:   bindingAssertions,
 		ImplementModel:      implementModel,
 	})

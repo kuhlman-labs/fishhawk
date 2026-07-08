@@ -510,6 +510,45 @@ func (s *Server) foldScopePaths(ctx context.Context, scopeFiles []scopeFile, pat
 	return scopeFiles
 }
 
+// subtractScopePaths is the inverse of foldScopePaths (#1726): it removes every
+// scope entry whose .Path is in paths (compare-by-Path, the same semantics the
+// fold uses) and info-logs the removals. It is the prompt-side half of a
+// gate-time remove_scope_files edit — the runner reads cfg.scopeFiles solely
+// from the prompt-response ScopeFiles, so subtracting here makes every runner
+// gate (created-out-of-scope, commit-in-scope, category-B) honor the removal
+// with no runner change. Empty paths is a no-op. A subtraction that would empty
+// a non-empty scope is refused at the plan gate (checkRemoveScopeFiles), so
+// this helper does not re-guard it; if the resulting set is empty it simply
+// returns empty (the runner's git add -A fallback), matching the fold's
+// empty-scope contract.
+func (s *Server) subtractScopePaths(ctx context.Context, scopeFiles []scopeFile, paths []string, source string) []scopeFile {
+	if len(paths) == 0 || len(scopeFiles) == 0 {
+		return scopeFiles
+	}
+	remove := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		remove[p] = struct{}{}
+	}
+	out := make([]scopeFile, 0, len(scopeFiles))
+	removed := make([]string, 0, len(paths))
+	for _, f := range scopeFiles {
+		if _, drop := remove[f.Path]; drop {
+			removed = append(removed, f.Path)
+			continue
+		}
+		out = append(out, f)
+	}
+	if len(removed) > 0 {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"prompt: subtracted files from implement scope",
+			slog.String("source", source),
+			slog.Int("count", len(removed)),
+			slog.String("paths", strings.Join(removed, ",")),
+		)
+	}
+	return out
+}
+
 // effectiveFixupScope computes the effective scope for an implement-review
 // fix-up dispatch. It RETAINS the FULL inherited plan scope (#1314), reversing
 // the #1162 concern-surface narrowing that rebuilt the fix-up scope from an
@@ -788,6 +827,18 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// carries the amended scope. No-op on an empty scope (keeps the
 		// runner's git add -A fallback).
 		scopeFiles = s.mergeApprovedScopeAmendments(r.Context(), scopeFiles, runRow.ID, stage.ID)
+		// Subtract the operator's gate-time remove_scope_files (#1726) AFTER
+		// the add fold, the approved-amendment fold, and (for decomposed
+		// children) the per-slice narrowing above — so the removal covers
+		// top-level, decomposed per-slice, and fix-up scopes uniformly. The
+		// runner reads cfg.scopeFiles solely from this ScopeFiles, so a removed
+		// path is honored by every runner gate with no runner change. Resolved
+		// across the decomposition fan-out boundary so removals reach
+		// implement-only decomposed and recovery children. No-op on an empty
+		// removal set (audit prompt-hash replay stability).
+		removedScopeFiles := s.resolveApprovalRemoveScopeFiles(r.Context(), runRow)
+		scopeFiles = s.subtractScopePaths(r.Context(), scopeFiles, removedScopeFiles, "approval-remove-scope-files")
+		trigger.RemovedScopeFiles = removedScopeFiles
 		// Fix-up pass (#762): when the operator routed implement-review
 		// concerns back to this stage, deliver them as binding instructions
 		// (reusing #558's framing) and RETAIN the FULL approved plan scope as the
@@ -1132,6 +1183,12 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// Fold the operator-approved mid-stage scope amendment paths (#961),
 		// same derivation as the dispatch path so the rendered view matches.
 		scopeFiles = s.mergeApprovedScopeAmendments(r.Context(), scopeFiles, runRow.ID, stage.ID)
+		// Subtract the operator's gate-time remove_scope_files (#1726), the same
+		// derivation as the dispatch path so the rendered (SPA-readable) view
+		// stays byte-for-byte consistent with the runner-facing prompt.
+		removedScopeFiles := s.resolveApprovalRemoveScopeFiles(r.Context(), runRow)
+		scopeFiles = s.subtractScopePaths(r.Context(), scopeFiles, removedScopeFiles, "approval-remove-scope-files")
+		trigger.RemovedScopeFiles = removedScopeFiles
 		// Fix-up pass (#762): when the operator routed implement-review
 		// concerns back to this stage, deliver them as binding instructions
 		// (reusing #558's framing) and RETAIN the FULL approved plan scope
@@ -3083,6 +3140,80 @@ func (s *Server) resolveApprovalAddScopeFiles(ctx context.Context, runRow *run.R
 	if len(paths) > 0 {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 			"prompt: inherited add_scope_files from retry/recovery parent",
+			slog.String("child_run_id", runRow.ID.String()),
+			slog.String("parent_run_id", runRow.ParentRunID.String()),
+		)
+	}
+	return paths
+}
+
+// loadApprovalRemoveScopeFiles scans the run's approval_submitted audit
+// entries (newest-first) for the first approve carrying remove_scope_files and
+// returns its paths (#1726). The inverse of loadApprovalAddScopeFiles: the
+// prompt builder subtracts these from the effective scope. Best-effort:
+// WARN-logs and returns nil on any error.
+func (s *Server) loadApprovalRemoveScopeFiles(ctx context.Context, runID uuid.UUID) []string {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "approval_submitted")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list approval_submitted for remove_scope_files failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		var payload struct {
+			Decision         string   `json:"decision"`
+			RemoveScopeFiles []string `json:"remove_scope_files"`
+		}
+		if err := json.Unmarshal(entries[i].Payload, &payload); err != nil {
+			continue
+		}
+		if payload.Decision == "approve" && len(payload.RemoveScopeFiles) > 0 {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"prompt: loaded structured remove_scope_files for implement scope",
+				slog.String("run_id", runID.String()),
+				slog.Int("count", len(payload.RemoveScopeFiles)),
+			)
+			return payload.RemoveScopeFiles
+		}
+	}
+	return nil
+}
+
+// resolveApprovalRemoveScopeFiles returns the structured remove_scope_files
+// paths for an implement-stage prompt, resolving across the decomposition
+// fan-out boundary (#1726, mirroring resolveApprovalAddScopeFiles / #824). It
+// reads the run's own approval_submitted entries first; for a decomposed child
+// with no gate of its own that yields nil, so it falls back to the PARENT
+// run's paths so removals reach implement-only decomposed children. CI-retry /
+// category-B recovery children carry ParentRunID and get the same single-level
+// fallback.
+func (s *Server) resolveApprovalRemoveScopeFiles(ctx context.Context, runRow *run.Run) []string {
+	if paths := s.loadApprovalRemoveScopeFiles(ctx, runRow.ID); len(paths) > 0 {
+		return paths
+	}
+	if runRow.DecomposedFrom != nil {
+		paths := s.loadApprovalRemoveScopeFiles(ctx, *runRow.DecomposedFrom)
+		if len(paths) > 0 {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"prompt: inherited remove_scope_files from decomposition parent",
+				slog.String("child_run_id", runRow.ID.String()),
+				slog.String("parent_run_id", runRow.DecomposedFrom.String()),
+			)
+		}
+		return paths
+	}
+	if runRow.ParentRunID == nil {
+		return nil
+	}
+	paths := s.loadApprovalRemoveScopeFiles(ctx, *runRow.ParentRunID)
+	if len(paths) > 0 {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"prompt: inherited remove_scope_files from retry/recovery parent",
 			slog.String("child_run_id", runRow.ID.String()),
 			slog.String("parent_run_id", runRow.ParentRunID.String()),
 		)
