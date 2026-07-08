@@ -308,6 +308,13 @@ type fakeBackend struct {
 	costByRun  map[uuid.UUID]RunCost
 	costStatus int
 
+	// Latency fixtures: GET /v0/runs/{run_id}/latency (#1702). latencyByRun
+	// seeds the gate-latency rollup per run; an unseeded run returns the empty
+	// object {} — mirroring the backend's no-gate-data 200. latencyStatus drives
+	// the HTTP status code (default 200).
+	latencyByRun  map[uuid.UUID]RunLatency
+	latencyStatus int
+
 	// integrate-wave fixtures: POST /v0/runs/{run_id}/integrate-wave (#1278
 	// slice B). The run_children wave loop calls this between waves; the tests
 	// drive its response and assert the call counter. integrateWaveResp is the
@@ -427,6 +434,8 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		cacheEffStatus:                http.StatusOK,
 		costByRun:                     map[uuid.UUID]RunCost{},
 		costStatus:                    http.StatusOK,
+		latencyByRun:                  map[uuid.UUID]RunLatency{},
+		latencyStatus:                 http.StatusOK,
 		integrateWaveResp:             map[uuid.UUID]IntegrateWaveResult{},
 		integrateWaveStatus:           http.StatusOK,
 		integrateWaveCalledBy:         map[uuid.UUID]int{},
@@ -1121,6 +1130,25 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(rc)
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}/latency", func(w http.ResponseWriter, r *http.Request) {
+		id, perr := uuid.Parse(r.PathValue("run_id"))
+		w.Header().Set("Content-Type", "application/json")
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		rl, ok := fb.latencyByRun[id]
+		status := fb.latencyStatus
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if !ok {
+			// No gate data — empty object, as the backend does.
+			_, _ = w.Write([]byte("{}"))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(rl)
 	})
 	mux.HandleFunc("GET /v0/audit", func(w http.ResponseWriter, r *http.Request) {
 		runIDQ := r.URL.Query().Get("run_id")
@@ -6248,6 +6276,107 @@ func TestGetRunStatus_OmitsCostWhenNoData(t *testing.T) {
 	_ = json.Unmarshal(raw, &m)
 	if _, ok := m["cost"]; ok {
 		t.Errorf("marshaled output must omit the cost key when no data; got %s", raw)
+	}
+}
+
+// --- run latency (#1702) ---
+//
+// Cross-boundary wire-to-tool seam: a stub backend serves GET
+// /v0/runs/{id}/latency and getRunStatus surfaces the same block (and omits it
+// when the backend returns the empty no-data object). The compute → endpoint
+// layers — the audit-timestamp gate-latency aggregation — are covered end-to-end
+// by the latency package (AggregateGateLatency) and the server handler tests
+// (latency_test.go); this asserts the MCP-mapping seam so the per-gate breakdown
+// and totals don't silently drop on the wire (cf. #618).
+
+func seedRunLatency(fb *fakeBackend, runID uuid.UUID, rl RunLatency) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.latencyByRun[runID] = rl
+}
+
+func TestGetRunStatus_SurfacesLatencyBlock(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: "succeeded"}
+	opened := time.Date(2026, 7, 8, 9, 1, 0, 0, time.UTC)
+	closed := time.Date(2026, 7, 8, 9, 6, 0, 0, time.UTC)
+	seedRunLatency(fb, runID, RunLatency{
+		Gates: []LatencyGate{
+			{Gate: "plan_approval", OpenedAt: opened, ClosedAt: closed, WaitSeconds: 300},
+			{Gate: "checks_green_to_merge", OpenedAt: opened, ClosedAt: closed, WaitSeconds: 600},
+		},
+		TotalWaitOnHumanSeconds: 900,
+		WallClockSeconds:        2400,
+	})
+
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.Latency == nil {
+		t.Fatal("expected latency block surfaced from backend; got nil")
+	}
+	if out.Latency.TotalWaitOnHumanSeconds != 900 || out.Latency.WallClockSeconds != 2400 {
+		t.Errorf("latency totals = wait %g wall %g, want 900 / 2400",
+			out.Latency.TotalWaitOnHumanSeconds, out.Latency.WallClockSeconds)
+	}
+	if len(out.Latency.Gates) != 2 {
+		t.Fatalf("want 2 gate rows, got %d: %+v", len(out.Latency.Gates), out.Latency.Gates)
+	}
+	if out.Latency.Gates[0].Gate != "plan_approval" || out.Latency.Gates[0].WaitSeconds != 300 {
+		t.Errorf("gate[0] = %+v, want plan_approval wait 300", out.Latency.Gates[0])
+	}
+	// The gate timestamps must cross the wire intact.
+	if !out.Latency.Gates[0].OpenedAt.Equal(opened) || !out.Latency.Gates[0].ClosedAt.Equal(closed) {
+		t.Errorf("gate[0] timestamps = %v..%v, want %v..%v",
+			out.Latency.Gates[0].OpenedAt, out.Latency.Gates[0].ClosedAt, opened, closed)
+	}
+}
+
+func TestGetRunStatus_OmitsLatencyWhenNoData(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: "running"}
+	// No seedRunLatency → backend returns {} → GetRunLatency yields nil.
+
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.Latency != nil {
+		t.Errorf("expected no latency block; got %+v", out.Latency)
+	}
+	// The no-data block must omit the JSON key entirely (nil pointer +
+	// omitempty), not serialize a null.
+	raw, _ := json.Marshal(out)
+	var m map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &m)
+	if _, ok := m["latency"]; ok {
+		t.Errorf("marshaled output must omit the latency key when no data; got %s", raw)
+	}
+}
+
+// TestGetRunStatus_LatencyFetchErrorOmitsBlock proves the best-effort posture:
+// a 500 from the latency endpoint omits the block and NEVER fails the snapshot.
+func TestGetRunStatus_LatencyFetchErrorOmitsBlock(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: "running"}
+	fb.latencyStatus = http.StatusInternalServerError
+
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus must not fail when the latency fetch errors: %v", err)
+	}
+	if out.Latency != nil {
+		t.Errorf("expected no latency block on a fetch error; got %+v", out.Latency)
 	}
 }
 

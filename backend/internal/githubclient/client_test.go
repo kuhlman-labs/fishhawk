@@ -2090,6 +2090,88 @@ func TestClosePullRequest_GitHubError(t *testing.T) {
 	}
 }
 
+func TestEditPullRequest_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	if err := c.EditPullRequest(context.Background(), 42,
+		RepoRef{Owner: "o", Name: "r"}, 7, "new body with economics"); err != nil {
+		t.Fatalf("EditPullRequest: %v", err)
+	}
+	if fg.gotMethod != http.MethodPatch {
+		t.Errorf("method = %q, want PATCH", fg.gotMethod)
+	}
+	if fg.gotPath != "/repos/o/r/pulls/7" {
+		t.Errorf("path = %q, want /repos/o/r/pulls/7", fg.gotPath)
+	}
+	if fg.gotContentType != "application/json" {
+		t.Errorf("content-type = %q", fg.gotContentType)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(fg.gotBody, &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["body"] != "new body with economics" {
+		t.Errorf("body field = %q, want the new body", body["body"])
+	}
+	// The PATCH must carry ONLY the body field — it must not clobber state.
+	if _, ok := body["state"]; ok {
+		t.Errorf("edit PATCH must not include state: %v", body)
+	}
+}
+
+func TestEditPullRequest_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	cases := []struct {
+		name      string
+		repo      RepoRef
+		number    int
+		wantSubst string
+	}{
+		{"missing owner", RepoRef{Name: "r"}, 1, "owner and name"},
+		{"missing name", RepoRef{Owner: "o"}, 1, "owner and name"},
+		{"zero number", RepoRef{Owner: "o", Name: "r"}, 0, "pr number must be"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := c.EditPullRequest(context.Background(), 1, tc.repo, tc.number, "b")
+			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
+			}
+		})
+	}
+}
+
+func TestEditPullRequest_GitHubError(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.closePullRequestStatus = http.StatusForbidden
+	fg.closePullRequestBody = `{"message":"Resource not accessible by integration"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	err := c.EditPullRequest(context.Background(), 1,
+		RepoRef{Owner: "o", Name: "r"}, 7, "b")
+	if err == nil || !errors.Is(err, ErrForbidden) {
+		t.Errorf("err = %v, want ErrForbidden", err)
+	}
+}
+
+// TestGetPullRequest_DecodesBody pins the #1702 body-read half of the stamp:
+// GetPullRequest surfaces the PR description so the merge-time stamp can splice
+// its section into it.
+func TestGetPullRequest_DecodesBody(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getPullRequestBody = `{"number":7,"node_id":"PR_kw7","state":"closed","merged":true,"body":"Existing description.","head":{"sha":"abc"},"base":{"ref":"main"}}`
+	c, _ := newTestClient(t, srv, nil)
+
+	pr, err := c.GetPullRequest(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, 7)
+	if err != nil {
+		t.Fatalf("GetPullRequest: %v", err)
+	}
+	if pr.Body != "Existing description." {
+		t.Errorf("Body = %q, want the decoded PR description", pr.Body)
+	}
+}
+
 func TestListOpenPullRequestsByHead_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	fg.listPullsBody = `[{"number":99,"node_id":"PR_kw99","state":"open","html_url":"https://github.com/x/y/pull/99","head":{"sha":"def456"}}]`

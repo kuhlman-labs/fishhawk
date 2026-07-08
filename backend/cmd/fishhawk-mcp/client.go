@@ -355,6 +355,51 @@ func (c *apiClient) GetRunCost(ctx context.Context, runID uuid.UUID) (*RunCost, 
 	return &rc, nil
 }
 
+// RunLatency mirrors the backend's GET /v0/runs/{run_id}/latency body
+// (`backend/internal/server/latency.go::latencySummaryResponse`): the per-run
+// gate-latency (wait-on-human) rollup derived from the run's audit-chain
+// timestamps (#1702) — the time parked at each human gate (plan approval,
+// implement-review → next dispatch, checks-green → merge), the total wait on
+// human decisions, and the run's end-to-end wall clock. DISPLAY-ONLY —
+// surfaced in fishhawk_get_run_status so the operator sees human-gate latency;
+// it never gates a run.
+//
+// Repeated here rather than imported because the MCP server's apiClient is a
+// thin local copy (the import direction is `cli → backend`, not the reverse).
+// The scalar fields are omitempty so the no-data path — which GetRunLatency
+// collapses to a nil pointer — never marshals a half-empty block.
+type RunLatency struct {
+	Gates                   []LatencyGate `json:"gates,omitempty"`
+	TotalWaitOnHumanSeconds float64       `json:"total_wait_on_human_seconds,omitempty"`
+	WallClockSeconds        float64       `json:"wall_clock_seconds,omitempty"`
+}
+
+// LatencyGate is one measured human gate: the interval between its opening and
+// closing audit markers, with the wait in seconds.
+type LatencyGate struct {
+	Gate        string    `json:"gate"`
+	OpenedAt    time.Time `json:"opened_at"`
+	ClosedAt    time.Time `json:"closed_at"`
+	WaitSeconds float64   `json:"wait_seconds"`
+}
+
+// GetRunLatency fetches the run's gate-latency rollup. The backend returns 200
+// with an empty object when no gate interval resolves; GetRunLatency collapses
+// that to (nil, nil) so every caller treats "no data" uniformly by checking for
+// a nil pointer. The presence sentinel is "no gate rows" — the empty object has
+// none, while any gated run reports at least one gate, so the empty object never
+// false-collapses a real rollup.
+func (c *apiClient) GetRunLatency(ctx context.Context, runID uuid.UUID) (*RunLatency, error) {
+	var rl RunLatency
+	if err := c.do(ctx, http.MethodGet, "/v0/runs/"+runID.String()+"/latency", nil, &rl); err != nil {
+		return nil, err
+	}
+	if len(rl.Gates) == 0 {
+		return nil, nil
+	}
+	return &rl, nil
+}
+
 // OnboardingReadinessReport mirrors the backend's GET
 // /v0/onboarding/readiness body
 // (`backend/internal/server/onboarding.go::onboardingReadinessResponse`, E29.4 /

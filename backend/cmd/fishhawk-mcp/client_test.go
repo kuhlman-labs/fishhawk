@@ -141,3 +141,51 @@ func TestDeferFiledIssue_DecodesLabelCompleteness(t *testing.T) {
 		t.Errorf("MissingLabelNamespaces = %v, want [area]", got.MissingLabelNamespaces)
 	}
 }
+
+// TestGetRunLatency_CollapsesEmptyObject pins the apiClient no-data contract
+// (#1702): the backend returns 200 + `{}` when no gate interval has resolved,
+// and GetRunLatency must collapse that to (nil, nil) so callers branch on a nil
+// pointer — the same presence-sentinel convention as GetRunCost.
+func TestGetRunLatency_CollapsesEmptyObject(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	// No seedRunLatency → the fake serves {}.
+
+	rl, err := r.api.GetRunLatency(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("GetRunLatency: %v", err)
+	}
+	if rl != nil {
+		t.Errorf("empty object must collapse to nil, got %+v", rl)
+	}
+}
+
+// TestGetRunLatency_DecodesGatedRollup proves a populated rollup decodes off the
+// wire with its gates and totals intact.
+func TestGetRunLatency_DecodesGatedRollup(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedRunLatency(fb, runID, RunLatency{
+		Gates: []LatencyGate{
+			{Gate: "plan_approval", WaitSeconds: 300},
+		},
+		TotalWaitOnHumanSeconds: 300,
+		WallClockSeconds:        1200,
+	})
+
+	rl, err := r.api.GetRunLatency(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("GetRunLatency: %v", err)
+	}
+	if rl == nil {
+		t.Fatal("expected a rollup, got nil")
+	}
+	if len(rl.Gates) != 1 || rl.Gates[0].Gate != "plan_approval" || rl.Gates[0].WaitSeconds != 300 {
+		t.Errorf("gates = %+v, want a single plan_approval/300", rl.Gates)
+	}
+	if rl.TotalWaitOnHumanSeconds != 300 || rl.WallClockSeconds != 1200 {
+		t.Errorf("totals = wait %g wall %g, want 300 / 1200", rl.TotalWaitOnHumanSeconds, rl.WallClockSeconds)
+	}
+}
