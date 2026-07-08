@@ -71,10 +71,27 @@ Notes:
   isolation above), and — for an approve carrying binding conditions — the
   verbatim conditions text (`approval_submitted` payload `comment`) in a
   nested collapsed `<details>`. Reject decisions carry no override marker.
+- **Per-change economics block (#1702).** The anchor renders a compact
+  `**Economics**` section just above the footer: the total cost with the
+  per-stage breakdown (`agent` / `plan_review` / `implement_review`), the
+  end-to-end wall clock, the wait-on-human total with its per-gate breakdown
+  (plan approval, implement review → dispatch, checks green → merge), and the
+  cache net savings. Every figure is DERIVED at rebuild time from the run's
+  existing audit data — the `cost_recorded` ledger (`cost.AggregateRunCost` /
+  `cost.AggregateCacheEfficiency`) and the audit-chain timestamps
+  (`latency.AggregateGateLatency`) — via `issuecomment.BuildRunEconomics` +
+  `RenderEconomicsBlock`, so the block adds no new write and no new gate. It is
+  a rendered SECTION of the living anchor, not a new comment surface, and it is
+  omitted entirely when the run carries no economics signal (no cost, no gate
+  interval, no cache activity). **The same block is stamped into the PR body
+  when a merge is observed** (`Server.resolveReviewStageOnMerge` →
+  `githubclient.EditPullRequest`), spliced between `<!-- fishhawk:economics -->`
+  markers so a re-observed merge replaces rather than duplicates the section;
+  the stamp is best-effort and never blocks the merge-gate resolution.
 - **Body cap.** The anchor body is capped at `MaxIssueCommentBodyBytes`
-  (65,536) by a degradation ladder that drops the timeline first, then
-  superseded plans, always preserving the header, the current plan summary,
-  and the dashboard deep-link.
+  (65,536) by a degradation ladder that drops the **economics block first**
+  (display-only, derived), then the timeline, then superseded plans, always
+  preserving the header, the current plan summary, and the dashboard deep-link.
 - **Page-class pings (`anchor_ping_posted`).** GitHub does not notify on
   comment EDITS, so a state change that needs a human is announced by a
   one-line NEW comment linking to the anchor. Page-class events are derived

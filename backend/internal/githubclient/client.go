@@ -816,10 +816,15 @@ type PullRequest struct {
 	HeadRef string
 	// Number and HTMLURL are populated by CreatePullRequest and
 	// ListOpenPullRequestsByHead (the consolidated-PR path, #714).
-	// GetPullRequest leaves them zero/empty — its callers only need
-	// NodeID/HeadSHA/State/Merged.
+	// GetPullRequest leaves HTMLURL empty — its callers only need
+	// NodeID/HeadSHA/State/Merged/Body.
 	Number  int
 	HTMLURL string
+	// Body is the PR description. Populated by GetPullRequest so the
+	// merge-time economics stamp (#1702) can splice its delimited section
+	// into the existing body idempotently. Empty on CreatePullRequest /
+	// ListOpenPullRequestsByHead results (they don't read it back).
+	Body string
 }
 
 // GetPullRequest fetches a single PR by number.
@@ -864,6 +869,7 @@ func (c *Client) GetPullRequest(ctx context.Context, installationID int64,
 		NodeID string `json:"node_id"`
 		State  string `json:"state"`
 		Merged bool   `json:"merged"`
+		Body   string `json:"body"`
 		Head   struct {
 			SHA string `json:"sha"`
 			Ref string `json:"ref"`
@@ -885,7 +891,55 @@ func (c *Client) GetPullRequest(ctx context.Context, installationID int64,
 		Merged:  body.Merged,
 		BaseRef: body.Base.Ref,
 		HeadRef: body.Head.Ref,
+		Body:    body.Body,
 	}, nil
+}
+
+// EditPullRequest replaces a pull request's body (#1702). It is the write
+// half of the merge-time economics stamp: resolveReviewStageOnMerge reads the
+// current body via GetPullRequest, splices its delimited economics section in,
+// and calls this to persist the result.
+//
+//	PATCH /repos/{owner}/{repo}/pulls/{number}
+//	{ "body": "<body>" }
+//
+// This is the same endpoint GitHub documents for "Update a pull request";
+// editing the body is permitted regardless of merge state, so a stamp on an
+// already-merged PR succeeds. Mirrors the ClosePullRequest PATCH pattern.
+// Returns ErrNotFound when the repo/PR isn't visible to the installation,
+// ErrForbidden on auth issues, ErrValidation when GitHub rejects the update.
+func (c *Client) EditPullRequest(ctx context.Context, installationID int64,
+	repo RepoRef, number int, body string) error {
+	if c.Tokens == nil {
+		return errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return errors.New("githubclient: repo owner and name required")
+	}
+	if number <= 0 {
+		return errors.New("githubclient: pr number must be > 0")
+	}
+
+	raw, err := json.Marshal(map[string]string{"body": body})
+	if err != nil {
+		return fmt.Errorf("githubclient: marshal edit pr: %w", err)
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/pulls/" + url.PathEscape(fmt.Sprintf("%d", number)))
+	req, err := c.buildRequest(ctx, http.MethodPatch, endpoint, bytes.NewReader(raw), installationID)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("githubclient: edit pr: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return classifyStatus("edit pr", resp)
 }
 
 // CompareCommits returns the SHAs of the commits on head since its

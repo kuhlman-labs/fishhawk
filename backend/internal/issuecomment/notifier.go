@@ -46,7 +46,10 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/cost"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/latency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -810,6 +813,7 @@ func (n *Notifier) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID
 		Audit:           entries,
 		CurrentPlan:     current,
 		SupersededPlans: superseded,
+		Economics:       BuildRunEconomics(runRow, entries),
 		ExternalURL:     n.externalURL,
 		Now:             n.now(),
 	})
@@ -892,6 +896,118 @@ func (n *Notifier) loadAnchorPlans(ctx context.Context, stages []*run.Stage, ent
 		superseded = append(superseded, v)
 	}
 	return &current, superseded
+}
+
+// BuildRunEconomics folds the run's audit chain into the economics rollups
+// the living anchor renders (#1702): the cost + cache-efficiency aggregates
+// over the cost_recorded ledger and the gate-latency rollup over the whole
+// chain. It mirrors the derivation the /cost, /cache-efficiency, and /latency
+// read surfaces perform (backend/internal/server), reusing the authoritative
+// rolled cost total (runRow.CostUSDTotal) and the run-start bound
+// (runRow.CreatedAt).
+//
+// Exported so the merge-time PR-body stamp (server.resolveReviewStageOnMerge)
+// derives the SAME block the anchor shows from one fold, rather than
+// re-implementing the mapping in the server package.
+//
+// Best-effort and pure over the loaded entries: an unparsable cost payload is
+// skipped, and a chain with no economics signal yields an all-zero
+// EconomicsInput that RenderEconomicsBlock renders as "" — the block is
+// dropped from the anchor rather than shown empty. Always returns a non-nil
+// input; emptiness is decided by the renderer.
+func BuildRunEconomics(runRow *run.Run, entries []*audit.Entry) *EconomicsInput {
+	costEntries := make([]cost.RunCostEntry, 0)
+	cacheEntries := make([]cost.CacheEfficiencyEntry, 0)
+	events := make([]latency.GateEvent, 0, len(entries))
+
+	// runEnd is the newest terminal-marker timestamp (pr_merged /
+	// post_merge_observed) when present, else the max timestamp in the chain —
+	// "as far as the run has gotten" — mirroring server.runLatencySummary.
+	runEnd := runRow.CreatedAt
+	var terminal time.Time
+	haveTerminal := false
+
+	for _, e := range entries {
+		if e.Timestamp.After(runEnd) {
+			runEnd = e.Timestamp
+		}
+		if e.Category == "cost_recorded" {
+			var p struct {
+				Model            string  `json:"model"`
+				USD              float64 `json:"usd"`
+				Source           string  `json:"source"`
+				InputTokens      int     `json:"input_tokens"`
+				OutputTokens     int     `json:"output_tokens"`
+				CacheReadTokens  int     `json:"cache_read_input_tokens"`
+				CacheWriteTokens int     `json:"cache_write_input_tokens"`
+			}
+			if json.Unmarshal(e.Payload, &p) == nil {
+				costEntries = append(costEntries, cost.RunCostEntry{Source: p.Source, USD: p.USD})
+				cacheEntries = append(cacheEntries, cost.CacheEfficiencyEntry{
+					Model:      p.Model,
+					Source:     p.Source,
+					FreshInput: p.InputTokens,
+					CacheRead:  p.CacheReadTokens,
+					CacheWrite: p.CacheWriteTokens,
+					Output:     p.OutputTokens,
+				})
+			}
+		}
+		if cat, ok := latencyGateCategory(e.Category, e.Payload); ok {
+			events = append(events, latency.GateEvent{Category: cat, Timestamp: e.Timestamp})
+		}
+		if e.Category == latency.CategoryPRMerged || e.Category == "post_merge_observed" {
+			if !haveTerminal || e.Timestamp.After(terminal) {
+				terminal = e.Timestamp
+				haveTerminal = true
+			}
+		}
+	}
+	if haveTerminal {
+		runEnd = terminal
+	}
+
+	costSummary := cost.AggregateRunCost(costEntries)
+	// total_cost mirrors the /cost surface's authoritative figure — the run
+	// record's rolled total, which the per-stage sum breaks down.
+	costSummary.TotalUSD = runRow.CostUSDTotal
+
+	return &EconomicsInput{
+		Cost:    costSummary,
+		Cache:   cost.AggregateCacheEfficiency(cacheEntries),
+		Latency: latency.AggregateGateLatency(events, runRow.CreatedAt, runEnd),
+	}
+}
+
+// latencyGateCategory maps an audit entry to the latency category the
+// aggregator keys on, or reports ok=false to skip it. Most categories map to
+// themselves; the synthetic `ci_green` boundary is derived from the
+// `run_auto_advanced` entry whose payload rule is checks_green_awaiting_merge.
+// It mirrors server.gateEventCategory — duplicated here because the server
+// package imports issuecomment, so this package cannot import back the other
+// way.
+func latencyGateCategory(category string, payload json.RawMessage) (string, bool) {
+	switch category {
+	case latency.CategoryPlanGenerated,
+		latency.CategoryApprovalSubmitted,
+		latency.CategoryImplementReviewed,
+		latency.CategoryAcceptanceDispatched,
+		latency.CategoryPRMerged:
+		return category, true
+	case drive.Category: // run_auto_advanced
+		var adv struct {
+			Rule string `json:"rule"`
+		}
+		if err := json.Unmarshal(payload, &adv); err != nil {
+			return "", false
+		}
+		if adv.Rule == string(drive.RuleChecksGreenAwaitingMerge) {
+			return latency.CategoryCIGreen, true
+		}
+		return "", false
+	default:
+		return "", false
+	}
 }
 
 // planRejectionReasons extracts the rejection comments from the run's

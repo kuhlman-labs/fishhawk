@@ -13,8 +13,10 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/latency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -1449,5 +1451,145 @@ func TestNotifyStatusUpdateForRun_AnchorEndToEnd(t *testing.T) {
 	}
 	if !strings.Contains(body, "scoped the wrong fork") {
 		t.Errorf("superseded plan missing its rejection reason:\n%s", body)
+	}
+}
+
+// econEntry is a small audit-chain entry builder for the BuildRunEconomics
+// fold test: category + ascending sequence + timestamp + optional payload.
+func econEntry(seq int64, category string, ts int64, payload map[string]any) *audit.Entry {
+	var raw json.RawMessage
+	if payload != nil {
+		raw, _ = json.Marshal(payload)
+	}
+	return &audit.Entry{Sequence: seq, Category: category, Timestamp: time.Unix(ts, 0).UTC(), Payload: raw}
+}
+
+// TestBuildRunEconomics_FoldsChain exercises the notifier's fold (#1702): a
+// seeded chain with cost_recorded ledger rows and all three gate boundaries
+// produces the cost / cache / latency rollups, with the authoritative run
+// total (CostUSDTotal) as the cost total and the audit-timestamp deltas as the
+// gate waits. Also asserts the rendered block reconciles.
+func TestBuildRunEconomics_FoldsChain(t *testing.T) {
+	runRow := &run.Run{
+		ID:           uuid.New(),
+		CreatedAt:    time.Unix(100, 0).UTC(),
+		CostUSDTotal: 0.40,
+	}
+	entries := []*audit.Entry{
+		econEntry(1, "plan_generated", 100, nil),
+		econEntry(2, "approval_submitted", 2800, map[string]any{"decision": "approve"}), // plan approval = 2700
+		econEntry(3, "cost_recorded", 2900, map[string]any{
+			"usd": 0.30, "source": "", "model": "claude-opus-4-8",
+			"input_tokens": 500, "output_tokens": 100,
+			"cache_read_input_tokens": 1000, "cache_write_input_tokens": 200,
+		}),
+		econEntry(4, "implement_reviewed", 5000, nil),
+		econEntry(5, "acceptance_dispatched", 6800, nil), // implement_review_to_dispatch = 1800
+		econEntry(6, drive.Category, 7000, map[string]any{"rule": string(drive.RuleChecksGreenAwaitingMerge)}),
+		econEntry(7, "cost_recorded", 7100, map[string]any{"usd": 0.10, "source": "plan_review", "model": "claude-opus-4-8"}),
+		econEntry(8, "pr_merged", 7900, nil), // checks_green_to_merge = 900; wall clock = 7800
+	}
+
+	econ := issuecomment.BuildRunEconomics(runRow, entries)
+	if econ == nil {
+		t.Fatal("BuildRunEconomics returned nil")
+	}
+
+	// Cost: authoritative total + per-stage breakdown.
+	if econ.Cost.TotalUSD != 0.40 {
+		t.Errorf("cost total = %v, want the authoritative 0.40", econ.Cost.TotalUSD)
+	}
+	stageCost := map[string]float64{}
+	for _, st := range econ.Cost.Stages {
+		stageCost[st.Source] = st.CostUSD
+	}
+	if stageCost["agent"] != 0.30 || stageCost["plan_review"] != 0.10 {
+		t.Errorf("per-stage cost = %+v, want agent 0.30 + plan_review 0.10", stageCost)
+	}
+
+	// Cache: tokens folded, net savings surfaced.
+	if econ.Cache.CacheReadTokens != 1000 || econ.Cache.CacheWriteTokens != 200 {
+		t.Errorf("cache tokens = read %d / write %d, want 1000 / 200", econ.Cache.CacheReadTokens, econ.Cache.CacheWriteTokens)
+	}
+
+	// Latency: three gate waits equal to the audit-timestamp deltas.
+	waits := map[string]float64{}
+	for _, g := range econ.Latency.Gates {
+		waits[g.Gate] = g.WaitSeconds
+	}
+	if waits[latency.GatePlanApproval] != 2700 {
+		t.Errorf("plan approval wait = %v, want 2700", waits[latency.GatePlanApproval])
+	}
+	if waits[latency.GateImplementReviewToDispatch] != 1800 {
+		t.Errorf("implement→dispatch wait = %v, want 1800", waits[latency.GateImplementReviewToDispatch])
+	}
+	if waits[latency.GateChecksGreenToMerge] != 900 {
+		t.Errorf("checks-green→merge wait = %v, want 900", waits[latency.GateChecksGreenToMerge])
+	}
+	if econ.Latency.WallClockSeconds != 7800 {
+		t.Errorf("wall clock = %v, want 7800 (pr_merged - created)", econ.Latency.WallClockSeconds)
+	}
+
+	block := issuecomment.RenderEconomicsBlock(*econ)
+	for _, want := range []string{"**Total cost**: $0.40", "plan approval: 45m", "**Wall clock**: 2h 10m"} {
+		if !strings.Contains(block, want) {
+			t.Errorf("rendered block missing %q:\n%s", want, block)
+		}
+	}
+}
+
+// TestBuildRunEconomics_EmptyChainRendersNothing is the defensive branch: a
+// run with no cost and no gate boundaries yields an all-zero rollup whose
+// rendered block is empty (dropped from the anchor).
+func TestBuildRunEconomics_EmptyChainRendersNothing(t *testing.T) {
+	runRow := &run.Run{ID: uuid.New(), CreatedAt: time.Unix(100, 0).UTC()}
+	econ := issuecomment.BuildRunEconomics(runRow, []*audit.Entry{
+		econEntry(1, "stage_dispatched", 200, nil),
+	})
+	if got := issuecomment.RenderEconomicsBlock(*econ); got != "" {
+		t.Errorf("empty-signal chain should render an empty block; got %q", got)
+	}
+}
+
+// TestBuildRunEconomics_MalformedCostSkipped is the unparsable-payload branch:
+// a cost_recorded entry with an invalid payload is skipped, not fatal — the
+// valid entries still fold and the rollup is unaffected.
+func TestBuildRunEconomics_MalformedCostSkipped(t *testing.T) {
+	runRow := &run.Run{ID: uuid.New(), CreatedAt: time.Unix(100, 0).UTC(), CostUSDTotal: 0.25}
+	entries := []*audit.Entry{
+		{Sequence: 1, Category: "cost_recorded", Timestamp: time.Unix(150, 0).UTC(), Payload: json.RawMessage(`{not valid json`)},
+		econEntry(2, "cost_recorded", 200, map[string]any{"usd": 0.25, "source": "agent", "model": "claude-opus-4-8"}),
+	}
+	econ := issuecomment.BuildRunEconomics(runRow, entries)
+	// The single valid entry is the only stage; the malformed one contributed nothing.
+	if len(econ.Cost.Stages) != 1 || econ.Cost.Stages[0].Source != "agent" {
+		t.Fatalf("malformed cost entry must be skipped, valid one kept: %+v", econ.Cost.Stages)
+	}
+	if econ.Cost.Stages[0].CostUSD != 0.25 {
+		t.Errorf("agent stage cost = %v, want 0.25", econ.Cost.Stages[0].CostUSD)
+	}
+}
+
+// TestBuildRunEconomics_SynthesizesCIGreenGate exercises the run_auto_advanced
+// → ci_green boundary synthesis: a checks-green auto-advance paired with a
+// following pr_merged yields the checks_green_to_merge gate, while a
+// non-matching run_auto_advanced rule synthesizes no boundary.
+func TestBuildRunEconomics_SynthesizesCIGreenGate(t *testing.T) {
+	runRow := &run.Run{ID: uuid.New(), CreatedAt: time.Unix(100, 0).UTC(), CostUSDTotal: 0.10}
+	entries := []*audit.Entry{
+		econEntry(1, "cost_recorded", 150, map[string]any{"usd": 0.10, "source": "agent"}),
+		econEntry(2, drive.Category, 7000, map[string]any{"rule": string(drive.RuleChecksGreenAwaitingMerge)}),
+		econEntry(3, "pr_merged", 7900, nil), // checks_green_to_merge = 900
+		econEntry(4, drive.Category, 7950, map[string]any{"rule": "some_other_rule"}),
+	}
+	econ := issuecomment.BuildRunEconomics(runRow, entries)
+	var checksGreen float64 = -1
+	for _, g := range econ.Latency.Gates {
+		if g.Gate == latency.GateChecksGreenToMerge {
+			checksGreen = g.WaitSeconds
+		}
+	}
+	if checksGreen != 900 {
+		t.Errorf("checks_green_to_merge wait = %v, want 900 (synthesized from run_auto_advanced)", checksGreen)
 	}
 }

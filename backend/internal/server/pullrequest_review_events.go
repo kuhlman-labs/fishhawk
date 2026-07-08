@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
@@ -252,6 +254,9 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 			// succeeded_merged. No review stage on this shape, so the
 			// entry carries no stage id.
 			s.writePostMergeObservedAudit(ctx, target.ID, nil, meta)
+			// Stamp the per-change economics into the PR body (#1702).
+			// Best-effort; never unwinds the merge resolution above.
+			s.stampEconomicsIntoPRBody(ctx, target)
 			return
 		}
 		if _, err := s.cfg.RunRepo.TransitionStage(ctx,
@@ -287,6 +292,9 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 		// observation alongside the run_merged board move so next_actions
 		// can surface succeeded_merged. Carries the resolved review stage id.
 		s.writePostMergeObservedAudit(ctx, target.ID, stageID, meta)
+		// Stamp the per-change economics into the PR body (#1702).
+		// Best-effort; never unwinds the merge resolution above.
+		s.stampEconomicsIntoPRBody(ctx, target)
 		return
 	}
 
@@ -594,6 +602,118 @@ func (s *Server) writePostMergeObservedAudit(ctx context.Context, runID uuid.UUI
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()))
 	}
+}
+
+// economicsMarkerBegin / economicsMarkerEnd delimit the idempotent economics
+// section spliced into a merged PR's body (#1702). A re-observed merge
+// replaces the content between the markers rather than appending a duplicate,
+// so redelivered pull_request.closed events and reconciler re-polls converge
+// on a single section.
+const (
+	economicsMarkerBegin = "<!-- fishhawk:economics -->"
+	economicsMarkerEnd   = "<!-- /fishhawk:economics -->"
+)
+
+// stampEconomicsIntoPRBody splices the per-change economics block into the
+// merged PR's description (#1702). Best-effort throughout: EVERY failure — no
+// GitHub client / audit repo, a missing installation id / PR URL / repo, an
+// unparseable PR number, an empty block, or a GitHub read/write error —
+// warn-logs and returns without touching the merge-gate resolution that
+// already completed. It NEVER blocks or unwinds the merge (mirrors
+// writePRMergedAudit's best-effort posture).
+//
+// Idempotent by construction: the block is written between delimited markers,
+// so a re-observed merge replaces the section in place; when the derived block
+// matches the one already in the body the PATCH is skipped entirely.
+func (s *Server) stampEconomicsIntoPRBody(ctx context.Context, target *run.Run) {
+	if s.cfg.GitHub == nil || s.cfg.AuditRepo == nil {
+		return
+	}
+	if target.InstallationID == nil || target.PullRequestURL == nil || *target.PullRequestURL == "" {
+		return
+	}
+	repo, err := parseRepoOwnerName(target.Repo)
+	if err != nil {
+		return
+	}
+	prNumber := parsePRNumberFromURL(target.PullRequestURL)
+	if prNumber <= 0 {
+		return
+	}
+
+	block := s.deriveEconomicsBlock(ctx, target)
+	if block == "" {
+		return
+	}
+
+	pr, err := s.cfg.GitHub.GetPullRequest(ctx, *target.InstallationID, repo, prNumber)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"economics stamp: get pr failed",
+			slog.String("run_id", target.ID.String()),
+			slog.Int("pr_number", prNumber),
+			slog.String("error", err.Error()))
+		return
+	}
+	updated := spliceEconomicsSection(pr.Body, block)
+	if updated == pr.Body {
+		// The same block already sits in the body — a re-observed merge.
+		// Skip the PATCH so a redelivery is a true no-op.
+		return
+	}
+	if err := s.cfg.GitHub.EditPullRequest(ctx, *target.InstallationID, repo, prNumber, updated); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"economics stamp: edit pr body failed",
+			slog.String("run_id", target.ID.String()),
+			slog.Int("pr_number", prNumber),
+			slog.String("error", err.Error()))
+		return
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+		"economics stamp: pr body updated",
+		slog.String("run_id", target.ID.String()),
+		slog.Int("pr_number", prNumber))
+}
+
+// deriveEconomicsBlock loads the run's audit chain and renders the economics
+// block from it, reusing the SAME fold the living anchor uses
+// (issuecomment.BuildRunEconomics) so the PR-body stamp and the anchor never
+// diverge. Returns "" on a list failure (warn-logged) or when the run carries
+// no economics signal (all-zero rollup).
+func (s *Server) deriveEconomicsBlock(ctx context.Context, target *run.Run) string {
+	entries, err := s.cfg.AuditRepo.ListForRun(ctx, target.ID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"economics stamp: list audit failed",
+			slog.String("run_id", target.ID.String()),
+			slog.String("error", err.Error()))
+		return ""
+	}
+	return issuecomment.RenderEconomicsBlock(*issuecomment.BuildRunEconomics(target, entries))
+}
+
+// spliceEconomicsSection returns body with the delimited fishhawk:economics
+// section set to block. If the markers already exist it replaces the content
+// between them (idempotent); a begin marker with no matching end (corrupted
+// prior write) is truncated from the begin marker onward so the section stays
+// single; otherwise the section is appended. When the resulting body equals
+// the input (block unchanged), the caller skips the PATCH.
+func spliceEconomicsSection(body, block string) string {
+	section := economicsMarkerBegin + "\n" + block + "\n" + economicsMarkerEnd
+	if begin := strings.Index(body, economicsMarkerBegin); begin >= 0 {
+		rest := body[begin:]
+		if endRel := strings.Index(rest, economicsMarkerEnd); endRel >= 0 {
+			after := body[begin+endRel+len(economicsMarkerEnd):]
+			return body[:begin] + section + after
+		}
+		// Begin marker without a matching end: replace from the begin marker
+		// onward so a corrupted prior write can't accumulate duplicates.
+		return strings.TrimRight(body[:begin], "\n") + "\n\n" + section
+	}
+	if strings.TrimSpace(body) == "" {
+		return section
+	}
+	return strings.TrimRight(body, "\n") + "\n\n" + section
 }
 
 // checkImplementReviewSettled enforces the ADR-036 (#876) implement-review /
