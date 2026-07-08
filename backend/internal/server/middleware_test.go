@@ -245,6 +245,35 @@ func TestBearerAuth_BadToken_HealthyDB_FallsThrough(t *testing.T) {
 	}
 }
 
+// TestBearerAuth_StaticToken_ThreadsAuthMethod is the static-token
+// regression (#1708): a valid static api_token (auth_method='static')
+// authenticates, reaches the handler with a non-anonymous identity, and
+// carries its auth_method onto the Identity so the approval audit can
+// record the credential kind.
+func TestBearerAuth_StaticToken_ThreadsAuthMethod(t *testing.T) {
+	s := newServer(t, newFakeRepo())
+	tok := &apitoken.Token{Subject: "github:42", Scopes: []string{"runs:read"}, AuthMethod: "static"}
+	auth := stubAPITokenAuth{tok: tok}
+
+	var captured Identity
+	h := s.bearerAuth(auth, nil, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		captured = IdentityFrom(r.Context())
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer fhk_static_token_xxxx")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if captured.IsAnonymous() {
+		t.Fatalf("expected non-anonymous identity, got %+v", captured)
+	}
+	if captured.Subject != "github:42" {
+		t.Errorf("Subject = %q, want github:42", captured.Subject)
+	}
+	if captured.AuthMethod != "static" {
+		t.Errorf("AuthMethod = %q, want static", captured.AuthMethod)
+	}
+}
+
 func TestLogging_EmitsStructuredEvent(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))

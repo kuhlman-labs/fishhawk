@@ -65,6 +65,15 @@ type Identity struct {
 	Scopes    []string
 	UserID    string
 	SessionID string
+
+	// AuthMethod records how a bearer api_token was authenticated at
+	// issue time: "static" for operator-minted tokens, "oauth" for tokens
+	// minted through the OAuth device flow (E39.3 / #1708). Populated only
+	// on the api_token bearer path from the authenticated token's
+	// auth_method; empty for cookie-session and MCP-token identities. The
+	// approval audit records it (approvals.go) so a decision's provenance
+	// includes which credential kind acted.
+	AuthMethod string
 }
 
 // IsAnonymous reports whether i represents an unauthenticated
@@ -285,9 +294,10 @@ func (s *Server) bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuth
 						}
 						if err == nil {
 							id = Identity{
-								Subject: rec.Subject,
-								TokenID: rec.ID.String(),
-								Scopes:  append([]string(nil), rec.Scopes...),
+								Subject:    rec.Subject,
+								TokenID:    rec.ID.String(),
+								Scopes:     append([]string(nil), rec.Scopes...),
+								AuthMethod: rec.AuthMethod,
 							}
 						}
 					}
