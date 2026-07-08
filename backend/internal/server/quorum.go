@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -93,11 +94,57 @@ func eligibleApprover(subject, changeAuthor string) bool {
 	return actorKindForSubject(subject) != audit.ActorAgent
 }
 
+// delegatedApproverSubjects returns the set of approver subjects whose prior
+// approval_submitted audit row on this run recorded a non-empty delegated rule
+// (the ADR-040 delegated path, #1026). The approval row itself does NOT retain
+// delegated status, so the audit payload is the single source of truth: a
+// delegated approval is recorded but must NEVER count toward the human quorum
+// (#1709 binding acceptance criterion). Without this, a prior delegated
+// non-agent (human) approver — which eligibleApprover cannot distinguish from a
+// normal human — would be counted when the next non-delegated approver submits.
+// Fail-open to an empty set on a nil repo or a read error: an unreadable audit
+// history is treated as "no known delegations", matching the rest of the quorum
+// path's best-effort posture (an over-count risk here is bounded by the same
+// audit history the gate itself is derived from).
+func (s *Server) delegatedApproverSubjects(ctx context.Context, runID uuid.UUID) map[string]struct{} {
+	out := make(map[string]struct{})
+	if s.cfg.AuditRepo == nil {
+		return out
+	}
+	entries, err := s.cfg.AuditRepo.ListForRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"quorum: delegated approvers: list run audit failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return out
+	}
+	for _, e := range entries {
+		if e.Category != "approval_submitted" || e.ActorSubject == nil {
+			continue
+		}
+		var payload struct {
+			Delegated string `json:"delegated"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			continue
+		}
+		if payload.Delegated != "" {
+			out[*e.ActorSubject] = struct{}{}
+		}
+	}
+	return out
+}
+
 // countDistinctEligibleApprovers counts the DISTINCT eligible-approver
 // subjects among the stage's approve-decision rows (the just-inserted
-// submission included). Fail-open to 0 on a list error — an unreadable
+// submission included). A subject whose prior approval was delegated
+// (delegatedApproverSubjects) is excluded — delegated approvals are recorded
+// but never counted toward the human quorum, and the approval row does not
+// retain delegated status. Fail-open to 0 on a list error — an unreadable
 // approval history never spuriously advances the gate.
-func (s *Server) countDistinctEligibleApprovers(ctx context.Context, stageID uuid.UUID, changeAuthor string) int {
+func (s *Server) countDistinctEligibleApprovers(ctx context.Context, runID, stageID uuid.UUID, changeAuthor string) int {
 	rows, err := s.cfg.ApprovalRepo.ListForStage(ctx, stageID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
@@ -107,12 +154,17 @@ func (s *Server) countDistinctEligibleApprovers(ctx context.Context, stageID uui
 		)
 		return 0
 	}
+	delegated := s.delegatedApproverSubjects(ctx, runID)
 	seen := make(map[string]struct{})
 	for _, a := range rows {
 		if a.Decision != approval.DecisionApprove {
 			continue
 		}
 		if !eligibleApprover(a.ApproverSubject, changeAuthor) {
+			continue
+		}
+		if _, ok := delegated[a.ApproverSubject]; ok {
+			// Delegated approval: recorded but never counted (#1709).
 			continue
 		}
 		seen[a.ApproverSubject] = struct{}{}

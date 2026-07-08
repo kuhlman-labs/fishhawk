@@ -149,6 +149,7 @@ func TestResolveChangeAuthor(t *testing.T) {
 
 func TestCountDistinctEligibleApprovers(t *testing.T) {
 	const author = "github:author"
+	runID := uuid.New()
 	stageID := uuid.New()
 	repo := newFakeApprovalRepo()
 	seed := func(subject string, d approval.Decision) {
@@ -164,8 +165,48 @@ func TestCountDistinctEligibleApprovers(t *testing.T) {
 	seed("github:r3", approval.DecisionReject)                        // reject — not counted
 
 	s := New(Config{ApprovalRepo: repo})
-	if got := s.countDistinctEligibleApprovers(context.Background(), stageID, author); got != 2 {
+	// No AuditRepo wired → delegatedApproverSubjects fails open to empty.
+	if got := s.countDistinctEligibleApprovers(context.Background(), runID, stageID, author); got != 2 {
 		t.Errorf("countDistinctEligibleApprovers = %d, want 2", got)
+	}
+}
+
+// TestCountDistinctEligibleApprovers_ExcludesDelegatedHuman pins the fix-up:
+// a prior DELEGATED non-agent (human) approval — recorded in the audit log
+// with a non-empty `delegated` rule — is excluded from the human quorum, even
+// though its approval row is indistinguishable from a normal human approve and
+// eligibleApprover would otherwise count it (#1709).
+func TestCountDistinctEligibleApprovers_ExcludesDelegatedHuman(t *testing.T) {
+	const author = "github:author"
+	runID := uuid.New()
+	stageID := uuid.New()
+	repo := newFakeApprovalRepo()
+	repo.all = append(repo.all,
+		&approval.Approval{StageID: stageID, ApproverSubject: "github:r1", Decision: approval.DecisionApprove},
+		&approval.Approval{StageID: stageID, ApproverSubject: "github:r2", Decision: approval.DecisionApprove},
+	)
+
+	au := &resolveChangeAuthorFake{entries: []*audit.Entry{
+		// github:r1's prior approval was delegated → must not count.
+		approvalSubmittedEntry("github:r1", `{"delegated":"clean_dual_approval"}`),
+		// github:r2's approval carries no delegated rule → counts.
+		approvalSubmittedEntry("github:r2", `{}`),
+	}}
+
+	s := New(Config{ApprovalRepo: repo, AuditRepo: au})
+	if got := s.countDistinctEligibleApprovers(context.Background(), runID, stageID, author); got != 1 {
+		t.Errorf("countDistinctEligibleApprovers = %d, want 1 (delegated github:r1 excluded)", got)
+	}
+}
+
+// approvalSubmittedEntry builds an approval_submitted audit entry for a subject
+// with the given raw JSON payload, for the delegated-exclusion count tests.
+func approvalSubmittedEntry(subject, payload string) *audit.Entry {
+	s := subject
+	return &audit.Entry{
+		Category:     "approval_submitted",
+		ActorSubject: &s,
+		Payload:      json.RawMessage(payload),
 	}
 }
 

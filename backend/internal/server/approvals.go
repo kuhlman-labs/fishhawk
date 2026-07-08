@@ -663,7 +663,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		channel = "delegated"
 	}
 
-	eligibleCount := s.countDistinctEligibleApprovers(ctx, p.Stage.ID, changeAuthor)
+	eligibleCount := s.countDistinctEligibleApprovers(ctx, p.Stage.RunID, p.Stage.ID, changeAuthor)
 	required := 1
 	if approvals.Count != nil {
 		required = *approvals.Count

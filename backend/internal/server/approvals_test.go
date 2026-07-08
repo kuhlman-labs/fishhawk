@@ -5137,6 +5137,52 @@ func TestSubmitApproval_Quorum_TransitionsAtDistinctCount(t *testing.T) {
 	}
 }
 
+// TestSubmitApproval_Quorum_DelegatedHumanNotCounted pins the fix-up for the
+// delegated-but-non-agent path: a prior DELEGATED human approval (github:r1,
+// recorded in the audit log with a `delegated` rule but with an approval row
+// indistinguishable from a normal human approve) must NOT count toward the
+// human quorum. On a count=2 gate a following normal approve (github:r2) is
+// then the only eligible vote, so the stage stays awaiting_approval rather than
+// advancing. Without the fix, r1 would be counted and the gate would advance
+// with a single eligible human approval.
+func TestSubmitApproval_Quorum_DelegatedHumanNotCounted(t *testing.T) {
+	s, ar, rr, au := newApprovalServer(t)
+	stage := seedQuorumStage(rr, au, 2, "github:author")
+
+	// Reproduce the state left by a prior delegated human approval: an
+	// approval row for github:r1 plus its approval_submitted audit entry
+	// carrying a non-empty `delegated` rule.
+	ar.all = append(ar.all, &approval.Approval{
+		StageID: stage.ID, ApproverSubject: "github:r1", Decision: approval.DecisionApprove,
+	})
+	uk := audit.ActorUser
+	r1 := "github:r1"
+	au.seedRunEntries(stage.RunID, &audit.Entry{
+		Category:     "approval_submitted",
+		ActorKind:    &uk,
+		ActorSubject: &r1,
+		Payload:      json.RawMessage(`{"decision":"approve","delegated":"clean_dual_approval"}`),
+	})
+
+	// A second DISTINCT eligible approve by a NON-delegated human: only this
+	// vote counts, so the gate stays below the count=2 quorum.
+	w := submitApprovalAs(t, s, stage.ID, "github:r2", `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("r2 status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Fatalf("after r2 state = %q, want awaiting_approval (delegated r1 not counted)", got)
+	}
+	r2Payload := approvalPayloadFor(t, au, "github:r2")
+	snap, _ := r2Payload["predicate_snapshot"].(map[string]any)
+	if snap["quorum_reached"] != false {
+		t.Errorf("r2 quorum_reached = %v, want false (delegated r1 excluded)", snap["quorum_reached"])
+	}
+	if snap["count_eligible"].(float64) != 1 {
+		t.Errorf("r2 count_eligible = %v, want 1 (only r2 counts)", snap["count_eligible"])
+	}
+}
+
 // TestSubmitApproval_Quorum_EnrichedAuditFields pins step 7c: a quorum-gate
 // approval_submitted payload carries identity{provider,subject}, auth_method,
 // channel, and predicate_snapshot, and the audit row carries a timestamp.
