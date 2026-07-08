@@ -14,17 +14,32 @@ import (
 // handling); the rest are stripped wherever they appear:
 //   - format ............ (uri / date-time) — unsupported assertion keyword
 //   - $schema / $id ..... dialect/identifier metadata the subset rejects
-//   - x-coerce-principal / x-coerce-defaults — Fishhawk runtime-coercion
-//     annotations (#537) with no meaning to the CLI
+//
+// Every "x-"-prefixed key is dropped by isDroppedKeyword's prefix rule, so
+// vendor annotations need no per-name entry here.
 //
 // oneOf is rejected too, but the canonical standard_v1 schema uses none, so
 // there is no oneOf to strip — derive_test asserts none sneaks in.
 var structuredOutputDroppedKeywords = map[string]bool{
-	"format":             true,
-	"$schema":            true,
-	"$id":                true,
-	"x-coerce-principal": true,
-	"x-coerce-defaults":  true,
+	"format":  true,
+	"$schema": true,
+	"$id":     true,
+}
+
+// isDroppedKeyword reports whether a schema key must be elided from the
+// derived structured-output schema. Beyond the named keyword set, EVERY
+// "x-"-prefixed vendor-extension key is dropped: JSON Schema 2020-12 treats
+// unknown keywords as inert annotations, but claude CLI 2.1.205 introduced
+// strict --json-schema validation that hard-rejects them (#1741 — the
+// x-intended-required annotation the AGENTS.md schema checklist places on
+// soaking fields took down every plan stage when the CLI auto-updated).
+// Stripping by prefix keeps the canonical schema free to carry annotations
+// while the CLI always receives a strict-clean derivation. Note the walk
+// applies this at every object level (same positional naivety as "format"),
+// so a property literally NAMED "x-…" would be elided — the canonical
+// schema has none, and derive_test pins the real derivation end to end.
+func isDroppedKeyword(k string) bool {
+	return structuredOutputDroppedKeywords[k] || strings.HasPrefix(k, "x-")
 }
 
 // maxInlineDepth bounds the recursive $ref inlining so a future cyclic
@@ -103,7 +118,7 @@ func inlineNode(node any, defs map[string]any, depth int) (any, error) {
 				return inlined, nil
 			}
 			for k, v := range n {
-				if k == "$ref" || k == "$defs" || structuredOutputDroppedKeywords[k] {
+				if k == "$ref" || k == "$defs" || isDroppedKeyword(k) {
 					continue
 				}
 				iv, err := inlineNode(v, defs, depth+1)
@@ -116,7 +131,7 @@ func inlineNode(node any, defs map[string]any, depth int) (any, error) {
 		}
 		out := make(map[string]any, len(n))
 		for k, v := range n {
-			if k == "$defs" || structuredOutputDroppedKeywords[k] {
+			if k == "$defs" || isDroppedKeyword(k) {
 				continue
 			}
 			iv, err := inlineNode(v, defs, depth+1)
