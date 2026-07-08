@@ -3038,6 +3038,58 @@ func findApprovalSubmittedPayload(t *testing.T, appended []audit.ChainAppendPara
 	return nil
 }
 
+// TestSubmitApproval_RecordsAuthMethod pins #1708: the approval_submitted
+// audit payload records the acting bearer token's auth_method, so a static
+// token's approval records auth_method='static' and an oauth token's
+// records 'oauth'.
+func TestSubmitApproval_RecordsAuthMethod(t *testing.T) {
+	for _, method := range []string{"static", "oauth"} {
+		t.Run(method, func(t *testing.T) {
+			s, _, rr, au := newApprovalServer(t)
+			stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+			req := httptest.NewRequest(http.MethodPost,
+				fmt.Sprintf("/v0/stages/%s/approvals", stage.ID),
+				strings.NewReader(`{"decision":"approve"}`))
+			req.Header.Set("Content-Type", "application/json")
+			req.SetPathValue("stage_id", stage.ID.String())
+			// A bearer token identity (TokenID set) carrying the auth_method.
+			id := Identity{Subject: "github:op", TokenID: "tok-1",
+				Scopes: []string{"write:approvals"}, AuthMethod: method}
+			req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
+			w := httptest.NewRecorder()
+			s.handleSubmitApproval(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+
+			payload := findApprovalSubmittedPayload(t, au.appended)
+			if payload["auth_method"] != method {
+				t.Errorf("auth_method = %v, want %q", payload["auth_method"], method)
+			}
+		})
+	}
+}
+
+// TestSubmitApproval_AuthMethodOmittedForSession pins the omitempty
+// behavior: a cookie-session identity carries no auth_method, so the
+// approval_submitted payload must not include the key (byte-identical to
+// pre-#1708 session approvals).
+func TestSubmitApproval_AuthMethodOmittedForSession(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	// withAuth injects a cookie-session identity (no AuthMethod).
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if _, ok := payload["auth_method"]; ok {
+		t.Errorf("auth_method must be omitted for a session identity; payload: %v", payload)
+	}
+}
+
 func TestSubmitApproval_Reject_EmptyComment_NoRejectionCommentInPayload(t *testing.T) {
 	// Reject with no comment → approval_submitted payload must not have rejection_comment.
 	s, _, rr, au := newApprovalServer(t)

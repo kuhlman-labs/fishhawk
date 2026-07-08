@@ -507,6 +507,16 @@ func runServe(args []string, logSink io.Writer) int {
 	oauthRedirectAfterLogin := fs.String("oauth-redirect-after-login",
 		envOr("FISHHAWKD_OAUTH_REDIRECT_AFTER_LOGIN", "/"),
 		"URL the callback handler redirects to on successful sign-in (must be a relative path)")
+	operatorRepo := fs.String("oauth-operator-repo",
+		envOr("FISHHAWKD_OPERATOR_REPO", ""),
+		"owner/name repository the OAuth token-mint gate (POST /v0/tokens/login, E39.3 / #1708) reads a "+
+			"verified subject's permission tier on; a subject must hold at least --operator-min-permission "+
+			"to mint a token. Empty leaves the mint endpoint at 503 tokens_unconfigured (fail closed)")
+	operatorMinPermission := fs.String("operator-min-permission",
+		envOr("FISHHAWKD_OPERATOR_MIN_PERMISSION", "write"),
+		"minimum repository permission (none|read|triage|write|maintain|admin) a verified subject must hold "+
+			"on --oauth-operator-repo to mint an OAuth token (E39.3 / #1708); default write. An unrecognized "+
+			"value fails startup (fail closed) rather than silently under-gating")
 	externalURL := fs.String("external-url",
 		envOr("FISHHAWKD_EXTERNAL_URL", ""),
 		"operator-facing root URL for the SPA, e.g. https://app.fishhawk.example.com; used to build links in surfaces that escape the backend (today: GitHub Check Runs). Empty disables the publish-to-GitHub paths cleanly.")
@@ -638,6 +648,17 @@ func runServe(args []string, logSink io.Writer) int {
 
 	logger := newLogger(logSink)
 
+	// OAuth token-mint authz minimum (E39.3 / #1708). Fail closed on an
+	// unrecognized tier rather than silently defaulting — a typo must not
+	// under-gate the mint endpoint.
+	operatorMinPerm, permOK := identity.ParsePermission(*operatorMinPermission)
+	if !permOK {
+		logger.Error("invalid --operator-min-permission",
+			slog.String("got", *operatorMinPermission),
+			slog.String("expected", "none|read|triage|write|maintain|admin"))
+		return exitFailure
+	}
+
 	// Warn when an operator .env / flag override drops the plan-review
 	// timeout below the #606 code default (300s) — a value that risks
 	// timing out review of large standard_v1 plans, silently defeating the
@@ -677,6 +698,17 @@ func runServe(args []string, logSink io.Writer) int {
 	modelOracle := modeloracle.NewCached(modelProviders, *modelsStalenessThreshold, logger)
 
 	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, BudgetLimitOverrideUSD: *budgetLimitOverrideUSD, BudgetAckMultiple: *budgetAckMultiple, BudgetPageMultiple: *budgetPageMultiple, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), PlanAllowedModels: server.ParseAllowedModels(*planAllowedModels), ReviewAllowedModels: server.ParseAllowedModels(*reviewAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modelOracle}
+
+	// OAuth token-login wiring (E39.3 / #1708). The client_id the discovery
+	// endpoint advertises is the SAME --oauth-client-id the browser sign-in
+	// flow uses; OperatorRepo + OperatorMinPermission gate the mint; the
+	// OperatorDefaultScopes ceiling reuses the exact set `fishhawkd token
+	// issue` applies so both mint paths cap scopes identically. The
+	// IdentityProvider itself is config-gated below (resolveIdentityProvider).
+	cfg.OAuthClientID = *oauthClientID
+	cfg.OperatorRepo = *operatorRepo
+	cfg.OperatorMinPermission = operatorMinPerm
+	cfg.OperatorDefaultScopes = operatorDefaultScopes
 
 	// Plan-review agent wiring. Resolved by a pure helper so the selection seam
 	// (which adapters the flags configure) is unit-testable without booting a

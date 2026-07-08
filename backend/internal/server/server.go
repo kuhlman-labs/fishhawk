@@ -158,6 +158,46 @@ type Config struct {
 	// consumes it yet; this issue stands up the seam.
 	IdentityProvider identity.IdentityProvider
 
+	// OAuthClientID is the GitHub OAuth App client_id the token-login
+	// discovery endpoint (GET /v0/tokens/login) advertises so the CLI can
+	// drive the device flow (E39.3 / #1708). Empty leaves the discovery
+	// endpoint at 503 tokens_unconfigured — the same config-gate that
+	// selects the NoOp IdentityProvider, so a backend without OAuth wired
+	// can neither advertise a client_id nor mint an OAuth token. Wired from
+	// FISHHAWKD_OAUTH_CLIENT_ID in serve.go (the same client_id the
+	// browser sign-in flow uses).
+	OAuthClientID string
+
+	// OperatorRepo is the "owner/name" repository the token-mint authz
+	// gate reads the verified subject's permission tier on (E39.3 / #1708):
+	// POST /v0/tokens/login mints only when
+	// IdentityProvider.PermissionLevel(OperatorRepo, subject) is at least
+	// OperatorMinPermission. Empty leaves the mint endpoint at 503
+	// tokens_unconfigured — with no repo to gate against, an OAuth mint
+	// would authorize any GitHub user, so the endpoint fails closed. Wired
+	// from FISHHAWKD_OPERATOR_REPO in serve.go.
+	OperatorRepo string
+
+	// OperatorMinPermission is the minimum repository permission tier a
+	// verified subject must hold on OperatorRepo to mint an OAuth token
+	// (E39.3 / #1708). Zero-value ("") is normalized to
+	// identity.PermissionWrite in New so an unconfigured deployment still
+	// gates at write rather than none (which would authorize any
+	// collaborator). Wired from FISHHAWKD_OPERATOR_MIN_PERMISSION in
+	// serve.go.
+	OperatorMinPermission identity.Permission
+
+	// OperatorDefaultScopes is the allow-set the token-mint endpoint
+	// rejects requested scopes against (E39.3 / #1708): a POST
+	// /v0/tokens/login whose scopes list names anything outside this set is
+	// refused, so an OAuth-minted token can never exceed the operator
+	// default surface. Wired from the fishhawkd operatorDefaultScopes set
+	// in serve.go (the same set `fishhawkd token issue` applies), keeping
+	// the two mint paths' scope ceilings identical. Empty disables the
+	// scope-rejection check (any requested scope accepted) — a deployment
+	// that leaves it unset gets no ceiling, so serve.go always wires it.
+	OperatorDefaultScopes []string
+
 	// OIDCVerifier authenticates GitHub Actions OIDC tokens on
 	// the signing-key endpoint per `githubOIDC` in the OpenAPI
 	// spec. Nil leaves the endpoint open (the v0 self-execution
@@ -536,6 +576,13 @@ func New(cfg Config) *Server {
 	// omits the field stays green.
 	if cfg.IdentityProvider == nil {
 		cfg.IdentityProvider = identity.NewNoOp()
+	}
+	// Default the mint authz minimum to write (#1708) so a deployment that
+	// wires OperatorRepo but leaves the minimum unset still gates at write
+	// rather than the zero-value none, which would authorize any
+	// collaborator with read access.
+	if cfg.OperatorMinPermission == "" {
+		cfg.OperatorMinPermission = identity.PermissionWrite
 	}
 	// Default a zero-value review budget to the documented policy (#747) so a
 	// server constructed without explicit budget config still bounds reviewer

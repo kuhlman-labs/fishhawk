@@ -75,6 +75,98 @@ func TestVerifyUser_Success(t *testing.T) {
 	}
 }
 
+// TestVerifyAccessToken_Success covers the server-side re-verify half of
+// the CLI-driven device flow (#1708): a CLI-obtained access token is
+// exchanged at GET /user and resolves to the provider-qualified subject,
+// with the token forwarded as the bearer credential.
+func TestVerifyAccessToken_Success(t *testing.T) {
+	f := newFakeGitHub(t)
+	f.mux.HandleFunc("/user", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer gho_cli" {
+			t.Errorf("GET /user Authorization = %q, want Bearer gho_cli", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"login":"octocat"}`))
+	})
+
+	p := newTestProvider(f)
+	subject, err := p.VerifyAccessToken(context.Background(), "gho_cli")
+	if err != nil {
+		t.Fatalf("VerifyAccessToken: %v", err)
+	}
+	if subject != "github:octocat" {
+		t.Errorf("subject = %q, want github:octocat", subject)
+	}
+}
+
+// TestVerifyAccessToken_EmptyToken rejects an empty token before any HTTP
+// call — the mint endpoint must never treat a blank credential as a
+// verified subject.
+func TestVerifyAccessToken_EmptyToken(t *testing.T) {
+	f := newFakeGitHub(t)
+	f.mux.HandleFunc("/user", func(http.ResponseWriter, *http.Request) {
+		t.Error("GET /user hit despite an empty access token")
+	})
+	p := newTestProvider(f)
+	if _, err := p.VerifyAccessToken(context.Background(), ""); err == nil {
+		t.Fatal("VerifyAccessToken(\"\"): want error, got nil")
+	}
+}
+
+// TestVerifyAccessToken_Unauthorized covers the forge-rejection branch: a
+// 401 from GET /user (e.g. a revoked/garbage token) surfaces as an error,
+// never a mint.
+func TestVerifyAccessToken_Unauthorized(t *testing.T) {
+	f := newFakeGitHub(t)
+	f.mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	p := newTestProvider(f)
+	if _, err := p.VerifyAccessToken(context.Background(), "gho_bad"); err == nil {
+		t.Fatal("VerifyAccessToken with a 401 /user: want error, got nil")
+	}
+}
+
+// TestPermission_AtLeast covers the tier ordering the token-mint authz
+// gate (#1708) uses: a subject satisfies a minimum only when its tier is
+// at least as privileged, and an unrecognized tier ranks as none.
+func TestPermission_AtLeast(t *testing.T) {
+	cases := []struct {
+		p    Permission
+		min  Permission
+		want bool
+	}{
+		{PermissionAdmin, PermissionWrite, true},
+		{PermissionWrite, PermissionWrite, true},
+		{PermissionTriage, PermissionWrite, false},
+		{PermissionRead, PermissionWrite, false},
+		{PermissionNone, PermissionRead, false},
+		{PermissionMaintain, PermissionAdmin, false},
+		{Permission("garbage"), PermissionRead, false},
+	}
+	for _, c := range cases {
+		if got := c.p.AtLeast(c.min); got != c.want {
+			t.Errorf("%q.AtLeast(%q) = %v, want %v", c.p, c.min, got, c.want)
+		}
+	}
+}
+
+// TestParsePermission covers the serve.go flag gate: recognized tiers
+// round-trip, and an unrecognized value reports ok=false so startup can
+// fail closed rather than under-gate.
+func TestParsePermission(t *testing.T) {
+	for _, name := range []string{"none", "read", "triage", "write", "maintain", "admin"} {
+		if p, ok := ParsePermission(name); !ok || string(p) != name {
+			t.Errorf("ParsePermission(%q) = (%q, %v), want (%q, true)", name, p, ok, name)
+		}
+	}
+	for _, bad := range []string{"", "owner", "push", "WRITE"} {
+		if _, ok := ParsePermission(bad); ok {
+			t.Errorf("ParsePermission(%q) ok = true, want false", bad)
+		}
+	}
+}
+
 func TestVerifyUser_SlowDownHonored(t *testing.T) {
 	f := newFakeGitHub(t)
 	f.mux.HandleFunc("/login/device/code", func(w http.ResponseWriter, _ *http.Request) {

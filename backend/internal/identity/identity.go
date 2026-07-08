@@ -35,6 +35,42 @@ const (
 	PermissionAdmin    Permission = "admin"
 )
 
+// permissionRank orders the tiers so callers can gate on "at least" a
+// minimum. An unrecognized tier is absent from the map and ranks 0
+// (none), so a garbage value never satisfies a real minimum —
+// deny-by-default.
+var permissionRank = map[Permission]int{
+	PermissionNone:     0,
+	PermissionRead:     1,
+	PermissionTriage:   2,
+	PermissionWrite:    3,
+	PermissionMaintain: 4,
+	PermissionAdmin:    5,
+}
+
+// AtLeast reports whether p is at least as privileged as min in the
+// ordered tier set (none < read < triage < write < maintain < admin).
+// Used by the token-mint authz gate (E39.3 / #1708) to require a
+// configured minimum repository permission of the verified subject.
+func (p Permission) AtLeast(min Permission) bool {
+	return permissionRank[p] >= permissionRank[min]
+}
+
+// ParsePermission maps a tier name to a Permission, reporting ok=false
+// for an unrecognized name so a caller (e.g. serve.go flag parsing) can
+// fail configuration loudly rather than silently under-gating on a
+// typo. The empty string is not recognized; callers supply their own
+// default before calling.
+func ParsePermission(name string) (Permission, bool) {
+	switch Permission(name) {
+	case PermissionNone, PermissionRead, PermissionTriage,
+		PermissionWrite, PermissionMaintain, PermissionAdmin:
+		return Permission(name), true
+	default:
+		return PermissionNone, false
+	}
+}
+
 // DeviceCodePrompt is invoked once during VerifyUser with the user
 // code and verification URI the human must visit to authorize the
 // device flow. It is a plain func so no GitHub-specific display type
@@ -78,6 +114,17 @@ type IdentityProvider interface {
 	// the user code + verification URI. Returns ErrVerificationTimeout
 	// if authorization does not complete in time.
 	VerifyUser(ctx context.Context, prompt DeviceCodePrompt) (subject string, err error)
+
+	// VerifyAccessToken verifies a forge access token — a GitHub user
+	// access token the CLI obtained by driving the device flow itself —
+	// server-side and returns the provider-qualified subject
+	// ("github:<login>") it authenticates. It is the "server-side
+	// re-verify" half of the CLI-driven device-flow login (E39.3 /
+	// #1708): the CLI drives the device flow and posts the resulting
+	// access token; the backend re-derives the subject from the token
+	// rather than trusting a client-supplied login. Returns
+	// ErrNotConfigured on the NoOp provider (no forge to verify against).
+	VerifyAccessToken(ctx context.Context, accessToken string) (subject string, err error)
 
 	// PermissionLevel returns the subject's forge-neutral permission
 	// tier on repo (in "owner/name" form). Returns PermissionNone for
