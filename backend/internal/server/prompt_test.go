@@ -4327,6 +4327,40 @@ func TestGetStagePrompt_DecomposedScope_FailLoud(t *testing.T) {
 		assertDecomposedScopeUnresolved(t, wr, 0)
 	})
 
+	t.Run("nil-SliceIndex child of a decomposed plan fails closed at both endpoints", func(t *testing.T) {
+		// A decomposed child (DecomposedFrom set) with NO persisted SliceIndex
+		// that resolves — via the parent walk — to a plan carrying a
+		// Decomposition is a fan-out child that lost its slice link:
+		// matchDecomposedSubPlan treats a nil index as unlinked, so the guard
+		// fails closed (slice_index -1) rather than falling through to the
+		// parent's full top-level scope — the silent full-scope fallback the
+		// approval condition required gone, not merely bypassed (#1721). The
+		// orchestrator stamps SliceIndex on every real fan-out child, so this
+		// shape is unreachable in production, but the handler must fail closed if
+		// it ever appears rather than reopen the #1669 full-scope binding. (A
+		// nil-SliceIndex child whose resolved plan has NO decomposition is a
+		// standalone child with its own top-level plan — see seed's ParentRunID
+		// walk lands on a decomposed plan here — and keeps that scope instead.)
+		s, _, childStageID, priv := seed(t, func(child *run.Run, parentRunID uuid.UUID) {
+			child.DecomposedFrom = &parentRunID
+			// SliceIndex intentionally left nil.
+		})
+		w := promptRequest(t, s, uuid.Nil, childStageID, priv, "")
+		if w.Code != http.StatusConflict {
+			t.Fatalf("/prompt status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		assertDecomposedScopeUnresolved(t, w, -1)
+
+		s2, _, childStageID2, _ := seed(t, func(child *run.Run, parentRunID uuid.UUID) {
+			child.DecomposedFrom = &parentRunID
+		})
+		wr := promptRenderRequest(t, s2, childStageID2)
+		if wr.Code != http.StatusConflict {
+			t.Fatalf("/prompt-render status = %d, want 409:\n%s", wr.Code, wr.Body.String())
+		}
+		assertDecomposedScopeUnresolved(t, wr, -1)
+	})
+
 	t.Run("non-decomposed control keeps full scope, no 409", func(t *testing.T) {
 		s, _, childStageID, priv := seed(t, func(child *run.Run, _ uuid.UUID) {
 			// DecomposedFrom nil → ordinary run; never touches the require path.
