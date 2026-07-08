@@ -52,6 +52,7 @@ const (
 	acceptanceReasonTargetStale      = "acceptance_target_stale"
 	acceptanceReasonTargetUnreach    = "acceptance_target_unreachable"
 	acceptanceReasonProvisionFailed  = "acceptance_preview_provision_failed"
+	acceptanceEventTeardownMissing   = "acceptance_preview_teardown_missing"
 	previewCmdEnv                    = "FISHHAWK_ACCEPTANCE_PREVIEW_CMD"
 	previewTeardownCmdEnv            = "FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD"
 	previewProvisionTimeoutSecsEnv   = "FISHHAWK_ACCEPTANCE_PREVIEW_TIMEOUT_SECS"
@@ -326,6 +327,20 @@ func acceptanceTargetGate(ctx context.Context, gcfg previewGateConfig, targetHos
 			`{"event":"acceptance_target_unverified","run_id":%q,"host":%q,"reason":%q}`+"\n",
 			runID, host, "backend sent no expected head SHA; proceeding unverified")
 		return nil, "", ""
+	}
+
+	// Advisory diagnostic: a provision command with NO teardown command
+	// leaks the provisioned preview instance — nothing tears it down after
+	// the verdict ships. Warn (never fail) so an operator who intentionally
+	// runs a self-tearing-down provision command is not blocked. Placed AFTER
+	// the no-hosts and empty-expectedSHA early returns so it fires only on the
+	// path where provisioning actually runs — it never false-warns on a
+	// skipped gate.
+	if gcfg.provisionCmd != "" && gcfg.teardownCmd == "" {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":%q,"run_id":%q,"host":%q,"reason":%q}`+"\n",
+			acceptanceEventTeardownMissing, runID, host,
+			previewCmdEnv+" is set but "+previewTeardownCmdEnv+" is not — the provisioned preview instance will not be torn down")
 	}
 
 	if gcfg.teardownCmd != "" {

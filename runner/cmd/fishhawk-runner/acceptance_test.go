@@ -1242,6 +1242,92 @@ func TestAcceptenv_ExcludesPreviewVars(t *testing.T) {
 	}
 }
 
+// TestRun_AcceptanceStage_ProvisionWithoutTeardown_WarnsMissingTeardown
+// (E36.2 / #1640): a provision command with NO teardown command emits the
+// advisory acceptance_preview_teardown_missing warning — and, because the
+// warning is advisory-only (never fail-closed), the stage still provisions,
+// verifies, spawns, and ships its verdict (run == exitOK). This locks BOTH
+// the diagnostic branch and that it does not block provisioning.
+func TestRun_AcceptanceStage_ProvisionWithoutTeardown_WarnsMissingTeardown(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	ts, _ := healthzServer(t, 200, `{"git_sha":"abc1234"}`)
+	fu.promptResp.EgressTargetHosts = []string{hostOf(ts)}
+	fu.promptResp.AcceptanceExpectedHeadSHA = testExpectedSHA
+	t.Setenv(previewCmdEnv, "true")     // provision set...
+	t.Setenv(previewTeardownCmdEnv, "") // ...teardown explicitly empty (unset).
+	invoker := &fakeInvoker{canned: agent.Result{
+		OK:               true,
+		StructuredOutput: []byte(passedVerdict),
+	}}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK (teardown-missing is advisory, not fail-closed):\n%s", got, stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, `"event":"acceptance_preview_teardown_missing"`) {
+		t.Errorf("missing acceptance_preview_teardown_missing diagnostic: %s", out)
+	}
+	if fu.gotAcceptanceArgs == nil {
+		t.Error("verdict must still ship (advisory warning does not block the stage)")
+	}
+	if invoker.callIdx != 1 {
+		t.Errorf("agent invoked %d times, want 1 (provisioning proceeds after the warning)", invoker.callIdx)
+	}
+}
+
+// TestRun_NonAcceptanceStage_PreviewEnvSet_GateNeverRuns (E36.2 / #1640):
+// a NON-acceptance stage (implement) with the full FISHHAWK_ACCEPTANCE_PREVIEW_*
+// env set to marker-writing commands must NEVER invoke the preview gate — no
+// acceptance_preview_/acceptance_target_ event is logged and neither the
+// provision nor the teardown marker file is written. This is the
+// no-dangling-teardown guarantee asserted on observable output: the gate and
+// its hooks are structurally skipped for stages that are not acceptance.
+func TestRun_NonAcceptanceStage_PreviewEnvSet_GateNeverRuns(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	provisionMarker := markerPath(t)
+	teardownMarker := markerPath(t)
+	t.Setenv(previewCmdEnv, "echo provisioned > "+provisionMarker)
+	t.Setenv(previewTeardownCmdEnv, "echo torn > "+teardownMarker)
+
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	stageID := "22222222-3333-4444-5555-666666666666"
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    stageID,
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", stageID,
+		"--fetch-prompt",
+		"--upload-trace",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	out := stderr.String()
+	if strings.Contains(out, "acceptance_preview_") || strings.Contains(out, "acceptance_target_") {
+		t.Errorf("non-acceptance stage must fire NO preview/target gate event: %s", out)
+	}
+	if _, err := os.Stat(provisionMarker); err == nil {
+		t.Error("provision hook must not run on a non-acceptance stage")
+	}
+	if _, err := os.Stat(teardownMarker); err == nil {
+		t.Error("teardown hook must not run on a non-acceptance stage (no dangling teardown)")
+	}
+}
+
 // TestRun_AcceptanceStage_ExpectedHeadSHASeam_JSONToGate (binding approval
 // condition 1 — the seam through-test): the expected head SHA travels from
 // the backend's fetched-prompt JSON, through the runner's real prompt
