@@ -37,6 +37,16 @@ const deviceFlowScope = "read:user"
 // on a "slow_down" poll response (add 5s to the polling interval).
 const slowDownIncrement = 5 * time.Second
 
+// minPollInterval is the floor applied to the forge-supplied device-flow
+// poll interval. GitHub's documented default is 5s; when the device-code
+// response omits `interval` or returns a non-positive value, deriving the
+// interval directly yields 0, and the ctx-aware sleep returns immediately
+// for a non-positive duration — an authorization_pending loop would then
+// hammer the OAuth token endpoint until expiry. Clamping the forge value up
+// to this floor keeps a missing/zero interval from busy-polling. A positive
+// test override (p.pollInterval) still wins.
+const minPollInterval = 5 * time.Second
+
 // GitHubIdentityProvider is the hand-rolled GitHub REST implementation
 // of IdentityProvider. It confines every GitHub specific (the device
 // flow, the collaborators-permission endpoint, the members/teams
@@ -135,9 +145,13 @@ func (p *GitHubIdentityProvider) VerifyUser(ctx context.Context, prompt DeviceCo
 		prompt(device.UserCode, device.VerificationURI)
 	}
 
-	// Poll interval: the forge's suggested interval unless a test
+	// Poll interval: the forge's suggested interval, floored so a
+	// missing/zero interval never collapses to a busy-poll, unless a test
 	// overrides it.
 	interval := time.Duration(device.Interval) * time.Second
+	if interval < minPollInterval {
+		interval = minPollInterval
+	}
 	if p.pollInterval > 0 {
 		interval = p.pollInterval
 	}

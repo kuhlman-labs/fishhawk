@@ -206,6 +206,89 @@ func TestVerifyUser_AccessDenied(t *testing.T) {
 	}
 }
 
+// TestVerifyUser_PollIntervalFloor covers the security fix: when the forge
+// omits `interval` (or returns 0) and no test seam overrides it, the poll
+// interval is floored to minPollInterval rather than collapsing to 0 — which
+// would busy-poll the OAuth token endpoint. The polling tests elsewhere always
+// inject a positive pollInterval, so this branch was previously uncovered.
+func TestVerifyUser_PollIntervalFloor(t *testing.T) {
+	f := newFakeGitHub(t)
+	// Device-code response omits `interval` entirely → device.Interval == 0.
+	f.mux.HandleFunc("/login/device/code", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"device_code":"DC","user_code":"UC","verification_uri":"URI","expires_in":900}`))
+	})
+	f.mux.HandleFunc("/login/oauth/access_token", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"access_token":"gho_x"}`))
+	})
+	f.mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"login":"me"}`))
+	})
+
+	p := newTestProvider(f)
+	// Do NOT override the forge interval: production leaves pollInterval 0, so
+	// the floor — not the test seam — must supply the wait.
+	p.pollInterval = 0
+	var slept []time.Duration
+	p.sleep = func(_ context.Context, d time.Duration) error {
+		slept = append(slept, d)
+		return nil
+	}
+
+	if _, err := p.VerifyUser(context.Background(), nil); err != nil {
+		t.Fatalf("VerifyUser: %v", err)
+	}
+	if len(slept) == 0 {
+		t.Fatal("expected at least one sleep before polling the token endpoint")
+	}
+	if slept[0] < minPollInterval {
+		t.Errorf("poll interval = %v, want >= %v (floor guards a 0/omitted forge interval)", slept[0], minPollInterval)
+	}
+}
+
+// TestGet_AuthenticatedToken exercises the authenticated REST-read path in
+// get(): a non-nil token accessor resolves a bearer token and sets the
+// Authorization header. Every other test constructs the provider anonymously,
+// so this branch was previously uncovered.
+func TestGet_AuthenticatedToken(t *testing.T) {
+	f := newFakeGitHub(t)
+	var gotAuth string
+	f.mux.HandleFunc("/repos/owner/repo/collaborators/octocat/permission",
+		func(w http.ResponseWriter, r *http.Request) {
+			gotAuth = r.Header.Get("Authorization")
+			_, _ = w.Write([]byte(`{"role_name":"write"}`))
+		})
+	p := newTestProvider(f)
+	p.token = func(context.Context) (string, error) { return "tok-123", nil }
+
+	got, err := p.PermissionLevel(context.Background(), "owner/repo", "github:octocat")
+	if err != nil {
+		t.Fatalf("PermissionLevel: %v", err)
+	}
+	if got != PermissionWrite {
+		t.Errorf("PermissionLevel = %q, want write", got)
+	}
+	if gotAuth != "Bearer tok-123" {
+		t.Errorf("Authorization = %q, want Bearer tok-123", gotAuth)
+	}
+}
+
+// TestGet_TokenAccessorError covers the token-accessor error-wrap branch:
+// a failing accessor aborts the request with an "identity: resolve token" wrap
+// before any HTTP call.
+func TestGet_TokenAccessorError(t *testing.T) {
+	f := newFakeGitHub(t)
+	f.mux.HandleFunc("/orgs/acme/members/octocat", func(http.ResponseWriter, *http.Request) {
+		t.Error("REST endpoint hit despite a token-accessor failure")
+	})
+	p := newTestProvider(f)
+	p.token = func(context.Context) (string, error) { return "", errors.New("boom") }
+
+	_, err := p.ResolveMembership(context.Background(), "acme", "github:octocat")
+	if err == nil || !strings.Contains(err.Error(), "resolve token") {
+		t.Fatalf("err = %v, want an 'identity: resolve token' wrap", err)
+	}
+}
+
 func TestPermissionLevel(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -252,6 +335,36 @@ func TestPermissionLevel_RateLimited(t *testing.T) {
 	_, err := p.PermissionLevel(context.Background(), "owner/repo", "github:octocat")
 	if !errors.Is(err, ErrRateLimited) {
 		t.Fatalf("PermissionLevel err = %v, want ErrRateLimited", err)
+	}
+}
+
+// TestPermissionLevel_ServerError covers the generic non-2xx branch
+// ("identity: permission: %d") — distinct from the 404 and rate-limit paths.
+func TestPermissionLevel_ServerError(t *testing.T) {
+	f := newFakeGitHub(t)
+	f.mux.HandleFunc("/repos/owner/repo/collaborators/octocat/permission",
+		func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) })
+	p := newTestProvider(f)
+	_, err := p.PermissionLevel(context.Background(), "owner/repo", "github:octocat")
+	if err == nil || !strings.Contains(err.Error(), "permission: 500") {
+		t.Fatalf("err = %v, want 'identity: permission: 500'", err)
+	}
+}
+
+// TestPermissionLevel_RateLimited_429RetryAfter covers rateLimitError's
+// secondary signature (429 + Retry-After) — the only rate-limit case the other
+// test does not exercise (it asserts 403 + X-RateLimit-Remaining:0).
+func TestPermissionLevel_RateLimited_429RetryAfter(t *testing.T) {
+	f := newFakeGitHub(t)
+	f.mux.HandleFunc("/repos/owner/repo/collaborators/octocat/permission",
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Retry-After", "60")
+			w.WriteHeader(http.StatusTooManyRequests)
+		})
+	p := newTestProvider(f)
+	_, err := p.PermissionLevel(context.Background(), "owner/repo", "github:octocat")
+	if !errors.Is(err, ErrRateLimited) {
+		t.Fatalf("err = %v, want ErrRateLimited (429 + Retry-After signature)", err)
 	}
 }
 
@@ -311,6 +424,32 @@ func TestResolveMembership_Team(t *testing.T) {
 				t.Errorf("ResolveMembership = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestResolveMembership_Org_ServerError covers orgMembership's default branch
+// (a status that is neither 204 nor 404).
+func TestResolveMembership_Org_ServerError(t *testing.T) {
+	f := newFakeGitHub(t)
+	f.mux.HandleFunc("/orgs/acme/members/octocat",
+		func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) })
+	p := newTestProvider(f)
+	_, err := p.ResolveMembership(context.Background(), "acme", "github:octocat")
+	if err == nil || !strings.Contains(err.Error(), "org membership: 500") {
+		t.Fatalf("err = %v, want 'identity: org membership: 500'", err)
+	}
+}
+
+// TestResolveMembership_Team_ServerError covers teamMembership's non-2xx branch
+// (a status that is neither 200 nor 404).
+func TestResolveMembership_Team_ServerError(t *testing.T) {
+	f := newFakeGitHub(t)
+	f.mux.HandleFunc("/orgs/acme/teams/reviewers/memberships/octocat",
+		func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) })
+	p := newTestProvider(f)
+	_, err := p.ResolveMembership(context.Background(), "acme/reviewers", "github:octocat")
+	if err == nil || !strings.Contains(err.Error(), "team membership: 500") {
+		t.Fatalf("err = %v, want 'identity: team membership: 500'", err)
 	}
 }
 
