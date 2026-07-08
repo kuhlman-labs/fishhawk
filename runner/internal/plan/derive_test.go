@@ -2,6 +2,7 @@ package plan
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
@@ -13,7 +14,7 @@ import (
 // subset rejects (verified 2026-06-23). The derivation must strip every one
 // ANYWHERE in the document — a single survivor makes the CLI silently emit no
 // structured_output.
-var rejectedKeywords = []string{"$ref", "$defs", "format", "$schema", "$id", "x-coerce-principal", "x-coerce-defaults", "oneOf"}
+var rejectedKeywords = []string{"$ref", "$defs", "format", "$schema", "$id", "x-coerce-principal", "x-coerce-defaults", "x-intended-required", "oneOf"}
 
 // walkKeys invokes fn for every object key anywhere in the decoded JSON tree.
 func walkKeys(node any, fn func(key string)) {
@@ -46,6 +47,28 @@ func TestStructuredOutputSchema_StripsRejectedKeywords(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestStructuredOutputSchema_StripsAllVendorExtensionKeys pins the #1741
+// prefix rule directly: claude CLI 2.1.205's strict --json-schema validation
+// rejects ANY unknown keyword, so no "x-"-prefixed key of any name may
+// survive the derivation — not just the ones enumerated in rejectedKeywords.
+// This fails if a future annotation (the next x-something the schema
+// checklist invents) reaches the CLI and re-runs the outage.
+func TestStructuredOutputSchema_StripsAllVendorExtensionKeys(t *testing.T) {
+	b, err := StructuredOutputSchema()
+	if err != nil {
+		t.Fatalf("StructuredOutputSchema: %v", err)
+	}
+	var tree any
+	if err := json.Unmarshal(b, &tree); err != nil {
+		t.Fatalf("derived schema is not valid JSON: %v", err)
+	}
+	walkKeys(tree, func(key string) {
+		if strings.HasPrefix(key, "x-") {
+			t.Errorf("derived schema still contains vendor-extension key %q (claude CLI 2.1.205 strict mode hard-rejects it, #1741)", key)
+		}
+	})
 }
 
 // compileDerived compiles the derived schema with the jsonschema library, the
