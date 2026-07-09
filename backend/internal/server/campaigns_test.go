@@ -3244,6 +3244,32 @@ func settledAuditPayload(t *testing.T, aud *campaignAuditRecorder) map[string]an
 	return nil
 }
 
+// settledAuditPayloadsByRef returns every campaign_issue_settled payload keyed by
+// its issue_ref, so a multi-item chain test can assert each item's audit carries
+// the load-bearing settled_via / state_reason / outcome fields (not just that N
+// entries exist). A missing or non-string issue_ref fails the test.
+func settledAuditPayloadsByRef(t *testing.T, aud *campaignAuditRecorder) map[string]map[string]any {
+	t.Helper()
+	aud.mu.Lock()
+	defer aud.mu.Unlock()
+	byRef := map[string]map[string]any{}
+	for _, e := range aud.entries {
+		if e.Category != categoryCampaignIssueSettled {
+			continue
+		}
+		var p map[string]any
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode settled payload: %v", err)
+		}
+		ref, ok := p["issue_ref"].(string)
+		if !ok {
+			t.Fatalf("settled payload missing string issue_ref: %v", p)
+		}
+		byRef[ref] = p
+	}
+	return byRef
+}
+
 // TestReconcileOnRead_RunlessIssueClosed_SettlesAndUnblocks_E2E is the headline
 // cross-boundary path for the run-less settle (#1558): a run-less, deps-satisfied
 // item whose GitHub issue is closed-as-completed settles succeeded on a status
@@ -3292,10 +3318,12 @@ func TestReconcileOnRead_RunlessIssueClosed_SettlesAndUnblocks_E2E(t *testing.T)
 	if _, ok := p["run_id"]; ok {
 		t.Errorf("payload carries run_id = %v, want absent for a run-less settle", p["run_id"])
 	}
-	// The dependent's dep was NOT satisfied when the pass computed its done-set,
-	// so only issue:100's issue was read (single-hop within one read).
-	if ghState.issueCalls != 1 {
-		t.Errorf("issueCalls = %d, want 1 (dependent skipped before GetIssue)", ghState.issueCalls)
+	// Phase 1 resolves closed-status for EVERY run-less pending/blocked item
+	// exactly once, independent of dep order (the dep gate moved to the in-memory
+	// Phase-2 fixpoint), so both issue:100 (settled) and the dependent issue:101
+	// (unknown → 404, skipped) are read once each — two calls, no re-read.
+	if ghState.issueCalls != 2 {
+		t.Errorf("issueCalls = %d, want 2 (both items read once in Phase 1)", ghState.issueCalls)
 	}
 	if ghState.installCalls != 1 {
 		t.Errorf("installCalls = %d, want 1 (installation resolved once and cached)", ghState.installCalls)
@@ -3342,6 +3370,151 @@ func TestReconcileOnRead_RunlessAllHumanLed_CampaignSucceeds_E2E(t *testing.T) {
 	}
 	if got := crepo.campaigns[c.ID].State; got != campaign.StateSucceeded {
 		t.Errorf("persisted campaign state = %q, want succeeded", got)
+	}
+}
+
+// TestReconcileOnRead_RunlessClosedChain_ConvergesInSingleRead_E2E is the #1758
+// regression: a run-less child C (issue:101) depends_on a run-less child D
+// (issue:100), BOTH closed-as-completed. The pass must settle the WHOLE chain in
+// ONE status read regardless of iteration order. C is seeded FIRST so that the
+// old single-hop pass (done-set computed once, deps gated in the same loop)
+// would skip C — its dep D not yet in the done-set when C is visited — and leave
+// C phantom-pending until a later read/restart; the in-memory Phase-2 fixpoint
+// instead settles D, adds its ref, then settles C in the same read. Asserts both
+// reach succeeded with nil run_id, each emits a settled_via=issue_closed audit,
+// the eligible slice holds no CLOSED issue, next_action never targets a closed
+// item, and the campaign advances to succeeded.
+func TestReconcileOnRead_RunlessClosedChain_ConvergesInSingleRead_E2E(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "completed"},
+		101: {state: "closed", stateReason: "completed"},
+	}}
+	gh := newRunlessGitHubClient(t, ghState)
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: gh})
+	// C (issue:101, depends_on D=issue:100) is seeded BEFORE D so it is iterated
+	// first — proving the fixpoint converges independent of candidate order.
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:101", []string{"issue:100"}, campaign.ItemStatePending),
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+
+	st := getCampaignStatusBody(t, s, c.ID)
+
+	// Both C and D settled to succeeded with NO run_id in this single read.
+	byRef := map[string]campaignItemResponse{}
+	for _, it := range st.Items {
+		byRef[it.IssueRef] = it
+	}
+	for _, ref := range []string{"issue:100", "issue:101"} {
+		it, ok := byRef[ref]
+		if !ok {
+			t.Fatalf("item %s missing from status", ref)
+		}
+		if it.State != string(campaign.ItemStateSucceeded) {
+			t.Errorf("item %s state = %q, want succeeded (chain converged in one read)", ref, it.State)
+		}
+		if it.RunID != nil {
+			t.Errorf("item %s run_id = %v, want nil (run-less settle)", ref, it.RunID)
+		}
+	}
+
+	// One settled audit per chain item, both the run-less variant — and the
+	// PAYLOAD must be load-bearing: each item's audit is keyed to ITS issue_ref
+	// and carries settled_via=issue_closed, state_reason=completed, and
+	// outcome=succeeded, with NO run_id. Asserting only the count=2 would pass
+	// even if the impl emitted audits without settled_via or for the wrong refs.
+	if n := aud.count("campaign_issue_settled"); n != 2 {
+		t.Fatalf("campaign_issue_settled = %d, want 2 (both chain items)", n)
+	}
+	byRefAudit := settledAuditPayloadsByRef(t, aud)
+	for _, ref := range []string{"issue:100", "issue:101"} {
+		p, ok := byRefAudit[ref]
+		if !ok {
+			t.Fatalf("no campaign_issue_settled audit for %s (want one per chain item)", ref)
+		}
+		if got := p["settled_via"]; got != "issue_closed" {
+			t.Errorf("%s settled_via = %v, want issue_closed", ref, got)
+		}
+		if got := p["state_reason"]; got != "completed" {
+			t.Errorf("%s state_reason = %v, want completed", ref, got)
+		}
+		if got := p["outcome"]; got != string(campaign.ItemStateSucceeded) {
+			t.Errorf("%s outcome = %v, want succeeded", ref, got)
+		}
+		if _, hasRun := p["run_id"]; hasRun {
+			t.Errorf("%s audit carries run_id = %v, want absent for a run-less settle", ref, p["run_id"])
+		}
+	}
+
+	// Eligible-slice-never-CLOSED invariant: neither closed item is eligible, and
+	// next_action never suggests starting a run on a closed item.
+	for _, ref := range []string{"issue:100", "issue:101"} {
+		if containsRef(st.Rollup.Eligible, ref) {
+			t.Errorf("rollup.Eligible = %v, contains CLOSED item %s", st.Rollup.Eligible, ref)
+		}
+	}
+	if st.NextAction.Action == "start_run" &&
+		(st.NextAction.IssueRef == "issue:100" || st.NextAction.IssueRef == "issue:101") {
+		t.Errorf("next_action = %+v, must not start_run a CLOSED item", st.NextAction)
+	}
+
+	// Whole chain settled → campaign advances to succeeded.
+	if st.Campaign.State != string(campaign.StateSucceeded) {
+		t.Errorf("campaign state = %q, want succeeded once all items settle", st.Campaign.State)
+	}
+
+	// The two-phase design resolves each item's closed-status exactly once — the
+	// fixpoint is in-memory, so no O(n^2) GitHub calls.
+	if ghState.issueCalls != 2 {
+		t.Errorf("issueCalls = %d, want 2 (each item read once; fixpoint is in-memory)", ghState.issueCalls)
+	}
+	if ghState.installCalls != 1 {
+		t.Errorf("installCalls = %d, want 1 (installation resolved once and cached)", ghState.installCalls)
+	}
+}
+
+// TestReconcileOnRead_RunlessClosedDepOnOpen_StaysBlocked is the negative guard
+// preserving DAG order under the #1758 fixpoint: a run-less child C (issue:101)
+// that is itself closed-as-completed but whose dependency D (issue:100) is still
+// OPEN must NOT be settled. D never enters the done-set, so C's dep is
+// unsatisfied and the Phase-2 fixpoint never reaches C — it stays Blocked, never
+// Eligible, and emits no settle audit.
+func TestReconcileOnRead_RunlessClosedDepOnOpen_StaysBlocked(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "open", stateReason: ""},            // D still open
+		101: {state: "closed", stateReason: "completed"}, // C closed out of dep order
+	}}
+	gh := newRunlessGitHubClient(t, ghState)
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: gh})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+		cItem("issue:101", []string{"issue:100"}, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID)
+
+	// C is closed but its dep is open → left unsettled, no settle audit.
+	if n := aud.count("campaign_issue_settled"); n != 0 {
+		t.Errorf("campaign_issue_settled = %d, want 0 (closed item's dep still open)", n)
+	}
+	for _, it := range st.Items {
+		if it.IssueRef == "issue:101" && it.State == string(campaign.ItemStateSucceeded) {
+			t.Errorf("item issue:101 settled to succeeded, want unsettled (dep D open)")
+		}
+	}
+
+	// DAG order preserved: C appears Blocked, never Eligible.
+	if !containsRef(st.Rollup.Blocked, "issue:101") {
+		t.Errorf("rollup.Blocked = %v, want to contain issue:101 (closed-with-open-dep stays Blocked)", st.Rollup.Blocked)
+	}
+	if containsRef(st.Rollup.Eligible, "issue:101") {
+		t.Errorf("rollup.Eligible = %v, must NOT contain issue:101 (dep unsatisfied)", st.Rollup.Eligible)
 	}
 }
 
