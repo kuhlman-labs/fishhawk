@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -79,6 +80,15 @@ type reviewerInvocation struct {
 	reasoningEffort string
 	resolveErr      error
 
+	// agentVersion is the spec-declared per-reviewer agent_version
+	// compatibility range (#1743, symmetry with specModel/reasoningEffort):
+	// the semver comparator range the workflow was validated against for this
+	// reviewer's CLI. Empty for the count form (no per-reviewer field) and for
+	// reviewers that declare none. reviewerAgentVersionMismatch probes a codex
+	// reviewer's actual CLI version against it before dispatch and fails loudly
+	// on an out-of-range CLI.
+	agentVersion string
+
 	// optional is the spec-declared per-reviewer degradation policy (#1495).
 	// When resolveErr is non-nil (the provider is unavailable on this
 	// deployment — a capability gap, NOT a reviewer error), the loop emits a
@@ -130,6 +140,7 @@ func (s *Server) resolveReviewerInvocationsWithReviewModel(reviewersCfg *spec.Re
 				provider:        a.Provider,
 				specModel:       a.Model,
 				reasoningEffort: a.ReasoningEffort,
+				agentVersion:    a.AgentVersion,
 				resolveErr:      err,
 				optional:        a.Optional,
 			})
@@ -1413,6 +1424,52 @@ func (s *Server) emitReviewerUnavailable(ctx context.Context, runID, stageID uui
 	}
 }
 
+// versionProber is the optional capability a reviewer adapter implements to
+// report its resolved CLI version, consumed by the agent_version compatibility
+// guard (#1743). Only the codex reviewer (a `codex` subprocess) implements it;
+// the anthropic SDK and claudecode adapters do not, so a type assertion against
+// this interface naturally scopes the guard to codex reviewers — an anthropic
+// reviewer that declares agent_version is ignored, as intended.
+type versionProber interface {
+	ProbeVersion(ctx context.Context) string
+}
+
+// reviewerAgentVersionMismatch probes a codex reviewer's CLI version and
+// reports whether it falls OUTSIDE the reviewer's spec-declared agent_version
+// range (#1743). It turns the #1741 opaque zero-token failure class (a CLI
+// auto-update drifting out of the validated range) into a one-line diagnosis.
+//
+// It returns mismatch=true ONLY in the fail-loud case — the probed version is
+// comparable AND out of range — so the caller blocks the review dispatch. Every
+// other case degrades to mismatch=false (proceed):
+//   - no declared range (nothing to enforce);
+//   - a reviewer that exposes no version probe (anthropic/claudecode — the
+//     field is ignored for non-codex reviewers this slice does not enforce);
+//   - an unprobeable CLI (the #1769 "unknown" sentinel, or a version string
+//     with no semver token, which MatchAgentVersionRange reports uncomparable);
+//   - a malformed range — it was validated at spec-parse time by
+//     ValidAgentVersionRange, so a parse error here is a validator gap, not an
+//     operator-facing dispatch fault, and must not block a real review.
+//
+// reason is a human-readable diagnosis naming the provider, probed version, and
+// declared range when mismatch is true; empty otherwise.
+func reviewerAgentVersionMismatch(ctx context.Context, inv reviewerInvocation) (mismatch bool, reason string) {
+	if inv.agentVersion == "" {
+		return false, ""
+	}
+	prober, ok := inv.reviewer.(versionProber)
+	if !ok {
+		return false, ""
+	}
+	probed := prober.ProbeVersion(ctx)
+	matched, comparable, err := spec.MatchAgentVersionRange(inv.agentVersion, probed)
+	if err != nil || !comparable || matched {
+		return false, ""
+	}
+	return true, fmt.Sprintf("%s reviewer CLI version %q is outside the declared agent_version range %q",
+		inv.provider, probed, inv.agentVersion)
+}
+
 // runPlanReviewLoop runs the per-reviewer plan-review loop shared by the
 // synchronous (gating) and detached (advisory) dispatch paths. For each
 // resolved invocation it calls its reviewer's Review, logs WARN on
@@ -1439,6 +1496,34 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 		// so the review-settled gate still resolves.
 		if inv.resolveErr != nil {
 			s.emitReviewerUnavailable(ctx, runID, stageID, "plan_review_skipped", authority, inv.provider, inv.optional, len(invocations), inv.resolveErr)
+			continue
+		}
+		// Reviewer agent-version compatibility guard (#1743): a codex reviewer
+		// that declares an agent_version range is checked against its probed CLI
+		// version BEFORE the review is invoked. An out-of-range CLI fails the
+		// review dispatch LOUDLY — the #1741 opaque-failure class made
+		// one-line-diagnosable — rather than running a reviewer whose drifted CLI
+		// may emit an incompatible verdict shape. Set hasRejection so GATING
+		// authority blocks stage advancement (a stronger stance than the transient
+		// reviewer-error path below, which never blocks — an out-of-range CLI is a
+		// deliberate hard fail, the reviewer analog of the executor's pre-spawn
+		// category-C exit); the advisory caller ignores the return, leaving the
+		// human gate authoritative. Emit a terminal plan_review_failed entry
+		// carrying the range+version diagnosis, and skip the reviewer. An
+		// unprobeable/"unknown" CLI degrades to proceed (mismatch=false), never
+		// blocking.
+		if mismatch, reason := reviewerAgentVersionMismatch(ctx, inv); mismatch {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
+				"plan review: reviewer CLI version outside declared agent_version range — failing review dispatch",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.Int("reviewer_index", i),
+				slog.String("provider", inv.provider),
+				slog.String("agent_version_range", inv.agentVersion),
+				slog.String("reason", reason),
+			)
+			s.emitReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, inv.specModel, reason, false)
+			hasRejection = true
 			continue
 		}
 		// Apply the size-aware per-invocation budget (#747) as a context

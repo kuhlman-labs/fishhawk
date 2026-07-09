@@ -503,6 +503,67 @@ func stderrSuffix(stderrText string) string {
 	return ": " + stderrText
 }
 
+// probeVersionTimeout bounds a single `<binary> --version` probe so a hung CLI
+// cannot wedge review dispatch. The probe is a fast local subprocess; ten
+// seconds is generous headroom over a normal `--version` while still failing
+// closed on a wedged binary (→ "unknown", degrade to proceed).
+const probeVersionTimeout = 10 * time.Second
+
+// ProbeVersion runs `<binary> --version` and returns the trimmed first
+// non-empty line of its stdout — the free-form CLI version string the
+// agent_version compatibility guard (#1743) feeds to
+// spec.MatchAgentVersionRange, which extracts the semver token from it (e.g.
+// "0.30.5 (codex-cli)" → "0.30.5"). It returns "unknown" on ANY failure
+// (binary missing, non-zero exit, timeout, scratch-dir failure, empty output),
+// mirroring the runner's probeAgentVersion contract (#1769): an "unknown"
+// version is uncomparable, so the guard degrades to PROCEED rather than
+// blocking a review on an unprobeable CLI. The probe runs from a fresh scratch
+// dir (the #995 empty-cwd posture) via the same Cmd seam Inference uses, so
+// tests redirect it to a fake binary.
+func (c *Client) ProbeVersion(ctx context.Context) string {
+	cmdFn := c.Cmd
+	if cmdFn == nil {
+		cmdFn = exec.CommandContext
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, probeVersionTimeout)
+	defer cancel()
+
+	scratchDir, err := os.MkdirTemp("", "fishhawk-codex-version-")
+	if err != nil {
+		return "unknown"
+	}
+	defer func() { _ = os.RemoveAll(scratchDir) }()
+
+	cmd := cmdFn(probeCtx, c.cfg.Binary, "--version")
+	cmd.Dir = scratchDir
+	// Inherit the host env (PATH resolves the binary; no API key is needed for
+	// a version probe) when the Cmd builder left env nil (production).
+	if cmd.Env == nil {
+		cmd.Env = os.Environ()
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return "unknown"
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			return trimmed
+		}
+	}
+	return "unknown"
+}
+
+// ProbeVersion exposes the underlying Client's CLI version probe on the
+// Reviewer so the server-side agent_version compatibility guard (#1743) can
+// resolve a codex reviewer's actual CLI version through the server.PlanReviewer
+// it already holds — the guard type-asserts the reviewer to an interface
+// carrying this method, so only codex reviewers are probed. It lives in
+// client.go alongside the probe it forwards to (the Reviewer type is declared
+// in reviewer.go, but Go permits a type's methods in any file of its package).
+func (r *Reviewer) ProbeVersion(ctx context.Context) string {
+	return r.client.ProbeVersion(ctx)
+}
+
 // isBinaryMissing reports whether err means the binary itself is not on disk /
 // not on PATH, as opposed to a runtime failure. Mirrors
 // claudecode.isBinaryMissing.
