@@ -357,6 +357,23 @@ type FetchedPrompt struct {
 	// this against its own version and exits with exitVersionSkew when it is
 	// older than required.
 	MinRunnerVersion string `json:"min_runner_version,omitempty"`
+	// AgentVersionRange is the stage executor's spec-declared agent CLI
+	// compatibility range (executor.agent_version, E32.13 / #1743): a semver
+	// comparator range (e.g. ">=2.1 <2.2") the workflow was validated
+	// against. Non-empty only when the stage's executor declares it. Before
+	// spawning the coding agent the runner compares its resolved (#1769-probed)
+	// CLI version against this range and fails the stage LOUDLY pre-spawn
+	// (category C, agent_version_mismatch) on an out-of-range version, or
+	// degrades to a warn and proceeds when the version is unprobeable/unknown.
+	// Empty (the byte-identical default) means no constraint — no check runs,
+	// mirroring the MinRunnerVersion precedent.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (min/agent_version_range) MUST
+	// stay byte-identical to the backend's promptResponse.AgentVersionRange
+	// (backend/internal/server/prompt.go). Same independent-struct-by-tag
+	// convention as MinRunnerVersion / ImplementModel. A tag drift silently
+	// disables the pre-spawn compatibility check.
+	AgentVersionRange string `json:"agent_version_range,omitempty"`
 	// AgentSelfRetry is true when the workflow spec opts the stage into
 	// ADR-023 runner-side self-retry on category-A/C failures.
 	AgentSelfRetry bool `json:"agent_self_retry,omitempty"`

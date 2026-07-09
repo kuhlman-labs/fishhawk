@@ -65,6 +65,22 @@ type promptResponse struct {
 	// Runners that are older than this should exit with a version-skew error
 	// rather than proceeding to invoke the agent.
 	MinRunnerVersion string `json:"min_runner_version,omitempty"`
+	// AgentVersionRange is the stage executor's spec-declared agent CLI
+	// compatibility range (executor.agent_version, E32.13 / #1743): a semver
+	// comparator range (e.g. ">=2.1 <2.2") the workflow was validated
+	// against. Non-empty only when the stage's executor declares it. The
+	// runner compares its resolved (#1769-probed) coding-agent CLI version
+	// against this range BEFORE spawning the agent and fails the stage loudly
+	// pre-spawn (category C) on an out-of-range version, degrading-and-
+	// proceeding on an unprobeable one. Empty/omitted (the common case) means
+	// no constraint — byte-identical to today.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (`agent_version_range`) MUST
+	// stay byte-identical to the runner's upload.FetchedPrompt.AgentVersionRange
+	// decoder (runner/internal/upload/upload.go) — the same independent-struct-
+	// by-tag convention as ImplementModel/MinRunnerVersion. A tag drift here
+	// silently disables the runner's pre-spawn compatibility check.
+	AgentVersionRange string `json:"agent_version_range,omitempty"`
 	// AgentSelfRetry is true when the workflow spec opts the stage into
 	// ADR-023 runner-side self-retry on category-A/C failures.
 	AgentSelfRetry bool `json:"agent_self_retry,omitempty"`
@@ -979,6 +995,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		VerifyTimeoutSeconds: verifyTimeoutSecs,
 		VerifyMaxIterations:  verifyMaxIterations,
 		MinRunnerVersion:     version.MinRunnerVersion,
+		AgentVersionRange:    s.resolveExecutorAgentVersionRange(r.Context(), runRow, stage.Type),
 		AgentSelfRetry:       s.resolveAgentSelfRetryForStage(r.Context(), runRow, stage.Type),
 		MaxRetriesSnapshot:   runRow.MaxRetriesSnapshot,
 		RetryAttempt:         runRow.RetryAttempt,
@@ -1324,6 +1341,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		VerifyTimeoutSeconds: verifyTimeoutSecs,
 		VerifyMaxIterations:  verifyMaxIterations,
 		MinRunnerVersion:     version.MinRunnerVersion,
+		AgentVersionRange:    s.resolveExecutorAgentVersionRange(r.Context(), runRow, stage.Type),
 		AgentSelfRetry:       s.resolveAgentSelfRetryForStage(r.Context(), runRow, stage.Type),
 		MaxRetriesSnapshot:   runRow.MaxRetriesSnapshot,
 		RetryAttempt:         runRow.RetryAttempt,
@@ -2018,6 +2036,47 @@ func (s *Server) resolveVerifyConfig(ctx context.Context, runRow *run.Run, stage
 	}
 	secs := int(specStage.Executor.Verify.Timeout.Seconds())
 	return specStage.Executor.Verify.Command, secs, specStage.Executor.Verify.MaxIterations
+}
+
+// resolveExecutorAgentVersionRange returns the stage executor's spec-declared
+// agent CLI compatibility range (executor.agent_version, #1743) for the given
+// stage type, threaded to the runner as promptResponse.agent_version_range.
+// Mirrors resolveVerifyConfig's parse + stage-lookup pattern. Returns the
+// empty string on any error (nil spec, missing workflow, parse failure) or an
+// absent field so the runner performs no compatibility check — byte-identical
+// to today.
+func (s *Server) resolveExecutorAgentVersionRange(ctx context.Context, runRow *run.Run, stageType run.StageType) string {
+	if runRow.WorkflowSpec == nil {
+		return ""
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: parse workflow spec for agent_version range",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return ""
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		return ""
+	}
+	var specStage spec.Stage
+	for _, st := range wf.Stages {
+		if st.ID == string(stageType) {
+			specStage = st
+			break
+		}
+	}
+	if specStage.ID == "" {
+		for _, st := range wf.Stages {
+			if string(st.Type) == string(stageType) {
+				specStage = st
+				break
+			}
+		}
+	}
+	return specStage.Executor.AgentVersion
 }
 
 // parseIssueRef extracts the issue number from a TriggerRef of the

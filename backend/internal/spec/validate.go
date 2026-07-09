@@ -116,6 +116,35 @@ func validateWorkflow(s *Spec, name string, wf *Workflow) error {
 			}
 		}
 
+		// agent_version compatibility ranges (E32.13 / #1743) are plain
+		// strings to the JSON Schema, so a malformed range like ">=abc"
+		// passes schema validation. Validate the syntactic shape here — on
+		// the executor's agent branch and each heterogeneous reviewer — so a
+		// bad range is a spec authoring error caught at parse time rather
+		// than an opaque dispatch-time failure. Empty = absent (no
+		// constraint), skipped.
+		if stage.Executor.AgentVersion != "" {
+			if err := ValidAgentVersionRange(stage.Executor.AgentVersion); err != nil {
+				return &ValidationError{
+					Path:    stagePath(i, "/executor/agent_version"),
+					Message: err.Error(),
+				}
+			}
+		}
+		if stage.Reviewers != nil {
+			for j, ar := range stage.Reviewers.Agents {
+				if ar.AgentVersion == "" {
+					continue
+				}
+				if err := ValidAgentVersionRange(ar.AgentVersion); err != nil {
+					return &ValidationError{
+						Path:    stagePath(i, fmt.Sprintf("/reviewers/agents/%d/agent_version", j)),
+						Message: err.Error(),
+					}
+				}
+			}
+		}
+
 		// inputs[].from_stage cross-references must resolve.
 		for j, in := range stage.Inputs {
 			if in.FromStage == "" {

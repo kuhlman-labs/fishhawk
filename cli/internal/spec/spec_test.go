@@ -385,3 +385,88 @@ func TestValidateBytes_UnsupportedMajorFailsClosed(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateBytes_AgentVersion_Valid asserts a workflow-v1.4 spec declaring
+// agent_version ranges on both the executor and a reviewer passes CLI
+// validation (schema + the #1743 semantic range sweep).
+func TestValidateBytes_AgentVersion_Valid(t *testing.T) {
+	const yml = `
+version: "1.4"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+          agent_version: ">=2.1 <2.2"
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agents:
+            - provider: codex
+              agent_version: ">=0.30 <0.31"
+            - provider: anthropic
+          human: 1
+`
+	if err := spec.ValidateBytes([]byte(yml)); err != nil {
+		t.Errorf("expected valid agent_version spec to pass, got: %v", err)
+	}
+}
+
+// TestValidateBytes_AgentVersion_ExecutorMalformed asserts the CLI's semantic
+// sweep rejects a malformed executor agent_version range that the schema (a
+// plain string) accepts (#1743).
+func TestValidateBytes_AgentVersion_ExecutorMalformed(t *testing.T) {
+	const yml = `
+version: "1.4"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          agent_version: ">=abc"
+`
+	err := spec.ValidateBytes([]byte(yml))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(err.Error(), "/executor/agent_version") {
+		t.Errorf("error = %q, want it to name /executor/agent_version", err.Error())
+	}
+}
+
+// TestValidateBytes_AgentVersion_ReviewerMalformed asserts the CLI sweep
+// rejects a malformed reviewer agent_version range (#1743).
+func TestValidateBytes_AgentVersion_ReviewerMalformed(t *testing.T) {
+	const yml = `
+version: "1.4"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agents:
+            - provider: codex
+              agent_version: "2.1"
+          human: 1
+`
+	err := spec.ValidateBytes([]byte(yml))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(err.Error(), "/reviewers/agents/0/agent_version") {
+		t.Errorf("error = %q, want it to name the reviewer agent_version", err.Error())
+	}
+}

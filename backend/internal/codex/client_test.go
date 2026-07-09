@@ -185,6 +185,17 @@ func TestHelperProcess(t *testing.T) {
 		// detail rather than the external/OOM kill label.
 		fmt.Println(`{"type":"turn.failed"}`)
 		os.Exit(1)
+	case "version":
+		// The #1743 ProbeVersion probe: emit the canned version (HELPER_VERSION)
+		// with a leading blank line, surrounding whitespace, and a trailing noise
+		// line to exercise the first-non-empty-line trim.
+		fmt.Println("")
+		fmt.Println("  " + os.Getenv("HELPER_VERSION") + "  ")
+		fmt.Println("extra codex-cli banner line")
+	case "version_err":
+		// A `--version` that fails non-zero → ProbeVersion returns "unknown".
+		fmt.Fprintln(os.Stderr, "codex: unknown flag --version")
+		os.Exit(1)
 	case "slow":
 		// Sleep past a short Timeout so the per-attempt deadline fires and the
 		// child is killed with ctx.Err()==DeadlineExceeded (the timeout class,
@@ -204,6 +215,21 @@ func helperCommand(mode string) func(ctx context.Context, name string, args ...s
 		c.Env = append(os.Environ(),
 			"GO_HELPER_PROCESS=1",
 			"HELPER_MODE="+mode,
+		)
+		return c
+	}
+}
+
+// versionHelperCommand returns a Cmd-builder that re-execs the test binary as
+// the `codex` stand-in for a `--version` probe, emitting the given version
+// string via the HELPER_MODE=version transcript.
+func versionHelperCommand(version string) func(ctx context.Context, name string, args ...string) *exec.Cmd {
+	return func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		c := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess")
+		c.Env = append(os.Environ(),
+			"GO_HELPER_PROCESS=1",
+			"HELPER_MODE=version",
+			"HELPER_VERSION="+version,
 		)
 		return c
 	}
@@ -784,5 +810,54 @@ func TestInference_ScratchDirFailureFailsClosed(t *testing.T) {
 	}
 	if attempts != 0 {
 		t.Errorf("attempts = %d, want 0 (the subprocess must never spawn without the workspace bound)", attempts)
+	}
+}
+
+// TestProbeVersion_ReturnsTrimmedFirstLine asserts ProbeVersion returns the
+// trimmed first non-empty line of `<binary> --version` output (#1743) — the
+// free-form version string the server-side guard feeds to
+// spec.MatchAgentVersionRange — ignoring a leading blank line, surrounding
+// whitespace, and trailing banner noise.
+func TestProbeVersion_ReturnsTrimmedFirstLine(t *testing.T) {
+	c := NewClient(testConfig())
+	c.Cmd = versionHelperCommand("0.30.5 (codex-cli)")
+	if got := c.ProbeVersion(context.Background()); got != "0.30.5 (codex-cli)" {
+		t.Errorf("ProbeVersion = %q, want the trimmed first non-empty line %q", got, "0.30.5 (codex-cli)")
+	}
+}
+
+// TestProbeVersion_NonZeroExitReturnsUnknown asserts a `--version` that exits
+// non-zero degrades to "unknown" (uncomparable → the guard proceeds, never
+// blocks a review on a probe failure).
+func TestProbeVersion_NonZeroExitReturnsUnknown(t *testing.T) {
+	c := NewClient(testConfig())
+	c.Cmd = helperCommand("version_err")
+	if got := c.ProbeVersion(context.Background()); got != "unknown" {
+		t.Errorf("ProbeVersion = %q, want unknown on a non-zero --version exit", got)
+	}
+}
+
+// TestProbeVersion_BinaryMissingReturnsUnknown asserts a missing binary degrades
+// to "unknown" rather than surfacing an error — the probe never fails the
+// review dispatch on its own.
+func TestProbeVersion_BinaryMissingReturnsUnknown(t *testing.T) {
+	c := NewClient(testConfig())
+	c.cfg.Binary = "definitely-not-a-real-binary-xyz"
+	c.Cmd = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, name, args...)
+	}
+	if got := c.ProbeVersion(context.Background()); got != "unknown" {
+		t.Errorf("ProbeVersion = %q, want unknown when the binary is missing", got)
+	}
+}
+
+// TestReviewerProbeVersion_ForwardsToClient asserts the Reviewer forwards
+// ProbeVersion to its underlying Client (#1743) — the method the server-side
+// guard type-asserts on the resolved server.PlanReviewer.
+func TestReviewerProbeVersion_ForwardsToClient(t *testing.T) {
+	r := NewReviewer(testConfig())
+	r.client.Cmd = versionHelperCommand("0.42.0")
+	if got := r.ProbeVersion(context.Background()); got != "0.42.0" {
+		t.Errorf("Reviewer.ProbeVersion = %q, want it to forward the client probe (%q)", got, "0.42.0")
 	}
 }

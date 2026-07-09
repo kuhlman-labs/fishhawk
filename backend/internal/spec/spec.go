@@ -463,6 +463,19 @@ type AgentReviewer struct {
 	// enum (low|medium|high|xhigh|max) is the sole guard before the value
 	// reaches the codex CLI as -c model_reasoning_effort=<effort>.
 	ReasoningEffort string `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
+	// AgentVersion is the optional per-reviewer agent-version compatibility
+	// RANGE (E32.13 / #1743): a semver comparator range (e.g. ">=0.30
+	// <0.31") of this reviewer's agent CLI versions the workflow was
+	// validated against. Enforced ONLY for a codex reviewer — the backend
+	// probes the codex CLI version and fails the review dispatch loudly on
+	// an out-of-range version via MatchAgentVersionRange (the reviewer
+	// enforcement is a sibling slice; this slice owns the field + matcher).
+	// The anthropic and claudecode adapters take no CLI version and ignore
+	// it. Empty falls back to no constraint. The schema's agents items are
+	// additionalProperties:false, so this field MUST stay in lockstep with
+	// the schema's agent_version property. Validated syntactically by
+	// ValidAgentVersionRange in the semantic layer.
+	AgentVersion string `json:"agent_version,omitempty" yaml:"agent_version,omitempty"`
 	// Optional is the per-reviewer degradation policy (#1495). It frames the
 	// FISHHAWKD_ENABLE_* / FISHHAWKD_ANTHROPIC_API_KEY env flags as deployment
 	// CAPABILITY gates (is this provider available here) rather than policy
@@ -546,7 +559,21 @@ type Executor struct {
 	// Empty falls through to the next-lower rung (ultimately the deployment
 	// default spawn). Declared in the agent branch of the executor oneOf;
 	// the schema rejects it on a human executor.
-	Model          string        `json:"model,omitempty" yaml:"model,omitempty"`
+	Model string `json:"model,omitempty" yaml:"model,omitempty"`
+	// AgentVersion is the optional executor agent-version compatibility
+	// RANGE (E32.13 / #1743): a semver comparator range (space-separated
+	// AND list, e.g. ">=2.1 <2.2") of coding-agent CLI versions the stage
+	// was validated against. Threaded to the runner (via
+	// promptResponse.agent_version_range), which fails the stage loudly
+	// pre-spawn (category C) when its resolved #1769-probed CLI version
+	// falls outside the range, and degrades-and-proceeds on an unprobeable
+	// version. Empty/absent = no constraint (mirrors MinRunnerVersion).
+	// Declared in the agent branch of the executor oneOf; the schema
+	// additionalProperties/unevaluatedProperties lockstep rejects it on a
+	// human executor, so this field MUST stay in lockstep with the schema's
+	// executor agent-branch agent_version property. Validated syntactically
+	// by ValidAgentVersionRange in the semantic layer.
+	AgentVersion   string        `json:"agent_version,omitempty" yaml:"agent_version,omitempty"`
 	Human          bool          `json:"human,omitempty" yaml:"human,omitempty"`
 	Timeout        Duration      `json:"timeout,omitempty" yaml:"timeout,omitempty"`
 	Verify         *VerifyConfig `json:"verify,omitempty" yaml:"verify,omitempty"`

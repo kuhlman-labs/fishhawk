@@ -231,7 +231,11 @@ func ValidateBytes(data []byte) error {
 			{Path: "/", Message: err.Error()},
 		}}
 	}
-	return nil
+	// Semantic sweep the schema can't express: agent_version compatibility
+	// ranges (#1743) are plain strings to the schema, so a malformed range
+	// is caught here (the CLI's sole semantic check; richer graph-shape
+	// checks stay on the backend).
+	return validateAgentVersions(raw)
 }
 
 // validationErrorFrom collapses the validator's nested error tree
