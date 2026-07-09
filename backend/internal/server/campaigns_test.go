@@ -3244,6 +3244,32 @@ func settledAuditPayload(t *testing.T, aud *campaignAuditRecorder) map[string]an
 	return nil
 }
 
+// settledAuditPayloadsByRef returns every campaign_issue_settled payload keyed by
+// its issue_ref, so a multi-item chain test can assert each item's audit carries
+// the load-bearing settled_via / state_reason / outcome fields (not just that N
+// entries exist). A missing or non-string issue_ref fails the test.
+func settledAuditPayloadsByRef(t *testing.T, aud *campaignAuditRecorder) map[string]map[string]any {
+	t.Helper()
+	aud.mu.Lock()
+	defer aud.mu.Unlock()
+	byRef := map[string]map[string]any{}
+	for _, e := range aud.entries {
+		if e.Category != categoryCampaignIssueSettled {
+			continue
+		}
+		var p map[string]any
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode settled payload: %v", err)
+		}
+		ref, ok := p["issue_ref"].(string)
+		if !ok {
+			t.Fatalf("settled payload missing string issue_ref: %v", p)
+		}
+		byRef[ref] = p
+	}
+	return byRef
+}
+
 // TestReconcileOnRead_RunlessIssueClosed_SettlesAndUnblocks_E2E is the headline
 // cross-boundary path for the run-less settle (#1558): a run-less, deps-satisfied
 // item whose GitHub issue is closed-as-completed settles succeeded on a status
@@ -3395,9 +3421,32 @@ func TestReconcileOnRead_RunlessClosedChain_ConvergesInSingleRead_E2E(t *testing
 		}
 	}
 
-	// One settled audit per chain item, both the run-less variant.
+	// One settled audit per chain item, both the run-less variant — and the
+	// PAYLOAD must be load-bearing: each item's audit is keyed to ITS issue_ref
+	// and carries settled_via=issue_closed, state_reason=completed, and
+	// outcome=succeeded, with NO run_id. Asserting only the count=2 would pass
+	// even if the impl emitted audits without settled_via or for the wrong refs.
 	if n := aud.count("campaign_issue_settled"); n != 2 {
 		t.Fatalf("campaign_issue_settled = %d, want 2 (both chain items)", n)
+	}
+	byRefAudit := settledAuditPayloadsByRef(t, aud)
+	for _, ref := range []string{"issue:100", "issue:101"} {
+		p, ok := byRefAudit[ref]
+		if !ok {
+			t.Fatalf("no campaign_issue_settled audit for %s (want one per chain item)", ref)
+		}
+		if got := p["settled_via"]; got != "issue_closed" {
+			t.Errorf("%s settled_via = %v, want issue_closed", ref, got)
+		}
+		if got := p["state_reason"]; got != "completed" {
+			t.Errorf("%s state_reason = %v, want completed", ref, got)
+		}
+		if got := p["outcome"]; got != string(campaign.ItemStateSucceeded) {
+			t.Errorf("%s outcome = %v, want succeeded", ref, got)
+		}
+		if _, hasRun := p["run_id"]; hasRun {
+			t.Errorf("%s audit carries run_id = %v, want absent for a run-less settle", ref, p["run_id"])
+		}
 	}
 
 	// Eligible-slice-never-CLOSED invariant: neither closed item is eligible, and
