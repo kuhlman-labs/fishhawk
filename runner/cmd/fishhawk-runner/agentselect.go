@@ -34,9 +34,13 @@ var errUnknownAgent = errors.New("agent: unknown provider")
 // newCodexInvoker is the seam for the codex provider, wiring the real
 // codex adapter (#840). Kept as a var so the adapter is constructed in
 // one place and tests can swap it for a fake (e.g. redirecting to a
-// fake-binary seam) without standing up the real `codex` binary.
-var newCodexInvoker = func(apiKey string) agent.Invoker {
-	return codex.New(apiKey)
+// fake-binary seam) without standing up the real `codex` binary. The
+// binary arg is the operator FISHHAWK_CODEX_BIN override; empty leaves
+// the adapter .Binary empty so it resolves codex.DefaultBinary (#1741).
+var newCodexInvoker = func(apiKey, binary string) agent.Invoker {
+	inv := codex.New(apiKey)
+	inv.Binary = binary
+	return inv
 }
 
 // selectInvoker maps an agent id to a concrete agent.Invoker.
@@ -45,15 +49,21 @@ var newCodexInvoker = func(apiKey string) agent.Invoker {
 //	codex       → the codex adapter (via the newCodexInvoker seam)
 //	(anything)  → errUnknownAgent wrapping the offending id
 //
+// binary is the operator binary override for the selected provider
+// (FISHHAWK_AGENT_BIN for claude-code, FISHHAWK_CODEX_BIN for codex),
+// threaded onto the concrete invoker's .Binary; empty leaves .Binary
+// empty so the adapter resolves its DefaultBinary — preserving the
+// historical PATH-resolution path for invocations that set no override.
+//
 // The default agent id is claude-code (set on the --agent flag), so an
 // invocation that omits the flag selects the historical Claude adapter
 // and behaves exactly as before.
-func selectInvoker(agentID, apiKey string) (agent.Invoker, error) {
+func selectInvoker(agentID, apiKey, binary string) (agent.Invoker, error) {
 	switch agentID {
 	case "claude-code":
-		return newInvoker(apiKey), nil
+		return newInvoker(apiKey, binary), nil
 	case "codex":
-		return newCodexInvoker(apiKey), nil
+		return newCodexInvoker(apiKey, binary), nil
 	default:
 		return nil, fmt.Errorf("%w: %q", errUnknownAgent, agentID)
 	}

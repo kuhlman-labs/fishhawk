@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/claudecode"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/codex"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
@@ -219,7 +220,7 @@ func mirrorWorkingTree(src, dst string) {
 func withFakeInvoker(t *testing.T, fake *fakeInvoker) {
 	t.Helper()
 	orig := newInvoker
-	newInvoker = func(apiKey string) agent.Invoker {
+	newInvoker = func(apiKey, _ string) agent.Invoker {
 		fake.gotAPIKey = apiKey
 		return fake
 	}
@@ -945,7 +946,7 @@ func TestRun_AgentFlagStampsBundleManifest(t *testing.T) {
 			fake := &fakeInvoker{canned: agent.Result{OK: true}}
 			withFakeInvoker(t, fake)
 			origCodex := newCodexInvoker
-			newCodexInvoker = func(string) agent.Invoker { return fake }
+			newCodexInvoker = func(_, _ string) agent.Invoker { return fake }
 			t.Cleanup(func() { newCodexInvoker = origCodex })
 
 			args := []string{
@@ -1023,7 +1024,7 @@ func TestRun_CodexForwardsOpenAIKeyEndToEnd(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", sentinel)
 
 	origCodex := newCodexInvoker
-	newCodexInvoker = func(apiKey string) agent.Invoker {
+	newCodexInvoker = func(apiKey, _ string) agent.Invoker {
 		c := codex.New(apiKey)
 		c.Cmd = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 			cc := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcessCodex")
@@ -2120,7 +2121,7 @@ func TestEmitEvents_OneJSONPerLine(t *testing.T) {
 func TestNewInvoker_DefaultIsClaudeCode(t *testing.T) {
 	// Sanity check: production wiring constructs a non-nil invoker.
 	// Regression guard for someone removing the default assignment.
-	inv := newInvoker("k")
+	inv := newInvoker("k", "")
 	if inv == nil {
 		t.Fatal("newInvoker returned nil")
 	}
@@ -5170,6 +5171,71 @@ func TestRun_StampsRunnerKindOnManifestsAndStartup(t *testing.T) {
 			wantLog := `"runner_kind":"` + tc.want + `"`
 			if !strings.Contains(stderr.String(), wantLog) {
 				t.Errorf("runner_started missing %s:\n%s", wantLog, stderr.String())
+			}
+		})
+	}
+}
+
+// withCannedAgentVersion swaps the probeAgentVersion seam to return a
+// fixed string so runner_started assertions are deterministic and never
+// spawn a real CLI subprocess.
+func withCannedAgentVersion(t *testing.T, version string) {
+	t.Helper()
+	orig := probeAgentVersion
+	probeAgentVersion = func(context.Context, string) string { return version }
+	t.Cleanup(func() { probeAgentVersion = orig })
+}
+
+// TestRun_StampsAgentProvenanceOnStartup asserts the #1741 provenance
+// wiring: the runner_started line records agent_kind (the selected
+// provider), agent_binary (the resolved CLI — the adapter DefaultBinary
+// with no operator override set), and agent_version (the probed
+// `--version` line) for BOTH a claude-code and a codex run. This asserts
+// the SHIPPED startup output, so a no-op logStartup touch that a
+// scope-presence gate would pass fails here. probeAgentVersion is swapped
+// to a canned value so the assertion is deterministic and execs no real
+// CLI.
+func TestRun_StampsAgentProvenanceOnStartup(t *testing.T) {
+	cases := []struct {
+		name       string
+		agent      string
+		wantKind   string
+		wantBinary string
+	}{
+		{name: "claude-code", agent: "claude-code", wantKind: "claude-code", wantBinary: claudecode.DefaultBinary},
+		{name: "codex", agent: "codex", wantKind: "codex", wantBinary: codex.DefaultBinary},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// No operator override: assert the adapter default is recorded.
+			t.Setenv("FISHHAWK_AGENT_BIN", "")
+			t.Setenv("FISHHAWK_CODEX_BIN", "")
+			withCannedAgentVersion(t, "test-agent 9.9.9")
+
+			fake := &fakeInvoker{canned: agent.Result{OK: true}}
+			withFakeInvoker(t, fake)
+			origCodex := newCodexInvoker
+			newCodexInvoker = func(_, _ string) agent.Invoker { return fake }
+			t.Cleanup(func() { newCodexInvoker = origCodex })
+
+			var out strings.Builder
+			got := run([]string{
+				"--run-id", "11111111-2222-3333-4444-555555555555",
+				"--backend-url", "https://api.fishhawk.test",
+				"--workflow", "feature_change", "--stage", "plan",
+				"--agent", tc.agent,
+			}, &out)
+			if got != exitOK {
+				t.Fatalf("run = %d:\n%s", got, out.String())
+			}
+			for _, want := range []string{
+				`"agent_kind":"` + tc.wantKind + `"`,
+				`"agent_binary":"` + tc.wantBinary + `"`,
+				`"agent_version":"test-agent 9.9.9"`,
+			} {
+				if !strings.Contains(out.String(), want) {
+					t.Errorf("runner_started missing %s:\n%s", want, out.String())
+				}
 			}
 		})
 	}

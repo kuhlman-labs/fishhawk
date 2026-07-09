@@ -63,7 +63,7 @@ func TestRun_ContextCancel_EmitsCancelledAndExits130(t *testing.T) {
 
 	// Block forever in the agent until ctx is cancelled.
 	origInvoker := newInvoker
-	newInvoker = func(_ string) agent.Invoker {
+	newInvoker = func(_, _ string) agent.Invoker {
 		return &blockingInvoker{events: []agent.Event{{Payload: []byte(`{"kind":"runner_started"}`)}}}
 	}
 	t.Cleanup(func() { newInvoker = origInvoker })
@@ -139,7 +139,7 @@ func TestRun_ContextCancel_BeforeAgentStart_StillEmitsCancelled(t *testing.T) {
 
 	// Pre-cancel: ctx is already done before run() reads it.
 	origInvoker := newInvoker
-	newInvoker = func(_ string) agent.Invoker {
+	newInvoker = func(_, _ string) agent.Invoker {
 		return &blockingInvoker{}
 	}
 	t.Cleanup(func() { newInvoker = origInvoker })

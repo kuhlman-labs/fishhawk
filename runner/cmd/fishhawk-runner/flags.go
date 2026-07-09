@@ -24,6 +24,15 @@ type config struct {
 	workflow   string
 	stage      string
 
+	// agentBinary / agentVersion are set at runtime (not flags), in run()
+	// after parseFlags. agentBinary is the resolved agent CLI executable —
+	// the operator override (FISHHAWK_AGENT_BIN / FISHHAWK_CODEX_BIN) when
+	// set, else the adapter DefaultBinary — and agentVersion is that
+	// binary's probed `--version` line ("unknown" on any probe error). Both
+	// are recorded on the runner_started log line for provenance (#1741).
+	agentBinary  string
+	agentVersion string
+
 	// agent selects the coding-agent provider the runner invokes
 	// (E22.X / #839). Maps 1:1 onto an agent.Invoker via
 	// selectInvoker: "claude-code" (default) wires the existing
