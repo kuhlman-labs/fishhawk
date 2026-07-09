@@ -1400,6 +1400,138 @@ func TestBranchNames_NoDFConflict(t *testing.T) {
 	}
 }
 
+// TestConsolidatedPRTitleBody drives the pure #1774 helper across every
+// branch: the chore-prefix / verbatim / no-issue title rules, the ## Summary
+// heading with plan summary vs default fallback, the per-slice bullet list
+// (paired-with-child-ids vs titles-only degrade), the Closes line, and the
+// byte-identical attribution footer (asserted field-for-field against
+// prTitleAndBody's shape, including the empty-baseURL relative-URL degrade).
+func TestConsolidatedPRTitleBody(t *testing.T) {
+	runID := uuid.MustParse("11111111-2222-3333-4444-555555555555")
+	implID := uuid.MustParse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	child0 := uuid.MustParse("c0000000-0000-0000-0000-000000000000")
+	child1 := uuid.MustParse("c1111111-1111-1111-1111-111111111111")
+	head := "fishhawk/run-11111111-consolidated"
+
+	planWithSlices := &plan.Plan{
+		Summary: "Align the consolidated PR body with single-run conventions.",
+		Decomposition: &plan.Decomposition{
+			SubPlans: []plan.SubPlanSummary{
+				{Title: "Slice one: backend helper"},
+				{Title: "Slice two: runner mirror"},
+			},
+		},
+	}
+
+	// The exact footer literal a byte-identical mirror of prTitleAndBody must
+	// render for the (a) case (non-empty baseURL, right-trimmed of the slash).
+	wantFooterA := "\n\n---\n_Opened by [Fishhawk](https://github.com/kuhlman-labs/fishhawk) for run `" +
+		runID.String() + "`, stage `" + implID.String() + "`._\n_Branch: `" + head +
+		"` · Audit log: `https://app.fishhawk.test/v0/runs/" + runID.String() + "/audit`._\n"
+
+	tests := []struct {
+		name         string
+		r            *run.Run
+		p            *plan.Plan
+		baseURL      string
+		childIDs     []uuid.UUID
+		wantTitle    string
+		wantContains []string
+		wantAbsent   []string
+	}{
+		{
+			name:      "issue-triggered parent, non-conventional title, paired slices",
+			r:         &run.Run{ID: runID, IssueContext: &run.IssueContext{Title: "Add widget", Number: 714}},
+			p:         planWithSlices,
+			baseURL:   "https://app.fishhawk.test/", // trailing slash trimmed
+			childIDs:  []uuid.UUID{child0, child1},
+			wantTitle: "chore: Add widget",
+			wantContains: []string{
+				"## Summary\n\nAlign the consolidated PR body with single-run conventions.",
+				"\n- Slice one: backend helper (run c0000000)",
+				"\n- Slice two: runner mirror (run c1111111)",
+				"\n\nCloses #714",
+				wantFooterA,
+			},
+		},
+		{
+			name:      "already-conventional issue title used verbatim (no double prefix)",
+			r:         &run.Run{ID: runID, IssueContext: &run.IssueContext{Title: "feat(api): add endpoint", Number: 5}},
+			p:         nil,
+			baseURL:   "https://app.fishhawk.test",
+			wantTitle: "feat(api): add endpoint",
+			wantContains: []string{
+				"## Summary\n\nConsolidated changes for decomposed run " + runID.String() + ".",
+				"\n\nCloses #5",
+			},
+			wantAbsent: []string{"chore: feat(api)"},
+		},
+		{
+			name:      "nil IssueContext falls back to run-id-stamped chore title",
+			r:         &run.Run{ID: runID},
+			p:         planWithSlices,
+			baseURL:   "https://app.fishhawk.test",
+			childIDs:  []uuid.UUID{child0, child1},
+			wantTitle: "chore: fishhawk consolidated run 11111111",
+			wantContains: []string{
+				"## Summary\n\nAlign the consolidated PR body with single-run conventions.",
+				"\n- Slice one: backend helper (run c0000000)",
+				"Audit log: `https://app.fishhawk.test/v0/runs/" + runID.String() + "/audit`",
+			},
+			wantAbsent: []string{"Closes #"},
+		},
+		{
+			name:      "plan without summary or sub_plans uses default summary, no bullets",
+			r:         &run.Run{ID: runID, IssueContext: &run.IssueContext{Title: "Fix thing"}},
+			p:         &plan.Plan{},
+			baseURL:   "",
+			wantTitle: "chore: Fix thing",
+			wantContains: []string{
+				"## Summary\n\nConsolidated changes for decomposed run " + runID.String() + ".",
+				// Empty baseURL degrades the audit-log URL to a relative path.
+				"Audit log: `/v0/runs/" + runID.String() + "/audit`",
+			},
+			wantAbsent: []string{"\n- ", "Closes #"},
+		},
+		{
+			name:      "child-count mismatch degrades to titles-only bullets",
+			r:         &run.Run{ID: runID, IssueContext: &run.IssueContext{Title: "Add widget"}},
+			p:         planWithSlices,
+			baseURL:   "https://app.fishhawk.test",
+			childIDs:  []uuid.UUID{child0}, // 1 id, 2 sub_plans
+			wantTitle: "chore: Add widget",
+			wantContains: []string{
+				"\n- Slice one: backend helper",
+				"\n- Slice two: runner mirror",
+			},
+			wantAbsent: []string{"(run c0000000)", "(run "},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			title, body := consolidatedPRTitleBody(tc.r, tc.p, implID, head, tc.baseURL, tc.childIDs)
+			if title != tc.wantTitle {
+				t.Errorf("title = %q, want %q", title, tc.wantTitle)
+			}
+			for _, want := range tc.wantContains {
+				if !strings.Contains(body, want) {
+					t.Errorf("body missing %q:\n%s", want, body)
+				}
+			}
+			for _, absent := range tc.wantAbsent {
+				if strings.Contains(body, absent) {
+					t.Errorf("body unexpectedly contains %q:\n%s", absent, body)
+				}
+			}
+			// The body always opens with the ## Summary heading.
+			if !strings.HasPrefix(body, "## Summary\n\n") {
+				t.Errorf("body does not open with ## Summary heading:\n%s", body)
+			}
+		})
+	}
+}
+
 func TestAdvance_DecomposedParent_OpensConsolidatedPR(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
 	o.DefaultRef = "main"
@@ -1432,8 +1564,21 @@ func TestAdvance_DecomposedParent_OpensConsolidatedPR(t *testing.T) {
 	if call.InstallationID != 55 {
 		t.Errorf("installation_id = %d, want 55", call.InstallationID)
 	}
-	if call.Title != "Add widget" {
-		t.Errorf("title = %q, want issue title", call.Title)
+	// #1774: a non-conventional issue title is chore-prefixed to a
+	// Conventional Commits header.
+	if call.Title != "chore: Add widget" {
+		t.Errorf("title = %q, want %q (chore-prefixed issue title)", call.Title, "chore: Add widget")
+	}
+	// Body carries the ## Summary heading, the Closes line, and the mirrored
+	// attribution footer.
+	if !strings.Contains(call.Body, "## Summary") {
+		t.Errorf("body missing ## Summary heading:\n%s", call.Body)
+	}
+	if !strings.Contains(call.Body, "Closes #714") {
+		t.Errorf("body missing Closes #714:\n%s", call.Body)
+	}
+	if !strings.Contains(call.Body, "_Opened by [Fishhawk](https://github.com/kuhlman-labs/fishhawk) for run `"+parent.ID.String()+"`") {
+		t.Errorf("body missing attribution footer:\n%s", call.Body)
 	}
 
 	// pull_request_url stamped on the parent.

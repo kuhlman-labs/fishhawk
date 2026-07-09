@@ -6867,6 +6867,11 @@ var pullRequestDescriptionPath = "/tmp/fishhawk-pr.md"
 // description. Applied WARN-ONLY to the agent-authored PR title — a non-match
 // emits pr_template_warning and the title is used verbatim; it never rewrites
 // the title or fails the stage.
+//
+// MIRRORED in backend/internal/orchestrator/orchestrator.go's
+// conventionalCommitHeaderRe (#1774), which uses the byte-identical pattern to
+// decide the consolidated PR title's chore-prefix. The backend is a separate Go
+// module, so it cannot import this — keep the two patterns in sync.
 var conventionalCommitHeaderRe = regexp.MustCompile(`^(feat|fix|docs|refactor|test|chore|perf|build)(\([a-z0-9/._-]+\))?!?: .+$`)
 
 // prTitleAndBody assembles the PR title and body for the implement
@@ -6899,6 +6904,11 @@ func prTitleAndBody(cfg config, branch string, logSink io.Writer) (title, body s
 	// Agent-authored path: append the attribution footer so
 	// reviewers can find the run + audit log even when the agent's
 	// body doesn't mention them.
+	//
+	// MIRRORED in backend/internal/orchestrator/orchestrator.go's
+	// consolidatedPRFooter (#1774), which appends the byte-identical literal to
+	// the decomposed-parent consolidated PR body. The backend is a separate Go
+	// module, so it cannot import this — keep the two literals in sync.
 	footer := fmt.Sprintf(
 		"\n\n---\n_Opened by [Fishhawk](https://github.com/kuhlman-labs/fishhawk) for run `%s`, stage `%s`._\n_Branch: `%s` · Audit log: `%s/v0/runs/%s/audit`._\n",
 		cfg.runID, cfg.stageID, branch,
