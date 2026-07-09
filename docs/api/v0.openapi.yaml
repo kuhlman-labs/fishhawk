@@ -4514,6 +4514,121 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/runs/{run_id}/stages/{stage_id}/reap-failure:
+    post:
+      operationId: reapStageFailure
+      summary: Report a spawn-phase runner failure so a stuck 'dispatched' stage fails
+      description: |
+        Records a detached runner's spawn-phase non-zero exit (#1747). The
+        `fishhawk_dispatch_stage` reaper (in the MCP host) calls this when a
+        spawned runner exits non-zero BEFORE reporting a terminal stage state
+        (e.g. an acceptance pre-flight provision failure) — the case that
+        otherwise leaves the stage stuck `dispatched` forever, with
+        `retry_stage` returning 422 and no audit entry written.
+
+        It is the eager, event-driven complement to the off-by-default ~1h
+        dispatch watchdog, and mirrors that watchdog's contract exactly:
+        `run.FailStage` (category `C` is the retryable infrastructure class)
+        → append a `dispatch_reaper_failed` audit entry (actor `system`) →
+        `orchestrator.Advance`. After it lands the stage is `failed`
+        (category `C`), the audit trail names the reason, and `retry_stage`
+        is applicable.
+
+        **Idempotent.** A report against an already-terminal stage (a
+        double-report, or a race with the dispatch watchdog reaping the same
+        stuck stage) is a benign no-op: 200 with `transitioned: false`, NO
+        audit entry, and NO advance.
+
+        **Authorization.** Requires an authenticated identity carrying
+        `write:runs` (anonymous → 401; a token without the scope → 403). The
+        operator/MCP token that drives dispatch already carries it.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        description: |
+          The failure category, a required reason, and optional diagnostics
+          (the parsed `runner_failed` detail and the child's process exit
+          code).
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [category, reason]
+              properties:
+                category:
+                  type: string
+                  enum: [B, C]
+                  description: |
+                    Failure category — exactly `B` or `C` (mirrors the
+                    pull-request failed-outcome contract). The reaper always
+                    sends `C` (the retryable infrastructure class) for a
+                    process-level non-zero exit.
+                reason:
+                  type: string
+                  description: |
+                    Why the runner failed — the parsed `runner_failed`
+                    reason, or a synthesized `runner exited N before
+                    reporting a terminal state` when the runner emitted no
+                    structured line. Recorded on the `dispatch_reaper_failed`
+                    audit entry.
+                detail:
+                  type: string
+                  description: Optional diagnostic detail from the runner_failed line.
+                exit_code:
+                  type: integer
+                  description: The runner's process exit code.
+      responses:
+        '200':
+          description: |
+            The report was recorded. `transitioned` is `true` when this call
+            drove the stage to `failed`, `false` on the idempotent
+            already-terminal no-op.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [transitioned, stage_state]
+                properties:
+                  transitioned:
+                    type: boolean
+                    description: True when this call transitioned the stage to failed.
+                  stage_state:
+                    type: string
+                    description: The resulting stage state.
+        '400':
+          description: |
+            Malformed body, an unknown field, a `category` other than
+            `B`/`C`, or an empty `reason`. Body's `error` is
+            `validation_failed`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            The identity lacks `write:runs` scope (`insufficient_scope`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `stage_not_found` — no stage with that id, or the stage's
+            `run_id` does not match the path `run_id` (inconsistent handle).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            The run or audit repositories are not wired
+            (`reap_failure_unconfigured`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/runs/{run_id}/audit:
     get:
       operationId: listRunAudit

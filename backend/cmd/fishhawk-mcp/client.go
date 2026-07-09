@@ -693,6 +693,51 @@ func (c *apiClient) RetryStage(ctx context.Context, id uuid.UUID) (*Stage, error
 	return &s, nil
 }
 
+// reapFailureRequest mirrors the backend's
+// `POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure` body
+// (`backend/internal/server/reap_failure.go::reapFailureRequest`). Both
+// category and reason are required; detail and exit_code are optional
+// diagnostics.
+type reapFailureRequest struct {
+	Category string `json:"category"`
+	Reason   string `json:"reason"`
+	Detail   string `json:"detail,omitempty"`
+	ExitCode int    `json:"exit_code,omitempty"`
+}
+
+// ReapFailureResult mirrors the backend's reap-failure 200 body: whether this
+// report drove the stage to failed (false on the idempotent already-terminal
+// no-op) and the resulting stage state.
+type ReapFailureResult struct {
+	Transitioned bool   `json:"transitioned"`
+	StageState   string `json:"stage_state"`
+}
+
+// ReportStageFailure reports a spawn-phase runner failure — a detached runner
+// that exited non-zero BEFORE reporting a terminal stage state — to the backend
+// via `POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure` (#1747). The
+// backend fails the stage (category C is the retryable infrastructure class),
+// writes a dispatch_reaper_failed audit entry, and advances the run, so the
+// stage lands in failed/category-C instead of stuck 'dispatched'. Idempotent: a
+// double-report against an already-terminal stage returns
+// {transitioned:false}. Mirrors VouchCommit/RetryStage. 4xx surfaces:
+//   - 400 validation_failed (category other than B/C, empty reason, malformed
+//     UUIDs/body)
+//   - 401 authentication_required / 403 insufficient_scope (needs write:runs)
+//   - 404 stage_not_found (unknown stage, or the stage's run_id disagrees)
+func (c *apiClient) ReportStageFailure(ctx context.Context, runID, stageID uuid.UUID, category, reason, detail string, exitCode int) (*ReapFailureResult, error) {
+	body, err := json.Marshal(reapFailureRequest{Category: category, Reason: reason, Detail: detail, ExitCode: exitCode})
+	if err != nil {
+		return nil, fmt.Errorf("marshal reap-failure: %w", err)
+	}
+	var res ReapFailureResult
+	if err := c.do(ctx, http.MethodPost,
+		"/v0/runs/"+runID.String()+"/stages/"+stageID.String()+"/reap-failure", body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // fixupRequest mirrors the backend's
 // `POST /v0/stages/{stage_id}/fixup` body
 // (`backend/internal/server/fixup.go::fixupRequest`). ConcernIDs is the

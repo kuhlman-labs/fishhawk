@@ -179,8 +179,20 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	argv := r.composeRunnerArgv(runStageIn, resolvedStageID, repo, baseBranch, pushAndOpenPR)
 	env := append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
 
-	// (6) Spawn DETACHED — start and return; the runner outlives this call.
-	logPath, err := spawnRunnerStageDetached(binary, argv, env, runUUID.String(), resolvedStageID)
+	// (6) Spawn DETACHED — start and return; the runner outlives this call. The
+	// reporter closure binds the backend client + durable handle so the detached
+	// reaper can report a spawn-phase non-zero exit (a runner that died before
+	// registering a terminal stage state) to the backend, transitioning the stage
+	// to failed/category-C instead of leaving it stuck 'dispatched' (#1747).
+	stageUUID, err := uuid.Parse(resolvedStageID)
+	if err != nil {
+		return nil, DispatchStageOutput{}, fmt.Errorf("resolved stage_id %q is not a valid UUID: %w", resolvedStageID, err)
+	}
+	report := func(ctx context.Context, category, reason, detail string, exitCode int) error {
+		_, rerr := r.api.ReportStageFailure(ctx, runUUID, stageUUID, category, reason, detail, exitCode)
+		return rerr
+	}
+	logPath, err := spawnRunnerStageDetached(binary, argv, env, runUUID.String(), resolvedStageID, report)
 	if err != nil {
 		return nil, DispatchStageOutput{}, err
 	}

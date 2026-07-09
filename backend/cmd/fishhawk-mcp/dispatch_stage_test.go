@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"strings"
@@ -629,5 +631,73 @@ func TestDispatchStage_AcceptanceStage_ResolvesAndSpawns(t *testing.T) {
 	}
 	if strings.Contains(joined, "--plan-out") || strings.Contains(joined, "--check-base-ref") {
 		t.Errorf("acceptance dispatch must not carry --plan-out/--check-base-ref: %s", joined)
+	}
+}
+
+// TestDispatchStage_ReaperReportsSpawnFailure is the call-site wiring test for
+// the detached-dispatch reaper (#1747): driving r.dispatchStage end-to-end with
+// a fake runner that dies non-zero BEFORE reporting a terminal stage state makes
+// the reaper POST /v0/runs/{id}/stages/{id}/reap-failure with the parsed reason
+// and category C. It exercises the reporter closure dispatchStage threads into
+// spawnRunnerStageDetached (the new signature).
+func TestDispatchStage_ReaperReportsSpawnFailure(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	gotCh := make(chan reapFailureRequest, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/reap-failure"):
+			var b reapFailureRequest
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			gotCh <- b
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"transitioned":true,"stage_state":"failed"}`))
+		case strings.HasSuffix(r.URL.Path, "/stages"):
+			// resolveStageID + the post-dispatch wait-status classify both read this.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"items": []Stage{{ID: stageID.String(), RunID: runID.String(), Type: "implement", State: "pending"}},
+			})
+		default:
+			// guardHostDispatch's GET /v0/runs/{id}: an unlocked run so the guard passes.
+			_ = json.NewEncoder(w).Encode(Run{ID: runID.String(), Repo: "x/y", State: "running"})
+		}
+	}))
+	defer srv.Close()
+
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok-test"}),
+		getenv: func(string) string { return "" },
+	}
+
+	// Fake runner: emit a runner_failed line to stdout (redirected to the detached
+	// log) and exit non-zero.
+	withFakeRunner(t, `echo '{"event":"runner_failed","reason":"acceptance_preview_provision_failed","detail":"boom"}'; exit 7`)
+
+	out, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	})
+	_ = out
+	if err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+
+	select {
+	case b := <-gotCh:
+		if b.Category != "C" {
+			t.Errorf("category = %q, want C", b.Category)
+		}
+		if b.Reason != "acceptance_preview_provision_failed" {
+			t.Errorf("reason = %q", b.Reason)
+		}
+		if b.Detail != "boom" {
+			t.Errorf("detail = %q", b.Detail)
+		}
+		if b.ExitCode != 7 {
+			t.Errorf("exit_code = %d, want 7", b.ExitCode)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reaper did not POST reap-failure within 5s")
 	}
 }

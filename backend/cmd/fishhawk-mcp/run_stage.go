@@ -730,12 +730,20 @@ func (r *runResolver) composeRunnerArgv(in RunStageInput, resolvedStageID, repo,
 //     pipe to EOF in a goroutine); the detached path has no such reader, so it
 //     must redirect to a file. The runner ships its trace via --upload-trace
 //     and its state to the backend, so the local log is a diagnostic only.
-//   - A detached reaper goroutine `go func(){ _ = cmd.Wait() }()` collects the
-//     child's exit so it never becomes a zombie while the tool returns
-//     (os/exec Cmd.Wait releases the Cmd's resources).
+//   - A detached reaper goroutine collects the child's exit so it never becomes
+//     a zombie while the tool returns (os/exec Cmd.Wait releases the Cmd's
+//     resources). On a NON-ZERO exit that carries an *exec.ExitError — the
+//     runner died before reporting a terminal stage state — the reaper parses
+//     the runner's failure reason from logPath and reports it to the backend
+//     via `report` so the stage transitions to failed/category-C with an audit
+//     entry instead of sitting 'dispatched' forever (#1747). A zero exit is a
+//     no-op: the runner reported its own outcome via trace/backend.
+//
+// report is the backend reporter the reaper calls on a non-zero exit; nil
+// disables reporting (the runner's dispatch watchdog remains the backstop).
 //
 // Returns the log path (always set when spawn succeeded) and any spawn error.
-func spawnRunnerStageDetached(binary string, argv, env []string, runID, stageID string) (string, error) {
+func spawnRunnerStageDetached(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter) (string, error) {
 	cmd := runStageCommand(binary, argv...)
 	cmd.Env = env
 
@@ -766,10 +774,97 @@ func spawnRunnerStageDetached(binary string, argv, env []string, runID, stageID 
 	_ = logFile.Close()
 
 	// Detached reaper: collect the exit so the child never zombies while
-	// the tool call returns. No ctx watch — the runner outlives the call.
-	go func() { _ = cmd.Wait() }()
+	// the tool call returns. No ctx watch — the runner outlives the call. On a
+	// non-zero exit that predates a terminal stage report, parse the runner's
+	// failure and report it so the stage doesn't stay stuck 'dispatched' (#1747).
+	go reapDetachedRunner(cmd, logPath, runID, stageID, report)
 
 	return logPath, nil
+}
+
+// detachedFailureReporter reports a spawn-phase non-zero runner exit to the
+// backend (#1747). spawnRunnerStageDetached's reaper calls it after cmd.Wait
+// returns an *exec.ExitError with the parsed reason/detail, the child's exit
+// code, and a category the caller fixes to "C" (the retryable infrastructure
+// class). nil disables reporting.
+type detachedFailureReporter func(ctx context.Context, category, reason, detail string, exitCode int) error
+
+// reapDetachedRunner waits for the detached child and, on a non-zero exit that
+// carries an *exec.ExitError, reports the failure to the backend (#1747). The
+// reaper ALWAYS reports category "C" for a process-level non-zero exit — the
+// retryable infrastructure class the issue targets — regardless of any category
+// on the parsed runner_failed line (only the acceptance sites emit one). A zero
+// exit, a non-ExitError wait failure (no exit code to report), or a nil report
+// is a no-op: the runner reported its own outcome, or the dispatch watchdog is
+// the backstop.
+func reapDetachedRunner(cmd *exec.Cmd, logPath, runID, stageID string, report detachedFailureReporter) {
+	waitErr := cmd.Wait()
+	if waitErr == nil {
+		return
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(waitErr, &exitErr) {
+		return
+	}
+	if report == nil {
+		return
+	}
+	exitCode := exitErr.ExitCode()
+	reason, detail := parseDetachedRunnerFailure(logPath)
+	if reason == "" {
+		// The runner emitted no runner_failed line (it died before any structured
+		// report). Synthesize a generic reason so the audit entry still pins what
+		// happened.
+		reason = fmt.Sprintf("runner exited %d before reporting a terminal state", exitCode)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := report(ctx, "C", reason, detail, exitCode); err != nil {
+		// Detached goroutine with no request logger — surface to stderr (the same
+		// diagnostic stream the redirected runner log rides). The failure is not
+		// fatal: the dispatch watchdog remains the eventual backstop.
+		fmt.Fprintf(os.Stderr,
+			"fishhawk-mcp: reap detached runner failure report failed (run=%s stage=%s): %v\n",
+			runID, stageID, err)
+	}
+}
+
+// parseDetachedRunnerFailure reads the detached runner's redirected log at
+// logPath and returns the reason/detail from the LAST runner_failed JSONL line
+// the runner emitted (`{"event":"runner_failed","reason":...,"detail":...}`).
+// The runner has fully exited and flushed its redirected stdout/stderr by the
+// time cmd.Wait returns, so this read is race-free. Returns ("", "") when the
+// log is unreadable or carries no runner_failed line, so the caller synthesizes
+// a generic reason.
+func parseDetachedRunnerFailure(logPath string) (reason, detail string) {
+	f, err := os.Open(logPath)
+	if err != nil {
+		return "", ""
+	}
+	defer func() { _ = f.Close() }()
+	scanner := bufio.NewScanner(f)
+	// Runner JSONL lines can be large (trace events with embedded payloads);
+	// bump from the default 64KiB to 1MiB, matching runStageParseEvents.
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var ev struct {
+			Event  string `json:"event"`
+			Reason string `json:"reason"`
+			Detail string `json:"detail"`
+		}
+		if json.Unmarshal([]byte(line), &ev) != nil {
+			continue
+		}
+		if ev.Event == "runner_failed" {
+			// Last runner_failed line wins — the runner's final structured word.
+			reason, detail = ev.Reason, ev.Detail
+		}
+	}
+	return reason, detail
 }
 
 // spawnRunnerStage is the single source of truth for the process-group
