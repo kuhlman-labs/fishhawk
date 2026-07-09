@@ -16,9 +16,10 @@
         "1.0",
         "1.1",
         "1.2",
-        "1.3"
+        "1.3",
+        "1.4"
       ],
-      "description": "Spec syntax version. workflow-v1 advertises 1.0 (the initial grammar plus the E23.2 deploy surface), 1.1 (adds the `acceptance` stage type, ADR-049 / #1519), 1.2 (adds the `acceptance` produces artifact, ADR-049 / #1531, E31.3), and 1.3 (adds the acceptance-stage `egress` allowance, ADR-050 / #1532, E31.4). Each is an additive minor — every lower-minor spec remains valid — mirroring v0's additive 0.3…0.7 minor chain. The validator routes a spec to this schema when its version major is 1 (minor is not routing-significant). Old specs in the audit log remain readable forever via their historical schemas; this enum gates *new* v1 specs only."
+      "description": "Spec syntax version. workflow-v1 advertises 1.0 (the initial grammar plus the E23.2 deploy surface), 1.1 (adds the `acceptance` stage type, ADR-049 / #1519), 1.2 (adds the `acceptance` produces artifact, ADR-049 / #1531, E31.3), 1.3 (adds the acceptance-stage `egress` allowance, ADR-050 / #1532, E31.4), and 1.4 (adds the `agent_version` compatibility range on the executor's agent branch and per reviewer in reviewers.agents[], E32.13 / #1743). Each is an additive minor — every lower-minor spec remains valid — mirroring v0's additive 0.3…0.7 minor chain. The validator routes a spec to this schema when its version major is 1 (minor is not routing-significant). Old specs in the audit log remain readable forever via their historical schemas; this enum gates *new* v1 specs only."
     },
     "roles": {
       "type": "object",
@@ -277,6 +278,11 @@
               "type": "string",
               "minLength": 1,
               "description": "Optional model override for this stage's agent invocation (#1013). One rung of the implement-model resolution ladder: deployment default < this executor.model < plan model_recommendation < operator gate decision. Empty/absent falls through to the next-lower rung (ultimately the deployment default spawn). The resolved model is validated against the deployment's per-adapter allowed-model set at the approval gate. Additive optional field within workflow-v0.x \u2014 accepted at every advertised version."
+            },
+            "agent_version": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Optional semver comparator RANGE (a space-separated AND list of comparators, e.g. \">=2.1 <2.2\") of coding-agent CLI versions this stage was validated against (E32.13 / #1743). Before spawning the agent the runner compares its resolved CLI version \u2014 the #1769-probed `<binary> --version` \u2014 against this range; a version OUTSIDE the range fails the stage LOUDLY pre-spawn (category C), turning an opaque mid-run CLI-drift break (the 2026-07-08 claude CLI auto-update, #1741) into a one-line diagnosis. It is a RANGE, not an exact pin: CLIs release near-daily, so the actual binary pin stays a host concern via the FISHHAWK_AGENT_BIN / FISHHAWK_CODEX_BIN overrides (#1741 / #1769) \u2014 this field owns only the spec-level contract. Permanently optional (deliberately NOT annotated x-intended-required); absent = no constraint (full back-compat, mirroring min_runner_version). An unprobeable / `unknown` version degrades to a warn and proceeds (never blocks). Additive optional field within workflow-v1.x \u2014 accepted at every advertised version."
             },
             "timeout": {
               "type": "string",
@@ -882,6 +888,11 @@
                   "max"
                 ],
                 "description": "Codex-only reviewer reasoning-effort override (#1493). One rung of the per-reviewer reasoning-effort ladder: deployment default (FISHHAWKD_CODEX_REASONING_EFFORT) < this reasoning_effort. Empty/absent falls back to the deployment default exactly as today; the resolved value is passed to the codex adapter as a `-c model_reasoning_effort=<effort>` CLI override. Ignored by the anthropic and claudecode adapters, which take no reasoning-effort parameter. Additive optional field within workflow-v1.x — accepted at every advertised version."
+              },
+              "agent_version": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Optional semver comparator RANGE (a space-separated AND list, e.g. \">=0.30 <0.31\") of this reviewer's agent CLI versions the workflow was validated against (E32.13 / #1743). Enforced ONLY for a codex reviewer, whose CLI version the backend probes before dispatch: a probed version OUTSIDE the range fails the review dispatch LOUDLY; an unprobeable version degrades and proceeds. The anthropic (SDK) and claudecode adapters take no CLI version and ignore it. A RANGE, not an exact pin — the binary pin stays a host concern via FISHHAWK_CODEX_BIN (#1741 / #1769); this field owns only the spec-level contract. Permanently optional; absent = no constraint. Additive optional field within workflow-v1.x — accepted at every advertised version."
               },
               "optional": {
                 "type": "boolean",

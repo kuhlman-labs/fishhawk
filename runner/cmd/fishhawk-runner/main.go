@@ -162,6 +162,138 @@ func parseSemver(v string) []int {
 	return result
 }
 
+// agentVersionTokenRe extracts the first 1-to-3-part dotted numeric token
+// from a free-form agent CLI version string. "2.1.5 (Claude Code)" -> "2.1.5";
+// "codex 0.30" -> "0.30"; "unknown" -> "" (no token, uncomparable).
+var agentVersionTokenRe = regexp.MustCompile(`[0-9]+(?:\.[0-9]+){0,2}`)
+
+// agentVersionComparator is one parsed term of an agent_version range: an
+// operator and its 3-slot version.
+type agentVersionComparator struct {
+	op  string
+	ver [3]int
+}
+
+// satisfiedBy reports whether ver satisfies this comparator.
+func (c agentVersionComparator) satisfiedBy(ver [3]int) bool {
+	cmp := compareVersionTriples(ver, c.ver)
+	switch c.op {
+	case ">":
+		return cmp > 0
+	case ">=":
+		return cmp >= 0
+	case "<":
+		return cmp < 0
+	case "<=":
+		return cmp <= 0
+	case "=", "==":
+		return cmp == 0
+	default:
+		return false
+	}
+}
+
+// agentVersionOps is the closed comparator-operator set, longest-first so the
+// two-character operators match before their single-character prefixes.
+var agentVersionOps = []string{">=", "<=", "==", ">", "<", "="}
+
+// parseAgentVersionComparators parses an agent_version range (a space-separated
+// AND list of comparators, e.g. ">=2.1 <2.2") into its comparator list,
+// returning ok=false on an empty or malformed range so the caller degrades to
+// a warn-and-proceed rather than blocking on a backend authoring bug.
+func parseAgentVersionComparators(rng string) ([]agentVersionComparator, bool) {
+	fields := strings.Fields(rng)
+	if len(fields) == 0 {
+		return nil, false
+	}
+	comps := make([]agentVersionComparator, 0, len(fields))
+	for _, tok := range fields {
+		op := ""
+		for _, cand := range agentVersionOps {
+			if strings.HasPrefix(tok, cand) {
+				op = cand
+				break
+			}
+		}
+		if op == "" {
+			return nil, false
+		}
+		ver, ok := parseVersionTriple(strings.TrimPrefix(tok, op))
+		if !ok {
+			return nil, false
+		}
+		comps = append(comps, agentVersionComparator{op: op, ver: ver})
+	}
+	return comps, true
+}
+
+// parseVersionTriple parses a 1-to-3-part dotted numeric version into a 3-slot
+// array, zero-padding missing components ("2.1" -> {2,1,0}). Returns ok=false
+// on an empty string, more than three parts, or a non-numeric part.
+func parseVersionTriple(v string) ([3]int, bool) {
+	var out [3]int
+	if v == "" {
+		return out, false
+	}
+	parts := strings.Split(v, ".")
+	if len(parts) > 3 {
+		return out, false
+	}
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 {
+			return out, false
+		}
+		out[i] = n
+	}
+	return out, true
+}
+
+// compareVersionTriples returns -1, 0, or 1 as a is less than, equal to, or
+// greater than b, comparing the three components in order.
+func compareVersionTriples(a, b [3]int) int {
+	for i := 0; i < 3; i++ {
+		if a[i] < b[i] {
+			return -1
+		}
+		if a[i] > b[i] {
+			return 1
+		}
+	}
+	return 0
+}
+
+// matchAgentVersionRange evaluates a probed agent CLI version against the
+// spec-declared agent_version compatibility range (#1743). It returns
+// (matched, comparable):
+//
+//   - comparable is false when no semver token can be extracted from probed
+//     (the #1769 "unknown" sentinel, or any version with no dotted-number
+//     token) OR the range itself is malformed — the caller degrades to a
+//     warn-and-proceed, mirroring semverLT's "dev" degrade.
+//   - matched is true when the extracted probed version satisfies EVERY
+//     comparator in the range (only meaningful when comparable is true).
+//
+// This duplicates spec.MatchAgentVersionRange: the runner is a separate Go
+// module and cannot import backend/internal/spec, exactly as it carries its
+// own semverLT/parseSemver rather than the backend's version package.
+func matchAgentVersionRange(rng, probed string) (matched, comparable bool) {
+	comps, ok := parseAgentVersionComparators(rng)
+	if !ok {
+		return false, false
+	}
+	ver, ok := parseVersionTriple(agentVersionTokenRe.FindString(probed))
+	if !ok {
+		return false, false
+	}
+	for _, c := range comps {
+		if !c.satisfiedBy(ver) {
+			return false, true
+		}
+	}
+	return true, true
+}
+
 // runSliceIndex holds the decomposed child's 0-based sub_plan position
 // (E24.1 / #1141 / ADR-041), set at runtime from the fetched prompt's
 // slice_index. It names the per-child sole-writer slice branch
@@ -403,7 +535,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -417,6 +549,28 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				`{"event":"version_skew_detected","runner_version":%q,"min_required":%q}`+"\n",
 				runnerVersion(), minRunnerVersion)
 			return exitVersionSkew
+		}
+		// Executor agent-version compatibility check (E32.13 / #1743): when the
+		// stage's executor declares an agent_version range and the resolved
+		// coding-agent CLI version (the #1769-probed cfg.agentVersion) falls
+		// OUTSIDE it, fail the stage LOUDLY pre-spawn (category C) — turning an
+		// opaque mid-run CLI-drift break (the 2026-07-08 claude CLI auto-update,
+		// #1741) into a one-line diagnosis. An unprobeable/unknown version (no
+		// extractable semver token) or a malformed range degrades to a warn and
+		// proceeds, mirroring semverLT's "dev" degrade. Absent range = no check.
+		if agentVersionRange != "" {
+			matched, comparable := matchAgentVersionRange(agentVersionRange, cfg.agentVersion)
+			switch {
+			case !comparable:
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"agent_version_uncomparable","range":%q,"resolved":%q}`+"\n",
+					agentVersionRange, cfg.agentVersion)
+			case !matched:
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"agent_version_mismatch","category":"C","range":%q,"resolved":%q}`+"\n",
+					agentVersionRange, cfg.agentVersion)
+				return exitFailure
+			}
 		}
 		cfg.promptFile = path
 		cfg.decomposedFromRunID = decomposedFromRunID
@@ -2362,13 +2516,13 @@ func reissueSigningKeyForTerminalUpload(ctx context.Context, client uploadClient
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fetchErr
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -2376,20 +2530,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, 0, "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, nil
 }
 
 func logStartup(w io.Writer, cfg config) {

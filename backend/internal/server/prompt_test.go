@@ -7252,3 +7252,107 @@ func TestGetStagePromptRender_Acceptance_ServesEgressHostsAndCriteriaIDs(t *test
 		t.Errorf("AcceptanceCriteriaIDs = %v, want %v", resp.AcceptanceCriteriaIDs, want)
 	}
 }
+
+// TestGetStagePrompt_CarriesAgentVersionRange is the cross-boundary seam test
+// (E32.13 / #1743): a spec executor.agent_version range is carried on the
+// stage prompt response under the byte-identical `agent_version_range` json
+// tag the runner decoder reads, on both the signed /prompt and the SPA
+// /prompt-render endpoints. The runner main_test drives the fetch->enforce
+// half; this asserts the serialize half so a JSON-tag/threading drift is
+// caught (separate Go modules).
+func TestGetStagePrompt_CarriesAgentVersionRange(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	rr.runRow = &run.Run{
+		ID:            runID,
+		Repo:          "kuhlman-labs/example",
+		WorkflowID:    "feature_change",
+		TriggerSource: "manual",
+		WorkflowSpec: []byte("version: \"1.4\"\n" +
+			"workflows:\n" +
+			"  feature_change:\n" +
+			"    stages:\n" +
+			"      - id: plan\n" +
+			"        type: plan\n" +
+			"        executor:\n" +
+			"          agent: claude-code\n" +
+			"          agent_version: \">=2.1 <2.2\"\n"),
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.AgentVersionRange != ">=2.1 <2.2" {
+		t.Fatalf("AgentVersionRange = %q, want %q", resp.AgentVersionRange, ">=2.1 <2.2")
+	}
+	// Pin the wire tag byte-identical to the runner decoder. Go's json.Marshal
+	// HTML-escapes > and < to > / <, so match the escaped form.
+	if !contains(w.Body.String(), `"agent_version_range":"\u003e=2.1 \u003c2.2"`) {
+		t.Fatalf("response missing the agent_version_range json tag:\n%s", w.Body.String())
+	}
+
+	// The SPA-readable render path carries the same resolution.
+	rreq := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	rw := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rw, rreq)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("render status = %d, want 200:\n%s", rw.Code, rw.Body.String())
+	}
+	var rendered promptResponse
+	if err := json.Unmarshal(rw.Body.Bytes(), &rendered); err != nil {
+		t.Fatalf("decode render: %v", err)
+	}
+	if rendered.AgentVersionRange != ">=2.1 <2.2" {
+		t.Fatalf("render AgentVersionRange = %q, want %q", rendered.AgentVersionRange, ">=2.1 <2.2")
+	}
+}
+
+// TestGetStagePrompt_AgentVersionRangeOmittedWhenAbsent asserts the
+// byte-identical back-compat path (#1743): with no spec executor.agent_version,
+// the resolved range is empty and the agent_version_range key is OMITTED.
+func TestGetStagePrompt_AgentVersionRangeOmittedWhenAbsent(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	rr.runRow = &run.Run{
+		ID:            runID,
+		Repo:          "kuhlman-labs/example",
+		WorkflowID:    "feature_change",
+		TriggerSource: "manual",
+		WorkflowSpec: []byte("version: \"1.4\"\n" +
+			"workflows:\n" +
+			"  feature_change:\n" +
+			"    stages:\n" +
+			"      - id: plan\n" +
+			"        type: plan\n" +
+			"        executor:\n" +
+			"          agent: claude-code\n"),
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.AgentVersionRange != "" {
+		t.Fatalf("AgentVersionRange = %q, want empty", resp.AgentVersionRange)
+	}
+	if contains(w.Body.String(), "agent_version_range") {
+		t.Fatalf("agent_version_range key must be omitted when absent:\n%s", w.Body.String())
+	}
+}
