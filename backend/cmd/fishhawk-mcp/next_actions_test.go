@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 )
 
 // --- fixture helpers -------------------------------------------------------
@@ -1621,5 +1623,45 @@ func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 		if isAcceptancePagedDisposition(d) {
 			t.Errorf("isAcceptancePagedDisposition(%q) = true, want false", d)
 		}
+	}
+}
+
+// TestAcceptanceStateStringsMatchDrive pins the E31.17 / #1568 cross-surface
+// agreement: the MCP next_actions.state strings for the acceptance arm MUST
+// equal the backend drive.Rule* presentation-status strings so the drive path
+// and the MCP classifier can never disagree on the acceptance gate. The two
+// scalar states (pending / settled-outcome-unknown) match byte-for-byte; the
+// failed arm's two states (paged / rerouting) share the drive triage rule as a
+// PREFIX. Asserted against the classifier's actual output (not a hand-copied
+// literal) so a rename of either surface trips this test.
+func TestAcceptanceStateStringsMatchDrive(t *testing.T) {
+	run := naRun("running")
+	acc := func(state string) *Stage { s := naStage("acceptance", state); return &s }
+
+	// pending: a non-terminal, non-running acceptance stage.
+	if got := acceptanceStageNextActions(run, acc("pending"), "", "").State; got != string(drive.RuleAcceptancePending) {
+		t.Errorf("pending state = %q, want %q (drive.RuleAcceptancePending)", got, drive.RuleAcceptancePending)
+	}
+	// settled-outcome-unknown: a terminal acceptance stage with no verdict.
+	if got := acceptanceStageNextActions(run, acc("succeeded"), "", "").State; got != string(drive.RuleAcceptanceOutcomeUnknown) {
+		t.Errorf("outcome-unknown state = %q, want %q (drive.RuleAcceptanceOutcomeUnknown)", got, drive.RuleAcceptanceOutcomeUnknown)
+	}
+	// failed arm: paged + rerouting states both carry the drive triage prefix.
+	paged := acceptanceStageNextActions(run, acc("succeeded"), acceptanceVerdictFailed, acceptanceDispositionPaged).State
+	rerouting := acceptanceStageNextActions(run, acc("succeeded"), acceptanceVerdictFailed, acceptanceDispositionFixupDispatched).State
+	for _, st := range []string{paged, rerouting} {
+		if !strings.HasPrefix(st, string(drive.RuleAcceptanceTriage)) {
+			t.Errorf("failed-arm state %q does not carry the drive triage prefix %q", st, drive.RuleAcceptanceTriage)
+		}
+	}
+
+	// Lock the exact drive-rule literals too, so a coordinated rename that keeps
+	// the two surfaces internally consistent but drifts from the documented
+	// strings still trips here.
+	if drive.RuleAcceptancePending != "acceptance_pending" ||
+		drive.RuleAcceptanceOutcomeUnknown != "acceptance_settled_outcome_unknown" ||
+		drive.RuleAcceptanceTriage != "acceptance_triage" {
+		t.Errorf("drive acceptance rule literals drifted: pending=%q unknown=%q triage=%q",
+			drive.RuleAcceptancePending, drive.RuleAcceptanceOutcomeUnknown, drive.RuleAcceptanceTriage)
 	}
 }

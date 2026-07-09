@@ -366,6 +366,160 @@ func TestAutoDriveRunGate_Merge(t *testing.T) {
 	}
 }
 
+// --- (d') acceptance gate on may_merge (E31.17 / #1568) ---------------------
+
+// autoDriveAcceptanceSpecYAML declares an acceptance stage alongside the
+// may_merge delegation, so the acceptance gate at the AutoDriveRunGate merge
+// call site is exercisable. version 1.1 (workflow-v1) supports both the
+// operator_agent block and the acceptance stage type.
+const autoDriveAcceptanceSpecYAML = `version: "1.1"
+workflows:
+  feature_change:
+    operator_agent:
+      may_merge: gates_resolved_ci_green
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+`
+
+// seedAcceptanceMergeRun constructs an acceptance-declaring run whose delegation
+// may_merge condition IS met (latest drive entry is checks_green_awaiting_merge,
+// PR open, all approval gates resolved, no open concerns) — so the ONLY thing
+// that can still block the merge is the call-site acceptance gate. The acceptance
+// stage is materialized in accState; when verdict != "" an acceptance_outcome_recorded
+// entry is seeded.
+func seedAcceptanceMergeRun(t *testing.T, repo *autoDriveRepo, au *auditFake, accState run.StageState, verdict string) *run.Run {
+	t.Helper()
+	runID := uuid.New()
+	pr := "https://github.com/x/y/pull/7"
+	runRow := &run.Run{
+		ID:             runID,
+		State:          run.StateRunning,
+		WorkflowID:     "feature_change",
+		WorkflowSpec:   []byte(autoDriveAcceptanceSpecYAML),
+		PullRequestURL: &pr,
+	}
+	repo.mu.Lock()
+	repo.runs[runID] = runRow
+	repo.stagesByRun[runID] = []*run.Stage{
+		{ID: uuid.New(), RunID: runID, Sequence: 0, Type: run.StageTypePlan, State: run.StageStateSucceeded},
+		{ID: uuid.New(), RunID: runID, Sequence: 1, Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+		{ID: uuid.New(), RunID: runID, Sequence: 2, Type: run.StageTypeAcceptance, State: accState},
+	}
+	repo.mu.Unlock()
+	// Latest drive auto-advance is checks_green_awaiting_merge → may_merge Met.
+	seedReviewEntry(t, au, runID, 5, drive.Category, drive.Advance{Rule: drive.RuleChecksGreenAwaitingMerge})
+	if verdict != "" {
+		seedAcceptanceOutcome(au, runID, 6, verdict)
+	}
+	return runRow
+}
+
+// TestAutoDriveRunGate_Merge_AcceptancePending_ObserveOnly pins that the
+// call-site acceptance gate blocks the merge while the acceptance stage is
+// pending: the delegation may_merge is Met, but the merger is NOT called.
+func TestAutoDriveRunGate_Merge_AcceptancePending_ObserveOnly(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runRow := seedAcceptanceMergeRun(t, repo, au, run.StageStateRunning, "") // non-terminal, no verdict
+
+	merger := &fakeMerger{}
+	out, err := s.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), merger, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Acted {
+		t.Errorf("outcome = %+v, want observe-only (acceptance pending blocks the merge)", out)
+	}
+	if merger.called != 0 {
+		t.Errorf("merger called %d times, want 0 — the acceptance gate must block the merge", merger.called)
+	}
+}
+
+// TestAutoDriveRunGate_Merge_AcceptanceOutcomeUnknown_ObserveOnly pins the
+// settled-outcome-unknown block: terminal acceptance stage, no verdict → no merge.
+func TestAutoDriveRunGate_Merge_AcceptanceOutcomeUnknown_ObserveOnly(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runRow := seedAcceptanceMergeRun(t, repo, au, run.StageStateSucceeded, "") // terminal, no verdict
+
+	merger := &fakeMerger{}
+	out, err := s.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), merger, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Acted || merger.called != 0 {
+		t.Errorf("outcome=%+v merger.called=%d, want observe-only + 0 merges (outcome unknown blocks)", out, merger.called)
+	}
+}
+
+// TestAutoDriveRunGate_Merge_AcceptanceFailed_ObserveOnly pins the failed-verdict
+// block: a failed acceptance verdict → no merge.
+func TestAutoDriveRunGate_Merge_AcceptanceFailed_ObserveOnly(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runRow := seedAcceptanceMergeRun(t, repo, au, run.StageStateSucceeded, acceptanceVerdictFailed)
+
+	merger := &fakeMerger{}
+	out, err := s.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), merger, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Acted || merger.called != 0 {
+		t.Errorf("outcome=%+v merger.called=%d, want observe-only + 0 merges (failed verdict blocks)", out, merger.called)
+	}
+}
+
+// TestAutoDriveRunGate_Merge_AcceptancePassed_Merges pins the positive path:
+// a passed acceptance verdict lets the auto-driver enable the merge.
+func TestAutoDriveRunGate_Merge_AcceptancePassed_Merges(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runRow := seedAcceptanceMergeRun(t, repo, au, run.StageStateSucceeded, acceptanceVerdictPassed)
+
+	merger := &fakeMerger{}
+	out, err := s.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), merger, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionMerge {
+		t.Fatalf("outcome = %+v, want acted merge on a passed acceptance", out)
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1 — a passed acceptance must not block the merge", merger.called)
+	}
+}
+
+// TestAutoDriveRunGate_Merge_AcceptanceReadError_ObserveOnly pins the
+// fail-closed posture: an acceptance/audit read error never merges (the
+// acceptanceGateState error and the evaluator error both resolve to
+// observe-only; neither yields a merge).
+func TestAutoDriveRunGate_Merge_AcceptanceReadError_ObserveOnly(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runRow := seedAcceptanceMergeRun(t, repo, au, run.StageStateSucceeded, acceptanceVerdictPassed)
+	au.listByCategoryErr = errors.New("audit boom")
+
+	merger := &fakeMerger{}
+	out, err := s.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), merger, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Acted || merger.called != 0 {
+		t.Errorf("outcome=%+v merger.called=%d, want observe-only + 0 merges on a read error (fail-closed)", out, merger.called)
+	}
+}
+
 // --- (e) must_page_human reviewer_reject -> NO action, page -----------------
 
 func TestAutoDriveRunGate_Page_ReviewerReject(t *testing.T) {

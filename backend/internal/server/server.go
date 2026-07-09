@@ -826,6 +826,81 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 		}
 		return
 	}
+	// Acceptance-gate consultation (E31.17 / #1568). On a run whose workflow
+	// declares an acceptance stage the merge is gated on the acceptance_passed
+	// evidence condition (ADR-049 decision #6) — awaiting_merge must NOT fire
+	// while acceptance is pending, settled-outcome-unknown, or failed. The
+	// single acceptanceGateState classifier (shared with AutoDriveRunGate)
+	// decides. FAIL-CLOSED (binding approval condition 1): a ListStagesForRun
+	// or acceptance-outcome audit read error must NOT fall through to
+	// checks_green_awaiting_merge / merge_pr — the observer skips advancing
+	// (leaving the prior drive state) and logs, so the next tick retries.
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, stage.RunID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"drive: list stages for acceptance gate failed; skipping advance (fail-closed)",
+			slog.String("run_id", stage.RunID.String()), slog.String("error", err.Error()))
+		return
+	}
+	gateState, gerr := s.acceptanceGateState(ctx, runRow, stages)
+	if gerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"drive: acceptance gate read failed; skipping advance (fail-closed)",
+			slog.String("run_id", stage.RunID.String()), slog.String("error", gerr.Error()))
+		return
+	}
+	switch gateState {
+	case acceptanceGatePending:
+		if !s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleAcceptancePending) {
+			s.drive.Record(ctx, stage.RunID, &stage.ID, drive.Advance{
+				Rule:  drive.RuleAcceptancePending,
+				From:  "review:awaiting_approval",
+				To:    "acceptance_pending",
+				Event: "review evidence terminal and required PR checks green; acceptance stage has not settled a verdict",
+				NextAction: &drive.NextAction{
+					Action: "await_acceptance",
+					Detail: "required checks are green but the acceptance stage has not settled; dispatch/await the acceptance stage before merging (ADR-049 decision #6)",
+					PRURL:  prURL,
+				},
+			})
+		}
+		return
+	case acceptanceGateOutcomeUnknown:
+		if !s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleAcceptanceOutcomeUnknown) {
+			s.drive.Record(ctx, stage.RunID, &stage.ID, drive.Advance{
+				Rule:  drive.RuleAcceptanceOutcomeUnknown,
+				From:  "review:awaiting_approval",
+				To:    "acceptance_settled_outcome_unknown",
+				Event: "review evidence terminal and required PR checks green; acceptance stage settled with no recorded verdict",
+				NextAction: &drive.NextAction{
+					Action: "read_acceptance_audit",
+					Detail: "the acceptance stage settled but no acceptance_outcome_recorded verdict is visible; read the audit trail (fail toward read, not toward merge)",
+					PRURL:  prURL,
+				},
+			})
+		}
+		return
+	case acceptanceGateTriage:
+		if !s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleAcceptanceTriage) {
+			s.drive.Record(ctx, stage.RunID, &stage.ID, drive.Advance{
+				Rule:  drive.RuleAcceptanceTriage,
+				From:  "review:awaiting_approval",
+				To:    "acceptance_triage",
+				Event: "review evidence terminal and required PR checks green; newest acceptance verdict failed",
+				NextAction: &drive.NextAction{
+					Action: "read_acceptance_triage",
+					Detail: "the acceptance verdict failed; read the acceptance_triage_decided disposition and arbitrate before merging",
+					PRURL:  prURL,
+				},
+			})
+		}
+		return
+	default:
+		// acceptanceGatePassed / acceptanceGateNotDeclared: the merge is not
+		// (or no longer) acceptance-gated — fall through to awaiting_merge. The
+		// latest-entry supersession in applyDriveSurfaces upgrades a prior
+		// acceptance_pending stamp to awaiting_merge once acceptance passes.
+	}
 	if s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleChecksGreenAwaitingMerge) {
 		return
 	}

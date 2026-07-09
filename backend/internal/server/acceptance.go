@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -845,6 +846,121 @@ func (s *Server) acceptanceStageHasVerdict(ctx context.Context, runID, stageID u
 		}
 	}
 	return false, nil
+}
+
+// Acceptance drive-gate state values (E31.17 / #1568). The single source of
+// truth acceptanceGateState returns, consumed by BOTH drive surfaces
+// (ObserveParkedReviewForDrive's presentation status and AutoDriveRunGate's
+// real merge). The pending / outcome-unknown / triage strings are pinned to the
+// drive.Rule* constants (string conversions of constants are constant
+// expressions) so the drive presentation status, the audit-rule name, and the
+// MCP next_actions.state string cannot diverge. acceptanceGatePassed mirrors the
+// MCP "acceptance_passed" state; the empty acceptanceGateNotDeclared marks a
+// workflow with no acceptance stage (the merge is never acceptance-gated).
+const (
+	acceptanceGateNotDeclared    = ""
+	acceptanceGatePending        = string(drive.RuleAcceptancePending)
+	acceptanceGateOutcomeUnknown = string(drive.RuleAcceptanceOutcomeUnknown)
+	acceptanceGateTriage         = string(drive.RuleAcceptanceTriage)
+	acceptanceGatePassed         = "acceptance_passed"
+)
+
+// latestAcceptanceVerdict returns the verdict on the newest (highest-Sequence)
+// acceptance_outcome_recorded audit entry for the run, whether ANY such entry
+// exists (recorded), and a read error. recorded=false with a nil error means
+// the acceptance stage has shipped no verdict yet. A recorded entry whose
+// payload cannot be decoded is reported as (verdict="", recorded=true, nil) so
+// the caller treats it as a settled-outcome-unknown hole, never a pass. The
+// audit read error is PROPAGATED (never swallowed) so acceptanceGateState can
+// fail closed — the binding condition forbids resolving an unreadable
+// acceptance outcome to passed/merge.
+func (s *Server) latestAcceptanceVerdict(ctx context.Context, runID uuid.UUID) (verdict string, recorded bool, err error) {
+	if s.cfg.AuditRepo == nil {
+		return "", false, nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryAcceptanceOutcomeRecorded)
+	if err != nil {
+		return "", false, err
+	}
+	var latest *audit.Entry
+	for _, e := range entries {
+		if latest == nil || e.Sequence > latest.Sequence {
+			latest = e
+		}
+	}
+	if latest == nil {
+		return "", false, nil
+	}
+	var p struct {
+		Verdict string `json:"verdict"`
+	}
+	if uerr := json.Unmarshal(latest.Payload, &p); uerr != nil {
+		// A malformed outcome payload is a recorded-but-unreadable verdict:
+		// treat it as an outcome-unknown hole (recorded, empty verdict), never
+		// a pass.
+		return "", true, nil
+	}
+	return p.Verdict, true, nil
+}
+
+// acceptanceGateState is the single server-side acceptance-gate classifier
+// (E31.17 / #1568) that both drive surfaces consult before advancing to merge.
+// It mirrors the MCP next_actions classifier (acceptanceStageNextActions) so
+// the backend drive path and the MCP presentation surface agree on when the
+// acceptance stage blocks the merge (ADR-049 decision #6: the merge is gated on
+// the acceptance_passed evidence condition).
+//
+// Returns, for a run whose workflow declares an acceptance stage:
+//   - acceptanceGatePassed        — newest recorded verdict is passed (merge OK).
+//   - acceptanceGateTriage        — newest recorded verdict is failed.
+//   - acceptanceGateOutcomeUnknown— no readable verdict AND the acceptance stage
+//     is terminal (settled-outcome-unknown hole).
+//   - acceptanceGatePending       — no verdict yet and the acceptance stage is
+//     non-terminal or not yet materialized.
+//
+// For a workflow with no acceptance stage it returns acceptanceGateNotDeclared
+// ("") — the merge is never acceptance-gated. FAIL-CLOSED (binding condition):
+// an acceptance-outcome audit read error is PROPAGATED, never resolved to
+// passed — so a caller that cannot read the outcome skips advancing rather than
+// merging on unknown evidence.
+func (s *Server) acceptanceGateState(ctx context.Context, runRow *run.Run, stages []*run.Stage) (string, error) {
+	// Off-switch: a workflow that declares no acceptance stage never gates the
+	// merge (mirrors resolveAcceptanceStage's stage-conditional posture).
+	if _, ok := s.resolveAcceptanceStageSpec(ctx, runRow); !ok {
+		return acceptanceGateNotDeclared, nil
+	}
+	verdict, recorded, err := s.latestAcceptanceVerdict(ctx, runRow.ID)
+	if err != nil {
+		return "", err
+	}
+	if recorded {
+		switch verdict {
+		case acceptanceVerdictPassed:
+			return acceptanceGatePassed, nil
+		case acceptanceVerdictFailed:
+			return acceptanceGateTriage, nil
+		}
+		// Recorded but unreadable/empty verdict falls through to the
+		// stage-terminality distinction below (outcome unknown vs pending).
+	}
+	// No settled verdict. Distinguish a terminal acceptance stage (it settled
+	// but no verdict is visible → outcome unknown) from a non-terminal or
+	// not-yet-materialized stage (still pending).
+	if acc := acceptanceStageOf(stages); acc != nil && acc.State.IsTerminal() {
+		return acceptanceGateOutcomeUnknown, nil
+	}
+	return acceptanceGatePending, nil
+}
+
+// acceptanceStageOf returns the run's acceptance stage from the supplied slice,
+// or nil when the workflow declares one but it has not been materialized yet.
+func acceptanceStageOf(stages []*run.Stage) *run.Stage {
+	for _, st := range stages {
+		if st.Type == run.StageTypeAcceptance {
+			return st
+		}
+	}
+	return nil
 }
 
 // acceptanceValidatedHeadSHA resolves the head the acceptance stage actually

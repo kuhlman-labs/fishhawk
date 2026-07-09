@@ -1445,6 +1445,21 @@ func applyDriveSurfaces(resp *runResponse, runRow *run.Run, entries []*audit.Ent
 	if latest.Rule == drive.RuleCIFailed && runRow.PullRequestURL != nil {
 		resp.DerivedStatus = "ci_failed"
 	}
+	// Acceptance-gate presentation statuses (E31.17 / #1568): when the latest
+	// stamp is an acceptance-gate rule and the PR is open, the derived status
+	// is the rule name itself — acceptance_pending / acceptance_settled_outcome_unknown
+	// / acceptance_triage. next_action already carried through generically
+	// above (await_acceptance / read_acceptance_audit / read_acceptance_triage).
+	// Keying off the LATEST entry means a later checks_green_awaiting_merge
+	// stamp (acceptance passed) supersedes these to awaiting_merge.
+	if runRow.PullRequestURL != nil {
+		switch latest.Rule {
+		case drive.RuleAcceptancePending,
+			drive.RuleAcceptanceOutcomeUnknown,
+			drive.RuleAcceptanceTriage:
+			resp.DerivedStatus = string(latest.Rule)
+		}
+	}
 }
 
 // buildRunConcernsPayload renders the open-concern summary for the

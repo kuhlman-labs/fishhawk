@@ -58,12 +58,27 @@ func TestMechanical_RuleTable(t *testing.T) {
 		RuleFixupRereviewRepark,
 		RuleChecksGreenAwaitingMerge,
 		RuleCIFailed,
+		RuleAcceptancePending,
+		RuleAcceptanceOutcomeUnknown,
+		RuleAcceptanceTriage,
 		RuleDeployInitialization,
 		RuleChildrenDispatch,
 	} {
 		if !Mechanical(rule) {
 			t.Errorf("Mechanical(%q) = false, want true", rule)
 		}
+	}
+	// The acceptance-gate rules (E31.17 / #1568) must byte-match the MCP
+	// next_actions.state strings so the two surfaces cannot diverge; the failed
+	// arm is the shared PREFIX of the MCP paged/rerouting states.
+	if RuleAcceptancePending != "acceptance_pending" {
+		t.Errorf("RuleAcceptancePending = %q, want acceptance_pending", RuleAcceptancePending)
+	}
+	if RuleAcceptanceOutcomeUnknown != "acceptance_settled_outcome_unknown" {
+		t.Errorf("RuleAcceptanceOutcomeUnknown = %q, want acceptance_settled_outcome_unknown", RuleAcceptanceOutcomeUnknown)
+	}
+	if RuleAcceptanceTriage != "acceptance_triage" {
+		t.Errorf("RuleAcceptanceTriage = %q, want acceptance_triage", RuleAcceptanceTriage)
 	}
 	for _, rule := range []Rule{
 		RuleGateApproval,
