@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -2616,18 +2617,27 @@ func TestAdvance_AcceptanceSkippedOutOfScope(t *testing.T) {
 		}
 	})
 
-	t.Run("no out_of_scope -> still dispatches", func(t *testing.T) {
-		planBytes := acceptanceSkipPlanBytes(t, nil, nil)
+	// Control: a drivable blocking criterion with NO out_of_scope is neither
+	// E38.3-skippable (out_of_scope==0) NOR #1728 short-circuitable
+	// (acceptance_criteria>0) — it still dispatches to the operator/agent path.
+	// (Was "no out_of_scope -> still dispatches" with an empty plan; that empty
+	// plan now SHORT-CIRCUITS under #1728, asserted separately.)
+	t.Run("drivable blocking criterion, no out_of_scope -> still dispatches", func(t *testing.T) {
+		planBytes := acceptanceSkipPlanBytes(t, nil,
+			[]map[string]any{{"id": "ac-1", "statement": "POST returns 201", "source": "explicit", "source_ref": "#1", "blocking": true}})
 		r, stages, _, ra, o := seedAcceptanceSkipRun(t, planBytes)
 
 		if _, err := o.Advance(context.Background(), r.ID); err != nil {
 			t.Fatalf("Advance: %v", err)
 		}
 		if stages[3].State != run.StageStateDispatched {
-			t.Errorf("acceptance stage state = %q, want dispatched (no out_of_scope -> not skippable)", stages[3].State)
+			t.Errorf("acceptance stage state = %q, want dispatched (criteria present, no out_of_scope -> neither skip fires)", stages[3].State)
 		}
 		if n := countAcceptanceCategory(ra, "acceptance_skipped_out_of_scope"); n != 0 {
-			t.Errorf("acceptance_skipped_out_of_scope entries = %d, want 0 with no out_of_scope", n)
+			t.Errorf("acceptance_skipped_out_of_scope entries = %d, want 0", n)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_outcome_recorded"); n != 0 {
+			t.Errorf("acceptance_outcome_recorded entries = %d, want 0 at dispatch (no short-circuit)", n)
 		}
 		if n := countAcceptanceCategory(ra, "acceptance_dispatched"); n != 1 {
 			t.Errorf("acceptance_dispatched entries = %d, want 1", n)
@@ -2665,6 +2675,80 @@ func TestAdvance_AcceptanceSkippedOutOfScope(t *testing.T) {
 		}
 		if out != OutcomeRunCompleted || stages[3].State != run.StageStateSucceeded || r.State != run.StateSucceeded {
 			t.Errorf("nil-audit skip: out=%q acceptance=%q run=%q, want run_completed/succeeded/succeeded", out, stages[3].State, r.State)
+		}
+	})
+}
+
+// TestAdvance_AcceptanceShortCircuitEmptyCriteria pins the #1728 (E41.5)
+// pre-spawn short-circuit: when the approved plan declares ZERO
+// acceptance_criteria AND ZERO out_of_scope, Advance walks the acceptance stage
+// straight to succeeded (NOT dispatched), records exactly one
+// acceptance_outcome_recorded verdict=passed carrying basis=empty-criteria (and
+// NO acceptance_dispatched, NO acceptance_skipped_out_of_scope marker), and
+// drives the run to succeeded in the same call. The nil-Audit subtest pins the
+// best-effort emit: the walk still completes the run without an appended entry.
+func TestAdvance_AcceptanceShortCircuitEmptyCriteria(t *testing.T) {
+	t.Run("zero criteria + zero out_of_scope -> short-circuit records verdict", func(t *testing.T) {
+		planBytes := acceptanceSkipPlanBytes(t, nil, nil)
+		r, stages, _, ra, o := seedAcceptanceSkipRun(t, planBytes)
+
+		out, err := o.Advance(context.Background(), r.ID)
+		if err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+		if out != OutcomeRunCompleted {
+			t.Errorf("Outcome = %q, want run_completed (the short-circuit re-enters Advance to complete the run)", out)
+		}
+		if stages[3].State != run.StageStateSucceeded {
+			t.Errorf("acceptance stage state = %q, want succeeded (short-circuited, NOT dispatched)", stages[3].State)
+		}
+		if r.State != run.StateSucceeded {
+			t.Errorf("run state = %q, want succeeded", r.State)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_dispatched"); n != 0 {
+			t.Errorf("acceptance_dispatched entries = %d, want 0 on the short-circuit path", n)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_skipped_out_of_scope"); n != 0 {
+			t.Errorf("acceptance_skipped_out_of_scope entries = %d, want 0 (empty-criteria records a verdict, not a skip marker)", n)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_outcome_recorded"); n != 1 {
+			t.Fatalf("acceptance_outcome_recorded entries = %d, want 1", n)
+		}
+		var verdict audit.ChainAppendParams
+		for _, p := range ra.appended {
+			if p.Category == "acceptance_outcome_recorded" {
+				verdict = p
+			}
+		}
+		if verdict.StageID == nil || *verdict.StageID != stages[3].ID {
+			t.Errorf("verdict stage_id = %v, want the acceptance stage %s", verdict.StageID, stages[3].ID)
+		}
+		for _, want := range []string{
+			`"verdict":"passed"`,
+			`"outcome":"accepted"`,
+			`"criteria_total":0`,
+			fmt.Sprintf("%q:%q", plan.AcceptanceBasisKey, plan.AcceptanceBasisEmptyCriteria),
+		} {
+			if !strings.Contains(string(verdict.Payload), want) {
+				t.Errorf("acceptance_outcome_recorded payload missing %s: %s", want, verdict.Payload)
+			}
+		}
+	})
+
+	// Defensive branch: a nil Audit is best-effort — the short-circuit still
+	// walks the acceptance stage to succeeded and completes the run (the emit
+	// WARN-logs and never unwinds), mirroring the E38.3 nil-Audit posture.
+	t.Run("nil audit -> still short-circuits", func(t *testing.T) {
+		planBytes := acceptanceSkipPlanBytes(t, nil, nil)
+		r, stages, _, _, o := seedAcceptanceSkipRun(t, planBytes)
+		o.Audit = nil
+
+		out, err := o.Advance(context.Background(), r.ID)
+		if err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+		if out != OutcomeRunCompleted || stages[3].State != run.StageStateSucceeded || r.State != run.StateSucceeded {
+			t.Errorf("nil-audit short-circuit: out=%q acceptance=%q run=%q, want run_completed/succeeded/succeeded", out, stages[3].State, r.State)
 		}
 	})
 }

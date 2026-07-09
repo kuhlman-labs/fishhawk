@@ -121,3 +121,46 @@ func CriterionBlocking(c AcceptanceCriterion) bool {
 func AcceptanceSkippableOutOfScope(v Verification) bool {
 	return len(v.OutOfScope) > 0 && len(v.AcceptanceCriteria) == 0
 }
+
+// Acceptance short-circuit audit-payload contract (#1728). The orchestrator's
+// pre-spawn acceptance short-circuit records an acceptance_outcome_recorded
+// entry whose payload carries a `basis` field naming WHY the verdict was
+// recorded without a runner spawn; auditcomplete reads the SAME field to exempt
+// the no-trace short-circuited stage from the trace-required rule. Defining the
+// key and its sole legal value ONCE here — the plan package is imported by both
+// backend/internal/orchestrator and backend/internal/auditcomplete and imports
+// no project packages, so there is no import cycle — makes a producer/consumer
+// payload-shape drift a compile error rather than a silent runtime miss. The
+// emit helper, the auditcomplete reader, and both packages' tests all reference
+// these constants instead of free-typed strings.
+const (
+	// AcceptanceBasisKey is the acceptance_outcome_recorded payload key naming
+	// the short-circuit basis. A normally server-recorded verdict never sets
+	// it, so its presence unambiguously discriminates the pre-spawn
+	// short-circuit from an ordinary validator-shipped verdict.
+	AcceptanceBasisKey = "basis"
+	// AcceptanceBasisEmptyCriteria is the ONLY basis value auditcomplete honors
+	// for the trace exemption (#1728): an approved plan with ZERO
+	// acceptance_criteria AND ZERO verification.out_of_scope. A future
+	// "all-skip-with-basis" basis is added by #1748 when it ships; until then,
+	// any other basis value is NOT exempted.
+	AcceptanceBasisEmptyCriteria = "empty-criteria"
+)
+
+// AcceptanceSkippableEmptyCriteria reports whether a plan's verification carries
+// ZERO acceptance_criteria AND ZERO verification.out_of_scope — the sole
+// canonical #1728 condition under which the acceptance stage has no observable
+// criterion to validate AND no out_of_scope justification, so the orchestrator
+// short-circuits it straight to succeeded with a deterministic verdict=passed
+// entry (basis AcceptanceBasisEmptyCriteria) instead of spawning a runner for a
+// no-op stage.
+//
+// It is deliberately DISJOINT from AcceptanceSkippableOutOfScope, which fires
+// when out_of_scope is present with zero acceptance_criteria (the E38.3 domain):
+// that predicate requires len(OutOfScope) > 0, this one requires
+// len(OutOfScope) == 0, so at most one fires for any given plan. Together the
+// two partition the "zero acceptance_criteria" space by whether an out_of_scope
+// justification is present.
+func AcceptanceSkippableEmptyCriteria(v Verification) bool {
+	return len(v.AcceptanceCriteria) == 0 && len(v.OutOfScope) == 0
+}

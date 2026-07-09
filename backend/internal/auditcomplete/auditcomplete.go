@@ -44,6 +44,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -296,6 +297,35 @@ func Compute(ctx context.Context, runID uuid.UUID, deps Deps) (stagecheck.State,
 	skippedStageIDs := make(map[uuid.UUID]struct{}, len(skipMarkers))
 	for _, e := range skipMarkers {
 		if e.StageID != nil {
+			skippedStageIDs[*e.StageID] = struct{}{}
+		}
+	}
+
+	// #1728 (E41.5): an acceptance stage the orchestrator SHORT-CIRCUITED for a
+	// zero-acceptance_criteria / zero-out_of_scope plan records a verdict=passed
+	// acceptance_outcome_recorded entry at dispatch time and ships NO trace
+	// bundle — yet is legitimately succeeded. Exempt it from the trace-required
+	// rule the same way the E38.3 skip marker is exempted. The exemption accepts
+	// ONLY the known basis value "empty-criteria" (the shared
+	// plan.AcceptanceBasisEmptyCriteria constant): any other basis — or a normal
+	// validator-recorded verdict, which never sets basis at all — is NOT exempted
+	// and still requires its trace, so a normally-dispatched acceptance stage is
+	// unaffected. ("all-skip-with-basis" is added by #1748 when it ships.) A read
+	// failure is transient (matching the skip-marker read above): return it so
+	// the caller retries rather than silently under- or over-gating.
+	outcomeEntries, err := deps.Audit.ListForRunByCategory(ctx, runID, "acceptance_outcome_recorded")
+	if err != nil {
+		return stagecheck.StatePending, nil, fmt.Errorf("auditcomplete: acceptance outcome entries: %w", err)
+	}
+	for _, e := range outcomeEntries {
+		if e.StageID == nil {
+			continue
+		}
+		var p map[string]any
+		if json.Unmarshal(e.Payload, &p) != nil {
+			continue
+		}
+		if b, ok := p[plan.AcceptanceBasisKey].(string); ok && b == plan.AcceptanceBasisEmptyCriteria {
 			skippedStageIDs[*e.StageID] = struct{}{}
 		}
 	}
