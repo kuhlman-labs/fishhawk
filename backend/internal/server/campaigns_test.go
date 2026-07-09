@@ -2233,6 +2233,234 @@ func TestStartCampaignItemRun_ReconcileOnRead_FailedRun_Attention_E2E(t *testing
 	}
 }
 
+// seedRecoveryChild mints a run in the fake run repo carrying parent_run_id =
+// parentID (a resume/recovery child, the #216 lineage) and drives it to state.
+// It models the run fishhawk_resume_run mints when an operator recovers a
+// failed run (#1751).
+func seedRecoveryChild(t *testing.T, rrepo *fakeRepo, parentID uuid.UUID, state run.State) *run.Run {
+	t.Helper()
+	child, err := rrepo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "sha-rec",
+		TriggerSource: run.TriggerCLI,
+		ParentRunID:   &parentID,
+	})
+	if err != nil {
+		t.Fatalf("seed recovery child: %v", err)
+	}
+	if state != run.StatePending {
+		if _, err := rrepo.TransitionRun(context.Background(), child.ID, state); err != nil {
+			t.Fatalf("transition recovery child to %s: %v", state, err)
+		}
+	}
+	return child
+}
+
+// startFailedItemRun starts an item run, flips the linked run to failed, and
+// returns the campaign + the now-failed run id — the shared setup for the
+// recovery-lineage reconcile tests (#1751).
+func startFailedItemRun(t *testing.T, s *Server, rrepo *fakeRepo, crepo *fakeCampaignRepo) (*campaign.Campaign, uuid.UUID) {
+	t.Helper()
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("start status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var body startItemRunBody
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	if _, err := rrepo.TransitionRun(context.Background(), body.Run.ID, run.StateFailed); err != nil {
+		t.Fatalf("flip run failed: %v", err)
+	}
+	return c, body.Run.ID
+}
+
+// TestReconcileOnRead_FailedRun_RecoveredChildSucceeded_E2E is the headline
+// done-means of #1751: an item whose linked run failed category-B but was
+// recovered via resume_run (a succeeded recovery child) settles SUCCEEDED — not
+// failed — the campaign derives succeeded, and the item re-links to the
+// recovery child for provenance.
+func TestReconcileOnRead_FailedRun_RecoveredChildSucceeded_E2E(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, aud := newCampaignStartServer(t, crepo)
+	c, failedRunID := startFailedItemRun(t, s, rrepo, crepo)
+
+	// The operator recovered the failed run via resume_run; the recovery child
+	// succeeded and merged.
+	child := seedRecoveryChild(t, rrepo, failedRunID, run.StateSucceeded)
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if len(st.Rollup.Done) != 1 || st.Rollup.Done[0] != "issue:100" {
+		t.Errorf("rollup.Done = %v, want [issue:100] (settled off recovery child)", st.Rollup.Done)
+	}
+	if len(st.Rollup.Failed) != 0 {
+		t.Errorf("rollup.Failed = %v, want empty (recovery succeeded)", st.Rollup.Failed)
+	}
+	if st.Campaign.State != string(campaign.StateSucceeded) {
+		t.Errorf("campaign state = %q, want succeeded", st.Campaign.State)
+	}
+	if st.NextAction.Action != "complete" {
+		t.Errorf("next_action = %+v, want complete", st.NextAction)
+	}
+	// The item is re-linked to the recovery child that produced the outcome.
+	if len(st.Items) != 1 || st.Items[0].RunID == nil || *st.Items[0].RunID != child.ID {
+		t.Errorf("item run_id = %v, want re-linked to recovery child %s", st.Items[0].RunID, child.ID)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 1 {
+		t.Errorf("campaign_issue_settled count = %d, want 1", n)
+	}
+}
+
+// TestReconcileOnRead_FailedRun_RecoveryInFlight_LeavesRunning covers the
+// in-flight-descendant branch: a failed run with a still-running recovery child
+// leaves the item RUNNING (not settled), so a later read re-settles it off the
+// recovery's terminal outcome. Binding condition: the in-flight branch must not
+// settle the item.
+func TestReconcileOnRead_FailedRun_RecoveryInFlight_LeavesRunning(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, aud := newCampaignStartServer(t, crepo)
+	c, failedRunID := startFailedItemRun(t, s, rrepo, crepo)
+
+	seedRecoveryChild(t, rrepo, failedRunID, run.StateRunning) // non-terminal recovery
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if len(st.Rollup.Running) != 1 || st.Rollup.Running[0] != "issue:100" {
+		t.Errorf("rollup.Running = %v, want [issue:100] (recovery in flight)", st.Rollup.Running)
+	}
+	if len(st.Rollup.Failed) != 0 {
+		t.Errorf("rollup.Failed = %v, want empty (not settled while recovering)", st.Rollup.Failed)
+	}
+	if st.NextAction.Action != "wait" {
+		t.Errorf("next_action = %+v, want wait", st.NextAction)
+	}
+	if st.Items[0].State != string(campaign.ItemStateRunning) {
+		t.Errorf("item state = %q, want running (in-flight recovery)", st.Items[0].State)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 0 {
+		t.Errorf("campaign_issue_settled count = %d, want 0 (nothing settled)", n)
+	}
+}
+
+// TestReconcileOnRead_FailedRun_RecoveryAlsoFailed_StaysFailed is the
+// regression guard: a failed run whose newest terminal recovery descendant also
+// failed (no in-flight child) settles FAILED, exactly as today, and the
+// campaign derives failed with next_action attention.
+func TestReconcileOnRead_FailedRun_RecoveryAlsoFailed_StaysFailed(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, aud := newCampaignStartServer(t, crepo)
+	c, failedRunID := startFailedItemRun(t, s, rrepo, crepo)
+
+	child := seedRecoveryChild(t, rrepo, failedRunID, run.StateFailed)
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if len(st.Rollup.Failed) != 1 || st.Rollup.Failed[0] != "issue:100" {
+		t.Errorf("rollup.Failed = %v, want [issue:100]", st.Rollup.Failed)
+	}
+	if st.Campaign.State != string(campaign.StateFailed) {
+		t.Errorf("campaign state = %q, want failed", st.Campaign.State)
+	}
+	if st.NextAction.Action != "attention" {
+		t.Errorf("next_action = %+v, want attention", st.NextAction)
+	}
+	// Settled off — and re-linked to — the newest terminal recovery descendant.
+	if st.Items[0].RunID == nil || *st.Items[0].RunID != child.ID {
+		t.Errorf("item run_id = %v, want re-linked to newest terminal descendant %s", st.Items[0].RunID, child.ID)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 1 {
+		t.Errorf("campaign_issue_settled count = %d, want 1", n)
+	}
+}
+
+// TestReconcileOnRead_FailedRun_RecoveryListError_SettlesFailed covers the
+// best-effort ListRuns-error branch in newestTerminalRecoveryDescendant: a
+// ListRuns failure while walking recovery descendants degrades to (nil,false)
+// so the item settles off the failed run (today's behavior) and the read still
+// returns 200.
+func TestReconcileOnRead_FailedRun_RecoveryListError_SettlesFailed(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c, _ := startFailedItemRun(t, s, rrepo, crepo)
+
+	rrepo.listErr = errInjected // recovery-descendant walk errors
+
+	st := getCampaignStatusBody(t, s, c.ID) // asserts 200 internally
+	if len(st.Rollup.Failed) != 1 || st.Rollup.Failed[0] != "issue:100" {
+		t.Errorf("rollup.Failed = %v, want [issue:100] (fell back to failed settle)", st.Rollup.Failed)
+	}
+	if st.Campaign.State != string(campaign.StateFailed) {
+		t.Errorf("campaign state = %q, want failed", st.Campaign.State)
+	}
+}
+
+// TestReconcileOnRead_FailedRun_RelinkError_StillSettles covers the best-effort
+// relink branch: a succeeded recovery descendant settles the item succeeded
+// even when SetCampaignItemRun (the provenance re-link) fails — the failed link
+// write is logged, never unwinds the settle, and the read returns 200.
+func TestReconcileOnRead_FailedRun_RelinkError_StillSettles(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c, failedRunID := startFailedItemRun(t, s, rrepo, crepo)
+
+	seedRecoveryChild(t, rrepo, failedRunID, run.StateSucceeded)
+	crepo.setRunErr = errInjected // relink write fails
+
+	st := getCampaignStatusBody(t, s, c.ID) // asserts 200 internally
+	if st.Items[0].State != string(campaign.ItemStateSucceeded) {
+		t.Errorf("item state = %q, want succeeded despite relink failure", st.Items[0].State)
+	}
+	if st.Campaign.State != string(campaign.StateSucceeded) {
+		t.Errorf("campaign state = %q, want succeeded", st.Campaign.State)
+	}
+}
+
+// TestNewestTerminalRecoveryDescendant_NilRunRepo covers the defensive
+// nil-RunRepo guard (unreachable from reconcile pass 1, which is itself gated on
+// RunRepo != nil, but guarded for direct callers): it returns (nil,false).
+func TestNewestTerminalRecoveryDescendant_NilRunRepo(t *testing.T) {
+	s := New(Config{})
+	desc, inFlight := s.newestTerminalRecoveryDescendant(context.Background(), uuid.New())
+	if desc != nil || inFlight {
+		t.Errorf("nil RunRepo = (%v,%v), want (nil,false)", desc, inFlight)
+	}
+}
+
+// TestNewestTerminalRecoveryDescendant_CycleGuard proves the visited-set guard
+// terminates on a corrupt parent_run_id cycle (root ↔ child) instead of looping
+// forever, returning the terminal child.
+func TestNewestTerminalRecoveryDescendant_CycleGuard(t *testing.T) {
+	rrepo := newFakeRepo()
+	ctx := context.Background()
+	root, err := rrepo.CreateRun(ctx, run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "s", TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+	child, err := rrepo.CreateRun(ctx, run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "s", TriggerSource: run.TriggerCLI,
+		ParentRunID: &root.ID,
+	})
+	if err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	// Introduce a cycle: root also points at child as its parent.
+	root.ParentRunID = &child.ID
+	if _, err := rrepo.TransitionRun(ctx, child.ID, run.StateFailed); err != nil {
+		t.Fatalf("transition child: %v", err)
+	}
+	s := New(Config{RunRepo: rrepo})
+	desc, inFlight := s.newestTerminalRecoveryDescendant(ctx, root.ID)
+	if inFlight {
+		t.Errorf("inFlight = true, want false (child is terminal)")
+	}
+	if desc == nil || desc.ID != child.ID {
+		t.Errorf("desc = %v, want terminal child %s", desc, child.ID)
+	}
+}
+
 // TestMapRunTerminalToItemState covers all three run-terminal states map to the
 // corresponding item-terminal state, and a non-terminal state is unmapped.
 func TestMapRunTerminalToItemState(t *testing.T) {

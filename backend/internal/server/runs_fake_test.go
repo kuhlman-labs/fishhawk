@@ -86,6 +86,8 @@ func (f *fakeRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		TriggerRef:         p.TriggerRef,
 		InstallationID:     p.InstallationID,
 		IdempotencyKey:     p.IdempotencyKey,
+		ParentRunID:        p.ParentRunID,
+		DecomposedFrom:     p.DecomposedFrom,
 		RunnerKind:         runnerKind,
 		WorkflowSpec:       p.WorkflowSpec,
 		MaxRetriesSnapshot: p.MaxRetriesSnapshot,
@@ -197,6 +199,11 @@ func (f *fakeRepo) ListRuns(_ context.Context, fil run.ListRunsFilter) ([]*run.R
 		}
 		if fil.TriggerRef != nil {
 			if r.TriggerRef == nil || *r.TriggerRef != *fil.TriggerRef {
+				continue
+			}
+		}
+		if fil.ParentRunID != nil {
+			if r.ParentRunID == nil || *r.ParentRunID != *fil.ParentRunID {
 				continue
 			}
 		}
