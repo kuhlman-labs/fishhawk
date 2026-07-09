@@ -208,6 +208,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		return exitUsage
 	}
 
+	// Capture the operator-provided dispatch working_dir BEFORE the
+	// E22.X/#1137 lineage-worktree relocation below overwrites
+	// cfg.workingDir with the worktree path. The acceptance preview hook
+	// must resolve a RELATIVE FISHHAWK_ACCEPTANCE_PREVIEW_CMD against the
+	// operator's dispatch checkout (which carries the untracked .env), not
+	// the lineage worktree (also missing .env) nor the runner-inherited
+	// fishhawk-mcp cwd (#1746).
+	dispatchWorkingDir := cfg.workingDir
+
 	logStartup(logSink, cfg)
 	_, _ = fmt.Fprintf(logSink, `{"event":"coercion_registry","summary":%q}`+"\n", plan.CoercionRegistrySummary())
 
@@ -749,8 +758,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// happy path after the verdict ships (binding approval condition).
 		// The probe dials direct from the runner process, not through the
 		// egress proxy — the proxy contains the agent, not the runner.
+		// A relative FISHHAWK_ACCEPTANCE_PREVIEW_CMD must resolve against
+		// the operator's dispatch checkout (which carries .env), not the
+		// runner-inherited fishhawk-mcp cwd nor the lineage worktree
+		// (#1746). hookDir rides inside the gate config; empty falls back
+		// to the runner cwd (os/exec semantics), preserving prior behavior.
+		gcfg := previewGateConfigFromEnv()
+		gcfg.hookDir = dispatchWorkingDir
 		gateTeardown, gateFailReason, gateFailDetail := acceptanceTargetGate(
-			ctx, previewGateConfigFromEnv(), egressTargetHosts, acceptanceExpectedHeadSHA, cfg.runID, logSink)
+			ctx, gcfg, egressTargetHosts, acceptanceExpectedHeadSHA, cfg.runID, logSink)
 		if gateTeardown != nil {
 			defer gateTeardown()
 		}

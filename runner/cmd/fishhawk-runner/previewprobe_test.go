@@ -189,7 +189,7 @@ func markerPath(t *testing.T) string {
 func TestRunPreviewCommand_EnvAndSuccess(t *testing.T) {
 	marker := markerPath(t)
 	cmd := `printf '%s %s' "$FISHHAWK_PREVIEW_SHA" "$FISHHAWK_PREVIEW_TARGET_HOST" > ` + marker
-	if err := runPreviewCommand(context.Background(), cmd, testExpectedSHA, "localhost:8090", 30*time.Second); err != nil {
+	if err := runPreviewCommand(context.Background(), cmd, testExpectedSHA, "localhost:8090", "", 30*time.Second); err != nil {
 		t.Fatalf("runPreviewCommand: %v", err)
 	}
 	got, err := os.ReadFile(marker)
@@ -211,7 +211,7 @@ func TestRunPreviewCommand_StripsRunnerSecrets(t *testing.T) {
 	t.Setenv("SOME_UNLISTED_SECRET", "omitted-secret")  // dropped by default-deny
 	marker := markerPath(t)
 	cmd := `printf '%s|%s|%s' "$FISHHAWK_API_TOKEN" "$SOME_UNLISTED_SECRET" "$PATH" > ` + marker
-	if err := runPreviewCommand(context.Background(), cmd, testExpectedSHA, "h", 30*time.Second); err != nil {
+	if err := runPreviewCommand(context.Background(), cmd, testExpectedSHA, "h", "", 30*time.Second); err != nil {
 		t.Fatalf("runPreviewCommand: %v", err)
 	}
 	got, err := os.ReadFile(marker)
@@ -232,7 +232,7 @@ func TestRunPreviewCommand_StripsRunnerSecrets(t *testing.T) {
 
 // (h) non-zero exit → error carrying exit code and output tail.
 func TestRunPreviewCommand_NonZeroExit(t *testing.T) {
-	err := runPreviewCommand(context.Background(), "echo boom-tail; exit 3", testExpectedSHA, "h", 30*time.Second)
+	err := runPreviewCommand(context.Background(), "echo boom-tail; exit 3", testExpectedSHA, "h", "", 30*time.Second)
 	if err == nil {
 		t.Fatal("want error on exit 3")
 	}
@@ -242,12 +242,44 @@ func TestRunPreviewCommand_NonZeroExit(t *testing.T) {
 }
 
 func TestRunPreviewCommand_Timeout(t *testing.T) {
-	err := runPreviewCommand(context.Background(), "sleep 5", testExpectedSHA, "h", 100*time.Millisecond)
+	err := runPreviewCommand(context.Background(), "sleep 5", testExpectedSHA, "h", "", 100*time.Millisecond)
 	if err == nil {
 		t.Fatal("want error on timeout")
 	}
 	if !strings.Contains(err.Error(), "timed out") {
 		t.Errorf("error %q should name the timeout", err)
+	}
+}
+
+// dir != "" → the hook runs with cmd.Dir set, so a RELATIVE output path
+// resolves against dir (the operator's dispatch checkout), not the runner
+// process cwd (#1746). Asserted via a relative marker file rather than
+// macOS-symlink-sensitive `pwd`.
+func TestRunPreviewCommand_RunsInHookDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := runPreviewCommand(context.Background(), "printf ok > marker.txt", testExpectedSHA, "h", dir, 30*time.Second); err != nil {
+		t.Fatalf("runPreviewCommand: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "marker.txt"))
+	if err != nil {
+		t.Fatalf("marker not written in hook dir: %v", err)
+	}
+	if string(got) != "ok" {
+		t.Errorf("marker = %q, want %q", got, "ok")
+	}
+}
+
+// dir == "" → the hook falls back to the runner process cwd (an empty
+// cmd.Dir is os/exec's process-cwd default), preserving the pre-#1746
+// behavior. Guards the empty-dir fallback against regression.
+func TestRunPreviewCommand_EmptyDirInheritsProcessCwd(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := runPreviewCommand(context.Background(), "printf ok > marker.txt", testExpectedSHA, "h", "", 30*time.Second); err != nil {
+		t.Fatalf("runPreviewCommand: %v", err)
+	}
+	if _, err := os.ReadFile(filepath.Join(dir, "marker.txt")); err != nil {
+		t.Fatalf("empty dir must run in process cwd, marker not found there: %v", err)
 	}
 }
 
@@ -322,6 +354,30 @@ func TestAcceptanceTargetGate_ProvisionFailure(t *testing.T) {
 	teardown()
 	if _, err := os.Stat(marker); err != nil {
 		t.Errorf("teardown did not run: %v", err)
+	}
+}
+
+// gcfg.hookDir threads through the gate to the provision hook's cmd.Dir:
+// a provision command writing a RELATIVE marker lands it in hookDir, not
+// the process cwd — pinning the config → gate → hook seam (#1746).
+func TestAcceptanceTargetGate_ProvisionRunsInHookDir(t *testing.T) {
+	dir := t.TempDir()
+	ts, _ := healthzServer(t, 200, `{"git_sha":"abc1234"}`)
+	gcfg := fastGateConfig()
+	gcfg.readyTimeout = 500 * time.Millisecond
+	gcfg.provisionCmd = "printf ok > marker.txt"
+	gcfg.hookDir = dir
+	var log strings.Builder
+	_, reason, detail := acceptanceTargetGate(context.Background(), gcfg, []string{hostOf(ts)}, testExpectedSHA, "run-1", &log)
+	if reason != "" {
+		t.Fatalf("gate must proceed, got reason %q (%s)", reason, detail)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "marker.txt"))
+	if err != nil {
+		t.Fatalf("provision hook did not run in gcfg.hookDir: %v", err)
+	}
+	if string(got) != "ok" {
+		t.Errorf("marker = %q, want %q", got, "ok")
 	}
 }
 

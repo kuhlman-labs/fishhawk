@@ -23,9 +23,15 @@ import (
  * agent spawns, the runner:
  *
  *   provision — when FISHHAWK_ACCEPTANCE_PREVIEW_CMD is set, runs it via
- *               `sh -c` with FISHHAWK_PREVIEW_SHA / FISHHAWK_PREVIEW_TARGET_HOST
- *               in its env so the operator's hook can build+serve the
- *               merge candidate (e.g. `scripts/dev preview`).
+ *               `sh -c` in the operator's dispatch working_dir (falling back
+ *               to the runner cwd when none was dispatched) with
+ *               FISHHAWK_PREVIEW_SHA / FISHHAWK_PREVIEW_TARGET_HOST in its
+ *               env so the operator's hook can build+serve the merge
+ *               candidate (e.g. `scripts/dev preview`). Anchoring to the
+ *               dispatch checkout (not the runner-inherited fishhawk-mcp cwd)
+ *               is what makes a RELATIVE hook command resolve the operator's
+ *               .env-carrying checkout from a worktree-launched session
+ *               (#1746).
  *   readiness — polls probeTargetIdentity until the target serves the
  *               expected head SHA or the ready budget expires.
  *   gate      — verified proceeds; stale/unreachable (and a provision
@@ -222,6 +228,14 @@ type previewGateConfig struct {
 	// absorbs connection blips rather than waiting a full boot budget.
 	quickInterval time.Duration
 	quickAttempts int
+	// hookDir anchors the provision/teardown hooks to the operator's
+	// dispatch working_dir (the checkout that carries the untracked .env),
+	// so a RELATIVE FISHHAWK_ACCEPTANCE_PREVIEW_CMD like `scripts/dev
+	// preview` resolves that checkout instead of the runner-inherited
+	// fishhawk-mcp cwd (#1746). NOT an env var — it is set by the
+	// acceptance call site from the captured dispatch working_dir, so it
+	// defaults to "" (runner cwd, os/exec semantics) everywhere else.
+	hookDir string
 }
 
 // previewGateConfigFromEnv reads the FISHHAWK_ACCEPTANCE_PREVIEW_* knobs
@@ -253,10 +267,13 @@ func envSeconds(name string, def time.Duration) time.Duration {
 	return time.Duration(n) * time.Second
 }
 
-// runPreviewCommand executes an operator hook via `sh -c` in the runner's
-// cwd with a CREDENTIAL-STRIPPED env plus FISHHAWK_PREVIEW_SHA /
-// FISHHAWK_PREVIEW_TARGET_HOST. On a non-zero exit or timeout it returns an
-// error carrying the exit state and an output tail.
+// runPreviewCommand executes an operator hook via `sh -c` in dir (the
+// operator's dispatch working_dir) with a CREDENTIAL-STRIPPED env plus
+// FISHHAWK_PREVIEW_SHA / FISHHAWK_PREVIEW_TARGET_HOST. When dir is "" the
+// hook runs in the runner process cwd (an empty cmd.Dir is os/exec's
+// process-cwd default), preserving the pre-#1746 behavior. On a non-zero
+// exit or timeout it returns an error carrying the exit state and an
+// output tail.
 //
 // The provisioning hook (in the dogfood spec, `scripts/dev preview`) builds
 // and RUNS the merge candidate's fishhawkd (`migrate up` / `serve`) — i.e.
@@ -269,10 +286,11 @@ func envSeconds(name string, def time.Duration) time.Duration {
 // verify gates) applies the default-deny allow-list, so those secrets never
 // reach the hook or the branch binary it spawns while PATH/HOME/GO* survive
 // for the Go build.
-func runPreviewCommand(ctx context.Context, command, expectedSHA, host string, timeout time.Duration) error {
+func runPreviewCommand(ctx context.Context, command, expectedSHA, host, dir string, timeout time.Duration) error {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "sh", "-c", command)
+	cmd.Dir = dir
 	cmd.Env = append(sanitizedGateEnv(),
 		"FISHHAWK_PREVIEW_SHA="+expectedSHA,
 		"FISHHAWK_PREVIEW_TARGET_HOST="+host,
@@ -345,7 +363,7 @@ func acceptanceTargetGate(ctx context.Context, gcfg previewGateConfig, targetHos
 
 	if gcfg.teardownCmd != "" {
 		teardown = func() {
-			if err := runPreviewCommand(ctx, gcfg.teardownCmd, expectedSHA, host, gcfg.provisionTimeout); err != nil {
+			if err := runPreviewCommand(ctx, gcfg.teardownCmd, expectedSHA, host, gcfg.hookDir, gcfg.provisionTimeout); err != nil {
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"acceptance_preview_teardown_failed","run_id":%q,"host":%q,"detail":%q}`+"\n",
 					runID, host, err.Error())
@@ -354,7 +372,7 @@ func acceptanceTargetGate(ctx context.Context, gcfg previewGateConfig, targetHos
 	}
 
 	if gcfg.provisionCmd != "" {
-		if err := runPreviewCommand(ctx, gcfg.provisionCmd, expectedSHA, host, gcfg.provisionTimeout); err != nil {
+		if err := runPreviewCommand(ctx, gcfg.provisionCmd, expectedSHA, host, gcfg.hookDir, gcfg.provisionTimeout); err != nil {
 			return teardown, acceptanceReasonProvisionFailed,
 				fmt.Sprintf("preview provision command failed: %v", err)
 		}
