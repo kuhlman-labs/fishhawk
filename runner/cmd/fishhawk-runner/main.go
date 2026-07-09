@@ -71,9 +71,14 @@ var newRunnerContext = func() (context.Context, context.CancelFunc) {
 
 // newInvoker is the seam tests use to swap the real Claude Code
 // adapter for a fake. Production wiring is the only assignment in
-// non-test code; tests reassign and restore it via t.Cleanup.
-var newInvoker = func(apiKey string) agent.Invoker {
-	return claudecode.New(apiKey)
+// non-test code; tests reassign and restore it via t.Cleanup. The
+// binary arg is the operator FISHHAWK_AGENT_BIN override; empty leaves
+// the adapter .Binary empty so it resolves claudecode.DefaultBinary
+// (#1741).
+var newInvoker = func(apiKey, binary string) agent.Invoker {
+	inv := claudecode.New(apiKey)
+	inv.Binary = binary
+	return inv
 }
 
 // deriveStructuredOutputSchema is the seam that produces the plan-stage
@@ -217,11 +222,17 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// fishhawk-mcp cwd (#1746).
 	dispatchWorkingDir := cfg.workingDir
 
-	logStartup(logSink, cfg)
-	_, _ = fmt.Fprintf(logSink, `{"event":"coercion_registry","summary":%q}`+"\n", plan.CoercionRegistrySummary())
-
 	ctx, stop := newRunnerContext()
 	defer stop()
+
+	// Resolve the agent CLI binary (operator override or adapter default)
+	// and probe its version BEFORE the startup line, so runner_started
+	// records the exact binary + version that will be invoked (#1741).
+	cfg.agentBinary = effectiveAgentBinary(cfg.agent, os.Getenv)
+	cfg.agentVersion = probeAgentVersion(ctx, cfg.agentBinary)
+
+	logStartup(logSink, cfg)
+	_, _ = fmt.Fprintf(logSink, `{"event":"coercion_registry","summary":%q}`+"\n", plan.CoercionRegistrySummary())
 
 	// GenAI observability (#649). Bootstrap is gated by
 	// OTEL_EXPORTER_OTLP_ENDPOINT: a disabled (no-op) Emitter when
@@ -804,7 +815,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 	}
 
-	invoker, selErr := selectInvoker(cfg.agent, apiKeyForAgent(cfg.agent))
+	invoker, selErr := selectInvoker(cfg.agent, apiKeyForAgent(cfg.agent), agentBinaryOverride(cfg.agent, os.Getenv))
 	if selErr != nil {
 		// Category-A runner/agent failure: the requested provider maps to
 		// no known invoker. Fail fast BEFORE any agent is invoked.
@@ -2386,9 +2397,15 @@ func logStartup(w io.Writer, cfg config) {
 	// surfaced here for log observability and computed from the SAME
 	// detectRunnerKind(os.Getenv) source that stamps the signed manifest, so
 	// the log line and the attestable manifest claim never disagree.
+	//
+	// agent_kind/agent_binary/agent_version record the coding-agent provider
+	// (cfg.agent), the resolved CLI binary (operator override or adapter
+	// default), and its probed `--version` string (#1741) so an operator can
+	// tell exactly which agent build produced a run from the log alone. A
+	// binary that has no --version flag records agent_version:"unknown".
 	_, _ = fmt.Fprintf(w,
-		`{"event":"runner_started","run_id":%q,"workflow":%q,"stage":%q,"backend_url":%q,"version":%q,"git_sha":%q,"prompt_file":%q,"runner_kind":%q}`+"\n",
-		cfg.runID, cfg.workflow, cfg.stage, cfg.backendURL, runnerVersion(), runnerGitSHA(), cfg.promptFile, detectRunnerKind(os.Getenv),
+		`{"event":"runner_started","run_id":%q,"workflow":%q,"stage":%q,"backend_url":%q,"version":%q,"git_sha":%q,"prompt_file":%q,"runner_kind":%q,"agent_kind":%q,"agent_binary":%q,"agent_version":%q}`+"\n",
+		cfg.runID, cfg.workflow, cfg.stage, cfg.backendURL, runnerVersion(), runnerGitSHA(), cfg.promptFile, detectRunnerKind(os.Getenv), cfg.agent, cfg.agentBinary, cfg.agentVersion,
 	)
 }
 

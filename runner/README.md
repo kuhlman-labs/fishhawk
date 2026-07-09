@@ -69,6 +69,20 @@ The runner can drive either of two coding-agent providers, selected by the `agen
 - **Default and fallback.** Omitting `agent` selects `claude-code`, so existing workflows are unchanged. Any value other than `claude-code` or `codex` fails the stage **category-A before the agent is invoked** (`selectInvoker` returns `errUnknownAgent` in `cmd/fishhawk-runner/agentselect.go`) — a typo can't silently fall through to the wrong provider.
 - **Codex key wiring.** Pass `agent: codex` plus `openai-api-key: ${{ secrets.OPENAI_API_KEY }}` to the action. The composite action threads that input into the `OPENAI_API_KEY` environment variable only when `agent == 'codex'` (`runner/action.yml`), and the codex adapter forwards it to the `codex` CLI child. The `anthropic-api-key` / `openai-api-key` inputs are independent; the unused one is left empty.
 - **Trace attribution.** The selected provider id is stamped into the trace bundle manifest's `agent` field, so a post-hoc reviewer can see which agent produced the run.
+- **Provenance on startup (#1741).** The `runner_started` log line records `agent_kind` (the selected provider), `agent_binary` (the resolved CLI executable), and `agent_version` (that binary's probed `--version` line, or `unknown` when the binary has no working `--version`), so the exact agent build behind a run is recoverable from the logs alone.
+
+### Pinning the agent CLI binary (`FISHHAWK_AGENT_BIN` / `FISHHAWK_CODEX_BIN`, #1741)
+
+By default each adapter resolves its CLI by name against `PATH` (`claude` for `claude-code`, `codex` for `codex`). To pin a **known-good** build without touching a global symlink, set an operator environment variable on the host that runs the runner:
+
+| `agent` | Override env var | Overrides |
+|---|---|---|
+| `claude-code` | `FISHHAWK_AGENT_BIN` | the `claude` binary |
+| `codex` | `FISHHAWK_CODEX_BIN` | the `codex` binary |
+
+The value may be an absolute path or a name resolvable on `PATH`. A whitespace-only value is treated as unset, so an empty export never shadows the adapter default. The resolved binary is both probed for its version (recorded as `agent_version`) and invoked as the agent — the log and the invocation can never disagree.
+
+> **Recommended: disable agent-CLI auto-update on runner hosts.** A CLI that silently auto-updates can introduce a breaking change mid-flight — exactly the #1741 incident, where Claude CLI `2.1.205` tightened `--json-schema` validation and took every plan stage down. Pin a vetted version (uninstall/reinstall a specific version, or point `FISHHAWK_AGENT_BIN` / `FISHHAWK_CODEX_BIN` at a pinned build) and turn off the CLI's self-update on operator hosts so upgrades are deliberate and reviewable. The `agent_version` on `runner_started` lets you confirm which build actually ran.
 
 ### Local verification with a fake Codex binary
 
@@ -152,6 +166,8 @@ The same binary the action runs can be invoked locally for development:
     gunzip -c /tmp/trace.jsonl.gz | jq -c .
 
 When `--prompt-file` is set the runner invokes Claude Code; the structured runner log lines (`runner_started`, `runner_completed`) go to stderr. With `--bundle-out`, captured events are packed into `*.jsonl.gz` per ADR-007. Without it, events fall back to JSONL on stdout.
+
+To pin a known-good agent CLI build on a local (or any operator) host — and the recommendation to disable the CLI's auto-update so an upgrade like the #1741 Claude CLI `2.1.205` break can't land mid-run — set `FISHHAWK_AGENT_BIN` / `FISHHAWK_CODEX_BIN`; see [Pinning the agent CLI binary](#pinning-the-agent-cli-binary-fishhawk_agent_bin--fishhawk_codex_bin-1741) above. The `runner_started` line's `agent_binary`/`agent_version` fields confirm which build actually ran.
 
 ### Progress heartbeats (#580)
 
