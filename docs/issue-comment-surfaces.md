@@ -910,6 +910,21 @@ Notes:
   never reaches `review:awaiting_approval` with a null PR. Listed here only so a
   future reader grepping the audit categories doesn't mistake it for a comment
   surface.
+- The detached-dispatch reaper failure kind — `dispatch_reaper_failed` (#1747) —
+  is an **internal, audit-only kind, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it; it has no Notifier method.
+  `server/reap_failure.go::handleReapStageFailure` writes it via
+  `AuditRepo.AppendChained` when the `fishhawk_dispatch_stage` reaper (in the MCP
+  host) reports a spawned runner that exited non-zero BEFORE reporting a terminal
+  stage state to `POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure` — the
+  case that otherwise leaves the stage stuck `dispatched` forever (`retry_stage`
+  422s, no audit). The actor is `system` and the payload is `{run_id, stage_id,
+  failure_category, reason, detail, exit_code, reported_at, auth_method}`. It is
+  the eager, event-driven complement to the off-by-default dispatch watchdog and
+  mirrors its `dispatch_watchdog_elapsed` precedent (FailStage category-C →
+  chained audit → orchestrator Advance). The endpoint is idempotent — a report
+  against an already-terminal stage writes NO entry. Listed here only so a future
+  reader grepping the audit categories doesn't mistake it for a comment surface.
 - The gating-reject PR-close audit kind — `pull_request_closed_after_review_reject`
   (#877) — is an **audit kind, not a triggering-issue comment surface**, but it
   DOES post a best-effort comment to the closed PR thread (not via the

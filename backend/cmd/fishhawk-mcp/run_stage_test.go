@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1781,5 +1782,226 @@ func TestRunStage_ArgvComposition_AcceptanceStage(t *testing.T) {
 	}
 	if strings.Contains(joined, "--check-base-ref") {
 		t.Errorf("acceptance stage must not include --check-base-ref: %v", capturedArgs)
+	}
+}
+
+// --- detached-dispatch reaper (#1747) ---
+
+// capturedReap records what the detached reaper's report closure was called
+// with, so the reaper-branch tests can assert the parsed reason/detail/category.
+type capturedReap struct {
+	called   bool
+	category string
+	reason   string
+	detail   string
+	exitCode int
+}
+
+// startedShellCmd builds and Start()s a shell subprocess so reapDetachedRunner
+// can Wait() on it. The body controls the exit code.
+func startedShellCmd(t *testing.T, body string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", body)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start fake runner: %v", err)
+	}
+	return cmd
+}
+
+// writeReapLog writes a runner log file with the given lines and returns its path.
+func writeReapLog(t *testing.T, lines ...string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "runner.log")
+	if err := os.WriteFile(p, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write reap log: %v", err)
+	}
+	return p
+}
+
+// (1) Non-zero exit with a parseable runner_failed line → reason/detail parsed,
+// category C, the child's exit code reported.
+func TestReapDetachedRunner_ParsesRunnerFailed(t *testing.T) {
+	logPath := writeReapLog(t,
+		`{"event":"runner_failed","reason":"acceptance_preview_provision_failed","detail":"no port"}`)
+	cmd := startedShellCmd(t, "exit 7")
+
+	var got capturedReap
+	report := func(_ context.Context, category, reason, detail string, exitCode int) error {
+		got = capturedReap{called: true, category: category, reason: reason, detail: detail, exitCode: exitCode}
+		return nil
+	}
+	reapDetachedRunner(cmd, logPath, "run-1", "stage-1", report)
+
+	if !got.called {
+		t.Fatal("report was not called on a non-zero exit with a runner_failed line")
+	}
+	if got.category != "C" {
+		t.Errorf("category = %q, want C", got.category)
+	}
+	if got.reason != "acceptance_preview_provision_failed" {
+		t.Errorf("reason = %q", got.reason)
+	}
+	if got.detail != "no port" {
+		t.Errorf("detail = %q", got.detail)
+	}
+	if got.exitCode != 7 {
+		t.Errorf("exit_code = %d, want 7", got.exitCode)
+	}
+}
+
+// The risk-item test: a runner_failed line LACKING a category still yields
+// category C (the reaper never relies on a category field).
+func TestReapDetachedRunner_NoCategoryFieldDefaultsC(t *testing.T) {
+	logPath := writeReapLog(t, `{"event":"runner_failed","reason":"worktree_provision","detail":"disk full"}`)
+	cmd := startedShellCmd(t, "exit 1")
+
+	var got capturedReap
+	reapDetachedRunner(cmd, logPath, "r", "s", func(_ context.Context, category, reason, detail string, exitCode int) error {
+		got = capturedReap{called: true, category: category, reason: reason}
+		return nil
+	})
+	if !got.called || got.category != "C" {
+		t.Errorf("category = %q (called=%v), want C", got.category, got.called)
+	}
+	if got.reason != "worktree_provision" {
+		t.Errorf("reason = %q", got.reason)
+	}
+}
+
+// (2) Non-zero exit with NO runner_failed line → synthesized reason, category C.
+func TestReapDetachedRunner_SynthesizesReasonWhenNoLine(t *testing.T) {
+	logPath := writeReapLog(t, `not json`, `{"event":"stage_progress","turns":1}`)
+	cmd := startedShellCmd(t, "exit 5")
+
+	var got capturedReap
+	reapDetachedRunner(cmd, logPath, "r", "s", func(_ context.Context, category, reason, detail string, exitCode int) error {
+		got = capturedReap{called: true, category: category, reason: reason, exitCode: exitCode}
+		return nil
+	})
+	if !got.called {
+		t.Fatal("report was not called on a non-zero exit with no runner_failed line")
+	}
+	if got.category != "C" {
+		t.Errorf("category = %q, want C", got.category)
+	}
+	if !strings.Contains(got.reason, "runner exited 5 before reporting a terminal state") {
+		t.Errorf("reason = %q, want synthesized 'runner exited 5 before...'", got.reason)
+	}
+}
+
+// (3) Zero exit → no report (the runner reported its own outcome).
+func TestReapDetachedRunner_ZeroExitNoReport(t *testing.T) {
+	logPath := writeReapLog(t, `{"event":"runner_completed","outcome":"ok"}`)
+	cmd := startedShellCmd(t, "exit 0")
+
+	called := false
+	reapDetachedRunner(cmd, logPath, "r", "s", func(context.Context, string, string, string, int) error {
+		called = true
+		return nil
+	})
+	if called {
+		t.Error("report was called on a zero exit; it must be a no-op")
+	}
+}
+
+// A nil reporter is a safe no-op even on a non-zero exit (a caller with no
+// backend client). Nothing to assert but the absence of a panic.
+func TestReapDetachedRunner_NilReporterNoPanic(t *testing.T) {
+	cmd := startedShellCmd(t, "exit 1")
+	reapDetachedRunner(cmd, writeReapLog(t, `{"event":"runner_failed","reason":"x"}`), "r", "s", nil)
+}
+
+// parseDetachedRunnerFailure: the LAST runner_failed line wins, non-matching
+// lines are ignored, and an unreadable path yields ("", "").
+func TestParseDetachedRunnerFailure(t *testing.T) {
+	t.Run("last runner_failed wins", func(t *testing.T) {
+		p := writeReapLog(t,
+			`{"event":"runner_failed","reason":"first","detail":"a"}`,
+			`{"event":"stage_progress","turns":2}`,
+			`{"event":"runner_failed","reason":"second","detail":"b"}`)
+		reason, detail := parseDetachedRunnerFailure(p)
+		if reason != "second" || detail != "b" {
+			t.Errorf("(%q,%q), want (second,b)", reason, detail)
+		}
+	})
+	t.Run("no runner_failed line", func(t *testing.T) {
+		p := writeReapLog(t, `{"event":"runner_completed","outcome":"ok"}`)
+		if reason, detail := parseDetachedRunnerFailure(p); reason != "" || detail != "" {
+			t.Errorf("(%q,%q), want empty", reason, detail)
+		}
+	})
+	t.Run("unreadable path", func(t *testing.T) {
+		if reason, detail := parseDetachedRunnerFailure(filepath.Join(t.TempDir(), "absent.log")); reason != "" || detail != "" {
+			t.Errorf("(%q,%q), want empty for a missing file", reason, detail)
+		}
+	})
+}
+
+// Cross-boundary integration (#1747): a detached runner that writes a
+// runner_failed line to its redirected log and exits non-zero drives the reaper
+// to POST /v0/runs/{id}/stages/{id}/reap-failure with the parsed reason and
+// category C — crossing the MCP-host → HTTP → handler seam via a real apiClient.
+func TestSpawnRunnerStageDetached_ReaperReportsOverHTTP(t *testing.T) {
+	type captured struct {
+		path string
+		body reapFailureRequest
+	}
+	gotCh := make(chan captured, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/reap-failure") {
+			var b reapFailureRequest
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			gotCh <- captured{path: r.URL.Path, body: b}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"transitioned":true,"stage_state":"failed"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	api := newAPIClient(config{backendURL: srv.URL, apiToken: "tok-test"})
+	runID, stageID := uuid.New(), uuid.New()
+	report := func(ctx context.Context, category, reason, detail string, exitCode int) error {
+		_, err := api.ReportStageFailure(ctx, runID, stageID, category, reason, detail, exitCode)
+		return err
+	}
+
+	// Fake runner: emit a runner_failed line to stdout (redirected to the log by
+	// spawnRunnerStageDetached) and exit non-zero.
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, _ ...string) *exec.Cmd {
+		return exec.Command("sh", "-c",
+			`echo '{"event":"runner_failed","reason":"acceptance_preview_provision_failed","detail":"no port"}'; exit 7`)
+	}
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	logPath, err := spawnRunnerStageDetached("/fake/runner", nil, os.Environ(),
+		runID.String(), stageID.String(), report)
+	if err != nil {
+		t.Fatalf("spawnRunnerStageDetached: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(logPath) })
+
+	select {
+	case c := <-gotCh:
+		wantPath := "/v0/runs/" + runID.String() + "/stages/" + stageID.String() + "/reap-failure"
+		if c.path != wantPath {
+			t.Errorf("path = %q, want %q", c.path, wantPath)
+		}
+		if c.body.Category != "C" {
+			t.Errorf("category = %q, want C", c.body.Category)
+		}
+		if c.body.Reason != "acceptance_preview_provision_failed" {
+			t.Errorf("reason = %q", c.body.Reason)
+		}
+		if c.body.Detail != "no port" {
+			t.Errorf("detail = %q", c.body.Detail)
+		}
+		if c.body.ExitCode != 7 {
+			t.Errorf("exit_code = %d, want 7", c.body.ExitCode)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reaper did not POST reap-failure within 5s")
 	}
 }
