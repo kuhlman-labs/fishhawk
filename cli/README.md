@@ -108,6 +108,8 @@ The credential store is a single JSON file at `$XDG_CONFIG_HOME/fishhawk/credent
 
 `token login` reads one extra input, `--client-id` / `FISHHAWK_OAUTH_CLIENT_ID` (the OAuth App `client_id`); when unset it is discovered from the backend, so most operators never set it.
 
+**Enable Device Flow (setup).** The OAuth App backing `FISHHAWK_OAUTH_CLIENT_ID` must have GitHub's per-app **Enable Device Flow** checkbox turned on (GitHub → Settings → Developer settings → the App → check **Enable Device Flow** → Update application). Until it is, GitHub answers the device-code request with `device_flow_disabled`, which `token login` surfaces verbatim from GitHub's `error_description`.
+
 ## Build and test
 
 From the repo root (workspace-aware):
@@ -139,9 +141,24 @@ Or from this directory directly:
     fishhawk run list --state running --limit 25
 
     # Mint a user-bound token via the OAuth device flow, then reuse it
-    # implicitly (stored per backend URL; no --token needed afterwards)
-    fishhawk token login --backend-url http://localhost:8080
-    fishhawk token list
+    # implicitly (stored per backend URL; no --token needed afterwards).
+    # login prints the user_code + verification_uri to stderr and polls
+    # until you authorize in the browser:
+    $ fishhawk token login --backend-url http://localhost:8080
+    To authorize, visit https://github.com/login/device
+    and enter code: WDJB-MJHT
+    Waiting for authorization…
+    Logged in as github:octocat (scope: operator). Token stored for
+    http://localhost:8080. (v0 tokens do not expire.)
+
+    # token list shows the stored credential — subject / scope / provider /
+    # expiry — without contacting the backend or printing the secret:
+    $ fishhawk token list
+    http://localhost:8080
+      subject:  github:octocat
+      scope:    operator
+      provider: github
+      expiry:   none (v0)
 
     # Approve the plan stage on a run from the terminal (ADR-019 / #320)
     fishhawk plan approve <run-id> --reason "scope looks right"
