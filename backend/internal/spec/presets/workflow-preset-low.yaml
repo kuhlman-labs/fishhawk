@@ -45,6 +45,12 @@ workflows:
         type: plan
         executor:
           agent: claude-code
+          # Optionally pin the coding-agent CLI versions this stage was
+          # validated against (#1743): a resolved CLI outside the range fails
+          # the stage loudly pre-spawn. The binary pin itself stays a host
+          # concern (FISHHAWK_AGENT_BIN / FISHHAWK_CODEX_BIN); absent = no
+          # constraint. Uncomment and adjust to enforce.
+          # agent_version: ">=2.1 <2.2"
         # Advisory plan review (ADR-027): agent reviewers surface
         # verdicts before the human gate. Heterogeneous topology (#955):
         # Claude and Codex review concurrently.
@@ -54,6 +60,10 @@ workflows:
               model: claude-opus-4-8
             - provider: codex
               model: gpt-5.5
+              # A codex reviewer may likewise pin the reviewer CLI versions it
+              # was validated against (#1743): an out-of-range CLI fails the
+              # review dispatch; an unprobeable version degrades to a warning.
+              # agent_version: ">=2.1 <2.2"
           human: 1
         inputs:
           - source: github_issue
