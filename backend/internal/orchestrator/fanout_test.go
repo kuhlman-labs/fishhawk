@@ -104,13 +104,35 @@ func (r *fanoutRunsRepo) ListRuns(ctx context.Context, f run.ListRunsFilter) ([]
 // fakeArtifacts is a minimal artifact.Repository returning a fixed
 // list of artifacts for any stage.
 type fakeArtifacts struct {
+	mu      sync.Mutex
 	byStage map[uuid.UUID][]*artifact.Artifact
 }
 
-func (f *fakeArtifacts) Create(context.Context, artifact.CreateParams) (*artifact.Artifact, error) {
-	return nil, nil
+// Create records the created artifact into byStage[p.StageID] and returns a
+// real *artifact.Artifact so ListForStage/hasPullRequest observe
+// orchestrator-created artifacts (#1732). Additive — tests that ignore Create
+// are unaffected.
+func (f *fakeArtifacts) Create(_ context.Context, p artifact.CreateParams) (*artifact.Artifact, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a := &artifact.Artifact{
+		ID:            uuid.New(),
+		StageID:       p.StageID,
+		Kind:          p.Kind,
+		SchemaVersion: p.SchemaVersion,
+		Content:       p.Content,
+		ContentHash:   p.ContentHash,
+		CreatedAt:     time.Now().UTC(),
+	}
+	if f.byStage == nil {
+		f.byStage = map[uuid.UUID][]*artifact.Artifact{}
+	}
+	f.byStage[p.StageID] = append(f.byStage[p.StageID], a)
+	return a, nil
 }
 func (f *fakeArtifacts) Get(_ context.Context, id uuid.UUID) (*artifact.Artifact, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	for _, list := range f.byStage {
 		for _, a := range list {
 			if a.ID == id {
@@ -121,6 +143,8 @@ func (f *fakeArtifacts) Get(_ context.Context, id uuid.UUID) (*artifact.Artifact
 	return nil, artifact.ErrNotFound
 }
 func (f *fakeArtifacts) ListForStage(_ context.Context, stageID uuid.UUID) ([]*artifact.Artifact, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.byStage[stageID], nil
 }
 func (f *fakeArtifacts) GetByHash(context.Context, uuid.UUID, string) (*artifact.Artifact, error) {

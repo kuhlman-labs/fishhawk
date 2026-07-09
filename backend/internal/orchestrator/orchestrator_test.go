@@ -1526,6 +1526,131 @@ func TestAdvance_DecomposedParent_LostRace_EmptyList_RetryableError(t *testing.T
 	}
 }
 
+// TestAdvance_DecomposedParent_RecordsPullRequestArtifact is the #1732
+// regression: opening the consolidated PR must ALSO record a kind=pull_request
+// artifact on the parent IMPLEMENT stage so audit_complete's Rule 3
+// (hasPullRequest over the implement stage) passes on a decomposed parent —
+// previously it recorded none and audit_complete was permanently red. It
+// asserts: (a) the URL is stamped; (b) exactly one kind=pull_request artifact
+// lands on the IMPLEMENT stage carrying a non-empty head_sha + pr_number (the
+// exact predicate auditcomplete Rule 3 and the publisher's decodeHeadSHA
+// evaluate); (c) idempotency — a second pass over the gate records no second
+// artifact; (d) graceful skip — with Artifacts=nil the flow still stamps the
+// URL and returns no error.
+func TestAdvance_DecomposedParent_RecordsPullRequestArtifact(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{}}
+	o.Artifacts = arts
+
+	parent, stages := seedDecomposedParent(t, rs, int64Ptr(55), run.ExecutorHuman)
+	implStageID := stages[0].ID // implement is stage 0 (seedDecomposedParent)
+	// The consolidated head resolves to a real tip SHA so the recorded artifact
+	// carries a non-empty head_sha (the publisher-readiness predicate).
+	gh.branchSHAs = map[string]string{
+		consolidatedBranch(parent.ID): "headsha-consolidated",
+		"main":                        "basesha-main",
+	}
+
+	if _, err := o.Advance(context.Background(), parent.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	// (a) URL stamped.
+	if rs.runs[parent.ID].PullRequestURL == nil || *rs.runs[parent.ID].PullRequestURL == "" {
+		t.Fatal("parent run pull_request_url not stamped")
+	}
+
+	// (b) exactly one pull_request artifact on the IMPLEMENT stage, decoding to
+	// a non-empty head_sha + pr_number (audit_complete Rule 3 satisfied).
+	implArts, err := arts.ListForStage(context.Background(), implStageID)
+	if err != nil {
+		t.Fatalf("ListForStage(implement): %v", err)
+	}
+	prArts := prArtifacts(implArts)
+	if len(prArts) != 1 {
+		t.Fatalf("pull_request artifacts on implement stage = %d, want 1", len(prArts))
+	}
+	// The artifact must NOT be attached to the review stage.
+	if revArts, _ := arts.ListForStage(context.Background(), stages[1].ID); len(prArtifacts(revArts)) != 0 {
+		t.Errorf("pull_request artifacts on review stage = %d, want 0 (must land on implement)", len(prArtifacts(revArts)))
+	}
+	var content struct {
+		HeadSHA  string `json:"head_sha"`
+		PRNumber int    `json:"pr_number"`
+		BaseSHA  string `json:"base_sha"`
+		Origin   string `json:"origin"`
+		Branch   string `json:"branch"`
+	}
+	if err := json.Unmarshal(prArts[0].Content, &content); err != nil {
+		t.Fatalf("decode pull_request artifact content: %v", err)
+	}
+	if content.HeadSHA != "headsha-consolidated" {
+		t.Errorf("artifact head_sha = %q, want headsha-consolidated (empty => publisher never publishes)", content.HeadSHA)
+	}
+	if content.PRNumber != 777 {
+		t.Errorf("artifact pr_number = %d, want 777 (the opened PR number)", content.PRNumber)
+	}
+	if content.Origin != "orchestrator_consolidated" {
+		t.Errorf("artifact origin = %q, want orchestrator_consolidated", content.Origin)
+	}
+	if content.Branch != consolidatedBranch(parent.ID) {
+		t.Errorf("artifact branch = %q, want %q", content.Branch, consolidatedBranch(parent.ID))
+	}
+
+	// (c) idempotency: a redelivered settle over the still-pending review gate
+	// records no second artifact.
+	stages[1].State = run.StageStatePending
+	// Clear the stamped URL so Advance re-enters maybeOpenConsolidatedPR (the
+	// URL-set short-circuit would otherwise return before the record path).
+	rs.runs[parent.ID].PullRequestURL = nil
+	if _, err := o.Advance(context.Background(), parent.ID); err != nil {
+		t.Fatalf("Advance #2 (idempotency): %v", err)
+	}
+	implArts2, _ := arts.ListForStage(context.Background(), implStageID)
+	if got := len(prArtifacts(implArts2)); got != 1 {
+		t.Errorf("pull_request artifacts after second pass = %d, want still 1 (idempotent)", got)
+	}
+}
+
+// TestAdvance_DecomposedParent_NilArtifacts_GracefulSkip asserts the (d)
+// graceful-skip branch (#1732): with Artifacts=nil the consolidated-PR flow
+// still stamps the URL and returns no error — the artifact recording is simply
+// skipped, mirroring the GitHub/installation nil-skip posture.
+func TestAdvance_DecomposedParent_NilArtifacts_GracefulSkip(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	o.Artifacts = nil // no artifact repo wired
+	gh.branchSHAs = map[string]string{}
+
+	parent, stages := seedDecomposedParent(t, rs, int64Ptr(55), run.ExecutorHuman)
+
+	out, err := o.Advance(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out != OutcomeDispatched {
+		t.Errorf("Outcome = %q, want dispatched", out)
+	}
+	if rs.runs[parent.ID].PullRequestURL == nil || *rs.runs[parent.ID].PullRequestURL == "" {
+		t.Error("parent run pull_request_url not stamped (nil Artifacts must not block the URL stamp)")
+	}
+	if stages[1].State != run.StageStateAwaitingApproval {
+		t.Errorf("review stage = %q, want awaiting_approval", stages[1].State)
+	}
+}
+
+// prArtifacts filters a stage's artifacts down to the kind=pull_request ones.
+func prArtifacts(arts []*artifact.Artifact) []*artifact.Artifact {
+	var out []*artifact.Artifact
+	for _, a := range arts {
+		if a.Kind == artifact.KindPullRequest {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 func TestAdvance_NonDecomposedParent_NoConsolidatedPR(t *testing.T) {
 	// A plain run (no decomposed children) reaching its review gate must
 	// NOT open a PR — only decomposed parents do.

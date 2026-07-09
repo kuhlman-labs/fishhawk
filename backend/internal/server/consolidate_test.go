@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -99,6 +100,7 @@ type consolidateFixture struct {
 	rr     *orchestratorRepo
 	au     *auditCompleteAuditFake
 	gh     *consolidateGitHub
+	arts   *fakeArtifactRepo
 	parent *run.Run
 	impl   *run.Stage
 }
@@ -146,14 +148,15 @@ func seedConsolidateFixture(t *testing.T, gh *consolidateGitHub, implementAwaiti
 		c.State = cs.state
 	}
 
-	o := &orchestrator.Orchestrator{Runs: rr, GitHub: gh, Audit: au, DefaultRef: "main"}
-	s := New(Config{RunRepo: rr, AuditRepo: au, Orchestrator: o})
+	arts := newFakeArtifactRepo()
+	o := &orchestrator.Orchestrator{Runs: rr, GitHub: gh, Audit: au, Artifacts: arts, DefaultRef: "main"}
+	s := New(Config{RunRepo: rr, AuditRepo: au, ArtifactRepo: arts, Orchestrator: o})
 	// Isolate the endpoint from the fire-and-forget consolidated implement
 	// review New() wires (#1060) — it is out of scope for this endpoint's
 	// behavior and would otherwise run during Advance.
 	o.ConsolidatedReview = nil
 
-	return &consolidateFixture{s: s, rr: rr, au: au, gh: gh, parent: parent, impl: impl}
+	return &consolidateFixture{s: s, rr: rr, au: au, gh: gh, arts: arts, parent: parent, impl: impl}
 }
 
 // postConsolidate drives POST /v0/runs/{run_id}/consolidate with the given
@@ -368,6 +371,105 @@ func TestConsolidateRun_CleanFanIn(t *testing.T) {
 	}
 	if got := gh.mergeCount(); got != 2 {
 		t.Errorf("merge calls after re-invoke = %d, want 2 (no new merges)", got)
+	}
+}
+
+// prArtifactsForStage filters a stage's artifacts down to the kind=pull_request
+// ones — the predicate audit_complete's Rule 3 (hasPullRequest) evaluates.
+func prArtifactsForStage(t *testing.T, arts *fakeArtifactRepo, stageID uuid.UUID) []*artifact.Artifact {
+	t.Helper()
+	all, err := arts.ListForStage(context.Background(), stageID)
+	if err != nil {
+		t.Fatalf("ListForStage: %v", err)
+	}
+	var out []*artifact.Artifact
+	for _, a := range all {
+		if a.Kind == artifact.KindPullRequest {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// TestConsolidateRun_502ThenRetry_RecordsPullRequestArtifact is the #1732
+// cross-boundary regression: a decomposed parent whose first /consolidate 502s
+// on IntegrateSlices (a transient integrate-wave failure, as seen on run
+// 431041c0 / PR #1730) and then succeeds on retry must end with a
+// kind=pull_request artifact on the parent IMPLEMENT stage — so a subsequent
+// audit_complete over the consolidated head is green instead of permanently red
+// (pr_missing). It crosses the HTTP handler -> Orchestrator.Advance ->
+// maybeOpenConsolidatedPR -> artifact.Repository seam.
+func TestConsolidateRun_502ThenRetry_RecordsPullRequestArtifact(t *testing.T) {
+	gh := newConsolidateGitHub()
+	gh.mergeErr = githubclient.ErrNotFound // first attempt: transient integrate failure
+	f := seedConsolidateFixture(t, gh, true, []childSpec{
+		{sliceIndex: 0, state: run.StateSucceeded},
+		{sliceIndex: 1, state: run.StateSucceeded},
+	})
+
+	// First attempt 502s; the parent stage is left awaiting_children and NO
+	// pull_request artifact is recorded (the PR was never opened).
+	w1 := postConsolidate(t, f.s, f.parent.ID, withAuth)
+	if w1.Code != http.StatusBadGateway {
+		t.Fatalf("first attempt status = %d, want 502:\n%s", w1.Code, w1.Body.String())
+	}
+	if code := decodeError(t, w1); code != "slice_integration_error" {
+		t.Errorf("first attempt error = %q, want slice_integration_error", code)
+	}
+	if f.impl.State != run.StageStateAwaitingChildren {
+		t.Errorf("after 502: parent implement state = %q, want awaiting_children (unchanged)", f.impl.State)
+	}
+	if got := len(prArtifactsForStage(t, f.arts, f.impl.ID)); got != 0 {
+		t.Fatalf("after 502: pull_request artifacts = %d, want 0 (no PR opened yet)", got)
+	}
+
+	// Retry: the integrate failure clears; the second /consolidate drives
+	// IntegrateSlices -> stage succeeded -> Advance -> maybeOpenConsolidatedPR.
+	gh.mu.Lock()
+	gh.mergeErr = nil
+	gh.mu.Unlock()
+
+	w2 := postConsolidate(t, f.s, f.parent.ID, withAuth)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200:\n%s", w2.Code, w2.Body.String())
+	}
+	resp := decodeConsolidate(t, w2)
+	if resp.Outcome != "integrated" {
+		t.Errorf("retry outcome = %q, want integrated", resp.Outcome)
+	}
+
+	// The parent implement stage ends with EXACTLY ONE kind=pull_request
+	// artifact carrying a non-empty head_sha + pr_number — the exact predicate
+	// audit_complete Rule 3 (hasPullRequest) and the publisher's decodeHeadSHA
+	// evaluate. Green, not pr_missing.
+	prArts := prArtifactsForStage(t, f.arts, f.impl.ID)
+	if len(prArts) != 1 {
+		t.Fatalf("after retry: pull_request artifacts on implement stage = %d, want 1", len(prArts))
+	}
+	var content struct {
+		HeadSHA  string `json:"head_sha"`
+		PRNumber int    `json:"pr_number"`
+		Origin   string `json:"origin"`
+	}
+	if err := json.Unmarshal(prArts[0].Content, &content); err != nil {
+		t.Fatalf("decode pull_request artifact: %v", err)
+	}
+	if content.HeadSHA == "" {
+		t.Error("artifact head_sha is empty — the publisher would treat the run as not ready to publish")
+	}
+	if content.Origin != "orchestrator_consolidated" {
+		t.Errorf("artifact origin = %q, want orchestrator_consolidated", content.Origin)
+	}
+
+	// A further idempotent re-invoke records no additional artifact: the stage
+	// already resolved, so /consolidate is a 409 no-op and the artifact count
+	// stays 1.
+	w3 := postConsolidate(t, f.s, f.parent.ID, withAuth)
+	if w3.Code != http.StatusConflict {
+		t.Fatalf("re-invoke status = %d, want 409:\n%s", w3.Code, w3.Body.String())
+	}
+	if got := len(prArtifactsForStage(t, f.arts, f.impl.ID)); got != 1 {
+		t.Errorf("after re-invoke: pull_request artifacts = %d, want still 1 (no duplicate)", got)
 	}
 }
 
