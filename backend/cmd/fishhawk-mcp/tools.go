@@ -892,6 +892,14 @@ func (r *runResolver) fetchRunDriveView(ctx context.Context, runID uuid.UUID) (*
 type GetRunStatusInput struct {
 	RunID      string `json:"run_id" jsonschema:"the Fishhawk run UUID"`
 	AuditLimit int    `json:"audit_limit,omitempty" jsonschema:"how many recent audit entries to include (default 5, capped at 50)"`
+	// IncludeIssueContext / IncludeReviewProse opt the heavy free-text
+	// back into the response. Both default false: the compact default
+	// omits the issue body + all comments and reviewer free-text prose
+	// (free_form + concern notes) — the token-dominant fields — while
+	// keeping every operator-playbook field. Mirrors
+	// ListRunsInput.IncludeIssueContext.
+	IncludeIssueContext bool `json:"include_issue_context,omitempty" jsonschema:"include the run's full issue_context (issue body + all comments) in the response; omitted by default to stay within the tool-result token budget. Set true only when the issue payload is actually needed"`
+	IncludeReviewProse  bool `json:"include_review_prose,omitempty" jsonschema:"include reviewer free-text prose (implement_reviews[] free_form + concern notes, and recent_audit review-payload free_form) in the response; omitted by default to stay within the tool-result token budget. Verdicts/severities/concern keys are always present regardless of this flag"`
 }
 
 // GetRunStatusOutput bundles the three /v0 reads into one
@@ -1046,6 +1054,16 @@ Returns the Run row (state, workflow, trigger, PR URL when stamped),
 the full ordered stage list (each stage's id / type / state /
 executor / timing / failure category if any), and the N most-recent
 audit entries time-descending (default 5; capped at 50).
+
+The response is compact by default to stay within the tool-result token
+budget: the heavy issue_context (issue body + all comments) and reviewer
+free-text prose (implement_reviews[] free_form + concern notes, plus
+recent_audit review-payload free_form / issue-fetch body+comments) are
+omitted. Every operator-playbook field is retained — next_actions, all
+wait statuses, the run.concerns block, and each review's
+verdict/severity/category/concern keys. Set include_issue_context=true to
+restore the issue payload and include_review_prose=true to restore the
+reviewer free-text; both default false.
 
 Also returns plan_stage_wait_status + implement_stage_wait_status — each a
 StageWaitStatus whose status is one of
@@ -1257,6 +1275,39 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	// review concerns. On any error the slice stays nil — never fails the
 	// snapshot.
 	securityFindings := r.securityFindingsFor(ctx, runID)
+
+	// Compact-by-default projection (#1727), applied AFTER all reads and
+	// helper computations (next_actions/wait-status/hints saw the full
+	// data) but BEFORE serialization, so the heavy free-text is stripped
+	// from the marshalled payload — real token savings, not a client-side
+	// hide. Two opt-in flags restore today's full shape.
+	//   (a) issue_context: Run.IssueContext carries json issue_context,omitempty,
+	//       so a nil pointer drops the field entirely (same as list_runs).
+	//   (b) reviewer prose: clear free_form + concern notes on the typed
+	//       implement_reviews[]; verdict/authority/severity/category survive.
+	//   (c) recent_audit payloads: compact each entry's untyped payload so
+	//       implement_reviewed free_form and issue-fetch body/comments are
+	//       stripped too (a major token source).
+	// run.concerns already elides note text by design, so it is unaffected.
+	if !in.IncludeIssueContext {
+		runRow.IssueContext = nil
+	}
+	if !in.IncludeReviewProse {
+		// The same reviewer prose is carried by the typed implement_reviews[]
+		// AND by the reviews[] embedded in plan_review_status /
+		// implement_review_status — strip all three so the free-text is gone
+		// from the wire, not merely from one surface.
+		stripReviewProse(implementReviews)
+		if planReviewStatus != nil {
+			stripReviewProse(planReviewStatus.Reviews)
+		}
+		if implementReviewStatus != nil {
+			stripReviewProse(implementReviewStatus.Reviews)
+		}
+	}
+	for i := range recent {
+		recent[i].Payload = compactAuditPayload(recent[i].Payload, !in.IncludeIssueContext, !in.IncludeReviewProse)
+	}
 
 	return nil, GetRunStatusOutput{
 		Run:                       *runRow,

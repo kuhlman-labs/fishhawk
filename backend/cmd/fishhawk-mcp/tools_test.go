@@ -2203,6 +2203,189 @@ func TestGetRunStatus_WithImplementReviews_PopulatesField(t *testing.T) {
 	}
 }
 
+// seedRecentAuditPayload appends one recent-audit entry (served from the
+// /v0/audit feed, distinct from the per-run audit endpoint) carrying an
+// arbitrary decoded-JSON payload. Used by the #1727 compact-projection
+// tests to exercise the recent_audit body/comments/free_form strip.
+func seedRecentAuditPayload(fb *fakeBackend, runID uuid.UUID, category string, payload map[string]any) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	raw, _ := json.Marshal(payload)
+	var decoded any
+	_ = json.Unmarshal(raw, &decoded)
+	fb.auditByRun[runID] = append(fb.auditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.auditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		Category: category,
+		Payload:  decoded,
+	})
+}
+
+// seedCompactFixture builds a run that carries every heavy free-text field
+// the #1727 projection targets — issue_context, implement-review prose,
+// and a recent-audit payload with body/comments/free_form — plus the
+// operator-playbook fields (stages for the wait statuses, open concerns)
+// so the same fixture drives both the omission and the retention tests.
+func seedCompactFixture(t *testing.T) (*fakeBackend, *httptest.Server, uuid.UUID) {
+	t.Helper()
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{
+		ID: runID.String(), Repo: "x/y", State: "running",
+		IssueContext: &IssueContext{
+			Title:    "an issue",
+			Body:     "the big issue body text",
+			URL:      "https://example/issues/1",
+			Number:   1727,
+			Comments: []IssueComment{{Author: "a", Body: "a comment body", CreatedAt: "t"}},
+		},
+		Concerns: &RunConcerns{
+			Open:    1,
+			ByState: map[string]int{"raised": 1},
+			Items:   []RunConcernItem{{ID: uuid.NewString(), StageKind: "implement", Severity: "low", Category: "scope", State: "raised"}},
+		},
+	}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "running"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 3, Type: "acceptance", State: "pending"},
+	}
+	seedImplementReviewAudit(fb, runID, PlanReview{
+		ReviewerKind:  "agent",
+		ReviewerModel: "claude-opus-4-8",
+		Authority:     "advisory",
+		Verdict:       "approve_with_concerns",
+		Concerns:      []PlanReviewConcern{{Severity: "high", Category: "security", Note: "unvalidated input note"}},
+		FreeForm:      "reviewer free-text prose",
+	})
+	// A recent-audit review payload carrying nested prose + an issue-fetch
+	// payload carrying body/comments — the major recent_audit token source.
+	seedRecentAuditPayload(fb, runID, "implement_reviewed", map[string]any{
+		"verdict":   "approve_with_concerns",
+		"free_form": "recent payload prose",
+	})
+	seedRecentAuditPayload(fb, runID, "issue_context_fetched", map[string]any{
+		"title":    "an issue",
+		"body":     "recent payload issue body",
+		"comments": []any{map[string]any{"body": "recent comment body"}},
+	})
+	return fb, srv, runID
+}
+
+// TestGetRunStatus_CompactDefault_OmitsHeavyFreeText is the #1727 default
+// omission proof: issue_context, reviewer free_form, and per-concern notes
+// are stripped from the wire bytes, not merely nil in Go.
+func TestGetRunStatus_CompactDefault_OmitsHeavyFreeText(t *testing.T) {
+	_, srv, runID := seedCompactFixture(t)
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.Run.IssueContext != nil {
+		t.Errorf("Run.IssueContext = %+v, want nil (stripped by default)", out.Run.IssueContext)
+	}
+	if len(out.ImplementReviews) != 1 {
+		t.Fatalf("len(ImplementReviews) = %d, want 1", len(out.ImplementReviews))
+	}
+	if out.ImplementReviews[0].FreeForm != "" {
+		t.Errorf("ImplementReviews[0].FreeForm = %q, want cleared", out.ImplementReviews[0].FreeForm)
+	}
+	if n := out.ImplementReviews[0].Concerns[0].Note; n != "" {
+		t.Errorf("concern Note = %q, want cleared", n)
+	}
+	// Wire-bytes proof: the heavy keys must not survive serialization.
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal output: %v", err)
+	}
+	// "issue_context" as a bare substring would false-match the
+	// "issue_context_fetched" audit category name, so assert on the JSON
+	// key form ("issue_context":) plus the heavy values themselves.
+	for _, banned := range []string{`"issue_context":`, `"free_form":`, "the big issue body", "recent payload prose", "unvalidated input note", "recent payload issue body"} {
+		if strings.Contains(string(raw), banned) {
+			t.Errorf("wire bytes must not contain %q (compact default), got it in payload", banned)
+		}
+	}
+}
+
+// TestGetRunStatus_IncludeIssueContext_RestoresIssuePayload asserts the
+// opt-in restores IssueContext and the recent-audit body/comments.
+func TestGetRunStatus_IncludeIssueContext_RestoresIssuePayload(t *testing.T) {
+	_, srv, runID := seedCompactFixture(t)
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String(), IncludeIssueContext: true})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.Run.IssueContext == nil || out.Run.IssueContext.Body != "the big issue body text" {
+		t.Fatalf("IssueContext not restored: %+v", out.Run.IssueContext)
+	}
+	raw, _ := json.Marshal(out)
+	if !strings.Contains(string(raw), "recent payload issue body") {
+		t.Errorf("recent_audit issue body should be restored under include_issue_context")
+	}
+	// Review prose still stripped (the other flag was not set).
+	if out.ImplementReviews[0].FreeForm != "" {
+		t.Errorf("review free_form should still be stripped when only include_issue_context is set")
+	}
+}
+
+// TestGetRunStatus_IncludeReviewProse_RestoresReviewText asserts the opt-in
+// restores implement-review free_form + concern notes and the recent-audit
+// review payload free_form.
+func TestGetRunStatus_IncludeReviewProse_RestoresReviewText(t *testing.T) {
+	_, srv, runID := seedCompactFixture(t)
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String(), IncludeReviewProse: true})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.ImplementReviews[0].FreeForm != "reviewer free-text prose" {
+		t.Errorf("FreeForm = %q, want restored", out.ImplementReviews[0].FreeForm)
+	}
+	if out.ImplementReviews[0].Concerns[0].Note != "unvalidated input note" {
+		t.Errorf("concern Note = %q, want restored", out.ImplementReviews[0].Concerns[0].Note)
+	}
+	raw, _ := json.Marshal(out)
+	if !strings.Contains(string(raw), "recent payload prose") {
+		t.Errorf("recent_audit review free_form should be restored under include_review_prose")
+	}
+	// Issue context still stripped (the other flag was not set).
+	if out.Run.IssueContext != nil {
+		t.Errorf("IssueContext should still be stripped when only include_review_prose is set")
+	}
+}
+
+// TestGetRunStatus_CompactDefault_RetainsPlaybookFields is the retention
+// half of #1727: the compact default keeps every operator-playbook field.
+func TestGetRunStatus_CompactDefault_RetainsPlaybookFields(t *testing.T) {
+	_, srv, runID := seedCompactFixture(t)
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.NextActions == nil {
+		t.Error("NextActions is nil; want the playbook block retained")
+	}
+	if out.PlanStageWaitStatus == nil || out.ImplementStageWaitStatus == nil || out.AcceptanceStageWaitStatus == nil {
+		t.Errorf("wait statuses must be retained: plan=%v implement=%v acceptance=%v",
+			out.PlanStageWaitStatus, out.ImplementStageWaitStatus, out.AcceptanceStageWaitStatus)
+	}
+	if out.Run.Concerns == nil || out.Run.Concerns.Open != 1 {
+		t.Errorf("run.concerns must be retained, got %+v", out.Run.Concerns)
+	}
+	rev := out.ImplementReviews[0]
+	if rev.Verdict != "approve_with_concerns" || rev.Authority != "advisory" {
+		t.Errorf("review verdict/authority must be retained, got %+v", rev)
+	}
+	if len(rev.Concerns) != 1 || rev.Concerns[0].Severity != "high" || rev.Concerns[0].Category != "security" {
+		t.Errorf("concern severity/category must be retained, got %+v", rev.Concerns)
+	}
+}
+
 // TestGetRunStatus_Heterogeneous_BothReviewerRowsAcrossStages is the #1127
 // cross-seam test: a full heterogeneous round (configured_agents=2) on BOTH
 // the plan and implement stages must surface BOTH reviewer rows through the

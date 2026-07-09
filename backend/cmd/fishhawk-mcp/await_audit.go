@@ -20,6 +20,13 @@ type AwaitAuditInput struct {
 	Category       string `json:"category" jsonschema:"the audit category to wait for (e.g. 'implement_reviewed', 'fixup_pushed')"`
 	SinceSequence  int64  `json:"since_sequence,omitempty" jsonschema:"only an entry with sequence strictly greater than this resolves the wait (default 0 = the next entry of the category). Anchor it at the sequence of the event you are waiting past — e.g. the fixup_pushed entry's sequence when waiting for the post-fix-up implement_reviewed verdict"`
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"how long to wait before returning 'timeout' (default 360, capped at 600). On timeout, re-call with since_sequence = the returned latest_sequence to resume with no gap"`
+	// IncludeIssueContext / IncludeReviewProse opt the heavy free-text
+	// back into the returned entry's payload. Both default false: the
+	// compact default strips reviewer free_form and issue-context
+	// body/comments from the found entry's payload while retaining the
+	// verdict/severity/category keys (#1727).
+	IncludeIssueContext bool `json:"include_issue_context,omitempty" jsonschema:"include the found entry's issue-context body + comments in its payload; omitted by default to stay within the tool-result token budget"`
+	IncludeReviewProse  bool `json:"include_review_prose,omitempty" jsonschema:"include the found entry's reviewer free_form prose in its payload; omitted by default to stay within the tool-result token budget. Verdicts/severities/concern keys are always present regardless of this flag"`
 }
 
 // AwaitAuditOutput is the fishhawk_await_audit response. Status is one of:
@@ -87,6 +94,13 @@ Inputs:
                       category regardless of history.
   - timeout_seconds — default 360, capped at 600.
 
+The returned entry's payload is compact by default (#1727): oversized
+free-text — reviewer free_form prose and issue-context body/comments —
+is stripped to stay within the tool-result token budget, while the
+verdict/severity/category keys are always retained. Set
+include_review_prose=true or include_issue_context=true to restore the
+full payload.
+
 Re-polling fishhawk_get_run_status remains the authoritative fallback
 path (ADR-037); this tool blocks that poll for you when you would
 rather wait synchronously than loop yourself.
@@ -120,7 +134,7 @@ func (r *runResolver) awaitAudit(ctx context.Context, _ *mcp.CallToolRequest, in
 		return nil, AwaitAuditOutput{}, fmt.Errorf("list audit: %w", err)
 	}
 	if entry != nil {
-		return nil, awaitAuditFoundOutput(entry, start), nil
+		return nil, awaitAuditFoundOutput(entry, in, start), nil
 	}
 
 	// Nothing yet: check the run-terminal backstop once before the loop
@@ -155,7 +169,7 @@ func (r *runResolver) awaitAudit(ctx context.Context, _ *mcp.CallToolRequest, in
 				return nil, AwaitAuditOutput{}, fmt.Errorf("poll audit: %w", err)
 			}
 			if entry != nil {
-				return nil, awaitAuditFoundOutput(entry, start), nil
+				return nil, awaitAuditFoundOutput(entry, in, start), nil
 			}
 			if out, done := r.awaitAuditRunTerminalBackstop(pollCtx, runID, in, start); done {
 				return nil, out, nil
@@ -204,7 +218,7 @@ func (r *runResolver) awaitAuditRunTerminalBackstop(ctx context.Context, runID u
 	// still resolves as found.
 	entry, err := r.nextAuditEntry(ctx, runID, in.Category, in.SinceSequence)
 	if err == nil && entry != nil {
-		return awaitAuditFoundOutput(entry, start), true
+		return awaitAuditFoundOutput(entry, in, start), true
 	}
 	return AwaitAuditOutput{
 		Status:         "run_terminal",
@@ -218,10 +232,17 @@ func (r *runResolver) awaitAuditRunTerminalBackstop(ctx context.Context, runID u
 }
 
 // awaitAuditFoundOutput builds the resolved response for a matched entry.
-func awaitAuditFoundOutput(entry *AuditEntry, start time.Time) AwaitAuditOutput {
+// It applies the compact-by-default projection (#1727) to a COPY of the
+// entry so the returned payload has reviewer free_form and issue-context
+// body/comments stripped unless the caller opted in — the shared
+// backend-fetched AuditEntry is never mutated. LatestSequence is read off
+// the entry before the copy, so the anchor semantics are unaffected.
+func awaitAuditFoundOutput(entry *AuditEntry, in AwaitAuditInput, start time.Time) AwaitAuditOutput {
+	projected := *entry
+	projected.Payload = compactAuditPayload(entry.Payload, !in.IncludeIssueContext, !in.IncludeReviewProse)
 	return AwaitAuditOutput{
 		Status:         "found",
-		Entry:          entry,
+		Entry:          &projected,
 		LatestSequence: entry.Sequence,
 		WaitedSeconds:  time.Since(start).Seconds(),
 	}
