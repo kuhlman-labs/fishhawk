@@ -1134,6 +1134,23 @@ Notes:
   Same GLOBAL chain, same system actor, still best-effort. They remain
   best-effort and are still NOT issue-comment surfaces. Listed here only so a future reader grepping the
   audit categories doesn't mistake them for a comment surface.
+- The campaign **issue-restart** marker — `campaign_issue_restarted` (E32.9 /
+  #1729) — is a fourth **system-actor GLOBAL-chain audit kind, NOT an
+  issue-comment surface**, of the same family as the three above. The
+  operator-driven restart path (`POST /v0/campaigns/{id}/runs` →
+  `handleStartCampaignItemRun`) is the SOLE writer: when the started item is a
+  deps-satisfied, non-human-led **cancelled** item (the engine's `Restartable`
+  partition), the handler resets it to `pending` via
+  `campaign.Repository.RestartCampaignItem` — clearing the stale run link — and
+  emits `campaign_issue_restarted` with payload `{campaign_id, issue_ref,
+  prior_run_id, prior_state}` (`prior_run_id` is the empty string when the
+  cancelled item carried no run) BEFORE the normal mint/link/transition flow
+  emits the usual `campaign_issue_started` + `campaign_advanced` for the fresh
+  run. This is what gives a wedged campaign a forward path — a cancelled item's
+  dependents no longer stay blocked forever. Same GLOBAL chain, same system
+  actor, best-effort (a marshal/append failure WARN-logs and never unwinds the
+  restart). Still NOT an issue-comment surface — listed here only so a future
+  reader grepping the audit categories doesn't mistake it for a comment surface.
 - The campaign **pause** marker — `campaign_paused` (E25.7 / #1446, ADR-047
   Track C) — is also a **system-actor GLOBAL-chain audit kind, NOT an
   issue-comment surface**. The campaign-driver ticker

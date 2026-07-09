@@ -125,4 +125,31 @@ type Repository interface {
 	// idempotent no-op returning the unchanged item (its first PauseReason is
 	// preserved). This is the driver's gate-handoff entry point (E25.7).
 	PauseCampaignItem(ctx context.Context, id uuid.UUID, reason PauseReason) (*Item, error)
+
+	// RestartCampaignItem resets an item in a restartable TERMINAL state
+	// (cancelled or failed) back to pending and clears its run link, atomically
+	// under the same SELECT … FOR UPDATE lock as the other transitions — the
+	// operator-driven restart reset behind fishhawk_start_campaign_item_run
+	// (#1729). It deliberately lives OUTSIDE the campaignItemTransitions table
+	// (transition.go), which treats every terminal state as terminal
+	// (ValidCampaignItemTransition returns false for any terminal `from`): a
+	// restart is an operator reset, not a lifecycle transition, so it enforces
+	// its OWN guard here — `from` must be in {cancelled, failed} — and returns
+	// InvalidTransitionError for any other state (including running/succeeded)
+	// and ErrNotFound for a missing item. A concurrent second call re-reads the
+	// now-pending row under the lock and is rejected. On success the item is
+	// pending with run_id NULL, ready to fall through the mint/link/transition
+	// path for a fresh run.
+	//
+	// NOTE ON THE cancelled-vs-failed ASYMMETRY: this repository reset admits
+	// BOTH cancelled and failed as the forward-compatible seam for the
+	// failed-item recovery family. The OPERATOR VERB
+	// (handleStartCampaignItemRun), however, currently admits ONLY cancelled
+	// items: a failed item drives DeriveState to campaign `failed` (engine.go),
+	// which the handler's campaign-state gate refuses (campaign_not_startable)
+	// BEFORE item admission — so a failed item never reaches this reset through
+	// the verb today. The broader repo contract is intentional; the layering
+	// asymmetry is documented here at the definition site (operator arbitration,
+	// #1729).
+	RestartCampaignItem(ctx context.Context, id uuid.UUID) (*Item, error)
 }

@@ -916,6 +916,105 @@ func TestPostgres_PauseCampaignItem_InvalidAndMissing(t *testing.T) {
 	}
 }
 
+// TestPostgres_RestartCampaignItem is the E32.9 (#1729) round-trip + per-mode
+// done-means for the operator restart reset. It drives one item per named mode
+// through the reset:
+//   - cancelled → pending, run link cleared (the operator-verb path);
+//   - failed → pending, run link cleared (the broader repo contract);
+//   - succeeded → InvalidTransitionError (not restartable);
+//   - running → InvalidTransitionError (not restartable);
+//   - missing → ErrNotFound.
+//
+// A REAL runs row is linked so the run-link-clearing is observable.
+func TestPostgres_RestartCampaignItem(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	runRepo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+	c := makeCampaign(t, repo)
+
+	// mkLinkedItem creates an item linked to a fresh run and drives it to the
+	// requested state through the valid running-first path.
+	mkLinkedItem := func(t *testing.T, ref string, to campaign.ItemState) *campaign.Item {
+		t.Helper()
+		r, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+			Repo:          "kuhlman-labs/fishhawk",
+			WorkflowID:    "feature_change",
+			WorkflowSHA:   "deadbeef",
+			TriggerSource: run.TriggerCLI,
+		})
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		it, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+			CampaignID: c.ID,
+			IssueRef:   ref,
+		})
+		if err != nil {
+			t.Fatalf("create item: %v", err)
+		}
+		if _, err := repo.SetCampaignItemRun(ctx, it.ID, &r.ID); err != nil {
+			t.Fatalf("link run: %v", err)
+		}
+		if _, err := repo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateRunning); err != nil {
+			t.Fatalf("→running: %v", err)
+		}
+		if to != campaign.ItemStateRunning {
+			if _, err := repo.TransitionCampaignItem(ctx, it.ID, to); err != nil {
+				t.Fatalf("→%s: %v", to, err)
+			}
+		}
+		return it
+	}
+
+	// cancelled → pending, run link cleared.
+	cancelled := mkLinkedItem(t, "issue:cancelled", campaign.ItemStateCancelled)
+	restarted, err := repo.RestartCampaignItem(ctx, cancelled.ID)
+	if err != nil {
+		t.Fatalf("restart(cancelled): %v", err)
+	}
+	if restarted.State != campaign.ItemStatePending {
+		t.Errorf("restart(cancelled) state = %q, want pending", restarted.State)
+	}
+	if restarted.RunID != nil {
+		t.Errorf("restart(cancelled) run_id = %v, want nil (link cleared)", restarted.RunID)
+	}
+	// Persisted, not just returned.
+	if got, _ := repo.GetCampaignItem(ctx, cancelled.ID); got.State != campaign.ItemStatePending || got.RunID != nil {
+		t.Errorf("persisted cancelled restart = state %q run_id %v, want pending/nil", got.State, got.RunID)
+	}
+
+	// failed → pending, run link cleared (the broader repo contract).
+	failed := mkLinkedItem(t, "issue:failed", campaign.ItemStateFailed)
+	rf, err := repo.RestartCampaignItem(ctx, failed.ID)
+	if err != nil {
+		t.Fatalf("restart(failed): %v", err)
+	}
+	if rf.State != campaign.ItemStatePending || rf.RunID != nil {
+		t.Errorf("restart(failed) = state %q run_id %v, want pending/nil", rf.State, rf.RunID)
+	}
+
+	// succeeded → InvalidTransitionError (not a restartable state).
+	succeeded := mkLinkedItem(t, "issue:succeeded", campaign.ItemStateSucceeded)
+	var ite campaign.InvalidTransitionError
+	if _, err := repo.RestartCampaignItem(ctx, succeeded.ID); !errors.As(err, &ite) {
+		t.Errorf("restart(succeeded) err = %v, want InvalidTransitionError", err)
+	} else if ite.Kind != "campaign_item" || ite.From != "succeeded" {
+		t.Errorf("restart(succeeded) err = %+v, want campaign_item from succeeded", ite)
+	}
+
+	// running → InvalidTransitionError (not a restartable state).
+	running := mkLinkedItem(t, "issue:running", campaign.ItemStateRunning)
+	if _, err := repo.RestartCampaignItem(ctx, running.ID); !errors.As(err, &ite) {
+		t.Errorf("restart(running) err = %v, want InvalidTransitionError", err)
+	}
+
+	// missing → ErrNotFound.
+	if _, err := repo.RestartCampaignItem(ctx, uuid.New()); !errors.Is(err, campaign.ErrNotFound) {
+		t.Errorf("restart(missing) err = %v, want ErrNotFound", err)
+	}
+}
+
 // TestPostgres_RunLinkage_EndToEnd spans domain → persistence → run linkage:
 // it inserts a REAL runs row (via the run repo, exercising the cross-package
 // boundary), attaches it to a campaign item, and asserts both forward

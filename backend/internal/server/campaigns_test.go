@@ -50,6 +50,7 @@ type fakeCampaignRepo struct {
 	transCmpErr  error
 	transItemErr error
 	setRunErr    error
+	restartErr   error
 
 	// itemsErrOnCall, when non-zero, fails ListCampaignItemsForCampaign on
 	// exactly that 1-based call number (others succeed), so a test can exercise
@@ -63,6 +64,7 @@ type fakeCampaignRepo struct {
 	transItemCalls int
 	transCmpCalls  int
 	setRunCalls    int
+	restartCalls   int
 }
 
 func newFakeCampaignRepo() *fakeCampaignRepo {
@@ -174,6 +176,35 @@ func (f *fakeCampaignRepo) SetCampaignItemRun(_ context.Context, itemID uuid.UUI
 				continue
 			}
 			it.RunID = runID
+			it.UpdatedAt = time.Now().UTC()
+			return it, nil
+		}
+	}
+	return nil, campaign.ErrNotFound
+}
+
+// RestartCampaignItem resets a restartable-terminal item (cancelled or failed)
+// back to pending and clears its run link, mirroring the Postgres adapter's
+// InvalidTransitionError/ErrNotFound contract so the start handler's restart
+// path is exercised. restartErr injects a non-terminal error so the 500 branch
+// is reachable; restartCalls counts invocations for the audit/mutation asserts.
+func (f *fakeCampaignRepo) RestartCampaignItem(_ context.Context, id uuid.UUID) (*campaign.Item, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.restartCalls++
+	if f.restartErr != nil {
+		return nil, f.restartErr
+	}
+	for _, items := range f.itemsByCmp {
+		for _, it := range items {
+			if it.ID != id {
+				continue
+			}
+			if it.State != campaign.ItemStateCancelled && it.State != campaign.ItemStateFailed {
+				return nil, campaign.InvalidTransitionError{Kind: "campaign_item", From: string(it.State), To: string(campaign.ItemStatePending)}
+			}
+			it.State = campaign.ItemStatePending
+			it.RunID = nil
 			it.UpdatedAt = time.Now().UTC()
 			return it, nil
 		}
@@ -1114,6 +1145,37 @@ func TestComputeCampaignNextAction_Precedence(t *testing.T) {
 			elig:    campaign.Eligibility{Eligible: []string{"issue:6"}, HumanLed: []string{"issue:12"}},
 			want:    "start_run",
 			wantRef: "issue:6",
+		},
+		{
+			// Restartable (#1729): a deps-satisfied cancelled item surfaces as
+			// start_run so its dependents unblock — the campaign-wedge fix.
+			name:    "restartable only -> start_run",
+			elig:    campaign.Eligibility{Restartable: []string{"issue:20"}},
+			want:    "start_run",
+			wantRef: "issue:20",
+		},
+		{
+			// Eligible OUTRANKS Restartable: a fresh unstarted item is preferred
+			// over restarting a cancelled one.
+			name:    "eligible and restartable both present -> start_run (eligible wins)",
+			elig:    campaign.Eligibility{Eligible: []string{"issue:6"}, Restartable: []string{"issue:20"}},
+			want:    "start_run",
+			wantRef: "issue:6",
+		},
+		{
+			// Restartable OUTRANKS HumanLed: an autonomous restart is surfaced
+			// before human-led work.
+			name:    "restartable and human-led both present -> start_run (restartable wins)",
+			elig:    campaign.Eligibility{Restartable: []string{"issue:20"}, HumanLed: []string{"issue:12"}},
+			want:    "start_run",
+			wantRef: "issue:20",
+		},
+		{
+			// FAILED still wins over a restartable item (failed is strict-first).
+			name:    "failed and restartable both present -> attention",
+			elig:    campaign.Eligibility{Failed: []string{"issue:5"}, Restartable: []string{"issue:20"}},
+			want:    "attention",
+			wantRef: "issue:5",
 		},
 		{
 			// attend_human_led fires ONLY when no autonomous item is eligible.
@@ -2230,6 +2292,150 @@ func TestStartCampaignItemRun_ReconcileOnRead_FailedRun_Attention_E2E(t *testing
 	}
 	if n := aud.count("campaign_advanced"); n < 1 {
 		t.Errorf("campaign_advanced count = %d, want >=1 (running→failed)", n)
+	}
+}
+
+// newCampaignStartServerPG wires a Server with a REAL Postgres campaign + run
+// repo (so the run-link FK is enforced and RestartCampaignItem executes against
+// the adapter), a recording audit repo, and the GitHub spec stub — the setup
+// the restart cross-boundary E2E needs to cross HTTP → engine → Postgres repo.
+func newCampaignStartServerPG(t *testing.T) (*Server, campaign.Repository, run.Repository, *campaignAuditRecorder) {
+	t.Helper()
+	pool := pgtest.NewPool(t)
+	campaigns := campaign.NewPostgresRepository(pool)
+	runs := run.NewPostgresRepository(pool)
+	aud := &campaignAuditRecorder{}
+	fake := newFakeGitHubForRuns(gatedSpecYAML)
+	ghSrv := fake.server(t)
+	gh := &githubclient.Client{
+		BaseURL: ghSrv.URL,
+		Tokens:  &ghTokensStub{tok: "ghs_test"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "gha_app_jwt", nil },
+	}
+	s := New(Config{Addr: "127.0.0.1:0", CampaignRepo: campaigns, RunRepo: runs, AuditRepo: aud, GitHub: gh})
+	return s, campaigns, runs, aud
+}
+
+// TestStartCampaignItemRun_RestartCancelled_CrossBoundary_E2E is the E32.9
+// (#1729) headline done-means over a real Postgres: a terminal-cancelled item
+// with satisfied deps and a Blocked dependent — the campaign-wedge shape — is
+// restarted via POST /v0/campaigns/{id}/runs. It asserts the full crossing:
+//   - status reports next_action=start_run on the cancelled ref (folded into the
+//     wire cancelled slice), with the dependent still blocked;
+//   - the POST resets the item, mints + re-links a FRESH run (run_id changes),
+//     moves the item to running, and emits exactly one campaign_issue_restarted;
+//   - a second POST while the item is running is refused 409 item_not_eligible
+//     (the running-item refusal is preserved);
+//   - settling the fresh run succeeded unblocks the dependent on the next read.
+func TestStartCampaignItemRun_RestartCancelled_CrossBoundary_E2E(t *testing.T) {
+	ctx := context.Background()
+	s, campaigns, runs, aud := newCampaignStartServerPG(t)
+
+	c, err := campaigns.CreateCampaign(ctx, campaign.CreateCampaignParams{
+		Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:99",
+	})
+	if err != nil {
+		t.Fatalf("create campaign: %v", err)
+	}
+	// A: no deps — driven to succeeded so B's deps are satisfied.
+	itemA, err := campaigns.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{CampaignID: c.ID, IssueRef: "issue:100"})
+	if err != nil {
+		t.Fatalf("create A: %v", err)
+	}
+	if _, err := campaigns.TransitionCampaignItem(ctx, itemA.ID, campaign.ItemStateSucceeded); err != nil {
+		t.Fatalf("A→succeeded: %v", err)
+	}
+	// B: depends on A — driven to cancelled with a linked (now stale) run.
+	itemB, err := campaigns.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{CampaignID: c.ID, IssueRef: "issue:101", DependsOn: []string{"issue:100"}})
+	if err != nil {
+		t.Fatalf("create B: %v", err)
+	}
+	staleRef := "issue:101"
+	staleRun, err := runs.CreateRun(ctx, run.CreateRunParams{Repo: c.Repo, WorkflowID: "feature_change", WorkflowSHA: "deadbeef", TriggerSource: run.TriggerGitHubIssue, TriggerRef: &staleRef})
+	if err != nil {
+		t.Fatalf("create stale run: %v", err)
+	}
+	if _, err := campaigns.SetCampaignItemRun(ctx, itemB.ID, &staleRun.ID); err != nil {
+		t.Fatalf("link B stale run: %v", err)
+	}
+	if _, err := campaigns.TransitionCampaignItem(ctx, itemB.ID, campaign.ItemStateRunning); err != nil {
+		t.Fatalf("B→running: %v", err)
+	}
+	if _, err := campaigns.TransitionCampaignItem(ctx, itemB.ID, campaign.ItemStateCancelled); err != nil {
+		t.Fatalf("B→cancelled: %v", err)
+	}
+	// C: depends on B — stays pending (blocked on B).
+	if _, err := campaigns.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{CampaignID: c.ID, IssueRef: "issue:102", DependsOn: []string{"issue:101"}}); err != nil {
+		t.Fatalf("create C: %v", err)
+	}
+	// Campaign running (DeriveState over succeeded/cancelled/pending), so the
+	// dispatch gate passes.
+	if _, err := campaigns.TransitionCampaign(ctx, c.ID, campaign.StateRunning); err != nil {
+		t.Fatalf("campaign→running: %v", err)
+	}
+
+	// Status: the cancelled item is restartable → start_run on issue:101, folded
+	// into the wire cancelled slice; C still blocked.
+	st := getCampaignStatusBody(t, s, c.ID)
+	if st.NextAction.Action != "start_run" || st.NextAction.IssueRef != "issue:101" {
+		t.Fatalf("next_action = %+v, want start_run issue:101", st.NextAction)
+	}
+	if !containsRef(st.Rollup.Cancelled, "issue:101") {
+		t.Errorf("rollup.Cancelled = %v, want it to fold in issue:101", st.Rollup.Cancelled)
+	}
+	if !containsRef(st.Rollup.Blocked, "issue:102") {
+		t.Errorf("rollup.Blocked = %v, want [issue:102] still blocked", st.Rollup.Blocked)
+	}
+
+	// Restart via POST /runs.
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:101","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("restart status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var body startItemRunBody
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.Item.State != string(campaign.ItemStateRunning) {
+		t.Errorf("item state = %q, want running", body.Item.State)
+	}
+	if body.Item.RunID == nil || *body.Item.RunID != body.Run.ID {
+		t.Errorf("item run_id = %v, want linked to fresh run %s", body.Item.RunID, body.Run.ID)
+	}
+	if body.Run.ID == staleRun.ID {
+		t.Errorf("fresh run id = %s, want a NEW run distinct from the stale %s", body.Run.ID, staleRun.ID)
+	}
+	if n := aud.count("campaign_issue_restarted"); n != 1 {
+		t.Errorf("campaign_issue_restarted count = %d, want exactly 1", n)
+	}
+	if n := aud.count("campaign_issue_started"); n != 1 {
+		t.Errorf("campaign_issue_started count = %d, want 1 (fresh run started)", n)
+	}
+
+	// Regression: a second POST while the item is running is refused.
+	w2 := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:101","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w2.Code != http.StatusConflict || decodeCampaignError(t, w2) != "item_not_eligible" {
+		t.Fatalf("second start = %d/%s, want 409 item_not_eligible (body=%s)", w2.Code, decodeCampaignError(t, w2), w2.Body.String())
+	}
+
+	// Settle the fresh run succeeded → reconcile-on-read settles B and unblocks C.
+	// A real run reaches a terminal state through running.
+	if _, err := runs.TransitionRun(ctx, body.Run.ID, run.StateRunning); err != nil {
+		t.Fatalf("fresh run→running: %v", err)
+	}
+	if _, err := runs.TransitionRun(ctx, body.Run.ID, run.StateSucceeded); err != nil {
+		t.Fatalf("settle fresh run: %v", err)
+	}
+	st2 := getCampaignStatusBody(t, s, c.ID)
+	if !containsRef(st2.Rollup.Done, "issue:101") {
+		t.Errorf("rollup.Done = %v, want it to include the settled issue:101", st2.Rollup.Done)
+	}
+	if !containsRef(st2.Rollup.Eligible, "issue:102") {
+		t.Errorf("rollup.Eligible = %v, want [issue:102] (dependent unblocked)", st2.Rollup.Eligible)
+	}
+	if st2.NextAction.Action != "start_run" || st2.NextAction.IssueRef != "issue:102" {
+		t.Errorf("next_action = %+v, want start_run issue:102 after unblock", st2.NextAction)
 	}
 }
 

@@ -292,6 +292,53 @@ func (r *postgresRepo) PauseCampaignItem(ctx context.Context, id uuid.UUID, reas
 	return result, nil
 }
 
+// RestartCampaignItem resets a restartable-terminal item (cancelled or failed)
+// to pending and clears its run link, atomically under SELECT … FOR UPDATE. It
+// mirrors TransitionCampaignItem/PauseCampaignItem's lock posture but bypasses
+// the campaignItemTransitions terminal guard on purpose (a restart is an
+// operator reset, not a lifecycle transition — see the Repository doc): it
+// enforces its own from ∈ {cancelled, failed} check under the lock, then reuses
+// the generated SetCampaignItemRun{nil} + UpdateCampaignItemState{pending}
+// queries. Any other from — running/succeeded/pending/blocked/paused — is
+// rejected InvalidTransitionError; a missing item is ErrNotFound.
+func (r *postgresRepo) RestartCampaignItem(ctx context.Context, id uuid.UUID) (*Item, error) {
+	var result *Item
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := campaigndb.New(tx)
+		current, err := q.LockCampaignItemForUpdate(ctx, id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock campaign item: %w", err)
+		}
+		from := ItemState(current.State)
+		// Restart is only defined from a restartable terminal state. This guard
+		// stands in for the transition table, which refuses every terminal from.
+		if from != ItemStateCancelled && from != ItemStateFailed {
+			return InvalidTransitionError{Kind: "campaign_item", From: string(from), To: string(ItemStatePending)}
+		}
+		// Clear the run link first, then reset the state to pending. Both go
+		// through the same tx so the reset is all-or-nothing.
+		if _, err := q.SetCampaignItemRun(ctx, campaigndb.SetCampaignItemRunParams{ID: id, RunID: nil}); err != nil {
+			return fmt.Errorf("clear campaign item run: %w", err)
+		}
+		updated, err := q.UpdateCampaignItemState(ctx, campaigndb.UpdateCampaignItemStateParams{
+			ID:    id,
+			State: string(ItemStatePending),
+		})
+		if err != nil {
+			return fmt.Errorf("reset campaign item state: %w", err)
+		}
+		result = rowToCampaignItem(updated)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // --- Conversions between DB and domain types ---
 
 // marshalDependsOn renders the depends_on edge slice as a JSONB array. A nil
