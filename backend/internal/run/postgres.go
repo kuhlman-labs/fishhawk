@@ -149,6 +149,7 @@ func (r *postgresRepo) ListRuns(ctx context.Context, f ListRunsFilter) ([]*Run, 
 		TriggerRef:     f.TriggerRef,
 		RunnerKind:     f.RunnerKind,
 		DecomposedFrom: f.DecomposedFrom,
+		ParentRunID:    f.ParentRunID,
 		Lim:            int32(f.Limit),
 		Off:            int32(f.Offset),
 	})

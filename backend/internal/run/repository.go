@@ -156,8 +156,15 @@ type ListRunsFilter struct {
 	// DecomposedFrom filters to runs minted as children of the
 	// given parent run (#455). Nil = no constraint.
 	DecomposedFrom *uuid.UUID
-	Limit          int
-	Offset         int
+	// ParentRunID filters to recovery children minted with this
+	// parent_run_id — the resume/retry lineage loadApprovedPlanForRun
+	// walks upward (#216). Nil = no constraint. DISTINCT from
+	// DecomposedFrom: decomposition children carry decomposed_from,
+	// recovery children carry parent_run_id; the two lineages must not
+	// be conflated (#1751).
+	ParentRunID *uuid.UUID
+	Limit       int
+	Offset      int
 }
 
 // Repository persists runs and stages and applies state-machine

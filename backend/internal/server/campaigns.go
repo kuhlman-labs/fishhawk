@@ -1116,6 +1116,30 @@ func (s *Server) reconcileCampaignItemsOnRead(ctx context.Context, c *campaign.C
 					"campaign_id", c.ID.String(), "item_id", it.ID.String(), "run_state", string(runRow.State))
 				continue
 			}
+			// Recovery-lineage walk (#1751): a linked run that failed category-B
+			// may have been recovered via fishhawk_resume_run, which mints a
+			// recovery child carrying parent_run_id = the failed run. Settling
+			// straight off the failed run ignores that recovery and flips the
+			// campaign failed after the recovered work merged. So when the linked
+			// run is terminal-failed, walk its recovery descendants and settle off
+			// the newest terminal one instead. A still-in-flight recovery
+			// descendant leaves the item running (re-settled on a later read); no
+			// descendants preserves today's failed settle.
+			relinkID := it.RunID
+			if runRow.State == run.StateFailed {
+				desc, inFlight := s.newestTerminalRecoveryDescendant(ctx, *it.RunID)
+				if inFlight {
+					continue
+				}
+				if desc != nil {
+					dtarget, dok := mapRunTerminalToItemState(desc.State)
+					if dok {
+						target = dtarget
+						id := desc.ID
+						relinkID = &id
+					}
+				}
+			}
 			if !campaign.ValidCampaignItemTransition(it.State, target) {
 				continue
 			}
@@ -1124,11 +1148,21 @@ func (s *Server) reconcileCampaignItemsOnRead(ctx context.Context, c *campaign.C
 					"campaign_id", c.ID.String(), "item_id", it.ID.String(), "target", string(target), "error", err.Error())
 				continue
 			}
+			// Re-link the item to the recovery descendant it settled off, so the
+			// item's run_id reflects the run that actually produced the outcome
+			// (provenance). Best-effort: a link failure logs and does not unwind
+			// the settled transition.
+			if relinkID != it.RunID {
+				if _, err := s.cfg.CampaignRepo.SetCampaignItemRun(ctx, it.ID, relinkID); err != nil {
+					s.cfg.Logger.Warn("reconcile-on-read: relink item to recovery descendant failed; item settled but link stale",
+						"campaign_id", c.ID.String(), "item_id", it.ID.String(), "run_id", relinkID.String(), "error", err.Error())
+				}
+			}
 			settledAny = true
 			s.emitCampaignAudit(ctx, categoryCampaignIssueSettled, map[string]any{
 				"campaign_id": c.ID.String(),
 				"issue_ref":   it.IssueRef,
-				"run_id":      it.RunID.String(),
+				"run_id":      relinkID.String(),
 				"outcome":     string(target),
 			})
 		}
@@ -1295,6 +1329,66 @@ func (s *Server) deriveCampaignAfterChange(ctx context.Context, c *campaign.Camp
 		"from":        string(c.State),
 		"to":          string(newState),
 	})
+}
+
+// recoveryDescendantListLimit bounds each ListRuns page fetching a run's
+// recovery children. A resume/recovery fan-out at any single level is a
+// handful of runs (a run is resumed a few times at most), so 100 is generous
+// and never truncates a real lineage.
+const recoveryDescendantListLimit = 100
+
+// newestTerminalRecoveryDescendant transitively walks the recovery-child
+// lineage rooted at failedRunID — runs carrying parent_run_id = an ancestor,
+// the same lineage loadApprovedPlanForRun walks upward (#216) — and returns
+// the newest terminal descendant by CreatedAt, or inFlight=true when ANY
+// descendant is still non-terminal (a recovery in progress). Returns
+// (nil, false) when the failed run has no recovery children at all — the
+// caller then preserves today's direct failed settle.
+//
+// It is a BFS over the parent_run_id tree, cycle-guarded with a visited set so
+// a corrupt parent_run_id cycle can't loop forever. This lineage is DISTINCT
+// from DecomposedFrom (decomposition children, #455): the ParentRunID filter
+// selects only resume/recovery children, so a decomposition child is never
+// mistaken for a recovery of the failed run (#1751).
+//
+// BEST-EFFORT: a ListRuns error logs and returns (nil, false) so reconcile
+// never fails the read — the item then keeps today's failed settle.
+func (s *Server) newestTerminalRecoveryDescendant(ctx context.Context, failedRunID uuid.UUID) (*run.Run, bool) {
+	if s.cfg.RunRepo == nil {
+		return nil, false
+	}
+	visited := map[uuid.UUID]bool{failedRunID: true}
+	queue := []uuid.UUID{failedRunID}
+	var newest *run.Run
+	for len(queue) > 0 {
+		parent := queue[0]
+		queue = queue[1:]
+		children, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
+			ParentRunID: &parent,
+			Limit:       recoveryDescendantListLimit,
+		})
+		if err != nil {
+			s.cfg.Logger.Warn("reconcile-on-read: list recovery children failed; treating failed run as having no recovery lineage",
+				"parent_run_id", parent.String(), "error", err.Error())
+			return nil, false
+		}
+		for _, child := range children {
+			if visited[child.ID] {
+				continue
+			}
+			visited[child.ID] = true
+			// Any non-terminal descendant means a recovery is still in flight;
+			// leave the item running for a later read rather than settling it.
+			if !child.State.IsTerminal() {
+				return nil, true
+			}
+			if newest == nil || child.CreatedAt.After(newest.CreatedAt) {
+				newest = child
+			}
+			queue = append(queue, child.ID)
+		}
+	}
+	return newest, false
 }
 
 // mapRunTerminalToItemState maps a terminal run state to the campaign item's

@@ -35,6 +35,7 @@ SELECT * FROM runs
    AND (sqlc.narg('trigger_ref')::text IS NULL OR trigger_ref = sqlc.narg('trigger_ref'))
    AND (sqlc.narg('runner_kind')::text IS NULL OR runner_kind = sqlc.narg('runner_kind'))
    AND (sqlc.narg('decomposed_from')::uuid IS NULL OR decomposed_from = sqlc.narg('decomposed_from'))
+   AND (sqlc.narg('parent_run_id')::uuid IS NULL OR parent_run_id = sqlc.narg('parent_run_id'))
  ORDER BY created_at DESC, id DESC
  LIMIT sqlc.arg('lim') OFFSET sqlc.arg('off');
 

@@ -516,8 +516,9 @@ SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, 
    AND ($5::text IS NULL OR trigger_ref = $5)
    AND ($6::text IS NULL OR runner_kind = $6)
    AND ($7::uuid IS NULL OR decomposed_from = $7)
+   AND ($8::uuid IS NULL OR parent_run_id = $8)
  ORDER BY created_at DESC, id DESC
- LIMIT $9 OFFSET $8
+ LIMIT $10 OFFSET $9
 `
 
 type ListRunsParams struct {
@@ -528,6 +529,7 @@ type ListRunsParams struct {
 	TriggerRef     *string    `json:"trigger_ref"`
 	RunnerKind     *string    `json:"runner_kind"`
 	DecomposedFrom *uuid.UUID `json:"decomposed_from"`
+	ParentRunID    *uuid.UUID `json:"parent_run_id"`
 	Off            int32      `json:"off"`
 	Lim            int32      `json:"lim"`
 }
@@ -549,6 +551,7 @@ func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, erro
 		arg.TriggerRef,
 		arg.RunnerKind,
 		arg.DecomposedFrom,
+		arg.ParentRunID,
 		arg.Off,
 		arg.Lim,
 	)

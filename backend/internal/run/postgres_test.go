@@ -395,6 +395,74 @@ func TestPostgres_ListRuns(t *testing.T) {
 	_ = r3 // silence "declared and not used" if filters change.
 }
 
+// TestPostgres_ListRuns_ParentRunIDFilter proves the new ParentRunID filter
+// (#1751) selects only recovery children minted with parent_run_id = the given
+// run, and DOES NOT conflate them with decomposition children (decomposed_from)
+// or unrelated runs. This is the cross-layer guard for the hand-edited
+// positional-parameter renumber in db/queries.sql.go: a wrong $8/$9/$10 mapping
+// fails here.
+func TestPostgres_ListRuns_ParentRunIDFilter(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	parent := makeRun(t, repo)
+
+	// A recovery child carries parent_run_id = parent.
+	recoveryChild, err := repo.CreateRun(ctx, run.CreateRunParams{
+		Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", WorkflowSHA: "sha-rec",
+		TriggerSource: run.TriggerCLI, ParentRunID: &parent.ID,
+	})
+	if err != nil {
+		t.Fatalf("create recovery child: %v", err)
+	}
+	// A decomposition child carries decomposed_from = parent — a DISTINCT
+	// lineage that the ParentRunID filter must NOT return.
+	if _, err := repo.CreateRun(ctx, run.CreateRunParams{
+		Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", WorkflowSHA: "sha-dec",
+		TriggerSource: run.TriggerCLI, DecomposedFrom: &parent.ID,
+	}); err != nil {
+		t.Fatalf("create decomposition child: %v", err)
+	}
+	// An unrelated run with no lineage pointer at all.
+	if _, err := repo.CreateRun(ctx, run.CreateRunParams{
+		Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", WorkflowSHA: "sha-unrel",
+		TriggerSource: run.TriggerCLI,
+	}); err != nil {
+		t.Fatalf("create unrelated run: %v", err)
+	}
+
+	got, err := repo.ListRuns(ctx, run.ListRunsFilter{ParentRunID: &parent.ID, Limit: 10})
+	if err != nil {
+		t.Fatalf("list runs by parent_run_id: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != recoveryChild.ID {
+		t.Fatalf("ParentRunID filter = %d runs %v, want exactly the recovery child %s", len(got), runIDs(got), recoveryChild.ID)
+	}
+	if got[0].ParentRunID == nil || *got[0].ParentRunID != parent.ID {
+		t.Errorf("recovery child ParentRunID = %v, want %s", got[0].ParentRunID, parent.ID)
+	}
+
+	// A nil ParentRunID is no constraint: every run (parent + 3 children) is
+	// returned, proving the filter defaults off.
+	all, err := repo.ListRuns(ctx, run.ListRunsFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("list runs unfiltered: %v", err)
+	}
+	if len(all) != 4 {
+		t.Errorf("unfiltered = %d, want 4 (parent + 3 children)", len(all))
+	}
+}
+
+// runIDs projects run ids for test failure messages.
+func runIDs(runs []*run.Run) []uuid.UUID {
+	out := make([]uuid.UUID, len(runs))
+	for i, r := range runs {
+		out[i] = r.ID
+	}
+	return out
+}
+
 func TestPostgres_TransitionRun_HappyPath(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
