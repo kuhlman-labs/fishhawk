@@ -864,7 +864,11 @@ type startCampaignItemRunRequest struct {
 // handleStartCampaignItemRun implements POST /v0/campaigns/{campaign_id}/runs:
 // the operator-driven, campaign-aware run start (E26.2 / #1481). For an
 // issue_ref in the campaign it refuses unless the item is eligible per
-// campaign.NextEligible (naming the blocking dependency on refusal), mints the
+// campaign.NextEligible (naming the blocking dependency on refusal). A
+// deps-satisfied autonomy:low (human-led) item is refused at the primary DAG
+// gate with a DISTINCT item_human_led code whose detail says a human must lead
+// it — never "start the ref" (#1697); every other refusal keeps the generic
+// item_not_eligible detail. On an eligible/restartable item it mints the
 // run via Server.StartRunForCampaignIssue (carrying runner_kind so the local
 // loop gets runner_kind:local), links it with SetCampaignItemRun, transitions
 // the item pending → running, and derives/advances the campaign so a
@@ -967,6 +971,20 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 	elig := campaign.NextEligible(items)
 	isRestartable := containsRef(elig.Restartable, req.IssueRef)
 	if !containsRef(elig.Eligible, req.IssueRef) && !isRestartable {
+		// A deps-satisfied autonomy:low item is human-led (#1551 / E32.4): it is
+		// refused with a DISTINCT item_human_led code whose detail names the
+		// human-led reason and does NOT tell the caller to start a ref (its
+		// next_action is attend_human_led, which names no startable ref — #1697).
+		// Every other refusal keeps the generic item_not_eligible detail.
+		if containsRef(elig.HumanLed, req.IssueRef) {
+			s.writeError(w, r, http.StatusConflict, "item_human_led",
+				humanLedDetail(), map[string]any{
+					"campaign_id": id.String(),
+					"issue_ref":   req.IssueRef,
+					"item_state":  string(item.State),
+				})
+			return
+		}
 		s.writeError(w, r, http.StatusConflict, "item_not_eligible",
 			ineligibilityDetail(item, items), map[string]any{
 				"campaign_id": id.String(),
@@ -1135,6 +1153,15 @@ func ineligibilityDetail(item *campaign.Item, items []*campaign.Item) string {
 	default:
 		return "item is already in state " + string(item.State) + "; only an eligible (unstarted, dependencies-satisfied) item can be started"
 	}
+}
+
+// humanLedDetail returns the refusal detail for a deps-satisfied autonomy:low
+// (human-led) item. It single-sources the attend_human_led wording the campaign
+// status surface already uses (computeCampaignNextAction, #1681) and, unlike
+// ineligibilityDetail, does NOT tell the caller to start a ref — a human-led
+// item's next_action names no startable ref (#1697).
+func humanLedDetail() string {
+	return "item is deps-satisfied but autonomy:low (human-led); a human must lead it — do not start an agent run (next_action: attend_human_led)"
 }
 
 // firstUnmetDependency returns the item's first depends_on ref whose target
