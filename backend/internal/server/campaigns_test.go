@@ -2743,6 +2743,36 @@ func TestStartCampaignItemRun_AlreadyDone(t *testing.T) {
 	}
 }
 
+// TestStartCampaignItemRun_HumanLed_NamesHumanLedReason refuses a deps-satisfied
+// autonomy:low (human-led) item with the DISTINCT 409 item_human_led code whose
+// detail names the human-led reason and does NOT tell the caller to start a ref
+// (#1697). This is the done-means: a no-op edit that left the generic
+// item_not_eligible code fails here.
+func TestStartCampaignItemRun_HumanLed_NamesHumanLedReason(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s := New(Config{CampaignRepo: crepo})
+	humanLed := cItem("issue:101", []string{"issue:100"}, campaign.ItemStatePending)
+	humanLed.Autonomy = "low"
+	c := crepo.seedCampaignWithItems("x/y", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStateSucceeded),
+		humanLed,
+	})
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:101","workflow_id":"feature_change"}`)
+	if w.Code != http.StatusConflict || decodeCampaignError(t, w) != "item_human_led" {
+		t.Fatalf("status/code = %d/%s, want 409 item_human_led (body=%s)", w.Code, decodeCampaignError(t, w), w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "human-led") {
+		t.Errorf("body should name the human-led reason: %s", body)
+	}
+	if !strings.Contains(body, "attend_human_led") {
+		t.Errorf("body should reference attend_human_led: %s", body)
+	}
+	if strings.Contains(body, "start the ref") || strings.Contains(body, "next_action names") {
+		t.Errorf("body must NOT tell the caller to start a ref: %s", body)
+	}
+}
+
 // TestStartCampaignItemRun_ItemNotFound 404s an unknown issue_ref.
 func TestStartCampaignItemRun_ItemNotFound(t *testing.T) {
 	crepo := newFakeCampaignRepo()

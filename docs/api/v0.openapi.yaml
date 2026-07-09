@@ -5621,6 +5621,9 @@ paths:
             `campaign_not_startable` — the campaign is paused (resume it first)
             or terminal; `item_not_eligible` — the item is blocked on a
             dependency (the detail names it), already running, or terminal;
+            `item_human_led` — the item is deps-satisfied but `autonomy:low`
+            (human-led); a human must lead it out of band (do not start an agent
+            run) — the detail does not name a ref to start;
             `invalid_transition` — a concurrent change made the running
             transition illegal.
         '502':

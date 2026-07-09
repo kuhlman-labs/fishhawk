@@ -198,8 +198,10 @@ campaign_id, issue_ref, and workflow_id are required. Pass runner_kind 'local'
 for the local dogfood loop. A write tool: needs an operator token with
 write:campaigns scope (a runner-bound token is rejected 403). A running or
 still-blocked item fails item_not_eligible (the detail names the unmet
-dependency); an unknown issue_ref fails campaign_item_not_found; a paused or
-terminal campaign fails campaign_not_startable.
+dependency); a deps-satisfied autonomy:low (human-led) item fails item_human_led
+instead — a human must lead it out of band, do not start an agent run; an
+unknown issue_ref fails campaign_item_not_found; a paused or terminal campaign
+fails campaign_not_startable.
 `),
 	}, resolver.startCampaignItemRun)
 }
@@ -231,6 +233,9 @@ func (r *runResolver) startCampaignItemRun(ctx context.Context, _ *mcp.CallToolR
 			case "item_not_eligible":
 				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
 					"item_not_eligible: %s — only an eligible item can be started; poll fishhawk_get_campaign_status and start the ref its next_action names", ae.Message)
+			case "item_human_led":
+				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
+					"item_human_led: %s — this item is deps-satisfied but autonomy:low (human-led); a human must lead it out of band (do not start an agent run), then re-poll fishhawk_get_campaign_status", ae.Message)
 			case "campaign_not_startable":
 				return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
 					"campaign_not_startable: %s — a paused campaign must be resumed (fishhawk_resume_campaign) and a terminal one cannot start new runs", ae.Message)

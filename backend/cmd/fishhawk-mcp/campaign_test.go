@@ -557,6 +557,35 @@ func TestStartCampaignItemRun_ItemNotEligible_MapsActionableError(t *testing.T) 
 	}
 }
 
+// TestStartCampaignItemRun_ItemHumanLed_MapsActionableError maps the DISTINCT
+// human-led refusal (#1697): a deps-satisfied autonomy:low item yields
+// item_human_led, and the wrapper routes to out-of-band handling + re-poll
+// WITHOUT the "start the ref" suffix the item_not_eligible case keeps. The fake
+// backend returns the byte-real error JSON the server writes (status + code +
+// the human-led detail shape), so the decode/wrap path runs against the true
+// wire shape rather than a hand-built apiError.
+func TestStartCampaignItemRun_ItemHumanLed_MapsActionableError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.startCampaignItemRunStatus = http.StatusConflict
+	fb.startCampaignItemRunErr = `{"error":{"code":"item_human_led","message":"item is deps-satisfied but autonomy:low (human-led); a human must lead it — do not start an agent run (next_action: attend_human_led)"}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+		CampaignID: uuid.NewString(), IssueRef: "issue:101", WorkflowID: "feature_change",
+	})
+	if err == nil {
+		t.Fatal("err = nil, want item_human_led mapping")
+	}
+	for _, want := range []string{"item_human_led", "human-led", "fishhawk_get_campaign_status"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+	if strings.Contains(err.Error(), "start the ref") || strings.Contains(err.Error(), "next_action names") {
+		t.Errorf("err must NOT tell the caller to start a ref: %q", err.Error())
+	}
+}
+
 // TestStartCampaignItemRun_CampaignNotStartable_MapsActionableError maps the
 // paused/terminal-campaign refusal.
 func TestStartCampaignItemRun_CampaignNotStartable_MapsActionableError(t *testing.T) {
