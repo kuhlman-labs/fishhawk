@@ -632,54 +632,73 @@ func TestResolveReviewerInvocations_AgentVersionThreaded(t *testing.T) {
 }
 
 // TestReviewerAgentVersionMismatch enumerates the #1743 guard's branches: an
-// out-of-range codex reviewer is the only fail-loud case; in-range,
-// unprobeable, no-declared-range, and a non-probing (anthropic) reviewer all
-// degrade to no-mismatch (proceed).
+// out-of-range codex reviewer is the only fail-loud (mismatch) case; an
+// unprobeable CLI proceeds but is degraded=true so the caller can WARN;
+// in-range, no-declared-range, and a non-probing (anthropic) reviewer proceed
+// quietly (neither mismatch nor degraded).
 func TestReviewerAgentVersionMismatch(t *testing.T) {
 	const rng = ">=0.30 <0.31"
 	cases := []struct {
 		name         string
 		inv          reviewerInvocation
 		wantMismatch bool
+		wantDegraded bool
 	}{
 		{
-			name:         "in range proceeds",
+			name:         "in range proceeds quietly",
 			inv:          reviewerInvocation{provider: "codex", agentVersion: rng, reviewer: &probingReviewer{version: "0.30.5 (codex-cli)"}},
 			wantMismatch: false,
+			wantDegraded: false,
 		},
 		{
 			name:         "out of range fails loudly",
 			inv:          reviewerInvocation{provider: "codex", agentVersion: rng, reviewer: &probingReviewer{version: "0.140.0 (codex-cli)"}},
 			wantMismatch: true,
+			wantDegraded: false,
 		},
 		{
-			name:         "unprobeable degrades",
+			name:         "unprobeable degrades with warning",
 			inv:          reviewerInvocation{provider: "codex", agentVersion: rng, reviewer: &probingReviewer{version: "unknown"}},
 			wantMismatch: false,
+			wantDegraded: true,
 		},
 		{
 			name:         "no declared range",
 			inv:          reviewerInvocation{provider: "codex", agentVersion: "", reviewer: &probingReviewer{version: "0.140.0 (codex-cli)"}},
 			wantMismatch: false,
+			wantDegraded: false,
 		},
 		{
 			name:         "non-probing reviewer ignored",
 			inv:          reviewerInvocation{provider: "anthropic", agentVersion: rng, reviewer: &fakePlanReviewer{}},
 			wantMismatch: false,
+			wantDegraded: false,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mismatch, reason := reviewerAgentVersionMismatch(context.Background(), tc.inv)
+			mismatch, degraded, reason := reviewerAgentVersionMismatch(context.Background(), tc.inv)
 			if mismatch != tc.wantMismatch {
 				t.Fatalf("mismatch = %v, want %v (reason=%q)", mismatch, tc.wantMismatch, reason)
 			}
-			if mismatch {
+			if degraded != tc.wantDegraded {
+				t.Fatalf("degraded = %v, want %v (reason=%q)", degraded, tc.wantDegraded, reason)
+			}
+			switch {
+			case mismatch:
 				if !strings.Contains(reason, rng) || !strings.Contains(reason, "0.140.0") {
 					t.Errorf("reason %q must name both the declared range and the probed version", reason)
 				}
-			} else if reason != "" {
-				t.Errorf("reason = %q, want empty when there is no mismatch", reason)
+			case degraded:
+				// The degrade diagnosis must name the range and the unprobeable
+				// version so the WARN is actionable, not a bare "proceeding".
+				if !strings.Contains(reason, rng) || !strings.Contains(reason, "unknown") {
+					t.Errorf("degraded reason %q must name the declared range and the unprobeable version", reason)
+				}
+			default:
+				if reason != "" {
+					t.Errorf("reason = %q, want empty when the guard proceeds quietly", reason)
+				}
 			}
 		})
 	}
@@ -752,10 +771,14 @@ func TestPlanReviewLoop_AgentVersionInRangeDispatches(t *testing.T) {
 
 // TestPlanReviewLoop_AgentVersionUnprobeableDegrades asserts the degrade path:
 // a codex reviewer whose CLI version is unprobeable ("unknown") is dispatched
-// anyway — the guard never blocks a review on an uncomparable version.
+// anyway — the guard never blocks a review on an uncomparable version — but the
+// degrade is OBSERVABLE: a WARN naming the provider, range, and reason is
+// emitted so an operator can see the compatibility guard was disabled (#1743).
 func TestPlanReviewLoop_AgentVersionUnprobeableDegrades(t *testing.T) {
 	au := newSeqAuditFake()
+	var logBuf bytes.Buffer
 	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	runID, stageID := uuid.New(), uuid.New()
 
 	rev := &probingReviewer{version: "unknown", verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "gpt-5-codex"}
@@ -775,6 +798,18 @@ func TestPlanReviewLoop_AgentVersionUnprobeableDegrades(t *testing.T) {
 	}
 	if n := len(au.entriesByCategory("plan_reviewed")); n != 1 {
 		t.Fatalf("plan_reviewed entries = %d, want 1", n)
+	}
+	// The degrade must not be silent: a WARN naming the guard, provider, and
+	// declared range is emitted so the disabled compatibility check is visible.
+	logs := logBuf.String()
+	if !strings.Contains(logs, "compatibility guard not enforced") {
+		t.Errorf("expected a WARN that the compatibility guard was not enforced; logs:\n%s", logs)
+	}
+	if !strings.Contains(logs, `"level":"WARN"`) {
+		t.Errorf("expected the degrade log at WARN level; logs:\n%s", logs)
+	}
+	if !strings.Contains(logs, "codex") || !strings.Contains(logs, ">=0.30 <0.31") {
+		t.Errorf("expected the WARN to name the provider and declared range; logs:\n%s", logs)
 	}
 }
 

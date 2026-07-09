@@ -1441,7 +1441,7 @@ type versionProber interface {
 //
 // It returns mismatch=true ONLY in the fail-loud case — the probed version is
 // comparable AND out of range — so the caller blocks the review dispatch. Every
-// other case degrades to mismatch=false (proceed):
+// other case leaves mismatch=false (proceed):
 //   - no declared range (nothing to enforce);
 //   - a reviewer that exposes no version probe (anthropic/claudecode — the
 //     field is ignored for non-codex reviewers this slice does not enforce);
@@ -1451,22 +1451,36 @@ type versionProber interface {
 //     ValidAgentVersionRange, so a parse error here is a validator gap, not an
 //     operator-facing dispatch fault, and must not block a real review.
 //
+// The unprobeable case additionally returns degraded=true so the caller can
+// emit an observable WARN: a codex reviewer whose CLI version cannot be compared
+// silently disables the compatibility guard, so proceeding must not be silent
+// (#1743). degraded is mutually exclusive with mismatch — the fail-loud path is
+// already loud via mismatch — and the other proceed cases (no range, non-probing
+// reviewer, in-range, malformed range) stay quiet.
+//
 // reason is a human-readable diagnosis naming the provider, probed version, and
-// declared range when mismatch is true; empty otherwise.
-func reviewerAgentVersionMismatch(ctx context.Context, inv reviewerInvocation) (mismatch bool, reason string) {
+// declared range when mismatch OR degraded is true; empty otherwise.
+func reviewerAgentVersionMismatch(ctx context.Context, inv reviewerInvocation) (mismatch, degraded bool, reason string) {
 	if inv.agentVersion == "" {
-		return false, ""
+		return false, false, ""
 	}
 	prober, ok := inv.reviewer.(versionProber)
 	if !ok {
-		return false, ""
+		return false, false, ""
 	}
 	probed := prober.ProbeVersion(ctx)
 	matched, comparable, err := spec.MatchAgentVersionRange(inv.agentVersion, probed)
-	if err != nil || !comparable || matched {
-		return false, ""
+	if err != nil {
+		return false, false, ""
 	}
-	return true, fmt.Sprintf("%s reviewer CLI version %q is outside the declared agent_version range %q",
+	if !comparable {
+		return false, true, fmt.Sprintf("%s reviewer CLI version %q is not comparable against the declared agent_version range %q — compatibility guard not enforced, proceeding",
+			inv.provider, probed, inv.agentVersion)
+	}
+	if matched {
+		return false, false, ""
+	}
+	return true, false, fmt.Sprintf("%s reviewer CLI version %q is outside the declared agent_version range %q",
 		inv.provider, probed, inv.agentVersion)
 }
 
@@ -1510,9 +1524,10 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 		// category-C exit); the advisory caller ignores the return, leaving the
 		// human gate authoritative. Emit a terminal plan_review_failed entry
 		// carrying the range+version diagnosis, and skip the reviewer. An
-		// unprobeable/"unknown" CLI degrades to proceed (mismatch=false), never
-		// blocking.
-		if mismatch, reason := reviewerAgentVersionMismatch(ctx, inv); mismatch {
+		// unprobeable/"unknown" CLI degrades to proceed (mismatch=false) but is
+		// NOT silent: it emits a WARN so an operator can see the compatibility
+		// guard was disabled for this reviewer.
+		if mismatch, degraded, reason := reviewerAgentVersionMismatch(ctx, inv); mismatch {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
 				"plan review: reviewer CLI version outside declared agent_version range — failing review dispatch",
 				slog.String("run_id", runID.String()),
@@ -1525,6 +1540,16 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 			s.emitReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, inv.specModel, reason, false)
 			hasRejection = true
 			continue
+		} else if degraded {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"plan review: reviewer CLI version unprobeable — agent_version compatibility guard not enforced, proceeding",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.Int("reviewer_index", i),
+				slog.String("provider", inv.provider),
+				slog.String("agent_version_range", inv.agentVersion),
+				slog.String("reason", reason),
+			)
 		}
 		// Apply the size-aware per-invocation budget (#747) as a context
 		// deadline so a large diff gets proportionally more wall-clock. The
