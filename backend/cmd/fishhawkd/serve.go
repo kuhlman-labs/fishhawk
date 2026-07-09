@@ -334,6 +334,43 @@ func resolveIdentityProvider(oauthClientID string, token func(context.Context) (
 	return identity.NewGitHubIdentityProvider(oauthClientID, token)
 }
 
+// resolveOperatorRepoToken builds the REST-read token accessor the forge-neutral
+// identity provider uses to authenticate its permission/membership reads
+// (E39.10 / #1753). The token-mint authz gate (#1708/#1709) reads
+// GET /repos/{owner}/{repo}/collaborators/{login}/permission, which GitHub only
+// answers for an authenticated caller with push access — so an anonymous read
+// 401s and the mint handler 500s. This accessor mints/reuses the operator-repo
+// installation token so those reads carry a credential.
+//
+// It fail-closes to nil (→ anonymous reads, preserving the pre-#1753 behavior)
+// when App auth is absent (gh or tokens nil) or operatorRepo is empty / not
+// "owner/name". Otherwise it returns a closure that resolves the App
+// installation id for the operator repo (an App-JWT endpoint the NewWithSigner
+// client already backs) then mints/reuses the per-installation token via the
+// CachedProvider.
+//
+// Like resolveRefinementRepo / resolveIdentityProvider, this is the single
+// construction seam the serve-wiring test (TestResolveOperatorRepoToken) drives,
+// so a nil hand-off at the OAuth block is caught by a unit test rather than only
+// surfacing as a live 500.
+func resolveOperatorRepoToken(gh *githubclient.Client, tokens githubapp.TokenProvider, operatorRepo string) func(context.Context) (string, error) {
+	if gh == nil || tokens == nil {
+		return nil
+	}
+	owner, name, ok := strings.Cut(operatorRepo, "/")
+	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+		return nil
+	}
+	repo := githubclient.RepoRef{Owner: owner, Name: name}
+	return func(ctx context.Context) (string, error) {
+		installationID, err := gh.GetRepoInstallation(ctx, repo)
+		if err != nil {
+			return "", fmt.Errorf("resolve operator repo installation: %w", err)
+		}
+		return tokens.Token(ctx, installationID)
+	}
+}
+
 // buildModelProviders builds the provider→Fetcher map the live ModelOracle
 // (#1341) refreshes. A provider is registered ONLY when its API key is present:
 // an absent key leaves the provider UNREGISTERED, so its Snapshot reports
@@ -1039,14 +1076,22 @@ func runServe(args []string, logSink io.Writer) int {
 		// same OAuth client config: with a client_id present we construct
 		// the GitHub device-flow + REST implementation; leaving the field
 		// nil on the else branch lets server.New fall back to the
-		// deny-by-default NoOp. REST reads go out anonymously for now (no
-		// token accessor wired) — the seam accepts one when a later issue
-		// needs authenticated permission/membership reads.
-		cfg.IdentityProvider = resolveIdentityProvider(*oauthClientID, nil)
+		// deny-by-default NoOp. The identity provider's permission/membership
+		// reads authenticate with the operator-repo installation token
+		// (E39.10 / #1753): the mint-authz collaborator-permission GET only
+		// answers an authenticated caller with push access, so an anonymous
+		// read 401s and `fishhawk token login` 500s. resolveOperatorRepoToken
+		// degrades to nil (anonymous reads) when App auth is absent.
+		operatorRepoToken := resolveOperatorRepoToken(cfg.GitHub, cfg.GitHubTokens, cfg.OperatorRepo)
+		if operatorRepoToken == nil {
+			logger.Warn("identity-provider REST reads stay anonymous: token-mint authz gate (fishhawk token login) will fail HTTP 500 until FISHHAWKD_GITHUB_APP_ID + key are configured")
+		}
+		cfg.IdentityProvider = resolveIdentityProvider(*oauthClientID, operatorRepoToken)
 		logger.Info("github oauth sign-in configured",
 			slog.String("callback_url", *oauthCallbackURL),
 			slog.String("redirect_after_login", *oauthRedirectAfterLogin),
-			slog.Bool("github_identity_provider", cfg.IdentityProvider != nil))
+			slog.Bool("github_identity_provider", cfg.IdentityProvider != nil),
+			slog.Bool("rest_read_token", operatorRepoToken != nil))
 	} else {
 		logger.Warn("FISHHAWKD_OAUTH_CLIENT_ID not set; /v0/auth/github/login + /callback respond 503; identity provider defaults to NoOp (deny-by-default)")
 	}

@@ -1,10 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -730,11 +732,23 @@ func TestTokenLoginMint_IssueError_500(t *testing.T) {
 }
 
 func TestTokenLoginMint_PermissionCheckError_500(t *testing.T) {
-	s := newFakeLoginServer(t, &fakeIdentityProvider{subject: "github:octocat", permErr: errors.New("rate limited")}, nil)
+	// Capture the server-side log so the E39.10 / #1753 logging fix — the
+	// wrapped underlying cause is emitted at the 500 branch, not only in the
+	// response details — has a behavioral assertion, alongside the retained
+	// 500-status check.
+	var logs bytes.Buffer
+	s := newFakeLoginServer(t, &fakeIdentityProvider{subject: "github:octocat", permErr: errors.New("rate limited")},
+		func(cfg *Config) {
+			cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+		})
 	w := tokenRequest(t, s, http.MethodPost, "/v0/tokens/login", "",
 		map[string]any{"access_token": "gho_cli"})
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", w.Code)
+	}
+	if got := logs.String(); !strings.Contains(got, "rate limited") ||
+		!strings.Contains(got, "token-login permission check failed") {
+		t.Errorf("server log missing the wrapped permission-check cause; got:\n%s", got)
 	}
 }
 
