@@ -99,6 +99,40 @@ const (
 	// never advances — the remediation (fix-up, an operator commit +
 	// vouch, or a checks re-run) stays the operator's call.
 	RuleCIFailed Rule = "ci_failed"
+	// RuleAcceptancePending covers a run whose workflow declares an
+	// acceptance stage where review evidence is terminal and required PR
+	// checks are green, but the acceptance stage has not yet settled a
+	// verdict (E31.17 / #1568). It parks the run with an await_acceptance
+	// next action instead of the merge ritual: on an acceptance-declaring
+	// run the merge is gated on the acceptance_passed evidence condition
+	// (ADR-049 decision #6), so awaiting_merge must not fire until
+	// acceptance settles passed. Detection only, like RuleCIFailed: it
+	// parks and never advances — the dispatch/await of the acceptance
+	// stage stays the operator's action. This name MUST byte-match the MCP
+	// next_actions.state string "acceptance_pending" (the two surfaces are
+	// pinned by a cross-module literal test).
+	RuleAcceptancePending Rule = "acceptance_pending"
+	// RuleAcceptanceOutcomeUnknown covers the same acceptance-declaring run
+	// where the acceptance stage settled (terminal) but no
+	// acceptance_outcome_recorded verdict is recorded for it (E31.17 /
+	// #1568) — the settled-outcome-unknown hole. It parks with a
+	// read_acceptance_audit next action, deliberately NEVER the merge
+	// ritual (fail toward read, not toward merge), mirroring the MCP
+	// acceptanceOutcomeUnknownActions arm. Detection only, like
+	// RuleCIFailed. This name MUST byte-match the MCP next_actions.state
+	// string "acceptance_settled_outcome_unknown".
+	RuleAcceptanceOutcomeUnknown Rule = "acceptance_settled_outcome_unknown"
+	// RuleAcceptanceTriage covers the failed-verdict arm: an
+	// acceptance-declaring run whose newest acceptance_outcome_recorded
+	// verdict is failed (E31.17 / #1568). It parks with a
+	// read_acceptance_triage next action so the operator reads the triage
+	// disposition before acting — never the merge ritual. Detection only,
+	// like RuleCIFailed. This name is the shared PREFIX of the MCP
+	// next_actions.state strings for the failed arm ("acceptance_triage_paged"
+	// / "acceptance_triage_rerouting"); the cross-module literal test pins
+	// that prefix relationship so the drive presentation status and the MCP
+	// classifier cannot diverge.
+	RuleAcceptanceTriage Rule = "acceptance_triage"
 	// RuleDeployInitialization covers a deploy-FIRST run's
 	// pending → awaiting_deploy_approval pre-execution park at run
 	// creation (E23.13 / #1429). A deploy stage has no agent or runner, so
@@ -151,6 +185,9 @@ var mechanical = map[Rule]bool{
 	RuleFixupRereviewRepark:      true,
 	RuleChecksGreenAwaitingMerge: true,
 	RuleCIFailed:                 true,
+	RuleAcceptancePending:        true,
+	RuleAcceptanceOutcomeUnknown: true,
+	RuleAcceptanceTriage:         true,
 	RuleDeployInitialization:     true,
 	RuleChildrenDispatch:         true,
 	RuleGateApproval:             false,

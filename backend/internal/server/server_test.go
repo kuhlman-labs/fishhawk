@@ -452,6 +452,212 @@ func TestObserveParkedReview_AuditReadError_SkipsQuietly(t *testing.T) {
 	}
 }
 
+// --- acceptance-aware drive gate (E31.17 / #1568) -------------------------
+
+// seedAcceptanceObserverRun re-seeds the harness run with the acceptance
+// workflow spec and (when accState is non-nil) materializes an acceptance stage
+// row in the given state so ListStagesForRun surfaces it to acceptanceGateState.
+func (h *driveObserverHarness) seedAcceptanceObserverRun(accState *run.StageState) {
+	h.repo.seedRun(&run.Run{
+		ID:           h.runID,
+		Drive:        true,
+		State:        run.StateRunning,
+		WorkflowID:   "feature_change",
+		WorkflowSpec: specWithAcceptanceStage,
+	})
+	if accState != nil {
+		st := acceptanceStage(h.runID, *accState)
+		h.repo.mu.Lock()
+		h.repo.stages[st.ID] = st
+		h.repo.mu.Unlock()
+	}
+}
+
+func stageStatePtr(s run.StageState) *run.StageState { return &s }
+
+// TestObserveParkedReview_AcceptancePassed_StampsAwaitingMerge pins that a
+// passed acceptance verdict lets the awaiting_merge presentation status fire —
+// the merge is no longer acceptance-blocked (ADR-049 decision #6).
+func TestObserveParkedReview_AcceptancePassed_StampsAwaitingMerge(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedAcceptanceObserverRun(stageStatePtr(run.StageStateSucceeded))
+	seedAcceptanceOutcome(h.au, h.runID, 30, acceptanceVerdictPassed)
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	advances := h.driveAdvances(t)
+	if len(advances) != 2 || advances[1].Rule != drive.RuleChecksGreenAwaitingMerge {
+		t.Fatalf("run_auto_advanced = %+v, want settled + checks_green_awaiting_merge on a passed acceptance", advances)
+	}
+	if advances[1].NextAction == nil || advances[1].NextAction.Action != "merge_pr" {
+		t.Errorf("NextAction = %+v, want merge_pr", advances[1].NextAction)
+	}
+}
+
+// TestObserveParkedReview_AcceptancePending_ParksNoMerge pins the pending arm:
+// review evidence green but the acceptance stage has not settled → the run
+// parks with await_acceptance, NEVER merge_pr.
+func TestObserveParkedReview_AcceptancePending_ParksNoMerge(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedAcceptanceObserverRun(stageStatePtr(run.StageStateRunning)) // non-terminal, no verdict
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	advances := h.driveAdvances(t)
+	if len(advances) != 2 || advances[1].Rule != drive.RuleAcceptancePending {
+		t.Fatalf("run_auto_advanced = %+v, want settled + acceptance_pending", advances)
+	}
+	if advances[1].To != "acceptance_pending" || advances[1].NextAction == nil || advances[1].NextAction.Action != "await_acceptance" {
+		t.Errorf("entry = %+v, want acceptance_pending / await_acceptance", advances[1])
+	}
+	for _, a := range advances {
+		if a.Rule == drive.RuleChecksGreenAwaitingMerge {
+			t.Fatal("checks_green_awaiting_merge must NOT stamp while acceptance is pending")
+		}
+	}
+}
+
+// TestObserveParkedReview_AcceptanceOutcomeUnknown_ParksNoMerge pins the
+// settled-outcome-unknown arm: the acceptance stage is terminal but no verdict
+// is recorded → park with read_acceptance_audit, never merge_pr.
+func TestObserveParkedReview_AcceptanceOutcomeUnknown_ParksNoMerge(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedAcceptanceObserverRun(stageStatePtr(run.StageStateSucceeded)) // terminal, no verdict
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	advances := h.driveAdvances(t)
+	if len(advances) != 2 || advances[1].Rule != drive.RuleAcceptanceOutcomeUnknown {
+		t.Fatalf("run_auto_advanced = %+v, want settled + acceptance_settled_outcome_unknown", advances)
+	}
+	if advances[1].To != "acceptance_settled_outcome_unknown" || advances[1].NextAction == nil || advances[1].NextAction.Action != "read_acceptance_audit" {
+		t.Errorf("entry = %+v, want acceptance_settled_outcome_unknown / read_acceptance_audit", advances[1])
+	}
+}
+
+// TestObserveParkedReview_AcceptanceTriage_ParksNoMerge pins the failed-verdict
+// arm: a failed acceptance verdict parks with read_acceptance_triage, never
+// merge_pr.
+func TestObserveParkedReview_AcceptanceTriage_ParksNoMerge(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedAcceptanceObserverRun(stageStatePtr(run.StageStateSucceeded))
+	seedAcceptanceOutcome(h.au, h.runID, 30, acceptanceVerdictFailed)
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	advances := h.driveAdvances(t)
+	if len(advances) != 2 || advances[1].Rule != drive.RuleAcceptanceTriage {
+		t.Fatalf("run_auto_advanced = %+v, want settled + acceptance_triage", advances)
+	}
+	if advances[1].To != "acceptance_triage" || advances[1].NextAction == nil || advances[1].NextAction.Action != "read_acceptance_triage" {
+		t.Errorf("entry = %+v, want acceptance_triage / read_acceptance_triage", advances[1])
+	}
+}
+
+// TestObserveParkedReview_NoAcceptanceStage_StampsAwaitingMerge is the
+// regression: a workflow that declares NO acceptance stage must still reach
+// checks_green_awaiting_merge (the acceptance gate is a pure off-switch there).
+func TestObserveParkedReview_NoAcceptanceStage_StampsAwaitingMerge(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.repo.seedRun(&run.Run{
+		ID:           h.runID,
+		Drive:        true,
+		State:        run.StateRunning,
+		WorkflowID:   "feature_change",
+		WorkflowSpec: specNoAcceptanceStage,
+	})
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	advances := h.driveAdvances(t)
+	if len(advances) != 2 || advances[1].Rule != drive.RuleChecksGreenAwaitingMerge {
+		t.Fatalf("run_auto_advanced = %+v, want settled + checks_green_awaiting_merge (no acceptance stage declared)", advances)
+	}
+}
+
+// TestObserveParkedReview_AcceptancePendingIdempotent pins per-stage dedup for
+// the new pending rule: two ticks stamp acceptance_pending once.
+func TestObserveParkedReview_AcceptancePendingIdempotent(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedAcceptanceObserverRun(stageStatePtr(run.StageStateRunning))
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	advances := h.driveAdvances(t)
+	pending := 0
+	for _, a := range advances {
+		if a.Rule == drive.RuleAcceptancePending {
+			pending++
+		}
+	}
+	if pending != 1 {
+		t.Fatalf("acceptance_pending stamps = %d, want 1 (idempotent across two ticks)", pending)
+	}
+}
+
+// TestObserveParkedReview_StageListError_NoMerge pins BINDING approval
+// condition 1: a ListStagesForRun error on an acceptance-declaring run must NOT
+// fall through to checks_green_awaiting_merge / merge_pr — the observer skips
+// advancing (only the earlier reviews_settled_gate stamp remains).
+func TestObserveParkedReview_StageListError_NoMerge(t *testing.T) {
+	repo := newApprovalRunRepo()
+	au := newAuditFake()
+	wrapped := &stageListErrRepo{approvalRunRepo: repo, err: errors.New("list stages boom")}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: wrapped, AuditRepo: au})
+
+	stage := repo.seedStage(run.StageStateAwaitingApproval)
+	repo.mu.Lock()
+	stage.Type = run.StageTypeReview
+	repo.mu.Unlock()
+	repo.seedRun(&run.Run{
+		ID: stage.RunID, Drive: true, State: run.StateRunning,
+		WorkflowID: "feature_change", WorkflowSpec: specWithAcceptanceStage,
+	})
+	rid := stage.RunID
+	payload, _ := json.Marshal(planreview.ReviewStartedPayload{ConfiguredAgents: 1})
+	au.seeded = append(au.seeded,
+		&audit.Entry{RunID: &rid, Sequence: 10, Category: "implement_review_started", Payload: payload},
+		&audit.Entry{RunID: &rid, Sequence: 11, Category: "implement_reviewed", Payload: []byte(`{}`)},
+	)
+
+	s.ObserveParkedReviewForDrive(context.Background(), stage, driveObserverPRURL)
+
+	for _, e := range au.appended {
+		if e.Category != drive.Category {
+			continue
+		}
+		var adv drive.Advance
+		if err := json.Unmarshal(e.Payload, &adv); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if adv.Rule == drive.RuleChecksGreenAwaitingMerge {
+			t.Fatal("checks_green_awaiting_merge must NOT stamp when ListStagesForRun errors (fail-closed)")
+		}
+		if adv.NextAction != nil && adv.NextAction.Action == "merge_pr" {
+			t.Fatal("merge_pr must never be the next action when the stage read errored")
+		}
+	}
+}
+
+// stageListErrRepo wraps approvalRunRepo, overriding only ListStagesForRun to
+// return an injected error so the acceptance-gate fail-closed branch is
+// exercisable.
+type stageListErrRepo struct {
+	*approvalRunRepo
+	err error
+}
+
+func (r *stageListErrRepo) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
+	return nil, r.err
+}
+
 // TestNew_WiresConsolidatedReviewDispatcher pins the #1060 production
 // wiring: server.New must set cfg.Orchestrator.ConsolidatedReview to the
 // constructed Server so the parent consolidated implement review actually

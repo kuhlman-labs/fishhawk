@@ -180,14 +180,31 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 
 	// may_merge(gates_resolved_ci_green) -> merge the PR via the seam.
 	if d, found := res.Decision(delegation.ActionMerge); found && d.Met {
-		if !mergeGateReady(runRow, stages) {
+		// Acceptance-gate AND (E31.17 / #1568): on a run whose workflow declares
+		// an acceptance stage the merge is gated on the acceptance_passed
+		// evidence condition (ADR-049 decision #6). mergeGateReady's structural
+		// checks are kept; the acceptance gate is added as an independent AND at
+		// this call site so its unit tests stay valid. FAIL-CLOSED: a read error
+		// or any non-passed/non-declared state (pending / settled-outcome-unknown
+		// / failed) is observe-only — the actor never merges on unknown or unmet
+		// acceptance evidence.
+		gateState, gerr := s.acceptanceGateState(ctx, runRow, stages)
+		acceptanceMergeOK := gerr == nil && (gateState == acceptanceGateNotDeclared || gateState == acceptanceGatePassed)
+		switch {
+		case !mergeGateReady(runRow, stages):
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but real merge state not ready; observe-only",
 				slog.String("run_id", runRow.ID.String()))
-		} else if merger == nil {
+		case !acceptanceMergeOK:
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but acceptance gate not passed; observe-only",
+				slog.String("run_id", runRow.ID.String()),
+				slog.String("acceptance_gate_state", gateState),
+				slog.Bool("acceptance_read_error", gerr != nil))
+			return observeOnly("acceptance gate not passed (fail-closed); observe-only"), nil
+		case merger == nil:
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but no merge client configured; observe-only",
 				slog.String("run_id", runRow.ID.String()))
 			return observeOnly("merge seam unconfigured (fail-closed); observe-only"), nil
-		} else {
+		default:
 			if merr := merger.MergePullRequest(ctx, runRow); merr != nil {
 				return AutoDriveOutcome{Action: delegation.ActionMerge, Note: "merge dispatch failed"}, merr
 			}

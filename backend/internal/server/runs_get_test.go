@@ -968,6 +968,88 @@ func TestGetRun_Drive_CIFailedSuperseded_FlipsDerivedStatus(t *testing.T) {
 	}
 }
 
+// TestGetRun_Drive_AcceptanceStates_SurfaceDerivedStatus pins the E31.17 /
+// #1568 acceptance-gate presentation statuses: when the latest run_auto_advanced
+// rule is an acceptance-gate rule on a non-terminal run with an open PR, the
+// derived_status is the rule name itself, and the generic next_action carries
+// through — and NEVER merge_pr.
+func TestGetRun_Drive_AcceptanceStates_SurfaceDerivedStatus(t *testing.T) {
+	cases := []struct {
+		name       string
+		rule       drive.Rule
+		to         string
+		nextAction string
+	}{
+		{"pending", drive.RuleAcceptancePending, "acceptance_pending", "await_acceptance"},
+		{"outcome_unknown", drive.RuleAcceptanceOutcomeUnknown, "acceptance_settled_outcome_unknown", "read_acceptance_audit"},
+		{"triage", drive.RuleAcceptanceTriage, "acceptance_triage", "read_acceptance_triage"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, au, seeded := newDriveGetServer(t)
+			pr := "https://github.com/x/y/pull/7"
+			seeded.PullRequestURL = &pr
+
+			seedAutoAdvance(t, au, seeded.ID, 9, time.Now().UTC(), drive.Advance{
+				Rule: tc.rule, From: "review:awaiting_approval", To: tc.to,
+				NextAction: &drive.NextAction{Action: tc.nextAction, PRURL: pr},
+			})
+
+			resp, _ := getRunResponse(t, s, seeded.ID)
+			if resp.DerivedStatus != string(tc.rule) {
+				t.Errorf("derived_status = %q, want %q", resp.DerivedStatus, tc.rule)
+			}
+			if resp.NextAction == nil || resp.NextAction.Action != tc.nextAction {
+				t.Errorf("next_action = %+v, want %q", resp.NextAction, tc.nextAction)
+			}
+			if resp.NextAction != nil && resp.NextAction.Action == "merge_pr" {
+				t.Error("acceptance-gate states must never surface merge_pr")
+			}
+		})
+	}
+}
+
+// TestGetRun_Drive_AcceptancePendingSupersededByAwaitingMerge pins the
+// pending->passed supersession: a later checks_green_awaiting_merge stamp (the
+// acceptance passed) flips derived_status from acceptance_pending to
+// awaiting_merge — only the LATEST entry derives the presentation status.
+func TestGetRun_Drive_AcceptancePendingSupersededByAwaitingMerge(t *testing.T) {
+	s, _, au, seeded := newDriveGetServer(t)
+	pr := "https://github.com/x/y/pull/7"
+	seeded.PullRequestURL = &pr
+
+	t0 := time.Now().UTC().Add(-5 * time.Minute)
+	seedAutoAdvance(t, au, seeded.ID, 5, t0, drive.Advance{
+		Rule: drive.RuleAcceptancePending, From: "review:awaiting_approval", To: "acceptance_pending",
+		NextAction: &drive.NextAction{Action: "await_acceptance", PRURL: pr},
+	})
+	seedAutoAdvance(t, au, seeded.ID, 8, t0.Add(2*time.Minute), drive.Advance{
+		Rule: drive.RuleChecksGreenAwaitingMerge, From: "review:awaiting_approval", To: "awaiting_merge",
+		NextAction: &drive.NextAction{Action: "merge_pr", PRURL: pr},
+	})
+
+	resp, _ := getRunResponse(t, s, seeded.ID)
+	if resp.DerivedStatus != "awaiting_merge" {
+		t.Errorf("derived_status = %q, want awaiting_merge (checks_green supersedes acceptance_pending)", resp.DerivedStatus)
+	}
+}
+
+// TestGetRun_Drive_AcceptancePending_NoPR_OmitsDerivedStatus: like
+// awaiting_merge / ci_failed, an acceptance-gate derived_status requires an
+// open PR on the row.
+func TestGetRun_Drive_AcceptancePending_NoPR_OmitsDerivedStatus(t *testing.T) {
+	s, _, au, seeded := newDriveGetServer(t)
+	seedAutoAdvance(t, au, seeded.ID, 9, time.Now().UTC(), drive.Advance{
+		Rule: drive.RuleAcceptancePending, From: "review:awaiting_approval", To: "acceptance_pending",
+		NextAction: &drive.NextAction{Action: "await_acceptance"},
+	})
+
+	_, raw := getRunResponse(t, s, seeded.ID)
+	if _, present := raw["derived_status"]; present {
+		t.Error("derived_status present without a PR on the run row")
+	}
+}
+
 // TestGetRun_Drive_CorruptPayloadSkipped: a corrupt run_auto_advanced
 // payload degrades to the readable entries, never a 500.
 func TestGetRun_Drive_CorruptPayloadSkipped(t *testing.T) {

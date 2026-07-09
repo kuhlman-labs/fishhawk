@@ -1857,3 +1857,200 @@ func minimalFixupPlan() *plan.Plan {
 		Verification: plan.Verification{TestStrategy: "unit", RollbackPlan: "revert"},
 	}
 }
+
+// --- acceptanceGateState / latestAcceptanceVerdict (E31.17 / #1568) ----------
+
+// newAcceptanceGateServer wires a Server whose only dependency the gate
+// classifier needs is the audit fake (latestAcceptanceVerdict reads it;
+// resolveAcceptanceStageSpec parses runRow.WorkflowSpec directly).
+func newAcceptanceGateServer(t *testing.T) (*Server, *auditFake) {
+	t.Helper()
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	return s, au
+}
+
+// acceptanceGateRun builds a run row carrying the given workflow spec so
+// resolveAcceptanceStageSpec can decide whether an acceptance stage is declared.
+func acceptanceGateRun(runID uuid.UUID, workflowSpec []byte) *run.Run {
+	return &run.Run{ID: runID, WorkflowID: "feature_change", WorkflowSpec: workflowSpec, State: run.StateRunning}
+}
+
+// seedAcceptanceOutcome seeds one acceptance_outcome_recorded entry at the given
+// sequence carrying the verdict.
+func seedAcceptanceOutcome(au *auditFake, runID uuid.UUID, seq int64, verdict string) {
+	rid := runID
+	p, _ := json.Marshal(map[string]any{"verdict": verdict})
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, Category: CategoryAcceptanceOutcomeRecorded, Sequence: seq, Payload: p,
+	})
+}
+
+// acceptanceStage builds an acceptance-type stage in the given state.
+func acceptanceStage(runID uuid.UUID, state run.StageState) *run.Stage {
+	return &run.Stage{ID: uuid.New(), RunID: runID, Type: run.StageTypeAcceptance, State: state}
+}
+
+func TestLatestAcceptanceVerdict_NoEntries_NotRecorded(t *testing.T) {
+	s, _ := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	verdict, recorded, err := s.latestAcceptanceVerdict(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if recorded || verdict != "" {
+		t.Errorf("got (%q, recorded=%v), want (\"\", false)", verdict, recorded)
+	}
+}
+
+func TestLatestAcceptanceVerdict_HighestSequenceWins(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	seedAcceptanceOutcome(au, runID, 10, acceptanceVerdictFailed)
+	seedAcceptanceOutcome(au, runID, 20, acceptanceVerdictPassed) // newer
+	verdict, recorded, err := s.latestAcceptanceVerdict(context.Background(), runID)
+	if err != nil || !recorded {
+		t.Fatalf("got (%q, recorded=%v, err=%v), want passed/recorded/nil", verdict, recorded, err)
+	}
+	if verdict != acceptanceVerdictPassed {
+		t.Errorf("verdict = %q, want passed (highest-sequence entry)", verdict)
+	}
+}
+
+func TestLatestAcceptanceVerdict_ReadError_Propagates(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	au.listByCategoryErr = errors.New("audit boom")
+	_, _, err := s.latestAcceptanceVerdict(context.Background(), uuid.New())
+	if err == nil {
+		t.Fatal("err = nil, want the propagated read error (fail-closed)")
+	}
+}
+
+func TestLatestAcceptanceVerdict_MalformedPayload_RecordedNoVerdict(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	rid := runID
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, Category: CategoryAcceptanceOutcomeRecorded, Sequence: 5, Payload: []byte(`not json`),
+	})
+	verdict, recorded, err := s.latestAcceptanceVerdict(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("err = %v, want nil (malformed payload is not a read error)", err)
+	}
+	if !recorded || verdict != "" {
+		t.Errorf("got (%q, recorded=%v), want (\"\", true) for a malformed payload", verdict, recorded)
+	}
+}
+
+func TestAcceptanceGateState_NoAcceptanceStageDeclared_NotGated(t *testing.T) {
+	s, _ := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specNoAcceptanceStage), nil)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGateNotDeclared {
+		t.Errorf("state = %q, want \"\" (not declared)", got)
+	}
+}
+
+func TestAcceptanceGateState_VerdictPassed(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	seedAcceptanceOutcome(au, runID, 10, acceptanceVerdictPassed)
+	stages := []*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)}
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), stages)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGatePassed {
+		t.Errorf("state = %q, want %q", got, acceptanceGatePassed)
+	}
+}
+
+func TestAcceptanceGateState_VerdictFailed_Triage(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	seedAcceptanceOutcome(au, runID, 10, acceptanceVerdictFailed)
+	stages := []*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)}
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), stages)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGateTriage {
+		t.Errorf("state = %q, want %q", got, acceptanceGateTriage)
+	}
+}
+
+func TestAcceptanceGateState_NoVerdict_TerminalStage_OutcomeUnknown(t *testing.T) {
+	s, _ := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	stages := []*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)}
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), stages)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGateOutcomeUnknown {
+		t.Errorf("state = %q, want %q (terminal stage, no verdict)", got, acceptanceGateOutcomeUnknown)
+	}
+}
+
+func TestAcceptanceGateState_NoVerdict_NonTerminalStage_Pending(t *testing.T) {
+	s, _ := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	stages := []*run.Stage{acceptanceStage(runID, run.StageStateRunning)}
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), stages)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGatePending {
+		t.Errorf("state = %q, want %q (non-terminal stage, no verdict)", got, acceptanceGatePending)
+	}
+}
+
+func TestAcceptanceGateState_NoVerdict_MissingStage_Pending(t *testing.T) {
+	s, _ := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	// Spec declares an acceptance stage but no stage row has materialized yet.
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), nil)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGatePending {
+		t.Errorf("state = %q, want %q (stage not yet materialized)", got, acceptanceGatePending)
+	}
+}
+
+func TestAcceptanceGateState_AuditReadError_FailsClosed(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	au.listByCategoryErr = errors.New("audit boom")
+	runID := uuid.New()
+	stages := []*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)}
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), stages)
+	if err == nil {
+		t.Fatal("err = nil, want the propagated read error (fail-closed, never passed)")
+	}
+	if got == acceptanceGatePassed {
+		t.Errorf("state = %q, must never be passed on a read error", got)
+	}
+}
+
+// TestAcceptanceGateState_MalformedVerdict_TerminalStage_OutcomeUnknown pins
+// that a recorded-but-unreadable verdict falls to the settled-outcome-unknown
+// hole (never a pass) when the acceptance stage is terminal.
+func TestAcceptanceGateState_MalformedVerdict_TerminalStage_OutcomeUnknown(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	rid := runID
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, Category: CategoryAcceptanceOutcomeRecorded, Sequence: 5, Payload: []byte(`not json`),
+	})
+	stages := []*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)}
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), stages)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGateOutcomeUnknown {
+		t.Errorf("state = %q, want %q (malformed verdict + terminal stage)", got, acceptanceGateOutcomeUnknown)
+	}
+}
