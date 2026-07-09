@@ -477,3 +477,47 @@ func TestNewClient_TokenPrecedence(t *testing.T) {
 		t.Errorf("want empty token when nothing stored, got %q", c.Token)
 	}
 }
+
+// TestCheckAPIStatus_SurfacesDetailsError exercises the E39.10 / #1753
+// change: a failed mint's response body carries the underlying cause under
+// details.error (the backend's map[string]any{"error": ...}), and
+// checkAPIStatus appends it to the returned error so the operator sees WHY
+// the mint 500'd, not just "permission check failed".
+func TestCheckAPIStatus_SurfacesDetailsError(t *testing.T) {
+	body := `{"error":{"code":"internal_error","message":"permission check failed"},` +
+		`"details":{"error":"identity: do request: 401 Unauthorized"}}`
+	resp := &http.Response{
+		StatusCode: http.StatusInternalServerError,
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	err := checkAPIStatus(resp)
+	if err == nil {
+		t.Fatal("checkAPIStatus returned nil for a 500 response")
+	}
+	got := err.Error()
+	if !strings.Contains(got, "permission check failed") {
+		t.Errorf("error should carry the backend message: %q", got)
+	}
+	if !strings.Contains(got, "401 Unauthorized") {
+		t.Errorf("error should surface details.error cause: %q", got)
+	}
+}
+
+// TestCheckAPIStatus_NoDetails keeps the details-absent branch honest: an
+// error envelope without a details.error still yields the code+message form
+// with no dangling separator.
+func TestCheckAPIStatus_NoDetails(t *testing.T) {
+	body := `{"error":{"code":"insufficient_permission","message":"nope"}}`
+	resp := &http.Response{
+		StatusCode: http.StatusForbidden,
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	err := checkAPIStatus(resp)
+	if err == nil {
+		t.Fatal("checkAPIStatus returned nil for a 403 response")
+	}
+	got := err.Error()
+	if want := "HTTP 403 (insufficient_permission): nope"; got != want {
+		t.Errorf("error = %q, want %q", got, want)
+	}
+}

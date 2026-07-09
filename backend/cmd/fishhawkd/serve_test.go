@@ -6,6 +6,7 @@ import (
 	"flag"
 	"io"
 	"log/slog"
+	"reflect"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
@@ -778,6 +780,19 @@ func TestResolveIdentityProvider(t *testing.T) {
 		t.Errorf("provider = %T, want *identity.GitHubIdentityProvider", present)
 	}
 
+	// Passthrough: the accessor handed to resolveIdentityProvider must reach
+	// the constructed provider's unexported token field (E39.10 / #1753) —
+	// otherwise the REST reads stay anonymous even when serve wires an
+	// accessor. Reflection reads the field's nil-ness without invoking it.
+	accessor := func(context.Context) (string, error) { return "tok", nil }
+	withTok := resolveIdentityProvider("client-id", accessor)
+	if got := identityProviderTokenIsNil(t, withTok); got {
+		t.Error("resolveIdentityProvider dropped the token accessor; provider.token is nil, want non-nil")
+	}
+	if got := identityProviderTokenIsNil(t, present); !got {
+		t.Error("resolveIdentityProvider(nil) left provider.token non-nil, want nil")
+	}
+
 	// Absent: nil so server.New defaults to NoOp. Feeding it through
 	// server.New proves the end-to-end fallback the seam relies on.
 	absent := resolveIdentityProvider("", nil)
@@ -787,5 +802,67 @@ func TestResolveIdentityProvider(t *testing.T) {
 	srv := server.New(server.Config{IdentityProvider: absent})
 	if srv == nil {
 		t.Fatal("server.New returned nil")
+	}
+}
+
+// identityProviderTokenIsNil reports whether the constructed provider's
+// unexported REST-read token accessor is nil. It reads (never invokes) the
+// field via reflection so the passthrough assertion needs no exported test
+// hook on the identity package.
+func identityProviderTokenIsNil(t *testing.T, p identity.IdentityProvider) bool {
+	t.Helper()
+	gh, ok := p.(*identity.GitHubIdentityProvider)
+	if !ok {
+		t.Fatalf("provider = %T, want *identity.GitHubIdentityProvider", p)
+	}
+	f := reflect.ValueOf(gh).Elem().FieldByName("token")
+	if !f.IsValid() {
+		t.Fatal("GitHubIdentityProvider has no token field; passthrough test is stale")
+	}
+	return f.IsNil()
+}
+
+// fakeTokenProvider is a non-nil githubapp.TokenProvider for the wiring seam
+// test. TestResolveOperatorRepoToken only asserts accessor nil-ness at
+// construction, so Token is never invoked.
+type fakeTokenProvider struct{}
+
+func (fakeTokenProvider) Token(context.Context, int64) (string, error) { return "tok", nil }
+
+// TestResolveOperatorRepoToken pins the serve-construction seam the
+// fake-driven server tests cannot reach (E39.10 / #1753, same lesson as
+// resolveRefinementRepo): the operator-repo REST-read accessor is non-nil
+// exactly when a GitHub client + TokenProvider + an "owner/name" operator
+// repo are all present, and nil (→ anonymous reads) when any is absent or the
+// repo is malformed. The current serve wiring passed nil here, which is the
+// defect this asserts against.
+func TestResolveOperatorRepoToken(t *testing.T) {
+	gh := &githubclient.Client{}
+	var tokens githubapp.TokenProvider = fakeTokenProvider{}
+
+	if acc := resolveOperatorRepoToken(gh, tokens, "kuhlman-labs/fishhawk"); acc == nil {
+		t.Error("resolveOperatorRepoToken with gh+tokens+repo returned nil accessor, want non-nil")
+	}
+
+	nilCases := []struct {
+		name   string
+		gh     *githubclient.Client
+		tokens githubapp.TokenProvider
+		repo   string
+	}{
+		{"gh nil", nil, tokens, "kuhlman-labs/fishhawk"},
+		{"tokens nil", gh, nil, "kuhlman-labs/fishhawk"},
+		{"repo empty", gh, tokens, ""},
+		{"repo no slash", gh, tokens, "fishhawk"},
+		{"repo empty owner", gh, tokens, "/fishhawk"},
+		{"repo empty name", gh, tokens, "kuhlman-labs/"},
+		{"repo extra slash", gh, tokens, "kuhlman-labs/fishhawk/extra"},
+	}
+	for _, tc := range nilCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if acc := resolveOperatorRepoToken(tc.gh, tc.tokens, tc.repo); acc != nil {
+				t.Errorf("resolveOperatorRepoToken(%s) = non-nil accessor, want nil (fail-closed → anonymous reads)", tc.name)
+			}
+		})
 	}
 }

@@ -135,6 +135,12 @@ func (s *Server) handleTokenLoginMint(w http.ResponseWriter, r *http.Request) {
 	// minimum permission on the operator repo.
 	perm, err := s.cfg.IdentityProvider.PermissionLevel(r.Context(), s.cfg.OperatorRepo, subject)
 	if err != nil {
+		// Log the wrapped cause server-side so the underlying failure mode
+		// (401 anonymous read, rate-limit, network) is visible in fishhawkd
+		// logs, not only in the response details (E39.10 / #1753).
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError, "token-login permission check failed",
+			slog.String("error", err.Error()),
+			slog.String("repo", s.cfg.OperatorRepo))
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"permission check failed", map[string]any{"error": err.Error()})
 		return

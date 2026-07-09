@@ -378,6 +378,13 @@ type apiErrorEnvelope struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	} `json:"error"`
+	// Details mirrors the backend's map[string]any{"error": ...} detail
+	// payload. On a failed mint the backend puts the underlying cause (e.g.
+	// the wrapped permission-check error) here; surfacing it gives the
+	// operator the real reason a `token login` 500'd (E39.10 / #1753).
+	Details struct {
+		Error string `json:"error"`
+	} `json:"details"`
 }
 
 // postForJSON POSTs a JSON body and decodes a JSON response. Used for
@@ -467,6 +474,10 @@ func checkAPIStatus(resp *http.Response) error {
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	var env apiErrorEnvelope
 	if json.Unmarshal(raw, &env) == nil && env.Error.Code != "" {
+		if env.Details.Error != "" {
+			return fmt.Errorf("HTTP %d (%s): %s: %s",
+				resp.StatusCode, env.Error.Code, env.Error.Message, env.Details.Error)
+		}
 		return fmt.Errorf("HTTP %d (%s): %s", resp.StatusCode, env.Error.Code, env.Error.Message)
 	}
 	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
