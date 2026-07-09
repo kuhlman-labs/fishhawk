@@ -18,6 +18,8 @@ package orchestrator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -605,10 +607,12 @@ func (o *Orchestrator) maybeOpenConsolidatedPR(ctx context.Context, r *run.Run, 
 
 	// (e) Open the PR; recover the existing one on a lost race.
 	var prURL string
+	var prNumber int
 	pr, err := o.GitHub.CreatePullRequest(ctx, *r.InstallationID, repo, head, base, title, body)
 	switch {
 	case err == nil:
 		prURL = pr.HTMLURL
+		prNumber = pr.Number
 	case errors.Is(err, githubclient.ErrPullRequestExists):
 		existing, lerr := o.GitHub.ListOpenPullRequestsByHead(ctx, *r.InstallationID, repo, head, base)
 		if lerr != nil {
@@ -618,11 +622,27 @@ func (o *Orchestrator) maybeOpenConsolidatedPR(ctx context.Context, r *run.Run, 
 			return r, fmt.Errorf("pr already exists for head %q but none returned by list", head)
 		}
 		prURL = existing[0].HTMLURL
+		prNumber = existing[0].Number
 	default:
 		return r, fmt.Errorf("create consolidated pr: %w", err)
 	}
 	if prURL == "" {
 		return r, fmt.Errorf("consolidated pr opened but URL is empty")
+	}
+
+	// (#1732) Record the kind=pull_request artifact on the parent implement
+	// stage BEFORE stamping pull_request_url. The single-run flow records
+	// that artifact in the runner-driven PR-upload handler, but the decomposed
+	// parent's PR is opened here — so without this, audit_complete's Rule 3
+	// (hasPullRequest over the implement stage) reports pr_missing on every
+	// decomposed parent. Ordering matters: recording BEFORE the URL stamp means
+	// the (b) "URL already set -> return early" short-circuit above can never
+	// observe a URL-stamped-but-artifact-missing state. On an error, return it
+	// (unwind) WITHOUT stamping the URL so the next Advance re-enters this gate
+	// with the URL still empty, re-opens the PR idempotently via the
+	// ErrPullRequestExists recovery, and records the artifact on retry.
+	if err := o.recordConsolidatedPRArtifact(ctx, r, prURL, prNumber, head, base); err != nil {
+		return r, fmt.Errorf("record consolidated pull_request artifact: %w", err)
 	}
 
 	// (f) Stamp the URL, reload so the in-flight Advance dispatches the
@@ -639,6 +659,133 @@ func (o *Orchestrator) maybeOpenConsolidatedPR(ctx context.Context, r *run.Run, 
 		slog.String("pull_request_url", prURL),
 	)
 	return updated, nil
+}
+
+// recordConsolidatedPRArtifact records the kind=pull_request artifact on the
+// decomposed parent's IMPLEMENT stage when the orchestrator opens the
+// consolidated PR (#1732). The single-run flow records this artifact in the
+// runner-driven PR-upload handler (server/pullrequest.go), so audit_complete's
+// Rule 3 (hasPullRequest over the implement stage) passes there. A decomposed
+// parent's PR is opened by the orchestrator, which never recorded the artifact
+// — leaving audit_complete permanently red (pr_missing) on an otherwise-healthy
+// run. This helper closes that gap on every fan-in settle path, since both the
+// event-driven sweeper and the on-demand /consolidate endpoint funnel through
+// Advance -> maybeOpenConsolidatedPR.
+//
+// The recorded content mirrors the field shape the runner's pull_request
+// artifact ships and the three downstream consumers decode: head_sha +
+// pr_number (auditcheckpublisher.decodeHeadSHA readiness,
+// webhook.decodeArtifactHeadSHA synchronize matching, auditcomplete.decodePRArtifact
+// foreign-commit gather). An empty head_sha makes the publisher treat the run
+// as "not ready to publish", so the consolidated branch tip is resolved via
+// GetBranchSHA to carry a real SHA.
+//
+// Graceful skip (nil error) when o.Artifacts == nil, mirroring the GitHub/
+// installation nil-skip posture in maybeOpenConsolidatedPR. IDEMPOTENT: there
+// is NO unique (stage_id, kind) DB constraint, so a naive Create on a race or
+// retry would duplicate — the helper ListForStage-guards and skips Create when
+// a kind=pull_request artifact already exists. The ListForStage-then-Create
+// guard is non-atomic; per-run Advance serialization makes that an accepted
+// documented limitation.
+func (o *Orchestrator) recordConsolidatedPRArtifact(ctx context.Context, r *run.Run, prURL string, prNumber int, head, base string) error {
+	// Graceful skip: a harness without the artifact repo can't record the
+	// artifact — same posture as maybeOpenConsolidatedPR's GitHub/installation
+	// nil-skip. The parent stays artifact-less; narrowing, not regressing.
+	if o.Artifacts == nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Artifacts not configured; skipping consolidated pull_request artifact",
+			slog.String("run_id", r.ID.String()))
+		return nil
+	}
+
+	// Locate the parent IMPLEMENT stage — the same stage auditcomplete's Rule 3
+	// checks (NOT the review stage maybeOpenConsolidatedPR receives).
+	stages, err := o.Runs.ListStagesForRun(ctx, r.ID)
+	if err != nil {
+		return fmt.Errorf("list stages for consolidated pull_request artifact: %w", err)
+	}
+	var implID uuid.UUID
+	foundImpl := false
+	for _, s := range stages {
+		if s.Type == run.StageTypeImplement {
+			implID = s.ID
+			foundImpl = true
+			break
+		}
+	}
+	if !foundImpl {
+		return fmt.Errorf("no implement stage on run %s to record consolidated pull_request artifact", r.ID)
+	}
+
+	// Idempotency: skip Create when a pull_request artifact already exists on
+	// the implement stage (no unique (stage_id, kind) constraint exists, so a
+	// naive Create on a race/retry would duplicate).
+	existing, err := o.Artifacts.ListForStage(ctx, implID)
+	if err != nil {
+		return fmt.Errorf("list artifacts for implement stage %s: %w", implID, err)
+	}
+	for _, a := range existing {
+		if a.Kind == artifact.KindPullRequest {
+			return nil
+		}
+	}
+
+	// Resolve the consolidated branch tip so the artifact carries a real
+	// head_sha (empty head_sha makes the publisher treat the run as not ready
+	// to publish). base_sha is resolved best-effort for a complete artifact;
+	// only head_sha and pr_number are load-bearing for the consumers.
+	repo, err := parseRepo(r.Repo)
+	if err != nil {
+		return fmt.Errorf("parse repo %q: %w", r.Repo, err)
+	}
+	headSHA, _, err := o.GitHub.GetBranchSHA(ctx, *r.InstallationID, repo, head)
+	if err != nil {
+		return fmt.Errorf("resolve consolidated head %q: %w", head, err)
+	}
+	// base_sha is best-effort per the doc comment: only head_sha and pr_number
+	// are load-bearing for the consumers. A transient failure resolving the base
+	// branch tip must NOT unwind the artifact record (and, per the ordering, the
+	// URL stamp) — log it and leave base_sha empty rather than forcing a retry.
+	baseSHA, _, berr := o.GitHub.GetBranchSHA(ctx, *r.InstallationID, repo, base)
+	if berr != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: best-effort consolidated base_sha resolution failed; recording artifact without it",
+			slog.String("run_id", r.ID.String()),
+			slog.String("base", base),
+			slog.Any("error", berr))
+		baseSHA = ""
+	}
+
+	content, err := json.Marshal(map[string]any{
+		"pr_number": prNumber,
+		"pr_url":    prURL,
+		"branch":    head,
+		"head_sha":  headSHA,
+		"base_sha":  baseSHA,
+		"origin":    "orchestrator_consolidated",
+	})
+	if err != nil {
+		return fmt.Errorf("marshal consolidated pull_request artifact: %w", err)
+	}
+	sum := sha256.Sum256(content)
+	contentHash := hex.EncodeToString(sum[:])
+
+	if _, err := o.Artifacts.Create(ctx, artifact.CreateParams{
+		StageID:     implID,
+		Kind:        artifact.KindPullRequest,
+		Content:     content,
+		ContentHash: contentHash,
+		// SchemaVersion intentionally nil for v0 — mirrors the runner-driven
+		// PR-upload handler.
+	}); err != nil {
+		return fmt.Errorf("create consolidated pull_request artifact: %w", err)
+	}
+	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator recorded consolidated pull_request artifact",
+		slog.String("run_id", r.ID.String()),
+		slog.String("stage_id", implID.String()),
+		slog.String("head", head),
+		slog.String("head_sha", headSHA),
+		slog.Int("pr_number", prNumber),
+	)
+	return nil
 }
 
 // shortRunID returns the first 8 characters of a run UUID's string
