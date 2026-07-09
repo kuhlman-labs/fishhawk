@@ -443,6 +443,27 @@ func (f *fakePlanReviewer) Review(_ context.Context, promptText string) (*planre
 	return f.verdict, f.model, nil
 }
 
+// probingReviewer is a fake PlanReviewer that ALSO implements versionProber —
+// the codex-reviewer analog for the agent_version compatibility guard (#1743).
+// It reports a canned CLI version and records whether Review was invoked, so a
+// test can assert an out-of-range reviewer is never dispatched.
+type probingReviewer struct {
+	version  string
+	verdict  *planreview.ReviewVerdict
+	model    string
+	reviewed bool
+}
+
+func (p *probingReviewer) Review(_ context.Context, _ string) (*planreview.ReviewVerdict, string, error) {
+	p.reviewed = true
+	if p.verdict == nil {
+		return &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, p.model, nil
+	}
+	return p.verdict, p.model, nil
+}
+
+func (p *probingReviewer) ProbeVersion(_ context.Context) string { return p.version }
+
 // singleReviewerSet wraps one PlanReviewer as a ReviewerSet for tests:
 // Default() returns the wrapped reviewer (possibly nil) and For resolves
 // every provider to it — the count-form equivalent of the pre-#955
@@ -583,6 +604,177 @@ func TestResolveReviewerInvocations_ReasoningEffort(t *testing.T) {
 	}
 	if invs[1].reasoningEffort != "" {
 		t.Errorf("invs[1].reasoningEffort = %q, want empty", invs[1].reasoningEffort)
+	}
+}
+
+// TestResolveReviewerInvocations_AgentVersionThreaded pins the #1743 spec→server
+// threading: a reviewers.agents entry's declared agent_version range is recorded
+// on the resolved invocation (symmetry with specModel/reasoningEffort), and a
+// reviewer that declares none threads empty.
+func TestResolveReviewerInvocations_AgentVersionThreaded(t *testing.T) {
+	cfg := &spec.ReviewersConfig{Agents: []spec.AgentReviewer{
+		{Provider: "codex", Model: "spec-gpt", AgentVersion: ">=0.30 <0.31"},
+		{Provider: "anthropic", Model: "spec-opus"},
+	}}
+	set := &capturingReviewerSet{reviewer: &fakePlanReviewer{}}
+	s := New(Config{PlanReviewers: set})
+
+	invs := s.resolveReviewerInvocations(cfg)
+	if len(invs) != 2 {
+		t.Fatalf("got %d invocations, want 2", len(invs))
+	}
+	if invs[0].agentVersion != ">=0.30 <0.31" {
+		t.Errorf("invs[0].agentVersion = %q, want %q", invs[0].agentVersion, ">=0.30 <0.31")
+	}
+	if invs[1].agentVersion != "" {
+		t.Errorf("invs[1].agentVersion = %q, want empty (no declared range)", invs[1].agentVersion)
+	}
+}
+
+// TestReviewerAgentVersionMismatch enumerates the #1743 guard's branches: an
+// out-of-range codex reviewer is the only fail-loud case; in-range,
+// unprobeable, no-declared-range, and a non-probing (anthropic) reviewer all
+// degrade to no-mismatch (proceed).
+func TestReviewerAgentVersionMismatch(t *testing.T) {
+	const rng = ">=0.30 <0.31"
+	cases := []struct {
+		name         string
+		inv          reviewerInvocation
+		wantMismatch bool
+	}{
+		{
+			name:         "in range proceeds",
+			inv:          reviewerInvocation{provider: "codex", agentVersion: rng, reviewer: &probingReviewer{version: "0.30.5 (codex-cli)"}},
+			wantMismatch: false,
+		},
+		{
+			name:         "out of range fails loudly",
+			inv:          reviewerInvocation{provider: "codex", agentVersion: rng, reviewer: &probingReviewer{version: "0.140.0 (codex-cli)"}},
+			wantMismatch: true,
+		},
+		{
+			name:         "unprobeable degrades",
+			inv:          reviewerInvocation{provider: "codex", agentVersion: rng, reviewer: &probingReviewer{version: "unknown"}},
+			wantMismatch: false,
+		},
+		{
+			name:         "no declared range",
+			inv:          reviewerInvocation{provider: "codex", agentVersion: "", reviewer: &probingReviewer{version: "0.140.0 (codex-cli)"}},
+			wantMismatch: false,
+		},
+		{
+			name:         "non-probing reviewer ignored",
+			inv:          reviewerInvocation{provider: "anthropic", agentVersion: rng, reviewer: &fakePlanReviewer{}},
+			wantMismatch: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mismatch, reason := reviewerAgentVersionMismatch(context.Background(), tc.inv)
+			if mismatch != tc.wantMismatch {
+				t.Fatalf("mismatch = %v, want %v (reason=%q)", mismatch, tc.wantMismatch, reason)
+			}
+			if mismatch {
+				if !strings.Contains(reason, rng) || !strings.Contains(reason, "0.140.0") {
+					t.Errorf("reason %q must name both the declared range and the probed version", reason)
+				}
+			} else if reason != "" {
+				t.Errorf("reason = %q, want empty when there is no mismatch", reason)
+			}
+		})
+	}
+}
+
+// TestPlanReviewLoop_AgentVersionMismatchBlocksDispatch asserts the fail-loud
+// path (#1743): an out-of-range codex reviewer is NEVER dispatched, a terminal
+// plan_review_failed entry naming the range+version is emitted, and the loop
+// returns hasRejection=true so the gating caller blocks stage advancement.
+func TestPlanReviewLoop_AgentVersionMismatchBlocksDispatch(t *testing.T) {
+	au := newSeqAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	runID, stageID := uuid.New(), uuid.New()
+
+	rev := &probingReviewer{version: "0.140.0 (codex-cli)", model: "gpt-5-codex"}
+	inv := reviewerInvocation{reviewer: rev, provider: "codex", specModel: "gpt-5-codex", agentVersion: ">=0.30 <0.31"}
+
+	hasRejection := s.runPlanReviewLoop(context.Background(), runID, stageID,
+		[]reviewerInvocation{inv}, planreview.AuthorityGating, "prompt", "author-model", planreview.DefaultReviewBudget)
+
+	if !hasRejection {
+		t.Error("hasRejection = false, want true (an out-of-range codex reviewer blocks under gating)")
+	}
+	if rev.reviewed {
+		t.Error("the out-of-range reviewer must NOT be dispatched")
+	}
+	failed := au.entriesByCategory("plan_review_failed")
+	if len(failed) != 1 {
+		t.Fatalf("plan_review_failed entries = %d, want 1", len(failed))
+	}
+	var payload planreview.ReviewFailedPayload
+	if err := json.Unmarshal(failed[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal plan_review_failed payload: %v", err)
+	}
+	if !strings.Contains(payload.Reason, ">=0.30 <0.31") || !strings.Contains(payload.Reason, "0.140.0") {
+		t.Errorf("plan_review_failed reason = %q, want it to name the range and probed version", payload.Reason)
+	}
+	if n := len(au.entriesByCategory("plan_reviewed")); n != 0 {
+		t.Fatalf("plan_reviewed entries = %d, want 0 (the reviewer was skipped)", n)
+	}
+}
+
+// TestPlanReviewLoop_AgentVersionInRangeDispatches asserts an in-range codex
+// reviewer proceeds normally: Review runs, a plan_reviewed entry lands, and no
+// plan_review_failed / rejection is produced by the guard.
+func TestPlanReviewLoop_AgentVersionInRangeDispatches(t *testing.T) {
+	au := newSeqAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	runID, stageID := uuid.New(), uuid.New()
+
+	rev := &probingReviewer{version: "0.30.5 (codex-cli)", verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "gpt-5-codex"}
+	inv := reviewerInvocation{reviewer: rev, provider: "codex", specModel: "gpt-5-codex", agentVersion: ">=0.30 <0.31"}
+
+	hasRejection := s.runPlanReviewLoop(context.Background(), runID, stageID,
+		[]reviewerInvocation{inv}, planreview.AuthorityGating, "prompt", "author-model", planreview.DefaultReviewBudget)
+
+	if hasRejection {
+		t.Error("hasRejection = true, want false (an in-range approve must not block)")
+	}
+	if !rev.reviewed {
+		t.Error("the in-range reviewer must be dispatched")
+	}
+	if n := len(au.entriesByCategory("plan_reviewed")); n != 1 {
+		t.Fatalf("plan_reviewed entries = %d, want 1", n)
+	}
+	if n := len(au.entriesByCategory("plan_review_failed")); n != 0 {
+		t.Fatalf("plan_review_failed entries = %d, want 0", n)
+	}
+}
+
+// TestPlanReviewLoop_AgentVersionUnprobeableDegrades asserts the degrade path:
+// a codex reviewer whose CLI version is unprobeable ("unknown") is dispatched
+// anyway — the guard never blocks a review on an uncomparable version.
+func TestPlanReviewLoop_AgentVersionUnprobeableDegrades(t *testing.T) {
+	au := newSeqAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	runID, stageID := uuid.New(), uuid.New()
+
+	rev := &probingReviewer{version: "unknown", verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "gpt-5-codex"}
+	inv := reviewerInvocation{reviewer: rev, provider: "codex", specModel: "gpt-5-codex", agentVersion: ">=0.30 <0.31"}
+
+	hasRejection := s.runPlanReviewLoop(context.Background(), runID, stageID,
+		[]reviewerInvocation{inv}, planreview.AuthorityGating, "prompt", "author-model", planreview.DefaultReviewBudget)
+
+	if hasRejection {
+		t.Error("hasRejection = true, want false (an unprobeable CLI must degrade to proceed, never block)")
+	}
+	if !rev.reviewed {
+		t.Error("the reviewer must be dispatched when its version is unprobeable")
+	}
+	if n := len(au.entriesByCategory("plan_review_failed")); n != 0 {
+		t.Fatalf("plan_review_failed entries = %d, want 0 (unprobeable degrades, no loud failure)", n)
+	}
+	if n := len(au.entriesByCategory("plan_reviewed")); n != 1 {
+		t.Fatalf("plan_reviewed entries = %d, want 1", n)
 	}
 }
 
