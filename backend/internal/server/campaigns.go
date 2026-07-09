@@ -1308,13 +1308,29 @@ func (s *Server) reconcileCampaignItemsOnRead(ctx context.Context, c *campaign.C
 // tagged settled_via=issue_closed and carrying NO run_id. Returns whether it
 // settled anything so the caller re-derives and re-reads.
 //
+// SOLE SETTLE SITE: reconcileCampaignItemsOnRead (this pass's only caller) is
+// the ONLY place a run-less issue-closed item is settled. The create path
+// (handleCreateCampaign) performs NO settle, so the FIRST status read of a
+// campaign is the effective assembly-time settle — the MCP start_campaign flow
+// reads status immediately after assembly, so a chain of already-closed
+// children converges on that first read (#1758).
+//
+// SINGLE-READ FIXPOINT: closed-completed status is resolved via GitHub at most
+// ONCE per item in Phase 1, then Phase 2 settles to a fixpoint purely in-memory
+// — repeatedly settling any closed-completed candidate whose deps are now in
+// the done-set and adding its ref, until a full pass settles nothing new. So a
+// closed child C that depends_on a closed child D converges in the SAME read
+// regardless of iteration order, instead of one dependency-hop per read.
+//
 // BEST-EFFORT and FAIL-CLOSED: every guard leaves the item unsettled and NEVER
 // fails the read — a nil GitHub client, a repo not in owner/name form, an
 // installation-resolution error, a GetIssue error, an unparseable issue_ref, an
 // open issue, or a not_planned closure each logs (where useful) and skips. The
 // repo installation is resolved at most ONCE per reconcile (lazily, only when a
 // candidate item exists) and cached across items; the pass short-circuits
-// entirely when GitHub is unwired.
+// entirely when GitHub is unwired. The depends_on DAG-order guard is preserved:
+// a CLOSED item whose dependency is still OPEN never enters the done-set and so
+// stays Blocked, never Eligible.
 func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaign, items []*campaign.Item) bool {
 	if s.cfg.GitHub == nil {
 		return false
@@ -1326,11 +1342,12 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 		return false
 	}
 
-	// Done-set: refs of items that have succeeded (the firstUnmetDependency /
-	// NextEligible idiom). A dependency is satisfied iff its ref is in this set;
-	// an absent ref is therefore not-satisfied for free. Computed once, single-
-	// hop within this read — a chain of run-less items converges over successive
-	// polls, which the operator already drives.
+	// Done-set: refs of items that have already succeeded (the
+	// firstUnmetDependency / NextEligible idiom). A dependency is satisfied iff
+	// its ref is in this set; an absent ref is therefore not-satisfied for free.
+	// Seeded from the already-succeeded items, then GROWN in Phase 2 as each
+	// candidate settles — the growth is what converges a run-less closed-closed
+	// chain within this single read.
 	done := make(map[string]bool, len(items))
 	for _, it := range items {
 		if it.State == campaign.ItemStateSucceeded {
@@ -1338,7 +1355,12 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 		}
 	}
 
-	settledAny := false
+	// Phase 1 (GitHub reads, at most ONCE per item): collect the run-less
+	// pending/blocked items whose issue is CLOSED as completed. Every fail-closed
+	// guard applies here EXCEPT the depends_on gate — Phase 2 enforces that
+	// in-memory so the closed-status read happens exactly once per item and the
+	// fixpoint never re-reads GitHub.
+	var candidates []*campaign.Item
 	var instID int64
 	instResolved := false
 	for _, it := range items {
@@ -1348,11 +1370,6 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 			continue
 		}
 		if it.State != campaign.ItemStatePending && it.State != campaign.ItemStateBlocked {
-			continue
-		}
-		// DAG ordering: an out-of-dependency-order human-merge (a dependency not
-		// yet satisfied) is deliberately NOT settled, preserving wave order.
-		if !depsSatisfiedRefs(it.DependsOn, done) {
 			continue
 		}
 		number, ok := parseIssueTriggerRef(it.IssueRef)
@@ -1366,7 +1383,7 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 			if err != nil {
 				s.cfg.Logger.Warn("reconcile-on-read: resolve installation failed; run-less settle pass skipped",
 					"campaign_id", c.ID.String(), "repo", c.Repo, "error", err.Error())
-				return settledAny
+				return false
 			}
 			instID = id
 			instResolved = true
@@ -1382,22 +1399,55 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 		if issue.State != "closed" || issue.StateReason != "completed" {
 			continue
 		}
-		if !campaign.ValidCampaignItemTransition(it.State, campaign.ItemStateSucceeded) {
-			continue
+		candidates = append(candidates, it)
+	}
+
+	// Phase 2 (in-memory fixpoint, no further GitHub calls): settle any candidate
+	// whose depends_on refs are all in the done-set, add its ref to the done-set,
+	// and repeat until a full pass settles nothing new. This converges a closed
+	// C-depends_on-closed-D chain in a SINGLE read regardless of iteration order,
+	// while a closed candidate whose dependency is still OPEN is never reached
+	// (its ref never enters the done-set) and stays Blocked.
+	settledAny := false
+	settled := make(map[uuid.UUID]bool, len(candidates))
+	for {
+		progressed := false
+		for _, it := range candidates {
+			if settled[it.ID] {
+				continue
+			}
+			// DAG ordering: an out-of-dependency-order human-merge (a dependency
+			// not yet in the done-set) is deliberately NOT settled, preserving
+			// wave order — a closed item whose dep is still OPEN stays Blocked.
+			if !depsSatisfiedRefs(it.DependsOn, done) {
+				continue
+			}
+			// Mark before transitioning so an untransitionable or failing
+			// candidate is never revisited by the fixpoint (bounds iteration and
+			// avoids a duplicate transition attempt this read).
+			settled[it.ID] = true
+			if !campaign.ValidCampaignItemTransition(it.State, campaign.ItemStateSucceeded) {
+				continue
+			}
+			if _, err := s.cfg.CampaignRepo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateSucceeded); err != nil {
+				s.cfg.Logger.Warn("reconcile-on-read: run-less settle transition failed; left for next read",
+					"campaign_id", c.ID.String(), "item_id", it.ID.String(), "error", err.Error())
+				continue
+			}
+			done[it.IssueRef] = true
+			progressed = true
+			settledAny = true
+			s.emitCampaignAudit(ctx, categoryCampaignIssueSettled, map[string]any{
+				"campaign_id":  c.ID.String(),
+				"issue_ref":    it.IssueRef,
+				"outcome":      string(campaign.ItemStateSucceeded),
+				"settled_via":  "issue_closed",
+				"state_reason": "completed",
+			})
 		}
-		if _, err := s.cfg.CampaignRepo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateSucceeded); err != nil {
-			s.cfg.Logger.Warn("reconcile-on-read: run-less settle transition failed; left for next read",
-				"campaign_id", c.ID.String(), "item_id", it.ID.String(), "error", err.Error())
-			continue
+		if !progressed {
+			break
 		}
-		settledAny = true
-		s.emitCampaignAudit(ctx, categoryCampaignIssueSettled, map[string]any{
-			"campaign_id":  c.ID.String(),
-			"issue_ref":    it.IssueRef,
-			"outcome":      string(campaign.ItemStateSucceeded),
-			"settled_via":  "issue_closed",
-			"state_reason": "completed",
-		})
 	}
 	return settledAny
 }
