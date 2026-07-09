@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -152,6 +153,14 @@ type Orchestrator struct {
 	// still dispatches the children (the dispatch is the shipped
 	// behavior; the audit is pure observability).
 	Drive *drive.Engine
+
+	// ExternalURL is the operator-facing base URL used to render the
+	// consolidated PR body's audit-log footer (#1774), mirroring the
+	// runner's cfg.backendURL for the single-run implement PR. Wired from
+	// server.Config.ExternalURL in newStageOrchestrator. Empty (the CLI/dev
+	// posture) degrades the audit-log URL to a relative `/v0/runs/<id>/audit`,
+	// matching the defensive nil-URL posture elsewhere in this file.
+	ExternalURL string
 }
 
 // Outcome describes what Advance did. Useful for telemetry and
@@ -603,7 +612,41 @@ func (o *Orchestrator) maybeOpenConsolidatedPR(ctx context.Context, r *run.Run, 
 	if base == "" {
 		base = "main"
 	}
-	title, body := consolidatedPRTitleBody(r)
+
+	// Gather the inputs the aligned PR body (#1774) needs. Every load is
+	// defensive: a failure logs at WARN and proceeds with a nil plan / empty
+	// child ids so a missing artifact or child-list error NEVER fails the open.
+	stages, serr := o.Runs.ListStagesForRun(ctx, r.ID)
+	if serr != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: list stages for consolidated PR body failed; proceeding without implement stage id / plan",
+			slog.String("run_id", r.ID.String()),
+			slog.String("error", serr.Error()))
+		stages = nil
+	}
+	implStageID := firstImplementStageID(stages)
+	var approvedPlan *plan.Plan
+	if o.Artifacts != nil {
+		if p, _, perr := o.loadApprovedPlan(ctx, stages); perr != nil {
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: load approved plan for consolidated PR body failed; proceeding with nil plan",
+				slog.String("run_id", r.ID.String()),
+				slog.String("error", perr.Error()))
+		} else {
+			approvedPlan = p
+		}
+	}
+	childIDs, cerr := o.listAllDecomposedChildren(ctx, r.ID)
+	if cerr != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: list decomposed children for consolidated PR body failed; proceeding with empty child ids",
+			slog.String("run_id", r.ID.String()),
+			slog.String("error", cerr.Error()))
+		childIDs = nil
+	}
+	// listAllDecomposedChildren returns created_at DESC (repository contract);
+	// reverse to created_at ASC to approximate the children's mint order so the
+	// per-slice bullet pairing lines up with the plan's sub_plans ordering.
+	childRunIDs := childRunIDsInMintOrder(childIDs)
+
+	title, body := consolidatedPRTitleBody(r, approvedPlan, implStageID, head, o.ExternalURL, childRunIDs)
 
 	// (e) Open the PR; recover the existing one on a lost race.
 	var prURL string
@@ -703,16 +746,8 @@ func (o *Orchestrator) recordConsolidatedPRArtifact(ctx context.Context, r *run.
 	if err != nil {
 		return fmt.Errorf("list stages for consolidated pull_request artifact: %w", err)
 	}
-	var implID uuid.UUID
-	foundImpl := false
-	for _, s := range stages {
-		if s.Type == run.StageTypeImplement {
-			implID = s.ID
-			foundImpl = true
-			break
-		}
-	}
-	if !foundImpl {
+	implID := firstImplementStageID(stages)
+	if implID == uuid.Nil {
 		return fmt.Errorf("no implement stage on run %s to record consolidated pull_request artifact", r.ID)
 	}
 
@@ -840,20 +875,128 @@ func ConsolidatedBranch(parentID uuid.UUID) string {
 	return consolidatedBranch(parentID)
 }
 
-// consolidatedPRTitleBody derives the PR title + body from the parent
-// run's cached issue context. Falls back to a run-id-stamped title when
-// no issue context is present (webhook runs that left it nil are fetched
-// by the runner; this is the defensive default).
-func consolidatedPRTitleBody(r *run.Run) (string, string) {
-	if r.IssueContext != nil && r.IssueContext.Title != "" {
-		body := fmt.Sprintf("Consolidated changes for decomposed run %s.", r.ID)
-		if r.IssueContext.Number > 0 {
-			body += fmt.Sprintf("\n\nCloses #%d", r.IssueContext.Number)
+// conventionalCommitHeaderRe matches a Conventional Commits v1.0.0 header
+// (#1572): a lowercase type from the allowed set, an optional lowercase scope
+// in parens, an optional breaking-change `!`, then `: ` and a non-empty
+// description. Used by consolidatedPRTitleBody (#1774) to decide whether the
+// issue title is already a conventional header (used verbatim) or needs the
+// `chore: ` prefix.
+//
+// BYTE-IDENTICAL MIRROR of runner/cmd/fishhawk-runner/main.go's
+// conventionalCommitHeaderRe. The runner is a separate Go module, so this
+// cannot be imported and MUST stay in sync — the runner side carries a
+// cross-reference comment pointing back here. The consolidatedPRTitleBody unit
+// test asserts the shipped title shape, so a drift that changed the
+// verbatim-vs-prefix decision fails the suite.
+var conventionalCommitHeaderRe = regexp.MustCompile(`^(feat|fix|docs|refactor|test|chore|perf|build)(\([a-z0-9/._-]+\))?!?: .+$`)
+
+// consolidatedPRTitleBody renders the decomposed parent's consolidated PR
+// title + body (#1774) aligned with the single-run implement PR the runner
+// produces in prTitleAndBody. The title is a Conventional Commits header (the
+// issue title verbatim when it already matches, else `chore: <title>`, else a
+// deterministic run-id-stamped fallback); the body carries `## Summary` (the
+// approved-plan summary plus a per-slice bullet list from decomposition
+// sub_plans), a `Closes #N` line for issue-triggered parents, and the SAME
+// attribution footer literal the runner appends.
+//
+// Defensive by construction: nil/empty IssueContext, a nil plan, and a plan
+// lacking a summary or sub_plan titles each still yield a valid, run-id-stamped
+// PR — the open never fails on missing context. childIDs pairs positionally
+// with p.Decomposition.SubPlans; the pairing is descriptive metadata only, so a
+// length mismatch degrades to titles-only bullets rather than mispairing.
+func consolidatedPRTitleBody(r *run.Run, p *plan.Plan, implStageID uuid.UUID, head, baseURL string, childIDs []uuid.UUID) (title, body string) {
+	// Title: a Conventional Commits header. An issue title that already
+	// matches the header shape is used verbatim (no double prefix); a
+	// non-conventional title gets the `chore: ` prefix; no issue title falls
+	// back to a deterministic run-id-stamped chore subject.
+	switch {
+	case r.IssueContext != nil && r.IssueContext.Title != "":
+		if conventionalCommitHeaderRe.MatchString(r.IssueContext.Title) {
+			title = r.IssueContext.Title
+		} else {
+			title = "chore: " + r.IssueContext.Title
 		}
-		return r.IssueContext.Title, body
+	default:
+		title = fmt.Sprintf("chore: fishhawk consolidated run %s", shortRunID(r.ID))
 	}
-	return fmt.Sprintf("Fishhawk decomposition %s", shortRunID(r.ID)),
-		fmt.Sprintf("Consolidated changes for decomposed run %s.", r.ID)
+
+	var b strings.Builder
+	b.WriteString("## Summary\n\n")
+	if p != nil && p.Summary != "" {
+		b.WriteString(p.Summary)
+	} else {
+		fmt.Fprintf(&b, "Consolidated changes for decomposed run %s.", r.ID)
+	}
+
+	// Per-slice bullet list from the approved plan's sub_plans. Pair each
+	// bullet with its child run's short id ONLY when the counts line up
+	// (positional pairing relies on ListRuns mint order — descriptive, not
+	// load-bearing); a mismatch degrades to titles-only bullets.
+	if p != nil && p.Decomposition != nil && len(p.Decomposition.SubPlans) > 0 {
+		pairIDs := len(childIDs) == len(p.Decomposition.SubPlans)
+		b.WriteString("\n")
+		for i, sub := range p.Decomposition.SubPlans {
+			b.WriteString("\n- ")
+			b.WriteString(sub.Title)
+			if pairIDs {
+				fmt.Fprintf(&b, " (run %s)", shortRunID(childIDs[i]))
+			}
+		}
+	}
+
+	if r.IssueContext != nil && r.IssueContext.Number > 0 {
+		fmt.Fprintf(&b, "\n\nCloses #%d", r.IssueContext.Number)
+	}
+
+	b.WriteString(consolidatedPRFooter(r.ID, implStageID, head, baseURL))
+	return title, b.String()
+}
+
+// consolidatedPRFooter renders the Fishhawk attribution footer appended to the
+// consolidated PR body (#1774).
+//
+// BYTE-IDENTICAL MIRROR of the agent-path footer literal in
+// runner/cmd/fishhawk-runner/main.go's prTitleAndBody. The runner is a separate
+// Go module, so this cannot be imported and MUST stay in sync — the runner side
+// carries a cross-reference comment pointing back here, and the
+// consolidatedPRTitleBody unit test asserts the exact footer shape so a drift
+// fails the suite. baseURL is right-trimmed of a trailing slash exactly as the
+// runner does; an empty baseURL renders a relative `/v0/runs/<id>/audit`.
+func consolidatedPRFooter(runID, implStageID uuid.UUID, head, baseURL string) string {
+	return fmt.Sprintf(
+		"\n\n---\n_Opened by [Fishhawk](https://github.com/kuhlman-labs/fishhawk) for run `%s`, stage `%s`._\n_Branch: `%s` · Audit log: `%s/v0/runs/%s/audit`._\n",
+		runID, implStageID, head,
+		strings.TrimRight(baseURL, "/"), runID,
+	)
+}
+
+// firstImplementStageID returns the id of the first implement-typed stage in
+// the run's stage list, or uuid.Nil when there is none. It is the single
+// derivation reused by both the consolidated-PR footer (#1774) and
+// recordConsolidatedPRArtifact (#1732) so the implement stage they reference is
+// always the same one.
+func firstImplementStageID(stages []*run.Stage) uuid.UUID {
+	for _, s := range stages {
+		if s.Type == run.StageTypeImplement {
+			return s.ID
+		}
+	}
+	return uuid.Nil
+}
+
+// childRunIDsInMintOrder reverses the created_at-DESC child list
+// (listAllDecomposedChildren's repository ordering) into created_at-ASC order,
+// approximating the children's mint order so the consolidated PR body's
+// per-slice bullets pair positionally with the plan's sub_plans (#1774). The
+// pairing is descriptive metadata only — consolidatedPRTitleBody degrades to
+// titles-only bullets on any count mismatch — so an imperfect approximation
+// never mispairs load-bearing state.
+func childRunIDsInMintOrder(children []*run.Run) []uuid.UUID {
+	ids := make([]uuid.UUID, 0, len(children))
+	for i := len(children) - 1; i >= 0; i-- {
+		ids = append(ids, children[i].ID)
+	}
+	return ids
 }
 
 // emitConsolidatedPROpened writes a consolidated_pr_opened audit entry

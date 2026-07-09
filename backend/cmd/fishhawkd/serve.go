@@ -1598,6 +1598,10 @@ func newStageOrchestrator(cfg server.Config, logger *slog.Logger) *orchestrator.
 		Audit:               cfg.AuditRepo,
 		MaxParallelChildren: cfg.MaxParallelChildren,
 		Drive:               &drive.Engine{Audit: cfg.AuditRepo, Logger: logger},
+		// ExternalURL threads the operator-facing base URL into the
+		// consolidated PR body's audit-log footer (#1774). Empty degrades the
+		// footer URL to a relative /v0/runs/<id>/audit.
+		ExternalURL: cfg.ExternalURL,
 	}
 }
 

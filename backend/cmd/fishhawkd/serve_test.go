@@ -379,6 +379,23 @@ func TestNewStageOrchestrator_WiresDriveEngine(t *testing.T) {
 	}
 }
 
+// TestNewStageOrchestrator_ThreadsExternalURL pins the cross-layer wiring
+// (#1774, binding condition 2): newStageOrchestrator must thread
+// cfg.ExternalURL into the Orchestrator's ExternalURL field so the consolidated
+// PR body's audit-log footer renders the operator-facing base URL rather than a
+// relative path. A regression here silently degrades every decomposed-parent PR
+// footer to a relative URL.
+func TestNewStageOrchestrator_ThreadsExternalURL(t *testing.T) {
+	const want = "https://app.fishhawk.test"
+	o := newStageOrchestrator(server.Config{ExternalURL: want}, slog.Default())
+	if o == nil {
+		t.Fatal("newStageOrchestrator returned nil")
+	}
+	if o.ExternalURL != want {
+		t.Errorf("orchestrator ExternalURL = %q, want %q (cfg.ExternalURL not threaded)", o.ExternalURL, want)
+	}
+}
+
 // TestNewChildCompletionSweeper_WiresDispatchBackstop pins the
 // construction-site wiring (E24.3 / #1143): the sweeper runServe builds
 // must carry a non-nil Dispatch backstop (the childCompletionAdvancer
