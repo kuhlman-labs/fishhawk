@@ -294,29 +294,61 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	// can fire for the skipped stage. A load error surfaces (do NOT silently
 	// dispatch); a nil plan or a false predicate falls through to the unchanged
 	// operator-dispatched acceptance path.
+	//
+	// #1728 (E41.5) rides the SAME approved-plan load with a second, disjoint
+	// predicate: when the approved plan declares ZERO acceptance_criteria AND
+	// ZERO out_of_scope, there is no observable criterion to validate and no
+	// out_of_scope justification, so short-circuit the acceptance stage straight
+	// to succeeded — but record a REAL passed verdict
+	// (acceptance_outcome_recorded, verdict=passed, basis=empty-criteria) rather
+	// than an acceptance_skipped_out_of_scope marker, so downstream next_actions
+	// surfaces acceptance_passed and auto-close/merge proceed identically. The two
+	// predicates are disjoint by construction (E38.3 requires out_of_scope>0; #1728
+	// requires out_of_scope==0), so at most one fires.
 	if next.Type == run.StageTypeAcceptance && o.Artifacts != nil {
 		approvedPlan, _, err := o.loadApprovedPlan(ctx, stages)
 		if err != nil {
 			return OutcomeNoOp, fmt.Errorf("orchestrator: load approved plan for acceptance skip: %w", err)
 		}
-		if approvedPlan != nil && plan.AcceptanceSkippableOutOfScope(approvedPlan.Verification) {
-			for _, to := range []run.StageState{
-				run.StageStateDispatched,
-				run.StageStateRunning,
-				run.StageStateSucceeded,
-			} {
-				if _, err := o.Runs.TransitionStage(ctx, next.ID, to, nil); err != nil {
-					return OutcomeNoOp, fmt.Errorf("orchestrator: walk acceptance stage to %s for out-of-scope skip: %w", to, err)
+		if approvedPlan != nil {
+			walkAcceptanceToSucceeded := func(kind string) error {
+				for _, to := range []run.StageState{
+					run.StageStateDispatched,
+					run.StageStateRunning,
+					run.StageStateSucceeded,
+				} {
+					if _, err := o.Runs.TransitionStage(ctx, next.ID, to, nil); err != nil {
+						return fmt.Errorf("orchestrator: walk acceptance stage to %s for %s: %w", to, kind, err)
+					}
 				}
+				return nil
 			}
-			o.emitAcceptanceSkippedOutOfScope(ctx, r.ID, next.ID, next.Sequence, len(approvedPlan.Verification.OutOfScope))
-			o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator auto-terminated acceptance stage (out_of_scope, zero acceptance_criteria)",
-				slog.String("run_id", r.ID.String()),
-				slog.String("stage_id", next.ID.String()),
-				slog.Int("sequence", next.Sequence),
-				slog.Int("out_of_scope_count", len(approvedPlan.Verification.OutOfScope)),
-			)
-			return o.Advance(ctx, runID)
+			switch {
+			case plan.AcceptanceSkippableOutOfScope(approvedPlan.Verification):
+				if err := walkAcceptanceToSucceeded("out-of-scope skip"); err != nil {
+					return OutcomeNoOp, err
+				}
+				o.emitAcceptanceSkippedOutOfScope(ctx, r.ID, next.ID, next.Sequence, len(approvedPlan.Verification.OutOfScope))
+				o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator auto-terminated acceptance stage (out_of_scope, zero acceptance_criteria)",
+					slog.String("run_id", r.ID.String()),
+					slog.String("stage_id", next.ID.String()),
+					slog.Int("sequence", next.Sequence),
+					slog.Int("out_of_scope_count", len(approvedPlan.Verification.OutOfScope)),
+				)
+				return o.Advance(ctx, runID)
+			case plan.AcceptanceSkippableEmptyCriteria(approvedPlan.Verification):
+				if err := walkAcceptanceToSucceeded("empty-criteria short-circuit"); err != nil {
+					return OutcomeNoOp, err
+				}
+				o.emitAcceptanceOutcomeShortCircuit(ctx, r.ID, next.ID, next.Sequence)
+				o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator short-circuited acceptance stage (zero acceptance_criteria, zero out_of_scope) to a passed verdict",
+					slog.String("run_id", r.ID.String()),
+					slog.String("stage_id", next.ID.String()),
+					slog.Int("sequence", next.Sequence),
+					slog.String("basis", plan.AcceptanceBasisEmptyCriteria),
+				)
+				return o.Advance(ctx, runID)
+			}
 		}
 	}
 
@@ -781,6 +813,63 @@ func (o *Orchestrator) emitAcceptanceSkippedOutOfScope(ctx context.Context, runI
 		Payload:   payload,
 	}); err != nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append acceptance_skipped_out_of_scope failed",
+			slog.String("error", err.Error()))
+	}
+}
+
+// emitAcceptanceOutcomeShortCircuit writes the acceptance_outcome_recorded
+// verdict the orchestrator records when it short-circuits a no-surface
+// acceptance stage — an approved plan with ZERO acceptance_criteria AND ZERO
+// out_of_scope (#1728 / E41.5). Unlike emitAcceptanceSkippedOutOfScope (which
+// records a skip MARKER), this records a real passed verdict so downstream
+// next_actions surfaces acceptance_passed and auto-close/merge proceed
+// identically to a validator-shipped pass. Best-effort, mirroring the other
+// emit helpers: nil-Audit guard with a WARN log, WARN-on-error, never unwinds
+// the walk.
+//
+// The category literal is byte-identical to server.CategoryAcceptanceOutcomeRecorded
+// so the same audit shape the validator ships is what auditcomplete and the MCP
+// next_actions classifier read. The payload mirrors the server's
+// buildOutcomePayload verdict/outcome/criteria_* render contract (all zero — no
+// criterion was validated) and additionally carries the basis field
+// (plan.AcceptanceBasisKey → plan.AcceptanceBasisEmptyCriteria). A normal
+// server-recorded verdict never sets basis, so its presence cleanly marks this
+// entry as the pre-spawn short-circuit — the discriminator auditcomplete reads
+// to exempt the no-trace acceptance stage from the trace-required rule. Appended
+// with AppendChained (ActorKind system) so Rule 4 chain-verify stays intact.
+func (o *Orchestrator) emitAcceptanceOutcomeShortCircuit(ctx context.Context, runID, stageID uuid.UUID, sequence int) {
+	if o.Audit == nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping acceptance_outcome_recorded short-circuit entry",
+			slog.String("run_id", runID.String()))
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"stage_id":              stageID.String(),
+		"sequence":              sequence,
+		"verdict":               "passed",
+		"outcome":               "accepted",
+		"criteria_passed":       0,
+		"criteria_failed":       0,
+		"criteria_skipped":      0,
+		"criteria_total":        0,
+		plan.AcceptanceBasisKey: plan.AcceptanceBasisEmptyCriteria,
+		"reason":                "approved plan declares zero acceptance_criteria and zero verification.out_of_scope; acceptance stage short-circuited to a passed verdict with no runner spawn and no preview",
+	})
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal acceptance_outcome_recorded short-circuit payload failed",
+			slog.String("error", err.Error()))
+		return
+	}
+	systemKind := audit.ActorSystem
+	if _, err := o.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "acceptance_outcome_recorded",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append acceptance_outcome_recorded short-circuit failed",
 			slog.String("error", err.Error()))
 	}
 }
