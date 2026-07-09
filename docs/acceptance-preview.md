@@ -10,7 +10,7 @@ The acceptance stage validates a **running instance** at the first spec-declared
 
 ## The two hooks
 
-Both hooks run via `sh -c` in the runner's current working directory.
+Both hooks run via `sh -c` in the operator's dispatch `working_dir` — the checkout the run was dispatched from (e.g. the one carrying the untracked `.env`) — falling back to the runner's current working directory when no `working_dir` was dispatched. Anchoring to the dispatch checkout means a **relative** provision command like `scripts/dev preview` resolves the operator's checkout even when the driving session launched from a git worktree, rather than the runner-inherited process cwd (#1746).
 
 | Env var | Role | When it runs |
 |---|---|---|
