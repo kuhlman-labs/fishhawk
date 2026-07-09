@@ -196,6 +196,75 @@ func TestReapStageFailure_AlreadyTerminalNoOp(t *testing.T) {
 	}
 }
 
+// raceReapRepo simulates the double-report / watchdog race the pre-check alone
+// can't cover: a report passes the non-terminal pre-check, but by the time
+// FailStage attempts the transition another writer (a concurrent reap report or
+// the dispatch watchdog / runner's own terminal report) has already driven the
+// stage terminal. It flips the target stage to succeeded on the FIRST
+// TransitionStage attempt, then delegates — so the embedded repo refuses the
+// move exactly as the real repo refuses a terminal → running transition.
+type raceReapRepo struct {
+	*orchestratorRepo
+	stageID uuid.UUID
+	flipped bool
+}
+
+func (r *raceReapRepo) TransitionStage(ctx context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	if !r.flipped && id == r.stageID {
+		r.flipped = true
+		r.mu.Lock()
+		if st := r.stagesByID[id]; st != nil {
+			st.State = run.StageStateSucceeded // the concurrent winner already settled it
+		}
+		r.mu.Unlock()
+	}
+	return r.orchestratorRepo.TransitionStage(ctx, id, to, c)
+}
+
+// (b2) Concurrent-terminal race: the pre-check sees a non-terminal stage, but a
+// concurrent writer drives it terminal before FailStage's transition lands. The
+// loser must still return the benign {transitioned:false} no-op — NOT a 500 —
+// with NO audit entry and NO advance. Guards the idempotency race the plain
+// already-terminal test (which only exercises the non-racy pre-check) misses.
+func TestReapStageFailure_ConcurrentTerminalRace(t *testing.T) {
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched)
+	race := &raceReapRepo{orchestratorRepo: rr, stageID: stage.ID}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      race,
+		AuditRepo:    au,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+
+	w := postReapFailure(t, s, runRow.ID, stage.ID,
+		reapFailureRequest{Category: "C", Reason: "loser"}, withReapOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (benign no-op, not 500):\n%s", w.Code, w.Body.String())
+	}
+	var resp reapFailureResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Transitioned {
+		t.Error("transitioned = true, want false for a stage won by a concurrent writer")
+	}
+	if resp.StageState != string(run.StageStateSucceeded) {
+		t.Errorf("stage_state = %q, want succeeded (the winner's terminal state)", resp.StageState)
+	}
+	// No dispatch_reaper_failed audit entry: the loser wrote nothing.
+	if got := reapAudit(au); len(got) != 0 {
+		t.Errorf("dispatch_reaper_failed entries = %d, want 0 (loser no-op)", len(got))
+	}
+	// Advance NOT invoked by the loser: the run is untouched by this call.
+	curRun, _ := rr.GetRun(context.Background(), runRow.ID)
+	if curRun.State != run.StateRunning {
+		t.Errorf("run state = %q, want running (loser did not advance)", curRun.State)
+	}
+}
+
 // (c) Invalid category (A) → 400. An empty category is covered by the sub-test.
 func TestReapStageFailure_InvalidCategory(t *testing.T) {
 	for _, cat := range []string{"A", ""} {

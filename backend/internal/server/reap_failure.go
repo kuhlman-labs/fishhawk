@@ -188,6 +188,22 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 	// path from whichever non-terminal state the stage is in (e.g. dispatched →
 	// running → failed), so the spawn-phase 'dispatched' case is handled.
 	if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, req.Reason); err != nil {
+		// Idempotency under concurrency: the pre-check above and this FailStage
+		// call are NOT atomic. A concurrent reap report, or a race with the
+		// dispatch watchdog / runner's own terminal report, can drive the stage
+		// terminal in the window between them — the loser reaches FailStage
+		// after the winner and TransitionStage refuses the move
+		// (InvalidTransitionError). Re-load the stage: if it is now terminal the
+		// winner already did the work, so return the SAME benign
+		// {transitioned:false} no-op the pre-check returns — no audit entry, no
+		// advance. Only a genuine failure (stage still non-terminal) is a 500.
+		if cur, gerr := s.cfg.RunRepo.GetStage(r.Context(), stageID); gerr == nil && cur.State.IsTerminal() {
+			s.writeJSON(w, r, http.StatusOK, reapFailureResponse{
+				Transitioned: false,
+				StageState:   string(cur.State),
+			})
+			return
+		}
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"could not transition the stage to failed",
 			map[string]any{"stage_id": stageID.String(), "state": string(stage.State), "error": err.Error()})
