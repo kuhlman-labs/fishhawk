@@ -2,11 +2,11 @@
 
 Reference for `.fishhawk/workflows.yaml` at major version 1. The canonical schema is [`workflow-v1.schema.json`](workflow-v1.schema.json) (JSON Schema Draft 2020-12).
 
-> **v1 began as a structural copy of v0 (ADR-046 / #1381) and now adds the deploy surface (E23.2 / #1382).** The inherited `$defs` and `properties` stay byte-for-byte identical to [`workflow-v0.schema.json`](workflow-v0.schema.json); v1 layers the delegating deploy grammar (per ADR-038 / #925) on top — the `deploy` stage type, the `deployment` artifact, the delegating executor, and three pre-flight constraint kinds. **v1.1 adds the `acceptance` stage type (E31.2 / #1519, per ADR-049)** — a runner-hosted advisory acceptance stage on the ordinary agent/human executor branches (no delegate, no deploy-only constraints); an additive minor, so every 1.0 spec stays valid. **v1.2 adds the `acceptance` produces artifact (E31.3 / #1531, per ADR-049)** — the durable acceptance-evidence record, valid only on an acceptance stage; also an additive minor. **v1.3 adds the acceptance-stage `egress` allowance (E31.4 / #1532, per ADR-050)** — the declared target host(s) the acceptance agent may reach through the runner's default-deny egress proxy; also an additive minor. **v0 stays frozen** and rejects both `deploy` and `acceptance` via its closed enums, so a v0 spec carrying either fails at the schema layer.
+> **v1 began as a structural copy of v0 (ADR-046 / #1381) and now adds the deploy surface (E23.2 / #1382).** The inherited `$defs` and `properties` stay byte-for-byte identical to [`workflow-v0.schema.json`](workflow-v0.schema.json); v1 layers the delegating deploy grammar (per ADR-038 / #925) on top — the `deploy` stage type, the `deployment` artifact, the delegating executor, and three pre-flight constraint kinds. **v1.1 adds the `acceptance` stage type (E31.2 / #1519, per ADR-049)** — a runner-hosted advisory acceptance stage on the ordinary agent/human executor branches (no delegate, no deploy-only constraints); an additive minor, so every 1.0 spec stays valid. **v1.2 adds the `acceptance` produces artifact (E31.3 / #1531, per ADR-049)** — the durable acceptance-evidence record, valid only on an acceptance stage; also an additive minor. **v1.3 adds the acceptance-stage `egress` allowance (E31.4 / #1532, per ADR-050)** — the declared target host(s) the acceptance agent may reach through the runner's default-deny egress proxy; also an additive minor. **v1.4 adds the `agent_version` compatibility range (E32.13 / #1743)** — on the executor's agent branch and per reviewer in `reviewers.agents[]`, failing dispatch loudly when the resolved agent CLI version falls outside the declared range; also an additive minor. **v0 stays frozen** and rejects both `deploy` and `acceptance` via its closed enums, so a v0 spec carrying either fails at the schema layer.
 
 ## Grammar
 
-Every v0 field is inherited unchanged. For the full base reference (top-level shape, stages, executors, inputs, produces, constraints, budgets, gates, operator-agent delegation — including the `operator_agent.model_policy` scenario-A model-selection contract (#1421), inherited verbatim and surfaced identically on the run-status delegation block — decomposition controls), see [`workflow-v0.md`](workflow-v0.md). The v1 additions are the [deploy stage](#deploy-stage-v1) (v1.0), the [acceptance stage](#acceptance-stage-v11) (v1.1), the [acceptance artifact](#acceptance-artifact-v12) (v1.2), and the [egress allowance](#egress-allowance-v13) (v1.3) members below. A minimal non-deploy v1 spec differs from a v0 spec only in its `version` value:
+Every v0 field is inherited unchanged. For the full base reference (top-level shape, stages, executors, inputs, produces, constraints, budgets, gates, operator-agent delegation — including the `operator_agent.model_policy` scenario-A model-selection contract (#1421), inherited verbatim and surfaced identically on the run-status delegation block — decomposition controls), see [`workflow-v0.md`](workflow-v0.md). The v1 additions are the [deploy stage](#deploy-stage-v1) (v1.0), the [acceptance stage](#acceptance-stage-v11) (v1.1), the [acceptance artifact](#acceptance-artifact-v12) (v1.2), the [egress allowance](#egress-allowance-v13) (v1.3), and the [agent version compatibility](#agent-version-compatibility-v14) range (v1.4) members below. A minimal non-deploy v1 spec differs from a v0 spec only in its `version` value:
 
 ```yaml
 version: "1.0" # required; routes to workflow-v1.schema.json
@@ -266,6 +266,49 @@ Either way run creation **no longer hard-fails** on the capability gap: the spec
 | **No** reviewer backend wired at all | run creation rejected (400) | **still rejected** (400) — a deployment-wide misconfiguration, distinct from a per-reviewer gap, `optional` does not apply |
 
 The **coarse** "no reviewer backend wired at all" case remains a hard-fail on **both** run-create paths — the API create-run path (`handleCreateRun`) and the webhook dispatcher (`!PlanReviewerConfigured`) — so they stay symmetric. Only the finer per-reviewer capability gap degrades.
+
+## Agent version compatibility (v1.4)
+
+v1.4 (E32.13 / #1743) adds the **additive optional** `agent_version` field on two surfaces: the executor's agent branch (`executor.agent_version`) and each heterogeneous reviewer (`reviewers.agents[i].agent_version`). It declares the semver comparator **range** of agent CLI versions a workflow was validated against, and fails dispatch **loudly** when the resolved CLI version falls outside it — turning an opaque mid-run break like the 2026-07-08 claude CLI auto-update (#1741, a silent `--json-schema` tightening that took every plan stage down at zero tokens) into a one-line diagnosis. Absent on every surface = **no constraint** (full back-compat, mirroring `min_runner_version`).
+
+**It is a RANGE, not an exact pin.** CLIs release near-daily, so pinning an exact build in the spec would be churn-prone and wrong. The actual binary pin stays a **host concern** via the `FISHHAWK_AGENT_BIN` / `FISHHAWK_CODEX_BIN` overrides (#1741 / #1769); this field owns only the spec-level compatibility contract. The range is intentionally never annotated `x-intended-required` — it is permanently optional.
+
+### Range grammar
+
+An `agent_version` value is a **space-separated AND list** of comparators. Each comparator is an operator — one of `>=`, `>`, `<=`, `<`, `=`, `==` — immediately followed by a 1-to-3-part dotted version (`2`, `2.1`, or `2.1.5`; partial bounds normalize by zero-padding, so `>=2.1` means `>=2.1.0`). Examples: `">=2.1 <2.2"`, `"=3.0.1"`, `">=0.30 <0.31"`. The range string is a plain string to the JSON Schema; a **malformed** range (e.g. `">=abc"`, or a bare `"2.1"` with no operator) is rejected by the **semantic validator** at spec-parse time, not silently accepted.
+
+The comparison **extracts the first semver token** from the free-form probed version string (#1769 records e.g. `"2.1.5 (Claude Code)"` or `"codex 0.30.2"`), so the matcher compares against `2.1.5` / `0.30.2`. A probed version with **no extractable token** — the `unknown` sentinel #1769 records on any probe error, or a build string with no digits — is treated as **uncomparable**: the check **degrades to a warn and proceeds**, never blocking (mirroring the runner's `semverLT("dev")` degrade).
+
+### `executor.agent_version` — the coding agent (runner-enforced)
+
+Declared in the agent branch of the executor `oneOf` (alongside `model` / `timeout` / `verify`); the schema rejects it on a human executor. The backend threads the range to the runner on the stage prompt (`agent_version_range`). **Before spawning the coding agent**, the runner compares its resolved (#1769-probed) CLI version against the range:
+
+- **in range** → dispatch proceeds normally.
+- **out of range** → the stage fails **loudly pre-spawn (category C)** with an `agent_version_mismatch` log naming the range + resolved version; the agent never runs.
+- **unprobeable / `unknown`** → an `agent_version_uncomparable` warn, then proceed.
+
+### `reviewers.agents[i].agent_version` — a plan reviewer (backend-enforced)
+
+Declared per reviewer in the `reviewers.agents[]` list (see [Reviewer policy](#reviewer-policy-v1)). It is **codex-only**: the backend probes the codex reviewer CLI version before dispatch and, on an out-of-range version, fails the review dispatch loudly; an unprobeable version proceeds. The anthropic (SDK) and claudecode adapters take no CLI version and **ignore** the field. (The reviewer-side probe + enforcement is a sibling change; this section documents the contract.)
+
+```yaml
+stages:
+  - id: implement
+    type: implement
+    executor:
+      agent: claude-code
+      agent_version: ">=2.1 <2.2" # fail dispatch outside this coding-agent CLI range
+  - id: plan
+    type: plan
+    executor:
+      agent: claude-code
+    reviewers:
+      agents:
+        - provider: codex
+          agent_version: ">=0.30 <0.31" # codex reviewer CLI range (codex-only)
+        - provider: anthropic # SDK reviewer — agent_version ignored
+      human: 1
+```
 
 ## Approval gate predicate (v1)
 

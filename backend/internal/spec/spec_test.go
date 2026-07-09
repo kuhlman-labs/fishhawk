@@ -3102,3 +3102,121 @@ func TestEmbeddedSchemaHashV1(t *testing.T) {
 		t.Error("v1 hash equals v0 hash; the structural-copy schemas must still differ by $id/title/version")
 	}
 }
+
+// TestParse_AgentVersion_RoundTrip asserts a workflow-v1.4 spec declaring
+// agent_version on BOTH the executor's agent branch and a reviewers.agents
+// entry parses into the struct fields and passes semantic validation
+// (E32.13 / #1743). The field is workflow-v1-only, so the spec is pinned at
+// version "1.4".
+func TestParse_AgentVersion_RoundTrip(t *testing.T) {
+	yml := []byte(`
+version: "1.4"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+          agent_version: ">=2.1 <2.2"
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agents:
+            - provider: codex
+              agent_version: ">=0.30 <0.31"
+            - provider: anthropic
+          human: 1
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	st := s.Workflows["feature_change"].Stages[0]
+	if got := st.Executor.AgentVersion; got != ">=2.1 <2.2" {
+		t.Errorf("Executor.AgentVersion = %q, want %q", got, ">=2.1 <2.2")
+	}
+	if st.Reviewers == nil || len(st.Reviewers.Agents) != 2 {
+		t.Fatalf("Reviewers.Agents = %+v, want 2 entries", st.Reviewers)
+	}
+	if got := st.Reviewers.Agents[0].AgentVersion; got != ">=0.30 <0.31" {
+		t.Errorf("Agents[0].AgentVersion = %q, want %q", got, ">=0.30 <0.31")
+	}
+	// An absent reviewer agent_version stays empty (no constraint).
+	if got := st.Reviewers.Agents[1].AgentVersion; got != "" {
+		t.Errorf("Agents[1].AgentVersion = %q, want empty (absent)", got)
+	}
+
+	// Re-marshal preserves the executor field; omitempty keeps the absent
+	// reviewer field absent.
+	out, err := yaml.Marshal(st.Executor)
+	if err != nil {
+		t.Fatalf("re-marshal executor: %v", err)
+	}
+	if !strings.Contains(string(out), "agent_version: '>=2.1 <2.2'") &&
+		!strings.Contains(string(out), `agent_version: ">=2.1 <2.2"`) {
+		t.Errorf("re-marshalled executor = %q, want it to preserve agent_version", out)
+	}
+	absent, err := yaml.Marshal(st.Reviewers.Agents[1])
+	if err != nil {
+		t.Fatalf("re-marshal absent reviewer: %v", err)
+	}
+	if strings.Contains(string(absent), "agent_version") {
+		t.Errorf("re-marshalled reviewer with no agent_version = %q, want it omitted", absent)
+	}
+}
+
+// TestParse_AgentVersion_ExecutorMalformedRange_Rejected asserts a malformed
+// executor agent_version range — schema-valid as a plain string — is caught
+// by the semantic validator (#1743).
+func TestParse_AgentVersion_ExecutorMalformedRange_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.4"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          agent_version: ">=abc"
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Path, "/executor/agent_version") {
+		t.Errorf("ValidationError.Path = %q, want it to name /executor/agent_version", ve.Path)
+	}
+}
+
+// TestParse_AgentVersion_ReviewerMalformedRange_Rejected asserts a malformed
+// reviewer agent_version range is caught by the semantic validator (#1743).
+func TestParse_AgentVersion_ReviewerMalformedRange_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "1.4"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agents:
+            - provider: codex
+              agent_version: "2.1"
+          human: 1
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Path, "/reviewers/agents/0/agent_version") {
+		t.Errorf("ValidationError.Path = %q, want it to name the reviewer agent_version", ve.Path)
+	}
+}

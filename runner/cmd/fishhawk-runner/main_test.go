@@ -14172,3 +14172,160 @@ func TestFixupCheckoutFailReason(t *testing.T) {
 		})
 	}
 }
+
+// TestMatchAgentVersionRange covers the runner-local agent_version matcher
+// (E32.13 / #1743) — the duplicated twin of spec.MatchAgentVersionRange. Each
+// branch (in/below/above/boundary/partial/unextractable/malformed) is asserted
+// on BOTH the matched and comparable return so the pre-spawn gate's three
+// dispositions (block / proceed / degrade) are exercised.
+func TestMatchAgentVersionRange(t *testing.T) {
+	cases := []struct {
+		name           string
+		rng            string
+		probed         string
+		wantMatched    bool
+		wantComparable bool
+	}{
+		{name: "in_range", rng: ">=2.1 <2.2", probed: "2.1.5", wantMatched: true, wantComparable: true},
+		{name: "in_range_freeform", rng: ">=2.1 <2.2", probed: "2.1.5 (Claude Code)", wantMatched: true, wantComparable: true},
+		{name: "below", rng: ">=2.1 <2.2", probed: "2.0.9", wantMatched: false, wantComparable: true},
+		{name: "above", rng: ">=2.1 <2.2", probed: "2.2.0", wantMatched: false, wantComparable: true},
+		{name: "lower_boundary_inclusive", rng: ">=2.1 <2.2", probed: "2.1.0", wantMatched: true, wantComparable: true},
+		{name: "upper_boundary_exclusive", rng: ">=2.1 <2.2", probed: "2.2", wantMatched: false, wantComparable: true},
+		{name: "partial_bound_equal", rng: "=2.1", probed: "2.1.0", wantMatched: true, wantComparable: true},
+		{name: "unknown_sentinel", rng: ">=2.1 <2.2", probed: "unknown", wantMatched: false, wantComparable: false},
+		{name: "no_digits", rng: ">=2.1 <2.2", probed: "claude (dev build)", wantMatched: false, wantComparable: false},
+		{name: "malformed_range", rng: ">=foo", probed: "2.1.5", wantMatched: false, wantComparable: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			matched, comparable := matchAgentVersionRange(tc.rng, tc.probed)
+			if matched != tc.wantMatched || comparable != tc.wantComparable {
+				t.Errorf("matchAgentVersionRange(%q, %q) = (%v, %v), want (%v, %v)",
+					tc.rng, tc.probed, matched, comparable, tc.wantMatched, tc.wantComparable)
+			}
+		})
+	}
+}
+
+// agentVersionRunArgs is the shared fetch-prompt invocation for the
+// agent_version pre-spawn gate tests: a plan stage driven through
+// --fetch-prompt so the fake uploader's promptResp.AgentVersionRange reaches
+// the gate.
+func agentVersionRunArgs() []string {
+	return []string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "plan",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+	}
+}
+
+func agentVersionPromptResp(rng string) *upload.FetchedPrompt {
+	return &upload.FetchedPrompt{
+		StageID:           "22222222-3333-4444-5555-666666666666",
+		StageType:         "plan",
+		Prompt:            "test prompt",
+		PromptHash:        "deadbeef",
+		AgentVersionRange: rng,
+	}
+}
+
+// TestRun_AgentVersionMismatch_FailsPreSpawn is the shipped fail-loud
+// behavior: an executor agent_version range that the resolved CLI version
+// falls OUTSIDE fails the stage pre-spawn (category C) with an
+// agent_version_mismatch log naming the range + resolved version, and the
+// agent is NEVER invoked (#1743). A comment-only touch would not satisfy this.
+func TestRun_AgentVersionMismatch_FailsPreSpawn(t *testing.T) {
+	withCannedAgentVersion(t, "2.5.0")
+	fu := newFakeUploader(t)
+	fu.promptResp = agentVersionPromptResp(">=2.1 <2.2")
+	withFakeUploader(t, fu)
+	fake := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, fake)
+
+	var stderr strings.Builder
+	got := run(agentVersionRunArgs(), &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure; stderr:\n%s", got, stderr.String())
+	}
+	if fake.gotInv != nil {
+		t.Error("agent was invoked; the mismatch must fail PRE-spawn")
+	}
+	for _, want := range []string{
+		`"event":"agent_version_mismatch"`,
+		`"category":"C"`,
+		`"range":">=2.1 <2.2"`,
+		`"resolved":"2.5.0"`,
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("log missing %s:\n%s", want, stderr.String())
+		}
+	}
+}
+
+// TestRun_AgentVersionInRange_Proceeds: a resolved CLI version inside the
+// declared range passes the gate and the agent is invoked (#1743).
+func TestRun_AgentVersionInRange_Proceeds(t *testing.T) {
+	withCannedAgentVersion(t, "2.1.5")
+	fu := newFakeUploader(t)
+	fu.promptResp = agentVersionPromptResp(">=2.1 <2.2")
+	withFakeUploader(t, fu)
+	fake := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, fake)
+
+	var stderr strings.Builder
+	run(agentVersionRunArgs(), &stderr)
+	if fake.gotInv == nil {
+		t.Errorf("agent was NOT invoked; an in-range version must proceed:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "agent_version_mismatch") {
+		t.Errorf("unexpected agent_version_mismatch for an in-range version:\n%s", stderr.String())
+	}
+}
+
+// TestRun_AgentVersionAbsent_Proceeds: no declared range → no check → the run
+// proceeds exactly as today (back-compat, #1743).
+func TestRun_AgentVersionAbsent_Proceeds(t *testing.T) {
+	withCannedAgentVersion(t, "2.5.0") // would be out-of-range IF a range were set
+	fu := newFakeUploader(t)
+	fu.promptResp = agentVersionPromptResp("") // absent
+	withFakeUploader(t, fu)
+	fake := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, fake)
+
+	var stderr strings.Builder
+	run(agentVersionRunArgs(), &stderr)
+	if fake.gotInv == nil {
+		t.Errorf("agent was NOT invoked; an absent range must proceed:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "agent_version_mismatch") ||
+		strings.Contains(stderr.String(), "agent_version_uncomparable") {
+		t.Errorf("unexpected agent_version event for an absent range:\n%s", stderr.String())
+	}
+}
+
+// TestRun_AgentVersionUncomparable_Proceeds: an unprobeable/"unknown" version
+// degrades to a warn (agent_version_uncomparable) and proceeds — never blocks
+// (#1743).
+func TestRun_AgentVersionUncomparable_Proceeds(t *testing.T) {
+	withCannedAgentVersion(t, "unknown")
+	fu := newFakeUploader(t)
+	fu.promptResp = agentVersionPromptResp(">=2.1 <2.2")
+	withFakeUploader(t, fu)
+	fake := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, fake)
+
+	var stderr strings.Builder
+	run(agentVersionRunArgs(), &stderr)
+	if fake.gotInv == nil {
+		t.Errorf("agent was NOT invoked; an unprobeable version must proceed:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"agent_version_uncomparable"`) {
+		t.Errorf("missing agent_version_uncomparable degraded-warn log:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "agent_version_mismatch") {
+		t.Errorf("unexpected agent_version_mismatch for an unprobeable version:\n%s", stderr.String())
+	}
+}
