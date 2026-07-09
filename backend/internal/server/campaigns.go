@@ -163,6 +163,13 @@ func toCampaignItemResponse(it *campaign.Item) campaignItemResponse {
 // toCampaignRollupPayload maps a campaign.Eligibility partition onto the
 // wire payload, normalizing every nil slice to an empty slice so the JSON
 // shape is a stable array (never null) for each partition.
+//
+// The engine's Restartable partition (deps-satisfied, non-human-led cancelled
+// items restartable via the operator verb, #1729) has NO dedicated wire slice:
+// it is FOLDED BACK into the `cancelled` array so the CampaignRollup wire
+// contract (OpenAPI + the fishhawk-mcp client struct) is unchanged. A
+// restartable item is still a cancelled item to a rollup reader; the restart
+// signal reaches the operator through next_action (start_run), not a new slice.
 func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 	nz := func(s []string) []string {
 		if s == nil {
@@ -170,6 +177,11 @@ func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 		}
 		return s
 	}
+	// Restartable items are cancelled items on the wire — fold them back into
+	// the cancelled slice so the rollup shape is unchanged (#1729).
+	cancelled := make([]string, 0, len(e.Cancelled)+len(e.Restartable))
+	cancelled = append(cancelled, e.Cancelled...)
+	cancelled = append(cancelled, e.Restartable...)
 	return campaignRollupPayload{
 		Eligible:  nz(e.Eligible),
 		HumanLed:  nz(e.HumanLed),
@@ -177,7 +189,7 @@ func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 		Running:   nz(e.Running),
 		Done:      nz(e.Done),
 		Failed:    nz(e.Failed),
-		Cancelled: nz(e.Cancelled),
+		Cancelled: cancelled,
 		Paused:    nz(e.Paused),
 	}
 }
@@ -199,12 +211,18 @@ func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 //     ref. start_run WINS over attend_human_led: whenever ANY autonomous item
 //     is dispatchable it is surfaced first, so a human-led item never stalls
 //     DAG-independent autonomous work.
-//  4. else any human-led item -> "attend_human_led" on the first human-led ref.
-//     Fires ONLY when len(Eligible)==0 && len(HumanLed)>0 — every deps-satisfied
-//     item that remains is autonomy:low, reserved for human leadership, so the
-//     operator (not an auto-driver) must pick it up.
-//  5. else any running or blocked item -> "wait".
-//  6. else (every item terminal done/cancelled) -> "complete".
+//  4. else any restartable (cancelled, deps-satisfied, non-human-led) item ->
+//     "start_run" on the first restartable ref. A cancelled item with a
+//     satisfied DAG position has a forward path via the operator restart verb
+//     (#1729): surfaced as start_run so dependents no longer stay blocked
+//     forever. Ranked below Eligible (a fresh unstarted item is preferred over
+//     a restart) and above HumanLed.
+//  5. else any human-led item -> "attend_human_led" on the first human-led ref.
+//     Fires ONLY when len(Eligible)==0 && len(Restartable)==0 && len(HumanLed)>0
+//     — every deps-satisfied item that remains is autonomy:low, reserved for
+//     human leadership, so the operator (not an auto-driver) must pick it up.
+//  6. else any running or blocked item -> "wait".
+//  7. else (every item terminal done/cancelled) -> "complete".
 func computeCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload {
 	switch {
 	case len(e.Failed) > 0:
@@ -224,6 +242,12 @@ func computeCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload
 			Action:   "start_run",
 			IssueRef: e.Eligible[0],
 			Detail:   "this item's dependencies are satisfied and it has no run yet",
+		}
+	case len(e.Restartable) > 0:
+		return campaignNextActionPayload{
+			Action:   "start_run",
+			IssueRef: e.Restartable[0],
+			Detail:   "this item was cancelled but its dependencies are satisfied; restart it to unblock its dependents",
 		}
 	case len(e.HumanLed) > 0:
 		return campaignNextActionPayload{
@@ -816,9 +840,10 @@ func (s *Server) handleResumeCampaign(w http.ResponseWriter, r *http.Request) {
 // (AppendGlobalChained) because a campaign is not a run; the run linkage travels
 // in the payload's run_id field.
 const (
-	categoryCampaignIssueStarted = "campaign_issue_started"
-	categoryCampaignIssueSettled = "campaign_issue_settled"
-	categoryCampaignAdvanced     = "campaign_advanced"
+	categoryCampaignIssueStarted   = "campaign_issue_started"
+	categoryCampaignIssueSettled   = "campaign_issue_settled"
+	categoryCampaignAdvanced       = "campaign_advanced"
+	categoryCampaignIssueRestarted = "campaign_issue_restarted"
 )
 
 // startCampaignItemRunRequest is the POST /v0/campaigns/{campaign_id}/runs body.
@@ -933,12 +958,15 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// DAG gate: refuse unless the item is eligible per the pure engine. On
-	// refusal, name the precise blocker — the first unmet dependency for a
-	// blocked item, otherwise the item's current state — so the operator-agent
-	// knows what to wait on.
+	// DAG gate: refuse unless the item is eligible OR restartable per the pure
+	// engine. On refusal, name the precise blocker — the first unmet dependency
+	// for a blocked item, otherwise the item's current state — so the
+	// operator-agent knows what to wait on. Restartable (#1729) admits a
+	// deps-satisfied, non-human-led CANCELLED item: it has no eligible forward
+	// path (a cancelled item is terminal) but the operator verb resets it.
 	elig := campaign.NextEligible(items)
-	if !containsRef(elig.Eligible, req.IssueRef) {
+	isRestartable := containsRef(elig.Restartable, req.IssueRef)
+	if !containsRef(elig.Eligible, req.IssueRef) && !isRestartable {
 		s.writeError(w, r, http.StatusConflict, "item_not_eligible",
 			ineligibilityDetail(item, items), map[string]any{
 				"campaign_id": id.String(),
@@ -947,6 +975,59 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 			})
 		return
 	}
+
+	// Restart path (#1729): reset the restartable cancelled item back to pending,
+	// clearing its stale run link, BEFORE the mint/link/transition flow — which
+	// then runs unchanged over the now-pending item. The reset is atomic under
+	// the repo's FOR UPDATE lock; capture the prior run/state for the restart
+	// audit before RestartCampaignItem clears them.
+	if isRestartable {
+		priorState := string(item.State)
+		priorRunID := ""
+		if item.RunID != nil {
+			priorRunID = item.RunID.String()
+		}
+		resetItem, rerr := s.cfg.CampaignRepo.RestartCampaignItem(r.Context(), item.ID)
+		if rerr != nil {
+			var inv campaign.InvalidTransitionError
+			switch {
+			case errors.As(rerr, &inv):
+				// A concurrent restart/dispatch already moved the item off its
+				// terminal state — it is no longer restartable.
+				s.writeError(w, r, http.StatusConflict, "item_not_eligible",
+					ineligibilityDetail(item, items), map[string]any{
+						"campaign_id": id.String(),
+						"issue_ref":   req.IssueRef,
+						"item_state":  string(item.State),
+					})
+			case errors.Is(rerr, campaign.ErrNotFound):
+				s.writeError(w, r, http.StatusNotFound, "campaign_item_not_found",
+					"no campaign item with that issue_ref",
+					map[string]any{"campaign_id": id.String(), "issue_ref": req.IssueRef})
+			default:
+				s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+					"restart campaign item failed",
+					map[string]any{"error": rerr.Error(), "item_id": item.ID.String()})
+			}
+			return
+		}
+		item = resetItem
+		s.emitCampaignAudit(r.Context(), categoryCampaignIssueRestarted, map[string]any{
+			"campaign_id":  id.String(),
+			"issue_ref":    item.IssueRef,
+			"prior_run_id": priorRunID,
+			"prior_state":  priorState,
+		})
+		// Re-list so the flow below sees the item as pending (run link cleared).
+		refreshed, lerr := s.cfg.CampaignRepo.ListCampaignItemsForCampaign(r.Context(), id)
+		if lerr != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"list campaign items failed", map[string]any{"error": lerr.Error()})
+			return
+		}
+		items = refreshed
+	}
+
 	// Defensive re-check: NextEligible already excludes linked/terminal/running
 	// items, but confirm the running transition is reachable before minting a
 	// run we could not link.

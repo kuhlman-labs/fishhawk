@@ -37,6 +37,19 @@ type Eligibility struct {
 	// they are never re-dispatched; tracked separately so a cancelled item with
 	// no run and no deps is not mistaken for Eligible.
 	Cancelled []string
+	// Restartable holds cancelled items that a deps-satisfied, non-autonomy:low
+	// DAG position makes eligible for an operator-driven restart via the
+	// fishhawk_start_campaign_item_run verb (#1729). A cancelled item is
+	// terminal for auto-dispatch — it is NEVER in Eligible — but unlike Done/
+	// Failed it has a forward path: the operator verb resets it to pending and
+	// mints a fresh run. It is a DISJOINT partition from Cancelled (a cancelled
+	// item is in exactly one of the two): a cancelled item lands here only when
+	// every dependency has succeeded AND its autonomy tier is not "low"
+	// (human-led work is never auto-surfaced for restart); otherwise it stays in
+	// Cancelled. computeCampaignNextAction surfaces a Restartable item as
+	// start_run; the wire rollup folds it back into the cancelled slice so the
+	// rollup contract is unchanged.
+	Restartable []string
 	// Paused items were handed off to a human by the auto-driver (E25.7). A
 	// paused item carries a RunID and a non-terminal state, so it must be
 	// classified BEFORE the Running catch-all — otherwise it would be mistaken
@@ -61,7 +74,9 @@ type Eligibility struct {
 //
 // A cancelled item is terminal: it is reported in Cancelled and never Eligible,
 // even with no run and no deps (which would otherwise fall through to the
-// eligible default branch).
+// eligible default branch). A deps-satisfied, non-autonomy:low cancelled item
+// is diverted to Restartable instead — still never Eligible (no auto-dispatch)
+// but flagged as restartable via the operator verb (#1729).
 func NextEligible(items []*Item) Eligibility {
 	var e Eligibility
 
@@ -81,9 +96,19 @@ func NextEligible(items []*Item) Eligibility {
 		case it.State == ItemStateFailed:
 			e.Failed = append(e.Failed, ref)
 		case it.State == ItemStateCancelled:
-			// Terminal: never eligible for dispatch, even with no run and no
-			// deps (which would otherwise fall through to the default branch).
-			e.Cancelled = append(e.Cancelled, ref)
+			// Terminal: never eligible for AUTO-dispatch, even with no run and no
+			// deps (which would otherwise fall through to the default branch). But
+			// a deps-satisfied, non-human-led cancelled item has a forward path via
+			// the operator restart verb (#1729): divert it to Restartable so
+			// next_action can surface it as start_run. A deps-unsatisfied item, or
+			// an autonomy:low (human-led) one, stays in Cancelled. Exactly one of
+			// Restartable / Cancelled holds each cancelled item.
+			switch {
+			case depsSatisfied(it.DependsOn, done) && it.Autonomy != "low":
+				e.Restartable = append(e.Restartable, ref)
+			default:
+				e.Cancelled = append(e.Cancelled, ref)
+			}
 		case it.State == ItemStatePaused:
 			// Paused (E25.7): carries a RunID and a non-terminal state, so it
 			// MUST be classified before the Running catch-all below or it would

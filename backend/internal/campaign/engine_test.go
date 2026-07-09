@@ -71,18 +71,54 @@ func TestNextEligible_RunningByRunLinkage(t *testing.T) {
 }
 
 // TestNextEligible_CancelledIsTerminal covers the terminal cancelled branch: a
-// cancelled item with no run and no deps must NOT be reported as eligible (it
-// would otherwise fall through the default branch and could be re-dispatched).
+// cancelled item must NEVER be reported as Eligible (auto-dispatch), even with
+// no run and no deps (which would otherwise fall through the default branch). A
+// no-dep, non-human-led cancelled item IS diverted to Restartable (#1729) — the
+// operator restart path — but that is still disjoint from Eligible.
 func TestNextEligible_CancelledIsTerminal(t *testing.T) {
 	items := []*campaign.Item{
 		item("issue:1", campaign.ItemStateCancelled, nil), // terminal, no run, no deps
 	}
 	got := campaign.NextEligible(items)
 	if len(got.Eligible) != 0 {
-		t.Errorf("eligible = %v, want none (cancelled is terminal)", got.Eligible)
+		t.Errorf("eligible = %v, want none (cancelled is never auto-dispatched)", got.Eligible)
 	}
-	if !reflect.DeepEqual(got.Cancelled, []string{"issue:1"}) {
-		t.Errorf("cancelled = %v, want [issue:1]", got.Cancelled)
+	// deps-satisfied (no deps) + non-low autonomy → Restartable, not Cancelled.
+	if !reflect.DeepEqual(got.Restartable, []string{"issue:1"}) {
+		t.Errorf("restartable = %v, want [issue:1]", got.Restartable)
+	}
+	if len(got.Cancelled) != 0 {
+		t.Errorf("cancelled = %v, want none (diverted to Restartable)", got.Cancelled)
+	}
+}
+
+// TestNextEligible_RestartablePartition is the E32.9 (#1729) done-means for the
+// Restartable partition: a deps-satisfied, non-autonomy:low cancelled item is
+// Restartable; a deps-UNsatisfied cancelled item stays Cancelled; an autonomy:low
+// cancelled item stays Cancelled (human-led work is never auto-surfaced for
+// restart); and Restartable / Cancelled are disjoint (each cancelled item is in
+// exactly one). A cancelled item is NEVER Eligible.
+func TestNextEligible_RestartablePartition(t *testing.T) {
+	items := []*campaign.Item{
+		item("issue:1", campaign.ItemStateSucceeded, nil), // done — satisfies deps below
+		// cancelled, deps satisfied, autonomy unset → Restartable.
+		{IssueRef: "issue:2", State: campaign.ItemStateCancelled, DependsOn: []string{"issue:1"}},
+		// cancelled, deps UNsatisfied → stays Cancelled (never restart against an open edge).
+		{IssueRef: "issue:3", State: campaign.ItemStateCancelled, DependsOn: []string{"issue:999"}},
+		// cancelled, deps satisfied, autonomy:low → stays Cancelled (human-led).
+		{IssueRef: "issue:4", State: campaign.ItemStateCancelled, DependsOn: []string{"issue:1"}, Autonomy: "low"},
+	}
+	got := campaign.NextEligible(items)
+	want := campaign.Eligibility{
+		Done:        []string{"issue:1"},
+		Restartable: []string{"issue:2"},
+		Cancelled:   []string{"issue:3", "issue:4"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("NextEligible =\n  %+v\nwant\n  %+v", got, want)
+	}
+	if len(got.Eligible) != 0 {
+		t.Errorf("eligible = %v, want none (a cancelled item is never Eligible)", got.Eligible)
 	}
 }
 

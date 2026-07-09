@@ -159,7 +159,7 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 // refuses a re-start against an already-running item.
 type StartCampaignItemRunInput struct {
 	CampaignID  string `json:"campaign_id" jsonschema:"the campaign UUID (from fishhawk_start_campaign)"`
-	IssueRef    string `json:"issue_ref" jsonschema:"the campaign item's issue ref to start (must be one of the campaign's items and currently eligible per the DAG)"`
+	IssueRef    string `json:"issue_ref" jsonschema:"the campaign item's issue ref to start (must be one of the campaign's items and currently startable per the DAG: either eligible, or a deps-satisfied cancelled item, which is restarted with a fresh run)"`
 	WorkflowID  string `json:"workflow_id" jsonschema:"the workflow id to run for this issue (e.g. 'feature_change')"`
 	WorkflowRef string `json:"workflow_ref,omitempty" jsonschema:"OPTIONAL git ref to fetch the workflow spec at; omit for the repo's default branch"`
 	RunnerKind  string `json:"runner_kind,omitempty" jsonschema:"OPTIONAL execution backend: 'github_actions' (default) or 'local'. Pass 'local' for the local dogfood loop so the run executes through the local runner"`
@@ -182,22 +182,24 @@ func registerStartCampaignItemRun(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_start_campaign_item_run",
 		Description: strings.TrimSpace(`
-Start a run for one eligible campaign item and link it to the campaign. Use this
-when fishhawk_get_campaign_status reports next_action "start_run" — to drive a
-campaign locally yourself, instead of the backend auto-driver, so the campaign
-tracks + DAG-gates each run as you push it to merge. It refuses unless the item
-is eligible (its dependencies have all succeeded), naming the blocking
-dependency on refusal, then mints the run, links it, and moves the item to
-running. Poll fishhawk_get_campaign_status again after starting — the status
-read settles each run as it reaches terminal and advances the campaign in DAG
-order.
+Start a run for one startable campaign item and link it to the campaign. Use
+this when fishhawk_get_campaign_status reports next_action "start_run" — to drive
+a campaign locally yourself, instead of the backend auto-driver, so the campaign
+tracks + DAG-gates each run as you push it to merge. It admits an item that is
+either eligible (its dependencies have all succeeded) OR a deps-satisfied
+cancelled item, which it RESTARTS: the cancelled item is reset to pending and a
+fresh run is minted, re-linked, and audited (campaign_issue_restarted) so its
+dependents no longer stay blocked forever. On refusal it names the blocking
+dependency; then it mints the run, links it, and moves the item to running. Poll
+fishhawk_get_campaign_status again after starting — the status read settles each
+run as it reaches terminal and advances the campaign in DAG order.
 
 campaign_id, issue_ref, and workflow_id are required. Pass runner_kind 'local'
 for the local dogfood loop. A write tool: needs an operator token with
-write:campaigns scope (a runner-bound token is rejected 403). A blocked item
-fails item_not_eligible (the detail names the unmet dependency); an unknown
-issue_ref fails campaign_item_not_found; a paused or terminal campaign fails
-campaign_not_startable.
+write:campaigns scope (a runner-bound token is rejected 403). A running or
+still-blocked item fails item_not_eligible (the detail names the unmet
+dependency); an unknown issue_ref fails campaign_item_not_found; a paused or
+terminal campaign fails campaign_not_startable.
 `),
 	}, resolver.startCampaignItemRun)
 }
