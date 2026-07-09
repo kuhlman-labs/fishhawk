@@ -313,6 +313,8 @@ workflows:
 
 When an `approvals` gate sets `min_permission` and/or `member_of`, the backend resolves the predicate against the forge at **each** approval event (via the forge-neutral `identity.IdentityProvider` seam) before recording the vote — no forge result is cached between requests. A real human submitter whose resolved permission is below `min_permission`, or who is not a member of `member_of`, is refused `403 approver_predicate_unmet` (no approval row is inserted). A forge failure (error / rate-limit / timeout, or an ad-hoc run with no repository to resolve against) **fails the gate closed** with a retryable `503 forge_unavailable`. `agent` and delegated submissions are recorded-but-never-counted and are not forge-gated. See the POST `.../approvals` responses in `docs/api/v0.openapi.yaml`.
 
+At **each** approval event the backend records a `predicate_snapshot` — the submitter's `auth_method` (`static`/`oauth`), `channel` (`interactive`/`api`/`delegated`), resolved permission/membership, and the resulting quorum state — into the `approval_submitted` audit entry, including on the `403 approver_predicate_unmet` and `503 forge_unavailable` rejection paths. See [`docs/ARCHITECTURE.md` §8.1 Approval identity](../ARCHITECTURE.md#81-approval-identity) for the IdentityProvider seam and the full snapshot lifecycle.
+
 #### Forge permission mapping
 
 The `min_permission` tier vocabulary is forge-neutral. GitHub maps its own `role_name` tiers directly onto it:
@@ -343,3 +345,4 @@ The backend (`backend/internal/spec`) and the CLI (`cli/internal/spec`) compile 
 - [`workflow-v0.md`](workflow-v0.md) — the full grammar v1 currently copies.
 - [`README.md`](README.md) — the versioning + coexistence policy.
 - `docs/ARCHITECTURE.md` §4 — workflow run lifecycle.
+- [`docs/ARCHITECTURE.md` §8.1](../ARCHITECTURE.md#81-approval-identity) — approval identity: the IdentityProvider seam and the runtime `predicate_snapshot` recording lifecycle.
