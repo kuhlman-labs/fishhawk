@@ -1640,6 +1640,43 @@ func TestAdvance_DecomposedParent_NilArtifacts_GracefulSkip(t *testing.T) {
 	}
 }
 
+// TestAdvance_DecomposedParent_ArtifactRecordError_LeavesURLUnstamped is the
+// #1732 retry-correctness invariant: when recordConsolidatedPRArtifact returns
+// an error (here o.GitHub.GetBranchSHA on the load-bearing head fails), the
+// error must unwind maybeOpenConsolidatedPR WITHOUT stamping pull_request_url —
+// so the next Advance re-enters the gate with the URL still empty, re-opens the
+// PR idempotently, and records the artifact on retry. This is the crux of the
+// 502-then-retry regression the issue exists to fix, asserted at the
+// artifact-record seam (not just the IntegrateSlices seam).
+func TestAdvance_DecomposedParent_ArtifactRecordError_LeavesURLUnstamped(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{}}
+	o.Artifacts = arts
+
+	parent, stages := seedDecomposedParent(t, rs, int64Ptr(55), run.ExecutorHuman)
+	implStageID := stages[0].ID // implement is stage 0 (seedDecomposedParent)
+	// The head-SHA resolution inside recordConsolidatedPRArtifact fails, so the
+	// helper returns an error and maybeOpenConsolidatedPR unwinds before the URL
+	// stamp. (The PR itself is opened first, so a retry recovers it via
+	// ErrPullRequestExists.)
+	gh.getBranchSHAErr = errors.New("transient github failure resolving head")
+
+	if _, err := o.Advance(context.Background(), parent.ID); err == nil {
+		t.Fatal("Advance: want error from artifact-record unwind, got nil")
+	}
+
+	// The URL must remain unstamped so the next Advance re-enters the gate.
+	if url := rs.runs[parent.ID].PullRequestURL; url != nil {
+		t.Errorf("pull_request_url = %q, want nil (record error must not stamp the URL)", *url)
+	}
+	// No artifact was recorded either (the head resolution failed before Create).
+	implArts, _ := arts.ListForStage(context.Background(), implStageID)
+	if got := len(prArtifacts(implArts)); got != 0 {
+		t.Errorf("pull_request artifacts = %d, want 0 (record failed pre-Create)", got)
+	}
+}
+
 // prArtifacts filters a stage's artifacts down to the kind=pull_request ones.
 func prArtifacts(arts []*artifact.Artifact) []*artifact.Artifact {
 	var out []*artifact.Artifact

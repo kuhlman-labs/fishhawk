@@ -741,9 +741,17 @@ func (o *Orchestrator) recordConsolidatedPRArtifact(ctx context.Context, r *run.
 	if err != nil {
 		return fmt.Errorf("resolve consolidated head %q: %w", head, err)
 	}
-	baseSHA, _, err := o.GitHub.GetBranchSHA(ctx, *r.InstallationID, repo, base)
-	if err != nil {
-		return fmt.Errorf("resolve consolidated base %q: %w", base, err)
+	// base_sha is best-effort per the doc comment: only head_sha and pr_number
+	// are load-bearing for the consumers. A transient failure resolving the base
+	// branch tip must NOT unwind the artifact record (and, per the ordering, the
+	// URL stamp) — log it and leave base_sha empty rather than forcing a retry.
+	baseSHA, _, berr := o.GitHub.GetBranchSHA(ctx, *r.InstallationID, repo, base)
+	if berr != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: best-effort consolidated base_sha resolution failed; recording artifact without it",
+			slog.String("run_id", r.ID.String()),
+			slog.String("base", base),
+			slog.Any("error", berr))
+		baseSHA = ""
 	}
 
 	content, err := json.Marshal(map[string]any{
