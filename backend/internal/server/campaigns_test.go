@@ -2295,6 +2295,94 @@ func TestStartCampaignItemRun_ReconcileOnRead_FailedRun_Attention_E2E(t *testing
 	}
 }
 
+// TestDeriveCampaignAfterChange_CampaignStart_SweepsToUpNext_CrossBoundary is
+// the #1816 cross-boundary done-means: driving a pending campaign to running
+// through deriveCampaignAfterChange sweeps its still-QUEUED items onto the
+// board's Up Next column via the campaign_started edge. It crosses the campaign
+// driver -> board-sync hook -> registered Transitioner -> global-chain audit
+// seam and asserts (1) each still-pending item fired campaign_started -> Up Next
+// with a work_item_transitioned audit on the GLOBAL chain, (2) the already-
+// running item was NOT campaign_started, and (3) run_started later advances an
+// Up Next card to In Progress (up_next is in run_started's expected source).
+func TestDeriveCampaignAfterChange_CampaignStart_SweepsToUpNext_CrossBoundary(t *testing.T) {
+	prev := conventionsLoader
+	conventionsLoader = func(string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	fp := &fakeTransitionProvider{result: &workmgmt.TransitionResult{Moved: true, From: "Backlog", To: "Up Next"}}
+	registerTransitionProvider(t, fp)
+
+	crepo := newFakeCampaignRepo()
+	au := &campaignAuditRecorder{}
+	gh := recordingInstallGitHubClient(t, 12345, &installRecorder{})
+	s := New(Config{CampaignRepo: crepo, AuditRepo: au, GitHub: gh})
+
+	// A PENDING campaign: one item already running (the just-dispatched one that
+	// drives the pending->running derivation), two still-queued pending items.
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStateRunning),
+		cItem("issue:101", nil, campaign.ItemStatePending),
+		cItem("issue:102", []string{"issue:101"}, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+
+	items, err := crepo.ListCampaignItemsForCampaign(context.Background(), c.ID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	s.deriveCampaignAfterChange(context.Background(), c, items)
+
+	// The campaign advanced pending -> running.
+	if got := crepo.campaigns[c.ID].State; got != campaign.StateRunning {
+		t.Fatalf("campaign state = %q, want running", got)
+	}
+
+	// (1)+(2): both still-pending items (101, 102) fired campaign_started -> Up
+	// Next; the already-running item (100) was excluded.
+	if len(fp.calls) != 2 {
+		t.Fatalf("Transition calls = %d, want 2 (only the two pending items)", len(fp.calls))
+	}
+	fired := map[int]bool{}
+	for _, call := range fp.calls {
+		if call.Trigger != lifecycleCampaignStarted {
+			t.Errorf("trigger = %q, want campaign_started", call.Trigger)
+		}
+		if call.CanonicalState != workmgmt.CanonicalStateUpNext {
+			t.Errorf("canonical = %q, want up_next", call.CanonicalState)
+		}
+		if call.Target.InstallationID != 12345 {
+			t.Errorf("installation id = %d, want 12345 (resolved from repo)", call.Target.InstallationID)
+		}
+		fired[call.IssueNumber] = true
+	}
+	if !fired[101] || !fired[102] {
+		t.Errorf("fired issues = %v, want 101 and 102", fired)
+	}
+	if fired[100] {
+		t.Errorf("running item issue:100 fired campaign_started, want excluded")
+	}
+	if got := au.count(categoryWorkItemTransitioned); got != 2 {
+		t.Errorf("work_item_transitioned audits = %d, want 2", got)
+	}
+
+	// (3) run_started advances an Up Next card: firing the run_started edge for a
+	// now-Up-Next card dispatches In Progress with up_next in the expected source.
+	fp.calls = nil
+	inst := int64(99)
+	ref := "issue:101"
+	rn := &run.Run{ID: uuid.New(), Repo: "kuhlman-labs/fishhawk", State: run.StateRunning, TriggerRef: &ref, InstallationID: &inst}
+	s.boardTransitionForRun(context.Background(), rn, lifecycleRunStarted)
+	if len(fp.calls) != 1 {
+		t.Fatalf("run_started Transition calls = %d, want 1", len(fp.calls))
+	}
+	if fp.calls[0].CanonicalState != workmgmt.CanonicalStateInProgress {
+		t.Errorf("run_started canonical = %q, want in_progress", fp.calls[0].CanonicalState)
+	}
+	if !containsState(fp.calls[0].ExpectedSourceStates, workmgmt.CanonicalStateUpNext) {
+		t.Errorf("run_started expected sources = %v, want to contain up_next", fp.calls[0].ExpectedSourceStates)
+	}
+}
+
 // newCampaignStartServerPG wires a Server with a REAL Postgres campaign + run
 // repo (so the run-link FK is enforced and RestartCampaignItem executes against
 // the adapter), a recording audit repo, and the GitHub spec stub — the setup

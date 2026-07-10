@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -102,7 +103,7 @@ func TestNotifyBoardTransition_LifecycleSeam(t *testing.T) {
 		wantCanonical string
 		wantExpectSrc []string
 	}{
-		{lifecycleRunStarted, workmgmt.CanonicalStateInProgress, []string{workmgmt.CanonicalStateBacklog}},
+		{lifecycleRunStarted, workmgmt.CanonicalStateInProgress, []string{workmgmt.CanonicalStateBacklog, workmgmt.CanonicalStateUpNext}},
 		{lifecyclePROpened, workmgmt.CanonicalStateInReview, []string{workmgmt.CanonicalStateInProgress}},
 		{lifecycleRunMerged, workmgmt.CanonicalStateDone, []string{workmgmt.CanonicalStateInReview, workmgmt.CanonicalStateInProgress, workmgmt.CanonicalStateBlocked}},
 		{lifecycleRunFailed, workmgmt.CanonicalStateBlocked, []string{workmgmt.CanonicalStateInProgress, workmgmt.CanonicalStateInReview}},
@@ -190,6 +191,198 @@ func containsState(states []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestExpectedSourceStates_CampaignStarted pins the #1816 expected-source sets:
+// campaign_started accepts the backlog/unset entry state ONLY (a card a human
+// already advanced past Backlog is left untouched), while run_started ALSO
+// accepts up_next so a campaign-queued Up Next card advances to In Progress when
+// its run starts.
+func TestExpectedSourceStates_CampaignStarted(t *testing.T) {
+	conv := workmgmt.Default()
+
+	campaignStarted := expectedSourceStates(lifecycleCampaignStarted, conv)
+	if !sameSet(campaignStarted, []string{workmgmt.CanonicalStateBacklog}) {
+		t.Errorf("expectedSourceStates(campaign_started) = %v, want [%q] only", campaignStarted, workmgmt.CanonicalStateBacklog)
+	}
+
+	runStarted := expectedSourceStates(lifecycleRunStarted, conv)
+	if !sameSet(runStarted, []string{workmgmt.CanonicalStateBacklog, workmgmt.CanonicalStateUpNext}) {
+		t.Errorf("expectedSourceStates(run_started) = %v, want {backlog, up_next}", runStarted)
+	}
+}
+
+// campaignBoardServer wires a Server with a global-chain audit recorder and a
+// GitHub stub serving the installation endpoint, so the campaign-scoped board
+// hook resolves an installation and audits on the global chain.
+func campaignBoardServer(t *testing.T) (*Server, *campaignAuditRecorder) {
+	t.Helper()
+	prev := conventionsLoader
+	conventionsLoader = func(string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	au := &campaignAuditRecorder{}
+	gh := recordingInstallGitHubClient(t, 12345, &installRecorder{})
+	return New(Config{AuditRepo: au, GitHub: gh}), au
+}
+
+// campaignTransitionAudits decodes the global-chain work_item_transitioned
+// entries the campaign-scoped hook wrote.
+func campaignTransitionAudits(au *campaignAuditRecorder) []map[string]any {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []map[string]any
+	for _, e := range au.entries {
+		if e.Category != categoryWorkItemTransitioned {
+			continue
+		}
+		var m map[string]any
+		_ = json.Unmarshal(e.Payload, &m)
+		out = append(out, m)
+	}
+	return out
+}
+
+// TestBoardTransitionForCampaignItem_MovesBacklogToUpNext drives the campaign
+// entry point moving a backlog/unset card to Up Next: the fake Transitioner is
+// dispatched campaign_started with the up_next canonical state + a backlog-only
+// expected-source set, and the move is audited on the GLOBAL chain carrying the
+// campaign id + issue number.
+func TestBoardTransitionForCampaignItem_MovesBacklogToUpNext(t *testing.T) {
+	fp := &fakeTransitionProvider{result: &workmgmt.TransitionResult{Moved: true, From: "Backlog", To: "Up Next"}}
+	registerTransitionProvider(t, fp)
+	s, au := campaignBoardServer(t)
+	c := &campaign.Campaign{ID: uuid.New(), Repo: "kuhlman-labs/fishhawk"}
+
+	s.boardTransitionForCampaignItem(context.Background(), c, 1816, lifecycleCampaignStarted)
+
+	if len(fp.calls) != 1 {
+		t.Fatalf("Transition calls = %d, want 1", len(fp.calls))
+	}
+	got := fp.calls[0]
+	if got.CanonicalState != workmgmt.CanonicalStateUpNext {
+		t.Errorf("canonical state = %q, want %q", got.CanonicalState, workmgmt.CanonicalStateUpNext)
+	}
+	if got.Trigger != lifecycleCampaignStarted {
+		t.Errorf("trigger = %q, want %q", got.Trigger, lifecycleCampaignStarted)
+	}
+	if got.IssueNumber != 1816 {
+		t.Errorf("issue number = %d, want 1816", got.IssueNumber)
+	}
+	if got.Target.InstallationID != 12345 {
+		t.Errorf("installation id = %d, want 12345 (resolved from repo)", got.Target.InstallationID)
+	}
+	if !sameSet(got.ExpectedSourceStates, []string{workmgmt.CanonicalStateBacklog}) {
+		t.Errorf("expected sources = %v, want [backlog] only", got.ExpectedSourceStates)
+	}
+	if got.States[workmgmt.CanonicalStateUpNext] != "Up Next" {
+		t.Errorf("states map not carried: %v", got.States)
+	}
+
+	audits := campaignTransitionAudits(au)
+	if len(audits) != 1 {
+		t.Fatalf("work_item_transitioned audits = %d, want 1", len(audits))
+	}
+	a := audits[0]
+	if a["moved"] != true || a["trigger"] != lifecycleCampaignStarted || a["canonical_state"] != workmgmt.CanonicalStateUpNext {
+		t.Errorf("audit = %v, want moved=true trigger=campaign_started canonical=up_next", a)
+	}
+	if a["campaign_id"] != c.ID.String() {
+		t.Errorf("audit campaign_id = %v, want %q", a["campaign_id"], c.ID.String())
+	}
+	// issue_number decodes as a float64 through the map[string]any round-trip.
+	if a["issue_number"] != float64(1816) {
+		t.Errorf("audit issue_number = %v, want 1816", a["issue_number"])
+	}
+}
+
+// TestBoardTransitionForCampaignItem_SkipNeverFightHuman asserts a card a human
+// already advanced (In Progress) is left untouched — the provider returns a
+// Skipped result — and the skip is STILL audited on the global chain.
+func TestBoardTransitionForCampaignItem_SkipNeverFightHuman(t *testing.T) {
+	fp := &fakeTransitionProvider{result: &workmgmt.TransitionResult{
+		Skipped: true, From: "In Progress", To: "Up Next",
+		SkipReason: `current status "In Progress" is not in the expected source set`,
+	}}
+	registerTransitionProvider(t, fp)
+	s, au := campaignBoardServer(t)
+	c := &campaign.Campaign{ID: uuid.New(), Repo: "kuhlman-labs/fishhawk"}
+
+	s.boardTransitionForCampaignItem(context.Background(), c, 1816, lifecycleCampaignStarted)
+
+	audits := campaignTransitionAudits(au)
+	if len(audits) != 1 {
+		t.Fatalf("audits = %d, want 1 (skips are audited)", len(audits))
+	}
+	if audits[0]["skipped"] != true || audits[0]["moved"] != false {
+		t.Errorf("audit = %v, want skipped=true moved=false", audits[0])
+	}
+}
+
+// TestBoardTransitionForCampaignItem_TokenAbsentSkip asserts the projects-token-
+// absent skip (#1107/#1114) — the provider degrades a user-owned board move to a
+// Skipped result rather than an error — is AUDITED, not errored.
+func TestBoardTransitionForCampaignItem_TokenAbsentSkip(t *testing.T) {
+	fp := &fakeTransitionProvider{result: &workmgmt.TransitionResult{
+		Skipped: true, To: "Up Next",
+		SkipReason: "user-owned project board unreachable: no projects token configured",
+	}}
+	registerTransitionProvider(t, fp)
+	s, au := campaignBoardServer(t)
+	c := &campaign.Campaign{ID: uuid.New(), Repo: "kuhlman-labs/fishhawk"}
+
+	s.boardTransitionForCampaignItem(context.Background(), c, 1816, lifecycleCampaignStarted)
+
+	audits := campaignTransitionAudits(au)
+	if len(audits) != 1 {
+		t.Fatalf("audits = %d, want 1 (token-absent skip is audited, not errored)", len(audits))
+	}
+	if audits[0]["skipped"] != true {
+		t.Errorf("audit = %v, want skipped=true", audits[0])
+	}
+}
+
+// TestBoardTransitionForCampaignItem_ProviderError_Swallowed asserts a genuine
+// provider error is best-effort: the Transition is attempted but no audit is
+// written and nothing unwinds.
+func TestBoardTransitionForCampaignItem_ProviderError_Swallowed(t *testing.T) {
+	fp := &fakeTransitionProvider{transErr: context.DeadlineExceeded}
+	registerTransitionProvider(t, fp)
+	s, au := campaignBoardServer(t)
+	c := &campaign.Campaign{ID: uuid.New(), Repo: "kuhlman-labs/fishhawk"}
+
+	s.boardTransitionForCampaignItem(context.Background(), c, 1816, lifecycleCampaignStarted)
+
+	if len(fp.calls) != 1 {
+		t.Fatalf("Transition calls = %d, want 1", len(fp.calls))
+	}
+	if len(campaignTransitionAudits(au)) != 0 {
+		t.Errorf("audit written despite provider error, want none")
+	}
+}
+
+// TestBoardTransitionForCampaignItem_NilGitHub_NoOp asserts the nil-GitHub-client
+// branch is a logged no-op: no provider Transition call, no audit. (An
+// installation cannot be resolved without a client.)
+func TestBoardTransitionForCampaignItem_NilGitHub_NoOp(t *testing.T) {
+	prev := conventionsLoader
+	conventionsLoader = func(string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	fp := &fakeTransitionProvider{}
+	registerTransitionProvider(t, fp)
+	au := &campaignAuditRecorder{}
+	s := New(Config{AuditRepo: au}) // no GitHub client
+	c := &campaign.Campaign{ID: uuid.New(), Repo: "kuhlman-labs/fishhawk"}
+
+	s.boardTransitionForCampaignItem(context.Background(), c, 1816, lifecycleCampaignStarted)
+
+	if len(fp.calls) != 0 {
+		t.Errorf("Transition called %d times with nil GitHub client, want 0", len(fp.calls))
+	}
+	if len(campaignTransitionAudits(au)) != 0 {
+		t.Errorf("audit written with nil GitHub client, want none")
+	}
 }
 
 // TestNotifyBoardTransition_AuditsSkip asserts a deliberate provider skip (the
