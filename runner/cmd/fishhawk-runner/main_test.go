@@ -8511,6 +8511,134 @@ func TestRun_VerifyFixLoop_ReemitsReconciledGitDiff(t *testing.T) {
 	}
 }
 
+// TestRun_VerifyFixLoop_MainAdvancedMidRun_ReemitNoPhantomDeletion is the #1801
+// done-means regression. A parallel merge to main mid-run advances the base tip
+// (--check-base-ref) past the run's fork point, adding a file the run never
+// touched. The reviewed diff is the LAST git_diff — the reemit, authoritative
+// via ExtractDiff's last-write-wins. Before the fix reemitScopedGitDiff diffed
+// 2-dot against the advanced tip, so the parallel merge's file surfaced as a
+// phantom deletion ("this diff reverts a merged feature", the false rejects on
+// runs 6a4c3c03/#1785 and f104f9a1/#1787). Anchoring the reemit to the run's
+// fork point (merge-base, shared with computeAndEmitDiff) removes the phantom
+// while keeping the in-scope fix. FAILS on the old 2-dot reemit, PASSES after.
+func TestRun_VerifyFixLoop_MainAdvancedMidRun_ReemitNoPhantomDeletion(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+
+	// Synthesize a mid-run advance of the base branch: a NEW file present ONLY
+	// on the advanced --check-base-ref commit, absent from the run's index and
+	// HEAD (still at the fork point). It rides an off-HEAD branch so the run's
+	// worktree stays at the fork point while --check-base-ref points past it.
+	runGitIn := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	runGitIn("checkout", "-b", "advanced-main")
+	if err := os.MkdirAll(filepath.Join(repo, "parallel"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(repo, "parallel", "feature.go"), "package feature\n")
+	runGitIn("add", "-A")
+	runGitIn("commit", "-m", "parallel merge to main mid-run")
+	advancedSHA := gitHead(t, repo)
+	// Back on the run's fork point; the checkout drops parallel/feature.go from
+	// the working tree so it lives ONLY on advancedSHA's tree.
+	runGitIn("checkout", "main")
+
+	// Buggy→fixed reinvoke so reemitScopedGitDiff fires (as in
+	// _ReemitsReconciledGitDiff): reg.go is buggy on the committed scope-only
+	// tree, the fix reinvoke rewrites it in-scope.
+	regPath := filepath.Join(repo, "mod", "reg.go")
+	mustWrite(t, regPath, regGetBuggy)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+	mustWrite(t, filepath.Join(repo, "mod", "seed.go"),
+		"package mod\n\nfunc init() { registry[\"x\"] = 42 }\n")
+
+	invoker := &fakeInvoker{
+		mirrorWorkingTreeFrom: repo, // reflect agent edits into the isolated worktree (#1137)
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+		onInvoke: func(idx int, _ agent.Invocation) {
+			if idx == 1 {
+				mustWrite(t, regPath, regGetFixed)
+			}
+		},
+	}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "cd mod && go test ./...",
+		VerifyMaxIterations: 2,
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	// --check-base-ref is the advanced tip, NOT the fork point.
+	args := append(verifyFixRunArgs(repo, bundlePath), "--check-base-ref", advancedSHA)
+	if got := run(args, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	patches := gitDiffPatches(t, readBundleEvents(t, bundlePath))
+	if len(patches) != 2 {
+		t.Fatalf("git_diff event count = %d, want 2 (original + reconciled re-emit)", len(patches))
+	}
+	// Last-write-wins: the reemit is the diff the implement reviewer reads.
+	last := patches[len(patches)-1]
+	// A 3-dot diff against the fork point never references the parallel-merge
+	// file; a 2-dot diff against the advanced tip reports it as a phantom
+	// deletion (`deleted file` / `-package feature` hunk). Asserting the path is
+	// wholly absent covers the name-status D entry and the deletion hunk at once.
+	if strings.Contains(last, "parallel/feature.go") {
+		t.Errorf("last git_diff (authoritative re-emit) references the parallel-merge file — a phantom deletion from a 2-dot diff against the advanced tip:\n%s", last)
+	}
+	// ...and it must still carry the in-scope fix (proves this is a real diff,
+	// not an empty one that trivially lacks the phantom).
+	const fixMarker = `registry["x"] = 42`
+	if !strings.Contains(last, fixMarker) {
+		t.Errorf("last git_diff must still carry the in-scope fix %q:\n%s", fixMarker, last)
+	}
+}
+
+// TestResolveDiffBaseRef_MergeBaseUnresolved_FallsBackToBaseRef locks the
+// helper's FAIL-OPEN branch (ADR-043 rev 2 posture): when `git merge-base`
+// cannot resolve the base (unrelated histories / a ref not fetched locally),
+// resolveDiffBaseRef returns the input baseRef UNCHANGED and writes a
+// merge_base_unresolved degradation line — the fallback stays observable rather
+// than blocking the diff.
+func TestResolveDiffBaseRef_MergeBaseUnresolved_FallsBackToBaseRef(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "f.txt"), "x\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "base")
+
+	const badRef = "no-such-ref-deadbeef"
+	var log strings.Builder
+	got := resolveDiffBaseRef(context.Background(), badRef, repo, "stage-1", &log)
+	if got != badRef {
+		t.Errorf("fail-open resolveDiffBaseRef = %q, want the input baseRef %q unchanged", got, badRef)
+	}
+	if !strings.Contains(log.String(), "merge_base_unresolved") {
+		t.Errorf("expected a merge_base_unresolved degradation line on the log sink, got:\n%s", log.String())
+	}
+}
+
 // TestRun_VerifyFixLoop_PassFirstIteration_SingleGitDiff: a loop whose first
 // committed-tree verify PASSES never reinvokes, so the runner must NOT re-emit
 // a second git_diff — exactly one (computeAndEmitDiff's original) is in the
