@@ -41,6 +41,159 @@ func TestAwaitAudit_RejectsBadInput(t *testing.T) {
 	}
 }
 
+// TestAwaitAudit_UnknownCategoryRejected is the #1764 fail-loud proof: an
+// unknown/misspelled category is rejected UP FRONT with the nearest known
+// category named, and NO wait is armed (the endpoint is never queried for it),
+// so it cannot silently block the full timeout on an unsatisfiable wait.
+func TestAwaitAudit_UnknownCategoryRejected(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	r := newResolver(srv, nil)
+
+	_, _, err := r.awaitAudit(context.Background(), nil, AwaitAuditInput{
+		RunID:    runID.String(),
+		Category: "scope_amendment_pending", // the runner-log event, NOT the audit category
+	})
+	if err == nil {
+		t.Fatal("expected a rejection on an unknown category")
+	}
+	if !strings.Contains(err.Error(), "scope_amendment_requested") {
+		t.Errorf("rejection must name the nearest known category; got %q", err.Error())
+	}
+	// No wait armed: the endpoint was never queried for the unknown category.
+	fb.mu.Lock()
+	reads := fb.perRunAuditCategoryReads["scope_amendment_pending"]
+	fb.mu.Unlock()
+	if reads != 0 {
+		t.Errorf("unknown category armed a wait (%d audit reads); it must be rejected before any query", reads)
+	}
+}
+
+// TestAwaitAudit_AllowUnknownAdmitsUnknown proves the allow_unknown escape
+// hatch admits an unlisted category: the wait is armed and resolves on a
+// seeded entry of that category.
+func TestAwaitAudit_AllowUnknownAdmitsUnknown(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedAuditEntry(fb, runID, "some_brand_new_category", 4)
+	r := newResolver(srv, nil)
+
+	_, out, err := r.awaitAudit(context.Background(), nil, AwaitAuditInput{
+		RunID:         runID.String(),
+		Category:      "some_brand_new_category",
+		SinceSequence: 2,
+		AllowUnknown:  true,
+	})
+	if err != nil {
+		t.Fatalf("awaitAudit with allow_unknown: %v", err)
+	}
+	if out.Status != "found" || out.Entry == nil || out.Entry.Sequence != 4 {
+		t.Fatalf("Status=%q Entry=%+v, want found on the seeded seq-4 entry", out.Status, out.Entry)
+	}
+}
+
+// TestAwaitAudit_EmptyBothRejected proves the both-blank input (no category,
+// no categories) is rejected — the unsatisfiable degenerate wait.
+func TestAwaitAudit_EmptyBothRejected(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	if _, _, err := r.awaitAudit(context.Background(), nil, AwaitAuditInput{
+		RunID:      uuid.NewString(),
+		Category:   "  ",
+		Categories: []string{"", "   "},
+	}); err == nil {
+		t.Error("expected an error when neither category nor categories provides a value")
+	}
+}
+
+// TestAwaitAudit_MultiCategoryResolvesOnFirstLanding is the OR-semantics proof
+// (#1764): with two categories both carrying a past-anchor entry, the wait
+// resolves on the LOWER-sequence entry — the first to land.
+func TestAwaitAudit_MultiCategoryResolvesOnFirstLanding(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedAuditEntry(fb, runID, "implement_reviewed", 8)
+	seedAuditEntry(fb, runID, "fixup_pushed", 5) // lower sequence — the OR-winner
+	r := newResolver(srv, nil)
+
+	_, out, err := r.awaitAudit(context.Background(), nil, AwaitAuditInput{
+		RunID:         runID.String(),
+		Categories:    []string{"implement_reviewed", "fixup_pushed"},
+		SinceSequence: 2,
+	})
+	if err != nil {
+		t.Fatalf("awaitAudit multi-category: %v", err)
+	}
+	if out.Status != "found" {
+		t.Fatalf("Status = %q, want found", out.Status)
+	}
+	if out.Entry == nil || out.Entry.Sequence != 5 || out.Entry.Category != "fixup_pushed" {
+		t.Errorf("Entry = %+v, want the lower-sequence fixup_pushed (seq 5) OR-winner", out.Entry)
+	}
+	if out.LatestSequence != 5 {
+		t.Errorf("LatestSequence = %d, want 5", out.LatestSequence)
+	}
+}
+
+// TestAwaitAudit_MultiCategoryTimeoutReArmIsSharedMax is the #1764 binding
+// condition (2): on a multi-category timeout, the returned latest_sequence is
+// the single shared anchor — the MAX gapless re-arm across ALL requested
+// categories. A per-category-anchor divergence bug (re-arming each category
+// from its own last-seen and returning a per-category value, e.g. 0 for an
+// unpolled category) would return something other than the shared anchor and
+// fail this. Entries seeded AT/BELOW the anchor never resolve, forcing the
+// timeout.
+func TestAwaitAudit_MultiCategoryTimeoutReArmIsSharedMax(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	// Both categories carry only pre-anchor entries (seq <= 7), so nothing
+	// past the shared anchor resolves and the wait times out.
+	seedAuditEntry(fb, runID, "implement_reviewed", 3)
+	seedAuditEntry(fb, runID, "fixup_pushed", 6)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Drive the deadline deterministically: cancel once the poll loop has
+	// begun. awaitAudit issues one query PER category per pass; with two
+	// categories the fast path is queries 1+2 and the first tick is 3+4.
+	var queries atomic.Int64
+	fb.reviewFlip = func(category string) {
+		if queries.Add(1) == 3 {
+			cancel()
+		}
+	}
+
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitAudit(ctx, nil, AwaitAuditInput{
+		RunID:          runID.String(),
+		Categories:     []string{"implement_reviewed", "fixup_pushed"},
+		SinceSequence:  7,
+		TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitAudit: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("Status = %q, want timeout", out.Status)
+	}
+	// The shared anchor IS the max gapless re-arm across every category.
+	if out.LatestSequence != 7 {
+		t.Errorf("LatestSequence = %d, want 7 (the shared anchor == max re-arm across ALL categories)", out.LatestSequence)
+	}
+	if !strings.Contains(out.Message, "since_sequence=7") {
+		t.Errorf("timeout message should name the re-arm anchor: %q", out.Message)
+	}
+	// The multi-category message names both categories.
+	for _, c := range []string{"implement_reviewed", "fixup_pushed"} {
+		if !strings.Contains(out.Message, c) {
+			t.Errorf("timeout message should name category %q: %q", c, out.Message)
+		}
+	}
+}
+
 func TestAwaitAudit_ImmediateHit(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()

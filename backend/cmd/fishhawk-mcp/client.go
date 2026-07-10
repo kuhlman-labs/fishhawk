@@ -2334,6 +2334,13 @@ type ListRunAuditFilter struct {
 	SinceSequence int64
 	Limit         int
 	Cursor        string
+	// AllowUnknown sets allow_unknown=true on the request (#1764), telling
+	// the endpoint to skip its known-category validation. The MCP tool sets
+	// it when the operator has opted into an unknown category via
+	// fishhawk_await_audit's allow_unknown flag, so the tool's own polling
+	// calls are not re-rejected by the endpoint. False omits the param and
+	// stays byte-identical to the prior request.
+	AllowUnknown bool
 }
 
 // ListRunAudit calls GET /v0/runs/{run_id}/audit with optional
@@ -2358,6 +2365,9 @@ func (c *apiClient) ListRunAudit(ctx context.Context, runID uuid.UUID, f ListRun
 	}
 	if f.Cursor != "" {
 		q.Set("cursor", f.Cursor)
+	}
+	if f.AllowUnknown {
+		q.Set("allow_unknown", "true")
 	}
 	path := "/v0/runs/" + runID.String() + "/audit"
 	if encoded := q.Encode(); encoded != "" {

@@ -146,6 +146,52 @@ func TestDeferFiledIssue_DecodesLabelCompleteness(t *testing.T) {
 	}
 }
 
+// TestListRunAudit_EmitsAllowUnknownAndCategory is the #1764 binding-condition
+// (1) client seam proof: ListRunAudit must actually serialize allow_unknown=true
+// (and the category) into the request RawQuery, so the MCP-input →
+// client-serialization → handler path cannot silently drop the param and leave
+// the endpoint's known-category validation re-rejecting the tool's own polling
+// calls for an operator-approved unknown category.
+func TestListRunAudit_EmitsAllowUnknownAndCategory(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+
+	_, _, err := r.api.ListRunAudit(context.Background(), runID, ListRunAuditFilter{
+		Category:     "scope_amendment_pending", // an unknown category the operator opted into
+		AllowUnknown: true,
+	})
+	if err != nil {
+		t.Fatalf("ListRunAudit: %v", err)
+	}
+	q := fb.perRunAuditLastQueryByID[runID]
+	for _, want := range []string{"allow_unknown=true", "category=scope_amendment_pending"} {
+		if !strings.Contains(q, want) {
+			t.Errorf("request RawQuery %q missing %q", q, want)
+		}
+	}
+}
+
+// TestListRunAudit_OmitsAllowUnknownWhenFalse proves the param is absent
+// (byte-identical to the pre-#1764 request) when AllowUnknown is false — the
+// omitempty half of the client contract.
+func TestListRunAudit_OmitsAllowUnknownWhenFalse(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+
+	_, _, err := r.api.ListRunAudit(context.Background(), runID, ListRunAuditFilter{
+		Category: "implement_reviewed",
+	})
+	if err != nil {
+		t.Fatalf("ListRunAudit: %v", err)
+	}
+	q := fb.perRunAuditLastQueryByID[runID]
+	if strings.Contains(q, "allow_unknown") {
+		t.Errorf("allow_unknown must be omitted when false; got %q", q)
+	}
+}
+
 // TestGetRunLatency_CollapsesEmptyObject pins the apiClient no-data contract
 // (#1702): the backend returns 200 + `{}` when no gate interval has resolved,
 // and GetRunLatency must collapse that to (nil, nil) so callers branch on a nil
