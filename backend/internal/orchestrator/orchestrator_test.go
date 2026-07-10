@@ -323,7 +323,11 @@ type stubGitHub struct {
 	// mergeErrByHead programs a per-head-branch MergeBranch error (e.g.
 	// githubclient.ErrMergeConflict on a specific slice branch).
 	mergeErrByHead map[string]error
-	mergeCalls     []mergeBranchCall
+	// mergeEmptyByHead programs a per-head-branch 204 (already-merged) no-op:
+	// MergeBranch returns ("", nil), modeling a re-entrant pass whose slices
+	// were already merged on a prior pass (#1806).
+	mergeEmptyByHead map[string]bool
+	mergeCalls       []mergeBranchCall
 }
 
 type createRefCall struct {
@@ -454,6 +458,10 @@ func (g *stubGitHub) MergeBranch(_ context.Context, _ int64,
 	g.mergeCalls = append(g.mergeCalls, mergeBranchCall{Base: base, Head: head, Msg: msg})
 	if err, ok := g.mergeErrByHead[head]; ok {
 		return "", err
+	}
+	// A 204 already-merged no-op returns an empty SHA (#1806 re-entrant pass).
+	if g.mergeEmptyByHead[head] {
+		return "", nil
 	}
 	// Deterministic per-head merge commit SHA so tests can assert the
 	// slices_integrated integration_commit_shas payload (#1459).
@@ -1156,6 +1164,25 @@ func auditHasCategory(a *recordingAudit, category string) bool {
 		}
 	}
 	return false
+}
+
+// auditRunIDForCategory reports whether every AppendChained call of the given
+// category was recorded on the given run's chain (RunID == want). Returns
+// false if no such entry exists.
+func auditRunIDForCategory(a *recordingAudit, category string, want uuid.UUID) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	found := false
+	for _, p := range a.appended {
+		if p.Category != category {
+			continue
+		}
+		found = true
+		if p.RunID != want {
+			return false
+		}
+	}
+	return found
 }
 
 func TestCompleteRun_AllFailedChildrenRetryable_ParksParent(t *testing.T) {
@@ -2420,6 +2447,194 @@ func TestIntegrateSlices_OverlappingSlice_ReturnsConflict(t *testing.T) {
 	}
 	if conflict.ChildRunID != child1.ID {
 		t.Errorf("conflict.ChildRunID = %s, want %s", conflict.ChildRunID, child1.ID)
+	}
+}
+
+// integrationCommitRecords returns the decoded payloads of every
+// integration_commit_recorded audit entry, in append order (#1806).
+func integrationCommitRecords(t *testing.T, a *recordingAudit) []map[string]any {
+	t.Helper()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []map[string]any
+	for _, p := range a.appended {
+		if p.Category != "integration_commit_recorded" {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal(p.Payload, &m); err != nil {
+			t.Fatalf("decode integration_commit_recorded payload: %v", err)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// TestIntegrateSlices_PartialMergeThenConflict_RecordsCreatedMergeSHAs is the
+// a26835f7 shape (#1806): slice-0 and slice-1 merge (201), then slice-2
+// CONFLICTS and the fan-in bails early — so the terminal slices_integrated
+// never fires. The merges already created must STILL be attributable, recorded
+// incrementally via integration_commit_recorded at merge time.
+func TestIntegrateSlices_PartialMergeThenConflict_RecordsCreatedMergeSHAs(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	au := &recordingAudit{}
+	o.Audit = au
+	gh.branchSHAs = map[string]string{"main": "basesha"}
+
+	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+	child0 := seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	child1 := seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+	_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 2)
+
+	// Slice-2 conflicts, so the loop returns *SliceConflict before reaching
+	// the terminal emitSlicesIntegrated.
+	gh.mergeErrByHead = map[string]error{
+		sliceBranch(parent.ID, 2): githubclient.ErrMergeConflict,
+	}
+
+	conflict, err := o.IntegrateSlices(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("IntegrateSlices: %v", err)
+	}
+	if conflict == nil {
+		t.Fatal("conflict = nil, want a *SliceConflict for slice 2")
+	}
+	if conflict.SliceIndex != 2 {
+		t.Errorf("conflict.SliceIndex = %d, want 2", conflict.SliceIndex)
+	}
+
+	// The terminal slices_integrated must NOT have fired (early return).
+	if auditHasCategory(au, "slices_integrated") {
+		t.Error("slices_integrated recorded on a partial pass; want none (early return)")
+	}
+
+	// slice-0 and slice-1's merges were recorded incrementally, so the SHAs
+	// survive the early return.
+	records := integrationCommitRecords(t, au)
+	if len(records) != 2 {
+		t.Fatalf("integration_commit_recorded entries = %d, want 2 (slice 0 and 1)", len(records))
+	}
+	wantSHA0 := "mergesha-" + sliceBranch(parent.ID, 0)
+	wantSHA1 := "mergesha-" + sliceBranch(parent.ID, 1)
+	if records[0]["merge_sha"] != wantSHA0 || records[1]["merge_sha"] != wantSHA1 {
+		t.Errorf("recorded merge_sha = [%v, %v], want [%q, %q]",
+			records[0]["merge_sha"], records[1]["merge_sha"], wantSHA0, wantSHA1)
+	}
+	// The entry carries the slice/child provenance and the parent's own run id.
+	if got, _ := records[0]["slice_index"].(float64); int(got) != 0 {
+		t.Errorf("records[0] slice_index = %v, want 0", records[0]["slice_index"])
+	}
+	if records[0]["child_run_id"] != child0.ID.String() {
+		t.Errorf("records[0] child_run_id = %v, want %q", records[0]["child_run_id"], child0.ID.String())
+	}
+	if records[1]["child_run_id"] != child1.ID.String() {
+		t.Errorf("records[1] child_run_id = %v, want %q", records[1]["child_run_id"], child1.ID.String())
+	}
+	// The recorded entry is on the PARENT's own chain (RunID == parent).
+	if !auditRunIDForCategory(au, "integration_commit_recorded", parent.ID) {
+		t.Errorf("integration_commit_recorded not appended on parent run %s chain", parent.ID)
+	}
+}
+
+// TestIntegrateSlices_PartialMergeThenAPIError_RecordsCreatedMergeSHAs is the
+// binding-condition companion to the conflict-path test: slice-0 merges (201),
+// then slice-1's GitHub merge call ERRORS (a non-conflict API failure) and the
+// fan-in returns (nil, err) before the terminal emit. Slice-0's merge SHA must
+// still be recorded (#1806 — BOTH early-return paths lose the SHA).
+func TestIntegrateSlices_PartialMergeThenAPIError_RecordsCreatedMergeSHAs(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	au := &recordingAudit{}
+	o.Audit = au
+	gh.branchSHAs = map[string]string{"main": "basesha"}
+
+	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+	child0 := seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+
+	// Slice-1's merge fails with a generic (non-conflict) GitHub error, taking
+	// the default branch that returns (nil, err) — a DIFFERENT early return
+	// than the conflict path.
+	apiErr := errors.New("github: 500 internal error")
+	gh.mergeErrByHead = map[string]error{
+		sliceBranch(parent.ID, 1): apiErr,
+	}
+
+	conflict, err := o.IntegrateSlices(context.Background(), parent.ID)
+	if conflict != nil {
+		t.Fatalf("conflict = %+v, want nil (this is the error path, not a conflict)", conflict)
+	}
+	if err == nil || !errors.Is(err, apiErr) {
+		t.Fatalf("IntegrateSlices err = %v, want wrapped %v", err, apiErr)
+	}
+
+	// The terminal slices_integrated must NOT have fired.
+	if auditHasCategory(au, "slices_integrated") {
+		t.Error("slices_integrated recorded on an errored pass; want none (early return)")
+	}
+
+	// slice-0's merge was recorded incrementally before slice-1 errored.
+	records := integrationCommitRecords(t, au)
+	if len(records) != 1 {
+		t.Fatalf("integration_commit_recorded entries = %d, want 1 (slice 0)", len(records))
+	}
+	wantSHA0 := "mergesha-" + sliceBranch(parent.ID, 0)
+	if records[0]["merge_sha"] != wantSHA0 {
+		t.Errorf("recorded merge_sha = %v, want %q", records[0]["merge_sha"], wantSHA0)
+	}
+	if records[0]["child_run_id"] != child0.ID.String() {
+		t.Errorf("records[0] child_run_id = %v, want %q", records[0]["child_run_id"], child0.ID.String())
+	}
+}
+
+// TestIntegrateSlices_RecordsOneMergePerSuccessfulMerge asserts the per-merge
+// durability contract in both directions (#1806): a clean 3-slice pass emits
+// three integration_commit_recorded entries AND the terminal slices_integrated;
+// a re-entrant all-204 pass (slices already merged) emits NO new records — the
+// SHAs were recorded on the original 201 pass.
+func TestIntegrateSlices_RecordsOneMergePerSuccessfulMerge(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultRef = "main"
+	au := &recordingAudit{}
+	o.Audit = au
+	gh.branchSHAs = map[string]string{"main": "basesha"}
+
+	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+	for i := 0; i < 3; i++ {
+		_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), i)
+	}
+
+	// First pass: all three merge (201), recording three SHAs + the terminal.
+	if conflict, err := o.IntegrateSlices(context.Background(), parent.ID); err != nil || conflict != nil {
+		t.Fatalf("first IntegrateSlices: conflict=%v err=%v", conflict, err)
+	}
+	records := integrationCommitRecords(t, au)
+	if len(records) != 3 {
+		t.Fatalf("integration_commit_recorded entries = %d, want 3", len(records))
+	}
+	for i := 0; i < 3; i++ {
+		want := "mergesha-" + sliceBranch(parent.ID, i)
+		if records[i]["merge_sha"] != want {
+			t.Errorf("records[%d] merge_sha = %v, want %q", i, records[i]["merge_sha"], want)
+		}
+	}
+	if !auditHasCategory(au, "slices_integrated") {
+		t.Error("clean pass did not record terminal slices_integrated")
+	}
+
+	// Second (re-entrant) pass: every slice is already merged → 204 no-ops.
+	// No NEW integration_commit_recorded entries: an empty merge SHA records
+	// nothing (the SHA was durable from the first pass).
+	gh.mergeEmptyByHead = map[string]bool{}
+	for i := 0; i < 3; i++ {
+		gh.mergeEmptyByHead[sliceBranch(parent.ID, i)] = true
+	}
+	if conflict, err := o.IntegrateSlices(context.Background(), parent.ID); err != nil || conflict != nil {
+		t.Fatalf("second IntegrateSlices: conflict=%v err=%v", conflict, err)
+	}
+	if got := integrationCommitRecords(t, au); len(got) != 3 {
+		t.Errorf("integration_commit_recorded entries after re-entrant pass = %d, want 3 (no new records)", len(got))
 	}
 }
 

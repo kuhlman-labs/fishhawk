@@ -1520,3 +1520,103 @@ func TestVerifyBranchLineage_SlicesIntegratedReadErrorFailsOpen(t *testing.T) {
 		t.Error("fail-open path must not fail the stage")
 	}
 }
+
+// mustIntegrationCommitRecordedPayload renders an integration_commit_recorded
+// audit payload byte-shaped exactly as Orchestrator.emitIntegrationCommitRecorded
+// writes it (#1806): merge_sha / slice_index / child_run_id / consolidated_branch.
+// Only merge_sha drives the lineage ledger, but the test seeds the real shape so
+// a future field rename in the emitter surfaces here.
+func mustIntegrationCommitRecordedPayload(t *testing.T, mergeSHA string, sliceIndex int) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{
+		"merge_sha":           mergeSHA,
+		"slice_index":         sliceIndex,
+		"child_run_id":        uuid.New().String(),
+		"consolidated_branch": "fishhawk/run-abc",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestVerifyBranchLineage_IntegrationCommitRecordedAttributes crosses the
+// emitter->reader merge_sha seam for #1806: an integration merge recorded ONLY
+// via integration_commit_recorded (with NO slices_integrated entry — the
+// partial/re-entrant fan-in that never fired the terminal emit) must attribute
+// on a parent fix-up. The merge SHA is the only commit the seed doesn't cover,
+// so a pass proves the new incremental-category union is load-bearing.
+func TestVerifyBranchLineage_IntegrationCommitRecordedAttributes(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	const i0 = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a" // integrate slice 0 merge (recorded incrementally)
+	const f2 = "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d" // current fix-up head (report)
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {i0, f2}},
+	}
+	gh := newLineageGitHubClient(t, stub)
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning, InstallationID: instID(99)}
+	stage := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement,
+		State: run.StageStateRunning, RequiresApproval: true}
+	s, _, au, rr := newLineageServer(t, gh, runRow, stage)
+	// The incremental integration_commit_recorded entry naming i0 — the ONLY
+	// provenance for it (no slices_integrated entry exists, mirroring the
+	// partial-fan-in shape a26835f7 that never fired the terminal emit).
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &runID,
+		Category: "integration_commit_recorded",
+		Payload:  mustIntegrationCommitRecordedPayload(t, i0, 0),
+	})
+
+	if ok := s.verifyBranchLineage(context.Background(), runID, stage, f2, 42); !ok {
+		t.Fatal("expected ok=true: an integration merge recorded via integration_commit_recorded must attribute")
+	}
+	if v := foreignViolation(au); v != nil {
+		t.Fatalf("unexpected violation on an incrementally-recorded integration merge: %+v", v)
+	}
+	if transitionedTo(rr, run.StageStateFailed) {
+		t.Error("stage was failed despite an attributable integration merge")
+	}
+}
+
+// TestVerifyBranchLineage_IntegrationCommitRecordedReadErrorFailsOpen is the
+// fail-OPEN guard for #1806: a ListForRunByCategory error on the new
+// integration_commit_recorded category marks the ledger incomplete, so the
+// guard SKIPS (ok=true) rather than enforcing against a partial ledger. The
+// branch carries a commit that WOULD flag against a complete ledger, proving
+// the pass is the incomplete-ledger skip. Mirrors the slices_integrated
+// read-error fail-open contract.
+func TestVerifyBranchLineage_IntegrationCommitRecordedReadErrorFailsOpen(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	const i0 = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+	const foreign = "ffffffffffffffffffffffffffffffffffffffff" // would flag if the ledger were complete
+	const f2 = "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {i0, foreign, f2}},
+	}
+	gh := newLineageGitHubClient(t, stub)
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning, InstallationID: instID(99)}
+	stage := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement,
+		State: run.StageStateRunning, RequiresApproval: true}
+	s, _, au, rr := newLineageServer(t, gh, runRow, stage)
+	// Fail ONLY the integration_commit_recorded read; every other category
+	// delegates to au and stays readable, so the ledger is incomplete solely
+	// because of the new-category read error.
+	s.cfg.AuditRepo = &categoryErrAudit{
+		auditFake: au,
+		errFor:    map[string]error{lineageIntegrationCommitCategory: errors.New("integration_commit_recorded read boom")},
+	}
+
+	if ok := s.verifyBranchLineage(context.Background(), runID, stage, f2, 42); !ok {
+		t.Fatal("expected ok=true: an incomplete ledger must fail open (skip), never false-block")
+	}
+	if v := foreignViolation(au); v != nil {
+		t.Fatalf("fail-open path must not emit a violation: %+v", v)
+	}
+	if transitionedTo(rr, run.StageStateFailed) {
+		t.Error("fail-open path must not fail the stage")
+	}
+}

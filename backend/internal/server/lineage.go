@@ -47,6 +47,18 @@ const lineageVouchLedgerCategory = CategoryOperatorCommitVouched
 // standalone run has no such entry, so the read is a no-op for it.
 const lineageIntegrationLedgerCategory = "slices_integrated"
 
+// lineageIntegrationCommitCategory is the incremental companion to
+// slices_integrated (#1806). The orchestrator emits one integration_commit_recorded
+// entry the instant each "Integrate slice N" merge commit is created, so the
+// merge SHA is durable across a partial fan-in that bails on a later slice's
+// conflict/error (never reaching the terminal slices_integrated) and across a
+// re-entrant pass that sees the earlier merges as 204 no-ops. Its merge_sha
+// payload field names a single integration merge commit; the ledger unions
+// these alongside slices_integrated.integration_commit_shas so the ADR-035
+// guard attributes the merges even when the clean-integration signal never
+// fired. A standalone run has no such entry, so the read is a no-op for it.
+const lineageIntegrationCommitCategory = "integration_commit_recorded"
+
 // lineageChildLedgerCategories are the audit categories read from a
 // decomposition CHILD run's chain when building the PARENT's ledger
 // (#1038). Children push onto the shared parent branch (child_pushed)
@@ -540,6 +552,25 @@ func (s *Server) buildReportedHeadLedger(ctx context.Context, runRow *run.Run, l
 		addIntegrationCommitSHAs(ledger, integrated)
 	}
 
+	// Union in the integration merges recorded INCREMENTALLY on THIS run's own
+	// chain (#1806): the orchestrator emits one integration_commit_recorded
+	// entry per successful merge at merge time, so the SHA survives a partial
+	// fan-in that bailed before the terminal slices_integrated fired (later
+	// slice conflict/error) and a re-entrant 204 no-op pass. Read parent-chain
+	// only, exactly like slices_integrated. A standalone run has no such entry,
+	// so this is a no-op. A read error sets complete=false (fail open),
+	// matching the head/vouch/integration-category contract above.
+	if recorded, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, lineageIntegrationCommitCategory); err != nil {
+		complete = false
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"branch lineage: list integration_commit_recorded failed; ledger incomplete (guard fails open)",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("category", lineageIntegrationCommitCategory),
+			slog.String("error", err.Error()))
+	} else {
+		addIntegrationMergeSHAs(ledger, recorded)
+	}
+
 	// Union in the heads reported by this run's decomposition children.
 	// A standalone run (and every child run itself) has no children, so
 	// this is a no-op and standalone behavior is unchanged.
@@ -624,6 +655,25 @@ func addIntegrationCommitSHAs(ledger map[string]struct{}, entries []*audit.Entry
 			if sha != "" {
 				ledger[sha] = struct{}{}
 			}
+		}
+	}
+}
+
+// addIntegrationMergeSHAs adds every non-empty merge_sha payload field from the
+// given integration_commit_recorded audit entries to the ledger (#1806).
+// Parallel to addIntegrationCommitSHAs, but reads the single merge_sha the
+// fan-in records incrementally per merge (one entry per "Integrate slice N"
+// commit) rather than the terminal []string batch.
+func addIntegrationMergeSHAs(ledger map[string]struct{}, entries []*audit.Entry) {
+	for _, e := range entries {
+		var payload struct {
+			MergeSHA string `json:"merge_sha"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			continue
+		}
+		if payload.MergeSHA != "" {
+			ledger[payload.MergeSHA] = struct{}{}
 		}
 	}
 }

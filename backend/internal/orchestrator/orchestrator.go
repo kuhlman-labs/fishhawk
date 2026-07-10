@@ -1307,6 +1307,13 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 			childIDs = append(childIDs, c.ID.String())
 			if mergeSHA != "" {
 				integrationCommitSHAs = append(integrationCommitSHAs, mergeSHA)
+				// Record the merge SHA on the parent chain the INSTANT the
+				// commit is created — durable across a later slice's
+				// conflict/error early return and a re-entrant 204 no-op pass,
+				// both of which never reach the terminal emitSlicesIntegrated
+				// (#1806). buildReportedHeadLedger unions this alongside
+				// slices_integrated.integration_commit_shas.
+				o.emitIntegrationCommitRecorded(ctx, parent.ID, mergeSHA, *c.SliceIndex, c.ID.String(), consolidated)
 			}
 		case errors.Is(err, githubclient.ErrMergeConflict):
 			detail := fmt.Sprintf("slice integration conflict: slice %d (child run %s) could not merge onto %s",
@@ -1423,6 +1430,48 @@ func (o *Orchestrator) emitSlicesIntegrated(ctx context.Context, parentRunID uui
 		Payload:   payload,
 	}); err != nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append slices_integrated failed",
+			slog.String("error", err.Error()))
+	}
+}
+
+// emitIntegrationCommitRecorded writes an integration_commit_recorded audit
+// entry (system actor) immediately after each successful 201 slice merge, so
+// the merge SHA is durable the instant the commit is created — BEFORE the
+// merge loop reaches a slice that may conflict or error (#1806). The terminal
+// emitSlicesIntegrated fires only on a fully-clean pass, so a partial pass
+// that merges some slices then bails early, or a re-entrant pass that sees
+// those merges as 204 no-ops, would otherwise lose the SHA from the reported-
+// head ledger forever and flag it foreign at the parent fix-up boundary.
+// buildReportedHeadLedger unions merge_sha in alongside
+// slices_integrated.integration_commit_shas. Best-effort, mirroring
+// emitSlicesIntegrated: nil-Audit guard, WARN-on-error, never unwinds the
+// settle.
+func (o *Orchestrator) emitIntegrationCommitRecorded(ctx context.Context, parentRunID uuid.UUID, mergeSHA string, sliceIndex int, childRunID, consolidatedBranch string) {
+	if o.Audit == nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping integration_commit_recorded entry",
+			slog.String("parent_run_id", parentRunID.String()))
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"merge_sha":           mergeSHA,
+		"slice_index":         sliceIndex,
+		"child_run_id":        childRunID,
+		"consolidated_branch": consolidatedBranch,
+	})
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal integration_commit_recorded payload failed",
+			slog.String("error", err.Error()))
+		return
+	}
+	systemKind := audit.ActorSystem
+	if _, err := o.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     parentRunID,
+		Timestamp: time.Now().UTC(),
+		Category:  "integration_commit_recorded",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append integration_commit_recorded failed",
 			slog.String("error", err.Error()))
 	}
 }
