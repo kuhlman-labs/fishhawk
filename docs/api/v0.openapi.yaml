@@ -5427,8 +5427,10 @@ paths:
           description: "`validation_failed` — malformed body, missing `repo`/`from`/`to`/`stage_id`, or a non-UUID `stage_id`."
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: "`stage_not_found` — the `stage_id` is a valid UUID but keys no stage row (the artifact FK cannot resolve)."
         '500':
-          description: "`release_notes_persist_failed` — the artifact insert failed (verify the `stage_id` exists)."
+          description: "`release_notes_persist_failed` — the artifact insert failed for a reason other than a missing stage."
         '502':
           description: "`release_notes_assembly_failed` / `installation_resolution_failed` — as for the preview endpoint."
         '503':

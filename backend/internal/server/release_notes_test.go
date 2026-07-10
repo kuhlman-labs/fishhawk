@@ -303,9 +303,56 @@ func TestReleaseNotesPreview_Anonymous(t *testing.T) {
 	}
 }
 
-// The 503 nil-dependency branch for both routes is pinned by the
-// *RouteRegistered tests in handlers_test.go (a zero-Config server reaches the
-// handler and 503s rather than 404ing).
+// TestReleaseNotesUnconfigured pins the 503 nil-dependency branch for both
+// routes: an AUTHENTICATED caller on a zero-Config server clears the auth ladder
+// and then hits releaseNotesConfigured. (Anonymous callers get 401 first — the
+// auth ladder now runs before the config guard, see the *RouteRegistered tests.)
+func TestReleaseNotesUnconfigured(t *testing.T) {
+	s := New(Config{})
+
+	getReq := httptest.NewRequest(http.MethodGet,
+		"/v0/releases/notes/preview?repo=o/n&from=a&to=b", nil)
+	getRec := httptest.NewRecorder()
+	s.handleReleaseNotesPreview(getRec, withReleaseOperator(getReq))
+	if getRec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("preview status = %d, want 503:\n%s", getRec.Code, getRec.Body.String())
+	}
+	if !strings.Contains(getRec.Body.String(), "release_notes_unconfigured") {
+		t.Errorf("preview body missing release_notes_unconfigured:\n%s", getRec.Body.String())
+	}
+
+	postReq := httptest.NewRequest(http.MethodPost, "/v0/releases/notes",
+		strings.NewReader(`{"repo":"o/n","from":"a","to":"b","stage_id":"`+uuid.New().String()+`"}`))
+	postRec := httptest.NewRecorder()
+	s.handleReleaseNotesPersist(postRec, withReleaseOperator(postReq))
+	if postRec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("persist status = %d, want 503:\n%s", postRec.Code, postRec.Body.String())
+	}
+	if !strings.Contains(postRec.Body.String(), "release_notes_unconfigured") {
+		t.Errorf("persist body missing release_notes_unconfigured:\n%s", postRec.Body.String())
+	}
+}
+
+// TestReleaseNotesPersist_UnknownStage pins the FK-miss branch: a valid-UUID
+// stage_id with no stages row fails the artifacts.stage_id FK (SQLSTATE 23503),
+// which is a client mistake and must surface as 404 stage_not_found, not a 5xx.
+func TestReleaseNotesPersist_UnknownStage(t *testing.T) {
+	h := newReleaseNotesHarness(t, mixedPRs()...)
+	h.seedLoopRun("https://github.com/kuhlman-labs/fishhawk/pull/100", "assemble release evidence")
+
+	// A well-formed UUID that keys no stage row.
+	req := httptest.NewRequest(http.MethodPost, "/v0/releases/notes",
+		strings.NewReader(`{"repo":"kuhlman-labs/fishhawk","from":"v0.1.0","to":"main","stage_id":"`+uuid.New().String()+`"}`))
+	rec := httptest.NewRecorder()
+	h.server.handleReleaseNotesPersist(rec, withReleaseOperator(req))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404:\n%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "stage_not_found") {
+		t.Errorf("body missing stage_not_found:\n%s", rec.Body.String())
+	}
+}
 
 // TestReleaseNotesPersist_Anonymous pins the 401 branch on the write endpoint.
 func TestReleaseNotesPersist_Anonymous(t *testing.T) {

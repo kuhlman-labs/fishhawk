@@ -10,12 +10,18 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/releaseevidence"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/releasenotes"
 )
+
+// pgSQLStateForeignKeyViolation is Postgres SQLSTATE 23503, raised when an
+// insert violates a foreign-key constraint — here, a caller-supplied stage_id
+// that references no stages row.
+const pgSQLStateForeignKeyViolation = "23503"
 
 // releaseNotesPersistRequest is the JSON body of POST /v0/releases/notes. repo,
 // from, and to are the same coordinates the preview endpoint reads from query
@@ -72,13 +78,13 @@ type releaseNotesError struct {
 // 401, no scope gate beyond that, matching the sibling read endpoints. A new
 // endpoint, so no existing token is tightened (impact inventory empty).
 func (s *Server) handleReleaseNotesPreview(w http.ResponseWriter, r *http.Request) {
-	if !s.releaseNotesConfigured(w, r) {
-		return
-	}
 	id := IdentityFrom(r.Context())
 	if id.IsAnonymous() {
 		s.writeError(w, r, http.StatusUnauthorized, "authentication_required",
 			"an authenticated token is required", nil)
+		return
+	}
+	if !s.releaseNotesConfigured(w, r) {
 		return
 	}
 
@@ -115,9 +121,6 @@ func (s *Server) handleReleaseNotesPreview(w http.ResponseWriter, r *http.Reques
 // an empty TokenID is not scope-gated (matching those siblings). A new
 // endpoint, so no existing token is tightened (impact inventory empty).
 func (s *Server) handleReleaseNotesPersist(w http.ResponseWriter, r *http.Request) {
-	if !s.releaseNotesConfigured(w, r) {
-		return
-	}
 	id := IdentityFrom(r.Context())
 	if id.IsAnonymous() {
 		s.writeError(w, r, http.StatusUnauthorized, "authentication_required",
@@ -128,6 +131,9 @@ func (s *Server) handleReleaseNotesPersist(w http.ResponseWriter, r *http.Reques
 		s.writeError(w, r, http.StatusForbidden, "insufficient_scope",
 			"token is missing required scope: write:runs",
 			map[string]any{"required_scope": "write:runs"})
+		return
+	}
+	if !s.releaseNotesConfigured(w, r) {
 		return
 	}
 
@@ -185,8 +191,19 @@ func (s *Server) handleReleaseNotesPersist(w http.ResponseWriter, r *http.Reques
 		ContentHash: hex.EncodeToString(sum[:]),
 	})
 	if err != nil {
+		// A caller-supplied stage_id that is a valid UUID but has no
+		// stages row fails the artifacts.stage_id FK (SQLSTATE 23503).
+		// That is a client mistake, not a server fault — surface it as a
+		// 404 rather than mislabeling it 500.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgSQLStateForeignKeyViolation {
+			s.writeError(w, r, http.StatusNotFound, "stage_not_found",
+				"no stage with that id to key the release_notes artifact",
+				map[string]any{"stage_id": stageID.String()})
+			return
+		}
 		s.writeError(w, r, http.StatusInternalServerError, "release_notes_persist_failed",
-			"persist release_notes artifact failed (verify the stage_id exists)",
+			"persist release_notes artifact failed",
 			map[string]any{"error": err.Error(), "stage_id": stageID.String()})
 		return
 	}
@@ -204,9 +221,10 @@ func (s *Server) handleReleaseNotesPersist(w http.ResponseWriter, r *http.Reques
 
 // releaseNotesConfigured writes a 503 and returns false when a repository the
 // assembler crosses (run / audit / concern / artifact) is nil — mirroring the
-// sibling handlers' nil-dependency fail-closed posture. The check runs BEFORE
-// the auth ladder so the *RouteRegistered convention (a zero-Config server 503s
-// rather than 404s) holds.
+// sibling handlers' nil-dependency fail-closed posture. The check runs AFTER the
+// auth ladder (401/403) so an anonymous caller on an unconfigured server gets
+// 401 — the binding auth posture for these endpoints — rather than leaking
+// configuration state as a 503 before authentication.
 func (s *Server) releaseNotesConfigured(w http.ResponseWriter, r *http.Request) bool {
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil || s.cfg.ConcernRepo == nil || s.cfg.ArtifactRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "release_notes_unconfigured",
