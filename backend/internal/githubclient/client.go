@@ -2471,6 +2471,98 @@ func (c *Client) CreateCheckRun(ctx context.Context, installationID int64, repo 
 	return &CreateCheckRunResult{ID: out.ID, HTMLURL: out.HTMLURL}, nil
 }
 
+// CreateReviewParams is the typed wire body for
+// POST /repos/{owner}/{repo}/pulls/{pull_number}/reviews. Only the two
+// fields Fishhawk sets are surfaced — Body (the review markdown) and Event
+// (the review action). The GitHub schema is wider (commit_id, and a
+// `comments` array for inline review comments); mapping file/line-located
+// concerns to inline review comments is the deferred v2 (#1785).
+type CreateReviewParams struct {
+	Body  string
+	Event string
+}
+
+// CreateReviewResult carries the bits of GitHub's create-review response
+// Fishhawk records: the review id and its html_url.
+type CreateReviewResult struct {
+	ID      int64
+	HTMLURL string
+}
+
+// CreateReview posts a pull-request review (E42.2 / #1785).
+//
+//	POST /repos/{owner}/{repo}/pulls/{pull_number}/reviews
+//
+// Fishhawk uses this ONLY to post advisory COMMENT-type reviews of an agent
+// reviewer's verdict: a review with Event="COMMENT" and a body posts a
+// non-blocking comment review. APPROVE / REQUEST_CHANGES are the
+// branch-protection-relevant blocking events and are deliberately never sent
+// from the agent-review surface (the COMMENT-type invariant is pinned by
+// issuecomment.PRReviewEventComment and its test), so a bot review can never
+// hard-block merge under branch protection.
+//
+// v2 deferral (#1785): mapping file/line-located concerns to inline review
+// comments (this endpoint's `comments` array) is out of scope here — the body
+// carries the full verdict as prose.
+//
+// Returns ErrValidation when GitHub rejects the request (422 — e.g. an
+// invalid event), ErrNotFound when the repo/PR isn't visible to the
+// installation, ErrForbidden when the installation token lacks
+// `pull_requests:write`.
+func (c *Client) CreateReview(ctx context.Context, installationID int64, repo RepoRef, prNumber int, params CreateReviewParams) (*CreateReviewResult, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if prNumber <= 0 {
+		return nil, errors.New("githubclient: pr number must be > 0")
+	}
+	if params.Event == "" {
+		return nil, errors.New("githubclient: review event required")
+	}
+
+	body := map[string]string{"event": params.Event}
+	if params.Body != "" {
+		body["body"] = params.Body
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: marshal review body: %w", err)
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/pulls/" + url.PathEscape(fmt.Sprintf("%d", prNumber)) +
+		"/reviews")
+
+	req, err := c.buildRequest(ctx, http.MethodPost, endpoint, bytes.NewReader(raw), installationID)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: create review: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := classifyStatus("create review", resp); err != nil {
+		return nil, err
+	}
+
+	var out struct {
+		ID      int64  `json:"id"`
+		HTMLURL string `json:"html_url"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("githubclient: decode review: %w", err)
+	}
+	return &CreateReviewResult{ID: out.ID, HTMLURL: out.HTMLURL}, nil
+}
+
 // IssueCommentReaction is the subset of GitHub's reaction payload
 // Fishhawk reads from
 // `GET /repos/{owner}/{repo}/issues/comments/{comment_id}/reactions`.

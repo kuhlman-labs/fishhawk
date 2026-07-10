@@ -62,6 +62,9 @@ type fakeGitHub struct {
 	createIssueCommentStatus int
 	createIssueCommentBody   string
 
+	createReviewStatus int
+	createReviewBody   string
+
 	updateIssueCommentStatus int
 	updateIssueCommentBody   string
 
@@ -128,6 +131,8 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 		createCheckRunBody:        `{"id":987654,"html_url":"https://github.com/x/y/runs/987654"}`,
 		createIssueCommentStatus:  http.StatusCreated,
 		createIssueCommentBody:    `{"id":11111}`,
+		createReviewStatus:        http.StatusOK,
+		createReviewBody:          `{"id":424242,"html_url":"https://github.com/x/y/pull/7#pullrequestreview-424242"}`,
 		updateIssueCommentStatus:  http.StatusOK,
 		updateIssueCommentBody:    `{"id":11111,"body":"edited body","html_url":"https://github.com/x/y/issues/17#issuecomment-11111"}`,
 		listReactionsStatus:       http.StatusOK,
@@ -252,6 +257,16 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			w.WriteHeader(fg.updateIssueCommentStatus)
 			if fg.updateIssueCommentBody != "" {
 				_, _ = io.WriteString(w, fg.updateIssueCommentBody)
+			}
+		})
+
+	mux.HandleFunc("POST /repos/{owner}/{repo}/pulls/{number}/reviews",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.createReviewStatus)
+			if fg.createReviewBody != "" {
+				_, _ = io.WriteString(w, fg.createReviewBody)
 			}
 		})
 
@@ -1103,6 +1118,95 @@ func TestCreateCheckRun_RejectsConclusionWithoutCompleted(t *testing.T) {
 		})
 	if err == nil || !strings.Contains(err.Error(), "conclusion only allowed") {
 		t.Errorf("err = %v, want conclusion-only-allowed error", err)
+	}
+}
+
+func TestCreateReview_Comment_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.CreateReview(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 7,
+		CreateReviewParams{
+			Body:  "Advisory review by claude-opus-4-8.",
+			Event: "COMMENT",
+		})
+	if err != nil {
+		t.Fatalf("CreateReview: %v", err)
+	}
+	if got.ID != 424242 {
+		t.Errorf("ID = %d, want 424242", got.ID)
+	}
+	if got.HTMLURL != "https://github.com/x/y/pull/7#pullrequestreview-424242" {
+		t.Errorf("HTMLURL = %q", got.HTMLURL)
+	}
+	if fg.gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", fg.gotMethod)
+	}
+	if fg.gotPath != "/repos/x/y/pulls/7/reviews" {
+		t.Errorf("path = %q, want /repos/x/y/pulls/7/reviews", fg.gotPath)
+	}
+	if fg.gotContentType != "application/json" {
+		t.Errorf("Content-Type = %q", fg.gotContentType)
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(fg.gotBody, &body); err != nil {
+		t.Fatalf("body decode: %v", err)
+	}
+	if body["event"] != "COMMENT" {
+		t.Errorf("event = %v, want COMMENT", body["event"])
+	}
+	if body["body"] != "Advisory review by claude-opus-4-8." {
+		t.Errorf("body = %v", body["body"])
+	}
+}
+
+func TestCreateReview_StatusMapping(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		want   error
+	}{
+		{"not found", http.StatusNotFound, ErrNotFound},
+		{"validation", http.StatusUnprocessableEntity, ErrValidation},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fg, srv := newFakeGitHub(t)
+			fg.createReviewStatus = tc.status
+			fg.createReviewBody = `{"message":"nope"}`
+			c, _ := newTestClient(t, srv, nil)
+			_, err := c.CreateReview(context.Background(), 42,
+				RepoRef{Owner: "x", Name: "y"}, 7,
+				CreateReviewParams{Body: "b", Event: "COMMENT"})
+			if !errors.Is(err, tc.want) {
+				t.Errorf("err = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestCreateReview_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	cases := []struct {
+		name    string
+		repo    RepoRef
+		pr      int
+		params  CreateReviewParams
+		wantMsg string
+	}{
+		{"no owner", RepoRef{Name: "y"}, 7, CreateReviewParams{Event: "COMMENT"}, "owner and name required"},
+		{"zero pr", RepoRef{Owner: "x", Name: "y"}, 0, CreateReviewParams{Event: "COMMENT"}, "pr number must be > 0"},
+		{"empty event", RepoRef{Owner: "x", Name: "y"}, 7, CreateReviewParams{Body: "b"}, "review event required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := c.CreateReview(context.Background(), 42, tc.repo, tc.pr, tc.params)
+			if err == nil || !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Errorf("err = %v, want containing %q", err, tc.wantMsg)
+			}
+		})
 	}
 }
 

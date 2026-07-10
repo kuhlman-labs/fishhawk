@@ -11,6 +11,7 @@ it.
 |---|---|---|---|---|---|
 | Living anchor | `status_comment_posted` | `status_update` | `Dispatcher.Handle` (run create); `Server.notifyStatusUpdate` (every stage transition); `Server.notifyPlanReady` (plan-stage terminal) | run dispatch | Yes — one comment per run, every transition rebuilds + edits the same comment id |
 | PR status comment | `pr_status_comment_posted` | `pr_status_update` | `Server.notifyStatusUpdate` via `issuecomment.Notifier.NotifyStatusUpdateForRun` (folded in after the anchor edit) | PR first observed / `pull_request_url` stamped | Yes — one comment per PR, rebuilt on every transition + edited in place (identical body skips the edit) |
+| Agent-review PR review | `pr_review_posted` | _(source `implement_reviewed`)_ | `Notifier.maybePostAgentReviewPRReviews` via `NotifyStatusUpdateForRun` (folded in after the anchor edit) | each terminal agent `implement_reviewed` verdict on a PR-owning run | No — a NEW advisory COMMENT-type PR review per verdict round (deduped on the source `implement_reviewed` audit `Sequence`); a post-fixup re-review round posts a new review |
 | Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, advisory-reject arbitrated, must_page_human, clarification request / awaiting_input park, CI failure, acceptance triage paged, campaign gate hand-off) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor |
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
 | Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688, #1371) | crossing of an advisory periodic-budget ladder rung — `warn` / `over` / `ack_required` (≥2x) / `page` (≥3x) | No (per-`(period_start, tier)` dedup; each tier posts once per calendar period) |
@@ -136,6 +137,42 @@ Notes:
   - The **#1702 economics stamp stays in the PR BODY**
     (`Server.resolveReviewStageOnMerge`); folding it into this comment is out of
     scope for this change.
+- **Agent-review PR reviews (E42.2 / #1785).** Each terminal agent
+  `implement_reviewed` verdict (the opus-4-8 + gpt-5.5 heterogeneous pair) is
+  ALSO posted as an actual GitHub pull-request review, so the verdict lands in
+  the PR merge box — not only in the issue anchor and audit chain. Rendered by
+  the pure `RenderPRReviewBody` (`pr_review_template.go`, reusing the anchor's
+  severity-bucketed concern shape + a `concern_resolutions` arc + a
+  reviewer-model / run attribution line) and posted by a best-effort
+  `maybePostAgentReviewPRReviews` folded into `NotifyStatusUpdateForRun` AFTER
+  the anchor edit, mirroring the E42.1 `maybeUpdatePRStatusComment` plumbing —
+  the single fan-out point every rebuild hook already calls, so no new
+  `Channel` method. Discipline:
+  - **Always COMMENT-type — advisory, never hard-block.** Reviews are ALWAYS
+    posted with `event=COMMENT` (`PRReviewEventComment`), never
+    `APPROVE`/`REQUEST_CHANGES`: agent verdicts are advisory and the operator
+    arbitrates, so a bot `REQUEST_CHANGES` would hard-block merge under branch
+    protection and silently change gate semantics. The COMMENT-type invariant
+    is the load-bearing safety property, pinned by a dedicated test asserting
+    the constant can never be a blocking event.
+  - **Owns-PR only.** Skipped unless the run has a non-empty `pull_request_url`
+    AND an installation id (identical to the `maybeUpdatePRStatusComment` /
+    `stampEconomicsIntoPRBody` guard).
+  - **Fail-open.** Every skip and every GitHub / audit error is swallowed to
+    `nil` — a `CreateReview` failure logs-and-continues and never unwinds the
+    notify path or blocks the page-class pings; on a `CreateReview` failure no
+    dedup row is written, so the next rebuild retries that verdict.
+  - **Dedup on the source `implement_reviewed` audit `Sequence`.** Each posted
+    review appends a `pr_review_posted` row carrying `source_sequence` (+
+    `reviewer_model`, `review_id`, `event`), so a re-render of the run never
+    double-posts a review for the same verdict, while a genuinely new
+    post-fixup re-review round (a later `Sequence`) posts a NEW review.
+  - `pr_review_posted` is deliberately NOT added to the anchor timeline's
+    `activityCategories` — it is PR-locus review bookkeeping, not an
+    issue-anchor timeline activity (same posture as `pr_status_comment_posted`).
+  - **v2 deferral.** Mapping file/line-located concerns to inline PR review
+    comments (the create-review endpoint's `comments` array) is out of scope;
+    the review body carries the full verdict as prose.
 - **Page-class pings (`anchor_ping_posted`).** GitHub does not notify on
   comment EDITS, so a state change that needs a human is announced by a
   one-line NEW comment linking to the anchor. Page-class events are derived

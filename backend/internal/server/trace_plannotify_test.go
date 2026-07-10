@@ -316,6 +316,14 @@ func (c *commentRecorder) UpdateIssueComment(_ context.Context, _ int64, _ githu
 	return &githubclient.IssueComment{ID: commentID, Body: body}, nil
 }
 
+// CreateReview is a no-op stub for the IssueCommenter interface extension
+// landed in #1785 (advisory COMMENT-type PR reviews). trace_plannotify tests
+// don't exercise the PR-review path; a happy response keeps the interface
+// satisfied without changing the test surface.
+func (c *commentRecorder) CreateReview(_ context.Context, _ int64, _ githubclient.RepoRef, _ int, _ githubclient.CreateReviewParams) (*githubclient.CreateReviewResult, error) {
+	return &githubclient.CreateReviewResult{}, nil
+}
+
 // planReadyAuditFake is a tiny in-memory audit.Repository that the
 // notifier's dedup query and AppendChained can both run against.
 // Mirrors the in-memory fakes elsewhere in the package.
