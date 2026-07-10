@@ -3116,3 +3116,227 @@ func TestMergeBranch_Validation(t *testing.T) {
 		t.Errorf("merge sha = %q, want empty on validation error", sha)
 	}
 }
+
+// --- Release publish integration (E33.3 / #1588) ---
+
+// releaseServer spins up an httptest server answering a single canned
+// status+body and recording the request line, for the Release GET/PATCH/DELETE
+// methods that target the REST API host.
+func releaseServer(t *testing.T, status int, body string) (*Client, *struct {
+	method      string
+	path        string
+	rawQuery    string
+	contentType string
+	reqBody     []byte
+}) {
+	t.Helper()
+	rec := &struct {
+		method      string
+		path        string
+		rawQuery    string
+		contentType string
+		reqBody     []byte
+	}{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.method = r.Method
+		rec.path = r.URL.Path
+		rec.rawQuery = r.URL.RawQuery
+		rec.contentType = r.Header.Get("Content-Type")
+		rec.reqBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	c, _ := newTestClient(t, srv, nil)
+	return c, rec
+}
+
+func TestGetReleaseByTag_HappyPath(t *testing.T) {
+	body := `{"id":555,"tag_name":"v1.2.3","body":"old notes","html_url":"https://github.com/o/r/releases/tag/v1.2.3","assets":[{"id":9001,"name":"release-notes.md"},{"id":9002,"name":"binary.tar.gz"}]}`
+	c, rec := releaseServer(t, http.StatusOK, body)
+	rel, err := c.GetReleaseByTag(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, "v1.2.3")
+	if err != nil {
+		t.Fatalf("GetReleaseByTag: %v", err)
+	}
+	if rel.ID != 555 || rel.TagName != "v1.2.3" || rel.Body != "old notes" {
+		t.Errorf("release = %+v", rel)
+	}
+	if rel.HTMLURL != "https://github.com/o/r/releases/tag/v1.2.3" {
+		t.Errorf("html_url = %q", rel.HTMLURL)
+	}
+	if len(rel.Assets) != 2 || rel.Assets[0].ID != 9001 || rel.Assets[0].Name != "release-notes.md" {
+		t.Errorf("assets = %+v", rel.Assets)
+	}
+	if rec.method != http.MethodGet || rec.path != "/repos/o/r/releases/tags/v1.2.3" {
+		t.Errorf("request = %s %s", rec.method, rec.path)
+	}
+}
+
+func TestGetReleaseByTag_NotFound(t *testing.T) {
+	c, _ := releaseServer(t, http.StatusNotFound, `{"message":"Not Found"}`)
+	_, err := c.GetReleaseByTag(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, "v9.9.9")
+	if err == nil || !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestGetReleaseByTag_Validation(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	if _, err := c.GetReleaseByTag(context.Background(), 1, RepoRef{Name: "r"}, "v1"); err == nil ||
+		!strings.Contains(err.Error(), "owner and name") {
+		t.Errorf("missing owner err = %v", err)
+	}
+	if _, err := c.GetReleaseByTag(context.Background(), 1, RepoRef{Owner: "o", Name: "r"}, ""); err == nil ||
+		!strings.Contains(err.Error(), "tag is required") {
+		t.Errorf("missing tag err = %v", err)
+	}
+}
+
+func TestUpdateReleaseBody_HappyPath(t *testing.T) {
+	c, rec := releaseServer(t, http.StatusOK, `{"id":555}`)
+	if err := c.UpdateReleaseBody(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, 555, "new release notes"); err != nil {
+		t.Fatalf("UpdateReleaseBody: %v", err)
+	}
+	if rec.method != http.MethodPatch || rec.path != "/repos/o/r/releases/555" {
+		t.Errorf("request = %s %s", rec.method, rec.path)
+	}
+	if rec.contentType != "application/json" {
+		t.Errorf("content-type = %q", rec.contentType)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(rec.reqBody, &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got["body"] != "new release notes" {
+		t.Errorf("body field = %q", got["body"])
+	}
+}
+
+func TestUpdateReleaseBody_Errors(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		want   error
+	}{
+		{"forbidden", http.StatusForbidden, ErrForbidden},
+		{"not-found", http.StatusNotFound, ErrNotFound},
+		{"validation", http.StatusUnprocessableEntity, ErrValidation},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := releaseServer(t, tc.status, `{"message":"boom"}`)
+			err := c.UpdateReleaseBody(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, 555, "b")
+			if err == nil || !errors.Is(err, tc.want) {
+				t.Errorf("err = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestUpdateReleaseBody_Validation(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	if err := c.UpdateReleaseBody(context.Background(), 1, RepoRef{Owner: "o", Name: "r"}, 0, "b"); err == nil ||
+		!strings.Contains(err.Error(), "release id must be") {
+		t.Errorf("zero release id err = %v", err)
+	}
+}
+
+func TestDeleteReleaseAsset_HappyPath(t *testing.T) {
+	c, rec := releaseServer(t, http.StatusNoContent, "")
+	if err := c.DeleteReleaseAsset(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, 9001); err != nil {
+		t.Fatalf("DeleteReleaseAsset: %v", err)
+	}
+	if rec.method != http.MethodDelete || rec.path != "/repos/o/r/releases/assets/9001" {
+		t.Errorf("request = %s %s", rec.method, rec.path)
+	}
+}
+
+func TestDeleteReleaseAsset_Errors(t *testing.T) {
+	c, _ := releaseServer(t, http.StatusNotFound, `{"message":"Not Found"}`)
+	err := c.DeleteReleaseAsset(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, 9001)
+	if err == nil || !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+	cc := &Client{Tokens: &stubTokens{}}
+	if err := cc.DeleteReleaseAsset(context.Background(), 1, RepoRef{Owner: "o", Name: "r"}, 0); err == nil ||
+		!strings.Contains(err.Error(), "asset id must be") {
+		t.Errorf("zero asset id err = %v", err)
+	}
+}
+
+// TestUploadReleaseAsset_TargetsUploadHost is the load-bearing wiring assertion
+// from the plan's risk note: the asset POST must hit the SEPARATE upload host
+// (UploadBaseURL), NOT the REST API host (BaseURL). Two recording servers prove
+// it — the upload server receives the request and the api server receives none.
+func TestUploadReleaseAsset_TargetsUploadHost(t *testing.T) {
+	var apiHits int
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		apiHits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(apiSrv.Close)
+
+	rec := &struct {
+		method      string
+		path        string
+		rawQuery    string
+		contentType string
+		body        []byte
+	}{}
+	uploadSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.method = r.Method
+		rec.path = r.URL.Path
+		rec.rawQuery = r.URL.RawQuery
+		rec.contentType = r.Header.Get("Content-Type")
+		rec.body, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"id":1,"name":"release-notes.md"}`)
+	}))
+	t.Cleanup(uploadSrv.Close)
+
+	c, _ := newTestClient(t, apiSrv, nil)
+	c.UploadBaseURL = uploadSrv.URL
+
+	data := []byte("# Release notes\n\nbody")
+	if err := c.UploadReleaseAsset(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, 555,
+		"release-notes.md", "text/markdown", data); err != nil {
+		t.Fatalf("UploadReleaseAsset: %v", err)
+	}
+	if apiHits != 0 {
+		t.Errorf("api host received %d requests, want 0 (upload must target the upload host)", apiHits)
+	}
+	if rec.method != http.MethodPost || rec.path != "/repos/o/r/releases/555/assets" {
+		t.Errorf("upload request = %s %s", rec.method, rec.path)
+	}
+	if rec.rawQuery != "name=release-notes.md" {
+		t.Errorf("query = %q, want name=release-notes.md", rec.rawQuery)
+	}
+	if rec.contentType != "text/markdown" {
+		t.Errorf("content-type = %q, want text/markdown", rec.contentType)
+	}
+	if !bytes.Equal(rec.body, data) {
+		t.Errorf("uploaded body = %q, want %q", rec.body, data)
+	}
+}
+
+func TestUploadReleaseAsset_Errors(t *testing.T) {
+	// Point UploadBaseURL at a server that rejects with 422 (asset name clash).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = io.WriteString(w, `{"message":"already_exists"}`)
+	}))
+	t.Cleanup(srv.Close)
+	c, _ := newTestClient(t, srv, nil)
+	c.UploadBaseURL = srv.URL
+	err := c.UploadReleaseAsset(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, 555,
+		"release-notes.md", "text/markdown", []byte("x"))
+	if err == nil || !errors.Is(err, ErrValidation) {
+		t.Errorf("err = %v, want ErrValidation", err)
+	}
+
+	cc := &Client{Tokens: &stubTokens{}}
+	if err := cc.UploadReleaseAsset(context.Background(), 1, RepoRef{Owner: "o", Name: "r"}, 555, "", "text/markdown", nil); err == nil ||
+		!strings.Contains(err.Error(), "asset name is required") {
+		t.Errorf("missing name err = %v", err)
+	}
+}

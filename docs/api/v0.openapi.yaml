@@ -5436,6 +5436,76 @@ paths:
         '503':
           description: "`release_notes_unconfigured` / `github_app_not_installed` — as for the preview endpoint."
 
+  /v0/releases/publish:
+    post:
+      operationId: releasePublish
+      summary: Publish persisted release notes to a GitHub Release
+      description: |
+        Given a published GitHub Release (by `tag`) and a persisted
+        `release_notes` artifact (by `artifact_id`), sets the Release body to
+        the persisted notes markdown and attaches the notes as a fixed-name
+        markdown asset (`release-notes.md`) via the App installation token, then
+        records a `release_published` audit entry on the release run's chain
+        (E33.3 / #1588, ADR-051 option B, publish half). A persisting write —
+        requires the `write:runs` scope.
+
+        No App permission change: the Releases REST endpoints are covered by the
+        App's existing `contents:write` grant (ADR-051 accepted-condition 3,
+        confirmed on #1588).
+
+        Idempotency keys on CONTENT HASH for BOTH surfaces (body AND asset): a
+        re-invoke is a full no-op (`published:false, idempotent:true`, no PATCH,
+        no asset upload, no new audit entry) only when the desired notes hash
+        equals the last recorded `release_published` hash AND the live Release
+        body already hashes to the desired notes. When the hash differs it
+        PATCHes the body AND replaces the asset (delete the fixed-name asset,
+        then upload) so the body and asset can never diverge.
+      tags: [audit]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [repo, tag, run_id, artifact_id]
+              additionalProperties: false
+              properties:
+                repo: { type: string, description: "Repository (owner/name)." }
+                tag: { type: string, description: "The published GitHub Release tag." }
+                run_id: { $ref: '#/components/schemas/UUID' }
+                stage_id: { $ref: '#/components/schemas/UUID' }
+                artifact_id: { $ref: '#/components/schemas/UUID' }
+      responses:
+        '200':
+          description: |
+            The Release was published, or a content-hash-equal re-invoke was a
+            no-op (`idempotent: true`).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  release_url: { type: string }
+                  tag: { type: string }
+                  artifact_id: { $ref: '#/components/schemas/UUID' }
+                  content_hash: { type: string }
+                  published: { type: boolean }
+                  idempotent: { type: boolean }
+        '400':
+          description: "`validation_failed` — malformed body, missing `repo`/`tag`/`run_id`/`artifact_id`, or a non-UUID id."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: "`artifact_not_found` — no artifact with that id; `release_not_found` — no published GitHub Release for the tag."
+        '409':
+          description: "`artifact_wrong_kind` — the artifact is not a `release_notes` artifact."
+        '500':
+          description: "`release_publish_failed` — an artifact load/decode fault; `release_publish_audit_failed` — the durable `release_published` audit append failed after the Release was updated."
+        '502':
+          description: "`installation_resolution_failed` / `release_lookup_failed` / `release_publish_failed` — a GitHub round-trip failed."
+        '503':
+          description: "`release_publish_unconfigured` — artifact/audit repo or GitHub client not wired; `github_app_not_installed` — the App is not installed on the target repo."
+
   # ---------------------------------------------------------------------
   # Campaigns (ADR-047 / #1437)
   # ---------------------------------------------------------------------

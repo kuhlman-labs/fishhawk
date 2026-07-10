@@ -1285,6 +1285,22 @@ Notes:
     page-class `anchor_ping_posted` ping for this event (see the page-class ping
     list above). The `campaign_gate_paged` entry itself stays audit-only —
     `campaign_gate_acted` has no comment surface at all.
+- The release-publish audit kind — `release_published` (E33.3 / #1588, ADR-051
+  option B publish half) — is an **internal, system-actor audit kind, NOT an
+  issue-comment surface**. Nothing in `issuecomment` posts it and it has no
+  Notifier method. The publish handler
+  (`server/release_publish.go::handleReleasePublish`) is the SOLE writer: after
+  it sets a published GitHub Release's body to the persisted release-notes
+  markdown and replaces the fixed-name `release-notes.md` asset, it writes ONE
+  entry on the release run's chain (`AppendChained`, `system` actor) with
+  payload `{tag, release_url, artifact_id, content_hash}`. The `content_hash` is
+  also the idempotency key the endpoint reads back
+  (`lastReleasePublishedHash`) to make a re-invoke a content-hash-equal no-op.
+  Unlike the best-effort audit writes above, this append is
+  **durable-before-response**: a failure surfaces as `500
+  release_publish_audit_failed` rather than a false success. Listed here only so
+  a reader grepping the audit categories doesn't mistake it for a comment
+  surface.
 
 ## Routing
 
