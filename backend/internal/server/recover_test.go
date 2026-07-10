@@ -354,6 +354,7 @@ func TestRecoverRun_HappyPath(t *testing.T) {
 		ParentRunID           string                     `json:"parent_run_id"`
 		ParentFailureCategory string                     `json:"parent_failure_category"`
 		AddedPaths            []scopeamendment.PathEntry `json:"added_paths"`
+		InheritedAmendments   []scopeamendment.PathEntry `json:"inherited_amendments"`
 		Source                string                     `json:"source"`
 	}
 	if err := json.Unmarshal(reused[0].Payload, &payload); err != nil {
@@ -368,6 +369,11 @@ func TestRecoverRun_HappyPath(t *testing.T) {
 	}
 	if len(payload.AddedPaths) != 2 || payload.AddedPaths[0].Path != "docs/extra.md" {
 		t.Errorf("payload added_paths = %+v, want the two operator paths", payload.AddedPaths)
+	}
+	// No parent amendments were seeded, so inherited_amendments is empty
+	// (#1770 no-parent-amendments regression).
+	if len(payload.InheritedAmendments) != 0 {
+		t.Errorf("payload inherited_amendments = %+v, want empty (no parent amendments seeded)", payload.InheritedAmendments)
 	}
 }
 
@@ -1484,5 +1490,274 @@ func TestRecoverRun_NonDriveChild_RecordsNoDriveEntry(t *testing.T) {
 	}
 	if advances := reviseDriveAdvances(t, au); len(advances) != 0 {
 		t.Errorf("run_auto_advanced entries = %+v, want none on a non-drive child", advances)
+	}
+}
+
+// --- Inheriting the parent's APPROVED scope amendments (#1770) --------------
+
+// seedDeniedAmendment seeds a DENIED amendment on (runID, stageID) so the
+// inherit path's status filter (approved-only) can be exercised — a denied
+// row must NOT be inherited.
+func seedDeniedAmendment(t *testing.T, sa *fakeScopeAmendmentRepo, runID, stageID uuid.UUID, path string) {
+	t.Helper()
+	a, err := sa.Create(context.Background(), scopeamendment.CreateParams{
+		RunID:   runID,
+		StageID: stageID,
+		Paths:   []scopeamendment.PathEntry{{Path: path, Operation: scopeamendment.OperationModify}},
+		Reason:  "denied seam",
+	})
+	if err != nil {
+		t.Fatalf("create denied amendment: %v", err)
+	}
+	if _, err := sa.Decide(context.Background(), scopeamendment.DecideParams{
+		ID: a.ID, Status: scopeamendment.StatusDenied, Reason: "not needed", DecidedBy: "github:operator",
+	}); err != nil {
+		t.Fatalf("deny amendment: %v", err)
+	}
+}
+
+// decodeInheritedAmendments reads the run's plan_reused_from
+// inherited_amendments from the recorded audit appends.
+func decodeInheritedAmendments(t *testing.T, au *recoverAuditRepo, runID uuid.UUID) []scopeamendment.PathEntry {
+	t.Helper()
+	for i := range au.appended {
+		if au.appended[i].Category != CategoryPlanReusedFrom || au.appended[i].RunID != runID {
+			continue
+		}
+		var payload struct {
+			InheritedAmendments []scopeamendment.PathEntry `json:"inherited_amendments"`
+		}
+		if err := json.Unmarshal(au.appended[i].Payload, &payload); err != nil {
+			t.Fatalf("decode plan_reused_from payload: %v", err)
+		}
+		return payload.InheritedAmendments
+	}
+	t.Fatalf("no plan_reused_from audit entry for run %s", runID)
+	return nil
+}
+
+// TestRecoverRun_InheritsParentApprovedAmendments is the #1770 cross-boundary
+// end-to-end test reproducing the #1741 shape. A recoverable parent's implement
+// stage carries one APPROVED amendment (a coupled test) and one DENIED
+// amendment. After POST /recover the recovery child must inherit ONLY the
+// approved path — as a pre-approved amendment row on its OWN implement stage,
+// on the plan_reused_from provenance, AND folded into the rendered child
+// implement prompt's effective scope.files (crossing HTTP → persistence →
+// prompt). The denied path must be absent everywhere.
+func TestRecoverRun_InheritsParentApprovedAmendments(t *testing.T) {
+	const plannedFile = "backend/internal/server/handlers.go"
+	const approvedInherited = "backend/internal/server/cancel_test.go"
+	const deniedPath = "backend/internal/server/never_inherited.go"
+
+	rr := newRecoverRepo()
+	sa := newFakeScopeAmendmentRepo()
+	art := newFakeArtifactRepo()
+
+	parent, planStage, parentImplement := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+
+	// The parent's approved plan artifact on its plan stage — the source the
+	// child implement prompt walks to via ParentRunID.
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "recoverable plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{{Path: plannedFile, Operation: plan.FileOpModify}},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	// Parent implement stage: one APPROVED amendment (inherited) + one DENIED
+	// (excluded).
+	seedApprovedAmendment(t, sa, parent.ID, parentImplement.ID, approvedInherited)
+	seedDeniedAmendment(t, sa, parent.ID, parentImplement.ID, deniedPath)
+
+	au := &recoverAuditRepo{}
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		ScopeAmendmentRepo: sa,
+		AuditRepo:          au,
+		ArtifactRepo:       art,
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := postRecover(t, s, parent.ID.String(), `{}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("recover status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var created runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode recover response: %v", err)
+	}
+	childStages, err := rr.ListStagesForRun(context.Background(), created.ID)
+	if err != nil || len(childStages) != 1 {
+		t.Fatalf("child stages = %v (err %v), want exactly one", childStages, err)
+	}
+	childImplement := childStages[0]
+
+	// (a) exactly one inherited pre-approved amendment on the child implement
+	// stage, carrying ONLY the approved path.
+	childAmendments, err := sa.ListByRun(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("list child amendments: %v", err)
+	}
+	if len(childAmendments) != 1 {
+		t.Fatalf("child amendments = %d, want 1 (the inherited approved amendment)", len(childAmendments))
+	}
+	ia := childAmendments[0]
+	if ia.StageID != childImplement.ID {
+		t.Errorf("inherited amendment StageID = %s, want child implement %s", ia.StageID, childImplement.ID)
+	}
+	if ia.Status != scopeamendment.StatusApproved {
+		t.Errorf("inherited amendment Status = %q, want approved", ia.Status)
+	}
+	if len(ia.Paths) != 1 || ia.Paths[0].Path != approvedInherited ||
+		ia.Paths[0].Operation != scopeamendment.OperationModify {
+		t.Errorf("inherited amendment Paths = %+v, want only %q (modify)", ia.Paths, approvedInherited)
+	}
+	// (b) the denied path is nowhere on the child.
+	for _, pe := range ia.Paths {
+		if pe.Path == deniedPath {
+			t.Errorf("denied path %q was inherited; it must be excluded", deniedPath)
+		}
+	}
+
+	// (c) plan_reused_from inherited_amendments carries exactly the approved path.
+	inherited := decodeInheritedAmendments(t, au, created.ID)
+	if len(inherited) != 1 || inherited[0].Path != approvedInherited {
+		t.Errorf("provenance inherited_amendments = %+v, want only %q", inherited, approvedInherited)
+	}
+
+	// (d) the inherited path crosses HTTP → persistence → prompt: the child
+	// implement prompt-render places it in scope.files alongside the parent
+	// plan's file.
+	req := httptest.NewRequest(http.MethodGet,
+		"/v0/stages/"+childImplement.ID.String()+"/prompt-render", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("prompt-render status = %d, want 200:\n%s", rec.Code, rec.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode prompt-render: %v", err)
+	}
+	got := make(map[string]bool, len(resp.ScopeFiles))
+	for _, f := range resp.ScopeFiles {
+		got[f.Path] = true
+	}
+	if !got[plannedFile] {
+		t.Errorf("ScopeFiles missing the parent plan's %q; got %#v", plannedFile, resp.ScopeFiles)
+	}
+	if !got[approvedInherited] {
+		t.Errorf("ScopeFiles missing the inherited approved amendment %q (inheritance fold broke); got %#v",
+			approvedInherited, resp.ScopeFiles)
+	}
+	if got[deniedPath] {
+		t.Errorf("ScopeFiles contains the denied path %q; a denied amendment must not be inherited", deniedPath)
+	}
+}
+
+// TestRecoverRun_InheritDedupsAgainstOperatorAddScopeFiles pins the dedup
+// branch (#1770): when the operator's add_scope_files names the SAME path as an
+// inherited approved amendment, exactly one amendment row is minted for that
+// path (the operator row), and the provenance records it under added_paths, not
+// twice.
+func TestRecoverRun_InheritDedupsAgainstOperatorAddScopeFiles(t *testing.T) {
+	const shared = "backend/internal/server/cancel_test.go"
+
+	s, rr, sa, au := newRecoverServer(t)
+	parent, _, parentImplement := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+	seedApprovedAmendment(t, sa, parent.ID, parentImplement.ID, shared)
+
+	w := postRecover(t, s, parent.ID.String(),
+		`{"add_scope_files":[{"path":"`+shared+`"}],"reason":"operator also names the inherited path"}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("recover status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var created runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// Exactly one amendment row for the shared path — the operator row; the
+	// inherit path deduped it out.
+	childAmendments, err := sa.ListByRun(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("list child amendments: %v", err)
+	}
+	rowsForShared := 0
+	for _, a := range childAmendments {
+		for _, pe := range a.Paths {
+			if pe.Path == shared {
+				rowsForShared++
+			}
+		}
+	}
+	if rowsForShared != 1 {
+		t.Errorf("rows naming %q = %d, want exactly 1 (operator row; inherited deduped)", shared, rowsForShared)
+	}
+
+	// The provenance records it under added_paths (operator), NOT
+	// inherited_amendments (deduped out).
+	if inherited := decodeInheritedAmendments(t, au, created.ID); len(inherited) != 0 {
+		t.Errorf("inherited_amendments = %+v, want empty (the shared path was deduped against add_scope_files)", inherited)
+	}
+}
+
+// TestRecoverRun_InheritBestEffortOnParentListError pins the binding approval
+// condition: a parent ListByRun error must NOT fail the recovery mint. Recovery
+// proceeds with no inherited amendments and a warning is logged — a regression
+// that hard-failed recovery on the amendment lookup would surface here.
+func TestRecoverRun_InheritBestEffortOnParentListError(t *testing.T) {
+	s, rr, sa, au := newRecoverServer(t)
+	parent, _, parentImplement := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+	// Seed an approved amendment that WOULD be inherited absent the error, so
+	// the assertion that nothing was inherited is meaningful.
+	seedApprovedAmendment(t, sa, parent.ID, parentImplement.ID, "backend/internal/server/cancel_test.go")
+	// The inheritance step is the first (and only) ScopeAmendmentRepo.ListByRun
+	// call in the new-child recover path, so failing call #1 fails exactly it.
+	sa.failListOn = 1
+
+	var logBuf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, nil))
+
+	w := postRecover(t, s, parent.ID.String(), `{}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("recover status = %d, want 201 (a parent ListByRun error must not fail the recover):\n%s",
+			w.Code, w.Body.String())
+	}
+	var created runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// Recovery proceeded with NO inherited amendments.
+	childAmendments, err := sa.ListByRun(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("list child amendments: %v", err)
+	}
+	if len(childAmendments) != 0 {
+		t.Errorf("child amendments = %d, want 0 (inheritance degraded on the list error)", len(childAmendments))
+	}
+	if inherited := decodeInheritedAmendments(t, au, created.ID); len(inherited) != 0 {
+		t.Errorf("inherited_amendments = %+v, want empty (list error → no inheritance)", inherited)
+	}
+	// The best-effort branch logged a warning rather than failing.
+	if !strings.Contains(logBuf.String(), "recover: list parent scope amendments for inheritance failed") {
+		t.Errorf("expected a best-effort warning log, got:\n%s", logBuf.String())
 	}
 }

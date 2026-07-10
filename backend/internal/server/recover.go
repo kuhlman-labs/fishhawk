@@ -24,8 +24,11 @@ import (
 // CategoryPlanReusedFrom is the audit-log category for the provenance
 // entry the recovery handler appends on the NEW run (E22.X / #978).
 // Payload carries {parent_run_id, parent_failure_category, added_paths,
-// exempted_paths, source, reason}. Internal audit kind — NOT an
-// issue-comment surface.
+// inherited_amendments, exempted_paths, source, reason}.
+// inherited_amendments (#1770) records the parent's APPROVED implement-stage
+// scope amendments re-materialized onto the recovery child so the agent does
+// not re-file and the operator does not re-decide them. Internal audit kind —
+// NOT an issue-comment surface.
 const CategoryPlanReusedFrom = "plan_reused_from"
 
 // recoverRunRequest is the JSON body of POST /v0/runs/{run_id}/recover.
@@ -319,26 +322,53 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 
 	id := IdentityFrom(r.Context())
 
+	// Inherit the parent's APPROVED implement-stage scope amendments
+	// (#1770). Amendments are keyed by (run_id, stage_id) and the fresh
+	// child owns a brand-new implement stage, so without this the child's
+	// implement agent would re-file — and the operator re-decide — the
+	// identical amendment on every recovery attempt. The approval is
+	// plan-scoped, not attempt-scoped, so re-materializing it onto the
+	// child is correct. Denied and pending rows are excluded, and the set
+	// is deduped against the operator's add_scope_files so no path yields a
+	// duplicate row. Best-effort: a parent ListByRun error log-and-continues
+	// (recovery proceeds with no inherited amendments) rather than failing
+	// the recover.
+	inheritedPaths := s.resolveInheritedApprovedAmendments(r.Context(), parent.ID, implementStage.ID, amendPaths)
+
+	// Factor the child implement-stage lookup once — shared by the
+	// operator-amendment fold and the inherited-amendment fold below.
+	var newImplement *run.Stage
+	for _, st := range createdStages {
+		if st.Type == run.StageTypeImplement {
+			newImplement = st
+			break
+		}
+	}
+	if (len(amendPaths) > 0 || len(inheritedPaths) > 0) && newImplement == nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"recovery run has no implement stage to attach the scope amendment to", nil)
+		return
+	}
+
 	// Fold the operator's scope amendment as a pre-approved #961 row
 	// on the new implement stage — exactly what
 	// mergeApprovedScopeAmendments and the runner's pre-commit
 	// refresh already consume; the operation=create entries flow into
 	// the #818/#825 net-new-file gates like any approved amendment.
 	if len(amendPaths) > 0 {
-		var newImplement *run.Stage
-		for _, st := range createdStages {
-			if st.Type == run.StageTypeImplement {
-				newImplement = st
-				break
-			}
-		}
-		if newImplement == nil {
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"recovery run has no implement stage to attach the scope amendment to", nil)
-			return
-		}
 		if err := s.createApprovedScopeAmendment(r.Context(), child.ID, newImplement.ID, amendPaths, req.Reason,
 			"operator-named scope amendment at category-B recovery of run "+parent.ID.String(), id.Subject); err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error", err.Error(), nil)
+			return
+		}
+	}
+
+	// Fold the inherited amendments as ONE pre-approved row on the new
+	// implement stage — same create+auto-approve path as the operator fold,
+	// so no prompt.go or DB/query-layer change is needed.
+	if len(inheritedPaths) > 0 {
+		if err := s.createApprovedScopeAmendment(r.Context(), child.ID, newImplement.ID, inheritedPaths, "",
+			"inherited APPROVED scope amendment from parent run "+parent.ID.String(), id.Subject); err != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error", err.Error(), nil)
 			return
 		}
@@ -348,7 +378,7 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 	// child's ParentRunID and the approved amendment row are the
 	// durable records; a failed append warn-logs rather than
 	// unwinding the created run.
-	s.writePlanReusedFromAudit(r, child.ID, parent.ID.String(), "operator_recovery", amendPaths, exemptPaths, req.Reason, id.Subject)
+	s.writePlanReusedFromAudit(r, child.ID, parent.ID.String(), "operator_recovery", amendPaths, inheritedPaths, exemptPaths, req.Reason, id.Subject)
 
 	s.writeJSON(w, r, http.StatusCreated, toRunResponse(child))
 }
@@ -383,6 +413,51 @@ func (s *Server) createApprovedScopeAmendment(ctx context.Context, runID, stageI
 		return fmt.Errorf("approve scope amendment failed: %w", err)
 	}
 	return nil
+}
+
+// resolveInheritedApprovedAmendments returns the parent implement stage's
+// APPROVED scope-amendment paths (#1770), each keeping the operation the
+// parent declared, so the recovery child inherits them rather than the agent
+// re-filing and the operator re-deciding on every attempt. It mirrors
+// resolveApprovedScopeAmendments' status filter but returns PathEntry
+// (operation-preserving) rather than []string. Pending and denied rows are
+// excluded — a denied amendment is explicitly NOT inherited. The result is
+// deduped against amendPaths (compare by Path) so a path the operator already
+// named in add_scope_files does not also mint a second inherited row, and
+// deduped against itself so repeated parent rows for one path yield one entry.
+// Best-effort, matching resolveApprovedScopeAmendments' posture: a nil
+// ScopeAmendmentRepo yields nil, and a ListByRun error log-and-continues
+// (returns nil) rather than failing the recover.
+func (s *Server) resolveInheritedApprovedAmendments(ctx context.Context, parentRunID, parentImplementStageID uuid.UUID, amendPaths []scopeamendment.PathEntry) []scopeamendment.PathEntry {
+	if s.cfg.ScopeAmendmentRepo == nil {
+		return nil
+	}
+	items, err := s.cfg.ScopeAmendmentRepo.ListByRun(ctx, parentRunID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"recover: list parent scope amendments for inheritance failed",
+			slog.String("parent_run_id", parentRunID.String()),
+			slog.String("error", err.Error()))
+		return nil
+	}
+	seen := make(map[string]struct{}, len(amendPaths))
+	for _, p := range amendPaths {
+		seen[p.Path] = struct{}{}
+	}
+	var out []scopeamendment.PathEntry
+	for _, a := range items {
+		if a.StageID != parentImplementStageID || a.Status != scopeamendment.StatusApproved {
+			continue
+		}
+		for _, p := range a.Paths {
+			if _, dup := seen[p.Path]; dup {
+				continue
+			}
+			seen[p.Path] = struct{}{}
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // handleRecoverDecompositionChild is the recover-handler branch for a
@@ -518,7 +593,7 @@ func (s *Server) handleRecoverDecompositionChild(w http.ResponseWriter, r *http.
 	// the approved amendment row and the re-driven stage are the durable
 	// records.
 	s.writePlanReusedFromAudit(r, child.ID, child.DecomposedFrom.String(),
-		"decomposition_child_recovery", amendPaths, exemptPaths, reason, id.Subject)
+		"decomposition_child_recovery", amendPaths, nil, exemptPaths, reason, id.Subject)
 
 	// Un-terminal-ing the run let Advance act (it no-ops on terminal
 	// runs); walk the re-opened pending implement stage → dispatched.
@@ -623,15 +698,20 @@ func validateExemptScopeFiles(in []scopeExemption) ([]scopeExemption, error) {
 // the recovery run (childID). source distinguishes the new-child mint
 // (operator_recovery) from the in-place decomposition re-drive
 // (decomposition_child_recovery); parentRunID is the run whose approved
-// plan was reused. exemptedPaths records the operator's exempt_scope_files
+// plan was reused. addedPaths records the operator's add_scope_files;
+// inheritedPaths (#1770) records the parent's APPROVED implement-stage
+// amendments re-materialized onto the child (nil on the in-place
+// decomposition branch, which re-uses the same stage id and so inherits
+// nothing). exemptedPaths records the operator's exempt_scope_files
 // (#1229) — the durable record the prompt builder reads back to deliver
 // scope_exemptions to the runner gate.
-func (s *Server) writePlanReusedFromAudit(r *http.Request, childID uuid.UUID, parentRunID, source string, addedPaths []scopeamendment.PathEntry, exemptedPaths []scopeExemption, reason, subject string) {
+func (s *Server) writePlanReusedFromAudit(r *http.Request, childID uuid.UUID, parentRunID, source string, addedPaths, inheritedPaths []scopeamendment.PathEntry, exemptedPaths []scopeExemption, reason, subject string) {
 	actorKind := audit.ActorUser
 	payload, _ := json.Marshal(map[string]any{
 		"parent_run_id":           parentRunID,
 		"parent_failure_category": string(run.FailureB),
 		"added_paths":             addedPaths,
+		"inherited_amendments":    inheritedPaths,
 		"exempted_paths":          exemptedPaths,
 		"source":                  source,
 		"reason":                  reason,
