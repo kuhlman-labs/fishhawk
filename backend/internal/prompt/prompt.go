@@ -214,6 +214,22 @@ type CalibrationHint struct {
 	ConfidenceBands  map[string]CalibrationBand
 }
 
+// SurfaceCouplingPattern is one static surface-sweep lockstep pattern (#763)
+// threaded into the plan-stage prompt so the planner scopes (or justifies) a
+// multi-surface file's coupled siblings at first emission instead of the plan
+// gate burning a full review round on a deterministic, machine-derivable miss
+// (#1797). Name is the pattern's human label; Triggers are the paths whose
+// presence in scope.files fires the pattern; Siblings are the paths that must
+// also be scoped (or justified). The prompt package cannot import server
+// (server imports prompt), so the data is threaded IN via the Trigger from the
+// server's surfaceCouplingPatternsForPrompt accessor over the single-source
+// surfacePatterns registry — prompt stays a pure renderer of injected data.
+type SurfaceCouplingPattern struct {
+	Name     string
+	Triggers []string
+	Siblings []string
+}
+
 // PredictionContext carries the runtime prediction context for the
 // implement-stage prompt's Budget context section. Populated by the
 // server-side prompt handler from the approved plan's
@@ -347,6 +363,16 @@ type Trigger struct {
 	// threshold of implement-stage executions have been recorded (mirrors
 	// the DecomposeRequired pattern for plan-stage hint injection).
 	CalibrationHint *CalibrationHint
+	// SurfaceCouplingPatterns is the static surface-sweep sibling map (#763)
+	// rendered into the plan-stage prompt's Coupling-discovery checklist so the
+	// planner scopes (or justifies) lockstep siblings at first emission instead
+	// of the plan gate recurring as a deterministic dual-reject on a
+	// machine-derivable miss (#1797) — the same knowledge the plan-gate sweep
+	// already uses (evaluateSurfaceSweep over surfacePatterns), now made visible
+	// to the planner. Threaded IN from the server because the prompt package
+	// cannot import server; populated ONLY on the plan-stage build, so buildPlan
+	// guards on len>0 and every non-plan build renders byte-unchanged.
+	SurfaceCouplingPatterns []SurfaceCouplingPattern
 	// PriorRejectionFeedback is the operator's rationale from the most
 	// recent rejection of a plan for the same trigger_ref. When non-nil
 	// and non-empty, buildPlan injects a binding "you MUST address this"
@@ -2034,6 +2060,14 @@ func buildPlan(t Trigger) string {
 	b.WriteString("- the callers' tests when you change a function signature or an exported struct — the call sites compile-break and their tests must update with them.\n")
 	b.WriteString("- when you edit a canonical docs/spec/*.schema.json, EVERY embedded mirror copy of it — backend internal/*/schemas, runner/internal/plan/schemas, AND cli/internal/spec/schemas (the cli copy is routinely omitted) — and run scripts/sync-schemas; CI's schema-sync gate red-lines if any mirror drifts.\n")
 	b.WriteString("- when you add a backend/internal/postgres/migrations/*.sql, also scope backend/internal/postgres/postgres_test.go — TestMigrateDown_RemovesTables pins the LATEST migration and must be updated in the same commit.\n")
+	if len(t.SurfaceCouplingPatterns) > 0 {
+		b.WriteString("\n")
+		b.WriteString("Surface-coupling sibling map (#763/#1797): the plan gate runs a deterministic surface sweep that flags a plan scoping one member of a known multi-surface lockstep pattern without its coupled siblings. These are machine-derivable, so pre-empt the reject round — when you scope ANY trigger path in a pattern below, also scope EVERY listed sibling path in the SAME plan, or justify in the plan why a listed sibling correctly needs no change:\n")
+		for _, p := range t.SurfaceCouplingPatterns {
+			fmt.Fprintf(&b, "- %s: scoping any of [%s] requires also scoping [%s];\n",
+				p.Name, strings.Join(p.Triggers, ", "), strings.Join(p.Siblings, ", "))
+		}
+	}
 	b.WriteString("\n")
 	b.WriteString("Compound-field shape rule: the following fields must be the structured shape shown in the schema — never a bare string or prose summary:\n")
 	b.WriteString("- approach: array of {\"step\": N, \"description\": \"...\"} objects\n")

@@ -949,6 +949,14 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		} else {
 			trigger.CalibrationHint = hint
 		}
+		// Surface-coupling sibling map (#763/#1797): thread the static
+		// surface-sweep registry into the plan prompt's Coupling-discovery
+		// checklist so the planner scopes (or justifies) lockstep siblings at
+		// first emission instead of the plan gate burning a review round on a
+		// deterministic miss. surfacePatterns is the single source of truth; the
+		// accessor is a pure projection. Set on BOTH prompt handlers so the
+		// signed prompt and the render preview stay byte-identical.
+		trigger.SurfaceCouplingPatterns = surfaceCouplingPatternsForPrompt()
 		if runRow.TriggerRef != nil {
 			trigger.PriorRejectionFeedback = s.loadPriorRejectionFeedback(r.Context(), runRow.Repo, *runRow.TriggerRef, runRow.ID)
 		}
@@ -1302,6 +1310,14 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		} else {
 			trigger.CalibrationHint = hint
 		}
+		// Surface-coupling sibling map (#763/#1797): thread the static
+		// surface-sweep registry into the plan prompt's Coupling-discovery
+		// checklist so the planner scopes (or justifies) lockstep siblings at
+		// first emission instead of the plan gate burning a review round on a
+		// deterministic miss. surfacePatterns is the single source of truth; the
+		// accessor is a pure projection. Set on BOTH prompt handlers so the
+		// signed prompt and the render preview stay byte-identical.
+		trigger.SurfaceCouplingPatterns = surfaceCouplingPatternsForPrompt()
 		if runRow.TriggerRef != nil {
 			trigger.PriorRejectionFeedback = s.loadPriorRejectionFeedback(r.Context(), runRow.Repo, *runRow.TriggerRef, runRow.ID)
 		}

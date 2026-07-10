@@ -12,6 +12,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
 
 // categoryPlanSurfaceSweep is the audit-log category for the entry
@@ -226,6 +227,26 @@ var surfacePatterns = []surfacePattern{
 			"backend/internal/workmgmt/schemas/work-management-v0.schema.json",
 		},
 	},
+}
+
+// surfaceCouplingPatternsForPrompt maps the static surfacePatterns registry
+// into the prompt-package wire type so the plan-stage prompt handler can thread
+// the sibling map into the plan prompt (#763/#1797). The registry stays the
+// SINGLE SOURCE OF TRUTH — this accessor is a pure structural projection with
+// no second copy of the coupling knowledge, so a registry edit propagates to
+// the prompt with no drift. Called only from the StageTypePlan block of the two
+// prompt handlers (handleGetStagePrompt / handleGetStagePromptRender) so the
+// signed prompt and the render preview stay byte-identical.
+func surfaceCouplingPatternsForPrompt() []prompt.SurfaceCouplingPattern {
+	out := make([]prompt.SurfaceCouplingPattern, 0, len(surfacePatterns))
+	for _, p := range surfacePatterns {
+		out = append(out, prompt.SurfaceCouplingPattern{
+			Name:     p.Name,
+			Triggers: append([]string(nil), p.Triggers...),
+			Siblings: append([]string(nil), p.Siblings...),
+		})
+	}
+	return out
 }
 
 // evaluateSurfaceSweep is the pure matcher: for each pattern, if any
