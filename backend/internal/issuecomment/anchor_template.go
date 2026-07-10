@@ -111,7 +111,7 @@ func RenderAnchorBody(in AnchorInput) string {
 		header:          renderAnchorHeader(in.Run, externalURL),
 		whatNow:         renderWhatNow(in.Run, in.Stages),
 		stages:          renderAnchorStages(in.Stages),
-		timeline:        renderAnchorTimeline(in.Audit, in.Now),
+		timeline:        renderAnchorTimeline(in.Audit),
 		reviews:         renderAnchorReviews(in.Stages, in.Audit),
 		currentPlan:     renderCurrentPlan(in.CurrentPlan),
 		modelResolved:   renderResolvedModel(in.Audit),
@@ -230,8 +230,12 @@ func renderAnchorStages(stages []*run.Stage) string {
 // renderAnchorTimeline projects the run's interesting audit rows as a
 // collapsed event timeline (most-recent first). Reuses pickActivity's
 // closed category set + renderActivityLine so the verb phrasing matches
-// the rest of the surface. Empty when no interesting rows exist.
-func renderAnchorTimeline(entries []*audit.Entry, now time.Time) string {
+// the rest of the surface, but with the anchor's no-@-mention actor
+// renderers (#1788) and an absolute UTC timestamp per row (which freezes
+// correctly once the run settles, unlike a relative "5m ago"). Needs no
+// reference clock — the stamp is derived from each row's own timestamp.
+// Empty when no interesting rows exist.
+func renderAnchorTimeline(entries []*audit.Entry) string {
 	activity := pickActivity(entries, anchorTimelineLimit)
 	if len(activity) == 0 {
 		return ""
@@ -240,13 +244,58 @@ func renderAnchorTimeline(entries []*audit.Entry, now time.Time) string {
 	b.WriteString("<details><summary>Timeline</summary>\n\n")
 	for _, e := range activity {
 		if e.Category == "approval_submitted" {
-			b.WriteString(renderGateDecisionTimelineEntry(e, entries, now))
+			b.WriteString(renderGateDecisionTimelineEntry(e, entries))
 			continue
 		}
-		fmt.Fprintf(&b, "- %s · %s\n", renderActivityLine(e), relativeAge(e.Timestamp, now))
+		fmt.Fprintf(&b, "- %s · %s\n", renderActivityLine(e, anchorActorRenderers), anchorTimestamp(e.Timestamp))
 	}
 	b.WriteString("\n</details>")
 	return b.String()
+}
+
+// anchorTimestamp renders an absolute UTC timestamp for an anchor timeline
+// row, e.g. `2026-07-09 23:36Z`. Absolute rather than relative ("5m ago") so
+// the timeline reads correctly forever — a relative age freezes at whatever
+// the last render computed once the run settles and the anchor stops being
+// rebuilt. Minute precision keeps the row compact.
+func anchorTimestamp(ts time.Time) string {
+	return ts.UTC().Format("2006-01-02 15:04Z")
+}
+
+// anchorActorRenderers is the living anchor's no-@-mention actor rendering
+// (#751/#755/#1788): every actor renders as a backtick code span rather than
+// an @-mention, so a system/app actor (merge-reconciler, an app login) can
+// never ping an unrelated GitHub user from the shared timeline projection.
+var anchorActorRenderers = actorRenderers{actor: anchorActorMention, approver: anchorApproverMention}
+
+// anchorActorMention renders a bare audit actor for the anchor timeline as a
+// backtick code span for a syntactically-valid GitHub login, and "" for any
+// non-login subject (the system/sentinel actors) — mirroring actorMention's
+// status-side "" contract, but never emitting an @-mention (#1788).
+func anchorActorMention(actor *string) string {
+	if actor == nil || !validApproverLogin(*actor) {
+		return ""
+	}
+	return "`" + *actor + "`"
+}
+
+// anchorApproverMention renders an approval_submitted row's approver for the
+// anchor WITHOUT an @-mention: it prefers the resolved GitHub login the MCP
+// loop threads through (#751), then the acting subject, rendering a valid
+// login as a backtick code span and every non-login subject through
+// renderApproverIdentity's no-@ forms (operator-agent identity / verbatim code
+// span / "an approver"). Mirrors approverMention's preference order but never
+// pings a real user (#755/#1788).
+func anchorApproverMention(e *audit.Entry) string {
+	id := decodeApproverIdentity(e.Payload)
+	if validApproverLogin(id.githubLogin) {
+		return "`" + id.githubLogin + "`"
+	}
+	subject := id.approver
+	if subject == "" && e.ActorSubject != nil {
+		subject = *e.ActorSubject
+	}
+	return renderApproverIdentity(subject, id.delegated, false)
 }
 
 // renderGateDecisionTimelineEntry projects an `approval_submitted` row as
@@ -259,7 +308,7 @@ func renderAnchorTimeline(entries []*audit.Entry, now time.Time) string {
 // <details>. The relative-age suffix stays on the parent bullet so the
 // timeline reads uniformly. `entries` is the full chain (needed to bound
 // the advisory-reject count to the arbitrated round).
-func renderGateDecisionTimelineEntry(e *audit.Entry, entries []*audit.Entry, now time.Time) string {
+func renderGateDecisionTimelineEntry(e *audit.Entry, entries []*audit.Entry) string {
 	decision := approvalDecisionOf(e.Payload)
 	comment := decodeApprovalComment(e.Payload)
 
@@ -277,7 +326,7 @@ func renderGateDecisionTimelineEntry(e *audit.Entry, entries []*audit.Entry, now
 		phrase = "acted on the plan"
 	}
 
-	line := fmt.Sprintf("%s %s", approverMention(e), phrase)
+	line := fmt.Sprintf("%s %s", anchorApproverMention(e), phrase)
 	// The "over N advisory reject(s)" marker is an OVERRIDE signal: it
 	// only makes sense on an approve that proceeded despite reviewer
 	// rejects in the same round. A reject decision aligning with reviewer
@@ -289,7 +338,7 @@ func renderGateDecisionTimelineEntry(e *audit.Entry, entries []*audit.Entry, now
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "- %s · %s\n", line, relativeAge(e.Timestamp, now))
+	fmt.Fprintf(&b, "- %s · %s\n", line, anchorTimestamp(e.Timestamp))
 	if decision == "approve" && comment != "" {
 		// Block-level <details> nested under the bullet — GitHub Flavored
 		// Markdown renders it inside the list item, matching how the anchor
@@ -352,22 +401,22 @@ func renderStageReviews(stageType string, entries []*audit.Entry) string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "**%s review** — %s\n", capitalize(stageType), strings.Join(summaries, " · "))
-	// Every current-round reviewer gets its own per-reviewer <details> so a
-	// two-reviewer round can never read as one (#1073). When a verdict
-	// carries no concerns and no free_form, the body is "(no additional
-	// notes)" — keeping the block non-empty and the expandable-block count
-	// equal to the reviewer count.
+	// A reviewer with concerns or free_form gets its own per-reviewer
+	// <details> so a two-reviewer round can never read as one (#1073). A
+	// verdict with NEITHER has nothing to expand, so it emits no block at all
+	// rather than a content-free "(no additional notes)" one (#1788) — the
+	// inline summary line above already lists every reviewer, preserving the
+	// per-reviewer legibility #1073 was about.
 	for _, v := range verdicts {
-		fmt.Fprintf(&b, "<details><summary>%s</summary>\n\n", v.summaryToken())
 		if v.freeForm == "" && len(v.concerns) == 0 {
-			b.WriteString("(no additional notes)\n")
-		} else {
-			for _, c := range v.concerns {
-				fmt.Fprintf(&b, "- **%s** (%s): %s\n", c.severity, c.category, c.note)
-			}
-			if v.freeForm != "" {
-				fmt.Fprintf(&b, "\n%s\n", v.freeForm)
-			}
+			continue
+		}
+		fmt.Fprintf(&b, "<details><summary>%s</summary>\n\n", v.summaryToken())
+		for _, c := range v.concerns {
+			fmt.Fprintf(&b, "- **%s** (%s): %s\n", c.severity, c.category, c.note)
+		}
+		if v.freeForm != "" {
+			fmt.Fprintf(&b, "\n%s\n", v.freeForm)
 		}
 		b.WriteString("\n</details>\n")
 	}
@@ -395,7 +444,7 @@ func renderCurrentPlan(p *AnchorPlanView) string {
 		// (#1013), visible alongside the summary so the operator sees the
 		// suggestion the gate will ratify or override.
 		if p.RecommendationRationale != "" {
-			fmt.Fprintf(&b, "\n_Model recommendation: `%s` — %s_\n", p.RecommendedModel, oneLine(p.RecommendationRationale))
+			fmt.Fprintf(&b, "\n_Model recommendation: `%s` — %s_\n", p.RecommendedModel, oneLineWords(p.RecommendationRationale, 200))
 		} else {
 			fmt.Fprintf(&b, "\n_Model recommendation: `%s`_\n", p.RecommendedModel)
 		}
@@ -744,6 +793,35 @@ func oneLine(s string) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	s = strings.TrimSpace(strings.Join(strings.Fields(s), " "))
 	return truncate(s, 200)
+}
+
+// oneLineWords is the word-boundary sibling of oneLine: it collapses
+// whitespace to single spaces, then truncates at a word boundary via
+// truncateWords rather than mid-word. Used for the plan model-recommendation
+// rationale (#1788) so a long rationale reads cleanly.
+func oneLineWords(s string, max int) string {
+	s = strings.TrimSpace(strings.Join(strings.Fields(s), " "))
+	return truncateWords(s, max)
+}
+
+// truncateWords truncates s to at most max bytes, cutting at the last space at
+// or before the cap so the break lands on a word boundary rather than
+// mid-word; with no space in range it backs off to a UTF-8 rune boundary. A
+// real "…" ellipsis (not the ASCII "...") is appended when truncation happens.
+// Returns s unchanged when it already fits.
+func truncateWords(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	if sp := strings.LastIndexByte(s[:cut], ' '); sp > 0 {
+		cut = sp
+	} else {
+		for cut > 0 && (s[cut]&0xC0) == 0x80 {
+			cut--
+		}
+	}
+	return strings.TrimRight(s[:cut], " ") + "…"
 }
 
 func capitalize(s string) string {

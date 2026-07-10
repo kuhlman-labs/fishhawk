@@ -350,9 +350,9 @@ func renderPlanStatusFooter(s *planStatus) string {
 	// a human MCP approval renders `@<login>` with no delegated clause.
 	// Otherwise renderApproverIdentity picks the three-form identity
 	// rendering for the acting subject (#1053).
-	actor := renderApproverIdentity(s.approver, s.delegated)
+	actor := renderApproverIdentity(s.approver, s.delegated, true)
 	if validApproverLogin(s.githubLogin) {
-		actor = renderApproverIdentity(s.githubLogin, "")
+		actor = renderApproverIdentity(s.githubLogin, "", true)
 	}
 	switch s.decision {
 	case approval.DecisionApprove:
@@ -366,8 +366,13 @@ func renderPlanStatusFooter(s *planStatus) string {
 // renderApproverIdentity picks the human-facing form of an approval
 // audit row's subject (#1053). Three forms, in preference order:
 //
-//  1. A syntactically-valid GitHub login → `@<login>` (the #751
-//     mention path, unchanged).
+//  1. A syntactically-valid GitHub login → `@<login>` in mention mode
+//     (the #751 status-comment mention path), or a backtick-wrapped code
+//     span (no @) in no-mention mode (the living anchor, which must never
+//     @-mention an actor so a system/app actor can never ping an unrelated
+//     GitHub user — #751/#755). Forms 2 and 3 below carry NO `@` in either
+//     mode, so the coupled anchor render (#1788) stays @-free by delegating
+//     its non-login cases straight to this helper.
 //  2. An operator-agent token subject (operatorrole.IsTokenSubject,
 //     ADR-040 / #1027) → "the operator agent (`<subject>`, delegated:
 //     `<rule>`)", naming the delegation rule when the audit payload
@@ -387,9 +392,12 @@ func renderPlanStatusFooter(s *planStatus) string {
 // literal "anonymous" placeholder (matches the convention the retired
 // renderPlanApprovedBody used so the issue thread never leaks
 // `@anonymous`).
-func renderApproverIdentity(subject, delegatedRule string) string {
+func renderApproverIdentity(subject, delegatedRule string, mention bool) string {
 	if validApproverLogin(subject) {
-		return "@" + subject
+		if mention {
+			return "@" + subject
+		}
+		return "`" + subject + "`"
 	}
 	if operatorrole.IsTokenSubject(subject) {
 		if rule := sanitizeSubjectForCodeSpan(delegatedRule); rule != "" {

@@ -1306,6 +1306,33 @@ func TestNotifyRunRejected_SkipsBadParams(t *testing.T) {
 	}
 }
 
+// TestPlanStatusFooter_MentionModePreserved is the behavior-preserving gate for
+// the renderApproverIdentity mention-mode split (#1788): the status-comment
+// surface (mention=true) still @-mentions a resolved GitHub login and still
+// never @-mentions a raw token subject (#751/#755). The anchor's no-@ variant
+// (mention=false) is covered in anchor_template_test.go.
+func TestPlanStatusFooter_MentionModePreserved(t *testing.T) {
+	loginPayload, _ := json.Marshal(map[string]any{
+		"decision":              "approve",
+		"approver_github_login": "alice",
+	})
+	if got := issuecomment.PlanStatusFooterForAuditPayload(loginPayload); !strings.Contains(got, "@alice") {
+		t.Errorf("status footer should still @-mention a resolved login; got %q", got)
+	}
+
+	tokenPayload, _ := json.Marshal(map[string]any{
+		"decision": "approve",
+		"approver": "brett@local-mcp",
+	})
+	got := issuecomment.PlanStatusFooterForAuditPayload(tokenPayload)
+	if strings.HasPrefix(strings.TrimPrefix(got, "_Status: approved by "), "@") {
+		t.Errorf("status footer must not @-mention a token subject (#755); got %q", got)
+	}
+	if !strings.Contains(got, "`brett@local-mcp`") {
+		t.Errorf("token subject should render as a code span; got %q", got)
+	}
+}
+
 // --- helpers ---
 
 func int64Ptr(v int64) *int64 { return &v }

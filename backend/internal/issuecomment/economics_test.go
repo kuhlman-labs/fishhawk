@@ -52,7 +52,7 @@ func TestRenderEconomicsBlock_FullContent(t *testing.T) {
 		"  - plan approval: 45m",
 		"  - implement review → dispatch: 30m",
 		"  - checks green → merge: 15m",
-		"- **Cache net savings**: $0.12",
+		"- **Cache net savings**: $0.12 (vs uncached replay)",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("rendered block missing %q:\n%s", want, got)
