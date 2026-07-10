@@ -1023,9 +1023,12 @@ type PullRequestRef struct {
 // Each PR object carries merged_at (null until merged); this filters to
 // the merged ones so an open PR that also touches the commit is
 // excluded. Returns a typed error (ErrNotFound / ErrValidation /
-// ErrForbidden) on non-2xx so callers can fail open on a transient
-// GitHub failure. Mirrors CompareCommits' TokenProvider guard, endpoint
-// building, and classifyStatus error mapping.
+// ErrForbidden) on non-2xx so callers can classify the failure and
+// decide their own policy — the sole production caller
+// (GitHubResolver.MergedPRsInRange) propagates it and fails the
+// release-evidence assembly closed. Mirrors CompareCommits'
+// TokenProvider guard, endpoint building, and classifyStatus error
+// mapping.
 //
 // No pagination: the number of PRs associated with a single commit is
 // tiny (in practice one — the PR the commit landed), far below the

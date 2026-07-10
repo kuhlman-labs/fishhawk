@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -411,6 +412,42 @@ func TestAssemble_MultiRunRecoveryChild(t *testing.T) {
 	}
 }
 
+// TestAssemble_MultiAcceptanceLastWins seeds MULTIPLE
+// acceptance_outcome_recorded entries for one run (a failed acceptance
+// followed by a passing re-run) and asserts the LAST-appended outcome
+// wins — exercising acceptanceOutcome()'s "entries are
+// sequence-ascending, so the last decoded wins" assumption. A single
+// entry would not distinguish last-wins from first-wins.
+func TestAssemble_MultiAcceptanceLastWins(t *testing.T) {
+	h := newHarness(t)
+	prURL := "https://github.com/kuhlman-labs/fishhawk/pull/500"
+	r := h.createRun(prURL, nil)
+	impl := h.addStage(r.ID, 1, run.StageTypeImplement)
+	h.addReviewerVerdict(r.ID, impl.ID, "claude-opus-4-8", "approve")
+	acc := h.addStage(r.ID, 2, run.StageTypeAcceptance)
+	// Two acceptance outcomes on the same run, appended in order: the
+	// earlier failure, then the passing re-run. Last-appended must win.
+	h.addAcceptance(r.ID, acc.ID, "failed", "criteria_unmet")
+	h.addAcceptance(r.ID, acc.ID, "passed", "")
+	h.transitionRun(r.ID, run.StateSucceeded)
+
+	a := h.assembler(releaseevidence.MergedPR{URL: prURL, Number: 500, Title: "retried acceptance"})
+	ev, err := a.Assemble(h.ctx, "kuhlman-labs/fishhawk", "v0.1.0", "HEAD")
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	if len(ev.Changes) != 1 {
+		t.Fatalf("len(Changes) = %d, want 1", len(ev.Changes))
+	}
+	ce := ev.Changes[0]
+	if ce.AcceptanceOutcome == nil {
+		t.Fatalf("AcceptanceOutcome = nil, want the last-appended outcome")
+	}
+	if ce.AcceptanceOutcome.Verdict != "passed" || ce.AcceptanceOutcome.FailureMode != "" {
+		t.Errorf("AcceptanceOutcome = %+v, want the LAST entry (passed, no failure_mode)", ce.AcceptanceOutcome)
+	}
+}
+
 // TestAssemble_ResolverError propagates a resolver failure (defensive
 // branch: a GitHub walk failure is an error, not a silent empty release).
 func TestAssemble_ResolverError(t *testing.T) {
@@ -431,15 +468,25 @@ func TestAssemble_ResolverError(t *testing.T) {
 // the compare range both map to the same PR number, so the resolver
 // yields ONE MergedPR.
 func TestGitHubResolver_DedupByPRNumber(t *testing.T) {
+	var mu sync.Mutex
+	queried := map[string]int{}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /repos/{owner}/{repo}/compare/{basehead...}",
 		func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{"commits":[{"sha":"s1"},{"sha":"s2"}]}`)
 		})
-	// Both landing commits of the squash-merged PR report PR #42.
+	// Both landing commits of the squash-merged PR report PR #42, so the
+	// resolver must fan in across BOTH SHAs and de-dup by number. Recording
+	// each queried SHA proves the fan-in: an implementation that queried
+	// only the first commit would leave s2 unqueried and fail below, even
+	// though it too would return a single PR.
 	mux.HandleFunc("GET /repos/{owner}/{repo}/commits/{sha}/pulls",
-		func(w http.ResponseWriter, _ *http.Request) {
+		func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			queried[r.PathValue("sha")]++
+			mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `[{"number":42,"html_url":"https://github.com/x/y/pull/42","title":"squashed","merged_at":"2026-07-01T00:00:00Z"}]`)
 		})
@@ -457,6 +504,11 @@ func TestGitHubResolver_DedupByPRNumber(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MergedPRsInRange: %v", err)
 	}
+	// Fan-in: BOTH landing commits were queried, not just the first.
+	if queried["s1"] == 0 || queried["s2"] == 0 {
+		t.Errorf("expected both SHAs queried (fan-in), got %v", queried)
+	}
+	// De-dup: the shared PR #42 across both SHAs yields a single MergedPR.
 	if len(prs) != 1 {
 		t.Fatalf("len(prs) = %d, want 1 (de-duped by PR number) — got %+v", len(prs), prs)
 	}
