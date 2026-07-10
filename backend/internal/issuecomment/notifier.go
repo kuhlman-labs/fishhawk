@@ -31,6 +31,8 @@ package issuecomment
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -77,6 +79,16 @@ const CategoryIssueCommented = "issue_commented"
 // notifier falls back to creating a new one).
 const CategoryStatusCommentPosted = "status_comment_posted"
 
+// CategoryPRStatusCommentPosted records that Fishhawk created or edited the
+// run's sticky PR status comment (E42.1 / #1784) — the PR-locus sibling of the
+// living issue anchor. A SEPARATE category from CategoryStatusCommentPosted so
+// the two comments never collide on comment-id lookup: the anchor lookup wants
+// "the latest issue-comment id for this run", this one wants "the latest
+// PR-comment id + body hash for this run". Each successful post/edit appends a
+// fresh row carrying the canonical `github_comment_id` and a `body_hash` used
+// for the identical-body edit skip.
+const CategoryPRStatusCommentPosted = "pr_status_comment_posted"
+
 // Kind enumerates which moment a comment recorded. Stored in the
 // audit entry's payload so a single category covers both moments
 // while staying queryable per kind.
@@ -118,6 +130,11 @@ const (
 	// each per calendar period while a re-evaluation in the same period
 	// (or a redelivered upload) is absorbed.
 	KindBudgetAlert Kind = "budget_alert"
+	// KindPRStatusUpdate tags the sticky PR-status-comment audit row (E42.1 /
+	// #1784). Lives on CategoryPRStatusCommentPosted, not
+	// CategoryStatusCommentPosted. The payload carries github_comment_id (the
+	// comment to edit next time) plus body_hash (the identical-body edit skip).
+	KindPRStatusUpdate Kind = "pr_status_update"
 )
 
 // IssueCommenter is the slice of githubclient.Client this package
@@ -820,6 +837,12 @@ func (n *Notifier) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID
 	if err := n.NotifyStatusUpdate(ctx, runID, body); err != nil {
 		return err
 	}
+	// PR-locus sibling of the anchor (E42.1 / #1784): fold a best-effort PR
+	// status comment into the same fan-out AFTER the anchor edit lands, so
+	// every existing rebuild hook maintains it with no new call site. Fail-open
+	// — the error is swallowed so a PR-comment failure never unwinds the
+	// transition or blocks the page-class pings below.
+	_ = n.maybeUpdatePRStatusComment(ctx, runRow, stages, entries)
 	// Page-class pings ride on the same audit chain we just projected;
 	// fire them after the anchor edit lands. Resolve the comment context
 	// fresh (NotifyStatusUpdate validated it but doesn't return it).
@@ -1154,6 +1177,243 @@ func extractGithubCommentID(payload []byte) int64 {
 		return 0
 	}
 	return p.GithubCommentID
+}
+
+// maybeUpdatePRStatusComment posts or edits the run's sticky PR status comment
+// (E42.1 / #1784). Folded into NotifyStatusUpdateForRun so every rebuild hook
+// maintains it. Best-effort / fail-open throughout: EVERY skip and EVERY
+// GitHub / artifact-load / audit error returns nil so the PR comment never
+// unwinds a transition. Maintained ONLY for runs that own the PR (non-empty
+// pull_request_url + installation id), matching stampEconomicsIntoPRBody's
+// owns-PR guard. An identical rendered body skips the GitHub edit (dedup via
+// the body hash stored in the last pr_status_comment_posted row).
+func (n *Notifier) maybeUpdatePRStatusComment(ctx context.Context, runRow *run.Run, stages []*run.Stage, entries []*audit.Entry) error {
+	// Owns-PR guard — identical to stampEconomicsIntoPRBody.
+	if runRow.InstallationID == nil || runRow.PullRequestURL == nil || *runRow.PullRequestURL == "" {
+		return nil
+	}
+	prNumber := parsePRNumberFromURL(runRow.PullRequestURL)
+	if prNumber <= 0 {
+		return nil
+	}
+	repo, err := parseRepo(runRow.Repo)
+	if err != nil {
+		return nil
+	}
+
+	body := RenderPRStatusBody(PRStatusInput{
+		Run:                runRow,
+		Stages:             stages,
+		Audit:              entries,
+		AcceptanceArtifact: n.loadAcceptanceArtifact(ctx, stages, entries),
+		ExternalURL:        n.externalURL,
+		Now:                n.now(),
+	})
+	if body == "" {
+		return nil
+	}
+	newHash := hashPRStatusBody(body)
+
+	existingID, lastHash, err := n.findPRStatusComment(ctx, runRow.ID)
+	if err != nil {
+		// Fail-open: a bookkeeping read failure must not unwind the transition.
+		return nil
+	}
+	if existingID > 0 && lastHash == newHash {
+		// Identical body — skip the GitHub edit (mirrors the
+		// stampEconomicsIntoPRBody no-op-on-redelivery posture) and avoid a
+		// second GitHub read.
+		return nil
+	}
+
+	var commentID int64
+	switch {
+	case existingID > 0:
+		got, updErr := n.github.UpdateIssueComment(ctx, *runRow.InstallationID, repo, existingID, body)
+		switch {
+		case updErr == nil:
+			commentID = got.ID
+		case errors.Is(updErr, githubclient.ErrNotFound):
+			// Operator deleted the comment between updates — recreate it.
+			created, cerr := n.github.CreateIssueComment(ctx, *runRow.InstallationID, repo, prNumber, body)
+			if cerr != nil {
+				return nil
+			}
+			commentID = created.ID
+		default:
+			return nil
+		}
+	default:
+		created, cerr := n.github.CreateIssueComment(ctx, *runRow.InstallationID, repo, prNumber, body)
+		if cerr != nil {
+			return nil
+		}
+		commentID = created.ID
+	}
+	return n.appendPRStatusAudit(ctx, runRow, repo, prNumber, commentID, newHash)
+}
+
+// loadAcceptanceArtifact loads the KindAcceptance artifact body for the run's
+// acceptance stage so the PR comment can render the per-criterion table (which
+// the acceptance_outcome_recorded audit payload does NOT carry). Returns nil
+// when no artifact lister is wired, no acceptance outcome has been recorded, or
+// the matching artifact is unretrievable — the render then degrades to the
+// tally line. Best-effort: any error is swallowed to nil.
+func (n *Notifier) loadAcceptanceArtifact(ctx context.Context, stages []*run.Stage, entries []*audit.Entry) []byte {
+	if n.artifacts == nil {
+		return nil
+	}
+	var latest *audit.Entry
+	for _, e := range entries {
+		if e.Category == "acceptance_outcome_recorded" && (latest == nil || e.Sequence > latest.Sequence) {
+			latest = e
+		}
+	}
+	if latest == nil {
+		return nil
+	}
+	stageIDStr, contentHash := decodeAcceptanceArtifactRef(latest.Payload)
+
+	acceptanceStageID := uuid.Nil
+	if stageIDStr != "" {
+		if id, perr := uuid.Parse(stageIDStr); perr == nil {
+			acceptanceStageID = id
+		}
+	}
+	if acceptanceStageID == uuid.Nil {
+		for _, s := range stages {
+			if s.Type == run.StageTypeAcceptance {
+				acceptanceStageID = s.ID
+				break
+			}
+		}
+	}
+	if acceptanceStageID == uuid.Nil {
+		return nil
+	}
+	arts, err := n.artifacts.ListForStage(ctx, acceptanceStageID)
+	if err != nil {
+		return nil
+	}
+	for _, a := range arts {
+		if a.Kind != artifact.KindAcceptance {
+			continue
+		}
+		// Prefer the artifact the recorded outcome referenced; a content-hash
+		// mismatch means a newer record superseded this artifact.
+		if contentHash != "" && a.ContentHash != contentHash {
+			continue
+		}
+		return a.Content
+	}
+	return nil
+}
+
+// decodeAcceptanceArtifactRef reads stage_id + content_hash out of an
+// acceptance_outcome_recorded payload (server/acceptance.go buildOutcomePayload).
+// Empty strings on any decode failure.
+func decodeAcceptanceArtifactRef(payload []byte) (stageID, contentHash string) {
+	if len(payload) == 0 {
+		return "", ""
+	}
+	var p struct {
+		StageID     string `json:"stage_id"`
+		ContentHash string `json:"content_hash"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return "", ""
+	}
+	return p.StageID, p.ContentHash
+}
+
+// findPRStatusComment returns the most-recent PR status comment id AND the body
+// hash the audit log records for this run, or (0, "") when none exists. Errors
+// propagate; corrupt payloads are treated as "no id" so the notifier falls back
+// to creating a fresh comment.
+func (n *Notifier) findPRStatusComment(ctx context.Context, runID uuid.UUID) (int64, string, error) {
+	entries, err := n.audit.ListForRunByCategory(ctx, runID, CategoryPRStatusCommentPosted)
+	if err != nil {
+		return 0, "", err
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		if id, hash := extractPRStatusCommentID(entries[i].Payload); id > 0 {
+			return id, hash, nil
+		}
+	}
+	return 0, "", nil
+}
+
+// extractPRStatusCommentID pulls the comment id + body hash out of a
+// pr_status_comment_posted audit payload. Returns (0, "") on parse failure or
+// absent field — the caller treats 0 as "no prior id; create a new comment."
+func extractPRStatusCommentID(payload []byte) (int64, string) {
+	if len(payload) == 0 {
+		return 0, ""
+	}
+	var p struct {
+		GithubCommentID int64  `json:"github_comment_id"`
+		BodyHash        string `json:"body_hash"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return 0, ""
+	}
+	return p.GithubCommentID, p.BodyHash
+}
+
+// appendPRStatusAudit records that the run's PR status comment is at commentID
+// with the given body hash as of now. The body hash powers the identical-body
+// edit skip on the next rebuild.
+func (n *Notifier) appendPRStatusAudit(ctx context.Context, runRow *run.Run, repo githubclient.RepoRef, prNumber int, commentID int64, bodyHash string) error {
+	systemKind := audit.ActorSystem
+	payload, _ := json.Marshal(map[string]any{
+		"kind":              string(KindPRStatusUpdate),
+		"pr_number":         prNumber,
+		"repo":              repo.String(),
+		"github_comment_id": commentID,
+		"body_hash":         bodyHash,
+	})
+	if _, err := n.audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runRow.ID,
+		Timestamp: n.now().UTC(),
+		Category:  CategoryPRStatusCommentPosted,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		return fmt.Errorf("issuecomment: pr status audit append: %w", err)
+	}
+	return nil
+}
+
+// hashPRStatusBody returns a hex SHA-256 of the rendered PR-comment body, used
+// to skip a redundant GitHub edit when the freshly rendered body is unchanged.
+func hashPRStatusBody(body string) string {
+	sum := sha256.Sum256([]byte(body))
+	return hex.EncodeToString(sum[:])
+}
+
+// parsePRNumberFromURL extracts the integer PR number from a GitHub PR URL of
+// the form https://github.com/{owner}/{repo}/pull/{n}. Returns 0 when the URL
+// is nil/empty or carries no parseable trailing number, so callers treat it as
+// "unknown" and skip the PR comment. Mirrors the server-package helper of the
+// same name (server/lineage.go); duplicated because server imports this
+// package, not the other way.
+func parsePRNumberFromURL(url *string) int {
+	if url == nil || *url == "" {
+		return 0
+	}
+	idx := strings.LastIndex(*url, "/pull/")
+	if idx < 0 {
+		return 0
+	}
+	tail := (*url)[idx+len("/pull/"):]
+	if cut := strings.IndexAny(tail, "/?#"); cut >= 0 {
+		tail = tail[:cut]
+	}
+	n, err := strconv.Atoi(tail)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 // renderCIRetryBody renders the CI-failure auto-retry comment.
