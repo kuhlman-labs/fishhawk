@@ -852,6 +852,201 @@ func TestRollbackDeployment_APIErrorPassthrough(t *testing.T) {
 	}
 }
 
+// --- releases (E33.5 / #1590, ADR-051) ---
+
+func TestPreviewReleaseNotes_ReadsMarkdownBody(t *testing.T) {
+	var gotQuery, gotAccept, gotAuth string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/releases/notes/preview", func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		gotAccept = r.Header.Get("Accept")
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "# Release notes\n\nsuggested bump: minor (because ...)\n")
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "op-tok")
+	md, err := c.PreviewReleaseNotes(context.Background(), "acme/app", "v1.0.0", "HEAD")
+	if err != nil {
+		t.Fatalf("PreviewReleaseNotes: %v", err)
+	}
+	// The raw markdown body is returned verbatim — NOT JSON-decoded.
+	if !strings.Contains(md, "suggested bump: minor") {
+		t.Errorf("markdown mismatch: %q", md)
+	}
+	for _, want := range []string{"repo=acme%2Fapp", "from=v1.0.0", "to=HEAD"} {
+		if !strings.Contains(gotQuery, want) {
+			t.Errorf("query %q missing %q", gotQuery, want)
+		}
+	}
+	if gotAccept != "text/markdown" {
+		t.Errorf("Accept = %q, want text/markdown", gotAccept)
+	}
+	if gotAuth != "Bearer op-tok" {
+		t.Errorf("Authorization = %q, want Bearer op-tok", gotAuth)
+	}
+}
+
+func TestPreviewReleaseNotes_APIErrorEnvelope(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/releases/notes/preview", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":{"code":"authentication_required","message":"an authenticated token is required","details":null}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "")
+	_, err := c.PreviewReleaseNotes(context.Background(), "acme/app", "a", "b")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v, want *APIError", err)
+	}
+	if apiErr.StatusCode != http.StatusUnauthorized || apiErr.Code != "authentication_required" {
+		t.Errorf("envelope mismatch: %+v", apiErr)
+	}
+}
+
+func TestPrepareReleaseNotes_BodyAndResponse(t *testing.T) {
+	var gotBody []byte
+	stageID := uuid.New()
+	artifactID := uuid.New()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/releases/notes", func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(ReleaseNotesResult{
+			ArtifactID: artifactID.String(), StageID: stageID.String(),
+			Repo: "acme/app", From: "v1.0.0", To: "HEAD", ContentHash: "deadbeef", Markdown: "# Notes\n",
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "tok")
+	got, err := c.PrepareReleaseNotes(context.Background(), PrepareReleaseNotesInput{
+		Repo: "acme/app", From: "v1.0.0", To: "HEAD", StageID: stageID.String(),
+	})
+	if err != nil {
+		t.Fatalf("PrepareReleaseNotes: %v", err)
+	}
+	if got.ArtifactID != artifactID.String() || got.ContentHash != "deadbeef" || got.Markdown != "# Notes\n" {
+		t.Errorf("decoded mismatch: %+v", got)
+	}
+	for _, want := range []string{`"repo":"acme/app"`, `"from":"v1.0.0"`, `"to":"HEAD"`, `"stage_id":"` + stageID.String()} {
+		if !strings.Contains(string(gotBody), want) {
+			t.Errorf("body missing %q: %s", want, gotBody)
+		}
+	}
+}
+
+func TestCutRelease_BodyOmitsOptionalFields(t *testing.T) {
+	var gotBody []byte
+	artifactID := uuid.New()
+	runID := uuid.New()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/releases/cut", func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(CutReleaseResult{
+			Version: "v1.4.0", ArtifactID: artifactID.String(), ContentHash: "abc", Recorded: true,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "tok")
+	// StageID + BumpLevel omitted → omitempty must drop them from the wire body
+	// (the backend decodes with DisallowUnknownFields, so an empty-but-present
+	// key is fine, but omitting matches the "optional" contract).
+	got, err := c.CutRelease(context.Background(), CutReleaseInput{
+		Repo: "acme/app", RunID: runID.String(), ArtifactID: artifactID.String(), Version: "v1.4.0",
+	})
+	if err != nil {
+		t.Fatalf("CutRelease: %v", err)
+	}
+	if got.Version != "v1.4.0" || !got.Recorded {
+		t.Errorf("decoded mismatch: %+v", got)
+	}
+	if strings.Contains(string(gotBody), "stage_id") || strings.Contains(string(gotBody), "bump_level") {
+		t.Errorf("optional fields should be omitted: %s", gotBody)
+	}
+	for _, want := range []string{`"repo":"acme/app"`, `"run_id":"` + runID.String(), `"version":"v1.4.0"`} {
+		if !strings.Contains(string(gotBody), want) {
+			t.Errorf("body missing %q: %s", want, gotBody)
+		}
+	}
+}
+
+func TestCutRelease_APIErrorPassthrough(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/releases/cut", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"error":{"code":"artifact_wrong_kind","message":"artifact is not a release_notes artifact","details":null}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "tok")
+	_, err := c.CutRelease(context.Background(), CutReleaseInput{
+		Repo: "acme/app", RunID: uuid.New().String(), ArtifactID: uuid.New().String(), Version: "v1.0.0",
+	})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v, want *APIError", err)
+	}
+	if apiErr.StatusCode != http.StatusConflict || apiErr.Code != "artifact_wrong_kind" {
+		t.Errorf("envelope mismatch: %+v", apiErr)
+	}
+}
+
+func TestPublishRelease_BodyAndFlags(t *testing.T) {
+	var gotBody []byte
+	artifactID := uuid.New()
+	runID := uuid.New()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/releases/publish", func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(PublishReleaseResult{
+			ReleaseURL: "https://github.com/acme/app/releases/tag/v1.4.0", Tag: "v1.4.0",
+			ArtifactID: artifactID.String(), ContentHash: "abc", Published: true, Idempotent: false,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, "tok")
+	got, err := c.PublishRelease(context.Background(), PublishReleaseInput{
+		Repo: "acme/app", Tag: "v1.4.0", RunID: runID.String(), ArtifactID: artifactID.String(),
+	})
+	if err != nil {
+		t.Fatalf("PublishRelease: %v", err)
+	}
+	if got.ReleaseURL == "" || !got.Published || got.Idempotent {
+		t.Errorf("decoded mismatch: %+v", got)
+	}
+	if strings.Contains(string(gotBody), "stage_id") {
+		t.Errorf("optional stage_id should be omitted: %s", gotBody)
+	}
+	for _, want := range []string{`"repo":"acme/app"`, `"tag":"v1.4.0"`, `"run_id":"` + runID.String(), `"artifact_id":"` + artifactID.String()} {
+		if !strings.Contains(string(gotBody), want) {
+			t.Errorf("body missing %q: %s", want, gotBody)
+		}
+	}
+}
+
 // --- campaigns (ADR-047 / #1437) ---
 
 func TestCreateCampaign_BodyMarshalingAndOmitempty(t *testing.T) {

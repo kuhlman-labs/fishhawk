@@ -18,6 +18,10 @@
 //	fishhawk deploy approve  <run-id> [--reason ...] [--output text|json]
 //	fishhawk deploy reject   <run-id> [--reason ...] [--output text|json]
 //	fishhawk deploy rollback <run-id> [--output text|json]
+//	fishhawk release preview --repo R --from REF --to REF [--output text|json]
+//	fishhawk release prepare --repo R --from REF --to REF --stage-id UUID [--output text|json]
+//	fishhawk release cut     --repo R --run-id UUID --artifact-id UUID --version V [--stage-id UUID] [--bump-level L] [--output text|json]
+//	fishhawk release publish --repo R --tag T --run-id UUID --artifact-id UUID [--stage-id UUID] [--output text|json]
 //	fishhawk campaign start  --repo R --epic E [--pause-policy P] [--output text|json]
 //	fishhawk campaign status <campaign-id> [--output text|json]
 //	fishhawk campaign list   [--repo R] [--state S] [--limit N] [--cursor X]
@@ -79,6 +83,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runToken(rest, stdout, stderr)
 	case "deploy":
 		return runDeploy(rest, stdout, stderr)
+	case "release":
+		return runRelease(rest, stdout, stderr)
 	case "campaign":
 		return runCampaign(rest, stdout, stderr)
 	case "audit":
@@ -149,6 +155,10 @@ func printUsage(w io.Writer) {
 		"  deploy approve  Approve the deploy stage's pre-execution gate (needs write:deploy).",
 		"  deploy reject   Reject the deploy stage's pre-execution gate (category-D failure).",
 		"  deploy rollback Roll back a settled deploy (re-dispatches the rollback path).",
+		"  release preview Render release notes for a ref range without persisting.",
+		"  release prepare Persist rendered release notes as a release_notes artifact.",
+		"  release cut     Record the operator's ratified release version (no git tag push).",
+		"  release publish Write the notes to the GitHub Release body + asset.",
 		"  campaign start  Create a campaign from an epic ref.",
 		"  campaign status Show a campaign's rollup status and next action.",
 		"  campaign list   List campaigns with optional filters.",

@@ -65,7 +65,7 @@ type NextActions struct {
 // every input except run and stages may be nil. For drive-enabled runs
 // with a distilled NextAction, that action is folded in FIRST so drive
 // and next_actions never point different ways.
-func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, drive *DriveStatus, mergeObserved, acceptanceSkippedOutOfScope bool, acceptanceVerdict, acceptanceTriageDisposition string) *NextActions {
+func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, drive *DriveStatus, mergeObserved, acceptanceSkippedOutOfScope bool, acceptanceVerdict, acceptanceTriageDisposition string, release releaseSignals) *NextActions {
 	if run == nil {
 		return nil
 	}
@@ -82,7 +82,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		return na
 	}
 
-	na := classifyNextActions(run, stages, planReviewStatus, implementReviewStatus, hint, mergeObserved, acceptanceSkippedOutOfScope, acceptanceVerdict, acceptanceTriageDisposition)
+	na := classifyNextActions(run, stages, planReviewStatus, implementReviewStatus, hint, mergeObserved, acceptanceSkippedOutOfScope, acceptanceVerdict, acceptanceTriageDisposition, release)
 
 	if drive != nil && drive.NextAction != nil {
 		na.Actions = append([]SuggestedAction{driveAction(run, drive.NextAction)}, na.Actions...)
@@ -100,7 +100,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 
 // classifyNextActions is the state table. Each arm returns a labeled
 // state with >= 1 action; only terminal arms return nil actions.
-func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, mergeObserved, acceptanceSkippedOutOfScope bool, acceptanceVerdict, acceptanceTriageDisposition string) *NextActions {
+func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, mergeObserved, acceptanceSkippedOutOfScope bool, acceptanceVerdict, acceptanceTriageDisposition string, release releaseSignals) *NextActions {
 	plan := stageByType(stages, "plan")
 	impl := stageByType(stages, "implement")
 	review := stageByType(stages, "review")
@@ -198,6 +198,21 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 	// exists — the resume_run recovery-child shape).
 	if impl != nil && (plan == nil || plan.State == "succeeded") {
 		if a := implementStageNextActions(run, impl, acceptance, implementReviewStatus, hint, acceptanceVerdict, acceptanceTriageDisposition); a != nil {
+			return a
+		}
+	}
+
+	// Release-workflow loop arm (E33.5 / #1590, ADR-051). A delegating
+	// WorkflowID == "release" run drives the operator through
+	// prepare -> preview -> cut -> (human-led tag push) -> publish, tracked via
+	// the release_notes-artifact / release_cut / release_published signals plus
+	// the deploy stage state (all computed in getRunStatus). Placed BEFORE the
+	// generic deploy arm so a release run gets release-verb next-actions (the
+	// operator loop) rather than the plain deploy-approval gate; a non-release
+	// delegating run (release.IsRelease false) skips this and reaches the deploy
+	// arm unchanged. Display-only — like every other arm it never gates the run.
+	if release.IsRelease {
+		if a := releaseStageNextActions(run, release); a != nil {
 			return a
 		}
 	}
@@ -454,6 +469,136 @@ func deployStageNextActions(run *Run, deploy *Stage) *NextActions {
 				"the deploy stage has not yet parked at its pre-execution approval gate — re-poll until it reaches awaiting_deploy_approval (the backend parks it at creation)")},
 		}
 	}
+}
+
+// releaseSignals bundles the release-workflow loop signals (E33.5 / #1590,
+// ADR-051) the next_actions classifier reads for a WorkflowID == "release" run.
+// getRunStatus derives them from data it already fetches — the run's
+// WorkflowID (IsRelease), the deploy stage state, the release_cut /
+// release_published audit entries in the recent-audit slice, and a
+// release_notes-artifact presence probe — and threads them in as an additive
+// value param. The zero value (IsRelease false) leaves every non-release run
+// byte-identical, so the arm is inert for the whole existing surface. Like the
+// rest of next_actions it is DISPLAY-ONLY: it never gates the release.
+type releaseSignals struct {
+	// IsRelease gates the release arm — true only for the delegating "release"
+	// workflow.
+	IsRelease bool
+	// NotesPrepared is true once a release_notes artifact has been persisted
+	// (the prepare verb ran). The persist endpoint creates an ARTIFACT and
+	// emits no audit entry, so this is probed from the run's stage artifacts,
+	// not the audit trail.
+	NotesPrepared bool
+	// Cut is true once a release_cut audit entry exists — the operator's
+	// version decision is recorded (POST /v0/releases/cut). Records the
+	// decision ONLY; it pushes no git tag.
+	Cut bool
+	// Published is true once a release_published audit entry exists — the notes
+	// are live on the GitHub Release (POST /v0/releases/publish).
+	Published bool
+	// DeployState is the release run's deploy stage state ("" when absent). It
+	// distinguishes pipeline_running (the pushed-tag pipeline is in flight)
+	// from awaiting_publish (the pipeline has settled).
+	DeployState string
+}
+
+// releaseStageNextActions is the release-workflow loop arm (E33.5 / #1590,
+// ADR-051), modeled on deployStageNextActions. It maps the five release-loop
+// states to the correct operator verb:
+//
+//	notes_ready       -> prepare the notes  (fishhawk_release_notes, mode=prepare)
+//	awaiting_cut      -> preview then cut    (fishhawk_release_notes preview; `fishhawk release cut`)
+//	pipeline_running  -> poll                (the human pushed the tag; the pipeline runs)
+//	awaiting_publish  -> publish             (`fishhawk release publish`)
+//	published         -> poll                (the loop is complete)
+//
+// The version cut and the publish are CLI verbs (sibling slice) over the
+// /v0/releases/cut and /v0/releases/publish endpoints, so they surface as
+// named ritual steps (like approve_pr/merge_pr) rather than MCP tools — the
+// only new MCP tool is fishhawk_release_notes (the prepare/preview pair). The
+// tag push between cut and the pipeline stays a HUMAN git action per the
+// delegating posture, called out in the awaiting_cut reason. States are checked
+// most-advanced-first so the freshest signal wins. Every arm carries >= 1
+// action, so the arm never returns an empty list.
+func releaseStageNextActions(run *Run, sig releaseSignals) *NextActions {
+	switch {
+	case sig.Published:
+		// The notes are live on the GitHub Release (a release_published audit
+		// entry exists). The release loop is complete; the run winds down.
+		return &NextActions{
+			State: "published",
+			Actions: []SuggestedAction{pollAction(run,
+				suggestedStageWaitPollIntervalSeconds,
+				"the release notes are published to the GitHub Release (a release_published audit entry exists) — the release loop is complete; re-poll until the run resolves")},
+		}
+	case sig.Cut && deployInFlight(sig.DeployState):
+		// The version is cut and the human pushed the release tag; the external
+		// release pipeline (the deploy stage) is in flight. Nothing for the
+		// operator to do but re-poll until it settles.
+		return &NextActions{
+			State: "pipeline_running",
+			Actions: []SuggestedAction{pollAction(run,
+				suggestedStageWaitPollIntervalSeconds,
+				"the version is cut and the release tag was pushed (a human git action); the external release pipeline is running (deploy stage in flight) — re-poll until it settles, then publish the notes")},
+		}
+	case sig.Cut:
+		// Cut and the pipeline (if any) has settled — publish the prepared notes
+		// to the GitHub Release.
+		return &NextActions{
+			State: "awaiting_publish",
+			Actions: []SuggestedAction{{
+				Action:       "release_publish",
+				Params:       map[string]string{"run_id": run.ID},
+				Precondition: "the version is cut (a release_cut audit entry exists) and — when a release pipeline gates it — the pipeline has settled; the GitHub Release for the pushed tag exists",
+				Consumes:     consumesNone,
+				Reason:       "publish the prepared notes with `fishhawk release publish` (POST /v0/releases/publish): it sets the GitHub Release body to the rendered markdown and records a release_published audit entry",
+			}},
+		}
+	case sig.NotesPrepared:
+		// Notes are persisted but no cut is recorded — preview them (and the
+		// advisory semver bump hint) then record the version decision.
+		return &NextActions{
+			State: "awaiting_cut",
+			Actions: []SuggestedAction{
+				{
+					Action:       "fishhawk_release_notes",
+					Params:       map[string]string{"mode": "preview", "repo": run.Repo},
+					Precondition: "a release_notes artifact is prepared but no release_cut decision is recorded; preview the rendered notes and the advisory semver bump hint before cutting",
+					Consumes:     consumesNone,
+					Reason:       "preview the prepared notes (read-only) to review the changelog and the suggested semver bump before recording the version decision",
+				},
+				{
+					Action:       "release_cut",
+					Params:       map[string]string{"run_id": run.ID},
+					Precondition: "you have reviewed the previewed notes and chosen the release version",
+					Consumes:     consumesNone,
+					Reason:       "record the version decision with `fishhawk release cut` (POST /v0/releases/cut) — it writes a release_cut audit entry ONLY and pushes NO git tag. After cut, push the release tag yourself (a human git action) to trigger the external release pipeline",
+				},
+			},
+		}
+	default:
+		// No notes persisted yet — the release run is ready for the operator to
+		// prepare (render + persist) the notes.
+		return &NextActions{
+			State: "notes_ready",
+			Actions: []SuggestedAction{{
+				Action:       "fishhawk_release_notes",
+				Params:       map[string]string{"mode": "prepare", "repo": run.Repo},
+				Precondition: "the release run has no persisted release_notes artifact yet; choose the from/to ref range and the stage_id that keys the artifact",
+				Consumes:     consumesNone,
+				Reason:       "prepare the release notes: fishhawk_release_notes (mode=prepare) renders the merged-run evidence in the ref range — carrying the advisory semver bump hint — and persists a release_notes artifact the cut and publish verbs consume. Use mode=preview first for a read-only render",
+			}},
+		}
+	}
+}
+
+// deployInFlight reports whether a deploy stage state is present and not yet
+// terminal — the release arm reads it to split pipeline_running (the pushed-tag
+// pipeline is running) from awaiting_publish (no pipeline, or it settled). An
+// empty state (no deploy stage) is treated as not-in-flight so a release run
+// without a deploy stage falls straight to awaiting_publish after the cut.
+func deployInFlight(state string) bool {
+	return state != "" && !stageStateIsTerminal(state)
 }
 
 // awaitingChildrenActions is the decomposed-parent fan-out arm (#1147): drive

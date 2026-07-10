@@ -44,6 +44,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/reports/agent-changes.md", s.handleAgentChangesReportMarkdown)
 	mux.HandleFunc("GET /v0/releases/notes/preview", s.handleReleaseNotesPreview)
 	mux.HandleFunc("POST /v0/releases/notes", s.handleReleaseNotesPersist)
+	mux.HandleFunc("POST /v0/releases/cut", s.handleReleaseCut)
 	mux.HandleFunc("POST /v0/releases/publish", s.handleReleasePublish)
 	mux.HandleFunc("GET /v0/campaigns", s.handleListCampaigns)
 	mux.HandleFunc("POST /v0/campaigns", s.handleCreateCampaign)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1516,11 +1517,12 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	const minDescriptionLen = 80
 	// The registered tool set is the fishhawk_* tools swept in #778. Bump
 	// this and give the new tool a conformant description when adding one.
-	// This count is the surface-sweep invariant (#873/#867): the E38.3 (#1657)
-	// next_actions param-threading edit to tools.go registers NO new tool and
-	// removes/renames none, so the total is deliberately UNCHANGED at 40 — this
-	// assertion pins that a param-only tools.go edit did not perturb the surface.
-	const wantToolCount = 40
+	// This count is the surface-sweep invariant (#873/#867). E33.5 (#1590,
+	// ADR-051) adds exactly ONE tool — fishhawk_release_notes, the release
+	// prepare/preview pair — taking the total 40 -> 41; the release cut/publish
+	// verbs are CLI-only (next_actions names them at the release-loop states),
+	// so the MCP surface grows by AT MOST one per the binding approval condition.
+	const wantToolCount = 41
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -7002,5 +7004,155 @@ func TestGetRunStatus_AcceptancePassed_ThreadsRecentAudit(t *testing.T) {
 	// from the verdict.
 	if out.AcceptanceStageWaitStatus == nil || out.AcceptanceStageWaitStatus.Status != "succeeded" {
 		t.Errorf("AcceptanceStageWaitStatus = %+v, want status succeeded", out.AcceptanceStageWaitStatus)
+	}
+}
+
+// releaseNotesFake is a minimal mux over the two release-notes endpoints the
+// fishhawk_release_notes handler calls (E33.5 / #1590). It records the request
+// coordinates and counts hits so a validation-branch test can assert the
+// handler short-circuited BEFORE any HTTP hop.
+type releaseNotesFake struct {
+	previewHits int
+	persistHits int
+	lastPreview map[string]string
+	lastPersist releaseNotesPersistRequest
+	srv         *httptest.Server
+}
+
+func newReleaseNotesFake(t *testing.T) *releaseNotesFake {
+	t.Helper()
+	f := &releaseNotesFake{lastPreview: map[string]string{}}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/releases/notes/preview", func(w http.ResponseWriter, r *http.Request) {
+		f.previewHits++
+		f.lastPreview = map[string]string{
+			"repo": r.URL.Query().Get("repo"),
+			"from": r.URL.Query().Get("from"),
+			"to":   r.URL.Query().Get("to"),
+		}
+		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		_, _ = io.WriteString(w, "# preview\n\nsuggested bump: minor (because ...)\n")
+	})
+	mux.HandleFunc("POST /v0/releases/notes", func(w http.ResponseWriter, r *http.Request) {
+		f.persistHits++
+		_ = json.NewDecoder(r.Body).Decode(&f.lastPersist)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(ReleaseNotesPersistResult{
+			ArtifactID:  "art-1",
+			StageID:     f.lastPersist.StageID,
+			Repo:        f.lastPersist.Repo,
+			From:        f.lastPersist.From,
+			To:          f.lastPersist.To,
+			ContentHash: "hash-1",
+			Markdown:    "# persisted",
+		})
+	})
+	f.srv = httptest.NewServer(mux)
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+func (f *releaseNotesFake) resolver(env map[string]string) *runResolver {
+	return &runResolver{
+		api:    newAPIClient(config{backendURL: f.srv.URL, apiToken: "tok-test"}),
+		getenv: envFuncFromMap(env),
+	}
+}
+
+// TestReleaseNotesTool_Handler exercises the fishhawk_release_notes tool handler
+// (E33.5 / #1590): the preview and prepare happy paths plus EACH fail-closed
+// validation branch, asserting the validation branches short-circuit before any
+// HTTP hop (previewHits+persistHits stay zero).
+func TestReleaseNotesTool_Handler(t *testing.T) {
+	t.Run("preview renders the markdown without persisting", func(t *testing.T) {
+		f := newReleaseNotesFake(t)
+		_, out, err := f.resolver(nil).releaseNotes(context.Background(), nil,
+			ReleaseNotesInput{Mode: "preview", Repo: "x/y", From: "v1.1.0", To: "HEAD"})
+		if err != nil {
+			t.Fatalf("releaseNotes preview: %v", err)
+		}
+		if out.Mode != "preview" || !strings.Contains(out.Markdown, "suggested bump") {
+			t.Errorf("preview out = %+v, want the rendered markdown", out)
+		}
+		if out.ArtifactID != "" {
+			t.Errorf("preview must not persist an artifact; got id %q", out.ArtifactID)
+		}
+		if f.persistHits != 0 {
+			t.Errorf("preview hit the persist endpoint %d times, want 0", f.persistHits)
+		}
+		if f.lastPreview["repo"] != "x/y" || f.lastPreview["from"] != "v1.1.0" || f.lastPreview["to"] != "HEAD" {
+			t.Errorf("preview coordinates = %+v", f.lastPreview)
+		}
+	})
+
+	t.Run("empty mode defaults to preview", func(t *testing.T) {
+		f := newReleaseNotesFake(t)
+		_, out, err := f.resolver(nil).releaseNotes(context.Background(), nil,
+			ReleaseNotesInput{Repo: "x/y", From: "v1.1.0", To: "HEAD"})
+		if err != nil {
+			t.Fatalf("releaseNotes default mode: %v", err)
+		}
+		if out.Mode != "preview" || f.previewHits != 1 || f.persistHits != 0 {
+			t.Errorf("empty mode did not default to preview: out.Mode=%q previewHits=%d persistHits=%d", out.Mode, f.previewHits, f.persistHits)
+		}
+	})
+
+	t.Run("repo falls back to GITHUB_REPOSITORY", func(t *testing.T) {
+		f := newReleaseNotesFake(t)
+		_, _, err := f.resolver(map[string]string{"GITHUB_REPOSITORY": "env/repo"}).releaseNotes(
+			context.Background(), nil, ReleaseNotesInput{From: "v1.1.0", To: "HEAD"})
+		if err != nil {
+			t.Fatalf("releaseNotes env repo: %v", err)
+		}
+		if f.lastPreview["repo"] != "env/repo" {
+			t.Errorf("repo = %q, want the GITHUB_REPOSITORY fallback env/repo", f.lastPreview["repo"])
+		}
+	})
+
+	t.Run("prepare persists and returns the artifact id", func(t *testing.T) {
+		f := newReleaseNotesFake(t)
+		stageID := uuid.NewString()
+		_, out, err := f.resolver(nil).releaseNotes(context.Background(), nil,
+			ReleaseNotesInput{Mode: "prepare", Repo: "x/y", From: "v1.1.0", To: "HEAD", StageID: stageID})
+		if err != nil {
+			t.Fatalf("releaseNotes prepare: %v", err)
+		}
+		if out.Mode != "prepare" || out.ArtifactID != "art-1" || out.ContentHash != "hash-1" {
+			t.Errorf("prepare out = %+v", out)
+		}
+		if f.lastPersist.StageID != stageID {
+			t.Errorf("persist stage_id = %q, want %q", f.lastPersist.StageID, stageID)
+		}
+	})
+
+	// Fail-closed validation branches — EACH must return an error BEFORE any HTTP
+	// hop, so no request reaches the fake.
+	validationCases := []struct {
+		name string
+		env  map[string]string
+		in   ReleaseNotesInput
+		want string
+	}{
+		{name: "repo missing", in: ReleaseNotesInput{From: "v1.1.0", To: "HEAD"}, want: "repo is required"},
+		{name: "from/to missing", in: ReleaseNotesInput{Repo: "x/y"}, want: "from and to"},
+		{name: "prepare without stage_id", in: ReleaseNotesInput{Mode: "prepare", Repo: "x/y", From: "v1.1.0", To: "HEAD"}, want: "stage_id is required"},
+		{name: "prepare with non-UUID stage_id", in: ReleaseNotesInput{Mode: "prepare", Repo: "x/y", From: "v1.1.0", To: "HEAD", StageID: "not-a-uuid"}, want: "not a valid UUID"},
+		{name: "unrecognized mode", in: ReleaseNotesInput{Mode: "cut", Repo: "x/y", From: "v1.1.0", To: "HEAD"}, want: "not recognized"},
+	}
+	for _, tc := range validationCases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newReleaseNotesFake(t)
+			_, _, err := f.resolver(tc.env).releaseNotes(context.Background(), nil, tc.in)
+			if err == nil {
+				t.Fatalf("want a validation error containing %q, got nil", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to contain %q", err.Error(), tc.want)
+			}
+			if f.previewHits != 0 || f.persistHits != 0 {
+				t.Errorf("validation branch hit the backend: previewHits=%d persistHits=%d", f.previewHits, f.persistHits)
+			}
+		})
 	}
 }
