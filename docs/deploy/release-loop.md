@@ -117,6 +117,55 @@ Release. The release loop is complete. Re-poll until the run resolves.
 All four are new endpoints, so no existing token is tightened (the impact
 inventory is empty per the AGENTS.md auth-change checklist).
 
+## Evidence notes verification
+
+The notes are only trustworthy if their evidence lines resolve to **real**
+merged-run evidence, and if the publish is **verifiable on the audit chain**.
+Two checks close that loop.
+
+### The published body resolves to real plan / review / acceptance evidence
+
+The rendered notes are assembled, never authored: each loop-merged change's
+section resolves to that PR's own audit rows (ADR-051 honesty constraint —
+nothing is fabricated). To confirm a published Release body is evidence-linked,
+read it back and check that each change carries:
+
+- **`- Plan: <pr-url>`** and the plan summary — resolved from the merged run's
+  approved `standard_v1` plan artifact (via the `parent_run_id` walk).
+- **`Reviewer verdicts:`** with one `- <reviewer_model>: <verdict>` line per
+  configured reviewer — decoded from the run's `implement_reviewed` audit
+  entries (a `feature_change` run has two).
+- **`Acceptance: <verdict>`** — the latest `acceptance_outcome_recorded` outcome
+  for the run, when the workflow ran an acceptance stage.
+
+A PR in range with no resolvable Fishhawk run (a human-led or loop-bypassing
+change) renders as **`> **Reduced evidence.**`** rather than carrying invented
+verdicts — its presence is expected and honest, not a defect.
+
+### The `release_published` entry is verified on the chain
+
+Both `release_cut` and `release_published` are appended to the release run's
+per-run audit hash-chain (`audit.AppendChained`). Read the run's entries in
+ascending order (`GET /v0/runs/{id}/audit`, or `fishhawk_list_audit`) and
+confirm:
+
+- a `release_cut` entry carrying `{version, artifact_id, bump_level,
+  content_hash}` — the ratified version and which notes it was cut against;
+- a `release_published` entry carrying `{tag, release_url, artifact_id,
+  content_hash}` — the live Release and the published notes hash;
+- **`prev_hash`→`hash` continuity** across the chain, including the
+  `release_published` entry's `prev_hash` linking back to the preceding entry's
+  hash — the same integrity the compliance export (`fishhawk export` +
+  `VerifyExport`) checks.
+
+The deterministic in-tree proof of this exact path — assemble → render → prepare
+→ cut → publish → chain continuity, run offline against a fake resolver and a
+fake GitHub publisher — is `backend/internal/server/release_seam_test.go`
+(`TestReleaseSeam_EndToEnd`, the E33.6 capstone, #1591). It is the committed-tree
+analogue of the live operator walk above: the same seam, asserted without a real
+tag push or a real GitHub Release. The one real published Release remains an
+operator-executed live walk.
+
 ## See also
 
 - `backend/cmd/fishhawk-mcp/README.md` — the `fishhawk_release_notes` tool entry.
