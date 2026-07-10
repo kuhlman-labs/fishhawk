@@ -1633,6 +1633,11 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 			hasRejection = true
 		}
 	}
+	// Fire the page-class ping immediately (#1786) so a plan-review reject
+	// pages the operator within the review append flow rather than riding the
+	// next transition. Deduped on the source Sequence, so it never
+	// double-posts with notifyStatusUpdate.
+	s.notifyPageClass(ctx, runID, "plan_review")
 	return hasRejection
 }
 

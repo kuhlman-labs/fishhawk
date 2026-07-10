@@ -1545,6 +1545,30 @@ func TestTriageAcceptance_Idempotent(t *testing.T) {
 	}
 }
 
+// TestRecordAcceptance_FiresPageClassHook is one of the four
+// binding-condition-#2 site assertions (#1786): the acceptance record
+// handler invokes the pings-only immediate hook at its append site (after
+// triage), so a paged acceptance triage disposition pages the operator
+// within the record window rather than at the next transition.
+func TestRecordAcceptance_FiresPageClassHook(t *testing.T) {
+	s, _, _, au, _, runID, implementStageID, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	rec := &pageClassRecorder{}
+	s.issueNotifier = rec
+	// Exhaust the fix-up budget so triage routes to a PAGED disposition
+	// (fixup_unavailable_paged) — a genuine page-class event at this site.
+	fixupPayload, _ := json.Marshal(map[string]any{"stage_id": implementStageID.String()})
+	au.seeded = append(au.seeded, &audit.Entry{RunID: &runID, StageID: &implementStageID, Category: CategoryStageFixupTriggered, Payload: fixupPayload})
+	body := failedAcceptanceBytes(t, "error", []acceptanceCriterionResult{{ID: "ac-create", Result: "failed"}})
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if !rec.pagedRun(runID) {
+		t.Errorf("acceptance record site did not invoke the page-class hook; paged=%v", rec.pageClass)
+	}
+}
+
 // TestTriageAcceptance_PassedVerdict_NoTriage: a passed verdict writes no
 // triage entry.
 func TestTriageAcceptance_PassedVerdict_NoTriage(t *testing.T) {

@@ -874,6 +874,47 @@ func (n *Notifier) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID
 	return n.firePings(ctx, ctxv, entries, stages, ctxv.runURL)
 }
 
+// NotifyPageClassForRun is the pings-only sibling of
+// NotifyStatusUpdateForRun (#1786). It fires any page-class pings the
+// current audit state crossed WITHOUT rebuilding the living anchor, the PR
+// status comment, or the agent-review PR reviews. It is invoked at the four
+// batched page-class append sites (plan-review reject, implement-review
+// reject, scope-amendment request, paged acceptance triage) so a page posts
+// within the event's own transaction window instead of riding the NEXT
+// stage transition minutes later.
+//
+// Best-effort and idempotent: firePings dedups on the source audit
+// Sequence, so invoking this in ADDITION to the per-transition
+// NotifyStatusUpdateForRun cannot double-post. Returns nil silently for a
+// nil receiver and for non-issue triggers (contextForStatus screens both),
+// mirroring NotifyStatusUpdateForRun's posture so every call site is
+// branch-free.
+func (n *Notifier) NotifyPageClassForRun(ctx context.Context, runID uuid.UUID) error {
+	if n == nil {
+		return nil
+	}
+	runRow, err := n.runs.GetRun(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("issuecomment: get run: %w", err)
+	}
+	if runRow.TriggerSource != run.TriggerGitHubIssue {
+		return nil
+	}
+	stages, err := n.runs.ListStagesForRun(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("issuecomment: list stages: %w", err)
+	}
+	entries, err := n.audit.ListForRun(ctx, runID)
+	if err != nil {
+		return fmt.Errorf("issuecomment: list audit: %w", err)
+	}
+	ctxv, ok, err := n.contextForStatus(ctx, runID)
+	if err != nil || !ok {
+		return err
+	}
+	return n.firePings(ctx, ctxv, entries, stages, ctxv.runURL)
+}
+
 // loadAnchorPlans projects the run's plan artifacts into the anchor's
 // current + superseded plan views. The latest plan artifact (by
 // CreatedAt) across the run's plan stages is the current plan; any

@@ -901,6 +901,28 @@ func (s *Server) notifyStatusUpdate(ctx context.Context, runID uuid.UUID, source
 	}
 }
 
+// notifyPageClass is the best-effort pings-only immediate hook (#1786),
+// invoked right after each currently-batched page-class audit append
+// (plan-review reject, implement-review reject, scope-amendment request,
+// paged acceptance triage) so the page posts within the event's own
+// transaction window instead of riding the next stage transition. The
+// notifier dedups on the source audit Sequence, so this cannot double-post
+// with the per-transition notifyStatusUpdate; here we just call it and log
+// on failure. `source` tags the call site in the log line.
+func (s *Server) notifyPageClass(ctx context.Context, runID uuid.UUID, source string) {
+	if s.issueNotifier == nil {
+		return
+	}
+	if err := s.issueNotifier.NotifyPageClassForRun(ctx, runID); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"page-class ping failed",
+			slog.String("source", source),
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
 // reEvaluatePolicy is the backend's source-of-truth re-evaluation
 // of the closed-set constraints (E3.13). Returns the policy
 // violations found; the caller derives pass/fail from the length and
@@ -3131,6 +3153,12 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 	// the review loop's return (a publish failure recomputes on the next SPA
 	// visit or PR webhook).
 	s.recomputeAndPublishAuditComplete(ctx, runID)
+
+	// Fire the page-class ping immediately (#1786) so a reviewer reject pages
+	// the operator within the review append flow rather than riding the next
+	// transition (the operator's own fixup/approve) minutes later. Deduped on
+	// the source Sequence, so it never double-posts with notifyStatusUpdate.
+	s.notifyPageClass(ctx, runID, "implement_review")
 
 	return hasRejection
 }

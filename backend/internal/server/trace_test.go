@@ -27,6 +27,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -4865,4 +4866,82 @@ func containsString(xs []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// pageClassRecorder is an issuecomment.Channel fake that counts the
+// page-class immediate-hook invocations per run (#1786). It lets the four
+// batched page-class append sites (implement-review, plan-review,
+// scope-amendment, acceptance triage) each assert s.notifyPageClass fired at
+// the site without any GitHub I/O. Every non-page-class Channel method is a
+// no-op.
+type pageClassRecorder struct {
+	pageClass []uuid.UUID
+	status    []uuid.UUID
+}
+
+func (r *pageClassRecorder) NotifyPageClassForRun(_ context.Context, runID uuid.UUID) error {
+	r.pageClass = append(r.pageClass, runID)
+	return nil
+}
+
+func (r *pageClassRecorder) NotifyStatusUpdateForRun(_ context.Context, runID uuid.UUID) error {
+	r.status = append(r.status, runID)
+	return nil
+}
+
+func (r *pageClassRecorder) NotifyPlanReady(_ context.Context, _ uuid.UUID, _ *run.Stage, _ *plan.Plan) error {
+	return nil
+}
+
+func (r *pageClassRecorder) NotifyCIRetry(_ context.Context, _ uuid.UUID, _ uuid.UUID, _ string, _, _ int) error {
+	return nil
+}
+
+func (r *pageClassRecorder) NotifyBudgetAlert(_ context.Context, _ uuid.UUID, _ issuecomment.BudgetAlertPayload) (bool, error) {
+	return false, nil
+}
+
+func (r *pageClassRecorder) NotifySlashApprovalReply(_ context.Context, _ issuecomment.SlashApprovalReply) error {
+	return nil
+}
+
+func (r *pageClassRecorder) NotifyRunRejected(_ context.Context, _ string, _ int64, _ int, _, _ string) error {
+	return nil
+}
+
+func (r *pageClassRecorder) ArtifactListerWired() bool { return false }
+
+func (r *pageClassRecorder) pagedRun(runID uuid.UUID) bool {
+	for _, id := range r.pageClass {
+		if id == runID {
+			return true
+		}
+	}
+	return false
+}
+
+var _ issuecomment.Channel = (*pageClassRecorder)(nil)
+
+// TestImplementReviewInvocations_FiresPageClassHook is one of the four
+// binding-condition-#2 site assertions (#1786): the implement-review loop
+// invokes the pings-only immediate hook at its append site, so a reviewer
+// reject pages the operator within the review flow rather than at the next
+// transition.
+func TestImplementReviewInvocations_FiresPageClassHook(t *testing.T) {
+	au := newSeqAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	rec := &pageClassRecorder{}
+	s.issueNotifier = rec
+	runID, stageID := uuid.New(), uuid.New()
+
+	rev := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+		model:   "gpt-5.5",
+	}
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget)
+
+	if !rec.pagedRun(runID) {
+		t.Errorf("implement-review site did not invoke the page-class hook; paged=%v", rec.pageClass)
+	}
 }

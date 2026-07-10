@@ -722,6 +722,15 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 		s.triageAcceptanceFailure(r.Context(), runID, stage, acc, created.ID.String())
 	}
 
+	// Fire the page-class ping immediately (#1786): a paged acceptance-triage
+	// disposition is otherwise silent on anchor edits, so pinging within the
+	// record window (after triage has decided and written its
+	// acceptance_triage_decided entry) gets the operator looking sooner than
+	// the next transition. Deduped on the source Sequence, so it never
+	// double-posts, and a non-paged (auto-routed) disposition produces no
+	// page-class event.
+	s.notifyPageClass(r.Context(), runID, "acceptance_recorded")
+
 	s.writeJSON(w, r, http.StatusCreated, acceptanceResponse{
 		ID:          created.ID,
 		StageID:     created.StageID,

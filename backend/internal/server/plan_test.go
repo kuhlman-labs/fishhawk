@@ -769,6 +769,29 @@ func TestPlanReviewLoop_AgentVersionInRangeDispatches(t *testing.T) {
 	}
 }
 
+// TestPlanReviewLoop_FiresPageClassHook is one of the four
+// binding-condition-#2 site assertions (#1786): the plan-review loop invokes
+// the pings-only immediate hook at its append site so a plan-review reject
+// pages the operator within the review flow rather than at the next transition.
+func TestPlanReviewLoop_FiresPageClassHook(t *testing.T) {
+	au := newSeqAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	rec := &pageClassRecorder{}
+	s.issueNotifier = rec
+	runID, stageID := uuid.New(), uuid.New()
+
+	rev := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+		model:   "gpt-5.5",
+	}
+	s.runPlanReviewLoop(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author-model", planreview.DefaultReviewBudget)
+
+	if !rec.pagedRun(runID) {
+		t.Errorf("plan-review site did not invoke the page-class hook; paged=%v", rec.pageClass)
+	}
+}
+
 // TestPlanReviewLoop_AgentVersionUnprobeableDegrades asserts the degrade path:
 // a codex reviewer whose CLI version is unprobeable ("unknown") is dispatched
 // anyway — the guard never blocks a review on an uncomparable version — but the

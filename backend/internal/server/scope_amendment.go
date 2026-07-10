@@ -270,6 +270,13 @@ func (s *Server) handleRequestScopeAmendment(w http.ResponseWriter, r *http.Requ
 	s.writeScopeAmendmentRequestedAudit(r, amendment, id.Subject,
 		maxScopeAmendmentsPerStage-used-1, effective, maxFiles)
 
+	// Fire the page-class ping immediately (#1786): a scope-amendment request
+	// is a must_page_human event that always parks for an operator decision
+	// and is otherwise silent on anchor edits, so pinging within the request
+	// window (rather than at the next transition) gets the operator looking
+	// sooner. Deduped on the source Sequence, so it never double-posts.
+	s.notifyPageClass(r.Context(), runID, "scope_amendment")
+
 	resp := amendmentToResponse(amendment)
 	resp.EffectiveScopeFilesAfterApproval = effective
 	resp.MaxFilesChanged = maxFiles
