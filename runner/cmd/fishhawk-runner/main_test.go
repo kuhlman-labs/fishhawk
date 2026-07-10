@@ -3889,14 +3889,16 @@ func TestSweepStalePullRequestDescription(t *testing.T) {
 	keyed := withPRDescriptionPath(t, "r", "s")
 	cfg := config{runID: "r", stageID: "s"}
 
-	// Absent both → silent no-op.
+	// Absent both → silent no-op, returns ok.
 	var quiet strings.Builder
-	sweepStalePullRequestDescription(cfg, &quiet)
+	if !sweepStalePullRequestDescription(cfg, &quiet) {
+		t.Errorf("absent files must return ok, got false:\n%s", quiet.String())
+	}
 	if strings.Contains(quiet.String(), "pr_description_swept") {
 		t.Errorf("absent files must not emit pr_description_swept, got:\n%s", quiet.String())
 	}
 
-	// Stale keyed + legacy files → both swept, both emit.
+	// Stale keyed + legacy files → both swept, both emit, returns ok.
 	if err := os.WriteFile(keyed, []byte("stale keyed\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -3904,7 +3906,9 @@ func TestSweepStalePullRequestDescription(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stderr strings.Builder
-	sweepStalePullRequestDescription(cfg, &stderr)
+	if !sweepStalePullRequestDescription(cfg, &stderr) {
+		t.Errorf("swept files must return ok, got false:\n%s", stderr.String())
+	}
 	if _, statErr := os.Stat(keyed); !os.IsNotExist(statErr) {
 		t.Errorf("keyed stale file must be swept, stat err = %v", statErr)
 	}
@@ -3914,6 +3918,34 @@ func TestSweepStalePullRequestDescription(t *testing.T) {
 	swept := strings.Count(stderr.String(), `"event":"pr_description_swept"`)
 	if swept != 2 {
 		t.Errorf("expected 2 pr_description_swept events (keyed + legacy), got %d:\n%s", swept, stderr.String())
+	}
+}
+
+// TestSweepStalePullRequestDescription_RemoveError (#1777 fix-up, binding
+// condition 2): a stale readable file the runner cannot unlink must fail LOUD, not
+// be silently left for loadAgentAuthoredPR to parse into this run's PR text. A
+// non-empty directory at the legacy path makes os.Remove fail ENOTEMPTY (not
+// not-exist), so the sweep must emit a category-C runner_failed and return false.
+func TestSweepStalePullRequestDescription_RemoveError(t *testing.T) {
+	withPRDescriptionPath(t, "r", "s")
+	cfg := config{runID: "r", stageID: "s"}
+
+	// Make the legacy path an un-removable non-empty directory: os.Remove
+	// returns "directory not empty", which is NOT os.IsNotExist.
+	if err := os.MkdirAll(filepath.Join(legacyPullRequestDescriptionPath, "child"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr strings.Builder
+	if sweepStalePullRequestDescription(cfg, &stderr) {
+		t.Errorf("an un-removable stale legacy file must fail the sweep, got ok:\n%s", stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, `"reason":"pr_description_stale_clear"`) {
+		t.Errorf("expected pr_description_stale_clear runner_failed event, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"category":"C"`) {
+		t.Errorf("stale-clear failure must be category C, got:\n%s", out)
 	}
 }
 

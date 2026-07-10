@@ -1133,8 +1133,13 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// concurrent run that raced on the shared legacy path) can never be
 		// silently parsed into this run's PR title/body — the exact clobber this
 		// issue fixes. Covers keyed AND legacy to match loadAgentAuthoredPR's
-		// keyed-first-legacy-fallback read (binding condition 2).
-		sweepStalePullRequestDescription(cfg, logSink)
+		// keyed-first-legacy-fallback read (binding condition 2). A remove error
+		// other than not-exist means a stale readable file would survive to be
+		// parsed downstream — fail category-C here rather than risk the silent
+		// clobber, mirroring the acceptance stale-verdict clear.
+		if !sweepStalePullRequestDescription(cfg, logSink) {
+			return exitFailure
+		}
 	}
 
 	// Run()-level restore net (#953, the #941 residual): the restore defers
@@ -6694,17 +6699,38 @@ func sweepStaleImplementCommitMessage(cfg config, logSink io.Writer) {
 // during the deprecation window; that failure is loud (the other run falls back
 // to the generic Fishhawk template) and acceptable — the alternative (silently
 // parsing a foreign run's PR text) is the bug this issue closes.
-func sweepStalePullRequestDescription(cfg config, logSink io.Writer) {
+//
+// Returns false when a path could not be removed for a reason OTHER than not-
+// exist: loadAgentAuthoredPR reads these SAME paths after the agent runs, so a
+// stale-but-unremovable readable file (e.g. a foreign legacy file in /tmp the
+// runner cannot unlink) would otherwise be silently parsed into this run's PR
+// title/body — the exact clobber this issue closes. The caller fails the stage
+// category-C on false rather than risk that silent parse, mirroring the
+// acceptance stale-verdict clear (loud-over-silent, binding condition 2). A
+// not-exist (the common case) is silent and never fails.
+func sweepStalePullRequestDescription(cfg config, logSink io.Writer) bool {
+	ok := true
 	for _, path := range []string{
 		pullRequestDescriptionPath(cfg.runID, cfg.stageID),
 		legacyPullRequestDescriptionPath,
 	} {
-		if rerr := os.Remove(path); rerr == nil {
+		rerr := os.Remove(path)
+		switch {
+		case rerr == nil:
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"pr_description_swept","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
 				cfg.runID, cfg.stageID, path)
+		case !os.IsNotExist(rerr):
+			// A stale readable file we cannot unlink survives to be parsed by
+			// loadAgentAuthoredPR — fail closed before the agent spawns rather
+			// than clobber this run's PR text with a foreign handoff.
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"pr_description_stale_clear","category":"C","path":%q,"detail":%q}`+"\n",
+				path, rerr.Error())
+			ok = false
 		}
 	}
+	return ok
 }
 
 // loadImplementCommitMessage reads the agent's initial-implement commit-message
