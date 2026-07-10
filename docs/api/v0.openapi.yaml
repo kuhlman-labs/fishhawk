@@ -4639,7 +4639,24 @@ paths:
       tags: [audit]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
-        - { name: category, in: query, schema: { type: string } }
+        - name: category
+          in: query
+          schema: { type: string }
+          description: |
+            Optional. Filters the feed to entries of this audit category.
+            Validated against the curated known-category registry (#1764):
+            an unknown or misspelled category is rejected `400
+            validation_failed` naming the nearest known categories, rather
+            than returning a permissive empty page that would silently arm
+            an unsatisfiable `fishhawk_await_audit` wait for the full
+            timeout. Pass `allow_unknown=true` to bypass the check.
+        - name: allow_unknown
+          in: query
+          schema: { type: boolean, default: false }
+          description: |
+            Optional. When `true`, skips the known-category validation on
+            `category` (#1764), so a legitimately-unlisted category returns
+            a normal (possibly empty) page instead of `400`.
         - name: stage_id
           in: query
           schema: { $ref: '#/components/schemas/UUID' }
@@ -4676,7 +4693,9 @@ paths:
         '400':
           description: |
             `validation_failed` — `stage_id` not a UUID, `since_sequence`
-            not a non-negative integer, or `limit` out of range.
+            not a non-negative integer, `limit` out of range, or `category`
+            not a known audit category (absent `allow_unknown=true`; the
+            error `details.suggestions` names the nearest known categories).
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 

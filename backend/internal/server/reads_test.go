@@ -884,6 +884,64 @@ func TestListRunAudit_CategoryFilter(t *testing.T) {
 	}
 }
 
+// TestListRunAudit_UnknownCategory_400 is the #1764 endpoint fail-loud proof:
+// an unknown category query param is rejected 400 validation_failed naming the
+// nearest known categories, rather than returning a permissive empty page that
+// would silently arm an unsatisfiable await.
+func TestListRunAudit_UnknownCategory_400(t *testing.T) {
+	a := newAuditReadFake()
+	a.byCat["plan_generated"] = makeAuditEntries(2)
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/runs/%s/audit?category=scope_amendment_pending", uuid.New()), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 on an unknown category:\n%s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Error struct {
+			Code    string `json:"code"`
+			Details struct {
+				Suggestions []string `json:"suggestions"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Error.Code != "validation_failed" {
+		t.Errorf("error code = %q, want validation_failed", got.Error.Code)
+	}
+	found := false
+	for _, sug := range got.Error.Details.Suggestions {
+		if sug == "scope_amendment_requested" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("suggestions %v should name scope_amendment_requested", got.Error.Details.Suggestions)
+	}
+}
+
+// TestListRunAudit_UnknownCategory_AllowUnknown_200 proves the escape hatch:
+// allow_unknown=true bypasses the known-category validation, so an unlisted
+// category returns 200 (an empty page here, since the fake has no such
+// entries) rather than 400.
+func TestListRunAudit_UnknownCategory_AllowUnknown_200(t *testing.T) {
+	a := newAuditReadFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/runs/%s/audit?category=scope_amendment_pending&allow_unknown=true", uuid.New()), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 with allow_unknown=true:\n%s", w.Code, w.Body.String())
+	}
+}
+
 // TestListRunAudit_StageFilter verifies the stage_id query param
 // (#215) narrows the per-run feed to entries for that stage. The
 // implement-stage session view depends on this so the activity

@@ -349,6 +349,24 @@ func (s *Server) handleListRunAudit(w http.ResponseWriter, r *http.Request) {
 
 	q := r.URL.Query()
 	category := q.Get("category")
+	// Reject an unknown category (#1764) so a misspelled or wrong-surface
+	// string — e.g. the runner-log event "scope_amendment_pending" instead
+	// of the audit category "scope_amendment_requested" — fails LOUD naming
+	// the nearest known categories, rather than returning a permissive empty
+	// page that silently arms an unsatisfiable fishhawk_await_audit wait for
+	// the full timeout. allow_unknown=true is the escape hatch: it bypasses
+	// the check for a legitimately-unlisted category. Parsed before the
+	// category-filter branch below; the no-category path is unaffected.
+	if category != "" && q.Get("allow_unknown") != "true" && !audit.IsKnownCategory(category) {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"category is not a known audit category; pass allow_unknown=true to bypass this check",
+			map[string]any{
+				"field":       "category",
+				"got":         category,
+				"suggestions": audit.SuggestCategories(category, 3),
+			})
+		return
+	}
 	limit, err := parseLimit(q.Get("limit"), auditDefaultLimit, auditMaxLimit)
 	if err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
