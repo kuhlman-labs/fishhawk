@@ -212,6 +212,57 @@ func TestReconcileOrphanedReviews_AlreadyTerminalIdempotent(t *testing.T) {
 	}
 }
 
+// TestReconcileOrphanedReviews_SelfSynthesizedIdempotent closes the low/
+// test-coverage gap: TestReconcileOrphanedReviews_AlreadyTerminalIdempotent
+// only proves idempotency against a PRE-SEEDED verdict, never against the
+// reconcile's OWN synthesized *_review_failed. The in-memory auditFake returns
+// appended entries WITHOUT a sequence (Sequence 0), so a re-read of a
+// self-synthesized failure would not count as landed (0 is not > the started
+// anchor). The real audit store assigns a monotonic sequence to every appended
+// entry, which is why production self-idempotency holds; this test bridges the
+// fake's gap by promoting the pass-1 synthesized failure into seeded history
+// with a real sequence strictly greater than the started anchor (what the store
+// does) before a second pass, then asserts the second pass is a true no-op
+// against the reconcile's own prior output.
+func TestReconcileOrphanedReviews_SelfSynthesizedIdempotent(t *testing.T) {
+	s, repo, au, _ := newReconcileServer(t)
+	runID := seedRunningRun(t, repo)
+	stageID := uuid.New()
+	seedReviewAuditEntry(t, au, runID, stageID, 1, beforeBoot, "plan_review_started",
+		planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityAdvisory})
+
+	// Pass 1: the orphaned round synthesizes exactly one plan_review_failed.
+	if _, err := s.ReconcileOrphanedReviews(context.Background()); err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	first := emittedReviewFailures(t, au, "plan_review_failed")
+	if len(first) != 1 {
+		t.Fatalf("pass 1: plan_review_failed emitted = %d, want 1", len(first))
+	}
+
+	// Durably land the synthesized failure the way the real store does: promote
+	// pass-1's OWN output into seeded history with a monotonic sequence strictly
+	// greater than the started anchor (seq 1), then drop the append buffer so the
+	// second pass reads only the persisted state.
+	seedReviewAuditEntry(t, au, runID, stageID, 2, beforeBoot, "plan_review_failed", first[0])
+	au.mu.Lock()
+	au.appended = nil
+	au.mu.Unlock()
+
+	// Pass 2: the round is now settled (landed seq 2 > started seq 1 == 1
+	// configured) — a no-op against the reconcile's OWN synthesized entry.
+	n, err := s.ReconcileOrphanedReviews(context.Background())
+	if err != nil {
+		t.Fatalf("pass 2: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("pass 2: terminated runs = %d, want 0 (self-synthesized already landed)", n)
+	}
+	if got := emittedReviewFailures(t, au, "plan_review_failed"); len(got) != 0 {
+		t.Fatalf("pass 2: plan_review_failed emitted = %d, want 0 (idempotent on self-synthesized)", len(got))
+	}
+}
+
 // TestReconcileOrphanedReviews_Partial covers a round with more than one
 // configured agent where one terminal verdict already landed: exactly the
 // missing count (1) is synthesized so landed reaches ConfiguredAgents.
@@ -325,10 +376,66 @@ func TestReconcileOrphanedReviews_SynthesizedFailedIsTerminal(t *testing.T) {
 	if f.Timeout {
 		t.Error("Timeout = true, want false")
 	}
-	// Terminal for the N-of-N settle detection the mcp pending predicate shares.
+
+	// Exercise the mcp consumer-side terminal classification, not just the count.
+	// reviewStatusFor's decodeFailedReviews (fishhawk-mcp review.go) unmarshals a
+	// *_review_failed payload through a struct keyed on reason/reviewer_model/
+	// authority and UNCONDITIONALLY yields a terminal verdict "failed" row — the
+	// placeholder empty reviewer_model must NOT drop the entry. Decode the ACTUAL
+	// emitted bytes through that exact json contract so this fails if the
+	// placeholder fields ever stopped decoding (the concern's failure scenario),
+	// rather than only counting len(failures).
+	//
+	// The unexported reviewStatusFor lives in package main (backend/cmd/
+	// fishhawk-mcp) and is unreachable from this package, so this asserts the
+	// same decode contract it applies rather than calling it directly. The
+	// authoritative end-to-end reviewStatusFor assertion (started+placeholder
+	// failed pair resolving to status "failed") belongs in
+	// backend/cmd/fishhawk-mcp/review_test.go alongside the existing
+	// TestReviewStatusFor_Failed_WinsOverStarted; it is deferred here because
+	// that file is outside this change's scope.
+	raw := appendedPayload(t, au, "implement_review_failed")
+	var consumer struct {
+		Reason        string `json:"reason"`
+		ReviewerModel string `json:"reviewer_model"`
+		Authority     string `json:"authority"`
+	}
+	if err := json.Unmarshal(raw, &consumer); err != nil {
+		t.Fatalf("consumer decode rejected the synthesized placeholder payload: %v", err)
+	}
+	if consumer.ReviewerModel != "" {
+		t.Errorf("consumer reviewer_model = %q, want empty placeholder", consumer.ReviewerModel)
+	}
+	if consumer.Reason != orphanedReviewRestartReason {
+		t.Errorf("consumer reason = %q, want %q", consumer.Reason, orphanedReviewRestartReason)
+	}
+	// A cleanly-decoded placeholder is a terminal "failed" row for the consumer,
+	// so a 1-of-1 round settles — reviewStatusFor flips pending -> failed.
 	if !planreview.Settled(1, len(failures)) {
 		t.Error("synthesized failed entry did not settle the round")
 	}
+}
+
+// appendedPayload returns the raw JSON payload of the single audit entry the
+// reconcile appended for the given category, so a test can decode it through
+// the mcp consumer's exact json contract rather than the producer type.
+func appendedPayload(t *testing.T, au *auditFake, category string) []byte {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []byte
+	n := 0
+	for _, p := range au.appended {
+		if p.Category != category {
+			continue
+		}
+		out = p.Payload
+		n++
+	}
+	if n != 1 {
+		t.Fatalf("appended %s payloads = %d, want 1", category, n)
+	}
+	return out
 }
 
 // TestReconcileOrphanedReviews_NoStartedEntry covers the guard for a stage
