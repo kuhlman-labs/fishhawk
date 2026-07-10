@@ -139,6 +139,48 @@ func TestRender_AllLoop(t *testing.T) {
 	}
 }
 
+// TestRender_SemverHint pins the E33.5 wiring: Render emits the advisory
+// semver-bump line from releaseevidence.ClassifyBump where the reserved
+// `<!-- semver-hint -->` comment used to sit, and it exercises BOTH PreviewLine
+// branches — the no-signal (patch) basis and a fired-signal (major) basis that
+// names the introducing PR. A no-op comment touch that left the reserved slot
+// in place would fail the reserved-absent / patch-present assertions.
+func TestRender_SemverHint(t *testing.T) {
+	// Empty-signal case: no breaking/additive prose → patch, doc/test-only
+	// basis. Reuses the all-loop fixture (its changes carry no bump keywords).
+	patch := releasenotes.Render(allLoopFixture())
+	if strings.Contains(patch, "semver-hint: reserved") {
+		t.Errorf("reserved semver-hint slot still present (wiring not shipped):\n%s", patch)
+	}
+	if !strings.Contains(patch, "suggested bump: patch (because no breaking or additive signal detected; doc/test-only changes)") {
+		t.Errorf("patch suggested-bump line missing:\n%s", patch)
+	}
+
+	// Fired-signal case: a change whose plan summary carries a breaking-change
+	// keyword rolls the hint up to major and the parenthetical names the PR.
+	breaking := &releaseevidence.ReleaseEvidence{
+		Repo:         "kuhlman-labs/fishhawk",
+		PreviousRef:  "v0.9.0",
+		CandidateRef: "v1.0.0",
+		Changes: []releaseevidence.ChangeEvidence{
+			{
+				PullRequestURL:    "https://github.com/kuhlman-labs/fishhawk/pull/303",
+				PullRequestNumber: 303,
+				Title:             "Cut over to workflow-v1",
+				PlanSummary:       "This is a breaking change to the workflow schema major.",
+				LoopMerged:        true,
+			},
+		},
+	}
+	got := releasenotes.Render(breaking)
+	if !strings.Contains(got, "suggested bump: major (because") {
+		t.Errorf("major suggested-bump line missing:\n%s", got)
+	}
+	if !strings.Contains(got, "#303") {
+		t.Errorf("major hint does not name the introducing PR #303:\n%s", got)
+	}
+}
+
 // TestRender_NilAndEmpty pins the two defensive render branches: a nil model
 // and a release with no changes each produce a stable, non-fabricated document.
 func TestRender_NilAndEmpty(t *testing.T) {

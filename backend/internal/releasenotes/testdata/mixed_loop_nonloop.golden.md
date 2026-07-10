@@ -2,7 +2,7 @@
 
 Range: `v0.1.0..main`
 
-<!-- semver-hint: reserved for E33.4 -->
+suggested bump: patch (because no breaking or additive signal detected; doc/test-only changes)
 
 Total cost: $4.20
 

@@ -5351,8 +5351,10 @@ paths:
         release-notes markdown WITHOUT persisting anything (E33.2 / #1587). Per
         change the notes carry the plan summary + link, the reviewer verdicts,
         the acceptance outcome, and any deferred concerns; the header carries
-        the ref range, an empty semver-hint slot reserved for E33.4, and the
-        per-release cost rollup. A merged PR in range with no resolvable
+        the ref range, the advisory semver-bump hint (the heuristic
+        `suggested bump: <level> (because …)` line derived from the same
+        evidence, E33.4/E33.5), and the per-release cost rollup. A merged PR in
+        range with no resolvable
         Fishhawk run (a human-led / loop-bypassing change) is rendered as an
         explicitly-marked reduced-evidence entry per the ADR-051 honesty
         constraint — never fabricated with invented verdicts. Authenticated
@@ -5435,6 +5437,68 @@ paths:
           description: "`release_notes_assembly_failed` / `installation_resolution_failed` — as for the preview endpoint."
         '503':
           description: "`release_notes_unconfigured` / `github_app_not_installed` — as for the preview endpoint."
+
+  /v0/releases/cut:
+    post:
+      operationId: releaseCut
+      summary: Record the operator's ratified release-version decision
+      description: |
+        Records the operator's ratified release version as a `release_cut`
+        audit entry on the release run's chain (E33.5 / #1590, ADR-051), after
+        validating that `artifact_id` names a persisted `release_notes`
+        artifact. `version` is the ratified version; `bump_level` is the
+        OPTIONAL advisory semver level (`patch`/`minor`/`major`) the operator
+        settled on, recorded verbatim and never validated (it mirrors the
+        advisory classifier hint). A persisting write — requires the
+        `write:runs` scope.
+
+        Records the DECISION only: it appends the audit entry and performs NO
+        git tag push and NO GitHub write. Tagging the release stays a human git
+        action per the delegating posture — the operator pushes the tag out of
+        band once the cut is recorded.
+      tags: [audit]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [repo, run_id, artifact_id, version]
+              additionalProperties: false
+              properties:
+                repo: { type: string, description: "Repository (owner/name)." }
+                run_id: { $ref: '#/components/schemas/UUID' }
+                stage_id: { $ref: '#/components/schemas/UUID' }
+                artifact_id: { $ref: '#/components/schemas/UUID' }
+                version: { type: string, description: "The ratified release version." }
+                bump_level:
+                  type: string
+                  description: "Optional advisory semver level (patch/minor/major), recorded verbatim."
+      responses:
+        '201':
+          description: The release_cut decision was recorded.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: string }
+                  artifact_id: { $ref: '#/components/schemas/UUID' }
+                  content_hash: { type: string }
+                  bump_level: { type: string }
+                  recorded: { type: boolean }
+        '400':
+          description: "`validation_failed` — malformed body, missing `repo`/`run_id`/`artifact_id`/`version`, or a non-UUID id."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: "`artifact_not_found` — no artifact with that id."
+        '409':
+          description: "`artifact_wrong_kind` — the artifact is not a `release_notes` artifact."
+        '500':
+          description: "`release_cut_failed` — an artifact load fault; `release_cut_audit_failed` — the durable `release_cut` audit append failed."
+        '503':
+          description: "`release_cut_unconfigured` — artifact/audit repo not wired."
 
   /v0/releases/publish:
     post:

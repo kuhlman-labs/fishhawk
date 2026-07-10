@@ -2,7 +2,7 @@
 
 Range: `abc1234..def5678`
 
-<!-- semver-hint: reserved for E33.4 -->
+suggested bump: patch (because no breaking or additive signal detected; doc/test-only changes)
 
 Total cost: $7.50
 
