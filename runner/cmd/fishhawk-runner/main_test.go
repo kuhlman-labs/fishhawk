@@ -3949,6 +3949,93 @@ func TestSweepStalePullRequestDescription_RemoveError(t *testing.T) {
 	}
 }
 
+// withAcceptanceVerdictPaths redirects the keyed verdict dir AND the legacy
+// fixed-path fallback to temp dirs for the test, restoring the production values
+// via t.Cleanup so a real /tmp/fishhawk-acceptance*.json never leaks into a test.
+// Returns the run/stage-KEYED path for the given ids (the sweep's first target).
+func withAcceptanceVerdictPaths(t *testing.T, runID, stageID string) string {
+	t.Helper()
+	origDir := acceptanceVerdictDir
+	acceptanceVerdictDir = t.TempDir()
+	origLegacy := legacyAcceptanceVerdictPath
+	legacyAcceptanceVerdictPath = filepath.Join(t.TempDir(), "fishhawk-acceptance.json")
+	t.Cleanup(func() {
+		acceptanceVerdictDir = origDir
+		legacyAcceptanceVerdictPath = origLegacy
+	})
+	return acceptanceVerdictPath(runID, stageID)
+}
+
+// TestSweepStaleAcceptanceVerdict (#1780, extracted from the inline #1535/#1777
+// stale-clear): the pre-invoke sweep removes a stale verdict at BOTH the keyed
+// and legacy paths and emits acceptance_verdict_swept for each; an absent path is
+// a silent no-op. Twin of TestSweepStalePullRequestDescription.
+func TestSweepStaleAcceptanceVerdict(t *testing.T) {
+	keyed := withAcceptanceVerdictPaths(t, "r", "s")
+	cfg := config{runID: "r", stageID: "s"}
+
+	// Absent both → silent no-op, returns ok.
+	var quiet strings.Builder
+	if !sweepStaleAcceptanceVerdict(cfg, &quiet) {
+		t.Errorf("absent files must return ok, got false:\n%s", quiet.String())
+	}
+	if strings.Contains(quiet.String(), "acceptance_verdict_swept") {
+		t.Errorf("absent files must not emit acceptance_verdict_swept, got:\n%s", quiet.String())
+	}
+
+	// Stale keyed + legacy files → both swept, both emit, returns ok.
+	if err := os.WriteFile(keyed, []byte("stale keyed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyAcceptanceVerdictPath, []byte("stale legacy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	if !sweepStaleAcceptanceVerdict(cfg, &stderr) {
+		t.Errorf("swept files must return ok, got false:\n%s", stderr.String())
+	}
+	if _, statErr := os.Stat(keyed); !os.IsNotExist(statErr) {
+		t.Errorf("keyed stale verdict must be swept, stat err = %v", statErr)
+	}
+	if _, statErr := os.Stat(legacyAcceptanceVerdictPath); !os.IsNotExist(statErr) {
+		t.Errorf("legacy stale verdict must be swept, stat err = %v", statErr)
+	}
+	swept := strings.Count(stderr.String(), `"event":"acceptance_verdict_swept"`)
+	if swept != 2 {
+		t.Errorf("expected 2 acceptance_verdict_swept events (keyed + legacy), got %d:\n%s", swept, stderr.String())
+	}
+}
+
+// TestSweepStaleAcceptanceVerdict_RemoveError (#1780 addendum, binding
+// condition): a stale readable verdict the runner cannot unlink must fail LOUD,
+// not be silently read and shipped by captureAcceptanceVerdict. A non-empty
+// directory at the legacy path makes os.Remove fail ENOTEMPTY (not not-exist),
+// so the sweep must emit an acceptance_stale_verdict_clear category-C
+// runner_failed and return false. Twin of
+// TestSweepStalePullRequestDescription_RemoveError.
+func TestSweepStaleAcceptanceVerdict_RemoveError(t *testing.T) {
+	withAcceptanceVerdictPaths(t, "r", "s")
+	cfg := config{runID: "r", stageID: "s"}
+
+	// Make the legacy path an un-removable non-empty directory: os.Remove
+	// returns "directory not empty", which is NOT os.IsNotExist.
+	if err := os.MkdirAll(filepath.Join(legacyAcceptanceVerdictPath, "child"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr strings.Builder
+	if sweepStaleAcceptanceVerdict(cfg, &stderr) {
+		t.Errorf("an un-removable stale legacy verdict must fail the sweep, got ok:\n%s", stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, `"reason":"acceptance_stale_verdict_clear"`) {
+		t.Errorf("expected acceptance_stale_verdict_clear runner_failed event, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"category":"C"`) {
+		t.Errorf("stale-clear failure must be category C, got:\n%s", out)
+	}
+}
+
 func TestRun_ImplementStage_PassesAgentAuthoredPRTitle(t *testing.T) {
 	// End-to-end: agent wrote /tmp/fishhawk-pr.md (via the
 	// PullRequestDescriptionPath constant in the prompt), the

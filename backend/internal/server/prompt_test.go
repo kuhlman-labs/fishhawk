@@ -27,6 +27,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
@@ -6991,6 +6992,55 @@ func TestGetStagePromptRender_Acceptance_PopulatesCriteria(t *testing.T) {
 	}
 	if strings.Contains(body, "### Diff under review") {
 		t.Errorf("rendered acceptance prompt must withhold the diff:\n%s", body)
+	}
+}
+
+// TestGetStagePrompt_Acceptance_ThreadsKeyedVerdictPath is the #1780 cross-
+// boundary guard (binding condition, discipline of #1774/#627): the acceptance-
+// stage /prompt handler must thread the REAL runRow.ID/stage.ID into the
+// rendered prompt so the output-contract line names the fully-substituted keyed
+// /tmp/fishhawk-acceptance-<runID>-<stageID>.json path — the SAME path the
+// runner reads first. A unit-level buildAcceptance render with hand-set ids
+// cannot catch a handler that drops the threading; this asserts it at the
+// server boundary.
+func TestGetStagePrompt_Acceptance_ThreadsKeyedVerdictPath(t *testing.T) {
+	s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+	w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	wantKeyed := prompt.AcceptanceVerdictPath(runID.String(), acceptanceStageID.String())
+	if !strings.Contains(resp.Prompt, "write the verdict as a single JSON object to "+wantKeyed) {
+		t.Errorf("acceptance /prompt did not thread run/stage ids into the keyed verdict path %q:\n%s", wantKeyed, resp.Prompt)
+	}
+	// The legacy fixed path must NOT appear on the fully-keyed happy path.
+	if strings.Contains(resp.Prompt, "object to "+prompt.LegacyAcceptanceVerdictPath+" —") {
+		t.Errorf("acceptance /prompt named the legacy fixed path despite threaded ids:\n%s", resp.Prompt)
+	}
+}
+
+// TestGetStagePromptRender_Acceptance_ThreadsKeyedVerdictPath is the SPA-render
+// twin: the /prompt-render handler duplicates trigger construction, so the
+// acceptance keyed-path threading must land in BOTH branches (#1780 binding
+// condition — "for BOTH acceptance dispatch branches") or the SPA view diverges
+// from the runner path.
+func TestGetStagePromptRender_Acceptance_ThreadsKeyedVerdictPath(t *testing.T) {
+	s, runID, acceptanceStageID, _, _ := newAcceptancePromptServer(t)
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt-render", acceptanceStageID), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	wantKeyed := prompt.AcceptanceVerdictPath(runID.String(), acceptanceStageID.String())
+	if !strings.Contains(body, "write the verdict as a single JSON object to "+wantKeyed) {
+		t.Errorf("rendered acceptance prompt did not thread run/stage ids into the keyed verdict path %q:\n%s", wantKeyed, body)
 	}
 }
 

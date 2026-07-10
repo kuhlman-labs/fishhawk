@@ -50,21 +50,24 @@ var acceptanceVerdictDir = "/tmp"
 // verdict (the codex path — Invocation.JSONSchema is a claudecode-only feature,
 // so StructuredOutput stays nil there). Keyed by the FULL run id + stage id
 // (#1777) so parallel acceptance runners on one host no longer share a single
-// fixed path. The acceptance prompt still names the LEGACY fixed path
-// (backend/internal/prompt/prompt.go AcceptanceVerdictPath is not keyed, because
-// the acceptance Trigger threads no run/stage ids), so the runner reads the
-// keyed path FIRST and falls back to the legacy path (binding condition 1) — a
-// fixed-path prompt render is therefore never stranded in verdict-missing, and
-// keying the prompt later needs no runner change.
+// fixed path. The acceptance prompt now NAMES this run/stage-keyed path
+// (backend/internal/prompt/prompt.go AcceptanceVerdictPath is keyed as of #1780,
+// because the acceptance Trigger threads AcceptanceRunID/AcceptanceStageID), so
+// the runner's keyed-first read matches the prompt's keyed write on the happy
+// path. The legacy fixed path is retained as the fallback (binding condition 1)
+// — a trigger missing ids (rendered via the legacy path) is therefore never
+// stranded in verdict-missing. MUST stay byte-identical to the prompt's keyed
+// AcceptanceVerdictPath format string.
 func acceptanceVerdictPath(runID, stageID string) string {
 	return filepath.Join(acceptanceVerdictDir, fmt.Sprintf("fishhawk-acceptance-%s-%s.json", runID, stageID))
 }
 
-// legacyAcceptanceVerdictPath is the fixed shared path the acceptance prompt's
-// output contract still names (prompt.AcceptanceVerdictPath). The runner reads
-// the keyed path first and falls back to THIS legacy path (binding condition 1),
-// so today's fixed-path prompt render lands its verdict. MUST stay byte-identical
-// to prompt.AcceptanceVerdictPath. var (not const) so tests can redirect it.
+// legacyAcceptanceVerdictPath is the fixed shared path the acceptance prompt
+// named before #1780 keyed it (prompt.LegacyAcceptanceVerdictPath). The runner
+// reads the keyed path first and falls back to THIS legacy path (binding
+// condition 1), so a trigger that threads no ids — rendered via the legacy path
+// — still lands its verdict. MUST stay byte-identical to
+// prompt.LegacyAcceptanceVerdictPath. var (not const) so tests can redirect it.
 var legacyAcceptanceVerdictPath = "/tmp/fishhawk-acceptance.json"
 
 // acceptanceVerdictJSONSchema is the structured-output schema for the
