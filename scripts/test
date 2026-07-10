@@ -78,22 +78,40 @@ _lease_token() {
 # sections. mkdir is atomic on POSIX, so exactly one racer wins. The lock records
 # its owner PID inside the lock dir; before each retry the spin loop checks that
 # owner with `kill -0` and BREAKS a lock whose owner is dead (rm -rf, then retry
-# mkdir) so a SIGKILL'd holder can never permanently wedge later invocations.
+# mkdir) so a SIGKILL'd holder can never permanently wedge later invocations. A
+# lock that stays OWNERLESS (empty/garbage owner file) past a bounded grace
+# window is ALSO broken: the winner stamps its PID on the line immediately after
+# mkdir, so a persistently ownerless lock means the holder was SIGKILL'd in that
+# acquisition window before stamping — an ownerless-forever wedge the kill -0
+# check alone cannot recover (there is no PID to test). The grace window
+# tolerates the sub-poll transient where a live holder simply hasn't stamped yet.
 # Returns non-zero if the bounded retry cap is exhausted with a LIVE owner still
 # holding it (stuck) — callers must then fail SAFE (never docker-rm under an
 # uncertain lease state).
 _lease_lock() {
   local lock="$LEASE_DIR.lock"
   local cap="${FISHHAWK_TEST_LEASE_LOCK_CAP:-50}"
-  local tries=0 owner
+  local grace="${FISHHAWK_TEST_LEASE_LOCK_GRACE:-10}"
+  local tries=0 ownerless=0 owner
   while ! mkdir "$lock" 2>/dev/null; do
     owner=""
     if [ -r "$lock/owner" ]; then
       owner="$(cat "$lock/owner" 2>/dev/null || true)"
     fi
     case "$owner" in
-      ''|*[!0-9]*) : ;;  # no/garbage owner (transient: holder not yet stamped) — wait it out
+      ''|*[!0-9]*)
+        # No/garbage owner: either a holder that has not stamped its PID yet
+        # (sub-poll transient) or one SIGKILL'd between mkdir and stamping
+        # (ownerless forever). Distinguish by persistence — break the lock once
+        # it has stayed ownerless for `grace` consecutive polls.
+        ownerless=$((ownerless + 1))
+        if [ "$ownerless" -ge "$grace" ]; then
+          rm -rf "$lock" 2>/dev/null || true  # ownerless-window death → break it
+          ownerless=0
+        fi
+        ;;
       *)
+        ownerless=0
         if ! kill -0 "$owner" 2>/dev/null; then
           rm -rf "$lock" 2>/dev/null || true  # dead owner → break the stale lock
         fi
@@ -132,22 +150,33 @@ _prune_dead_leases() {
   done
 }
 
-# _register_lease: record this invocation's lease under the lock. No-op without
-# Docker (nothing to refcount).
+# _register_lease: record this invocation's lease under the lock. Returns
+# non-zero when it did NOT record a lease — no Docker (nothing to refcount) or a
+# live-but-stuck lock the retry cap could not acquire. The caller MUST treat a
+# non-zero return as "hold no lease" and NOT arm the reap: an invocation that
+# never recorded a lease must never docker-rm the shared container, or it could
+# reap it out from under a peer whose lease it never got the lock to see (the
+# register-timeout lifecycle hole).
 _register_lease() {
-  command -v docker >/dev/null 2>&1 || return 0
-  _lease_lock || return 0  # lock stuck → skip; a missed register can't over-reap
+  command -v docker >/dev/null 2>&1 || return 1
+  _lease_lock || return 1  # lock stuck → hold NO lease; caller must NOT arm reap
   mkdir -p "$LEASE_DIR" 2>/dev/null || true
   _prune_dead_leases
   : > "$LEASE_DIR/$(_lease_token)" 2>/dev/null || true
   _lease_unlock
+  return 0
 }
 
-# _arm_container_lease: register this invocation's lease and arm the reap trap.
-# Replaces the bare EXIT trap at the top of cmd_test / cmd_coverage.
+# _arm_container_lease: register this invocation's lease and arm the reap trap
+# ONLY if the lease was actually recorded. Replaces the bare EXIT trap at the top
+# of cmd_test / cmd_coverage. If registration failed (no Docker, or a live-stuck
+# lock), we hold no lease and deliberately do NOT arm the reap — the container is
+# left for a lease-holding invocation to reap, never removed under an uncertain
+# lease state.
 _arm_container_lease() {
-  _register_lease
-  trap _reap_shared_container EXIT
+  if _register_lease; then
+    trap _reap_shared_container EXIT
+  fi
 }
 
 # _reap_shared_container: EXIT-trap teardown. Remove ONLY this invocation's lease

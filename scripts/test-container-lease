@@ -129,6 +129,57 @@ else
 fi
 unset FISHHAWK_TEST_LEASE_LOCK_CAP
 
+# (g) stale-lock-broken (ownerless acquisition window): a lock dir left with NO
+# owner file — a holder SIGKILL'd between mkdir and stamping its PID — is broken
+# once it stays ownerless past the grace window, so the operation proceeds. This
+# is the acquisition-window failure the populated-dead-owner case (d) does not
+# cover. Reap is the last holder, so a successful break lets it docker rm once.
+reset_case g
+export FISHHAWK_TEST_LEASE_TOKEN=$$
+export FISHHAWK_TEST_LEASE_LOCK_GRACE=2    # short grace so the test is fast
+mkdir -p "$LEASE_DIR"
+: > "$LEASE_DIR/$(_lease_token)"           # our lease → reap is last holder
+mkdir -p "$LEASE_DIR.lock"                 # lock dir with NO owner file stamped
+_reap_shared_container
+if [ "$(rm_count)" -eq 1 ] && [ ! -d "$LEASE_DIR.lock" ]; then
+  pass "stale-lock-broken-ownerless: acquisition-window lock broken, reap proceeds"
+else
+  fail "stale-lock-broken-ownerless: expected lock broken + 1 docker rm, got $(rm_count) (lock exists: $([ -d "$LEASE_DIR.lock" ] && echo yes || echo no))"
+fi
+unset FISHHAWK_TEST_LEASE_LOCK_GRACE
+
+# (h) register-timeout lifecycle: when the lock is live-stuck, _register_lease
+# records NO lease and returns non-zero, and _arm_container_lease then does NOT
+# arm the reap trap — so this invocation can never docker-rm the shared container
+# out from under a concurrent invocation whose live lease it never got the lock
+# to see. Guards the register-timeout hole the direct reap fail-safe (e) misses.
+reset_case h
+export FISHHAWK_TEST_LEASE_TOKEN=$$
+export FISHHAWK_TEST_LEASE_LOCK_CAP=2     # short cap so the test is fast
+mkdir -p "$LEASE_DIR"
+sleep 60 &                                # a concurrent invocation still testing
+other=$!
+disown "$other" 2>/dev/null || true       # silence job-control "Terminated" noise
+: > "$LEASE_DIR/$other"                   # its live lease keeps the dir non-empty
+mkdir -p "$LEASE_DIR.lock"
+printf '%s\n' "$$" > "$LEASE_DIR.lock/owner"  # live owner (this process) → stuck
+_register_lease
+reg_rc=$?
+saved_trap="$(trap -p EXIT)"              # preserve the test's own cleanup trap
+_arm_container_lease
+armed_trap="$(trap -p EXIT)"
+eval "$saved_trap"                        # restore cleanup trap (untouched if unarmed)
+kill "$other" 2>/dev/null
+if [ "$reg_rc" -ne 0 ] && [ ! -e "$LEASE_DIR/$(_lease_token)" ] \
+   && [ -e "$LEASE_DIR/$other" ] \
+   && ! printf '%s' "$armed_trap" | grep -q _reap_shared_container \
+   && [ "$(rm_count)" -eq 0 ]; then
+  pass "register-timeout: stuck lock records no lease, reap unarmed, container kept"
+else
+  fail "register-timeout: expected no lease + reap unarmed + 0 docker rm (reg_rc=$reg_rc, rm=$(rm_count))"
+fi
+unset FISHHAWK_TEST_LEASE_LOCK_CAP
+
 # (f) parse-clean: scripts/test itself parses with no syntax errors.
 if bash -n "$REPO_ROOT/scripts/test" 2>/dev/null; then
   pass "bash -n scripts/test parses clean"
