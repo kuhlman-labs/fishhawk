@@ -4945,3 +4945,27 @@ func TestImplementReviewInvocations_FiresPageClassHook(t *testing.T) {
 		t.Errorf("implement-review site did not invoke the page-class hook; paged=%v", rec.pageClass)
 	}
 }
+
+// TestImplementReviewInvocations_ApproveSkipsPageClassHook proves the #1786
+// gating condition, not merely call-site invocation: an all-approve loop
+// appends no implement_reviewed reject (no page-class event), so it must NOT
+// invoke the immediate hook — which, evaluating the full audit history, would
+// otherwise flush an older unpinged page-class event at this unrelated moment.
+func TestImplementReviewInvocations_ApproveSkipsPageClassHook(t *testing.T) {
+	au := newSeqAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	rec := &pageClassRecorder{}
+	s.issueNotifier = rec
+	runID, stageID := uuid.New(), uuid.New()
+
+	rev := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "gpt-5.5",
+	}
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget)
+
+	if rec.pagedRun(runID) {
+		t.Errorf("implement-review site fired the page-class hook on an all-approve loop; paged=%v", rec.pageClass)
+	}
+}

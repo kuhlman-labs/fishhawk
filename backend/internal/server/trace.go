@@ -3035,6 +3035,13 @@ func (s *Server) approvedAmendmentScopePaths(ctx context.Context, runID uuid.UUI
 func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel, origin, headSHA string, reviewBudget planreview.ReviewBudget) bool {
 	systemKind := audit.ActorKind("system")
 	hasRejection := false
+	// pagedRejectAppended tracks whether THIS loop appended a page-class audit
+	// entry — an implement_reviewed reject verdict (#1786). Gating the
+	// immediate hook on this (not on an unconditional call) keeps an
+	// all-approve loop from calling NotifyPageClassForRun, which evaluates the
+	// full audit history and would otherwise flush an OLDER unpinged
+	// page-class event at this unrelated moment.
+	pagedRejectAppended := false
 	budget := reviewBudget.Budget(len(promptText))
 	for i, inv := range invocations {
 		// An unresolvable provider is a deployment CAPABILITY gap, not a
@@ -3141,6 +3148,7 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 
 		if verdict.Verdict == planreview.VerdictReject {
 			hasRejection = true
+			pagedRejectAppended = true
 		}
 	}
 
@@ -3156,9 +3164,15 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 
 	// Fire the page-class ping immediately (#1786) so a reviewer reject pages
 	// the operator within the review append flow rather than riding the next
-	// transition (the operator's own fixup/approve) minutes later. Deduped on
-	// the source Sequence, so it never double-posts with notifyStatusUpdate.
-	s.notifyPageClass(ctx, runID, "implement_review")
+	// transition (the operator's own fixup/approve) minutes later — but ONLY
+	// when this loop actually appended a reject verdict (the page-class event).
+	// An all-approve loop appends no page-class entry, so an unconditional call
+	// would flush an OLDER unpinged page-class event at this unrelated moment.
+	// Deduped on the source Sequence, so it never double-posts with
+	// notifyStatusUpdate.
+	if pagedRejectAppended {
+		s.notifyPageClass(ctx, runID, "implement_review")
+	}
 
 	return hasRejection
 }
