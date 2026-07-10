@@ -2726,6 +2726,41 @@ func resolvePolicyBaseRef(ctx context.Context, cfg config, logSink io.Writer) st
 	return baseRef
 }
 
+// resolveDiffBaseRef anchors the staged-index diff to the run's fork point.
+//
+// ADR-043 rev 2 (#1294): convert the staged-index policy diff from a
+// 2-dot comparison (staged index vs. the base-branch TIP) to a 3-dot one
+// (staged index vs. the run's fork point) by diffing against the
+// merge-base of baseRef and HEAD instead of the moving tip. Without this,
+// a file the base branch added orthogonally AFTER the run branched is
+// present in the tip's tree but absent from the run's index, so `git diff
+// --cached <tip>` reports it as a phantom deletion (status D) that
+// inflates the StagedFiles count gateevidence + the #1151
+// scope-completeness gate read — reproducing #1290's 16-staged-vs-7-
+// declared implement-review failure. merge-base is a purely LOCAL git
+// operation (no forge API), so the gate stays provider-agnostic.
+//
+// FAIL-OPEN: if the merge-base cannot be resolved (unrelated histories,
+// shallow clone, or a base ref not yet fetched locally) we log a
+// degradation line and fall back to the original tip baseRef — today's
+// exact behavior — never blocking the diff. The caller keeps baseRef as
+// the human-meaningful label on the git_diff event; the returned ref is
+// the commit-ish the staged index is actually measured against, so the
+// name-status (Run), patch (RunPatch), and numstat are all 3-dot and
+// internally consistent. Both git_diff emitters (computeAndEmitDiff and
+// reemitScopedGitDiff) call this so the two paths cannot drift apart —
+// that drift was the #1801 phantom-deletion re-emit bug.
+func resolveDiffBaseRef(ctx context.Context, baseRef, repoDir, stageID string, logSink io.Writer) string {
+	mb, mbErr := (&gitdiff.Runner{}).MergeBase(ctx, baseRef, repoDir)
+	if mbErr != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"merge_base_unresolved","stage_id":%q,"base_ref":%q,"detail":%q}`+"\n",
+			stageID, baseRef, mbErr.Error())
+		return baseRef
+	}
+	return mb
+}
+
 func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent.Event, error) {
 	repoDir := cfg.workingDir
 	if repoDir == "" {
@@ -2738,34 +2773,11 @@ func computeAndEmitDiff(cfg config, logSink io.Writer) (constraint.Diff, []agent
 	// (#765); for everything else it is cfg.checkBaseRef unchanged.
 	baseRef := resolvePolicyBaseRef(context.Background(), cfg, logSink)
 
-	// ADR-043 rev 2 (#1294): convert the staged-index policy diff from a
-	// 2-dot comparison (staged index vs. the base-branch TIP) to a 3-dot one
-	// (staged index vs. the run's fork point) by diffing against the
-	// merge-base of baseRef and HEAD instead of the moving tip. Without this,
-	// a file the base branch added orthogonally AFTER the run branched is
-	// present in the tip's tree but absent from the run's index, so `git diff
-	// --cached <tip>` reports it as a phantom deletion (status D) that
-	// inflates the StagedFiles count gateevidence + the #1151
-	// scope-completeness gate read — reproducing #1290's 16-staged-vs-7-
-	// declared implement-review failure. merge-base is a purely LOCAL git
-	// operation (no forge API), so the gate stays provider-agnostic.
-	//
-	// FAIL-OPEN: if the merge-base cannot be resolved (unrelated histories,
-	// shallow clone, or a base ref not yet fetched locally) we log a
-	// degradation line and fall back to the original tip baseRef — today's
-	// exact behavior — never blocking the diff. baseRef stays the
-	// human-meaningful label on the git_diff event; diffBaseRef is the
-	// commit-ish the staged index is actually measured against, so the
-	// name-status (Run), patch (RunPatch), and numstat are all 3-dot and
-	// internally consistent.
-	diffBaseRef := baseRef
-	if mb, mbErr := (&gitdiff.Runner{}).MergeBase(context.Background(), baseRef, repoDir); mbErr != nil {
-		_, _ = fmt.Fprintf(logSink,
-			`{"event":"merge_base_unresolved","stage_id":%q,"base_ref":%q,"detail":%q}`+"\n",
-			cfg.stageID, baseRef, mbErr.Error())
-	} else {
-		diffBaseRef = mb
-	}
+	// Anchor the diff to the run's fork point (3-dot) — see resolveDiffBaseRef.
+	// baseRef stays the human-meaningful label on the git_diff event;
+	// diffBaseRef is the commit-ish the staged index is actually measured
+	// against.
+	diffBaseRef := resolveDiffBaseRef(context.Background(), baseRef, repoDir, cfg.stageID, logSink)
 
 	var events []agent.Event
 
@@ -2910,12 +2922,23 @@ func categorizeDrift(ctx context.Context, repoDir string, drift []string, decomp
 // re-stage) it logs a degradation line and returns nil. The original git_diff
 // stays in the bundle as a graceful fallback, and the stage is never failed on a
 // re-emit error — the load-bearing gate already passed inside the loop.
+//
+// Like computeAndEmitDiff, this anchors the reviewed diff to the run's fork
+// point (3-dot) via resolveDiffBaseRef — because ExtractDiff's last-write-wins
+// invariant makes THIS re-emitted event the one the implement reviewer reads.
+// The two emitters share the same merge-base helper so they cannot drift apart:
+// the prior 2-dot re-emit reported a parallel mid-run merge to main as phantom
+// deletions of the merged feature's files (#1801).
 func reemitScopedGitDiff(cfg config, logSink io.Writer) []agent.Event {
 	repoDir := cfg.workingDir
 	if repoDir == "" {
 		repoDir = "."
 	}
 	baseRef := resolvePolicyBaseRef(context.Background(), cfg, logSink)
+	// diffBaseRef is what the diff is measured against (3-dot fork point);
+	// baseRef stays the human-meaningful label on the git_diff event, exactly
+	// as computeAndEmitDiff does.
+	diffBaseRef := resolveDiffBaseRef(context.Background(), baseRef, repoDir, cfg.stageID, logSink)
 
 	// Re-stage the reconciled in-scope tree. The verify-fix loop's final
 	// `git reset --soft` preserves the index, but re-staging is deterministic and
@@ -2939,21 +2962,21 @@ func reemitScopedGitDiff(cfg config, logSink io.Writer) []agent.Event {
 	}
 
 	runner := &gitdiff.Runner{}
-	d, err := runner.Run(context.Background(), baseRef, repoDir)
+	d, err := runner.Run(context.Background(), diffBaseRef, repoDir)
 	if err != nil {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"git_diff_reemit_skipped","stage_id":%q,"detail":%q}`+"\n",
 			cfg.stageID, fmt.Sprintf("name-status: %v", err))
 		return nil
 	}
-	patch, truncated, perr := runner.RunPatch(context.Background(), baseRef, repoDir)
+	patch, truncated, perr := runner.RunPatch(context.Background(), diffBaseRef, repoDir)
 	if perr != nil {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"git_diff_patch_failed","base_ref":%q,"detail":%q}`+"\n",
-			baseRef, perr.Error())
+			diffBaseRef, perr.Error())
 		patch, truncated = "", false
 	}
-	ins, dels := computeDiffNumstat(context.Background(), baseRef, repoDir, logSink)
+	ins, dels := computeDiffNumstat(context.Background(), diffBaseRef, repoDir, logSink)
 	return []agent.Event{makeGitDiffEventStats(baseRef, d, patch, truncated, ins, dels)}
 }
 
