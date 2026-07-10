@@ -34,6 +34,14 @@ import (
 // via Client.BaseURL pointing at httptest fakes.
 const DefaultBaseURL = "https://api.github.com"
 
+// DefaultUploadBaseURL is GitHub's release-asset upload host. Release
+// asset uploads go to a SEPARATE host from the REST API — POST
+// https://uploads.github.com/repos/{owner}/{repo}/releases/{id}/assets
+// (per the GitHub REST "Upload a release asset" docs). Tests override this
+// via Client.UploadBaseURL pointing at an httptest fake, and the upload
+// test asserts the request hit THIS host, not api.github.com.
+const DefaultUploadBaseURL = "https://uploads.github.com"
+
 // WorkflowSpecPath is the canonical location of the workflow spec
 // in a customer's repo (per MVP_SPEC §4.1).
 const WorkflowSpecPath = ".fishhawk/workflows.yaml"
@@ -97,6 +105,13 @@ type FileContent struct {
 type Client struct {
 	// BaseURL is the API root. Empty → DefaultBaseURL.
 	BaseURL string
+
+	// UploadBaseURL is the release-asset upload host. Empty →
+	// DefaultUploadBaseURL. Release asset uploads (UploadReleaseAsset)
+	// target this host, not BaseURL — GitHub serves asset uploads from
+	// uploads.github.com rather than api.github.com. Test-overridable to
+	// point at an httptest fake.
+	UploadBaseURL string
 
 	// Tokens issues installation-scoped Authorization tokens.
 	Tokens githubapp.TokenProvider
@@ -940,6 +955,193 @@ func (c *Client) EditPullRequest(ctx context.Context, installationID int64,
 	}
 	defer func() { _ = resp.Body.Close() }()
 	return classifyStatus("edit pr", resp)
+}
+
+// ReleaseAsset is one asset attached to a GitHub Release — the id (used to
+// delete/replace the asset) and its file name (matched against the fixed
+// release-notes asset name for idempotent replacement). Other fields
+// (size, content_type, download URL) land here as callers need them.
+type ReleaseAsset struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+}
+
+// Release is the slice of a GitHub Release payload the publish integration
+// reads (E33.3 / #1588): the numeric id (addresses the body-PATCH + asset
+// endpoints), the tag, the current body (hashed for content-hash idempotency),
+// the html_url (recorded on the release_published audit entry), and the
+// attached assets (scanned for the fixed release-notes asset to replace).
+type Release struct {
+	ID      int64          `json:"id"`
+	TagName string         `json:"tag_name"`
+	Body    string         `json:"body"`
+	HTMLURL string         `json:"html_url"`
+	Assets  []ReleaseAsset `json:"assets"`
+}
+
+// GetReleaseByTag fetches a published Release by its tag (E33.3 / #1588).
+//
+//	GET /repos/{owner}/{repo}/releases/tags/{tag}
+//
+// Returns ErrNotFound when no release exists for the tag (or the repo isn't
+// visible to the installation), ErrForbidden on auth issues. The Releases
+// endpoints are covered by the App's existing contents:write grant — no new
+// permission (ADR-051 accepted-condition 3, confirmed on #1588).
+func (c *Client) GetReleaseByTag(ctx context.Context, installationID int64, repo RepoRef, tag string) (*Release, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if tag == "" {
+		return nil, errors.New("githubclient: tag is required")
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/releases/tags/" + escapePath(tag))
+	req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: get release by tag: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if err := classifyStatus("get release by tag", resp); err != nil {
+		return nil, err
+	}
+	var rel Release
+	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+		return nil, fmt.Errorf("githubclient: decode release: %w", err)
+	}
+	return &rel, nil
+}
+
+// UpdateReleaseBody replaces a Release's body with the persisted release-notes
+// markdown (E33.3 / #1588). Mirrors EditPullRequest's PATCH-with-body shape.
+//
+//	PATCH /repos/{owner}/{repo}/releases/{id}
+//	{ "body": "<body>" }
+//
+// Returns ErrNotFound when the release/repo isn't visible to the installation,
+// ErrForbidden on auth issues, ErrValidation when GitHub rejects the update.
+func (c *Client) UpdateReleaseBody(ctx context.Context, installationID int64, repo RepoRef, releaseID int64, body string) error {
+	if c.Tokens == nil {
+		return errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return errors.New("githubclient: repo owner and name required")
+	}
+	if releaseID <= 0 {
+		return errors.New("githubclient: release id must be > 0")
+	}
+
+	raw, err := json.Marshal(map[string]string{"body": body})
+	if err != nil {
+		return fmt.Errorf("githubclient: marshal update release body: %w", err)
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/releases/" + url.PathEscape(fmt.Sprintf("%d", releaseID)))
+	req, err := c.buildRequest(ctx, http.MethodPatch, endpoint, bytes.NewReader(raw), installationID)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("githubclient: update release body: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return classifyStatus("update release body", resp)
+}
+
+// DeleteReleaseAsset removes an existing release asset by id (E33.3 / #1588).
+// The publish integration deletes a stale release-notes asset by name before
+// re-uploading, so the attached asset can never diverge from the Release body
+// (binding approval condition: content-hash idempotency for both surfaces).
+//
+//	DELETE /repos/{owner}/{repo}/releases/assets/{asset_id}
+//
+// A 204 (no content) is success. Returns ErrNotFound when the asset/repo isn't
+// visible, ErrForbidden on auth issues.
+func (c *Client) DeleteReleaseAsset(ctx context.Context, installationID int64, repo RepoRef, assetID int64) error {
+	if c.Tokens == nil {
+		return errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return errors.New("githubclient: repo owner and name required")
+	}
+	if assetID <= 0 {
+		return errors.New("githubclient: asset id must be > 0")
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/releases/assets/" + url.PathEscape(fmt.Sprintf("%d", assetID)))
+	req, err := c.buildRequest(ctx, http.MethodDelete, endpoint, nil, installationID)
+	if err != nil {
+		return err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("githubclient: delete release asset: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return classifyStatus("delete release asset", resp)
+}
+
+// UploadReleaseAsset attaches raw bytes to a Release as a named asset
+// (E33.3 / #1588). It targets the SEPARATE upload host (UploadBaseURL /
+// uploads.github.com), NOT the REST API host — GitHub serves asset uploads
+// from a different origin.
+//
+//	POST {UploadBaseURL}/repos/{owner}/{repo}/releases/{id}/assets?name={name}
+//	Content-Type: <contentType>
+//	<raw bytes>
+//
+// Returns ErrNotFound when the release/repo isn't visible to the installation,
+// ErrForbidden on auth issues, ErrValidation when GitHub rejects the upload
+// (e.g. an asset with the same name already exists — the caller deletes the
+// stale asset first).
+func (c *Client) UploadReleaseAsset(ctx context.Context, installationID int64, repo RepoRef, releaseID int64, name, contentType string, data []byte) error {
+	if c.Tokens == nil {
+		return errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return errors.New("githubclient: repo owner and name required")
+	}
+	if releaseID <= 0 {
+		return errors.New("githubclient: release id must be > 0")
+	}
+	if name == "" {
+		return errors.New("githubclient: asset name is required")
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	endpoint := c.uploadEndpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/releases/" + url.PathEscape(fmt.Sprintf("%d", releaseID)) +
+		"/assets?name=" + url.QueryEscape(name))
+	req, err := c.buildRequest(ctx, http.MethodPost, endpoint, bytes.NewReader(data), installationID)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", contentType)
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("githubclient: upload release asset: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return classifyStatus("upload release asset", resp)
 }
 
 // CompareCommits returns the SHAs of the commits on head since its
@@ -2890,6 +3092,17 @@ func (c *Client) endpoint(path string) string {
 	base := c.BaseURL
 	if base == "" {
 		base = DefaultBaseURL
+	}
+	return base + path
+}
+
+// uploadEndpoint returns UploadBaseURL + path, defaulting to
+// uploads.github.com. Release-asset uploads use this host, not endpoint's
+// api.github.com root.
+func (c *Client) uploadEndpoint(path string) string {
+	base := c.UploadBaseURL
+	if base == "" {
+		base = DefaultUploadBaseURL
 	}
 	return base + path
 }

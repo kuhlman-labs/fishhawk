@@ -18,7 +18,7 @@ Per `MVP_SPEC.md` §5.1.5:
 | Permission | Level | Purpose |
 |---|---|---|
 | `actions` | rw | Fire `workflow_dispatch` to invoke the runner action (`POST /repos/.../actions/workflows/{file}/dispatches`). Distinct from `workflows`, which only covers editing workflow files. |
-| `contents` | rw | Read `.fishhawk/workflows.yaml` from the customer's repo; push branches for the implement stage. |
+| `contents` | rw | Read `.fishhawk/workflows.yaml` from the customer's repo; push branches for the implement stage; update GitHub Release bodies + attach release-notes assets for the publish integration (E33.3 / #1588 — see the note below). |
 | `issues` | rw | Read the originating issue's body for prompt construction; comment back with the rendered plan. |
 | `pull_requests` | rw | Open PRs from the runner's pushed branch. |
 | `checks` | rw | Surface stage outcomes as a check run on the PR. |
@@ -27,6 +27,15 @@ Per `MVP_SPEC.md` §5.1.5:
 | `metadata` | r | Always granted; required for any read access. |
 | `administration` | r | Read branch protection + rulesets to derive the required-checks list (ADR-017 / #249). |
 | `organization_projects` | rw | Board work items on the installing account's **org-owned** Projects v2 via the installation token (`fishhawk_file_issue` / `fishhawk_report_product_issue`, #1116). **Does NOT cover user-owned Projects v2** (e.g. Project #7) — no App permission can; those need a UAT/PAT (#1114). |
+
+**Releases are covered by `contents`, not a new permission (E33.3 / #1588,
+ADR-051).** The release-publish integration (`POST /v0/releases/publish`) reads
+a Release by tag, PATCHes its body, and deletes/uploads the release-notes asset
+via the GitHub Releases REST endpoints. Per GitHub's "Permissions required for
+GitHub Apps" reference, those endpoints require only `contents: write`, which
+the App already holds (it pushes run branches) — confirmed on #1588's permission
+inventory by the repo owner. So E33.3 adds NO permission and existing installs
+need no re-consent; the auth-change impact inventory is empty.
 
 Webhook events:
 

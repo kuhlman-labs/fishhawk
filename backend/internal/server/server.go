@@ -477,6 +477,14 @@ type Server struct {
 	// resolved installation. Mirrors promptIssueGetterOverride exactly.
 	releaseNotesResolverOverride releaseevidence.MergedPRResolver
 
+	// releasePublisherOverride lets the release-publish endpoint tests
+	// substitute a fake releasePublisher so the publish path runs offline
+	// (artifact load -> GitHub round-trip -> audit append) without a live
+	// GitHub Release. nil in production; the handler then resolves through
+	// cfg.GitHub, which satisfies the releasePublisher interface. Mirrors
+	// releaseNotesResolverOverride exactly.
+	releasePublisherOverride releasePublisher
+
 	// auditCheckPublisher posts the derived fishhawk_audit_complete
 	// state to GitHub as a Check Run on every compute (#231). nil
 	// when ExternalURL or GitHub aren't wired — the in-Fishhawk
