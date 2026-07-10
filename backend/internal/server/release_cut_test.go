@@ -287,6 +287,24 @@ func TestReleaseCut_WrongKind(t *testing.T) {
 	}
 }
 
+// TestReleaseCut_ArtifactLoadError pins the 500 release_cut_failed branch: a
+// non-NotFound error from ArtifactRepo.Get (a transient load failure, not a
+// missing artifact) surfaces as release_cut_failed and records no audit entry.
+func TestReleaseCut_ArtifactLoadError(t *testing.T) {
+	h := newCutHarness(t)
+	h.artRepo.getErr = context.DeadlineExceeded
+	rec := h.post(h.validBody(), withReleaseOperator)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "release_cut_failed") {
+		t.Errorf("body missing release_cut_failed:\n%s", rec.Body.String())
+	}
+	if len(h.auditRepo.appendSeen) != 0 {
+		t.Errorf("audit appends = %d, want 0 (no record on an artifact load failure)", len(h.auditRepo.appendSeen))
+	}
+}
+
 // TestReleaseCut_AuditFailure pins the durable-before-response 500 branch: an
 // audit append error surfaces as release_cut_audit_failed rather than a false
 // 201.
