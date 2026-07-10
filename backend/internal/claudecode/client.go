@@ -27,11 +27,20 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/procgroup"
 )
 
 // DefaultBinary is the executable name resolved against PATH when
 // Config.Binary is empty.
 const DefaultBinary = "claude"
+
+// killGrace is the procgroup.Harden WaitDelay applied to every claude
+// subprocess: after the review deadline fires and the whole-group SIGKILL runs,
+// os/exec waits at most this long for the process and its inherited pipe fds to
+// close before force-closing the parent-side descriptors so cmd.Output()
+// returns. It bounds the residual hang from a group member that escaped the
+// kill (#1805). A var, not a const, so timing-sensitive tests can shorten it.
+var killGrace = 5 * time.Second
 
 // Config holds the settings needed to spawn the `claude` CLI for inference.
 type Config struct {
@@ -171,6 +180,13 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 		"-p", prompt,
 	}
 	cmd := cmdFn(ctx, c.cfg.Binary, args...)
+	// Harden the subprocess so the review deadline actually terminates a wedged
+	// reviewer (#1805): the child leads its own process group, a deadline-fired
+	// cancel SIGKILLs the whole group (reaping a grandchild that inherited the
+	// stdout pipe), and WaitDelay force-closes the parent-side pipe fd if a group
+	// member escaped the kill. Must be applied after the cmd is built and before
+	// cmd.Output().
+	procgroup.Harden(cmd, killGrace)
 	if cmd.Env == nil {
 		cmd.Env = os.Environ()
 	}
@@ -189,17 +205,25 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 		if isBinaryMissing(err) {
 			return "", "", planreview.Usage{}, false, fmt.Errorf("claudecode: binary not found: %s", c.cfg.Binary)
 		}
+		stderrText := strings.TrimSpace(stderr.String())
+		// A context deadline (the #747 size-aware review budget applied at the
+		// server call site, or the internal per-attempt fallback) fired and
+		// killed the review: a slow/wedged review, not a launch crash. This
+		// check is HOISTED above the *exec.ExitError type gate because the
+		// procgroup.Harden group-kill / WaitDelay termination (#1805) can force
+		// cmd.Output() to return a NON-ExitError (e.g. context.DeadlineExceeded
+		// when the direct child already exited but an escaped grandchild held
+		// the pipe) — the old in-branch check dropped the timeout label on that
+		// path. Keying off ctx.Err() keeps the label correct on every return
+		// type. Do NOT retry — retrying a 300s timeout would compound into a
+		// 600s wait (#606).
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return "", "", planreview.Usage{}, false, fmt.Errorf("claudecode: claude killed after %s (timeout): %v%s", elapsed, err, stderrSuffix(stderrText))
+		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			stderrText := strings.TrimSpace(stderr.String())
-			// A per-attempt context deadline kills the child and leaves
-			// ctx.Err()==DeadlineExceeded: a slow review, not a launch
-			// crash. Label it and do NOT retry — retrying a 300s timeout
-			// would compound into a 600s wait (#606). External/OOM kills
-			// (ctx.Err()==nil) are the transient #620 class and retry.
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return "", "", planreview.Usage{}, false, fmt.Errorf("claudecode: claude killed after %s (timeout): %v%s", elapsed, err, stderrSuffix(stderrText))
-			}
+			// An external/OOM SIGKILL (ctx.Err()==nil) is the transient #620
+			// class — retry.
 			return "", "", planreview.Usage{}, true, fmt.Errorf("claudecode: claude killed after %s (external/OOM): %v%s", elapsed, err, stderrSuffix(stderrText))
 		}
 		return "", "", planreview.Usage{}, false, fmt.Errorf("claudecode: claude invocation failed: %w", err)
