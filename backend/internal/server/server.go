@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
@@ -455,6 +457,14 @@ type Config struct {
 	// accept-with-warning today and becomes live the moment #1335 wires a real
 	// /v1/models snapshot, with zero validation-code change.
 	ModelOracle modeloracle.ModelOracle
+
+	// ProcessStart overrides the in-memory boot marker New stamps on the
+	// Server (default time.Now()). It is the reference the startup
+	// ReconcileOrphanedReviews (#1781) compares audit timestamps against to
+	// tell a prior-process dispatch (predates the marker) from a review this
+	// process legitimately still has in flight. Zero uses time.Now(); tests
+	// inject a fixed instant to exercise the boot-marker gate deterministically.
+	ProcessStart time.Time
 }
 
 // Server wraps an http.Server with the routes and middleware stack
@@ -561,6 +571,21 @@ type Server struct {
 	// hooks themselves gate on the run row's Drive flag, so the engine
 	// is inert for non-drive runs.
 	drive *drive.Engine
+
+	// processStart is the in-memory boot marker the startup orphaned-review
+	// reconcile (#1781) compares audit timestamps against: every un-terminated
+	// *_review_started with a timestamp before this instant belongs to a dead
+	// prior process. Stamped once at New from Config.ProcessStart (default
+	// time.Now()); never mutated after construction.
+	processStart time.Time
+
+	// reconcileRecomputeAuditComplete lets a test observe the
+	// audit-complete republish ReconcileOrphanedReviews fires after healing an
+	// orphaned implement review (#1781). nil in production — the reconcile then
+	// calls recomputeAndPublishAuditComplete, which no-ops when ArtifactRepo /
+	// GitHub aren't wired, so the republish is otherwise unobservable in a
+	// minimal fake. Mirrors the other *Override test seams on this struct.
+	reconcileRecomputeAuditComplete func(context.Context, uuid.UUID)
 }
 
 // soleReviewerSet adapts the Config.PlanReviewer single-reviewer convenience
@@ -613,6 +638,13 @@ func New(cfg Config) *Server {
 	s := &Server{cfg: cfg, p95Cache: map[string]p95CacheEntry{}}
 	if s.nowFunc == nil {
 		s.nowFunc = time.Now
+	}
+	// Stamp the boot marker the startup orphaned-review reconcile compares
+	// audit timestamps against (#1781). Default to now; a test-injected
+	// Config.ProcessStart lets the boot-marker gate be exercised deterministically.
+	s.processStart = cfg.ProcessStart
+	if s.processStart.IsZero() {
+		s.processStart = time.Now()
 	}
 	if cfg.AuditRepo != nil {
 		s.drive = &drive.Engine{Audit: cfg.AuditRepo, Logger: cfg.Logger}
