@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1909,6 +1910,66 @@ func TestReapDetachedRunner_ZeroExitNoReport(t *testing.T) {
 func TestReapDetachedRunner_NilReporterNoPanic(t *testing.T) {
 	cmd := startedShellCmd(t, "exit 1")
 	reapDetachedRunner(cmd, writeReapLog(t, `{"event":"runner_failed","reason":"x"}`), "r", "s", nil)
+}
+
+// zeroReapBackoff overrides reapReportBackoff with a same-length slice of
+// zero-duration sleeps under t.Cleanup, so retry tests exercise the loop without
+// real sleeps while preserving the attempt bound (len+1). Restored on cleanup.
+func zeroReapBackoff(t *testing.T) {
+	t.Helper()
+	saved := reapReportBackoff
+	zeroed := make([]time.Duration, len(saved))
+	reapReportBackoff = zeroed
+	t.Cleanup(func() { reapReportBackoff = saved })
+}
+
+// (4) The report fails K times then succeeds → it is retried and the eventually
+// successful call carries category C / the parsed reason / the exit code, proving
+// the report DID land on retry rather than dropping the stuck-'dispatched' report
+// (#1763).
+func TestReapDetachedRunner_ReportRetriedThenSucceeds(t *testing.T) {
+	zeroReapBackoff(t)
+	const failFirst = 2 // fail attempts 0 and 1, succeed on attempt 2
+	logPath := writeReapLog(t,
+		`{"event":"runner_failed","reason":"worktree_provision","detail":"disk full"}`)
+	cmd := startedShellCmd(t, "exit 9")
+
+	calls := 0
+	var got capturedReap
+	reapDetachedRunner(cmd, logPath, "r", "s", func(_ context.Context, category, reason, detail string, exitCode int) error {
+		calls++
+		if calls <= failFirst {
+			return fmt.Errorf("transient POST failure %d", calls)
+		}
+		got = capturedReap{called: true, category: category, reason: reason, detail: detail, exitCode: exitCode}
+		return nil
+	})
+
+	if calls != failFirst+1 {
+		t.Fatalf("report called %d times, want %d (K failures then success)", calls, failFirst+1)
+	}
+	if !got.called || got.category != "C" || got.reason != "worktree_provision" || got.detail != "disk full" || got.exitCode != 9 {
+		t.Errorf("successful retry carried %+v, want category C / worktree_provision / disk full / exit 9", got)
+	}
+}
+
+// (5) The report fails on EVERY attempt → the loop is bounded to
+// len(reapReportBackoff)+1 attempts and the reaper returns cleanly via the
+// fail-closed stderr fallback (previously untested) without panicking (#1763).
+func TestReapDetachedRunner_ReportExhaustsRetries(t *testing.T) {
+	zeroReapBackoff(t)
+	logPath := writeReapLog(t, `{"event":"runner_failed","reason":"x","detail":"y"}`)
+	cmd := startedShellCmd(t, "exit 1")
+
+	calls := 0
+	reapDetachedRunner(cmd, logPath, "r", "s", func(context.Context, string, string, string, int) error {
+		calls++
+		return fmt.Errorf("always fails")
+	})
+
+	if want := len(reapReportBackoff) + 1; calls != want {
+		t.Errorf("report called %d times, want %d (the bound must hold)", calls, want)
+	}
 }
 
 // parseDetachedRunnerFailure: the LAST runner_failed line wins, non-matching
