@@ -1460,6 +1460,41 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				// (which would wrongly demote it to category-B) and leave res.OK
 				// true. uploadPlan ships the bytes as-is; the backend ingests the
 				// sibling, persists it, and parks the stage at awaiting_input.
+				//
+				// Before shipping, strip undeclared properties from the
+				// clarification artifact (#1837): the backend strict-validates it
+				// against clarification-request-v1 (additionalProperties:false), so
+				// a benign extra field an agent emitted (observed:
+				// recommended_default_choice on a question) would 400
+				// clarification_request_invalid and fail the stage category-C —
+				// losing the plan generation. StripUnknownClarificationProps
+				// coerces the bytes clean against the schema-derived allowlists.
+				// Best-effort, mirroring adoptStructuredOutput below: on a write
+				// error, log a policy_event and leave the original file. res.OK
+				// stays true (non-demoting coercion); a parse failure or no-strip
+				// leaves file + events unchanged.
+				if data, rerr := os.ReadFile(cfg.planOut); rerr == nil {
+					cleaned, warnings, serr := plan.StripUnknownClarificationProps(data)
+					if serr == nil && len(warnings) > 0 {
+						if werr := os.WriteFile(cfg.planOut, cleaned, 0o600); werr != nil {
+							res.Events = append(res.Events, agent.Event{
+								Kind: "policy_event",
+								Payload: agent.MakePayload(map[string]string{
+									"check": "plan_validation", "outcome": "clarification_strip_write_failed",
+									"path": cfg.planOut, "error": werr.Error(),
+								}),
+							})
+						} else {
+							res.Events = append(res.Events, agent.Event{
+								Kind: "policy_event",
+								Payload: agent.MakePayload(map[string]string{
+									"check": "plan_validation", "outcome": "clarification_props_stripped",
+									"path": cfg.planOut, "stripped": strings.Join(warnings, "; "),
+								}),
+							})
+						}
+					}
+				}
 				res.Events = append(res.Events, ev)
 			} else {
 				// (2) structured_output present: overwrite the plan-out file with

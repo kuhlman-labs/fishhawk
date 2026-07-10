@@ -556,3 +556,249 @@ func jsonSemanticEqual(t *testing.T, a, b []byte) bool {
 	}
 	return reflect.DeepEqual(av, bv)
 }
+
+// validClarification returns a fully-declared clarification_request map matching
+// docs/spec/clarification-request-v1.schema.json — the no-op baseline the strip
+// tests mutate.
+func validClarification() map[string]any {
+	return map[string]any{
+		"kind": "clarification_request",
+		"ticket_reference": map[string]any{
+			"type": "github_issue",
+			"url":  "https://github.com/kuhlman-labs/fishhawk/issues/1837",
+			"id":   "kuhlman-labs/fishhawk#1837",
+		},
+		"generated_by": map[string]any{
+			"agent":     "planner",
+			"model":     "claude-opus-4-8",
+			"timestamp": "2026-07-10T12:00:00Z",
+		},
+		"summary": "Issue lacks a non-derivable decision.",
+		"questions": []any{
+			map[string]any{
+				"id":                  "auth-backend",
+				"question":            "Which auth backend?",
+				"what_i_can_infer":    "The repo has an oauth stub.",
+				"recommended_default": "oauth",
+				"tradeoffs":           "oauth is more work than basic.",
+			},
+		},
+	}
+}
+
+// clarQuestion mirrors the backend ClarificationQuestion shape (declared fields
+// of #/$defs/question) for the DisallowUnknownFields round-trip seam test.
+type clarQuestion struct {
+	ID                 string `json:"id"`
+	Question           string `json:"question"`
+	WhatICanInfer      string `json:"what_i_can_infer,omitempty"`
+	RecommendedDefault string `json:"recommended_default"`
+	Tradeoffs          string `json:"tradeoffs"`
+}
+
+// clarTicketReference mirrors #/$defs/ticket-reference.
+type clarTicketReference struct {
+	Type string `json:"type"`
+	URL  string `json:"url"`
+	ID   string `json:"id"`
+}
+
+// clarGeneratedBy mirrors #/$defs/generated-by.
+type clarGeneratedBy struct {
+	Agent     string `json:"agent"`
+	Model     string `json:"model"`
+	Version   string `json:"version,omitempty"`
+	Timestamp string `json:"timestamp"`
+}
+
+// clarRequest mirrors the backend ClarificationRequest shape for the seam test.
+type clarRequest struct {
+	Kind            string              `json:"kind"`
+	TicketReference clarTicketReference `json:"ticket_reference"`
+	GeneratedBy     clarGeneratedBy     `json:"generated_by"`
+	Summary         string              `json:"summary"`
+	Questions       []clarQuestion      `json:"questions"`
+}
+
+// TestStripUnknownClarificationProps pins the runner-side source fix for the
+// clarification-request strict-decode failure class (#1837). Each defensive
+// branch of StripUnknownClarificationProps is asserted: unknown question prop
+// stripped+warned; unknown top-level prop stripped+warned; nested
+// ticket_reference/generated_by props stripped+warned (binding condition 1);
+// multi-question per-index/id warning; valid-input no-op; malformed-input
+// fail-open; and a DisallowUnknownFields round-trip proving the shipped bytes
+// satisfy a strict decode.
+func TestStripUnknownClarificationProps(t *testing.T) {
+	// (a) the exact observed field on a question is stripped, declared fields kept.
+	t.Run("question unknown prop stripped and warned", func(t *testing.T) {
+		m := validClarification()
+		q := m["questions"].([]any)[0].(map[string]any)
+		q["recommended_default_choice"] = "oauth"
+		out, warnings, err := plan.StripUnknownClarificationProps(marshal(t, m))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(warnings) != 1 {
+			t.Fatalf("want 1 warning, got %d: %v", len(warnings), warnings)
+		}
+		if !strings.Contains(warnings[0], "recommended_default_choice") || !strings.Contains(warnings[0], `question "auth-backend"`) {
+			t.Errorf("warning must name the property and question id; got %q", warnings[0])
+		}
+		var got clarRequest
+		strictDecode(t, out, &got)
+		if len(got.Questions) != 1 {
+			t.Fatalf("want 1 question, got %d", len(got.Questions))
+		}
+		gq := got.Questions[0]
+		if gq.ID != "auth-backend" || gq.Question != "Which auth backend?" ||
+			gq.WhatICanInfer != "The repo has an oauth stub." ||
+			gq.RecommendedDefault != "oauth" || gq.Tradeoffs != "oauth is more work than basic." {
+			t.Errorf("declared question fields not preserved: %+v", gq)
+		}
+	})
+
+	// (b) multiple questions, each carrying a distinct unknown prop.
+	t.Run("multiple questions each stripped with correct id or index", func(t *testing.T) {
+		m := validClarification()
+		q0 := m["questions"].([]any)[0].(map[string]any)
+		q0["extra_a"] = "x"
+		q1 := map[string]any{ // no id → warning must use index
+			"question":            "Second?",
+			"recommended_default": "b",
+			"tradeoffs":           "t",
+			"extra_b":             "y",
+		}
+		m["questions"] = append(m["questions"].([]any), q1)
+		_, warnings, err := plan.StripUnknownClarificationProps(marshal(t, m))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(warnings) != 2 {
+			t.Fatalf("want 2 warnings, got %d: %v", len(warnings), warnings)
+		}
+		joined := strings.Join(warnings, "\n")
+		if !strings.Contains(joined, "extra_a") || !strings.Contains(joined, `question "auth-backend"`) {
+			t.Errorf("missing id-labelled warning for extra_a: %v", warnings)
+		}
+		if !strings.Contains(joined, "extra_b") || !strings.Contains(joined, "question index 1") {
+			t.Errorf("missing index-labelled warning for extra_b: %v", warnings)
+		}
+	})
+
+	// (c) unknown top-level prop stripped, declared top-level survives.
+	t.Run("top-level unknown prop stripped and warned", func(t *testing.T) {
+		m := validClarification()
+		m["plan_version"] = "standard_v1" // an alien top-level field
+		out, warnings, err := plan.StripUnknownClarificationProps(marshal(t, m))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(warnings) != 1 || !strings.Contains(warnings[0], "plan_version") ||
+			!strings.Contains(warnings[0], "clarification_request") {
+			t.Fatalf("want one clarification_request warning naming plan_version; got %v", warnings)
+		}
+		var got clarRequest
+		strictDecode(t, out, &got)
+		if got.Kind != "clarification_request" || len(got.Questions) != 1 {
+			t.Errorf("declared top-level fields not preserved: %+v", got)
+		}
+	})
+
+	// (binding condition 1) nested ticket_reference and generated_by objects.
+	t.Run("nested ticket_reference and generated_by props stripped", func(t *testing.T) {
+		m := validClarification()
+		m["ticket_reference"].(map[string]any)["source"] = "linear"
+		m["generated_by"].(map[string]any)["temperature"] = 0.2
+		out, warnings, err := plan.StripUnknownClarificationProps(marshal(t, m))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		joined := strings.Join(warnings, "\n")
+		if !strings.Contains(joined, "source") || !strings.Contains(joined, "ticket_reference") {
+			t.Errorf("missing ticket_reference warning: %v", warnings)
+		}
+		if !strings.Contains(joined, "temperature") || !strings.Contains(joined, "generated_by") {
+			t.Errorf("missing generated_by warning: %v", warnings)
+		}
+		var got clarRequest
+		strictDecode(t, out, &got)
+		if got.TicketReference.Type != "github_issue" || got.GeneratedBy.Agent != "planner" {
+			t.Errorf("declared nested fields not preserved: %+v", got)
+		}
+	})
+
+	// (d) fully-valid input is a no-op: original bytes returned, no warnings.
+	t.Run("valid input is a no-op", func(t *testing.T) {
+		in := marshal(t, validClarification())
+		out, warnings, err := plan.StripUnknownClarificationProps(in)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(warnings) != 0 {
+			t.Errorf("want no warnings, got %v", warnings)
+		}
+		if !bytesEqual(out, in) {
+			t.Errorf("want original bytes returned unchanged")
+		}
+	})
+
+	// (e) malformed input fails open: original bytes, nil warnings, nil error.
+	t.Run("malformed input fails open", func(t *testing.T) {
+		in := []byte("this is not json")
+		out, warnings, err := plan.StripUnknownClarificationProps(in)
+		if err != nil {
+			t.Fatalf("want nil error (fail-open), got %v", err)
+		}
+		if warnings != nil {
+			t.Errorf("want nil warnings, got %v", warnings)
+		}
+		if !bytesEqual(out, in) {
+			t.Errorf("want original bytes returned on parse failure")
+		}
+	})
+
+	// (f) the stripped output survives a strict DisallowUnknownFields decode into
+	// a struct mirroring the backend clarification shape — the runner-strip →
+	// backend-strict-validate seam.
+	t.Run("stripped output round-trips through strict decode", func(t *testing.T) {
+		m := validClarification()
+		m["alien_top"] = true
+		m["questions"].([]any)[0].(map[string]any)["recommended_default_choice"] = "oauth"
+		m["ticket_reference"].(map[string]any)["source"] = "x"
+		m["generated_by"].(map[string]any)["temperature"] = 0.2
+		out, warnings, err := plan.StripUnknownClarificationProps(marshal(t, m))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(warnings) != 4 {
+			t.Fatalf("want 4 warnings (one per level), got %d: %v", len(warnings), warnings)
+		}
+		var got clarRequest
+		strictDecode(t, out, &got)
+	})
+}
+
+// strictDecode decodes b into v with DisallowUnknownFields, failing the test on
+// any unknown field — the backend's strict-validation posture in miniature.
+func strictDecode(t *testing.T, b []byte, v any) {
+	t.Helper()
+	dec := json.NewDecoder(strings.NewReader(string(b)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		t.Fatalf("strict decode rejected stripped bytes: %v\nbytes: %s", err, b)
+	}
+}
+
+// bytesEqual reports byte-for-byte equality (fail-open/no-op paths must return
+// the exact input, not a re-marshaled copy).
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

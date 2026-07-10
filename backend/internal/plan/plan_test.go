@@ -1191,6 +1191,41 @@ func validClarificationJSON(t *testing.T, mutate ...func(map[string]any)) []byte
 	return b
 }
 
+// TestValidateClarificationRequest_StrippedPayloadAccepted pins the
+// runner-strip -> backend-strict-validate seam from the backend side (#1837,
+// binding approval condition 2). The runner's StripUnknownClarificationProps
+// removes undeclared properties at every level of a clarification_request
+// (top-level, questions[], ticket_reference, generated_by) so the backend's
+// strict (additionalProperties:false) validator accepts an artifact an agent
+// emitted with a benign extra field (observed: recommended_default_choice).
+//
+// The backend cannot import the runner package (module boundary), so this test
+// reconstructs both sides against the REAL validator plan.ValidateClarification-
+// Request, which compiles the canonical docs/spec-embedded schema — the shared
+// contract, not the runner's hand-written mirror struct:
+//   - the PRE-strip payload, carrying an unknown prop at every level, is
+//     REJECTED (proving the strip is load-bearing, not decorative), and
+//   - the POST-strip payload (declared allowlist fields only) is ACCEPTED.
+func TestValidateClarificationRequest_StrippedPayloadAccepted(t *testing.T) {
+	// Pre-strip: an unknown prop at each of the four filtered levels.
+	preStrip := validClarificationJSON(t, func(m map[string]any) {
+		m["plan_version"] = "standard_v1" // alien top-level field
+		m["ticket_reference"].(map[string]any)["source"] = "linear"
+		m["generated_by"].(map[string]any)["temperature"] = 0.2
+		m["questions"].([]any)[0].(map[string]any)["recommended_default_choice"] = "in-process"
+	})
+	if err := plan.ValidateClarificationRequest(preStrip); err == nil {
+		t.Fatal("pre-strip payload with unknown props at every level: want strict-validation error, got nil")
+	}
+
+	// Post-strip: exactly what StripUnknownClarificationProps yields — the same
+	// artifact with the four unknown props removed and every declared field kept.
+	postStrip := validClarificationJSON(t)
+	if err := plan.ValidateClarificationRequest(postStrip); err != nil {
+		t.Fatalf("post-strip payload (declared fields only): want accept, got %v", err)
+	}
+}
+
 func TestDetectArtifactKind(t *testing.T) {
 	k, err := plan.DetectArtifactKind(validClarificationJSON(t))
 	if err != nil {
