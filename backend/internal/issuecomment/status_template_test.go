@@ -458,6 +458,150 @@ func TestRenderStatusBody_AcceptanceActivity_NotFilteredAsNoise(t *testing.T) {
 	}
 }
 
+// TestRenderStatusBody_DecisionClassActivity pins E42.6 / #1789: the four
+// decision-class audit kinds (fixup_pushed, concern_waived, concern_deferred,
+// scope_amendment_decided) are newly recognized by activityCategories and
+// render their verb phrases through the status activity section — the
+// waive/defer/amendment rows surfacing the operator's audited reason, the
+// amendment row branching on the payload decision.
+func TestRenderStatusBody_DecisionClassActivity(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	cases := []struct {
+		name     string
+		category string
+		payload  map[string]any
+		want     string
+	}{
+		{
+			name:     "fixup pushed carries files-changed count (plural)",
+			category: "fixup_pushed",
+			payload:  map[string]any{"files_changed_count": 3, "head_sha": "abc123"},
+			want:     "Fix-up pushed (3 files changed)",
+		},
+		{
+			name:     "fixup pushed single file uses singular",
+			category: "fixup_pushed",
+			payload:  map[string]any{"files_changed_count": 1},
+			want:     "Fix-up pushed (1 file changed)",
+		},
+		{
+			name:     "concern waived carries severity/category tag and reason",
+			category: "concern_waived",
+			payload:  map[string]any{"severity": "high", "category": "correctness", "reason": "acceptable risk here"},
+			want:     "Concern waived (high correctness): acceptable risk here",
+		},
+		{
+			name:     "concern deferred carries issue number and reason",
+			category: "concern_deferred",
+			payload:  map[string]any{"issue_number": 1790, "reason": "tracked as follow-up"},
+			want:     "Concern deferred to #1790: tracked as follow-up",
+		},
+		{
+			name:     "scope amendment approved carries reason",
+			category: "scope_amendment_decided",
+			payload:  map[string]any{"decision": "approve", "reason": "coupled test sibling"},
+			want:     "Scope amendment approved: coupled test sibling",
+		},
+		{
+			name:     "scope amendment rejected branches on decision",
+			category: "scope_amendment_decided",
+			payload:  map[string]any{"decision": "deny", "reason": "belongs elsewhere"},
+			want:     "Scope amendment rejected: belongs elsewhere",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := []*audit.Entry{
+				auditEntry(runID, 1, tc.category, "system", now.Add(-1*time.Minute), tc.payload),
+			}
+			body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+			if !strings.Contains(body, tc.want) {
+				t.Errorf("expected %q in the activity section\n---\n%s", tc.want, body)
+			}
+		})
+	}
+}
+
+// TestRenderStatusBody_DecisionClassActivity_Degrades covers each decision-class
+// renderer's degrade branch: an absent count / tag / reason and a malformed
+// payload fall back to the bare (or neutral) verb — never a stray enrichment
+// clause, dropped row, or panic. Asserting the "<verb> · " form (the bare verb
+// immediately followed by the relative-age separator) pins that no enrichment
+// leaked. A scope-amendment with an UNRECOGNIZED decision still surfaces its
+// reason under the neutral verb.
+func TestRenderStatusBody_DecisionClassActivity_Degrades(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	cases := []struct {
+		name     string
+		category string
+		payload  json.RawMessage
+		want     string
+	}{
+		{"fixup zero count omits parenthetical", "fixup_pushed", json.RawMessage(`{"files_changed_count":0}`), "Fix-up pushed · "},
+		{"fixup malformed json", "fixup_pushed", json.RawMessage("{not json"), "Fix-up pushed · "},
+		{"waive no tag no reason", "concern_waived", json.RawMessage(`{}`), "Concern waived · "},
+		{"waive malformed json", "concern_waived", json.RawMessage("{not json"), "Concern waived · "},
+		{"defer no issue no reason", "concern_deferred", json.RawMessage(`{}`), "Concern deferred · "},
+		{"defer malformed json", "concern_deferred", json.RawMessage("{not json"), "Concern deferred · "},
+		{"amendment empty payload neutral verb", "scope_amendment_decided", json.RawMessage(`{}`), "Scope amendment decided · "},
+		{"amendment malformed json", "scope_amendment_decided", json.RawMessage("{not json"), "Scope amendment decided · "},
+		{"amendment unknown decision keeps neutral verb + reason", "scope_amendment_decided", json.RawMessage(`{"decision":"weird","reason":"x"}`), "Scope amendment decided: x"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &audit.Entry{
+				ID:        uuid.New(),
+				Sequence:  1,
+				RunID:     &runID,
+				Timestamp: now.Add(-1 * time.Minute),
+				Category:  tc.category,
+				Payload:   tc.payload,
+			}
+			body := issuecomment.RenderStatusBody(r, stages, []*audit.Entry{e}, "https://x", now)
+			if !strings.Contains(body, tc.want) {
+				t.Errorf("expected degrade to %q\n---\n%s", tc.want, body)
+			}
+		})
+	}
+}
+
+// TestRenderStatusBody_DecisionClassActivity_NotFilteredAsNoise proves the four
+// decision-class kinds survive pickActivity's noise filter (they are members of
+// activityCategories) — a comment-only touch of the set fails this — while a
+// genuine noise category (trace_uploaded) alongside them is dropped. Uses three
+// rows to stay within the status comment's 3-row cap.
+func TestRenderStatusBody_DecisionClassActivity_NotFilteredAsNoise(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	entries := []*audit.Entry{
+		auditEntry(runID, 5, "concern_waived", "system", now.Add(-3*time.Minute),
+			map[string]any{"severity": "low", "category": "style", "reason": "cosmetic"}),
+		auditEntry(runID, 6, "concern_deferred", "system", now.Add(-2*time.Minute),
+			map[string]any{"issue_number": 99, "reason": "later"}),
+		auditEntry(runID, 7, "scope_amendment_decided", "system", now.Add(-1*time.Minute),
+			map[string]any{"decision": "approve", "reason": "ok"}),
+		auditEntry(runID, 8, "trace_uploaded", "system", now, nil),
+	}
+	body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+	for _, want := range []string{
+		"Concern waived (low style): cosmetic",
+		"Concern deferred to #99: later",
+		"Scope amendment approved: ok",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("decision-class kind dropped as noise; missing %q\n---\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "trace_uploaded") {
+		t.Errorf("noise category leaked into the activity section\n---\n%s", body)
+	}
+}
+
 func TestRenderStatusBody_NoActivity_OmitsLatestSection(t *testing.T) {
 	r, stages := statusRun(t, uuid.New())
 	body := issuecomment.RenderStatusBody(r, stages, nil, "https://x", time.Now())

@@ -236,7 +236,7 @@ func renderAnchorStages(stages []*run.Stage) string {
 // reference clock — the stamp is derived from each row's own timestamp.
 // Empty when no interesting rows exist.
 func renderAnchorTimeline(entries []*audit.Entry) string {
-	activity := pickActivity(entries, anchorTimelineLimit)
+	activity := selectAnchorTimeline(entries, anchorTimelineLimit)
 	if len(activity) == 0 {
 		return ""
 	}
@@ -354,6 +354,84 @@ func renderGateDecisionTimelineEntry(e *audit.Entry, entries []*audit.Entry) str
 // status comment's 3 because the anchor is the run's full projection,
 // not a glance.
 const anchorTimelineLimit = 12
+
+// informationalTimelineCategories is the anchor-only class of low-signal
+// "heartbeat" rows the timeline curation (selectAnchorTimeline, E42.6 / #1789)
+// drops FIRST when the row cap is exceeded: the dispatch/start markers and the
+// model-resolution echo. Everything else recognized by activityCategories —
+// gate decisions, plan_generated, stage/outcome terminals, fixup_pushed,
+// concern_waived / concern_deferred, scope_amendment_decided — is RETAINED, so
+// an eventful run's audited decisions survive the cap while only these
+// informational rows are sacrificed. The set is intentionally NOT shared with
+// the status comment (which keeps pure-recency selection over its 3 slots); it
+// curates the anchor timeline alone.
+var informationalTimelineCategories = map[string]struct{}{
+	"run_dispatched":        {},
+	"acceptance_dispatched": {},
+	"deployment_dispatched": {},
+	"model_resolved":        {},
+}
+
+// isInformationalTimelineCategory reports whether a category is an
+// anchor-timeline informational row (dropped first under the cap). Everything
+// recognized by activityCategories that is NOT informational is retained.
+func isInformationalTimelineCategory(category string) bool {
+	_, ok := informationalTimelineCategories[category]
+	return ok
+}
+
+// selectAnchorTimeline curates the anchor timeline by event CLASS rather than
+// pure recency (E42.6 / #1789), so an eventful run's gate decisions and stage
+// terminals are never silently dropped by the row cap. It gathers every
+// recognized activity row most-recent-first, and — when the total exceeds
+// limit — fills the limit slots with RETAINED rows (gate decisions, terminals,
+// fix-ups, waives, defers, amendment decisions) first, then backfills any
+// remaining slots with the most-recent INFORMATIONAL rows (dispatch/start
+// heartbeats + model_resolved). When retained rows ALONE exceed the cap the
+// cap still wins — the oldest retained rows are trimmed (binding condition 2:
+// the cap ALWAYS wins over the retain-everything intent). The returned slice
+// preserves the existing most-recent-first (by audit Sequence) render order.
+func selectAnchorTimeline(entries []*audit.Entry, limit int) []*audit.Entry {
+	if limit <= 0 {
+		return nil
+	}
+	// Gather all recognized rows most-recent-first (cap at len(entries) so
+	// nothing is pre-dropped by recency before the class partition runs).
+	all := pickActivity(entries, len(entries))
+	if len(all) <= limit {
+		// Under the cap: keep every recognized row, order unchanged.
+		return all
+	}
+	// Partition preserving the most-recent-first order pickActivity produced.
+	var retained, informational []*audit.Entry
+	for _, e := range all {
+		if isInformationalTimelineCategory(e.Category) {
+			informational = append(informational, e)
+		} else {
+			retained = append(retained, e)
+		}
+	}
+	// Retained rows fill the slots first. When they alone overflow the cap,
+	// keep the most-recent `limit` of them (dropping the oldest retained) —
+	// no informational row is shown, and the cap is still honored.
+	if len(retained) >= limit {
+		return retained[:limit]
+	}
+	// Backfill the remaining slots with the most-recent informational rows.
+	selection := make([]*audit.Entry, 0, limit)
+	selection = append(selection, retained...)
+	backfill := limit - len(retained)
+	if backfill > len(informational) {
+		backfill = len(informational)
+	}
+	selection = append(selection, informational[:backfill]...)
+	// Re-sort most-recent-first by Sequence so the render order matches today's
+	// pure-recency output (retained + informational interleaved by recency).
+	sort.SliceStable(selection, func(i, j int) bool {
+		return selection[i].Sequence > selection[j].Sequence
+	})
+	return selection
+}
 
 // renderAnchorReviews renders the surfaced reviewer verdicts for each
 // stage that has review activity, honoring the current-round isolation
