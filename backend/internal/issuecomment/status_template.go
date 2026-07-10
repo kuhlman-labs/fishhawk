@@ -43,7 +43,7 @@ func RenderStatusBody(runRow *run.Run, stages []*run.Stage, recentAudit []*audit
 	if activity := pickActivity(recentAudit, 3); len(activity) > 0 {
 		b.WriteString("\n_Latest activity:_\n")
 		for _, e := range activity {
-			fmt.Fprintf(&b, "- %s · %s\n", renderActivityLine(e), relativeAge(e.Timestamp, now))
+			fmt.Fprintf(&b, "- %s · %s\n", renderActivityLine(e, statusActorRenderers), relativeAge(e.Timestamp, now))
 		}
 	}
 	b.WriteString("\n")
@@ -168,12 +168,29 @@ var activityCategories = map[string]struct{}{
 	"acceptance_triage_decided":   {},
 }
 
+// actorRenderers supplies the actor-identity render functions
+// renderActivityLine uses, so the shared category switch stays DRY across the
+// two surfaces that render the same timeline: the sticky status comment (the
+// default @-mention identities) and the living anchor (backtick code spans, no
+// @-mention — so a system/app actor can never ping an unrelated GitHub user,
+// #751/#755/#1788). `actor` renders a bare ActorSubject; `approver` renders an
+// approval_submitted row's three-form identity.
+type actorRenderers struct {
+	actor    func(*string) string
+	approver func(*audit.Entry) string
+}
+
+// statusActorRenderers is the default @-mention rendering the sticky status
+// comment uses (behavior unchanged — the status surface keeps its @-mentions).
+var statusActorRenderers = actorRenderers{actor: actorMention, approver: approverMention}
+
 // renderActivityLine returns a user-readable verb-phrase for an
 // audit entry. Falls back to the bare category name + actor when
 // the category has no template — keeps the output stable if the
-// audit vocabulary grows.
-func renderActivityLine(e *audit.Entry) string {
-	actor := actorMention(e.ActorSubject)
+// audit vocabulary grows. The actor-identity rendering is supplied by `r` so
+// the anchor can render the same timeline without @-mentions.
+func renderActivityLine(e *audit.Entry, r actorRenderers) string {
+	actor := r.actor(e.ActorSubject)
 	switch e.Category {
 	case "run_dispatched":
 		return "Fishhawk run dispatched"
@@ -181,9 +198,9 @@ func renderActivityLine(e *audit.Entry) string {
 		return "Plan posted"
 	case "approval_submitted":
 		// Prefer the resolved GitHub login (#751); never @-mention the raw
-		// token subject (#755) — approverMention renders the three-form
-		// identity convention (#1053) instead.
-		return fmt.Sprintf("%s %s the plan", approverMention(e), approvalDecisionVerb(e.Payload))
+		// token subject (#755) — the approver renderer applies the three-form
+		// identity convention (#1053). The anchor passes a no-@ variant.
+		return fmt.Sprintf("%s %s the plan", r.approver(e), approvalDecisionVerb(e.Payload))
 	case "plan_approved_via_reaction":
 		return fmt.Sprintf("%s approved on GitHub (reaction)", actor)
 	case "ci_failure_retry_dispatched":
@@ -260,7 +277,7 @@ func approverMention(e *audit.Entry) string {
 	if subject == "" && e.ActorSubject != nil {
 		subject = *e.ActorSubject
 	}
-	return renderApproverIdentity(subject, id.delegated)
+	return renderApproverIdentity(subject, id.delegated, true)
 }
 
 // approverIdentity carries the identity fields of an approval_submitted

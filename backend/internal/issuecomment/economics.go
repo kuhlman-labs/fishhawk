@@ -63,7 +63,11 @@ func RenderEconomicsBlock(in EconomicsInput) string {
 	}
 
 	if hasCacheActivity(in.Cache) {
-		fmt.Fprintf(&b, "- **Cache net savings**: %s\n", formatUSD(in.Cache.NetSavingsUSD))
+		// The savings figure is meaningful only against a denominator: it is
+		// what the prompt cache saved versus replaying every cached prefix at
+		// full uncached input price. Naming that baseline stops the line from
+		// being misread as an absolute discount off the total (#1788).
+		fmt.Fprintf(&b, "- **Cache net savings**: %s (vs uncached replay)\n", formatUSD(in.Cache.NetSavingsUSD))
 	}
 
 	return strings.TrimRight(b.String(), "\n")

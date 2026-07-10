@@ -290,10 +290,11 @@ func TestRenderAnchorBody_ReviewVerdictsInline(t *testing.T) {
 	}
 }
 
-// TestRenderAnchorBody_PerReviewerBlocks pins the per-reviewer-block-count
-// shape (#1073): every current-round reviewer gets its own <details>, even
-// a bare approve with no concerns and no free_form, so a two-reviewer round
-// can never read as one.
+// TestRenderAnchorBody_PerReviewerBlocks pins the refined per-reviewer-block
+// shape (#1073 → #1788): a bare approve with no concerns and no free_form has
+// nothing to expand, so it emits NO per-reviewer <details> (not a content-free
+// "(no additional notes)" one) — while the inline summary line still lists
+// every reviewer, so a two-reviewer round is never misread as one.
 func TestRenderAnchorBody_PerReviewerBlocks(t *testing.T) {
 	entries := []*audit.Entry{
 		startedEntry(10, "plan"),
@@ -307,15 +308,16 @@ func TestRenderAnchorBody_PerReviewerBlocks(t *testing.T) {
 		ExternalURL: "https://app.example",
 		Now:         time.Now(),
 	})
-	if !strings.Contains(body, "<details><summary>claude-opus-4-8: approve</summary>") {
-		t.Errorf("opus per-reviewer block missing: %q", body)
+	if strings.Contains(body, "<details><summary>claude-opus-4-8: approve</summary>") {
+		t.Errorf("a content-free approve must not emit a per-reviewer block: %q", body)
 	}
-	if !strings.Contains(body, "<details><summary>gpt-5.5: approve</summary>") {
-		t.Errorf("codex per-reviewer block missing: %q", body)
+	if strings.Contains(body, "<details><summary>gpt-5.5: approve</summary>") {
+		t.Errorf("a content-free approve must not emit a per-reviewer block: %q", body)
 	}
-	if n := strings.Count(body, "(no additional notes)"); n != 2 {
-		t.Errorf("expected exactly 2 '(no additional notes)' bodies; got %d: %q", n, body)
+	if strings.Contains(body, "(no additional notes)") {
+		t.Errorf("empty-details body must be dropped entirely: %q", body)
 	}
+	// The inline summary line still names every reviewer.
 	if !strings.Contains(body, "claude-opus-4-8: approve · gpt-5.5: approve") {
 		t.Errorf("inline one-liner must survive: %q", body)
 	}
@@ -379,6 +381,7 @@ func approvalEntry(t *testing.T, seq int64, login, decision, comment string) *au
 // marker — each only when the underlying chain warrants it.
 func TestRenderAnchorBody_GateDecisionTimeline(t *testing.T) {
 	now := time.Unix(1000, 0).UTC()
+	tokenPayload, _ := json.Marshal(map[string]any{"decision": "approve", "approver": "brett@local-mcp"})
 	tests := []struct {
 		name        string
 		entries     []*audit.Entry
@@ -391,11 +394,12 @@ func TestRenderAnchorBody_GateDecisionTimeline(t *testing.T) {
 				approvalEntry(t, 5, "alice", "approve", "keep the two-round test"),
 			},
 			wantContain: []string{
-				"@alice approved the plan with conditions",
+				"`alice` approved the plan with conditions",
 				"<details><summary>Approval conditions</summary>",
 				"keep the two-round test",
 			},
-			wantAbsent: []string{"advisory reject"},
+			// The anchor timeline never @-mentions an actor (#751/#755/#1788).
+			wantAbsent: []string{"advisory reject", "@alice"},
 		},
 		{
 			name: "approve over one advisory reject",
@@ -406,16 +410,29 @@ func TestRenderAnchorBody_GateDecisionTimeline(t *testing.T) {
 					[]anchorReviewConcern{{severity: "high", category: "correctness", note: "boom"}}, "see note"),
 				approvalEntry(t, 13, "alice", "approve", ""),
 			},
-			wantContain: []string{"@alice approved the plan (over 1 advisory reject)"},
-			wantAbsent:  []string{"Approval conditions", "over 2 advisory"},
+			wantContain: []string{"`alice` approved the plan (over 1 advisory reject)"},
+			wantAbsent:  []string{"Approval conditions", "over 2 advisory", "@alice"},
 		},
 		{
 			name: "clean approve",
 			entries: []*audit.Entry{
 				approvalEntry(t, 5, "alice", "approve", ""),
 			},
-			wantContain: []string{"@alice approved the plan"},
-			wantAbsent:  []string{"advisory reject", "Approval conditions", "with conditions"},
+			wantContain: []string{"`alice` approved the plan"},
+			wantAbsent:  []string{"advisory reject", "Approval conditions", "with conditions", "@alice"},
+		},
+		{
+			// A non-login token subject flows through renderApproverIdentity's
+			// no-@ code-span form (the anchor never pings a real user, #755/#1788).
+			name: "token subject approve renders no @-mention",
+			entries: []*audit.Entry{
+				{Sequence: 5, Category: "approval_submitted", Payload: tokenPayload, Timestamp: time.Unix(5, 0).UTC()},
+			},
+			// The subject renders inside a backtick code span (which itself
+			// contains the literal @), so the guard is that it never appears as
+			// a bare leading @-mention that GitHub would resolve to a user.
+			wantContain: []string{"`brett@local-mcp` approved the plan"},
+			wantAbsent:  []string{"@brett", " @`", "by @"},
 		},
 	}
 	for _, tt := range tests {
@@ -522,6 +539,96 @@ func TestRenderAnchorBody_NilRun(t *testing.T) {
 	}
 }
 
+// TestRenderAnchorBody_AbsoluteTimestamps pins fix 1 (#1788): anchor timeline
+// rows carry an absolute UTC stamp (`YYYY-MM-DD HH:MMZ`) that reads correctly
+// once the run settles, NOT a relative "5m ago"/"just now" that freezes at the
+// last render. It also pins fix 2: the row's actor renders as a backtick code
+// span, never an @-mention.
+func TestRenderAnchorBody_AbsoluteTimestamps(t *testing.T) {
+	ts := time.Date(2026, 7, 9, 23, 36, 0, 0, time.UTC)
+	alice := "alice"
+	entries := []*audit.Entry{
+		{Sequence: 5, Category: "pr_merged", ActorSubject: &alice, Timestamp: ts},
+	}
+	body := RenderAnchorBody(AnchorInput{
+		Run:         anchorRun(),
+		Stages:      []*run.Stage{{Type: run.StageTypeImplement, State: run.StageStateRunning}},
+		Audit:       entries,
+		ExternalURL: "https://app.example",
+		// Now is a full day later; a relative age would render "1d ago".
+		Now: time.Date(2026, 7, 10, 23, 36, 0, 0, time.UTC),
+	})
+	if !strings.Contains(body, "2026-07-09 23:36Z") {
+		t.Errorf("timeline row should carry an absolute UTC stamp:\n%s", body)
+	}
+	for _, rel := range []string{"m ago", "h ago", "d ago", "just now"} {
+		if strings.Contains(body, rel) {
+			t.Errorf("timeline must not carry a relative age %q:\n%s", rel, body)
+		}
+	}
+	if strings.Contains(body, "@alice") {
+		t.Errorf("timeline actor must render as a backtick code span, not an @-mention:\n%s", body)
+	}
+	if !strings.Contains(body, "`alice` merged the PR") {
+		t.Errorf("timeline actor should render as a backtick code span:\n%s", body)
+	}
+}
+
+// TestTruncateWords covers truncateWords' three branches directly: a string
+// that already fits (returned unchanged, no ellipsis), a word-boundary cut
+// (breaks on the last space with a real "…"), and the no-space fallback (a
+// single over-long token backs off to a rune boundary rather than never
+// truncating).
+func TestTruncateWords(t *testing.T) {
+	if got := truncateWords("short", 200); got != "short" {
+		t.Errorf("a fitting string must be returned unchanged; got %q", got)
+	}
+	// Word boundary: "aaa bbb ccc ddd" capped at 9 → last space ≤9 is after
+	// "bbb" (index 7), so "aaa bbb…".
+	if got := truncateWords("aaa bbb ccc ddd", 9); got != "aaa bbb…" {
+		t.Errorf("word-boundary cut = %q, want %q", got, "aaa bbb…")
+	}
+	// No space in range: a single long token backs off to a rune boundary and
+	// still truncates (never returns the whole over-cap token).
+	got := truncateWords("aaaaaaaaaaaaaaa", 5)
+	if !strings.HasSuffix(got, "…") || len([]rune(got)) > 6 {
+		t.Errorf("no-space fallback should truncate with an ellipsis; got %q", got)
+	}
+}
+
+// TestRenderAnchorBody_RationaleWordBoundaryTruncation pins fix 4a (#1788): an
+// over-cap model-recommendation rationale truncates at a WORD boundary with a
+// real "…" ellipsis, never mid-word and never the ASCII "...".
+func TestRenderAnchorBody_RationaleWordBoundaryTruncation(t *testing.T) {
+	// 40 × "complexity " is ~440 bytes — well over the 200-byte cap — and every
+	// token is the same word, so a word-boundary cut ends on a whole
+	// "complexity".
+	rationale := strings.TrimSpace(strings.Repeat("complexity ", 40))
+	body := RenderAnchorBody(AnchorInput{
+		Run:    anchorRun(),
+		Stages: []*run.Stage{{Type: run.StageTypePlan, State: run.StageStateSucceeded}},
+		CurrentPlan: &AnchorPlanView{
+			Summary:                 "s",
+			RecommendedModel:        "claude-sonnet-4-6",
+			RecommendationRationale: rationale,
+		},
+		ExternalURL: "https://app.example",
+		Now:         time.Unix(1000, 0).UTC(),
+	})
+	if !strings.Contains(body, "complexity…") {
+		t.Errorf("rationale should truncate on a word boundary with a real ellipsis:\n%s", body)
+	}
+	// Isolate the recommendation line and assert it uses the real ellipsis, not
+	// the ASCII "..." the shared oneLine/truncate would emit.
+	line := body[strings.Index(body, "Model recommendation:"):]
+	if end := strings.IndexByte(line, '\n'); end >= 0 {
+		line = line[:end]
+	}
+	if strings.Contains(line, "...") {
+		t.Errorf("rationale must use a real ellipsis, not ASCII '...':\n%s", line)
+	}
+}
+
 // TestRenderAnchorBody_Economics pins #1702: a wired economics rollup renders
 // the block (above the footer) in a normal-size anchor body.
 func TestRenderAnchorBody_Economics(t *testing.T) {
@@ -538,7 +645,7 @@ func TestRenderAnchorBody_Economics(t *testing.T) {
 		"**Total cost**: $0.42",
 		"**Wait on human**: 1h 30m",
 		"plan approval: 45m",
-		"**Cache net savings**: $0.12",
+		"**Cache net savings**: $0.12 (vs uncached replay)",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("anchor missing economics content %q:\n%s", want, body)
