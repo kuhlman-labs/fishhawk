@@ -613,11 +613,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		stageType = sType
 		// Hand the resolved scope.files to the out-of-process CLI
 		// auto-PR path (#581) the same way the PR description is
-		// handed off via /tmp/fishhawk-pr.md. Only implement stages
+		// handed off via the run/stage-keyed sidecar. Only implement stages
 		// carry a scope; a write failure is non-fatal — the CLI falls
 		// back to `git add -A` when the file is missing.
 		if sType == "implement" && len(scopeFiles) > 0 {
-			writeScopeHandoff(scopeFiles, logSink)
+			writeScopeHandoff(cfg, scopeFiles, logSink)
 		}
 		// Server-resolved timeout wins when operator didn't pass --timeout explicitly.
 		if cfg.timeout == 0 && agentTimeoutSecs > 0 {
@@ -953,19 +953,30 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		inv.JSONSchema = acceptanceVerdictJSONSchema
 
 		// Clear any stale fallback verdict from a PRIOR run BEFORE the
-		// acceptance agent runs. acceptanceVerdictPath is a fixed shared
-		// path (/tmp/fishhawk-acceptance.json); without this removal, an
-		// agent that produces neither structured output nor a fresh file
-		// would let captureAcceptanceVerdict read and ship a previous run's
-		// stale verdict instead of failing acceptance_verdict_missing
-		// (#1535 fix-up). A remove error other than not-exist means we
-		// cannot guarantee a clean transport — fail category-C before any
-		// agent spawn rather than risk shipping stale evidence.
-		if err := os.Remove(acceptanceVerdictPath); err != nil && !os.IsNotExist(err) {
-			_, _ = fmt.Fprintf(logSink,
-				`{"event":"runner_failed","reason":"acceptance_stale_verdict_clear","category":"C","detail":%q}`+"\n",
-				err.Error())
-			return exitFailure
+		// acceptance agent runs. captureAcceptanceVerdict reads the run/stage-
+		// keyed path first and falls back to the legacy fixed path
+		// (/tmp/fishhawk-acceptance.json) the prompt still names, so the
+		// pre-spawn clear MUST cover BOTH (#1777, binding condition 2): without
+		// it, an agent that produces neither structured output nor a fresh file
+		// would let captureAcceptanceVerdict read and ship a previous run's stale
+		// verdict instead of failing acceptance_verdict_missing (#1535 fix-up).
+		// Clearing the legacy path can delete a concurrent OLD-PROMPT run's
+		// verdict during the deprecation window; that failure is loud (the other
+		// run reports verdict-missing) and acceptable — the alternative (shipping
+		// a foreign stale verdict) is the bug this defends against. A remove error
+		// other than not-exist means we cannot guarantee a clean transport — fail
+		// category-C before any agent spawn rather than risk shipping stale
+		// evidence.
+		for _, path := range []string{
+			acceptanceVerdictPath(cfg.runID, cfg.stageID),
+			legacyAcceptanceVerdictPath,
+		} {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"runner_failed","reason":"acceptance_stale_verdict_clear","category":"C","detail":%q}`+"\n",
+					err.Error())
+				return exitFailure
+			}
 		}
 	}
 
@@ -1116,6 +1127,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// message. Fires on both the GHA and local paths (the runner subprocess
 		// always invokes the agent, even under --no-pr).
 		sweepStaleImplementCommitMessage(cfg, logSink)
+		// Pre-invoke PR-description sweep (#1777): delete any leftover PR
+		// description at THIS run/stage's keyed path AND at the legacy fixed path
+		// before the agent runs, so a stale foreign handoff (a prior retry, or a
+		// concurrent run that raced on the shared legacy path) can never be
+		// silently parsed into this run's PR title/body — the exact clobber this
+		// issue fixes. Covers keyed AND legacy to match loadAgentAuthoredPR's
+		// keyed-first-legacy-fallback read (binding condition 2).
+		sweepStalePullRequestDescription(cfg, logSink)
 	}
 
 	// Run()-level restore net (#953, the #941 residual): the restore defers
@@ -1617,7 +1636,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// carries the redacted bytes to the post-trace ShipAcceptance below.
 	var acceptanceVerdictRedacted []byte
 	if stageType == "acceptance" && res.OK {
-		rawVerdict, capErr := captureAcceptanceVerdict(res, acceptanceVerdictPath)
+		// Shared runner-log seam for the capture (legacy-path deprecation) and
+		// validate (coercion) events.
+		acceptanceWarn := func(event, detail string) {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":%q,"run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+				event, cfg.runID, cfg.stageID, detail)
+		}
+		rawVerdict, capErr := captureAcceptanceVerdict(res,
+			acceptanceVerdictPath(cfg.runID, cfg.stageID), legacyAcceptanceVerdictPath, acceptanceWarn)
 		if capErr != nil {
 			res.OK = false
 			res.FailureCategory = "B"
@@ -1627,11 +1654,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				`{"event":"acceptance_verdict_missing","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
 				cfg.runID, cfg.stageID, capErr.Error())
 		} else if coercedVerdict, valErr := validateAcceptanceVerdict(rawVerdict, acceptanceCriteriaIDs,
-			func(event, detail string) {
-				_, _ = fmt.Fprintf(logSink,
-					`{"event":%q,"run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
-					event, cfg.runID, cfg.stageID, detail)
-			}); valErr != nil {
+			acceptanceWarn); valErr != nil {
 			res.OK = false
 			res.FailureCategory = "B"
 			res.FailureReason = "acceptance_verdict_invalid: " + valErr.Error()
@@ -5200,7 +5223,8 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// loadImplementCommitMessage), falling back to today's title + "\n\n" + body
 	// when no sidecar is present — so the initial commit no longer stuffs the
 	// whole PR review body into its message. The PR title/body still come from
-	// /tmp/fishhawk-pr.md unchanged. Overridden below on the isFixup path.
+	// the (run/stage-keyed, #1777) PR-description handoff unchanged. Overridden
+	// below on the isFixup path.
 	commitMessage := implementCommitMessage(cfg, title, body, logSink)
 	if isFixup {
 		// Per-pass fix-up commit message (#1572): a fix-up gets its own commit
@@ -5951,13 +5975,25 @@ func childSliceBranch(decomposedFromRunID string, sliceIndex int) string {
 	return fmt.Sprintf("fishhawk/run-%s/slice-%d", shortID(decomposedFromRunID), sliceIndex)
 }
 
-// scopeHandoffPath mirrors the /tmp/fishhawk-pr.md handoff: the runner
-// writes the implement stage's resolved scope.files here so the
-// out-of-process CLI auto-PR path (cli/cmd/fishhawk/autopr.go, a
-// separate Go module) can bound its staging to the same declared paths
-// (#581). var (not const) so tests can redirect it to a t.TempDir path
-// and avoid /tmp pollution / parallel-test races.
-var scopeHandoffPath = "/tmp/fishhawk-scope.json"
+// scopeHandoffDir is the directory the run/stage-keyed scope handoff lives in
+// (#581, keyed by #1777). var (not const) so tests can redirect it to a
+// t.TempDir path and avoid /tmp pollution / parallel-test races.
+var scopeHandoffDir = "/tmp"
+
+// scopeHandoffPath mirrors the PR-description handoff: the runner writes the
+// implement stage's resolved scope.files here so the out-of-process CLI auto-PR
+// path (cli/cmd/fishhawk/autopr.go, a separate Go module) can bound its staging
+// to the same declared paths (#581). Keyed by the FULL run id + stage id (#1777)
+// so parallel implement runners on one host no longer share the single fixed
+// /tmp/fishhawk-scope.json — the last writer could otherwise bound another run's
+// commit to the wrong scope. No legacy fixed-path fallback is needed (unlike the
+// PR-description handoff): the runner writer and the CLI reader upgrade in
+// lockstep within one binary set, so there is no old-writer/new-reader
+// deprecation window to bridge. The CLI mirrors this EXACT format string in its
+// own scopeFilePath.
+func scopeHandoffPath(runID, stageID string) string {
+	return filepath.Join(scopeHandoffDir, fmt.Sprintf("fishhawk-scope-%s-%s.json", runID, stageID))
+}
 
 // scopeHandoff is the JSON written to scopeHandoffPath. `files` mirrors
 // the standard_v1 plan scope.files shape (path + operation) so the CLI
@@ -5971,21 +6007,22 @@ type scopeHandoff struct {
 // for the CLI auto-PR path. Best-effort: a marshal or write failure is
 // logged but never fails the stage — the CLI falls back to `git add -A`
 // when the file is absent or empty.
-func writeScopeHandoff(files []upload.ScopeFile, logSink io.Writer) {
+func writeScopeHandoff(cfg config, files []upload.ScopeFile, logSink io.Writer) {
+	path := scopeHandoffPath(cfg.runID, cfg.stageID)
 	data, err := json.Marshal(scopeHandoff{Files: files})
 	if err != nil {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"scope_handoff_failed","reason":"marshal","detail":%q}`+"\n", err.Error())
 		return
 	}
-	if err := os.WriteFile(scopeHandoffPath, data, 0o600); err != nil {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"scope_handoff_failed","reason":"write","detail":%q}`+"\n", err.Error())
 		return
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"scope_handoff_written","path":%q,"file_count":%d}`+"\n",
-		scopeHandoffPath, len(files))
+		path, len(files))
 }
 
 // syncWriter serializes concurrent Write calls to an underlying writer
@@ -6643,6 +6680,33 @@ func sweepStaleImplementCommitMessage(cfg config, logSink io.Writer) {
 	}
 }
 
+// sweepStalePullRequestDescription deletes any leftover PR-description handoff at
+// THIS run/stage's keyed path AND at the legacy fixed path before the agent is
+// invoked (#1777) — the pre-invoke freshness defense mirroring
+// sweepStaleImplementCommitMessage. A stale foreign PR file must never be
+// silently parsed (the exact clobber this issue fixes), so the sweep covers
+// BOTH the path this run's agent may write (keyed) and the path an older
+// prompt/agent may write (legacy), matching loadAgentAuthoredPR's keyed-first-
+// legacy-fallback read (binding condition 2). Best-effort: a not-exist (the
+// common case) is silent; a leftover actually removed emits pr_description_swept.
+//
+// Clearing the legacy path can delete a concurrent OLD-PROMPT run's handoff
+// during the deprecation window; that failure is loud (the other run falls back
+// to the generic Fishhawk template) and acceptable — the alternative (silently
+// parsing a foreign run's PR text) is the bug this issue closes.
+func sweepStalePullRequestDescription(cfg config, logSink io.Writer) {
+	for _, path := range []string{
+		pullRequestDescriptionPath(cfg.runID, cfg.stageID),
+		legacyPullRequestDescriptionPath,
+	} {
+		if rerr := os.Remove(path); rerr == nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"pr_description_swept","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
+				cfg.runID, cfg.stageID, path)
+		}
+	}
+}
+
 // loadImplementCommitMessage reads the agent's initial-implement commit-message
 // sidecar (#1686) and splits it into (subject, body). It deletes the file on
 // EVERY return path (delete-after-read) so a stale sidecar can never bleed into a
@@ -6689,7 +6753,7 @@ func loadImplementCommitMessage(cfg config, logSink io.Writer) (subject, body st
 // falling back to EXACTLY today's title + "\n\n" + body when the sidecar is
 // absent/empty — no synthetic subject, so an older agent that writes no sidecar
 // sees no behavior change. title/body are the PR title/body sourced unchanged
-// from /tmp/fishhawk-pr.md.
+// from the run/stage-keyed PR-description handoff (#1777).
 func implementCommitMessage(cfg config, title, body string, logSink io.Writer) string {
 	if subject, sidecarBody, ok := loadImplementCommitMessage(cfg, logSink); ok {
 		// Warn-only conventional-commit header check on the sidecar subject,
@@ -6851,15 +6915,30 @@ func isBinaryArtifactDrift(repoDir, path string) (bool, int64) {
 	return executableOversized || cmdBinaryShape, size
 }
 
-// pullRequestDescriptionPath mirrors prompt.PullRequestDescriptionPath
-// in the backend. Hardcoded in both places by design — the runner
-// and the backend are independent Go modules; using the shared
-// string here is the cheapest coordination. v0.x can move to a
-// per-stage env var if multi-tenancy demands isolation. (#206.)
-//
-// var (not const) so tests can swap it for a t.TempDir-scoped path
-// and avoid /tmp pollution / parallel-test races.
-var pullRequestDescriptionPath = "/tmp/fishhawk-pr.md"
+// pullRequestDescriptionDir is the directory the run/stage-keyed PR-description
+// handoff lives in (#1777). var (not const) so tests can redirect it to a
+// t.TempDir, avoiding /tmp pollution / parallel-test races — the same seam
+// pattern as implementCommitMessageDir.
+var pullRequestDescriptionDir = "/tmp"
+
+// pullRequestDescriptionPath mirrors prompt.PullRequestDescriptionPath in the
+// backend: the run/stage-keyed path the implement agent writes its PR
+// description to and the runner reads it from (#1777). The format string is
+// hardcoded in all three independent modules (backend prompt, runner, CLI) by
+// design — the same coordination as implementCommitMessagePath. Keying isolates
+// each parallel runner's handoff so the last writer can no longer win and open
+// a PR with another run's title/body (the #1775/#1776 incident).
+func pullRequestDescriptionPath(runID, stageID string) string {
+	return filepath.Join(pullRequestDescriptionDir, fmt.Sprintf("fishhawk-pr-%s-%s.md", runID, stageID))
+}
+
+// legacyPullRequestDescriptionPath is the fixed shared path the PR description
+// used to be written to before #1777 keyed it. Retained ONLY as the
+// deprecation-window fallback: loadAgentAuthoredPR reads the keyed path first
+// and falls back to this legacy path (emitting pr_description_legacy_path) so an
+// older prompt/agent that still writes the fixed path is not silently lost. var
+// (not const) so tests can redirect it to a t.TempDir path.
+var legacyPullRequestDescriptionPath = "/tmp/fishhawk-pr.md"
 
 // conventionalCommitHeaderRe matches a Conventional Commits v1.0.0 header
 // (#1572): a lowercase type from the allowed set, an optional lowercase scope in
@@ -6883,7 +6962,7 @@ var conventionalCommitHeaderRe = regexp.MustCompile(`^(feat|fix|docs|refactor|te
 // auditable provenance is preserved without requiring the agent to
 // remember to include it in every PR.
 func prTitleAndBody(cfg config, branch string, logSink io.Writer) (title, body string) {
-	agentTitle, agentBody, kind := loadAgentAuthoredPR(logSink)
+	agentTitle, agentBody, kind := loadAgentAuthoredPR(cfg, logSink)
 
 	switch kind {
 	case prSourceAgent:
@@ -6931,6 +7010,14 @@ const (
 // parse it into a (title, body) pair. Returns prSourceFallback when
 // the file is absent or malformed; prSourceAgent on success.
 //
+// Path resolution (#1777): reads the run/stage-KEYED path first, then falls
+// back to the LEGACY fixed path — mirroring the acceptance keyed-first-legacy
+// design — so an older prompt/agent that still writes the fixed path is not
+// silently lost during the deprecation window (a legacy read emits a
+// pr_description_legacy_path deprecation event). The consumed file is deleted on
+// EVERY read path (delete-after-read) so a leftover cannot bleed into a later
+// run/stage.
+//
 // Format (#206):
 //   - First line is the title (≤72 chars; we don't enforce, GitHub
 //     handles overflow gracefully).
@@ -6942,20 +7029,39 @@ const (
 //   - Empty file.
 //   - First line empty.
 //   - No blank line separating title from body.
-func loadAgentAuthoredPR(logSink io.Writer) (title, body string, kind prSource) {
-	raw, err := os.ReadFile(pullRequestDescriptionPath)
+func loadAgentAuthoredPR(cfg config, logSink io.Writer) (title, body string, kind prSource) {
+	keyed := pullRequestDescriptionPath(cfg.runID, cfg.stageID)
+	raw, err := os.ReadFile(keyed)
+	path := keyed
 	if err != nil {
-		// File absent is the common no-op path (agent didn't follow
-		// the instruction, or we're in a stage type that doesn't
-		// produce a PR). Don't log; just fall back.
-		return "", "", prSourceFallback
+		if !os.IsNotExist(err) {
+			// Unreadable keyed file (permissions, etc.): fall back to the
+			// generic template, same as the pre-#1777 absent-file no-op.
+			return "", "", prSourceFallback
+		}
+		// Keyed path absent: fall back to the legacy fixed path so a fixed-path
+		// prompt render (an older agent/prompt) still lands its PR text.
+		legacyRaw, legacyErr := os.ReadFile(legacyPullRequestDescriptionPath)
+		if legacyErr != nil {
+			// Neither path present is the common no-op (agent didn't follow the
+			// instruction, or a stage type that produces no PR). Don't log.
+			return "", "", prSourceFallback
+		}
+		raw = legacyRaw
+		path = legacyPullRequestDescriptionPath
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"pr_description_legacy_path","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
+			cfg.runID, cfg.stageID, path)
 	}
+	// A present file is consumed regardless of outcome: remove whichever path we
+	// read so a stale handoff is never reused by a later run/stage.
+	defer func() { _ = os.Remove(path) }()
 
 	text := strings.TrimRight(string(raw), "\n")
 	if text == "" {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"pr_template_invalid","reason":%q,"path":%q}`+"\n",
-			"empty file", pullRequestDescriptionPath)
+			"empty file", path)
 		return "", "", prSourceFallback
 	}
 
@@ -6966,7 +7072,7 @@ func loadAgentAuthoredPR(logSink io.Writer) (title, body string, kind prSource) 
 	if title == "" {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"pr_template_invalid","reason":%q,"path":%q}`+"\n",
-			"empty title line", pullRequestDescriptionPath)
+			"empty title line", path)
 		return "", "", prSourceFallback
 	}
 
@@ -6978,7 +7084,7 @@ func loadAgentAuthoredPR(logSink io.Writer) (title, body string, kind prSource) 
 	if !conventionalCommitHeaderRe.MatchString(title) {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"pr_template_warning","reason":%q,"path":%q}`+"\n",
-			"title is not a conventional-commit header", pullRequestDescriptionPath)
+			"title is not a conventional-commit header", path)
 	}
 
 	if len(lines) < 2 {
@@ -6987,7 +7093,7 @@ func loadAgentAuthoredPR(logSink io.Writer) (title, body string, kind prSource) 
 		// the operator can spot agents that aren't writing bodies.
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"pr_template_warning","reason":%q,"path":%q}`+"\n",
-			"title-only (no body)", pullRequestDescriptionPath)
+			"title-only (no body)", path)
 		return title, "", prSourceAgent
 	}
 
@@ -6998,7 +7104,7 @@ func loadAgentAuthoredPR(logSink io.Writer) (title, body string, kind prSource) 
 	if !strings.HasPrefix(lines[1], "\n") {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"pr_template_warning","reason":%q,"path":%q}`+"\n",
-			"no blank line between title and body", pullRequestDescriptionPath)
+			"no blank line between title and body", path)
 	}
 
 	return title, rest, prSourceAgent

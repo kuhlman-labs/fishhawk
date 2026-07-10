@@ -70,8 +70,9 @@ func TestBuild_Implement_FullContext(t *testing.T) {
 		"URL: https://github.com/kuhlman-labs/example/issues/42",
 		"Fetch the issue body via your GitHub tooling",
 		"smallest set of changes",
-		// PR description guidance + the path the runner reads (#206).
-		PullRequestDescriptionPath,
+		// PR description guidance + the path the runner reads (#206). No
+		// run/stage ids on this trigger → the legacy fixed path renders (#1777).
+		LegacyPullRequestDescriptionPath,
 		// Conventional Commits v1.0.0 instruction (#1572): the first line is a
 		// `type(scope): description` header, the full allowed-type list is
 		// enumerated, and the line doubles as the PR title AND the commit
@@ -122,7 +123,7 @@ func TestBuild_Implement_NoIssueRef_OmitsClosesGuidance(t *testing.T) {
 	if strings.Contains(got, "Closes #") {
 		t.Errorf("prompt should not mention 'Closes #' when IssueNumber is 0:\n%s", got)
 	}
-	if !strings.Contains(got, PullRequestDescriptionPath) {
+	if !strings.Contains(got, LegacyPullRequestDescriptionPath) {
 		t.Errorf("prompt missing PR description path even without issue context:\n%s", got)
 	}
 }
@@ -457,8 +458,9 @@ func TestBuild_Implement_WithApprovedPlan_LeadsWithPlan(t *testing.T) {
 		"diverging silently",
 		"materially changed since the plan was approved",
 		// Existing PR-description instructions still present —
-		// the plan addition is additive, not replacement.
-		PullRequestDescriptionPath,
+		// the plan addition is additive, not replacement. No run/stage ids on
+		// this trigger → the legacy fixed path renders (#1777).
+		LegacyPullRequestDescriptionPath,
 		"## Summary",
 		"## Test plan",
 		"Closes #42",
@@ -2395,7 +2397,7 @@ func TestBuild_Implement_Fixup_OmitsFullScaffolding(t *testing.T) {
 		"Approved plan (binding instruction)",
 		"### Budget context",
 		"write a pull-request description",
-		PullRequestDescriptionPath,
+		LegacyPullRequestDescriptionPath,
 	}
 	for _, a := range absent {
 		if strings.Contains(got, a) {
@@ -2456,7 +2458,7 @@ func TestBuild_Implement_Fixup_TargetedPatch_ContainsConcernsAndFilesNotCorpus(t
 		"Approved plan (binding instruction)",
 		"### Budget context",
 		"write a pull-request description",
-		PullRequestDescriptionPath,
+		LegacyPullRequestDescriptionPath,
 	}
 	for _, c := range corpus {
 		if strings.Contains(got, c) {
@@ -3693,7 +3695,7 @@ func TestBuild_PlanReview_ProducesNoPRDescriptionGuidance(t *testing.T) {
 	}
 	// The review prompt must not bleed in implement-stage instructions.
 	// The agent is a reviewer, not an implementer.
-	if strings.Contains(got, PullRequestDescriptionPath) {
+	if strings.Contains(got, LegacyPullRequestDescriptionPath) {
 		t.Errorf("plan_review prompt must not include PR description guidance:\n%s", got)
 	}
 	if strings.Contains(got, "## Summary") {
@@ -4953,9 +4955,14 @@ func TestBuild_ImplementFixup_CommitMessage_RendersKeyedPathAndInstruction(t *te
 		}
 	}
 	// The PR-description block must NOT be on the fix-up path: a fix-up must
-	// never clobber the existing PR title/body.
-	if strings.Contains(got, PullRequestDescriptionPath) {
-		t.Errorf("fix-up prompt must NOT contain the PR-description path:\n%s", got)
+	// never clobber the existing PR title/body. Assert absence of BOTH the
+	// run/stage-keyed path (what a leaked full-implement block would render for
+	// these ids) and the legacy fixed path (#1777).
+	if strings.Contains(got, PullRequestDescriptionPath(runID, stageID)) {
+		t.Errorf("fix-up prompt must NOT contain the keyed PR-description path:\n%s", got)
+	}
+	if strings.Contains(got, LegacyPullRequestDescriptionPath) {
+		t.Errorf("fix-up prompt must NOT contain the legacy PR-description path:\n%s", got)
 	}
 }
 
@@ -5042,9 +5049,10 @@ func TestBuild_Implement_CommitMessage_RendersKeyedPathAndInstruction(t *testing
 		}
 	}
 	// Binding condition 4: the PR-description block is untouched — the PR title
-	// and body still come from PullRequestDescriptionPath with the same sections.
+	// and body still come from the (now run/stage-keyed, #1777) PR-description
+	// path with the same sections.
 	for _, w := range []string{
-		"write a pull-request description to `" + PullRequestDescriptionPath + "`",
+		"write a pull-request description to `" + PullRequestDescriptionPath(runID, stageID) + "`",
 		"`## Summary`",
 		"`## Test plan`",
 		"it becomes BOTH the PR title and the commit subject",
@@ -5069,6 +5077,56 @@ func TestBuild_Implement_CommitMessage_AbsentWhenIDsUnset(t *testing.T) {
 	}
 	if strings.Contains(got, "### Write the commit message") {
 		t.Errorf("commit-message block must be absent when run/stage ids are unset:\n%s", got)
+	}
+}
+
+// TestBuild_Implement_PRDescription_RendersKeyedPath (#1777): the full implement
+// prompt renders the run/stage-KEYED PR-description path as the fully-substituted
+// LITERAL — the cross-module drift guard, byte-identical to the runner + CLI
+// helpers — and never also emits the legacy fixed path when ids are present.
+func TestBuild_Implement_PRDescription_RendersKeyedPath(t *testing.T) {
+	const runID = "11112222333344445555666677778888"
+	const stageID = "99990000aaaabbbbccccddddeeeeffff"
+	got, err := Build("implement", Trigger{
+		Repo:             "o/r",
+		ApprovedPlan:     fixturePlan(),
+		ImplementRunID:   runID,
+		ImplementStageID: stageID,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wantKeyed := "/tmp/fishhawk-pr-" + runID + "-" + stageID + ".md"
+	if got := PullRequestDescriptionPath(runID, stageID); got != wantKeyed {
+		t.Fatalf("keyed literal drift: helper = %q, want %q (runner + CLI mirror this)", got, wantKeyed)
+	}
+	if !strings.Contains(got, "write a pull-request description to `"+wantKeyed+"`") {
+		t.Errorf("implement prompt missing keyed PR-description path %q\n---\n%s", wantKeyed, got)
+	}
+	// The commit-message cross-reference must ALSO render the keyed path.
+	if !strings.Contains(got, "Keep it SEPARATE from the rich PR review body you write to `"+wantKeyed+"`") {
+		t.Errorf("commit-message cross-reference must name the keyed PR path\n---\n%s", got)
+	}
+	// The legacy fixed path must NOT appear when ids are present.
+	if strings.Contains(got, LegacyPullRequestDescriptionPath) {
+		t.Errorf("keyed render must not also emit the legacy fixed path:\n%s", got)
+	}
+}
+
+// TestBuild_Implement_PRDescription_FallsBackToLegacyWhenIDsUnset (#1777): a full
+// implement trigger missing the run/stage ids renders the legacy fixed path
+// rather than a malformed unkeyed path.
+func TestBuild_Implement_PRDescription_FallsBackToLegacyWhenIDsUnset(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		ApprovedPlan: fixturePlan(),
+		// ImplementRunID / ImplementStageID deliberately empty.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "write a pull-request description to `"+LegacyPullRequestDescriptionPath+"`") {
+		t.Errorf("id-less trigger must render the legacy fixed PR-description path\n---\n%s", got)
 	}
 }
 
@@ -5429,7 +5487,7 @@ func TestBuild_ImplementReview_ProducesNoPRDescriptionGuidance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if strings.Contains(got, PullRequestDescriptionPath) {
+	if strings.Contains(got, LegacyPullRequestDescriptionPath) {
 		t.Errorf("implement_review prompt must not carry implement-stage PR guidance:\n%s", got)
 	}
 }

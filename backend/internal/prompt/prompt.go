@@ -53,24 +53,58 @@ var ErrUnsupportedStage = errors.New("prompt: unsupported stage type")
 // per-stage variable if multi-tenancy demands isolation.
 const PlanArtifactPath = "/tmp/fishhawk-plan.json"
 
-// PullRequestDescriptionPath is the absolute path the runner expects
-// to find the agent-authored PR description at after an
-// implement-stage invocation. Format: first line = title (≤72 chars),
-// blank line, then markdown body. The runner reads this and forwards
-// the title + body to GitHub's pulls API; if missing or malformed
-// the runner falls back to a generic Fishhawk template, so v0 stays
-// robust against agents that ignore the instruction.
+// LegacyPullRequestDescriptionPath is the fixed shared path the agent-authored
+// PR description used to be written to before it was keyed by run/stage (#1777).
+// Retained ONLY as the deprecation-window fallback: an older prompt/agent that
+// still renders this fixed path is read by the runner + CLI after the keyed path
+// misses, so a fixed-path render never strands the PR-description transport.
+// New renders use the run/stage-keyed PullRequestDescriptionPath below.
+const LegacyPullRequestDescriptionPath = "/tmp/fishhawk-pr.md"
+
+// PullRequestDescriptionPath is the run/stage-keyed path the runner expects
+// to find the agent-authored PR description at after an implement-stage
+// invocation. Format: first line = title (≤72 chars), blank line, then
+// markdown body. The runner reads this and forwards the title + body to
+// GitHub's pulls API; if missing or malformed the runner falls back to a
+// generic Fishhawk template, so v0 stays robust against agents that ignore
+// the instruction.
 //
-// Hardcoded for v0 — same rationale as PlanArtifactPath. (#206.)
-const PullRequestDescriptionPath = "/tmp/fishhawk-pr.md"
+// Keyed by the FULL run id + stage id (#1777): parallel implement runners on
+// one host previously shared the single fixed /tmp/fishhawk-pr.md, so the last
+// writer won and a run could open its PR with another run's title/body (and
+// Closes #N — the #1775/#1776 incident). Keying the path isolates each run's
+// handoff, mirroring ImplementCommitMessagePath / FixupCommitMessagePath.
+//
+// The runner (runner/cmd/fishhawk-runner/main.go) and the CLI
+// (cli/cmd/fishhawk/autopr.go) each mirror this EXACT format string in their own
+// pullRequestDescriptionPath / prDescriptionPath — the same independent-module
+// coordination as ImplementCommitMessagePath. A one-sided edit to any of the
+// three copies is caught by the prompt-render test (asserts the literal
+// substituted path) plus the runner and CLI load tests (each assert the
+// byte-identical literal for the same ids), so the three copies cannot silently
+// drift.
+func PullRequestDescriptionPath(runID, stageID string) string {
+	return fmt.Sprintf("/tmp/fishhawk-pr-%s-%s.md", runID, stageID)
+}
 
 // AcceptanceVerdictPath is the absolute file-fallback path the acceptance
 // agent writes its structured verdict to when the driving adapter has no
 // structured-output channel (the codex path; claudecode agents emit the
 // verdict via --json-schema structured output, which the runner prefers).
 // Embedded in the acceptance prompt's output contract and read by the E31.7
-// runner executor's capture fallback. Hardcoded for v0 — same rationale as
-// PlanArtifactPath.
+// runner executor's capture fallback.
+//
+// Deliberately NOT run/stage-keyed (#1777): unlike the implement-stage PR
+// description, the acceptance Trigger does not thread run/stage ids into the
+// acceptance prompt (only implement-stage prompts carry ImplementRunID /
+// ImplementStageID — see backend/internal/server/prompt.go), so this stays a
+// fixed shared path. The sharing is narrow and mostly fail-loud: a clobbered
+// verdict is caught by the runner's served-criteria-id membership check and the
+// #1535 pre-spawn stale-clear, which fail the stage loudly rather than shipping
+// a wrong verdict silently. The RUNNER reads the run/stage-keyed path FIRST and
+// falls back to THIS legacy fixed path (binding condition 1), so keying the
+// acceptance prompt later (once the acceptance Trigger threads ids) needs no
+// runner change. Keying THIS constant is deferred to that follow-up.
 const AcceptanceVerdictPath = "/tmp/fishhawk-acceptance.json"
 
 // ScopeJustificationPath is the run/stage-keyed path the implement agent
@@ -1069,9 +1103,12 @@ func buildImplement(t Trigger) string {
 	// PR description: write to a known path so the runner can lift
 	// it into the GitHub PR's title + body. Format is documented
 	// here in the prompt itself (rather than a separate spec doc)
-	// because the agent reads the prompt and nothing else.
+	// because the agent reads the prompt and nothing else. Keyed by
+	// run/stage when the ids are populated (#1777) so parallel runners
+	// never clobber each other's handoff; falls back to the legacy fixed
+	// path when a trigger carries no ids (byte-identical to pre-#1777).
 	b.WriteString("When you're done, write a pull-request description to `")
-	b.WriteString(PullRequestDescriptionPath)
+	b.WriteString(pullRequestDescriptionPathForTrigger(t))
 	b.WriteString("`. Format:\n")
 	b.WriteString("\n")
 	b.WriteString("- The first line is a Conventional Commits v1.0.0 header of the form `type(scope): description` — it becomes BOTH the PR title and the commit subject. `type` MUST be lowercase and one of `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `perf`, `build`; the `(scope)` is optional (a lowercase area name in parentheses); then `: ` and an imperative, task-specific description of what you changed (e.g. `feat(runner): add minio-init target`). Be specific — vague subjects like `fix bug` or `update code` are not acceptable. Aim for ≤50 characters and never exceed 72. Mark a breaking change with a `!` before the colon (`feat!: …`) or a `BREAKING CHANGE:` footer. Do not prefix it with `Fishhawk:` — the runner adds attribution separately.\n")
@@ -1482,9 +1519,25 @@ func writeImplementCommitMessage(b *strings.Builder, t Trigger) {
 	b.WriteString("- Leave one blank line, then a concise plain-text body describing WHAT changed and " +
 		"why — a few sentences or short bullets, NOT the full PR review body.\n")
 	b.WriteString("- This file is the commit message ONLY. Keep it SEPARATE from the rich PR review body " +
-		"you write to `" + PullRequestDescriptionPath + "` (the `## Summary` / `## Test plan` / `## Notes` " +
+		"you write to `" + pullRequestDescriptionPathForTrigger(t) + "` (the `## Summary` / `## Test plan` / `## Notes` " +
 		"sections, approval-condition and failure-mode checklists, and `Closes #…` line stay in the PR " +
 		"description, NOT here).\n\n")
+}
+
+// pullRequestDescriptionPathForTrigger resolves the PR-description handoff path
+// for an implement-stage prompt (#1777): the run/stage-keyed
+// PullRequestDescriptionPath when the trigger threads both ids (the normal
+// implement dispatch, since backend/internal/server/prompt.go sets
+// ImplementRunID/ImplementStageID), falling back to the legacy fixed path when
+// either id is empty so a trigger missing them still renders a usable (if
+// shared) path rather than a malformed one. Shared by buildImplement's PR-body
+// instruction and writeImplementCommitMessage's cross-reference so both name the
+// identical path.
+func pullRequestDescriptionPathForTrigger(t Trigger) string {
+	if t.ImplementRunID != "" && t.ImplementStageID != "" {
+		return PullRequestDescriptionPath(t.ImplementRunID, t.ImplementStageID)
+	}
+	return LegacyPullRequestDescriptionPath
 }
 
 // writeGitOpsProhibition renders the line forbidding the agent from running

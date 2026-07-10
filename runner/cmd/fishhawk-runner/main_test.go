@@ -2951,14 +2951,15 @@ func TestRun_ImplementStage_ScopeFilesThreadedAndHandoffWritten(t *testing.T) {
 	fpr := &fakePROpener{}
 	withFakeGitOps(t, fp, fpr)
 
-	// Redirect the scope handoff to a temp path so the CLI auto-PR
-	// contract is exercised without /tmp pollution.
-	scopePath := filepath.Join(t.TempDir(), "scope.json")
-	origScope := scopeHandoffPath
-	scopeHandoffPath = scopePath
-	t.Cleanup(func() { scopeHandoffPath = origScope })
+	// Redirect the scope handoff dir to a temp path so the CLI auto-PR
+	// contract is exercised without /tmp pollution. The runner writes the
+	// run/stage-keyed path (#1777).
+	origScopeDir := scopeHandoffDir
+	scopeHandoffDir = t.TempDir()
+	t.Cleanup(func() { scopeHandoffDir = origScopeDir })
 
 	runID := "11111111-2222-3333-4444-555555555555"
+	scopePath := scopeHandoffPath(runID, stageID)
 	var stderr strings.Builder
 	got := run([]string{
 		"--run-id", runID,
@@ -3160,14 +3161,15 @@ func TestRun_ImplementStage_NoScopeFiles_FallsBack(t *testing.T) {
 	fpr := &fakePROpener{}
 	withFakeGitOps(t, fp, fpr)
 
-	scopePath := filepath.Join(t.TempDir(), "scope.json")
-	origScope := scopeHandoffPath
-	scopeHandoffPath = scopePath
-	t.Cleanup(func() { scopeHandoffPath = origScope })
+	origScopeDir := scopeHandoffDir
+	scopeHandoffDir = t.TempDir()
+	t.Cleanup(func() { scopeHandoffDir = origScopeDir })
+	runID := "11111111-2222-3333-4444-555555555555"
+	scopePath := scopeHandoffPath(runID, stageID)
 
 	var stderr strings.Builder
 	got := run([]string{
-		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--run-id", runID,
 		"--backend-url", "https://api.fishhawk.test",
 		"--workflow", "feature_change", "--stage", "implement",
 		"--stage-id", stageID,
@@ -3666,29 +3668,36 @@ func TestRun_ImplementStage_AlwaysFetchesFreshTokenBeforePush(t *testing.T) {
 	}
 }
 
-// withPRDescriptionPath redirects pullRequestDescriptionPath to a
-// temp dir for the duration of the test, restoring the production
-// value via t.Cleanup. Tests that write to the file should call
-// this before writing.
-func withPRDescriptionPath(t *testing.T) string {
+// withPRDescriptionPath redirects the PR-description handoff dir (and the legacy
+// fixed-path fallback) to a temp dir for the duration of the test, restoring the
+// production values via t.Cleanup. It returns the run/stage-KEYED path for the
+// given ids (#1777) — tests that write the agent-authored PR file should write to
+// the returned path so the runner's keyed-first read finds it. The legacy path is
+// also redirected into the temp dir so a real /tmp/fishhawk-pr.md never leaks into
+// a test.
+func withPRDescriptionPath(t *testing.T, runID, stageID string) string {
 	t.Helper()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "fishhawk-pr.md")
-	orig := pullRequestDescriptionPath
-	pullRequestDescriptionPath = path
-	t.Cleanup(func() { pullRequestDescriptionPath = orig })
-	return path
+	origDir := pullRequestDescriptionDir
+	pullRequestDescriptionDir = dir
+	origLegacy := legacyPullRequestDescriptionPath
+	legacyPullRequestDescriptionPath = filepath.Join(dir, "legacy-fishhawk-pr.md")
+	t.Cleanup(func() {
+		pullRequestDescriptionDir = origDir
+		legacyPullRequestDescriptionPath = origLegacy
+	})
+	return pullRequestDescriptionPath(runID, stageID)
 }
 
 func TestPRTitleAndBody_AgentAuthored_HappyPath(t *testing.T) {
-	path := withPRDescriptionPath(t)
-	if err := os.WriteFile(path, []byte("feat(make): add minio-init target\n\n## Why\n\nLocal stack needed a bucket-init step.\n\nCloses #184\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	cfg := config{
 		runID:      "11111111-2222-3333-4444-555555555555",
 		stageID:    "22222222-3333-4444-5555-666666666666",
 		backendURL: "https://api.fishhawk.test",
+	}
+	path := withPRDescriptionPath(t, cfg.runID, cfg.stageID)
+	if err := os.WriteFile(path, []byte("feat(make): add minio-init target\n\n## Why\n\nLocal stack needed a bucket-init step.\n\nCloses #184\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	var stderr strings.Builder
 	title, body := prTitleAndBody(cfg, "fishhawk/run-x/stage-y", &stderr)
@@ -3712,7 +3721,7 @@ func TestPRTitleAndBody_AgentAuthored_HappyPath(t *testing.T) {
 }
 
 func TestPRTitleAndBody_AgentAuthored_TitleOnly(t *testing.T) {
-	path := withPRDescriptionPath(t)
+	path := withPRDescriptionPath(t, "r", "s")
 	if err := os.WriteFile(path, []byte("Just the title\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -3734,7 +3743,7 @@ func TestPRTitleAndBody_AgentAuthored_TitleOnly(t *testing.T) {
 }
 
 func TestPRTitleAndBody_AgentAuthored_NoBlankLine(t *testing.T) {
-	path := withPRDescriptionPath(t)
+	path := withPRDescriptionPath(t, "r", "s")
 	// Title and body separated only by a single \n (no blank line).
 	if err := os.WriteFile(path, []byte("Title here\nBody starts immediately.\nMore body.\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -3756,9 +3765,9 @@ func TestPRTitleAndBody_AgentAuthored_NoBlankLine(t *testing.T) {
 }
 
 func TestPRTitleAndBody_FallbackWhenFileMissing(t *testing.T) {
-	// withPRDescriptionPath points at a temp file, but we don't
-	// write it. Helper must fall back silently.
-	withPRDescriptionPath(t)
+	// withPRDescriptionPath points at a temp dir, but we don't
+	// write the file. Helper must fall back silently.
+	withPRDescriptionPath(t, "11111111-2222-3333-4444-555555555555", "22222222-3333-4444-5555-666666666666")
 	var stderr strings.Builder
 	title, body := prTitleAndBody(config{
 		runID:      "11111111-2222-3333-4444-555555555555",
@@ -3778,7 +3787,7 @@ func TestPRTitleAndBody_FallbackWhenFileMissing(t *testing.T) {
 }
 
 func TestPRTitleAndBody_FallbackWhenFileEmpty(t *testing.T) {
-	path := withPRDescriptionPath(t)
+	path := withPRDescriptionPath(t, "r", "s")
 	if err := os.WriteFile(path, []byte(""), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -3795,7 +3804,7 @@ func TestPRTitleAndBody_FallbackWhenFileEmpty(t *testing.T) {
 }
 
 func TestPRTitleAndBody_FallbackWhenTitleEmpty(t *testing.T) {
-	path := withPRDescriptionPath(t)
+	path := withPRDescriptionPath(t, "r", "s")
 	// First line is whitespace; that's not a usable title.
 	if err := os.WriteFile(path, []byte("   \n\nbody only\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -3812,17 +3821,121 @@ func TestPRTitleAndBody_FallbackWhenTitleEmpty(t *testing.T) {
 	}
 }
 
+// TestPullRequestDescriptionPath_KeyedFormat asserts the run/stage-keyed PR
+// description path format (#1777): distinct (runID,stageID) pairs yield distinct
+// paths, and the literal matches the byte-identical format mirrored in the
+// backend prompt and the CLI (a cross-module drift guard, like the #1686 commit-
+// message sidecar).
+func TestPullRequestDescriptionPath_KeyedFormat(t *testing.T) {
+	origDir := pullRequestDescriptionDir
+	pullRequestDescriptionDir = "/tmp"
+	t.Cleanup(func() { pullRequestDescriptionDir = origDir })
+
+	a := pullRequestDescriptionPath("run-1", "stage-1")
+	b := pullRequestDescriptionPath("run-2", "stage-2")
+	if a == b {
+		t.Errorf("distinct run/stage ids must yield distinct paths: %q == %q", a, b)
+	}
+	if want := "/tmp/fishhawk-pr-run-1-stage-1.md"; a != want {
+		t.Errorf("keyed path = %q, want %q (must match backend + CLI literal)", a, want)
+	}
+}
+
+// TestPRTitleAndBody_LegacyFallback (#1777, binding condition 1): when the keyed
+// path is ABSENT and the legacy fixed path is present (an older prompt/agent),
+// the runner reads the legacy path AND emits a pr_description_legacy_path
+// deprecation event.
+func TestPRTitleAndBody_LegacyFallback(t *testing.T) {
+	// Redirect the keyed dir + legacy path into a temp dir, but write ONLY the
+	// legacy path (keyed stays absent).
+	withPRDescriptionPath(t, "r", "s")
+	if err := os.WriteFile(legacyPullRequestDescriptionPath,
+		[]byte("feat(runner): legacy handoff\n\n## Summary\n\nBody.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	title, body := prTitleAndBody(config{runID: "r", stageID: "s", backendURL: "https://x"}, "branch", &stderr)
+	if title != "feat(runner): legacy handoff" {
+		t.Errorf("title = %q, want the legacy-path title", title)
+	}
+	if !strings.Contains(body, "## Summary") {
+		t.Errorf("body should come from the legacy file, got:\n%s", body)
+	}
+	if !strings.Contains(stderr.String(), `"event":"pr_description_legacy_path"`) {
+		t.Errorf("expected pr_description_legacy_path deprecation event, got:\n%s", stderr.String())
+	}
+}
+
+// TestLoadAgentAuthoredPR_DeleteAfterRead (#1777): the consumed handoff is
+// removed on the read path so a leftover cannot bleed into a later run/stage.
+func TestLoadAgentAuthoredPR_DeleteAfterRead(t *testing.T) {
+	keyed := withPRDescriptionPath(t, "r", "s")
+	if err := os.WriteFile(keyed, []byte("feat: x\n\nbody\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	if _, _, kind := loadAgentAuthoredPR(config{runID: "r", stageID: "s"}, &stderr); kind != prSourceAgent {
+		t.Fatalf("kind = %v, want prSourceAgent", kind)
+	}
+	if _, statErr := os.Stat(keyed); !os.IsNotExist(statErr) {
+		t.Errorf("keyed handoff must be deleted after read, stat err = %v", statErr)
+	}
+}
+
+// TestSweepStalePullRequestDescription (#1777, binding condition 2): the
+// pre-invoke sweep removes a stale handoff at BOTH the keyed and legacy paths and
+// emits pr_description_swept for each; an absent path is a silent no-op.
+func TestSweepStalePullRequestDescription(t *testing.T) {
+	keyed := withPRDescriptionPath(t, "r", "s")
+	cfg := config{runID: "r", stageID: "s"}
+
+	// Absent both → silent no-op.
+	var quiet strings.Builder
+	sweepStalePullRequestDescription(cfg, &quiet)
+	if strings.Contains(quiet.String(), "pr_description_swept") {
+		t.Errorf("absent files must not emit pr_description_swept, got:\n%s", quiet.String())
+	}
+
+	// Stale keyed + legacy files → both swept, both emit.
+	if err := os.WriteFile(keyed, []byte("stale keyed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPullRequestDescriptionPath, []byte("stale legacy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	sweepStalePullRequestDescription(cfg, &stderr)
+	if _, statErr := os.Stat(keyed); !os.IsNotExist(statErr) {
+		t.Errorf("keyed stale file must be swept, stat err = %v", statErr)
+	}
+	if _, statErr := os.Stat(legacyPullRequestDescriptionPath); !os.IsNotExist(statErr) {
+		t.Errorf("legacy stale file must be swept, stat err = %v", statErr)
+	}
+	swept := strings.Count(stderr.String(), `"event":"pr_description_swept"`)
+	if swept != 2 {
+		t.Errorf("expected 2 pr_description_swept events (keyed + legacy), got %d:\n%s", swept, stderr.String())
+	}
+}
+
 func TestRun_ImplementStage_PassesAgentAuthoredPRTitle(t *testing.T) {
 	// End-to-end: agent wrote /tmp/fishhawk-pr.md (via the
 	// PullRequestDescriptionPath constant in the prompt), the
 	// runner reads it, and the agent's title + body land on the
 	// gitops.OpenPRArgs and on the shipped pull_request artifact.
-	prPath := withPRDescriptionPath(t)
-	if err := os.WriteFile(prPath, []byte("Add make minio-init target\n\nThis adds an idempotent make target for the local MinIO bucket.\n\nCloses #184\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	prPath := withPRDescriptionPath(t, "11111111-2222-3333-4444-555555555555", "22222222-3333-4444-5555-666666666666")
+	prContent := "Add make minio-init target\n\nThis adds an idempotent make target for the local MinIO bucket.\n\nCloses #184\n"
 	implementEnv(t, "kuhlman-labs/fishhawk", "main")
-	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	// The agent writes the PR file DURING invocation — after the pre-invoke sweep
+	// (#1777) removes any stale handoff — mirroring the real flow. Writing it
+	// before run() would let the sweep delete it.
+	withFakeInvoker(t, &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(_ int, _ agent.Invocation) {
+			if werr := os.WriteFile(prPath, []byte(prContent), 0o600); werr != nil {
+				t.Errorf("write PR file in onInvoke: %v", werr)
+			}
+		},
+	})
 	fu := newFakeUploader(t)
 	fu.promptResp = &upload.FetchedPrompt{
 		StageID:    "22222222-3333-4444-5555-666666666666",
@@ -13470,7 +13583,7 @@ func TestImplementCommitMessage_NonConventionalSubjectWarns(t *testing.T) {
 // TestPRTitleAndBody_NonConventionalTitle_WarnsAndUsesVerbatim (#1572, mode 5):
 // a non-conventional agent title emits pr_template_warning AND is used verbatim.
 func TestPRTitleAndBody_NonConventionalTitle_WarnsAndUsesVerbatim(t *testing.T) {
-	path := withPRDescriptionPath(t)
+	path := withPRDescriptionPath(t, "r", "s")
 	if err := os.WriteFile(path, []byte("Add a thing without a type prefix\n\n## Summary\n\nBody.\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -13488,7 +13601,7 @@ func TestPRTitleAndBody_NonConventionalTitle_WarnsAndUsesVerbatim(t *testing.T) 
 // TestPRTitleAndBody_ConventionalTitle_NoWarning (#1572, mode 6): a conventional
 // agent title emits NO pr_template_warning.
 func TestPRTitleAndBody_ConventionalTitle_NoWarning(t *testing.T) {
-	path := withPRDescriptionPath(t)
+	path := withPRDescriptionPath(t, "r", "s")
 	if err := os.WriteFile(path, []byte("fix(runner): guard nil pool\n\n## Summary\n\nBody.\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -13934,10 +14047,16 @@ func TestRun_AcceptanceStage_EndToEnd(t *testing.T) {
 	}
 	withFakeUploader(t, fu)
 
-	// Keep the file-fallback path out of the real shared /tmp file.
-	origPath := acceptanceVerdictPath
-	acceptanceVerdictPath = filepath.Join(t.TempDir(), "fishhawk-acceptance.json")
-	t.Cleanup(func() { acceptanceVerdictPath = origPath })
+	// Keep the file-fallback paths (keyed + legacy) out of the real shared
+	// /tmp file so the pre-spawn stale-clear never touches production paths.
+	origDir := acceptanceVerdictDir
+	acceptanceVerdictDir = t.TempDir()
+	origLegacy := legacyAcceptanceVerdictPath
+	legacyAcceptanceVerdictPath = filepath.Join(t.TempDir(), "fishhawk-acceptance.json")
+	t.Cleanup(func() {
+		acceptanceVerdictDir = origDir
+		legacyAcceptanceVerdictPath = origLegacy
+	})
 
 	// evidence_hashes ships as the historical string-valued object-map variant
 	// (the #1574 class) so the main.go log seam + validateAcceptanceVerdict
