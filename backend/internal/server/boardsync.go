@@ -11,6 +11,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -24,6 +26,12 @@ const (
 	lifecyclePROpened   = "pr_opened"
 	lifecycleRunFailed  = "run_failed"
 	lifecycleRunMerged  = "run_merged"
+	// lifecycleCampaignStarted (#1816) is the CAMPAIGN-scoped edge: it fires for
+	// each still-queued campaign item as the campaign transitions pending ->
+	// running, moving the card to the up_next state. It is not run-scoped —
+	// campaign items have no run at start time — so it is driven from the
+	// separate boardTransitionForCampaignItem entry point, not notifyBoardTransition.
+	lifecycleCampaignStarted = "campaign_started"
 )
 
 // categoryWorkItemTransitioned is the audit category written for every
@@ -54,6 +62,9 @@ var lifecyclePredecessors = map[string][]string{
 	lifecyclePROpened:   {lifecycleRunStarted},
 	lifecycleRunFailed:  {lifecycleRunStarted, lifecyclePROpened},
 	lifecycleRunMerged:  {lifecyclePROpened, lifecycleRunStarted, lifecycleRunFailed},
+	// campaign_started has no predecessor edge (#1816): its expected source is
+	// the backlog/unset entry state only, added explicitly by expectedSourceStates.
+	lifecycleCampaignStarted: nil,
 }
 
 // NotifyBoardTransition is the exported webhook.BoardSyncer entrypoint the
@@ -163,6 +174,138 @@ func (s *Server) boardTransitionForRun(ctx context.Context, rn *run.Run, event s
 	s.auditBoardTransition(ctx, rn, event, issueNum, canonical, res)
 }
 
+// boardTransitionForCampaignItem is the CAMPAIGN-scoped board-sync entry point
+// (#1816): move a campaign item's card along a campaign-lifecycle edge
+// (campaign_started -> up_next). It is the sibling of boardTransitionForRun,
+// separate because a campaign item has NO run at start time — so it resolves the
+// installation from the repo (as handleCreateCampaign does) rather than from a
+// run, and audits on the GLOBAL chain (a campaign is not a run) with the
+// campaign id + issue number in the payload.
+//
+// Like the run-scoped hook it is best-effort and every exit is a no-op-or-log:
+//   - load-conventions failure / unmapped event / unconfigured states map =>
+//     silent no-op (nothing to move).
+//   - a provider that does not implement Transitioner => no-op.
+//   - a nil GitHub client / installation-resolution failure => WARN log, no move.
+//   - a genuine provider error => WARN log, no audit, no unwind.
+//   - a move OR a deliberate skip => a work_item_transitioned audit on the
+//     global chain (audit every move AND every skip, including the
+//     projects-token-absent skip #1107/#1114).
+func (s *Server) boardTransitionForCampaignItem(ctx context.Context, c *campaign.Campaign, issueNumber int, event string) {
+	if c == nil || issueNumber <= 0 {
+		return
+	}
+	conv, err := conventionsLoader(c.Repo)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "campaign board transition: load conventions failed",
+			slog.String("event", event),
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	canonical, ok := conv.Transitions[event]
+	if !ok || len(conv.States) == 0 {
+		return // event not mapped, or no states map: no transition configured.
+	}
+
+	provider, err := workmgmt.Get(conv.Provider)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "campaign board transition: resolve provider failed",
+			slog.String("event", event),
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("provider", conv.Provider),
+			slog.String("error", err.Error()))
+		return
+	}
+	transitioner, ok := provider.(workmgmt.Transitioner)
+	if !ok {
+		return // provider does not board work (e.g. jira is interface-only in v0).
+	}
+
+	owner, name, ok := splitRepoFullName(c.Repo)
+	if !ok {
+		return
+	}
+	// Resolve the App installation directly from the repo — a campaign item has
+	// no run row to carry it (campaigns.go:372 does the same for the runless
+	// create). A nil client or resolution error is a logged no-op, not a failure.
+	if s.cfg.GitHub == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "campaign board transition: no GitHub client; skipping",
+			slog.String("event", event),
+			slog.String("campaign_id", c.ID.String()),
+			slog.Int("issue_number", issueNumber))
+		return
+	}
+	instID, err := s.cfg.GitHub.GetRepoInstallation(ctx, githubclient.RepoRef{Owner: owner, Name: name})
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "campaign board transition: resolve installation failed",
+			slog.String("event", event),
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("repo", c.Repo),
+			slog.String("error", err.Error()))
+		return
+	}
+
+	target := workmgmt.Target{
+		Repo:           workmgmt.Repo{Owner: owner, Name: name},
+		InstallationID: instID,
+		Project:        conv.Project,
+	}
+	res, err := transitioner.Transition(ctx, workmgmt.TransitionRequest{
+		IssueNumber:          issueNumber,
+		Trigger:              event,
+		Target:               target,
+		CanonicalState:       canonical,
+		ExpectedSourceStates: expectedSourceStates(event, conv),
+		States:               conv.States,
+	})
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "campaign board transition failed",
+			slog.String("event", event),
+			slog.String("campaign_id", c.ID.String()),
+			slog.Int("issue_number", issueNumber),
+			slog.String("canonical_state", canonical),
+			slog.String("error", err.Error()))
+		return
+	}
+	s.auditCampaignBoardTransition(ctx, c, event, issueNumber, canonical, res)
+}
+
+// auditCampaignBoardTransition appends a work_item_transitioned entry recording
+// what a campaign-scoped board move did — a landed move or a deliberate skip — on
+// the GLOBAL audit chain (a campaign is not a run; the campaign id + issue number
+// travel in the payload). Best-effort: a missing audit repo or an append error
+// logs and returns. Audits BOTH a move and every skip (the never-fight-the-human
+// skip and the projects-token-absent skip), matching the run-scoped hook.
+func (s *Server) auditCampaignBoardTransition(ctx context.Context, c *campaign.Campaign, event string, issueNumber int, canonical string, res *workmgmt.TransitionResult) {
+	if s.cfg.AuditRepo == nil || c == nil || res == nil {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"trigger":         event,
+		"campaign_id":     c.ID.String(),
+		"issue_number":    issueNumber,
+		"canonical_state": canonical,
+		"from":            res.From,
+		"to":              res.To,
+		"moved":           res.Moved,
+		"skipped":         res.Skipped,
+		"skip_reason":     res.SkipReason,
+	})
+	kind := audit.ActorSystem
+	if _, err := s.cfg.AuditRepo.AppendGlobalChained(ctx, audit.GlobalChainAppendParams{
+		Timestamp: time.Now().UTC(),
+		Category:  categoryWorkItemTransitioned,
+		ActorKind: &kind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "append campaign work_item_transitioned audit",
+			slog.String("event", event),
+			slog.String("campaign_id", c.ID.String()),
+			slog.String("error", err.Error()))
+	}
+}
+
 // auditBoardTransition appends a work_item_transitioned entry recording what the
 // transition did — a landed move or a deliberate skip — onto the run. It is
 // best-effort: a missing audit repo or an append error logs and returns. Unlike
@@ -201,8 +344,11 @@ func (s *Server) auditBoardTransition(ctx context.Context, rn *run.Run, event st
 // expectedSourceStates derives the never-fight-the-human expected-source set for
 // a lifecycle event from the configured transitions: the canonical states the
 // prior lifecycle edges target. run_started additionally accepts the
-// backlog/unset entry state (the provider treats an unset Status as Backlog).
-// The set is deduplicated; order is not significant to the provider.
+// backlog/unset entry state (the provider treats an unset Status as Backlog) and
+// the up_next state (#1816), so a campaign-queued Up Next card advances Up Next
+// -> In Progress when its run starts. campaign_started accepts the backlog/unset
+// entry state only — a card a human already advanced past Backlog is left
+// untouched. The set is deduplicated; order is not significant to the provider.
 func expectedSourceStates(event string, conv workmgmt.Conventions) []string {
 	var out []string
 	seen := map[string]bool{}
@@ -213,6 +359,10 @@ func expectedSourceStates(event string, conv workmgmt.Conventions) []string {
 		}
 	}
 	if event == lifecycleRunStarted {
+		add(workmgmt.CanonicalStateBacklog)
+		add(workmgmt.CanonicalStateUpNext)
+	}
+	if event == lifecycleCampaignStarted {
 		add(workmgmt.CanonicalStateBacklog)
 	}
 	for _, pred := range lifecyclePredecessors[event] {

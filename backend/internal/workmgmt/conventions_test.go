@@ -595,12 +595,16 @@ transitions:
 }
 
 // TestDefaultStatesAndTransitions locks the shipped default's board-state
-// map and lifecycle transitions (#1012): the four canonical edges resolve
-// through the states map to the Project #7 Status options.
+// map and lifecycle transitions (#1012, #1816): the canonical edges resolve
+// through the states map to the Project #7 Status options, including the
+// up_next state and the campaign_started edge. These are behavioral
+// assertions on the SHIPPED default, so a comment-only no-op touch of the
+// YAML that dropped the real key fails here.
 func TestDefaultStatesAndTransitions(t *testing.T) {
 	d := Default()
 	wantStates := map[string]string{
 		"backlog":     "Backlog",
+		"up_next":     "Up Next",
 		"in_progress": "In Progress",
 		"in_review":   "In Review",
 		"blocked":     "Blocked",
@@ -612,10 +616,11 @@ func TestDefaultStatesAndTransitions(t *testing.T) {
 		}
 	}
 	wantTransitions := map[string]string{
-		"run_started": "in_progress",
-		"pr_opened":   "in_review",
-		"run_failed":  "blocked",
-		"run_merged":  "done",
+		"run_started":      "in_progress",
+		"pr_opened":        "in_review",
+		"run_failed":       "blocked",
+		"run_merged":       "done",
+		"campaign_started": "up_next",
 	}
 	for event, target := range wantTransitions {
 		if d.Transitions[event] != target {

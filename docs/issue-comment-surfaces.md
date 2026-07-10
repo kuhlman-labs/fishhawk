@@ -1247,7 +1247,19 @@ Notes:
   this entry is NOT gated on the run being non-terminal: `run_merged` and
   `run_failed` fire as the run reaches a terminal state. The write is
   best-effort (the board move, if any, already happened) and never unwinds the
-  run. Listed here so a future reader grepping the audit categories doesn't
+  run. **Campaign-scoped emitter (#1816).** The SAME `work_item_transitioned`
+  category is ALSO written by a campaign-scoped sibling entry point,
+  `server/boardsync.go::boardTransitionForCampaignItem` (audited via
+  `auditCampaignBoardTransition`), for the `campaign_started` edge: when a
+  campaign transitions pending → running, `deriveCampaignAfterChange` fires it
+  for each still-queued item, moving the card to `up_next` (Up Next). This path
+  is separate because a campaign item has NO run at start time — it resolves the
+  installation from the repo (like `handleCreateCampaign`) rather than from a run,
+  and writes on the **GLOBAL chain** (`AppendGlobalChained`, a campaign is not a
+  run) with `campaign_id` + `issue_number` in the payload instead of a run link.
+  It audits both a landed move and every deliberate skip (never-fight-the-human,
+  and the projects-token-absent skip #1107/#1114), matching the run-scoped hook.
+  Listed here so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
 - The product-feedback egress kind — `product_report_filed` (#1006) — is an
   **internal, source-side audit-only category, not a run-thread comment

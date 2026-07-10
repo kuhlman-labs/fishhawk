@@ -69,8 +69,14 @@ type BoardPlacement struct {
 // the schema constrains both the states keys and the transitions values to
 // exactly these — so the board-sync hook and the provider agree on a fixed
 // vocabulary independent of how any one board labels its columns.
+//
+// CanonicalStateUpNext (#1816) is the committed/not-started entry column:
+// when a campaign transitions pending -> running, the campaign_started edge
+// sweeps its still-queued items onto Up Next, and run_started later advances
+// an Up Next card to In Progress just as it does a Backlog card.
 const (
 	CanonicalStateBacklog    = "backlog"
+	CanonicalStateUpNext     = "up_next"
 	CanonicalStateInProgress = "in_progress"
 	CanonicalStateInReview   = "in_review"
 	CanonicalStateBlocked    = "blocked"

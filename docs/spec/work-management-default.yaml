@@ -33,8 +33,11 @@ required_fields:
 
 # Canonical board states -> the Project #7 single-select Status options
 # (#1012). The closed canonical set keeps a future Jira provider tractable.
+# up_next (#1816) is the committed/not-started entry column a campaign start
+# sweeps its still-queued items onto.
 states:
   backlog: Backlog
+  up_next: Up Next
   in_progress: In Progress
   in_review: In Review
   blocked: Blocked
@@ -42,12 +45,15 @@ states:
 
 # Run-lifecycle event -> canonical state. The board-sync hook moves the
 # card along these edges, but only from the transition's expected source
-# state — a human's manual placement is never overridden.
+# state — a human's manual placement is never overridden. campaign_started
+# (#1816) is campaign-scoped (not run-scoped): it fires for each still-queued
+# item as a campaign transitions pending -> running.
 transitions:
   run_started: in_progress
   pr_opened: in_review
   run_failed: blocked
   run_merged: done
+  campaign_started: up_next
 
 # Per-repo kill-switch for upstream product-feedback egress (ADR-029,
 # #1006). Shipped in its enabled (egress-on) position. To hard-disable the

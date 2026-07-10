@@ -103,9 +103,10 @@
       "type": "object",
       "additionalProperties": false,
       "minProperties": 1,
-      "description": "Canonical board-state map for run-lifecycle-driven transitions (#1012): each canonical state from the closed set (backlog/in_progress/in_review/blocked/done) maps to the provider's column/option string (e.g. the GitHub Projects single-select Status option \"In Progress\"). The small closed set is what keeps a future Jira provider tractable. Optional and additive: absent means no transitions are configured and the board-sync hook no-ops. Every transitions value must be a key present here (semantic check).",
+      "description": "Canonical board-state map for run-lifecycle-driven transitions (#1012): each canonical state from the closed set (backlog/up_next/in_progress/in_review/blocked/done) maps to the provider's column/option string (e.g. the GitHub Projects single-select Status option \"In Progress\"). The small closed set is what keeps a future Jira provider tractable. Optional and additive: absent means no transitions are configured and the board-sync hook no-ops. Every transitions value must be a key present here (semantic check).",
       "properties": {
         "backlog": { "type": "string", "minLength": 1, "description": "Provider option for the canonical backlog state." },
+        "up_next": { "type": "string", "minLength": 1, "description": "Provider option for the canonical up_next state — the committed/not-started entry column a campaign start (#1816) sweeps its still-queued items onto." },
         "in_progress": { "type": "string", "minLength": 1, "description": "Provider option for the canonical in_progress state." },
         "in_review": { "type": "string", "minLength": 1, "description": "Provider option for the canonical in_review state." },
         "blocked": { "type": "string", "minLength": 1, "description": "Provider option for the canonical blocked state." },
@@ -116,12 +117,13 @@
       "type": "object",
       "additionalProperties": false,
       "minProperties": 1,
-      "description": "Run-lifecycle-event to canonical-state map (#1012): when a run reaches a lifecycle point, the board card moves to the mapped canonical state (resolved to a provider option via `states`). The closed event set is run_started/pr_opened/run_failed/run_merged. Optional and additive: absent means no transitions are configured. Every value must be a key present in `states` (semantic check).",
+      "description": "Run-lifecycle-event to canonical-state map (#1012): when a run reaches a lifecycle point, the board card moves to the mapped canonical state (resolved to a provider option via `states`). The closed event set is run_started/pr_opened/run_failed/run_merged plus the campaign-scoped campaign_started (#1816). Optional and additive: absent means no transitions are configured. Every value must be a key present in `states` (semantic check).",
       "properties": {
         "run_started": { "$ref": "#/$defs/canonical_state", "description": "Canonical state when a run starts on the item (e.g. in_progress)." },
         "pr_opened": { "$ref": "#/$defs/canonical_state", "description": "Canonical state when the run opens a PR (e.g. in_review)." },
         "run_failed": { "$ref": "#/$defs/canonical_state", "description": "Canonical state when the run fails (e.g. blocked)." },
-        "run_merged": { "$ref": "#/$defs/canonical_state", "description": "Canonical state when the run's PR merges (e.g. done)." }
+        "run_merged": { "$ref": "#/$defs/canonical_state", "description": "Canonical state when the run's PR merges (e.g. done)." },
+        "campaign_started": { "$ref": "#/$defs/canonical_state", "description": "Canonical state a campaign's still-queued item moves to when the campaign transitions pending -> running (e.g. up_next). Campaign-scoped, not run-scoped: campaign items have no run at start time (#1816)." }
       }
     },
     "product_feedback": {
@@ -237,7 +239,7 @@
     },
     "canonical_state": {
       "type": "string",
-      "enum": ["backlog", "in_progress", "in_review", "blocked", "done"],
+      "enum": ["backlog", "up_next", "in_progress", "in_review", "blocked", "done"],
       "description": "A canonical board state from the closed set. The provider option string each maps to is declared in `states`."
     },
     "label": {

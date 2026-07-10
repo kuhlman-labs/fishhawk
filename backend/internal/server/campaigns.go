@@ -1473,20 +1473,43 @@ func depsSatisfiedRefs(deps []string, done map[string]bool) bool {
 // running on first dispatch) and reconcile-on-read (running → succeeded/failed
 // as items settle).
 func (s *Server) deriveCampaignAfterChange(ctx context.Context, c *campaign.Campaign, items []*campaign.Item) {
+	// Capture the pre-transition state: TransitionCampaign may mutate the shared
+	// campaign pointer (the in-memory fake aliases it), so read prevState BEFORE
+	// the write to keep the pending->running board sweep and the audit "from"
+	// correct regardless of aliasing.
+	prevState := c.State
 	newState := campaign.DeriveState(items)
-	if newState == c.State || !campaign.ValidCampaignTransition(c.State, newState) {
+	if newState == prevState || !campaign.ValidCampaignTransition(prevState, newState) {
 		return
 	}
 	if _, err := s.cfg.CampaignRepo.TransitionCampaign(ctx, c.ID, newState); err != nil {
 		s.cfg.Logger.Warn("campaign derivation transition failed; left for next read",
-			"campaign_id", c.ID.String(), "from", string(c.State), "to", string(newState), "error", err.Error())
+			"campaign_id", c.ID.String(), "from", string(prevState), "to", string(newState), "error", err.Error())
 		return
 	}
 	s.emitCampaignAudit(ctx, categoryCampaignAdvanced, map[string]any{
 		"campaign_id": c.ID.String(),
-		"from":        string(c.State),
+		"from":        string(prevState),
 		"to":          string(newState),
 	})
+
+	// On the pending -> running edge (#1816), sweep the campaign's still-queued
+	// items onto the board's Up Next column via the campaign_started board hook.
+	// The just-dispatched running item is naturally excluded (it is no longer
+	// pending). Best-effort: each move is a no-op-or-log and never unwinds the
+	// derivation the campaign already recorded.
+	if prevState == campaign.StatePending && newState == campaign.StateRunning {
+		for _, it := range items {
+			if it.State != campaign.ItemStatePending {
+				continue
+			}
+			number, ok := parseIssueTriggerRef(it.IssueRef)
+			if !ok {
+				continue // a non issue:N ref (e.g. a Jira key) has no GitHub issue to board.
+			}
+			s.boardTransitionForCampaignItem(ctx, c, number, lifecycleCampaignStarted)
+		}
+	}
 }
 
 // recoveryDescendantListLimit bounds each ListRuns page fetching a run's
