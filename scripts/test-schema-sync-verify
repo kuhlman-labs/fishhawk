@@ -101,6 +101,30 @@ else
   fail "not-a-git-work-tree: expected 0 no-op, got $nogit_rc"
 fi
 
+# (d2) bare git repo (valid non-worktree): `git rev-parse --is-inside-work-tree`
+# prints `false` yet exits 0 inside a bare repo, so an exit-status-only guard
+# would fall through to `git status --porcelain` (which errors in a bare repo).
+# The value-guard must treat this as a clean return-0 no-op and never run
+# sync-schemas. The stub would mutate a file if reached, so a 0 exit proves the
+# guard short-circuited before it ran.
+ROOT="$tmproot/bare"
+rm -rf "$ROOT"
+git init -q --bare "$ROOT"
+mkdir -p "$ROOT/scripts"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'echo reached > "$(cd "$(dirname "$0")/.." && pwd)/REACHED"'
+} > "$ROOT/scripts/sync-schemas"
+chmod +x "$ROOT/scripts/sync-schemas"
+bare_out="$( (_verify_schema_sync) 2>&1 )"
+bare_rc=$?
+if [ "$bare_rc" -eq 0 ] && [ ! -e "$ROOT/REACHED" ] \
+   && printf '%s' "$bare_out" | grep -q 'not a git work tree'; then
+  pass "bare git repo: non-worktree is a clean no-op (return 0, sync-schemas never run)"
+else
+  fail "bare git repo: expected 0 no-op that skips sync-schemas (rc=$bare_rc, reached=$([ -e "$ROOT/REACHED" ] && echo yes || echo no), out='$bare_out')"
+fi
+
 # (e) git-binary-unavailable (binding condition): with git stripped from PATH the
 # `command -v git` guard short-circuits to a return-0 no-op, even against a real
 # git repo ROOT. Runs in a subshell so the PATH override is scoped to the call.

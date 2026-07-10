@@ -293,7 +293,11 @@ _verify_schema_sync() {
     echo "scripts/test: git not found — skipping schema-sync drift check" >&2
     return 0
   fi
-  if ! git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  # `--is-inside-work-tree` prints `true`/`false` and, in a BARE repo, prints
+  # `false` yet exits 0 — so guard on the printed value, not just the exit
+  # status, or a bare-repo $ROOT falls through to `git status --porcelain`
+  # (which errors in a bare repo) instead of the documented return-0 no-op.
+  if [ "$(git -C "$ROOT" rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ]; then
     echo "scripts/test: $ROOT is not a git work tree — skipping schema-sync drift check" >&2
     return 0
   fi
