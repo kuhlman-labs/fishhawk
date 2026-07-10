@@ -112,6 +112,25 @@ Notes:
   isolation above), and — for an approve carrying binding conditions — the
   verbatim conditions text (`approval_submitted` payload `comment`) in a
   nested collapsed `<details>`. Reject decisions carry no override marker.
+- **Anchor timeline class curation (E42.6 / #1789).** The anchor timeline is
+  curated by event CLASS, not pure recency, so an eventful run's audited gate
+  decisions and stage terminals are never silently dropped by the 12-row cap.
+  `selectAnchorTimeline` (`anchor_template.go`) partitions the recognized rows
+  into a **retained** class — gate decisions, `plan_generated`, stage/outcome
+  terminals, `fixup_pushed`, `concern_waived` / `concern_deferred`,
+  `scope_amendment_decided` — and an **informational** class
+  (`informationalTimelineCategories`: `run_dispatched`, `acceptance_dispatched`,
+  `deployment_dispatched`, `model_resolved`). Under the cap it fills the slots
+  with retained rows first and only backfills the remaining slots with the
+  most-recent informational rows, so informational rows are the FIRST dropped.
+  The 12-row cap ALWAYS wins: when retained rows alone exceed it the oldest
+  retained rows are trimmed and no informational row is shown. The existing
+  most-recent-first (by audit `Sequence`) render order is preserved. This
+  curates the ANCHOR timeline only; the sticky status comment keeps pure-recency
+  selection over its 3 slots. The four decision-class categories above are the
+  same rows now recognized by the shared `activityCategories` set and rendered
+  data-drivenly by `renderActivityLine` (with the operator's audited reason),
+  none carrying a dedicated Notifier method.
 - **Per-change economics block (#1702).** The anchor renders a compact
   `**Economics**` section just above the footer: the total cost with the
   per-stage breakdown (`agent` / `plan_review` / `implement_review`), the
@@ -854,9 +873,15 @@ Notes:
   audit categories doesn't mistake it for a comment surface.
 
 - The concern-waiver audit kinds — `concern_waived` and its corrective
-  companion `concern_waive_failed` (#984) — are **internal audit kinds, not
-  issue-comment surfaces**. Nothing in `issuecomment` posts them; they have no
-  Notifier method. The waive handler (`server/waive.go::handleWaiveConcern`,
+  companion `concern_waive_failed` (#984) — have **no dedicated Notifier
+  method**, but as of E42.6 (#1789) `concern_waived` renders **data-drivenly**
+  on the living-anchor / status timeline through the `activityCategories` set +
+  `renderActivityLine` in `status_template.go` (as "Concern waived (`<severity>`
+  `<category>`): `<reason>`"), surfacing the operator's audited reason; the
+  corrective `concern_waive_failed` stays an internal-only kind. Nothing in
+  `issuecomment` POSTS either (same posture as the acceptance/deploy kinds — a
+  timeline render, not a comment surface). The waive handler
+  (`server/waive.go::handleWaiveConcern`,
   `POST /v0/concerns/{concern_id}/waive`) writes `concern_waived` with the
   acting token's subject and a kind selected from it (`user` for a human
   token, `agent` for an `operator-agent/<role-spec-version>` token —
@@ -874,9 +899,14 @@ Notes:
   mistake them for comment surfaces.
 
 - The concern-defer audit kinds — `concern_deferred` and its corrective
-  companion `concern_defer_failed` (#1202) — are **internal audit kinds, not
-  issue-comment surfaces**. Nothing in `issuecomment` posts them; they have no
-  Notifier method. The defer handler (`server/defer_concern.go::handleDeferConcern`,
+  companion `concern_defer_failed` (#1202) — have **no dedicated Notifier
+  method**, but as of E42.6 (#1789) `concern_deferred` renders **data-drivenly**
+  on the living-anchor / status timeline through the `activityCategories` set +
+  `renderActivityLine` (as "Concern deferred to #`<issue_number>`: `<reason>`"),
+  surfacing the filed follow-up + the operator's reason; the corrective
+  `concern_defer_failed` stays an internal-only kind. Nothing in `issuecomment`
+  POSTS either (a timeline render, not a comment surface). The defer handler
+  (`server/defer_concern.go::handleDeferConcern`,
   `POST /v0/concerns/{concern_id}/defer`) converts an open concern into a
   follow-up work item and transitions it to terminal `deferred`. Unlike the
   waiver's audit-before-mutation contract, defer is **audit-AFTER-transition**
@@ -904,9 +934,14 @@ Notes:
   durable record that a fix-up failure was absorbed without making the run a failed
   casualty. Listed here only so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
-- The fix-up push-success audit kind — `fixup_pushed` (#794) — is an **internal,
-  system-actor audit kind, not an issue-comment surface**. Nothing in `issuecomment`
-  posts it; it has no Notifier method. `server/pullrequest.go::succeedFixupPushStage`
+- The fix-up push-success audit kind — `fixup_pushed` (#794) — has **no
+  dedicated Notifier method**, but as of E42.6 (#1789) it renders
+  **data-drivenly** on the living-anchor / status timeline through the
+  `activityCategories` set + `renderActivityLine` (as "Fix-up pushed
+  (`<files_changed_count>` files changed)"), and it is a **retained** row the
+  anchor timeline curation keeps over informational rows under the 12-row cap.
+  Nothing in `issuecomment` POSTS it (a timeline render, not a comment surface).
+  `server/pullrequest.go::succeedFixupPushStage`
   writes it once (idempotency-guarded on `(stage_id, head_sha)`) when a fix-up
   re-dispatch reports `{outcome:"fixup_pushed"}` after committing onto the EXISTING
   PR branch, with a `system` (or operator, on the bearer path) actor and payload
@@ -939,8 +974,16 @@ Notes:
   (#794) minus the new commit. Listed here only so a future reader grepping the audit
   categories doesn't mistake it for a comment surface.
 - The mid-stage scope-amendment audit kinds — `scope_amendment_requested` /
-  `scope_amendment_decided` (#961) — are **internal audit kinds, not issue-comment
-  surfaces**. Nothing in `issuecomment` posts them; they have no Notifier methods.
+  `scope_amendment_decided` (#961) — have **no dedicated Notifier methods**.
+  `scope_amendment_requested` stays an internal-only kind (it doubles as the
+  page-class ping trigger + the `fishhawk_await_audit` anchor), but as of E42.6
+  (#1789) `scope_amendment_decided` renders **data-drivenly** on the
+  living-anchor / status timeline through the `activityCategories` set +
+  `renderActivityLine` (as "Scope amendment approved: `<reason>`" / "Scope
+  amendment rejected: `<reason>`", branching on the payload `decision`), and it
+  is a **retained** row the anchor timeline curation keeps over informational
+  rows. Nothing in `issuecomment` POSTS either (a timeline render, not a comment
+  surface).
   `server/scope_amendment.go` writes the requested entry (agent actor, payload
   `{amendment_id, paths, reason, remaining_budget}`) when the implement agent files
   a mid-stage scope amendment request, and the decided entry (user actor, payload

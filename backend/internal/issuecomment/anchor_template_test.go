@@ -375,6 +375,248 @@ func approvalEntry(t *testing.T, seq int64, login, decision, comment string) *au
 	return &audit.Entry{Sequence: seq, Category: "approval_submitted", Payload: raw, Timestamp: time.Unix(seq, 0).UTC()}
 }
 
+// activityEntry builds a recognized activity audit entry for the timeline
+// curation tests, stamping a deterministic 1970-dated timestamp keyed to the
+// sequence (so every rendered row carries a "· 1970-01-01 …" stamp that the
+// tests count to assert the row cap).
+func activityEntry(seq int64, category string, payload map[string]any) *audit.Entry {
+	var raw json.RawMessage
+	if payload != nil {
+		raw, _ = json.Marshal(payload)
+	}
+	return &audit.Entry{Sequence: seq, Category: category, Payload: raw, Timestamp: time.Unix(seq, 0).UTC()}
+}
+
+// countTimelineRows counts rendered timeline rows by the per-row absolute
+// timestamp stamp (anchorTimestamp renders "1970-01-01 …Z" for the tests'
+// Unix-epoch entries; no other anchor section stamps a timestamp), so the
+// count is exactly the number of timeline rows the curation admitted.
+func countTimelineRows(body string) int {
+	return strings.Count(body, "· 1970-01-01")
+}
+
+// TestRenderAnchorBody_TimelineCuration is the E42.6 / #1789 done-means test:
+// the anchor timeline is curated by event CLASS, not pure recency, so an
+// eventful run's gate decisions, fix-up pushes, waives, defers, and
+// scope-amendment decisions (with their reasons) are RETAINED under the 12-row
+// cap while only informational rows (dispatch/start heartbeats + model_resolved)
+// are dropped. One case per selection branch: under-cap (nothing dropped),
+// over-cap (informational dropped first), retained-alone-overflow (oldest
+// retained trimmed, no informational shown), and reason-surfaced.
+func TestRenderAnchorBody_TimelineCuration(t *testing.T) {
+	// retainedOverflow: 13 retained fix-up rows (distinguishable by count) +
+	// 2 informational rows. Retained alone exceeds the cap, so the oldest
+	// retained (count=1) is trimmed and NO informational row survives.
+	var retainedOverflow []*audit.Entry
+	for i := int64(1); i <= 13; i++ {
+		retainedOverflow = append(retainedOverflow,
+			activityEntry(i, "fixup_pushed", map[string]any{"files_changed_count": int(i)}))
+	}
+	retainedOverflow = append(retainedOverflow,
+		activityEntry(14, "run_dispatched", nil),
+		activityEntry(15, "run_dispatched", nil),
+	)
+
+	tests := []struct {
+		name        string
+		entries     []*audit.Entry
+		wantContain []string
+		wantAbsent  []string
+		wantRows    int    // exact rendered timeline row count (0 = skip)
+		orderFirst  string // must appear before orderSecond (0 = skip)
+		orderSecond string
+	}{
+		{
+			name: "over-cap drops informational rows first, retains every decision + terminal",
+			entries: []*audit.Entry{
+				activityEntry(1, "plan_generated", nil),                                        // retained
+				activityEntry(2, "run_dispatched", nil),                                        // informational
+				approvalEntry(t, 3, "alice", "approve", ""),                                    // retained gate decision
+				activityEntry(4, "model_resolved", map[string]any{"model": "claude-opus-4-8"}), // informational
+				activityEntry(5, "fixup_pushed", map[string]any{"files_changed_count": 2}),     // retained
+				activityEntry(6, "acceptance_dispatched", nil),                                 // informational
+				activityEntry(7, "concern_waived", map[string]any{"severity": "high", "category": "correctness", "reason": "acceptable in this slice"}),
+				activityEntry(8, "concern_deferred", map[string]any{"issue_number": 1790, "reason": "tracked as follow-up"}),
+				activityEntry(9, "fixup_pushed", map[string]any{"files_changed_count": 5}),      // retained
+				activityEntry(10, "model_resolved", map[string]any{"model": "claude-opus-4-8"}), // informational
+				activityEntry(11, "scope_amendment_decided", map[string]any{"decision": "approve", "reason": "coupled test sibling"}),
+				activityEntry(12, "run_dispatched", nil),                                        // informational
+				activityEntry(13, "acceptance_dispatched", nil),                                 // informational
+				activityEntry(14, "model_resolved", map[string]any{"model": "claude-opus-4-8"}), // informational
+				activityEntry(20, "pr_merged", map[string]any{}),                                // retained terminal
+			},
+			// All 8 retained rows survive, each decision carrying its reason.
+			wantContain: []string{
+				"Plan posted",
+				"`alice` approved the plan",
+				"Fix-up pushed (2 files changed)",
+				"Fix-up pushed (5 files changed)",
+				"Concern waived (high correctness): acceptable in this slice",
+				"Concern deferred to #1790: tracked as follow-up",
+				"Scope amendment approved: coupled test sibling",
+				"merged the PR",
+			},
+			// 8 retained + 4 backfilled informational = exactly the 12-row cap; the
+			// 3 oldest informational rows are the only rows dropped.
+			wantRows:    anchorTimelineLimit,
+			orderFirst:  "merged the PR", // seq 20, newest
+			orderSecond: "Plan posted",   // seq 1, oldest — proves most-recent-first
+		},
+		{
+			name: "under-cap keeps every recognized row unchanged",
+			entries: []*audit.Entry{
+				activityEntry(1, "run_dispatched", nil),
+				activityEntry(2, "plan_generated", nil),
+				approvalEntry(t, 3, "alice", "approve", ""),
+				activityEntry(4, "fixup_pushed", map[string]any{"files_changed_count": 1}),
+				activityEntry(5, "model_resolved", map[string]any{"model": "claude-opus-4-8"}),
+			},
+			wantContain: []string{
+				"Fishhawk run dispatched",
+				"Plan posted",
+				"`alice` approved the plan",
+				"Fix-up pushed (1 file changed)",
+				"Implement model resolved",
+			},
+			wantRows: 5,
+		},
+		{
+			name:    "retained-alone-overflow trims oldest retained, shows no informational",
+			entries: retainedOverflow,
+			wantContain: []string{
+				"Fix-up pushed (13 files changed)", // newest retained kept
+				"Fix-up pushed (2 files changed)",  // second-oldest retained kept
+			},
+			wantAbsent: []string{
+				"Fix-up pushed (1 file changed)", // oldest retained trimmed by the cap
+				"Fishhawk run dispatched",        // no informational row survives
+			},
+			wantRows: anchorTimelineLimit,
+		},
+		{
+			name: "reasons surfaced for waive, defer, and rejected amendment",
+			entries: []*audit.Entry{
+				activityEntry(1, "concern_waived", map[string]any{"severity": "medium", "category": "style", "reason": "cosmetic only"}),
+				activityEntry(2, "concern_deferred", map[string]any{"issue_number": 42, "reason": "separate PR"}),
+				activityEntry(3, "scope_amendment_decided", map[string]any{"decision": "deny", "reason": "belongs elsewhere"}),
+			},
+			wantContain: []string{
+				"Concern waived (medium style): cosmetic only",
+				"Concern deferred to #42: separate PR",
+				"Scope amendment rejected: belongs elsewhere",
+			},
+			wantRows: 3,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := RenderAnchorBody(AnchorInput{
+				Run:         anchorRun(),
+				Stages:      []*run.Stage{{Type: run.StageTypeImplement, State: run.StageStateRunning}},
+				Audit:       tt.entries,
+				ExternalURL: "https://app.example",
+				Now:         time.Unix(1000, 0).UTC(),
+			})
+			for _, want := range tt.wantContain {
+				if !strings.Contains(body, want) {
+					t.Errorf("timeline missing %q:\n%s", want, body)
+				}
+			}
+			for _, absent := range tt.wantAbsent {
+				if strings.Contains(body, absent) {
+					t.Errorf("timeline should not contain %q:\n%s", absent, body)
+				}
+			}
+			if tt.wantRows > 0 {
+				if got := countTimelineRows(body); got != tt.wantRows {
+					t.Errorf("timeline rendered %d rows, want %d (cap %d)\n%s", got, tt.wantRows, anchorTimelineLimit, body)
+				}
+			}
+			if tt.orderFirst != "" && tt.orderSecond != "" {
+				fi, si := strings.Index(body, tt.orderFirst), strings.Index(body, tt.orderSecond)
+				if fi < 0 || si < 0 || fi >= si {
+					t.Errorf("expected %q (idx %d) before %q (idx %d) — most-recent-first order broken\n%s",
+						tt.orderFirst, fi, tt.orderSecond, si, body)
+				}
+			}
+		})
+	}
+}
+
+// TestSelectAnchorTimeline_Partition unit-tests the selection branches directly
+// (independent of rendering): under-cap returns all rows, over-cap keeps every
+// retained row and drops the oldest informational, retained-alone-overflow
+// trims the oldest retained and admits no informational, and the result is
+// always most-recent-first and bounded by the limit.
+func TestSelectAnchorTimeline_Partition(t *testing.T) {
+	t.Run("under-cap returns all recognized rows", func(t *testing.T) {
+		entries := []*audit.Entry{
+			activityEntry(1, "run_dispatched", nil),
+			activityEntry(2, "fixup_pushed", map[string]any{"files_changed_count": 1}),
+		}
+		got := selectAnchorTimeline(entries, anchorTimelineLimit)
+		if len(got) != 2 {
+			t.Fatalf("got %d rows, want 2", len(got))
+		}
+		if got[0].Sequence != 2 || got[1].Sequence != 1 {
+			t.Errorf("not most-recent-first: %d then %d", got[0].Sequence, got[1].Sequence)
+		}
+	})
+	t.Run("over-cap keeps all retained, drops oldest informational", func(t *testing.T) {
+		var entries []*audit.Entry
+		// 4 retained (fix-ups at seq 1..4) + 10 informational (run_dispatched 5..14).
+		for i := int64(1); i <= 4; i++ {
+			entries = append(entries, activityEntry(i, "fixup_pushed", map[string]any{"files_changed_count": int(i)}))
+		}
+		for i := int64(5); i <= 14; i++ {
+			entries = append(entries, activityEntry(i, "run_dispatched", nil))
+		}
+		got := selectAnchorTimeline(entries, anchorTimelineLimit)
+		if len(got) != anchorTimelineLimit {
+			t.Fatalf("got %d rows, want %d", len(got), anchorTimelineLimit)
+		}
+		retained := 0
+		for _, e := range got {
+			if e.Category == "fixup_pushed" {
+				retained++
+			}
+		}
+		if retained != 4 {
+			t.Errorf("kept %d retained rows, want all 4", retained)
+		}
+		// Most-recent-first + bounded.
+		for i := 1; i < len(got); i++ {
+			if got[i-1].Sequence < got[i].Sequence {
+				t.Errorf("not most-recent-first at %d: %d then %d", i, got[i-1].Sequence, got[i].Sequence)
+			}
+		}
+	})
+	t.Run("retained-alone-overflow trims oldest retained, admits no informational", func(t *testing.T) {
+		var entries []*audit.Entry
+		for i := int64(1); i <= 14; i++ {
+			entries = append(entries, activityEntry(i, "fixup_pushed", map[string]any{"files_changed_count": int(i)}))
+		}
+		entries = append(entries, activityEntry(15, "run_dispatched", nil))
+		got := selectAnchorTimeline(entries, anchorTimelineLimit)
+		if len(got) != anchorTimelineLimit {
+			t.Fatalf("got %d rows, want %d", len(got), anchorTimelineLimit)
+		}
+		for _, e := range got {
+			if e.Category == "run_dispatched" {
+				t.Errorf("informational row leaked into a retained-overflow selection")
+			}
+			if e.Sequence <= 2 {
+				t.Errorf("oldest retained (seq %d) should have been trimmed", e.Sequence)
+			}
+		}
+	})
+	t.Run("zero limit returns nil", func(t *testing.T) {
+		if got := selectAnchorTimeline([]*audit.Entry{activityEntry(1, "fixup_pushed", nil)}, 0); got != nil {
+			t.Errorf("limit 0 should return nil, got %v", got)
+		}
+	})
+}
+
 // TestRenderAnchorBody_GateDecisionTimeline covers the enriched
 // gate-decision timeline entry (#1070): the decision phrase, the
 // conditions <details>, and the "over N advisory reject(s)" arbitration

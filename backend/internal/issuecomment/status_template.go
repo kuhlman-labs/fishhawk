@@ -166,6 +166,19 @@ var activityCategories = map[string]struct{}{
 	"acceptance_dispatched":       {},
 	"acceptance_outcome_recorded": {},
 	"acceptance_triage_decided":   {},
+	// Decision-class gate + fix-up kinds (E42.6 / #1789). Like the deploy /
+	// acceptance kinds above, these are user/system-actor audit kinds with NO
+	// dedicated Notifier method — they render data-drivenly through this set
+	// (and renderActivityLine below), surfacing the operator's audited gate
+	// decision (with its recorded reason). Adding them here is what makes the
+	// anchor-timeline curation (anchor_template.go's selectAnchorTimeline) able
+	// to RETAIN them over informational rows under the row cap: an eventful
+	// run's fix-up pushes, waives, defers, and scope-amendment decisions are no
+	// longer silently dropped by pure-recency selection.
+	"fixup_pushed":            {},
+	"concern_waived":          {},
+	"concern_deferred":        {},
+	"scope_amendment_decided": {},
 }
 
 // actorRenderers supplies the actor-identity render functions
@@ -237,6 +250,14 @@ func renderActivityLine(e *audit.Entry, r actorRenderers) string {
 		return renderAcceptanceOutcomeLine(e.Payload)
 	case "acceptance_triage_decided":
 		return renderAcceptanceTriageLine(e.Payload)
+	case "fixup_pushed":
+		return renderFixupPushedLine(e.Payload)
+	case "concern_waived":
+		return renderConcernWaivedLine(e.Payload)
+	case "concern_deferred":
+		return renderConcernDeferredLine(e.Payload)
+	case "scope_amendment_decided":
+		return renderScopeAmendmentDecidedLine(e.Payload)
 	default:
 		if actor == "" {
 			return e.Category
@@ -487,6 +508,142 @@ func decodeAcceptanceActivity(payload json.RawMessage) acceptanceActivity {
 		class:          p.Class,
 		disposition:    p.Disposition,
 	}
+}
+
+// renderFixupPushedLine renders a fixup_pushed activity row (E42.6 / #1789):
+// "Fix-up pushed (N files changed)". Reuses decodeFixupPush + the plural
+// helper (pr_status_template.go). An absent / zero files_changed_count drops
+// the parenthetical count and degrades to the bare verb.
+func renderFixupPushedLine(payload json.RawMessage) string {
+	n := decodeFixupPush(payload).filesChanged
+	if n <= 0 {
+		return "Fix-up pushed"
+	}
+	return fmt.Sprintf("Fix-up pushed (%d file%s changed)", n, plural(n))
+}
+
+// renderConcernWaivedLine renders a concern_waived activity row (E42.6 /
+// #1789): "Concern waived (high correctness): <reason>". Surfaces the
+// operator's audited reason (oneLine-capped so a long rationale stays one
+// row). Degrades field-by-field: an absent severity/category drops the tag,
+// an absent reason drops the reason clause, and an empty/undecodable payload
+// degrades to the bare verb.
+func renderConcernWaivedLine(payload json.RawMessage) string {
+	c := decodeConcernResolution(payload)
+	verb := "Concern waived"
+	if tag := severityCategoryTag(c.severity, c.category); tag != "" {
+		verb += " " + tag
+	}
+	if c.reason != "" {
+		return fmt.Sprintf("%s: %s", verb, oneLine(c.reason))
+	}
+	return verb
+}
+
+// renderConcernDeferredLine renders a concern_deferred activity row (E42.6 /
+// #1789): "Concern deferred to #123: <reason>". Degrades field-by-field: an
+// absent issue_number drops the "to #N" clause, an absent reason drops the
+// reason clause, and an empty/undecodable payload degrades to the bare verb.
+func renderConcernDeferredLine(payload json.RawMessage) string {
+	c := decodeConcernResolution(payload)
+	verb := "Concern deferred"
+	if c.issueNumber > 0 {
+		verb = fmt.Sprintf("Concern deferred to #%d", c.issueNumber)
+	}
+	if c.reason != "" {
+		return fmt.Sprintf("%s: %s", verb, oneLine(c.reason))
+	}
+	return verb
+}
+
+// renderScopeAmendmentDecidedLine renders a scope_amendment_decided row
+// (E42.6 / #1789): "Scope amendment approved: <reason>" / "Scope amendment
+// rejected: <reason>". Branches on the payload decision ("approve" / "deny",
+// the request verbs server/scope_amendment.go stamps); an unrecognized or
+// absent decision degrades to the neutral verb, and an absent reason drops
+// the reason clause.
+func renderScopeAmendmentDecidedLine(payload json.RawMessage) string {
+	d := decodeScopeAmendmentDecision(payload)
+	verb := "Scope amendment decided"
+	switch d.decision {
+	case "approve":
+		verb = "Scope amendment approved"
+	case "deny":
+		verb = "Scope amendment rejected"
+	}
+	if d.reason != "" {
+		return fmt.Sprintf("%s: %s", verb, oneLine(d.reason))
+	}
+	return verb
+}
+
+// concernResolution carries the fields a concern_waived / concern_deferred
+// audit payload (server/waive.go, server/defer_concern.go) contributes to its
+// rendered activity line (#1789).
+type concernResolution struct {
+	reason      string
+	severity    string
+	category    string
+	issueNumber int
+}
+
+// decodeConcernResolution reads {reason, severity, category, issue_number} out
+// of a concern_waived / concern_deferred payload. Returns the zero value on
+// any decode failure so the line degrades to its bare verb. issue_number is
+// present only on concern_deferred.
+func decodeConcernResolution(payload json.RawMessage) concernResolution {
+	if len(payload) == 0 {
+		return concernResolution{}
+	}
+	var p struct {
+		Reason      string `json:"reason"`
+		Severity    string `json:"severity"`
+		Category    string `json:"category"`
+		IssueNumber int    `json:"issue_number"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return concernResolution{}
+	}
+	return concernResolution{reason: p.Reason, severity: p.Severity, category: p.Category, issueNumber: p.IssueNumber}
+}
+
+// severityCategoryTag renders the compact "(high correctness)" tag from a
+// concern's severity + category, degrading to just one when the other is
+// empty and to "" when both are absent.
+func severityCategoryTag(severity, category string) string {
+	switch {
+	case severity != "" && category != "":
+		return fmt.Sprintf("(%s %s)", severity, category)
+	case severity != "":
+		return fmt.Sprintf("(%s)", severity)
+	case category != "":
+		return fmt.Sprintf("(%s)", category)
+	}
+	return ""
+}
+
+// scopeAmendmentDecision carries the fields a scope_amendment_decided payload
+// (server/scope_amendment.go) contributes to its rendered activity line.
+type scopeAmendmentDecision struct {
+	decision string
+	reason   string
+}
+
+// decodeScopeAmendmentDecision reads {decision, reason} out of a
+// scope_amendment_decided payload. Returns the zero value on any decode
+// failure so the line degrades to its neutral verb.
+func decodeScopeAmendmentDecision(payload json.RawMessage) scopeAmendmentDecision {
+	if len(payload) == 0 {
+		return scopeAmendmentDecision{}
+	}
+	var p struct {
+		Decision string `json:"decision"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return scopeAmendmentDecision{}
+	}
+	return scopeAmendmentDecision{decision: p.Decision, reason: p.Reason}
 }
 
 func retryAttemptSuffix(payload json.RawMessage) string {
