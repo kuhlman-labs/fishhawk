@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Hermetic test for scripts/test's concurrent-invocation container lease
+# refcount (#1792). Sources scripts/test lib-only (FISHHAWK_TEST_LIB_ONLY=1, so
+# no subcommand runs), puts a fake `docker` on PATH that records its `rm` calls,
+# and drives _reap_shared_container with injectable lease tokens + a temp lease
+# dir to assert the refcount contract without Docker or a real container.
+# Standalone like scripts/test-cleanup-merged / scripts/test-dev — not wired
+# into scripts/test or CI.
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PASS=0
+FAIL=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+tmproot=$(mktemp -d)
+trap 'rm -rf "$tmproot"' EXIT
+
+# Fake docker on PATH that records `rm` invocations to a log (one line each).
+bindir="$tmproot/bin"
+mkdir -p "$bindir"
+rmlog="$tmproot/docker-rm.log"
+cat > "$bindir/docker" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = "rm" ]; then
+  printf '%s\n' "\$*" >> "$rmlog"
+fi
+exit 0
+EOF
+chmod +x "$bindir/docker"
+export PATH="$bindir:$PATH"
+
+# Source the lib. scripts/test enables \`set -e\`; turn it back off so assertions
+# that run commands expected to fail don't abort the test.
+FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test"
+set +e
+
+# Per-case reset: fresh lease dir, no lock, empty docker-rm log.
+reset_case() {
+  LEASE_DIR="$tmproot/case-$1"
+  rm -rf "$LEASE_DIR" "$LEASE_DIR.lock"
+  : > "$rmlog"
+}
+
+# Number of docker rm invocations recorded so far.
+rm_count() {
+  if [ -s "$rmlog" ]; then
+    wc -l < "$rmlog" | tr -d ' '
+  else
+    echo 0
+  fi
+}
+
+# (a) ref-held: reap while ANOTHER invocation's live lease is registered records
+# NO docker rm — the exact #1792 bug. Our own token has no lease; a live-PID
+# lease from a concurrent invocation keeps the dir non-empty.
+reset_case a
+mkdir -p "$LEASE_DIR"
+: > "$LEASE_DIR/$$"                       # concurrent invocation's lease (live PID)
+export FISHHAWK_TEST_LEASE_TOKEN=2000000 # our token — no lease file of its own
+_reap_shared_container
+if [ "$(rm_count)" -eq 0 ]; then
+  pass "ref-held: no docker rm while another lease is live"
+else
+  fail "ref-held: expected 0 docker rm, got $(rm_count)"
+fi
+
+# (b) last-holder: reap as the final lease holder records docker rm exactly once.
+reset_case b
+export FISHHAWK_TEST_LEASE_TOKEN=$$
+mkdir -p "$LEASE_DIR"
+: > "$LEASE_DIR/$(_lease_token)"          # our lease, the only one
+_reap_shared_container
+if [ "$(rm_count)" -eq 1 ] && grep -q fishhawk-test-postgres "$rmlog"; then
+  pass "last-holder: docker rm fishhawk-test-postgres exactly once"
+else
+  fail "last-holder: expected 1 docker rm of fishhawk-test-postgres, got $(rm_count)"
+fi
+
+# (c) stale-lease: a dead-PID lease is pruned so it neither blocks the reap nor
+# pins the container — reap proceeds to docker rm.
+reset_case c
+export FISHHAWK_TEST_LEASE_TOKEN=$$
+mkdir -p "$LEASE_DIR"
+dead_pid=$(bash -c 'echo $$')            # a PID that has already exited
+: > "$LEASE_DIR/$dead_pid"                # stale lease from a crashed invocation
+: > "$LEASE_DIR/$(_lease_token)"          # our own lease
+_reap_shared_container
+if [ "$(rm_count)" -eq 1 ] && [ ! -d "$LEASE_DIR" ]; then
+  pass "stale-lease: dead-PID lease pruned, reap proceeds to docker rm"
+else
+  fail "stale-lease: expected dead lease pruned + 1 docker rm, got $(rm_count) (dir exists: $([ -d "$LEASE_DIR" ] && echo yes || echo no))"
+fi
+
+# (d) stale-lock-broken: a lock dir left by a DEAD owner PID is broken so the
+# operation proceeds — binding condition (2)/(4). Reap is the last holder, so a
+# successful break lets it docker rm exactly once and release the lock.
+reset_case d
+export FISHHAWK_TEST_LEASE_TOKEN=$$
+mkdir -p "$LEASE_DIR"
+: > "$LEASE_DIR/$(_lease_token)"          # our lease → reap is last holder
+mkdir -p "$LEASE_DIR.lock"
+dead_owner=$(bash -c 'echo $$')          # dead PID as the lock's recorded owner
+printf '%s\n' "$dead_owner" > "$LEASE_DIR.lock/owner"
+_reap_shared_container
+if [ "$(rm_count)" -eq 1 ] && [ ! -d "$LEASE_DIR.lock" ]; then
+  pass "stale-lock-broken: dead-owner lock broken, reap proceeds and releases lock"
+else
+  fail "stale-lock-broken: expected lock broken + 1 docker rm, got $(rm_count) (lock exists: $([ -d "$LEASE_DIR.lock" ] && echo yes || echo no))"
+fi
+
+# (e) fail-safe on a live-but-stuck lock: a lock held by a LIVE owner is never
+# broken; the bounded retry cap is exhausted and reap fails SAFE — NO docker rm,
+# the container is left for the next invocation's attach-reuse — binding cond (3).
+reset_case e
+export FISHHAWK_TEST_LEASE_TOKEN=$$
+export FISHHAWK_TEST_LEASE_LOCK_CAP=2     # short cap so the test is fast
+mkdir -p "$LEASE_DIR"
+: > "$LEASE_DIR/$(_lease_token)"
+mkdir -p "$LEASE_DIR.lock"
+printf '%s\n' "$$" > "$LEASE_DIR.lock/owner"  # live owner (this process)
+_reap_shared_container
+if [ "$(rm_count)" -eq 0 ]; then
+  pass "fail-safe: live-but-stuck lock leaves the container (no docker rm)"
+else
+  fail "fail-safe: expected 0 docker rm under a live-stuck lock, got $(rm_count)"
+fi
+unset FISHHAWK_TEST_LEASE_LOCK_CAP
+
+# (f) parse-clean: scripts/test itself parses with no syntax errors.
+if bash -n "$REPO_ROOT/scripts/test" 2>/dev/null; then
+  pass "bash -n scripts/test parses clean"
+else
+  fail "bash -n scripts/test reported a syntax error"
+fi
+
+echo ""
+echo "Results: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]
