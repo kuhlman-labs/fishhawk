@@ -981,6 +981,10 @@ func (g *slashGitHubRecorder) CreateReview(_ context.Context, _ int64, _ githubc
 	return &githubclient.CreateReviewResult{}, nil
 }
 
+func (g *slashGitHubRecorder) ListIssueComments(_ context.Context, _ int64, _ githubclient.RepoRef, _ int) ([]githubclient.FetchedIssueComment, error) {
+	return nil, nil
+}
+
 // orchestratorRepoFailingList wraps orchestratorRepo to inject a
 // failing ListRuns. The other methods come through the embedded
 // pointer; the test only exercises the look-up path so anything

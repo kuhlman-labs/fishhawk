@@ -195,6 +195,33 @@ Notes:
   - The **#1702 economics stamp stays in the PR BODY**
     (`Server.resolveReviewStageOnMerge`); folding it into this comment is out of
     scope for this change.
+- **Hidden sticky marker + orphan re-discovery (#1793).** Both the living
+  anchor (`status_comment_posted`) and the sticky PR status comment
+  (`pr_status_comment_posted`) embed a hidden HTML-comment marker as the FIRST
+  section of every rendered body:
+  `<!-- fishhawk-sticky locus=<locus> run=<run-uuid> -->`, where `<locus>` is
+  `anchor` (the living anchor — emitted IDENTICALLY by both `RenderAnchorBody`
+  and the CLI status-comment `RenderStatusBody`, which edit the SAME comment in
+  place) or `pr-status` (the PR status comment). The marker is invisible in
+  rendered markdown, constant for a given `(locus, run)` so it does not perturb
+  the PR-comment body-hash dedup, and — because it leads the body — it counts
+  toward the `MaxIssueCommentBodyBytes` degradation-ladder budget and survives
+  tail-truncation (`stickyMarker` / `notifier.go`). Its purpose is to close a
+  sticky-comment STACKING hole: the comment id is normally re-discovered from
+  the audit chain (`findStatusCommentID` / `findPRStatusComment`), but if a
+  post succeeds and its audit append then fails, the id is orphaned, the next
+  rebuild finds none, and a SECOND comment would stack. **When the audit lookup
+  returns 0**, the notifier falls back to LISTING the issue/PR thread
+  (`IssueCommenter.ListIssueComments`) and matching the marker
+  (`rediscoverStickyComment`) to recover the orphaned id, which then flows
+  through the normal edit-in-place path. On the next successful edit the
+  recovered id is **re-persisted** to a fresh `status_comment_posted` /
+  `pr_status_comment_posted` row (self-heal), so subsequent rebuilds use the
+  audit chain and never list again. Fail-open: a list error (or no marker
+  match) returns 0 and degrades to today's create. This adds NO new surface
+  row and NO new audit kind — it is discovery hardening on the two existing
+  sticky surfaces; the extra list call fires only in the rare
+  post-succeeded/audit-failed double-failure case, off the hot path.
 - **Agent-review PR reviews (E42.2 / #1785).** Each terminal agent
   `implement_reviewed` verdict (the opus-4-8 + gpt-5.5 heterogeneous pair) is
   ALSO posted as an actual GitHub pull-request review, so the verdict lands in

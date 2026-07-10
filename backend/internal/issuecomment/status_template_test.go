@@ -51,6 +51,21 @@ func auditEntry(runID uuid.UUID, sequence int64, category string, actor string, 
 	}
 }
 
+// TestRenderStatusBody_EmbedsAnchorStickyMarker pins #1793: the CLI
+// status-comment renderer leads with the SAME hidden anchor marker
+// RenderAnchorBody emits (both edit the same anchor comment in place), so an
+// orphaned comment stays re-discoverable and a CLI edit never strips the marker.
+func TestRenderStatusBody_EmbedsAnchorStickyMarker(t *testing.T) {
+	runID := uuid.MustParse("7be5974b-c389-4577-a5a9-43510cadca88")
+	r, stages := statusRun(t, runID)
+	body := issuecomment.RenderStatusBody(r, stages, nil, "https://app.example",
+		time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC))
+	marker := "<!-- fishhawk-sticky locus=anchor run=7be5974b-c389-4577-a5a9-43510cadca88 -->"
+	if !strings.HasPrefix(body, marker) {
+		t.Errorf("status body must lead with the anchor sticky marker %q; body = %q", marker, body)
+	}
+}
+
 func TestRenderStatusBody_HeaderCarriesShortIDAndWorkflowAndState(t *testing.T) {
 	runID := uuid.MustParse("7be5974b-c389-4577-a5a9-43510cadca88")
 	r, stages := statusRun(t, runID)

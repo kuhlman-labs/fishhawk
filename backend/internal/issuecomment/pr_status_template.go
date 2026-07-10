@@ -46,6 +46,11 @@ type PRStatusInput struct {
 // per-criterion table) and acceptanceTally (the collapsed tally line) — so the
 // ladder can shed the table detail first while keeping the outcome visible.
 type prStatusSections struct {
+	// marker is the hidden sticky-comment marker (#1793), kept as the FIRST
+	// assembled section so it counts toward the degradation-ladder size budget
+	// and survives truncateForGitHubComment's tail-trim. Never dropped by the
+	// ladder.
+	marker          string
 	header          string
 	whatNow         string
 	reviews         string
@@ -76,6 +81,7 @@ func RenderPRStatusBody(in PRStatusInput) string {
 
 	acc := buildPRAcceptance(in.Audit, in.AcceptanceArtifact)
 	s := prStatusSections{
+		marker:          stickyMarker(stickyLocusPRStatus, in.Run.ID),
 		header:          renderPRStatusHeader(in.Run, externalURL),
 		whatNow:         renderPRWhatNow(in.Run, in.Stages, acc),
 		reviews:         renderStageReviews("implement", in.Audit),
@@ -106,7 +112,7 @@ func RenderPRStatusBody(in PRStatusInput) string {
 //	level 1 — acceptance collapsed to the tally line
 //	level 2 — also drop the fix-up history
 func assemblePRStatus(s prStatusSections, level int) string {
-	parts := []string{s.header, s.whatNow}
+	parts := []string{s.marker, s.header, s.whatNow}
 	if s.reviews != "" {
 		parts = append(parts, s.reviews)
 	}

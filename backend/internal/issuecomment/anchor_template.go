@@ -77,6 +77,11 @@ type AnchorInput struct {
 // always keeping the header, the current plan summary, and the dashboard
 // deep-link.
 type anchorSections struct {
+	// marker is the hidden sticky-comment marker (#1793), kept as the FIRST
+	// assembled section so it counts toward the degradation-ladder size budget
+	// and survives truncateForGitHubComment's tail-trim (which preserves the
+	// head). Never dropped by the ladder.
+	marker          string
 	header          string
 	whatNow         string
 	stages          string
@@ -108,6 +113,7 @@ func RenderAnchorBody(in AnchorInput) string {
 	runURL := runURLFor(externalURL, in.Run.ID)
 
 	s := anchorSections{
+		marker:          stickyMarker(stickyLocusAnchor, in.Run.ID),
 		header:          renderAnchorHeader(in.Run, externalURL),
 		whatNow:         renderWhatNow(in.Run, in.Stages),
 		stages:          renderAnchorStages(in.Stages),
@@ -147,7 +153,7 @@ func RenderAnchorBody(in AnchorInput) string {
 // are never dropped. The economics block sits just above the footer and is
 // the FIRST section shed under the cap (#1702).
 func assembleAnchor(s anchorSections, level int) string {
-	parts := []string{s.header, s.whatNow, s.stages}
+	parts := []string{s.marker, s.header, s.whatNow, s.stages}
 	if level < 2 && s.timeline != "" {
 		parts = append(parts, s.timeline)
 	}

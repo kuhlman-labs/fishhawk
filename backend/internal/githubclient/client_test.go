@@ -916,8 +916,8 @@ func TestGetIssue_DecodeError(t *testing.T) {
 func TestListIssueComments_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	fg.listIssueCommentsPages = []string{
-		`[{"user":{"login":"alice"},"body":"First.","created_at":"2026-05-01T10:00:00Z"},` +
-			`{"user":{"login":"bob"},"body":"Second.","created_at":"2026-05-01T11:00:00Z"}]`,
+		`[{"id":101,"user":{"login":"alice"},"body":"First.","created_at":"2026-05-01T10:00:00Z"},` +
+			`{"id":102,"user":{"login":"bob"},"body":"Second.","created_at":"2026-05-01T11:00:00Z"}]`,
 	}
 	c, _ := newTestClient(t, srv, nil)
 
@@ -928,7 +928,7 @@ func TestListIssueComments_HappyPath(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("got %d comments, want 2: %+v", len(got), got)
 	}
-	if got[0] != (FetchedIssueComment{Author: "alice", Body: "First.", CreatedAt: "2026-05-01T10:00:00Z"}) {
+	if got[0] != (FetchedIssueComment{ID: 101, Author: "alice", Body: "First.", CreatedAt: "2026-05-01T10:00:00Z"}) {
 		t.Errorf("comment[0] = %+v", got[0])
 	}
 	if got[1].Author != "bob" || got[1].Body != "Second." {
