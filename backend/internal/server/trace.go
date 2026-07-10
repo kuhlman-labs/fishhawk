@@ -901,6 +901,28 @@ func (s *Server) notifyStatusUpdate(ctx context.Context, runID uuid.UUID, source
 	}
 }
 
+// notifyPageClass is the best-effort pings-only immediate hook (#1786),
+// invoked right after each currently-batched page-class audit append
+// (plan-review reject, implement-review reject, scope-amendment request,
+// paged acceptance triage) so the page posts within the event's own
+// transaction window instead of riding the next stage transition. The
+// notifier dedups on the source audit Sequence, so this cannot double-post
+// with the per-transition notifyStatusUpdate; here we just call it and log
+// on failure. `source` tags the call site in the log line.
+func (s *Server) notifyPageClass(ctx context.Context, runID uuid.UUID, source string) {
+	if s.issueNotifier == nil {
+		return
+	}
+	if err := s.issueNotifier.NotifyPageClassForRun(ctx, runID); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"page-class ping failed",
+			slog.String("source", source),
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
 // reEvaluatePolicy is the backend's source-of-truth re-evaluation
 // of the closed-set constraints (E3.13). Returns the policy
 // violations found; the caller derives pass/fail from the length and
@@ -3013,6 +3035,13 @@ func (s *Server) approvedAmendmentScopePaths(ctx context.Context, runID uuid.UUI
 func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel, origin, headSHA string, reviewBudget planreview.ReviewBudget) bool {
 	systemKind := audit.ActorKind("system")
 	hasRejection := false
+	// pagedRejectAppended tracks whether THIS loop appended a page-class audit
+	// entry — an implement_reviewed reject verdict (#1786). Gating the
+	// immediate hook on this (not on an unconditional call) keeps an
+	// all-approve loop from calling NotifyPageClassForRun, which evaluates the
+	// full audit history and would otherwise flush an OLDER unpinged
+	// page-class event at this unrelated moment.
+	pagedRejectAppended := false
 	budget := reviewBudget.Budget(len(promptText))
 	for i, inv := range invocations {
 		// An unresolvable provider is a deployment CAPABILITY gap, not a
@@ -3119,6 +3148,7 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 
 		if verdict.Verdict == planreview.VerdictReject {
 			hasRejection = true
+			pagedRejectAppended = true
 		}
 	}
 
@@ -3131,6 +3161,18 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 	// the review loop's return (a publish failure recomputes on the next SPA
 	// visit or PR webhook).
 	s.recomputeAndPublishAuditComplete(ctx, runID)
+
+	// Fire the page-class ping immediately (#1786) so a reviewer reject pages
+	// the operator within the review append flow rather than riding the next
+	// transition (the operator's own fixup/approve) minutes later — but ONLY
+	// when this loop actually appended a reject verdict (the page-class event).
+	// An all-approve loop appends no page-class entry, so an unconditional call
+	// would flush an OLDER unpinged page-class event at this unrelated moment.
+	// Deduped on the source Sequence, so it never double-posts with
+	// notifyStatusUpdate.
+	if pagedRejectAppended {
+		s.notifyPageClass(ctx, runID, "implement_review")
+	}
 
 	return hasRejection
 }

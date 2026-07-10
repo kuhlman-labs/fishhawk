@@ -258,6 +258,27 @@ func TestRequestScopeAmendment_HappyPath(t *testing.T) {
 	}
 }
 
+// TestRequestScopeAmendment_FiresPageClassHook is one of the four
+// binding-condition-#2 site assertions (#1786): the scope-amendment request
+// handler invokes the pings-only immediate hook at its append site so the
+// must_page_human request pages the operator within the request window
+// rather than at the next transition.
+func TestRequestScopeAmendment_FiresPageClassHook(t *testing.T) {
+	s, _, _, _, runRow, _ := scopeAmendmentServer(t)
+	rec := &pageClassRecorder{}
+	s.issueNotifier = rec
+
+	w := postAmendment(t, s, runRow.ID, validAmendmentBody, func(r *http.Request) *http.Request {
+		return withRunBoundIdentity(r, runRow.ID, "mcp:read", "write:scope-amendments")
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", w.Code, w.Body.String())
+	}
+	if !rec.pagedRun(runRow.ID) {
+		t.Errorf("scope-amendment site did not invoke the page-class hook; paged=%v", rec.pageClass)
+	}
+}
+
 func TestRequestScopeAmendment_BudgetExhausted422(t *testing.T) {
 	s, _, _, _, runRow, _ := scopeAmendmentServer(t)
 	agent := func(r *http.Request) *http.Request {

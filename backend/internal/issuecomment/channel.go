@@ -30,6 +30,11 @@ type Channel interface {
 	// status comment and fires any page-class pings the new audit state
 	// crossed (E20.4 / #330, anchor redrive #1054).
 	NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID) error
+	// NotifyPageClassForRun fires any page-class pings the current audit
+	// state crossed WITHOUT rebuilding the anchor — the pings-only immediate
+	// sibling invoked at each batched page-class append site so a page posts
+	// within the event's own window instead of the next transition (#1786).
+	NotifyPageClassForRun(ctx context.Context, runID uuid.UUID) error
 	// NotifyPlanReady fires the plan-ready hook after the plan stage
 	// transitions terminally (#234); in the living-anchor world it routes
 	// to the same anchor rebuild as every other transition.
@@ -98,6 +103,11 @@ func (r *Router) each(fn func(Channel) error) error {
 // NotifyStatusUpdateForRun fans the anchor rebuild out to every channel.
 func (r *Router) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID) error {
 	return r.each(func(c Channel) error { return c.NotifyStatusUpdateForRun(ctx, runID) })
+}
+
+// NotifyPageClassForRun fans the pings-only immediate hook out to every channel.
+func (r *Router) NotifyPageClassForRun(ctx context.Context, runID uuid.UUID) error {
+	return r.each(func(c Channel) error { return c.NotifyPageClassForRun(ctx, runID) })
 }
 
 // NotifyPlanReady fans the plan-ready hook out to every channel.

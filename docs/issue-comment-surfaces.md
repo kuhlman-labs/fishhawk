@@ -12,7 +12,7 @@ it.
 | Living anchor | `status_comment_posted` | `status_update` | `Dispatcher.Handle` (run create); `Server.notifyStatusUpdate` (every stage transition); `Server.notifyPlanReady` (plan-stage terminal) | run dispatch | Yes — one comment per run, every transition rebuilds + edits the same comment id |
 | PR status comment | `pr_status_comment_posted` | `pr_status_update` | `Server.notifyStatusUpdate` via `issuecomment.Notifier.NotifyStatusUpdateForRun` (folded in after the anchor edit) | PR first observed / `pull_request_url` stamped | Yes — one comment per PR, rebuilt on every transition + edited in place (identical body skips the edit) |
 | Agent-review PR review | `pr_review_posted` | _(source `implement_reviewed`)_ | `Notifier.maybePostAgentReviewPRReviews` via `NotifyStatusUpdateForRun` (folded in after the anchor edit) | each terminal agent `implement_reviewed` verdict on a PR-owning run | No — a NEW advisory COMMENT-type PR review per verdict round (deduped on the source `implement_reviewed` audit `Sequence`); a post-fixup re-review round posts a new review |
-| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, advisory-reject arbitrated, must_page_human, clarification request / awaiting_input park, CI failure, acceptance triage paged, campaign gate hand-off) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor |
+| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` AND the pings-only immediate `NotifyPageClassForRun` invoked at each batched append site (#1786) | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, must_page_human, clarification request / awaiting_input park, CI failure, acceptance triage paged, campaign gate hand-off) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor; an already-resolved reviewer-reject page is recorded-and-skipped |
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
 | Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688, #1371) | crossing of an advisory periodic-budget ladder rung — `warn` / `over` / `ack_required` (≥2x) / `page` (≥3x) | No (per-`(period_start, tier)` dedup; each tier posts once per calendar period) |
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
@@ -187,15 +187,17 @@ Notes:
     blocking concern on the `<stage>` (advisory reject) — awaiting operator
     arbitration." (naming the `reviewer_model`, falling back to "A reviewer")
     and never reads as a gate rejection. The kind token stays
-    `<stage>_review_rejected` for dedup parity.
-  - **Advisory-reject arbitrated (resolution, #1070)** — `advisory_reject_arbitrated`,
-    fired on an `approval_submitted` approve that follows >=1 current-round
-    reviewer reject (`advisoryRejectCountBefore('plan', …) > 0`), deduped on
-    the approval `Sequence`. It posts "✅ The operator approved the plan over N
-    advisory reject(s) — implementing now." so the thread's most-recent
-    comment reflects the real gate outcome instead of leaving a stale advisory
-    reject as the last word. A clean approve (no preceding advisory reject)
-    produces no ping — it stays edit-only on the anchor.
+    `<stage>_review_rejected` for dedup parity. **Skipped once resolved
+    (#1786):** if a later `approval_submitted` (plan or implement) or
+    `stage_fixup_triggered` (implement) has landed by the time the page would
+    fire, `firePings` records the dedup row WITHOUT posting — the operator has
+    already arbitrated, so the page would arrive stale.
+  - **Advisory-reject arbitration is NOT a page-class ping (#1786).** Approving
+    over a reviewer reject is the operator's OWN action, so it no longer emits
+    a page-class event (the retired `advisory_reject_arbitrated`, #1070) — that
+    would page the approver about their own approval. The arbitration is still
+    rendered on the anchor timeline (its "(over N advisory reject(s))" marker,
+    `anchor_template.go` via `advisoryRejectCountBefore`), just not as a ping.
   - **must_page_human (ADR-040)** — the concrete must_page_human EVENTS in the
     closed v0 set (`spec.PageEvent*`) are audit categories even though the
     request-time `may_*` delegation knobs are not. Today this surfaces the
@@ -236,6 +238,19 @@ Notes:
 
   Each ping records its source audit `Sequence` so a re-render never
   double-pings.
+
+  **Immediate dispatch (#1786).** Historically page-class pings only fired
+  from `NotifyStatusUpdateForRun`, so they were batched to the NEXT stage
+  transition — a reviewer-reject page could arrive minutes late (riding the
+  operator's own fixup/approve transition). A pings-only sibling
+  `NotifyPageClassForRun` (no anchor / PR-comment / PR-review rebuild) is now
+  invoked directly at each currently-batched page-class append site
+  (`server`: `plan.go` plan-review reject, `trace.go` implement-review reject,
+  `scope_amendment.go` request, `acceptance.go` paged triage) so the page
+  posts within the event's own transaction window. It shares `firePings` with
+  the per-transition path, so the source-`Sequence` dedup makes the extra call
+  idempotent — a ping recorded under either path never re-fires under the
+  other.
 - The reaction-polling worker (#360) is a *read-side* concern that reads the
   anchor comment rather than writing new surfaces; it records observed
   reactions under the separate `plan_reaction_observed` audit category and

@@ -655,6 +655,138 @@ func TestNotifyStatusUpdateForRun_NilReceiver_NoOp(t *testing.T) {
 	}
 }
 
+// countAppendedCategory returns how many audit rows the notifier appended in
+// the given category (page-class dedup-row assertions).
+func countAppendedCategory(au *fakeAudit, category string) int {
+	n := 0
+	for _, p := range au.appended {
+		if p.Category == category {
+			n++
+		}
+	}
+	return n
+}
+
+// TestNotifyPageClassForRun_FiresRejectPingImmediately is the #1786
+// cross-boundary integration test: the real Notifier over fake repos + fake
+// github, seeded with an implement_reviewed reject, posts exactly one ping
+// comment IMMEDIATELY (audit-read → firePings → github-post) and does NOT
+// rebuild or edit the living anchor.
+func TestNotifyPageClassForRun_FiresRejectPingImmediately(t *testing.T) {
+	runID, gh, au, _, n := happyDepsWithStages(t)
+	au.preSeed(runID, "implement_reviewed", map[string]any{"verdict": "reject", "reviewer_model": "gpt-5.5"})
+
+	if err := n.NotifyPageClassForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyPageClassForRun: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected exactly 1 ping comment; got %d", len(gh.calls))
+	}
+	if !strings.Contains(gh.calls[0].body, "flagged a blocking concern") {
+		t.Errorf("ping body missing reviewer-reject wording: %q", gh.calls[0].body)
+	}
+	if strings.Contains(gh.calls[0].body, "Fishhawk run") {
+		t.Errorf("NotifyPageClassForRun must NOT rebuild the anchor; got anchor body: %q", gh.calls[0].body)
+	}
+	if len(gh.updateCalls) != 0 {
+		t.Errorf("NotifyPageClassForRun must NOT edit the anchor; got %d edits", len(gh.updateCalls))
+	}
+	if got := countAppendedCategory(au, issuecomment.CategoryAnchorPingPosted); got != 1 {
+		t.Errorf("expected 1 anchor_ping_posted dedup row; got %d", got)
+	}
+}
+
+// TestNotifyPageClassForRun_SkipsResolvedRejectButRecordsDedup proves the
+// proposal-2 skip path: a reject already resolved by a later
+// stage_fixup_triggered records the dedup row WITHOUT posting, and a second
+// pass never re-posts or double-records (source-Sequence dedup).
+func TestNotifyPageClassForRun_SkipsResolvedRejectButRecordsDedup(t *testing.T) {
+	runID, gh, au, _, n := happyDepsWithStages(t)
+	au.preSeed(runID, "implement_reviewed", map[string]any{"verdict": "reject", "reviewer_model": "gpt-5.5"})
+	au.preSeed(runID, "stage_fixup_triggered", map[string]any{}) // later resolver
+
+	if err := n.NotifyPageClassForRun(context.Background(), runID); err != nil {
+		t.Fatalf("first NotifyPageClassForRun: %v", err)
+	}
+	if len(gh.calls) != 0 {
+		t.Fatalf("a resolved reject must not post a ping; got %d comments", len(gh.calls))
+	}
+	if got := countAppendedCategory(au, issuecomment.CategoryAnchorPingPosted); got != 1 {
+		t.Fatalf("expected the dedup row to be recorded on skip; got %d", got)
+	}
+
+	// Second pass: the source Sequence is already pinged → skip entirely.
+	if err := n.NotifyPageClassForRun(context.Background(), runID); err != nil {
+		t.Fatalf("second NotifyPageClassForRun: %v", err)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("second pass must not post; got %d comments", len(gh.calls))
+	}
+	if got := countAppendedCategory(au, issuecomment.CategoryAnchorPingPosted); got != 1 {
+		t.Errorf("second pass must not record a duplicate dedup row; got %d", got)
+	}
+}
+
+// TestNotifyPageClassForRun_PreexistingDedupRowNeverRefires is the binding
+// condition #3 regression: a ping already recorded under the OLD batched path
+// (a pre-existing anchor_ping_posted row for the reject's source Sequence)
+// must never re-fire under the new immediate path — the source-Sequence dedup
+// is byte-compatible across the upgrade.
+func TestNotifyPageClassForRun_PreexistingDedupRowNeverRefires(t *testing.T) {
+	runID, gh, au, _, n := happyDepsWithStages(t)
+	// An UNRESOLVED implement-review reject at seq 1 (no resolver present).
+	au.preSeed(runID, "implement_reviewed", map[string]any{"verdict": "reject", "reviewer_model": "gpt-5.5"})
+	// The old batched path already pinged this exact source Sequence.
+	au.preSeed(runID, issuecomment.CategoryAnchorPingPosted, map[string]any{
+		"source_sequence": 1, "event": "implement_review_rejected",
+	})
+
+	if err := n.NotifyPageClassForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyPageClassForRun: %v", err)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("a source Sequence already pinged under the old path must not re-fire; got %d comments", len(gh.calls))
+	}
+	if got := countAppendedCategory(au, issuecomment.CategoryAnchorPingPosted); got != 0 {
+		t.Errorf("no new dedup row expected on a pre-pinged source Sequence; got %d", got)
+	}
+}
+
+func TestNotifyPageClassForRun_NonIssueTrigger_SkipsSilently(t *testing.T) {
+	runID, gh, au, runs, n := happyDepsWithStages(t)
+	runs.runs[runID].TriggerSource = run.TriggerCLI
+	au.preSeed(runID, "implement_reviewed", map[string]any{"verdict": "reject", "reviewer_model": "x"})
+	if err := n.NotifyPageClassForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyPageClassForRun: %v", err)
+	}
+	if len(gh.calls)+len(gh.updateCalls) != 0 {
+		t.Errorf("non-issue trigger should skip; got %d creates + %d updates", len(gh.calls), len(gh.updateCalls))
+	}
+	if got := countAppendedCategory(au, issuecomment.CategoryAnchorPingPosted); got != 0 {
+		t.Errorf("non-issue trigger should not append; got %d", got)
+	}
+}
+
+func TestNotifyPageClassForRun_NilReceiver_NoOp(t *testing.T) {
+	var n *issuecomment.Notifier
+	if err := n.NotifyPageClassForRun(context.Background(), uuid.New()); err != nil {
+		t.Errorf("nil receiver should be a no-op; got %v", err)
+	}
+}
+
+// TestNotifyPageClassForRun_RunLoadError surfaces the GetRun-error branch: an
+// unknown run id returns a wrapped error (best-effort caller logs it) rather
+// than posting or panicking.
+func TestNotifyPageClassForRun_RunLoadError(t *testing.T) {
+	_, gh, _, _, n := happyDepsWithStages(t)
+	if err := n.NotifyPageClassForRun(context.Background(), uuid.New()); err == nil {
+		t.Error("expected a wrapped error for an unknown run id; got nil")
+	}
+	if len(gh.calls)+len(gh.updateCalls) != 0 {
+		t.Errorf("a load error must post nothing; got %d creates + %d updates", len(gh.calls), len(gh.updateCalls))
+	}
+}
+
 // TestStatusComment_Lifecycle drives the sticky-status comment through
 // the operator-visible transitions of a representative run lifecycle
 // (E20.5 / #331): dispatch seed → plan-ready → plan-approved →
@@ -1493,11 +1625,13 @@ func TestNotifyStatusUpdateForRun_AnchorEndToEnd(t *testing.T) {
 	if anchorCreates != 1 {
 		t.Errorf("expected exactly 1 anchor comment create; got %d", anchorCreates)
 	}
-	// Page-class events in the chain: the plan gate awaiting approval +
-	// a reviewer reject = 2 pings, each fired once across the 3
-	// transitions (the gate-decision reject is not itself a ping class).
-	if pingCreates != 2 {
-		t.Errorf("expected 2 page-class pings (plan awaiting + reviewer reject); got %d", pingCreates)
+	// Page-class events in the chain: the plan gate awaiting approval fires
+	// its ping (v2 awaiting a human). The round-1 reviewer reject is
+	// RESOLVED by the later approval_submitted (the operator arbitrated the
+	// gate) so firePings records its dedup row but skips the stale page
+	// (#1786) — leaving exactly 1 ping create.
+	if pingCreates != 1 {
+		t.Errorf("expected 1 page-class ping (plan awaiting; reviewer reject resolved by later approval); got %d", pingCreates)
 	}
 	if len(gh.updateCalls) < 2 {
 		t.Errorf("expected the anchor to edit in place on later transitions; got %d edits", len(gh.updateCalls))

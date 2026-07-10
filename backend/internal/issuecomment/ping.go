@@ -100,29 +100,19 @@ func pageClassEvents(entries []*audit.Entry, stages []*run.Stage) []pageEvent {
 				// A reviewer reject is ADVISORY — the operator arbitrates the
 				// gate. Word it so it cannot read as a GATE rejection (a stale
 				// "🚫 rejected the plan" as the thread's last word when the
-				// operator in fact approved over it). The resolution ping
-				// (advisory_reject_arbitrated, below) closes the loop.
+				// operator in fact approved over it). Once the operator
+				// arbitrates (an approval_submitted, or a fixup dispatch for an
+				// implement reject), firePings treats the not-yet-posted page as
+				// already-resolved via pageEventResolved and records the dedup
+				// row WITHOUT posting — the arbitration stays on the anchor
+				// timeline and no longer pages the approver about their own
+				// action (#1786). Advisory-reject arbitration is deliberately
+				// NOT its own page-class event.
 				out = append(out, pageEvent{
 					sequence: e.Sequence,
 					kind:     stage + "_review_rejected",
 					message:  fmt.Sprintf("🚫 %s flagged a blocking concern on the %s (advisory reject) — awaiting operator arbitration.", who, stage),
 				})
-			}
-		case "approval_submitted":
-			// Resolution ping: when the operator approves the plan over one
-			// or more current-round reviewer rejects, post a NEW comment so
-			// the thread's most-recent comment reflects the real gate outcome
-			// instead of leaving a stale advisory-reject ping as the last
-			// word. A clean approve (no preceding advisory reject) stays
-			// edit-only on the anchor and produces no ping.
-			if approvalDecisionOf(e.Payload) == "approve" {
-				if n := advisoryRejectCountBefore("plan", entries, e.Sequence); n > 0 {
-					out = append(out, pageEvent{
-						sequence: e.Sequence,
-						kind:     "advisory_reject_arbitrated",
-						message:  fmt.Sprintf("✅ The operator approved the plan over %d advisory %s — implementing now.", n, advisoryRejectNoun(n)),
-					})
-				}
 			}
 		case "scope_amendment_requested":
 			// must_page_human (ADR-040, spec.PageEventScopeAmendment): a
@@ -194,6 +184,47 @@ func pageClassEvents(entries []*audit.Entry, stages []*run.Stage) []pageEvent {
 	// plan-awaiting event was prepended in.
 	sort.SliceStable(out, func(i, j int) bool { return out[i].sequence < out[j].sequence })
 	return out
+}
+
+// pageEventResolved reports whether a reviewer-reject page event has
+// already been resolved by a LATER audit entry, in which case firePings
+// records the dedup row but SKIPS the actual comment: the page would arrive
+// stale (the operator has already acted on the concern). This matters for
+// the new immediate-dispatch path (#1786) — under the old batched path the
+// ping rode the NEXT transition, which could be the very arbitration that
+// resolved it, whereas an immediate ping could still fire moments before
+// the resolving entry lands on a later re-render.
+//
+// Only reviewer-reject kinds are resolvable; every other page class (a
+// must_page_human park, a CI failure, an acceptance triage page) always
+// pages and returns false.
+//
+//   - plan_review_rejected — resolved by a later approval_submitted entry
+//     (the operator arbitrated the plan gate).
+//   - implement_review_rejected — resolved by a later stage_fixup_triggered
+//     (the operator routed the concern back to the agent) OR a later
+//     approval_submitted entry.
+func pageEventResolved(ev pageEvent, entries []*audit.Entry) bool {
+	switch ev.kind {
+	case "plan_review_rejected":
+		return hasLaterCategory(entries, ev.sequence, "approval_submitted")
+	case "implement_review_rejected":
+		return hasLaterCategory(entries, ev.sequence, "stage_fixup_triggered") ||
+			hasLaterCategory(entries, ev.sequence, "approval_submitted")
+	default:
+		return false
+	}
+}
+
+// hasLaterCategory reports whether any entry in the named category has an
+// audit Sequence strictly greater than afterSeq.
+func hasLaterCategory(entries []*audit.Entry, afterSeq int64, category string) bool {
+	for _, e := range entries {
+		if e.Sequence > afterSeq && e.Category == category {
+			return true
+		}
+	}
+	return false
 }
 
 // planStageAwaitingApproval reports whether a plan stage is currently
@@ -367,6 +398,16 @@ func (n *Notifier) firePings(ctx context.Context, ctxv commentContext, entries [
 	}
 	for _, ev := range events {
 		if _, done := pinged[ev.sequence]; done {
+			continue
+		}
+		// A reviewer-reject page the operator has already arbitrated is
+		// stale: record the dedup row so it never fires later, but skip the
+		// comment (#1786). The source-Sequence dedup gate above is unchanged,
+		// so a ping already recorded under the old batched path stays deduped.
+		if pageEventResolved(ev, entries) {
+			if err := n.appendPingAudit(ctx, ctxv.run.ID, ev); err != nil {
+				return err
+			}
 			continue
 		}
 		body := fmt.Sprintf("%s [View the run →](%s)", ev.message, runURL)

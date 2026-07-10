@@ -718,8 +718,24 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	// verdict cannot double-route. Best-effort relative to the ship: any
 	// internal error WARN-logs inside and never unwinds the 201 / artifact /
 	// outcome audit already committed.
+	paged := false
 	if acc.Verdict == acceptanceVerdictFailed {
-		s.triageAcceptanceFailure(r.Context(), runID, stage, acc, created.ID.String())
+		disposition := s.triageAcceptanceFailure(r.Context(), runID, stage, acc, created.ID.String())
+		paged = acceptanceDispositionPages(disposition)
+	}
+
+	// Fire the page-class ping immediately (#1786), but ONLY when triage
+	// actually PAGED: a paged acceptance-triage disposition is otherwise silent
+	// on anchor edits, so pinging within the record window (after triage has
+	// decided and written its acceptance_triage_decided entry) gets the
+	// operator looking sooner than the next transition. A passed verdict (no
+	// triage) or an auto-routed fixup_dispatched / retry_dispatched disposition
+	// writes NO page-class event, so calling the hook then would only flush an
+	// OLDER unpinged page-class event at this unrelated moment
+	// (NotifyPageClassForRun evaluates the full audit history). Deduped on the
+	// source Sequence, so it never double-posts.
+	if paged {
+		s.notifyPageClass(r.Context(), runID, "acceptance_recorded")
 	}
 
 	s.writeJSON(w, r, http.StatusCreated, acceptanceResponse{
@@ -1261,7 +1277,13 @@ func allSkipsCarryExpectationBasis(criteria []acceptanceCriterionResult) bool {
 // best-effort relative to the ship: every internal error WARN-logs and never
 // unwinds the 201 / artifact / outcome audit. It ALWAYS ends by writing ONE
 // acceptance_triage_decided chained entry recording what actually happened.
-func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, stage *run.Stage, acc acceptanceBody, artifactID string) {
+//
+// Returns the realized disposition so the caller can gate the immediate
+// page-class hook on whether triage actually PAGED (#1786) — an auto-routed
+// fixup_dispatched / retry_dispatched disposition writes no page-class event,
+// so firing the hook then would flush an older unpinged event at an unrelated
+// moment. acceptanceDispositionPages classifies the returned value.
+func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, stage *run.Stage, acc acceptanceBody, artifactID string) string {
 	// Load the approved plan for provenance grounding (nil-tolerant → the
 	// classifier grounds class 4).
 	var criteria []plan.AcceptanceCriterion
@@ -1298,7 +1320,7 @@ func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, s
 		s.writeAcceptanceTriageAudit(ctx, runID, stage.ID, artifactID, class,
 			acceptanceDispositionPaged, criterionIDs, acc.FailureMode, prior,
 			"triage route count failed; paging without action", misses)
-		return
+		return acceptanceDispositionPaged
 	}
 
 	// Defensive settle check: an operator-bearer ship may race the trace-bundle
@@ -1308,7 +1330,7 @@ func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, s
 		s.writeAcceptanceTriageAudit(ctx, runID, stage.ID, artifactID, class,
 			acceptanceDispositionUnsettled, criterionIDs, acc.FailureMode, prior,
 			fmt.Sprintf("acceptance stage not yet settled (state %q); recording classification without acting", stage.State), misses)
-		return
+		return acceptanceDispositionUnsettled
 	}
 
 	// Re-run bound: at the cap keep the classified class but degrade to a paged
@@ -1317,7 +1339,7 @@ func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, s
 		s.writeAcceptanceTriageAudit(ctx, runID, stage.ID, artifactID, class,
 			acceptanceDispositionRerunBudget, criterionIDs, acc.FailureMode, prior,
 			fmt.Sprintf("re-run budget exhausted (%d of %d auto-routed passes used); paging", prior, defaultMaxAcceptanceReruns), misses)
-		return
+		return acceptanceDispositionRerunBudget
 	}
 
 	// Route by class. Class 3 / class 4 take NO state transition — page. Class 5
@@ -1340,6 +1362,25 @@ func (s *Server) triageAcceptanceFailure(ctx context.Context, runID uuid.UUID, s
 
 	s.writeAcceptanceTriageAudit(ctx, runID, stage.ID, artifactID, class,
 		disposition, criterionIDs, acc.FailureMode, prior, reason, misses)
+	return disposition
+}
+
+// acceptanceDispositionPages reports whether a triage disposition is one that
+// PAGES a human — the exact set issuecomment/ping.go's acceptanceTriageNeedsHuman
+// keys the acceptance_triage_decided page-class event on (#1786). The
+// auto-routed fixup_dispatched / retry_dispatched dispositions (and a passed
+// verdict, which triages nothing) return false, so handleShipAcceptance skips
+// the immediate page-class hook for them rather than flushing an older unpinged
+// event at an unrelated moment.
+func acceptanceDispositionPages(disposition string) bool {
+	switch disposition {
+	case acceptanceDispositionPaged, acceptanceDispositionRerunBudget,
+		acceptanceDispositionFixupUnavailable, acceptanceDispositionRetryUnavailable,
+		acceptanceDispositionUnsettled, acceptanceDispositionUnvalidatable:
+		return true
+	default:
+		return false
+	}
 }
 
 // buildPlanReviewMisses joins each class-3 criterion id with the approved

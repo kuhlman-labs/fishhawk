@@ -16,6 +16,7 @@ import (
 // asserted without any GitHub I/O.
 type recordingChannel struct {
 	statusUpdate int
+	pageClass    int
 	planReady    int
 	ciRetry      int
 	budgetAlert  int
@@ -30,6 +31,11 @@ type recordingChannel struct {
 
 func (c *recordingChannel) NotifyStatusUpdateForRun(_ context.Context, _ uuid.UUID) error {
 	c.statusUpdate++
+	return c.err
+}
+
+func (c *recordingChannel) NotifyPageClassForRun(_ context.Context, _ uuid.UUID) error {
+	c.pageClass++
 	return c.err
 }
 
@@ -72,6 +78,9 @@ func TestRouter_FansOutEverySurface(t *testing.T) {
 	if err := r.NotifyStatusUpdateForRun(ctx, uuid.New()); err != nil {
 		t.Fatalf("NotifyStatusUpdateForRun: %v", err)
 	}
+	if err := r.NotifyPageClassForRun(ctx, uuid.New()); err != nil {
+		t.Fatalf("NotifyPageClassForRun: %v", err)
+	}
 	if err := r.NotifyPlanReady(ctx, uuid.New(), nil, nil); err != nil {
 		t.Fatalf("NotifyPlanReady: %v", err)
 	}
@@ -89,7 +98,7 @@ func TestRouter_FansOutEverySurface(t *testing.T) {
 	}
 
 	for name, c := range map[string]*recordingChannel{"a": a, "b": b} {
-		if c.statusUpdate != 1 || c.planReady != 1 || c.ciRetry != 1 ||
+		if c.statusUpdate != 1 || c.pageClass != 1 || c.planReady != 1 || c.ciRetry != 1 ||
 			c.budgetAlert != 1 || c.slashReply != 1 || c.runRejected != 1 {
 			t.Errorf("channel %s did not receive every surface once: %+v", name, c)
 		}

@@ -62,40 +62,125 @@ func TestPageClassEvents_ReviewerRejectModelFallback(t *testing.T) {
 	}
 }
 
-// TestPageClassEvents_AdvisoryRejectArbitrated covers the resolution ping
-// (#1070): an approve OVER a current-round reviewer reject fires exactly
-// one advisory_reject_arbitrated event keyed on the approval Sequence;
-// a clean approve fires none.
-func TestPageClassEvents_AdvisoryRejectArbitrated(t *testing.T) {
+// TestPageClassEvents_NoAdvisoryRejectArbitratedEvent covers proposal 3 of
+// #1786: approving OVER a current-round reviewer reject no longer produces a
+// page-class advisory_reject_arbitrated event — approving is the operator's
+// own action and must not page them. The chain still projects the reviewer
+// reject itself (that page is resolved-and-skipped at firePings time, not
+// dropped from the projection). The arbitration line stays on the anchor
+// timeline (asserted in anchor_template_test.go), not here.
+func TestPageClassEvents_NoAdvisoryRejectArbitratedEvent(t *testing.T) {
 	arbitrated := []*audit.Entry{
 		startedEntry(10, "plan"),
 		reviewerVerdictEntry(11, "plan_reviewed", "reject", "gpt-5.5"),
 		approvalDecisionEntry(12, "approve"),
 	}
 	got := pageClassEvents(arbitrated, nil)
-	// Two events: the advisory-reject ping (seq 11) and the resolution
-	// ping (seq 12), oldest-first.
-	if len(got) != 2 {
-		t.Fatalf("expected reject + resolution events; got %+v", got)
+	// Only the reviewer-reject event (seq 11) — no advisory_reject_arbitrated.
+	if len(got) != 1 {
+		t.Fatalf("expected only the reviewer-reject event; got %+v", got)
 	}
-	res := got[1]
-	if res.kind != "advisory_reject_arbitrated" || res.sequence != 12 {
-		t.Errorf("resolution event = %+v, want advisory_reject_arbitrated at seq 12", res)
+	if got[0].kind != "plan_review_rejected" || got[0].sequence != 11 {
+		t.Errorf("got %+v, want plan_review_rejected at seq 11", got[0])
 	}
-	if !strings.Contains(res.message, "over 1 advisory reject") {
-		t.Errorf("resolution message missing override marker: %q", res.message)
+	for _, ev := range got {
+		if ev.kind == "advisory_reject_arbitrated" {
+			t.Errorf("advisory_reject_arbitrated must no longer be a page class; got %+v", ev)
+		}
 	}
 
-	// Clean approve (no preceding advisory reject) fires no resolution ping.
+	// Clean approve (no preceding reject) likewise produces no page event.
 	clean := []*audit.Entry{
 		startedEntry(10, "plan"),
 		reviewerVerdictEntry(11, "plan_reviewed", "approve", "claude-opus-4-8"),
 		approvalDecisionEntry(12, "approve"),
 	}
-	for _, ev := range pageClassEvents(clean, nil) {
-		if ev.kind == "advisory_reject_arbitrated" {
-			t.Errorf("clean approve must not fire a resolution ping; got %+v", ev)
-		}
+	if ev := pageClassEvents(clean, nil); len(ev) != 0 {
+		t.Errorf("clean approve chain must produce no page-class events; got %+v", ev)
+	}
+}
+
+// fixupEntry builds a stage_fixup_triggered audit entry (the implement-reject
+// resolver).
+func fixupEntry(seq int64) *audit.Entry {
+	return &audit.Entry{Sequence: seq, Category: "stage_fixup_triggered"}
+}
+
+// TestPageEventResolved covers proposal 2 of #1786: a reviewer-reject page is
+// "resolved" (→ firePings records the dedup row but skips the stale post) once
+// a later arbitration lands, and never for a non-reviewer-reject kind or a
+// resolver at an earlier/equal sequence.
+func TestPageEventResolved(t *testing.T) {
+	planReject := pageEvent{sequence: 11, kind: "plan_review_rejected"}
+	implReject := pageEvent{sequence: 11, kind: "implement_review_rejected"}
+
+	cases := []struct {
+		name    string
+		ev      pageEvent
+		entries []*audit.Entry
+		want    bool
+	}{
+		{
+			name:    "plan reject resolved by later approval_submitted",
+			ev:      planReject,
+			entries: []*audit.Entry{approvalDecisionEntry(12, "approve")},
+			want:    true,
+		},
+		{
+			name:    "plan reject resolved by a later reject decision too (gate arbitrated → replan)",
+			ev:      planReject,
+			entries: []*audit.Entry{approvalDecisionEntry(12, "reject")},
+			want:    true,
+		},
+		{
+			name:    "plan reject NOT resolved by a fixup (implement-only resolver)",
+			ev:      planReject,
+			entries: []*audit.Entry{fixupEntry(12)},
+			want:    false,
+		},
+		{
+			name:    "plan reject NOT resolved with no later approval",
+			ev:      planReject,
+			entries: nil,
+			want:    false,
+		},
+		{
+			name:    "plan reject NOT resolved by an EARLIER approval (seq <= ev)",
+			ev:      planReject,
+			entries: []*audit.Entry{approvalDecisionEntry(10, "approve"), approvalDecisionEntry(11, "approve")},
+			want:    false,
+		},
+		{
+			name:    "implement reject resolved by later stage_fixup_triggered",
+			ev:      implReject,
+			entries: []*audit.Entry{fixupEntry(12)},
+			want:    true,
+		},
+		{
+			name:    "implement reject resolved by later approval_submitted",
+			ev:      implReject,
+			entries: []*audit.Entry{approvalDecisionEntry(12, "approve")},
+			want:    true,
+		},
+		{
+			name:    "implement reject NOT resolved with no later resolver",
+			ev:      implReject,
+			entries: []*audit.Entry{fixupEntry(11)}, // equal sequence, not strictly greater
+			want:    false,
+		},
+		{
+			name:    "non-reviewer-reject kind never resolvable (always pages)",
+			ev:      pageEvent{sequence: 11, kind: "scope_amendment"},
+			entries: []*audit.Entry{approvalDecisionEntry(12, "approve"), fixupEntry(13)},
+			want:    false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pageEventResolved(tc.ev, tc.entries); got != tc.want {
+				t.Errorf("pageEventResolved = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

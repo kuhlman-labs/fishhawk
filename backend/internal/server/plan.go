@@ -1499,6 +1499,14 @@ func reviewerAgentVersionMismatch(ctx context.Context, inv reviewerInvocation) (
 func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel string, reviewBudget planreview.ReviewBudget) bool {
 	systemKind := audit.ActorKind("system")
 	hasRejection := false
+	// pagedRejectAppended tracks whether THIS loop appended a page-class
+	// audit entry — a plan_reviewed reject verdict (#1786). It is a strict
+	// subset of hasRejection: the agent-version-mismatch fail-loud path also
+	// sets hasRejection but emits plan_review_failed, which is NOT a
+	// page-class event. Gating the immediate hook on this (not on
+	// hasRejection or an unconditional call) keeps a non-page invocation from
+	// flushing OLDER unpinged page-class events at an unrelated moment.
+	pagedRejectAppended := false
 	budget := reviewBudget.Budget(len(promptText))
 	for i, inv := range invocations {
 		// An unresolvable provider is a deployment CAPABILITY gap, not a
@@ -1631,7 +1639,20 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 
 		if verdict.Verdict == planreview.VerdictReject {
 			hasRejection = true
+			pagedRejectAppended = true
 		}
+	}
+	// Fire the page-class ping immediately (#1786) so a plan-review reject
+	// pages the operator within the review append flow rather than riding the
+	// next transition — but ONLY when this loop actually appended a reject
+	// verdict (the page-class event). An all-approve loop, or a fail-loud
+	// agent-version-mismatch that emits no page-class entry, must not call the
+	// hook: NotifyPageClassForRun evaluates the full audit history, so an
+	// unconditional call here would flush an OLDER unpinged page-class event at
+	// this unrelated moment. Deduped on the source Sequence, so it never
+	// double-posts with notifyStatusUpdate.
+	if pagedRejectAppended {
+		s.notifyPageClass(ctx, runID, "plan_review")
 	}
 	return hasRejection
 }

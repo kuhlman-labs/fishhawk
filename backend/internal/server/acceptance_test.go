@@ -1545,6 +1545,73 @@ func TestTriageAcceptance_Idempotent(t *testing.T) {
 	}
 }
 
+// TestRecordAcceptance_FiresPageClassHook is one of the four
+// binding-condition-#2 site assertions (#1786): the acceptance record
+// handler invokes the pings-only immediate hook at its append site (after
+// triage), so a paged acceptance triage disposition pages the operator
+// within the record window rather than at the next transition.
+func TestRecordAcceptance_FiresPageClassHook(t *testing.T) {
+	s, _, _, au, _, runID, implementStageID, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	rec := &pageClassRecorder{}
+	s.issueNotifier = rec
+	// Exhaust the fix-up budget so triage routes to a PAGED disposition
+	// (fixup_unavailable_paged) — a genuine page-class event at this site.
+	fixupPayload, _ := json.Marshal(map[string]any{"stage_id": implementStageID.String()})
+	au.seeded = append(au.seeded, &audit.Entry{RunID: &runID, StageID: &implementStageID, Category: CategoryStageFixupTriggered, Payload: fixupPayload})
+	body := failedAcceptanceBytes(t, "error", []acceptanceCriterionResult{{ID: "ac-create", Result: "failed"}})
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if !rec.pagedRun(runID) {
+		t.Errorf("acceptance record site did not invoke the page-class hook; paged=%v", rec.pageClass)
+	}
+}
+
+// TestRecordAcceptance_AutoRoutedDisposition_SkipsPageClassHook proves the
+// #1786 gating condition, not merely call-site invocation: a class-1 error
+// verdict auto-routes to fixup_dispatched — an auto-routed disposition that
+// writes NO page-class acceptance_triage_decided event — so the record handler
+// must NOT invoke the immediate hook (which, evaluating the full audit history,
+// would flush an older unpinged event at this unrelated moment).
+func TestRecordAcceptance_AutoRoutedDisposition_SkipsPageClassHook(t *testing.T) {
+	s, _, _, au, _, runID, _, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	rec := &pageClassRecorder{}
+	s.issueNotifier = rec
+	// A class-1 error verdict with fix-up budget available routes to
+	// fixup_dispatched — an auto-routed (non-paged) disposition.
+	body := failedAcceptanceBytes(t, "error", []acceptanceCriterionResult{{ID: "ac-create", Result: "failed"}})
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if disp := acceptanceTriageDispositionOf([]byte(triagePayload(t, au))); disp != acceptanceDispositionFixupDispatched {
+		t.Fatalf("disposition = %q, want fixup_dispatched (auto-routed precondition)", disp)
+	}
+	if rec.pagedRun(runID) {
+		t.Errorf("acceptance record site fired the page-class hook on an auto-routed disposition; paged=%v", rec.pageClass)
+	}
+}
+
+// TestRecordAcceptance_PassedVerdict_SkipsPageClassHook: a passed verdict
+// triages nothing, so the record handler appends no page-class event and must
+// not invoke the immediate hook (#1786).
+func TestRecordAcceptance_PassedVerdict_SkipsPageClassHook(t *testing.T) {
+	s, _, _, _, _, runID, _, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
+	rec := &pageClassRecorder{}
+	s.issueNotifier = rec
+
+	w := shipAcceptanceRequest(t, s, runID, acceptanceStageID, priv, validAcceptanceBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if rec.pagedRun(runID) {
+		t.Errorf("acceptance record site fired the page-class hook on a passed verdict; paged=%v", rec.pageClass)
+	}
+}
+
 // TestTriageAcceptance_PassedVerdict_NoTriage: a passed verdict writes no
 // triage entry.
 func TestTriageAcceptance_PassedVerdict_NoTriage(t *testing.T) {
