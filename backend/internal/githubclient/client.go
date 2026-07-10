@@ -1003,6 +1003,85 @@ func (c *Client) CompareCommits(ctx context.Context, installationID int64,
 	return shas, nil
 }
 
+// PullRequestRef is one merged pull request associated with a commit,
+// as returned by ListPullRequestsForCommit: the number, the canonical
+// github.com URL, and the title. Only merged PRs are returned, so the
+// caller never sees an open/closed-unmerged association.
+type PullRequestRef struct {
+	Number int
+	URL    string
+	Title  string
+}
+
+// ListPullRequestsForCommit returns the MERGED pull requests associated
+// with a commit — the squash/merge commit that landed a PR carries the
+// PR in this list, which is how the release-evidence walk maps a commit
+// in a compare range back to its merged PR.
+//
+//	GET /repos/{owner}/{repo}/commits/{sha}/pulls
+//
+// Each PR object carries merged_at (null until merged); this filters to
+// the merged ones so an open PR that also touches the commit is
+// excluded. Returns a typed error (ErrNotFound / ErrValidation /
+// ErrForbidden) on non-2xx so callers can fail open on a transient
+// GitHub failure. Mirrors CompareCommits' TokenProvider guard, endpoint
+// building, and classifyStatus error mapping.
+//
+// No pagination: the number of PRs associated with a single commit is
+// tiny (in practice one — the PR the commit landed), far below the
+// per-page default.
+func (c *Client) ListPullRequestsForCommit(ctx context.Context, installationID int64,
+	repo RepoRef, sha string) ([]PullRequestRef, error) {
+	if c.Tokens == nil {
+		return nil, errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return nil, errors.New("githubclient: repo owner and name required")
+	}
+	if sha == "" {
+		return nil, errors.New("githubclient: commit sha required")
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/commits/" + escapePath(sha) + "/pulls")
+	req, err := c.buildRequest(ctx, http.MethodGet, endpoint, nil, installationID)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("githubclient: list pulls for commit: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if err := classifyStatus("list pulls for commit", resp); err != nil {
+		return nil, err
+	}
+	var body []struct {
+		Number   int     `json:"number"`
+		HTMLURL  string  `json:"html_url"`
+		Title    string  `json:"title"`
+		MergedAt *string `json:"merged_at"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("githubclient: decode pulls for commit: %w", err)
+	}
+	prs := make([]PullRequestRef, 0, len(body))
+	for _, p := range body {
+		// merged_at is null until the PR merges; skip any PR associated
+		// with the commit that has not merged (an open PR touching it).
+		if p.MergedAt == nil {
+			continue
+		}
+		prs = append(prs, PullRequestRef{
+			Number: p.Number,
+			URL:    p.HTMLURL,
+			Title:  p.Title,
+		})
+	}
+	return prs, nil
+}
+
 // compareFilesCap is GitHub's documented per-response changed-file
 // ceiling for the Compare API: a comparison touching more than 300 files
 // returns only the first 300 in `files`. The consolidated decomposition
