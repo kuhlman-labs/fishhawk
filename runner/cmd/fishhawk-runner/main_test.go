@@ -10551,6 +10551,99 @@ func TestVerifyCommittedTree_StripsRunnerCredsFromSubprocess(t *testing.T) {
 	}
 }
 
+// extractEnvGateVal pulls the value of a "KEY=..." line out of a gate
+// subprocess's captured output. It works both for a raw combined-output string
+// (runVerifyCommittedTree returns the env dump verbatim) and for a JSON-encoded
+// verify_run payload (runVerifyGate embeds the env dump in an "output" field):
+// the value ends at the first real newline, JSON-escape backslash, or closing
+// quote, none of which appear in a temp-dir path.
+func extractEnvGateVal(s, key string) string {
+	prefix := key + "="
+	idx := strings.Index(s, prefix)
+	if idx < 0 {
+		return ""
+	}
+	rest := s[idx+len(prefix):]
+	if end := strings.IndexAny(rest, "\n\"\\"); end >= 0 {
+		return rest[:end]
+	}
+	return rest
+}
+
+// TestVerifyCommittedTree_IsolatesLintCachePerInvocation is the #1796 repro in
+// test form for the committed-tree gate. With an ambient
+// GOLANGCI_LINT_CACHE=/shared planted, two runVerifyCommittedTree invocations
+// must each see a GOLANGCI_LINT_CACHE that is non-empty, differs from the
+// ambient /shared, and differs BETWEEN the invocations — proving the linter's
+// path-keyed analysis cache is isolated per verify-gate invocation so one local
+// run's cached results can't leak into another's re-verify. Asserting the
+// observed subprocess-env value (not mere edit presence) means a no-op touch
+// fails this test (Done-means test rule, #1169).
+func TestVerifyCommittedTree_IsolatesLintCachePerInvocation(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	t.Setenv("GOLANGCI_LINT_CACHE", "/shared")
+
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "f.txt"), "seed\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "seed commit")
+	head := gitHead(t, repo)
+
+	_, out1, _ := runVerifyCommittedTree(context.Background(), "env", repo, head, time.Minute)
+	_, out2, _ := runVerifyCommittedTree(context.Background(), "env", repo, head, time.Minute)
+
+	c1 := extractEnvGateVal(out1, "GOLANGCI_LINT_CACHE")
+	c2 := extractEnvGateVal(out2, "GOLANGCI_LINT_CACHE")
+	if c1 == "" || c2 == "" {
+		t.Fatalf("gate subprocess saw empty GOLANGCI_LINT_CACHE: c1=%q c2=%q\nout1:\n%s\nout2:\n%s", c1, c2, out1, out2)
+	}
+	if c1 == "/shared" || c2 == "/shared" {
+		t.Errorf("gate subprocess saw the ambient /shared cache instead of a per-invocation dir: c1=%q c2=%q", c1, c2)
+	}
+	if c1 == c2 {
+		t.Errorf("both invocations shared one cache dir %q; each must be disjoint", c1)
+	}
+}
+
+// TestVerifyGate_IsolatesLintCachePerInvocation covers the SECOND wired call
+// site — the working-tree gate (runVerifyGate) — per the operator's binding
+// approval condition that BOTH wired sites be proven to receive a non-ambient,
+// per-invocation GOLANGCI_LINT_CACHE. Same shape as the committed-tree twin:
+// two invocations under an ambient /shared must each see a non-empty cache dir
+// that differs from /shared and from each other.
+func TestVerifyGate_IsolatesLintCachePerInvocation(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available")
+	}
+	t.Setenv("GOLANGCI_LINT_CACHE", "/shared")
+
+	ev1, err := runVerifyGate(context.Background(), config{verifyCmd: "env"}, io.Discard)
+	if err != nil {
+		t.Fatalf("env should exit 0, got %v\npayload: %s", err, ev1.Payload)
+	}
+	ev2, err := runVerifyGate(context.Background(), config{verifyCmd: "env"}, io.Discard)
+	if err != nil {
+		t.Fatalf("env should exit 0, got %v\npayload: %s", err, ev2.Payload)
+	}
+
+	c1 := extractEnvGateVal(string(ev1.Payload), "GOLANGCI_LINT_CACHE")
+	c2 := extractEnvGateVal(string(ev2.Payload), "GOLANGCI_LINT_CACHE")
+	if c1 == "" || c2 == "" {
+		t.Fatalf("gate subprocess saw empty GOLANGCI_LINT_CACHE: c1=%q c2=%q\npayload1: %s\npayload2: %s", c1, c2, ev1.Payload, ev2.Payload)
+	}
+	if c1 == "/shared" || c2 == "/shared" {
+		t.Errorf("gate subprocess saw the ambient /shared cache instead of a per-invocation dir: c1=%q c2=%q", c1, c2)
+	}
+	if c1 == c2 {
+		t.Errorf("both invocations shared one cache dir %q; each must be disjoint", c1)
+	}
+}
+
 // TestVerifyCommittedTreeCompiles_GateSubprocessEnvStripped covers the
 // go-toolchain gate exec sites (go work edit / go vet / go test inside
 // verifyCommittedTreeCompiles). It plants a sentinel runner secret, then

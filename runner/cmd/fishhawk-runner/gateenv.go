@@ -146,6 +146,33 @@ func redactURLEntryUserinfo(entry string) string {
 	return u.String()
 }
 
+// withIsolatedLintCache returns a copy of env with GOLANGCI_LINT_CACHE forced to
+// cacheDir, dropping any inherited GOLANGCI_LINT_CACHE= entry first so the
+// override cannot be undercut by an ambient value regardless of the platform's
+// os/exec.Cmd duplicate-key env semantics (which are not documented to be
+// "last wins"; see https://pkg.go.dev/os/exec#Cmd — Env is passed as-is with no
+// dedup guarantee).
+//
+// golangci-lint keys its analysis cache by ABSOLUTE file path and shares one
+// cache dir across processes when GOLANGCI_LINT_CACHE is unset (falling back to
+// os.UserCacheDir()/golangci-lint). Under the shared local gitdir, two
+// concurrent runs' lineage worktrees carry distinct absolute paths, so run A's
+// cached lint results could surface in run B's strict re-verify — a spurious
+// category-B (#1796). Isolating the linter cache per verify-gate invocation
+// makes that leak impossible. GOCACHE is deliberately left SHARED: the Go build
+// cache is content-addressed (not path-keyed) and safe across worktrees, so
+// sharing it keeps compilation warm; only the linter analysis re-runs cold.
+func withIsolatedLintCache(env []string, cacheDir string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GOLANGCI_LINT_CACHE=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, "GOLANGCI_LINT_CACHE="+cacheDir)
+}
+
 // gateEnvAllowed reports whether key is on the allow-list (exact match or an
 // allowed prefix).
 func gateEnvAllowed(key string) bool {
