@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 // prEventsRunRepo is the run.Repository surface the
@@ -1011,6 +1012,70 @@ func TestResolveReviewOnMerge_ClosedWithoutMerge_NoPostMergeObserved(t *testing.
 
 	if n := countCategory(ar.appended, CategoryPostMergeObserved); n != 0 {
 		t.Fatalf("post_merge_observed rows = %d, want 0 on a closed-without-merge resolution; got %v", n, auditCategories(ar.appended))
+	}
+}
+
+// TestResolveReviewOnMerge_NoReviewStage_EmitsRunMergedBoardTransition is the
+// #1815 done-means assertion for step 1: an implement-only (no review stage)
+// merge must advance the work item to Done via the run_merged board edge —
+// exactly like the review-path sibling. It drives the full webhook-resolver ->
+// board-sync hook -> registered Transitioner seam and asserts BOTH the single
+// run_merged/Done Transition call AND a work_item_transitioned audit row.
+// Against the pre-fix code (no notifyBoardTransition in the no-review branch)
+// it fails: neither the Transition call nor the audit row is emitted.
+func TestResolveReviewOnMerge_NoReviewStage_EmitsRunMergedBoardTransition(t *testing.T) {
+	prev := conventionsLoader
+	conventionsLoader = func(string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	fp := &fakeTransitionProvider{}
+	registerTransitionProvider(t, fp)
+
+	runID := uuid.New()
+	prURL := "https://github.com/kuhlman-labs/fishhawk/pull/42"
+	inst := int64(99)
+	ref := "issue:1815"
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{{
+			ID:             runID,
+			Repo:           "kuhlman-labs/fishhawk",
+			PullRequestURL: &prURL,
+			TriggerRef:     &ref,
+			InstallationID: &inst,
+		}},
+		stages: map[uuid.UUID][]*run.Stage{
+			runID: {{ID: uuid.New(), RunID: runID, Type: run.StageTypeImplement, State: run.StageStateSucceeded}},
+		},
+	}
+	ar := &prEventsAuditRepo{}
+	s := prEventsTestServer(t, rr, ar)
+
+	payload, _ := json.Marshal(map[string]any{
+		"pull_request": map[string]any{
+			"html_url":  prURL,
+			"merged":    true,
+			"merged_by": map[string]any{"login": "alice"},
+			"head":      map[string]any{"sha": "h"},
+			"base":      map[string]any{"sha": "b"},
+		},
+	})
+	s.handlePullRequestClosed(context.Background(), payload)
+
+	if len(fp.calls) != 1 {
+		t.Fatalf("Transition calls = %d, want exactly 1 (the run_merged/Done board move)", len(fp.calls))
+	}
+	got := fp.calls[0]
+	if got.Trigger != lifecycleRunMerged {
+		t.Errorf("trigger = %q, want %q", got.Trigger, lifecycleRunMerged)
+	}
+	if got.CanonicalState != workmgmt.CanonicalStateDone {
+		t.Errorf("canonical state = %q, want %q", got.CanonicalState, workmgmt.CanonicalStateDone)
+	}
+	if got.IssueNumber != 1815 {
+		t.Errorf("issue number = %d, want 1815", got.IssueNumber)
+	}
+	if n := countCategory(ar.appended, categoryWorkItemTransitioned); n != 1 {
+		t.Fatalf("work_item_transitioned rows = %d, want exactly 1; got %v", n, auditCategories(ar.appended))
 	}
 }
 

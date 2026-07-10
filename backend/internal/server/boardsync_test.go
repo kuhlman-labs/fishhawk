@@ -104,7 +104,7 @@ func TestNotifyBoardTransition_LifecycleSeam(t *testing.T) {
 	}{
 		{lifecycleRunStarted, workmgmt.CanonicalStateInProgress, []string{workmgmt.CanonicalStateBacklog}},
 		{lifecyclePROpened, workmgmt.CanonicalStateInReview, []string{workmgmt.CanonicalStateInProgress}},
-		{lifecycleRunMerged, workmgmt.CanonicalStateDone, []string{workmgmt.CanonicalStateInReview, workmgmt.CanonicalStateInProgress}},
+		{lifecycleRunMerged, workmgmt.CanonicalStateDone, []string{workmgmt.CanonicalStateInReview, workmgmt.CanonicalStateInProgress, workmgmt.CanonicalStateBlocked}},
 		{lifecycleRunFailed, workmgmt.CanonicalStateBlocked, []string{workmgmt.CanonicalStateInProgress, workmgmt.CanonicalStateInReview}},
 	}
 	for _, tc := range cases {
@@ -152,6 +152,44 @@ func TestNotifyBoardTransition_LifecycleSeam(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestExpectedSourceStates_RunMerged_IncludesBlocked pins the #1815 fix at the
+// derivation layer: run_merged's expected-source set must include Blocked (the
+// run_failed target in the Default conventions) so a Blocked-parked card the
+// prior run_failed edge left behind is an expected source for the Done move —
+// alongside the InReview / InProgress sources it already carried. The negative
+// assertion pins never-fight-the-human unchanged for genuinely-parked columns:
+// pr_opened's expected-source set must NOT gain Blocked, so no OTHER lifecycle
+// edge can advance a Blocked card.
+func TestExpectedSourceStates_RunMerged_IncludesBlocked(t *testing.T) {
+	conv := workmgmt.Default()
+
+	merged := expectedSourceStates(lifecycleRunMerged, conv)
+	for _, want := range []string{
+		workmgmt.CanonicalStateBlocked,
+		workmgmt.CanonicalStateInReview,
+		workmgmt.CanonicalStateInProgress,
+	} {
+		if !containsState(merged, want) {
+			t.Errorf("expectedSourceStates(run_merged) = %v, want to contain %q", merged, want)
+		}
+	}
+
+	opened := expectedSourceStates(lifecyclePROpened, conv)
+	if containsState(opened, workmgmt.CanonicalStateBlocked) {
+		t.Errorf("expectedSourceStates(pr_opened) = %v, must NOT contain %q (never-fight-the-human)", opened, workmgmt.CanonicalStateBlocked)
+	}
+}
+
+// containsState reports whether states contains want.
+func containsState(states []string, want string) bool {
+	for _, s := range states {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 // TestNotifyBoardTransition_AuditsSkip asserts a deliberate provider skip (the
