@@ -10,6 +10,7 @@ it.
 | Surface | Audit category | Audit kind | Caller (production) | First posted | Edits in place? |
 |---|---|---|---|---|---|
 | Living anchor | `status_comment_posted` | `status_update` | `Dispatcher.Handle` (run create); `Server.notifyStatusUpdate` (every stage transition); `Server.notifyPlanReady` (plan-stage terminal) | run dispatch | Yes — one comment per run, every transition rebuilds + edits the same comment id |
+| PR status comment | `pr_status_comment_posted` | `pr_status_update` | `Server.notifyStatusUpdate` via `issuecomment.Notifier.NotifyStatusUpdateForRun` (folded in after the anchor edit) | PR first observed / `pull_request_url` stamped | Yes — one comment per PR, rebuilt on every transition + edited in place (identical body skips the edit) |
 | Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, advisory-reject arbitrated, must_page_human, clarification request / awaiting_input park, CI failure, acceptance triage paged, campaign gate hand-off) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor |
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
 | Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688, #1371) | crossing of an advisory periodic-budget ladder rung — `warn` / `over` / `ack_required` (≥2x) / `page` (≥3x) | No (per-`(period_start, tier)` dedup; each tier posts once per calendar period) |
@@ -92,6 +93,49 @@ Notes:
   (65,536) by a degradation ladder that drops the **economics block first**
   (display-only, derived), then the timeline, then superseded plans, always
   preserving the header, the current plan summary, and the dashboard deep-link.
+- **Sticky PR status comment (E42.1 / #1784).** The PR-locus sibling of the
+  living anchor: ONE system-owned comment per PR, edited in place, projecting
+  the subset a human deciding the merge needs on the PR page itself — a
+  merge-scoped "what now" line, the CURRENT-round `implement` review verdicts
+  (reusing the anchor's `renderStageReviews` / current-round isolation), the
+  acceptance outcome with a **per-criterion table** (id, pass/fail/skip, basis)
+  + validated target URL + head SHA + triage disposition, and fix-up history
+  (one line per `fixup_pushed` pass). It carries **NO plan / scope / approach
+  dump** — that material is issue-locus and stays on the anchor. Rendered by the
+  pure `RenderPRStatusBody` (`pr_status_template.go`) and maintained by a
+  best-effort `maybeUpdatePRStatusComment` folded into
+  `NotifyStatusUpdateForRun` AFTER the anchor edit, so every existing rebuild
+  hook maintains it with no new call site and no `Channel`-interface change.
+  Discipline:
+  - **Owns-PR only.** Skipped unless the run has a non-empty `pull_request_url`
+    AND an installation id (identical to the `stampEconomicsIntoPRBody` guard),
+    so it is maintained only for runs that own the PR.
+  - **Fail-open.** Every skip and every GitHub / artifact-load / audit error is
+    swallowed to `nil` — a PR-comment failure never unwinds a transition or
+    blocks the page-class pings.
+  - **Dedup / identical-body skip.** The comment id + a body hash are persisted
+    on a `pr_status_comment_posted` audit row (following the
+    `status_comment_posted` precedent — NO new DB column). A rebuild whose
+    freshly rendered body hashes identically to the last row skips the GitHub
+    edit (mirroring the economics-stamp no-op-on-redelivery posture). An
+    operator-deleted comment (`ErrNotFound` on edit) is re-created.
+  - **Per-criterion table source.** The table is loaded from the
+    `KindAcceptance` artifact body via `ListForStage` — the per-criterion
+    detail is NOT in the `acceptance_outcome_recorded` audit payload (which
+    carries only aggregate tallies + `target_url` + `head_sha`). When the
+    artifact is unretrievable the table degrades to the tally line.
+  - **Body cap.** Capped at `MaxIssueCommentBodyBytes` by a degradation ladder
+    that drops the acceptance criteria table detail first (collapsing to the
+    tally line), then the fix-up history, always preserving the header, the
+    reviews, the acceptance outcome, and the footer.
+  - `pr_status_comment_posted` is a distinct category from
+    `status_comment_posted` so the two comments never collide on comment-id
+    lookup; it is deliberately NOT added to the anchor timeline's
+    `activityCategories` (it is system-comment bookkeeping, not a timeline
+    activity, like `status_comment_posted`).
+  - The **#1702 economics stamp stays in the PR BODY**
+    (`Server.resolveReviewStageOnMerge`); folding it into this comment is out of
+    scope for this change.
 - **Page-class pings (`anchor_ping_posted`).** GitHub does not notify on
   comment EDITS, so a state change that needs a human is announced by a
   one-line NEW comment linking to the anchor. Page-class events are derived

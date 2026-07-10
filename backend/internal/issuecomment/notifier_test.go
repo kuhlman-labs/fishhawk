@@ -3,6 +3,7 @@ package issuecomment_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -752,46 +753,63 @@ func TestStatusComment_Lifecycle(t *testing.T) {
 	}
 
 	// Step 5: PR opened (pullrequest handler). PR URL is stamped on
-	// the run; review stage moves to awaiting_approval.
-	prURL := "https://github.com/x/y/pull/42"
+	// the run; review stage moves to awaiting_approval. Now that the run
+	// OWNS a PR, the sticky PR status comment (#1784) fires too: the anchor
+	// edit lands on id=1 (update #4) and a NEW PR comment is CREATED (id=2)
+	// on the PR number (77, distinct from the issue number 42).
+	prURL := "https://github.com/x/y/pull/77"
 	r.PullRequestURL = &prURL
 	reviewStage.State = run.StageStateAwaitingApproval
 	if err := n.NotifyStatusUpdateForRun(ctx, runID); err != nil {
 		t.Fatalf("step 5 PR opened: %v", err)
 	}
-	if len(gh.calls) != 1 || len(gh.updateCalls) != 4 {
-		t.Fatalf("step 5: expected 1 create + 4 updates; got %d + %d", len(gh.calls), len(gh.updateCalls))
+	if len(gh.calls) != 2 || len(gh.updateCalls) != 4 {
+		t.Fatalf("step 5: expected 2 creates (anchor + PR) + 4 updates; got %d + %d", len(gh.calls), len(gh.updateCalls))
 	}
+	// The step-5 anchor edit (update #4, index 3) carries the PR link.
 	if !strings.Contains(gh.updateCalls[3].body, prURL) {
-		t.Errorf("step 5: comment body should contain PR URL: %q", gh.updateCalls[3].body)
+		t.Errorf("step 5: anchor comment body should contain PR URL: %q", gh.updateCalls[3].body)
 	}
 
 	// Step 6: PR merged (PR-events handler). Review stage succeeds,
-	// run state moves to succeeded.
+	// run state moves to succeeded. Anchor edits id=1 (update #5) and the PR
+	// comment (body now differs) edits id=2 (update #6).
 	reviewStage.State = run.StageStateSucceeded
 	r.State = run.StateSucceeded
 	if err := n.NotifyStatusUpdateForRun(ctx, runID); err != nil {
 		t.Fatalf("step 6 PR merged: %v", err)
 	}
-	if len(gh.calls) != 1 || len(gh.updateCalls) != 5 {
-		t.Fatalf("step 6: expected 1 create + 5 updates; got %d + %d", len(gh.calls), len(gh.updateCalls))
+	if len(gh.calls) != 2 || len(gh.updateCalls) != 6 {
+		t.Fatalf("step 6: expected 2 creates + 6 updates; got %d + %d", len(gh.calls), len(gh.updateCalls))
 	}
 
-	// All updates must target the same comment id — the test fails
-	// loudly if the dedup ever races and creates a second comment.
+	// Every update targets either the anchor (id=1) or the PR comment (id=2) —
+	// the test fails loudly if the dedup ever races and stacks a third comment.
 	for i, upd := range gh.updateCalls {
-		if upd.commentID != 1 {
-			t.Errorf("update %d targeted comment id %d; expected stable id=1 across lifecycle",
+		if upd.commentID != 1 && upd.commentID != 2 {
+			t.Errorf("update %d targeted comment id %d; expected the anchor (1) or PR comment (2)",
 				i, upd.commentID)
 		}
 	}
+	// No stacking: exactly one anchor create (issue 42) and one PR create (77).
+	if got := prCreateCount(gh, 42); got != 1 {
+		t.Errorf("anchor create count = %d, want 1 (no stacking)", got)
+	}
+	if got := prCreateCount(gh, 77); got != 1 {
+		t.Errorf("PR-comment create count = %d, want 1 (no stacking)", got)
+	}
 
-	// Final body should reflect the succeeded state and carry both
-	// the run link and the PR link.
-	finalBody := gh.updateCalls[len(gh.updateCalls)-1].body
+	// The final ANCHOR body should reflect the succeeded state and carry both
+	// the run link and the PR link. Select the last update targeting id=1.
+	var finalBody string
+	for _, upd := range gh.updateCalls {
+		if upd.commentID == 1 {
+			finalBody = upd.body
+		}
+	}
 	for _, want := range []string{"succeeded", "Pull request", prURL, "View run"} {
 		if !strings.Contains(finalBody, want) {
-			t.Errorf("final body missing %q\n---\n%s", want, finalBody)
+			t.Errorf("final anchor body missing %q\n---\n%s", want, finalBody)
 		}
 	}
 
@@ -1116,6 +1134,12 @@ type fakeGitHub struct {
 	updateCalls []ghUpdateCommentCall
 	err         error
 	updateErr   error
+	// failOnIssueNumber, when non-zero, fails CreateIssueComment ONLY for that
+	// issue/PR number — so a PR-status-comment test can fail the PR-locus post
+	// (posted to the PR number) while leaving the anchor post (posted to the
+	// triggering issue number) succeeding. Used to prove PR-comment fail-open
+	// independently of the anchor.
+	failOnIssueNumber int
 }
 
 func (f *fakeGitHub) CreateIssueComment(_ context.Context, installationID int64, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
@@ -1124,6 +1148,9 @@ func (f *fakeGitHub) CreateIssueComment(_ context.Context, installationID int64,
 	f.calls = append(f.calls, ghCommentCall{installationID: installationID, repo: repo, issueNumber: issueNumber, body: body})
 	if f.err != nil {
 		return nil, f.err
+	}
+	if f.failOnIssueNumber != 0 && issueNumber == f.failOnIssueNumber {
+		return nil, errors.New("fake github: create failed for issue/PR number")
 	}
 	// Synthesize an id deterministically from the call index so
 	// status-comment tests can predict the comment id without
@@ -1591,5 +1618,248 @@ func TestBuildRunEconomics_SynthesizesCIGreenGate(t *testing.T) {
 	}
 	if checksGreen != 900 {
 		t.Errorf("checks_green_to_merge wait = %v, want 900 (synthesized from run_auto_advanced)", checksGreen)
+	}
+}
+
+// ---------------------------------------------------------------------
+// Sticky PR status comment cross-boundary integration (E42.1 / #1784).
+// ---------------------------------------------------------------------
+
+// prStatusDeps wires a Notifier against an issue-triggered run that OWNS a PR
+// (non-empty pull_request_url) with an acceptance stage and an artifact lister,
+// so NotifyStatusUpdateForRun maintains both the issue anchor and the PR status
+// comment. The returned run pointer is mutable so a test can change state
+// between rebuilds. PR number = 7, issue number = 42.
+func prStatusDeps(t *testing.T) (runID, acceptanceStageID uuid.UUID, runRow *run.Run, gh *fakeGitHub, au *fakeAudit, arts *fakeArtifacts, n *issuecomment.Notifier) {
+	t.Helper()
+	runID = uuid.New()
+	acceptanceStageID = uuid.New()
+	triggerRef := "issue:42"
+	prURL := "https://github.com/x/y/pull/7"
+	runRow = &run.Run{
+		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
+		TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef,
+		InstallationID: int64Ptr(99), State: run.StateRunning,
+		PullRequestURL: &prURL,
+	}
+	stages := []*run.Stage{
+		{ID: uuid.New(), RunID: runID, Sequence: 1, Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+		{ID: acceptanceStageID, RunID: runID, Sequence: 2, Type: run.StageTypeAcceptance, State: run.StageStateSucceeded},
+	}
+	repoRuns := &fakeRuns{
+		runs:   map[uuid.UUID]*run.Run{runID: runRow},
+		stages: map[uuid.UUID][]*run.Stage{runID: stages},
+	}
+	gh = &fakeGitHub{}
+	au = &fakeAudit{}
+	arts = &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{}}
+	n = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: repoRuns, Audit: au, Artifacts: arts,
+		ExternalURL: "https://app.example",
+		Now:         func() time.Time { return time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC) },
+	})
+	if n == nil {
+		t.Fatal("notifier nil")
+	}
+	return runID, acceptanceStageID, runRow, gh, au, arts, n
+}
+
+func prCreateCount(gh *fakeGitHub, issueNumber int) int {
+	gh.mu.Lock()
+	defer gh.mu.Unlock()
+	c := 0
+	for _, call := range gh.calls {
+		if call.issueNumber == issueNumber {
+			c++
+		}
+	}
+	return c
+}
+
+func prUpdateCount(gh *fakeGitHub, commentID int64) int {
+	gh.mu.Lock()
+	defer gh.mu.Unlock()
+	c := 0
+	for _, call := range gh.updateCalls {
+		if call.commentID == commentID {
+			c++
+		}
+	}
+	return c
+}
+
+func prStatusAuditCount(au *fakeAudit) int {
+	c := 0
+	for _, p := range au.appended {
+		if p.Category == issuecomment.CategoryPRStatusCommentPosted {
+			c++
+		}
+	}
+	return c
+}
+
+// TestPRStatusComment_CreatesThenEditsSameComment: the first rebuild after
+// pull_request_url is stamped CREATES exactly one PR comment; a second rebuild
+// (state changed so the body differs) EDITS the same comment id — no stacking.
+func TestPRStatusComment_CreatesThenEditsSameComment(t *testing.T) {
+	runID, _, runRow, gh, au, _, n := prStatusDeps(t)
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("first rebuild: %v", err)
+	}
+	// Anchor create → id 1 (issue 42); PR create → id 2 (issue/PR 7).
+	if got := prCreateCount(gh, 7); got != 1 {
+		t.Fatalf("expected 1 PR create; got %d", got)
+	}
+	if got := prStatusAuditCount(au); got != 1 {
+		t.Fatalf("expected 1 pr_status_comment_posted row; got %d", got)
+	}
+
+	// Change state so the rendered PR body differs, forcing an edit.
+	runRow.State = run.StateSucceeded
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("second rebuild: %v", err)
+	}
+	if got := prCreateCount(gh, 7); got != 1 {
+		t.Errorf("PR comment stacked: expected 1 create total, got %d", got)
+	}
+	if got := prUpdateCount(gh, 2); got != 1 {
+		t.Errorf("expected 1 PR edit on comment id 2; got %d", got)
+	}
+}
+
+// TestPRStatusComment_IdenticalBodySkipsEdit: a second rebuild with no state
+// change renders an identical body, so the GitHub edit is skipped (no PATCH).
+func TestPRStatusComment_IdenticalBodySkipsEdit(t *testing.T) {
+	runID, _, _, gh, au, _, n := prStatusDeps(t)
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("first rebuild: %v", err)
+	}
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("second rebuild: %v", err)
+	}
+	// PR comment id 2 must NOT have been edited (identical body → skip).
+	if got := prUpdateCount(gh, 2); got != 0 {
+		t.Errorf("identical body should skip the PR edit; got %d PATCH(es)", got)
+	}
+	if got := prStatusAuditCount(au); got != 1 {
+		t.Errorf("skip should not append a second audit row; got %d", got)
+	}
+}
+
+// TestPRStatusComment_SkipsWhenNoPR: a run without pull_request_url is skipped
+// (owns-PR-only guard) — the anchor still posts, but no PR comment.
+func TestPRStatusComment_SkipsWhenNoPR(t *testing.T) {
+	runID, _, runRow, gh, au, _, n := prStatusDeps(t)
+	runRow.PullRequestURL = nil // does not own a PR
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if got := prCreateCount(gh, 7); got != 0 {
+		t.Errorf("no PR comment should be created without pull_request_url; got %d", got)
+	}
+	if got := prStatusAuditCount(au); got != 0 {
+		t.Errorf("no pr_status_comment_posted row without a PR; got %d", got)
+	}
+	// The anchor still posted to the issue.
+	if got := prCreateCount(gh, 42); got != 1 {
+		t.Errorf("anchor comment should still be created; got %d", got)
+	}
+}
+
+// TestPRStatusComment_GitHubErrorSwallowed: a PR-comment post failure is
+// swallowed — NotifyStatusUpdateForRun still returns nil and the anchor update
+// is unaffected (fail-open).
+func TestPRStatusComment_GitHubErrorSwallowed(t *testing.T) {
+	runID, _, _, gh, au, _, n := prStatusDeps(t)
+	gh.failOnIssueNumber = 7 // fail only the PR-locus create, not the anchor
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("PR-comment failure must not propagate; got %v", err)
+	}
+	if got := prStatusAuditCount(au); got != 0 {
+		t.Errorf("failed post must not append an audit row; got %d", got)
+	}
+	// The anchor comment landed despite the PR-comment failure.
+	if got := prCreateCount(gh, 42); got != 1 {
+		t.Errorf("anchor comment unaffected: expected 1 create; got %d", got)
+	}
+}
+
+// TestPRStatusComment_DeletedCommentRecreated: an operator-deleted PR comment
+// (ErrNotFound on edit) is re-created rather than left stale.
+func TestPRStatusComment_DeletedCommentRecreated(t *testing.T) {
+	runID, _, _, gh, au, _, n := prStatusDeps(t)
+	// Seed a prior PR comment id with a stale hash so the rebuild attempts an
+	// edit (hash differs) rather than skipping.
+	au.preSeed(runID, issuecomment.CategoryPRStatusCommentPosted, map[string]any{
+		"kind": "pr_status_update", "pr_number": 7, "repo": "x/y",
+		"github_comment_id": 555, "body_hash": "stale",
+	})
+	gh.updateErr = githubclient.ErrNotFound // the comment was deleted
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	// The edit 404'd, so a fresh create to the PR number happened.
+	if got := prCreateCount(gh, 7); got != 1 {
+		t.Errorf("deleted comment should be re-created; got %d PR create(s)", got)
+	}
+	if got := prStatusAuditCount(au); got != 1 {
+		t.Errorf("re-create should append one fresh audit row; got %d", got)
+	}
+}
+
+// TestPRStatusComment_LoadsAcceptanceArtifact: an acceptance_outcome_recorded
+// entry causes the KindAcceptance artifact to be loaded and the per-criterion
+// table to render in the PR comment.
+func TestPRStatusComment_LoadsAcceptanceArtifact(t *testing.T) {
+	runID, acceptanceStageID, _, gh, au, arts, n := prStatusDeps(t)
+
+	// The KindAcceptance artifact carries the per-criterion detail (absent from
+	// the audit payload).
+	body, _ := json.Marshal(map[string]any{
+		"verdict": "failed",
+		"criteria": []map[string]any{
+			{"id": "AC-1", "result": "passed", "expectation_basis": "issue statement"},
+			{"id": "AC-2", "result": "failed", "observed": "returned 500"},
+		},
+	})
+	arts.byStage[acceptanceStageID] = []*artifact.Artifact{
+		{ID: uuid.New(), StageID: acceptanceStageID, Kind: artifact.KindAcceptance, ContentHash: "h1", Content: body},
+	}
+	// The outcome audit row references the acceptance stage + content hash so
+	// loadAcceptanceArtifact resolves the artifact above.
+	au.preSeed(runID, "acceptance_outcome_recorded", map[string]any{
+		"outcome": "rejected", "criteria_passed": 1, "criteria_total": 2,
+		"stage_id": acceptanceStageID.String(), "content_hash": "h1",
+	})
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+
+	// Find the PR-locus create (issue/PR number 7).
+	var prBody string
+	gh.mu.Lock()
+	for _, c := range gh.calls {
+		if c.issueNumber == 7 {
+			prBody = c.body
+		}
+	}
+	gh.mu.Unlock()
+	if prBody == "" {
+		t.Fatal("no PR comment was created")
+	}
+	for _, want := range []string{
+		"| Criterion | Result | Basis |",
+		"| `AC-1` | ✅ pass | issue statement |",
+		"| `AC-2` | ❌ fail | returned 500 |",
+	} {
+		if !strings.Contains(prBody, want) {
+			t.Errorf("PR comment missing acceptance table row %q:\n%s", want, prBody)
+		}
 	}
 }
