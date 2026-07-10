@@ -6056,7 +6056,9 @@ func TestBuild_Acceptance_RendersCriteriaAndOutOfScope(t *testing.T) {
 		"assertion_fail",
 		"`expectation_basis`",
 		"`repro_handle`",
-		AcceptanceVerdictPath,
+		// No AcceptanceRunID/StageID on this trigger, so the output contract
+		// falls back to the legacy fixed path (#1780).
+		LegacyAcceptanceVerdictPath,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("acceptance prompt missing %q\n---\n%s", want, got)
@@ -6065,20 +6067,44 @@ func TestBuild_Acceptance_RendersCriteriaAndOutOfScope(t *testing.T) {
 }
 
 // TestBuild_Acceptance_OutputContractFileFallback pins the transport-fallback
-// line (E31.7 / #1535): the output contract names /tmp/fishhawk-acceptance.json
-// as the single-JSON-object fallback for adapters without a structured-output
-// channel (the codex path), mirroring the plan prompt's PlanArtifactPath
-// convention.
+// line (E31.7 / #1535, keyed in #1780): the output contract names the run/stage-
+// keyed /tmp/fishhawk-acceptance-<run>-<stage>.json path when the acceptance
+// Trigger threads both ids (the normal dispatch), and falls back to the legacy
+// fixed /tmp/fishhawk-acceptance.json when either id is empty. The runner mirrors
+// both format strings byte-identically.
 func TestBuild_Acceptance_OutputContractFileFallback(t *testing.T) {
-	got, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	const runID = "11111111-2222-3333-4444-555555555555"
+	const stageID = "66666666-7777-8888-9999-000000000000"
+
+	// With both ids set, the contract names the fully-substituted KEYED path.
+	keyed, err := Build("acceptance", Trigger{
+		Repo:              "x/y",
+		ApprovedPlan:      acceptanceFixturePlan(),
+		AcceptanceRunID:   runID,
+		AcceptanceStageID: stageID,
+	})
 	if err != nil {
-		t.Fatalf("Build(acceptance): %v", err)
+		t.Fatalf("Build(acceptance) keyed: %v", err)
 	}
-	if !strings.Contains(got, "write the verdict as a single JSON object to "+AcceptanceVerdictPath) {
-		t.Errorf("acceptance prompt missing the %s file-fallback contract line:\n%s", AcceptanceVerdictPath, got)
+	wantKeyed := "/tmp/fishhawk-acceptance-" + runID + "-" + stageID + ".json"
+	if AcceptanceVerdictPath(runID, stageID) != wantKeyed {
+		t.Errorf("AcceptanceVerdictPath(%q,%q) = %q, want %q (the runner mirrors this exact format)",
+			runID, stageID, AcceptanceVerdictPath(runID, stageID), wantKeyed)
 	}
-	if AcceptanceVerdictPath != "/tmp/fishhawk-acceptance.json" {
-		t.Errorf("AcceptanceVerdictPath = %q, want /tmp/fishhawk-acceptance.json (the runner mirrors this exact path)", AcceptanceVerdictPath)
+	if !strings.Contains(keyed, "write the verdict as a single JSON object to "+wantKeyed) {
+		t.Errorf("acceptance prompt missing the keyed %s file-fallback contract line:\n%s", wantKeyed, keyed)
+	}
+
+	// With no ids, the contract falls back to the legacy fixed path.
+	legacy, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	if err != nil {
+		t.Fatalf("Build(acceptance) legacy: %v", err)
+	}
+	if !strings.Contains(legacy, "write the verdict as a single JSON object to "+LegacyAcceptanceVerdictPath) {
+		t.Errorf("acceptance prompt missing the legacy %s file-fallback contract line:\n%s", LegacyAcceptanceVerdictPath, legacy)
+	}
+	if LegacyAcceptanceVerdictPath != "/tmp/fishhawk-acceptance.json" {
+		t.Errorf("LegacyAcceptanceVerdictPath = %q, want /tmp/fishhawk-acceptance.json (the runner mirrors this exact path)", LegacyAcceptanceVerdictPath)
 	}
 }
 

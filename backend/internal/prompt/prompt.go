@@ -87,25 +87,34 @@ func PullRequestDescriptionPath(runID, stageID string) string {
 	return fmt.Sprintf("/tmp/fishhawk-pr-%s-%s.md", runID, stageID)
 }
 
-// AcceptanceVerdictPath is the absolute file-fallback path the acceptance
-// agent writes its structured verdict to when the driving adapter has no
-// structured-output channel (the codex path; claudecode agents emit the
+// AcceptanceVerdictPath is the run/stage-keyed absolute file-fallback path the
+// acceptance agent writes its structured verdict to when the driving adapter
+// has no structured-output channel (the codex path; claudecode agents emit the
 // verdict via --json-schema structured output, which the runner prefers).
-// Embedded in the acceptance prompt's output contract and read by the E31.7
-// runner executor's capture fallback.
+// Embedded in the acceptance prompt's output contract (via
+// acceptanceVerdictPathForTrigger) and read by the E31.7 runner executor's
+// capture fallback.
 //
-// Deliberately NOT run/stage-keyed (#1777): unlike the implement-stage PR
-// description, the acceptance Trigger does not thread run/stage ids into the
-// acceptance prompt (only implement-stage prompts carry ImplementRunID /
-// ImplementStageID — see backend/internal/server/prompt.go), so this stays a
-// fixed shared path. The sharing is narrow and mostly fail-loud: a clobbered
-// verdict is caught by the runner's served-criteria-id membership check and the
-// #1535 pre-spawn stale-clear, which fail the stage loudly rather than shipping
-// a wrong verdict silently. The RUNNER reads the run/stage-keyed path FIRST and
-// falls back to THIS legacy fixed path (binding condition 1), so keying the
-// acceptance prompt later (once the acceptance Trigger threads ids) needs no
-// runner change. Keying THIS constant is deferred to that follow-up.
-const AcceptanceVerdictPath = "/tmp/fishhawk-acceptance.json"
+// Now run/stage-keyed (#1780), mirroring the #1777 PR-description keying: the
+// acceptance Trigger threads AcceptanceRunID / AcceptanceStageID (set by
+// backend/internal/server/prompt.go's acceptance branches), so the prompt names
+// the SAME keyed path the runner reads FIRST. Before this change the prompt
+// named the fixed LegacyAcceptanceVerdictPath and the runner's keyed-first read
+// always missed and fell back to legacy, firing acceptance_verdict_legacy_path
+// on every happy run. The runner retains the legacy fixed path as its fallback
+// (binding condition 1), so a trigger missing ids (rendered via
+// LegacyAcceptanceVerdictPath) is still read. MUST stay byte-identical to the
+// runner's acceptanceVerdictPath format string.
+func AcceptanceVerdictPath(runID, stageID string) string {
+	return fmt.Sprintf("/tmp/fishhawk-acceptance-%s-%s.json", runID, stageID)
+}
+
+// LegacyAcceptanceVerdictPath is the fixed shared path the acceptance prompt
+// named before #1780 keyed it. Retained as the resolver's fallback when a
+// trigger threads no run/stage ids, and mirrored by the runner's
+// legacyAcceptanceVerdictPath var (which the runner reads as its keyed-first
+// fallback). MUST stay byte-identical to that runner var.
+const LegacyAcceptanceVerdictPath = "/tmp/fishhawk-acceptance.json"
 
 // ScopeJustificationPath is the run/stage-keyed path the implement agent
 // writes its scope self-exempt sidecar to (#1153) and the runner reads it
@@ -533,6 +542,17 @@ type Trigger struct {
 	// those prompts byte-identical.
 	ImplementRunID   string
 	ImplementStageID string
+
+	// AcceptanceRunID and AcceptanceStageID are the run/stage UUIDs of the
+	// acceptance stage being dispatched (#1780). Populated ONLY for acceptance-
+	// stage prompts (the two buildAcceptance-feeding handler call sites in
+	// backend/internal/server/prompt.go); empty for every other build.
+	// acceptanceVerdictPathForTrigger renders the run/stage-keyed verdict
+	// file-fallback path (AcceptanceVerdictPath) from these; both empty (a non-
+	// acceptance or older trigger) falls back to LegacyAcceptanceVerdictPath,
+	// keeping those prompts byte-identical.
+	AcceptanceRunID   string
+	AcceptanceStageID string
 
 	// PlanGateEvidence carries the backend-computed plan-gate results —
 	// the plan_scope_precheck verdict against the implement stage's path
@@ -1540,6 +1560,22 @@ func pullRequestDescriptionPathForTrigger(t Trigger) string {
 	return LegacyPullRequestDescriptionPath
 }
 
+// acceptanceVerdictPathForTrigger resolves the acceptance verdict file-fallback
+// path for an acceptance-stage prompt (#1780), mirroring
+// pullRequestDescriptionPathForTrigger: the run/stage-keyed
+// AcceptanceVerdictPath when the trigger threads both ids (the normal
+// acceptance dispatch, since backend/internal/server/prompt.go sets
+// AcceptanceRunID/AcceptanceStageID), falling back to the legacy fixed path
+// when either id is empty so a trigger missing them still renders a usable (if
+// shared) path rather than a malformed one. The runner reads the keyed path
+// first and falls back to the same legacy path (binding condition 1).
+func acceptanceVerdictPathForTrigger(t Trigger) string {
+	if t.AcceptanceRunID != "" && t.AcceptanceStageID != "" {
+		return AcceptanceVerdictPath(t.AcceptanceRunID, t.AcceptanceStageID)
+	}
+	return LegacyAcceptanceVerdictPath
+}
+
 // writeGitOpsProhibition renders the line forbidding the agent from running
 // any branch/commit-mutating git command — the runner owns all version
 // control and the shared checkout. Shared by the full implement prompt and
@@ -1722,7 +1758,7 @@ func buildAcceptance(t Trigger) string {
 		"`notes`. Any OTHER field is rejected fail-closed by the runner's validator and fails " +
 		"the stage — do not invent fields; put overflow prose in `notes`.\n\n")
 	b.WriteString("Emit the verdict as structured output when your harness supports it. " +
-		"Otherwise, write the verdict as a single JSON object to " + AcceptanceVerdictPath +
+		"Otherwise, write the verdict as a single JSON object to " + acceptanceVerdictPathForTrigger(t) +
 		" — the runner falls back to reading that file.\n\n")
 	b.WriteString("The result is shipped via the signed evidence bundle — keep evidence blobs " +
 		"customer-side and reference them by content hash; only the structured verdict + hashes " +

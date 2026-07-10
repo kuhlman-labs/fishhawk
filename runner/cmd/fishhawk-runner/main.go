@@ -953,30 +953,13 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		inv.JSONSchema = acceptanceVerdictJSONSchema
 
 		// Clear any stale fallback verdict from a PRIOR run BEFORE the
-		// acceptance agent runs. captureAcceptanceVerdict reads the run/stage-
-		// keyed path first and falls back to the legacy fixed path
-		// (/tmp/fishhawk-acceptance.json) the prompt still names, so the
-		// pre-spawn clear MUST cover BOTH (#1777, binding condition 2): without
-		// it, an agent that produces neither structured output nor a fresh file
-		// would let captureAcceptanceVerdict read and ship a previous run's stale
-		// verdict instead of failing acceptance_verdict_missing (#1535 fix-up).
-		// Clearing the legacy path can delete a concurrent OLD-PROMPT run's
-		// verdict during the deprecation window; that failure is loud (the other
-		// run reports verdict-missing) and acceptable — the alternative (shipping
-		// a foreign stale verdict) is the bug this defends against. A remove error
-		// other than not-exist means we cannot guarantee a clean transport — fail
-		// category-C before any agent spawn rather than risk shipping stale
-		// evidence.
-		for _, path := range []string{
-			acceptanceVerdictPath(cfg.runID, cfg.stageID),
-			legacyAcceptanceVerdictPath,
-		} {
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-				_, _ = fmt.Fprintf(logSink,
-					`{"event":"runner_failed","reason":"acceptance_stale_verdict_clear","category":"C","detail":%q}`+"\n",
-					err.Error())
-				return exitFailure
-			}
+		// acceptance agent runs (#1535 / #1777). Extracted to
+		// sweepStaleAcceptanceVerdict (#1780) so its remove-error branch is
+		// testable; false means a stale readable verdict could not be unlinked,
+		// so fail category-C before any agent spawn rather than risk shipping
+		// stale evidence.
+		if !sweepStaleAcceptanceVerdict(cfg, logSink) {
+			return exitFailure
 		}
 	}
 
@@ -6683,6 +6666,48 @@ func sweepStaleImplementCommitMessage(cfg config, logSink io.Writer) {
 			`{"event":"implement_commitmsg_swept","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
 			cfg.runID, cfg.stageID, path)
 	}
+}
+
+// sweepStaleAcceptanceVerdict deletes any leftover acceptance verdict file at
+// THIS run/stage's keyed path AND at the legacy fixed path before the acceptance
+// agent is invoked (#1535 / #1777, extracted for testability in #1780) —
+// mirroring sweepStalePullRequestDescription. captureAcceptanceVerdict reads the
+// run/stage-keyed path first and falls back to the legacy fixed path, so an agent
+// that produces neither structured output nor a fresh file would otherwise let a
+// PRIOR run's stale verdict be shipped instead of failing acceptance_verdict_missing.
+// Clearing the legacy path can delete a concurrent OLD-PROMPT run's verdict during
+// the deprecation window; that failure is loud (the other run reports verdict-
+// missing) and acceptable — the alternative (shipping a foreign stale verdict) is
+// the bug this defends against.
+//
+// Returns false when a path could not be removed for a reason OTHER than not-
+// exist: a stale-but-unremovable readable verdict would otherwise be read and
+// shipped by captureAcceptanceVerdict. The caller fails the stage category-C on
+// false (loud-over-silent, binding condition 2). A not-exist (the common case)
+// is silent and never fails.
+func sweepStaleAcceptanceVerdict(cfg config, logSink io.Writer) bool {
+	ok := true
+	for _, path := range []string{
+		acceptanceVerdictPath(cfg.runID, cfg.stageID),
+		legacyAcceptanceVerdictPath,
+	} {
+		rerr := os.Remove(path)
+		switch {
+		case rerr == nil:
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"acceptance_verdict_swept","run_id":%q,"stage_id":%q,"path":%q}`+"\n",
+				cfg.runID, cfg.stageID, path)
+		case !os.IsNotExist(rerr):
+			// A stale readable verdict we cannot unlink survives to be read by
+			// captureAcceptanceVerdict — fail closed before the agent spawns
+			// rather than ship a foreign run's stale evidence.
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":"acceptance_stale_verdict_clear","category":"C","path":%q,"detail":%q}`+"\n",
+				path, rerr.Error())
+			ok = false
+		}
+	}
+	return ok
 }
 
 // sweepStalePullRequestDescription deletes any leftover PR-description handoff at

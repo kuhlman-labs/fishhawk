@@ -920,6 +920,13 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	// empty string until E31.4/#1532's egress-allowance grammar lands, and
 	// buildAcceptance then renders an explicit not-declared line.
 	if stage.Type == run.StageTypeAcceptance {
+		// Run/stage ids for the acceptance prompt's run/stage-keyed verdict
+		// file-fallback path (#1780). Populated only on the acceptance path so
+		// acceptanceVerdictPathForTrigger names the SAME keyed path the runner
+		// reads first; other prompts leave them empty and fall back to the
+		// legacy fixed path, staying byte-identical.
+		trigger.AcceptanceRunID = runRow.ID.String()
+		trigger.AcceptanceStageID = stage.ID.String()
 		approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), runRow.ID)
 		if err != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -1266,6 +1273,13 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	// empty string until E31.4/#1532's egress-allowance grammar lands, and
 	// buildAcceptance then renders an explicit not-declared line.
 	if stage.Type == run.StageTypeAcceptance {
+		// Run/stage ids for the acceptance prompt's run/stage-keyed verdict
+		// file-fallback path (#1780). Populated only on the acceptance path so
+		// acceptanceVerdictPathForTrigger names the SAME keyed path the runner
+		// reads first; other prompts leave them empty and fall back to the
+		// legacy fixed path, staying byte-identical.
+		trigger.AcceptanceRunID = runRow.ID.String()
+		trigger.AcceptanceStageID = stage.ID.String()
 		approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), runRow.ID)
 		if err != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
