@@ -549,6 +549,88 @@ func TestNotifyStatusUpdate_UpdateErrorOtherThan404_SurfacesError(t *testing.T) 
 	}
 }
 
+// TestNotifyStatusUpdate_OrphanRediscovery_EditsInPlaceNoSecondCreate pins the
+// anchor half of #1793: the audit chain lost the comment id (a prior post
+// landed but its audit append failed), so findStatusCommentID returns 0. Rather
+// than stack a SECOND comment, the notifier lists the thread, matches the hidden
+// anchor marker, and edits the orphan in place — then self-heals by re-persisting
+// the recovered id in a fresh audit row.
+func TestNotifyStatusUpdate_OrphanRediscovery_EditsInPlaceNoSecondCreate(t *testing.T) {
+	runID, gh, au, n := happyDeps(t)
+	marker := fmt.Sprintf("<!-- fishhawk-sticky locus=anchor run=%s -->", runID)
+	gh.listComments = []githubclient.FetchedIssueComment{
+		{ID: 8888, Body: marker + "\n**Fishhawk run** — orphaned body"},
+	}
+	// Audit chain carries NO status_comment_posted row → the orphan case.
+	if err := n.NotifyStatusUpdate(context.Background(), runID, "status body"); err != nil {
+		t.Fatalf("NotifyStatusUpdate: %v", err)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("orphan re-discovery must NOT create a second comment; got %d creates", len(gh.calls))
+	}
+	if len(gh.updateCalls) != 1 || gh.updateCalls[0].commentID != 8888 {
+		t.Fatalf("expected 1 edit on re-discovered id 8888; got %+v", gh.updateCalls)
+	}
+	if len(gh.listCalls) != 1 {
+		t.Errorf("expected exactly 1 list call for re-discovery; got %d", len(gh.listCalls))
+	}
+	// Self-heal: the audit row re-persists the recovered id so the NEXT rebuild
+	// finds it via the audit chain and never lists again.
+	if len(au.appended) != 1 {
+		t.Fatalf("expected 1 audit row; got %d", len(au.appended))
+	}
+	var body map[string]any
+	_ = json.Unmarshal(au.appended[0].Payload, &body)
+	if id, _ := body["github_comment_id"].(float64); int64(id) != 8888 {
+		t.Errorf("self-heal must re-persist recovered id 8888; got %v", body["github_comment_id"])
+	}
+}
+
+// TestNotifyStatusUpdate_NoMarkerMatch_CreatesFirstComment is the first-post
+// negative: an empty audit chain AND no comment on the thread carrying THIS
+// run's anchor marker (a genuine first post, or an unrelated thread) must create
+// exactly one comment — the fallback must not regress the genuine first post.
+func TestNotifyStatusUpdate_NoMarkerMatch_CreatesFirstComment(t *testing.T) {
+	runID, gh, au, n := happyDeps(t)
+	gh.listComments = []githubclient.FetchedIssueComment{
+		{ID: 1, Body: "a human comment"},
+		{ID: 2, Body: "<!-- fishhawk-sticky locus=anchor run=00000000-0000-0000-0000-000000000000 -->"},
+	}
+	if err := n.NotifyStatusUpdate(context.Background(), runID, "first status"); err != nil {
+		t.Fatalf("NotifyStatusUpdate: %v", err)
+	}
+	if len(gh.updateCalls) != 0 {
+		t.Errorf("no marker match must NOT edit; got %d edits", len(gh.updateCalls))
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("no marker match must create the first comment; got %d creates", len(gh.calls))
+	}
+	if len(au.appended) != 1 {
+		t.Errorf("expected 1 audit row for the create; got %d", len(au.appended))
+	}
+}
+
+// TestNotifyStatusUpdate_ListError_DegradesToCreate is the list-error fail-open
+// branch: when ListIssueComments fails, re-discovery returns 0 and the path
+// degrades to today's behavior (create) — the read failure is swallowed, never
+// propagated.
+func TestNotifyStatusUpdate_ListError_DegradesToCreate(t *testing.T) {
+	runID, gh, au, n := happyDeps(t)
+	gh.listErr = errors.New("list boom")
+	if err := n.NotifyStatusUpdate(context.Background(), runID, "status"); err != nil {
+		t.Fatalf("list error must be fail-open, not propagated: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Errorf("list error must degrade to create; got %d creates", len(gh.calls))
+	}
+	if len(gh.updateCalls) != 0 {
+		t.Errorf("no edit on the list-error degrade path; got %d", len(gh.updateCalls))
+	}
+	if len(au.appended) != 1 {
+		t.Errorf("expected 1 audit row for the fallback create; got %d", len(au.appended))
+	}
+}
+
 // happyDepsWithStages returns the happyDeps fixtures plus a stage
 // list so NotifyStatusUpdateForRun has something to render against.
 func happyDepsWithStages(t *testing.T) (uuid.UUID, *fakeGitHub, *fakeAudit, *fakeRuns, *issuecomment.Notifier) {
@@ -1379,6 +1461,34 @@ type fakeGitHub struct {
 	// triggering issue number) succeeding. Used to prove PR-comment fail-open
 	// independently of the anchor.
 	failOnIssueNumber int
+	// listComments seeds ListIssueComments' return value — the orphan
+	// re-discovery fallback (#1793) matches a hidden marker against these.
+	listComments []githubclient.FetchedIssueComment
+	// listErr, when non-nil, fails every ListIssueComments so tests can prove
+	// the list-error fail-open path (re-discovery returns 0 → degrade to create).
+	listErr error
+	// listCalls records each ListIssueComments call so tests can assert the
+	// fallback fired (or did not) on the expected issue/PR number.
+	listCalls []ghListCommentsCall
+}
+
+// ghListCommentsCall records one ListIssueComments invocation.
+type ghListCommentsCall struct {
+	installationID int64
+	repo           githubclient.RepoRef
+	number         int
+}
+
+// ListIssueComments returns the seeded comment thread (or listErr), recording
+// the call. Backs the orphan-rediscovery fallback (#1793).
+func (f *fakeGitHub) ListIssueComments(_ context.Context, installationID int64, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listCalls = append(f.listCalls, ghListCommentsCall{installationID: installationID, repo: repo, number: number})
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.listComments, nil
 }
 
 func (f *fakeGitHub) CreateIssueComment(_ context.Context, installationID int64, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
@@ -2076,6 +2186,55 @@ func TestPRStatusComment_DeletedCommentRecreated(t *testing.T) {
 	}
 	if got := prStatusAuditCount(au); got != 1 {
 		t.Errorf("re-create should append one fresh audit row; got %d", got)
+	}
+}
+
+// TestPRStatusComment_OrphanRediscovery_EditsInPlaceNoSecondCreate pins the PR
+// half of #1793: findPRStatusComment returns 0 (the audit append that would have
+// recorded the id failed), so the notifier lists the PR thread, matches the
+// hidden pr-status marker, and edits the orphan in place instead of stacking a
+// SECOND PR comment. It then self-heals by re-persisting the recovered id in a
+// pr_status_comment_posted row. The anchor (whose marker is NOT on the thread)
+// still creates normally, proving the two loci never cross-match.
+func TestPRStatusComment_OrphanRediscovery_EditsInPlaceNoSecondCreate(t *testing.T) {
+	runID, _, _, gh, au, _, n := prStatusDeps(t)
+	prMarker := fmt.Sprintf("<!-- fishhawk-sticky locus=pr-status run=%s -->", runID)
+	gh.listComments = []githubclient.FetchedIssueComment{
+		{ID: 5555, Body: prMarker + "\n**Fishhawk run** — orphaned PR body"},
+	}
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if got := prCreateCount(gh, 7); got != 0 {
+		t.Errorf("PR orphan re-discovery must NOT create a second PR comment; got %d", got)
+	}
+	if got := prUpdateCount(gh, 5555); got != 1 {
+		t.Errorf("expected 1 edit on re-discovered PR comment id 5555; got %d", got)
+	}
+	// The anchor's marker isn't on the thread, so it creates normally (no false
+	// cross-locus match against the pr-status marker).
+	if got := prCreateCount(gh, 42); got != 1 {
+		t.Errorf("anchor comment should still be created; got %d", got)
+	}
+	// Self-heal: the pr_status_comment_posted row re-persists the recovered id.
+	if got := prStatusAuditCount(au); got != 1 {
+		t.Fatalf("expected 1 pr_status_comment_posted row; got %d", got)
+	}
+	var checked bool
+	for _, p := range au.appended {
+		if p.Category != issuecomment.CategoryPRStatusCommentPosted {
+			continue
+		}
+		var body map[string]any
+		_ = json.Unmarshal(p.Payload, &body)
+		if id, _ := body["github_comment_id"].(float64); int64(id) != 5555 {
+			t.Errorf("PR self-heal must re-persist recovered id 5555; got %v", body["github_comment_id"])
+		}
+		checked = true
+	}
+	if !checked {
+		t.Error("no pr_status_comment_posted row appended")
 	}
 }
 

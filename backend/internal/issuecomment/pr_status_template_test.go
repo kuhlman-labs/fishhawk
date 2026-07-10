@@ -274,11 +274,35 @@ func TestRenderPRStatusBody_DegradationLadder(t *testing.T) {
 	if !strings.Contains(body, "Fishhawk run") {
 		t.Errorf("header dropped under degradation:\n%s", body[:200])
 	}
+	// The hidden sticky marker (#1793) is accounted for in the size budget and
+	// preserved through the ladder + tail-truncation.
+	if marker := stickyMarker(stickyLocusPRStatus, prStatusRun().ID); !strings.Contains(body, marker) {
+		t.Errorf("sticky marker must survive the degradation ladder: want %q in body", marker)
+	}
 }
 
 // TestRenderPRStatusBody_NilRun returns empty for a nil run.
 func TestRenderPRStatusBody_NilRun(t *testing.T) {
 	if got := RenderPRStatusBody(PRStatusInput{}); got != "" {
 		t.Errorf("nil run should render empty, got %q", got)
+	}
+}
+
+// TestRenderPRStatusBody_EmbedsStickyMarker pins #1793: the PR status body leads
+// with the hidden pr-status sticky marker so the orphan-rediscovery fallback can
+// match it, and it is distinct from the anchor marker (different locus).
+func TestRenderPRStatusBody_EmbedsStickyMarker(t *testing.T) {
+	r := prStatusRun()
+	marker := stickyMarker(stickyLocusPRStatus, r.ID)
+	if marker != "<!-- fishhawk-sticky locus=pr-status run=11111111-2222-3333-4444-555555555555 -->" {
+		t.Fatalf("unexpected marker format: %q", marker)
+	}
+	body := RenderPRStatusBody(PRStatusInput{Run: r, ExternalURL: "https://app.example", Now: time.Unix(1000, 0).UTC()})
+	if !strings.HasPrefix(body, marker) {
+		t.Errorf("pr-status marker must be the FIRST body section; body = %q", body)
+	}
+	// Distinct from the anchor marker so a locus never cross-matches.
+	if strings.Contains(body, stickyMarker(stickyLocusAnchor, r.ID)) {
+		t.Errorf("PR status body must not carry the anchor marker")
 	}
 }

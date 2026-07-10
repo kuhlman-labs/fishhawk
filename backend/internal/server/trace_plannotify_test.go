@@ -324,6 +324,10 @@ func (c *commentRecorder) CreateReview(_ context.Context, _ int64, _ githubclien
 	return &githubclient.CreateReviewResult{}, nil
 }
 
+func (c *commentRecorder) ListIssueComments(_ context.Context, _ int64, _ githubclient.RepoRef, _ int) ([]githubclient.FetchedIssueComment, error) {
+	return nil, nil
+}
+
 // planReadyAuditFake is a tiny in-memory audit.Repository that the
 // notifier's dedup query and AppendChained can both run against.
 // Mirrors the in-memory fakes elsewhere in the package.

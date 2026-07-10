@@ -2019,6 +2019,10 @@ func nextPageURL(link string) string {
 // author login, body, and creation timestamp the plan-stage prompt
 // renders.
 type FetchedIssueComment struct {
+	// ID is the GitHub comment id, surfaced so the sticky-comment
+	// orphan-rediscovery fallback (#1793) can match a hidden marker to the
+	// comment that must be edited in place when the audit chain lost its id.
+	ID        int64
 	Author    string
 	Body      string
 	CreatedAt string
@@ -2084,6 +2088,7 @@ func decodeIssueCommentsPage(resp *http.Response) ([]FetchedIssueComment, string
 		return nil, "", err
 	}
 	var body []struct {
+		ID   int64 `json:"id"`
 		User struct {
 			Login string `json:"login"`
 		} `json:"user"`
@@ -2096,6 +2101,7 @@ func decodeIssueCommentsPage(resp *http.Response) ([]FetchedIssueComment, string
 	out := make([]FetchedIssueComment, 0, len(body))
 	for _, c := range body {
 		out = append(out, FetchedIssueComment{
+			ID:        c.ID,
 			Author:    c.User.Login,
 			Body:      c.Body,
 			CreatedAt: c.CreatedAt,

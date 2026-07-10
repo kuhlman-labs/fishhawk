@@ -37,6 +37,12 @@ func RenderStatusBody(runRow *run.Run, stages []*run.Stage, recentAudit []*audit
 		return ""
 	}
 	var b strings.Builder
+	// The hidden sticky marker (#1793) leads the body — the SAME anchor marker
+	// RenderAnchorBody emits, because the CLI status-comment read/edit path edits
+	// the SAME anchor comment in place; omitting it here would strip the marker
+	// from the live comment on a CLI edit and defeat orphan re-discovery.
+	b.WriteString(stickyMarker(stickyLocusAnchor, runRow.ID))
+	b.WriteString("\n")
 	writeHeader(&b, runRow, externalURL)
 	b.WriteString("\n")
 	writeStages(&b, stages)

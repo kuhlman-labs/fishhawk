@@ -100,6 +100,31 @@ const CategoryPRStatusCommentPosted = "pr_status_comment_posted"
 // Sequence) posts a NEW review.
 const CategoryPRReviewPosted = "pr_review_posted"
 
+// Sticky-comment marker loci (#1793). Each sticky comment carries a hidden
+// HTML-comment marker keyed by locus + run id so the notifier can re-discover
+// an orphaned comment (one whose GitHub id never made it into the audit chain
+// because the post succeeded but the subsequent audit append failed) by LISTING
+// the thread and matching the marker, rather than stacking a second comment.
+//
+//   - stickyLocusAnchor is shared by the issue-anchor renderers (RenderAnchorBody
+//     and the CLI status-comment renderer RenderStatusBody, which edit the SAME
+//     anchor comment in place — both must emit the identical marker or a CLI edit
+//     would strip it from the live comment).
+//   - stickyLocusPRStatus is the PR sticky status comment.
+const (
+	stickyLocusAnchor   = "anchor"
+	stickyLocusPRStatus = "pr-status"
+)
+
+// stickyMarker returns the hidden HTML-comment marker embedded as the first
+// section of a sticky comment body. Constant for a given (locus, runID) so it
+// does not perturb body-hash dedup (hashPRStatusBody) across rebuilds. The
+// marker is an inert HTML comment: invisible in rendered GitHub markdown, but
+// greppable in the raw body for orphan re-discovery.
+func stickyMarker(locus string, runID uuid.UUID) string {
+	return fmt.Sprintf("<!-- fishhawk-sticky locus=%s run=%s -->", locus, runID)
+}
+
 // Kind enumerates which moment a comment recorded. Stored in the
 // audit entry's payload so a single category covers both moments
 // while staying queryable per kind.
@@ -165,6 +190,11 @@ type IssueCommenter interface {
 	CreateIssueComment(ctx context.Context, installationID int64, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error)
 	UpdateIssueComment(ctx context.Context, installationID int64, repo githubclient.RepoRef, commentID int64, body string) (*githubclient.IssueComment, error)
 	CreateReview(ctx context.Context, installationID int64, repo githubclient.RepoRef, prNumber int, params githubclient.CreateReviewParams) (*githubclient.CreateReviewResult, error)
+	// ListIssueComments lists an issue/PR comment thread so the sticky-comment
+	// orphan-rediscovery fallback (#1793) can match a hidden marker to a comment
+	// whose id was lost from the audit chain. Production *githubclient.Client
+	// already implements it.
+	ListIssueComments(ctx context.Context, installationID int64, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error)
 }
 
 // PlanArtifactLister is the narrow slice of artifact.Repository the
@@ -803,6 +833,17 @@ func (n *Notifier) NotifyStatusUpdate(ctx context.Context, runID uuid.UUID, body
 	if err != nil {
 		return fmt.Errorf("issuecomment: lookup status comment: %w", err)
 	}
+	if existingID == 0 {
+		// The audit chain has no id. Either this is the genuine first post, or a
+		// prior post landed on GitHub but its audit append failed and orphaned the
+		// id (#1793). Re-discover by matching the hidden anchor marker on the
+		// thread before creating a second comment; on no match / list error this
+		// returns 0 and we fall through to create, preserving today's behavior.
+		if recovered := n.rediscoverStickyComment(ctx, *ctxv.run.InstallationID,
+			ctxv.repo, ctxv.issueNumber, stickyMarker(stickyLocusAnchor, runID)); recovered > 0 {
+			existingID = recovered
+		}
+	}
 
 	if existingID > 0 {
 		// Try to edit in place. If the comment was deleted, fall
@@ -1264,6 +1305,28 @@ func extractGithubCommentID(payload []byte) int64 {
 	return p.GithubCommentID
 }
 
+// rediscoverStickyComment recovers the id of an orphaned sticky comment — one
+// posted successfully but whose id never reached the audit chain because the
+// subsequent audit append failed (#1793). It LISTS the issue/PR thread and
+// returns the id of the first comment whose body contains marker, or 0 on no
+// match. Fail-open: a list error (or an empty thread) returns 0, degrading to
+// today's behavior (create a fresh comment) — the extra list call is off the
+// hot path because it fires only when the audit lookup already returned 0.
+func (n *Notifier) rediscoverStickyComment(ctx context.Context, installationID int64, repo githubclient.RepoRef, number int, marker string) int64 {
+	comments, err := n.github.ListIssueComments(ctx, installationID, repo, number)
+	if err != nil {
+		// Fail-open: degrade to create, matching the surrounding best-effort
+		// posture. The next successful audit append re-anchors the id.
+		return 0
+	}
+	for _, c := range comments {
+		if strings.Contains(c.Body, marker) {
+			return c.ID
+		}
+	}
+	return 0
+}
+
 // maybeUpdatePRStatusComment posts or edits the run's sticky PR status comment
 // (E42.1 / #1784). Folded into NotifyStatusUpdateForRun so every rebuild hook
 // maintains it. Best-effort / fail-open throughout: EVERY skip and EVERY
@@ -1303,6 +1366,18 @@ func (n *Notifier) maybeUpdatePRStatusComment(ctx context.Context, runRow *run.R
 	if err != nil {
 		// Fail-open: a bookkeeping read failure must not unwind the transition.
 		return nil
+	}
+	if existingID == 0 {
+		// The audit chain has no id — genuine first post, or a prior post landed
+		// on GitHub but its audit append failed and orphaned the id (#1793).
+		// Re-discover by matching the hidden pr-status marker on the PR thread
+		// before creating a second comment; leave lastHash empty so the recovered
+		// comment is edited in place (not dedup-skipped). No match / list error
+		// returns 0 and we fall through to create, preserving today's behavior.
+		if recovered := n.rediscoverStickyComment(ctx, *runRow.InstallationID,
+			repo, prNumber, stickyMarker(stickyLocusPRStatus, runRow.ID)); recovered > 0 {
+			existingID = recovered
+		}
 	}
 	if existingID > 0 && lastHash == newHash {
 		// Identical body — skip the GitHub edit (mirrors the

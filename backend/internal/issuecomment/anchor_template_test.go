@@ -773,11 +773,37 @@ func TestRenderAnchorBody_DegradationLadder(t *testing.T) {
 	if !strings.Contains(body, "https://app.example/runs/11111111") {
 		t.Errorf("dashboard deep-link must survive the degradation ladder")
 	}
+	// The hidden sticky marker (#1793) is accounted for in the size budget and
+	// preserved through the ladder + tail-truncation (it leads the body).
+	if marker := stickyMarker(stickyLocusAnchor, anchorRun().ID); !strings.Contains(body, marker) {
+		t.Errorf("sticky marker must survive the degradation ladder: want %q in body", marker)
+	}
 }
 
 func TestRenderAnchorBody_NilRun(t *testing.T) {
 	if got := RenderAnchorBody(AnchorInput{}); got != "" {
 		t.Errorf("nil run should render empty; got %q", got)
+	}
+}
+
+// TestRenderAnchorBody_EmbedsStickyMarker pins #1793: the living-anchor body
+// leads with the hidden anchor sticky marker, and the CLI status-comment
+// renderer (RenderStatusBody) embeds the IDENTICAL marker — both edit the same
+// anchor comment, so a mismatch would strip the marker on a CLI edit and defeat
+// orphan re-discovery.
+func TestRenderAnchorBody_EmbedsStickyMarker(t *testing.T) {
+	r := anchorRun()
+	marker := stickyMarker(stickyLocusAnchor, r.ID)
+	if marker != "<!-- fishhawk-sticky locus=anchor run=11111111-2222-3333-4444-555555555555 -->" {
+		t.Fatalf("unexpected marker format: %q", marker)
+	}
+	anchor := RenderAnchorBody(AnchorInput{Run: r, ExternalURL: "https://app.example", Now: time.Now()})
+	if !strings.HasPrefix(anchor, marker) {
+		t.Errorf("anchor marker must be the FIRST body section; body = %q", anchor)
+	}
+	status := RenderStatusBody(r, nil, nil, "https://app.example", time.Now())
+	if !strings.Contains(status, marker) {
+		t.Errorf("status body missing IDENTICAL anchor marker %q; body = %q", marker, status)
 	}
 }
 
