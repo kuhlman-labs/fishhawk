@@ -217,11 +217,15 @@ type Deps struct {
 // without nil-checking the receiver — the methods short-circuit on
 // a nil receiver.
 //
-// We bail on missing ExternalURL because every comment carries at
-// least one Fishhawk URL; without ExternalURL the comment would
-// link nowhere useful.
+// The notifier constructs whenever GitHub / Runs / Audit are wired. An UNSET
+// ExternalURL no longer suppresses comments (#1787): every renderer degrades a
+// run reference to a plain, link-less short-id (and omits footer "view run"
+// links) when the base URL is empty, so link-less comments still post — the
+// nil-notifier dividing line is "no GitHub client", not "no base URL". This
+// unblocks the dogfood posture, which leaves ExternalURL unset rather than
+// pointing it at an operator-host-local address that would post dead links.
 func New(d Deps) *Notifier {
-	if d.GitHub == nil || d.Runs == nil || d.Audit == nil || d.ExternalURL == "" {
+	if d.GitHub == nil || d.Runs == nil || d.Audit == nil {
 		return nil
 	}
 	now := d.Now
@@ -446,14 +450,25 @@ func truncateForGitHubComment(body, runURL, stageID, externalURL, runID string) 
 	if len(body) <= MaxIssueCommentBodyBytes {
 		return body
 	}
-	tail := fmt.Sprintf("\n\n_…truncated — [view full plan →](%s/runs/%s/stages/%s)_\n",
-		externalURL, runID, stageID)
+	// When the base URL is unset (#1787), degrade the truncation marker to a
+	// link-less form rather than emitting a dead relative /runs/<id>/stages path.
+	var tail string
+	if externalURL == "" {
+		tail = "\n\n_…truncated._\n"
+	} else {
+		tail = fmt.Sprintf("\n\n_…truncated — [view full plan →](%s/runs/%s/stages/%s)_\n",
+			externalURL, runID, stageID)
+	}
 	// Reserve room for the tail; trim conservatively.
 	budget := MaxIssueCommentBodyBytes - len(tail)
 	if budget < 0 {
 		// Tail itself exceeds the cap (would be a very long URL).
 		// Render only the bare run URL as a fallback so the
-		// reviewer can navigate without leaving the comment.
+		// reviewer can navigate without leaving the comment; when the base URL
+		// is unset there is no link to offer, so state the overflow plainly.
+		if runURL == "" {
+			return "_Plan exceeds GitHub's comment size._\n"
+		}
 		return fmt.Sprintf("_Plan exceeds GitHub's comment size; view at %s_\n", runURL)
 	}
 	cut := budget
@@ -539,7 +554,7 @@ func (n *Notifier) contextForCIRetry(ctx context.Context, runID uuid.UUID, attem
 		run:         runRow,
 		repo:        repo,
 		issueNumber: number,
-		runURL:      n.externalURL + "/runs/" + runID.String(),
+		runURL:      runURLFor(n.externalURL, runID),
 	}, true, nil
 }
 
@@ -645,7 +660,7 @@ func (n *Notifier) NotifyBudgetAlert(ctx context.Context, runID uuid.UUID, p Bud
 	if err != nil || !ok {
 		return false, err
 	}
-	body := renderBudgetAlertBody(ctxv, p)
+	body := renderBudgetAlertBody(ctxv, p, n.externalURL)
 	if err := n.postBudgetAlert(ctx, ctxv, p, body); err != nil {
 		return false, err
 	}
@@ -686,7 +701,7 @@ func (n *Notifier) contextForBudgetAlert(ctx context.Context, runID uuid.UUID, p
 		run:         runRow,
 		repo:        repo,
 		issueNumber: number,
-		runURL:      n.externalURL + "/runs/" + runID.String(),
+		runURL:      runURLFor(n.externalURL, runID),
 	}, true, nil
 }
 
@@ -1178,7 +1193,7 @@ func (n *Notifier) contextForStatus(ctx context.Context, runID uuid.UUID) (comme
 		run:         runRow,
 		repo:        repo,
 		issueNumber: number,
-		runURL:      n.externalURL + "/runs/" + runID.String(),
+		runURL:      runURLFor(n.externalURL, runID),
 	}, true, nil
 }
 
@@ -1612,10 +1627,12 @@ func parsePRNumberFromURL(url *string) int {
 // can predict whether a second failure will trigger another retry.
 func renderCIRetryBody(c commentContext, parentRunID uuid.UUID, checkName string, attempt, max int, externalURL string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "CI check `%s` failed on Run [`%s`](%s/runs/%s) — Fishhawk dispatched a retry as Run [`%s`](%s).\n\n",
+	// Both run references degrade to plain backticked short-ids when the base
+	// URL is unset (#1787) via runShortLink.
+	fmt.Fprintf(&b, "CI check `%s` failed on Run %s — Fishhawk dispatched a retry as Run %s.\n\n",
 		checkName,
-		shortID(parentRunID), externalURL, parentRunID.String(),
-		shortID(c.run.ID), c.runURL)
+		runShortLink(externalURL, parentRunID),
+		runShortLink(externalURL, c.run.ID))
 	fmt.Fprintf(&b, "Retry attempt %d of %d.\n", attempt, max)
 	return b.String()
 }
@@ -1661,14 +1678,16 @@ func extractBudgetPeriodTier(payload []byte) (periodStart, tier string) {
 // the per-run cost rollup, which undercounts invocations a backend
 // reported no tokens for (known_usage=false, #685), so the real spend is
 // at least the figure shown.
-func renderBudgetAlertBody(c commentContext, p BudgetAlertPayload) string {
+func renderBudgetAlertBody(c commentContext, p BudgetAlertPayload, externalURL string) string {
 	var b strings.Builder
 	headline := "approaching its"
 	if p.Tier == "over" {
 		headline = "has exhausted its"
 	}
-	fmt.Fprintf(&b, "Workflow `%s` %s %s cost budget on Run [`%s`](%s).\n\n",
-		p.WorkflowID, headline, p.Period, shortID(c.run.ID), c.runURL)
+	// The run reference degrades to a plain backticked short-id when the base
+	// URL is unset (#1787) via runShortLink.
+	fmt.Fprintf(&b, "Workflow `%s` %s %s cost budget on Run %s.\n\n",
+		p.WorkflowID, headline, p.Period, runShortLink(externalURL, c.run.ID))
 	fmt.Fprintf(&b, "- **Period spend**: $%.2f of $%.2f (%.0f%%)\n",
 		p.Spent, p.Limit, p.Fraction*100)
 	if p.Tier == "warn" && p.WarnAt != nil {
@@ -1848,7 +1867,7 @@ func (n *Notifier) contextFor(ctx context.Context, runID uuid.UUID, kind Kind) (
 		run:         runRow,
 		repo:        repo,
 		issueNumber: number,
-		runURL:      n.externalURL + "/runs/" + runID.String(),
+		runURL:      runURLFor(n.externalURL, runID),
 	}, true, nil
 }
 

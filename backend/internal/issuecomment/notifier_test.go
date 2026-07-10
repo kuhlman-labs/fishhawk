@@ -696,6 +696,57 @@ func TestNotifyPageClassForRun_FiresRejectPingImmediately(t *testing.T) {
 	}
 }
 
+// TestNotifyPageClassForRun_UnsetExternalURL_PingHasNoLink pins #1787 for the
+// firePings body end-to-end: a notifier built with an UNSET ExternalURL still
+// posts the reviewer-reject ping, but the body carries the bare message with no
+// anchor link and no localhost literal (the constructor no longer bails, and
+// the ping degrades link-less).
+func TestNotifyPageClassForRun_UnsetExternalURL_PingHasNoLink(t *testing.T) {
+	runID := uuid.New()
+	triggerRef := "issue:42"
+	stages := []*run.Stage{
+		{ID: uuid.New(), RunID: runID, Sequence: 1, Type: run.StageTypeImplement, State: run.StageStateRunning},
+	}
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID:             runID,
+			Repo:           "x/y",
+			WorkflowID:     "feature_change",
+			TriggerSource:  run.TriggerGitHubIssue,
+			TriggerRef:     &triggerRef,
+			InstallationID: int64Ptr(99),
+			State:          run.StateRunning,
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: stages},
+	}
+	gh := &fakeGitHub{}
+	au := &fakeAudit{}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: repoRuns, Audit: au,
+		// ExternalURL deliberately unset.
+		Now: func() time.Time { return time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC) },
+	})
+	if n == nil {
+		t.Fatal("notifier should construct with an unset ExternalURL (#1787)")
+	}
+	au.preSeed(runID, "implement_reviewed", map[string]any{"verdict": "reject", "reviewer_model": "gpt-5.5"})
+
+	if err := n.NotifyPageClassForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyPageClassForRun: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected exactly 1 ping comment; got %d", len(gh.calls))
+	}
+	body := gh.calls[0].body
+	if !strings.Contains(body, "flagged a blocking concern") {
+		t.Errorf("ping body missing reviewer-reject wording: %q", body)
+	}
+	if strings.Contains(body, "localhost") || strings.Contains(body, "/runs/") ||
+		strings.Contains(body, "](/") || strings.Contains(body, "View the run") {
+		t.Errorf("unset-URL ping must carry no run link: %q", body)
+	}
+}
+
 // TestNotifyPageClassForRun_SkipsResolvedRejectButRecordsDedup proves the
 // proposal-2 skip path: a reject already resolved by a later
 // stage_fixup_triggered records the dedup row WITHOUT posting, and a second
@@ -1024,7 +1075,6 @@ func TestNew_NilDepsReturnsNilNotifier(t *testing.T) {
 		{"no github", issuecomment.Deps{Runs: &fakeRuns{}, Audit: &fakeAudit{}, ExternalURL: "x"}},
 		{"no runs", issuecomment.Deps{GitHub: &fakeGitHub{}, Audit: &fakeAudit{}, ExternalURL: "x"}},
 		{"no audit", issuecomment.Deps{GitHub: &fakeGitHub{}, Runs: &fakeRuns{}, ExternalURL: "x"}},
-		{"no external url", issuecomment.Deps{GitHub: &fakeGitHub{}, Runs: &fakeRuns{}, Audit: &fakeAudit{}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1032,6 +1082,23 @@ func TestNew_NilDepsReturnsNilNotifier(t *testing.T) {
 				t.Errorf("expected nil; got %+v", n)
 			}
 		})
+	}
+}
+
+// TestNew_EmptyExternalURLStillConstructs pins the #1787 constructor-guard
+// relaxation: with GitHub / Runs / Audit wired but ExternalURL empty, New no
+// longer bails — the notifier constructs so link-less comments still post (the
+// dogfood posture leaves ExternalURL unset). The nil dividing line is "no
+// GitHub client", asserted by the "no github" case above.
+func TestNew_EmptyExternalURLStillConstructs(t *testing.T) {
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub: &fakeGitHub{},
+		Runs:   &fakeRuns{},
+		Audit:  &fakeAudit{},
+		// ExternalURL deliberately empty.
+	})
+	if n == nil {
+		t.Fatal("empty ExternalURL should still construct a notifier (#1787); got nil")
 	}
 }
 

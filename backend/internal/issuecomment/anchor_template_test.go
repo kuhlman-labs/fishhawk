@@ -71,6 +71,45 @@ func TestRenderAnchorBody_SliceIntegrationTimeline(t *testing.T) {
 	}
 }
 
+// TestRenderAnchorBody_UnsetExternalURL_DegradesLinks pins #1787 at the issue
+// anchor locus: with the base URL unset the header renders the plain backticked
+// short-id (no link) and the footer omits the "view run" link entirely (leaving
+// no dangling middot before the PR link), and nothing leaks a localhost literal
+// or a relative run link. With the base URL configured the absolute link
+// returns.
+func TestRenderAnchorBody_UnsetExternalURL_DegradesLinks(t *testing.T) {
+	r := anchorRun()
+	prURL := "https://github.com/kuhlman-labs/fishhawk/pull/7"
+	r.PullRequestURL = &prURL
+	in := AnchorInput{
+		Run:    r,
+		Stages: []*run.Stage{{Type: run.StageTypeImplement, State: run.StageStateRunning}},
+		Now:    time.Unix(1000, 0).UTC(),
+	}
+
+	unset := RenderAnchorBody(in)
+	if strings.Contains(unset, "localhost") || strings.Contains(unset, "/runs/") || strings.Contains(unset, "](/") {
+		t.Errorf("unset anchor leaked a run link:\n%s", unset)
+	}
+	if !strings.Contains(unset, "**Fishhawk run `11111111`**") {
+		t.Errorf("unset anchor header should carry the plain backticked short-id:\n%s", unset)
+	}
+	// The PR link survives (it is not derived from the base URL), and there is
+	// no leading "· " before it (the omitted run link took no separator).
+	if !strings.Contains(unset, "[Pull request →]("+prURL+")") {
+		t.Errorf("unset anchor should still carry the PR link:\n%s", unset)
+	}
+	if strings.Contains(unset, "· [Pull request →]") {
+		t.Errorf("unset anchor footer left a dangling middot before the PR link:\n%s", unset)
+	}
+
+	in.ExternalURL = "https://app.example"
+	cfg := RenderAnchorBody(in)
+	if !strings.Contains(cfg, "https://app.example/runs/"+r.ID.String()) {
+		t.Errorf("configured anchor should carry the absolute run link:\n%s", cfg)
+	}
+}
+
 // TestRenderAnchorBody_DeployTimeline pins E23.5 / #1385: the deploy
 // governance audit kinds surface on the living-anchor timeline (which reuses
 // pickActivity + renderActivityLine), so a completed deploy's outcome renders

@@ -52,10 +52,8 @@ func RenderStatusBody(runRow *run.Run, stages []*run.Stage, recentAudit []*audit
 }
 
 func writeHeader(b *strings.Builder, r *run.Run, externalURL string) {
-	short := shortID(r.ID)
-	runURL := externalURL + "/runs/" + r.ID.String()
-	fmt.Fprintf(b, "**Fishhawk run [`%s`](%s)** — `%s` · %s\n",
-		short, runURL, r.WorkflowID, runStateIcon(r.State)+" "+string(r.State))
+	fmt.Fprintf(b, "**Fishhawk run %s** — `%s` · %s\n",
+		runShortLink(externalURL, r.ID), r.WorkflowID, runStateIcon(r.State)+" "+string(r.State))
 }
 
 func writeStages(b *strings.Builder, stages []*run.Stage) {
@@ -73,12 +71,18 @@ func writeStages(b *strings.Builder, stages []*run.Stage) {
 	}
 }
 
+// writeFooter joins the "view run" link (omitted when the base URL is unset,
+// #1787) and the optional pull-request link with the middot so an omitted run
+// link leaves no dangling separator.
 func writeFooter(b *strings.Builder, r *run.Run, externalURL string) {
-	runURL := externalURL + "/runs/" + r.ID.String()
-	fmt.Fprintf(b, "[View run →](%s)", runURL)
-	if r.PullRequestURL != nil && *r.PullRequestURL != "" {
-		fmt.Fprintf(b, " · [Pull request →](%s)", *r.PullRequestURL)
+	var parts []string
+	if link := viewRunLink("View run →", externalURL, r.ID); link != "" {
+		parts = append(parts, link)
 	}
+	if r.PullRequestURL != nil && *r.PullRequestURL != "" {
+		parts = append(parts, fmt.Sprintf("[Pull request →](%s)", *r.PullRequestURL))
+	}
+	b.WriteString(strings.Join(parts, " · "))
 	b.WriteString("\n")
 }
 

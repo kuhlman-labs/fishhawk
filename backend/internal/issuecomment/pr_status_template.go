@@ -68,17 +68,21 @@ func RenderPRStatusBody(in PRStatusInput) string {
 		return ""
 	}
 	externalURL := strings.TrimRight(in.ExternalURL, "/")
-	runURL := externalURL + "/runs/" + in.Run.ID.String()
+	// runURL is the bare run-page URL used only by the oversize truncation
+	// fallback; "" when the base URL is unset so the fallback degrades link-less
+	// (#1787). The rendered surfaces thread externalURL through runShortLink /
+	// viewRunLink instead.
+	runURL := runURLFor(externalURL, in.Run.ID)
 
 	acc := buildPRAcceptance(in.Audit, in.AcceptanceArtifact)
 	s := prStatusSections{
-		header:          renderPRStatusHeader(in.Run, runURL),
+		header:          renderPRStatusHeader(in.Run, externalURL),
 		whatNow:         renderPRWhatNow(in.Run, in.Stages, acc),
 		reviews:         renderStageReviews("implement", in.Audit),
 		acceptanceFull:  renderPRAcceptance(acc, true),
 		acceptanceTally: renderPRAcceptance(acc, false),
 		fixups:          renderPRFixupHistory(in.Audit),
-		footer:          renderPRStatusFooter(in.Run, runURL),
+		footer:          renderPRStatusFooter(in.Run, externalURL),
 	}
 
 	// Degradation ladder: level 0 is everything; level 1 collapses the
@@ -134,9 +138,9 @@ func assemblePRStatus(s prStatusSections, level int) string {
 	return b.String()
 }
 
-func renderPRStatusHeader(r *run.Run, runURL string) string {
-	return fmt.Sprintf("**Fishhawk run [`%s`](%s)** — `%s` · %s %s",
-		shortID(r.ID), runURL, r.WorkflowID, runStateIcon(r.State), string(r.State))
+func renderPRStatusHeader(r *run.Run, externalURL string) string {
+	return fmt.Sprintf("**Fishhawk run %s** — `%s` · %s %s",
+		runShortLink(externalURL, r.ID), r.WorkflowID, runStateIcon(r.State), string(r.State))
 }
 
 // renderPRWhatNow is the merge-scoped "what now" line — a single sentence
@@ -170,13 +174,18 @@ func renderPRWhatNow(r *run.Run, stages []*run.Stage, acc *prAcceptanceView) str
 	return "_What now: run in progress._"
 }
 
-func renderPRStatusFooter(r *run.Run, runURL string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "[View run →](%s)", runURL)
-	if issueURL := issueURLFor(r); issueURL != "" {
-		fmt.Fprintf(&b, " · [Issue thread →](%s)", issueURL)
+// renderPRStatusFooter joins the "view run" link (omitted when the base URL is
+// unset, #1787) and the optional issue-thread link with the middot so an
+// omitted run link leaves no dangling separator.
+func renderPRStatusFooter(r *run.Run, externalURL string) string {
+	var parts []string
+	if link := viewRunLink("View run →", externalURL, r.ID); link != "" {
+		parts = append(parts, link)
 	}
-	return b.String()
+	if issueURL := issueURLFor(r); issueURL != "" {
+		parts = append(parts, fmt.Sprintf("[Issue thread →](%s)", issueURL))
+	}
+	return strings.Join(parts, " · ")
 }
 
 // issueURLFor rebuilds the triggering issue's GitHub URL from the run's repo +

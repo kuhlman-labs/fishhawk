@@ -40,6 +40,46 @@ func acceptanceArtifactJSON(t *testing.T, verdict string, criteria []map[string]
 	return b
 }
 
+// TestRenderPRStatusBody_UnsetExternalURL_DegradesLinks pins #1787 at the E42.1
+// sticky PR-status-comment locus (binding condition 1): with the base URL unset
+// the header renders the plain backticked short-id (no link) and the footer
+// omits the "view run" link (no dangling middot before the Issue-thread link),
+// with no localhost / relative run link leaking. Configured, the absolute link
+// returns.
+func TestRenderPRStatusBody_UnsetExternalURL_DegradesLinks(t *testing.T) {
+	r := prStatusRun()
+	in := PRStatusInput{
+		Run:    r,
+		Stages: []*run.Stage{{Type: run.StageTypeReview, State: run.StageStateRunning}},
+		Now:    time.Unix(1000, 0).UTC(),
+	}
+
+	unset := RenderPRStatusBody(in)
+	if strings.Contains(unset, "localhost") || strings.Contains(unset, "/runs/") || strings.Contains(unset, "](/") {
+		t.Errorf("unset PR status comment leaked a run link:\n%s", unset)
+	}
+	if !strings.Contains(unset, "**Fishhawk run `11111111`**") {
+		t.Errorf("unset PR status header should carry the plain backticked short-id:\n%s", unset)
+	}
+	if strings.Contains(unset, "View run") {
+		t.Errorf("unset PR status footer should omit the View run link:\n%s", unset)
+	}
+	// The Issue-thread link is a github.com URL, not derived from the base URL,
+	// so it survives — and there is no dangling middot before it.
+	if !strings.Contains(unset, "[Issue thread →](https://github.com/octo/cat/issues/42)") {
+		t.Errorf("unset PR status footer should still carry the Issue-thread link:\n%s", unset)
+	}
+	if strings.Contains(unset, "· [Issue thread →]") {
+		t.Errorf("unset PR status footer left a dangling middot before the Issue link:\n%s", unset)
+	}
+
+	in.ExternalURL = "https://app.example"
+	cfg := RenderPRStatusBody(in)
+	if !strings.Contains(cfg, "https://app.example/runs/"+r.ID.String()) {
+		t.Errorf("configured PR status comment should carry the absolute run link:\n%s", cfg)
+	}
+}
+
 // TestRenderPRStatusBody_HeaderAndWhatNow pins the header state icon and the
 // merge-scoped "what now" line for the running / accepted / rejected states.
 func TestRenderPRStatusBody_HeaderAndWhatNow(t *testing.T) {

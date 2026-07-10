@@ -646,11 +646,13 @@ func New(cfg Config) *Server {
 			OnRecovered: s.auditCheckPublishRecovered,
 		})
 		// Wire the GitHub-comment channel behind the Router seam (ADR-015
-		// #79). Guard the wrap on a non-nil channel so a nil notifier
-		// (e.g. empty ExternalURL) leaves s.issueNotifier as a nil
-		// interface, NOT a non-nil Router over a typed-nil channel —
-		// preserving the exact nil semantics approvalCommandConfigured and
-		// the trace.go guards depend on (no behavior change).
+		// #79). Guard the wrap on a non-nil channel so a nil notifier leaves
+		// s.issueNotifier as a nil interface, NOT a non-nil Router over a
+		// typed-nil channel — preserving the exact nil semantics
+		// approvalCommandConfigured and the trace.go guards depend on. Since
+		// #1787 the notifier is nil ONLY when GitHub is unwired (an empty
+		// ExternalURL no longer suppresses it — comments post with link-less
+		// short-ids), so this guard now hinges on the GitHub client alone.
 		if ghChannel := issuecomment.New(issuecomment.Deps{
 			GitHub:      cfg.GitHub,
 			Runs:        cfg.RunRepo,
