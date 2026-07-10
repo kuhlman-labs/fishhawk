@@ -86,7 +86,8 @@ workflows:
             - provider: claudecode
               model: claude-opus-4-8
             - provider: codex
-              model: gpt-5.5
+              model: gpt-5.6-terra
+              reasoning_effort: high
           human: 1
         inputs:
           - source: github_issue
@@ -148,7 +149,8 @@ workflows:
             - provider: claudecode
               model: claude-opus-4-8
             - provider: codex
-              model: gpt-5.5
+              model: gpt-5.6-terra
+              reasoning_effort: high
           human: 1
         inputs:
           - artifact: plan
