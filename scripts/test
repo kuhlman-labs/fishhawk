@@ -74,46 +74,50 @@ _lease_token() {
   printf '%s' "${FISHHAWK_TEST_LEASE_TOKEN:-$$}"
 }
 
-# _lease_lock: acquire the mkdir-based lock guarding the register/reap critical
-# sections. mkdir is atomic on POSIX, so exactly one racer wins. The lock records
-# its owner PID inside the lock dir; before each retry the spin loop checks that
-# owner with `kill -0` and BREAKS a lock whose owner is dead (rm -rf, then retry
-# mkdir) so a SIGKILL'd holder can never permanently wedge later invocations. A
-# lock that stays OWNERLESS (empty/garbage owner file) past a bounded grace
-# window is ALSO broken: the winner stamps its PID on the line immediately after
-# mkdir, so a persistently ownerless lock means the holder was SIGKILL'd in that
-# acquisition window before stamping — an ownerless-forever wedge the kill -0
-# check alone cannot recover (there is no PID to test). The grace window
-# tolerates the sub-poll transient where a live holder simply hasn't stamped yet.
+# _lease_lock: acquire the lock guarding the register/reap critical sections.
+# The lock is an atomically-created SYMLINK whose target IS the holder's owner
+# PID, so it carries its owner from the instant it exists: symlink(2) is a single
+# atomic syscall that fails EEXIST if the path is already taken, and there is NO
+# separate stamp step. Exactly one racer wins; the loser reads the winner's PID
+# via `readlink`. Before each retry the spin loop breaks a lock whose owner PID
+# is dead (`kill -0` fails → rm, then retry) so a SIGKILL'd holder can never
+# permanently wedge later invocations.
+#
+# Because acquisition is atomic there is NO window in which the lock exists yet
+# is unowned. That eliminates BY CONSTRUCTION both the old mkdir-then-stamp lock's
+# ownerless-forever wedge (a holder SIGKILL'd between mkdir and stamping) AND its
+# live-but-delayed acquisition race (a live holder paused before stamping whose
+# "ownerless" lock a concurrent breaker could remove and then double-enter the
+# critical section, #1792 fixup). A grace-window heuristic could only trade those
+# two off; the symlink carries its owner atomically so a live holder's lock can
+# never be seen as ownerless and broken out from under it. An empty/garbage link
+# target is therefore never a live claim — only a crash leftover, a corrupt link,
+# or a stray inner link left when `ln -s` landed inside a leftover dir-form lock
+# (the readlink-equals-$$ re-check catches that) — and is safe to break.
+#
 # Returns non-zero if the bounded retry cap is exhausted with a LIVE owner still
 # holding it (stuck) — callers must then fail SAFE (never docker-rm under an
 # uncertain lease state).
 _lease_lock() {
   local lock="$LEASE_DIR.lock"
   local cap="${FISHHAWK_TEST_LEASE_LOCK_CAP:-50}"
-  local grace="${FISHHAWK_TEST_LEASE_LOCK_GRACE:-10}"
-  local tries=0 ownerless=0 owner
-  while ! mkdir "$lock" 2>/dev/null; do
-    owner=""
-    if [ -r "$lock/owner" ]; then
-      owner="$(cat "$lock/owner" 2>/dev/null || true)"
-    fi
+  local tries=0 owner
+  # Atomic acquire: ln -s creates the lock with our PID as its target in one
+  # syscall. The readlink-equals-$$ re-check rejects the case where ln "succeeded"
+  # by landing a stray link inside a leftover dir-form lock (which the break
+  # branch below then clears), so only a genuine atomic claim returns success.
+  while ! { ln -s "$$" "$lock" 2>/dev/null && [ "$(readlink "$lock" 2>/dev/null)" = "$$" ]; }; do
+    owner="$(readlink "$lock" 2>/dev/null || true)"
     case "$owner" in
       ''|*[!0-9]*)
-        # No/garbage owner: either a holder that has not stamped its PID yet
-        # (sub-poll transient) or one SIGKILL'd between mkdir and stamping
-        # (ownerless forever). Distinguish by persistence — break the lock once
-        # it has stayed ownerless for `grace` consecutive polls.
-        ownerless=$((ownerless + 1))
-        if [ "$ownerless" -ge "$grace" ]; then
-          rm -rf "$lock" 2>/dev/null || true  # ownerless-window death → break it
-          ownerless=0
-        fi
+        # No/garbage owner target: NOT a live-holder claim (a live acquire always
+        # carries its PID atomically). A crash leftover, corrupt link, or stray
+        # inner link from an older dir-form lock — break it and retry.
+        rm -rf "$lock" 2>/dev/null || true
         ;;
       *)
-        ownerless=0
         if ! kill -0 "$owner" 2>/dev/null; then
-          rm -rf "$lock" 2>/dev/null || true  # dead owner → break the stale lock
+          rm -f "$lock" 2>/dev/null || true  # dead owner → break the stale lock
         fi
         ;;
     esac
@@ -123,7 +127,6 @@ _lease_lock() {
     fi
     sleep 0.1
   done
-  printf '%s\n' "$$" > "$lock/owner" 2>/dev/null || true
   return 0
 }
 

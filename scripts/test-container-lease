@@ -94,21 +94,21 @@ else
   fail "stale-lease: expected dead lease pruned + 1 docker rm, got $(rm_count) (dir exists: $([ -d "$LEASE_DIR" ] && echo yes || echo no))"
 fi
 
-# (d) stale-lock-broken: a lock dir left by a DEAD owner PID is broken so the
-# operation proceeds — binding condition (2)/(4). Reap is the last holder, so a
-# successful break lets it docker rm exactly once and release the lock.
+# (d) stale-lock-broken: a lock left by a DEAD owner PID is broken so the
+# operation proceeds — binding condition (2)/(4). The lock is a symlink whose
+# target IS the owner PID. Reap is the last holder, so a successful break lets it
+# docker rm exactly once and release the lock.
 reset_case d
 export FISHHAWK_TEST_LEASE_TOKEN=$$
 mkdir -p "$LEASE_DIR"
 : > "$LEASE_DIR/$(_lease_token)"          # our lease → reap is last holder
-mkdir -p "$LEASE_DIR.lock"
 dead_owner=$(bash -c 'echo $$')          # dead PID as the lock's recorded owner
-printf '%s\n' "$dead_owner" > "$LEASE_DIR.lock/owner"
+ln -s "$dead_owner" "$LEASE_DIR.lock"     # stale lock owned by a dead PID
 _reap_shared_container
-if [ "$(rm_count)" -eq 1 ] && [ ! -d "$LEASE_DIR.lock" ]; then
+if [ "$(rm_count)" -eq 1 ] && [ ! -L "$LEASE_DIR.lock" ]; then
   pass "stale-lock-broken: dead-owner lock broken, reap proceeds and releases lock"
 else
-  fail "stale-lock-broken: expected lock broken + 1 docker rm, got $(rm_count) (lock exists: $([ -d "$LEASE_DIR.lock" ] && echo yes || echo no))"
+  fail "stale-lock-broken: expected lock broken + 1 docker rm, got $(rm_count) (lock exists: $([ -L "$LEASE_DIR.lock" ] && echo yes || echo no))"
 fi
 
 # (e) fail-safe on a live-but-stuck lock: a lock held by a LIVE owner is never
@@ -119,8 +119,7 @@ export FISHHAWK_TEST_LEASE_TOKEN=$$
 export FISHHAWK_TEST_LEASE_LOCK_CAP=2     # short cap so the test is fast
 mkdir -p "$LEASE_DIR"
 : > "$LEASE_DIR/$(_lease_token)"
-mkdir -p "$LEASE_DIR.lock"
-printf '%s\n' "$$" > "$LEASE_DIR.lock/owner"  # live owner (this process)
+ln -s "$$" "$LEASE_DIR.lock"              # live owner (this process), atomic lock
 _reap_shared_container
 if [ "$(rm_count)" -eq 0 ]; then
   pass "fail-safe: live-but-stuck lock leaves the container (no docker rm)"
@@ -128,25 +127,36 @@ else
   fail "fail-safe: expected 0 docker rm under a live-stuck lock, got $(rm_count)"
 fi
 unset FISHHAWK_TEST_LEASE_LOCK_CAP
+rm -rf "$LEASE_DIR.lock"                  # release the synthetic live lock
 
-# (g) stale-lock-broken (ownerless acquisition window): a lock dir left with NO
-# owner file — a holder SIGKILL'd between mkdir and stamping its PID — is broken
-# once it stays ownerless past the grace window, so the operation proceeds. This
-# is the acquisition-window failure the populated-dead-owner case (d) does not
-# cover. Reap is the last holder, so a successful break lets it docker rm once.
+# (g) live-delayed-acquire safety (#1792 fixup): the old mkdir-then-stamp lock had
+# a window where a holder had mkdir'd the lock but not yet written its owner PID;
+# a concurrent breaker could rm that "ownerless" dir after the grace window and
+# enter the critical section ALONGSIDE the delayed-but-live holder, so both could
+# reap the shared container concurrently. The lock is now an atomically-created
+# symlink whose target IS the owner PID, so a live holder's lock carries its owner
+# from the instant it exists and is NEVER observed as ownerless. Assert the
+# now-impossible race is closed: a lock held by a LIVE owner is NOT broken by a
+# concurrent _lease_lock attempt — it exhausts its cap and fails (return 1) with
+# the live lock intact, so no second party can enter the critical section.
 reset_case g
 export FISHHAWK_TEST_LEASE_TOKEN=$$
-export FISHHAWK_TEST_LEASE_LOCK_GRACE=2    # short grace so the test is fast
-mkdir -p "$LEASE_DIR"
-: > "$LEASE_DIR/$(_lease_token)"           # our lease → reap is last holder
-mkdir -p "$LEASE_DIR.lock"                 # lock dir with NO owner file stamped
-_reap_shared_container
-if [ "$(rm_count)" -eq 1 ] && [ ! -d "$LEASE_DIR.lock" ]; then
-  pass "stale-lock-broken-ownerless: acquisition-window lock broken, reap proceeds"
+export FISHHAWK_TEST_LEASE_LOCK_CAP=2      # short cap so the test is fast
+sleep 60 &                                 # a live "delayed" holder
+live_holder=$!
+disown "$live_holder" 2>/dev/null || true  # silence job-control "Terminated" noise
+ln -s "$live_holder" "$LEASE_DIR.lock"      # its atomic lock: target = live PID
+_lease_lock                                # a concurrent invocation racing for it
+lock_rc=$?
+kill "$live_holder" 2>/dev/null
+if [ "$lock_rc" -ne 0 ] && [ -L "$LEASE_DIR.lock" ] \
+   && [ "$(readlink "$LEASE_DIR.lock" 2>/dev/null)" = "$live_holder" ]; then
+  pass "live-delayed-acquire: live holder's atomic lock never broken (no ownerless window)"
 else
-  fail "stale-lock-broken-ownerless: expected lock broken + 1 docker rm, got $(rm_count) (lock exists: $([ -d "$LEASE_DIR.lock" ] && echo yes || echo no))"
+  fail "live-delayed-acquire: expected acquire to fail with live lock intact (rc=$lock_rc, lock exists: $([ -L "$LEASE_DIR.lock" ] && echo yes || echo no))"
 fi
-unset FISHHAWK_TEST_LEASE_LOCK_GRACE
+unset FISHHAWK_TEST_LEASE_LOCK_CAP
+rm -rf "$LEASE_DIR.lock"                    # release the synthetic live lock
 
 # (h) register-timeout lifecycle: when the lock is live-stuck, _register_lease
 # records NO lease and returns non-zero, and _arm_container_lease then does NOT
@@ -161,8 +171,7 @@ sleep 60 &                                # a concurrent invocation still testin
 other=$!
 disown "$other" 2>/dev/null || true       # silence job-control "Terminated" noise
 : > "$LEASE_DIR/$other"                   # its live lease keeps the dir non-empty
-mkdir -p "$LEASE_DIR.lock"
-printf '%s\n' "$$" > "$LEASE_DIR.lock/owner"  # live owner (this process) → stuck
+ln -s "$$" "$LEASE_DIR.lock"              # live owner (this process) → stuck
 _register_lease
 reg_rc=$?
 saved_trap="$(trap -p EXIT)"              # preserve the test's own cleanup trap
