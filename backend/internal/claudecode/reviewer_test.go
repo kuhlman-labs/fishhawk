@@ -2,9 +2,12 @@ package claudecode
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -83,6 +86,31 @@ func TestHelperProcess(t *testing.T) {
 		// the child is killed with ctx.Err()==DeadlineExceeded (the
 		// timeout class, which must NOT be retried).
 		time.Sleep(5 * time.Second)
+	case "pipe_leak_group":
+		// The #1805 latent hang, group-kill arm: fork a grandchild that
+		// inherits this stdout pipe and holds it open, staying in this process
+		// GROUP; then this fake claude sleeps past the review deadline. A naive
+		// single-child kill would leave the grandchild holding the pipe and
+		// wedge cmd.Output(); procgroup.Harden's whole-group SIGKILL reaps both.
+		spawnGrandchild(false)
+		time.Sleep(30 * time.Second)
+	case "pipe_leak_escape":
+		// The #1805 latent hang, WaitDelay arm: fork a grandchild that ESCAPES
+		// this process group (self-setpgid) and holds the inherited stdout pipe,
+		// then exit immediately. The group kill cannot reach the escaped
+		// grandchild, so only cmd.WaitDelay can force-close the parent-side pipe
+		// fd — the branch whose forced return is a non-ExitError the timeout
+		// hoist must still classify.
+		spawnGrandchild(true)
+		// exit immediately (deferred os.Exit(0)), leaving the pipe held.
+	case "pipe_grandchild":
+		// The stdout-inheriting grandchild forked by the pipe_leak_* modes:
+		// record our pid so the driving test can assert reap/survival, then hold
+		// the inherited stdout open well past any deadline+grace.
+		if pf := os.Getenv("HELPER_GC_PIDFILE"); pf != "" {
+			_ = os.WriteFile(pf, []byte(strconv.Itoa(os.Getpid())), 0o600)
+		}
+		time.Sleep(30 * time.Second)
 	case "slow_brief":
 		// Sleep longer than a short cfg.Timeout but shorter than an incoming
 		// ctx deadline, then succeed. Used to prove invokeOnce honours the
@@ -123,6 +151,184 @@ func reviewerWithMode(mode string) *Reviewer {
 	r := NewReviewer(testConfig())
 	r.client.Cmd = helperCommand(mode)
 	return r
+}
+
+// spawnGrandchild re-execs the test binary as a stdout-inheriting grandchild of
+// the fake claude process (the pipe_grandchild mode). escape=true makes it its
+// own process-group leader so procgroup.Harden's kill(-pgid) misses it (the
+// WaitDelay path); escape=false leaves it in the fake claude's group so the
+// group kill reaps it. Used only inside TestHelperProcess (the fake-claude
+// re-exec).
+func spawnGrandchild(escape bool) {
+	gc := exec.Command(os.Args[0], "-test.run=TestHelperProcess") //nolint:gosec // re-exec of the test binary itself
+	env := append(os.Environ(), "GO_HELPER_PROCESS=1", "HELPER_MODE=pipe_grandchild")
+	if pf := os.Getenv("HELPER_GC_PIDFILE"); pf != "" {
+		env = append(env, "HELPER_GC_PIDFILE="+pf)
+	}
+	gc.Env = env
+	gc.Stdout = os.Stdout // inherit the pipe write-end so it stays open after the fake claude dies
+	if escape {
+		gc.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
+	_ = gc.Start()
+}
+
+// countingPipeLeakHelper returns a Cmd-builder for a pipe_leak_* mode that
+// threads HELPER_GC_PIDFILE through to the fake claude (so the forked grandchild
+// records its pid) and counts subprocess attempts.
+func countingPipeLeakHelper(mode, pidfile string, attempts *int) func(ctx context.Context, name string, args ...string) *exec.Cmd {
+	return func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		*attempts++
+		c := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess")
+		c.Env = append(os.Environ(),
+			"GO_HELPER_PROCESS=1",
+			"HELPER_MODE="+mode,
+			"HELPER_GC_PIDFILE="+pidfile,
+		)
+		return c
+	}
+}
+
+// setKillGrace overrides the package killGrace (the procgroup.Harden WaitDelay)
+// for a timing-sensitive test and returns a restore func.
+func setKillGrace(d time.Duration) func() {
+	prev := killGrace
+	killGrace = d
+	return func() { killGrace = prev }
+}
+
+// killPidFromFile best-effort SIGKILLs the pid recorded in pidfile — cleanup for
+// an escaped grandchild the group kill cannot reap.
+func killPidFromFile(pidfile string) {
+	if b, err := os.ReadFile(pidfile); err == nil {
+		if pid, perr := strconv.Atoi(string(b)); perr == nil && pid > 0 {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+}
+
+// pidAliveFromFile reports whether the pid recorded in pidfile is still live.
+func pidAliveFromFile(t *testing.T, pidfile string) bool {
+	t.Helper()
+	b, err := os.ReadFile(pidfile)
+	if err != nil {
+		t.Fatalf("read grandchild pidfile %s: %v", pidfile, err)
+	}
+	pid, err := strconv.Atoi(string(b))
+	if err != nil {
+		t.Fatalf("parse grandchild pid %q: %v", b, err)
+	}
+	return syscall.Kill(pid, 0) == nil
+}
+
+// waitPidGone polls until the pid recorded in pidfile is gone, or fails the test.
+func waitPidGone(t *testing.T, pidfile string) {
+	t.Helper()
+	var pid int
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if b, err := os.ReadFile(pidfile); err == nil {
+			if p, perr := strconv.Atoi(string(b)); perr == nil && p > 0 {
+				pid = p
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if pid == 0 {
+		t.Fatalf("grandchild never wrote its pid to %s", pidfile)
+	}
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if syscall.Kill(pid, 0) != nil {
+			return // gone
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL) // best-effort cleanup on failure
+	t.Errorf("grandchild pid %d still alive — the group kill did not reap it", pid)
+}
+
+// TestReviewer_PipeLeakGroupKillTimeout is the #1805 group-kill arm through the
+// full Review()/Inference() path: a wedged fake claude holds an in-group
+// grandchild that inherited stdout, run under a genuine incoming context
+// DEADLINE. procgroup.Harden's whole-group SIGKILL reaps the grandchild so
+// cmd.Output() returns AT the deadline (not minutes later), the error is the
+// (timeout) classification, the deadline (not a bare cancel) is the trigger, the
+// attempt is not retried, and the grandchild is reaped.
+func TestReviewer_PipeLeakGroupKillTimeout(t *testing.T) {
+	pidfile := filepath.Join(t.TempDir(), "gc.pid")
+	defer setKillGrace(10 * time.Second)() // a long grace: group-kill must return well before it
+
+	var attempts int
+	r := NewReviewer(testConfig())
+	r.client.Cmd = countingPipeLeakHelper("pipe_leak_group", pidfile, &attempts)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, _, err := r.Review(ctx, "review this plan")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected a timeout error from the wedged reviewer, got nil")
+	}
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("ctx.Err() = %v, want context.DeadlineExceeded (the deadline, not a bare cancel, must be the trigger)", ctx.Err())
+	}
+	if !strings.Contains(err.Error(), "timeout") {
+		t.Errorf("error = %q, want it labelled a timeout", err)
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("Review took %s — the group kill should return at the deadline, not wait the 10s grace (the #1805 hang)", elapsed)
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1 (a timeout must not be retried)", attempts)
+	}
+	waitPidGone(t, pidfile)
+}
+
+// TestReviewer_PipeLeakEscapedGroupWaitDelayTimeout is the #1805 WaitDelay arm
+// and the step-6 hoist guard: the fake claude forks a grandchild that ESCAPES
+// its group and holds the inherited stdout pipe, then exits. The group kill
+// cannot reach the escaped grandchild, so cmd.WaitDelay force-closes the parent
+// pipe fd and cmd.Output() returns a NON-ExitError. The HOISTED ctx.Err() check
+// must still classify this as a (timeout); the pre-hoist in-ExitError-branch code
+// would have mislabelled it a generic invocation failure. The trigger is
+// asserted to be a genuine deadline.
+func TestReviewer_PipeLeakEscapedGroupWaitDelayTimeout(t *testing.T) {
+	pidfile := filepath.Join(t.TempDir(), "gc.pid")
+	defer setKillGrace(300 * time.Millisecond)() // short grace so the WaitDelay path is fast
+	t.Cleanup(func() { killPidFromFile(pidfile) })
+
+	var attempts int
+	r := NewReviewer(testConfig())
+	r.client.Cmd = countingPipeLeakHelper("pipe_leak_escape", pidfile, &attempts)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, _, err := r.Review(ctx, "review this plan")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected a timeout error from the WaitDelay-forced return, got nil")
+	}
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("ctx.Err() = %v, want context.DeadlineExceeded (the deadline must be the trigger, not a bare cancel)", ctx.Err())
+	}
+	if !strings.Contains(err.Error(), "timeout") {
+		t.Errorf("error = %q, want the WaitDelay-forced non-ExitError return still classified as a timeout (the step-6 hoist)", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("Review took %s — WaitDelay should force-close near deadline+grace, not hang on the escaped grandchild", elapsed)
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1 (a timeout must not be retried)", attempts)
+	}
+	if !pidAliveFromFile(t, pidfile) {
+		t.Error("grandchild was reaped — it should have escaped the group and been force-closed via WaitDelay")
+	}
 }
 
 // countingHelperCommand wraps helperCommand to count how many times the Cmd
