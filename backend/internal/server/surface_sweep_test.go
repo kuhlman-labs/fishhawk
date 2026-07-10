@@ -93,6 +93,56 @@ func TestSurfacePatternsExistOnDisk(t *testing.T) {
 	}
 }
 
+// TestSurfaceCouplingPatternsForPrompt_MapsRegistry pins the #763/#1797
+// accessor: surfaceCouplingPatternsForPrompt() projects EVERY surfacePatterns
+// entry into the prompt wire type with no drift (single source of truth), and
+// in particular carries the notifier.go<->status_template.go actor-@-mention
+// coupling — the exact miss #1797 targets.
+func TestSurfaceCouplingPatternsForPrompt_MapsRegistry(t *testing.T) {
+	got := surfaceCouplingPatternsForPrompt()
+	if len(got) != len(surfacePatterns) {
+		t.Fatalf("accessor mapped %d patterns, registry has %d — projection must be 1:1", len(got), len(surfacePatterns))
+	}
+	for i, src := range surfacePatterns {
+		if got[i].Name != src.Name {
+			t.Errorf("pattern %d name: got %q want %q", i, got[i].Name, src.Name)
+		}
+		if !reflect.DeepEqual(got[i].Triggers, src.Triggers) {
+			t.Errorf("pattern %d triggers: got %v want %v", i, got[i].Triggers, src.Triggers)
+		}
+		if !reflect.DeepEqual(got[i].Siblings, src.Siblings) {
+			t.Errorf("pattern %d siblings: got %v want %v", i, got[i].Siblings, src.Siblings)
+		}
+	}
+
+	// The actor @-mention render pattern must be present with both members —
+	// the notifier.go / status_template.go lockstep coupling #1797 targets.
+	var found bool
+	for _, p := range got {
+		if p.Name != "actor @-mention render surfaces" {
+			continue
+		}
+		found = true
+		hasNotifier := containsStrSlice(p.Triggers, "backend/internal/issuecomment/notifier.go")
+		hasTemplate := containsStrSlice(p.Siblings, "backend/internal/issuecomment/status_template.go")
+		if !hasNotifier || !hasTemplate {
+			t.Errorf("actor @-mention pattern missing lockstep members: triggers=%v siblings=%v", p.Triggers, p.Siblings)
+		}
+	}
+	if !found {
+		t.Errorf("accessor did not include the actor @-mention render surfaces pattern")
+	}
+}
+
+func containsStrSlice(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestEvaluateSurfaceSweep(t *testing.T) {
 	const (
 		statusTemplate = "backend/internal/issuecomment/status_template.go"

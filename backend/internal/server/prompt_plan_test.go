@@ -537,6 +537,54 @@ func TestImplementPrompt_BothEndpointsProduceIdenticalBody(t *testing.T) {
 	}
 }
 
+// TestPlanPrompt_SurfaceCouplingSiblingMap_NamesLockstepSibling is the
+// cross-boundary done-means test for #1797: the plan-stage prompt built via
+// handleGetStagePrompt must name status_template.go as notifier.go's required
+// lockstep sibling, proving the server accessor → prompt.Trigger →
+// buildPlan render seam is wired end-to-end. It asserts SHIPPED behavior (a
+// no-op touch that fails to thread the registry fails this test, Done-means
+// rule #1169). The plan stage needs no plan artifact — the sibling map renders
+// from the static surfacePatterns registry alone.
+func TestPlanPrompt_SurfaceCouplingSiblingMap_NamesLockstepSibling(t *testing.T) {
+	s, rr, _, _, sf, gh := newImplementPromptServer(t)
+	runID, planStageID, _, _ := seedRunWithStages(rr)
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Multi-surface change", Body: "ctx"}
+
+	priv, _ := sf.issue(t, runID)
+	w := promptRequestForStage(t, s, runID, planStageID, priv)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Surface-coupling sibling map",
+		"backend/internal/issuecomment/notifier.go",
+		"backend/internal/issuecomment/status_template.go",
+	} {
+		if !strings.Contains(resp.Prompt, want) {
+			t.Errorf("plan-stage prompt missing %q\n---\n%s", want, resp.Prompt)
+		}
+	}
+
+	// Locate the sibling-map section and confirm notifier.go and its lockstep
+	// sibling status_template.go co-occur on the same rendered pattern line —
+	// not merely elsewhere in the (large) prompt.
+	idx := strings.Index(resp.Prompt, "actor @-mention render surfaces")
+	if idx < 0 {
+		t.Fatalf("actor @-mention render surfaces pattern not rendered:\n%s", resp.Prompt)
+	}
+	line := resp.Prompt[idx:]
+	if nl := strings.IndexByte(line, '\n'); nl >= 0 {
+		line = line[:nl]
+	}
+	if !strings.Contains(line, "notifier.go") || !strings.Contains(line, "status_template.go") {
+		t.Errorf("actor @-mention pattern line does not name both lockstep siblings:\n%s", line)
+	}
+}
+
 func TestHandleGetStagePromptRender_BudgetContext(t *testing.T) {
 	// Seed a run with a 30m workflow policy and a plan artifact where
 	// predicted_runtime_minutes=9. Assert the implement-stage prompt

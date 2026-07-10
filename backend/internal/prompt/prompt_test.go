@@ -1269,6 +1269,60 @@ func TestBuild_Plan_CouplingDiscoveryChecklist(t *testing.T) {
 	}
 }
 
+// TestBuild_Plan_SurfaceCouplingSiblingMap_Rendered pins the #763/#1797
+// positive path: when the plan-stage Trigger carries SurfaceCouplingPatterns,
+// buildPlan renders the Surface-coupling sibling map subsection naming each
+// pattern's trigger path(s), its required sibling path(s), and the binding
+// also-scope-or-justify instruction.
+func TestBuild_Plan_SurfaceCouplingSiblingMap_Rendered(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 1797,
+		IssueTitle:  "Plan a multi-surface change",
+		Repo:        "x/y",
+		SurfaceCouplingPatterns: []SurfaceCouplingPattern{
+			{
+				Name:     "actor @-mention render surfaces",
+				Triggers: []string{"backend/internal/issuecomment/status_template.go", "backend/internal/issuecomment/notifier.go"},
+				Siblings: []string{"backend/internal/issuecomment/status_template.go", "backend/internal/issuecomment/notifier.go"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"Surface-coupling sibling map",
+		"actor @-mention render surfaces",
+		"backend/internal/issuecomment/status_template.go",
+		"backend/internal/issuecomment/notifier.go",
+		// the binding also-scope-or-justify instruction.
+		"or justify",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing surface-coupling sibling map guidance %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_Plan_SurfaceCouplingSiblingMap_EmptyOmitsSubsection pins the
+// negative/guard path (#1797): with no SurfaceCouplingPatterns the subsection
+// must NOT render, keeping the plan prompt byte-unchanged for a caller that
+// does not thread the registry (and every non-plan build).
+func TestBuild_Plan_SurfaceCouplingSiblingMap_EmptyOmitsSubsection(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 1797,
+		IssueTitle:  "Plan without the sibling map",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "Surface-coupling sibling map") {
+		t.Errorf("surface-coupling sibling map must be omitted when no patterns are threaded:\n%s", got)
+	}
+}
+
 // TestBuild_Plan_SingleOwnerFileRule pins the decomposition single-owner-file
 // guidance (#1472): every file path must appear in exactly one sub-plan's
 // scope.files, with the validator's reject message and the compile-shim
