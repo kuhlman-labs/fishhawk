@@ -2302,8 +2302,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				}
 				res.FailureReason = err.Error()
 				invokeErr = err
+				// Bound the runner_failed line's detail (#1791): the detached
+				// reaper (backend parseDetachedRunnerFailure) parses this line and
+				// re-POSTs its detail to the 32*1024-capped reap-failure endpoint,
+				// so a category-B failure whose err embeds the whole multi-module
+				// verify output would 413 the backstop too. res.FailureReason above
+				// keeps the full text for the trace bundle + local log.
 				_, _ = fmt.Fprintf(logSink,
-					`{"event":"runner_failed","reason":"pull_request_upload","detail":%q}`+"\n", err.Error())
+					`{"event":"runner_failed","reason":"pull_request_upload","detail":%q}`+"\n",
+					upload.TruncateReason(err.Error(), upload.MaxFailureReportReasonBytes))
 				// Report the failure to /pull-request so the backend fails the
 				// implement stage that its trace gate left in `running` (#742,
 				// #771, #794). Without this the gated stage would hang until the
@@ -2318,7 +2325,10 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				// restores the run to its pre-fix-up review gate. Best-effort —
 				// the failure exit stands regardless of whether the report lands.
 				if willOpenPR || willPushChild || willPushFixup {
-					reportPullRequestFailure(ctx, cfg, logSink, client, issuedKey, res.FailureCategory, err.Error())
+					// Best-effort here: this path already returns exitFailure, so the
+					// detached reaper backstop engages regardless of whether the report
+					// landed. The report error is logged inside reportPullRequestFailure.
+					_ = reportPullRequestFailure(ctx, cfg, logSink, client, issuedKey, res.FailureCategory, err.Error())
 				}
 				logCompletion(logSink, res, invokeErr)
 				return exitFailure
@@ -5016,7 +5026,9 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch strin
 	fail := func(category, reason string) int {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"runner_failed","reason":"scope_exempt_open_pr","detail":%q}`+"\n", reason)
-		reportPullRequestFailure(ctx, cfg, logSink, client, issued, category, reason)
+		// Best-effort: this closure returns exitFailure, so the detached reaper
+		// backstop engages regardless of whether the report landed.
+		_ = reportPullRequestFailure(ctx, cfg, logSink, client, issued, category, reason)
 		return exitFailure
 	}
 	if cfg.runID == "" || cfg.stageID == "" {
@@ -5685,9 +5697,16 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 				`{"event":"implement_child_no_changes","run_id":%q,"stage_id":%q,"shared_branch":%q,"base_sha":%q,"slice_index":%d}`+"\n",
 				cfg.runID, cfg.stageID, branch, cap.BaseSHA, runSliceIndex,
 			)
-			reportPullRequestFailure(ctx, cfg, logSink, client, issued, "C",
+			// Propagate a report failure (#1791, proposal c): a bare `return nil`
+			// after the in-band 'failed' report exits 0, so if that report is itself
+			// rejected (e.g. 413 body_too_large) the detached reaper backstop —
+			// which engages only on a NON-zero exit — never fires and the stage is
+			// re-stranded 'running'. Returning the report result makes run() set
+			// res.OK=false and exit exitFailure on a rejected report (engaging the
+			// reaper), while a landed report returns nil and keeps exit 0 (the
+			// backend already terminalized).
+			return reportPullRequestFailure(ctx, cfg, logSink, client, issued, "C",
 				childNoChangesReason(runSliceIndex))
-			return nil
 		}
 		// Non-fix-up no-changes (first implement pass, no forward gate): no PR to
 		// open; no artifact to ship. The stage still counts as succeeded — the
@@ -5956,9 +5975,17 @@ func childNoChangesReason(sliceIndex int) string {
 // category is "B" (ErrPullRequestInvalid / ErrCommitWouldNotCompile) or
 // "C" (network, git, GitHub API). Best-effort: a report failure is logged
 // but never changes the runner's exit — the failed exit already stands.
-func reportPullRequestFailure(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, category, reason string) {
+// reportPullRequestFailure ships a {outcome:"failed"} report so the backend
+// fails a stage the trace gate left in `running`. It returns nil when the report
+// landed (or when there is nothing to report against — no signing key/client),
+// and the report error otherwise. Proposal (c) of #1791: a terminal-reporter
+// path that today reports 'failed' then `return nil` (exit 0) can propagate this
+// error to exit non-zero, engaging the detached reaper backstop when the in-band
+// report itself failed. ShipPullRequest truncates the reason to the 32*1024 body
+// cap (#1791), so a normal oversized reason no longer 413s here.
+func reportPullRequestFailure(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, category, reason string) error {
 	if issued == nil || client == nil {
-		return
+		return nil
 	}
 	if _, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
 		RunID:      cfg.runID,
@@ -5971,11 +5998,12 @@ func reportPullRequestFailure(ctx context.Context, cfg config, logSink io.Writer
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"pull_request_failure_report_failed","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
 			cfg.runID, cfg.stageID, err.Error())
-		return
+		return err
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"pull_request_failure_reported","run_id":%q,"stage_id":%q,"category":%q}`+"\n",
 		cfg.runID, cfg.stageID, category)
+	return nil
 }
 
 // shortID returns the first 8 characters of a UUID-shaped string,

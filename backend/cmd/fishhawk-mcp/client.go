@@ -693,6 +693,53 @@ func (c *apiClient) RetryStage(ctx context.Context, id uuid.UUID) (*Stage, error
 	return &s, nil
 }
 
+// Reap-failure body caps (#1791). The reap-failure endpoint caps the request
+// body at 32*1024 bytes (backend/internal/server/reap_failure.go
+// maxReapFailureBodyBytes) and rejects an oversized body 413 body_too_large.
+// The detached reaper re-POSTs the runner_failed line's detail here, so a
+// category-B failure whose detail embeds the whole multi-module verify output
+// would 413 the backstop too — the exact #1791 double-failure. reason is a short
+// classification and detail is the large diagnostic, so detail gets the bulk of
+// the budget; their sum plus the JSON envelope stays under 32*1024.
+// aggressiveReapFailureBytes is the far smaller cap the bounded post-4xx retry
+// re-marshals both fields with. Mirrors upload.MaxFailureReportReasonBytes /
+// AggressiveFailureReportReasonBytes (a separate Go module — the helper cannot
+// be shared, so each module defines its own with the same head+tail contract).
+const (
+	maxReapFailureReasonBytes  = 4 * 1024
+	maxReapFailureDetailBytes  = 26 * 1024
+	aggressiveReapFailureBytes = 2 * 1024
+)
+
+// truncateReason bounds s to at most max bytes for a reap-failure field (#1791).
+// When s already fits it is returned byte-identical. Otherwise the middle is
+// elided — a head + a "\n… [truncated N bytes] …\n" marker + a tail — so BOTH
+// the leading classification and the trailing summary survive, and the result
+// never exceeds max. Same contract as the runner's upload.TruncateReason; kept
+// package-local because backend → runner is not an allowed import direction.
+func truncateReason(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(s) <= max {
+		return s
+	}
+	const markerFmt = "\n… [truncated %d bytes] …\n"
+	// Size the head/tail budget against the marker rendered with the LARGEST
+	// possible elided count (len(s)); the real marker cannot have more digits,
+	// so the final head+marker+tail can only be <= max.
+	upper := fmt.Sprintf(markerFmt, len(s))
+	keep := max - len(upper)
+	if keep <= 0 {
+		return s[:max]
+	}
+	head := keep / 2
+	tail := keep - head
+	elided := len(s) - head - tail
+	marker := fmt.Sprintf(markerFmt, elided)
+	return s[:head] + marker + s[len(s)-tail:]
+}
+
 // reapFailureRequest mirrors the backend's
 // `POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure` body
 // (`backend/internal/server/reap_failure.go::reapFailureRequest`). Both
@@ -726,16 +773,43 @@ type ReapFailureResult struct {
 //   - 401 authentication_required / 403 insufficient_scope (needs write:runs)
 //   - 404 stage_not_found (unknown stage, or the stage's run_id disagrees)
 func (c *apiClient) ReportStageFailure(ctx context.Context, runID, stageID uuid.UUID, category, reason, detail string, exitCode int) (*ReapFailureResult, error) {
+	// Truncate both fields so the marshalled body fits the endpoint's 32*1024
+	// cap (#1791) — otherwise this backstop 413s for the very oversized detail
+	// that stranded the stage in the first place.
+	reason = truncateReason(reason, maxReapFailureReasonBytes)
+	detail = truncateReason(detail, maxReapFailureDetailBytes)
 	body, err := json.Marshal(reapFailureRequest{Category: category, Reason: reason, Detail: detail, ExitCode: exitCode})
 	if err != nil {
 		return nil, fmt.Errorf("marshal reap-failure: %w", err)
 	}
+	path := "/v0/runs/" + runID.String() + "/stages/" + stageID.String() + "/reap-failure"
 	var res ReapFailureResult
-	if err := c.do(ctx, http.MethodPost,
-		"/v0/runs/"+runID.String()+"/stages/"+stageID.String()+"/reap-failure", body, &res); err != nil {
-		return nil, err
+	err = c.do(ctx, http.MethodPost, path, body, &res)
+	if err == nil {
+		return &res, nil
 	}
-	return &res, nil
+	// A 4xx (esp. 413 body_too_large) means even the normal-cap body was
+	// rejected. Re-marshal both fields with the aggressive cap and re-POST
+	// exactly once (#1791). A 5xx, a network error, or a second 4xx surfaces
+	// unchanged — no loop.
+	var ae *apiError
+	if errors.As(err, &ae) && ae.StatusCode >= 400 && ae.StatusCode < 500 {
+		aggBody, mErr := json.Marshal(reapFailureRequest{
+			Category: category,
+			Reason:   truncateReason(reason, aggressiveReapFailureBytes),
+			Detail:   truncateReason(detail, aggressiveReapFailureBytes),
+			ExitCode: exitCode,
+		})
+		if mErr != nil {
+			return nil, fmt.Errorf("marshal aggressive reap-failure: %w", mErr)
+		}
+		var aggRes ReapFailureResult
+		if aggErr := c.do(ctx, http.MethodPost, path, aggBody, &aggRes); aggErr != nil {
+			return nil, aggErr
+		}
+		return &aggRes, nil
+	}
+	return nil, err
 }
 
 // fixupRequest mirrors the backend's
