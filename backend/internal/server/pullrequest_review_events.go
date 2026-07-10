@@ -249,10 +249,15 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 			// Sticky status comment (E20.4 / #330) — the audit row
 			// reflects the merge; the comment should too.
 			s.notifyStatusUpdate(ctx, target.ID, "pr_merged_no_review")
+			// Board-state sync (#1012 / #1815): an implement-only merge
+			// advances the work item to Done exactly like the review-path
+			// sibling. Without this the card stays off Done for every
+			// implement-only workflow. Best-effort; never unwinds the merge.
+			s.notifyBoardTransition(ctx, target.ID, lifecycleRunMerged)
 			// Lifecycle owns its post-merge tail (#1370): record the
-			// merge observation so next_actions can surface
-			// succeeded_merged. No review stage on this shape, so the
-			// entry carries no stage id.
+			// merge observation alongside the run_merged board move so
+			// next_actions can surface succeeded_merged. No review stage
+			// on this shape, so the entry carries no stage id.
 			s.writePostMergeObservedAudit(ctx, target.ID, nil, meta)
 			// Stamp the per-change economics into the PR body (#1702).
 			// Best-effort; never unwinds the merge resolution above.

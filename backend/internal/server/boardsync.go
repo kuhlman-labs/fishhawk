@@ -40,11 +40,20 @@ const categoryWorkItemTransitioned = "work_item_transitioned"
 // a card is advanced only from a status a prior lifecycle edge would have left
 // it in. run_started has no predecessor edge — its expected source is the
 // backlog/unset entry state, added explicitly by expectedSourceStates.
+//
+// run_merged additionally lists run_failed as a predecessor (#1815): a prior
+// run that failed parks the card in the run_failed target (Blocked in the
+// Default conventions), and the merge of the succeeding retry must advance
+// that Blocked-parked card to Done. Without run_failed here, expectedSourceStates
+// omits Blocked and the provider's never-fight-the-human guard skips the Done
+// move even though a Fishhawk run_failed edge — not a human — left the card there.
+// This is scoped to the run_merged edge only; no other lifecycle edge gains
+// Blocked as a source, so never-fight-the-human is preserved everywhere else.
 var lifecyclePredecessors = map[string][]string{
 	lifecycleRunStarted: nil,
 	lifecyclePROpened:   {lifecycleRunStarted},
 	lifecycleRunFailed:  {lifecycleRunStarted, lifecyclePROpened},
-	lifecycleRunMerged:  {lifecyclePROpened, lifecycleRunStarted},
+	lifecycleRunMerged:  {lifecyclePROpened, lifecycleRunStarted, lifecycleRunFailed},
 }
 
 // NotifyBoardTransition is the exported webhook.BoardSyncer entrypoint the
