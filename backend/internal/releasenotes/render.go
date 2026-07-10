@@ -47,13 +47,16 @@ func renderInto(b *strings.Builder, ev *releaseevidence.ReleaseEvidence) {
 		return
 	}
 
-	// Header: repo, ref range, the empty semver-hint slot reserved for E33.4,
-	// and the per-release cost rollup.
+	// Header: repo, ref range, the advisory semver-bump hint, and the
+	// per-release cost rollup.
 	fmt.Fprintf(b, "# Release notes: %s\n\n", ev.Repo)
 	fmt.Fprintf(b, "Range: `%s..%s`\n\n", ev.PreviousRef, ev.CandidateRef)
-	// Semver hint is deferred to E33.4; the slot is reserved (empty) so the
-	// downstream renderer/consumer shape is stable across that change.
-	b.WriteString("<!-- semver-hint: reserved for E33.4 -->\n\n")
+	// Advisory semver-bump hint (E33.4 classifier, wired in E33.5): the
+	// heuristic recommendation derived from this same evidence, rendered where
+	// the reserved slot used to sit so preview and persisted notes both carry
+	// it. It is advisory only — the operator ratifies the actual version at cut
+	// time; a wrong hint has no failure mode beyond an operator override.
+	fmt.Fprintf(b, "%s\n\n", releaseevidence.ClassifyBump(ev).PreviewLine())
 	fmt.Fprintf(b, "Total cost: $%.2f\n\n", ev.TotalCostUSD)
 
 	b.WriteString("## Changes\n\n")

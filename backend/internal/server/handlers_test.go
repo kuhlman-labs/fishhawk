@@ -120,6 +120,27 @@ func TestReleaseNotesPersistRouteRegistered(t *testing.T) {
 	}
 }
 
+// TestReleaseCutRouteRegistered guards the route table: POST /v0/releases/cut
+// (#1590) must reach handleReleaseCut. The anonymous request reaches the
+// handler's auth ladder and returns 401 — an UNregistered route would instead
+// 404 with a default not-found body, so a 401 here proves the route is wired in
+// handlers.go. (handleReleaseCut runs the auth ladder BEFORE the nil-dependency
+// guard so an anonymous caller gets 401 rather than a 503 that would leak
+// configuration state before authentication.)
+func TestReleaseCutRouteRegistered(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/releases/cut", strings.NewReader(`{}`))
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (route reaches handler auth ladder)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "authentication_required") {
+		t.Errorf("body = %s, want authentication_required (handleReleaseCut reached)", rec.Body.String())
+	}
+}
+
 // TestCacheEfficiencyRouteRegistered guards the route table: GET
 // /v0/runs/{run_id}/cache-efficiency (#1352) must reach
 // handleGetRunCacheEfficiency. With no RunRepo configured the handler
