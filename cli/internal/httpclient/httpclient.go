@@ -755,6 +755,178 @@ func (c *Client) RollbackDeployment(ctx context.Context, runID uuid.UUID) (*Roll
 	return &res, nil
 }
 
+// --- releases (E33.5 / #1590, ADR-051) ---
+
+// ReleaseNotesResult is the decoded 201 body of POST /v0/releases/notes: the
+// persisted release_notes artifact's id + coordinates + content hash + rendered
+// markdown. Field names + types match the backend releaseNotesPersistResponse
+// wire shape verbatim. The same shape backs `release prepare` output.
+type ReleaseNotesResult struct {
+	ArtifactID  string `json:"artifact_id"`
+	StageID     string `json:"stage_id"`
+	Repo        string `json:"repo"`
+	From        string `json:"from"`
+	To          string `json:"to"`
+	ContentHash string `json:"content_hash"`
+	Markdown    string `json:"markdown"`
+}
+
+// PrepareReleaseNotesInput is the request body for POST /v0/releases/notes. The
+// backend decodes it with DisallowUnknownFields, so the field set is exact.
+type PrepareReleaseNotesInput struct {
+	Repo    string `json:"repo"`
+	From    string `json:"from"`
+	To      string `json:"to"`
+	StageID string `json:"stage_id"`
+}
+
+// PreviewReleaseNotes calls GET /v0/releases/notes/preview?repo=&from=&to=.
+// Unlike every other endpoint this one returns text/markdown, not JSON, so it
+// reads the raw response body verbatim rather than JSON-decoding it. Non-2xx
+// still carries the JSON error envelope and surfaces as *APIError.
+func (c *Client) PreviewReleaseNotes(ctx context.Context, repo, from, to string) (string, error) {
+	if c.BaseURL == "" {
+		return "", errors.New("httpclient: BaseURL not set")
+	}
+	q := url.Values{}
+	q.Set("repo", repo)
+	q.Set("from", from)
+	q.Set("to", to)
+	path := "/v0/releases/notes/preview?" + q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
+	if err != nil {
+		return "", fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Accept", "text/markdown")
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("http: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read body: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		apiErr := &APIError{StatusCode: resp.StatusCode}
+		var env errorEnvelope
+		if json.Unmarshal(raw, &env) == nil {
+			apiErr.Code = env.Error.Code
+			apiErr.Message = env.Error.Message
+			apiErr.Details = env.Error.Details
+		}
+		return "", apiErr
+	}
+	return string(raw), nil
+}
+
+// PrepareReleaseNotes calls POST /v0/releases/notes — it assembles + renders the
+// release notes for the ref range and persists them as a release_notes artifact
+// keyed to StageID, returning the artifact id + content hash + markdown. Server
+// rejections (validation_failed 400, insufficient_scope 403, stage_not_found
+// 404, release_notes_unconfigured 503, …) surface as *APIError verbatim.
+func (c *Client) PrepareReleaseNotes(ctx context.Context, in PrepareReleaseNotesInput) (*ReleaseNotesResult, error) {
+	body, err := json.Marshal(in)
+	if err != nil {
+		return nil, fmt.Errorf("marshal: %w", err)
+	}
+	var res ReleaseNotesResult
+	if err := c.do(ctx, http.MethodPost, "/v0/releases/notes", body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// CutReleaseInput is the request body for POST /v0/releases/cut. StageID and
+// BumpLevel are optional (omitempty), matching the backend's optional fields;
+// the backend decodes with DisallowUnknownFields, so the field set is exact.
+type CutReleaseInput struct {
+	Repo       string `json:"repo"`
+	RunID      string `json:"run_id"`
+	StageID    string `json:"stage_id,omitempty"`
+	ArtifactID string `json:"artifact_id"`
+	Version    string `json:"version"`
+	BumpLevel  string `json:"bump_level,omitempty"`
+}
+
+// CutReleaseResult is the decoded 201 body of POST /v0/releases/cut: the
+// ratified version + source artifact + content hash + recorded advisory bump
+// level, plus a recorded flag affirming the release_cut audit entry landed. The
+// endpoint records the DECISION only — no git tag is pushed (the tag push stays
+// a human git action per the delegating posture).
+type CutReleaseResult struct {
+	Version     string `json:"version"`
+	ArtifactID  string `json:"artifact_id"`
+	ContentHash string `json:"content_hash"`
+	BumpLevel   string `json:"bump_level,omitempty"`
+	Recorded    bool   `json:"recorded"`
+}
+
+// CutRelease calls POST /v0/releases/cut — it records the operator's ratified
+// release-version decision as a release_cut audit entry on the release run's
+// chain after validating that ArtifactID names a real release_notes artifact.
+// Server rejections (validation_failed 400, insufficient_scope 403,
+// artifact_not_found 404, artifact_wrong_kind 409, release_cut_unconfigured
+// 503, …) surface as *APIError verbatim.
+func (c *Client) CutRelease(ctx context.Context, in CutReleaseInput) (*CutReleaseResult, error) {
+	body, err := json.Marshal(in)
+	if err != nil {
+		return nil, fmt.Errorf("marshal: %w", err)
+	}
+	var res CutReleaseResult
+	if err := c.do(ctx, http.MethodPost, "/v0/releases/cut", body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// PublishReleaseInput is the request body for POST /v0/releases/publish. StageID
+// is optional (omitempty); the backend decodes with DisallowUnknownFields, so
+// the field set is exact.
+type PublishReleaseInput struct {
+	Repo       string `json:"repo"`
+	Tag        string `json:"tag"`
+	RunID      string `json:"run_id"`
+	StageID    string `json:"stage_id,omitempty"`
+	ArtifactID string `json:"artifact_id"`
+}
+
+// PublishReleaseResult is the decoded 200 body of POST /v0/releases/publish: the
+// release URL + tag + source artifact + content hash, plus published/idempotent
+// flags distinguishing a real publish from a no-op re-invoke.
+type PublishReleaseResult struct {
+	ReleaseURL  string `json:"release_url"`
+	Tag         string `json:"tag"`
+	ArtifactID  string `json:"artifact_id"`
+	ContentHash string `json:"content_hash"`
+	Published   bool   `json:"published"`
+	Idempotent  bool   `json:"idempotent"`
+}
+
+// PublishRelease calls POST /v0/releases/publish — it sets the GitHub Release
+// body + fixed-name asset to the persisted release_notes markdown and records a
+// release_published audit entry. Idempotent on content hash. Server rejections
+// (validation_failed 400, insufficient_scope 403, artifact_not_found 404,
+// release_not_found 404, artifact_wrong_kind 409, github_app_not_installed 503,
+// …) surface as *APIError verbatim.
+func (c *Client) PublishRelease(ctx context.Context, in PublishReleaseInput) (*PublishReleaseResult, error) {
+	body, err := json.Marshal(in)
+	if err != nil {
+		return nil, fmt.Errorf("marshal: %w", err)
+	}
+	var res PublishReleaseResult
+	if err := c.do(ctx, http.MethodPost, "/v0/releases/publish", body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // Campaign is the CLI-side projection of the OpenAPI Campaign schema
 // (ADR-047 / #1437): the parent record of an epic-driven multi-issue
 // run. Field names + types match the wire shape verbatim.
