@@ -973,6 +973,14 @@ func (g *slashGitHubRecorder) UpdateIssueComment(_ context.Context, _ int64, _ g
 	return &githubclient.IssueComment{ID: commentID, Body: body}, nil
 }
 
+// CreateReview is a no-op stub for the IssueCommenter interface extension
+// landed in #1785 (advisory COMMENT-type PR reviews). Slash-approval tests
+// don't exercise the PR-review path; a happy response keeps the interface
+// satisfied.
+func (g *slashGitHubRecorder) CreateReview(_ context.Context, _ int64, _ githubclient.RepoRef, _ int, _ githubclient.CreateReviewParams) (*githubclient.CreateReviewResult, error) {
+	return &githubclient.CreateReviewResult{}, nil
+}
+
 // orchestratorRepoFailingList wraps orchestratorRepo to inject a
 // failing ListRuns. The other methods come through the embedded
 // pointer; the test only exercises the look-up path so anything

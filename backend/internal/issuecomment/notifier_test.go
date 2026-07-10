@@ -1128,12 +1128,25 @@ type ghUpdateCommentCall struct {
 	body           string
 }
 
+type ghReviewCall struct {
+	installationID int64
+	repo           githubclient.RepoRef
+	prNumber       int
+	event          string
+	body           string
+}
+
 type fakeGitHub struct {
 	mu          sync.Mutex
 	calls       []ghCommentCall
 	updateCalls []ghUpdateCommentCall
+	reviewCalls []ghReviewCall
 	err         error
 	updateErr   error
+	// reviewErr, when non-nil, fails every CreateReview — proves the
+	// agent-review PR-review fail-open path (a CreateReview error is swallowed
+	// and never appends a dedup row).
+	reviewErr error
 	// failOnIssueNumber, when non-zero, fails CreateIssueComment ONLY for that
 	// issue/PR number — so a PR-status-comment test can fail the PR-locus post
 	// (posted to the PR number) while leaving the anchor post (posted to the
@@ -1179,6 +1192,25 @@ func (f *fakeGitHub) UpdateIssueComment(_ context.Context, installationID int64,
 	}, nil
 }
 
+// CreateReview records the advisory PR-review call. Returns a deterministic
+// review id from the call index so tests can predict it.
+func (f *fakeGitHub) CreateReview(_ context.Context, installationID int64, repo githubclient.RepoRef, prNumber int, params githubclient.CreateReviewParams) (*githubclient.CreateReviewResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reviewCalls = append(f.reviewCalls, ghReviewCall{
+		installationID: installationID, repo: repo, prNumber: prNumber,
+		event: params.Event, body: params.Body,
+	})
+	if f.reviewErr != nil {
+		return nil, f.reviewErr
+	}
+	id := int64(len(f.reviewCalls))
+	return &githubclient.CreateReviewResult{
+		ID:      id,
+		HTMLURL: fmt.Sprintf("https://github.com/%s/pull/%d#pullrequestreview-%d", repo.String(), prNumber, id),
+	}, nil
+}
+
 type fakeRuns struct {
 	run.Repository
 	runs   map[uuid.UUID]*run.Run
@@ -1205,6 +1237,10 @@ type fakeAudit struct {
 	mu       sync.Mutex
 	appended []audit.ChainAppendParams
 	preSeeds []*audit.Entry
+	// appendErrOnCategory, when non-empty, makes AppendChained fail for that
+	// category only — used to prove the agent-review audit-append fail-open path
+	// (the review posted, but recording the dedup row failed).
+	appendErrOnCategory string
 }
 
 func (f *fakeAudit) preSeed(runID uuid.UUID, category string, payload map[string]any) {
@@ -1233,6 +1269,9 @@ func (f *fakeAudit) preSeedWithStage(runID, stageID uuid.UUID, category string, 
 func (f *fakeAudit) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.appendErrOnCategory != "" && p.Category == f.appendErrOnCategory {
+		return nil, errors.New("fake audit: append failed for category")
+	}
 	f.appended = append(f.appended, p)
 	r := p.RunID
 	return &audit.Entry{ID: uuid.New(), RunID: &r}, nil
@@ -1861,5 +1900,225 @@ func TestPRStatusComment_LoadsAcceptanceArtifact(t *testing.T) {
 		if !strings.Contains(prBody, want) {
 			t.Errorf("PR comment missing acceptance table row %q:\n%s", want, prBody)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------
+// Agent-review PR reviews (E42.2 / #1785).
+// ---------------------------------------------------------------------
+
+// seedImplementReviewed appends an implement_reviewed audit row for the run.
+func seedImplementReviewed(au *fakeAudit, runID uuid.UUID, model, verdict string) {
+	au.preSeed(runID, "implement_reviewed", map[string]any{
+		"reviewer_model": model,
+		"verdict":        verdict,
+	})
+}
+
+// prReviewCount counts CreateReview calls to the given PR number.
+func prReviewCount(gh *fakeGitHub, prNumber int) int {
+	gh.mu.Lock()
+	defer gh.mu.Unlock()
+	c := 0
+	for _, call := range gh.reviewCalls {
+		if call.prNumber == prNumber {
+			c++
+		}
+	}
+	return c
+}
+
+// prReviewAuditCount counts pr_review_posted audit rows.
+func prReviewAuditCount(au *fakeAudit) int {
+	c := 0
+	for _, p := range au.appended {
+		if p.Category == issuecomment.CategoryPRReviewPosted {
+			c++
+		}
+	}
+	return c
+}
+
+// assertAllReviewsComment asserts every recorded CreateReview event is COMMENT
+// — the load-bearing advisory-never-hard-block invariant (binding condition 2).
+func assertAllReviewsComment(t *testing.T, gh *fakeGitHub) {
+	t.Helper()
+	gh.mu.Lock()
+	defer gh.mu.Unlock()
+	for i, call := range gh.reviewCalls {
+		if call.event != "COMMENT" {
+			t.Fatalf("review call %d event = %q, want COMMENT (advisory must never hard-block)", i, call.event)
+		}
+	}
+}
+
+// TestPRReview_OneTerminalVerdict_PostsOneComment: a single terminal
+// implement_reviewed entry on a PR-owning run posts exactly one COMMENT review
+// and appends one pr_review_posted dedup row.
+func TestPRReview_OneTerminalVerdict_PostsOneComment(t *testing.T) {
+	runID, _, _, gh, au, _, n := prStatusDeps(t)
+	seedImplementReviewed(au, runID, "claude-opus-4-8", "approve")
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if got := prReviewCount(gh, 7); got != 1 {
+		t.Fatalf("expected 1 PR review; got %d", got)
+	}
+	if got := prReviewAuditCount(au); got != 1 {
+		t.Fatalf("expected 1 pr_review_posted row; got %d", got)
+	}
+	assertAllReviewsComment(t, gh)
+}
+
+// TestPRReview_TwoReviewersOneRound_PostsTwoReviews: a heterogeneous pair
+// (two implement_reviewed entries in one round) posts one review per source
+// Sequence — two reviews, two dedup rows.
+func TestPRReview_TwoReviewersOneRound_PostsTwoReviews(t *testing.T) {
+	runID, _, _, gh, au, _, n := prStatusDeps(t)
+	seedImplementReviewed(au, runID, "claude-opus-4-8", "approve")
+	seedImplementReviewed(au, runID, "gpt-5.5", "reject")
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if got := prReviewCount(gh, 7); got != 2 {
+		t.Fatalf("expected 2 PR reviews (one per Sequence); got %d", got)
+	}
+	if got := prReviewAuditCount(au); got != 2 {
+		t.Fatalf("expected 2 pr_review_posted rows; got %d", got)
+	}
+	assertAllReviewsComment(t, gh)
+}
+
+// TestPRReview_ReinvokeSameEntries_NoDoublePost: re-invoking the fan-out over
+// the SAME entries posts no additional review — dedup on source Sequence. A
+// presence check would pass here; this fails on a re-post (no-op detector).
+func TestPRReview_ReinvokeSameEntries_NoDoublePost(t *testing.T) {
+	runID, _, _, gh, au, _, n := prStatusDeps(t)
+	seedImplementReviewed(au, runID, "claude-opus-4-8", "approve")
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("first rebuild: %v", err)
+	}
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("second rebuild: %v", err)
+	}
+	if got := prReviewCount(gh, 7); got != 1 {
+		t.Fatalf("dedup failed: expected 1 PR review total across two rebuilds; got %d", got)
+	}
+	if got := prReviewAuditCount(au); got != 1 {
+		t.Fatalf("expected 1 pr_review_posted row total; got %d", got)
+	}
+}
+
+// TestPRReview_FixupRound_PostsNewReview: a later implement_reviewed entry (a
+// post-fixup re-review round, a NEW Sequence) posts a NEW review even after an
+// earlier round was already posted.
+func TestPRReview_FixupRound_PostsNewReview(t *testing.T) {
+	runID, _, _, gh, au, _, n := prStatusDeps(t)
+	seedImplementReviewed(au, runID, "claude-opus-4-8", "reject")
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("first rebuild: %v", err)
+	}
+	if got := prReviewCount(gh, 7); got != 1 {
+		t.Fatalf("expected 1 PR review after first round; got %d", got)
+	}
+
+	// A post-fixup re-review lands as a NEW implement_reviewed entry (later
+	// Sequence).
+	seedImplementReviewed(au, runID, "claude-opus-4-8", "approve")
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("second rebuild: %v", err)
+	}
+	if got := prReviewCount(gh, 7); got != 2 {
+		t.Fatalf("fixup round should post a NEW review; got %d total", got)
+	}
+	if got := prReviewAuditCount(au); got != 2 {
+		t.Fatalf("expected 2 pr_review_posted rows; got %d", got)
+	}
+	assertAllReviewsComment(t, gh)
+}
+
+// TestPRReview_FailOpen_NoPRGuard: a run that does not own a PR posts no
+// review (owns-PR guard) and the transition is unaffected.
+func TestPRReview_FailOpen_NoPRGuard(t *testing.T) {
+	runID, _, runRow, gh, au, _, n := prStatusDeps(t)
+	runRow.PullRequestURL = nil // does not own a PR
+	seedImplementReviewed(au, runID, "claude-opus-4-8", "approve")
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("rebuild must not propagate; got %v", err)
+	}
+	if got := prReviewCount(gh, 7); got != 0 {
+		t.Errorf("no PR review without pull_request_url; got %d", got)
+	}
+	if got := prReviewAuditCount(au); got != 0 {
+		t.Errorf("no pr_review_posted row without a PR; got %d", got)
+	}
+	// The anchor still posted to the issue.
+	if got := prCreateCount(gh, 42); got != 1 {
+		t.Errorf("anchor comment should still be created; got %d", got)
+	}
+}
+
+// TestPRReview_FailOpen_CreateReviewError: a CreateReview error is swallowed —
+// the transition still returns nil, no dedup row is written (so a later rebuild
+// can retry), and the anchor is unaffected.
+func TestPRReview_FailOpen_CreateReviewError(t *testing.T) {
+	runID, _, _, gh, au, _, n := prStatusDeps(t)
+	gh.reviewErr = errors.New("fake github: create review failed")
+	seedImplementReviewed(au, runID, "claude-opus-4-8", "approve")
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("CreateReview failure must not propagate; got %v", err)
+	}
+	if got := prReviewAuditCount(au); got != 0 {
+		t.Errorf("failed review must not append a dedup row; got %d", got)
+	}
+	// The anchor comment landed despite the review failure.
+	if got := prCreateCount(gh, 42); got != 1 {
+		t.Errorf("anchor comment unaffected: expected 1 create; got %d", got)
+	}
+}
+
+// TestPRReview_FailOpen_AuditError: an audit-append failure after a successful
+// CreateReview is swallowed — the transition returns nil and the anchor is
+// unaffected. (The review posted; a missing dedup row only risks a re-post.)
+func TestPRReview_FailOpen_AuditError(t *testing.T) {
+	runID, _, _, gh, au, _, n := prStatusDeps(t)
+	au.appendErrOnCategory = issuecomment.CategoryPRReviewPosted
+	seedImplementReviewed(au, runID, "claude-opus-4-8", "approve")
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("audit-append failure must not propagate; got %v", err)
+	}
+	// The review itself was posted despite the audit failure.
+	if got := prReviewCount(gh, 7); got != 1 {
+		t.Errorf("review should still post before the audit append; got %d", got)
+	}
+	// The anchor comment landed.
+	if got := prCreateCount(gh, 42); got != 1 {
+		t.Errorf("anchor comment unaffected: expected 1 create; got %d", got)
+	}
+}
+
+// TestPRReview_UndecodablePayloadSkipped: an implement_reviewed entry whose
+// payload does not decode to a verdict posts no review (RenderPRReviewBody
+// returns "") — proves the render-empty skip.
+func TestPRReview_UndecodablePayloadSkipped(t *testing.T) {
+	runID, _, _, gh, au, _, n := prStatusDeps(t)
+	// A verdictless implement_reviewed payload → RenderPRReviewBody returns "".
+	au.preSeed(runID, "implement_reviewed", map[string]any{"reviewer_model": "x"})
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if got := prReviewCount(gh, 7); got != 0 {
+		t.Errorf("verdictless payload should post no review; got %d", got)
+	}
+	if got := prReviewAuditCount(au); got != 0 {
+		t.Errorf("no dedup row for a skipped verdict; got %d", got)
 	}
 }

@@ -89,6 +89,17 @@ const CategoryStatusCommentPosted = "status_comment_posted"
 // for the identical-body edit skip.
 const CategoryPRStatusCommentPosted = "pr_status_comment_posted"
 
+// CategoryPRReviewPosted records that Fishhawk posted a terminal agent
+// implement-review verdict as an advisory COMMENT-type GitHub PR review
+// (E42.2 / #1785) — the PR merge-box locus of the verdict, distinct from the
+// issue anchor and the audit chain. Dedup is per SOURCE implement_reviewed
+// audit Sequence: each row's payload carries `source_sequence` (the dedup
+// key) plus `reviewer_model`, `review_id`, and `event`, so a re-render of the
+// run (which re-reads the whole chain) never double-posts a review for the
+// same verdict, while a genuinely new post-fixup review round (a later
+// Sequence) posts a NEW review.
+const CategoryPRReviewPosted = "pr_review_posted"
+
 // Kind enumerates which moment a comment recorded. Stored in the
 // audit entry's payload so a single category covers both moments
 // while staying queryable per kind.
@@ -146,9 +157,14 @@ const (
 // sticky-status-comment flow (E20.2 / #328) and the plan
 // `update_on_change` flow (E17.2 / #337) can persist the comment
 // id for later edits via UpdateIssueComment.
+//
+// CreateReview posts an advisory COMMENT-type pull-request review of a
+// terminal agent implement verdict (E42.2 / #1785), so the verdict lands in
+// the PR merge box, not only in the issue anchor + audit chain.
 type IssueCommenter interface {
 	CreateIssueComment(ctx context.Context, installationID int64, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error)
 	UpdateIssueComment(ctx context.Context, installationID int64, repo githubclient.RepoRef, commentID int64, body string) (*githubclient.IssueComment, error)
+	CreateReview(ctx context.Context, installationID int64, repo githubclient.RepoRef, prNumber int, params githubclient.CreateReviewParams) (*githubclient.CreateReviewResult, error)
 }
 
 // PlanArtifactLister is the narrow slice of artifact.Repository the
@@ -843,6 +859,11 @@ func (n *Notifier) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID
 	// — the error is swallowed so a PR-comment failure never unwinds the
 	// transition or blocks the page-class pings below.
 	_ = n.maybeUpdatePRStatusComment(ctx, runRow, stages, entries)
+	// Advisory COMMENT-type PR reviews for terminal agent implement verdicts
+	// (E42.2 / #1785): fold into the same fan-out AFTER the anchor edit lands.
+	// Fail-open — the error is swallowed so a review-post failure never unwinds
+	// the transition or blocks the page-class pings below.
+	_ = n.maybePostAgentReviewPRReviews(ctx, runRow, entries)
 	// Page-class pings ride on the same audit chain we just projected;
 	// fire them after the anchor edit lands. Resolve the comment context
 	// fresh (NotifyStatusUpdate validated it but doesn't return it).
@@ -1389,6 +1410,135 @@ func (n *Notifier) appendPRStatusAudit(ctx context.Context, runRow *run.Run, rep
 func hashPRStatusBody(body string) string {
 	sum := sha256.Sum256([]byte(body))
 	return hex.EncodeToString(sum[:])
+}
+
+// maybePostAgentReviewPRReviews posts each terminal agent implement-review
+// verdict as an advisory COMMENT-type GitHub PR review (E42.2 / #1785) so the
+// verdict lands in the PR merge box, not only in the issue anchor + audit
+// chain. Folded into NotifyStatusUpdateForRun alongside
+// maybeUpdatePRStatusComment so every rebuild hook maintains it with no new
+// call site.
+//
+// Best-effort / fail-open throughout: EVERY guard-skip and EVERY GitHub /
+// audit error returns nil so a review-post failure never unwinds a transition
+// or blocks the page-class pings. Maintained ONLY for runs that own the PR
+// (non-empty pull_request_url + installation id), matching
+// maybeUpdatePRStatusComment's owns-PR guard.
+//
+// Reviews are ALWAYS COMMENT-type (PRReviewEventComment): advisory reviewer
+// verdicts must never hard-block merge under branch protection. Dedup is on
+// the source implement_reviewed audit Sequence via a pr_review_posted row, so
+// a round never double-posts while a post-fixup re-review (a later Sequence)
+// posts a NEW review.
+func (n *Notifier) maybePostAgentReviewPRReviews(ctx context.Context, runRow *run.Run, entries []*audit.Entry) error {
+	// Owns-PR guard — identical to maybeUpdatePRStatusComment.
+	if runRow.InstallationID == nil || runRow.PullRequestURL == nil || *runRow.PullRequestURL == "" {
+		return nil
+	}
+	prNumber := parsePRNumberFromURL(runRow.PullRequestURL)
+	if prNumber <= 0 {
+		return nil
+	}
+	repo, err := parseRepo(runRow.Repo)
+	if err != nil {
+		return nil
+	}
+
+	posted, err := n.postedReviewSequences(ctx, runRow.ID)
+	if err != nil {
+		// Fail-open: a bookkeeping read failure must not unwind the transition.
+		return nil
+	}
+
+	for _, e := range entries {
+		if e.Category != "implement_reviewed" {
+			continue
+		}
+		if _, done := posted[e.Sequence]; done {
+			continue
+		}
+		body := RenderPRReviewBody(e, runRow, n.externalURL)
+		if body == "" {
+			// Undecodable / verdictless payload — nothing to post.
+			continue
+		}
+		result, cerr := n.github.CreateReview(ctx, *runRow.InstallationID, repo, prNumber, githubclient.CreateReviewParams{
+			Body:  body,
+			Event: PRReviewEventComment,
+		})
+		if cerr != nil {
+			// Fail-open: log-and-continue. A CreateReview failure never unwinds
+			// the notify path; no dedup row is written, so the next rebuild
+			// retries this Sequence.
+			continue
+		}
+		var reviewID int64
+		if result != nil {
+			reviewID = result.ID
+		}
+		_, model := decodeReviewerVerdict(e.Payload)
+		if aerr := n.appendPRReviewAudit(ctx, runRow.ID, e.Sequence, model, reviewID); aerr != nil {
+			// Fail-open: the review posted; a missing dedup row only risks a
+			// re-post on the next rebuild, never a lost transition.
+			continue
+		}
+	}
+	return nil
+}
+
+// postedReviewSequences returns the set of source implement_reviewed audit
+// sequences already posted as PR reviews for the run — the per-verdict dedup
+// gate, mirroring pingedSequences.
+func (n *Notifier) postedReviewSequences(ctx context.Context, runID uuid.UUID) (map[int64]struct{}, error) {
+	entries, err := n.audit.ListForRunByCategory(ctx, runID, CategoryPRReviewPosted)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[int64]struct{}, len(entries))
+	for _, e := range entries {
+		if seq := prReviewSourceSequence(e.Payload); seq > 0 {
+			seen[seq] = struct{}{}
+		}
+	}
+	return seen, nil
+}
+
+// appendPRReviewAudit records that the run's terminal implement verdict at
+// sourceSequence was posted as PR review reviewID (COMMENT-type). The
+// source_sequence powers the per-verdict dedup on the next rebuild.
+func (n *Notifier) appendPRReviewAudit(ctx context.Context, runID uuid.UUID, sourceSequence int64, reviewerModel string, reviewID int64) error {
+	systemKind := audit.ActorSystem
+	payload, _ := json.Marshal(map[string]any{
+		"source_sequence": sourceSequence,
+		"reviewer_model":  reviewerModel,
+		"review_id":       reviewID,
+		"event":           PRReviewEventComment,
+	})
+	if _, err := n.audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: n.now().UTC(),
+		Category:  CategoryPRReviewPosted,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		return fmt.Errorf("issuecomment: pr review audit append: %w", err)
+	}
+	return nil
+}
+
+// prReviewSourceSequence pulls the source implement_reviewed audit Sequence out
+// of a pr_review_posted payload. Returns 0 on parse failure or absent field.
+func prReviewSourceSequence(payload []byte) int64 {
+	if len(payload) == 0 {
+		return 0
+	}
+	var p struct {
+		SourceSequence int64 `json:"source_sequence"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return 0
+	}
+	return p.SourceSequence
 }
 
 // parsePRNumberFromURL extracts the integer PR number from a GitHub PR URL of
