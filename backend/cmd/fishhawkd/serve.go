@@ -1341,6 +1341,23 @@ func runServe(args []string, logSink io.Writer) int {
 		}
 	}
 
+	// One-shot startup orphaned-review recovery (#1781). A fishhawkd restart
+	// mid-review kills the detached reviewing goroutine, so no terminal
+	// *_reviewed/*_review_failed entry lands and review_status stays 'pending'
+	// forever, wedging the plan/implement gate. ReconcileOrphanedReviews
+	// synthesizes the missing terminal *_review_failed entries for any review
+	// dispatched by a prior process, flipping review_status to a terminal
+	// 'failed' the operator can re-trigger. Best-effort — a failure logs at
+	// warn and never blocks server start. Gated on the audit + run wiring the
+	// pass reads/writes.
+	if srv != nil && cfg.RunRepo != nil && cfg.AuditRepo != nil {
+		if n, err := srv.ReconcileOrphanedReviews(ctx); err != nil {
+			logger.Warn("startup orphaned-review reconciliation failed", slog.String("error", err.Error()))
+		} else if n > 0 {
+			logger.Info("startup orphaned-review reconciliation completed", slog.Int("terminated", n))
+		}
+	}
+
 	// Self-consistency invariant monitor (#764). Generalizes the
 	// one-shot startup ReconcileStuckRuns above into a periodic sweep:
 	// invariant 1 (all-stages-terminal + run non-terminal) auto-
