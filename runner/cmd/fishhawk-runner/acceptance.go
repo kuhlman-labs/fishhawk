@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -40,15 +41,31 @@ import (
  * completed and produced evidence; routing the failure is E31.8's scope.
  */
 
-// acceptanceVerdictPath is the file-fallback transport for the verdict
-// (the codex path — Invocation.JSONSchema is a claudecode-only feature,
-// so StructuredOutput stays nil there). MUST stay byte-identical to the
-// path buildAcceptance's output contract names
-// (backend/internal/prompt/prompt.go AcceptanceVerdictPath), mirroring
-// the plan prompt's /tmp/fishhawk-plan.json convention. A package var
-// (not const) so tests can point it at a temp file instead of the real
-// shared /tmp path.
-var acceptanceVerdictPath = "/tmp/fishhawk-acceptance.json"
+// acceptanceVerdictDir is the directory the run/stage-keyed acceptance verdict
+// fallback lives in (#1777). var (not const) so tests can redirect it to a
+// t.TempDir path and avoid /tmp pollution / parallel-test races.
+var acceptanceVerdictDir = "/tmp"
+
+// acceptanceVerdictPath is the run/stage-keyed file-fallback transport for the
+// verdict (the codex path — Invocation.JSONSchema is a claudecode-only feature,
+// so StructuredOutput stays nil there). Keyed by the FULL run id + stage id
+// (#1777) so parallel acceptance runners on one host no longer share a single
+// fixed path. The acceptance prompt still names the LEGACY fixed path
+// (backend/internal/prompt/prompt.go AcceptanceVerdictPath is not keyed, because
+// the acceptance Trigger threads no run/stage ids), so the runner reads the
+// keyed path FIRST and falls back to the legacy path (binding condition 1) — a
+// fixed-path prompt render is therefore never stranded in verdict-missing, and
+// keying the prompt later needs no runner change.
+func acceptanceVerdictPath(runID, stageID string) string {
+	return filepath.Join(acceptanceVerdictDir, fmt.Sprintf("fishhawk-acceptance-%s-%s.json", runID, stageID))
+}
+
+// legacyAcceptanceVerdictPath is the fixed shared path the acceptance prompt's
+// output contract still names (prompt.AcceptanceVerdictPath). The runner reads
+// the keyed path first and falls back to THIS legacy path (binding condition 1),
+// so today's fixed-path prompt render lands its verdict. MUST stay byte-identical
+// to prompt.AcceptanceVerdictPath. var (not const) so tests can redirect it.
+var legacyAcceptanceVerdictPath = "/tmp/fishhawk-acceptance.json"
 
 // acceptanceVerdictJSONSchema is the structured-output schema for the
 // claudecode --json-schema flag (Invocation.JSONSchema). Hand-authored
@@ -139,20 +156,41 @@ type acceptanceVerdict struct {
 }
 
 // captureAcceptanceVerdict returns the agent's verdict bytes.
-// Result.StructuredOutput (the claudecode --json-schema capture) is
-// preferred; the fallback is reading path (the file the prompt's output
-// contract tells a non-claudecode agent to write). Returns
-// errAcceptanceVerdictMissing when neither transport produced anything.
-func captureAcceptanceVerdict(res agent.Result, path string) ([]byte, error) {
+// Result.StructuredOutput (the claudecode --json-schema capture) is preferred;
+// the file fallback reads the run/stage-KEYED path first and, when it is absent,
+// falls back to the LEGACY fixed path (#1777, binding condition 1). The
+// acceptance prompt's output contract still names the legacy fixed path (it
+// threads no run/stage ids), so the legacy fallback is the path the verdict
+// actually lands on today — reading keyed-first means keying the prompt later
+// needs no change here, and a fixed-path render is never stranded in
+// verdict-missing. A legacy read emits an acceptance_verdict_legacy_path
+// deprecation event via warn (nil-tolerant). Returns errAcceptanceVerdictMissing
+// when neither transport produced anything.
+func captureAcceptanceVerdict(res agent.Result, keyedPath, legacyPath string, warn func(event, detail string)) ([]byte, error) {
 	if len(res.StructuredOutput) > 0 {
 		return res.StructuredOutput, nil
 	}
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(keyedPath)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("acceptance verdict fallback read: %w", err)
+		}
+		// Keyed path absent: fall back to the legacy fixed path the prompt names.
+		lb, lerr := os.ReadFile(legacyPath)
+		if lerr != nil {
+			if os.IsNotExist(lerr) {
+				return nil, errAcceptanceVerdictMissing
+			}
+			return nil, fmt.Errorf("acceptance verdict legacy fallback read: %w", lerr)
+		}
+		if len(lb) == 0 {
 			return nil, errAcceptanceVerdictMissing
 		}
-		return nil, fmt.Errorf("acceptance verdict fallback read: %w", err)
+		if warn != nil {
+			warn("acceptance_verdict_legacy_path",
+				"read verdict from legacy fixed path "+legacyPath)
+		}
+		return lb, nil
 	}
 	if len(b) == 0 {
 		return nil, errAcceptanceVerdictMissing

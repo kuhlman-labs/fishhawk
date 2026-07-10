@@ -25,12 +25,19 @@ import (
 
 // --- captureAcceptanceVerdict -------------------------------------------
 
+// absentPath returns a path in a fresh temp dir that does not exist — used as
+// the never-present keyed or legacy argument in the capture tests.
+func absentPath(t *testing.T, name string) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), name)
+}
+
 func TestCaptureAcceptanceVerdict_StructuredOutputPreferred(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "verdict.json")
 	mustWrite(t, path, `{"verdict":"failed","failure_mode":"error"}`)
 	res := agent.Result{StructuredOutput: []byte(`{"verdict":"passed"}`)}
 
-	got, err := captureAcceptanceVerdict(res, path)
+	got, err := captureAcceptanceVerdict(res, path, absentPath(t, "legacy.json"), nil)
 	if err != nil {
 		t.Fatalf("captureAcceptanceVerdict: %v", err)
 	}
@@ -43,18 +50,45 @@ func TestCaptureAcceptanceVerdict_FileFallback(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "verdict.json")
 	mustWrite(t, path, `{"verdict":"passed"}`)
 
-	got, err := captureAcceptanceVerdict(agent.Result{}, path)
+	got, err := captureAcceptanceVerdict(agent.Result{}, path, absentPath(t, "legacy.json"), nil)
 	if err != nil {
 		t.Fatalf("captureAcceptanceVerdict: %v", err)
 	}
 	if string(got) != `{"verdict":"passed"}` {
-		t.Errorf("file fallback bytes = %s", got)
+		t.Errorf("keyed file fallback bytes = %s", got)
+	}
+}
+
+// TestCaptureAcceptanceVerdict_LegacyFallback covers binding condition 1 /
+// condition 3: when the run/stage-keyed path is ABSENT and the LEGACY fixed path
+// is present (the path today's acceptance prompt actually names), the verdict is
+// read from the legacy path AND an acceptance_verdict_legacy_path deprecation
+// event is emitted via warn.
+func TestCaptureAcceptanceVerdict_LegacyFallback(t *testing.T) {
+	legacy := filepath.Join(t.TempDir(), "legacy.json")
+	mustWrite(t, legacy, `{"verdict":"passed"}`)
+	var warned []string
+	got, err := captureAcceptanceVerdict(agent.Result{}, absentPath(t, "keyed.json"), legacy,
+		func(event, _ string) { warned = append(warned, event) })
+	if err != nil {
+		t.Fatalf("captureAcceptanceVerdict: %v", err)
+	}
+	if string(got) != `{"verdict":"passed"}` {
+		t.Errorf("legacy file fallback bytes = %s", got)
+	}
+	found := false
+	for _, e := range warned {
+		if e == "acceptance_verdict_legacy_path" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected acceptance_verdict_legacy_path deprecation event, got %v", warned)
 	}
 }
 
 func TestCaptureAcceptanceVerdict_MissingBoth(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "nope.json")
-	_, err := captureAcceptanceVerdict(agent.Result{}, path)
+	_, err := captureAcceptanceVerdict(agent.Result{}, absentPath(t, "keyed.json"), absentPath(t, "legacy.json"), nil)
 	if !errors.Is(err, errAcceptanceVerdictMissing) {
 		t.Fatalf("err = %v, want errAcceptanceVerdictMissing", err)
 	}
@@ -63,23 +97,22 @@ func TestCaptureAcceptanceVerdict_MissingBoth(t *testing.T) {
 func TestCaptureAcceptanceVerdict_EmptyFileIsMissing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "empty.json")
 	mustWrite(t, path, "")
-	_, err := captureAcceptanceVerdict(agent.Result{}, path)
+	_, err := captureAcceptanceVerdict(agent.Result{}, path, absentPath(t, "legacy.json"), nil)
 	if !errors.Is(err, errAcceptanceVerdictMissing) {
 		t.Fatalf("err = %v, want errAcceptanceVerdictMissing", err)
 	}
 }
 
 // TestCaptureAcceptanceVerdict_ReadErrorNotMissing covers the
-// non-os.IsNotExist read-error branch (#1535 fix-up): a fallback path
-// that exists but cannot be read as a file (here a directory, EISDIR)
-// must return the distinct wrapped "fallback read" error rather than
-// errAcceptanceVerdictMissing, so a genuine read fault is not
-// misattributed to a missing verdict.
+// non-os.IsNotExist read-error branch (#1535 fix-up): a keyed path that exists
+// but cannot be read as a file (here a directory, EISDIR) must return the
+// distinct wrapped "fallback read" error rather than errAcceptanceVerdictMissing,
+// so a genuine read fault is not misattributed to a missing verdict.
 func TestCaptureAcceptanceVerdict_ReadErrorNotMissing(t *testing.T) {
 	dir := t.TempDir() // a directory: os.ReadFile fails with a non-not-exist error
-	_, err := captureAcceptanceVerdict(agent.Result{}, dir)
+	_, err := captureAcceptanceVerdict(agent.Result{}, dir, absentPath(t, "legacy.json"), nil)
 	if err == nil {
-		t.Fatal("expected a read error when the fallback path is a directory")
+		t.Fatal("expected a read error when the keyed path is a directory")
 	}
 	if errors.Is(err, errAcceptanceVerdictMissing) {
 		t.Errorf("a non-not-exist read error must NOT be errAcceptanceVerdictMissing, got %v", err)
@@ -593,23 +626,44 @@ func acceptanceStageSetup(t *testing.T) (repo string, fu *fakeUploader, runArgs 
 	}
 	withFakeUploader(t, fu)
 
-	// Point the verdict file fallback at a per-test temp path so a stale
-	// real /tmp/fishhawk-acceptance.json can never bleed into a test.
-	orig := acceptanceVerdictPath
-	acceptanceVerdictPath = filepath.Join(t.TempDir(), "fishhawk-acceptance.json")
-	t.Cleanup(func() { acceptanceVerdictPath = orig })
+	// Point the verdict file fallbacks (keyed dir + legacy fixed path) at
+	// per-test temp paths so a stale real /tmp/fishhawk-acceptance.json can
+	// never bleed into a test and the pre-spawn stale-clear never touches
+	// production paths (#1777).
+	origDir := acceptanceVerdictDir
+	acceptanceVerdictDir = t.TempDir()
+	origLegacy := legacyAcceptanceVerdictPath
+	legacyAcceptanceVerdictPath = filepath.Join(t.TempDir(), "fishhawk-acceptance.json")
+	t.Cleanup(func() {
+		acceptanceVerdictDir = origDir
+		legacyAcceptanceVerdictPath = origLegacy
+	})
 
 	runArgs = []string{
-		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--run-id", acceptanceTestRunID,
 		"--backend-url", "https://api.fishhawk.test",
 		"--workflow", "feature_change",
 		"--stage", "acceptance",
-		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--stage-id", acceptanceTestStageID,
 		"--fetch-prompt",
 		"--working-dir", repo,
 		"--upload-trace",
 	}
 	return repo, fu, runArgs
+}
+
+// acceptanceTestRunID / acceptanceTestStageID are the fixed run/stage ids the
+// acceptance run()-level harness dispatches with; the file-fallback tests build
+// the run/stage-keyed verdict path from them (#1777).
+const (
+	acceptanceTestRunID   = "11111111-2222-3333-4444-555555555555"
+	acceptanceTestStageID = "22222222-3333-4444-5555-666666666666"
+)
+
+// acceptanceKeyedVerdictPath is the run/stage-keyed verdict fallback path for the
+// harness's fixed ids — the path the runner reads first (#1777).
+func acceptanceKeyedVerdictPath() string {
+	return acceptanceVerdictPath(acceptanceTestRunID, acceptanceTestStageID)
 }
 
 // TestRun_AcceptanceStage_ProxyStartFailure_FailsClosed: a malformed
@@ -839,7 +893,7 @@ func TestRun_AcceptanceStage_FileFallback_Ships(t *testing.T) {
 	invoker := &fakeInvoker{
 		canned: agent.Result{OK: true},
 		onInvoke: func(_ int, _ agent.Invocation) {
-			mustWrite(t, acceptanceVerdictPath,
+			mustWrite(t, acceptanceKeyedVerdictPath(),
 				`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed"}]}`)
 		},
 	}
@@ -870,7 +924,7 @@ func TestRun_AcceptanceStage_FileFallback_NotesShips(t *testing.T) {
 	invoker := &fakeInvoker{
 		canned: agent.Result{OK: true},
 		onInvoke: func(_ int, _ agent.Invocation) {
-			mustWrite(t, acceptanceVerdictPath,
+			mustWrite(t, acceptanceKeyedVerdictPath(),
 				`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed"}],"notes":"preview was slow to boot but all criteria passed"}`)
 		},
 	}
@@ -894,16 +948,16 @@ func TestRun_AcceptanceStage_FileFallback_NotesShips(t *testing.T) {
 }
 
 // TestRun_AcceptanceStage_StaleFallbackCleared: a stale verdict left at
-// the fixed fallback path by a PRIOR run must be removed BEFORE the
-// acceptance agent runs. Here the agent produces neither StructuredOutput
-// nor a fresh file; without the pre-run clear, captureAcceptanceVerdict
-// would read and ship the stale bytes. With the clear (#1535 fix-up) the
-// stage instead demotes to category-B acceptance_verdict_missing and
-// nothing ships.
+// the run/stage-keyed fallback path by a PRIOR attempt must be removed
+// BEFORE the acceptance agent runs. Here the agent produces neither
+// StructuredOutput nor a fresh file; without the pre-run clear,
+// captureAcceptanceVerdict would read and ship the stale bytes. With the
+// clear (#1535 fix-up, keyed by #1777) the stage instead demotes to
+// category-B acceptance_verdict_missing and nothing ships.
 func TestRun_AcceptanceStage_StaleFallbackCleared(t *testing.T) {
 	_, fu, args := acceptanceStageSetup(t)
-	// Simulate a stale verdict from a previous run at the shared path.
-	mustWrite(t, acceptanceVerdictPath,
+	// Simulate a stale verdict from a previous attempt at the keyed path.
+	mustWrite(t, acceptanceKeyedVerdictPath(),
 		`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed"}]}`)
 	// The agent settles OK but writes NO fresh verdict (no StructuredOutput,
 	// no onInvoke file write).
@@ -920,6 +974,69 @@ func TestRun_AcceptanceStage_StaleFallbackCleared(t *testing.T) {
 	}
 	if fu.gotAcceptanceArgs != nil {
 		t.Error("ShipAcceptance must not ship a prior run's stale verdict")
+	}
+}
+
+// TestRun_AcceptanceStage_StaleLegacyFallbackCleared (#1777, binding condition
+// 2 / condition 3): a stale verdict left at the LEGACY fixed path by a foreign
+// run must ALSO be removed before the agent runs — the pre-spawn stale-clear
+// covers BOTH the keyed AND the legacy path, since captureAcceptanceVerdict
+// falls back to reading the legacy path. Without the legacy arm of the clear,
+// an agent that produces no fresh verdict would resurrect the foreign stale
+// bytes via the legacy fallback read. With it, the stage demotes to category-B
+// acceptance_verdict_missing and nothing ships.
+func TestRun_AcceptanceStage_StaleLegacyFallbackCleared(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	// A stale verdict from a foreign run at the LEGACY shared path.
+	mustWrite(t, legacyAcceptanceVerdictPath,
+		`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed"}]}`)
+	// The agent settles OK but writes NO fresh verdict at either path.
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure (stale legacy verdict must not resurrect):\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"acceptance_verdict_missing"`) {
+		t.Errorf("stale legacy fallback must be cleared → acceptance_verdict_missing, got: %s", stderr.String())
+	}
+	if fu.gotAcceptanceArgs != nil {
+		t.Error("ShipAcceptance must not ship a foreign run's stale legacy verdict")
+	}
+	// The stale-clear removed the legacy file before spawn.
+	if _, statErr := os.Stat(legacyAcceptanceVerdictPath); !os.IsNotExist(statErr) {
+		t.Errorf("legacy verdict path should have been cleared, stat err = %v", statErr)
+	}
+}
+
+// TestRun_AcceptanceStage_LegacyFallbackRead (#1777, binding condition 1): the
+// acceptance prompt still names the legacy fixed path, so an agent that writes
+// its verdict there (keyed path absent) must be read via the legacy fallback and
+// shipped — never stranded in verdict-missing. An acceptance_verdict_legacy_path
+// deprecation event is emitted.
+func TestRun_AcceptanceStage_LegacyFallbackRead(t *testing.T) {
+	_, fu, args := acceptanceStageSetup(t)
+	invoker := &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(_ int, _ agent.Invocation) {
+			// Agent writes ONLY the legacy path (keyed path stays absent).
+			mustWrite(t, legacyAcceptanceVerdictPath,
+				`{"verdict":"passed","criteria":[{"id":"AC1","result":"passed"}]}`)
+		},
+	}
+	withFakeInvoker(t, invoker)
+
+	var stderr strings.Builder
+	got := run(args, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK (legacy-path verdict must ship):\n%s", got, stderr.String())
+	}
+	if fu.gotAcceptanceArgs == nil {
+		t.Fatal("ShipAcceptance not called on the legacy-fallback path")
+	}
+	if !strings.Contains(stderr.String(), `"event":"acceptance_verdict_legacy_path"`) {
+		t.Errorf("expected acceptance_verdict_legacy_path deprecation event, got: %s", stderr.String())
 	}
 }
 

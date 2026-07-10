@@ -15,16 +15,44 @@ import (
 	"github.com/kuhlman-labs/fishhawk/cli/internal/httpclient"
 )
 
-// prDescriptionPath is where the runner agent writes the PR title and
-// body. The autoOpenPR function reads this file; override in tests.
-var prDescriptionPath = "/tmp/fishhawk-pr.md"
+// prDescriptionDir is the directory the run/stage-keyed PR-description handoff
+// lives in (#1777). var (not const) so tests can redirect it to a t.TempDir,
+// avoiding /tmp pollution / parallel-test races.
+var prDescriptionDir = "/tmp"
 
-// scopeFilePath is where the runner writes the implement stage's
-// resolved plan scope.files (see writeScopeHandoff in
-// runner/cmd/fishhawk-runner/main.go). autoOpenPR reads this to bound
-// staging to the declared paths instead of `git add -A`; override in
-// tests. Missing or empty falls back to `git add -A` (#581).
-var scopeFilePath = "/tmp/fishhawk-scope.json"
+// prDescriptionPath mirrors prompt.PullRequestDescriptionPath and the runner's
+// pullRequestDescriptionPath: the run/stage-keyed path the implement agent writes
+// the PR title+body to and the CLI reads it from (#1777). The format string is
+// hardcoded in all three independent modules by design — a one-sided edit is
+// caught by the prompt-render test plus the runner and CLI load tests.
+func prDescriptionPath(runID, stageID string) string {
+	return prDescriptionDir + "/" + fmt.Sprintf("fishhawk-pr-%s-%s.md", runID, stageID)
+}
+
+// legacyPRDescriptionPath is the fixed shared path the PR description used to be
+// written to before #1777 keyed it. Retained ONLY as the deprecation-window
+// fallback: parsePRDescriptionFile reads the keyed path first and falls back to
+// this legacy path (emitting pr_description_legacy_path) so an older prompt/agent
+// that still writes the fixed path is not silently lost. var so tests can
+// redirect it.
+var legacyPRDescriptionPath = "/tmp/fishhawk-pr.md"
+
+// scopeFileDir is the directory the run/stage-keyed scope handoff lives in
+// (#581, keyed by #1777). var (not const) so tests can redirect it to a
+// t.TempDir path and avoid /tmp pollution / parallel-test races.
+var scopeFileDir = "/tmp"
+
+// scopeFilePath mirrors the runner's scopeHandoffPath: the run/stage-keyed path
+// the runner writes the implement stage's resolved plan scope.files to (see
+// writeScopeHandoff in runner/cmd/fishhawk-runner/main.go). autoOpenPR reads this
+// to bound staging to the declared paths instead of `git add -A`. Keyed by run
+// id + stage id (#1777) so parallel runners no longer share one fixed path. No
+// legacy fallback is needed: the runner writer and this CLI reader upgrade in
+// lockstep within one binary set. Missing or empty falls back to `git add -A`
+// (#581).
+func scopeFilePath(runID, stageID string) string {
+	return scopeFileDir + "/" + fmt.Sprintf("fishhawk-scope-%s-%s.json", runID, stageID)
+}
 
 // scopeHandoffFile is the JSON the runner writes to scopeFilePath. It is
 // field-for-field compatible with the runner's scopeHandoff type — this
@@ -121,7 +149,8 @@ func loadImplementCommitMessage(runID, stageID string) (subject, body string, ok
 // (consumed + deleted by loadImplementCommitMessage), falling back to EXACTLY
 // today's title + "\n\n" + body when the sidecar is absent/empty — no synthetic
 // subject, so an older agent that writes no sidecar sees no behavior change.
-// title/body are the PR title/body sourced unchanged from /tmp/fishhawk-pr.md.
+// title/body are the PR title/body sourced unchanged from the run/stage-keyed
+// PR-description handoff (#1777).
 func implementCommitMessage(runID, stageID, title, body string) string {
 	if subject, sidecarBody, ok := loadImplementCommitMessage(runID, stageID); ok {
 		// Warn-only conventional-commit header check on the sidecar subject,
@@ -159,23 +188,47 @@ type autoOpenPRResult struct {
 	PRURL    string
 }
 
-// parsePRDescriptionFile reads the agent-authored PR description at
-// path and returns the title and body. The first non-blank line is the
-// title; everything after the first blank separator line is the body.
+// parsePRDescriptionFile reads the agent-authored PR description and returns the
+// title and body. The first non-blank line is the title; everything after the
+// first blank separator line is the body.
+//
+// Path resolution (#1777): reads the run/stage-KEYED path first, then falls back
+// to the LEGACY fixed path — mirroring the runner's keyed-first-legacy design —
+// so an older prompt/agent that still writes the fixed path is not silently lost
+// (a legacy read emits a pr_description_legacy_path deprecation event). The
+// consumed file is deleted on EVERY read path (delete-after-read) so a leftover
+// cannot bleed into a later run/stage.
 //
 // Falls back to a generated title ("chore: fishhawk implement stage
-// <shortRunID>") and empty body when the file is missing or the first
-// line is whitespace-only. The attribution footer is always appended.
-// A non-conventional agent title is used verbatim but flagged with a
-// warn-only pr_template_warning (#1572).
-func parsePRDescriptionFile(path, runID string) (title, body string, err error) {
-	data, readErr := os.ReadFile(path)
+// <shortRunID>") and empty body when neither file exists or the first line is
+// whitespace-only. The attribution footer is always appended. A non-conventional
+// agent title is used verbatim but flagged with a warn-only pr_template_warning
+// (#1572).
+func parsePRDescriptionFile(runID, stageID string) (title, body string, err error) {
+	keyed := prDescriptionPath(runID, stageID)
+	data, readErr := os.ReadFile(keyed)
+	path := keyed
 	if readErr != nil {
-		if os.IsNotExist(readErr) {
-			return prFallbackTitle(runID), autoPRFooter, nil
+		if !os.IsNotExist(readErr) {
+			return "", "", fmt.Errorf("read pr description: %w", readErr)
 		}
-		return "", "", fmt.Errorf("read pr description: %w", readErr)
+		// Keyed path absent: fall back to the legacy fixed path so a fixed-path
+		// prompt render (an older agent/prompt) still lands its PR text.
+		legacyData, legacyErr := os.ReadFile(legacyPRDescriptionPath)
+		if legacyErr != nil {
+			if os.IsNotExist(legacyErr) {
+				return prFallbackTitle(runID), autoPRFooter, nil
+			}
+			return "", "", fmt.Errorf("read pr description: %w", legacyErr)
+		}
+		data = legacyData
+		path = legacyPRDescriptionPath
+		_, _ = fmt.Fprintf(os.Stderr,
+			`{"event":"pr_description_legacy_path","path":%q}`+"\n", path)
 	}
+	// A present file is consumed regardless of outcome: remove whichever path we
+	// read so a stale handoff is never reused by a later run/stage.
+	defer func() { _ = os.Remove(path) }()
 
 	lines := strings.Split(string(data), "\n")
 	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
@@ -237,7 +290,7 @@ func autoOpenPR(ctx context.Context, client *httpclient.Client, args autoOpenPRA
 	shortRunID := shortID(args.RunID)
 	shortStageID := shortID(args.StageID)
 
-	title, body, err := parsePRDescriptionFile(prDescriptionPath, args.RunID.String())
+	title, body, err := parsePRDescriptionFile(args.RunID.String(), args.StageID.String())
 	if err != nil {
 		return nil, fmt.Errorf("autopr: %w", err)
 	}
@@ -295,7 +348,7 @@ func autoOpenPR(ctx context.Context, client *httpclient.Client, args autoOpenPRA
 	// staging excludes dirty-but-undeclared paths (stray dev .pid files,
 	// editor scratch, unrelated local edits) from the Fishhawk-attributed
 	// commit, warning about them as scope drift rather than blocking (#581).
-	if scopeFiles := readScopeFiles(scopeFilePath); len(scopeFiles) > 0 {
+	if scopeFiles := readScopeFiles(args.RunID.String(), args.StageID.String()); len(scopeFiles) > 0 {
 		drift, scopeErr := stageScopedAuto(args.WorkingDir, scopeFiles)
 		if scopeErr != nil {
 			return nil, fmt.Errorf("autopr: %w", scopeErr)
@@ -313,7 +366,7 @@ func autoOpenPR(ctx context.Context, client *httpclient.Client, args autoOpenPRA
 	// Conventional-Commits sidecar (delete-after-read), falling back to today's
 	// title + "\n\n" + body when absent — so the local --no-pr commit no longer
 	// stuffs the whole PR review body into its message. The PR title/body still
-	// come from /tmp/fishhawk-pr.md unchanged.
+	// come from the run/stage-keyed PR-description handoff unchanged (#1777).
 	commitMsg := implementCommitMessage(args.RunID.String(), args.StageID.String(), title, body)
 	commitOut, commitErr := autoGitCommand("git", "-C", args.WorkingDir,
 		"commit", "--signoff", "-m", commitMsg).CombinedOutput()
@@ -425,12 +478,13 @@ func parsePRCreateOutput(out string) (prURL string, prNumber int, err error) {
 	return "", 0, fmt.Errorf("no pull request URL found in gh output: %q", strings.TrimSpace(out))
 }
 
-// readScopeFiles reads the runner-written scope handoff at path and
-// returns the declared repo-relative paths. Returns nil — triggering
-// the `git add -A` fallback in autoOpenPR — when the file is missing,
-// empty, unparseable, or declares no paths.
-func readScopeFiles(path string) []string {
-	data, err := os.ReadFile(path)
+// readScopeFiles reads the runner-written scope handoff at the run/stage-keyed
+// path and returns the declared repo-relative paths. Returns nil — triggering
+// the `git add -A` fallback in autoOpenPR — when the file is missing, empty,
+// unparseable, or declares no paths. No legacy fallback: the runner writer and
+// this reader key the path in lockstep within one binary set (#1777).
+func readScopeFiles(runID, stageID string) []string {
+	data, err := os.ReadFile(scopeFilePath(runID, stageID))
 	if err != nil {
 		return nil
 	}

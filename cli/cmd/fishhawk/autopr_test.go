@@ -17,19 +17,45 @@ import (
 	"github.com/kuhlman-labs/fishhawk/cli/internal/httpclient"
 )
 
-func TestParsePRDescriptionFile_AgentAuthored(t *testing.T) {
-	f, err := os.CreateTemp(t.TempDir(), "pr-*.md")
-	if err != nil {
+// redirectPRDescriptionDir points prDescriptionDir + the legacy fixed path at a
+// temp dir so parsePRDescriptionFile's keyed-first read never touches a real
+// /tmp file (#1777). Returns the temp dir.
+func redirectPRDescriptionDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	origDir := prDescriptionDir
+	prDescriptionDir = dir
+	origLegacy := legacyPRDescriptionPath
+	legacyPRDescriptionPath = filepath.Join(dir, "legacy-fishhawk-pr.md")
+	t.Cleanup(func() {
+		prDescriptionDir = origDir
+		legacyPRDescriptionPath = origLegacy
+	})
+	return dir
+}
+
+// writePRDescriptionKeyed redirects the PR-description dir and writes content to
+// the run/stage-keyed path (#1777), returning that path.
+func writePRDescriptionKeyed(t *testing.T, runID, stageID, content string) string {
+	t.Helper()
+	redirectPRDescriptionDir(t)
+	path := prDescriptionPath(runID, stageID)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	content := "Add widget support\n\n## Summary\n- adds widgets\n\n## Test plan\n- [ ] run tests\n"
-	if _, werr := f.WriteString(content); werr != nil {
-		t.Fatal(werr)
-	}
-	f.Close()
+	return path
+}
 
-	runID := "11111111-2222-3333-4444-555555555555"
-	title, body, err := parsePRDescriptionFile(f.Name(), runID)
+const (
+	testPRRunID   = "11111111-2222-3333-4444-555555555555"
+	testPRStageID = "22222222-3333-4444-5555-666666666666"
+)
+
+func TestParsePRDescriptionFile_AgentAuthored(t *testing.T) {
+	content := "Add widget support\n\n## Summary\n- adds widgets\n\n## Test plan\n- [ ] run tests\n"
+	writePRDescriptionKeyed(t, testPRRunID, testPRStageID, content)
+
+	title, body, err := parsePRDescriptionFile(testPRRunID, testPRStageID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -44,11 +70,30 @@ func TestParsePRDescriptionFile_AgentAuthored(t *testing.T) {
 	}
 }
 
-func TestParsePRDescriptionFile_MissingFallback(t *testing.T) {
-	path := t.TempDir() + "/no-such-file.md"
-	runID := "aabbccdd-1122-3344-5566-778899aabbcc"
+// TestPRDescriptionPath_KeyedFormat asserts the run/stage-keyed CLI-side path
+// format (#1777): distinct ids yield distinct paths, and the literal is
+// byte-identical to the backend prompt and runner format strings (cross-module
+// drift guard, like the #1686 commit-message sidecar).
+func TestPRDescriptionPath_KeyedFormat(t *testing.T) {
+	origDir := prDescriptionDir
+	prDescriptionDir = "/tmp"
+	t.Cleanup(func() { prDescriptionDir = origDir })
+	a := prDescriptionPath("run-1", "stage-1")
+	b := prDescriptionPath("run-2", "stage-2")
+	if a == b {
+		t.Errorf("distinct ids must yield distinct paths: %q == %q", a, b)
+	}
+	if want := "/tmp/fishhawk-pr-run-1-stage-1.md"; a != want {
+		t.Errorf("keyed path = %q, want %q (must match backend + runner literal)", a, want)
+	}
+}
 
-	title, body, err := parsePRDescriptionFile(path, runID)
+func TestParsePRDescriptionFile_MissingFallback(t *testing.T) {
+	runID := "aabbccdd-1122-3344-5566-778899aabbcc"
+	// Redirect the dir but write nothing → both keyed and legacy absent.
+	redirectPRDescriptionDir(t)
+
+	title, body, err := parsePRDescriptionFile(runID, testPRStageID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -61,18 +106,47 @@ func TestParsePRDescriptionFile_MissingFallback(t *testing.T) {
 	}
 }
 
-func TestParsePRDescriptionFile_BlankFirstLineFallback(t *testing.T) {
-	f, err := os.CreateTemp(t.TempDir(), "pr-*.md")
-	if err != nil {
+// TestParsePRDescriptionFile_LegacyFallback (#1777, binding condition 1): when
+// the keyed path is absent and the legacy fixed path is present, the CLI reads
+// the legacy path AND emits a pr_description_legacy_path deprecation event.
+func TestParsePRDescriptionFile_LegacyFallback(t *testing.T) {
+	redirectPRDescriptionDir(t)
+	if err := os.WriteFile(legacyPRDescriptionPath,
+		[]byte("feat(cli): legacy handoff\n\n## Summary\n- x\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, werr := f.WriteString("\nsome content below"); werr != nil {
-		t.Fatal(werr)
+	var title string
+	stderr := captureStderr(t, func() {
+		var perr error
+		title, _, perr = parsePRDescriptionFile(testPRRunID, testPRStageID)
+		if perr != nil {
+			t.Fatalf("unexpected error: %v", perr)
+		}
+	})
+	if title != "feat(cli): legacy handoff" {
+		t.Errorf("title = %q, want the legacy-path title", title)
 	}
-	f.Close()
+	if !strings.Contains(stderr, `"event":"pr_description_legacy_path"`) {
+		t.Errorf("expected pr_description_legacy_path deprecation event, got %q", stderr)
+	}
+}
 
-	runID := "11111111-2222-3333-4444-555555555555"
-	title, _, err := parsePRDescriptionFile(f.Name(), runID)
+// TestParsePRDescriptionFile_DeleteAfterRead (#1777): the consumed handoff is
+// removed after read so a leftover cannot bleed into a later run/stage.
+func TestParsePRDescriptionFile_DeleteAfterRead(t *testing.T) {
+	path := writePRDescriptionKeyed(t, testPRRunID, testPRStageID, "feat: x\n\nbody\n")
+	if _, _, err := parsePRDescriptionFile(testPRRunID, testPRStageID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Errorf("keyed handoff must be deleted after read, stat err = %v", statErr)
+	}
+}
+
+func TestParsePRDescriptionFile_BlankFirstLineFallback(t *testing.T) {
+	writePRDescriptionKeyed(t, testPRRunID, testPRStageID, "\nsome content below")
+
+	title, _, err := parsePRDescriptionFile(testPRRunID, testPRStageID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -107,19 +181,12 @@ func captureStderr(t *testing.T, fn func()) string {
 // TestParsePRDescriptionFile_NonConventionalTitleWarns (#1572): a non-conventional
 // agent title emits pr_template_warning AND is used verbatim.
 func TestParsePRDescriptionFile_NonConventionalTitleWarns(t *testing.T) {
-	f, err := os.CreateTemp(t.TempDir(), "pr-*.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, werr := f.WriteString("Add widget support\n\n## Summary\n- adds widgets\n"); werr != nil {
-		t.Fatal(werr)
-	}
-	f.Close()
+	writePRDescriptionKeyed(t, testPRRunID, testPRStageID, "Add widget support\n\n## Summary\n- adds widgets\n")
 
 	var title string
 	stderr := captureStderr(t, func() {
 		var perr error
-		title, _, perr = parsePRDescriptionFile(f.Name(), "11111111-2222-3333-4444-555555555555")
+		title, _, perr = parsePRDescriptionFile(testPRRunID, testPRStageID)
 		if perr != nil {
 			t.Fatalf("unexpected error: %v", perr)
 		}
@@ -136,19 +203,12 @@ func TestParsePRDescriptionFile_NonConventionalTitleWarns(t *testing.T) {
 // TestParsePRDescriptionFile_ConventionalTitleNoWarn (#1572): a conventional
 // agent title emits NO pr_template_warning.
 func TestParsePRDescriptionFile_ConventionalTitleNoWarn(t *testing.T) {
-	f, err := os.CreateTemp(t.TempDir(), "pr-*.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, werr := f.WriteString("feat(widget): add widget support\n\n## Summary\n- adds widgets\n"); werr != nil {
-		t.Fatal(werr)
-	}
-	f.Close()
+	writePRDescriptionKeyed(t, testPRRunID, testPRStageID, "feat(widget): add widget support\n\n## Summary\n- adds widgets\n")
 
 	var title string
 	stderr := captureStderr(t, func() {
 		var perr error
-		title, _, perr = parsePRDescriptionFile(f.Name(), "11111111-2222-3333-4444-555555555555")
+		title, _, perr = parsePRDescriptionFile(testPRRunID, testPRStageID)
 		if perr != nil {
 			t.Fatalf("unexpected error: %v", perr)
 		}
@@ -276,16 +336,11 @@ func TestAutoOpenPR_ImplementCommitMessageSidecar(t *testing.T) {
 	}
 	repo, _ := autoOpenPRTestRepo(t)
 
-	prFile := filepath.Join(t.TempDir(), "pr.md")
-	if err := os.WriteFile(prFile, []byte("feat(cli): PR TITLE\n\n## Summary\n\nRich PR body.\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	origPath := prDescriptionPath
-	prDescriptionPath = prFile
-	t.Cleanup(func() { prDescriptionPath = origPath })
-
 	runID := uuid.New()
 	stageID := uuid.New()
+	writePRDescriptionKeyed(t, runID.String(), stageID.String(),
+		"feat(cli): PR TITLE\n\n## Summary\n\nRich PR body.\n")
+
 	sidecarPath := writeImplementCommitMsgSidecar(t, runID.String(), stageID.String(),
 		"feat(cli): add minio-init target\n\nConcise commit body.\n")
 
@@ -342,13 +397,10 @@ func TestAutoOpenPR_ImplementCommitMessageFallback(t *testing.T) {
 	implementCommitMessageDir = t.TempDir()
 	t.Cleanup(func() { implementCommitMessageDir = origDir })
 
-	prFile := filepath.Join(t.TempDir(), "pr.md")
-	if err := os.WriteFile(prFile, []byte("feat(cli): PR TITLE\n\n## Summary\n\nRich PR body.\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	origPath := prDescriptionPath
-	prDescriptionPath = prFile
-	t.Cleanup(func() { prDescriptionPath = origPath })
+	runID := uuid.New()
+	stageID := uuid.New()
+	writePRDescriptionKeyed(t, runID.String(), stageID.String(),
+		"feat(cli): PR TITLE\n\n## Summary\n\nRich PR body.\n")
 
 	origGh := autoGhCommand
 	autoGhCommand = func(_ string, _ ...string) *exec.Cmd {
@@ -369,8 +421,8 @@ func TestAutoOpenPR_ImplementCommitMessageFallback(t *testing.T) {
 		httpclient.New(srv.URL, "test-token"),
 		autoOpenPRArgs{
 			WorkingDir: repo,
-			RunID:      uuid.New(),
-			StageID:    uuid.New(),
+			RunID:      runID,
+			StageID:    stageID,
 			GitHubRepo: "owner/repo",
 			BaseBranch: "main",
 		}); err != nil {
@@ -410,11 +462,12 @@ func autoOpenPRTestRepo(t *testing.T) (repo, bare string) {
 	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# changed\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Point scopeFilePath at a nonexistent path so staging falls back to
-	// `git add -A` (the default /tmp/fishhawk-scope.json may exist on the host).
-	origScope := scopeFilePath
-	scopeFilePath = filepath.Join(dir, "no-such-scope.json")
-	t.Cleanup(func() { scopeFilePath = origScope })
+	// Point the scope handoff dir at an empty temp dir so the keyed scope file
+	// is absent and staging falls back to `git add -A` (the default
+	// /tmp/fishhawk-scope-*.json may exist on the host).
+	origScopeDir := scopeFileDir
+	scopeFileDir = filepath.Join(dir, "no-such-scope-dir")
+	t.Cleanup(func() { scopeFileDir = origScopeDir })
 	return repo, bare
 }
 
@@ -460,18 +513,10 @@ func stubGitCommand(name string, arg ...string) *exec.Cmd {
 }
 
 func TestAutoOpenPR_SuccessPath(t *testing.T) {
-	f, err := os.CreateTemp(t.TempDir(), "pr-*.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, werr := f.WriteString("Add feature X\n\nThis adds feature X.\n"); werr != nil {
-		t.Fatal(werr)
-	}
-	f.Close()
-
-	origPath := prDescriptionPath
-	prDescriptionPath = f.Name()
-	t.Cleanup(func() { prDescriptionPath = origPath })
+	runID := uuid.MustParse("11111111-2222-3333-4444-555555555555")
+	stageID := uuid.MustParse("22222222-3333-4444-5555-666666666666")
+	writePRDescriptionKeyed(t, runID.String(), stageID.String(),
+		"Add feature X\n\nThis adds feature X.\n")
 
 	origGit := autoGitCommand
 	autoGitCommand = stubGitCommand
@@ -494,9 +539,6 @@ func TestAutoOpenPR_SuccessPath(t *testing.T) {
 		})
 	}))
 	defer srv.Close()
-
-	runID := uuid.MustParse("11111111-2222-3333-4444-555555555555")
-	stageID := uuid.MustParse("22222222-3333-4444-5555-666666666666")
 
 	result, err := autoOpenPR(context.Background(),
 		httpclient.New(srv.URL, "test-token"),
@@ -525,18 +567,9 @@ func TestAutoOpenPR_SuccessPath(t *testing.T) {
 }
 
 func TestAutoOpenPR_GhMissing(t *testing.T) {
-	f, err := os.CreateTemp(t.TempDir(), "pr-*.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, werr := f.WriteString("Add feature\n\nBody.\n"); werr != nil {
-		t.Fatal(werr)
-	}
-	f.Close()
-
-	origPath := prDescriptionPath
-	prDescriptionPath = f.Name()
-	t.Cleanup(func() { prDescriptionPath = origPath })
+	// PR title/body are irrelevant here (gh fails before ship); just keep the
+	// keyed read off the real /tmp. Keyed absent → fallback title.
+	redirectPRDescriptionDir(t)
 
 	origGit := autoGitCommand
 	autoGitCommand = stubGitCommand
@@ -555,7 +588,7 @@ func TestAutoOpenPR_GhMissing(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err = autoOpenPR(context.Background(),
+	_, err := autoOpenPR(context.Background(),
 		httpclient.New(srv.URL, ""),
 		autoOpenPRArgs{
 			WorkingDir: t.TempDir(),
@@ -573,18 +606,8 @@ func TestAutoOpenPR_GhMissing(t *testing.T) {
 }
 
 func TestAutoOpenPR_PushFails(t *testing.T) {
-	f, err := os.CreateTemp(t.TempDir(), "pr-*.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, werr := f.WriteString("Title\n\nBody.\n"); werr != nil {
-		t.Fatal(werr)
-	}
-	f.Close()
-
-	origPath := prDescriptionPath
-	prDescriptionPath = f.Name()
-	t.Cleanup(func() { prDescriptionPath = origPath })
+	// PR title/body are irrelevant here (push fails before ship).
+	redirectPRDescriptionDir(t)
 
 	origGit := autoGitCommand
 	autoGitCommand = func(name string, arg ...string) *exec.Cmd {
@@ -609,7 +632,7 @@ func TestAutoOpenPR_PushFails(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err = autoOpenPR(context.Background(),
+	_, err := autoOpenPR(context.Background(),
 		httpclient.New(srv.URL, ""),
 		autoOpenPRArgs{
 			WorkingDir: t.TempDir(),
@@ -650,30 +673,36 @@ func mustGitOutCLI(t *testing.T, dir string, args ...string) string {
 }
 
 func TestReadScopeFiles(t *testing.T) {
-	dir := t.TempDir()
+	// Redirect the keyed scope dir into a temp dir (#1777).
+	origDir := scopeFileDir
+	scopeFileDir = t.TempDir()
+	t.Cleanup(func() { scopeFileDir = origDir })
+
+	// TestScopeFilePath_KeyedFormat asserts distinct ids yield distinct paths.
+	if a, b := scopeFilePath("r1", "s1"), scopeFilePath("r2", "s2"); a == b {
+		t.Errorf("distinct ids must yield distinct scope paths: %q == %q", a, b)
+	}
 
 	// Missing file → nil (fallback to git add -A).
-	if got := readScopeFiles(filepath.Join(dir, "absent.json")); got != nil {
+	if got := readScopeFiles("absent-run", "absent-stage"); got != nil {
 		t.Errorf("readScopeFiles(missing) = %v, want nil", got)
 	}
 
 	// Empty files list → nil.
-	emptyPath := filepath.Join(dir, "empty.json")
-	if err := os.WriteFile(emptyPath, []byte(`{"files":[]}`), 0o600); err != nil {
+	if err := os.WriteFile(scopeFilePath("empty-run", "empty-stage"), []byte(`{"files":[]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := readScopeFiles(emptyPath); got != nil {
+	if got := readScopeFiles("empty-run", "empty-stage"); got != nil {
 		t.Errorf("readScopeFiles(empty) = %v, want nil", got)
 	}
 
 	// Valid handoff → declared paths, dropping blank-path entries.
-	validPath := filepath.Join(dir, "scope.json")
 	body := `{"files":[{"path":"cli/cmd/fishhawk/autopr.go","operation":"modify"},` +
 		`{"path":"","operation":"modify"},{"path":".gitignore","operation":"modify"}]}`
-	if err := os.WriteFile(validPath, []byte(body), 0o600); err != nil {
+	if err := os.WriteFile(scopeFilePath("valid-run", "valid-stage"), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got := readScopeFiles(validPath)
+	got := readScopeFiles("valid-run", "valid-stage")
 	want := []string{"cli/cmd/fishhawk/autopr.go", ".gitignore"}
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Errorf("readScopeFiles(valid) = %v, want %v", got, want)
@@ -779,22 +808,18 @@ func TestAutoOpenPR_ScopeBoundedStaging(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	prFile := filepath.Join(dir, "pr.md")
-	if err := os.WriteFile(prFile, []byte("Scoped change\n\nBody.\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	origPath := prDescriptionPath
-	prDescriptionPath = prFile
-	t.Cleanup(func() { prDescriptionPath = origPath })
+	runID := uuid.New()
+	stageID := uuid.New()
+	writePRDescriptionKeyed(t, runID.String(), stageID.String(), "Scoped change\n\nBody.\n")
 
-	scopeFile := filepath.Join(dir, "scope.json")
-	if err := os.WriteFile(scopeFile,
+	// Write the run/stage-keyed scope handoff so autoOpenPR bounds staging to it.
+	origScopeDir := scopeFileDir
+	scopeFileDir = dir
+	t.Cleanup(func() { scopeFileDir = origScopeDir })
+	if err := os.WriteFile(scopeFilePath(runID.String(), stageID.String()),
 		[]byte(`{"files":[{"path":"README.md","operation":"modify"}]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	origScope := scopeFilePath
-	scopeFilePath = scopeFile
-	t.Cleanup(func() { scopeFilePath = origScope })
 
 	origGh := autoGhCommand
 	autoGhCommand = func(_ string, _ ...string) *exec.Cmd {
@@ -815,8 +840,8 @@ func TestAutoOpenPR_ScopeBoundedStaging(t *testing.T) {
 		httpclient.New(srv.URL, "test-token"),
 		autoOpenPRArgs{
 			WorkingDir: repo,
-			RunID:      uuid.New(),
-			StageID:    uuid.New(),
+			RunID:      runID,
+			StageID:    stageID,
 			GitHubRepo: "owner/repo",
 			BaseBranch: "main",
 		})
@@ -856,18 +881,7 @@ func stubGitCommandDecomposed(showRefExists bool) func(string, ...string) *exec.
 }
 
 func TestAutoOpenPR_DecomposedFirstChild(t *testing.T) {
-	f, err := os.CreateTemp(t.TempDir(), "pr-*.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, werr := f.WriteString("Add feature X\n\nThis adds feature X.\n"); werr != nil {
-		t.Fatal(werr)
-	}
-	f.Close()
-
-	origPath := prDescriptionPath
-	prDescriptionPath = f.Name()
-	t.Cleanup(func() { prDescriptionPath = origPath })
+	redirectPRDescriptionDir(t)
 
 	origGit := autoGitCommand
 	// First child: show-ref exits non-zero (branch not yet on remote).
@@ -925,18 +939,7 @@ func TestAutoOpenPR_DecomposedFirstChild(t *testing.T) {
 }
 
 func TestAutoOpenPR_DecomposedSubsequentChild(t *testing.T) {
-	f, err := os.CreateTemp(t.TempDir(), "pr-*.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, werr := f.WriteString("Add feature Y\n\nThis adds feature Y.\n"); werr != nil {
-		t.Fatal(werr)
-	}
-	f.Close()
-
-	origPath := prDescriptionPath
-	prDescriptionPath = f.Name()
-	t.Cleanup(func() { prDescriptionPath = origPath })
+	redirectPRDescriptionDir(t)
 
 	origGit := autoGitCommand
 	// Subsequent child: show-ref exits 0 (branch already on remote).
