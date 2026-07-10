@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# Hermetic test for scripts/test's schema-sync drift check inside the verify gate
+# (#1064/#1772). Sources scripts/test lib-only (FISHHAWK_TEST_LIB_ONLY=1, so no
+# subcommand runs), then drives _verify_schema_sync against a throwaway git repo
+# by overriding ROOT after sourcing (exactly as scripts/test-container-lease
+# overrides LEASE_DIR) with a stub $ROOT/scripts/sync-schemas. Asserts one
+# behavioral case per named branch of the helper: drift, clean, not-a-git-work-
+# tree, and git-binary-unavailable — plus a body-grep that cmd_verify invokes
+# _verify_schema_sync between cmd_lint and cmd_test. Standalone like
+# scripts/test-container-lease / scripts/test-dev — not wired into scripts/test
+# or CI.
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PASS=0
+FAIL=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+tmproot=$(mktemp -d)
+trap 'rm -rf "$tmproot"' EXIT
+
+# Source the lib. scripts/test enables `set -e`; turn it back off so assertions
+# that run commands expected to fail don't abort the test.
+FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test"
+set +e
+
+# Build a throwaway git repo with a stub scripts/sync-schemas. `body` is the
+# stub's shell body (after the shebang); it computes its own repo root so it
+# mutates the repo regardless of the caller's cwd, exactly as the real
+# scripts/sync-schemas derives REPO_ROOT from its own path.
+make_repo() {
+  local repo="$1" body="$2"
+  rm -rf "$repo"
+  mkdir -p "$repo/scripts"
+  git init -q "$repo"
+  # Repo-local identity so `git commit` works even though scripts/test exports
+  # GIT_CONFIG_GLOBAL=/dev/null (a global user.name/email is unavailable).
+  git -C "$repo" config user.email test@example.com
+  git -C "$repo" config user.name test
+  echo original > "$repo/tracked.txt"
+  git -C "$repo" add tracked.txt
+  git -C "$repo" commit -q -m init
+  {
+    echo '#!/usr/bin/env bash'
+    echo "$body"
+  } > "$repo/scripts/sync-schemas"
+  chmod +x "$repo/scripts/sync-schemas"
+}
+
+# (a) presence + ordering: cmd_verify invokes _verify_schema_sync positioned
+# between cmd_lint and cmd_test (the fast-checks-lead-the-output contract).
+verify_body="$(declare -f cmd_verify)"
+lint_line=$(printf '%s\n' "$verify_body" | grep -n 'cmd_lint' | head -1 | cut -d: -f1)
+sync_line=$(printf '%s\n' "$verify_body" | grep -n '_verify_schema_sync' | head -1 | cut -d: -f1)
+test_line=$(printf '%s\n' "$verify_body" | grep -n 'cmd_test' | head -1 | cut -d: -f1)
+if [ -n "$lint_line" ] && [ -n "$sync_line" ] && [ -n "$test_line" ] \
+   && [ "$lint_line" -lt "$sync_line" ] && [ "$sync_line" -lt "$test_line" ]; then
+  pass "cmd_verify invokes _verify_schema_sync between cmd_lint and cmd_test"
+else
+  fail "cmd_verify ordering: expected cmd_lint < _verify_schema_sync < cmd_test (lint=$lint_line sync=$sync_line test=$test_line)"
+fi
+
+# (b) drift: a stub sync-schemas that mutates a tracked file changes the
+# porcelain output, so _verify_schema_sync exits non-zero with a message naming
+# scripts/sync-schemas. Run in a subshell — the helper calls `exit 1`, which
+# would otherwise terminate this test.
+ROOT="$tmproot/drift"
+make_repo "$ROOT" 'd="$(cd "$(dirname "$0")/.." && pwd)"; echo drifted > "$d/tracked.txt"'
+drift_out="$( (_verify_schema_sync) 2>&1 )"
+drift_rc=$?
+if [ "$drift_rc" -ne 0 ] && printf '%s' "$drift_out" | grep -q 'scripts/sync-schemas'; then
+  pass "drift: sync-schemas producing a change fails non-zero and names scripts/sync-schemas"
+else
+  fail "drift: expected non-zero exit + message naming scripts/sync-schemas (rc=$drift_rc, out='$drift_out')"
+fi
+
+# (c) clean: a stub sync-schemas that mutates nothing leaves the porcelain output
+# unchanged, so _verify_schema_sync returns 0 (the already-synced-tree case).
+ROOT="$tmproot/clean"
+make_repo "$ROOT" 'exit 0'
+( _verify_schema_sync ) >/dev/null 2>&1
+clean_rc=$?
+if [ "$clean_rc" -eq 0 ]; then
+  pass "clean: no-op sync-schemas returns 0"
+else
+  fail "clean: expected 0 on an already-synced tree, got $clean_rc"
+fi
+
+# (d) not-a-git-work-tree: ROOT points at a plain non-git directory, so the
+# rev-parse guard short-circuits to a return-0 no-op (never runs sync-schemas).
+ROOT="$tmproot/nogit"
+rm -rf "$ROOT"
+mkdir -p "$ROOT"
+( _verify_schema_sync ) >/dev/null 2>&1
+nogit_rc=$?
+if [ "$nogit_rc" -eq 0 ]; then
+  pass "not-a-git-work-tree: non-git ROOT is a clean no-op (return 0)"
+else
+  fail "not-a-git-work-tree: expected 0 no-op, got $nogit_rc"
+fi
+
+# (d2) bare git repo (valid non-worktree): `git rev-parse --is-inside-work-tree`
+# prints `false` yet exits 0 inside a bare repo, so an exit-status-only guard
+# would fall through to `git status --porcelain` (which errors in a bare repo).
+# The value-guard must treat this as a clean return-0 no-op and never run
+# sync-schemas. The stub would mutate a file if reached, so a 0 exit proves the
+# guard short-circuited before it ran.
+ROOT="$tmproot/bare"
+rm -rf "$ROOT"
+git init -q --bare "$ROOT"
+mkdir -p "$ROOT/scripts"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'echo reached > "$(cd "$(dirname "$0")/.." && pwd)/REACHED"'
+} > "$ROOT/scripts/sync-schemas"
+chmod +x "$ROOT/scripts/sync-schemas"
+bare_out="$( (_verify_schema_sync) 2>&1 )"
+bare_rc=$?
+if [ "$bare_rc" -eq 0 ] && [ ! -e "$ROOT/REACHED" ] \
+   && printf '%s' "$bare_out" | grep -q 'not a git work tree'; then
+  pass "bare git repo: non-worktree is a clean no-op (return 0, sync-schemas never run)"
+else
+  fail "bare git repo: expected 0 no-op that skips sync-schemas (rc=$bare_rc, reached=$([ -e "$ROOT/REACHED" ] && echo yes || echo no), out='$bare_out')"
+fi
+
+# (e) git-binary-unavailable (binding condition): with git stripped from PATH the
+# `command -v git` guard short-circuits to a return-0 no-op, even against a real
+# git repo ROOT. Runs in a subshell so the PATH override is scoped to the call.
+ROOT="$tmproot/drift"   # a real git repo — proves the git-absent guard fires first
+nogit_bin_out="$( PATH="/nonexistent" _verify_schema_sync 2>&1 )"
+nogit_bin_rc=$?
+if [ "$nogit_bin_rc" -eq 0 ] && ! printf '%s' "$nogit_bin_out" | grep -q 'drifted from'; then
+  pass "git-binary-unavailable: PATH stripped of git is a clean no-op (return 0)"
+else
+  fail "git-binary-unavailable: expected 0 no-op with no drift error (rc=$nogit_bin_rc, out='$nogit_bin_out')"
+fi
+
+# (f) parse-clean: scripts/test itself parses with no syntax errors.
+if bash -n "$REPO_ROOT/scripts/test" 2>/dev/null; then
+  pass "bash -n scripts/test parses clean"
+else
+  fail "bash -n scripts/test reported a syntax error"
+fi
+
+echo ""
+echo "Results: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]
