@@ -75,6 +75,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerVerifyRun(srv, resolver)
 	registerVouchCommit(srv, resolver)
 	registerReportProductIssue(srv, resolver)
+	registerReleaseNotes(srv, resolver)
 	registerDoctor(srv, resolver)
 	registerInit(srv, resolver)
 }
@@ -1258,7 +1259,15 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	// slice (the mergeObservedIn idiom) to relabel the merge-eligible
 	// succeeded_acceptance_skipped_out_of_scope state.
 	acceptanceSkippedOutOfScope := acceptanceSkippedOutOfScopeIn(recent)
-	nextActions := nextActionsFor(runRow, stages, planReviewStatus, implementReviewStatus, reviewActionHint, view.driveStatus(), mergeObserved, acceptanceSkippedOutOfScope, acceptanceVerdict, acceptanceTriageDisposition)
+	// Release-workflow loop signals (E33.5 / #1590): computed only for a
+	// delegating WorkflowID == "release" run (cost-gated — an ordinary run pays
+	// no extra round-trips) and threaded into the classifier so the release arm
+	// names the correct verb (prepare/preview/cut/publish) at each loop state.
+	var release releaseSignals
+	if runRow.WorkflowID == "release" {
+		release = r.releaseSignalsFor(ctx, stages, recent)
+	}
+	nextActions := nextActionsFor(runRow, stages, planReviewStatus, implementReviewStatus, reviewActionHint, view.driveStatus(), mergeObserved, acceptanceSkippedOutOfScope, acceptanceVerdict, acceptanceTriageDisposition, release)
 
 	// Best-effort decomposed-parent children status (#1147). Cost-gated so an
 	// ordinary run pays nothing: only a decomposed parent (no parent_run_id,

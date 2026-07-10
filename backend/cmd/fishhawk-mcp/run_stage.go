@@ -594,7 +594,12 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		// acceptance-skip flag are empty/false here — safe: run_stage never runs
 		// the acceptance stage, and the defensive acceptance_settled_outcome_unknown
 		// arm covers an already-settled acceptance stage (E31.9).
-		nextActions = nextActionsFor(&runView.Run, postStages, planReviewStatus, implementReviewStatus, reviewActionHint, runView.driveStatus(), false, false, "", "")
+		// A run_stage call executes plan/implement/acceptance, never the
+		// delegating "release" workflow's operator loop (E33.5 / #1590), and it
+		// holds no recent-audit slice to derive the release_cut/release_published
+		// signals from — so the release signals are the zero value here (the
+		// release arm is inert). getRunStatus is the surface that computes them.
+		nextActions = nextActionsFor(&runView.Run, postStages, planReviewStatus, implementReviewStatus, reviewActionHint, runView.driveStatus(), false, false, "", "", releaseSignals{})
 	}
 
 	out := RunStageOutput{

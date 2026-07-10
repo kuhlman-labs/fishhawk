@@ -2108,6 +2108,117 @@ func (c *apiClient) ListStageArtifacts(ctx context.Context, stageID uuid.UUID) (
 	return res.Items, nil
 }
 
+// releaseNotesPersistRequest mirrors the backend's POST /v0/releases/notes
+// request body (`backend/internal/server/release_notes.go`, E33.2 / #1587).
+// stage_id keys the persisted release_notes artifact — the persist endpoint is
+// stage-scoped because no first-class release stage type exists yet. Repeated
+// here (not imported) per the thin-local-copy rule: the import direction is
+// cli → backend, not the reverse.
+type releaseNotesPersistRequest struct {
+	Repo    string `json:"repo"`
+	From    string `json:"from"`
+	To      string `json:"to"`
+	StageID string `json:"stage_id"`
+}
+
+// ReleaseNotesPersistResult mirrors the backend's POST /v0/releases/notes 201
+// body: the persisted artifact id, the coordinates, the content hash, and the
+// rendered markdown (which carries the advisory semver bump hint after E33.4).
+// IDs are typed string per the #371 reflection rule so the MCP SDK's schema
+// reflection sees a string, not a uuid byte array.
+type ReleaseNotesPersistResult struct {
+	ArtifactID  string `json:"artifact_id"`
+	StageID     string `json:"stage_id"`
+	Repo        string `json:"repo"`
+	From        string `json:"from"`
+	To          string `json:"to"`
+	ContentHash string `json:"content_hash"`
+	Markdown    string `json:"markdown"`
+}
+
+// PreviewReleaseNotes renders the release-notes markdown for the ref range via
+// GET /v0/releases/notes/preview?repo=&from=&to= (E33.2 / #1587) WITHOUT
+// persisting anything. The endpoint responds with a text/markdown body (NOT a
+// JSON envelope), so this reads the raw body via getText rather than decoding
+// into a struct. 4xx surfaces as *apiError:
+//   - 400 validation_failed (missing repo/from/to)
+//   - 401 authentication_required (anonymous)
+//   - 503 release_notes_unconfigured (a required repository is not wired)
+func (c *apiClient) PreviewReleaseNotes(ctx context.Context, repo, from, to string) (string, error) {
+	q := url.Values{}
+	q.Set("repo", repo)
+	q.Set("from", from)
+	q.Set("to", to)
+	return c.getText(ctx, "/v0/releases/notes/preview?"+q.Encode())
+}
+
+// PersistReleaseNotes renders exactly as the preview endpoint and persists the
+// notes as a release_notes artifact keyed to stageID, via
+// POST /v0/releases/notes (E33.2 / #1587). Returns the persisted artifact id +
+// coordinates + rendered markdown. 4xx/5xx surfaces as *apiError:
+//   - 400 validation_failed (missing repo/from/to/stage_id, malformed stage_id)
+//   - 401 authentication_required (anonymous) / 403 insufficient_scope (needs
+//     write:runs)
+//   - 404 stage_not_found (stage_id references no stages row)
+//   - 503 release_notes_unconfigured (a required repository is not wired)
+func (c *apiClient) PersistReleaseNotes(ctx context.Context, repo, from, to, stageID string) (*ReleaseNotesPersistResult, error) {
+	body, err := json.Marshal(releaseNotesPersistRequest{Repo: repo, From: from, To: to, StageID: stageID})
+	if err != nil {
+		return nil, fmt.Errorf("marshal release-notes persist: %w", err)
+	}
+	var res ReleaseNotesPersistResult
+	if err := c.do(ctx, http.MethodPost, "/v0/releases/notes", body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// getText performs a GET and returns the raw response body as a string. Unlike
+// do, it does NOT json-decode the body — used for the text/markdown
+// release-notes preview (E33.2), whose body is rendered markdown, not a JSON
+// envelope. On a non-2xx response the body IS parsed as the OpenAPI error
+// envelope and returned as *apiError, so callers get the same typed error
+// surface as the JSON methods. Routed through the 30s short client.
+func (c *apiClient) getText(ctx context.Context, path string) (string, error) {
+	if c.baseURL == "" {
+		return "", errors.New("apiClient: baseURL not set")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return "", fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Accept", "text/markdown")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("http: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read body: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		ae := &apiError{StatusCode: resp.StatusCode}
+		var env struct {
+			Error struct {
+				Code    string         `json:"code"`
+				Message string         `json:"message"`
+				Details map[string]any `json:"details"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(raw, &env) == nil {
+			ae.Code = env.Error.Code
+			ae.Message = env.Error.Message
+			ae.Details = env.Error.Details
+		}
+		return "", ae
+	}
+	return string(raw), nil
+}
+
 // AuditEntry mirrors the OpenAPI AuditEntry schema. Payload is
 // left as json.RawMessage so the MCP tool can pass the typed shape
 // directly through to the client without re-encoding category-
