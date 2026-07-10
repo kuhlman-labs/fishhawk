@@ -5340,6 +5340,103 @@ paths:
           description: "`audit_export_unconfigured` — the audit, run, or signing repository is not configured on this instance."
 
   # ---------------------------------------------------------------------
+  # Release notes (E33.2 / #1587, ADR-051 option B)
+  # ---------------------------------------------------------------------
+  /v0/releases/notes/preview:
+    get:
+      operationId: releaseNotesPreview
+      summary: Preview evidence-derived release notes for a ref range
+      description: |
+        Assembles the merged-run evidence in `(from, to]` and renders it to
+        release-notes markdown WITHOUT persisting anything (E33.2 / #1587). Per
+        change the notes carry the plan summary + link, the reviewer verdicts,
+        the acceptance outcome, and any deferred concerns; the header carries
+        the ref range, an empty semver-hint slot reserved for E33.4, and the
+        per-release cost rollup. A merged PR in range with no resolvable
+        Fishhawk run (a human-led / loop-bypassing change) is rendered as an
+        explicitly-marked reduced-evidence entry per the ADR-051 honesty
+        constraint — never fabricated with invented verdicts. Authenticated
+        read-only.
+      tags: [audit]
+      parameters:
+        - { name: repo, in: query, required: true, description: "Repository (owner/name) whose merged PRs are resolved.", schema: { type: string } }
+        - { name: from, in: query, required: true, description: "Previous release ref (tag or SHA); the exclusive lower bound of the range.", schema: { type: string } }
+        - { name: to, in: query, required: true, description: "Candidate ref (tag or SHA); the inclusive upper bound of the range.", schema: { type: string } }
+      responses:
+        '200':
+          description: The rendered release notes as markdown.
+          content:
+            text/markdown:
+              schema: { type: string }
+        '400':
+          description: "`validation_failed` — `repo`, `from`, or `to` is missing, or `repo` is not `owner/name`."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '502':
+          description: |
+            `release_notes_assembly_failed` — the merged-PR resolver or evidence
+            assembly failed (fails closed rather than rendering from a partial
+            walk); `installation_resolution_failed` — the GitHub App installation
+            for the repo could not be resolved.
+        '503':
+          description: |
+            `release_notes_unconfigured` — the run, audit, concern, or artifact
+            repository (or the GitHub client used to resolve merged PRs) is not
+            configured; `github_app_not_installed` — the App is not installed on
+            the target repo.
+  /v0/releases/notes:
+    post:
+      operationId: releaseNotesPersist
+      summary: Persist evidence-derived release notes as an artifact
+      description: |
+        Assembles and renders exactly as `GET /v0/releases/notes/preview`, then
+        persists the rendered notes as a `release_notes` artifact keyed to the
+        caller-supplied `stage_id` (E33.2 / #1587). Because `artifact.Create` is
+        stage-scoped and no first-class release stage type exists yet, the
+        artifact attaches to a caller-chosen stage exactly as every other
+        artifact is keyed. A persisting write — requires the `write:runs` scope.
+      tags: [audit]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [repo, from, to, stage_id]
+              additionalProperties: false
+              properties:
+                repo: { type: string, description: "Repository (owner/name)." }
+                from: { type: string, description: "Previous release ref (tag or SHA)." }
+                to: { type: string, description: "Candidate ref (tag or SHA)." }
+                stage_id: { $ref: '#/components/schemas/UUID' }
+      responses:
+        '201':
+          description: The persisted release_notes artifact.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  artifact_id: { $ref: '#/components/schemas/UUID' }
+                  stage_id: { $ref: '#/components/schemas/UUID' }
+                  repo: { type: string }
+                  from: { type: string }
+                  to: { type: string }
+                  content_hash: { type: string }
+                  markdown: { type: string }
+        '400':
+          description: "`validation_failed` — malformed body, missing `repo`/`from`/`to`/`stage_id`, or a non-UUID `stage_id`."
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: "`stage_not_found` — the `stage_id` is a valid UUID but keys no stage row (the artifact FK cannot resolve)."
+        '500':
+          description: "`release_notes_persist_failed` — the artifact insert failed for a reason other than a missing stage."
+        '502':
+          description: "`release_notes_assembly_failed` / `installation_resolution_failed` — as for the preview endpoint."
+        '503':
+          description: "`release_notes_unconfigured` / `github_app_not_installed` — as for the preview endpoint."
+
+  # ---------------------------------------------------------------------
   # Campaigns (ADR-047 / #1437)
   # ---------------------------------------------------------------------
   /v0/campaigns:

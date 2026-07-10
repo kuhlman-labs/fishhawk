@@ -20,9 +20,11 @@ type GitHubResolver struct {
 
 // MergedPRsInRange resolves the merged PRs whose landing commits fall in
 // (base, head]. A CompareCommits or ListPullRequestsForCommit failure is
-// returned as an error (the caller fails open on a transient GitHub
-// failure). PRs are de-duped by number, so a PR whose merge commit plus
-// follow-on commits both appear in range yields a single MergedPR.
+// returned as an error — MergedPRsInRange fails CLOSED: the caller (the
+// assembler) propagates the error and the release-notes endpoint returns a
+// non-2xx rather than rendering notes from a partial commit walk. PRs are
+// de-duped by number, so a PR whose merge commit plus follow-on commits both
+// appear in range yields a single MergedPR.
 func (g *GitHubResolver) MergedPRsInRange(ctx context.Context, repo, base, head string) ([]MergedPR, error) {
 	ref, err := parseRepoRef(repo)
 	if err != nil {

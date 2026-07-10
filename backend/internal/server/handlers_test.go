@@ -76,6 +76,50 @@ func TestHandleHealth_StartNonce(t *testing.T) {
 	}
 }
 
+// TestReleaseNotesPreviewRouteRegistered guards the route table: GET
+// /v0/releases/notes/preview (#1587) must reach handleReleaseNotesPreview. The
+// anonymous request reaches the handler's auth ladder and returns 401 — an
+// UNregistered route would instead 404 with a default not-found body, so a 401
+// here proves the route is wired in handlers.go. (handleReleaseNotesPreview
+// runs the auth ladder BEFORE the nil-dependency guard so an anonymous caller
+// gets 401 rather than a 503 that would leak configuration state before
+// authentication.)
+func TestReleaseNotesPreviewRouteRegistered(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/releases/notes/preview?repo=o/n&from=a&to=b", nil)
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (route reaches handler auth ladder)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "authentication_required") {
+		t.Errorf("body = %s, want authentication_required (handleReleaseNotesPreview reached)", rec.Body.String())
+	}
+}
+
+// TestReleaseNotesPersistRouteRegistered guards the route table: POST
+// /v0/releases/notes (#1587) must reach handleReleaseNotesPersist. The
+// anonymous request reaches the handler's auth ladder and returns 401 — an
+// UNregistered route would instead 404 with a default not-found body, so a 401
+// here proves the route is wired in handlers.go. (handleReleaseNotesPersist
+// runs the auth ladder BEFORE the nil-dependency guard so an anonymous caller
+// gets 401 rather than a 503 that would leak configuration state before
+// authentication.)
+func TestReleaseNotesPersistRouteRegistered(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/releases/notes", strings.NewReader(`{}`))
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (route reaches handler auth ladder)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "authentication_required") {
+		t.Errorf("body = %s, want authentication_required (handleReleaseNotesPersist reached)", rec.Body.String())
+	}
+}
+
 // TestCacheEfficiencyRouteRegistered guards the route table: GET
 // /v0/runs/{run_id}/cache-efficiency (#1352) must reach
 // handleGetRunCacheEfficiency. With no RunRepo configured the handler
