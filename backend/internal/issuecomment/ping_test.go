@@ -453,6 +453,26 @@ func TestClarificationQuestionCount(t *testing.T) {
 	}
 }
 
+// TestPingCommentBody covers both branches of the ping-body assembler (#1787):
+// a configured base URL appends the anchor link; an unset base URL (runURL == "")
+// degrades to the bare message with no link and no localhost literal.
+func TestPingCommentBody(t *testing.T) {
+	const msg = "🔔 An agent requested a scope amendment — your decision is needed."
+
+	configured := pingCommentBody(msg, "https://app.example/runs/abc")
+	if !strings.Contains(configured, "[View the run →](https://app.example/runs/abc)") {
+		t.Errorf("configured ping body missing the anchor link: %q", configured)
+	}
+
+	unset := pingCommentBody(msg, "")
+	if unset != msg {
+		t.Errorf("unset ping body = %q, want the bare message with no link", unset)
+	}
+	if strings.Contains(unset, "View the run") || strings.Contains(unset, "](") {
+		t.Errorf("unset ping body must carry no run link: %q", unset)
+	}
+}
+
 // acceptanceTriageEntry builds an acceptance_triage_decided audit entry with
 // the given class + disposition.
 func acceptanceTriageEntry(seq int64, class, disposition string) *audit.Entry {

@@ -19,6 +19,45 @@ it.
 | Run rejected (misconfigured) | _(none at notifier; global-chain `run_rejected_misconfigured` on the dispatcher)_ | _(none)_ | `Dispatcher.Handle` reviewer-misconfigured guard (#599) | dispatch refusal (agent-gated plan stage, no reviewer wired) | No (each refusal posts its own comment) |
 
 Notes:
+- **Run-link degradation when `FISHHAWKD_EXTERNAL_URL` is unset (#1787).** Every
+  surface renders its run link(s) from the configured base URL. When that base
+  URL is UNSET (the empty string — the dogfood/dev posture, which leaves it
+  unset rather than pointing it at an operator-host-local address like
+  `http://localhost:5173` that would post dead, internal-topology-leaking links
+  on GitHub), every renderer degrades: a run reference becomes a plain,
+  link-less backticked short-id, a footer/attribution "view run" link is omitted
+  entirely (along with its middot separator, so no dangling `·` is left before a
+  surviving GitHub link), and the oversize-comment truncation marker drops its
+  `view full plan` / relative `/runs/…` tail. A CONFIGURED base URL (even one
+  that happens to be localhost) still renders the absolute link — the contract is
+  "omit when unset", and the dogfood fix is to leave the URL unset. The single
+  decision point is `runlink.go` (`runShortLink` / `viewRunLink` / `runURLFor`),
+  reused by every affected surface:
+  - **Living anchor** — header short-id (`runShortLink`) and footer "View run →"
+    link (`viewRunLink`, joined to the PR link with a non-empty-parts middot).
+  - **Sticky status comment** — header short-id and footer "View run →" link
+    (joined to the PR link).
+  - **Sticky PR status comment (E42.1)** — header short-id and footer "View
+    run →" link (joined to the Issue-thread link).
+  - **Agent-review PR review (E42.2)** — the attribution line's `view run →`
+    link, dropped so the line reads `_Advisory review by `<model>`._`.
+  - **Page-class pings** — the `[View the run →](…)` suffix, dropped so the ping
+    is the bare one-line message.
+  - **CI-failure retry** — both the parent-run and child-run references
+    (`runShortLink`).
+  - **Budget alert** — the run reference (`runShortLink`).
+  Because unsetting the base URL degrades links rather than suppressing comments,
+  `issuecomment.New` NO LONGER bails on an empty `ExternalURL` (it constructs
+  whenever GitHub / Runs / Audit are wired) — so the dogfood loop with an unset
+  base URL still posts link-less comments. The nil-notifier dividing line moved
+  from "no base URL" to "no GitHub client".
+  - **Runner-owned PR body audit-log URL is OUT OF SCOPE.** The audit-log link in
+    the runner's PR body footer is rendered runner-side (`prTitleAndBody`), NOT
+    by this package, so this backend-side change does not touch it. It may still
+    render a localhost literal under the dogfood posture until a separate
+    runner-side follow-up addresses it. (The orchestrator's consolidated-PR body
+    footer already degrades an unset base URL to a relative `/v0/runs/<id>/audit`
+    path — no localhost literal, PR #1775 — and is deliberately left unchanged.)
 - **The living anchor (#1054) subsumes the old plan-on-issue full/summary
   comments.** There is now ONE comment per run (the `status_comment_posted`
   surface), rebuilt from the run's audit chain on every transition by

@@ -101,10 +101,14 @@ func RenderAnchorBody(in AnchorInput) string {
 		return ""
 	}
 	externalURL := strings.TrimRight(in.ExternalURL, "/")
-	runURL := externalURL + "/runs/" + in.Run.ID.String()
+	// runURL is the bare run-page URL used only by the oversize truncation
+	// fallback; "" when the base URL is unset so the fallback degrades link-less
+	// (#1787). The rendered surfaces thread externalURL through runShortLink /
+	// viewRunLink instead, which branch on emptiness themselves.
+	runURL := runURLFor(externalURL, in.Run.ID)
 
 	s := anchorSections{
-		header:          renderAnchorHeader(in.Run, runURL),
+		header:          renderAnchorHeader(in.Run, externalURL),
 		whatNow:         renderWhatNow(in.Run, in.Stages),
 		stages:          renderAnchorStages(in.Stages),
 		timeline:        renderAnchorTimeline(in.Audit, in.Now),
@@ -113,7 +117,7 @@ func RenderAnchorBody(in AnchorInput) string {
 		modelResolved:   renderResolvedModel(in.Audit),
 		supersededPlans: renderSupersededPlans(in.SupersededPlans),
 		economics:       renderEconomicsSection(in.Economics),
-		footer:          renderAnchorFooter(in.Run, runURL),
+		footer:          renderAnchorFooter(in.Run, externalURL),
 	}
 
 	// Degradation ladder: assemble at progressively reduced fidelity
@@ -180,9 +184,9 @@ func assembleAnchor(s anchorSections, level int) string {
 	return b.String()
 }
 
-func renderAnchorHeader(r *run.Run, runURL string) string {
-	return fmt.Sprintf("**Fishhawk run [`%s`](%s)** — `%s` · %s %s",
-		shortID(r.ID), runURL, r.WorkflowID, runStateIcon(r.State), string(r.State))
+func renderAnchorHeader(r *run.Run, externalURL string) string {
+	return fmt.Sprintf("**Fishhawk run %s** — `%s` · %s %s",
+		runShortLink(externalURL, r.ID), r.WorkflowID, runStateIcon(r.State), string(r.State))
 }
 
 // renderWhatNow is the next_actions-style "what now" line: a single
@@ -500,13 +504,19 @@ func renderEconomicsSection(in *EconomicsInput) string {
 	return RenderEconomicsBlock(*in)
 }
 
-func renderAnchorFooter(r *run.Run, runURL string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "[View run →](%s)", runURL)
-	if r.PullRequestURL != nil && *r.PullRequestURL != "" {
-		fmt.Fprintf(&b, " · [Pull request →](%s)", *r.PullRequestURL)
+// renderAnchorFooter builds the footer from the "view run" link (omitted when
+// the base URL is unset, #1787) and the optional pull-request link, joining the
+// non-empty parts with the middot so an omitted run link leaves no dangling
+// separator.
+func renderAnchorFooter(r *run.Run, externalURL string) string {
+	var parts []string
+	if link := viewRunLink("View run →", externalURL, r.ID); link != "" {
+		parts = append(parts, link)
 	}
-	return b.String()
+	if r.PullRequestURL != nil && *r.PullRequestURL != "" {
+		parts = append(parts, fmt.Sprintf("[Pull request →](%s)", *r.PullRequestURL))
+	}
+	return strings.Join(parts, " · ")
 }
 
 // ---------------------------------------------------------------------

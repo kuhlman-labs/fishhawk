@@ -110,9 +110,12 @@ func RenderPRReviewBody(entry *audit.Entry, runRow *run.Run, externalURL string)
 		model = "agent reviewer"
 	}
 	fmt.Fprintf(&b, "\n_Advisory review by `%s`", model)
+	// Omit the run link (and its middot) when the base URL is unset (#1787); the
+	// attribution then reads "_Advisory review by `<model>`._" with no dead link.
 	if runRow != nil {
-		runURL := strings.TrimRight(externalURL, "/") + "/runs/" + runRow.ID.String()
-		fmt.Fprintf(&b, " · [view run →](%s)", runURL)
+		if link := viewRunLink("view run →", externalURL, runRow.ID); link != "" {
+			fmt.Fprintf(&b, " · %s", link)
+		}
 	}
 	b.WriteString("._\n")
 

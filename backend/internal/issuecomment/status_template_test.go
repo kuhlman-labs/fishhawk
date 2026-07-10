@@ -72,6 +72,41 @@ func TestRenderStatusBody_HeaderCarriesShortIDAndWorkflowAndState(t *testing.T) 
 	}
 }
 
+// TestRenderStatusBody_UnsetExternalURL_DegradesLinks pins #1787 for the sticky
+// status comment: with the base URL unset the header renders the plain
+// backticked short-id (no link), the footer omits the "view run" link (no
+// dangling middot before the PR link), and no localhost / relative run link
+// leaks. Configured, the absolute link returns.
+func TestRenderStatusBody_UnsetExternalURL_DegradesLinks(t *testing.T) {
+	runID := uuid.MustParse("7be5974b-c389-4577-a5a9-43510cadca88")
+	r, stages := statusRun(t, runID)
+	prURL := "https://github.com/kuhlman-labs/fishhawk/pull/7"
+	r.PullRequestURL = &prURL
+	now := time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)
+
+	unset := issuecomment.RenderStatusBody(r, stages, nil, "", now)
+	if strings.Contains(unset, "localhost") || strings.Contains(unset, "/runs/") || strings.Contains(unset, "](/") {
+		t.Errorf("unset status comment leaked a run link:\n%s", unset)
+	}
+	if !strings.Contains(unset, "**Fishhawk run `7be5974b`**") {
+		t.Errorf("unset status header should carry the plain backticked short-id:\n%s", unset)
+	}
+	if strings.Contains(unset, "View run") {
+		t.Errorf("unset status footer should omit the View run link:\n%s", unset)
+	}
+	if !strings.Contains(unset, "[Pull request →]("+prURL+")") {
+		t.Errorf("unset status footer should still carry the PR link:\n%s", unset)
+	}
+	if strings.Contains(unset, "· [Pull request →]") {
+		t.Errorf("unset status footer left a dangling middot before the PR link:\n%s", unset)
+	}
+
+	cfg := issuecomment.RenderStatusBody(r, stages, nil, "https://app.example", now)
+	if !strings.Contains(cfg, "https://app.example/runs/"+runID.String()) {
+		t.Errorf("configured status comment should carry the absolute run link:\n%s", cfg)
+	}
+}
+
 func TestRenderStatusBody_StagesEachStateRendered(t *testing.T) {
 	// One row per stage, each with a state-icon. Cover every state
 	// the state machine emits so a future state-machine extension

@@ -410,7 +410,7 @@ func (n *Notifier) firePings(ctx context.Context, ctxv commentContext, entries [
 			}
 			continue
 		}
-		body := fmt.Sprintf("%s [View the run →](%s)", ev.message, runURL)
+		body := pingCommentBody(ev.message, runURL)
 		if _, err := n.github.CreateIssueComment(ctx, *ctxv.run.InstallationID, ctxv.repo, ctxv.issueNumber, body); err != nil {
 			return fmt.Errorf("issuecomment: create ping comment: %w", err)
 		}
@@ -419,6 +419,17 @@ func (n *Notifier) firePings(ctx context.Context, ctxv commentContext, entries [
 		}
 	}
 	return nil
+}
+
+// pingCommentBody assembles a page-class ping body. It appends the anchor link
+// only when the base URL is configured (runURL non-empty); an unset base URL
+// (runURL == "") degrades the ping to the bare message rather than a dead
+// operator-host-local link (#1787).
+func pingCommentBody(message, runURL string) string {
+	if runURL == "" {
+		return message
+	}
+	return fmt.Sprintf("%s [View the run →](%s)", message, runURL)
 }
 
 // pingedSequences returns the set of source audit sequences already

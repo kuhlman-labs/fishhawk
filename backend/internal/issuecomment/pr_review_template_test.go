@@ -109,6 +109,27 @@ func TestRenderPRReviewBody(t *testing.T) {
 		}
 	})
 
+	t.Run("unset base URL omits the attribution run link", func(t *testing.T) {
+		// #1787: with the base URL unset the attribution drops the "view run"
+		// link (and its middot) rather than posting a dead link; the reviewer
+		// model still renders. Configured, the link is present (asserted above).
+		entry := implementReviewedEntry(t, 7, planreview.ImplementReviewedPayload{
+			ReviewerModel: "claude-opus-4-8",
+			Verdict:       planreview.VerdictApprove,
+			FreeForm:      "looks correct",
+		})
+		got := issuecomment.RenderPRReviewBody(entry, runRow, "")
+		if strings.Contains(got, "localhost") || strings.Contains(got, "/runs/") || strings.Contains(got, "](/") {
+			t.Errorf("unset PR review leaked a run link:\n%s", got)
+		}
+		if strings.Contains(got, "view run") {
+			t.Errorf("unset PR review should omit the view-run link:\n%s", got)
+		}
+		if !strings.Contains(got, "_Advisory review by `claude-opus-4-8`._") {
+			t.Errorf("unset PR review attribution should read clean with no dangling middot:\n%s", got)
+		}
+	})
+
 	t.Run("undecodable payload renders empty", func(t *testing.T) {
 		entry := &audit.Entry{Sequence: 1, Category: "implement_reviewed", Payload: json.RawMessage(`not json`)}
 		if got := issuecomment.RenderPRReviewBody(entry, runRow, externalURL); got != "" {

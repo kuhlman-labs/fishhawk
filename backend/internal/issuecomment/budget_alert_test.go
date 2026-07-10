@@ -158,6 +158,49 @@ func TestNotifyBudgetAlert_PreSeededDedup(t *testing.T) {
 	}
 }
 
+// TestNotifyBudgetAlert_UnsetExternalURL_DegradesLink pins #1787 for the
+// budget-alert body: with the base URL unset the run reference renders as a
+// plain backticked short-id (no link, no localhost literal), yet the comment
+// still posts (the constructor no longer bails on an empty ExternalURL).
+func TestNotifyBudgetAlert_UnsetExternalURL_DegradesLink(t *testing.T) {
+	runID := uuid.New()
+	triggerRef := "issue:42"
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID:             runID,
+			Repo:           "x/y",
+			WorkflowID:     "feature_change",
+			TriggerSource:  run.TriggerGitHubIssue,
+			TriggerRef:     &triggerRef,
+			InstallationID: int64Ptr(99),
+		}},
+	}
+	gh := &fakeGitHub{}
+	au := &fakeAudit{}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: repoRuns, Audit: au,
+		// ExternalURL deliberately unset.
+		Now: func() time.Time { return time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC) },
+	})
+	if n == nil {
+		t.Fatal("notifier should construct with an unset ExternalURL (#1787)")
+	}
+	posted, err := n.NotifyBudgetAlert(context.Background(), runID, warnPayload())
+	if err != nil {
+		t.Fatalf("NotifyBudgetAlert: %v", err)
+	}
+	if !posted || len(gh.calls) != 1 {
+		t.Fatalf("unset-URL budget alert should still post; posted=%v calls=%d", posted, len(gh.calls))
+	}
+	body := gh.calls[0].body
+	if strings.Contains(body, "localhost") || strings.Contains(body, "/runs/") || strings.Contains(body, "](/") {
+		t.Errorf("unset-URL budget alert leaked a run link:\n%s", body)
+	}
+	if !strings.Contains(body, "on Run `"+runID.String()[:8]+"`") {
+		t.Errorf("unset-URL budget alert should carry the plain backticked short-id:\n%s", body)
+	}
+}
+
 func TestNotifyBudgetAlert_SkipsNonIssueTrigger(t *testing.T) {
 	runID := uuid.New()
 	cliRef := "cli:adhoc"

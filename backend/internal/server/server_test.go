@@ -680,9 +680,9 @@ func TestNew_WiresConsolidatedReviewDispatcher(t *testing.T) {
 // living anchor (#1054) renders its plan section in the real binary.
 // Without it loadAnchorPlans short-circuits on a nil lister and the anchor
 // silently drops the plan despite a green e2e — the same constructor-seam
-// regression class as #1060. The notifier is only built when GitHub is
-// non-nil and issuecomment.New additionally requires Runs, Audit, and a
-// non-empty ExternalURL, so the Config sets all of them plus ArtifactRepo.
+// regression class as #1060. The notifier is built when GitHub / Runs / Audit
+// are non-nil (since #1787 an empty ExternalURL no longer suppresses it), so
+// the Config sets all of them plus ArtifactRepo.
 func TestNew_WiresAnchorPlanArtifactLister(t *testing.T) {
 	s := New(Config{
 		RunRepo:      newOrchestratorRepo(),
@@ -696,5 +696,25 @@ func TestNew_WiresAnchorPlanArtifactLister(t *testing.T) {
 	}
 	if !s.issueNotifier.ArtifactListerWired() {
 		t.Fatal("server.New did not thread cfg.ArtifactRepo into issuecomment.New — the living anchor renders no plan in production (#1069)")
+	}
+}
+
+// TestNew_WiresIssueNotifierWithEmptyExternalURL pins the #1787 cross-boundary
+// wiring: with GitHub / Runs / Audit wired but ExternalURL EMPTY, server.New
+// must still construct a non-nil issue notifier (the dropped issuecomment.New
+// bail), so link-less comments post under the dogfood posture that leaves the
+// base URL unset. Before #1787 the empty ExternalURL made issuecomment.New
+// return nil and s.issueNotifier stayed a nil interface, silencing every
+// comment surface.
+func TestNew_WiresIssueNotifierWithEmptyExternalURL(t *testing.T) {
+	s := New(Config{
+		RunRepo:      newOrchestratorRepo(),
+		AuditRepo:    newAuditCompleteAuditFake(),
+		ArtifactRepo: newFakeArtifactRepo(),
+		// ExternalURL deliberately empty.
+		GitHub: &githubclient.Client{},
+	})
+	if s.issueNotifier == nil {
+		t.Fatal("server.New must construct the issue notifier even with an empty ExternalURL (#1787)")
 	}
 }
