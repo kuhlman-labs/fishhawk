@@ -76,6 +76,47 @@ func TestHandleHealth_StartNonce(t *testing.T) {
 	}
 }
 
+// TestReleaseNotesPreviewRouteRegistered guards the route table: GET
+// /v0/releases/notes/preview (#1587) must reach handleReleaseNotesPreview. With
+// no repositories configured the handler returns 503 — an UNregistered route
+// would instead 404 with a default not-found body, so a 503 here proves the
+// route is wired in handlers.go. (handleReleaseNotesPreview checks the
+// nil-dependency guard BEFORE the auth ladder precisely so this idiom reaches
+// the handler.)
+func TestReleaseNotesPreviewRouteRegistered(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/releases/notes/preview?repo=o/n&from=a&to=b", nil)
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (route reaches handler with no repos)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "release_notes_unconfigured") {
+		t.Errorf("body = %s, want release_notes_unconfigured (handleReleaseNotesPreview reached)", rec.Body.String())
+	}
+}
+
+// TestReleaseNotesPersistRouteRegistered guards the route table: POST
+// /v0/releases/notes (#1587) must reach handleReleaseNotesPersist. With no
+// repositories configured the handler returns 503 — an UNregistered route would
+// instead 404 with a default not-found body, so a 503 here proves the route is
+// wired in handlers.go. (handleReleaseNotesPersist checks the nil-dependency
+// guard BEFORE the auth ladder precisely so this idiom reaches the handler.)
+func TestReleaseNotesPersistRouteRegistered(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/releases/notes", strings.NewReader(`{}`))
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (route reaches handler with no repos)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "release_notes_unconfigured") {
+		t.Errorf("body = %s, want release_notes_unconfigured (handleReleaseNotesPersist reached)", rec.Body.String())
+	}
+}
+
 // TestCacheEfficiencyRouteRegistered guards the route table: GET
 // /v0/runs/{run_id}/cache-efficiency (#1352) must reach
 // handleGetRunCacheEfficiency. With no RunRepo configured the handler

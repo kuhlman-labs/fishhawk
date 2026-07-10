@@ -29,8 +29,8 @@ type Artifact struct {
 }
 
 // Kind enumerates the artifact kinds. Closed set per the schema's
-// CHECK constraint (migration 0002, widened by 0037 and 0045): plan,
-// pull_request, deployment, acceptance.
+// CHECK constraint (migration 0002, widened by 0037, 0045, and 0051):
+// plan, pull_request, deployment, acceptance, release_notes.
 type Kind string
 
 // Artifact kinds.
@@ -50,4 +50,14 @@ const (
 	// migration ship together (a Create with this kind fails SQLSTATE 23514
 	// against the un-widened CHECK). Written by the E31.6 outcome handler.
 	KindAcceptance Kind = "acceptance"
+	// KindReleaseNotes is E33's evidence-derived release-notes record
+	// (E33.2 / #1587, ADR-051 option B): the durable artifact the release-notes
+	// persist endpoint emits capturing the rendered markdown assembled from the
+	// releaseevidence model (per-change summary, plan link, reviewer verdicts,
+	// acceptance outcome, deferred concerns, and the per-release cost rollup).
+	// Admitted by migration 0051, which widens artifacts_kind_check; the
+	// constant and migration ship together (a Create with this kind fails
+	// SQLSTATE 23514 against the un-widened CHECK), exactly as 0037 paired with
+	// KindDeployment and 0045 with KindAcceptance.
+	KindReleaseNotes Kind = "release_notes"
 )

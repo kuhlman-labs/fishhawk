@@ -36,6 +36,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/releaseevidence"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
@@ -467,6 +468,14 @@ type Server struct {
 	// standing up a fake api.github.com. nil in production; the
 	// handler then resolves through cfg.GitHub.
 	promptIssueGetterOverride issueGetter
+
+	// releaseNotesResolverOverride lets the release-notes endpoint tests
+	// substitute a fake releaseevidence.MergedPRResolver so the
+	// preview/persist path runs offline (assembler -> renderer -> HTTP)
+	// without a live GitHub commit walk. nil in production; the handler
+	// then builds a releaseevidence.GitHubResolver from cfg.GitHub + the
+	// resolved installation. Mirrors promptIssueGetterOverride exactly.
+	releaseNotesResolverOverride releaseevidence.MergedPRResolver
 
 	// auditCheckPublisher posts the derived fishhawk_audit_complete
 	// state to GitHub as a Check Run on every compute (#231). nil
