@@ -707,6 +707,53 @@ func (c *Client) FetchPrompt(ctx context.Context, args FetchPromptArgs) (*Fetche
 	return nil, fmt.Errorf("upload: fetch prompt exhausted retries: %w", lastErr)
 }
 
+// Failure-report body caps (#1791). The backend's POST
+// /v0/runs/{id}/pull-request and reap-failure endpoints both cap the request
+// body at 32*1024 bytes (backend/internal/server/pullrequest.go
+// maxPullRequestBundleBytes and reap_failure.go maxReapFailureBodyBytes) and
+// reject an oversized body 413 body_too_large. A category-B implement failure
+// whose reason embedded the entire multi-module verify output blew past that
+// cap, so the in-band failure report never landed and the stage was stranded
+// 'running'. MaxFailureReportReasonBytes bounds a normal 'failed' report's
+// reason with headroom under 32*1024 for the JSON envelope;
+// AggressiveFailureReportReasonBytes is the far smaller cap the bounded post-4xx
+// retry re-marshals with when even the normal cap was still rejected.
+const (
+	MaxFailureReportReasonBytes        = 30 * 1024
+	AggressiveFailureReportReasonBytes = 2 * 1024
+)
+
+// TruncateReason bounds s to at most max bytes for a failure-report field
+// (#1791). When s already fits it is returned byte-identical. Otherwise the
+// middle is elided — a head + a "\n… [truncated N bytes] …\n" marker + a tail —
+// so BOTH the leading failure classification and the trailing verify summary
+// survive, and the returned length never exceeds max. The full untruncated text
+// still reaches the trace bundle and the local log; only the wire report shrinks.
+func TruncateReason(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(s) <= max {
+		return s
+	}
+	const markerFmt = "\n… [truncated %d bytes] …\n"
+	// Size the head/tail budget against the marker rendered with the LARGEST
+	// possible elided count (len(s)); the real marker cannot have more digits,
+	// so the final head+marker+tail can only be <= max.
+	upper := fmt.Sprintf(markerFmt, len(s))
+	keep := max - len(upper)
+	if keep <= 0 {
+		// max is too small to fit even the marker — hard byte-truncate so the
+		// contract (len(result) <= max) still holds.
+		return s[:max]
+	}
+	head := keep / 2
+	tail := keep - head
+	elided := len(s) - head - tail
+	marker := fmt.Sprintf(markerFmt, elided)
+	return s[:head] + marker + s[len(s)-tail:]
+}
+
 // readBriefBody returns the first 256 bytes of resp.Body as a
 // string, useful for surfacing backend error envelopes in client
 // errors without unbounded log lines. Caller is responsible for
@@ -1152,11 +1199,15 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 	switch args.Outcome {
 	case "failed":
 		// Failure-report POST (#742): build the failure body from the
-		// outcome fields rather than the (absent) success artifact.
+		// outcome fields rather than the (absent) success artifact. Truncate the
+		// reason to fit the backend's 32*1024 body cap (#1791) — a category-B
+		// implement failure whose reason embeds the whole multi-module verify
+		// output would otherwise 413 body_too_large and strand the stage
+		// 'running'. The full text stays in the trace bundle + local log.
 		marshalled, err := json.Marshal(pullRequestFailureBody{
 			Outcome:  args.Outcome,
 			Category: args.Category,
-			Reason:   args.Reason,
+			Reason:   TruncateReason(args.Reason, MaxFailureReportReasonBytes),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("upload: marshal pull-request failure body: %w", err)
@@ -1217,6 +1268,13 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 		url.PathEscape(args.RunID),
 		url.PathEscape(args.StageID),
 	)
+
+	// aggressiveRetried guards the single bounded post-4xx retry below (#1791):
+	// a 413 body_too_large on a failure report means even the normal-cap body
+	// exceeded 32*1024, so re-marshal the reason with the aggressive cap and
+	// re-POST exactly once. Only the "failed" outcome carries an operator-facing
+	// reason large enough to overflow, so the retry is scoped to it.
+	aggressiveRetried := false
 
 	maxRetries := c.MaxRetries
 	if maxRetries == 0 {
@@ -1283,6 +1341,28 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 		default:
 			lastErr = statusError("ship pull-request", resp)
 			_ = resp.Body.Close()
+			// Bounded single retry for a 4xx (esp. 413 body_too_large) on a
+			// failure report (#1791): the normal-cap body was still rejected, so
+			// re-marshal the reason with the aggressive cap, re-sign the smaller
+			// bytes, and re-POST exactly once. aggressiveRetried prevents a loop —
+			// a persistent 4xx after the retry surfaces lastErr. A non-failed
+			// outcome (a real PR artifact) is never rescued: its body is not a
+			// truncatable reason, so it fails fast as before.
+			if args.Outcome == "failed" && resp.StatusCode >= 400 && resp.StatusCode < 500 && !aggressiveRetried {
+				aggressiveRetried = true
+				marshalled, mErr := json.Marshal(pullRequestFailureBody{
+					Outcome:  args.Outcome,
+					Category: args.Category,
+					Reason:   TruncateReason(args.Reason, AggressiveFailureReportReasonBytes),
+				})
+				if mErr != nil {
+					return nil, fmt.Errorf("upload: marshal aggressive pull-request failure body: %w", mErr)
+				}
+				body = marshalled
+				d := sha256.Sum256(body)
+				sigHex = hex.EncodeToString(ed25519.Sign(args.PrivateKey, d[:]))
+				continue
+			}
 			return nil, lastErr
 		}
 	}

@@ -5120,6 +5120,135 @@ func TestRun_ImplementStage_DecomposedChild_NoChanges_ReportsFailedCategoryC(t *
 	}
 }
 
+// TestRun_ImplementStage_DecomposedChild_NoChanges_ReportRejected_ExitFailure is
+// proposal (c) of #1791: when the child no-changes terminal-reporter path's
+// in-band 'failed' report is itself rejected (e.g. 413 body_too_large), the
+// runner must exit NON-ZERO instead of the old `return nil` (exit 0) — only a
+// non-zero exit engages the detached reaper backstop. A bare exit 0 would
+// re-strand the stage 'running'.
+func TestRun_ImplementStage_DecomposedChild_NoChanges_ReportRejected_ExitFailure(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	withFakeRemoteBranchExists(t, false)
+	fu := newFakeUploader(t)
+	fu.promptResp = decomposedChildPromptResp()
+	// The in-band 'failed' report is rejected — the exact stranding condition.
+	fu.prErr = errors.New("ship pull-request: 413: body_too_large")
+	withFakeUploader(t, fu)
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{NoChanges: true, BaseSHA: "base"}}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	var stderr strings.Builder
+	if got := runDecomposedChildStage(t, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure when the in-band failed report is rejected (#1791 proposal c):\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"pull_request_failure_report_failed"`) {
+		t.Errorf("expected a pull_request_failure_report_failed log line:\n%s", stderr.String())
+	}
+}
+
+// TestRun_ImplementStage_PushedTreeNotVerified_CategoryB_ExitFailure is the
+// proposal (c) regression lock: the ErrPushedTreeNotVerified category-B path
+// must stay NON-ZERO. The exit-code propagation change (return-nil → return the
+// report error on the no-changes path) must not weaken the already-failing
+// pushed-tree-unverified path.
+func TestRun_ImplementStage_PushedTreeNotVerified_CategoryB_ExitFailure(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{err: fmt.Errorf("verify tree: %w", gitops.ErrPushedTreeNotVerified)}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure (category-B pushed-tree-unverified stays non-zero):\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("expected category-B classification:\n%s", stderr.String())
+	}
+}
+
+// TestRun_ImplementStage_OversizedFailure_BoundsRunnerFailedDetail is proposal
+// (a)'s reaper-facing half: an oversized failure err must be bounded on the
+// runner_failed JSONL line (<= MaxFailureReportReasonBytes) so the detached
+// reaper's parseDetachedRunnerFailure reads a small detail and its 32KB-capped
+// reap-failure POST fits. res.FailureReason keeps the full text for the trace
+// bundle; only the reaper-parsed line shrinks.
+func TestRun_ImplementStage_OversizedFailure_BoundsRunnerFailedDetail(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+	withFakeUploader(t, fu)
+	// A push error whose message is far larger than the 32KB cap — the #1791
+	// multi-module verify dump embedded in a category-B reason.
+	oversized := "commit gate: verify failed\n" + strings.Repeat("x", 200*1024)
+	fp := &fakePusher{err: errors.New(oversized)}
+	withFakeGitOps(t, fp, &fakePROpener{})
+
+	var stderr strings.Builder
+	if got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%.500s", got, stderr.String())
+	}
+
+	// Find the runner_failed line the reaper parses and assert its detail is
+	// bounded and carries the truncation marker.
+	var boundedLineSeen bool
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		if !strings.Contains(line, `"event":"runner_failed"`) ||
+			!strings.Contains(line, `"reason":"pull_request_upload"`) {
+			continue
+		}
+		var ev struct {
+			Event  string `json:"event"`
+			Reason string `json:"reason"`
+			Detail string `json:"detail"`
+		}
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("runner_failed line is not valid JSON: %v\n%.300s", err, line)
+		}
+		if len(ev.Detail) > upload.MaxFailureReportReasonBytes {
+			t.Errorf("runner_failed detail = %d bytes, want <= %d (bounded for the reaper)",
+				len(ev.Detail), upload.MaxFailureReportReasonBytes)
+		}
+		if !strings.Contains(ev.Detail, "truncated") {
+			t.Errorf("runner_failed detail lost its truncation marker")
+		}
+		if !strings.Contains(ev.Detail, "commit gate: verify failed") {
+			t.Errorf("runner_failed detail lost the head classification: %.60q", ev.Detail)
+		}
+		boundedLineSeen = true
+	}
+	if !boundedLineSeen {
+		t.Fatalf("no pull_request_upload runner_failed line emitted:\n%.500s", stderr.String())
+	}
+}
+
 // TestRun_ImplementStage_DecomposedChild_NoChanges_DependentSlice_ReportsActionableC
 // is the BINDING-CONDITION behavioral test (#1302): it drives the
 // implement_child_no_changes branch end to end with runSliceIndex=2 (a dependent

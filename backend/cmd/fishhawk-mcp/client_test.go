@@ -307,3 +307,127 @@ func TestPersistReleaseNotes_SurfacesAPIError(t *testing.T) {
 		t.Errorf("apiError = %d/%q, want 404/stage_not_found", ae.StatusCode, ae.Code)
 	}
 }
+
+// bodyCap mirrors the backend's maxReapFailureBodyBytes
+// (backend/internal/server/reap_failure.go) — the exact 32*1024 limit the
+// reap-failure endpoint enforces (#1791).
+const bodyCap = 32 * 1024
+
+// TestReportStageFailure_OversizedReasonDetail_FitsCap is the #1791 client half:
+// an oversized reason+detail (the multi-module verify dump the reaper re-POSTs)
+// is truncated so the body fits the 32KB cap on the FIRST attempt — no 413, no
+// retry — and the report succeeds.
+func TestReportStageFailure_OversizedReasonDetail_FitsCap(t *testing.T) {
+	var calls, gotLen int
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		raw, _ := io.ReadAll(r.Body)
+		gotLen = len(raw)
+		if len(raw) > bodyCap {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "body_too_large"}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ReapFailureResult{Transitioned: true, StageState: "failed"})
+	})
+
+	res, err := c.ReportStageFailure(context.Background(), uuid.New(), uuid.New(), "C",
+		strings.Repeat("r", 100*1024), strings.Repeat("d", 200*1024), 1)
+	if err != nil {
+		t.Fatalf("ReportStageFailure: %v", err)
+	}
+	if !res.Transitioned {
+		t.Error("Transitioned = false, want true")
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1 (truncated body fits on first POST)", calls)
+	}
+	if gotLen > bodyCap {
+		t.Errorf("posted body %d exceeds cap %d", gotLen, bodyCap)
+	}
+}
+
+// TestReportStageFailure_413ThenAggressiveRetry drives EXACTLY ONE aggressive
+// retry: a first POST that 413s re-marshals both fields with the aggressive cap
+// and re-POSTs once with a strictly smaller body that succeeds.
+func TestReportStageFailure_413ThenAggressiveRetry(t *testing.T) {
+	var bodies [][]byte
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, raw)
+		if len(bodies) == 1 {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "body_too_large"}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ReapFailureResult{Transitioned: true, StageState: "failed"})
+	})
+
+	if _, err := c.ReportStageFailure(context.Background(), uuid.New(), uuid.New(), "C",
+		"short reason", strings.Repeat("d", 200*1024), 2); err != nil {
+		t.Fatalf("ReportStageFailure: %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("calls = %d, want exactly 2 (413 then one aggressive retry)", len(bodies))
+	}
+	if len(bodies[1]) >= len(bodies[0]) {
+		t.Errorf("aggressive body %d not smaller than first %d", len(bodies[1]), len(bodies[0]))
+	}
+	if len(bodies[1]) > bodyCap {
+		t.Errorf("aggressive body %d exceeds cap %d", len(bodies[1]), bodyCap)
+	}
+}
+
+// TestReportStageFailure_Persistent413_NoLoop asserts the aggressive retry is
+// bounded: when even the aggressive-cap body 413s, ReportStageFailure surfaces
+// the second 4xx after EXACTLY TWO requests (initial + one aggressive retry) —
+// it does NOT keep retrying. Distinct from the 413-then-success and the
+// 5xx-before-retry cases: only a persistent 4xx exercises the loop guard.
+func TestReportStageFailure_Persistent413_NoLoop(t *testing.T) {
+	var calls int
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "body_too_large"}})
+	})
+
+	_, err := c.ReportStageFailure(context.Background(), uuid.New(), uuid.New(), "C",
+		"reason", strings.Repeat("d", 200*1024), 1)
+	if err == nil {
+		t.Fatal("expected an error after a persistent 413")
+	}
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("err = %v, want *apiError with 413", err)
+	}
+	if calls != 2 {
+		t.Errorf("calls = %d, want exactly 2 (initial + one aggressive retry, no loop)", calls)
+	}
+}
+
+// TestReportStageFailure_5xx_NotRescuedByAggressiveRetry asserts the retry is
+// scoped to 4xx: a 5xx surfaces unchanged after a SINGLE attempt — the
+// aggressive-truncation path never fires for a transient server error.
+func TestReportStageFailure_5xx_NotRescuedByAggressiveRetry(t *testing.T) {
+	var calls int
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "internal"}})
+	})
+
+	_, err := c.ReportStageFailure(context.Background(), uuid.New(), uuid.New(), "C",
+		"reason", strings.Repeat("d", 200*1024), 1)
+	if err == nil {
+		t.Fatal("expected an error on 5xx")
+	}
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.StatusCode != http.StatusInternalServerError {
+		t.Errorf("err = %v, want *apiError with 500", err)
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1 (5xx must not trigger the aggressive retry)", calls)
+	}
+}

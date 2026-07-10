@@ -235,6 +235,245 @@ func TestShipPullRequest_RejectsBadInputs(t *testing.T) {
 	}
 }
 
+// serverBodyCap mirrors the backend's maxPullRequestBundleBytes /
+// maxReapFailureBodyBytes (backend/internal/server/{pullrequest,reap_failure}.go)
+// — the exact 32*1024 limit the production endpoints enforce (#1791).
+const serverBodyCap = 32 * 1024
+
+// verifyPRSig fails the test if sigHex is not a valid Ed25519 signature over
+// sha256(raw) under pub — proving ShipPullRequest re-signed over the exact bytes
+// it posted (load-bearing for the aggressive-retry re-sign, #1791).
+func verifyPRSig(t *testing.T, pub ed25519.PublicKey, raw []byte, sigHex string) {
+	t.Helper()
+	sig, err := hex.DecodeString(sigHex)
+	if err != nil {
+		t.Fatalf("decode signature: %v", err)
+	}
+	d := sha256.Sum256(raw)
+	if !ed25519.Verify(pub, d[:], sig) {
+		t.Errorf("signature does not cover the posted body bytes")
+	}
+}
+
+// TestTruncateReason locks the head+tail elision contract (#1791): under cap the
+// input is byte-identical; over cap the result fits max, keeps the head and tail,
+// and carries a non-zero elided-bytes marker.
+func TestTruncateReason(t *testing.T) {
+	t.Run("under cap is byte-identical", func(t *testing.T) {
+		s := "category-B: short reason"
+		if got := TruncateReason(s, 1024); got != s {
+			t.Errorf("TruncateReason(%q) = %q, want byte-identical", s, got)
+		}
+		exact := strings.Repeat("x", 100)
+		if got := TruncateReason(exact, 100); got != exact {
+			t.Errorf("at-cap input was mutated: len %d", len(got))
+		}
+	})
+	t.Run("over cap elides middle, keeps head+tail, fits max", func(t *testing.T) {
+		head := strings.Repeat("H", 500)
+		tail := strings.Repeat("T", 500)
+		s := head + strings.Repeat("M", 100*1024) + tail
+		const max = 4096
+		got := TruncateReason(s, max)
+		if len(got) > max {
+			t.Fatalf("len(got) = %d, want <= %d", len(got), max)
+		}
+		if !strings.Contains(got, "truncated") {
+			t.Errorf("missing truncation marker: %q", got[:80])
+		}
+		if strings.Contains(got, "truncated 0 bytes") {
+			t.Errorf("marker reports zero elided bytes: %q", got)
+		}
+		if !strings.HasPrefix(got, "HHHHH") {
+			t.Errorf("head not preserved: %q", got[:10])
+		}
+		if !strings.HasSuffix(got, "TTTTT") {
+			t.Errorf("tail not preserved: %q", got[len(got)-10:])
+		}
+	})
+	t.Run("degenerate tiny cap hard-truncates to max", func(t *testing.T) {
+		got := TruncateReason(strings.Repeat("x", 100), 5)
+		if len(got) != 5 {
+			t.Errorf("len(got) = %d, want 5", len(got))
+		}
+	})
+	t.Run("non-positive cap returns empty", func(t *testing.T) {
+		if got := TruncateReason("abc", 0); got != "" {
+			t.Errorf("got %q, want empty for max=0", got)
+		}
+	})
+}
+
+// TestShipPullRequest_FailedOutcome_OversizedReason_FitsCap is proposal (a): a
+// "failed" report whose reason far exceeds 32KB (the #1791 multi-module verify
+// dump) is truncated so the POST body fits the cap on the FIRST attempt — no
+// 413, no retry — and the shipped reason keeps its head classification + marker.
+func TestShipPullRequest_FailedOutcome_OversizedReason_FitsCap(t *testing.T) {
+	priv := makePRKey(t)
+	pub := priv.Public().(ed25519.PublicKey)
+	var calls int
+	var gotBody []byte
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/pull-request", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		raw, _ := io.ReadAll(r.Body)
+		gotBody = raw
+		verifyPRSig(t, pub, raw, r.Header.Get("X-Fishhawk-Signature"))
+		if len(raw) > serverBodyCap {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = io.WriteString(w, `{"error":{"code":"body_too_large"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(ShipPullRequestResult{StageID: r.URL.Query().Get("stage_id")})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := New(srv.URL)
+	c.MaxRetries = 3
+	c.Backoff = time.Millisecond
+
+	reason := "category-B: verify failed\n" + strings.Repeat("x", 200*1024) + "\nFAIL summary tail"
+	if _, err := c.ShipPullRequest(context.Background(), ShipPullRequestArgs{
+		RunID: "run-aaa", StageID: "stage-bbb", PrivateKey: priv,
+		Outcome: "failed", Category: "B", Reason: reason,
+	}); err != nil {
+		t.Fatalf("ShipPullRequest: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1 (truncated body fits on first POST)", calls)
+	}
+	if len(gotBody) > serverBodyCap {
+		t.Fatalf("posted body %d bytes exceeds cap %d", len(gotBody), serverBodyCap)
+	}
+	var sent pullRequestFailureBody
+	if err := json.Unmarshal(gotBody, &sent); err != nil {
+		t.Fatalf("unmarshal failure body: %v", err)
+	}
+	if sent.Outcome != "failed" || sent.Category != "B" {
+		t.Errorf("sent = %+v, want outcome=failed category=B", sent)
+	}
+	if !strings.Contains(sent.Reason, "truncated") {
+		t.Errorf("shipped reason lost the truncation marker (len %d)", len(sent.Reason))
+	}
+	if !strings.HasPrefix(sent.Reason, "category-B: verify failed") {
+		t.Errorf("head classification lost: %q", sent.Reason[:40])
+	}
+}
+
+// TestShipPullRequest_FailedOutcome_413ThenAggressiveRetry is proposal (b): a
+// first POST that 413s drives EXACTLY ONE aggressive-cap retry whose body is
+// strictly smaller, still under the cap, re-signed over its own bytes, and
+// succeeds.
+func TestShipPullRequest_FailedOutcome_413ThenAggressiveRetry(t *testing.T) {
+	priv := makePRKey(t)
+	pub := priv.Public().(ed25519.PublicKey)
+	var bodies [][]byte
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/pull-request", func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		verifyPRSig(t, pub, raw, r.Header.Get("X-Fishhawk-Signature"))
+		bodies = append(bodies, raw)
+		if len(bodies) == 1 {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = io.WriteString(w, `{"error":{"code":"body_too_large"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(ShipPullRequestResult{StageID: r.URL.Query().Get("stage_id")})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := New(srv.URL)
+	c.MaxRetries = 3
+	c.Backoff = time.Millisecond
+
+	reason := "category-B\n" + strings.Repeat("x", 200*1024)
+	if _, err := c.ShipPullRequest(context.Background(), ShipPullRequestArgs{
+		RunID: "r", StageID: "s", PrivateKey: priv,
+		Outcome: "failed", Category: "B", Reason: reason,
+	}); err != nil {
+		t.Fatalf("ShipPullRequest: %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("calls = %d, want exactly 2 (413 then one aggressive retry)", len(bodies))
+	}
+	if len(bodies[1]) >= len(bodies[0]) {
+		t.Errorf("aggressive body %d not smaller than first %d", len(bodies[1]), len(bodies[0]))
+	}
+	if len(bodies[1]) > serverBodyCap {
+		t.Errorf("aggressive body %d exceeds cap %d", len(bodies[1]), serverBodyCap)
+	}
+	var sent pullRequestFailureBody
+	if err := json.Unmarshal(bodies[1], &sent); err != nil {
+		t.Fatalf("unmarshal aggressive body: %v", err)
+	}
+	if !strings.Contains(sent.Reason, "truncated") {
+		t.Errorf("aggressive reason missing marker: len %d", len(sent.Reason))
+	}
+}
+
+// TestShipPullRequest_413NonFailedBody_NoRetry asserts the aggressive retry is
+// scoped to the "failed" outcome: a 413 on a real PR artifact (empty Outcome)
+// fails fast with NO retry — its body is not a truncatable reason.
+func TestShipPullRequest_413NonFailedBody_NoRetry(t *testing.T) {
+	var calls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/pull-request", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_, _ = io.WriteString(w, `{"error":{"code":"body_too_large"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := New(srv.URL)
+	c.MaxRetries = 3
+	c.Backoff = time.Millisecond
+	priv := makePRKey(t)
+
+	if _, err := c.ShipPullRequest(context.Background(), ShipPullRequestArgs{
+		RunID: "r", StageID: "s", Body: []byte(`{"pr_number":1}`), PrivateKey: priv,
+	}); err == nil {
+		t.Fatal("expected an error for a 413 on a success body")
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1 (no aggressive retry for a non-failed body)", calls)
+	}
+}
+
+// TestShipPullRequest_FailedOutcome_Persistent413_NoLoop asserts the retry is
+// bounded: when even the aggressive body 413s, ShipPullRequest surfaces the
+// error after EXACTLY ONE retry (initial + one aggressive attempt) — no loop.
+func TestShipPullRequest_FailedOutcome_Persistent413_NoLoop(t *testing.T) {
+	var calls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/pull-request", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_, _ = io.WriteString(w, `{"error":{"code":"body_too_large"}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := New(srv.URL)
+	c.MaxRetries = 3
+	c.Backoff = time.Millisecond
+	priv := makePRKey(t)
+
+	if _, err := c.ShipPullRequest(context.Background(), ShipPullRequestArgs{
+		RunID: "r", StageID: "s", PrivateKey: priv,
+		Outcome: "failed", Category: "B", Reason: strings.Repeat("x", 200*1024),
+	}); err == nil {
+		t.Fatal("expected an error after a persistent 413")
+	}
+	if calls != 2 {
+		t.Errorf("calls = %d, want exactly 2 (initial + one aggressive retry, no loop)", calls)
+	}
+}
+
 // TestShipPullRequest_ChildPushOutcome_MarshalsPushBody confirms the #771
 // child-push success report: Outcome=="pushed" causes ShipPullRequest to
 // build the {outcome:"pushed", branch, head_sha, base_sha, files_changed_count}
