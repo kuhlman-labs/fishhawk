@@ -163,6 +163,56 @@ func TestSanitizedGateEnv_StripsLiveSecret(t *testing.T) {
 	}
 }
 
+// TestWithIsolatedLintCache pins the pure helper that forces
+// GOLANGCI_LINT_CACHE to a per-invocation dir: a base env without the var gains
+// exactly one entry equal to the override; an inherited GOLANGCI_LINT_CACHE is
+// dropped and replaced (a single entry, never a duplicate the platform might
+// resolve to the ambient value); unrelated entries are preserved untouched.
+func TestWithIsolatedLintCache(t *testing.T) {
+	const override = "/tmp/iso-lint-cache"
+
+	// (a) No inherited GOLANGCI_LINT_CACHE — exactly one entry is appended.
+	base := []string{"PATH=/usr/bin:/bin", "HOME=/home/runner"}
+	got := withIsolatedLintCache(base, override)
+	if n := countKey(got, "GOLANGCI_LINT_CACHE"); n != 1 {
+		t.Errorf("expected exactly 1 GOLANGCI_LINT_CACHE entry, got %d in %v", n, got)
+	}
+	gotMap := envSliceToMap(t, got)
+	if gotMap["GOLANGCI_LINT_CACHE"] != override {
+		t.Errorf("GOLANGCI_LINT_CACHE = %q, want %q", gotMap["GOLANGCI_LINT_CACHE"], override)
+	}
+
+	// (b) Inherited GOLANGCI_LINT_CACHE=/shared — dropped and replaced by the
+	// override, leaving a single entry (no ambient value can win).
+	inherited := []string{"PATH=/usr/bin:/bin", "GOLANGCI_LINT_CACHE=/shared", "HOME=/home/runner"}
+	got = withIsolatedLintCache(inherited, override)
+	if n := countKey(got, "GOLANGCI_LINT_CACHE"); n != 1 {
+		t.Errorf("expected exactly 1 GOLANGCI_LINT_CACHE entry after replacing inherited, got %d in %v", n, got)
+	}
+	gotMap = envSliceToMap(t, got)
+	if gotMap["GOLANGCI_LINT_CACHE"] != override {
+		t.Errorf("inherited GOLANGCI_LINT_CACHE not overridden: = %q, want %q", gotMap["GOLANGCI_LINT_CACHE"], override)
+	}
+
+	// (c) Unrelated entries survive with their values intact.
+	for k, v := range map[string]string{"PATH": "/usr/bin:/bin", "HOME": "/home/runner"} {
+		if gotMap[k] != v {
+			t.Errorf("unrelated %s = %q, want %q", k, gotMap[k], v)
+		}
+	}
+}
+
+// countKey returns how many "KEY=..." entries in env have the given key.
+func countKey(env []string, key string) int {
+	n := 0
+	for _, kv := range env {
+		if strings.HasPrefix(kv, key+"=") {
+			n++
+		}
+	}
+	return n
+}
+
 func envSliceToMap(t *testing.T, env []string) map[string]string {
 	t.Helper()
 	m := make(map[string]string, len(env))

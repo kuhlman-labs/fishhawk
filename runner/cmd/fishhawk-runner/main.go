@@ -3324,7 +3324,16 @@ func runVerifyGate(ctx context.Context, cfg config, _ io.Writer) (agent.Event, e
 	// Strip runner credentials from the gate subprocess env (ADR-029 #650
 	// item 4): the verify command runs agent-authored code, so it must not
 	// see the installation token / API keys / MCP token.
-	cmd.Env = sanitizedGateEnv()
+	gateEnv := sanitizedGateEnv()
+	// Isolate golangci-lint's path-keyed analysis cache per invocation so a
+	// concurrent local run's cached lint results can't leak into this gate's
+	// output (#1796). Degrade to the shared cache on a temp-dir failure rather
+	// than inventing a gate failure from plumbing.
+	if lintCacheDir, err := os.MkdirTemp("", "fishhawk-lintcache-*"); err == nil {
+		defer func() { _ = os.RemoveAll(lintCacheDir) }()
+		gateEnv = withIsolatedLintCache(gateEnv, lintCacheDir)
+	}
+	cmd.Env = gateEnv
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {
@@ -4092,7 +4101,12 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 	cmd.Dir = wt
 	// Strip runner credentials from the gate subprocess env (ADR-029 #650
 	// item 4): the committed-tree verify command runs agent-authored code.
-	cmd.Env = sanitizedGateEnv()
+	// Isolate golangci-lint's analysis cache to a per-invocation dir under the
+	// existing parent temp (cleaned by the defer above) so a concurrent local
+	// run's path-keyed lint results can't leak into this re-verify (#1796). This
+	// covers the committed gate, the verify-fix loop, and the #960 strict
+	// re-verify — all route through here.
+	cmd.Env = withIsolatedLintCache(sanitizedGateEnv(), filepath.Join(parent, "golangci-lint-cache"))
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {
