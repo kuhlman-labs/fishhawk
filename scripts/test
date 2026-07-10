@@ -48,15 +48,158 @@ export GIT_CONFIG_SYSTEM=/dev/null
 # sources this script.
 export TESTCONTAINERS_RYUK_DISABLED=true
 
-# Best-effort teardown of the shared testcontainers Postgres (#1174). internal/
-# pgtest deliberately does NOT Terminate fishhawk-test-postgres (it is reused
-# across every package's test process while ryuk is disabled above), so reap it
-# here once the run is done. The test/coverage paths register this as an EXIT
-# trap so it also fires on a fail-fast exit. Guarded to be a no-op when Docker
-# is absent and to never fail the run.
+# Concurrent-invocation lease refcount for the shared testcontainers Postgres
+# (#1174 reuse design, #1792 collision fix). internal/pgtest deliberately does
+# NOT Terminate fishhawk-test-postgres (it is reused across every package's test
+# process while ryuk is disabled above), so scripts/test reaps it via the EXIT
+# trap below. That was safe for concurrent PROCESSES within one invocation but
+# NOT for concurrent INVOCATIONS: a first invocation's EXIT trap would docker-rm
+# the shared container out from under a second invocation whose go test loop
+# still held live connections (the #1587/#1589 spurious verify failure).
+#
+# Fix: lease-count the container across concurrent scripts/test invocations.
+# Each container-using invocation registers a per-invocation lease file (named
+# by its PID) in a shared lease directory under a mkdir-based lock; the EXIT
+# trap removes only its OWN lease and docker-rm's the container only when no
+# leases remain (rmdir of the now-empty lease dir succeeds). Stale leases left
+# by a SIGKILL'd invocation are pruned by a `kill -0` PID liveness check so a
+# crashed run never permanently pins the container. LEASE_DIR / LEASE_TOKEN are
+# overridable to make the refcount contract hermetically testable
+# (scripts/test-container-lease).
+LEASE_DIR="${FISHHAWK_TEST_LEASE_DIR:-${TMPDIR:-/tmp}/fishhawk-test-postgres.leases}"
+
+# _lease_token: this invocation's lease identity (its PID by default). Injectable
+# so the hermetic test can register/reap distinct synthetic leases.
+_lease_token() {
+  printf '%s' "${FISHHAWK_TEST_LEASE_TOKEN:-$$}"
+}
+
+# _lease_lock: acquire the lock guarding the register/reap critical sections.
+# The lock is an atomically-created SYMLINK whose target IS the holder's owner
+# PID, so it carries its owner from the instant it exists: symlink(2) is a single
+# atomic syscall that fails EEXIST if the path is already taken, and there is NO
+# separate stamp step. Exactly one racer wins; the loser reads the winner's PID
+# via `readlink`. Before each retry the spin loop breaks a lock whose owner PID
+# is dead (`kill -0` fails → rm, then retry) so a SIGKILL'd holder can never
+# permanently wedge later invocations.
+#
+# Because acquisition is atomic there is NO window in which the lock exists yet
+# is unowned. That eliminates BY CONSTRUCTION both the old mkdir-then-stamp lock's
+# ownerless-forever wedge (a holder SIGKILL'd between mkdir and stamping) AND its
+# live-but-delayed acquisition race (a live holder paused before stamping whose
+# "ownerless" lock a concurrent breaker could remove and then double-enter the
+# critical section, #1792 fixup). A grace-window heuristic could only trade those
+# two off; the symlink carries its owner atomically so a live holder's lock can
+# never be seen as ownerless and broken out from under it. An empty/garbage link
+# target is therefore never a live claim — only a crash leftover, a corrupt link,
+# or a stray inner link left when `ln -s` landed inside a leftover dir-form lock
+# (the readlink-equals-$$ re-check catches that) — and is safe to break.
+#
+# Returns non-zero if the bounded retry cap is exhausted with a LIVE owner still
+# holding it (stuck) — callers must then fail SAFE (never docker-rm under an
+# uncertain lease state).
+_lease_lock() {
+  local lock="$LEASE_DIR.lock"
+  local cap="${FISHHAWK_TEST_LEASE_LOCK_CAP:-50}"
+  local tries=0 owner
+  # Atomic acquire: ln -s creates the lock with our PID as its target in one
+  # syscall. The readlink-equals-$$ re-check rejects the case where ln "succeeded"
+  # by landing a stray link inside a leftover dir-form lock (which the break
+  # branch below then clears), so only a genuine atomic claim returns success.
+  while ! { ln -s "$$" "$lock" 2>/dev/null && [ "$(readlink "$lock" 2>/dev/null)" = "$$" ]; }; do
+    owner="$(readlink "$lock" 2>/dev/null || true)"
+    case "$owner" in
+      ''|*[!0-9]*)
+        # No/garbage owner target: NOT a live-holder claim (a live acquire always
+        # carries its PID atomically). A crash leftover, corrupt link, or stray
+        # inner link from an older dir-form lock — break it and retry.
+        rm -rf "$lock" 2>/dev/null || true
+        ;;
+      *)
+        if ! kill -0 "$owner" 2>/dev/null; then
+          rm -f "$lock" 2>/dev/null || true  # dead owner → break the stale lock
+        fi
+        ;;
+    esac
+    tries=$((tries + 1))
+    if [ "$tries" -ge "$cap" ]; then
+      return 1
+    fi
+    sleep 0.1
+  done
+  return 0
+}
+
+_lease_unlock() {
+  rm -rf "$LEASE_DIR.lock" 2>/dev/null || true
+}
+
+# _prune_dead_leases: drop lease files whose PID name no longer names a live
+# process — crashed-invocation cleanup so a SIGKILL'd run never pins the
+# container. Guards the empty glob and skips non-numeric names. Callers hold the
+# lock.
+_prune_dead_leases() {
+  [ -d "$LEASE_DIR" ] || return 0
+  local f base
+  for f in "$LEASE_DIR"/*; do
+    [ -e "$f" ] || continue  # empty-glob guard
+    base="$(basename "$f")"
+    case "$base" in
+      ''|*[!0-9]*) continue ;;  # non-PID lease name — can't liveness-check, leave it
+    esac
+    if ! kill -0 "$base" 2>/dev/null; then
+      rm -f "$f" 2>/dev/null || true
+    fi
+  done
+}
+
+# _register_lease: record this invocation's lease under the lock. Returns
+# non-zero when it did NOT record a lease — no Docker (nothing to refcount) or a
+# live-but-stuck lock the retry cap could not acquire. The caller MUST treat a
+# non-zero return as "hold no lease" and NOT arm the reap: an invocation that
+# never recorded a lease must never docker-rm the shared container, or it could
+# reap it out from under a peer whose lease it never got the lock to see (the
+# register-timeout lifecycle hole).
+_register_lease() {
+  command -v docker >/dev/null 2>&1 || return 1
+  _lease_lock || return 1  # lock stuck → hold NO lease; caller must NOT arm reap
+  mkdir -p "$LEASE_DIR" 2>/dev/null || true
+  _prune_dead_leases
+  : > "$LEASE_DIR/$(_lease_token)" 2>/dev/null || true
+  _lease_unlock
+  return 0
+}
+
+# _arm_container_lease: register this invocation's lease and arm the reap trap
+# ONLY if the lease was actually recorded. Replaces the bare EXIT trap at the top
+# of cmd_test / cmd_coverage. If registration failed (no Docker, or a live-stuck
+# lock), we hold no lease and deliberately do NOT arm the reap — the container is
+# left for a lease-holding invocation to reap, never removed under an uncertain
+# lease state.
+_arm_container_lease() {
+  if _register_lease; then
+    trap _reap_shared_container EXIT
+  fi
+}
+
+# _reap_shared_container: EXIT-trap teardown. Remove ONLY this invocation's lease
+# and docker-rm the shared container only when no leases remain. Fails SAFE on an
+# unacquirable lock (a live-but-stuck owner): skip docker rm and leave the
+# container for the next invocation's attach-reuse, never removing it under an
+# uncertain lease state. Guarded to be a no-op when Docker is absent and to never
+# fail the run.
 _reap_shared_container() {
   command -v docker >/dev/null 2>&1 || return 0
-  docker rm -f fishhawk-test-postgres >/dev/null 2>&1 || true
+  if ! _lease_lock; then
+    return 0  # lock stuck (live owner) → fail safe, leave the container
+  fi
+  rm -f "$LEASE_DIR/$(_lease_token)" 2>/dev/null || true
+  _prune_dead_leases
+  if rmdir "$LEASE_DIR" 2>/dev/null; then
+    docker rm -f fishhawk-test-postgres >/dev/null 2>&1 || true
+  fi
+  _lease_unlock
+  return 0
 }
 
 modules() {
@@ -84,7 +227,7 @@ modules() {
 TEST_P="${FISHHAWK_TEST_P:-4}"
 
 cmd_test() {
-  trap _reap_shared_container EXIT
+  _arm_container_lease
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"
     (cd "$m" && go test -race -p "$TEST_P" ./...)
@@ -92,7 +235,7 @@ cmd_test() {
 }
 
 cmd_coverage() {
-  trap _reap_shared_container EXIT
+  _arm_container_lease
   local profiles=()
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"
@@ -160,16 +303,21 @@ usage: scripts/test [SUBCOMMAND] [ARGS]
 EOF
 }
 
-case "${1:-test}" in
-  test|"")          cmd_test ;;
-  coverage|cover)   cmd_coverage ;;
-  lint)             cmd_lint ;;
-  verify)           cmd_verify ;;
-  single)           shift; cmd_single "$@" ;;
-  -h|--help|help)   usage ;;
-  *)
-    echo "scripts/test: unknown subcommand: $1" >&2
-    usage >&2
-    exit 1
-    ;;
-esac
+# Bottom dispatch is skipped when sourced lib-only (FISHHAWK_TEST_LIB_ONLY=1),
+# so scripts/test-container-lease can exercise the lease helpers without running
+# a subcommand. Behavior is unchanged when the var is unset.
+if [ -z "${FISHHAWK_TEST_LIB_ONLY:-}" ]; then
+  case "${1:-test}" in
+    test|"")          cmd_test ;;
+    coverage|cover)   cmd_coverage ;;
+    lint)             cmd_lint ;;
+    verify)           cmd_verify ;;
+    single)           shift; cmd_single "$@" ;;
+    -h|--help|help)   usage ;;
+    *)
+      echo "scripts/test: unknown subcommand: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+fi
