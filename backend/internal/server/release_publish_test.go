@@ -443,26 +443,46 @@ func TestReleasePublish_Unconfigured(t *testing.T) {
 }
 
 // TestReleasePublish_BadBody pins the 400 branches: missing required field,
-// malformed run_id, malformed artifact_id.
+// malformed run_id, malformed artifact_id. Each field-level case additionally
+// asserts the response NAMES the offending field in details.field — a generic
+// validation error for every case must not satisfy [publish-validates-required-
+// fields]. The unknown-field case is a JSON decode failure (no field name), so
+// it only asserts the code.
 func TestReleasePublish_BadBody(t *testing.T) {
 	h := newPublishHarness(t, "md", newAuthedPublisher())
-	cases := map[string]string{
-		"missing-repo":     `{"tag":"v1","run_id":"` + h.runID.String() + `","artifact_id":"` + h.artifactID.String() + `"}`,
-		"missing-tag":      `{"repo":"o/n","run_id":"` + h.runID.String() + `","artifact_id":"` + h.artifactID.String() + `"}`,
-		"missing-run":      `{"repo":"o/n","tag":"v1","artifact_id":"` + h.artifactID.String() + `"}`,
-		"missing-artifact": `{"repo":"o/n","tag":"v1","run_id":"` + h.runID.String() + `"}`,
-		"bad-run":          `{"repo":"o/n","tag":"v1","run_id":"nope","artifact_id":"` + h.artifactID.String() + `"}`,
-		"bad-artifact":     `{"repo":"o/n","tag":"v1","run_id":"` + h.runID.String() + `","artifact_id":"nope"}`,
-		"unknown-field":    `{"repo":"o/n","tag":"v1","run_id":"` + h.runID.String() + `","artifact_id":"` + h.artifactID.String() + `","x":1}`,
+	cases := []struct {
+		name      string
+		body      string
+		wantField string // "" when the case is a decode error with no field
+	}{
+		{"missing-repo", `{"tag":"v1","run_id":"` + h.runID.String() + `","artifact_id":"` + h.artifactID.String() + `"}`, "repo"},
+		{"missing-tag", `{"repo":"o/n","run_id":"` + h.runID.String() + `","artifact_id":"` + h.artifactID.String() + `"}`, "tag"},
+		{"missing-run", `{"repo":"o/n","tag":"v1","artifact_id":"` + h.artifactID.String() + `"}`, "run_id"},
+		{"missing-artifact", `{"repo":"o/n","tag":"v1","run_id":"` + h.runID.String() + `"}`, "artifact_id"},
+		{"bad-run", `{"repo":"o/n","tag":"v1","run_id":"nope","artifact_id":"` + h.artifactID.String() + `"}`, "run_id"},
+		{"bad-artifact", `{"repo":"o/n","tag":"v1","run_id":"` + h.runID.String() + `","artifact_id":"nope"}`, "artifact_id"},
+		{"unknown-field", `{"repo":"o/n","tag":"v1","run_id":"` + h.runID.String() + `","artifact_id":"` + h.artifactID.String() + `","x":1}`, ""},
 	}
-	for name, body := range cases {
-		t.Run(name, func(t *testing.T) {
-			rec := h.post(body, withReleaseOperator)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := h.post(tc.body, withReleaseOperator)
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400:\n%s", rec.Code, rec.Body.String())
 			}
-			if !strings.Contains(rec.Body.String(), "validation_failed") {
-				t.Errorf("body missing validation_failed:\n%s", rec.Body.String())
+			var env errorEnvelope
+			if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+				t.Fatalf("decode error envelope: %v\n%s", err, rec.Body.String())
+			}
+			if env.Error.Code != "validation_failed" {
+				t.Errorf("code = %q, want validation_failed:\n%s", env.Error.Code, rec.Body.String())
+			}
+			if tc.wantField == "" {
+				return
+			}
+			gotField, _ := env.Error.Details["field"].(string)
+			if gotField != tc.wantField {
+				t.Errorf("details.field = %q, want %q (a generic validation error must name the offending field)\n%s",
+					gotField, tc.wantField, rec.Body.String())
 			}
 		})
 	}
@@ -585,5 +605,98 @@ func TestReleasePublish_AuditFailure(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "release_publish_audit_failed") {
 		t.Errorf("body missing release_publish_audit_failed:\n%s", rec.Body.String())
+	}
+}
+
+// TestReleasePublish_InstallResolutionError pins the 502
+// installation_resolution_failed branch: a NON-ErrNotInstalled error from
+// GetRepoInstallation fails closed as a bad-gateway (the ErrNotInstalled->503
+// path is covered by TestReleasePublish_AppNotInstalled).
+func TestReleasePublish_InstallResolutionError(t *testing.T) {
+	pub := newAuthedPublisher()
+	pub.installErr = context.DeadlineExceeded
+	h := newPublishHarness(t, "md", pub)
+	rec := h.post(h.validBody(), withReleaseOperator)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502:\n%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "installation_resolution_failed") {
+		t.Errorf("body missing installation_resolution_failed:\n%s", rec.Body.String())
+	}
+}
+
+// TestReleasePublish_DecodeContentError pins the 500 release_publish_failed
+// branch on a release_notes artifact whose stored content is not valid JSON:
+// the kind check passes but the releaseNotesContent unmarshal fails closed.
+func TestReleasePublish_DecodeContentError(t *testing.T) {
+	h := newPublishHarness(t, "md", newAuthedPublisher())
+	bad, err := h.artRepo.Create(context.Background(), artifact.CreateParams{
+		StageID:     uuid.New(),
+		Kind:        artifact.KindReleaseNotes,
+		Content:     []byte("this is not json"),
+		ContentHash: sha256Hex([]byte("this is not json")),
+	})
+	if err != nil {
+		t.Fatalf("seed bad-content artifact: %v", err)
+	}
+	body, _ := json.Marshal(releasePublishRequest{
+		Repo: "kuhlman-labs/fishhawk", Tag: "v0.2.0",
+		RunID: h.runID.String(), ArtifactID: bad.ID.String(),
+	})
+	rec := h.post(string(body), withReleaseOperator)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "release_publish_failed") {
+		t.Errorf("body missing release_publish_failed:\n%s", rec.Body.String())
+	}
+	if len(h.auditRepo.appendSeen) != 0 {
+		t.Errorf("audit appends = %d, want 0 (no audit on a decode failure)", len(h.auditRepo.appendSeen))
+	}
+}
+
+// TestReleasePublish_DeleteAssetError pins the 502 release_publish_failed branch
+// in the delete-stale-asset loop: a GitHub failure deleting the existing
+// fixed-name asset fails closed with no upload and no audit row.
+func TestReleasePublish_DeleteAssetError(t *testing.T) {
+	md := "# Release v0.2.0\n\nfresh\n"
+	pub := &fakeReleasePublisher{
+		instID: 77, releaseID: 555, body: "old body that differs",
+		htmlURL:   "https://x/tag/v0.2.0",
+		assets:    []fakePublisherAsset{{id: 9001, name: releaseNotesAssetName, content: []byte("stale")}},
+		deleteErr: context.DeadlineExceeded,
+	}
+	h := newPublishHarness(t, md, pub)
+	rec := h.post(h.validBody(), withReleaseOperator)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502:\n%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "release_publish_failed") {
+		t.Errorf("body missing release_publish_failed:\n%s", rec.Body.String())
+	}
+	if pub.uploadCalls != 0 {
+		t.Errorf("upload calls = %d, want 0 (delete failed before upload)", pub.uploadCalls)
+	}
+	if len(h.auditRepo.appendSeen) != 0 {
+		t.Errorf("audit appends = %d, want 0 (no audit on a failed delete)", len(h.auditRepo.appendSeen))
+	}
+}
+
+// TestReleasePublish_UploadAssetError pins the 502 release_publish_failed branch
+// on UploadReleaseAsset failure: after the body PATCH succeeds, a GitHub failure
+// uploading the fixed-name asset fails closed with no audit row.
+func TestReleasePublish_UploadAssetError(t *testing.T) {
+	pub := &fakeReleasePublisher{instID: 77, releaseID: 555, body: "stale", htmlURL: "https://x/tag/v0.2.0"}
+	pub.uploadErr = context.DeadlineExceeded
+	h := newPublishHarness(t, "notes", pub)
+	rec := h.post(h.validBody(), withReleaseOperator)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502:\n%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "release_publish_failed") {
+		t.Errorf("body missing release_publish_failed:\n%s", rec.Body.String())
+	}
+	if len(h.auditRepo.appendSeen) != 0 {
+		t.Errorf("audit appends = %d, want 0 (no audit on a failed upload)", len(h.auditRepo.appendSeen))
 	}
 }
