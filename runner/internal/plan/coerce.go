@@ -279,6 +279,130 @@ func CoercionRegistrySummary() string {
 	return fmt.Sprintf("%d paths: %s", len(paths), strings.Join(paths, ", "))
 }
 
+// Clarification-request allowlists. Hand-derived from the canonical schema
+// docs/spec/clarification-request-v1.schema.json (source of truth). The runner
+// module does NOT embed the clarification schema — scripts/sync-schemas
+// deliberately excludes it — so these sets are maintained by hand against that
+// canonical file. A round-trip unit test pins each declared field so a
+// mistaken omission (which would wrongly strip a real field) is caught. When
+// the canonical schema gains a declared property, add it here.
+//
+// clarificationTopLevelProps mirrors the schema's top-level `properties`.
+var clarificationTopLevelProps = map[string]struct{}{
+	"kind":             {},
+	"ticket_reference": {},
+	"generated_by":     {},
+	"summary":          {},
+	"questions":        {},
+}
+
+// clarificationQuestionProps mirrors #/$defs/question `properties`.
+var clarificationQuestionProps = map[string]struct{}{
+	"id":                  {},
+	"question":            {},
+	"what_i_can_infer":    {},
+	"recommended_default": {},
+	"tradeoffs":           {},
+}
+
+// clarificationTicketReferenceProps mirrors #/$defs/ticket-reference `properties`.
+var clarificationTicketReferenceProps = map[string]struct{}{
+	"type": {},
+	"url":  {},
+	"id":   {},
+}
+
+// clarificationGeneratedByProps mirrors #/$defs/generated-by `properties`.
+var clarificationGeneratedByProps = map[string]struct{}{
+	"agent":     {},
+	"model":     {},
+	"version":   {},
+	"timestamp": {},
+}
+
+// stripUnknownMapProps removes from obj every key not present in allow, appending
+// a human-readable warning per stripped key using label to name the object. It
+// mutates obj in place and returns the number of keys removed.
+func stripUnknownMapProps(obj map[string]any, allow map[string]struct{}, label string, warnings *[]string) int {
+	stripped := 0
+	// Collect first, then delete, to avoid mutating the map while ranging it.
+	var drop []string
+	for key := range obj {
+		if _, ok := allow[key]; !ok {
+			drop = append(drop, key)
+		}
+	}
+	sort.Strings(drop) // deterministic warning order (map iteration is unspecified)
+	for _, key := range drop {
+		delete(obj, key)
+		*warnings = append(*warnings, fmt.Sprintf("stripped unknown property %q from %s", key, label))
+		stripped++
+	}
+	return stripped
+}
+
+// StripUnknownClarificationProps removes undeclared properties from a
+// clarification_request artifact so the backend's strict (additionalProperties:
+// false) decode of clarification-request-v1 accepts bytes an agent emitted with
+// a benign extra field (observed: recommended_default_choice on a question).
+// This is the runner-side source fix for the strict-decode-vs-agent-output
+// failure class (siblings #1574/#1646/#1653) applied to the clarification
+// surface: the wire schema stays strict, the runner coerces the artifact clean.
+//
+// It filters the top-level object, the nested ticket_reference and generated_by
+// objects, and each questions[] element against the hand-derived allowlists
+// above. Only those object levels are filtered; other nested structures are
+// left untouched. A warning is appended per stripped property naming the
+// property and the object (question id when present, else index).
+//
+// Returns (originalBytes, nil, nil) when the input is not a JSON object
+// (fail-open, mirroring TryCoerce coerce.go:307-309 — a malformed artifact
+// still reaches the backend for its precise error rather than being silently
+// altered) and when nothing is stripped (caller no-ops, preserving the bytes).
+// Returns (cleanedBytes, warnings, nil) when at least one property was stripped.
+func StripUnknownClarificationProps(data []byte) ([]byte, []string, error) {
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return data, nil, nil
+	}
+
+	var warnings []string
+	stripped := 0
+
+	stripped += stripUnknownMapProps(m, clarificationTopLevelProps, "clarification_request", &warnings)
+
+	if tr, ok := m["ticket_reference"].(map[string]any); ok {
+		stripped += stripUnknownMapProps(tr, clarificationTicketReferenceProps, "ticket_reference", &warnings)
+	}
+	if gb, ok := m["generated_by"].(map[string]any); ok {
+		stripped += stripUnknownMapProps(gb, clarificationGeneratedByProps, "generated_by", &warnings)
+	}
+
+	if questions, ok := m["questions"].([]any); ok {
+		for i, elem := range questions {
+			q, ok := elem.(map[string]any)
+			if !ok {
+				continue
+			}
+			label := fmt.Sprintf("question index %d", i)
+			if id, ok := q["id"].(string); ok && id != "" {
+				label = fmt.Sprintf("question %q", id)
+			}
+			stripped += stripUnknownMapProps(q, clarificationQuestionProps, label, &warnings)
+		}
+	}
+
+	if stripped == 0 {
+		return data, nil, nil
+	}
+
+	cleaned, err := json.Marshal(m)
+	if err != nil {
+		return nil, nil, fmt.Errorf("clarification: marshal stripped: %w", err)
+	}
+	return cleaned, warnings, nil
+}
+
 // TryCoerce attempts to fix two known classes of plan schema violations:
 // (1) the string-elision class — an agent emits a bare string where the schema
 // expects an object; and (2) the null-optional class — an agent sets an
