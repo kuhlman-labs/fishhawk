@@ -268,6 +268,43 @@ func TestListTokens_HappyPath(t *testing.T) {
 	if len(resp.Items) != 2 {
 		t.Errorf("got %d items, want 2 (other user's token must not leak)", len(resp.Items))
 	}
+	// Each projected item carries the bound subject (#1755) so `fishhawk
+	// token list` can render the identity, not a bare dash.
+	for i, it := range resp.Items {
+		if it.Subject != "github:42" {
+			t.Errorf("item[%d] subject = %q, want github:42", i, it.Subject)
+		}
+	}
+}
+
+// TestTokenLoginMint_ResponseIncludesSubject is the backend wire-contract
+// pin (binding approval condition): it decodes the REAL handleTokenLoginMint
+// 201 body into a raw map[string]any and asserts the literal "subject" key is
+// present and equals the provider-qualified verified subject. Decoding into a
+// map (rather than the apiTokenResponse struct) means a rename of the JSON
+// tag — the exact divergence that shipped this bug, where the CLI read
+// `subject` but the handler never wrote it — fails this test instead of being
+// silently tolerated by a struct decode.
+func TestTokenLoginMint_ResponseIncludesSubject(t *testing.T) {
+	s := newFakeLoginServer(t, &fakeIdentityProvider{subject: "github:octocat", perm: identity.PermissionAdmin}, nil)
+
+	w := tokenRequest(t, s, http.MethodPost, "/v0/tokens/login", "",
+		map[string]any{"access_token": "gho_cli", "provider": "github", "scopes": []string{"read:runs"}})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	subject, ok := body["subject"]
+	if !ok {
+		t.Fatalf("mint 201 body missing the literal \"subject\" key: %s", w.Body.String())
+	}
+	if subject != "github:octocat" {
+		t.Errorf("subject = %v, want github:octocat", subject)
+	}
 }
 
 func TestListTokens_AnonymousRejected(t *testing.T) {

@@ -2889,6 +2889,14 @@ components:
           description: |
             The identity provider that authenticated an OAuth token (e.g.
             `github`). Omitted for static tokens.
+        subject:
+          type: string
+          description: |
+            The provider-qualified identity the token is bound to (e.g.
+            `github:<login>`), the verified subject stamped at issue time.
+            The mint 201 echoes it so `fishhawk token login` / `token list`
+            can show which identity was authenticated. Omitted for legacy
+            rows whose subject is empty.
 
   responses:
     BadRequest:
