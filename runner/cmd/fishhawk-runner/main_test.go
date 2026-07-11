@@ -11799,6 +11799,35 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_PassingReverifyPushes(t *tes
 	if !strings.Contains(logs, `"event":"verified_tree_mismatch"`) {
 		t.Errorf("expected verified_tree_mismatch before the re-verify:\n%s", logs)
 	}
+	// tree_delta forensics (#1821): the mismatch event now names the
+	// ground-truth perturbed path. moveBareMain added b.txt to the moved
+	// base, so the verifiedTree→realTree delta must carry an A/M/D-prefixed
+	// entry for it.
+	var mismatchLine string
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, `"event":"verified_tree_mismatch"`) {
+			mismatchLine = line
+		}
+	}
+	var mm struct {
+		TreeDelta []string `json:"tree_delta"`
+	}
+	if err := json.Unmarshal([]byte(mismatchLine), &mm); err != nil {
+		t.Fatalf("parse verified_tree_mismatch line: %v\n%s", err, mismatchLine)
+	}
+	if len(mm.TreeDelta) == 0 {
+		t.Errorf("tree_delta must be non-empty on a real mismatch:\n%s", mismatchLine)
+	}
+	perturbed := false
+	for _, d := range mm.TreeDelta {
+		hasStatus := strings.HasPrefix(d, "A\t") || strings.HasPrefix(d, "M\t") || strings.HasPrefix(d, "D\t")
+		if hasStatus && strings.HasSuffix(d, "\tb.txt") {
+			perturbed = true
+		}
+	}
+	if !perturbed {
+		t.Errorf("tree_delta must name the perturbed path b.txt with an M/A/D prefix, got %v", mm.TreeDelta)
+	}
 	if fpr.gotArgs == nil {
 		t.Error("OpenPR should have run after the re-verified push")
 	}
@@ -11838,6 +11867,140 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_PassingReverifyPushes(t *tes
 	if !strings.Contains(verifyRunLine, `"outcome":"passed"`) ||
 		!strings.Contains(verifyRunLine, fmt.Sprintf(`"tree_sha":%q`, pushedTree)) {
 		t.Errorf("expected a verify_run log event with outcome passed and tree_sha %q:\n%s", pushedTree, logs)
+	}
+}
+
+// TestGitDiffTreeNameStatus pins the tree-delta forensic helper's output
+// formatting (#1821): given two tree-ish SHAs that differ by a modify, an add,
+// and a delete, it must emit exactly one `<status>\t<path>` line per changed
+// entry with an M/A/D status prefix. It fails if diff-tree rejected raw tree
+// SHAs or emitted a different column layout.
+func TestGitDiffTreeNameStatus(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	runGit("init", "--initial-branch=main")
+	runGit("config", "user.name", "init")
+	runGit("config", "user.email", "init@example.com")
+	runGit("config", "commit.gpgsign", "false")
+	mustWrite(t, filepath.Join(repo, "a.txt"), "a1\n")
+	mustWrite(t, filepath.Join(repo, "c.txt"), "c1\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "first")
+	treeA, err := gitRevParseTreeOf(context.Background(), repo, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(repo, "a.txt"), "a2\n") // modify
+	mustWrite(t, filepath.Join(repo, "b.txt"), "b1\n") // add
+	if err := os.Remove(filepath.Join(repo, "c.txt")); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "-A")
+	runGit("commit", "-m", "second")
+	treeB, err := gitRevParseTreeOf(context.Background(), repo, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	delta, err := gitDiffTreeNameStatus(context.Background(), repo, treeA, treeB)
+	if err != nil {
+		t.Fatalf("gitDiffTreeNameStatus: %v", err)
+	}
+	got := make(map[string]bool, len(delta))
+	for _, d := range delta {
+		got[d] = true
+	}
+	for _, want := range []string{"M\ta.txt", "A\tb.txt", "D\tc.txt"} {
+		if !got[want] {
+			t.Errorf("missing %q in delta %v", want, delta)
+		}
+	}
+	if len(delta) != 3 {
+		t.Errorf("delta = %v, want exactly 3 entries (M a.txt, A b.txt, D c.txt)", delta)
+	}
+}
+
+// TestOpenPRAndShipArtifact_VerifiedTreeMismatch_TreeDeltaFailOpen proves the
+// tree-delta forensic capture is FAIL-OPEN (#1821 approval condition): a
+// CONCRETE diff-tree failure — the helper's git binary substituted for a
+// nonexistent command via the gitDiffTreeBinary seam, exercising the real exec
+// error path through the real openPRAndShipArtifact call site — must leave the
+// push/gate decision byte-identical. The mismatch is still emitted (tree_delta
+// empty), a tree_delta_unresolved marker is logged, and the passing re-verify
+// still pushes exactly as it does when the capture succeeds.
+func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_TreeDeltaFailOpen(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+
+	moveBareMain(t, bare)
+
+	// Substitute the tree-delta helper's git binary for a command that does
+	// not exist, so the helper's exec fails for real on the mismatch path.
+	orig := gitDiffTreeBinary
+	gitDiffTreeBinary = "fishhawk-nonexistent-git-binary-xyz"
+	t.Cleanup(func() { gitDiffTreeBinary = orig })
+
+	var logSink strings.Builder
+	// The re-verify passes ("true"), so the byte-identical push decision is:
+	// push proceeds, PR opens — exactly as PassingReverifyPushes. A fail-open
+	// helper must not change that.
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil); err != nil {
+		t.Fatalf("a diff-tree failure must not block the push: %v\n%s", err, logSink.String())
+	}
+	logs := logSink.String()
+	if !strings.Contains(logs, `"event":"verified_tree_mismatch"`) {
+		t.Errorf("expected verified_tree_mismatch even when the delta capture fails:\n%s", logs)
+	}
+	if !strings.Contains(logs, `"event":"tree_delta_unresolved"`) {
+		t.Errorf("expected a tree_delta_unresolved marker when diff-tree fails:\n%s", logs)
+	}
+	// The mismatch event's tree_delta must be an empty array, never null.
+	var mismatchLine string
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, `"event":"verified_tree_mismatch"`) {
+			mismatchLine = line
+		}
+	}
+	var mm struct {
+		TreeDelta []string `json:"tree_delta"`
+	}
+	if err := json.Unmarshal([]byte(mismatchLine), &mm); err != nil {
+		t.Fatalf("parse verified_tree_mismatch line: %v\n%s", err, mismatchLine)
+	}
+	if len(mm.TreeDelta) != 0 {
+		t.Errorf("tree_delta must be empty on a diff-tree failure, got %v", mm.TreeDelta)
+	}
+	if !strings.Contains(mismatchLine, `"tree_delta":[]`) {
+		t.Errorf("tree_delta must serialize as [] (not null) on failure:\n%s", mismatchLine)
+	}
+	// Byte-identical push decision: no ErrPushedTreeNotVerified, PR opened,
+	// pushed_tree_reverified stamped, and the ref reached the bare remote.
+	if fpr.gotArgs == nil {
+		t.Error("OpenPR should still run after a fail-open delta capture")
+	}
+	if !strings.Contains(logs, `"event":"pushed_tree_reverified"`) {
+		t.Errorf("re-verified push must still proceed:\n%s", logs)
+	}
+	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).Output(); rerr != nil {
+		t.Errorf("run branch %s must reach the bare remote on the fail-open path: %v", branch, rerr)
 	}
 }
 

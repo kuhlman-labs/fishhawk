@@ -4247,6 +4247,38 @@ func gitRevParseTreeOf(ctx context.Context, repoDir, rev string) (string, error)
 	return strings.TrimSpace(string(out)), nil
 }
 
+// gitDiffTreeBinary is the git executable the tree-delta forensic helper
+// invokes. It is a package var SOLELY so a test can substitute a failing
+// command and prove the helper is fail-open (the seam the #1821 approval
+// condition requires: a concrete failure mechanism through the real call
+// path). Production always leaves it "git".
+var gitDiffTreeBinary = "git"
+
+// gitDiffTreeNameStatus lists the paths that differ between two tree-ish SHAs
+// via `git diff-tree -r --no-commit-id --name-status <treeA> <treeB>`,
+// returning one `<status>\t<path>` string per changed entry (M/A/D prefix),
+// blanks skipped. It is diagnostic-only and FAIL-OPEN: on any error it returns
+// the error so the caller log-and-continues — a diff-tree failure must NEVER
+// alter the push/gate decision (mirrors the merge_base_unresolved best-effort
+// forensics). Used to stamp the ground-truth perturbed-path delta into the
+// verified_tree_mismatch event (#1821) so a future occurrence names exactly
+// what moved the worktree between gate-verify and commit.
+func gitDiffTreeNameStatus(ctx context.Context, repoDir, treeA, treeB string) ([]string, error) {
+	out, err := exec.CommandContext(ctx, gitDiffTreeBinary, "-C", repoDir,
+		"diff-tree", "-r", "--no-commit-id", "--name-status", treeA, treeB).Output()
+	if err != nil {
+		return nil, fmt.Errorf("verify-gate: diff-tree %s %s: %w", treeA, treeB, err)
+	}
+	var lines []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return lines, nil
+}
+
 // gitResetSoftHEAD1 undoes the most recent commit with `git reset --soft
 // HEAD~1`, which moves HEAD back one commit WITHOUT touching the index or the
 // working tree — so the staged scope and the agent's edits both survive. This
@@ -5484,6 +5516,22 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// (an infra-skip is NOT a pass — #959-complementary), anything else
 		// returns ErrPushedTreeNotVerified BEFORE the push (origin untouched,
 		// category-B). Empty verifiedTreeSHA = no gate ran = no-op.
+		//
+		// EXPECTED-with-rationale (#1821, disposition of the #1820-adjacent
+		// recurrence): a mismatch is NOT inherently a defect. It is the
+		// designed outcome when the base advances mid-run — concurrent merges
+		// land the re-staged commit on a moved base (FreshFetchBase re-fetches
+		// origin/<base>), yielding a different tree the gates never saw. The
+		// strict re-verify below is the intended backstop for exactly that
+		// case; #1820 closed the spurious-category-B window it used to open.
+		// What was still missing was ATTRIBUTION: the drift slice records only
+		// scope-EXCLUDED files, so it never named what perturbed the worktree.
+		// The tree_delta stamped on the mismatch event (gitDiffTreeNameStatus,
+		// fail-open) captures the ground-truth verifiedTreeSHA→realTree path
+		// delta, so the next occurrence names the exact perturbed paths.
+		// #1813's diff re-anchoring alters only the RE-EMITTED diff base
+		// (resolveDiffBaseRef, 2-dot→3-dot merge-base), not realTree — the
+		// committed tree this compares — so it is ruled out as the perturber.
 		if verifiedTreeSHA == "" {
 			return scopeParkResult()
 		}
@@ -5502,9 +5550,24 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			return scopeParkResult()
 		}
 		driftJSON, _ := json.Marshal(drift)
+		// Capture the ground-truth perturbed-path delta between the gate-verified
+		// tree and the real pushed tree (#1821). Fail-open: a diff-tree error
+		// leaves an empty tree_delta plus a tree_delta_unresolved marker and
+		// NEVER alters the mismatch handling below — the push/gate decision is
+		// byte-identical whether or not this forensic capture succeeds.
+		treeDelta, tdErr := gitDiffTreeNameStatus(ctx, repoDir, verifiedTreeSHA, realTree)
+		if tdErr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"tree_delta_unresolved","run_id":%q,"stage_id":%q,"head_sha":%q,"error":%q}`+"\n",
+				cfg.runID, cfg.stageID, headSHA, tdErr.Error())
+		}
+		if treeDelta == nil {
+			treeDelta = []string{}
+		}
+		treeDeltaJSON, _ := json.Marshal(treeDelta)
 		_, _ = fmt.Fprintf(logSink,
-			`{"event":"verified_tree_mismatch","run_id":%q,"stage_id":%q,"head_sha":%q,"verified_tree_sha":%q,"pushed_tree_sha":%q,"drift":%s}`+"\n",
-			cfg.runID, cfg.stageID, headSHA, verifiedTreeSHA, realTree, driftJSON)
+			`{"event":"verified_tree_mismatch","run_id":%q,"stage_id":%q,"head_sha":%q,"verified_tree_sha":%q,"pushed_tree_sha":%q,"drift":%s,"tree_delta":%s}`+"\n",
+			cfg.runID, cfg.stageID, headSHA, verifiedTreeSHA, realTree, driftJSON, treeDeltaJSON)
 		reverifyTimeout := cfg.verifyTimeout
 		if reverifyTimeout == 0 {
 			reverifyTimeout = 10 * time.Minute
