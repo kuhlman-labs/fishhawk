@@ -36,9 +36,12 @@ const (
 )
 
 // permissionRank orders the tiers so callers can gate on "at least" a
-// minimum. An unrecognized tier is absent from the map and ranks 0
-// (none), so a garbage value never satisfies a real minimum —
-// deny-by-default.
+// minimum. An unrecognized ACTUAL permission is absent from the map and
+// ranks 0 (none), so a garbage value never satisfies a real minimum —
+// deny-by-default. An unrecognized MINIMUM is handled separately by
+// AtLeast (comma-ok lookup, fails closed) rather than by this map alone,
+// since a plain index would silently treat it as rank 0 and be satisfied
+// by any permission.
 var permissionRank = map[Permission]int{
 	PermissionNone:     0,
 	PermissionRead:     1,
@@ -51,9 +54,17 @@ var permissionRank = map[Permission]int{
 // AtLeast reports whether p is at least as privileged as min in the
 // ordered tier set (none < read < triage < write < maintain < admin).
 // Used by the token-mint authz gate (E39.3 / #1708) to require a
-// configured minimum repository permission of the verified subject.
+// configured minimum repository permission of the verified subject. An
+// unrecognized min (e.g. a typo'd config value) is not a recognized
+// tier and returns false — deny-by-default — rather than being treated
+// as PermissionNone, which any permission (including PermissionNone)
+// would satisfy.
 func (p Permission) AtLeast(min Permission) bool {
-	return permissionRank[p] >= permissionRank[min]
+	minRank, ok := permissionRank[min]
+	if !ok {
+		return false
+	}
+	return permissionRank[p] >= minRank
 }
 
 // ParsePermission maps a tier name to a Permission, reporting ok=false

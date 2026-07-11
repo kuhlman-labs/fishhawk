@@ -129,7 +129,9 @@ func TestVerifyAccessToken_Unauthorized(t *testing.T) {
 
 // TestPermission_AtLeast covers the tier ordering the token-mint authz
 // gate (#1708) uses: a subject satisfies a minimum only when its tier is
-// at least as privileged, and an unrecognized tier ranks as none.
+// at least as privileged, an unrecognized ACTUAL permission ranks as
+// none, and an unrecognized MINIMUM fails closed (#1731) rather than
+// being treated as an always-satisfied PermissionNone floor.
 func TestPermission_AtLeast(t *testing.T) {
 	cases := []struct {
 		p    Permission
@@ -143,6 +145,10 @@ func TestPermission_AtLeast(t *testing.T) {
 		{PermissionNone, PermissionRead, false},
 		{PermissionMaintain, PermissionAdmin, false},
 		{Permission("garbage"), PermissionRead, false},
+		{PermissionAdmin, Permission("garbage"), false},
+		{PermissionWrite, Permission("owner"), false},
+		{PermissionNone, Permission("garbage"), false},
+		{PermissionRead, PermissionNone, true},
 	}
 	for _, c := range cases {
 		if got := c.p.AtLeast(c.min); got != c.want {
