@@ -63,7 +63,8 @@ Any property whose `$ref` (or array `items.$ref`) points to an annotated `$defs`
 
   "risks_and_assumptions": ["..."],
   "decomposition": { "rationale": "...", "sub_plans": [...] },
-  "model_recommendation": { "implement_model": "...", "rationale": "...", "complexity_assessed": "low|medium|high" }
+  "model_recommendation": { "implement_model": "...", "rationale": "...", "complexity_assessed": "low|medium|high" },
+  "surface_sweep_exemptions": [ { "pattern": "...", "sibling": "...", "reason": "..." } ]
 }
 ```
 
@@ -309,6 +310,32 @@ The agent's optional, complexity-informed recommendation for which model should 
 | `complexity_assessed` | `"low"` / `"medium"` / `"high"` | yes (when the object is present) | The agent's complexity assessment, informing the recommendation; stamped onto calibration history. |
 
 `model_recommendation` is one rung of the implement-model resolution ladder: deployment default < workflow-spec `executor.model` < plan `model_recommendation.implement_model` < operator gate decision. When omitted, resolution falls through to the next-lower rung (ultimately the deployment default spawn — byte-identical to today's behavior). The whole object is additive-optional within `standard_v1.x`; a plan that omits it validates unchanged. A decomposed sub-plan may carry its own `model_recommendation` (see the sub-plan table above), resolved through the same chokepoint at the child's plan gate.
+
+### `surface_sweep_exemptions`
+
+The plan's optional, machine-readable declarations that a surface-sweep **lockstep pattern's sibling correctly needs no change** in this plan (#1544) — the structured form of the prose "justify why a sibling needs no change" escape hatch. The plan-gate surface sweep flags a plan that scopes one member of a known multi-surface pattern (e.g. `status_template.go`) without its coupled siblings (e.g. `notifier.go`). But a path-only sweep cannot tell an `@`-mention render edit (which *does* need its `notifier.go` peer) from a system-actor render edit (which does not) — both are `status_template.go`-only. A declared exemption lets the planner assert the distinction and pass the sweep without the false-positive finding.
+
+```json
+{
+  "surface_sweep_exemptions": [
+    {
+      "pattern": "actor @-mention render surfaces",
+      "sibling": "backend/internal/issuecomment/notifier.go",
+      "reason": "This adds a system-actor render (deployment_dispatched) that mentions no @-user, so the notifier.go @-mention peer needs no change."
+    }
+  ]
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `pattern` | string (≥ 1 char) | yes | The surface-sweep pattern's name, exactly as surfaced in the plan-gate surface-coupling sibling map (e.g. `actor @-mention render surfaces`). |
+| `sibling` | string (≥ 1 char) | yes | Repo-relative path of the pattern sibling that correctly needs no change in this plan. |
+| `reason` | string (≥ 1 char) | yes | Why the sibling needs no change. Rendered to plan reviewers as a **challengeable** justification, so a bogus reason is never silent. |
+
+**When to use.** Only when you scope a lockstep pattern's trigger but a listed sibling genuinely needs no change — most commonly a purely data-driven addition to a shared render file that adds no new coupling. Do not use it to skip a sibling that actually must move in lockstep.
+
+**How the sweep honors it.** The sweep suppresses a missing-sibling finding only when the pattern's entire missing set is covered by matching `(pattern, sibling)` exemptions; a partial exemption still fires a finding for the remaining uncovered siblings (the true positive is preserved). A declared top-level exemption also applies to every decomposition sub-plan's own scope. Each **applied** exemption is recorded in the `plan_surface_sweep` audit payload (`applied_exemptions`) and rendered into the plan-review prompt's gate evidence, so a reviewer can challenge a bogus reason — the reviewer-visibility guardrail. A non-matching, non-firing, or already-scoped-sibling exemption is a harmless no-op and is not recorded as applied. The whole array is additive-optional within `standard_v1.x`; a plan that omits it validates and sweeps exactly as before.
 
 ## Validation rules beyond the schema
 

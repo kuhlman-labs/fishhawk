@@ -483,6 +483,74 @@ func TestParse_WithoutModelRecommendation_StillValidates(t *testing.T) {
 	}
 }
 
+// --- surface_sweep_exemptions (#1544) ---
+
+// TestParse_SurfaceSweepExemptions_RoundTrips covers the additive top-level
+// surface_sweep_exemptions array: a plan carrying it validates against the
+// schema and decodes each {pattern, sibling, reason} into the typed
+// Plan.SurfaceSweepExemptions.
+func TestParse_SurfaceSweepExemptions_RoundTrips(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["surface_sweep_exemptions"] = []any{
+			map[string]any{
+				"pattern": "actor @-mention render surfaces",
+				"sibling": "backend/internal/issuecomment/notifier.go",
+				"reason":  "system-actor render adds no @-mention, so the notifier peer needs no change",
+			},
+		}
+	})
+	p, err := plan.Parse(marshalFixture(t, m))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got, want := len(p.SurfaceSweepExemptions), 1; got != want {
+		t.Fatalf("SurfaceSweepExemptions len = %d, want %d", got, want)
+	}
+	e := p.SurfaceSweepExemptions[0]
+	if e.Pattern != "actor @-mention render surfaces" {
+		t.Errorf("Pattern = %q", e.Pattern)
+	}
+	if e.Sibling != "backend/internal/issuecomment/notifier.go" {
+		t.Errorf("Sibling = %q", e.Sibling)
+	}
+	if e.Reason != "system-actor render adds no @-mention, so the notifier peer needs no change" {
+		t.Errorf("Reason = %q", e.Reason)
+	}
+}
+
+// TestParse_WithoutSurfaceSweepExemptions_StillValidates confirms the field
+// is additive-optional: the minimal valid plan (no exemptions) parses and the
+// typed slice is nil. Failure here would indicate an accidental required
+// promotion.
+func TestParse_WithoutSurfaceSweepExemptions_StillValidates(t *testing.T) {
+	p, err := plan.Parse(marshalFixture(t, planfixture.Valid()))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.SurfaceSweepExemptions != nil {
+		t.Errorf("SurfaceSweepExemptions = %+v, want nil (field omitted)", p.SurfaceSweepExemptions)
+	}
+}
+
+// TestParse_SurfaceSweepExemptionMissingReason_IsSchemaError pins the
+// required-fields contract on the exemption $def: an entry omitting reason
+// (the load-bearing challengeable justification) is rejected at validation.
+func TestParse_SurfaceSweepExemptionMissingReason_IsSchemaError(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["surface_sweep_exemptions"] = []any{
+			map[string]any{
+				"pattern": "actor @-mention render surfaces",
+				"sibling": "backend/internal/issuecomment/notifier.go",
+			},
+		}
+	})
+	_, err := plan.Parse(marshalFixture(t, m))
+	var se *plan.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError for a missing required reason", err)
+	}
+}
+
 // TestParse_SubPlanModelRecommendation_RoundTrips covers the per-child
 // recommendation: a sub-plan carrying model_recommendation decodes into the
 // typed SubPlanSummary.ModelRecommendation, while a sibling without it decodes
@@ -1336,13 +1404,13 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // as a drift guard: any byte change (an unintended edit, or a docs/spec
 // sync that did not land in the embedded copy) fails this test deliberately.
 // The hash is re-pinned only for a sanctioned additive-optional change within
-// standard_v1.x — most recently the #1529 verification.acceptance_criteria /
-// out_of_scope fields. A standard_v1 plan that omits the new optional fields
-// must still validate unchanged through the plan-only Validate entry point
-// (asserted below), which is the proof the change did not break the schema in
-// place.
+// standard_v1.x — most recently the #1544 top-level surface_sweep_exemptions
+// field (before that, the #1529 verification.acceptance_criteria / out_of_scope
+// fields). A standard_v1 plan that omits the new optional fields must still
+// validate unchanged through the plan-only Validate entry point (asserted
+// below), which is the proof the change did not break the schema in place.
 func TestPlanSchemaFrozen(t *testing.T) {
-	const wantHash = "5ad129d5c22737f2ed21291abb75f5e3129b010c4e991aa3918243d220371d28"
+	const wantHash = "4b57026debcfa77847a6cd7a54c458d398a9a06d3aecf3babe96379ad01a7f13"
 	b, err := os.ReadFile("schemas/plan-standard-v1.schema.json")
 	if err != nil {
 		t.Fatalf("read embedded plan schema: %v", err)

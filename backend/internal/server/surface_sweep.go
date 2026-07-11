@@ -70,6 +70,28 @@ type SurfaceSweepPayload struct {
 	Findings           []SurfaceSweepFinding       `json:"findings"`
 	ScannedFiles       int                         `json:"scanned_files"`
 	CrossSliceFindings []CrossSliceCouplingFinding `json:"cross_slice_findings"`
+	// AppliedExemptions records the plan-declared surface_sweep_exemptions
+	// that actually suppressed a would-be missing-sibling finding (#1544).
+	// Like Findings/CrossSliceFindings it marshals as an empty array (not
+	// null) when nothing was suppressed, so a reader can distinguish "no
+	// exemption applied" from a legacy plan predating the field. A
+	// non-matching or non-firing declared exemption is a harmless no-op and
+	// is NOT recorded here — only an exemption that removed a genuinely
+	// absent sibling from the missing set appears.
+	AppliedExemptions []AppliedExemption `json:"applied_exemptions"`
+}
+
+// AppliedExemption records one plan-declared surface_sweep_exemption that
+// suppressed a would-be missing-sibling finding (#1544): the Pattern it
+// belongs to, the Sibling path it exempted, the plan's stated Reason, and —
+// for a decomposition sub-plan scope — the attributing SubPlanTitle. It is
+// recorded in the audit payload and rendered to plan reviewers so a bogus
+// reason stays challengeable: an exemption is never silent.
+type AppliedExemption struct {
+	Pattern      string `json:"pattern"`
+	Sibling      string `json:"sibling"`
+	Reason       string `json:"reason"`
+	SubPlanTitle string `json:"sub_plan_title,omitempty"`
 }
 
 // surfacePattern is one entry in the static surface registry: when any
@@ -255,13 +277,34 @@ func surfaceCouplingPatternsForPrompt() []prompt.SurfaceCouplingPattern {
 // never flags a sibling already present. MissingSiblings is sorted for
 // deterministic output. Paths are slash-normalized so a plan listing
 // backslash-separated paths still matches.
-func evaluateSurfaceSweep(scopeFiles []string, patterns []surfacePattern) []SurfaceSweepFinding {
+//
+// A plan-declared surface_sweep_exemption naming (pattern.Name, sibling)
+// suppresses that sibling from the missing set (#1544): the finding is
+// suppressed only when the pattern's missing set is FULLY covered by
+// exemptions — a partial exemption still fires a finding listing the
+// remaining uncovered siblings. Only an exemption that removes a genuinely
+// absent sibling is returned in the second result (an applied exemption);
+// a non-matching, non-firing, or already-scoped-sibling exemption is a
+// harmless no-op and is not returned. Applied exemptions carry the plan's
+// reason so the caller can render it to reviewers as challengeable. Stays
+// pure — no receiver, no I/O.
+func evaluateSurfaceSweep(scopeFiles []string, patterns []surfacePattern, exemptions []plan.SurfaceSweepExemption) ([]SurfaceSweepFinding, []AppliedExemption) {
 	scope := make(map[string]bool, len(scopeFiles))
 	for _, f := range scopeFiles {
 		scope[filepath.ToSlash(f)] = true
 	}
 
+	// Index exemptions by (pattern name, slash-normalized sibling) so a
+	// firing pattern can look up an exemption for an absent sibling in O(1),
+	// preserving the declared reason.
+	type exKey struct{ pattern, sibling string }
+	exByKey := make(map[exKey]plan.SurfaceSweepExemption, len(exemptions))
+	for _, e := range exemptions {
+		exByKey[exKey{e.Pattern, filepath.ToSlash(e.Sibling)}] = e
+	}
+
 	var findings []SurfaceSweepFinding
+	var applied []AppliedExemption
 	for _, p := range patterns {
 		trigger, matched := "", false
 		for _, t := range p.Triggers {
@@ -275,9 +318,22 @@ func evaluateSurfaceSweep(scopeFiles []string, patterns []surfacePattern) []Surf
 		}
 		var missing []string
 		for _, sib := range p.Siblings {
-			if !pathMatches(scope, sib) {
-				missing = append(missing, filepath.ToSlash(sib))
+			if pathMatches(scope, sib) {
+				continue
 			}
+			sibNorm := filepath.ToSlash(sib)
+			// Sibling absent from scope: a plan-declared exemption naming
+			// (this pattern, this sibling) suppresses it from the missing
+			// set and is recorded as applied for reviewer visibility.
+			if e, ok := exByKey[exKey{p.Name, sibNorm}]; ok {
+				applied = append(applied, AppliedExemption{
+					Pattern: p.Name,
+					Sibling: sibNorm,
+					Reason:  e.Reason,
+				})
+				continue
+			}
+			missing = append(missing, sibNorm)
 		}
 		if len(missing) == 0 {
 			continue
@@ -289,7 +345,7 @@ func evaluateSurfaceSweep(scopeFiles []string, patterns []surfacePattern) []Surf
 			MissingSiblings: missing,
 		})
 	}
-	return findings
+	return findings, applied
 }
 
 // pathMatches reports whether the registry path is present in the scope
@@ -424,14 +480,19 @@ func (s *Server) runSurfaceSweep(ctx context.Context, runID, stageID uuid.UUID, 
 		scopeFiles = append(scopeFiles, f.Path)
 	}
 
-	findings := evaluateSurfaceSweep(scopeFiles, surfacePatterns)
+	// The plan's declared surface_sweep_exemptions apply to the flat parent
+	// scope AND every sub-plan scope (#1544): a top-level exemption suppresses
+	// the matching missing-sibling finding wherever it would otherwise fire.
+	exemptions := parsedPlan.SurfaceSweepExemptions
+
+	findings, applied := evaluateSurfaceSweep(scopeFiles, surfacePatterns, exemptions)
 
 	// Evaluate each decomposition sub-plan's own scope.files too (#1077):
 	// an under-scoped slice's coupling gap must surface at the parent plan
 	// gate the operator approves, since the fan-out child runs are
-	// implement-only and never re-upload a plan. Findings are attributed to
-	// their sub-plan via SubPlanTitle; the parent ScannedFiles count is
-	// unchanged. evaluateSurfaceSweep stays pure.
+	// implement-only and never re-upload a plan. Findings and applied
+	// exemptions are attributed to their sub-plan via SubPlanTitle; the
+	// parent ScannedFiles count is unchanged. evaluateSurfaceSweep stays pure.
 	if parsedPlan.Decomposition != nil {
 		for _, sp := range parsedPlan.Decomposition.SubPlans {
 			if sp.Scope == nil {
@@ -441,9 +502,14 @@ func (s *Server) runSurfaceSweep(ctx context.Context, runID, stageID uuid.UUID, 
 			for _, f := range sp.Scope.Files {
 				subFiles = append(subFiles, f.Path)
 			}
-			for _, f := range evaluateSurfaceSweep(subFiles, surfacePatterns) {
+			subFindings, subApplied := evaluateSurfaceSweep(subFiles, surfacePatterns, exemptions)
+			for _, f := range subFindings {
 				f.SubPlanTitle = sp.Title
 				findings = append(findings, f)
+			}
+			for _, a := range subApplied {
+				a.SubPlanTitle = sp.Title
+				applied = append(applied, a)
 			}
 		}
 	}
@@ -453,6 +519,13 @@ func (s *Server) runSurfaceSweep(ctx context.Context, runID, stageID uuid.UUID, 
 		// "checked and clean" state is explicit (a missing entry means
 		// "never checked").
 		findings = []SurfaceSweepFinding{}
+	}
+
+	if applied == nil {
+		// Empty array (not null), same "checked and clean" rationale as
+		// findings: an explicit "no exemption applied" rather than a
+		// legacy plan that predates the field.
+		applied = []AppliedExemption{}
 	}
 
 	// Cross-slice coupling pass (#1102): when a registered lockstep
@@ -469,6 +542,7 @@ func (s *Server) runSurfaceSweep(ctx context.Context, runID, stageID uuid.UUID, 
 		Findings:           findings,
 		ScannedFiles:       len(scopeFiles),
 		CrossSliceFindings: crossSlice,
+		AppliedExemptions:  applied,
 	}
 	payload, _ := json.Marshal(result)
 	systemKind := audit.ActorKind("system")

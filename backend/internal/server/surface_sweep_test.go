@@ -154,9 +154,11 @@ func TestEvaluateSurfaceSweep(t *testing.T) {
 		mcpReadme      = "backend/cmd/fishhawk-mcp/README.md"
 	)
 	tests := []struct {
-		name  string
-		scope []string
-		want  []SurfaceSweepFinding
+		name        string
+		scope       []string
+		exemptions  []plan.SurfaceSweepExemption
+		want        []SurfaceSweepFinding
+		wantApplied []AppliedExemption
 	}{
 		{
 			name:  "render surface alone flags missing peer",
@@ -304,12 +306,110 @@ func TestEvaluateSurfaceSweep(t *testing.T) {
 				},
 			},
 		},
+		{
+			// #1544 branch 1: status_template.go in scope with a matching
+			// exemption naming the absent notifier.go sibling fully covers the
+			// missing set — the finding is suppressed and the exemption is
+			// recorded as applied (reviewer-visible), not silent.
+			name:  "matching exemption suppresses finding and records applied",
+			scope: []string{statusTemplate},
+			exemptions: []plan.SurfaceSweepExemption{
+				{Pattern: "actor @-mention render surfaces", Sibling: notifier, Reason: "system-actor render, no @-mention"},
+			},
+			want: nil,
+			wantApplied: []AppliedExemption{
+				{Pattern: "actor @-mention render surfaces", Sibling: notifier, Reason: "system-actor render, no @-mention"},
+			},
+		},
+		{
+			// #1544 branch 2: a partial exemption covering one of two absent
+			// siblings still fires a finding listing the REMAINING uncovered
+			// sibling, and records the one applied exemption. tools.go alone
+			// misses README.md + tools_test.go; exempt only the readme.
+			name:  "partial exemption still flags remaining sibling",
+			scope: []string{mcpTools},
+			exemptions: []plan.SurfaceSweepExemption{
+				{Pattern: "mcp tool registration requires count test + readme", Sibling: mcpReadme, Reason: "no user-facing tool listing change"},
+			},
+			want: []SurfaceSweepFinding{
+				{
+					Pattern:         "mcp tool registration requires count test + readme",
+					TriggerPath:     mcpTools,
+					MissingSiblings: []string{mcpToolsTest},
+				},
+			},
+			wantApplied: []AppliedExemption{
+				{Pattern: "mcp tool registration requires count test + readme", Sibling: mcpReadme, Reason: "no user-facing tool listing change"},
+			},
+		},
+		{
+			// #1544 branch 5a: an exemption naming the WRONG pattern for the
+			// sibling does not match, so nothing is suppressed and no applied
+			// exemption is recorded — the finding fires as if undeclared.
+			name:  "wrong-pattern exemption does not suppress",
+			scope: []string{statusTemplate},
+			exemptions: []plan.SurfaceSweepExemption{
+				{Pattern: "audit kind requires surfaces doc", Sibling: notifier, Reason: "mislabeled pattern"},
+			},
+			want: []SurfaceSweepFinding{
+				{
+					Pattern:         "actor @-mention render surfaces",
+					TriggerPath:     statusTemplate,
+					MissingSiblings: []string{notifier},
+				},
+			},
+			wantApplied: nil,
+		},
+		{
+			// #1544 branch 5b: an exemption naming a NON-MEMBER sibling path
+			// (not a sibling of the firing pattern) never matches, so the
+			// finding fires unchanged and no applied exemption is recorded.
+			name:  "non-member sibling exemption does not suppress",
+			scope: []string{statusTemplate},
+			exemptions: []plan.SurfaceSweepExemption{
+				{Pattern: "actor @-mention render surfaces", Sibling: "backend/internal/foo/foo.go", Reason: "not a member"},
+			},
+			want: []SurfaceSweepFinding{
+				{
+					Pattern:         "actor @-mention render surfaces",
+					TriggerPath:     statusTemplate,
+					MissingSiblings: []string{notifier},
+				},
+			},
+			wantApplied: nil,
+		},
+		{
+			// #1544: an exemption for a non-firing pattern (its trigger is not
+			// in scope) is a harmless no-op — never recorded as applied.
+			name:  "exemption for non-firing pattern is a no-op",
+			scope: []string{"backend/internal/foo/foo.go"},
+			exemptions: []plan.SurfaceSweepExemption{
+				{Pattern: "actor @-mention render surfaces", Sibling: notifier, Reason: "no-op"},
+			},
+			want:        nil,
+			wantApplied: nil,
+		},
+		{
+			// #1544: exempting a sibling that is ALSO scoped is not "applied"
+			// — the sibling is present, so it was never in the missing set.
+			// Both surfaces scoped + surfaces doc = clean, exemption unused.
+			name:  "exemption for already-scoped sibling not applied",
+			scope: []string{statusTemplate, notifier, surfacesDoc},
+			exemptions: []plan.SurfaceSweepExemption{
+				{Pattern: "actor @-mention render surfaces", Sibling: notifier, Reason: "already scoped"},
+			},
+			want:        nil,
+			wantApplied: nil,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := evaluateSurfaceSweep(tt.scope, surfacePatterns)
+			got, gotApplied := evaluateSurfaceSweep(tt.scope, surfacePatterns, tt.exemptions)
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("evaluateSurfaceSweep() = %+v, want %+v", got, tt.want)
+				t.Errorf("evaluateSurfaceSweep() findings = %+v, want %+v", got, tt.want)
+			}
+			if !reflect.DeepEqual(gotApplied, tt.wantApplied) {
+				t.Errorf("evaluateSurfaceSweep() applied = %+v, want %+v", gotApplied, tt.wantApplied)
 			}
 		})
 	}
@@ -414,6 +514,148 @@ func TestRunSurfaceSweep_CleanWritesEmptyFindings(t *testing.T) {
 		if got := string(ap.Payload); !strings.Contains(got, `"cross_slice_findings":[]`) {
 			t.Errorf("payload should encode cross_slice_findings as []; got %s", got)
 		}
+		// applied_exemptions must marshal as [] not null when the plan
+		// declared no exemption that applied (#1544).
+		if got := string(ap.Payload); !strings.Contains(got, `"applied_exemptions":[]`) {
+			t.Errorf("payload should encode applied_exemptions as []; got %s", got)
+		}
+	}
+}
+
+// exemptionPlanBody builds a schema-valid flat plan body with the given
+// scope.files and top-level surface_sweep_exemptions (#1544).
+func exemptionPlanBody(t *testing.T, files []plan.ScopeFile, exemptions []plan.SurfaceSweepExemption) []byte {
+	t.Helper()
+	fileMaps := make([]any, 0, len(files))
+	for _, f := range files {
+		fileMaps = append(fileMaps, map[string]any{"path": f.Path, "operation": string(f.Operation)})
+	}
+	exMaps := make([]any, 0, len(exemptions))
+	for _, e := range exemptions {
+		exMaps = append(exMaps, map[string]any{"pattern": e.Pattern, "sibling": e.Sibling, "reason": e.Reason})
+	}
+	m := planfixture.Valid(func(p map[string]any) {
+		p["scope"] = map[string]any{"files": fileMaps}
+		p["surface_sweep_exemptions"] = exMaps
+	})
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal exemption plan: %v", err)
+	}
+	if err := plan.Validate(body); err != nil {
+		t.Fatalf("fixture exemption plan does not validate: %v", err)
+	}
+	return body
+}
+
+// TestRunSurfaceSweep_AppliedExemptionsPopulated covers #1544 branch 6: a
+// plan scoping a trigger with a matching exemption for the absent sibling
+// suppresses the finding AND records the applied exemption (reviewer-
+// visible), and the returned payload equals the recorded one.
+func TestRunSurfaceSweep_AppliedExemptionsPopulated(t *testing.T) {
+	s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+	const (
+		statusTemplate = "backend/internal/issuecomment/status_template.go"
+		notifier       = "backend/internal/issuecomment/notifier.go"
+	)
+	body := exemptionPlanBody(t,
+		[]plan.ScopeFile{{Path: statusTemplate, Operation: plan.FileOpModify}},
+		[]plan.SurfaceSweepExemption{
+			{Pattern: "actor @-mention render surfaces", Sibling: notifier, Reason: "system-actor render, no @-mention"},
+		},
+	)
+
+	got := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result when the sweep ran")
+	}
+	if len(got.Findings) != 0 {
+		t.Fatalf("matching exemption should suppress the finding; got %+v", got.Findings)
+	}
+	if len(got.AppliedExemptions) != 1 {
+		t.Fatalf("want 1 applied exemption; got %+v", got.AppliedExemptions)
+	}
+	ae := got.AppliedExemptions[0]
+	if ae.Pattern != "actor @-mention render surfaces" || ae.Sibling != notifier ||
+		ae.Reason != "system-actor render, no @-mention" || ae.SubPlanTitle != "" {
+		t.Errorf("applied exemption = %+v, want {pattern, notifier, reason, no subplan}", ae)
+	}
+
+	// The recorded payload must equal the returned one, and encode
+	// applied_exemptions with the reason (not silent).
+	recorded := lastSurfaceSweepEntry(t, au)
+	gotJSON, _ := json.Marshal(got)
+	recordedJSON, _ := json.Marshal(recorded)
+	if string(gotJSON) != string(recordedJSON) {
+		t.Errorf("returned result diverges from recorded payload:\nreturned: %s\nrecorded: %s", gotJSON, recordedJSON)
+	}
+}
+
+// TestRunSurfaceSweep_SubPlanExemptionAttributed covers #1544 branch 7: a
+// top-level exemption applies to a decomposition sub-plan's own scope, and
+// the applied exemption is attributed to that sub-plan via SubPlanTitle.
+func TestRunSurfaceSweep_SubPlanExemptionAttributed(t *testing.T) {
+	s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+	const (
+		statusTemplate = "backend/internal/issuecomment/status_template.go"
+		notifier       = "backend/internal/issuecomment/notifier.go"
+	)
+	// Build a decomposed body whose "render slice" scopes status_template.go
+	// only, then attach a top-level exemption for the notifier.go sibling.
+	m := planfixture.Valid(func(p map[string]any) {
+		p["scope"] = map[string]any{"files": []any{
+			map[string]any{"path": "backend/internal/foo/foo.go", "operation": "modify"},
+		}}
+		p["surface_sweep_exemptions"] = []any{
+			map[string]any{"pattern": "actor @-mention render surfaces", "sibling": notifier, "reason": "system-actor render only"},
+		}
+		p["decomposition"] = map[string]any{
+			"rationale": "scope exceeded single-stage budget",
+			"sub_plans": []any{
+				map[string]any{
+					"title": "render slice", "scope_hint": "render slice",
+					"scope":                        map[string]any{"files": []any{map[string]any{"path": statusTemplate, "operation": "modify"}}},
+					"predicted_runtime_minutes":    10,
+					"predicted_runtime_confidence": "medium",
+				},
+				map[string]any{
+					"title": "unrelated slice", "scope_hint": "unrelated slice",
+					"scope":                        map[string]any{"files": []any{map[string]any{"path": "backend/internal/bar/bar.go", "operation": "modify"}}},
+					"predicted_runtime_minutes":    10,
+					"predicted_runtime_confidence": "medium",
+				},
+			},
+		}
+	})
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal decomposed exemption plan: %v", err)
+	}
+	if err := plan.Validate(body); err != nil {
+		t.Fatalf("fixture does not validate: %v", err)
+	}
+
+	s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, body)
+
+	got := lastSurfaceSweepEntry(t, au)
+	// No finding should survive: the render slice's missing notifier.go
+	// sibling is fully covered by the top-level exemption.
+	for _, f := range got.Findings {
+		if f.Pattern == "actor @-mention render surfaces" {
+			t.Errorf("render-surface finding should be suppressed by the exemption; got %+v", f)
+		}
+	}
+	var found *AppliedExemption
+	for i := range got.AppliedExemptions {
+		if got.AppliedExemptions[i].SubPlanTitle == "render slice" {
+			found = &got.AppliedExemptions[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("want an applied exemption attributed to the render slice; got %+v", got.AppliedExemptions)
+	}
+	if found.Sibling != notifier || found.Reason != "system-actor render only" {
+		t.Errorf("attributed exemption = %+v", *found)
 	}
 }
 

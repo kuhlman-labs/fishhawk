@@ -46,6 +46,29 @@ type Plan struct {
 	// resolver falls through to the spec executor.model, then the
 	// deployment default.
 	ModelRecommendation *ModelRecommendation `json:"model_recommendation,omitempty"`
+	// SurfaceSweepExemptions carries the plan's optional machine-readable
+	// declarations that a surface-sweep lockstep pattern's sibling correctly
+	// needs no change in this plan (#1544) — the structured form of the prose
+	// "justify why a sibling needs no change" escape hatch. The plan-gate
+	// surface sweep honors a matching (pattern, sibling) entry to suppress the
+	// would-be missing-sibling finding, recording the applied exemption in the
+	// audit payload + plan-review evidence so a bogus reason stays reviewer-
+	// challengeable. Additive-optional within standard_v1; nil/empty means the
+	// plan declares none (the sweep reduces to its prior behavior). JSON tags
+	// mirror the surface-sweep-exemption $def in the schema.
+	SurfaceSweepExemptions []SurfaceSweepExemption `json:"surface_sweep_exemptions,omitempty"`
+}
+
+// SurfaceSweepExemption is one entry in Plan.SurfaceSweepExemptions (#1544):
+// a declaration that the named surface-sweep lockstep Pattern's named Sibling
+// correctly needs no change in this plan, with the Reason surfaced to plan
+// reviewers as a challengeable justification. Pattern is the pattern's human
+// label (as surfaced in the plan-gate surface-coupling sibling map); Sibling
+// is the repo-relative sibling path; Reason is why it needs no change.
+type SurfaceSweepExemption struct {
+	Pattern string `json:"pattern"`
+	Sibling string `json:"sibling"`
+	Reason  string `json:"reason"`
 }
 
 // ModelRecommendation is the agent's optional recommendation for the
