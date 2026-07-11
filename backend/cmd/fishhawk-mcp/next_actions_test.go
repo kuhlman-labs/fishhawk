@@ -1110,6 +1110,17 @@ func TestCampaignNextActionsFor_Attention(t *testing.T) {
 	if got.Params["issue_ref"] != "#27" {
 		t.Errorf("issue_ref param = %q, want #27", got.Params["issue_ref"])
 	}
+	// #1838: the prose must NO LONGER promise the retry/abandon verbs that refuse
+	// on a failed item — the whole point of the fix. It must say the item is not
+	// auto-restartable (a restartable item surfaces as start_run instead).
+	for _, s := range []string{got.Precondition, got.Reason} {
+		if strings.Contains(s, "abandon") {
+			t.Errorf("attention prose still promises abandon: %q", s)
+		}
+	}
+	if !strings.Contains(got.Precondition+got.Reason, "auto-restart") {
+		t.Errorf("attention prose = %q / %q, want it to explain the item is not auto-restartable", got.Precondition, got.Reason)
+	}
 }
 
 func TestCampaignNextActionsFor_Resume(t *testing.T) {
@@ -1140,6 +1151,29 @@ func TestCampaignNextActionsFor_StartRun(t *testing.T) {
 	}
 	if got.Params["trigger_ref"] != "#26" {
 		t.Errorf("trigger_ref param = %q, want #26", got.Params["trigger_ref"])
+	}
+}
+
+// TestCampaignNextActionsFor_StartRun_Restartable asserts the SAME start_run arm
+// serves a restartable failed/cancelled item (server-side computeCampaignNextAction
+// surfaces both eligible and restartable as start_run, #1838) — it carries a
+// non-empty dispatch action on the item's ref, upholding the "never unclassified"
+// invariant for a restartable next_action.
+func TestCampaignNextActionsFor_StartRun_Restartable(t *testing.T) {
+	// Restartable items are folded into the wire cancelled slice.
+	na := campaignNextActionsFor(CampaignRollup{Cancelled: []string{"#40"}}, caNextAction("start_run", "#40"))
+	if na.State != "campaign_start_run" {
+		t.Errorf("State = %q, want campaign_start_run", na.State)
+	}
+	if len(na.Actions) == 0 {
+		t.Fatal("start_run must carry at least one action")
+	}
+	got := na.Actions[0]
+	if got.Action != "fishhawk_start_run" {
+		t.Errorf("action = %q, want fishhawk_start_run", got.Action)
+	}
+	if got.Params["trigger_ref"] != "#40" {
+		t.Errorf("trigger_ref param = %q, want #40", got.Params["trigger_ref"])
 	}
 }
 

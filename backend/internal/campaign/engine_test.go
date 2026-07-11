@@ -16,14 +16,15 @@ func item(ref string, state campaign.ItemState, runID *uuid.UUID, deps ...string
 
 // TestNextEligible_PartiallyComplete asserts the eligible/blocked/running/
 // done/failed partition over a partially-complete campaign: one succeeded
-// (done), one running, one failed, one pending whose only dep succeeded
-// (eligible), and one pending whose dep is still running (blocked).
+// (done), one running, one failed whose dep is unsatisfied (stays Failed, not
+// diverted to Restartable), one pending whose only dep succeeded (eligible),
+// and one pending whose dep is still running (blocked).
 func TestNextEligible_PartiallyComplete(t *testing.T) {
 	run := uuid.New()
 	items := []*campaign.Item{
 		item("issue:1", campaign.ItemStateSucceeded, nil),          // done
 		item("issue:2", campaign.ItemStateRunning, &run),           // running
-		item("issue:3", campaign.ItemStateFailed, nil),             // failed
+		item("issue:3", campaign.ItemStateFailed, nil, "issue:2"),  // failed, dep running → stays Failed (not restartable)
 		item("issue:4", campaign.ItemStatePending, nil, "issue:1"), // dep done → eligible
 		item("issue:5", campaign.ItemStatePending, nil, "issue:2"), // dep running → blocked
 	}
@@ -119,6 +120,37 @@ func TestNextEligible_RestartablePartition(t *testing.T) {
 	}
 	if len(got.Eligible) != 0 {
 		t.Errorf("eligible = %v, want none (a cancelled item is never Eligible)", got.Eligible)
+	}
+}
+
+// TestNextEligible_FailedRestartablePartition is the E32.37 (#1838) done-means
+// for admitting FAILED items to the Restartable partition (mirroring #1729's
+// cancelled arm): a deps-satisfied, non-autonomy:low failed item is Restartable;
+// a deps-UNsatisfied failed item stays Failed; an autonomy:low failed item stays
+// Failed (human-led work is never auto-surfaced for restart); Restartable /
+// Failed are disjoint (each failed item is in exactly one). A failed item is
+// NEVER Eligible.
+func TestNextEligible_FailedRestartablePartition(t *testing.T) {
+	items := []*campaign.Item{
+		item("issue:1", campaign.ItemStateSucceeded, nil), // done — satisfies deps below
+		// failed, deps satisfied, autonomy unset → Restartable.
+		{IssueRef: "issue:2", State: campaign.ItemStateFailed, DependsOn: []string{"issue:1"}},
+		// failed, deps UNsatisfied → stays Failed (never restart against an open edge).
+		{IssueRef: "issue:3", State: campaign.ItemStateFailed, DependsOn: []string{"issue:999"}},
+		// failed, deps satisfied, autonomy:low → stays Failed (human-led).
+		{IssueRef: "issue:4", State: campaign.ItemStateFailed, DependsOn: []string{"issue:1"}, Autonomy: "low"},
+	}
+	got := campaign.NextEligible(items)
+	want := campaign.Eligibility{
+		Done:        []string{"issue:1"},
+		Restartable: []string{"issue:2"},
+		Failed:      []string{"issue:3", "issue:4"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("NextEligible =\n  %+v\nwant\n  %+v", got, want)
+	}
+	if len(got.Eligible) != 0 {
+		t.Errorf("eligible = %v, want none (a failed item is never Eligible)", got.Eligible)
 	}
 }
 
@@ -219,12 +251,48 @@ func TestDeriveState(t *testing.T) {
 			want: campaign.StateSucceeded,
 		},
 		{
-			name: "any failed is failed",
+			// #1838 QUARANTINE: a failed item ALONGSIDE still-actionable work
+			// (here a pending sibling) keeps the campaign RUNNING — the failed item
+			// is quarantined so its eligible siblings can still be driven, instead
+			// of the old unconditional anyFailed->Failed that drove the whole
+			// campaign terminal. This is the core fix.
+			name: "failed alongside pending is running (quarantine)",
+			items: []*campaign.Item{
+				item("issue:1", campaign.ItemStateFailed, nil),
+				item("issue:2", campaign.ItemStatePending, nil),
+			},
+			want: campaign.StateRunning,
+		},
+		{
+			// Anti-over-fix guard: when EVERY item is terminal and at least one
+			// failed (here succeeded + failed, no actionable item remains), the
+			// campaign is genuinely terminal-failed and still derives Failed.
+			name: "all terminal with one failed is failed",
 			items: []*campaign.Item{
 				item("issue:1", campaign.ItemStateSucceeded, nil),
 				item("issue:2", campaign.ItemStateFailed, nil),
 			},
 			want: campaign.StateFailed,
+		},
+		{
+			// Anti-over-fix guard: a single failed item (the whole campaign) is
+			// all-terminal, so it still derives Failed — the quarantine only spares
+			// a failure that has actionable siblings.
+			name: "single failed item is failed",
+			items: []*campaign.Item{
+				item("issue:1", campaign.ItemStateFailed, nil),
+			},
+			want: campaign.StateFailed,
+		},
+		{
+			// A failed item with a still-RUNNING sibling is not all-terminal, so
+			// the campaign stays running (progress remains in flight).
+			name: "failed alongside running is running",
+			items: []*campaign.Item{
+				item("issue:1", campaign.ItemStateFailed, nil),
+				item("issue:2", campaign.ItemStateRunning, nil),
+			},
+			want: campaign.StateRunning,
 		},
 		{
 			// A paused item is never derived to StatePaused; with a succeeded

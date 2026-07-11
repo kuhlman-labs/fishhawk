@@ -520,6 +520,74 @@ func TestTick_AdvancePath_SettlesAndAdvancesCampaign(t *testing.T) {
 	}
 }
 
+// TestTick_SettleFailed_WithRemainingWork_LeavesCampaignRunning is the #1838
+// quarantine done-means at the auto-driver seam: a tick that settles one item to
+// FAILED while a non-terminal sibling remains (here a dependent blocked on the
+// failed item) re-derives the campaign to RUNNING — the failed item is
+// quarantined, NOT campaign-terminal — so the driver keeps the campaign alive for
+// the operator to restart the failed item. Both settle engines reduce through the
+// same campaign.DeriveState, so this exercises the driver's deriveAndTransition path.
+func TestTick_SettleFailed_WithRemainingWork_LeavesCampaignRunning(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	reader := newFakeRunReader()
+	failedRun := reader.put(run.StateFailed)
+	// issue:7 running, linked to a terminal-failed run → settles failed this tick.
+	it := store.seedItem(c, "issue:7", campaign.ItemStateRunning, nil, &failedRun.ID)
+	// issue:8 depends on the failing item, so it stays blocked (non-terminal) and
+	// is not started — remaining, still-actionable work.
+	store.seedItem(c, "issue:8", campaign.ItemStatePending, []string{"issue:7"}, nil)
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
+
+	tk.Tick(context.Background())
+
+	if it.State != campaign.ItemStateFailed {
+		t.Fatalf("item state = %s, want failed", it.State)
+	}
+	// Quarantine: the failed item alongside a non-terminal sibling keeps the
+	// campaign RUNNING (running→running no-op), NOT failed.
+	if c.State != campaign.StateRunning {
+		t.Fatalf("campaign state = %s, want running (failed item quarantined)", c.State)
+	}
+	for _, tr := range store.campTransitions {
+		if tr.to == campaign.StateFailed {
+			t.Fatalf("campaign transitioned to failed, want no terminal transition while work remains")
+		}
+	}
+}
+
+// TestTick_SettleFailed_AllTerminal_TransitionsCampaignFailed is the anti-over-fix
+// guard at the driver seam: a tick that settles the LAST non-terminal item to
+// failed — leaving every item terminal with at least one failed — still
+// transitions the campaign to FAILED (no actionable work remains).
+func TestTick_SettleFailed_AllTerminal_TransitionsCampaignFailed(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	reader := newFakeRunReader()
+	failedRun := reader.put(run.StateFailed)
+	// issue:7 running, linked to a terminal-failed run → settles failed this tick.
+	it := store.seedItem(c, "issue:7", campaign.ItemStateRunning, nil, &failedRun.ID)
+	// issue:9 already succeeded (terminal) — no run to settle; after issue:7
+	// settles, every item is terminal.
+	store.seedItem(c, "issue:9", campaign.ItemStateSucceeded, nil, nil)
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, &fakeStarter{reader: reader}, au, 4)
+
+	tk.Tick(context.Background())
+
+	if it.State != campaign.ItemStateFailed {
+		t.Fatalf("item state = %s, want failed", it.State)
+	}
+	if c.State != campaign.StateFailed {
+		t.Fatalf("campaign state = %s, want failed (all items terminal, one failed)", c.State)
+	}
+	advanced := au.byCategory(categoryCampaignAdvanced)
+	if len(advanced) != 1 || advanced[0].payload["to"] != string(campaign.StateFailed) {
+		t.Fatalf("advanced audit = %+v, want one running→failed", advanced)
+	}
+}
+
 // --- (f) TERMINAL-STATE MAPPING (one assertion per branch) ------------------
 
 func TestTick_TerminalStateMapping(t *testing.T) {

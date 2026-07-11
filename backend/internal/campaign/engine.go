@@ -31,24 +31,28 @@ type Eligibility struct {
 	Running []string
 	// Done items have succeeded.
 	Done []string
-	// Failed items have failed.
+	// Failed items have failed. A deps-satisfied, non-autonomy:low failed item
+	// is diverted to Restartable (#1838) — it has a forward path via the operator
+	// restart verb; only a genuinely-stuck failed item (deps-unsatisfied or
+	// human-led) remains here.
 	Failed []string
 	// Cancelled items reached the terminal cancelled state. Like Done/Failed
 	// they are never re-dispatched; tracked separately so a cancelled item with
 	// no run and no deps is not mistaken for Eligible.
 	Cancelled []string
-	// Restartable holds cancelled items that a deps-satisfied, non-autonomy:low
-	// DAG position makes eligible for an operator-driven restart via the
-	// fishhawk_start_campaign_item_run verb (#1729). A cancelled item is
-	// terminal for auto-dispatch — it is NEVER in Eligible — but unlike Done/
-	// Failed it has a forward path: the operator verb resets it to pending and
-	// mints a fresh run. It is a DISJOINT partition from Cancelled (a cancelled
-	// item is in exactly one of the two): a cancelled item lands here only when
-	// every dependency has succeeded AND its autonomy tier is not "low"
-	// (human-led work is never auto-surfaced for restart); otherwise it stays in
-	// Cancelled. computeCampaignNextAction surfaces a Restartable item as
-	// start_run; the wire rollup folds it back into the cancelled slice so the
-	// rollup contract is unchanged.
+	// Restartable holds cancelled OR failed items that a deps-satisfied,
+	// non-autonomy:low DAG position makes eligible for an operator-driven restart
+	// via the fishhawk_start_campaign_item_run verb (#1729 cancelled; #1838
+	// failed). A cancelled/failed item is terminal for auto-dispatch — it is
+	// NEVER in Eligible — but unlike Done it has a forward path: the operator verb
+	// resets it to pending and mints a fresh run. It is a DISJOINT partition from
+	// both Cancelled and Failed (each cancelled/failed item is in exactly one of
+	// Restartable vs its terminal slice): an item lands here only when every
+	// dependency has succeeded AND its autonomy tier is not "low" (human-led work
+	// is never auto-surfaced for restart); otherwise it stays in Cancelled/Failed.
+	// computeCampaignNextAction surfaces a Restartable item as start_run; the wire
+	// rollup folds it back into the cancelled slice so the rollup contract is
+	// unchanged.
 	Restartable []string
 	// Paused items were handed off to a human by the auto-driver (E25.7). A
 	// paused item carries a RunID and a non-terminal state, so it must be
@@ -77,6 +81,11 @@ type Eligibility struct {
 // eligible default branch). A deps-satisfied, non-autonomy:low cancelled item
 // is diverted to Restartable instead — still never Eligible (no auto-dispatch)
 // but flagged as restartable via the operator verb (#1729).
+//
+// A failed item is likewise terminal for auto-dispatch (never Eligible), but a
+// deps-satisfied, non-autonomy:low failed item is diverted to Restartable too
+// (#1838) — mirroring the cancelled arm — so its dependents are not blocked
+// forever; a deps-unsatisfied or human-led failed item stays in Failed.
 func NextEligible(items []*Item) Eligibility {
 	var e Eligibility
 
@@ -94,7 +103,19 @@ func NextEligible(items []*Item) Eligibility {
 		ref := it.IssueRef
 		switch {
 		case it.State == ItemStateFailed:
-			e.Failed = append(e.Failed, ref)
+			// Terminal for AUTO-dispatch — a failed item is never Eligible. But,
+			// mirroring the cancelled arm (#1729), a deps-satisfied, non-human-led
+			// failed item has a forward path via the operator restart verb (#1838):
+			// divert it to Restartable so next_action surfaces it as start_run and
+			// its dependents no longer stay blocked forever. A deps-unsatisfied
+			// item, or an autonomy:low (human-led) one, stays in Failed. Exactly one
+			// of Restartable / Failed holds each failed item.
+			switch {
+			case depsSatisfied(it.DependsOn, done) && it.Autonomy != "low":
+				e.Restartable = append(e.Restartable, ref)
+			default:
+				e.Failed = append(e.Failed, ref)
+			}
 		case it.State == ItemStateCancelled:
 			// Terminal: never eligible for AUTO-dispatch, even with no run and no
 			// deps (which would otherwise fall through to the default branch). But
@@ -151,23 +172,40 @@ func depsSatisfied(deps []string, done map[string]bool) bool {
 // DeriveState reduces a campaign's item states to the campaign state. It emits
 // only pending / running / succeeded / failed:
 //   - no items => pending;
-//   - any item failed => failed (a terminal item failure fails the campaign);
 //   - every item succeeded => succeeded;
-//   - any item running, or partial progress (some succeeded, not all) => running;
+//   - any item failed AND every item terminal => failed (a QUARANTINE rule: a
+//     failed item fails the WHOLE campaign only when no forward progress
+//     remains — every item has reached a terminal state; #1838);
+//   - any progress (some running, succeeded, or failed) => running (a failed
+//     item ALONGSIDE pending/eligible/running work keeps the campaign running so
+//     the still-actionable siblings can be driven — the failed item is
+//     quarantined, not campaign-terminal);
 //   - otherwise (all pending, or pending/blocked with no progress) => pending.
+//
+// The quarantine rule (anyFailed && allTerminal -> Failed, otherwise a failed
+// item is progress -> Running) is the #1838 fix: previously a single failed item
+// forced StateFailed unconditionally, driving the whole campaign terminal even
+// while eligible siblings remained — and a terminal campaign refuses every
+// recovery verb, so the failed item could never be restarted. The anti-over-fix
+// guard is the allTerminal conjunct: when NO item remains actionable (every item
+// terminal) and at least one failed, the campaign is genuinely terminal-failed
+// and still derives StateFailed. A single failed item (the whole campaign) is
+// all-terminal, so it still derives Failed.
 //
 // StateCancelled and StatePaused are NOT derived here: they are operator/
 // driver-set overlays (cancel = manual halt; paused = the E25.7 gate hand-off),
 // and no item state implies them. A paused item is treated as
 // non-succeeding/non-failing — it contributes to none of anyFailed/anyRunning/
-// anySucceeded and makes allSucceeded false, exactly like a still-pending item
-// — so derivation never emits StatePaused (the driver overlays it).
+// anySucceeded, is non-terminal (so it keeps allTerminal false), and makes
+// allSucceeded false, exactly like a still-pending item — so derivation never
+// emits StatePaused (the driver overlays it).
 func DeriveState(items []*Item) State {
 	if len(items) == 0 {
 		return StatePending
 	}
 	var anyFailed, anyRunning, anySucceeded bool
 	allSucceeded := true
+	allTerminal := true
 	for _, it := range items {
 		switch it.State {
 		case ItemStateFailed:
@@ -180,17 +218,24 @@ func DeriveState(items []*Item) State {
 		if it.State != ItemStateSucceeded {
 			allSucceeded = false
 		}
+		if !it.State.IsTerminal() {
+			allTerminal = false
+		}
 	}
 	switch {
-	case anyFailed:
-		return StateFailed
 	case allSucceeded:
 		return StateSucceeded
-	case anyRunning || anySucceeded:
-		// Some work is in flight or partially done — the campaign is running.
+	case anyFailed && allTerminal:
+		// Genuine terminal failure: at least one item failed and NO item remains
+		// actionable — the campaign cannot make further progress, so it is failed.
+		return StateFailed
+	case anyRunning || anySucceeded || anyFailed:
+		// Some work is in flight, partially done, OR a failed item sits alongside
+		// still-actionable siblings (pending/eligible/running) — the campaign is
+		// running so those siblings can be driven; the failed item is quarantined.
 		return StateRunning
 	default:
-		// No failure, no progress, nothing running: still pending.
+		// No progress, nothing running/failed: still pending.
 		return StatePending
 	}
 }

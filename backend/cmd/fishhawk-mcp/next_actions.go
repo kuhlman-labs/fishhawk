@@ -1391,19 +1391,23 @@ func reviewVerdictSummary(rs *ReviewStatus) string {
 func campaignNextActionsFor(_ CampaignRollup, na CampaignNextAction) *NextActions {
 	switch na.Action {
 	case "attention":
-		// A campaign item failed terminally (FAILED-wins precedence in
-		// computeCampaignNextAction): the operator must retry or abandon it
-		// before the campaign can proceed. There is no single MCP verb for this
-		// — point at fishhawk_get_run_status on the failed item's run, then
-		// retry-or-abandon by hand.
+		// A campaign item failed and is GENUINELY STUCK (#1838): its dependencies
+		// are unsatisfied or it is human-led, so computeCampaignNextAction left it
+		// in the Failed slice rather than diverting it to Restartable (a
+		// deps-satisfied, non-human-led failed item surfaces as start_run instead,
+		// via fishhawk_start_campaign_item_run). There is no auto-restart forward
+		// path here — point at fishhawk_get_run_status on the failed item's run so
+		// the operator can resolve it manually. NOTE: a stuck failed item no longer
+		// blocks dispatch of still-actionable siblings — start_run/resume outrank
+		// this arm, so attention fires only when nothing else is dispatchable.
 		return &NextActions{
 			State: "campaign_attention",
 			Actions: []SuggestedAction{{
 				Action:       "fishhawk_get_run_status",
 				Params:       map[string]string{"issue_ref": na.IssueRef},
-				Precondition: "a campaign item failed terminally (its issue_ref is on the next_action); resolve the failed run on that item (fishhawk_list_runs / fishhawk_get_run_status) first",
+				Precondition: "a campaign item failed and cannot be auto-restarted (deps-unsatisfied or human-led — a deps-satisfied failed item is surfaced as start_run instead); resolve the failed run on that item (fishhawk_list_runs / fishhawk_get_run_status) first",
 				Consumes:     consumesNone,
-				Reason:       "campaign item " + na.IssueRef + " failed — read its run, then retry the stage or abandon the item before the campaign can advance; a failed item blocks dispatch regardless of other eligible items",
+				Reason:       "campaign item " + na.IssueRef + " failed and is not auto-restartable — read its run and resolve it manually; still-actionable siblings are surfaced first, so this fires only when no eligible/restartable/paused work remains",
 			}},
 		}
 	case "resume":
@@ -1420,16 +1424,19 @@ func campaignNextActionsFor(_ CampaignRollup, na CampaignNextAction) *NextAction
 			}},
 		}
 	case "start_run":
-		// An eligible item's dependencies are satisfied and it has no run yet:
-		// open one with fishhawk_start_run on its issue ref.
+		// A dispatchable campaign item: either an ELIGIBLE item (deps satisfied,
+		// no run yet) or a RESTARTABLE item — a deps-satisfied, non-human-led
+		// CANCELLED (#1729) or FAILED (#1838) item the operator can restart. The
+		// server surfaces both as start_run (computeCampaignNextAction); open a run
+		// on the item's issue ref to advance the campaign.
 		return &NextActions{
 			State: "campaign_start_run",
 			Actions: []SuggestedAction{{
 				Action:       "fishhawk_start_run",
 				Params:       map[string]string{"trigger_ref": na.IssueRef},
-				Precondition: "this campaign item's dependencies are all satisfied (it is in the rollup's eligible slice) and it has no run yet",
+				Precondition: "this campaign item is dispatchable — its dependencies are all satisfied and it has no active run (rollup eligible, or a cancelled/failed item flagged restartable and folded into the wire cancelled slice)",
 				Consumes:     consumesNewRun,
-				Reason:       "dispatch the next eligible campaign item " + na.IssueRef + " — start a run on its issue ref to advance the campaign",
+				Reason:       "dispatch campaign item " + na.IssueRef + " — start a run on its issue ref to advance the campaign (an eligible item starts fresh; a restartable cancelled/failed item is reset and re-run)",
 			}},
 		}
 	case "attend_human_led":

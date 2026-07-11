@@ -1099,24 +1099,28 @@ func TestCreateCampaign_ConventionsError_500(t *testing.T) {
 
 func TestComputeCampaignNextAction_Precedence(t *testing.T) {
 	cases := []struct {
-		name    string
-		elig    campaign.Eligibility
-		want    string
-		wantRef string
+		name               string
+		elig               campaign.Eligibility
+		want               string
+		wantRef            string
+		wantDetailContains string
 	}{
 		{
-			// THE mandated test: FAILED wins over an existing ELIGIBLE item.
-			name:    "failed and eligible both present -> attention",
+			// THE #1838 fix: a stuck FAILED item no longer suppresses an ELIGIBLE
+			// sibling — the eligible item is dispatched first (start_run) so the
+			// campaign keeps making progress while the failed item is quarantined.
+			name:    "failed and eligible both present -> start_run (eligible wins)",
 			elig:    campaign.Eligibility{Failed: []string{"issue:5"}, Eligible: []string{"issue:6"}},
-			want:    "attention",
-			wantRef: "issue:5",
+			want:    "start_run",
+			wantRef: "issue:6",
 		},
 		{
-			// FAILED still wins over a PAUSED item (failed is the strict-first check).
-			name:    "failed and paused both present -> attention",
+			// PAUSED now outranks a stuck FAILED item (#1838 reorder: a gate
+			// hand-off is surfaced before the stuck-failure attention).
+			name:    "failed and paused both present -> resume (paused wins)",
 			elig:    campaign.Eligibility{Failed: []string{"issue:5"}, Paused: []string{"issue:6"}},
-			want:    "attention",
-			wantRef: "issue:5",
+			want:    "resume",
+			wantRef: "issue:6",
 		},
 		{
 			// PAUSED outranks ELIGIBLE: a gate hand-off is surfaced before dispatch.
@@ -1171,11 +1175,13 @@ func TestComputeCampaignNextAction_Precedence(t *testing.T) {
 			wantRef: "issue:20",
 		},
 		{
-			// FAILED still wins over a restartable item (failed is strict-first).
-			name:    "failed and restartable both present -> attention",
+			// A RESTARTABLE item outranks a stuck FAILED item (#1838): the
+			// restartable dispatch is surfaced first so a genuinely-stuck failure
+			// never suppresses still-actionable work.
+			name:    "failed and restartable both present -> start_run (restartable wins)",
 			elig:    campaign.Eligibility{Failed: []string{"issue:5"}, Restartable: []string{"issue:20"}},
-			want:    "attention",
-			wantRef: "issue:5",
+			want:    "start_run",
+			wantRef: "issue:20",
 		},
 		{
 			// attend_human_led fires ONLY when no autonomous item is eligible.
@@ -1200,10 +1206,15 @@ func TestComputeCampaignNextAction_Precedence(t *testing.T) {
 			want: "complete",
 		},
 		{
-			name:    "failed only -> attention",
-			elig:    campaign.Eligibility{Failed: []string{"issue:10"}},
-			want:    "attention",
-			wantRef: "issue:10",
+			// A genuinely-stuck failed item (deps-unsatisfied or human-led, so it
+			// stayed in Failed rather than diverting to Restartable) is the ONLY
+			// case that still surfaces attention — with the honest #1838 detail
+			// that names no verb that refuses (no more "retry or abandon").
+			name:               "failed only -> attention (stuck, honest detail)",
+			elig:               campaign.Eligibility{Failed: []string{"issue:10"}},
+			want:               "attention",
+			wantRef:            "issue:10",
+			wantDetailContains: "cannot be auto-restarted",
 		},
 		{
 			name: "cancelled only -> complete",
@@ -1219,6 +1230,9 @@ func TestComputeCampaignNextAction_Precedence(t *testing.T) {
 			}
 			if tc.wantRef != "" && got.IssueRef != tc.wantRef {
 				t.Errorf("issue_ref = %q, want %q", got.IssueRef, tc.wantRef)
+			}
+			if tc.wantDetailContains != "" && !strings.Contains(got.Detail, tc.wantDetailContains) {
+				t.Errorf("detail = %q, want to contain %q", got.Detail, tc.wantDetailContains)
 			}
 		})
 	}
@@ -1364,9 +1378,13 @@ func TestListCampaignItems_BadUUID_400(t *testing.T) {
 
 func TestGetCampaignStatus_RollupAndNextAction(t *testing.T) {
 	repo := newFakeCampaignRepo()
-	// A failed item alongside an eligible item: next_action must be attention.
+	// A GENUINELY-STUCK failed item (its dependency is unsatisfied, so it stays in
+	// the Failed slice rather than diverting to Restartable) alongside an eligible
+	// sibling: after #1838 the eligible sibling is dispatched FIRST (start_run) —
+	// the stuck failure no longer suppresses actionable work — while the failed
+	// item still surfaces in the rollup's Failed partition.
 	c := repo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
-		{IssueRef: "issue:100", State: campaign.ItemStateFailed},
+		{IssueRef: "issue:100", State: campaign.ItemStateFailed, DependsOn: []string{"issue:999"}},
 		{IssueRef: "issue:101", State: campaign.ItemStatePending},
 	})
 	s := New(Config{CampaignRepo: repo})
@@ -1386,9 +1404,9 @@ func TestGetCampaignStatus_RollupAndNextAction(t *testing.T) {
 	if len(status.Rollup.Failed) != 1 || status.Rollup.Failed[0] != "issue:100" {
 		t.Errorf("rollup.Failed = %v, want [issue:100]", status.Rollup.Failed)
 	}
-	// FAILED wins over the eligible item.
-	if status.NextAction.Action != "attention" || status.NextAction.IssueRef != "issue:100" {
-		t.Errorf("next_action = %+v, want attention issue:100", status.NextAction)
+	// The eligible sibling is dispatched first; the stuck failure is quarantined.
+	if status.NextAction.Action != "start_run" || status.NextAction.IssueRef != "issue:101" {
+		t.Errorf("next_action = %+v, want start_run issue:101", status.NextAction)
 	}
 }
 
@@ -2260,10 +2278,17 @@ func TestStartCampaignItemRun_ReconcileOnRead_SettlesAndAdvances_E2E(t *testing.
 	}
 }
 
-// TestStartCampaignItemRun_ReconcileOnRead_FailedRun_Attention_E2E asserts a
-// failed linked run settles the item failed and the campaign derives to failed
-// with next_action attention.
-func TestStartCampaignItemRun_ReconcileOnRead_FailedRun_Attention_E2E(t *testing.T) {
+// TestStartCampaignItemRun_ReconcileOnRead_FailedRun_TerminalFailed_E2E asserts
+// the #1838 anti-over-fix guard at the reconcile seam: a SINGLE-item campaign
+// whose only linked run fails settles the item failed and the campaign derives
+// to FAILED (all items terminal, at least one failed — genuinely terminal). The
+// dispatched-then-failed item is deps-satisfied and non-human-led, so NextEligible
+// diverts it to Restartable (folded into the wire cancelled slice), and
+// next_action surfaces start_run. NOTE the residual: the campaign is terminal, so
+// handleStartCampaignItemRun would refuse the restart (campaign_not_startable) —
+// flagged as a known single-item/all-terminal limitation (see PR Notes). The
+// multi-item quarantine done-means is covered by the _Quarantine_ e2e below.
+func TestStartCampaignItemRun_ReconcileOnRead_FailedRun_TerminalFailed_E2E(t *testing.T) {
 	crepo := newFakeCampaignRepo()
 	s, rrepo, aud := newCampaignStartServer(t, crepo)
 	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
@@ -2281,17 +2306,69 @@ func TestStartCampaignItemRun_ReconcileOnRead_FailedRun_Attention_E2E(t *testing
 		t.Fatalf("flip run failed: %v", err)
 	}
 	st := getCampaignStatusBody(t, s, c.ID)
-	if len(st.Rollup.Failed) != 1 || st.Rollup.Failed[0] != "issue:100" {
-		t.Errorf("rollup.Failed = %v, want [issue:100]", st.Rollup.Failed)
-	}
-	if st.NextAction.Action != "attention" || st.NextAction.IssueRef != "issue:100" {
-		t.Errorf("next_action = %+v, want attention issue:100", st.NextAction)
-	}
+	// The single all-terminal failed item drives the campaign genuinely failed
+	// (the anti-over-fix guard — no actionable sibling remains).
 	if st.Campaign.State != string(campaign.StateFailed) {
-		t.Errorf("campaign state = %q, want failed", st.Campaign.State)
+		t.Errorf("campaign state = %q, want failed (single all-terminal failed item)", st.Campaign.State)
+	}
+	// The failed item is restartable (deps-satisfied, non-human-led), so it is NOT
+	// in the Failed rollup slice — it is folded into the wire cancelled slice.
+	if len(st.Rollup.Failed) != 0 {
+		t.Errorf("rollup.Failed = %v, want [] (restartable item folded into cancelled)", st.Rollup.Failed)
+	}
+	if len(st.Rollup.Cancelled) != 1 || st.Rollup.Cancelled[0] != "issue:100" {
+		t.Errorf("rollup.Cancelled = %v, want [issue:100] (restartable folded)", st.Rollup.Cancelled)
+	}
+	if st.NextAction.Action != "start_run" || st.NextAction.IssueRef != "issue:100" {
+		t.Errorf("next_action = %+v, want start_run issue:100 (restartable)", st.NextAction)
 	}
 	if n := aud.count("campaign_advanced"); n < 1 {
 		t.Errorf("campaign_advanced count = %d, want >=1 (running→failed)", n)
+	}
+}
+
+// TestStartCampaignItemRun_ReconcileOnRead_FailedRun_Quarantine_E2E is the #1838
+// PRIMARY done-means at the engine->reconcile-on-read->status seam: a multi-item
+// campaign where one linked run FAILS while an independent sibling is still
+// eligible reconciles to a RUNNING campaign (the failed item is quarantined, not
+// campaign-terminal) with next_action start_run on the still-actionable sibling —
+// so the failed item no longer drives the whole campaign terminal.
+func TestStartCampaignItemRun_ReconcileOnRead_FailedRun_Quarantine_E2E(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, aud := newCampaignStartServer(t, crepo)
+	// issue:100 is dispatched and will fail; issue:101 is an independent pending
+	// item (no deps) that stays eligible throughout.
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+		cItem("issue:101", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("start status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var body startItemRunBody
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	if _, err := rrepo.TransitionRun(context.Background(), body.Run.ID, run.StateFailed); err != nil {
+		t.Fatalf("flip run failed: %v", err)
+	}
+	st := getCampaignStatusBody(t, s, c.ID)
+	// Quarantine: the failed item alongside an eligible sibling keeps the campaign
+	// RUNNING (NOT failed) so the sibling can still be driven.
+	if st.Campaign.State != string(campaign.StateRunning) {
+		t.Errorf("campaign state = %q, want running (failed item quarantined, sibling still eligible)", st.Campaign.State)
+	}
+	if len(st.Rollup.Eligible) != 1 || st.Rollup.Eligible[0] != "issue:101" {
+		t.Errorf("rollup.Eligible = %v, want [issue:101]", st.Rollup.Eligible)
+	}
+	// next_action dispatches the still-eligible sibling — a restartable failed item
+	// (issue:100) is outranked by the fresh eligible one (issue:101).
+	if st.NextAction.Action != "start_run" || st.NextAction.IssueRef != "issue:101" {
+		t.Errorf("next_action = %+v, want start_run issue:101 (eligible sibling)", st.NextAction)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 1 {
+		t.Errorf("campaign_issue_settled count = %d, want 1", n)
 	}
 }
 
@@ -2641,7 +2718,10 @@ func TestReconcileOnRead_FailedRun_RecoveryInFlight_LeavesRunning(t *testing.T) 
 // TestReconcileOnRead_FailedRun_RecoveryAlsoFailed_StaysFailed is the
 // regression guard: a failed run whose newest terminal recovery descendant also
 // failed (no in-flight child) settles FAILED, exactly as today, and the
-// campaign derives failed with next_action attention.
+// single-item campaign derives failed (the #1838 anti-over-fix guard — no
+// actionable sibling remains). The settled item is deps-satisfied and
+// non-human-led, so it is restartable (folded into the wire cancelled slice) and
+// next_action is start_run.
 func TestReconcileOnRead_FailedRun_RecoveryAlsoFailed_StaysFailed(t *testing.T) {
 	crepo := newFakeCampaignRepo()
 	s, rrepo, aud := newCampaignStartServer(t, crepo)
@@ -2650,14 +2730,17 @@ func TestReconcileOnRead_FailedRun_RecoveryAlsoFailed_StaysFailed(t *testing.T) 
 	child := seedRecoveryChild(t, rrepo, failedRunID, run.StateFailed)
 
 	st := getCampaignStatusBody(t, s, c.ID)
-	if len(st.Rollup.Failed) != 1 || st.Rollup.Failed[0] != "issue:100" {
-		t.Errorf("rollup.Failed = %v, want [issue:100]", st.Rollup.Failed)
+	if len(st.Rollup.Failed) != 0 {
+		t.Errorf("rollup.Failed = %v, want [] (restartable item folded into cancelled)", st.Rollup.Failed)
+	}
+	if len(st.Rollup.Cancelled) != 1 || st.Rollup.Cancelled[0] != "issue:100" {
+		t.Errorf("rollup.Cancelled = %v, want [issue:100] (restartable folded)", st.Rollup.Cancelled)
 	}
 	if st.Campaign.State != string(campaign.StateFailed) {
 		t.Errorf("campaign state = %q, want failed", st.Campaign.State)
 	}
-	if st.NextAction.Action != "attention" {
-		t.Errorf("next_action = %+v, want attention", st.NextAction)
+	if st.NextAction.Action != "start_run" {
+		t.Errorf("next_action = %+v, want start_run (restartable item)", st.NextAction)
 	}
 	// Settled off — and re-linked to — the newest terminal recovery descendant.
 	if st.Items[0].RunID == nil || *st.Items[0].RunID != child.ID {
@@ -2681,8 +2764,14 @@ func TestReconcileOnRead_FailedRun_RecoveryListError_SettlesFailed(t *testing.T)
 	rrepo.listErr = errInjected // recovery-descendant walk errors
 
 	st := getCampaignStatusBody(t, s, c.ID) // asserts 200 internally
-	if len(st.Rollup.Failed) != 1 || st.Rollup.Failed[0] != "issue:100" {
-		t.Errorf("rollup.Failed = %v, want [issue:100] (fell back to failed settle)", st.Rollup.Failed)
+	// The item settled off the failed run (fell back to today's failed settle);
+	// being deps-satisfied + non-human-led it is restartable, folded into the wire
+	// cancelled slice, and the single-item campaign derives failed.
+	if len(st.Rollup.Failed) != 0 {
+		t.Errorf("rollup.Failed = %v, want [] (restartable item folded into cancelled)", st.Rollup.Failed)
+	}
+	if len(st.Rollup.Cancelled) != 1 || st.Rollup.Cancelled[0] != "issue:100" {
+		t.Errorf("rollup.Cancelled = %v, want [issue:100] (restartable folded)", st.Rollup.Cancelled)
 	}
 	if st.Campaign.State != string(campaign.StateFailed) {
 		t.Errorf("campaign state = %q, want failed", st.Campaign.State)
