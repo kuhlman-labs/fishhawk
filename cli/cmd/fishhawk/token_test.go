@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -424,6 +426,44 @@ func TestTokenList_Populated(t *testing.T) {
 	// The bare token secret must never be printed.
 	if strings.Contains(out, "fhk_a") {
 		t.Errorf("token list leaked the bearer secret: %s", out)
+	}
+}
+
+// TestTokenList_RendersStoredSubject is the CLI render pin (binding
+// approval condition): it seeds the credential store from a RAW JSON fixture
+// that references the literal "subject" key — the same key the backend
+// mint-response test asserts — then runs `token list` and requires the
+// subject to render, not the `-` placeholder. Writing the fixture as raw JSON
+// (rather than a credstore.Credential struct) means a rename of the CLI
+// decode tag would leave the subject empty and fail this test, keeping the
+// key aligned across the mint-response -> credstore -> list-output round-trip.
+func TestTokenList_RendersStoredSubject(t *testing.T) {
+	xdg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+
+	dir := filepath.Join(xdg, "fishhawk")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Raw fixture: the store file is a map of backend URL -> credential,
+	// and the credential carries the literal "subject" JSON key.
+	fixture := `{"http://localhost:8080":{"token":"fhk_a","subject":"github:carol","provider":"github"}}`
+	if err := os.WriteFile(filepath.Join(dir, "credentials"), []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "list"}, &stdout, &stderr)
+	if code != exitOK {
+		t.Fatalf("exit = %d, want %d; stderr=%s", code, exitOK, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "github:carol") {
+		t.Errorf("token list did not render the stored subject: %s", out)
+	}
+	// The subject must render, not the empty-value dash placeholder.
+	if strings.Contains(out, "subject: -") {
+		t.Errorf("token list rendered a dash instead of the subject: %s", out)
 	}
 }
 

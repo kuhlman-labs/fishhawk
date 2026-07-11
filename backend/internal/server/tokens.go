@@ -224,6 +224,13 @@ type apiTokenResponse struct {
 	// byte-identically to before, and a static token omits Provider.
 	AuthMethod string `json:"auth_method,omitempty"`
 	Provider   string `json:"provider,omitempty"`
+	// Subject is the provider-qualified identity the token is bound to
+	// (e.g. "github:octocat"), the verified subject stamped at issue time.
+	// Surfacing it on the mint 201 lets `fishhawk token login` / `token
+	// list` show the operator which identity they authenticated as (#1755).
+	// omitempty preserves byte-identical projection for a legacy row whose
+	// subject is empty.
+	Subject string `json:"subject,omitempty"`
 }
 
 // apiTokenCreatedResponse is the 201 body for POST /v0/tokens. The
@@ -243,6 +250,7 @@ func toTokenResponse(t *apitoken.Token) apiTokenResponse {
 		RevokedAt:  t.RevokedAt,
 		AuthMethod: t.AuthMethod,
 		Provider:   t.Provider,
+		Subject:    t.Subject,
 	}
 }
 
