@@ -195,42 +195,39 @@ func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 }
 
 // computeCampaignNextAction distills the rollup partition into the single
-// next step for the operator-agent. PRECEDENCE is FAILED-wins and STRICT,
-// in this order:
+// next step for the operator-agent. PRECEDENCE is FORWARD-PROGRESS-first and
+// STRICT, in this order (#1838 reordered this so a failed item no longer
+// suppresses sibling dispatch):
 //
-//  1. any failed item -> "attention" on the first failed ref. A terminal
-//     item failure forces operator attention (retry/abandon) REGARDLESS of
-//     whether eligible items also exist — this check is FIRST and
-//     unconditional, with NO "start_run whenever eligible is non-empty"
-//     short-circuit ahead of it.
-//  2. else any paused item -> "resume" on the first paused ref. The
-//     auto-driver handed a gate off to a human (E25.7); the campaign is
-//     stalled until the gate is handled and the operator resumes it. Ranked
-//     above start_run so a paused hand-off is surfaced before new dispatch.
-//  3. else any eligible (autonomous) item -> "start_run" on the first eligible
-//     ref. start_run WINS over attend_human_led: whenever ANY autonomous item
-//     is dispatchable it is surfaced first, so a human-led item never stalls
-//     DAG-independent autonomous work.
-//  4. else any restartable (cancelled, deps-satisfied, non-human-led) item ->
-//     "start_run" on the first restartable ref. A cancelled item with a
-//     satisfied DAG position has a forward path via the operator restart verb
-//     (#1729): surfaced as start_run so dependents no longer stay blocked
-//     forever. Ranked below Eligible (a fresh unstarted item is preferred over
-//     a restart) and above HumanLed.
-//  5. else any human-led item -> "attend_human_led" on the first human-led ref.
+//  1. any paused item -> "resume" on the first paused ref. The auto-driver
+//     handed a gate off to a human (E25.7); the campaign is stalled until the
+//     gate is handled and the operator resumes it. Ranked first so a paused
+//     hand-off is surfaced before new dispatch.
+//  2. else any eligible (autonomous) item -> "start_run" on the first eligible
+//     ref. start_run WINS over attend_human_led AND over a stuck failed item:
+//     whenever ANY autonomous item is dispatchable it is surfaced first, so a
+//     failed or human-led item never stalls DAG-independent autonomous work
+//     (#1838: a quarantined failed item leaves its eligible siblings dispatchable).
+//  3. else any restartable (cancelled OR failed, deps-satisfied, non-human-led)
+//     item -> "start_run" on the first restartable ref. A cancelled (#1729) or
+//     failed (#1838) item with a satisfied DAG position has a forward path via
+//     the operator restart verb: surfaced as start_run so dependents no longer
+//     stay blocked forever. Ranked below Eligible (a fresh unstarted item is
+//     preferred over a restart) and above HumanLed.
+//  4. else any human-led item -> "attend_human_led" on the first human-led ref.
 //     Fires ONLY when len(Eligible)==0 && len(Restartable)==0 && len(HumanLed)>0
 //     — every deps-satisfied item that remains is autonomy:low, reserved for
 //     human leadership, so the operator (not an auto-driver) must pick it up.
+//  5. else any failed item -> "attention" on the first failed ref. Only a
+//     GENUINELY-STUCK failed item reaches here — deps-unsatisfied or human-led,
+//     so NextEligible left it in Failed rather than diverting it to Restartable
+//     (#1838). It cannot be auto-restarted (no satisfied forward path), so the
+//     operator must resolve its run manually. Ranked below the dispatch arms so a
+//     stuck failure never suppresses still-actionable sibling work.
 //  6. else any running or blocked item -> "wait".
 //  7. else (every item terminal done/cancelled) -> "complete".
 func computeCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload {
 	switch {
-	case len(e.Failed) > 0:
-		return campaignNextActionPayload{
-			Action:   "attention",
-			IssueRef: e.Failed[0],
-			Detail:   "a campaign item failed; retry or abandon it before the campaign can proceed",
-		}
 	case len(e.Paused) > 0:
 		return campaignNextActionPayload{
 			Action:   "resume",
@@ -247,13 +244,19 @@ func computeCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload
 		return campaignNextActionPayload{
 			Action:   "start_run",
 			IssueRef: e.Restartable[0],
-			Detail:   "this item was cancelled but its dependencies are satisfied; restart it to unblock its dependents",
+			Detail:   "this item was cancelled or failed but its dependencies are satisfied; restart it via fishhawk_start_campaign_item_run to unblock its dependents",
 		}
 	case len(e.HumanLed) > 0:
 		return campaignNextActionPayload{
 			Action:   "attend_human_led",
 			IssueRef: e.HumanLed[0],
 			Detail:   "this item's dependencies are satisfied but it is autonomy:low (human-led); a human must lead it — do not dispatch an agent run",
+		}
+	case len(e.Failed) > 0:
+		return campaignNextActionPayload{
+			Action:   "attention",
+			IssueRef: e.Failed[0],
+			Detail:   "a campaign item failed and cannot be auto-restarted (its dependencies are unsatisfied or it is human-led); resolve its run manually before the campaign can proceed",
 		}
 	case len(e.Running) > 0 || len(e.Blocked) > 0:
 		return campaignNextActionPayload{
@@ -965,9 +968,11 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 	// DAG gate: refuse unless the item is eligible OR restartable per the pure
 	// engine. On refusal, name the precise blocker — the first unmet dependency
 	// for a blocked item, otherwise the item's current state — so the
-	// operator-agent knows what to wait on. Restartable (#1729) admits a
-	// deps-satisfied, non-human-led CANCELLED item: it has no eligible forward
-	// path (a cancelled item is terminal) but the operator verb resets it.
+	// operator-agent knows what to wait on. Restartable admits a deps-satisfied,
+	// non-human-led CANCELLED (#1729) or FAILED (#1838) item: it has no eligible
+	// forward path (cancelled/failed is terminal for auto-dispatch) but the
+	// operator verb resets it. RestartCampaignItem accepts both from-states
+	// (postgres.go).
 	elig := campaign.NextEligible(items)
 	isRestartable := containsRef(elig.Restartable, req.IssueRef)
 	if !containsRef(elig.Eligible, req.IssueRef) && !isRestartable {
@@ -994,8 +999,8 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Restart path (#1729): reset the restartable cancelled item back to pending,
-	// clearing its stale run link, BEFORE the mint/link/transition flow — which
+	// Restart path (#1729 cancelled / #1838 failed): reset the restartable item
+	// back to pending, clearing its stale run link, BEFORE the mint/link/transition flow — which
 	// then runs unchanged over the now-pending item. The reset is atomic under
 	// the repo's FOR UPDATE lock; capture the prior run/state for the restart
 	// audit before RestartCampaignItem clears them.
