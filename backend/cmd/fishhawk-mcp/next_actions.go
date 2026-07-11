@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -1388,7 +1389,7 @@ func reviewVerdictSummary(rs *ReviewStatus) string {
 // "complete" arm returns nil actions; every other arm — including the
 // unknown-action fallback — carries at least one entry, the same structural
 // guarantee nextActionsFor upholds for runs.
-func campaignNextActionsFor(_ CampaignRollup, na CampaignNextAction) *NextActions {
+func campaignNextActionsFor(rollup CampaignRollup, na CampaignNextAction) *NextActions {
 	switch na.Action {
 	case "attention":
 		// A campaign item failed and is GENUINELY STUCK (#1838): its dependencies
@@ -1424,19 +1425,43 @@ func campaignNextActionsFor(_ CampaignRollup, na CampaignNextAction) *NextAction
 			}},
 		}
 	case "start_run":
-		// A dispatchable campaign item: either an ELIGIBLE item (deps satisfied,
-		// no run yet) or a RESTARTABLE item — a deps-satisfied, non-human-led
-		// CANCELLED (#1729) or FAILED (#1838) item the operator can restart. The
-		// server surfaces both as start_run (computeCampaignNextAction); open a run
-		// on the item's issue ref to advance the campaign.
+		// A dispatchable campaign item, surfaced by the server as start_run for
+		// BOTH an ELIGIBLE item (deps satisfied, no run yet) and a RESTARTABLE
+		// item — a deps-satisfied, non-human-led CANCELLED (#1729) or FAILED
+		// (#1838) item the operator can restart. The two need DIFFERENT verbs, so
+		// the arm splits on the rollup: restartable items are folded into the wire
+		// cancelled slice (toCampaignRollupPayload appends Restartable onto
+		// Cancelled), so an item in rollup.Cancelled is the restart path and one in
+		// rollup.Eligible is a fresh start.
+		//
+		// A restartable item MUST use fishhawk_start_campaign_item_run — the ONLY
+		// verb that reaches the restart handler (handleStartCampaignItemRun), which
+		// resets the item to pending and mints a fresh, re-linked run. The generic
+		// fishhawk_start_run never restarts a failed/cancelled item, so the #1838
+		// failed-item recovery path depends on the campaign-item verb here. A fresh
+		// ELIGIBLE item keeps the established fishhawk_start_run (pinned by
+		// campaign_test.go): there is no item to restart, so a plain run on the
+		// issue ref advances the campaign.
+		if slices.Contains(rollup.Cancelled, na.IssueRef) {
+			return &NextActions{
+				State: "campaign_start_run",
+				Actions: []SuggestedAction{{
+					Action:       "fishhawk_start_campaign_item_run",
+					Params:       map[string]string{"issue_ref": na.IssueRef},
+					Precondition: "this campaign item is a deps-satisfied, non-human-led cancelled/failed item flagged restartable (folded into the wire cancelled slice); pass the campaign_id and workflow_id fishhawk_start_campaign_item_run requires",
+					Consumes:     consumesNewRun,
+					Reason:       "restart campaign item " + na.IssueRef + " — fishhawk_start_campaign_item_run resets the deps-satisfied cancelled/failed item and mints a fresh, re-linked run through the restart handler (#1729/#1838) so its dependents no longer stay blocked; the generic fishhawk_start_run would neither restart nor link it",
+				}},
+			}
+		}
 		return &NextActions{
 			State: "campaign_start_run",
 			Actions: []SuggestedAction{{
 				Action:       "fishhawk_start_run",
 				Params:       map[string]string{"trigger_ref": na.IssueRef},
-				Precondition: "this campaign item is dispatchable — its dependencies are all satisfied and it has no active run (rollup eligible, or a cancelled/failed item flagged restartable and folded into the wire cancelled slice)",
+				Precondition: "this campaign item is eligible — its dependencies are all satisfied and it has no run yet (rollup eligible)",
 				Consumes:     consumesNewRun,
-				Reason:       "dispatch campaign item " + na.IssueRef + " — start a run on its issue ref to advance the campaign (an eligible item starts fresh; a restartable cancelled/failed item is reset and re-run)",
+				Reason:       "dispatch campaign item " + na.IssueRef + " — start a fresh run on its issue ref to advance the campaign",
 			}},
 		}
 	case "attend_human_led":

@@ -1137,6 +1137,11 @@ func TestCampaignNextActionsFor_Resume(t *testing.T) {
 	}
 }
 
+// TestCampaignNextActionsFor_StartRun asserts a FRESH ELIGIBLE campaign item
+// (in the rollup's eligible slice, no run yet) keeps the established
+// fishhawk_start_run dispatch verb — there is no item to restart, so a plain run
+// on the issue ref advances the campaign. The restart verb is reserved for the
+// restartable path (TestCampaignNextActionsFor_StartRun_Restartable).
 func TestCampaignNextActionsFor_StartRun(t *testing.T) {
 	na := campaignNextActionsFor(CampaignRollup{Eligible: []string{"#26"}}, caNextAction("start_run", "#26"))
 	if na.State != "campaign_start_run" {
@@ -1154,13 +1159,17 @@ func TestCampaignNextActionsFor_StartRun(t *testing.T) {
 	}
 }
 
-// TestCampaignNextActionsFor_StartRun_Restartable asserts the SAME start_run arm
-// serves a restartable failed/cancelled item (server-side computeCampaignNextAction
-// surfaces both eligible and restartable as start_run, #1838) — it carries a
-// non-empty dispatch action on the item's ref, upholding the "never unclassified"
-// invariant for a restartable next_action.
+// TestCampaignNextActionsFor_StartRun_Restartable asserts a RESTARTABLE
+// failed/cancelled item (server-side computeCampaignNextAction surfaces both
+// eligible and restartable as start_run, #1729/#1838) surfaces
+// fishhawk_start_campaign_item_run — the ONLY verb that reaches the restart
+// handler (handleStartCampaignItemRun) which resets the item and mints a fresh
+// re-linked run. The generic fishhawk_start_run neither restarts nor links, so a
+// test asserting it would pass while the advertised failed-item recovery path
+// stays unexercised.
 func TestCampaignNextActionsFor_StartRun_Restartable(t *testing.T) {
-	// Restartable items are folded into the wire cancelled slice.
+	// Restartable items are folded into the wire cancelled slice
+	// (toCampaignRollupPayload).
 	na := campaignNextActionsFor(CampaignRollup{Cancelled: []string{"#40"}}, caNextAction("start_run", "#40"))
 	if na.State != "campaign_start_run" {
 		t.Errorf("State = %q, want campaign_start_run", na.State)
@@ -1169,11 +1178,19 @@ func TestCampaignNextActionsFor_StartRun_Restartable(t *testing.T) {
 		t.Fatal("start_run must carry at least one action")
 	}
 	got := na.Actions[0]
-	if got.Action != "fishhawk_start_run" {
-		t.Errorf("action = %q, want fishhawk_start_run", got.Action)
+	if got.Action != "fishhawk_start_campaign_item_run" {
+		t.Errorf("action = %q, want fishhawk_start_campaign_item_run — the verb that reaches the restart handler", got.Action)
 	}
-	if got.Params["trigger_ref"] != "#40" {
-		t.Errorf("trigger_ref param = %q, want #40", got.Params["trigger_ref"])
+	if got.Action == "fishhawk_start_run" {
+		t.Error("a restartable failed item must NOT surface the generic fishhawk_start_run — it never reaches the restart handler")
+	}
+	if got.Params["issue_ref"] != "#40" {
+		t.Errorf("issue_ref param = %q, want #40", got.Params["issue_ref"])
+	}
+	// The reason must name the restart path (this is the wire cancelled slice, so
+	// the classifier distinguishes it from a fresh eligible start via the rollup).
+	if !strings.Contains(got.Reason, "restart") {
+		t.Errorf("reason = %q, want it to name the restart path for a restartable item", got.Reason)
 	}
 }
 
