@@ -669,7 +669,7 @@ func TestStripUnknownClarificationProps(t *testing.T) {
 			"extra_b":             "y",
 		}
 		m["questions"] = append(m["questions"].([]any), q1)
-		_, warnings, err := plan.StripUnknownClarificationProps(marshal(t, m))
+		out, warnings, err := plan.StripUnknownClarificationProps(marshal(t, m))
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -682,6 +682,21 @@ func TestStripUnknownClarificationProps(t *testing.T) {
 		}
 		if !strings.Contains(joined, "extra_b") || !strings.Contains(joined, "question index 1") {
 			t.Errorf("missing index-labelled warning for extra_b: %v", warnings)
+		}
+		// The returned bytes must have BOTH unknown props actually deleted, not
+		// merely warned about — a strict decode rejects any that survived, and we
+		// re-read each question to prove the deletion is per-question (both q0's
+		// extra_a and q1's extra_b gone, declared fields on both preserved).
+		var got clarRequest
+		strictDecode(t, out, &got)
+		if len(got.Questions) != 2 {
+			t.Fatalf("want 2 questions, got %d", len(got.Questions))
+		}
+		if got.Questions[0].ID != "auth-backend" || got.Questions[0].Question != "Which auth backend?" {
+			t.Errorf("q0 declared fields not preserved after strip: %+v", got.Questions[0])
+		}
+		if got.Questions[1].Question != "Second?" || got.Questions[1].RecommendedDefault != "b" {
+			t.Errorf("q1 declared fields not preserved after strip: %+v", got.Questions[1])
 		}
 	})
 
