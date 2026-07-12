@@ -170,6 +170,7 @@ var KnownCategories = map[string]struct{}{
 	"stage_retried":                           {},
 	"status_comment_posted":                   {},
 	"trace_uploaded":                          {},
+	"unpriced_model_alert":                    {},
 	"work_item_filed":                         {},
 	"work_item_transitioned":                  {},
 }

@@ -35,6 +35,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spendalert"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/unpricedmodel"
 	"github.com/kuhlman-labs/fishhawk/pricing"
 )
 
@@ -1562,6 +1563,13 @@ func (s *Server) recordCost(ctx context.Context, runID, stageID uuid.UUID, bundl
 	// Warn-only: it never gates the upload.
 	s.checkSpendAlert(ctx, runID, stageID, rec.Model)
 
+	// Ground-truth pricing-coverage check (#1870). The cost_recorded entry
+	// carries known_model/known_usage; re-read the recent ledger and warn
+	// (once per window) if any dispatched model is unpriced or reported no
+	// usage. Warn-only, best-effort, exactly like checkSpendAlert: it never
+	// gates the upload.
+	s.checkUnpricedModel(ctx, runID, stageID, rec.Model)
+
 	recorder, ok := s.cfg.RunRepo.(runCostRecorder)
 	if !ok {
 		return
@@ -1823,6 +1831,129 @@ func (s *Server) checkSpendAlert(ctx context.Context, runID, stageID uuid.UUID, 
 	}); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"spend alert: append spend_alert audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
+}
+
+// checkUnpricedModel reads the recent cost_recorded audit history across
+// all runs and emits a warn-only unpriced_model_alert when a dispatched
+// model recorded a cost row it could not price — either the model id was
+// absent from the pricing table (known_model=false) or the backend
+// reported no usable usage (known_usage=false) (#1870). Per ADR-044 the
+// pricing table stays human-authoritative — this alarms, it never
+// auto-prices.
+//
+// It is warn-only and best-effort throughout, identical in posture to
+// checkSpendAlert: the trace upload is already stored, audited, and
+// cost-recorded by the time this runs, so a ListAll failure (samples OR
+// prior-alert read) or an AppendChained failure all log at WARN and
+// return — never propagated, never unwinding the cost_recorded append or
+// the upload.
+//
+// The ListAll -> Evaluate -> AppendChained sequence is deliberately NOT
+// serialized or locked: the dedup against prior unpriced_model_alert
+// entries is noise-reduction, not a correctness invariant, so a rare
+// duplicate warn-only alert under two concurrent recordCost calls is
+// acceptable noise (mirrors checkSpendAlert's un-serialized best-effort
+// shape). triggeringModel is the model of the bundle that drove this
+// check; it's recorded on the alert for operator context.
+func (s *Server) checkUnpricedModel(ctx context.Context, runID, stageID uuid.UUID, triggeringModel string) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+
+	costCategory := "cost_recorded"
+	costEntries, err := s.cfg.AuditRepo.ListAll(ctx, audit.ListAllParams{Category: &costCategory})
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"unpriced model: list cost_recorded entries failed — skipping check",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+
+	samples := make([]unpricedmodel.Sample, 0, len(costEntries))
+	for _, e := range costEntries {
+		var p struct {
+			Model      string `json:"model"`
+			KnownModel bool   `json:"known_model"`
+			KnownUsage bool   `json:"known_usage"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			continue
+		}
+		samples = append(samples, unpricedmodel.Sample{
+			Time:       e.Timestamp,
+			Model:      p.Model,
+			KnownModel: p.KnownModel,
+			KnownUsage: p.KnownUsage,
+		})
+	}
+
+	// Prior alerts feed the once-per-window dedup: expand each prior
+	// unpriced_model_alert payload's unpriced_models / unknown_usage_models
+	// arrays into one Alert per model id at the entry's timestamp.
+	alertCategory := "unpriced_model_alert"
+	alertEntries, err := s.cfg.AuditRepo.ListAll(ctx, audit.ListAllParams{Category: &alertCategory})
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"unpriced model: list unpriced_model_alert entries failed — skipping check",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+
+	var priorAlerts []unpricedmodel.Alert
+	for _, e := range alertEntries {
+		var p struct {
+			UnpricedModels     []string `json:"unpriced_models"`
+			UnknownUsageModels []string `json:"unknown_usage_models"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			continue
+		}
+		for _, m := range p.UnpricedModels {
+			priorAlerts = append(priorAlerts, unpricedmodel.Alert{Time: e.Timestamp, Model: m})
+		}
+		for _, m := range p.UnknownUsageModels {
+			priorAlerts = append(priorAlerts, unpricedmodel.Alert{Time: e.Timestamp, Model: m})
+		}
+	}
+
+	d := unpricedmodel.Evaluate(samples, priorAlerts, s.nowFunc().UTC(), unpricedmodel.Window)
+	if !d.Tripped {
+		return
+	}
+
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+		"unpriced model: dispatched model(s) recorded uncosted rows",
+		slog.String("run_id", runID.String()),
+		slog.Any("unpriced_models", d.UnpricedModels),
+		slog.Any("unknown_usage_models", d.UnknownUsageModels),
+		slog.String("triggering_model", triggeringModel))
+
+	modelCount := len(d.UnpricedModels) + len(d.UnknownUsageModels)
+	payload, _ := json.Marshal(map[string]any{
+		"unpriced_models":      d.UnpricedModels,
+		"unknown_usage_models": d.UnknownUsageModels,
+		"model_count":          modelCount,
+		"triggering_model":     triggeringModel,
+		"window_start":         d.WindowStart.Format(time.RFC3339),
+		"window_hours":         d.Window.Hours(),
+	})
+	systemKind := audit.ActorKind("system")
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: s.nowFunc().UTC(),
+		Category:  "unpriced_model_alert",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"unpriced model: append unpriced_model_alert audit entry failed",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
