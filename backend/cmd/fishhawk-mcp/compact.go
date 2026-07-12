@@ -93,14 +93,26 @@ func compactValue(v any, dropIssueContext, dropReviewProse bool) any {
 // auditPayloadStringCap is the default byte cap on a single string value in a
 // recent_audit entry's payload. A value longer than this is truncated by
 // truncateAuditPayloadStrings on the compact-by-default get_run_status path
-// (#1749): post-#1727/#1744 the surviving payload objects (untruncated) are the
-// residual bulk that dominates the default response. Sized to keep the
-// audit_limit=10 default snapshot under the ~7KB done-means target (the
+// (#1749): post-#1727/#1744 the oversized free-text payload strings (a review
+// free_form, an issue body/comment, a routed-concern note) are the residual
+// per-entry bulk this lever removes. Sized to keep the audit_limit=10 default
+// snapshot under the ~7KB done-means target (the
 // TestGetRunStatus_CompactDefault_UnderSizeBudget backstop); lowered from the
-// initial ~256 so the representative fixture clears the target. The full,
+// initial ~256, then to 96, to bite harder on genuine prose payloads. The full,
 // untruncated value always remains available via fishhawk_list_audit and is
 // restored on get_run_status by include_audit_hashes.
-const auditPayloadStringCap = 160
+//
+// NOTE (scope boundary): this cap only shrinks oversized *string* values. A
+// run whose recent 10 audit entries are small-payload structural categories
+// (cost_recorded, trace_uploaded, policy_evaluated, *_precheck/_sweep) carries
+// almost no cappable string bulk, so its default response floor is set by (a)
+// the retained operator-playbook non-audit fields (next_actions, stages,
+// drive_status, cache_efficiency, cost, budget — ~6.5KB, retained by the
+// compaction contract) plus (b) the irreducible per-entry audit structure
+// (id/run_id/ts/sequence/actor ≈ 280B/entry). Those two floors are outside the
+// recent_audit-string remit, so on such a run no cap value reaches ~7KB;
+// compacting them is a separate follow-up (see #1749 acceptance notes).
+const auditPayloadStringCap = 96
 
 // truncateAuditPayloadStrings returns a copy of a decoded-JSON audit payload
 // with every oversized string value truncated to a rune-safe prefix plus a
