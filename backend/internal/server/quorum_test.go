@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/google/uuid"
@@ -12,6 +13,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
@@ -405,5 +407,155 @@ func TestPredicateSnapshotMarshaling(t *testing.T) {
 	}
 	if mr["predicate_result"] != "satisfied" {
 		t.Errorf("predicate_result = %v, want satisfied", mr["predicate_result"])
+	}
+}
+
+// seedQuorumRunStage seeds a plan stage in `state` plus a run row whose cached
+// workflow-v1 spec carries an approval gate with the given distinct-approver
+// count, so fetchApprovalsForStage resolves the quorum block for the stage. The
+// approvals predicate is a workflow-v1 feature, so the spec pins version 1.0.
+func seedQuorumRunStage(t *testing.T, rr *approvalRunRepo, count int, state run.StageState) *run.Stage {
+	t.Helper()
+	st := rr.seedStage(state)
+	workflowSpec := []byte(fmt.Sprintf(`version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        gates:
+          - type: approval
+            approvals:
+              count: %d
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`, count))
+	rr.seedRun(&run.Run{ID: st.RunID, WorkflowID: "feature_change", WorkflowSpec: workflowSpec})
+	return st
+}
+
+// eligibleApproverIdentity builds a token identity (TokenID non-empty so the
+// write-scope check actually runs) that carries write:approvals and is a
+// distinct human subject — an eligible quorum voter.
+func eligibleApproverIdentity(subject string) Identity {
+	return Identity{Subject: subject, TokenID: "tok-" + subject, Scopes: []string{"write:approvals"}}
+}
+
+// lastPredicateSnapshot decodes the predicate_snapshot from the most recent
+// approval_submitted audit entry the fake captured.
+func lastPredicateSnapshot(t *testing.T, au *approvalAuditFake) predicateSnapshot {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for i := len(au.appended) - 1; i >= 0; i-- {
+		e := au.appended[i]
+		if e.Category != "approval_submitted" {
+			continue
+		}
+		var payload struct {
+			PredicateSnapshot *predicateSnapshot `json:"predicate_snapshot"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			t.Fatalf("unmarshal approval_submitted payload: %v", err)
+		}
+		if payload.PredicateSnapshot == nil {
+			t.Fatalf("approval_submitted entry carries no predicate_snapshot: %s", e.Payload)
+		}
+		return *payload.PredicateSnapshot
+	}
+	t.Fatalf("no approval_submitted audit entry captured")
+	return predicateSnapshot{}
+}
+
+// TestApproveStageAs_Quorum_TwoApproversAdvanceOnce is the liveness / no-stall
+// assertion of the #1734 resolution at the server-orchestration layer: two
+// distinct eligible approvers against a count:2 gate advance the stage to
+// succeeded exactly once, and the advancing row's predicate snapshot observed
+// the full quorum (count_eligible == 2). The first below-quorum approve records
+// its row without advancing; the second reaches quorum and advances.
+func TestApproveStageAs_Quorum_TwoApproversAdvanceOnce(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := seedQuorumRunStage(t, rr, 2, run.StageStateAwaitingApproval)
+
+	// First distinct eligible approver: recorded, below quorum, no advance.
+	res1, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("github:r1"),
+		approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+	if err != nil {
+		t.Fatalf("first approve: %v", err)
+	}
+	if res1.Duplicate != nil {
+		t.Fatalf("first approve returned a duplicate on a fresh stage")
+	}
+	if res1.Stage == nil || res1.Stage.State != run.StageStateAwaitingApproval {
+		t.Fatalf("after first approve state = %v, want awaiting_approval (below quorum)", res1.Stage)
+	}
+	if len(rr.transitions) != 0 {
+		t.Fatalf("first approve recorded %d transitions, want 0 (below quorum)", len(rr.transitions))
+	}
+
+	// Second distinct eligible approver: quorum reached, advance exactly once.
+	res2, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("github:r2"),
+		approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+	if err != nil {
+		t.Fatalf("second approve: %v", err)
+	}
+	if res2.Stage == nil || res2.Stage.State != run.StageStateSucceeded {
+		t.Fatalf("after second approve state = %v, want succeeded (quorum reached)", res2.Stage)
+	}
+	if len(rr.transitions) != 1 || rr.transitions[0].To != run.StageStateSucceeded {
+		t.Fatalf("transitions = %+v, want exactly one → succeeded", rr.transitions)
+	}
+
+	// The counted-approver snapshot on the advancing row observed the full
+	// quorum: count_eligible == 2, quorum_reached true.
+	snap := lastPredicateSnapshot(t, au)
+	if snap.CountEligible != 2 {
+		t.Errorf("count_eligible = %d, want 2 (last committer sees full quorum)", snap.CountEligible)
+	}
+	if !snap.QuorumReached {
+		t.Errorf("quorum_reached = false, want true")
+	}
+}
+
+// TestApproveStageAs_Quorum_LateApproveOnSettledStage_NoDoubleAdvance is the
+// safety / no-double-advance assertion of the #1734 resolution. A count:1 gate
+// whose stage has ALREADY settled to a terminal state (a prior reject failed it
+// category-D, or the SLA timed out) receives a late approve that reaches quorum
+// in the count read — but advanceStage's TransitionStage guard rejects
+// failed → succeeded with InvalidTransitionError, which approveStageAs surfaces
+// as an advance-phase error (mapped to 409 on the HTTP path). The guard fires
+// before any state mutation, so the settled stage is never resurrected /
+// double-advanced.
+func TestApproveStageAs_Quorum_LateApproveOnSettledStage_NoDoubleAdvance(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	stage := seedQuorumRunStage(t, rr, 1, run.StageStateFailed)
+
+	_, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("github:late"),
+		approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+	if err == nil {
+		t.Fatalf("late approve on a settled stage returned nil error, want an advance-phase InvalidTransition error")
+	}
+	var aerr *approveActionError
+	if !errors.As(err, &aerr) {
+		t.Fatalf("err = %v, want *approveActionError", err)
+	}
+	if aerr.failedAt != gateActionAdvance {
+		t.Errorf("failedAt = %v, want gateActionAdvance", aerr.failedAt)
+	}
+	var inv run.InvalidTransitionError
+	if !errors.As(aerr.err, &inv) {
+		t.Fatalf("wrapped err = %v, want run.InvalidTransitionError", aerr.err)
+	}
+	if inv.To != string(run.StageStateSucceeded) {
+		t.Errorf("invalid transition To = %q, want succeeded", inv.To)
+	}
+	// No successful transition was recorded — the guard blocked the
+	// double-advance before mutating state.
+	if len(rr.transitions) != 0 {
+		t.Errorf("transitions = %+v, want none (guard blocked the double-advance)", rr.transitions)
 	}
 }
