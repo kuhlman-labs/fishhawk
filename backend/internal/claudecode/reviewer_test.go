@@ -221,11 +221,20 @@ func pidAliveFromFile(t *testing.T, pidfile string) bool {
 	return syscall.Kill(pid, 0) == nil
 }
 
+// grandchildLivenessWait bounds how long a loaded CI runner may take to START
+// (fork/exec the grandchild and flush its pid file) or REAP (deliver the
+// group-kill signal and have the kernel remove the process) a helper process
+// in waitPidGone. This is spawn/reap liveness, NOT the kill-latency behavior
+// under test — the tight #1805 regression bounds (elapsed > 3s at
+// TestReviewer_PipeLeakGroupKillTimeout, elapsed > 5s at
+// TestReviewer_PipeLeakEscapedGroupWaitDelayTimeout) stay unchanged.
+const grandchildLivenessWait = 30 * time.Second
+
 // waitPidGone polls until the pid recorded in pidfile is gone, or fails the test.
 func waitPidGone(t *testing.T, pidfile string) {
 	t.Helper()
 	var pid int
-	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+	for deadline := time.Now().Add(grandchildLivenessWait); time.Now().Before(deadline); {
 		if b, err := os.ReadFile(pidfile); err == nil {
 			if p, perr := strconv.Atoi(string(b)); perr == nil && p > 0 {
 				pid = p
@@ -237,7 +246,7 @@ func waitPidGone(t *testing.T, pidfile string) {
 	if pid == 0 {
 		t.Fatalf("grandchild never wrote its pid to %s", pidfile)
 	}
-	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+	for deadline := time.Now().Add(grandchildLivenessWait); time.Now().Before(deadline); {
 		if syscall.Kill(pid, 0) != nil {
 			return // gone
 		}
