@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 const testSecret = "shhh-its-a-secret"
@@ -216,5 +217,76 @@ func TestWebhook_BodyTooLarge(t *testing.T) {
 	}, body)
 	if w.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("status = %d, want 413", w.Code)
+	}
+}
+
+// TestWebhook_IssueClosedBoardSync drives the #1817 issue-lifecycle reconciler
+// end-to-end across the wire -> handleWebhook -> payload decode -> conventions
+// -> fake Transitioner -> global work_item_transitioned audit seam: an
+// HMAC-signed issues.closed delivery (state_reason completed, an installation
+// block) is accepted 202, the provider is dispatched issue_closed with the
+// payload's installation id on the Target, and a global-chain audit row records
+// the move with the repo + issue number + state_reason. A per-layer-only suite
+// would pass while this routing/decode/audit seam silently no-ops (#618).
+func TestWebhook_IssueClosedBoardSync(t *testing.T) {
+	prev := conventionsLoader
+	conventionsLoader = func(string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	fp := &fakeTransitionProvider{result: &workmgmt.TransitionResult{Moved: true, From: "In Progress", To: "Done"}}
+	registerTransitionProvider(t, fp)
+
+	au := &campaignAuditRecorder{}
+	s := New(Config{
+		Addr:                "127.0.0.1:0",
+		GitHubWebhookSecret: []byte(testSecret),
+		WebhookDeliveries:   webhook.NewMemoryStore(0),
+		AuditRepo:           au,
+	})
+
+	body := []byte(`{
+		"action": "closed",
+		"repository": {"full_name": "kuhlman-labs/fishhawk"},
+		"sender": {"login": "kuhlman-labs"},
+		"installation": {"id": 4242},
+		"issue": {"number": 1817, "state_reason": "completed"}
+	}`)
+	w := postWebhook(t, s, map[string]string{
+		"X-GitHub-Event":      "issues",
+		"X-GitHub-Delivery":   "cccccccc-dddd-eeee-ffff-000000000000",
+		"X-Hub-Signature-256": sign(body),
+		"Content-Type":        "application/json",
+	}, body)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	if len(fp.calls) != 1 {
+		t.Fatalf("Transition calls = %d, want 1 (routing reached the reconciler?)", len(fp.calls))
+	}
+	got := fp.calls[0]
+	if got.Trigger != lifecycleIssueClosed {
+		t.Errorf("trigger = %q, want %q", got.Trigger, lifecycleIssueClosed)
+	}
+	if got.CanonicalState != workmgmt.CanonicalStateDone {
+		t.Errorf("canonical state = %q, want %q", got.CanonicalState, workmgmt.CanonicalStateDone)
+	}
+	if got.IssueNumber != 1817 {
+		t.Errorf("issue number = %d, want 1817", got.IssueNumber)
+	}
+	if got.Target.InstallationID != 4242 {
+		t.Errorf("installation id = %d, want 4242 (from the payload)", got.Target.InstallationID)
+	}
+
+	audits := campaignTransitionAudits(au)
+	if len(audits) != 1 {
+		t.Fatalf("global work_item_transitioned audits = %d, want 1", len(audits))
+	}
+	a := audits[0]
+	if a["moved"] != true || a["trigger"] != lifecycleIssueClosed {
+		t.Errorf("audit = %v, want moved=true trigger=issue_closed", a)
+	}
+	if a["repo"] != "kuhlman-labs/fishhawk" || a["issue_number"] != float64(1817) || a["state_reason"] != "completed" {
+		t.Errorf("audit = %v, want repo/issue_number/state_reason from the payload", a)
 	}
 }

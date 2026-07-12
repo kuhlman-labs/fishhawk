@@ -581,6 +581,8 @@ transitions:
   pr_opened: in_review
   run_failed: blocked
   run_merged: done
+  issue_closed: done
+  issue_reopened: backlog
 `
 	c, err := Parse(strings.NewReader(cfg))
 	if err != nil {
@@ -591,6 +593,14 @@ transitions:
 	}
 	if c.Transitions["run_started"] != "in_progress" {
 		t.Errorf("transitions[run_started] = %q, want %q", c.Transitions["run_started"], "in_progress")
+	}
+	// The issue-lifecycle edges (#1817) are accepted as new optional
+	// transitions keys and resolve to declared canonical states.
+	if c.Transitions["issue_closed"] != "done" {
+		t.Errorf("transitions[issue_closed] = %q, want %q", c.Transitions["issue_closed"], "done")
+	}
+	if c.Transitions["issue_reopened"] != "backlog" {
+		t.Errorf("transitions[issue_reopened] = %q, want %q", c.Transitions["issue_reopened"], "backlog")
 	}
 }
 
@@ -621,6 +631,8 @@ func TestDefaultStatesAndTransitions(t *testing.T) {
 		"run_failed":       "blocked",
 		"run_merged":       "done",
 		"campaign_started": "up_next",
+		"issue_closed":     "done",
+		"issue_reopened":   "backlog",
 	}
 	for event, target := range wantTransitions {
 		if d.Transitions[event] != target {
