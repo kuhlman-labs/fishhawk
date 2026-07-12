@@ -74,6 +74,14 @@ workflows:
         type: plan
         executor:
           agent: claude-code
+          # Planner runs on Fable 5 (Anthropic's most capable model) rather
+          # than the deployment default. Fable is ~2x Opus per token
+          # ($10/$50 vs $5/$25), but the plan stage is the cheapest agent
+          # stage (~$1.4/run of the ~$3.9/run implement) and higher plan
+          # quality is the lever most likely to cut downstream implement
+          # rework. executor.model is the #1013 override rung (deployment
+          # default < this < plan model_recommendation < operator gate).
+          model: claude-fable-5
         # Advisory plan review (ADR-027): agent reviewers surface verdicts
         # before the human gate; effective agent count >0 + human>0 →
         # advisory, so the founder approval below stays authoritative.
