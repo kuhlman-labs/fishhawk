@@ -395,6 +395,21 @@ type PlanReviewedPayload struct {
 	// usage-free payloads byte-identical to pre-#995 entries.
 	InputTokens  int `json:"input_tokens,omitempty"`
 	OutputTokens int `json:"output_tokens,omitempty"`
+
+	// ReviewerVersion / ReviewerBinary record the resolved reviewer CLI's
+	// version and binary-path provenance for this invocation (#1768,
+	// completing the both-CLIs half of #1741 leg (a) for the REVIEWER
+	// surface). ReviewerVersion is the CLI's free-form version string (e.g.
+	// "0.30.5 (codex-cli)"), or "unknown" when the CLI is present but
+	// unprobeable; ReviewerBinary is the resolved binary name/path (e.g.
+	// "codex", or a FISHHAWKD_CODEX_BINARY override path). Both are populated
+	// only for a reviewer whose adapter implements the version-probe /
+	// binary-report capabilities (the codex subprocess adapter); the
+	// anthropic SDK and claudecode adapters implement neither, so both fields
+	// stay empty and omitempty keeps every pre-#1768 payload byte-identical —
+	// mirroring the InputTokens/OutputTokens additive-field posture above.
+	ReviewerVersion string `json:"reviewer_version,omitempty"`
+	ReviewerBinary  string `json:"reviewer_binary,omitempty"`
 }
 
 // ImplementReviewedPayload is the JSON payload stored in an audit entry
@@ -429,6 +444,14 @@ type ImplementReviewedPayload struct {
 	// Usage contract (#1010).
 	InputTokens  int `json:"input_tokens,omitempty"`
 	OutputTokens int `json:"output_tokens,omitempty"`
+
+	// ReviewerVersion / ReviewerBinary mirror PlanReviewedPayload (#1768):
+	// the resolved reviewer CLI's version string and binary-path provenance
+	// for this invocation. Populated only for a capability-bearing reviewer
+	// (the codex subprocess adapter); empty for the anthropic/claudecode
+	// adapters, so omitempty keeps every pre-#1768 payload byte-identical.
+	ReviewerVersion string `json:"reviewer_version,omitempty"`
+	ReviewerBinary  string `json:"reviewer_binary,omitempty"`
 
 	// Origin marks a non-first-review provenance for the verdict (#1250).
 	// Empty on the first review and the parent-decomposition consolidated

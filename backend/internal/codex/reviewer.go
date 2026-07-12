@@ -20,6 +20,19 @@ func NewReviewer(cfg Config) *Reviewer {
 	return &Reviewer{client: NewClient(cfg)}
 }
 
+// ReviewerBinaryPath reports the resolved `codex` binary name/path this
+// reviewer shells out to — the binary-path provenance the server stamps onto
+// every plan_reviewed / implement_reviewed audit entry (#1768). NewClient
+// normalises an empty Config.Binary to DefaultBinary ("codex"), so this always
+// returns the truthful resolved binary: "codex" by default, or the override
+// path when the deployment sets FISHHAWKD_CODEX_BINARY. It is the codex
+// adapter's implementation of the server's optional binaryReporter capability;
+// the anthropic SDK and claudecode adapters implement neither this nor
+// ProbeVersion, so the provenance fields stay empty for them.
+func (r *Reviewer) ReviewerBinaryPath() string {
+	return r.client.cfg.Binary
+}
+
 // SetMaxRetries overrides the retry budget on the underlying Client AFTER
 // construction, assigning n directly and bypassing NewClient's zero->1
 // normalisation. This is the explicit-override path the env wiring uses: Go

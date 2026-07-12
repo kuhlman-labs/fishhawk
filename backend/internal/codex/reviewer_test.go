@@ -214,3 +214,25 @@ func TestReviewer_ImplementsPlanReviewer(t *testing.T) {
 		Review(ctx context.Context, promptText string) (*planreview.ReviewVerdict, string, error)
 	} = NewReviewer(testConfig())
 }
+
+// TestReviewer_ReviewerBinaryPath pins the #1768 binary-path provenance
+// accessor: it returns the resolved binary the reviewer shells out to — the
+// DefaultBinary ("codex") when Config.Binary is empty (NewClient normalises
+// it), and the operator's override path verbatim when set. This is the value
+// the server stamps as reviewer_binary on every plan_reviewed /
+// implement_reviewed audit entry.
+func TestReviewer_ReviewerBinaryPath(t *testing.T) {
+	// Empty Config.Binary defaults to DefaultBinary via NewClient.
+	r := NewReviewer(Config{})
+	if got := r.ReviewerBinaryPath(); got != DefaultBinary {
+		t.Errorf("ReviewerBinaryPath() = %q, want the default %q", got, DefaultBinary)
+	}
+
+	// An explicit override path is returned truthfully (the FISHHAWKD_CODEX_BINARY
+	// resolved provenance).
+	const override = "/opt/fishhawk/codex-pinned"
+	ro := NewReviewer(Config{Binary: override})
+	if got := ro.ReviewerBinaryPath(); got != override {
+		t.Errorf("ReviewerBinaryPath() = %q, want the override %q", got, override)
+	}
+}
