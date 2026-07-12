@@ -768,17 +768,25 @@ func TestRun_UnknownRunSubcommand(t *testing.T) {
 	}
 }
 
-// TestRun_NoSubcommand_ListsAutoDecide asserts the interim auto-decide
-// subcommand (#1233) is discoverable in the `run` usage string and is a
-// recognized dispatcher arm (not 'unknown subcommand'). An empty `run`
-// prints the subcommand list to stderr.
-func TestRun_NoSubcommand_ListsAutoDecide(t *testing.T) {
+// TestRun_AutoDecideRemoved asserts the interim `auto-decide` subcommand
+// (#1233) stays gone (#1554): the no-subcommand usage string no longer
+// advertises it, and invoking it is rejected as an unknown subcommand
+// rather than dispatched.
+func TestRun_AutoDecideRemoved(t *testing.T) {
 	var stderr strings.Builder
 	if got := run([]string{"run"}, io.Discard, &stderr); got != exitUsage {
 		t.Fatalf("status = %d, want exitUsage", got)
 	}
-	if !strings.Contains(stderr.String(), "auto-decide") {
-		t.Errorf("run usage missing auto-decide: %s", stderr.String())
+	if strings.Contains(stderr.String(), "auto-decide") {
+		t.Errorf("run usage still advertises auto-decide: %s", stderr.String())
+	}
+
+	stderr.Reset()
+	if got := run([]string{"run", "auto-decide"}, io.Discard, &stderr); got != exitUsage {
+		t.Fatalf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "unknown subcommand") {
+		t.Errorf("expected unknown subcommand error, got: %s", stderr.String())
 	}
 }
 

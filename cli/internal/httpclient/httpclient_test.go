@@ -580,7 +580,7 @@ func TestAPIError_Error(t *testing.T) {
 	}
 }
 
-// --- scope amendments (#1233 interim auto-decider) ---
+// --- scope amendments ---
 
 func TestListScopeAmendments_WaitForwardedAndEnvelopeDecoded(t *testing.T) {
 	runID := uuid.New()
@@ -706,53 +706,6 @@ func TestGetRunStageWait_WaitOmittedWhenNonPositive(t *testing.T) {
 	}
 	if got.FailureCategory != nil {
 		t.Errorf("failure_category should be nil, got %v", got.FailureCategory)
-	}
-}
-
-func TestDecideScopeAmendment_RequestBodyShape(t *testing.T) {
-	runID := uuid.New()
-	amendID := uuid.New()
-	var gotBody []byte
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v0/runs/{run_id}/scope-amendments/{amendment_id}/decision", func(w http.ResponseWriter, r *http.Request) {
-		gotBody, _ = io.ReadAll(r.Body)
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(ScopeAmendment{ID: amendID, RunID: runID, Status: "approved"})
-	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-
-	c := New(srv.URL, "op-tok")
-	got, err := c.DecideScopeAmendment(context.Background(), runID, amendID, "approve", "because")
-	if err != nil {
-		t.Fatalf("DecideScopeAmendment: %v", err)
-	}
-	if !strings.Contains(string(gotBody), `"decision":"approve"`) || !strings.Contains(string(gotBody), `"reason":"because"`) {
-		t.Errorf("body shape mismatch: %s", gotBody)
-	}
-	if got.Status != "approved" {
-		t.Errorf("status = %q, want approved", got.Status)
-	}
-}
-
-func TestDecideScopeAmendment_AlreadyDecidedMapsToAPIError(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v0/runs/{run_id}/scope-amendments/{amendment_id}/decision", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		_, _ = io.WriteString(w, `{"error":{"code":"amendment_already_decided","message":"already decided"}}`)
-	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-
-	c := New(srv.URL, "op-tok")
-	_, err := c.DecideScopeAmendment(context.Background(), uuid.New(), uuid.New(), "approve", "")
-	var apiErr *APIError
-	if !errors.As(err, &apiErr) {
-		t.Fatalf("err = %v, want *APIError", err)
-	}
-	if apiErr.StatusCode != http.StatusConflict || apiErr.Code != "amendment_already_decided" {
-		t.Errorf("APIError = %+v, want 409 amendment_already_decided", apiErr)
 	}
 }
 

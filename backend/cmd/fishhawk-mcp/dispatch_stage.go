@@ -58,8 +58,9 @@ Dispatch one stage of a run NON-BLOCKING. Use this instead of
 fishhawk_run_stage when you need a SINGLE MCP session to both await a stage
 and decide a mid-stage scope amendment in-band — it is the SDK-independent
 non-blocking half of the ADR-037 (#879/#880) poll-to-terminal contract
-(#1232), the durable answer to the #1189 amendment-timeout that supersedes
-the interim "fishhawk run auto-decide" second channel (#1233/#1234).
+(#1232), the durable answer to the #1189 amendment-timeout that superseded
+the interim "fishhawk run auto-decide" second channel (#1233/#1234), since
+removed (#1554).
 
 It spawns the fishhawk-runner binary on the operator's host DETACHED (its own
 process group; output redirected to a per-run log file; a reaper goroutine

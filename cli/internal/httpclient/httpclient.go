@@ -632,8 +632,9 @@ type ScopeAmendmentPath struct {
 // ScopeAmendment is the CLI-side projection of the backend
 // scopeAmendmentResponse wire shape (one mid-stage scope-amendment
 // request). Field names + types match the wire shape verbatim. Only
-// the fields the auto-decider reads are projected; the #983 headroom
-// fields are intentionally omitted (additive, ignored on decode).
+// the fields watch.go's pending-amendment poll reads are projected;
+// the #983 headroom fields are intentionally omitted (additive,
+// ignored on decode).
 type ScopeAmendment struct {
 	ID             uuid.UUID            `json:"id"`
 	RunID          uuid.UUID            `json:"run_id"`
@@ -670,34 +671,9 @@ func (c *Client) ListScopeAmendments(ctx context.Context, runID uuid.UUID, waitS
 	return res.Items, nil
 }
 
-// scopeAmendmentDecisionBody is the POST decision request body,
-// matching the backend scopeAmendmentDecisionRequest wire shape.
-type scopeAmendmentDecisionBody struct {
-	Decision string `json:"decision"` // approve | deny
-	Reason   string `json:"reason"`
-}
-
-// DecideScopeAmendment calls POST
-// /v0/runs/{run_id}/scope-amendments/{amendment_id}/decision with
-// {decision, reason}. An already-decided amendment surfaces as
-// *APIError (409, code amendment_already_decided) so callers can
-// distinguish a benign race from a real failure.
-func (c *Client) DecideScopeAmendment(ctx context.Context, runID, amendmentID uuid.UUID, decision, reason string) (*ScopeAmendment, error) {
-	body, err := json.Marshal(scopeAmendmentDecisionBody{Decision: decision, Reason: reason})
-	if err != nil {
-		return nil, fmt.Errorf("marshal: %w", err)
-	}
-	path := "/v0/runs/" + runID.String() + "/scope-amendments/" + amendmentID.String() + "/decision"
-	var res ScopeAmendment
-	if err := c.do(ctx, http.MethodPost, path, body, &res); err != nil {
-		return nil, err
-	}
-	return &res, nil
-}
-
 // Artifact is the CLI-side projection of the OpenAPI Artifact schema.
 // Content is left as raw JSON so the caller decodes only the shape it
-// needs (the auto-decider decodes the standard_v1 plan's scope.files).
+// needs (deploy.go decodes the standard_v1 plan's scope.files).
 type Artifact struct {
 	ID            uuid.UUID       `json:"id"`
 	StageID       uuid.UUID       `json:"stage_id"`
