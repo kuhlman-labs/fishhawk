@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -147,6 +148,17 @@ type auditFake struct {
 	// ListForRunByCategory and is fail-open on a read error (WARN + fall
 	// through); this lets a test exercise that path.
 	listByCategoryErr error
+	// listAllErr, when set, makes ListAll return an error. The spend-alert
+	// and unpriced-model checks (#649 / #1870) read the cost ledger via
+	// ListAll and are best-effort (WARN + return) on a read failure; this
+	// injects that error path so a test can assert the upload still
+	// succeeds and the cost_recorded append is never unwound.
+	listAllErr error
+	// appendErrCategory, when set, makes AppendChained fail ONLY for
+	// entries of that category (leaving other categories, e.g.
+	// cost_recorded, appending normally). Used to inject the
+	// unpriced_model_alert write-failure path in isolation.
+	appendErrCategory string
 	// seeded is pre-existing history returned by ListAll alongside the
 	// entries appended during the test. The spend-alert check (#649)
 	// reads cost_recorded entries via ListAll to build its rolling
@@ -166,6 +178,9 @@ func (a *auditFake) ChainsByParent(_ context.Context, _ uuid.UUID, _ bool) ([]*a
 func (a *auditFake) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
 	if a.appendErr != nil {
 		return nil, a.appendErr
+	}
+	if a.appendErrCategory != "" && p.Category == a.appendErrCategory {
+		return nil, errors.New("auditFake: injected append error for " + p.Category)
 	}
 	a.mu.Lock()
 	a.appended = append(a.appended, p)
@@ -193,6 +208,9 @@ func (a *auditFake) ListGlobal(_ context.Context) ([]*audit.Entry, error) {
 // spend-alert check's cost-history read (#649); the trace handler is
 // the only caller, and it filters to cost_recorded.
 func (a *auditFake) ListAll(_ context.Context, p audit.ListAllParams) ([]*audit.Entry, error) {
+	if a.listAllErr != nil {
+		return nil, a.listAllErr
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	var out []*audit.Entry
@@ -2629,6 +2647,275 @@ func TestShipTrace_NoSpendAlertUnderSteadySpend(t *testing.T) {
 		}
 	}
 	au.mu.Unlock()
+}
+
+// seedUnpricedCostEntry builds a cost_recorded audit entry carrying the
+// model + ground-truth coverage flags the unpriced-model check (#1870)
+// reads back to decide whether a dispatched model was priced.
+func seedUnpricedCostEntry(t *testing.T, ts time.Time, model string, knownModel, knownUsage bool) *audit.Entry {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"model":       model,
+		"known_model": knownModel,
+		"known_usage": knownUsage,
+		"usd":         0,
+	})
+	if err != nil {
+		t.Fatalf("marshal cost seed payload: %v", err)
+	}
+	return &audit.Entry{Timestamp: ts, Category: "cost_recorded", Payload: payload}
+}
+
+// seedUnpricedAlertEntry builds a prior unpriced_model_alert entry whose
+// model arrays feed the once-per-window dedup.
+func seedUnpricedAlertEntry(t *testing.T, ts time.Time, unpriced, unknownUsage []string) *audit.Entry {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"unpriced_models":      unpriced,
+		"unknown_usage_models": unknownUsage,
+	})
+	if err != nil {
+		t.Fatalf("marshal alert seed payload: %v", err)
+	}
+	return &audit.Entry{Timestamp: ts, Category: "unpriced_model_alert", Payload: payload}
+}
+
+// unpricedModelID is a model id deliberately absent from the shared
+// pricing table, so recordCost stamps its cost_recorded entry with
+// known_model=false — the ground-truth signal the detector alarms on.
+const unpricedModelID = "totally-unpriced-model-xyz"
+
+// TestShipTrace_UnpricedModelTrips is the cross-boundary wiring test for
+// the unpriced-model detector (#1870): a shipped bundle whose manifest
+// names a model absent from the pricing table records a cost_recorded
+// entry with known_model=false, and checkUnpricedModel (re-reading the
+// ledger) writes exactly one warn-only unpriced_model_alert naming that
+// model. Warn-only: the upload still returns 202.
+func TestShipTrace_UnpricedModelTrips(t *testing.T) {
+	s, sf, _, au := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStateDispatched)
+	rr.seedRun(&run.Run{ID: stage.RunID})
+	s.cfg.RunRepo = rr
+	s.nowFunc = func() time.Time { return spendTestNow }
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        stage.RunID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        unpricedModelID,
+		InputTokens:  100,
+		OutputTokens: 200,
+	})
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (warn-only must not gate):\n%s", w.Code, w.Body.String())
+	}
+
+	au.mu.Lock()
+	var alert *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "unpriced_model_alert" {
+			alert = &au.appended[i]
+			break
+		}
+	}
+	au.mu.Unlock()
+	if alert == nil {
+		t.Fatal("no unpriced_model_alert written for a dispatched unpriced model")
+	}
+	if alert.RunID != stage.RunID {
+		t.Errorf("unpriced_model_alert RunID = %s, want %s", alert.RunID, stage.RunID)
+	}
+	var ap struct {
+		UnpricedModels     []string `json:"unpriced_models"`
+		UnknownUsageModels []string `json:"unknown_usage_models"`
+		ModelCount         int      `json:"model_count"`
+		TriggeringModel    string   `json:"triggering_model"`
+	}
+	if err := json.Unmarshal(alert.Payload, &ap); err != nil {
+		t.Fatalf("decode unpriced_model_alert payload: %v", err)
+	}
+	if !reflect.DeepEqual(ap.UnpricedModels, []string{unpricedModelID}) {
+		t.Errorf("unpriced_models = %v, want [%s]", ap.UnpricedModels, unpricedModelID)
+	}
+	if len(ap.UnknownUsageModels) != 0 {
+		t.Errorf("unknown_usage_models = %v, want empty (usage was reported)", ap.UnknownUsageModels)
+	}
+	if ap.ModelCount != 1 {
+		t.Errorf("model_count = %d, want 1", ap.ModelCount)
+	}
+	if ap.TriggeringModel != unpricedModelID {
+		t.Errorf("triggering_model = %q, want %q", ap.TriggeringModel, unpricedModelID)
+	}
+}
+
+// TestShipTrace_NoUnpricedModelAlertWhenAllKnown confirms the detector
+// stays quiet when the dispatched model is priced and reported usage: a
+// steady all-known window yields no unpriced_model_alert entry.
+func TestShipTrace_NoUnpricedModelAlertWhenAllKnown(t *testing.T) {
+	s, sf, _, au := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStateDispatched)
+	rr.seedRun(&run.Run{ID: stage.RunID})
+	s.cfg.RunRepo = rr
+	s.nowFunc = func() time.Time { return spendTestNow }
+
+	const model = "claude-opus-4-8"
+	if _, ok := pricing.Cost(model, 1000, 2000); !ok {
+		t.Fatalf("pricing.Cost(%q) ok=false — fixture model must be priced", model)
+	}
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        stage.RunID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        model,
+		InputTokens:  1000,
+		OutputTokens: 2000,
+	})
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+
+	au.mu.Lock()
+	for i := range au.appended {
+		if au.appended[i].Category == "unpriced_model_alert" {
+			t.Errorf("unexpected unpriced_model_alert for a priced model: %s", au.appended[i].Payload)
+		}
+	}
+	au.mu.Unlock()
+}
+
+// TestCheckUnpricedModel_DedupsWithPriorAlert exercises the per-window
+// dedup directly: a ledger with an in-window unpriced cost row AND a
+// prior in-window unpriced_model_alert naming that same model emits no
+// duplicate alert.
+func TestCheckUnpricedModel_DedupsWithPriorAlert(t *testing.T) {
+	au := newAuditFake()
+	now := spendTestNow
+	au.seeded = []*audit.Entry{
+		seedUnpricedCostEntry(t, now.Add(-1*time.Hour), "claude-fable-5", false, true),
+		seedUnpricedAlertEntry(t, now.Add(-30*time.Minute), []string{"claude-fable-5"}, nil),
+	}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	s.nowFunc = func() time.Time { return spendTestNow }
+
+	s.checkUnpricedModel(t.Context(), uuid.New(), uuid.New(), "claude-fable-5")
+
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for i := range au.appended {
+		if au.appended[i].Category == "unpriced_model_alert" {
+			t.Errorf("unexpected duplicate unpriced_model_alert within window: %s", au.appended[i].Payload)
+		}
+	}
+}
+
+// TestShipTrace_UnpricedModel_ListAllErrorDoesNotBlockUpload asserts the
+// best-effort/warn-only contract on the ListAll READ error path inside
+// checkUnpricedModel: when the ledger read fails, the trace upload still
+// returns 202 and the cost_recorded append is preserved (never unwound).
+func TestShipTrace_UnpricedModel_ListAllErrorDoesNotBlockUpload(t *testing.T) {
+	s, sf, _, au := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStateDispatched)
+	rr.seedRun(&run.Run{ID: stage.RunID})
+	s.cfg.RunRepo = rr
+	s.nowFunc = func() time.Time { return spendTestNow }
+	// Fail every ListAll read — this is the read-failure branch both
+	// checkSpendAlert and checkUnpricedModel must swallow.
+	au.listAllErr = errors.New("boom: audit ListAll unavailable")
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        stage.RunID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        unpricedModelID,
+		InputTokens:  100,
+		OutputTokens: 200,
+	})
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 — a ListAll read failure must not unwind the upload:\n%s",
+			w.Code, w.Body.String())
+	}
+
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var sawCost, sawAlert bool
+	for i := range au.appended {
+		switch au.appended[i].Category {
+		case "cost_recorded":
+			sawCost = true
+		case "unpriced_model_alert":
+			sawAlert = true
+		}
+	}
+	if !sawCost {
+		t.Error("cost_recorded append was unwound by the ListAll error — it must be preserved")
+	}
+	if sawAlert {
+		t.Error("unpriced_model_alert emitted despite the ListAll read failing")
+	}
+}
+
+// TestShipTrace_UnpricedModel_AppendErrorDoesNotBlockUpload asserts the
+// best-effort/warn-only contract on the AppendChained WRITE error path
+// inside checkUnpricedModel: when writing the unpriced_model_alert entry
+// fails, the error is swallowed (WARN-logged, not propagated), the trace
+// upload still returns 202, and the earlier cost_recorded append stands.
+func TestShipTrace_UnpricedModel_AppendErrorDoesNotBlockUpload(t *testing.T) {
+	s, sf, _, au := newTraceServer(t)
+	rr := newApprovalRunRepo()
+	stage := rr.seedStage(run.StageStateDispatched)
+	rr.seedRun(&run.Run{ID: stage.RunID})
+	s.cfg.RunRepo = rr
+	s.nowFunc = func() time.Time { return spendTestNow }
+	// Fail only the unpriced_model_alert write, leaving cost_recorded to
+	// append normally — isolates the detector's write-failure branch.
+	au.appendErrCategory = "unpriced_model_alert"
+
+	bundleBytes := packManifestBundle(t, bundle.Manifest{
+		BundleSchema: "trace-bundle-v0",
+		RunID:        stage.RunID.String(),
+		StageID:      stage.ID.String(),
+		Agent:        "claude-code",
+		Model:        unpricedModelID,
+		InputTokens:  100,
+		OutputTokens: 200,
+	})
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, bundleBytes, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 — an alert-append failure must not unwind the upload:\n%s",
+			w.Code, w.Body.String())
+	}
+
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var sawCost bool
+	for i := range au.appended {
+		if au.appended[i].Category == "cost_recorded" {
+			sawCost = true
+		}
+		if au.appended[i].Category == "unpriced_model_alert" {
+			t.Error("unpriced_model_alert should have failed to append (injected error), yet one is recorded")
+		}
+	}
+	if !sawCost {
+		t.Error("cost_recorded append was unwound by the alert-append error — it must be preserved")
+	}
 }
 
 // TestShipTrace_RunBudgetTripwire_HaltsRun is the cross-boundary integration
