@@ -70,7 +70,9 @@ var familyToLiteLLM = map[string]string{
 	"claude-sonnet": "claude-sonnet-4-6",
 	"claude-haiku":  "claude-haiku-4-5",
 	"gpt-5.5":       "gpt-5.5",
+	"gpt-5.6-sol":   "gpt-5.6-sol",
 	"gpt-5.6-terra": "gpt-5.6-terra",
+	"gpt-5.6-luna":  "gpt-5.6-luna",
 }
 
 // DriftFinding is one priced-field comparison between our table and LiteLLM.

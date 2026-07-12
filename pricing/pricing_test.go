@@ -62,11 +62,25 @@ func TestCost_KnownTiers(t *testing.T) {
 			want:   10 + 50, // $10 input + $50 output per 1M
 		},
 		{
+			name:   "gpt-5.6-sol flagship tier",
+			model:  "gpt-5.6-sol",
+			input:  1_000_000,
+			output: 1_000_000,
+			want:   5 + 30, // $5 input + $30 output per 1M
+		},
+		{
 			name:   "gpt-5.6-terra mid tier",
 			model:  "gpt-5.6-terra",
 			input:  1_000_000,
 			output: 1_000_000,
 			want:   2.5 + 15, // $2.50 input + $15 output per 1M
+		},
+		{
+			name:   "gpt-5.6-luna cost-optimized tier",
+			model:  "gpt-5.6-luna",
+			input:  1_000_000,
+			output: 1_000_000,
+			want:   1 + 6, // $1 input + $6 output per 1M
 		},
 		{
 			name:   "zero usage is zero cost",
@@ -161,8 +175,10 @@ func TestCacheRates_Multipliers(t *testing.T) {
 		{family: "claude-haiku", wantReadMultiplier: 0.1, wantReadPerToken: 0.1 / 1_000_000, wantWritePerToken: 1.25 / 1_000_000},
 		// gpt-5.5: read = $0.50/1M (0.1x input), write = input rate ($5/1M).
 		{family: "gpt-5.5", wantReadMultiplier: 0.1, wantReadPerToken: 0.5 / 1_000_000, wantWritePerToken: 5.0 / 1_000_000},
-		// gpt-5.6-terra: read = $0.25/1M (0.1x input), write = 1.25x input ($3.125/1M).
+		// gpt-5.6 tiers: read = 0.1x input, write = 1.25x input (the 5.6 premium).
+		{family: "gpt-5.6-sol", wantReadMultiplier: 0.1, wantReadPerToken: 0.5 / 1_000_000, wantWritePerToken: 6.25 / 1_000_000},
 		{family: "gpt-5.6-terra", wantReadMultiplier: 0.1, wantReadPerToken: 0.25 / 1_000_000, wantWritePerToken: 3.125 / 1_000_000},
+		{family: "gpt-5.6-luna", wantReadMultiplier: 0.1, wantReadPerToken: 0.1 / 1_000_000, wantWritePerToken: 1.25 / 1_000_000},
 	}
 	for _, tc := range tests {
 		t.Run(tc.family, func(t *testing.T) {
@@ -178,8 +194,8 @@ func TestCacheRates_Multipliers(t *testing.T) {
 		})
 	}
 	// Anthropic write is 1.25x input; pin the multiplier directly too.
-	// gpt-5.6-terra also carries the 1.25x write premium (unlike gpt-5.5).
-	for _, family := range []string{"claude-opus", "claude-fable", "claude-sonnet", "claude-haiku", "gpt-5.6-terra"} {
+	// The whole gpt-5.6 family carries the same 1.25x write premium (unlike gpt-5.5).
+	for _, family := range []string{"claude-opus", "claude-fable", "claude-sonnet", "claude-haiku", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} {
 		r := familyRates[family]
 		approx(t, r.cacheWritePerToken, 1.25*r.inputPerToken)
 	}
