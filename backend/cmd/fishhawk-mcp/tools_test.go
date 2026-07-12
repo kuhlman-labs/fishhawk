@@ -2215,12 +2215,18 @@ func seedRecentAuditPayload(fb *fakeBackend, runID uuid.UUID, category string, p
 	raw, _ := json.Marshal(payload)
 	var decoded any
 	_ = json.Unmarshal(raw, &decoded)
+	// Stamp non-empty verifier-only hash-chain fields (64 hex chars each, as the
+	// production /v0/audit feed carries) so the #1749 compact-projection tests can
+	// assert they are dropped by default and restored under include_audit_hashes.
+	prev := strings.Repeat("a", 64)
 	fb.auditByRun[runID] = append(fb.auditByRun[runID], AuditEntry{
-		ID:       uuid.New().String(),
-		Sequence: int64(len(fb.auditByRun[runID]) + 1),
-		RunID:    runID.String(),
-		Category: category,
-		Payload:  decoded,
+		ID:        uuid.New().String(),
+		Sequence:  int64(len(fb.auditByRun[runID]) + 1),
+		RunID:     runID.String(),
+		Category:  category,
+		Payload:   decoded,
+		PrevHash:  &prev,
+		EntryHash: strings.Repeat("b", 64),
 	})
 }
 
@@ -2271,6 +2277,21 @@ func seedCompactFixture(t *testing.T) (*fakeBackend, *httptest.Server, uuid.UUID
 		"title":    "an issue",
 		"body":     "recent payload issue body",
 		"comments": []any{map[string]any{"body": "recent comment body"}},
+	})
+	// A recent-audit entry carrying an oversized non-free-text payload string
+	// (survives the #1727 free-text strip) — the #1749 truncation target.
+	seedRecentAuditPayload(fb, runID, "cost_recorded", map[string]any{
+		"detail": strings.Repeat("x", 800),
+	})
+	// A cache_efficiency metric WITH a per-stage breakdown — the #1749
+	// cache-stage collapse target.
+	seedCacheEfficiency(fb, runID, CacheEfficiency{
+		CacheReadRatio: 0.5, ReuseFactor: 2.0, NetSavingsUSD: 16.75,
+		Stages: []CacheEfficiencyStage{
+			{Source: "agent", FreshInputTokens: 2_000_000},
+			{Source: "implement_review", NetSavingsUSD: 4.5},
+			{Source: "plan_review", NetSavingsUSD: 12.25},
+		},
 	})
 	return fb, srv, runID
 }
@@ -2385,6 +2406,239 @@ func TestGetRunStatus_CompactDefault_RetainsPlaybookFields(t *testing.T) {
 	}
 	if len(rev.Concerns) != 1 || rev.Concerns[0].Severity != "high" || rev.Concerns[0].Category != "security" {
 		t.Errorf("concern severity/category must be retained, got %+v", rev.Concerns)
+	}
+}
+
+// findRecentAudit returns the first recent_audit entry of the given category.
+func findRecentAudit(t *testing.T, entries []AuditEntry, category string) AuditEntry {
+	t.Helper()
+	for _, e := range entries {
+		if e.Category == category {
+			return e
+		}
+	}
+	t.Fatalf("no recent_audit entry of category %q in %+v", category, entries)
+	return AuditEntry{}
+}
+
+// TestGetRunStatus_CompactDefault_OmitsAuditHashes is the #1749 default proof:
+// each recent_audit entry's verifier-only entry_hash/prev_hash are dropped from
+// the Go values AND the wire bytes.
+func TestGetRunStatus_CompactDefault_OmitsAuditHashes(t *testing.T) {
+	_, srv, runID := seedCompactFixture(t)
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if len(out.RecentAudit) == 0 {
+		t.Fatal("no recent audit entries")
+	}
+	for _, e := range out.RecentAudit {
+		if e.EntryHash != "" {
+			t.Errorf("entry %s: EntryHash = %q, want dropped", e.Category, e.EntryHash)
+		}
+		if e.PrevHash != nil {
+			t.Errorf("entry %s: PrevHash = %v, want dropped", e.Category, *e.PrevHash)
+		}
+	}
+	raw, _ := json.Marshal(out)
+	for _, banned := range []string{`"entry_hash":`, `"prev_hash":`, strings.Repeat("a", 64), strings.Repeat("b", 64)} {
+		if strings.Contains(string(raw), banned) {
+			t.Errorf("wire bytes must not contain %q (compact default)", banned)
+		}
+	}
+}
+
+// TestGetRunStatus_IncludeAuditHashes_RestoresHashesAndPayload asserts the
+// single flag restores BOTH the hash-chain fields AND the untruncated payload
+// values together (the ratified single-flag coupling).
+func TestGetRunStatus_IncludeAuditHashes_RestoresHashesAndPayload(t *testing.T) {
+	_, srv, runID := seedCompactFixture(t)
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String(), IncludeAuditHashes: true})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	cost := findRecentAudit(t, out.RecentAudit, "cost_recorded")
+	if cost.EntryHash != strings.Repeat("b", 64) {
+		t.Errorf("EntryHash = %q, want restored", cost.EntryHash)
+	}
+	if cost.PrevHash == nil || *cost.PrevHash != strings.Repeat("a", 64) {
+		t.Errorf("PrevHash = %v, want restored", cost.PrevHash)
+	}
+	// Full untruncated payload restored together (not just the hashes).
+	detail := cost.Payload.(map[string]any)["detail"].(string)
+	if detail != strings.Repeat("x", 800) {
+		t.Errorf("payload detail truncated under include_audit_hashes: len=%d", len(detail))
+	}
+	raw, _ := json.Marshal(out)
+	if strings.Contains(string(raw), "full value via fishhawk_list_audit") {
+		t.Error("wire bytes must not carry the truncation marker under include_audit_hashes")
+	}
+}
+
+// TestGetRunStatus_CompactDefault_TruncatesLargePayload asserts an oversized
+// recent_audit payload string is truncated by default with the list_audit marker.
+func TestGetRunStatus_CompactDefault_TruncatesLargePayload(t *testing.T) {
+	_, srv, runID := seedCompactFixture(t)
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	cost := findRecentAudit(t, out.RecentAudit, "cost_recorded")
+	detail := cost.Payload.(map[string]any)["detail"].(string)
+	if len(detail) >= 800 {
+		t.Errorf("payload detail not truncated: len=%d", len(detail))
+	}
+	if !strings.Contains(detail, "full value via fishhawk_list_audit") {
+		t.Errorf("truncated payload missing list_audit marker: %q", detail)
+	}
+}
+
+// TestGetRunStatus_CompactDefault_CollapsesCacheStages asserts the
+// cache_efficiency per-stage breakdown collapses to nil by default while the
+// run-level rollup scalars remain.
+func TestGetRunStatus_CompactDefault_CollapsesCacheStages(t *testing.T) {
+	_, srv, runID := seedCompactFixture(t)
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.CacheEfficiency == nil {
+		t.Fatal("cache_efficiency block missing")
+	}
+	if out.CacheEfficiency.Stages != nil {
+		t.Errorf("cache stages should collapse to nil by default, got %+v", out.CacheEfficiency.Stages)
+	}
+	// Rollup scalars are always present.
+	if out.CacheEfficiency.NetSavingsUSD != 16.75 || out.CacheEfficiency.CacheReadRatio != 0.5 {
+		t.Errorf("rollup scalars must survive collapse, got %+v", out.CacheEfficiency)
+	}
+	// The top-level Stages (ordered stage list) always serializes "stages:",
+	// so assert on a cache-stage-only marker instead: the per-stage source
+	// "plan_review" appears only in the cache breakdown (the stage list types
+	// are plan/implement/acceptance).
+	ceRaw, _ := json.Marshal(out.CacheEfficiency)
+	if strings.Contains(string(ceRaw), `"source"`) || strings.Contains(string(ceRaw), "plan_review") {
+		t.Errorf("cache_efficiency wire bytes must omit the per-stage breakdown by default: %s", ceRaw)
+	}
+}
+
+// TestGetRunStatus_IncludeCacheStages_RestoresBreakdown asserts the opt-in
+// restores the per-stage breakdown while the rollup scalars remain present.
+func TestGetRunStatus_IncludeCacheStages_RestoresBreakdown(t *testing.T) {
+	_, srv, runID := seedCompactFixture(t)
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String(), IncludeCacheStages: true})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.CacheEfficiency == nil || len(out.CacheEfficiency.Stages) != 3 {
+		t.Fatalf("cache stages not restored: %+v", out.CacheEfficiency)
+	}
+	if out.CacheEfficiency.Stages[2].Source != "plan_review" || out.CacheEfficiency.Stages[2].NetSavingsUSD != 12.25 {
+		t.Errorf("stage breakdown wrong: %+v", out.CacheEfficiency.Stages[2])
+	}
+	if out.CacheEfficiency.NetSavingsUSD != 16.75 {
+		t.Errorf("rollup scalar altered: %+v", out.CacheEfficiency)
+	}
+}
+
+// TestListAudit_RetainsAuditHashes is the omitempty regression guard: the
+// EntryHash json:"entry_hash,omitempty" change must NOT leak into the verifier
+// surface — fishhawk_list_audit entries always carry non-empty entry_hash/prev_hash.
+func TestListAudit_RetainsAuditHashes(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	prev := strings.Repeat("a", 64)
+	fb.perRunAuditByRun[runID] = []AuditEntry{
+		{
+			ID: uuid.New().String(), Sequence: 1, RunID: runID.String(),
+			Category: "plan_generated", Payload: json.RawMessage(`{}`),
+			PrevHash: &prev, EntryHash: strings.Repeat("b", 64),
+		},
+	}
+	r := newResolver(srv, nil)
+	_, out, err := r.listAudit(context.Background(), nil, ListAuditInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("listAudit: %v", err)
+	}
+	if len(out.Items) != 1 {
+		t.Fatalf("want 1 item, got %d", len(out.Items))
+	}
+	if out.Items[0].EntryHash != strings.Repeat("b", 64) {
+		t.Errorf("list_audit entry_hash dropped: %q", out.Items[0].EntryHash)
+	}
+	raw, _ := json.Marshal(out)
+	if !strings.Contains(string(raw), `"entry_hash":`) || !strings.Contains(string(raw), `"prev_hash":`) {
+		t.Errorf("list_audit wire bytes must retain entry_hash + prev_hash: %s", raw)
+	}
+}
+
+// TestGetRunStatus_CompactDefault_UnderSizeBudget is the done-means byte-size
+// backstop (#1749): a representative audit_limit=10 post-review run marshalled
+// with no flags must fall under the ~7KB target. A comment-only / no-op
+// implementation fails this even though the scope-presence gate passes.
+func TestGetRunStatus_CompactDefault_UnderSizeBudget(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{
+		ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: "running",
+		IssueContext: &IssueContext{
+			Title: "an issue", Body: strings.Repeat("issue body ", 40), URL: "https://example/issues/1", Number: 1749,
+			Comments: []IssueComment{{Author: "a", Body: strings.Repeat("comment ", 30), CreatedAt: "t"}},
+		},
+	}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "succeeded"},
+	}
+	seedImplementReviewAudit(fb, runID, PlanReview{
+		ReviewerKind: "agent", ReviewerModel: "claude-opus-4-8", Authority: "advisory",
+		Verdict:  "approve_with_concerns",
+		Concerns: []PlanReviewConcern{{Severity: "high", Category: "security", Note: strings.Repeat("concern note ", 20)}},
+		FreeForm: strings.Repeat("reviewer prose ", 40),
+	})
+	// Ten realistic recent-audit entries with non-empty hashes + payloads,
+	// enough to reach audit_limit=10.
+	seedRecentAuditPayload(fb, runID, "plan_generated", map[string]any{"detail": strings.Repeat("p", 400)})
+	seedRecentAuditPayload(fb, runID, "issue_context_fetched", map[string]any{
+		"title": "an issue", "body": strings.Repeat("body ", 60),
+		"comments": []any{map[string]any{"body": strings.Repeat("c ", 40)}},
+	})
+	seedRecentAuditPayload(fb, runID, "implement_reviewed", map[string]any{
+		"verdict": "approve_with_concerns", "free_form": strings.Repeat("prose ", 60),
+	})
+	for i := 0; i < 7; i++ {
+		seedRecentAuditPayload(fb, runID, "cost_recorded", map[string]any{"detail": strings.Repeat("x", 400)})
+	}
+	seedCacheEfficiency(fb, runID, CacheEfficiency{
+		CacheReadRatio: 0.5, ReuseFactor: 2.0, NetSavingsUSD: 16.75,
+		Stages: []CacheEfficiencyStage{
+			{Source: "agent", FreshInputTokens: 2_000_000, CacheReadRatio: 0.5, NetSavingsUSD: 4.0},
+			{Source: "implement_review", CacheReadRatio: 0.5, NetSavingsUSD: 4.5},
+			{Source: "plan_review", CacheReadRatio: 0.75, ReuseFactor: 3.0, NetSavingsUSD: 12.25},
+		},
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String(), AuditLimit: 10})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if len(out.RecentAudit) != 10 {
+		t.Fatalf("want 10 recent audit entries at audit_limit=10, got %d", len(out.RecentAudit))
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	const target = 7 * 1024
+	if len(raw) >= target {
+		t.Errorf("compact default response = %d bytes, want < %d (lower auditPayloadStringCap)", len(raw), target)
 	}
 }
 
@@ -6376,7 +6630,10 @@ func TestGetRunStatus_SurfacesCacheEfficiencyBlock(t *testing.T) {
 		},
 	})
 
-	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	// include_cache_stages restores the per-stage breakdown this test asserts;
+	// the compact default collapses stages[] to the rollup (#1749, covered by
+	// TestGetRunStatus_CompactDefault_CollapsesCacheStages).
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String(), IncludeCacheStages: true})
 	if err != nil {
 		t.Fatalf("getRunStatus: %v", err)
 	}

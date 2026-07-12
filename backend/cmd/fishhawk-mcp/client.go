@@ -2312,7 +2312,11 @@ type AuditEntry struct {
 	ActorSubject *string   `json:"actor_subject,omitempty"`
 	Payload      any       `json:"payload,omitempty"`
 	PrevHash     *string   `json:"prev_hash,omitempty"`
-	EntryHash    string    `json:"entry_hash"`
+	// EntryHash carries omitempty so the compact get_run_status projection can
+	// blank it to drop the verifier-only hash-chain field from the wire (#1749).
+	// Safe for fishhawk_list_audit: a real audit entry always has a non-empty
+	// entry_hash there, so omitempty never elides it on the verifier surface.
+	EntryHash string `json:"entry_hash,omitempty"`
 }
 
 type listAuditResult struct {

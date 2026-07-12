@@ -901,6 +901,19 @@ type GetRunStatusInput struct {
 	// ListRunsInput.IncludeIssueContext.
 	IncludeIssueContext bool `json:"include_issue_context,omitempty" jsonschema:"include the run's full issue_context (issue body + all comments) in the response; omitted by default to stay within the tool-result token budget. Set true only when the issue payload is actually needed"`
 	IncludeReviewProse  bool `json:"include_review_prose,omitempty" jsonschema:"include reviewer free-text prose (implement_reviews[] free_form + concern notes, and recent_audit review-payload free_form) in the response; omitted by default to stay within the tool-result token budget. Verdicts/severities/concern keys are always present regardless of this flag"`
+	// IncludeAuditHashes restores each recent_audit entry's verifier-only
+	// hash-chain fields (entry_hash + prev_hash) AND its full untruncated
+	// payload string values together — one verifier/forensic concern, not
+	// split (ratified at the plan gate). Defaults false: the compact default
+	// drops the hash-chain fields and truncates oversized payload string
+	// values with a marker pointing at fishhawk_list_audit, where the full
+	// shape always remains available. verdict/severity/category keys are
+	// retained regardless of this flag.
+	IncludeAuditHashes bool `json:"include_audit_hashes,omitempty" jsonschema:"include each recent_audit entry's verifier-only hash-chain fields (entry_hash + prev_hash) AND its full untruncated payload string values; both are dropped/truncated by default to stay within the tool-result token budget. The full shape always remains available on fishhawk_list_audit. verdict/severity/category keys are present regardless of this flag"`
+	// IncludeCacheStages restores cache_efficiency.stages[] — the per-stage
+	// (plan_review / implement_review / agent) breakdown. Defaults false: the
+	// compact default collapses it to the run-level rollup scalars.
+	IncludeCacheStages bool `json:"include_cache_stages,omitempty" jsonschema:"include the cache_efficiency per-stage breakdown (stages[]); collapsed to the run-level rollup by default to stay within the tool-result token budget"`
 }
 
 // GetRunStatusOutput bundles the three /v0 reads into one
@@ -1060,11 +1073,21 @@ The response is compact by default to stay within the tool-result token
 budget: the heavy issue_context (issue body + all comments) and reviewer
 free-text prose (implement_reviews[] free_form + concern notes, plus
 recent_audit review-payload free_form / issue-fetch body+comments) are
-omitted. Every operator-playbook field is retained — next_actions, all
-wait statuses, the run.concerns block, and each review's
-verdict/severity/category/concern keys. Set include_issue_context=true to
-restore the issue payload and include_review_prose=true to restore the
-reviewer free-text; both default false.
+omitted. In addition (#1749) each recent_audit entry's verifier-only
+hash-chain fields (entry_hash + prev_hash) are dropped and any oversized
+payload string value is truncated with a marker pointing at
+fishhawk_list_audit, and the cache_efficiency per-stage breakdown
+(stages[]) is collapsed to the run-level rollup. Every operator-playbook
+field is retained — next_actions, all wait statuses, the run.concerns
+block, and each review's/audit entry's verdict/severity/category/concern
+keys. Opt-in flags restore today's full shape, all default false: set
+include_issue_context=true to restore the issue payload,
+include_review_prose=true to restore the reviewer free-text,
+include_audit_hashes=true to restore the recent_audit hash-chain fields
+AND the untruncated payload values together (one flag, not split), and
+include_cache_stages=true to restore the cache_efficiency per-stage
+breakdown. The full audit/hash shape always remains available on
+fishhawk_list_audit.
 
 Also returns plan_stage_wait_status + implement_stage_wait_status — each a
 StageWaitStatus whose status is one of
@@ -1316,6 +1339,26 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	}
 	for i := range recent {
 		recent[i].Payload = compactAuditPayload(recent[i].Payload, !in.IncludeIssueContext, !in.IncludeReviewProse)
+		// (d) recent_audit hash chain + oversized payload strings (#1749):
+		// each entry still carries its verifier-only entry_hash/prev_hash
+		// (64 hex chars each) and its full untruncated payload — structural
+		// bulk an operator never acts on. Drop the hash-chain fields and
+		// truncate oversized payload strings by default; the single
+		// include_audit_hashes flag restores BOTH together (one verifier
+		// concern, not split). The full shape stays on fishhawk_list_audit.
+		if !in.IncludeAuditHashes {
+			recent[i].EntryHash = ""
+			recent[i].PrevHash = nil
+			recent[i].Payload = truncateAuditPayloadStrings(recent[i].Payload, auditPayloadStringCap)
+		}
+	}
+	// (e) cache_efficiency per-stage breakdown (#1749): collapse the
+	// stages[] rows to the run-level rollup scalars by default — ~1.3KB of
+	// structural bulk. include_cache_stages restores the breakdown.
+	// fetchCacheEfficiency returns a freshly-decoded value per call, so the
+	// in-place blank is safe; collapseCacheEfficiencyStages is nil-safe.
+	if !in.IncludeCacheStages {
+		collapseCacheEfficiencyStages(cacheEfficiency)
 	}
 
 	return nil, GetRunStatusOutput{

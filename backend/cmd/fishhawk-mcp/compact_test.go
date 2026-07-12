@@ -2,7 +2,9 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // TestStripReviewProse asserts the typed strip clears free_form + concern
@@ -171,4 +173,140 @@ func TestCompactAuditPayload_NilAndNonMap(t *testing.T) {
 	if got := compactAuditPayload(in, false, false); !reflect.DeepEqual(got, in) {
 		t.Errorf("no-flag call should be a pass-through, got %+v", got)
 	}
+}
+
+const truncMarker = "; full value via fishhawk_list_audit)"
+
+// TestTruncateAuditPayloadStrings pins the #1749 payload-string truncation:
+// (a) an oversized string is truncated to the cap with a marker reporting the
+// elided byte count; (b) a short string is unchanged; (c) recursion truncates
+// strings nested in maps and slices while structured keys and short values
+// survive; (d) non-string scalars, nil, and a bare non-map/slice value pass
+// through untouched; (e) cap<=0 is a pass-through.
+func TestTruncateAuditPayloadStrings(t *testing.T) {
+	long := strings.Repeat("a", 500)
+
+	t.Run("oversized string truncated with elided-byte marker", func(t *testing.T) {
+		payload := map[string]any{"note": long}
+		got := truncateAuditPayloadStrings(payload, 100).(map[string]any)
+		s := got["note"].(string)
+		if len(s) >= len(long) {
+			t.Fatalf("string not truncated: len=%d", len(s))
+		}
+		if !strings.Contains(s, truncMarker) {
+			t.Errorf("truncated string missing marker: %q", s)
+		}
+		// The marker reports the elided original-byte count (500 - kept prefix).
+		if !strings.Contains(s, "…(+") {
+			t.Errorf("truncated string missing elided-byte prefix: %q", s)
+		}
+	})
+
+	t.Run("short string unchanged", func(t *testing.T) {
+		payload := map[string]any{"note": "short value"}
+		got := truncateAuditPayloadStrings(payload, 100).(map[string]any)
+		if got["note"] != "short value" {
+			t.Errorf("short string altered: %q", got["note"])
+		}
+	})
+
+	t.Run("recurses into nested maps and slices, keeps short values and keys", func(t *testing.T) {
+		payload := map[string]any{
+			"verdict": "approve",
+			"nested":  map[string]any{"deep": long, "keep": "ok"},
+			"list":    []any{long, "small", map[string]any{"inner": long}},
+		}
+		got := truncateAuditPayloadStrings(payload, 100).(map[string]any)
+		if got["verdict"] != "approve" {
+			t.Errorf("structured key altered: %q", got["verdict"])
+		}
+		nested := got["nested"].(map[string]any)
+		if !strings.Contains(nested["deep"].(string), truncMarker) {
+			t.Errorf("nested map string not truncated: %q", nested["deep"])
+		}
+		if nested["keep"] != "ok" {
+			t.Errorf("nested short value altered: %q", nested["keep"])
+		}
+		list := got["list"].([]any)
+		if !strings.Contains(list[0].(string), truncMarker) {
+			t.Errorf("slice string not truncated: %q", list[0])
+		}
+		if list[1] != "small" {
+			t.Errorf("slice short value altered: %q", list[1])
+		}
+		if !strings.Contains(list[2].(map[string]any)["inner"].(string), truncMarker) {
+			t.Errorf("map-in-slice string not truncated: %q", list[2])
+		}
+	})
+
+	t.Run("non-string scalars, nil, and bare values pass through", func(t *testing.T) {
+		if got := truncateAuditPayloadStrings(nil, 100); got != nil {
+			t.Errorf("nil should pass through, got %+v", got)
+		}
+		if got := truncateAuditPayloadStrings(float64(42), 100); got != float64(42) {
+			t.Errorf("scalar should pass through, got %+v", got)
+		}
+		// A number nested in a map survives; only strings are touched.
+		payload := map[string]any{"n": float64(7), "b": true, "z": nil}
+		got := truncateAuditPayloadStrings(payload, 100).(map[string]any)
+		if got["n"] != float64(7) || got["b"] != true || got["z"] != nil {
+			t.Errorf("non-string values altered: %+v", got)
+		}
+	})
+
+	t.Run("cap<=0 is a pass-through", func(t *testing.T) {
+		payload := map[string]any{"note": long}
+		got := truncateAuditPayloadStrings(payload, 0).(map[string]any)
+		if got["note"] != long {
+			t.Errorf("cap<=0 should not truncate: got %d bytes", len(got["note"].(string)))
+		}
+	})
+}
+
+// TestTruncateAuditPayloadStrings_UTF8Boundary asserts truncation never splits
+// a multi-byte rune: a string of multi-byte runes straddling the cap must stay
+// valid UTF-8 after truncation (the utf8.DecodeLastRuneInString back-off).
+func TestTruncateAuditPayloadStrings_UTF8Boundary(t *testing.T) {
+	// "€" is 3 bytes; 200 of them = 600 bytes, straddling a cap that does not
+	// land on a rune boundary (100 is not a multiple of 3).
+	multi := strings.Repeat("€", 200)
+	payload := map[string]any{"note": multi}
+	got := truncateAuditPayloadStrings(payload, 100).(map[string]any)
+	s := got["note"].(string)
+	// The whole marker-bearing result must be valid UTF-8 (the back-off never
+	// leaves a split rune before the marker).
+	if !utf8.ValidString(s) {
+		t.Errorf("truncated multi-byte string is not valid UTF-8: %q", s)
+	}
+	if !strings.Contains(s, truncMarker) {
+		t.Errorf("truncated multi-byte string missing marker: %q", s)
+	}
+	// The kept prefix must be a whole number of 3-byte runes (<=100 bytes).
+	before := strings.SplitN(s, "…(+", 2)[0]
+	if len(before)%3 != 0 {
+		t.Errorf("prefix length %d is not a rune boundary (multiple of 3)", len(before))
+	}
+}
+
+// TestCollapseCacheEfficiencyStages pins the #1749 cache-stage collapse:
+// Stages is nilled, the run-level rollup scalars are intact, and the helper is
+// nil-safe.
+func TestCollapseCacheEfficiencyStages(t *testing.T) {
+	ce := &CacheEfficiency{
+		CacheReadRatio: 0.5,
+		NetSavingsUSD:  16.75,
+		Stages: []CacheEfficiencyStage{
+			{Source: "agent"},
+			{Source: "plan_review"},
+		},
+	}
+	collapseCacheEfficiencyStages(ce)
+	if ce.Stages != nil {
+		t.Errorf("Stages should be nilled, got %+v", ce.Stages)
+	}
+	if ce.CacheReadRatio != 0.5 || ce.NetSavingsUSD != 16.75 {
+		t.Errorf("rollup scalars altered: %+v", ce)
+	}
+	// nil-safe.
+	collapseCacheEfficiencyStages(nil)
 }
