@@ -145,6 +145,46 @@ func (s *Server) delegatedApproverSubjects(ctx context.Context, runID uuid.UUID)
 // but never counted toward the human quorum, and the approval row does not
 // retain delegated status. Fail-open to 0 on a list error — an unreadable
 // approval history never spuriously advances the gate.
+//
+// Read-after-write serialization (#1734 — deliberately NOT serialized). This
+// count is a read-after-write: approveStageAs calls ApprovalRepo.Submit
+// (which autocommits the approver's row via approvaldb.New(r.pool) — a
+// pool-backed, single-statement INSERT that commits BEFORE Submit returns) and
+// only THEN calls this count, whose ListForStage runs on the SAME single
+// Postgres primary under READ COMMITTED. PR #1733 deferred a concern that two
+// concurrent approvers could each observe only their own row and stall below
+// quorum. That stall is a temporal contradiction and cannot occur today:
+//
+//   - Each approver's own committed row is visible to its own later count
+//     (commit_X < count_X), and READ COMMITTED shows every statement a fresh
+//     snapshot including all rows committed before the statement started.
+//   - The stall requires BOTH counts to precede the OTHER approver's commit:
+//     count_A < commit_B AND count_B < commit_A. Combined with commit_A <
+//     count_A and commit_B < count_B, that implies commit_A < commit_A — a
+//     contradiction. So whichever approver commits LAST always observes the
+//     full quorum in its own count, and the gate is always reachable.
+//
+// Because the race provably does not occur, an in-process mutex (incorrect
+// anyway — the API tier runs multiple replicas) or a Postgres advisory lock
+// would only over-serialize. The safety leg on the two-approvers-reach-quorum
+// path is advanceStage's TransitionStage InvalidTransition guard: a losing /
+// late approve that reaches a stage already off its gate cannot double-advance
+// it (surfaced as an advance-phase error / HTTP 409). NOTE the stale package
+// doc in backend/internal/approval/approval.go still describes a "SELECT FOR
+// UPDATE on the stage row" — the current path holds no such lock; the
+// transition guard is the actual safeguard.
+//
+// Invariants a future change MUST preserve to keep this reasoning sound:
+//   - NEVER route this count (ListForStage) through a read-replica / lagging
+//     read path — a committed row must be immediately visible to the count.
+//   - NEVER evaluate this count BEFORE Submit commits the approver's row.
+//   - NEVER wrap Submit in an uncommitted long-lived transaction still open at
+//     count time (the count would not see the uncommitted sibling row).
+//
+// Pinned by TestPostgres_Submit_ConcurrentQuorum (approval package, pgtest —
+// the last committer always sees full quorum under real Postgres commit
+// interleaving) and TestApproveStageAs_Quorum_* (server package — the happy
+// two-approver advance-once path and the InvalidTransition safety guard).
 func (s *Server) countDistinctEligibleApprovers(ctx context.Context, runID, stageID uuid.UUID, changeAuthor string) int {
 	rows, err := s.cfg.ApprovalRepo.ListForStage(ctx, stageID)
 	if err != nil {
