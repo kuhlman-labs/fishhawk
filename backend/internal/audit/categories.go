@@ -3,7 +3,7 @@ package audit
 import "sort"
 
 // KnownCategories is the curated registry of canonical audit-log category
-// strings (#1764). It is the validation authority behind
+// strings (#1764, extended #1850). It is the validation authority behind
 // fishhawk_await_audit and GET /v0/runs/{run_id}/audit: a wait armed on a
 // category NOT in this set is almost always a misspelling or a
 // wrong-surface string (e.g. the runner-log event "scope_amendment_pending"
@@ -22,9 +22,17 @@ import "sort"
 // Seeded from the full backend/internal inventory: the run/plan/implement/
 // acceptance/deployment lifecycle, the review-lifecycle literals, the
 // scope-amendment + scope-completeness gates, PR/lineage events, the
-// budget/cost/CI signals, and the token/policy/status surfaces. When a new
-// canonical category is introduced, add it here so operators can await it
-// without the allow_unknown escape hatch.
+// budget/cost/CI signals, and the token/policy/status surfaces. #1850
+// closed the remaining gaps — the registry now also covers the API-token
+// issue/revoke events, the board/work-item filing + transition family, the
+// refinement-draft approve/reject decisions, the runner-kind resolution
+// events, the deployment-dispatch failure, and the campaign-lifecycle
+// markers (advanced / gate-acted / issue-started / issue-settled /
+// issue-restarted / paused) written via audit.AppendGlobalChained. When a
+// new canonical category is introduced, add it here so operators can await
+// it without the allow_unknown escape hatch;
+// categories_completeness_test.go's AST sweep fails the build if a
+// non-test backend audit-write emits a category absent from this map.
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -33,6 +41,8 @@ var KnownCategories = map[string]struct{}{
 	"acceptance_skipped_out_of_scope":         {},
 	"acceptance_triage_decided":               {},
 	"anchor_ping_posted":                      {},
+	"api_token_issued":                        {},
+	"api_token_revoked":                       {},
 	"approval_predicate_rejected":             {},
 	"approval_sla_elapsed":                    {},
 	"approval_submitted":                      {},
@@ -41,7 +51,13 @@ var KnownCategories = map[string]struct{}{
 	"branch_reset":                            {},
 	"budget_alert":                            {},
 	"budget_alert_sent":                       {},
+	"campaign_advanced":                       {},
+	"campaign_gate_acted":                     {},
 	"campaign_gate_paged":                     {},
+	"campaign_issue_restarted":                {},
+	"campaign_issue_settled":                  {},
+	"campaign_issue_started":                  {},
+	"campaign_paused":                         {},
 	"child_pushed":                            {},
 	"child_redriven":                          {},
 	"children_settled":                        {},
@@ -59,6 +75,7 @@ var KnownCategories = map[string]struct{}{
 	"cost_recorded":                           {},
 	"deploy_preflight_refused":                {},
 	"deploy_run":                              {},
+	"deployment_dispatch_failed":              {},
 	"deployment_dispatched":                   {},
 	"deployment_outcome_recorded":             {},
 	"deployment_rollback_completed":           {},
@@ -83,6 +100,7 @@ var KnownCategories = map[string]struct{}{
 	"operator_commit_vouched":                 {},
 	"operator_scope_path_undelivered":         {},
 	"parent_awaiting_redrive":                 {},
+	"plan_acceptance_precheck":                {},
 	"plan_budget_override_acknowledged":       {},
 	"plan_coerced":                            {},
 	"plan_decomposed":                         {},
@@ -100,7 +118,9 @@ var KnownCategories = map[string]struct{}{
 	"plan_schema_retry":                       {},
 	"plan_scope_cap_override_acknowledged":    {},
 	"plan_scope_precheck":                     {},
+	"plan_scope_regression":                   {},
 	"plan_surface_sweep":                      {},
+	"plan_test_sweep":                         {},
 	"plan_warnings":                           {},
 	"plan_violates_budget":                    {},
 	"plan_violates_periodic_budget":           {},
@@ -113,9 +133,14 @@ var KnownCategories = map[string]struct{}{
 	"pr_review_posted":                        {},
 	"pr_review_submitted":                     {},
 	"pr_status_comment_posted":                {},
+	"product_report_filed":                    {},
 	"pull_request_closed_after_review_reject": {},
 	"pull_request_failed":                     {},
 	"pull_request_opened":                     {},
+	"refinement_draft_approved":               {},
+	"refinement_draft_edited":                 {},
+	"refinement_draft_rejected":               {},
+	"refinement_filing_completed":             {},
 	"release_cut":                             {},
 	"release_published":                       {},
 	"reviewer_capability_unavailable":         {},
@@ -126,6 +151,8 @@ var KnownCategories = map[string]struct{}{
 	"run_dispatched":                          {},
 	"run_rejected_budget":                     {},
 	"run_rejected_misconfigured":              {},
+	"runner_kind_mismatch":                    {},
+	"runner_kind_resolved":                    {},
 	"runtime_observed":                        {},
 	"scope_amendment_decided":                 {},
 	"scope_amendment_requested":               {},
@@ -143,6 +170,8 @@ var KnownCategories = map[string]struct{}{
 	"stage_retried":                           {},
 	"status_comment_posted":                   {},
 	"trace_uploaded":                          {},
+	"work_item_filed":                         {},
+	"work_item_transitioned":                  {},
 }
 
 // knownCategoryList is the sorted slice form of KnownCategories, computed
