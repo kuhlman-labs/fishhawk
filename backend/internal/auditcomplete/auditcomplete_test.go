@@ -135,28 +135,31 @@ func TestCompute_AcceptanceSkippedOutOfScope_ExemptsTraceRule(t *testing.T) {
 	})
 }
 
-// TestCompute_AcceptanceShortCircuit_ExemptsTraceRule pins the #1728 (E41.5)
-// basis-gated exemption: an acceptance stage the orchestrator SHORT-CIRCUITED
-// (an acceptance_outcome_recorded entry carrying basis=empty-criteria keyed to
-// it) is succeeded yet ships NO trace bundle — Compute must still pass it. The
-// negative control proves the exemption is BASIS-GATED, not blanket: an
-// identical succeeded acceptance stage whose acceptance_outcome_recorded entry
-// carries NO basis (a normal validator-shipped verdict) still fails
-// trace_missing. This is the cross-boundary assertion that the orchestrator's
-// emitted verdict shape actually satisfies the downstream trace-exemption gate.
+// TestCompute_AcceptanceShortCircuit_ExemptsTraceRule pins the #1728 (E41.5) /
+// #1748 (E41.6) basis-gated exemption boundary: an acceptance stage the
+// orchestrator SHORT-CIRCUITED (an acceptance_outcome_recorded entry carrying an
+// exempt basis keyed to it) is succeeded yet ships NO trace bundle — Compute
+// must still pass it. The exemption is BASIS-GATED, not blanket: it honors
+// EXACTLY the two known basis values (empty-criteria, all-skip-with-basis); a
+// foreign/unknown basis, and a normal validator-shipped verdict with NO basis at
+// all, both still fail trace_missing. This is the cross-boundary assertion that
+// the orchestrator's emitted verdict shape actually satisfies the downstream
+// trace-exemption gate.
 func TestCompute_AcceptanceShortCircuit_ExemptsTraceRule(t *testing.T) {
-	// Build the acceptance_outcome_recorded payload with the SAME shared
-	// constants the orchestrator emit helper and the auditcomplete reader use —
-	// a producer/consumer drift is then a compile error, not a silent test miss.
-	shortCircuitPayload := func(t *testing.T, withBasis bool) json.RawMessage {
+	// Build the acceptance_outcome_recorded payload. An empty basis string means
+	// "omit the basis field entirely" (a normal validator-shipped verdict). The
+	// exempt cases reference the SAME shared constants the orchestrator emit
+	// helper and the auditcomplete reader use, so a producer/consumer drift is a
+	// compile error, not a silent test miss.
+	shortCircuitPayload := func(t *testing.T, basis string) json.RawMessage {
 		t.Helper()
 		m := map[string]any{
 			"verdict":        "passed",
 			"outcome":        "accepted",
 			"criteria_total": 0,
 		}
-		if withBasis {
-			m[plan.AcceptanceBasisKey] = plan.AcceptanceBasisEmptyCriteria
+		if basis != "" {
+			m[plan.AcceptanceBasisKey] = basis
 		}
 		b, err := json.Marshal(m)
 		if err != nil {
@@ -165,7 +168,7 @@ func TestCompute_AcceptanceShortCircuit_ExemptsTraceRule(t *testing.T) {
 		return b
 	}
 
-	build := func(t *testing.T, withBasis bool) (uuid.UUID, uuid.UUID, auditcomplete.Deps) {
+	build := func(t *testing.T, basis string) (uuid.UUID, uuid.UUID, auditcomplete.Deps) {
 		t.Helper()
 		runID := uuid.New()
 		planS := mkStage(runID, 1, run.StageTypePlan, run.StageStateSucceeded)
@@ -184,47 +187,61 @@ func TestCompute_AcceptanceShortCircuit_ExemptsTraceRule(t *testing.T) {
 		au.appendChained(t, runID, &impl.ID, "trace_uploaded", traceVariantPayload("raw"))
 		au.appendChained(t, runID, &impl.ID, "trace_uploaded", traceVariantPayload("redacted"))
 		// The short-circuited acceptance stage ships NO trace; it records only the
-		// acceptance_outcome_recorded verdict (with or without the basis marker).
-		au.appendChained(t, runID, &acc.ID, "acceptance_outcome_recorded", shortCircuitPayload(t, withBasis))
+		// acceptance_outcome_recorded verdict (with or without an exempt basis).
+		au.appendChained(t, runID, &acc.ID, "acceptance_outcome_recorded", shortCircuitPayload(t, basis))
 		return runID, acc.ID, deps(runs, arts, au)
 	}
 
-	t.Run("basis=empty-criteria -> pass despite no acceptance trace", func(t *testing.T) {
-		runID, _, d := build(t, true)
-		state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
-		if err != nil {
-			t.Fatalf("Compute: %v", err)
-		}
-		if state != stagecheck.StatePass {
-			t.Fatalf("state = %s, want pass; missing=%+v", state, missing)
-		}
-		if len(missing) != 0 {
-			t.Fatalf("want no missing items; got %+v", missing)
-		}
-	})
-
-	t.Run("no basis (normal verdict) -> trace_missing for the acceptance stage", func(t *testing.T) {
-		runID, accID, d := build(t, false)
-		state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
-		if err != nil {
-			t.Fatalf("Compute: %v", err)
-		}
-		if state != stagecheck.StateFail {
-			t.Fatalf("state = %s, want fail (a no-basis acceptance verdict still needs its trace); missing=%+v", state, missing)
-		}
-		if !containsKind(missing, auditcomplete.MissingTrace) {
-			t.Fatalf("want a trace_missing item for the unmarked acceptance stage; got %+v", missing)
-		}
-		named := false
-		for _, m := range missing {
-			if m.Kind == auditcomplete.MissingTrace && strings.Contains(m.Detail, "acceptance") {
-				named = true
+	// Exempt basis values -> pass despite no acceptance trace.
+	for _, basis := range []string{plan.AcceptanceBasisEmptyCriteria, plan.AcceptanceBasisAllSkipWithBasis} {
+		t.Run("basis="+basis+" -> pass despite no acceptance trace", func(t *testing.T) {
+			runID, _, d := build(t, basis)
+			state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+			if err != nil {
+				t.Fatalf("Compute: %v", err)
 			}
-		}
-		if !named {
-			t.Errorf("trace_missing detail should name the acceptance stage (%s); got %+v", accID, missing)
-		}
-	})
+			if state != stagecheck.StatePass {
+				t.Fatalf("state = %s, want pass; missing=%+v", state, missing)
+			}
+			if len(missing) != 0 {
+				t.Fatalf("want no missing items; got %+v", missing)
+			}
+		})
+	}
+
+	// Non-exempt cases -> trace_missing for the acceptance stage. A foreign basis
+	// is NOT one of the two honored values; a normal verdict carries no basis at
+	// all. Both still require the trace.
+	for _, tc := range []struct {
+		name  string
+		basis string
+	}{
+		{name: "foreign basis (not honored) -> trace_missing", basis: "bogus-basis"},
+		{name: "no basis (normal verdict) -> trace_missing", basis: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, accID, d := build(t, tc.basis)
+			state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+			if err != nil {
+				t.Fatalf("Compute: %v", err)
+			}
+			if state != stagecheck.StateFail {
+				t.Fatalf("state = %s, want fail (a non-exempt acceptance verdict still needs its trace); missing=%+v", state, missing)
+			}
+			if !containsKind(missing, auditcomplete.MissingTrace) {
+				t.Fatalf("want a trace_missing item for the non-exempt acceptance stage; got %+v", missing)
+			}
+			named := false
+			for _, m := range missing {
+				if m.Kind == auditcomplete.MissingTrace && strings.Contains(m.Detail, "acceptance") {
+					named = true
+				}
+			}
+			if !named {
+				t.Errorf("trace_missing detail should name the acceptance stage (%s); got %+v", accID, missing)
+			}
+		})
+	}
 }
 
 // TestCompute_AcceptanceOutcomeReadError_Transient pins the #1728 read-failure

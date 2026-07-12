@@ -693,6 +693,11 @@ func TestBuild_Plan_ExternallyTriggeredCriteriaGuidance(t *testing.T) {
 		"skip-expected",
 		"posture-A",
 		"wedge the merge gate",
+		// #1748: the plan-derivable marker + the all-skip short-circuit.
+		"skip_expected",
+		"expectation_basis",
+		"short-circuit",
+		"all-skip-with-basis",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {

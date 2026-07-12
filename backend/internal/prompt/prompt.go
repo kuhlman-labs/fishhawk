@@ -2122,6 +2122,11 @@ func buildPlan(t Trigger) string {
 	b.WriteString("- `source_ref`, `verify_hint`, `preconditions` are OPTIONAL: `source_ref` points at where an explicit criterion " +
 		"came from (an issue anchor or spec section); `verify_hint` hints how to verify it; `preconditions` is an array of strings " +
 		"that must hold before the criterion can be checked.\n")
+	b.WriteString("- `skip_expected`, `expectation_basis` are OPTIONAL (see the Externally-triggered criteria rule below): set " +
+		"`skip_expected` to `true` on a criterion the sandboxed acceptance agent cannot validate against the localhost preview, and " +
+		"then `expectation_basis` (REQUIRED when `skip_expected` is `true`) MUST cite where the behavior is actually validated (the " +
+		"integration/e2e test with a fake). Omit both on a drivable criterion — a legacy criterion without `skip_expected` is " +
+		"unaffected.\n")
 	b.WriteString("verification.out_of_scope escape hatch: an OPTIONAL array of non-empty strings stating what the change deliberately " +
 		"does NOT cover. It is the mechanism a test-only or doc-only change uses to declare it intentionally authors no " +
 		"acceptance_criteria — populate out_of_scope with the reason instead of leaving the intent unstated. Author " +
@@ -2129,11 +2134,14 @@ func buildPlan(t Trigger) string {
 	b.WriteString("Externally-triggered criteria rule: the acceptance stage runs the acceptance agent under a DEFAULT-DENY egress " +
 		"sandbox against the localhost preview ONLY — it CANNOT reach GitHub or any third-party service to close an issue, push a " +
 		"commit, or fire a webhook. So a criterion whose trigger requires an external event the sandboxed acceptance agent cannot " +
-		"produce MUST be authored up front as EITHER (a) an explicit skip-expected criterion whose statement/verify_hint names the " +
-		"expectation basis and points at the integration / end-to-end test that actually validates the behavior with a fake, OR (b) " +
+		"produce MUST be authored up front as EITHER (a) an explicit skip-expected criterion — set `skip_expected: true` and cite " +
+		"where the behavior is actually validated in `expectation_basis` (the integration / end-to-end test with a fake), OR (b) " +
 		"covered by verification.out_of_scope with that reason — so it never enters the failed/retry path. Do NOT author it as a " +
 		"live-service criterion: the acceptance agent will correctly skip it (posture-A can't-exhibit) and, absent this guidance, " +
-		"that skip can wedge the merge gate.\n")
+		"that skip can wedge the merge gate. When EVERY criterion in the plan is marked `skip_expected` with an `expectation_basis`, " +
+		"the orchestrator short-circuits acceptance dispatch straight to a passed verdict (basis `all-skip-with-basis`) with no " +
+		"runner spawn — there is nothing the sandboxed agent could observe. The marker is OPTIONAL and the plan gate does not reject " +
+		"a legacy unmarked plan.\n")
 	b.WriteString("\n")
 	b.WriteString("Cross-boundary test rule: when scope.files spans multiple architectural layers (request/response " +
 		"payload, domain type, persistence, render/consumer), verification.test_strategy MUST name an " +

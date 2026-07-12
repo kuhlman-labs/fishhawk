@@ -231,6 +231,13 @@
             "required": ["source"]
           },
           "then": { "required": ["rationale"] }
+        },
+        {
+          "if": {
+            "properties": { "skip_expected": { "const": true } },
+            "required": ["skip_expected"]
+          },
+          "then": { "required": ["expectation_basis"] }
         }
       ],
       "properties": {
@@ -270,6 +277,15 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Optional. Preconditions that must hold before this criterion can be verified."
+        },
+        "skip_expected": {
+          "type": "boolean",
+          "description": "Optional (#1748). Marks a criterion the acceptance agent cannot validate against the localhost preview — its trigger needs an external event the default-deny egress sandbox cannot produce. When true, expectation_basis is required (enforced by the presence-aware if/then conditional). A plan whose EVERY criterion is so marked short-circuits acceptance dispatch to a passed verdict (basis all-skip-with-basis). Omitted on a legacy criterion never triggers the then-branch."
+        },
+        "expectation_basis": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Required when skip_expected is true (#1748). Cites where the criterion's expectation is actually validated — e.g. the integration / end-to-end test with a fake that exercises the externally-triggered behavior."
         }
       }
     },

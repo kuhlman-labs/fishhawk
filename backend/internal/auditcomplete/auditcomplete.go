@@ -301,18 +301,19 @@ func Compute(ctx context.Context, runID uuid.UUID, deps Deps) (stagecheck.State,
 		}
 	}
 
-	// #1728 (E41.5): an acceptance stage the orchestrator SHORT-CIRCUITED for a
-	// zero-acceptance_criteria / zero-out_of_scope plan records a verdict=passed
-	// acceptance_outcome_recorded entry at dispatch time and ships NO trace
-	// bundle — yet is legitimately succeeded. Exempt it from the trace-required
-	// rule the same way the E38.3 skip marker is exempted. The exemption accepts
-	// ONLY the known basis value "empty-criteria" (the shared
-	// plan.AcceptanceBasisEmptyCriteria constant): any other basis — or a normal
-	// validator-recorded verdict, which never sets basis at all — is NOT exempted
-	// and still requires its trace, so a normally-dispatched acceptance stage is
-	// unaffected. ("all-skip-with-basis" is added by #1748 when it ships.) A read
-	// failure is transient (matching the skip-marker read above): return it so
-	// the caller retries rather than silently under- or over-gating.
+	// #1728 (E41.5) / #1748 (E41.6): an acceptance stage the orchestrator
+	// SHORT-CIRCUITED records a verdict=passed acceptance_outcome_recorded entry
+	// at dispatch time and ships NO trace bundle — yet is legitimately succeeded.
+	// Exempt it from the trace-required rule the same way the E38.3 skip marker
+	// is exempted. The exemption accepts ONLY the two known basis values —
+	// "empty-criteria" (zero acceptance_criteria / zero out_of_scope) and
+	// "all-skip-with-basis" (every criterion skip_expected with basis), the
+	// shared plan.AcceptanceBasisEmptyCriteria / plan.AcceptanceBasisAllSkipWithBasis
+	// constants: any OTHER basis — or a normal validator-recorded verdict, which
+	// never sets basis at all — is NOT exempted and still requires its trace, so a
+	// normally-dispatched acceptance stage is unaffected. A read failure is
+	// transient (matching the skip-marker read above): return it so the caller
+	// retries rather than silently under- or over-gating.
 	outcomeEntries, err := deps.Audit.ListForRunByCategory(ctx, runID, "acceptance_outcome_recorded")
 	if err != nil {
 		return stagecheck.StatePending, nil, fmt.Errorf("auditcomplete: acceptance outcome entries: %w", err)
@@ -325,7 +326,7 @@ func Compute(ctx context.Context, runID uuid.UUID, deps Deps) (stagecheck.State,
 		if json.Unmarshal(e.Payload, &p) != nil {
 			continue
 		}
-		if b, ok := p[plan.AcceptanceBasisKey].(string); ok && b == plan.AcceptanceBasisEmptyCriteria {
+		if b, ok := p[plan.AcceptanceBasisKey].(string); ok && (b == plan.AcceptanceBasisEmptyCriteria || b == plan.AcceptanceBasisAllSkipWithBasis) {
 			skippedStageIDs[*e.StageID] = struct{}{}
 		}
 	}

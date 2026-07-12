@@ -3275,6 +3275,114 @@ func TestAdvance_AcceptanceShortCircuitEmptyCriteria(t *testing.T) {
 	})
 }
 
+// TestAdvance_AcceptanceShortCircuitAllSkipWithBasis pins the #1748 (E41.6)
+// pre-spawn short-circuit: when EVERY acceptance criterion carries
+// skip_expected with a non-empty expectation_basis, Advance walks the acceptance
+// stage straight to succeeded (NOT dispatched), records exactly one
+// acceptance_outcome_recorded verdict=passed carrying basis=all-skip-with-basis
+// with criteria_total/criteria_skipped == N (and NO acceptance_dispatched, NO
+// skip marker, NO preview), and drives the run to succeeded in the same call.
+// The mixed control (one drivable criterion) proves the predicate gates the
+// behavior: it takes the normal operator-dispatched path with no short-circuit
+// entry.
+func TestAdvance_AcceptanceShortCircuitAllSkipWithBasis(t *testing.T) {
+	allSkip := []map[string]any{
+		{"id": "webhook-fires", "statement": "webhook fires on close", "source": "inferred", "rationale": "external", "skip_expected": true, "expectation_basis": "validated in webhook_integration_test.go with a fake"},
+		{"id": "issue-closes", "statement": "issue auto-closes", "source": "inferred", "rationale": "external", "skip_expected": true, "expectation_basis": "validated in closer_e2e_test.go"},
+	}
+
+	t.Run("every criterion skip_expected with basis -> short-circuit records verdict", func(t *testing.T) {
+		planBytes := acceptanceSkipPlanBytes(t, nil, allSkip)
+		r, stages, _, ra, o := seedAcceptanceSkipRun(t, planBytes)
+
+		out, err := o.Advance(context.Background(), r.ID)
+		if err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+		if out != OutcomeRunCompleted {
+			t.Errorf("Outcome = %q, want run_completed (the short-circuit re-enters Advance to complete the run)", out)
+		}
+		if stages[3].State != run.StageStateSucceeded {
+			t.Errorf("acceptance stage state = %q, want succeeded (short-circuited, NOT dispatched)", stages[3].State)
+		}
+		if r.State != run.StateSucceeded {
+			t.Errorf("run state = %q, want succeeded", r.State)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_dispatched"); n != 0 {
+			t.Errorf("acceptance_dispatched entries = %d, want 0 on the short-circuit path", n)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_skipped_out_of_scope"); n != 0 {
+			t.Errorf("acceptance_skipped_out_of_scope entries = %d, want 0 (all-skip records a verdict, not a skip marker)", n)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_outcome_recorded"); n != 1 {
+			t.Fatalf("acceptance_outcome_recorded entries = %d, want 1", n)
+		}
+		var verdict audit.ChainAppendParams
+		for _, p := range ra.appended {
+			if p.Category == "acceptance_outcome_recorded" {
+				verdict = p
+			}
+		}
+		if verdict.StageID == nil || *verdict.StageID != stages[3].ID {
+			t.Errorf("verdict stage_id = %v, want the acceptance stage %s", verdict.StageID, stages[3].ID)
+		}
+		for _, want := range []string{
+			`"verdict":"passed"`,
+			`"outcome":"accepted"`,
+			`"criteria_total":2`,
+			`"criteria_skipped":2`,
+			`"criteria_passed":0`,
+			`"criteria_failed":0`,
+			fmt.Sprintf("%q:%q", plan.AcceptanceBasisKey, plan.AcceptanceBasisAllSkipWithBasis),
+		} {
+			if !strings.Contains(string(verdict.Payload), want) {
+				t.Errorf("acceptance_outcome_recorded payload missing %s: %s", want, verdict.Payload)
+			}
+		}
+	})
+
+	// Control: one drivable criterion (no marker) among skip-expected ones is
+	// NOT all-skip-with-basis (nor empty-criteria, nor out_of_scope) -> normal
+	// dispatch, no short-circuit entry.
+	t.Run("mixed: one drivable criterion -> still dispatches", func(t *testing.T) {
+		mixed := []map[string]any{
+			allSkip[0],
+			{"id": "get-returns-200", "statement": "GET returns 200", "source": "explicit", "source_ref": "#1", "blocking": true},
+		}
+		planBytes := acceptanceSkipPlanBytes(t, nil, mixed)
+		r, stages, _, ra, o := seedAcceptanceSkipRun(t, planBytes)
+
+		if _, err := o.Advance(context.Background(), r.ID); err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+		if stages[3].State != run.StageStateDispatched {
+			t.Errorf("acceptance stage state = %q, want dispatched (a drivable criterion -> not short-circuitable)", stages[3].State)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_outcome_recorded"); n != 0 {
+			t.Errorf("acceptance_outcome_recorded entries = %d, want 0 at dispatch (no short-circuit)", n)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_dispatched"); n != 1 {
+			t.Errorf("acceptance_dispatched entries = %d, want 1 (operator-dispatched path)", n)
+		}
+	})
+
+	// Defensive branch: a nil Audit is best-effort — the short-circuit still
+	// walks the acceptance stage to succeeded and completes the run.
+	t.Run("nil audit -> still short-circuits", func(t *testing.T) {
+		planBytes := acceptanceSkipPlanBytes(t, nil, allSkip)
+		r, stages, _, _, o := seedAcceptanceSkipRun(t, planBytes)
+		o.Audit = nil
+
+		out, err := o.Advance(context.Background(), r.ID)
+		if err != nil {
+			t.Fatalf("Advance: %v", err)
+		}
+		if out != OutcomeRunCompleted || stages[3].State != run.StageStateSucceeded || r.State != run.StateSucceeded {
+			t.Errorf("nil-audit short-circuit: out=%q acceptance=%q run=%q, want run_completed/succeeded/succeeded", out, stages[3].State, r.State)
+		}
+	})
+}
+
 // TestAdvance_ImplementStage_NoAcceptanceEmit pins that a non-acceptance
 // dispatch appends no acceptance_dispatched entry (the emit is stage-typed).
 func TestAdvance_ImplementStage_NoAcceptanceEmit(t *testing.T) {
