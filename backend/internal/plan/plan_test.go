@@ -1404,13 +1404,15 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // as a drift guard: any byte change (an unintended edit, or a docs/spec
 // sync that did not land in the embedded copy) fails this test deliberately.
 // The hash is re-pinned only for a sanctioned additive-optional change within
-// standard_v1.x — most recently the #1544 top-level surface_sweep_exemptions
-// field (before that, the #1529 verification.acceptance_criteria / out_of_scope
-// fields). A standard_v1 plan that omits the new optional fields must still
+// standard_v1.x — most recently the #1748 acceptance-criterion skip_expected /
+// expectation_basis marker (before that, the #1544 top-level
+// surface_sweep_exemptions field, and the #1529
+// verification.acceptance_criteria / out_of_scope fields). A standard_v1 plan
+// that omits the new optional fields must still
 // validate unchanged through the plan-only Validate entry point (asserted
 // below), which is the proof the change did not break the schema in place.
 func TestPlanSchemaFrozen(t *testing.T) {
-	const wantHash = "4b57026debcfa77847a6cd7a54c458d398a9a06d3aecf3babe96379ad01a7f13"
+	const wantHash = "ab98a6bf5c47adb7cb8e1980756511bfda9c67683de685313f4eec3364491b14"
 	b, err := os.ReadFile("schemas/plan-standard-v1.schema.json")
 	if err != nil {
 		t.Fatalf("read embedded plan schema: %v", err)
@@ -1522,5 +1524,79 @@ func TestParse_AcceptanceCriteria_InferredMissingRationale_IsSchemaError(t *test
 func TestParse_NoAcceptanceCriteria_StillValidates(t *testing.T) {
 	if err := plan.Validate(readFixture(t, "valid/example.json")); err != nil {
 		t.Fatalf("Validate: %v", err)
+	}
+}
+
+// --- acceptance-criterion skip_expected / expectation_basis (#1748) ---
+
+// TestParse_AcceptanceCriteria_SkipExpectedWithBasis_RoundTrips proves the new
+// additive fields ACCEPT and decode: a criterion carrying skip_expected:true
+// with a non-empty expectation_basis validates and round-trips through Parse.
+func TestParse_AcceptanceCriteria_SkipExpectedWithBasis_RoundTrips(t *testing.T) {
+	m := planfixture.Valid(acceptanceCriteriaOption(
+		map[string]any{
+			"id":                "webhook-skip",
+			"statement":         "the webhook fires on close",
+			"source":            "inferred",
+			"rationale":         "external trigger the sandbox cannot produce",
+			"skip_expected":     true,
+			"expectation_basis": "validated in webhook_integration_test.go with a fake",
+		},
+	))
+	p, err := plan.Parse(marshalFixture(t, m))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ac := p.Verification.AcceptanceCriteria
+	if len(ac) != 1 {
+		t.Fatalf("acceptance_criteria len = %d, want 1", len(ac))
+	}
+	if !ac[0].SkipExpected {
+		t.Errorf("criteria[0].SkipExpected = false, want true")
+	}
+	if got, want := ac[0].ExpectationBasis, "validated in webhook_integration_test.go with a fake"; got != want {
+		t.Errorf("criteria[0].ExpectationBasis = %q, want %q", got, want)
+	}
+}
+
+// TestParse_AcceptanceCriteria_UnmarkedLegacy_StillValidates is the binding
+// approval-condition proof: a legacy criterion that omits skip_expected entirely
+// (and therefore has no expectation_basis) validates successfully — the
+// presence-aware if/then never triggers the then-branch when skip_expected is
+// absent, so older plans are unaffected.
+func TestParse_AcceptanceCriteria_UnmarkedLegacy_StillValidates(t *testing.T) {
+	m := planfixture.Valid(acceptanceCriteriaOption(
+		map[string]any{"id": "legacy", "statement": "GET returns 200", "source": "explicit", "source_ref": "#1"},
+	))
+	if err := plan.Validate(marshalFixture(t, m)); err != nil {
+		t.Fatalf("Validate: an unmarked legacy criterion must validate, got %v", err)
+	}
+}
+
+// TestParse_AcceptanceCriteria_SkipExpectedMissingBasis_IsSchemaError asserts
+// the new presence-aware if/then conditional: skip_expected:true WITHOUT
+// expectation_basis is rejected as a *SchemaError.
+func TestParse_AcceptanceCriteria_SkipExpectedMissingBasis_IsSchemaError(t *testing.T) {
+	m := planfixture.Valid(acceptanceCriteriaOption(
+		map[string]any{"id": "marked-no-basis", "statement": "webhook fires", "source": "explicit", "source_ref": "#1", "skip_expected": true},
+	))
+	err := plan.Validate(marshalFixture(t, m))
+	var se *plan.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError (skip_expected:true requires expectation_basis)", err)
+	}
+}
+
+// TestParse_AcceptanceCriteria_MisspelledProperty_IsSchemaError asserts a typo'd
+// property inside a criterion is still rejected via additionalProperties:false —
+// the second allOf branch does not loosen the closed property set.
+func TestParse_AcceptanceCriteria_MisspelledProperty_IsSchemaError(t *testing.T) {
+	m := planfixture.Valid(acceptanceCriteriaOption(
+		map[string]any{"id": "typo", "statement": "a thing", "source": "explicit", "source_ref": "#1", "skip_expcted": true},
+	))
+	err := plan.Validate(marshalFixture(t, m))
+	var se *plan.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError (a misspelled criterion property is rejected)", err)
 	}
 }

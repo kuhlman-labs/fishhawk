@@ -224,6 +224,72 @@ func TestAcceptanceSkippableEmptyCriteria_TruthTable(t *testing.T) {
 	}
 }
 
+// (predicate: AcceptanceSkippableAllSkipWithBasis) The full truth table of the
+// all-skip-with-basis short-circuit condition (#1748): true only when there is
+// at least one criterion AND every criterion carries skip_expected with a
+// non-empty (trimmed) expectation_basis. A single drivable criterion, a marked
+// criterion with an empty/whitespace basis, or an empty criteria set all yield
+// false. It is disjoint from AcceptanceSkippableEmptyCriteria (which requires
+// zero criteria), so an empty set is false here.
+func TestAcceptanceSkippableAllSkipWithBasis_TruthTable(t *testing.T) {
+	cases := []struct {
+		name string
+		v    Verification
+		want bool
+	}{
+		{
+			name: "all marked with basis -> skippable",
+			v: Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{ID: "a1", Statement: "webhook fires", Source: CriterionSourceInferred, Rationale: "external", SkipExpected: true, ExpectationBasis: "validated in webhook_integration_test.go with a fake"},
+					{ID: "a2", Statement: "issue closes", Source: CriterionSourceInferred, Rationale: "external", SkipExpected: true, ExpectationBasis: "validated in closer_e2e_test.go"},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "mixed: one drivable (no marker) -> NOT skippable",
+			v: Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{ID: "a1", Statement: "webhook fires", Source: CriterionSourceInferred, Rationale: "external", SkipExpected: true, ExpectationBasis: "validated in webhook_integration_test.go"},
+					{ID: "a2", Statement: "GET returns 200", Source: CriterionSourceExplicit, SourceRef: "#1"},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "marked but empty basis -> NOT skippable",
+			v: Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{ID: "a1", Statement: "webhook fires", Source: CriterionSourceInferred, Rationale: "external", SkipExpected: true, ExpectationBasis: ""},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "marked but whitespace-only basis -> NOT skippable",
+			v: Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{ID: "a1", Statement: "webhook fires", Source: CriterionSourceInferred, Rationale: "external", SkipExpected: true, ExpectationBasis: "   \t "},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "empty criteria -> NOT skippable (disjoint from empty-criteria predicate)",
+			v:    Verification{},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := AcceptanceSkippableAllSkipWithBasis(tc.v); got != tc.want {
+				t.Errorf("AcceptanceSkippableAllSkipWithBasis = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // (clean contract) A fully clean criteria set returns a NON-NIL empty slice, so
 // a payload can distinguish "checked and clean" ([]) from "never checked".
 func TestEvaluateAcceptanceCriteria_CleanReturnsNonNilEmpty(t *testing.T) {

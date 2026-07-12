@@ -1,5 +1,7 @@
 package plan
 
+import "strings"
+
 // acceptance_check.go holds the pure, deterministic acceptance-criteria rule
 // set (#1596, E34.5 / ADR-052). It lives in the plan package — which already
 // owns Verification/AcceptanceCriterion and imports no project packages — so it
@@ -139,12 +141,17 @@ const (
 	// it, so its presence unambiguously discriminates the pre-spawn
 	// short-circuit from an ordinary validator-shipped verdict.
 	AcceptanceBasisKey = "basis"
-	// AcceptanceBasisEmptyCriteria is the ONLY basis value auditcomplete honors
-	// for the trace exemption (#1728): an approved plan with ZERO
-	// acceptance_criteria AND ZERO verification.out_of_scope. A future
-	// "all-skip-with-basis" basis is added by #1748 when it ships; until then,
-	// any other basis value is NOT exempted.
+	// AcceptanceBasisEmptyCriteria is a basis value auditcomplete honors for the
+	// trace exemption (#1728): an approved plan with ZERO acceptance_criteria AND
+	// ZERO verification.out_of_scope.
 	AcceptanceBasisEmptyCriteria = "empty-criteria"
+	// AcceptanceBasisAllSkipWithBasis is the second basis value auditcomplete
+	// honors for the trace exemption (#1748): an approved plan whose EVERY
+	// acceptance criterion carries skip_expected with a non-empty
+	// expectation_basis — so there is nothing the sandboxed acceptance agent
+	// could observe and the stage short-circuits to a passed verdict with no
+	// runner spawn. Any basis value OTHER than these two is NOT exempted.
+	AcceptanceBasisAllSkipWithBasis = "all-skip-with-basis"
 )
 
 // AcceptanceSkippableEmptyCriteria reports whether a plan's verification carries
@@ -163,4 +170,29 @@ const (
 // justification is present.
 func AcceptanceSkippableEmptyCriteria(v Verification) bool {
 	return len(v.AcceptanceCriteria) == 0 && len(v.OutOfScope) == 0
+}
+
+// AcceptanceSkippableAllSkipWithBasis reports whether a plan's verification
+// carries at least one acceptance criterion AND EVERY criterion is marked
+// skip_expected with a non-empty expectation_basis — the #1748 condition under
+// which no criterion can be validated against the localhost preview, so the
+// orchestrator short-circuits the acceptance stage straight to a passed verdict
+// (basis AcceptanceBasisAllSkipWithBasis) with no runner spawn and no preview.
+//
+// It requires len(AcceptanceCriteria) > 0, so it is disjoint from
+// AcceptanceSkippableEmptyCriteria (which requires zero criteria): at most one
+// of the two short-circuit predicates fires for any given plan. A single
+// criterion that is drivable (SkipExpected==false) or marked but missing a
+// basis (whitespace-only ExpectationBasis) makes this false — the stage then
+// dispatches normally so the drivable criterion is actually validated.
+func AcceptanceSkippableAllSkipWithBasis(v Verification) bool {
+	if len(v.AcceptanceCriteria) == 0 {
+		return false
+	}
+	for _, c := range v.AcceptanceCriteria {
+		if !c.SkipExpected || strings.TrimSpace(c.ExpectationBasis) == "" {
+			return false
+		}
+	}
+	return true
 }

@@ -347,6 +347,17 @@ type AcceptanceCriterion struct {
 	Blocking      *bool    `json:"blocking,omitempty"`
 	VerifyHint    string   `json:"verify_hint,omitempty"`
 	Preconditions []string `json:"preconditions,omitempty"`
+	// SkipExpected marks a criterion the acceptance agent cannot validate
+	// against the localhost preview (its trigger needs an external event the
+	// default-deny egress sandbox cannot produce). When true, ExpectationBasis
+	// is required (enforced by the schema's presence-aware if/then). A plan
+	// whose every criterion is so marked short-circuits acceptance dispatch to a
+	// passed verdict (AcceptanceBasisAllSkipWithBasis). Additive-optional (#1748).
+	SkipExpected bool `json:"skip_expected,omitempty"`
+	// ExpectationBasis cites where the criterion's expectation is actually
+	// validated (e.g. the integration/e2e test with a fake). Required when
+	// SkipExpected is true.
+	ExpectationBasis string `json:"expectation_basis,omitempty"`
 }
 
 // CriterionSource is the provenance of an acceptance criterion, drawn from a

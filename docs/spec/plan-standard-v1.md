@@ -183,6 +183,10 @@ Optional array. Each entry is a provenance-tagged acceptance criterion. The `id`
 | `blocking` | no | Whether failing the criterion blocks acceptance. **Defaults to `true`**; downstream consumers apply the default when omitted. |
 | `verify_hint` | no | A hint to the acceptance executor on how to verify. |
 | `preconditions` | no | Conditions that must hold before the criterion can be verified. |
+| `skip_expected` | no | Marks a criterion the acceptance agent cannot validate against the localhost preview (its trigger needs an external event the default-deny egress sandbox cannot produce). Optional boolean; omitting it leaves the criterion drivable as usual. |
+| `expectation_basis` | only when `skip_expected = true` | Cites where the criterion's expectation is actually validated — e.g. the integration/e2e test with a fake. A schema `if/then` conditional makes it required when `skip_expected` is `true` (a marked criterion without a basis is a `*SchemaError`). |
+
+When **every** criterion in `acceptance_criteria` carries `skip_expected: true` with a non-empty `expectation_basis`, the orchestrator short-circuits acceptance dispatch straight to a passed verdict (basis `all-skip-with-basis`) with no runner spawn and no preview — there is nothing the sandboxed acceptance agent could observe. A legacy criterion that omits `skip_expected` entirely never triggers the required-`expectation_basis` conditional, so older plans validate and dispatch exactly as before.
 
 `acceptance_criteria` is annotated `x-intended-required: true` in the schema: it is additive-optional today, but a future `standard` version promotes it to required after an E31 soak period (see `AGENTS.md` → Schema change checklist). Downstream consumers are later E31 waves — **E31.5** (`plan_acceptance_precheck`) and **E31.7** (the runner acceptance agent) — which is why the field is optional now and no consumer depends on it yet.
 
