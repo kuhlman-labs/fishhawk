@@ -151,11 +151,16 @@ workflows:
         # founder approval stays the gate. Runs async server-side
         # post-#584; verdicts land ~60-90s+ after the implement trace
         # upload (poll the audit / get_run_status). Heterogeneous
-        # topology (#955): same Claude+Codex pair as the plan stage.
+        # topology (#955): same Codex reviewer as the plan stage; the Claude
+        # reviewer runs on Fable 5 (see the plan executor note) — the
+        # implement review is the last quality gate before merge, so the
+        # most capable model reviewing the diff is the highest-leverage
+        # place to catch escaped defects. ~2x Opus per reviewer token, but
+        # implement_review is a small slice of run cost (~$0.2/review).
         reviewers:
           agents:
             - provider: claudecode
-              model: claude-opus-4-8
+              model: claude-fable-5
             - provider: codex
               model: gpt-5.6-terra
               reasoning_effort: high
