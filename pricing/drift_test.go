@@ -12,9 +12,13 @@ import (
 const fixtureNoDrift = `{
   "sample_spec": {"note": "not a real model — must be ignored"},
   "claude-opus-4-7":   {"input_cost_per_token": 5e-6, "output_cost_per_token": 25e-6, "cache_read_input_token_cost": 0.5e-6, "cache_creation_input_token_cost": 6.25e-6},
+  "claude-fable-5":    {"input_cost_per_token": 10e-6, "output_cost_per_token": 50e-6, "cache_read_input_token_cost": 1e-6, "cache_creation_input_token_cost": 12.5e-6},
   "claude-sonnet-4-6": {"input_cost_per_token": 3e-6, "output_cost_per_token": 15e-6, "cache_read_input_token_cost": 0.3e-6, "cache_creation_input_token_cost": 3.75e-6},
   "claude-haiku-4-5":  {"input_cost_per_token": 1e-6, "output_cost_per_token": 5e-6, "cache_read_input_token_cost": 0.1e-6, "cache_creation_input_token_cost": 1.25e-6},
   "gpt-5.5":           {"input_cost_per_token": 5e-6, "output_cost_per_token": 30e-6, "cache_read_input_token_cost": 0.5e-6},
+  "gpt-5.6-sol":       {"input_cost_per_token": 5e-6, "output_cost_per_token": 30e-6, "cache_read_input_token_cost": 0.5e-6, "cache_creation_input_token_cost": 6.25e-6},
+  "gpt-5.6-terra":     {"input_cost_per_token": 2.5e-6, "output_cost_per_token": 15e-6, "cache_read_input_token_cost": 0.25e-6, "cache_creation_input_token_cost": 3.125e-6},
+  "gpt-5.6-luna":      {"input_cost_per_token": 1e-6, "output_cost_per_token": 6e-6, "cache_read_input_token_cost": 0.1e-6, "cache_creation_input_token_cost": 1.25e-6},
   "some-unreferenced-model": {"input_cost_per_token": 9e-6, "output_cost_per_token": 9e-6}
 }`
 
@@ -49,9 +53,13 @@ func TestCheckDrift_NoDrift(t *testing.T) {
 // ours_higher). Other families match.
 const fixtureDrift = `{
   "claude-opus-4-7":   {"input_cost_per_token": 5.2e-6, "output_cost_per_token": 20e-6, "cache_read_input_token_cost": 0.5e-6, "cache_creation_input_token_cost": 6.25e-6},
+  "claude-fable-5":    {"input_cost_per_token": 10e-6, "output_cost_per_token": 50e-6, "cache_read_input_token_cost": 1e-6, "cache_creation_input_token_cost": 12.5e-6},
   "claude-sonnet-4-6": {"input_cost_per_token": 3e-6, "output_cost_per_token": 15e-6, "cache_read_input_token_cost": 0.3e-6, "cache_creation_input_token_cost": 3.75e-6},
   "claude-haiku-4-5":  {"input_cost_per_token": 1e-6, "output_cost_per_token": 5e-6, "cache_read_input_token_cost": 0.1e-6, "cache_creation_input_token_cost": 1.25e-6},
-  "gpt-5.5":           {"input_cost_per_token": 5e-6, "output_cost_per_token": 30e-6, "cache_read_input_token_cost": 0.5e-6}
+  "gpt-5.5":           {"input_cost_per_token": 5e-6, "output_cost_per_token": 30e-6, "cache_read_input_token_cost": 0.5e-6},
+  "gpt-5.6-sol":       {"input_cost_per_token": 5e-6, "output_cost_per_token": 30e-6, "cache_read_input_token_cost": 0.5e-6, "cache_creation_input_token_cost": 6.25e-6},
+  "gpt-5.6-terra":     {"input_cost_per_token": 2.5e-6, "output_cost_per_token": 15e-6, "cache_read_input_token_cost": 0.25e-6, "cache_creation_input_token_cost": 3.125e-6},
+  "gpt-5.6-luna":      {"input_cost_per_token": 1e-6, "output_cost_per_token": 6e-6, "cache_read_input_token_cost": 0.1e-6, "cache_creation_input_token_cost": 1.25e-6}
 }`
 
 func TestCheckDrift_WarnAndHigh(t *testing.T) {
