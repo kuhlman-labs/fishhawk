@@ -114,7 +114,7 @@ The credential store is a single JSON file at `$XDG_CONFIG_HOME/fishhawk/credent
 
 `token login` reads one extra input, `--client-id` / `FISHHAWK_OAUTH_CLIENT_ID` (the OAuth App `client_id`); when unset it is discovered from the backend, so most operators never set it.
 
-**Enable Device Flow (setup).** The OAuth App backing `FISHHAWK_OAUTH_CLIENT_ID` must have GitHub's per-app **Enable Device Flow** checkbox turned on (GitHub → Settings → Developer settings → the App → check **Enable Device Flow** → Update application). Until it is, GitHub answers the device-code request with `device_flow_disabled`, which `token login` surfaces verbatim from GitHub's `error_description`.
+**Enable Device Flow (setup).** The OAuth App backing `FISHHAWK_OAUTH_CLIENT_ID` must have GitHub's per-app **Enable Device Flow** checkbox turned on (GitHub → Settings → Developer settings → the App → check **Enable Device Flow** → Update application). Until it is, GitHub answers the device-code request with `device_flow_disabled` — in either a non-2xx error body or a 200 response with no `device_code` — and `token login` now appends an actionable hint naming the exact checkbox location on top of GitHub's error text, rather than surfacing `error_description` verbatim (#1752).
 
 ## Build and test
 

@@ -64,3 +64,17 @@ fi
 sed -e "s|{{BACKEND_URL}}|${backend_url}|g" \
     -e "s|{{WEBHOOK_URL}}|${webhook_url}|g" \
     "$template"
+
+# The App manifest schema has no device-flow key (GitHub's manifest
+# parameter set is fixed), so this step can't be automated. Printed to
+# stderr, after stdout, so `| jq .` / `| pbcopy` pipelines see only the
+# rendered JSON.
+cat >&2 <<'EOF'
+
+Post-creation checklist:
+  [ ] Enable Device Flow — GitHub → Settings → Developer settings →
+      GitHub Apps → the app → General → check 'Enable Device Flow' →
+      Update application.
+      Until this is checked, every `fishhawk token login` fails with
+      device_flow_disabled.
+EOF

@@ -49,6 +49,13 @@ type deviceCodeResponse struct {
 	VerificationURI string `json:"verification_uri"`
 	ExpiresIn       int    `json:"expires_in"`
 	Interval        int    `json:"interval"`
+
+	// Error/ErrorDescription carry GitHub's OAuth error body when the
+	// device-code endpoint answers 200 with no device_code (observed
+	// live for device_flow_disabled, #1752) — mirrors
+	// accessTokenResponse's Error field for the same failure shape.
+	Error            string `json:"error"`
+	ErrorDescription string `json:"error_description"`
 }
 
 // accessTokenResponse is the subset of POST
@@ -310,9 +317,39 @@ func requestDeviceCode(ctx context.Context, clientID string) (*deviceCodeRespons
 	err := postForJSON(ctx, strings.TrimRight(githubDeviceBaseURL, "/")+"/login/device/code",
 		map[string]string{"client_id": clientID, "scope": deviceFlowScope}, &out)
 	if err != nil {
-		return nil, fmt.Errorf("request device code: %w", err)
+		wrapped := fmt.Errorf("request device code: %w", err)
+		return nil, annotateDeviceFlowError(wrapped, err.Error())
+	}
+	// GitHub can answer 200 with no device_code and the OAuth error in
+	// the body instead of a non-2xx status (observed live for
+	// device_flow_disabled, #1752). Treat that the same as a transport
+	// error rather than proceeding with an empty verification URI.
+	if out.DeviceCode == "" && out.Error != "" {
+		msg := out.ErrorDescription
+		if msg == "" {
+			msg = out.Error
+		}
+		return nil, annotateDeviceFlowError(fmt.Errorf("request device code: %s", msg), out.Error)
 	}
 	return &out, nil
+}
+
+// deviceFlowDisabledHint names the exact GitHub setting that must be
+// enabled before the device flow will work, so the operator doesn't
+// have to go spelunking through GitHub's docs on a first-install
+// failure (#1752).
+const deviceFlowDisabledHint = "enable the app's Device Flow: GitHub → Settings → Developer settings → GitHub Apps → <your app> → General → check 'Enable Device Flow' → Update application"
+
+// annotateDeviceFlowError appends deviceFlowDisabledHint to err when
+// probeText carries GitHub's device_flow_disabled token — whether that
+// token arrived in a non-2xx raw response body or a 200-body error
+// field, both of which requestDeviceCode's two failure branches surface
+// via postForJSON/readBrief. Any other error passes through unchanged.
+func annotateDeviceFlowError(err error, probeText string) error {
+	if err == nil || !strings.Contains(probeText, "device_flow_disabled") {
+		return err
+	}
+	return fmt.Errorf("%w (%s)", err, deviceFlowDisabledHint)
 }
 
 func pollAccessToken(ctx context.Context, clientID, deviceCode string) (*accessTokenResponse, error) {

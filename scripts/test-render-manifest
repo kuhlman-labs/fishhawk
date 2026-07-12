@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Standalone harness pinning scripts/render-github-app-manifest.sh's output
+# contract (#1752), in the style of the sibling scripts/test-* harnesses
+# (scripts/test-schema-sync-verify, scripts/test-container-lease): not wired
+# into scripts/test or CI, run explicitly by the implement stage and
+# operators. Asserts:
+#   (a) happy path — stdout parses as JSON with both URL placeholders
+#       substituted, and stderr names the 'Enable Device Flow' checklist.
+#   (b) stdout purity — the checklist text appears ONLY on stderr, never in
+#       the stdout JSON, so `| jq .` / `| pbcopy` pipelines are unaffected.
+#   (c) usage-error path — a wrong arg count still exits 2 with usage on
+#       stderr and no checklist (the checklist only prints after a
+#       successful render).
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT="$REPO_ROOT/scripts/render-github-app-manifest.sh"
+PASS=0
+FAIL=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+backend_url="https://api.fishhawk.example.com"
+webhook_url="https://api.fishhawk.example.com/webhooks/github"
+
+# (a) happy path.
+out_file="$tmpdir/stdout.json"
+err_file="$tmpdir/stderr.txt"
+"$SCRIPT" "$backend_url" "$webhook_url" >"$out_file" 2>"$err_file"
+happy_rc=$?
+if [ "$happy_rc" -eq 0 ] \
+   && python3 -m json.tool <"$out_file" >/dev/null 2>&1 \
+   && grep -qF "$backend_url" "$out_file" \
+   && grep -qF "$webhook_url" "$out_file" \
+   && grep -q 'Enable Device Flow' "$err_file"; then
+  pass "happy path: stdout is valid JSON with both placeholders substituted, stderr names the checklist"
+else
+  fail "happy path: expected exit 0 + valid JSON + substituted URLs + stderr checklist (rc=$happy_rc)"
+fi
+
+# (b) stdout purity: the checklist text never leaks into stdout.
+if ! grep -q 'Enable Device Flow' "$out_file"; then
+  pass "stdout purity: checklist text does not appear in stdout"
+else
+  fail "stdout purity: checklist text leaked into stdout JSON"
+fi
+
+# (c) usage-error path: wrong arg count still exits 2, usage on stderr, no
+# checklist (the checklist only follows a successful render).
+usage_err_file="$tmpdir/usage-stderr.txt"
+"$SCRIPT" "only-one-arg" >/dev/null 2>"$usage_err_file"
+usage_rc=$?
+if [ "$usage_rc" -eq 2 ] \
+   && grep -q '^usage:' "$usage_err_file" \
+   && ! grep -q 'Enable Device Flow' "$usage_err_file"; then
+  pass "usage-error path: wrong arg count exits 2 with usage on stderr and no checklist"
+else
+  fail "usage-error path: expected exit 2 + usage + no checklist (rc=$usage_rc)"
+fi
+
+echo ""
+echo "Results: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]

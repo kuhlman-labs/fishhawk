@@ -81,7 +81,9 @@ Everything else — runs, plans, audit log, retries — works against the local 
 
 2. On the App's settings page, generate a webhook secret, generate and download a private key (`.pem`), and note the App ID + OAuth Client ID + Client secret.
 
-3. Drop the credentials into a local `.env` (gitignored — already covered by `.env*` in `.gitignore`):
+3. **Enable Device Flow**: on the same settings page, under **General**, check **Enable Device Flow** and click **Update application**. The manifest schema (see the callout under "Registration paths" below) cannot express this, so it must be turned on by hand — and Mode B's CLI-driven `fishhawk token login` is the device flow, so skipping this step fails every login attempt with `device_flow_disabled`.
+
+4. Drop the credentials into a local `.env` (gitignored — already covered by `.env*` in `.gitignore`):
 
    ```sh
    FISHHAWKD_GITHUB_APP_ID=123456
@@ -92,7 +94,7 @@ Everything else — runs, plans, audit log, retries — works against the local 
    FISHHAWKD_OAUTH_CALLBACK_URL=http://localhost:8080/v0/auth/github/callback
    ```
 
-4. Run the backend with the env loaded:
+5. Run the backend with the env loaded:
 
    ```sh
    set -a; source .env; set +a
@@ -139,6 +141,8 @@ For Mode B (OAuth-only), use a placeholder webhook URL (e.g. `https://smee.io/an
 ## Registration paths
 
 Pick one. Manifest flow is faster and removes manual scope-typo risk; manual setup is the fallback when something in the manifest doesn't resolve cleanly (rare).
+
+> **Enable Device Flow — required, all paths.** GitHub's App manifest parameter set (verified 2026-07-12 against GitHub's manifest-flow docs) has no device-flow key, so **no registration path below — A, A', or B — can turn this on for you.** After the App is created, go to its settings page → **General** → check **Enable Device Flow** → **Update application**. Until that box is checked, every `fishhawk token login` fails with `device_flow_disabled`.
 
 ### A. Manifest flow via the backend (recommended)
 
@@ -193,6 +197,7 @@ If you'd rather click through the form:
    - Note the **App ID** (numeric).
    - Click **Generate a private key**. Download the `.pem`.
    - **Optional but recommended**: configure the App to also issue OAuth user-tokens by checking "Request user authorization (OAuth) during installation" and saving the resulting **Client ID** + **Client secret**. The Web UI sign-in flow (E4.2) uses these.
+   - **Enable Device Flow**: under **General**, check **Enable Device Flow** and click **Update application**. Skipping this fails every `fishhawk token login` with `device_flow_disabled` — see the callout above.
 
 ## Configuring the backend
 

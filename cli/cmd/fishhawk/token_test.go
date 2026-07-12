@@ -25,6 +25,12 @@ type tokenTestServer struct {
 	// deviceCode is the response to POST /login/device/code.
 	deviceCode deviceCodeResponse
 
+	// deviceCodeStatus overrides the 200 status for POST
+	// /login/device/code (e.g. a non-2xx device_flow_disabled OAuth
+	// error); deviceCodeBody is the raw body written in that case.
+	deviceCodeStatus int
+	deviceCodeBody   any
+
 	// pollStates is the sequence of access-token poll responses; each
 	// poll pops the next one, and the last is repeated if exhausted.
 	pollStates []accessTokenResponse
@@ -68,6 +74,10 @@ func newTokenTestServer(t *testing.T) *tokenTestServer {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/login/device/code", func(w http.ResponseWriter, r *http.Request) {
+		if ts.deviceCodeStatus != 0 {
+			writeJSON(w, ts.deviceCodeStatus, ts.deviceCodeBody)
+			return
+		}
 		writeJSON(w, http.StatusOK, ts.deviceCode)
 	})
 	mux.HandleFunc("/login/oauth/access_token", func(w http.ResponseWriter, r *http.Request) {
@@ -352,6 +362,87 @@ func TestTokenLogin_MintEmptyToken(t *testing.T) {
 	}
 	if _, err := credstore.Load(ts.srv.URL); err == nil {
 		t.Error("an empty-token mint must NOT be stored")
+	}
+}
+
+// A non-2xx device-code response carrying device_flow_disabled surfaces
+// both GitHub's error text AND the checkbox hint (#1752, approval
+// condition (2)'s sibling non-2xx mode).
+func TestTokenLogin_DeviceCodeDisabledNon2xx(t *testing.T) {
+	ts := newTokenTestServer(t)
+	ts.deviceCodeStatus = http.StatusBadRequest
+	ts.deviceCodeBody = map[string]string{
+		"error":             "device_flow_disabled",
+		"error_description": "Device Flow must be explicitly enabled for the app.",
+	}
+	setupTokenTest(t, ts)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "login", "--backend-url", ts.srv.URL}, &stdout, &stderr)
+	if code != exitFailure {
+		t.Fatalf("exit = %d, want %d; stderr=%s", code, exitFailure, stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, "device_flow_disabled") {
+		t.Errorf("stderr should surface GitHub's error text: %s", out)
+	}
+	if !strings.Contains(out, "Enable Device Flow") {
+		t.Errorf("stderr should append the checkbox hint: %s", out)
+	}
+}
+
+// A 200 device-code response carrying the error in the body (no
+// device_code) hits the same hint, and — per the binding approval
+// condition — must NOT print the "To authorize, open ..." device-code
+// prompt, since the flow never got a real device code to prompt with.
+func TestTokenLogin_DeviceCodeDisabled200Body(t *testing.T) {
+	ts := newTokenTestServer(t)
+	ts.deviceCode = deviceCodeResponse{
+		Error:            "device_flow_disabled",
+		ErrorDescription: "Device Flow must be explicitly enabled for the app.",
+	}
+	setupTokenTest(t, ts)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "login", "--backend-url", ts.srv.URL}, &stdout, &stderr)
+	if code != exitFailure {
+		t.Fatalf("exit = %d, want %d; stderr=%s", code, exitFailure, stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, "Enable Device Flow") {
+		t.Errorf("stderr should append the checkbox hint: %s", out)
+	}
+	if strings.Contains(out, "To authorize, open") {
+		t.Errorf("no device-code prompt should print when the device-code request itself failed: %s", out)
+	}
+	if _, err := credstore.Load(ts.srv.URL); err == nil {
+		t.Error("credential must NOT be stored when the device-code request fails")
+	}
+}
+
+// A different OAuth error on the device-code request surfaces verbatim
+// and must NOT carry the device_flow_disabled hint (guards against a
+// misleading hint on an unrelated failure).
+func TestTokenLogin_DeviceCodeOtherOAuthError(t *testing.T) {
+	ts := newTokenTestServer(t)
+	ts.deviceCodeStatus = http.StatusBadRequest
+	ts.deviceCodeBody = map[string]string{
+		"error":             "incorrect_client_credentials",
+		"error_description": "The client_id is invalid.",
+	}
+	setupTokenTest(t, ts)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"token", "login", "--backend-url", ts.srv.URL}, &stdout, &stderr)
+	if code != exitFailure {
+		t.Fatalf("exit = %d, want %d; stderr=%s", code, exitFailure, stderr.String())
+	}
+	out := stderr.String()
+	if !strings.Contains(out, "incorrect_client_credentials") {
+		t.Errorf("stderr should surface the raw OAuth error: %s", out)
+	}
+	if strings.Contains(out, "Enable Device Flow") {
+		t.Errorf("stderr must NOT carry the device-flow hint for an unrelated error: %s", out)
 	}
 }
 
