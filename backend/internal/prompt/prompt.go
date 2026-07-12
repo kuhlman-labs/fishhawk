@@ -837,6 +837,24 @@ type SurfaceSweepEvidence struct {
 	ScannedFiles       int
 	Findings           []SurfaceSweepFindingEvidence
 	CrossSliceFindings []CrossSliceCouplingFindingEvidence
+	// AppliedExemptions carries the plan-declared surface_sweep_exemptions
+	// that suppressed a would-be missing-sibling finding (#1544), rendered to
+	// the reviewer as a challengeable justification so a bogus reason is never
+	// silent. Empty when the plan declared no exemption that applied.
+	AppliedExemptions []SurfaceSweepExemptionEvidence
+}
+
+// SurfaceSweepExemptionEvidence is one applied surface_sweep_exemption
+// (#1544): the plan declared that Pattern's Sibling correctly needs no
+// change, with Reason the stated justification. SubPlanTitle, when set,
+// names the decomposition sub-plan whose own scope the exemption applied to
+// (empty for the flat parent scope). Rendered so the reviewer can challenge
+// a bogus reason.
+type SurfaceSweepExemptionEvidence struct {
+	Pattern      string
+	Sibling      string
+	Reason       string
+	SubPlanTitle string
 }
 
 // SurfaceSweepFindingEvidence is one missing-sibling finding: the plan
@@ -2062,11 +2080,12 @@ func buildPlan(t Trigger) string {
 	b.WriteString("- when you add a backend/internal/postgres/migrations/*.sql, also scope backend/internal/postgres/postgres_test.go — TestMigrateDown_RemovesTables pins the LATEST migration and must be updated in the same commit.\n")
 	if len(t.SurfaceCouplingPatterns) > 0 {
 		b.WriteString("\n")
-		b.WriteString("Surface-coupling sibling map (#763/#1797): the plan gate runs a deterministic surface sweep that flags a plan scoping one member of a known multi-surface lockstep pattern without its coupled siblings. These are machine-derivable, so pre-empt the reject round — when you scope ANY trigger path in a pattern below, also scope EVERY listed sibling path in the SAME plan, or justify in the plan why a listed sibling correctly needs no change:\n")
+		b.WriteString("Surface-coupling sibling map (#763/#1797): the plan gate runs a deterministic surface sweep that flags a plan scoping one member of a known multi-surface lockstep pattern without its coupled siblings. These are machine-derivable, so pre-empt the reject round — when you scope ANY trigger path in a pattern below, also scope EVERY listed sibling path in the SAME plan, or justify why a listed sibling correctly needs no change:\n")
 		for _, p := range t.SurfaceCouplingPatterns {
 			fmt.Fprintf(&b, "- %s: scoping any of [%s] requires also scoping [%s];\n",
 				p.Name, strings.Join(p.Triggers, ", "), strings.Join(p.Siblings, ", "))
 		}
+		b.WriteString("When a listed sibling genuinely needs no change (e.g. you are adding a system-actor render to status_template.go that mentions no @-user, so the notifier.go @-mention peer is untouched), declare that as a machine-readable top-level surface_sweep_exemptions entry — {\"pattern\": \"<the pattern name above>\", \"sibling\": \"<the sibling path>\", \"reason\": \"<why it needs no change>\"} — instead of only prose. The sweep honors a matching (pattern, sibling) entry to suppress the missing-sibling finding while surfacing your reason to reviewers as challengeable, so it is never silent. A non-matching entry is a harmless no-op.\n")
 	}
 	b.WriteString("\n")
 	b.WriteString("Compound-field shape rule: the following fields must be the structured shape shown in the schema — never a bare string or prose summary:\n")
@@ -2424,6 +2443,11 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 				"Completing this seam will otherwise need a runtime scope amendment, which can time out (#1035). "+
 				"Consolidate these files into the single slice that completes the seam, or assign the shared file to the integrating slice.\n",
 				f.Pattern, strings.Join(parts, ", "))
+		}
+		for _, e := range sw.AppliedExemptions {
+			fmt.Fprintf(b, "- %sAPPLIED EXEMPTION (%s): the plan declared that sibling %s correctly needs no change — reason: %q. "+
+				"This suppressed a would-be missing-sibling finding; CHALLENGE it if the reason is wrong and the sibling in fact must move in lockstep with the change.\n",
+				subPlanPrefix(e.SubPlanTitle), e.Pattern, e.Sibling, e.Reason)
 		}
 		b.WriteString("\n")
 	}

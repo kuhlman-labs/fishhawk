@@ -1297,11 +1297,32 @@ func TestBuild_Plan_SurfaceCouplingSiblingMap_Rendered(t *testing.T) {
 		"backend/internal/issuecomment/notifier.go",
 		// the binding also-scope-or-justify instruction.
 		"or justify",
+		// #1544: the structured-exemption alternative to prose justification.
+		"surface_sweep_exemptions",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
 			t.Errorf("plan prompt missing surface-coupling sibling map guidance %q\n---\n%s", w, got)
 		}
+	}
+}
+
+// TestBuild_Plan_SurfaceSweepExemptionsGuidance_OmittedWithoutPatterns pins
+// the plan-stage guard (#1544): the surface_sweep_exemptions guidance rides
+// inside the SurfaceCouplingPatterns block, so a build that threads no
+// patterns (every non-plan build) never renders it — keeping those prompts
+// byte-unchanged.
+func TestBuild_Plan_SurfaceSweepExemptionsGuidance_OmittedWithoutPatterns(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 1544,
+		IssueTitle:  "Plan without the sibling map",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "surface_sweep_exemptions") {
+		t.Errorf("surface_sweep_exemptions guidance must be omitted when no patterns are threaded:\n%s", got)
 	}
 }
 
@@ -2814,6 +2835,47 @@ func TestBuild_PlanReview_GateEvidence_Renders(t *testing.T) {
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
 			t.Errorf("plan_review prompt missing gate-evidence element %q:\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_PlanReview_GateEvidence_AppliedExemptionRenders pins the #1544
+// reviewer-visibility guardrail: an applied surface_sweep_exemption is
+// rendered in the surface-sweep block with its pattern, sibling, reason, and
+// a CHALLENGE prompt — so a bogus declared reason is never silent. The
+// SubPlanTitle attribution renders when set.
+func TestBuild_PlanReview_GateEvidence_AppliedExemptionRenders(t *testing.T) {
+	got, err := Build("plan_review", Trigger{
+		Repo:         "x/y",
+		ApprovedPlan: fixturePlan(),
+		PlanGateEvidence: &PlanGateEvidence{
+			SurfaceSweep: &SurfaceSweepEvidence{
+				ScannedFiles: 1,
+				AppliedExemptions: []SurfaceSweepExemptionEvidence{
+					{
+						Pattern:      "actor @-mention render surfaces",
+						Sibling:      "backend/internal/issuecomment/notifier.go",
+						Reason:       "system-actor render adds no @-mention",
+						SubPlanTitle: "render slice",
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"APPLIED EXEMPTION (actor @-mention render surfaces)",
+		"backend/internal/issuecomment/notifier.go",
+		"system-actor render adds no @-mention",
+		"CHALLENGE",
+		// SubPlanTitle attribution prefix.
+		"render slice",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan_review prompt missing applied-exemption element %q:\n%s", w, got)
 		}
 	}
 }

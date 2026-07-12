@@ -24,6 +24,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -3435,5 +3436,57 @@ func TestShipPlan_ClarificationRequest_Idempotent(t *testing.T) {
 	}
 	if len(au.appended) != 1 {
 		t.Errorf("audit entries = %d, want 1 (no second clarification_requested)", len(au.appended))
+	}
+}
+
+// TestPlanGateEvidence_SurfaceSweepExemptionSeam is the operator-mandated
+// binding-condition test (#1544): a serialized plan declaring a
+// surface_sweep_exemption is fed through the plan-gate sweep path
+// (runSurfaceSweep) and its computed payload is mapped into the plan-review
+// evidence via planGateEvidence. It asserts the constructed
+// SurfaceSweepEvidence.AppliedExemptions carries the pattern, sibling, and
+// reason end-to-end — so a drop or mis-map in server/plan.go's
+// planGateEvidence (or in runSurfaceSweep) fails this test rather than
+// silently dropping a reviewer-visible exemption.
+func TestPlanGateEvidence_SurfaceSweepExemptionSeam(t *testing.T) {
+	s, _, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+	const (
+		statusTemplate = "backend/internal/issuecomment/status_template.go"
+		notifier       = "backend/internal/issuecomment/notifier.go"
+		reason         = "system-actor render adds no @-mention"
+	)
+	body := exemptionPlanBody(t,
+		[]plan.ScopeFile{{Path: statusTemplate, Operation: plan.FileOpModify}},
+		[]plan.SurfaceSweepExemption{
+			{Pattern: "actor @-mention render surfaces", Sibling: notifier, Reason: reason},
+		},
+	)
+
+	// Plan-gate sweep path: compute the payload the handler threads into the
+	// plan-review prompt.
+	sweep := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, body)
+	if sweep == nil {
+		t.Fatal("runSurfaceSweep returned nil (fail-open) — expected a computed payload")
+	}
+	if len(sweep.AppliedExemptions) != 1 {
+		t.Fatalf("sweep payload AppliedExemptions = %+v, want 1", sweep.AppliedExemptions)
+	}
+
+	// Payload → evidence mapping (the server/plan.go seam under test).
+	ev := planGateEvidence(nil, sweep, nil, nil, nil)
+	if ev == nil || ev.SurfaceSweep == nil {
+		t.Fatalf("planGateEvidence produced no SurfaceSweep evidence: %+v", ev)
+	}
+	if len(ev.SurfaceSweep.AppliedExemptions) != 1 {
+		t.Fatalf("SurfaceSweepEvidence.AppliedExemptions = %+v, want 1 (a drop/mis-map in planGateEvidence)", ev.SurfaceSweep.AppliedExemptions)
+	}
+	got := ev.SurfaceSweep.AppliedExemptions[0]
+	want := prompt.SurfaceSweepExemptionEvidence{
+		Pattern: "actor @-mention render surfaces",
+		Sibling: notifier,
+		Reason:  reason,
+	}
+	if got != want {
+		t.Errorf("applied exemption evidence = %+v, want %+v", got, want)
 	}
 }

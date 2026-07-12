@@ -1205,6 +1205,17 @@ func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload
 			}
 			sw.CrossSliceFindings = append(sw.CrossSliceFindings, cf)
 		}
+		// Map the applied surface_sweep_exemptions so the plan-review prompt
+		// renders each as a challengeable justification (#1544) — a drop or
+		// mis-map here would let a bogus exemption suppress a finding silently.
+		for _, e := range sweep.AppliedExemptions {
+			sw.AppliedExemptions = append(sw.AppliedExemptions, prompt.SurfaceSweepExemptionEvidence{
+				Pattern:      e.Pattern,
+				Sibling:      e.Sibling,
+				Reason:       e.Reason,
+				SubPlanTitle: e.SubPlanTitle,
+			})
+		}
 		ev.SurfaceSweep = sw
 	}
 	if testSweep != nil {

@@ -73,7 +73,12 @@
         }
       }
     },
-    "model_recommendation": { "$ref": "#/$defs/model-recommendation" }
+    "model_recommendation": { "$ref": "#/$defs/model-recommendation" },
+    "surface_sweep_exemptions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/surface-sweep-exemption" },
+      "description": "Optional (#1544). Machine-readable declarations that a surface-sweep lockstep pattern's named sibling correctly needs no change in this plan — the structured form of the prose 'justify why a sibling needs no change' escape hatch. The plan-gate surface sweep honors a matching (pattern, sibling) entry to suppress the would-be missing-sibling finding, and records the applied exemption in the audit payload + plan-review evidence so a bogus reason stays reviewer-challengeable (never silent). A non-matching or non-firing entry is a harmless no-op."
+    }
   },
 
   "$defs": {
@@ -332,6 +337,30 @@
           "type": "string",
           "enum": ["low", "medium", "high"],
           "description": "The agent's assessment of the change's complexity, informing the recommendation. Stamped onto calibration history so per-model-per-complexity outcomes accumulate."
+        }
+      }
+    },
+
+    "surface-sweep-exemption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pattern", "sibling", "reason"],
+      "description": "One machine-readable surface-sweep exemption (#1544): a declaration that the named lockstep pattern's named sibling correctly needs no change in this plan. The plan-gate surface sweep suppresses the missing-sibling finding only for a sibling actually absent from scope.files whose (pattern, sibling) matches; the applied exemption is surfaced to reviewers as a challengeable justification.",
+      "properties": {
+        "pattern": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The surface-sweep pattern's name, exactly as surfaced in the plan-gate surface-coupling sibling map (e.g. \"actor @-mention render surfaces\")."
+        },
+        "sibling": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repo-relative path of the pattern sibling that correctly needs no change in this plan."
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why the sibling correctly needs no change. Rendered to plan reviewers as a challengeable justification, so a bogus reason is not silent."
         }
       }
     }
