@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -271,12 +271,26 @@ func surfaceCouplingPatternsForPrompt() []prompt.SurfaceCouplingPattern {
 	return out
 }
 
+// toSlashPath normalizes a path to forward slashes on EVERY runtime.
+// filepath.ToSlash only rewrites the HOST OS separator, so on the Unix
+// server it leaves a Windows-style backslash path untouched — a
+// schema-valid `sibling` like `backend\internal\issuecomment\notifier.go`
+// would then never match the slash-form registry sibling and the exemption
+// (or trigger/scope match) would silently become a no-op (#1544).
+// Backslash is not a legal path separator in this registry's slash-form
+// domain, so replacing it unconditionally is safe and matches the
+// documented "backslash-separated paths still match" contract.
+func toSlashPath(p string) string {
+	return strings.ReplaceAll(p, "\\", "/")
+}
+
 // evaluateSurfaceSweep is the pure matcher: for each pattern, if any
 // Trigger path is in scope, it reports the Siblings absent from scope as a
 // finding. Reporting only absent siblings means a self-referential pattern
 // never flags a sibling already present. MissingSiblings is sorted for
-// deterministic output. Paths are slash-normalized so a plan listing
-// backslash-separated paths still matches.
+// deterministic output. Paths are slash-normalized (via toSlashPath, which
+// works on every runtime) so a plan listing backslash-separated paths still
+// matches.
 //
 // A plan-declared surface_sweep_exemption naming (pattern.Name, sibling)
 // suppresses that sibling from the missing set (#1544): the finding is
@@ -291,7 +305,7 @@ func surfaceCouplingPatternsForPrompt() []prompt.SurfaceCouplingPattern {
 func evaluateSurfaceSweep(scopeFiles []string, patterns []surfacePattern, exemptions []plan.SurfaceSweepExemption) ([]SurfaceSweepFinding, []AppliedExemption) {
 	scope := make(map[string]bool, len(scopeFiles))
 	for _, f := range scopeFiles {
-		scope[filepath.ToSlash(f)] = true
+		scope[toSlashPath(f)] = true
 	}
 
 	// Index exemptions by (pattern name, slash-normalized sibling) so a
@@ -300,7 +314,7 @@ func evaluateSurfaceSweep(scopeFiles []string, patterns []surfacePattern, exempt
 	type exKey struct{ pattern, sibling string }
 	exByKey := make(map[exKey]plan.SurfaceSweepExemption, len(exemptions))
 	for _, e := range exemptions {
-		exByKey[exKey{e.Pattern, filepath.ToSlash(e.Sibling)}] = e
+		exByKey[exKey{e.Pattern, toSlashPath(e.Sibling)}] = e
 	}
 
 	var findings []SurfaceSweepFinding
@@ -309,7 +323,7 @@ func evaluateSurfaceSweep(scopeFiles []string, patterns []surfacePattern, exempt
 		trigger, matched := "", false
 		for _, t := range p.Triggers {
 			if pathMatches(scope, t) {
-				trigger, matched = filepath.ToSlash(t), true
+				trigger, matched = toSlashPath(t), true
 				break
 			}
 		}
@@ -321,7 +335,7 @@ func evaluateSurfaceSweep(scopeFiles []string, patterns []surfacePattern, exempt
 			if pathMatches(scope, sib) {
 				continue
 			}
-			sibNorm := filepath.ToSlash(sib)
+			sibNorm := toSlashPath(sib)
 			// Sibling absent from scope: a plan-declared exemption naming
 			// (this pattern, this sibling) suppresses it from the missing
 			// set and is recorded as applied for reviewer visibility.
@@ -353,7 +367,7 @@ func evaluateSurfaceSweep(scopeFiles []string, patterns []surfacePattern, exempt
 // matcher stays glob-ready: a future registry entry needing prefix/glob
 // triggers extends this helper without touching evaluateSurfaceSweep.
 func pathMatches(scope map[string]bool, registryPath string) bool {
-	return scope[filepath.ToSlash(registryPath)]
+	return scope[toSlashPath(registryPath)]
 }
 
 // evaluateCrossSliceCoupling is the pure cross-slice detector (#1102): for
@@ -386,7 +400,7 @@ func evaluateCrossSliceCoupling(parsedPlan *plan.Plan, patterns []surfacePattern
 		}
 		files := make(map[string]bool, len(sp.Scope.Files))
 		for _, f := range sp.Scope.Files {
-			files[filepath.ToSlash(f.Path)] = true
+			files[toSlashPath(f.Path)] = true
 		}
 		sliceFiles[sp.Title] = files
 	}
@@ -396,10 +410,10 @@ func evaluateCrossSliceCoupling(parsedPlan *plan.Plan, patterns []surfacePattern
 		// Member-file set: Triggers ∪ Siblings, deduped.
 		members := make(map[string]bool, len(p.Triggers)+len(p.Siblings))
 		for _, m := range p.Triggers {
-			members[filepath.ToSlash(m)] = true
+			members[toSlashPath(m)] = true
 		}
 		for _, m := range p.Siblings {
-			members[filepath.ToSlash(m)] = true
+			members[toSlashPath(m)] = true
 		}
 
 		// Which member files each declaring slice owns.

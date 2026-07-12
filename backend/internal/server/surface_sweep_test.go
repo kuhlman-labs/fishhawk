@@ -296,14 +296,35 @@ func TestEvaluateSurfaceSweep(t *testing.T) {
 			want:  nil,
 		},
 		{
-			name:  "backslash path still matches via normalization",
-			scope: []string{filepath.FromSlash(statusTemplate)},
+			// A backslash-separated scope path must normalize and match on
+			// EVERY runtime. A literal backslash string is used (not
+			// filepath.FromSlash, a no-op on the Unix test runtime) so the
+			// case actually exercises the backslash edge (#1544).
+			name:  "backslash scope path still matches via normalization",
+			scope: []string{`backend\internal\issuecomment\status_template.go`},
 			want: []SurfaceSweepFinding{
 				{
 					Pattern:         "actor @-mention render surfaces",
 					TriggerPath:     statusTemplate,
 					MissingSiblings: []string{notifier},
 				},
+			},
+		},
+		{
+			// #1544 regression: a schema-valid exemption whose `sibling` is
+			// backslash-separated must normalize and match the slash-form
+			// registry sibling on the Unix server runtime. A literal
+			// backslash string (not filepath.FromSlash, a no-op here) proves
+			// filepath.ToSlash's host-separator-only rewrite would leave this
+			// unmatched and the exemption a silent no-op.
+			name:  "backslash sibling exemption suppresses finding",
+			scope: []string{statusTemplate},
+			exemptions: []plan.SurfaceSweepExemption{
+				{Pattern: "actor @-mention render surfaces", Sibling: `backend\internal\issuecomment\notifier.go`, Reason: "system-actor render, no @-mention"},
+			},
+			want: nil,
+			wantApplied: []AppliedExemption{
+				{Pattern: "actor @-mention render surfaces", Sibling: notifier, Reason: "system-actor render, no @-mention"},
 			},
 		},
 		{
