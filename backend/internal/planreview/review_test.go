@@ -157,12 +157,14 @@ func TestReviewVerdict_JSONRoundTrip_Reject(t *testing.T) {
 
 func TestPlanReviewedPayload_JSONRoundTrip(t *testing.T) {
 	p := planreview.PlanReviewedPayload{
-		ReviewerKind:  "agent",
-		ReviewerModel: "claude-opus-4-7",
-		Authority:     planreview.AuthorityGating,
-		Verdict:       planreview.VerdictApprove,
-		Concerns:      nil,
-		FreeForm:      "plan is sound",
+		ReviewerKind:    "agent",
+		ReviewerModel:   "claude-opus-4-7",
+		Authority:       planreview.AuthorityGating,
+		Verdict:         planreview.VerdictApprove,
+		Concerns:        nil,
+		FreeForm:        "plan is sound",
+		ReviewerVersion: "0.30.5 (codex-cli)",
+		ReviewerBinary:  "codex",
 	}
 	b, err := json.Marshal(p)
 	if err != nil {
@@ -184,6 +186,43 @@ func TestPlanReviewedPayload_JSONRoundTrip(t *testing.T) {
 	if got.Verdict != p.Verdict {
 		t.Errorf("Verdict = %q, want %q", got.Verdict, p.Verdict)
 	}
+	// Reviewer provenance survives the round-trip (#1768).
+	if got.ReviewerVersion != p.ReviewerVersion {
+		t.Errorf("ReviewerVersion = %q, want %q", got.ReviewerVersion, p.ReviewerVersion)
+	}
+	if got.ReviewerBinary != p.ReviewerBinary {
+		t.Errorf("ReviewerBinary = %q, want %q", got.ReviewerBinary, p.ReviewerBinary)
+	}
+}
+
+// TestPlanReviewedPayload_ProvenanceOmittedFromWire pins the #1768 additive-field
+// contract: a provenance-free payload marshals WITHOUT reviewer_version /
+// reviewer_binary (byte-identical to pre-#1768 entries), and an old stored
+// payload (no keys) decodes with both fields empty.
+func TestPlanReviewedPayload_ProvenanceOmittedFromWire(t *testing.T) {
+	p := planreview.PlanReviewedPayload{
+		ReviewerKind: "agent",
+		Authority:    planreview.AuthorityAdvisory,
+		Verdict:      planreview.VerdictApprove,
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(b), "reviewer_version") {
+		t.Errorf("provenance-free payload must omit reviewer_version (omitempty): %s", b)
+	}
+	if strings.Contains(string(b), "reviewer_binary") {
+		t.Errorf("provenance-free payload must omit reviewer_binary (omitempty): %s", b)
+	}
+
+	var got planreview.PlanReviewedPayload
+	if err := json.Unmarshal([]byte(`{"reviewer_kind":"agent","authority":"advisory","verdict":"approve"}`), &got); err != nil {
+		t.Fatalf("Unmarshal pre-#1768 payload: %v", err)
+	}
+	if got.ReviewerVersion != "" || got.ReviewerBinary != "" {
+		t.Errorf("ReviewerVersion=%q ReviewerBinary=%q, want both empty decoding a pre-#1768 payload", got.ReviewerVersion, got.ReviewerBinary)
+	}
 }
 
 // --- ImplementReviewedPayload JSON round-trip (ADR-027 impl 2/2) ---
@@ -197,7 +236,9 @@ func TestImplementReviewedPayload_JSONRoundTrip(t *testing.T) {
 		Concerns: []planreview.Concern{
 			{Severity: planreview.SeverityLow, Category: "scope", Note: "touched a file outside scope.files"},
 		},
-		FreeForm: "diff implements the plan",
+		FreeForm:        "diff implements the plan",
+		ReviewerVersion: "0.30.5 (codex-cli)",
+		ReviewerBinary:  "codex",
 	}
 	b, err := json.Marshal(p)
 	if err != nil {
@@ -218,6 +259,43 @@ func TestImplementReviewedPayload_JSONRoundTrip(t *testing.T) {
 	}
 	if len(got.Concerns) != 1 || got.Concerns[0].Category != "scope" {
 		t.Errorf("Concerns = %+v, want one scope concern", got.Concerns)
+	}
+	// Reviewer provenance survives the round-trip (#1768).
+	if got.ReviewerVersion != p.ReviewerVersion {
+		t.Errorf("ReviewerVersion = %q, want %q", got.ReviewerVersion, p.ReviewerVersion)
+	}
+	if got.ReviewerBinary != p.ReviewerBinary {
+		t.Errorf("ReviewerBinary = %q, want %q", got.ReviewerBinary, p.ReviewerBinary)
+	}
+}
+
+// TestImplementReviewedPayload_ProvenanceOmittedFromWire pins the #1768
+// additive-field contract for the implement payload: a provenance-free payload
+// marshals WITHOUT reviewer_version / reviewer_binary, and an old stored payload
+// decodes with both fields empty.
+func TestImplementReviewedPayload_ProvenanceOmittedFromWire(t *testing.T) {
+	p := planreview.ImplementReviewedPayload{
+		ReviewerKind: "agent",
+		Authority:    planreview.AuthorityAdvisory,
+		Verdict:      planreview.VerdictApprove,
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(b), "reviewer_version") {
+		t.Errorf("provenance-free payload must omit reviewer_version (omitempty): %s", b)
+	}
+	if strings.Contains(string(b), "reviewer_binary") {
+		t.Errorf("provenance-free payload must omit reviewer_binary (omitempty): %s", b)
+	}
+
+	var got planreview.ImplementReviewedPayload
+	if err := json.Unmarshal([]byte(`{"reviewer_kind":"agent","authority":"advisory","verdict":"approve"}`), &got); err != nil {
+		t.Fatalf("Unmarshal pre-#1768 payload: %v", err)
+	}
+	if got.ReviewerVersion != "" || got.ReviewerBinary != "" {
+		t.Errorf("ReviewerVersion=%q ReviewerBinary=%q, want both empty decoding a pre-#1768 payload", got.ReviewerVersion, got.ReviewerBinary)
 	}
 }
 

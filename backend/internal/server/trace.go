@@ -3055,6 +3055,11 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			s.emitReviewerUnavailable(ctx, runID, stageID, "implement_review_skipped", authority, inv.provider, inv.optional, len(invocations), inv.resolveErr)
 			continue
 		}
+		// Resolve the reviewer's CLI version + binary-path provenance once per
+		// invocation (#1768) and stamp both onto the implement_reviewed payload
+		// below. The implement loop has no agent_version guard, so this is a
+		// straight provenance add; empty for the non-codex adapters (omitempty).
+		reviewerVersion, reviewerBinary := s.resolveReviewerProvenance(ctx, inv.reviewer)
 		// Apply the size-aware per-invocation budget (#747) as a context
 		// deadline. Implement-review inputs (the diff) are larger than plan
 		// review, so the size-aware formula naturally grants a larger budget
@@ -3115,6 +3120,10 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			// omitempty); set for the base-rebase re-invoke supplemental pass.
 			Origin:  origin,
 			HeadSHA: headSHA,
+			// Resolved reviewer CLI version + binary-path provenance (#1768),
+			// probed once above. Empty for non-codex reviewers (omitempty).
+			ReviewerVersion: reviewerVersion,
+			ReviewerBinary:  reviewerBinary,
 		}
 		payloadBytes, _ := json.Marshal(payload)
 		entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{

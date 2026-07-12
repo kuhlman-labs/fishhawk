@@ -1445,17 +1445,56 @@ type versionProber interface {
 	ProbeVersion(ctx context.Context) string
 }
 
-// reviewerAgentVersionMismatch probes a codex reviewer's CLI version and
-// reports whether it falls OUTSIDE the reviewer's spec-declared agent_version
-// range (#1743). It turns the #1741 opaque zero-token failure class (a CLI
-// auto-update drifting out of the validated range) into a one-line diagnosis.
+// binaryReporter is the optional capability a reviewer adapter implements to
+// report its resolved binary name/path provenance (#1768). Like versionProber
+// only the codex reviewer (a `codex` subprocess) implements it — the anthropic
+// SDK and claudecode adapters shell out to no binary — so a type assertion
+// against this interface naturally scopes the recorded reviewer_binary
+// provenance to codex reviewers, leaving it empty for the others.
+type binaryReporter interface {
+	ReviewerBinaryPath() string
+}
+
+// resolveReviewerProvenance resolves a reviewer's CLI version and binary-path
+// provenance ONCE per invocation (#1768) by type-asserting the reviewer to the
+// optional versionProber / binaryReporter capabilities. Only the codex adapter
+// implements them; a non-codex reviewer (anthropic SDK / claudecode) implements
+// neither, so both returns are empty and the *_reviewed payload's omitempty
+// fields stay absent for those adapters — every pre-#1768 payload byte-identical.
+//
+// The version is resolved through ProbeVersion, which already degrades to the
+// "unknown" sentinel on ANY failure (binary missing, non-zero exit, timeout)
+// and never errors — so a probe failure never fails the review. It is resolved
+// here, before the agent_version mismatch guard, so the CLI is probed exactly
+// once per invocation (the probed version is then passed into
+// reviewerAgentVersionMismatch rather than re-probed there).
+func (*Server) resolveReviewerProvenance(ctx context.Context, reviewer PlanReviewer) (version, binary string) {
+	if prober, ok := reviewer.(versionProber); ok {
+		version = prober.ProbeVersion(ctx)
+	}
+	if reporter, ok := reviewer.(binaryReporter); ok {
+		binary = reporter.ReviewerBinaryPath()
+	}
+	return version, binary
+}
+
+// reviewerAgentVersionMismatch reports whether a codex reviewer's already-probed
+// CLI version falls OUTSIDE the reviewer's spec-declared agent_version range
+// (#1743). It turns the #1741 opaque zero-token failure class (a CLI auto-update
+// drifting out of the validated range) into a one-line diagnosis. The CLI is
+// probed ONCE per invocation by resolveReviewerProvenance (#1768) and the
+// resolved version is passed in as probedVersion — this function no longer
+// probes, so the same version stamped on the plan_reviewed payload is the one
+// the guard compares.
 //
 // It returns mismatch=true ONLY in the fail-loud case — the probed version is
 // comparable AND out of range — so the caller blocks the review dispatch. Every
 // other case leaves mismatch=false (proceed):
 //   - no declared range (nothing to enforce);
-//   - a reviewer that exposes no version probe (anthropic/claudecode — the
-//     field is ignored for non-codex reviewers this slice does not enforce);
+//   - a reviewer that exposes no version probe (anthropic/claudecode — for a
+//     non-probing reviewer resolveReviewerProvenance yields an empty
+//     probedVersion, so the empty-version early return scopes the guard to
+//     codex reviewers, exactly as the old versionProber type assertion did);
 //   - an unprobeable CLI (the #1769 "unknown" sentinel, or a version string
 //     with no semver token, which MatchAgentVersionRange reports uncomparable);
 //   - a malformed range — it was validated at spec-parse time by
@@ -1471,28 +1510,30 @@ type versionProber interface {
 //
 // reason is a human-readable diagnosis naming the provider, probed version, and
 // declared range when mismatch OR degraded is true; empty otherwise.
-func reviewerAgentVersionMismatch(ctx context.Context, inv reviewerInvocation) (mismatch, degraded bool, reason string) {
+func reviewerAgentVersionMismatch(inv reviewerInvocation, probedVersion string) (mismatch, degraded bool, reason string) {
 	if inv.agentVersion == "" {
 		return false, false, ""
 	}
-	prober, ok := inv.reviewer.(versionProber)
-	if !ok {
+	// An empty probed version means the reviewer implements no version probe
+	// (anthropic/claudecode) — the guard does not apply. Distinct from the
+	// "unknown" sentinel, which is a codex CLI that probed but is uncomparable
+	// (the degrade case below).
+	if probedVersion == "" {
 		return false, false, ""
 	}
-	probed := prober.ProbeVersion(ctx)
-	matched, comparable, err := spec.MatchAgentVersionRange(inv.agentVersion, probed)
+	matched, comparable, err := spec.MatchAgentVersionRange(inv.agentVersion, probedVersion)
 	if err != nil {
 		return false, false, ""
 	}
 	if !comparable {
 		return false, true, fmt.Sprintf("%s reviewer CLI version %q is not comparable against the declared agent_version range %q — compatibility guard not enforced, proceeding",
-			inv.provider, probed, inv.agentVersion)
+			inv.provider, probedVersion, inv.agentVersion)
 	}
 	if matched {
 		return false, false, ""
 	}
 	return true, false, fmt.Sprintf("%s reviewer CLI version %q is outside the declared agent_version range %q",
-		inv.provider, probed, inv.agentVersion)
+		inv.provider, probedVersion, inv.agentVersion)
 }
 
 // runPlanReviewLoop runs the per-reviewer plan-review loop shared by the
@@ -1531,6 +1572,12 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 			s.emitReviewerUnavailable(ctx, runID, stageID, "plan_review_skipped", authority, inv.provider, inv.optional, len(invocations), inv.resolveErr)
 			continue
 		}
+		// Resolve the reviewer's CLI version + binary-path provenance ONCE per
+		// invocation (#1768). The probed version is reused by the agent-version
+		// guard below (so the CLI is probed exactly once, not twice) and both
+		// values are stamped onto the plan_reviewed payload. Empty for the
+		// non-codex adapters, which implement neither capability.
+		reviewerVersion, reviewerBinary := s.resolveReviewerProvenance(ctx, inv.reviewer)
 		// Reviewer agent-version compatibility guard (#1743): a codex reviewer
 		// that declares an agent_version range is checked against its probed CLI
 		// version BEFORE the review is invoked. An out-of-range CLI fails the
@@ -1546,7 +1593,7 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 		// unprobeable/"unknown" CLI degrades to proceed (mismatch=false) but is
 		// NOT silent: it emits a WARN so an operator can see the compatibility
 		// guard was disabled for this reviewer.
-		if mismatch, degraded, reason := reviewerAgentVersionMismatch(ctx, inv); mismatch {
+		if mismatch, degraded, reason := reviewerAgentVersionMismatch(inv, reviewerVersion); mismatch {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
 				"plan review: reviewer CLI version outside declared agent_version range — failing review dispatch",
 				slog.String("run_id", runID.String()),
@@ -1621,6 +1668,10 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 			// Per-invocation token usage on the review surface (#995).
 			InputTokens:  verdict.Usage.InputTokens,
 			OutputTokens: verdict.Usage.OutputTokens,
+			// Resolved reviewer CLI version + binary-path provenance (#1768),
+			// probed once above. Empty for non-codex reviewers (omitempty).
+			ReviewerVersion: reviewerVersion,
+			ReviewerBinary:  reviewerBinary,
 		}
 		payloadBytes, _ := json.Marshal(payload)
 		entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{

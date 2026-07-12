@@ -444,12 +444,15 @@ func (f *fakePlanReviewer) Review(_ context.Context, promptText string) (*planre
 	return f.verdict, f.model, nil
 }
 
-// probingReviewer is a fake PlanReviewer that ALSO implements versionProber —
-// the codex-reviewer analog for the agent_version compatibility guard (#1743).
-// It reports a canned CLI version and records whether Review was invoked, so a
-// test can assert an out-of-range reviewer is never dispatched.
+// probingReviewer is a fake PlanReviewer that ALSO implements versionProber AND
+// binaryReporter — the codex-reviewer analog for the agent_version
+// compatibility guard (#1743) and the reviewer-provenance stamping (#1768). It
+// reports a canned CLI version + binary path and records whether Review was
+// invoked, so a test can assert an out-of-range reviewer is never dispatched and
+// that the probed version/binary reach the emitted audit payload end-to-end.
 type probingReviewer struct {
 	version  string
+	binary   string
 	verdict  *planreview.ReviewVerdict
 	model    string
 	reviewed bool
@@ -464,6 +467,8 @@ func (p *probingReviewer) Review(_ context.Context, _ string) (*planreview.Revie
 }
 
 func (p *probingReviewer) ProbeVersion(_ context.Context) string { return p.version }
+
+func (p *probingReviewer) ReviewerBinaryPath() string { return p.binary }
 
 // singleReviewerSet wraps one PlanReviewer as a ReviewerSet for tests:
 // Default() returns the wrapped reviewer (possibly nil) and For resolves
@@ -632,53 +637,61 @@ func TestResolveReviewerInvocations_AgentVersionThreaded(t *testing.T) {
 	}
 }
 
-// TestReviewerAgentVersionMismatch enumerates the #1743 guard's branches: an
+// TestReviewerAgentVersionMismatch enumerates the #1743 guard's branches
+// against a pre-probed version (#1768 refactor: the guard no longer probes; the
+// version is resolved once by resolveReviewerProvenance and passed in). An
 // out-of-range codex reviewer is the only fail-loud (mismatch) case; an
-// unprobeable CLI proceeds but is degraded=true so the caller can WARN;
-// in-range, no-declared-range, and a non-probing (anthropic) reviewer proceed
-// quietly (neither mismatch nor degraded).
+// unprobeable CLI ("unknown") proceeds but is degraded=true so the caller can
+// WARN; in-range, no-declared-range, and a non-probing reviewer (empty probed
+// version) proceed quietly (neither mismatch nor degraded).
 func TestReviewerAgentVersionMismatch(t *testing.T) {
 	const rng = ">=0.30 <0.31"
 	cases := []struct {
 		name         string
 		inv          reviewerInvocation
+		probed       string
 		wantMismatch bool
 		wantDegraded bool
 	}{
 		{
 			name:         "in range proceeds quietly",
-			inv:          reviewerInvocation{provider: "codex", agentVersion: rng, reviewer: &probingReviewer{version: "0.30.5 (codex-cli)"}},
+			inv:          reviewerInvocation{provider: "codex", agentVersion: rng},
+			probed:       "0.30.5 (codex-cli)",
 			wantMismatch: false,
 			wantDegraded: false,
 		},
 		{
 			name:         "out of range fails loudly",
-			inv:          reviewerInvocation{provider: "codex", agentVersion: rng, reviewer: &probingReviewer{version: "0.140.0 (codex-cli)"}},
+			inv:          reviewerInvocation{provider: "codex", agentVersion: rng},
+			probed:       "0.140.0 (codex-cli)",
 			wantMismatch: true,
 			wantDegraded: false,
 		},
 		{
 			name:         "unprobeable degrades with warning",
-			inv:          reviewerInvocation{provider: "codex", agentVersion: rng, reviewer: &probingReviewer{version: "unknown"}},
+			inv:          reviewerInvocation{provider: "codex", agentVersion: rng},
+			probed:       "unknown",
 			wantMismatch: false,
 			wantDegraded: true,
 		},
 		{
 			name:         "no declared range",
-			inv:          reviewerInvocation{provider: "codex", agentVersion: "", reviewer: &probingReviewer{version: "0.140.0 (codex-cli)"}},
+			inv:          reviewerInvocation{provider: "codex", agentVersion: ""},
+			probed:       "0.140.0 (codex-cli)",
 			wantMismatch: false,
 			wantDegraded: false,
 		},
 		{
-			name:         "non-probing reviewer ignored",
-			inv:          reviewerInvocation{provider: "anthropic", agentVersion: rng, reviewer: &fakePlanReviewer{}},
+			name:         "non-probing reviewer ignored (empty probed version)",
+			inv:          reviewerInvocation{provider: "anthropic", agentVersion: rng},
+			probed:       "",
 			wantMismatch: false,
 			wantDegraded: false,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mismatch, degraded, reason := reviewerAgentVersionMismatch(context.Background(), tc.inv)
+			mismatch, degraded, reason := reviewerAgentVersionMismatch(tc.inv, tc.probed)
 			if mismatch != tc.wantMismatch {
 				t.Fatalf("mismatch = %v, want %v (reason=%q)", mismatch, tc.wantMismatch, reason)
 			}
@@ -858,6 +871,121 @@ func TestPlanReviewLoop_AgentVersionUnprobeableDegrades(t *testing.T) {
 	}
 	if !strings.Contains(logs, "codex") || !strings.Contains(logs, ">=0.30 <0.31") {
 		t.Errorf("expected the WARN to name the provider and declared range; logs:\n%s", logs)
+	}
+}
+
+// TestPlanReviewLoop_StampsReviewerProvenance asserts the #1768 happy path: a
+// codex-capable reviewer's probed CLI version AND binary path are resolved once
+// via resolveReviewerProvenance and stamped end-to-end onto the emitted
+// plan_reviewed audit payload (binding approval condition: BOTH fields, not just
+// reviewer_version).
+func TestPlanReviewLoop_StampsReviewerProvenance(t *testing.T) {
+	au := newSeqAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	runID, stageID := uuid.New(), uuid.New()
+
+	rev := &probingReviewer{
+		version: "0.30.5 (codex-cli)",
+		binary:  "/opt/codex-override",
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "gpt-5-codex",
+	}
+	// No agent_version range declared, so the compatibility guard does not
+	// apply — provenance is still probed and stamped regardless.
+	inv := reviewerInvocation{reviewer: rev, provider: "codex", specModel: "gpt-5-codex"}
+
+	s.runPlanReviewLoop(context.Background(), runID, stageID,
+		[]reviewerInvocation{inv}, planreview.AuthorityAdvisory, "prompt", "author-model", planreview.DefaultReviewBudget)
+
+	reviewed := au.entriesByCategory("plan_reviewed")
+	if len(reviewed) != 1 {
+		t.Fatalf("plan_reviewed entries = %d, want 1", len(reviewed))
+	}
+	var p planreview.PlanReviewedPayload
+	if err := json.Unmarshal(reviewed[0].Payload, &p); err != nil {
+		t.Fatalf("unmarshal plan_reviewed payload: %v", err)
+	}
+	if p.ReviewerVersion != "0.30.5 (codex-cli)" {
+		t.Errorf("ReviewerVersion = %q, want %q", p.ReviewerVersion, "0.30.5 (codex-cli)")
+	}
+	if p.ReviewerBinary != "/opt/codex-override" {
+		t.Errorf("ReviewerBinary = %q, want %q", p.ReviewerBinary, "/opt/codex-override")
+	}
+}
+
+// TestPlanReviewLoop_ProvenanceUnknownVersionDegrades asserts a codex reviewer
+// whose CLI version is "unknown" still records a terminal plan_reviewed entry
+// (NOT plan_review_failed) carrying reviewer_version=="unknown" — the
+// provenance probe degrades without failing the review (#1768).
+func TestPlanReviewLoop_ProvenanceUnknownVersionDegrades(t *testing.T) {
+	au := newSeqAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	runID, stageID := uuid.New(), uuid.New()
+
+	rev := &probingReviewer{
+		version: "unknown",
+		binary:  "codex",
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "gpt-5-codex",
+	}
+	inv := reviewerInvocation{reviewer: rev, provider: "codex", specModel: "gpt-5-codex"}
+
+	s.runPlanReviewLoop(context.Background(), runID, stageID,
+		[]reviewerInvocation{inv}, planreview.AuthorityAdvisory, "prompt", "author-model", planreview.DefaultReviewBudget)
+
+	if n := len(au.entriesByCategory("plan_review_failed")); n != 0 {
+		t.Fatalf("plan_review_failed entries = %d, want 0 (an unknown version degrades, never fails)", n)
+	}
+	reviewed := au.entriesByCategory("plan_reviewed")
+	if len(reviewed) != 1 {
+		t.Fatalf("plan_reviewed entries = %d, want 1", len(reviewed))
+	}
+	var p planreview.PlanReviewedPayload
+	if err := json.Unmarshal(reviewed[0].Payload, &p); err != nil {
+		t.Fatalf("unmarshal plan_reviewed payload: %v", err)
+	}
+	if p.ReviewerVersion != "unknown" {
+		t.Errorf("ReviewerVersion = %q, want %q", p.ReviewerVersion, "unknown")
+	}
+	if p.ReviewerBinary != "codex" {
+		t.Errorf("ReviewerBinary = %q, want %q", p.ReviewerBinary, "codex")
+	}
+}
+
+// TestPlanReviewLoop_NonProbingReviewerOmitsProvenance asserts the both-fields
+// omit path (binding approval condition): a reviewer that implements neither the
+// versionProber nor the binaryReporter capability (the anthropic/claudecode
+// analog) leaves BOTH reviewer_version and reviewer_binary empty, and the
+// emitted plan_reviewed payload omits both keys (omitempty byte-compat).
+func TestPlanReviewLoop_NonProbingReviewerOmitsProvenance(t *testing.T) {
+	au := newSeqAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	runID, stageID := uuid.New(), uuid.New()
+
+	rev := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-8",
+	}
+	s.runPlanReviewLoop(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: rev, provider: "anthropic"}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", planreview.DefaultReviewBudget)
+
+	reviewed := au.entriesByCategory("plan_reviewed")
+	if len(reviewed) != 1 {
+		t.Fatalf("plan_reviewed entries = %d, want 1", len(reviewed))
+	}
+	if strings.Contains(string(reviewed[0].Payload), "reviewer_version") {
+		t.Errorf("non-probing reviewer payload must omit reviewer_version: %s", reviewed[0].Payload)
+	}
+	if strings.Contains(string(reviewed[0].Payload), "reviewer_binary") {
+		t.Errorf("non-probing reviewer payload must omit reviewer_binary: %s", reviewed[0].Payload)
+	}
+	var p planreview.PlanReviewedPayload
+	if err := json.Unmarshal(reviewed[0].Payload, &p); err != nil {
+		t.Fatalf("unmarshal plan_reviewed payload: %v", err)
+	}
+	if p.ReviewerVersion != "" || p.ReviewerBinary != "" {
+		t.Errorf("ReviewerVersion=%q ReviewerBinary=%q, want both empty for a non-probing reviewer", p.ReviewerVersion, p.ReviewerBinary)
 	}
 }
 

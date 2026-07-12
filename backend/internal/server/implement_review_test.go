@@ -1687,6 +1687,118 @@ func TestImplementReviewLoop_PersistsConcernsWithOriginSequence(t *testing.T) {
 	}
 }
 
+// TestImplementReviewLoop_StampsReviewerProvenance asserts the #1768 happy path
+// for the implement loop: a codex-capable reviewer's probed CLI version AND
+// binary path are resolved once via resolveReviewerProvenance and stamped
+// end-to-end onto the emitted implement_reviewed audit payload (binding
+// approval condition: BOTH fields).
+func TestImplementReviewLoop_StampsReviewerProvenance(t *testing.T) {
+	au := newSeqAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	runID, stageID := uuid.New(), uuid.New()
+
+	rev := &probingReviewer{
+		version: "0.30.5 (codex-cli)",
+		binary:  "/opt/codex-override",
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "gpt-5-codex",
+	}
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: rev, provider: "codex"}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget)
+
+	reviewed := au.entriesByCategory("implement_reviewed")
+	if len(reviewed) != 1 {
+		t.Fatalf("implement_reviewed entries = %d, want 1", len(reviewed))
+	}
+	var p planreview.ImplementReviewedPayload
+	if err := json.Unmarshal(reviewed[0].Payload, &p); err != nil {
+		t.Fatalf("unmarshal implement_reviewed payload: %v", err)
+	}
+	if p.ReviewerVersion != "0.30.5 (codex-cli)" {
+		t.Errorf("ReviewerVersion = %q, want %q", p.ReviewerVersion, "0.30.5 (codex-cli)")
+	}
+	if p.ReviewerBinary != "/opt/codex-override" {
+		t.Errorf("ReviewerBinary = %q, want %q", p.ReviewerBinary, "/opt/codex-override")
+	}
+}
+
+// TestImplementReviewLoop_ProvenanceUnknownVersionDegrades asserts a codex
+// reviewer whose CLI version is "unknown" still records a terminal
+// implement_reviewed entry (NOT implement_review_failed) carrying
+// reviewer_version=="unknown" — the provenance probe degrades without failing
+// the review (#1768).
+func TestImplementReviewLoop_ProvenanceUnknownVersionDegrades(t *testing.T) {
+	au := newSeqAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	runID, stageID := uuid.New(), uuid.New()
+
+	rev := &probingReviewer{
+		version: "unknown",
+		binary:  "codex",
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "gpt-5-codex",
+	}
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: rev, provider: "codex"}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget)
+
+	if n := len(au.entriesByCategory("implement_review_failed")); n != 0 {
+		t.Fatalf("implement_review_failed entries = %d, want 0 (an unknown version degrades, never fails)", n)
+	}
+	reviewed := au.entriesByCategory("implement_reviewed")
+	if len(reviewed) != 1 {
+		t.Fatalf("implement_reviewed entries = %d, want 1", len(reviewed))
+	}
+	var p planreview.ImplementReviewedPayload
+	if err := json.Unmarshal(reviewed[0].Payload, &p); err != nil {
+		t.Fatalf("unmarshal implement_reviewed payload: %v", err)
+	}
+	if p.ReviewerVersion != "unknown" {
+		t.Errorf("ReviewerVersion = %q, want %q", p.ReviewerVersion, "unknown")
+	}
+	if p.ReviewerBinary != "codex" {
+		t.Errorf("ReviewerBinary = %q, want %q", p.ReviewerBinary, "codex")
+	}
+}
+
+// TestImplementReviewLoop_NonProbingReviewerOmitsProvenance asserts the
+// both-fields omit path (binding approval condition): a reviewer that implements
+// neither the versionProber nor the binaryReporter capability leaves BOTH
+// reviewer_version and reviewer_binary empty, and the emitted implement_reviewed
+// payload omits both keys (omitempty byte-compat).
+func TestImplementReviewLoop_NonProbingReviewerOmitsProvenance(t *testing.T) {
+	au := newSeqAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	runID, stageID := uuid.New(), uuid.New()
+
+	rev := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-8",
+	}
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: rev, provider: "anthropic"}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget)
+
+	reviewed := au.entriesByCategory("implement_reviewed")
+	if len(reviewed) != 1 {
+		t.Fatalf("implement_reviewed entries = %d, want 1", len(reviewed))
+	}
+	if strings.Contains(string(reviewed[0].Payload), "reviewer_version") {
+		t.Errorf("non-probing reviewer payload must omit reviewer_version: %s", reviewed[0].Payload)
+	}
+	if strings.Contains(string(reviewed[0].Payload), "reviewer_binary") {
+		t.Errorf("non-probing reviewer payload must omit reviewer_binary: %s", reviewed[0].Payload)
+	}
+	var p planreview.ImplementReviewedPayload
+	if err := json.Unmarshal(reviewed[0].Payload, &p); err != nil {
+		t.Fatalf("unmarshal implement_reviewed payload: %v", err)
+	}
+	if p.ReviewerVersion != "" || p.ReviewerBinary != "" {
+		t.Errorf("ReviewerVersion=%q ReviewerBinary=%q, want both empty for a non-probing reviewer", p.ReviewerVersion, p.ReviewerBinary)
+	}
+}
+
 // TestImplementReviewLoop_FailedAppendSkipsConcernPersistence: when the
 // audit append fails there is no sequence to stamp, so concern
 // persistence for that verdict is skipped (warn-only) — the audit chain
