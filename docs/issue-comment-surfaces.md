@@ -1259,6 +1259,23 @@ Notes:
   run) with `campaign_id` + `issue_number` in the payload instead of a run link.
   It audits both a landed move and every deliberate skip (never-fight-the-human,
   and the projects-token-absent skip #1107/#1114), matching the run-scoped hook.
+  **Issue-lifecycle-scoped emitter (#1817).** The SAME `work_item_transitioned`
+  category is ALSO written by a third, issue-scoped sibling entry point,
+  `server/boardsync_issue_events.go::handleIssueLifecycleBoardSync` (audited via
+  `auditIssueBoardTransition`), for the `issue_closed`/`issue_reopened` edges: on
+  an `issues.closed`/`issues.reopened` webhook, a hand-closed, never-run-driven
+  issue (epic/ADR/throwaway) advances to `done`, and a reopened card is pulled
+  back from `done` to `backlog`. This path is separate because a closed issue has
+  NO run and NO campaign — it resolves the installation straight off the webhook
+  event (not a repo lookup) and writes on the **GLOBAL chain**
+  (`AppendGlobalChained`) with `repo` + `issue_number` + `state_reason` in the
+  payload (`{trigger, repo, issue_number, state_reason, canonical_state, from, to,
+  moved, skipped, skip_reason}`). It audits both a landed move and every skip: the
+  never-fight-the-human idempotent overlap with a prior `run_merged` (a card
+  already in `done` yields exactly one `moved=true` row plus one `skipped=true`
+  row, never two moves) AND the deliberate `not_planned`/`duplicate`
+  leave-in-place (the provider is not called; the skip is audited naming the
+  `state_reason`).
   Listed here so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
 - The product-feedback egress kind — `product_report_filed` (#1006) — is an

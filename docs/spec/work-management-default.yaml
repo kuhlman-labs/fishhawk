@@ -47,13 +47,20 @@ states:
 # card along these edges, but only from the transition's expected source
 # state — a human's manual placement is never overridden. campaign_started
 # (#1816) is campaign-scoped (not run-scoped): it fires for each still-queued
-# item as a campaign transitions pending -> running.
+# item as a campaign transitions pending -> running. issue_closed /
+# issue_reopened (#1817) are issue-lifecycle-scoped (not run-scoped): the
+# issues.closed/reopened webhook reconciler advances a hand-closed,
+# never-run-driven issue (epic/ADR/throwaway) to done — a not_planned or
+# duplicate close is left in place — and a reopen pulls the card back to
+# backlog from the issue_closed target only.
 transitions:
   run_started: in_progress
   pr_opened: in_review
   run_failed: blocked
   run_merged: done
   campaign_started: up_next
+  issue_closed: done
+  issue_reopened: backlog
 
 # Per-repo kill-switch for upstream product-feedback egress (ADR-029,
 # #1006). Shipped in its enabled (egress-on) position. To hard-disable the

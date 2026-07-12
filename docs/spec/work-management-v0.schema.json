@@ -117,13 +117,15 @@
       "type": "object",
       "additionalProperties": false,
       "minProperties": 1,
-      "description": "Run-lifecycle-event to canonical-state map (#1012): when a run reaches a lifecycle point, the board card moves to the mapped canonical state (resolved to a provider option via `states`). The closed event set is run_started/pr_opened/run_failed/run_merged plus the campaign-scoped campaign_started (#1816). Optional and additive: absent means no transitions are configured. Every value must be a key present in `states` (semantic check).",
+      "description": "Run-lifecycle-event to canonical-state map (#1012): when a run reaches a lifecycle point, the board card moves to the mapped canonical state (resolved to a provider option via `states`). The closed event set is run_started/pr_opened/run_failed/run_merged, the campaign-scoped campaign_started (#1816), and the issue-lifecycle issue_closed/issue_reopened (#1817). Optional and additive: absent means no transitions are configured. Every value must be a key present in `states` (semantic check).",
       "properties": {
         "run_started": { "$ref": "#/$defs/canonical_state", "description": "Canonical state when a run starts on the item (e.g. in_progress)." },
         "pr_opened": { "$ref": "#/$defs/canonical_state", "description": "Canonical state when the run opens a PR (e.g. in_review)." },
         "run_failed": { "$ref": "#/$defs/canonical_state", "description": "Canonical state when the run fails (e.g. blocked)." },
         "run_merged": { "$ref": "#/$defs/canonical_state", "description": "Canonical state when the run's PR merges (e.g. done)." },
-        "campaign_started": { "$ref": "#/$defs/canonical_state", "description": "Canonical state a campaign's still-queued item moves to when the campaign transitions pending -> running (e.g. up_next). Campaign-scoped, not run-scoped: campaign items have no run at start time (#1816)." }
+        "campaign_started": { "$ref": "#/$defs/canonical_state", "description": "Canonical state a campaign's still-queued item moves to when the campaign transitions pending -> running (e.g. up_next). Campaign-scoped, not run-scoped: campaign items have no run at start time (#1816)." },
+        "issue_closed": { "$ref": "#/$defs/canonical_state", "description": "Canonical state a hand-closed, never-run-driven issue (epic/ADR/throwaway) advances to when the issue is closed as completed (e.g. done). Issue-lifecycle-scoped, not run-scoped: driven by the issues.closed webhook, not a run (#1817). A not_planned/duplicate close leaves the card in place." },
+        "issue_reopened": { "$ref": "#/$defs/canonical_state", "description": "Canonical state a reopened issue is pulled back to, from the issue_closed target only (a human-parked card elsewhere is untouched) (e.g. backlog). Issue-lifecycle-scoped, driven by the issues.reopened webhook (#1817)." }
       }
     },
     "product_feedback": {

@@ -159,5 +159,16 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		s.ingestCodeScanningAlert(r.Context(), ev.RawBody)
 	}
 
+	// `issues.closed` / `issues.reopened` drive the board-sync reconciler
+	// (#1817): a hand-closed, never-run-driven issue (epic/ADR/throwaway)
+	// advances to Done, and a reopened card is pulled back — every move and
+	// deliberate skip audited on the global chain. The dispatcher already
+	// treats closed/reopened as non-trigger skips (only issues.labeled
+	// triggers a run), so this consumer doesn't conflict with the trigger
+	// path. Best-effort — never influences the 202.
+	if ev.Type == "issues" && (ev.Action == "closed" || ev.Action == "reopened") {
+		s.handleIssueLifecycleBoardSync(r.Context(), ev)
+	}
+
 	w.WriteHeader(http.StatusAccepted)
 }
