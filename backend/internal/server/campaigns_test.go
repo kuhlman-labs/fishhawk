@@ -2604,6 +2604,144 @@ func TestStartCampaignItemRun_RestartCancelled_CrossBoundary_E2E(t *testing.T) {
 	}
 }
 
+// seedRestartableCampaign seeds a running campaign with a single deps-satisfied,
+// non-human-led CANCELLED item — the shape campaign.NextEligible classifies as
+// Restartable (engine.go: a cancelled item with satisfied deps and Autonomy!=
+// "low" diverts to Restartable). It returns the campaign and the item pointer so
+// a test can drive handleStartCampaignItemRun's `if isRestartable` restart branch
+// and inspect the item's post-call state. The fake's default campaign state is
+// running, so the dispatch gate passes.
+func seedRestartableCampaign(crepo *fakeCampaignRepo) (*campaign.Campaign, *campaign.Item) {
+	item := cItem("issue:100", nil, campaign.ItemStateCancelled)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{item})
+	return c, item
+}
+
+// TestStartCampaignItemRun_RestartInvalidTransition_409 pins the first restart
+// error arm: RestartCampaignItem returning campaign.InvalidTransitionError (a
+// concurrent restart/dispatch raced the item off its terminal state) maps to 409
+// item_not_eligible via the errors.As(rerr,&inv) case. Injected through the fake's
+// restartErr seam on a NextEligible-classified Restartable item so control reaches
+// the `if isRestartable` block.
+func TestStartCampaignItemRun_RestartInvalidTransition_409(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, _, _ := newCampaignStartServer(t, crepo)
+	c, _ := seedRestartableCampaign(crepo)
+	crepo.restartErr = campaign.InvalidTransitionError{Kind: "campaign_item", From: "cancelled", To: "pending"}
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "item_not_eligible" {
+		t.Errorf("error code = %q, want item_not_eligible", code)
+	}
+	if crepo.restartCalls != 1 {
+		t.Errorf("restartCalls = %d, want 1 (restart branch reached)", crepo.restartCalls)
+	}
+}
+
+// TestStartCampaignItemRun_RestartNotFound_404 pins the second restart error arm:
+// RestartCampaignItem returning campaign.ErrNotFound maps to 404
+// campaign_item_not_found via the errors.Is(rerr, campaign.ErrNotFound) case.
+func TestStartCampaignItemRun_RestartNotFound_404(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, _, _ := newCampaignStartServer(t, crepo)
+	c, _ := seedRestartableCampaign(crepo)
+	crepo.restartErr = campaign.ErrNotFound
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "campaign_item_not_found" {
+		t.Errorf("error code = %q, want campaign_item_not_found", code)
+	}
+	if crepo.restartCalls != 1 {
+		t.Errorf("restartCalls = %d, want 1 (restart branch reached)", crepo.restartCalls)
+	}
+}
+
+// TestStartCampaignItemRun_RestartInternalError_500 pins the default restart error
+// arm: a plain (non-InvalidTransition, non-ErrNotFound) error from
+// RestartCampaignItem maps to 500 internal_error via the default case.
+func TestStartCampaignItemRun_RestartInternalError_500(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, _, _ := newCampaignStartServer(t, crepo)
+	c, _ := seedRestartableCampaign(crepo)
+	crepo.restartErr = errInjected
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "internal_error" {
+		t.Errorf("error code = %q, want internal_error", code)
+	}
+	if crepo.restartCalls != 1 {
+		t.Errorf("restartCalls = %d, want 1 (restart branch reached)", crepo.restartCalls)
+	}
+}
+
+// TestStartCampaignItemRun_RestartThenDownstreamFailure_ReAdmittable pins the
+// partial-failure edge: RestartCampaignItem succeeds (item reset to pending, run
+// link cleared, campaign_issue_restarted emitted exactly once) but the immediate
+// downstream SetCampaignItemRun link fails, leaving the item PENDING and UNLINKED
+// (RunID nil). A subsequent verb call must re-admit that item via the Eligible
+// pending path (NOT a second restart) and drive it to running — demonstrating the
+// pending-unlinked item is retryable rather than wedged.
+func TestStartCampaignItemRun_RestartThenDownstreamFailure_ReAdmittable(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, _, aud := newCampaignStartServer(t, crepo)
+	c, item := seedRestartableCampaign(crepo)
+	// The post-restart run-link write fails, aborting after RestartCampaignItem
+	// already reset the item.
+	crepo.setRunErr = errInjected
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("first start = %d, want 500 (link failure; body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "internal_error" {
+		t.Errorf("error code = %q, want internal_error", code)
+	}
+	if crepo.restartCalls != 1 {
+		t.Errorf("restartCalls = %d, want 1 (item restarted once)", crepo.restartCalls)
+	}
+	if n := aud.count("campaign_issue_restarted"); n != 1 {
+		t.Errorf("campaign_issue_restarted count = %d, want exactly 1", n)
+	}
+	// The item is left pending and unlinked — the state the re-admittability path
+	// must recover from.
+	if item.State != campaign.ItemStatePending {
+		t.Errorf("item state = %q, want pending (reset but unlinked)", item.State)
+	}
+	if item.RunID != nil {
+		t.Errorf("item run_id = %v, want nil (link failed)", item.RunID)
+	}
+
+	// Recover: clear the injected link failure and re-issue the verb. The now-pending
+	// item is Eligible, so it is admitted WITHOUT a second restart.
+	crepo.setRunErr = nil
+	w2 := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w2.Code != http.StatusCreated {
+		t.Fatalf("re-admit start = %d, want 201 (body=%s)", w2.Code, w2.Body.String())
+	}
+	var body startItemRunBody
+	if err := json.Unmarshal(w2.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.Item.State != string(campaign.ItemStateRunning) {
+		t.Errorf("item state = %q, want running", body.Item.State)
+	}
+	if body.Item.RunID == nil || *body.Item.RunID != body.Run.ID {
+		t.Errorf("item run_id = %v, want linked to %s", body.Item.RunID, body.Run.ID)
+	}
+	if crepo.restartCalls != 1 {
+		t.Errorf("restartCalls = %d, want 1 (re-admitted via Eligible path, NOT a second restart)", crepo.restartCalls)
+	}
+}
+
 // seedRecoveryChild mints a run in the fake run repo carrying parent_run_id =
 // parentID (a resume/recovery child, the #216 lineage) and drives it to state.
 // It models the run fishhawk_resume_run mints when an operator recovers a
