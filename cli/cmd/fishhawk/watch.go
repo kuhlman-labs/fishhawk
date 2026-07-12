@@ -25,8 +25,7 @@ import (
 // completion with ZERO coupling to runner-log event names — replacing
 // the fragile grep-the-log-for-a-guessed-event-name contract that
 // silently stalled run 4459817d. It changes NO backend/runner/MCP
-// surface; it reuses endpoints that already exist. The poll loop mirrors
-// autoDecideLoop so both detached operator verbs share one shape.
+// surface; it reuses endpoints that already exist.
 
 // Watch outcome exit codes. terminal-ok and failed alias the CLI's
 // standard exitOK/exitFailure; amendment-pending and timeout are watch-
@@ -119,8 +118,8 @@ func runWatch(args []string, stdout, stderr io.Writer) int {
 	defer cancel()
 
 	// Resolve the stage id from the run: the operator passes a stage
-	// TYPE, not a raw id (mirroring auto-decide's plan-stage resolution).
-	// A resolution failure is a non-terminal failure path that still owes
+	// TYPE, not a raw id. A resolution failure is a non-terminal
+	// failure path that still owes
 	// the caller exactly one JSON summary (outcome=error) per the
 	// exactly-one-summary-line contract — not a bare stderr error.
 	stageID, resolveErr := resolveStageID(ctx, client, runID, *stageType)
@@ -142,8 +141,7 @@ func runWatch(args []string, stdout, stderr io.Writer) int {
 // resolveStageID lists the run's stages and returns the id of the stage
 // whose Type == stageType. On a transport failure it returns the error;
 // on no match it returns an actionable error naming the available stage
-// types. Reuses the same list endpoint auto-decide's plan-stage
-// resolution uses.
+// types.
 func resolveStageID(ctx context.Context, client *httpclient.Client, runID uuid.UUID, stageType string) (uuid.UUID, error) {
 	stages, err := client.ListRunStages(ctx, runID)
 	if err != nil {
@@ -161,9 +159,8 @@ func resolveStageID(ctx context.Context, client *httpclient.Client, runID uuid.U
 }
 
 // watchLoop is the poll→classify→emit loop, split out of runWatch so
-// tests can drive it against an httptest.Server (mirroring
-// autoDecideLoop). It emits EXACTLY ONE watchSummary line before
-// returning, whichever exit class it lands in.
+// tests can drive it against an httptest.Server. It emits EXACTLY ONE
+// watchSummary line before returning, whichever exit class it lands in.
 func watchLoop(ctx context.Context, client *httpclient.Client, runID, stageID uuid.UUID, stageType, until string, pollSeconds int, stdout, stderr io.Writer) int {
 	// finish centralizes the exactly-one-summary contract: every return
 	// path routes through it so stdout carries one JSON line per run.

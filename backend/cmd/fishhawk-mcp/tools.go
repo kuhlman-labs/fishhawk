@@ -33,9 +33,10 @@ type runResolver struct {
 
 // registerTools wires every MCP tool onto srv. Called once at
 // server startup; the SDK keeps the handlers alive for the
-// lifetime of the stdio session. Tools register in alphabetical
-// order so the protocol's tool-listing endpoint returns a stable
-// ordering for clients that index on position.
+// lifetime of the stdio session. Registration order is the fixed
+// source order of the register* calls below (not alphabetical),
+// so the protocol's tool-listing endpoint returns a stable
+// ordering across restarts for clients that index on position.
 func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerAnswerClarification(srv, resolver)
 	registerGetActiveRun(srv, resolver)
