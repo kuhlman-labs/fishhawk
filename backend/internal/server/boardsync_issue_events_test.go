@@ -59,6 +59,12 @@ func TestHandleIssueLifecycle_ClosedCompleted_Moves(t *testing.T) {
 	if got.IssueNumber != 1817 || got.Target.InstallationID != 4242 {
 		t.Errorf("call issue=%d install=%d, want 1817/4242", got.IssueNumber, got.Target.InstallationID)
 	}
+	// The handler must pass the derived issue_closed expected-source set (all
+	// configured states minus the target) — a wiring bug that passed nil would
+	// slip past the fake provider, which ignores the set.
+	if !sameSet(got.ExpectedSourceStates, issueExpectedSourceStates(lifecycleIssueClosed, workmgmt.Default())) {
+		t.Errorf("expected sources = %v, want the derived issue_closed set (all states minus done)", got.ExpectedSourceStates)
+	}
 
 	audits := campaignTransitionAudits(au)
 	if len(audits) != 1 {
@@ -140,6 +146,39 @@ func TestHandleIssueLifecycle_ClosedDuplicate_LeftInPlace(t *testing.T) {
 	}
 }
 
+// (d2) closed with an absent/null state_reason (GitHub's REST default, which
+// closes the issue as completed) advances the card like an explicit "completed":
+// the provider IS called and the move is audited with an empty state_reason.
+func TestHandleIssueLifecycle_ClosedNullStateReason_Moves(t *testing.T) {
+	fp := &fakeTransitionProvider{result: &workmgmt.TransitionResult{Moved: true, From: "In Progress", To: "Done"}}
+	registerTransitionProvider(t, fp)
+	s, au := issueEventServer(t)
+
+	// state_reason is absent entirely from the payload (unmarshals to "").
+	ev := webhook.Event{
+		Type:           "issues",
+		Action:         "closed",
+		Repo:           "kuhlman-labs/fishhawk",
+		InstallationID: 4242,
+		RawBody:        []byte(`{"action":"closed","repository":{"full_name":"kuhlman-labs/fishhawk"},"installation":{"id":4242},"issue":{"number":1817}}`),
+	}
+	s.handleIssueLifecycleBoardSync(context.Background(), ev)
+
+	if len(fp.calls) != 1 {
+		t.Fatalf("Transition calls = %d, want 1 (null state_reason advances like completed)", len(fp.calls))
+	}
+	if got := fp.calls[0]; got.Trigger != lifecycleIssueClosed || got.CanonicalState != workmgmt.CanonicalStateDone {
+		t.Errorf("call = trigger %q canonical %q, want issue_closed/done", got.Trigger, got.CanonicalState)
+	}
+	audits := campaignTransitionAudits(au)
+	if len(audits) != 1 || audits[0]["moved"] != true {
+		t.Fatalf("audits = %v, want one moved=true", audits)
+	}
+	if audits[0]["state_reason"] != "" {
+		t.Errorf("audit state_reason = %v, want empty for a null/absent state_reason", audits[0]["state_reason"])
+	}
+}
+
 // (e) reopened from Done moves the card back to backlog.
 func TestHandleIssueLifecycle_Reopened_MovesToBacklog(t *testing.T) {
 	fp := &fakeTransitionProvider{result: &workmgmt.TransitionResult{Moved: true, From: "Done", To: "Backlog"}}
@@ -203,6 +242,31 @@ func TestHandleIssueLifecycle_UnmappedAction_NoOp(t *testing.T) {
 	}
 	if len(campaignTransitionAudits(au)) != 0 {
 		t.Errorf("audit written for unmapped action, want none")
+	}
+}
+
+// (g1b) a mapped action (issues.closed) whose corresponding transition key is
+// absent from conv.Transitions is a silent no-op: the action IS recognized but
+// no board edge is configured for it, so the provider is never called.
+func TestHandleIssueLifecycle_UnmappedTransition_NoOp(t *testing.T) {
+	prev := conventionsLoader
+	conv := workmgmt.Default()
+	conv.Transitions = map[string]string{} // states present, but no issue_closed edge
+	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	fp := &fakeTransitionProvider{}
+	registerTransitionProvider(t, fp)
+	au := &campaignAuditRecorder{}
+	s := New(Config{AuditRepo: au})
+
+	s.handleIssueLifecycleBoardSync(context.Background(), issuesEvent("closed", 1817, "completed"))
+
+	if len(fp.calls) != 0 {
+		t.Errorf("Transition called %d times for an unmapped transition key, want 0", len(fp.calls))
+	}
+	if len(campaignTransitionAudits(au)) != 0 {
+		t.Errorf("audit written for an unmapped transition key, want none")
 	}
 }
 
@@ -280,6 +344,57 @@ func TestHandleIssueLifecycle_NonTransitioner_NoOp(t *testing.T) {
 
 	if len(campaignTransitionAudits(au)) != 0 {
 		t.Errorf("audit written for non-Transitioner provider, want none")
+	}
+}
+
+// (k) a conventions-load error is best-effort: WARN log + return, provider
+// never called, no audit written — the reconciler must not proceed past a
+// failed conventions load.
+func TestHandleIssueLifecycle_ConventionsError_NoOp(t *testing.T) {
+	prev := conventionsLoader
+	conventionsLoader = func(string) (workmgmt.Conventions, error) {
+		return workmgmt.Conventions{}, context.DeadlineExceeded
+	}
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	fp := &fakeTransitionProvider{}
+	registerTransitionProvider(t, fp)
+	au := &campaignAuditRecorder{}
+	s := New(Config{AuditRepo: au})
+
+	s.handleIssueLifecycleBoardSync(context.Background(), issuesEvent("closed", 1817, "completed"))
+
+	if len(fp.calls) != 0 {
+		t.Errorf("Transition called %d times after a conventions-load error, want 0", len(fp.calls))
+	}
+	if len(campaignTransitionAudits(au)) != 0 {
+		t.Errorf("audit written after a conventions-load error, want none")
+	}
+}
+
+// (l) an unsplittable repo full name (no owner/name) is a silent no-op: the
+// transition target cannot be built, so the provider is never called.
+func TestHandleIssueLifecycle_UnsplittableRepo_NoOp(t *testing.T) {
+	fp := &fakeTransitionProvider{}
+	registerTransitionProvider(t, fp)
+	s, au := issueEventServer(t)
+
+	// A repo with no "/" fails splitRepoFullName after conventions load and
+	// provider resolution succeed (the default loader ignores the repo arg).
+	ev := webhook.Event{
+		Type:           "issues",
+		Action:         "closed",
+		Repo:           "not-a-valid-repo",
+		InstallationID: 4242,
+		RawBody:        []byte(`{"action":"closed","installation":{"id":4242},"issue":{"number":1817,"state_reason":"completed"}}`),
+	}
+	s.handleIssueLifecycleBoardSync(context.Background(), ev)
+
+	if len(fp.calls) != 0 {
+		t.Errorf("Transition called %d times for an unsplittable repo, want 0", len(fp.calls))
+	}
+	if len(campaignTransitionAudits(au)) != 0 {
+		t.Errorf("audit written for an unsplittable repo, want none")
 	}
 }
 
