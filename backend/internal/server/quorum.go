@@ -145,6 +145,52 @@ func (s *Server) delegatedApproverSubjects(ctx context.Context, runID uuid.UUID)
 // but never counted toward the human quorum, and the approval row does not
 // retain delegated status. Fail-open to 0 on a list error — an unreadable
 // approval history never spuriously advances the gate.
+//
+// Read-after-write quorum, #1734 (deliberately NOT serialized).
+//
+// This count is a read-after-write against the approval rows with no
+// serialization (no in-process mutex, no advisory lock, no SELECT FOR UPDATE),
+// and that is correct today by construction:
+//
+//   - Commit-before-count ordering. ApprovalRepo.Submit (approval/postgres.go)
+//     runs CreateApproval through approvaldb.New(r.pool) in AUTOCOMMIT, so the
+//     approver's row is committed before Submit returns. approveStageAs then
+//     calls this count strictly AFTER Submit returns — never before.
+//   - Single primary, READ COMMITTED. Every count read hits the one
+//     FISHHAWKD_DATABASE_URL pool; there is no read-replica / lagging-standby
+//     routing. Under READ COMMITTED each statement sees a fresh snapshot as of
+//     its own start, so a later count observes its own just-committed row plus
+//     every previously-committed eligible row.
+//
+// Therefore the reviewer's two-approver liveness stall ("A and B each observe
+// only their own row, so neither reaches count=2 and the gate never advances")
+// is a TEMPORAL CONTRADICTION and cannot occur. The stall needs both counts to
+// precede the other approver's commit: commitA<countA, commitB<countB,
+// countA<commitB, countB<commitA — which chains to commitA<commitA. Whichever
+// approver commits LAST always counts after both rows are durable and observes
+// the full quorum, so the gate is always reachable under concurrency.
+//
+// Safety on the double-advance path is preserved independently: if a second
+// (or racing) submission reaches an already-advanced stage, advanceStage's
+// TransitionStage InvalidTransition guard fires and approveStageAs surfaces it
+// (approveActionError failedAt gateActionAdvance → 409), so no stage is
+// advanced twice. (The "SELECT FOR UPDATE on the stage row" line in
+// approval/approval.go's package doc is stale — the current path holds no such
+// lock; the transition guard is the actual safety mechanism.)
+//
+// Invariants a future change MUST preserve, or this analysis reopens:
+//   - Never route this count through a read-replica / lagging read path.
+//   - Never evaluate the count before Submit's row commits (never reorder count
+//     ahead of Submit).
+//   - Never wrap Submit in an uncommitted long-lived transaction still open at
+//     count time.
+//
+// Pinned by TestPostgres_Submit_ConcurrentQuorum (approval/postgres_test.go —
+// real Postgres commit semantics: N concurrent distinct approvers, the last
+// committer observes all N) and the server-layer no-stall / no-double-advance
+// tests in quorum_test.go. An in-process mutex would be wrong regardless — the
+// API tier runs multiple replicas — and a Postgres advisory lock would only
+// over-serialize a race that provably does not occur.
 func (s *Server) countDistinctEligibleApprovers(ctx context.Context, runID, stageID uuid.UUID, changeAuthor string) int {
 	rows, err := s.cfg.ApprovalRepo.ListForStage(ctx, stageID)
 	if err != nil {

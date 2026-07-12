@@ -3,7 +3,9 @@ package approval_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -151,6 +153,92 @@ func TestPostgres_Submit_AppendOnlyEnforced(t *testing.T) {
 		`DELETE FROM approvals WHERE id = $1`, res.Approval.ID)
 	if err == nil {
 		t.Error("DELETE on approvals succeeded; trigger should have refused")
+	}
+}
+
+// TestPostgres_Submit_ConcurrentQuorum is the #1734 read-after-write quorum
+// regression guard. It fires N concurrent distinct-approver submissions against
+// one stage and proves the liveness property that closes #1734 WITHOUT
+// serialization: because Submit commits its row (autocommit) before returning
+// and every count read hits the single primary under READ COMMITTED, the
+// last-committing goroutine's post-Submit ListForStage always observes the full
+// N-approver quorum. The reviewer's "each approver sees only its own row so the
+// gate never advances" stall is a temporal contradiction and cannot occur.
+//
+// The in-memory fake (server.fakeApprovalRepo) serializes every Submit under a
+// mutex and cannot reproduce Postgres commit semantics, so this MUST be
+// pgtest-backed. Stress with `-race -count=50` to shake out any ordering flake.
+func TestPostgres_Submit_ConcurrentQuorum(t *testing.T) {
+	const n = 4
+	pool := pgtest.NewPool(t)
+	repo := approval.NewPostgresRepository(pool)
+	_, stageID := seedRunAndStage(t, pool)
+
+	// Each goroutine submits a DISTINCT approver, then reads back the stage's
+	// approval count it observes immediately after its own commit. A released
+	// start barrier maximizes interleaving so the submissions genuinely race.
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	inserted := make([]bool, n)
+	observed := make([]int, n)
+	errs := make([]error, n)
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			res, err := repo.Submit(context.Background(), approval.SubmitParams{
+				StageID:         stageID,
+				ApproverSubject: fmt.Sprintf("@r%d", i),
+				Decision:        approval.DecisionApprove,
+			})
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			inserted[i] = res.Inserted
+			// Read-after-write: the count this approver observes once its own
+			// row is committed.
+			rows, err := repo.ListForStage(context.Background(), stageID)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			observed[i] = len(rows)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	// Every distinct approver inserted a fresh row.
+	maxObserved := 0
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d: %v", i, errs[i])
+		}
+		if !inserted[i] {
+			t.Errorf("goroutine %d: Inserted = false, want true (distinct approver)", i)
+		}
+		if observed[i] > maxObserved {
+			maxObserved = observed[i]
+		}
+	}
+
+	// Liveness / no-stall: the last-committing approver's post-Submit count
+	// observed the FULL quorum. If concurrent counts could each see only their
+	// own row (the #1734 stall), maxObserved would be < n.
+	if maxObserved != n {
+		t.Errorf("max observed post-Submit count = %d, want %d (last committer must see full quorum — no stall)", maxObserved, n)
+	}
+
+	// Durability: all N rows persisted.
+	all, err := repo.ListForStage(context.Background(), stageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != n {
+		t.Errorf("final ListForStage = %d rows, want %d (all concurrent submissions durable)", len(all), n)
 	}
 }
 

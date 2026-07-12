@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"testing"
 
 	"github.com/google/uuid"
@@ -12,6 +13,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
@@ -309,6 +311,116 @@ func approvalSubmittedEntry(subject, payload string) *audit.Entry {
 		Category:     "approval_submitted",
 		ActorSubject: &s,
 		Payload:      json.RawMessage(payload),
+	}
+}
+
+// TestQuorum_NoStall_LastCommitterAdvancesOnce is the server-layer liveness
+// half of the #1734 resolution: it pins the orchestration outcome that the
+// unserialized read-after-write quorum REACHES quorum and advances the stage
+// exactly once. Two DISTINCT eligible approvers submit against a count=2
+// acceptance gate; the stage stays awaiting_approval after the first vote, then
+// transitions to succeeded EXACTLY ONCE on the second (last-committing) vote,
+// whose predicate snapshot records count_eligible == 2 — the last committer
+// observes the full quorum, so there is no stall. The concurrent interleaving
+// itself is proven against real Postgres in
+// approval.TestPostgres_Submit_ConcurrentQuorum; here the deterministic server
+// fakes pin the resulting advance semantics.
+func TestQuorum_NoStall_LastCommitterAdvancesOnce(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := seedQuorumStage(rr, au, 2, "github:author")
+
+	// First eligible approve: recorded, below quorum, no advance.
+	if w := submitApprovalAs(t, s, stage.ID, "github:r1", `{"decision":"approve"}`); w.Code != http.StatusOK {
+		t.Fatalf("r1 status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Fatalf("after r1 state = %q, want awaiting_approval (below quorum)", got)
+	}
+
+	// Second DISTINCT eligible approve: quorum reached, stage advances.
+	if w := submitApprovalAs(t, s, stage.ID, "github:r2", `{"decision":"approve"}`); w.Code != http.StatusOK {
+		t.Fatalf("r2 status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateSucceeded {
+		t.Fatalf("after r2 state = %q, want succeeded (quorum reached — no stall)", got)
+	}
+
+	// Advanced EXACTLY ONCE: a single succeeded transition, no double-advance.
+	succeeded := 0
+	for _, tr := range rr.transitions {
+		if tr.StageID == stage.ID && tr.To == run.StageStateSucceeded {
+			succeeded++
+		}
+	}
+	if succeeded != 1 {
+		t.Errorf("succeeded transitions = %d, want exactly 1 (advance-once)", succeeded)
+	}
+
+	// The last committer's snapshot observed the full quorum.
+	snap, _ := approvalPayloadFor(t, au, "github:r2")["predicate_snapshot"].(map[string]any)
+	if snap["quorum_reached"] != true {
+		t.Errorf("r2 quorum_reached = %v, want true (last committer sees full quorum)", snap["quorum_reached"])
+	}
+	if snap["count_eligible"].(float64) != 2 {
+		t.Errorf("r2 count_eligible = %v, want 2", snap["count_eligible"])
+	}
+}
+
+// TestQuorum_Safety_InvalidTransitionGuard pins the safety half of the #1734
+// resolution: the double-advance guard. When the quorum advance reaches a stage
+// whose TransitionStage rejects the transition (advanceStage returning
+// run.InvalidTransitionError — what a genuine late/racing second advance against
+// an already-advanced stage hits), approveStageAs surfaces it through the
+// InvalidTransition path — an *approveActionError whose failedAt is
+// gateActionAdvance, unwrapping to the run.InvalidTransitionError the HTTP
+// handler maps to 409 — and records NO state transition, so no stage is
+// advanced twice.
+func TestQuorum_Safety_InvalidTransitionGuard(t *testing.T) {
+	s, ar, rr, au := newApprovalServer(t)
+	stage := seedQuorumStage(rr, au, 1, "github:author")
+
+	// Force the advance to hit the transition guard, standing in for a genuine
+	// double-advance against an already-advanced stage. The existing
+	// approvalRunRepo.transitionErr field drives TransitionStage to return this
+	// error — no fake defined elsewhere is extended.
+	rr.transitionErr = run.InvalidTransitionError{
+		Kind: "stage",
+		From: string(run.StageStateSucceeded),
+		To:   string(run.StageStateSucceeded),
+	}
+
+	result, err := s.approveStageAs(context.Background(),
+		Identity{Subject: "github:r1"},
+		approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+	if err == nil {
+		t.Fatalf("approveStageAs err = nil, want InvalidTransition advance error; result=%+v", result)
+	}
+
+	// Surfaced as an advance-phase failure...
+	var aerr *approveActionError
+	if !errors.As(err, &aerr) {
+		t.Fatalf("err = %T, want *approveActionError", err)
+	}
+	if aerr.failedAt != gateActionAdvance {
+		t.Errorf("failedAt = %v, want gateActionAdvance", aerr.failedAt)
+	}
+	// ...unwrapping to the run.InvalidTransitionError the handler maps to 409.
+	var inv run.InvalidTransitionError
+	if !errors.As(err, &inv) {
+		t.Fatalf("err does not unwrap to run.InvalidTransitionError: %v", err)
+	}
+
+	// No stage was advanced: the guard blocked the transition (no double-advance).
+	for _, tr := range rr.transitions {
+		if tr.StageID == stage.ID {
+			t.Errorf("recorded a transition to %q despite the guard; want none", tr.To)
+		}
+	}
+	// The approval row WAS submitted — Submit precedes advance, so the guard
+	// fires only at the transition, never before the row is durable.
+	rows, _ := ar.ListForStage(context.Background(), stage.ID)
+	if len(rows) != 1 {
+		t.Errorf("approval rows = %d, want 1 (Submit succeeded before the advance guard)", len(rows))
 	}
 }
 
