@@ -55,6 +55,20 @@ func TestCost_KnownTiers(t *testing.T) {
 			want:   2*5 + 1*30,
 		},
 		{
+			name:   "fable premium tier",
+			model:  "claude-fable-5",
+			input:  1_000_000,
+			output: 1_000_000,
+			want:   10 + 50, // $10 input + $50 output per 1M
+		},
+		{
+			name:   "gpt-5.6-terra mid tier",
+			model:  "gpt-5.6-terra",
+			input:  1_000_000,
+			output: 1_000_000,
+			want:   2.5 + 15, // $2.50 input + $15 output per 1M
+		},
+		{
 			name:   "zero usage is zero cost",
 			model:  "claude-opus-4-8",
 			input:  0,
@@ -76,18 +90,25 @@ func TestCost_KnownTiers(t *testing.T) {
 // TestCost_PricesLiveModelIDs is the drift guard: every model id the
 // product actually dispatches today must price (ok==true), so a live
 // model the table never covers fails CI here instead of silently
-// recording $0. Keep this list in sync with the default allow-list in
+// recording $0. Two sources feed this list: the default allow-list in
 // backend/cmd/fishhawkd/serve.go and backend/internal/server/modelpolicy.go
-// (claudecode=claude-opus-4-8,claude-sonnet-4-6; codex=gpt-5.5) — those
-// are the source of truth for which model ids are in use. The pricing
-// module is standalone (no dependency on backend/server), so this
-// literal list is the manual mirror, and this comment is the guard
-// against it going stale when a maintainer adds a new default model.
+// (claudecode=claude-opus-4-8,claude-sonnet-4-6; codex=gpt-5.5), AND the
+// models pinned in .fishhawk/workflows.yaml, which overrides the defaults
+// with claude-fable-5 (planner/executor) and gpt-5.6-terra (codex
+// reviewer). claude-sonnet-5 is included so a future family-prefix change
+// can't silently drop it (it prices via the claude-sonnet prefix). The
+// pricing module is standalone (no dependency on backend/server or the
+// spec), so this literal list is the manual mirror, and this comment is
+// the guard against it going stale when a maintainer changes a dispatched
+// model.
 func TestCost_PricesLiveModelIDs(t *testing.T) {
 	live := []string{
 		"claude-opus-4-8",
+		"claude-fable-5",
 		"claude-sonnet-4-6",
+		"claude-sonnet-5",
 		"gpt-5.5",
+		"gpt-5.6-terra",
 	}
 	for _, model := range live {
 		if _, ok := Cost(model, 1, 1); !ok {
@@ -135,10 +156,13 @@ func TestCacheRates_Multipliers(t *testing.T) {
 	}{
 		// Anthropic: read = 0.1x input, write = 1.25x input.
 		{family: "claude-opus", wantReadMultiplier: 0.1, wantReadPerToken: 0.5 / 1_000_000, wantWritePerToken: 6.25 / 1_000_000},
+		{family: "claude-fable", wantReadMultiplier: 0.1, wantReadPerToken: 1.0 / 1_000_000, wantWritePerToken: 12.5 / 1_000_000},
 		{family: "claude-sonnet", wantReadMultiplier: 0.1, wantReadPerToken: 0.3 / 1_000_000, wantWritePerToken: 3.75 / 1_000_000},
 		{family: "claude-haiku", wantReadMultiplier: 0.1, wantReadPerToken: 0.1 / 1_000_000, wantWritePerToken: 1.25 / 1_000_000},
 		// gpt-5.5: read = $0.50/1M (0.1x input), write = input rate ($5/1M).
 		{family: "gpt-5.5", wantReadMultiplier: 0.1, wantReadPerToken: 0.5 / 1_000_000, wantWritePerToken: 5.0 / 1_000_000},
+		// gpt-5.6-terra: read = $0.25/1M (0.1x input), write = 1.25x input ($3.125/1M).
+		{family: "gpt-5.6-terra", wantReadMultiplier: 0.1, wantReadPerToken: 0.25 / 1_000_000, wantWritePerToken: 3.125 / 1_000_000},
 	}
 	for _, tc := range tests {
 		t.Run(tc.family, func(t *testing.T) {
@@ -154,7 +178,8 @@ func TestCacheRates_Multipliers(t *testing.T) {
 		})
 	}
 	// Anthropic write is 1.25x input; pin the multiplier directly too.
-	for _, family := range []string{"claude-opus", "claude-sonnet", "claude-haiku"} {
+	// gpt-5.6-terra also carries the 1.25x write premium (unlike gpt-5.5).
+	for _, family := range []string{"claude-opus", "claude-fable", "claude-sonnet", "claude-haiku", "gpt-5.6-terra"} {
 		r := familyRates[family]
 		approx(t, r.cacheWritePerToken, 1.25*r.inputPerToken)
 	}
@@ -165,7 +190,7 @@ func TestCacheRates_Multipliers(t *testing.T) {
 // for every live model id, so a non-cache-aware caller routed through the new
 // entry point is unaffected.
 func TestCostWithCache_ReducesToCost(t *testing.T) {
-	for _, model := range []string{"claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5", "gpt-5.5"} {
+	for _, model := range []string{"claude-opus-4-8", "claude-fable-5", "claude-sonnet-4-6", "claude-haiku-4-5", "gpt-5.5", "gpt-5.6-terra"} {
 		t.Run(model, func(t *testing.T) {
 			wantUSD, wantOK := Cost(model, 1_234_567, 89_012)
 			gotUSD, gotOK := CostWithCache(model, 1_234_567, 0, 0, 89_012)

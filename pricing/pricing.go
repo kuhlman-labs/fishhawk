@@ -21,7 +21,7 @@ import "strings"
 // AsOf is the date the price table was last reconciled against
 // published vendor pricing. Surfaced alongside any rolled cost so
 // consumers can label the figure as an estimate of a known vintage.
-const AsOf = "2026-06-24"
+const AsOf = "2026-07-12"
 
 // rate is the per-token price for a single model family, in US
 // dollars. Vendors publish per-million-token prices; we store the
@@ -76,27 +76,39 @@ func perMillionCache(input, output, cacheRead, cacheWrite float64) rate {
 // Prices are published vendor list prices as of AsOf, in $/1M-tokens
 // (input / output / cache-read / cache-write):
 //
-//	Opus    5  / 25 / 0.5  / 6.25   (Anthropic, non-fast tier)
-//	Sonnet  3  / 15 / 0.3  / 3.75   (Anthropic)
-//	Haiku   1  / 5  / 0.1  / 1.25   (Anthropic)
-//	gpt-5.5 5  / 30 / 0.5  / 5      (OpenAI standard short-context)
+//	Opus          5   / 25 / 0.5  / 6.25   (Anthropic, non-fast tier)
+//	Fable         10  / 50 / 1.0  / 12.5   (Anthropic, premium tier)
+//	Sonnet        3   / 15 / 0.3  / 3.75   (Anthropic)
+//	Haiku         1   / 5  / 0.1  / 1.25   (Anthropic)
+//	gpt-5.5       5   / 30 / 0.5  / 5      (OpenAI standard short-context)
+//	gpt-5.6-terra 2.5 / 15 / 0.25 / 3.125  (OpenAI mid tier — Sol/Luna differ)
 //
 // The Anthropic cache rates are the 5-minute-TTL baseline (#1343):
 // cache READ = 0.1x the family input rate, cache WRITE = 1.25x the
 // family input rate — verified against the Anthropic prompt-caching
 // pricing (the 1-hour-TTL 2x write tier is intentionally out of scope
-// this slice). gpt-5.5's cache READ is OpenAI's published cached-input
-// discount ($0.50/1M = 0.1x the $5/1M input rate, verified against the
-// OpenAI pricing page); its cache WRITE is set to the input rate
-// because OpenAI charges no separate cache-write premium (prompt
-// caching is automatic) — and the codex adapter maps cache writes to 0
-// regardless, so the gpt-5.5 cacheWrite rate is effectively unexercised
-// in the reviewer path.
+// this slice). Fable follows the same convention at the premium tier
+// ($10/1M input → 1.0 read / 12.5 write). The OpenAI cache READ is the
+// published 90%-cached-input discount (0.1x input: gpt-5.5 $0.50/1M,
+// gpt-5.6-terra $0.25/1M). gpt-5.5's cache WRITE is set to the input
+// rate because that model charges no separate cache-write premium;
+// gpt-5.6-terra DID introduce the premium (1.25x input = $3.125/1M),
+// so its cacheWrite carries the real rate. Either way the codex adapter
+// maps cache writes to 0, so both gpt cacheWrite rates are effectively
+// unexercised in the reviewer path.
+//
+// Family-key convention: Anthropic keys are the tier stem (claude-opus,
+// claude-fable) so every dated point release inherits the tier price.
+// OpenAI's gpt-5.6 splits into distinctly-priced tiers (Sol / Terra /
+// Luna), so the key is the full tier id gpt-5.6-terra — a bare gpt-5.6
+// would mis-price Sol and Luna.
 var familyRates = map[string]rate{
 	"claude-opus":   perMillionCache(5, 25, 0.5, 6.25),
+	"claude-fable":  perMillionCache(10, 50, 1, 12.5),
 	"claude-sonnet": perMillionCache(3, 15, 0.3, 3.75),
 	"claude-haiku":  perMillionCache(1, 5, 0.1, 1.25),
 	"gpt-5.5":       perMillionCache(5, 30, 0.5, 5),
+	"gpt-5.6-terra": perMillionCache(2.5, 15, 0.25, 3.125),
 }
 
 // Cost returns the estimated US-dollar cost of an invocation that

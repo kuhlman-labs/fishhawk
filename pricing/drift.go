@@ -66,9 +66,11 @@ const (
 // TestDriftReferenceMapMatchesFamilies.
 var familyToLiteLLM = map[string]string{
 	"claude-opus":   "claude-opus-4-7",
+	"claude-fable":  "claude-fable-5",
 	"claude-sonnet": "claude-sonnet-4-6",
 	"claude-haiku":  "claude-haiku-4-5",
 	"gpt-5.5":       "gpt-5.5",
+	"gpt-5.6-terra": "gpt-5.6-terra",
 }
 
 // DriftFinding is one priced-field comparison between our table and LiteLLM.
