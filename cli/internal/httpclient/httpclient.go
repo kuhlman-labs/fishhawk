@@ -673,7 +673,8 @@ func (c *Client) ListScopeAmendments(ctx context.Context, runID uuid.UUID, waitS
 
 // Artifact is the CLI-side projection of the OpenAPI Artifact schema.
 // Content is left as raw JSON so the caller decodes only the shape it
-// needs (deploy.go decodes the standard_v1 plan's scope.files).
+// needs (deploy.go decodes the "deployment"-kind artifact's content
+// into Deployment).
 type Artifact struct {
 	ID            uuid.UUID       `json:"id"`
 	StageID       uuid.UUID       `json:"stage_id"`
