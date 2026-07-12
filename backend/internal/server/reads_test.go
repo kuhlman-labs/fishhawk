@@ -925,6 +925,39 @@ func TestListRunAudit_UnknownCategory_400(t *testing.T) {
 	}
 }
 
+// TestListRunAudit_PlanTestSweepCategory_200 is the #1850 endpoint repair
+// proof: plan_test_sweep is a real audit category the backend emits (the
+// loadTestSweep enrichment fishhawk_get_plan issues queries it), but it was
+// absent from the KnownCategories registry, so GET
+// /v0/runs/{run_id}/audit?category=plan_test_sweep returned 400
+// validation_failed and broke get_plan on every run. With the category now
+// registered, the same request must return 200 through the HTTP handler — the
+// same shape as the category-validation tests above, asserting the observable
+// repair rather than only registry membership.
+func TestListRunAudit_PlanTestSweepCategory_200(t *testing.T) {
+	a := newAuditReadFake()
+	a.byCat["plan_test_sweep"] = makeAuditEntries(1)
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/runs/%s/audit?category=plan_test_sweep", uuid.New()), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for the now-registered plan_test_sweep category "+
+			"(not 400 validation_failed):\n%s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Items []auditEntryResponse `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 1 {
+		t.Errorf("items = %d, want 1 (the plan_test_sweep entry)", len(got.Items))
+	}
+}
+
 // TestListRunAudit_UnknownCategory_AllowUnknown_200 proves the escape hatch:
 // allow_unknown=true bypasses the known-category validation, so an unlisted
 // category returns 200 (an empty page here, since the fake has no such
