@@ -672,11 +672,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// removes a worktree whose lineage the backend doesn't report
 		// complete.
 		sweepTerminalWorktrees(ctx, baseRepoDir, client, logSink)
-		wt, provErr := provisionLineageWorktree(ctx, baseRepoDir, root, logSink)
+		wt, provErr := provisionLineageWorktree(ctx, baseRepoDir, root, resolveImplementBaseRef(cfg), logSink)
 		if provErr != nil {
 			adminRelease()
 			_, _ = fmt.Fprintf(logSink,
-				`{"event":"runner_failed","reason":"worktree_provision","detail":%q}`+"\n", provErr.Error())
+				`{"event":"runner_failed","reason":%q,"detail":%q}`+"\n",
+				worktreeProvisionFailureReason(provErr), provErr.Error())
 			return exitFailure
 		}
 		// Critical section done — release the cross-lineage admin lock before

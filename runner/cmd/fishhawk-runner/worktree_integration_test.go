@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -118,7 +119,7 @@ func provisionFlow(ctx context.Context, repo, runID, decomposedFrom string, para
 		return "", nil, err
 	}
 	sweepTerminalWorktrees(ctx, repo, client, io.Discard)
-	wt, err = provisionLineageWorktree(ctx, repo, root, io.Discard)
+	wt, err = provisionLineageWorktree(ctx, repo, root, "main", io.Discard)
 	if err != nil {
 		adminRelease()
 		return "", nil, err
@@ -419,7 +420,7 @@ func TestWorktreeAdminLock_ConcurrentSweepWithLiveSibling(t *testing.T) {
 	// Pre-provision a terminal lineage's worktree + sidecar, then mark it
 	// complete so the next provision's sweep removes it.
 	termRoot := lineageRoot(termID, "", false)
-	termPath, err := provisionLineageWorktree(ctx, repo, termRoot, io.Discard)
+	termPath, err := provisionLineageWorktree(ctx, repo, termRoot, "main", io.Discard)
 	if err != nil {
 		t.Fatalf("provision terminal lineage: %v", err)
 	}
@@ -606,6 +607,79 @@ func TestWorktreeIsolation_ParallelChildren(t *testing.T) {
 	}
 	if head := gitPorcelainHead(t, repo); head != seed {
 		t.Errorf("operator HEAD moved: %q, want seed %q", head, seed)
+	}
+}
+
+// TestWorktreeIsolation_DivergedSeedRefusesNewLineageReusesExisting is the
+// #1866 cross-lineage integration case over REAL git (bare origin + linked
+// worktrees): once the operator HEAD diverges from origin/main, a NEW lineage's
+// FRESH provision refuses (working_dir_diverged_from_base) while an
+// ALREADY-provisioned lineage's next stage still REUSES its worktree — proving
+// the guard + the reuse-path exemption interact correctly at the layer where
+// main.go's wiring (provisionFlow), worktree.go, and git compose.
+func TestWorktreeIsolation_DivergedSeedRefusesNewLineageReusesExisting(t *testing.T) {
+	operator, _ := initRepoWithOrigin(t)
+	ctx := context.Background()
+	client := &syncLineageClient{complete: map[string]bool{}}
+
+	const (
+		existingID = "a1a1a1a1-0000-0000-0000-000000000001"
+		newID      = "b2b2b2b2-0000-0000-0000-000000000002"
+	)
+
+	// (1) An already-provisioned lineage seeded from a CLEAN operator HEAD.
+	existingWT, release, err := provisionFlow(ctx, operator, existingID, "", false, client)
+	if err != nil {
+		t.Fatalf("provision existing lineage: %v", err)
+	}
+	release()
+
+	// (2) Diverge the operator HEAD with a leftover unmerged commit (#1866).
+	if err := os.WriteFile(filepath.Join(operator, "leftover.txt"), []byte("stray\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "-A"}, {"commit", "-q", "-m", "leftover unmerged commit"}} {
+		if err := runGitErr(operator, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// (3) A NEW lineage's fresh provision refuses — its seed diverged from base.
+	_, newRelease, newErr := provisionFlow(ctx, operator, newID, "", false, client)
+	if newRelease != nil {
+		newRelease()
+	}
+	if newErr == nil {
+		t.Fatal("new lineage provisioned from a diverged seed; want a loud refusal")
+	}
+	var bde *baseDivergenceError
+	if !errors.As(newErr, &bde) {
+		t.Fatalf("new lineage error = %T (%v), want *baseDivergenceError", newErr, newErr)
+	}
+
+	// (4) The already-provisioned lineage's NEXT stage still reuses its worktree
+	// despite the since-diverged operator HEAD (the reuse-path exemption).
+	reuseWT, reuseRelease, reuseErr := provisionFlow(ctx, operator, existingID, "", false, client)
+	if reuseErr != nil {
+		t.Fatalf("already-provisioned lineage refused on reuse: %v", reuseErr)
+	}
+	reuseRelease()
+	if canonPath(reuseWT) != canonPath(existingWT) {
+		t.Errorf("reuse returned a different worktree: %q vs %q", reuseWT, existingWT)
+	}
+
+	// The refused new lineage left no registered worktree, and the operator's
+	// tracked tree stays clean (worktrees live under .git).
+	registered, err := listWorktreePaths(ctx, operator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wtDir, _ := worktreesDir(ctx, operator)
+	if isRegisteredWorktree(filepath.Join(wtDir, "run-"+lineageRoot(newID, "", false)), registered) {
+		t.Errorf("refused new lineage left a registered worktree: %v", registered)
+	}
+	if status := gitPorcelain(t, operator); status != "" {
+		t.Errorf("operator git status not clean after the refusal + reuse:\n%s", status)
 	}
 }
 
