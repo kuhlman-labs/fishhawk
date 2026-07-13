@@ -9,13 +9,13 @@ Agents do the work. Your team approves the work. Fishhawk holds the record.
 Pre-alpha. The v0 build has largely landed, and Fishhawk now develops itself through Fishhawk:
 
 - **Backend control plane (`fishhawkd`)** — REST API, run/stage state machine on Postgres, signed audit log, policy evaluator, approval gating with SLA timeouts, retry semantics, GitHub App webhook receiver. ([`backend/`](backend/README.md))
-- **Runner action (`fishhawk/runner`)** — runs the agent (Claude Code or Codex) on the customer's CI, captures the signed trace, and validates the plan against its schema. Published as `kuhlman-labs/fishhawk/runner@runner/vX.Y.Z`; cosign-signed releases with SBOMs. ([`runner/`](runner/README.md))
-- **CLI (`fishhawk`)** — `validate`, `run` (start/status/open), `plan`, `audit`, `export`, `doctor`. ([`cli/`](cli/README.md))
+- **Runner action (`fishhawk/runner`)** — runs the agent (Claude Code or Codex) on the customer's CI, captures the signed trace, and validates the plan against its schema. Releases ship as `kuhlman-labs/fishhawk/runner@runner/vX.Y.Z` through a pipeline that cosign-signs each release and attaches an SBOM; the first public tag has not been cut yet. ([`runner/`](runner/README.md))
+- **CLI (`fishhawk`)** — `validate`, `run` (start/status/open), `plan`, `audit`, `export`, `doctor`, `token`, `deploy`, `campaign`, among others; the component README documents the full command set. ([`cli/`](cli/README.md))
 - **MCP server (`fishhawk-mcp`)** — exposes run, plan, and audit state to Claude Code (and any MCP client) over the Model Context Protocol; the surface self-hosted runs are driven through. ([`backend/cmd/fishhawk-mcp/`](backend/cmd/fishhawk-mcp))
 - **Web UI** — plan review, approval, audit log per run, retry on failures. ([`frontend/`](frontend/README.md))
 - **Audit-log verifier** — standalone binary that re-verifies an exported chain offline. ([`verifier/`](verifier/README.md))
 - **Hosted infrastructure** — Terraform on AWS (VPC, RDS, ECS Fargate, ALB, OIDC-based deploys; dev ~$15/mo and prod ~$85/mo profiles, [`infra/terraform/`](infra/terraform/README.md)) plus a Helm chart for Kubernetes ([`deploy/helm/fishhawk/`](deploy/helm/fishhawk), quickstart in [`docs/deploy/kubernetes.md`](docs/deploy/kubernetes.md)).
-- **CI/CD** — every push to `main` builds + signs the backend image; tagged releases auto-deploy via GitHub Actions OIDC.
+- **CI/CD** — every push to `main` that touches backend code builds + signs the backend image; tagged releases are wired to auto-deploy via GitHub Actions OIDC.
 
 Fishhawk now ships its *own* changes through Fishhawk. Since Day 22 of the v0 build (2026-05-21), substantive changes flow through a workflow run defined by [`.fishhawk/workflows.yaml`](.fishhawk/workflows.yaml): a human approves the plan, constraints are enforced on the implementation, and the PR is opened by Fishhawk itself — stamped with its run and stage IDs (the *"Opened by Fishhawk for run …"* footer on recent PRs). This is the methodology commitment in [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md), today held by convention rather than enforced by the product. The audit log behind Fishhawk's own development is published as a public artifact in [`docs/compliance/`](docs/compliance/) — a machine-verifiable export plus a human-readable agent-changes report, both re-verifiable offline with the standalone `fishhawk-verify` binary.
 
@@ -41,7 +41,7 @@ Prerequisites:
 The repository ships a [`Makefile`](Makefile) that wraps the common loops. Run `make help` to see every target. The quickstart:
 
 ```sh
-cp .env.example .env        # populate later for GitHub App / OAuth (see below)
+cp .env.example .env        # populate later for GitHub App / OAuth / trace storage (see below)
 make up                     # docker compose: Postgres :5432, MinIO :9000/:9001
 make minio-init             # one-time per fresh stack: create the fishhawk-traces bucket
 make migrate                # apply backend migrations
@@ -54,6 +54,10 @@ make coverage               # reproduce the CI 80% gate
 ```
 
 The Makefile auto-loads `.env` if present, so credentials and overrides flow into `make dev-backend` without manual `source` plumbing.
+
+Trace storage is opt-in: after `make minio-init`, uncomment the trace-storage block in `.env` (`FISHHAWKD_S3_BUCKET` and friends) so `fishhawkd` can reach MinIO. Without it, `/v0/runs/{id}/trace` responds 503 — everything else works.
+
+Contributors driving Fishhawk through its own workflow loop use `scripts/dev` instead (see [`AGENTS.md`](AGENTS.md)); the Makefile is the plain local path.
 
 If you'd rather run things by hand, the Makefile targets are thin wrappers over these commands:
 
