@@ -26,13 +26,14 @@ The child connection sits behind a small `childTransport` seam so a later phase 
 
 ## Registration
 
-Register the shim with the harness **instead of** `fishhawk-mcp` so the session survives rebuilds. With the standard `bin/` layout no `--child` flag is needed:
+Register the shim with the harness **instead of** `fishhawk-mcp` so the session survives rebuilds. The registration mirrors the sibling [`fishhawk-mcp`](../fishhawk-mcp/README.md#install-operators) form — `--command` with the token wired through `--env` — just pointed at the shim binary. With the standard `bin/` layout no `--child` flag is needed:
 
 ```sh
-claude mcp add fishhawk --binary /path/to/bin/fishhawk-mcp-shim
+claude mcp add fishhawk --command /path/to/bin/fishhawk-mcp-shim \
+  --env FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN
 ```
 
-The shim inherits `FISHHAWK_API_TOKEN` / `FISHHAWK_BACKEND_URL` from the environment and passes them straight through to the child — it adds no auth of its own.
+The shim adds no auth of its own: it passes `FISHHAWK_API_TOKEN` / `FISHHAWK_BACKEND_URL` straight through to the child, so the child needs them in its environment. Wire `FISHHAWK_API_TOKEN` via `--env` as above (and `FISHHAWK_BACKEND_URL` too when it is not the default `http://localhost:8080`).
 
 > `scripts/dev` integration, retirement of the reconnect banner, and operator re-registration are the sibling issue [#1922](https://github.com/kuhlman-labs/fishhawk/issues/1922); this binary is not yet wired into the dev loop.
 

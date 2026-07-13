@@ -27,6 +27,7 @@ type fakeChild struct {
 	sent       [][]byte
 	started    bool
 	terminated bool
+	failSend   bool // when set, Send returns an error and delivers nothing
 }
 
 func newFake(marker string, autoRespond bool) *fakeChild {
@@ -51,6 +52,10 @@ func (f *fakeChild) Start(ctx context.Context) error {
 
 func (f *fakeChild) Send(frame []byte) error {
 	f.mu.Lock()
+	if f.failSend {
+		f.mu.Unlock()
+		return errors.New("send failed: " + f.marker)
+	}
 	f.sent = append(f.sent, cloneBytes(frame))
 	auto := f.autoRespond
 	f.mu.Unlock()
@@ -86,6 +91,13 @@ func (f *fakeChild) isTerminated() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.terminated
+}
+
+// setFailSend flips the child's stdin to broken so subsequent Sends error.
+func (f *fakeChild) setFailSend(v bool) {
+	f.mu.Lock()
+	f.failSend = v
+	f.mu.Unlock()
 }
 
 func (f *fakeChild) sentFrames() []string {
@@ -697,6 +709,124 @@ func TestSwapNewChildCrashesDuringHandshake(t *testing.T) {
 	}
 	if len(child2.sentFrames()) == 0 {
 		t.Fatal("retry child should have received the replayed handshake")
+	}
+}
+
+// --- a persistently crashing replacement respawns in a bounded loop (no unbounded recursion) ---
+
+func TestSwapReplacementCrashesRepeatedlyRecoversBounded(t *testing.T) {
+	child0 := newFake("A", true)
+	// Three replacement children die the instant they are handed the replayed
+	// handshake; the fourth completes it. The OLD recursion (swallowResponse →
+	// handleCrash → spawnAndReplay → replayHandshake → swallowResponse) added a
+	// stack frame per crash; this asserts the loop recovers with capped backoff.
+	c1 := newFake("B", false)
+	c2 := newFake("C", false)
+	c3 := newFake("D", false)
+	c4 := newFake("E", true)
+	h := newHarness(t, child0, c1, c2, c3, c4)
+
+	var mu sync.Mutex
+	var slept []time.Duration
+	h.sup.sleep = func(d time.Duration) {
+		mu.Lock()
+		slept = append(slept, d)
+		mu.Unlock()
+	}
+	h.start()
+	h.handshake()
+
+	// Arm each replacement to die when it is asked to handshake.
+	c1.crash(errors.New("die1"))
+	c2.crash(errors.New("die2"))
+	c3.crash(errors.New("die3"))
+	h.triggerSwap("hash-B")
+
+	lc := h.expect()
+	if !strings.Contains(lc, "notifications/tools/list_changed") {
+		t.Fatalf("expected list_changed once a replacement finally handshakes, got %q", lc)
+	}
+	if len(c4.sentFrames()) == 0 {
+		t.Fatal("the child that finally handshakes should have received the replayed handshake")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	// One capped backoff sleep per crashed replay before the recovery.
+	if len(slept) < 3 {
+		t.Fatalf("expected a capped backoff sleep per crashed replay, got %v", slept)
+	}
+	for i, d := range slept {
+		if d > backoffMax {
+			t.Fatalf("backoff sleep %d exceeded the cap %s: %v", i, backoffMax, d)
+		}
+	}
+}
+
+// --- upstream Send failure orphans the request and terminates for respawn ---
+
+func TestUpstreamSendFailureOrphansAndRespawns(t *testing.T) {
+	child0 := newFake("A", true)
+	child1 := newFake("B", true) // the respawn after the broken child is reaped
+	h := newHarness(t, child0, child1)
+	h.sup.sleep = func(time.Duration) {}
+	h.start()
+	h.handshake()
+
+	// The child's stdin breaks. A client request must NOT hang: it gets an orphan
+	// error and the child is terminated so its exit drives the respawn.
+	child0.setFailSend(true)
+	h.send(`{"jsonrpc":"2.0","method":"tools/call","id":7}`)
+
+	orphan := h.expect()
+	if !strings.Contains(orphan, `"id":7`) || !strings.Contains(orphan, "-32603") {
+		t.Fatalf("expected an orphan error for id 7 on send failure, got %q", orphan)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !child0.isTerminated() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !child0.isTerminated() {
+		t.Fatal("a child with broken stdin must be terminated to trigger respawn")
+	}
+
+	// The Terminate would fire Exited on a real child; simulate that exit so the
+	// crash-recovery respawn re-establishes the session on a healthy child.
+	child0.crash(nil)
+	lc := h.expect()
+	if !strings.Contains(lc, "notifications/tools/list_changed") {
+		t.Fatalf("expected list_changed after the send-failure respawn, got %q", lc)
+	}
+	if len(child1.sentFrames()) == 0 {
+		t.Fatal("the respawned child should have received the replayed handshake")
+	}
+}
+
+// --- a Send failure during the replayed handshake respawns instead of hanging ---
+
+func TestReplaySendFailureRespawns(t *testing.T) {
+	child0 := newFake("A", true)
+	child1 := newFake("B", true) // fresh child, but its stdin is broken for the replay
+	child2 := newFake("C", true) // the retry child completes the replay
+	child1.failSend = true
+	h := newHarness(t, child0, child1, child2)
+	h.sup.sleep = func(time.Duration) {}
+	h.start()
+	h.handshake()
+
+	h.triggerSwap("hash-B")
+
+	// replayHandshake's initialize Send fails against child1; the shim must NOT
+	// block waiting on a response that can never arrive — it terminates child1 and
+	// respawns child2, which completes the replay.
+	lc := h.expect()
+	if !strings.Contains(lc, "notifications/tools/list_changed") {
+		t.Fatalf("expected list_changed after a replay send-failure respawn, got %q", lc)
+	}
+	if !child1.isTerminated() {
+		t.Fatal("the replay child with broken stdin should be terminated")
+	}
+	if len(child2.sentFrames()) == 0 {
+		t.Fatal("the retry child should have received the replayed handshake")
 	}
 }
 

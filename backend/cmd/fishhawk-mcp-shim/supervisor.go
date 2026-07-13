@@ -128,15 +128,31 @@ func (s *supervisor) run(ctx context.Context) error {
 // method) are forwarded but never tracked as in-flight.
 func (s *supervisor) handleUpstream(frame []byte) {
 	p := peek(frame)
-	if p.hasMethod() && p.hasID() {
-		key := p.idKey()
+	isReq := p.hasMethod() && p.hasID()
+	var key string
+	if isReq {
+		key = p.idKey()
 		s.inFlight[key] = true
-		if p.method() == "initialize" && s.initReq == nil {
-			s.initReq = cloneBytes(frame)
-			s.initIDKey = key
-		}
 	}
-	_ = s.child.Send(frame)
+	if err := s.child.Send(frame); err != nil {
+		// The child's stdin is broken — it may have closed stdin yet still be
+		// alive, so no Exited fires on its own and the request would otherwise
+		// hang forever. Answer any just-registered request with an orphan error so
+		// the client is never stranded, then Terminate the child so its Exited
+		// drives the crash-recovery respawn. The record below is skipped: an
+		// initialize that never reached the child must not be replayed.
+		s.logf("send to child failed: %v; terminating for respawn", err)
+		if isReq {
+			delete(s.inFlight, key)
+			s.sendClient(orphanError(key))
+		}
+		s.child.Terminate(s.grace)
+		return
+	}
+	if isReq && p.method() == "initialize" && s.initReq == nil {
+		s.initReq = cloneBytes(frame)
+		s.initIDKey = key
+	}
 }
 
 // handleDownstream forwards a child frame byte-verbatim to the client. A child
@@ -228,11 +244,23 @@ func (*supervisor) drainOldChild(c childTransport) {
 	}()
 }
 
-// handleCrash reacts to the child exiting without a shim-initiated terminate.
-// Every in-flight request is answered upstream with a synthesized JSON-RPC
-// error so the client is never stranded, then the child is respawned through
-// the same replay path with capped exponential backoff.
+// handleCrash reacts to the child exiting without a shim-initiated terminate:
+// it reaps the crash (orphan errors), backs off, and respawns through the
+// replay path. reapCrash and applyCrashBackoff are split out so the replay path
+// can drive the SAME respawn iteratively (see spawnAndReplay) rather than
+// re-entering handleCrash — a persistently crashing replacement must not recurse
+// one stack frame per crash.
 func (s *supervisor) handleCrash(ctx context.Context, err error) {
+	s.reapCrash(err)
+	s.applyCrashBackoff()
+	s.spawnAndReplay(ctx, nil)
+}
+
+// reapCrash answers every in-flight request with a synthesized JSON-RPC error so
+// the client is never stranded, resets in-flight tracking, and cancels any
+// mid-flight swap (the respawn re-execs the same on-disk path, which already
+// carries the new content).
+func (s *supervisor) reapCrash(err error) {
 	s.logf("child exited unexpectedly (%v); respawning", err)
 	for id := range s.inFlight {
 		// A crash before the handshake completes leaves the client's initialize
@@ -245,12 +273,14 @@ func (s *supervisor) handleCrash(ctx context.Context, err error) {
 		s.sendClient(orphanError(id))
 	}
 	s.inFlight = map[string]bool{}
-
-	// A swap that was mid-flight is subsumed by the crash respawn (the respawn
-	// re-execs the same on-disk path, which already carries the new content).
 	s.pendingSwapHash = nil
 	s.quiesceExpired = false
+}
 
+// applyCrashBackoff sleeps for the current capped-exponential backoff and
+// advances it, resetting to the base after a healthy interval since the last
+// spawn.
+func (s *supervisor) applyCrashBackoff() {
 	if s.now().Sub(s.lastSpawnAt) > healthyReset {
 		s.backoffCur = backoffBase
 	}
@@ -259,7 +289,14 @@ func (s *supervisor) handleCrash(ctx context.Context, err error) {
 	if s.backoffCur > backoffMax {
 		s.backoffCur = backoffMax
 	}
-	s.spawnAndReplay(ctx, nil)
+}
+
+// terminateAndDrain kills a child whose stdin broke mid-replay (a send error
+// leaves it possibly-alive, so no Exited fires on its own) and drains its frames
+// to exit so a chatty terminating child cannot wedge its readLoop.
+func (s *supervisor) terminateAndDrain(c childTransport) {
+	c.Terminate(s.grace)
+	s.drainOldChild(c)
 }
 
 // spawnAndReplay starts a fresh child and re-establishes the session per the
@@ -274,74 +311,116 @@ func (s *supervisor) handleCrash(ctx context.Context, err error) {
 //     notifications/initialized, then synthesize notifications/tools/list_changed
 //     upstream.
 func (s *supervisor) spawnAndReplay(ctx context.Context, newHash []byte) {
-	// Retry Start in a bounded-stack LOOP rather than self-recursion: a
-	// persistently missing or unexecutable child would otherwise recurse one
+	// Retry the WHOLE respawn (Start AND the replayed handshake) in a
+	// bounded-stack LOOP rather than self-recursion: a persistently missing,
+	// unexecutable, or mid-handshake-crashing child would otherwise recurse one
 	// stack frame per backoff interval and eventually exhaust the stack. Backoff
-	// is capped; the loop exits as soon as a Start succeeds (or ctx is cancelled).
-	var nc childTransport
+	// is capped; the loop exits as soon as the session is re-established (or ctx
+	// is cancelled).
 	for {
-		nc = s.newChild()
-		err := nc.Start(ctx)
-		if err == nil {
-			break
+		var nc childTransport
+		for {
+			nc = s.newChild()
+			err := nc.Start(ctx)
+			if err == nil {
+				break
+			}
+			s.logf("respawn start failed: %v; retrying after backoff", err)
+			s.sleep(s.backoffCur)
+			s.backoffCur *= 2
+			if s.backoffCur > backoffMax {
+				s.backoffCur = backoffMax
+			}
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 		}
-		s.logf("respawn start failed: %v; retrying after backoff", err)
-		s.sleep(s.backoffCur)
-		s.backoffCur *= 2
-		if s.backoffCur > backoffMax {
-			s.backoffCur = backoffMax
+		s.child = nc
+		s.lastSpawnAt = s.now()
+		if newHash == nil {
+			newHash = nc.LaunchHash()
 		}
+		if s.watcher != nil {
+			s.watcher.setBaseline(newHash)
+		}
+
+		// Re-establish the session per the pre-init-safe-restart rules. Each arm
+		// yields done=true on success; a send failure (broken stdin) or a
+		// mid-handshake crash yields done=false so the loop respawns with capped
+		// backoff instead of recursing.
+		done := false
+		switch {
+		case s.initReq == nil:
+			// Nothing recorded yet — resume plain passthrough.
+			done = true
+		case !s.handshakeDone:
+			// Pre-handshake restart: re-send the original initialize verbatim so its
+			// response reaches the still-waiting client. The main loop captures the
+			// response and marks the handshake done as usual.
+			if err := s.child.Send(s.initReq); err != nil {
+				s.logf("pre-handshake initialize re-send failed: %v; respawning", err)
+				s.terminateAndDrain(s.child)
+			} else {
+				done = true
+			}
+		default:
+			done = s.replayHandshake(ctx)
+		}
+		if done {
+			return
+		}
+		// The fresh child failed the re-send/replay. Respawn with capped backoff
+		// unless the context is cancelled.
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-	}
-	s.child = nc
-	s.lastSpawnAt = s.now()
-	if newHash == nil {
-		newHash = nc.LaunchHash()
-	}
-	if s.watcher != nil {
-		s.watcher.setBaseline(newHash)
-	}
-
-	switch {
-	case s.initReq == nil:
-		// Nothing recorded yet — resume plain passthrough.
-		return
-	case !s.handshakeDone:
-		// Pre-handshake restart: re-send the original initialize verbatim so its
-		// response reaches the still-waiting client. The main loop captures the
-		// response and marks the handshake done as usual.
-		_ = s.child.Send(s.initReq)
-		return
-	default:
-		s.replayHandshake(ctx)
+		s.applyCrashBackoff()
+		newHash = nil // recompute the launch hash from the next child
 	}
 }
 
 // replayHandshake performs the full (post-handshake) replay against a fresh
 // child: a synthetic-id initialize whose response is swallowed, then
 // notifications/initialized to the child and a synthesized
-// notifications/tools/list_changed to the client.
-func (s *supervisor) replayHandshake(ctx context.Context) {
+// notifications/tools/list_changed to the client. It returns true once the
+// replay completes, or false when the child cannot be handshaked (a send error
+// against a broken stdin, or a crash mid-handshake) — the caller's respawn loop
+// then retries with capped backoff. A false return NEVER leaves the client
+// hanging on a never-arriving response.
+func (s *supervisor) replayHandshake(ctx context.Context) bool {
 	s.replayN++
 	synthID := fmt.Sprintf("fishhawk-shim/replay/%d", s.replayN)
-	_ = s.child.Send(rewriteInitID(s.initReq, synthID))
-	if !s.swallowResponse(ctx, synthID) {
-		// The fresh child died during the replayed handshake; a crash respawn is
-		// already in flight from swallowResponse — do not send stale frames.
-		return
+	if err := s.child.Send(rewriteInitID(s.initReq, synthID)); err != nil {
+		// The fresh child's stdin is already broken: swallowResponse would block
+		// forever waiting for a response that can never come. Terminate for a
+		// respawn instead of entering the read.
+		s.logf("replay initialize send failed: %v; respawning", err)
+		s.terminateAndDrain(s.child)
+		return false
 	}
-	_ = s.child.Send(initializedNotification)
+	if !s.swallowResponse(ctx, synthID) {
+		// The fresh child died mid-handshake; swallowResponse reaped it. The child
+		// is already gone, so do not terminate/drain here — the caller respawns.
+		return false
+	}
+	if err := s.child.Send(initializedNotification); err != nil {
+		s.logf("replay initialized send failed: %v; respawning", err)
+		s.terminateAndDrain(s.child)
+		return false
+	}
 	s.sendClient(listChangedNotification)
+	return true
 }
 
 // swallowResponse reads child frames until the response to the synthetic-id
 // initialize arrives and discards it. Any other frame in that window (a child
 // should emit nothing before it is initialized) is forwarded verbatim. Returns
-// false if the child exits mid-handshake, having already routed a crash respawn.
+// false if the child exits mid-handshake, having reaped the crash so the caller
+// loop respawns (it does NOT re-enter handleCrash — that would recurse).
 func (s *supervisor) swallowResponse(ctx context.Context, synthID string) bool {
 	want := strconv.Quote(synthID)
 	for {
@@ -353,7 +432,7 @@ func (s *supervisor) swallowResponse(ctx context.Context, synthID string) bool {
 			}
 			s.sendClient(frame)
 		case err := <-s.child.Exited():
-			s.handleCrash(ctx, err)
+			s.reapCrash(err)
 			return false
 		case <-ctx.Done():
 			return false
