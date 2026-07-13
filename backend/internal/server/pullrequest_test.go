@@ -1922,6 +1922,18 @@ func (r *failTransitionToFailedRepo) TransitionStage(ctx context.Context, id uui
 	return r.orchestratorRepo.TransitionStage(ctx, id, to, c)
 }
 
+// TransitionStageFrom mirrors the forced-error onto the compare-and-swap
+// path (#1903). Since orchestratorRepo now implements StageCASTransitioner,
+// run.FailStage routes its failed transition through TransitionStageFrom
+// rather than TransitionStage — so the forced error must be applied here too
+// to keep driving the handler's ferr != nil degradation branch.
+func (r *failTransitionToFailedRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	if to == run.StageStateFailed {
+		return nil, r.err
+	}
+	return r.orchestratorRepo.TransitionStageFrom(ctx, id, from, to, c)
+}
+
 // TestShipPullRequest_SupplementalReinvokeReview_GatingReject_FailStageError
 // pins the FailStage-ERROR (ferr != nil) degradation sub-branch of the
 // gating-reject path: when the gating supplemental reviewer rejects AND

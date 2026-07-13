@@ -515,6 +515,29 @@ func (r *postgresRepo) ListStagesAwaitingChildren(ctx context.Context) ([]*Stage
 }
 
 func (r *postgresRepo) TransitionStage(ctx context.Context, id uuid.UUID, to StageState, completion *StageCompletion) (*Stage, error) {
+	return r.transitionStage(ctx, id, to, completion, nil)
+}
+
+// TransitionStageFrom is the compare-and-swap sibling of TransitionStage
+// (StageCASTransitioner): it applies the move ONLY when the stage's
+// row-locked current state still equals `from`. Because the comparison
+// happens inside the same transaction that holds the LockStageForUpdate
+// row lock, the check-and-transition is atomic — a concurrent writer that
+// flipped the stage after the caller's load cannot slip a stale-premise
+// transition through. A mismatch returns StageStateChangedError and
+// mutates nothing. run.FailStage consumes this to refuse a fan-in park (or
+// any other flip) landing mid-flight instead of destroying it.
+func (r *postgresRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to StageState, completion *StageCompletion) (*Stage, error) {
+	return r.transitionStage(ctx, id, to, completion, &from)
+}
+
+// transitionStage is the shared body of TransitionStage (expectedFrom
+// nil — byte-identical to the pre-refactor behavior) and
+// TransitionStageFrom (expectedFrom non-nil — a compare-and-swap under the
+// row lock). Every downstream step (same-state short-circuit, completion
+// validation, started_at/ended_at stamping, override-table union) is
+// shared, not duplicated.
+func (r *postgresRepo) transitionStage(ctx context.Context, id uuid.UUID, to StageState, completion *StageCompletion, expectedFrom *StageState) (*Stage, error) {
 	if to == StageStateFailed && (completion == nil || completion.FailureCategory == nil) {
 		return nil, errors.New("transition to failed requires StageCompletion with FailureCategory")
 	}
@@ -535,6 +558,15 @@ func (r *postgresRepo) TransitionStage(ctx context.Context, id uuid.UUID, to Sta
 			return fmt.Errorf("lock stage: %w", err)
 		}
 		from := StageState(current.State)
+		// Compare-and-swap: when the caller pinned an expected from-state
+		// (TransitionStageFrom), refuse atomically under the row lock if the
+		// current state has drifted since the caller's load. Checked BEFORE
+		// the same-state short-circuit so an already-flipped stage (e.g. a
+		// stage another writer already failed or parked) surfaces as a typed
+		// StageStateChangedError rather than a silent idempotent success.
+		if expectedFrom != nil && from != *expectedFrom {
+			return StageStateChangedError{StageID: id, Expected: *expectedFrom, Actual: from}
+		}
 		if from == to {
 			result = rowToStage(current)
 			return nil

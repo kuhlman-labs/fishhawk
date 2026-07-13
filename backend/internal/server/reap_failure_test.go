@@ -201,15 +201,16 @@ func TestReapStageFailure_AlreadyTerminalNoOp(t *testing.T) {
 // FailStage attempts the transition another writer (a concurrent reap report or
 // the dispatch watchdog / runner's own terminal report) has already driven the
 // stage terminal. It flips the target stage to succeeded on the FIRST
-// TransitionStage attempt, then delegates — so the embedded repo refuses the
-// move exactly as the real repo refuses a terminal → running transition.
+// TransitionStageFrom attempt (FailStage's CAS path), then delegates — so the
+// embedded repo refuses the move with StageStateChangedError, exactly as the
+// real row-locked CAS refuses a stage another writer already settled.
 type raceReapRepo struct {
 	*orchestratorRepo
 	stageID uuid.UUID
 	flipped bool
 }
 
-func (r *raceReapRepo) TransitionStage(ctx context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+func (r *raceReapRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
 	if !r.flipped && id == r.stageID {
 		r.flipped = true
 		r.mu.Lock()
@@ -218,7 +219,7 @@ func (r *raceReapRepo) TransitionStage(ctx context.Context, id uuid.UUID, to run
 		}
 		r.mu.Unlock()
 	}
-	return r.orchestratorRepo.TransitionStage(ctx, id, to, c)
+	return r.orchestratorRepo.TransitionStageFrom(ctx, id, from, to, c)
 }
 
 // (b2) Concurrent-terminal race: the pre-check sees a non-terminal stage, but a
@@ -308,16 +309,18 @@ func TestReapStageFailure_AwaitingChildrenNoOp(t *testing.T) {
 // non-terminal, non-awaiting_children pre-check, but by the time FailStage
 // attempts its transition a concurrent fanout has PARKED the stage
 // awaiting_children. It flips the target stage to awaiting_children on the first
-// TransitionStage attempt, then delegates — so the embedded repo refuses the
-// move (awaiting_children → running is not a valid edge) exactly as the real
-// repo would, driving the handler's post-FailStage re-load branch.
+// TransitionStageFrom attempt (FailStage's CAS path), then delegates — so the
+// row-locked compare-and-swap refuses the move with StageStateChangedError
+// exactly as the real repo would, driving the handler's post-FailStage re-load
+// branch. (This is the same interleaving as TestReapStageFailure_ParkLandsAfter-
+// FailStageLoad; kept as a pre-existing regression pin.)
 type parkRaceReapRepo struct {
 	*orchestratorRepo
 	stageID uuid.UUID
 	flipped bool
 }
 
-func (r *parkRaceReapRepo) TransitionStage(ctx context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+func (r *parkRaceReapRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
 	if !r.flipped && id == r.stageID {
 		r.flipped = true
 		r.mu.Lock()
@@ -326,7 +329,7 @@ func (r *parkRaceReapRepo) TransitionStage(ctx context.Context, id uuid.UUID, to
 		}
 		r.mu.Unlock()
 	}
-	return r.orchestratorRepo.TransitionStage(ctx, id, to, c)
+	return r.orchestratorRepo.TransitionStageFrom(ctx, id, from, to, c)
 }
 
 // (b4) Post-FailStage park race: the pre-check sees a dispatched (non-terminal,
@@ -370,6 +373,138 @@ func TestReapStageFailure_ConcurrentParkRace(t *testing.T) {
 	if cur.State != run.StageStateAwaitingChildren {
 		t.Errorf("stage state = %q, want awaiting_children (park preserved, not failed)", cur.State)
 	}
+}
+
+// parkBeforeLoadReapRepo models the interleaving where a concurrent fanout
+// parks the stage awaiting_children AFTER the handler's pre-check load but
+// BEFORE FailStage's own GetStage (#1903). GetStage call 1 is the handler's
+// pre-check (sees the seeded non-park state → passes it); call 2 is
+// FailStage's load, at which point the stage is flipped to awaiting_children,
+// so FailStage refuses up-front with ErrStageParked. Before the #1903 fix
+// FailStage took the legal awaiting_children → failed edge and destroyed the
+// park.
+type parkBeforeLoadReapRepo struct {
+	*orchestratorRepo
+	stageID  uuid.UUID
+	getCount int
+}
+
+func (r *parkBeforeLoadReapRepo) GetStage(ctx context.Context, id uuid.UUID) (*run.Stage, error) {
+	if id == r.stageID {
+		r.getCount++
+		if r.getCount == 2 {
+			r.mu.Lock()
+			if st := r.stagesByID[id]; st != nil {
+				st.State = run.StageStateAwaitingChildren
+			}
+			r.mu.Unlock()
+		}
+	}
+	return r.orchestratorRepo.GetStage(ctx, id)
+}
+
+// parkAfterLoadReapRepo models the interleaving where the fanout parks the
+// stage awaiting_children AFTER FailStage's GetStage but BEFORE its transition
+// (#1903) — the residual TOCTOU the pre-check and FailStage's own load both
+// miss. It flips the stage on the first TransitionStageFrom call, so the
+// row-locked compare-and-swap (anchored to the observed pending state) refuses
+// with StageStateChangedError.
+type parkAfterLoadReapRepo struct {
+	*orchestratorRepo
+	stageID uuid.UUID
+	flipped bool
+}
+
+func (r *parkAfterLoadReapRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	if !r.flipped && id == r.stageID {
+		r.flipped = true
+		r.mu.Lock()
+		if st := r.stagesByID[id]; st != nil {
+			st.State = run.StageStateAwaitingChildren
+		}
+		r.mu.Unlock()
+	}
+	return r.orchestratorRepo.TransitionStageFrom(ctx, id, from, to, c)
+}
+
+// assertBenignParkNoOp checks the reap handler returned the benign
+// {transitioned:false, stage_state:awaiting_children} no-op with the park
+// intact, no dispatch_reaper_failed audit entry, and no orchestrator advance.
+func assertBenignParkNoOp(t *testing.T, w *httptest.ResponseRecorder, rr *orchestratorRepo, au *auditFake, runID, stageID uuid.UUID) {
+	t.Helper()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (benign no-op, not 500):\n%s", w.Code, w.Body.String())
+	}
+	var resp reapFailureResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Transitioned {
+		t.Error("transitioned = true, want false for a mid-window fanout park")
+	}
+	if resp.StageState != string(run.StageStateAwaitingChildren) {
+		t.Errorf("stage_state = %q, want awaiting_children (the fanout's park)", resp.StageState)
+	}
+	if got := reapAudit(au); len(got) != 0 {
+		t.Errorf("dispatch_reaper_failed entries = %d, want 0 (park preserved)", len(got))
+	}
+	// The park survived: not failed out from under the fanout.
+	cur, _ := rr.GetStage(context.Background(), stageID)
+	if cur.State != run.StageStateAwaitingChildren {
+		t.Errorf("stage state = %q, want awaiting_children (park preserved, not failed)", cur.State)
+	}
+	// Advance not invoked by the loser: the run is untouched.
+	curRun, _ := rr.GetRun(context.Background(), runID)
+	if curRun.State != run.StateRunning {
+		t.Errorf("run state = %q, want running (Advance not invoked)", curRun.State)
+	}
+}
+
+// (b5) Park lands before FailStage's load (#1903): the handler's pre-check
+// sees a pending (non-park) stage and passes it, but a concurrent fanout parks
+// the stage awaiting_children before FailStage's own GetStage. FailStage now
+// refuses up-front (ErrStageParked) instead of destroying the park; the
+// handler's error branch re-loads and returns the benign no-op.
+func TestReapStageFailure_ParkLandsBeforeFailStageLoad(t *testing.T) {
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStatePending)
+	race := &parkBeforeLoadReapRepo{orchestratorRepo: rr, stageID: stage.ID}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      race,
+		AuditRepo:    au,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+
+	w := postReapFailure(t, s, runRow.ID, stage.ID,
+		reapFailureRequest{Category: "C", Reason: "parked before FailStage load"}, withReapOperator)
+	assertBenignParkNoOp(t, w, rr, au, runRow.ID, stage.ID)
+}
+
+// (b6) Park lands after FailStage's load (#1903): the residual TOCTOU. The
+// handler's pre-check AND FailStage's own load both see pending; the fanout
+// parks the stage awaiting_children between FailStage's load and its
+// transition. The row-locked compare-and-swap refuses (StageStateChangedError)
+// rather than taking the legal awaiting_children → failed edge; the handler's
+// error branch re-loads and returns the benign no-op.
+func TestReapStageFailure_ParkLandsAfterFailStageLoad(t *testing.T) {
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStatePending)
+	race := &parkAfterLoadReapRepo{orchestratorRepo: rr, stageID: stage.ID}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      race,
+		AuditRepo:    au,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+
+	w := postReapFailure(t, s, runRow.ID, stage.ID,
+		reapFailureRequest{Category: "C", Reason: "parked after FailStage load"}, withReapOperator)
+	assertBenignParkNoOp(t, w, rr, au, runRow.ID, stage.ID)
 }
 
 // (c) Invalid category (A) → 400. An empty category is covered by the sub-test.

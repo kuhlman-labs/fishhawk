@@ -2,7 +2,10 @@ package run
 
 import (
 	"errors"
+	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 // TestRunTransitions_AllowedAndForbidden table-tests the run state
@@ -285,6 +288,38 @@ func TestStageReviseTransitions(t *testing.T) {
 	// only through the dedicated revise table (the #1099 invariant).
 	if ValidStageTransition(StageStateAwaitingApproval, StageStatePending) {
 		t.Error("ValidStageTransition admits awaiting_approval → pending; the base machine must not (revise edge belongs to the dedicated table)")
+	}
+}
+
+// TestStageAwaitingChildrenFanInEdges pins that the fan-in resolution edges
+// awaiting_children → failed / succeeded stay VALID in the base transition
+// table (#1903). run.FailStage refuses awaiting_children → failed at the
+// DOMAIN layer (the park-ownership guard), NOT by removing the base-table
+// edge — the childcompletion sweeper, orchestrator resolveParent, and the
+// consolidate handler still need it to resolve a decomposition park. This
+// guards against a future refactor conflating the #1903 FailStage guard with
+// deleting the edge.
+func TestStageAwaitingChildrenFanInEdges(t *testing.T) {
+	if !ValidStageTransition(StageStateAwaitingChildren, StageStateFailed) {
+		t.Error("ValidStageTransition must admit awaiting_children → failed (owned by the fan-in resolvers; FailStage refuses it at the domain layer, not the base table)")
+	}
+	if !ValidStageTransition(StageStateAwaitingChildren, StageStateSucceeded) {
+		t.Error("ValidStageTransition must admit awaiting_children → succeeded (fan-in resolution)")
+	}
+}
+
+func TestStageStateChangedError_FormatsAndIsErrorsTarget(t *testing.T) {
+	id := uuid.New()
+	err := error(StageStateChangedError{StageID: id, Expected: StageStatePending, Actual: StageStateAwaitingChildren})
+	var target StageStateChangedError
+	if !errors.As(err, &target) {
+		t.Fatal("expected errors.As to extract StageStateChangedError")
+	}
+	if target.Expected != StageStatePending || target.Actual != StageStateAwaitingChildren {
+		t.Errorf("target = {expected:%q actual:%q}, want {pending awaiting_children}", target.Expected, target.Actual)
+	}
+	if !strings.Contains(err.Error(), "state changed") {
+		t.Errorf("Error() = %q, want contains 'state changed'", err.Error())
 	}
 }
 

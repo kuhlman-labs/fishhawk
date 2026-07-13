@@ -283,3 +283,24 @@ type Repository interface {
 	// already hold that decision.
 	RetryStage(ctx context.Context, id uuid.UUID, to StageState) (*Stage, error)
 }
+
+// StageCASTransitioner is an OPTIONAL capability on the concrete postgres
+// repo — a compare-and-swap sibling of TransitionStage that applies the
+// move ONLY when the stage's row-locked current state still equals `from`.
+// If another writer flipped the stage between the caller's load and this
+// call, it returns StageStateChangedError and mutates nothing; otherwise
+// it behaves exactly like TransitionStage (same completion validation,
+// started_at/ended_at stamping, override-table union).
+//
+// It is deliberately kept OFF the Repository interface — mirroring the
+// ResumeAwaitingInputAndAppend / ParkScopeCompletenessAndAppend /
+// AddRunCost precedent — because adding a method to Repository would break
+// every manually-written full-interface test fake (~20 across the
+// backend). run.FailStage type-asserts this capability and drives its
+// transitions through it when present (production postgresRepo), falling
+// back to the plain Repository.TransitionStage path for in-memory fakes
+// that do not implement it. That fallback retains the (fake-only) post-load
+// race window; production always has the capability.
+type StageCASTransitioner interface {
+	TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to StageState, completion *StageCompletion) (*Stage, error)
+}

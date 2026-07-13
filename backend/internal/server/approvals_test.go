@@ -927,6 +927,33 @@ func (r *orchestratorRepo) TransitionStage(_ context.Context, id uuid.UUID, to r
 	return s, nil
 }
 
+// TransitionStageFrom gives the fake the StageCASTransitioner capability so
+// FailStage exercises its compare-and-swap path end-to-end in handler tests
+// (#1903). Mirrors postgresRepo.TransitionStageFrom: refuse atomically with
+// StageStateChangedError when the current state has drifted from the caller's
+// expected from-state, otherwise apply the same validated transition as
+// TransitionStage.
+func (r *orchestratorRepo) TransitionStageFrom(_ context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.stagesByID[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	if s.State != from {
+		return nil, run.StageStateChangedError{StageID: id, Expected: from, Actual: s.State}
+	}
+	if !run.ValidStageTransition(s.State, to) {
+		return nil, run.InvalidTransitionError{Kind: "stage", From: string(s.State), To: string(to)}
+	}
+	s.State = to
+	if c != nil {
+		s.FailureCategory = c.FailureCategory
+		s.FailureReason = c.FailureReason
+	}
+	return s, nil
+}
+
 // Unused.
 func (r *orchestratorRepo) CreateRun(context.Context, run.CreateRunParams) (*run.Run, error) {
 	return nil, errors.New("not used")
