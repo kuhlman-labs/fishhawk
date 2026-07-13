@@ -244,9 +244,10 @@ func TestProvisionAcceptanceTree_StaleLeftoverSwept(t *testing.T) {
 
 // TestProvisionAcceptanceTree_TeardownRemoveFallback: when `git worktree remove`
 // fails (here forced by locking the worktree so a single --force is refused),
-// teardown falls back to os.RemoveAll + `git worktree prune` — the directory is
-// removed regardless and the fallback variant is logged, never affecting the
-// stage outcome.
+// teardown falls back to unlock + os.RemoveAll + `git worktree prune` — the
+// directory is removed AND the locked registration is unregistered (the unlock
+// clears the lock a plain prune would otherwise skip), the fallback variant is
+// logged, and the stage outcome is never affected.
 func TestProvisionAcceptanceTree_TeardownRemoveFallback(t *testing.T) {
 	dispatch, mcSHA := acceptanceTreeRepo(t)
 	redirectAcceptanceTreeDir(t)
@@ -269,5 +270,12 @@ func TestProvisionAcceptanceTree_TeardownRemoveFallback(t *testing.T) {
 	}
 	if !strings.Contains(log.String(), `"fallback":"rm_prune"`) {
 		t.Errorf("teardown remove failure must take the rm_prune fallback:\n%s", log.String())
+	}
+	// The unlock+prune fallback must ALSO unregister the locked worktree — a plain
+	// prune skips locked entries, so without the unlock the registration would
+	// persist in the dispatch repo's admin area and acceptance_tree_removed would
+	// overclaim.
+	if worktreeRegistered(t, dispatch, target) {
+		t.Error("fallback must unregister the locked worktree, not leave a stranded registration")
 	}
 }

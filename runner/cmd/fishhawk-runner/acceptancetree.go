@@ -27,12 +27,21 @@ import (
  * paging the operator.
  *
  * provisionAcceptanceTree materializes the ONE sanctioned tree the prompt
- * names: a disposable, read-only detached checkout of the merge-candidate
+ * names: a disposable detached checkout of the merge-candidate
  * head (acceptanceExpectedHeadSHA — the exact identity the #1569 target
  * gate verifies the preview serves) at a run/stage-keyed path, created via
  * `git worktree add --detach` against the operator's dispatch checkout
  * (the established provisionLineageWorktree pattern). It is torn down after
  * the stage.
+ *
+ * "Read-only" is a prompt-directed convention the acceptance agent is told to
+ * honor, NOT a mechanically enforced property: a `git worktree` shares the
+ * dispatch checkout's git admin dir and object store, so the tree is writable
+ * host-local git state, not an isolated clone. This does not widen the ADR-050
+ * containment boundary (credential-free env + no MCP token + egress proxy — not
+ * filesystem isolation); the credential-free agent could already reach the
+ * dispatch checkout on the host (the #1881 bug this fixes). Naming the tree in
+ * the prompt just points it at the RIGHT checkout instead of a wrong one.
  *
  * EVERY provisioning failure warns and PROCEEDS — never a stage failure:
  * the prompt's skip rule turns the degraded case into an honest skipped
@@ -143,16 +152,27 @@ func provisionAcceptanceTree(ctx context.Context, repoDir, headSHA, runID, stage
 		`{"event":"acceptance_tree_provisioned","run_id":%q,"stage_id":%q,"path":%q,"head_sha":%q}`+"\n",
 		runID, stageID, target, headSHA)
 
-	// Teardown: `git worktree remove --force <path>`, with an os.RemoveAll +
-	// `git worktree prune` fallback. The fallback is path-canonicalization-proof:
+	// Teardown: `git worktree remove --force <path>`, with an unlock + os.RemoveAll
+	// + `git worktree prune` fallback. The fallback is path-canonicalization-proof:
 	// on macOS /tmp is a symlink to /private/tmp, so the path git REGISTERED for
 	// the worktree can differ from the path passed to `worktree remove`, making
 	// the remove miss — os.RemoveAll deletes the tree regardless and prune clears
-	// the registration by scanning for a missing tree. Best-effort; never changes
-	// the stage outcome.
+	// the registration by scanning for a missing tree.
+	//
+	// A single `worktree remove --force` REFUSES a locked worktree, and a plain
+	// `worktree prune` ALSO skips locked entries (git-worktree(1)) — so without the
+	// explicit `worktree unlock` the fallback would remove the directory yet leave
+	// the registration + lock stranded in the dispatch repo's admin area, making
+	// the acceptance_tree_removed event overclaim. The unlock (best-effort; a
+	// no-op/harmless error when the worktree is unlocked or the path mismatches, as
+	// in the /tmp-symlink case) runs BEFORE the RemoveAll so git can still resolve
+	// the registered path, letting the subsequent prune actually unregister the
+	// now-missing tree. Best-effort throughout; never changes the stage outcome.
 	return func() {
 		if out, err := exec.CommandContext(ctx, "git", "-C", repoDir,
 			"worktree", "remove", "--force", target).CombinedOutput(); err != nil {
+			_ = exec.CommandContext(ctx, "git", "-C", repoDir,
+				"worktree", "unlock", target).Run()
 			_ = os.RemoveAll(target)
 			if pout, perr := exec.CommandContext(ctx, "git", "-C", repoDir,
 				"worktree", "prune").CombinedOutput(); perr != nil {

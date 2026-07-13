@@ -116,9 +116,12 @@ func AcceptanceVerdictPath(runID, stageID string) string {
 // fallback). MUST stay byte-identical to that runner var.
 const LegacyAcceptanceVerdictPath = "/tmp/fishhawk-acceptance.json"
 
-// AcceptanceTreePath is the run/stage-keyed absolute path of the disposable,
-// read-only detached checkout of the merge-candidate head the runner provisions
-// before the acceptance agent spawns (#1881). It is the ONLY sanctioned tree the
+// AcceptanceTreePath is the run/stage-keyed absolute path of the disposable
+// detached checkout of the merge-candidate head the runner provisions
+// before the acceptance agent spawns (#1881). "Read-only" is a prompt-directed
+// convention the agent is instructed to honor, NOT a mechanically enforced
+// filesystem property: the checkout is a `git worktree` that shares the dispatch
+// repo's git admin dir and object store, so it is not an isolated clone. It is the ONLY sanctioned tree the
 // acceptance prompt names for repository-content (Posture B) criteria: the agent
 // spawns in an empty temp dir (ADR-049 #4 diff-withholding), so before this fix a
 // Posture B repository-local check would grep whatever checkout it could find on
@@ -1866,8 +1869,10 @@ func buildAcceptance(t Trigger) string {
 		"merge candidate IS sanctioned when the running target cannot exhibit it. ")
 	if treePath := acceptanceTreePathForTrigger(t); treePath != "" {
 		b.WriteString("The merge-candidate tree — the SAME head the preview target serves — is " +
-			"provisioned for you as a disposable, read-only detached checkout at " + treePath +
-			". Posture B repository-local validation MUST run against THAT checkout only. ")
+			"provisioned for you as a disposable detached checkout at " + treePath +
+			". Treat it as READ-ONLY: read from it for Posture B validation but do NOT write to " +
+			"or modify it (it shares the dispatch repo's git store and is not an isolated clone). " +
+			"Posture B repository-local validation MUST run against THAT checkout only. ")
 	}
 	b.WriteString("NEVER evaluate a repository-content criterion against any other local " +
 		"checkout, worktree, or clone you find on the host: the operator's checkout and the " +

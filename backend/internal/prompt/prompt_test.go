@@ -6442,7 +6442,9 @@ func TestBuild_Acceptance_MergeCandidateTree_Keyed(t *testing.T) {
 	}
 	wantPath := AcceptanceTreePath(runID, stageID)
 	for _, want := range []string{
-		"provisioned for you as a disposable, read-only detached checkout at " + wantPath,
+		"provisioned for you as a disposable detached checkout at " + wantPath,
+		"Treat it as READ-ONLY",
+		"is not an isolated clone",
 		"MUST run against THAT checkout only",
 		"NEVER evaluate a repository-content criterion against any other local",
 		"When the sanctioned checkout is absent or was not provisioned",
