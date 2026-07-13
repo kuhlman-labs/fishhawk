@@ -18,25 +18,59 @@ fail() { print "FAIL: $1"; FAIL=$(( FAIL + 1 )) }
 DEV_LIB_ONLY=1 source "${REPO_ROOT}/scripts/dev"
 set +e
 
-# 1. Rebuilt path: prominent, names the binary, and tells the operator to reconnect.
-out="$(_signal_mcp_activation 1)"
-if [[ "$out" == *fishhawk-mcp* ]]; then
-  pass "rebuilt signal mentions fishhawk-mcp"
+# 1. _signal_mcp_activation is now KIND-form (ADR-060 / #1922): one banner per
+# kind (schema_major | shim_rebuilt | reconnect | auto_swap | none). Assert the
+# shipped text of each, not mere helper presence.
+out="$(_signal_mcp_activation schema_major)"
+if print -r -- "$out" | grep -q 'schema MAJOR'; then
+  pass "schema_major banner names the schema MAJOR bump"
 else
-  fail "rebuilt signal should mention fishhawk-mcp (got: $out)"
-fi
-if print -r -- "$out" | grep -qi reconnect; then
-  pass "rebuilt signal matches /reconnect/i"
-else
-  fail "rebuilt signal should match /reconnect/i (got: $out)"
+  fail "schema_major banner should name the schema MAJOR bump (got: $out)"
 fi
 
-# 2. Unchanged path: single explicit no-op line.
-out="$(_signal_mcp_activation 0)"
-if [[ "$out" == *"no MCP reconnect needed"* ]]; then
-  pass "unchanged signal says 'no MCP reconnect needed'"
+out="$(_signal_mcp_activation shim_rebuilt)"
+if [[ "$out" == *fishhawk-mcp-shim* ]] && print -r -- "$out" | grep -q -- '/mcp'; then
+  pass "shim_rebuilt banner names fishhawk-mcp-shim and /mcp"
 else
-  fail "unchanged signal should say 'no MCP reconnect needed' (got: $out)"
+  fail "shim_rebuilt banner should name fishhawk-mcp-shim and /mcp (got: $out)"
+fi
+
+out="$(_signal_mcp_activation reconnect)"
+if [[ "$out" == *fishhawk-mcp* ]] && print -r -- "$out" | grep -qi reconnect \
+   && print -r -- "$out" | grep -q 'ACTION REQUIRED'; then
+  pass "reconnect banner keeps the ACTION REQUIRED fishhawk-mcp reconnect text"
+else
+  fail "reconnect banner should keep the ACTION REQUIRED fishhawk-mcp reconnect text (got: $out)"
+fi
+
+# auto_swap: a single line naming automatic swap + GitSHA verification, and it
+# must NOT carry the manual ACTION REQUIRED nag (the shim swaps automatically).
+out="$(_signal_mcp_activation auto_swap)"
+if print -r -- "$out" | grep -qi 'hot-swaps' && print -r -- "$out" | grep -q 'GitSHA' \
+   && ! print -r -- "$out" | grep -q 'ACTION REQUIRED'; then
+  pass "auto_swap note names automatic swap + GitSHA and omits ACTION REQUIRED"
+else
+  fail "auto_swap note should name automatic swap + GitSHA and omit ACTION REQUIRED (got: $out)"
+fi
+if [[ "$(print -r -- "$out" | grep -c .)" == 1 ]]; then
+  pass "auto_swap note is a single line"
+else
+  fail "auto_swap note should be a single line (got: $out)"
+fi
+
+# 2. Unchanged path (none): single explicit no-op line.
+out="$(_signal_mcp_activation none)"
+if [[ "$out" == *"no MCP reconnect needed"* ]]; then
+  pass "none banner says 'no MCP reconnect needed'"
+else
+  fail "none banner should say 'no MCP reconnect needed' (got: $out)"
+fi
+# Unknown/absent kind degrades to the no-op line.
+out="$(_signal_mcp_activation)"
+if [[ "$out" == *"no MCP reconnect needed"* ]]; then
+  pass "absent kind degrades to 'no MCP reconnect needed'"
+else
+  fail "absent kind should degrade to 'no MCP reconnect needed' (got: $out)"
 fi
 
 # 3. cmd_reload core behavior: invokes cmd_down then cmd_up, forwarding flags.
@@ -111,6 +145,32 @@ if _diff_touches_mcp "runner/internal/plan/coerce.go"; then
 else
   pass "_diff_touches_mcp stays quiet for runner-only delta"
 fi
+# Cross-glob non-collision (ADR-060 / #1922): the mcp glob must NOT match a shim
+# path — the literal `/` after `fishhawk-mcp` blocks the prefix.
+if _diff_touches_mcp "backend/cmd/fishhawk-mcp-shim/main.go"; then
+  fail "_diff_touches_mcp should NOT match a fishhawk-mcp-shim path"
+else
+  pass "_diff_touches_mcp stays quiet for a fishhawk-mcp-shim path (cross-glob non-collision)"
+fi
+
+# 4a. _diff_touches_shim: the shim's OWN trigger glob only — not the shared libs,
+# and (cross-glob non-collision) not a plain fishhawk-mcp path.
+if _diff_touches_shim "backend/cmd/fishhawk-mcp-shim/main.go"; then
+  pass "_diff_touches_shim matches backend/cmd/fishhawk-mcp-shim/"
+else
+  fail "_diff_touches_shim should match backend/cmd/fishhawk-mcp-shim/"
+fi
+if _diff_touches_shim "backend/cmd/fishhawk-mcp/main.go"; then
+  fail "_diff_touches_shim should NOT match a plain fishhawk-mcp path"
+else
+  pass "_diff_touches_shim stays quiet for a fishhawk-mcp path (cross-glob non-collision)"
+fi
+# The shim deliberately does NOT join the shared-lib case.
+if _diff_touches_shim "backend/internal/plan/validate.go"; then
+  fail "_diff_touches_shim should NOT match a shared-lib path"
+else
+  pass "_diff_touches_shim stays quiet for a shared-lib path (shim not in the shared-lib case)"
+fi
 
 # 4b. _sha_with_dirty: pure dirty-suffix helper (#1007). Empty porcelain text
 # means a clean tree -> bare sha; any output means dirty -> '-dirty' suffix.
@@ -133,12 +193,13 @@ fi
 # package move/rename must fail here instead of shipping unstamped binaries.
 typeset -A gitsha_pkg
 gitsha_pkg=(
-  fishhawkd        backend/internal/version
-  fishhawk-mcp     backend/internal/version
-  fishhawk-runner  runner/internal/version
-  fishhawk         cli/internal/version
+  fishhawkd         backend/internal/version
+  fishhawk-mcp      backend/internal/version
+  fishhawk-mcp-shim backend/internal/version
+  fishhawk-runner   runner/internal/version
+  fishhawk          cli/internal/version
 )
-for bin in fishhawkd fishhawk-mcp fishhawk-runner fishhawk; do
+for bin in fishhawkd fishhawk-mcp fishhawk-mcp-shim fishhawk-runner fishhawk; do
   rel="${gitsha_pkg[$bin]}"
   out="$(_build_ldflags "$bin" abc1234)"
   if [[ "$out" == "-X github.com/kuhlman-labs/fishhawk/${rel}.GitSHA=abc1234" ]]; then
@@ -274,6 +335,172 @@ if [[ "$(_workflow_major_changed '' '')" == 0 ]]; then
   pass "_workflow_major_changed: both empty -> 0"
 else
   fail "_workflow_major_changed: both-empty should be 0"
+fi
+
+# 5e. _decide_shim_signal (ADR-060 / #1922): mirrors _decide_mcp_signal's ladder
+# minus the schema-major fold. Args: <shim_rebuilt> <force_all> <reflog_ok> <merge_diff>
+if [[ "$(_decide_shim_signal 0 1 1 'backend/cmd/fishhawk-mcp-shim/main.go')" == 0 ]]; then
+  pass "_decide_shim_signal: shim not rebuilt -> 0"
+else
+  fail "_decide_shim_signal: shim not rebuilt should be 0"
+fi
+if [[ "$(_decide_shim_signal 1 1 1 'backend/cmd/fishhawk-mcp-shim/main.go')" == 1 ]]; then
+  pass "_decide_shim_signal: rebuilt + --all + diff touches shim -> 1"
+else
+  fail "_decide_shim_signal: rebuilt + --all + shim delta should be 1"
+fi
+if [[ "$(_decide_shim_signal 1 1 1 'runner/internal/plan/coerce.go')" == 0 ]]; then
+  pass "_decide_shim_signal: rebuilt + --all + diff misses shim -> 0"
+else
+  fail "_decide_shim_signal: rebuilt + --all + non-shim delta should be 0"
+fi
+if [[ "$(_decide_shim_signal 1 1 0 '')" == 1 ]]; then
+  pass "_decide_shim_signal: rebuilt + --all + no reflog -> 1 (conservative fire)"
+else
+  fail "_decide_shim_signal: reflog-unavailable fallback should be 1"
+fi
+if [[ "$(_decide_shim_signal 1 0 1 'runner/internal/plan/coerce.go')" == 1 ]]; then
+  pass "_decide_shim_signal: rebuilt under branch-diff up -> 1"
+else
+  fail "_decide_shim_signal: branch-diff up rebuild should be 1"
+fi
+
+# 5f. _shim_registered_from: override wins; empty override consults the text.
+if [[ "$(_shim_registered_from 1 '')" == 1 ]]; then
+  pass "_shim_registered_from: override 1 -> 1"
+else
+  fail "_shim_registered_from: override 1 should be 1"
+fi
+if [[ "$(_shim_registered_from 0 'fishhawk-mcp-shim')" == 0 ]]; then
+  pass "_shim_registered_from: override 0 wins over matching text -> 0"
+else
+  fail "_shim_registered_from: override 0 should be 0"
+fi
+if [[ "$(_shim_registered_from '' 'command: /path/to/bin/fishhawk-mcp-shim')" == 1 ]]; then
+  pass "_shim_registered_from: empty override + matching text -> 1"
+else
+  fail "_shim_registered_from: empty override + matching text should be 1"
+fi
+if [[ "$(_shim_registered_from '' 'command: /path/to/bin/fishhawk-mcp')" == 0 ]]; then
+  pass "_shim_registered_from: empty override + non-matching text -> 0"
+else
+  fail "_shim_registered_from: empty override + non-matching text should be 0"
+fi
+# Empty override + empty text (absent/errored `claude mcp get`) degrades to 0 —
+# the fail-safe direction that keeps the manual reconnect banner.
+if [[ "$(_shim_registered_from '' '')" == 0 ]]; then
+  pass "_shim_registered_from: empty override + empty text degrades to 0 (fail-safe)"
+else
+  fail "_shim_registered_from: empty override + empty text should degrade to 0"
+fi
+
+# 5g. _select_mcp_banner precedence (ADR-060 / #1922). Args:
+# <schema_major> <shim_signal> <mcp_signal> <shim_registered>
+if [[ "$(_select_mcp_banner 1 0 0 0)" == schema_major ]]; then
+  pass "_select_mcp_banner: schema_major kind"
+else
+  fail "_select_mcp_banner: schema_major input should select schema_major"
+fi
+if [[ "$(_select_mcp_banner 0 1 0 0)" == shim_rebuilt ]]; then
+  pass "_select_mcp_banner: shim_rebuilt kind"
+else
+  fail "_select_mcp_banner: shim signal should select shim_rebuilt"
+fi
+if [[ "$(_select_mcp_banner 0 0 1 0)" == reconnect ]]; then
+  pass "_select_mcp_banner: reconnect kind (mcp signal, shim unregistered)"
+else
+  fail "_select_mcp_banner: mcp signal + unregistered shim should select reconnect"
+fi
+if [[ "$(_select_mcp_banner 0 0 1 1)" == auto_swap ]]; then
+  pass "_select_mcp_banner: auto_swap kind (mcp signal, shim registered)"
+else
+  fail "_select_mcp_banner: mcp signal + registered shim should select auto_swap"
+fi
+if [[ "$(_select_mcp_banner 0 0 0 0)" == none ]]; then
+  pass "_select_mcp_banner: none kind"
+else
+  fail "_select_mcp_banner: nothing-changed should select none"
+fi
+# Contested precedences: schema_major beats shim_rebuilt; shim_rebuilt beats auto_swap.
+if [[ "$(_select_mcp_banner 1 1 1 1)" == schema_major ]]; then
+  pass "_select_mcp_banner: schema_major beats shim_rebuilt"
+else
+  fail "_select_mcp_banner: schema_major should win over shim_rebuilt"
+fi
+if [[ "$(_select_mcp_banner 0 1 1 1)" == shim_rebuilt ]]; then
+  pass "_select_mcp_banner: shim_rebuilt beats auto_swap"
+else
+  fail "_select_mcp_banner: shim_rebuilt should win over auto_swap"
+fi
+
+# 5h. _detect_rebuild_set wiring (ADR-060 / #1922): the shim carries its own
+# trigger glob, and the shared-lib case must NOT short-circuit past the shim.
+drs_body="$(typeset -f _detect_rebuild_set)"
+if print -r -- "$drs_body" | grep -q 'backend/cmd/fishhawk-mcp-shim/\*'; then
+  pass "_detect_rebuild_set carries the fishhawk-mcp-shim trigger glob"
+else
+  fail "_detect_rebuild_set should carry backend/cmd/fishhawk-mcp-shim/* glob"
+fi
+# The shared-lib case must fall through (no early `return`) so a diff touching
+# both a shared lib AND the shim still marks the shim. Behavioral proof: drive
+# _detect_rebuild_set through a stubbed git that emits exactly that two-line diff.
+(
+  set +e
+  tmp_stub="$(mktemp -d)"
+  cat > "${tmp_stub}/git" <<'STUB'
+#!/usr/bin/env zsh
+case "$*" in
+  *rev-parse*) exit 0 ;;
+  *diff*) print "backend/internal/plan/x.go"; print "backend/cmd/fishhawk-mcp-shim/main.go"; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+  chmod +x "${tmp_stub}/git"
+  PATH="${tmp_stub}:$PATH"
+  typeset -gA rebuild_set
+  rebuild_set=()
+  _detect_rebuild_set
+  if [[ -n "${rebuild_set[fishhawk-mcp-shim]:-}" && -n "${rebuild_set[fishhawk-mcp]:-}" ]]; then
+    pass "_detect_rebuild_set: shared-lib + shim two-line diff marks BOTH (no early-return drop)"
+  else
+    fail "_detect_rebuild_set: shared-lib + shim diff should mark the shim (mcp=${rebuild_set[fishhawk-mcp]:-unset} shim=${rebuild_set[fishhawk-mcp-shim]:-unset})"
+  fi
+  rm -rf "$tmp_stub"
+)
+
+# 5i. Build/banner wiring body-greps: _build_binary src_paths, cmd_up's forced
+# --all set, the build loop, and cmd_up's banner-decision call sites all carry
+# the shim.
+if print -r -- "$bb_body" | grep -q 'fishhawk-mcp-shim'; then
+  pass "_build_binary src_paths includes fishhawk-mcp-shim"
+else
+  fail "_build_binary src_paths should include fishhawk-mcp-shim"
+fi
+up_body_all="$(typeset -f cmd_up)"
+if print -r -- "$up_body_all" | grep -q 'fishhawk-mcp-shim __all__'; then
+  pass "cmd_up forced --all set includes fishhawk-mcp-shim"
+else
+  fail "cmd_up forced --all set should include fishhawk-mcp-shim __all__"
+fi
+if print -r -- "$up_body_all" | grep -q 'for binary in fishhawkd fishhawk-mcp fishhawk-mcp-shim'; then
+  pass "cmd_up build loop iterates fishhawk-mcp-shim"
+else
+  fail "cmd_up build loop should iterate fishhawk-mcp-shim"
+fi
+if print -r -- "$up_body_all" | grep -q '_select_mcp_banner'; then
+  pass "cmd_up consults _select_mcp_banner for the activation kind"
+else
+  fail "cmd_up should consult _select_mcp_banner"
+fi
+if print -r -- "$up_body_all" | grep -q '_detect_shim_registered'; then
+  pass "cmd_up consults _detect_shim_registered"
+else
+  fail "cmd_up should consult _detect_shim_registered"
+fi
+if print -r -- "$up_body_all" | grep -q '_signal_mcp_activation "$mcp_banner_kind"'; then
+  pass "cmd_up emits the selected banner kind as the last line"
+else
+  fail "cmd_up should call _signal_mcp_activation with the selected kind"
 fi
 
 # 7. _healthz_url: derives the port from FISHHAWKD_ADDR, default 8080.
