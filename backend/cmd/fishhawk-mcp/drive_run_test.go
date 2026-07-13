@@ -47,6 +47,11 @@ type driveFakeBackend struct {
 	gateErr      bool // /auto-drive returns 500 when true
 	auditErr     bool // /audit returns 500 when true (drives the amendment-poll fail-closed path)
 
+	// auditErrCategory, when set, returns 500 only for /audit reads of that
+	// category — so a run_auto_driven read can fail while the amendment-poll
+	// reads (scope_amendment_requested/decided) still succeed.
+	auditErrCategory string
+
 	onGate  func(f *driveFakeBackend) AutoDriveOutcome
 	onSpawn func(f *driveFakeBackend, stageType string)
 
@@ -194,12 +199,12 @@ func (f *driveFakeBackend) handler() http.HandlerFunc {
 		case strings.HasSuffix(path, "/audit"):
 			f.mu.Lock()
 			defer f.mu.Unlock()
-			if f.auditErr {
+			cat := r.URL.Query().Get("category")
+			if f.auditErr || (f.auditErrCategory != "" && cat == f.auditErrCategory) {
 				w.WriteHeader(http.StatusInternalServerError)
 				_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"audit boom"}}`))
 				return
 			}
-			cat := r.URL.Query().Get("category")
 			var items []AuditEntry
 			for _, e := range f.audit {
 				if cat == "" || e.Category == cat {
@@ -725,6 +730,89 @@ func TestDriveRun_ResumeDispatchedInFlight_NoDoubleSpawn(t *testing.T) {
 	// No NEW dispatch row was recorded — only the prior invocation's remains.
 	if n := len(f.autoRows()); n != 1 {
 		t.Errorf("run_auto_driven rows = %d, want 1 (no re-record on resume of an in-flight dispatched stage)", n)
+	}
+}
+
+// --- (l2) manual dispatch in flight -> no double-spawn, no driver row -------
+
+func TestDriveRun_ManualDispatchInFlight_NoDoubleSpawn(t *testing.T) {
+	// A stage was dispatched by a MANUAL fishhawk_dispatch_stage: it sits in the
+	// 'dispatched' window but has NO run_auto_driven dispatch row (only the
+	// driver writes those). A fresh drive invocation's per-run `spawned` map
+	// cannot see it and driveDispatchableStage treats 'dispatched' as
+	// dispatchable — the guard must STILL treat it as in-flight and POLL, never
+	// host-spawn a SECOND runner against the same repo. The earlier guard keyed
+	// on a driver dispatch row (priorRow) and would have double-spawned here.
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "dispatched", 1),
+	})
+	// Deliberately NO run_auto_driven row — a manual dispatch, not a driver one.
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 40 * time.Millisecond // the in-flight stage never advances
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedTimeout {
+		t.Fatalf("stopped_reason = %q, want timeout (polled the in-flight manual dispatch)", out.StoppedReason)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("resumed invocation re-spawned a manually-dispatched in-flight stage: %v", got)
+	}
+	if n := len(f.autoRows()); n != 0 {
+		t.Errorf("run_auto_driven rows = %d, want 0 (no re-record for a manual in-flight dispatch)", n)
+	}
+	f.mu.Lock()
+	nActs := len(f.recordedActs)
+	f.mu.Unlock()
+	if nActs != 0 {
+		t.Errorf("recorded %d acts for a manually-dispatched stage; want 0", nActs)
+	}
+}
+
+// --- (l3) prior-dispatch-row read error -> fail-closed, never dispatch ------
+
+func TestDriveRun_PriorDispatchRowCheckError_FailsClosed(t *testing.T) {
+	// The run_auto_driven audit read that derives the crash-resume retry note
+	// errors. The loop must NOT silently downgrade to "no prior row" and record
+	// + spawn — an unreadable audit state on a resume could mean a prior
+	// invocation already spawned this stage, so a spawn now would start a SECOND
+	// concurrent runner. Fail closed: stop, never record, never spawn. The
+	// amendment poll (a distinct category) still succeeds, so the stop is
+	// dispatch_check_failed, not amendment_check_failed.
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "pending", 0),
+		stg(driveImplID, "implement", "blocked", 1),
+	})
+	f.auditErrCategory = CategoryRunAutoDriven
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedDispatchCheckFailed {
+		t.Fatalf("stopped_reason = %q, want dispatch_check_failed (fail-closed)", out.StoppedReason)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("driver spawned despite an unreadable prior-dispatch-row state: %v", got)
+	}
+	f.mu.Lock()
+	nActs := len(f.recordedActs)
+	f.mu.Unlock()
+	if nActs != 0 {
+		t.Errorf("driver recorded %d acts despite the fail-closed read error; want 0", nActs)
+	}
+	if out.NextActions == nil {
+		t.Error("fail-closed dispatch-check stop carried no next_actions")
 	}
 }
 

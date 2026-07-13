@@ -165,6 +165,12 @@ func TestAutoDrive_ObserveOnlyNoDelegation(t *testing.T) {
 		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
 		"trigger_source": "cli", "workflow_spec": gatedSpecYAML,
 	})
+	// Capture run + stage state BEFORE the call so we can prove the fail-closed
+	// no-delegation path is genuinely observe-only — the blocking requirement is
+	// that it must NOT silently transition the run or a stage while returning
+	// observe-only. Response flags + the absent act row alone do not prove that.
+	before := autoDriveStateSig(t, repo.driveE2ERepo, runID)
+
 	w := autoDrivePost(t, s, s.handleAutoDrive, runID, "", "{}", autoDriveOperatorIdentity())
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
@@ -179,6 +185,34 @@ func TestAutoDrive_ObserveOnlyNoDelegation(t *testing.T) {
 	if countAudit(au, CategoryRunAutoDriven) != 0 {
 		t.Error("run_auto_driven row appended on an observe-only outcome")
 	}
+	// Fail-closed means NO state change: the run state and every stage state are
+	// exactly as before the call.
+	if after := autoDriveStateSig(t, repo.driveE2ERepo, runID); after != before {
+		t.Errorf("observe-only outcome changed run/stage state:\n before = %q\n after  = %q", before, after)
+	}
+}
+
+// autoDriveStateSig captures the run state + each stage's id:state as a stable
+// signature, so an observe-only outcome can be asserted to have changed nothing.
+func autoDriveStateSig(t *testing.T, repo *driveE2ERepo, runID uuid.UUID) string {
+	t.Helper()
+	runRow, err := repo.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	stages, err := repo.ListStagesForRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListStagesForRun: %v", err)
+	}
+	var b strings.Builder
+	b.WriteString(string(runRow.State))
+	for _, st := range stages {
+		b.WriteString("|")
+		b.WriteString(st.ID.String())
+		b.WriteString(":")
+		b.WriteString(string(st.State))
+	}
+	return b.String()
 }
 
 // --- (5) CROSS-BOUNDARY end-to-end acted approve -----------------------------

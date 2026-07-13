@@ -46,6 +46,13 @@ const (
 	// decision, so an unreadable amendment state must halt the driver rather
 	// than fall through to a stage dispatch.
 	stoppedAmendmentCheckFailed = "amendment_check_failed"
+	// stoppedDispatchCheckFailed is the fail-CLOSED stop when the prior-
+	// dispatch-row audit read errors: an unreadable run_auto_driven state can
+	// never be silently downgraded to "no prior dispatch", which on a resume of
+	// a still-'dispatched' stage would let the loop record + host-spawn a SECOND
+	// runner while the first is in flight. Halt rather than risk concurrent
+	// repository command execution.
+	stoppedDispatchCheckFailed = "dispatch_check_failed"
 	// "paged:<event>" and "decision_required:<state>" are composed inline.
 )
 
@@ -78,7 +85,7 @@ type DriveStep struct {
 // resumable by re-invoking with the same run_id.
 type DriveRunOutput struct {
 	RunID         string       `json:"run_id"`
-	StoppedReason string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | run_failed | cancelled | gate_error | amendment_check_failed"`
+	StoppedReason string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed"`
 	RunState      string       `json:"run_state"`
 	StepsTaken    []DriveStep  `json:"steps_taken,omitempty" jsonschema:"the ordered acts the driver performed; each dispatch and gate act also landed a run_auto_driven audit row"`
 	PageEvent     string       `json:"page_event,omitempty" jsonschema:"the must_page_human event, set only on a paged stop"`
@@ -261,20 +268,35 @@ func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in D
 		if disp := driveDispatchableStage(stages, spawned); disp != nil {
 			stall = 0
 			recordName := driveDispatchName(*disp, dispatchedCount)
-			priorRow := false
-			if had, herr := r.driveHasPriorDispatchRow(ctx, runUUID, recordName); herr == nil {
-				priorRow = had
+			// A prior run_auto_driven dispatch row for this stage name is a
+			// crash-resume / re-open signal (drives the retry note below).
+			// FAIL-CLOSED on a read error: an unreadable audit state must NEVER be
+			// silently downgraded to "no prior row". On a resume that observes a
+			// still-'dispatched' stage, downgrading would let the loop record +
+			// host-spawn a SECOND runner while the first is in flight (concurrent
+			// repository command execution). Halt instead.
+			priorRow, herr := r.driveHasPriorDispatchRow(ctx, runUUID, recordName)
+			if herr != nil {
+				out.StoppedReason = stoppedDispatchCheckFailed
+				out.Warnings = append(out.Warnings,
+					fmt.Sprintf("prior-dispatch-row poll for %s failed; stopping fail-closed: %v", recordName, herr))
+				out.NextActions = driveDecisionActions("stalled", runUUID, in.WorkingDir)
+				return nil, out, nil
 			}
-			// Cross-invocation resume guard: a stage already in the 'dispatched'
-			// window that a PRIOR invocation recorded (a dispatch row exists) and
-			// that THIS invocation did not re-open (dispatchedCount==0) is in
-			// flight from that prior invocation — a fresh invocation's per-run
-			// `spawned` map cannot see it. Treat it as in-flight and POLL; never
-			// host-spawn a second runner for the same stage. A 'pending' resume
+			// Concurrency / cross-invocation resume guard: a stage already in the
+			// 'dispatched' window that THIS invocation did not spawn
+			// (dispatchedCount==0) has a runner in flight — from a PRIOR driver
+			// invocation OR a manual fishhawk_dispatch_stage (which lands NO
+			// run_auto_driven dispatch row). A fresh invocation's per-run
+			// `spawned` map cannot see it, and driveDispatchableStage treats
+			// 'dispatched' as dispatchable. Treat it as in-flight and POLL; never
+			// host-spawn a SECOND runner for the same stage — regardless of
+			// whether a driver dispatch row exists (keying on priorRow would miss
+			// the manual-dispatch case and double-spawn). A 'pending' resume
 			// (crashed before the stage started) still re-records + re-dispatches
 			// with a retry note below; a fixup/retry re-open (dispatchedCount>0)
 			// still re-dispatches as fixup_redispatch.
-			if disp.State == "dispatched" && dispatchedCount[disp.ID] == 0 && priorRow {
+			if disp.State == "dispatched" && dispatchedCount[disp.ID] == 0 {
 				spawned[disp.ID] = true // mark in-flight so driveAnyInFlight polls it
 				driveSleep(ctx, pollInterval)
 				continue
@@ -282,8 +304,8 @@ func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in D
 			note := ""
 			if priorRow {
 				// A run_auto_driven dispatch row already exists for this stage
-				// name and the stage is still dispatchable — a crash-resume or a
-				// re-open. Re-record honestly with a retry note.
+				// name and the stage is still dispatchable (pending) — a
+				// crash-resume. Re-record honestly with a retry note.
 				note = "retry"
 			}
 			if _, rerr := r.api.RecordAutoDriveAct(ctx, runUUID, RecordAutoDriveAct{
