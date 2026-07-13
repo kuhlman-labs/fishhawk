@@ -265,6 +265,113 @@ func TestReapStageFailure_ConcurrentTerminalRace(t *testing.T) {
 	}
 }
 
+// (b3) Protected-park no-op (#1891): a report against an awaiting_children stage
+// is a benign no-op — that state is a live decomposition park owned by its
+// children, and failing it would destroy the fan-in park a doomed mis-dispatched
+// runner never owned. 200 {transitioned:false}, stage unchanged, NO audit, NO
+// advance.
+func TestReapStageFailure_AwaitingChildrenNoOp(t *testing.T) {
+	s, rr, au, runID, stageID := reapServer(t, run.StageStateAwaitingChildren)
+
+	w := postReapFailure(t, s, runID, stageID,
+		reapFailureRequest{Category: "C", Reason: "doomed spawn against a decomposed parent"},
+		withReapOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp reapFailureResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Transitioned {
+		t.Error("transitioned = true, want false for an awaiting_children park")
+	}
+	if resp.StageState != string(run.StageStateAwaitingChildren) {
+		t.Errorf("stage_state = %q, want awaiting_children (unchanged)", resp.StageState)
+	}
+	// No audit entry: the park was preserved, nothing failed.
+	if got := reapAudit(au); len(got) != 0 {
+		t.Errorf("dispatch_reaper_failed entries = %d, want 0 (park preserved)", len(got))
+	}
+	// Advance NOT invoked: the run and stage are untouched.
+	cur, _ := rr.GetStage(context.Background(), stageID)
+	if cur.State != run.StageStateAwaitingChildren {
+		t.Errorf("stage state = %q, want awaiting_children (park preserved)", cur.State)
+	}
+	curRun, _ := rr.GetRun(context.Background(), runID)
+	if curRun.State != run.StateRunning {
+		t.Errorf("run state = %q, want running (Advance not invoked)", curRun.State)
+	}
+}
+
+// parkRaceReapRepo models the concurrent-fanout race: a report passes the
+// non-terminal, non-awaiting_children pre-check, but by the time FailStage
+// attempts its transition a concurrent fanout has PARKED the stage
+// awaiting_children. It flips the target stage to awaiting_children on the first
+// TransitionStage attempt, then delegates — so the embedded repo refuses the
+// move (awaiting_children → running is not a valid edge) exactly as the real
+// repo would, driving the handler's post-FailStage re-load branch.
+type parkRaceReapRepo struct {
+	*orchestratorRepo
+	stageID uuid.UUID
+	flipped bool
+}
+
+func (r *parkRaceReapRepo) TransitionStage(ctx context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	if !r.flipped && id == r.stageID {
+		r.flipped = true
+		r.mu.Lock()
+		if st := r.stagesByID[id]; st != nil {
+			st.State = run.StageStateAwaitingChildren // a concurrent fanout parked it
+		}
+		r.mu.Unlock()
+	}
+	return r.orchestratorRepo.TransitionStage(ctx, id, to, c)
+}
+
+// (b4) Post-FailStage park race: the pre-check sees a dispatched (non-terminal,
+// non-park) stage, but a concurrent fanout parks it awaiting_children before
+// FailStage's transition lands. The re-load must return the benign
+// {transitioned:false} no-op — NOT a 500 and NOT a destroyed park — with NO
+// audit entry and NO advance.
+func TestReapStageFailure_ConcurrentParkRace(t *testing.T) {
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched)
+	race := &parkRaceReapRepo{orchestratorRepo: rr, stageID: stage.ID}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      race,
+		AuditRepo:    au,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+
+	w := postReapFailure(t, s, runRow.ID, stage.ID,
+		reapFailureRequest{Category: "C", Reason: "raced by a fanout park"}, withReapOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (benign no-op, not 500):\n%s", w.Code, w.Body.String())
+	}
+	var resp reapFailureResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Transitioned {
+		t.Error("transitioned = true, want false for a stage parked by a concurrent fanout")
+	}
+	if resp.StageState != string(run.StageStateAwaitingChildren) {
+		t.Errorf("stage_state = %q, want awaiting_children (the fanout's park)", resp.StageState)
+	}
+	if got := reapAudit(au); len(got) != 0 {
+		t.Errorf("dispatch_reaper_failed entries = %d, want 0 (park preserved)", len(got))
+	}
+	// The park survived: the stage was not failed out from under the fanout.
+	cur, _ := rr.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateAwaitingChildren {
+		t.Errorf("stage state = %q, want awaiting_children (park preserved, not failed)", cur.State)
+	}
+}
+
 // (c) Invalid category (A) → 400. An empty category is covered by the sub-test.
 func TestReapStageFailure_InvalidCategory(t *testing.T) {
 	for _, cat := range []string{"A", ""} {

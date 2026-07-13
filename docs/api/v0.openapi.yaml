@@ -4702,6 +4702,17 @@ paths:
         stuck stage) is a benign no-op: 200 with `transitioned: false`, NO
         audit entry, and NO advance.
 
+        **Protected `awaiting_children` park (#1891).** A report against a
+        stage in `awaiting_children` is the SAME benign no-op (200,
+        `transitioned: false`, no audit entry, no advance). That state is a
+        live decomposition park owned by its child slices; a doomed runner
+        mis-dispatched against a decomposed parent's implement stage would
+        otherwise let its spawn-failure report destroy the fan-in park
+        (`awaiting_children → failed` is a legal sweeper edge). The same no-op
+        also covers the race where a concurrent fanout parks the stage
+        `awaiting_children` after the pre-check but before the fail transition
+        lands.
+
         **Authorization.** Requires an authenticated identity carrying
         `write:runs` (anonymous → 401; a token without the scope → 403). The
         operator/MCP token that drives dispatch already carries it.
@@ -4749,7 +4760,8 @@ paths:
           description: |
             The report was recorded. `transitioned` is `true` when this call
             drove the stage to `failed`, `false` on the idempotent
-            already-terminal no-op.
+            already-terminal no-op or the protected `awaiting_children`
+            decomposition-park no-op (#1891).
           content:
             application/json:
               schema:
@@ -7836,6 +7848,16 @@ paths:
           stage (typically `dispatched`). Orchestrator failures are
           logged but don't fail the request — the stage stays at
           pending and an operator can re-fire Advance manually.
+        - **A** / **C on a decomposed PARENT** (#1891): when the retried
+          stage is an implement stage whose run is a decomposition parent
+          (it has children), the target is `awaiting_children` instead of
+          `pending` — restoring the fan-in park so the childcompletion
+          sweeper and `POST /v0/runs/{run_id}/consolidate` re-engage,
+          rather than spawning a doomed runner. NO orchestrator dispatch
+          handoff fires (that is gated on the pending re-open); the run is
+          still un-terminalled (failed → running) so the sweeper's later
+          advance is effective. Returns 200 with the stage in
+          `awaiting_children`.
         - **D, gate-rejected**: 422 (`retry_not_applicable`) — the
           approver said no; create a fresh run instead.
         - **B**: 422 (`retry_not_applicable`) — the workflow or spec

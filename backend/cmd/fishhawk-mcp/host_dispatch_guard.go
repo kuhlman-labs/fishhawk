@@ -73,6 +73,11 @@ func (r *runResolver) guardHostDispatch(ctx context.Context, runUUID uuid.UUID) 
 //     shipping.
 //   - The TARGET stage itself in "running": BLOCK — a live runner already owns
 //     it; a second spawn would double-drive the stage.
+//   - The TARGET stage itself in "awaiting_children" (#1891): BLOCK — it is a
+//     decomposed parent's implement stage parked on its child slices. Spawning
+//     a runner here 409s (stage_not_runnable) and the reaper report would
+//     destroy the park; the error names fishhawk_run_children /
+//     fishhawk_consolidate_slices as the correct verbs.
 //   - The target stage merely "dispatched" with every sibling settled: ALLOW —
 //     this is the local retry/fixup park-then-spawn state (retry_stage /
 //     fixup_stage park the stage as "dispatched" for a host-side re-dispatch);
@@ -97,6 +102,18 @@ func (r *runResolver) guardSiblingStageInFlight(ctx context.Context, runUUID uui
 	for _, s := range stages {
 		inFlight := s.State == "dispatched" || s.State == "running"
 		if s.ID == targetStageID {
+			// A target parked "awaiting_children" is a decomposed parent's
+			// implement stage waiting on its child slices (#1891). Spawning a
+			// runner here produces a doomed prompt-fetch (409 stage_not_runnable),
+			// and the detached reaper's spawn-failure report would then destroy
+			// the park (awaiting_children → failed is a legal sweeper edge). Refuse
+			// synchronously and name the correct verbs. The server-side reap no-op
+			// is the fail-closed backstop if this guard is ever skipped.
+			if s.State == "awaiting_children" {
+				return nil, fmt.Errorf(
+					"stage %s (%s) is a decomposed parent's implement stage parked awaiting_children for run %s — its child slices own it. Dispatching a runner here produces a doomed prompt fetch (409 stage_not_runnable) whose failure report would destroy the park. Use fishhawk_run_children to dispatch the child slices, then fishhawk_consolidate_slices for the final fan-in",
+					s.ID, s.Type, runUUID)
+			}
 			// The target's own "dispatched" park state is the retry/fixup
 			// re-dispatch case — allow it. Only a live "running" target blocks.
 			if s.State == "running" {

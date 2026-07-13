@@ -3200,6 +3200,36 @@ func computeDiffNumstat(ctx context.Context, baseRef, repoDir string, logSink io
 	return parseDiffNumstat(string(out))
 }
 
+// childPushFilesChanged computes a decomposed child's child-push
+// files_changed_count against the pushed commit's OWN recorded base
+// (capBaseSHA — the exact value shipped as base_sha in the SAME child_pushed
+// report), NOT the workflow base-branch label baseRef. The base-branch label
+// can advance past this slice's cut point (a sibling slice's consolidation
+// lands new commits on it), so diffing the child's index against it counts the
+// base's own orthogonal files as phantom deletions — the #1891 wrong-count
+// symptom. capBaseSHA is the slice's cut point by construction, so the count is
+// self-consistent with the reported base_sha. Falls back to baseRef only when
+// capBaseSHA is empty (not expected on the push path).
+//
+// Best-effort: files_changed_count is advisory (not load-bearing for the stage
+// transition), so a diff failure returns 0 and emits a
+// child_push_files_changed_unavailable event naming the base used, so a wrong
+// count is diagnosable rather than silently discarded.
+func childPushFilesChanged(ctx context.Context, capBaseSHA, baseRef, repoDir, runID, stageID string, logSink io.Writer) int {
+	diffBase := capBaseSHA
+	if diffBase == "" {
+		diffBase = baseRef
+	}
+	d, err := (&gitdiff.Runner{}).Run(ctx, diffBase, repoDir)
+	if err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"child_push_files_changed_unavailable","run_id":%q,"stage_id":%q,"base":%q,"detail":%q}`+"\n",
+			runID, stageID, diffBase, err.Error())
+		return 0
+	}
+	return len(d.ChangedFiles)
+}
+
 // parseDiffNumstat parses `git diff --numstat` output and sums insertions
 // and deletions across all rows, skipping binary-file rows where either
 // column is '-'. Mirrors the backend's parseNumstat shape
@@ -5924,17 +5954,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// artifact). A report error is category-C (network) and is surfaced
 		// like the success ShipPullRequest error below so the failure path
 		// reports it.
-		filesChanged := 0
-		if d, err := (&gitdiff.Runner{}).Run(ctx, baseRef, repoDir); err == nil {
-			filesChanged = len(d.ChangedFiles)
-		} else {
-			// Informational only: files_changed_count is not load-bearing for
-			// the stage transition. Log rather than silently discard so a diff
-			// failure here is observable.
-			_, _ = fmt.Fprintf(logSink,
-				`{"event":"child_push_files_changed_unavailable","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
-				cfg.runID, cfg.stageID, err.Error())
-		}
+		filesChanged := childPushFilesChanged(ctx, cap.BaseSHA, baseRef, repoDir, cfg.runID, cfg.stageID, logSink)
 		if _, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
 			RunID:             cfg.runID,
 			StageID:           cfg.stageID,

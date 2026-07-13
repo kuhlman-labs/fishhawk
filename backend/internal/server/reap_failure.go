@@ -65,7 +65,10 @@ type reapFailureResponse struct {
 // best-effort logging order.
 //
 // Idempotent: a report against an already-terminal stage is a benign no-op
-// (200 {transitioned:false}) with NO audit entry and NO advance.
+// (200 {transitioned:false}) with NO audit entry and NO advance. A report
+// against an awaiting_children stage is the same benign no-op (#1891): that
+// state is a live decomposition park owned by its children, and failing it
+// would destroy the fan-in park a doomed mis-dispatched runner never owned.
 func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "reap_failure_unconfigured",
@@ -182,6 +185,24 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Protected-park no-op (#1891): a stage in awaiting_children is a LIVE
+	// decomposition park owned by its child slices, not a stuck spawn. A
+	// spawn-phase failure report can reach here when a runner is (mis-)dispatched
+	// against a decomposed parent's implement stage — the doomed runner 409s on
+	// prompt fetch and its detached reaper reports the exit. Failing the stage
+	// here would destroy the park (awaiting_children → failed is a legal sweeper
+	// edge), suppressing fan-in forever. Treat it exactly like the already-terminal
+	// no-op: 200 {transitioned:false}, NO FailStage, NO dispatch_reaper_failed
+	// audit entry, NO orchestrator advance. This is the fail-closed backstop that
+	// holds even if the MCP admission guard (guardSiblingStageInFlight) is skipped.
+	if stage.State == run.StageStateAwaitingChildren {
+		s.writeJSON(w, r, http.StatusOK, reapFailureResponse{
+			Transitioned: false,
+			StageState:   string(stage.State),
+		})
+		return
+	}
+
 	// Fail the stage → append the dispatch_reaper_failed audit entry → advance
 	// the run, in the exact order and with the exact best-effort logging the
 	// dispatch watchdog uses (dispatchwatchdog.go). FailStage walks the canonical
@@ -197,7 +218,12 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 		// winner already did the work, so return the SAME benign
 		// {transitioned:false} no-op the pre-check returns — no audit entry, no
 		// advance. Only a genuine failure (stage still non-terminal) is a 500.
-		if cur, gerr := s.cfg.RunRepo.GetStage(r.Context(), stageID); gerr == nil && cur.State.IsTerminal() {
+		// A concurrent fanout can also PARK the stage awaiting_children in this
+		// window (the decomposed-parent race): the re-loaded stage is then a live
+		// park, not a stuck spawn, so return the same benign no-op rather than a
+		// 500 — never fail a restored/live park (#1891).
+		if cur, gerr := s.cfg.RunRepo.GetStage(r.Context(), stageID); gerr == nil &&
+			(cur.State.IsTerminal() || cur.State == run.StageStateAwaitingChildren) {
 			s.writeJSON(w, r, http.StatusOK, reapFailureResponse{
 				Transitioned: false,
 				StageState:   string(cur.State),

@@ -98,7 +98,12 @@ func (r *policyRunRepo) GetRunByIdempotencyKey(context.Context, string, string) 
 	return nil, run.ErrNotFound
 }
 func (r *policyRunRepo) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
-	return nil, errors.New("not used")
+	// (nil, nil) = the run has no decomposition children, so run.RetryStage's
+	// decomposed-parent detection (#1891) treats a failed implement stage as a
+	// standalone retry (→ pending), not an awaiting_children restore. Returning
+	// an error here would fail the retry closed (the fail-closed detection
+	// path), breaking the category-C retryability seam this file asserts.
+	return nil, nil
 }
 func (r *policyRunRepo) TransitionRun(context.Context, uuid.UUID, run.State) (*run.Run, error) {
 	return nil, errors.New("not used")

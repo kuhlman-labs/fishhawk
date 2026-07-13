@@ -309,6 +309,84 @@ func TestRetryStage_AReopensRunAndAdvancesToReview(t *testing.T) {
 	}
 }
 
+// TestRetryStage_DecomposedParentRestoresAwaitingChildren is the #1891
+// cross-boundary seam test: retrying a failed implement stage whose run is a
+// decomposition PARENT (it has a child run) crosses the HTTP handler →
+// run.RetryStage → repository layers and must restore the fan-in park
+// (awaiting_children), NOT re-open to pending and fire a runner dispatch. It
+// asserts (a) the 200 response state is awaiting_children, (b) the run reopened
+// failed → running (so the sweeper's later Advance is not a terminal no-op),
+// (c) NO orchestrator dispatch handoff fired — the stage stayed awaiting_children
+// rather than advancing to dispatched (the handoff is gated on a pending
+// re-open), and (d) the stage_retried audit row landed.
+func TestRetryStage_DecomposedParentRestoresAwaitingChildren(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.State = run.StateFailed // the decomposed parent resolved terminal-failed
+
+	implement := rr.seedStage(r.ID, 0, run.StageStateFailed)
+	implement.Type = run.StageTypeImplement
+	cat := run.FailureC
+	reason := "dispatch_watchdog: 70m elapsed (deadline 60m)"
+	implement.FailureCategory = &cat
+	implement.FailureReason = &reason
+
+	// A child run makes this run a decomposition parent (ListRuns on
+	// DecomposedFrom returns ≥1). Seed it directly into the repo.
+	childID := uuid.New()
+	rr.mu.Lock()
+	rr.runs[childID] = &run.Run{ID: childID, Repo: "x/y", State: run.StateSucceeded, DecomposedFrom: &r.ID}
+	rr.mu.Unlock()
+
+	au := newApprovalAuditFake()
+	o := &orchestrator.Orchestrator{Runs: rr} // wired: proves the dispatch handoff is NOT taken
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: o,
+	})
+
+	w := postRetry(t, s, implement.ID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// (a) Response state is the restored fan-in park.
+	var body stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.State != string(run.StageStateAwaitingChildren) {
+		t.Errorf("body.State = %q, want awaiting_children (decomposed-parent restore)", body.State)
+	}
+
+	// (b) Run reopened failed → running.
+	gotRun, err := rr.GetRun(context.Background(), r.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if gotRun.State != run.StateRunning {
+		t.Errorf("run state = %q, want running (reopened for the sweeper's later Advance)", gotRun.State)
+	}
+
+	// (c) No orchestrator dispatch handoff fired: the stage stayed
+	// awaiting_children, not dispatched (the handoff is gated on a pending
+	// re-open, which the decomposed-parent restore intentionally skips).
+	gotStage, err := rr.GetStage(context.Background(), implement.ID)
+	if err != nil {
+		t.Fatalf("get stage: %v", err)
+	}
+	if gotStage.State != run.StageStateAwaitingChildren {
+		t.Errorf("stage state = %q, want awaiting_children (no dispatch handoff)", gotStage.State)
+	}
+
+	// (d) The stage_retried audit row landed.
+	if len(au.appended) != 1 || au.appended[0].Category != CategoryStageRetried {
+		t.Fatalf("audit chain = %+v, want one stage_retried entry", au.appended)
+	}
+}
+
 // retryRunSpy wraps orchestratorRepo to count RetryRun invocations and
 // optionally force an error from it. The call count lets the guard tests
 // distinguish "the State == failed guard prevented the RetryRun call"
