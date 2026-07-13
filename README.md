@@ -93,6 +93,89 @@ Per-component details live in each subdirectory's README:
 | Verifier | [`verifier/README.md`](verifier/README.md) — `fishhawk-verify` against an exported audit log |
 | Infrastructure | [`infra/terraform/README.md`](infra/terraform/README.md) — bootstrap, dev vs prod profiles, CI deploy flow |
 
+## Defining a workflow
+
+Fishhawk reads `.fishhawk/workflows.yaml` from the repository it governs. `fishhawk init` scaffolds one from an autonomy preset (`--preset low|medium|high`, default `medium` — see [`docs/spec/workflow-preset.md`](docs/spec/workflow-preset.md)), and `fishhawk validate` checks it against the workflow schema. A trimmed version of the medium preset, showing the plan → implement → review shape most work uses:
+
+```yaml
+version: "1.0"
+
+workflows:
+  feature_change:
+    description: >-
+      Default workflow for feature work. Human approves the plan and the
+      PR; the agent does the implementation.
+    drive: true                    # fishhawkd auto-advances mechanical transitions
+    operator_agent:                # what the operator agent may decide alone
+      may_approve: clean_dual_approval
+      may_route_fixup: convergent_concerns
+      may_retry: infra_flake
+      must_page_human: [reviewer_reject, plan_rejection, scope_amendment]
+    on_ci_failure:
+      max_retries: 1
+
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:                 # advisory agent review before the human gate
+          agents:
+            - provider: claudecode
+              model: claude-opus-4-8
+          human: 1
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval         # one approval, not the author or an agent
+            approvals:
+              count: 1
+              not: [author, agent]
+
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          verify:                  # run your test entrypoint before the PR opens
+            command: "make test"
+            timeout: "15m"
+            max_iterations: 1
+        inputs:
+          - artifact: plan
+            from_stage: plan
+        produces:
+          - artifact: pull_request
+        constraints:               # enforced on the implementation, not advisory
+          - max_files_changed: 45
+          - forbidden_paths: [".github/workflows/**", ".fishhawk/**"]
+          - required_outcomes: [tests_added_or_updated, ci_green]
+
+      - id: review
+        type: review
+        executor:
+          human: true
+        inputs:
+          - artifact: pull_request
+            from_stage: implement
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              not: [author, agent]
+```
+
+This document validates as-is (`fishhawk validate`). The full preset adds budgets, a second heterogeneous reviewer, and runtime policy; this repository's own [`.fishhawk/workflows.yaml`](.fishhawk/workflows.yaml) is the fuller real-world reference, including an acceptance stage and a delegating deploy workflow. The schema and field reference live in [`docs/spec/`](docs/spec/).
+
+### The operator contract
+
+A run is a negotiation between two parties: agents propose (a plan, a diff), and an **operator** decides at each gate — approve or reject the plan, route review concerns back as a fix-up, approve and merge the PR. The `operator_agent` block above delegates the mechanical share of that role to an operator agent under named conditions: approve on a clean dual approval, route convergent review concerns to a fix-up, retry an infrastructure flake. Everything listed in `must_page_human` — and merging — stays with a person.
+
+The operator's behavioral contract (gate procedures, escalation posture, prohibitions) ships with the product as `operator-role-v0` — see [`docs/spec/operator-role.md`](docs/spec/operator-role.md) and the shipped default [`docs/spec/operator-role-default.yaml`](docs/spec/operator-role-default.yaml). A repository does not write its own role spec; it may add a thin overlay at `.fishhawk/operator.yaml` for local conventions (merge ritual specifics, escalation contacts). Authority stays in the workflow's `operator_agent` knobs.
+
 ## Following along
 
 Watch the repository. Substantive changes land as PRs against `main`, each opened by Fishhawk and stamped with its workflow run and stage IDs.
