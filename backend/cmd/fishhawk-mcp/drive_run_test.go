@@ -1125,6 +1125,27 @@ func TestDriveRun_ResumeDispatchedStale_StopsDistinct(t *testing.T) {
 	if out.NextActions.Actions[0].Action != "fishhawk_dispatch_stage" {
 		t.Errorf("next_actions[0] = %q, want fishhawk_dispatch_stage", out.NextActions.Actions[0].Action)
 	}
+	// #1924: the stale-stop message must no longer assert the unprobed "no
+	// runner appears live" fact, and must instruct the operator to verify
+	// runner-process liveness FIRST before any manual re-dispatch.
+	assertDispatchedStaleWarning(t, out.Warnings)
+}
+
+// assertDispatchedStaleWarning pins the #1924-revised dispatched_stale stop
+// message contract behaviorally: it drops the unprobed "no runner appears
+// live" assertion and instructs the operator to verify runner-process
+// liveness (pgrep / the dispatch log_path) before re-dispatching by hand.
+func assertDispatchedStaleWarning(t *testing.T, warnings []string) {
+	t.Helper()
+	joined := strings.Join(warnings, "\n")
+	if strings.Contains(joined, "no runner appears live") {
+		t.Errorf("dispatched_stale warning still asserts the unprobed 'no runner appears live' fact:\n%s", joined)
+	}
+	for _, want := range []string{"pgrep -f fishhawk-runner", "log_path", "flipped it to 'running'"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("dispatched_stale warning missing %q (verify-liveness-first instruction):\n%s", want, joined)
+		}
+	}
 }
 
 // --- (t5) cross-invocation fixup re-open -> fixup_redispatch attribution -----
@@ -1291,6 +1312,7 @@ func TestDriveRun_ResumeDispatchedStale_MidInvocation_StopsDistinct(t *testing.T
 	if out.NextActions.Actions[0].Action != "fishhawk_dispatch_stage" {
 		t.Errorf("next_actions[0] = %q, want fishhawk_dispatch_stage", out.NextActions.Actions[0].Action)
 	}
+	assertDispatchedStaleWarning(t, out.Warnings)
 }
 
 // --- (t6) context cancelled -> distinct context_cancelled stop --------------

@@ -721,6 +721,16 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Liveness flip (#1924): a valid signature proves a runner holding
+	// THIS run's signing key is fetching THIS stage's prompt, and that
+	// fetch lands within seconds of spawn — so it is the earliest
+	// authenticated proof a runner is alive. Flip a 'dispatched' stage to
+	// 'running' now, before prompt construction, giving runner_kind:local
+	// the real-time dispatched→running signal it otherwise lacks until
+	// trace upload at settle. Best-effort: a flip failure logs and never
+	// blocks the prompt response.
+	s.markStageRunningOnPromptFetch(r.Context(), stage)
+
 	// Build the trigger context. For issue-style triggers we fetch
 	// the issue from GitHub at request time so the prompt reflects
 	// the latest title/body — the cost is one API call per stage
@@ -1057,6 +1067,56 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		resp.AcceptanceExpectedHeadSHA = s.resolveAcceptanceExpectedHeadSHA(r.Context(), runRow.ID, stage.ID)
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// markStageRunningOnPromptFetch gives runner_kind:local a real-time
+// dispatched→running liveness signal (#1924). Today nothing flips a local
+// stage into 'running' until trace upload at settle (trace.go
+// advanceStageAfterTrace), so every local implement stage sits in
+// 'dispatched' for its entire runtime and fishhawk_drive_run's
+// dispatched_stale detector deterministically false-stales any healthy
+// implement past its liveness threshold. The signed prompt fetch that
+// drives this call is authenticated by the per-run signing key with a
+// stage-bound message and lands within seconds of spawn, so it is proof a
+// runner for THIS stage is alive.
+//
+// The flip is best-effort and must never unwind the load-bearing prompt
+// response: every failure path logs at warn and returns. It fires ONLY on
+// an observed 'dispatched' state:
+//
+//   - 'pending' is left untouched to preserve the #1030 local first-stage
+//     semantics (advanceStageAfterTrace owns the pending→dispatched walk).
+//   - a 'running' replay re-fetch is a no-op by the state guard.
+//   - every other runnable state the prompt endpoint admits
+//     (awaiting_input, awaiting_scope_decision) is left untouched, so a
+//     legitimately-parked stage is never advanced.
+//
+// It anchors on 'dispatched' via the run.StageCASTransitioner capability
+// (mirroring run.failStageCAS) so a concurrent advance — a scope park, a
+// reap, any other writer — refuses atomically with StageStateChangedError
+// instead of being stomped; the park's legal →running edge can never be
+// collapsed. Repos without the capability (in-memory fakes) fall back to
+// plain TransitionStage, still guarded on the observed dispatched state. As
+// a side effect the repo sets started_at at real start time on this first
+// →running transition (postgres.go), improving duration accuracy.
+func (s *Server) markStageRunningOnPromptFetch(ctx context.Context, stage *run.Stage) {
+	if stage.State != run.StageStateDispatched {
+		return
+	}
+	var err error
+	if cas, ok := s.cfg.RunRepo.(run.StageCASTransitioner); ok {
+		_, err = cas.TransitionStageFrom(ctx, stage.ID,
+			run.StageStateDispatched, run.StageStateRunning, nil)
+	} else {
+		_, err = s.cfg.RunRepo.TransitionStage(ctx, stage.ID, run.StageStateRunning, nil)
+	}
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt-fetch dispatched→running liveness flip failed (advisory; prompt still served)",
+			slog.String("run_id", stage.RunID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+	}
 }
 
 // handleGetStagePromptRender implements GET /v0/stages/{stage_id}/prompt-render.
