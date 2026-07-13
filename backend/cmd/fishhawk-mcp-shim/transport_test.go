@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -43,6 +44,15 @@ func TestFakeChildProcess(t *testing.T) {
 				} else {
 					if mode == "crash_on_call" {
 						os.Exit(1)
+					}
+					if mode == "leak_grandchild" {
+						// Spawn a grandchild that INHERITS stdout and outlives us,
+						// then exit. The grandchild keeps the stdout write end open,
+						// so an exit signal gated on stdout EOF would never fire.
+						gc := exec.Command("sleep", "5")
+						gc.Stdout = os.Stdout
+						_ = gc.Start()
+						os.Exit(0)
 					}
 					fmt.Printf(`{"jsonrpc":"2.0","id":%s,"result":{"marker":"%s"}}`+"\n", idRaw, marker)
 				}
@@ -193,6 +203,43 @@ func TestTerminateEscalatesToSIGKILL(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("SIGTERM-ignoring child was not reaped by the SIGKILL escalation")
 	}
+}
+
+// TestExitFiresDespiteGrandchildHoldingStdout pins that the direct child's exit
+// is reported off cmd.Wait, NOT stdout EOF: the child spawns a grandchild that
+// inherits the stdout write end and outlives it, then exits. Exited must still
+// fire — a readLoop gated on pipe EOF would hang until the grandchild died,
+// masking the crash and starving orphan recovery.
+func TestExitFiresDespiteGrandchildHoldingStdout(t *testing.T) {
+	dir := t.TempDir()
+	childPath := filepath.Join(dir, "child.sh")
+	writeChildScript(t, childPath, "A", "leak_grandchild")
+
+	c := newStdioChild(childPath, io.Discard)
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	// Drive the handshake so the child is up.
+	if err := c.Send([]byte(initReq1 + "\n")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	select {
+	case <-c.Frames():
+	case <-time.After(5 * time.Second):
+		t.Fatal("no init response from child")
+	}
+
+	// This call makes the child spawn a stdout-holding grandchild and exit.
+	if err := c.Send([]byte(`{"jsonrpc":"2.0","method":"tools/call","id":2}` + "\n")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	select {
+	case <-c.Exited():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Exited did not fire; a grandchild holding stdout masked the direct child's exit")
+	}
+	// Reap the lingering grandchild via the process-group SIGKILL escalation.
+	c.Terminate(100 * time.Millisecond)
 }
 
 // TestEndToEndCrashRespawnRealChild pins child-crash respawn over real pipes:

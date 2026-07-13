@@ -202,8 +202,30 @@ func (s *supervisor) doSwap(ctx context.Context) {
 	s.pendingSwapHash = nil
 	s.quiesceExpired = false
 	s.logf("child content changed; quiesced at 0 in-flight, swapping")
-	s.child.Terminate(s.grace)
+	old := s.child
+	old.Terminate(s.grace)
+	// Keep draining the terminating child's frames until it exits. A child that
+	// stays chatty between quiesce and process death would otherwise wedge its
+	// readLoop on the full (256) Frames buffer, leaking the goroutine and an
+	// unreaped process. Draining to exit makes that structurally impossible.
+	s.drainOldChild(old)
 	s.spawnAndReplay(ctx, newHash)
+}
+
+// drainOldChild discards frames from a terminated child until it exits, so a
+// child that keeps emitting frames after Terminate cannot block its readLoop on
+// a full Frames() buffer. It runs in the background and returns once Exited
+// fires (Frames() is never closed — Exited is the authoritative death signal).
+func (*supervisor) drainOldChild(c childTransport) {
+	go func() {
+		for {
+			select {
+			case <-c.Frames():
+			case <-c.Exited():
+				return
+			}
+		}
+	}()
 }
 
 // handleCrash reacts to the child exiting without a shim-initiated terminate.
@@ -252,16 +274,28 @@ func (s *supervisor) handleCrash(ctx context.Context, err error) {
 //     notifications/initialized, then synthesize notifications/tools/list_changed
 //     upstream.
 func (s *supervisor) spawnAndReplay(ctx context.Context, newHash []byte) {
-	nc := s.newChild()
-	if err := nc.Start(ctx); err != nil {
+	// Retry Start in a bounded-stack LOOP rather than self-recursion: a
+	// persistently missing or unexecutable child would otherwise recurse one
+	// stack frame per backoff interval and eventually exhaust the stack. Backoff
+	// is capped; the loop exits as soon as a Start succeeds (or ctx is cancelled).
+	var nc childTransport
+	for {
+		nc = s.newChild()
+		err := nc.Start(ctx)
+		if err == nil {
+			break
+		}
 		s.logf("respawn start failed: %v; retrying after backoff", err)
 		s.sleep(s.backoffCur)
 		s.backoffCur *= 2
 		if s.backoffCur > backoffMax {
 			s.backoffCur = backoffMax
 		}
-		s.spawnAndReplay(ctx, newHash)
-		return
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 	}
 	s.child = nc
 	s.lastSpawnAt = s.now()

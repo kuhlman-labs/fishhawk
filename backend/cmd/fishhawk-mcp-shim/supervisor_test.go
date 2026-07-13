@@ -18,6 +18,7 @@ type fakeChild struct {
 	marker      string
 	hash        []byte
 	autoRespond bool
+	failStart   bool // when set, Start returns an error instead of launching
 
 	frames chan []byte
 	exited chan error
@@ -40,8 +41,11 @@ func newFake(marker string, autoRespond bool) *fakeChild {
 
 func (f *fakeChild) Start(ctx context.Context) error {
 	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failStart {
+		return errors.New("start failed: " + f.marker)
+	}
 	f.started = true
-	f.mu.Unlock()
 	return nil
 }
 
@@ -269,32 +273,67 @@ func TestPassthroughByteVerbatimBothWays(t *testing.T) {
 // --- swap admission barrier (condition 1) ---
 
 func TestSwapBuffersFramesUntilNewChildReady(t *testing.T) {
-	child0 := newFake("A", true)
-	child1 := newFake("B", true)
+	child0 := newFake("A", false) // manual, so we control in-flight timing
+	child1 := newFake("B", true)  // NEW child auto-answers
 	h := newHarness(t, child0, child1)
 	h.start()
 
-	h.handshake() // handshakeDone; in-flight == 0
+	// Manual handshake.
+	h.send(initReq1)
+	child0.pushFrame(`{"jsonrpc":"2.0","id":1,"result":{}}` + "\n")
+	if r := h.expect(); !strings.Contains(r, `"id":1`) {
+		t.Fatalf("init: %q", r)
+	}
 
-	// Trigger the swap. maybeSwap runs doSwap synchronously; the loop does not
-	// read clientIn during the swap, so a frame sent now waits in the channel.
+	// Put a request in flight so the swap enters active quiesce and the event
+	// loop stops reading clientIn.
+	h.send(`{"jsonrpc":"2.0","method":"tools/call","id":9}`)
+	// Trigger the swap: it blocks in quiesce (id 9 outstanding) and will not read
+	// clientIn until the whole swap/replay completes.
 	h.triggerSwap("hash-B")
-	// This send blocks until the swap completes and the loop reads clientIn —
-	// which is exactly the admission barrier.
-	go h.send(`{"jsonrpc":"2.0","method":"tools/call","id":2}`)
 
-	// First the synthesized list_changed (end of the replayed handshake)...
+	// With the loop parked in quiesce, THIS client frame is now provably pending
+	// in clientIn BEFORE the swap begins — the send cannot be read until the swap
+	// finishes. A missing admission barrier would forward it to the terminating
+	// child0 (or answer it before list_changed); the assertions below reject both.
+	frameArrived := make(chan struct{})
+	go func() {
+		h.send(`{"jsonrpc":"2.0","method":"tools/call","id":2}`)
+		close(frameArrived)
+	}()
+
+	// The mid-swap frame must stay blocked while the swap is pending.
+	select {
+	case <-frameArrived:
+		t.Fatal("mid-swap client frame was read before the swap completed (no admission barrier)")
+	case <-time.After(100 * time.Millisecond):
+	}
+	// It must NOT have leaked to the terminating child mid-swap either.
+	for _, f := range child0.sentFrames() {
+		if strings.Contains(f, `"id":2`) {
+			t.Fatalf("client frame leaked to the terminating child during swap: %q", f)
+		}
+	}
+
+	// Complete the in-flight request → quiesce ends → doSwap → replay.
+	child0.pushFrame(`{"jsonrpc":"2.0","id":9,"result":{"marker":"A"}}` + "\n")
+	if r := h.expect(); !strings.Contains(r, `"id":9`) {
+		t.Fatalf("expected the in-flight response to flow, got %q", r)
+	}
+	// End of the replayed handshake.
 	lc := h.expect()
 	if !strings.Contains(lc, "notifications/tools/list_changed") {
 		t.Fatalf("expected list_changed after swap, got %q", lc)
 	}
-	// ...then the mid-swap request, answered by the NEW child (marker B).
+	// Only now is the buffered mid-swap frame flushed to the NEW child (marker B),
+	// after the replayed handshake — ordering preserved.
+	<-frameArrived
 	resp := h.expect()
 	if !strings.Contains(resp, `"marker":"B"`) || !strings.Contains(resp, `"id":2`) {
 		t.Fatalf("mid-swap request must be answered by the NEW child, got %q", resp)
 	}
 
-	// The terminating (old) child must NEVER have received the client frame.
+	// The terminating (old) child must NEVER have received the mid-swap frame.
 	for _, f := range child0.sentFrames() {
 		if strings.Contains(f, `"id":2`) {
 			t.Fatalf("client frame leaked to the terminating child: %q", f)
@@ -472,6 +511,75 @@ func TestCrashRespawnOrphansAndBacksOff(t *testing.T) {
 	if slept[0] != backoffBase {
 		t.Fatalf("first backoff should be the base %s, got %s", backoffBase, slept[0])
 	}
+}
+
+// --- respawn retries a bounded loop on Start failure (no unbounded recursion) ---
+
+func TestRespawnRetriesOnStartFailure(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", true)
+	child2 := newFake("C", true)
+	child3 := newFake("D", true)
+	// The first two respawn attempts fail to Start; the third launches.
+	child1.failStart = true
+	child2.failStart = true
+	h := newHarness(t, child0, child1, child2, child3)
+
+	var mu sync.Mutex
+	var sleeps int
+	h.sup.sleep = func(time.Duration) {
+		mu.Lock()
+		sleeps++
+		mu.Unlock()
+	}
+	h.start()
+
+	// Handshake, then crash the child. The respawn must retry Start in a loop
+	// (not self-recursion) until child3 launches and re-establishes the session.
+	h.send(initReq1)
+	child0.pushFrame(`{"jsonrpc":"2.0","id":1,"result":{}}` + "\n")
+	h.expect()
+	child0.crash(errors.New("boom"))
+
+	lc := h.expect()
+	if !strings.Contains(lc, "notifications/tools/list_changed") {
+		t.Fatalf("expected list_changed once a respawn finally starts, got %q", lc)
+	}
+	if len(child3.sentFrames()) == 0 {
+		t.Fatal("the child that finally started should have received the replayed handshake")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	// One backoff from handleCrash + one per failed Start (2) = at least 3.
+	if sleeps < 3 {
+		t.Fatalf("expected retry-on-start-failure backoff sleeps, got %d", sleeps)
+	}
+}
+
+// --- the terminating child's frames are drained so a chatty child cannot wedge ---
+
+func TestDrainOldChildConsumesChattyFrames(t *testing.T) {
+	c := newFake("old", false)
+	sup := &supervisor{}
+
+	// A child that stays chatty after the swap emits far more than the 256-frame
+	// buffer. Without draining, the 257th send blocks forever and leaks readLoop.
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 512; i++ {
+			c.frames <- []byte("noise\n")
+		}
+		close(done)
+	}()
+
+	sup.drainOldChild(c)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("chatty old child blocked; drainOldChild did not consume its frames")
+	}
+	c.exited <- nil // let the drain goroutine return
 }
 
 // --- pre-init safe restart: no initialize recorded → plain passthrough (condition 2a) ---

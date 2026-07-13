@@ -83,25 +83,38 @@ func (c *stdioChild) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	stdout, err := cmd.StdoutPipe()
+	// Use a manual os.Pipe for stdout rather than cmd.StdoutPipe: StdoutPipe's
+	// read end is closed by cmd.Wait, which forces exit reporting to be gated on
+	// pipe EOF. Here the read end is ours and Wait never touches it, so waitLoop
+	// can report the direct child's exit independently of stdout EOF — a
+	// grandchild that inherited the stdout write end can hold the pipe open after
+	// the direct child dies without masking the exit.
+	pr, pw, err := os.Pipe()
 	if err != nil {
 		return err
 	}
+	cmd.Stdout = pw
 	if err := cmd.Start(); err != nil {
+		_ = pr.Close()
+		_ = pw.Close()
 		return err
 	}
+	// The child holds the write end now; the parent must drop its copy, or the
+	// read end would never observe EOF once the child (and any grandchild) exits.
+	_ = pw.Close()
 	c.cmd = cmd
 	c.stdin = stdin
-	go c.readLoop(stdout)
+	go c.readLoop(pr)
+	go c.waitLoop()
 	return nil
 }
 
 // readLoop drains the child stdout pipe to EOF using bufio.Reader.ReadBytes —
 // NOT bufio.Scanner, whose default 64KiB token cap would truncate large
 // tool-result frames — preserving each line's exact bytes (including any
-// trailing \r). It calls cmd.Wait only AFTER the pipe is fully drained (the
-// Wait/pipe-read race), and reports exit off cmd.Wait rather than pipe EOF
-// alone so a grandchild that inherited the stdout writer cannot mask the exit.
+// trailing \r). Exit is reported separately by waitLoop off cmd.Wait, NOT off
+// this pipe's EOF, so a grandchild that inherited the stdout writer and outlives
+// the direct child cannot mask the exit.
 func (c *stdioChild) readLoop(stdout io.ReadCloser) {
 	r := bufio.NewReader(stdout)
 	for {
@@ -113,6 +126,15 @@ func (c *stdioChild) readLoop(stdout io.ReadCloser) {
 			break
 		}
 	}
+	_ = stdout.Close()
+}
+
+// waitLoop reaps the DIRECT child and reports its exit exactly once. It waits on
+// cmd.Wait (the direct child pid) independent of stdout EOF, so the exit fires
+// promptly even when a grandchild keeps the inherited stdout write end open. The
+// manual os.Pipe in Start means Wait never closes the read end, so there is no
+// Wait/pipe-read race to serialize against.
+func (c *stdioChild) waitLoop() {
 	c.exited <- c.cmd.Wait()
 }
 
