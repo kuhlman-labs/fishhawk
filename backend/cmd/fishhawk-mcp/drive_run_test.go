@@ -1437,6 +1437,27 @@ func (f *driveFakeBackend) seedPlanReviewed(verdict string) {
 	})
 }
 
+// seedImplementReviewStarted appends an implement_review_started row with the
+// given configured-agent count — the implement-stage analog of
+// seedPlanReviewStarted, feeding the #1127 count gate reviewStatusFor("implement")
+// reads.
+func (f *driveFakeBackend) seedImplementReviewStarted(configured int) {
+	f.seq++
+	f.audit = append(f.audit, AuditEntry{
+		ID: uuid.New().String(), Sequence: f.seq, RunID: f.runID.String(),
+		Category: "implement_review_started", Payload: map[string]any{"configured_agents": configured},
+	})
+}
+
+// seedImplementReviewed appends one implement_reviewed terminal verdict row.
+func (f *driveFakeBackend) seedImplementReviewed(verdict string) {
+	f.seq++
+	f.audit = append(f.audit, AuditEntry{
+		ID: uuid.New().String(), Sequence: f.seq, RunID: f.runID.String(),
+		Category: "implement_reviewed", Payload: map[string]any{"verdict": verdict},
+	})
+}
+
 // --- (T1) the #1905 incident: plan parked + settled reviews on a fixture that
 // INCLUDES the pending human review stage row -> decision_required, NOT a poll
 // to timeout ----------------------------------------------------------------
@@ -1561,6 +1582,120 @@ func TestDriveRun_PlanGateParked_ReviewsPending_PollsThenGates(t *testing.T) {
 	// observe-only faked past a premature, still-pending gate call).
 	if gatedWhilePending {
 		t.Error("driver gate-called while the advisory reviews were still pending; the review-settlement wait did not hold zero gate calls during the pending round")
+	}
+}
+
+// --- (T2b) the review->implement mapping branch: a parked REVIEW-type gate
+// waits on the IMPLEMENT advisory round -> POLL with ZERO gate calls, then gate
+// once that round settles. Pins driveReviewStageForParkedType("review") ->
+// "implement" (drive_run.go:806-807), the branch T1-T3 never exercise (they
+// park a PLAN gate). Concern deferred from #1908 / #1909. ---------------------
+
+func TestDriveRun_ReviewGateParked_ImplementReviewsPending_PollsThenGates(t *testing.T) {
+	// The production shape this branch was written for: a review-type stage
+	// parked awaiting_approval behind succeeded plan/implement stages, whose
+	// gate waits on the implement advisory round. Mirrors T2's choreography for
+	// the review->implement mapping instead of plan->plan.
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "succeeded", 1),
+		stg(driveReviewID, "review", "awaiting_approval", 2),
+		stg(driveAccID, "acceptance", "pending", 3),
+	})
+	f.seedImplementReviewStarted(2)
+	f.seedImplementReviewed("approve") // only ONE of two verdicts landed -> pending
+	// Land the SECOND verdict on the 2nd implement_reviewed read (the 2nd loop
+	// iteration), so the first iteration observes 'pending' and must NOT gate.
+	reads := 0
+	f.onAudit = func(f *driveFakeBackend, category string) {
+		if category != "implement_reviewed" {
+			return
+		}
+		reads++
+		if reads == 2 {
+			f.seq++
+			f.audit = append(f.audit, AuditEntry{
+				ID: uuid.New().String(), Sequence: f.seq, RunID: f.runID.String(),
+				Category: "implement_reviewed", Payload: map[string]any{"verdict": "approve"},
+			})
+		}
+	}
+	// LOAD-BEARING ordering check (same as T2, adapted to the implement round): at
+	// the instant the gate is called, the implement advisory round MUST already be
+	// settled. A regression that gate-calls on the first still-pending iteration
+	// returns the same decision_required with gateCalls==1, so without this probe
+	// the assertion would pass vacuously.
+	var gatedWhilePending bool
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		configured, verdicts := 0, 0
+		for _, e := range f.audit {
+			switch e.Category {
+			case "implement_review_started":
+				if m, ok := e.Payload.(map[string]any); ok {
+					if c, ok := m["configured_agents"].(int); ok && c > configured {
+						configured = c
+					}
+				}
+			case "implement_reviewed":
+				verdicts++
+			}
+		}
+		if configured > 0 && verdicts < configured {
+			gatedWhilePending = true
+		}
+		return AutoDriveOutcome{Note: "observe-only"}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 5 * time.Second
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	// The eventual decision return — NOT the silent poll-to-timeout hang the
+	// concern describes (a regression to that shape fails on stoppedTimeout here).
+	if out.StoppedReason != "decision_required:review_gate_parked" {
+		t.Fatalf("stopped_reason = %q, want decision_required:review_gate_parked (settled then gated)", out.StoppedReason)
+	}
+	// Zero gate calls while the implement round was pending (iteration 1), exactly
+	// one after settlement (iteration 2).
+	f.mu.Lock()
+	gateCalls := f.gateCalls
+	f.mu.Unlock()
+	if gateCalls != 1 {
+		t.Errorf("gate called %d times; want exactly 1 (zero while the implement round was pending, one after settlement)", gateCalls)
+	}
+	if gatedWhilePending {
+		t.Error("driver gate-called while the implement advisory round was still pending; the review-settlement wait did not hold zero gate calls during the pending round")
+	}
+	if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
+		t.Error("decision_required stop carried no next_actions")
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Errorf("no stage should have been dispatched at a parked review gate: %v", got)
+	}
+}
+
+// --- TestDriveReviewStageForParkedType pins the pure mapping table so a future
+// edit to the switch cannot silently drop the review->implement branch. --------
+
+func TestDriveReviewStageForParkedType(t *testing.T) {
+	cases := []struct {
+		parkedType string
+		want       string
+	}{
+		{"plan", "plan"},        // a parked plan gate waits on the plan review
+		{"review", "implement"}, // a parked review-type gate waits on the implement review
+		{"implement", ""},       // everything else skips the wait -> falls through to the gate
+		{"acceptance", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := driveReviewStageForParkedType(tc.parkedType); got != tc.want {
+			t.Errorf("driveReviewStageForParkedType(%q) = %q, want %q", tc.parkedType, got, tc.want)
+		}
 	}
 }
 
