@@ -6630,6 +6630,14 @@ paths:
         at signing-key time and sends the hex signature in
         `X-Fishhawk-Signature`.
 
+        Side effect (#1924): a successful authenticated fetch
+        transitions a `dispatched` stage to `running` (best-effort;
+        it sets `started_at` on that first transition). This gives
+        local runs a real-time dispatched→running liveness signal —
+        the signed fetch is the earliest proof a runner for this
+        stage is alive. A flip failure is logged and never blocks the
+        response. `pending` and every other state are left unchanged.
+
         Returns 501 when no prompt template is implemented yet for
         the stage's type — caller should treat the stage as
         unsupported and fail rather than guess.

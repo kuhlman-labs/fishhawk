@@ -32,9 +32,14 @@ const (
 	// defaultDriveDispatchedStaleAfter is the runner-liveness threshold: a stage
 	// this invocation did not spawn that has sat in 'dispatched' longer than this
 	// (with no runner observed) is treated as genuinely runner-less rather than
-	// in-flight. A live local runner flips dispatched->running within seconds, so
-	// 10 minutes of headroom cannot misclassify a live runner. Overridable via
-	// the runResolver.driveDispatchedStaleAfter seam (tests inject a tiny value).
+	// in-flight. The backend flips dispatched->running on the runner's signed
+	// prompt fetch (#1924), which lands within seconds of spawn for BOTH runner
+	// kinds — so a stage still reading 'dispatched' past this threshold means the
+	// runner never reached its prompt fetch (it died at or just after spawn) or a
+	// mixed-version backend without the flip is in play; 10 minutes of headroom
+	// cannot misclassify a live runner that has fetched its prompt. Overridable
+	// via the runResolver.driveDispatchedStaleAfter seam (tests inject a tiny
+	// value).
 	defaultDriveDispatchedStaleAfter = 10 * time.Minute
 )
 
@@ -440,17 +445,20 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 					anchor = newestDispatchTs
 				}
 				// (b) Genuinely runner-less: the newest spawn evidence is older than
-				// the liveness threshold with no runner observed. Stop distinct and
-				// hand the manual re-dispatch to the operator rather than polling every
-				// resume to timeout. A live runner flips dispatched->running within
-				// seconds, so the threshold cannot misclassify it. A zero-value anchor
-				// (no timestamped evidence at all) degrades to polling — fail toward
-				// polling, never toward a stale stop or a spawn.
+				// the liveness threshold and no signed prompt fetch flipped the stage
+				// to running. Stop distinct and hand the manual re-dispatch to the
+				// operator rather than polling every resume to timeout. The backend
+				// flips dispatched->running on the runner's prompt fetch within
+				// seconds of spawn (#1924), so a stage still 'dispatched' past the
+				// threshold is a runner that never reached that fetch — not a
+				// misclassified live one. A zero-value anchor (no timestamped
+				// evidence at all) degrades to polling — fail toward polling, never
+				// toward a stale stop or a spawn.
 				if !anchor.IsZero() && time.Since(anchor) > staleAfter {
 					age := time.Since(anchor).Round(time.Second)
 					out.StoppedReason = stoppedDispatchedStale
 					out.Warnings = append(out.Warnings, fmt.Sprintf(
-						"stage %s (%s) has sat in 'dispatched' for %s (newest spawn evidence), past the %s runner-liveness threshold, with no runner observed; no runner appears live. Confirm no runner process is running, re-dispatch by hand with fishhawk_dispatch_stage, then re-invoke fishhawk_drive_run.",
+						"stage %s (%s) has sat in 'dispatched' for %s (newest spawn evidence), past the %s runner-liveness threshold, and no prompt fetch flipped it to 'running'. Before re-dispatching, FIRST verify no runner process is live on this host — check `pgrep -f fishhawk-runner` and the dispatch's log_path — because a second runner into the same lineage lock is the failure this driver exists to prevent. Only if none is live, re-dispatch by hand with fishhawk_dispatch_stage, then re-invoke fishhawk_drive_run.",
 						disp.Type, disp.ID, age, staleAfter))
 					out.NextActions = driveDecisionActions("dispatched_stale", runUUID, in.WorkingDir)
 					return nil, out, nil

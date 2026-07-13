@@ -24,12 +24,14 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 )
 
@@ -64,6 +66,11 @@ type promptRunRepo struct {
 	// instant the plan stage flips to succeeded — the dispatch-gating
 	// transition.
 	onTransitionStage func(id uuid.UUID, to run.StageState)
+	// transitionStageErr, when set, makes TransitionStage return it (after
+	// recording the call). The prompt-fetch liveness flip (#1924) is
+	// best-effort: this drives the fail-open path where the transition
+	// errors yet the full prompt is still served.
+	transitionStageErr error
 }
 
 type promptTransitionStageCall struct {
@@ -259,6 +266,9 @@ func (r *promptRunRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.
 		To:         to,
 		Completion: c,
 	})
+	if r.transitionStageErr != nil {
+		return nil, r.transitionStageErr
+	}
 	if st, ok := r.getStages[id]; ok {
 		st.State = to
 		return st, nil
@@ -311,6 +321,16 @@ func (s *stubIssueGetter) ListIssueComments(_ context.Context, installationID in
 func newPromptServer(t *testing.T) (*Server, *promptRunRepo, *signingFake, *stubIssueGetter) {
 	t.Helper()
 	rr := newPromptRunRepo()
+	s, sf, gh := newPromptServerRepo(t, rr)
+	return s, rr, sf, gh
+}
+
+// newPromptServerRepo builds the prompt-handler server around an arbitrary
+// run.Repository so a test can inject a CAS-capable or otherwise-augmented
+// fake (the #1924 dispatched→running liveness-flip modes). newPromptServer
+// is the plain-fake convenience wrapper.
+func newPromptServerRepo(t *testing.T, rr run.Repository) (*Server, *signingFake, *stubIssueGetter) {
+	t.Helper()
 	sf := newSigningFake()
 	gh := &stubIssueGetter{}
 	s := New(Config{
@@ -322,7 +342,7 @@ func newPromptServer(t *testing.T) (*Server, *promptRunRepo, *signingFake, *stub
 	// via a dedicated test-only field. promptIssueGetterOverride is
 	// nil in production.
 	s.promptIssueGetterOverride = gh
-	return s, rr, sf, gh
+	return s, sf, gh
 }
 
 func promptRequest(t *testing.T, s *Server, runID, stageID uuid.UUID, priv ed25519.PrivateKey, sigOverride string) *httptest.ResponseRecorder {
@@ -7404,5 +7424,309 @@ func TestGetStagePrompt_AgentVersionRangeOmittedWhenAbsent(t *testing.T) {
 	}
 	if contains(w.Body.String(), "agent_version_range") {
 		t.Fatalf("agent_version_range key must be omitted when absent:\n%s", w.Body.String())
+	}
+}
+
+// --- #1924: prompt-fetch dispatched→running liveness flip ----------------
+//
+// A valid signed prompt fetch is the earliest authenticated proof a runner
+// for THIS stage is alive, so the handler flips a 'dispatched' stage to
+// 'running' (giving runner_kind:local the real-time liveness signal it
+// otherwise lacks until trace upload at settle). These tests pin each
+// enumerated failure mode of markStageRunningOnPromptFetch.
+
+// seedFlipRun wires a plan-type stage in the given state onto the plain
+// promptRunRepo fake with a manual-trigger run row (minimal prompt
+// construction, no GitHub issue fetch) and issues the run's signing key, so
+// these tests isolate the #1924 flip behavior. The stage TYPE is irrelevant
+// to the flip — it keys on the loaded state == dispatched only.
+func seedFlipRun(t *testing.T, rr *promptRunRepo, sf *signingFake, state run.StageState) (runID, stageID uuid.UUID, priv ed25519.PrivateKey) {
+	t.Helper()
+	runID = uuid.New()
+	stageID = uuid.New()
+	priv, _ = sf.issue(t, runID)
+	rr.runRow = &run.Run{
+		ID:            runID,
+		Repo:          "kuhlman-labs/example",
+		WorkflowID:    "feature_change",
+		TriggerSource: "manual",
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan, State: state}
+	return runID, stageID, priv
+}
+
+// Mode (i): a dispatched stage + a valid signature serves 200 AND records
+// exactly one dispatched→running transition.
+func TestGetStagePrompt_LivenessFlip_DispatchedFlipsToRunning(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID, stageID, priv := seedFlipRun(t, rr, sf, run.StageStateDispatched)
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(rr.transitionStageCalls) != 1 {
+		t.Fatalf("transition calls = %d, want exactly 1 (dispatched→running flip)", len(rr.transitionStageCalls))
+	}
+	if got := rr.transitionStageCalls[0]; got.To != run.StageStateRunning || got.StageID != stageID {
+		t.Fatalf("transition = {stage:%s to:%s}, want {stage:%s to:running}", got.StageID, got.To, stageID)
+	}
+}
+
+// Mode (ii): a 'pending' stage is left untouched — the #1030 local
+// first-stage gap is owned by advanceStageAfterTrace's pending→dispatched
+// walk, so the flip must never advance it.
+func TestGetStagePrompt_LivenessFlip_PendingUntouched(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID, stageID, priv := seedFlipRun(t, rr, sf, run.StageStatePending)
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(rr.transitionStageCalls) != 0 {
+		t.Fatalf("transition calls = %d, want 0 (pending is not flipped)", len(rr.transitionStageCalls))
+	}
+}
+
+// Mode (iii): a 'running' replay re-fetch is a no-op by the state guard.
+func TestGetStagePrompt_LivenessFlip_RunningReplayNoOp(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID, stageID, priv := seedFlipRun(t, rr, sf, run.StageStateRunning)
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(rr.transitionStageCalls) != 0 {
+		t.Fatalf("transition calls = %d, want 0 (running re-fetch is a no-op)", len(rr.transitionStageCalls))
+	}
+}
+
+// Mode (iv): the flip is best-effort — a transition error is logged, never
+// propagated, and the full prompt is still served (fail-open).
+func TestGetStagePrompt_LivenessFlip_TransitionErrorFailsOpen(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID, stageID, priv := seedFlipRun(t, rr, sf, run.StageStateDispatched)
+	rr.transitionStageErr = errors.New("boom: transition failed")
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (flip failure must not block the prompt):\n%s", w.Code, w.Body.String())
+	}
+	if len(rr.transitionStageCalls) != 1 {
+		t.Fatalf("transition calls = %d, want 1 (the flip was attempted)", len(rr.transitionStageCalls))
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Prompt == "" {
+		t.Fatal("prompt body empty after a fail-open flip; the full prompt must still be served")
+	}
+}
+
+// Mode (v): the flip is strictly post-auth — an unauthenticated request on a
+// dispatched stage is rejected and records zero transitions.
+func TestGetStagePrompt_LivenessFlip_UnauthenticatedNoFlip(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID, stageID, _ := seedFlipRun(t, rr, sf, run.StageStateDispatched)
+
+	// Bad-hex signature: verifyPromptSignature rejects before the flip.
+	w := promptRequest(t, s, runID, stageID, nil, "not-hex")
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+	if len(rr.transitionStageCalls) != 0 {
+		t.Fatalf("transition calls = %d, want 0 (flip must never run on an unauthenticated request)", len(rr.transitionStageCalls))
+	}
+}
+
+// promptCASRunRepo augments promptRunRepo with the StageCASTransitioner
+// capability so the flip's compare-and-swap path (preferred over plain
+// TransitionStage) can be exercised. fromErr injects the CAS refusal.
+type promptCASRunRepo struct {
+	*promptRunRepo
+	fromErr   error
+	fromCalls []promptTransitionFromCall
+}
+
+type promptTransitionFromCall struct {
+	StageID  uuid.UUID
+	From, To run.StageState
+}
+
+func (r *promptCASRunRepo) TransitionStageFrom(_ context.Context, id uuid.UUID, from, to run.StageState, _ *run.StageCompletion) (*run.Stage, error) {
+	r.fromCalls = append(r.fromCalls, promptTransitionFromCall{StageID: id, From: from, To: to})
+	if r.fromErr != nil {
+		return nil, r.fromErr
+	}
+	if st, ok := r.getStages[id]; ok {
+		st.State = to
+		return st, nil
+	}
+	return &run.Stage{ID: id, State: to}, nil
+}
+
+// Mode (vi): when the repo provides the CAS capability, the flip anchors on
+// 'dispatched' via TransitionStageFrom. A concurrent advance — here a scope
+// park (Actual=awaiting_scope_decision) — refuses atomically with
+// StageStateChangedError. The prompt is still served (best-effort), the park
+// is NOT collapsed, and no fallback plain TransitionStage is attempted.
+func TestGetStagePrompt_LivenessFlip_CASRefusesConcurrentPark(t *testing.T) {
+	inner := newPromptRunRepo()
+	cas := &promptCASRunRepo{
+		promptRunRepo: inner,
+		fromErr: run.StageStateChangedError{
+			Expected: run.StageStateDispatched,
+			Actual:   run.StageStateAwaitingScopeDecision,
+		},
+	}
+	s, sf, _ := newPromptServerRepo(t, cas)
+	runID, stageID, priv := seedFlipRun(t, inner, sf, run.StageStateDispatched)
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (CAS refusal is best-effort; prompt still served):\n%s", w.Code, w.Body.String())
+	}
+	if len(cas.fromCalls) != 1 {
+		t.Fatalf("CAS calls = %d, want exactly 1 (dispatched→running attempted via CAS)", len(cas.fromCalls))
+	}
+	if got := cas.fromCalls[0]; got.From != run.StageStateDispatched || got.To != run.StageStateRunning {
+		t.Fatalf("CAS call = %s→%s, want dispatched→running", got.From, got.To)
+	}
+	if len(inner.transitionStageCalls) != 0 {
+		t.Fatalf("plain TransitionStage calls = %d, want 0 (CAS refusal must NOT fall back and stomp the park)", len(inner.transitionStageCalls))
+	}
+}
+
+// Mode (vii): the flip is plan-mandated to fire AFTER signature verification
+// but BEFORE prompt construction, so a handler failure that occurs after a
+// successful flip still leaves the stage persisted as 'running'. Here a
+// 'deploy' stage has no prompt template, so prompt.Build returns
+// ErrUnsupportedStage → 501 — but only after markStageRunningOnPromptFetch has
+// already flipped dispatched→running. This pins the
+// flip-succeeded-then-prompt-construction-failed ordering and documents the
+// accepted residual detection gap (#1924): such a 'running' stage never
+// executes yet is outside the dispatched_stale detector, which examines only
+// 'dispatched'. Mode (iv) covers the inverse (flip failed, prompt served).
+func TestGetStagePrompt_LivenessFlip_FlipsThenBuildFails(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID, stageID, priv := seedFlipRun(t, rr, sf, run.StageStateDispatched)
+	// A 'deploy' stage has no prompt template, so prompt.Build fails with
+	// ErrUnsupportedStage — a construction failure AFTER the flip has fired.
+	rr.stage.Type = run.StageTypeDeploy
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501 (deploy has no prompt template):\n%s", w.Code, w.Body.String())
+	}
+	// The flip already ran before construction failed: the stage is now
+	// persisted as 'running' despite the 501 — the accepted residual gap.
+	if len(rr.transitionStageCalls) != 1 {
+		t.Fatalf("transition calls = %d, want 1 (flip fires before prompt construction)", len(rr.transitionStageCalls))
+	}
+	if got := rr.transitionStageCalls[0]; got.To != run.StageStateRunning || got.StageID != stageID {
+		t.Fatalf("transition = {stage:%s to:%s}, want {stage:%s to:running}", got.StageID, got.To, stageID)
+	}
+}
+
+// Cross-boundary seam: a stage flipped to 'running' at prompt-fetch time (as
+// the #1924 flip does, before trace upload) still settles normally through
+// the trace-upload path — advanceStageAfterTrace's running→running
+// idempotent walk drives it to its terminal state, so the earlier flip
+// cannot wedge the settle.
+func TestAdvanceStageAfterTrace_PreFlippedRunning_SettlesNormally(t *testing.T) {
+	sf := newSigningFake()
+	rr := newApprovalRunRepo()
+	art := newFakeArtifactRepo()
+	// Seed the stage already in 'running' — modelling the prompt-fetch flip
+	// having landed before the runner uploads its trace.
+	stage := rr.seedStage(run.StageStateRunning)
+	seedBudgetPlanArtifact(t, art, stage.ID, &plan.Plan{PlanVersion: "standard_v1"})
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		TraceStore:   newTraceStoreFake(),
+		AuditRepo:    newAuditFake(),
+		RunRepo:      rr,
+		ArtifactRepo: art,
+	})
+
+	priv, _ := sf.issue(t, stage.RunID)
+	w := shipRequest(t, s, stage.RunID, stage.ID, "raw", priv, []byte("b"), "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Fatalf("stage state = %q, want awaiting_approval (a pre-flipped running stage still settles through the gate)", got)
+	}
+}
+
+// Binding condition (#1924): an integration test against persisted state.
+// With the real Postgres-backed run repository and a stage seeded in
+// 'dispatched', a properly signed prompt fetch through the real handler
+// must persist the dispatched→running flip — the stage row read back from
+// the database reads 'running' with started_at set (the postgresRepo sets
+// started_at on the first →running transition).
+func TestGetStagePrompt_LivenessFlip_PersistsRunningInPostgres(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	ctx := context.Background()
+
+	runRepo := run.NewPostgresRepository(pool)
+	realRun, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	stage, err := runRepo.CreateStage(ctx, run.CreateStageParams{
+		RunID:        realRun.ID,
+		Sequence:     0,
+		Type:         run.StageTypeImplement,
+		ExecutorKind: run.ExecutorAgent,
+		ExecutorRef:  "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("create stage: %v", err)
+	}
+	// Walk pending → dispatched so the flip's dispatched→running edge is legal.
+	if _, err := runRepo.TransitionStage(ctx, stage.ID, run.StageStateDispatched, nil); err != nil {
+		t.Fatalf("transition to dispatched: %v", err)
+	}
+
+	signingRepo := signing.NewPostgresRepository(pool)
+	issued, err := signingRepo.Issue(ctx, realRun.ID, signing.DefaultTTL)
+	if err != nil {
+		t.Fatalf("issue signing key: %v", err)
+	}
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  signingRepo,
+		RunRepo:      runRepo,
+		AuditRepo:    newAuditFake(),
+		ArtifactRepo: newFakeArtifactRepo(),
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRequest(t, s, realRun.ID, stage.ID, issued.PrivateKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// Read the stage row back from the database and assert the flip persisted.
+	got, err := runRepo.GetStage(ctx, stage.ID)
+	if err != nil {
+		t.Fatalf("get stage after flip: %v", err)
+	}
+	if got.State != run.StageStateRunning {
+		t.Fatalf("persisted stage state = %q, want running (the signed prompt fetch must flip dispatched→running)", got.State)
+	}
+	if got.StartedAt == nil {
+		t.Fatal("persisted started_at is nil, want set (postgresRepo sets it on the first →running transition)")
 	}
 }
