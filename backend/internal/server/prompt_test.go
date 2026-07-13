@@ -7600,6 +7600,37 @@ func TestGetStagePrompt_LivenessFlip_CASRefusesConcurrentPark(t *testing.T) {
 	}
 }
 
+// Mode (vii): the flip is plan-mandated to fire AFTER signature verification
+// but BEFORE prompt construction, so a handler failure that occurs after a
+// successful flip still leaves the stage persisted as 'running'. Here a
+// 'deploy' stage has no prompt template, so prompt.Build returns
+// ErrUnsupportedStage → 501 — but only after markStageRunningOnPromptFetch has
+// already flipped dispatched→running. This pins the
+// flip-succeeded-then-prompt-construction-failed ordering and documents the
+// accepted residual detection gap (#1924): such a 'running' stage never
+// executes yet is outside the dispatched_stale detector, which examines only
+// 'dispatched'. Mode (iv) covers the inverse (flip failed, prompt served).
+func TestGetStagePrompt_LivenessFlip_FlipsThenBuildFails(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID, stageID, priv := seedFlipRun(t, rr, sf, run.StageStateDispatched)
+	// A 'deploy' stage has no prompt template, so prompt.Build fails with
+	// ErrUnsupportedStage — a construction failure AFTER the flip has fired.
+	rr.stage.Type = run.StageTypeDeploy
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501 (deploy has no prompt template):\n%s", w.Code, w.Body.String())
+	}
+	// The flip already ran before construction failed: the stage is now
+	// persisted as 'running' despite the 501 — the accepted residual gap.
+	if len(rr.transitionStageCalls) != 1 {
+		t.Fatalf("transition calls = %d, want 1 (flip fires before prompt construction)", len(rr.transitionStageCalls))
+	}
+	if got := rr.transitionStageCalls[0]; got.To != run.StageStateRunning || got.StageID != stageID {
+		t.Fatalf("transition = {stage:%s to:%s}, want {stage:%s to:running}", got.StageID, got.To, stageID)
+	}
+}
+
 // Cross-boundary seam: a stage flipped to 'running' at prompt-fetch time (as
 // the #1924 flip does, before trace upload) still settles normally through
 // the trace-upload path — advanceStageAfterTrace's running→running

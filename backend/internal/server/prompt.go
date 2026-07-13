@@ -1099,6 +1099,20 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 // plain TransitionStage, still guarded on the observed dispatched state. As
 // a side effect the repo sets started_at at real start time on this first
 // →running transition (postgres.go), improving duration accuracy.
+//
+// RESIDUAL DETECTION GAP (#1924, accepted tradeoff): the flip is plan-mandated
+// to fire after verifyPromptSignature succeeds and BEFORE prompt construction,
+// so a handler failure AFTER a successful flip — the 501 unsupported-stage-type
+// path, or a load-approved-plan / decomposed-scope error — leaves the stage
+// persisted as 'running' even though the runner never executes. Such a stage is
+// outside the dispatched_stale detector's coverage (it only examines
+// 'dispatched'), converting what was previously a correctly-detected stale into
+// an undetected wedged-'running' stage. The blast radius is bounded by the
+// runner's own failure/reap paths and operator visibility, and is strictly
+// narrower than the deterministic false-stale class this flip removes, so the
+// pre-construction ordering stands. The
+// TestGetStagePrompt_LivenessFlip_FlipsThenBuildFails test pins the
+// flip-succeeded-then-construction-failed ordering.
 func (s *Server) markStageRunningOnPromptFetch(ctx context.Context, stage *run.Stage) {
 	if stage.State != run.StageStateDispatched {
 		return
