@@ -444,7 +444,12 @@ fi
 # The shared-lib case must fall through (no early `return`) so a diff touching
 # both a shared lib AND the shim still marks the shim. Behavioral proof: drive
 # _detect_rebuild_set through a stubbed git that emits exactly that two-line diff.
-(
+# The subshell isolates the PATH git stub and rebuild_set; its EXIT STATUS carries
+# the assertion result back to the parent so pass/fail is counted in the parent
+# shell (a pass/fail inside the subshell would increment a copy of the counter
+# that is discarded on subshell exit, making the assertion unable to turn the
+# suite red).
+if (
   set +e
   tmp_stub="$(mktemp -d)"
   cat > "${tmp_stub}/git" <<'STUB'
@@ -460,13 +465,18 @@ STUB
   typeset -gA rebuild_set
   rebuild_set=()
   _detect_rebuild_set
-  if [[ -n "${rebuild_set[fishhawk-mcp-shim]:-}" && -n "${rebuild_set[fishhawk-mcp]:-}" ]]; then
-    pass "_detect_rebuild_set: shared-lib + shim two-line diff marks BOTH (no early-return drop)"
-  else
-    fail "_detect_rebuild_set: shared-lib + shim diff should mark the shim (mcp=${rebuild_set[fishhawk-mcp]:-unset} shim=${rebuild_set[fishhawk-mcp-shim]:-unset})"
+  ok=0
+  if [[ -z "${rebuild_set[fishhawk-mcp-shim]:-}" || -z "${rebuild_set[fishhawk-mcp]:-}" ]]; then
+    print "  (mcp=${rebuild_set[fishhawk-mcp]:-unset} shim=${rebuild_set[fishhawk-mcp-shim]:-unset})"
+    ok=1
   fi
   rm -rf "$tmp_stub"
-)
+  exit $ok
+); then
+  pass "_detect_rebuild_set: shared-lib + shim two-line diff marks BOTH (no early-return drop)"
+else
+  fail "_detect_rebuild_set: shared-lib + shim diff should mark the shim (see diagnostic above)"
+fi
 
 # 5i. Build/banner wiring body-greps: _build_binary src_paths, cmd_up's forced
 # --all set, the build loop, and cmd_up's banner-decision call sites all carry
