@@ -128,7 +128,11 @@ func (s *Server) handleAutoDrive(w http.ResponseWriter, r *http.Request) {
 	// recording failure — the drive loop stops acting rather than continuing
 	// on a silent acted:true (binding approval condition 1).
 	if out.Acted {
-		if aerr := s.appendRunAutoDrivenGate(r.Context(), runRow, id, out); aerr != nil {
+		// Recover the delegated CONDITION (the ADR-040 rule) that governed the
+		// acted gate so the attribution row carries delegation provenance
+		// (never a rule-less gate row).
+		rule := s.autoDriveGateRule(r.Context(), runRow, out.Action)
+		if aerr := s.appendRunAutoDrivenGate(r.Context(), runRow, id, out, rule); aerr != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "auto_drive_record_failed",
 				"gate action landed but the supplementary run_auto_driven attribution row failed to append; the authoritative delegated-action audit row is durable, but the driver must stop and not continue acting",
 				map[string]any{"error": aerr.Error(), "action": out.Action})
@@ -287,22 +291,52 @@ func autoDriveKnownDispatchStage(stage string) bool {
 	return ok
 }
 
+// autoDriveGateRule re-derives the delegated CONDITION (the ADR-040 rule)
+// that governed an acted gate outcome so the supplementary run_auto_driven
+// row records delegation provenance alongside act/action/source. The
+// condition is STATIC operator_agent config, so re-evaluating with the same
+// (nil) override the gate endpoint used recovers the identical rule the
+// dispatch site applied — independent of the post-action state change. This
+// is only reached on an ACTED outcome, where the in-line AutoDriveRunGate
+// evaluation already succeeded, so the re-evaluation is expected to resolve.
+// Returns "" only if the contract is momentarily unevaluable (a transient
+// repo error): the row then omits the rule, and the AUTHORITATIVE rule
+// remains on the action's own transactional audit row (binding condition 2).
+func (s *Server) autoDriveGateRule(ctx context.Context, runRow *run.Run, action string) string {
+	res, _, ok := s.evaluateRunDelegation(ctx, runRow, nil)
+	if !ok || res == nil {
+		return ""
+	}
+	if d, found := res.Decision(action); found {
+		return string(d.Condition)
+	}
+	return ""
+}
+
 // appendRunAutoDrivenGate appends the supplementary run_auto_driven
-// act:"gate" attribution row for an ACTED gate outcome under id. It returns
-// the append error so the caller can FAIL-LOUD (binding approval condition
-// 1) — this is deliberately NOT best-effort.
-func (s *Server) appendRunAutoDrivenGate(ctx context.Context, runRow *run.Run, id Identity, out AutoDriveOutcome) error {
+// act:"gate" attribution row for an ACTED gate outcome under id, recording
+// the delegated rule (when derivable) for provenance. It returns the append
+// error so the caller can FAIL-LOUD (binding approval condition 1) — this is
+// deliberately NOT best-effort.
+func (s *Server) appendRunAutoDrivenGate(ctx context.Context, runRow *run.Run, id Identity, out AutoDriveOutcome, rule string) error {
 	subject := id.Subject
 	if subject == "" {
 		subject = "anonymous"
 	}
 	kind := actorKindForSubject(subject)
-	payload, _ := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"act":    autoDriveActGate,
 		"action": out.Action,
 		"source": autoDriveSourceEndpoint,
 		"note":   out.Note,
-	})
+	}
+	// Record the delegated rule so the driver-attribution row keeps delegation
+	// provenance; omitted only when momentarily unevaluable (the action's own
+	// audit row remains the authoritative delegation record).
+	if rule != "" {
+		fields["delegated_rule"] = rule
+	}
+	payload, _ := json.Marshal(fields)
 	_, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        runRow.ID,
 		Timestamp:    time.Now().UTC(),

@@ -4396,7 +4396,9 @@ paths:
         **`run_auto_driven` is the SUPPLEMENTARY driver-attribution record,
         NOT the authoritative delegation record.** On an ACTED outcome this
         endpoint ALSO appends a run-chained `run_auto_driven` `act:"gate"`
-        entry for driver attribution. The AUTHORITATIVE record of the
+        entry for driver attribution, carrying the delegated rule
+        (`delegated_rule`, the ADR-040 condition that governed the act) for
+        provenance alongside the action. The AUTHORITATIVE record of the
         delegated action is that action's own audit row (above); the
         supplementary row exists only to attribute which driver acted.
 

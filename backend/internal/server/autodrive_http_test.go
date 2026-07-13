@@ -225,6 +225,14 @@ func TestAutoDrive_ActedApprove_EndToEnd(t *testing.T) {
 	if fields["source"] != autoDriveSourceEndpoint {
 		t.Errorf("run_auto_driven source = %v, want %q", fields["source"], autoDriveSourceEndpoint)
 	}
+	// The attribution row carries delegation provenance — the delegated rule
+	// that governed the acted gate — not just act/action/source. This is the
+	// authoritative check of the real write path (the audit fake IS the
+	// server's AuditRepo), so a rule-less gate row (the concern-1 regression)
+	// fails here.
+	if fields["delegated_rule"] != "clean_dual_approval" {
+		t.Errorf("run_auto_driven delegated_rule = %v, want clean_dual_approval", fields["delegated_rule"])
+	}
 }
 
 // --- (6) paged: gating reviewer reject --------------------------------------

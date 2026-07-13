@@ -41,8 +41,18 @@ const (
 	stoppedCancelled     = "cancelled"
 	stoppedRunFailed     = "run_failed"
 	stoppedGateError     = "gate_error"
+	// stoppedAmendmentCheckFailed is the fail-CLOSED stop when the scope-
+	// amendment audit read errors: a pending amendment is always a human
+	// decision, so an unreadable amendment state must halt the driver rather
+	// than fall through to a stage dispatch.
+	stoppedAmendmentCheckFailed = "amendment_check_failed"
 	// "paged:<event>" and "decision_required:<state>" are composed inline.
 )
+
+// driveActionMerge is the delegation verb the gate endpoint returns for a
+// queued merge; mirrors backend delegation.ActionMerge (not imported per the
+// thin local-copy rule).
+const driveActionMerge = "merge"
 
 // DriveRunInput is the fishhawk_drive_run tool's input (#1700).
 type DriveRunInput struct {
@@ -68,7 +78,7 @@ type DriveStep struct {
 // resumable by re-invoking with the same run_id.
 type DriveRunOutput struct {
 	RunID         string       `json:"run_id"`
-	StoppedReason string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | run_failed | cancelled | gate_error"`
+	StoppedReason string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | run_failed | cancelled | gate_error | amendment_check_failed"`
 	RunState      string       `json:"run_state"`
 	StepsTaken    []DriveStep  `json:"steps_taken,omitempty" jsonschema:"the ordered acts the driver performed; each dispatch and gate act also landed a run_auto_driven audit row"`
 	PageEvent     string       `json:"page_event,omitempty" jsonschema:"the must_page_human event, set only on a paged stop"`
@@ -182,6 +192,7 @@ func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in D
 	dispatchedCount := map[string]int{} // stage ID -> dispatch count (fixup_redispatch discriminator)
 	stall := 0
 	var lastSig string
+	mergeQueued := false // a delegated merge was queued; poll for the webhook-settle, don't re-act
 
 	for {
 		if time.Now().After(deadline) {
@@ -211,6 +222,18 @@ func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in D
 			return nil, out, nil
 		}
 
+		// A delegated merge was queued on a prior iteration: GitHub auto-merge
+		// settles it via the pull_request webhook (merge is queued-not-landed).
+		// Poll the run state ONLY — never re-call the gate, which would
+		// re-enable auto-merge and append a duplicate run_auto_driven act:gate
+		// merge row every interval (and, if the seam rejects re-enabling on an
+		// already-enabled PR, exit gate_error) — until the run settles terminal
+		// (handled at the top of the loop) or the deadline elapses.
+		if mergeQueued {
+			driveSleep(ctx, pollInterval)
+			continue
+		}
+
 		stages, serr := r.api.ListRunStages(ctx, runUUID)
 		if serr != nil {
 			return nil, out, fmt.Errorf("drive: list stages: %w", serr)
@@ -219,7 +242,15 @@ func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in D
 		// (b) A pending scope amendment is ALWAYS a decision — no delegation
 		// knob covers amendments, and its window times out in minutes.
 		if pending, aerr := r.driveScopeAmendmentPending(ctx, runUUID); aerr != nil {
-			out.Warnings = append(out.Warnings, "scope-amendment poll failed: "+aerr.Error())
+			// FAIL-CLOSED: we cannot confirm no amendment is parked, and a
+			// pending amendment is a human decision. STOP rather than fall
+			// through to (c) dispatch — an unreadable amendment state must never
+			// open the code-execution path (concern: audit-read failure was
+			// downgraded to a warning and the loop continued into record+spawn).
+			out.StoppedReason = stoppedAmendmentCheckFailed
+			out.Warnings = append(out.Warnings, "scope-amendment poll failed; stopping fail-closed: "+aerr.Error())
+			out.NextActions = driveDecisionActions("scope_amendment_requested", runUUID, in.WorkingDir)
+			return nil, out, nil
 		} else if pending {
 			out.StoppedReason = "decision_required:scope_amendment_requested"
 			out.NextActions = driveDecisionActions("scope_amendment_requested", runUUID, in.WorkingDir)
@@ -230,8 +261,26 @@ func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in D
 		if disp := driveDispatchableStage(stages, spawned); disp != nil {
 			stall = 0
 			recordName := driveDispatchName(*disp, dispatchedCount)
+			priorRow := false
+			if had, herr := r.driveHasPriorDispatchRow(ctx, runUUID, recordName); herr == nil {
+				priorRow = had
+			}
+			// Cross-invocation resume guard: a stage already in the 'dispatched'
+			// window that a PRIOR invocation recorded (a dispatch row exists) and
+			// that THIS invocation did not re-open (dispatchedCount==0) is in
+			// flight from that prior invocation — a fresh invocation's per-run
+			// `spawned` map cannot see it. Treat it as in-flight and POLL; never
+			// host-spawn a second runner for the same stage. A 'pending' resume
+			// (crashed before the stage started) still re-records + re-dispatches
+			// with a retry note below; a fixup/retry re-open (dispatchedCount>0)
+			// still re-dispatches as fixup_redispatch.
+			if disp.State == "dispatched" && dispatchedCount[disp.ID] == 0 && priorRow {
+				spawned[disp.ID] = true // mark in-flight so driveAnyInFlight polls it
+				driveSleep(ctx, pollInterval)
+				continue
+			}
 			note := ""
-			if had, herr := r.driveHasPriorDispatchRow(ctx, runUUID, recordName); herr == nil && had {
+			if priorRow {
 				// A run_auto_driven dispatch row already exists for this stage
 				// name and the stage is still dispatchable — a crash-resume or a
 				// re-open. Re-record honestly with a retry note.
@@ -317,6 +366,13 @@ func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in D
 			out.StepsTaken = append(out.StepsTaken, DriveStep{
 				Kind: "gate", Action: gate.Action, Delegated: true, Note: gate.Note,
 			})
+			// A merge is queued-not-landed: remember it so subsequent iterations
+			// poll for the webhook-settle instead of re-calling the gate (which
+			// would duplicate the gate:merge attribution row and re-enable
+			// auto-merge every interval).
+			if gate.Action == driveActionMerge {
+				mergeQueued = true
+			}
 			driveSleep(ctx, pollInterval)
 			continue
 		default:
