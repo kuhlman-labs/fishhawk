@@ -612,9 +612,26 @@ func TestReapStageFailure_AwaitingApprovalFlipAbsorbed(t *testing.T) {
 // livelockReapRepo models pathological livelock (#1907): it alternates the
 // target stage between two live states on EVERY TransitionStageFrom call, so
 // no CAS attempt ever succeeds and FailStage exhausts its bounded retries.
+// advanceReached records whether orchestrator.Advance ran: the handler reaches
+// ListStagesForRun ONLY through Advance (its own path uses GetStage, never
+// ListStagesForRun), and Advance always calls it for a non-terminal run — so a
+// false flag load-bearingly proves Advance was never invoked, which the
+// run-still-running check alone cannot (a live stage leaves the run running
+// whether or not Advance ran).
 type livelockReapRepo struct {
 	*orchestratorRepo
-	stageID uuid.UUID
+	stageID        uuid.UUID
+	advanceReached bool
+}
+
+// ListStagesForRun flags that orchestrator.Advance entered its stage walk, then
+// delegates. The flag is set under the embedded mutex and released before the
+// delegate re-locks it (sync.Mutex is not reentrant).
+func (r *livelockReapRepo) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]*run.Stage, error) {
+	r.mu.Lock()
+	r.advanceReached = true
+	r.mu.Unlock()
+	return r.orchestratorRepo.ListStagesForRun(ctx, runID)
 }
 
 func (r *livelockReapRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
@@ -645,10 +662,12 @@ func TestReapStageFailure_LivelockExhaustion500(t *testing.T) {
 	stage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
 	race := &livelockReapRepo{orchestratorRepo: rr, stageID: stage.ID}
 	s := New(Config{
-		Addr:         "127.0.0.1:0",
-		RunRepo:      race,
-		AuditRepo:    au,
-		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+		Addr:      "127.0.0.1:0",
+		RunRepo:   race,
+		AuditRepo: au,
+		// Route Advance through race so its entry is observable via the
+		// advanceReached spy — the run-still-running check below cannot see it.
+		Orchestrator: &orchestrator.Orchestrator{Runs: race},
 	})
 
 	w := postReapFailure(t, s, runRow.ID, stage.ID,
@@ -659,13 +678,19 @@ func TestReapStageFailure_LivelockExhaustion500(t *testing.T) {
 	if !bytes.Contains(w.Body.Bytes(), []byte("internal_error")) {
 		t.Errorf("body missing internal_error: %s", w.Body.String())
 	}
-	// No audit entry and no Advance: the stage never reached failed.
+	// No audit entry and no Advance: the stage never reached failed. The
+	// advanceReached spy is the load-bearing no-Advance proof — the stage is
+	// deliberately left live, so the run stays running whether or not Advance
+	// ran, and the run-state check below cannot distinguish the two.
 	if got := reapAudit(au); len(got) != 0 {
 		t.Errorf("dispatch_reaper_failed entries = %d, want 0 (nothing failed)", len(got))
 	}
+	if race.advanceReached {
+		t.Errorf("orchestrator.Advance was invoked, want NOT invoked (500 exhaustion path)")
+	}
 	curRun, _ := rr.GetRun(context.Background(), runRow.ID)
 	if curRun.State != run.StateRunning {
-		t.Errorf("run state = %q, want running (Advance not invoked)", curRun.State)
+		t.Errorf("run state = %q, want running (stage still live)", curRun.State)
 	}
 }
 
