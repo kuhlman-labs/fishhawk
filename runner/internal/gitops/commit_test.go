@@ -1962,6 +1962,144 @@ func TestCommitAndPush_UpdateTrackingRef_KeepsForceWithLeaseFresh(t *testing.T) 
 	}
 }
 
+// TestCommitAndPush_FreshFetchBase_ForceWithLease_OverwritesStaleSelfRef is the
+// done-means test for bug 2 of incident bdf94763 (#1872): a standalone
+// sole-writer run whose OWN branch carries a stale head from a partial prior
+// ship must, on a FreshFetchBase re-run with ForceWithLease, overwrite that
+// stale ref. There is NO local tracking ref (FreshFetchBase cuts fresh from the
+// fetched base), so the pre-fix code fell back to a bare --force-with-lease that
+// a URL push rejects non-fast-forward. The fix observes the remote head via
+// ls-remote and binds the lease to it, so the push succeeds and the remote head
+// becomes the new commit. Fails non-fast-forward on the old code.
+func TestCommitAndPush_FreshFetchBase_ForceWithLease_OverwritesStaleSelfRef(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	const branch = "fishhawk/run-1872/stage-ship"
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+	authoritativeTip := mustGitOut(t, repo, "rev-parse", "HEAD")
+
+	// Simulate a partial prior ship: a diverged commit lands on the run branch
+	// on the bare remote via a URL push, which does NOT create a local tracking
+	// ref (so the subsequent FreshFetchBase re-run has none).
+	if err := os.WriteFile(filepath.Join(repo, "stale.txt"), []byte("stale partial ship\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "stale partial ship")
+	staleSHA := mustGitOut(t, repo, "rev-parse", "HEAD")
+	mustGit(t, repo, "push", bare, "HEAD:"+branch)
+
+	// Confirm no local tracking ref for the run branch exists (the FreshFetchBase
+	// case this test pins).
+	trackCmd := exec.Command("git", "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch)
+	trackCmd.Dir = repo
+	if err := trackCmd.Run(); err == nil {
+		t.Fatalf("precondition: expected NO tracking ref for %s", branch)
+	}
+
+	// Reset ambient HEAD back to the authoritative main tip; the run's fresh
+	// branch bases on the fetched main, diverging from the stale ship commit.
+	mustGit(t, repo, "reset", "--hard", authoritativeTip)
+	if err := os.WriteFile(filepath.Join(repo, "agent.txt"), []byte("agent edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Pusher{}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         branch,
+		CommitMessage:  "standalone re-ship",
+		RemoteURL:      bare,
+		FreshFetchBase: "main",
+		ForceWithLease: true,
+	})
+	if err != nil {
+		t.Fatalf("CommitAndPush (FreshFetchBase+ForceWithLease over stale self-ref): %v", err)
+	}
+
+	// The stale ship commit must be overwritten: the bare branch now points at
+	// the new HEAD, and the stale commit is NOT its ancestor.
+	got := mustGitOut(t, repo, "--git-dir="+bare, "rev-parse", branch)
+	if got != res.HeadSHA {
+		t.Errorf("bare branch sha = %q, want new HeadSHA %q", got, res.HeadSHA)
+	}
+	if isAncestor(t, repo, staleSHA, res.HeadSHA) {
+		t.Errorf("stale ship commit %s must NOT be an ancestor of the re-shipped HEAD", staleSHA)
+	}
+}
+
+// TestCommitAndPush_FreshFetchBase_ForceWithLease_AbsentRefPlainPush covers the
+// absent-ref branch of the #1872 lease fix: when the run branch does NOT yet
+// exist on the remote, observeRemoteHead returns "" and the push proceeds with
+// NO lease flag (creating a ref cannot be non-fast-forward). The branch is
+// created at the new HEAD.
+func TestCommitAndPush_FreshFetchBase_ForceWithLease_AbsentRefPlainPush(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	const branch = "fishhawk/run-1872/stage-fresh"
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+
+	if err := os.WriteFile(filepath.Join(repo, "agent.txt"), []byte("agent edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := &Pusher{}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         branch,
+		CommitMessage:  "fresh ship",
+		RemoteURL:      bare,
+		FreshFetchBase: "main",
+		ForceWithLease: true,
+	})
+	if err != nil {
+		t.Fatalf("CommitAndPush (FreshFetchBase+ForceWithLease, absent ref): %v", err)
+	}
+
+	got := mustGitOut(t, repo, "--git-dir="+bare, "rev-parse", branch)
+	if got != res.HeadSHA {
+		t.Errorf("bare branch sha = %q, want new HeadSHA %q (branch created by plain push)", got, res.HeadSHA)
+	}
+}
+
 // TestCommitAndPush_RebaseFromRemote_FetchesViaRemoteURL pins #772: the
 // RebaseFromRemote path must fetch the shared branch over args.RemoteURL (the
 // run's authenticated HTTPS URL), NOT the named `origin` remote, which in the

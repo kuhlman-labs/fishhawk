@@ -37,7 +37,7 @@ func TestDispatchStage_NonBlockingReturnsHandle(t *testing.T) {
 
 	runID := uuid.New()
 	stageID := uuid.New()
-	seedStageOfType(fb, runID, stageID, "implement", "running")
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
 
 	start := time.Now()
 	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
@@ -62,8 +62,11 @@ func TestDispatchStage_NonBlockingReturnsHandle(t *testing.T) {
 	if out.StageWaitStatus == nil {
 		t.Fatal("StageWaitStatus is nil; expected the freshly-dispatched (non-terminal) status")
 	}
-	if out.StageWaitStatus.Status != "running" {
-		t.Errorf("StageWaitStatus.Status = %q, want running", out.StageWaitStatus.Status)
+	// A freshly-dispatched stage sits at 'pending' pre-run (the sibling-in-flight
+	// guard, #1872, rejects dispatching a target already 'running'); the wait
+	// status must still be non-terminal and carry the poll cadence.
+	if out.StageWaitStatus.Status != "pending" {
+		t.Errorf("StageWaitStatus.Status = %q, want pending", out.StageWaitStatus.Status)
 	}
 	if out.StageWaitStatus.PollIntervalSeconds != suggestedStageWaitPollIntervalSeconds {
 		t.Errorf("PollIntervalSeconds = %d, want %d (non-terminal stage advertises the poll cadence)",
@@ -193,10 +196,13 @@ func TestDispatchStage_PostFetchFailureWarnsNoError(t *testing.T) {
 
 	runID := uuid.New()
 	stageID := uuid.New()
-	seedStageOfType(fb, runID, stageID, "implement", "running")
-	// Call 1 (resolveStageID) succeeds; call 2 (post-dispatch classify) 500s.
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+	// Three /stages calls now fire: (1) resolveStageID, (2) the sibling-in-flight
+	// guard (#1872), (3) the post-dispatch classify. Fail the THIRD so the
+	// post-dispatch classify errors (the guard's call-2 succeeds — target pending,
+	// no in-flight sibling — and allows the spawn).
 	fb.mu.Lock()
-	fb.stagesFailOnCall = 2
+	fb.stagesFailOnCall = 3
 	fb.mu.Unlock()
 
 	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
@@ -278,7 +284,7 @@ func TestDispatchStage_LocalLockedRunPassesThrough(t *testing.T) {
 
 	runID := uuid.New()
 	stageID := uuid.New()
-	seedStageOfType(fb, runID, stageID, "implement", "running")
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
 	fb.getRunByID[runID] = Run{
 		ID:                 runID.String(),
 		State:              "running",
@@ -297,6 +303,42 @@ func TestDispatchStage_LocalLockedRunPassesThrough(t *testing.T) {
 	}
 	if len(*calls) != 1 {
 		t.Errorf("a local-locked dispatch must spawn exactly one runner, got %d", len(*calls))
+	}
+}
+
+// TestDispatchStage_BlocksSiblingInFlight is the cross-boundary integration
+// test proving the sibling-in-flight guard (#1872) is wired into the detached
+// dispatch path: a dispatch while a sibling stage is still running must return a
+// non-nil error AND spawn ZERO runners. It seeds a running implement sibling
+// through the real GET /v0/runs/{run_id}/stages round-trip and uses
+// captureAllArgv to prove no runner invocation happened.
+func TestDispatchStage_BlocksSiblingInFlight(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	calls := captureAllArgv(t)
+
+	runID := uuid.New()
+	implID := uuid.NewString()
+	acceptanceID := uuid.NewString()
+	seedStages(fb, runID,
+		Stage{ID: implID, RunID: runID.String(), Type: "implement", State: "running"},
+		Stage{ID: acceptanceID, RunID: runID.String(), Type: "acceptance", State: "pending"},
+	)
+
+	_, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID:      runID.String(),
+		Workflow:   "feature_change",
+		Stage:      "acceptance",
+		GitHubRepo: "x/y",
+	})
+	if err == nil {
+		t.Fatal("expected a pre-dispatch block when a sibling stage is running")
+	}
+	if !strings.Contains(err.Error(), "implement") {
+		t.Errorf("block error should name the in-flight sibling: %v", err)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("a blocked dispatch must spawn ZERO runners, got %d invocations", len(*calls))
 	}
 }
 
@@ -394,7 +436,7 @@ func TestDispatchStage_HighOutputDoesNotBlock(t *testing.T) {
 
 	runID := uuid.New()
 	stageID := uuid.New()
-	seedStageOfType(fb, runID, stageID, "implement", "running")
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
 
 	start := time.Now()
 	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
@@ -484,7 +526,7 @@ func TestDispatchStage_RepoDetectSoftFail(t *testing.T) {
 
 		runID := uuid.New()
 		stageID := uuid.New()
-		seedStageOfType(fb, runID, stageID, "implement", "running")
+		seedStageOfType(fb, runID, stageID, "implement", "pending")
 
 		_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
 			RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
@@ -526,7 +568,7 @@ func TestDispatchStage_CallToolRoundTrip(t *testing.T) {
 
 	runID := uuid.New()
 	stageID := uuid.New()
-	seedStageOfType(fb, runID, stageID, "implement", "running")
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
 
 	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "0"}, nil)
 	registerDispatchStage(server, resolver)
@@ -585,8 +627,8 @@ func TestDispatchStage_CallToolRoundTrip(t *testing.T) {
 	if out.StageWaitStatus == nil {
 		t.Fatal("StageWaitStatus did not round-trip")
 	}
-	if out.StageWaitStatus.Status != "running" || out.StageWaitStatus.PollIntervalSeconds != suggestedStageWaitPollIntervalSeconds {
-		t.Errorf("StageWaitStatus = %+v, want running with poll=%d", out.StageWaitStatus, suggestedStageWaitPollIntervalSeconds)
+	if out.StageWaitStatus.Status != "pending" || out.StageWaitStatus.PollIntervalSeconds != suggestedStageWaitPollIntervalSeconds {
+		t.Errorf("StageWaitStatus = %+v, want pending with poll=%d", out.StageWaitStatus, suggestedStageWaitPollIntervalSeconds)
 	}
 	if out.LogPath == "" {
 		t.Error("LogPath did not round-trip")
@@ -605,7 +647,7 @@ func TestDispatchStage_AcceptanceStage_ResolvesAndSpawns(t *testing.T) {
 
 	runID := uuid.New()
 	stageID := uuid.New()
-	seedStageOfType(fb, runID, stageID, "acceptance", "running")
+	seedStageOfType(fb, runID, stageID, "acceptance", "pending")
 
 	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
 		RunID:      runID.String(),
@@ -619,8 +661,8 @@ func TestDispatchStage_AcceptanceStage_ResolvesAndSpawns(t *testing.T) {
 	if out.StageID != stageID.String() {
 		t.Errorf("StageID = %q, want resolved %q", out.StageID, stageID.String())
 	}
-	if out.StageWaitStatus == nil || out.StageWaitStatus.Status != "running" {
-		t.Fatalf("StageWaitStatus = %+v, want status running", out.StageWaitStatus)
+	if out.StageWaitStatus == nil || out.StageWaitStatus.Status != "pending" {
+		t.Fatalf("StageWaitStatus = %+v, want status pending", out.StageWaitStatus)
 	}
 	if len(*calls) == 0 {
 		t.Fatal("expected the detached runner to be spawned")

@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -107,6 +108,69 @@ func TestShipPullRequest_HappyPath(t *testing.T) {
 	}
 	if got := au.appended[0].Category; got != "pull_request_opened" {
 		t.Errorf("audit category = %q", got)
+	}
+}
+
+// TestShipPullRequest_RotationToleratesInFlightUpload is the
+// cross-boundary seam test for incident bdf94763 (#1872): it drives
+// the REAL signing repo through the real PR-upload handler. A run
+// issues two keys (a sibling stage rotated a fresh key in while the
+// implement runner's ship phase was still open), the pull-request
+// artifact body is signed with the FIRST key, and the upload must
+// still be accepted (not 401 signature_invalid) with pull_request_url
+// recorded. Fails on the pre-fix latest-key-only Verify.
+func TestShipPullRequest_RotationToleratesInFlightUpload(t *testing.T) {
+	pool := pgtest.NewPool(t)
+
+	// Real run row so the signing_keys FK is satisfied.
+	runRepoPG := run.NewPostgresRepository(pool)
+	realRun, err := runRepoPG.CreateRun(context.Background(), run.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	runID := realRun.ID
+	stageID := uuid.New()
+
+	signingRepo := signing.NewPostgresRepository(pool)
+	// First key signs the in-flight implement upload...
+	first, err := signingRepo.Issue(context.Background(), runID, signing.DefaultTTL)
+	if err != nil {
+		t.Fatalf("issue first key: %v", err)
+	}
+	// ...then a sibling stage rotates a fresh key in mid-flight.
+	if _, err := signingRepo.Issue(context.Background(), runID, signing.DefaultTTL); err != nil {
+		t.Fatalf("issue second key: %v", err)
+	}
+
+	ar := newFakeArtifactRepo()
+	au := newAuditFake()
+	rr := newPromptRunRepo()
+	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "kuhlman-labs/fishhawk", State: run.StateRunning}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  signingRepo,
+		ArtifactRepo: ar,
+		AuditRepo:    au,
+		RunRepo:      rr,
+	})
+
+	body := validPRBytes(t)
+	// Sign with the FIRST (now-older) key.
+	w := shipPRRequest(t, s, runID, stageID, first.PrivateKey, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (older-key signature must verify after rotation):\n%s", w.Code, w.Body.String())
+	}
+	if len(rr.setPRURLCalls) != 1 {
+		t.Fatalf("expected pull_request_url to be recorded once; got %d calls", len(rr.setPRURLCalls))
+	}
+	if url := rr.setPRURLCalls[0].URL; !strings.HasPrefix(url, "http") {
+		t.Errorf("recorded pull_request_url = %q, want an http URL", url)
 	}
 }
 

@@ -194,7 +194,7 @@ func TestRunStage_ResolvesStageIDWhenOmitted(t *testing.T) {
 	implStage := uuid.New()
 	seedStages(fb, runID,
 		Stage{ID: planStage.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
-		Stage{ID: implStage.String(), RunID: runID.String(), Type: "implement", State: "running"},
+		Stage{ID: implStage.String(), RunID: runID.String(), Type: "implement", State: "pending"},
 	)
 
 	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
@@ -208,6 +208,47 @@ func TestRunStage_ResolvesStageIDWhenOmitted(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(*argv, " "), "--stage-id "+implStage.String()) {
 		t.Errorf("argv should carry the resolved implement stage id %s\nfull: %v", implStage, *argv)
+	}
+}
+
+// TestRunStage_BlocksSiblingInFlight proves the sibling-in-flight guard (#1872)
+// is wired into the synchronous run_stage path too: a run_stage while a sibling
+// stage is running must return a non-nil error AND spawn ZERO runners.
+func TestRunStage_BlocksSiblingInFlight(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	spawned := 0
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, _ ...string) *exec.Cmd {
+		spawned++
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	runID := uuid.New()
+	implID := uuid.NewString()
+	acceptanceID := uuid.NewString()
+	seedStages(fb, runID,
+		Stage{ID: implID, RunID: runID.String(), Type: "implement", State: "running"},
+		Stage{ID: acceptanceID, RunID: runID.String(), Type: "acceptance", State: "pending"},
+	)
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		Workflow:   "feature_change",
+		Stage:      "acceptance",
+		GitHubRepo: "x/y",
+	})
+	if err == nil {
+		t.Fatal("expected a pre-dispatch block when a sibling stage is running")
+	}
+	if !strings.Contains(err.Error(), "implement") {
+		t.Errorf("block error should name the in-flight sibling: %v", err)
+	}
+	if spawned != 0 {
+		t.Errorf("a blocked run_stage must spawn ZERO runners, got %d", spawned)
 	}
 }
 
@@ -282,7 +323,7 @@ func TestRunStage_ExplicitStageIDDisagreesErrors(t *testing.T) {
 	implStage := uuid.New()
 	seedStages(fb, runID,
 		Stage{ID: planStage.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
-		Stage{ID: implStage.String(), RunID: runID.String(), Type: "implement", State: "running"},
+		Stage{ID: implStage.String(), RunID: runID.String(), Type: "implement", State: "pending"},
 	)
 
 	// Pass the plan stage id but ask to run the implement stage.
@@ -314,7 +355,7 @@ func TestRunStage_ExplicitStageIDAgreesWorks(t *testing.T) {
 	implStage := uuid.New()
 	seedStages(fb, runID,
 		Stage{ID: planStage.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
-		Stage{ID: implStage.String(), RunID: runID.String(), Type: "implement", State: "running"},
+		Stage{ID: implStage.String(), RunID: runID.String(), Type: "implement", State: "pending"},
 	)
 
 	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
@@ -814,7 +855,7 @@ func TestRunStage_GitHubRepoAutoDetectFails_WithPushErrors(t *testing.T) {
 	// exercises (resolveStageID runs before the github_repo check).
 	runID := uuid.New()
 	stageID := uuid.New()
-	seedStageOfType(fb, runID, stageID, "implement", "running")
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
 
 	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
 		RunID:         runID.String(),
@@ -983,7 +1024,9 @@ func TestRunStage_ContextCancelSendsSIGTERM(t *testing.T) {
 
 	runID := uuid.New()
 	stageID := uuid.New()
-	seedStage(fb, runID, stageID, "running")
+	// 'pending' is the realistic pre-spawn state: the sibling-in-flight guard
+	// (#1872) rejects dispatching a target already 'running'.
+	seedStage(fb, runID, stageID, "pending")
 
 	ctx, cancel := context.WithCancel(context.Background())
 

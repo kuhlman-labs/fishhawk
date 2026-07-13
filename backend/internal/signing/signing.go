@@ -57,7 +57,7 @@ var (
 	// backwards compatibility with callers that still test for it
 	// (notably runner/internal/upload), but the postgres adapter
 	// no longer returns it — Issue is multi-call, each invocation
-	// inserts a new row, and Verify uses the latest unexpired key.
+	// inserts a new row, and Verify accepts any unexpired key.
 	//
 	// Deprecated: never returned by the production repository.
 	ErrAlreadyIssued = errors.New("signing key already issued for this run")

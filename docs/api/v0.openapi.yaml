@@ -8549,10 +8549,12 @@ paths:
         Multi-call: each invocation appends a new row so each stage's
         fresh GitHub Actions runner process can issue its own key
         without coordinating with prior stages. `Verify` (used by the
-        trace and plan upload endpoints) picks the latest unexpired
-        key for the run; older rows remain so the standalone audit
-        verifier can replay any signature that was valid at upload
-        time. Migration 0012.
+        trace, plan, and pull-request upload endpoints) accepts a
+        signature from ANY unexpired key for the run (newest-first),
+        so a sibling stage's key rotation does not invalidate an
+        in-flight runner's still-open upload (#1872); older rows remain
+        so the standalone audit verifier can replay any signature that
+        was valid at upload time. Migration 0012.
 
         TTL: the server sets `expires_at` to
         `max(30m, resolved_stage_budget + 5m)`, where

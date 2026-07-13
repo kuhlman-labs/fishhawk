@@ -380,6 +380,17 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		return nil, RunStageOutput{}, fmt.Errorf("resolved stage_id %q is not a valid UUID: %w", resolvedStageID, err)
 	}
 
+	// Sibling-in-flight admission guard (#1872). Refuse a synchronous host
+	// dispatch while another stage of the run is dispatched/running (or the
+	// target itself is running), so a second local runner cannot rotate the
+	// signing key out from under an in-flight sibling. Allows the target's own
+	// 'dispatched' park state; fails OPEN on a stage-list read error.
+	siblingWarnings, siblingErr := r.guardSiblingStageInFlight(ctx, runUUID, resolvedStageID)
+	if siblingErr != nil {
+		return nil, RunStageOutput{}, siblingErr
+	}
+	guardWarnings = append(guardWarnings, siblingWarnings...)
+
 	// (2) Resolve the runner binary.
 	// Resolution order: input > FISHHAWK_RUNNER_BIN env > os.Executable sibling dir > PATH > error.
 	binary, err := resolveRunnerBinary(in.RunnerBinary, r.getenv)
