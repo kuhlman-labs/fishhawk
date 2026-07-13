@@ -1,6 +1,10 @@
 package run
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/google/uuid"
+)
 
 // runTransitions enumerates allowed Run state transitions. Any
 // (from, to) not present here is rejected. Same-state transitions
@@ -117,6 +121,18 @@ func ValidRunRetryTransition(from, to State) bool {
 //	external delegating pipeline (ADR-038 / #1384).
 //
 // AwaitingDeployment → Succeeded / Failed: the external pipeline settled.
+//
+// AwaitingChildren → Succeeded / Failed: the decomposition fan-in resolved.
+//
+//	This edge is OWNED by the fan-in resolvers — the childcompletion
+//	sweeper, the orchestrator's resolveParent, and the consolidate
+//	handler — which validate every child slice's terminal state before
+//	resolving the parent park. run.FailStage deliberately REFUSES to fail
+//	an awaiting_children stage (see failure.go): an ordinary failure
+//	reporter (e.g. the reap backstop firing for a doomed mis-dispatched
+//	runner) must never destroy a live fan-in park it does not own, even
+//	though the base-table edge exists for the resolvers. The edge stays in
+//	the table; the ownership guard lives at the domain layer.
 //
 // Cancelled is reachable from any non-terminal state via manual halt.
 var stageTransitions = map[StageState]map[StageState]struct{}{
@@ -379,4 +395,23 @@ type InvalidTransitionError struct {
 
 func (e InvalidTransitionError) Error() string {
 	return fmt.Sprintf("invalid %s transition: %s → %s", e.Kind, e.From, e.To)
+}
+
+// StageStateChangedError is returned by the compare-and-swap stage
+// transition (StageCASTransitioner.TransitionStageFrom) when the
+// row-locked current state differs from the from-state the caller
+// expected. It signals that another writer flipped the stage between the
+// caller's load and its transition, so the transition was refused
+// atomically under the row lock rather than applied against a stale
+// premise. Callers classify it with errors.As to treat the flip as a
+// benign no-op — see run.FailStage (a concurrent fan-in park landing
+// mid-flight) and the reap backstop.
+type StageStateChangedError struct {
+	StageID  uuid.UUID
+	Expected StageState
+	Actual   StageState
+}
+
+func (e StageStateChangedError) Error() string {
+	return fmt.Sprintf("stage %s state changed: expected %s, got %s", e.StageID, e.Expected, e.Actual)
 }

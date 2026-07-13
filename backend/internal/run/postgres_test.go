@@ -755,6 +755,102 @@ func TestPostgres_StageFailureRequiresCompletion(t *testing.T) {
 	}
 }
 
+// TestPostgres_TransitionStageFrom_MismatchRefused pins the CAS refusal
+// against real Postgres (#1903): with the stage parked awaiting_children, a
+// TransitionStageFrom anchored to the stale `pending` expected state must
+// refuse atomically under the FOR UPDATE row lock — returning a typed
+// StageStateChangedError and leaving the park's row completely unchanged (no
+// failure metadata, no ended_at stamped).
+func TestPostgres_TransitionStageFrom_MismatchRefused(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r := makeRun(t, repo)
+	s := makeStage(t, repo, r.ID, 0) // pending
+	// Park it awaiting_children (pending → awaiting_children is a base edge).
+	if _, err := repo.TransitionStage(ctx, s.ID, run.StageStateAwaitingChildren, nil); err != nil {
+		t.Fatalf("park awaiting_children: %v", err)
+	}
+
+	cas, ok := repo.(run.StageCASTransitioner)
+	if !ok {
+		t.Fatal("postgres repo does not implement StageCASTransitioner")
+	}
+	cat := run.FailureC
+	reason := "raced reap against a decomposed parent"
+	_, err := cas.TransitionStageFrom(ctx, s.ID, run.StageStatePending, run.StageStateFailed,
+		&run.StageCompletion{FailureCategory: &cat, FailureReason: &reason})
+	if err == nil {
+		t.Fatal("TransitionStageFrom against a stale expected state returned nil error")
+	}
+	var sce run.StageStateChangedError
+	if !errors.As(err, &sce) {
+		t.Fatalf("error = %v, want StageStateChangedError via errors.As", err)
+	}
+	if sce.Expected != run.StageStatePending || sce.Actual != run.StageStateAwaitingChildren {
+		t.Errorf("StageStateChangedError = {expected:%q actual:%q}, want {pending awaiting_children}",
+			sce.Expected, sce.Actual)
+	}
+
+	// The park row is intact: still awaiting_children, no failure metadata,
+	// no ended_at stamped.
+	cur, err := repo.GetStage(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("get stage: %v", err)
+	}
+	if cur.State != run.StageStateAwaitingChildren {
+		t.Errorf("state = %q, want awaiting_children (park preserved)", cur.State)
+	}
+	if cur.FailureCategory != nil || cur.FailureReason != nil {
+		t.Errorf("failure metadata stamped on a refused CAS: cat=%v reason=%v",
+			cur.FailureCategory, cur.FailureReason)
+	}
+	if cur.EndedAt != nil {
+		t.Errorf("ended_at stamped on a refused CAS: %v", cur.EndedAt)
+	}
+}
+
+// TestPostgres_TransitionStageFrom_MatchTransitions pins that when the
+// expected from-state matches, TransitionStageFrom applies identical
+// completion semantics to TransitionStage: the stage lands failed with the
+// category/reason and a stamped ended_at (#1903).
+func TestPostgres_TransitionStageFrom_MatchTransitions(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r := makeRun(t, repo)
+	s := makeStage(t, repo, r.ID, 0) // pending
+	if _, err := repo.TransitionStage(ctx, s.ID, run.StageStateDispatched, nil); err != nil {
+		t.Fatalf("→dispatched: %v", err)
+	}
+	if _, err := repo.TransitionStage(ctx, s.ID, run.StageStateRunning, nil); err != nil {
+		t.Fatalf("→running: %v", err)
+	}
+
+	cas := repo.(run.StageCASTransitioner)
+	cat := run.FailureB
+	reason := "policy violation post-trace"
+	got, err := cas.TransitionStageFrom(ctx, s.ID, run.StageStateRunning, run.StageStateFailed,
+		&run.StageCompletion{FailureCategory: &cat, FailureReason: &reason})
+	if err != nil {
+		t.Fatalf("TransitionStageFrom (matching expected): %v", err)
+	}
+	if got.State != run.StageStateFailed {
+		t.Errorf("state = %q, want failed", got.State)
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != run.FailureB {
+		t.Errorf("failure category = %v, want B", got.FailureCategory)
+	}
+	if got.FailureReason == nil || *got.FailureReason != reason {
+		t.Errorf("failure reason = %v, want %q", got.FailureReason, reason)
+	}
+	if got.EndedAt == nil {
+		t.Error("ended_at not stamped on terminal CAS transition")
+	}
+}
+
 func TestPostgres_ListStagesForRun_OrderedBySequence(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)

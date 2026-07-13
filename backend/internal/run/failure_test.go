@@ -365,3 +365,132 @@ func TestFailStageOnSucceededIsRejected(t *testing.T) {
 		t.Fatal("FailStage on succeeded stage returned nil error")
 	}
 }
+
+// Mode 1 (#1903): a stage already in awaiting_children at load time is a
+// live decomposition fan-in park owned by its child slices. FailStage must
+// REFUSE it up-front with the ErrStageParked sentinel and attempt no
+// transition — leaving the park's state and (nil) failure metadata
+// untouched — because failing it would take the legal awaiting_children →
+// failed edge and destroy the park. This holds on the non-CAS memRepo, so
+// the refusal is not merely the CAS path's doing.
+func TestFailStageRefusesAwaitingChildrenPark(t *testing.T) {
+	stage := newStage(run.StageStateAwaitingChildren)
+	repo := newMemRepo(stage)
+
+	_, err := run.FailStage(context.Background(), repo, stage.ID, run.FailureC, "doomed spawn")
+	if err == nil {
+		t.Fatal("FailStage on an awaiting_children park returned nil error")
+	}
+	if !errors.Is(err, run.ErrStageParked) {
+		t.Errorf("error = %v, want wrapping ErrStageParked", err)
+	}
+	// The park is intact: state unchanged, no failure metadata stamped.
+	cur, _ := repo.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateAwaitingChildren {
+		t.Errorf("stage state = %q, want awaiting_children (park preserved)", cur.State)
+	}
+	if cur.FailureCategory != nil || cur.FailureReason != nil {
+		t.Errorf("failure metadata stamped on a refused park: cat=%v reason=%v",
+			cur.FailureCategory, cur.FailureReason)
+	}
+}
+
+// casMemRepo augments memRepo with the StageCASTransitioner capability so
+// FailStage exercises its compare-and-swap path (as it does against the
+// production postgresRepo). beforeTransitionFrom, when set, runs just before
+// each TransitionStageFrom evaluates its expected-vs-current check, letting a
+// test flip the stage state to model a park landing mid-flight.
+type casMemRepo struct {
+	*memRepo
+	beforeTransitionFrom func(id uuid.UUID)
+}
+
+func (m *casMemRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	if m.beforeTransitionFrom != nil {
+		m.beforeTransitionFrom(id)
+	}
+	m.mu.Lock()
+	s, ok := m.stages[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, run.ErrNotFound
+	}
+	// Compare-and-swap under the (mutex) lock: refuse atomically if the
+	// current state drifted from the caller's expected from-state, mirroring
+	// postgresRepo.TransitionStageFrom's row-locked check.
+	if s.State != from {
+		cur := s.State
+		m.mu.Unlock()
+		return nil, run.StageStateChangedError{StageID: id, Expected: from, Actual: cur}
+	}
+	m.mu.Unlock()
+	// Delegate the actual mutation + completion/ended_at semantics to the
+	// embedded memRepo's TransitionStage (which re-locks internally).
+	return m.TransitionStage(ctx, id, to, c)
+}
+
+// Mode 2 (#1903): a park landing AFTER FailStage's load — the residual
+// TOCTOU. The stage is loaded as pending; the CAS hook flips it to
+// awaiting_children before the (pending → failed) TransitionStageFrom
+// evaluates, so the compare-and-swap refuses with StageStateChangedError and
+// the park survives instead of being destroyed.
+func TestFailStageCASRefusesMidFlightPark(t *testing.T) {
+	stage := newStage(run.StageStatePending)
+	base := newMemRepo(stage)
+	var flipped bool
+	repo := &casMemRepo{memRepo: base, beforeTransitionFrom: func(id uuid.UUID) {
+		if flipped || id != stage.ID {
+			return
+		}
+		flipped = true
+		base.mu.Lock()
+		base.stages[id].State = run.StageStateAwaitingChildren
+		base.mu.Unlock()
+	}}
+
+	_, err := run.FailStage(context.Background(), repo, stage.ID, run.FailureC, "raced by a fanout park")
+	if err == nil {
+		t.Fatal("FailStage returned nil error despite a mid-flight park")
+	}
+	var sce run.StageStateChangedError
+	if !errors.As(err, &sce) {
+		t.Fatalf("error = %v, want StageStateChangedError via errors.As", err)
+	}
+	if sce.Expected != run.StageStatePending || sce.Actual != run.StageStateAwaitingChildren {
+		t.Errorf("StageStateChangedError = {expected:%q actual:%q}, want {pending awaiting_children}",
+			sce.Expected, sce.Actual)
+	}
+	// The park survived and was never stamped failed.
+	cur, _ := repo.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateAwaitingChildren {
+		t.Errorf("stage state = %q, want awaiting_children (park preserved)", cur.State)
+	}
+	if cur.FailureCategory != nil {
+		t.Errorf("failure metadata stamped on a refused park: %v", cur.FailureCategory)
+	}
+}
+
+// Mode 3 (#1903): the CAS happy path, including the dispatched → running →
+// failed walk. Proves failStageCAS re-anchors its expected from-state per
+// step (dispatched for the first CAS, then the produced running state for the
+// final CAS), landing failed with the right category — so the CAS path is not
+// merely a refusal mechanism.
+func TestFailStageCASHappyPathWalksDispatched(t *testing.T) {
+	stage := newStage(run.StageStateDispatched)
+	base := newMemRepo(stage)
+	repo := &casMemRepo{memRepo: base}
+
+	got, err := run.FailStage(context.Background(), repo, stage.ID, run.FailureC, "infra")
+	if err != nil {
+		t.Fatalf("FailStage: %v", err)
+	}
+	if got.State != run.StageStateFailed {
+		t.Errorf("state = %q, want failed", got.State)
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != run.FailureC {
+		t.Errorf("failure category = %v, want C", got.FailureCategory)
+	}
+	if got.EndedAt == nil {
+		t.Error("ended_at not stamped on terminal transition")
+	}
+}

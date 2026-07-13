@@ -185,16 +185,26 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Protected-park no-op (#1891): a stage in awaiting_children is a LIVE
-	// decomposition park owned by its child slices, not a stuck spawn. A
-	// spawn-phase failure report can reach here when a runner is (mis-)dispatched
-	// against a decomposed parent's implement stage — the doomed runner 409s on
-	// prompt fetch and its detached reaper reports the exit. Failing the stage
-	// here would destroy the park (awaiting_children → failed is a legal sweeper
-	// edge), suppressing fan-in forever. Treat it exactly like the already-terminal
-	// no-op: 200 {transitioned:false}, NO FailStage, NO dispatch_reaper_failed
-	// audit entry, NO orchestrator advance. This is the fail-closed backstop that
-	// holds even if the MCP admission guard (guardSiblingStageInFlight) is skipped.
+	// Protected-park FAST PATH (#1891): a stage already in awaiting_children
+	// at load time is a LIVE decomposition park owned by its child slices,
+	// not a stuck spawn. A spawn-phase failure report can reach here when a
+	// runner is (mis-)dispatched against a decomposed parent's implement
+	// stage — the doomed runner 409s on prompt fetch and its detached reaper
+	// reports the exit. Return the benign no-op WITHOUT reaching FailStage:
+	// 200 {transitioned:false}, NO dispatch_reaper_failed audit entry, NO
+	// orchestrator advance.
+	//
+	// This pre-check is the fast path, NOT the sole guarantor of the
+	// park-protection invariant — it only catches a park already visible at
+	// load. The invariant is actually held by run.FailStage itself: it
+	// REFUSES an awaiting_children stage up-front (ErrStageParked) and drives
+	// its transitions through a row-locked compare-and-swap, so a park that
+	// lands AFTER this pre-check (the residual TOCTOU, #1903) is refused
+	// there rather than destroyed. Both refusal shapes surface in the
+	// post-FailStage error branch below, where the re-load classifies them as
+	// the same benign no-op. The pre-check remains as the cheap common case
+	// and as the fail-closed backstop even if the MCP admission guard
+	// (guardSiblingStageInFlight) is skipped.
 	if stage.State == run.StageStateAwaitingChildren {
 		s.writeJSON(w, r, http.StatusOK, reapFailureResponse{
 			Transitioned: false,
@@ -218,10 +228,16 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 		// winner already did the work, so return the SAME benign
 		// {transitioned:false} no-op the pre-check returns — no audit entry, no
 		// advance. Only a genuine failure (stage still non-terminal) is a 500.
+		//
 		// A concurrent fanout can also PARK the stage awaiting_children in this
-		// window (the decomposed-parent race): the re-loaded stage is then a live
-		// park, not a stuck spawn, so return the same benign no-op rather than a
-		// 500 — never fail a restored/live park (#1891).
+		// window (the decomposed-parent race, #1903). FailStage now REFUSES that
+		// mid-window park rather than taking the legal awaiting_children → failed
+		// edge and destroying it: either up-front (ErrStageParked, when the park
+		// is already visible at FailStage's own load) or via a row-locked
+		// compare-and-swap (StageStateChangedError, when it lands between
+		// FailStage's load and its transition). Both refusals land here, where
+		// the re-loaded stage is a live park — so return the same benign no-op
+		// rather than a 500. Never fail a restored/live park (#1891/#1903).
 		if cur, gerr := s.cfg.RunRepo.GetStage(r.Context(), stageID); gerr == nil &&
 			(cur.State.IsTerminal() || cur.State == run.StageStateAwaitingChildren) {
 			s.writeJSON(w, r, http.StatusOK, reapFailureResponse{
