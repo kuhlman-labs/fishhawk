@@ -900,6 +900,13 @@ func runServe(args []string, logSink io.Writer) int {
 		// is a secret and must never be logged or traced (#1114). Absent, a
 		// user-owned project board stays best-effort boarded:false (#1107).
 		cfg.GitHub.ProjectsToken = *projectsToken
+		// Bind the SAME GitHub auto-merge seam the campaign GateActor uses into
+		// the server so the local auto-driver endpoint (POST
+		// /v0/runs/{run_id}/auto-drive, #1700) can dispatch a delegated
+		// may_merge. Guarded by this cfg.GitHub != nil block exactly like the
+		// campaign wiring — a nil GateMerger keeps may_merge fail-CLOSED to
+		// observe-only, byte-identical to today.
+		cfg.GateMerger = githubAutoMerger{gh: cfg.GitHub}
 		logger.Info("github app + REST client configured",
 			slog.Int64("app_id", appID),
 			slog.Bool("projects_token_configured", *projectsToken != ""))

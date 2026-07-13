@@ -4378,6 +4378,159 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/runs/{run_id}/auto-drive:
+    post:
+      operationId: autoDriveRunGate
+      summary: Drive the run's parked gate under ADR-040 delegation
+      description: |
+        Exposes the in-process auto-driver (`AutoDriveRunGate`, E25.6 /
+        ADR-047) — the GHA campaign driver's delegated
+        approve/route_fixup/retry/merge contract with double-gating,
+        fail-closed observe-only, and must_page_human refusal — to the local
+        auto-driver (`fishhawk_drive_run`, #1700). The caller's operator-agent
+        token identity is the acting identity, so the delegated action's own
+        audit row (`approval_submitted` with its delegated rule,
+        `stage_fixup_triggered`, `stage_retried`, …) carries the ADR-040
+        delegation context, written TRANSACTIONALLY by the action path.
+
+        **`run_auto_driven` is the SUPPLEMENTARY driver-attribution record,
+        NOT the authoritative delegation record.** On an ACTED outcome this
+        endpoint ALSO appends a run-chained `run_auto_driven` `act:"gate"`
+        entry for driver attribution. The AUTHORITATIVE record of the
+        delegated action is that action's own audit row (above); the
+        supplementary row exists only to attribute which driver acted.
+
+        **Fail-loud.** If the supplementary append fails after the gate act,
+        the endpoint returns `500 auto_drive_record_failed` naming the
+        recording failure rather than a silent `acted:true` — the drive loop
+        surfaces it and STOPS acting. The action's own row is already durable,
+        so the primary delegation record is intact even in that window. A
+        genuine gate-dispatch failure is surfaced as `500
+        auto_drive_dispatch_failed`, never swallowed as observe-only.
+
+        **Merge is queued, not landed.** A delegated `may_merge` ENABLES
+        GitHub auto-merge via the configured seam; the real merge lands when
+        branch protection clears, observed via the `pull_request`-closed
+        webhook. A nil merge seam keeps `may_merge` fail-closed to
+        observe-only.
+
+        **Authorization.** Requires `write:approvals` — the strictest action
+        the gate can dispatch (approve); operator and operator-agent tokens
+        already carry it.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: |
+            The gate outcome. Exactly one of `acted`/`paged` is true on a
+            non-observe-only outcome; observe-only has both false.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [acted, paged, note]
+                properties:
+                  acted: { type: boolean, description: 'True when a delegated gate action was dispatched.' }
+                  action: { type: string, description: 'The delegation verb taken (approve|route_fixup|retry|merge), set when acted.' }
+                  paged: { type: boolean, description: 'True when a must_page_human condition was refused.' }
+                  page_event: { type: string, description: 'The page event name, set when paged.' }
+                  note: { type: string, description: 'Short human-readable summary of the outcome.' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'The identity lacks `write:approvals` (`insufficient_scope`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500':
+          description: |
+            `auto_drive_dispatch_failed` (the gate action was attempted and
+            errored) or `auto_drive_record_failed` (the gate action landed but
+            the supplementary `run_auto_driven` attribution row failed to
+            append — fail-loud; the authoritative delegated-action row is
+            durable, but the driver must stop).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: 'Run or audit repositories are not wired (`auto_drive_unconfigured`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/auto-drive/acts:
+    post:
+      operationId: recordAutoDriveAct
+      summary: Record a driver stage dispatch (record-before-dispatch)
+      description: |
+        The server-owned write path the local auto-driver
+        (`fishhawk_drive_run`, #1700) calls to record a stage dispatch BEFORE
+        it host-spawns the runner, so no mechanical act can occur unaudited —
+        the audit chain stays server-owned; the MCP host never writes a chain
+        entry itself. On success it appends a run-chained `run_auto_driven`
+        `act:"dispatch"` entry under the caller's operator-agent identity.
+
+        Like the gate endpoint, this row is the SUPPLEMENTARY
+        driver-attribution record; the stage's own lifecycle audit rows remain
+        authoritative. Validation fails CLOSED — an unknown run 404s and every
+        missing/bad field 400s, appending nothing. A record-append failure is
+        fail-loud (`500 auto_drive_record_failed`) so the driver does NOT
+        dispatch. Requires `write:approvals`.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [action, stage, source]
+              properties:
+                action: { type: string, enum: [dispatch_stage], description: 'The only recognised action.' }
+                stage: { type: string, enum: [plan, implement, acceptance, fixup_redispatch], description: 'The stage being dispatched; fixup_redispatch is a delegated fix-up/retry re-open.' }
+                source: { type: string, description: 'The driver tag, e.g. fishhawk_drive_run.' }
+                note: { type: string, description: 'Optional note (e.g. "retry" on a crash-resume re-record).' }
+      responses:
+        '200':
+          description: The appended attribution row's identifying fields.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  category: { type: string }
+                  act: { type: string }
+                  action: { type: string }
+                  stage: { type: string }
+                  source: { type: string }
+                  sequence: { type: integer, format: int64 }
+        '400':
+          description: 'Missing/bad `action`, `stage`, or `source` (`validation_failed`, naming the field). Nothing is appended.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: 'The identity lacks `write:approvals` (`insufficient_scope`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500':
+          description: 'The record append failed (`auto_drive_record_failed`); the driver must not dispatch.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: 'Run or audit repositories are not wired (`auto_drive_unconfigured`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/runs/{run_id}/stages:
     get:
       operationId: listRunStages

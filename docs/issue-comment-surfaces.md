@@ -394,6 +394,23 @@ Notes:
   `NotifyRunRejected` (below); the finer per-reviewer capability gap does not
   reject and posts no comment. Listed here so a reader grepping for reviewer
   audit kinds sees the full non-comment set.
+- The local auto-driver attribution audit kind — `run_auto_driven` (#1700),
+  written by the auto-drive endpoints (`server/autodrive_http.go`) when the
+  local `fishhawk_drive_run` verb walks a run one mechanical step under ADR-040
+  delegation — is an **internal, driver-attribution audit kind, not an
+  issue-comment surface**. Nothing in `issuecomment` posts it. It carries two
+  act shapes via an `act` discriminator: `act:"gate"` `{action:
+  approve|route_fixup|retry|merge, source: run_auto_drive_endpoint, note}` for a
+  delegated gate action, and `act:"dispatch"` `{action: dispatch_stage, stage:
+  plan|implement|acceptance|fixup_redispatch, source: fishhawk_drive_run, note}`
+  for a driver stage dispatch (recorded BEFORE the host-spawn). **It is the
+  SUPPLEMENTARY driver-attribution record, NOT the authoritative delegation
+  record**: the delegated action's OWN audit row (`approval_submitted` with its
+  delegated rule, `stage_fixup_triggered`, `stage_retried`, …) is written
+  transactionally by the action path and remains the authoritative record of
+  the delegation. Listed here so a reader grepping for auto-driver audit kinds
+  sees it is a non-comment, supplementary surface (the campaign sibling
+  `campaign_gate_paged` above IS a hand-off surface; this one is not).
 - The plan-approval completion-gate backstop audit kind —
   `plan_review_backstop_elapsed` (ADR-036 / #875), written by the approval
   handler (`server/approvals.go::checkPlanReviewSettled`) when a plan-stage

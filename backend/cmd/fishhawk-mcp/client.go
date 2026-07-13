@@ -1160,6 +1160,85 @@ func (c *apiClient) VouchCommit(ctx context.Context, runID uuid.UUID, sha, reaso
 	return &res, nil
 }
 
+// AutoDriveOutcome mirrors the backend's POST /v0/runs/{run_id}/auto-drive
+// 200 body (#1700): the AutoDriveRunGate result the local drive verb switches
+// on. Exactly one of Acted / Paged is true on a non-observe-only outcome; an
+// observe-only outcome has both false. Repeated (not imported) per the thin
+// local-copy rule — import direction is cli → backend, not the reverse.
+type AutoDriveOutcome struct {
+	Acted     bool   `json:"acted"`
+	Action    string `json:"action,omitempty"`
+	Paged     bool   `json:"paged"`
+	PageEvent string `json:"page_event,omitempty"`
+	Note      string `json:"note"`
+}
+
+// AutoDriveRunGate calls POST /v0/runs/{run_id}/auto-drive (#1700): it drives
+// the run's ONE parked gate under ADR-040 delegation, returning the outcome.
+// The delegated action's own audit row is the authoritative record; the
+// endpoint ALSO lands a supplementary run_auto_driven act:gate attribution
+// row on an ACTED outcome. FAIL-LOUD: a supplementary-append failure surfaces
+// as a 500 apiError (auto_drive_record_failed), and a genuine gate-dispatch
+// failure as auto_drive_dispatch_failed — the drive loop stops acting on
+// either rather than continuing on a silent success. 4xx/5xx surfaces:
+//   - 401 authentication_required / 403 insufficient_scope (needs write:approvals)
+//   - 404 run_not_found
+//   - 500 auto_drive_dispatch_failed / auto_drive_record_failed
+func (c *apiClient) AutoDriveRunGate(ctx context.Context, runID uuid.UUID) (*AutoDriveOutcome, error) {
+	var res AutoDriveOutcome
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/auto-drive", []byte("{}"), &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// RecordAutoDriveAct is one record-before-dispatch call the drive verb makes
+// before host-spawning a stage. Action is always "dispatch_stage"; Stage is
+// one of plan|implement|acceptance|fixup_redispatch; Source is the driver
+// tag ("fishhawk_drive_run").
+type RecordAutoDriveAct struct {
+	Action string `json:"action"`
+	Stage  string `json:"stage"`
+	Source string `json:"source"`
+	Note   string `json:"note,omitempty"`
+}
+
+// RecordAutoDriveActResult mirrors the backend's POST
+// /v0/runs/{run_id}/auto-drive/acts 200 body (#1700): the appended
+// run_auto_driven act:dispatch attribution row's identifying fields.
+type RecordAutoDriveActResult struct {
+	RunID    string `json:"run_id"`
+	Category string `json:"category"`
+	Act      string `json:"act"`
+	Action   string `json:"action"`
+	Stage    string `json:"stage"`
+	Source   string `json:"source"`
+	Sequence int64  `json:"sequence"`
+}
+
+// RecordAutoDriveAct calls POST /v0/runs/{run_id}/auto-drive/acts (#1700): the
+// server-owned write path the drive verb uses to record a stage dispatch
+// BEFORE it host-spawns the runner. The audit chain stays server-owned; the
+// MCP host never writes a chain entry itself. Validation fails CLOSED — an
+// unknown run 404s and every missing/bad field 400s, appending nothing.
+// FAIL-LOUD: a record-append failure surfaces as 500 auto_drive_record_failed
+// so the caller does NOT dispatch. 4xx/5xx surfaces:
+//   - 400 validation_failed (missing/bad action, stage, or source)
+//   - 401 authentication_required / 403 insufficient_scope (needs write:approvals)
+//   - 404 run_not_found
+//   - 500 auto_drive_record_failed
+func (c *apiClient) RecordAutoDriveAct(ctx context.Context, runID uuid.UUID, act RecordAutoDriveAct) (*RecordAutoDriveActResult, error) {
+	body, err := json.Marshal(act)
+	if err != nil {
+		return nil, fmt.Errorf("marshal record auto-drive act: %w", err)
+	}
+	var res RecordAutoDriveActResult
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/auto-drive/acts", body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // ConsolidateResult mirrors the backend's consolidate 200 body (E24.2 /
 // #1238): the outcome of running the decomposed-parent fan-in on demand.
 // Outcome is "integrated" (every slice merged, parent implement succeeded,

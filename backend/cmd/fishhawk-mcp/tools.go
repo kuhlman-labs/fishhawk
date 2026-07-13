@@ -29,6 +29,21 @@ type runResolver struct {
 	// defaultReviewPollInterval; tests inject a sub-millisecond value so
 	// the poll loop runs without wall-clock sleeps.
 	reviewPollInterval time.Duration
+
+	// drivePollInterval is the poll cadence fishhawk_drive_run (#1700) uses
+	// while a stage or review is in flight. Zero falls back to
+	// defaultDrivePollInterval; tests inject a sub-millisecond value.
+	drivePollInterval time.Duration
+
+	// driveMaxWallclock, when non-zero, OVERRIDES the max_minutes-derived
+	// wall-clock deadline for fishhawk_drive_run. Tests inject a tiny value
+	// to exercise the timeout stop without a real minutes-long wait.
+	driveMaxWallclock time.Duration
+
+	// driveSpawn is the injectable spawn seam for fishhawk_drive_run (#1700).
+	// Nil uses the real spawnRunnerStageDetached; tests inject a recording
+	// spawner so the loop runs without launching a runner process.
+	driveSpawn driveSpawnFunc
 }
 
 // registerTools wires every MCP tool onto srv. Called once at
@@ -71,6 +86,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerListRuns(srv, resolver)
 	registerRunStage(srv, resolver)
 	registerDispatchStage(srv, resolver)
+	registerDriveRun(srv, resolver)
 	registerRunChildren(srv, resolver)
 	registerRuntimeCalibration(srv, resolver)
 	registerVerifyRun(srv, resolver)
