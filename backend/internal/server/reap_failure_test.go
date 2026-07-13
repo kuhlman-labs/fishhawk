@@ -507,6 +507,193 @@ func TestReapStageFailure_ParkLandsAfterFailStageLoad(t *testing.T) {
 	assertBenignParkNoOp(t, w, rr, au, runRow.ID, stage.ID)
 }
 
+// midFlightFlipReapRepo models a benign concurrent ADVANCE (#1907): a report
+// passes the pre-check, but by the time FailStage's CAS evaluates, a
+// concurrent writer has advanced the stage to another still-live,
+// legally-failable state. It flips the target stage to flipTo on the FIRST
+// TransitionStageFrom attempt, then delegates — so that CAS refuses with
+// StageStateChangedError, driving FailStage's re-anchor loop, which must
+// ABSORB the advance and land failed rather than surfacing a 500.
+type midFlightFlipReapRepo struct {
+	*orchestratorRepo
+	stageID uuid.UUID
+	flipTo  run.StageState
+	flipped bool
+}
+
+func (r *midFlightFlipReapRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	if !r.flipped && id == r.stageID {
+		r.flipped = true
+		r.mu.Lock()
+		if st := r.stagesByID[id]; st != nil {
+			st.State = r.flipTo
+		}
+		r.mu.Unlock()
+	}
+	return r.orchestratorRepo.TransitionStageFrom(ctx, id, from, to, c)
+}
+
+// assertAbsorbedFailure checks the reap handler absorbed a benign mid-flight
+// advance: 200 {transitioned:true, stage_state:failed}, the stage lands failed,
+// exactly one dispatch_reaper_failed audit entry, and Advance ran (the run's
+// only stage is failed, so it walked the run to failed).
+func assertAbsorbedFailure(t *testing.T, w *httptest.ResponseRecorder, rr *orchestratorRepo, au *auditFake, runID, stageID uuid.UUID) {
+	t.Helper()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (advance absorbed, not 500):\n%s", w.Code, w.Body.String())
+	}
+	var resp reapFailureResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.Transitioned {
+		t.Error("transitioned = false, want true (mid-flight advance absorbed)")
+	}
+	if resp.StageState != string(run.StageStateFailed) {
+		t.Errorf("stage_state = %q, want failed", resp.StageState)
+	}
+	cur, _ := rr.GetStage(context.Background(), stageID)
+	if cur.State != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed", cur.State)
+	}
+	if got := reapAudit(au); len(got) != 1 {
+		t.Errorf("dispatch_reaper_failed entries = %d, want 1", len(got))
+	}
+	curRun, _ := rr.GetRun(context.Background(), runID)
+	if curRun.State != run.StateFailed {
+		t.Errorf("run state = %q, want failed (Advance invoked)", curRun.State)
+	}
+}
+
+// (b7) Concurrent mid-flight flip absorbed (#1907, review interleaving (a)): a
+// dispatched stage is advanced to running by a concurrent writer before
+// FailStage's first CAS. The re-anchor loop absorbs it, so the report settles
+// 200 {transitioned:true} — NOT a 500 — with one audit entry and an Advance.
+func TestReapStageFailure_ConcurrentMidFlightFlipAbsorbed(t *testing.T) {
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched)
+	race := &midFlightFlipReapRepo{orchestratorRepo: rr, stageID: stage.ID, flipTo: run.StageStateRunning}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      race,
+		AuditRepo:    au,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+
+	w := postReapFailure(t, s, runRow.ID, stage.ID,
+		reapFailureRequest{Category: "C", Reason: "raced by a concurrent advance"}, withReapOperator)
+	assertAbsorbedFailure(t, w, rr, au, runRow.ID, stage.ID)
+}
+
+// (b8) Awaiting-approval flip absorbed (#1907, review interleaving (b)): a
+// running stage is advanced to awaiting_approval by a concurrent writer before
+// FailStage's final CAS. The re-anchor loop absorbs it via the legal
+// awaiting_approval → failed edge; same 200 {transitioned:true} outcome.
+func TestReapStageFailure_AwaitingApprovalFlipAbsorbed(t *testing.T) {
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	race := &midFlightFlipReapRepo{orchestratorRepo: rr, stageID: stage.ID, flipTo: run.StageStateAwaitingApproval}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      race,
+		AuditRepo:    au,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+
+	w := postReapFailure(t, s, runRow.ID, stage.ID,
+		reapFailureRequest{Category: "C", Reason: "raced by a gate opening"}, withReapOperator)
+	assertAbsorbedFailure(t, w, rr, au, runRow.ID, stage.ID)
+}
+
+// livelockReapRepo models pathological livelock (#1907): it alternates the
+// target stage between two live states on EVERY TransitionStageFrom call, so
+// no CAS attempt ever succeeds and FailStage exhausts its bounded retries.
+// advanceReached records whether orchestrator.Advance ran: the handler reaches
+// ListStagesForRun ONLY through Advance (its own path uses GetStage, never
+// ListStagesForRun), and Advance always calls it for a non-terminal run — so a
+// false flag load-bearingly proves Advance was never invoked, which the
+// run-still-running check alone cannot (a live stage leaves the run running
+// whether or not Advance ran).
+type livelockReapRepo struct {
+	*orchestratorRepo
+	stageID        uuid.UUID
+	advanceReached bool
+}
+
+// ListStagesForRun flags that orchestrator.Advance entered its stage walk, then
+// delegates. The flag is set under the embedded mutex and released before the
+// delegate re-locks it (sync.Mutex is not reentrant).
+func (r *livelockReapRepo) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]*run.Stage, error) {
+	r.mu.Lock()
+	r.advanceReached = true
+	r.mu.Unlock()
+	return r.orchestratorRepo.ListStagesForRun(ctx, runID)
+}
+
+func (r *livelockReapRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	if id == r.stageID {
+		r.mu.Lock()
+		if st := r.stagesByID[id]; st != nil {
+			if st.State == run.StageStateRunning {
+				st.State = run.StageStateAwaitingApproval
+			} else {
+				st.State = run.StageStateRunning
+			}
+		}
+		r.mu.Unlock()
+	}
+	return r.orchestratorRepo.TransitionStageFrom(ctx, id, from, to, c)
+}
+
+// (b9) Livelock exhaustion → 500 (#1907): FailStage's re-anchor loop never
+// converges because a concurrent writer flips the stage between two live states
+// before every CAS. The report must return 500 internal_error — the documented,
+// retryable exhaustion contract — with NO dispatch_reaper_failed audit entry and
+// NO Advance (the stage is still live, so the re-load does not classify it
+// benign).
+func TestReapStageFailure_LivelockExhaustion500(t *testing.T) {
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	race := &livelockReapRepo{orchestratorRepo: rr, stageID: stage.ID}
+	s := New(Config{
+		Addr:      "127.0.0.1:0",
+		RunRepo:   race,
+		AuditRepo: au,
+		// Route Advance through race so its entry is observable via the
+		// advanceReached spy — the run-still-running check below cannot see it.
+		Orchestrator: &orchestrator.Orchestrator{Runs: race},
+	})
+
+	w := postReapFailure(t, s, runRow.ID, stage.ID,
+		reapFailureRequest{Category: "C", Reason: "perpetual livelock"}, withReapOperator)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (documented exhaustion contract):\n%s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("internal_error")) {
+		t.Errorf("body missing internal_error: %s", w.Body.String())
+	}
+	// No audit entry and no Advance: the stage never reached failed. The
+	// advanceReached spy is the load-bearing no-Advance proof — the stage is
+	// deliberately left live, so the run stays running whether or not Advance
+	// ran, and the run-state check below cannot distinguish the two.
+	if got := reapAudit(au); len(got) != 0 {
+		t.Errorf("dispatch_reaper_failed entries = %d, want 0 (nothing failed)", len(got))
+	}
+	if race.advanceReached {
+		t.Errorf("orchestrator.Advance was invoked, want NOT invoked (500 exhaustion path)")
+	}
+	curRun, _ := rr.GetRun(context.Background(), runRow.ID)
+	if curRun.State != run.StateRunning {
+		t.Errorf("run state = %q, want running (stage still live)", curRun.State)
+	}
+}
+
 // (c) Invalid category (A) → 400. An empty category is covered by the sub-test.
 func TestReapStageFailure_InvalidCategory(t *testing.T) {
 	for _, cat := range []string{"A", ""} {

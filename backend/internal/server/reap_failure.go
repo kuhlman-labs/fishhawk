@@ -219,25 +219,37 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 	// path from whichever non-terminal state the stage is in (e.g. dispatched →
 	// running → failed), so the spawn-phase 'dispatched' case is handled.
 	if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, req.Reason); err != nil {
-		// Idempotency under concurrency: the pre-check above and this FailStage
-		// call are NOT atomic. A concurrent reap report, or a race with the
-		// dispatch watchdog / runner's own terminal report, can drive the stage
-		// terminal in the window between them — the loser reaches FailStage
-		// after the winner and TransitionStage refuses the move
-		// (InvalidTransitionError). Re-load the stage: if it is now terminal the
-		// winner already did the work, so return the SAME benign
-		// {transitioned:false} no-op the pre-check returns — no audit entry, no
-		// advance. Only a genuine failure (stage still non-terminal) is a 500.
+		// This branch now fires for a NARROW, well-classified set, because
+		// FailStage's #1907 re-anchor loop ABSORBS every benign concurrent
+		// ADVANCE to a still-live, legally-failable state (e.g. a
+		// dispatched → running or running → awaiting_approval flip landing
+		// mid-window): those no longer reach here as a refusal — FailStage
+		// re-anchors and lands failed, so this call returns success. What
+		// still lands here is:
 		//
-		// A concurrent fanout can also PARK the stage awaiting_children in this
-		// window (the decomposed-parent race, #1903). FailStage now REFUSES that
-		// mid-window park rather than taking the legal awaiting_children → failed
-		// edge and destroying it: either up-front (ErrStageParked, when the park
-		// is already visible at FailStage's own load) or via a row-locked
-		// compare-and-swap (StageStateChangedError, when it lands between
-		// FailStage's load and its transition). Both refusals land here, where
-		// the re-loaded stage is a live park — so return the same benign no-op
-		// rather than a 500. Never fail a restored/live park (#1891/#1903).
+		//   (a) A concurrent writer SETTLED the stage terminal (a double-report
+		//       or a race with the dispatch watchdog / runner's own terminal
+		//       report) — FailStage returns the typed StageStateChangedError
+		//       unchanged. Re-load: the stage is terminal, the winner did the
+		//       work, so return the benign {transitioned:false} no-op — no audit
+		//       entry, no advance.
+		//   (b) A concurrent fanout PARKED the stage awaiting_children (the
+		//       decomposed-parent race, #1903). FailStage REFUSES that park
+		//       rather than taking the legal awaiting_children → failed edge and
+		//       destroying it — either up-front (ErrStageParked, park visible at
+		//       FailStage's load) or via the row-locked CAS
+		//       (StageStateChangedError, park landing mid-flight OR after a
+		//       re-anchor). Re-load: the stage is a live park, so return the same
+		//       benign no-op. Never fail a restored/live park (#1891/#1903).
+		//   (c) FailStage retry EXHAUSTION under pathological livelock, or a
+		//       genuine repo error — the stage is still non-terminal and
+		//       non-park, so the re-load falls through to the 500 below. That
+		//       500 is the DELIBERATE, retryable contract (#1907): the detached
+		//       reaper may re-POST, and the ~1h dispatch watchdog is the eventual
+		//       backstop for a genuinely stuck stage.
+		//
+		// The re-load's terminal-or-park check is exactly the benign set (a)+(b);
+		// no classification code changed for the #1907 semantics.
 		if cur, gerr := s.cfg.RunRepo.GetStage(r.Context(), stageID); gerr == nil &&
 			(cur.State.IsTerminal() || cur.State == run.StageStateAwaitingChildren) {
 			s.writeJSON(w, r, http.StatusOK, reapFailureResponse{

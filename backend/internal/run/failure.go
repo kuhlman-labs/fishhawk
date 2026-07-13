@@ -36,12 +36,39 @@ var ErrStageParked = errors.New("stage is parked awaiting children")
 // because a CAS anchored at from=awaiting_children would LEGALLY perform
 // exactly that destructive move.
 //
-// Concurrency: when the repo provides the StageCASTransitioner capability
-// (production postgresRepo), FailStage drives each step through
-// TransitionStageFrom anchored to the state observed at that step, so a
-// concurrent park (or any other flip) landing AFTER the load surfaces as a
-// typed StageStateChangedError instead of succeeding against a stale
-// premise. In-memory fakes without the capability fall back to the plain
+// Concurrency contract (decided in #1907, restoring pre-#1906 semantics):
+// when the repo provides the StageCASTransitioner capability (production
+// postgresRepo), FailStage drives each step through TransitionStageFrom
+// anchored to the state observed at that step. A concurrent flip landing
+// between the load and a step is handled by class:
+//
+//   - Benign concurrent ADVANCE to a still-live, legally-failable state
+//     (e.g. dispatched → running, or running → awaiting_approval): the CAS
+//     refuses with StageStateChangedError, and failStageCAS RE-ANCHORS its
+//     walk at the observed Actual state and retries (bounded). This ABSORBS
+//     the advance and lands failed, exactly as the pre-CAS TransitionStage
+//     walk did — so the 18 FailStage call sites (SLA, approvals, dispatch
+//     watchdog, webhook dispatcher, trace, plan, pullrequest,
+//     scope_completeness, lineage, deploy_trigger, reap) need NO per-site
+//     CAS handling: their error branches fire only for the two typed
+//     refusals below, retry exhaustion, and genuine repo errors — the same
+//     benign-or-real classes their pre-CAS handling was written for.
+//   - Flip to a TERMINAL state (another writer already settled the stage):
+//     a typed StageStateChangedError, returned unchanged and never retried.
+//   - Flip to the awaiting_children PARK (#1903 fan-in): a typed
+//     StageStateChangedError (or the up-front ErrStageParked when the park
+//     is visible at load), returned unchanged and never retried — the park
+//     is owned by its children and must never be collapsed. Because every
+//     retry attempt is itself an atomic row-locked CAS and a park observed
+//     at ANY attempt refuses without retrying, the park-protection
+//     invariant holds by construction across re-anchoring.
+//   - Retry EXHAUSTION under pathological livelock (a state flip between
+//     every attempt): the last StageStateChangedError is returned. For the
+//     reap endpoint this is the documented 500-and-retry contract — the
+//     reporter may re-POST and the ~1h dispatch watchdog is the eventual
+//     backstop.
+//
+// In-memory fakes without the capability fall back to the plain
 // TransitionStage walk, which retains a (fake-only) post-load window — no
 // production repo takes that path.
 //
@@ -107,14 +134,34 @@ func FailStage(
 	return out, nil
 }
 
+// failStageCASMaxAttempts bounds the re-anchor loop below. Each attempt
+// absorbs one benign concurrent advance; four is far beyond any realistic
+// interleaving (a genuine livelock requires a state flip between every
+// attempt) yet caps the pathological case so the loop terminates.
+const failStageCASMaxAttempts = 4
+
 // failStageCAS drives the FailStage walk through the compare-and-swap
-// capability, re-anchoring the expected from-state at each step: the
-// dispatched → running step anchors to dispatched, then the final → failed
-// step anchors to the running state that step produced (or, when the walk
-// is skipped, to the state observed at load). Any flip landing between the
-// load and a step surfaces as StageStateChangedError from
-// TransitionStageFrom, which the reap backstop classifies as a benign
-// no-op.
+// capability inside a bounded RE-ANCHOR loop (see FailStage's concurrency
+// contract). Each attempt walks the canonical path from the anchored
+// from-state: the dispatched → running step anchors to dispatched, then the
+// final → failed step anchors to the running state that step produced (or,
+// when the walk is skipped, to the state anchored at loop entry).
+//
+// When a CAS step refuses with StageStateChangedError, reanchorTarget
+// classifies the row-locked Actual state:
+//
+//   - Actual still live and legally failable (non-terminal, not the
+//     awaiting_children park): RE-ANCHOR from = Actual and loop, absorbing
+//     the benign concurrent advance. The loop top re-checks the dispatched
+//     case, so a re-anchor at dispatched still walks through running.
+//   - Actual terminal OR awaiting_children: the error propagates UNCHANGED
+//     and is never retried — the two genuinely-benign refusals the caller
+//     classifies as a no-op. Never retrying the park is what makes the
+//     #1903 park-protection invariant hold by construction here.
+//
+// Exhausting the attempt bound returns the last StageStateChangedError (the
+// documented retry-me contract). A non-StageStateChangedError returns
+// immediately as a genuine repo error, exactly as before.
 func failStageCAS(
 	ctx context.Context,
 	cas StageCASTransitioner,
@@ -123,22 +170,53 @@ func failStageCAS(
 	cat FailureCategory,
 	reason string,
 ) (*Stage, error) {
-	if from == StageStateDispatched {
-		running, err := cas.TransitionStageFrom(ctx, stageID, StageStateDispatched, StageStateRunning, nil)
-		if err != nil {
-			return nil, fmt.Errorf("FailStage: dispatched → running: %w", err)
-		}
-		from = running.State
-	}
-
 	cat2 := cat
 	reason2 := reason
-	out, err := cas.TransitionStageFrom(ctx, stageID, from, StageStateFailed, &StageCompletion{
-		FailureCategory: &cat2,
-		FailureReason:   &reason2,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("FailStage: %s → failed: %w", from, err)
+	var lastErr error
+	for attempt := 0; attempt < failStageCASMaxAttempts; attempt++ {
+		if from == StageStateDispatched {
+			running, err := cas.TransitionStageFrom(ctx, stageID, StageStateDispatched, StageStateRunning, nil)
+			if err != nil {
+				if next, ok := reanchorTarget(err); ok {
+					from, lastErr = next, err
+					continue
+				}
+				return nil, fmt.Errorf("FailStage: dispatched → running: %w", err)
+			}
+			from = running.State
+		}
+
+		out, err := cas.TransitionStageFrom(ctx, stageID, from, StageStateFailed, &StageCompletion{
+			FailureCategory: &cat2,
+			FailureReason:   &reason2,
+		})
+		if err != nil {
+			if next, ok := reanchorTarget(err); ok {
+				from, lastErr = next, err
+				continue
+			}
+			return nil, fmt.Errorf("FailStage: %s → failed: %w", from, err)
+		}
+		return out, nil
 	}
-	return out, nil
+	// Retry exhaustion under pathological livelock: surface the last typed
+	// refusal so the reap endpoint's re-load yields the documented 500.
+	return nil, lastErr
+}
+
+// reanchorTarget classifies a CAS step error for failStageCAS's re-anchor
+// loop. It returns (Actual, true) — re-anchor and retry — only when err is a
+// StageStateChangedError whose row-locked Actual state is still live and
+// legally failable. A non-CAS error, or a genuinely-benign refusal (Actual
+// terminal, or the awaiting_children park that must never be collapsed),
+// returns ("", false) so the caller propagates the error unchanged.
+func reanchorTarget(err error) (StageState, bool) {
+	var sce StageStateChangedError
+	if !errors.As(err, &sce) {
+		return "", false
+	}
+	if sce.Actual.IsTerminal() || sce.Actual == StageStateAwaitingChildren {
+		return "", false
+	}
+	return sce.Actual, true
 }

@@ -494,3 +494,200 @@ func TestFailStageCASHappyPathWalksDispatched(t *testing.T) {
 		t.Error("ended_at not stamped on terminal transition")
 	}
 }
+
+// setState is a small helper to flip a seeded stage's state under the
+// memRepo lock, used by the re-anchor-loop tests' CAS hooks.
+func (m *memRepo) setState(id uuid.UUID, to run.StageState) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.stages[id].State = to
+}
+
+// #1907 mode (i): a benign concurrent ADVANCE from dispatched to running,
+// landing before the first CAS. The re-anchor loop must ABSORB it — re-anchor
+// at running and drive on to failed — rather than surfacing the refusal, so
+// the stage lands failed with the caller's category/reason stamped exactly
+// once (only the single successful terminal transition writes completion).
+func TestFailStageCASAbsorbsDispatchedRunningFlip(t *testing.T) {
+	stage := newStage(run.StageStateDispatched)
+	base := newMemRepo(stage)
+	var flipped bool
+	repo := &casMemRepo{memRepo: base, beforeTransitionFrom: func(id uuid.UUID) {
+		if flipped || id != stage.ID {
+			return
+		}
+		flipped = true
+		base.setState(id, run.StageStateRunning) // a concurrent writer advanced it
+	}}
+
+	got, err := run.FailStage(context.Background(), repo, stage.ID, run.FailureC, "infra")
+	if err != nil {
+		t.Fatalf("FailStage: %v", err)
+	}
+	if got.State != run.StageStateFailed {
+		t.Errorf("state = %q, want failed (advance absorbed)", got.State)
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != run.FailureC {
+		t.Errorf("failure category = %v, want C stamped exactly once", got.FailureCategory)
+	}
+	if got.FailureReason == nil || *got.FailureReason != "infra" {
+		t.Errorf("failure reason = %v, want the caller's reason", got.FailureReason)
+	}
+}
+
+// #1907 mode (ii): a benign concurrent ADVANCE from running to
+// awaiting_approval, landing before the final CAS. The re-anchor loop must
+// absorb it via the legal awaiting_approval → failed edge.
+func TestFailStageCASAbsorbsAwaitingApprovalFlip(t *testing.T) {
+	stage := newStage(run.StageStateRunning)
+	base := newMemRepo(stage)
+	var flipped bool
+	repo := &casMemRepo{memRepo: base, beforeTransitionFrom: func(id uuid.UUID) {
+		if flipped || id != stage.ID {
+			return
+		}
+		flipped = true
+		base.setState(id, run.StageStateAwaitingApproval) // gate opened concurrently
+	}}
+
+	got, err := run.FailStage(context.Background(), repo, stage.ID, run.FailureD, "sla elapsed")
+	if err != nil {
+		t.Fatalf("FailStage: %v", err)
+	}
+	if got.State != run.StageStateFailed {
+		t.Errorf("state = %q, want failed (advance absorbed via awaiting_approval → failed)", got.State)
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != run.FailureD {
+		t.Errorf("failure category = %v, want D", got.FailureCategory)
+	}
+}
+
+// #1907 mode (iii): a concurrent writer settled the stage TERMINAL mid-flight.
+// The re-anchor loop must NOT retry — it returns the typed
+// StageStateChangedError (Actual=failed) unchanged, and the winner's
+// completion metadata is left untouched.
+func TestFailStageCASRefusesTerminalFlip(t *testing.T) {
+	stage := newStage(run.StageStateRunning)
+	base := newMemRepo(stage)
+	winnerCat := run.FailureB
+	winnerReason := "winner settled first"
+	var flipped bool
+	repo := &casMemRepo{memRepo: base, beforeTransitionFrom: func(id uuid.UUID) {
+		if flipped || id != stage.ID {
+			return
+		}
+		flipped = true
+		base.mu.Lock()
+		base.stages[id].State = run.StageStateFailed
+		base.stages[id].FailureCategory = &winnerCat
+		base.stages[id].FailureReason = &winnerReason
+		base.mu.Unlock()
+	}}
+
+	_, err := run.FailStage(context.Background(), repo, stage.ID, run.FailureC, "loser")
+	if err == nil {
+		t.Fatal("FailStage returned nil error despite a terminal flip")
+	}
+	var sce run.StageStateChangedError
+	if !errors.As(err, &sce) {
+		t.Fatalf("error = %v, want StageStateChangedError via errors.As", err)
+	}
+	if sce.Actual != run.StageStateFailed {
+		t.Errorf("StageStateChangedError.Actual = %q, want failed", sce.Actual)
+	}
+	// The winner's completion metadata is untouched by the loser.
+	cur, _ := repo.GetStage(context.Background(), stage.ID)
+	if cur.FailureCategory == nil || *cur.FailureCategory != run.FailureB {
+		t.Errorf("failure category = %v, want B (winner's, untouched)", cur.FailureCategory)
+	}
+	if cur.FailureReason == nil || *cur.FailureReason != winnerReason {
+		t.Errorf("failure reason = %v, want the winner's (untouched)", cur.FailureReason)
+	}
+}
+
+// #1907 mode (iv): the park invariant must survive a RE-ANCHOR, not just the
+// first attempt. The hook flips dispatched → running before the first CAS (a
+// benign advance the loop absorbs by re-anchoring), then flips running →
+// awaiting_children before the retry's CAS. FailStage must refuse the park
+// (StageStateChangedError, Actual=awaiting_children) with no failure metadata
+// stamped — proving a park landing on ANY attempt is never collapsed.
+func TestFailStageCASRefusesParkAfterReanchor(t *testing.T) {
+	stage := newStage(run.StageStateDispatched)
+	base := newMemRepo(stage)
+	var calls int
+	repo := &casMemRepo{memRepo: base, beforeTransitionFrom: func(id uuid.UUID) {
+		if id != stage.ID {
+			return
+		}
+		calls++
+		switch calls {
+		case 1:
+			base.setState(id, run.StageStateRunning) // benign advance, absorbed
+		case 2:
+			base.setState(id, run.StageStateAwaitingChildren) // park lands on the retry
+		}
+	}}
+
+	_, err := run.FailStage(context.Background(), repo, stage.ID, run.FailureC, "raced by a fanout park after re-anchor")
+	if err == nil {
+		t.Fatal("FailStage returned nil error despite a park landing after re-anchor")
+	}
+	var sce run.StageStateChangedError
+	if !errors.As(err, &sce) {
+		t.Fatalf("error = %v, want StageStateChangedError via errors.As", err)
+	}
+	if sce.Actual != run.StageStateAwaitingChildren {
+		t.Errorf("StageStateChangedError.Actual = %q, want awaiting_children", sce.Actual)
+	}
+	cur, _ := repo.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateAwaitingChildren {
+		t.Errorf("stage state = %q, want awaiting_children (park preserved)", cur.State)
+	}
+	if cur.FailureCategory != nil || cur.FailureReason != nil {
+		t.Errorf("failure metadata stamped on a refused park: cat=%v reason=%v",
+			cur.FailureCategory, cur.FailureReason)
+	}
+}
+
+// #1907 mode (v): pathological livelock. The hook alternates the stage between
+// two live states before every CAS so no attempt ever succeeds. FailStage must
+// return StageStateChangedError after exactly failStageCASMaxAttempts CAS
+// calls — the asserted call count pins the bound so a future off-by-one or an
+// unbounded loop regresses loudly.
+func TestFailStageCASExhaustsRetries(t *testing.T) {
+	stage := newStage(run.StageStateRunning)
+	base := newMemRepo(stage)
+	var calls int
+	repo := &casMemRepo{memRepo: base, beforeTransitionFrom: func(id uuid.UUID) {
+		if id != stage.ID {
+			return
+		}
+		calls++
+		base.mu.Lock()
+		if base.stages[id].State == run.StageStateRunning {
+			base.stages[id].State = run.StageStateAwaitingApproval
+		} else {
+			base.stages[id].State = run.StageStateRunning
+		}
+		base.mu.Unlock()
+	}}
+
+	_, err := run.FailStage(context.Background(), repo, stage.ID, run.FailureC, "livelock")
+	if err == nil {
+		t.Fatal("FailStage returned nil error despite perpetual livelock")
+	}
+	var sce run.StageStateChangedError
+	if !errors.As(err, &sce) {
+		t.Fatalf("error = %v, want StageStateChangedError via errors.As", err)
+	}
+	// The bound: one CAS call per attempt (no dispatched pre-step from a
+	// running anchor), so the hook fires exactly maxAttempts times.
+	if calls != 4 {
+		t.Errorf("CAS attempts = %d, want 4 (failStageCASMaxAttempts)", calls)
+	}
+	// The stage is left in a live state — never failed under livelock.
+	cur, _ := repo.GetStage(context.Background(), stage.ID)
+	if cur.State == run.StageStateFailed {
+		t.Error("stage failed despite exhausted retries; must be left live for a re-report")
+	}
+}
