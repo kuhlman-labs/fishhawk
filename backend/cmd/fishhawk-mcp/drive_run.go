@@ -152,6 +152,19 @@ stopped; next_actions names the legal moves at a decision. merge is
 queued-not-landed, so merged is reported only after the webhook-settled
 terminal run state.
 
+Supply a progressToken on the call to receive a keep-alive heartbeat: the
+driver emits an MCP notifications/progress update once per poll iteration
+(run state + earliest non-terminal stage + steps taken + elapsed seconds), so
+a >30-min drive is not aborted by the client's idle timeout. Progress is
+opt-in per the MCP spec — no token means no heartbeat (the return is still
+resumable). At a parked approval gate the driver waits for the stage's
+advisory agent reviews to settle before calling the gate, so a delegated
+approve fires only on settled reviews. A stage left 'dispatched' with no
+runner ever observed is handed back for a manual re-dispatch
+(dispatched_stale); a fresh manual fishhawk_dispatch_stage records spawn
+evidence so a re-invoked drive reads it as live and polls to convergence
+rather than re-reporting stale.
+
 Requires the fishhawk-runner binary to resolve on the MCP server's host, like
 fishhawk_run_stage / fishhawk_dispatch_stage (local-only by design, ADR-024).
 Reach for fishhawk_dispatch_stage instead to drive a single stage by hand.
@@ -160,7 +173,7 @@ Reach for fishhawk_dispatch_stage instead to drive a single stage by hand.
 }
 
 // driveRun is the tool handler: the bounded, resumable drive loop.
-func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in DriveRunInput) (*mcp.CallToolResult, DriveRunOutput, error) {
+func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in DriveRunInput) (*mcp.CallToolResult, DriveRunOutput, error) {
 	if in.RunID == "" {
 		return nil, DriveRunOutput{}, errors.New("run_id is required")
 	}
@@ -217,12 +230,24 @@ func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in D
 	if r.driveMaxWallclock > 0 {
 		wall = r.driveMaxWallclock
 	}
-	deadline := time.Now().Add(wall)
+	start := time.Now()
+	deadline := start.Add(wall)
 
 	pollInterval := r.drivePollInterval
 	if pollInterval <= 0 {
 		pollInterval = defaultDrivePollInterval
 	}
+
+	// Progress heartbeat (defect 2, #1905): a >30-min drive would otherwise be
+	// aborted by the client's idle timeout. Capture the client-supplied
+	// progressToken exactly as run_stage.go:443-447 / run_children.go:240-242
+	// do, and emit a best-effort NotifyProgress once per poll iteration. MCP
+	// progress is opt-in per spec: no token (or no session) -> no emission.
+	var progToken any
+	if req != nil && req.Params != nil {
+		progToken = req.Params.GetProgressToken()
+	}
+	var progress float64
 
 	out := DriveRunOutput{RunID: runUUID.String(), Warnings: warnings}
 
@@ -309,6 +334,21 @@ func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in D
 			return nil, out, fmt.Errorf("drive: list stages: %w", serr)
 		}
 
+		// Progress heartbeat once per loop iteration (best-effort, opt-in): a
+		// healthy long drive keeps the client's idle timeout from aborting it.
+		// Emitted only when the caller supplied a progressToken AND the request
+		// carries a live session (the go-sdk emission seam, mirroring
+		// run_stage.go:1117). A failed notify is swallowed — the drive is
+		// authoritative, the heartbeat advisory.
+		if progToken != nil && req != nil && req.Session != nil {
+			progress++
+			_ = req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
+				ProgressToken: progToken,
+				Progress:      progress,
+				Message:       driveProgressMessage(runRow, stages, len(out.StepsTaken), time.Since(start)),
+			})
+		}
+
 		// (b) A pending scope amendment is ALWAYS a decision — no delegation
 		// knob covers amendments, and its window times out in minutes.
 		if pending, aerr := r.driveScopeAmendmentPending(ctx, runUUID); aerr != nil {
@@ -338,7 +378,7 @@ func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in D
 			// still-'dispatched' stage, downgrading would let the loop record +
 			// host-spawn a SECOND runner while the first is in flight (concurrent
 			// repository command execution). Halt instead.
-			priorRow, newestDispatchSeq, herr := r.driveHasPriorDispatchRow(ctx, runUUID, recordName)
+			priorRow, newestDispatchSeq, newestDispatchTs, herr := r.driveHasPriorDispatchRow(ctx, runUUID, recordName)
 			if herr != nil {
 				out.StoppedReason = stoppedDispatchCheckFailed
 				out.Warnings = append(out.Warnings,
@@ -364,26 +404,59 @@ func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in D
 				if staleAfter <= 0 {
 					staleAfter = defaultDriveDispatchedStaleAfter
 				}
-				// A stage that has sat in 'dispatched' past the liveness threshold
-				// with no runner observed is genuinely runner-less: stop distinct
-				// (dispatched_stale) and hand the manual re-dispatch to the operator
-				// rather than polling every resume to timeout. A live runner flips
-				// dispatched->running within seconds, so the threshold cannot
-				// misclassify it. A zero-value UpdatedAt (field absent from a
-				// response) degrades to polling — fail toward polling, never toward
-				// spawning; the driver still NEVER host-spawns a 'dispatched' stage
-				// it did not spawn itself.
-				if !disp.UpdatedAt.IsZero() && time.Since(disp.UpdatedAt) > staleAfter {
-					age := time.Since(disp.UpdatedAt).Round(time.Second)
+				// Spawn evidence = a prior run_auto_driven dispatch row (driver OR
+				// manual fishhawk_dispatch_stage — one canonical vocabulary) OR a
+				// non-nil StartedAt. A bare UpdatedAt is NOT evidence: on local, plan
+				// approval pre-flips implement to 'dispatched' (with a fresh
+				// UpdatedAt) BEFORE any host dispatch, so UpdatedAt alone cannot prove
+				// a runner was ever spawned.
+				hasEvidence := priorRow || disp.StartedAt != nil
+				if !hasEvidence {
+					// (a) NO evidence of any spawn attempt: the local parked-for-host-
+					// dispatch handoff. Stop IMMEDIATELY rather than polling the full
+					// liveness threshold first, and hand the dispatch to the operator.
+					// The message names the handoff and instructs FIRST confirming no
+					// runner is live — a fishhawk_run_stage / fishhawk_dispatch_stage
+					// invoked moments ago may not have registered yet, so that transient
+					// must not induce a double dispatch. The driver still NEVER
+					// auto-spawns, so double-spawn stays impossible by construction.
 					out.StoppedReason = stoppedDispatchedStale
 					out.Warnings = append(out.Warnings, fmt.Sprintf(
-						"stage %s (%s) has sat in 'dispatched' for %s, past the %s runner-liveness threshold, with no runner observed; no runner appears live. Confirm no runner process is running, re-dispatch by hand with fishhawk_dispatch_stage, then re-invoke fishhawk_drive_run.",
+						"stage %s (%s) is 'dispatched' with no spawn evidence (no dispatch row, no started_at). On local, plan approval parks the implement stage in 'dispatched' awaiting a host dispatch, so no runner has been spawned yet. FIRST confirm no runner process is live: a fishhawk_run_stage or fishhawk_dispatch_stage invoked moments ago may not have registered yet — wait for it to register (dispatched->running) rather than hand-dispatching during that transient. Only after confirming no live runner, re-dispatch by hand with fishhawk_dispatch_stage, then re-invoke fishhawk_drive_run.",
+						disp.Type, disp.ID))
+					out.NextActions = driveDecisionActions("dispatched_stale", runUUID, in.WorkingDir)
+					return nil, out, nil
+				}
+				// Evidence exists: anchor staleness on the NEWEST spawn evidence —
+				// max{UpdatedAt, StartedAt, newest dispatch-row Timestamp}. A fresh
+				// manual re-dispatch records an act row with a server-set wall-clock
+				// timestamp, so a just-recovered stage reads as fresh and the recovery
+				// loop converges instead of insta-tripping stale on a stale UpdatedAt.
+				anchor := disp.UpdatedAt
+				if disp.StartedAt != nil && disp.StartedAt.After(anchor) {
+					anchor = *disp.StartedAt
+				}
+				if priorRow && newestDispatchTs.After(anchor) {
+					anchor = newestDispatchTs
+				}
+				// (b) Genuinely runner-less: the newest spawn evidence is older than
+				// the liveness threshold with no runner observed. Stop distinct and
+				// hand the manual re-dispatch to the operator rather than polling every
+				// resume to timeout. A live runner flips dispatched->running within
+				// seconds, so the threshold cannot misclassify it. A zero-value anchor
+				// (no timestamped evidence at all) degrades to polling — fail toward
+				// polling, never toward a stale stop or a spawn.
+				if !anchor.IsZero() && time.Since(anchor) > staleAfter {
+					age := time.Since(anchor).Round(time.Second)
+					out.StoppedReason = stoppedDispatchedStale
+					out.Warnings = append(out.Warnings, fmt.Sprintf(
+						"stage %s (%s) has sat in 'dispatched' for %s (newest spawn evidence), past the %s runner-liveness threshold, with no runner observed; no runner appears live. Confirm no runner process is running, re-dispatch by hand with fishhawk_dispatch_stage, then re-invoke fishhawk_drive_run.",
 						disp.Type, disp.ID, age, staleAfter))
 					out.NextActions = driveDecisionActions("dispatched_stale", runUUID, in.WorkingDir)
 					return nil, out, nil
 				}
-				// In-flight (or the zero-value degrade): poll and re-evaluate the
-				// threshold next iteration. Deliberately NOT a one-shot spawned[]
+				// (c) Anchor fresh (or the zero-value degrade): poll and re-evaluate
+				// the threshold next iteration. Deliberately NOT a one-shot spawned[]
 				// mark — leaving the stage dispatchable lets this guard re-trip once
 				// the threshold passes mid-invocation.
 				driveSleep(ctx, pollInterval)
@@ -473,6 +546,37 @@ func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in D
 			stall = 0
 			driveSleep(ctx, pollInterval)
 			continue
+		}
+
+		// (e-pre) Review-settlement wait at a parked approval gate (defect 1,
+		// #1905). A feature_change run creates its human 'review' stage row
+		// 'pending' at run creation, so once the plan stage parks
+		// awaiting_approval the loop must not spin gate-calls while the advisory
+		// agent reviews are still landing: the delegated may_approve can only fire
+		// on settled reviews. When a parked approval gate's advisory round is still
+		// 'pending' (the #1127 count-based primitive), poll instead of gate-calling.
+		if parkedType := driveParkedApprovalStageType(stages); parkedType != "" {
+			if reviewStage := driveReviewStageForParkedType(parkedType); reviewStage != "" {
+				st, rerr := r.reviewStatusFor(ctx, runUUID, reviewStage)
+				switch {
+				case rerr != nil:
+					// FAIL TOWARD THE OPERATOR: an unreadable review state at a
+					// parked gate appends a warning and falls through to the
+					// gate/decision return (which hands the operator a decision).
+					// Unlike the dispatch-path fail-closed, this path opens no
+					// code-execution surface, so failing toward a decision — not a
+					// wedge — is correct.
+					out.Warnings = append(out.Warnings, fmt.Sprintf(
+						"review-status poll for the parked %s gate failed; falling through to the gate decision: %v",
+						parkedType, rerr))
+				case st != nil && st.Status == "pending":
+					// Reviews still landing: wait for settlement rather than a noisy
+					// observe-only gate call every interval.
+					stall = 0
+					driveSleep(ctx, pollInterval)
+					continue
+				}
+			}
 		}
 
 		// (e) Parked at a gate — call the auto-drive endpoint.
@@ -634,15 +738,27 @@ func driveGatePreconditionsMet(st Stage, stages []Stage) bool {
 }
 
 // driveAnyInFlight reports whether any stage is still executing: a running
-// stage, a server-driven review stage that is pending/dispatched/running, or
-// a stage this invocation already spawned that has not yet advanced.
+// stage, a server-driven review stage that is actually triggered, or a stage
+// this invocation already spawned that has not yet advanced.
+//
+// Reachability (defect 1, #1905): a review-type stage in 'pending' counts as
+// in-flight ONLY when it is REACHABLE — every lower-sequence stage terminal. A
+// feature_change run creates its human 'review' stage row 'pending' at run
+// creation (CreateStagesFromSpec), so an unconditional pending-review-is-in-
+// flight rule polls branch (d) forever once the plan gate parks awaiting_
+// approval, and the gate/decision branch (e) is never reached — the #1905
+// silent hang. A 'dispatched' review stage is always in-flight (the server has
+// triggered it), regardless of predecessor state.
 func driveAnyInFlight(stages []Stage, spawned map[string]bool) bool {
 	for i := range stages {
 		st := &stages[i]
 		if st.State == "running" {
 			return true
 		}
-		if st.Type == "review" && (st.State == "pending" || st.State == "dispatched") {
+		if st.Type == "review" && st.State == "dispatched" {
+			return true
+		}
+		if st.Type == "review" && st.State == "pending" && driveLowerStagesTerminal(stages, st.Sequence) {
 			return true
 		}
 		if spawned[st.ID] && (st.State == "pending" || st.State == "dispatched") {
@@ -650,6 +766,48 @@ func driveAnyInFlight(stages []Stage, spawned map[string]bool) bool {
 		}
 	}
 	return false
+}
+
+// driveLowerStagesTerminal reports whether every stage with a sequence lower
+// than seq is terminal — i.e. the stage at seq is reachable (un-triggered
+// predecessors would mean it has not started). Used to distinguish a pending
+// review stage that is genuinely in flight from one that is merely a row
+// created pending at run creation whose predecessor has not yet succeeded.
+func driveLowerStagesTerminal(stages []Stage, seq int) bool {
+	for i := range stages {
+		if stages[i].Sequence < seq && !stageStateIsTerminal(stages[i].State) {
+			return false
+		}
+	}
+	return true
+}
+
+// driveParkedApprovalStageType returns the type of a stage parked at an
+// approval gate (awaiting_approval), else "". The review-settlement wait maps
+// it to the advisory review round to poll before calling the gate.
+func driveParkedApprovalStageType(stages []Stage) string {
+	for i := range stages {
+		if stages[i].State == "awaiting_approval" {
+			return stages[i].Type
+		}
+	}
+	return ""
+}
+
+// driveReviewStageForParkedType maps a parked approval-gate stage type to the
+// reviewStatusFor stage whose advisory round gates it: a parked plan stage
+// waits on the 'plan' review, a parked review-type stage on the 'implement'
+// review. Every other parked type ("" return) skips the review-settlement
+// wait and falls straight through to the gate call.
+func driveReviewStageForParkedType(parkedType string) string {
+	switch parkedType {
+	case "plan":
+		return "plan"
+	case "review":
+		return "implement"
+	default:
+		return ""
+	}
 }
 
 // driveParkedGateState returns a short state label when a stage is parked at
@@ -706,19 +864,30 @@ func (r *runResolver) driveScopeAmendmentPending(ctx context.Context, runID uuid
 
 // driveHasPriorDispatchRow reports whether a run_auto_driven dispatch row for
 // the given dispatch stage name already exists — a crash-resume or re-open
-// signal so the re-record carries an honest retry note — and returns the highest
-// audit sequence among the matching rows. For an implement stage the match set
-// includes BOTH 'implement' and 'fixup_redispatch' dispatch rows (a fix-up re-
-// dispatch is still an implement dispatch), so the returned sequence is the
-// newest implement-family dispatch — the caller compares it against the newest
-// stage_fixup_triggered row to attribute a cross-invocation fix-up re-open.
-func (r *runResolver) driveHasPriorDispatchRow(ctx context.Context, runID uuid.UUID, stageName string) (bool, int64, error) {
+// signal so the re-record carries an honest retry note — and returns the
+// highest audit sequence among the matching rows PLUS that newest row's
+// server-set Timestamp (the staleness anchor's spawn-evidence input, #1905).
+// For an implement stage the match set includes BOTH 'implement' and
+// 'fixup_redispatch' dispatch rows (a fix-up re-dispatch is still an implement
+// dispatch), so the returned sequence is the newest implement-family dispatch —
+// the caller compares it against the newest stage_fixup_triggered row to
+// attribute a cross-invocation fix-up re-open.
+//
+// The match predicate is deliberately act=='dispatch' + stage family, SOURCE-
+// and action-value-agnostic: the endpoint rejects any action other than
+// autoDriveDispatchActionName ('dispatch_stage') with a 400 that appends
+// nothing (autodrive_http.go), so driver rows (source fishhawk_drive_run) and
+// manual fishhawk_dispatch_stage rows are ONE dispatch-evidence vocabulary by
+// server-side construction — matching on act+stage is provably complete over
+// it.
+func (r *runResolver) driveHasPriorDispatchRow(ctx context.Context, runID uuid.UUID, stageName string) (bool, int64, time.Time, error) {
 	rows, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{Category: CategoryRunAutoDriven, Limit: 500})
 	if err != nil {
-		return false, 0, err
+		return false, 0, time.Time{}, err
 	}
 	found := false
 	var newestSeq int64
+	var newestTs time.Time
 	for _, e := range rows {
 		fields, ok := e.Payload.(map[string]any)
 		if !ok {
@@ -736,10 +905,34 @@ func (r *runResolver) driveHasPriorDispatchRow(ctx context.Context, runID uuid.U
 			found = true
 			if e.Sequence > newestSeq {
 				newestSeq = e.Sequence
+				newestTs = e.Timestamp
 			}
 		}
 	}
-	return found, newestSeq, nil
+	return found, newestSeq, newestTs, nil
+}
+
+// driveProgressMessage builds the per-iteration heartbeat message: the run
+// state, the earliest non-terminal stage type:state, the number of driver
+// steps taken so far, and the elapsed wall-clock seconds. Pure (no I/O) so a
+// table test pins it (#1905).
+func driveProgressMessage(run *Run, stages []Stage, steps int, elapsed time.Duration) string {
+	stagePart := "no non-terminal stage"
+	var earliest *Stage
+	for i := range stages {
+		st := &stages[i]
+		if stageStateIsTerminal(st.State) {
+			continue
+		}
+		if earliest == nil || st.Sequence < earliest.Sequence {
+			earliest = st
+		}
+	}
+	if earliest != nil {
+		stagePart = earliest.Type + ":" + earliest.State
+	}
+	return fmt.Sprintf("drive: run %s; next %s; steps %d; elapsed %ds",
+		run.State, stagePart, steps, int(elapsed.Seconds()))
 }
 
 // driveNewestFixupTriggeredSeq returns the highest audit sequence among the
