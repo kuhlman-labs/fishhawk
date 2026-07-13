@@ -1200,6 +1200,87 @@ func TestRetryStage_AcceptanceReopen_OtherStageOutcome_Reopens(t *testing.T) {
 	}
 }
 
+// acceptanceSkipMarkerEntryFor builds a stage-scoped
+// acceptance_skipped_out_of_scope audit entry — the E38.3 / #1877 marker the
+// retry backstop checks when no verdict is recorded.
+func acceptanceSkipMarkerEntryFor(stageID uuid.UUID) *audit.Entry {
+	sid := stageID
+	return &audit.Entry{
+		ID:       uuid.New(),
+		StageID:  &sid,
+		Category: CategoryAcceptanceSkippedOutOfScope,
+	}
+}
+
+// b2c (E38.3 / #1877): a no-verdict acceptance stage that carries a stage-scoped
+// acceptance_skipped_out_of_scope marker → 422 retry_not_applicable, no
+// transition, no audit write. The skip is a terminal disposition; a reopen would
+// re-fire the same skip forever, so the backstop refuses even though no verdict
+// exists (the #1567 outcome-unknown reopen would otherwise admit here).
+func TestRetryStage_AcceptanceReopen_SkipMarker_422(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	au.byCategory = map[string][]*audit.Entry{
+		CategoryAcceptanceSkippedOutOfScope: {acceptanceSkipMarkerEntryFor(stage.ID)},
+	}
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "retry_not_applicable") {
+		t.Errorf("body missing retry_not_applicable:\n%s", w.Body.String())
+	}
+	if got, _ := repo.GetStage(context.Background(), stage.ID); got.State != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want unchanged succeeded (skip is terminal, no reopen)", got.State)
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit chain = %+v, want no write on the 422 refusal", au.appended)
+	}
+}
+
+// b2d: a skip-marker for a DIFFERENT stage does NOT block the reopen — the
+// backstop filters by stage id (mirrors the outcome-entry stage scoping, and
+// pins that the no-marker path still admits the #1567 outcome-unknown reopen).
+func TestRetryStage_AcceptanceReopen_SkipMarkerOtherStage_Reopens(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	au.byCategory = map[string][]*audit.Entry{
+		CategoryAcceptanceSkippedOutOfScope: {acceptanceSkipMarkerEntryFor(uuid.New())},
+	}
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (other-stage skip marker must not block):\n%s", w.Code, w.Body.String())
+	}
+	if len(au.appended) != 1 || au.appended[0].Category != CategoryAcceptanceReopened {
+		t.Fatalf("audit chain = %+v, want one acceptance_reopened entry", au.appended)
+	}
+}
+
+// b2e: the verdict read succeeds (no verdict) but the skip-marker category read
+// errors → 500, no transition. Fail closed: never reopen when the skip-marker
+// evidence is unknown. Uses catErr to fail ONLY the skip-marker read.
+func TestRetryStage_AcceptanceReopen_SkipMarkerReadError_500(t *testing.T) {
+	s, repo, au := reopenRetryServer(t)
+	stage := seedSucceededAcceptanceStage(repo, run.StateRunning)
+	au.catErr = map[string]error{CategoryAcceptanceSkippedOutOfScope: errors.New("skip-marker read down")}
+
+	w := postRetry(t, s, stage.ID)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if got, _ := repo.GetStage(context.Background(), stage.ID); got.State != run.StageStateSucceeded {
+		t.Errorf("stage state = %q, want unchanged succeeded (fail closed)", got.State)
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit chain = %+v, want no write on the 500 fail-closed path", au.appended)
+	}
+}
+
 // b3: an mcp:run:* subject (agent) token invoking the reopen → 403
 // agent_token_forbidden (operator-only verb).
 func TestRetryStage_AcceptanceReopen_AgentTokenForbidden(t *testing.T) {

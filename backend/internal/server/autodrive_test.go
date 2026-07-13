@@ -501,6 +501,31 @@ func TestAutoDriveRunGate_Merge_AcceptancePassed_Merges(t *testing.T) {
 	}
 }
 
+// TestAutoDriveRunGate_Merge_AcceptanceSkippedOutOfScope_Merges pins the E38.3 /
+// #1877 admit: a terminal acceptance stage settled via the out-of-scope skip
+// marker (no verdict) is merge-eligible, so the delegated may_merge proceeds to
+// the merge seam exactly like a passed verdict.
+func TestAutoDriveRunGate_Merge_AcceptanceSkippedOutOfScope_Merges(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runRow := seedAcceptanceMergeRun(t, repo, au, run.StageStateSucceeded, "") // terminal, no verdict
+	repo.mu.Lock()
+	accID := repo.stagesByRun[runRow.ID][2].ID // plan, implement, acceptance
+	repo.mu.Unlock()
+	seedAcceptanceSkipMarker(au, runRow.ID, accID)
+
+	merger := &fakeMerger{}
+	out, err := s.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), merger, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionMerge {
+		t.Fatalf("outcome = %+v, want acted merge on a skip-settled acceptance", out)
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1 — a skip-settled acceptance must not block the merge", merger.called)
+	}
+}
+
 // TestAutoDriveRunGate_Merge_AcceptanceReadError_ObserveOnly pins the
 // fail-closed posture: an acceptance/audit read error never merges (the
 // acceptanceGateState error and the evaluator error both resolve to

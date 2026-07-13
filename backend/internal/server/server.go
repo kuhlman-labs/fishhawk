@@ -956,10 +956,15 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 		}
 		return
 	default:
-		// acceptanceGatePassed / acceptanceGateNotDeclared: the merge is not
-		// (or no longer) acceptance-gated — fall through to awaiting_merge. The
-		// latest-entry supersession in applyDriveSurfaces upgrades a prior
-		// acceptance_pending stamp to awaiting_merge once acceptance passes.
+		// acceptanceGatePassed / acceptanceGateNotDeclared /
+		// acceptanceGateSkippedOutOfScope: the merge is not (or no longer)
+		// acceptance-gated — fall through to the RuleChecksGreenAwaitingMerge
+		// stamp below (derived status awaiting_merge, merge_pr next_action). An
+		// out-of-scope skip (E38.3 / #1877) is a legitimate terminal disposition
+		// equivalent to a recorded pass, so it intentionally lands here rather
+		// than parking in acceptance_settled_outcome_unknown. The latest-entry
+		// supersession in applyDriveSurfaces upgrades a prior acceptance_pending
+		// stamp to awaiting_merge once acceptance passes or is skipped.
 	}
 	if s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleChecksGreenAwaitingMerge) {
 		return

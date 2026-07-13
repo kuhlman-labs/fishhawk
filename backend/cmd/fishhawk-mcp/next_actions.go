@@ -198,7 +198,7 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 	// Implement stage arms (the plan gate is behind us, or no plan stage
 	// exists — the resume_run recovery-child shape).
 	if impl != nil && (plan == nil || plan.State == "succeeded") {
-		if a := implementStageNextActions(run, impl, acceptance, implementReviewStatus, hint, acceptanceVerdict, acceptanceTriageDisposition); a != nil {
+		if a := implementStageNextActions(run, impl, acceptance, implementReviewStatus, hint, acceptanceSkippedOutOfScope, acceptanceVerdict, acceptanceTriageDisposition); a != nil {
 			return a
 		}
 	}
@@ -325,8 +325,10 @@ func planStageNextActions(run *Run, plan *Stage, planReviewStatus *ReviewStatus)
 // the merge, so the settled path branches to the acceptance arm before
 // the merge ritual. acceptanceVerdict / acceptanceTriageDisposition are
 // the signals extracted from the acceptance_outcome_recorded /
-// acceptance_triage_decided audit payloads.
-func implementStageNextActions(run *Run, impl, acceptance *Stage, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, acceptanceVerdict, acceptanceTriageDisposition string) *NextActions {
+// acceptance_triage_decided audit payloads. acceptanceSkippedOutOfScope is the
+// recent-audit-window flag threaded down so the acceptance arm can recognize an
+// E38.3 / #1877 out-of-scope skip as a merge-eligible disposition.
+func implementStageNextActions(run *Run, impl, acceptance *Stage, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, acceptanceSkippedOutOfScope bool, acceptanceVerdict, acceptanceTriageDisposition string) *NextActions {
 	switch impl.State {
 	case "pending", "dispatched":
 		return &NextActions{State: "implement_pending", Actions: dispatchOrPollActions(run, "implement")}
@@ -392,7 +394,7 @@ func implementStageNextActions(run *Run, impl, acceptance *Stage, implementRevie
 		// declares an acceptance stage (E31.9 / ADR-049), it gates the merge
 		// — branch to the acceptance arm BEFORE the merge ritual.
 		if acceptance != nil {
-			return acceptanceStageNextActions(run, acceptance, acceptanceVerdict, acceptanceTriageDisposition)
+			return acceptanceStageNextActions(run, acceptance, acceptanceSkippedOutOfScope, acceptanceVerdict, acceptanceTriageDisposition)
 		}
 		// No acceptance stage: the PR is the next surface — approve and merge.
 		return &NextActions{State: "implement_gate_settled", Actions: mergeRitualActions(run, "the implement review is settled with no open concerns")}
@@ -898,7 +900,14 @@ func dispatchOrPollActions(run *Run, stageType string) []SuggestedAction {
 // so the arm reads the acceptance_outcome_recorded verdict + the
 // acceptance_triage_decided disposition (passed as acceptanceVerdict /
 // acceptanceTriageDisposition), NEVER the stage state, to decide the move.
-func acceptanceStageNextActions(run *Run, acceptance *Stage, verdict, disposition string) *NextActions {
+//
+// skippedOutOfScope is the recent-audit-window flag (E38.3 / #1877): a succeeded
+// verdict-less acceptance stage that carries the out-of-scope skip marker is a
+// legitimate merge-eligible disposition, so it returns the merge ritual instead
+// of the futile retry-reopen read arm. A recorded verdict (passed/failed) always
+// wins over the flag; a marker aged out of the window (flag false) degrades to
+// the read-first outcome-unknown arm (fail toward read, never toward merge).
+func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope bool, verdict, disposition string) *NextActions {
 	// A non-terminal acceptance stage dispatches (local) or polls
 	// (github_actions), mirroring the plan/implement pending arms. A
 	// running stage is validating against the preview — poll.
@@ -912,6 +921,21 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, verdict, dispositio
 			}
 		}
 		return &NextActions{State: "acceptance_pending", Actions: dispatchOrPollActions(run, "acceptance")}
+	}
+
+	// E38.3 / #1877: a succeeded verdict-less acceptance stage that carries the
+	// out-of-scope skip marker was auto-terminated because the approved plan
+	// declared verification.out_of_scope with zero acceptance_criteria — a
+	// legitimate terminal disposition equivalent to a recorded outcome, so the
+	// run is MERGE-ELIGIBLE. Return the merge ritual (not the futile
+	// retry-reopen arm; the server also 422s a direct retry for the skip). This
+	// is checked BEFORE the outcome-unknown defensive arm so the skip disposition
+	// routes to merge. Graceful degradation: when the marker has aged out of the
+	// recent-audit window the flag is false and the arm falls through to the
+	// read-first outcome-unknown arm below (fail toward read, never toward merge).
+	if acceptance.State == "succeeded" && verdict == "" && skippedOutOfScope {
+		return &NextActions{State: "acceptance_skipped_out_of_scope", Actions: mergeRitualActions(run,
+			"the acceptance stage was auto-terminated because the approved plan declared verification.out_of_scope with no acceptance_criteria (E38.3 / #1877) — no verdict was recorded by design, and the run is merge-eligible")}
 	}
 
 	// A terminal acceptance stage that never recorded a verdict in the recent

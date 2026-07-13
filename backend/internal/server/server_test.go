@@ -558,6 +558,43 @@ func TestObserveParkedReview_AcceptanceTriage_ParksNoMerge(t *testing.T) {
 	}
 }
 
+// TestObserveParkedReview_AcceptanceSkippedOutOfScope_StampsAwaitingMerge pins
+// the E38.3 / #1877 arm: a terminal acceptance stage settled via the
+// out-of-scope skip marker (no verdict) is a legitimate merge-eligible
+// disposition, so the drive observer falls through to checks_green_awaiting_merge
+// / merge_pr — NOT the acceptance_settled_outcome_unknown park.
+func TestObserveParkedReview_AcceptanceSkippedOutOfScope_StampsAwaitingMerge(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.repo.seedRun(&run.Run{
+		ID:           h.runID,
+		Drive:        true,
+		State:        run.StateRunning,
+		WorkflowID:   "feature_change",
+		WorkflowSpec: specWithAcceptanceStage,
+	})
+	acc := acceptanceStage(h.runID, run.StageStateSucceeded)
+	h.repo.mu.Lock()
+	h.repo.stages[acc.ID] = acc
+	h.repo.mu.Unlock()
+	seedAcceptanceSkipMarker(h.au, h.runID, acc.ID)
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	advances := h.driveAdvances(t)
+	if len(advances) != 2 || advances[1].Rule != drive.RuleChecksGreenAwaitingMerge {
+		t.Fatalf("run_auto_advanced = %+v, want settled + checks_green_awaiting_merge on a skip-settled acceptance", advances)
+	}
+	if advances[1].NextAction == nil || advances[1].NextAction.Action != "merge_pr" {
+		t.Errorf("NextAction = %+v, want merge_pr", advances[1].NextAction)
+	}
+	for _, a := range advances {
+		if a.Rule == drive.RuleAcceptanceOutcomeUnknown {
+			t.Fatal("acceptance_settled_outcome_unknown must NOT stamp for a skip-settled acceptance stage")
+		}
+	}
+}
+
 // TestObserveParkedReview_NoAcceptanceStage_StampsAwaitingMerge is the
 // regression: a workflow that declares NO acceptance stage must still reach
 // checks_green_awaiting_merge (the acceptance gate is a pure off-switch there).
