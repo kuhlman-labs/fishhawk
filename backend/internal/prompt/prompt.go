@@ -116,6 +116,28 @@ func AcceptanceVerdictPath(runID, stageID string) string {
 // fallback). MUST stay byte-identical to that runner var.
 const LegacyAcceptanceVerdictPath = "/tmp/fishhawk-acceptance.json"
 
+// AcceptanceTreePath is the run/stage-keyed absolute path of the disposable,
+// read-only detached checkout of the merge-candidate head the runner provisions
+// before the acceptance agent spawns (#1881). It is the ONLY sanctioned tree the
+// acceptance prompt names for repository-content (Posture B) criteria: the agent
+// spawns in an empty temp dir (ADR-049 #4 diff-withholding), so before this fix a
+// Posture B repository-local check would grep whatever checkout it could find on
+// the host — the operator's dispatch checkout or the run's lineage worktree,
+// either of which may have been restored to a DIFFERENT commit (run 34eae492's
+// working_tree_restored detach) so a reference the PR deletes appears to remain
+// and a criterion the PR head satisfies false-fails assertion_fail.
+//
+// Keyed by the FULL run id + stage id, mirroring AcceptanceVerdictPath's keyed
+// path (#1780). This is a NEW surface — there is no legacy fixed path. The runner
+// (runner/cmd/fishhawk-runner/acceptancetree.go) mirrors this EXACT format string
+// in its own acceptanceTreePath; the two are pinned byte-identical from each side
+// (TestAcceptanceTreePath here and the runner-side twin) because they are not
+// importable across the module boundary. MUST stay byte-identical to the runner's
+// acceptanceTreePath format string.
+func AcceptanceTreePath(runID, stageID string) string {
+	return fmt.Sprintf("/tmp/fishhawk-acceptance-tree-%s-%s", runID, stageID)
+}
+
 // ScopeJustificationPath is the run/stage-keyed path the implement agent
 // writes its scope self-exempt sidecar to (#1153) and the runner reads it
 // from. The path is keyed by the FULL run id + stage id (not shortened) so
@@ -1620,6 +1642,22 @@ func acceptanceVerdictPathForTrigger(t Trigger) string {
 	return LegacyAcceptanceVerdictPath
 }
 
+// acceptanceTreePathForTrigger resolves the run/stage-keyed merge-candidate
+// checkout path the acceptance prompt names as the ONLY sanctioned tree for
+// repository-content (Posture B) criteria (#1881). It returns AcceptanceTreePath
+// ONLY when the trigger threads BOTH AcceptanceRunID and AcceptanceStageID (the
+// #1780 keying pattern); it returns "" otherwise — there is NO legacy fixed path
+// for this new surface. An empty result renders the no-path Posture B branch,
+// which still carries the never-evaluate-another-checkout hard rule and the
+// skip-when-absent instruction, so an older trigger with no ids can never be
+// steered into wrong-tree evaluation.
+func acceptanceTreePathForTrigger(t Trigger) string {
+	if t.AcceptanceRunID != "" && t.AcceptanceStageID != "" {
+		return AcceptanceTreePath(t.AcceptanceRunID, t.AcceptanceStageID)
+	}
+	return ""
+}
+
 // writeGitOpsProhibition renders the line forbidding the agent from running
 // any branch/commit-mutating git command — the runner owns all version
 // control and the shared checkout. Shared by the full implement prompt and
@@ -1825,9 +1863,20 @@ func buildAcceptance(t Trigger) string {
 		"alternative validation to manufacture a pass or a fail; leave the outcome for triage.\n")
 	b.WriteString("- Posture B (bounded, opt-in): ONLY when the criterion's `verify_hint` names " +
 		"an in-repository / repository-local check, bounded repository-local validation of the " +
-		"merge candidate IS sanctioned when the running target cannot exhibit it. If you take " +
-		"that path you MUST (i) state the caveat in the top-level `notes` — what could not be " +
-		"validated against the running target and why; (ii) reference confirmable evidence " +
+		"merge candidate IS sanctioned when the running target cannot exhibit it. ")
+	if treePath := acceptanceTreePathForTrigger(t); treePath != "" {
+		b.WriteString("The merge-candidate tree — the SAME head the preview target serves — is " +
+			"provisioned for you as a disposable, read-only detached checkout at " + treePath +
+			". Posture B repository-local validation MUST run against THAT checkout only. ")
+	}
+	b.WriteString("NEVER evaluate a repository-content criterion against any other local " +
+		"checkout, worktree, or clone you find on the host: the operator's checkout and the " +
+		"run's lineage worktree may have been restored to a DIFFERENT commit, so grepping them " +
+		"reports the wrong tree (the #1881 false failure). When the sanctioned checkout is " +
+		"absent or was not provisioned, mark that criterion `result`=`skipped` with the reason " +
+		"in `expectation_basis` rather than improvising a tree. If you take the sanctioned " +
+		"Posture B path you MUST (i) state the caveat in the top-level `notes` — what could not " +
+		"be validated against the running target and why; (ii) reference confirmable evidence " +
 		"artifacts by content hash in `evidence_hashes`; and (iii) name exactly what was " +
 		"validated against what in that criterion's `steps_taken` / `observed` / " +
 		"`expectation_basis`.\n")

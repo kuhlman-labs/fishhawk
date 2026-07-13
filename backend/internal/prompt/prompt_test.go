@@ -6389,9 +6389,83 @@ func TestBuild_Acceptance_CannotExhibitContract(t *testing.T) {
 		"name exactly what was validated against what",
 		"`steps_taken`",
 		"`observed`",
+		// #1881 hard rule: NEVER evaluate a repository-content criterion against
+		// any other checkout, and skip when the sanctioned checkout is absent.
+		"NEVER evaluate a repository-content criterion against any other local",
+		"restored to a DIFFERENT commit",
+		"When the sanctioned checkout is absent or was not provisioned",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("acceptance prompt missing cannot-exhibit contract string %q\n---\n%s", want, got)
+		}
+	}
+	// This trigger threads NO run/stage ids, so no merge-candidate checkout is
+	// provisioned and the prompt names NO tree path — the hard rule still renders
+	// (asserted above), steering the ids-less case into an honest skip.
+	if strings.Contains(got, "/tmp/fishhawk-acceptance-tree-") {
+		t.Errorf("no-ids acceptance prompt must not name a merge-candidate tree path\n---\n%s", got)
+	}
+}
+
+// TestAcceptanceTreePath pins the run/stage-keyed merge-candidate checkout path
+// literal (#1881) — the prompt side of the byte-identical lockstep pair the
+// runner's acceptanceTreePath mirrors (runner/cmd/fishhawk-runner/acceptancetree.go),
+// exactly how TestBuild_Acceptance_OutputContractFileFallback pins the verdict
+// path. A drift on either side is caught by the paired literal tests.
+func TestAcceptanceTreePath(t *testing.T) {
+	const runID = "11111111-2222-3333-4444-555555555555"
+	const stageID = "66666666-7777-8888-9999-000000000000"
+	want := "/tmp/fishhawk-acceptance-tree-" + runID + "-" + stageID
+	if got := AcceptanceTreePath(runID, stageID); got != want {
+		t.Errorf("AcceptanceTreePath(%q,%q) = %q, want %q (the runner mirrors this exact format)",
+			runID, stageID, got, want)
+	}
+}
+
+// TestBuild_Acceptance_MergeCandidateTree_Keyed pins the #1881 Posture B rewrite:
+// a trigger that threads both run/stage ids renders the keyed merge-candidate
+// checkout path as the ONLY sanctioned tree for repository-local validation, and
+// a trigger without ids renders NO path but still carries the never-another-
+// checkout hard rule and the skip-when-absent instruction.
+func TestBuild_Acceptance_MergeCandidateTree_Keyed(t *testing.T) {
+	const runID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	const stageID = "12345678-90ab-cdef-1234-567890abcdef"
+
+	keyed, err := Build("acceptance", Trigger{
+		Repo:              "x/y",
+		ApprovedPlan:      acceptanceFixturePlan(),
+		AcceptanceRunID:   runID,
+		AcceptanceStageID: stageID,
+	})
+	if err != nil {
+		t.Fatalf("Build(acceptance) keyed: %v", err)
+	}
+	wantPath := AcceptanceTreePath(runID, stageID)
+	for _, want := range []string{
+		"provisioned for you as a disposable, read-only detached checkout at " + wantPath,
+		"MUST run against THAT checkout only",
+		"NEVER evaluate a repository-content criterion against any other local",
+		"When the sanctioned checkout is absent or was not provisioned",
+	} {
+		if !strings.Contains(keyed, want) {
+			t.Errorf("keyed acceptance prompt missing %q\n---\n%s", want, keyed)
+		}
+	}
+
+	// No ids: no path is named, but the hard rule + skip instruction still render.
+	noIDs, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	if err != nil {
+		t.Fatalf("Build(acceptance) no-ids: %v", err)
+	}
+	if strings.Contains(noIDs, "/tmp/fishhawk-acceptance-tree-") {
+		t.Errorf("no-ids acceptance prompt must not name a tree path\n---\n%s", noIDs)
+	}
+	for _, want := range []string{
+		"NEVER evaluate a repository-content criterion against any other local",
+		"When the sanctioned checkout is absent or was not provisioned",
+	} {
+		if !strings.Contains(noIDs, want) {
+			t.Errorf("no-ids acceptance prompt missing %q\n---\n%s", want, noIDs)
 		}
 	}
 }
