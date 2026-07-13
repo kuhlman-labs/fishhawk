@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -121,7 +123,7 @@ func TestProvisionLineageWorktree_CreateThenReuse(t *testing.T) {
 	ctx := context.Background()
 	const root = "abcdef12"
 
-	first, err := provisionLineageWorktree(ctx, repo, root, io.Discard)
+	first, err := provisionLineageWorktree(ctx, repo, root, "main", io.Discard)
 	if err != nil {
 		t.Fatalf("first provision: %v", err)
 	}
@@ -136,7 +138,7 @@ func TestProvisionLineageWorktree_CreateThenReuse(t *testing.T) {
 
 	// Second provision of the SAME root reuses the existing worktree
 	// (decomposed-child sharing) rather than failing on a populated path.
-	second, err := provisionLineageWorktree(ctx, repo, root, io.Discard)
+	second, err := provisionLineageWorktree(ctx, repo, root, "main", io.Discard)
 	if err != nil {
 		t.Fatalf("reuse provision: %v", err)
 	}
@@ -149,11 +151,11 @@ func TestProvisionLineageWorktree_SoloDistinct(t *testing.T) {
 	repo := initRepo(t)
 	ctx := context.Background()
 
-	a, err := provisionLineageWorktree(ctx, repo, "aaaaaaaa", io.Discard)
+	a, err := provisionLineageWorktree(ctx, repo, "aaaaaaaa", "main", io.Discard)
 	if err != nil {
 		t.Fatalf("provision a: %v", err)
 	}
-	b, err := provisionLineageWorktree(ctx, repo, "bbbbbbbb", io.Discard)
+	b, err := provisionLineageWorktree(ctx, repo, "bbbbbbbb", "main", io.Discard)
 	if err != nil {
 		t.Fatalf("provision b: %v", err)
 	}
@@ -398,12 +400,12 @@ func TestSweepTerminalWorktrees_RemovesTerminalKeepsLive(t *testing.T) {
 		liveRoot = "live0000"
 		liveID   = "11e70000-0000-0000-0000-000000000000"
 	)
-	donePath, err := provisionLineageWorktree(ctx, repo, doneRoot, io.Discard)
+	donePath, err := provisionLineageWorktree(ctx, repo, doneRoot, "main", io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
 	writeLineageRunID(ctx, repo, doneRoot, doneID, io.Discard)
-	livePath, err := provisionLineageWorktree(ctx, repo, liveRoot, io.Discard)
+	livePath, err := provisionLineageWorktree(ctx, repo, liveRoot, "main", io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +442,7 @@ func TestSweepTerminalWorktrees_SkipsWhenNoSidecar(t *testing.T) {
 	repo := initRepo(t)
 	ctx := context.Background()
 	const root = "nosc0000"
-	path, err := provisionLineageWorktree(ctx, repo, root, io.Discard)
+	path, err := provisionLineageWorktree(ctx, repo, root, "main", io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -463,7 +465,7 @@ func TestSweepTerminalWorktrees_BackendErrorIsBestEffort(t *testing.T) {
 		root  = "errr0000"
 		runID = "e4440000-0000-0000-0000-000000000000"
 	)
-	path, err := provisionLineageWorktree(ctx, repo, root, io.Discard)
+	path, err := provisionLineageWorktree(ctx, repo, root, "main", io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -505,7 +507,7 @@ func TestSweepTerminalWorktrees_PrunesNonRunRoot(t *testing.T) {
 	repo := initRepo(t)
 	ctx := context.Background()
 	const root = "rid00000"
-	path, err := provisionLineageWorktree(ctx, repo, root, io.Discard)
+	path, err := provisionLineageWorktree(ctx, repo, root, "main", io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,7 +545,7 @@ func TestSweepTerminalWorktrees_PrunesUnknownRun(t *testing.T) {
 		root  = "gone0000"
 		runID = "9c9e0000-0000-0000-0000-000000000000"
 	)
-	path, err := provisionLineageWorktree(ctx, repo, root, io.Discard)
+	path, err := provisionLineageWorktree(ctx, repo, root, "main", io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -576,7 +578,7 @@ func TestSweepTerminalWorktrees_KeepsHealthyRun(t *testing.T) {
 		root  = "helt0000"
 		runID = "be170000-0000-0000-0000-000000000000"
 	)
-	path, err := provisionLineageWorktree(ctx, repo, root, io.Discard)
+	path, err := provisionLineageWorktree(ctx, repo, root, "main", io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -598,6 +600,268 @@ var errSweepProbe = errProbe("backend down")
 type errProbe string
 
 func (e errProbe) Error() string { return string(e) }
+
+// initRepoWithOrigin builds an operator checkout cloned from a bare origin
+// carrying `main`, so refs/remotes/origin/main resolves and HEAD sits at the
+// pushed tip — the shape the #1866 seed-ancestry guard consults. Returns the
+// operator checkout dir and the origin/main tip SHA.
+func initRepoWithOrigin(t *testing.T) (operator, tipSHA string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	must := func(dir string, args ...string) {
+		t.Helper()
+		if err := runGitErr(dir, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed := t.TempDir()
+	must(seed, "init", "-q")
+	if err := os.WriteFile(filepath.Join(seed, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	must(seed, "add", "-A")
+	must(seed, "commit", "-q", "-m", "base")
+	must(seed, "branch", "-M", "main")
+	bare := filepath.Join(t.TempDir(), "origin.git")
+	must(seed, "init", "--bare", "-q", bare)
+	must(seed, "remote", "add", "origin", bare)
+	must(seed, "push", "-q", "origin", "main")
+	operator = filepath.Join(t.TempDir(), "operator")
+	must(seed, "clone", "-q", bare, operator)
+	var err error
+	tipSHA, err = runGitOut(operator, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return operator, tipSHA
+}
+
+// TestProvisionLineageWorktree_RefusesDivergedSeed is the #1866 repro: a
+// leftover unmerged commit on the operator HEAD (never pushed to the base)
+// makes a FRESH provision refuse with a *baseDivergenceError naming both the
+// HEAD SHA and the base tip SHA, and no new worktree is registered (the refusal
+// fires before `git worktree add`).
+func TestProvisionLineageWorktree_RefusesDivergedSeed(t *testing.T) {
+	operator, tipSHA := initRepoWithOrigin(t)
+	ctx := context.Background()
+
+	// A leftover unmerged commit on the operator HEAD — the MCP-cwd-default
+	// footgun (#1866): committed locally, never pushed to the base.
+	if err := os.WriteFile(filepath.Join(operator, "leftover.txt"), []byte("stray\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := runGitErr(operator, "add", "-A"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runGitErr(operator, "commit", "-q", "-m", "leftover unmerged commit"); err != nil {
+		t.Fatal(err)
+	}
+	headSHA, err := runGitOut(operator, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, provErr := provisionLineageWorktree(ctx, operator, "div00000", "main", io.Discard)
+	if provErr == nil {
+		t.Fatal("provision succeeded from a diverged seed; want a loud refusal")
+	}
+	var bde *baseDivergenceError
+	if !errors.As(provErr, &bde) {
+		t.Fatalf("error = %T (%v), want *baseDivergenceError", provErr, provErr)
+	}
+	if !strings.Contains(provErr.Error(), headSHA) {
+		t.Errorf("refusal message missing HEAD SHA %q:\n%s", headSHA, provErr.Error())
+	}
+	if !strings.Contains(provErr.Error(), tipSHA) {
+		t.Errorf("refusal message missing base tip SHA %q:\n%s", tipSHA, provErr.Error())
+	}
+	// The refusal fired before `git worktree add` — no worktree registered.
+	registered, err := listWorktreePaths(ctx, operator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wtDir, _ := worktreesDir(ctx, operator)
+	if isRegisteredWorktree(filepath.Join(wtDir, "run-div00000"), registered) {
+		t.Errorf("a worktree was registered despite the refusal: %v", registered)
+	}
+}
+
+// TestProvisionLineageWorktree_EqualAndBehindSeedPass asserts the two allowed
+// shapes: HEAD equal to the base tip provisions, and HEAD strictly BEHIND the
+// base tip (an ancestor — commit-time FreshFetchBase handles a base that has
+// since advanced, ADR-043) also provisions.
+func TestProvisionLineageWorktree_EqualAndBehindSeedPass(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("EqualToTip", func(t *testing.T) {
+		operator, _ := initRepoWithOrigin(t)
+		wt, err := provisionLineageWorktree(ctx, operator, "eq000000", "main", io.Discard)
+		if err != nil {
+			t.Fatalf("provision at tip refused: %v", err)
+		}
+		if st, err := os.Stat(wt); err != nil || !st.IsDir() {
+			t.Fatalf("worktree not created: %v", err)
+		}
+	})
+
+	t.Run("BehindTip", func(t *testing.T) {
+		operator, _ := initRepoWithOrigin(t)
+		base, err := runGitOut(operator, "rev-parse", "HEAD")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Advance origin/main by one commit (updating refs/remotes/origin/main),
+		// then move HEAD back to base so HEAD is strictly an ancestor of the tip.
+		if err := os.WriteFile(filepath.Join(operator, "adv.txt"), []byte("adv\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{
+			{"add", "-A"},
+			{"commit", "-q", "-m", "advance base"},
+			{"push", "-q", "origin", "HEAD:main"},
+			{"fetch", "-q", "origin"},
+			{"reset", "--hard", base},
+		} {
+			if err := runGitErr(operator, args...); err != nil {
+				t.Fatal(err)
+			}
+		}
+		wt, err := provisionLineageWorktree(ctx, operator, "bh000000", "main", io.Discard)
+		if err != nil {
+			t.Fatalf("provision behind tip refused: %v", err)
+		}
+		if st, err := os.Stat(wt); err != nil || !st.IsDir() {
+			t.Fatalf("worktree not created: %v", err)
+		}
+	})
+}
+
+// TestProvisionLineageWorktree_RemoteUnconfiguredSkips asserts the #1302
+// GitHub-not-wired degrade: with no origin the guard emits a skip event
+// (remote_unconfigured) and provisions rather than blocking.
+func TestProvisionLineageWorktree_RemoteUnconfiguredSkips(t *testing.T) {
+	repo := initRepo(t) // no origin remote
+	ctx := context.Background()
+	var log bytes.Buffer
+	wt, err := provisionLineageWorktree(ctx, repo, "noorig00", "main", &log)
+	if err != nil {
+		t.Fatalf("provision refused without a remote: %v", err)
+	}
+	if st, err := os.Stat(wt); err != nil || !st.IsDir() {
+		t.Fatalf("worktree not created: %v", err)
+	}
+	if !strings.Contains(log.String(), `"event":"lineage_worktree_base_guard_skipped"`) ||
+		!strings.Contains(log.String(), `"reason":"remote_unconfigured"`) {
+		t.Errorf("missing remote_unconfigured skip event:\n%s", log.String())
+	}
+}
+
+// TestProvisionLineageWorktree_TrackingRefAbsentSkips asserts the
+// base_ref_unresolvable degrade: origin is configured but
+// refs/remotes/origin/main is absent (never fetched / deleted), so the guard
+// skips and provisions.
+func TestProvisionLineageWorktree_TrackingRefAbsentSkips(t *testing.T) {
+	operator, _ := initRepoWithOrigin(t)
+	ctx := context.Background()
+	// Origin stays configured; delete only the remote-tracking ref.
+	if err := runGitErr(operator, "update-ref", "-d", "refs/remotes/origin/main"); err != nil {
+		t.Fatal(err)
+	}
+	var log bytes.Buffer
+	wt, err := provisionLineageWorktree(ctx, operator, "notrack0", "main", &log)
+	if err != nil {
+		t.Fatalf("provision refused with an unresolvable tracking ref: %v", err)
+	}
+	if st, err := os.Stat(wt); err != nil || !st.IsDir() {
+		t.Fatalf("worktree not created: %v", err)
+	}
+	if !strings.Contains(log.String(), `"reason":"base_ref_unresolvable"`) {
+		t.Errorf("missing base_ref_unresolvable skip event:\n%s", log.String())
+	}
+}
+
+// TestProvisionLineageWorktree_AncestryProbeFailedSkips is the binding
+// gpt-5.6-terra condition: force the ancestry probe ITSELF to error (not a
+// clean exit-0/exit-1) and assert the distinct ancestry_probe_failed skip event
+// AND that provisioning still succeeds — an infra flake must never hard-fail a
+// stage the old seed-from-ambient-HEAD code would have run.
+func TestProvisionLineageWorktree_AncestryProbeFailedSkips(t *testing.T) {
+	operator, _ := initRepoWithOrigin(t)
+	ctx := context.Background()
+
+	orig := ancestryProbe
+	ancestryProbe = func(_ context.Context, _, _, _ string) error {
+		return errProbe("simulated ancestry probe failure")
+	}
+	t.Cleanup(func() { ancestryProbe = orig })
+
+	var log bytes.Buffer
+	wt, err := provisionLineageWorktree(ctx, operator, "probeflt", "main", &log)
+	if err != nil {
+		t.Fatalf("provision blocked on a probe failure; want degrade-and-proceed: %v", err)
+	}
+	if st, err := os.Stat(wt); err != nil || !st.IsDir() {
+		t.Fatalf("worktree not created after the probe-failure degrade: %v", err)
+	}
+	if !strings.Contains(log.String(), `"reason":"ancestry_probe_failed"`) {
+		t.Errorf("missing ancestry_probe_failed skip event:\n%s", log.String())
+	}
+}
+
+// TestProvisionLineageWorktree_ReuseSkipsGuard asserts the reuse-path
+// exemption: once a lineage's worktree exists, a subsequent provision of the
+// SAME root reuses it with NO guard even when the operator HEAD has since
+// diverged (a fresh provision would refuse) — the seed was validated at first
+// provision and a mid-lineage worktree's HEAD is legitimately the run branch.
+func TestProvisionLineageWorktree_ReuseSkipsGuard(t *testing.T) {
+	operator, _ := initRepoWithOrigin(t)
+	ctx := context.Background()
+	const root = "reuse000"
+
+	first, err := provisionLineageWorktree(ctx, operator, root, "main", io.Discard)
+	if err != nil {
+		t.Fatalf("first provision: %v", err)
+	}
+	// Diverge the operator HEAD AFTER first provision — a fresh provision would
+	// now refuse, but the reuse path must not consult the guard.
+	if err := os.WriteFile(filepath.Join(operator, "leftover.txt"), []byte("stray\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "-A"}, {"commit", "-q", "-m", "leftover after provision"}} {
+		if err := runGitErr(operator, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	second, err := provisionLineageWorktree(ctx, operator, root, "main", io.Discard)
+	if err != nil {
+		t.Fatalf("reuse provision refused despite the exemption: %v", err)
+	}
+	if canonPath(first) != canonPath(second) {
+		t.Errorf("reuse returned a different path: %q vs %q", first, second)
+	}
+}
+
+// TestWorktreeProvisionFailureReason pins the runner_failed reason mapping: the
+// #1866 typed error (wrapped or not) maps to working_dir_diverged_from_base,
+// any other error to the generic worktree_provision. This is the done-means
+// test for the main.go change — a comment-only touch cannot pass it.
+func TestWorktreeProvisionFailureReason(t *testing.T) {
+	div := &baseDivergenceError{headSHA: "aaaaaaa", baseRef: "main", baseSHA: "bbbbbbb"}
+	if got := worktreeProvisionFailureReason(div); got != "working_dir_diverged_from_base" {
+		t.Errorf("reason(baseDivergenceError) = %q, want working_dir_diverged_from_base", got)
+	}
+	if got := worktreeProvisionFailureReason(fmt.Errorf("provisionLineageWorktree: %w", div)); got != "working_dir_diverged_from_base" {
+		t.Errorf("reason(wrapped) = %q, want working_dir_diverged_from_base", got)
+	}
+	if got := worktreeProvisionFailureReason(errProbe("worktree add: boom")); got != "worktree_provision" {
+		t.Errorf("reason(other) = %q, want worktree_provision", got)
+	}
+	if got := worktreeProvisionFailureReason(nil); got != "worktree_provision" {
+		t.Errorf("reason(nil) = %q, want worktree_provision", got)
+	}
+}
 
 // gitPorcelain returns `git status --porcelain` output for dir.
 func gitPorcelain(t *testing.T, dir string) string {

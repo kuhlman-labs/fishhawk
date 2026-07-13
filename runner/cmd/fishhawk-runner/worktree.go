@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
@@ -118,13 +119,131 @@ func worktreesDir(ctx context.Context, repoDir string) (string, error) {
 	return filepath.Join(common, "fishhawk-worktrees"), nil
 }
 
+// baseDivergenceError reports that a FRESH lineage worktree would be seeded
+// from an operator checkout whose HEAD is NOT an ancestor of (or equal to) the
+// declared base's remote-tracking ref — the #1866 diverged-seed footgun (a
+// leftover unmerged commit on the operator HEAD, the MCP-cwd-default footgun,
+// contaminates the agent's tree, the reviewer diff, and the NoChanges probe).
+// Its Error() names both resolved SHAs and the recovery so a diverged operator
+// environment surfaces loudly at dispatch — before any agent budget burns.
+type baseDivergenceError struct {
+	headSHA string
+	baseRef string
+	baseSHA string
+}
+
+func (e *baseDivergenceError) Error() string {
+	return fmt.Sprintf(
+		"seed checkout HEAD %s is not an ancestor of the declared base %s (origin/%s at %s): "+
+			"a fresh run worktree seeded from this diverged operator checkout would contaminate "+
+			"the agent's tree and the review diff (#1866, ADR-035 declared-base). Recovery: "+
+			"re-dispatch with working_dir pointing at a clean checkout of %s, or reset/rebase the "+
+			"checkout onto origin/%s.",
+		e.headSHA, e.baseRef, e.baseRef, e.baseSHA, e.baseRef, e.baseRef)
+}
+
+// ancestryProbe runs `git merge-base --is-ancestor <headRev> <baseRev>` in
+// repoDir, returning its raw error: nil when headRev is an ancestor of (or
+// equal to) baseRev, a *exec.ExitError with code 1 when it is provably NOT,
+// and any other error when the probe itself failed. It is a package-level var
+// so a test can force the probe-error degrade branch (#1866
+// ancestry_probe_failed) deterministically without corrupting a real repo.
+var ancestryProbe = func(ctx context.Context, repoDir, headRev, baseRev string) error {
+	return exec.CommandContext(ctx, "git", "-C", repoDir,
+		"merge-base", "--is-ancestor", headRev, baseRev).Run()
+}
+
+// verifySeedAncestry is the #1866 seed-ancestry guard: before a FRESH lineage
+// worktree is seeded via `git worktree add --detach HEAD` from the operator
+// checkout, it verifies HEAD is an ancestor of (or equal to) the declared
+// base's remote-tracking ref refs/remotes/origin/<base>. On PROVEN divergence
+// it returns a *baseDivergenceError (mapped by the caller to the
+// working_dir_diverged_from_base runner_failed reason). It degrades to a
+// logged skip — never a block — when evidence is unavailable (remote
+// unconfigured, tracking ref unresolvable, or the ancestry probe itself
+// errors), mirroring the #1302/#1363 not-wired-vs-transient degrade contract:
+// an infra flake must never hard-fail a stage the old code would have run.
+//
+// The check is offline/auth-free by design (no fetch): `git push` updates the
+// remote-tracking ref, so a checkout whose extra commits were genuinely pushed
+// cannot false-refuse against the local origin/<base> ref.
+func verifySeedAncestry(ctx context.Context, repoDir, baseRef string, logSink io.Writer) error {
+	if baseRef == "" {
+		return nil
+	}
+	// (b) Remote not configured — the bare local-test-repo / GitHub-not-wired
+	// degrade state (#1302): no origin/<base> to compare against, so skip.
+	if !remoteConfigured(ctx, repoDir, gitops.DefaultRemote) {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"lineage_worktree_base_guard_skipped","reason":"remote_unconfigured"}`+"\n")
+		return nil
+	}
+	trackingRef := "refs/remotes/" + gitops.DefaultRemote + "/" + baseRef
+	// (c) Tracking ref unresolvable (never fetched, shallow single-ref
+	// checkout, deleted) — skip: there is no local base tip to compare against.
+	baseOut, err := exec.CommandContext(ctx, "git", "-C", repoDir,
+		"rev-parse", "--verify", "--quiet", trackingRef).Output()
+	if err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"lineage_worktree_base_guard_skipped","reason":"base_ref_unresolvable"}`+"\n")
+		return nil
+	}
+	// (d) HEAD ancestor-of/equal-to the base tip → nil (commit-time
+	// FreshFetchBase handles a base that has since advanced, ADR-043).
+	probeErr := ancestryProbe(ctx, repoDir, "HEAD", trackingRef)
+	if probeErr == nil {
+		return nil
+	}
+	var ee *exec.ExitError
+	if errors.As(probeErr, &ee) && ee.ExitCode() == 1 {
+		// Proven not-an-ancestor: refuse loud with both resolved SHAs.
+		headOut, herr := exec.CommandContext(ctx, "git", "-C", repoDir,
+			"rev-parse", "HEAD").Output()
+		if herr != nil {
+			// Can't resolve HEAD to name it → degrade rather than block.
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"lineage_worktree_base_guard_skipped","reason":"ancestry_probe_failed"}`+"\n")
+			return nil
+		}
+		return &baseDivergenceError{
+			headSHA: strings.TrimSpace(string(headOut)),
+			baseRef: baseRef,
+			baseSHA: strings.TrimSpace(string(baseOut)),
+		}
+	}
+	// Any other probe failure (git unavailable, transient) → skip, never
+	// hard-fail a stage the old code would have run.
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"lineage_worktree_base_guard_skipped","reason":"ancestry_probe_failed"}`+"\n")
+	return nil
+}
+
+// worktreeProvisionFailureReason maps a provisionLineageWorktree error to the
+// runner_failed reason string: "working_dir_diverged_from_base" for the #1866
+// seed-ancestry refusal, else the generic "worktree_provision". Factored out
+// so main.go's call site stays a two-line change and the reason mapping is
+// unit-testable.
+func worktreeProvisionFailureReason(err error) string {
+	var bde *baseDivergenceError
+	if errors.As(err, &bde) {
+		return "working_dir_diverged_from_base"
+	}
+	return "worktree_provision"
+}
+
 // provisionLineageWorktree returns the absolute path to the lineage's
 // worktree, creating it on first use and reusing it for every subsequent
 // run that keys on the same root (decomposed-child sharing). The worktree
 // is a detached checkout of HEAD at <worktrees-dir>/run-<root>; downstream
 // git ops re-derive their repo dir from cfg.workingDir, so relocating that
 // one field into the returned path isolates the whole stage.
-func provisionLineageWorktree(ctx context.Context, repoDir, root string, logSink io.Writer) (string, error) {
+//
+// baseRef is the declared PR base branch; on a FRESH provision (not the reuse
+// path) verifySeedAncestry refuses to seed from an operator HEAD that has
+// diverged from origin/<baseRef> (#1866). The reuse path is exempt: a
+// mid-lineage worktree's HEAD is legitimately the run branch, and its seed was
+// validated at first provision.
+func provisionLineageWorktree(ctx context.Context, repoDir, root, baseRef string, logSink io.Writer) (string, error) {
 	if repoDir == "" {
 		repoDir = "."
 	}
@@ -145,6 +264,14 @@ func provisionLineageWorktree(ctx context.Context, repoDir, root string, logSink
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"lineage_worktree_reused","root":%q,"path":%q}`+"\n", root, target)
 		return target, nil
+	}
+
+	// #1866 seed-ancestry guard — FRESH provisions only (the reuse return
+	// above exempts mid-lineage stages and already-seeded siblings). A fresh
+	// worktree is seeded via `worktree add --detach HEAD`, so a diverged
+	// operator HEAD would contaminate the agent's tree and the review diff.
+	if err := verifySeedAncestry(ctx, repoDir, baseRef, logSink); err != nil {
+		return "", err
 	}
 
 	if err := os.MkdirAll(wtDir, 0o755); err != nil {
