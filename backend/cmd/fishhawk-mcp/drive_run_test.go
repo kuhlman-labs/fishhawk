@@ -1915,6 +1915,54 @@ func TestDriveRun_DispatchedFreshRow_SourceAgnostic_Polls(t *testing.T) {
 	}
 }
 
+// --- (T8b) evidence-bearing 'dispatched' with a ZERO anchor -> degrade to poll
+
+func TestDriveRun_DispatchedZeroAnchor_DegradesToPolling(t *testing.T) {
+	// The zero-value-anchor degrade branch (drive_run.go: `!anchor.IsZero() && ...`).
+	// hasEvidence is true (a dispatch row exists) so the immediate no-evidence
+	// handoff (T6) does NOT fire, yet the newest spawn evidence carries no usable
+	// timestamp: UpdatedAt is the zero value (stg() leaves it unset), StartedAt is
+	// nil, and the dispatch-row Timestamp is time.Time{}. The anchor is therefore
+	// zero, and both drive_run.go's comment and the README promise "A zero-value
+	// anchor degrades to polling (fail toward polling, never toward a stale stop or
+	// a spawn)". No other test pins this: T6 covers no-evidence, T7 a fresh row, T8
+	// an old row, T11 the convergence chain. A regression that dropped the
+	// !anchor.IsZero() guard would make time.Since(zero) enormous and trip an
+	// instant stale stop (or worse, reorder the branch toward a spawn) — this test
+	// fails loudly if it does.
+	impl := stg(driveImplID, "implement", "dispatched", 1) // UpdatedAt zero, StartedAt nil by default
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		impl,
+	})
+	// A dispatch-evidence row with a ZERO Timestamp: priorRow (hasEvidence) is
+	// true, but it contributes no timestamped anchor.
+	f.appendAutoAt(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""}, time.Time{})
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveDispatchedStaleAfter = time.Millisecond // tiny: a NON-zero anchor would trip instantly; the zero anchor must NOT
+	r.driveMaxWallclock = 40 * time.Millisecond    // degrade-to-poll -> polls to the deadline
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedTimeout {
+		t.Fatalf("stopped_reason = %q, want timeout (zero anchor degrades to polling, never a stale stop)", out.StoppedReason)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("driver spawned a zero-anchor 'dispatched' stage: %v (must never auto-spawn)", got)
+	}
+	f.mu.Lock()
+	nActs := len(f.recordedActs)
+	f.mu.Unlock()
+	if nActs != 0 {
+		t.Errorf("driver recorded %d acts on a zero-anchor degrade; want 0", nActs)
+	}
+}
+
 // --- (T11) MANDATED end-to-end stale-recovery convergence -------------------
 
 func TestDriveRun_StaleRecoveryConvergence_EndToEnd(t *testing.T) {
@@ -1979,14 +2027,23 @@ func TestDriveRun_StaleRecoveryConvergence_EndToEnd(t *testing.T) {
 	}
 
 	// Advance the stage as the fresh runner would once the re-invoked drive polls
-	// it: running, then succeeded (with the run settling) — the convergence tail.
+	// it. The FIRST stages read must leave implement 'dispatched' so drive #2
+	// actually evaluates the dispatched guard: only then does the fresh manual row
+	// reset the anchor and make it POLL rather than re-report stale. Advancing to
+	// 'running' on the first read would skip the guard entirely, and the test
+	// would pass even if the fresh-evidence anchor logic were removed (the
+	// staleness check is what this end-to-end is here to pin). It then advances
+	// running -> succeeded (with the run settling) — the convergence tail.
 	converge := 0
 	f.onStages = func(f *driveFakeBackend) {
 		converge++
 		switch converge {
 		case 1:
-			f.setState("implement", "running")
+			// stays 'dispatched': drive #2 must hit the dispatched guard and,
+			// off the fresh manual row's reset anchor, poll rather than stop stale.
 		case 2:
+			f.setState("implement", "running")
+		case 3:
 			f.setState("implement", "succeeded")
 			f.runState = "succeeded"
 		}
