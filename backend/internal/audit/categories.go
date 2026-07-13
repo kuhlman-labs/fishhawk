@@ -146,6 +146,7 @@ var KnownCategories = map[string]struct{}{
 	"reviewer_capability_unavailable":         {},
 	"run_admitted_budget_override":            {},
 	"run_auto_advanced":                       {},
+	"run_auto_driven":                         {},
 	"run_budget_exceeded":                     {},
 	"run_completed":                           {},
 	"run_dispatched":                          {},

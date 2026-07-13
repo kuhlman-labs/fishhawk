@@ -1522,7 +1522,10 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// prepare/preview pair — taking the total 40 -> 41; the release cut/publish
 	// verbs are CLI-only (next_actions names them at the release-loop states),
 	// so the MCP surface grows by AT MOST one per the binding approval condition.
-	const wantToolCount = 41
+	//
+	// E22.X (#1700, ADR-040/ADR-047) adds exactly ONE tool —
+	// fishhawk_drive_run, the local auto-driver — taking the total 41 -> 42.
+	const wantToolCount = 42
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

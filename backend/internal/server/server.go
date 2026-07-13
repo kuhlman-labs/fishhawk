@@ -248,6 +248,15 @@ type Config struct {
 	// the ID-addressed fix-up path returning 503.
 	ConcernRepo concern.Repository
 
+	// GateMerger is the GitHub auto-merge seam the local auto-driver
+	// endpoint (POST /v0/runs/{run_id}/auto-drive, #1700) dispatches a
+	// delegated may_merge gate through — the SAME githubAutoMerger seam
+	// serve.go builds for the campaign GateActor. A nil merger keeps
+	// may_merge fail-CLOSED to observe-only, byte-identical to today: the
+	// auto-drive handler passes it straight to AutoDriveRunGate, whose
+	// merge arm already returns observe-only when the merger is nil.
+	GateMerger GitHubMerger
+
 	// AuthRepo persists users + sessions for the OAuth
 	// sign-in flow (E4.2). Wired by the /v0/auth/* handlers; nil
 	// leaves them returning 503 and cookie-bearing requests
