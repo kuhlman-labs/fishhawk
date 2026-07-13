@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -741,5 +742,160 @@ func TestDispatchStage_ReaperReportsSpawnFailure(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("reaper did not POST reap-failure within 5s")
+	}
+}
+
+// --- (T9/T10) manual-dispatch spawn-evidence vocabulary pin (#1905) ----------
+
+// dispatchAutoDriveFake is a self-contained backend for the record-act tests:
+// it serves the endpoints the dispatch path touches (GET run unlocked, GET
+// stages with one implement stage, POST /auto-drive/acts) and captures the
+// recorded act. recordStatus, when non-2xx, drives the best-effort failure
+// branch. Kept local to dispatch_stage_test.go so the shared fakeBackend stays
+// unchanged.
+type dispatchAutoDriveFake struct {
+	mu           sync.Mutex
+	runID        uuid.UUID
+	stageID      uuid.UUID
+	acts         []RecordAutoDriveAct
+	actCalledN   int
+	recordStatus int // 0 -> 200; non-2xx drives the failure branch
+}
+
+func (f *dispatchAutoDriveFake) handler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/auto-drive/acts"):
+			var body RecordAutoDriveAct
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.mu.Lock()
+			f.acts = append(f.acts, body)
+			f.actCalledN++
+			status := f.recordStatus
+			f.mu.Unlock()
+			if status != 0 && status != http.StatusOK {
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(`{"error":{"code":"auto_drive_record_failed","message":"boom"}}`))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(RecordAutoDriveActResult{
+				RunID: f.runID.String(), Category: CategoryRunAutoDriven, Act: "dispatch",
+				Action: body.Action, Stage: body.Stage, Source: body.Source, Sequence: 1,
+			})
+		case strings.HasSuffix(r.URL.Path, "/stages"):
+			// resolveStageID, the sibling-in-flight guard, and the post-dispatch
+			// classify all read this.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"items": []Stage{{ID: f.stageID.String(), RunID: f.runID.String(), Type: "implement", State: "pending"}},
+			})
+		default:
+			// guardHostDispatch's GET /v0/runs/{id}: an unlocked run so the guard passes.
+			_ = json.NewEncoder(w).Encode(Run{ID: f.runID.String(), Repo: "x/y", State: "running"})
+		}
+	}
+}
+
+// TestDispatchStage_RecordsAutoDriveActBeforeSpawn is the canonical-vocabulary
+// pin at the producer: a successful dispatch records EXACTLY ONE run_auto_driven
+// spawn-evidence act whose Action == autoDriveDispatchActionName (the SHARED
+// constant, not a duplicated literal — so the two callers cannot drift),
+// Source == dispatchStageSourceTag ('fishhawk_dispatch_stage'), and Stage == the
+// resolved stage type — recorded BEFORE the runner spawn (the record-before-
+// spawn ordering). T11 (drive_run_test.go) then proves this row lets a re-invoked
+// drive read the stage as live instead of dispatched_stale.
+func TestDispatchStage_RecordsAutoDriveActBeforeSpawn(t *testing.T) {
+	f := &dispatchAutoDriveFake{runID: uuid.New(), stageID: uuid.New()}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv: func(string) string { return "" },
+	}
+
+	// Capture how many acts were recorded at the moment the runner spawns, to
+	// prove the record preceded the spawn (record-before-spawn ordering).
+	recordSeenAtSpawn := -1
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, _ ...string) *exec.Cmd {
+		f.mu.Lock()
+		recordSeenAtSpawn = f.actCalledN
+		f.mu.Unlock()
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	_, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: f.runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+
+	f.mu.Lock()
+	acts := append([]RecordAutoDriveAct(nil), f.acts...)
+	f.mu.Unlock()
+	if len(acts) != 1 {
+		t.Fatalf("recorded %d acts, want exactly 1", len(acts))
+	}
+	if acts[0].Action != autoDriveDispatchActionName {
+		t.Errorf("act Action = %q, want the shared constant autoDriveDispatchActionName (%q)", acts[0].Action, autoDriveDispatchActionName)
+	}
+	if acts[0].Source != dispatchStageSourceTag {
+		t.Errorf("act Source = %q, want %q", acts[0].Source, dispatchStageSourceTag)
+	}
+	if acts[0].Stage != "implement" {
+		t.Errorf("act Stage = %q, want implement (the resolved stage type)", acts[0].Stage)
+	}
+	if recordSeenAtSpawn != 1 {
+		t.Errorf("record-before-spawn ordering violated: %d acts recorded when the runner spawned, want 1", recordSeenAtSpawn)
+	}
+}
+
+// TestDispatchStage_RecordActFailure_WarnsAndProceeds pins the best-effort
+// branch (T10): when POST /auto-drive/acts fails (500 — including the
+// insufficient_scope case on a token lacking write:approvals), the dispatch
+// STILL proceeds (no tool error, runner spawned) and the output carries a
+// warning naming the degraded stale detection. The record is staleness
+// evidence, not an authorization gate, so it must never block the core manual
+// recovery verb.
+func TestDispatchStage_RecordActFailure_WarnsAndProceeds(t *testing.T) {
+	f := &dispatchAutoDriveFake{runID: uuid.New(), stageID: uuid.New(), recordStatus: http.StatusInternalServerError}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv: func(string) string { return "" },
+	}
+
+	spawned := 0
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, _ ...string) *exec.Cmd {
+		spawned++
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: f.runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("dispatchStage must proceed on a record-act failure (best-effort), got error: %v", err)
+	}
+	if spawned != 1 {
+		t.Errorf("the dispatch must still spawn exactly one runner despite the record failure, got %d", spawned)
+	}
+	var warned bool
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "dispatched_stale") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("no warning naming the degraded stale detection; warnings: %v", out.Warnings)
 	}
 }

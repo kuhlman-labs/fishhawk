@@ -49,6 +49,25 @@ type DispatchStageOutput struct {
 	Warnings        []string         `json:"warnings,omitempty"`
 }
 
+// dispatchStageSourceTag is the run_auto_driven source that distinguishes a
+// manual fishhawk_dispatch_stage spawn-evidence row from the driver's own
+// (driveSourceTag). Caller identity lives ONLY in source — the action value is
+// the shared canonical autoDriveDispatchActionName for both callers (#1905).
+const dispatchStageSourceTag = "fishhawk_dispatch_stage"
+
+// autoDriveRecordableStage reports whether a manual-dispatch stage type is in
+// the /auto-drive/acts endpoint's closed dispatch-stage set (plan|implement|
+// acceptance). A review dispatch is NOT recordable — the endpoint would 400 an
+// unknown stage, and the driver never host-dispatches review stages anyway.
+func autoDriveRecordableStage(stage string) bool {
+	switch stage {
+	case "plan", "implement", "acceptance":
+		return true
+	default:
+		return false
+	}
+}
+
 // registerDispatchStage wires the fishhawk_dispatch_stage tool (#1232).
 func registerDispatchStage(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
@@ -204,6 +223,33 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		_, rerr := r.api.ReportStageFailure(ctx, runUUID, stageUUID, category, reason, detail, exitCode)
 		return rerr
 	}
+
+	// (5a) Record this manual host-spawn as run_auto_driven spawn evidence under
+	// the SAME canonical action value the driver uses (autoDriveDispatchActionName,
+	// 'dispatch_stage'), distinguished only by Source (#1905). This lands a
+	// dispatch-evidence row so a later fishhawk_drive_run resume anchors staleness
+	// on a FRESH timestamp and reads this stage as live rather than re-reporting
+	// dispatched_stale — the recovery loop then converges. BEST-EFFORT: on error
+	// (including insufficient_scope on a token lacking write:approvals) append a
+	// warning naming the degraded stale detection and proceed — the record is
+	// staleness evidence, not an authorization gate, so making it mandatory would
+	// regress the core manual recovery verb. Only stage types the endpoint's
+	// closed set accepts (plan|implement|acceptance) are recorded; a review
+	// dispatch records nothing (the endpoint would 400 an unknown stage, and the
+	// driver never host-dispatches review stages anyway).
+	if autoDriveRecordableStage(in.Stage) {
+		if _, rerr := r.api.RecordAutoDriveAct(ctx, runUUID, RecordAutoDriveAct{
+			Action: autoDriveDispatchActionName,
+			Stage:  in.Stage,
+			Source: dispatchStageSourceTag,
+			Note:   "manual host dispatch",
+		}); rerr != nil {
+			warnings = append(warnings, fmt.Sprintf(
+				"could not record manual-dispatch spawn evidence (%v); a later fishhawk_drive_run resume may mis-report this stage dispatched_stale. Proceeding — the record is staleness evidence, not an authorization gate.",
+				rerr))
+		}
+	}
+
 	logPath, err := spawnRunnerStageDetached(binary, argv, env, runUUID.String(), resolvedStageID, report)
 	if err != nil {
 		return nil, DispatchStageOutput{}, err
