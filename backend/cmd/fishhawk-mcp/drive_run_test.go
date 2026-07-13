@@ -1146,6 +1146,117 @@ func TestDriveRun_CrossInvocationFixupRedispatch(t *testing.T) {
 	}
 }
 
+// --- (t5b) fixup-attribution read error -> fail-closed, never dispatch -------
+
+func TestDriveRun_FixupAttributionCheckError_FailsClosed(t *testing.T) {
+	// The LATER audit read in the dispatch path — driveNewestFixupTriggeredSeq,
+	// reached only when a fresh invocation (dispatchedCount==0) re-dispatches a
+	// still-'pending' implement stage that a prior invocation already dispatched
+	// (priorRow==true) — errors. Like the earlier prior-dispatch-row read, an
+	// unreadable stage_fixup_triggered state precedes a record + host-spawn and
+	// must NEVER be downgraded to "no fix-up trigger": halt fail-closed, never
+	// record, never spawn.
+	//
+	// The error is scoped to categoryStageFixupTriggered ONLY: the
+	// CategoryRunAutoDriven read (driveHasPriorDispatchRow) succeeds and returns
+	// priorRow==true, so the loop reaches the NEW branch rather than halting at
+	// driveHasPriorDispatchRow (the existing (l3) fixture errors
+	// CategoryRunAutoDriven and stops earlier). This pins the branch (l3) cannot.
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "pending", 1),
+	})
+	// A prior implement dispatch row: makes driveHasPriorDispatchRow return
+	// priorRow==true so the fixup-attribution branch is entered.
+	f.appendAuto(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""})
+	f.auditErrCategory = categoryStageFixupTriggered // only the fix-up trigger read errors
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedDispatchCheckFailed {
+		t.Fatalf("stopped_reason = %q, want dispatch_check_failed (fail-closed on the fixup-attribution read)", out.StoppedReason)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("driver spawned despite an unreadable stage_fixup_triggered state: %v", got)
+	}
+	f.mu.Lock()
+	nActs := len(f.recordedActs)
+	f.mu.Unlock()
+	if nActs != 0 {
+		t.Errorf("driver recorded %d acts despite the fail-closed fixup-attribution read error; want 0", nActs)
+	}
+	var warned bool
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "fixup-attribution poll failed") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("no fail-closed warning about the fixup-attribution read; warnings: %v", out.Warnings)
+	}
+	if out.NextActions == nil {
+		t.Error("fail-closed fixup-attribution stop carried no next_actions")
+	}
+}
+
+// --- (t5c) stale threshold crossed MID-invocation -> distinct stop -----------
+
+func TestDriveRun_ResumeDispatchedStale_MidInvocation_StopsDistinct(t *testing.T) {
+	// The dispatched-guard rework replaced the one-shot spawned[] mark with a
+	// poll+continue that RE-EVALUATES the stale threshold every iteration. The
+	// existing stale test seeds a stage already stale at loop start; this one
+	// seeds a stage FRESH at loop start (UpdatedAt == now, threshold not yet
+	// crossed) and lets the threshold trip DURING the poll loop — pinning the
+	// "can also trip mid-invocation" property the comment advertises. The stage
+	// never advances, so once time.Since(UpdatedAt) passes the (tiny, but
+	// non-zero at start) threshold, the guard re-trips and stops dispatched_stale
+	// rather than polling silently to the wall-clock deadline.
+	impl := stg(driveImplID, "implement", "dispatched", 1)
+	impl.UpdatedAt = time.Now() // FRESH at loop start: not stale on the first check
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		impl,
+	})
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	// Threshold comfortably larger than the first check's sub-ms latency (so the
+	// first iteration polls, not stops) yet far smaller than the wall-clock
+	// budget (so the stale stop, not timeout, is what fires).
+	r.driveDispatchedStaleAfter = 40 * time.Millisecond
+	r.driveMaxWallclock = 10 * time.Second
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedDispatchedStale {
+		t.Fatalf("stopped_reason = %q, want dispatched_stale (threshold crossed mid-invocation)", out.StoppedReason)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("driver spawned a stage whose stale threshold tripped mid-invocation: %v (must never auto-spawn)", got)
+	}
+	f.mu.Lock()
+	nActs := len(f.recordedActs)
+	f.mu.Unlock()
+	if nActs != 0 {
+		t.Errorf("driver recorded %d acts on a mid-invocation stale stop; want 0", nActs)
+	}
+	if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
+		t.Fatal("mid-invocation dispatched_stale stop carried no next_actions")
+	}
+	if out.NextActions.Actions[0].Action != "fishhawk_dispatch_stage" {
+		t.Errorf("next_actions[0] = %q, want fishhawk_dispatch_stage", out.NextActions.Actions[0].Action)
+	}
+}
+
 // --- (t6) context cancelled -> distinct context_cancelled stop --------------
 
 func TestDriveRun_ContextCancelled(t *testing.T) {
