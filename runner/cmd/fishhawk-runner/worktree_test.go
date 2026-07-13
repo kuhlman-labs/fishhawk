@@ -810,6 +810,65 @@ func TestProvisionLineageWorktree_AncestryProbeFailedSkips(t *testing.T) {
 	}
 }
 
+// TestProvisionLineageWorktree_PinsSeedAgainstConcurrentHeadAdvance is the
+// check-then-add TOCTOU repro: the operator HEAD advances to a local-only
+// (diverged, unpushed) commit in the window AFTER verifySeedAncestry succeeds
+// but BEFORE `git worktree add` resolves its seed. Because provision pins HEAD
+// to a concrete SHA once and seeds the worktree from that pinned SHA, the fresh
+// worktree must land on the pre-advance tip that was actually checked — never
+// the diverged commit HEAD raced to. The interleaving is injected
+// deterministically by advancing HEAD inside the ancestryProbe hook, which runs
+// exactly between the pin+check and the seed.
+func TestProvisionLineageWorktree_PinsSeedAgainstConcurrentHeadAdvance(t *testing.T) {
+	operator, tipSHA := initRepoWithOrigin(t)
+	ctx := context.Background()
+
+	orig := ancestryProbe
+	var advancedSHA string
+	ancestryProbe = func(ctx context.Context, repoDir, headRev, baseRev string) error {
+		// Simulate a concurrent HEAD advance to a local-only commit landing in
+		// the window between the ancestry check and `git worktree add`.
+		if err := os.WriteFile(filepath.Join(operator, "race.txt"), []byte("race\n"), 0o644); err != nil {
+			return err
+		}
+		if err := runGitErr(operator, "add", "-A"); err != nil {
+			return err
+		}
+		if err := runGitErr(operator, "commit", "-q", "-m", "concurrent local advance"); err != nil {
+			return err
+		}
+		var rerr error
+		if advancedSHA, rerr = runGitOut(operator, "rev-parse", "HEAD"); rerr != nil {
+			return rerr
+		}
+		// The guard must probe the PINNED headRev (the pre-advance tip), not
+		// the just-advanced HEAD — delegate to the real probe to confirm it
+		// passes (pinned SHA == origin/main tip, still an ancestor).
+		return orig(ctx, repoDir, headRev, baseRev)
+	}
+	t.Cleanup(func() { ancestryProbe = orig })
+
+	wt, err := provisionLineageWorktree(ctx, operator, "raceseed", "main", io.Discard)
+	if err != nil {
+		t.Fatalf("provision refused despite a pinned in-window advance: %v", err)
+	}
+	if advancedSHA == "" || advancedSHA == tipSHA {
+		t.Fatalf("test did not advance HEAD in the probe window (advanced=%q tip=%q)", advancedSHA, tipSHA)
+	}
+	wtHead, err := runGitOut(wt, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The worktree must be seeded from the checked tip, never the diverged
+	// commit HEAD advanced to mid-provision.
+	if wtHead != tipSHA {
+		t.Errorf("worktree seeded from %q, want the checked tip %q", wtHead, tipSHA)
+	}
+	if wtHead == advancedSHA {
+		t.Errorf("worktree seeded from the concurrently-advanced commit %q (TOCTOU not closed)", advancedSHA)
+	}
+}
+
 // TestProvisionLineageWorktree_ReuseSkipsGuard asserts the reuse-path
 // exemption: once a lineage's worktree exists, a subsequent provision of the
 // SAME root reuses it with NO guard even when the operator HEAD has since

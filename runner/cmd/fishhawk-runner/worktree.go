@@ -153,21 +153,40 @@ var ancestryProbe = func(ctx context.Context, repoDir, headRev, baseRev string) 
 		"merge-base", "--is-ancestor", headRev, baseRev).Run()
 }
 
+// resolveHead resolves the operator checkout's current HEAD to a concrete
+// commit SHA. The caller pins this value so the seed-ancestry check and the
+// subsequent `git worktree add` reference the SAME immutable commit rather than
+// re-resolving the mutable symbolic HEAD twice (the #1866 check-then-add race).
+func resolveHead(ctx context.Context, repoDir string) (string, error) {
+	out, err := exec.CommandContext(ctx, "git", "-C", repoDir,
+		"rev-parse", "HEAD").Output()
+	if err != nil {
+		return "", gitErr(err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // verifySeedAncestry is the #1866 seed-ancestry guard: before a FRESH lineage
-// worktree is seeded via `git worktree add --detach HEAD` from the operator
-// checkout, it verifies HEAD is an ancestor of (or equal to) the declared
-// base's remote-tracking ref refs/remotes/origin/<base>. On PROVEN divergence
-// it returns a *baseDivergenceError (mapped by the caller to the
-// working_dir_diverged_from_base runner_failed reason). It degrades to a
+// worktree is seeded from the operator checkout, it verifies headRev — the
+// PINNED commit the caller will seed the worktree from — is an ancestor of (or
+// equal to) the declared base's remote-tracking ref refs/remotes/origin/<base>.
+// On PROVEN divergence it returns a *baseDivergenceError (mapped by the caller
+// to the working_dir_diverged_from_base runner_failed reason). It degrades to a
 // logged skip — never a block — when evidence is unavailable (remote
 // unconfigured, tracking ref unresolvable, or the ancestry probe itself
 // errors), mirroring the #1302/#1363 not-wired-vs-transient degrade contract:
 // an infra flake must never hard-fail a stage the old code would have run.
 //
+// headRev is a concrete commit SHA the caller resolved ONCE (not the symbolic
+// "HEAD"): the same immutable commit is both checked here and handed to
+// `git worktree add`, so an operator HEAD that advances to a local-only commit
+// between this check and the seed cannot slip a diverged commit past the guard
+// (the check-then-add TOCTOU the mutable operator checkout would otherwise open).
+//
 // The check is offline/auth-free by design (no fetch): `git push` updates the
 // remote-tracking ref, so a checkout whose extra commits were genuinely pushed
 // cannot false-refuse against the local origin/<base> ref.
-func verifySeedAncestry(ctx context.Context, repoDir, baseRef string, logSink io.Writer) error {
+func verifySeedAncestry(ctx context.Context, repoDir, headRev, baseRef string, logSink io.Writer) error {
 	if baseRef == "" {
 		return nil
 	}
@@ -188,25 +207,18 @@ func verifySeedAncestry(ctx context.Context, repoDir, baseRef string, logSink io
 			`{"event":"lineage_worktree_base_guard_skipped","reason":"base_ref_unresolvable"}`+"\n")
 		return nil
 	}
-	// (d) HEAD ancestor-of/equal-to the base tip → nil (commit-time
+	// (d) headRev ancestor-of/equal-to the base tip → nil (commit-time
 	// FreshFetchBase handles a base that has since advanced, ADR-043).
-	probeErr := ancestryProbe(ctx, repoDir, "HEAD", trackingRef)
+	probeErr := ancestryProbe(ctx, repoDir, headRev, trackingRef)
 	if probeErr == nil {
 		return nil
 	}
 	var ee *exec.ExitError
 	if errors.As(probeErr, &ee) && ee.ExitCode() == 1 {
-		// Proven not-an-ancestor: refuse loud with both resolved SHAs.
-		headOut, herr := exec.CommandContext(ctx, "git", "-C", repoDir,
-			"rev-parse", "HEAD").Output()
-		if herr != nil {
-			// Can't resolve HEAD to name it → degrade rather than block.
-			_, _ = fmt.Fprintf(logSink,
-				`{"event":"lineage_worktree_base_guard_skipped","reason":"ancestry_probe_failed"}`+"\n")
-			return nil
-		}
+		// Proven not-an-ancestor: refuse loud with both resolved SHAs. headRev
+		// is already the pinned SHA, so no second (racy) HEAD resolution.
 		return &baseDivergenceError{
-			headSHA: strings.TrimSpace(string(headOut)),
+			headSHA: headRev,
 			baseRef: baseRef,
 			baseSHA: strings.TrimSpace(string(baseOut)),
 		}
@@ -266,23 +278,37 @@ func provisionLineageWorktree(ctx context.Context, repoDir, root, baseRef string
 		return target, nil
 	}
 
+	// Resolve HEAD to a concrete commit ONCE and pin it: the same immutable
+	// SHA is both checked by the seed-ancestry guard and handed to `git
+	// worktree add` below. Because the operator checkout is mutable, resolving
+	// the symbolic "HEAD" twice (once in the guard, once at `worktree add`)
+	// would open a TOCTOU window — HEAD could advance to a local-only commit
+	// in between and seed the fresh worktree from the diverged commit the guard
+	// is meant to prevent (#1866 concurrency). Pinning closes that window.
+	headSHA, err := resolveHead(ctx, repoDir)
+	if err != nil {
+		return "", fmt.Errorf("provisionLineageWorktree: resolve HEAD: %w", err)
+	}
+
 	// #1866 seed-ancestry guard — FRESH provisions only (the reuse return
 	// above exempts mid-lineage stages and already-seeded siblings). A fresh
-	// worktree is seeded via `worktree add --detach HEAD`, so a diverged
-	// operator HEAD would contaminate the agent's tree and the review diff.
-	if err := verifySeedAncestry(ctx, repoDir, baseRef, logSink); err != nil {
+	// worktree is seeded from the pinned HEAD SHA, so a diverged operator HEAD
+	// would contaminate the agent's tree and the review diff.
+	if err := verifySeedAncestry(ctx, repoDir, headSHA, baseRef, logSink); err != nil {
 		return "", err
 	}
 
 	if err := os.MkdirAll(wtDir, 0o755); err != nil {
 		return "", fmt.Errorf("provisionLineageWorktree: mkdir worktrees dir: %w", err)
 	}
-	// `git worktree add --detach <path> HEAD` — the same pattern the verify
-	// gate uses (main.go runVerifyCommittedTree). --detach avoids claiming a
-	// branch; the run's own branch/commit work happens via the downstream
-	// FreshFetchBase / checkoutChildBase / commit sequences in the worktree.
+	// `git worktree add --detach <path> <pinned-sha>` — the same pattern the
+	// verify gate uses (main.go runVerifyCommittedTree), but seeded from the
+	// pinned SHA rather than the symbolic HEAD so it agrees with the guard
+	// above. --detach avoids claiming a branch; the run's own branch/commit
+	// work happens via the downstream FreshFetchBase / checkoutChildBase /
+	// commit sequences in the worktree.
 	if out, err := exec.CommandContext(ctx, "git", "-C", repoDir,
-		"worktree", "add", "--detach", target, "HEAD").CombinedOutput(); err != nil {
+		"worktree", "add", "--detach", target, headSHA).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("provisionLineageWorktree: worktree add: %v: %s",
 			err, strings.TrimSpace(string(out)))
 	}
