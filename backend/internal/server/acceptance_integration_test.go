@@ -481,6 +481,23 @@ func TestAcceptanceSeam_OutOfScopeZeroCriteria_AutoTerminal(t *testing.T) {
 		t.Errorf("acceptance_dispatched entries = %d, want 0 on the skip path", n)
 	}
 
+	// --- Server-gate leg (E38.3 / #1877): acceptanceGateState classifies the
+	//     REAL orchestrator-written skip marker as merge-eligible, crossing the
+	//     orchestrator-write -> server-gate-read boundary the unit tables fake.
+	//     A synthetic run row carries the acceptance-declaring spec so
+	//     resolveAcceptanceStageSpec's off-switch is satisfied; the gate reads the
+	//     marker from the SAME audit store the orchestrator wrote to (au).
+	gateSrv := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	gateRun := &run.Run{ID: runID, WorkflowID: "feature_change", WorkflowSpec: specWithAcceptanceStage, State: run.StateSucceeded}
+	gateStages := []*run.Stage{{ID: accID, RunID: runID, Type: run.StageTypeAcceptance, State: run.StageStateSucceeded}}
+	gotGate, gerr := gateSrv.acceptanceGateState(ctx, gateRun, gateStages)
+	if gerr != nil {
+		t.Fatalf("acceptanceGateState (skip marker): %v", gerr)
+	}
+	if gotGate != acceptanceGateSkippedOutOfScope {
+		t.Errorf("acceptanceGateState = %q, want %q (the real orchestrator skip marker is merge-eligible)", gotGate, acceptanceGateSkippedOutOfScope)
+	}
+
 	// --- Orchestrator control: a plan with a blocking criterion still DISPATCHES
 	//     the acceptance stage (predicate false → operator-dispatched path).
 	cRunID, _, cAccID, cRR, cAR, cAU := build(t, criteriaPlan)

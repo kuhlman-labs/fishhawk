@@ -2121,3 +2121,100 @@ func TestAcceptanceGateState_MalformedVerdict_TerminalStage_OutcomeUnknown(t *te
 		t.Errorf("state = %q, want %q (malformed verdict + terminal stage)", got, acceptanceGateOutcomeUnknown)
 	}
 }
+
+// seedAcceptanceSkipMarker seeds one stage-scoped acceptance_skipped_out_of_scope
+// marker entry (the orchestrator's emitAcceptanceSkippedOutOfScope shape) for the
+// given run + acceptance stage.
+func seedAcceptanceSkipMarker(au *auditFake, runID, stageID uuid.UUID) {
+	rid, sid := runID, stageID
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &sid, Category: CategoryAcceptanceSkippedOutOfScope, Sequence: 7,
+	})
+}
+
+// TestAcceptanceGateState_NoVerdict_SkipMarker_MergeEligible pins the E38.3 /
+// #1877 done-means: a terminal acceptance stage with NO recorded verdict but a
+// stage-scoped acceptance_skipped_out_of_scope marker classifies the
+// merge-eligible acceptanceGateSkippedOutOfScope state — NOT the outcome-unknown
+// hole. Fails on today's code (which returns outcome-unknown).
+func TestAcceptanceGateState_NoVerdict_SkipMarker_MergeEligible(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	acc := acceptanceStage(runID, run.StageStateSucceeded)
+	seedAcceptanceSkipMarker(au, runID, acc.ID)
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), []*run.Stage{acc})
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGateSkippedOutOfScope {
+		t.Errorf("state = %q, want %q (terminal stage + skip marker, no verdict)", got, acceptanceGateSkippedOutOfScope)
+	}
+}
+
+// TestAcceptanceGateState_SkipMarker_WrongStage_OutcomeUnknown pins that the
+// marker is stage-scoped: a skip marker for a DIFFERENT stage id does not
+// resolve this acceptance stage to merge-eligible — it stays the genuine hole.
+func TestAcceptanceGateState_SkipMarker_WrongStage_OutcomeUnknown(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	acc := acceptanceStage(runID, run.StageStateSucceeded)
+	seedAcceptanceSkipMarker(au, runID, uuid.New()) // marker for some other stage
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), []*run.Stage{acc})
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGateOutcomeUnknown {
+		t.Errorf("state = %q, want %q (marker scoped to a different stage)", got, acceptanceGateOutcomeUnknown)
+	}
+}
+
+// TestAcceptanceGateState_SkipMarkerReadError_FailsClosed pins the fail-closed
+// posture of the skip-marker read: the verdict read succeeds (no entries) but the
+// skip-marker category read errors, so the state must not resolve — the error is
+// propagated. Uses categoryErrAuditRepo to fail ONLY the skip-marker category.
+func TestAcceptanceGateState_SkipMarkerReadError_FailsClosed(t *testing.T) {
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &categoryErrAuditRepo{
+		auditFake:   au,
+		errCategory: CategoryAcceptanceSkippedOutOfScope,
+		err:         errors.New("skip-marker read boom"),
+	}})
+	runID := uuid.New()
+	stages := []*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)}
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), stages)
+	if err == nil {
+		t.Fatal("err = nil, want the propagated skip-marker read error (fail-closed)")
+	}
+	if got == acceptanceGateSkippedOutOfScope || got == acceptanceGatePassed {
+		t.Errorf("state = %q, must never resolve to a merge-eligible state on a read error", got)
+	}
+}
+
+// TestAcceptanceGateState_VerdictWinsOverSkipMarker pins that a recorded verdict
+// always takes precedence over the skip marker on every surface: passed -> passed,
+// failed -> triage, even when a skip marker is also present.
+func TestAcceptanceGateState_VerdictWinsOverSkipMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		verdict string
+		want    string
+	}{
+		{"passed wins", acceptanceVerdictPassed, acceptanceGatePassed},
+		{"failed wins", acceptanceVerdictFailed, acceptanceGateTriage},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, au := newAcceptanceGateServer(t)
+			runID := uuid.New()
+			acc := acceptanceStage(runID, run.StageStateSucceeded)
+			seedAcceptanceOutcome(au, runID, 10, tc.verdict)
+			seedAcceptanceSkipMarker(au, runID, acc.ID)
+			got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), []*run.Stage{acc})
+			if err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if got != tc.want {
+				t.Errorf("state = %q, want %q (recorded verdict wins over the skip marker)", got, tc.want)
+			}
+		})
+	}
+}

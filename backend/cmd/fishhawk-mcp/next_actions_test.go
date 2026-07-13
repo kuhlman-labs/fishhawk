@@ -1515,6 +1515,62 @@ func TestNextActions_AcceptanceOutcomeUnknown(t *testing.T) {
 	}
 }
 
+// TestNextActions_AcceptanceSkippedOutOfScope_SettledImplement pins the E38.3 /
+// #1877 acceptance-arm behavior reached via the settled-implement path (run
+// still running, review terminal, acceptance succeeded verdict-less). Three
+// modes:
+//   - flag set -> acceptance_skipped_out_of_scope + the FULL merge ritual, and
+//     crucially NO fishhawk_retry_stage action (the futile reopen the
+//     outcome-unknown arm otherwise offers is suppressed for the skip).
+//   - flag false (marker aged out) -> the read-first acceptance_settled_outcome_unknown
+//     arm unchanged (graceful degradation, fail toward read).
+//   - failed verdict + flag set -> the triage arm wins (a recorded verdict takes
+//     precedence over the flag).
+func TestNextActions_AcceptanceSkippedOutOfScope_SettledImplement(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	newRun := func() *Run { r := naLocalRun("running"); r.PullRequestURL = &prURL; return r }
+
+	t.Run("flag set -> merge ritual, no retry_stage", func(t *testing.T) {
+		na := nextActionsFor(newRun(), naAcceptanceStages("succeeded"), nil,
+			naReviewStatus("implement", "complete"), nil, nil, false, true, "", "", releaseSignals{})
+		if na == nil || na.State != "acceptance_skipped_out_of_scope" {
+			t.Fatalf("state = %+v, want acceptance_skipped_out_of_scope", na)
+		}
+		if got := actionNames(na); len(got) != 3 || got[0] != "approve_pr" || got[1] != "merge_pr" || got[2] != "post_merge" {
+			t.Fatalf("actions = %v, want the full merge ritual [approve_pr merge_pr post_merge]", got)
+		}
+		for _, a := range na.Actions {
+			if a.Action == "fishhawk_retry_stage" {
+				t.Errorf("fishhawk_retry_stage must NOT be offered for the skip disposition (server 422s it): %+v", na.Actions)
+			}
+		}
+	})
+
+	t.Run("flag false (aged out) -> read-first outcome-unknown arm", func(t *testing.T) {
+		na := nextActionsFor(newRun(), naAcceptanceStages("succeeded"), nil,
+			naReviewStatus("implement", "complete"), nil, nil, false, false, "", "", releaseSignals{})
+		if na == nil || na.State != "acceptance_settled_outcome_unknown" {
+			t.Fatalf("state = %+v, want acceptance_settled_outcome_unknown (graceful degradation)", na)
+		}
+		if na.Actions[0].Action != "fishhawk_list_audit" {
+			t.Errorf("actions[0] = %q, want fishhawk_list_audit", na.Actions[0].Action)
+		}
+		for _, a := range na.Actions {
+			if a.Action == "approve_pr" || a.Action == "merge_pr" {
+				t.Errorf("merge ritual must not surface on the aged-out arm: %+v", na.Actions)
+			}
+		}
+	})
+
+	t.Run("failed verdict + flag set -> triage wins", func(t *testing.T) {
+		na := nextActionsFor(newRun(), naAcceptanceStages("succeeded"), nil,
+			naReviewStatus("implement", "complete"), nil, nil, false, true, "failed", "paged", releaseSignals{})
+		if na == nil || na.State != "acceptance_triage_paged" {
+			t.Fatalf("state = %+v, want acceptance_triage_paged (recorded verdict wins over the flag)", na)
+		}
+	})
+}
+
 // TestNextActions_NoAcceptanceStage_MergeRitualUnchanged covers mode (9): a run
 // with no acceptance stage keeps the prior implement_gate_settled + merge
 // ritual behavior byte-identical.
@@ -1690,16 +1746,23 @@ func TestAcceptanceStateStringsMatchDrive(t *testing.T) {
 	acc := func(state string) *Stage { s := naStage("acceptance", state); return &s }
 
 	// pending: a non-terminal, non-running acceptance stage.
-	if got := acceptanceStageNextActions(run, acc("pending"), "", "").State; got != string(drive.RuleAcceptancePending) {
+	if got := acceptanceStageNextActions(run, acc("pending"), false, "", "").State; got != string(drive.RuleAcceptancePending) {
 		t.Errorf("pending state = %q, want %q (drive.RuleAcceptancePending)", got, drive.RuleAcceptancePending)
 	}
 	// settled-outcome-unknown: a terminal acceptance stage with no verdict.
-	if got := acceptanceStageNextActions(run, acc("succeeded"), "", "").State; got != string(drive.RuleAcceptanceOutcomeUnknown) {
+	if got := acceptanceStageNextActions(run, acc("succeeded"), false, "", "").State; got != string(drive.RuleAcceptanceOutcomeUnknown) {
 		t.Errorf("outcome-unknown state = %q, want %q (drive.RuleAcceptanceOutcomeUnknown)", got, drive.RuleAcceptanceOutcomeUnknown)
 	}
+	// skipped-out-of-scope (E38.3 / #1877): a terminal verdict-less acceptance
+	// stage WITH the skip flag classifies acceptance_skipped_out_of_scope — the
+	// MCP state string MUST equal the audit-category marker so the drive gate
+	// state (server acceptanceGateSkippedOutOfScope) and this surface agree.
+	if got := acceptanceStageNextActions(run, acc("succeeded"), true, "", "").State; got != auditCategoryAcceptanceSkippedOutOfScope {
+		t.Errorf("skip state = %q, want %q (audit-category marker)", got, auditCategoryAcceptanceSkippedOutOfScope)
+	}
 	// failed arm: paged + rerouting states both carry the drive triage prefix.
-	paged := acceptanceStageNextActions(run, acc("succeeded"), acceptanceVerdictFailed, acceptanceDispositionPaged).State
-	rerouting := acceptanceStageNextActions(run, acc("succeeded"), acceptanceVerdictFailed, acceptanceDispositionFixupDispatched).State
+	paged := acceptanceStageNextActions(run, acc("succeeded"), false, acceptanceVerdictFailed, acceptanceDispositionPaged).State
+	rerouting := acceptanceStageNextActions(run, acc("succeeded"), false, acceptanceVerdictFailed, acceptanceDispositionFixupDispatched).State
 	for _, st := range []string{paged, rerouting} {
 		if !strings.HasPrefix(st, string(drive.RuleAcceptanceTriage)) {
 			t.Errorf("failed-arm state %q does not carry the drive triage prefix %q", st, drive.RuleAcceptanceTriage)

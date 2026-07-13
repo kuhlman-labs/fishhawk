@@ -311,6 +311,30 @@ func (s *Server) retryAcceptanceOutcomeUnknown(w http.ResponseWriter, r *http.Re
 		// head, so a fix-up push invalidated it. Fall through to the re-open.
 	}
 
+	// (ii.b) Skip-marker backstop (E38.3 / #1877). A no-verdict acceptance stage
+	// that carries a stage-scoped acceptance_skipped_out_of_scope marker was
+	// auto-terminated because the approved plan declared verification.out_of_scope
+	// with zero acceptance_criteria — there is no observable criterion for a
+	// re-run to validate, so a reopen would re-fire the same skip forever. Refuse
+	// with 422 retry_not_applicable; the run is already merge-eligible via the
+	// gate's acceptanceGateSkippedOutOfScope state. A marker read error 500s like
+	// the sibling verdict read above — never admit a reopen on unknown evidence.
+	if !hasVerdict {
+		skipped, serr := s.acceptanceStageSkippedOutOfScope(ctx, stage.RunID, stage.ID)
+		if serr != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"list acceptance skip-marker audit entries failed",
+				map[string]any{"error": serr.Error()})
+			return
+		}
+		if skipped {
+			s.writeError(w, r, http.StatusUnprocessableEntity, "retry_not_applicable",
+				"the acceptance stage was auto-terminated because the approved plan declared verification.out_of_scope with zero acceptance_criteria (E38.3); a reopen would re-fire the same skip with no observable criterion to validate, and the run is already merge-eligible",
+				map[string]any{"stage_id": stage.ID.String()})
+			return
+		}
+	}
+
 	// (iii) Re-open succeeded → pending via the class-2 verb. A refusal
 	// (wrong type, not succeeded, terminal run) maps to 422.
 	dec, err := run.ReopenAcceptanceStage(ctx, s.cfg.RunRepo, stage.ID)

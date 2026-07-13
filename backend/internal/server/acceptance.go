@@ -879,6 +879,16 @@ const (
 	acceptanceGateOutcomeUnknown = string(drive.RuleAcceptanceOutcomeUnknown)
 	acceptanceGateTriage         = string(drive.RuleAcceptanceTriage)
 	acceptanceGatePassed         = "acceptance_passed"
+	// acceptanceGateSkippedOutOfScope is a merge-eligible terminal disposition
+	// (E38.3 / #1877): the acceptance stage settled with NO recorded verdict but
+	// DOES carry a stage-scoped acceptance_skipped_out_of_scope marker — the
+	// orchestrator auto-terminated it because the approved plan declared
+	// verification.out_of_scope with zero acceptance_criteria. The skip is a
+	// legitimate recorded outcome equivalent to a passed verdict for the merge
+	// gate, so both drive surfaces fall through to the merge ritual rather than
+	// parking in acceptance_settled_outcome_unknown. Value is the audit category
+	// itself so the marker string and the gate state cannot diverge.
+	acceptanceGateSkippedOutOfScope = CategoryAcceptanceSkippedOutOfScope
 )
 
 // latestAcceptanceVerdict returns the verdict on the newest (highest-Sequence)
@@ -929,8 +939,12 @@ func (s *Server) latestAcceptanceVerdict(ctx context.Context, runID uuid.UUID) (
 // Returns, for a run whose workflow declares an acceptance stage:
 //   - acceptanceGatePassed        — newest recorded verdict is passed (merge OK).
 //   - acceptanceGateTriage        — newest recorded verdict is failed.
-//   - acceptanceGateOutcomeUnknown— no readable verdict AND the acceptance stage
-//     is terminal (settled-outcome-unknown hole).
+//   - acceptanceGateSkippedOutOfScope — no readable verdict, the acceptance
+//     stage is terminal, AND it carries a stage-scoped
+//     acceptance_skipped_out_of_scope marker (E38.3 / #1877 auto-terminated
+//     out-of-scope skip — a legitimate merge-eligible disposition).
+//   - acceptanceGateOutcomeUnknown— no readable verdict, the acceptance stage
+//     is terminal, and NO skip marker (the genuine settled-outcome-unknown hole).
 //   - acceptanceGatePending       — no verdict yet and the acceptance stage is
 //     non-terminal or not yet materialized.
 //
@@ -960,12 +974,45 @@ func (s *Server) acceptanceGateState(ctx context.Context, runRow *run.Run, stage
 		// stage-terminality distinction below (outcome unknown vs pending).
 	}
 	// No settled verdict. Distinguish a terminal acceptance stage (it settled
-	// but no verdict is visible → outcome unknown) from a non-terminal or
-	// not-yet-materialized stage (still pending).
+	// but no verdict is visible) from a non-terminal or not-yet-materialized
+	// stage (still pending). For a terminal stage, an out-of-scope skip marker
+	// (E38.3 / #1877) is a legitimate merge-eligible disposition — consult it
+	// before falling to the genuine settled-outcome-unknown hole. FAIL-CLOSED: a
+	// marker read error is PROPAGATED (same posture as the verdict read), never
+	// resolved to a merge-eligible state on unknown evidence.
 	if acc := acceptanceStageOf(stages); acc != nil && acc.State.IsTerminal() {
+		skipped, serr := s.acceptanceStageSkippedOutOfScope(ctx, runRow.ID, acc.ID)
+		if serr != nil {
+			return "", serr
+		}
+		if skipped {
+			return acceptanceGateSkippedOutOfScope, nil
+		}
 		return acceptanceGateOutcomeUnknown, nil
 	}
 	return acceptanceGatePending, nil
+}
+
+// acceptanceStageSkippedOutOfScope reports whether the run's audit chain carries
+// an acceptance_skipped_out_of_scope entry scoped to stageID — i.e. the
+// orchestrator auto-terminated this acceptance stage because the approved plan
+// declared verification.out_of_scope with zero acceptance_criteria (E38.3 /
+// #1657). Mirrors acceptanceStageHasVerdict: the orchestrator's
+// emitAcceptanceSkippedOutOfScope appends the marker with StageID set
+// (orchestrator.go), so the stage-scoped filter matches exactly. Propagates the
+// read error so acceptanceGateState fails closed (never resolves a merge-eligible
+// state) on an unreadable chain rather than acting on unknown evidence.
+func (s *Server) acceptanceStageSkippedOutOfScope(ctx context.Context, runID, stageID uuid.UUID) (bool, error) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryAcceptanceSkippedOutOfScope)
+	if err != nil {
+		return false, err
+	}
+	for _, e := range entries {
+		if e.StageID != nil && *e.StageID == stageID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // acceptanceStageOf returns the run's acceptance stage from the supplied slice,

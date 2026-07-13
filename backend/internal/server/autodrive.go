@@ -189,7 +189,14 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 		// / failed) is observe-only — the actor never merges on unknown or unmet
 		// acceptance evidence.
 		gateState, gerr := s.acceptanceGateState(ctx, runRow, stages)
-		acceptanceMergeOK := gerr == nil && (gateState == acceptanceGateNotDeclared || gateState == acceptanceGatePassed)
+		// #1877: an out-of-scope skip (acceptanceGateSkippedOutOfScope) is a
+		// legitimate terminal disposition equivalent to a recorded outcome for the
+		// merge gate — the orchestrator auto-terminated a degenerate acceptance
+		// stage (verification.out_of_scope, zero acceptance_criteria), so the run
+		// is merge-eligible. A read error keeps the observe-only fail-closed posture
+		// (gerr != nil admits nothing).
+		acceptanceMergeOK := gerr == nil && (gateState == acceptanceGateNotDeclared ||
+			gateState == acceptanceGatePassed || gateState == acceptanceGateSkippedOutOfScope)
 		switch {
 		case !mergeGateReady(runRow, stages):
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but real merge state not ready; observe-only",
