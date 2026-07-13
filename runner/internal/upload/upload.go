@@ -146,7 +146,9 @@ type signingKeyResponse struct {
 //
 // Multi-call against backends with migration 0012+: each call inserts
 // a new row, every stage's fresh runner process gets its own private
-// key, the backend's Verify uses the latest unexpired key. Older
+// key, and the backend's Verify accepts a signature from ANY unexpired
+// key for the run (#1872), so a sibling stage's rotation does not
+// invalidate an in-flight runner's still-open upload. Older
 // backends return 409 ErrAlreadyIssued for the second call; we keep
 // that mapping as a defensive shim (callers shouldn't see it in
 // practice). Single-attempt either way — IssueKey doesn't retry on

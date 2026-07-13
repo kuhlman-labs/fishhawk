@@ -150,6 +150,103 @@ func TestPostgres_Issue_AllowsRotation(t *testing.T) {
 	}
 }
 
+func TestPostgres_Verify_RotationToleratesOlderKey(t *testing.T) {
+	// The done-means test for bug 1a (incident bdf94763 / #1872):
+	// a sibling stage rotating in a fresh key must NOT invalidate an
+	// in-flight runner's still-open upload signed under the earlier
+	// key. Issue key A, sign with A, then rotate in key B — A's
+	// signature must still verify. Fails on the old latest-only Verify.
+	pool := pgtest.NewPool(t)
+	repo := signing.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+
+	first, err := repo.Issue(context.Background(), runID, signing.DefaultTTL)
+	if err != nil {
+		t.Fatalf("first Issue: %v", err)
+	}
+	msg := signing.ComputeMessage([]byte("in-flight upload bytes"))
+	sigA := signing.Sign(first.PrivateKey, msg)
+
+	// A sibling stage's runner rotates in a fresh key mid-flight.
+	if _, err := repo.Issue(context.Background(), runID, signing.DefaultTTL); err != nil {
+		t.Fatalf("second Issue: %v", err)
+	}
+
+	if err := repo.Verify(context.Background(), runID, msg, sigA); err != nil {
+		t.Errorf("Verify with older key A after rotation: %v, want nil", err)
+	}
+}
+
+func TestPostgres_Verify_LatestKeyStillVerifies(t *testing.T) {
+	// The newest-key path is unchanged: after rotation, a signature
+	// from the latest key B verifies too.
+	pool := pgtest.NewPool(t)
+	repo := signing.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+
+	if _, err := repo.Issue(context.Background(), runID, signing.DefaultTTL); err != nil {
+		t.Fatalf("first Issue: %v", err)
+	}
+	second, err := repo.Issue(context.Background(), runID, signing.DefaultTTL)
+	if err != nil {
+		t.Fatalf("second Issue: %v", err)
+	}
+	msg := signing.ComputeMessage([]byte("later stage upload"))
+	sigB := signing.Sign(second.PrivateKey, msg)
+
+	if err := repo.Verify(context.Background(), runID, msg, sigB); err != nil {
+		t.Errorf("Verify with latest key B: %v, want nil", err)
+	}
+}
+
+func TestPostgres_Verify_AllKeysExpired(t *testing.T) {
+	// Multiple keys, ALL past their TTL -> ErrExpired (not ErrNotFound
+	// and not ErrSignatureInvalid). Uses the clock-injecting ctor.
+	pool := pgtest.NewPool(t)
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	repo := signing.NewPostgresRepositoryWithClock(pool, clock)
+	runID := makeRun(t, pool)
+
+	first, err := repo.Issue(context.Background(), runID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Issue(context.Background(), runID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	msg := signing.ComputeMessage([]byte("trace"))
+	sig := signing.Sign(first.PrivateKey, msg)
+
+	// Advance past both keys' expiry.
+	now = now.Add(2 * time.Hour)
+	if err := repo.Verify(context.Background(), runID, msg, sig); !errors.Is(err, signing.ErrExpired) {
+		t.Errorf("err = %v, want ErrExpired", err)
+	}
+}
+
+func TestPostgres_Verify_MultipleUnexpiredNoneVerify(t *testing.T) {
+	// Multiple unexpired keys but a garbage signature matches none of
+	// them -> ErrSignatureInvalid (distinguishing "keys exist, none
+	// verify" from ErrNotFound / ErrExpired).
+	pool := pgtest.NewPool(t)
+	repo := signing.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+
+	if _, err := repo.Issue(context.Background(), runID, signing.DefaultTTL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Issue(context.Background(), runID, signing.DefaultTTL); err != nil {
+		t.Fatal(err)
+	}
+	msg := signing.ComputeMessage([]byte("trace"))
+	garbage := make([]byte, ed25519.SignatureSize)
+
+	if err := repo.Verify(context.Background(), runID, msg, garbage); !errors.Is(err, signing.ErrSignatureInvalid) {
+		t.Errorf("err = %v, want ErrSignatureInvalid", err)
+	}
+}
+
 func TestPostgres_Issue_RunNotFound(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := signing.NewPostgresRepository(pool)

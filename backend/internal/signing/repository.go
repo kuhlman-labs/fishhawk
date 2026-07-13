@@ -16,7 +16,7 @@ type Repository interface {
 	// halves plus the timestamps. Multi-call: every Issue inserts a
 	// new row (per migration 0012), so each stage's GitHub Actions
 	// runner can issue its own private key independently. Verify
-	// uses the latest unexpired key for the run.
+	// accepts a signature from any unexpired key for the run.
 	//
 	// The caller is responsible for delivering IssuedKey.PrivateKey
 	// to the runner (typically over the response body of the
@@ -30,11 +30,12 @@ type Repository interface {
 	Get(ctx context.Context, runID uuid.UUID) (*Key, error)
 
 	// Verify checks that signature is valid for the given message
-	// using the stored public key for runID, and that the key has
-	// not expired. Returns:
+	// against ANY unexpired signing key issued for runID (newest
+	// key tried first), so a sibling stage's key rotation does not
+	// invalidate an in-flight runner's still-open upload. Returns:
 	//   - ErrNotFound        no key exists for the run
-	//   - ErrExpired         the key's expires_at is in the past
-	//   - ErrSignatureInvalid Ed25519 verify failed
+	//   - ErrExpired         keys exist but all are expired
+	//   - ErrSignatureInvalid unexpired keys exist but none verify
 	//   - nil                success
 	Verify(ctx context.Context, runID uuid.UUID, message, signature []byte) error
 }

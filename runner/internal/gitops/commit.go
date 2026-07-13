@@ -662,21 +662,37 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		// A *bare* --force-with-lease compares the push against the local
 		// remote-tracking ref, but git cannot associate that ref with a URL
 		// push (we push to RemoteURL, not the remote name), so a bare lease
-		// on a subsequent shared-branch push always rejects with
-		// `(stale info)` regardless of the ref's value (#767). When the
-		// tracking ref exists — a subsequent decomposed child, kept current
-		// by this function's post-push update-ref — pass it as the explicit
-		// lease expected-value so the lease is honored against the URL push.
-		// When it is absent (first child / brand-new branch) the bare form
-		// correctly permits the create.
-		lease := "--force-with-lease"
+		// on a shared-branch URL push always rejects with `(stale info)`
+		// regardless of the ref's value (#767). So we always bind the lease to
+		// an EXPLICIT expected-value (--force-with-lease=<branch>:<sha>), which
+		// git honors on a URL push because it needs no tracking information.
+		var lease string
 		trackingRef := fmt.Sprintf("refs/remotes/%s/%s", remote, args.Branch)
-		if track, err := p.runOut(ctx, args.RepoDir, "rev-parse", "--verify", "--quiet", trackingRef); err == nil {
-			if sha := strings.TrimSpace(track); sha != "" {
-				lease = fmt.Sprintf("--force-with-lease=%s:%s", args.Branch, sha)
+		if track, err := p.runOut(ctx, args.RepoDir, "rev-parse", "--verify", "--quiet", trackingRef); err == nil && strings.TrimSpace(track) != "" {
+			// Tracking ref present — a subsequent decomposed child, kept current
+			// by this function's post-push update-ref. Lease against its value.
+			lease = fmt.Sprintf("--force-with-lease=%s:%s", args.Branch, strings.TrimSpace(track))
+		} else {
+			// No tracking ref (the FreshFetchBase worktree case, e.g. a
+			// standalone sole-writer run-owned branch after a partial prior
+			// ship, #1872): a bare lease would reject on a URL push, so observe
+			// the remote head DIRECTLY via ls-remote and bind the lease to it.
+			// A stale self-owned ref is overwritten exactly as observed, while a
+			// ref that MOVED after observation still fails the lease.
+			observed, lsErr := p.observeRemoteHead(ctx, args.RepoDir, args.RemoteURL, args.Branch)
+			if lsErr != nil {
+				return nil, fmt.Errorf("gitops: observe remote head for lease: %w", lsErr)
 			}
+			if observed != "" {
+				lease = fmt.Sprintf("--force-with-lease=%s:%s", args.Branch, observed)
+			}
+			// observed == "" → the ref does not exist yet; push plain. Creating a
+			// new ref cannot be non-fast-forward, and git rejects a lease for a
+			// ref it cannot verify — so no lease flag is added.
 		}
-		pushArgs = append(pushArgs, lease)
+		if lease != "" {
+			pushArgs = append(pushArgs, lease)
+		}
 	}
 	if err := p.run(ctx, args.RepoDir, pushArgs...); err != nil {
 		return nil, fmt.Errorf("gitops: push %s: %w", remote, err)
@@ -1291,6 +1307,32 @@ func RemoteHasBranch(ctx context.Context, repoDir, remote, branch string) (bool,
 		return false, fmt.Errorf("gitops: ls-remote %s %s: %w", remote, branch, err)
 	}
 	return strings.TrimSpace(out) != "", nil
+}
+
+// observeRemoteHead returns the current commit SHA of refs/heads/<branch> on
+// the remote reachable at remoteURL, or "" when the branch does not exist
+// there. It queries the remote DIRECTLY (`git ls-remote <remoteURL>
+// refs/heads/<branch>`) rather than a local tracking ref, so it works on the
+// FreshFetchBase worktree where no refs/remotes/<remote>/<branch> exists (#1872).
+// It is the observed expected-value bound into a --force-with-lease on a URL
+// push: a stale self-owned ref is overwritten exactly as observed, while a ref
+// that moved between observation and push fails the lease and the push fails
+// loud. `git ls-remote` exits 0 with EMPTY stdout for a no-match, so absence is
+// derived from the output (empty SHA), not the exit code.
+func (p *Pusher) observeRemoteHead(ctx context.Context, repoDir, remoteURL, branch string) (string, error) {
+	out, err := p.runOut(ctx, repoDir, "ls-remote", remoteURL, "refs/heads/"+branch)
+	if err != nil {
+		return "", fmt.Errorf("gitops: ls-remote %s %s: %w", remoteURL, branch, err)
+	}
+	line := strings.TrimSpace(out)
+	if line == "" {
+		return "", nil
+	}
+	// Format: "<sha>\trefs/heads/<branch>". Take the leading SHA field.
+	if fields := strings.Fields(line); len(fields) > 0 {
+		return fields[0], nil
+	}
+	return "", nil
 }
 
 // RemoteConfigured reports whether the named remote (defaulting to

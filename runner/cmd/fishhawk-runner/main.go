@@ -4985,6 +4985,17 @@ type implementBranchRouting struct {
 	freshFetchBase string
 }
 
+// forceWithLease reports whether the ship push should use --force-with-lease.
+// True ONLY for the STANDALONE sole-writer run-owned branch (ADR-035 / #1872):
+// a standalone re-run after a partial prior ship can find its own branch
+// carrying a stale head, so the lease — bound to the observed remote head in
+// gitops — overwrites only that self-owned stale ref. Decomposed children (each
+// cuts a fresh sole-writer slice branch, subsequent siblings rebase) and fix-ups
+// (rebase their existing PR branch) keep it FALSE.
+func (r implementBranchRouting) forceWithLease() bool {
+	return !r.isFixup && !r.isDecomposed
+}
+
 // The ctx/repoDir params are unused under ADR-041 (#1141): routing no longer
 // consults remoteBranchExists for a decomposed child (each child cuts a fresh
 // sole-writer slice branch). They are retained — passed by every caller and
@@ -5637,13 +5648,19 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// has expired by the time the agent finishes. See the
 		// FetchInstallationToken call above.
 		PushToken: token,
-		// ADR-041 (#1141): a decomposed child now owns a sole-writer slice
-		// branch cut fresh from base, so no path force-pushes a shared branch.
-		// ForceWithLease is false for every routing case (the fix-up path
-		// updates its PR branch via RebaseFromRemote; standalone and slice
-		// both cut a fresh sole-writer branch). The shared-branch
-		// force-with-lease coupling that #767 needed is dropped.
-		ForceWithLease:   false,
+		// ADR-041 (#1141) + #1872: ForceWithLease is set ONLY for the STANDALONE
+		// default routing case (the sole-writer run-owned branch, ADR-035). A
+		// standalone re-run (retry/fixup after a partial prior ship) can find its
+		// OWN branch carrying a stale head from the aborted first ship; the plain
+		// URL push then rejects non-fast-forward. gitops binds the lease to the
+		// remote head it observes via ls-remote, so it overwrites ONLY the run's
+		// own stale ref while a ref that moved after observation still fails the
+		// lease. Decomposed children keep ForceWithLease FALSE — the first child
+		// cuts a fresh sole-writer slice branch and subsequent children rebase via
+		// RebaseFromRemote — as does the fix-up path (updates its PR branch via
+		// RebaseFromRemote). The server-side verifyBranchLineage guard at the
+		// report boundary remains the foreign-commit enforcement.
+		ForceWithLease:   routing.forceWithLease(),
 		RebaseFromRemote: isSubsequent,
 		// Cut a standalone run branch from a freshly-fetched authoritative
 		// base (origin/<baseRef>) rather than the ambient local HEAD, so a

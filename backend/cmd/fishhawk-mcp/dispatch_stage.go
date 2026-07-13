@@ -130,6 +130,17 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		return nil, DispatchStageOutput{}, err
 	}
 
+	// (2a) Sibling-in-flight admission guard (#1872). Refuse a host dispatch
+	// while another stage of the run is dispatched/running (or the target
+	// itself is running), so a second local runner cannot rotate the signing
+	// key out from under an in-flight sibling. Allows the target's own
+	// 'dispatched' park state (retry/fixup re-dispatch); fails OPEN on a
+	// stage-list read error. Any fail-open warning merges into warnings below.
+	siblingWarnings, siblingErr := r.guardSiblingStageInFlight(ctx, runUUID, resolvedStageID)
+	if siblingErr != nil {
+		return nil, DispatchStageOutput{}, siblingErr
+	}
+
 	// (3) Resolve the runner binary (input > env > sibling > PATH > error).
 	binary, err := resolveRunnerBinary(in.RunnerBinary, r.getenv)
 	if err != nil {
@@ -143,8 +154,8 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 
 	// (4) Resolve the GitHub repo with the same soft-fail rule run_stage uses:
 	// push_and_open_pr=false makes a missing repo a warning, not an error.
-	// Seeded with any guard fail-open warning from step (1a).
-	warnings := guardWarnings
+	// Seeded with any guard fail-open warning from step (1a) and (2a).
+	warnings := append(guardWarnings, siblingWarnings...)
 	repo := in.GitHubRepo
 	if repo == "" {
 		detected, derr := runStageDetectGitHubRepo(workingDir)

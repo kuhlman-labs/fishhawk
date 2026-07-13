@@ -4599,12 +4599,16 @@ func TestResolveImplementBranchRouting(t *testing.T) {
 		wantSubsequent bool
 		wantFixup      bool
 		wantFreshBase  string
+		wantForceLease bool
 	}{
 		{
 			name:          "standalone",
 			cfg:           config{runID: runID, stageID: stageID},
 			wantBranch:    "fishhawk/run-11111111/stage-22222222",
 			wantFreshBase: baseRef,
+			// #1872: the standalone sole-writer branch force-with-leases so a
+			// retry after a partial prior ship overwrites its own stale ref.
+			wantForceLease: true,
 		},
 		{
 			name:       "fixup",
@@ -4613,6 +4617,8 @@ func TestResolveImplementBranchRouting(t *testing.T) {
 			wantFixup:  true,
 			// fix-up rebases the existing PR branch from the remote.
 			wantSubsequent: true,
+			// fix-up rebases its PR branch — no force-with-lease.
+			wantForceLease: false,
 		},
 		{
 			name:           "decomposed slice-0",
@@ -4621,6 +4627,9 @@ func TestResolveImplementBranchRouting(t *testing.T) {
 			wantBranch:     "fishhawk/run-aaaaaaaa/slice-0",
 			wantDecomposed: true,
 			wantFreshBase:  baseRef,
+			// #1872: decomposed children cut a fresh sole-writer slice branch —
+			// never force-with-lease.
+			wantForceLease: false,
 		},
 		{
 			name:           "decomposed slice-2",
@@ -4629,6 +4638,7 @@ func TestResolveImplementBranchRouting(t *testing.T) {
 			wantBranch:     "fishhawk/run-aaaaaaaa/slice-2",
 			wantDecomposed: true,
 			wantFreshBase:  baseRef,
+			wantForceLease: false,
 		},
 		{
 			// ADR-041 decoupling guard: a child must NOT become "subsequent"
@@ -4641,6 +4651,7 @@ func TestResolveImplementBranchRouting(t *testing.T) {
 			wantDecomposed: true,
 			wantSubsequent: false,
 			wantFreshBase:  baseRef,
+			wantForceLease: false,
 		},
 	}
 	for _, tc := range tests {
@@ -4666,6 +4677,11 @@ func TestResolveImplementBranchRouting(t *testing.T) {
 			}
 			if r.freshFetchBase != tc.wantFreshBase {
 				t.Errorf("freshFetchBase = %q, want %q", r.freshFetchBase, tc.wantFreshBase)
+			}
+			// #1872 binding coverage: the ship push force-with-leases ONLY for the
+			// standalone sole-writer routing case; decomposed/fixup keep it false.
+			if got := r.forceWithLease(); got != tc.wantForceLease {
+				t.Errorf("forceWithLease() = %t, want %t", got, tc.wantForceLease)
 			}
 		})
 	}
