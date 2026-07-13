@@ -14692,6 +14692,10 @@ func TestRun_AcceptanceStage_EndToEnd(t *testing.T) {
 		PromptHash:            "deadbeef",
 		EgressTargetHosts:     []string{targetHost},
 		AcceptanceCriteriaIDs: []string{"AC1", "AC2"},
+		// The backend-resolved merge-candidate identity (#1569/#1881). Set to the
+		// repo's own HEAD so the #1881 merge-candidate tree provisioning wires end
+		// to end from the dispatch working dir (repo) at this expected head.
+		AcceptanceExpectedHeadSHA: headBefore,
 	}
 	withFakeUploader(t, fu)
 
@@ -14701,9 +14705,13 @@ func TestRun_AcceptanceStage_EndToEnd(t *testing.T) {
 	acceptanceVerdictDir = t.TempDir()
 	origLegacy := legacyAcceptanceVerdictPath
 	legacyAcceptanceVerdictPath = filepath.Join(t.TempDir(), "fishhawk-acceptance.json")
+	// Keep the #1881 merge-candidate checkout out of the shared /tmp path too.
+	origTreeDir := acceptanceTreeDir
+	acceptanceTreeDir = t.TempDir()
 	t.Cleanup(func() {
 		acceptanceVerdictDir = origDir
 		legacyAcceptanceVerdictPath = origLegacy
+		acceptanceTreeDir = origTreeDir
 	})
 
 	// evidence_hashes ships as the historical string-valued object-map variant
@@ -14871,6 +14879,18 @@ func TestRun_AcceptanceStage_EndToEnd(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), `"event":"acceptance_shipped"`) {
 		t.Errorf("missing acceptance_shipped event: %s", stderr.String())
+	}
+
+	// #1881 wiring: the merge-candidate tree was provisioned from the dispatch
+	// working dir (repo) at the expected head, and torn down on the happy path
+	// (teardown deferred immediately after provision). The provisioned event
+	// carries the same head the target gate verified.
+	if !strings.Contains(stderr.String(), `"event":"acceptance_tree_provisioned"`) ||
+		!strings.Contains(stderr.String(), `"head_sha":"`+headBefore+`"`) {
+		t.Errorf("missing acceptance_tree_provisioned event at head %s: %s", headBefore, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"acceptance_tree_removed"`) {
+		t.Errorf("missing acceptance_tree_removed teardown event: %s", stderr.String())
 	}
 
 	// The packed bundle carries the acceptance_evidence event.

@@ -943,6 +943,21 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 
+		// Provision the disposable merge-candidate checkout the acceptance
+		// prompt's Posture B names as the ONLY sanctioned tree for
+		// repository-content criteria (#1881). It is a detached checkout of the
+		// SAME merge-candidate head the target gate above verified the preview
+		// serves (acceptanceExpectedHeadSHA), created against the operator's
+		// dispatch checkout (dispatchWorkingDir, captured at main.go:355 — the
+		// repo the lineage worktrees hang off). The teardown is deferred
+		// IMMEDIATELY so the checkout is removed on every post-provision return
+		// path (the same discipline as gateTeardown). Every provisioning failure
+		// warns and proceeds — never a stage failure: the prompt's skip rule
+		// turns the degraded case into an honest skipped criterion.
+		acceptanceTreeTeardown := provisionAcceptanceTree(
+			ctx, dispatchWorkingDir, acceptanceExpectedHeadSHA, cfg.runID, cfg.stageID, logSink)
+		defer acceptanceTreeTeardown()
+
 		baseEnv, refused := acceptenv.Env(os.Environ(), proxy.URL())
 		if len(refused) > 0 {
 			refusedJSON, _ := json.Marshal(refused)
