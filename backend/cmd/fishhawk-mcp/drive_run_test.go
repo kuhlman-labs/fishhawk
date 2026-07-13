@@ -752,9 +752,15 @@ func TestDriveRun_ResumeDispatchedInFlight_NoDoubleSpawn(t *testing.T) {
 	// so the resume guard must treat it as in-flight and POLL, never host-spawn
 	// a SECOND runner and never re-record. (Plan test (g) second half: a
 	// re-invocation continues without double-spawning the in-flight stage.)
+	//
+	// A FRESH UpdatedAt models the live-runner case explicitly (#1890): a runner
+	// flips dispatched->running within seconds, so a recently-updated 'dispatched'
+	// stage is in-flight and must be polled, NEVER stopped stale.
+	impl := stg(driveImplID, "implement", "dispatched", 1)
+	impl.UpdatedAt = time.Now()
 	f := newDriveFake("running", []Stage{
 		stg(drivePlanID, "plan", "succeeded", 0),
-		stg(driveImplID, "implement", "dispatched", 1),
+		impl,
 	})
 	// The prior invocation's dispatch row — the cross-invocation resume signal.
 	f.appendAuto(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""})
@@ -792,16 +798,23 @@ func TestDriveRun_ManualDispatchInFlight_NoDoubleSpawn(t *testing.T) {
 	// dispatchable — the guard must STILL treat it as in-flight and POLL, never
 	// host-spawn a SECOND runner against the same repo. The earlier guard keyed
 	// on a driver dispatch row (priorRow) and would have double-spawned here.
+	//
+	// This is ALSO the zero-value-UpdatedAt degrade fixture (binding approval
+	// condition (a)): the 'dispatched' stage carries a ZERO-value UpdatedAt
+	// (field absent from the response), and the stale threshold is set TINY — yet
+	// because UpdatedAt is zero the stale check must NOT fire: fail toward
+	// polling, never toward a stale stop or a spawn.
 	f := newDriveFake("running", []Stage{
 		stg(drivePlanID, "plan", "succeeded", 0),
-		stg(driveImplID, "implement", "dispatched", 1),
+		stg(driveImplID, "implement", "dispatched", 1), // zero-value UpdatedAt
 	})
 	// Deliberately NO run_auto_driven row — a manual dispatch, not a driver one.
 	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
-	r.driveMaxWallclock = 40 * time.Millisecond // the in-flight stage never advances
+	r.driveDispatchedStaleAfter = time.Millisecond // tiny threshold: zero UpdatedAt must still degrade to POLL
+	r.driveMaxWallclock = 40 * time.Millisecond    // the in-flight stage never advances
 
 	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
 	if err != nil {
@@ -918,5 +931,449 @@ func TestDriveRun_FixupRedispatch(t *testing.T) {
 	}
 	if !sawImpl || !sawFixup {
 		t.Errorf("dispatch rows: implement=%v fixup_redispatch=%v, want both", sawImpl, sawFixup)
+	}
+}
+
+// --- (t1) fresh run, ALL stages pending -> ONLY plan dispatches --------------
+
+func TestDriveRun_FreshRunAllPending_DispatchesOnlyPlan(t *testing.T) {
+	// The real fresh-run shape from live run fdcc17cd (#1890): start_run creates
+	// EVERY stage as a 'pending' row. The prior lowest-sequence-dispatchable rule
+	// dispatched implement + acceptance the instant plan was spawned — both died
+	// category-C on the lineage lock the plan runner held. The earliest-non-
+	// terminal + gate-precondition rule must dispatch EXACTLY plan and nothing
+	// else while plan is still running.
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "pending", 0),
+		stg(driveImplID, "implement", "pending", 1),
+		stg(driveAccID, "acceptance", "pending", 2),
+	})
+	// The plan spawn leaves plan NON-terminal (running) so it stays the earliest
+	// non-terminal stage — implement/acceptance must never become dispatchable.
+	f.onSpawn = func(f *driveFakeBackend, typ string) {
+		if typ == "plan" {
+			f.setState("plan", "running")
+		}
+	}
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 40 * time.Millisecond // plan never settles; poll to the deadline
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedTimeout {
+		t.Fatalf("stopped_reason = %q, want timeout (plan runs, then poll to deadline)", out.StoppedReason)
+	}
+	// EXACTLY one spawn: plan. implement and acceptance never dispatch.
+	if got := rec.list(); len(got) != 1 || got[0] != "plan" {
+		t.Fatalf("spawn sequence = %v, want exactly [plan] (no premature implement/acceptance dispatch)", got)
+	}
+	// EXACTLY one dispatch record row (plan).
+	rows := f.autoRows()
+	var dispatchRows int
+	for _, m := range rows {
+		if m["act"] == "dispatch" {
+			dispatchRows++
+			if m["stage"] != "plan" {
+				t.Errorf("dispatch row for %v; want only plan", m["stage"])
+			}
+		}
+	}
+	if dispatchRows != 1 {
+		t.Errorf("dispatch rows = %d, want exactly 1 (plan only)", dispatchRows)
+	}
+}
+
+// --- (t2) acceptance held while a review stage is non-terminal --------------
+
+func TestDriveRun_AcceptanceHeldOnReview(t *testing.T) {
+	// acceptance requires the implement stage succeeded AND every type=review
+	// stage terminal (driveGatePreconditionsMet). A review stage placed at a
+	// HIGHER sequence than acceptance makes acceptance the earliest non-terminal
+	// stage, so ONLY the precondition can hold the dispatch — a direct test of
+	// the belt-and-suspenders gate check.
+	t.Run("review_non_terminal_holds", func(t *testing.T) {
+		f := newDriveFake("running", []Stage{
+			stg(drivePlanID, "plan", "succeeded", 0),
+			stg(driveImplID, "implement", "succeeded", 1),
+			stg(driveAccID, "acceptance", "pending", 2),
+			stg(uuid.NewSHA1(uuid.Nil, []byte("review")).String(), "review", "running", 3),
+		})
+		f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+		rec := &spawnRecorder{}
+		r, srv := newDriveResolver(t, f, rec)
+		defer srv.Close()
+		r.driveMaxWallclock = 40 * time.Millisecond // review never settles; poll to deadline
+
+		_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+		if err != nil {
+			t.Fatalf("driveRun: %v", err)
+		}
+		if out.StoppedReason != stoppedTimeout {
+			t.Fatalf("stopped_reason = %q, want timeout (acceptance held on the pending review)", out.StoppedReason)
+		}
+		if got := rec.list(); len(got) != 0 {
+			t.Fatalf("acceptance (or anything) spawned while a review stage was non-terminal: %v", got)
+		}
+	})
+
+	t.Run("review_terminal_dispatches", func(t *testing.T) {
+		// Same shape but the review stage is terminal: acceptance's preconditions
+		// now hold, so it IS the earliest host-dispatchable stage and dispatches.
+		f := newDriveFake("running", []Stage{
+			stg(drivePlanID, "plan", "succeeded", 0),
+			stg(driveImplID, "implement", "succeeded", 1),
+			stg(driveAccID, "acceptance", "pending", 2),
+			stg(uuid.NewSHA1(uuid.Nil, []byte("review")).String(), "review", "succeeded", 3),
+		})
+		f.onSpawn = func(f *driveFakeBackend, typ string) {
+			if typ == "acceptance" {
+				f.setState("acceptance", "succeeded")
+				f.runState = "succeeded"
+			}
+		}
+		f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+		rec := &spawnRecorder{}
+		r, srv := newDriveResolver(t, f, rec)
+		defer srv.Close()
+
+		_, _, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+		if err != nil {
+			t.Fatalf("driveRun: %v", err)
+		}
+		if got := rec.list(); len(got) != 1 || got[0] != "acceptance" {
+			t.Fatalf("spawn sequence = %v, want [acceptance] once the review settled", got)
+		}
+	})
+}
+
+// --- (t3) resume of a runner-less STALE 'dispatched' stage -> distinct stop --
+
+func TestDriveRun_ResumeDispatchedStale_StopsDistinct(t *testing.T) {
+	// A stage sits in 'dispatched' with an hour-old UpdatedAt and no runner ever
+	// advanced it (a crashed/killed runner). Past the (lowered) liveness
+	// threshold the driver must STOP dispatched_stale — never poll silently to
+	// timeout, and never auto-spawn — handing the manual re-dispatch to the
+	// operator via next_actions.
+	impl := stg(driveImplID, "implement", "dispatched", 1)
+	impl.UpdatedAt = time.Now().Add(-time.Hour)
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		impl,
+	})
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveDispatchedStaleAfter = time.Millisecond // lower the threshold so the hour-old stage trips it
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedDispatchedStale {
+		t.Fatalf("stopped_reason = %q, want dispatched_stale", out.StoppedReason)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("driver spawned a stale 'dispatched' stage: %v (must never auto-spawn)", got)
+	}
+	f.mu.Lock()
+	nActs := len(f.recordedActs)
+	f.mu.Unlock()
+	if nActs != 0 {
+		t.Errorf("driver recorded %d acts on a stale-dispatched stop; want 0", nActs)
+	}
+	if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
+		t.Fatal("dispatched_stale stop carried no next_actions")
+	}
+	if out.NextActions.Actions[0].Action != "fishhawk_dispatch_stage" {
+		t.Errorf("next_actions[0] = %q, want fishhawk_dispatch_stage", out.NextActions.Actions[0].Action)
+	}
+}
+
+// --- (t5) cross-invocation fixup re-open -> fixup_redispatch attribution -----
+
+func TestDriveRun_CrossInvocationFixupRedispatch(t *testing.T) {
+	// A fresh invocation observes implement 'pending' (dispatchedCount==0), the
+	// audit carries a prior implement dispatch row AND a NEWER
+	// stage_fixup_triggered row — a fix-up re-open from a prior invocation. The
+	// re-record must be attributed fixup_redispatch, not a generic implement
+	// retry.
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "pending", 1),
+	})
+	// Prior implement dispatch (seq 1), then a NEWER fixup trigger (seq 2).
+	f.appendAuto(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""})
+	f.seq++
+	f.audit = append(f.audit, AuditEntry{ID: uuid.New().String(), Sequence: f.seq, RunID: f.runID.String(), Category: categoryStageFixupTriggered, Payload: map[string]any{}})
+	f.onSpawn = func(f *driveFakeBackend, typ string) {
+		if typ == "implement" {
+			f.setState("implement", "succeeded")
+			f.runState = "succeeded"
+		}
+	}
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedMerged {
+		t.Fatalf("stopped_reason = %q, want merged", out.StoppedReason)
+	}
+	// The re-record row is attributed fixup_redispatch, NOT implement.
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var sawFixupRedispatch bool
+	for _, a := range f.recordedActs {
+		if a.Stage == "fixup_redispatch" {
+			sawFixupRedispatch = true
+		}
+		if a.Stage == "implement" {
+			t.Errorf("recorded an 'implement' act; want 'fixup_redispatch' for a cross-invocation fix-up re-open")
+		}
+	}
+	if !sawFixupRedispatch {
+		t.Errorf("no fixup_redispatch record row; recorded acts: %+v", f.recordedActs)
+	}
+}
+
+// --- (t5b) fixup-attribution read error -> fail-closed, never dispatch -------
+
+func TestDriveRun_FixupAttributionCheckError_FailsClosed(t *testing.T) {
+	// The LATER audit read in the dispatch path — driveNewestFixupTriggeredSeq,
+	// reached only when a fresh invocation (dispatchedCount==0) re-dispatches a
+	// still-'pending' implement stage that a prior invocation already dispatched
+	// (priorRow==true) — errors. Like the earlier prior-dispatch-row read, an
+	// unreadable stage_fixup_triggered state precedes a record + host-spawn and
+	// must NEVER be downgraded to "no fix-up trigger": halt fail-closed, never
+	// record, never spawn.
+	//
+	// The error is scoped to categoryStageFixupTriggered ONLY: the
+	// CategoryRunAutoDriven read (driveHasPriorDispatchRow) succeeds and returns
+	// priorRow==true, so the loop reaches the NEW branch rather than halting at
+	// driveHasPriorDispatchRow (the existing (l3) fixture errors
+	// CategoryRunAutoDriven and stops earlier). This pins the branch (l3) cannot.
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "pending", 1),
+	})
+	// A prior implement dispatch row: makes driveHasPriorDispatchRow return
+	// priorRow==true so the fixup-attribution branch is entered.
+	f.appendAuto(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""})
+	f.auditErrCategory = categoryStageFixupTriggered // only the fix-up trigger read errors
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedDispatchCheckFailed {
+		t.Fatalf("stopped_reason = %q, want dispatch_check_failed (fail-closed on the fixup-attribution read)", out.StoppedReason)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("driver spawned despite an unreadable stage_fixup_triggered state: %v", got)
+	}
+	f.mu.Lock()
+	nActs := len(f.recordedActs)
+	f.mu.Unlock()
+	if nActs != 0 {
+		t.Errorf("driver recorded %d acts despite the fail-closed fixup-attribution read error; want 0", nActs)
+	}
+	var warned bool
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "fixup-attribution poll failed") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("no fail-closed warning about the fixup-attribution read; warnings: %v", out.Warnings)
+	}
+	if out.NextActions == nil {
+		t.Error("fail-closed fixup-attribution stop carried no next_actions")
+	}
+}
+
+// --- (t5c) stale threshold crossed MID-invocation -> distinct stop -----------
+
+func TestDriveRun_ResumeDispatchedStale_MidInvocation_StopsDistinct(t *testing.T) {
+	// The dispatched-guard rework replaced the one-shot spawned[] mark with a
+	// poll+continue that RE-EVALUATES the stale threshold every iteration. The
+	// existing stale test seeds a stage already stale at loop start; this one
+	// seeds a stage FRESH at loop start (UpdatedAt == now, threshold not yet
+	// crossed) and lets the threshold trip DURING the poll loop — pinning the
+	// "can also trip mid-invocation" property the comment advertises. The stage
+	// never advances, so once time.Since(UpdatedAt) passes the (tiny, but
+	// non-zero at start) threshold, the guard re-trips and stops dispatched_stale
+	// rather than polling silently to the wall-clock deadline.
+	impl := stg(driveImplID, "implement", "dispatched", 1)
+	impl.UpdatedAt = time.Now() // FRESH at loop start: not stale on the first check
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		impl,
+	})
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	// Threshold comfortably larger than the first check's sub-ms latency (so the
+	// first iteration polls, not stops) yet far smaller than the wall-clock
+	// budget (so the stale stop, not timeout, is what fires).
+	r.driveDispatchedStaleAfter = 40 * time.Millisecond
+	r.driveMaxWallclock = 10 * time.Second
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedDispatchedStale {
+		t.Fatalf("stopped_reason = %q, want dispatched_stale (threshold crossed mid-invocation)", out.StoppedReason)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("driver spawned a stage whose stale threshold tripped mid-invocation: %v (must never auto-spawn)", got)
+	}
+	f.mu.Lock()
+	nActs := len(f.recordedActs)
+	f.mu.Unlock()
+	if nActs != 0 {
+		t.Errorf("driver recorded %d acts on a mid-invocation stale stop; want 0", nActs)
+	}
+	if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
+		t.Fatal("mid-invocation dispatched_stale stop carried no next_actions")
+	}
+	if out.NextActions.Actions[0].Action != "fishhawk_dispatch_stage" {
+		t.Errorf("next_actions[0] = %q, want fishhawk_dispatch_stage", out.NextActions.Actions[0].Action)
+	}
+}
+
+// --- (t6) context cancelled -> distinct context_cancelled stop --------------
+
+func TestDriveRun_ContextCancelled(t *testing.T) {
+	f := newDriveFake("running", []Stage{stg(drivePlanID, "plan", "blocked", 0)})
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancelled
+
+	_, out, err := r.driveRun(ctx, nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedContextCancelled {
+		t.Fatalf("stopped_reason = %q, want context_cancelled (distinct from timeout)", out.StoppedReason)
+	}
+}
+
+// --- (t7) queued-merge memory persists across a resume ----------------------
+
+func TestDriveRun_MergeQueuedPersistsAcrossResume(t *testing.T) {
+	// A prior invocation queued the merge (its act:gate merge row is in the
+	// audit) but the run has not yet settled. On resume the driver must SEED
+	// mergeQueued from that row and poll for the webhook-settle — it must NOT
+	// re-call the gate (which would duplicate the gate:merge row and re-enable
+	// auto-merge every interval).
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "succeeded", 1),
+		stg(driveAccID, "acceptance", "succeeded", 2),
+	})
+	// The prior invocation's queued-merge row.
+	f.appendAuto(map[string]any{"act": "gate", "action": "merge", "source": "run_auto_drive_endpoint", "note": "enabled auto-merge"})
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		// Would re-queue the merge if reached — the test asserts it is NOT reached.
+		return AutoDriveOutcome{Acted: true, Action: "merge", Note: "should not be called"}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 40 * time.Millisecond // run never settles; poll to deadline
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedTimeout {
+		t.Fatalf("stopped_reason = %q, want timeout (poll-only after the seeded queued merge)", out.StoppedReason)
+	}
+	f.mu.Lock()
+	gateCalls := f.gateCalls
+	f.mu.Unlock()
+	if gateCalls != 0 {
+		t.Errorf("gate called %d times; want 0 (queued-merge memory seeded from the prior row)", gateCalls)
+	}
+	// EXACTLY the one seeded gate:merge row — no duplicate landed on resume.
+	var mergeRows int
+	for _, m := range f.autoRows() {
+		if m["act"] == "gate" && m["action"] == "merge" {
+			mergeRows++
+		}
+	}
+	if mergeRows != 1 {
+		t.Errorf("gate:merge rows = %d, want exactly 1 (no duplicate on resume)", mergeRows)
+	}
+}
+
+// --- (t8) queued-merge seed read ERROR -> fail-OPEN, loop continues ----------
+
+func TestDriveRun_MergeRowReadError_FailsOpen(t *testing.T) {
+	// The loop-start queued-merge seed reads run_auto_driven and errors. Unlike
+	// the dispatch-path read (fail-CLOSED, halts), this check opens no code-
+	// execution surface — the worst case of a false negative is a benign
+	// duplicate gate:merge row — so it must FAIL-OPEN: warn and continue with
+	// today's behavior (mergeQueued=false), never halt.
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "succeeded", 1),
+		stg(driveAccID, "acceptance", "succeeded", 2),
+	})
+	f.auditErrCategory = CategoryRunAutoDriven // the seed's read (and any prior-dispatch read) errors
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		// The loop must REACH the gate (proving it did not halt on the read error);
+		// acting merge here then engages the in-memory queued-merge guard.
+		return AutoDriveOutcome{Acted: true, Action: "merge", Note: "enabled auto-merge"}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 40 * time.Millisecond // run never settles; poll to deadline
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	// Not a fail-closed halt — the loop degraded to today's behavior and ran on.
+	if out.StoppedReason != stoppedTimeout {
+		t.Fatalf("stopped_reason = %q, want timeout (fail-open, loop continues)", out.StoppedReason)
+	}
+	var warned bool
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "prior gate:merge poll failed") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("no fail-open warning about the merge-row read; warnings: %v", out.Warnings)
+	}
+	// The loop reached the gate (proving no halt) and queued the merge exactly
+	// once via the in-memory guard.
+	f.mu.Lock()
+	gateCalls := f.gateCalls
+	f.mu.Unlock()
+	if gateCalls != 1 {
+		t.Errorf("gate called %d times; want exactly 1 (reached the gate, then in-memory queued-merge guard)", gateCalls)
 	}
 }
