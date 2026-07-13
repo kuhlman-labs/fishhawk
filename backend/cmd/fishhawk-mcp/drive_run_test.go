@@ -1510,7 +1510,32 @@ func TestDriveRun_PlanGateParked_ReviewsPending_PollsThenGates(t *testing.T) {
 			})
 		}
 	}
-	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	// LOAD-BEARING ordering check (concern: the fake's observe-only outcome would
+	// otherwise mask a premature gate call — a regression gate-calling on the
+	// first still-pending iteration returns the same decision_required with
+	// gateCalls==1). At the instant the gate is called, the advisory reviews MUST
+	// already be settled; record a violation if the driver gate-called while the
+	// round was still pending.
+	var gatedWhilePending bool
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		configured, verdicts := 0, 0
+		for _, e := range f.audit {
+			switch e.Category {
+			case "plan_review_started":
+				if m, ok := e.Payload.(map[string]any); ok {
+					if c, ok := m["configured_agents"].(int); ok && c > configured {
+						configured = c
+					}
+				}
+			case "plan_reviewed":
+				verdicts++
+			}
+		}
+		if configured > 0 && verdicts < configured {
+			gatedWhilePending = true
+		}
+		return AutoDriveOutcome{Note: "observe-only"}
+	}
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
@@ -1530,6 +1555,12 @@ func TestDriveRun_PlanGateParked_ReviewsPending_PollsThenGates(t *testing.T) {
 	f.mu.Unlock()
 	if gateCalls != 1 {
 		t.Errorf("gate called %d times; want exactly 1 (zero while reviews pending, one after settlement)", gateCalls)
+	}
+	// The single gate call happened AFTER the advisory round settled, proving the
+	// review-settlement wait is load-bearing (not a decision_required the fake's
+	// observe-only faked past a premature, still-pending gate call).
+	if gatedWhilePending {
+		t.Error("driver gate-called while the advisory reviews were still pending; the review-settlement wait did not hold zero gate calls during the pending round")
 	}
 }
 
@@ -1648,10 +1679,24 @@ func TestDriveRun_ProgressHeartbeat_RealMCPBoundary(t *testing.T) {
 		stg(drivePlanID, "plan", "running", 0), // in-flight: the loop polls, emitting a heartbeat per iteration
 	})
 	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	// Deterministic iteration count (concern: a >=1 assertion accepts a single
+	// notification for an otherwise multi-iteration drive, leaving the cadence
+	// unpinned). The plan stage is polled as in-flight, so exactly one heartbeat
+	// fires per loop iteration. Settle the run to succeeded on the 3rd stages read
+	// so the loop runs EXACTLY wantHeartbeats heartbeat-emitting iterations — the
+	// next GetRun observes terminal and exits before its heartbeat.
+	const wantHeartbeats = 3
+	stageReads := 0
+	f.onStages = func(f *driveFakeBackend) {
+		stageReads++
+		if stageReads == wantHeartbeats {
+			f.runState = "succeeded"
+		}
+	}
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
-	r.driveMaxWallclock = 60 * time.Millisecond // several sub-ms poll iterations, then timeout
+	r.driveMaxWallclock = 5 * time.Second // safety net; the deterministic settle fires first
 
 	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "0"}, nil)
 	registerDriveRun(server, r)
@@ -1690,28 +1735,37 @@ func TestDriveRun_ProgressHeartbeat_RealMCPBoundary(t *testing.T) {
 		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
 	}
 
-	// Notifications are delivered async; give them a moment to flush.
+	// Notifications are delivered async; wait for all wantHeartbeats to flush.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
 		n := len(notes)
 		mu.Unlock()
-		if n >= 1 {
+		if n >= wantHeartbeats {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(notes) < 1 {
-		t.Fatalf("no progress notifications received at the real MCP boundary; want >= 1 heartbeat")
+	// EXACTLY one heartbeat per poll iteration — not merely "at least one". The
+	// deterministic settle bounds the drive to wantHeartbeats iterations, so a
+	// regression emitting a single (or per-drive) notification fails here.
+	if len(notes) != wantHeartbeats {
+		t.Fatalf("received %d progress notifications at the real MCP boundary; want exactly %d (one per poll iteration)", len(notes), wantHeartbeats)
 	}
-	for _, n := range notes {
+	for i, n := range notes {
 		if n.ProgressToken != "drive-tok-1" {
 			t.Errorf("notification progressToken = %v, want the request token drive-tok-1", n.ProgressToken)
 		}
 		if !strings.HasPrefix(n.Message, "drive: run ") {
 			t.Errorf("notification message = %q, want driveProgressMessage content", n.Message)
+		}
+		// Progress increments once per iteration (drive_run.go: progress++ before
+		// each emit), so the i-th notification carries progress i+1 — a monotone
+		// per-iteration cadence a single lumped emission cannot satisfy.
+		if n.Progress != float64(i+1) {
+			t.Errorf("notification[%d] progress = %v, want %d (one increment per poll iteration)", i, n.Progress, i+1)
 		}
 	}
 }
@@ -2064,4 +2118,89 @@ func TestDriveRun_StaleRecoveryConvergence_EndToEnd(t *testing.T) {
 	if got := rec.list(); len(got) != 0 {
 		t.Errorf("re-invoked drive spawned a stage it did not own: %v (must never auto-spawn)", got)
 	}
+}
+
+// --- (T12) StartedAt is spawn evidence AND a valid staleness anchor ----------
+
+func TestDriveRun_StartedAtStalenessAnchor(t *testing.T) {
+	// Direct coverage for the StartedAt paths in the dispatched-guard staleness
+	// anchor (drive_run.go): `hasEvidence := priorRow || disp.StartedAt != nil`
+	// and the `disp.StartedAt.After(anchor)` max. T6 (no evidence), T7 (a fresh
+	// dispatch row), T8 (an old row), T8b (zero anchor) and T11 (the convergence
+	// chain) all drive the priorRow / dispatch-row evidence path — none exercises
+	// StartedAt on its own, so both StartedAt branches were previously untested.
+
+	t.Run("fresh_started_at_no_dispatch_row_polls", func(t *testing.T) {
+		// A 'dispatched' stage with a STALE UpdatedAt, a FRESH StartedAt, and NO
+		// dispatch row. StartedAt alone is spawn evidence (so the immediate
+		// no-evidence handoff must NOT fire) AND it is the freshest anchor (so the
+		// stale-threshold stop must NOT fire): the driver must POLL. A regression
+		// dropping StartedAt from hasEvidence would insta-stop dispatched_stale via
+		// the no-evidence handoff; one dropping it from the anchor max would trip
+		// the stale threshold off the hour-old UpdatedAt — either fails this timeout.
+		started := time.Now()
+		impl := stg(driveImplID, "implement", "dispatched", 1)
+		impl.UpdatedAt = time.Now().Add(-time.Hour)
+		impl.StartedAt = &started
+		f := newDriveFake("running", []Stage{
+			stg(drivePlanID, "plan", "succeeded", 0),
+			impl,
+		})
+		// Deliberately NO dispatch row: StartedAt is the only spawn evidence.
+		f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+		rec := &spawnRecorder{}
+		r, srv := newDriveResolver(t, f, rec)
+		defer srv.Close()
+		r.driveDispatchedStaleAfter = 10 * time.Second // fresh StartedAt < threshold -> live
+		r.driveMaxWallclock = 40 * time.Millisecond    // never advances -> times out while polling
+
+		_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+		if err != nil {
+			t.Fatalf("driveRun: %v", err)
+		}
+		if out.StoppedReason != stoppedTimeout {
+			t.Fatalf("stopped_reason = %q, want timeout (fresh StartedAt is live spawn evidence, so it polls)", out.StoppedReason)
+		}
+		if got := rec.list(); len(got) != 0 {
+			t.Fatalf("driver spawned a stage whose fresh StartedAt marks it live: %v (must never auto-spawn)", got)
+		}
+		if n := len(f.autoRows()); n != 0 {
+			t.Errorf("run_auto_driven rows = %d, want 0 (no dispatch row seeded, no driver re-record)", n)
+		}
+	})
+
+	t.Run("started_at_wins_over_older_audit_row", func(t *testing.T) {
+		// StartedAt must win the anchor max when it is newer than BOTH UpdatedAt and
+		// the newest dispatch-row Timestamp. Old UpdatedAt + an old dispatch row, but
+		// a FRESH StartedAt: the anchor resolves to StartedAt and the stage reads
+		// live -> polls. A regression that omitted StartedAt from the max would take
+		// the older audit-row / UpdatedAt anchor and stop dispatched_stale.
+		started := time.Now()
+		impl := stg(driveImplID, "implement", "dispatched", 1)
+		impl.UpdatedAt = time.Now().Add(-time.Hour)
+		impl.StartedAt = &started
+		f := newDriveFake("running", []Stage{
+			stg(drivePlanID, "plan", "succeeded", 0),
+			impl,
+		})
+		// An OLD dispatch-evidence row (older than StartedAt): StartedAt must still win.
+		f.appendAutoAt(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""}, time.Now().Add(-time.Hour))
+		f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+		rec := &spawnRecorder{}
+		r, srv := newDriveResolver(t, f, rec)
+		defer srv.Close()
+		r.driveDispatchedStaleAfter = 10 * time.Second
+		r.driveMaxWallclock = 40 * time.Millisecond
+
+		_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+		if err != nil {
+			t.Fatalf("driveRun: %v", err)
+		}
+		if out.StoppedReason != stoppedTimeout {
+			t.Fatalf("stopped_reason = %q, want timeout (fresh StartedAt wins over the older audit-row anchor)", out.StoppedReason)
+		}
+		if got := rec.list(); len(got) != 0 {
+			t.Fatalf("driver spawned a stage StartedAt marks live: %v (must never auto-spawn)", got)
+		}
+	})
 }
