@@ -361,6 +361,7 @@ _detect_rebuild_set() {
   if ! changed_files="$(git diff --name-only "${base_ref}...HEAD" 2>/dev/null)"; then
     print "warning: git diff failed — rebuilding all binaries"
     rebuild_set[fishhawk-mcp]="__all__"
+    rebuild_set[fishhawk-mcp-shim]="__all__"
     rebuild_set[fishhawk-runner]="__all__"
     rebuild_set[fishhawk]="__all__"
     return
@@ -373,16 +374,25 @@ _detect_rebuild_set() {
     [[ -z "$f" ]] && continue
 
     case "$f" in
-      # Shared libs trigger all four binaries; short-circuit on first hit
+      # Shared libs trigger the four version-coupled binaries. Do NOT `return`
+      # here: fishhawk-mcp-shim is deliberately NOT in this case (it rebuilds
+      # only on its own trigger glob), so a diff touching both a shared lib AND
+      # the shim would drop the shim trigger if we short-circuited. Fall through
+      # so a later shim path in the same diff still marks it.
       backend/internal/plan/*|backend/internal/spec/*)
         if [[ "${rebuild_set[fishhawkd]}" == "__baseline__" ]]; then rebuild_set[fishhawkd]="$f"; fi
         if [[ -z "${rebuild_set[fishhawk-mcp]:-}" ]];    then rebuild_set[fishhawk-mcp]="$f"; fi
         if [[ -z "${rebuild_set[fishhawk-runner]:-}" ]]; then rebuild_set[fishhawk-runner]="$f"; fi
         if [[ -z "${rebuild_set[fishhawk]:-}" ]];        then rebuild_set[fishhawk]="$f"; fi
-        return
         ;;
       backend/cmd/fishhawkd/*|backend/internal/*)
         if [[ "${rebuild_set[fishhawkd]}" == "__baseline__" ]]; then rebuild_set[fishhawkd]="$f"; fi
+        ;;
+      # The shim's own trigger glob only — the literal `/` after fishhawk-mcp
+      # keeps `backend/cmd/fishhawk-mcp/*` (below) from matching shim paths, and
+      # this glob from matching plain-mcp paths (cross-glob non-collision).
+      backend/cmd/fishhawk-mcp-shim/*)
+        if [[ -z "${rebuild_set[fishhawk-mcp-shim]:-}" ]]; then rebuild_set[fishhawk-mcp-shim]="$f"; fi
         ;;
       backend/cmd/fishhawk-mcp/*)
         if [[ -z "${rebuild_set[fishhawk-mcp]:-}" ]]; then rebuild_set[fishhawk-mcp]="$f"; fi
@@ -422,7 +432,7 @@ _build_ldflags() {
   local sha="$2"
   local pkg
   case "$name" in
-    fishhawkd|fishhawk-mcp) pkg="github.com/kuhlman-labs/fishhawk/backend/internal/version" ;;
+    fishhawkd|fishhawk-mcp|fishhawk-mcp-shim) pkg="github.com/kuhlman-labs/fishhawk/backend/internal/version" ;;
     fishhawk-runner)        pkg="github.com/kuhlman-labs/fishhawk/runner/internal/version" ;;
     fishhawk)               pkg="github.com/kuhlman-labs/fishhawk/cli/internal/version" ;;
     *)                      return 1 ;;
@@ -454,10 +464,11 @@ _build_binary() {
   local trigger="$2"
   typeset -A src_paths
   src_paths=(
-    fishhawkd        "./backend/cmd/fishhawkd/"
-    fishhawk-mcp     "./backend/cmd/fishhawk-mcp/"
-    fishhawk-runner  "./runner/cmd/fishhawk-runner/"
-    fishhawk         "./cli/cmd/fishhawk/"
+    fishhawkd         "./backend/cmd/fishhawkd/"
+    fishhawk-mcp      "./backend/cmd/fishhawk-mcp/"
+    fishhawk-mcp-shim "./backend/cmd/fishhawk-mcp-shim/"
+    fishhawk-runner   "./runner/cmd/fishhawk-runner/"
+    fishhawk          "./cli/cmd/fishhawk/"
   )
   local src="${src_paths[$name]}"
   local src_dir="${REPO_ROOT}/${src#./}"
@@ -492,6 +503,29 @@ _diff_touches_mcp() {
     [[ -z "$f" ]] && continue
     case "$f" in
       backend/cmd/fishhawk-mcp/*|backend/internal/plan/*|backend/internal/spec/*)
+        return 0
+        ;;
+    esac
+  done <<< "$diff_text"
+  return 1
+}
+
+# Pure path matcher: returns 0 if any line of the newline-delimited changed-file
+# text in $1 matches the rebuild-matrix glob that routes to fishhawk-mcp-shim,
+# else 1. Mirrors _diff_touches_mcp's shape but tracks ONLY the shim's own
+# trigger glob (`backend/cmd/fishhawk-mcp-shim/*`) — the shim deliberately does
+# not join the shared-lib case, so a plan/spec edit does not fire the shim
+# banner. Cross-glob non-collision holds both directions: the literal `/` after
+# `fishhawk-mcp` keeps _diff_touches_mcp's glob off shim paths and this glob off
+# plain-mcp paths. If the matrix shim glob changes, this must move with it.
+# Git-free so scripts/test-dev can drive it with crafted input.
+_diff_touches_shim() {
+  local diff_text="$1"
+  local f
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    case "$f" in
+      backend/cmd/fishhawk-mcp-shim/*)
         return 0
         ;;
     esac
@@ -600,19 +634,125 @@ _decide_mcp_signal() {
   print 1
 }
 
-# Emits the MCP reconnect signal — must be the LAST thing printed by up/reload
-# so it is unmissable. Arg 1: 1 if a /mcp reconnect is required this run, else 0.
-# Arg 2 (optional): the reason — "schema_major" prints a distinct, louder line
-# naming the workflow-spec MAJOR bump (#1422) as the trigger; anything else (or
-# unset) keeps the plain-rebuild text. scripts/dev cannot restart the MCP server
-# (the Claude Code harness owns that process), so on a rebuild OR a schema-major
-# bump the only lever is to tell the operator, unmissably, that a manual /mcp
-# reconnect is required or the new binary / new schema major stays inert.
+# Pure decision helper for the fishhawk-mcp-shim rebuild banner (ADR-060 /
+# #1922) — mirrors _decide_mcp_signal's rebuild ladder MINUS the schema-major
+# fold (a schema-major bump is handled by _select_mcp_banner's precedence, not
+# the per-binary signal). Echoes 1 (the shim binary changed this run) or 0.
+# Args: <shim_rebuilt 0|1> <force_all 0|1> <reflog_ok 0|1> <merge_diff_text>
+#   - shim not rebuilt               -> 0
+#   - rebuilt under --all, reflog ok -> consult merge diff (touches shim ? 1 : 0)
+#   - rebuilt under --all, no reflog -> 1 (safe fallback; never a silent stale shim)
+#   - rebuilt under a branch-diff up -> 1 (rebuilt_list membership already means
+#                                          shim source differs from main)
+_decide_shim_signal() {
+  local shim_rebuilt="$1"
+  local force_all="$2"
+  local reflog_ok="$3"
+  local merge_diff="$4"
+
+  if (( ! shim_rebuilt )); then
+    print 0
+    return
+  fi
+
+  if (( force_all )); then
+    if (( reflog_ok )); then
+      if _diff_touches_shim "$merge_diff"; then
+        print 1
+      else
+        print 0
+      fi
+    else
+      print 1
+    fi
+    return
+  fi
+
+  print 1
+}
+
+# Pure: decide whether the fishhawk-mcp-shim is the registered MCP server.
+# Args: <override_value> <registration_text>
+#   - override '1'/'true'  -> 1 (explicit operator assertion, wins)
+#   - override '0'/'false' -> 0
+#   - empty override       -> 1 iff registration_text contains 'fishhawk-mcp-shim',
+#                             else 0 (absent/errored `claude mcp get` yields empty
+#                             text -> 0, which keeps the manual reconnect banner —
+#                             the fail-safe direction).
+# Git/CLI-free so scripts/test-dev can drive every branch with crafted input.
+_shim_registered_from() {
+  local override="$1"
+  local reg_text="$2"
+  case "$override" in
+    1|true)  print 1; return ;;
+    0|false) print 0; return ;;
+  esac
+  if [[ "$reg_text" == *fishhawk-mcp-shim* ]]; then
+    print 1
+  else
+    print 0
+  fi
+}
+
+# Impure: is the shim registered as the MCP server this session? An explicit
+# FISHHAWK_MCP_SHIM_REGISTERED override (sourced from .env before the banner
+# decision) wins; otherwise, when the `claude` CLI is present, best-effort match
+# `claude mcp get fishhawk` output for the shim binary. The lookup is guarded
+# (command -v + if-condition capture, set -e safe); an absent CLI or a non-zero
+# lookup degrades to empty text -> not-registered, preserving the manual banner.
+_detect_shim_registered() {
+  local override="${FISHHAWK_MCP_SHIM_REGISTERED:-}"
+  local reg_text=""
+  if [[ -z "$override" ]] && command -v claude &>/dev/null; then
+    if ! reg_text="$(claude mcp get fishhawk 2>/dev/null)"; then reg_text=""; fi
+  fi
+  _shim_registered_from "$override" "$reg_text"
+}
+
+# Pure: map the four MCP-activation inputs to exactly one banner kind, in fixed
+# precedence order. Args:
+#   <schema_major 0|1> <shim_signal 0|1> <mcp_signal 0|1> <shim_registered 0|1>
+#   1. schema_major — a workflow-spec MAJOR bump (#1422) breaks every start_run
+#      against the live server's stale embedded schema, regardless of transport;
+#      unconditional and first.
+#   2. shim_rebuilt — the shim binary itself changed. The shim swaps its CHILD,
+#      not itself, so a shim-binary change still needs one manual /mcp (a
+#      reconnect also covers any simultaneous mcp change).
+#   3. reconnect — mcp changed and the shim is NOT registered: the existing
+#      manual-reconnect banner.
+#   4. auto_swap — mcp changed and the shim IS registered: the registered shim
+#      hot-swaps the rebuilt child automatically; a one-line verifiable note.
+#   5. none — nothing MCP-relevant changed.
+_select_mcp_banner() {
+  local schema_major="$1"
+  local shim_signal="$2"
+  local mcp_signal="$3"
+  local shim_registered="$4"
+
+  if (( schema_major )); then print "schema_major"; return; fi
+  if (( shim_signal )); then print "shim_rebuilt"; return; fi
+  if (( mcp_signal )); then
+    if (( shim_registered )); then
+      print "auto_swap"
+    else
+      print "reconnect"
+    fi
+    return
+  fi
+  print "none"
+}
+
+# Emits the MCP-activation signal — must be the LAST thing printed by up/reload
+# so it is unmissable. Arg 1: the banner KIND from _select_mcp_banner
+# (schema_major | shim_rebuilt | reconnect | auto_swap | none). scripts/dev
+# cannot restart the MCP server (the Claude Code harness owns that process), so
+# on a change that leaves the live server stale the only lever is to tell the
+# operator, unmissably, what manual action is required — EXCEPT the auto_swap
+# case, where a registered fishhawk-mcp-shim refreshes the child with no /mcp.
 _signal_mcp_activation() {
-  local rebuilt="${1:-0}"
-  local reason="${2:-}"
-  if (( rebuilt )); then
-    if [[ "$reason" == "schema_major" ]]; then
+  local kind="${1:-none}"
+  case "$kind" in
+    schema_major)
       print ""
       print "################################################################"
       print "  ACTION REQUIRED: the .fishhawk/workflows.yaml schema MAJOR"
@@ -624,7 +764,19 @@ _signal_mcp_activation() {
       print "  Code harness owns that process. Run /mcp to reconnect NOW, or"
       print "  the loop stays broken in this session."
       print "################################################################"
-    else
+      ;;
+    shim_rebuilt)
+      print ""
+      print "================================================================"
+      print "  ACTION REQUIRED: bin/fishhawk-mcp-shim was rebuilt this run."
+      print ""
+      print "  The shim hot-swaps its CHILD, but a change to the shim binary"
+      print "  itself is owned by the Claude Code harness — scripts/dev cannot"
+      print "  restart it. Run /mcp to reconnect, or the rebuilt"
+      print "  fishhawk-mcp-shim stays inert in this session."
+      print "================================================================"
+      ;;
+    reconnect)
       print ""
       print "================================================================"
       print "  ACTION REQUIRED: bin/fishhawk-mcp was rebuilt this run."
@@ -632,11 +784,18 @@ _signal_mcp_activation() {
       print "  scripts/dev cannot restart the MCP server — the Claude Code"
       print "  harness owns that process. Run /mcp to reconnect, or the"
       print "  rebuilt fishhawk-mcp binary stays inert in this session."
+      print ""
+      print "  (Register the fishhawk-mcp-shim to auto-swap rebuilds — see"
+      print "  backend/cmd/fishhawk-mcp-shim/README.md.)"
       print "================================================================"
-    fi
-  else
-    print "no MCP reconnect needed (bin/fishhawk-mcp unchanged)"
-  fi
+      ;;
+    auto_swap)
+      print "bin/fishhawk-mcp rebuilt; the registered fishhawk-mcp-shim hot-swaps it automatically — no /mcp needed. Verify via a version-returning tool call reflecting the new GitSHA (#1007)."
+      ;;
+    none|*)
+      print "no MCP reconnect needed (bin/fishhawk-mcp unchanged)"
+      ;;
+  esac
 }
 
 cmd_up() {
@@ -743,10 +902,11 @@ cmd_up() {
 
   if (( force_all )); then
     rebuild_set=(
-      fishhawkd       __all__
-      fishhawk-mcp    __all__
-      fishhawk-runner __all__
-      fishhawk        __all__
+      fishhawkd         __all__
+      fishhawk-mcp      __all__
+      fishhawk-mcp-shim __all__
+      fishhawk-runner   __all__
+      fishhawk          __all__
     )
   else
     _detect_rebuild_set
@@ -754,7 +914,7 @@ cmd_up() {
 
   local -a rebuilt_list=()
   local binary
-  for binary in fishhawkd fishhawk-mcp fishhawk-runner fishhawk; do
+  for binary in fishhawkd fishhawk-mcp fishhawk-mcp-shim fishhawk-runner fishhawk; do
     if [[ -n "${rebuild_set[$binary]:-}" ]]; then
       if _build_binary "$binary" "${rebuild_set[$binary]}"; then
         rebuilt_list+=("$binary")
@@ -764,9 +924,9 @@ cmd_up() {
 
   local count=${#rebuilt_list[@]}
   if (( count > 0 )); then
-    print "rebuilt ${count} of 4 binaries: ${(j:, :)rebuilt_list}"
+    print "rebuilt ${count} of 5 binaries: ${(j:, :)rebuilt_list}"
   else
-    print "rebuilt 0 of 4 binaries (nothing changed)"
+    print "rebuilt 0 of 5 binaries (nothing changed)"
   fi
 
   # Detect whether fishhawk-mcp was rebuilt off the existing rebuilt_list — no
@@ -804,10 +964,33 @@ cmd_up() {
   local workflow_major_changed
   workflow_major_changed="$(_workflow_major_changed "$old_spec_text" "$new_spec_text")"
 
+  # The pure mcp-source signal: pass workflow_major_changed=0 so _decide_mcp_signal
+  # reports ONLY whether fishhawk-mcp itself changed. The schema-major bump is
+  # folded back in by _select_mcp_banner's schema_major precedence below, so the
+  # existing _decide_mcp_signal contract (and its tests) stay untouched.
   local mcp_signal
-  mcp_signal="$(_decide_mcp_signal "$mcp_rebuilt" "$force_all" "$reflog_ok" "$merge_diff" "$workflow_major_changed")"
-  local mcp_reason=""
-  if (( workflow_major_changed )); then mcp_reason="schema_major"; fi
+  mcp_signal="$(_decide_mcp_signal "$mcp_rebuilt" "$force_all" "$reflog_ok" "$merge_diff" 0)"
+
+  # Shim rebuild signal (ADR-060 / #1922): membership off the same rebuilt_list,
+  # then _decide_shim_signal applies the same reflog/merge-diff ladder minus the
+  # schema-major fold.
+  local shim_rebuilt=0
+  if (( ${rebuilt_list[(Ie)fishhawk-mcp-shim]} )); then
+    shim_rebuilt=1
+  fi
+  local shim_signal
+  shim_signal="$(_decide_shim_signal "$shim_rebuilt" "$force_all" "$reflog_ok" "$merge_diff")"
+
+  # Is the shim the registered MCP server? An .env override (sourced above at the
+  # top of cmd_up) wins over a best-effort `claude mcp get fishhawk` probe; an
+  # absent/errored CLI degrades to not-registered, keeping the manual banner.
+  local shim_registered
+  shim_registered="$(_detect_shim_registered)"
+
+  # Exactly one banner kind (schema_major | shim_rebuilt | reconnect | auto_swap
+  # | none), in fixed precedence.
+  local mcp_banner_kind
+  mcp_banner_kind="$(_select_mcp_banner "$workflow_major_changed" "$shim_signal" "$mcp_signal" "$shim_registered")"
 
   # Migrate
   print "applying migrations..."
@@ -875,10 +1058,11 @@ cmd_up() {
 
   print "fishhawkd started (pid ${pid}) — logs: ${LOG_FILE}"
 
-  # Last line(s): tell the operator whether a /mcp reconnect is required. The
-  # reason distinguishes a schema-MAJOR bump (#1422, louder banner) from a plain
-  # rebuild.
-  _signal_mcp_activation "$mcp_signal" "$mcp_reason"
+  # Last line(s): tell the operator what MCP-activation step (if any) this run
+  # requires. The kind selects among the schema-major banner (#1422), the
+  # distinct shim-rebuilt banner, the plain mcp reconnect banner, the one-line
+  # auto-swap note (registered shim, ADR-060 / #1922), or the no-op line.
+  _signal_mcp_activation "$mcp_banner_kind"
 }
 
 cmd_down() {
@@ -1605,9 +1789,11 @@ _usage() {
   print -u2 "  the port-forward and helm-uninstalls. See docs/deploy/kubernetes.md."
   print -u2 ""
   print -u2 "binary activation after a rebuild:"
-  print -u2 "  fishhawkd        rebuilt + restarted by up/reload"
-  print -u2 "  fishhawk-runner  picked up automatically (spawned fresh from bin/ per stage)"
-  print -u2 "  fishhawk-mcp     rebuilt on disk but requires a manual /mcp reconnect"
+  print -u2 "  fishhawkd         rebuilt + restarted by up/reload"
+  print -u2 "  fishhawk-runner   picked up automatically (spawned fresh from bin/ per stage)"
+  print -u2 "  fishhawk-mcp      auto-swapped when the fishhawk-mcp-shim is registered; a"
+  print -u2 "                    manual /mcp reconnect only as the unregistered fallback"
+  print -u2 "  fishhawk-mcp-shim rebuilt on disk but a shim-binary change needs a manual /mcp"
 }
 
 # DEV_LIB_ONLY lets scripts/test-dev source this file to unit-test the helpers

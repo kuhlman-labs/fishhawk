@@ -26,16 +26,30 @@ The child connection sits behind a small `childTransport` seam so a later phase 
 
 ## Registration
 
-Register the shim with the harness **instead of** `fishhawk-mcp` so the session survives rebuilds. The registration mirrors the sibling [`fishhawk-mcp`](../fishhawk-mcp/README.md#install-operators) form — `--command` with the token wired through `--env` — just pointed at the shim binary. With the standard `bin/` layout no `--child` flag is needed:
+**One-time operator re-registration (required).** To move a live session off the manual-reconnect treadmill you must re-point the harness's `fishhawk` MCP server entry at the shim **instead of** `fishhawk-mcp` — a one-time step per host. If a plain `fishhawk-mcp` entry already exists, remove it and re-add pointed at the shim binary:
 
 ```sh
+claude mcp remove fishhawk    # drop the existing plain fishhawk-mcp entry, if any
 claude mcp add fishhawk --command /path/to/bin/fishhawk-mcp-shim \
   --env FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN
 ```
 
+The registration mirrors the sibling [`fishhawk-mcp`](../fishhawk-mcp/README.md#install-operators) form — `--command` with the token wired through `--env` — just pointed at the shim binary. With the standard `bin/` layout no `--child` flag is needed. Run `/mcp` once after re-registering so the session picks up the shim; from then on child rebuilds hot-swap with no further `/mcp`.
+
 The shim adds no auth of its own: it passes `FISHHAWK_API_TOKEN` / `FISHHAWK_BACKEND_URL` straight through to the child, so the child needs them in its environment. Wire `FISHHAWK_API_TOKEN` via `--env` as above (and `FISHHAWK_BACKEND_URL` too when it is not the default `http://localhost:8080`).
 
-> `scripts/dev` integration, retirement of the reconnect banner, and operator re-registration are the sibling issue [#1922](https://github.com/kuhlman-labs/fishhawk/issues/1922); this binary is not yet wired into the dev loop.
+### `scripts/dev` integration
+
+The shim is wired into the dev loop ([#1922](https://github.com/kuhlman-labs/fishhawk/issues/1922)) as the fifth rebuild-matrix binary with its **own** trigger glob (`backend/cmd/fishhawk-mcp-shim/` only — deliberately not the `backend/internal/plan|spec` shared-lib case, so it rebuilds rarely). `scripts/dev reload` (`--all`) rebuilds `bin/fishhawk-mcp-shim` alongside the others; a running shim keeps its open inode, so the on-disk rebuild is inert until a manual `/mcp` (see the accepted residual below).
+
+`scripts/dev up`/`reload` select exactly one closing banner:
+
+- **schema-major bump** — a `.fishhawk/workflows.yaml` `version:` MAJOR change; unconditional (#1422).
+- **shim rebuilt** — `fishhawk-mcp-shim` source changed: a distinct banner telling you to run `/mcp` once (the shim swaps its child, not itself).
+- **reconnect** — `fishhawk-mcp` changed and the shim is **not** registered: the legacy manual-reconnect banner.
+- **auto-swap** — `fishhawk-mcp` changed and the shim **is** registered: a one-line note that the shim hot-swaps the rebuilt child automatically, verifiable via a version-returning tool call reflecting the new GitSHA.
+
+Registration is detected via the `FISHHAWK_MCP_SHIM_REGISTERED` env override (sourced from `.env`; `1`/`true` or `0`/`false`) winning over a best-effort `claude mcp get fishhawk` probe; an absent or errored `claude` CLI degrades to not-registered, which keeps the manual banner (the fail-safe direction).
 
 ## Accepted residuals
 
