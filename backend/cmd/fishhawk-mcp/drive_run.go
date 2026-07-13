@@ -29,6 +29,13 @@ const (
 	// no-state-change, no-parked-gate iterations after which the verb returns
 	// stalled rather than spinning.
 	driveStallThreshold = 3
+	// defaultDriveDispatchedStaleAfter is the runner-liveness threshold: a stage
+	// this invocation did not spawn that has sat in 'dispatched' longer than this
+	// (with no runner observed) is treated as genuinely runner-less rather than
+	// in-flight. A live local runner flips dispatched->running within seconds, so
+	// 10 minutes of headroom cannot misclassify a live runner. Overridable via
+	// the runResolver.driveDispatchedStaleAfter seam (tests inject a tiny value).
+	defaultDriveDispatchedStaleAfter = 10 * time.Minute
 )
 
 // stopped_reason values (some are composed with a suffix at return).
@@ -53,6 +60,17 @@ const (
 	// runner while the first is in flight. Halt rather than risk concurrent
 	// repository command execution.
 	stoppedDispatchCheckFailed = "dispatch_check_failed"
+	// stoppedDispatchedStale is the stop when a stage this invocation did not
+	// spawn has sat in 'dispatched' past the runner-liveness threshold with no
+	// runner observed: a genuinely runner-less stage (the cross-invocation
+	// in-flight guard would otherwise poll every resume to timeout). The driver
+	// still NEVER auto-spawns it — double-spawn stays impossible by construction;
+	// it hands the manual re-dispatch to the operator via next_actions.
+	stoppedDispatchedStale = "dispatched_stale"
+	// stoppedContextCancelled is the stop when the drive context is cancelled
+	// (distinct from the run-state-derived 'cancelled', which reports a run the
+	// backend moved to the cancelled terminal state).
+	stoppedContextCancelled = "context_cancelled"
 	// "paged:<event>" and "decision_required:<state>" are composed inline.
 )
 
@@ -93,7 +111,7 @@ type DriveStep struct {
 // resumable by re-invoking with the same run_id.
 type DriveRunOutput struct {
 	RunID         string       `json:"run_id"`
-	StoppedReason string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed"`
+	StoppedReason string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | context_cancelled"`
 	RunState      string       `json:"run_state"`
 	StepsTaken    []DriveStep  `json:"steps_taken,omitempty" jsonschema:"the ordered acts the driver performed; each dispatch and gate act also landed a run_auto_driven audit row"`
 	PageEvent     string       `json:"page_event,omitempty" jsonschema:"the must_page_human event, set only on a paged stop"`
@@ -111,10 +129,15 @@ between human gates on a runner_kind:local run under ADR-040 delegation, and
 stop at the first genuine decision — the local sibling of the GHA campaign
 auto-driver (#1700).
 
-It is a bounded, resumable loop: for any local stage in a dispatchable state it
-FIRST records the dispatch (POST /v0/runs/{id}/auto-drive/acts) and only on a
-successful record host-spawns the runner (record-before-dispatch makes an
-unaudited mechanical act impossible by construction); it polls stages/reviews
+It is a bounded, resumable loop: it dispatches only the EARLIEST non-terminal
+stage once its gate preconditions hold (plan always, implement after plan
+succeeds, acceptance after implement succeeds and every review settles), so a
+fresh run whose stages are all created pending never dispatches implement or
+acceptance while the plan runner still holds the lineage lock. For that
+dispatchable stage it FIRST records the dispatch (POST
+/v0/runs/{id}/auto-drive/acts) and only on a successful record host-spawns the
+runner (record-before-dispatch makes an unaudited mechanical act impossible by
+construction); it polls stages/reviews
 to settle; and at every gate it calls POST /v0/runs/{id}/auto-drive, continuing
 on a delegated act (approve/route_fixup/retry/merge) and returning immediately
 on a page, on an observe-only outcome at a decision state (a plan gate without
@@ -209,13 +232,28 @@ func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in D
 	var lastSig string
 	mergeQueued := false // a delegated merge was queued; poll for the webhook-settle, don't re-act
 
+	// QUEUED-MERGE MEMORY across invocations: a prior run_auto_driven act:gate
+	// merge row means a merge was already queued on an earlier invocation, so a
+	// resume during merge latency must poll for the webhook-settle instead of
+	// re-calling the gate (no duplicate gate:merge act, no auto-merge re-enable).
+	// FAIL-OPEN on a read error, unlike the dispatch-path fail-closed: this check
+	// opens NO code-execution surface — the worst case of a false negative is the
+	// pre-existing duplicate gate:merge attribution row, so fail-closed halting
+	// would trade a benign duplicate for a wedge.
+	if queued, merr := r.driveHasPriorGateMergeRow(ctx, runUUID); merr != nil {
+		out.Warnings = append(out.Warnings,
+			"prior gate:merge poll failed; continuing (fail-open, merge memory not seeded): "+merr.Error())
+	} else if queued {
+		mergeQueued = true
+	}
+
 	for {
 		if time.Now().After(deadline) {
 			out.StoppedReason = stoppedTimeout
 			return nil, out, nil
 		}
 		if ctx.Err() != nil {
-			out.StoppedReason = stoppedTimeout
+			out.StoppedReason = stoppedContextCancelled
 			out.Warnings = append(out.Warnings, "context cancelled: "+ctx.Err().Error())
 			return nil, out, nil
 		}
@@ -300,7 +338,7 @@ func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in D
 			// still-'dispatched' stage, downgrading would let the loop record +
 			// host-spawn a SECOND runner while the first is in flight (concurrent
 			// repository command execution). Halt instead.
-			priorRow, herr := r.driveHasPriorDispatchRow(ctx, runUUID, recordName)
+			priorRow, newestDispatchSeq, herr := r.driveHasPriorDispatchRow(ctx, runUUID, recordName)
 			if herr != nil {
 				out.StoppedReason = stoppedDispatchCheckFailed
 				out.Warnings = append(out.Warnings,
@@ -322,7 +360,32 @@ func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in D
 			// with a retry note below; a fixup/retry re-open (dispatchedCount>0)
 			// still re-dispatches as fixup_redispatch.
 			if disp.State == "dispatched" && dispatchedCount[disp.ID] == 0 {
-				spawned[disp.ID] = true // mark in-flight so driveAnyInFlight polls it
+				staleAfter := r.driveDispatchedStaleAfter
+				if staleAfter <= 0 {
+					staleAfter = defaultDriveDispatchedStaleAfter
+				}
+				// A stage that has sat in 'dispatched' past the liveness threshold
+				// with no runner observed is genuinely runner-less: stop distinct
+				// (dispatched_stale) and hand the manual re-dispatch to the operator
+				// rather than polling every resume to timeout. A live runner flips
+				// dispatched->running within seconds, so the threshold cannot
+				// misclassify it. A zero-value UpdatedAt (field absent from a
+				// response) degrades to polling — fail toward polling, never toward
+				// spawning; the driver still NEVER host-spawns a 'dispatched' stage
+				// it did not spawn itself.
+				if !disp.UpdatedAt.IsZero() && time.Since(disp.UpdatedAt) > staleAfter {
+					age := time.Since(disp.UpdatedAt).Round(time.Second)
+					out.StoppedReason = stoppedDispatchedStale
+					out.Warnings = append(out.Warnings, fmt.Sprintf(
+						"stage %s (%s) has sat in 'dispatched' for %s, past the %s runner-liveness threshold, with no runner observed; no runner appears live. Confirm no runner process is running, re-dispatch by hand with fishhawk_dispatch_stage, then re-invoke fishhawk_drive_run.",
+						disp.Type, disp.ID, age, staleAfter))
+					out.NextActions = driveDecisionActions("dispatched_stale", runUUID, in.WorkingDir)
+					return nil, out, nil
+				}
+				// In-flight (or the zero-value degrade): poll and re-evaluate the
+				// threshold next iteration. Deliberately NOT a one-shot spawned[]
+				// mark — leaving the stage dispatchable lets this guard re-trip once
+				// the threshold passes mid-invocation.
 				driveSleep(ctx, pollInterval)
 				continue
 			}
@@ -332,6 +395,32 @@ func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in D
 				// name and the stage is still dispatchable (pending) — a
 				// crash-resume. Re-record honestly with a retry note.
 				note = "retry"
+			}
+			// Cross-invocation fixup_redispatch attribution: a fresh invocation
+			// (dispatchedCount==0) re-dispatching a still-'pending' implement stage
+			// that a prior invocation already dispatched, where a
+			// stage_fixup_triggered row is NEWER than that newest implement dispatch
+			// row, is a fix-up re-open from a prior invocation. Attribute the record
+			// as fixup_redispatch rather than a generic implement retry.
+			// recordName=="implement" excludes the intra-invocation path
+			// (dispatchedCount>0), which driveDispatchName already names
+			// fixup_redispatch.
+			if disp.Type == "implement" && recordName == "implement" && dispatchedCount[disp.ID] == 0 && priorRow {
+				fixupSeq, ferr := r.driveNewestFixupTriggeredSeq(ctx, runUUID)
+				if ferr != nil {
+					// FAIL-CLOSED on the code-execution path, exactly as the prior-
+					// dispatch-row read: never downgrade an unreadable audit state,
+					// which precedes a record + host-spawn.
+					out.StoppedReason = stoppedDispatchCheckFailed
+					out.Warnings = append(out.Warnings,
+						fmt.Sprintf("fixup-attribution poll failed; stopping fail-closed: %v", ferr))
+					out.NextActions = driveDecisionActions("stalled", runUUID, in.WorkingDir)
+					return nil, out, nil
+				}
+				if fixupSeq > newestDispatchSeq {
+					recordName = "fixup_redispatch"
+					note = ""
+				}
 			}
 			if _, rerr := r.api.RecordAutoDriveAct(ctx, runUUID, RecordAutoDriveAct{
 				Action: autoDriveDispatchActionName,
@@ -461,30 +550,87 @@ func driveSleep(ctx context.Context, d time.Duration) {
 	}
 }
 
-// driveDispatchableStage returns the lowest-sequence host-dispatchable stage
-// (a plan/implement/acceptance stage in pending or dispatched, not already
-// spawned this invocation), or nil. Review stages are server-driven, never
-// host-spawned, so they are never dispatchable (driveAnyInFlight polls them).
+// driveDispatchableStage returns the EARLIEST non-terminal stage when — and
+// only when — it is itself host-dispatchable: a plan/implement/acceptance stage
+// in pending or dispatched that this invocation has not already spawned, with
+// its gate preconditions satisfied. It returns nil when nothing is host-
+// dispatchable right now: the earliest non-terminal stage is a review stage
+// (server-driven, polled by driveAnyInFlight) or a plan/implement/acceptance
+// stage parked in awaiting_approval/running/blocked (the gate branch / poll own
+// those).
+//
+// Gating on the EARLIEST non-terminal stage is the load-bearing fix (run
+// fdcc17cd): a fresh run creates every stage 'pending', and the prior lowest-
+// sequence-dispatchable rule dispatched implement and acceptance the moment plan
+// was spawned — both then died category-C on the lineage lock the plan runner
+// held. Only the earliest non-terminal stage can be host-dispatched, so plan
+// runs alone until it settles. The precondition check
+// (driveGatePreconditionsMet) is a belt-and-suspenders mirror of the backend
+// drive rules for any unexpected sequence layout: implement requires a preceding
+// plan stage to have succeeded; acceptance requires the implement stage to have
+// succeeded and every review stage to be terminal.
 func driveDispatchableStage(stages []Stage, spawned map[string]bool) *Stage {
-	var best *Stage
+	var earliest *Stage
 	for i := range stages {
 		st := &stages[i]
-		if spawned[st.ID] {
+		if stageStateIsTerminal(st.State) {
 			continue
 		}
-		switch st.Type {
-		case "plan", "implement", "acceptance":
-		default:
-			continue
-		}
-		if st.State != "pending" && st.State != "dispatched" {
-			continue
-		}
-		if best == nil || st.Sequence < best.Sequence {
-			best = st
+		if earliest == nil || st.Sequence < earliest.Sequence {
+			earliest = st
 		}
 	}
-	return best
+	if earliest == nil {
+		return nil
+	}
+	switch earliest.Type {
+	case "plan", "implement", "acceptance":
+	default:
+		return nil // earliest non-terminal is a review stage → nothing host-dispatchable
+	}
+	if earliest.State != "pending" && earliest.State != "dispatched" {
+		return nil // parked at a gate / running / blocked → not host-dispatchable
+	}
+	if spawned[earliest.ID] {
+		return nil // already spawned this invocation → driveAnyInFlight polls it
+	}
+	if !driveGatePreconditionsMet(*earliest, stages) {
+		return nil
+	}
+	return earliest
+}
+
+// driveGatePreconditionsMet reports whether the gate preconditions for host-
+// dispatching st hold, mirroring the backend drive rules: plan is always
+// dispatchable; implement requires any existing plan stage to have succeeded;
+// acceptance requires the implement stage to have succeeded AND every review
+// stage to be terminal. A defensive backstop for an unexpected sequence layout —
+// the earliest-non-terminal ordering in driveDispatchableStage already prevents
+// the common premature-dispatch case.
+func driveGatePreconditionsMet(st Stage, stages []Stage) bool {
+	switch st.Type {
+	case "implement":
+		for i := range stages {
+			if stages[i].Type == "plan" && stages[i].State != "succeeded" {
+				return false
+			}
+		}
+		return true
+	case "acceptance":
+		implementSucceeded := false
+		for i := range stages {
+			s := &stages[i]
+			if s.Type == "implement" && s.State == "succeeded" {
+				implementSucceeded = true
+			}
+			if s.Type == "review" && !stageStateIsTerminal(s.State) {
+				return false
+			}
+		}
+		return implementSucceeded
+	default: // plan
+		return true
+	}
 }
 
 // driveAnyInFlight reports whether any stage is still executing: a running
@@ -558,10 +704,69 @@ func (r *runResolver) driveScopeAmendmentPending(ctx context.Context, runID uuid
 	return len(req) > len(dec), nil
 }
 
-// driveHasPriorDispatchRow reports whether a run_auto_driven audit row for the
-// given dispatch stage name already exists — a crash-resume or re-open signal
-// so the re-record carries an honest retry note.
-func (r *runResolver) driveHasPriorDispatchRow(ctx context.Context, runID uuid.UUID, stageName string) (bool, error) {
+// driveHasPriorDispatchRow reports whether a run_auto_driven dispatch row for
+// the given dispatch stage name already exists — a crash-resume or re-open
+// signal so the re-record carries an honest retry note — and returns the highest
+// audit sequence among the matching rows. For an implement stage the match set
+// includes BOTH 'implement' and 'fixup_redispatch' dispatch rows (a fix-up re-
+// dispatch is still an implement dispatch), so the returned sequence is the
+// newest implement-family dispatch — the caller compares it against the newest
+// stage_fixup_triggered row to attribute a cross-invocation fix-up re-open.
+func (r *runResolver) driveHasPriorDispatchRow(ctx context.Context, runID uuid.UUID, stageName string) (bool, int64, error) {
+	rows, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{Category: CategoryRunAutoDriven, Limit: 500})
+	if err != nil {
+		return false, 0, err
+	}
+	found := false
+	var newestSeq int64
+	for _, e := range rows {
+		fields, ok := e.Payload.(map[string]any)
+		if !ok {
+			continue
+		}
+		if fields["act"] != "dispatch" {
+			continue
+		}
+		stage, _ := fields["stage"].(string)
+		match := stage == stageName
+		if stageName == "implement" && stage == "fixup_redispatch" {
+			match = true
+		}
+		if match {
+			found = true
+			if e.Sequence > newestSeq {
+				newestSeq = e.Sequence
+			}
+		}
+	}
+	return found, newestSeq, nil
+}
+
+// driveNewestFixupTriggeredSeq returns the highest audit sequence among the
+// run's stage_fixup_triggered rows (0 when none). A trigger newer than the
+// newest implement dispatch row means a pending implement stage a prior
+// invocation already dispatched is a fix-up re-open, attributed
+// fixup_redispatch on the re-record.
+func (r *runResolver) driveNewestFixupTriggeredSeq(ctx context.Context, runID uuid.UUID) (int64, error) {
+	rows, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{Category: categoryStageFixupTriggered, Limit: 500})
+	if err != nil {
+		return 0, err
+	}
+	var newest int64
+	for _, e := range rows {
+		if e.Sequence > newest {
+			newest = e.Sequence
+		}
+	}
+	return newest, nil
+}
+
+// driveHasPriorGateMergeRow reports whether a run_auto_driven act:gate
+// action:merge row already exists — the cross-invocation signal that a merge was
+// queued on an earlier invocation, so a resume seeds mergeQueued and polls for
+// the webhook-settle instead of re-calling the gate. The payload shape mirrors
+// appendRunAutoDrivenGate (backend/internal/server/autodrive_http.go).
+func (r *runResolver) driveHasPriorGateMergeRow(ctx context.Context, runID uuid.UUID) (bool, error) {
 	rows, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{Category: CategoryRunAutoDriven, Limit: 500})
 	if err != nil {
 		return false, err
@@ -571,7 +776,7 @@ func (r *runResolver) driveHasPriorDispatchRow(ctx context.Context, runID uuid.U
 		if !ok {
 			continue
 		}
-		if fields["act"] == "dispatch" && fields["stage"] == stageName {
+		if fields["act"] == "gate" && fields["action"] == driveActionMerge {
 			return true, nil
 		}
 	}
@@ -607,6 +812,14 @@ func driveDecisionActions(state string, runID uuid.UUID, workingDir string) *Nex
 			Precondition: "a must_page_human condition halted the driver",
 			Consumes:     consumesNone,
 			Reason:       "the gate was handed to you; arbitrate, then re-invoke fishhawk_drive_run",
+		}}}
+	case state == "dispatched_stale":
+		return &NextActions{State: state, Actions: []SuggestedAction{{
+			Action:       "fishhawk_dispatch_stage",
+			Params:       params,
+			Precondition: "the stage has sat in 'dispatched' beyond the runner-liveness threshold with no runner observed",
+			Consumes:     consumesNone,
+			Reason:       "confirm no runner process is live, re-dispatch the stage by hand, then re-invoke fishhawk_drive_run",
 		}}}
 	case strings.HasPrefix(state, "plan_"):
 		return &NextActions{State: state, Actions: []SuggestedAction{{

@@ -44,6 +44,13 @@ type runResolver struct {
 	// Nil uses the real spawnRunnerStageDetached; tests inject a recording
 	// spawner so the loop runs without launching a runner process.
 	driveSpawn driveSpawnFunc
+
+	// driveDispatchedStaleAfter, when non-zero, OVERRIDES the runner-liveness
+	// threshold (defaultDriveDispatchedStaleAfter) past which a stage this
+	// invocation did not spawn but that sits in 'dispatched' is treated as
+	// runner-less (dispatched_stale) rather than in-flight. Tests inject a tiny
+	// value to exercise the stale stop without a 10-minute wait.
+	driveDispatchedStaleAfter time.Duration
 }
 
 // registerTools wires every MCP tool onto srv. Called once at
