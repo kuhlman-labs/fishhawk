@@ -36,12 +36,13 @@ var (
 // endpoints the drive loop calls: GET run, GET stages, GET audit, POST
 // auto-drive, POST auto-drive/acts.
 type driveFakeBackend struct {
-	mu       sync.Mutex
-	runID    uuid.UUID
-	runState string
-	stages   []Stage
-	audit    []AuditEntry
-	seq      int64
+	mu         sync.Mutex
+	runID      uuid.UUID
+	runState   string
+	runnerKind string // GET run response runner_kind; defaults to "local"
+	stages     []Stage
+	audit      []AuditEntry
+	seq        int64
 
 	recordActErr bool // /acts returns 500 when true
 	gateErr      bool // /auto-drive returns 500 when true
@@ -60,7 +61,10 @@ type driveFakeBackend struct {
 }
 
 func newDriveFake(runState string, stages []Stage) *driveFakeBackend {
-	return &driveFakeBackend{runID: uuid.New(), runState: runState, stages: stages}
+	// runner_kind defaults to "local" — the drive verb's local-only guard
+	// requires it, so every happy-path fixture is a local run unless a test
+	// overrides runnerKind to exercise the rejection path.
+	return &driveFakeBackend{runID: uuid.New(), runState: runState, runnerKind: "local", stages: stages}
 }
 
 // driveFakeGateRule mirrors the backend's action->delegated-condition mapping
@@ -217,7 +221,7 @@ func (f *driveFakeBackend) handler() http.HandlerFunc {
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			pr := "https://github.com/x/y/pull/7"
-			_ = json.NewEncoder(w).Encode(Run{ID: f.runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: f.runState, PullRequestURL: &pr})
+			_ = json.NewEncoder(w).Encode(Run{ID: f.runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: f.runState, RunnerKind: f.runnerKind, PullRequestURL: &pr})
 		}
 	}
 }
@@ -354,6 +358,51 @@ func actOrAction(m map[string]any) string {
 		return m["stage"].(string)
 	}
 	return m["action"].(string)
+}
+
+// --- (a2) non-local runner_kind -> rejected, NEVER records or spawns --------
+
+func TestDriveRun_NonLocalRunnerKind_Rejected(t *testing.T) {
+	// The drive verb is local-only (ADR-024): it records + host-spawns a LOCAL
+	// runner for every dispatchable stage. A run whose runner_kind is NOT 'local'
+	// must be rejected BEFORE anything reaches the record-act / composeRunnerArgv
+	// / spawn seam — otherwise a github_actions (or unset) run expands the host
+	// code-execution surface. The plan stage is 'pending' (dispatchable), so a
+	// missing guard would record + spawn it.
+	for _, kind := range []string{"github_actions", ""} {
+		t.Run("kind="+kind, func(t *testing.T) {
+			f := newDriveFake("running", []Stage{
+				stg(drivePlanID, "plan", "pending", 0),
+				stg(driveImplID, "implement", "blocked", 1),
+			})
+			f.runnerKind = kind
+			f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+			rec := &spawnRecorder{}
+			r, srv := newDriveResolver(t, f, rec)
+			defer srv.Close()
+
+			_, _, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+			if err == nil {
+				t.Fatalf("driveRun on a runner_kind=%q run returned no error; want a local-only rejection", kind)
+			}
+			if !strings.Contains(err.Error(), "local-only") {
+				t.Errorf("rejection error = %q, want it to name the local-only constraint", err.Error())
+			}
+			if got := rec.list(); len(got) != 0 {
+				t.Fatalf("driver spawned a stage on a non-local run: %v", got)
+			}
+			f.mu.Lock()
+			nActs := len(f.recordedActs)
+			gateCalls := f.gateCalls
+			f.mu.Unlock()
+			if nActs != 0 {
+				t.Errorf("driver recorded %d acts on a non-local run; want 0 (rejected before record)", nActs)
+			}
+			if gateCalls != 0 {
+				t.Errorf("driver called the gate %d times on a non-local run; want 0", gateCalls)
+			}
+		})
+	}
 }
 
 // --- (b) record-act failure -> unrecorded_act, NO spawn ---------------------

@@ -61,6 +61,14 @@ const (
 // thin local-copy rule).
 const driveActionMerge = "merge"
 
+// driveRunnerKindLocal is the only runner_kind fishhawk_drive_run will act on.
+// The verb records + host-spawns a LOCAL runner for every dispatchable stage
+// (local-only by design, ADR-024), so a non-local run must be rejected BEFORE
+// any record/spawn reaches composeRunnerArgv — the run's persisted runner_kind
+// is materialized non-empty by the backend (empty → github_actions), so a
+// strict positive "== local" check is fail-closed against every other value.
+const driveRunnerKindLocal = "local"
+
 // DriveRunInput is the fishhawk_drive_run tool's input (#1700).
 type DriveRunInput struct {
 	RunID        string `json:"run_id" jsonschema:"Fishhawk run UUID; the local runner_kind:local run to drive between human gates"`
@@ -215,6 +223,23 @@ func (r *runResolver) driveRun(ctx context.Context, _ *mcp.CallToolRequest, in D
 		runRow, gerr := r.api.GetRun(ctx, runUUID)
 		if gerr != nil {
 			return nil, out, fmt.Errorf("drive: get run: %w", gerr)
+		}
+		// Local-only guard (authz): the drive loop records + host-spawns a LOCAL
+		// runner for every dispatchable stage, so a run whose runner_kind is not
+		// 'local' must be rejected BEFORE anything reaches the record-act /
+		// composeRunnerArgv / spawn seam — no non-local run may expand the host
+		// code-execution surface. This is a permanent misuse (a github_actions run
+		// never becomes local), so it fails loud as an error rather than a
+		// resumable stopped_reason. Checked every iteration but returns on the
+		// first, so a runner_kind that somehow flips mid-drive is also caught.
+		if runRow.RunnerKind != driveRunnerKindLocal {
+			kind := runRow.RunnerKind
+			if kind == "" {
+				kind = "github_actions" // backend default when unset
+			}
+			return nil, DriveRunOutput{}, fmt.Errorf(
+				"run %s is runner_kind=%s, but fishhawk_drive_run is local-only (ADR-024): it records and host-spawns a LOCAL runner for every stage. To drive a run from the operator host, start a NEW run with runner_kind=local; a github_actions run executes through the Actions workflow channel",
+				runUUID, kind)
 		}
 		out.RunState = runRow.State
 		if runStateIsTerminal(runRow.State) {
