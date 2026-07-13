@@ -5,8 +5,40 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
+
+// decomposedRepo layers a controllable ListRuns over memRepo so the
+// decomposed-parent detection in RetryStage (#1891) can be exercised.
+// memRepo (failure_test.go) returns an error from ListRuns, so a fake
+// that resolves DecomposedFrom to a concrete result is needed to model a
+// parent-with-children.
+type decomposedRepo struct {
+	*memRepo
+	children []*run.Run
+	listErr  error
+}
+
+func (d *decomposedRepo) ListRuns(_ context.Context, _ run.ListRunsFilter) ([]*run.Run, error) {
+	if d.listErr != nil {
+		return nil, d.listErr
+	}
+	return d.children, nil
+}
+
+// failedImplementStage builds a failed IMPLEMENT stage (newStage defaults
+// to a plan stage) with the given category so the decomposed-parent branch,
+// which is gated on StageTypeImplement, is reachable.
+func failedImplementStage(t *testing.T, cat run.FailureCategory, reason string) *run.Stage {
+	t.Helper()
+	s := newStage(run.StageStateFailed)
+	s.Type = run.StageTypeImplement
+	s.FailureCategory = &cat
+	s.FailureReason = &reason
+	return s
+}
 
 // memRepo from failure_test.go satisfies run.Repository for the
 // retry-helper tests too. Reuses the same fixture builder.
@@ -135,6 +167,104 @@ func TestRetryStage_CTransitionsToPending(t *testing.T) {
 	}
 	if dec.Stage.State != run.StageStatePending {
 		t.Errorf("post-retry state = %q, want pending", dec.Stage.State)
+	}
+}
+
+// #1891: retrying a failed implement stage whose run is a decomposition
+// PARENT (it has children) restores the awaiting_children fan-in park
+// instead of re-opening to pending, so the childcompletion sweeper and
+// /consolidate re-engage rather than a doomed runner spawning.
+func TestRetryStage_DecomposedParentCRestoresAwaitingChildren(t *testing.T) {
+	stage := failedImplementStage(t, run.FailureC, "dispatch_watchdog: 70m elapsed (deadline 60m)")
+	repo := &decomposedRepo{memRepo: newMemRepo(stage), children: []*run.Run{{ID: uuid.New()}}}
+
+	dec, err := run.RetryStage(context.Background(), repo, stage.ID, run.RetryOptions{})
+	if err != nil {
+		t.Fatalf("RetryStage: %v", err)
+	}
+	if dec.Stage.State != run.StageStateAwaitingChildren {
+		t.Errorf("post-retry state = %q, want awaiting_children", dec.Stage.State)
+	}
+	if dec.Stage.FailureCategory != nil || dec.Stage.FailureReason != nil {
+		t.Errorf("post-retry stage still carries failure metadata: %+v", dec.Stage)
+	}
+}
+
+// #1891: a standalone (non-decomposed) implement stage — its run has no
+// children — still re-opens to pending. Regression lock: the awaiting_children
+// restore must fire ONLY for a genuine decomposed parent.
+func TestRetryStage_StandaloneImplementStillPending(t *testing.T) {
+	stage := failedImplementStage(t, run.FailureA, "agent crashed: SIGSEGV")
+	repo := &decomposedRepo{memRepo: newMemRepo(stage), children: nil}
+
+	dec, err := run.RetryStage(context.Background(), repo, stage.ID, run.RetryOptions{})
+	if err != nil {
+		t.Fatalf("RetryStage: %v", err)
+	}
+	if dec.Stage.State != run.StageStatePending {
+		t.Errorf("post-retry state = %q, want pending", dec.Stage.State)
+	}
+}
+
+// #1891: a ListRuns read error fails the retry CLOSED — defaulting to
+// pending would recreate the very bug (a doomed re-dispatch + suppressed
+// sweeper) the fix prevents.
+func TestRetryStage_DecomposedDetectListRunsErrorFailsClosed(t *testing.T) {
+	stage := failedImplementStage(t, run.FailureC, "infra timeout")
+	sentinel := errors.New("boom: list runs unavailable")
+	repo := &decomposedRepo{memRepo: newMemRepo(stage), listErr: sentinel}
+
+	_, err := run.RetryStage(context.Background(), repo, stage.ID, run.RetryOptions{})
+	if err == nil {
+		t.Fatal("RetryStage: want error on ListRuns failure, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("err = %v, want wrapped %v", err, sentinel)
+	}
+	// The stage must NOT have been retried on a fail-closed read error.
+	cur, gerr := repo.GetStage(context.Background(), stage.ID)
+	if gerr != nil {
+		t.Fatalf("GetStage: %v", gerr)
+	}
+	if cur.State != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed (retry must not have fired)", cur.State)
+	}
+}
+
+// #1891: a category-B OVERRIDE on a decomposed parent also restores the
+// fan-in park (the override rides the same pending path the decomposed
+// detection intercepts), not pending.
+func TestRetryStage_DecomposedParentBOverrideRestoresAwaitingChildren(t *testing.T) {
+	stage := failedImplementStage(t, run.FailureB, "forbidden_paths violated")
+	repo := &decomposedRepo{memRepo: newMemRepo(stage), children: []*run.Run{{ID: uuid.New()}}}
+
+	dec, err := run.RetryStage(context.Background(), repo, stage.ID, run.RetryOptions{OverrideB: true})
+	if err != nil {
+		t.Fatalf("RetryStage with OverrideB: %v", err)
+	}
+	if !dec.Overridden {
+		t.Error("dec.Overridden = false, want true for a B override")
+	}
+	if dec.Stage.State != run.StageStateAwaitingChildren {
+		t.Errorf("post-override state = %q, want awaiting_children", dec.Stage.State)
+	}
+}
+
+// #1891: the decomposed detection is gated on target==pending, so a
+// D-timeout retry (target awaiting_approval) is untouched even for a
+// decomposed parent — it never consults ListRuns.
+func TestRetryStage_DecomposedParentDTimeoutUnchanged(t *testing.T) {
+	stage := failedImplementStage(t, run.FailureD, "sla_timeout: 5h elapsed (deadline 4h)")
+	// listErr set: if the D-timeout path wrongly consulted ListRuns it would
+	// fail closed here, so a clean awaiting_approval proves the branch is skipped.
+	repo := &decomposedRepo{memRepo: newMemRepo(stage), listErr: errors.New("must not be called")}
+
+	dec, err := run.RetryStage(context.Background(), repo, stage.ID, run.RetryOptions{})
+	if err != nil {
+		t.Fatalf("RetryStage: %v", err)
+	}
+	if dec.Stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("post-retry state = %q, want awaiting_approval", dec.Stage.State)
 	}
 }
 

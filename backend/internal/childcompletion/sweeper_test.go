@@ -472,6 +472,67 @@ func TestTick_Integrate_CleanIntegrationResolvesSucceeded(t *testing.T) {
 	}
 }
 
+// TestTick_RetryRestoredParkReEngagesFanIn is the #1891 done-means test: it
+// proves that a decomposed-parent implement stage RESTORED to awaiting_children
+// by run.RetryStage (rather than left failed / mis-restored to pending) is
+// actually re-swept by the fan-in path — the observable that a state-string-only
+// change would NOT prove. The retry fix targets awaiting_children precisely so
+// the stage re-appears in ListStagesAwaitingChildren; this test seeds exactly
+// that restored park with a late-completing child (the wave-1 child that never
+// got a fan-in attempt while the park was destroyed) now terminal-succeeded, and
+// asserts Tick integrates the slices and resolves the parent + advances. Had the
+// retry mis-restored the stage to pending or left it failed, it would never
+// appear in the awaiting_children list and this sweep could never fire.
+func TestTick_RetryRestoredParkReEngagesFanIn(t *testing.T) {
+	parentRun := uuid.New()
+	// The parent stage AS RESTORED by run.RetryStage: awaiting_children, no
+	// lingering failure metadata (RetryStage clears it).
+	parentStage := &run.Stage{
+		ID:    uuid.New(),
+		RunID: parentRun,
+		Type:  run.StageTypeImplement,
+		State: run.StageStateAwaitingChildren,
+	}
+	// The late-completing wave-1 child, now terminal-succeeded.
+	lateChild := uuid.New()
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{
+			parentRun: {
+				mkChild(lateChild, run.StateSucceeded),
+				mkChild(uuid.New(), run.StateSucceeded),
+			},
+		},
+	}
+	au := &fakeAudit{}
+	ad := &recordingAdvancer{}
+	integ := &recordingIntegrator{} // clean, idempotent fan-in
+	s := &Sweeper{Runs: rs, Audit: au, Advance: ad, Integrate: integ, Logger: slog.Default()}
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	// The restored park was swept: fan-in ran for this parent...
+	integ.mu.Lock()
+	if len(integ.called) != 1 || integ.called[0] != parentRun {
+		t.Errorf("IntegrateSlices called = %v, want [%s] (restored park must re-engage fan-in)", integ.called, parentRun)
+	}
+	integ.mu.Unlock()
+
+	// ...the parent stage resolved succeeded...
+	rs.mu.Lock()
+	if len(rs.transitions) != 1 || rs.transitions[0].To != run.StageStateSucceeded {
+		t.Fatalf("transitions = %v, want one to succeeded (restored park resolved)", rs.transitions)
+	}
+	rs.mu.Unlock()
+
+	// ...and the parent run was advanced to its next stage.
+	if len(ad.advanced) != 1 || ad.advanced[0] != parentRun {
+		t.Errorf("Advance calls = %v, want [%s] (fan-in re-engaged after retry restore)", ad.advanced, parentRun)
+	}
+}
+
 func TestTick_Integrate_ConflictFailsParentBNoAdvance(t *testing.T) {
 	parentRun := uuid.New()
 	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}

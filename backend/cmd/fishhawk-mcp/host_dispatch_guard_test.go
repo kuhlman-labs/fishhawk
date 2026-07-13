@@ -229,6 +229,41 @@ func TestGuardSiblingInFlight_AllSettled_Allows(t *testing.T) {
 	}
 }
 
+// The TARGET stage itself parked "awaiting_children" is BLOCKED (#1891): it is
+// a decomposed parent's implement stage waiting on its child slices; spawning a
+// runner here 409s and the reaper report would destroy the park. The refusal
+// must name fishhawk_run_children / fishhawk_consolidate_slices.
+func TestGuardSiblingInFlight_TargetAwaitingChildren_Blocks(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	targetID := uuid.NewString()
+	siblingID := uuid.NewString()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: siblingID, RunID: runID.String(), Type: "plan", State: "succeeded"},
+		{ID: targetID, RunID: runID.String(), Type: "implement", State: "awaiting_children"},
+	}
+
+	warnings, err := r.guardSiblingStageInFlight(context.Background(), runID, targetID)
+	if err == nil {
+		t.Fatal("expected a block error when the target stage is parked awaiting_children")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "awaiting_children") {
+		t.Errorf("error must name the awaiting_children park: %v", err)
+	}
+	if !strings.Contains(msg, "fishhawk_run_children") {
+		t.Errorf("error must name fishhawk_run_children as the correct verb: %v", err)
+	}
+	if !strings.Contains(msg, "fishhawk_consolidate_slices") {
+		t.Errorf("error must name fishhawk_consolidate_slices for the final fan-in: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("a hard block carries no warnings, got %v", warnings)
+	}
+}
+
 // A stage-list read error FAILS OPEN: nil error + a warning, mirroring the
 // #1355 guardHostDispatch posture (the multi-key Verify fix is the backstop).
 func TestGuardSiblingInFlight_ListError_FailsOpen(t *testing.T) {

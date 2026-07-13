@@ -66,6 +66,18 @@ type retryRequest struct {
 //	C (infrastructure)           → 200; same flow as A — fresh
 //	                               runner instance with a fresh
 //	                               signing key.
+//	A/C on a decomposed PARENT   → 200; failed → awaiting_children
+//	                               (#1891). When the retried stage is an
+//	                               implement stage whose run has children,
+//	                               run.RetryStage restores the fan-in park
+//	                               instead of pending, so the childcompletion
+//	                               sweeper and /consolidate re-engage. The
+//	                               orchestrator dispatch handoff below does
+//	                               NOT fire (it is gated on the pending
+//	                               re-open); the run is still un-terminalled
+//	                               failed → running so a later sweeper Advance
+//	                               is effective. Response + stage_retried audit
+//	                               reflect awaiting_children.
 //	D, sla_timeout sub-reason    → 200; failed → awaiting_approval,
 //	                               failure metadata cleared,
 //	                               updated_at trigger restarts the
@@ -456,6 +468,15 @@ type retryActionParams struct {
 // the identical path and stamp identical audit. run.RetryStage's sentinel
 // errors are returned verbatim for the caller to map; every post-transition
 // step is best-effort exactly as in the prior inline handler.
+//
+// Decomposed-parent restore (#1891): when run.RetryStage restores a failed
+// implement stage whose run has children to awaiting_children (rather than
+// pending), the orchestrator dispatch handoff below is a no-op — it is gated
+// on dec.Stage.State == pending, which the restore intentionally skips, so no
+// runner is dispatched against the parent. The failed → running run reopen is
+// gated on run state (not the stage target) so it STILL fires, keeping the
+// childcompletion sweeper's later Advance effective; the recordDriveRetryStage
+// stamp is likewise gated on the pending re-open shape and so does not fire.
 func (s *Server) retryStageAs(ctx context.Context, id Identity, p retryActionParams) (*run.Stage, error) {
 	// Enforce the retry gate's write scope on the acting identity (write:stages
 	// OR write:retries, matching the handler's inline check). A no-op on the HTTP

@@ -193,6 +193,13 @@ func implementFailureMatches(stages []*Stage, pred func(FailureCategory, string)
 // for the caller to put in the audit entry. On a non-retriable
 // case returns ErrRetryNotApplicable.
 //
+// Decomposed-parent exception (#1891): when the retried stage is an
+// implement stage whose run is a decomposition PARENT (it has children),
+// the A/C target is awaiting_children rather than pending — restoring the
+// fan-in park so the childcompletion sweeper and /consolidate re-engage,
+// instead of spawning a doomed runner. The detection issues one ListRuns
+// on DecomposedFrom; a read error fails the retry closed.
+//
 // The orchestrator handoff for A/C lives in the handler, not here:
 // run depends on nothing external; orchestrator depends on run.
 // Inverting that would create a cycle.
@@ -267,6 +274,28 @@ func RetryStage(ctx context.Context, repo Repository, stageID uuid.UUID, opts Re
 	target := StageStatePending
 	if priorCat == FailureD {
 		target = StageStateAwaitingApproval
+	}
+
+	// Decomposed-parent restore (#1891). A failed implement stage whose run
+	// is a decomposition PARENT (it has children) must NOT re-open to pending
+	// — that would spawn a doomed runner AND permanently suppress the
+	// childcompletion sweeper, which lists only awaiting_children stages, so
+	// fan-in could never re-engage and /consolidate would 409
+	// not_awaiting_children. Restore the fan-in park instead: target
+	// awaiting_children so the sweeper's existing all-terminal + idempotent
+	// IntegrateSlices path re-drives late-completing children. This only
+	// applies to the A/C (and B-override) pending path; the D-timeout
+	// awaiting_approval target is left untouched (a parked gate, not a park
+	// on children). A ListRuns error fails the retry CLOSED — defaulting to
+	// pending would recreate the very bug this fixes.
+	if target == StageStatePending && stage.Type == StageTypeImplement {
+		children, err := repo.ListRuns(ctx, ListRunsFilter{DecomposedFrom: &stage.RunID, Limit: 1})
+		if err != nil {
+			return nil, fmt.Errorf("RetryStage: detect decomposed parent: %w", err)
+		}
+		if len(children) > 0 {
+			target = StageStateAwaitingChildren
+		}
 	}
 	updated, err := repo.RetryStage(ctx, stageID, target)
 	if err != nil {

@@ -15116,3 +15116,129 @@ func TestRun_AgentVersionUncomparable_Proceeds(t *testing.T) {
 		t.Errorf("unexpected agent_version_mismatch for an unprobeable version:\n%s", stderr.String())
 	}
 }
+
+// --- child-push files_changed base selection (#1891) -------------------------
+
+// childPushBaseRepo builds a real git repo modelling the #1891 scenario: an
+// initial commit is the slice's cut point (returned as cutSHA), the base branch
+// "main" then ADVANCES past it with an orthogonal file, and a slice branch cut
+// from the cut point commits the child's own new files. It returns the repo dir
+// and the cut-point SHA so a test can diff the staged child tree against either
+// base and observe the counts diverge.
+func childPushBaseRepo(t *testing.T) (repoDir, cutSHA string) {
+	t.Helper()
+	repo, runGit := compileGateRepo(t)
+
+	// Cut point: the base as the slice was branched from it.
+	if err := os.WriteFile(filepath.Join(repo, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write base.txt: %v", err)
+	}
+	runGit("add", "base.txt")
+	runGit("commit", "-m", "base cut point")
+	out, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("rev-parse cut point: %v", err)
+	}
+	cutSHA = strings.TrimSpace(string(out))
+
+	// Advance main PAST the cut point with an orthogonal file the child never
+	// touches — this is the sibling-consolidation advance that inflates a
+	// baseRef-based count with a phantom deletion.
+	if err := os.WriteFile(filepath.Join(repo, "advanced.txt"), []byte("advanced\n"), 0o644); err != nil {
+		t.Fatalf("write advanced.txt: %v", err)
+	}
+	runGit("add", "advanced.txt")
+	runGit("commit", "-m", "main advances past the cut point")
+
+	// Slice branch cut from the cut point; commit the child's own new files so
+	// the staged index (== child HEAD tree) carries exactly two new files vs the
+	// cut point.
+	runGit("checkout", "-b", "fishhawk/run-aaaa/slice-0", cutSHA)
+	for _, f := range []string{"child1.txt", "child2.txt"} {
+		if err := os.WriteFile(filepath.Join(repo, f), []byte("child\n"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", f, err)
+		}
+	}
+	runGit("add", "child1.txt", "child2.txt")
+	runGit("commit", "-m", "child slice work")
+	return repo, cutSHA
+}
+
+// TestChildPushFilesChanged_MeasuredAgainstCapBaseSHA is the #1891 done-means:
+// the child-push files_changed_count is computed against the pushed commit's own
+// recorded base (cap.BaseSHA / the cut point), NOT the workflow base-branch
+// label baseRef ("main", advanced past the cut). The base advance makes the two
+// counts diverge (main adds a phantom deletion of advanced.txt), so a wrong-base
+// computation yields a different number and this test fails on it. It also
+// proves `git diff --cached <raw SHA>` accepts a raw commit SHA as the base.
+func TestChildPushFilesChanged_MeasuredAgainstCapBaseSHA(t *testing.T) {
+	repo, cutSHA := childPushBaseRepo(t)
+	ctx := context.Background()
+
+	// Reference counts computed directly, so the assertion is not hard-coded to
+	// the fixture's exact file layout.
+	againstCut, err := (&gitdiff.Runner{}).Run(ctx, cutSHA, repo)
+	if err != nil {
+		t.Fatalf("diff against cut point: %v", err)
+	}
+	againstMain, err := (&gitdiff.Runner{}).Run(ctx, "main", repo)
+	if err != nil {
+		t.Fatalf("diff against main: %v", err)
+	}
+	wantCut := len(againstCut.ChangedFiles)
+	wantMain := len(againstMain.ChangedFiles)
+	if wantCut == wantMain {
+		t.Fatalf("fixture invalid: base advance did not diverge the counts (cut=%d main=%d)", wantCut, wantMain)
+	}
+
+	var logSink strings.Builder
+	got := childPushFilesChanged(ctx, cutSHA, "main", repo, "run-1", "stage-1", &logSink)
+	if got != wantCut {
+		t.Errorf("filesChanged = %d, want %d (measured against cap.BaseSHA, the cut point)", got, wantCut)
+	}
+	if got == wantMain {
+		t.Errorf("filesChanged = %d equals the baseRef(main) count; the wrong base was used", got)
+	}
+}
+
+// TestChildPushFilesChanged_EmptyBaseSHAFallsBackToBaseRef pins the fallback
+// branch: an empty cap.BaseSHA falls back to the workflow base-branch label
+// baseRef ("main"), so the count matches a diff against main.
+func TestChildPushFilesChanged_EmptyBaseSHAFallsBackToBaseRef(t *testing.T) {
+	repo, _ := childPushBaseRepo(t)
+	ctx := context.Background()
+
+	againstMain, err := (&gitdiff.Runner{}).Run(ctx, "main", repo)
+	if err != nil {
+		t.Fatalf("diff against main: %v", err)
+	}
+	wantMain := len(againstMain.ChangedFiles)
+
+	var logSink strings.Builder
+	got := childPushFilesChanged(ctx, "", "main", repo, "run-1", "stage-1", &logSink)
+	if got != wantMain {
+		t.Errorf("filesChanged = %d, want %d (empty BaseSHA must fall back to baseRef)", got, wantMain)
+	}
+}
+
+// TestChildPushFilesChanged_DiffErrorReturnsZeroAndLogs pins the error branch: a
+// diff against an unresolvable base returns 0 and emits a
+// child_push_files_changed_unavailable event naming the base used.
+func TestChildPushFilesChanged_DiffErrorReturnsZeroAndLogs(t *testing.T) {
+	repo, _ := childPushBaseRepo(t)
+	ctx := context.Background()
+
+	const badBase = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+	var logSink strings.Builder
+	got := childPushFilesChanged(ctx, badBase, "main", repo, "run-1", "stage-1", &logSink)
+	if got != 0 {
+		t.Errorf("filesChanged = %d, want 0 on a diff error", got)
+	}
+	log := logSink.String()
+	if !strings.Contains(log, `"event":"child_push_files_changed_unavailable"`) {
+		t.Errorf("missing unavailable event:\n%s", log)
+	}
+	if !strings.Contains(log, badBase) {
+		t.Errorf("event must name the base used (%s):\n%s", badBase, log)
+	}
+}

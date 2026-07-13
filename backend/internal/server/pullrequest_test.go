@@ -596,16 +596,31 @@ func TestShipPullRequest_ChildPushOutcome_DrivesChildTerminal(t *testing.T) {
 	if gotRun.PullRequestURL != nil {
 		t.Errorf("run.PullRequestURL = %q, want nil (parent opens the consolidated PR)", *gotRun.PullRequestURL)
 	}
+	// Binding approval condition (2) of #1891: the persisted child_pushed audit
+	// row must carry the reported files_changed_count — asserting the value
+	// through the persistence path (succeedChildPushStage), not only the
+	// runner's outbound value. The runner-side fix computes this count against
+	// cap.BaseSHA; here we prove the handler faithfully persists whatever the
+	// report carried (files_changed_count: 3 above).
 	au.mu.Lock()
 	defer au.mu.Unlock()
-	var found bool
-	for _, e := range au.appended {
-		if e.Category == "child_pushed" {
-			found = true
+	var childPushed *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "child_pushed" {
+			childPushed = &au.appended[i]
 		}
 	}
-	if !found {
-		t.Error("no child_pushed audit entry recorded")
+	if childPushed == nil {
+		t.Fatal("no child_pushed audit entry recorded")
+	}
+	var payload struct {
+		FilesChangedCount int `json:"files_changed_count"`
+	}
+	if err := json.Unmarshal(childPushed.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal child_pushed payload: %v", err)
+	}
+	if payload.FilesChangedCount != 3 {
+		t.Errorf("child_pushed audit files_changed_count = %d, want 3 (the reported count must be persisted)", payload.FilesChangedCount)
 	}
 }
 

@@ -235,6 +235,26 @@ func TestFailedToSucceededLeaksOnlyThroughRecovery(t *testing.T) {
 	}
 }
 
+// TestStageRetryDecomposedParentEdge pins the #1891 retry edge: the
+// decomposed-parent restore target failed → awaiting_children is reachable
+// ONLY through the retry table, never through the base machine (which would
+// let any ordinary caller un-fail a stage back onto its children).
+func TestStageRetryDecomposedParentEdge(t *testing.T) {
+	if !ValidStageRetryTransition(StageStateFailed, StageStateAwaitingChildren) {
+		t.Error("ValidStageRetryTransition must admit failed → awaiting_children (the #1891 decomposed-parent restore edge)")
+	}
+	if ValidStageTransition(StageStateFailed, StageStateAwaitingChildren) {
+		t.Error("ValidStageTransition admits failed → awaiting_children; the base machine must not (the edge belongs to the retry table only)")
+	}
+	// The two pre-existing retry edges stay admitted.
+	if !ValidStageRetryTransition(StageStateFailed, StageStatePending) {
+		t.Error("ValidStageRetryTransition must still admit failed → pending (A/C retry)")
+	}
+	if !ValidStageRetryTransition(StageStateFailed, StageStateAwaitingApproval) {
+		t.Error("ValidStageRetryTransition must still admit failed → awaiting_approval (D-timeout retry)")
+	}
+}
+
 // TestStageReviseTransitions pins the dedicated plan-revise edge (#1099):
 // the validator admits ONLY awaiting_approval → pending, and the base
 // stageTransitions machine must NOT admit that edge (so the revise re-open

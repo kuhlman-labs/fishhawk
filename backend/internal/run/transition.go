@@ -191,7 +191,7 @@ func ValidStageTransition(from, to StageState) bool {
 // off the normal state machine — moves out of a terminal state
 // that the regular ValidStageTransition refuses.
 //
-// Two retry paths live here:
+// Three retry paths live here:
 //
 //   - failed → awaiting_approval is the D-timeout retry: the SLA
 //     elapsed but no plan needs to be regenerated, just re-open
@@ -201,6 +201,14 @@ func ValidStageTransition(from, to StageState) bool {
 //     a fresh dispatch. The handler hands off to the orchestrator
 //     after the transition; the orchestrator walks pending →
 //     dispatched and fires workflow_dispatch.
+//   - failed → awaiting_children is the decomposed-parent A/C retry
+//     (#1891): retrying a failed implement stage that is a decomposition
+//     PARENT (its run has children) must restore the fan-in park, NOT
+//     re-dispatch a runner. Targeting pending would permanently suppress
+//     the childcompletion sweeper (it lists only awaiting_children stages)
+//     and 409 every /consolidate. run.RetryStage selects this target only
+//     for a decomposed parent; the sweeper's existing all-terminal +
+//     idempotent IntegrateSlices path then re-engages fan-in.
 //
 // B and D-rejected are deliberately not retriable — the spec or
 // the approver said no, the answer doesn't change without a fresh
@@ -209,6 +217,7 @@ var stageRetryTransitions = map[StageState]map[StageState]struct{}{
 	StageStateFailed: {
 		StageStateAwaitingApproval: {},
 		StageStatePending:          {},
+		StageStateAwaitingChildren: {},
 	},
 }
 
