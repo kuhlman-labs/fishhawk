@@ -2081,7 +2081,21 @@ func TestCommitAndPush_FreshFetchBase_ForceWithLease_AbsentRefPlainPush(t *testi
 		t.Fatal(err)
 	}
 
-	p := &Pusher{}
+	// Capture the actual push invocation. The branch-created outcome alone does
+	// NOT establish the plain-push contract — it would pass even if a bare
+	// --force-with-lease had been added (a create cannot be non-fast-forward, so
+	// git accepts the push either way). The load-bearing assertion is on the push
+	// FLAGS: an absent remote ref must be pushed PLAIN, because observeRemoteHead
+	// returns "" and binding a lease to a to-be-created ref is meaningless.
+	var pushArgs []string
+	p := &Pusher{
+		Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			if len(args) > 0 && args[0] == "push" {
+				pushArgs = append([]string(nil), args...)
+			}
+			return exec.CommandContext(ctx, name, args...)
+		},
+	}
 	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
 		RepoDir:        repo,
 		Branch:         branch,
@@ -2094,9 +2108,113 @@ func TestCommitAndPush_FreshFetchBase_ForceWithLease_AbsentRefPlainPush(t *testi
 		t.Fatalf("CommitAndPush (FreshFetchBase+ForceWithLease, absent ref): %v", err)
 	}
 
+	// The push must have run and carried NO --force-with-lease flag.
+	if pushArgs == nil {
+		t.Fatal("push was never invoked")
+	}
+	for _, a := range pushArgs {
+		if strings.HasPrefix(a, "--force-with-lease") {
+			t.Errorf("absent-ref push must be plain; got lease flag %q in push args %v", a, pushArgs)
+		}
+	}
+
 	got := mustGitOut(t, repo, "--git-dir="+bare, "rev-parse", branch)
 	if got != res.HeadSHA {
 		t.Errorf("bare branch sha = %q, want new HeadSHA %q (branch created by plain push)", got, res.HeadSHA)
+	}
+}
+
+// TestCommitAndPush_FreshFetchBase_ForceWithLease_MovedRefFailsLease pins the
+// load-bearing safety property of the #1872 lease binding: the lease is bound to
+// the SHA observeRemoteHead observed, so a remote ref that MOVED between the
+// ls-remote observation and the push (the live remote head no longer equals the
+// observed value) must FAIL the lease and the push must fail loud rather than
+// blindly overwriting. Without it the sole-writer overwrite silently degrades to
+// an unconditional --force, and a regression weakening the lease to a plain
+// --force would pass every other test in this suite. The move is simulated (per
+// the concern's own suggestion) by intercepting the ls-remote observation to
+// report a STALE SHA differing from the branch's real remote head; git then
+// rejects --force-with-lease=<branch>:<staleObserved> because the live ref does
+// not match. A plain-force regression would let this push succeed and overwrite
+// the remote head, tripping this test.
+func TestCommitAndPush_FreshFetchBase_ForceWithLease_MovedRefFailsLease(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	const branch = "fishhawk/run-1872/stage-moved"
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+	authoritativeTip := mustGitOut(t, repo, "rev-parse", "HEAD")
+
+	// The run branch's REAL current head on the remote (a prior partial ship),
+	// pushed via URL so no local tracking ref exists (the FreshFetchBase case
+	// that routes through observeRemoteHead).
+	if err := os.WriteFile(filepath.Join(repo, "stale.txt"), []byte("prior ship\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "prior ship")
+	realRemoteHead := mustGitOut(t, repo, "rev-parse", "HEAD")
+	mustGit(t, repo, "push", bare, "HEAD:"+branch)
+
+	// Return to the authoritative base and make the agent edit.
+	mustGit(t, repo, "reset", "--hard", authoritativeTip)
+	if err := os.WriteFile(filepath.Join(repo, "agent.txt"), []byte("agent edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the ref moving after observation: the lease observation reports a
+	// STALE SHA (authoritativeTip, a real but different commit) that no longer
+	// equals the branch's live remote head (realRemoteHead), so the bound
+	// --force-with-lease must reject. observeRemoteHead parses the leading field,
+	// so a space-separated `<sha> refs/heads/<branch>` line is sufficient.
+	p := &Pusher{
+		Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			if len(args) > 0 && args[0] == "ls-remote" {
+				return exec.CommandContext(ctx, "printf", "%s refs/heads/%s\n", authoritativeTip, branch)
+			}
+			return exec.CommandContext(ctx, name, args...)
+		},
+	}
+	_, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         branch,
+		CommitMessage:  "standalone re-ship over a moved ref",
+		RemoteURL:      bare,
+		FreshFetchBase: "main",
+		ForceWithLease: true,
+	})
+
+	// The push must fail loud — the lease bound to the stale observed value
+	// rejects because the live remote head moved.
+	if err == nil {
+		t.Fatal("CommitAndPush must fail: a lease bound to a stale observed SHA must reject a moved remote ref")
+	}
+	if !strings.Contains(err.Error(), "push") {
+		t.Errorf("error %q must surface the failed push", err.Error())
+	}
+
+	// The remote head must be UNCHANGED — the rejected push overwrote nothing.
+	got := mustGitOut(t, repo, "--git-dir="+bare, "rev-parse", branch)
+	if got != realRemoteHead {
+		t.Errorf("remote branch sha = %q, want unchanged %q (lease must block the overwrite)", got, realRemoteHead)
 	}
 }
 
