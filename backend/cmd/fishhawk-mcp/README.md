@@ -120,6 +120,10 @@ claude mcp add fishhawk --command /usr/local/bin/fishhawk-mcp \
   --env FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN
 ```
 
+## Surviving rebuilds (`fishhawk-mcp-shim`)
+
+Claude Code does not reconnect a restarted stdio MCP server, so a local `scripts/dev reload` that rebuilds this binary leaves the live session on the old code until the operator runs `/mcp` by hand. To survive rebuilds under a live session, register the [`fishhawk-mcp-shim`](../fishhawk-mcp-shim/) supervisor instead of this binary directly: it spawns `fishhawk-mcp` as a child, watches the child binary for a content change, and hot-swaps it in place (replaying the handshake and synthesizing `notifications/tools/list_changed`) with no manual reconnect. Details, flags, and the accepted residuals are in the [shim README](../fishhawk-mcp-shim/README.md) (ADR-060 / #1921); the `scripts/dev` wiring is #1922.
+
 ## Release pipeline
 
 `.github/workflows/mcp-release.yml` (E19.7 / #347) — triggered by `mcp/v*` tags. Re-runs lint + tests at the tag commit, cross-builds the four-platform matrix with CGO disabled, generates an SPDX-JSON SBOM, signs `SHA256SUMS` with cosign keyless, publishes the GitHub Release.
