@@ -626,10 +626,15 @@ func initRepoWithOrigin(t *testing.T) (operator, tipSHA string) {
 	must(seed, "branch", "-M", "main")
 	bare := filepath.Join(t.TempDir(), "origin.git")
 	must(seed, "init", "--bare", "-q", bare)
+	// `git init --bare` seeds the bare repo's HEAD from init.defaultBranch,
+	// which is still `master` on CI's git. Point it at `main` so the clone's
+	// origin/HEAD resolves and `git rev-parse HEAD` succeeds on the checkout
+	// (older-git CI otherwise clones a dangling HEAD → exit 128).
+	must(bare, "symbolic-ref", "HEAD", "refs/heads/main")
 	must(seed, "remote", "add", "origin", bare)
 	must(seed, "push", "-q", "origin", "main")
 	operator = filepath.Join(t.TempDir(), "operator")
-	must(seed, "clone", "-q", bare, operator)
+	must(seed, "clone", "-q", "-b", "main", bare, operator)
 	var err error
 	tipSHA, err = runGitOut(operator, "rev-parse", "HEAD")
 	if err != nil {
