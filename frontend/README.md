@@ -79,7 +79,7 @@ Routes: `/runs` (`src/routes/runs.tsx`) → `/runs/:id`
   artifact's `content` to `<PlanDocument>`.
 - `implement` — hands the most-recent `kind=pull_request` artifact to
   `<PullRequestDocument>` (#205).
-- `review` — loads the *implement* stage's `pull_request` artifact and
+- `review` — loads the _implement_ stage's `pull_request` artifact and
   hands it to `<ReviewDocument>` (#213).
 - Other types still render a "lands later in E7" placeholder.
 
@@ -205,9 +205,10 @@ The PR-upload handler (`backend/internal/server/pullrequest.go`)
 backfills `pull_request_url` after the artifact lands so the
 threaded-runs view can group by PR with a single equality query rather
 than a recursive parent walk. New `run.Repository.SetRunPullRequestURL`
-+ `ListRunsFilter.PullRequestURL` / `TriggerRef`.
-`GET /v0/runs?pull_request_url=…` and `?trigger_ref=…` are equality
-filters powering the SPA's grouping.
+
+- `ListRunsFilter.PullRequestURL` / `TriggerRef`.
+  `GET /v0/runs?pull_request_url=…` and `?trigger_ref=…` are equality
+  filters powering the SPA's grouping.
 
 SPA: `<RelatedRunsSection>` (`src/runs/related-runs.tsx`) on the
 run-detail page renders sibling runs grouped by PR (preferred when set)
@@ -215,8 +216,9 @@ or trigger_ref (fallback); `<FollowUpLink>` in the run-detail header
 points at `parent_run_id` when set.
 
 Decision per the #216 body: option (a) `parent_run_id` as the primitive
-+ (b) `pull_request_url` denorm, as a hybrid. Out of scope: CI-failure /
-PR-comment triggers (#216 calls these out as their own issues).
+
+- (b) `pull_request_url` denorm, as a hybrid. Out of scope: CI-failure /
+  PR-comment triggers (#216 calls these out as their own issues).
 
 ## Policy section on the implement page (#233)
 
@@ -226,7 +228,7 @@ burying it as a one-line row in the activity feed. Three states:
 
 - **pending** — no entry yet; a single line.
 - **pass** — green header + diff summary + foldable applied-constraints
-  list, default-open so reviewers see *what was checked*, not just that
+  list, default-open so reviewers see _what was checked_, not just that
   something passed.
 - **fail** — `Policy violations (N)` header + violations grouped by
   constraint name with per-violation files; applied constraints fold
