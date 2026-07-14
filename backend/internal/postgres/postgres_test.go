@@ -647,6 +647,26 @@ func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
 	); err != nil {
 		t.Errorf("insert gitlab installation FK'd to gitlab account failed, want success (composite FK matches): %v", err)
 	}
+	// Uniqueness mode (installations): a duplicate (provider, installation_ref) is
+	// rejected by the UNIQUE (provider, installation_ref). The FIRST '4242' row inserted
+	// above (github, FK'd to githubAccountID) makes a second (github, '4242') a
+	// conflict — this is the exercised failure path for the UNIQUE constraint. The
+	// same installation_ref under a DIFFERENT provider does NOT collide (the key is
+	// provider-scoped), mirroring the accounts (provider, account_key) pair above.
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO installations (id, account_id, provider, installation_ref)
+		 VALUES ($1, $2, 'github', '4242')`,
+		uuid.New(), githubAccountID,
+	); err == nil {
+		t.Error("duplicate (github, 4242) installation insert succeeded, want unique-constraint conflict")
+	}
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO installations (id, account_id, provider, installation_ref)
+		 VALUES ($1, $2, 'gitlab', '4242')`,
+		uuid.New(), gitlabAccountID,
+	); err != nil {
+		t.Errorf("insert (gitlab, 4242) installation failed, want success (installation_ref is provider-scoped): %v", err)
+	}
 
 	// Second application is a no-op.
 	if err := postgres.MigrateUp(url); err != nil {
