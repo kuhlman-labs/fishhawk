@@ -18,6 +18,7 @@ E19.2 / #342 shipped scaffolding + handshake. E19.3–E19.6 landed the v0 tool s
 - `fishhawk_get_run_status` (E19.5 / #345) — the agent's "where are we" query: bundles Run + ordered stages + recent audit (time-descending) into one call. Also carries `plan_review_status` + `implement_review_status` (`none`/`pending`/`complete`/`skipped`/`failed`) and `plan_stage_wait_status` + `implement_stage_wait_status` — plus `acceptance_stage_wait_status` when the workflow declares an acceptance stage (E31.9 / ADR-049), omitted otherwise — (`pending`/`running`/`succeeded`/`failed`/`cancelled`). The acceptance field tracks stage **execution**, not the verdict: a FAILED acceptance verdict leaves the stage `succeeded`, so read the verdict from the `acceptance_outcome_recorded` audit entry (surfaced through `next_actions`), never from the stage state. **Re-polling this tool is the authoritative way to reach a terminal review *or* stage-execution status (#879/#880)**: on a non-terminal status each carries a server-suggested `poll_interval_seconds` (15s for reviews, 30s for stage execution) — re-call on that cadence until the status goes terminal. See [Stage-execution wait contract](#stage-execution-wait-contract-adr-037-880). The run row also carries `run.concerns` when the run has **open** review concerns (#964): the open count, a `by_state` breakdown, and `items[]` with each concern's **stable id** — the primary addressing scheme for `fishhawk_fixup_stage`'s `concern_ids`. Drive-enabled runs (#1023) additionally get a top-level `drive_status` block: `auto_advanced` (`[{rule, from, to, parked?, ts}]`, oldest first — the transitions the backend advanced itself, distilled from `run_auto_advanced` audit entries; `parked` marks a runner_kind-`local` dispatch that recorded a ready-to-run next action instead), `next_action` (`{action, detail?, pr_url?}` — the distilled operator next step, e.g. `run_implement_stage` or `merge_pr`; omitted on terminal runs), and `derived_status` (`awaiting_merge` when every gate is resolved and required PR checks are green on an open PR — presentation-only, `run.state` stays `running`). The block is omitted entirely for non-drive runs. Decomposed parents (#1147) additionally get a `children_status` block (per-child live state + the fan-in `integration_phase`) — see [Decomposed-parent observability](#decomposed-parent-observability-children_status-1147). Runs with unresolved high-severity code-scanning (CodeQL/SAST) findings on the implement diff additionally get a top-level `security_findings` block (#1096): `[{number, rule_id, description?, severity, state?, path, start_line?, html_url?}]`, distilled from the newest `implement_security_findings` audit entry (the webhook records one idempotent entry per scan, floored on the latest fix-up, so the newest reflects current state). It is a **SEPARATE signal** from `run.concerns` — a finding is held by its own merge gate (`security_findings_unresolved`) and routed to its own fix-up pass, so it never consumes a design-concern budget. Omitted when the run has no findings (no scan yet, a clean scan, or a clean re-scan after a fix-up cleared them). Every run additionally carries a `next_actions` block (#1024) — see [Server-suggested next actions](#server-suggested-next-actions-next_actions-1024). Runs with cost data additionally get a best-effort, display-only `cache_efficiency` block (ADR-044 slice 3 / #1352): the run's prompt-cache `cache_read_ratio` (share of input served from cache), `reuse_factor` (re-reads per cache-write token), and `gross_read_savings_usd` / `write_penalty_usd` / `net_savings_usd`, plus a per-stage (`plan_review` / `implement_review` / `agent`) breakdown — derived from the `cost_recorded` audit ledger via `GET /v0/runs/{run_id}/cache-efficiency`. Omitted when the run has no cost data; it never gates a run. Runs with cost data also get a best-effort, display-only `cost` block (#1372): the run's `total_cost_usd` (its rolled estimated US-dollar cost), a per-stage (`agent` / `plan_review` / `implement_review`) `stages[].cost_usd` breakdown, and — when the run resolved to a merged PR (a `pr_merged` audit row exists and the run carries a PR URL) — a `merged_pr` rollup giving `cost_per_merged_pr_usd` (summed across every run sharing that PR URL) plus the contributing `run_count` — derived from the `cost_recorded` audit ledger via `GET /v0/runs/{run_id}/cost`. Omitted when the run has no cost data, and the `merged_pr` rollup is omitted unless the run resolved to a merged PR; like `cache_efficiency` it never gates a run. Runs that have crossed at least one human gate additionally get a best-effort, display-only `latency` block (#1702): a `gates[]` breakdown of the wall-clock time parked at each human gate — `plan_approval` (`plan_generated` → the first following `approval_submitted`), `implement_review_to_dispatch` (the latest `implement_reviewed` → the next dispatch, falling back to `pr_merged` when the workflow has no acceptance stage), and `checks_green_to_merge` (checks-green → `pr_merged`) — each with `opened_at` / `closed_at` / `wait_seconds` (clamped to 0 on clock skew), plus `total_wait_on_human_seconds` and the run's end-to-end `wall_clock_seconds` — derived from the run's audit-chain timestamps via `GET /v0/runs/{run_id}/latency`. A gate whose opening or closing marker is absent is omitted (partial rollup); the block is omitted entirely when no gate has resolved. Like `cost` it never gates a run. **Compact by default (#1727, extended #1749):** the heavy `issue_context` (issue body + all comments) and reviewer free-text prose (`implement_reviews[].free_form` + concern notes, the same prose in `plan_review_status`/`implement_review_status` `reviews[]`, and `recent_audit` review-payload `free_form` / issue-fetch `body`+`comments`) are omitted so the snapshot stays within the tool-result token budget. In addition (#1749) each `recent_audit` entry's verifier-only hash-chain fields (`entry_hash` + `prev_hash`) are dropped and any oversized payload string value is truncated with a marker pointing at `fishhawk_list_audit`, and the `cache_efficiency` per-stage breakdown (`stages[]`) collapses to the run-level rollup. Every operator-playbook field is retained (`next_actions`, all wait statuses, `run.concerns`, and each review's/audit entry's verdict/severity/category/concern keys). Four opt-in flags restore today's full shape, all default false: `include_issue_context: true` (issue payload), `include_review_prose: true` (reviewer free-text), `include_audit_hashes: true` (the `recent_audit` hash-chain fields **and** the untruncated payload values together — one flag, not split), and `include_cache_stages: true` (the `cache_efficiency` per-stage breakdown). `fishhawk_list_audit` remains the full verifier surface (its `entry_hash`/`prev_hash` are unaffected).
 - `fishhawk_await_review` (#600) — OPTIONAL convenience block over that poll: blocks until a stage's review reaches a terminal state. Default timeout **360s** (recalibrated from 120s to exceed the measured 3.5–4.5min review latency and the 300s reviewer budget, #878), cap 600s. Never strands — it also resolves when the run itself goes terminal (ADR-036 #874). Idempotent/resumable: a timeout returns `pending` + the `poll_interval_seconds` hint; re-call to resume, or switch to `fishhawk_get_run_status` polling (the primary path).
 - `fishhawk_await_audit` (#962) — the sequence-anchored await primitive: blocks until the next audit entry with the given `category` and sequence strictly greater than `since_sequence` lands, and returns that entry. The anchoring contract makes the wait race-free: an event that happens after another always has a strictly greater audit sequence, so "the review after the fix-up" is the `implement_reviewed` entry with sequence > the `fixup_pushed` entry's sequence — a stale pre-fix-up verdict can never satisfy the wait (the #894 class of stale-read race). Inputs `{run_id, category, categories (plural, OR-semantics), allow_unknown (default false), since_sequence (default 0), timeout_seconds (default 360, cap 600 — same clamp as await_review)}`. Provide `category` OR `categories` (or both — they union). **Fail-loud category validation (#1764):** an unknown or misspelled `category` (e.g. the runner-log event `scope_amendment_pending` instead of the audit category `scope_amendment_requested`) is rejected UP FRONT — no wait armed — naming the nearest known categories, so a wrong-surface string can never silently block the full timeout on an unsatisfiable wait; pass `allow_unknown: true` to await a category legitimately absent from the curated registry. **Multi-category OR:** `categories` resolves the wait on the FIRST entry (lowest sequence) matching ANY listed category past the anchor, in one call — the implement-stage wait can resolve across several anchors (e.g. `implement_reviewed` OR `fixup_pushed`) without a separate call each. Statuses: `found` (with `entry` + `latest_sequence`), `timeout` (gapless re-arm: re-call with `since_sequence` = the returned `latest_sequence`, == your shared anchor when nothing landed — the max re-arm across ALL requested categories, so no entry of any category can be skipped), `run_terminal` (the ADR-036 non-stranding backstop fired after one final anchored read — do not re-arm blindly). **Compact by default (#1727):** the returned entry's payload has reviewer `free_form` prose and issue-context `body`/`comments` stripped so it stays within the tool-result token budget, while verdict/severity/category keys are always retained; pass `include_review_prose: true` or `include_issue_context: true` to restore the full payload. `fishhawk_await_review` stays unchanged as the review-specific convenience; re-polling `fishhawk_get_run_status` remains the authoritative fallback (ADR-037).
+- `fishhawk_runtime_calibration` (#470) — the calibration read tool: agents call it before writing a plan; wraps `GET /v0/calibration`.
 - `fishhawk_list_audit` (E19.6 / #346) — use when you need the filtered or paginated audit trail (category, stage_id) rather than the recent slice — e.g. to read an `implement_reviewed` concern's full note text. Mirrors the CLI's `fishhawk audit list`. (For fix-up addressing, prefer the stable concern IDs on `run.concerns` over audit-entry indices, #964.)
 - `fishhawk_list_runs` (E22.5 / #394) — the "what runs do I have" enumeration: filter by `repo` / `workflow_id` / `state`, walk pages via the opaque `cursor`. Mirrors the CLI's `fishhawk run list`. **Compact by default (#1098):** each run's `issue_context` (issue body + every comment) is omitted from the list response so a single `list_runs` over issues with large bodies/comment threads stays within the tool-result token cap — the overflow that forced a `curl`+`jq` fallback when enumerating child run IDs during decomposition fan-out. Pass `include_issue_context: true` to re-include the full payload when it is actually needed. (`fishhawk_get_active_run` / `fishhawk_get_run_status` resolve a single run and are unaffected.)
 - `fishhawk_file_issue` ([#1005](https://github.com/kuhlman-labs/fishhawk/issues/1005)) — file a work item (issue, bug, chore, ADR) through the repo's work-management conventions. The consistent cross-repo/cross-platform filing surface and the operator-agent follow-up-filing path ([ADR-040](https://github.com/kuhlman-labs/fishhawk/issues/1004)). See [Work-item filing](#work-item-filing-fishhawk_file_issue-1005).
@@ -32,6 +33,11 @@ E19.2 / #342 shipped scaffolding + handshake. E19.3–E19.6 landed the v0 tool s
 - `fishhawk_init` ([E29.6 / #1506](https://github.com/kuhlman-labs/fishhawk/issues/1506)) — the in-band starter-**scaffold** generator, the counterpart to the CLI `fishhawk init`. Returns the canonical workflow-v1 preset spec bytes for the chosen autonomy tier (`low` / `medium` / `high`, default `medium`), generated **in-process** from the backend's embedded preset library via `spec.PresetBytes` — there is no HTTP generation endpoint. **Preset-only:** it returns the scaffold bytes for the conversational agent to write to `.fishhawk/workflows.yaml`; it writes no file itself, and the delta options + the AGENTS.md/CLAUDE.md bridge the CLI performs are a follow-up (the delta-applying generator lives only in `cli/internal/spec`). See [Onboarding tools](#onboarding-tools-fishhawk_doctor--fishhawk_init-1506).
 - `fishhawk_release_notes` ([E33.5 / ADR-051 / #1590](https://github.com/kuhlman-labs/fishhawk/issues/1590)) — the single operator surface over the E33.2 release-notes endpoints for the delegating `release` workflow: **one tool, two modes.** `mode: "preview"` (default) renders the notes markdown for the `from`/`to` ref range **without persisting** — read-only; `mode: "prepare"` renders **and** persists a `release_notes` artifact keyed to `stage_id` (required for `prepare`), the artifact the cut and publish verbs consume. `repo` falls back to `GITHUB_REPOSITORY`. The rendered markdown carries the advisory **semver bump hint** (E33.4). Reach for it when `fishhawk_get_run_status`'s `next_actions` reports a `notes_ready` (prepare) or `awaiting_cut` (preview) release-loop state. The **cut** and **publish** steps are **CLI verbs** (`fishhawk release cut` / `fishhawk release publish` over `/v0/releases/cut` and `/v0/releases/publish`), not MCP tools — `next_actions` names them at the `awaiting_cut` / `awaiting_publish` states — so the MCP surface grows by exactly one tool. Preview is an authenticated read (401 anonymous); prepare is a write additionally needing `write:runs` (403 without). The tag push between cut and the release pipeline stays a **human git action**. See [docs/deploy/release-loop.md](../../../docs/deploy/release-loop.md).
 - `fishhawk_drive_run` ([E22.X / ADR-040 / #1700](https://github.com/kuhlman-labs/fishhawk/issues/1700)) — the **local auto-driver**: executes every mechanical operator step between human gates on a `runner_kind:local` run under ADR-040 delegation, and stops at the first genuine decision. The local sibling of the GHA campaign auto-driver. A **write** tool needing `write:approvals`. See [Local auto-driver](#local-auto-driver-fishhawk_drive_run-1700).
+
+Lifecycle-write provenance (E22 / #389): `fishhawk_start_run` (E22.1 / #390), `fishhawk_cancel_run` (E22.2 / #391),
+`fishhawk_retry_stage` (E22.3 / #392), `fishhawk_approve_plan` + `fishhawk_reject_plan` (E22.4 / #393),
+`fishhawk_list_runs` (E22.5 / #394), `fishhawk_fixup_stage` (E22.X / #762), `fishhawk_revise_plan` (E22.X / #1099),
+`fishhawk_resume_run` (E22.X / #978). Phase A closed with E22.6 (docs sweep + E2E test extension).
 
 E19.7 / #347 wires the binary into the release pipeline next.
 
@@ -89,6 +95,12 @@ A connecting client whose agent holds no operator memory gets enough to drive a 
 
 Both register in the single shared `newServer` construction path (`onboarding.go`, content in `runbook.md`), so they are **transport-neutral** — identical over stdio and streamable-HTTP, and they carry into the #655 gateway unchanged.
 
+Implementation: `onboardingInstructions` is wired into `buildServer`'s `mcp.ServerOptions{Instructions: …}` so it is
+returned verbatim on every `initialize`; `registerOnboardingResources(srv)` adds the readable `fishhawk://runbook`
+`text/markdown` resource. The in-memory round-trip in `onboarding_test.go` and the HTTP-session assertion in
+`http_transport_test.go` pin both seams. This is the in-band counterpart to #996 Themes 2/3 (the thin operator agent +
+onboarding-as-data).
+
 ## Onboarding tools (`fishhawk_doctor` / `fishhawk_init`, [#1506](https://github.com/kuhlman-labs/fishhawk/issues/1506))
 
 Two thin tools (E29.6) wrap the E29 onboarding engine so a connecting Claude Code agent can drive a conversational "help me onboard a repo" flow — **one engine, another frontend** (the CLI `fishhawk doctor` / `fishhawk init` and the App-PR path are the other frontends). Both live in `onboard.go`.
@@ -104,6 +116,13 @@ Two thin tools (E29.6) wrap the E29 onboarding engine so a connecting Claude Cod
 - **`fishhawk_init`** generates the starter spec **in-process** via `backend/internal/spec.PresetBytes(preset)` — there is **no HTTP generation endpoint** (spec generation is CLI-local `spec.Generate`), and the `fishhawk-mcp` binary is built from the backend module (ADR-021) so it may import `backend/internal/spec` directly (it already does for spec parsing). Returns `{preset, workflow_yaml, target_path}` where `preset` is `low` / `medium` / `high` (default `medium`), `workflow_yaml` is the canonical workflow-v1 preset bytes, and `target_path` is `.fishhawk/workflows.yaml`. An unknown preset fails closed with a clean error naming the valid tiers.
 
   **Preset-only scoping:** `fishhawk_init` returns the scaffold bytes for the conversational agent to **write** — it writes no file itself. The delta options (`--budget-usd` / `--single-reviewer` / `--human-gates`) and the AGENTS.md/CLAUDE.md bridge (E29.2) the CLI `fishhawk init` performs are a **follow-up**, because the delta-applying `Generate` lives only in `cli/internal/spec` and porting it into the backend module is beyond a thin tool.
+
+Wiring: the `OnboardingReadinessReport` wire mirror (+ nested `OnboardingApp`/`OnboardingSpec`/`OnboardingReviewer`/`OnboardingScopes`)
+lives in `client.go` — all scalar/string/slice fields, so it is #371-safe. Both tools register in `tools.go`, bumping the
+house-style tool-count guard to 39; tests live in `onboard_test.go` (the low `client_test.go` stem-sibling needs no new
+coverage). The planned `.claude/skills/onboarding/SKILL.md` conversational-entry seed is DEFERRED — `.claude/` is
+gitignored repo-wide, so the skill file cannot be committed; the onboarding frontend ships in full via the two tools
+regardless, and the skill is a follow-up if the repo later tracks `.claude/`.
 
 ## Install (operators)
 
@@ -230,6 +249,37 @@ Output: ordered `steps_taken[]` (each labeled mechanical vs delegated), the fina
 - **Awaits ALL with no sibling-cancel.** A child failure is **data**, not a tool error: every child is awaited and surfaces in `children[]` with its `exit_code`, `outcome`, and `stage_state` regardless of success.
 
 Returns `children[]` (one entry per discovered child, in `plan_decomposed` order), `dispatched_count` (how many were pending and spawned), and `effective_cap` (the cap used; 0 = unlimited). Requires the `fishhawk-runner` binary to resolve on the MCP host, exactly like `fishhawk_run_stage`.
+
+### Topological-wave dispatch (E24.X / [#1278](https://github.com/kuhlman-labs/fishhawk/issues/1278) slice B)
+
+Decompositions whose `sub_plans` declare `depends_on` edges are dispatched in **topological waves** rather than one
+global fan-out.
+
+- **`plan_decomposed` `waves`.** `orchestrator.go::fanoutIfDecomposed` computes `waves [][]int` via
+  `plan.Waves(decomposition)` (slice A, #1280 — a pure Kahn topological sort of the sub_plans' `depends_on` edges) and
+  threads it through `emitPlanDecomposed` into the `plan_decomposed` audit payload alongside
+  `child_run_ids`/`effective_max_parallel`. The waves carry SLICE INDICES that positionally index `child_run_ids`
+  (`child_run_ids[i]` is slice `i`). A should-be-impossible `Waves` error (the plan was already validated in slice A)
+  falls back to a single all-indices wave (`singleAllIndicesWave`) with a WARN. `waves` is additive: the audit map
+  always carries it, and the MCP `PlanDecomposed.Waves` mirror decodes it `omitempty` (nil → single wave).
+- **Non-settling per-wave fan-in.** `backend/internal/server/consolidate.go::handleIntegrateWave`
+  (`POST /v0/runs/{run_id}/integrate-wave`; client method `apiClient.IntegrateWave`) reuses the EXACT same exported
+  `IntegrateSlices` primitive `/consolidate` uses (no new git-merge code) to merge the slices SUCCEEDED SO FAR onto the
+  consolidated branch — but, UNLIKE `/consolidate`, it does NOT require all children terminal, does NOT transition the
+  parent stage, and does NOT advance/open the PR (the parent stage is identical before/after on BOTH the `integrated`
+  and `slice_conflict` outcomes; the terminal fan-in stays `/consolidate`'s job after the last wave). It shares
+  `/consolidate`'s auth + decomposed-parent precondition posture (`agent_token_forbidden`/`insufficient_scope` 403,
+  `not_a_decomposed_parent` 400, `slice_integration_error` 502) minus the terminal-children gates.
+- **`run_children` wave loop.** `run_children.go` replaces the single global errgroup with an ordered per-wave loop:
+  each wave's pending children dispatch concurrently under the cap against `currentBase` (passed as both
+  `--base-branch` and `--check-base-ref`, so wave N cuts from the prior wave's merged tree), then between waves it
+  calls `IntegrateWave` and re-bases the next wave on the returned `consolidated_branch`. A nil/empty `waves` (an old
+  entry, or a no-`depends_on` decomposition) collapses to a single all-indices wave dispatched against `main` and
+  NEVER calls integrate-wave — byte-for-byte the pre-#1278 behavior.
+- **Guards** (each surfaced as a warning; the loop stops): a dispatched wave-N child that did not succeed (no
+  partial-wave integration), a `slice_conflict` or transport error from integrate-wave, and an empty
+  `consolidated_branch` (the GitHub-not-wired graceful skip — `currentBase` is kept unchanged rather than dispatching
+  against an empty ref). A waves index out of range is a loud tool error.
 
 ### Decomposed-parent observability (`children_status`, [#1147](https://github.com/kuhlman-labs/fishhawk/issues/1147))
 
@@ -428,6 +478,15 @@ Outcomes (200):
 
 A non-conflict failure returns `slice_integration_error` (502) with the cause in `details.error` — the diagnosability the event-driven fan-in path lacks.
 
+Implementation: `backend/internal/server/consolidate.go::handleConsolidateRun`, registered as the MCP verb in `tools.go`.
+It composes the **exported** orchestrator primitives `IntegrateSlices` → `TransitionStage` → `Advance`, mirroring
+`childcompletion.resolveParent`'s all-succeeded arm, WITHOUT touching the hot event-driven/sweeper paths. The
+`children_settled` and `slice_integration_conflict` audit payloads are byte-identical to the sweeper's, so the
+`children_status` integration-phase classifier reports correctly whichever path settled the parent. Where the
+event-driven `maybeAdvanceDecomposedParent` WARN-swallows a non-conflict `IntegrateSlices` error (leaving a silent
+stuck parent), this endpoint returns it — the 502 `slice_integration_error` above, with the stage left
+`awaiting_children` for retry.
+
 ## Run-branch vouch (`fishhawk_vouch_commit`)
 
 `fishhawk_vouch_commit` ([ADR-035](https://github.com/kuhlman-labs/fishhawk/issues/857) / [#1044](https://github.com/kuhlman-labs/fishhawk/issues/1044)) is the **operator-gated, audited** provenance path for a foreign commit on a run branch that no loop-native remediation can route — an operator's mechanical remediation commit (e.g. a `scripts/sync-schemas` output pushed onto a decomposition fan-out branch whose children are all terminal with zero open concerns). Unlike `fishhawk_reset_run_branch` (which **drops** an on-top foreign commit), vouch **keeps** the operator commit and **declares it run-authored lineage**: the vouched SHA is unioned into the run's reported-head ledger (on the run's own chain and its decomposition children), so the merge reconciler's ADR-035 re-check attributes it cleanly and the run it fixed is no longer wedged. It wraps `POST /v0/runs/{run_id}/vouch-commit`.
@@ -514,6 +573,9 @@ E22.X / [#1231](https://github.com/kuhlman-labs/fishhawk/issues/1231) adds a **z
 
 E22.X / [#978](https://github.com/kuhlman-labs/fishhawk/issues/978) adds operator-initiated recovery for a run whose implement stage failed **category-B** (scope/constraint violation) after its plan was approved — the gap between `fishhawk_retry_stage` (refuses B) and `fishhawk_start_run` (replans from scratch). The tool wraps `POST /v0/runs/{run_id}/recover` and mints a **new plan-stage-less child run** that re-executes against the parent's approved plan.
 
+Pointed at a failed decomposition **child** run instead, it re-drives that child **in place** on the shared parent
+branch (#1081) — not a new run. Both arms fold operator-named `add_scope_files` as a pre-approved #961 amendment.
+
 Inputs: `parent_run_id` (the failed run), optional `add_scope_files` (`[{path, operation: modify|create}]`, operation defaults to `modify`), optional `reason`, `budget_override`, and `idempotency_key` (same replay semantics as `fishhawk_start_run`).
 
 - **Eligibility**: parent's plan stage `succeeded` AND implement stage `failed` category-B; anything else returns `recovery_not_eligible` naming which leg failed. Parents without a cached workflow spec return `recovery_unsupported` — start a fresh run.
@@ -585,6 +647,219 @@ Inputs:
 Returns the egress outcome (`report.action` `created`\|`occurrence`, `fingerprint`, upstream `number`/`url`, `destination`), a transparency preview of the product facts that were attached (`diagnostics`), and `free_text_included`.
 
 **Auth:** the first **write** tool that drives an egress on the run's chain — the backend requires the run's **own** run-bound agent token (an operator token or a foreign run's token is rejected with `run_not_entitled`). Error surfaces propagated as tool errors: `validation_failed` (400), `authentication_required` (401), `run_not_entitled` (403 — only the run's own run-bound token may file), `product_feedback_disabled` (403 — the per-repo kill-switch), `run_not_found` (404), `provider_unimplemented` (501), `product_report_failed` (502). The CLI mirror is `fishhawk report-issue`.
+
+## Auth split (runner `fhm_*` vs operator `fhk_*` tokens)
+
+Runner-side `fhm_*` tokens carry the `mcp:read` scope only: a write tool called from the runner side hits the bearer
+middleware, resolves a read-only identity, and the handler-side role check returns 403 — the SDK surfaces it as a tool
+error, no code change needed. Operator-side `fhk_*` apitokens carry the `write:runs` / `write:approvals` /
+`write:stages` scopes.
+
+## Schema-reflection trap (#371)
+
+The `github.com/modelcontextprotocol/go-sdk/mcp` SDK (v1.6.1) auto-generates output schemas via Go reflection over the
+tool's return type. `uuid.UUID` (which is `[16]byte`) renders as `type: array`, and `json.RawMessage` (which is
+`[]byte`) does the same — but on the wire UUIDs are strings and per-category audit payloads are JSON objects, so schema
+validation rejects every response. `client.go` therefore types UUIDs as `string` and `Artifact.Content` /
+`AuditEntry.Payload` as `any`; callers `uuid.Parse` at the API-client boundary, and the plan decoder re-marshals +
+unmarshals into the typed `PlanContent`.
+
+## Cross-component E2E test (#371)
+
+`backend/internal/integration/mcp/e2e_test.go` spins up Postgres + the real backend HTTP server, then builds + spawns
+the actual `fishhawk-mcp` binary as a subprocess, fetches an `fhm_` token via the runner's HTTP shape, and exercises a
+tool call end-to-end. The revocation + malformed-token assertions assert at the `mcptoken.Repository.Authenticate`
+layer rather than at the tool call, because v0 reads don't enforce identity — the bearer middleware falls through to
+anonymous; per-handler enforcement is out of scope for v0.
+
+## `fishhawk_start_run` field parity (#426)
+
+The start_run tool accepts the same local-runner convenience inputs the CLI's `fishhawk run start` does:
+
+- `working_dir` walks for `.fishhawk/workflows.yaml` and ships the bytes inline (#411).
+- `issue` shells to `gh issue view` and caches the payload (#415).
+- `runner_kind=local` tags the run for the local-runner backend (ADR-022 / #388).
+
+Spec discovery / gh fetch live in `spec_discover.go` / `issue_fetch.go` — **local copies** of the CLI's helpers rather
+than a shared package (the cli → backend import direction precludes the inverse). Auto-flip rule: when `trigger_source`
+is defaulted (empty) and an issue resolves via `issue` or `trigger_ref=issue:N`, the MCP server flips it to
+`github_issue`; an explicit `trigger_source` is preserved.
+
+## Review-status internals (#600, count-gated #1127)
+
+Each `ReviewStatus{Stage, Status, Reviews[], PollIntervalSeconds}` (`Status` one of `none` | `pending` | `complete` |
+`skipped` | `failed`) is derived **entirely from the audit trail**.
+
+**Completeness is count-gated (#1127).** The round is terminal only once `landed_terminal >= configured_agents` (the
+latest `*_review_started` entry's `ConfiguredAgents`; ANY terminal kind — `reviewed`/`review_failed`/`review_skipped` —
+counts). That is the SAME rule `checkPlanReviewSettled`/`checkImplementReviewSettled` use for the approval/merge gates,
+so a poll catching the heterogeneous partial-landing window (reviewers run sequentially, each minutes long) reports
+`pending` rather than `complete` with only the first reviewer's verdict. Once the count threshold is met, precedence
+resolves the status (`reviewed → complete`, else `review_skipped → skipped`, else `review_failed → failed`) and
+`Reviews[]` is the UNION of every decoded terminal row — one per configured reviewer. Below the threshold (or with no
+terminal entry) the status is `review_started → pending`, else `none`. An absent/non-positive `ConfiguredAgents`
+(old/malformed started payload) degrades to the prior complete-on-first-verdict predicate so the surface never strands
+on `pending`. The `pending` state is the gap the existing `Reviews[]`/`ImplementReviews[]` slices couldn't express — it
+subsumes a still-running review, a silently-failed/timed-out one, and the partial-landing window; those fields stay
+populated unchanged (additive, no driver regression).
+
+**Poll-authoritative contract (#879).** The 15s `poll_interval_seconds` hint is populated ONLY on `pending` (the one
+state worth re-polling) and rides in via the shared `ReviewStatus` to every poll surface (`fishhawk_get_run_status`,
+`fishhawk_get_plan`) from one edit.
+
+**`fishhawk_await_review` internals.** It polls the existing `GET /v0/runs/{id}/audit` endpoint server-side on an
+injectable interval (no new backend long-poll, no wall-clock sleeps in tests) until a terminal entry lands, the run
+itself reaches a terminal state (the ADR-036 #874 non-stranding backstop — an inline `succeeded`/`failed`/`cancelled`
+comparison against the fishhawk-mcp-local `Run.State`, so a verdict that will never land never holds the session open),
+or the timeout fires. A `pending`-on-timeout result carries the `poll_interval_seconds` hint plus an actionable message
+framing the re-call (or a switch to `get_run_status` polling) as the documented next step and naming
+`FISHHAWKD_PLAN_REVIEW_TIMEOUT`. A 360s synchronous call may still hit a client/transport per-call timeout — acceptable
+precisely because poll-the-handle is the blessed primary path and a cut-short await is a no-op the caller can re-issue.
+Native MCP Tasks (`invocationMode:async`) is a deferred follow-up — the pinned go-sdk has no Tasks symbols; this ships
+the sync/poll fallback only. The #894 fix-up-boundary floor lives in `reviewStatusFor`. Implementation: `review.go`
+(`reviewStatusFor`, the shared `decodeReviewVerdicts`/`decodeSkippedReviews`, the `awaitReview` handler).
+
+## Await-audit internals (#962)
+
+`fishhawk_await_audit`'s `run_terminal` status is distinct from `timeout` because some categories land at/after the
+terminal transition, so the backstop resolves the wait only after ONE final anchored read that must win. Beneath it,
+`GET /v0/runs/{id}/audit` gained an additive `since_sequence` query param — a strictly-greater filter applied before
+pagination, in-memory like the #215 `stage_id` filter (`handleListRunAudit` in `backend/internal/server/reads.go`).
+Implementation: `await_audit.go` (`awaitAudit`, `nextAuditEntry`, `awaitAuditRunTerminalBackstop`), reusing
+`clampAwaitTimeout` / `reviewPollInterval` / `runStateIsTerminal`; the cross-boundary seam test is
+`backend/internal/integration/mcp/await_audit_test.go`.
+
+## Stage-wait internals (ADR-037 / #880; local dispatch default #1247)
+
+Implementation: `stage_wait.go` (`stageStateIsTerminal`, `classifyStageWaitStatus`, `stageWaitStatusFor`) — a LOCAL
+terminal classifier that does NOT import `backend/internal/run`, mirroring `review.go`'s `runStateIsTerminal`. Callers
+pass the already-fetched stage slice, so no extra `ListRunStages` round-trip is issued. `fishhawk_run_stage` adds
+`stage_wait_status` on its post-run output.
+
+**`next_actions` defaults a parked LOCAL implement stage to `fishhawk_dispatch_stage`** (with `fishhawk_run_stage`
+demoted to an explicit blocking opt-in second entry), because the implement stage is the one stage type that can file a
+mid-stage amendment a blocking call cannot decide in-band; the plan-local branch (no amendments) keeps the single
+`run_stage` action and the `github_actions` poll branch is unchanged (#1247).
+
+## `fishhawk_run_stage` internals and cancellation (ADR-024 / #434, runner half #435, compact #647)
+
+The tool mirrors the CLI's `fishhawk runner start` argv composition; stdout is parsed line-by-line as JSONL and either
+streamed as `notifications/progress` (when the client supplied a progress token) or accumulated for the final tool
+result. The audit log carries the durable record.
+
+`summarizeRunStageEvents` (the #647 compaction) walks the accumulated events once. `outcome`/`tokens_used` come from
+the terminal `{"event":"runner_completed","outcome":…,"tokens_used":N}` event — the only runner-level terminal event
+relayed on the JSONL **stderr** stream the relay reads; the bundle-only `kind=="invocation_end"` is deliberately NOT
+keyed on, as it never reaches this stream. All summary scalars are `omitempty` so they reflect as plain JSON scalars
+(no #371 array-reflection regression).
+
+**Cancellation.** Tool-context cancellation sends `SIGTERM`, waits `runStageGracePeriod` (default 30s), then escalates
+to `SIGKILL`. The runner-side half (#435) lives in `runner/cmd/fishhawk-runner/main.go::newRunnerContext` —
+`signal.NotifyContext` registers SIGINT + SIGTERM, and the deferred cancel-emit at the top of `run()` overrides the
+exit code to 130 (`exitCancelled`) and writes a `runner_cancelled` JSONL line so the MCP tool's progress stream sees a
+clean terminator. The plumbed `ctx` reaches the long-running calls (`Invoke`, `IssueKey`, `FetchPrompt`, `ShipTrace`,
+`ShipPlan`, `FetchMCPToken`, `openPRAndShipArtifact`) so cooperative cancellation works upstream and partial-trace
+bytes ship best-effort when the cancel lands during agent invocation.
+
+**Binary resolution:** `runner_binary` input > `FISHHAWK_RUNNER_BIN` env > `exec.LookPath("fishhawk-runner")` — matches
+the CLI's resolver. The tool is registered unconditionally on every `fishhawk-mcp` deployment and returns a clean error
+when the binary can't resolve; ADR-024 Q5 defers splitting into a `fishhawk-mcp-local` binary until hosted MCP becomes
+a real concern.
+
+**Transport implementation map:** `main.go` (`parseFlags`, transport dispatch in `run`) +
+`http_transport.go` (`validateLoopbackAddr`, `bearerAuthMiddleware`, `serveHTTP`). `next_actions.go` holds
+`nextActionsFor`, the pure classifier generalizing `review_action_hint`.
+
+## Intake refinement internals (`fishhawk_draft_epic`, ADR-052, E34.4 / #1595)
+
+`draft_epic.go` — the SINGLE operator MCP verb over the E34 refinement loop (reuse-first per E31.9: every existing
+decision verb is stage-gated and resolves a run/stage, but a refinement session is neither a run nor a stage, so one
+tool with arms keeps the registry at +1). The arms' 1:1 endpoint mapping:
+
+| Arm | Trigger fields | Endpoint |
+|---|---|---|
+| open | `brief` alone | `POST /v0/refinement/sessions` |
+| preview | `session_id` alone | `GET /v0/refinement/sessions/{id}` |
+| edit | `session_id` + exactly one of `brief_amendment` \| `draft` | `PATCH /v0/refinement/sessions/{id}/draft` |
+| decide | `session_id` + `decision` (`approved` \| `rejected`) + required `reason` | `POST /v0/refinement/sessions/{id}/decision` |
+| file | `session_id` + `repo` | `POST /v0/refinement/sessions/{id}/file` |
+
+`brief_amendment` is the agent re-draft, bounded by a per-session budget of **3**; `draft` is a direct strict-decoded
+`EpicDraft` field edit, unbudgeted. Arm classification lives in `draftEpic`: it fails closed with NO HTTP call
+(`armError` + the `legalArmsHelp` enumeration) when zero arms or an illegal combination is populated (e.g. `brief` with
+any other field, both edit sub-arms, or >1 session sub-arm).
+
+Every session-view result (open/preview/edit/decide) carries the `RefinementSession` mirror; the file arm carries
+`RefinementFilingResult`; exactly one is set. Every result also carries a `session_guidance` block
+(`guidanceForSession`/`guidanceForFiling`) — a next_actions-STYLE, tool-LOCAL block (deliberately NOT the run-scoped
+`next_actions.go` machinery, since a refinement session has no run UUID) naming the exact next arm + arguments for the
+derived state; the `awaiting_approval` guidance names any criteria-flagged child ordinals via
+`flaggedCriteriaOrdinals`/`formatOrdinals`.
+
+Backend error codes surface verbatim through typed `apiError` unwraps: `amendment_budget_exhausted`,
+`decision_already_recorded`, `refinement_not_approved`, `refinement_draft_drifted`, `refinement_filing_repo_mismatch`,
+and `refinement_filing_failed` — the last carrying the filed-so-far ordinals for a resumable re-invoke via
+`filedSoFarDetail`. Wire mirrors (`RefinementSession`/`RefinementFilingResult`/`CriteriaPrecheck`) live in `client.go`
+as #371-safe shapes (UUIDs typed `string`, no reflect-array pitfalls). Registered via `registerDraftEpic` in
+`tools.go`, bumping the tool-count guard to **40** (`tools_test.go` `wantToolCount`).
+
+**Auth:** `write:approvals` — NO new scope (the E34.2 precedent), so the operator token already driving
+`fishhawk_approve_plan` works unchanged; a runner-side `fhm_` token (`mcp:read` only, per the auth split above) is
+refused 403 — this is why the live draft→file walk is operator work, not implement-agent work.
+
+**Agent-backed drafting is decoupled from the request lifetime (E37.4 / #1637).** The open + `brief_amendment` arms are
+minutes-long drafting-agent calls, so `client.go` routes ONLY those two arms through a second `httpLong` client
+(`refinementDraftClientTimeout` = 22m) while read/decide/file/direct-edit stay on the 30s short client, and
+`backend/internal/server/refinement.go` runs the drafter+persist under `context.WithoutCancel` +
+`WithTimeout(refinementDraftBudget = 20m)` (the #584 detached-review pattern) — so a mid-draft client disconnect
+neither SIGKILLs the drafter nor strands a half-created session. The 22m client timeout sits above the 20m server
+budget so the server's bounded error surfaces first.
+
+## Campaign tool internals (ADR-047 / #1437, E25.8 / #1447, #1461; `operator_agent` override E25.12 / #1451)
+
+`campaign.go` holds the operator-agent's campaign verbs over the E25.4 REST API — the campaign counterparts to the
+single-run `fishhawk_start_run`/`fishhawk_get_run_status`/`fishhawk_resume_run` (see the Status list above for the
+per-tool contract). Internals not covered there:
+
+- **`operator_agent` override (E25.12 / #1451).** `fishhawk_start_campaign`'s optional `operator_agent` — the
+  campaign-level delegation override — is typed `map[string]any` on `StartCampaignInput` so the SDK's reflection-built
+  input schema sees an unconstrained object; it is marshalled to opaque JSON the backend validates against
+  `spec.OperatorAgent`. It wins WHOLESALE over every issue-run's per-workflow `operator_agent`. The `Campaign` wire
+  mirror (`client.go`) carries `operator_agent` as `map[string]any` for the same unconstrained-object reason, so the
+  create + status surfaces round-trip the override back.
+- **Gate-code mapping.** Each verb maps the backend gate codes onto operator-actionable tool errors;
+  `fishhawk_start_campaign_item_run` (E26.2 / #1481; `campaign_id` + `issue_ref` + `workflow_id` required, optional
+  `workflow_ref` + `runner_kind` — pass `local` for the local loop) maps `item_not_eligible` / `item_human_led`
+  (#1697) / `campaign_item_not_found` / `campaign_not_startable` / `campaign_run_start_failed`.
+- **`next_actions` mapping.** `fishhawk_get_campaign_status` maps `next_action` onto a legal operator move via
+  `campaignNextActionsFor`, so the agent never reads an unclassified state. `fishhawk_resume_campaign` is legal only
+  when `next_action` is `resume`.
+- The campaign-scoped operator procedure lives in the operator role spec's `conventions.campaign`
+  (`docs/spec/operator-role.md`), not hard-coded here.
+
+## Acceptance operator surface (E31.9 / #1537, ADR-049)
+
+**No new MCP tools or endpoints** — the acceptance stage is exposed to the operator loop by REUSING the existing verbs
+(the tool registry did not grow for it). Dispatch rides the ordinary agent path: `fishhawk_dispatch_stage` /
+`fishhawk_run_stage` accept `stage=acceptance` (their jsonschema enums + `composeRunnerArgv` already pass `--stage`
+through generically; acceptance takes neither `--plan-out` nor `--check-base-ref`, and its egress hosts + criteria ids
+arrive via `--fetch-prompt`, not argv). Awaiting the verdict rides the category-generic `fishhawk_await_audit` on
+`acceptance_outcome_recorded` / `acceptance_triage_decided` (`fishhawk_await_review` does NOT fit — it is
+ReviewStatus-shaped and acceptance has no reviewers). There is NO operator approve/reject acceptance gate (ADR-049
+decision #2 makes failure routing deterministic server-side triage, E31.8; decision #6 gates the MERGE via the
+`acceptance_passed` condition).
+
+**The real surface is `next_actions`**: `implementStageNextActions`' settled path branches to
+`acceptanceStageNextActions` before the merge ritual when the run declares an acceptance stage — the per-state arms are
+enumerated in the [Server-suggested next actions](#server-suggested-next-actions-next_actions-1024) section above. The
+verdict + disposition are read from the `acceptance_outcome_recorded` / `acceptance_triage_decided` audit payloads (a
+FAILED verdict leaves the stage `succeeded`, so stage state is never inferred from) via `latestAcceptanceVerdict` /
+`latestAcceptanceTriageDisposition` over the recent-audit slice; the verdict/disposition vocabulary is **mirrored, not
+imported** from `backend/internal/server/acceptance.go` (the #875 compile trap), pinned by
+`TestAcceptanceVocabularyMatchesBackend`. `fishhawk_get_run_status` adds `acceptance_stage_wait_status`
+(`stageWaitStatusFor(…, "acceptance", …)`, omitted for non-acceptance runs). The acceptance playbook
+(verdict-vs-stage-state, the deterministic triage table, the LOCAL-runner explicit-re-dispatch rule, paged arbitration)
+lives in the `fishhawk://runbook` resource + the server `instructions`.
 
 ## Runner integration
 

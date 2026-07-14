@@ -218,7 +218,7 @@ stream-json + bundle event-kind wire format so the scorer exercises the
 real parse path, but the trajectories themselves are invented. Each
 `case.md` states this plainly.
 
-## Plan-review-miss corpus (E31.11)
+## Plan-review-miss corpus (E31.11 / #1539)
 
 A second, sibling corpus under
 `backend/internal/agenteval/testdata/planreview-miss-corpus/<case>/`
@@ -240,13 +240,21 @@ The feed pipeline:
    observed behavior
    (`observed`/`expected`/`steps_taken`/`expectation_basis`/
    `repro_handle`/`result`). An unresolvable id still yields a record
-   keyed by the id with empty provenance. Omitted for classes 1/2/4/5.
+   keyed by the id with empty provenance. Omitted for classes 1/2/4/5,
+   so existing consumers are untouched. The payload is built by
+   `server/acceptance.go::buildPlanReviewMisses`, threaded through
+   `writeAcceptanceTriageAudit`.
 2. **Distill.** `fishhawk-distill-corpus --plan-review-miss` (backed by
    `corpusdistill.DistillPlanReviewMiss` / `PreviewPlanReviewMiss` and
    `FetchRunTriageAudit`, which follows `next_cursor` pages past the
    audit endpoint's 500-entry limit cap) scaffolds one candidate case
    per class-3 decision under the corpus dir: `miss.json` (the
    `agenteval.PlanReviewMissCase` shape) + a provenance `case.md`.
+   Input is either `--run-id` (fetch from the backend, PRODUCTION
+   redacted-by-construction provenance) or `--in`/stdin (TODO
+   provenance). The default out-dir is
+   `backend/internal/agenteval/testdata/planreview-miss-corpus/`
+   (committed synthetic seed: `seed-synthetic-inferred-criterion`).
 3. **Operator-labeled case.** Selection, labeling, and committing stay
    operator curation (#819 / ADR-040); the tool produces a CANDIDATE
    with a TODO(operator) distilled-signal prompt (or an inline
@@ -262,6 +270,10 @@ missing `miss.json`, an empty `misses` list, or an empty
 `criterion_id`. The **same** `PlanReviewMiss` type is used by the
 server marshal, the tool unmarshal, and the loader, so the three
 surfaces cannot drift (pinned by a corpusdistill round-trip seam test).
+The wire types (`PlanReviewMiss`, `PlanReviewMissCase`,
+`LoadPlanReviewMissCorpus` in
+`backend/internal/agenteval/planreviewmiss.go`) are stdlib-only so the
+server can import agenteval cycle-free.
 
 **Redaction posture:** the feed is redacted-by-construction. Per
 ADR-049 decision refinement #5, evidence blobs (logs, screenshots,
@@ -274,8 +286,14 @@ demonstration (`synthetic: true`), per the same synthetic-seed
 discipline as the Tier-A/Tier-B seeds.
 
 The queryable metric lives on the API: `GET /v0/acceptance-triage/stats`
-reports `plan_review_miss_rate` (class-3 decisions / all triage
-decisions, per DECISION not per run) — see `docs/api/v0.md`.
+(`backend/internal/server/acceptance_stats.go`, registered next to
+`/v0/calibration`) aggregates `acceptance_triage_decided` entries by
+class/disposition and reports `plan_review_miss_rate` (class-3
+decisions / all triage decisions, per DECISION not per run;
+undecodable payloads count under class `""` so the denominator never
+shrinks; 0 samples → rate 0). It takes `since`/`workflow_id` filters,
+returns `503 acceptance_stats_unconfigured` without an audit repo, and
+requires no new scope — see `docs/api/v0.md`.
 
 ## Acceptance triage class 5 (externally-unvalidatable, #1671)
 

@@ -1,10 +1,10 @@
 # Fishhawk infra (Terraform)
 
-Per [ADR-016](https://github.com/kuhlman-labs/fishhawk/issues/165) — Terraform manages all hosted infrastructure for `fishhawkd`. This directory has, as of E13.7.4:
+Per [ADR-016](https://github.com/kuhlman-labs/fishhawk/issues/165) — Terraform manages all hosted infrastructure for `fishhawkd`. Terraform 1.5+ with the AWS provider 5.x. This directory has, as of E13.7.4:
 
-- **Foundation** ([#148](https://github.com/kuhlman-labs/fishhawk/issues/148)) — VPC + subnets, security groups, IAM roles, Secrets Manager skeletons, CloudWatch log group.
-- **ECS service + ALB** ([#166](https://github.com/kuhlman-labs/fishhawk/issues/166)) — Fargate task definition pointing at the GHCR image, ECS service across both private subnets, Application Load Balancer with HTTP listener (HTTPS + ACM + Route 53 alias gated on `domain_name`).
-- **RDS Postgres + migration task** ([#167](https://github.com/kuhlman-labs/fishhawk/issues/167)) — `db.t4g.micro` Postgres 16 in the private subnets with TLS forced and the master password RDS-managed; Terraform reads it and assembles the libpq URL into the existing `database_url` secret. Dedicated migration task definition for `fishhawkd migrate up`.
+- **Foundation** ([#148](https://github.com/kuhlman-labs/fishhawk/issues/148)) — VPC + 2-AZ subnets + IGW + single NAT, security groups (ALB → app → RDS chain), IAM (ECS task / execution roles + GitHub Actions OIDC role), Secrets Manager skeletons, CloudWatch log group.
+- **ECS service + ALB** (E13.7.2 / [#166](https://github.com/kuhlman-labs/fishhawk/issues/166)) — Fargate cluster + task definition pointing at `ghcr.io/kuhlman-labs/fishhawkd:<image_tag>`, ECS service across both private subnets with rolling-deploy + circuit-breaker rollback, ALB + target group with `/healthz` health checks, HTTP listener (forward-only when no domain set, redirect-to-HTTPS otherwise), optional ACM cert + Route 53 alias + HTTPS listener gated on `var.domain_name`.
+- **RDS Postgres + migration task** (E13.7.3 / [#167](https://github.com/kuhlman-labs/fishhawk/issues/167)) — `db.t4g.micro` Postgres 16 in the private subnets with `rds.force_ssl=1` and the master password RDS-managed; Terraform reads it via `aws_db_instance.master_user_secret` and assembles the libpq URL into the existing `database_url` Secrets Manager entry. Dedicated `<project>-<env>-migrate` task definition for `fishhawkd migrate up`.
 - **CI deploy workflow** ([#168](https://github.com/kuhlman-labs/fishhawk/issues/168)) — `.github/workflows/backend-deploy.yml` runs after `backend-release.yml` on `backend/v*` tags, or via `workflow_dispatch` for rollback. Registers a new task-definition revision, runs the migration task to completion, then swaps the service via `aws-actions/amazon-ecs-deploy-task-definition`. Operator wires up the GitHub repo variable `AWS_DEPLOY_ROLE_ARN` once.
 
 The full deploy chain is in. Day-21 self-execution can run end-to-end against this stack.

@@ -311,14 +311,38 @@ _verify_schema_sync() {
   fi
 }
 
+# _verify_doc_line_budget: cap docs/ARCHITECTURE.md line length at 1000 chars.
+# The Read tool agents use truncates lines around 2000 chars, so a fat
+# "Where to look" table row is silently unreadable past that point — at its
+# worst the file hid ~195KB (35%) of its content that way. The budget keeps
+# §10 rows as pointers (path + one sentence); long-form contracts belong in
+# the package's README.md next to the code (see AGENTS.md "Documentation
+# surfaces"). 1000 leaves headroom for a legitimately dense row while staying
+# far below the truncation cliff.
+_verify_doc_line_budget() {
+  local doc="$ROOT/docs/ARCHITECTURE.md" offenders
+  [ -f "$doc" ] || return 0
+  offenders="$(awk 'length($0) > 1000 { print FILENAME ":" FNR " (" length($0) " chars)" }' "$doc")"
+  if [ -n "$offenders" ]; then
+    cat >&2 <<EOF
+docs/ARCHITECTURE.md has lines over the 1000-char budget:
+$offenders
+"Where to look" rows are pointers — path + one sentence. Move the long-form
+contract into the owning package's README.md and link it from the row.
+EOF
+    exit 1
+  fi
+}
+
 # verify: the runner's committed-tree implement gate. Lint FIRST so a fast
 # format/lint failure leads the captured output and aborts (set -e) before the
-# slow test loop. Schema-sync drift is checked NEXT (a <1s file-copy + porcelain
-# diff) so a docs/spec edit without a sync fails in-loop, still ahead of the slow
-# test loop. Coverage is intentionally omitted to bound in-loop runtime — it
-# stays on `coverage` and in CI.
+# slow test loop. The doc line budget and schema-sync drift are checked NEXT
+# (each <1s) so a docs defect fails in-loop, still ahead of the slow test loop.
+# Coverage is intentionally omitted to bound in-loop runtime — it stays on
+# `coverage` and in CI.
 cmd_verify() {
   cmd_lint
+  _verify_doc_line_budget
   _verify_schema_sync
   cmd_test
 }

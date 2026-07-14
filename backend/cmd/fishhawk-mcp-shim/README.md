@@ -51,6 +51,16 @@ The shim is wired into the dev loop ([#1922](https://github.com/kuhlman-labs/fis
 
 Registration is detected via the `FISHHAWK_MCP_SHIM_REGISTERED` env override (sourced from `.env`; `1`/`true` or `0`/`false`) winning over a best-effort `claude mcp get fishhawk` probe; an absent or errored `claude` CLI degrades to not-registered, which keeps the manual banner (the fail-safe direction).
 
+## Layout
+
+A separate binary built from the **backend module**, sibling to `fishhawk-mcp` per ADR-021.
+
+- `watcher.go` — the sha-256 content poller (never mtime, settle-debounced).
+- `supervisor.go` — quiesce, swap, handshake replay with a synthetic id, crash respawn with capped
+  backoff, orphaned-request error synthesis.
+- `transport.go` (+ `transport_unix.go` / `transport_other.go`) — the `childTransport` seam a
+  streamable-HTTP upstream can later replace stdio through (#655 phase 0).
+
 ## Accepted residuals
 
 - **A same-turn schema-new tool fails once.** Claude Code honours `notifications/tools/list_changed` across turns but not mid-turn ([anthropics/claude-code#31893](https://github.com/anthropics/claude-code/issues/31893), verified in the ADR-060 spike set). A tool whose schema is brand-new in the just-swapped binary fails once within the turn it was announced, then works.

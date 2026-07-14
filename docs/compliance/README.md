@@ -144,6 +144,21 @@ closed RFC 3339 range and re-run both commands above. Record the new `sha256`
 and window here as provenance; a moving `--to` (one not yet in the past) would
 produce a non-stable artifact and is not recommended for a published export.
 
+## CI pinning and publication scope (E9.6 / #1609)
+
+The export is the E31-window (`2026-06-25`..`2026-07-03`, 134 runs)
+output of the E9.4 `fishhawk export` consumer; the report is the E9.3
+human-readable rendering over the same data.
+
+The committed artifacts are continuously pinned by
+`verifier/internal/audit/published_export_test.go` — a committed-tree
+test that re-verifies the committed export via the real
+`ParseExport` + `VerifyExport` (zero issues, >0 runs and entries
+required) and asserts the report's completeness markers, so a corrupted,
+partial, or missing artifact fails CI.
+
+Scope: in-repo commit only; release-pipeline publication is E33.
+
 ## See also
 
 - [`docs/MVP_SPEC.md`](../MVP_SPEC.md) §12 (build commitment), §13 (done

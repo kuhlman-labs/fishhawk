@@ -20,6 +20,7 @@ Pre-alpha. Most code referenced in `docs/MVP_SPEC.md` doesn't exist yet — it's
 
 - `README.md` (root) is the only human-facing doc. Keep narrative.
 - Everything in `docs/` is agent-consumed. Write structured, dense, no fluff.
+- **`docs/ARCHITECTURE.md` §10 "Where to look" rows are pointers, not prose**: `path + ≤1 sentence + one anchor issue/ADR ref`, linking a package `README.md` for anything longer. The long-form behavioral contract, invariants, and issue history for a package live in that package's `README.md`, next to the code — an agent touching the package reads them in context instead of every agent paying for all of them up front. `scripts/test verify` fails any ARCHITECTURE.md line over 1000 chars (fat single-line rows are silently truncated by agents' file-read tooling, which cuts lines around 2000 chars).
 - Public-facing docs deploy via GitHub Pages (source path TBD).
 
 ## Build, test, lint
@@ -154,7 +155,7 @@ Because `--all` always rebuilds `fishhawk-mcp`, the closing MCP banner is **deco
 2. Branch from `origin/main`: `<issue-slug>-<desc>`, e.g. `e3.1-backend-skeleton`.
 3. Commit with `git commit -s` (DCO is mandatory; PRs without sign-off are rejected). Imperative-mood title, no conventional-commits prefix. Use HEREDOC for multi-line messages.
 4. **Update docs in the same PR**, before opening:
-   - New package / HTTP route / env var / flag → `docs/ARCHITECTURE.md` "Where to look" table; operator-facing inputs also → component `README.md`.
+   - New package / HTTP route / env var / flag → a pointer row in `docs/ARCHITECTURE.md` "Where to look" (path + ≤1 sentence, no history — the verify gate caps line length at 1000 chars) with the long-form contract in the owning package's `README.md`; operator-facing inputs also → component `README.md`.
    - Spec or schema change → `docs/spec/<x>.md` + every embedded copy (CI's schema-sync diff fails otherwise).
    - HTTP API change → `docs/api/v0.openapi.yaml` (source of truth) + `docs/api/v0.md`.
    - Add / remove / rename an issue-comment surface (Notifier method or audit kind) → `docs/issue-comment-surfaces.md`.
