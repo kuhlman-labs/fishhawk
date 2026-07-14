@@ -99,6 +99,90 @@ The credential store is a single JSON file at `$XDG_CONFIG_HOME/fishhawk/credent
 
 `audit tail` polls the audit endpoint on a configurable interval (default 2s, minimum 500ms) and prints new entries as they land. It exits cleanly on Ctrl-C. There's no server-side SSE today — if streaming demand grows we'd add one and migrate the client.
 
+## Local-runner spawn (`fishhawk runner start`, E22.9 / #407)
+
+`fishhawk runner start --run-id … --stage-id … --workflow … --stage …` (`cmd/fishhawk/runner.go`) is a thin wrapper
+around the `fishhawk-runner` binary. It composes the runner's argv from the operator's config — backend URL via
+`--backend-url`, token via the `FISHHAWK_API_TOKEN` env — auto-detects `--github-repo` from
+`git remote get-url origin` when not set, and defaults `--no-pr` on (the operator commits themselves).
+
+- **Test seams:** three seams (`runnerStartCommand`, `runnerBinaryLookPath`, `gitRemoteOriginURL`) let unit tests
+  assert on the constructed argv without actually spawning the binary.
+- **Binary resolution order:** `--runner-binary` flag > `FISHHAWK_RUNNER_BIN` env > `exec.LookPath("fishhawk-runner")`.
+
+It closes the Phase C dev loop with #406's runner flags as the substrate.
+
+## Campaign command internals (E25.9 / #1448)
+
+`cmd/fishhawk/campaign.go` (`campaign start|status|list|resume`, documented above) is a thin terminal surface over the
+E25.4 campaign REST endpoints — `POST /v0/campaigns`, `GET /v0/campaigns/{id}/status`, `GET /v0/campaigns`, and
+`POST /v0/campaigns/{id}/resume` — via the typed `CreateCampaign`/`GetCampaignStatus`/`ListCampaigns`/`ResumeCampaign`
+client methods in `internal/httpclient/`.
+
+History: the campaign `operator_agent` override (E25.12 / #1451) was **deferred on the CLI** when E25.9 shipped —
+wiring `campaign start --operator-agent '<json>'` required adding the field to `httpclient.CreateCampaignInput`
+(`cli/internal/httpclient/httpclient.go`), which fell outside that slice's scope (its scope amendment was not granted
+in time), so the MCP `fishhawk_start_campaign` tool carried the override first. The CLI flag has since landed as the
+small typed-wrapper follow-up (see `campaign` above).
+
+## Compliance-export internals (E9.4 / #1607)
+
+`cmd/fishhawk/export.go::runExport` is the reference consumer of `GET /v0/audit/export`(`.csv`); the operator behavior
+is documented under `export` above. Implementation notes:
+
+- `paginate` follows the `X-Fishhawk-Export-Complete` / `X-Fishhawk-Export-Next-Cursor` header continuation
+  automatically, assembling ONE complete bounded file.
+- `assembleJSONExport` keeps each `runs` value + `schema`/`exported_at` as `json.RawMessage`, so run subtrees are
+  byte-preserved and the assembled body is exactly the three-field Export v1 shape the verifier's
+  `DisallowUnknownFields` `ParseExport` accepts. It unions the per-page `runs` maps (disjoint — the global partition
+  is first-page-only), erroring on a duplicate run key or a complete=false page with no cursor.
+- `assembleCSVExport` concatenates pages keeping only page 1's header row, erroring on a header mismatch.
+- `writeExportOutput` writes `--out` atomically (temp file + rename).
+- Client methods `ExportAudit`/`ExportAuditCSV`/`exportRaw` in `cli/internal/httpclient/httpclient.go` return the raw
+  body + parsed continuation headers.
+- The pgtest-backed cross-module round-trip through the built `fishhawk-verify` binary (seed → export → verify exit 0;
+  tamper → exit 1 `hash_mismatch`) lives in `backend/internal/server/audit_export_roundtrip_test.go`.
+
+## Onboarding preflight internals (E29.5; `--spec-only` E36.1 / #1639)
+
+`cmd/fishhawk/doctor_onboarding.go` extends `fishhawk doctor` (`doctor.go`) into the per-repo onboarding preflight
+documented above. Implementation notes:
+
+- `checkOnboardingReadiness(backendURL, token, repo)` calls the E29.4 endpoint
+  (`GET /v0/onboarding/readiness?repo=owner/name`, served by `backend/internal/server/onboarding.go`) ONCE via the
+  `doctorHTTPDo` seam and expands its payload into one `checkResult` per precondition: **app installed** (fail +
+  install-URL remediation when not installed), **reviewer available: `<provider>`** per declared reviewer (fail
+  carrying the adapter `missing_hint` verbatim), **token scope adequate** (fail listing `scopes.missing` + a
+  `fishhawkd token issue` reissue hint), and **workflow spec (committed) valid** (fail with the server parse/validate
+  error + a `fishhawk validate` hint when `source==fetched && !valid`; warn when `source==unavailable`).
+- Any transport error / non-200 / unresolved repo degrades to a single WARN — never a crash.
+- `checkExecutionPath(workingDir)` is the client-side complement: a shallow `yaml.v3` parse of the discovered
+  `.fishhawk/workflows.yaml` that reports ok only when EVERY stage declares a non-empty executor (agent, human, or
+  delegate) and FAILs naming the unconfigured stage(s) — a mixed workflow (some stages configured, at least one not)
+  is flagged (an E29.5 approval condition).
+- The `--repo` flag targets the readiness probe, auto-detected from git origin via `detectGitHubRepo` when unset.
+- No backend changes were needed: E29.4 ships every server-side probe.
+- `--spec-only` (E36.1 / #1639) restricts the run to the two environment-free rungs — `checkSpec` (schema validity) +
+  `checkExecutionPath` (per-stage executor coverage) — and skips every docker/backend/token/MCP/git/gh/onboarding rung.
+
+Operator guide: `docs/onboarding.md`.
+
+## Init internals (E29.3)
+
+`cmd/fishhawk/init.go::runInit` implements the `fishhawk init` behavior documented above. Implementation notes:
+
+- Resolves the repo root by walking up from `--working-dir` to the `.git` boundary (`resolveRepoRoot`, mirroring
+  `spec_discover.go`; falls back to the working dir when no `.git`).
+- Writes `<root>/.fishhawk/workflows.yaml` via the E29.1 `spec.Generate` (`cli/internal/spec`), which validates its
+  own output and fails closed on an invalid delta.
+- `bridge.EnsureAgentDocs` (E29.2, `cli/internal/bridge`) ensures the AGENTS.md managed block + the CLAUDE.md
+  `@AGENTS.md` import — idempotent, with per-file status reported.
+- The printed App-install prerequisite URL (`https://github.com/apps/fishhawk/installations/new`) is the same URL
+  `doctor_onboarding.go` emits.
+- Closes by calling `runDoctor` with the equivalent flags (soft — a doctor failure is reported but does not fail
+  `init`, because the scaffold succeeded).
+- Purely additive: reuses E29.1 + E29.2; no schema/API/state changes.
+
 ## Global flags
 
 | Flag | Env | Default |

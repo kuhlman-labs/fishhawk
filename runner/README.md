@@ -57,6 +57,18 @@ For implement stages the runner additionally commits the agent's edits, pushes a
 
 The compile/test/verify gates run *committed agent-authored code* (`go vet`, `go test`, and the spec `executor.verify.command`). For the implement stage the spec `executor.verify.command` runs `scripts/test verify` (golangci-lint per module THEN the test loop, no coverage), so formatting/lint defects fail the stage's verify in-loop rather than red-lining the PR in CI after the agent is terminal (#1064). Because `sanitizedGateEnv` passes PATH through, golangci-lint on the runner's PATH is reachable; `scripts/test verify` fails closed with an actionable error if it is absent, never silently skipping lint. Those subprocesses run with the runner's credentials stripped from their env (ADR-029 #650 item 4, `sanitizedGateEnv`): the GitHub App installation token, agent API keys, and MCP backend token are NOT visible to agent code — only PATH/HOME/system essentials and the Go toolchain (`GO*`/`CGO_*`) vars are passed through. The git-plumbing operations (worktree/rev-parse/reset) keep the inherited env so push/auth still work.
 
+## Pre-checkout App-token flow (E5.X / #201)
+
+The canonical `fishhawk.yml` workflow opens with three steps before the runner:
+
+1. **Inline OIDC exchange** (or `kuhlman-labs/fishhawk/auth@auth/vX.Y.Z` for customers using the published action) — fetches an OIDC ID token bound to the workflow run via the `ACTIONS_ID_TOKEN_REQUEST_*` env vars, exchanges it at the backend's installation-token endpoint, masks the result with `::add-mask::`, and writes it to `$GITHUB_OUTPUT`.
+2. **`actions/checkout@v6` with `token: ${{ steps.fishhawk-auth.outputs.token }}`** — sets up the local `http.<host>.extraheader` with the App's token, so the initial clone authenticates as the App.
+3. **`./runner`** — the runner always mints a fresh App token at push-time via the backend's installation-token endpoint (`auth_method=ed25519`, signed by the per-run signing key), so a long-running implement stage doesn't outlive the auth pre-step's ~1-hour-TTL token. The fresh token is written to `http.<host>.extraheader` via `git config --local --replace-all` immediately before push; `gitops.CommitAndPush.PushToken` is the field that flows it through.
+
+The audit ledger ends up with two `installation_token_issued` events per implement stage: the OIDC one at workflow start (used by `actions/checkout`), and the Ed25519 one right before push (used by `git push` + PR creation).
+
+The workflow needs `permissions: id-token: write, contents: read`. Installing the App is the only repo-side dependency.
+
 ## Choosing the coding agent (Claude Code or Codex)
 
 The runner can drive either of two coding-agent providers, selected by the `agent` action input (see the [Inputs](#inputs-actionyml) table above). The provider story (#839 runner provider selection, #840 the Codex adapter, #841 the Actions wiring):
@@ -200,7 +212,7 @@ The acceptance stage is the one agent invocation that holds code execution, netw
 
 ### Acceptance target-identity gate + preview provisioning (E31.18 / #1569)
 
-`docs/acceptance-preview.md` is the full, build-system-agnostic hook-contract reference (injected env vars, exit-code semantics, timeouts, the teardown-on-every-return guarantee, the runner's event vocabulary, and a self-contained docker-compose worked example). The summary below covers the dogfood posture.
+`docs/acceptance-preview.md` (E36.2 / #1640) is the full, build-system-agnostic hook-contract reference (injected env vars, exit-code semantics, timeouts, the teardown-on-every-return guarantee, the runner's event vocabulary, and a self-contained docker-compose worked example). The summary below covers the dogfood posture.
 
 Before the acceptance agent spawns, the runner verifies that the first spec-declared `egress.target_hosts` entry actually serves the run's merge candidate — otherwise acceptance validates whatever build happens to answer there (typically current `main`). The backend sends the expected head SHA on the acceptance prompt response (`acceptance_expected_head_sha`); the runner probes `<host>/healthz` (http first for loopback/IP-literal hosts, https first otherwise, always falling back to the other scheme) and compares the body's `git_sha` build identifier:
 
@@ -211,12 +223,32 @@ Before the acceptance agent spawns, the runner verifies that the first spec-decl
 
 No declared target hosts skips the gate entirely. The probe dials direct from the runner process — the egress proxy contains the agent, not the runner.
 
+#### Backend wire and gate internals
+
+`backend/internal/server/prompt.go::resolveAcceptanceExpectedHeadSHA` resolves the run's merge-candidate identity — the newest reported PR-head SHA from the reported-head audit ledger (the `resolveFixupExpectedHeadSHA` pattern; best-effort WARN-and-omit on an empty ledger or read error, so a ledger gap can never hard-fail a stage) — and both prompt handlers set it as `acceptance_expected_head_sha` on their acceptance branches, next to `egress_target_hosts`.
+
+The runner decodes it on `runner/internal/upload/upload.go::FetchedPrompt.AcceptanceExpectedHeadSHA` (byte-identical json tag, lockstep-asserted). The "merge candidate" is the PR head SHA, not a synthesized merge commit — a base that moved after branch-off is exercised by the PR's required CI at merge time.
+
+Runner side, `runner/cmd/fishhawk-runner/previewprobe.go::acceptanceTargetGate` implements the provision → readiness → gate sequence, wired into `main.go`'s acceptance pre-spawn block; `probeTargetIdentity` performs the `/healthz` GET and the four-outcome classification above.
+
 Operator env vars (runner-process config; acceptenv excludes all of them from the agent env):
 
 - **`FISHHAWK_ACCEPTANCE_PREVIEW_CMD`** — optional provisioning hook, run via `sh -c` in the operator's dispatch `working_dir` (falling back to the runner's cwd when none was dispatched) **before** the identity gate, with `FISHHAWK_PREVIEW_SHA` (the expected head) and `FISHHAWK_PREVIEW_TARGET_HOST` (the first declared target host) added to its env. Anchoring to the dispatch checkout means a relative provision command like `scripts/dev preview` now resolves correctly from a worktree-launched MCP session — the operator's checkout carries the untracked `.env`, the runner-inherited fishhawk-mcp cwd does not (#1746). The dogfood value is `scripts/dev preview`. A non-zero exit or timeout fails the stage pre-spawn, category C, reason `acceptance_preview_provision_failed` (exit state + output tail in the detail). After a successful provision the runner readiness-polls the probe every 2s until verified or the ready budget expires; without a provision command the gate is single-shot (3 quick attempts absorb connection blips, definitive answers gate immediately). The provisioned preview instance runs UNTRUSTED merge-candidate code, so the dogfood `scripts/dev preview` hands that binary a **least-privilege** database credential — a dedicated non-superuser role that owns only the throwaway `<db>_preview` database and is denied `CONNECT` to the dev database — never the operator's superuser URL (E31.19 / #1577). An external operator wiring a custom provision command against a shared Postgres should mirror this: give the preview binary a role scoped to a throwaway database, not the admin credential.
 - **`FISHHAWK_ACCEPTANCE_PREVIEW_TEARDOWN_CMD`** — optional teardown hook (same `sh -c` + env contract), deferred so it runs on **every** post-provision exit: after the verdict ships on the happy path, and before the stage failure returns on readiness-timeout/stale/any pre-spawn gate failure. Best-effort — a teardown failure logs `acceptance_preview_teardown_failed` and never changes the stage outcome. Configuring a provision command with **no** teardown command leaks the provisioned instance; the runner emits an advisory `acceptance_preview_teardown_missing` warning on that path (it does not block provisioning — a self-tearing-down provision command is legitimate).
 - **`FISHHAWK_ACCEPTANCE_PREVIEW_TIMEOUT_SECS`** — provision/teardown command budget (default 300; the command typically includes a Go build).
 - **`FISHHAWK_ACCEPTANCE_PREVIEW_READY_TIMEOUT_SECS`** — post-provision readiness budget (default 60).
+
+#### Dogfood preview (`scripts/dev preview` / `preview-down`)
+
+`scripts/dev preview [<sha-or-ref>]` (the arg defaults to `$FISHHAWK_PREVIEW_SHA` so the provisioning hook can invoke it bare) fetches + resolves the merge candidate and checks it out in a detached worktree under `.fishhawk/cache/preview-worktree` — inside the already-gitignored `.fishhawk/cache/`, so a live preview never dirties the main tree's `git status` or `-dirty`-stamps dev builds.
+
+It builds fishhawkd GitSHA-stamped via the existing `_build_ldflags` path (clean detached checkout → no `-dirty`), DROP/CREATEs the isolated `<dbname>_preview` database on each start (PR-branch migrations never touch the dev DB) and migrates it with the preview binary, then serves on `FISHHAWK_PREVIEW_ADDR` (default `localhost:8090`, distinct from the orchestrating 8080), gated on `/healthz` echoing the stamped `git_sha` (pid tracked in `.fishhawk/preview.pid`). `scripts/dev preview-down` TERM→KILLs the tracked pid and removes the worktree.
+
+**Least-privilege preview credential (E31.19 / #1577).** The UNTRUSTED merge-candidate binary is NOT handed the operator's dev-Postgres superuser URL. `scripts/dev preview` provisions a dedicated non-superuser role (default `fishhawk_preview`; `FISHHAWK_PREVIEW_DB_ROLE` / `FISHHAWK_PREVIEW_DB_PASSWORD` overridable) that OWNS only the throwaway `<dbname>_preview` database and is DENIED CONNECT to the dev database (`REVOKE CONNECT … FROM PUBLIC` and explicitly from the role).
+
+The role is NORMALIZED (`ALTER ROLE … NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`) on every provision, so a pre-existing/tampered role is forced back to the contract. The admin (operator) URL is used ONLY for the privileged role/DB provisioning and never reaches branch code; the preview URL the binary receives bears the least-privilege role.
+
+The role is a stable, idempotently-(re)created artifact — not dropped at `preview-down` (it owns the persisted preview DB). The `REVOKE CONNECT … FROM PUBLIC` on the dev DB is a documented durable side effect (rollback SQL in the `scripts/dev` header comment). Preview helpers are unit-tested in `scripts/test-dev` (pure URL/SQL shape + an optional live psql-gated containment check of both role-connect modes).
 
 #### Merge-candidate tree for repository-content criteria (#1881)
 
@@ -231,7 +263,7 @@ Span shape (one trace per run, stitched under the deterministic `otelemit.TraceI
 - `stage <name>` — parent span; attrs `fishhawk.run_id`, `fishhawk.stage`. Span status records the stage outcome (Ok / Error).
 - `chat <model>` — child model-call span; GenAI-semconv attrs `gen_ai.system=anthropic`, `gen_ai.operation.name=chat`, `gen_ai.request.model`, `gen_ai.usage.input_tokens` / `output_tokens`, optional `gen_ai.request.temperature`; plus `fishhawk.*` cost/repro attrs `cost.usd`, `cost.estimated`, `cost.priced`, `pricing.as_of`, `latency_ms`, `repro.temperature_available`.
 
-To view traces locally, start the opt-in Jaeger all-in-one (`docker compose --profile otel up -d`), set `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318`, and open the Jaeger UI at http://localhost:16686. **Caveat**: the collector must be reachable from where the runner actually executes — under the standard dogfood loop the runner runs on a GitHub-hosted CI runner where `localhost:4318` is the CI host's loopback, so end-to-end local viewing requires invoking `fishhawk-runner` locally (see "Local invocation" above). Full span-attribute reference and the GHA-export deferral are in `docs/ARCHITECTURE.md` §10 ("Local OTLP trace collector").
+To view traces locally, start the opt-in Jaeger all-in-one (`docker compose --profile otel up -d`), set `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318`, and open the Jaeger UI at http://localhost:16686. **Caveat**: the collector must be reachable from where the runner actually executes — under the standard dogfood loop the runner runs on a GitHub-hosted CI runner where `localhost:4318` is the CI host's loopback, so end-to-end local viewing requires invoking `fishhawk-runner` locally (see "Local invocation" above). Full span-attribute reference, the k8s Jaeger story (#895), and the GHA-export deferral are in `internal/otelemit/README.md`.
 
 ## Releases
 

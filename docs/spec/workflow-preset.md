@@ -20,13 +20,15 @@ budgets, constraints, and gates are identical.
 
 ### The handle-free approval gate
 
-The presets carry NO fishhawk-repo-specific defaults and no
-`@your-github-handle` placeholder. Their approval gates use the
+The presets carry NO fishhawk-repo-specific defaults (E36.1 / #1639) and
+no `@your-github-handle` placeholder. Their approval gates use the
 forge-neutral [`approvals` block](workflow-v1.md#approval-gate-predicate-v1)
-— `approvals: {count: 1, not: [author, agent]}` (ADR-055's ratified
-preset default: one approval, excluding the change's author and any agent
-identity) — so a freshly-scaffolded repo needs **no** top-level `roles`
-map and **no** GitHub handle to fill in before its first run.
+— `approvals: {count: 1, not: [author, agent]}` (E39.2 / #1707; ADR-055's
+ratified preset default: one approval, excluding the change's author and
+any agent identity) — so a freshly-scaffolded repo needs **no** top-level
+`roles` map and **no** GitHub handle to fill in before its first run.
+The repo's own `.fishhawk/workflows.yaml` is intentionally NOT a preset
+mirror: it keeps `@kuhlman-labs` and `scripts/test verify`.
 
 ### Placeholder value every operator must replace
 
@@ -53,7 +55,8 @@ validate.
 
 ## The generator and its delta surface
 
-`cli/internal/spec/preset.go` implements `Generate(preset, deltas)`: it
+`cli/internal/spec/preset.go` implements `Generate(preset, deltas)`
+(alongside the `Deltas` type and the `PresetBytes` embed accessor): it
 loads the chosen preset's canonical bytes, applies structured deltas via
 `yaml.v3` node edits (preserving comments and ordering — no struct
 round-trip), then validates the result through the existing
@@ -72,8 +75,10 @@ The generator lives in `cli/internal/spec` so `fishhawk init` stays
 standalone — no backend round-trip. The backend/CLI module wall
 (`backend/` and `cli/` cannot import each other's `internal/` packages)
 means the generator cannot be shared; the backend side (E29.7 App-PR)
-receives the mirrored embedded presets plus a validation test now, and
-its own generator is deferred to E29.7.
+receives the mirrored embedded presets plus a validation test now —
+exposed via the `PresetBytes` embed accessor in
+`backend/internal/spec/preset.go` — and its own generator is deferred to
+E29.7.
 
 ## Embed / mirror / sync discipline
 

@@ -1486,10 +1486,18 @@ missing `installation_id`, unparseable `trigger_ref`, or non-issue
 
 Every surface above is delivered through the `Channel` interface
 (`channel.go`). In v0 there is exactly ONE channel — the GitHub-comment
-channel, `*Notifier` — and `Router` (`NewRouter(channels…)`) is the
+channel, `*Notifier` (the compile-time `var _ Channel = (*Notifier)(nil)`
+proves conformance) — and `Router` (`NewRouter(channels…)`) is the
 notification core that fans each `Notify*` call out to its registered
 channels. With a single channel the fan-out is a pass-through, so the
 routing structure changed but the delivered output did not.
+`server.issueNotifier` and the webhook dispatcher's `IssueNotifier` are
+both typed at the `Channel`/`Router` seam, and `server.New` only wraps a
+non-nil channel so the nil-notifier nil-semantics are preserved.
+(Historically `Notifier.New` returned nil when `ExternalURL`, the GitHub
+client, or the audit repo weren't wired — the demo-loop pre-#234
+posture; since #1787 the `ExternalURL` condition is dropped, see the
+run-link degradation note above.)
 
 The **(audit category, kind) taxonomy** in the table above is the routing
 key: a channel decides what to deliver and how to dedup from that taxonomy.
@@ -1503,8 +1511,12 @@ semantics to carry forward when that adapter lands:
   per-channel dedup (so a Slack post doesn't suppress a GitHub post) is a
   deferred v0.x design.
 - The Router is nil-safe (nil receiver / nil channel entries skipped),
-  matching the existing nil-safe `Notifier` posture, so call sites need no
-  nil checks.
+  matching the existing nil-safe `Notifier.NotifyXxx` posture, so call
+  sites need no nil checks.
+
+GitHub client surface for the v0 channel: `CreateIssueComment` +
+`UpdateIssueComment`; the App's `issues: write` permission was already in
+the manifest.
 
 ## Local-runner runs (#416, #428)
 
