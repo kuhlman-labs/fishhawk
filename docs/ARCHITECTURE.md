@@ -342,6 +342,20 @@ Designed under E2.1 (#22). Tables (immutable schema once frozen at Day 21):
 
 Connection pool: `pgxpool.Pool` per service instance.
 
+#### 5.1.1 Tenancy schema (ADR-057) — forge-neutral by construction (ADR-058)
+
+Migration `0052` (#1854, ADR-057 / ADR-058 keystone #1823/#1851) creates the first two tenancy tables **carrying a forge `provider` discriminator at birth**, so a second forge (GitLab, ADR-058) becomes an *additive* provider rather than a constraint migration that has to retrofit a GitHub-shaped schema. No code reads or writes these tables yet — E44.1 (#1825) extends them via additive ALTERs (`account_members`, `account_id` columns) instead of re-creating them GitHub-shaped.
+
+- `accounts` — one row per tenant forge account. `(id, provider, account_key, display_name, granularity, home_region, forge_base_url, oauth_base_url, …)`. `provider TEXT NOT NULL DEFAULT 'github'` with `accounts_provider_check CHECK (provider IN ('github','gitlab'))`. `granularity` admits `('enterprise','organization','group')` — enterprise/organization are the ADR-057 GitHub grains, group is GitLab's. Natural key is forge-neutral: `UNIQUE (provider, account_key)` (GitHub enterprise slug / org login today, GitLab group path later — the same key string in two forges never collides). `UNIQUE (id, provider)` anchors the `installations` composite FK.
+- `installations` — one row per credential scope. `(id, account_id, provider, installation_ref, …)`. `provider` carries the same CHECK; `installation_ref TEXT NOT NULL` is the forge-neutral credential-scope key (the stringified GitHub App installation id today, a GitLab group OAuth-application authorization ref later — **TEXT, not the `installationID` int64** the pre-ADR-058 code assumed, the ADR-058 Phase 1 seam, #1756). `FOREIGN KEY (account_id, provider) REFERENCES accounts (id, provider) ON DELETE CASCADE` structurally pins an installation's provider to its account's, so the two can never diverge.
+
+**Binding contract for the E44 children** (inherited from this schema):
+
+1. Every tenancy-scoped table added by E44.1+ carries or joins through the `provider` dimension.
+2. E44.6 RLS predicates and E44.4 per-account audit-chain keys scope by `account_id`, whose identity already embeds `provider` via `UNIQUE (provider, account_key)`.
+3. Endpoint-config columns are forge-neutral (`forge_base_url` / `oauth_base_url`, NULL = provider default endpoints — api.github.com / github.com today), **never** provider-named (no `github_base_url`).
+4. `installation_ref` is the forge-neutral credential-scope key replacing the `installationID` int64 assumption.
+
 ### 5.2 S3 (trace bundles)
 
 - Bucket-per-environment: `fishhawk-traces-{env}`.

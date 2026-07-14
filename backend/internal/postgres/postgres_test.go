@@ -491,6 +491,163 @@ func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
 		t.Error("insert api_token with auth_method='bogus' succeeded, want CHECK-constraint rejection")
 	}
 
+	// 0052 (#1854, ADR-057 / ADR-058) created the accounts + installations
+	// tenancy tables carrying a forge `provider` discriminator at birth. These
+	// are behavioral done-means assertions (a comment-only touch cannot pass):
+	// both tables exist; provider defaults to 'github'; the CHECK admits
+	// 'gitlab' but rejects 'bitbucket' (the additive-provider guarantee);
+	// (provider, account_key) is unique; the endpoint columns are forge-neutral
+	// (no accounts column matches 'github_%'); and an installation's provider is
+	// pinned to its account's by the composite FK.
+	var accountsTable, installationsTable int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'accounts'`,
+	).Scan(&accountsTable); err != nil {
+		t.Fatalf("query accounts table: %v", err)
+	}
+	if accountsTable != 1 {
+		t.Errorf("'accounts' table count after MigrateUp = %d, want 1", accountsTable)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'installations'`,
+	).Scan(&installationsTable); err != nil {
+		t.Fatalf("query installations table: %v", err)
+	}
+	if installationsTable != 1 {
+		t.Errorf("'installations' table count after MigrateUp = %d, want 1", installationsTable)
+	}
+	// Default mode: INSERT omitting provider reads back the shipped 'github'
+	// default (asserts the DEFAULT, not just column presence).
+	githubAccountID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO accounts (id, account_key) VALUES ($1, 'acme-corp')`,
+		githubAccountID,
+	); err != nil {
+		t.Errorf("insert account without provider after MigrateUp failed: %v", err)
+	}
+	var accountProvider, accountGranularity string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT provider, granularity FROM accounts WHERE id = $1`, githubAccountID,
+	).Scan(&accountProvider, &accountGranularity); err != nil {
+		t.Fatalf("read back account provider/granularity: %v", err)
+	}
+	if accountProvider != "github" {
+		t.Errorf("accounts.provider default = %q, want github", accountProvider)
+	}
+	if accountGranularity != "enterprise" {
+		t.Errorf("accounts.granularity default = %q, want enterprise", accountGranularity)
+	}
+	// CHECK fail-closed mode: an out-of-set provider is rejected on accounts.
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO accounts (id, provider, account_key) VALUES ($1, 'bitbucket', 'bb-team')`,
+		uuid.New(),
+	); err == nil {
+		t.Error("insert account with provider='bitbucket' succeeded, want accounts_provider_check rejection")
+	}
+	// Additive-provider mode: 'gitlab' succeeds (the guarantee #1854 exists to
+	// preserve — a narrower CHECK would fail this).
+	gitlabAccountID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO accounts (id, provider, account_key, granularity)
+		 VALUES ($1, 'gitlab', 'acme-group', 'group')`,
+		gitlabAccountID,
+	); err != nil {
+		t.Errorf("insert account with provider='gitlab' after MigrateUp failed (narrower CHECK?): %v", err)
+	}
+	// Uniqueness mode: a duplicate (provider, account_key) is rejected. The
+	// same account_key under a DIFFERENT provider does NOT collide (the key is
+	// provider-scoped).
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO accounts (id, provider, account_key) VALUES ($1, 'github', 'acme-corp')`,
+		uuid.New(),
+	); err == nil {
+		t.Error("duplicate (github, acme-corp) account insert succeeded, want unique-constraint conflict")
+	}
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO accounts (id, provider, account_key, granularity)
+		 VALUES ($1, 'gitlab', 'acme-corp', 'group')`,
+		uuid.New(),
+	); err != nil {
+		t.Errorf("insert (gitlab, acme-corp) account failed, want success (account_key is provider-scoped): %v", err)
+	}
+	// Forge-neutral-naming mode: the endpoint-config columns exist AND no
+	// accounts column is provider-named (pins acceptance criterion 2 as a test).
+	var forgeBaseURLCol, oauthBaseURLCol, githubNamedCols int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'accounts' AND column_name = 'forge_base_url'`,
+	).Scan(&forgeBaseURLCol); err != nil {
+		t.Fatalf("query accounts.forge_base_url column: %v", err)
+	}
+	if forgeBaseURLCol != 1 {
+		t.Errorf("accounts.forge_base_url count after MigrateUp = %d, want 1", forgeBaseURLCol)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'accounts' AND column_name = 'oauth_base_url'`,
+	).Scan(&oauthBaseURLCol); err != nil {
+		t.Fatalf("query accounts.oauth_base_url column: %v", err)
+	}
+	if oauthBaseURLCol != 1 {
+		t.Errorf("accounts.oauth_base_url count after MigrateUp = %d, want 1", oauthBaseURLCol)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'accounts' AND column_name LIKE 'github_%'`,
+	).Scan(&githubNamedCols); err != nil {
+		t.Fatalf("query accounts github_%% columns: %v", err)
+	}
+	if githubNamedCols != 0 {
+		t.Errorf("accounts has %d column(s) named 'github_%%', want 0 (endpoint columns must be forge-neutral)", githubNamedCols)
+	}
+	// An installations row FK'd to the github account inserts and reads back its
+	// TEXT credential-scope key.
+	installationID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO installations (id, account_id, installation_ref) VALUES ($1, $2, '4242')`,
+		installationID, githubAccountID,
+	); err != nil {
+		t.Errorf("insert installation FK'd to github account after MigrateUp failed: %v", err)
+	}
+	var installationProvider, installationRef string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT provider, installation_ref FROM installations WHERE id = $1`, installationID,
+	).Scan(&installationProvider, &installationRef); err != nil {
+		t.Fatalf("read back installation provider/ref: %v", err)
+	}
+	if installationProvider != "github" {
+		t.Errorf("installations.provider default = %q, want github", installationProvider)
+	}
+	if installationRef != "4242" {
+		t.Errorf("installations.installation_ref round-trip = %q, want 4242", installationRef)
+	}
+	// CHECK fail-closed mode (installations): an out-of-set provider is rejected.
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO installations (id, account_id, provider, installation_ref)
+		 VALUES ($1, $2, 'bitbucket', 'bb-1')`,
+		uuid.New(), githubAccountID,
+	); err == nil {
+		t.Error("insert installation with provider='bitbucket' succeeded, want installations_provider_check rejection")
+	}
+	// Provider-coherence mode: an installation whose provider differs from its
+	// account's is rejected by the composite FK (the github account has no
+	// (id, 'gitlab') row to reference).
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO installations (id, account_id, provider, installation_ref)
+		 VALUES ($1, $2, 'gitlab', 'mismatch-1')`,
+		uuid.New(), githubAccountID,
+	); err == nil {
+		t.Error("insert installation whose provider ('gitlab') differs from its account's ('github') succeeded, want composite-FK rejection")
+	}
+	// An installation matching its account's provider succeeds via the composite FK.
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO installations (id, account_id, provider, installation_ref)
+		 VALUES ($1, $2, 'gitlab', 'gl-auth-1')`,
+		uuid.New(), gitlabAccountID,
+	); err != nil {
+		t.Errorf("insert gitlab installation FK'd to gitlab account failed, want success (composite FK matches): %v", err)
+	}
+
 	// Second application is a no-op.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Errorf("second MigrateUp returned %v, want nil (idempotent)", err)
@@ -519,22 +676,43 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0051 (#1587) is now the latest
-	// migration: it is an additive CHECK widening that admitted the
-	// 'release_notes' artifact kind into artifacts_kind_check (no column, no new
-	// state). So its rollback narrows artifacts_kind_check back to the 0045 set
-	// (plan/pull_request/deployment/acceptance) and touches nothing else, while
-	// 0050's (#1708) api_tokens.auth_method/provider columns, 0044's
-	// (#1519) stages_type_check 'acceptance' member, 0043's (#1417)
+	// MigrateDown rolls back one step. 0052 (#1854, ADR-057 / ADR-058) is now
+	// the latest migration: it CREATED the accounts + installations tenancy
+	// tables (carrying the forge `provider` discriminator at birth). So its
+	// one-step rollback DROPS both tables and touches nothing else, while every
+	// prior migration's effect SURVIVES — notably 0051's (#1587)
+	// artifacts_kind_check 'release_notes' member (no longer the migration
+	// rolled back), 0050's (#1708) api_tokens.auth_method/provider columns,
+	// 0044's (#1519) stages_type_check 'acceptance' member, 0043's (#1417)
 	// runs.upstream_run_id column + partial index, 0042's (#1455)
 	// campaigns.idempotency_key column + unique index, 0041's (#1451)
-	// operator_agent column, 0040's (#1446) pause_policy + pause_reason
-	// columns and widened 'paused' state CHECK now SURVIVE the one-step down
-	// (they are prior migrations). 0039's (#1437) campaigns + campaign_items
-	// tables themselves likewise still EXIST, as does every earlier
-	// migration's effect — notably 0038's (#1400) widened stages_type_check
-	// ('deploy'), 0037's (#1385) artifacts_kind_check 'deployment', 0036's
-	// (#1346) runs.runner_kind_resolved column, etc.
+	// operator_agent column, and 0040's (#1446) pause_policy + pause_reason
+	// columns + widened 'paused' state CHECK. 0039's (#1437) campaigns +
+	// campaign_items tables likewise still EXIST, as does every earlier
+	// migration's effect — 0038's (#1400) widened stages_type_check ('deploy'),
+	// 0037's (#1385) artifacts_kind_check 'deployment', 0036's (#1346)
+	// runs.runner_kind_resolved column, etc.
+	//
+	// This is the binding TestMigrateDown flip for 0052: accounts and
+	// installations must be ABSENT after the one-step down, while 0051's
+	// 'release_notes' widening (now a prior migration) SURVIVES.
+	var accountsTableDown, installationsTableDown int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'accounts'`,
+	).Scan(&accountsTableDown); err != nil {
+		t.Fatalf("query accounts table: %v", err)
+	}
+	if accountsTableDown != 0 {
+		t.Errorf("'accounts' table count after MigrateDown = %d, want 0 (0052 rolled back)", accountsTableDown)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'installations'`,
+	).Scan(&installationsTableDown); err != nil {
+		t.Fatalf("query installations table: %v", err)
+	}
+	if installationsTableDown != 0 {
+		t.Errorf("'installations' table count after MigrateDown = %d, want 0 (0052 rolled back)", installationsTableDown)
+	}
 	var campaignsTable, campaignItemsTable int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'campaigns'`,
@@ -625,19 +803,18 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query artifacts_kind_check constraint def: %v", err)
 	}
 	if !strings.Contains(artifactsKindCheckDef, "deployment") {
-		t.Errorf("artifacts_kind_check after MigrateDown dropped 'deployment' (0037 still applied; only 0051 rolled back): %s", artifactsKindCheckDef)
+		t.Errorf("artifacts_kind_check after MigrateDown dropped 'deployment' (0037 still applied; only 0052 rolled back): %s", artifactsKindCheckDef)
 	}
-	// 0051 (#1587) IS the migration just rolled back: it is an additive CHECK
-	// widening that admitted the 'release_notes' artifact kind. So its one-step
-	// rollback NARROWS artifacts_kind_check back to the 0045 set — 'release_notes'
-	// must be GONE, while 0045's (#1531) 'acceptance' member SURVIVES (it is no
-	// longer the migration rolled back). This is the binding TestMigrateDown flip
-	// for 0051.
-	if strings.Contains(artifactsKindCheckDef, "release_notes") {
-		t.Errorf("artifacts_kind_check after MigrateDown still admits 'release_notes' (0051 should have rolled it back): %s", artifactsKindCheckDef)
+	// 0051 (#1587) is now a PRIOR migration (only 0052 rolled back), so its
+	// additive 'release_notes' artifact-kind widening SURVIVES the one-step down,
+	// alongside 0045's (#1531) 'acceptance' member. Before 0052 shipped, 0051
+	// was the migration a one-step down rolled back and 'release_notes' had to be
+	// GONE here — 0052 flips that assertion.
+	if !strings.Contains(artifactsKindCheckDef, "release_notes") {
+		t.Errorf("artifacts_kind_check after MigrateDown dropped 'release_notes' (0051 still applied; only 0052 rolled back): %s", artifactsKindCheckDef)
 	}
 	if !strings.Contains(artifactsKindCheckDef, "acceptance") {
-		t.Errorf("artifacts_kind_check after MigrateDown dropped 'acceptance' (0045 still applied; only 0051 rolled back): %s", artifactsKindCheckDef)
+		t.Errorf("artifacts_kind_check after MigrateDown dropped 'acceptance' (0045 still applied; only 0052 rolled back): %s", artifactsKindCheckDef)
 	}
 	// 0046 (#1592) is now a PRIOR migration (only 0049 rolled back), so its
 	// refinement_drafts table SURVIVES the one-step down.
@@ -693,7 +870,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if refinementFiledItemsTable != 1 {
 		t.Errorf("'refinement_filed_items' table count after MigrateDown = %d, want 1 (0048 still applied; only 0049 rolled back)", refinementFiledItemsTable)
 	}
-	// 0049 (#1551) is now a PRIOR migration (only 0051 rolled back), so its
+	// 0049 (#1551) is now a PRIOR migration (only 0052 rolled back), so its
 	// campaign_items.autonomy column SURVIVES the one-step down.
 	var autonomyCol int
 	if err := pool.QueryRow(context.Background(),
@@ -703,12 +880,11 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query campaign_items.autonomy column: %v", err)
 	}
 	if autonomyCol != 1 {
-		t.Errorf("campaign_items.autonomy count after MigrateDown = %d, want 1 (0049 still applied; only 0051 rolled back)", autonomyCol)
+		t.Errorf("campaign_items.autonomy count after MigrateDown = %d, want 1 (0049 still applied; only 0052 rolled back)", autonomyCol)
 	}
-	// 0050 (#1708) is now a PRIOR migration (only 0051 rolled back), so its two
+	// 0050 (#1708) is now a PRIOR migration (only 0052 rolled back), so its two
 	// added api_tokens columns — auth_method + provider — both SURVIVE the
-	// one-step down. This is the binding TestMigrateDown flip for 0050 as 0051
-	// becomes the latest migration.
+	// one-step down.
 	var authMethodCol, providerCol int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
@@ -717,7 +893,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query api_tokens.auth_method column: %v", err)
 	}
 	if authMethodCol != 1 {
-		t.Errorf("api_tokens.auth_method count after MigrateDown = %d, want 1 (0050 still applied; only 0051 rolled back)", authMethodCol)
+		t.Errorf("api_tokens.auth_method count after MigrateDown = %d, want 1 (0050 still applied; only 0052 rolled back)", authMethodCol)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
@@ -726,7 +902,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query api_tokens.provider column: %v", err)
 	}
 	if providerCol != 1 {
-		t.Errorf("api_tokens.provider count after MigrateDown = %d, want 1 (0050 still applied; only 0051 rolled back)", providerCol)
+		t.Errorf("api_tokens.provider count after MigrateDown = %d, want 1 (0050 still applied; only 0052 rolled back)", providerCol)
 	}
 	// 0044 (#1519) is now a PRIOR migration (only 0045 rolled back), so its
 	// widening — the 'acceptance' stage type — must STILL be present in
@@ -1102,9 +1278,9 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 // (drop idempotency_key) then 0041 (drop operator_agent) then 0040 (the
 // normalizing rollback under test) — and assert the final step succeeds AND the
 // rows were normalized to running. The extra steps are needed because 0045
-// (#1531), 0044 (#1519), 0043 (#1417), 0042 (#1455) and 0041 (#1451) now sit
-// above 0040, so fewer MigrateDowns would
-// only roll back the inert CHECK/column changes and never reach 0040's normalization
+// (#1531), 0044 (#1519), 0043 (#1417), 0042 (#1455), 0041 (#1451) and now
+// 0052 (#1854) sit above 0040, so fewer MigrateDowns would
+// only roll back the inert CHECK/column/table changes and never reach 0040's normalization
 // (the campaign tables survive all — 0039 is the table create).
 func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	url := startContainer(t)
@@ -1134,8 +1310,9 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	}
 	pool.Close()
 
-	// Step down past 0051 (narrow artifacts_kind_check — inert re: campaigns)
-	// then 0050 (drop api_tokens.auth_method + provider — additive
+	// Step down past 0052 (drop the accounts + installations tenancy tables —
+	// inert re: campaigns) then 0051 (narrow artifacts_kind_check — inert re:
+	// campaigns) then 0050 (drop api_tokens.auth_method + provider — additive
 	// columns, inert re: campaigns) then 0049 (drop campaign_items.autonomy —
 	// additive column, inert re: the paused rows) then 0048 (drop the refinement
 	// filing ledger — inert re: campaigns) then 0047 (drop refinement_decisions +
@@ -1146,6 +1323,9 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	// inert) then 0042 (drop idempotency_key — inert) then 0041 (drop
 	// operator_agent — inert), all leaving the paused rows untouched, to reach
 	// 0040, the normalizing rollback under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0052) failed: %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0051) failed: %v", err)
 	}
