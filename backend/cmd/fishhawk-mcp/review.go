@@ -576,9 +576,12 @@ Resolves the review_status from the audit trail and:
   - On "pending" (a review was dispatched but the configured reviewers have
     not all landed yet — including the heterogeneous partial-landing window
     where some but not all reviewers have returned) polls the audit endpoint
-    until every configured reviewer lands a terminal entry, the run itself
-    reaches a terminal state (the review can no longer progress — it never
-    strands, ADR-036 #874), or the timeout elapses.
+    until every configured reviewer lands a terminal entry, the run reaches a
+    terminal state with NO review in flight (the review can no longer progress —
+    it never strands, ADR-036 #874), or the timeout elapses. When the run goes
+    terminal WHILE the review is still in flight, the wait keeps polling (#1915):
+    a dispatched review's verdict is recorded with no run-state guard, so it WILL
+    land — the run flip is derived bookkeeping, not a review gate.
 
 Idempotent / resumable: a timeout returns status "pending" plus
 poll_interval_seconds; the wait holds nothing — re-call to resume it, or
@@ -600,7 +603,9 @@ and a terminal *_review_failed audit entry was written — reviews[] carries
 the failure reason. A "pending" status after the timeout means the review is
 genuinely STILL RUNNING (no terminal entry yet); re-call to resume, switch
 to fishhawk_get_run_status polling on poll_interval_seconds, or check the
-fishhawkd logs.
+fishhawkd logs. If the message reports the run has gone terminal while the
+review is in flight, the verdict will still land but the run must be
+re-admitted with fishhawk_revive_run to progress past the gate.
 `),
 	}, resolver.awaitReview)
 }
@@ -620,30 +625,55 @@ func runStateIsTerminal(state string) bool {
 	}
 }
 
-// awaitRunTerminalBackstop resolves the wait when the run itself has reached
-// a terminal state while the review is still pending (ADR-036 #874): the
-// review can never land a verdict, so holding the session open to the
-// deadline would strand the caller. Returns (output, true) to resolve the
-// wait; (zero, false) to keep polling. Best-effort — a GetRun error or a
-// non-terminal run leaves the normal poll/timeout path in charge.
-func (r *runResolver) awaitRunTerminalBackstop(ctx context.Context, runID uuid.UUID, stage string, st *ReviewStatus, start time.Time) (AwaitReviewOutput, bool) {
+// awaitRunTerminalBackstop decides how a pending review's wait resolves when
+// the run itself has gone terminal (ADR-036 #874, refined for in-flight reviews
+// by #1915). Three outcomes, via the (output, resolved, terminalInFlight)
+// return:
+//
+//   - (output, true, _): resolve the wait NOW — the run is terminal and NO
+//     dispatched review is in flight, so no verdict can ever land (the #874
+//     non-stranding backstop). The message explains the review can no longer
+//     progress.
+//   - (zero, false, false): keep polling — the run is not terminal (a GetRun
+//     error or a non-terminal run leaves the normal poll/timeout path in
+//     charge, byte-identical to before).
+//   - (zero, false, true): keep polling, but the run is terminal WITH a review
+//     still in flight. A dispatched review's verdict is RECORDED server-side
+//     with no run-state guard (runPlanReviews / runImplementReviews and their
+//     append loops never gate on IsTerminal, pinned by the server-side plan/
+//     trace tests), so a 'pending' review on a terminal run WILL still land its
+//     verdict. Resolving early here would abandon a review that is genuinely
+//     about to answer. The caller records terminalInFlight so a subsequent
+//     timeout names fishhawk_revive_run for re-admitting the run.
+//
+// review_status 'pending' is the in-flight signal: it implies a *_review_started
+// marker exists (#600) with fewer than the configured verdicts landed. The fast-
+// path statuses (none/skipped/failed/complete) never reach this backstop — the
+// caller only invokes it on 'pending'.
+func (r *runResolver) awaitRunTerminalBackstop(ctx context.Context, runID uuid.UUID, stage string, st *ReviewStatus, start time.Time) (AwaitReviewOutput, bool, bool) {
 	runRow, err := r.api.GetRun(ctx, runID)
 	if err != nil || runRow == nil {
-		return AwaitReviewOutput{}, false
+		return AwaitReviewOutput{}, false, false
 	}
 	if !runStateIsTerminal(runRow.State) {
-		return AwaitReviewOutput{}, false
+		return AwaitReviewOutput{}, false, false
 	}
+	// Terminal run with a dispatched review still in flight: keep polling and
+	// signal terminalInFlight so a timeout names fishhawk_revive_run (#1915).
+	if st.Status == "pending" {
+		return AwaitReviewOutput{}, false, true
+	}
+	// Terminal run, no review in flight — resolve early (#874).
 	return AwaitReviewOutput{
 		Stage:         stage,
 		Status:        st.Status,
 		Reviews:       st.Reviews,
 		WaitedSeconds: time.Since(start).Seconds(),
-		Message: fmt.Sprintf("%s review is still %q, but run %s has reached terminal state %q — "+
+		Message: fmt.Sprintf("%s review is %q and run %s has reached terminal state %q with no review in flight — "+
 			"the review can no longer progress, so the wait resolved instead of holding the "+
 			"session open. Poll fishhawk_get_run_status for the final run state.",
 			stage, st.Status, runID, runRow.State),
-	}, true
+	}, true, false
 }
 
 // awaitReview is the tool handler.
@@ -668,11 +698,22 @@ func (r *runResolver) awaitReview(ctx context.Context, _ *mcp.CallToolRequest, i
 	}
 
 	// Pending: poll until a terminal entry lands, the run itself goes
-	// terminal (the ADR-036 #874 non-stranding backstop), or the deadline
-	// fires. Check the run-terminal backstop once before the loop so a run
-	// that is already terminal at call time resolves without a poll tick.
-	if out, done := r.awaitRunTerminalBackstop(ctx, runID, in.Stage, st, start); done {
+	// terminal WITHOUT a review in flight (the ADR-036 #874 non-stranding
+	// backstop), or the deadline fires. Check the run-terminal backstop once
+	// before the loop so a run that is already terminal at call time resolves
+	// (or, with an in-flight review, is flagged) without a poll tick.
+	//
+	// terminalInFlight tracks the #1915 case: the run went terminal while the
+	// review is still in flight. The verdict is recorded with no run-state
+	// guard so it WILL land, so we keep polling — but a subsequent timeout must
+	// name fishhawk_revive_run rather than the ordinary still-running message.
+	// Terminality is captured HERE (with a live context) rather than re-queried
+	// at timeout, where the poll context is already cancelled.
+	terminalInFlight := false
+	if out, done, tif := r.awaitRunTerminalBackstop(ctx, runID, in.Stage, st, start); done {
 		return nil, out, nil
+	} else if tif {
+		terminalInFlight = true
 	}
 
 	interval := r.reviewPollInterval
@@ -687,7 +728,7 @@ func (r *runResolver) awaitReview(ctx context.Context, _ *mcp.CallToolRequest, i
 	for {
 		select {
 		case <-pollCtx.Done():
-			return nil, r.awaitPendingTimeoutOutput(in.Stage, timeout, start), nil
+			return nil, r.awaitPendingTimeoutOutput(in.Stage, timeout, start, terminalInFlight), nil
 		case <-ticker.C:
 			st, err := r.reviewStatusFor(pollCtx, runID, in.Stage)
 			if err != nil {
@@ -695,7 +736,7 @@ func (r *runResolver) awaitReview(ctx context.Context, _ *mcp.CallToolRequest, i
 				// that is a timeout, not a transport failure — return
 				// pending rather than surfacing the cancellation as an error.
 				if pollCtx.Err() != nil {
-					return nil, r.awaitPendingTimeoutOutput(in.Stage, timeout, start), nil
+					return nil, r.awaitPendingTimeoutOutput(in.Stage, timeout, start, terminalInFlight), nil
 				}
 				return nil, AwaitReviewOutput{}, fmt.Errorf("poll review status: %w", err)
 			}
@@ -703,10 +744,15 @@ func (r *runResolver) awaitReview(ctx context.Context, _ *mcp.CallToolRequest, i
 				return nil, r.awaitTerminalOutput(in.Stage, st, start), nil
 			}
 			// Still pending: the review hasn't landed a verdict. If the run
-			// itself has gone terminal the review never will — resolve now
-			// rather than spinning to the deadline (ADR-036 #874).
-			if out, done := r.awaitRunTerminalBackstop(pollCtx, runID, in.Stage, st, start); done {
+			// itself has gone terminal with NO review in flight the review
+			// never will — resolve now (#874). With a review still in flight
+			// keep polling (its verdict is recorded unguarded and WILL land)
+			// but flag terminalInFlight so a timeout names fishhawk_revive_run
+			// (#1915).
+			if out, done, tif := r.awaitRunTerminalBackstop(pollCtx, runID, in.Stage, st, start); done {
 				return nil, out, nil
+			} else if tif {
+				terminalInFlight = true
 			}
 		}
 	}
@@ -731,16 +777,33 @@ func (*runResolver) awaitTerminalOutput(stage string, st *ReviewStatus, start ti
 // times out writes a terminal *_review_failed entry that resolves to a
 // definite 'failed' status, so a lingering 'pending' still means the review
 // is genuinely in flight.
-func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start time.Time) AwaitReviewOutput {
-	return AwaitReviewOutput{
+//
+// terminalInFlight (#1915): when the run went terminal while the review was
+// still in flight, the verdict IS recorded server-side (unguarded) and will
+// land, but the run must be re-admitted to progress past the gate. That case
+// names fishhawk_revive_run instead of the ordinary still-running message. The
+// caller captures terminalInFlight during polling (with a live context) rather
+// than re-querying here, where the poll context is already cancelled.
+func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start time.Time, terminalInFlight bool) AwaitReviewOutput {
+	out := AwaitReviewOutput{
 		Stage:               stage,
 		Status:              "pending",
 		WaitedSeconds:       time.Since(start).Seconds(),
 		PollIntervalSeconds: suggestedReviewPollIntervalSeconds,
-		Message: fmt.Sprintf("%s review still pending after %ds — the review is genuinely still running (no terminal "+
-			"audit entry yet; a reviewer that errored or hit FISHHAWKD_PLAN_REVIEW_TIMEOUT would have resolved to a "+
-			"definite 'failed' status). The wait holds nothing: re-call fishhawk_await_review to resume it, or poll "+
-			"fishhawk_get_run_status every %ds (the authoritative path). Check the fishhawkd logs if this persists.",
-			stage, timeout, suggestedReviewPollIntervalSeconds),
 	}
+	if terminalInFlight {
+		out.Message = fmt.Sprintf("%s review still pending after %ds and the run has reached a terminal state while the "+
+			"review is still in flight. The review's verdict is recorded with no run-state guard, so it WILL land — but "+
+			"the run must be re-admitted to progress past the gate. Call fishhawk_revive_run to re-park the failed "+
+			"stage(s) and flip the run back to running, then re-call fishhawk_await_review or poll fishhawk_get_run_status "+
+			"every %ds (the authoritative path).",
+			stage, timeout, suggestedReviewPollIntervalSeconds)
+		return out
+	}
+	out.Message = fmt.Sprintf("%s review still pending after %ds — the review is genuinely still running (no terminal "+
+		"audit entry yet; a reviewer that errored or hit FISHHAWKD_PLAN_REVIEW_TIMEOUT would have resolved to a "+
+		"definite 'failed' status). The wait holds nothing: re-call fishhawk_await_review to resume it, or poll "+
+		"fishhawk_get_run_status every %ds (the authoritative path). Check the fishhawkd logs if this persists.",
+		stage, timeout, suggestedReviewPollIntervalSeconds)
+	return out
 }

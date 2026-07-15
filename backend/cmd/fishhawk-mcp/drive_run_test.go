@@ -1730,6 +1730,53 @@ func TestDriveRun_ReviewGateParked_ImplementReviewsPending_PollsThenGates(t *tes
 	}
 }
 
+// TestDriveRun_TerminalFailed_InFlightReview_StopsNotPolls pins the #1915
+// division of labor from the drive_run vantage the operator named: the
+// in-flight-review-aware keep-polling on a terminal run lives in the await
+// primitives (fishhawk_await_audit / fishhawk_await_review), NOT in
+// fishhawk_drive_run. Even with a review stage parked awaiting_approval whose
+// advisory round is still pending (only one of two verdicts landed), a
+// terminal-FAILED run makes drive_run bail immediately with stopped_reason
+// run_failed — it does NOT inherit the await primitives' keep-polling. A
+// regression that made drive_run also keep polling on a terminal run would blow
+// past the terminal check and hit the wall-clock timeout (a DIFFERENT
+// stopped_reason), so asserting run_failed here is load-bearing. No gate is
+// called and no stage is spawned once the run is terminal.
+func TestDriveRun_TerminalFailed_InFlightReview_StopsNotPolls(t *testing.T) {
+	f := newDriveFake("failed", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "succeeded", 1),
+		stg(driveReviewID, "review", "awaiting_approval", 2),
+	})
+	// In-flight implement advisory round: two configured, only one verdict —
+	// reviewCategoryInFlight("implement") would report pending. Irrelevant to a
+	// terminal run's bail, which is exactly what this test pins.
+	f.seedImplementReviewStarted(2)
+	f.seedImplementReviewed("approve")
+
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 5 * time.Second
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedRunFailed {
+		t.Fatalf("stopped_reason = %q, want %q (terminal-failed run bails, does not keep polling for the in-flight verdict)", out.StoppedReason, stoppedRunFailed)
+	}
+	f.mu.Lock()
+	gateCalls := f.gateCalls
+	f.mu.Unlock()
+	if gateCalls != 0 {
+		t.Errorf("gate called %d times; want 0 on a terminal run", gateCalls)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Errorf("no stage should be spawned on a terminal run: %v", got)
+	}
+}
+
 // --- TestDriveReviewStageForParkedType pins the pure mapping table so a future
 // edit to the switch cannot silently drop the review->implement branch. --------
 
