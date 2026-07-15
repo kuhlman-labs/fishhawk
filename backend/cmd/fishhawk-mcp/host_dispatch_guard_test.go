@@ -209,6 +209,54 @@ func TestGuardSiblingInFlight_TargetDispatchedSiblingsSettled_Allows(t *testing.
 	}
 }
 
+// #1912: a SIBLING parked at awaiting_host_dispatch is NOT in-flight (no spawn
+// attempt exists yet), so it must NOT block the target dispatch — only
+// {dispatched, running} siblings do.
+func TestGuardSiblingInFlight_SiblingAwaitingHostDispatch_Allows(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	targetID := uuid.NewString()
+	siblingID := uuid.NewString()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: siblingID, RunID: runID.String(), Type: "acceptance", State: "awaiting_host_dispatch"},
+		{ID: targetID, RunID: runID.String(), Type: "implement", State: "pending"},
+	}
+
+	warnings, err := r.guardSiblingStageInFlight(context.Background(), runID, targetID)
+	if err != nil {
+		t.Fatalf("a sibling at awaiting_host_dispatch is not in-flight and must not block, got %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("the allow path carries no warnings, got %v", warnings)
+	}
+}
+
+// #1912: the target's OWN awaiting_host_dispatch park (the plan-approved / retry /
+// fixup local park) is ALLOWED — it is exactly the state the host-dispatch verbs
+// spawn from; blocking it would wedge every local dispatch.
+func TestGuardSiblingInFlight_TargetAwaitingHostDispatch_Allows(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	targetID := uuid.NewString()
+	siblingID := uuid.NewString()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: siblingID, RunID: runID.String(), Type: "plan", State: "succeeded"},
+		{ID: targetID, RunID: runID.String(), Type: "implement", State: "awaiting_host_dispatch"},
+	}
+
+	warnings, err := r.guardSiblingStageInFlight(context.Background(), runID, targetID)
+	if err != nil {
+		t.Fatalf("the target's own awaiting_host_dispatch park must be allowed, got %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("the allow path carries no warnings, got %v", warnings)
+	}
+}
+
 // All stages settled (terminal / awaiting_approval) is ALLOWED — the happy
 // await-review-then-dispatch-acceptance boundary once implement has settled.
 func TestGuardSiblingInFlight_AllSettled_Allows(t *testing.T) {

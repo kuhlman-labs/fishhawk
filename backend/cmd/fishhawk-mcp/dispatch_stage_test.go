@@ -142,6 +142,38 @@ func TestDispatchStage_ArgvParity_PlanStage(t *testing.T) {
 	}
 }
 
+// TestDispatchStage_HostDispatchMarkerFails_NoSpawn pins the #1912 fail-closed
+// contract (plan test c): when the host-dispatch marker call 4xxes (or errors),
+// fishhawk_dispatch_stage returns a tool error and spawns NO runner — an unmarked
+// spawn would recreate the ambiguity #1912 removes.
+func TestDispatchStage_HostDispatchMarkerFails_NoSpawn(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	calls := captureAllArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "awaiting_host_dispatch")
+	fb.hostDispatchStatus = http.StatusConflict // the marker 4xx -> fail closed
+
+	_, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	})
+	if err == nil {
+		t.Fatal("expected a fail-closed error when the host-dispatch marker 4xxes")
+	}
+	if !strings.Contains(err.Error(), "host-dispatch marker") || !strings.Contains(err.Error(), "NOT spawning") {
+		t.Errorf("error should name the fail-closed marker; got %v", err)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("runner spawned despite a failed host-dispatch marker: %v (must fail closed)", *calls)
+	}
+	if n := fb.hostDispatchCalledByID[stageID]; n != 1 {
+		t.Errorf("host-dispatch marker called %d times, want 1 (attempted once, then fail-closed)", n)
+	}
+}
+
 // TestDispatchStage_ArgvParity_ImplementStage asserts byte-identical argv for
 // an implement-stage input AND that the implement-only --check-base-ref flag is
 // present (approval condition 1).
@@ -870,8 +902,8 @@ func (f *dispatchAutoDriveFake) handler() http.HandlerFunc {
 // constant, not a duplicated literal — so the two callers cannot drift),
 // Source == dispatchStageSourceTag ('fishhawk_dispatch_stage'), and Stage == the
 // resolved stage type — recorded BEFORE the runner spawn (the record-before-
-// spawn ordering). T11 (drive_run_test.go) then proves this row lets a re-invoked
-// drive read the stage as live instead of dispatched_stale.
+// spawn ordering). Post-#1912 this row is ATTRIBUTION only; the host-dispatch
+// marker (called between record and spawn) stamps the 'dispatched' spawn signal.
 func TestDispatchStage_RecordsAutoDriveActBeforeSpawn(t *testing.T) {
 	f := &dispatchAutoDriveFake{runID: uuid.New(), stageID: uuid.New()}
 	srv := httptest.NewServer(f.handler())
@@ -926,9 +958,9 @@ func TestDispatchStage_RecordsAutoDriveActBeforeSpawn(t *testing.T) {
 // branch (T10): when POST /auto-drive/acts fails (500 — including the
 // insufficient_scope case on a token lacking write:approvals), the dispatch
 // STILL proceeds (no tool error, runner spawned) and the output carries a
-// warning naming the degraded stale detection. The record is staleness
-// evidence, not an authorization gate, so it must never block the core manual
-// recovery verb.
+// warning naming the degraded attribution record. Post-#1912 the record is
+// ATTRIBUTION (the host-dispatch marker is the staleness evidence), not an
+// authorization gate, so it must never block the core manual recovery verb.
 func TestDispatchStage_RecordActFailure_WarnsAndProceeds(t *testing.T) {
 	f := &dispatchAutoDriveFake{runID: uuid.New(), stageID: uuid.New(), recordStatus: http.StatusInternalServerError}
 	srv := httptest.NewServer(f.handler())
@@ -959,12 +991,15 @@ func TestDispatchStage_RecordActFailure_WarnsAndProceeds(t *testing.T) {
 	}
 	var warned bool
 	for _, w := range out.Warnings {
-		if strings.Contains(w, "dispatched_stale") {
+		// Post-#1912 the record row is ATTRIBUTION, not the staleness evidence
+		// (the host-dispatch marker stamps that), so the degraded-record warning
+		// names the missing attribution/provenance rather than stale detection.
+		if strings.Contains(w, "attribution") {
 			warned = true
 		}
 	}
 	if !warned {
-		t.Errorf("no warning naming the degraded stale detection; warnings: %v", out.Warnings)
+		t.Errorf("no warning naming the degraded attribution record; warnings: %v", out.Warnings)
 	}
 }
 

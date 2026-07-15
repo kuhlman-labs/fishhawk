@@ -551,6 +551,79 @@ func TestAcceptanceDispatchAdmission_WireShape(t *testing.T) {
 	})
 }
 
+// TestHostDispatchStage_WireShape pins the tool -> client -> HTTP boundary for
+// HostDispatchStage (#1912): the POST method, the
+// /v0/runs/{run_id}/stages/{stage_id}/host-dispatch path, the Bearer auth
+// header, the decode of the 200 body (transitioned + stage_state), and that a
+// 4xx (409 dispatch_not_admissible) surfaces as *apiError so the callers can
+// fail closed.
+func TestHostDispatchStage_WireShape(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	wantPath := "/v0/runs/" + runID.String() + "/stages/" + stageID.String() + "/host-dispatch"
+
+	t.Run("200 transitioned decodes", func(t *testing.T) {
+		var gotMethod, gotPath, gotAuth string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotMethod, gotPath, gotAuth = r.Method, r.URL.Path, r.Header.Get("Authorization")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"transitioned":true,"stage_state":"dispatched"}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+		res, err := c.HostDispatchStage(context.Background(), runID, stageID)
+		if err != nil {
+			t.Fatalf("HostDispatchStage: %v", err)
+		}
+		if gotMethod != http.MethodPost {
+			t.Errorf("method = %q, want POST", gotMethod)
+		}
+		if gotPath != wantPath {
+			t.Errorf("path = %q, want %q", gotPath, wantPath)
+		}
+		if gotAuth != "Bearer tok-test" {
+			t.Errorf("auth = %q, want Bearer tok-test", gotAuth)
+		}
+		if !res.Transitioned || res.StageState != "dispatched" {
+			t.Errorf("res = %+v, want transitioned:true stage_state:dispatched", res)
+		}
+	})
+
+	t.Run("200 idempotent no-op decodes", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"transitioned":false,"stage_state":"dispatched"}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+		res, err := c.HostDispatchStage(context.Background(), runID, stageID)
+		if err != nil {
+			t.Fatalf("HostDispatchStage: %v", err)
+		}
+		if res.Transitioned {
+			t.Errorf("transitioned = true, want false (idempotent dead-runner re-dispatch)")
+		}
+	})
+
+	t.Run("409 surfaces as apiError", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"code":"dispatch_not_admissible","message":"stage is not in a host-dispatchable state"}}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+		_, err := c.HostDispatchStage(context.Background(), runID, stageID)
+		if err == nil {
+			t.Fatal("expected an error on 409")
+		}
+		var ae *apiError
+		if !errors.As(err, &ae) || ae.StatusCode != http.StatusConflict || ae.Code != "dispatch_not_admissible" {
+			t.Errorf("err = %v, want *apiError with 409 dispatch_not_admissible", err)
+		}
+	})
+}
+
 // TestReviveRun_WireShape pins the tool -> client -> HTTP boundary for
 // ReviveRun (#1915): the POST method, the /v0/runs/{run_id}/revive path, the
 // Bearer auth header, and the decode of the revive 200 body (the re-opened run

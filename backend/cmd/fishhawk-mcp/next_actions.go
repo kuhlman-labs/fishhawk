@@ -313,7 +313,16 @@ func planStageNextActions(run *Run, plan *Stage, planReviewStatus *ReviewStatus)
 				},
 			},
 		}
-	default: // pending | dispatched | awaiting_children
+	case "dispatched":
+		// A spawn attempt exists (#1912) — a runner is in flight. Poll rather than
+		// offering a dispatch that would double-drive the stage.
+		return &NextActions{
+			State: "plan_dispatched",
+			Actions: []SuggestedAction{pollAction(run,
+				suggestedStageWaitPollIntervalSeconds,
+				"the plan stage is dispatched — a spawn attempt exists (#1912) and a runner is in flight; re-poll until plan_stage_wait_status goes terminal")},
+		}
+	default: // pending | awaiting_host_dispatch | awaiting_children
 		return &NextActions{State: "plan_pending", Actions: dispatchOrPollActions(run, "plan")}
 	}
 }
@@ -330,8 +339,20 @@ func planStageNextActions(run *Run, plan *Stage, planReviewStatus *ReviewStatus)
 // E38.3 / #1877 out-of-scope skip as a merge-eligible disposition.
 func implementStageNextActions(run *Run, impl, acceptance *Stage, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, acceptanceSkippedOutOfScope bool, acceptanceVerdict, acceptanceTriageDisposition string) *NextActions {
 	switch impl.State {
-	case "pending", "dispatched":
+	case "pending", "awaiting_host_dispatch":
+		// pending and awaiting_host_dispatch (#1912) both await a host spawn — the
+		// operator host dispatches. Post-#1912 'dispatched' is a distinct state (a
+		// spawn attempt exists), routed to poll-only below.
 		return &NextActions{State: "implement_pending", Actions: dispatchOrPollActions(run, "implement")}
+	case "dispatched":
+		// A spawn attempt exists (#1912) — a runner is in flight. Poll rather than
+		// offering a dispatch that would double-drive the stage.
+		return &NextActions{
+			State: "implement_dispatched",
+			Actions: []SuggestedAction{pollAction(run,
+				suggestedStageWaitPollIntervalSeconds,
+				"the implement stage is dispatched — a spawn attempt exists (#1912) and a runner is in flight; re-poll until implement_stage_wait_status goes terminal (if no runner is live, fishhawk_drive_run's dispatched_stale hands back a manual re-dispatch)")},
+		}
 	case "awaiting_children":
 		// A DECOMPOSED PARENT parked at awaiting_children (#1147): the legal
 		// next move is to fan out the still-pending children, and the
@@ -942,6 +963,17 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope b
 					"the acceptance stage is validating the change against the running preview — re-poll until acceptance_stage_wait_status goes terminal, then read the acceptance_outcome_recorded verdict")},
 			}
 		}
+		if acceptance.State == "dispatched" {
+			// A spawn attempt exists (#1912) — a runner is in flight. Poll rather
+			// than offering a dispatch that would double-drive the stage.
+			return &NextActions{
+				State: "acceptance_dispatched",
+				Actions: []SuggestedAction{pollAction(run,
+					suggestedStageWaitPollIntervalSeconds,
+					"the acceptance stage is dispatched — a spawn attempt exists (#1912) and a runner is in flight; re-poll until acceptance_stage_wait_status goes terminal")},
+			}
+		}
+		// pending | awaiting_host_dispatch (#1912): the operator host dispatches.
 		return &NextActions{State: "acceptance_pending", Actions: dispatchOrPollActions(run, "acceptance")}
 	}
 

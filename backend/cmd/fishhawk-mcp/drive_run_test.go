@@ -63,6 +63,14 @@ type driveFakeBackend struct {
 	// reads (scope_amendment_requested/decided) still succeed.
 	auditErrCategory string
 
+	// #1912 host-dispatch marker fixtures. hostDispatchStatus (0 -> 200) drives
+	// the fail-closed error branch the loop's marker call hits; on a 200 the route
+	// CAS-flips the matching stage pending|awaiting_host_dispatch -> dispatched and
+	// counts the call. hostDispatchCalledN counts marker POSTs so the auto-dispatch
+	// test can assert the marker fired before the spawn.
+	hostDispatchStatus  int
+	hostDispatchCalledN int
+
 	onGate  func(f *driveFakeBackend) AutoDriveOutcome
 	onSpawn func(f *driveFakeBackend, stageType string)
 	// onAudit, when non-nil, fires under fb.mu on every /audit read with the
@@ -187,6 +195,35 @@ func (f *driveFakeBackend) handler() http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		path := r.URL.Path
 		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(path, "/host-dispatch"):
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.hostDispatchCalledN++
+			if f.hostDispatchStatus != 0 && f.hostDispatchStatus != http.StatusOK {
+				w.WriteHeader(f.hostDispatchStatus)
+				_, _ = w.Write([]byte(`{"error":{"code":"dispatch_not_admissible","message":"host-dispatch boom"}}`))
+				return
+			}
+			// Extract the stage id from .../stages/{stage_id}/host-dispatch and CAS-flip
+			// pending|awaiting_host_dispatch -> dispatched (transitioned), else the
+			// idempotent no-op for an already-dispatched stage.
+			segs := strings.Split(strings.TrimSuffix(path, "/host-dispatch"), "/")
+			stageID := segs[len(segs)-1]
+			transitioned := false
+			state := "dispatched"
+			for i := range f.stages {
+				if f.stages[i].ID != stageID {
+					continue
+				}
+				switch f.stages[i].State {
+				case "pending", "awaiting_host_dispatch":
+					f.stages[i].State = "dispatched"
+					transitioned = true
+				}
+				state = f.stages[i].State
+			}
+			_ = json.NewEncoder(w).Encode(HostDispatchResult{Transitioned: transitioned, StageState: state})
+
 		case r.Method == http.MethodPost && strings.HasSuffix(path, "/acceptance-admission"):
 			f.mu.Lock()
 			defer f.mu.Unlock()
@@ -849,29 +886,29 @@ func TestDriveRun_ResumeDispatchedInFlight_NoDoubleSpawn(t *testing.T) {
 // --- (l2) manual dispatch in flight -> no double-spawn, no driver row -------
 
 func TestDriveRun_ManualDispatchInFlight_NoDoubleSpawn(t *testing.T) {
-	// A stage was dispatched by a MANUAL fishhawk_dispatch_stage: under the #1905
-	// single-vocabulary contract that manual dispatch NOW lands a run_auto_driven
-	// dispatch-evidence row (source fishhawk_dispatch_stage) with a fresh
-	// timestamp. It sits in the 'dispatched' window; a fresh drive invocation's
-	// per-run `spawned` map cannot see it and driveDispatchableStage treats
-	// 'dispatched' as dispatchable — the guard must STILL treat it as in-flight
-	// (fresh spawn evidence) and POLL, never host-spawn a SECOND runner and never
-	// re-record. The earlier guard keyed on a driver dispatch row (priorRow) and
-	// would have double-spawned here; the source-agnostic match closes that.
+	// A stage was dispatched by a MANUAL fishhawk_dispatch_stage, whose host-
+	// dispatch marker CAS-flipped it to 'dispatched' stamping a FRESH updated_at
+	// (#1912). It sits in the 'dispatched' window; a fresh drive invocation's
+	// per-run `spawned` map cannot see it and driveDispatchableStage returns it —
+	// the guard must STILL treat it as in-flight (a fresh spawn timestamp) and
+	// POLL, never host-spawn a SECOND runner and never re-record. Post-#1912 the
+	// staleness anchor is the stage's own max(updated_at, started_at), NOT a
+	// dispatch-row timestamp; a fresh updated_at is what keeps it live.
 	impl := stg(driveImplID, "implement", "dispatched", 1)
-	impl.UpdatedAt = time.Now().Add(-time.Hour) // stale UpdatedAt: the FRESH act row is what keeps it live
+	impl.UpdatedAt = time.Now() // the marker flip stamped a fresh updated_at, so the anchor reads live
 	f := newDriveFake("running", []Stage{
 		stg(drivePlanID, "plan", "succeeded", 0),
 		impl,
 	})
-	// A fresh manual-dispatch evidence row (source fishhawk_dispatch_stage) —
-	// appendAuto stamps a fresh timestamp, so the anchor reads live.
+	// A manual-dispatch ATTRIBUTION row (source fishhawk_dispatch_stage) — kept for
+	// provenance; post-#1912 it no longer anchors staleness (the stage's updated_at
+	// does), so it must NOT trigger a re-record or double-spawn.
 	f.appendAuto(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_dispatch_stage", "note": "manual host dispatch"})
 	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
-	r.driveDispatchedStaleAfter = 10 * time.Second // large threshold: the FRESH act-row anchor reads live, so it polls
+	r.driveDispatchedStaleAfter = 10 * time.Second // large threshold: the FRESH updated_at anchor reads live, so it polls
 	r.driveMaxWallclock = 40 * time.Millisecond    // the in-flight stage never advances -> times out while polling
 
 	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
@@ -2096,110 +2133,236 @@ func TestDriveProgressMessage(t *testing.T) {
 	}
 }
 
-// --- (T6) 'dispatched' with NO spawn evidence -> immediate softened handoff --
+// --- (g) DONE-MEANS: the #1905 no-spawn-evidence inference arm is DELETED -----
 
-func TestDriveRun_DispatchedNoEvidence_ImmediateHandoff(t *testing.T) {
-	// A stage sits 'dispatched' with a FRESH UpdatedAt but NO spawn evidence (no
-	// dispatch row, nil StartedAt): the local parked-for-host-dispatch handoff
-	// (plan approval pre-flips implement to 'dispatched'). The driver must stop
-	// IMMEDIATELY — not poll the full liveness threshold first — with the SOFTENED
-	// message that names the handoff AND instructs confirming no live runner
-	// first. The threshold is set LARGE so a stale-anchor stop is impossible: the
-	// ONLY path to dispatched_stale here is the no-evidence branch.
-	impl := stg(driveImplID, "implement", "dispatched", 1)
-	impl.UpdatedAt = time.Now() // fresh: a threshold-based stop cannot fire
+func TestDriveRun_DispatchedInferenceArmDeleted_AnchorsOnStageTimestamp(t *testing.T) {
+	// The behavioral done-means for the inference deletion (plan test (g)): the
+	// #1905 "'dispatched' with no spawn evidence -> immediate parked-for-host-
+	// dispatch handoff" arm is GONE. Post-#1912 'dispatched' means a spawn attempt
+	// EXISTS, so a 'dispatched' stage this invocation did not spawn is classified
+	// PURELY on the runner-liveness threshold, anchored on the stage's own
+	// max(updated_at, started_at) — NOT on any inferred no-evidence signal. Two
+	// rows prove the classification behavior CHANGED, not just the code:
+	//
+	//   - FRESH updated_at, NO dispatch row, nil started_at: under the old inference
+	//     arm this was an IMMEDIATE dispatched_stale handoff; now it reads LIVE and
+	//     POLLS. This is the shipped-behavior change the deletion produced.
+	//   - STALE updated_at past the threshold: stops dispatched_stale via the
+	//     surviving liveness arm (anchored on updated_at), NOT the deleted inference
+	//     arm — and never auto-spawns.
+	t.Run("fresh_updated_at_no_row_polls", func(t *testing.T) {
+		impl := stg(driveImplID, "implement", "dispatched", 1)
+		impl.UpdatedAt = time.Now() // fresh spawn timestamp (the marker flip stamped it)
+		f := newDriveFake("running", []Stage{
+			stg(drivePlanID, "plan", "succeeded", 0),
+			impl,
+		})
+		// Deliberately NO dispatch row and nil StartedAt — the exact shape the
+		// deleted inference arm treated as an immediate handoff.
+		f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+		rec := &spawnRecorder{}
+		r, srv := newDriveResolver(t, f, rec)
+		defer srv.Close()
+		r.driveDispatchedStaleAfter = 10 * time.Second // fresh anchor < threshold -> live
+		r.driveMaxWallclock = 40 * time.Millisecond    // never advances -> times out while polling
+
+		_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+		if err != nil {
+			t.Fatalf("driveRun: %v", err)
+		}
+		if out.StoppedReason != stoppedTimeout {
+			t.Fatalf("stopped_reason = %q, want timeout — a fresh-updated_at 'dispatched' stage is LIVE now (the inference-arm handoff is deleted), so it polls", out.StoppedReason)
+		}
+		if got := rec.list(); len(got) != 0 {
+			t.Fatalf("driver spawned a fresh 'dispatched' stage: %v (must never auto-spawn)", got)
+		}
+	})
+
+	t.Run("stale_updated_at_stops_dispatched_stale", func(t *testing.T) {
+		impl := stg(driveImplID, "implement", "dispatched", 1)
+		impl.UpdatedAt = time.Now().Add(-time.Hour) // past the threshold: a dead runner
+		f := newDriveFake("running", []Stage{
+			stg(drivePlanID, "plan", "succeeded", 0),
+			impl,
+		})
+		f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+		rec := &spawnRecorder{}
+		r, srv := newDriveResolver(t, f, rec)
+		defer srv.Close()
+		r.driveDispatchedStaleAfter = time.Millisecond // the hour-old anchor is past it
+		r.driveMaxWallclock = 5 * time.Second
+
+		_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+		if err != nil {
+			t.Fatalf("driveRun: %v", err)
+		}
+		if out.StoppedReason != stoppedDispatchedStale {
+			t.Fatalf("stopped_reason = %q, want dispatched_stale (stale updated_at anchor, dead runner)", out.StoppedReason)
+		}
+		if got := rec.list(); len(got) != 0 {
+			t.Fatalf("driver spawned a stale 'dispatched' stage: %v (must never auto-spawn)", got)
+		}
+		// The rewritten message drops the parked-for-host-dispatch handoff framing
+		// and names the dead-runner case (a spawn attempt existed).
+		var msg string
+		for _, w := range out.Warnings {
+			if strings.Contains(w, "runner-liveness threshold") {
+				msg = w
+			}
+		}
+		if msg == "" {
+			t.Fatalf("no dispatched_stale warning; warnings: %v", out.Warnings)
+		}
+		for _, want := range []string{
+			"the spawned runner never reached its prompt fetch",
+			"re-dispatch by hand with fishhawk_dispatch_stage",
+		} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("stale message missing %q; got: %q", want, msg)
+			}
+		}
+		// The message must NOT resurrect the deleted parked-for-host-dispatch
+		// handoff framing.
+		if strings.Contains(msg, "plan approval parks") || strings.Contains(msg, "no spawn evidence") {
+			t.Errorf("stale message resurrects the deleted inference-arm framing: %q", msg)
+		}
+		if out.NextActions == nil || len(out.NextActions.Actions) == 0 || out.NextActions.Actions[0].Action != "fishhawk_dispatch_stage" {
+			t.Errorf("next_actions[0] should be fishhawk_dispatch_stage; got %+v", out.NextActions)
+		}
+	})
+}
+
+// --- (g2) the dispatch-row timestamp is NO LONGER a staleness anchor ----------
+
+func TestDriveRun_DispatchRowNoLongerAnchorsStaleness(t *testing.T) {
+	// The #1905 dispatch-row timestamp max-in is REMOVED (#1912): staleness anchors
+	// PURELY on the stage's own max(updated_at, started_at). A stale-updated_at
+	// 'dispatched' stage with a FRESH dispatch-evidence row therefore now STOPS
+	// dispatched_stale — the fresh row no longer rescues it (it is attribution
+	// only). Asserted for BOTH source values, since the row match itself stays
+	// source-agnostic for the retry/fixup attribution it still feeds.
+	for _, source := range []string{"fishhawk_drive_run", "fishhawk_dispatch_stage"} {
+		t.Run(source, func(t *testing.T) {
+			impl := stg(driveImplID, "implement", "dispatched", 1)
+			impl.UpdatedAt = time.Now().Add(-time.Hour) // stale; the fresh row must NOT rescue it now
+			f := newDriveFake("running", []Stage{
+				stg(drivePlanID, "plan", "succeeded", 0),
+				impl,
+			})
+			// A FRESH dispatch-evidence row — under the OLD model this reset the
+			// anchor and made it poll; post-#1912 it no longer does.
+			f.appendAuto(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": source, "note": ""})
+			f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+			rec := &spawnRecorder{}
+			r, srv := newDriveResolver(t, f, rec)
+			defer srv.Close()
+			r.driveDispatchedStaleAfter = time.Millisecond // the hour-old updated_at anchor is past it
+			r.driveMaxWallclock = 5 * time.Second
+
+			_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+			if err != nil {
+				t.Fatalf("driveRun: %v", err)
+			}
+			if out.StoppedReason != stoppedDispatchedStale {
+				t.Fatalf("stopped_reason = %q, want dispatched_stale (a fresh %s dispatch row no longer anchors staleness)", out.StoppedReason, source)
+			}
+			if got := rec.list(); len(got) != 0 {
+				t.Fatalf("driver spawned a stale 'dispatched' stage with a fresh %s row: %v", source, got)
+			}
+		})
+	}
+}
+
+// --- (2) DONE-MEANS: a parked implement (awaiting_host_dispatch) auto-dispatches
+
+func TestDriveRun_AwaitingHostDispatch_AutoDispatched(t *testing.T) {
+	// The primary #1912 done-means (plan test 2): a run whose implement stage is
+	// awaiting_host_dispatch after a delegated plan approval is AUTO-DISPATCHED by
+	// the loop — record-act, the host-dispatch marker call, then exactly ONE
+	// spawn, with NO manual handoff and NO dispatched_stale stop. It fails on any
+	// no-op touch of driveDispatchableStage (a parked implement that is not
+	// spawnable would never reach the spawn seam).
+	impl := stg(driveImplID, "implement", "awaiting_host_dispatch", 1)
 	f := newDriveFake("running", []Stage{
 		stg(drivePlanID, "plan", "succeeded", 0),
 		impl,
 	})
-	// Deliberately NO dispatch row and nil StartedAt: zero spawn evidence.
+	f.onSpawn = func(f *driveFakeBackend, typ string) {
+		if typ == "implement" {
+			f.setState("implement", "running") // the spawned runner reached its prompt fetch
+		}
+	}
+	converge := 0
+	f.onStages = func(f *driveFakeBackend) {
+		converge++
+		if converge >= 2 && f.stateOf("implement") == "running" {
+			f.setState("implement", "succeeded")
+			f.runState = "succeeded"
+		}
+	}
 	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
 	rec := &spawnRecorder{}
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
-	r.driveDispatchedStaleAfter = 10 * time.Second // large: a stale-anchor stop is impossible; only no-evidence can fire
 	r.driveMaxWallclock = 5 * time.Second
 
 	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
 	if err != nil {
 		t.Fatalf("driveRun: %v", err)
 	}
-	if out.StoppedReason != stoppedDispatchedStale {
-		t.Fatalf("stopped_reason = %q, want dispatched_stale (immediate no-evidence handoff)", out.StoppedReason)
+	if out.StoppedReason != stoppedMerged {
+		t.Fatalf("stopped_reason = %q, want merged (the parked implement auto-dispatched and settled); no dispatched_stale", out.StoppedReason)
 	}
-	if got := rec.list(); len(got) != 0 {
-		t.Fatalf("driver spawned a no-evidence 'dispatched' stage: %v (must never auto-spawn)", got)
+	if got := rec.list(); len(got) != 1 || got[0] != "implement" {
+		t.Fatalf("spawned %v, want exactly [implement] (one auto-dispatch of the parked stage)", got)
 	}
 	f.mu.Lock()
-	nActs := len(f.recordedActs)
+	marker := f.hostDispatchCalledN
+	acts := append([]RecordAutoDriveAct(nil), f.recordedActs...)
 	f.mu.Unlock()
-	if nActs != 0 {
-		t.Errorf("driver recorded %d acts on the no-evidence handoff; want 0", nActs)
+	if marker != 1 {
+		t.Errorf("host-dispatch marker called %d times, want 1 (once, before the spawn)", marker)
 	}
-	// The SOFTENED message contract: names the parked-for-host-dispatch handoff
-	// AND the confirm-no-live-runner-first / pre-registration-transient caveat
-	// before any hand-dispatch instruction.
-	var msg string
-	for _, w := range out.Warnings {
-		if strings.Contains(w, "no spawn evidence") {
-			msg = w
-		}
-	}
-	if msg == "" {
-		t.Fatalf("no no-evidence handoff warning; warnings: %v", out.Warnings)
-	}
-	for _, want := range []string{
-		"plan approval parks", "no runner has been spawned yet",
-		"FIRST confirm no runner process is live", "may not have registered yet",
-		"re-dispatch by hand with fishhawk_dispatch_stage",
-	} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("handoff message missing %q; got: %q", want, msg)
-		}
-	}
-	if out.NextActions == nil || len(out.NextActions.Actions) == 0 || out.NextActions.Actions[0].Action != "fishhawk_dispatch_stage" {
-		t.Errorf("next_actions[0] should be fishhawk_dispatch_stage; got %+v", out.NextActions)
+	if len(acts) != 1 || acts[0].Stage != "implement" {
+		t.Errorf("recorded acts = %+v, want exactly one implement dispatch (record-before-spawn)", acts)
 	}
 }
 
-// --- (T7) 'dispatched' with a FRESH dispatch row -> polls (source-agnostic) --
+// --- (c) DONE-MEANS: the host-dispatch marker fails closed -> zero spawns ------
 
-func TestDriveRun_DispatchedFreshRow_SourceAgnostic_Polls(t *testing.T) {
-	// A stale stage UpdatedAt but a FRESH dispatch-evidence row must read LIVE:
-	// the anchor is the newest of {UpdatedAt, StartedAt, newest dispatch-row ts}.
-	// Asserted for BOTH source values — a driver-sourced row and a
-	// fishhawk_dispatch_stage-sourced row — pinning the source-agnostic single-
-	// vocabulary matching (operator constraint).
-	for _, source := range []string{"fishhawk_drive_run", "fishhawk_dispatch_stage"} {
-		t.Run(source, func(t *testing.T) {
-			impl := stg(driveImplID, "implement", "dispatched", 1)
-			impl.UpdatedAt = time.Now().Add(-time.Hour) // stale UpdatedAt; the FRESH row keeps it live
-			f := newDriveFake("running", []Stage{
-				stg(drivePlanID, "plan", "succeeded", 0),
-				impl,
-			})
-			f.appendAuto(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": source, "note": ""})
-			f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
-			rec := &spawnRecorder{}
-			r, srv := newDriveResolver(t, f, rec)
-			defer srv.Close()
-			r.driveDispatchedStaleAfter = 10 * time.Second // fresh row < threshold -> live
-			r.driveMaxWallclock = 40 * time.Millisecond    // never advances -> times out while polling
+func TestDriveRun_HostDispatchMarkerFails_NoSpawn(t *testing.T) {
+	// Fail-closed (plan test c) for the driver: a 4xx/transport error from the
+	// host-dispatch marker between record-act and spawn means NO runner is spawned
+	// (an unmarked spawn would recreate the ambiguity #1912 removes). The record-
+	// act still landed (the marker is after it), but the recording spawner saw
+	// nothing, and the stop is the distinct host_dispatch_failed.
+	impl := stg(driveImplID, "implement", "awaiting_host_dispatch", 1)
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		impl,
+	})
+	f.hostDispatchStatus = http.StatusConflict // the marker 4xx -> fail closed
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 5 * time.Second
 
-			_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
-			if err != nil {
-				t.Fatalf("driveRun: %v", err)
-			}
-			if out.StoppedReason != stoppedTimeout {
-				t.Fatalf("stopped_reason = %q, want timeout (fresh %s row reads live, so it polls)", out.StoppedReason, source)
-			}
-			if got := rec.list(); len(got) != 0 {
-				t.Fatalf("driver spawned a stage with a fresh %s dispatch row: %v", source, got)
-			}
-			if n := len(f.autoRows()); n != 1 {
-				t.Errorf("run_auto_driven rows = %d, want 1 (the seeded row; no driver re-record)", n)
-			}
-		})
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedHostDispatchFailed {
+		t.Fatalf("stopped_reason = %q, want host_dispatch_failed (fail-closed marker)", out.StoppedReason)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("driver spawned despite a failed host-dispatch marker: %v (must fail closed)", got)
+	}
+	f.mu.Lock()
+	marker := f.hostDispatchCalledN
+	f.mu.Unlock()
+	if marker != 1 {
+		t.Errorf("host-dispatch marker called %d times, want 1 (attempted once, then fail-closed)", marker)
 	}
 }
 
@@ -2207,15 +2370,12 @@ func TestDriveRun_DispatchedFreshRow_SourceAgnostic_Polls(t *testing.T) {
 
 func TestDriveRun_DispatchedZeroAnchor_DegradesToPolling(t *testing.T) {
 	// The zero-value-anchor degrade branch (drive_run.go: `!anchor.IsZero() && ...`).
-	// hasEvidence is true (a dispatch row exists) so the immediate no-evidence
-	// handoff (T6) does NOT fire, yet the newest spawn evidence carries no usable
-	// timestamp: UpdatedAt is the zero value (stg() leaves it unset), StartedAt is
-	// nil, and the dispatch-row Timestamp is time.Time{}. The anchor is therefore
-	// zero, and both drive_run.go's comment and the README promise "A zero-value
-	// anchor degrades to polling (fail toward polling, never toward a stale stop or
-	// a spawn)". No other test pins this: T6 covers no-evidence, T7 a fresh row, T8
-	// an old row, T11 the convergence chain. A regression that dropped the
-	// !anchor.IsZero() guard would make time.Since(zero) enormous and trip an
+	// The 'dispatched' stage carries no usable spawn timestamp: UpdatedAt is the
+	// zero value (stg() leaves it unset) and StartedAt is nil. The anchor
+	// max(UpdatedAt, StartedAt) is therefore zero, and both drive_run.go's comment
+	// and the README promise "A zero-value anchor degrades to polling (fail toward
+	// polling, never toward a stale stop or a spawn)". A regression that dropped
+	// the !anchor.IsZero() guard would make time.Since(zero) enormous and trip an
 	// instant stale stop (or worse, reorder the branch toward a spawn) — this test
 	// fails loudly if it does.
 	impl := stg(driveImplID, "implement", "dispatched", 1) // UpdatedAt zero, StartedAt nil by default
@@ -2223,8 +2383,8 @@ func TestDriveRun_DispatchedZeroAnchor_DegradesToPolling(t *testing.T) {
 		stg(drivePlanID, "plan", "succeeded", 0),
 		impl,
 	})
-	// A dispatch-evidence row with a ZERO Timestamp: priorRow (hasEvidence) is
-	// true, but it contributes no timestamped anchor.
+	// A dispatch-evidence row (attribution only, post-#1912) with a ZERO Timestamp:
+	// it no longer feeds the anchor, so the anchor stays zero.
 	f.appendAutoAt(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""}, time.Time{})
 	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
 	rec := &spawnRecorder{}
@@ -2254,15 +2414,14 @@ func TestDriveRun_DispatchedZeroAnchor_DegradesToPolling(t *testing.T) {
 // --- (T11) MANDATED end-to-end stale-recovery convergence -------------------
 
 func TestDriveRun_StaleRecoveryConvergence_EndToEnd(t *testing.T) {
-	// The operator's binding constraint: chain fishhawk_dispatch_stage and
-	// fishhawk_drive_run against ONE shared stateful fake whose /auto-drive/acts
-	// handler APPENDS the recorded act into the audit log ListRunAudit serves. A
-	// first driveRun on a stage sat 'dispatched' past the threshold (with old
-	// spawn evidence) returns dispatched_stale; a manual dispatchStage then
-	// records a FRESH act row under the canonical action value; a re-invoked
-	// driveRun must NOT re-report stale (the fresh row reset the anchor) — it
-	// polls, and settles cleanly once the fake advances the stage to
-	// running/succeeded. This is the recovery loop CONVERGING rather than
+	// The recovery-convergence contract: chain fishhawk_dispatch_stage and
+	// fishhawk_drive_run against ONE shared stateful fake. A first driveRun on a
+	// stage sat 'dispatched' past the threshold (stale updated_at) returns
+	// dispatched_stale; a manual dispatchStage then re-spawns a fresh runner (and
+	// records an attribution act row); a re-invoked driveRun must NOT re-report
+	// stale — the fresh runner flips the stage dispatched->running (#1912/#1924),
+	// which the loop reads as in-flight and polls, settling cleanly once the fake
+	// advances running->succeeded. This is the recovery loop CONVERGING rather than
 	// insta-tripping stale on the manual verb's own recommended recovery.
 	impl := stg(driveImplID, "implement", "dispatched", 1)
 	impl.UpdatedAt = time.Now().Add(-time.Hour)
@@ -2314,24 +2473,21 @@ func TestDriveRun_StaleRecoveryConvergence_EndToEnd(t *testing.T) {
 		t.Fatalf("manual dispatch recorded %d fishhawk_dispatch_stage rows, want 1", manualRows)
 	}
 
-	// Advance the stage as the fresh runner would once the re-invoked drive polls
-	// it. The FIRST stages read must leave implement 'dispatched' so drive #2
-	// actually evaluates the dispatched guard: only then does the fresh manual row
-	// reset the anchor and make it POLL rather than re-report stale. Advancing to
-	// 'running' on the first read would skip the guard entirely, and the test
-	// would pass even if the fresh-evidence anchor logic were removed (the
-	// staleness check is what this end-to-end is here to pin). It then advances
-	// running -> succeeded (with the run settling) — the convergence tail.
+	// Advance the stage as the fresh runner from the manual re-dispatch would.
+	// Post-#1912 the convergence mechanism is the runner's prompt-fetch flip
+	// dispatched->running (#1924): the fresh runner reaches its prompt fetch and
+	// the backend flips the stage to 'running', so drive #2 reads it as in-flight
+	// and polls rather than re-reporting stale (it never re-anchors off a stale
+	// updated_at). It then advances running -> succeeded (with the run settling) —
+	// the convergence tail.
 	converge := 0
 	f.onStages = func(f *driveFakeBackend) {
 		converge++
 		switch converge {
 		case 1:
-			// stays 'dispatched': drive #2 must hit the dispatched guard and,
-			// off the fresh manual row's reset anchor, poll rather than stop stale.
-		case 2:
+			// The fresh runner reached its prompt fetch: dispatched -> running.
 			f.setState("implement", "running")
-		case 3:
+		case 2:
 			f.setState("implement", "succeeded")
 			f.runState = "succeeded"
 		}
@@ -2357,21 +2513,17 @@ func TestDriveRun_StaleRecoveryConvergence_EndToEnd(t *testing.T) {
 // --- (T12) StartedAt is spawn evidence AND a valid staleness anchor ----------
 
 func TestDriveRun_StartedAtStalenessAnchor(t *testing.T) {
-	// Direct coverage for the StartedAt paths in the dispatched-guard staleness
-	// anchor (drive_run.go): `hasEvidence := priorRow || disp.StartedAt != nil`
-	// and the `disp.StartedAt.After(anchor)` max. T6 (no evidence), T7 (a fresh
-	// dispatch row), T8 (an old row), T8b (zero anchor) and T11 (the convergence
-	// chain) all drive the priorRow / dispatch-row evidence path — none exercises
-	// StartedAt on its own, so both StartedAt branches were previously untested.
+	// Direct coverage for the StartedAt path in the dispatched-guard staleness
+	// anchor (drive_run.go): the `disp.StartedAt.After(anchor)` max over
+	// max(UpdatedAt, StartedAt). The zero-anchor and stale-updated_at cases drive
+	// the UpdatedAt path — these exercise StartedAt as the freshest anchor.
 
 	t.Run("fresh_started_at_no_dispatch_row_polls", func(t *testing.T) {
 		// A 'dispatched' stage with a STALE UpdatedAt, a FRESH StartedAt, and NO
-		// dispatch row. StartedAt alone is spawn evidence (so the immediate
-		// no-evidence handoff must NOT fire) AND it is the freshest anchor (so the
-		// stale-threshold stop must NOT fire): the driver must POLL. A regression
-		// dropping StartedAt from hasEvidence would insta-stop dispatched_stale via
-		// the no-evidence handoff; one dropping it from the anchor max would trip
-		// the stale threshold off the hour-old UpdatedAt — either fails this timeout.
+		// dispatch row. StartedAt is the freshest anchor (so the stale-threshold
+		// stop must NOT fire): the driver must POLL. A regression dropping StartedAt
+		// from the anchor max would trip the stale threshold off the hour-old
+		// UpdatedAt — this timeout fails if it does.
 		started := time.Now()
 		impl := stg(driveImplID, "implement", "dispatched", 1)
 		impl.UpdatedAt = time.Now().Add(-time.Hour)
@@ -2403,12 +2555,12 @@ func TestDriveRun_StartedAtStalenessAnchor(t *testing.T) {
 		}
 	})
 
-	t.Run("started_at_wins_over_older_audit_row", func(t *testing.T) {
-		// StartedAt must win the anchor max when it is newer than BOTH UpdatedAt and
-		// the newest dispatch-row Timestamp. Old UpdatedAt + an old dispatch row, but
-		// a FRESH StartedAt: the anchor resolves to StartedAt and the stage reads
-		// live -> polls. A regression that omitted StartedAt from the max would take
-		// the older audit-row / UpdatedAt anchor and stop dispatched_stale.
+	t.Run("started_at_wins_over_older_updated_at", func(t *testing.T) {
+		// StartedAt must win the anchor max when it is newer than UpdatedAt. Old
+		// UpdatedAt (and an old attribution dispatch row, which post-#1912 no longer
+		// anchors), but a FRESH StartedAt: the anchor resolves to StartedAt and the
+		// stage reads live -> polls. A regression that omitted StartedAt from the
+		// max would take the older UpdatedAt anchor and stop dispatched_stale.
 		started := time.Now()
 		impl := stg(driveImplID, "implement", "dispatched", 1)
 		impl.UpdatedAt = time.Now().Add(-time.Hour)
