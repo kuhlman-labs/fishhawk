@@ -1827,11 +1827,58 @@ type fakeChildNumberProvider struct {
 	filedTitles  []string
 	appendOnFile bool
 	number       int
+
+	// EpicChildren-read barrier (#1958, binding condition 1). When barrierN > 0,
+	// each EpicChildren call reports arrival and blocks until barrierN calls have
+	// arrived OR barrierWait elapses, BEFORE it snapshots f.children. This forces
+	// concurrent omitted-n filings to observe the SAME child snapshot: an
+	// implementation WITHOUT the per-epic lock overlaps both reads (both see
+	// [E7.1],[E7.2] -> both allocate [E7.3] -> collision, the test fails),
+	// whereas the correct locked implementation can never have two goroutines
+	// inside EpicChildren at once, so the lone arrival times out and the reads
+	// stay serialized (distinct [E7.3],[E7.4]) — the timeout is why the barrier
+	// exercises the race without deadlocking under the very lock it guards.
+	barrierN    int
+	barrierWait time.Duration
+	barrierArr  int
+	barrierCh   chan struct{}
+}
+
+// awaitBarrier blocks until barrierN EpicChildren calls have arrived (all
+// released together) or barrierWait elapses (a lone arrival proceeds). It is a
+// no-op when barrierN <= 0. The channel wait happens WITHOUT f.mu held so the
+// released goroutines contend for the snapshot read fairly.
+func (f *fakeChildNumberProvider) awaitBarrier() {
+	f.mu.Lock()
+	if f.barrierN <= 0 {
+		f.mu.Unlock()
+		return
+	}
+	if f.barrierCh == nil {
+		f.barrierCh = make(chan struct{})
+	}
+	ch := f.barrierCh
+	wait := f.barrierWait
+	f.barrierArr++
+	if f.barrierArr >= f.barrierN {
+		select {
+		case <-ch: // already released
+		default:
+			close(ch)
+		}
+	}
+	f.mu.Unlock()
+
+	select {
+	case <-ch:
+	case <-time.After(wait):
+	}
 }
 
 func (f *fakeChildNumberProvider) Name() string { return f.name }
 
 func (f *fakeChildNumberProvider) EpicChildren(_ context.Context, req workmgmt.EpicChildrenRequest) (*workmgmt.EpicChildrenResult, error) {
+	f.awaitBarrier() // force concurrent filings to snapshot the same children
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.epicCalls++
@@ -2047,10 +2094,22 @@ func TestFileWorkItem_ChildNumberFirstChild(t *testing.T) {
 // two parallel omitted-n filings against the SAME epic must serialize through
 // the per-epic in-process lock and file DISTINCT consecutive numbers ([E7.3] and
 // [E7.4]) — never a collision on [E7.3].
+//
+// The barrier (barrierN:2) makes the test load-bearing rather than probabilistic:
+// EpicChildren blocks until BOTH filings arrive before either snapshots the
+// children, so an implementation WITHOUT the per-epic lock — which can run both
+// EpicChildren calls concurrently — deterministically has both read the same
+// [E7.1],[E7.2] snapshot, both allocate [E7.3], and collide (the seen-set assert
+// fails). The correct locked implementation can never have two goroutines inside
+// EpicChildren at once, so the lone arrival trips barrierWait and the reads stay
+// serialized — barrierWait (not a fixed sleep) is what lets the guarded lock pass
+// without the barrier deadlocking on an arrival that can never come.
 func TestFileWorkItem_ChildNumberConcurrentFilingsDistinct(t *testing.T) {
 	fp := &fakeChildNumberProvider{
 		children:     []workmgmt.EpicChild{{Title: "[E7.1] existing"}, {Title: "[E7.2] existing"}},
 		appendOnFile: true,
+		barrierN:     2,
+		barrierWait:  2 * time.Second,
 	}
 	registerFakeChildNumberProvider(t, fp)
 	s := New(Config{})
