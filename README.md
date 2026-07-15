@@ -4,98 +4,39 @@ The governed, auditable workflow for agent-driven software development.
 
 Agents do the work. Your team approves the work. Fishhawk holds the record.
 
-## Status
+Fishhawk is an opinionated workflow engine for agent-driven software changes: it defines the stages a change moves through (plan → implement → review), enforces policy on what an agent can and cannot do, gates the work behind human approvals, and keeps an immutable, signed audit trail of every plan, approval, and outcome. It is tool-agnostic and agent-agnostic — it is **not** a coding agent, a CI/CD platform, or a general-purpose workflow engine.
 
-Pre-alpha. The v0 build has largely landed, and Fishhawk now develops itself through Fishhawk:
+Fishhawk develops itself through Fishhawk: since Day 22 of the v0 build (2026-05-21), substantive changes flow through a workflow run defined by [`.fishhawk/workflows.yaml`](.fishhawk/workflows.yaml), and the audit log behind that development is published in [`docs/compliance/`](docs/compliance/).
 
-- **Backend control plane (`fishhawkd`)** — REST API, run/stage state machine on Postgres, signed audit log, policy evaluator, approval gating with SLA timeouts, retry semantics, GitHub App webhook receiver. ([`backend/`](backend/README.md))
-- **Runner action (`fishhawk/runner`)** — runs the agent (Claude Code or Codex) on the customer's CI, captures the signed trace, and validates the plan against its schema. Releases ship as `kuhlman-labs/fishhawk/runner@runner/vX.Y.Z` through a pipeline that cosign-signs each release and attaches an SBOM; the first public tag has not been cut yet. ([`runner/`](runner/README.md))
-- **CLI (`fishhawk`)** — `validate`, `run` (start/status/open), `plan`, `audit`, `export`, `doctor`, `token`, `deploy`, `campaign`, among others; the component README documents the full command set. ([`cli/`](cli/README.md))
-- **MCP server (`fishhawk-mcp`)** — exposes run, plan, and audit state to Claude Code (and any MCP client) over the Model Context Protocol; the surface self-hosted runs are driven through. ([`backend/cmd/fishhawk-mcp/`](backend/cmd/fishhawk-mcp))
-- **Web UI** — plan review, approval, audit log per run, retry on failures. ([`frontend/`](frontend/README.md))
-- **Audit-log verifier** — standalone binary that re-verifies an exported chain offline. ([`verifier/`](verifier/README.md))
-- **Hosted infrastructure** — Terraform on AWS (VPC, RDS, ECS Fargate, ALB, OIDC-based deploys; dev ~$15/mo and prod ~$85/mo profiles, [`infra/terraform/`](infra/terraform/README.md)) plus a Helm chart for Kubernetes ([`deploy/helm/fishhawk/`](deploy/helm/fishhawk), quickstart in [`docs/deploy/kubernetes.md`](docs/deploy/kubernetes.md)).
-- **CI/CD** — every push to `main` that touches backend code builds + signs the backend image; tagged releases are wired to auto-deploy via GitHub Actions OIDC.
+> **Status: pre-alpha.** The v0 control plane, runner, CLI, MCP server, and Web UI have landed. See [Documentation](#documentation) for the full component map. Feature PRs are not yet being accepted while the v0 abstractions settle — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-Fishhawk now ships its *own* changes through Fishhawk. Since Day 22 of the v0 build (2026-05-21), substantive changes flow through a workflow run defined by [`.fishhawk/workflows.yaml`](.fishhawk/workflows.yaml): a human approves the plan, constraints are enforced on the implementation, and the PR is opened by Fishhawk itself — stamped with its run and stage IDs (the *"Opened by Fishhawk for run …"* footer on recent PRs). This is the methodology commitment in [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md), today held by convention rather than enforced by the product. The audit log behind Fishhawk's own development is published as a public artifact in [`docs/compliance/`](docs/compliance/) — a machine-verifiable export plus a human-readable agent-changes report, both re-verifiable offline with the standalone `fishhawk-verify` binary.
+## Quickstart
 
-For the canonical scope and the technical realization, see [`docs/MVP_SPEC.md`](docs/MVP_SPEC.md) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Local setup brings up the backend against a Postgres + MinIO stack and validates a workflow.
 
-## What Fishhawk is
+**Prerequisites:** [Go 1.25+](https://go.dev/dl/), [Docker](https://www.docker.com/), and — only for the Web UI — [Node 22+](https://nodejs.org/) with [pnpm 10+](https://pnpm.io/).
 
-An opinionated workflow engine for agent-driven software changes, a policy enforcement layer for what agents can and cannot do, and an immutable audit trail of agent activity, plans, approvals, and outcomes. Tool-agnostic, agent-agnostic, opinionated about process.
-
-## What Fishhawk is not
-
-A coding agent. A project management tool. A CI/CD platform. A general-purpose workflow engine. See [`docs/MVP_SPEC.md`](docs/MVP_SPEC.md) §1 for the full framing.
-
-## Running locally
-
-Prerequisites:
-
-- [Go 1.25+](https://go.dev/dl/) (the workspace targets `~> 1.25`)
-- [Node 22+](https://nodejs.org/) and [pnpm 10+](https://pnpm.io/) (for the Web UI)
-- [Docker](https://www.docker.com/) (for the local Postgres + MinIO stack)
-- Optional: [`golangci-lint v2`](https://golangci-lint.run/) for linting; `actionlint` for workflow files
-
-The repository ships a [`Makefile`](Makefile) that wraps the common loops. Run `make help` to see every target. The quickstart:
+The [`Makefile`](Makefile) wraps the common loops (`make help` lists every target):
 
 ```sh
-cp .env.example .env        # populate later for GitHub App / OAuth / trace storage (see below)
+cp .env.example .env        # optional: populate later for GitHub App / OAuth / trace storage
 make up                     # docker compose: Postgres :5432, MinIO :9000/:9001
-make minio-init             # one-time per fresh stack: create the fishhawk-traces bucket
 make migrate                # apply backend migrations
-make dev-backend            # run fishhawkd on :8080
-make dev-frontend           # in another terminal: Web UI on :5173 (proxies /v0)
+make dev-backend            # run fishhawkd on :8080 — http://localhost:8080/healthz
 make validate               # validate .fishhawk/workflows.yaml with the CLI
-make test                   # all Go modules (-race) + Web UI vitest
-make lint                   # golangci-lint v2 + eslint + tsc --noEmit
-make coverage               # reproduce the CI 80% gate
 ```
 
-The Makefile auto-loads `.env` if present, so credentials and overrides flow into `make dev-backend` without manual `source` plumbing.
-
-Trace storage is opt-in: after `make minio-init`, uncomment the trace-storage block in `.env` (`FISHHAWKD_S3_BUCKET` and friends) so `fishhawkd` can reach MinIO. Without it, `/v0/runs/{id}/trace` responds 503 — everything else works.
-
-Contributors driving Fishhawk through its own workflow loop use `scripts/dev` instead (see [`AGENTS.md`](AGENTS.md)); the Makefile is the plain local path.
-
-If you'd rather run things by hand, the Makefile targets are thin wrappers over these commands:
+The Web UI (plan review, approvals, per-run audit log) is optional:
 
 ```sh
-docker compose up -d
-export FISHHAWKD_DATABASE_URL='postgres://fishhawk:fishhawk@localhost:5432/fishhawk?sslmode=disable'
-go run ./backend/cmd/fishhawkd migrate up
-go run ./backend/cmd/fishhawkd serve   # http://localhost:8080/healthz
-
-cd frontend && pnpm install && pnpm dev   # http://localhost:5173
-
-go run ./cli/cmd/fishhawk validate ./.fishhawk/workflows.yaml
+make dev-frontend           # in another terminal: http://localhost:5173 (proxies /v0)
 ```
 
-A plain `go test ./...` from the root won't work — the repo is a multi-module Go workspace. The Makefile's `test-go` target loops over every module in `go.work`; the equivalent loop:
+Without a GitHub App configured, the OAuth and webhook endpoints respond 503 — runs, plans, and the audit log still work. Trace storage is opt-in: run `make minio-init` once, then uncomment the trace-storage block in `.env`. To wire up sign-in and GitHub events, see [`docs/github-app/README.md`](docs/github-app/README.md).
 
-```sh
-for m in $(go work edit -json | jq -r '.Use[].DiskPath'); do
-  (cd "$m" && go test -race ./...)
-done
-```
+### A sample workflow
 
-Without a GitHub App configured, the backend logs warnings on startup and the OAuth + webhook endpoints respond 503 — runs, plans, and the audit log still work. To wire up Web UI sign-in and GitHub events, see the **Local development** section in [`docs/github-app/README.md`](docs/github-app/README.md).
-
-Per-component details live in each subdirectory's README:
-
-| Component | README |
-|---|---|
-| Backend (`fishhawkd`) | [`backend/README.md`](backend/README.md) — `serve`, `migrate`, `token issue`, env-var reference |
-| Web UI | [`frontend/README.md`](frontend/README.md) — `pnpm dev`, route layout, OAuth wiring |
-| Runner action | [`runner/README.md`](runner/README.md) — used in GitHub Actions, not typically run locally |
-| CLI | [`cli/README.md`](cli/README.md) — `fishhawk validate`, `run`, `plan`, `audit`, `export`, `doctor` |
-| Verifier | [`verifier/README.md`](verifier/README.md) — `fishhawk-verify` against an exported audit log |
-| Infrastructure | [`infra/terraform/README.md`](infra/terraform/README.md) — bootstrap, dev vs prod profiles, CI deploy flow |
-
-## Defining a workflow
-
-Fishhawk reads `.fishhawk/workflows.yaml` from the repository it governs. `fishhawk init` scaffolds one from an autonomy preset (`--preset low|medium|high`, default `medium` — see [`docs/spec/workflow-preset.md`](docs/spec/workflow-preset.md)), and `fishhawk validate` checks it against the workflow schema. A trimmed version of the medium preset, showing the plan → implement → review shape most work uses:
+Fishhawk reads `.fishhawk/workflows.yaml` from the repository it governs. `fishhawk init` scaffolds one from an autonomy preset (`--preset low|medium|high`); the trimmed `feature_change` workflow below shows the plan → implement → review shape most work uses, and validates as-is with `fishhawk validate`:
 
 ```yaml
 version: "1.0"
@@ -106,11 +47,6 @@ workflows:
       Default workflow for feature work. Human approves the plan and the
       PR; the agent does the implementation.
     drive: true                    # fishhawkd auto-advances mechanical transitions
-    operator_agent:                # what the operator agent may decide alone
-      may_approve: clean_dual_approval
-      may_route_fixup: convergent_concerns
-      may_retry: infra_flake
-      must_page_human: [reviewer_reject, plan_rejection, scope_amendment]
     on_ci_failure:
       max_retries: 1
 
@@ -168,13 +104,81 @@ workflows:
               not: [author, agent]
 ```
 
-This document validates as-is (`fishhawk validate`). The full preset adds budgets, a second heterogeneous reviewer, and runtime policy; this repository's own [`.fishhawk/workflows.yaml`](.fishhawk/workflows.yaml) is the fuller real-world reference, including an acceptance stage and a delegating deploy workflow. The schema and field reference live in [`docs/spec/`](docs/spec/).
+The full preset adds budgets, a second heterogeneous reviewer, and runtime policy; this repository's own [`.fishhawk/workflows.yaml`](.fishhawk/workflows.yaml) is the fuller real-world reference. The schema and field reference live in [`docs/spec/`](docs/spec/).
 
-### The operator contract
+## Connect the MCP server
 
-A run is a negotiation between two parties: agents propose (a plan, a diff), and an **operator** decides at each gate — approve or reject the plan, route review concerns back as a fix-up, approve and merge the PR. The `operator_agent` block above delegates the mechanical share of that role to an operator agent under named conditions: approve on a clean dual approval, route convergent review concerns to a fix-up, retry an infrastructure flake. Everything listed in `must_page_human` — and merging — stays with a person.
+The MCP server (`fishhawk-mcp`) exposes run, plan, and audit state — and the local-runner drive loop — to any MCP client over the Model Context Protocol. Connecting it to your CLI lets an agent start runs, read plans, and drive stages without leaving the chat.
 
-The operator's behavioral contract (gate procedures, escalation posture, prohibitions) ships with the product as `operator-role-v0` — see [`docs/spec/operator-role.md`](docs/spec/operator-role.md) and the shipped default [`docs/spec/operator-role-default.yaml`](docs/spec/operator-role-default.yaml). A repository does not write its own role spec; it may add a thin overlay at `.fishhawk/operator.yaml` for local conventions (merge ritual specifics, escalation contacts). Authority stays in the workflow's `operator_agent` knobs.
+**1. Build the binaries** (co-locate them so the MCP server auto-resolves the runner):
+
+```sh
+go build -o bin/fishhawk-mcp ./backend/cmd/fishhawk-mcp
+go build -o bin/fishhawk-runner ./runner/cmd/fishhawk-runner
+```
+
+**2. Issue an operator token** against your local backend and export it:
+
+```sh
+go run ./backend/cmd/fishhawkd token issue \
+  --subject <your-login> \
+  --scopes read:runs,read:audit,write:runs,write:approvals,write:stages
+export FISHHAWK_API_TOKEN="<the fhk_ token printed above>"
+export FISHHAWK_BACKEND_URL="http://localhost:8080"   # default; override for hosted
+```
+
+`FISHHAWK_API_TOKEN` is required — every tool round-trips the API. There is no anonymous mode.
+
+**3a. Register with Claude Code:**
+
+```sh
+claude mcp add fishhawk \
+  --env FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN \
+  --env FISHHAWK_BACKEND_URL=$FISHHAWK_BACKEND_URL \
+  -- "$(pwd)/bin/fishhawk-mcp"
+```
+
+Verify with `claude mcp list`, then ask the agent for the status of a run — it should call `fishhawk_get_run_status`. The exact flag shape varies by version; `claude mcp add --help` is authoritative.
+
+**3b. Register with the Codex CLI** — add a `[mcp_servers.fishhawk]` block to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.fishhawk]
+command = "/absolute/path/to/bin/fishhawk-mcp"
+env = { FISHHAWK_API_TOKEN = "fhk_...", FISHHAWK_BACKEND_URL = "http://localhost:8080" }
+```
+
+Recent Codex CLI versions also accept `codex mcp add fishhawk -- /absolute/path/to/bin/fishhawk-mcp` (see `codex mcp --help`). Confirm with `codex mcp list`.
+
+> **Tip — surviving rebuilds:** Claude Code does not reconnect a restarted stdio MCP server, so rebuilding `fishhawk-mcp` under a live session needs a manual `/mcp`. Register the [`fishhawk-mcp-shim`](backend/cmd/fishhawk-mcp-shim/README.md) supervisor instead — it hot-swaps the rebuilt child with no reconnect.
+
+The full install path (pre-built release binaries, cosign verification, the complete tool surface, and troubleshooting) lives in [`docs/mcp/install.md`](docs/mcp/install.md).
+
+## Documentation
+
+| Doc | What |
+|---|---|
+| [`docs/MVP_SPEC.md`](docs/MVP_SPEC.md) | v0 scope and framing — what Fishhawk is and is not. |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Stack, run/stage lifecycle, storage, invariants. Read before designing anything cross-component. |
+| [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md) | Autonomy tiers (low/medium/high) and the operator contract. |
+| [`docs/spec/`](docs/spec/) | JSON Schemas + reference for the workflow spec and the plan artifact. |
+| [`docs/mcp/install.md`](docs/mcp/install.md) | MCP server install, tool surface, and troubleshooting. |
+| [`docs/api/v0.md`](docs/api/v0.md) | REST API surface (`docs/api/v0.openapi.yaml` is the source of truth). |
+| [`docs/deploy/kubernetes.md`](docs/deploy/kubernetes.md) | Helm-chart quickstart for a Kubernetes deployment. |
+| [`docs/BRAND_FOUNDATIONS.md`](docs/BRAND_FOUNDATIONS.md) | Voice, naming, positioning. |
+| [`AGENTS.md`](AGENTS.md) | Build/test/lint gates and the contributor workflow loop. |
+
+### Components
+
+| Component | README |
+|---|---|
+| Backend control plane (`fishhawkd`) | [`backend/README.md`](backend/README.md) — REST API, state machine, audit log, policy, approvals. |
+| Runner action (`fishhawk/runner`) | [`runner/README.md`](runner/README.md) — runs the agent on CI, captures the signed trace. |
+| CLI (`fishhawk`) | [`cli/README.md`](cli/README.md) — `validate`, `run`, `plan`, `audit`, `export`, `doctor`, `token`. |
+| MCP server (`fishhawk-mcp`) | [`backend/cmd/fishhawk-mcp/README.md`](backend/cmd/fishhawk-mcp/README.md) — run/plan/audit state over MCP. |
+| Web UI | [`frontend/README.md`](frontend/README.md) — plan review, approval, per-run audit log. |
+| Audit-log verifier | [`verifier/README.md`](verifier/README.md) — re-verify an exported chain offline. |
+| Infrastructure | [`infra/terraform/README.md`](infra/terraform/README.md) — Terraform on AWS; Helm chart under [`deploy/helm/`](deploy/helm/fishhawk). |
 
 ## Following along
 
