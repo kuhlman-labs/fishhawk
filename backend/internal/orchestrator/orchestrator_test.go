@@ -527,12 +527,13 @@ func TestAdvance_DispatchesNextAgentStage(t *testing.T) {
 	}
 }
 
-// TestAdvance_LocalLockedRun_SkipsWorkflowDispatch asserts the Actions-direction
-// half of the #1355 runner_kind mismatch guardrail: a run already LOCKED to
-// runner_kind=local must NOT fire a github_actions workflow_dispatch (which
-// would be a phantom Actions run against a local-locked run). The stage still
-// advances to dispatched; only the Actions firing is skipped.
-func TestAdvance_LocalLockedRun_SkipsWorkflowDispatch(t *testing.T) {
+// TestAdvance_LocalLockedRun_ParksAwaitingHostDispatch asserts the #1912 park:
+// a run already LOCKED to runner_kind=local parks its agent stage at
+// awaiting_host_dispatch (the backend cannot spawn the host-local runner per
+// ADR-024) instead of the pre-split 'dispatched', and must NOT fire a
+// github_actions workflow_dispatch. The stage still advances (OutcomeDispatched);
+// the spawn marker endpoint (or an MCP spawn verb) later flips it to dispatched.
+func TestAdvance_LocalLockedRun_ParksAwaitingHostDispatch(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
 	r, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
 		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
@@ -549,12 +550,39 @@ func TestAdvance_LocalLockedRun_SkipsWorkflowDispatch(t *testing.T) {
 	if out != OutcomeDispatched {
 		t.Errorf("Outcome = %q, want dispatched (the stage still advances)", out)
 	}
-	if stages[1].State != run.StageStateDispatched {
-		t.Errorf("stage[1].State = %q, want dispatched", stages[1].State)
+	if stages[1].State != run.StageStateAwaitingHostDispatch {
+		t.Errorf("stage[1].State = %q, want awaiting_host_dispatch (the #1912 local park)", stages[1].State)
 	}
 	// The local lock must suppress the github_actions workflow_dispatch.
 	if len(gh.calls) != 0 {
 		t.Errorf("workflow_dispatch fired for a local-locked run: %d", len(gh.calls))
+	}
+}
+
+// TestAdvance_LocalUnresolvedRun_DispatchesNotParked is the negative control for
+// the #1912 park: an UN-resolved run (RunnerKindResolved == false) is NOT parked
+// even if its RunnerKind string happens to read local — the park engages only on
+// the LOCKED state, matching fireDispatch's own locked-local skip. The stage
+// takes the normal dispatched path (fireDispatch no-ops on GitHub being wired
+// but the run has no lock, so the dispatch still fires here).
+func TestAdvance_LocalUnresolvedRun_DispatchesNotParked(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	r, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	r.RunnerKind = run.RunnerKindLocal
+	r.RunnerKindResolved = false
+
+	if _, err := o.Advance(context.Background(), r.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if stages[1].State != run.StageStateDispatched {
+		t.Errorf("stage[1].State = %q, want dispatched (un-resolved run is not parked)", stages[1].State)
+	}
+	// Un-resolved run auto-resolves on first dispatch (#1346) → the dispatch fires.
+	if len(gh.calls) != 1 {
+		t.Errorf("workflow_dispatch calls = %d, want 1 for an un-resolved run", len(gh.calls))
 	}
 }
 
@@ -3479,6 +3507,39 @@ func TestTryShortCircuitAcceptance(t *testing.T) {
 		for _, tr := range rs.stageTransitions {
 			if tr.StageID == stages[3].ID && tr.To == run.StageStateDispatched {
 				t.Errorf("walk re-issued pending->dispatched for a stage already dispatched")
+			}
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_outcome_recorded"); n != 1 {
+			t.Errorf("acceptance_outcome_recorded = %d, want 1", n)
+		}
+	})
+
+	// (b2) #1912: the stage starts parked in 'awaiting_host_dispatch' (the new
+	// local host-dispatch park, replacing the conflated 'dispatched'): the walk
+	// starts from awaiting_host_dispatch and still settles to succeeded without
+	// re-issuing the already-passed pending->awaiting_host_dispatch transition.
+	t.Run("all-skip-with-basis awaiting_host_dispatch-park -> short-circuits", func(t *testing.T) {
+		planBytes := acceptanceSkipPlanBytes(t, nil, allSkip)
+		r, stages, rs, ra, o := seedAcceptanceSkipRunWithAcceptanceState(t, planBytes, run.StageStateAwaitingHostDispatch)
+
+		sc, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
+		if err != nil {
+			t.Fatalf("TryShortCircuitAcceptance: %v", err)
+		}
+		if sc == nil || sc.Kind != AcceptanceShortCircuitAllSkipWithBasis {
+			t.Fatalf("short-circuit = %+v, want an all-skip-with-basis hit", sc)
+		}
+		if stages[3].State != run.StageStateSucceeded {
+			t.Errorf("acceptance stage = %q, want succeeded", stages[3].State)
+		}
+		if r.State != run.StateSucceeded {
+			t.Errorf("run state = %q, want succeeded", r.State)
+		}
+		// The walk must NOT re-issue the already-passed pending->awaiting_host_dispatch
+		// transition: it starts at dispatched.
+		for _, tr := range rs.stageTransitions {
+			if tr.StageID == stages[3].ID && tr.To == run.StageStateAwaitingHostDispatch {
+				t.Errorf("walk re-issued pending->awaiting_host_dispatch for a stage already parked")
 			}
 		}
 		if n := countAcceptanceCategory(ra, "acceptance_outcome_recorded"); n != 1 {

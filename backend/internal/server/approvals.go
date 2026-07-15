@@ -993,8 +993,14 @@ func (s *Server) recordDrivePlanApproved(ctx context.Context, stage *run.Stage) 
 		adv.To = "implement:dispatched"
 		adv.Event = "plan gate approved; orchestrator dispatched implement via workflow_dispatch"
 	} else {
-		adv.To = "implement:ready"
-		adv.Event = "plan gate approved; runner_kind local parks for a host-side dispatch"
+		// #1912: the local park is now an explicit stage state
+		// (awaiting_host_dispatch), not the conflated 'dispatched'. Compose the
+		// drive-audit To string as implement:awaiting_host_dispatch so the audit
+		// trail names the exact parked state the orchestrator wrote, and the
+		// MCP host-dispatch marker (or an auto-dispatching drive loop) flips it
+		// to dispatched at spawn time.
+		adv.To = "implement:awaiting_host_dispatch"
+		adv.Event = "plan gate approved; runner_kind local parks the implement stage at awaiting_host_dispatch for a host-side dispatch"
 		adv.Parked = true
 		adv.NextAction = out.NextAction
 	}

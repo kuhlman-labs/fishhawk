@@ -139,7 +139,7 @@ The SDK-independent REST analogue of the scope-amendment `?wait` long-poll, appl
 
 `GET /v0/runs/{run_id}/stages/{stage_id}` (`run_stage_wait.go::handleGetRunStage`) resolves a stage by the durable ADR-037 `(run_id, stage_id)` handle and returns the canonical `Stage` shape plus a wait envelope (`state`, `terminal`, optional `next_action`).
 
-- `terminal` is keyed off the `run.StageState.IsSettled()` classifier (`backend/internal/run/run.go`) — true for the three terminal states (`succeeded`/`failed`/`cancelled`) AND the four parked states (`awaiting_approval`/`awaiting_children`/`awaiting_input`/`awaiting_scope_decision`), false for the in-flight three (`pending`/`dispatched`/`running`). `IsTerminal()` is left UNTOUCHED for its narrower transition-table callers.
+- `terminal` is keyed off the `run.StageState.IsSettled()` classifier (`backend/internal/run/run.go`) — true for the three terminal states (`succeeded`/`failed`/`cancelled`) AND the parked states (`awaiting_approval`/`awaiting_children`/`awaiting_input`/`awaiting_scope_decision`/`awaiting_deploy_approval`/`awaiting_host_dispatch`), false for the in-flight states (`pending`/`dispatched`/`running`/`awaiting_deployment`). `awaiting_host_dispatch` (#1912) is settled — a runner_kind-locked-`local` agent stage parked for a host/operator spawn, released by the host-dispatch marker. `IsTerminal()` is left UNTOUCHED for its narrower transition-table callers.
 - Optional `?wait=<0..30>` (`parseRunStageWaitSeconds`, clamped) holds the connection via `awaitStageSettled` — a `time.After(deadline)` / `time.NewTicker(runStageWaitPollInterval)` / `r.Context().Done()` select modeled byte-for-byte on `awaitScopeAmendmentDecision` — returning the moment the stage settles, at the cap (last-read still-unsettled stage), or on client disconnect. A transient re-read error returns the last-good stage at 200 (never a 500).
 - Auth mirrors `handleListScopeAmendments`: anonymous → 401; a run-bound `fhm_` token needs `mcp:read` (else 403 `insufficient_scope`) AND must match the path run (else 403 `cross_run_stage`); operator bearers pass. A stage whose `RunID` != the path run is 404 `stage_not_found` (handle consistency).
 - `next_action` reuses `applyDriveSurfaces` (`runs.go`) — best-effort, omitted for non-drive/terminal runs, never fabricated.
@@ -355,6 +355,16 @@ Two endpoints exposing the in-process `AutoDriveRunGate` (E25.6 / ADR-047, the c
 - **Fail-loud**: a supplementary-append failure after a gate act returns `500 auto_drive_record_failed` (never a silent `acted:true`), and a record-append failure returns `500 auto_drive_record_failed` so the driver does not dispatch.
 - `fishhawk_drive_run` is the bounded, resumable loop that walks a `runner_kind:local` run start→merged with no operator calls when every knob is delegated, stopping at the first genuine decision (`decision_required:<state>`, `paged:<event>`, a pending scope amendment).
 - `run_auto_driven` is registered in `audit.KnownCategories` and is an internal, non-comment audit kind (see `docs/issue-comment-surfaces.md`).
+
+### Host-dispatch spawn marker (`host_dispatch.go`, #1912)
+
+`POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch` (`handleHostDispatchStage`) is the spawn marker that splits the conflated local `dispatched` state into two explicit signals (#1912). The backend cannot spawn the host-local runner (ADR-024), so `orchestrator.dispatchStage` parks a runner_kind-locked-`local` agent stage at `awaiting_host_dispatch` rather than `dispatched`; this endpoint stamps the spawn.
+
+- CAS-transitions `{pending, awaiting_host_dispatch} → dispatched` (via the `run.StageCASTransitioner` capability, mirroring `run.failStageCAS`; in-memory fakes fall back to the plain table-validated `TransitionStage`). The MCP host-spawn verbs (`fishhawk_run_stage`, `fishhawk_dispatch_stage`, `fishhawk_drive_run`) call it fail-closed IMMEDIATELY BEFORE spawning, so post-#1912 `dispatched` unambiguously means "a spawn attempt exists".
+- **Idempotent** on an already-`dispatched` stage: `200 {transitioned:false}` — the legal manual re-dispatch of a stage whose spawned runner died. A concurrent CAS-loss whose winner already marked `dispatched` is re-classified as the same benign no-op.
+- **`409 dispatch_not_admissible`** on a `running`/terminal/`awaiting_*` gate state (and on a CAS-loss whose winner moved the stage to any such state) — a live or settled stage can never be re-marked as a fresh spawn.
+- **Auth** mirrors the reap-failure endpoint: an authenticated identity carrying `write:runs` (anonymous → 401; a token without the scope → 403), with the auth ladder running BEFORE the nil-`RunRepo` guard (the #1915 revive convention) so config state never leaks pre-auth. A `(run_id, stage_id)` handle mismatch is `404 stage_not_found`.
+- The prompt-fetch liveness flip (`prompt.go::markStageRunningOnPromptFetch`) defensively walks a still-parked `awaiting_host_dispatch → dispatched → running` on the authenticated prompt fetch, so a version-skewed spawn whose marker call was skipped/lost still converges.
 
 ### Startup orphaned-review reconcile (`review_reconcile.go`, #1781)
 
