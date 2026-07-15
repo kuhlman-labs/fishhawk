@@ -51,6 +51,12 @@ type runResolver struct {
 	// runner-less (dispatched_stale) rather than in-flight. Tests inject a tiny
 	// value to exercise the stale stop without a 10-minute wait.
 	driveDispatchedStaleAfter time.Duration
+
+	// driveProbeRunnerLiveness is the injectable host-liveness probe seam for
+	// fishhawk_drive_run (#1955). Nil falls back to the production
+	// probeRunnerLiveness (which execs pgrep); tests inject a canned verdict so
+	// the loop runs the dead/live/unknown branches without a real process table.
+	driveProbeRunnerLiveness func(ctx context.Context, stageID string) runnerLivenessVerdict
 }
 
 // registerTools wires every MCP tool onto srv. Called once at
