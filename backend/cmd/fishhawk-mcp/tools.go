@@ -77,6 +77,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerConsolidateSlices(srv, resolver)
 	registerResetRunBranch(srv, resolver)
 	registerRetryStage(srv, resolver)
+	registerReviveRun(srv, resolver)
 	registerFileIssue(srv, resolver)
 	registerDraftEpic(srv, resolver)
 	registerFixupStage(srv, resolver)

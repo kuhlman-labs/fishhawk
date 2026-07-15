@@ -71,6 +71,45 @@ budget and wedges the run. Before approving a fixup, cross-check the
 files-changed against the plan scope; if a pass would be a no-op, abandon and
 start a fresh run instead.
 
+### Failed-run revive (`fishhawk_revive_run`)
+
+When a stage fails, the **whole run** flips terminal-`failed`. On a run with more
+than one failed stage — or a healthy stage whose review is still settling when a
+sibling's failure flipped the run terminal — the old recovery was a
+**retry-without-dispatch dance**: `fishhawk_retry_stage` each failed stage one at
+a time, being careful **not** to let any re-opened stage dispatch out of gate
+order (the #1700 wrong-order re-dispatch corruption), and hand-park the rest.
+That dance is **retired**. Use the single verb instead:
+
+**`fishhawk_revive_run` (run_id)** re-admits the terminal-`failed` run in one
+call. The backend **pre-validates** that *every* failed stage is retryable, then
+re-parks each in its correct gate-ordered pre-dispatch state (A/C → `pending`,
+D SLA-timeout → `awaiting_approval`, decomposed-parent implement →
+`awaiting_children`) and flips the run **failed → running**. A single
+non-retryable failed stage (category-B, D-rejected, or one with no recorded
+category) refuses the **whole** revive with `422 revive_not_applicable` naming
+the blocking stage — **no partial mutation**, so you never end up half-re-parked.
+
+The load-bearing property: revive **re-parks only — it never dispatches**. Each
+re-parked stage sits in its pre-dispatch state until you dispatch it at its
+proper gate turn via the existing verbs (`fishhawk_dispatch_stage` /
+`fishhawk_run_stage` on the local runner). Because no orchestrator `Advance`
+fires during the revive, the #1700 wrong-order re-dispatch is **structurally**
+impossible — you no longer have to hand-sequence it. Poll
+`fishhawk_get_run_status` after reviving and follow `next_actions` for each
+re-parked stage.
+
+Distinct from `fishhawk_retry_stage`, which re-opens **one** stage and
+**auto-dispatches** it: reach for **retry** when you want a single stage re-run
+immediately; reach for **revive** when a run has flipped terminal and you want a
+safe **batch** re-park (especially while sibling reviews are still settling).
+Each re-park consumes that stage's per-stage retry budget exactly like a retry —
+revive is a batch retry-shaped re-open, not a budget bypass. Revive is
+**operator-token only** (`write:stages` or `write:retries`); a run-bound agent
+token is refused `403 agent_token_forbidden`. The failed-run `next_actions` arms
+(`implement_failed_category_a`, `implement_failed`) surface it alongside
+`fishhawk_retry_stage`.
+
 ### Acceptance stage
 
 Some workflows declare an **acceptance stage** (E31.9 / ADR-049) after the
@@ -189,7 +228,8 @@ add-scope-files path. Do **not** write a repo-relative path into approval
 *rationale* prose to merely explain it — that folds the path into required
 scope, and an untouched required file fails the stage. Pending amendments
 survive a stage failure: approve post-failure, then `fishhawk_retry_stage`
-folds them at restart.
+(one stage) or `fishhawk_revive_run` (the whole terminal-`failed` run, re-parked
+without dispatch) folds them at restart.
 
 ### Heterogeneous-review two-verdict waits
 

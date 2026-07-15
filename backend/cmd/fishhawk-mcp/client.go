@@ -1147,6 +1147,56 @@ func (c *apiClient) ResetRunBranch(ctx context.Context, runID uuid.UUID, reason 
 	return &res, nil
 }
 
+// ReviveRestoredStage mirrors the backend's reviveRestoredStage wire shape
+// (`backend/internal/server/revive.go`): one re-parked stage in a revive's
+// batch. StageID is typed `string` (not `uuid.UUID`) per the #371 reflection
+// rule so the MCP SDK's response-schema reflection sees a string — the JSON
+// payload IS a string, and a `uuid.UUID` (a 16-byte array) would surface as
+// `type: array` and reject at the wire boundary.
+type ReviveRestoredStage struct {
+	StageID       string `json:"stage_id" jsonschema:"the re-parked stage's UUID"`
+	Type          string `json:"type" jsonschema:"the stage kind (plan/implement/review/…)"`
+	PriorCategory string `json:"prior_category" jsonschema:"the stage's failure category before the revive (A/C, or a retryable D)"`
+	PriorReason   string `json:"prior_reason" jsonschema:"the stage's failure_reason from before the revive"`
+	RestoredState string `json:"restored_state" jsonschema:"the pre-dispatch state the stage was re-parked to (pending for A/C, awaiting_approval for a D SLA-timeout gate, awaiting_children for a decomposed-parent implement)"`
+}
+
+// ReviveRunResult mirrors the backend's revive 200 body (`reviveResponse`):
+// the re-opened run (now running) plus the per-stage re-park summary. The
+// nested Run reuses the client's Run type, which already decodes the backend's
+// runResponse (it is the GET /v0/runs/{id} shape).
+type ReviveRunResult struct {
+	Run            Run                   `json:"run"`
+	RestoredStages []ReviveRestoredStage `json:"restored_stages"`
+}
+
+// ReviveRun re-admits a terminal-FAILED run for another operator turn via
+// `POST /v0/runs/{run_id}/revive` (#1915): the backend pre-validates that
+// EVERY failed stage is retryable, then re-parks each failed stage in its
+// correct gate-ordered pre-dispatch state (A/C → pending, D SLA-timeout →
+// awaiting_approval, decomposed-parent implement → awaiting_children) and flips
+// the run failed → running. CRUCIALLY revive performs NO orchestrator handoff
+// and never dispatches — it re-parks only, so the #1700 wrong-order
+// re-dispatch corruption is structurally impossible; dispatch happens later at
+// each stage's proper gate turn via the existing verbs. Operator-token-only,
+// modeled on ResetRunBranch/VouchCommit. 4xx/5xx surfaces:
+//   - 403 agent_token_forbidden (a run-bound agent/mcp token attempted revive)
+//   - 403 insufficient_scope (token lacks write:stages or write:retries)
+//   - 404 run_not_found
+//   - 409 invalid_state_transition (a concurrent transition raced the reopen)
+//   - 422 revive_not_applicable (the run is not failed, has no failed stage,
+//     or a failed stage is non-retryable — category-B, D-rejected, or no
+//     recorded category; the message names the blocking stage. No partial
+//     mutation: the whole revive is refused pre-transition)
+//   - 503 revive_unconfigured (run/audit repositories not wired)
+func (c *apiClient) ReviveRun(ctx context.Context, runID uuid.UUID) (*ReviveRunResult, error) {
+	var res ReviveRunResult
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/revive", nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // vouchCommitRequest mirrors the backend's
 // `POST /v0/runs/{run_id}/vouch-commit` body
 // (`backend/internal/server/vouch.go::vouchCommitRequest`). Both fields

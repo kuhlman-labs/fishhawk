@@ -1587,7 +1587,10 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	//
 	// E22.X (#1700, ADR-040/ADR-047) adds exactly ONE tool —
 	// fishhawk_drive_run, the local auto-driver — taking the total 41 -> 42.
-	const wantToolCount = 42
+	//
+	// #1915 adds exactly ONE tool — fishhawk_revive_run, the one-verb
+	// failed-run revive — taking the total 42 -> 43.
+	const wantToolCount = 43
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -1606,6 +1609,27 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawConsolidate {
 		t.Error("fishhawk_consolidate_slices is not registered/visible over ListTools")
+	}
+
+	// fishhawk_revive_run (#1915) must be wire-visible AND its description must
+	// document the load-bearing no-dispatch re-park semantics that distinguish
+	// it from fishhawk_retry_stage — a registration or description regression
+	// would otherwise ship the wrong contract.
+	var reviveDesc string
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_revive_run" {
+			reviveDesc = tool.Description
+			break
+		}
+	}
+	if reviveDesc == "" {
+		t.Fatal("fishhawk_revive_run is not registered/visible over ListTools")
+	}
+	lowerRevive := strings.ToLower(reviveDesc)
+	for _, want := range []string{"re-park", "never dispatches", "fishhawk_retry_stage"} {
+		if !strings.Contains(lowerRevive, strings.ToLower(want)) {
+			t.Errorf("fishhawk_revive_run description missing %q (no-dispatch re-park contract, #1915):\n%s", want, reviveDesc)
+		}
 	}
 
 	for _, tool := range res.Tools {
