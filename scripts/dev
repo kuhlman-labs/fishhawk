@@ -798,8 +798,223 @@ _signal_mcp_activation() {
   esac
 }
 
+# Pure: classify one operator worktree from precomputed git facts. Echoes exactly
+# one of dirty|merged|active|detached in fixed precedence:
+#   dirty    — porcelain non-empty (uncommitted changes); NEVER touched, whatever
+#              the merge state, so this wins FIRST.
+#   detached — empty branch (detached HEAD): no branch to test for merge, skip.
+#   merged   — clean, on a branch that IS an ancestor of the base ref.
+#   active   — clean, on a branch that is NOT merged.
+# Git-free so scripts/test-dev can drive every branch with crafted input,
+# mirroring _sha_with_dirty / _decide_mcp_signal.
+# Args: <porcelain_text> <is_merged 0|1> <branch_or_empty>
+_classify_worktree() {
+  local porcelain="$1"
+  local is_merged="$2"
+  local branch="$3"
+  if [[ -n "$porcelain" ]]; then
+    print -r -- dirty
+    return
+  fi
+  if [[ -z "$branch" ]]; then
+    print -r -- detached
+    return
+  fi
+  if (( is_merged )); then
+    print -r -- merged
+  else
+    print -r -- active
+  fi
+}
+
+# Impure: the repo's SHARED git common dir, absolutized against REPO_ROOT the way
+# the runner's worktreesDir (runner/cmd/fishhawk-runner/worktree.go) normalizes
+# it — git emits --git-common-dir relative (".git") for a normal checkout and
+# absolute for a linked worktree. REPO_ROOT is the WORKTREE root when scripts/dev
+# runs from a linked worktree, so both the stale-worktree scan and the litter
+# sweep key off THIS shared dir, not REPO_ROOT. Returns 1 (silence) when git
+# can't resolve it.
+_git_common_dir() {
+  local common
+  if ! common="$(git -C "${REPO_ROOT}" rev-parse --git-common-dir 2>/dev/null)"; then
+    return 1
+  fi
+  if [[ -z "$common" ]]; then
+    return 1
+  fi
+  if [[ "$common" != /* ]]; then
+    common="${REPO_ROOT}/${common}"
+  fi
+  print -r -- "$common"
+}
+
+# Impure: the main checkout root — the parent of the shared git dir. This is the
+# operator's primary checkout even when scripts/dev runs from a linked worktree,
+# so .claude/worktrees (an operator-checkout sibling) is resolved here.
+_main_repo_root() {
+  local common
+  if ! common="$(_git_common_dir)"; then
+    return 1
+  fi
+  print -r -- "${common:h}"
+}
+
+# Impure: the shared fishhawk-worktrees dir (runner-owned run-* litter root),
+# under the shared git dir. Returns 1 when git can't resolve it.
+_shared_worktrees_dir() {
+  local common
+  if ! common="$(_git_common_dir)"; then
+    return 1
+  fi
+  print -r -- "${common}/fishhawk-worktrees"
+}
+
+# Impure: classify every operator worktree under <worktrees_dir> against
+# <base_ref> (typically origin/main). Emits one `<classification>\t<path>` line
+# per checkout; an absent/empty dir is a clean no-op (the *(N/) qualifier). Every
+# git call is a tested if-condition so the pass can NEVER abort a set -e caller
+# (#631). Args: <worktrees_dir> <base_ref>
+_scan_operator_worktrees() {
+  local wt_dir="$1"
+  local base_ref="$2"
+  local d branch porcelain is_merged class
+  for d in "$wt_dir"/*(N/); do
+    branch=""
+    if ! branch="$(git -C "$d" symbolic-ref --short HEAD 2>/dev/null)"; then
+      branch=""
+    fi
+    porcelain=""
+    if ! porcelain="$(git -C "$d" status --porcelain 2>/dev/null)"; then
+      porcelain=""
+    fi
+    is_merged=0
+    if [[ -n "$branch" ]] && git -C "$d" merge-base --is-ancestor "$branch" "$base_ref" 2>/dev/null; then
+      is_merged=1
+    fi
+    class="$(_classify_worktree "$porcelain" "$is_merged" "$branch")"
+    print -r -- "${class}"$'\t'"${d}"
+  done
+}
+
+# Non-fatal: warn when any operator worktree under the main checkout's
+# .claude/worktrees is a merged-into-origin/main leftover — a session launched
+# from such a stale checkout can contaminate a run base (#1866). Strictly
+# advisory: git absent, origin/main unresolvable, or a missing worktrees dir all
+# degrade to SILENCE. Every command is in a tested context so the pass can never
+# abort cmd_up under set -e; reload/post-merge inherit it through cmd_up.
+_warn_stale_worktrees() {
+  local base_ref="origin/main"
+  if ! command -v git >/dev/null 2>&1; then
+    return 0
+  fi
+  local root
+  if ! root="$(_main_repo_root)"; then
+    return 0
+  fi
+  local wt_dir="${root}/.claude/worktrees"
+  if [[ ! -d "$wt_dir" ]]; then
+    return 0
+  fi
+  # origin/main must resolve, or merged-ness can't be judged.
+  if ! git -C "${REPO_ROOT}" rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null 2>&1; then
+    return 0
+  fi
+  # NB: use wtpath, NOT `path` — a lowercase `path` is zsh's special array tied
+  # to $PATH; `read -r class path` would corrupt the command search path.
+  local scan class wtpath
+  local -a stale
+  stale=()
+  scan="$(_scan_operator_worktrees "$wt_dir" "$base_ref")"
+  while IFS=$'\t' read -r class wtpath; do
+    if [[ -z "$wtpath" ]]; then continue; fi
+    if [[ "$class" == merged ]]; then stale+=("$wtpath"); fi
+  done <<< "$scan"
+  if (( ${#stale} )); then
+    print -u2 ""
+    print -u2 "warning: ${#stale} merged operator worktree(s) under .claude/worktrees are stale leftovers:"
+    for wtpath in "${stale[@]}"; do
+      print -u2 "  ${wtpath}"
+    done
+    print -u2 "  a session launched from one can contaminate a run base (#1866); run 'scripts/dev sweep' to remove them."
+  fi
+  return 0
+}
+
+# Impure: prune aged run/tmp litter. Two roots:
+#   (1) <worktrees_dir>/run-* — runner-owned detached checkouts older than <days>
+#       AND clean (a dirty or age-fresh run worktree is skipped, protecting any
+#       plausibly-live run), removed via `git worktree remove --force` with an
+#       rm -rf fallback and one `git worktree prune` at the end; plus aged
+#       run-*.runid files.
+#   (2) <tmp_dir> keyed sidecars older than <days> — plain files only (the
+#       fishhawk-acceptance-evidence DIRECTORY is never matched), each glob
+#       requiring a dash after the prefix so the legacy fixed-slot transports
+#       (fishhawk-plan.json / fishhawk-pr.md / fishhawk-acceptance.json) are
+#       never touched.
+# dry_run=1 lists candidates without removing. Directory args are parameterized
+# (defaulting to the real roots) so scripts/test-dev drives it against fixtures.
+# Args: <days> <dry_run 0|1> [worktrees_dir] [tmp_dir]
+_prune_aged_artifacts() {
+  local days="$1"
+  local dry_run="$2"
+  local wt_dir="${3:-}"
+  local tmp_dir="${4:-/tmp}"
+  if [[ -z "$wt_dir" ]]; then
+    wt_dir="$(_shared_worktrees_dir 2>/dev/null)" || wt_dir=""
+  fi
+
+  # (1) aged run worktrees + runid files under the shared git dir.
+  if [[ -n "$wt_dir" && -d "$wt_dir" ]]; then
+    local rd status_out rf
+    for rd in "$wt_dir"/run-*(N/m+${days}); do
+      status_out=""
+      if ! status_out="$(git -C "$rd" status --porcelain 2>/dev/null)"; then
+        status_out=""
+      fi
+      if [[ -n "$status_out" ]]; then continue; fi
+      if (( dry_run )); then
+        print "would remove run worktree: $rd"
+        continue
+      fi
+      if git -C "${REPO_ROOT}" worktree remove --force "$rd" 2>/dev/null; then
+        print "removed run worktree: $rd"
+      else
+        rm -rf "$rd"
+        print "removed run worktree (rm -rf fallback): $rd"
+      fi
+    done
+    for rf in "$wt_dir"/run-*.runid(N.m+${days}); do
+      if (( dry_run )); then
+        print "would remove runid file: $rf"
+      else
+        rm -f "$rf" && print "removed runid file: $rf"
+      fi
+    done
+    if (( ! dry_run )); then
+      git -C "${REPO_ROOT}" worktree prune 2>/dev/null || true
+    fi
+  fi
+
+  # (2) aged keyed /tmp sidecars — plain-file qualifier (.), dash-keyed globs.
+  local f
+  for f in \
+    "$tmp_dir"/fishhawk-scope-*-*.json(N.m+${days}) \
+    "$tmp_dir"/fishhawk-scope-justifications-*-*.json(N.m+${days}) \
+    "$tmp_dir"/fishhawk-acceptance-*-*.json(N.m+${days}) \
+    "$tmp_dir"/fishhawk-pr-*-*.md(N.m+${days}) \
+    "$tmp_dir"/fishhawk-prompt-*.txt(N.m+${days}); do
+    if (( dry_run )); then
+      print "would remove tmp sidecar: $f"
+    else
+      rm -f "$f" && print "removed tmp sidecar: $f"
+    fi
+  done
+  return 0
+}
+
 cmd_up() {
   print "up: starting"
+  _warn_stale_worktrees || true
   local force_all=0
   local start_deps=0
   for arg in "$@"; do
@@ -1768,8 +1983,125 @@ cmd_preview_down() {
   return $rc
 }
 
+# `scripts/dev sweep [--days N] [--yes] [--dry-run]` — remove merged-clean
+# operator worktrees under .claude/worktrees (never a dirty one, never the
+# worktree the command runs from, never the main checkout), then prune aged run
+# litter (.git/fishhawk-worktrees/run-* dirs + run-*.runid files) and keyed /tmp
+# sidecars older than N days (default 7). ONE confirmation gates all removal:
+# `read -q` when stdin is a tty; a non-tty stdin without --yes (or a 'no' answer)
+# lists candidates and exits 0 WITHOUT removing anything — never a hung prompt in
+# a non-interactive session. Branch deletion is delegated to scripts/cleanup-merged
+# AFTER worktree removal (git refuses to delete a branch checked out in any
+# worktree — exactly why cleanup-merged alone never cleans these).
+cmd_sweep() {
+  local days=7 assume_yes=0 dry_run=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --days)
+        shift
+        days="${1:-}"
+        if [[ -z "$days" || "$days" == *[!0-9]* ]]; then
+          _die "sweep: --days requires a non-negative integer (got: '${days}')"
+        fi
+        ;;
+      --days=*)
+        days="${1#--days=}"
+        if [[ -z "$days" || "$days" == *[!0-9]* ]]; then
+          _die "sweep: --days requires a non-negative integer (got: '${days}')"
+        fi
+        ;;
+      --yes)     assume_yes=1 ;;
+      --dry-run) dry_run=1 ;;
+      *)         _die "sweep: unknown argument '$1'" ;;
+    esac
+    shift
+  done
+
+  local base_ref="origin/main"
+  local root
+  if ! root="$(_main_repo_root)"; then
+    _die "sweep: cannot resolve the main repo root (git required)"
+  fi
+  local wt_dir="${root}/.claude/worktrees"
+
+  # Merged-clean operator worktree removal candidates, excluding the worktree
+  # containing $PWD and the main checkout itself.
+  local -a wt_candidates
+  wt_candidates=()
+  local pwd_phys="${PWD:A}"
+  if [[ -d "$wt_dir" ]] && git -C "${REPO_ROOT}" rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null 2>&1; then
+    # NB: wtpath, NOT `path` — the lowercase `path` is zsh's special array tied
+    # to $PATH; `read -r class path` would corrupt the command search path.
+    local scan class wtpath pabs
+    scan="$(_scan_operator_worktrees "$wt_dir" "$base_ref")"
+    while IFS=$'\t' read -r class wtpath; do
+      if [[ -z "$wtpath" ]]; then continue; fi
+      if [[ "$class" != merged ]]; then continue; fi
+      pabs="${wtpath:A}"
+      # self-protection: never the current worktree, never the main checkout.
+      if [[ "$pwd_phys" == "$pabs" || "$pwd_phys" == "$pabs"/* ]]; then continue; fi
+      if [[ "$pabs" == "${root:A}" ]]; then continue; fi
+      wt_candidates+=("$wtpath")
+    done <<< "$scan"
+  fi
+
+  # Present candidates (worktrees + a dry-run pass over the litter roots).
+  print "sweep: merged-clean operator worktrees to remove: ${#wt_candidates}"
+  local c
+  for c in "${wt_candidates[@]}"; do print "  $c"; done
+  print "sweep: aged run/tmp litter older than ${days} day(s):"
+  _prune_aged_artifacts "$days" 1 || true
+
+  if (( dry_run )); then
+    print "sweep: --dry-run — nothing removed."
+    return 0
+  fi
+
+  # ONE confirmation. Non-tty stdin without --yes never blocks on a prompt: it
+  # has already listed the candidates above and removes nothing.
+  if (( ! assume_yes )); then
+    if [[ ! -t 0 ]]; then
+      print "sweep: non-interactive stdin and no --yes — listing only, nothing removed. Re-run with --yes to remove."
+      return 0
+    fi
+    print -n "Proceed with removal? [y/N] "
+    if ! read -q; then
+      print ""
+      print "sweep: cancelled — nothing removed."
+      return 0
+    fi
+    print ""
+  fi
+
+  # Remove merged-clean operator worktrees (NO --force: dirtiness was pre-checked;
+  # --force is reserved for the runner-owned run-* dirs in _prune_aged_artifacts).
+  for c in "${wt_candidates[@]}"; do
+    if git -C "${REPO_ROOT}" worktree remove "$c" 2>/dev/null; then
+      print "removed operator worktree: $c"
+    else
+      print -u2 "warning: could not remove operator worktree (skipped): $c"
+    fi
+  done
+  git -C "${REPO_ROOT}" worktree prune 2>/dev/null || true
+
+  # Prune aged run/tmp litter for real.
+  _prune_aged_artifacts "$days" 0 || true
+
+  # Delete the now-un-checked-out merged branches. Reuse, don't reimplement.
+  if [[ -x "${REPO_ROOT}/scripts/cleanup-merged" ]]; then
+    "${REPO_ROOT}/scripts/cleanup-merged" || print -u2 "warning: cleanup-merged reported an error"
+  fi
+
+  print "sweep: done."
+}
+
 _usage() {
-  print -u2 "usage: scripts/dev <up [--all] [--start-deps]|reload [--all] [--start-deps]|post-merge [<issue>] [--start-deps]|preview [<sha-or-ref>]|preview-down|k8s|k8s-down|down>"
+  print -u2 "usage: scripts/dev <up [--all] [--start-deps]|reload [--all] [--start-deps]|post-merge [<issue>] [--start-deps]|preview [<sha-or-ref>]|preview-down|sweep [--days N] [--yes] [--dry-run]|k8s|k8s-down|down>"
+  print -u2 ""
+  print -u2 "  sweep removes merged-clean operator worktrees under .claude/worktrees"
+  print -u2 "  (never a dirty one, never the current worktree) and prunes aged run/tmp"
+  print -u2 "  litter older than --days N (default 7); one confirmation, --yes to skip"
+  print -u2 "  it, --dry-run to list only. A non-tty stdin lists and removes nothing."
   print -u2 ""
   print -u2 "  post-merge runs the full per-PR post-merge walk: git pull --ff-only,"
   print -u2 "  scripts/cleanup-merged, an optional issue-closed check (<issue>), then"
@@ -1805,6 +2137,7 @@ if [[ -z "${DEV_LIB_ONLY:-}" ]]; then
     post-merge) cmd_post_merge "${@:2}" ;;
     preview)      cmd_preview "${@:2}" ;;
     preview-down) cmd_preview_down ;;
+    sweep)        cmd_sweep "${@:2}" ;;
     k8s)        cmd_k8s_up "${@:2}" ;;
     k8s-down)   cmd_k8s_down ;;
     down)       cmd_down ;;
