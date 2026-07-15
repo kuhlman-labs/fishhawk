@@ -622,11 +622,29 @@ func awaitingChildrenActions(run *Run) []SuggestedAction {
 	}
 }
 
+// reviveRunAction is the fishhawk_revive_run suggestion (#1915) offered on the
+// failed-run recovery arms alongside fishhawk_retry_stage. Revive re-parks
+// EVERY retryable failed stage WITHOUT dispatching (no orchestrator handoff),
+// so it is the safe move when a sibling stage's failure flipped the run
+// terminal while a healthy stage's review is still settling — distinct from
+// fishhawk_retry_stage, which re-opens ONE stage and auto-dispatches it. Like
+// retry, each re-park consumes that stage's per-stage retry budget.
+func reviveRunAction(run *Run) SuggestedAction {
+	return SuggestedAction{
+		Action:       "fishhawk_revive_run",
+		Params:       map[string]string{"run_id": run.ID},
+		Precondition: "the run flipped terminal-failed and every failed stage is retryable (category A/C, or a retryable D); revive refuses (422 revive_not_applicable) if any failed stage is non-retryable (category-B / D-rejected)",
+		Consumes:     consumesRetryBudget,
+		Reason:       "re-park ALL retryable failed stages in one operator verb WITHOUT dispatching — the safe batch recovery when a sibling stage's failure flipped the run terminal while a healthy stage's review is still settling. Distinct from fishhawk_retry_stage (which re-opens ONE stage and auto-dispatches): revive never dispatches, so you dispatch each re-parked stage at its proper gate turn via the existing verbs",
+	}
+}
+
 // implementFailedNextActions branches on the failed implement stage's
 // failure category: B routes to the no-replan recovery run (or, for a
 // decomposition child, an IN-PLACE re-drive), A to an in-place retry
 // (citing a known flake trace event when the failure detail carries one),
-// everything else to retry-or-cancel.
+// everything else to retry-or-cancel. The category-A and default (retryable)
+// arms also offer fishhawk_revive_run (#1915) — the batch no-dispatch re-park.
 func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextActions {
 	category := ""
 	if impl.FailureCategory != nil {
@@ -722,13 +740,16 @@ func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextAction
 		}
 		return &NextActions{
 			State: "implement_failed_category_a",
-			Actions: []SuggestedAction{{
-				Action:       "fishhawk_retry_stage",
-				Params:       map[string]string{"stage_id": impl.ID},
-				Precondition: "the implement stage failed category-A",
-				Consumes:     consumesRetryBudget,
-				Reason:       reason,
-			}},
+			Actions: []SuggestedAction{
+				{
+					Action:       "fishhawk_retry_stage",
+					Params:       map[string]string{"stage_id": impl.ID},
+					Precondition: "the implement stage failed category-A",
+					Consumes:     consumesRetryBudget,
+					Reason:       reason,
+				},
+				reviveRunAction(run),
+			},
 		}
 	default:
 		return &NextActions{
@@ -741,6 +762,7 @@ func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextAction
 					Consumes:     consumesRetryBudget,
 					Reason:       "retry the failed stage in place after reading the failure reason",
 				},
+				reviveRunAction(run),
 				{
 					Action:       "fishhawk_cancel_run",
 					Params:       map[string]string{"run_id": run.ID},

@@ -230,28 +230,32 @@ func TestNextActions_StateTable(t *testing.T) {
 			wantConsumes: []string{consumesNewRun},
 		},
 		{
+			// #1915: the category-A arm now also offers fishhawk_revive_run (the
+			// batch no-dispatch re-park) after the single-stage retry.
 			name:         "e_category_a_retry_with_flake_citation",
 			run:          naRun("failed"),
 			stages:       []Stage{naStage("plan", "succeeded"), naFailedImplement("A", "verify failed after verify_infra_flake_retry absorbed one flake")},
 			wantState:    "implement_failed_category_a",
-			wantActions:  []string{"fishhawk_retry_stage"},
-			wantConsumes: []string{consumesRetryBudget},
+			wantActions:  []string{"fishhawk_retry_stage", "fishhawk_revive_run"},
+			wantConsumes: []string{consumesRetryBudget, consumesRetryBudget},
 		},
 		{
 			name:         "e_category_a_retry_without_citation",
 			run:          naRun("failed"),
 			stages:       []Stage{naStage("plan", "succeeded"), naFailedImplement("A", "agent crashed")},
 			wantState:    "implement_failed_category_a",
-			wantActions:  []string{"fishhawk_retry_stage"},
-			wantConsumes: []string{consumesRetryBudget},
+			wantActions:  []string{"fishhawk_retry_stage", "fishhawk_revive_run"},
+			wantConsumes: []string{consumesRetryBudget, consumesRetryBudget},
 		},
 		{
+			// #1915: the default (retryable) arm offers fishhawk_revive_run
+			// between the single-stage retry and cancel.
 			name:         "f_category_c_retry_or_cancel",
 			run:          naRun("failed"),
 			stages:       []Stage{naStage("plan", "succeeded"), naFailedImplement("C", "infra")},
 			wantState:    "implement_failed",
-			wantActions:  []string{"fishhawk_retry_stage", "fishhawk_cancel_run"},
-			wantConsumes: []string{consumesRetryBudget, consumesNone},
+			wantActions:  []string{"fishhawk_retry_stage", "fishhawk_revive_run", "fishhawk_cancel_run"},
+			wantConsumes: []string{consumesRetryBudget, consumesRetryBudget, consumesNone},
 		},
 		{
 			name:         "g_implement_review_pending_repoll",
@@ -728,6 +732,45 @@ func TestNextActions_CategoryAExternalAPICitation(t *testing.T) {
 	retry = findAction(t, uncited, "fishhawk_retry_stage")
 	if strings.Contains(retry.Reason, "529") || strings.Contains(retry.Reason, "status.claude.com") {
 		t.Errorf("generic category-A retry reason must not cite an external-API incident: %q", retry.Reason)
+	}
+}
+
+// TestNextActions_FailedRunOffersReviveRun pins the #1915 addition: both the
+// category-A arm and the default (retryable) arm surface fishhawk_revive_run
+// keyed to the run id, with a reason that distinguishes the batch no-dispatch
+// re-park from the single-stage auto-dispatching retry. This is the arm that
+// makes the one-verb revive discoverable when a sibling failure flips the run
+// terminal.
+func TestNextActions_FailedRunOffersReviveRun(t *testing.T) {
+	run := naRun("failed")
+
+	for _, tc := range []struct {
+		name  string
+		stage Stage
+	}{
+		{"category_a", naFailedImplement("A", "agent crashed")},
+		{"category_c_default_arm", naFailedImplement("C", "infra")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			na := nextActionsFor(run, []Stage{naStage("plan", "succeeded"), tc.stage},
+				nil, nil, nil, nil, false, false, "", "", releaseSignals{})
+			revive := findAction(t, na, "fishhawk_revive_run")
+			if revive.Params["run_id"] != run.ID {
+				t.Errorf("revive params run_id = %q, want %q", revive.Params["run_id"], run.ID)
+			}
+			if revive.Consumes != consumesRetryBudget {
+				t.Errorf("revive consumes = %q, want %q", revive.Consumes, consumesRetryBudget)
+			}
+			// The reason must distinguish revive (re-park, no dispatch) from
+			// retry (re-open + auto-dispatch).
+			lower := strings.ToLower(revive.Reason)
+			if !strings.Contains(lower, "without dispatching") {
+				t.Errorf("revive reason must state it re-parks without dispatching; got %q", revive.Reason)
+			}
+			if !strings.Contains(lower, "fishhawk_retry_stage") {
+				t.Errorf("revive reason must contrast with fishhawk_retry_stage; got %q", revive.Reason)
+			}
+		})
 	}
 }
 

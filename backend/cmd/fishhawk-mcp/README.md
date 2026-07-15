@@ -37,7 +37,7 @@ E19.2 / #342 shipped scaffolding + handshake. E19.3–E19.6 landed the v0 tool s
 Lifecycle-write provenance (E22 / #389): `fishhawk_start_run` (E22.1 / #390), `fishhawk_cancel_run` (E22.2 / #391),
 `fishhawk_retry_stage` (E22.3 / #392), `fishhawk_approve_plan` + `fishhawk_reject_plan` (E22.4 / #393),
 `fishhawk_list_runs` (E22.5 / #394), `fishhawk_fixup_stage` (E22.X / #762), `fishhawk_revise_plan` (E22.X / #1099),
-`fishhawk_resume_run` (E22.X / #978). Phase A closed with E22.6 (docs sweep + E2E test extension).
+`fishhawk_resume_run` (E22.X / #978), `fishhawk_revive_run` (E22.X / #1915). Phase A closed with E22.6 (docs sweep + E2E test extension).
 
 E19.7 / #347 wires the binary into the release pipeline next.
 
@@ -589,6 +589,21 @@ Inputs: `parent_run_id` (the failed run), optional `add_scope_files` (`[{path, o
 - **Budget**: `retry_attempt` is carried UNCHANGED — recovery never consumes the `on_ci_failure` auto-retry cap. Provenance lands as a `plan_reused_from` audit entry on the child (internal audit kind, not an issue-comment surface).
 
 Drive the child like any local run: `fishhawk_run_stage` executes the implement stage directly — no plan stage exists, no plan approval is needed.
+
+## Failed-run revive (`fishhawk_revive_run`)
+
+`fishhawk_revive_run` (E22.X / [#1915](https://github.com/kuhlman-labs/fishhawk/issues/1915)) is the **single operator verb** that re-admits a terminal-**FAILED** run for another turn, replacing the old retry-without-dispatch dance (retry each failed stage, then hand-park the rest). It wraps `POST /v0/runs/{run_id}/revive`.
+
+The backend **pre-validates** that **every** failed stage is retryable, then re-parks each in its correct gate-ordered pre-dispatch state (A/C → `pending`, D SLA-timeout → `awaiting_approval`, decomposed-parent implement → `awaiting_children`) and flips the run **failed → running**. A single non-retryable failed stage (category-B, D-rejected, or a stage with no recorded category) refuses the **whole** revive with `422 revive_not_applicable` naming the blocking stage — **no partial mutation**.
+
+The load-bearing distinction from `fishhawk_retry_stage`: revive **re-parks only** — it performs **NO** orchestrator handoff and **never dispatches**. A re-parked stage sits in its pre-dispatch state until you dispatch it at its proper gate turn via the existing verbs (`fishhawk_dispatch_stage` / `fishhawk_run_stage` on the local runner), so the [#1700](https://github.com/kuhlman-labs/fishhawk/issues/1700) wrong-order re-dispatch corruption is structurally impossible. `fishhawk_retry_stage`, by contrast, re-opens **one** stage and auto-dispatches it. Reach for revive when a sibling stage's failure flipped the run terminal while a healthy stage's review is still settling and you want a safe batch re-park; reach for retry when you want one stage re-run immediately. Each re-park consumes that stage's per-stage retry budget exactly like a retry — revive is a batch retry-shaped re-open, not a budget bypass.
+
+- **Input**: `run_id` (the terminal-FAILED run).
+- **Auth**: operator-only. The backend requires `write:stages` **or** `write:retries` and rejects any run-bound agent (`mcp:run:*`) token outright (`403 agent_token_forbidden`).
+- **Returns**: the re-opened run (now `running`), the per-stage re-park summary (`restored_stages` — each carrying id / type / prior failure category+reason / restored state), and a `next_step` hint that dispatch happens at each stage's proper gate turn.
+- **Errors** propagated as tool errors: invalid UUID (caught before the HTTP hop), `agent_token_forbidden` (403), `insufficient_scope` (403), `run_not_found` (404), `revive_not_applicable` (422), `revive_unconfigured` (503).
+
+The `next_actions` failed-run arms (`implement_failed_category_a` and the default `implement_failed`) surface `fishhawk_revive_run` alongside `fishhawk_retry_stage`.
 
 ## Clarification answer-and-resume (`fishhawk_answer_clarification`)
 
