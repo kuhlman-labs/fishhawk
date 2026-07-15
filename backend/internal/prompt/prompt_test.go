@@ -4067,6 +4067,134 @@ func TestBuild_ImplementReview_DeltaVerificationSectionGuardedByPriorConcerns(t 
 	}
 }
 
+// TestBuild_ImplementReview_SettledConcernsLedger pins the #1913 settled-ledger
+// rendering: the section, its per-state rows, the waived/deferred operator-reason
+// lines, the addressed/superseded context rows (with NO reason line), and the
+// conditional settled_ref/new_evidence verdict-schema members.
+func TestBuild_ImplementReview_SettledConcernsLedger(t *testing.T) {
+	out, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		SettledConcerns: []PriorConcern{
+			{ID: "w1", State: "waived", Severity: "medium", Category: "scope", Note: "extra file", StateReason: "operator accepts the extra helper"},
+			{ID: "d1", State: "deferred", Severity: "low", Category: "verification", Note: "missing bench", StateReason: "filed follow-up #4242"},
+			{ID: "a1", State: "addressed", Severity: "high", Category: "correctness", Note: "nil deref"},
+			{ID: "s1", State: "superseded", Severity: "low", Category: "style", Note: "old naming"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"### Settled concerns (operator arbitrations and resolved findings — binding)",
+		"id: w1",
+		"state: waived",
+		"operator waived reason: operator accepts the extra helper",
+		"id: d1",
+		"state: deferred",
+		"operator deferred reason: filed follow-up #4242",
+		"id: a1",
+		"state: addressed",
+		"id: s1",
+		"state: superseded",
+		// conditional schema members render because SettledConcerns is non-empty
+		"\"settled_ref\":",
+		"\"new_evidence\":",
+	} {
+		if !strings.Contains(out, w) {
+			t.Errorf("settled ledger must render %q:\n%s", w, out)
+		}
+	}
+	// addressed/superseded rows carry NO operator-reason line (only waived/deferred do).
+	if strings.Contains(out, "operator addressed reason") || strings.Contains(out, "operator superseded reason") {
+		t.Errorf("addressed/superseded rows must not carry an operator-reason line:\n%s", out)
+	}
+}
+
+// TestBuild_ImplementReview_SettledConcernsTwoTierLanguage is the binding
+// approval-condition test: the ledger's discard/suppression sentence must name
+// ONLY waived and deferred (matching the server guard exactly), and a SEPARATE
+// sentence must name addressed/superseded as the insertable-regression path.
+// The two tiers must not bleed together — an addressed regression is RECORDED,
+// not discarded.
+func TestBuild_ImplementReview_SettledConcernsTwoTierLanguage(t *testing.T) {
+	out, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		SettledConcerns: []PriorConcern{
+			{ID: "w1", State: "waived", Severity: "medium", Category: "scope", Note: "n", StateReason: "r"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	lines := strings.Split(out, "\n")
+	var discardLine, regressionLine string
+	for _, l := range lines {
+		if strings.Contains(l, "will DISCARD it") {
+			discardLine = l
+		}
+		if strings.Contains(l, "will RECORD it, not discard it") {
+			regressionLine = l
+		}
+	}
+	if discardLine == "" {
+		t.Fatalf("ledger must contain a discard sentence for the binding tier:\n%s", out)
+	}
+	// Tier 1: the discard sentence names ONLY waived and deferred.
+	if !strings.Contains(discardLine, "waived") || !strings.Contains(discardLine, "deferred") {
+		t.Errorf("discard sentence must name both waived and deferred:\n%s", discardLine)
+	}
+	if strings.Contains(discardLine, "addressed") || strings.Contains(discardLine, "superseded") {
+		t.Errorf("discard sentence must NOT name addressed/superseded (they are not discarded):\n%s", discardLine)
+	}
+	// Tier 2: a separate sentence names addressed/superseded as insertable regressions.
+	if regressionLine == "" {
+		t.Fatalf("ledger must contain an insertable-regression sentence:\n%s", out)
+	}
+	if !strings.Contains(regressionLine, "addressed") || !strings.Contains(regressionLine, "superseded") {
+		t.Errorf("insertable-regression sentence must name addressed and superseded:\n%s", regressionLine)
+	}
+}
+
+// TestBuild_ImplementReview_EmptySettledConcernsByteIdentical pins the #1913
+// byte-identity property: an empty SettledConcerns (the no-settled-context run,
+// which INCLUDES the common no-waived-concern case) leaves the implement-review
+// prompt byte-identical to omitting the field — protecting the caching prefix
+// and the pre-#1913 output.
+func TestBuild_ImplementReview_EmptySettledConcernsByteIdentical(t *testing.T) {
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		PriorConcerns: []PriorConcern{
+			{ID: "c1", State: "addressed_pending", Severity: "high", Category: "correctness", Note: "n"},
+		},
+	}
+	without, err := Build("implement_review", base)
+	if err != nil {
+		t.Fatalf("Build without: %v", err)
+	}
+	withEmpty := base
+	withEmpty.SettledConcerns = []PriorConcern{}
+	got, err := Build("implement_review", withEmpty)
+	if err != nil {
+		t.Fatalf("Build with empty: %v", err)
+	}
+	if got != without {
+		t.Errorf("empty SettledConcerns must be byte-identical to omitting it")
+	}
+	if strings.Contains(without, "### Settled concerns") {
+		t.Errorf("no settled concerns must omit the settled ledger section:\n%s", without)
+	}
+	// The conditional schema members must NOT render without settled concerns.
+	if strings.Contains(without, "settled_ref") || strings.Contains(without, "new_evidence") {
+		t.Errorf("no settled concerns must omit the settled_ref/new_evidence schema members:\n%s", without)
+	}
+}
+
 func TestBuild_ImplementReview_SupplementalReinvoke_RendersFramingAndExemptions(t *testing.T) {
 	// #1250: with SupplementalReinvoke=true the prompt renders the bounded
 	// supplemental framing AND the exemption delta in the gate_evidence section,

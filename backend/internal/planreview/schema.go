@@ -48,6 +48,14 @@ func VerdictSchema() map[string]any {
 			"note":     map[string]any{"type": "string"},
 			// SuggestedPatch (#1165): an optional unified diff for a mechanical fix.
 			"suggested_patch": map[string]any{"type": "string"},
+			// SettledRef / NewEvidence (#1913): the re-litigation lineage tag.
+			// Registered as optional properties so the closed
+			// (additionalProperties:false) verdict schema accepts a reviewer
+			// emitting the settled_ref/new_evidence the prompt instructs — an
+			// un-registered property would make a schema-conforming reviewer
+			// unable to emit the field the ledger asks it to tag a re-raise with.
+			"settled_ref":  map[string]any{"type": "string"},
+			"new_evidence": map[string]any{"type": "string"},
 		},
 	}
 

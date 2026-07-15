@@ -111,6 +111,43 @@ func TestDecodeVerdict_SuggestedPatch(t *testing.T) {
 	}
 }
 
+// TestDecodeVerdict_SettledRefNewEvidence covers the additive #1913 fields: a
+// verdict whose concern carries settled_ref + new_evidence decodes both onto
+// the struct verbatim, AND a legacy verdict WITHOUT them still decodes with both
+// empty — so reviewer output predating the fields stays valid (encoding/json
+// ignores unknown members in both directions, so old builds reading new payloads
+// and new builds reading old payloads both decode cleanly).
+func TestDecodeVerdict_SettledRefNewEvidence(t *testing.T) {
+	withTag := []byte(`{"verdict":"approve_with_concerns","concerns":[{"severity":"high","category":"correctness","note":"nil deref regressed","settled_ref":"11111111-1111-1111-1111-111111111111","new_evidence":"the fix was reverted in the fixup diff"}]}`)
+	verdict, err := DecodeVerdict(withTag)
+	if err != nil {
+		t.Fatalf("DecodeVerdict (with tag): %v", err)
+	}
+	if len(verdict.Concerns) != 1 {
+		t.Fatalf("len(Concerns) = %d, want 1", len(verdict.Concerns))
+	}
+	if got := verdict.Concerns[0].SettledRef; got != "11111111-1111-1111-1111-111111111111" {
+		t.Errorf("SettledRef = %q, want the echoed id", got)
+	}
+	if got := verdict.Concerns[0].NewEvidence; got != "the fix was reverted in the fixup diff" {
+		t.Errorf("NewEvidence = %q, want the reviewer justification", got)
+	}
+
+	// Legacy: a concern with both fields ABSENT still decodes, with both empty.
+	legacy := []byte(`{"verdict":"approve_with_concerns","concerns":[{"severity":"low","category":"scope","note":"x"}]}`)
+	verdict, err = DecodeVerdict(legacy)
+	if err != nil {
+		t.Fatalf("DecodeVerdict (legacy): %v", err)
+	}
+	if len(verdict.Concerns) != 1 {
+		t.Fatalf("len(Concerns) = %d, want 1", len(verdict.Concerns))
+	}
+	if verdict.Concerns[0].SettledRef != "" || verdict.Concerns[0].NewEvidence != "" {
+		t.Errorf("legacy concern: SettledRef=%q NewEvidence=%q, want both empty",
+			verdict.Concerns[0].SettledRef, verdict.Concerns[0].NewEvidence)
+	}
+}
+
 // TestDecodeVerdict_MalformedReturnsOriginalError asserts genuinely-malformed
 // JSON (a truncated object the sanitizer cannot rescue) still returns a decode
 // error — the original strict error, not a masked one.

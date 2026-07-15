@@ -574,6 +574,57 @@ func TestConcern_Provenance_JSONRoundTrip(t *testing.T) {
 	})
 }
 
+// TestConcern_SettledRefNewEvidence_JSONRoundTrip pins the #1913 additive
+// fields on the authoritative audit payload: because ImplementReviewedPayload
+// embeds []Concern, settled_ref/new_evidence ride the payload for free via
+// omitempty. A concern carrying both marshals them and round-trips; a concern
+// without them emits neither key (byte-identical to a pre-#1913 payload) and
+// decodes with both empty.
+func TestConcern_SettledRefNewEvidence_JSONRoundTrip(t *testing.T) {
+	t.Run("present on the payload when set", func(t *testing.T) {
+		p := planreview.ImplementReviewedPayload{
+			ReviewerKind: "agent",
+			Verdict:      planreview.VerdictApproveWithConcerns,
+			Concerns: []planreview.Concern{{
+				Severity:    planreview.SeverityHigh,
+				Category:    "correctness",
+				Note:        "regressed",
+				SettledRef:  "22222222-2222-2222-2222-222222222222",
+				NewEvidence: "the fixup reverted the guard",
+			}},
+		}
+		b, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		if !strings.Contains(string(b), `"settled_ref":"22222222-2222-2222-2222-222222222222"`) {
+			t.Errorf("payload = %s, want it to carry settled_ref", b)
+		}
+		if !strings.Contains(string(b), `"new_evidence":"the fixup reverted the guard"`) {
+			t.Errorf("payload = %s, want it to carry new_evidence", b)
+		}
+		var got planreview.ImplementReviewedPayload
+		if err := json.Unmarshal(b, &got); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if len(got.Concerns) != 1 || got.Concerns[0].SettledRef != "22222222-2222-2222-2222-222222222222" ||
+			got.Concerns[0].NewEvidence != "the fixup reverted the guard" {
+			t.Errorf("round-tripped concern = %+v, want settled_ref/new_evidence preserved", got.Concerns)
+		}
+	})
+
+	t.Run("omitted when empty", func(t *testing.T) {
+		c := planreview.Concern{Severity: planreview.SeverityLow, Category: "scope", Note: "n"}
+		b, err := json.Marshal(c)
+		if err != nil {
+			t.Fatalf("Marshal: %v", err)
+		}
+		if strings.Contains(string(b), "settled_ref") || strings.Contains(string(b), "new_evidence") {
+			t.Errorf("marshaled concern = %s, want no settled_ref/new_evidence keys (json:omitempty)", b)
+		}
+	})
+}
+
 // TestVerdictSchema_OmitsProvenance is the binding guard for the plan's CRITICAL
 // condition: the reviewer-facing verdict schema must NOT expose `provenance`, so
 // a review agent cannot smuggle the server-internal trust marker in through the

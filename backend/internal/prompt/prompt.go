@@ -554,6 +554,21 @@ type Trigger struct {
 	// build) omits the section and keeps the prompt byte-identical to
 	// the pre-#984 output.
 	PriorConcerns []PriorConcern
+	// SettledConcerns carries the stage's SETTLED review concerns for the
+	// implement-review prompt's "Settled concerns" ledger (#1913): the
+	// operator-arbitrated (waived, deferred) rows plus the prior rounds'
+	// resolved (addressed, superseded) rows, each with its audited reason.
+	// It is a distinct set from PriorConcerns (open concerns the reviewer must
+	// delta-verify): the ledger is a two-tier binding-vs-context surface.
+	// WAIVED and DEFERRED entries are binding — re-raising one without BOTH a
+	// settled_ref echo AND non-empty new_evidence is re-litigation the server
+	// discards. ADDRESSED and SUPERSEDED entries are resolved-in-a-prior-round
+	// context whose re-raise REMAINS insertable (a genuine regression must
+	// reach the operator) — the reviewer tags such a re-raise with
+	// settled_ref + new_evidence only for lineage. Implement-review-only;
+	// empty/nil omits the section and keeps the prompt byte-identical to the
+	// pre-#1913 output for a run with no settled concerns.
+	SettledConcerns []PriorConcern
 	// GateEvidence carries the machine-verified gate results for the
 	// implement-review prompt (#963): the runner's committed-tree verify
 	// outcomes, verify summary, infra-flake retries, scope-enforcement
@@ -2714,7 +2729,18 @@ func buildImplementReview(t Trigger) string {
 	b.WriteString("      \"severity\": \"high\" | \"medium\" | \"low\",\n")
 	b.WriteString("      \"category\": \"<short classifier, e.g. scope | correctness | regression | verification>\",\n")
 	b.WriteString("      \"note\": \"<free-form explanation of the concern>\",\n")
-	b.WriteString("      \"suggested_patch\": \"<optional unified diff that applies to the PR branch>\"\n")
+	// The settled_ref/new_evidence members render ONLY when a "Settled
+	// concerns" ledger is shown below (#1913): with no settled concerns there
+	// is nothing to re-raise, and the omission keeps the prompt byte-identical
+	// to the pre-#1913 output. When rendered, suggested_patch gains a trailing
+	// comma so the JSON shape stays valid with the two extra members.
+	if len(t.SettledConcerns) > 0 {
+		b.WriteString("      \"suggested_patch\": \"<optional unified diff that applies to the PR branch>\",\n")
+		b.WriteString("      \"settled_ref\": \"<optional: the id of a Settled-concerns ledger entry this concern re-raises>\",\n")
+		b.WriteString("      \"new_evidence\": \"<required WITH settled_ref: what makes this a genuinely new finding, not re-litigation>\"\n")
+	} else {
+		b.WriteString("      \"suggested_patch\": \"<optional unified diff that applies to the PR branch>\"\n")
+	}
 	b.WriteString("    }\n")
 	b.WriteString("  ],\n")
 	if len(t.PriorConcerns) > 0 {
@@ -3034,6 +3060,46 @@ func buildImplementReview(t Trigger) string {
 				c.ID, c.State, c.Severity, c.Category, c.Note)
 			if c.State == "waived" && c.StateReason != "" {
 				fmt.Fprintf(&b, "  operator waive reason: %s\n", c.StateReason)
+			}
+		}
+		b.WriteString("\n")
+	}
+
+	// Settled-concerns ledger (#1913). The operator's waive/defer arbitrations
+	// and prior rounds' resolved findings, carried forward so a round-N reviewer
+	// has the settled history and does not re-raise a settled finding reworded.
+	// Two tiers, matching the server-side re-litigation guard EXACTLY:
+	//   - WAIVED / DEFERRED — binding. A re-raise without BOTH settled_ref AND
+	//     non-empty new_evidence is re-litigation the server DISCARDS (it records
+	//     a concern_relitigation_suppressed audit entry instead of minting a new
+	//     open concern row).
+	//   - ADDRESSED / SUPERSEDED — resolved-in-a-prior-round context. A re-raise
+	//     REMAINS insertable: a genuine regression of an addressed fix is recorded
+	//     and reaches the operator. Tag it with settled_ref + new_evidence for
+	//     lineage.
+	// Rendered only when settled concerns exist; empty keeps the prompt
+	// byte-identical to the pre-#1913 output.
+	if len(t.SettledConcerns) > 0 {
+		b.WriteString("### Settled concerns (operator arbitrations and resolved findings — binding)\n\n")
+		b.WriteString("Earlier rounds of this stage SETTLED the concerns below, each with a stable id and its " +
+			"lifecycle state. They are carried forward so you have the full settled history — do NOT re-discover them " +
+			"from scratch. These rules are BINDING:\n\n")
+		b.WriteString("- Concerns in state `waived` or `deferred` are operator arbitrations. You MUST NOT re-raise " +
+			"one in `concerns[]` unless you attach BOTH a `settled_ref` echoing its id AND a non-empty `new_evidence` " +
+			"stating what makes it a genuinely new finding. A re-raise of a waived or deferred concern WITHOUT both is " +
+			"re-litigation and the server will DISCARD it (recording a suppression audit entry) rather than mint a new " +
+			"concern.\n")
+		b.WriteString("- Concerns in state `addressed` or `superseded` are resolved-in-a-prior-round context. If you " +
+			"observe a genuine REGRESSION of one — the prior fix was undone or broke — you MAY re-raise it in " +
+			"`concerns[]`; the server will RECORD it, not discard it. Tag such a re-raise with `settled_ref` (its id) " +
+			"and `new_evidence` (the regression you observed) for lineage.\n")
+		b.WriteString("- Do NOT re-raise any listed concern that is still settled. `concerns[]` is for genuinely NEW " +
+			"findings and evidence-backed regressions only.\n\n")
+		for _, c := range t.SettledConcerns {
+			fmt.Fprintf(&b, "- id: %s\n  state: %s\n  severity: %s\n  category: %s\n  note: %s\n",
+				c.ID, c.State, c.Severity, c.Category, c.Note)
+			if (c.State == "waived" || c.State == "deferred") && c.StateReason != "" {
+				fmt.Fprintf(&b, "  operator %s reason: %s\n", c.State, c.StateReason)
 			}
 		}
 		b.WriteString("\n")

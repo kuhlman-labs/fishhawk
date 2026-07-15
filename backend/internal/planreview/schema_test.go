@@ -138,6 +138,27 @@ func TestVerdictSchema_MatchesStruct(t *testing.T) {
 	}
 }
 
+// TestVerdictSchema_SettledConcernFields pins the #1913 additive concern
+// properties: the closed (additionalProperties:false) concerns.items object
+// registers settled_ref AND new_evidence as string properties, so a
+// schema-conforming reviewer CAN emit the re-litigation lineage tag the
+// "Settled concerns" ledger instructs it to. Absent from the schema, the
+// prompt would ask for a field a strict reviewer cannot produce.
+func TestVerdictSchema_SettledConcernFields(t *testing.T) {
+	schema := VerdictSchema()
+	topProps := propsOf(t, schema, "top-level")
+	concernProps := propsOf(t, itemsOf(t, topProps, "concerns"), "concerns.items")
+	for _, key := range []string{"settled_ref", "new_evidence"} {
+		p, ok := concernProps[key].(map[string]any)
+		if !ok {
+			t.Fatalf("concerns.items is missing the %q property (#1913)", key)
+		}
+		if p["type"] != "string" {
+			t.Errorf("concerns.items.%s type = %v, want \"string\"", key, p["type"])
+		}
+	}
+}
+
 // assertRequiredEnumeratesAll asserts an object node's `required` array lists
 // EVERY key in its `properties` — the codex strict-mode invariant (#1330).
 func assertRequiredEnumeratesAll(t *testing.T, node map[string]any, where string) {
@@ -230,7 +251,7 @@ func TestStrictVerdictSchema_SatisfiesStrictRequired(t *testing.T) {
 	if _, ok := concernProps["severity"].(map[string]any)["enum"]; !ok {
 		t.Error("strict concerns.items: severity lost its enum in the strict transform")
 	}
-	for _, k := range []string{"category", "note", "suggested_patch"} {
+	for _, k := range []string{"category", "note", "suggested_patch", "settled_ref", "new_evidence"} {
 		assertNullable(t, concernProps, k, "strict concerns.items")
 	}
 

@@ -114,6 +114,29 @@ type Concern struct {
 	// without provenance decodes with the zero value (empty string) and
 	// renders on the unchanged trusted path.
 	Provenance string `json:"provenance,omitempty"`
+
+	// SettledRef optionally echoes the stable id of a concern listed in the
+	// implement-review prompt's "Settled concerns" ledger (#1913) that this
+	// concern re-raises. It is the lineage tag the deterministic server-side
+	// re-litigation guard keys on: a concern whose SettledRef resolves to a
+	// same-run/same-stage WAIVED or DEFERRED concern and whose NewEvidence is
+	// empty is recorded as a concern_relitigation_suppressed audit entry rather
+	// than minted as a fresh open concern row — closing the round-over-round
+	// churn where a reviewer re-raises an operator-arbitrated finding reworded.
+	// A re-raise of an ADDRESSED or SUPERSEDED ledger entry stays insertable
+	// (a genuine regression of an addressed fix must reach the operator); the
+	// tag is still requested for lineage. omitempty keeps reviewer output
+	// predating the field byte-identical, and encoding/json ignores the absent
+	// member in both directions so old verdicts decode with an empty value.
+	SettledRef string `json:"settled_ref,omitempty"`
+
+	// NewEvidence optionally carries the reviewer's justification that a
+	// re-raise of a settled concern (SettledRef) rests on genuinely new
+	// evidence rather than re-litigating the operator's arbitration (#1913).
+	// A non-empty NewEvidence disarms the re-litigation guard for that
+	// concern — it falls open to the normal insert so a real regression is
+	// never discarded. omitempty keeps pre-#1913 verdicts byte-identical.
+	NewEvidence string `json:"new_evidence,omitempty"`
 }
 
 // ConcernProvenanceAcceptance marks a Concern synthesized from the acceptance
