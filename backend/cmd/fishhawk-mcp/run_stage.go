@@ -408,6 +408,53 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	// as a warning rather than failing. Seeded with any guard fail-open
 	// warning from the runner_kind guardrail above.
 	warnings := guardWarnings
+
+	// (3a) Acceptance-dispatch admission (#1928): for an acceptance run_stage,
+	// short-circuit an all-skip-with-basis / empty-criteria / out-of-scope plan
+	// BEFORE spawning a runner that would fail category-C
+	// acceptance_target_unreachable. Fail OPEN (admission-call error -> warning +
+	// spawn as today); a short_circuited:false result is the normal no-op with no
+	// warning. On a hit, compose the output from the settled stage and return
+	// without spawning.
+	if in.Stage == "acceptance" {
+		admission, warn := r.maybeShortCircuitAcceptance(ctx, stageUUID)
+		if warn != "" {
+			warnings = append(warnings, warn)
+		}
+		if admission != nil && admission.ShortCircuited {
+			stageState := ""
+			var stageWaitStatus *StageWaitStatus
+			if fetchErr := func() error {
+				fetchCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				stages, ferr := r.api.ListRunStages(fetchCtx, runUUID)
+				if ferr != nil {
+					return ferr
+				}
+				for _, s := range stages {
+					if s.ID == stageUUID.String() {
+						stageState = s.State
+					}
+				}
+				stageWaitStatus = stageWaitStatusFor(stages, in.Stage, "")
+				return nil
+			}(); fetchErr != nil {
+				warnings = append(warnings,
+					fmt.Sprintf("post-short-circuit stage fetch failed: %v", fetchErr))
+			}
+			warnings = append(warnings, fmt.Sprintf(
+				"acceptance stage short-circuited to a passed verdict server-side (%s) with no runner spawn and no preview.",
+				shortCircuitLabel(admission)))
+			return nil, RunStageOutput{
+				StageState:      stageState,
+				Warnings:        warnings,
+				RunURL:          r.api.baseURL + "/runs/" + runUUID.String(),
+				StageWaitStatus: stageWaitStatus,
+				Outcome:         "short_circuited",
+			}, nil
+		}
+	}
+
 	repo := in.GitHubRepo
 	if repo == "" {
 		detected, derr := runStageDetectGitHubRepo(workingDir)
@@ -641,6 +688,35 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	}
 
 	return nil, out, nil
+}
+
+// maybeShortCircuitAcceptance calls the pre-spawn acceptance-admission endpoint
+// (#1928) for an acceptance stage before a host dispatch records spawn evidence
+// or spawns a runner. It returns the admission result on a 2xx and a non-empty
+// warning ONLY when the admission HTTP call itself errored (network / 5xx) — the
+// fail-OPEN signal the caller appends before proceeding to record+spawn as
+// today. Per the reconciliation binding condition, a short_circuited:false
+// result (a non-admissible stage state — already settled, mixed criteria, an
+// unconfigured orchestrator) is the NORMAL no-op path and carries NO warning: it
+// returns (res, "") and the caller records+spawns exactly as today. Only
+// admission.ShortCircuited == true means the caller skips the spawn.
+func (r *runResolver) maybeShortCircuitAcceptance(ctx context.Context, stageID uuid.UUID) (*AcceptanceAdmissionResult, string) {
+	res, err := r.api.AcceptanceDispatchAdmission(ctx, stageID)
+	if err != nil {
+		return nil, fmt.Sprintf(
+			"acceptance-admission pre-check failed (%v); proceeding to spawn as usual (fail-open).", err)
+	}
+	return res, ""
+}
+
+// shortCircuitLabel renders a human label for a fired admission short-circuit:
+// the basis when present (the two verdict-recording predicates), else the kind
+// (the out-of-scope skip records a marker, not a basis).
+func shortCircuitLabel(res *AcceptanceAdmissionResult) string {
+	if res.Basis != "" {
+		return res.Basis
+	}
+	return res.Kind
 }
 
 // resolveRunnerBinary resolves the fishhawk-runner binary path shared by

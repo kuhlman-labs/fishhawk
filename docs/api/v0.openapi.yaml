@@ -7989,6 +7989,95 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/stages/{stage_id}/acceptance-admission:
+    post:
+      operationId: acceptanceDispatchAdmission
+      summary: Pre-spawn acceptance short-circuit admission
+      description: |
+        Pre-spawn admission step (#1928) a local host dispatch
+        (`fishhawk_dispatch_stage` / `fishhawk_run_stage` /
+        `fishhawk_drive_run`) calls for an **acceptance** stage BEFORE it
+        spawns a runner. The server evaluates the approved plan's three
+        disjoint acceptance short-circuit predicates — out-of-scope skip
+        (verification.out_of_scope with zero acceptance_criteria),
+        empty-criteria (zero acceptance_criteria and zero out_of_scope),
+        and all-skip-with-basis (every acceptance criterion is
+        `skip_expected` with a non-empty `expectation_basis`) — the same
+        arm `orchestrator.Advance` runs on the retry path.
+
+        On a hit the acceptance stage is walked straight to `succeeded`
+        (a passed verdict / skip marker recorded, NO runner dispatched)
+        and the run rolls forward, so the caller returns without spawning
+        a runner that would only fail category-C
+        `acceptance_target_unreachable`. The response is
+        `short_circuited: true` plus the fired predicate and the refreshed
+        stage.
+
+        **Fail-open by design.** A non-admissible stage state (already
+        settled, mixed criteria, an unconfigured orchestrator) returns
+        `short_circuited: false` — the normal no-op path; the caller
+        records spawn evidence and spawns a runner exactly as today.
+        Admission is an evaluate-and-maybe-settle pre-step, so a degraded
+        server never blocks a legitimate dispatch. The endpoint reuses the
+        `write:stages` scope and adds no new scope or audit kind.
+      tags: [stages]
+      parameters:
+        - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: |
+            Admission evaluated. `short_circuited: true` means the stage
+            settled server-side (the fired predicate + refreshed stage are
+            included); `short_circuited: false` is the no-op path (proceed
+            to spawn as today).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [short_circuited]
+                properties:
+                  short_circuited:
+                    type: boolean
+                    description: |
+                      True when the acceptance stage was settled server-side
+                      with no runner; false is the normal no-op path.
+                  kind:
+                    type: string
+                    description: |
+                      The fired predicate on a hit: `out_of_scope_skip`,
+                      `empty_criteria`, or `all_skip_with_basis`.
+                  basis:
+                    type: string
+                    description: |
+                      The `acceptance_outcome_recorded` basis for the two
+                      verdict-recording predicates (`empty-criteria` /
+                      `all-skip-with-basis`); empty for the out-of-scope
+                      skip, which records a marker rather than a verdict.
+                  criteria_total:
+                    type: integer
+                    description: The acceptance-criteria count carried into the verdict.
+                  stage:
+                    allOf: [{ $ref: '#/components/schemas/Stage' }]
+                    description: The refreshed (now terminal) stage, present on a hit.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            (1) bearer token lacks `write:stages` scope — body `error` is
+            `insufficient_scope`; (2) caller is an mcp token
+            (`mcp:run:<uuid>`) whose run does not match the target stage's
+            `run_id` — body `error` is `cross_run_admission`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: |
+            The target is not an acceptance-typed stage. Body's `error`
+            is `validation_failed`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/stages/{stage_id}/fixup:
     post:
       operationId: fixupStage

@@ -2109,3 +2109,132 @@ func TestSpawnRunnerStageDetached_ReaperReportsOverHTTP(t *testing.T) {
 		t.Fatal("reaper did not POST reap-failure within 5s")
 	}
 }
+
+// --- (#1928) acceptance-dispatch admission on run_stage -----------------------
+
+// TestRunStage_AcceptanceShortCircuit_NoSpawn: a synchronous acceptance
+// run_stage whose admission short-circuits spawns NO runner and returns the
+// settled stage.
+func TestRunStage_AcceptanceShortCircuit_NoSpawn(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.admissionShortCircuit = true
+	r := newResolver(srv, nil)
+
+	spawned := 0
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, _ ...string) *exec.Cmd {
+		spawned++
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	runID := uuid.New()
+	acceptanceID := uuid.NewString()
+	seedStages(fb, runID,
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "implement", State: "succeeded"},
+		Stage{ID: acceptanceID, RunID: runID.String(), Type: "acceptance", State: "pending"},
+	)
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "acceptance", GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if spawned != 0 {
+		t.Errorf("a short-circuited acceptance run_stage must spawn NO runner, got %d", spawned)
+	}
+	if out.StageState != "succeeded" {
+		t.Errorf("StageState = %q, want succeeded (settled)", out.StageState)
+	}
+	if out.Outcome != "short_circuited" {
+		t.Errorf("Outcome = %q, want short_circuited", out.Outcome)
+	}
+	var noted bool
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "short-circuited to a passed verdict") {
+			noted = true
+		}
+	}
+	if !noted {
+		t.Errorf("missing the short-circuit note; warnings: %v", out.Warnings)
+	}
+}
+
+// TestRunStage_AcceptanceAdmissionFalse_SpawnsAsToday: short_circuited:false
+// spawns exactly as today with the acceptance argv and no short-circuit warning.
+func TestRunStage_AcceptanceAdmissionFalse_SpawnsAsToday(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.admissionShortCircuit = false
+	r := newResolver(srv, nil)
+	argv := captureArgv(t)
+
+	runID := uuid.New()
+	acceptanceID := uuid.NewString()
+	seedStages(fb, runID,
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "implement", State: "succeeded"},
+		Stage{ID: acceptanceID, RunID: runID.String(), Type: "acceptance", State: "pending"},
+	)
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "acceptance", GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if joined := strings.Join(*argv, " "); !strings.Contains(joined, "--stage acceptance") {
+		t.Errorf("spawned argv missing --stage acceptance: %s", joined)
+	}
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "short-circuited") || strings.Contains(w, "fail-open") {
+			t.Errorf("no short-circuit / fail-open warning on the normal no-op path; got %q", w)
+		}
+	}
+}
+
+// TestRunStage_AcceptanceAdmissionError_FailsOpen: an admission error appends a
+// warning and the run_stage spawns as today.
+func TestRunStage_AcceptanceAdmissionError_FailsOpen(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.admissionStatus = http.StatusInternalServerError
+	r := newResolver(srv, nil)
+
+	spawned := 0
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, _ ...string) *exec.Cmd {
+		spawned++
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	runID := uuid.New()
+	acceptanceID := uuid.NewString()
+	seedStages(fb, runID,
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "implement", State: "succeeded"},
+		Stage{ID: acceptanceID, RunID: runID.String(), Type: "acceptance", State: "pending"},
+	)
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "acceptance", GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage must fail open on an admission error, got: %v", err)
+	}
+	if spawned != 1 {
+		t.Errorf("an admission error must fall through to spawn, got %d spawns", spawned)
+	}
+	var warned bool
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "acceptance-admission pre-check failed") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("missing the fail-open admission warning; warnings: %v", out.Warnings)
+	}
+}

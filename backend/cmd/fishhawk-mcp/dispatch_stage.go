@@ -219,6 +219,55 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	if err != nil {
 		return nil, DispatchStageOutput{}, fmt.Errorf("resolved stage_id %q is not a valid UUID: %w", resolvedStageID, err)
 	}
+
+	// (5b) Acceptance-dispatch admission (#1928). For an acceptance stage, ask
+	// the backend to evaluate the approved plan's short-circuit predicates
+	// BEFORE recording spawn evidence or spawning a runner: an
+	// all-skip-with-basis / empty-criteria / out-of-scope plan settles the stage
+	// server-side to a passed verdict with no preview, so spawning a runner would
+	// only fail category-C acceptance_target_unreachable — the #1928 parity gap.
+	// Fail OPEN: an admission-call error appends a warning and proceeds to
+	// record+spawn as today; a short_circuited:false result is the normal no-op
+	// and adds NO warning (the reconciliation binding condition).
+	if in.Stage == "acceptance" {
+		admission, warn := r.maybeShortCircuitAcceptance(ctx, stageUUID)
+		if warn != "" {
+			warnings = append(warnings, warn)
+		}
+		if admission != nil && admission.ShortCircuited {
+			// The stage settled server-side; record NO spawn evidence and spawn
+			// NO runner. Compose the output from the freshly-settled (terminal)
+			// stage — a fetch failure omits the wait status with a warning.
+			var stageWaitStatus *StageWaitStatus
+			if fetchErr := func() error {
+				fetchCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				stages, ferr := r.api.ListRunStages(fetchCtx, runUUID)
+				if ferr != nil {
+					return ferr
+				}
+				stageWaitStatus = stageWaitStatusFor(stages, in.Stage, "")
+				if stageWaitStatus == nil {
+					return fmt.Errorf("stage %s not found in run %s stage list", resolvedStageID, runUUID)
+				}
+				return nil
+			}(); fetchErr != nil {
+				warnings = append(warnings,
+					fmt.Sprintf("post-short-circuit stage fetch failed (stage_wait_status omitted): %v", fetchErr))
+			}
+			warnings = append(warnings, fmt.Sprintf(
+				"acceptance stage short-circuited to a passed verdict server-side (%s) with no runner spawn and no preview; no spawn evidence recorded.",
+				shortCircuitLabel(admission)))
+			return nil, DispatchStageOutput{
+				RunID:           runUUID.String(),
+				StageID:         resolvedStageID,
+				StageWaitStatus: stageWaitStatus,
+				RunURL:          r.api.baseURL + "/runs/" + runUUID.String(),
+				Warnings:        warnings,
+			}, nil
+		}
+	}
+
 	report := func(ctx context.Context, category, reason, detail string, exitCode int) error {
 		_, rerr := r.api.ReportStageFailure(ctx, runUUID, stageUUID, category, reason, detail, exitCode)
 		return rerr

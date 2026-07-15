@@ -760,12 +760,54 @@ type dispatchAutoDriveFake struct {
 	acts         []RecordAutoDriveAct
 	actCalledN   int
 	recordStatus int // 0 -> 200; non-2xx drives the failure branch
+
+	// Acceptance-admission fixtures (#1928). stageType/stageState default to
+	// implement/pending; the acceptance short-circuit tests set stageType
+	// "acceptance". admissionShortCircuit drives the short_circuited response;
+	// admissionStatus (0 -> 200) drives the fail-open error branch;
+	// admissionCalledN counts admission POSTs; on a short-circuit the handler
+	// flips stageState to succeeded so the post-short-circuit stages read
+	// reflects the settle.
+	stageType             string
+	stageState            string
+	admissionShortCircuit bool
+	admissionStatus       int
+	admissionCalledN      int
+}
+
+func (f *dispatchAutoDriveFake) stageTypeOrDefault() string {
+	if f.stageType != "" {
+		return f.stageType
+	}
+	return "implement"
 }
 
 func (f *dispatchAutoDriveFake) handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/acceptance-admission"):
+			f.mu.Lock()
+			f.admissionCalledN++
+			sc := f.admissionShortCircuit
+			status := f.admissionStatus
+			if sc {
+				f.stageState = "succeeded"
+			}
+			f.mu.Unlock()
+			if status != 0 && status != http.StatusOK {
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"boom"}}`))
+				return
+			}
+			res := AcceptanceAdmissionResult{ShortCircuited: sc}
+			if sc {
+				res.Kind = "all_skip_with_basis"
+				res.Basis = "all-skip-with-basis"
+				res.CriteriaTotal = 2
+				res.Stage = &Stage{ID: f.stageID.String(), RunID: f.runID.String(), Type: "acceptance", State: "succeeded"}
+			}
+			_ = json.NewEncoder(w).Encode(res)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/auto-drive/acts"):
 			var body RecordAutoDriveAct
 			_ = json.NewDecoder(r.Body).Decode(&body)
@@ -786,8 +828,15 @@ func (f *dispatchAutoDriveFake) handler() http.HandlerFunc {
 		case strings.HasSuffix(r.URL.Path, "/stages"):
 			// resolveStageID, the sibling-in-flight guard, and the post-dispatch
 			// classify all read this.
+			f.mu.Lock()
+			state := f.stageState
+			if state == "" {
+				state = "pending"
+			}
+			stype := f.stageTypeOrDefault()
+			f.mu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"items": []Stage{{ID: f.stageID.String(), RunID: f.runID.String(), Type: "implement", State: "pending"}},
+				"items": []Stage{{ID: f.stageID.String(), RunID: f.runID.String(), Type: stype, State: state}},
 			})
 		default:
 			// guardHostDispatch's GET /v0/runs/{id}: an unlocked run so the guard passes.
@@ -897,5 +946,157 @@ func TestDispatchStage_RecordActFailure_WarnsAndProceeds(t *testing.T) {
 	}
 	if !warned {
 		t.Errorf("no warning naming the degraded stale detection; warnings: %v", out.Warnings)
+	}
+}
+
+// --- (#1928) acceptance-dispatch admission at initial host dispatch ----------
+
+// TestDispatchStage_AcceptanceShortCircuit_NoSpawn pins the short-circuit mode:
+// when acceptance-admission returns short_circuited:true the dispatch spawns NO
+// runner and records NO auto-drive spawn-evidence act — the output reflects the
+// settled (succeeded) stage.
+func TestDispatchStage_AcceptanceShortCircuit_NoSpawn(t *testing.T) {
+	f := &dispatchAutoDriveFake{runID: uuid.New(), stageID: uuid.New(), stageType: "acceptance", admissionShortCircuit: true}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv: func(string) string { return "" },
+	}
+
+	spawned := 0
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, _ ...string) *exec.Cmd {
+		spawned++
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: f.runID.String(), Workflow: "feature_change", Stage: "acceptance",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	if spawned != 0 {
+		t.Errorf("a short-circuited acceptance dispatch must spawn NO runner, got %d", spawned)
+	}
+	f.mu.Lock()
+	acts := f.actCalledN
+	admissionN := f.admissionCalledN
+	f.mu.Unlock()
+	if acts != 0 {
+		t.Errorf("a short-circuited acceptance dispatch must record NO spawn-evidence act, got %d", acts)
+	}
+	if admissionN != 1 {
+		t.Errorf("admission endpoint calls = %d, want 1", admissionN)
+	}
+	if out.LogPath != "" {
+		t.Errorf("LogPath = %q, want empty (no runner spawned)", out.LogPath)
+	}
+	if out.StageWaitStatus == nil || out.StageWaitStatus.Status != "succeeded" {
+		t.Errorf("StageWaitStatus = %+v, want the settled succeeded stage", out.StageWaitStatus)
+	}
+	var noted bool
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "short-circuited to a passed verdict") {
+			noted = true
+		}
+	}
+	if !noted {
+		t.Errorf("missing the short-circuit note; warnings: %v", out.Warnings)
+	}
+}
+
+// TestDispatchStage_AcceptanceAdmissionFalse_SpawnsAsToday pins the no-op mode:
+// short_circuited:false records + spawns exactly as today, with NO short-circuit
+// warning appended (the reconciliation binding condition).
+func TestDispatchStage_AcceptanceAdmissionFalse_SpawnsAsToday(t *testing.T) {
+	f := &dispatchAutoDriveFake{runID: uuid.New(), stageID: uuid.New(), stageType: "acceptance", admissionShortCircuit: false}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv: func(string) string { return "" },
+	}
+
+	spawned := 0
+	var argv []string
+	origCmd := runStageCommand
+	runStageCommand = func(name string, args ...string) *exec.Cmd {
+		spawned++
+		argv = append([]string{name}, args...)
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: f.runID.String(), Workflow: "feature_change", Stage: "acceptance",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	if spawned != 1 {
+		t.Fatalf("short_circuited:false must spawn exactly one runner, got %d", spawned)
+	}
+	if joined := strings.Join(argv, " "); !strings.Contains(joined, "--stage acceptance") {
+		t.Errorf("spawned argv missing --stage acceptance: %s", joined)
+	}
+	f.mu.Lock()
+	acts := f.actCalledN
+	f.mu.Unlock()
+	if acts != 1 {
+		t.Errorf("short_circuited:false must record exactly one spawn-evidence act, got %d", acts)
+	}
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "short-circuited") || strings.Contains(w, "fail-open") {
+			t.Errorf("no short-circuit / fail-open warning must appear on the normal no-op path; got %q", w)
+		}
+	}
+}
+
+// TestDispatchStage_AcceptanceAdmissionError_FailsOpen pins the fail-open mode:
+// an admission-call error (500) appends a warning and the dispatch proceeds to
+// record + spawn as today.
+func TestDispatchStage_AcceptanceAdmissionError_FailsOpen(t *testing.T) {
+	f := &dispatchAutoDriveFake{runID: uuid.New(), stageID: uuid.New(), stageType: "acceptance", admissionStatus: http.StatusInternalServerError}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv: func(string) string { return "" },
+	}
+
+	spawned := 0
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, _ ...string) *exec.Cmd {
+		spawned++
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: f.runID.String(), Workflow: "feature_change", Stage: "acceptance",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("dispatchStage must fail open on an admission error, got: %v", err)
+	}
+	if spawned != 1 {
+		t.Errorf("an admission error must fall through to spawn, got %d spawns", spawned)
+	}
+	var warned bool
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "acceptance-admission pre-check failed") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("missing the fail-open admission warning; warnings: %v", out.Warnings)
 	}
 }

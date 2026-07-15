@@ -159,6 +159,16 @@ type fakeBackend struct {
 	retryErrBody    string
 	retryCalledByID map[uuid.UUID]int
 
+	// #1928 fixtures: POST /v0/stages/{id}/acceptance-admission.
+	// admissionShortCircuit drives the short_circuited response; on a
+	// short-circuit the route flips the matching seeded stage's State to
+	// succeeded so a post-short-circuit stages read reflects the settle.
+	// admissionStatus (0 -> 200) drives the fail-open error branch;
+	// admissionCalledByID counts admission POSTs per stage id.
+	admissionShortCircuit bool
+	admissionStatus       int
+	admissionCalledByID   map[uuid.UUID]int
+
 	// E22.X fixtures: POST /v0/stages/{id}/fixup (#762).
 	// fixupBody captures the last decoded request body so tests can
 	// assert the selected concern indices + reason threading.
@@ -401,6 +411,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		retryResp:                     map[uuid.UUID]Stage{},
 		retryStatus:                   http.StatusOK,
 		retryCalledByID:               map[uuid.UUID]int{},
+		admissionCalledByID:           map[uuid.UUID]int{},
 		fixupResp:                     map[uuid.UUID]Stage{},
 		fixupStatus:                   http.StatusOK,
 		fixupCalledByID:               map[uuid.UUID]int{},
@@ -527,6 +538,43 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 			resp = Stage{ID: id.String(), State: "pending"}
 		}
 		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("POST /v0/stages/{stage_id}/acceptance-admission", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("stage_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		fb.admissionCalledByID[id]++
+		sc := fb.admissionShortCircuit
+		status := fb.admissionStatus
+		if sc {
+			// Reflect the server-side settle so a post-short-circuit stages read
+			// returns the succeeded stage.
+			for _, stages := range fb.stagesByRun {
+				for i := range stages {
+					if stages[i].ID == id.String() {
+						stages[i].State = "succeeded"
+					}
+				}
+			}
+		}
+		fb.mu.Unlock()
+		if status != 0 && status != http.StatusOK {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"boom"}}`))
+			return
+		}
+		res := AcceptanceAdmissionResult{ShortCircuited: sc}
+		if sc {
+			res.Kind = "all_skip_with_basis"
+			res.Basis = "all-skip-with-basis"
+			res.CriteriaTotal = 2
+			res.Stage = &Stage{ID: id.String(), Type: "acceptance", State: "succeeded"}
+		}
+		_ = json.NewEncoder(w).Encode(res)
 	})
 	mux.HandleFunc("POST /v0/stages/{stage_id}/fixup", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

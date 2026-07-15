@@ -39,6 +39,47 @@ the example's schema-validity to the suite. Per-slice unit coverage:
 `acceptance_stats_test.go`. Runner-side schema↔validator lockstep:
 `TestAcceptanceVerdictSchema_LockstepWithValidator`.
 
+## Pre-spawn acceptance-dispatch admission (E31.23 / #1928)
+
+`acceptance_admission.go::handleAcceptanceAdmission` —
+`POST /v0/stages/{stage_id}/acceptance-admission`, the pre-spawn admission step
+a local host dispatch (`fishhawk_dispatch_stage` / `fishhawk_run_stage` /
+`fishhawk_drive_run`) calls for an acceptance stage BEFORE it spawns a runner. It
+closes the parity gap where the acceptance all-skip / empty-criteria /
+out-of-scope short-circuit fired only on the `orchestrator.Advance` retry path,
+not at initial host dispatch — so a run whose every acceptance criterion is
+`skip_expected`-with-basis spawned a runner that needed a preview and failed
+category-C `acceptance_target_unreachable`, a failure the server already knew was
+unnecessary.
+
+- **Orchestrator delegate:** the handler calls
+  `orchestrator.TryShortCircuitAcceptance(runID, stageID)` — the exported entry
+  point that shares the exact predicate/walk/emit core the inline `Advance` arm
+  delegates to (so retry-path behavior stays byte-identical). The target must be
+  an acceptance stage in a dispatch-admissible state (`pending`, or the local
+  `dispatched` park an operator host dispatch may find — the state walk starts
+  from the stage's CURRENT state). On a hit the stage is walked straight to
+  `succeeded`, the matching audit lands (skip marker for out-of-scope, an
+  `acceptance_outcome_recorded` passed verdict for the other two), and `Advance`
+  is re-entered so the run rolls forward.
+- **Auth mirrors `handleRetryStage`:** authenticated identity required (401
+  anonymous), `write:stages` scope gates a token identity (403
+  `insufficient_scope`), and an `mcp:run:<uuid>` subject may only admit stages
+  within its own run (403 `cross_run_admission`). The endpoint reuses
+  `write:stages` and adds NO new scope or audit kind, so the Auth-change impact
+  inventory is empty.
+- **Fail-open by design (the reconciliation binding condition):** a
+  non-admissible stage state (already settled, mixed criteria, an unconfigured
+  orchestrator) returns `200 {short_circuited:false}` with NO warning — the
+  normal no-op path; the caller records spawn evidence and spawns a runner
+  exactly as today. A hit returns `200 {short_circuited:true, kind, basis,
+  criteria_total, stage}`. A non-acceptance stage is `422 validation_failed`; an
+  unknown stage is `404`.
+- **MCP callers fail OPEN only on an admission-call error** (network/5xx →
+  warning + spawn as today); `short_circuited:false` never adds a warning. Tests:
+  `acceptance_admission_test.go` (endpoint) + the orchestrator's
+  `TestTryShortCircuitAcceptance`.
+
 ## Run-branch operator-vouch remediation (ADR-035 / #1044)
 
 `vouch.go::handleVouchCommit` — route
