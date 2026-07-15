@@ -247,8 +247,10 @@ runner ever observed past the liveness threshold triggers the driver's OWN host
 liveness probe (pgrep -f scoped to the stage's --stage-id argv, #1955): a
 NEGATIVE probe (no runner process) is auto-recovered in place — the driver
 re-dispatches through its record + host-dispatch marker + spawn path with no
-operator action — while a LIVE-but-unregistered or UNPROBEABLE result stops
-dispatched_stale and hands the manual verify-first re-dispatch to the operator.
+operator action. A LIVE-but-unregistered process stops dispatched_stale for
+INSPECTION with NO re-dispatch (a second runner into the same lineage lock is
+the failure this prevents); only an UNPROBEABLE result (pgrep absent / errored /
+timed out) hands the manual verify-first re-dispatch to the operator.
 A fresh manual fishhawk_dispatch_stage marks a new spawn so a re-invoked drive
 reads it as live and polls to convergence rather than re-reporting stale.
 
@@ -539,7 +541,12 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 						out.Warnings = append(out.Warnings, fmt.Sprintf(
 							"stage %s (%s) has sat in 'dispatched' for %s, past the %s runner-liveness threshold, yet a host process matching this stage id IS live (pgrep -f on the stage id) and never fetched its prompt to flip it to 'running' — anomalous. Inspect the dispatch's log_path; do NOT re-dispatch while that process lives, because a second runner into the same lineage lock is the failure this driver exists to prevent.",
 							disp.Type, disp.ID, age, staleAfter))
-						out.NextActions = driveDecisionActions("dispatched_stale", runUUID, in.WorkingDir)
+						// A LIVE process is confirmed present, so the manual verify-and-
+						// re-dispatch instruction MUST NOT survive here (it belongs only to
+						// the UNKNOWN/unprobeable branch): re-dispatching would spawn the very
+						// second runner this driver exists to prevent. Hand back an
+						// inspect-only next action instead.
+						out.NextActions = driveDecisionActions("dispatched_stale_live", runUUID, in.WorkingDir)
 						return nil, out, nil
 					default: // runnerUnknown
 						// pgrep absent / exit ≥2 / timeout / other exec error: we cannot
@@ -1187,11 +1194,24 @@ func driveDecisionActions(state string, runID uuid.UUID, workingDir string) *Nex
 			Consumes:     consumesNone,
 			Reason:       "the gate was handed to you; arbitrate, then re-invoke fishhawk_drive_run",
 		}}}
+	case state == "dispatched_stale_live":
+		// The driver's own probe found a LIVE process carrying the stage id, so
+		// the manual verify-and-re-dispatch instruction is deliberately WITHHELD
+		// here (it survives only on the UNKNOWN/unprobeable branch below): a
+		// re-dispatch while that process lives is the second-runner failure this
+		// driver exists to prevent. Point the operator at inspection only.
+		return &NextActions{State: state, Actions: []SuggestedAction{{
+			Action:       "fishhawk_get_run_status",
+			Params:       params,
+			Precondition: "the stage sat in 'dispatched' beyond the runner-liveness threshold and the driver's own liveness probe found a LIVE host process matching the stage id that never flipped 'running' — anomalous",
+			Consumes:     consumesNone,
+			Reason:       "inspect the dispatch's log_path; do NOT re-dispatch while that process lives, because a second runner into the same lineage lock is the failure this driver exists to prevent — once the process exits or you terminate it, re-invoke fishhawk_drive_run",
+		}}}
 	case state == "dispatched_stale":
 		return &NextActions{State: state, Actions: []SuggestedAction{{
 			Action:       "fishhawk_dispatch_stage",
 			Params:       params,
-			Precondition: "the stage sat in 'dispatched' beyond the runner-liveness threshold and the driver's own liveness probe could NOT confirm the runner dead (a live-but-unregistered process, or pgrep unavailable)",
+			Precondition: "the stage sat in 'dispatched' beyond the runner-liveness threshold and the driver's own liveness probe could NOT confirm the runner dead (pgrep unavailable / errored / timed out)",
 			Consumes:     consumesNone,
 			Reason:       "verify by hand that no runner process is live (pgrep -f fishhawk-runner + the dispatch log_path); only if none is, re-dispatch the stage and re-invoke fishhawk_drive_run",
 		}}}

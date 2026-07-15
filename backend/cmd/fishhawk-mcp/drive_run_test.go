@@ -1303,6 +1303,71 @@ func TestDriveRun_DispatchedStale_DeadProbe_AutoRedispatches(t *testing.T) {
 	}
 }
 
+// --- (#1955) dead probe on a FIXUP-re-opened stage -> fixup_redispatch survives ---
+
+func TestDriveRun_DispatchedStale_DeadProbe_FixupRedispatchAttribution(t *testing.T) {
+	// The combination the fall-through preserves but the plain dead-probe test does
+	// not exercise: a fix-up re-opened implement stage (a stage_fixup_triggered row
+	// NEWER than the newest implement dispatch row, so the fixup-attribution block
+	// renames recordName to fixup_redispatch) whose fresh runner then dies past the
+	// liveness threshold. The dead probe sets staleRedispatch, so the stale note must
+	// OVERWRITE the (blanked) fixup note WHILE the fixup_redispatch recordName is
+	// preserved — the record lands stage="fixup_redispatch" AND note=staleRedispatchNote.
+	impl := stg(driveImplID, "implement", "dispatched", 1)
+	impl.UpdatedAt = time.Now().Add(-time.Hour) // past the threshold -> probed
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		impl,
+	})
+	// A prior implement dispatch row (the fix-up's first dispatch that then died) —
+	// makes priorRow=true so the fixup-attribution block runs on the fall-through.
+	f.appendAutoAt(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""}, time.Now().Add(-time.Hour))
+	// A stage_fixup_triggered row NEWER than that dispatch row -> fixupSeq >
+	// newestDispatchSeq, so recordName renames to fixup_redispatch.
+	f.seq++
+	f.audit = append(f.audit, AuditEntry{ID: uuid.New().String(), Sequence: f.seq, RunID: f.runID.String(), Category: categoryStageFixupTriggered, Payload: map[string]any{}})
+	// The re-dispatched runner reaches its prompt fetch and settles the run.
+	f.onSpawn = func(f *driveFakeBackend, typ string) {
+		if typ == "implement" {
+			f.setState("implement", "succeeded")
+			f.runState = "succeeded"
+		}
+	}
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveDispatchedStaleAfter = time.Millisecond
+	r.driveMaxWallclock = 5 * time.Second
+	r.driveProbeRunnerLiveness = func(context.Context, string) runnerLivenessVerdict { return runnerDead }
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedMerged {
+		t.Fatalf("stopped_reason = %q, want merged (dead probe -> fixup re-dispatch -> merged)", out.StoppedReason)
+	}
+	// SINGLE-SPAWN-PER-INVOCATION invariant: exactly one spawn.
+	if got := rec.list(); len(got) != 1 || got[0] != "implement" {
+		t.Fatalf("spawn sequence = %v, want exactly [implement] (one stale re-dispatch)", got)
+	}
+	f.mu.Lock()
+	acts := append([]RecordAutoDriveAct(nil), f.recordedActs...)
+	f.mu.Unlock()
+	if len(acts) != 1 {
+		t.Fatalf("recorded acts = %d, want 1 (a single stale re-dispatch)", len(acts))
+	}
+	// The exact interaction: fixup_redispatch recordName survives AND the stale note
+	// overwrites the blanked fixup note.
+	if acts[0].Stage != "fixup_redispatch" {
+		t.Errorf("record-act stage = %q, want fixup_redispatch (fixup attribution renamed and survived the stale note)", acts[0].Stage)
+	}
+	if acts[0].Note != staleRedispatchNote {
+		t.Errorf("record-act note = %q, want %q (stale note overwrote the fixup note)", acts[0].Note, staleRedispatchNote)
+	}
+}
+
 // --- (#1955) live probe -> stop dispatched_stale, NEVER spawn (safety core) ---
 
 func TestDriveRun_DispatchedStale_LiveProbe_StopsWithoutSpawn(t *testing.T) {
@@ -1354,8 +1419,21 @@ func TestDriveRun_DispatchedStale_LiveProbe_StopsWithoutSpawn(t *testing.T) {
 	if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
 		t.Fatal("live-probe dispatched_stale stop carried no next_actions")
 	}
-	if out.NextActions.Actions[0].Action != "fishhawk_dispatch_stage" {
-		t.Errorf("next_actions[0] = %q, want fishhawk_dispatch_stage", out.NextActions.Actions[0].Action)
+	// The manual verify-and-re-dispatch instruction survives ONLY on the
+	// UNKNOWN/unprobeable branch: a confirmed-LIVE process must NEVER hand back a
+	// fishhawk_dispatch_stage action (a re-dispatch would spawn the second runner
+	// this driver exists to prevent). The LIVE arm offers inspect-only.
+	if got := out.NextActions.Actions[0].Action; got != "fishhawk_get_run_status" {
+		t.Errorf("next_actions[0] = %q, want fishhawk_get_run_status (inspect-only, NOT re-dispatch)", got)
+	}
+	for _, a := range out.NextActions.Actions {
+		if a.Action == "fishhawk_dispatch_stage" {
+			t.Errorf("live-probe next_actions wrongly offers fishhawk_dispatch_stage (manual re-dispatch): %+v", a)
+		}
+		joined := a.Precondition + " " + a.Reason
+		if strings.Contains(joined, "pgrep") || strings.Contains(joined, "re-dispatch by hand") {
+			t.Errorf("live-probe next_action wrongly carries the manual pgrep/re-dispatch instruction: %+v", a)
+		}
 	}
 }
 
