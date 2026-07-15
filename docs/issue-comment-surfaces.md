@@ -869,7 +869,9 @@ Notes:
   (`failed` → `running`), but performs NO dispatch — the operator dispatches
   each stage later at its proper turn (the semantic difference from `child_redriven`,
   which re-advances). Listed here only so a future reader grepping the audit
-  categories doesn't mistake it for a comment surface.
+  categories doesn't mistake it for a comment surface. `run_revived` is
+  registered in `audit.KnownCategories` (#1941), so `fishhawk_await_audit` on
+  it needs no `allow_unknown` escape hatch.
 - The audited category-B override audit kind — `stage_override_retried` (#698) —
   is an **internal, user-actor audit kind, not an issue-comment surface**.
   Nothing in `issuecomment` posts it to the issue thread; it has no Notifier

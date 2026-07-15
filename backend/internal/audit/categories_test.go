@@ -22,6 +22,7 @@ func TestIsKnownCategory(t *testing.T) {
 		"plan_review_skipped",
 		"run_completed",
 		"deployment_outcome_recorded",
+		"run_revived",
 	}
 	for _, c := range known {
 		if !IsKnownCategory(c) {

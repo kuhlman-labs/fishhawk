@@ -128,7 +128,7 @@ func TestReviveRun_EndToEnd(t *testing.T) {
 	var revived *audit.ChainAppendParams
 	count := 0
 	for i := range f.au.appended {
-		if f.au.appended[i].Category == RunRevivedAuditKind {
+		if f.au.appended[i].Category == RunRevivedCategory {
 			revived = &f.au.appended[i]
 			count++
 		}
@@ -211,7 +211,7 @@ func TestReviveRun_AgentTokenRejected(t *testing.T) {
 		t.Errorf("run = %q, want failed (revive must not have run)", got.State)
 	}
 	for _, a := range f.au.appended {
-		if a.Category == RunRevivedAuditKind {
+		if a.Category == RunRevivedCategory {
 			t.Errorf("run_revived audit written despite rejection")
 		}
 	}
@@ -314,7 +314,7 @@ func TestReviveRun_NonRetryableStageReturns422NoPartialMutation(t *testing.T) {
 		t.Errorf("run = %q, want failed (no reopen on refusal)", gotRun.State)
 	}
 	for _, a := range f.au.appended {
-		if a.Category == RunRevivedAuditKind {
+		if a.Category == RunRevivedCategory {
 			t.Errorf("run_revived audit written despite refusal")
 		}
 	}
@@ -347,7 +347,7 @@ func TestReviveRun_AuditAppendFailure_BestEffort200(t *testing.T) {
 	// No run_revived entry landed — the append failed — but the handler still
 	// succeeded rather than 500ing on a committed state change.
 	for _, a := range f.au.appended {
-		if a.Category == RunRevivedAuditKind {
+		if a.Category == RunRevivedCategory {
 			t.Errorf("run_revived audit unexpectedly recorded despite injected append failure")
 		}
 	}
