@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -3014,69 +3018,426 @@ func isAncestor(t *testing.T, dir, maybeAncestor, ref string) bool {
 	return cmd.Run() == nil
 }
 
-// TestConfigureExtraheader_SetsCredentialForHTTPS covers the credential-
-// configuration path the #772 fetch test cannot reach: that test passes a bare
-// filesystem path as RemoteURL, so configureExtraheader no-ops on the
-// not-HTTPS branch in both the rebase and push call sites. Here we exercise the
-// helper directly against a real repo to assert (1) an HTTPS RemoteURL with a
-// non-empty PushToken writes the host-scoped `http.<host>.extraheader` to the
-// Basic auth header derived from the token, (2) an empty token is a no-op
-// (ambient-auth path), and (3) a non-HTTPS RemoteURL is a no-op. This is the
-// branch coverage the helper's straight extraction shares with the already-
-// tested push-side block; pinning it here makes the credential path explicit.
-func TestConfigureExtraheader_SetsCredentialForHTTPS(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not available")
-	}
-	repo := initRepo(t)
-	p := &Pusher{}
-
+// TestAuthConfigEnv covers each branch of authConfigEnv, the process-scoped
+// auth builder that replaced the persistent configureExtraheader write (#1933).
+// It asserts (1) an http/https RemoteURL with a non-empty PushToken yields the
+// 5-entry GIT_CONFIG_* env with the EMPTY reset entry FIRST and the Basic header
+// derived from base64(x-access-token:token) second, scoped to the host key;
+// (2) an empty token yields nil (ambient auth); (3) a file-path / SSH RemoteURL
+// yields nil even with a token; and (4) an http:// URL scopes the env to the
+// http host key. This is a pure function so it needs no git binary or repo.
+func TestAuthConfigEnv(t *testing.T) {
 	const (
-		httpsURL = "https://github.com/kuhlman-labs/fishhawk.git"
 		token    = "ghs-test-token"
-		key      = "http.https://github.com/.extraheader"
+		httpsURL = "https://github.com/kuhlman-labs/fishhawk.git"
+		httpsKey = "http.https://github.com/.extraheader"
 	)
 	wantHeader := "AUTHORIZATION: basic " +
 		base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
 
-	// HTTPS + token: the host-scoped extraheader is written with the token's
-	// Basic auth header. The token lives in the config value, never on argv.
-	if err := p.configureExtraheader(context.Background(), repo, httpsURL, token); err != nil {
-		t.Fatalf("configureExtraheader (https+token): %v", err)
+	// https + token: the 5-entry env, empty reset entry FIRST, Basic header
+	// second, both scoped to the https host key.
+	env, err := authConfigEnv(httpsURL, token)
+	if err != nil {
+		t.Fatalf("authConfigEnv(https+token): %v", err)
 	}
-	if got := mustGitOut(t, repo, "config", "--local", "--get", key); got != wantHeader {
-		t.Errorf("extraheader = %q, want %q", got, wantHeader)
+	want := []string{
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=" + httpsKey,
+		"GIT_CONFIG_VALUE_0=",
+		"GIT_CONFIG_KEY_1=" + httpsKey,
+		"GIT_CONFIG_VALUE_1=" + wantHeader,
 	}
-
-	// Empty token is a no-op (ambient-auth path) — no second value appended,
-	// and a fresh repo would have none at all.
-	repoEmpty := initRepo(t)
-	if err := p.configureExtraheader(context.Background(), repoEmpty, httpsURL, ""); err != nil {
-		t.Fatalf("configureExtraheader (empty token): %v", err)
-	}
-	if gitConfigPresent(t, repoEmpty, key) {
-		t.Error("empty token should not write an extraheader")
+	if !slices.Equal(env, want) {
+		t.Errorf("authConfigEnv(https+token) =\n  %v\nwant\n  %v", env, want)
 	}
 
-	// Non-HTTPS RemoteURL (the bare-repo / SSH path) is a no-op even with a
-	// token — the same branch the #772 fetch test hits.
-	repoSSH := initRepo(t)
-	if err := p.configureExtraheader(context.Background(), repoSSH, "/tmp/origin.git", token); err != nil {
-		t.Fatalf("configureExtraheader (non-https): %v", err)
+	// Empty token → nil env (ambient-auth path).
+	if env, err := authConfigEnv(httpsURL, ""); err != nil || env != nil {
+		t.Errorf("authConfigEnv(empty token) = (%v, %v), want (nil, nil)", env, err)
 	}
-	if gitConfigPresent(t, repoSSH, key) {
-		t.Error("non-HTTPS RemoteURL should not write an extraheader")
+
+	// File-path and SSH RemoteURLs → nil even with a token (the #772 branch).
+	for _, u := range []string{"/tmp/origin.git", "git@github.com:kuhlman-labs/fishhawk.git"} {
+		if env, err := authConfigEnv(u, token); err != nil || env != nil {
+			t.Errorf("authConfigEnv(%q, token) = (%v, %v), want (nil, nil)", u, env, err)
+		}
+	}
+
+	// http:// (not https) → env scoped to the http host key.
+	httpEnv, err := authConfigEnv("http://127.0.0.1:8080/repo.git", token)
+	if err != nil {
+		t.Fatalf("authConfigEnv(http+token): %v", err)
+	}
+	const httpKey = "http.http://127.0.0.1:8080/.extraheader"
+	wantHTTP := []string{
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=" + httpKey,
+		"GIT_CONFIG_VALUE_0=",
+		"GIT_CONFIG_KEY_1=" + httpKey,
+		"GIT_CONFIG_VALUE_1=" + wantHeader,
+	}
+	if !slices.Equal(httpEnv, wantHTTP) {
+		t.Errorf("authConfigEnv(http+token) =\n  %v\nwant\n  %v", httpEnv, wantHTTP)
 	}
 }
 
-// gitConfigPresent reports whether a local git config key is set. `git config
-// --get` exits non-zero (code 1) when the key is absent, which is the "no-op
-// happened" signal we assert on rather than a test failure.
-func gitConfigPresent(t *testing.T, dir, key string) bool {
+// TestCommitAndPush_DumbHTTP_NoHeaderPersistence_WireAuth is the #1933
+// end-to-end no-persistence + wire-auth test. It drives CommitAndPush through a
+// REAL git fetch and ls-remote over git's dumb HTTP protocol (plain GETs served
+// by an httptest.Server rooted at a bare repo; no network beyond httptest) and a
+// push that fails BY CONSTRUCTION (dumb HTTP is fetch-only), making the run an
+// ERROR exit path. The FreshFetchBase+ForceWithLease routing exercises BOTH the
+// base fetch AND observeRemoteHead's ls-remote against the recording server, so
+// the wire assertion covers each (binding condition 1). It asserts:
+//
+//   - (wire auth + stale reset) every authenticated request carried EXACTLY ONE
+//     Authorization header equal to the FRESH token's Basic value — with a stale
+//     persisted `http.<url>.extraheader` pre-planted, a duplicate would appear
+//     if the empty-value reset entry did not clear it (#199/#200), and a missing
+//     header would appear if the GIT_CONFIG_* env never reached git (git < 2.31);
+//   - (no persistence on an error exit) after CommitAndPush returns its push
+//     error, the config FILE carries only the pre-planted value (or nothing) —
+//     the run added no extraheader, so the #1933 pollution is impossible.
+//
+// The companion no-pre-plant variant proves the key is entirely absent afterward.
+func TestCommitAndPush_DumbHTTP_NoHeaderPersistence_WireAuth(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	const (
+		token  = "ghs-fresh-token-1933"
+		branch = "fishhawk/run-1933/stage-x"
+	)
+	wireAuth := "basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
+	staleValue := "AUTHORIZATION: basic " +
+		base64.StdEncoding.EncodeToString([]byte("x-access-token:stale-persisted"))
+
+	for _, tc := range []struct {
+		name     string
+		prePlant bool
+	}{
+		{"stale persisted header pre-planted", true},
+		{"no pre-planted header", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+
+			// Bare remote seeded with an initial commit on main, prepared for
+			// dumb HTTP with `git update-server-info` (writes info/refs +
+			// objects/info/packs so plain-GET fetch/ls-remote resolve).
+			seed := filepath.Join(dir, "seed")
+			bare := filepath.Join(dir, "remote.git")
+			if err := os.Mkdir(seed, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			mustGit(t, seed, "init", "--initial-branch=main")
+			mustGit(t, seed, "config", "user.name", "seed")
+			mustGit(t, seed, "config", "user.email", "seed@example.com")
+			if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("# seed\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			mustGit(t, seed, "add", "-A")
+			mustGit(t, seed, "commit", "-m", "seed")
+			mustGit(t, seed, "init", "--bare", bare)
+			mustGit(t, seed, "push", bare, "main")
+			mustGit(t, bare, "update-server-info")
+
+			// Recording dumb-HTTP server: capture the Authorization header
+			// values of every authenticated request, then serve static files.
+			var mu sync.Mutex
+			var authRequests [][]string
+			fileSrv := http.FileServer(http.Dir(bare))
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if vals := r.Header.Values("Authorization"); len(vals) > 0 {
+					mu.Lock()
+					authRequests = append(authRequests, vals)
+					mu.Unlock()
+				}
+				fileSrv.ServeHTTP(w, r)
+			}))
+			defer srv.Close()
+
+			// Local repo the run operates in. Its own history is irrelevant —
+			// FreshFetchBase fetches main from the server and checks the run
+			// branch out from FETCH_HEAD; only the agent's uncommitted edit rides.
+			local := filepath.Join(dir, "local")
+			if err := os.Mkdir(local, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			mustGit(t, local, "init", "--initial-branch=main")
+			mustGit(t, local, "config", "user.name", "init")
+			mustGit(t, local, "config", "user.email", "init@example.com")
+			if err := os.WriteFile(filepath.Join(local, "README.md"), []byte("# local\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			mustGit(t, local, "add", "-A")
+			mustGit(t, local, "commit", "-m", "local initial")
+
+			hostKey, err := pushHost(srv.URL)
+			if err != nil {
+				t.Fatalf("pushHost(%q): %v", srv.URL, err)
+			}
+			key := "http." + hostKey + ".extraheader"
+			if tc.prePlant {
+				// The actions/checkout / legacy-runner pollution shape: a stale
+				// URL-scoped extraheader persisted in the (shared) config file.
+				mustGit(t, local, "config", "--local", key, staleValue)
+			}
+
+			// Agent edit.
+			if err := os.WriteFile(filepath.Join(local, "agent.txt"), []byte("agent edit\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			p := &Pusher{}
+			_, err = p.CommitAndPush(context.Background(), CommitAndPushArgs{
+				RepoDir:        local,
+				Branch:         branch,
+				CommitMessage:  "agent change",
+				RemoteURL:      srv.URL,
+				FreshFetchBase: "main",
+				ForceWithLease: true,
+				PushToken:      token,
+			})
+			// The push over dumb HTTP is fetch-only, so CommitAndPush MUST fail at
+			// the push — this is the error-exit fixture for the no-persistence check.
+			if err == nil {
+				t.Fatal("expected CommitAndPush to fail at the dumb-HTTP push (fetch-only)")
+			}
+
+			// (a) Wire auth: at least one authenticated request, and every one
+			// carried EXACTLY ONE Authorization header equal to the fresh token.
+			mu.Lock()
+			reqs := append([][]string(nil), authRequests...)
+			mu.Unlock()
+			if len(reqs) == 0 {
+				t.Fatal("server received no authenticated requests — wire auth was not exercised")
+			}
+			for i, vals := range reqs {
+				if len(vals) != 1 {
+					t.Errorf("request %d carried %d Authorization headers %v, want exactly 1 (stale-header reset failed → duplicate)", i, len(vals), vals)
+					continue
+				}
+				if vals[0] != wireAuth {
+					t.Errorf("request %d Authorization = %q, want fresh %q", i, vals[0], wireAuth)
+				}
+			}
+
+			// (b) No persistence on the error exit path: the config FILE carries
+			// only the pre-planted value (or nothing) — the run added nothing.
+			got := gitConfigGetAll(t, local, key)
+			if tc.prePlant {
+				if want := []string{staleValue}; !slices.Equal(got, want) {
+					t.Errorf("post-run config --get-all = %v, want only the pre-planted %v (run persisted a header!)", got, want)
+				}
+			} else if len(got) != 0 {
+				t.Errorf("post-run config --get-all = %v, want none (run persisted a header!)", got)
+			}
+		})
+	}
+}
+
+// TestCommitAndPush_FileRemote_TokenBearing_NoPersistence_NoArgvLeak pins two
+// properties of a SUCCESSFUL token-bearing CommitAndPush over a file remote
+// (authConfigEnv no-ops on the non-http scheme, so the happy path is reachable
+// without a network): (binding condition 2) the config file carries ZERO
+// extraheader entries afterward — a successful run persists no credential — and
+// (plan step 6) the token never appears on any git argv, the discipline the
+// env-scoped config exists to preserve (a `-c` flag would leak it to `ps`).
+func TestCommitAndPush_FileRemote_TokenBearing_NoPersistence_NoArgvLeak(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	const token = "ghs-file-token-1933"
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+
+	if err := os.WriteFile(filepath.Join(repo, "agent.txt"), []byte("agent edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var recorded [][]string
+	p := &Pusher{
+		Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			recorded = append(recorded, append([]string{name}, args...))
+			return exec.CommandContext(ctx, name, args...)
+		},
+	}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:       repo,
+		Branch:        "fishhawk/file/branch",
+		CommitMessage: "agent change",
+		RemoteURL:     bare,
+		PushToken:     token,
+	})
+	if err != nil {
+		t.Fatalf("CommitAndPush (file remote + token): %v", err)
+	}
+	if res.NoChanges {
+		t.Fatal("expected NoChanges=false on a dirty tree")
+	}
+
+	// (binding condition 2) A successful token-bearing run persisted no
+	// extraheader anywhere in the config file.
+	if extra := gitConfigExtraheaders(t, repo); len(extra) != 0 {
+		t.Errorf("successful token-bearing CommitAndPush persisted extraheader(s) %v, want none", extra)
+	}
+
+	// (plan step 6) The token never reached git's argv.
+	tokenB64 := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+	for _, inv := range recorded {
+		for _, a := range inv {
+			if strings.Contains(a, token) || strings.Contains(a, tokenB64) {
+				t.Errorf("token leaked onto git argv: %v", inv)
+			}
+		}
+	}
+}
+
+// TestCommitAndPush_PushEnvCarriesAuthConfig asserts, at the Cmd recording seam,
+// that the PUSH invocation carries the process-scoped GIT_CONFIG_* auth entries
+// (binding condition 1's env-propagation requirement — dumb HTTP cannot serve a
+// push, so the push's auth is verified here rather than on the wire). It uses an
+// unreachable https RemoteURL so the plain-path push is CONSTRUCTED (env set)
+// then fails at connect; the env is captured on the recorded *exec.Cmd, and the
+// token is additionally asserted absent from every git argv.
+func TestCommitAndPush_PushEnvCarriesAuthConfig(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	const (
+		token    = "ghs-env-token-1933"
+		httpsURL = "https://127.0.0.1:1/kuhlman-labs/fishhawk.git"
+	)
+	repo := initRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "agent.txt"), []byte("agent edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var pushCmd *exec.Cmd
+	var recorded [][]string
+	p := &Pusher{
+		Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			c := exec.CommandContext(ctx, name, args...)
+			recorded = append(recorded, append([]string{name}, args...))
+			if len(args) > 0 && args[0] == "push" {
+				pushCmd = c
+			}
+			return c
+		},
+	}
+	_, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:       repo,
+		Branch:        "fishhawk/env/branch",
+		CommitMessage: "agent change",
+		RemoteURL:     httpsURL,
+		PushToken:     token,
+	})
+	if err == nil {
+		t.Fatal("expected push to the unreachable https remote to fail")
+	}
+	if pushCmd == nil {
+		t.Fatal("push command was never constructed")
+	}
+
+	host, err := pushHost(httpsURL)
+	if err != nil {
+		t.Fatalf("pushHost(%q): %v", httpsURL, err)
+	}
+	key := "http." + host + ".extraheader"
+	header := "AUTHORIZATION: basic " +
+		base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
+	wantEnv := []string{
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=" + key,
+		"GIT_CONFIG_VALUE_0=",
+		"GIT_CONFIG_KEY_1=" + key,
+		"GIT_CONFIG_VALUE_1=" + header,
+	}
+	if !envContainsAll(pushCmd.Env, wantEnv) {
+		t.Errorf("push cmd.Env missing auth entries;\nwant superset of %v\ngot %v", wantEnv, pushCmd.Env)
+	}
+
+	// The token stays off argv even though it is threaded via env.
+	tokenB64 := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+	for _, inv := range recorded {
+		for _, a := range inv {
+			if strings.Contains(a, token) || strings.Contains(a, tokenB64) {
+				t.Errorf("token leaked onto git argv: %v", inv)
+			}
+		}
+	}
+}
+
+// gitConfigGetAll returns every local value of a git config key in config
+// order, or nil when the key is absent (`git config --get-all` exits 1 for a
+// missing key). The no-persistence assertions run it WITHOUT the GIT_CONFIG_*
+// env, so it sees only what was written to the config FILE — which the #1933
+// fix guarantees is nothing the run added.
+func gitConfigGetAll(t *testing.T, dir, key string) []string {
 	t.Helper()
-	cmd := exec.Command("git", "config", "--local", "--get", key)
+	cmd := exec.Command("git", "config", "--local", "--get-all", key)
 	cmd.Dir = dir
-	return cmd.Run() == nil
+	out, err := cmd.Output()
+	if err != nil {
+		return nil // exit 1 = key absent
+	}
+	var vals []string
+	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
+		if line != "" {
+			vals = append(vals, line)
+		}
+	}
+	return vals
+}
+
+// gitConfigExtraheaders returns every local `http.<url>.extraheader` config
+// entry (as "key value" lines), or nil when none exist. It is the success-path
+// no-persistence probe: a token-bearing CommitAndPush must leave the config
+// file with zero extraheader entries (#1933).
+func gitConfigExtraheaders(t *testing.T, dir string) []string {
+	t.Helper()
+	cmd := exec.Command("git", "config", "--local", "--get-regexp", `^http\..*\.extraheader$`)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil // exit 1 = no match
+	}
+	var lines []string
+	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// envContainsAll reports whether env contains every entry in want.
+func envContainsAll(env, want []string) bool {
+	for _, w := range want {
+		if !slices.Contains(env, w) {
+			return false
+		}
+	}
+	return true
 }
 
 // TestDirtyPaths_EnumeratesModifiedAndUntracked: DirtyPaths reports tracked
