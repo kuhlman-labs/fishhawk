@@ -342,16 +342,20 @@ func (s *Server) auditProductReport(r *http.Request, runRow *run.Run, fingerprin
 
 // bundleFingerprint computes the dedup fingerprint from the bundle's
 // product facts. The failing stage supplies the error code (failure
-// category) and surface; the run state stands in when there is no failing
-// stage (e.g. a feature request off a green run). The version family is
-// the fishhawkd major.minor.
+// category), surface, and detail class; the run state stands in for the
+// error code when there is no failing stage (e.g. a feature request off a
+// green run, where the detail class is "" — the surface fallback). The
+// detail class distinguishes distinct root causes sharing a surface
+// (#1962); an empty class reproduces the pre-change fingerprint. The
+// version family is the fishhawkd major.minor.
 func bundleFingerprint(b diagnostics.DiagnosticBundle) string {
-	errorCode, surface := b.RunState, ""
+	errorCode, surface, detailClass := b.RunState, "", ""
 	if b.FailingStage != nil {
 		errorCode = b.FailingStage.FailureCategory
 		surface = b.FailingStage.FailureSurface
+		detailClass = b.FailingStage.FailureDetailClass
 	}
-	return diagnostics.Fingerprint(errorCode, surface, diagnostics.VersionFamily(b.Versions.Fishhawkd.Version))
+	return diagnostics.Fingerprint(errorCode, surface, detailClass, diagnostics.VersionFamily(b.Versions.Fishhawkd.Version))
 }
 
 // redactedFreeText returns the operator free text that may cross the egress
@@ -418,6 +422,9 @@ func renderReportBody(b diagnostics.DiagnosticBundle, fingerprint, freeText stri
 			b.FailingStage.Type, b.FailingStage.FailureCategory)
 		if b.FailingStage.FailureSurface != "" {
 			fmt.Fprintf(&sb, ", surface `%s`", b.FailingStage.FailureSurface)
+		}
+		if b.FailingStage.FailureDetailClass != "" {
+			fmt.Fprintf(&sb, ", detail class `%s`", b.FailingStage.FailureDetailClass)
 		}
 		sb.WriteString(")\n")
 	}
