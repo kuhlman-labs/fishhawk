@@ -67,11 +67,20 @@ const (
 	stoppedDispatchCheckFailed = "dispatch_check_failed"
 	// stoppedDispatchedStale is the stop when a stage this invocation did not
 	// spawn has sat in 'dispatched' past the runner-liveness threshold with no
-	// runner observed: a genuinely runner-less stage (the cross-invocation
-	// in-flight guard would otherwise poll every resume to timeout). The driver
-	// still NEVER auto-spawns it — double-spawn stays impossible by construction;
-	// it hands the manual re-dispatch to the operator via next_actions.
+	// runner observed: a genuinely runner-less stage — the spawned runner never
+	// reached its prompt fetch (it died at or just after spawn). Post-#1912
+	// 'dispatched' means a spawn attempt EXISTS, so this is a dead runner, not a
+	// parked-for-host-dispatch handoff (that is 'awaiting_host_dispatch', which the
+	// loop auto-dispatches). The driver hands the manual re-dispatch to the
+	// operator via next_actions rather than polling every resume to timeout.
 	stoppedDispatchedStale = "dispatched_stale"
+	// stoppedHostDispatchFailed is the fail-CLOSED stop when the host-dispatch
+	// spawn-marker call (POST .../host-dispatch) errors between record-act and
+	// spawn (#1912): the marker is the core 'dispatched' signal on the
+	// code-execution path, so an unmarked spawn would recreate the ambiguity #1912
+	// removes. NO runner is spawned — the operator re-invokes once the transient
+	// clears.
+	stoppedHostDispatchFailed = "host_dispatch_failed"
 	// stoppedContextCancelled is the stop when the drive context is cancelled
 	// (distinct from the run-state-derived 'cancelled', which reports a run the
 	// backend moved to the cancelled terminal state).
@@ -116,7 +125,7 @@ type DriveStep struct {
 // resumable by re-invoking with the same run_id.
 type DriveRunOutput struct {
 	RunID         string       `json:"run_id"`
-	StoppedReason string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | context_cancelled"`
+	StoppedReason string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | host_dispatch_failed | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | context_cancelled"`
 	RunState      string       `json:"run_state"`
 	StepsTaken    []DriveStep  `json:"steps_taken,omitempty" jsonschema:"the ordered acts the driver performed; each dispatch and gate act also landed a run_auto_driven audit row"`
 	PageEvent     string       `json:"page_event,omitempty" jsonschema:"the must_page_human event, set only on a paged stop"`
@@ -164,11 +173,14 @@ a >30-min drive is not aborted by the client's idle timeout. Progress is
 opt-in per the MCP spec — no token means no heartbeat (the return is still
 resumable). At a parked approval gate the driver waits for the stage's
 advisory agent reviews to settle before calling the gate, so a delegated
-approve fires only on settled reviews. A stage left 'dispatched' with no
-runner ever observed is handed back for a manual re-dispatch
-(dispatched_stale); a fresh manual fishhawk_dispatch_stage records spawn
-evidence so a re-invoked drive reads it as live and polls to convergence
-rather than re-reporting stale.
+approve fires only on settled reviews. A parked implement stage
+(awaiting_host_dispatch) after a delegated plan approval is AUTO-DISPATCHED by
+the loop — record-act, host-dispatch marker, then one spawn — with no manual
+handoff (#1912). A stage left 'dispatched' (a spawn attempt exists) with no
+runner ever observed past the liveness threshold is a dead runner, handed back
+for a manual re-dispatch (dispatched_stale); a fresh manual
+fishhawk_dispatch_stage marks a new spawn so a re-invoked drive reads it as live
+and polls to convergence rather than re-reporting stale.
 
 Requires the fishhawk-runner binary to resolve on the MCP server's host, like
 fishhawk_run_stage / fishhawk_dispatch_stage (local-only by design, ADR-024).
@@ -383,7 +395,7 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 			// still-'dispatched' stage, downgrading would let the loop record +
 			// host-spawn a SECOND runner while the first is in flight (concurrent
 			// repository command execution). Halt instead.
-			priorRow, newestDispatchSeq, newestDispatchTs, herr := r.driveHasPriorDispatchRow(ctx, runUUID, recordName)
+			priorRow, newestDispatchSeq, herr := r.driveHasPriorDispatchRow(ctx, runUUID, recordName)
 			if herr != nil {
 				out.StoppedReason = stoppedDispatchCheckFailed
 				out.Warnings = append(out.Warnings,
@@ -391,82 +403,49 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 				out.NextActions = driveDecisionActions("stalled", runUUID, in.WorkingDir)
 				return nil, out, nil
 			}
-			// Concurrency / cross-invocation resume guard: a stage already in the
-			// 'dispatched' window that THIS invocation did not spawn
-			// (dispatchedCount==0) has a runner in flight — from a PRIOR driver
-			// invocation OR a manual fishhawk_dispatch_stage (which lands NO
-			// run_auto_driven dispatch row). A fresh invocation's per-run
-			// `spawned` map cannot see it, and driveDispatchableStage treats
-			// 'dispatched' as dispatchable. Treat it as in-flight and POLL; never
-			// host-spawn a SECOND runner for the same stage — regardless of
-			// whether a driver dispatch row exists (keying on priorRow would miss
-			// the manual-dispatch case and double-spawn). A 'pending' resume
-			// (crashed before the stage started) still re-records + re-dispatches
-			// with a retry note below; a fixup/retry re-open (dispatchedCount>0)
-			// still re-dispatches as fixup_redispatch.
+			// Cross-invocation in-flight guard (#1912): post-#1912 a 'dispatched'
+			// stage THIS invocation did not spawn (dispatchedCount==0) has a runner
+			// in flight — the host-dispatch spawn marker CAS-flipped it 'dispatched'
+			// from a PRIOR driver invocation OR a manual fishhawk_dispatch_stage. A
+			// fresh invocation's per-run `spawned` map cannot see it, and
+			// driveDispatchableStage returns it. Treat it as in-flight and POLL;
+			// never host-spawn a SECOND runner for the same stage. Only past the
+			// liveness threshold with no running flip — a DEAD runner (it never
+			// reached its prompt fetch) — do we hand the manual re-dispatch to the
+			// operator rather than polling every resume to timeout. A
+			// 'pending'/'awaiting_host_dispatch' stage never reaches here (its state
+			// is not 'dispatched'); it is recorded + host-spawned below, which is the
+			// auto-dispatch of a parked implement (#1912).
 			if disp.State == "dispatched" && dispatchedCount[disp.ID] == 0 {
 				staleAfter := r.driveDispatchedStaleAfter
 				if staleAfter <= 0 {
 					staleAfter = defaultDriveDispatchedStaleAfter
 				}
-				// Spawn evidence = a prior run_auto_driven dispatch row (driver OR
-				// manual fishhawk_dispatch_stage — one canonical vocabulary) OR a
-				// non-nil StartedAt. A bare UpdatedAt is NOT evidence: on local, plan
-				// approval pre-flips implement to 'dispatched' (with a fresh
-				// UpdatedAt) BEFORE any host dispatch, so UpdatedAt alone cannot prove
-				// a runner was ever spawned.
-				hasEvidence := priorRow || disp.StartedAt != nil
-				if !hasEvidence {
-					// (a) NO evidence of any spawn attempt: the local parked-for-host-
-					// dispatch handoff. Stop IMMEDIATELY rather than polling the full
-					// liveness threshold first, and hand the dispatch to the operator.
-					// The message names the handoff and instructs FIRST confirming no
-					// runner is live — a fishhawk_run_stage / fishhawk_dispatch_stage
-					// invoked moments ago may not have registered yet, so that transient
-					// must not induce a double dispatch. The driver still NEVER
-					// auto-spawns, so double-spawn stays impossible by construction.
-					out.StoppedReason = stoppedDispatchedStale
-					out.Warnings = append(out.Warnings, fmt.Sprintf(
-						"stage %s (%s) is 'dispatched' with no spawn evidence (no dispatch row, no started_at). On local, plan approval parks the implement stage in 'dispatched' awaiting a host dispatch, so no runner has been spawned yet. FIRST confirm no runner process is live: a fishhawk_run_stage or fishhawk_dispatch_stage invoked moments ago may not have registered yet — wait for it to register (dispatched->running) rather than hand-dispatching during that transient. Only after confirming no live runner, re-dispatch by hand with fishhawk_dispatch_stage, then re-invoke fishhawk_drive_run.",
-						disp.Type, disp.ID))
-					out.NextActions = driveDecisionActions("dispatched_stale", runUUID, in.WorkingDir)
-					return nil, out, nil
-				}
-				// Evidence exists: anchor staleness on the NEWEST spawn evidence —
-				// max{UpdatedAt, StartedAt, newest dispatch-row Timestamp}. A fresh
-				// manual re-dispatch records an act row with a server-set wall-clock
-				// timestamp, so a just-recovered stage reads as fresh and the recovery
-				// loop converges instead of insta-tripping stale on a stale UpdatedAt.
+				// Anchor staleness on the newest spawn timestamp: max(UpdatedAt,
+				// StartedAt). Post-#1912 the awaiting_host_dispatch → dispatched spawn
+				// flip stamps UpdatedAt, so UpdatedAt IS the spawn signal — the #1905
+				// dispatch-row timestamp max-in is removed (the marker, not a separate
+				// audit row, is now the timestamp of record). StartedAt (set on the
+				// running flip) can only be newer. A zero-value anchor (no timestamped
+				// evidence) degrades to polling — fail toward polling, never toward a
+				// stale stop or a spawn.
 				anchor := disp.UpdatedAt
 				if disp.StartedAt != nil && disp.StartedAt.After(anchor) {
 					anchor = *disp.StartedAt
 				}
-				if priorRow && newestDispatchTs.After(anchor) {
-					anchor = newestDispatchTs
-				}
-				// (b) Genuinely runner-less: the newest spawn evidence is older than
-				// the liveness threshold and no signed prompt fetch flipped the stage
-				// to running. Stop distinct and hand the manual re-dispatch to the
-				// operator rather than polling every resume to timeout. The backend
-				// flips dispatched->running on the runner's prompt fetch within
-				// seconds of spawn (#1924), so a stage still 'dispatched' past the
-				// threshold is a runner that never reached that fetch — not a
-				// misclassified live one. A zero-value anchor (no timestamped
-				// evidence at all) degrades to polling — fail toward polling, never
-				// toward a stale stop or a spawn.
 				if !anchor.IsZero() && time.Since(anchor) > staleAfter {
 					age := time.Since(anchor).Round(time.Second)
 					out.StoppedReason = stoppedDispatchedStale
 					out.Warnings = append(out.Warnings, fmt.Sprintf(
-						"stage %s (%s) has sat in 'dispatched' for %s (newest spawn evidence), past the %s runner-liveness threshold, and no prompt fetch flipped it to 'running'. Before re-dispatching, FIRST verify no runner process is live on this host — check `pgrep -f fishhawk-runner` and the dispatch's log_path — because a second runner into the same lineage lock is the failure this driver exists to prevent. Only if none is live, re-dispatch by hand with fishhawk_dispatch_stage, then re-invoke fishhawk_drive_run.",
+						"stage %s (%s) has sat in 'dispatched' for %s (newest spawn timestamp), past the %s runner-liveness threshold, and no prompt fetch flipped it to 'running' — the spawned runner never reached its prompt fetch (it died at or just after spawn). Before re-dispatching, FIRST verify no runner process is live on this host — check `pgrep -f fishhawk-runner` and the dispatch's log_path — because a second runner into the same lineage lock is the failure this driver exists to prevent. Only if none is live, re-dispatch by hand with fishhawk_dispatch_stage, then re-invoke fishhawk_drive_run.",
 						disp.Type, disp.ID, age, staleAfter))
 					out.NextActions = driveDecisionActions("dispatched_stale", runUUID, in.WorkingDir)
 					return nil, out, nil
 				}
-				// (c) Anchor fresh (or the zero-value degrade): poll and re-evaluate
-				// the threshold next iteration. Deliberately NOT a one-shot spawned[]
-				// mark — leaving the stage dispatchable lets this guard re-trip once
-				// the threshold passes mid-invocation.
+				// Anchor fresh (or the zero-value degrade): poll and re-evaluate the
+				// threshold next iteration. Deliberately NOT a one-shot spawned[] mark —
+				// leaving the stage dispatchable lets this guard re-trip once the
+				// threshold passes mid-invocation.
 				driveSleep(ctx, pollInterval)
 				continue
 			}
@@ -554,6 +533,21 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 			stageUUID, perr := uuid.Parse(disp.ID)
 			if perr != nil {
 				return nil, out, fmt.Errorf("drive: resolved stage_id %q not a UUID: %w", disp.ID, perr)
+			}
+			// Mark the host spawn BEFORE spawning (#1912), between record-act and
+			// spawn: the endpoint CAS-flips {pending, awaiting_host_dispatch} →
+			// dispatched so post-#1912 'dispatched' unambiguously means a spawn
+			// attempt exists — the signal the in-flight/stale guard above anchors on.
+			// FAIL CLOSED — a transport error or 4xx means NO spawn (an unmarked
+			// spawn would recreate the ambiguity #1912 removes). transitioned:false
+			// (already 'dispatched') proceeds; the guard above already handled the
+			// unspawned-this-invocation dispatched case, so reaching here means a
+			// pending/awaiting_host_dispatch stage the marker flips forward.
+			if _, hderr := r.api.HostDispatchStage(ctx, runUUID, stageUUID); hderr != nil {
+				out.StoppedReason = stoppedHostDispatchFailed
+				out.Warnings = append(out.Warnings, fmt.Sprintf(
+					"host-dispatch marker for %s failed; NOT spawning (fail-closed): %v", recordName, hderr))
+				return nil, out, nil
 			}
 			argv := r.composeRunnerArgv(RunStageInput{
 				RunID:      in.RunID,
@@ -698,13 +692,22 @@ func driveSleep(ctx context.Context, d time.Duration) {
 }
 
 // driveDispatchableStage returns the EARLIEST non-terminal stage when — and
-// only when — it is itself host-dispatchable: a plan/implement/acceptance stage
-// in pending or dispatched that this invocation has not already spawned, with
-// its gate preconditions satisfied. It returns nil when nothing is host-
-// dispatchable right now: the earliest non-terminal stage is a review stage
-// (server-driven, polled by driveAnyInFlight) or a plan/implement/acceptance
-// stage parked in awaiting_approval/running/blocked (the gate branch / poll own
-// those).
+// only when — it is a plan/implement/acceptance stage this invocation has not
+// already spawned, with its gate preconditions satisfied, whose state is one the
+// caller acts on: {pending, awaiting_host_dispatch} (host-SPAWNABLE — the loop
+// records + host-spawns it, #1912) OR 'dispatched' (in-flight — the caller's
+// dispatched-guard polls it or, past the liveness threshold, hands back a manual
+// re-dispatch; it is NEVER spawned). It returns nil when nothing here is
+// actionable: the earliest non-terminal stage is a review stage (server-driven,
+// polled by driveAnyInFlight) or a plan/implement/acceptance stage parked in
+// awaiting_approval/running/blocked (the gate branch / poll own those).
+//
+// awaiting_host_dispatch (#1912) is the NEW host-spawnable park: a runner_kind-
+// locked-local agent stage the backend parked for a host spawn (e.g. a parked
+// implement after a delegated plan approval). Returning it here is what lets the
+// loop AUTO-DISPATCH it with no manual handoff — the issue's primary done-means.
+// 'dispatched' is returned only so the caller's in-flight/stale guard can route
+// it; it is never carried through to a spawn.
 //
 // Gating on the EARLIEST non-terminal stage is the load-bearing fix (run
 // fdcc17cd): a fresh run creates every stage 'pending', and the prior lowest-
@@ -735,7 +738,11 @@ func driveDispatchableStage(stages []Stage, spawned map[string]bool) *Stage {
 	default:
 		return nil // earliest non-terminal is a review stage → nothing host-dispatchable
 	}
-	if earliest.State != "pending" && earliest.State != "dispatched" {
+	switch earliest.State {
+	case "pending", "awaiting_host_dispatch", "dispatched":
+		// spawnable ({pending, awaiting_host_dispatch}) or in-flight ('dispatched',
+		// routed to the caller's dispatched-guard) — actionable here.
+	default:
 		return nil // parked at a gate / running / blocked → not host-dispatchable
 	}
 	if spawned[earliest.ID] {
@@ -907,14 +914,17 @@ func (r *runResolver) driveScopeAmendmentPending(ctx context.Context, runID uuid
 
 // driveHasPriorDispatchRow reports whether a run_auto_driven dispatch row for
 // the given dispatch stage name already exists — a crash-resume or re-open
-// signal so the re-record carries an honest retry note — and returns the
-// highest audit sequence among the matching rows PLUS that newest row's
-// server-set Timestamp (the staleness anchor's spawn-evidence input, #1905).
-// For an implement stage the match set includes BOTH 'implement' and
-// 'fixup_redispatch' dispatch rows (a fix-up re-dispatch is still an implement
-// dispatch), so the returned sequence is the newest implement-family dispatch —
-// the caller compares it against the newest stage_fixup_triggered row to
-// attribute a cross-invocation fix-up re-open.
+// signal so the re-record carries an honest retry note — and returns the highest
+// audit sequence among the matching rows (the cross-invocation fixup-attribution
+// input). Post-#1912 it is used for ATTRIBUTION ONLY (the retry note + the
+// fixup_redispatch discriminator); the staleness anchor no longer reads a
+// dispatch-row timestamp — the host-dispatch spawn marker stamps the
+// 'dispatched' updated_at that is now the spawn signal. For an implement stage
+// the match set includes BOTH 'implement' and 'fixup_redispatch' dispatch rows
+// (a fix-up re-dispatch is still an implement dispatch), so the returned sequence
+// is the newest implement-family dispatch — the caller compares it against the
+// newest stage_fixup_triggered row to attribute a cross-invocation fix-up
+// re-open.
 //
 // The match predicate is deliberately act=='dispatch' + stage family, SOURCE-
 // and action-value-agnostic: the endpoint rejects any action other than
@@ -923,14 +933,13 @@ func (r *runResolver) driveScopeAmendmentPending(ctx context.Context, runID uuid
 // manual fishhawk_dispatch_stage rows are ONE dispatch-evidence vocabulary by
 // server-side construction — matching on act+stage is provably complete over
 // it.
-func (r *runResolver) driveHasPriorDispatchRow(ctx context.Context, runID uuid.UUID, stageName string) (bool, int64, time.Time, error) {
+func (r *runResolver) driveHasPriorDispatchRow(ctx context.Context, runID uuid.UUID, stageName string) (bool, int64, error) {
 	rows, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{Category: CategoryRunAutoDriven, Limit: 500})
 	if err != nil {
-		return false, 0, time.Time{}, err
+		return false, 0, err
 	}
 	found := false
 	var newestSeq int64
-	var newestTs time.Time
 	for _, e := range rows {
 		fields, ok := e.Payload.(map[string]any)
 		if !ok {
@@ -948,11 +957,10 @@ func (r *runResolver) driveHasPriorDispatchRow(ctx context.Context, runID uuid.U
 			found = true
 			if e.Sequence > newestSeq {
 				newestSeq = e.Sequence
-				newestTs = e.Timestamp
 			}
 		}
 	}
-	return found, newestSeq, newestTs, nil
+	return found, newestSeq, nil
 }
 
 // driveProgressMessage builds the per-iteration heartbeat message: the run

@@ -10,9 +10,12 @@ package main
 // Status is one of:
 //
 //   - "pending"   — the stage exists but has not started running yet
-//     (backend state pending | dispatched | awaiting_approval |
-//     awaiting_children). A polling agent should keep calling
-//     fishhawk_get_run_status until a terminal status lands.
+//     (backend state pending | awaiting_host_dispatch | dispatched |
+//     awaiting_approval | awaiting_children). awaiting_host_dispatch (#1912) is
+//     a runner_kind-locked-local agent stage parked for a host spawn — it is
+//     actionable (a host dispatch will start it), so it maps to the pending
+//     (keep-polling) bucket, not a terminal one. A polling agent should keep
+//     calling fishhawk_get_run_status until a terminal status lands.
 //   - "running"   — the runner is executing the stage (backend state
 //     running). Keep polling.
 //   - "succeeded" — terminal: the stage completed successfully.
@@ -65,10 +68,10 @@ func stageStateIsTerminal(state string) bool {
 // resolves rather than advertising an unbounded poll (pass "" when the run
 // state is unknown — the backstop simply does not fire).
 //
-// Non-terminal states (pending | dispatched | awaiting_approval |
-// awaiting_children) map to "pending"; running maps to "running"; the three
-// terminal states map to themselves. A non-terminal status carries the
-// suggested poll interval; a terminal status omits it.
+// Non-terminal states (pending | awaiting_host_dispatch | dispatched |
+// awaiting_approval | awaiting_children) map to "pending"; running maps to
+// "running"; the three terminal states map to themselves. A non-terminal status
+// carries the suggested poll interval; a terminal status omits it.
 func classifyStageWaitStatus(stageType, stageState, runState string) *StageWaitStatus {
 	status := "pending"
 	switch stageState {

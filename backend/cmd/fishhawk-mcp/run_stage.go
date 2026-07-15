@@ -483,6 +483,17 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 
 	env := append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
 
+	// (4a) Mark the host spawn BEFORE spawning (#1912): the endpoint CAS-flips
+	// {pending, awaiting_host_dispatch} → dispatched so post-#1912 'dispatched'
+	// unambiguously means a spawn attempt exists. FAIL CLOSED — a transport error
+	// or 4xx means NO spawn (an unmarked spawn would recreate the ambiguity #1912
+	// removes). transitioned:false (already 'dispatched') proceeds: the manual
+	// dead-runner re-dispatch.
+	if _, hderr := r.api.HostDispatchStage(ctx, runUUID, stageUUID); hderr != nil {
+		return nil, RunStageOutput{}, fmt.Errorf(
+			"host-dispatch marker for stage %s failed; NOT spawning (fail-closed): %w", resolvedStageID, hderr)
+	}
+
 	// (5)+(6)+(7) Spawn the runner in its own process group, parse its
 	// JSONL stream, watch ctx for cancellation (SIGTERM→grace→SIGKILL the
 	// group), and wait for exit — the whole spawn-to-exit core, extracted

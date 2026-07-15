@@ -500,7 +500,8 @@ func TestImplementStageDispatchable(t *testing.T) {
 		want  bool
 	}{
 		{"pending", true},
-		{"dispatched", true},
+		{"awaiting_host_dispatch", true}, // #1912: the new host-spawnable park
+		{"dispatched", false},            // #1912: a spawn attempt exists — in-flight, not re-dispatchable
 		{"running", false},
 		{"awaiting_approval", false},
 		{"succeeded", false},
@@ -517,23 +518,26 @@ func TestImplementStageDispatchable(t *testing.T) {
 
 // TestRunChildren_LocalParkedChildrenDispatch is the behavioral done-means
 // test for #1237: a decomposed parent whose children are at RUN state 'running'
-// but implement STAGE state pending/dispatched (the RuleChildrenDispatch-parked
-// shape from run 9b4e5654) must dispatch BOTH. Under the old run-state
+// but implement STAGE state pending/awaiting_host_dispatch (the
+// RuleChildrenDispatch-parked shape) must dispatch BOTH. Under the old run-state
 // predicate this dispatched ZERO (run=='running' classified as in-flight); it
-// passes only with the stage-state fix. A third child that is GENUINELY
-// executing (implement stage 'running') is still skipped as in-flight.
+// passes only with the stage-state fix. Post-#1912 a 'dispatched' child (a spawn
+// attempt EXISTS — a runner is in flight) is now SKIPPED as in-flight, and a
+// GENUINELY executing (implement stage 'running') child is likewise skipped.
 func TestRunChildren_LocalParkedChildrenDispatch(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
 
 	parent := uuid.New()
-	dispatchedID := uuid.New() // run='running', stage='dispatched' => dispatch
-	pendingID := uuid.New()    // run='running', stage='pending'    => dispatch
-	executingID := uuid.New()  // run='running', stage='running'    => skip
-	seedChildRunStage(fb, dispatchedID, "running", "dispatched")
+	awaitingID := uuid.New()   // run='running', stage='awaiting_host_dispatch' => dispatch
+	pendingID := uuid.New()    // run='running', stage='pending'                 => dispatch
+	dispatchedID := uuid.New() // run='running', stage='dispatched'              => skip (in-flight, #1912)
+	executingID := uuid.New()  // run='running', stage='running'                 => skip
+	seedChildRunStage(fb, awaitingID, "running", "awaiting_host_dispatch")
 	seedChildRunStage(fb, pendingID, "running", "pending")
+	seedChildRunStage(fb, dispatchedID, "running", "dispatched")
 	seedChildRunStage(fb, executingID, "running", "running")
-	seedPlanDecomposed(fb, parent, []string{dispatchedID.String(), pendingID.String(), executingID.String()}, 0)
+	seedPlanDecomposed(fb, parent, []string{awaitingID.String(), pendingID.String(), dispatchedID.String(), executingID.String()}, 0)
 
 	var argvSeen []string
 	var mu sync.Mutex
@@ -551,7 +555,7 @@ func TestRunChildren_LocalParkedChildrenDispatch(t *testing.T) {
 		t.Fatalf("runChildren: %v", err)
 	}
 	if out.DispatchedCount != 2 {
-		t.Fatalf("dispatched_count = %d, want 2 (the run='running' + stage=pending/dispatched children)", out.DispatchedCount)
+		t.Fatalf("dispatched_count = %d, want 2 (the run='running' + stage=pending/awaiting_host_dispatch children)", out.DispatchedCount)
 	}
 	mu.Lock()
 	if len(argvSeen) != 2 {
@@ -568,11 +572,16 @@ func TestRunChildren_LocalParkedChildrenDispatch(t *testing.T) {
 	for _, c := range out.Children {
 		byID[c.RunID] = c
 	}
-	if c := byID[dispatchedID.String()]; !c.Dispatched {
-		t.Errorf("stage='dispatched' child not dispatched: %+v", c)
+	if c := byID[awaitingID.String()]; !c.Dispatched {
+		t.Errorf("stage='awaiting_host_dispatch' child not dispatched: %+v", c)
 	}
 	if c := byID[pendingID.String()]; !c.Dispatched {
 		t.Errorf("stage='pending' child not dispatched: %+v", c)
+	}
+	// The 'dispatched' child (a spawn attempt exists, #1912) is in-flight: not
+	// re-spawned, and its stage_state reported as the stage state.
+	if c := byID[dispatchedID.String()]; c.Dispatched || c.StageState != "dispatched" {
+		t.Errorf("dispatched child = %+v, want not dispatched + stage_state dispatched", c)
 	}
 	// The genuinely-executing child (implement stage 'running') is in-flight:
 	// not re-spawned, and its stage_state reported as the stage state.
