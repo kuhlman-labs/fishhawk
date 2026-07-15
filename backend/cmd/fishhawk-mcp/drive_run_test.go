@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -1169,6 +1170,10 @@ func TestDriveRun_ResumeDispatchedStale_StopsDistinct(t *testing.T) {
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
 	r.driveDispatchedStaleAfter = time.Millisecond // lower the threshold so the hour-old stage trips it
+	// #1955: inject an UNKNOWN-verdict probe so this test pins the DEGRADED
+	// manual-stop contract (pgrep absent / unprobeable) rather than the real
+	// pgrep (which would find no process → DEAD → auto-re-dispatch).
+	r.driveProbeRunnerLiveness = func(context.Context, string) runnerLivenessVerdict { return runnerUnknown }
 
 	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
 	if err != nil {
@@ -1211,6 +1216,286 @@ func assertDispatchedStaleWarning(t *testing.T, warnings []string) {
 	for _, want := range []string{"pgrep -f fishhawk-runner", "log_path", "flipped it to 'running'"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("dispatched_stale warning missing %q (verify-liveness-first instruction):\n%s", want, joined)
+		}
+	}
+}
+
+// --- (#1955) dead probe -> auto-re-dispatch (primary done-means) --------------
+
+func TestDriveRun_DispatchedStale_DeadProbe_AutoRedispatches(t *testing.T) {
+	// The issue's primary behavior: an hour-old 'dispatched' implement this
+	// invocation did not spawn crosses the liveness threshold; the driver's OWN
+	// probe returns DEAD (no runner process), so it does NOT stop dispatched_stale
+	// — it auto-recovers by falling through to the record-act -> host-dispatch
+	// marker -> spawn path, attributes the record-act + DriveStep as a stale
+	// re-dispatch, and drives on to merged. EXACTLY one spawn: dispatchedCount>0
+	// after the respawn, so the stale guard cannot re-trip this invocation.
+	impl := stg(driveImplID, "implement", "dispatched", 1)
+	impl.UpdatedAt = time.Now().Add(-time.Hour) // past the threshold -> probed
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		impl,
+	})
+	// A prior implement dispatch row (an earlier invocation spawned the now-dead
+	// runner): it makes the fixup-attribution block RUN on the fall-through path
+	// (priorRow=true) — with no newer stage_fixup_triggered row it does NOT rename
+	// to fixup_redispatch, so recordName stays 'implement' and the stale note wins.
+	f.appendAutoAt(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""}, time.Now().Add(-time.Hour))
+	// The re-dispatched runner reaches its prompt fetch and settles the run.
+	f.onSpawn = func(f *driveFakeBackend, typ string) {
+		if typ == "implement" {
+			f.setState("implement", "succeeded")
+			f.runState = "succeeded"
+		}
+	}
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveDispatchedStaleAfter = time.Millisecond
+	r.driveMaxWallclock = 5 * time.Second
+	r.driveProbeRunnerLiveness = func(context.Context, string) runnerLivenessVerdict { return runnerDead }
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	// No dispatched_stale stop — the dead probe auto-recovered and the run merged.
+	if out.StoppedReason != stoppedMerged {
+		t.Fatalf("stopped_reason = %q, want merged (dead probe -> auto-re-dispatch -> merged)", out.StoppedReason)
+	}
+	// SINGLE-SPAWN-PER-INVOCATION invariant (safety core): exactly one spawn.
+	if got := rec.list(); len(got) != 1 || got[0] != "implement" {
+		t.Fatalf("spawn sequence = %v, want exactly [implement] (one stale re-dispatch, guard cannot re-trip)", got)
+	}
+	f.mu.Lock()
+	markerN := f.hostDispatchCalledN
+	acts := append([]RecordAutoDriveAct(nil), f.recordedActs...)
+	f.mu.Unlock()
+	// record-act -> host-dispatch marker -> spawn: the marker fired exactly once.
+	if markerN != 1 {
+		t.Errorf("host-dispatch marker calls = %d, want 1 (record -> marker -> spawn)", markerN)
+	}
+	if len(acts) != 1 {
+		t.Fatalf("recorded acts = %d, want 1 (a single stale re-dispatch)", len(acts))
+	}
+	// The record-act note marks the stale re-dispatch; recordName stayed implement.
+	if acts[0].Note != staleRedispatchNote {
+		t.Errorf("record-act note = %q, want %q", acts[0].Note, staleRedispatchNote)
+	}
+	if acts[0].Stage != "implement" {
+		t.Errorf("record-act stage = %q, want implement (fixup attribution ran but did not rename)", acts[0].Stage)
+	}
+	// A DriveStep notes the auto-recovery.
+	var sawStaleStep bool
+	for _, s := range out.StepsTaken {
+		if s.Kind == "dispatch" && strings.Contains(s.Note, "stale re-dispatch") {
+			sawStaleStep = true
+		}
+	}
+	if !sawStaleStep {
+		t.Errorf("no DriveStep noting the stale re-dispatch auto-recovery; steps: %+v", out.StepsTaken)
+	}
+	// A warning names the negative liveness probe.
+	joined := strings.Join(out.Warnings, "\n")
+	if !strings.Contains(joined, "found NO matching runner process") {
+		t.Errorf("no warning naming the negative liveness probe; warnings: %v", out.Warnings)
+	}
+}
+
+// --- (#1955) dead probe on a FIXUP-re-opened stage -> fixup_redispatch survives ---
+
+func TestDriveRun_DispatchedStale_DeadProbe_FixupRedispatchAttribution(t *testing.T) {
+	// The combination the fall-through preserves but the plain dead-probe test does
+	// not exercise: a fix-up re-opened implement stage (a stage_fixup_triggered row
+	// NEWER than the newest implement dispatch row, so the fixup-attribution block
+	// renames recordName to fixup_redispatch) whose fresh runner then dies past the
+	// liveness threshold. The dead probe sets staleRedispatch, so the stale note must
+	// OVERWRITE the (blanked) fixup note WHILE the fixup_redispatch recordName is
+	// preserved — the record lands stage="fixup_redispatch" AND note=staleRedispatchNote.
+	impl := stg(driveImplID, "implement", "dispatched", 1)
+	impl.UpdatedAt = time.Now().Add(-time.Hour) // past the threshold -> probed
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		impl,
+	})
+	// A prior implement dispatch row (the fix-up's first dispatch that then died) —
+	// makes priorRow=true so the fixup-attribution block runs on the fall-through.
+	f.appendAutoAt(map[string]any{"act": "dispatch", "action": "dispatch_stage", "stage": "implement", "source": "fishhawk_drive_run", "note": ""}, time.Now().Add(-time.Hour))
+	// A stage_fixup_triggered row NEWER than that dispatch row -> fixupSeq >
+	// newestDispatchSeq, so recordName renames to fixup_redispatch.
+	f.seq++
+	f.audit = append(f.audit, AuditEntry{ID: uuid.New().String(), Sequence: f.seq, RunID: f.runID.String(), Category: categoryStageFixupTriggered, Payload: map[string]any{}})
+	// The re-dispatched runner reaches its prompt fetch and settles the run.
+	f.onSpawn = func(f *driveFakeBackend, typ string) {
+		if typ == "implement" {
+			f.setState("implement", "succeeded")
+			f.runState = "succeeded"
+		}
+	}
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveDispatchedStaleAfter = time.Millisecond
+	r.driveMaxWallclock = 5 * time.Second
+	r.driveProbeRunnerLiveness = func(context.Context, string) runnerLivenessVerdict { return runnerDead }
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedMerged {
+		t.Fatalf("stopped_reason = %q, want merged (dead probe -> fixup re-dispatch -> merged)", out.StoppedReason)
+	}
+	// SINGLE-SPAWN-PER-INVOCATION invariant: exactly one spawn.
+	if got := rec.list(); len(got) != 1 || got[0] != "implement" {
+		t.Fatalf("spawn sequence = %v, want exactly [implement] (one stale re-dispatch)", got)
+	}
+	f.mu.Lock()
+	acts := append([]RecordAutoDriveAct(nil), f.recordedActs...)
+	f.mu.Unlock()
+	if len(acts) != 1 {
+		t.Fatalf("recorded acts = %d, want 1 (a single stale re-dispatch)", len(acts))
+	}
+	// The exact interaction: fixup_redispatch recordName survives AND the stale note
+	// overwrites the blanked fixup note.
+	if acts[0].Stage != "fixup_redispatch" {
+		t.Errorf("record-act stage = %q, want fixup_redispatch (fixup attribution renamed and survived the stale note)", acts[0].Stage)
+	}
+	if acts[0].Note != staleRedispatchNote {
+		t.Errorf("record-act note = %q, want %q (stale note overwrote the fixup note)", acts[0].Note, staleRedispatchNote)
+	}
+}
+
+// --- (#1955) live probe -> stop dispatched_stale, NEVER spawn (safety core) ---
+
+func TestDriveRun_DispatchedStale_LiveProbe_StopsWithoutSpawn(t *testing.T) {
+	// LIVE-never-spawns invariant (the safety core): a 'dispatched' stage past the
+	// threshold whose probe finds a LIVE process matching the stage id (yet it
+	// never flipped 'running') is anomalous — the driver STOPS dispatched_stale,
+	// spawns nothing, records nothing, and its warning names the live process +
+	// log_path without instructing an immediate re-dispatch. A second runner into
+	// the same lineage lock stays impossible by construction.
+	impl := stg(driveImplID, "implement", "dispatched", 1)
+	impl.UpdatedAt = time.Now().Add(-time.Hour)
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		impl,
+	})
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveDispatchedStaleAfter = time.Millisecond
+	r.driveProbeRunnerLiveness = func(context.Context, string) runnerLivenessVerdict { return runnerLive }
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedDispatchedStale {
+		t.Fatalf("stopped_reason = %q, want dispatched_stale (live probe)", out.StoppedReason)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("driver spawned on a LIVE probe: %v (a second runner into the same lineage lock must be impossible)", got)
+	}
+	f.mu.Lock()
+	nActs := len(f.recordedActs)
+	f.mu.Unlock()
+	if nActs != 0 {
+		t.Errorf("driver recorded %d acts on a live-probe stop; want 0", nActs)
+	}
+	joined := strings.Join(out.Warnings, "\n")
+	for _, want := range []string{"IS live", "log_path"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("live-probe warning missing %q; warnings: %v", want, out.Warnings)
+		}
+	}
+	// It must NOT instruct an immediate hand re-dispatch (unlike the unknown path).
+	if strings.Contains(joined, "re-dispatch by hand") {
+		t.Errorf("live-probe warning wrongly instructs an immediate re-dispatch:\n%s", joined)
+	}
+	if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
+		t.Fatal("live-probe dispatched_stale stop carried no next_actions")
+	}
+	// The manual verify-and-re-dispatch instruction survives ONLY on the
+	// UNKNOWN/unprobeable branch: a confirmed-LIVE process must NEVER hand back a
+	// fishhawk_dispatch_stage action (a re-dispatch would spawn the second runner
+	// this driver exists to prevent). The LIVE arm offers inspect-only.
+	if got := out.NextActions.Actions[0].Action; got != "fishhawk_get_run_status" {
+		t.Errorf("next_actions[0] = %q, want fishhawk_get_run_status (inspect-only, NOT re-dispatch)", got)
+	}
+	for _, a := range out.NextActions.Actions {
+		if a.Action == "fishhawk_dispatch_stage" {
+			t.Errorf("live-probe next_actions wrongly offers fishhawk_dispatch_stage (manual re-dispatch): %+v", a)
+		}
+		joined := a.Precondition + " " + a.Reason
+		if strings.Contains(joined, "pgrep") || strings.Contains(joined, "re-dispatch by hand") {
+			t.Errorf("live-probe next_action wrongly carries the manual pgrep/re-dispatch instruction: %+v", a)
+		}
+	}
+}
+
+// --- (#1955) pure pgrep exit-code -> verdict mapping --------------------------
+
+func TestClassifyPgrepResult(t *testing.T) {
+	// Pin the pgrep exit-code contract (procps-ng/BSD pgrep(1) EXIT STATUS) using
+	// REAL *exec.ExitError values from `sh -c 'exit N'`, plus a fabricated
+	// pgrep-absent error, a context-timeout error, and an arbitrary non-ExitError
+	// exec failure — the last three all degrade to runnerUnknown (binding
+	// condition 1). This is what fails if a platform's pgrep semantics diverge.
+	tctx, tcancel := context.WithCancel(context.Background())
+	tcancel() // pre-cancel so the exec is killed -> a context-timeout-shaped error
+	timeoutErr := exec.CommandContext(tctx, "sleep", "5").Run()
+
+	cases := []struct {
+		name string
+		err  error
+		want runnerLivenessVerdict
+	}{
+		{"exit0_live", exec.Command("sh", "-c", "exit 0").Run(), runnerLive},
+		{"exit1_dead", exec.Command("sh", "-c", "exit 1").Run(), runnerDead},
+		{"exit2_syntax_unknown", exec.Command("sh", "-c", "exit 2").Run(), runnerUnknown},
+		{"exit3_fatal_unknown", exec.Command("sh", "-c", "exit 3").Run(), runnerUnknown},
+		{"pgrep_absent_unknown", exec.ErrNotFound, runnerUnknown},
+		{"context_timeout_unknown", timeoutErr, runnerUnknown},
+		{"arbitrary_error_unknown", errStub("boom"), runnerUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyPgrepResult(tc.err); got != tc.want {
+				t.Errorf("classifyPgrepResult(%v) = %d, want %d", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// --- (#1955 binding condition 2) README staleness-bullet is a pass/fail doc ---
+
+func TestDriveRunREADME_StalenessBulletDocumentsProbe(t *testing.T) {
+	// The README "Anchor past the liveness threshold" bullet is a named
+	// deliverable of #1955: it must document the driver's own host-liveness probe
+	// and the three-way DEAD/LIVE/UNKNOWN outcome. Anchored on load-bearing
+	// phrases (not full sentences) so a reword does not fail spuriously, but a
+	// DROPPED rewrite does. This makes the doc change pass/fail per the operator's
+	// binding approval condition.
+	body, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatalf("read README.md: %v", err)
+	}
+	readme := string(body)
+	for _, anchor := range []string{
+		"Anchor past the liveness threshold",
+		"probes host liveness itself",
+		"--stage-id",
+		"auto-recovered in place",
+		"stale re-dispatch: liveness probe found no runner process",
+		"never spawns", // the LIVE-never-spawns safety-core statement
+		"UNKNOWN",      // the pgrep-absent / exec-error degrade to the manual stop
+	} {
+		if !strings.Contains(readme, anchor) {
+			t.Errorf("README drive_run staleness bullet missing %q (#1955 doc deliverable)", anchor)
 		}
 	}
 }
@@ -1356,6 +1641,9 @@ func TestDriveRun_ResumeDispatchedStale_MidInvocation_StopsDistinct(t *testing.T
 	// budget (so the stale stop, not timeout, is what fires).
 	r.driveDispatchedStaleAfter = 40 * time.Millisecond
 	r.driveMaxWallclock = 10 * time.Second
+	// #1955: an UNKNOWN probe keeps the mid-invocation trip a manual stop (the
+	// point of this test is the threshold re-trip, not the probe branch).
+	r.driveProbeRunnerLiveness = func(context.Context, string) runnerLivenessVerdict { return runnerUnknown }
 
 	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
 	if err != nil {
@@ -2191,6 +2479,10 @@ func TestDriveRun_DispatchedInferenceArmDeleted_AnchorsOnStageTimestamp(t *testi
 		defer srv.Close()
 		r.driveDispatchedStaleAfter = time.Millisecond // the hour-old anchor is past it
 		r.driveMaxWallclock = 5 * time.Second
+		// #1955: UNKNOWN probe -> the anchor-past-threshold path keeps its manual
+		// dispatched_stale stop (this test pins the anchor classification, not the
+		// probe branches).
+		r.driveProbeRunnerLiveness = func(context.Context, string) runnerLivenessVerdict { return runnerUnknown }
 
 		_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
 		if err != nil {
@@ -2258,6 +2550,9 @@ func TestDriveRun_DispatchRowNoLongerAnchorsStaleness(t *testing.T) {
 			defer srv.Close()
 			r.driveDispatchedStaleAfter = time.Millisecond // the hour-old updated_at anchor is past it
 			r.driveMaxWallclock = 5 * time.Second
+			// #1955: UNKNOWN probe -> the stale anchor still stops dispatched_stale
+			// (this test pins that a fresh dispatch row no longer anchors staleness).
+			r.driveProbeRunnerLiveness = func(context.Context, string) runnerLivenessVerdict { return runnerUnknown }
 
 			_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
 			if err != nil {
@@ -2439,8 +2734,13 @@ func TestDriveRun_StaleRecoveryConvergence_EndToEnd(t *testing.T) {
 	// Large enough that a FRESH manual row reads live, small enough that the
 	// hour-old evidence is past it.
 	r.driveDispatchedStaleAfter = 10 * time.Second
+	// #1955: an UNKNOWN probe keeps drive #1 on the manual-recovery path this test
+	// exercises (dispatched_stale -> manual re-dispatch -> converge). Drive #2's
+	// onStages flips the stage to 'running' before the guard is reached, so the
+	// same injected seam never fires there.
+	r.driveProbeRunnerLiveness = func(context.Context, string) runnerLivenessVerdict { return runnerUnknown }
 
-	// (1) First drive: genuinely stale -> dispatched_stale.
+	// (1) First drive: genuinely stale + ambiguous probe -> dispatched_stale.
 	_, out1, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
 	if err != nil {
 		t.Fatalf("driveRun #1: %v", err)

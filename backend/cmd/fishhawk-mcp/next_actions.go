@@ -351,7 +351,7 @@ func implementStageNextActions(run *Run, impl, acceptance *Stage, implementRevie
 			State: "implement_dispatched",
 			Actions: []SuggestedAction{pollAction(run,
 				suggestedStageWaitPollIntervalSeconds,
-				"the implement stage is dispatched — a spawn attempt exists (#1912) and a runner is in flight; re-poll until implement_stage_wait_status goes terminal (if no runner is live, fishhawk_drive_run's dispatched_stale hands back a manual re-dispatch)")},
+				"the implement stage is dispatched — a spawn attempt exists (#1912) and a runner is in flight; re-poll until implement_stage_wait_status goes terminal (fishhawk_drive_run auto-re-dispatches a probed-dead runner; a live-but-unregistered process stops for inspection with NO re-dispatch, and only an unprobeable/UNKNOWN result — pgrep unavailable — hands back a manual re-dispatch)")},
 		}
 	case "awaiting_children":
 		// A DECOMPOSED PARENT parked at awaiting_children (#1147): the legal

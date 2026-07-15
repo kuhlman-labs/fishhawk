@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -16,6 +17,68 @@ import (
 // matches spawnRunnerStageDetached exactly; production uses that function,
 // tests inject a recording spawner.
 type driveSpawnFunc func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter) (string, error)
+
+// runnerLivenessVerdict is the three-valued result of the host runner-liveness
+// probe fishhawk_drive_run runs on a stale 'dispatched' stage (#1955). The MCP
+// server runs on the same host that spawned every local runner (ADR-024), so
+// the driver can decide whether the runner is genuinely dead before choosing
+// between an auto-recovery re-dispatch and a manual hand-back.
+type runnerLivenessVerdict int
+
+const (
+	// runnerUnknown is the fail-SAFE default: pgrep is absent from PATH, exited
+	// with a syntax/fatal code, timed out, or failed to exec — the driver cannot
+	// confirm the runner dead, so it degrades to today's manual verify-first
+	// dispatched_stale stop. It is the zero value so any un-probed path is safe.
+	runnerUnknown runnerLivenessVerdict = iota
+	// runnerDead: pgrep exited 1 (no process carries the stale stage's id), so the
+	// spawned runner genuinely died — the driver auto-recovers by re-dispatching.
+	runnerDead
+	// runnerLive: pgrep exited 0 (a process carrying the stage id exists) yet the
+	// stage never flipped 'running' — anomalous; the driver stops dispatched_stale
+	// and NEVER spawns a second runner into the same lineage lock.
+	runnerLive
+)
+
+// driveLivenessProbeTimeout bounds the pgrep exec so a wedged process table
+// read can never hang the drive loop.
+const driveLivenessProbeTimeout = 5 * time.Second
+
+// probeRunnerLiveness execs `pgrep -f` scoped to the stale stage's id to decide
+// whether a runner process for it is still alive on this host (#1955). The
+// pattern is "stage-id <uuid>" — no leading '-', so BSD/procps flag parsing
+// never eats it as an option — which matches the runner argv's `--stage-id
+// <uuid>` token pair (pgrep -f matches against the full argument list) regardless
+// of the runner binary's path or name. Stage ids are UUIDs (hex + dashes), so the
+// pattern is ERE-safe, and pgrep never reports itself as a match. Classification
+// is delegated to the pure classifyPgrepResult so the exit-code contract is
+// unit-testable without a live process.
+func probeRunnerLiveness(ctx context.Context, stageID string) runnerLivenessVerdict {
+	pctx, cancel := context.WithTimeout(ctx, driveLivenessProbeTimeout)
+	defer cancel()
+	err := exec.CommandContext(pctx, "pgrep", "-f", "stage-id "+stageID).Run()
+	return classifyPgrepResult(err)
+}
+
+// classifyPgrepResult maps a pgrep exec error to a liveness verdict. It is the
+// pure unit-test seam for the pgrep exit-code contract (procps-ng / BSD pgrep(1)
+// EXIT STATUS: 0 = one or more matched, 1 = none matched, 2 = syntax error,
+// 3 = fatal error):
+//   - nil                       -> runnerLive   (exit 0: a process carries the id)
+//   - *exec.ExitError, code 1   -> runnerDead   (no process matched)
+//   - any other exit code (2/3/…), pgrep-not-on-PATH (exec.ErrNotFound), a
+//     context timeout, or any other error -> runnerUnknown (degrade to the
+//     manual verify-first stop)
+func classifyPgrepResult(err error) runnerLivenessVerdict {
+	if err == nil {
+		return runnerLive
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return runnerDead
+	}
+	return runnerUnknown
+}
 
 const (
 	// defaultDrivePollInterval is the in-flight poll cadence.
@@ -66,13 +129,16 @@ const (
 	// repository command execution.
 	stoppedDispatchCheckFailed = "dispatch_check_failed"
 	// stoppedDispatchedStale is the stop when a stage this invocation did not
-	// spawn has sat in 'dispatched' past the runner-liveness threshold with no
-	// runner observed: a genuinely runner-less stage — the spawned runner never
-	// reached its prompt fetch (it died at or just after spawn). Post-#1912
-	// 'dispatched' means a spawn attempt EXISTS, so this is a dead runner, not a
-	// parked-for-host-dispatch handoff (that is 'awaiting_host_dispatch', which the
-	// loop auto-dispatches). The driver hands the manual re-dispatch to the
-	// operator via next_actions rather than polling every resume to timeout.
+	// spawn has sat in 'dispatched' past the runner-liveness threshold AND the
+	// driver's own host liveness probe (pgrep -f on the stage id, #1955) could
+	// NOT confirm the runner dead — either a process matching the stage id is
+	// LIVE yet never flipped 'running' (anomalous) or the probe was UNPROBEABLE
+	// (pgrep absent / errored / timed out). A DEAD probe does NOT stop here — the
+	// driver auto-recovers by re-dispatching. Post-#1912 'dispatched' means a
+	// spawn attempt EXISTS, so this is never a parked-for-host-dispatch handoff
+	// (that is 'awaiting_host_dispatch', which the loop auto-dispatches). The
+	// driver hands the manual verify-first re-dispatch to the operator via
+	// next_actions only on the ambiguous probe results.
 	stoppedDispatchedStale = "dispatched_stale"
 	// stoppedHostDispatchFailed is the fail-CLOSED stop when the host-dispatch
 	// spawn-marker call (POST .../host-dispatch) errors between record-act and
@@ -177,10 +243,16 @@ approve fires only on settled reviews. A parked implement stage
 (awaiting_host_dispatch) after a delegated plan approval is AUTO-DISPATCHED by
 the loop — record-act, host-dispatch marker, then one spawn — with no manual
 handoff (#1912). A stage left 'dispatched' (a spawn attempt exists) with no
-runner ever observed past the liveness threshold is a dead runner, handed back
-for a manual re-dispatch (dispatched_stale); a fresh manual
-fishhawk_dispatch_stage marks a new spawn so a re-invoked drive reads it as live
-and polls to convergence rather than re-reporting stale.
+runner ever observed past the liveness threshold triggers the driver's OWN host
+liveness probe (pgrep -f scoped to the stage's --stage-id argv, #1955): a
+NEGATIVE probe (no runner process) is auto-recovered in place — the driver
+re-dispatches through its record + host-dispatch marker + spawn path with no
+operator action. A LIVE-but-unregistered process stops dispatched_stale for
+INSPECTION with NO re-dispatch (a second runner into the same lineage lock is
+the failure this prevents); only an UNPROBEABLE result (pgrep absent / errored /
+timed out) hands the manual verify-first re-dispatch to the operator.
+A fresh manual fishhawk_dispatch_stage marks a new spawn so a re-invoked drive
+reads it as live and polls to convergence rather than re-reporting stale.
 
 Requires the fishhawk-runner binary to resolve on the MCP server's host, like
 fishhawk_run_stage / fishhawk_dispatch_stage (local-only by design, ADR-024).
@@ -410,12 +482,14 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 			// fresh invocation's per-run `spawned` map cannot see it, and
 			// driveDispatchableStage returns it. Treat it as in-flight and POLL;
 			// never host-spawn a SECOND runner for the same stage. Only past the
-			// liveness threshold with no running flip — a DEAD runner (it never
-			// reached its prompt fetch) — do we hand the manual re-dispatch to the
-			// operator rather than polling every resume to timeout. A
-			// 'pending'/'awaiting_host_dispatch' stage never reaches here (its state
-			// is not 'dispatched'); it is recorded + host-spawned below, which is the
-			// auto-dispatch of a parked implement (#1912).
+			// liveness threshold with no running flip do we probe host liveness
+			// (#1955): a DEAD probe auto-recovers by falling through to the
+			// record+spawn path below; a LIVE or UNPROBEABLE result stops
+			// dispatched_stale and NEVER spawns. A 'pending'/'awaiting_host_dispatch'
+			// stage never reaches here (its state is not 'dispatched'); it is recorded
+			// + host-spawned below, which is the auto-dispatch of a parked implement
+			// (#1912).
+			staleRedispatch := false
 			if disp.State == "dispatched" && dispatchedCount[disp.ID] == 0 {
 				staleAfter := r.driveDispatchedStaleAfter
 				if staleAfter <= 0 {
@@ -435,19 +509,64 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 				}
 				if !anchor.IsZero() && time.Since(anchor) > staleAfter {
 					age := time.Since(anchor).Round(time.Second)
-					out.StoppedReason = stoppedDispatchedStale
-					out.Warnings = append(out.Warnings, fmt.Sprintf(
-						"stage %s (%s) has sat in 'dispatched' for %s (newest spawn timestamp), past the %s runner-liveness threshold, and no prompt fetch flipped it to 'running' — the spawned runner never reached its prompt fetch (it died at or just after spawn). Before re-dispatching, FIRST verify no runner process is live on this host — check `pgrep -f fishhawk-runner` and the dispatch's log_path — because a second runner into the same lineage lock is the failure this driver exists to prevent. Only if none is live, re-dispatch by hand with fishhawk_dispatch_stage, then re-invoke fishhawk_drive_run.",
-						disp.Type, disp.ID, age, staleAfter))
-					out.NextActions = driveDecisionActions("dispatched_stale", runUUID, in.WorkingDir)
-					return nil, out, nil
+					// Past the threshold: probe host runner liveness ourselves rather
+					// than unconditionally handing the pgrep to the operator (#1955). The
+					// MCP server runs on the host that spawned the runner (ADR-024) and the
+					// runner argv carries `--stage-id <uuid>`, so the probe is precise.
+					probe := r.driveProbeRunnerLiveness
+					if probe == nil {
+						probe = probeRunnerLiveness
+					}
+					switch probe(ctx, disp.ID) {
+					case runnerDead:
+						// Negative probe: no process carries this stage id, so the spawned
+						// runner genuinely died. AUTO-RECOVER — do NOT stop; warn and fall
+						// through to the record-act → host-dispatch marker → spawn sequence
+						// below, carrying a stale-re-dispatch note. dispatchedCount stays 0
+						// here so the fixup-attribution computation below still runs; the
+						// spawn then marks spawned[disp.ID]/dispatchedCount so this guard
+						// cannot re-trip this invocation and driveAnyInFlight polls the fresh
+						// runner.
+						out.Warnings = append(out.Warnings, fmt.Sprintf(
+							"stage %s (%s) sat in 'dispatched' for %s, past the %s runner-liveness threshold; a host liveness probe (pgrep -f on the stage id) found NO matching runner process, so the spawn died at or just after launch — auto-re-dispatching (stale re-dispatch: liveness probe found no runner process).",
+							disp.Type, disp.ID, age, staleAfter))
+						staleRedispatch = true
+						// fall through (NOT continue/return) to record + spawn below.
+					case runnerLive:
+						// A process carrying this stage id IS alive yet never flipped
+						// 'running' — anomalous (a live process stuck past the prompt-fetch
+						// window). STOP and NEVER spawn: a second runner into the same lineage
+						// lock stays impossible by construction.
+						out.StoppedReason = stoppedDispatchedStale
+						out.Warnings = append(out.Warnings, fmt.Sprintf(
+							"stage %s (%s) has sat in 'dispatched' for %s, past the %s runner-liveness threshold, yet a host process matching this stage id IS live (pgrep -f on the stage id) and never fetched its prompt to flip it to 'running' — anomalous. Inspect the dispatch's log_path; do NOT re-dispatch while that process lives, because a second runner into the same lineage lock is the failure this driver exists to prevent.",
+							disp.Type, disp.ID, age, staleAfter))
+						// A LIVE process is confirmed present, so the manual verify-and-
+						// re-dispatch instruction MUST NOT survive here (it belongs only to
+						// the UNKNOWN/unprobeable branch): re-dispatching would spawn the very
+						// second runner this driver exists to prevent. Hand back an
+						// inspect-only next action instead.
+						out.NextActions = driveDecisionActions("dispatched_stale_live", runUUID, in.WorkingDir)
+						return nil, out, nil
+					default: // runnerUnknown
+						// pgrep absent / exit ≥2 / timeout / other exec error: we cannot
+						// confirm the runner dead, so DEGRADE to today's manual verify-first
+						// stop verbatim — never auto-spawn on an ambiguous probe.
+						out.StoppedReason = stoppedDispatchedStale
+						out.Warnings = append(out.Warnings, fmt.Sprintf(
+							"stage %s (%s) has sat in 'dispatched' for %s (newest spawn timestamp), past the %s runner-liveness threshold, and no prompt fetch flipped it to 'running' — the spawned runner never reached its prompt fetch (it died at or just after spawn). Before re-dispatching, FIRST verify no runner process is live on this host — check `pgrep -f fishhawk-runner` and the dispatch's log_path — because a second runner into the same lineage lock is the failure this driver exists to prevent. Only if none is live, re-dispatch by hand with fishhawk_dispatch_stage, then re-invoke fishhawk_drive_run.",
+							disp.Type, disp.ID, age, staleAfter))
+						out.NextActions = driveDecisionActions("dispatched_stale", runUUID, in.WorkingDir)
+						return nil, out, nil
+					}
+				} else {
+					// Anchor fresh (or the zero-value degrade): poll and re-evaluate the
+					// threshold next iteration. Deliberately NOT a one-shot spawned[] mark —
+					// leaving the stage dispatchable lets this guard re-trip once the
+					// threshold passes mid-invocation.
+					driveSleep(ctx, pollInterval)
+					continue
 				}
-				// Anchor fresh (or the zero-value degrade): poll and re-evaluate the
-				// threshold next iteration. Deliberately NOT a one-shot spawned[] mark —
-				// leaving the stage dispatchable lets this guard re-trip once the
-				// threshold passes mid-invocation.
-				driveSleep(ctx, pollInterval)
-				continue
 			}
 			note := ""
 			if priorRow {
@@ -481,6 +600,14 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 					recordName = "fixup_redispatch"
 					note = ""
 				}
+			}
+			if staleRedispatch {
+				// A dead-runner auto-recovery (#1955): mark the record-act note so the
+				// audit trail distinguishes this stale re-dispatch (after a negative
+				// liveness probe) from a plain dispatch or a crash-resume retry. Applied
+				// after the fixup-attribution block so recordName's fixup_redispatch vs
+				// implement classification is preserved while the note names the recovery.
+				note = staleRedispatchNote
 			}
 			// Acceptance-dispatch admission (#1928): before recording + spawning
 			// an acceptance dispatch, ask the backend to short-circuit an
@@ -570,9 +697,13 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 			}
 			spawned[disp.ID] = true
 			dispatchedCount[disp.ID]++
+			stepNote := "mechanical stage dispatch"
+			if staleRedispatch {
+				stepNote = "stale re-dispatch after a negative liveness probe (auto-recovery)"
+			}
 			out.StepsTaken = append(out.StepsTaken, DriveStep{
 				Kind: "dispatch", Stage: recordName, Delegated: false,
-				Note: "mechanical stage dispatch",
+				Note: stepNote,
 			})
 			driveSleep(ctx, pollInterval)
 			continue
@@ -682,6 +813,12 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 // autoDriveDispatchActionName is the record-act action the drive verb sends;
 // it mirrors the backend's autoDriveDispatchAction ("dispatch_stage").
 const autoDriveDispatchActionName = "dispatch_stage"
+
+// staleRedispatchNote is the RecordAutoDriveAct note the driver stamps on a
+// dead-runner auto-recovery (#1955): a 'dispatched' stage the driver did not
+// spawn, past the liveness threshold, whose host liveness probe found no runner
+// process, re-dispatched by falling through to the record+spawn path.
+const staleRedispatchNote = "stale re-dispatch: liveness probe found no runner process"
 
 // driveSleep waits for d or until ctx is cancelled.
 func driveSleep(ctx context.Context, d time.Duration) {
@@ -1057,13 +1194,26 @@ func driveDecisionActions(state string, runID uuid.UUID, workingDir string) *Nex
 			Consumes:     consumesNone,
 			Reason:       "the gate was handed to you; arbitrate, then re-invoke fishhawk_drive_run",
 		}}}
+	case state == "dispatched_stale_live":
+		// The driver's own probe found a LIVE process carrying the stage id, so
+		// the manual verify-and-re-dispatch instruction is deliberately WITHHELD
+		// here (it survives only on the UNKNOWN/unprobeable branch below): a
+		// re-dispatch while that process lives is the second-runner failure this
+		// driver exists to prevent. Point the operator at inspection only.
+		return &NextActions{State: state, Actions: []SuggestedAction{{
+			Action:       "fishhawk_get_run_status",
+			Params:       params,
+			Precondition: "the stage sat in 'dispatched' beyond the runner-liveness threshold and the driver's own liveness probe found a LIVE host process matching the stage id that never flipped 'running' — anomalous",
+			Consumes:     consumesNone,
+			Reason:       "inspect the dispatch's log_path; do NOT re-dispatch while that process lives, because a second runner into the same lineage lock is the failure this driver exists to prevent — once the process exits or you terminate it, re-invoke fishhawk_drive_run",
+		}}}
 	case state == "dispatched_stale":
 		return &NextActions{State: state, Actions: []SuggestedAction{{
 			Action:       "fishhawk_dispatch_stage",
 			Params:       params,
-			Precondition: "the stage has sat in 'dispatched' beyond the runner-liveness threshold with no runner observed",
+			Precondition: "the stage sat in 'dispatched' beyond the runner-liveness threshold and the driver's own liveness probe could NOT confirm the runner dead (pgrep unavailable / errored / timed out)",
 			Consumes:     consumesNone,
-			Reason:       "confirm no runner process is live, re-dispatch the stage by hand, then re-invoke fishhawk_drive_run",
+			Reason:       "verify by hand that no runner process is live (pgrep -f fishhawk-runner + the dispatch log_path); only if none is, re-dispatch the stage and re-invoke fishhawk_drive_run",
 		}}}
 	case strings.HasPrefix(state, "plan_"):
 		return &NextActions{State: state, Actions: []SuggestedAction{{

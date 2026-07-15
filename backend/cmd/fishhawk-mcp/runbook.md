@@ -183,10 +183,14 @@ resumable:
 - `decision_required:<state>` — an operator gate (a plan gate without
   `may_approve`, a split reviewer verdict, or a pending scope amendment).
 - `paged:<event>` — a paged disposition you arbitrate.
-- `dispatched_stale` — a previously-spawned runner looks dead. Since
-  [#1924](https://github.com/kuhlman-labs/fishhawk/issues/1924)/[#1927](https://github.com/kuhlman-labs/fishhawk/issues/1927)
-  this is a **real** signal, not a false alarm — but confirm no live runner
-  (`pgrep -f fishhawk-runner`) before re-dispatching by hand.
+- `dispatched_stale` — past the liveness threshold the driver **probes host
+  runner liveness itself** ([#1955](https://github.com/kuhlman-labs/fishhawk/issues/1955),
+  building on [#1924](https://github.com/kuhlman-labs/fishhawk/issues/1924)/[#1927](https://github.com/kuhlman-labs/fishhawk/issues/1927)):
+  a **dead** runner (no process matching the stage's `--stage-id`) is
+  **auto-recovered** — re-dispatched with **no operator action**. This stop now
+  fires **only when the probe is ambiguous** — a live-but-unregistered process,
+  or no `pgrep` on the host — and THAT is when you `pgrep -f fishhawk-runner`
+  (and read the dispatch `log_path`) by hand before re-dispatching.
 
 **Every stop is resumable by re-invoking with the SAME `run_id`.** `max_minutes`
 clamps to **[1,240]** (default **60**); a timeout is itself a resumable stop.
