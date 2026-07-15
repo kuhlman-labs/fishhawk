@@ -587,17 +587,68 @@ func TestConvergentConcerns(t *testing.T) {
 	advisory := &spec.ReviewersConfig{Agent: 2, Human: 1}
 	gating := &spec.ReviewersConfig{Agent: 1, Human: 0}
 	tests := []struct {
-		name       string
-		reviewers  *spec.ReviewersConfig // implement-stage reviewers; nil = default advisory
-		open       []*concern.Concern
-		audit      *fakeAudit
-		wantMet    bool
-		wantReason string
+		name        string
+		reviewers   *spec.ReviewersConfig // implement-stage reviewers; nil = default advisory
+		minSeverity string                // route_fixup_min_severity knob; "" = absent (default medium)
+		open        []*concern.Concern
+		audit       *fakeAudit
+		wantMet     bool
+		wantReason  string
 	}{
 		{
-			name:  "advisory met: verdicts in, no reject, one open concern",
+			name:  "advisory met: verdicts in, no reject, one medium concern at default threshold",
 			open:  []*concern.Concern{openConcern("medium")},
 			audit: settledWithConcerns, wantMet: true,
+		},
+		{
+			// #1964: the run-6ecc1090 shape — dual approve with a single
+			// low-severity concern parks at the default medium threshold
+			// instead of auto-routing a full fix-up pass.
+			name:       "unmet: dual approve + solo low concern parks at default medium threshold",
+			open:       []*concern.Concern{openConcern("low")},
+			audit:      settledWithConcerns,
+			wantReason: "below the route_fixup_min_severity threshold (medium)",
+		},
+		{
+			// route_fixup_min_severity: low restores the legacy
+			// route-on-any-concern behavior.
+			name:        "met: threshold low routes a solo low concern (legacy behavior)",
+			minSeverity: "low",
+			open:        []*concern.Concern{openConcern("low")},
+			audit:       settledWithConcerns, wantMet: true,
+		},
+		{
+			// A stricter threshold parks a concern the default would route.
+			name:        "unmet: threshold high parks a medium concern",
+			minSeverity: "high",
+			open:        []*concern.Concern{openConcern("medium")},
+			audit:       settledWithConcerns,
+			wantReason:  "below the route_fixup_min_severity threshold (high)",
+		},
+		{
+			// A reject verdict (advisory authority) BYPASSES the threshold:
+			// arbitration stays met even with only low concerns.
+			name:    "advisory met: reject bypasses the threshold with all-low concerns",
+			open:    []*concern.Concern{openConcern("low"), openConcern("low")},
+			audit:   rejectAudit,
+			wantMet: true,
+		},
+		{
+			// A concern with an unrecognized severity ranks below low
+			// (rank 0) and parks rather than spending a fix-up (fail-closed).
+			name:       "unmet: unrecognized concern severity parks at default threshold",
+			open:       []*concern.Concern{openConcern("cosmetic")},
+			audit:      settledWithConcerns,
+			wantReason: "below the route_fixup_min_severity threshold (medium)",
+		},
+		{
+			// An out-of-enum route_fixup_min_severity value (reachable only
+			// via campaign-override bytes) defaults defensively to medium,
+			// so a medium concern still routes.
+			name:        "met: out-of-enum threshold value defaults to medium",
+			minSeverity: "cosmetic",
+			open:        []*concern.Concern{openConcern("medium")},
+			audit:       settledWithConcerns, wantMet: true,
 		},
 		{
 			name:       "unmet: no review round",
@@ -652,7 +703,10 @@ func TestConvergentConcerns(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			wf := testWorkflow(&spec.OperatorAgent{MayRouteFixup: spec.ConditionConvergentConcerns}, nil)
+			wf := testWorkflow(&spec.OperatorAgent{
+				MayRouteFixup:         spec.ConditionConvergentConcerns,
+				RouteFixupMinSeverity: tt.minSeverity,
+			}, nil)
 			reviewers := advisory
 			if tt.reviewers != nil {
 				reviewers = tt.reviewers

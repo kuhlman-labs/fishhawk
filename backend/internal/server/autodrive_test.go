@@ -293,6 +293,70 @@ func TestAutoDriveRunGate_RouteFixup(t *testing.T) {
 	}
 }
 
+// TestAutoDriveRunGate_RouteFixupParksOnAllLow is the #1964 done-means
+// cross-layer assertion: a dual-approve implement round whose ONLY open
+// concern is low-severity parks at the default medium threshold instead of
+// spending a full fix-up pass. Observe-only, and ZERO stage_fixup_triggered
+// entries — the no-budget-spent proof, crossing the spec-parse ->
+// delegation-evaluate -> autodrive-dispatch seam.
+func TestAutoDriveRunGate_RouteFixupParksOnAllLow(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRun(t, s, repo)
+	plan, impl := stages[0], stages[1]
+	plan.State = run.StageStateSucceeded
+	impl.State = run.StageStateAwaitingApproval
+
+	// Dual approve (no reject) with a single LOW open concern -> below the
+	// default medium threshold, so convergent_concerns is UNMET.
+	seedReviewEntry(t, au, runID, 1, "implement_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	seedReviewEntry(t, au, runID, 2, "implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	seedReviewEntry(t, au, runID, 3, "implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	seedOpenConcern(t, cr, runID, impl.ID, concern.StageKindImplement, string(planreview.SeverityLow), "style", "minor nit")
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Acted || out.Paged {
+		t.Fatalf("outcome = %+v, want observe-only (all-low round parks)", out)
+	}
+	if n := countAudit(au, CategoryStageFixupTriggered); n != 0 {
+		t.Errorf("%d %s entries, want 0 (no fix-up budget spent on an all-low round)", n, CategoryStageFixupTriggered)
+	}
+}
+
+// TestAutoDriveRunGate_RouteFixupThresholdLowRoutes proves the knob threads
+// from campaign-override JSON through parseCampaignOverride's
+// DisallowUnknownFields decode into the evaluator: the SAME all-low state
+// that parks under the default auto-routes when the campaign override sets
+// route_fixup_min_severity: low.
+func TestAutoDriveRunGate_RouteFixupThresholdLowRoutes(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRun(t, s, repo)
+	plan, impl := stages[0], stages[1]
+	plan.State = run.StageStateSucceeded
+	impl.State = run.StageStateAwaitingApproval
+
+	seedReviewEntry(t, au, runID, 1, "implement_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	seedReviewEntry(t, au, runID, 2, "implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	seedReviewEntry(t, au, runID, 3, "implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	seedOpenConcern(t, cr, runID, impl.ID, concern.StageKindImplement, string(planreview.SeverityLow), "style", "minor nit")
+
+	override := []byte(`{"may_route_fixup":"convergent_concerns","route_fixup_min_severity":"low"}`)
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, override)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionRouteFixup {
+		t.Fatalf("outcome = %+v, want acted route_fixup (threshold low routes a low concern)", out)
+	}
+	e := auditEntry(t, au, CategoryStageFixupTriggered)
+	assertOperatorActor(t, e)
+	if rule := auditDelegatedRule(t, e); rule != "convergent_concerns" {
+		t.Errorf("delegated rule = %q, want convergent_concerns", rule)
+	}
+}
+
 // --- (c) may_retry(infra_flake) -> auto-retry -------------------------------
 
 func TestAutoDriveRunGate_Retry(t *testing.T) {

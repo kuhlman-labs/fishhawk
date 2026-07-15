@@ -1895,6 +1895,76 @@ workflows:
 	}
 }
 
+func TestParse_OperatorAgent_RouteFixupMinSeverity_RoundTrip(t *testing.T) {
+	// route_fixup_min_severity (#1964) round-trips into
+	// OperatorAgent.RouteFixupMinSeverity, and is accepted at both a 0.x
+	// and a 1.x version (additive-optional at every advertised version).
+	cases := []struct {
+		name     string
+		version  string
+		severity string
+	}{
+		{"v0.x accepts high", "0.5", "high"},
+		{"v1.x accepts low", "1.0", "low"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := spec.ParseBytes([]byte(`
+version: "` + tc.version + `"
+workflows:
+  feature_change:
+    operator_agent:
+      may_route_fixup: convergent_concerns
+      route_fixup_min_severity: ` + tc.severity + `
+    stages:
+      - id: x
+        type: plan
+        executor: { agent: claude-code }
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			wf := s.Workflows["feature_change"]
+			if wf.OperatorAgent == nil {
+				t.Fatal("OperatorAgent should be non-nil")
+			}
+			if wf.OperatorAgent.RouteFixupMinSeverity != tc.severity {
+				t.Errorf("RouteFixupMinSeverity = %q, want %q", wf.OperatorAgent.RouteFixupMinSeverity, tc.severity)
+			}
+		})
+	}
+}
+
+func TestParse_OperatorAgent_RouteFixupMinSeverity_UnknownValue_Rejected(t *testing.T) {
+	// route_fixup_min_severity is a closed low/medium/high enum; an
+	// out-of-enum value is refused at parse with a JSON Pointer into the
+	// offending field (#1964).
+	_, err := spec.ParseBytes([]byte(`
+version: "0.5"
+workflows:
+  feature_change:
+    operator_agent:
+      route_fixup_min_severity: cosmetic
+    stages:
+      - id: x
+        type: plan
+        executor: { agent: claude-code }
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+	if !strings.Contains(se.Path, "operator_agent/route_fixup_min_severity") {
+		t.Errorf("Path = %q, want a JSON Pointer into operator_agent/route_fixup_min_severity", se.Path)
+	}
+}
+
 func TestParse_OperatorAgent_ModelPolicy_Absent_Nil(t *testing.T) {
 	// An operator_agent block WITHOUT model_policy (#1421) parses with a
 	// nil ModelPolicy — the byte-identical-to-today absence posture. The

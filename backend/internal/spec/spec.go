@@ -255,7 +255,21 @@ type OperatorAgent struct {
 	MayWaive      DelegationCondition `json:"may_waive,omitempty" yaml:"may_waive,omitempty"`
 	MayRetry      DelegationCondition `json:"may_retry,omitempty" yaml:"may_retry,omitempty"`
 	MayMerge      DelegationCondition `json:"may_merge,omitempty" yaml:"may_merge,omitempty"`
-	MustPageHuman []string            `json:"must_page_human,omitempty" yaml:"must_page_human,omitempty"`
+	// RouteFixupMinSeverity is the minimum open-concern severity (low |
+	// medium | high) that satisfies may_route_fixup's convergent_concerns
+	// condition when EVERY implement-review verdict is approve-class
+	// (approve / approve_with_concerns) — the severity-aware tune (#1964).
+	// When at least one verdict is a reject the threshold is BYPASSED:
+	// advisory arbitration and the gating-reject page are unchanged. Absent
+	// defaults to medium; "low" restores the legacy route-on-any-concern
+	// behavior. No Go-side validation — the JSON schema enum enforces the
+	// closed set for spec-declared blocks, and the delegation evaluator
+	// treats an out-of-enum value (reachable only via campaign-override
+	// bytes, which bypass JSON-schema validation) defensively as medium.
+	// Inherited under the SAME wholesale-override semantics as the may_*
+	// knobs (campaign > gate > workflow, never merged across levels).
+	RouteFixupMinSeverity string   `json:"route_fixup_min_severity,omitempty" yaml:"route_fixup_min_severity,omitempty"`
+	MustPageHuman         []string `json:"must_page_human,omitempty" yaml:"must_page_human,omitempty"`
 	// ModelPolicy is the scenario-A operator-agent model-selection
 	// contract (#1421). It is part of the operator_agent block and so is
 	// inherited under the SAME wholesale-override semantics as the may_*
