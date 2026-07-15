@@ -135,8 +135,9 @@ curl -fSL "https://github.com/kuhlman-labs/fishhawk/releases/download/mcp/vX.Y.Z
   -o /usr/local/bin/fishhawk-mcp
 chmod +x /usr/local/bin/fishhawk-mcp
 export FISHHAWK_API_TOKEN="<token>"
-claude mcp add fishhawk --command /usr/local/bin/fishhawk-mcp \
-  --env FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN
+claude mcp add fishhawk \
+  -e FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN \
+  -- /usr/local/bin/fishhawk-mcp
 ```
 
 ## Surviving rebuilds (`fishhawk-mcp-shim`)
