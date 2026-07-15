@@ -32,7 +32,7 @@ type FileIssueInput struct {
 	Body            string              `json:"body,omitempty" jsonschema:"verbatim body; when omitted the body is assembled from the type's skeleton plus sections"`
 	Repo            string              `json:"repo,omitempty" jsonschema:"target repo as owner/name; falls back to GITHUB_REPOSITORY env when omitted"`
 	Sections        map[string]string   `json:"sections,omitempty" jsonschema:"per-skeleton-section content keyed by section name; used only when body is empty. Keys MUST match the type's body skeleton exactly — an off-skeleton key fails the filing with work_item_invalid (the content is never silently dropped)"`
-	TitleVars       map[string]string   `json:"title_vars,omitempty" jsonschema:"title placeholders beyond {summary}/{number} (e.g. epic, n); an unresolved placeholder fails the filing. For a child type whose title_format is [E{epic}.{n}], the {epic} placeholder is auto-derived from the parent_epic relation, so you need only supply {n}"`
+	TitleVars       map[string]string   `json:"title_vars,omitempty" jsonschema:"title placeholders beyond {summary}/{number} (e.g. epic, n); an unresolved placeholder fails the filing. For a child type whose title_format is [E{epic}.{n}], BOTH {epic} AND the {n} child number are auto-derived from the parent_epic relation server-side (#1958) — {epic} from the epic's [E<n>] title token and {n} as the next number after the epic's existing children (open and closed) — so title_vars can be omitted entirely. Supply {n} only to override the auto-derived child number"`
 	Labels          []string            `json:"labels,omitempty" jsonschema:"labels merged on top of the type's default_labels"`
 	Complexity      string              `json:"complexity,omitempty" jsonschema:"overrides the type's default complexity; must be a declared level (e.g. low, medium, high)"`
 	Status          string              `json:"status,omitempty" jsonschema:"overrides the type's default board status/column"`
@@ -80,9 +80,13 @@ dependency edge a campaign reads to assemble its wave DAG; its entries are
 issue references among the epic's children, validated for format at file time
 with cycle/existence checks deferred to campaign-assembly time). For a child
 type whose title_format is
-[E{epic}.{n}], the {epic} placeholder is auto-derived from the parent_epic
-relation, so title_vars need only supply {n}; a 422 work_item_invalid lists
-the still-missing placeholders in details.missing_placeholders.
+[E{epic}.{n}], BOTH {epic} AND the {n} child number are auto-derived from the
+parent_epic relation server-side (#1958): {epic} from the parent epic's [E<n>]
+title token and {n} as the next number after the epic's existing children
+(open and closed), so title_vars can be omitted entirely — supply {n} only to
+override the auto-derived child number. A 422 work_item_invalid lists any
+still-missing placeholders in details.missing_placeholders, and a failed
+child-number lookup fails closed with details.n_discovery_failed.
 
 For a numbered type (e.g. adr, epic) existing_numbers is OPTIONAL: the backend now
 discovers the numbers already in use server-side from the tracker (searching

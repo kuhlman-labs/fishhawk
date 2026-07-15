@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/google/uuid"
 )
 
@@ -159,5 +160,34 @@ func TestDeferConcern_FilingFailure_PropagatesAs502(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "work_item_filing_failed") {
 		t.Errorf("err = %v, want work_item_filing_failed", err)
+	}
+}
+
+// TestDeferConcern_SchemaNOptional is binding condition (2): the advertised
+// defer_concern jsonschema — the SAME jsonschema.For inference AddTool uses —
+// must no longer list 'n' as required, since the backend discovers it
+// server-side (#1958). concern_id and parent_epic stay required, guarding
+// against an over-broad omitempty demotion.
+func TestDeferConcern_SchemaNOptional(t *testing.T) {
+	schema, err := jsonschema.For[DeferConcernInput](nil)
+	if err != nil {
+		t.Fatalf("infer DeferConcernInput schema: %v", err)
+	}
+	for _, req := range schema.Required {
+		if req == "n" {
+			t.Errorf("advertised defer_concern schema still lists 'n' as required: %v", schema.Required)
+		}
+	}
+	var sawConcernID, sawParentEpic bool
+	for _, req := range schema.Required {
+		switch req {
+		case "concern_id":
+			sawConcernID = true
+		case "parent_epic":
+			sawParentEpic = true
+		}
+	}
+	if !sawConcernID || !sawParentEpic {
+		t.Errorf("concern_id and parent_epic must stay required: %v", schema.Required)
 	}
 }

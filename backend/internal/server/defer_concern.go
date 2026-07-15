@@ -41,17 +41,19 @@ const CategoryConcernDeferFailed = "concern_defer_failed"
 // deferConcernRequest is the JSON body of
 // POST /v0/concerns/{concern_id}/defer. The body is fully auto-drafted
 // from the persisted concern + its run; the operator supplies only the
-// non-derivable title coordinates (parent_epic + n) and optional
-// overrides, mirroring fishhawk_file_issue.
+// parent_epic placement and optional overrides, mirroring
+// fishhawk_file_issue.
 type deferConcernRequest struct {
 	// ParentEpic is the epic the follow-up rolls up to (an issue
 	// reference like "#1196"); its leading [E<n>] title token is fetched
 	// to derive the {epic} title placeholder. Not derivable from the
 	// concern — the follow-up's epic placement is an operator judgment.
 	ParentEpic string `json:"parent_epic,omitempty"`
-	// N is the child number for the [E<epic>.<n>] title format. Not
-	// derivable from the concern (operator judgment), mirroring how
-	// fishhawk_file_issue takes {n} as a caller TitleVar.
+	// N is the child number for the [E<epic>.<n>] title format. Optional:
+	// when omitted the backend discovers it server-side from the parent
+	// epic's existing children (open and closed) and allocates the next one
+	// (#1958), so the operator no longer has to guess it. A supplied value
+	// is an explicit override that short-circuits discovery.
 	N string `json:"n,omitempty"`
 	// Type overrides the auto-selected work-item type (bug for a defect
 	// category, else chore). Optional.
