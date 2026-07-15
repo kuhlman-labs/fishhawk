@@ -75,10 +75,17 @@ unnecessary.
   exactly as today. A hit returns `200 {short_circuited:true, kind, basis,
   criteria_total, stage}`. A non-acceptance stage is `422 validation_failed`; an
   unknown stage is `404`.
-- **MCP callers fail OPEN only on an admission-call error** (network/5xx →
-  warning + spawn as today); `short_circuited:false` never adds a warning. Tests:
+- **MCP callers fail OPEN only on a TRANSPORT error** (network/5xx → warning +
+  spawn as today); `short_circuited:false` never adds a warning. A **4xx
+  admission REJECTION** (401 / 403 `cross_run_admission` / 404 / 422) is NOT
+  fail-open — the verb HALTS with a tool error and spawns nothing, so a runner
+  never executes after the run-subject authorization boundary rejected the
+  request. On the 5xx fail-open path the verb ALSO re-checks the target stage
+  before spawning: a mid-walk 500 can leave the acceptance stage `running`, and
+  an observed non-dispatchable state halts rather than double-driving it. Tests:
   `acceptance_admission_test.go` (endpoint) + the orchestrator's
-  `TestTryShortCircuitAcceptance`.
+  `TestTryShortCircuitAcceptance` + the MCP `*_Acceptance*FailsClosed` /
+  `*_PostFetchFailure` cases.
 
 ## Run-branch operator-vouch remediation (ADR-035 / #1044)
 

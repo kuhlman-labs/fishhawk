@@ -417,7 +417,10 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	// warning. On a hit, compose the output from the settled stage and return
 	// without spawning.
 	if in.Stage == "acceptance" {
-		admission, warn := r.maybeShortCircuitAcceptance(ctx, stageUUID)
+		admission, warn, admitErr := r.maybeShortCircuitAcceptance(ctx, runUUID, stageUUID)
+		if admitErr != nil {
+			return nil, RunStageOutput{}, admitErr
+		}
 		if warn != "" {
 			warnings = append(warnings, warn)
 		}
@@ -692,21 +695,77 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 
 // maybeShortCircuitAcceptance calls the pre-spawn acceptance-admission endpoint
 // (#1928) for an acceptance stage before a host dispatch records spawn evidence
-// or spawns a runner. It returns the admission result on a 2xx and a non-empty
-// warning ONLY when the admission HTTP call itself errored (network / 5xx) — the
-// fail-OPEN signal the caller appends before proceeding to record+spawn as
-// today. Per the reconciliation binding condition, a short_circuited:false
-// result (a non-admissible stage state — already settled, mixed criteria, an
-// unconfigured orchestrator) is the NORMAL no-op path and carries NO warning: it
-// returns (res, "") and the caller records+spawns exactly as today. Only
-// admission.ShortCircuited == true means the caller skips the spawn.
-func (r *runResolver) maybeShortCircuitAcceptance(ctx context.Context, stageID uuid.UUID) (*AcceptanceAdmissionResult, string) {
+// or spawns a runner. On a 2xx it returns (res, "", nil) — a short_circuited:false
+// result (a non-admissible stage state: already settled, mixed criteria, an
+// unconfigured orchestrator) is the NORMAL no-op path and carries NO warning, so
+// the caller records+spawns exactly as today; only admission.ShortCircuited == true
+// means the caller skips the spawn.
+//
+// On an admission-call error the outcome depends on the failure class:
+//
+//   - A 4xx is the backend REJECTING the admission request itself — 401
+//     authentication_required, 403 insufficient_scope / cross_run_admission, 404
+//     stage_not_found, 422 (a non-acceptance stage). Failing OPEN past one would
+//     let the runner spawn (a repository command execution) AFTER the run-subject
+//     authorization boundary said no, defeating it. The reconciliation binding
+//     condition's fail-open signal is a TRANSPORT error (network / 5xx) ONLY, so a
+//     4xx returns a non-nil error and the caller HALTS, spawning nothing.
+//   - A network / 5xx transport error fails OPEN per the binding condition,
+//     returning the fail-open warning — but ONLY after re-checking that the target
+//     stage is still host-dispatchable: a mid-walk 500 can leave the acceptance
+//     stage in an intermediate non-dispatchable state ('running'), which the
+//     pre-admission sibling guard (already run) cannot re-observe. A positively
+//     observed non-dispatchable state returns a non-nil error (halt); an
+//     unreadable state degrades to the fail-open spawn.
+func (r *runResolver) maybeShortCircuitAcceptance(ctx context.Context, runID, stageID uuid.UUID) (*AcceptanceAdmissionResult, string, error) {
 	res, err := r.api.AcceptanceDispatchAdmission(ctx, stageID)
-	if err != nil {
-		return nil, fmt.Sprintf(
-			"acceptance-admission pre-check failed (%v); proceeding to spawn as usual (fail-open).", err)
+	if err == nil {
+		return res, "", nil
 	}
-	return res, ""
+	// 4xx → fail CLOSED: an authorization/validation rejection is not a fail-open
+	// condition (#1928 authz concern). apiClient.do returns *apiError with the
+	// status for every non-2xx; a network failure is a non-apiError wrapped error
+	// (treated as a transport error below).
+	var ae *apiError
+	if errors.As(err, &ae) && ae.StatusCode >= 400 && ae.StatusCode < 500 {
+		return nil, "", fmt.Errorf(
+			"acceptance-admission rejected the dispatch: %w; not spawning (an authorization/validation rejection is not a fail-open condition)", err)
+	}
+	// Network / 5xx → fail OPEN, but first re-check the target stage. A mid-walk
+	// 500 (TryShortCircuitAcceptance failing between the sequential transitions its
+	// short-circuit performs) can leave the acceptance stage at 'running'; nothing
+	// else re-checks the state the failed walk left behind before this fail-open
+	// spawn (#1928 untested-error-path concern). A positively observed
+	// non-dispatchable state halts; a fetch error can't PROVE a wedge, so it
+	// degrades to the fail-open spawn — the re-check only ever ADDS a halt on an
+	// observed bad state, never a new hard gate on a secondary read blip.
+	if state, ok := r.acceptanceStageState(ctx, runID, stageID); ok && state != "pending" && state != "dispatched" {
+		return nil, "", fmt.Errorf(
+			"acceptance-admission failed (%v) and left stage %s in state %q (no longer pending/dispatched); not spawning to avoid double-driving a partially-settled acceptance stage", err, stageID, state)
+	}
+	return nil, fmt.Sprintf(
+		"acceptance-admission pre-check failed (%v); proceeding to spawn as usual (fail-open).", err), nil
+}
+
+// acceptanceStageState re-reads the target stage's current state via a bounded
+// stage-list fetch, returning (state, true) when the stage is found and
+// ("", false) on a fetch error or an absent stage. It backs maybeShortCircuit-
+// Acceptance's fail-open re-check (#1928): a mid-walk admission 500 can leave the
+// stage in a non-dispatchable intermediate state, and this is how the fail-open
+// path observes that before spawning.
+func (r *runResolver) acceptanceStageState(ctx context.Context, runID, stageID uuid.UUID) (string, bool) {
+	fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	stages, err := r.api.ListRunStages(fetchCtx, runID)
+	if err != nil {
+		return "", false
+	}
+	for _, s := range stages {
+		if s.ID == stageID.String() {
+			return s.State, true
+		}
+	}
+	return "", false
 }
 
 // shortCircuitLabel renders a human label for a fired admission short-circuit:

@@ -226,11 +226,17 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	// all-skip-with-basis / empty-criteria / out-of-scope plan settles the stage
 	// server-side to a passed verdict with no preview, so spawning a runner would
 	// only fail category-C acceptance_target_unreachable — the #1928 parity gap.
-	// Fail OPEN: an admission-call error appends a warning and proceeds to
-	// record+spawn as today; a short_circuited:false result is the normal no-op
-	// and adds NO warning (the reconciliation binding condition).
+	// Fail OPEN on a TRANSPORT error (network / 5xx): append a warning and proceed
+	// to record+spawn as today; a short_circuited:false result is the normal no-op
+	// and adds NO warning (the reconciliation binding condition). A 4xx admission
+	// REJECTION (401/403 cross_run_admission / 404 / 422) is NOT a fail-open
+	// condition — it halts with a tool error so a runner never spawns after the
+	// backend rejected the request on authorization grounds (#1928).
 	if in.Stage == "acceptance" {
-		admission, warn := r.maybeShortCircuitAcceptance(ctx, stageUUID)
+		admission, warn, admitErr := r.maybeShortCircuitAcceptance(ctx, runUUID, stageUUID)
+		if admitErr != nil {
+			return nil, DispatchStageOutput{}, admitErr
+		}
 		if warn != "" {
 			warnings = append(warnings, warn)
 		}

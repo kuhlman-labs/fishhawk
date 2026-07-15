@@ -168,6 +168,12 @@ type fakeBackend struct {
 	admissionShortCircuit bool
 	admissionStatus       int
 	admissionCalledByID   map[uuid.UUID]int
+	// admissionLeavesRunning, when true, flips the target stage's State to
+	// "running" inside the admission route (before any error status is written) —
+	// modelling a mid-walk 500 whose partial TryShortCircuitAcceptance left the
+	// stage in a non-dispatchable intermediate state. The fail-open re-check then
+	// observes it and halts instead of spawning (#1928).
+	admissionLeavesRunning bool
 
 	// E22.X fixtures: POST /v0/stages/{id}/fixup (#762).
 	// fixupBody captures the last decoded request body so tests can
@@ -550,13 +556,21 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.admissionCalledByID[id]++
 		sc := fb.admissionShortCircuit
 		status := fb.admissionStatus
+		newState := ""
 		if sc {
 			// Reflect the server-side settle so a post-short-circuit stages read
 			// returns the succeeded stage.
+			newState = "succeeded"
+		} else if fb.admissionLeavesRunning {
+			// Model a mid-walk 500 that left the stage 'running' (#1928): the
+			// fail-open re-check must observe this and halt.
+			newState = "running"
+		}
+		if newState != "" {
 			for _, stages := range fb.stagesByRun {
 				for i := range stages {
 					if stages[i].ID == id.String() {
-						stages[i].State = "succeeded"
+						stages[i].State = newState
 					}
 				}
 			}

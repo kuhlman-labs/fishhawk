@@ -2504,3 +2504,43 @@ func TestDriveRun_AcceptanceAdmissionError_FailsOpen(t *testing.T) {
 		t.Errorf("missing the fail-open admission warning; warnings: %v", out.Warnings)
 	}
 }
+
+// TestDriveRun_AcceptanceAdmissionAuthzRejection_FailsClosed pins the #1928 authz
+// concern for the drive verb: a 4xx admission rejection (403 cross_run_admission)
+// is NOT fail-open — the drive HALTS with an error and spawns NO acceptance runner
+// rather than proceed after the run-subject authorization boundary rejected it.
+func TestDriveRun_AcceptanceAdmissionAuthzRejection_FailsClosed(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "succeeded", 1),
+		stg(driveAccID, "acceptance", "pending", 2),
+	})
+	f.admissionStatus = http.StatusForbidden
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		return AutoDriveOutcome{Note: "observe-only"}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, _, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err == nil {
+		t.Fatal("a 4xx admission rejection must halt the drive with an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "rejected the dispatch") {
+		t.Errorf("error = %q, want it to name the admission rejection", err)
+	}
+	for _, typ := range rec.list() {
+		if typ == "acceptance" {
+			t.Errorf("a fail-closed admission rejection must NOT spawn the acceptance runner; spawned: %v", rec.list())
+		}
+	}
+	f.mu.Lock()
+	acts := append([]RecordAutoDriveAct(nil), f.recordedActs...)
+	f.mu.Unlock()
+	for _, a := range acts {
+		if a.Stage == "acceptance" {
+			t.Errorf("a fail-closed admission rejection must record NO acceptance dispatch act; acts: %+v", acts)
+		}
+	}
+}
