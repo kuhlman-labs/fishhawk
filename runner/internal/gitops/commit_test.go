@@ -3088,14 +3088,19 @@ func TestAuthConfigEnv(t *testing.T) {
 // by an httptest.Server rooted at a bare repo; no network beyond httptest) and a
 // push that fails BY CONSTRUCTION (dumb HTTP is fetch-only), making the run an
 // ERROR exit path. The FreshFetchBase+ForceWithLease routing exercises BOTH the
-// base fetch AND observeRemoteHead's ls-remote against the recording server, so
-// the wire assertion covers each (binding condition 1). It asserts:
+// base fetch AND observeRemoteHead's ls-remote against the recording server, and
+// the recorder captures EVERY request's path + Authorization values so auth is
+// asserted PER call site — both the fetch's and the ls-remote's /info/refs GET
+// must authenticate — not merely in aggregate (binding condition 1). It asserts:
 //
-//   - (wire auth + stale reset) every authenticated request carried EXACTLY ONE
-//     Authorization header equal to the FRESH token's Basic value — with a stale
-//     persisted `http.<url>.extraheader` pre-planted, a duplicate would appear
-//     if the empty-value reset entry did not clear it (#199/#200), and a missing
-//     header would appear if the GIT_CONFIG_* env never reached git (git < 2.31);
+//   - (wire auth + stale reset) NO /info/refs request arrived unauthenticated and
+//     at least two did WITH auth (the fetch and the ls-remote each issue one), and
+//     every authenticated request carried EXACTLY ONE Authorization header equal to
+//     the FRESH token's Basic value — with a stale persisted
+//     `http.<url>.extraheader` pre-planted, a duplicate would appear if the
+//     empty-value reset entry did not clear it (#199/#200), a missing header if the
+//     GIT_CONFIG_* env never reached git (git < 2.31), and an unauthenticated
+//     /info/refs if authEnv were dropped from the fetch or the ls-remote call site;
 //   - (no persistence on an error exit) after CommitAndPush returns its push
 //     error, the config FILE carries only the pre-planted value (or nothing) —
 //     the run added no extraheader, so the #1933 pollution is impossible.
@@ -3144,17 +3149,23 @@ func TestCommitAndPush_DumbHTTP_NoHeaderPersistence_WireAuth(t *testing.T) {
 			mustGit(t, seed, "push", bare, "main")
 			mustGit(t, bare, "update-server-info")
 
-			// Recording dumb-HTTP server: capture the Authorization header
-			// values of every authenticated request, then serve static files.
+			// Recording dumb-HTTP server: capture EVERY request's path and its
+			// Authorization header values (not only the authenticated ones), then
+			// serve static files. Recording all requests is what lets the auth be
+			// asserted per call site — an UNauthenticated ls-remote /info/refs (the
+			// regression binding condition 1 targets) is invisible to an auth-only
+			// recorder.
 			var mu sync.Mutex
-			var authRequests [][]string
+			type recordedReq struct {
+				path string
+				auth []string
+			}
+			var requests []recordedReq
 			fileSrv := http.FileServer(http.Dir(bare))
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if vals := r.Header.Values("Authorization"); len(vals) > 0 {
-					mu.Lock()
-					authRequests = append(authRequests, vals)
-					mu.Unlock()
-				}
+				mu.Lock()
+				requests = append(requests, recordedReq{path: r.URL.Path, auth: r.Header.Values("Authorization")})
+				mu.Unlock()
 				fileSrv.ServeHTTP(w, r)
 			}))
 			defer srv.Close()
@@ -3207,22 +3218,54 @@ func TestCommitAndPush_DumbHTTP_NoHeaderPersistence_WireAuth(t *testing.T) {
 				t.Fatal("expected CommitAndPush to fail at the dumb-HTTP push (fetch-only)")
 			}
 
-			// (a) Wire auth: at least one authenticated request, and every one
-			// carried EXACTLY ONE Authorization header equal to the fresh token.
+			// (a) Wire auth. The FreshFetchBase fetch AND observeRemoteHead's
+			// ls-remote each issue a dumb-HTTP GET on /info/refs. Assert auth PER
+			// call site: no /info/refs arrived unauthenticated, and at least two did
+			// WITH auth (one for the fetch, one for the ls-remote). If a regression
+			// dropped authEnv from observeRemoteHead, its /info/refs would arrive
+			// unauthenticated while the fetch's stayed authenticated — green under
+			// an aggregate assertion, caught here (binding condition 1).
 			mu.Lock()
-			reqs := append([][]string(nil), authRequests...)
+			reqs := append([]recordedReq(nil), requests...)
 			mu.Unlock()
-			if len(reqs) == 0 {
-				t.Fatal("server received no authenticated requests — wire auth was not exercised")
-			}
-			for i, vals := range reqs {
-				if len(vals) != 1 {
-					t.Errorf("request %d carried %d Authorization headers %v, want exactly 1 (stale-header reset failed → duplicate)", i, len(vals), vals)
+			var infoRefsAuthed, infoRefsUnauthed int
+			for _, rq := range reqs {
+				if !strings.HasSuffix(rq.path, "/info/refs") {
 					continue
 				}
-				if vals[0] != wireAuth {
-					t.Errorf("request %d Authorization = %q, want fresh %q", i, vals[0], wireAuth)
+				if len(rq.auth) == 0 {
+					infoRefsUnauthed++
+				} else {
+					infoRefsAuthed++
 				}
+			}
+			if infoRefsUnauthed != 0 {
+				t.Errorf("saw %d UNauthenticated /info/refs request(s); the fetch and the ls-remote must each authenticate (authEnv dropped from a call site?)", infoRefsUnauthed)
+			}
+			if infoRefsAuthed < 2 {
+				t.Errorf("saw %d authenticated /info/refs request(s), want >= 2 (the FreshFetchBase fetch AND observeRemoteHead's ls-remote)", infoRefsAuthed)
+			}
+
+			// Every request that carried auth carried EXACTLY ONE Authorization
+			// header equal to the fresh token — a stale pre-planted header the
+			// empty-value reset entry failed to clear would show as a duplicate
+			// (#199/#200), a missing GIT_CONFIG_* env as none (git < 2.31).
+			var authed int
+			for i, rq := range reqs {
+				if len(rq.auth) == 0 {
+					continue
+				}
+				authed++
+				if len(rq.auth) != 1 {
+					t.Errorf("request %d (%s) carried %d Authorization headers %v, want exactly 1 (stale-header reset failed → duplicate)", i, rq.path, len(rq.auth), rq.auth)
+					continue
+				}
+				if rq.auth[0] != wireAuth {
+					t.Errorf("request %d (%s) Authorization = %q, want fresh %q", i, rq.path, rq.auth[0], wireAuth)
+				}
+			}
+			if authed == 0 {
+				t.Fatal("server received no authenticated requests — wire auth was not exercised")
 			}
 
 			// (b) No persistence on the error exit path: the config FILE carries
@@ -3387,6 +3430,85 @@ func TestCommitAndPush_PushEnvCarriesAuthConfig(t *testing.T) {
 	}
 }
 
+// TestCommitAndPush_RebaseFetchEnvCarriesAuthConfig asserts, at the Cmd recording
+// seam, that the RebaseFromRemote base fetch carries the process-scoped
+// GIT_CONFIG_* auth entries — the shared-branch decomposed-child fetch path
+// (#772/#1933). The dumb-HTTP wire test routes via FreshFetchBase, so without this
+// the RebaseFromRemote fetch's authEnv threading is asserted by no test at either
+// seam; a regression dropping env from that one call site would surface only in
+// production operator-checkout fetches. It uses an unreachable https RemoteURL so
+// the fetch is CONSTRUCTED (env set) then fails at connect; the env is captured on
+// the recorded *exec.Cmd, and the token is asserted absent from every git argv.
+func TestCommitAndPush_RebaseFetchEnvCarriesAuthConfig(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	const (
+		token    = "ghs-rebase-token-1933"
+		httpsURL = "https://127.0.0.1:1/kuhlman-labs/fishhawk.git"
+	)
+	repo := initRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "agent.txt"), []byte("agent edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var fetchCmd *exec.Cmd
+	var recorded [][]string
+	p := &Pusher{
+		Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			c := exec.CommandContext(ctx, name, args...)
+			recorded = append(recorded, append([]string{name}, args...))
+			if len(args) > 0 && args[0] == "fetch" {
+				fetchCmd = c
+			}
+			return c
+		},
+	}
+	_, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:          repo,
+		Branch:           "fishhawk/rebase/branch",
+		CommitMessage:    "agent change",
+		RemoteURL:        httpsURL,
+		PushToken:        token,
+		RebaseFromRemote: true,
+	})
+	if err == nil {
+		t.Fatal("expected the RebaseFromRemote fetch to the unreachable https remote to fail")
+	}
+	if fetchCmd == nil {
+		t.Fatal("RebaseFromRemote fetch command was never constructed")
+	}
+
+	host, err := pushHost(httpsURL)
+	if err != nil {
+		t.Fatalf("pushHost(%q): %v", httpsURL, err)
+	}
+	key := "http." + host + ".extraheader"
+	header := "AUTHORIZATION: basic " +
+		base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
+	wantEnv := []string{
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=" + key,
+		"GIT_CONFIG_VALUE_0=",
+		"GIT_CONFIG_KEY_1=" + key,
+		"GIT_CONFIG_VALUE_1=" + header,
+	}
+	if !envContainsAll(fetchCmd.Env, wantEnv) {
+		t.Errorf("RebaseFromRemote fetch cmd.Env missing auth entries;\nwant superset of %v\ngot %v", wantEnv, fetchCmd.Env)
+	}
+
+	// The token stays off argv even though it is threaded via env.
+	tokenB64 := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+	for _, inv := range recorded {
+		for _, a := range inv {
+			if strings.Contains(a, token) || strings.Contains(a, tokenB64) {
+				t.Errorf("token leaked onto git argv: %v", inv)
+			}
+		}
+	}
+}
+
 // gitConfigGetAll returns every local value of a git config key in config
 // order, or nil when the key is absent (`git config --get-all` exits 1 for a
 // missing key). The no-persistence assertions run it WITHOUT the GIT_CONFIG_*
@@ -3398,7 +3520,15 @@ func gitConfigGetAll(t *testing.T, dir, key string) []string {
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
-		return nil // exit 1 = key absent
+		// ONLY exit 1 is the documented "key absent" signal. Any other failure
+		// (bad cwd, corrupt config, git missing → non-1 exit or a non-ExitError)
+		// must fail loud, not degrade to "absent" and let the no-persistence
+		// assertions pass vacuously.
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return nil
+		}
+		t.Fatalf("git config --get-all %s: %v (stderr: %s)", key, err, gitConfigProbeStderr(err))
 	}
 	var vals []string
 	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
@@ -3419,7 +3549,13 @@ func gitConfigExtraheaders(t *testing.T, dir string) []string {
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
-		return nil // exit 1 = no match
+		// ONLY exit 1 is "no match". Any other failure must fail loud so the
+		// success-path no-persistence assertion cannot pass vacuously.
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return nil
+		}
+		t.Fatalf("git config --get-regexp extraheader: %v (stderr: %s)", err, gitConfigProbeStderr(err))
 	}
 	var lines []string
 	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
@@ -3428,6 +3564,18 @@ func gitConfigExtraheaders(t *testing.T, dir string) []string {
 		}
 	}
 	return lines
+}
+
+// gitConfigProbeStderr surfaces the captured stderr from a `git config` probe
+// that failed for a non-exit-1 reason, so the fail-loud message in the config
+// helpers names WHY the probe broke. cmd.Output() populates *exec.ExitError's
+// Stderr when the command's Stderr was left nil, which is the case here.
+func gitConfigProbeStderr(err error) string {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return strings.TrimSpace(string(exitErr.Stderr))
+	}
+	return ""
 }
 
 // envContainsAll reports whether env contains every entry in want.
