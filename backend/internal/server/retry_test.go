@@ -836,8 +836,8 @@ func TestRetryStage_Drive_LocalImplement_ParksWithNextAction(t *testing.T) {
 	if !adv.Parked {
 		t.Error("parked = false, want true (local runner cannot be backend-dispatched, ADR-024)")
 	}
-	if adv.To != "implement:pending" {
-		t.Errorf("to = %q, want implement:pending", adv.To)
+	if adv.To != "implement:awaiting_host_dispatch" {
+		t.Errorf("to = %q, want implement:awaiting_host_dispatch", adv.To)
 	}
 	if adv.NextAction == nil || adv.NextAction.Action != "run_implement_stage" {
 		t.Fatalf("next_action = %+v, want action run_implement_stage", adv.NextAction)
@@ -868,8 +868,8 @@ func TestRetryStage_Drive_LocalPlan_ParksWithNextAction(t *testing.T) {
 	if adv.Rule != drive.RuleRetryReopen {
 		t.Errorf("rule = %q, want retry_reopen", adv.Rule)
 	}
-	if !adv.Parked || adv.To != "plan:pending" {
-		t.Errorf("parked/to = %v/%q, want true/plan:pending", adv.Parked, adv.To)
+	if !adv.Parked || adv.To != "plan:awaiting_host_dispatch" {
+		t.Errorf("parked/to = %v/%q, want true/plan:awaiting_host_dispatch", adv.Parked, adv.To)
 	}
 	if adv.NextAction == nil || adv.NextAction.Action != "run_plan_stage" {
 		t.Fatalf("next_action = %+v, want action run_plan_stage", adv.NextAction)

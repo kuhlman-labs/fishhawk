@@ -359,11 +359,18 @@ func TestRunChildren_SpawnErrIsDataNoSiblingCancel(t *testing.T) {
 // the same parent. The single-call partition (pending vs in-flight vs terminal)
 // is covered by TestRunChildren_PartitionsPendingOnly; here we prove that the
 // MCP layer ITSELF tolerates concurrent invocations — neither call returns a
-// tool error and each independently observes the pending child and dispatches
-// it. A benign one-slot overshoot (both calls reading pending and both spawning)
-// is the documented, acceptable outcome at this layer; double-run is prevented
-// DOWNSTREAM by the runner's per-child lineage lock (run-<child>.lock), which is
-// covered by the runner-side lock tests, not here.
+// tool error and the pending child is dispatched (spawned) exactly as many
+// times as callers observed it pending.
+//
+// Post-#1912-fixup the per-child host-dispatch marker (fired at spawn time,
+// CAS-flipping the child's implement stage pending → dispatched) ELIMINATES the
+// old one-slot overshoot: run_children keys the spawn on the marker's
+// transitioned signal, so exactly ONE caller wins the CAS (transitioned:true →
+// spawns) and the other observes the idempotent no-op (transitioned:false → does
+// NOT spawn). Whether the loser reads the child AFTER the winner's marker (its
+// partition sees 'dispatched' and skips) or BEFORE (both partitions read
+// 'pending' but the loser's marker returns transitioned:false), combined
+// dispatch is exactly 1 and actual spawns equal it — no double-spawn.
 func TestRunChildren_ConcurrentInvocationsNoToolError(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
@@ -404,17 +411,104 @@ func TestRunChildren_ConcurrentInvocationsNoToolError(t *testing.T) {
 			t.Errorf("concurrent runChildren[%d] returned an error: %v", i, err)
 		}
 	}
-	// Each call independently saw the pending child and dispatched it. Both
-	// spawning is the acknowledged benign overshoot — the assertion is that the
-	// MCP layer never errors and never silently drops the dispatch, NOT that the
-	// two calls coordinate (that guard lives in the runner lineage lock).
+	// Each call dispatched 0 or 1 (a caller either won the host-dispatch marker
+	// CAS and spawned, or observed the idempotent no-op and skipped), and the
+	// combined total is EXACTLY 1 — the marker's transitioned signal makes the
+	// double-spawn impossible (#1912 fix-up). At least one caller must have
+	// dispatched it: the MCP layer never silently drops the dispatch.
+	combined := 0
 	for i, d := range dispatched {
-		if d != 1 {
-			t.Errorf("concurrent runChildren[%d] dispatched_count = %d, want 1", i, d)
+		if d < 0 || d > 1 {
+			t.Errorf("concurrent runChildren[%d] dispatched_count = %d, want 0 or 1", i, d)
+		}
+		combined += d
+	}
+	if combined != 1 {
+		t.Errorf("combined dispatched_count = %d, want exactly 1 (the marker's transitioned signal eliminates the double-spawn)", combined)
+	}
+	// Actual spawns equal the combined dispatched_count: the winning caller
+	// spawned exactly once, and the caller that observed the marker no-op spawned
+	// nothing — no double-spawn of a runner against the same child.
+	if got := int(atomic.LoadInt32(&spawns)); got != combined {
+		t.Errorf("total spawns = %d, want %d (== combined dispatched_count)", got, combined)
+	}
+}
+
+// --- fail-closed host-dispatch marker (#1912 fix-up; plan test c) ---
+
+// TestRunChildren_HostDispatchMarkerFails_NoSpawnStopsWave pins run_children's
+// fail-closed posture for the host-dispatch marker — the branch the low/
+// test-coverage concern flagged as untested here, analogous to the
+// run_stage/dispatch_stage/drive_run marker-4xx tests (fb.hostDispatchStatus).
+// When a child's marker 4xxes, that child spawns NO runner, is reported as NOT
+// dispatched with the fail-closed warning, and — because its empty Outcome trips
+// the partial-wave guard — the dependent next wave is never dispatched and
+// integrate-wave is never called.
+func TestRunChildren_HostDispatchMarkerFails_NoSpawnStopsWave(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child0, child1 := uuid.New(), uuid.New()
+	seedChildRun(fb, child0, "pending")
+	seedChildRun(fb, child1, "pending")
+	seedPlanDecomposedWaves(fb, parent, []string{child0.String(), child1.String()}, 0, [][]int{{0}, {1}})
+
+	fb.mu.Lock()
+	fb.hostDispatchStatus = http.StatusConflict // the marker 4xx -> fail closed
+	fb.mu.Unlock()
+
+	var spawns int32
+	withFakeSpawn(t, func(_ context.Context, _ string, _, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		atomic.AddInt32(&spawns, 1)
+		return completedEvents("ok"), nil, 0, nil
+	})
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	// A marker failure is DATA, never a tool error.
+	if err != nil {
+		t.Fatalf("runChildren returned an error for a marker 4xx (must be data): %v", err)
+	}
+	// Fail closed: NO runner spawned despite the child being partitioned pending.
+	if got := atomic.LoadInt32(&spawns); got != 0 {
+		t.Fatalf("spawned %d runners despite a failed host-dispatch marker; must fail closed", got)
+	}
+	// dispatched_count reflects ACTUAL spawns (zero), not the attempt.
+	if out.DispatchedCount != 0 {
+		t.Errorf("dispatched_count = %d, want 0 (a marker fail-closed spawns nothing)", out.DispatchedCount)
+	}
+	byID := map[string]ChildResult{}
+	for _, c := range out.Children {
+		byID[c.RunID] = c
+	}
+	// The wave-0 child is reported NOT dispatched, carrying the fail-closed warning.
+	c0 := byID[child0.String()]
+	if c0.Dispatched {
+		t.Errorf("wave-0 child marked dispatched despite the marker fail-closed: %+v", c0)
+	}
+	var sawWarn bool
+	for _, w := range c0.Warnings {
+		if strings.Contains(w, "host-dispatch marker failed") && strings.Contains(w, "NOT spawning") {
+			sawWarn = true
 		}
 	}
-	if got := atomic.LoadInt32(&spawns); got < 1 {
-		t.Errorf("total spawns = %d, want >= 1", got)
+	if !sawWarn {
+		t.Errorf("wave-0 child warnings = %v, want one carrying the fail-closed marker message", c0.Warnings)
+	}
+	// The partial-wave guard tripped: wave 1 never dispatched, no integrate-wave.
+	if c1 := byID[child1.String()]; c1.Dispatched {
+		t.Errorf("wave-1 child dispatched despite the wave-0 marker failure; the partial-wave guard did not stop the loop")
+	}
+	fb.mu.Lock()
+	calls := fb.integrateWaveCalledBy[parent]
+	fb.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("integrate-wave calls = %d, want 0 (no integration after a fail-closed wave)", calls)
+	}
+	if !containsWarning(out.Warnings, "did not succeed") {
+		t.Errorf("warnings = %v, want one mentioning the failed wave", out.Warnings)
 	}
 }
 
@@ -500,7 +594,8 @@ func TestImplementStageDispatchable(t *testing.T) {
 		want  bool
 	}{
 		{"pending", true},
-		{"dispatched", true},
+		{"awaiting_host_dispatch", true}, // #1912: the new host-spawnable park
+		{"dispatched", false},            // #1912: a spawn attempt exists — in-flight, not re-dispatchable
 		{"running", false},
 		{"awaiting_approval", false},
 		{"succeeded", false},
@@ -517,23 +612,26 @@ func TestImplementStageDispatchable(t *testing.T) {
 
 // TestRunChildren_LocalParkedChildrenDispatch is the behavioral done-means
 // test for #1237: a decomposed parent whose children are at RUN state 'running'
-// but implement STAGE state pending/dispatched (the RuleChildrenDispatch-parked
-// shape from run 9b4e5654) must dispatch BOTH. Under the old run-state
+// but implement STAGE state pending/awaiting_host_dispatch (the
+// RuleChildrenDispatch-parked shape) must dispatch BOTH. Under the old run-state
 // predicate this dispatched ZERO (run=='running' classified as in-flight); it
-// passes only with the stage-state fix. A third child that is GENUINELY
-// executing (implement stage 'running') is still skipped as in-flight.
+// passes only with the stage-state fix. Post-#1912 a 'dispatched' child (a spawn
+// attempt EXISTS — a runner is in flight) is now SKIPPED as in-flight, and a
+// GENUINELY executing (implement stage 'running') child is likewise skipped.
 func TestRunChildren_LocalParkedChildrenDispatch(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
 
 	parent := uuid.New()
-	dispatchedID := uuid.New() // run='running', stage='dispatched' => dispatch
-	pendingID := uuid.New()    // run='running', stage='pending'    => dispatch
-	executingID := uuid.New()  // run='running', stage='running'    => skip
-	seedChildRunStage(fb, dispatchedID, "running", "dispatched")
+	awaitingID := uuid.New()   // run='running', stage='awaiting_host_dispatch' => dispatch
+	pendingID := uuid.New()    // run='running', stage='pending'                 => dispatch
+	dispatchedID := uuid.New() // run='running', stage='dispatched'              => skip (in-flight, #1912)
+	executingID := uuid.New()  // run='running', stage='running'                 => skip
+	seedChildRunStage(fb, awaitingID, "running", "awaiting_host_dispatch")
 	seedChildRunStage(fb, pendingID, "running", "pending")
+	seedChildRunStage(fb, dispatchedID, "running", "dispatched")
 	seedChildRunStage(fb, executingID, "running", "running")
-	seedPlanDecomposed(fb, parent, []string{dispatchedID.String(), pendingID.String(), executingID.String()}, 0)
+	seedPlanDecomposed(fb, parent, []string{awaitingID.String(), pendingID.String(), dispatchedID.String(), executingID.String()}, 0)
 
 	var argvSeen []string
 	var mu sync.Mutex
@@ -551,7 +649,7 @@ func TestRunChildren_LocalParkedChildrenDispatch(t *testing.T) {
 		t.Fatalf("runChildren: %v", err)
 	}
 	if out.DispatchedCount != 2 {
-		t.Fatalf("dispatched_count = %d, want 2 (the run='running' + stage=pending/dispatched children)", out.DispatchedCount)
+		t.Fatalf("dispatched_count = %d, want 2 (the run='running' + stage=pending/awaiting_host_dispatch children)", out.DispatchedCount)
 	}
 	mu.Lock()
 	if len(argvSeen) != 2 {
@@ -568,11 +666,16 @@ func TestRunChildren_LocalParkedChildrenDispatch(t *testing.T) {
 	for _, c := range out.Children {
 		byID[c.RunID] = c
 	}
-	if c := byID[dispatchedID.String()]; !c.Dispatched {
-		t.Errorf("stage='dispatched' child not dispatched: %+v", c)
+	if c := byID[awaitingID.String()]; !c.Dispatched {
+		t.Errorf("stage='awaiting_host_dispatch' child not dispatched: %+v", c)
 	}
 	if c := byID[pendingID.String()]; !c.Dispatched {
 		t.Errorf("stage='pending' child not dispatched: %+v", c)
+	}
+	// The 'dispatched' child (a spawn attempt exists, #1912) is in-flight: not
+	// re-spawned, and its stage_state reported as the stage state.
+	if c := byID[dispatchedID.String()]; c.Dispatched || c.StageState != "dispatched" {
+		t.Errorf("dispatched child = %+v, want not dispatched + stage_state dispatched", c)
 	}
 	// The genuinely-executing child (implement stage 'running') is in-flight:
 	// not re-spawned, and its stage_state reported as the stage state.
@@ -1141,6 +1244,12 @@ func TestRunChildren_CrossBoundary_SpawnsRealRunners(t *testing.T) {
 			},
 		}}})
 	})
+	// MCP host-dispatch marker (#1912): the real run_children marks each child's
+	// host spawn and spawns ONLY on transitioned:true, so the marker must report
+	// it won the CAS or the real runner is (correctly) never spawned.
+	mux.HandleFunc("POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, HostDispatchResult{Transitioned: true, StageState: "dispatched"})
+	})
 	// Permissive fallback for any other runner call (best-effort surfaces).
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{})
@@ -1343,6 +1452,12 @@ func TestRunChildren_CrossBoundary_TwoWaveStopsOnRealChildFailure(t *testing.T) 
 	mux.HandleFunc("POST /v0/runs/{run_id}/integrate-wave", func(w http.ResponseWriter, r *http.Request) {
 		integrateWaveCalls.Add(1)
 		writeJSON(w, http.StatusOK, IntegrateWaveResult{RunID: r.PathValue("run_id"), Outcome: "integrated"})
+	})
+	// MCP host-dispatch marker (#1912): the real run_children marks each child's
+	// host spawn and spawns ONLY on transitioned:true, so the marker must report
+	// it won the CAS or the real runner is (correctly) never spawned.
+	mux.HandleFunc("POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, HostDispatchResult{Transitioned: true, StageState: "dispatched"})
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{})

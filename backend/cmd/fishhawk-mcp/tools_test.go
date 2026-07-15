@@ -175,6 +175,18 @@ type fakeBackend struct {
 	// observes it and halts instead of spawning (#1928).
 	admissionLeavesRunning bool
 
+	// #1912 fixtures: POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch.
+	// hostDispatchStatus (0 -> 200) drives the fail-closed error branch a
+	// run_stage/dispatch_stage marker call hits; hostDispatchErrBody, when set, is
+	// written verbatim on the error status. On a 200 the route flips the matching
+	// seeded stage pending|awaiting_host_dispatch -> dispatched (transitioned:true)
+	// or reports the idempotent no-op (transitioned:false) for an already-dispatched
+	// stage. hostDispatchCalledByID counts marker POSTs per stage id so tests can
+	// assert the marker fired exactly once before a spawn.
+	hostDispatchStatus     int
+	hostDispatchErrBody    string
+	hostDispatchCalledByID map[uuid.UUID]int
+
 	// E22.X fixtures: POST /v0/stages/{id}/fixup (#762).
 	// fixupBody captures the last decoded request body so tests can
 	// assert the selected concern indices + reason threading.
@@ -418,6 +430,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		retryStatus:                   http.StatusOK,
 		retryCalledByID:               map[uuid.UUID]int{},
 		admissionCalledByID:           map[uuid.UUID]int{},
+		hostDispatchCalledByID:        map[uuid.UUID]int{},
 		fixupResp:                     map[uuid.UUID]Stage{},
 		fixupStatus:                   http.StatusOK,
 		fixupCalledByID:               map[uuid.UUID]int{},
@@ -589,6 +602,47 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 			res.Stage = &Stage{ID: id.String(), Type: "acceptance", State: "succeeded"}
 		}
 		_ = json.NewEncoder(w).Encode(res)
+	})
+	mux.HandleFunc("POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("stage_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		fb.hostDispatchCalledByID[id]++
+		status := fb.hostDispatchStatus
+		errBody := fb.hostDispatchErrBody
+		// Model the CAS marker: flip a seeded pending|awaiting_host_dispatch stage
+		// to dispatched (transitioned:true); an already-dispatched stage is the
+		// idempotent no-op (transitioned:false). The resulting state is echoed back.
+		transitioned := false
+		state := "dispatched"
+		for _, stages := range fb.stagesByRun {
+			for i := range stages {
+				if stages[i].ID != id.String() {
+					continue
+				}
+				switch stages[i].State {
+				case "pending", "awaiting_host_dispatch":
+					stages[i].State = "dispatched"
+					transitioned = true
+				}
+				state = stages[i].State
+			}
+		}
+		fb.mu.Unlock()
+		if status != 0 && status != http.StatusOK {
+			w.WriteHeader(status)
+			if errBody != "" {
+				_, _ = w.Write([]byte(errBody))
+			} else {
+				_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"host-dispatch boom"}}`))
+			}
+			return
+		}
+		_ = json.NewEncoder(w).Encode(HostDispatchResult{Transitioned: transitioned, StageState: state})
 	})
 	mux.HandleFunc("POST /v0/stages/{stage_id}/fixup", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1074,7 +1128,14 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.mu.Lock()
 		fb.stagesCalledByID[id]++
 		callNum := fb.stagesCalledByID[id]
-		items := fb.stagesByRun[id]
+		// Snapshot the stage VALUES under the lock (not just the slice header):
+		// the host-dispatch handler mutates stages[i].State in place on this same
+		// backing array, so encoding the shared slice after unlocking would race
+		// (#1912 fix-up made run_children fire concurrent host-dispatch markers
+		// against these stages).
+		src := fb.stagesByRun[id]
+		items := make([]Stage, len(src))
+		copy(items, src)
 		status := fb.stagesStatus
 		if fb.stagesFailOnCall > 0 && callNum == fb.stagesFailOnCall {
 			status = http.StatusInternalServerError

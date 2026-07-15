@@ -67,6 +67,17 @@ func ValidRunRetryTransition(from, to State) bool {
 // stageTransitions enumerates allowed Stage state transitions.
 //
 // Pending → Dispatched: backend has emitted workflow_dispatch.
+// Pending → AwaitingHostDispatch: a runner_kind-locked-local agent stage
+//
+//	parks — the backend wants it executed but the runner is host-spawned per
+//	ADR-024 and no spawn attempt exists yet (#1912). Written in exactly one
+//	place (orchestrator.dispatchStage, a sibling slice).
+//
+// AwaitingHostDispatch → Dispatched: the host spawn was marked (the
+//
+//	host-dispatch endpoint CAS, a sibling slice) — a spawn attempt now exists.
+//
+// AwaitingHostDispatch → Cancelled: run cancel halts the parked stage.
 // Dispatched → Running: runner checked in and started executing.
 // Dispatched → Failed: runner never started (category C).
 // Running → AwaitingApproval: gate evaluation produced a blocking gate.
@@ -138,10 +149,15 @@ func ValidRunRetryTransition(from, to State) bool {
 var stageTransitions = map[StageState]map[StageState]struct{}{
 	StageStatePending: {
 		StageStateDispatched:             {},
+		StageStateAwaitingHostDispatch:   {}, // runner_kind-locked-local agent stage parks for a host spawn (#1912)
 		StageStateCancelled:              {},
 		StageStateFailed:                 {},
 		StageStateAwaitingChildren:       {},
 		StageStateAwaitingDeployApproval: {}, // deploy stage parks pre-execution (ADR-038 / #1384)
+	},
+	StageStateAwaitingHostDispatch: {
+		StageStateDispatched: {}, // the host spawn was marked — a spawn attempt now exists (#1912)
+		StageStateCancelled:  {}, // run cancel halts the parked stage
 	},
 	StageStateDispatched: {
 		StageStateRunning:   {},

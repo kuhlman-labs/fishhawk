@@ -23,10 +23,11 @@ var ErrStageParked = errors.New("stage is parked awaiting children")
 // in, so call sites never need to think about whether they're
 // failing from running, awaiting_approval, dispatched, or pending:
 //
-//	pending           → failed
-//	dispatched        → running → failed   (e.g. agent never reported)
-//	running           → failed             (e.g. policy violation post-trace)
-//	awaiting_approval → failed             (e.g. SLA elapsed, gate rejected)
+//	pending                → failed
+//	awaiting_host_dispatch → dispatched → running → failed   (parked local spawn abandoned, #1912)
+//	dispatched             → running → failed   (e.g. agent never reported)
+//	running                → failed             (e.g. policy violation post-trace)
+//	awaiting_approval      → failed             (e.g. SLA elapsed, gate rejected)
 //
 // Park refusal: FailStage REFUSES an awaiting_children stage up-front,
 // returning ErrStageParked without attempting any transition. A fan-in
@@ -113,10 +114,16 @@ func FailStage(
 		return failStageCAS(ctx, cas, stageID, stage.State, cat, reason)
 	}
 
-	// Non-CAS fallback: dispatched stages must walk through Running first;
-	// the state machine forbids dispatched → failed without it (see
+	// Non-CAS fallback: a parked awaiting_host_dispatch stage must first step
+	// to dispatched (#1912), and dispatched stages must then walk through
+	// Running; the state machine forbids skipping either edge (see
 	// transition.go). Single-step otherwise.
-	if stage.State == StageStateDispatched {
+	if stage.State == StageStateAwaitingHostDispatch {
+		if _, err := repo.TransitionStage(ctx, stageID, StageStateDispatched, nil); err != nil {
+			return nil, fmt.Errorf("FailStage: awaiting_host_dispatch → dispatched: %w", err)
+		}
+	}
+	if stage.State == StageStateAwaitingHostDispatch || stage.State == StageStateDispatched {
 		if _, err := repo.TransitionStage(ctx, stageID, StageStateRunning, nil); err != nil {
 			return nil, fmt.Errorf("FailStage: dispatched → running: %w", err)
 		}
@@ -143,9 +150,10 @@ const failStageCASMaxAttempts = 4
 // failStageCAS drives the FailStage walk through the compare-and-swap
 // capability inside a bounded RE-ANCHOR loop (see FailStage's concurrency
 // contract). Each attempt walks the canonical path from the anchored
-// from-state: the dispatched → running step anchors to dispatched, then the
-// final → failed step anchors to the running state that step produced (or,
-// when the walk is skipped, to the state anchored at loop entry).
+// from-state: the awaiting_host_dispatch → dispatched step (#1912) anchors to
+// awaiting_host_dispatch, the dispatched → running step anchors to dispatched,
+// then the final → failed step anchors to the running state that step produced
+// (or, when the walk is skipped, to the state anchored at loop entry).
 //
 // When a CAS step refuses with StageStateChangedError, reanchorTarget
 // classifies the row-locked Actual state:
@@ -174,6 +182,17 @@ func failStageCAS(
 	reason2 := reason
 	var lastErr error
 	for attempt := 0; attempt < failStageCASMaxAttempts; attempt++ {
+		if from == StageStateAwaitingHostDispatch {
+			dispatched, err := cas.TransitionStageFrom(ctx, stageID, StageStateAwaitingHostDispatch, StageStateDispatched, nil)
+			if err != nil {
+				if next, ok := reanchorTarget(err); ok {
+					from, lastErr = next, err
+					continue
+				}
+				return nil, fmt.Errorf("FailStage: awaiting_host_dispatch → dispatched: %w", err)
+			}
+			from = dispatched.State
+		}
 		if from == StageStateDispatched {
 			running, err := cas.TransitionStageFrom(ctx, stageID, StageStateDispatched, StageStateRunning, nil)
 			if err != nil {

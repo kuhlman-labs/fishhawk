@@ -110,6 +110,37 @@ func seedStages(fb *fakeBackend, runID uuid.UUID, stages ...Stage) {
 	fb.stagesByRun[runID] = stages
 }
 
+// TestRunStage_HostDispatchMarkerFails_NoSpawn pins the #1912 fail-closed
+// contract (plan test c): when the host-dispatch marker call 4xxes, blocking
+// fishhawk_run_stage returns a tool error and spawns NO runner.
+func TestRunStage_HostDispatchMarkerFails_NoSpawn(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	calls := captureAllArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "awaiting_host_dispatch")
+	fb.hostDispatchStatus = http.StatusConflict // the marker 4xx -> fail closed
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	})
+	if err == nil {
+		t.Fatal("expected a fail-closed error when the host-dispatch marker 4xxes")
+	}
+	if !strings.Contains(err.Error(), "host-dispatch marker") || !strings.Contains(err.Error(), "NOT spawning") {
+		t.Errorf("error should name the fail-closed marker; got %v", err)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("runner spawned despite a failed host-dispatch marker: %v (must fail closed)", *calls)
+	}
+	if n := fb.hostDispatchCalledByID[stageID]; n != 1 {
+		t.Errorf("host-dispatch marker called %d times, want 1 (attempted once, then fail-closed)", n)
+	}
+}
+
 // --- input validation ---
 
 // TestRunStage_RequiresRunWorkflowStage asserts the three remaining

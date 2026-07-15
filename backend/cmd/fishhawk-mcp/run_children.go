@@ -58,14 +58,17 @@ type RunChildrenInput struct {
 }
 
 // ChildResult is one decomposed child's consolidated dispatch outcome.
-// Dispatched is false for a child that was NOT spawned this call (it was
-// already in-flight or terminal when discovered — re-invocation is idempotent),
-// in which case ExitCode/Outcome are zero and StageState reflects the state read
-// at discovery.
+// Dispatched is false for a child that was NOT spawned this call — it was
+// already in-flight or terminal when discovered (re-invocation is idempotent),
+// the host-dispatch marker failed closed, or the marker was a
+// concurrent-invocation no-op (another caller already marked it) — in which case
+// ExitCode/Outcome are zero and StageState reflects the state read at discovery
+// (or echoed by the marker). dispatched_count counts only Dispatched:true
+// children, so it never overstates the runners this call actually spawned.
 type ChildResult struct {
 	RunID      string   `json:"run_id"`
 	StageID    string   `json:"stage_id,omitempty"`
-	Dispatched bool     `json:"dispatched" jsonschema:"true when this call spawned the child's implement stage; false when it was already in-flight or terminal at discovery and left untouched"`
+	Dispatched bool     `json:"dispatched" jsonschema:"true when this call spawned the child's implement stage; false when no runner was spawned this call — it was already in-flight/terminal at discovery, the host-dispatch marker failed closed, or the marker was a concurrent-invocation no-op"`
 	ExitCode   int      `json:"exit_code,omitempty" jsonschema:"the child runner's process exit code; meaningful only when dispatched"`
 	Outcome    string   `json:"outcome,omitempty" jsonschema:"terminal runner outcome (ok | failed) from the child's runner_completed event"`
 	StageState string   `json:"stage_state,omitempty" jsonschema:"the child implement stage's state, fetched best-effort after the runner exits (or read at discovery for a non-dispatched child)"`
@@ -125,27 +128,31 @@ type childDispatch struct {
 	runID   string
 	stageID string
 	// state is the implement STAGE state read at discovery (pending |
-	// dispatched | running | terminal), surfaced to the caller as stage_state.
+	// awaiting_host_dispatch | dispatched | running | terminal), surfaced to the
+	// caller as stage_state.
 	state string
-	// pending is true when the stage was dispatchable (pending|dispatched) at
-	// discovery — i.e. awaiting a host spawn, so this call dispatches it.
+	// pending is true when the stage was dispatchable (pending|awaiting_host_dispatch)
+	// at discovery — i.e. awaiting a host spawn, so this call dispatches it.
 	pending    bool
 	stateKnown bool
 }
 
 // implementStageDispatchable reports whether an implement stage in the given
 // state is awaiting a host-side runner spawn and so should be dispatched by
-// fishhawk_run_children. Only {pending, dispatched} qualify: a local decomposed
-// child parked by RuleChildrenDispatch (#1143) has its RUN advanced to
-// 'running' but its implement STAGE left at pending/dispatched for host
-// dispatch, so keying on the run state skipped every such child as in-flight
-// (#1237). running / terminal stages are genuinely executing or done and are
-// left untouched. This mirrors the next_actions implement_pending arm
-// (next_actions.go:277, which routes pending|dispatched to dispatch-or-poll);
-// raw string literals match that file's convention (the mcp package does not
-// import the run.StageState* constants).
+// fishhawk_run_children. Only {pending, awaiting_host_dispatch} qualify (#1912):
+// a local decomposed child parked by RuleChildrenDispatch (#1143) has its RUN
+// advanced to 'running' but its implement STAGE left at
+// pending/awaiting_host_dispatch for a host dispatch, so keying on the run state
+// skipped every such child as in-flight (#1237). Post-#1912 'dispatched' means a
+// spawn attempt EXISTS — a runner is in flight — so a 'dispatched' child is
+// deliberately NOT dispatchable here: re-spawning would double-drive it. running
+// / terminal stages are likewise genuinely executing or done and left untouched.
+// This mirrors the next_actions implement_pending arm (which routes
+// pending|awaiting_host_dispatch to dispatch and bare dispatched to poll); raw
+// string literals match that file's convention (the mcp package does not import
+// the run.StageState* constants).
 func implementStageDispatchable(state string) bool {
-	return state == "pending" || state == "dispatched"
+	return state == "pending" || state == "awaiting_host_dispatch"
 }
 
 // runChildren is the tool handler.
@@ -204,12 +211,13 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 	}
 
 	// (b) Partition children by their freshly-read IMPLEMENT STAGE state:
-	// dispatch only the stages awaiting a host spawn (pending|dispatched);
-	// report in-flight (running) and terminal children as-is. Keying on the
-	// stage state — not the run state — is what makes a local decomposed child
-	// (run='running', stage=pending/dispatched after RuleChildrenDispatch)
-	// dispatchable here (#1237). Reading state fresh per call (not from the
-	// audit snapshot) is what makes re-invocation idempotent.
+	// dispatch only the stages awaiting a host spawn (pending|awaiting_host_dispatch);
+	// report in-flight (dispatched|running) and terminal children as-is. Keying on
+	// the stage state — not the run state — is what makes a local decomposed child
+	// (run='running', stage=pending/awaiting_host_dispatch after RuleChildrenDispatch)
+	// dispatchable here (#1237); a 'dispatched' child already has a runner in flight
+	// (#1912). Reading state fresh per call (not from the audit snapshot) is what
+	// makes re-invocation idempotent.
 	dispatches := make([]childDispatch, 0, len(pd.ChildRunIDs))
 	for _, childID := range pd.ChildRunIDs {
 		d := childDispatch{runID: childID}
@@ -269,7 +277,6 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 		mu         sync.Mutex
 		dispatched = map[string]*ChildResult{}
 	)
-	dispatchedCount := 0
 	currentBase := baseBranch
 
 	for wi, wave := range waves {
@@ -301,10 +308,68 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 				continue
 			}
 			d := d
-			dispatchedCount++
+			// waveDispatchedIDs records every child this wave ATTEMPTS to spawn
+			// (the partial-wave guard keys on these); dispatched_count is derived
+			// from the ACTUAL Dispatched:true results at assembly time, so a
+			// marker fail-closed / concurrent no-op that spawns nothing is counted
+			// as an attempt for the guard but NOT as a spawn in dispatched_count.
 			waveDispatchedIDs = append(waveDispatchedIDs, d.runID)
 			waveBase := currentBase
 			g.Go(func() error {
+				// (#1912 fix-up) Mark the host spawn BEFORE spawning, exactly as
+				// fishhawk_run_stage / fishhawk_dispatch_stage do: the endpoint
+				// CAS-flips {pending, awaiting_host_dispatch} → dispatched so
+				// 'dispatched' unambiguously means a spawn attempt exists at spawn
+				// time. UNLIKE the single-stage verbs, run_children keys the spawn
+				// on the marker's transitioned signal: only transitioned:true (THIS
+				// call won the CAS) proceeds to spawn. transitioned:false is the
+				// endpoint's idempotent already-'dispatched' no-op — a concurrent
+				// run_children / drive_run invocation already marked this child, so a
+				// runner is ALREADY in flight and spawning here would be the #1912
+				// double-spawn; skip it. FAIL CLOSED on any marker error: a transport
+				// error or 4xx means NO spawn (an unmarked spawn would recreate the
+				// ambiguity #1912 removes). Every no-spawn path records the child as
+				// Dispatched:false with an explanatory warning — NEVER Dispatched:true
+				// — so dispatched_count and the child's dispatched flag count ACTUAL
+				// spawns, not attempts. The empty Outcome still trips the partial-wave
+				// guard below (which stops before integrating or dispatching a
+				// dependent wave); this is never a sibling-cancel (this g.Go still
+				// returns nil).
+				childUUID, cerr := uuid.Parse(d.runID)
+				stageUUID, serr := uuid.Parse(d.stageID)
+				if cerr != nil || serr != nil {
+					mu.Lock()
+					dispatched[d.runID] = &ChildResult{
+						RunID: d.runID, StageID: d.stageID, Dispatched: false,
+						Warnings: []string{fmt.Sprintf("could not parse child run/stage id for host-dispatch marker (run=%q stage=%q); NOT spawning", d.runID, d.stageID)},
+					}
+					mu.Unlock()
+					return nil
+				}
+				hdr, hderr := r.api.HostDispatchStage(gctx, childUUID, stageUUID)
+				if hderr != nil {
+					mu.Lock()
+					dispatched[d.runID] = &ChildResult{
+						RunID: d.runID, StageID: d.stageID, Dispatched: false,
+						Warnings: []string{fmt.Sprintf("host-dispatch marker failed; NOT spawning (fail-closed): %v", hderr)},
+					}
+					mu.Unlock()
+					return nil
+				}
+				if !hdr.Transitioned {
+					// Idempotent already-'dispatched' no-op: a concurrent invocation
+					// won the CAS and a runner is already in flight. Do NOT spawn a
+					// second one (the #1912 double-spawn). Report it as not-dispatched
+					// this call with the marker's echoed state.
+					mu.Lock()
+					dispatched[d.runID] = &ChildResult{
+						RunID: d.runID, StageID: d.stageID, Dispatched: false,
+						StageState: hdr.StageState,
+						Warnings:   []string{"host-dispatch marker was a no-op (already 'dispatched' by a concurrent run_children/drive_run invocation; a runner is already in flight); NOT spawning to avoid a double-spawn"},
+					}
+					mu.Unlock()
+					return nil
+				}
 				argv := []string{
 					"--run-id", d.runID,
 					"--backend-url", r.api.baseURL,
@@ -429,14 +494,19 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 	}
 
 	// Assemble the consolidated output in plan_decomposed order so the result
-	// is stable across calls.
+	// is stable across calls. dispatched_count is the number of children this
+	// call ACTUALLY spawned (Dispatched:true) — a marker fail-closed or a
+	// concurrent-invocation no-op recorded Dispatched:false and so does not
+	// inflate the count.
 	out := RunChildrenOutput{
-		DispatchedCount: dispatchedCount,
-		EffectiveCap:    concurrencyCap,
-		Warnings:        warnings,
+		EffectiveCap: concurrencyCap,
+		Warnings:     warnings,
 	}
 	for _, d := range dispatches {
 		if res, ok := dispatched[d.runID]; ok {
+			if res.Dispatched {
+				out.DispatchedCount++
+			}
 			out.Children = append(out.Children, *res)
 			continue
 		}

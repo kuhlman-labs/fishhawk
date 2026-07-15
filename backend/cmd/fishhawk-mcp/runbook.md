@@ -59,11 +59,16 @@ the wrong kind cannot be retagged — cancel it and start fresh.
 ### Local-drive fixup needs an explicit dispatch_stage
 
 On a local-drive run, `fishhawk_fixup_stage` re-opens the implement stage to
-state `dispatched` but does **not** spawn the runner. It returns no
-`log_path`, and the "github_actions auto-dispatches / nothing to run"
-next-action hint is **false** for local drive. After a fixup you MUST call
-`fishhawk_dispatch_stage` (implement) to actually execute the re-implement.
-Skipping this strands the run with a re-opened stage and no runner.
+state `awaiting_host_dispatch` ([#1912](https://github.com/kuhlman-labs/fishhawk/issues/1912) —
+the parked-for-host-spawn state; the backend cannot spawn the host-local runner)
+but does **not** spawn the runner itself. It returns no `log_path`, and the
+"github_actions auto-dispatches / nothing to run" next-action hint is **false**
+for local drive. After a fixup, dispatch the parked stage: either call
+`fishhawk_dispatch_stage` (implement) by hand, or let **`fishhawk_drive_run`
+auto-dispatch it** — the driver now treats `awaiting_host_dispatch` as
+host-spawnable and dispatches a parked implement with no manual handoff (#1912).
+Leaving the stage parked without one of those strands the run with a re-opened
+stage and no runner.
 
 Note also that a fixup re-drives the **entire** implement agent (tens of
 thousands of tokens), not a patch. A no-op fixup (zero diff) still burns the

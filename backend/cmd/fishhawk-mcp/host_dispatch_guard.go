@@ -78,10 +78,15 @@ func (r *runResolver) guardHostDispatch(ctx context.Context, runUUID uuid.UUID) 
 //     a runner here 409s (stage_not_runnable) and the reaper report would
 //     destroy the park; the error names fishhawk_run_children /
 //     fishhawk_consolidate_slices as the correct verbs.
-//   - The target stage merely "dispatched" with every sibling settled: ALLOW —
-//     this is the local retry/fixup park-then-spawn state (retry_stage /
-//     fixup_stage park the stage as "dispatched" for a host-side re-dispatch);
-//     blocking it would wedge every local retry.
+//   - The target stage in "awaiting_host_dispatch" (#1912) with every sibling
+//     settled: ALLOW — this is the local park-then-spawn state (plan-approved
+//     dispatch, retry_stage, fixup_stage all park the agent stage here for a
+//     host-side spawn); blocking it would wedge every local dispatch. A target
+//     merely "dispatched" is likewise ALLOW as the legacy/transitional
+//     re-dispatch park (a spawned runner died and the operator re-dispatches).
+//     A SIBLING in "awaiting_host_dispatch" is NOT in-flight (no spawn attempt
+//     exists yet), so it never blocks the target — only {dispatched, running}
+//     siblings do.
 //   - All stages settled (pending / awaiting_* / terminal): ALLOW.
 //   - Stage-list read error: FAIL OPEN with a warning, mirroring
 //     guardHostDispatch's #1355 posture — availability over strictness for the
@@ -114,8 +119,10 @@ func (r *runResolver) guardSiblingStageInFlight(ctx context.Context, runUUID uui
 					"stage %s (%s) is a decomposed parent's implement stage parked awaiting_children for run %s — its child slices own it. Dispatching a runner here produces a doomed prompt fetch (409 stage_not_runnable) whose failure report would destroy the park. Use fishhawk_run_children to dispatch the child slices, then fishhawk_consolidate_slices for the final fan-in",
 					s.ID, s.Type, runUUID)
 			}
-			// The target's own "dispatched" park state is the retry/fixup
-			// re-dispatch case — allow it. Only a live "running" target blocks.
+			// The target's own park states — "awaiting_host_dispatch" (#1912, the
+			// plan-approved / retry / fixup local park) and legacy "dispatched"
+			// (transitional dead-runner re-dispatch) — are allowed. Only a live
+			// "running" target blocks.
 			if s.State == "running" {
 				return nil, fmt.Errorf(
 					"stage %s (%s) is already running for run %s — a live runner owns it; dispatching again would double-drive the stage. Wait for it to settle before re-dispatching",

@@ -279,19 +279,19 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		return rerr
 	}
 
-	// (5a) Record this manual host-spawn as run_auto_driven spawn evidence under
-	// the SAME canonical action value the driver uses (autoDriveDispatchActionName,
-	// 'dispatch_stage'), distinguished only by Source (#1905). This lands a
-	// dispatch-evidence row so a later fishhawk_drive_run resume anchors staleness
-	// on a FRESH timestamp and reads this stage as live rather than re-reporting
-	// dispatched_stale — the recovery loop then converges. BEST-EFFORT: on error
-	// (including insufficient_scope on a token lacking write:approvals) append a
-	// warning naming the degraded stale detection and proceed — the record is
-	// staleness evidence, not an authorization gate, so making it mandatory would
-	// regress the core manual recovery verb. Only stage types the endpoint's
-	// closed set accepts (plan|implement|acceptance) are recorded; a review
-	// dispatch records nothing (the endpoint would 400 an unknown stage, and the
-	// driver never host-dispatches review stages anyway).
+	// (5a) Record this manual host-spawn as run_auto_driven ATTRIBUTION under the
+	// SAME canonical action value the driver uses (autoDriveDispatchActionName,
+	// 'dispatch_stage'), distinguished only by Source (#1905). Post-#1912 this row
+	// is ATTRIBUTION ONLY — no longer the staleness evidence: the host-dispatch
+	// marker below stamps the 'dispatched' spawn signal (with a fresh updated_at),
+	// which is what a later fishhawk_drive_run resume anchors staleness on.
+	// BEST-EFFORT: on error (including insufficient_scope on a token lacking
+	// write:approvals) append a warning naming the degraded attribution and
+	// proceed — the record is provenance, not an authorization gate, so making it
+	// mandatory would regress the core manual recovery verb. Only stage types the
+	// endpoint's closed set accepts (plan|implement|acceptance) are recorded; a
+	// review dispatch records nothing (the endpoint would 400 an unknown stage,
+	// and the driver never host-dispatches review stages anyway).
 	if autoDriveRecordableStage(in.Stage) {
 		if _, rerr := r.api.RecordAutoDriveAct(ctx, runUUID, RecordAutoDriveAct{
 			Action: autoDriveDispatchActionName,
@@ -300,9 +300,20 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 			Note:   "manual host dispatch",
 		}); rerr != nil {
 			warnings = append(warnings, fmt.Sprintf(
-				"could not record manual-dispatch spawn evidence (%v); a later fishhawk_drive_run resume may mis-report this stage dispatched_stale. Proceeding — the record is staleness evidence, not an authorization gate.",
+				"could not record manual-dispatch attribution (%v); the run_auto_driven provenance row is missing. Proceeding — this row is attribution, not the staleness evidence (the host-dispatch marker stamps that) and not an authorization gate.",
 				rerr))
 		}
+	}
+
+	// (5c) Mark the host spawn BEFORE spawning (#1912): the endpoint CAS-flips
+	// {pending, awaiting_host_dispatch} → dispatched so post-#1912 'dispatched'
+	// unambiguously means a spawn attempt exists. FAIL CLOSED — a transport error
+	// or 4xx means NO spawn (an unmarked spawn would recreate the ambiguity #1912
+	// removes). transitioned:false (already 'dispatched') proceeds: the manual
+	// dead-runner re-dispatch.
+	if _, hderr := r.api.HostDispatchStage(ctx, runUUID, stageUUID); hderr != nil {
+		return nil, DispatchStageOutput{}, fmt.Errorf(
+			"host-dispatch marker for stage %s failed; NOT spawning (fail-closed): %w", resolvedStageID, hderr)
 	}
 
 	logPath, err := spawnRunnerStageDetached(binary, argv, env, runUUID.String(), resolvedStageID, report)

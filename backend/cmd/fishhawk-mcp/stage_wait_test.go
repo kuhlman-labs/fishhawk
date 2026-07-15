@@ -17,14 +17,15 @@ func TestSuggestedStageWaitPollIntervalSeconds(t *testing.T) {
 // updating this mapping fails here (and in TestClassifyStageWaitStatus).
 func TestStageStateIsTerminal(t *testing.T) {
 	terminal := map[string]bool{
-		"pending":           false,
-		"dispatched":        false,
-		"running":           false,
-		"awaiting_approval": false,
-		"awaiting_children": false,
-		"succeeded":         true,
-		"failed":            true,
-		"cancelled":         true,
+		"pending":                false,
+		"awaiting_host_dispatch": false, // #1912: parked for a host spawn — actionable, non-terminal
+		"dispatched":             false,
+		"running":                false,
+		"awaiting_approval":      false,
+		"awaiting_children":      false,
+		"succeeded":              true,
+		"failed":                 true,
+		"cancelled":              true,
 	}
 	for state, want := range terminal {
 		if got := stageStateIsTerminal(state); got != want {
@@ -33,8 +34,8 @@ func TestStageStateIsTerminal(t *testing.T) {
 	}
 }
 
-// TestClassifyStageWaitStatus walks all eight documented backend stage states
-// (run.StageState constants, run.go:56-65) and asserts the status mapping plus
+// TestClassifyStageWaitStatus walks the documented backend stage states
+// (run.StageState constants) and asserts the status mapping plus
 // the poll-interval rule: present (==30) while non-terminal, omitted on
 // terminal.
 func TestClassifyStageWaitStatus(t *testing.T) {
@@ -44,6 +45,7 @@ func TestClassifyStageWaitStatus(t *testing.T) {
 		wantInterval int // 0 means omitted
 	}{
 		{"pending", "pending", 30},
+		{"awaiting_host_dispatch", "pending", 30}, // #1912: maps to the actionable pending bucket
 		{"dispatched", "pending", 30},
 		{"awaiting_approval", "pending", 30},
 		{"awaiting_children", "pending", 30},

@@ -1082,8 +1082,16 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 //
 // The flip is best-effort and must never unwind the load-bearing prompt
 // response: every failure path logs at warn and returns. It fires ONLY on
-// an observed 'dispatched' state:
+// an observed 'dispatched' OR 'awaiting_host_dispatch' state:
 //
+//   - 'dispatched' walks the single dispatched → running edge (the common
+//     case: the MCP host-dispatch marker already flipped the park).
+//   - 'awaiting_host_dispatch' (#1912) is the version-skew / raced-marker
+//     defensive walk: a runner that spawned against a still-parked stage —
+//     because an older MCP binary never called the host-dispatch marker, or
+//     the marker call lost a race — presents this state. The authenticated
+//     prompt fetch is proof a runner for THIS stage is alive, so converge
+//     the state by walking awaiting_host_dispatch → dispatched → running.
 //   - 'pending' is left untouched to preserve the #1030 local first-stage
 //     semantics (advanceStageAfterTrace owns the pending→dispatched walk).
 //   - a 'running' replay re-fetch is a no-op by the state guard.
@@ -1091,12 +1099,12 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 //     (awaiting_input, awaiting_scope_decision) is left untouched, so a
 //     legitimately-parked stage is never advanced.
 //
-// It anchors on 'dispatched' via the run.StageCASTransitioner capability
+// It anchors each step via the run.StageCASTransitioner capability
 // (mirroring run.failStageCAS) so a concurrent advance — a scope park, a
 // reap, any other writer — refuses atomically with StageStateChangedError
 // instead of being stomped; the park's legal →running edge can never be
 // collapsed. Repos without the capability (in-memory fakes) fall back to
-// plain TransitionStage, still guarded on the observed dispatched state. As
+// plain TransitionStage, still guarded on the observed state. As
 // a side effect the repo sets started_at at real start time on this first
 // →running transition (postgres.go), improving duration accuracy.
 //
@@ -1114,11 +1122,34 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 // TestGetStagePrompt_LivenessFlip_FlipsThenBuildFails test pins the
 // flip-succeeded-then-construction-failed ordering.
 func (s *Server) markStageRunningOnPromptFetch(ctx context.Context, stage *run.Stage) {
-	if stage.State != run.StageStateDispatched {
+	if stage.State != run.StageStateDispatched && stage.State != run.StageStateAwaitingHostDispatch {
 		return
 	}
+	cas, hasCAS := s.cfg.RunRepo.(run.StageCASTransitioner)
+
+	// #1912 defensive first step: converge a still-parked stage to dispatched
+	// before the dispatched → running flip. Anchored on awaiting_host_dispatch
+	// so a concurrent cancel/reap refuses atomically rather than being stomped.
+	if stage.State == run.StageStateAwaitingHostDispatch {
+		var err error
+		if hasCAS {
+			_, err = cas.TransitionStageFrom(ctx, stage.ID,
+				run.StageStateAwaitingHostDispatch, run.StageStateDispatched, nil)
+		} else {
+			_, err = s.cfg.RunRepo.TransitionStage(ctx, stage.ID, run.StageStateDispatched, nil)
+		}
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"prompt-fetch awaiting_host_dispatch→dispatched liveness flip failed (advisory; prompt still served)",
+				slog.String("run_id", stage.RunID.String()),
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("error", err.Error()))
+			return
+		}
+	}
+
 	var err error
-	if cas, ok := s.cfg.RunRepo.(run.StageCASTransitioner); ok {
+	if hasCAS {
 		_, err = cas.TransitionStageFrom(ctx, stage.ID,
 			run.StageStateDispatched, run.StageStateRunning, nil)
 	} else {

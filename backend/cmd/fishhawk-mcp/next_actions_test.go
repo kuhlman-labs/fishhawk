@@ -474,6 +474,77 @@ func TestNextActions_ImplementLocalDispatchDefault(t *testing.T) {
 	findAction(t, na, "fishhawk_run_stage")
 }
 
+// TestNextActions_HostDispatchClassification pins the #1912 routing (plan test
+// m): a stage at awaiting_host_dispatch routes to the DISPATCH arm (the operator
+// host spawns it), while a bare 'dispatched' stage (a spawn attempt exists —
+// in-flight) routes to POLL-only, across the plan, implement, and acceptance
+// arms.
+func TestNextActions_HostDispatchClassification(t *testing.T) {
+	cases := []struct {
+		name       string
+		stages     []Stage
+		wantState  string
+		wantAction string // "" means poll-only (a pollAction first entry)
+	}{
+		{
+			name:       "implement_awaiting_host_dispatch_routes_to_dispatch",
+			stages:     []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_host_dispatch")},
+			wantState:  "implement_pending",
+			wantAction: "fishhawk_dispatch_stage",
+		},
+		{
+			name:      "implement_dispatched_routes_to_poll",
+			stages:    []Stage{naStage("plan", "succeeded"), naStage("implement", "dispatched")},
+			wantState: "implement_dispatched",
+		},
+		{
+			name:       "plan_awaiting_host_dispatch_routes_to_dispatch",
+			stages:     []Stage{naStage("plan", "awaiting_host_dispatch")},
+			wantState:  "plan_pending",
+			wantAction: "fishhawk_run_stage",
+		},
+		{
+			name:      "plan_dispatched_routes_to_poll",
+			stages:    []Stage{naStage("plan", "dispatched")},
+			wantState: "plan_dispatched",
+		},
+		{
+			name:       "acceptance_awaiting_host_dispatch_routes_to_dispatch",
+			stages:     []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded"), naStage("acceptance", "awaiting_host_dispatch")},
+			wantState:  "acceptance_pending",
+			wantAction: "fishhawk_dispatch_stage",
+		},
+		{
+			name:      "acceptance_dispatched_routes_to_poll",
+			stages:    []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded"), naStage("acceptance", "dispatched")},
+			wantState: "acceptance_dispatched",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			run := naRun("running")
+			na := nextActionsFor(run, tc.stages, nil, nil, nil, nil, false, false, "", "", releaseSignals{})
+			if na == nil || na.State != tc.wantState {
+				t.Fatalf("state = %+v, want %q", na, tc.wantState)
+			}
+			if len(na.Actions) == 0 {
+				t.Fatalf("no actions for %q (non-terminal must carry >=1)", tc.wantState)
+			}
+			if tc.wantAction != "" {
+				if na.Actions[0].Action != tc.wantAction {
+					t.Errorf("actions[0] = %q, want %q (dispatch arm)", na.Actions[0].Action, tc.wantAction)
+				}
+			} else {
+				// poll-only: the first action is a re-poll (fishhawk_get_run_status),
+				// never a dispatch/run verb.
+				if na.Actions[0].Action != "fishhawk_get_run_status" {
+					t.Errorf("actions[0] = %q, want fishhawk_get_run_status (poll-only for a bare dispatched stage)", na.Actions[0].Action)
+				}
+			}
+		})
+	}
+}
+
 // TestNextActions_PlanLocalDispatchUnchanged pins condition (1): the
 // plan-local branch is byte-unchanged — a parked LOCAL plan stage still
 // offers the single fishhawk_run_stage action and never dispatch_stage.

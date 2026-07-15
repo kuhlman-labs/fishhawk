@@ -722,6 +722,42 @@ func (c *apiClient) AcceptanceDispatchAdmission(ctx context.Context, stageID uui
 	return &res, nil
 }
 
+// HostDispatchResult mirrors the backend's host-dispatch 200 body (#1912):
+// whether this call drove the stage pending|awaiting_host_dispatch → dispatched
+// (the spawn marker) and the resulting stage state. Transitioned:true is the
+// common case (a parked stage marked as a spawn attempt); Transitioned:false is
+// the idempotent no-op — the stage was already 'dispatched', a legal manual
+// re-dispatch of a stage whose spawned runner died, which the caller proceeds on.
+type HostDispatchResult struct {
+	Transitioned bool   `json:"transitioned"`
+	StageState   string `json:"stage_state"`
+}
+
+// HostDispatchStage marks a host spawn against a runner_kind-locked-local stage
+// via POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch (#1912): the
+// backend cannot spawn the host-local runner (ADR-024), so it parks an agent
+// stage at 'awaiting_host_dispatch' rather than 'dispatched'. The MCP host-spawn
+// verbs (fishhawk_run_stage, fishhawk_dispatch_stage, fishhawk_drive_run) call
+// this IMMEDIATELY BEFORE spawning the runner and FAIL CLOSED on any error, so
+// post-#1912 'dispatched' unambiguously means "a spawn attempt exists". The
+// endpoint CAS-transitions {pending, awaiting_host_dispatch} → dispatched.
+// Callers fail closed on a non-nil error (transport / 4xx). 4xx surfaces:
+//   - 401 authentication_required / 403 insufficient_scope (needs write:runs)
+//   - 404 stage_not_found (unknown stage, or the stage's run_id disagrees)
+//   - 409 dispatch_not_admissible — either a running/terminal/awaiting_* gate
+//     state (a live or settled stage can never be re-marked as a fresh spawn),
+//     a run LOCKED to a non-local runner_kind, or a non-host-spawn stage (a
+//     human-executed or auto-merge review-gate stage) — none of which is ever
+//     host-spawned (#1912 fix-up)
+func (c *apiClient) HostDispatchStage(ctx context.Context, runID, stageID uuid.UUID) (*HostDispatchResult, error) {
+	path := "/v0/runs/" + runID.String() + "/stages/" + stageID.String() + "/host-dispatch"
+	var res HostDispatchResult
+	if err := c.do(ctx, http.MethodPost, path, nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // Reap-failure body caps (#1791). The reap-failure endpoint caps the request
 // body at 32*1024 bytes (backend/internal/server/reap_failure.go
 // maxReapFailureBodyBytes) and rejects an oversized body 413 body_too_large.
