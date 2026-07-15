@@ -1144,13 +1144,18 @@ var ErrBranchCheckedOutElsewhere = errors.New("gitops: run branch already checke
 // <trackingRef>`, resetting any stale local branch of the same name to the
 // fetched tip.
 //
-// Auth is ambient: the fetch targets the named remote (default
-// DefaultRemote), using whatever credentials the operator's checkout
-// already has for it — the pre-invoke call site has no installation token
-// yet (it is minted post-invoke on the push path). Like CaptureHead /
+// Auth: when pushToken is non-empty and the remote resolves to an http(s)
+// URL, the fetch authenticates per-invocation with a freshly-minted token via
+// AuthEnvForRemote's process-scoped extraheader entries, which also RESET any
+// stale persisted extraheader on the shared config so a fix-up base-checkout
+// fetch cannot die on a polluted header (the run-0ae81e43 failure, #1951).
+// An empty pushToken, a non-http remote, or an unresolvable remote falls back
+// to ambient auth (byte-identical to before) — in the hosted Actions flow
+// actions/checkout's live extraheader authenticates, and for local-dev /
+// bare-repo tests file remotes need no auth at all. Like CaptureHead /
 // RestoreHead it is a package-level function because the caller has no
 // *Pusher in scope.
-func CheckoutRemoteBranch(ctx context.Context, repoDir, remote, branch string) (tipSHA string, err error) {
+func CheckoutRemoteBranch(ctx context.Context, repoDir, remote, branch, pushToken string) (tipSHA string, err error) {
 	if branch == "" {
 		return "", errors.New("gitops: branch required")
 	}
@@ -1162,7 +1167,8 @@ func CheckoutRemoteBranch(ctx context.Context, repoDir, remote, branch string) (
 	if competing != "" {
 		return "", fmt.Errorf("gitops: %w: run branch %q is checked out in worktree %q — switch that tree off the branch (git checkout main) and re-dispatch; budget intact", ErrBranchCheckedOutElsewhere, branch, competing)
 	}
-	trackingRef, tip, err := fetchRemoteBranchTip(ctx, p, repoDir, remote, branch)
+	authEnv := AuthEnvForRemote(ctx, repoDir, remote, pushToken)
+	trackingRef, tip, err := fetchRemoteBranchTip(ctx, p, repoDir, remote, branch, authEnv)
 	if err != nil {
 		return "", err
 	}
@@ -1233,10 +1239,16 @@ func canonWorktreePath(pth string) string {
 // variants diverge only in HOW they move the working tree onto that tip:
 // on-branch `checkout -B` (fix-up) vs. detached `checkout --detach` (the
 // decomposed-child base, #1361).
-func fetchRemoteBranchTip(ctx context.Context, p *Pusher, repoDir, remote, branch string) (trackingRef, tipSHA string, err error) {
+//
+// authEnv carries the run token's process-scoped auth (authConfigEnv's
+// GIT_CONFIG_* entries, resolved by AuthEnvForRemote) so the fetch
+// authenticates per-invocation with a fresh credential and neutralizes any
+// stale persisted extraheader on the shared config (#1951) — a nil authEnv
+// falls back to ambient auth (byte-identical to before this seam existed).
+func fetchRemoteBranchTip(ctx context.Context, p *Pusher, repoDir, remote, branch string, authEnv []string) (trackingRef, tipSHA string, err error) {
 	remote = orDefault(remote, DefaultRemote)
 	trackingRef = fmt.Sprintf("refs/remotes/%s/%s", remote, branch)
-	if err := p.run(ctx, repoDir, "fetch", remote,
+	if err := p.runEnv(ctx, repoDir, authEnv, "fetch", remote,
 		fmt.Sprintf("+refs/heads/%s:%s", branch, trackingRef)); err != nil {
 		return "", "", fmt.Errorf("gitops: fetch %s from %s: %w", branch, remote, err)
 	}
@@ -1267,14 +1279,17 @@ func fetchRemoteBranchTip(ctx context.Context, p *Pusher, repoDir, remote, branc
 // branch: CommitAndPush cuts each per-slice sole-writer branch fresh from a
 // freshly-fetched origin/<base> (freshFetchBase routing, ADR-035), so
 // establishing the working tree at the base tip via a detached HEAD is
-// sufficient. Auth is ambient and the function is package-level for the same
-// reasons as CheckoutRemoteBranch.
-func CheckoutRemoteBranchDetached(ctx context.Context, repoDir, remote, branch string) (tipSHA string, err error) {
+// sufficient. Auth mirrors CheckoutRemoteBranch: env-scoped fresh-token auth
+// (with the stale-header reset) when pushToken is supplied and the remote is
+// http(s), ambient fallback otherwise (#1951). The function is package-level
+// for the same reasons as CheckoutRemoteBranch.
+func CheckoutRemoteBranchDetached(ctx context.Context, repoDir, remote, branch, pushToken string) (tipSHA string, err error) {
 	if branch == "" {
 		return "", errors.New("gitops: branch required")
 	}
 	p := &Pusher{}
-	_, tip, err := fetchRemoteBranchTip(ctx, p, repoDir, remote, branch)
+	authEnv := AuthEnvForRemote(ctx, repoDir, remote, pushToken)
+	_, tip, err := fetchRemoteBranchTip(ctx, p, repoDir, remote, branch, authEnv)
 	if err != nil {
 		return "", err
 	}
@@ -1309,13 +1324,20 @@ func CheckoutRemoteBranchDetached(ctx context.Context, repoDir, remote, branch s
 // the #1302 degrade contract) from a remote-query FAILURE (network/auth/
 // transient ls-remote error → false, err), which on a decomposed child with
 // an expected base must fail loud rather than silently degrade to running
-// against ambient HEAD and reintroducing the #1363 symptom.
-func RemoteHasBranch(ctx context.Context, repoDir, remote, branch string) (bool, error) {
+// against ambient HEAD and reintroducing the #1363 symptom. The (exists,
+// error) fail-loud-vs-degrade contract is unchanged by the #1951 auth thread.
+//
+// Auth mirrors the checkout variants: when pushToken is supplied and the
+// remote is http(s), the ls-remote authenticates per-invocation via
+// AuthEnvForRemote's env-scoped fresh-token entries (which reset any stale
+// persisted extraheader), else it falls back to ambient auth (#1951).
+func RemoteHasBranch(ctx context.Context, repoDir, remote, branch, pushToken string) (bool, error) {
 	if branch == "" {
 		return false, errors.New("gitops: branch required")
 	}
 	remote = orDefault(remote, DefaultRemote)
-	out, err := (&Pusher{}).runOut(ctx, repoDir, "ls-remote", "--heads", remote, "refs/heads/"+branch)
+	authEnv := AuthEnvForRemote(ctx, repoDir, remote, pushToken)
+	out, err := (&Pusher{}).runOutEnv(ctx, repoDir, authEnv, "ls-remote", "--heads", remote, "refs/heads/"+branch)
 	if err != nil {
 		return false, fmt.Errorf("gitops: ls-remote %s %s: %w", remote, branch, err)
 	}
@@ -1372,6 +1394,49 @@ func RemoteConfigured(ctx context.Context, repoDir, remote string) bool {
 		return false
 	}
 	return strings.TrimSpace(out) != ""
+}
+
+// AuthEnvForRemote resolves the named remote's URL and builds the same
+// process-scoped git-config auth entries authConfigEnv produces for the push
+// path, so a PRE-INVOKE remote-touching git operation (the fix-up base-checkout
+// fetch, the decomposed-child base fetch, the wave-base ls-remote, the
+// acceptance-tree object fetch) can authenticate per-invocation with a freshly
+// minted installation token AND reset any stale persisted extraheader on the
+// shared config — the run-0ae81e43 fix-up_base_checkout failure, where a stale
+// http.extraheader left in the operator's shared worktree config killed the
+// fetch (#1951). It returns the GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n/
+// GIT_CONFIG_VALUE_n entries (reset entry + fresh AUTHORIZATION header),
+// scoped to whichever single git invocation they are passed to via
+// runEnv/runOutEnv — nothing is written to any config file.
+//
+// It degrades to nil — ambient auth, byte-identical to the pre-#1951 behavior —
+// when pushToken is empty (no credential to inject), the named remote is not
+// configured (`git remote get-url` fails), the resolved remote URL is not
+// http/https (SSH / file-path remotes, where authConfigEnv also no-ops), or
+// authConfigEnv errors. Degrade-to-nil rather than error is deliberate: the
+// env auth is an ENHANCEMENT over the prior ambient path, and any real remote
+// problem surfaces on the subsequent fetch/ls-remote itself, not here. On a
+// github_actions run this preserves actions/checkout's live extraheader as the
+// ambient fallback on the degrade path while upgrading the normal path to
+// self-sufficient fresh-token auth.
+func AuthEnvForRemote(ctx context.Context, repoDir, remote, pushToken string) []string {
+	if pushToken == "" {
+		return nil
+	}
+	remote = orDefault(remote, DefaultRemote)
+	out, err := (&Pusher{}).runOut(ctx, repoDir, "remote", "get-url", remote)
+	if err != nil {
+		return nil
+	}
+	remoteURL := strings.TrimSpace(out)
+	if remoteURL == "" {
+		return nil
+	}
+	env, err := authConfigEnv(remoteURL, pushToken)
+	if err != nil {
+		return nil
+	}
+	return env
 }
 
 // RestoreHead returns the operator's checkout to ref via `git checkout

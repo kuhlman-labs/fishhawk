@@ -2850,13 +2850,13 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	// test must never fetch + force-checkout the runner's own source repo.
 	// The canned tip flows into the lineage comparison; tests that assert
 	// the wiring swap in recording spies AFTER this.
-	checkoutFixupBase = func(_ context.Context, _, _, _ string) (string, error) {
+	checkoutFixupBase = func(_ context.Context, _, _, _, _ string) (string, error) {
 		return "fixup-branch-tip-sha", nil
 	}
 	// Stub the subsequent-child base establishment (#1036) the same way: a
 	// decomposed-child run() test with the shared branch on the remote must
 	// never fetch + force-checkout the runner's own source repo.
-	checkoutChildBase = func(_ context.Context, _, _, _ string) (string, error) {
+	checkoutChildBase = func(_ context.Context, _, _, _, _ string) (string, error) {
 		return "shared-branch-tip-sha", nil
 	}
 	// Stub the remote-authoritative wave-base guard (#1363) to a safe absent
@@ -2866,7 +2866,7 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	// where the local-tracking remoteBranchExists show-ref in "." returned
 	// false and the block no-oped. Tests that force the wave-base path swap in
 	// withFakeRemoteHasBranch AFTER this call.
-	remoteHasBranch = func(_ context.Context, _, _, _ string) (bool, error) { return false, nil }
+	remoteHasBranch = func(_ context.Context, _, _, _, _ string) (bool, error) { return false, nil }
 	// Default the not-wired-vs-transient discriminator (#1363) to "configured"
 	// so a test that forces the remoteHasBranch error path (withFakeRemoteHasBranch
 	// with a non-nil err) exercises the fail-loud branch without shelling out to
@@ -4405,7 +4405,7 @@ func withFakeRemoteBranchExists(t *testing.T, exists bool) {
 func withFakeRemoteHasBranch(t *testing.T, exists bool, err error) {
 	t.Helper()
 	orig := remoteHasBranch
-	remoteHasBranch = func(_ context.Context, _, _, _ string) (bool, error) { return exists, err }
+	remoteHasBranch = func(_ context.Context, _, _, _, _ string) (bool, error) { return exists, err }
 	t.Cleanup(func() { remoteHasBranch = orig })
 }
 
@@ -4775,7 +4775,7 @@ func TestRun_DecomposedChild_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
 		return nil
 	}
 	var gotBranch, gotRemote string
-	checkoutChildBase = func(_ context.Context, _, remote, branch string) (string, error) {
+	checkoutChildBase = func(_ context.Context, _, remote, branch, _ string) (string, error) {
 		order = append(order, "checkout")
 		gotRemote = remote
 		gotBranch = branch
@@ -4897,7 +4897,7 @@ func TestRun_DecomposedChild_SkipsChildBaseCheckout(t *testing.T) {
 
 	checkoutCalled := false
 	origCheckout := checkoutChildBase
-	checkoutChildBase = func(_ context.Context, _, _, _ string) (string, error) {
+	checkoutChildBase = func(_ context.Context, _, _, _, _ string) (string, error) {
 		checkoutCalled = true
 		return "shared-branch-tip-sha", nil
 	}
@@ -4951,7 +4951,7 @@ func TestRun_DecomposedChild_CheckoutFailure_FailsBeforeAgentInvoke(t *testing.T
 		restoredRefs = append(restoredRefs, ref)
 		return nil
 	}
-	checkoutChildBase = func(_ context.Context, _, _, _ string) (string, error) {
+	checkoutChildBase = func(_ context.Context, _, _, _, _ string) (string, error) {
 		return "", errors.New("fetch origin fishhawk/run-aaaaaaaa: auth failed")
 	}
 	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes; checkoutChildBase = origCheckout })
@@ -5003,7 +5003,7 @@ func TestRun_DecomposedChild_RemoteQueryFailure_FailsBeforeAgentInvoke(t *testin
 
 	checkoutCalled := false
 	origCheckout := checkoutChildBase
-	checkoutChildBase = func(_ context.Context, _, _, _ string) (string, error) {
+	checkoutChildBase = func(_ context.Context, _, _, _, _ string) (string, error) {
 		checkoutCalled = true
 		return "shared-branch-tip-sha", nil
 	}
@@ -5054,7 +5054,7 @@ func TestRun_DecomposedChild_RemoteNotConfigured_SkipsGracefully(t *testing.T) {
 
 	checkoutCalled := false
 	origCheckout := checkoutChildBase
-	checkoutChildBase = func(_ context.Context, _, _, _ string) (string, error) {
+	checkoutChildBase = func(_ context.Context, _, _, _, _ string) (string, error) {
 		checkoutCalled = true
 		return "shared-branch-tip-sha", nil
 	}
@@ -6036,7 +6036,7 @@ func TestRun_Fixup_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
 		return nil
 	}
 	var gotBranch, gotRemote string
-	checkoutFixupBase = func(_ context.Context, _, remote, branch string) (string, error) {
+	checkoutFixupBase = func(_ context.Context, _, remote, branch, _ string) (string, error) {
 		order = append(order, "checkout")
 		gotRemote = remote
 		gotBranch = branch
@@ -6090,6 +6090,115 @@ func TestRun_Fixup_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
 	}
 }
 
+// TestRun_Fixup_MintsFreshTokenForBaseCheckout is the #1951 threading test: the
+// fix-up base-checkout fetch receives the freshly-minted installation token
+// (the fake backend's ghs_app_token) so it authenticates per-invocation and
+// resets any stale persisted extraheader — the run-0ae81e43 failure. A
+// capturing checkoutFixupBase fake asserts the minted token is what arrives at
+// the seam.
+func TestRun_Fixup_MintsFreshTokenForBaseCheckout(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupPromptResp("fixup-branch-tip-sha")
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	origCap, origRes, origCheckout := captureHead, restoreHead, checkoutFixupBase
+	origResPres := restoreHeadPreserving
+	captureHead = func(_ context.Context, _ string) (string, bool, error) { return "main", false, nil }
+	restoreHead = func(_ context.Context, _, _ string) error { return nil }
+	restoreHeadPreserving = func(_ context.Context, _, _ string, _ []string) error { return nil }
+	var gotToken string
+	checkoutFixupBase = func(_ context.Context, _, _, _, token string) (string, error) {
+		gotToken = token
+		return "fixup-branch-tip-sha", nil
+	}
+	t.Cleanup(func() {
+		captureHead = origCap
+		restoreHead = origRes
+		checkoutFixupBase = origCheckout
+		restoreHeadPreserving = origResPres
+	})
+
+	var stderr strings.Builder
+	if got := runFixupStage(t, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if gotToken != "ghs_app_token" {
+		t.Errorf("checkoutFixupBase pushToken = %q, want the minted ghs_app_token (#1951 pre-invoke mint)", gotToken)
+	}
+}
+
+// TestRun_Fixup_BaseTokenMintFailure_DegradesNotFails is the #1951 degrade
+// contract: when the base-auth mint fails (no installation AND no `gh` fallback
+// token), base establishment must NOT fail on the mint — it emits
+// base_auth_token_unavailable, proceeds with checkoutFixupBase called with an
+// EMPTY token (ambient auth), and the agent still runs. This preserves the
+// github_actions actions/checkout ambient flow when no token can be minted.
+func TestRun_Fixup_BaseTokenMintFailure_DegradesNotFails(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	inv := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, inv)
+	fu := newFakeUploader(t)
+	fu.promptResp = fixupPromptResp("fixup-branch-tip-sha")
+	// No App installation AND the `gh` fallback fails → mintImplementToken (and
+	// thus mintBaseAuthToken) errors. The push-path mint later fails the stage
+	// terminally, but base establishment must proceed regardless.
+	fu.instTokenErr = fmt.Errorf("%w: no_installation_for_run", upload.ErrNoInstallation)
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+	withFakeGHAuthToken(t, func(context.Context) (string, error) {
+		return "", errors.New("gh: not logged in")
+	})
+
+	origCap, origRes, origCheckout := captureHead, restoreHead, checkoutFixupBase
+	origResPres := restoreHeadPreserving
+	captureHead = func(_ context.Context, _ string) (string, bool, error) { return "main", false, nil }
+	restoreHead = func(_ context.Context, _, _ string) error { return nil }
+	restoreHeadPreserving = func(_ context.Context, _, _ string, _ []string) error { return nil }
+	var checkoutCalled bool
+	var gotToken = "sentinel"
+	checkoutFixupBase = func(_ context.Context, _, _, _, token string) (string, error) {
+		checkoutCalled = true
+		gotToken = token
+		return "fixup-branch-tip-sha", nil
+	}
+	t.Cleanup(func() {
+		captureHead = origCap
+		restoreHead = origRes
+		checkoutFixupBase = origCheckout
+		restoreHeadPreserving = origResPres
+	})
+
+	var stderr strings.Builder
+	_ = runFixupStage(t, &stderr)
+	out := stderr.String()
+
+	if !checkoutCalled {
+		t.Fatalf("checkoutFixupBase was not called — a base-auth mint failure must NOT abort base establishment:\n%s", out)
+	}
+	if gotToken != "" {
+		t.Errorf("checkoutFixupBase pushToken = %q, want \"\" (ambient degrade on mint failure)", gotToken)
+	}
+	if !strings.Contains(out, `"event":"base_auth_token_unavailable"`) {
+		t.Errorf("missing base_auth_token_unavailable degrade event:\n%s", out)
+	}
+	// Base establishment completed (the checkout succeeded) and the agent ran —
+	// the mint failure degraded rather than failing the stage at base setup.
+	if !strings.Contains(out, `"event":"fixup_base_established"`) {
+		t.Errorf("missing fixup_base_established — base establishment did not complete after the mint degrade:\n%s", out)
+	}
+	if inv.gotInv == nil {
+		t.Error("agent was not invoked — the mint degrade must not short-circuit before the agent")
+	}
+	// The failure, if any, must be the terminal push-path mint — never a
+	// base-establishment reason.
+	if strings.Contains(out, `"reason":"fixup_base_checkout"`) {
+		t.Errorf("stage failed at fixup_base_checkout on a mint degrade — must proceed ambient:\n%s", out)
+	}
+}
+
 // TestRun_Fixup_BaseMismatch_FailsBeforeAgentInvoke: when the fetched
 // branch tip differs from the backend-advertised fixup_expected_head_sha,
 // the runner fails fast — the agent is NEVER invoked, the mismatch event
@@ -6113,7 +6222,7 @@ func TestRun_Fixup_BaseMismatch_FailsBeforeAgentInvoke(t *testing.T) {
 		restoredRefs = append(restoredRefs, ref)
 		return nil
 	}
-	checkoutFixupBase = func(_ context.Context, _, _, _ string) (string, error) {
+	checkoutFixupBase = func(_ context.Context, _, _, _, _ string) (string, error) {
 		return "foreign-tip-sha", nil
 	}
 	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes; checkoutFixupBase = origCheckout })
