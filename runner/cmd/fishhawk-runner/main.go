@@ -954,8 +954,18 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// path (the same discipline as gateTeardown). Every provisioning failure
 		// warns and proceeds — never a stage failure: the prompt's skip rule
 		// turns the degraded case into an honest skipped criterion.
+		// The object-fetch (only when the merge-candidate object is absent
+		// locally) authenticates with a freshly-minted token that resets any
+		// stale persisted extraheader (#1951). The closure is LAZY — the token is
+		// minted only if the fetch actually runs — and degrades to ambient auth
+		// (empty env) when no token mints or the remote is non-http.
 		acceptanceTreeTeardown := provisionAcceptanceTree(
-			ctx, dispatchWorkingDir, acceptanceExpectedHeadSHA, cfg.runID, cfg.stageID, logSink)
+			ctx, dispatchWorkingDir, acceptanceExpectedHeadSHA, cfg.runID, cfg.stageID,
+			func() []string {
+				token := mintBaseAuthToken(ctx, cfg, client, issuedKey, logSink)
+				return gitops.AuthEnvForRemote(ctx, dispatchWorkingDir, gitops.DefaultRemote, token)
+			},
+			logSink)
 		defer acceptanceTreeTeardown()
 
 		baseEnv, refused := acceptenv.Env(os.Environ(), proxy.URL())
@@ -1236,7 +1246,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 					cfg.runID, cfg.stageID, preAgentRef, preAgentDetached)
 			}()
 		}
-		tipSHA, coErr := checkoutFixupBase(ctx, repoDir, gitops.DefaultRemote, cfg.fixupBranch)
+		// Mint a fresh token for the base-checkout fetch so it authenticates
+		// per-invocation and RESETS any stale persisted extraheader on the shared
+		// config — the run-0ae81e43 fix-up_base_checkout failure (#1951). A mint
+		// failure degrades to "" (ambient auth), never a stage failure.
+		baseAuthToken := mintBaseAuthToken(ctx, cfg, client, issuedKey, logSink)
+		tipSHA, coErr := checkoutFixupBase(ctx, repoDir, gitops.DefaultRemote, cfg.fixupBranch, baseAuthToken)
 		if coErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":%q,"detail":%q}`+"\n", fixupCheckoutFailReason(coErr), coErr.Error())
@@ -1377,7 +1392,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		if baseRef == "" {
 			baseRef = resolveImplementBaseRef(cfg)
 		}
-		baseExists, rhErr := remoteHasBranch(ctx, repoDir, gitops.DefaultRemote, baseRef)
+		// Mint a fresh token ONCE for both the wave-base ls-remote guard and the
+		// child-base fetch below, so each authenticates per-invocation and resets
+		// any stale persisted extraheader (#1951). A mint failure degrades to ""
+		// (ambient auth), never a stage failure.
+		baseAuthToken := mintBaseAuthToken(ctx, cfg, client, issuedKey, logSink)
+		baseExists, rhErr := remoteHasBranch(ctx, repoDir, gitops.DefaultRemote, baseRef, baseAuthToken)
 		if rhErr != nil {
 			// A remote-query FAILURE splits two ways. Against a CONFIGURED remote
 			// it is a genuine transient failure (network/auth/SSH-agent drop) on a
@@ -1412,7 +1432,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 						cfg.runID, cfg.stageID, preAgentRef, preAgentDetached)
 				}()
 			}
-			tipSHA, coErr := checkoutChildBase(ctx, repoDir, gitops.DefaultRemote, baseRef)
+			tipSHA, coErr := checkoutChildBase(ctx, repoDir, gitops.DefaultRemote, baseRef, baseAuthToken)
 			if coErr != nil {
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"runner_failed","reason":"child_base_checkout","detail":%q}`+"\n", coErr.Error())
@@ -4502,7 +4522,9 @@ var (
 	// treats a query ERROR as fail-loud (a transient ls-remote failure must NOT
 	// degrade to running a dependent slice against ambient HEAD), distinct from
 	// a successful empty result (branch genuinely absent → graceful skip,
-	// preserving the #1302 degrade contract).
+	// preserving the #1302 degrade contract). Its final pushToken argument
+	// (#1951) authenticates the ls-remote with a freshly-minted token that
+	// resets any stale persisted extraheader; "" falls back to ambient auth.
 	remoteHasBranch = gitops.RemoteHasBranch
 
 	// remoteConfigured is the not-wired-vs-transient discriminator the wave-base
@@ -4559,7 +4581,10 @@ var (
 	// Production wires it to gitops.CheckoutRemoteBranch, which fetches the
 	// run's PR branch from the named remote and checks the working tree out
 	// onto the fetched tip, returning that tip SHA for the ADR-035 lineage
-	// comparison. A package-level var for the same reason as captureHead /
+	// comparison. Its final pushToken argument (#1951) authenticates the fetch
+	// with a freshly-minted token that also resets any stale persisted
+	// extraheader (the run-0ae81e43 fix-up_base_checkout failure); "" falls back
+	// to ambient auth. A package-level var for the same reason as captureHead /
 	// restoreHead: the fake-pusher run() tests default repoDir to "." and
 	// must never fetch + force-checkout the runner's own source repo.
 	checkoutFixupBase = gitops.CheckoutRemoteBranch
@@ -4569,9 +4594,12 @@ var (
 	// production fetches the shared parent branch from the named remote and
 	// checks the working tree out onto the fetched tip so the agent runs
 	// against its declared policy base (#765), returning that tip SHA for the
-	// child_base_established record. A package-level var for the same reason
-	// as checkoutFixupBase: the fake-pusher run() tests default repoDir to
-	// "." and must never fetch + force-checkout the runner's own source repo.
+	// child_base_established record. Its final pushToken argument (#1951)
+	// authenticates the fetch with a freshly-minted token that resets any stale
+	// persisted extraheader; "" falls back to ambient auth. A package-level var
+	// for the same reason as checkoutFixupBase: the fake-pusher run() tests
+	// default repoDir to "." and must never fetch + force-checkout the runner's
+	// own source repo.
 	//
 	// Wired to gitops.CheckoutRemoteBranchDetached (NOT the on-branch
 	// CheckoutRemoteBranch used by checkoutFixupBase) so the child base is a
@@ -5130,6 +5158,36 @@ func mintImplementToken(ctx context.Context, cfg config, client uploadClient, is
 	default:
 		return "", fmt.Errorf("fetch installation token: %w", err)
 	}
+}
+
+// mintBaseAuthToken resolves a fresh installation token for the PRE-INVOKE
+// base-establishment git operations (the fix-up base-checkout fetch, the
+// decomposed-child base fetch, the wave-base ls-remote, the acceptance-tree
+// object fetch) so those remote-touching commands authenticate per-invocation
+// with a non-expired credential and reset any stale persisted extraheader
+// (#1951). It is a thin, NEVER-FATAL wrapper over mintImplementToken: a nil
+// client or issued key, or ANY mint error, emits a base_auth_token_unavailable
+// degrade event and returns "" so the caller proceeds with AMBIENT auth rather
+// than failing the stage — base establishment must never fail on the mint
+// itself. Returning "" is never reset-only: AuthEnvForRemote no-ops on an empty
+// token, so the github_actions flow (where actions/checkout's live extraheader
+// is the intended ambient auth) is preserved on the degrade path and upgraded
+// to self-sufficient fresh-token auth only when a token actually mints.
+func mintBaseAuthToken(ctx context.Context, cfg config, client uploadClient, issued *upload.IssuedKey, logSink io.Writer) string {
+	if client == nil || issued == nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"base_auth_token_unavailable","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+			cfg.runID, cfg.stageID, "nil upload client or unissued signing key")
+		return ""
+	}
+	token, err := mintImplementToken(ctx, cfg, client, issued, logSink)
+	if err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"base_auth_token_unavailable","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+			cfg.runID, cfg.stageID, err.Error())
+		return ""
+	}
+	return token
 }
 
 // openHeldCommitPR resolves an operator EXEMPT decision on a scope-completeness

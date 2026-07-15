@@ -1066,7 +1066,7 @@ func TestCheckoutRemoteBranch_EstablishesFixupBase(t *testing.T) {
 	mustGit(t, repo, "branch", "-D", branch)
 	mustGit(t, repo, "update-ref", "-d", "refs/remotes/origin/"+branch)
 
-	tip, err := CheckoutRemoteBranch(context.Background(), repo, "origin", branch)
+	tip, err := CheckoutRemoteBranch(context.Background(), repo, "origin", branch, "")
 	if err != nil {
 		t.Fatalf("CheckoutRemoteBranch: %v", err)
 	}
@@ -1144,7 +1144,7 @@ func TestCheckoutRemoteBranch_RemoteNameLockstep(t *testing.T) {
 	mustGit(t, repo, "update-ref", "-d", "refs/remotes/upstream/"+branch)
 	mustGit(t, repo, "checkout", "main")
 
-	tip, err := CheckoutRemoteBranch(context.Background(), repo, "upstream", branch)
+	tip, err := CheckoutRemoteBranch(context.Background(), repo, "upstream", branch, "")
 	if err != nil {
 		t.Fatalf("CheckoutRemoteBranch: %v", err)
 	}
@@ -1170,7 +1170,7 @@ func TestCheckoutRemoteBranch_RemoteNameLockstep(t *testing.T) {
 
 // TestCheckoutRemoteBranch_RejectsEmptyBranch pins the input contract.
 func TestCheckoutRemoteBranch_RejectsEmptyBranch(t *testing.T) {
-	if _, err := CheckoutRemoteBranch(context.Background(), t.TempDir(), "origin", ""); err == nil {
+	if _, err := CheckoutRemoteBranch(context.Background(), t.TempDir(), "origin", "", ""); err == nil {
 		t.Fatal("expected error for empty branch")
 	}
 }
@@ -1229,7 +1229,7 @@ func TestCheckoutRemoteBranchDetached_NoBranchCollisionWithSiblingWorktree(t *te
 	// holding `main`) with the distinct ErrBranchCheckedOutElsewhere sentinel,
 	// naming the competing worktree path and the `git checkout main` recovery —
 	// not the raw git-128 `already used by worktree` it used to surface.
-	if _, err := CheckoutRemoteBranch(context.Background(), child, "origin", "main"); err == nil {
+	if _, err := CheckoutRemoteBranch(context.Background(), child, "origin", "main", ""); err == nil {
 		t.Fatal("CheckoutRemoteBranch (-B main) unexpectedly succeeded with `main` held by a sibling worktree; the collision the detach fixes is gone")
 	} else if !errors.Is(err, ErrBranchCheckedOutElsewhere) {
 		t.Fatalf("CheckoutRemoteBranch (-B main) failed with %v, want errors.Is ErrBranchCheckedOutElsewhere", err)
@@ -1240,7 +1240,7 @@ func TestCheckoutRemoteBranchDetached_NoBranchCollisionWithSiblingWorktree(t *te
 	}
 
 	// The detached variant SUCCEEDS in the same setup.
-	tip, err := CheckoutRemoteBranchDetached(context.Background(), child, "origin", "main")
+	tip, err := CheckoutRemoteBranchDetached(context.Background(), child, "origin", "main", "")
 	if err != nil {
 		t.Fatalf("CheckoutRemoteBranchDetached: %v (must not collide with the sibling `main` worktree)", err)
 	}
@@ -1355,7 +1355,7 @@ func TestCheckoutRemoteBranchDetached_DetachesAndReturnsTip(t *testing.T) {
 	mustGit(t, repo, "reset", "--hard", "HEAD~1")
 	mustGit(t, repo, "update-ref", "-d", "refs/remotes/origin/main")
 
-	tip, err := CheckoutRemoteBranchDetached(context.Background(), repo, "origin", "main")
+	tip, err := CheckoutRemoteBranchDetached(context.Background(), repo, "origin", "main", "")
 	if err != nil {
 		t.Fatalf("CheckoutRemoteBranchDetached: %v", err)
 	}
@@ -1385,7 +1385,7 @@ func TestCheckoutRemoteBranchDetached_DetachesAndReturnsTip(t *testing.T) {
 
 // TestCheckoutRemoteBranchDetached_RejectsEmptyBranch pins the input contract.
 func TestCheckoutRemoteBranchDetached_RejectsEmptyBranch(t *testing.T) {
-	if _, err := CheckoutRemoteBranchDetached(context.Background(), t.TempDir(), "origin", ""); err == nil {
+	if _, err := CheckoutRemoteBranchDetached(context.Background(), t.TempDir(), "origin", "", ""); err == nil {
 		t.Fatal("expected error for empty branch")
 	}
 }
@@ -1439,7 +1439,7 @@ func TestRemoteHasBranch(t *testing.T) {
 	// tracking refs. RemoteHasBranch reports true; `git show-ref --verify
 	// refs/remotes/origin/<branch>` (the old local-tracking guard) is non-zero.
 	t.Run("present_on_remote_only", func(t *testing.T) {
-		got, err := RemoteHasBranch(context.Background(), repo, "origin", branch)
+		got, err := RemoteHasBranch(context.Background(), repo, "origin", branch, "")
 		if err != nil {
 			t.Fatalf("RemoteHasBranch: %v", err)
 		}
@@ -1458,7 +1458,7 @@ func TestRemoteHasBranch(t *testing.T) {
 	// no-match is not an error), so existence must be derived from the output,
 	// not the exit code. Fails if the helper keys on exit code alone.
 	t.Run("absent_on_remote", func(t *testing.T) {
-		got, err := RemoteHasBranch(context.Background(), repo, "origin", "never/pushed")
+		got, err := RemoteHasBranch(context.Background(), repo, "origin", "never/pushed", "")
 		if err != nil {
 			t.Fatalf("RemoteHasBranch (absent): %v", err)
 		}
@@ -1476,14 +1476,14 @@ func TestRemoteHasBranch(t *testing.T) {
 			t.Fatal(err)
 		}
 		mustGit(t, noremote, "init", "--initial-branch=main")
-		if _, err := RemoteHasBranch(context.Background(), noremote, "origin", "main"); err == nil {
+		if _, err := RemoteHasBranch(context.Background(), noremote, "origin", "main", ""); err == nil {
 			t.Error("RemoteHasBranch returned nil error with no reachable origin; the runner seam needs the error to fail loud rather than skip")
 		}
 	})
 
 	// Empty branch is rejected at the input guard.
 	t.Run("rejects_empty_branch", func(t *testing.T) {
-		if _, err := RemoteHasBranch(context.Background(), repo, "origin", ""); err == nil {
+		if _, err := RemoteHasBranch(context.Background(), repo, "origin", "", ""); err == nil {
 			t.Error("expected error for empty branch")
 		}
 	})
@@ -3280,6 +3280,339 @@ func TestCommitAndPush_DumbHTTP_NoHeaderPersistence_WireAuth(t *testing.T) {
 			}
 		})
 	}
+}
+
+// wireReq records one dumb-HTTP request's path and its Authorization header
+// values, so the base-establishment wire tests below can assert auth PER call
+// site (an UNauthenticated /info/refs is invisible to an auth-only recorder).
+type wireReq struct {
+	path string
+	auth []string
+}
+
+// dumbHTTPBranchRemote stands up a bare remote seeded with main plus a pushed
+// run branch, served over git's dumb HTTP protocol by a RECORDING httptest
+// server, and a fresh local repo whose `origin` points at that server. It is
+// the base-establishment analogue of the CommitAndPush wire fixture (#1951): it
+// pre-plants a STALE `http.<host>.extraheader` in the local config (when
+// prePlant) so the env-scoped reset entry is exercised, and returns the local
+// repo path, the extraheader config key for the server host, the pushed
+// run-branch tip SHA, an accessor for the recorded requests, and a server
+// closer the caller defers.
+func dumbHTTPBranchRemote(t *testing.T, branch string, prePlant bool, staleValue string) (local, key, remoteTip string, reqs func() []wireReq, closeSrv func()) {
+	t.Helper()
+	dir := t.TempDir()
+
+	seed := filepath.Join(dir, "seed")
+	bare := filepath.Join(dir, "remote.git")
+	if err := os.Mkdir(seed, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, seed, "init", "--initial-branch=main")
+	mustGit(t, seed, "config", "user.name", "seed")
+	mustGit(t, seed, "config", "user.email", "seed@example.com")
+	if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("# seed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, seed, "add", "-A")
+	mustGit(t, seed, "commit", "-m", "seed")
+	// The run branch the base-establishment fetch targets.
+	mustGit(t, seed, "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(seed, "fix.txt"), []byte("fix\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, seed, "add", "-A")
+	mustGit(t, seed, "commit", "-m", "run-branch tip")
+	remoteTip = mustGitOut(t, seed, "rev-parse", "HEAD")
+	mustGit(t, seed, "init", "--bare", bare)
+	mustGit(t, seed, "push", bare, "main")
+	mustGit(t, seed, "push", bare, branch)
+	mustGit(t, bare, "update-server-info")
+
+	var mu sync.Mutex
+	var requests []wireReq
+	fileSrv := http.FileServer(http.Dir(bare))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, wireReq{path: r.URL.Path, auth: r.Header.Values("Authorization")})
+		mu.Unlock()
+		fileSrv.ServeHTTP(w, r)
+	}))
+
+	local = filepath.Join(dir, "local")
+	if err := os.Mkdir(local, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, local, "init", "--initial-branch=main")
+	mustGit(t, local, "config", "user.name", "init")
+	mustGit(t, local, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(local, "README.md"), []byte("# local\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, local, "add", "-A")
+	mustGit(t, local, "commit", "-m", "local initial")
+	// `origin` names the recording server by URL — the base-establishment
+	// helpers fetch/ls-remote by remote NAME and AuthEnvForRemote resolves it.
+	mustGit(t, local, "remote", "add", "origin", srv.URL)
+
+	hostKey, err := pushHost(srv.URL)
+	if err != nil {
+		srv.Close()
+		t.Fatalf("pushHost(%q): %v", srv.URL, err)
+	}
+	key = "http." + hostKey + ".extraheader"
+	if prePlant {
+		mustGit(t, local, "config", "--local", key, staleValue)
+	}
+
+	return local, key, remoteTip, func() []wireReq {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]wireReq(nil), requests...)
+	}, srv.Close
+}
+
+// assertInfoRefsFreshAuth asserts every /info/refs request authenticated with
+// EXACTLY the fresh token (no unauthenticated request, no duplicate from a
+// stale header that the reset entry failed to clear), and at least one did.
+func assertInfoRefsFreshAuth(t *testing.T, reqs []wireReq, wireAuth string) {
+	t.Helper()
+	var authed, unauthed int
+	for i, rq := range reqs {
+		if !strings.HasSuffix(rq.path, "/info/refs") {
+			continue
+		}
+		if len(rq.auth) == 0 {
+			unauthed++
+			continue
+		}
+		authed++
+		if len(rq.auth) != 1 {
+			t.Errorf("request %d (%s) carried %d Authorization headers %v, want exactly 1 (stale-header reset failed → duplicate)", i, rq.path, len(rq.auth), rq.auth)
+			continue
+		}
+		if rq.auth[0] != wireAuth {
+			t.Errorf("request %d (%s) Authorization = %q, want fresh %q", i, rq.path, rq.auth[0], wireAuth)
+		}
+	}
+	if unauthed != 0 {
+		t.Errorf("saw %d UNauthenticated /info/refs request(s); the base-establishment fetch/ls-remote must authenticate (authEnv dropped from the call site?)", unauthed)
+	}
+	if authed == 0 {
+		t.Fatal("server received no authenticated /info/refs request — env-scoped auth was not exercised")
+	}
+}
+
+// TestCheckoutRemoteBranch_DumbHTTP_EnvScopedAuth is the #1951 end-to-end
+// regression reproducing the run-0ae81e43 fix-up_base_checkout failure: a stale
+// persisted `http.<host>.extraheader` in the shared config would ride along as a
+// duplicate/wrong Authorization header (or, once the base fetch stopped reading
+// ambient config, break outright). It drives CheckoutRemoteBranch (and its
+// detached sibling) through a REAL git fetch over dumb HTTP against a recording
+// server, with the stale header pre-planted, and asserts:
+//
+//   - (token path) the fetch's /info/refs carried EXACTLY the fresh token — the
+//     env-scoped reset neutralized the stale header — the checkout SUCCEEDED and
+//     returned the run-branch tip, HEAD is on the branch, and afterwards the
+//     config FILE still carries only the pre-planted value (nothing persisted);
+//   - (empty-token path) auth is ambient byte-identical: the request carries
+//     ONLY the stale header (no reset without a token — protects the GHA
+//     actions/checkout ambient flow).
+func TestCheckoutRemoteBranch_DumbHTTP_EnvScopedAuth(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	const (
+		token  = "ghs-fresh-checkout-1951"
+		branch = "fishhawk/run-1951/stage-x"
+	)
+	wireAuth := "basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
+	staleValue := "AUTHORIZATION: basic " +
+		base64.StdEncoding.EncodeToString([]byte("x-access-token:stale-persisted"))
+
+	t.Run("on-branch token wins over stale header", func(t *testing.T) {
+		local, key, remoteTip, reqs, closeSrv := dumbHTTPBranchRemote(t, branch, true, staleValue)
+		defer closeSrv()
+
+		tip, err := CheckoutRemoteBranch(context.Background(), local, "origin", branch, token)
+		if err != nil {
+			t.Fatalf("CheckoutRemoteBranch: %v", err)
+		}
+		if tip != remoteTip {
+			t.Errorf("returned tip = %q, want the remote run-branch tip %q", tip, remoteTip)
+		}
+		if got := mustGitOut(t, local, "symbolic-ref", "--short", "HEAD"); got != branch {
+			t.Errorf("HEAD = %q, want on the run branch %q", got, branch)
+		}
+		if got := mustGitOut(t, local, "rev-parse", "HEAD"); got != remoteTip {
+			t.Errorf("HEAD sha = %q, want %q", got, remoteTip)
+		}
+		assertInfoRefsFreshAuth(t, reqs(), wireAuth)
+		if got := gitConfigGetAll(t, local, key); !slices.Equal(got, []string{staleValue}) {
+			t.Errorf("post-run config --get-all = %v, want only the pre-planted %v (run persisted a header!)", got, []string{staleValue})
+		}
+	})
+
+	t.Run("detached token wins over stale header", func(t *testing.T) {
+		local, key, remoteTip, reqs, closeSrv := dumbHTTPBranchRemote(t, branch, true, staleValue)
+		defer closeSrv()
+
+		tip, err := CheckoutRemoteBranchDetached(context.Background(), local, "origin", branch, token)
+		if err != nil {
+			t.Fatalf("CheckoutRemoteBranchDetached: %v", err)
+		}
+		if tip != remoteTip {
+			t.Errorf("returned tip = %q, want the remote run-branch tip %q", tip, remoteTip)
+		}
+		// A detached HEAD claims no branch name; symbolic-ref exits non-zero.
+		if _, err := exec.Command("git", "-C", local, "symbolic-ref", "--quiet", "HEAD").Output(); err == nil {
+			t.Error("HEAD is on a branch, want DETACHED after CheckoutRemoteBranchDetached")
+		}
+		if got := mustGitOut(t, local, "rev-parse", "HEAD"); got != remoteTip {
+			t.Errorf("HEAD sha = %q, want %q", got, remoteTip)
+		}
+		assertInfoRefsFreshAuth(t, reqs(), wireAuth)
+		if got := gitConfigGetAll(t, local, key); !slices.Equal(got, []string{staleValue}) {
+			t.Errorf("post-run config --get-all = %v, want only the pre-planted %v (run persisted a header!)", got, []string{staleValue})
+		}
+	})
+
+	t.Run("empty token keeps ambient stale header", func(t *testing.T) {
+		local, _, _, reqs, closeSrv := dumbHTTPBranchRemote(t, branch, true, staleValue)
+		defer closeSrv()
+
+		if _, err := CheckoutRemoteBranch(context.Background(), local, "origin", branch, ""); err != nil {
+			t.Fatalf("CheckoutRemoteBranch (empty token): %v", err)
+		}
+		// No token → no reset entry → the fetch carries the ambient stale header
+		// exactly (the GHA actions/checkout ambient flow, unchanged). The fresh
+		// token never appears; the stale value is what git sends.
+		staleWire := strings.TrimPrefix(staleValue, "AUTHORIZATION: ")
+		var sawStale, sawFresh bool
+		for _, rq := range reqs() {
+			if !strings.HasSuffix(rq.path, "/info/refs") {
+				continue
+			}
+			for _, a := range rq.auth {
+				if a == staleWire {
+					sawStale = true
+				}
+				if a == wireAuth {
+					sawFresh = true
+				}
+			}
+		}
+		if !sawStale {
+			t.Error("empty-token fetch did not carry the ambient stale header — the no-token path must not reset ambient auth (GHA regression)")
+		}
+		if sawFresh {
+			t.Error("empty-token fetch carried the fresh token — no token was supplied")
+		}
+	})
+}
+
+// TestRemoteHasBranch_DumbHTTP_EnvScopedAuth pins the wave-base ls-remote guard
+// (#1363) against the same #1951 env-scoped auth fixture: with a stale header
+// pre-planted and a token supplied, the ls-remote authenticates with exactly the
+// fresh token and returns the correct existence answer.
+func TestRemoteHasBranch_DumbHTTP_EnvScopedAuth(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	const (
+		token  = "ghs-fresh-lsremote-1951"
+		branch = "fishhawk/run-1951/consolidated"
+	)
+	wireAuth := "basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
+	staleValue := "AUTHORIZATION: basic " +
+		base64.StdEncoding.EncodeToString([]byte("x-access-token:stale-persisted"))
+
+	local, _, _, reqs, closeSrv := dumbHTTPBranchRemote(t, branch, true, staleValue)
+	defer closeSrv()
+
+	exists, err := RemoteHasBranch(context.Background(), local, "origin", branch, token)
+	if err != nil {
+		t.Fatalf("RemoteHasBranch: %v", err)
+	}
+	if !exists {
+		t.Errorf("RemoteHasBranch = false, want true (the run branch was pushed to the remote)")
+	}
+	assertInfoRefsFreshAuth(t, reqs(), wireAuth)
+
+	// A genuinely-absent branch on the same authenticated remote is a clean
+	// (false, nil), still authenticating with the fresh token.
+	absent, err := RemoteHasBranch(context.Background(), local, "origin", "never/pushed", token)
+	if err != nil {
+		t.Fatalf("RemoteHasBranch(absent): %v", err)
+	}
+	if absent {
+		t.Error("RemoteHasBranch = true for a branch never pushed, want false")
+	}
+}
+
+// TestAuthEnvForRemote is the unit table for the base-establishment auth-env
+// resolver (#1951): an https remote yields the 5 GIT_CONFIG entries keyed to the
+// remote host; ssh/file remotes, an unconfigured remote name, and an empty token
+// all degrade to nil (ambient auth).
+func TestAuthEnvForRemote(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	const token = "ghs-auth-env-1951"
+
+	newRepoWithRemote := func(t *testing.T, remoteURL string) string {
+		t.Helper()
+		repo := t.TempDir()
+		mustGit(t, repo, "init", "--initial-branch=main")
+		if remoteURL != "" {
+			mustGit(t, repo, "remote", "add", "origin", remoteURL)
+		}
+		return repo
+	}
+
+	t.Run("https remote yields keyed entries", func(t *testing.T) {
+		repo := newRepoWithRemote(t, "https://github.com/kuhlman-labs/fishhawk.git")
+		got := AuthEnvForRemote(context.Background(), repo, "origin", token)
+		header := "AUTHORIZATION: basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
+		want := []string{
+			"GIT_CONFIG_COUNT=2",
+			"GIT_CONFIG_KEY_0=http.https://github.com/.extraheader",
+			"GIT_CONFIG_VALUE_0=",
+			"GIT_CONFIG_KEY_1=http.https://github.com/.extraheader",
+			"GIT_CONFIG_VALUE_1=" + header,
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("AuthEnvForRemote(https) = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("ssh remote → nil", func(t *testing.T) {
+		repo := newRepoWithRemote(t, "git@github.com:kuhlman-labs/fishhawk.git")
+		if got := AuthEnvForRemote(context.Background(), repo, "origin", token); got != nil {
+			t.Errorf("AuthEnvForRemote(ssh) = %v, want nil", got)
+		}
+	})
+
+	t.Run("file remote → nil", func(t *testing.T) {
+		repo := newRepoWithRemote(t, filepath.Join(t.TempDir(), "bare.git"))
+		if got := AuthEnvForRemote(context.Background(), repo, "origin", token); got != nil {
+			t.Errorf("AuthEnvForRemote(file) = %v, want nil", got)
+		}
+	})
+
+	t.Run("unconfigured remote → nil", func(t *testing.T) {
+		repo := newRepoWithRemote(t, "")
+		if got := AuthEnvForRemote(context.Background(), repo, "origin", token); got != nil {
+			t.Errorf("AuthEnvForRemote(no remote) = %v, want nil", got)
+		}
+	})
+
+	t.Run("empty token → nil", func(t *testing.T) {
+		repo := newRepoWithRemote(t, "https://github.com/kuhlman-labs/fishhawk.git")
+		if got := AuthEnvForRemote(context.Background(), repo, "origin", ""); got != nil {
+			t.Errorf("AuthEnvForRemote(empty token) = %v, want nil", got)
+		}
+	})
 }
 
 // TestCommitAndPush_FileRemote_TokenBearing_NoPersistence_NoArgvLeak pins two

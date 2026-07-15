@@ -2,11 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 )
 
 // acceptanceTreeRepo builds a dispatch checkout whose main branch carries
@@ -108,7 +115,7 @@ func TestProvisionAcceptanceTree_HappyPath(t *testing.T) {
 	redirectAcceptanceTreeDir(t)
 	var log strings.Builder
 
-	teardown := provisionAcceptanceTree(context.Background(), dispatch, mcSHA, "run1", "stage1", &log)
+	teardown := provisionAcceptanceTree(context.Background(), dispatch, mcSHA, "run1", "stage1", nil, &log)
 	target := acceptanceTreePath("run1", "stage1")
 
 	if _, err := os.Stat(target); err != nil {
@@ -154,7 +161,7 @@ func TestProvisionAcceptanceTree_EmptyHeadSHA(t *testing.T) {
 	redirectAcceptanceTreeDir(t)
 	var log strings.Builder
 
-	teardown := provisionAcceptanceTree(context.Background(), dispatch, "", "run1", "stage1", &log)
+	teardown := provisionAcceptanceTree(context.Background(), dispatch, "", "run1", "stage1", nil, &log)
 	if !strings.Contains(log.String(), `"event":"acceptance_tree_skipped"`) {
 		t.Errorf("empty head SHA must emit acceptance_tree_skipped:\n%s", log.String())
 	}
@@ -174,7 +181,7 @@ func TestProvisionAcceptanceTree_NotAGitWorkTree(t *testing.T) {
 	notARepo := t.TempDir()
 	var log strings.Builder
 
-	teardown := provisionAcceptanceTree(context.Background(), notARepo, "deadbeef", "run1", "stage1", &log)
+	teardown := provisionAcceptanceTree(context.Background(), notARepo, "deadbeef", "run1", "stage1", nil, &log)
 	if !strings.Contains(log.String(), `"event":"acceptance_tree_skipped"`) {
 		t.Errorf("non-work-tree dispatch dir must emit acceptance_tree_skipped:\n%s", log.String())
 	}
@@ -196,7 +203,7 @@ func TestProvisionAcceptanceTree_ObjectUnfetchable(t *testing.T) {
 	// A syntactically-valid but absent SHA; no origin remote is configured, so
 	// the bare-SHA fetch cannot resolve it.
 	const missing = "0123456789abcdef0123456789abcdef01234567"
-	teardown := provisionAcceptanceTree(context.Background(), dispatch, missing, "run1", "stage1", &log)
+	teardown := provisionAcceptanceTree(context.Background(), dispatch, missing, "run1", "stage1", nil, &log)
 	if !strings.Contains(log.String(), `"event":"acceptance_tree_failed"`) {
 		t.Errorf("unfetchable object must emit acceptance_tree_failed:\n%s", log.String())
 	}
@@ -225,7 +232,7 @@ func TestProvisionAcceptanceTree_StaleLeftoverSwept(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	teardown := provisionAcceptanceTree(context.Background(), dispatch, mcSHA, "run1", "stage1", &log)
+	teardown := provisionAcceptanceTree(context.Background(), dispatch, mcSHA, "run1", "stage1", nil, &log)
 	defer teardown()
 	if !strings.Contains(log.String(), `"event":"acceptance_tree_stale_swept"`) {
 		t.Errorf("stale leftover must emit acceptance_tree_stale_swept:\n%s", log.String())
@@ -253,7 +260,7 @@ func TestProvisionAcceptanceTree_TeardownRemoveFallback(t *testing.T) {
 	redirectAcceptanceTreeDir(t)
 	var log strings.Builder
 
-	teardown := provisionAcceptanceTree(context.Background(), dispatch, mcSHA, "run1", "stage1", &log)
+	teardown := provisionAcceptanceTree(context.Background(), dispatch, mcSHA, "run1", "stage1", nil, &log)
 	target := acceptanceTreePath("run1", "stage1")
 	if _, err := os.Stat(target); err != nil {
 		t.Fatalf("provision failed: %v\n%s", err, log.String())
@@ -277,5 +284,127 @@ func TestProvisionAcceptanceTree_TeardownRemoveFallback(t *testing.T) {
 	// overclaim.
 	if worktreeRegistered(t, dispatch, target) {
 		t.Error("fallback must unregister the locked worktree, not leave a stranded registration")
+	}
+}
+
+// TestProvisionAcceptanceTree_FetchAuthEnv is the #1951 acceptance-tree object
+// fetch auth test: when the merge-candidate object is ABSENT locally, the fetch
+// runs and must carry the provider-supplied env-scoped auth — exactly one fresh
+// Authorization header — despite a STALE persisted extraheader on the dispatch
+// config. The dispatch checkout's origin points at a recording dumb-HTTP server;
+// the merge-candidate SHA is absent, so the object-fetch path (git fetch origin
+// <sha>) runs and issues a /info/refs GET whose auth is asserted.
+func TestProvisionAcceptanceTree_FetchAuthEnv(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	const token = "ghs-acceptance-fetch-1951"
+	wireAuth := "basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
+	staleValue := "AUTHORIZATION: basic " +
+		base64.StdEncoding.EncodeToString([]byte("x-access-token:stale-persisted"))
+	redirectAcceptanceTreeDir(t)
+
+	dir := t.TempDir()
+	git := func(workdir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", workdir}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	// Bare remote served over dumb HTTP by a recording server.
+	seed := filepath.Join(dir, "seed")
+	bare := filepath.Join(dir, "remote.git")
+	if err := os.Mkdir(seed, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git(seed, "init", "--initial-branch=main")
+	if err := os.WriteFile(filepath.Join(seed, "f.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(seed, "add", "-A")
+	git(seed, "commit", "-m", "seed")
+	git(seed, "init", "--bare", bare)
+	git(seed, "push", bare, "main")
+	git(bare, "update-server-info")
+
+	type recReq struct {
+		path string
+		auth []string
+	}
+	var mu sync.Mutex
+	var requests []recReq
+	fileSrv := http.FileServer(http.Dir(bare))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, recReq{path: r.URL.Path, auth: r.Header.Values("Authorization")})
+		mu.Unlock()
+		fileSrv.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+
+	// Dispatch checkout: a SEPARATE repo (not a clone), so the merge-candidate
+	// object is absent locally and the fetch path runs. Its origin is the server.
+	dispatch := filepath.Join(dir, "dispatch")
+	if err := os.Mkdir(dispatch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git(dispatch, "init", "--initial-branch=main")
+	if err := os.WriteFile(filepath.Join(dispatch, "local.txt"), []byte("y\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(dispatch, "add", "-A")
+	git(dispatch, "commit", "-m", "dispatch initial")
+	git(dispatch, "remote", "add", "origin", srv.URL)
+
+	// Pre-plant a STALE extraheader on the dispatch config keyed to the server.
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := "http." + u.Scheme + "://" + u.Host + "/.extraheader"
+	git(dispatch, "config", "--local", key, staleValue)
+
+	// A syntactically-valid but absent SHA forces the object-fetch path.
+	const missing = "0123456789abcdef0123456789abcdef01234567"
+	var log strings.Builder
+	teardown := provisionAcceptanceTree(context.Background(), dispatch, missing, "run1", "stage1",
+		func() []string {
+			return gitops.AuthEnvForRemote(context.Background(), dispatch, gitops.DefaultRemote, token)
+		}, &log)
+	defer teardown()
+
+	// The object fetch issued at least one /info/refs GET, and every one carried
+	// EXACTLY the fresh token — the stale pre-planted header was reset, not sent
+	// (a duplicate) nor left as the sole (wrong) credential.
+	mu.Lock()
+	reqs := append([]recReq(nil), requests...)
+	mu.Unlock()
+	var authed int
+	for i, rq := range reqs {
+		if !strings.HasSuffix(rq.path, "/info/refs") {
+			continue
+		}
+		if len(rq.auth) == 0 {
+			t.Errorf("request %d (%s) was UNauthenticated — the provider env did not reach the object fetch", i, rq.path)
+			continue
+		}
+		authed++
+		if len(rq.auth) != 1 {
+			t.Errorf("request %d (%s) carried %d Authorization headers %v, want exactly 1 (stale header not reset → duplicate)", i, rq.path, len(rq.auth), rq.auth)
+			continue
+		}
+		if rq.auth[0] != wireAuth {
+			t.Errorf("request %d (%s) Authorization = %q, want fresh %q", i, rq.path, rq.auth[0], wireAuth)
+		}
+	}
+	if authed == 0 {
+		t.Fatalf("object fetch issued no authenticated /info/refs request — provider env did not reach the fetch:\n%s", log.String())
 	}
 }

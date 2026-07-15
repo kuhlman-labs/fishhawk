@@ -92,7 +92,14 @@ func isGitWorkTree(ctx context.Context, dir string) bool {
 // worktrees hang off — so `git worktree add` there follows the
 // provisionLineageWorktree pattern. headSHA is acceptanceExpectedHeadSHA, the
 // backend-resolved merge-candidate identity the #1569 target gate verifies.
-func provisionAcceptanceTree(ctx context.Context, repoDir, headSHA, runID, stageID string, logSink io.Writer) (teardown func()) {
+//
+// fetchAuthEnv is a LAZY, nil-safe provider of the process-scoped git-config
+// auth entries for the object fetch (#1951): it is invoked ONLY when the
+// merge-candidate object is absent locally and a fetch is attempted, so no token
+// is minted on the common already-present path. A nil provider (or one that
+// returns an empty env) leaves the fetch on ambient auth, byte-identical to
+// before. The fetch stays best-effort — a failure warns and proceeds.
+func provisionAcceptanceTree(ctx context.Context, repoDir, headSHA, runID, stageID string, fetchAuthEnv func() []string, logSink io.Writer) (teardown func()) {
 	noop := func() {}
 
 	// (i) Degrade class: no merge-candidate identity (empty expectation — a
@@ -129,8 +136,18 @@ func provisionAcceptanceTree(ctx context.Context, repoDir, headSHA, runID, stage
 	// into the (iv) `worktree add` failure, which warns and proceeds.
 	if err := exec.CommandContext(ctx, "git", "-C", repoDir,
 		"cat-file", "-e", headSHA+"^{commit}").Run(); err != nil {
-		if out, ferr := exec.CommandContext(ctx, "git", "-C", repoDir,
-			"fetch", "origin", headSHA).CombinedOutput(); ferr != nil {
+		fetchCmd := exec.CommandContext(ctx, "git", "-C", repoDir,
+			"fetch", "origin", headSHA)
+		// Lazily resolve the env-scoped auth ONLY now that a fetch is actually
+		// needed (#1951): authenticate the object fetch per-invocation and reset
+		// any stale persisted extraheader on the shared config. A nil provider or
+		// an empty env leaves the fetch on ambient auth, unchanged.
+		if fetchAuthEnv != nil {
+			if env := fetchAuthEnv(); len(env) > 0 {
+				fetchCmd.Env = append(os.Environ(), env...)
+			}
+		}
+		if out, ferr := fetchCmd.CombinedOutput(); ferr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"acceptance_tree_fetch_failed","run_id":%q,"stage_id":%q,"head_sha":%q,"detail":%q}`+"\n",
 				runID, stageID, headSHA, strings.TrimSpace(string(out)))
