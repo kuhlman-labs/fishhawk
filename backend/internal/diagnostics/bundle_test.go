@@ -118,6 +118,33 @@ func TestCollect_ProductFactsOnly(t *testing.T) {
 	}
 }
 
+// TestCollect_NilFailureReason_EmptyDetailClass pins the nil-guard branch
+// in Collect: a failing stage with no recorded FailureReason leaves
+// FailureDetailClass empty (omitempty), degrading to the pre-#1962
+// fingerprint per the backward-compat contract, without ever calling
+// ClassifyFailureDetail on a nil pointer.
+func TestCollect_NilFailureReason_EmptyDetailClass(t *testing.T) {
+	failStageID := uuid.New()
+	r := &run.Run{ID: uuid.New(), WorkflowID: "feature_change", State: run.StateFailed}
+	stages := []*run.Stage{
+		{
+			ID:              failStageID,
+			Sequence:        0,
+			Type:            run.StageTypeImplement,
+			State:           run.StageStateFailed,
+			FailureCategory: ptrCat(run.FailureB),
+			FailureReason:   nil, // no reason recorded on the failed stage
+		},
+	}
+	b := Collect(r, stages, nil, sampleVersions())
+	if b.FailingStage == nil {
+		t.Fatal("FailingStage = nil, want the implement stage")
+	}
+	if b.FailingStage.FailureDetailClass != "" {
+		t.Errorf("FailureDetailClass = %q, want empty for a nil FailureReason", b.FailingStage.FailureDetailClass)
+	}
+}
+
 func TestCollect_NoFailure(t *testing.T) {
 	r := &run.Run{ID: uuid.New(), WorkflowID: "feature_change", State: run.StateSucceeded}
 	stages := []*run.Stage{

@@ -59,13 +59,18 @@ func TestClassifyFailureDetail(t *testing.T) {
 			reason: "fatal: unable to access 'https://github.com/': Failed to connect to github.com port 443: Connection timed out",
 			want:   "target-unreachable",
 		},
-		// Precedence: a line carrying BOTH the shared "unable to access"
-		// prefix and a "401" suffix must classify auth-401, NOT
-		// target-unreachable. This fails if "unable to access" is ever
-		// added as a marker or the auth/unreachable order flips.
+		// Precedence: a synthetic line carrying markers from BOTH the
+		// auth-401 table ("...error: 401") AND the target-unreachable
+		// table ("connection timed out") must classify auth-401, because
+		// detailClassTable checks auth-401 first. This is the case that
+		// actually pins the check ORDER: flipping the auth/unreachable
+		// entries in detailClassTable makes target-unreachable win here
+		// and fails this assertion. (The "unable to access must not be a
+		// marker" property is pinned separately by the requested-url-401
+		// and could-not-resolve-host cases above.)
 		{
-			name:   "access-failure-with-401-is-auth",
-			reason: "fatal: unable to access 'https://github.com/kuhlman-labs/fishhawk/': The requested URL returned error: 401",
+			name:   "auth-and-unreachable-markers-classify-auth",
+			reason: "fatal: unable to access 'https://github.com/kuhlman-labs/fishhawk/': Connection timed out; The requested URL returned error: 401",
 			want:   "auth-401",
 		},
 		// Fail-open: empty and arbitrary unrecognized text classify "".

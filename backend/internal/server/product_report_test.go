@@ -611,6 +611,12 @@ func fingerprintFixture(t *testing.T, af *scAuditFake, category run.FailureCateg
 // ClassifyFailureDetail -> Fingerprint -> dedup search -> render end to end.
 func TestProductReport_DetailClass_SplitsConflatedSurface(t *testing.T) {
 	dp := &dedupFeedbackProvider{name: workmgmt.Default().Provider}
+	// Save and restore the prior registration so this global mutation does
+	// not leak into a product-report test that runs afterward in this
+	// package and relies on its own previously-registered provider.
+	if prev, err := workmgmt.GetFeedback(dp.name); err == nil {
+		t.Cleanup(func() { workmgmt.RegisterFeedback(prev) })
+	}
 	workmgmt.RegisterFeedback(dp)
 
 	const surface = "fixup_base_checkout"
