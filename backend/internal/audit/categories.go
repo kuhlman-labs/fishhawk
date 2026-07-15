@@ -28,7 +28,8 @@ import "sort"
 // refinement-draft approve/reject decisions, the runner-kind resolution
 // events, the deployment-dispatch failure, and the campaign-lifecycle
 // markers (advanced / gate-acted / issue-started / issue-settled /
-// issue-restarted / paused) written via audit.AppendGlobalChained. When a
+// issue-restarted / paused) written via audit.AppendGlobalChained. #1941
+// added the failed-run revive audit kind (run_revived, #1915). When a
 // new canonical category is introduced, add it here so operators can await
 // it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
@@ -153,6 +154,7 @@ var KnownCategories = map[string]struct{}{
 	"run_dispatched":                          {},
 	"run_rejected_budget":                     {},
 	"run_rejected_misconfigured":              {},
+	"run_revived":                             {},
 	"runner_kind_mismatch":                    {},
 	"runner_kind_resolved":                    {},
 	"runtime_observed":                        {},

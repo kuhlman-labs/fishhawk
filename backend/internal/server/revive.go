@@ -13,19 +13,18 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
-// RunRevivedAuditKind is the audit-log category for the single chained
+// RunRevivedCategory is the audit-log category for the single chained
 // entry the revive handler writes when a terminal-failed run is
 // re-admitted. The payload lists each re-parked stage's id / type /
 // prior failure category+reason / restored pre-dispatch state so the
 // audit trail records the whole batch re-park in one entry.
 //
-// The identifier deliberately avoids the "Category" substring so the
-// audit.KnownCategories completeness sweep does not require this string in
-// that registry (which lives in the out-of-scope backend/internal/audit
-// package). Until "run_revived" is added there in a follow-up, operators
-// await it with allow_unknown=true — the bounded escape hatch the registry
-// docstring calls out.
-const RunRevivedAuditKind = "run_revived"
+// The category is registered in audit.KnownCategories (#1941), so operators
+// await it without allow_unknown. The identifier deliberately carries the
+// "Category" substring so this emit site falls under the
+// categories_completeness_test.go value-spec sweep shape, structurally
+// enforcing that the emitted literal and the registry entry never diverge.
+const RunRevivedCategory = "run_revived"
 
 // reviveResponse is the POST /v0/runs/{run_id}/revive success body: the
 // re-opened run plus the per-stage re-park summary.
@@ -173,7 +172,7 @@ func (s *Server) writeReviveAudit(r *http.Request, runID uuid.UUID, restored []r
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:        runID,
 		Timestamp:    time.Now().UTC(),
-		Category:     RunRevivedAuditKind,
+		Category:     RunRevivedCategory,
 		ActorKind:    &actorKind,
 		ActorSubject: &subject,
 		Payload:      payload,
