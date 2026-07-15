@@ -3051,3 +3051,212 @@ func TestPersistReviewConcerns_RelitigationGuardMatrix(t *testing.T) {
 		}
 	})
 }
+
+// --- #1932 fix-up re-review backstop ------------------------------------------
+
+// newFixupReReviewBackstopServer wires an orchestratorRepo run with a succeeded
+// plan stage (+ plan artifact), a RUNNING implement stage requiring approval,
+// the advisory-reviewer feature_change spec, and an installation — the fixture
+// the #1932 fix-up re-review backstop dispatches against. ghBody wires a canned
+// ComparePatch GitHub client (the backstop's diff source); ghErr wires a compare
+// client that 500s instead; both empty leaves GitHub unwired. Returns the
+// server, signing fake, audit fake, run repo, run row, and implement stage.
+func newFixupReReviewBackstopServer(t *testing.T, reviewer PlanReviewer, ghBody string, ghErr bool) (
+	*Server, *signingFake, *auditFake, *orchestratorRepo, *run.Run, *run.Stage,
+) {
+	t.Helper()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+	au := newAuditFake()
+	rr := newOrchestratorRepo()
+
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = specImplementAdvisoryReviewers
+	runRow.Repo = "kuhlman-labs/example"
+	instID := int64(55)
+	runRow.InstallationID = &instID
+
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	seedBudgetPlanArtifact(t, art, planStage.ID, &plan.Plan{
+		PlanVersion:                "standard_v1",
+		Summary:                    "Add foo helper",
+		PredictedRuntimeMinutes:    10,
+		PredictedRuntimeConfidence: plan.RuntimeConfidenceMedium,
+		Scope:                      plan.Scope{Files: []plan.ScopeFile{{Path: "x.go", Operation: plan.FileOpModify}}},
+	})
+
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	cfg := Config{
+		Addr:          "127.0.0.1:0",
+		SigningRepo:   sf,
+		ArtifactRepo:  art,
+		AuditRepo:     au,
+		RunRepo:       rr,
+		PlanReviewers: singleReviewerSet{reviewer},
+	}
+	switch {
+	case ghErr:
+		cfg.GitHub = erroringComparePatchClient(t)
+	case ghBody != "":
+		cfg.GitHub = cannedComparePatchClient(t, ghBody)
+	}
+	s := New(cfg)
+	return s, sf, au, rr, runRow, implStage
+}
+
+// erroringComparePatchClient builds a githubclient.Client whose compare endpoint
+// always 500s, so ComparePatch returns an error — the #1932 backstop's
+// compare-error skip path.
+func erroringComparePatchClient(t *testing.T) *githubclient.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}
+}
+
+// seedImplementReviewStarted appends an implement_review_started audit entry
+// keyed to (stageID, headSHA) with the given timestamp, standing in for a prior
+// review round's pending-signal so a #1932 backstop test can seed the
+// pre-existing ledger state (a prior-head round, the same-head round, or an
+// unkeyed round) before driving the backstop.
+func seedImplementReviewStarted(t *testing.T, au *auditFake, runID, stageID uuid.UUID, headSHA string, ts time.Time) {
+	t.Helper()
+	payload, _ := json.Marshal(map[string]any{
+		"head_sha": headSHA, "configured_agents": 1, "authority": "advisory",
+	})
+	if _, err := au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: ts,
+		Category:  "implement_review_started",
+		Payload:   payload,
+	}); err != nil {
+		t.Fatalf("seed implement_review_started: %v", err)
+	}
+}
+
+// startedHeadSHAs returns the head_sha of every implement_review_started audit
+// entry recorded for the run, in append order.
+func startedHeadSHAs(t *testing.T, au *auditFake, runID uuid.UUID) []string {
+	t.Helper()
+	entries, err := au.ListForRunByCategory(context.Background(), runID, "implement_review_started")
+	if err != nil {
+		t.Fatalf("list implement_review_started: %v", err)
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		var p struct {
+			HeadSHA string `json:"head_sha"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("unmarshal started payload: %v", err)
+		}
+		out = append(out, p.HeadSHA)
+	}
+	return out
+}
+
+// TestBackstopFixupReReview_AlreadyStarted_NoOp pins guard (b): when an
+// implement_review_started entry already exists for (stage, NEW head) — the
+// normal path where the trace-time hook (#793) already dispatched for this head
+// — the backstop detects it and is a no-op: exactly one started entry, and the
+// reviewer is never invoked. Review cost is unchanged on the happy path.
+func TestBackstopFixupReReview_AlreadyStarted_NoOp(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+
+	const newHead = "head-new"
+	seedImplementReviewStarted(t, au, runRow.ID, implStage.ID, newHead, time.Now().UTC())
+
+	s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, newHead, "base-old")
+	s.waitBackgroundReviews()
+
+	if got := startedHeadSHAs(t, au, runRow.ID); len(got) != 1 {
+		t.Errorf("implement_review_started entries = %v, want exactly the seeded one (backstop must no-op when the head already started)", got)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 0 {
+		t.Errorf("reviewer invocations = %d, want 0 (already-started head must not re-review)", len(reviewer.calls))
+	}
+}
+
+// TestBackstopFixupReReview_ComparePatchError_NoDispatch pins the goroutine's
+// compare-error skip: a wired GitHub client whose ComparePatch 500s means the
+// delta cannot be resolved, so runImplementReviews is never called — no
+// implement_review_started for the new head and the reviewer is never invoked.
+// The miss stays diagnosable in the WARN log.
+func TestBackstopFixupReReview_ComparePatchError_NoDispatch(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, "", true)
+
+	seedImplementReviewStarted(t, au, runRow.ID, implStage.ID, "head-old", time.Now().UTC())
+
+	s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, "head-new", "base-old")
+	s.waitBackgroundReviews()
+
+	// Only the seeded prior-head started survives; the compare error aborts the
+	// goroutine before runImplementReviews emits a new started for the new head.
+	if got := startedHeadSHAs(t, au, runRow.ID); len(got) != 1 || got[0] != "head-old" {
+		t.Errorf("implement_review_started entries = %v, want only the seeded [head-old] (compare error must not dispatch)", got)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 0 {
+		t.Errorf("reviewer invocations = %d, want 0 (compare error must not reach the reviewer)", len(reviewer.calls))
+	}
+}
+
+// TestShipPullRequest_FixupPush_BackstopReReview_GitHubNotWired pins guard (d)
+// at the handler level: with GitHub unwired (CLI/dev posture) a fixup_pushed
+// report still drives the terminal transition and records the fixup_pushed audit
+// entry (200 OK), but the backstop dispatches no re-review — no
+// implement_review_started lands and the reviewer is never invoked.
+func TestShipPullRequest_FixupPush_BackstopReReview_GitHubNotWired(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, sf, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, "", false)
+
+	seedImplementReviewStarted(t, au, runRow.ID, implStage.ID, "head-old", time.Now().UTC())
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body, err := json.Marshal(map[string]any{
+		"outcome":             "fixup_pushed",
+		"branch":              "fishhawk/run-aaaaaaaa/stage-bbbbbbbb",
+		"head_sha":            "head-new",
+		"base_sha":            "base-old",
+		"files_changed_count": 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+
+	if n := countAuditCategory(au, "fixup_pushed"); n != 1 {
+		t.Errorf("fixup_pushed audit entries = %d, want 1 (handler must still record the push)", n)
+	}
+	if got := startedHeadSHAs(t, au, runRow.ID); len(got) != 1 || got[0] != "head-old" {
+		t.Errorf("implement_review_started entries = %v, want only the seeded [head-old] (GitHub-not-wired must not dispatch)", got)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 0 {
+		t.Errorf("reviewer invocations = %d, want 0 (GitHub-not-wired backstop must not review)", len(reviewer.calls))
+	}
+}

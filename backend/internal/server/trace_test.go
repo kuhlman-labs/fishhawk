@@ -5633,3 +5633,117 @@ func TestImplementReviewInvocations_ApproveSkipsPageClassHook(t *testing.T) {
 		t.Errorf("implement-review site fired the page-class hook on an all-approve loop; paged=%v", rec.pageClass)
 	}
 }
+
+// --- #1932 fix-up re-review backstop guard branches ---------------------------
+
+// TestBackstopFixupReReview_AuditRepoNil_NoDispatch pins guard (a): a nil
+// AuditRepo means the started ledger is unreadable, so the backstop skips
+// immediately and never reaches ComparePatch or the reviewer.
+func TestBackstopFixupReReview_AuditRepoNil_NoDispatch(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}}
+	s := New(Config{
+		Addr:          "127.0.0.1:0",
+		GitHub:        cannedComparePatchClient(t, cannedCompareOneFile),
+		PlanReviewers: singleReviewerSet{reviewer},
+		// AuditRepo intentionally nil.
+	})
+	stage := &run.Stage{ID: uuid.New(), RunID: uuid.New(), Type: run.StageTypeImplement}
+	s.maybeBackstopFixupReReview(context.Background(), stage.RunID, stage, "head-new", "base-old")
+	s.waitBackgroundReviews()
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 0 {
+		t.Errorf("reviewer invocations = %d, want 0 (nil AuditRepo must skip the backstop)", len(reviewer.calls))
+	}
+}
+
+// TestBackstopFixupReReview_ListError_SkipsClosed pins the guard (b) read-error
+// posture: when listing implement_review_started fails, the backstop cannot tell
+// whether the head already started, so it fails CLOSED (skips) rather than risk a
+// double dispatch — the reviewer is never invoked.
+func TestBackstopFixupReReview_ListError_SkipsClosed(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+	au.listByCategoryErr = errors.New("injected list error")
+
+	s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, "head-new", "base-old")
+	s.waitBackgroundReviews()
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 0 {
+		t.Errorf("reviewer invocations = %d, want 0 (list error must fail closed, no dispatch)", len(reviewer.calls))
+	}
+}
+
+// TestBackstopFixupReReview_EmptyHeadStarted_ConservativeSkip pins guard (c):
+// when the NEWEST implement_review_started entry for the stage carries an empty
+// head_sha, an unkeyed prior round cannot be told apart from a missed one, so the
+// backstop fails closed — no new started entry, reviewer never invoked.
+func TestBackstopFixupReReview_EmptyHeadStarted_ConservativeSkip(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+
+	// The newest (only) started round for the stage is unkeyed (empty head_sha).
+	seedImplementReviewStarted(t, au, runRow.ID, implStage.ID, "", time.Now().UTC())
+
+	s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, "head-new", "base-old")
+	s.waitBackgroundReviews()
+
+	if got := startedHeadSHAs(t, au, runRow.ID); len(got) != 1 {
+		t.Errorf("implement_review_started entries = %v, want only the seeded unkeyed one (empty-head must skip)", got)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 0 {
+		t.Errorf("reviewer invocations = %d, want 0 (empty-head newest round must not dispatch)", len(reviewer.calls))
+	}
+}
+
+// TestNewestImplementReviewStartedHead pins the helper behind the empty-head
+// guard: found reflects whether ANY started entry exists for the stage, and the
+// returned head_sha is the newest by (Timestamp, Sequence) — including an empty
+// head_sha when the newest round is unkeyed.
+func TestNewestImplementReviewStartedHead(t *testing.T) {
+	stageID := uuid.New()
+	other := uuid.New()
+	mk := func(sid uuid.UUID, head string, ts time.Time, seq int64) *audit.Entry {
+		payload, _ := json.Marshal(map[string]any{"head_sha": head})
+		return &audit.Entry{StageID: &sid, Payload: payload, Timestamp: ts, Sequence: seq}
+	}
+	base := time.Now().UTC()
+
+	t.Run("no_entries_for_stage", func(t *testing.T) {
+		if _, found := newestImplementReviewStartedHead([]*audit.Entry{mk(other, "h", base, 1)}, stageID); found {
+			t.Error("found=true for a stage with no started entries, want false (backstop then proceeds)")
+		}
+	})
+	t.Run("newest_by_timestamp", func(t *testing.T) {
+		entries := []*audit.Entry{
+			mk(stageID, "old", base, 1),
+			mk(stageID, "new", base.Add(time.Second), 2),
+		}
+		if sha, found := newestImplementReviewStartedHead(entries, stageID); !found || sha != "new" {
+			t.Errorf("got (%q,%v), want (new,true)", sha, found)
+		}
+	})
+	t.Run("newest_empty_head_returned", func(t *testing.T) {
+		entries := []*audit.Entry{
+			mk(stageID, "old", base, 1),
+			mk(stageID, "", base.Add(time.Second), 2),
+		}
+		if sha, found := newestImplementReviewStartedHead(entries, stageID); !found || sha != "" {
+			t.Errorf("got (%q,%v), want (\"\",true) — the unkeyed newest round", sha, found)
+		}
+	})
+	t.Run("tie_broken_by_sequence", func(t *testing.T) {
+		entries := []*audit.Entry{
+			mk(stageID, "lo", base, 1),
+			mk(stageID, "hi", base, 2),
+		}
+		if sha, _ := newestImplementReviewStartedHead(entries, stageID); sha != "hi" {
+			t.Errorf("got %q, want hi (higher sequence wins the timestamp tie)", sha)
+		}
+	})
+}

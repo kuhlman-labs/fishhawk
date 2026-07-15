@@ -2024,3 +2024,164 @@ func TestShipPullRequest_SupplementalReinvokeReview_GatingReject_FailStageError(
 		t.Error("no pull_request_opened audit entry recorded")
 	}
 }
+
+// TestShipPullRequest_FixupPush_BackstopReReview_WedgeRepro is the #1932
+// cross-boundary seam test: it reproduces the run 98020210 wedge and proves the
+// fix-up re-review backstop resolves it. A fixup_pushed report for a NEW head
+// arrives with ONLY a prior-head implement_review_started on the ledger (the
+// trace-time hook (#793) never fired for the new head — the fix-up's raw trace
+// was routed to category-B by a policy re-evaluation, then #788 recovery restored
+// the stage). Driving the REAL /pull-request handler with the audit repo, a fake
+// GitHub compare endpoint, and a fake reviewer wired, the test asserts the
+// observable end state crossing the report-handler → review-dispatch →
+// audit-emission layers:
+//
+//   - BEFORE the report the implement-review merge gate is HELD (a started entry
+//     exists but no terminal verdict has landed for the round);
+//   - the backstop lands a NEW implement_review_started keyed to the NEW head;
+//   - the reviewer is invoked exactly once with the COMPARE-DERIVED delta (the
+//     base..head patch, not the full bundle diff);
+//   - the fake reviewer drives to a terminal implement_reviewed verdict;
+//   - AFTER the round the merge gate COMPUTES SETTLED (the user-visible wedge
+//     resolution: implement_review_status/reviewStatusFor for the new head is
+//     'complete', not 'pending' — checkImplementReviewSettled is the server-side
+//     computation both share, counting terminal verdicts vs configured agents
+//     against the implement_review_started ledger).
+//
+// The done-means assertion is the NEW-head started entry plus the settled gate:
+// the test fails if the backstop is wired as a no-op touch.
+func TestShipPullRequest_FixupPush_BackstopReReview_WedgeRepro(t *testing.T) {
+	ctx := context.Background()
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, sf, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+
+	const (
+		oldHead = "head-old-5732012c"
+		newHead = "head-new-5d33d25f"
+		base    = "base-def"
+	)
+	// The wedge shape: a prior-head round's started entry ONLY (no terminal
+	// verdict for the round under the fix-up floor), recent so the review-gate
+	// backstop bound has not elapsed.
+	seedImplementReviewStarted(t, au, runRow.ID, implStage.ID, oldHead, time.Now().UTC())
+
+	// Before the report: the implement-review merge gate is held (started, 0
+	// terminal) — the wedge.
+	if s.checkImplementReviewSettled(ctx, runRow, implStage) {
+		t.Fatal("precondition: implement-review gate must be HELD before the backstop (started, no terminal verdict)")
+	}
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body, err := json.Marshal(map[string]any{
+		"outcome":             "fixup_pushed",
+		"branch":              "fishhawk/run-aaaaaaaa/stage-bbbbbbbb",
+		"head_sha":            newHead,
+		"base_sha":            base,
+		"files_changed_count": 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+
+	// A NEW implement_review_started keyed to the NEW head landed (the done-means).
+	started := startedHeadSHAs(t, au, runRow.ID)
+	if len(started) != 2 {
+		t.Fatalf("implement_review_started heads = %v, want 2 (seeded prior + backstop's new-head round)", started)
+	}
+	var sawNewHead bool
+	for _, h := range started {
+		if h == newHead {
+			sawNewHead = true
+		}
+	}
+	if !sawNewHead {
+		t.Errorf("no implement_review_started keyed to the new head %q: got %v", newHead, started)
+	}
+
+	// The reviewer was invoked exactly once with the COMPARE-DERIVED delta — the
+	// base..head patch body from ComparePatch, not the full bundle diff.
+	reviewer.mu.Lock()
+	calls := append([]string(nil), reviewer.calls...)
+	reviewer.mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("reviewer invocations = %d, want 1", len(calls))
+	}
+	if !strings.Contains(calls[0], "@@ -1 +1 @@") {
+		t.Errorf("reviewer prompt did not carry the compare-derived delta patch:\n%s", calls[0])
+	}
+
+	// The fake reviewer drove to a terminal verdict.
+	if n := countAuditCategory(au, "implement_reviewed"); n != 1 {
+		t.Errorf("implement_reviewed entries = %d, want 1 (backstop reviewer must land a terminal verdict)", n)
+	}
+
+	// AFTER the round: the merge gate computes SETTLED — the wedge is resolved.
+	gotRun, err := s.cfg.RunRepo.GetRun(ctx, runRow.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if !s.checkImplementReviewSettled(ctx, gotRun, implStage) {
+		t.Error("implement-review gate must compute SETTLED after the backstop round lands its verdict (wedge resolved)")
+	}
+}
+
+// TestShipPullRequest_FixupPush_BackstopReReview_DuplicateReport_NoDoubleDispatch
+// pins that a redelivered fixup_pushed report does not double-dispatch the
+// backstop: the second identical report short-circuits at the existing
+// (stage_id, head_sha) dedup in succeedFixupPushStage before the backstop runs,
+// so exactly ONE new-head review round is dispatched across both reports.
+func TestShipPullRequest_FixupPush_BackstopReReview_DuplicateReport_NoDoubleDispatch(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, sf, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+
+	const newHead = "head-new-dup"
+	seedImplementReviewStarted(t, au, runRow.ID, implStage.ID, "head-old", time.Now().UTC())
+
+	priv, _ := sf.issue(t, runRow.ID)
+	body, err := json.Marshal(map[string]any{
+		"outcome":             "fixup_pushed",
+		"branch":              "fishhawk/run-aaaaaaaa/stage-bbbbbbbb",
+		"head_sha":            newHead,
+		"base_sha":            "base-old",
+		"files_changed_count": 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ {
+		w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("report %d: status = %d, want 200:\n%s", i, w.Code, w.Body.String())
+		}
+		s.waitBackgroundReviews()
+	}
+
+	// One fixup_pushed audit entry (the redelivery deduped) and exactly one
+	// new-head review round (started + reviewed), never two.
+	if n := countAuditCategory(au, "fixup_pushed"); n != 1 {
+		t.Errorf("fixup_pushed audit entries = %d, want 1 (redelivery must dedup)", n)
+	}
+	newHeadStarts := 0
+	for _, h := range startedHeadSHAs(t, au, runRow.ID) {
+		if h == newHead {
+			newHeadStarts++
+		}
+	}
+	if newHeadStarts != 1 {
+		t.Errorf("new-head implement_review_started rounds = %d, want 1 (backstop must not double-dispatch on redelivery)", newHeadStarts)
+	}
+	if n := countAuditCategory(au, "implement_reviewed"); n != 1 {
+		t.Errorf("implement_reviewed entries = %d, want 1 (no double review on redelivery)", n)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Errorf("reviewer invocations = %d, want 1 (no double review on redelivery)", len(reviewer.calls))
+	}
+}
