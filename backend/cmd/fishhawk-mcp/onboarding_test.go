@@ -149,7 +149,11 @@ func TestOnboarding_RunbookResourceListedAndReadable(t *testing.T) {
 		"dispatched_stale",
 		"[1,240]",
 		// The revive pre-dispatch check reads this audit category before dispatching
-		// a re-parked acceptance stage.
+		// a re-parked acceptance stage. `acceptance_outcome_recorded` alone is NOT
+		// load-bearing for that section — it pre-exists in the acceptance/settled-outcome
+		// text — so pin the section by its unique bold heading, which fails if the
+		// paragraph is dropped or reworded away.
+		"Pre-dispatch check for a re-parked acceptance stage",
 		"acceptance_outcome_recorded",
 	} {
 		if !strings.Contains(c.Text, anchor) {
