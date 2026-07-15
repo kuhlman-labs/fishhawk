@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -2895,6 +2896,32 @@ func (s *Server) emitConsolidatedReviewTruncated(ctx context.Context, runID, sta
 	}
 }
 
+// reviewDispatchMu serializes the implement-review dispatch dedup critical
+// section in runImplementReviews — the #797 (stage_id, head_sha) absence check
+// PLUS the implement_review_started emit, held together so the pair is atomic.
+//
+// Two dispatchers can call runImplementReviews for the SAME (stage, new head)
+// concurrently: the trace-time hook (#793, advanceStageAfterTrace, off the raw
+// trace upload) and the fix-up re-review backstop (#1932,
+// maybeBackstopFixupReReview, off the fixup_pushed report). The #797 guard is a
+// read-then-append across two separate AuditRepo calls; without a lock spanning
+// them, a push report arriving while the trace-time dispatch is between its
+// absence check and its started-emit lets BOTH observe no started entry, both
+// emit, and both dispatch — the double review (2× cost, divergent verdicts, and
+// #777's review_action_hint over-firing on the stale first verdict) the backstop
+// exists to avoid. The backstop's own pre-goroutine absence check (guard (b)) is
+// only a fast no-op path; the load-bearing atomic guarantee is HERE, where both
+// dispatchers converge.
+//
+// Process-global: one backend serves both the trace upload and the pull-request
+// report for a run, so a single mutex closes the race for every (stage, head).
+// The critical section is one list + one append, so the coarse scope does not
+// harm throughput at v0 review volumes (mirrors the p95CacheMu rationale). A
+// multi-replica deployment where the two reports land on different replicas
+// would need a DB-level uniqueness guard for the durable dedup; the in-process
+// lock is the proportionate v0 fix and does not regress that future work.
+var reviewDispatchMu sync.Mutex
+
 // runImplementReviews resolves the implement stage's review config and
 // dispatches the review agents after the diff has landed in the trace
 // bundle (ADR-027 impl 2/2). It mirrors runPlanReviews' decoupling (#584):
@@ -3187,6 +3214,14 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// returns false for an empty headSHA (the no-verify / head_sha-less path),
 	// and a read error WARN-logs and falls through to dispatch — an absent or
 	// unreadable key never suppresses a review.
+	//
+	// The check and the emit below are held together under reviewDispatchMu so
+	// the two concurrent dispatchers for this (stage, head) — the trace-time
+	// hook (#793) and the fix-up re-review backstop (#1932) — cannot both
+	// observe the started entry absent and double-dispatch. See reviewDispatchMu.
+	// Unlocked on every exit from the section (early-return AND after the emit),
+	// never held across the reviewer dispatch below.
+	reviewDispatchMu.Lock()
 	if headSHA != "" && s.cfg.AuditRepo != nil {
 		started, lerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "implement_review_started")
 		if lerr != nil {
@@ -3196,6 +3231,7 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 				slog.String("error", lerr.Error()),
 			)
 		} else if implementReviewAlreadyStarted(started, stageID, headSHA) {
+			reviewDispatchMu.Unlock()
 			return false
 		}
 	}
@@ -3207,6 +3243,7 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// 'configured + running' (pending) from 'none configured'. Mirrors the
 	// plan path (runPlanReviews). Best-effort: never blocks dispatch.
 	s.emitReviewStarted(ctx, runID, stageID, "implement_review_started", authority, reviewersCfg.AgentCount(), headSHA)
+	reviewDispatchMu.Unlock()
 
 	// Resolve the per-invocation reviewer list (#955) up front so the
 	// detached goroutine closes over fully-resolved adapters, never the

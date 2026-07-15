@@ -5747,3 +5747,122 @@ func TestNewestImplementReviewStartedHead(t *testing.T) {
 		}
 	})
 }
+
+// TestRunImplementReviews_ConcurrentDispatch_SingleStarted pins the #1932
+// check-and-start atomicity concern: the two dispatchers that can call
+// runImplementReviews for the SAME (stage, head) — the trace-time hook (#793)
+// and the fix-up re-review backstop (#1932) — converge on the #797
+// read-then-append dedup, which is a TOCTOU window on its own. reviewDispatchMu
+// holds the check and the emit together, so N concurrent same-head dispatchers
+// yield EXACTLY ONE implement_review_started entry and EXACTLY ONE reviewer
+// invocation — never the double review (2× cost / divergent verdicts) the
+// backstop exists to avoid. Without the lock the read-then-append race lets more
+// than one dispatcher slip past the absence check under -race.
+func TestRunImplementReviews_ConcurrentDispatch_SingleStarted(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+
+	const head = "head-shared"
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "x.go", Status: policy.StatusModified}}}
+
+	const racers = 8
+	var wg sync.WaitGroup
+	wg.Add(racers)
+	for i := 0; i < racers; i++ {
+		go func() {
+			defer wg.Done()
+			// Advisory authority (specImplementAdvisoryReviewers): each call
+			// dispatches on s.bgReviews and returns immediately. Only the winner
+			// of the dedup race emits started + dispatches the reviewer.
+			s.runImplementReviews(context.Background(), runRow.ID, implStage.ID, diff, nil, head, nil)
+		}()
+	}
+	wg.Wait()
+	s.waitBackgroundReviews()
+
+	if got := startedHeadSHAs(t, au, runRow.ID); len(got) != 1 || got[0] != head {
+		t.Errorf("implement_review_started entries = %v, want exactly one keyed to %q (atomic check-and-start must dedup concurrent dispatchers)", got, head)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Errorf("reviewer invocations = %d, want 1 (only the dedup winner may dispatch the review)", len(reviewer.calls))
+	}
+}
+
+// TestBackstopFixupReReview_GetRunError_NoDispatch pins guard (d)'s GetRun-error
+// half: with GitHub + run repo wired but the run lookup failing, the backstop
+// cannot resolve the installation/repo, so it fails closed — no
+// implement_review_started for the new head and the reviewer is never invoked.
+func TestBackstopFixupReReview_GetRunError_NoDispatch(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, rr, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+	// Evict the run so RunRepo.GetRun returns run.ErrNotFound — the backstop's
+	// GetRun-error branch (guard (d), second half) without an out-of-scope fake
+	// knob. Guards (b)/(c) still pass (a non-empty prior-head round is seeded).
+	rr.mu.Lock()
+	delete(rr.runs, runRow.ID)
+	rr.mu.Unlock()
+
+	seedImplementReviewStarted(t, au, runRow.ID, implStage.ID, "head-old", time.Now().UTC())
+
+	s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, "head-new", "base-old")
+	s.waitBackgroundReviews()
+
+	if got := startedHeadSHAs(t, au, runRow.ID); len(got) != 1 || got[0] != "head-old" {
+		t.Errorf("implement_review_started entries = %v, want only the seeded [head-old] (get-run error must not dispatch)", got)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 0 {
+		t.Errorf("reviewer invocations = %d, want 0 (get-run error must fail closed)", len(reviewer.calls))
+	}
+}
+
+// TestBackstopFixupReReview_NoInstallationID_NoDispatch pins guard (d)'s
+// nil/zero-InstallationID half: a run with no GitHub App installation cannot
+// mint a token for ComparePatch, so the backstop skips (the same CLI/dev posture
+// as DispatchConsolidatedReview) — no new started entry, reviewer never invoked.
+func TestBackstopFixupReReview_NoInstallationID_NoDispatch(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+	runRow.InstallationID = nil
+
+	seedImplementReviewStarted(t, au, runRow.ID, implStage.ID, "head-old", time.Now().UTC())
+
+	s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, "head-new", "base-old")
+	s.waitBackgroundReviews()
+
+	if got := startedHeadSHAs(t, au, runRow.ID); len(got) != 1 || got[0] != "head-old" {
+		t.Errorf("implement_review_started entries = %v, want only the seeded [head-old] (nil installation must not dispatch)", got)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 0 {
+		t.Errorf("reviewer invocations = %d, want 0 (nil installation must fail closed)", len(reviewer.calls))
+	}
+}
+
+// TestBackstopFixupReReview_ParseRepoError_NoDispatch pins guard (d)'s
+// parseRepoOwnerName-error half: a run whose Repo is not owner/name cannot be
+// resolved for the compare call, so the backstop fails closed before the
+// goroutine — no new started entry, reviewer never invoked.
+func TestBackstopFixupReReview_ParseRepoError_NoDispatch(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+	runRow.Repo = "not-a-valid-owner-name" // no slash → parseRepoOwnerName errors
+
+	seedImplementReviewStarted(t, au, runRow.ID, implStage.ID, "head-old", time.Now().UTC())
+
+	s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, "head-new", "base-old")
+	s.waitBackgroundReviews()
+
+	if got := startedHeadSHAs(t, au, runRow.ID); len(got) != 1 || got[0] != "head-old" {
+		t.Errorf("implement_review_started entries = %v, want only the seeded [head-old] (parse-repo error must not dispatch)", got)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 0 {
+		t.Errorf("reviewer invocations = %d, want 0 (parse-repo error must fail closed)", len(reviewer.calls))
+	}
+}
