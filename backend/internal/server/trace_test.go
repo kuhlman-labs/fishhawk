@@ -5419,7 +5419,16 @@ func TestScopeProvenanceForReview_SkippedPathsMarkedTouched(t *testing.T) {
 		t.Fatal("prov = nil")
 	}
 	for _, skip := range []string{"pkg/", "/abs.go", "../esc.go"} {
-		if f, ok := foldByPath(prov.Folds, skip); ok && !f.Touched {
+		// Require PRESENCE, not just guard on it: an `ok && !f.Touched` check
+		// passes vacuously if a future refactor drops these paths from Folds
+		// entirely, defeating the test's purpose (pinning that skip paths are
+		// recorded AND marked touched). Assert both.
+		f, ok := foldByPath(prov.Folds, skip)
+		if !ok {
+			t.Errorf("skip path %q absent from Folds, want present and marked Touched", skip)
+			continue
+		}
+		if !f.Touched {
 			t.Errorf("skip path %q Touched = false, want true (never matches a committed path)", skip)
 		}
 	}
