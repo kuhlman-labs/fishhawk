@@ -309,6 +309,51 @@ func TestFailStageFromDispatchedWalksThroughRunning(t *testing.T) {
 	}
 }
 
+// #1912 non-CAS arm: FailStage on a parked awaiting_host_dispatch stage must
+// walk awaiting_host_dispatch → dispatched → running → failed (the base machine
+// forbids skipping any edge), landing failed with the caller's category. This
+// runs on the non-CAS memRepo, so the walk is not merely the CAS path's doing.
+func TestFailStageFromAwaitingHostDispatchWalks(t *testing.T) {
+	stage := newStage(run.StageStateAwaitingHostDispatch)
+	repo := newMemRepo(stage)
+
+	got, err := run.FailStage(context.Background(), repo, stage.ID, run.FailureC, "parked spawn abandoned")
+	if err != nil {
+		t.Fatalf("FailStage: %v", err)
+	}
+	if got.State != run.StageStateFailed {
+		t.Errorf("State = %q, want failed", got.State)
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != run.FailureC {
+		t.Errorf("FailureCategory = %v, want C", got.FailureCategory)
+	}
+}
+
+// #1912 CAS arm: the same parked → failed walk through the compare-and-swap
+// path (as against the production postgresRepo). failStageCAS must re-anchor its
+// expected from-state per step — awaiting_host_dispatch for the first CAS, then
+// the produced dispatched/running states — landing failed with the right
+// category, so the CAS path handles the new leading edge too.
+func TestFailStageCASFromAwaitingHostDispatchWalks(t *testing.T) {
+	stage := newStage(run.StageStateAwaitingHostDispatch)
+	base := newMemRepo(stage)
+	repo := &casMemRepo{memRepo: base}
+
+	got, err := run.FailStage(context.Background(), repo, stage.ID, run.FailureC, "parked spawn abandoned")
+	if err != nil {
+		t.Fatalf("FailStage: %v", err)
+	}
+	if got.State != run.StageStateFailed {
+		t.Errorf("state = %q, want failed", got.State)
+	}
+	if got.FailureCategory == nil || *got.FailureCategory != run.FailureC {
+		t.Errorf("failure category = %v, want C", got.FailureCategory)
+	}
+	if got.EndedAt == nil {
+		t.Error("ended_at not stamped on terminal transition")
+	}
+}
+
 func TestFailStageRejectsInvalidCategory(t *testing.T) {
 	stage := newStage(run.StageStateRunning)
 	repo := newMemRepo(stage)

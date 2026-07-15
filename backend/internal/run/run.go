@@ -45,8 +45,17 @@ func (s State) IsTerminal() bool {
 
 // StageState is the lifecycle state of a single workflow stage.
 //
-// `dispatched` means the workflow_dispatch event has been sent to
-// GitHub but the runner has not yet checked in. `running` means the
+// `awaiting_host_dispatch` and `dispatched` are the two halves of the
+// #1912 split of the old conflated local-`dispatched` state.
+// `awaiting_host_dispatch` means the backend wants this agent stage
+// executed but the runner is host-spawned per ADR-024 and NO spawn
+// attempt exists yet — a parked judgment awaiting a host/operator action
+// (see the host-dispatch marker endpoint POST
+// /v0/runs/{run_id}/stages/{stage_id}/host-dispatch, a sibling slice).
+// `dispatched` now unambiguously means a spawn attempt EXISTS — either
+// the workflow_dispatch event has been sent to GitHub (the
+// github_actions path) or a host spawn was marked (the local path) — but
+// the runner has not yet checked in. `running` means the
 // runner has started executing. `awaiting_approval` means a gate is
 // blocking on human action. `awaiting_input` means the stage parked
 // for operator direction — the planner emitted a clarification_request
@@ -75,7 +84,15 @@ type StageState string
 // Stage states. Terminal states (Succeeded, Failed, Cancelled) admit
 // no further transitions; see transition.go for the table.
 const (
-	StageStatePending               StageState = "pending"
+	StageStatePending StageState = "pending"
+	// StageStateAwaitingHostDispatch is the parked-for-host-spawn state (#1912):
+	// the backend wants this agent stage executed but the runner is host-spawned
+	// per ADR-024 and no spawn attempt exists yet. It is written in exactly one
+	// place (orchestrator.dispatchStage, a sibling slice) for a runner_kind-
+	// locked-local run and cleared by the host-dispatch marker
+	// (awaiting_host_dispatch → dispatched). Settled (a parked judgment awaiting
+	// operator/host action, mirroring awaiting_approval), never terminal.
+	StageStateAwaitingHostDispatch  StageState = "awaiting_host_dispatch"
 	StageStateDispatched            StageState = "dispatched"
 	StageStateRunning               StageState = "running"
 	StageStateAwaitingApproval      StageState = "awaiting_approval"
@@ -113,10 +130,12 @@ func (s StageState) IsTerminal() bool {
 // progress on its own — it is either terminal (succeeded, failed,
 // cancelled) or parked awaiting an operator action (awaiting_approval,
 // awaiting_children, awaiting_input, awaiting_scope_decision,
-// awaiting_deploy_approval). The in-flight states (pending, dispatched,
-// running, awaiting_deployment) are NOT settled — awaiting_deployment is the
-// executor polling the external pipeline, not an operator gate (#1384,
-// operator binding condition 2).
+// awaiting_deploy_approval, awaiting_host_dispatch). The in-flight states
+// (pending, dispatched, running, awaiting_deployment) are NOT settled —
+// awaiting_deployment is the executor polling the external pipeline, not an
+// operator gate (#1384, operator binding condition 2). awaiting_host_dispatch
+// IS settled — the stage needs a host/operator spawn action before it can
+// proceed, mirroring awaiting_approval (#1912).
 //
 // This is a strictly wider classifier than IsTerminal, used by the
 // stage terminal-wait long-poll (GET /v0/runs/{run_id}/stages/{stage_id}
@@ -129,7 +148,7 @@ func (s StageState) IsSettled() bool {
 	case StageStateSucceeded, StageStateFailed, StageStateCancelled,
 		StageStateAwaitingApproval, StageStateAwaitingChildren,
 		StageStateAwaitingInput, StageStateAwaitingScopeDecision,
-		StageStateAwaitingDeployApproval:
+		StageStateAwaitingDeployApproval, StageStateAwaitingHostDispatch:
 		return true
 	default:
 		return false
