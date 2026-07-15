@@ -2674,30 +2674,53 @@ func buildImplementReview(t Trigger) string {
 		"leave it absent for any concern whose resolution needs judgement or touches multiple call sites.\n\n")
 
 	// Review criteria — what the agent should assess. The lens is aimed at
-	// what the deterministic gates CANNOT see (#703); see the non-goals below.
+	// what the deterministic gates CANNOT see (#703). The default branches on
+	// whether machine-verified gate evidence accompanies the diff (ADR-059 /
+	// #1883): WITH evidence, mechanical correctness is deferred to that section
+	// and the generic-bug-hunt suppression stands (there are concrete gate
+	// results to point at); with NO evidence, the product holds no proof any
+	// upstream gate checked correctness, so a correctness lens is ENABLED and
+	// the bug-hunt suppression is withheld.
 	b.WriteString("### Review criteria\n\n")
 	if t.GateEvidence != nil {
 		// Deferral variant (#963): when gate evidence is present, the
 		// non-goals preamble must NOT assert that mechanical correctness
 		// "is already gated" — that unconditional claim is what licensed
 		// the run-07bce059 reviewer to ignore build truth. Point at the
-		// evidence section instead.
+		// evidence section instead. The two suppression bullets (plan
+		// adherence + generic-bug-hunt) stand ONLY here (ADR-059 / #1883):
+		// the evidence section supplies concrete machine-verified gate
+		// results, so the bug hunt is genuinely the lowest-orthogonality lens.
 		b.WriteString("**Non-goals — do NOT spend the review on these.** Mechanical correctness is reported by " +
 			"the deterministic gates in the 'Gate evidence' section below — read THAT section for the actual " +
 			"build/test/scope state rather than assuming the gates passed. A failed or skipped gate there is " +
 			"ground truth and overrides any presumption that the change is well-formed. Beyond reading that " +
 			"section:\n")
+		b.WriteString("- Do NOT re-verify plan adherence. Whether the diff mechanically implements the plan's approach " +
+			"steps is covered by the policy gate, the tests, and CI — re-stating it here adds no signal.\n")
+		b.WriteString("- Do NOT generic-bug-hunt. Hunting for arbitrary bugs overlaps the test suite and CI and is the " +
+			"lowest-orthogonality lens; spend the review on the three lenses below instead.\n\n")
+		b.WriteString("Apply these three orthogonal lenses — the gaps the deterministic gates are blind to. " +
+			"Record a concern for each gap found:\n\n")
 	} else {
-		b.WriteString("**Non-goals — do NOT spend the review on these.** Mechanical correctness is already gated " +
-			"upstream: the policy gate, the test suite the implement agent ran, build/lint, and CI all check that " +
-			"the change is present and well-formed. Therefore:\n")
+		// Inverted default (ADR-059 / #1883): NO machine-verified gate
+		// evidence accompanies this diff, so the reviewer must NOT assume any
+		// upstream gate checked correctness. Correctness review IS in scope
+		// here (the enabled correctness lens rendered after lens 3 below), and
+		// the generic-bug-hunt suppression is withheld — there is no evidence
+		// section to point at. The plan-adherence non-goal survives in a
+		// reworded form that no longer claims the policy gate/tests/CI cover
+		// it (a step-by-step restatement is low signal on its own; material
+		// deviations surface through the lenses).
+		b.WriteString("**No machine-verified gate evidence accompanies this diff.** Do NOT assume any upstream gate " +
+			"(the policy gate, the test suite, build/lint, or CI) checked that the change is CORRECT — the product " +
+			"holds no evidence that it did. Correctness review IS in scope for this pass. Beyond that:\n")
+		b.WriteString("- Do NOT re-verify plan adherence. Restating step by step whether the diff mechanically " +
+			"implements the plan's approach steps is low signal on its own; material deviations from the plan " +
+			"surface through the lenses below rather than through a mechanical re-walk.\n\n")
+		b.WriteString("Apply these orthogonal lenses — the gaps a passing gate would still leave open. " +
+			"Record a concern for each gap found:\n\n")
 	}
-	b.WriteString("- Do NOT re-verify plan adherence. Whether the diff mechanically implements the plan's approach " +
-		"steps is covered by the policy gate, the tests, and CI — re-stating it here adds no signal.\n")
-	b.WriteString("- Do NOT generic-bug-hunt. Hunting for arbitrary bugs overlaps the test suite and CI and is the " +
-		"lowest-orthogonality lens; spend the review on the three lenses below instead.\n\n")
-	b.WriteString("Apply these three orthogonal lenses — the gaps the deterministic gates are blind to. " +
-		"Record a concern for each gap found:\n\n")
 	b.WriteString("1. **Security / authz**: Does the diff widen the attack surface, mishandle a token or secret, " +
 		"skip an authz / scope / audience check, or trust untrusted input? Anchor this to Fishhawk's " +
 		"code-execution threat model — an agent that runs arbitrary commands against a repo, where the live risk " +
@@ -2712,6 +2735,18 @@ func buildImplementReview(t Trigger) string {
 	b.WriteString("3. **Untested error / edge / concurrency paths**: Does the change add happy-path code plus a " +
 		"happy-path test that silently skips the error branch, a boundary condition, or a race / concurrency " +
 		"path the change introduces? Flag the specific untested path.\n\n")
+	if t.GateEvidence == nil {
+		// Correctness lens — enabled ONLY on the no-evidence branch (ADR-059
+		// / #1883). Rendered as an unnumbered entry adjacent to lenses 1-3 so
+		// the numbered lenses and standing criteria 4-7 keep byte-identical
+		// numbering across both branches (the verdict rule cross-references
+		// "standing rule 7", and multiple tests pin the numbered strings).
+		b.WriteString("**Correctness on the paths the diff touches (enabled — no gate evidence is held for this " +
+			"run)**: Check that the change behaves correctly on the code paths it touches — logic errors, inverted " +
+			"conditions, wrong defaults or boundary values, and invariants the diff breaks. No upstream gate has " +
+			"certified that this diff compiles or passes its tests, so this lens is in scope. Record each defect " +
+			"found as a concern.\n\n")
+	}
 	b.WriteString("Three standing criteria orthogonal to the lenses above also apply:\n\n")
 	b.WriteString("4. **Scope adherence (flag-only)**: Does the diff touch files outside the plan's scope.files? " +
 		"If so, record a `{category: \"scope\"}` concern naming the out-of-scope files. " +
@@ -2743,10 +2778,21 @@ func buildImplementReview(t Trigger) string {
 		"sensitive surface) and any concerns are cosmetic.\n")
 	b.WriteString("- `approve_with_concerns`: diff is acceptable but has non-blocking gaps (including any scope drift); " +
 		"record each gap as a concern with appropriate severity.\n")
-	b.WriteString("- `reject`: diff has one or more blocking problems — a security / authz regression, a vacuous test " +
-		"that does not assert the behavior it claims, or an unhandled error / edge path the change introduces — " +
-		"that must be resolved; record each blocker as a `high`-severity concern. " +
-		"Scope drift ALONE is never grounds for reject; emit approve_with_concerns instead. " +
+	if t.GateEvidence == nil {
+		// No-evidence branch (ADR-059 / #1883): the enabled correctness lens
+		// gives a correctness defect on a touched path as an additional reject
+		// ground. The pinned substring "a security / authz regression, a
+		// vacuous test" is preserved verbatim.
+		b.WriteString("- `reject`: diff has one or more blocking problems — a security / authz regression, a vacuous test " +
+			"that does not assert the behavior it claims, an unhandled error / edge path the change introduces, or a " +
+			"correctness defect on a code path the change touches — that must be resolved; record each blocker as a " +
+			"`high`-severity concern. ")
+	} else {
+		b.WriteString("- `reject`: diff has one or more blocking problems — a security / authz regression, a vacuous test " +
+			"that does not assert the behavior it claims, or an unhandled error / edge path the change introduces — " +
+			"that must be resolved; record each blocker as a `high`-severity concern. ")
+	}
+	b.WriteString("Scope drift ALONE is never grounds for reject; emit approve_with_concerns instead. " +
 		"A required file merely APPEARING absent from the scope-bounded diff is ALSO never grounds for reject (it " +
 		"may be a drift path the operator stages); per standing rule 7, treat an absence you cannot positively " +
 		"confirm as unverifiable and emit approve_with_concerns, not a confirmed-missing reject.\n\n")

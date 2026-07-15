@@ -4250,11 +4250,13 @@ func TestBuild_ImplementReview_GroundsRuleCitationsAndScopesStyle(t *testing.T) 
 }
 
 func TestBuild_ImplementReview_OrthogonalLenses(t *testing.T) {
-	// #703: the implement-review prompt is re-aimed at the lenses the
-	// deterministic gates (policy gate, test suite, build/lint, CI) cannot
-	// see — security/authz, test vacuity, and untested error/edge/concurrency
-	// paths — and explicitly stops re-verifying plan adherence or
-	// generic-bug-hunting. The security lens is self-gating on low-risk diffs.
+	// #703 + ADR-059/#1883: the implement-review prompt is re-aimed at the
+	// lenses the deterministic gates (policy gate, test suite, build/lint, CI)
+	// cannot see — security/authz, test vacuity, and untested
+	// error/edge/concurrency paths. This fixture holds NO gate evidence, so
+	// the inverted default applies: a correctness lens is ENABLED and the
+	// generic-bug-hunt suppression is withheld. The security lens is
+	// self-gating on low-risk diffs.
 	got, err := Build("implement_review", Trigger{
 		Repo:         "kuhlman-labs/example",
 		ApprovedPlan: fixturePlan(),
@@ -4264,15 +4266,16 @@ func TestBuild_ImplementReview_OrthogonalLenses(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 	wants := []string{
-		// Explicit non-goals.
+		// Plan-adherence non-goal survives (reworded on this branch).
 		"Do NOT re-verify plan adherence",
-		"Do NOT generic-bug-hunt",
 		// The three orthogonal lenses.
 		"Security / authz",
 		"lethal trifecta",
 		"Test vacuity",
 		"vacuous",
 		"Untested error / edge / concurrency paths",
+		// The correctness lens is enabled on the no-evidence branch.
+		"Correctness on the paths the diff touches (enabled — no gate evidence is held for this run)",
 		// Self-gating escape on a low-risk diff.
 		"if the diff touches NO sensitive surface",
 		"manufacture a security concern for a low-risk diff",
@@ -4282,9 +4285,23 @@ func TestBuild_ImplementReview_OrthogonalLenses(t *testing.T) {
 			t.Errorf("implement_review prompt missing %q:\n%s", w, got)
 		}
 	}
+	// On the no-evidence branch the generic-bug-hunt suppression is withheld
+	// and the unconditional upstream-gating claim is gone.
+	for _, absent := range []string{
+		"Do NOT generic-bug-hunt",
+		"Mechanical correctness is already gated upstream",
+	} {
+		if strings.Contains(got, absent) {
+			t.Errorf("no-evidence prompt must not contain %q:\n%s", absent, got)
+		}
+	}
 	// Decision rule is re-anchored on the new lenses, not plan adherence.
 	if !strings.Contains(got, "a security / authz regression, a vacuous test") {
 		t.Errorf("verdict decision rule not re-aimed at the new lenses:\n%s", got)
+	}
+	// The correctness lens adds a correctness-defect reject ground.
+	if !strings.Contains(got, "correctness defect on a code path the change touches") {
+		t.Errorf("verdict decision rule missing the correctness-defect reject ground:\n%s", got)
 	}
 	// Determinism still holds across replays.
 	again, _ := Build("implement_review", Trigger{
@@ -4294,6 +4311,65 @@ func TestBuild_ImplementReview_OrthogonalLenses(t *testing.T) {
 	})
 	if got != again {
 		t.Errorf("implement_review prompt is non-deterministic across calls")
+	}
+}
+
+// TestBuild_ImplementReview_CorrectnessLensBranchSelection is the done-means
+// behavioral test for the ADR-059 / #1883 inversion: it drives both branches
+// of buildImplementReview's no-gate-evidence default from one table and pins,
+// per branch, that the correctness lens + correctness reject ground render
+// exactly when NO gate evidence is held, while the generic-bug-hunt
+// suppression + deferral preamble render exactly when evidence IS present.
+func TestBuild_ImplementReview_CorrectnessLensBranchSelection(t *testing.T) {
+	const (
+		correctnessLens        = "Correctness on the paths the diff touches (enabled — no gate evidence is held for this run)"
+		correctnessRejectGroun = "correctness defect on a code path the change touches"
+		bugHuntSuppression     = "Do NOT generic-bug-hunt"
+		alreadyGatedClaim      = "Mechanical correctness is already gated upstream"
+		noEvidencePreamble     = "**No machine-verified gate evidence accompanies this diff.**"
+		deferralPreamble       = "Mechanical correctness is reported by the deterministic gates in the 'Gate evidence' section below"
+	)
+	tests := []struct {
+		name    string
+		gate    *GateEvidence
+		present []string // substrings that MUST render on this branch
+		absent  []string // substrings that MUST NOT render on this branch
+	}{
+		{
+			name:    "no gate evidence enables the correctness lens",
+			gate:    nil,
+			present: []string{correctnessLens, correctnessRejectGroun, noEvidencePreamble},
+			absent:  []string{bugHuntSuppression, alreadyGatedClaim, deferralPreamble},
+		},
+		{
+			name:    "gate evidence retains the bug-hunt suppression",
+			gate:    &GateEvidence{},
+			present: []string{bugHuntSuppression, deferralPreamble},
+			absent:  []string{correctnessLens, correctnessRejectGroun, alreadyGatedClaim, noEvidencePreamble},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Build("implement_review", Trigger{
+				Repo:         "kuhlman-labs/example",
+				ApprovedPlan: fixturePlan(),
+				Diff:         "- M pkg/bar/bar.go\n",
+				GateEvidence: tc.gate,
+			})
+			if err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+			for _, w := range tc.present {
+				if !strings.Contains(got, w) {
+					t.Errorf("prompt missing expected %q:\n%s", w, got)
+				}
+			}
+			for _, w := range tc.absent {
+				if strings.Contains(got, w) {
+					t.Errorf("prompt must not contain %q:\n%s", w, got)
+				}
+			}
+		})
 	}
 }
 
@@ -4922,6 +4998,18 @@ func TestBuild_ImplementReview_GateEvidence_RendersAllFacts(t *testing.T) {
 	if strings.Contains(got, "Mechanical correctness is already gated upstream") {
 		t.Errorf("evidence-present prompt must not assert unconditional upstream gating:\n%s", got)
 	}
+	// ADR-059 / #1883: the generic-bug-hunt suppression stands ONLY on the
+	// with-evidence branch, and the correctness lens (a no-evidence-only
+	// entry) must NOT render here.
+	if !strings.Contains(got, "Do NOT generic-bug-hunt") {
+		t.Errorf("evidence-present prompt must retain the generic-bug-hunt suppression:\n%s", got)
+	}
+	if strings.Contains(got, "Correctness on the paths the diff touches (enabled") {
+		t.Errorf("evidence-present prompt must not render the correctness lens:\n%s", got)
+	}
+	if strings.Contains(got, "correctness defect on a code path the change touches") {
+		t.Errorf("evidence-present verdict rule must not add the correctness reject ground:\n%s", got)
+	}
 	// Neither run in this fixture is superseded, so the per-run SUPERSEDED
 	// marker must NOT appear — only an absorbed iteration carries it (#1205).
 	if strings.Contains(got, "— SUPERSEDED (absorbed by the verify-fix loop") {
@@ -5441,9 +5529,11 @@ func TestBuild_ImplementReview_GateEvidence_AbsorbedThenPassed(t *testing.T) {
 
 func TestBuild_ImplementReview_GateEvidence_AbsentWhenNil(t *testing.T) {
 	// #963 additive property (the #984 pattern): a nil GateEvidence leaves
-	// the review prompt byte-identical to omitting the field entirely —
-	// no section, and the original non-goals preamble intact — so
-	// reviewer behavior on no-gate runs is unchanged.
+	// the review prompt byte-identical to omitting the field entirely — no
+	// section. ADR-059 / #1883 retires the identical-to-pre-#963-output
+	// property: nil evidence now selects the correctness-enabled (inverted
+	// default) variant, so the no-evidence preamble marker is asserted here
+	// while the nil-vs-omitted byte-identity is retained.
 	base := Trigger{
 		Repo:         "kuhlman-labs/example",
 		ApprovedPlan: fixturePlan(),
@@ -5463,8 +5553,8 @@ func TestBuild_ImplementReview_GateEvidence_AbsentWhenNil(t *testing.T) {
 	if strings.Contains(gotBase, "### Gate evidence") {
 		t.Errorf("gate-evidence section should be absent when GateEvidence is nil:\n%s", gotBase)
 	}
-	if !strings.Contains(gotBase, "Mechanical correctness is already gated upstream") {
-		t.Errorf("nil-evidence prompt must keep the original non-goals preamble:\n%s", gotBase)
+	if !strings.Contains(gotBase, "**No machine-verified gate evidence accompanies this diff.**") {
+		t.Errorf("nil-evidence prompt must render the inverted no-evidence preamble:\n%s", gotBase)
 	}
 	if gotBase != gotNil {
 		t.Errorf("explicit-nil GateEvidence must be byte-identical to omitting it")
