@@ -18,6 +18,13 @@ fail() { print "FAIL: $1"; FAIL=$(( FAIL + 1 )) }
 DEV_LIB_ONLY=1 source "${REPO_ROOT}/scripts/dev"
 set +e
 
+# Sourcing scripts/dev sets the global REPO_ROOT to this repo. The #1917
+# worktree/sweep fixtures below re-point REPO_ROOT (and cwd) at throwaway git
+# repos to drive the git-backed helpers hermetically; capture the originals so
+# each fixture block can restore them.
+orig_repo_root="$REPO_ROOT"
+orig_pwd="$PWD"
+
 # 1. _signal_mcp_activation is now KIND-form (ADR-060 / #1922): one banner per
 # kind (schema_major | shim_rebuilt | reconnect | auto_swap | none). Assert the
 # shipped text of each, not mere helper presence.
@@ -1737,6 +1744,387 @@ else
   psql "$base_db_url" -q -c "DROP DATABASE IF EXISTS \"${live_preview_db}\" WITH (FORCE)" >/dev/null 2>&1
   psql "$base_db_url" -q -c "GRANT CONNECT ON DATABASE \"${live_dev_db}\" TO PUBLIC" >/dev/null 2>&1
   psql "$base_db_url" -q -c "DROP ROLE IF EXISTS ${live_role}" >/dev/null 2>&1
+fi
+
+# ── Stale operator-worktree warning + run-artifact litter sweep (#1917) ──────
+
+# 16. _classify_worktree pure precedence table (dirty > detached > merged > active).
+if [[ "$(_classify_worktree ' M f' 1 somebranch)" == dirty ]]; then
+  pass "_classify_worktree: dirty wins over merged"
+else
+  fail "_classify_worktree: a dirty merged worktree should classify dirty (got: $(_classify_worktree ' M f' 1 somebranch))"
+fi
+if [[ "$(_classify_worktree '' 1 somebranch)" == merged ]]; then
+  pass "_classify_worktree: clean merged-ancestor -> merged"
+else
+  fail "_classify_worktree: clean + is_merged should be merged"
+fi
+if [[ "$(_classify_worktree '' 0 somebranch)" == active ]]; then
+  pass "_classify_worktree: clean unmerged -> active"
+else
+  fail "_classify_worktree: clean + unmerged should be active"
+fi
+if [[ "$(_classify_worktree '' 0 '')" == detached ]]; then
+  pass "_classify_worktree: empty branch -> detached"
+else
+  fail "_classify_worktree: empty branch should be detached"
+fi
+if [[ "$(_classify_worktree ' M f' 0 '')" == dirty ]]; then
+  pass "_classify_worktree: dirty wins even with an empty branch"
+else
+  fail "_classify_worktree: dirty should win regardless of branch"
+fi
+
+# 17. _scan_operator_worktrees + _warn_stale_worktrees against a real git repo.
+# Fixture: a main checkout with an origin/main ref and four operator worktrees
+# under .claude/worktrees — merged-clean, merged-but-dirty, unmerged, detached.
+if command -v git >/dev/null 2>&1; then
+  gitfix="$(mktemp -d -t test-dev-worktrees.XXXXXX)"
+  (
+    set -e
+    cd "$gitfix"
+    git init -q -b main main
+    cd main
+    git config user.email t@example.com
+    git config user.name tester
+    git config commit.gpgsign false
+    echo a > f
+    git add f
+    git commit -qm base
+    base_sha="$(git rev-parse HEAD)"
+    git update-ref refs/remotes/origin/main "$base_sha"
+    mkdir -p .claude/worktrees
+    git branch merged-clean
+    git worktree add -q .claude/worktrees/wt-merged merged-clean
+    git branch merged-dirty
+    git worktree add -q .claude/worktrees/wt-merged-dirty merged-dirty
+    echo dirt >> .claude/worktrees/wt-merged-dirty/f
+    git branch unmerged
+    git worktree add -q .claude/worktrees/wt-unmerged unmerged
+    ( cd .claude/worktrees/wt-unmerged && echo b > g && git add g && git commit -qm ahead )
+    git worktree add -q --detach .claude/worktrees/wt-detached "$base_sha"
+  )
+  if [[ -d "$gitfix/main/.claude/worktrees/wt-merged" ]]; then
+    scan_out="$(_scan_operator_worktrees "$gitfix/main/.claude/worktrees" refs/remotes/origin/main)"
+    if print -r -- "$scan_out" | grep -qE "^merged"$'\t'".*/wt-merged$"; then
+      pass "_scan_operator_worktrees: merged-clean worktree classifies merged"
+    else
+      fail "_scan: wt-merged should be merged (got: $scan_out)"
+    fi
+    if print -r -- "$scan_out" | grep -qE "^dirty"$'\t'".*/wt-merged-dirty$"; then
+      pass "_scan_operator_worktrees: dirty merged worktree classifies dirty"
+    else
+      fail "_scan: wt-merged-dirty should be dirty (got: $scan_out)"
+    fi
+    if print -r -- "$scan_out" | grep -qE "^active"$'\t'".*/wt-unmerged$"; then
+      pass "_scan_operator_worktrees: unmerged worktree classifies active"
+    else
+      fail "_scan: wt-unmerged should be active (got: $scan_out)"
+    fi
+    if print -r -- "$scan_out" | grep -qE "^detached"$'\t'".*/wt-detached$"; then
+      pass "_scan_operator_worktrees: detached worktree classifies detached"
+    else
+      fail "_scan: wt-detached should be detached (got: $scan_out)"
+    fi
+    # _warn_stale_worktrees names ONLY the merged-clean path.
+    REPO_ROOT="$gitfix/main"
+    warn_out="$(_warn_stale_worktrees 2>&1)"
+    REPO_ROOT="$orig_repo_root"
+    if print -r -- "$warn_out" | grep -q "/wt-merged$"; then
+      pass "_warn_stale_worktrees names the merged-clean worktree"
+    else
+      fail "_warn_stale_worktrees should name wt-merged (got: $warn_out)"
+    fi
+    if print -r -- "$warn_out" | grep -qE "wt-merged-dirty|wt-unmerged|wt-detached"; then
+      fail "_warn_stale_worktrees should name ONLY merged-clean (got: $warn_out)"
+    else
+      pass "_warn_stale_worktrees excludes dirty/active/detached worktrees"
+    fi
+  else
+    fail "git worktree fixture setup failed (no wt-merged)"
+  fi
+  rm -rf "$gitfix"
+
+  # 17b. Degrade-to-silence: a missing .claude/worktrees dir and an unresolvable
+  # origin/main both yield NO warning and exit 0 (cmd_up never aborts).
+  silfix="$(mktemp -d -t test-dev-silent.XXXXXX)"
+  ( set -e; cd "$silfix"; git init -q -b main main; cd main
+    git config user.email t@e.com; git config user.name t; git config commit.gpgsign false
+    echo a > f; git add f; git commit -qm base )
+  REPO_ROOT="$silfix/main"
+  # No .claude/worktrees dir at all -> silence, rc 0.
+  sil_out="$(_warn_stale_worktrees 2>&1)"; sil_rc=$?
+  REPO_ROOT="$orig_repo_root"
+  if [[ -z "$sil_out" && "$sil_rc" == 0 ]]; then
+    pass "_warn_stale_worktrees: missing .claude/worktrees degrades to silence (rc 0)"
+  else
+    fail "_warn_stale_worktrees should be silent+rc0 with no worktrees dir (out: $sil_out rc: $sil_rc)"
+  fi
+  # A worktrees dir present but origin/main unresolvable -> still silence, rc 0.
+  ( set -e; cd "$silfix/main"; mkdir -p .claude/worktrees
+    git branch feat; git worktree add -q .claude/worktrees/wt feat )
+  REPO_ROOT="$silfix/main"
+  sil2_out="$(_warn_stale_worktrees 2>&1)"; sil2_rc=$?
+  REPO_ROOT="$orig_repo_root"
+  if [[ -z "$sil2_out" && "$sil2_rc" == 0 ]]; then
+    pass "_warn_stale_worktrees: unresolvable origin/main degrades to silence (rc 0)"
+  else
+    fail "_warn_stale_worktrees should be silent+rc0 when origin/main is unresolvable (out: $sil2_out rc: $sil2_rc)"
+  fi
+  rm -rf "$silfix"
+else
+  print "skip: git not found — skipping worktree scan/warn fixtures"
+fi
+
+# 18. _prune_aged_artifacts: age boundary, legacy fixed-slot protection, dry-run.
+# Uses a throwaway git repo as REPO_ROOT so the git worktree remove/prune calls
+# are hermetic, and drives the two litter roots against tempdir fixtures.
+prune_repo="$(mktemp -d -t test-dev-prunerepo.XXXXXX)"
+# A HEAD commit is required so `git worktree add --detach HEAD` can register the
+# real run worktrees the fail-closed prune path exercises (#1917 review).
+( cd "$prune_repo" && git init -q -b main && git config user.email t@e.com \
+  && git config user.name t && git config commit.gpgsign false \
+  && git commit -q --allow-empty -m base ) 2>/dev/null
+# 8 days ago (older than the 7-day default); fall back to year 2000 if date(1)
+# lacks the BSD -v flag.
+old_stamp="$(date -v-8d +%Y%m%d%H%M 2>/dev/null || echo 200001010000)"
+
+make_prune_fixture() {
+  local base="$1"
+  mkdir -p "$base/wt" "$base/tmp"
+  # aged run worktree — a REAL registered, CLEAN worktree of prune_repo, so
+  # git status succeeds and is empty -> removed (fail-closed: only a positively
+  # clean worktree is a removal candidate). + aged runid file.
+  git -C "$prune_repo" worktree add -q --detach "$base/wt/run-old" HEAD 2>/dev/null
+  : > "$base/wt/run-old.runid"
+  # aged DIRTY worktree — a real registered worktree with an uncommitted file,
+  # so git status is non-empty -> SKIPPED by the dirty-worktree protection
+  # (#1917 review: the protective branch now has a fixture).
+  git -C "$prune_repo" worktree add -q --detach "$base/wt/run-dirty" HEAD 2>/dev/null
+  : > "$base/wt/run-dirty/uncommitted"
+  # aged BROKEN dir — a plain dir where git status errors; fail-closed leaves it
+  # in place rather than rm -rf'ing possibly-uncommitted work (#1917 review).
+  mkdir -p "$base/wt/run-broken"; : > "$base/wt/run-broken/marker"
+  # fresh run worktree + runid (must survive the age gate).
+  mkdir -p "$base/wt/run-fresh"; : > "$base/wt/run-fresh/marker"; : > "$base/wt/run-fresh.runid"
+  # aged keyed /tmp sidecars (must be removed) + a fresh one (must survive).
+  : > "$base/tmp/fishhawk-scope-run1-stage1.json"
+  : > "$base/tmp/fishhawk-pr-run1-stage1.md"
+  : > "$base/tmp/fishhawk-scope-fresh-x.json"
+  # legacy fixed-slot transports (dash-keyed globs must NEVER match these).
+  : > "$base/tmp/fishhawk-plan.json"
+  : > "$base/tmp/fishhawk-pr.md"
+  : > "$base/tmp/fishhawk-acceptance.json"
+  # acceptance-evidence DIRECTORY (the plain-file (.) qualifier must skip it).
+  mkdir -p "$base/tmp/fishhawk-acceptance-evidence-run1"
+  # Age the "old" set; leave the fresh ones at now. Touch the run DIRS last so
+  # creating files inside them does not reset the mtime the glob keys on.
+  touch -t "$old_stamp" \
+    "$base/tmp/fishhawk-scope-run1-stage1.json" "$base/tmp/fishhawk-pr-run1-stage1.md" \
+    "$base/tmp/fishhawk-plan.json" "$base/tmp/fishhawk-pr.md" "$base/tmp/fishhawk-acceptance.json" \
+    "$base/tmp/fishhawk-acceptance-evidence-run1" "$base/wt/run-old.runid"
+  touch -t "$old_stamp" "$base/wt/run-old" "$base/wt/run-dirty" "$base/wt/run-broken"
+}
+
+prune_run="$(mktemp -d -t test-dev-prunerun.XXXXXX)"
+make_prune_fixture "$prune_run"
+REPO_ROOT="$prune_repo"
+_prune_aged_artifacts 7 0 "$prune_run/wt" "$prune_run/tmp" >/dev/null 2>&1
+REPO_ROOT="$orig_repo_root"
+if [[ ! -d "$prune_run/wt/run-old" ]]; then pass "_prune: removes aged CLEAN run worktree dir"; else fail "_prune should remove the aged clean run-old worktree"; fi
+if [[ ! -f "$prune_run/wt/run-old.runid" ]]; then pass "_prune: removes aged runid file"; else fail "_prune should remove aged run-old.runid"; fi
+# Protective branch: an aged-but-DIRTY registered run worktree survives (#1917).
+if [[ -d "$prune_run/wt/run-dirty" && -f "$prune_run/wt/run-dirty/uncommitted" ]]; then
+  pass "_prune: keeps an aged DIRTY run worktree (uncommitted work protected)"
+else
+  fail "_prune must NOT remove an aged dirty run worktree"
+fi
+# Fail-closed branch: an aged dir whose git status FAILS survives (#1917) —
+# never rm -rf'd when cleanliness cannot be positively established.
+if [[ -d "$prune_run/wt/run-broken" && -f "$prune_run/wt/run-broken/marker" ]]; then
+  pass "_prune: keeps an aged run dir whose cleanliness is unverifiable (fail-closed)"
+else
+  fail "_prune must NOT rm -rf a run dir when git status fails"
+fi
+if [[ ! -f "$prune_run/tmp/fishhawk-scope-run1-stage1.json" ]]; then pass "_prune: removes aged keyed scope sidecar"; else fail "_prune should remove aged scope sidecar"; fi
+if [[ ! -f "$prune_run/tmp/fishhawk-pr-run1-stage1.md" ]]; then pass "_prune: removes aged keyed pr sidecar"; else fail "_prune should remove aged pr sidecar"; fi
+if [[ -d "$prune_run/wt/run-fresh" ]]; then pass "_prune: keeps a fresh run worktree dir"; else fail "_prune should keep fresh run worktree"; fi
+if [[ -f "$prune_run/wt/run-fresh.runid" ]]; then pass "_prune: keeps a fresh runid file"; else fail "_prune should keep fresh runid"; fi
+if [[ -f "$prune_run/tmp/fishhawk-scope-fresh-x.json" ]]; then pass "_prune: keeps a fresh keyed sidecar (age boundary)"; else fail "_prune should keep the fresh keyed sidecar"; fi
+if [[ -f "$prune_run/tmp/fishhawk-plan.json" && -f "$prune_run/tmp/fishhawk-pr.md" && -f "$prune_run/tmp/fishhawk-acceptance.json" ]]; then
+  pass "_prune: keeps legacy fixed-slot files (fishhawk-plan.json / -pr.md / -acceptance.json)"
+else
+  fail "_prune must NOT touch the legacy fixed-slot transports"
+fi
+if [[ -d "$prune_run/tmp/fishhawk-acceptance-evidence-run1" ]]; then pass "_prune: keeps the acceptance-evidence directory"; else fail "_prune must not remove the acceptance-evidence dir"; fi
+rm -rf "$prune_run"
+
+# 18b. dry-run removes nothing.
+prune_dry="$(mktemp -d -t test-dev-prunedry.XXXXXX)"
+make_prune_fixture "$prune_dry"
+REPO_ROOT="$prune_repo"
+_prune_aged_artifacts 7 1 "$prune_dry/wt" "$prune_dry/tmp" >/dev/null 2>&1
+REPO_ROOT="$orig_repo_root"
+if [[ -d "$prune_dry/wt/run-old" && -f "$prune_dry/wt/run-old.runid" && -f "$prune_dry/tmp/fishhawk-scope-run1-stage1.json" ]]; then
+  pass "_prune: --dry-run removes nothing"
+else
+  fail "_prune --dry-run must not remove any candidate"
+fi
+rm -rf "$prune_dry"
+rm -rf "$prune_repo"
+
+# 19. Body-greps: cmd_up -> _warn_stale_worktrees, cmd_sweep wiring, dispatch, usage.
+up_body="$(typeset -f cmd_up)"
+if print -r -- "$up_body" | grep -q '_warn_stale_worktrees'; then
+  pass "cmd_up invokes _warn_stale_worktrees"
+else
+  fail "cmd_up should invoke _warn_stale_worktrees"
+fi
+sweep_body="$(typeset -f cmd_sweep)"
+if print -r -- "$sweep_body" | grep -q 'cleanup-merged'; then
+  pass "cmd_sweep reuses scripts/cleanup-merged"
+else
+  fail "cmd_sweep should compose scripts/cleanup-merged"
+fi
+if print -r -- "$sweep_body" | grep -q 'read -q'; then
+  pass "cmd_sweep gates removal on read -q"
+else
+  fail "cmd_sweep should confirm via read -q"
+fi
+if print -r -- "$sweep_body" | grep -q -- '--yes'; then
+  pass "cmd_sweep honors --yes"
+else
+  fail "cmd_sweep should parse --yes"
+fi
+if print -r -- "$sweep_body" | grep -q -- '--dry-run'; then
+  pass "cmd_sweep honors --dry-run"
+else
+  fail "cmd_sweep should parse --dry-run"
+fi
+if print -r -- "$sweep_body" | grep -q '_prune_aged_artifacts'; then
+  pass "cmd_sweep prunes aged run/tmp litter"
+else
+  fail "cmd_sweep should call _prune_aged_artifacts"
+fi
+if grep -qE '^[[:space:]]*sweep\)[[:space:]]*cmd_sweep' "${orig_repo_root}/scripts/dev"; then
+  pass "sweep wired into the dispatch table"
+else
+  fail "sweep should be wired into the dispatch case"
+fi
+usage_body="$(typeset -f _usage)"
+if print -r -- "$usage_body" | grep -q 'sweep'; then
+  pass "sweep documented in _usage"
+else
+  fail "_usage should document sweep"
+fi
+
+# 20. cmd_sweep fail-safe: a non-tty stdin without --yes lists and removes nothing;
+# and self-protection: the merged worktree containing $PWD is never a candidate.
+if command -v git >/dev/null 2>&1; then
+  swfix="$(mktemp -d -t test-dev-sweep.XXXXXX)"
+  (
+    set -e
+    cd "$swfix"; git init -q -b main main; cd main
+    git config user.email t@e.com; git config user.name t; git config commit.gpgsign false
+    echo a > f; git add f; git commit -qm base
+    git update-ref refs/remotes/origin/main "$(git rev-parse HEAD)"
+    mkdir -p .claude/worktrees
+    git branch merged-clean
+    git worktree add -q .claude/worktrees/wt-merged merged-clean
+  )
+  # 20a. non-tty stdin, no --yes -> nothing removed (fail-safe listing).
+  REPO_ROOT="$swfix/main"
+  sweep_noninteractive_out="$(cmd_sweep </dev/null 2>&1)"
+  REPO_ROOT="$orig_repo_root"
+  if [[ -d "$swfix/main/.claude/worktrees/wt-merged" ]]; then
+    pass "cmd_sweep: non-tty stdin without --yes removes nothing"
+  else
+    fail "cmd_sweep must not remove a worktree on non-tty stdin without --yes"
+  fi
+  # Pin the `[[ ! -t 0 ]]` guard specifically: a non-tty session must take the
+  # listing-only branch and NEVER reach the read -q prompt. Asserting the
+  # message distinguishes it from the read-q EOF-cancel path, which would also
+  # remove nothing but prove nothing about the tty guard (#1917 review).
+  if print -r -- "$sweep_noninteractive_out" | grep -q 'non-interactive stdin and no --yes — listing only, nothing removed'; then
+    pass "cmd_sweep: non-tty stdin takes the listing-only branch (never prompts)"
+  else
+    fail "cmd_sweep should print the non-interactive listing-only message (got: $sweep_noninteractive_out)"
+  fi
+  # 20b. from OUTSIDE the worktree, the merged worktree IS a listed candidate.
+  REPO_ROOT="$swfix/main"
+  cd "$swfix/main"
+  out_root="$(cmd_sweep --dry-run 2>&1)"
+  cd "$orig_pwd"
+  REPO_ROOT="$orig_repo_root"
+  if print -r -- "$out_root" | grep -q 'operator worktrees to remove: 1'; then
+    pass "cmd_sweep: a merged worktree is a removal candidate from the main checkout"
+  else
+    fail "cmd_sweep should list the merged worktree as a candidate (got: $out_root)"
+  fi
+  # 20c. from INSIDE the merged worktree, it self-protects (0 candidates).
+  REPO_ROOT="$swfix/main"
+  cd "$swfix/main/.claude/worktrees/wt-merged"
+  out_self="$(cmd_sweep --dry-run 2>&1)"
+  cd "$orig_pwd"
+  REPO_ROOT="$orig_repo_root"
+  if print -r -- "$out_self" | grep -q 'operator worktrees to remove: 0'; then
+    pass "cmd_sweep: never lists the worktree containing \$PWD as a candidate"
+  else
+    fail "cmd_sweep should self-protect the current worktree (got: $out_self)"
+  fi
+  rm -rf "$swfix"
+else
+  print "skip: git not found — skipping cmd_sweep fixtures"
+fi
+
+# 21. Confirmed sweep end-to-end: --yes removes the merged operator worktree AND
+# composes cleanup-merged to delete the now-un-checked-out merged branch. Uses a
+# real bare origin so cleanup-merged's `git fetch origin main` succeeds, and
+# --days 99999 so the real /tmp litter glob matches nothing (hermetic).
+if command -v git >/dev/null 2>&1; then
+  cfix="$(mktemp -d -t test-dev-confirm.XXXXXX)"
+  (
+    set -e
+    cd "$cfix"
+    git init -q --bare origin.git
+    git init -q -b main main
+    cd main
+    git config user.email t@e.com; git config user.name t; git config commit.gpgsign false
+    echo a > f; git add f; git commit -qm base
+    git remote add origin "$cfix/origin.git"
+    git push -q origin HEAD:main
+    git fetch -q origin
+    # cmd_sweep resolves cleanup-merged under REPO_ROOT; give the fixture its own
+    # copy so the composition runs against the fixture repo, not the real one.
+    mkdir -p scripts
+    cp "$orig_repo_root/scripts/cleanup-merged" scripts/cleanup-merged
+    chmod +x scripts/cleanup-merged
+    mkdir -p .claude/worktrees
+    git branch merged-clean
+    git worktree add -q .claude/worktrees/wt-merged merged-clean
+  )
+  if [[ -d "$cfix/main/.claude/worktrees/wt-merged" ]]; then
+    REPO_ROOT="$cfix/main"
+    cd "$cfix/main"
+    cmd_sweep --yes --days 99999 >/dev/null 2>&1
+    cd "$orig_pwd"
+    REPO_ROOT="$orig_repo_root"
+    if [[ ! -d "$cfix/main/.claude/worktrees/wt-merged" ]]; then
+      pass "cmd_sweep --yes removes the merged-clean operator worktree"
+    else
+      fail "cmd_sweep --yes should remove the merged-clean worktree"
+    fi
+    if ! git -C "$cfix/main" show-ref --verify --quiet refs/heads/merged-clean; then
+      pass "cmd_sweep --yes deletes the merged branch via cleanup-merged"
+    else
+      fail "cmd_sweep --yes should delete the merged branch (cleanup-merged composition)"
+    fi
+  else
+    fail "confirmed-sweep fixture setup failed (no wt-merged)"
+  fi
+  rm -rf "$cfix"
+else
+  print "skip: git not found — skipping confirmed-sweep fixture"
 fi
 
 # 6. Parse check: scripts/dev is valid zsh.
