@@ -5687,11 +5687,12 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// unchanged — e.g. local/dev runs with no resolvable App.
 		AuthorName:  cfg.commitAuthorName,
 		AuthorEmail: cfg.commitAuthorEmail,
-		// Refresh the local extraheader with the freshly-minted
-		// token before push. Handles the long-running-stage case
-		// where the auth pre-step's token (set by actions/checkout)
-		// has expired by the time the agent finishes. See the
-		// FetchInstallationToken call above.
+		// Authenticate the remote-touching git commands (fetch, ls-remote,
+		// push) with the freshly-minted token, applied per-invocation as
+		// process-scoped git config and NEVER written to any config file
+		// (#1933). Handles the long-running-stage case where the auth
+		// pre-step's token (set by actions/checkout) has expired by the time
+		// the agent finishes. See the FetchInstallationToken call above.
 		PushToken: token,
 		// ADR-041 (#1141) + #1872: ForceWithLease is set ONLY for the STANDALONE
 		// default routing case (the sole-writer run-owned branch, ADR-035). A

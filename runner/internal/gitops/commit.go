@@ -5,18 +5,27 @@
 // is opinionated about author identity, branch naming, and the
 // shape of the resulting pull-request artifact.
 //
-// Push auth is the calling environment's responsibility. In the
-// hosted Actions flow (#201) `actions/checkout` is called with the
-// Fishhawk App's installation token, which sets a local
-// `http.<host>.extraheader` that subsequent git operations
-// (including this package's push) authenticate with. We don't
-// embed credentials in the URL or set our own extraheader — both
-// approaches caused failure modes in #199 / #200 (the URL-embedded
-// path was overridden by actions/checkout's existing extraheader,
-// and `-c http.<host>.extraheader=…` produced a duplicate
-// Authorization header because git's extraheader is multi-valued).
-// PR creation (OpenPR) takes its token directly because GitHub's
-// REST API needs an explicit `Authorization: Bearer <token>`.
+// Push auth, when a run token is supplied, is applied PER-INVOCATION as
+// process-scoped git configuration rather than written to any config file.
+// authConfigEnv builds GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n
+// entries (git >= 2.31) that set `http.<host>.extraheader` for the duration of
+// exactly the git commands that talk to the remote with the token (the fetch
+// paths, observeRemoteHead's ls-remote, and the push). The first entry resets
+// the extra-header list to empty (git-config(1): an empty value clears it),
+// neutralizing any persisted or ambient extraheader — e.g. one actions/checkout
+// wrote — so it cannot ride along as a duplicate Authorization header (the
+// #199/#200 failure); the second sets the fresh Basic-auth header. The token
+// stays off argv (env, not `-c`), preserving the no-command-line-credential
+// discipline, and NOTHING is written to any config file, so there is no cleanup
+// to guarantee on ANY exit path — including SIGKILL. This is the #1933 fix: the
+// former persistent `git config --local` write leaked the ~1h-TTL token into
+// the operator's shared $GIT_COMMON_DIR/config, where it outlived the run and
+// broke every subsequent operator HTTPS git op with a 401. When no run token is
+// supplied, auth is the calling environment's responsibility — in the hosted
+// Actions flow (#201) actions/checkout's own extraheader authenticates, and for
+// local-dev / bare-repo tests file-path remotes need no auth at all. PR
+// creation (OpenPR) takes its token directly because GitHub's REST API needs an
+// explicit `Authorization: Bearer <token>`.
 package gitops
 
 import (
@@ -26,6 +35,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -285,16 +295,17 @@ type CommitAndPushArgs struct {
 	// don't need auth at all.
 	RemoteURL string
 
-	// PushToken, when non-empty, is configured as the local
-	// `http.<host>.extraheader` for an HTTPS RemoteURL immediately
-	// before push, replacing any existing value (--replace-all).
-	// Use this to refresh a stale extraheader from the workflow's
-	// initial actions/checkout — App installation tokens have a
-	// ~1-hour TTL and a long agent run can outlive the token that
-	// was minted at workflow start.
+	// PushToken, when non-empty, authenticates the remote-touching git
+	// commands (the fetch paths, observeRemoteHead's ls-remote, and the
+	// push) for an http/https RemoteURL. It is applied per-invocation as a
+	// process-scoped `http.<host>.extraheader` via authConfigEnv's
+	// GIT_CONFIG_* environment entries — NEVER written to any config file,
+	// so nothing needs cleanup on any exit path (the #1933 fix). Use it to
+	// supply a freshly-minted token: App installation tokens have a ~1-hour
+	// TTL and a long agent run can outlive the token minted at workflow start.
 	//
-	// Empty value (the default) means "use ambient auth" — caller
-	// trusts whatever extraheader the environment set up.
+	// Empty value (the default) means "use ambient auth" — caller trusts
+	// whatever extraheader the environment (e.g. actions/checkout) set up.
 	PushToken string
 
 	// ForceWithLease, when true, adds --force-with-lease to the push
@@ -441,6 +452,16 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	authorEmail := orDefault(args.AuthorEmail, DefaultAuthorEmail)
 	remote := orDefault(args.Remote, DefaultRemote)
 
+	// Process-scoped auth for the remote-touching git commands (#1933): build
+	// the GIT_CONFIG_* extraheader entries once and pass them ONLY to the
+	// fetch / ls-remote / push invocations below. Nothing is written to any
+	// config file, so there is no cleanup on any exit path. Nil (ambient auth)
+	// when PushToken is empty or RemoteURL is not http/https.
+	authEnv, err := authConfigEnv(args.RemoteURL, args.PushToken)
+	if err != nil {
+		return nil, err
+	}
+
 	// Capture the base SHA before doing anything so the eventual
 	// PR knows where the branch diverged.
 	baseSHA, err := p.runOut(ctx, args.RepoDir, "rev-parse", "HEAD")
@@ -478,19 +499,17 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		// The fetch targets args.RemoteURL (the authenticated HTTPS URL),
 		// not the named remote — in the operator's checkout the named
 		// `origin` is typically an SSH URL whose auth depends on the
-		// operator's SSH agent, which may be unavailable (#772). Configure
-		// the same extraheader the push uses BEFORE the fetch so the fetch
-		// authenticates with the run's installation token.
-		if err := p.configureExtraheader(ctx, args.RepoDir, args.RemoteURL, args.PushToken); err != nil {
-			return nil, err
-		}
+		// operator's SSH agent, which may be unavailable (#772). authEnv
+		// carries the run's installation token to the fetch as process-scoped
+		// git config (#1933), authenticating it without writing to any config
+		// file.
 		if err := p.run(ctx, args.RepoDir, "stash", "--include-untracked"); err != nil {
 			return nil, fmt.Errorf("gitops: stash: %w", err)
 		}
 		// Fetch the remote branch tip into FETCH_HEAD. A URL fetch does not
 		// create or update any refs/remotes/<name>/<branch> tracking ref, so
 		// the subsequent checkout references FETCH_HEAD explicitly.
-		if err := p.run(ctx, args.RepoDir, "fetch", args.RemoteURL, args.Branch); err != nil {
+		if err := p.runEnv(ctx, args.RepoDir, authEnv, "fetch", args.RemoteURL, args.Branch); err != nil {
 			return nil, fmt.Errorf("gitops: fetch %s: %w", args.Branch, err)
 		}
 		// Create/reset the local branch to the fetched remote tip. The agent's
@@ -516,9 +535,6 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		// the base advanced past) is detected specifically by popStash and
 		// surfaces as ErrBaseRebaseConflict (category-B) after a clean
 		// reset --hard abort, with no push and never a silent bad tree.
-		if err := p.configureExtraheader(ctx, args.RepoDir, args.RemoteURL, args.PushToken); err != nil {
-			return nil, err
-		}
 		if err := p.run(ctx, args.RepoDir, "stash", "--include-untracked"); err != nil {
 			return nil, fmt.Errorf("gitops: stash: %w", err)
 		}
@@ -538,8 +554,9 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		//
 		// Fetch the authoritative base branch tip into FETCH_HEAD. A URL fetch
 		// does not create a refs/remotes tracking ref, so the checkout
-		// references FETCH_HEAD explicitly.
-		if err := p.run(ctx, args.RepoDir, "fetch", args.RemoteURL, args.FreshFetchBase); err != nil {
+		// references FETCH_HEAD explicitly. authEnv carries the run token to
+		// the fetch as process-scoped git config (#1933, #772).
+		if err := p.runEnv(ctx, args.RepoDir, authEnv, "fetch", args.RemoteURL, args.FreshFetchBase); err != nil {
 			return nil, fmt.Errorf("gitops: fetch %s: %w", args.FreshFetchBase, err)
 		}
 		if err := p.run(ctx, args.RepoDir, "checkout", "-B", args.Branch, "FETCH_HEAD"); err != nil {
@@ -646,17 +663,13 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		}
 	}
 
-	// Refresh the local extraheader if the caller supplied a fresh
-	// PushToken. This is the long-running-stage path: the workflow's
-	// initial actions/checkout set an extraheader with the auth
-	// pre-step's token, but App installation tokens are ~1-hour
-	// TTL — agents that take >55min outlive the original. The
-	// runner pre-fetches a fresh token and hands it here so the
-	// push always authenticates with a non-expired credential.
-	if err := p.configureExtraheader(ctx, args.RepoDir, args.RemoteURL, args.PushToken); err != nil {
-		return nil, err
-	}
-
+	// authEnv (computed once above) carries the freshly-minted run token to
+	// the push as process-scoped git config. This is the long-running-stage
+	// path: the workflow's initial actions/checkout set an extraheader with
+	// the auth pre-step's token, but App installation tokens are ~1-hour TTL —
+	// agents that take >55min outlive the original. The runner pre-fetches a
+	// fresh token and hands it here so the push always authenticates with a
+	// non-expired credential, without persisting it to any config file (#1933).
 	pushArgs := []string{"push", args.RemoteURL, fmt.Sprintf("HEAD:%s", args.Branch)}
 	if args.ForceWithLease {
 		// A *bare* --force-with-lease compares the push against the local
@@ -679,7 +692,7 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 			// the remote head DIRECTLY via ls-remote and bind the lease to it.
 			// A stale self-owned ref is overwritten exactly as observed, while a
 			// ref that MOVED after observation still fails the lease.
-			observed, lsErr := p.observeRemoteHead(ctx, args.RepoDir, args.RemoteURL, args.Branch)
+			observed, lsErr := p.observeRemoteHead(ctx, args.RepoDir, args.RemoteURL, args.Branch, authEnv)
 			if lsErr != nil {
 				return nil, fmt.Errorf("gitops: observe remote head for lease: %w", lsErr)
 			}
@@ -694,7 +707,7 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 			pushArgs = append(pushArgs, lease)
 		}
 	}
-	if err := p.run(ctx, args.RepoDir, pushArgs...); err != nil {
+	if err := p.runEnv(ctx, args.RepoDir, authEnv, pushArgs...); err != nil {
 		return nil, fmt.Errorf("gitops: push %s: %w", remote, err)
 	}
 
@@ -1319,8 +1332,12 @@ func RemoteHasBranch(ctx context.Context, repoDir, remote, branch string) (bool,
 // that moved between observation and push fails the lease and the push fails
 // loud. `git ls-remote` exits 0 with EMPTY stdout for a no-match, so absence is
 // derived from the output (empty SHA), not the exit code.
-func (p *Pusher) observeRemoteHead(ctx context.Context, repoDir, remoteURL, branch string) (string, error) {
-	out, err := p.runOut(ctx, repoDir, "ls-remote", remoteURL, "refs/heads/"+branch)
+//
+// env carries the run token's process-scoped auth (authConfigEnv's GIT_CONFIG_*
+// entries) so the ls-remote authenticates per-invocation with the same fresh
+// credential the push uses (#1933) — a nil env falls back to ambient auth.
+func (p *Pusher) observeRemoteHead(ctx context.Context, repoDir, remoteURL, branch string, env []string) (string, error) {
+	out, err := p.runOutEnv(ctx, repoDir, env, "ls-remote", remoteURL, "refs/heads/"+branch)
 	if err != nil {
 		return "", fmt.Errorf("gitops: ls-remote %s %s: %w", remoteURL, branch, err)
 	}
@@ -1511,32 +1528,53 @@ func porcelainPath(line string) string {
 	return strings.Trim(rest, `"`)
 }
 
-// configureExtraheader sets the local `http.<host>.extraheader` to a Basic
-// auth header derived from pushToken, so subsequent git operations (fetch and
-// push) over an HTTPS remoteURL authenticate with the run's installation
-// token rather than the operator's ambient credentials. The token never
-// appears on the command line — it's written into the extraheader, preserving
-// the no-URL-embedded-credential discipline.
+// authConfigEnv builds the process-scoped git configuration environment that
+// authenticates a single remote-touching git command with the run's
+// installation token, WITHOUT writing anything to any config file. It returns
+// the GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n entries (git
+// >= 2.31) that set `http.<host>.extraheader` for the duration of the one git
+// invocation they are passed to via runEnv/runOutEnv:
 //
-// It no-ops when pushToken is empty (ambient-auth path) or remoteURL is not
-// HTTPS (file-path bare-repo tests, SSH). `--replace-all` overwrites any
-// existing single value rather than appending, so it is idempotent and safe to
-// call both before the rebase fetch and before the push without producing the
-// duplicate-Authorization-header failure of #199 / #200.
-func (p *Pusher) configureExtraheader(ctx context.Context, repoDir, remoteURL, pushToken string) error {
-	if pushToken == "" || !strings.HasPrefix(remoteURL, "https://") {
-		return nil
+//   - entry 0 sets the SAME key to an EMPTY value, which per git-config(1)
+//     resets the extra-header list to empty — neutralizing any persisted or
+//     ambient extraheader (one actions/checkout wrote, or a stale value a prior
+//     runner version left in a shared worktree config) so it cannot ride along
+//     as a duplicate Authorization header (the #199/#200 failure);
+//   - entry 1 sets the fresh `AUTHORIZATION: basic <b64(x-access-token:token)>`.
+//
+// Because the header lives in the process environment, not a config file,
+// nothing needs cleanup on ANY exit path — including SIGKILL, which a
+// defer-based cleanup of a persistent write could never cover. This is the
+// #1933 fix: the former persistent `git config --local` write leaked the
+// ~1h-TTL token into the operator's shared $GIT_COMMON_DIR/config, where it
+// outlived the run and broke every subsequent operator HTTPS git op with a 401.
+//
+// It returns nil (ambient auth, byte-identical to the pre-token behavior) when
+// pushToken is empty, or when remoteURL is not http/https (file-path bare-repo
+// tests, SSH remotes). http:// is accepted alongside https:// deliberately:
+// production RemoteURLs are always https://github.com/..., and an http URL only
+// arises in tests / self-hosted setups where the header IS the intended auth —
+// it is what makes the dumb-HTTP end-to-end test possible without a network.
+func authConfigEnv(remoteURL, pushToken string) ([]string, error) {
+	if pushToken == "" {
+		return nil, nil
+	}
+	if !strings.HasPrefix(remoteURL, "https://") && !strings.HasPrefix(remoteURL, "http://") {
+		return nil, nil
 	}
 	host, err := pushHost(remoteURL)
 	if err != nil {
-		return fmt.Errorf("gitops: parse remote URL: %w", err)
+		return nil, fmt.Errorf("gitops: parse remote URL: %w", err)
 	}
+	key := "http." + host + ".extraheader"
 	header := "AUTHORIZATION: basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+pushToken))
-	if err := p.run(ctx, repoDir, "config", "--local", "--replace-all",
-		"http."+host+".extraheader", header); err != nil {
-		return fmt.Errorf("gitops: refresh extraheader: %w", err)
-	}
-	return nil
+	return []string{
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=" + key,
+		"GIT_CONFIG_VALUE_0=",
+		"GIT_CONFIG_KEY_1=" + key,
+		"GIT_CONFIG_VALUE_1=" + header,
+	}, nil
 }
 
 // pushHost extracts the `<scheme>://<host>/` string git config keys
@@ -1554,7 +1592,15 @@ func pushHost(remoteURL string) (string, error) {
 // run invokes git with cwd=dir, returning a wrapped error including
 // stderr on failure so callers can see what git complained about.
 func (p *Pusher) run(ctx context.Context, dir string, gitArgs ...string) error {
-	_, err := p.runOut(ctx, dir, gitArgs...)
+	return p.runEnv(ctx, dir, nil, gitArgs...)
+}
+
+// runEnv is run with extra process-environment entries (e.g. authConfigEnv's
+// GIT_CONFIG_* auth entries). A nil/empty env inherits the parent environment
+// unchanged; a non-empty env runs the git command with
+// cmd.Env = os.Environ() + env for that single invocation.
+func (p *Pusher) runEnv(ctx context.Context, dir string, env []string, gitArgs ...string) error {
+	_, err := p.runOutEnv(ctx, dir, env, gitArgs...)
 	return err
 }
 
@@ -1562,6 +1608,15 @@ func (p *Pusher) run(ctx context.Context, dir string, gitArgs ...string) error {
 // trimmed of trailing newlines. stderr is folded into the returned
 // error on non-zero exit.
 func (p *Pusher) runOut(ctx context.Context, dir string, gitArgs ...string) (string, error) {
+	return p.runOutEnv(ctx, dir, nil, gitArgs...)
+}
+
+// runOutEnv is runOut with extra process-environment entries. When env is
+// non-empty the child runs with cmd.Env = os.Environ() + env, scoping the
+// auth GIT_CONFIG_* entries to that single invocation and writing nothing to
+// any config file; a nil/empty env leaves cmd.Env nil so the child inherits
+// the parent environment byte-identically to before this seam existed.
+func (p *Pusher) runOutEnv(ctx context.Context, dir string, env []string, gitArgs ...string) (string, error) {
 	binary := p.Binary
 	if binary == "" {
 		binary = "git"
@@ -1572,6 +1627,9 @@ func (p *Pusher) runOut(ctx context.Context, dir string, gitArgs ...string) (str
 	}
 	cmd := cmdFn(ctx, binary, gitArgs...)
 	cmd.Dir = dir
+	if len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
