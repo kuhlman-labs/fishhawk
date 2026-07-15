@@ -5614,6 +5614,248 @@ func TestBuild_ImplementReview_GateEvidence_UncategorizedDriftByteIdentical(t *t
 	}
 }
 
+func TestBuild_ImplementReview_ScopeProvenance_FoldOnlyDivergence_RendersNonDrift(t *testing.T) {
+	// #1914 behavioral done-means: a declared-vs-staged divergence explained
+	// ENTIRELY by untouched folded permissions renders the decomposition, the
+	// per-fold "a permission, not a work-order" mark, the provenance-aware
+	// binding bullet, AND the affirmative machine NON-drift classification. This
+	// is the shipped prompt text that changes reviewer behavior and kills the
+	// false-positive waiver class.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeFacts: &GateScopeFacts{DeclaredFiles: 3},
+			ScopeProvenance: &GateScopeProvenance{
+				PlanFiles: 1,
+				Folds: []GateScopeFold{
+					{Path: "backend/internal/foo/foo_test.go", Source: "fixup-coupled-test-sibling", Touched: false},
+					{Path: "backend/internal/foo/extra.go", Source: "approval-add-scope-files", Touched: false},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"Declared-scope provenance (decomposition of the declared scope.files count",
+		"- plan scope.files: 1 entries",
+		"backend/internal/foo/foo_test.go (folded: fixup-coupled-test-sibling) — folded, UNTOUCHED — a permission, not a work-order",
+		"backend/internal/foo/extra.go (folded: approval-add-scope-files) — folded, UNTOUCHED — a permission, not a work-order",
+		// The provenance-aware binding bullet.
+		"machine-classified NON-drift and MUST NOT be raised as a scope",
+		// The affirmative machine classification verdict.
+		"Machine classification: the declared-vs-staged divergence is FULLY EXPLAINED by untouched folded permissions",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement_review prompt missing %q:\n%s", w, got)
+		}
+	}
+	// The legacy (non-provenance) bullet must NOT render when provenance is present.
+	if strings.Contains(got, "likewise outranks stylistic findings — name it before them.") {
+		t.Errorf("provenance-present prompt must not render the legacy scope-divergence bullet:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementReview_ScopeProvenance_TouchedFold_NoUntouchedMark(t *testing.T) {
+	// A fold the commit DID touch renders as "(folded: <source>)" WITHOUT the
+	// untouched-permission mark — the mark is reserved for a permission the
+	// commit did not exercise.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeFacts: &GateScopeFacts{DeclaredFiles: 2},
+			ScopeProvenance: &GateScopeProvenance{
+				PlanFiles: 1,
+				Folds: []GateScopeFold{
+					{Path: "backend/internal/foo/extra.go", Source: "scope-amendment", Touched: true},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "- backend/internal/foo/extra.go (folded: scope-amendment)\n") {
+		t.Errorf("touched fold must render the bare folded line:\n%s", got)
+	}
+	if strings.Contains(got, "backend/internal/foo/extra.go (folded: scope-amendment) — folded, UNTOUCHED") {
+		t.Errorf("touched fold must NOT render the untouched-permission mark:\n%s", got)
+	}
+	// A fully-touched fold set has no untouched-explained entry → no affirmative
+	// non-drift verdict line (there is nothing to classify as non-drift).
+	if strings.Contains(got, "Machine classification: the declared-vs-staged divergence is FULLY EXPLAINED") {
+		t.Errorf("all-touched provenance must NOT render the non-drift verdict:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementReview_ScopeProvenance_UnexplainedResidual_StillFlag(t *testing.T) {
+	// #1914 real-drift preserved: a positive UnexplainedCount renders the
+	// still-flag "unexplained by provenance" line and MUST NOT render the
+	// affirmative non-drift verdict — the residual is real drift the provenance
+	// does not explain.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeFacts: &GateScopeFacts{DeclaredFiles: 4},
+			ScopeProvenance: &GateScopeProvenance{
+				PlanFiles: 1,
+				Folds: []GateScopeFold{
+					{Path: "backend/internal/foo/extra.go", Source: "approval-add-scope-files", Touched: false},
+				},
+				UnexplainedCount: 2,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "- unexplained by provenance: 2 entries") {
+		t.Errorf("positive UnexplainedCount must render the still-flag line:\n%s", got)
+	}
+	if strings.Contains(got, "Machine classification: the declared-vs-staged divergence is FULLY EXPLAINED") {
+		t.Errorf("unexplained residual must NOT render the non-drift verdict:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementReview_ScopeProvenance_FixupPass_RendersCeiling(t *testing.T) {
+	// #1914 fix-up ceiling: FixupPass renders the #1314 permission-ceiling line,
+	// and an untouched PLAN path is explained by the ceiling (so the affirmative
+	// non-drift verdict renders and mentions the ceiling).
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeFacts: &GateScopeFacts{DeclaredFiles: 2},
+			ScopeProvenance: &GateScopeProvenance{
+				PlanFiles:     2,
+				PlanUntouched: []string{"backend/internal/foo/foo.go"},
+				FixupPass:     true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"fix-up pass: the declared scope retains the FULL approved plan scope as a permission ceiling (#1314)",
+		"backend/internal/foo/foo.go (plan scope, UNTOUCHED — reviewer judgment",
+		"Machine classification: the declared-vs-staged divergence is FULLY EXPLAINED by untouched folded permissions and fix-up permission-ceiling semantics",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("fix-up provenance prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
+func TestBuild_ImplementReview_ScopeProvenance_PartiallyExplained_NoNonDrift(t *testing.T) {
+	// #1914 binding condition (the codex-named partially-explained test): a delta
+	// LARGER than the untouched folds — an untouched PLAN path on a non-fix-up
+	// pass — with a zero UnexplainedCount residual must NOT render the affirmative
+	// non-drift classification. The untouched plan path renders as its own
+	// reviewer-judgment category instead.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeFacts: &GateScopeFacts{DeclaredFiles: 3},
+			ScopeProvenance: &GateScopeProvenance{
+				PlanFiles:     2,
+				PlanUntouched: []string{"backend/internal/foo/foo.go"},
+				Folds: []GateScopeFold{
+					{Path: "backend/internal/foo/extra.go", Source: "approval-add-scope-files", Touched: false},
+				},
+				FixupPass:        false,
+				UnexplainedCount: 0,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// The untouched plan path renders as reviewer-judgment.
+	if !strings.Contains(got, "backend/internal/foo/foo.go (plan scope, UNTOUCHED — reviewer judgment") {
+		t.Errorf("untouched plan path must render as reviewer-judgment:\n%s", got)
+	}
+	// But the affirmative non-drift verdict MUST NOT render — the delta is larger
+	// than the untouched folds.
+	if strings.Contains(got, "Machine classification: the declared-vs-staged divergence is FULLY EXPLAINED") {
+		t.Errorf("partially-explained divergence must NOT render the non-drift verdict:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementReview_ScopeProvenance_NilByteIdentical(t *testing.T) {
+	// #1914 hash stability: a nil ScopeProvenance leaves the gate-evidence
+	// section byte-identical to the pre-change render — the legacy
+	// scope-divergence bullet, no "Declared-scope provenance" subsection — and
+	// the #1407 operator_scope_path_undelivered rendering is unchanged alongside.
+	base := Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeFacts:               &GateScopeFacts{DeclaredFiles: 2},
+			OperatorScopeUndelivered: []string{"backend/internal/foo/extra.go"},
+		},
+	}
+	got, err := Build("implement_review", base)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "Declared-scope provenance") {
+		t.Errorf("nil ScopeProvenance must NOT render the provenance subsection:\n%s", got)
+	}
+	if !strings.Contains(got, "likewise outranks stylistic findings — name it before them.") {
+		t.Errorf("nil ScopeProvenance must render the legacy scope-divergence bullet:\n%s", got)
+	}
+	// #1407 rendering unchanged in the presence of a nil provenance.
+	if !strings.Contains(got, "operator_scope_path_undelivered (operator-added scope path left UNTOUCHED by the commit):") {
+		t.Errorf("operator_scope_path_undelivered rendering must be unchanged:\n%s", got)
+	}
+}
+
+func TestBuild_ImplementReview_ScopeProvenance_CoexistsWithOperatorUndelivered(t *testing.T) {
+	// #1914 deliberate non-goal: the provenance decomposition and the #1407
+	// operator_scope_path_undelivered signal render together, independently —
+	// provenance reclassifies only the aggregate count divergence, the per-path
+	// undelivered signal is untouched.
+	got, err := Build("implement_review", Trigger{
+		Repo:         "kuhlman-labs/example",
+		ApprovedPlan: fixturePlan(),
+		Diff:         "- M pkg/bar/bar.go\n",
+		GateEvidence: &GateEvidence{
+			ScopeFacts:               &GateScopeFacts{DeclaredFiles: 2},
+			OperatorScopeUndelivered: []string{"backend/internal/foo/extra.go"},
+			ScopeProvenance: &GateScopeProvenance{
+				PlanFiles: 1,
+				Folds: []GateScopeFold{
+					{Path: "backend/internal/foo/extra.go", Source: "approval-add-scope-files", Touched: false},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"Declared-scope provenance (decomposition of the declared scope.files count",
+		"operator_scope_path_undelivered (operator-added scope path left UNTOUCHED by the commit):",
+		"An `operator_scope_path_undelivered` warning below",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("coexisting render missing %q:\n%s", w, got)
+		}
+	}
+}
+
 func TestBuild_ImplementReview_WithPatch_RendersHunks(t *testing.T) {
 	patch := "diff --git a/pkg/bar/bar.go b/pkg/bar/bar.go\n" +
 		"@@ -1,3 +1,3 @@\n-old line\n+new line\n"

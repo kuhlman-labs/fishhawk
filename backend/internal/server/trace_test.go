@@ -5182,6 +5182,337 @@ func TestApprovedAmendmentScopePaths_Degrades(t *testing.T) {
 	}
 }
 
+// provenancePlan builds an approved plan with the given scope.files paths
+// (all operation=modify) for the #1914 scopeProvenanceForReview unit tests.
+func provenancePlan(paths ...string) *plan.Plan {
+	files := make([]plan.ScopeFile, 0, len(paths))
+	for _, p := range paths {
+		files = append(files, plan.ScopeFile{Path: p, Operation: plan.FileOpModify})
+	}
+	return &plan.Plan{Scope: plan.Scope{Files: files}}
+}
+
+// provenanceDiff builds a policy.Diff whose committed file set is the given
+// paths (all modified).
+func provenanceDiff(paths ...string) policy.Diff {
+	files := make([]policy.ChangedFile, 0, len(paths))
+	for _, p := range paths {
+		files = append(files, policy.ChangedFile{Path: p, Status: policy.StatusModified})
+	}
+	return policy.Diff{ChangedFiles: files}
+}
+
+// foldByPath returns the fold with the given path, or a zero fold + false.
+func foldByPath(folds []prompt.GateScopeFold, path string) (prompt.GateScopeFold, bool) {
+	for _, f := range folds {
+		if f.Path == path {
+			return f, true
+		}
+	}
+	return prompt.GateScopeFold{}, false
+}
+
+// addressedPendingConcern is a prior concern in the addressed_pending state, so
+// hasFixupRoutedConcern reports the fix-up pass for the provenance tests.
+func addressedPendingConcern() prompt.PriorConcern {
+	return prompt.PriorConcern{ID: uuid.NewString(), State: string(concern.StateAddressedPending), Severity: "high", Category: "scope"}
+}
+
+// TestScopeProvenanceForReview_ChannelSourceLabels pins that each fold channel
+// contributes an entry with the correct source label (#1914): approval
+// add_scope_files, approved mid-stage amendment, fix-up allow_create, and the
+// coupled *_test.go stem sibling.
+func TestScopeProvenanceForReview_ChannelSourceLabels(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	t.Run("approval add_scope_files", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0"})
+		trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/add.go"}}
+		prov := s.scopeProvenanceForReview(context.Background(), runID, stageID,
+			provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"), nil)
+		if prov == nil {
+			t.Fatal("prov = nil, want folds")
+		}
+		f, ok := foldByPath(prov.Folds, "pkg/add.go")
+		if !ok || f.Source != "approval-add-scope-files" {
+			t.Errorf("add fold = %+v (ok=%v), want source approval-add-scope-files", f, ok)
+		}
+	})
+
+	t.Run("approved amendment", func(t *testing.T) {
+		sa := newFakeScopeAmendmentRepo()
+		seedApprovedAmendment(t, sa, runID, stageID, "pkg/amend.go")
+		s := New(Config{Addr: "127.0.0.1:0", ScopeAmendmentRepo: sa})
+		prov := s.scopeProvenanceForReview(context.Background(), runID, stageID,
+			provenancePlan("pkg/plan.go"), prompt.Trigger{}, provenanceDiff("pkg/plan.go"), nil)
+		if prov == nil {
+			t.Fatal("prov = nil, want folds")
+		}
+		f, ok := foldByPath(prov.Folds, "pkg/amend.go")
+		if !ok || f.Source != "scope-amendment" {
+			t.Errorf("amend fold = %+v (ok=%v), want source scope-amendment", f, ok)
+		}
+	})
+
+	t.Run("fixup allow_create and coupled sibling", func(t *testing.T) {
+		au := &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {makeFixupEntryWithAllowCreate(runID, stageID, nil, []string{"backend/internal/foo/new.go"})},
+		}}
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		trig := prompt.Trigger{PriorConcerns: []prompt.PriorConcern{addressedPendingConcern()}}
+		prov := s.scopeProvenanceForReview(context.Background(), runID, stageID,
+			provenancePlan("backend/internal/foo/main.go"), trig, provenanceDiff("backend/internal/foo/main.go"), nil)
+		if prov == nil {
+			t.Fatal("prov = nil, want folds")
+		}
+		if !prov.FixupPass {
+			t.Error("FixupPass = false, want true (addressed_pending prior concern)")
+		}
+		ac, ok := foldByPath(prov.Folds, "backend/internal/foo/new.go")
+		if !ok || ac.Source != "fixup-allow-create" {
+			t.Errorf("allow_create fold = %+v (ok=%v), want source fixup-allow-create", ac, ok)
+		}
+		// Coupled siblings of both the plan file and the allow_create file.
+		for _, sib := range []string{"backend/internal/foo/main_test.go", "backend/internal/foo/new_test.go"} {
+			f, ok := foldByPath(prov.Folds, sib)
+			if !ok || f.Source != "fixup-coupled-test-sibling" {
+				t.Errorf("coupled fold %q = %+v (ok=%v), want source fixup-coupled-test-sibling", sib, f, ok)
+			}
+		}
+	})
+}
+
+// TestScopeProvenanceForReview_TouchedMarking pins per-entry touch marking
+// against the committed diff (#1914): a fold present in the diff is touched, an
+// absent fold is untouched, and an untouched PLAN path lands in PlanUntouched.
+func TestScopeProvenanceForReview_TouchedMarking(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/touched.go", "pkg/untouched.go"}}
+	// Plan has two files; only one is touched → the other is an untouched plan path.
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
+		provenancePlan("pkg/plan_touched.go", "pkg/plan_untouched.go"), trig,
+		provenanceDiff("pkg/plan_touched.go", "pkg/touched.go"), nil)
+	if prov == nil {
+		t.Fatal("prov = nil")
+	}
+	if tf, _ := foldByPath(prov.Folds, "pkg/touched.go"); !tf.Touched {
+		t.Error("pkg/touched.go fold Touched = false, want true")
+	}
+	if uf, _ := foldByPath(prov.Folds, "pkg/untouched.go"); uf.Touched {
+		t.Error("pkg/untouched.go fold Touched = true, want false")
+	}
+	if !containsString(prov.PlanUntouched, "pkg/plan_untouched.go") {
+		t.Errorf("PlanUntouched = %v, want to contain pkg/plan_untouched.go", prov.PlanUntouched)
+	}
+	if containsString(prov.PlanUntouched, "pkg/plan_touched.go") {
+		t.Errorf("PlanUntouched = %v, must not contain the touched plan file", prov.PlanUntouched)
+	}
+	if prov.PlanFiles != 2 {
+		t.Errorf("PlanFiles = %d, want 2", prov.PlanFiles)
+	}
+}
+
+// TestScopeProvenanceForReview_PlanPathDedup pins first-source-wins dedup
+// (#1914): a path present in BOTH the plan scope and a fold channel counts as a
+// plan file, not a fold.
+func TestScopeProvenanceForReview_PlanPathDedup(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/dup.go", "pkg/extra.go"}}
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
+		provenancePlan("pkg/dup.go"), trig, provenanceDiff("pkg/dup.go"), nil)
+	if prov == nil {
+		t.Fatal("prov = nil")
+	}
+	if _, ok := foldByPath(prov.Folds, "pkg/dup.go"); ok {
+		t.Errorf("pkg/dup.go must NOT be a fold (it is a plan file); folds=%+v", prov.Folds)
+	}
+	if _, ok := foldByPath(prov.Folds, "pkg/extra.go"); !ok {
+		t.Errorf("pkg/extra.go must be a fold; folds=%+v", prov.Folds)
+	}
+	if prov.PlanFiles != 1 {
+		t.Errorf("PlanFiles = %d, want 1", prov.PlanFiles)
+	}
+}
+
+// TestScopeProvenanceForReview_UnexplainedArithmetic pins the residual
+// arithmetic and the zero-clamp (#1914): DeclaredFiles minus the reconstructed
+// size, floored at 0.
+func TestScopeProvenanceForReview_UnexplainedArithmetic(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/add.go"}}
+	base := func() *plan.Plan { return provenancePlan("pkg/plan.go") }
+
+	// Reconstructed size = 2 (plan + add). DeclaredFiles 5 → residual 3.
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
+		base(), trig, provenanceDiff("pkg/plan.go"),
+		&prompt.GateEvidence{ScopeFacts: &prompt.GateScopeFacts{DeclaredFiles: 5}})
+	if prov == nil || prov.UnexplainedCount != 3 {
+		t.Fatalf("UnexplainedCount = %v, want 3", prov)
+	}
+
+	// DeclaredFiles 1 < reconstructed 2 → clamp to 0.
+	provClamp := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
+		base(), trig, provenanceDiff("pkg/plan.go"),
+		&prompt.GateEvidence{ScopeFacts: &prompt.GateScopeFacts{DeclaredFiles: 1}})
+	if provClamp == nil || provClamp.UnexplainedCount != 0 {
+		t.Fatalf("UnexplainedCount = %v, want 0 (clamp)", provClamp)
+	}
+}
+
+// TestScopeProvenanceForReview_NilScopeFacts pins that provenance still attaches
+// its folds when ScopeFacts is absent (#1914): UnexplainedCount defaults to 0
+// and the fold decomposition is preserved.
+func TestScopeProvenanceForReview_NilScopeFacts(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/add.go"}}
+
+	// ev nil.
+	if prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
+		provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"), nil); prov == nil ||
+		len(prov.Folds) != 1 || prov.UnexplainedCount != 0 {
+		t.Fatalf("nil ev: prov = %+v, want 1 fold and UnexplainedCount 0", prov)
+	}
+	// ev non-nil but ScopeFacts nil.
+	if prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
+		provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"),
+		&prompt.GateEvidence{}); prov == nil || len(prov.Folds) != 1 || prov.UnexplainedCount != 0 {
+		t.Fatalf("nil ScopeFacts: prov = %+v, want 1 fold and UnexplainedCount 0", prov)
+	}
+}
+
+// TestScopeProvenanceForReview_AmendmentListError_BestEffort pins that a
+// ListByRun error on the amendment channel contributes nothing without blocking
+// the provenance construction (#1914): the other channels still populate.
+func TestScopeProvenanceForReview_AmendmentListError_BestEffort(t *testing.T) {
+	sa := newFakeScopeAmendmentRepo()
+	sa.failListOn = 1
+	s := New(Config{Addr: "127.0.0.1:0", ScopeAmendmentRepo: sa})
+	trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/add.go"}}
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
+		provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"), nil)
+	if prov == nil {
+		t.Fatal("prov = nil, want the add fold despite the amendment list error")
+	}
+	if _, ok := foldByPath(prov.Folds, "pkg/add.go"); !ok {
+		t.Errorf("add fold missing after amendment error; folds=%+v", prov.Folds)
+	}
+	// No amendment fold contributed.
+	for _, f := range prov.Folds {
+		if f.Source == "scope-amendment" {
+			t.Errorf("amendment error must contribute no scope-amendment fold; got %+v", f)
+		}
+	}
+}
+
+// TestScopeProvenanceForReview_SkippedPathsMarkedTouched pins that a
+// trailing-slash directory or non-repo-relative fold path is marked touched
+// (#1914), mirroring operatorScopeUndelivered's skips so a directory / absolute
+// / traversal token never produces a false untouched-permission signal.
+func TestScopeProvenanceForReview_SkippedPathsMarkedTouched(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/", "/abs.go", "../esc.go", "pkg/real.go"}}
+	// Diff touches nothing but the plan file.
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
+		provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"), nil)
+	if prov == nil {
+		t.Fatal("prov = nil")
+	}
+	for _, skip := range []string{"pkg/", "/abs.go", "../esc.go"} {
+		if f, ok := foldByPath(prov.Folds, skip); ok && !f.Touched {
+			t.Errorf("skip path %q Touched = false, want true (never matches a committed path)", skip)
+		}
+	}
+	if f, ok := foldByPath(prov.Folds, "pkg/real.go"); !ok || f.Touched {
+		t.Errorf("pkg/real.go fold = %+v (ok=%v), want present and untouched", f, ok)
+	}
+}
+
+// TestScopeProvenanceForReview_ReconstructionParity is the drift-guard (#1914):
+// the provenance reconstruction of the fix-up fold path must reproduce the real
+// effectiveFixupScope output EXACTLY (plan + allow_create + coupled siblings),
+// so the two code paths cannot silently diverge.
+func TestScopeProvenanceForReview_ReconstructionParity(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	allowCreate := []string{"backend/internal/foo/new.go"}
+	au := &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+		runID: {makeFixupEntryWithAllowCreate(runID, stageID, nil, allowCreate)},
+	}}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+
+	planScope := []scopeFile{{Path: "backend/internal/foo/main.go", Operation: "modify"}}
+	// The real served fold path (no approval-add, no amendment).
+	want := s.effectiveFixupScope(context.Background(), planScope, allowCreate, nil)
+
+	trig := prompt.Trigger{PriorConcerns: []prompt.PriorConcern{addressedPendingConcern()}}
+	prov := s.scopeProvenanceForReview(context.Background(), runID, stageID,
+		provenancePlan("backend/internal/foo/main.go"), trig,
+		provenanceDiff("backend/internal/foo/main.go"), nil)
+	if prov == nil {
+		t.Fatal("prov = nil")
+	}
+	// The reconstructed effective set = plan paths (in order) followed by folds.
+	got := []string{"backend/internal/foo/main.go"}
+	for _, f := range prov.Folds {
+		got = append(got, f.Path)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("reconstruction size = %d, effectiveFixupScope size = %d\ngot=%v\nwant=%v",
+			len(got), len(want), got, want)
+	}
+	for i := range want {
+		if got[i] != want[i].Path {
+			t.Errorf("reconstruction[%d] = %q, effectiveFixupScope[%d] = %q (paths must match exactly)",
+				i, got[i], i, want[i].Path)
+		}
+	}
+}
+
+// TestRunImplementReviews_ScopeProvenance_FoldOnly_RendersDecomposition is the
+// #1914 cross-boundary dispatch test: an approved add_scope_files path the
+// commit left untouched drives runImplementReviews, and the RENDERED
+// implement-review prompt carries the provenance decomposition, the
+// untouched-permission mark, and the machine NON-drift classification —
+// asserting the server-to-prompt seam end-to-end.
+func TestRunImplementReviews_ScopeProvenance_FoldOnly_RendersDecomposition(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	const addPath = "frontend/src/components/stage-detail.test.tsx"
+	au := s.cfg.AuditRepo.(*auditFake)
+	au.seeded = append(au.seeded, makeApproveWithScopeFilesEntry(runRow.ID, []string{addPath}))
+
+	// Commit touches only the raw plan scope file — the folded add path is untouched.
+	diff := policy.Diff{
+		ChangedFiles: []policy.ChangedFile{
+			{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+		},
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	for _, w := range []string{
+		"Declared-scope provenance (decomposition of the declared scope.files count",
+		addPath + " (folded: approval-add-scope-files) — folded, UNTOUCHED — a permission, not a work-order",
+		"Machine classification: the declared-vs-staged divergence is FULLY EXPLAINED by untouched folded permissions",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("dispatch-rendered prompt missing %q:\n%s", w, got)
+		}
+	}
+}
+
 // containsString reports whether want is in xs.
 func containsString(xs []string, want string) bool {
 	for _, x := range xs {
