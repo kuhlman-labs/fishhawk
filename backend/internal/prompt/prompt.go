@@ -665,6 +665,65 @@ type GateEvidence struct {
 	// a high-priority operator_scope_path_undelivered warning. Nil/empty omits
 	// the block.
 	OperatorScopeUndelivered []string
+	// ScopeProvenance decomposes the declared scope.files count into its
+	// provenance (#1914) so the implement reviewer can machine-classify a
+	// declared-vs-staged COUNT divergence as NON-drift when it is fully
+	// explained by folded permissions the commit left untouched (and/or fix-up
+	// permission-ceiling semantics) — killing the false-positive scope-evidence
+	// waiver class. Backend-derived at implement-review dispatch time from the
+	// approved plan + the operator-add / fix-up fold channels against the
+	// committed diff — like OperatorScopeUndelivered it is NOT bundle-carried,
+	// so a nil pointer keeps the prompt byte-identical (prompt-hash replay
+	// stability). writeGateEvidence renders it as the "Declared-scope
+	// provenance" subsection and rewrites the binding scope-divergence bullet.
+	ScopeProvenance *GateScopeProvenance
+}
+
+// GateScopeProvenance decomposes the declared scope.files count into its
+// provenance for the implement-review scope-divergence classification (#1914).
+// It makes "fully explained" machine-derived on BOTH sides of the
+// declared-vs-staged delta: the folds (with per-fold touch state) account for
+// the folded permissions, and PlanFiles/PlanUntouched account for the plan
+// base. Classification arithmetic (writeGateEvidence): the auto-NON-drift
+// classification applies ONLY when the divergence is fully accounted for by
+// untouched FOLDS (plus the fix-up permission-ceiling case) — i.e.
+// UnexplainedCount == 0 AND (FixupPass OR no untouched plan paths). Untouched
+// PLAN paths render as their own distinctly-labeled reviewer-judgment category
+// (neither auto-NON-drift nor auto-flag). Any residual beyond untouched folds +
+// untouched plan entries surfaces as UnexplainedCount, the still-flag signal.
+type GateScopeProvenance struct {
+	// PlanFiles is the count of raw plan scope.files entries — the base of the
+	// reconstructed effective scope.
+	PlanFiles int
+	// PlanUntouched is the subset of plan scope.files the committed diff did NOT
+	// touch. On a non-fix-up pass these render as a reviewer-judgment category
+	// (an approved-plan file left unchanged — not machine-classified either
+	// way); on a fix-up pass they are explained by the permission-ceiling
+	// semantics (#1314). Carrying the path list (not just a count) makes the
+	// plan side of "fully explained" machine-derived (#1914 binding condition).
+	PlanUntouched []string
+	// Folds are the non-plan effective-scope entries (folded permissions), each
+	// with its source channel and whether the committed diff touched it.
+	Folds []GateScopeFold
+	// FixupPass marks a fix-up dispatch: the declared scope retains the full
+	// approved plan scope as a permission ceiling (#1314), so an untouched
+	// in-plan path is an unused permission, not a dropped work-order.
+	FixupPass bool
+	// UnexplainedCount is the residual: the runner's DeclaredFiles minus the
+	// reconstructed effective-set size (clamped at 0). A positive value is a
+	// real divergence the provenance does NOT explain — the still-flag signal.
+	UnexplainedCount int
+}
+
+// GateScopeFold is one folded (non-plan) effective-scope entry (#1914): the
+// path, the fold source channel (approval-add-scope-files, scope-amendment,
+// fixup-allow-create, fixup-coupled-test-sibling), and whether the committed
+// diff touched it. An untouched fold is a permission, not a work-order — the
+// core of the non-drift classification.
+type GateScopeFold struct {
+	Path    string
+	Source  string
+	Touched bool
 }
 
 // GateFixupSelfReportDivergence is the advisory fix-up self-report divergence
@@ -3133,8 +3192,25 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 		"committed tree. A verify run marked SUPERSEDED is an earlier iteration the verify-fix loop absorbed and " +
 		"re-ran on a newer tree — its failure MUST NOT be treated as a committed-tree blocker. An absorbed-then-" +
 		"passed iteration is NOT a blocker; a terminal failure still is.\n")
-	b.WriteString("- A divergence between the declared and staged scope (counts below, or drift-excluded paths) " +
-		"likewise outranks stylistic findings — name it before them.\n")
+	// Provenance-aware scope-divergence bullet (#1914). When ScopeProvenance is
+	// attached, a declared-vs-staged COUNT divergence the provenance fully
+	// explains is machine-classified NON-drift and must NOT be raised; the flag
+	// is reserved for a divergence the provenance does NOT explain. When nil, the
+	// legacy bullet renders byte-for-byte (prompt-hash replay stability).
+	if ev.ScopeProvenance != nil {
+		b.WriteString("- A divergence between the declared and staged scope (counts below, or drift-excluded paths) " +
+			"likewise outranks stylistic findings — but FIRST read the 'Declared-scope provenance' decomposition " +
+			"below. A declared-vs-staged COUNT divergence the provenance FULLY EXPLAINS — accounted for entirely by " +
+			"folded permissions the commit left UNTOUCHED (a permission is not a work-order) and/or by fix-up " +
+			"permission-ceiling semantics — is machine-classified NON-drift and MUST NOT be raised as a scope " +
+			"concern. The flag is RESERVED for a divergence the provenance does NOT explain: a drift-excluded path, a " +
+			"positive unexplained residual, or an untouched path outside every fold channel (an untouched PLAN-scope " +
+			"path stays YOUR judgment — neither auto-cleared nor auto-flagged) — name those before stylistic " +
+			"findings.\n")
+	} else {
+		b.WriteString("- A divergence between the declared and staged scope (counts below, or drift-excluded paths) " +
+			"likewise outranks stylistic findings — name it before them.\n")
+	}
 	// The operator_scope_path_undelivered BINDING bullet is rendered only when
 	// the signal is present (#1407), so an empty/nil OperatorScopeUndelivered
 	// keeps the prompt byte-identical to the pre-change render.
@@ -3229,6 +3305,71 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 					fmt.Fprintf(b, "  - %s\n", p)
 				}
 			}
+		}
+		b.WriteString("\n")
+	}
+
+	// Declared-scope provenance decomposition (#1914): render the plan base,
+	// each folded permission with its touch state, the fix-up ceiling marker,
+	// the unexplained residual, and the machine NON-drift classification when the
+	// divergence is fully explained. Rendered independently of ScopeFacts (a
+	// nil-ScopeFacts bundle can still carry backend-derived provenance).
+	if p := ev.ScopeProvenance; p != nil {
+		b.WriteString("Declared-scope provenance (decomposition of the declared scope.files count — makes " +
+			"\"fully explained\" machine-derived on both sides of the divergence):\n\n")
+		fmt.Fprintf(b, "- plan scope.files: %d entries\n", p.PlanFiles)
+		// Untouched PLAN paths are their own distinctly-labeled reviewer-judgment
+		// category — NOT auto-classified as non-drift (unless the fix-up ceiling
+		// explains them) and NOT auto-flagged.
+		for _, pu := range p.PlanUntouched {
+			fmt.Fprintf(b, "  - %s (plan scope, UNTOUCHED — reviewer judgment: an approved-plan file the commit "+
+				"left unchanged; not machine-classified either way)\n", pu)
+		}
+		if len(p.Folds) > 0 {
+			b.WriteString("- folded (non-plan) effective-scope entries — permissions, not work-orders:\n")
+			for _, f := range p.Folds {
+				if f.Touched {
+					fmt.Fprintf(b, "  - %s (folded: %s)\n", f.Path, f.Source)
+				} else {
+					fmt.Fprintf(b, "  - %s (folded: %s) — folded, UNTOUCHED — a permission, not a work-order\n",
+						f.Path, f.Source)
+				}
+			}
+		}
+		if p.FixupPass {
+			b.WriteString("- fix-up pass: the declared scope retains the FULL approved plan scope as a permission " +
+				"ceiling (#1314); an untouched in-plan path is an unused permission, not a dropped work-order.\n")
+		}
+		if p.UnexplainedCount > 0 {
+			fmt.Fprintf(b, "- unexplained by provenance: %d entries — NOT accounted for by the folded permissions "+
+				"or plan scope above; treat this residual as a real scope-divergence signal and name it.\n",
+				p.UnexplainedCount)
+		}
+		// Machine NON-drift classification. It applies ONLY when the divergence is
+		// fully accounted for by untouched folds (plus the fix-up ceiling case):
+		// UnexplainedCount == 0 AND (FixupPass OR no untouched plan paths), and
+		// there is at least one untouched-but-explained entry to classify. A delta
+		// larger than the untouched folds (e.g. an untouched plan path on a
+		// non-fix-up pass) does NOT render this line (#1914 binding condition).
+		untouchedFolds := 0
+		for _, f := range p.Folds {
+			if !f.Touched {
+				untouchedFolds++
+			}
+		}
+		fullyExplained := p.UnexplainedCount == 0 && (p.FixupPass || len(p.PlanUntouched) == 0)
+		explainedUntouched := untouchedFolds
+		if p.FixupPass {
+			explainedUntouched += len(p.PlanUntouched)
+		}
+		if fullyExplained && explainedUntouched > 0 {
+			ceiling := ""
+			if p.FixupPass {
+				ceiling = " and fix-up permission-ceiling semantics"
+			}
+			fmt.Fprintf(b, "Machine classification: the declared-vs-staged divergence is FULLY EXPLAINED by "+
+				"untouched folded permissions%s — it is NON-drift. Do NOT raise the count divergence as a scope "+
+				"concern.\n", ceiling)
 		}
 		b.WriteString("\n")
 	}

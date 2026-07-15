@@ -2980,6 +2980,19 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		}
 	}
 
+	// Declared-scope provenance decomposition (#1914): reconstruct the effective
+	// scope and decompose the declared-vs-staged count so the reviewer can
+	// machine-classify a fold-only divergence as NON-drift. Adjacent to the
+	// #1407 block and using the same allocate-if-nil gateEvidence pattern; the
+	// #1407 operator_scope_path_undelivered signal is deliberately unchanged.
+	if prov := s.scopeProvenanceForReview(ctx, runID, stageID, approvedPlan, trig, diff, gateEvidence); prov != nil {
+		if gateEvidence == nil {
+			gateEvidence = &prompt.GateEvidence{}
+			trig.GateEvidence = gateEvidence
+		}
+		gateEvidence.ScopeProvenance = prov
+	}
+
 	promptText, err := prompt.Build("implement_review", trig)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: build prompt failed",
@@ -3146,6 +3159,121 @@ func (s *Server) approvedAmendmentScopePaths(ctx context.Context, runID uuid.UUI
 		}
 	}
 	return out
+}
+
+// scopeProvenanceForReview reconstructs the implement stage's effective
+// scope.files and decomposes the declared-vs-staged count into its provenance
+// (#1914), so the implement reviewer can machine-classify a fold-only count
+// divergence as NON-drift instead of waiving it as a false positive (the class
+// of six near-identical waivers across the 2026-07-12/13 drives). It runs
+// adjacent to the #1407 operator-scope-undelivered block, reusing the same
+// resolvers the prompt-serve folds use — so the partition matches the runner's
+// served DeclaredFiles by construction, and any residual disagreement surfaces
+// honestly as UnexplainedCount rather than being hidden.
+//
+// The effective set is rebuilt in the SAME fold order handleGetStagePrompt
+// applies (server/prompt.go): plan scope.files, then trig.AmendedScopeFiles
+// (approval-add-scope-files), approvedAmendmentScopePaths (scope-amendment),
+// and — on a fix-up pass only — resolveFixupAllowCreate (fixup-allow-create)
+// and the coupled *_test.go stem siblings over the accumulated set
+// (fixup-coupled-test-sibling), deduped by path with first-source-wins
+// (plan wins over any fold), matching foldScopePaths semantics.
+//
+// Each plan/fold path is marked touched by membership in the committed diff
+// using the same set walk + trailing-slash / non-repo-relative skips as
+// operatorScopeUndelivered (a directory or absolute/traversal token can never
+// name a committed path, so it is treated as touched rather than a false
+// untouched-permission signal). UnexplainedCount = max(0, DeclaredFiles - the
+// reconstructed size) when ScopeFacts is present (nil ScopeFacts → 0).
+//
+// Best-effort throughout: any channel lookup WARN-logs inside its resolver and
+// contributes nothing; the construction never blocks review dispatch. Returns
+// nil when there is nothing to report (no folds, no untouched plan path, no
+// unexplained residual, and not a fix-up pass), keeping the prompt
+// byte-identical for the common plain-plan-scope case.
+func (s *Server) scopeProvenanceForReview(ctx context.Context, runID, stageID uuid.UUID, approvedPlan *plan.Plan, trig prompt.Trigger, diff policy.Diff, ev *prompt.GateEvidence) *prompt.GateScopeProvenance {
+	if approvedPlan == nil || len(approvedPlan.Scope.Files) == 0 {
+		return nil
+	}
+
+	committed := make(map[string]struct{}, len(diff.ChangedFiles))
+	for _, f := range diff.ChangedFiles {
+		committed[f.Path] = struct{}{}
+	}
+	// touched mirrors operatorScopeUndelivered's skips: a trailing-slash
+	// directory prefix or a non-repo-relative token can never match a committed
+	// diff path, so it is treated as touched (not a false untouched signal).
+	touched := func(p string) bool {
+		if strings.HasSuffix(p, "/") || !isRepoRelativePath(p) {
+			return true
+		}
+		_, ok := committed[p]
+		return ok
+	}
+
+	inScope := make(map[string]struct{}, len(approvedPlan.Scope.Files))
+	accum := make([]scopeFile, 0, len(approvedPlan.Scope.Files))
+	var planPaths []string
+	for _, f := range approvedPlan.Scope.Files {
+		if _, ok := inScope[f.Path]; ok {
+			continue
+		}
+		inScope[f.Path] = struct{}{}
+		planPaths = append(planPaths, f.Path)
+		accum = append(accum, scopeFile{Path: f.Path, Operation: string(f.Operation)})
+	}
+
+	var folds []prompt.GateScopeFold
+	addFold := func(paths []string, source string) {
+		for _, p := range paths {
+			// first-source-wins dedup (plan wins over folds; earlier fold wins
+			// over later), matching foldScopePaths' compare-by-Path semantics.
+			if _, ok := inScope[p]; ok {
+				continue
+			}
+			inScope[p] = struct{}{}
+			accum = append(accum, scopeFile{Path: p, Operation: "modify"})
+			folds = append(folds, prompt.GateScopeFold{Path: p, Source: source, Touched: touched(p)})
+		}
+	}
+	addFold(trig.AmendedScopeFiles, "approval-add-scope-files")
+	addFold(s.approvedAmendmentScopePaths(ctx, runID), "scope-amendment")
+	fixupPass := hasFixupRoutedConcern(trig.PriorConcerns)
+	if fixupPass {
+		addFold(s.resolveFixupAllowCreate(ctx, runID, stageID), "fixup-allow-create")
+		// Coupled stem-sibling tests fold over the accumulated set (plan + prior
+		// folds), mirroring effectiveFixupScope's final fold so the reconstruction
+		// reproduces the served scope.
+		addFold(coupledTestSiblings(accum), "fixup-coupled-test-sibling")
+	}
+
+	var planUntouched []string
+	for _, p := range planPaths {
+		if !touched(p) {
+			planUntouched = append(planUntouched, p)
+		}
+	}
+
+	unexplained := 0
+	if ev != nil && ev.ScopeFacts != nil {
+		if d := ev.ScopeFacts.DeclaredFiles - len(inScope); d > 0 {
+			unexplained = d
+		}
+	}
+
+	// Nothing to report → nil keeps the prompt byte-identical for the common
+	// plain-plan-scope case (no folds, every plan file touched, no residual).
+	if len(folds) == 0 && len(planUntouched) == 0 && unexplained == 0 && !fixupPass {
+		return nil
+	}
+
+	return &prompt.GateScopeProvenance{
+		PlanFiles:        len(planPaths),
+		PlanUntouched:    planUntouched,
+		Folds:            folds,
+		FixupPass:        fixupPass,
+		UnexplainedCount: unexplained,
+	}
 }
 
 // runImplementReviewInvocations runs the per-reviewer implement-review loop

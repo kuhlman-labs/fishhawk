@@ -150,3 +150,25 @@ The sanitizer is pure (no time, no map iteration) to preserve the package's byte
 `writeFixupConcerns` reuses the same `sanitizeUntrustedComment` primitive for the fix-up-concern path.
 
 A `prompt.FixupConcern` with `AcceptanceDerived` true (set by `resolveFixupConcerns` from the persisted `planreview.Concern.Provenance == acceptance` marker) renders under a separate `<<<BEGIN/END UNTRUSTED ACCEPTANCE FAILURE>>>` DATA envelope, while trusted operator/reviewer concerns keep the byte-identical MANDATORY block (see the Rule-of-Two acceptance posture row in `docs/ARCHITECTURE.md` §10).
+
+## Declared-scope provenance decomposition (#1914)
+
+The implement-review "### Gate evidence" section (`writeGateEvidence`) renders a `Declared-scope provenance` subsection when `GateEvidence.ScopeProvenance` is attached. It decomposes the declared `scope.files` count into its provenance so the reviewer can machine-classify a declared-vs-staged COUNT divergence as NON-drift instead of waiving it as a false positive — killing the false-positive scope-evidence waiver class (four runs, six near-identical waivers in the 2026-07-12/13 drives).
+
+`ScopeProvenance` is backend-derived at implement-review dispatch time by `scopeProvenanceForReview` (`server/trace.go`), NOT bundle-carried — a nil pointer keeps the prompt byte-identical (prompt-hash replay stability), exactly like `OperatorScopeUndelivered`. It reconstructs the effective scope in the SAME fold order `handleGetStagePrompt` applies, reusing the same resolvers, so the partition matches the runner's served `DeclaredFiles` by construction; residual disagreement surfaces honestly as `UnexplainedCount` rather than being hidden.
+
+The decomposition carries:
+
+- **plan scope.files** (`PlanFiles`) — the base of the effective scope. An untouched plan path (`PlanUntouched`) renders as its OWN distinctly-labeled **reviewer-judgment** category: an approved-plan file the commit left unchanged, NOT machine-classified either way (on a fix-up pass it is instead explained by the permission-ceiling case below).
+- **folded (non-plan) entries** (`Folds`), each with its source label and whether the committed diff touched it:
+  - `approval-add-scope-files` — an `add_scope_files` path the operator folded at plan approval (#824).
+  - `scope-amendment` — an operator-approved mid-stage scope amendment (#961).
+  - `fixup-allow-create` — an operator-declared net-new file on a fix-up pass (#823).
+  - `fixup-coupled-test-sibling` — the coupled `*_test.go` stem sibling auto-folded on a fix-up pass (#1214).
+  An **untouched** fold is marked *"a permission, not a work-order"* — a folded path grants permission to touch it; leaving it untouched is not drift.
+- **fix-up ceiling** (`FixupPass`) — on a fix-up pass the declared scope retains the full approved plan scope as a permission ceiling (#1314), so an untouched in-plan path is an unused permission, not a dropped work-order.
+- **unexplained residual** (`UnexplainedCount`) — `max(0, DeclaredFiles − reconstructed size)`. A positive value is a real divergence the provenance does NOT explain and stays the **still-flag** signal.
+
+**Classification arithmetic.** The machine NON-drift classification applies ONLY when the declared-vs-staged delta is fully accounted for by untouched **folds** (plus the fix-up permission-ceiling case): `UnexplainedCount == 0` AND (`FixupPass` OR no untouched plan paths), with at least one untouched-but-explained entry. A delta larger than the untouched folds — e.g. an untouched plan path on a non-fix-up pass — does NOT render the affirmative non-drift verdict; the untouched plan path stays reviewer judgment. The provenance-aware binding bullet reserves the scope-divergence flag for a divergence the provenance does NOT explain (a drift-excluded path, a positive unexplained residual, or an untouched path outside every fold channel).
+
+The #1407 `operator_scope_path_undelivered` signal is deliberately UNCHANGED: an untouched operator-added path stays a separately-rendered high-priority per-path miss. This change reclassifies only the aggregate count divergence; the two signals render independently.
