@@ -3330,6 +3330,43 @@ func TestImplementReviewLoop_RepublishesAuditCompleteWhenReviewLands(t *testing.
 	}
 }
 
+// TestRunImplementReview_RecordsOnTerminalFailedRun_Unguarded pins the #1915
+// server-side invariant for the implement stage (the sibling of
+// TestRunPlanReviews_RecordsOnTerminalFailedRun_Unguarded in plan_test.go): the
+// implement-review loop records implement_reviewed even when the run has
+// already flipped terminal-failed. The recording path carries NO run-state
+// guard — the flip is derived bookkeeping, not a review gate — so a future
+// IsTerminal check on the record path (which would silently re-freeze a healthy
+// stage's review) fails here.
+func TestRunImplementReview_RecordsOnTerminalFailedRun_Unguarded(t *testing.T) {
+	rr := newOrchestratorRepo()
+	runRow := rr.seedRun()
+	runRow.State = run.StateFailed // a sibling stage failed → run terminal
+
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+
+	au := newAuditFake()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	// ArtifactRepo intentionally omitted: recomputeAndPublishAuditComplete
+	// short-circuits without it, isolating the record-path invariant.
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, PlanReviewer: reviewer})
+
+	s.runImplementReviewLoop(context.Background(), runRow.ID, implStage.ID, 1,
+		planreview.AuthorityAdvisory, "review prompt", "")
+
+	reviewed, err := au.ListForRunByCategory(context.Background(), runRow.ID, "implement_reviewed")
+	if err != nil {
+		t.Fatalf("list implement_reviewed: %v", err)
+	}
+	if len(reviewed) != 1 {
+		t.Fatalf("implement_reviewed entries = %d, want 1 (recording is unguarded by terminal run state)", len(reviewed))
+	}
+}
+
 // TestFailStageCategoryC_DuplicateReport_DoesNotAdvanceRun reproduces the
 // #968 incident sequence at the server layer: a fix-up re-dispatch failed,
 // fix-up recovery restored the implement stage to succeeded and re-parked

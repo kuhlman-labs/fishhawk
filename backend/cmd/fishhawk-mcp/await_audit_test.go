@@ -463,6 +463,93 @@ func TestAwaitAudit_RunTerminalBackstop_FinalReadWins(t *testing.T) {
 	}
 }
 
+// TestAwaitAudit_TerminalRun_InFlightReview_KeepsPollingUntilVerdict is the
+// #1915 m4 proof: awaiting a review verdict (implement_reviewed) on a run that
+// is already terminal-failed, with the review still in flight (an
+// implement_review_started marker but no verdict), does NOT short-circuit to
+// run_terminal — the verdict is recorded server-side with no run-state guard,
+// so the wait keeps polling and resolves 'found' once the verdict lands.
+func TestAwaitAudit_TerminalRun_InFlightReview_KeepsPollingUntilVerdict(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "failed"}
+	// A review was dispatched (started marker at seq 1) but no verdict landed.
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 1, "advisory")
+
+	// The backstop derives in-flight-ness from reviewStatusFor, whose last
+	// query per pass is the started category. Land the verdict on the first
+	// poll tick's reviewStatusFor (started query #2) — the pre-loop backstop's
+	// reviewStatusFor (query #1) already observed 'pending' and kept polling.
+	var startedQueries atomic.Int64
+	fb.reviewFlip = func(category string) {
+		if category == "implement_review_started" && startedQueries.Add(1) == 2 {
+			payload, _ := json.Marshal(PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+			var decoded any
+			_ = json.Unmarshal(payload, &decoded)
+			fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+				ID:       uuid.New().String(),
+				Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+				RunID:    runID.String(),
+				Category: "implement_reviewed",
+				Payload:  decoded,
+			})
+		}
+	}
+
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitAudit(context.Background(), nil, AwaitAuditInput{
+		RunID:          runID.String(),
+		Category:       "implement_reviewed",
+		SinceSequence:  1,
+		TimeoutSeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("awaitAudit: %v", err)
+	}
+	if out.Status != "found" {
+		t.Fatalf("Status = %q, want found (terminal run must keep polling while the review is in flight)", out.Status)
+	}
+	if out.Entry == nil || out.Entry.Category != "implement_reviewed" {
+		t.Errorf("Entry = %+v, want the landed implement_reviewed verdict", out.Entry)
+	}
+}
+
+// TestAwaitAudit_TerminalRun_NonReviewCategory_ResolvesRunTerminal is the #1915
+// m5 scoping proof: the in-flight-aware keep-polling is scoped STRICTLY to
+// review-verdict categories. Even with a review genuinely in flight (an
+// implement_review_started marker present), a wait on a NON-review category
+// (fixup_pushed) resolves run_terminal byte-identically — so the shared
+// drive_run.go / next_actions.go callers are unaffected for non-review waits.
+func TestAwaitAudit_TerminalRun_NonReviewCategory_ResolvesRunTerminal(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "failed"}
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 1, "advisory")
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	// Large timeout: the backstop resolves run_terminal immediately for a
+	// non-review category, so a prompt return is the proof it did not keep
+	// polling (which would hang to the deadline).
+	_, out, err := r.awaitAudit(context.Background(), nil, AwaitAuditInput{
+		RunID:          runID.String(),
+		Category:       "fixup_pushed",
+		SinceSequence:  2,
+		TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitAudit: %v", err)
+	}
+	if out.Status != "run_terminal" {
+		t.Fatalf("Status = %q, want run_terminal (non-review category is unaffected by the in-flight rule)", out.Status)
+	}
+	if !strings.Contains(out.Message, "Do not re-arm blindly") {
+		t.Errorf("run_terminal message should warn against blind re-arm: %q", out.Message)
+	}
+}
+
 // TestAwaitAudit_StaleReviewNeverReturned is the #894 reproduction at the
 // construction level: a fix-up re-opened the implement stage, so the audit
 // trail holds a stale pre-fix-up implement_reviewed verdict BELOW the

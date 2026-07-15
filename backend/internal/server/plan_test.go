@@ -2645,6 +2645,40 @@ func TestShipPlan_ReviewAgents_Advisory_ContextDetached(t *testing.T) {
 	}
 }
 
+// TestRunPlanReviews_RecordsOnTerminalFailedRun_Unguarded pins the #1915
+// server-side invariant that the MCP in-flight-aware backstops rely on: plan-
+// review dispatch AND verdict recording carry NO run-state guard. A run that
+// has already flipped terminal-failed (because a sibling stage failed) still
+// dispatches runPlanReviews and lands both the plan_review_started proxy and a
+// terminal plan_reviewed verdict. The run flip is derived bookkeeping, not a
+// review gate — so a future guard added to the dispatch/recording path (which
+// would silently re-introduce the operator-visible freeze this PR fixes) fails
+// here.
+func TestRunPlanReviews_RecordsOnTerminalFailedRun_Unguarded(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	// Gating authority runs the review loop synchronously, so the terminal
+	// entries land without draining a detached goroutine.
+	s, _, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewers)
+	// The run is already terminal-failed at dispatch time.
+	rr.getRuns[runID].State = run.StateFailed
+
+	body := validPlanBytes(t)
+	if s.runPlanReviews(context.Background(), runID, stageID, body, nil, nil, nil, nil, nil) {
+		t.Fatal("runPlanReviews returned true on an approve verdict (must not gate)")
+	}
+
+	if n := countAuditCategory(au, "plan_review_started"); n != 1 {
+		t.Errorf("plan_review_started entries = %d, want 1 (dispatch is unguarded by terminal run state)", n)
+	}
+	if n := countAuditCategory(au, "plan_reviewed"); n != 1 {
+		t.Errorf("plan_reviewed entries = %d, want 1 (verdict recording is unguarded by terminal run state)", n)
+	}
+}
+
 // TestShipPlan_ReviewAgents_GatingReject_FromAwaitingApproval asserts the
 // state-machine edge the synchronous-gating guarantee relies on: when the
 // trace handler has already advanced the plan stage to awaiting_approval

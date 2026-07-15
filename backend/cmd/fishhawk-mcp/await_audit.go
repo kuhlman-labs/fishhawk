@@ -102,7 +102,12 @@ Statuses:
                      waiting (the ADR-036 non-stranding backstop); a
                      final anchored read found nothing. The entry will
                      most likely never land — do not re-arm blindly;
-                     check fishhawk_get_run_status first.
+                     check fishhawk_get_run_status first. EXCEPTION
+                     (#1915): a wait on a review verdict (plan_reviewed /
+                     implement_reviewed) whose review is still in flight
+                     keeps polling instead — the verdict is recorded with
+                     no run-state guard, so it WILL land despite the
+                     terminal run.
 
 Inputs:
   - run_id          (required) — Fishhawk run UUID.
@@ -308,6 +313,17 @@ func (r *runResolver) awaitAuditRunTerminalBackstop(ctx context.Context, runID u
 	if err == nil && entry != nil {
 		return awaitAuditFoundOutput(entry, in, cats, start), true
 	}
+	// In-flight-review-aware (#1915): if the wait is on a review-verdict
+	// category (plan_reviewed / implement_reviewed) whose review is still in
+	// flight, the verdict WILL land — the server records it with no run-state
+	// guard, so the terminal run flip is derived bookkeeping, not a review
+	// gate. Keep polling to the bounded timeout instead of resolving
+	// run_terminal. EVERY non-review category keeps today's byte-identical
+	// early resolve, so the shared drive_run.go / next_actions.go callers are
+	// unaffected for non-review waits.
+	if r.reviewCategoryInFlight(ctx, runID, cats) {
+		return AwaitAuditOutput{}, false
+	}
 	return AwaitAuditOutput{
 		Status:         "run_terminal",
 		LatestSequence: in.SinceSequence,
@@ -317,6 +333,43 @@ func (r *runResolver) awaitAuditRunTerminalBackstop(ctx context.Context, runID u
 			"Do not re-arm blindly: check fishhawk_get_run_status for the final run state first.",
 			categoriesDisplay(cats), in.SinceSequence, runID, runRow.State),
 	}, true
+}
+
+// reviewStageForCategory maps a review-verdict audit category to the review
+// stage its in-flight state is derived from, reporting false for any
+// non-review category. It is the seam the #1915 in-flight-aware backstop keys
+// on so the keep-polling behavior is scoped strictly to review verdicts.
+func reviewStageForCategory(category string) (string, bool) {
+	switch category {
+	case "plan_reviewed":
+		return "plan", true
+	case "implement_reviewed":
+		return "implement", true
+	default:
+		return "", false
+	}
+}
+
+// reviewCategoryInFlight reports whether ANY awaited category is a review-
+// verdict category whose review is still in flight — reviewStatusFor for the
+// mapped stage resolves to "pending" (a *_review_started marker exists with
+// fewer than the configured verdicts landed). This is the #1915 signal that a
+// terminal-run wait on a review verdict must keep polling rather than resolve
+// run_terminal, because the verdict is recorded server-side with no run-state
+// guard and WILL land. Best-effort: a query error reports not-in-flight, so a
+// transient failure falls back to today's terminal resolve rather than spinning.
+func (r *runResolver) reviewCategoryInFlight(ctx context.Context, runID uuid.UUID, cats []string) bool {
+	for _, c := range cats {
+		stage, ok := reviewStageForCategory(c)
+		if !ok {
+			continue
+		}
+		st, err := r.reviewStatusFor(ctx, runID, stage)
+		if err == nil && st != nil && st.Status == "pending" {
+			return true
+		}
+	}
+	return false
 }
 
 // awaitAuditFoundOutput builds the resolved response for a matched entry.
