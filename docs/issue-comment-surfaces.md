@@ -855,6 +855,21 @@ Notes:
   re-dispatch; it is the operator counterpart to the system-emitted
   `parent_awaiting_redrive` park signal above. Listed here only so a future
   reader grepping the audit categories doesn't mistake it for a comment surface.
+- The one-verb failed-run revive audit kind — `run_revived` (#1915) — is an
+  **internal, user-actor audit kind, not an issue-comment surface**. Nothing in
+  `issuecomment` posts it to the issue thread; it has no Notifier method. The
+  revive handler (`server/revive.go::handleReviveRun`,
+  `POST /v0/runs/{run_id}/revive`) writes it once on a successful revive, with
+  the operator's `user` actor + subject and payload
+  `{run_id, restored_stages, stage_count, via}` — where `restored_stages` lists
+  each re-parked stage's `{stage_id, type, prior_category, prior_reason,
+  restored_state}`. The action re-admits a terminal-`failed` run: it re-parks
+  every failed stage to its gate-ordered pre-dispatch state (`pending` /
+  `awaiting_approval` / `awaiting_children`) and reopens the run
+  (`failed` → `running`), but performs NO dispatch — the operator dispatches
+  each stage later at its proper turn (the semantic difference from `child_redriven`,
+  which re-advances). Listed here only so a future reader grepping the audit
+  categories doesn't mistake it for a comment surface.
 - The audited category-B override audit kind — `stage_override_retried` (#698) —
   is an **internal, user-actor audit kind, not an issue-comment surface**.
   Nothing in `issuecomment` posts it to the issue thread; it has no Notifier

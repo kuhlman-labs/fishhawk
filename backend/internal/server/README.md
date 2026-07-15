@@ -316,6 +316,17 @@ The operator recovery action for a decomposition parent parked in `awaiting_chil
 - **Auth**: re-drive requires the operator retry scope (`write:stages`/`write:retries`) AND rejects any MCP/agent subject-bound token outright (`403 agent_token_forbidden`) — an agent may not re-drive any run.
 - Writes a `child_redriven` audit (user actor + prior implement-stage failure category/reason); the parked parent reconciles on the re-driven child's next terminal transition through the unchanged `maybeAdvanceDecomposedParent` path.
 
+### Revive — one-verb failed-run re-park (`revive.go`, #1915)
+
+The operator recovery action that re-admits ANY terminal-`failed` run for another turn — the single verb that replaces the retry-without-dispatch dance (retry each failed stage, then remember NOT to dispatch).
+
+- `POST /v0/runs/{run_id}/revive` (`backend/internal/server/revive.go`) calls `run.ReviveRun` (`backend/internal/run/revive.go`), which **pre-validates** that the run is `failed` AND that EVERY failed stage is retryable (`run.RetryableFailure`) BEFORE any mutation, then re-parks each failed stage via the existing `run.RetryStage` per-category targets (A/C → `pending`, D-`sla_timeout` → `awaiting_approval`, decomposed-parent implement → `awaiting_children` per #1891) and reopens the run `failed → running` via the same `RetryRun` primitive re-drive uses.
+- **No-partial-mutation batch**: a single non-retryable failed stage (category-B, D-rejected, or a stage with no recorded category) refuses the WHOLE revive with `422 revive_not_applicable` naming the blocking stage — nothing is re-parked, the run stays `failed`. A run in any non-`failed` state (`runRetryTransitions` admits only `failed → running`) and a run with zero failed stages both refuse the same way.
+- **No dispatch — the semantic difference from `/retry` and `/redrive`.** Revive performs NO `Orchestrator.Advance` and writes NO drive `retry_reopen` stamp: it re-parks only. Each re-parked stage sits in its pre-dispatch state until the operator dispatches it at its proper gate turn via the existing verbs. Because no `Advance` fires mid-revive, the #1700 wrong-order re-dispatch corruption is structurally impossible. A handler test asserts a re-parked `pending` stage stays `pending` (never `dispatched`) with a real orchestrator wired — proof of zero `Advance` calls.
+- Each `RetryStage` bumps the stage's `SelfRetryCount`, so revive consumes per-stage retry budget exactly like `fishhawk_retry_stage` — a batch retry-shaped re-open, not a budget bypass.
+- **Auth**: revive requires the operator retry scope (`write:stages`/`write:retries`) AND rejects any MCP/agent subject-bound token outright (`403 agent_token_forbidden`) — an agent may not revive any run. Mirrors `/redrive`.
+- Writes ONE chained `run_revived` audit (user actor; payload lists each restored stage's `stage_id`/`type`/`prior_category`/`prior_reason`/`restored_state` plus `stage_count`) and refreshes the sticky status comment. The response body is `{run, restored_stages[]}`.
+
 ### Run-branch reset remediation (`reset_branch.go`, ADR-035 third line / #867)
 
 `backend/internal/server/reset_branch.go::handleResetRunBranch` (route `POST /v0/runs/{run_id}/reset-branch`, MCP verb `fishhawk_reset_run_branch`).
