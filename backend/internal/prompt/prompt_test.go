@@ -4159,12 +4159,16 @@ func TestBuild_ImplementReview_SettledConcernsTwoTierLanguage(t *testing.T) {
 	}
 }
 
-// TestBuild_ImplementReview_EmptySettledConcernsByteIdentical pins the #1913
-// byte-identity property: an empty SettledConcerns (the no-settled-context run,
-// which INCLUDES the common no-waived-concern case) leaves the implement-review
-// prompt byte-identical to omitting the field — protecting the caching prefix
-// and the pre-#1913 output.
-func TestBuild_ImplementReview_EmptySettledConcernsByteIdentical(t *testing.T) {
+// TestBuild_ImplementReview_EmptySettledConcernsRendersNoLedger pins the #1913
+// no-settled-context property. The equality check proves only nil-vs-empty-slice
+// equivalence (both SettledConcerns values take the len==0 branch within THIS
+// build) — it is NOT a byte-identity check against the pre-#1913 output. The
+// load-bearing assertions are the ABSENCE ones below: the settled ledger header
+// and the conditional settled_ref/new_evidence schema members must not render
+// when there are no settled concerns, which (together with the unchanged
+// pre-existing prompt suite) carries the "unchanged from the pre-change output"
+// property the caching prefix depends on.
+func TestBuild_ImplementReview_EmptySettledConcernsRendersNoLedger(t *testing.T) {
 	base := Trigger{
 		Repo:         "kuhlman-labs/example",
 		ApprovedPlan: fixturePlan(),
@@ -4184,7 +4188,7 @@ func TestBuild_ImplementReview_EmptySettledConcernsByteIdentical(t *testing.T) {
 		t.Fatalf("Build with empty: %v", err)
 	}
 	if got != without {
-		t.Errorf("empty SettledConcerns must be byte-identical to omitting it")
+		t.Errorf("empty-slice SettledConcerns must render identically to nil (both take the len==0 branch)")
 	}
 	if strings.Contains(without, "### Settled concerns") {
 		t.Errorf("no settled concerns must omit the settled ledger section:\n%s", without)

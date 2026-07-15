@@ -2760,6 +2760,25 @@ func countSuppressionAudits(au *auditFake, category string) int {
 	return n
 }
 
+// findSuppressionAudit returns the single concern_relitigation_suppressed entry
+// appended to au, failing if there is not exactly one. Used to assert the
+// entry's payload contents and actor attribution, not just its category count.
+func findSuppressionAudit(t *testing.T, au *auditFake) audit.ChainAppendParams {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var found []audit.ChainAppendParams
+	for _, ap := range au.appended {
+		if ap.Category == concernRelitigationSuppressedCategory {
+			found = append(found, ap)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("concern_relitigation_suppressed entries = %d, want 1", len(found))
+	}
+	return found[0]
+}
+
 // lookupErrConcernRepo wraps fakeConcernRepo to inject a GetByIDs store error —
 // the only guard branch the base fake cannot express (a missing row surfaces as
 // ErrNotFound; this simulates a genuine store outage).
@@ -2775,12 +2794,21 @@ func (r *lookupErrConcernRepo) GetByIDs(ctx context.Context, ids []uuid.UUID) ([
 	return r.fakeConcernRepo.GetByIDs(ctx, ids)
 }
 
-// seedSettled seeds a concern and drives it to the given terminal state,
-// returning its id string. Waived/deferred set an operator reason.
+// seedSettled seeds an implement-stage concern and drives it to the given
+// terminal state, returning its id string. Waived/deferred set an operator
+// reason.
 func seedSettled(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.UUID, state concern.State) string {
 	t.Helper()
+	return seedSettledKind(t, cr, runID, stageID, concern.StageKindImplement, state)
+}
+
+// seedSettledKind is seedSettled with an explicit stage kind, for the guard's
+// cross-stage-kind fail-open branch (a same-run/same-stage ref whose settled
+// concern was raised under a different stage kind).
+func seedSettledKind(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.UUID, stageKind string, state concern.State) string {
+	t.Helper()
 	ctx := context.Background()
-	c := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 100, "settled finding")
+	c := seedConcernRow(t, cr, runID, stageID, stageKind, 100, "settled finding")
 	switch state {
 	case concern.StateWaived, concern.StateDeferred:
 		if _, err := cr.ApplyResolution(ctx, c.ID, state, "operator arbitration"); err != nil {
@@ -2814,8 +2842,30 @@ func TestPersistReviewConcerns_RelitigationGuardMatrix(t *testing.T) {
 		if got := countRaisedWithNote(cr, "re-raise"); got != 0 {
 			t.Errorf("waived no-evidence re-raise minted %d rows, want 0 (suppressed)", got)
 		}
-		if got := countSuppressionAudits(au, concernRelitigationSuppressedCategory); got != 1 {
-			t.Errorf("suppression audit entries = %d, want 1", got)
+		// The suppression is not merely counted: its audit entry carries the full
+		// operator-visibility payload documented as the server/README.md
+		// concern_relitigation_suppressed contract, attributed to the system actor.
+		// A regression that emitted the right category with a wrong/empty payload
+		// would pass a count-only assertion while breaking that contract.
+		entry := findSuppressionAudit(t, au)
+		if entry.ActorKind == nil || *entry.ActorKind != audit.ActorSystem {
+			t.Errorf("suppression ActorKind = %v, want system", entry.ActorKind)
+		}
+		var p concernRelitigationSuppressedPayload
+		if err := json.Unmarshal(entry.Payload, &p); err != nil {
+			t.Fatalf("decode suppression payload: %v", err)
+		}
+		want := concernRelitigationSuppressedPayload{
+			SettledRef:           ref,
+			SettledState:         string(concern.StateWaived),
+			Severity:             "high",
+			Category:             "correctness",
+			Note:                 "re-raise",
+			ReviewerModel:        "m",
+			OriginReviewSequence: 200,
+		}
+		if p != want {
+			t.Errorf("suppression payload = %+v, want %+v", p, want)
 		}
 	})
 
@@ -2886,6 +2936,42 @@ func TestPersistReviewConcerns_RelitigationGuardMatrix(t *testing.T) {
 			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref}})
 		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
 			t.Errorf("other-stage settled_ref minted %d rows, want 1 (fail-open)", got)
+		}
+		if got := countSuppressionAudits(au, concernRelitigationSuppressedCategory); got != 0 {
+			t.Errorf("suppression audit entries = %d, want 0", got)
+		}
+	})
+
+	t.Run("other_run_ref_inserted", func(t *testing.T) {
+		s, cr, au := guardServer(t)
+		runID, stageID := uuid.New(), uuid.New()
+		// The security-flavored case (row.RunID != runID): the waived concern
+		// belongs to a DIFFERENT run entirely. A reviewer can never suppress via a
+		// ref to another run's concern — it falls open to the normal insert.
+		otherRun := uuid.New()
+		ref := seedSettled(t, cr, otherRun, stageID, concern.StateWaived)
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref}})
+		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
+			t.Errorf("other-run settled_ref minted %d rows, want 1 (fail-open)", got)
+		}
+		if got := countSuppressionAudits(au, concernRelitigationSuppressedCategory); got != 0 {
+			t.Errorf("suppression audit entries = %d, want 0", got)
+		}
+	})
+
+	t.Run("other_stage_kind_ref_inserted", func(t *testing.T) {
+		s, cr, au := guardServer(t)
+		runID, stageID := uuid.New(), uuid.New()
+		// Same run AND same stage id, but the settled concern was raised under a
+		// DIFFERENT stage kind (plan vs the implement re-raise) — the third
+		// disjunct of the guard's cross-scope check (row.StageKind != stageKind).
+		// It falls open to the normal insert.
+		ref := seedSettledKind(t, cr, runID, stageID, concern.StageKindPlan, concern.StateWaived)
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref}})
+		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
+			t.Errorf("other-stage-kind settled_ref minted %d rows, want 1 (fail-open)", got)
 		}
 		if got := countSuppressionAudits(au, concernRelitigationSuppressedCategory); got != 0 {
 			t.Errorf("suppression audit entries = %d, want 0", got)
