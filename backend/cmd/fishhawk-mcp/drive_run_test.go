@@ -50,6 +50,14 @@ type driveFakeBackend struct {
 	gateErr      bool // /auto-drive returns 500 when true
 	auditErr     bool // /audit returns 500 when true (drives the amendment-poll fail-closed path)
 
+	// #1928 acceptance-admission fixtures. admissionShortCircuit drives the
+	// short_circuited response (and flips the acceptance stage to succeeded on a
+	// hit); admissionStatus (0 -> 200) drives the fail-open error branch;
+	// admissionCalledN counts admission POSTs.
+	admissionShortCircuit bool
+	admissionStatus       int
+	admissionCalledN      int
+
 	// auditErrCategory, when set, returns 500 only for /audit reads of that
 	// category — so a run_auto_driven read can fail while the amendment-poll
 	// reads (scope_amendment_requested/decided) still succeed.
@@ -179,6 +187,28 @@ func (f *driveFakeBackend) handler() http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		path := r.URL.Path
 		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(path, "/acceptance-admission"):
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.admissionCalledN++
+			sc := f.admissionShortCircuit
+			status := f.admissionStatus
+			if sc {
+				f.setState("acceptance", "succeeded")
+			}
+			if status != 0 && status != http.StatusOK {
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"admission boom"}}`))
+				return
+			}
+			res := AcceptanceAdmissionResult{ShortCircuited: sc}
+			if sc {
+				res.Kind = "all_skip_with_basis"
+				res.Basis = "all-skip-with-basis"
+				res.CriteriaTotal = 2
+			}
+			_ = json.NewEncoder(w).Encode(res)
+
 		case r.Method == http.MethodPost && strings.HasSuffix(path, "/auto-drive/acts"):
 			f.mu.Lock()
 			defer f.mu.Unlock()
@@ -2360,4 +2390,157 @@ func TestDriveRun_StartedAtStalenessAnchor(t *testing.T) {
 			t.Fatalf("driver spawned a stage StartedAt marks live: %v (must never auto-spawn)", got)
 		}
 	})
+}
+
+// --- (#1928) acceptance-dispatch admission in the drive loop ------------------
+
+// TestDriveRun_AcceptanceShortCircuit_NoSpawn_ContinuesToMerge: when the drive
+// loop reaches a dispatchable acceptance stage whose admission short-circuits,
+// it records NO act, spawns NO runner, appends a short-circuit DriveStep, and
+// the loop continues to merge after the stage settles server-side.
+func TestDriveRun_AcceptanceShortCircuit_NoSpawn_ContinuesToMerge(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "succeeded", 1),
+		stg(driveAccID, "acceptance", "pending", 2),
+	})
+	f.admissionShortCircuit = true
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		if f.allSucceeded("plan", "implement", "acceptance") {
+			f.runState = "succeeded" // webhook-settled on the next poll
+			return AutoDriveOutcome{Acted: true, Action: "merge", Note: "enabled auto-merge"}
+		}
+		return AutoDriveOutcome{Note: "observe-only"}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedMerged {
+		t.Fatalf("stopped_reason = %q, want merged:\n%+v", out.StoppedReason, out)
+	}
+	// NO acceptance runner spawned.
+	for _, typ := range rec.list() {
+		if typ == "acceptance" {
+			t.Errorf("a short-circuited acceptance stage must NOT spawn a runner; spawned: %v", rec.list())
+		}
+	}
+	// NO acceptance dispatch act recorded.
+	f.mu.Lock()
+	acts := append([]RecordAutoDriveAct(nil), f.recordedActs...)
+	admissionN := f.admissionCalledN
+	f.mu.Unlock()
+	for _, a := range acts {
+		if a.Stage == "acceptance" {
+			t.Errorf("a short-circuited acceptance stage must record NO dispatch act; acts: %+v", acts)
+		}
+	}
+	if admissionN < 1 {
+		t.Errorf("admission endpoint calls = %d, want >= 1", admissionN)
+	}
+	// A short-circuit DriveStep was appended.
+	var noted bool
+	for _, s := range out.StepsTaken {
+		if s.Kind == "dispatch" && s.Stage == "acceptance" && strings.Contains(s.Note, "short-circuited server-side") {
+			noted = true
+		}
+	}
+	if !noted {
+		t.Errorf("missing the acceptance short-circuit DriveStep; steps: %+v", out.StepsTaken)
+	}
+}
+
+// TestDriveRun_AcceptanceAdmissionError_FailsOpen: an admission error appends a
+// warning and the drive falls through to today's record + spawn for the
+// acceptance stage.
+func TestDriveRun_AcceptanceAdmissionError_FailsOpen(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "succeeded", 1),
+		stg(driveAccID, "acceptance", "pending", 2),
+	})
+	f.admissionStatus = http.StatusInternalServerError
+	f.onSpawn = func(f *driveFakeBackend, typ string) {
+		if typ == "acceptance" {
+			f.setState("acceptance", "succeeded")
+		}
+	}
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		if f.allSucceeded("plan", "implement", "acceptance") {
+			f.runState = "succeeded"
+			return AutoDriveOutcome{Acted: true, Action: "merge", Note: "enabled auto-merge"}
+		}
+		return AutoDriveOutcome{Note: "observe-only"}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	// The acceptance stage spawned as today (fail-open).
+	var spawnedAcceptance bool
+	for _, typ := range rec.list() {
+		if typ == "acceptance" {
+			spawnedAcceptance = true
+		}
+	}
+	if !spawnedAcceptance {
+		t.Errorf("an admission error must fall through to spawn the acceptance stage; spawned: %v", rec.list())
+	}
+	var warned bool
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "acceptance-admission pre-check failed") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("missing the fail-open admission warning; warnings: %v", out.Warnings)
+	}
+}
+
+// TestDriveRun_AcceptanceAdmissionAuthzRejection_FailsClosed pins the #1928 authz
+// concern for the drive verb: a 4xx admission rejection (403 cross_run_admission)
+// is NOT fail-open — the drive HALTS with an error and spawns NO acceptance runner
+// rather than proceed after the run-subject authorization boundary rejected it.
+func TestDriveRun_AcceptanceAdmissionAuthzRejection_FailsClosed(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "succeeded", 1),
+		stg(driveAccID, "acceptance", "pending", 2),
+	})
+	f.admissionStatus = http.StatusForbidden
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		return AutoDriveOutcome{Note: "observe-only"}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, _, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err == nil {
+		t.Fatal("a 4xx admission rejection must halt the drive with an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "rejected the dispatch") {
+		t.Errorf("error = %q, want it to name the admission rejection", err)
+	}
+	for _, typ := range rec.list() {
+		if typ == "acceptance" {
+			t.Errorf("a fail-closed admission rejection must NOT spawn the acceptance runner; spawned: %v", rec.list())
+		}
+	}
+	f.mu.Lock()
+	acts := append([]RecordAutoDriveAct(nil), f.recordedActs...)
+	f.mu.Unlock()
+	for _, a := range acts {
+		if a.Stage == "acceptance" {
+			t.Errorf("a fail-closed admission rejection must record NO acceptance dispatch act; acts: %+v", acts)
+		}
+	}
 }

@@ -503,6 +503,41 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 					note = ""
 				}
 			}
+			// Acceptance-dispatch admission (#1928): before recording + spawning
+			// an acceptance dispatch, ask the backend to short-circuit an
+			// all-skip-with-basis / empty-criteria / out-of-scope plan. On a hit
+			// the stage settles server-side (a passed verdict, no preview) — record
+			// NO act, spawn nothing, and let the next poll observe the terminal
+			// stage. Fail OPEN on a TRANSPORT error (network / 5xx): append a warning
+			// and fall through to today's record+spawn path (which opens no NEW
+			// code-execution surface); a short_circuited:false result is the normal
+			// no-op with no warning. A 4xx admission REJECTION (403
+			// cross_run_admission etc.) is NOT fail-open — it halts the drive so a
+			// runner never spawns after the backend rejected the request on
+			// authorization grounds.
+			if disp.Type == "acceptance" {
+				accStageUUID, perr := uuid.Parse(disp.ID)
+				if perr != nil {
+					return nil, out, fmt.Errorf("drive: resolved stage_id %q not a UUID: %w", disp.ID, perr)
+				}
+				admission, warn, admitErr := r.maybeShortCircuitAcceptance(ctx, runUUID, accStageUUID)
+				if admitErr != nil {
+					return nil, out, admitErr
+				}
+				if warn != "" {
+					out.Warnings = append(out.Warnings, warn)
+				}
+				if admission != nil && admission.ShortCircuited {
+					out.StepsTaken = append(out.StepsTaken, DriveStep{
+						Kind: "dispatch", Stage: "acceptance", Delegated: false,
+						Note: fmt.Sprintf("acceptance short-circuited server-side (%s); no runner spawned, no act recorded", shortCircuitLabel(admission)),
+					})
+					spawned[disp.ID] = true
+					driveSleep(ctx, pollInterval)
+					continue
+				}
+			}
+
 			if _, rerr := r.api.RecordAutoDriveAct(ctx, runUUID, RecordAutoDriveAct{
 				Action: autoDriveDispatchActionName,
 				Stage:  recordName,

@@ -693,6 +693,35 @@ func (c *apiClient) RetryStage(ctx context.Context, id uuid.UUID) (*Stage, error
 	return &s, nil
 }
 
+// AcceptanceAdmissionResult mirrors the backend's acceptance-admission 200 body
+// (#1928). ShortCircuited is the only always-present field: true means the
+// backend settled the acceptance stage server-side (a passed verdict / skip
+// marker recorded, NO runner needed) and Kind/Basis/CriteriaTotal/Stage are
+// populated; false is the normal no-op path (proceed to spawn as today).
+type AcceptanceAdmissionResult struct {
+	ShortCircuited bool   `json:"short_circuited"`
+	Kind           string `json:"kind"`
+	Basis          string `json:"basis"`
+	CriteriaTotal  int    `json:"criteria_total"`
+	Stage          *Stage `json:"stage"`
+}
+
+// AcceptanceDispatchAdmission POSTs the pre-spawn acceptance-admission check via
+// `POST /v0/stages/{stage_id}/acceptance-admission` (#1928): the backend
+// evaluates the approved plan's three short-circuit predicates and, on a hit,
+// settles the acceptance stage to a passed verdict WITHOUT a runner. The dispatch
+// verbs call it for an acceptance stage before recording spawn evidence or
+// spawning; a short_circuited:true result means skip the spawn. Follows
+// RetryStage's shape — a non-2xx surfaces as *apiError so the caller can fail
+// OPEN (spawn as today) on any admission-call error.
+func (c *apiClient) AcceptanceDispatchAdmission(ctx context.Context, stageID uuid.UUID) (*AcceptanceAdmissionResult, error) {
+	var res AcceptanceAdmissionResult
+	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+stageID.String()+"/acceptance-admission", nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // Reap-failure body caps (#1791). The reap-failure endpoint caps the request
 // body at 32*1024 bytes (backend/internal/server/reap_failure.go
 // maxReapFailureBodyBytes) and rejects an oversized body 413 body_too_large.

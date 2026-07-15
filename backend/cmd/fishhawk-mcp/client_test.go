@@ -477,3 +477,76 @@ func TestReportStageFailure_5xx_NotRescuedByAggressiveRetry(t *testing.T) {
 		t.Errorf("calls = %d, want 1 (5xx must not trigger the aggressive retry)", calls)
 	}
 }
+
+// TestAcceptanceDispatchAdmission_WireShape pins the apiClient method's exact
+// wire contract (#1928): POST to /v0/stages/{id}/acceptance-admission with the
+// bearer token, and the 200 body decoded into AcceptanceAdmissionResult. Both a
+// short-circuit hit and the no-op false path are asserted, plus HTTP-error
+// surfacing as *apiError.
+func TestAcceptanceDispatchAdmission_WireShape(t *testing.T) {
+	stageID := uuid.New()
+
+	t.Run("short-circuit hit decodes", func(t *testing.T) {
+		var gotMethod, gotPath, gotAuth string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotMethod, gotPath, gotAuth = r.Method, r.URL.Path, r.Header.Get("Authorization")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"short_circuited":true,"kind":"all_skip_with_basis","basis":"all-skip-with-basis","criteria_total":2,"stage":{"id":"` + stageID.String() + `","type":"acceptance","state":"succeeded"}}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+		res, err := c.AcceptanceDispatchAdmission(context.Background(), stageID)
+		if err != nil {
+			t.Fatalf("AcceptanceDispatchAdmission: %v", err)
+		}
+		if gotMethod != http.MethodPost {
+			t.Errorf("method = %q, want POST", gotMethod)
+		}
+		if gotPath != "/v0/stages/"+stageID.String()+"/acceptance-admission" {
+			t.Errorf("path = %q", gotPath)
+		}
+		if gotAuth != "Bearer tok-test" {
+			t.Errorf("auth = %q, want Bearer tok-test", gotAuth)
+		}
+		if !res.ShortCircuited || res.Kind != "all_skip_with_basis" || res.Basis != "all-skip-with-basis" || res.CriteriaTotal != 2 {
+			t.Errorf("res = %+v, want a decoded short-circuit hit", res)
+		}
+		if res.Stage == nil || res.Stage.State != "succeeded" {
+			t.Errorf("res.Stage = %+v, want a succeeded stage", res.Stage)
+		}
+	})
+
+	t.Run("no-op false decodes", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"short_circuited":false}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+		res, err := c.AcceptanceDispatchAdmission(context.Background(), stageID)
+		if err != nil {
+			t.Fatalf("AcceptanceDispatchAdmission: %v", err)
+		}
+		if res.ShortCircuited {
+			t.Errorf("short_circuited = true, want false")
+		}
+	})
+
+	t.Run("HTTP error surfaces as apiError", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"boom"}}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+		_, err := c.AcceptanceDispatchAdmission(context.Background(), stageID)
+		if err == nil {
+			t.Fatal("expected an error on 500")
+		}
+		var ae *apiError
+		if !errors.As(err, &ae) || ae.StatusCode != http.StatusInternalServerError {
+			t.Errorf("err = %v, want *apiError with 500", err)
+		}
+	})
+}

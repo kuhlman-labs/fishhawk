@@ -86,6 +86,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/stages/{stage_id}/clarification", s.handleAnswerClarification)
 	mux.HandleFunc("POST /v0/stages/{stage_id}/revise", s.handleRevisePlan)
 	mux.HandleFunc("POST /v0/stages/{stage_id}/retry", s.handleRetryStage)
+	mux.HandleFunc("POST /v0/stages/{stage_id}/acceptance-admission", s.handleAcceptanceAdmission)
 	mux.HandleFunc("POST /v0/stages/{stage_id}/fixup", s.handleFixupStage)
 	mux.HandleFunc("POST /v0/concerns/{concern_id}/waive", s.handleWaiveConcern)
 	mux.HandleFunc("POST /v0/concerns/{concern_id}/defer", s.handleDeferConcern)
