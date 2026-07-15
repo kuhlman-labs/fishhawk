@@ -262,6 +262,14 @@ func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
 	if !strings.Contains(stageStateCheckDef, "awaiting_deployment") {
 		t.Errorf("stages_state_check after MigrateUp does not admit 'awaiting_deployment': %s", stageStateCheckDef)
 	}
+	// 0053 (#1912) widened stages_state_check to admit the parked-for-host-
+	// dispatch state 'awaiting_host_dispatch' (the #1912 split of the conflated
+	// local 'dispatched' state). Confirm the CHECK names it after a full
+	// MigrateUp — without this widening a real awaiting_host_dispatch row is
+	// uninsertable (SQLSTATE 23514).
+	if !strings.Contains(stageStateCheckDef, "awaiting_host_dispatch") {
+		t.Errorf("stages_state_check after MigrateUp does not admit 'awaiting_host_dispatch': %s", stageStateCheckDef)
+	}
 
 	// 0039 (#1437) added the campaigns + campaign_items tables (the
 	// campaign keystone). Confirm both exist after a full MigrateUp.
@@ -696,15 +704,17 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0052 (#1854, ADR-057 / ADR-058) is now
-	// the latest migration: it CREATED the accounts + installations tenancy
-	// tables (carrying the forge `provider` discriminator at birth). So its
-	// one-step rollback DROPS both tables and touches nothing else, while every
-	// prior migration's effect SURVIVES — notably 0051's (#1587)
-	// artifacts_kind_check 'release_notes' member (no longer the migration
-	// rolled back), 0050's (#1708) api_tokens.auth_method/provider columns,
-	// 0044's (#1519) stages_type_check 'acceptance' member, 0043's (#1417)
-	// runs.upstream_run_id column + partial index, 0042's (#1455)
+	// MigrateDown rolls back one step. 0053 (#1912) is now the latest
+	// migration: it WIDENED stages_state_check to admit 'awaiting_host_dispatch'
+	// and backfilled the parked local rows (the #1912 split of the conflated
+	// local 'dispatched' state). It adds no table and no column, so its one-step
+	// rollback narrows the CHECK back (dropping 'awaiting_host_dispatch') and
+	// reverses the backfill, touching nothing else — 0052's (#1854, ADR-057 /
+	// ADR-058) accounts + installations tenancy tables now SURVIVE, as does
+	// every prior migration's effect: 0051's (#1587) artifacts_kind_check
+	// 'release_notes' member, 0050's (#1708) api_tokens.auth_method/provider
+	// columns, 0044's (#1519) stages_type_check 'acceptance' member, 0043's
+	// (#1417) runs.upstream_run_id column + partial index, 0042's (#1455)
 	// campaigns.idempotency_key column + unique index, 0041's (#1451)
 	// operator_agent column, and 0040's (#1446) pause_policy + pause_reason
 	// columns + widened 'paused' state CHECK. 0039's (#1437) campaigns +
@@ -713,25 +723,26 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	// 0037's (#1385) artifacts_kind_check 'deployment', 0036's (#1346)
 	// runs.runner_kind_resolved column, etc.
 	//
-	// This is the binding TestMigrateDown flip for 0052: accounts and
-	// installations must be ABSENT after the one-step down, while 0051's
-	// 'release_notes' widening (now a prior migration) SURVIVES.
+	// This is the binding TestMigrateDown flip for 0053: 'awaiting_host_dispatch'
+	// must be ABSENT from stages_state_check after the one-step down (asserted
+	// alongside the surviving deploy states below), while 0052's accounts +
+	// installations tables (now a prior migration) SURVIVE.
 	var accountsTableDown, installationsTableDown int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'accounts'`,
 	).Scan(&accountsTableDown); err != nil {
 		t.Fatalf("query accounts table: %v", err)
 	}
-	if accountsTableDown != 0 {
-		t.Errorf("'accounts' table count after MigrateDown = %d, want 0 (0052 rolled back)", accountsTableDown)
+	if accountsTableDown != 1 {
+		t.Errorf("'accounts' table count after MigrateDown = %d, want 1 (0052 still applied; only 0053 rolled back)", accountsTableDown)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'installations'`,
 	).Scan(&installationsTableDown); err != nil {
 		t.Fatalf("query installations table: %v", err)
 	}
-	if installationsTableDown != 0 {
-		t.Errorf("'installations' table count after MigrateDown = %d, want 0 (0052 rolled back)", installationsTableDown)
+	if installationsTableDown != 1 {
+		t.Errorf("'installations' table count after MigrateDown = %d, want 1 (0052 still applied; only 0053 rolled back)", installationsTableDown)
 	}
 	var campaignsTable, campaignItemsTable int
 	if err := pool.QueryRow(context.Background(),
@@ -1006,6 +1017,13 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	if !strings.Contains(stageStateCheckDef, "awaiting_children") {
 		t.Errorf("stages_state_check after MigrateDown dropped 'awaiting_children': %s", stageStateCheckDef)
+	}
+	// 0053 (#1912) is the migration rolled back by this one-step down, so its
+	// widening — the parked-for-host-dispatch state 'awaiting_host_dispatch' —
+	// must be GONE from stages_state_check (the binding TestMigrateDown flip for
+	// 0053). Every prior state above survives.
+	if strings.Contains(stageStateCheckDef, "awaiting_host_dispatch") {
+		t.Errorf("stages_state_check after MigrateDown still admits 'awaiting_host_dispatch' (0053 should have narrowed it): %s", stageStateCheckDef)
 	}
 	var driveCol int
 	if err := pool.QueryRow(context.Background(),
@@ -1330,7 +1348,9 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	}
 	pool.Close()
 
-	// Step down past 0052 (drop the accounts + installations tenancy tables —
+	// Step down past 0053 (narrow stages_state_check + reverse the
+	// awaiting_host_dispatch backfill — inert re: campaigns; no paused row holds
+	// that state) then 0052 (drop the accounts + installations tenancy tables —
 	// inert re: campaigns) then 0051 (narrow artifacts_kind_check — inert re:
 	// campaigns) then 0050 (drop api_tokens.auth_method + provider — additive
 	// columns, inert re: campaigns) then 0049 (drop campaign_items.autonomy —
@@ -1343,6 +1363,9 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	// inert) then 0042 (drop idempotency_key — inert) then 0041 (drop
 	// operator_agent — inert), all leaving the paused rows untouched, to reach
 	// 0040, the normalizing rollback under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0053) failed: %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0052) failed: %v", err)
 	}
@@ -1400,6 +1423,124 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	}
 	if campaignState != "running" {
 		t.Errorf("campaign state after MigrateDown = %q, want running (paused normalized)", campaignState)
+	}
+}
+
+// TestMigration0053_BackfillsParkedLocalStages is the #1912 backfill
+// round-trip guard (plan failure-mode (f)). It seeds three 'dispatched' stage
+// rows under the pre-0053 (narrow) CHECK, re-applies 0053's up migration, and
+// asserts ONLY the parked-local row (dispatched + started_at NULL + on a
+// non-terminal local run) flips to 'awaiting_host_dispatch' — a github_actions
+// row and a re-opened row carrying a prior attempt's started_at both stay
+// 'dispatched' (the deliberately-conservative skip). The down then reverses the
+// flip, restoring the exact pre-split row shape. This is a behavioral done-means
+// assertion: a comment-only touch of the migration cannot pass it.
+func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
+	url := startContainer(t)
+
+	// Apply everything, then roll 0053 back so we can seed 'dispatched' rows
+	// under the pre-0053 narrow CHECK before re-applying the backfill.
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0053 to seed pre-backfill rows): %v", err)
+	}
+
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	// A non-terminal local run and a non-terminal github_actions run.
+	localRunID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'running', 'local')`,
+		localRunID,
+	); err != nil {
+		t.Fatalf("seed local run: %v", err)
+	}
+	ghRunID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'running', 'github_actions')`,
+		ghRunID,
+	); err != nil {
+		t.Fatalf("seed github_actions run: %v", err)
+	}
+
+	// Parked-local stage: dispatched + started_at NULL on the non-terminal local
+	// run — the backfill flips exactly this one.
+	parkedStageID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at)
+		 VALUES ($1, $2, 0, 'implement', 'agent', 'claude-code', 'dispatched', NULL)`,
+		parkedStageID, localRunID,
+	); err != nil {
+		t.Fatalf("seed parked-local stage: %v", err)
+	}
+	// github_actions stage: dispatched + started_at NULL — must stay dispatched
+	// (the backfill scopes to runner_kind='local').
+	ghStageID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at)
+		 VALUES ($1, $2, 0, 'implement', 'agent', 'claude-code', 'dispatched', NULL)`,
+		ghStageID, ghRunID,
+	); err != nil {
+		t.Fatalf("seed github_actions stage: %v", err)
+	}
+	// Re-opened local stage: dispatched but carrying a PRIOR attempt's started_at
+	// — conservatively SKIPPED (started_at IS NOT NULL), stays dispatched.
+	reopenedStageID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state, started_at)
+		 VALUES ($1, $2, 1, 'implement', 'agent', 'claude-code', 'dispatched', now())`,
+		reopenedStageID, localRunID,
+	); err != nil {
+		t.Fatalf("seed re-opened local stage: %v", err)
+	}
+	pool.Close()
+
+	// Re-apply 0053: the CHECK widens and the backfill runs.
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp (re-apply 0053 backfill): %v", err)
+	}
+
+	pool2, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("re-Connect: %v", err)
+	}
+	defer pool2.Close()
+
+	stageState := func(id uuid.UUID) string {
+		t.Helper()
+		var s string
+		if err := pool2.QueryRow(context.Background(),
+			`SELECT state FROM stages WHERE id = $1`, id,
+		).Scan(&s); err != nil {
+			t.Fatalf("read stage %s state: %v", id, err)
+		}
+		return s
+	}
+
+	if got := stageState(parkedStageID); got != "awaiting_host_dispatch" {
+		t.Errorf("parked-local stage state after backfill = %q, want awaiting_host_dispatch", got)
+	}
+	if got := stageState(ghStageID); got != "dispatched" {
+		t.Errorf("github_actions stage state after backfill = %q, want dispatched (untouched)", got)
+	}
+	if got := stageState(reopenedStageID); got != "dispatched" {
+		t.Errorf("re-opened local stage (started_at set) state after backfill = %q, want dispatched (conservatively skipped)", got)
+	}
+
+	// Down reverses the backfill: the flipped row returns to dispatched.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (reverse 0053 backfill): %v", err)
+	}
+	if got := stageState(parkedStageID); got != "dispatched" {
+		t.Errorf("parked-local stage state after down = %q, want dispatched (backfill reversed)", got)
 	}
 }
 

@@ -77,11 +77,18 @@ func TestStageTransitions_AllowedAndForbidden(t *testing.T) {
 		from, to StageState
 		want     bool
 	}{
-		// pending → dispatched | cancelled | failed
+		// pending → dispatched | awaiting_host_dispatch | cancelled | failed
 		{StageStatePending, StageStateDispatched, true},
+		{StageStatePending, StageStateAwaitingHostDispatch, true}, // runner_kind-locked-local park (#1912)
 		{StageStatePending, StageStateCancelled, true},
 		{StageStatePending, StageStateFailed, true},
 		{StageStatePending, StageStateRunning, false}, // skips dispatched
+		// awaiting_host_dispatch → dispatched (host spawn marked) | cancelled (#1912)
+		{StageStateAwaitingHostDispatch, StageStateDispatched, true},
+		{StageStateAwaitingHostDispatch, StageStateCancelled, true},
+		{StageStateAwaitingHostDispatch, StageStateRunning, false},   // must route through dispatched
+		{StageStateAwaitingHostDispatch, StageStateFailed, false},    // FailStage walks dispatched→running→failed; no direct base edge
+		{StageStateAwaitingHostDispatch, StageStateSucceeded, false}, // never a direct success
 		// dispatched → running | failed | cancelled
 		{StageStateDispatched, StageStateRunning, true},
 		{StageStateDispatched, StageStateFailed, true},
@@ -145,8 +152,8 @@ func TestStageTransitions_AllowedAndForbidden(t *testing.T) {
 }
 
 // TestStageState_IsSettled pins the settled classification (#1252)
-// across ALL twelve StageState constants: the three terminal states and
-// the five parked states are settled; the four in-flight states are
+// across ALL thirteen StageState constants: the three terminal states and
+// the six parked states are settled; the four in-flight states are
 // not. This is the load-bearing behavioral assertion for the stage
 // terminal-wait long-poll — its correctness is not enforced by
 // compilation, so every constant is enumerated explicitly. Keep
@@ -154,6 +161,7 @@ func TestStageTransitions_AllowedAndForbidden(t *testing.T) {
 // transition tables above). awaiting_deploy_approval is settled (parked
 // for operator action); awaiting_deployment is NOT (executor polling the
 // external pipeline, #1384 operator binding condition 2).
+// awaiting_host_dispatch is settled (parked for a host/operator spawn, #1912).
 func TestStageState_IsSettled(t *testing.T) {
 	cases := []struct {
 		state StageState
@@ -163,20 +171,21 @@ func TestStageState_IsSettled(t *testing.T) {
 		{StageStateSucceeded, true},
 		{StageStateFailed, true},
 		{StageStateCancelled, true},
-		// Parked awaiting operator action: settled.
+		// Parked awaiting operator/host action: settled.
 		{StageStateAwaitingApproval, true},
 		{StageStateAwaitingChildren, true},
 		{StageStateAwaitingInput, true},
 		{StageStateAwaitingScopeDecision, true},
 		{StageStateAwaitingDeployApproval, true},
+		{StageStateAwaitingHostDispatch, true}, // parked for a host/operator spawn (#1912)
 		// In-flight: not settled.
 		{StageStatePending, false},
 		{StageStateDispatched, false},
 		{StageStateRunning, false},
 		{StageStateAwaitingDeployment, false},
 	}
-	if len(cases) != 12 {
-		t.Fatalf("expected all twelve StageState constants enumerated, got %d", len(cases))
+	if len(cases) != 13 {
+		t.Fatalf("expected all thirteen StageState constants enumerated, got %d", len(cases))
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.state), func(t *testing.T) {
@@ -308,6 +317,34 @@ func TestStageAwaitingChildrenFanInEdges(t *testing.T) {
 	}
 }
 
+// TestStageAwaitingHostDispatchEdges pins the #1912 park state's base-table
+// edges: pending → awaiting_host_dispatch (the local park) and
+// awaiting_host_dispatch → dispatched (the host spawn marker) / cancelled (run
+// cancel) are admitted, while the direct → failed / → running / → succeeded
+// edges are NOT — FailStage must walk awaiting_host_dispatch → dispatched →
+// running → failed (asserted in failure_test.go), and a spawn must route
+// through dispatched, never skip straight to running.
+func TestStageAwaitingHostDispatchEdges(t *testing.T) {
+	if !ValidStageTransition(StageStatePending, StageStateAwaitingHostDispatch) {
+		t.Error("ValidStageTransition must admit pending → awaiting_host_dispatch (the local park)")
+	}
+	if !ValidStageTransition(StageStateAwaitingHostDispatch, StageStateDispatched) {
+		t.Error("ValidStageTransition must admit awaiting_host_dispatch → dispatched (host spawn marked)")
+	}
+	if !ValidStageTransition(StageStateAwaitingHostDispatch, StageStateCancelled) {
+		t.Error("ValidStageTransition must admit awaiting_host_dispatch → cancelled (run cancel)")
+	}
+	if ValidStageTransition(StageStateAwaitingHostDispatch, StageStateFailed) {
+		t.Error("ValidStageTransition must NOT admit awaiting_host_dispatch → failed directly (FailStage walks via dispatched → running)")
+	}
+	if ValidStageTransition(StageStateAwaitingHostDispatch, StageStateRunning) {
+		t.Error("ValidStageTransition must NOT admit awaiting_host_dispatch → running (a spawn routes through dispatched)")
+	}
+	if ValidStageTransition(StageStateAwaitingHostDispatch, StageStateSucceeded) {
+		t.Error("ValidStageTransition must NOT admit awaiting_host_dispatch → succeeded")
+	}
+}
+
 func TestStageStateChangedError_FormatsAndIsErrorsTarget(t *testing.T) {
 	id := uuid.New()
 	err := error(StageStateChangedError{StageID: id, Expected: StageStatePending, Actual: StageStateAwaitingChildren})
@@ -360,6 +397,7 @@ func TestStateIsTerminal(t *testing.T) {
 func TestStageStateIsTerminal(t *testing.T) {
 	cases := map[StageState]bool{
 		StageStatePending:                false,
+		StageStateAwaitingHostDispatch:   false,
 		StageStateDispatched:             false,
 		StageStateRunning:                false,
 		StageStateAwaitingApproval:       false,

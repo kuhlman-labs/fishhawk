@@ -21,6 +21,25 @@ Reconciliation: the trace handler reconciles via `trace.go::reconcileRunnerKind`
 - The mismatch guardrail is post-execution AUDIT only this slice; a pre-dispatch host-endpoint block (the issue's level-1) is a deferred follow-up.
 - Best-effort throughout: any reconciliation error WARN-logs and never unwinds the stored trace.
 
+## Host-dispatch park state (`awaiting_host_dispatch`, #1912)
+
+`awaiting_host_dispatch` splits the old conflated local `dispatched` state into two explicit signals, resolving the #1905 no-spawn-evidence ambiguity at the source:
+
+- **`awaiting_host_dispatch`** — the backend wants this agent stage executed but the runner is host-spawned per ADR-024 and NO spawn attempt exists yet. A parked judgment awaiting a host/operator spawn action; `IsSettled()` true (mirrors `awaiting_approval`), `IsTerminal()` false.
+- **`dispatched`** — now unambiguously means a spawn attempt EXISTS: `workflow_dispatch` fired (github_actions) or a host spawn was marked (local). Stays in-flight (`IsSettled()` false).
+
+State-machine edges (`transition.go`):
+
+- `pending → awaiting_host_dispatch` — the local park, written in exactly one place: `orchestrator.dispatchStage` for a `runner_kind`-locked-local agent stage (a sibling slice). All local parks (plan-approved dispatch, retry/fixup re-open, revise replan, children dispatch) flow through `Advance → dispatchStage`, so one branch covers every drive rule.
+- `awaiting_host_dispatch → dispatched` — the host spawn marker (`POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch`, a sibling slice) CAS-flips the park once a spawn attempt exists.
+- `awaiting_host_dispatch → cancelled` — run cancel halts the parked stage.
+
+`FailStage` (`failure.go`) walks a parked stage `awaiting_host_dispatch → dispatched → running → failed` (the base machine forbids a direct `→ failed` edge) in both the CAS and non-CAS arms, so a parked local spawn that is abandoned still lands `failed` through the canonical path. The up-front `awaiting_children` park refusal is unaffected — only that fan-in park is un-failable.
+
+Migration `0053_stages_awaiting_host_dispatch` widens `stages_state_check` to admit the value (the 0035/0038 CHECK-widening precedent) and backfills existing parked local rows (`state='dispatched'` + `started_at IS NULL` on a non-terminal `runner_kind='local'` run) to the new state; a re-opened row carrying a prior attempt's `started_at` is conservatively skipped (tolerated read-side). The down reverses the backfill then narrows the CHECK.
+
+This slice is purely additive — nothing writes `awaiting_host_dispatch` yet (the park writer, marker endpoint, and MCP consumers land in sibling slices), so the tree stays green standalone.
+
 ## Stage-row gate persistence (#213, #254)
 
 The dispatcher captures the workflow-spec gate shape on each stage row at create time, alongside the existing `gate_sla` / `requires_approval` columns from #207.
