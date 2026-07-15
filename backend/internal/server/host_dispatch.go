@@ -41,6 +41,14 @@ type hostDispatchResponse struct {
 // proceeds on. A running/terminal/awaiting_* gate state returns 409
 // dispatch_not_admissible so a live or settled stage can never be re-marked.
 //
+// Eligibility (the #1912 fix-up): before the state CAS the endpoint validates
+// that the target is a legitimate host-spawn — the marker's 'dispatched'
+// meaning is only sound for a stage the backend would PARK for a host spawn.
+// A run LOCKED to a non-local runner_kind (github_actions), a human-executed
+// stage, and an auto-merge check-gate review stage each return 409
+// dispatch_not_admissible: none is ever host-spawned, so marking it 'dispatched'
+// would misrepresent state and could wedge the stage.
+//
 // Auth mirrors the reap-failure endpoint: an authenticated identity carrying
 // write:runs. Anonymous → 401; an authenticated token without write:runs → 403;
 // a cookie session with an empty TokenID is not scope-gated (matching the
@@ -96,6 +104,39 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, r, http.StatusNotFound, "stage_not_found",
 			"stage does not belong to the supplied run",
 			map[string]any{"stage_id": stageID.String(), "run_id": runID.String()})
+		return
+	}
+
+	// Host-dispatch eligibility (#1912 fix-up): the marker stamps 'dispatched'
+	// to mean "a host spawn attempt exists", which is only meaningful for a stage
+	// the backend actually PARKS for a host-side spawn — an agent-executed stage
+	// on a run destined for the LOCAL runner. Without these checks a write:runs
+	// caller could mark a GitHub Actions stage, or a human/auto-merge review-gate
+	// stage, 'dispatched' with no host spawn — breaking the meaning of
+	// 'dispatched' and potentially wedging that stage. The two guards below
+	// mirror the admission surface EXACTLY: orchestrator.dispatchStage's
+	// park predicate (agent executor, not an auto-merge check-gate review) and
+	// the MCP guardHostDispatch runner_kind posture (reject a run LOCKED to a
+	// non-local kind; allow an un-resolved run, whose first host dispatch
+	// auto-resolves it to local, and a locked-local run).
+	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), runID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"could not load the stage's run to validate host-dispatch eligibility",
+			map[string]any{"run_id": runID.String(), "error": err.Error()})
+		return
+	}
+	if runRow.RunnerKindResolved && runRow.RunnerKind != run.RunnerKindLocal {
+		s.writeError(w, r, http.StatusConflict, "dispatch_not_admissible",
+			"run is locked to a non-local runner_kind; host-dispatch marks a LOCAL host spawn",
+			map[string]any{"run_id": runID.String(), "runner_kind": runRow.RunnerKind})
+		return
+	}
+	if stage.ExecutorKind != run.ExecutorAgent || isAutoMergeReviewStage(stage) {
+		s.writeError(w, r, http.StatusConflict, "dispatch_not_admissible",
+			"stage is not an agent-executed host-spawn target (human or auto-merge review-gate stages are never host-spawned)",
+			map[string]any{"stage_id": stageID.String(),
+				"executor_kind": string(stage.ExecutorKind), "stage_type": string(stage.Type)})
 		return
 	}
 
@@ -162,4 +203,12 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		Transitioned: true,
 		StageState:   string(updated.State),
 	})
+}
+
+// isAutoMergeReviewStage mirrors orchestrator.isAutoMergeStage (unexported in
+// that package): a review stage carrying a check-only gate is queued for GitHub
+// auto-merge and walked straight to succeeded, never host-spawned. Replicated
+// here so the host-dispatch endpoint refuses to mark such a stage 'dispatched'.
+func isAutoMergeReviewStage(s *run.Stage) bool {
+	return s.Type == run.StageTypeReview && s.Gate != nil && s.Gate.Kind == run.GateKindCheck
 }

@@ -1128,7 +1128,14 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.mu.Lock()
 		fb.stagesCalledByID[id]++
 		callNum := fb.stagesCalledByID[id]
-		items := fb.stagesByRun[id]
+		// Snapshot the stage VALUES under the lock (not just the slice header):
+		// the host-dispatch handler mutates stages[i].State in place on this same
+		// backing array, so encoding the shared slice after unlocking would race
+		// (#1912 fix-up made run_children fire concurrent host-dispatch markers
+		// against these stages).
+		src := fb.stagesByRun[id]
+		items := make([]Stage, len(src))
+		copy(items, src)
 		status := fb.stagesStatus
 		if fb.stagesFailOnCall > 0 && callNum == fb.stagesFailOnCall {
 			status = http.StatusInternalServerError

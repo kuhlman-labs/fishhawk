@@ -253,6 +253,90 @@ func TestHostDispatch_UnknownAndMismatchedHandle_NotFound(t *testing.T) {
 	}
 }
 
+// Eligibility (#1912 fix-up): a run LOCKED to a non-local runner_kind is never
+// host-spawned, so a marker against its parked stage is refused 409 and the
+// stage is left untouched — a write:runs caller cannot mark a github_actions
+// stage 'dispatched' without a host spawn.
+func TestHostDispatch_LockedNonLocalRun_Conflict(t *testing.T) {
+	s, rr, runID, stageID := hostDispatchServer(t, run.StageStateAwaitingHostDispatch)
+	// Lock the seeded run to github_actions.
+	locked, _ := rr.GetRun(context.Background(), runID)
+	locked.RunnerKind = run.RunnerKindGitHubActions
+	locked.RunnerKindResolved = true
+
+	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "dispatch_not_admissible") {
+		t.Errorf("body = %s, want dispatch_not_admissible", w.Body.String())
+	}
+	cur, _ := rr.GetStage(context.Background(), stageID)
+	if cur.State != run.StageStateAwaitingHostDispatch {
+		t.Errorf("state = %q, want awaiting_host_dispatch (untouched)", cur.State)
+	}
+}
+
+// Eligibility (#1912 fix-up): a locked-LOCAL run is admitted (the normal parked
+// path); an UN-resolved run is also admitted (its first host dispatch
+// auto-resolves it to local), mirroring the MCP guardHostDispatch posture — the
+// default seeded run is un-resolved and every happy-path test above covers it.
+func TestHostDispatch_LockedLocalRun_Admitted(t *testing.T) {
+	s, rr, runID, stageID := hostDispatchServer(t, run.StageStateAwaitingHostDispatch)
+	locked, _ := rr.GetRun(context.Background(), runID)
+	locked.RunnerKind = run.RunnerKindLocal
+	locked.RunnerKindResolved = true
+
+	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if resp := decodeHostDispatch(t, w); !resp.Transitioned {
+		t.Errorf("resp = %+v, want transitioned:true", resp)
+	}
+}
+
+// Eligibility (#1912 fix-up): a human-executed stage is never host-spawned (the
+// orchestrator walks it to awaiting_approval), so the marker refuses it 409 and
+// leaves it untouched rather than silently flipping pending → dispatched. This
+// also closes the review-arm behavior the marker's unconditional call exposed:
+// the feature_change review stage is human-executed and now cleanly 409s.
+func TestHostDispatch_HumanStage_Conflict(t *testing.T) {
+	s, rr, runID, stageID := hostDispatchServer(t, run.StageStatePending)
+	st, _ := rr.GetStage(context.Background(), stageID)
+	st.ExecutorKind = run.ExecutorHuman
+
+	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "dispatch_not_admissible") {
+		t.Errorf("body = %s, want dispatch_not_admissible", w.Body.String())
+	}
+	cur, _ := rr.GetStage(context.Background(), stageID)
+	if cur.State != run.StageStatePending {
+		t.Errorf("state = %q, want pending (untouched)", cur.State)
+	}
+}
+
+// Eligibility (#1912 fix-up): an auto-merge review stage (a review-typed stage
+// with a check-only gate, walked straight to succeeded by the orchestrator) is
+// never host-spawned, so the marker refuses it 409.
+func TestHostDispatch_AutoMergeReviewStage_Conflict(t *testing.T) {
+	s, rr, runID, stageID := hostDispatchServer(t, run.StageStatePending)
+	st, _ := rr.GetStage(context.Background(), stageID)
+	st.Type = run.StageTypeReview
+	st.Gate = &run.Gate{Kind: run.GateKindCheck}
+
+	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "dispatch_not_admissible") {
+		t.Errorf("body = %s, want dispatch_not_admissible", w.Body.String())
+	}
+}
+
 // casRaceRepo embeds the CAS-capable orchestratorRepo but forces its
 // TransitionStageFrom to lose a compare-and-swap race: it flips the stage to
 // raceTo (a concurrent winner) and returns StageStateChangedError, so the

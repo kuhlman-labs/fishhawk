@@ -310,6 +310,38 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 			waveDispatchedIDs = append(waveDispatchedIDs, d.runID)
 			waveBase := currentBase
 			g.Go(func() error {
+				// (#1912 fix-up) Mark the host spawn BEFORE spawning, exactly as
+				// fishhawk_run_stage / fishhawk_dispatch_stage do: the endpoint
+				// CAS-flips {pending, awaiting_host_dispatch} → dispatched so
+				// 'dispatched' unambiguously means a spawn attempt exists at spawn
+				// time — closing the window in which a concurrent run_children /
+				// drive_run could classify this still-parked child as spawnable and
+				// double-spawn a runner. FAIL CLOSED per the same contract: a
+				// transport error or 4xx means NO spawn (an unmarked spawn would
+				// recreate the ambiguity #1912 removes). The failure is recorded as
+				// DATA — an empty Outcome trips the partial-wave guard below, which
+				// stops before integrating or dispatching a dependent wave — never a
+				// sibling-cancel (this g.Go still returns nil).
+				childUUID, cerr := uuid.Parse(d.runID)
+				stageUUID, serr := uuid.Parse(d.stageID)
+				if cerr != nil || serr != nil {
+					mu.Lock()
+					dispatched[d.runID] = &ChildResult{
+						RunID: d.runID, StageID: d.stageID, Dispatched: true,
+						Warnings: []string{fmt.Sprintf("could not parse child run/stage id for host-dispatch marker (run=%q stage=%q); NOT spawning", d.runID, d.stageID)},
+					}
+					mu.Unlock()
+					return nil
+				}
+				if _, hderr := r.api.HostDispatchStage(gctx, childUUID, stageUUID); hderr != nil {
+					mu.Lock()
+					dispatched[d.runID] = &ChildResult{
+						RunID: d.runID, StageID: d.stageID, Dispatched: true,
+						Warnings: []string{fmt.Sprintf("host-dispatch marker failed; NOT spawning (fail-closed): %v", hderr)},
+					}
+					mu.Unlock()
+					return nil
+				}
 				argv := []string{
 					"--run-id", d.runID,
 					"--backend-url", r.api.baseURL,

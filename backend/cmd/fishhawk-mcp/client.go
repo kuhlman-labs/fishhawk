@@ -744,8 +744,11 @@ type HostDispatchResult struct {
 // Callers fail closed on a non-nil error (transport / 4xx). 4xx surfaces:
 //   - 401 authentication_required / 403 insufficient_scope (needs write:runs)
 //   - 404 stage_not_found (unknown stage, or the stage's run_id disagrees)
-//   - 409 dispatch_not_admissible (a running/terminal/awaiting_* gate state — a
-//     live or settled stage can never be re-marked as a fresh spawn)
+//   - 409 dispatch_not_admissible — either a running/terminal/awaiting_* gate
+//     state (a live or settled stage can never be re-marked as a fresh spawn),
+//     a run LOCKED to a non-local runner_kind, or a non-host-spawn stage (a
+//     human-executed or auto-merge review-gate stage) — none of which is ever
+//     host-spawned (#1912 fix-up)
 func (c *apiClient) HostDispatchStage(ctx context.Context, runID, stageID uuid.UUID) (*HostDispatchResult, error) {
 	path := "/v0/runs/" + runID.String() + "/stages/" + stageID.String() + "/host-dispatch"
 	var res HostDispatchResult

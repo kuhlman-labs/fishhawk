@@ -359,11 +359,18 @@ func TestRunChildren_SpawnErrIsDataNoSiblingCancel(t *testing.T) {
 // the same parent. The single-call partition (pending vs in-flight vs terminal)
 // is covered by TestRunChildren_PartitionsPendingOnly; here we prove that the
 // MCP layer ITSELF tolerates concurrent invocations — neither call returns a
-// tool error and each independently observes the pending child and dispatches
-// it. A benign one-slot overshoot (both calls reading pending and both spawning)
-// is the documented, acceptable outcome at this layer; double-run is prevented
-// DOWNSTREAM by the runner's per-child lineage lock (run-<child>.lock), which is
-// covered by the runner-side lock tests, not here.
+// tool error and the pending child is dispatched (spawned) exactly as many
+// times as callers observed it pending.
+//
+// Post-#1912 the per-child host-dispatch marker (fired at spawn time, flipping
+// the child's implement stage pending → dispatched) NARROWS the old benign
+// one-slot overshoot: a second caller whose partition reads the child AFTER the
+// first caller's marker sees 'dispatched' and correctly skips it. So combined
+// dispatch is 1 or 2 (both is still possible when the two partitions both read
+// 'pending' before either marker), and actual spawns equal the combined
+// dispatched_count. The residual double-run window is closed DOWNSTREAM by the
+// runner's per-child lineage lock (run-<child>.lock), covered by the runner-side
+// lock tests, not here.
 func TestRunChildren_ConcurrentInvocationsNoToolError(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
@@ -404,17 +411,26 @@ func TestRunChildren_ConcurrentInvocationsNoToolError(t *testing.T) {
 			t.Errorf("concurrent runChildren[%d] returned an error: %v", i, err)
 		}
 	}
-	// Each call independently saw the pending child and dispatched it. Both
-	// spawning is the acknowledged benign overshoot — the assertion is that the
-	// MCP layer never errors and never silently drops the dispatch, NOT that the
-	// two calls coordinate (that guard lives in the runner lineage lock).
+	// Each call dispatched 0 or 1 (a caller either saw the child pending and
+	// dispatched it, or observed the other caller's host-dispatch mark and
+	// skipped). At least one caller must have dispatched it — the MCP layer never
+	// silently drops the dispatch — and the total is at most 2 (the marker
+	// narrows, but does not fully eliminate, the two-both-read-pending overshoot).
+	combined := 0
 	for i, d := range dispatched {
-		if d != 1 {
-			t.Errorf("concurrent runChildren[%d] dispatched_count = %d, want 1", i, d)
+		if d < 0 || d > 1 {
+			t.Errorf("concurrent runChildren[%d] dispatched_count = %d, want 0 or 1", i, d)
 		}
+		combined += d
 	}
-	if got := atomic.LoadInt32(&spawns); got < 1 {
-		t.Errorf("total spawns = %d, want >= 1", got)
+	if combined < 1 || combined > 2 {
+		t.Errorf("combined dispatched_count = %d, want 1 or 2", combined)
+	}
+	// Actual spawns equal the combined dispatched_count: every caller that
+	// observed the child pending spawned it exactly once, and a caller that
+	// skipped on the marker spawned nothing.
+	if got := int(atomic.LoadInt32(&spawns)); got != combined {
+		t.Errorf("total spawns = %d, want %d (== combined dispatched_count)", got, combined)
 	}
 }
 
