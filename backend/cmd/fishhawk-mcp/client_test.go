@@ -550,3 +550,69 @@ func TestAcceptanceDispatchAdmission_WireShape(t *testing.T) {
 		}
 	})
 }
+
+// TestReviveRun_WireShape pins the tool -> client -> HTTP boundary for
+// ReviveRun (#1915): the POST method, the /v0/runs/{run_id}/revive path, the
+// Bearer auth header, and the decode of the revive 200 body (the re-opened run
+// plus the per-stage re-park summary). The revive_run_test.go tests exercise the
+// tool handler against a fakeBackend seam; this is the only test that crosses the
+// real apiClient.do HTTP wire for the revive endpoint.
+func TestReviveRun_WireShape(t *testing.T) {
+	runID := uuid.New()
+
+	t.Run("200 decodes run + restored stages", func(t *testing.T) {
+		var gotMethod, gotPath, gotAuth string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotMethod, gotPath, gotAuth = r.Method, r.URL.Path, r.Header.Get("Authorization")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"run":{"id":"` + runID.String() + `","state":"running"},` +
+				`"restored_stages":[{"stage_id":"11111111-1111-1111-1111-111111111111",` +
+				`"type":"implement","prior_category":"A","prior_reason":"agent crashed",` +
+				`"restored_state":"pending"}]}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+		res, err := c.ReviveRun(context.Background(), runID)
+		if err != nil {
+			t.Fatalf("ReviveRun: %v", err)
+		}
+		if gotMethod != http.MethodPost {
+			t.Errorf("method = %q, want POST", gotMethod)
+		}
+		if gotPath != "/v0/runs/"+runID.String()+"/revive" {
+			t.Errorf("path = %q", gotPath)
+		}
+		if gotAuth != "Bearer tok-test" {
+			t.Errorf("auth = %q, want Bearer tok-test", gotAuth)
+		}
+		if res.Run.State != "running" {
+			t.Errorf("run state = %q, want running", res.Run.State)
+		}
+		if len(res.RestoredStages) != 1 {
+			t.Fatalf("restored %d stages, want 1", len(res.RestoredStages))
+		}
+		rs := res.RestoredStages[0]
+		if rs.Type != "implement" || rs.PriorCategory != "A" || rs.RestoredState != "pending" {
+			t.Errorf("restored stage = %+v, want implement/A/pending", rs)
+		}
+	})
+
+	t.Run("422 revive_not_applicable surfaces as apiError", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(`{"error":{"code":"revive_not_applicable","message":"run is not failed"}}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+		_, err := c.ReviveRun(context.Background(), runID)
+		if err == nil {
+			t.Fatal("expected an error on 422")
+		}
+		var ae *apiError
+		if !errors.As(err, &ae) || ae.StatusCode != http.StatusUnprocessableEntity || ae.Code != "revive_not_applicable" {
+			t.Errorf("err = %v, want *apiError 422 revive_not_applicable", err)
+		}
+	})
+}

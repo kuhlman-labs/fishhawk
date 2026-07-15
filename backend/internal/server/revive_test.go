@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -315,6 +316,39 @@ func TestReviveRun_NonRetryableStageReturns422NoPartialMutation(t *testing.T) {
 	for _, a := range f.au.appended {
 		if a.Category == RunRevivedAuditKind {
 			t.Errorf("run_revived audit written despite refusal")
+		}
+	}
+}
+
+// TestReviveRun_AuditAppendFailure_BestEffort200 pins writeReviveAudit's
+// deliberate best-effort contract: the re-park transitions are committed by
+// run.ReviveRun BEFORE the audit entry is chained, so a failure appending the
+// run_revived provenance record logs but does NOT unwind the reopen — the
+// handler still returns 200 with the run flipped failed → running. Returning an
+// error here would mislead the operator into thinking the revive did not happen
+// when the run IS revived; the correct behavior is a logged, non-fatal
+// audit-append failure. This test exists so that swallow is a pinned,
+// intentional contract rather than an unobserved silent failure (the security
+// review's "revive state changes returned unaudited" concern).
+func TestReviveRun_AuditAppendFailure_BestEffort200(t *testing.T) {
+	f := newReviveFixture(t)
+	f.seedFailedStage(t, 0, run.StageTypeImplement, run.FailureA, "agent crashed")
+	f.au.appendErr = errors.New("audit store down")
+
+	w := postRevive(t, f.s, f.run.ID, withAuth)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (audit-append failure is best-effort, does not unwind the committed reopen):\n%s", w.Code, w.Body.String())
+	}
+	// The reopen is committed regardless of the audit failure.
+	gotRun, _ := f.repo.GetRun(context.Background(), f.run.ID)
+	if gotRun.State != run.StateRunning {
+		t.Errorf("run = %q, want running (transitions commit before the audit append)", gotRun.State)
+	}
+	// No run_revived entry landed — the append failed — but the handler still
+	// succeeded rather than 500ing on a committed state change.
+	for _, a := range f.au.appended {
+		if a.Category == RunRevivedAuditKind {
+			t.Errorf("run_revived audit unexpectedly recorded despite injected append failure")
 		}
 	}
 }
