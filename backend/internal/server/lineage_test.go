@@ -22,9 +22,23 @@ import (
 
 // lineageGitHub is an in-test GitHub stub for the branch-lineage guard:
 // it serves GET /pulls/{n} (the PR base ref) and GET /compare/{base...head}
-// (the branch's commits) and records what compare base was actually used,
-// so assertions can prove the anchor is the PR base ref — never the
+// (the branch's commits) and records every compare call (base + head), so
+// assertions can prove the anchor is the PR base ref — never the
 // runner-reported base_sha.
+//
+// The #1932 fix-up re-review backstop (maybeBackstopFixupReReview →
+// ComparePatch, dispatched on a detached s.bgReviews goroutine from
+// succeedFixupPushStage's SUCCESS path) is a SECOND, background caller of the
+// compare endpoint on fixup_pushed reports. Its ComparePatch fires strictly
+// AFTER the synchronous lineage guard's compare, using the fixup report's
+// base_sha as the compare base — so it can land mid-assertion and pollute a
+// last-writer-wins slot. Every read of the stub's recorded state MUST
+// therefore go through the guarded accessors below (compareCalls / lastBase /
+// called): a bare field read racing the backstop goroutine's mutex-guarded
+// write is still a data race under -race even though the writer locks (Go
+// memory model — both sides must synchronize). Tests that exercise the
+// success path drain the backstop with s.waitBackgroundReviews() before
+// asserting.
 type lineageGitHub struct {
 	baseRef       string              // base.ref returned by GET /pulls/{n}
 	headSHA       string              // head.sha returned by GET /pulls/{n}; "" => "H"
@@ -34,8 +48,39 @@ type lineageGitHub struct {
 
 	mu              sync.Mutex
 	lastCompareBase string
+	compares        []lineageCompareCall // every GET /compare call, in order
 	compareCalled   bool
 	prCalled        bool
+}
+
+// lineageCompareCall records one GET /compare invocation's base and head refs.
+type lineageCompareCall struct {
+	base string
+	head string
+}
+
+// compareCalls returns a snapshot copy of every recorded GET /compare call, in
+// call order. Guarded read — see the lineageGitHub doc on the #1932 backstop.
+func (g *lineageGitHub) compareCalls() []lineageCompareCall {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]lineageCompareCall(nil), g.compares...)
+}
+
+// lastBase returns the base ref of the most recent GET /compare call. Guarded
+// read — see the lineageGitHub doc on the #1932 backstop.
+func (g *lineageGitHub) lastBase() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.lastCompareBase
+}
+
+// called reports whether the compare and PR endpoints were each hit. Guarded
+// read — see the lineageGitHub doc on the #1932 backstop.
+func (g *lineageGitHub) called() (compareCalled, prCalled bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.compareCalled, g.prCalled
 }
 
 func newLineageGitHubClient(t *testing.T, stub *lineageGitHub) *githubclient.Client {
@@ -60,13 +105,15 @@ func newLineageGitHubClient(t *testing.T, stub *lineageGitHub) *githubclient.Cli
 	mux.HandleFunc("GET /repos/{owner}/{repo}/compare/{basehead...}",
 		func(w http.ResponseWriter, r *http.Request) {
 			basehead := r.PathValue("basehead")
-			base := basehead
+			base, head := basehead, ""
 			if i := strings.Index(basehead, "..."); i >= 0 {
 				base = basehead[:i]
+				head = basehead[i+3:]
 			}
 			stub.mu.Lock()
 			stub.compareCalled = true
 			stub.lastCompareBase = base
+			stub.compares = append(stub.compares, lineageCompareCall{base: base, head: head})
 			stub.mu.Unlock()
 			if stub.compareStatus != 0 && stub.compareStatus != http.StatusOK {
 				w.WriteHeader(stub.compareStatus)
@@ -257,8 +304,10 @@ func TestVerifyBranchLineage_CaseA_Contamination(t *testing.T) {
 		t.Error("stage advanced to the review gate despite a lineage violation")
 	}
 	// The anchor must be the PR base ref ("main"), NOT the report's base_sha.
-	if stub.lastCompareBase != "main" {
-		t.Errorf("compare base = %q, want %q (PR base ref, not report base_sha)", stub.lastCompareBase, "main")
+	// (A category-B PR-open failure does not reach maybeBackstopFixupReReview,
+	// so there is no backstop compare to race here.)
+	if b := stub.lastBase(); b != "main" {
+		t.Errorf("compare base = %q, want %q (PR base ref, not report base_sha)", b, "main")
 	}
 }
 
@@ -324,14 +373,44 @@ func TestVerifyBranchLineage_CaseB_FixupVariant(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
+	// A clean fixup_pushed report reaches succeedFixupPushStage's success path,
+	// which dispatches the #1932 re-review backstop on a detached
+	// s.bgReviews goroutine. Drain it BEFORE any stub read so the backstop's
+	// own compare cannot land mid-assertion (the CI-flaking race, #1967): the
+	// sync.WaitGroup.Wait return establishes a happens-before edge over the
+	// goroutine's guarded stub writes.
+	s.waitBackgroundReviews()
 	if v := foreignViolation(au); v != nil {
 		t.Fatalf("unexpected violation on a clean fix-up: %+v", v)
 	}
 	if !transitionedTo(rr, run.StageStateAwaitingApproval) {
 		t.Error("clean fix-up did not advance the stage")
 	}
-	if stub.lastCompareBase != "main" {
-		t.Errorf("compare base = %q, want %q", stub.lastCompareBase, "main")
+	// The lineage guard runs synchronously (pullrequest.go verifyBranchLineage)
+	// strictly BEFORE maybeBackstopFixupReReview is invoked, so the FIRST
+	// recorded compare is deterministically the guard's own — anchored on the
+	// PR base ref ("main"), never the report's base_sha. Scope the assertion to
+	// that first call instead of a last-writer-wins slot the backstop pollutes.
+	calls := stub.compareCalls()
+	if len(calls) == 0 {
+		t.Fatal("no compare call recorded; expected the lineage guard's compare")
+	}
+	if calls[0].base != "main" {
+		t.Errorf("lineage compare base = %q, want %q", calls[0].base, "main")
+	}
+	// Positively pin the backstop provenance: it fires from the SUCCESS path
+	// with the fixup report's coordinates — compare base = the report base_sha
+	// ("2222...") and head = the fix-up head h2 — as a subsequent call, not a
+	// rejected-report dispatch and not another test's leaked goroutine.
+	var sawBackstop bool
+	for _, c := range calls[1:] {
+		if c.base == "2222222222222222222222222222222222222222" && c.head == h2 {
+			sawBackstop = true
+			break
+		}
+	}
+	if !sawBackstop {
+		t.Errorf("backstop compare (base=2222..., head=%q) not recorded among %+v", h2, calls)
 	}
 }
 
@@ -371,9 +450,12 @@ func TestVerifyBranchLineage_NonDefaultBase(t *testing.T) {
 	if !transitionedTo(rr, run.StageStateAwaitingApproval) {
 		t.Error("legit non-default-base run did not advance to the review gate")
 	}
-	if stub.lastCompareBase != "release-1.0" {
+	// A clean PR-open report does not reach the fixup re-review backstop, so
+	// the last compare is the lineage guard's own. Read guarded regardless, so
+	// a future background compare caller can't make this a latent race.
+	if b := stub.lastBase(); b != "release-1.0" {
 		t.Errorf("compare base = %q, want %q (the run's real base, not the default branch)",
-			stub.lastCompareBase, "release-1.0")
+			b, "release-1.0")
 	}
 }
 
@@ -426,8 +508,10 @@ func TestVerifyBranchLineage_ChildPush_Contamination(t *testing.T) {
 	if transitionedTo(rr, run.StageStateAwaitingApproval) {
 		t.Error("child-push stage advanced despite a lineage violation")
 	}
-	if stub.lastCompareBase != "main" {
-		t.Errorf("compare base = %q, want %q (PR base ref)", stub.lastCompareBase, "main")
+	// A child-push (Outcome="pushed") does not reach maybeBackstopFixupReReview,
+	// so there is no backstop compare to race; still read guarded for uniformity.
+	if b := stub.lastBase(); b != "main" {
+		t.Errorf("compare base = %q, want %q (PR base ref)", b, "main")
 	}
 }
 
@@ -500,6 +584,11 @@ func TestVerifyBranchLineage_MultiPushLedgerReadErrorFailsOpen(t *testing.T) {
 	au.listByCategoryErr = errors.New("audit read boom")
 	priv, _ := sf.issue(t, runID)
 
+	// Although this is a fixup_pushed report, the #1932 re-review backstop is
+	// guarded OFF here: au.listByCategoryErr fails the backstop's
+	// implement_review_started read (guard (a) in maybeBackstopFixupReReview),
+	// so it returns before spawning the s.bgReviews goroutine — no background
+	// compare to race the stub reads below.
 	w := shipPRRequest(t, s, runID, stageID, priv, mustFixupBody(t, h2), "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
@@ -567,9 +656,7 @@ func TestVerifyBranchLineage_CaseC_FailOpenOnNilInstallation(t *testing.T) {
 	if !transitionedTo(rr, run.StageStateAwaitingApproval) {
 		t.Error("nil-installation path did not advance the happy path")
 	}
-	stub.mu.Lock()
-	defer stub.mu.Unlock()
-	if stub.compareCalled || stub.prCalled {
+	if compareCalled, prCalled := stub.called(); compareCalled || prCalled {
 		t.Error("nil-installation path made a GitHub call; expected early fail-open")
 	}
 }
@@ -776,9 +863,7 @@ func TestReverifyBranchLineage_FailOpen(t *testing.T) {
 		if foreignViolationCount(au) != 0 {
 			t.Error("missing pr number/url emitted an audit")
 		}
-		stub.mu.Lock()
-		defer stub.mu.Unlock()
-		if stub.prCalled || stub.compareCalled {
+		if compareCalled, prCalled := stub.called(); prCalled || compareCalled {
 			t.Error("missing pr number/url made a GitHub call; expected early fail-open")
 		}
 	})
