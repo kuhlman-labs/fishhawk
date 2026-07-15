@@ -68,6 +68,7 @@ var KnownCategories = map[string]struct{}{
 	"clarification_requested":                 {},
 	"concern_defer_failed":                    {},
 	"concern_deferred":                        {},
+	"concern_relitigation_suppressed":         {},
 	"concern_waive_failed":                    {},
 	"concern_waived":                          {},
 	"consolidated_pr_opened":                  {},

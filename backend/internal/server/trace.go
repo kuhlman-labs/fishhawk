@@ -2545,6 +2545,32 @@ type operatorScopeUndeliveredPayload struct {
 	OperatorAddedCount int      `json:"operator_added_count"`
 }
 
+// concernRelitigationSuppressedCategory is the audit-log category for the
+// deterministic re-litigation guard (#1913): a reviewer concern whose
+// settled_ref resolves to a same-run/same-stage WAIVED or DEFERRED concern and
+// whose new_evidence is empty is NOT minted as a fresh open concern row — it is
+// recorded here instead, so the suppression is visible on the run surface rather
+// than silent. It is an internal advisory audit kind written by persistReviewConcerns;
+// it posts no issue comment and adds no Notifier method, so it is NOT an
+// issue-comment surface.
+const concernRelitigationSuppressedCategory = "concern_relitigation_suppressed"
+
+// concernRelitigationSuppressedPayload is the audit payload for a
+// concern_relitigation_suppressed entry (#1913). It records the settled concern
+// the re-raise targeted (SettledRef + SettledState) and the reviewer's would-be
+// concern (severity/category/note) so an operator can see exactly what was
+// suppressed and why, keyed back to the review that emitted it
+// (ReviewerModel + OriginReviewSequence).
+type concernRelitigationSuppressedPayload struct {
+	SettledRef           string `json:"settled_ref"`
+	SettledState         string `json:"settled_state"`
+	Severity             string `json:"severity"`
+	Category             string `json:"category"`
+	Note                 string `json:"note"`
+	ReviewerModel        string `json:"reviewer_model,omitempty"`
+	OriginReviewSequence int64  `json:"origin_review_sequence"`
+}
+
 // DispatchConsolidatedReview dispatches the gating agent implement review
 // for a decomposed parent run against its consolidated PR diff (#1060),
 // satisfying orchestrator.ConsolidatedReviewDispatcher. The orchestrator
@@ -2858,14 +2884,20 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		// re-reviews inherit this for free: the post-fixup re-dispatch
 		// routes through this same function.
 		ApprovalConditions: s.resolveApprovalConditions(ctx, runRow),
-		// The stage's previously recorded implement-review concerns for the
+		// The stage's previously recorded OPEN implement-review concerns for the
 		// delta-verification section (#984): open states the reviewer must
-		// resolve plus waived concerns shown as not-re-litigable context. A
-		// first review finds no rows → empty set → the section is omitted
-		// and the prompt stays byte-identical; the post-fixup re-review
-		// (same stage_id, new head_sha per #797) finds the
+		// resolve via concern_resolutions. A first review finds no rows → empty
+		// set → the section is omitted and the prompt stays byte-identical; the
+		// post-fixup re-review (same stage_id, new head_sha per #797) finds the
 		// addressed_pending rows the fix-up trigger wrote.
 		PriorConcerns: s.priorConcernsForReview(ctx, runID, stageID),
+		// The stage's SETTLED concerns for the "Settled concerns" ledger
+		// (#1913): operator arbitrations (waived, deferred) + prior rounds'
+		// resolved rows (addressed, superseded), carried forward so a round-N
+		// reviewer has the settled history and does not re-raise a settled
+		// finding reworded. Empty on a first review → the ledger is omitted and
+		// the prompt stays byte-identical to the pre-#1913 output.
+		SettledConcerns: s.settledConcernsForReview(ctx, runID, stageID),
 		// Machine-verified gate results from the bundle's gate_evidence
 		// event (#963), pre-redacted runner-side. Nil (older bundles,
 		// no gate ran, extraction error) keeps the prompt byte-identical.
@@ -2903,13 +2935,13 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// branch.
 	//
 	// The trigger is specifically a ROUTED concern (addressed_pending), NOT any
-	// prior concern: priorConcernsForReview also threads WAIVED concerns as
-	// not-re-litigable context (#984), but a waived concern was never routed for
-	// fix-up, so a run whose only prior concerns are waived must keep the full
-	// review diff rather than collapse to a delta with delta framing when no
-	// fix-up round actually happened. The routed concerns and the reviewer's
-	// concern_resolutions delta-verification mechanism are preserved either way —
-	// they ride on trig.PriorConcerns, which is already set above.
+	// prior concern. Since #1913 waived concerns no longer ride trig.PriorConcerns
+	// (they moved to the settled ledger), but the guard still keys on
+	// addressed_pending directly, so a run whose only settled context is a waived
+	// concern — with no routed round — keeps the full review diff rather than
+	// collapsing to a delta with delta framing. The routed concerns and the
+	// reviewer's concern_resolutions delta-verification mechanism are preserved
+	// either way — they ride on trig.PriorConcerns, which is already set above.
 	if hasFixupRoutedConcern(trig.PriorConcerns) {
 		if delta, ok := s.resolveFixupDeltaDiff(ctx, runRow, runID, stageID, headSHA); ok {
 			trig.Diff = renderDiffForReview(delta)
@@ -3638,15 +3670,21 @@ func supplementalReinvokeReviewAlreadyRecorded(entries []*audit.Entry, stageID u
 	return false
 }
 
-// priorConcernsForReview gathers the stage's previously recorded
-// implement-review concerns for the implement-review prompt's
-// delta-verification section (#984): every open-state concern (raised,
-// addressed_pending, reopened) plus waived ones (rendered as
-// not-re-litigable context with the operator's audited reason).
-// Addressed/superseded concerns are settled and stay out of the prompt.
-// Best-effort: a nil repo or a list error returns nil (warn-logged) —
-// a store outage must never block review dispatch, and an empty set
-// keeps the prompt byte-identical to the pre-#984 output.
+// priorConcernsForReview gathers the stage's OPEN implement-review concerns
+// for the implement-review prompt's delta-verification section (#984): every
+// open-state concern (raised, addressed_pending, reopened) the reviewer must
+// explicitly confirm/reopen/supersede via concern_resolutions. It feeds
+// Trigger.PriorConcerns and hasFixupRoutedConcern.
+//
+// The SETTLED rows (waived/deferred + addressed/superseded) are gathered
+// separately by settledConcernsForReview (#1913): waived concerns MOVED out of
+// this open set into the settled ledger, so a run whose only prior concerns are
+// waived no longer carries them here (hasFixupRoutedConcern still keys on
+// addressed_pending, so the delta-collapse gate is unaffected).
+//
+// Best-effort: a nil repo or a list error returns nil (warn-logged) — a store
+// outage must never block review dispatch, and an empty set keeps the prompt
+// byte-identical to the pre-#984 output.
 func (s *Server) priorConcernsForReview(ctx context.Context, runID, stageID uuid.UUID) []prompt.PriorConcern {
 	if s.cfg.ConcernRepo == nil {
 		return nil
@@ -3665,7 +3703,55 @@ func (s *Server) priorConcernsForReview(ctx context.Context, runID, stageID uuid
 		if c.StageID != stageID || c.StageKind != concern.StageKindImplement {
 			continue
 		}
-		if !c.State.IsOpen() && c.State != concern.StateWaived {
+		if !c.State.IsOpen() {
+			continue
+		}
+		out = append(out, prompt.PriorConcern{
+			ID:          c.ID.String(),
+			State:       string(c.State),
+			Severity:    c.Severity,
+			Category:    c.Category,
+			Note:        c.Note,
+			StateReason: c.StateReason,
+		})
+	}
+	return out
+}
+
+// settledConcernsForReview gathers the stage's SETTLED implement-review concerns
+// for the implement-review prompt's "Settled concerns" ledger (#1913): the
+// operator-arbitrated rows (waived, deferred) plus the prior rounds' resolved
+// rows (addressed, superseded), each carrying its audited StateReason. Threading
+// these into every post-fixup round closes the two convergence gaps the issue
+// measured: DEFERRED arbitrations reach the reviewer at all (they were dropped
+// entirely before), and delta rounds N>=2 carry the full settled history instead
+// of only the currently-open rows — so a round-N reviewer stops re-raising a
+// settled finding reworded.
+//
+// Same best-effort posture as priorConcernsForReview: a nil repo or a list error
+// returns nil (warn-logged), and an empty set keeps the prompt byte-identical to
+// the pre-#1913 output.
+func (s *Server) settledConcernsForReview(ctx context.Context, runID, stageID uuid.UUID) []prompt.PriorConcern {
+	if s.cfg.ConcernRepo == nil {
+		return nil
+	}
+	rows, err := s.cfg.ConcernRepo.ListByRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: list concerns failed — dispatching without the settled-concerns section",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	var out []prompt.PriorConcern
+	for _, c := range rows {
+		if c.StageID != stageID || c.StageKind != concern.StageKindImplement {
+			continue
+		}
+		switch c.State {
+		case concern.StateWaived, concern.StateDeferred, concern.StateAddressed, concern.StateSuperseded:
+		default:
 			continue
 		}
 		out = append(out, prompt.PriorConcern{
@@ -3683,12 +3769,11 @@ func (s *Server) priorConcernsForReview(ctx context.Context, runID, stageID uuid
 // hasFixupRoutedConcern reports whether any prior concern was actually routed
 // back to the agent for fix-up — i.e. transitioned to addressed_pending by the
 // fix-up trigger. This is the discriminator for a post-fix-up delta re-review
-// (#1725): priorConcernsForReview also threads WAIVED concerns as
-// not-re-litigable context, so gating the delta collapse on len(PriorConcerns)
-// alone would wrongly fire on a run whose only prior concerns are waived (no
-// fix-up round ever happened) — replacing the full review diff with a
-// ComparePatch delta and rendering delta framing. Requiring an addressed_pending
-// concern keeps the full diff in the waived-only case.
+// (#1725): keying the delta collapse on len(PriorConcerns) alone would be wrong
+// — a reopened concern is open but not necessarily fix-up-routed — so requiring
+// an addressed_pending concern keeps the full diff when no fix-up round happened.
+// (Since #1913 waived concerns no longer appear in PriorConcerns at all; they
+// moved to the settled ledger, so they can never spuriously trip this gate.)
 func hasFixupRoutedConcern(prior []prompt.PriorConcern) bool {
 	for _, c := range prior {
 		if c.State == string(concern.StateAddressedPending) {
@@ -3961,12 +4046,28 @@ func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.
 	}
 	raised := make([]concern.RaisedConcern, 0, len(concerns))
 	for _, c := range concerns {
+		// Re-litigation guard (#1913): a concern re-raising an operator-arbitrated
+		// (waived/deferred) settled concern with no new evidence is recorded as a
+		// suppression audit entry instead of minted as a fresh open row — that
+		// durable open row is what wedges the gate and drives repeat rounds. The
+		// reviewer's verdict and its audit payload are recorded unchanged upstream;
+		// the guard only stops the OPEN concern row from minting. Every other case
+		// (unparsable/unknown ref, a ref to another run/stage or a non-waived/
+		// deferred state, non-empty new_evidence, any lookup/append error) falls
+		// open to the normal insert below, so a sloppy or absent tag can never
+		// suppress a genuine finding and a store outage never wedges the loop.
+		if s.suppressRelitigation(ctx, runID, stageID, stageKind, reviewerModel, originSequence, c) {
+			continue
+		}
 		raised = append(raised, concern.RaisedConcern{
 			Severity:       string(c.Severity),
 			Category:       c.Category,
 			Note:           c.Note,
 			SuggestedPatch: c.SuggestedPatch,
 		})
+	}
+	if len(raised) == 0 {
+		return
 	}
 	if _, err := s.cfg.ConcernRepo.InsertRaised(ctx, concern.InsertRaisedParams{
 		RunID:                runID,
@@ -3983,6 +4084,94 @@ func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.
 			slog.String("error", err.Error()),
 		)
 	}
+}
+
+// suppressRelitigation reports whether the concern c is a no-evidence re-raise of
+// an operator-arbitrated (waived/deferred) settled concern that must be
+// SUPPRESSED — excluded from the InsertRaised batch and recorded as a
+// concern_relitigation_suppressed audit entry instead (#1913). It returns true
+// ONLY when every condition holds AND the audit entry lands durably; on ANY
+// other outcome it returns false so the caller inserts the concern normally:
+//
+//   - empty SettledRef, or non-empty NewEvidence → not a suppression candidate;
+//   - unparsable SettledRef → a sloppy tag never suppresses a finding;
+//   - GetByIDs error / no row (unknown ref, store outage) → fail open (WARN);
+//   - a ref to another run/stage/stageKind → fail open;
+//   - a ref to a non-waived/deferred state (addressed/superseded/open) → fail
+//     open: a genuine regression of an addressed fix must reach the operator,
+//     tagged with settled_ref+new_evidence for lineage but RECORDED, not discarded;
+//   - the audit append fails → fail open (WARN), so a suppression is never silent.
+func (s *Server) suppressRelitigation(ctx context.Context, runID, stageID uuid.UUID, stageKind, reviewerModel string, originSequence int64, c planreview.Concern) bool {
+	if c.SettledRef == "" || c.NewEvidence != "" {
+		return false
+	}
+	refID, perr := uuid.Parse(c.SettledRef)
+	if perr != nil {
+		// A malformed tag can never suppress a genuine finding — fall open.
+		return false
+	}
+	rows, gerr := s.cfg.ConcernRepo.GetByIDs(ctx, []uuid.UUID{refID})
+	if gerr != nil || len(rows) == 0 || rows[0] == nil {
+		if gerr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review concerns: settled_ref lookup failed — inserting concern (fail-open)",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("settled_ref", c.SettledRef),
+				slog.String("error", gerr.Error()),
+			)
+		}
+		return false
+	}
+	row := rows[0]
+	if row.RunID != runID || row.StageID != stageID || row.StageKind != stageKind {
+		// A reviewer can never suppress via a ref to another run's/stage's concern.
+		return false
+	}
+	if row.State != concern.StateWaived && row.State != concern.StateDeferred {
+		// addressed/superseded/open: the insertable-regression path — record it.
+		return false
+	}
+	// Suppression candidate: record the audit entry FIRST. Only when it lands
+	// durably do we exclude the concern; an append failure (or a nil AuditRepo)
+	// falls open to the normal insert so the suppression is never silent.
+	if err := s.appendRelitigationSuppressed(ctx, runID, stageID, reviewerModel, originSequence, c, string(row.State)); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review concerns: append concern_relitigation_suppressed failed — inserting concern (fail-open)",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("settled_ref", c.SettledRef),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+	return true
+}
+
+// appendRelitigationSuppressed writes the concern_relitigation_suppressed audit
+// entry for a suppressed re-litigation (#1913). Returns an error (so the caller
+// falls open) when the AuditRepo is unconfigured or the chained append fails.
+func (s *Server) appendRelitigationSuppressed(ctx context.Context, runID, stageID uuid.UUID, reviewerModel string, originSequence int64, c planreview.Concern, settledState string) error {
+	if s.cfg.AuditRepo == nil {
+		return errors.New("audit repo not configured")
+	}
+	payload, _ := json.Marshal(concernRelitigationSuppressedPayload{
+		SettledRef:           c.SettledRef,
+		SettledState:         settledState,
+		Severity:             string(c.Severity),
+		Category:             c.Category,
+		Note:                 c.Note,
+		ReviewerModel:        reviewerModel,
+		OriginReviewSequence: originSequence,
+	})
+	systemKind := audit.ActorKind("system")
+	_, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  concernRelitigationSuppressedCategory,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	})
+	return err
 }
 
 // renderDiffForReview formats a policy.Diff (per-file path + git status)

@@ -2052,17 +2052,19 @@ func TestShipTrace_ImplementReview_PriorConcernsThreadedIntoPrompt(t *testing.T)
 	}
 	got := reviewer.calls[0]
 	for _, want := range []string{
+		// The OPEN (addressed_pending) concern stays in the delta-verification section.
 		"### Prior concerns (delta verification)",
 		pending.ID.String(),
 		"state: addressed_pending",
 		"you MUST emit exactly one entry in the verdict's `concern_resolutions` array",
+		// Since #1913 the WAIVED concern moved into the settled ledger.
+		"### Settled concerns (operator arbitrations and resolved findings — binding)",
 		waived.ID.String(),
 		"state: waived",
-		"operator waive reason: accepted trade-off",
-		"MUST NOT re-raise or re-litigate a waived concern",
+		"operator waived reason: accepted trade-off",
 	} {
 		if !strings.Contains(got, want) {
-			t.Errorf("reviewer prompt missing %q from threaded prior concerns:\n%s", want, got)
+			t.Errorf("reviewer prompt missing %q from threaded concerns:\n%s", want, got)
 		}
 	}
 	if strings.Contains(got, foreign.ID.String()) {
@@ -2167,10 +2169,13 @@ func TestWaiveConcern_SuppressedFromOpenConcernsButThreadedIntoPrompt(t *testing
 	}
 	got := reviewer.calls[0]
 	for _, want := range []string{
-		"### Prior concerns (delta verification)",
+		// Since #1913 the waived concern rides the settled ledger, with the
+		// audited reason; the still-open concern stays in the prior-concerns section.
+		"### Settled concerns (operator arbitrations and resolved findings — binding)",
 		toWaive.ID.String(),
 		"state: waived",
-		"operator waive reason: false positive",
+		"operator waived reason: false positive",
+		"### Prior concerns (delta verification)",
 		stillOpen.ID.String(),
 	} {
 		if !strings.Contains(got, want) {
@@ -2336,13 +2341,18 @@ func TestRunImplementReviews_ReReview_WaivedOnlyUsesFullDiff(t *testing.T) {
 		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
 	}
 	got := reviewer.calls[0]
-	// The waived concern must still ride in the prior-concerns section (#984)…
-	for _, want := range []string{"### Prior concerns (delta verification)", "state: waived"} {
+	// Since #1913 the waived concern rides the SETTLED ledger, not the
+	// prior-concerns delta-verification section; with no open concern the
+	// delta-verification section is absent entirely.
+	for _, want := range []string{"### Settled concerns (operator arbitrations and resolved findings — binding)", "state: waived"} {
 		if !strings.Contains(got, want) {
-			t.Errorf("waived-only re-review prompt missing prior-concerns fidelity %q:\n%s", want, got)
+			t.Errorf("waived-only re-review prompt missing settled-ledger fidelity %q:\n%s", want, got)
 		}
 	}
-	// …but the diff must be the FULL bundle diff, NOT the ComparePatch delta.
+	if strings.Contains(got, "### Prior concerns (delta verification)") {
+		t.Errorf("waived-only re-review must NOT render the open prior-concerns section:\n%s", got)
+	}
+	// …and the diff must be the FULL bundle diff, NOT the ComparePatch delta.
 	assertFullDiffRetained(t, got)
 }
 
@@ -2545,6 +2555,499 @@ func TestResolvePriorReviewedHeadSHA(t *testing.T) {
 		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
 		if got := s.resolvePriorReviewedHeadSHA(context.Background(), uuid.New(), stageID); got != "" {
 			t.Errorf("resolvePriorReviewedHeadSHA = %q, want empty on no entries", got)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// #1913: re-review convergence — multi-round delta + settled ledger + the
+// deterministic re-litigation guard.
+// ---------------------------------------------------------------------------
+
+// deltaCompareBodyFor builds a ComparePatch response with a distinct marker +
+// filename so a test can prove which round's delta reached the reviewer.
+func deltaCompareBodyFor(marker, file string) string {
+	return `{"total_commits":1,"commits":[{"sha":"x"}],"files":[{"filename":"` + file +
+		`","status":"modified","changes":2,"patch":"@@ -1 +1 @@\n-a\n+` + marker + `"}]}`
+}
+
+// spanAwareComparePatchClient returns a ComparePatch client whose response is
+// keyed on the base...head span in the compare URL path — so a multi-round test
+// can prove round N's compare spans priorReviewedHead(N-1)..currentHead. A path
+// matching no configured span returns 500 (a compare error → the caller degrades
+// to the full diff, which the test would catch).
+func spanAwareComparePatchClient(t *testing.T, bySpan map[string]string) *githubclient.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		for span, body := range bySpan {
+			if strings.Contains(r.URL.Path, span) {
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, body)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}
+}
+
+// TestRunImplementReviews_MultiRoundDeltaPerRound is the #1913 multi-round delta
+// regression: rounds 2 AND 3 each receive the ComparePatch delta spanning the
+// PREVIOUS round's reviewed head..the current head — never the full bundle diff
+// and never the OTHER round's delta. Round 2 compares h1...h2 (h1 = round 1's
+// reviewed head, seeded as an implement_review_started head); round 2's own
+// started(h2) entry then becomes round 3's prior head, so round 3 compares
+// h2...h3. This pins that the #1725 delta gate fires per-round for N>=2.
+func TestRunImplementReviews_MultiRoundDeltaPerRound(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+
+	cr := newFakeConcernRepo()
+	s.cfg.ConcernRepo = cr
+	// A routed (addressed_pending) concern makes every round a fix-up delta round.
+	c := seedConcernRow(t, cr, runRow.ID, implStage.ID, concern.StageKindImplement, 100, "unhandled error path")
+	if err := cr.MarkAddressedPending(context.Background(), []uuid.UUID{c.ID}, "routed"); err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	inst := int64(55)
+	runRow.InstallationID = &inst
+	prURL := "https://github.com/kuhlman-labs/example/pull/7"
+	runRow.PullRequestURL = &prURL
+	s.cfg.GitHub = spanAwareComparePatchClient(t, map[string]string{
+		"h1...h2": deltaCompareBodyFor("ROUND2_DELTA", "round2/only.go"),
+		"h2...h3": deltaCompareBodyFor("ROUND3_DELTA", "round3/only.go"),
+	})
+
+	// Round 1's reviewed head is h1, seeded as a started head so the resolver
+	// carries it forward (a real implement_reviewed entry carries no head_sha).
+	sid := implStage.ID
+	seedHeadEntry(au, runRow.ID, &sid, "implement_review_started", 40, map[string]any{"head_sha": "h1"})
+
+	// Round 2: prior head h1, current head h2 → compare h1...h2.
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, fullReReviewBundleDiff(), nil, "h2", nil) {
+		t.Fatal("round 2 gating approve must not gate")
+	}
+	// Round 3: prior head h2 (round 2's own started entry), current head h3 → compare h2...h3.
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, fullReReviewBundleDiff(), nil, "h3", nil) {
+		t.Fatal("round 3 gating approve must not gate")
+	}
+
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 2 {
+		t.Fatalf("reviewer invoked %d times, want 2 (one per re-review round)", len(reviewer.calls))
+	}
+	round2, round3 := reviewer.calls[0], reviewer.calls[1]
+
+	// Round 2 carries ONLY its own delta + the delta framing.
+	for _, want := range []string{"ROUND2_DELTA", "round2/only.go", "This is a DELTA re-review after a fix-up."} {
+		if !strings.Contains(round2, want) {
+			t.Errorf("round 2 prompt missing %q:\n%s", want, round2)
+		}
+	}
+	for _, absent := range []string{"FULL_MARKER", "full/only.go", "ROUND3_DELTA"} {
+		if strings.Contains(round2, absent) {
+			t.Errorf("round 2 prompt must NOT carry %q (its delta must span h1...h2 only):\n%s", absent, round2)
+		}
+	}
+	// Round 3 carries ONLY its own delta + the delta framing.
+	for _, want := range []string{"ROUND3_DELTA", "round3/only.go", "This is a DELTA re-review after a fix-up."} {
+		if !strings.Contains(round3, want) {
+			t.Errorf("round 3 prompt missing %q:\n%s", want, round3)
+		}
+	}
+	for _, absent := range []string{"FULL_MARKER", "full/only.go", "ROUND2_DELTA"} {
+		if strings.Contains(round3, absent) {
+			t.Errorf("round 3 prompt must NOT carry %q (its delta must span h2...h3 only):\n%s", absent, round3)
+		}
+	}
+}
+
+// TestRunImplementReviews_SettledLedgerThreading pins step 5(ii): after a waive,
+// a defer, and a confirmed (addressed) resolution, the next round's prompt
+// renders all three in the settled ledger with the operator reasons — and the
+// DEFERRED concern (invisible to the reviewer before #1913) is present.
+func TestRunImplementReviews_SettledLedgerThreading(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	cr := newFakeConcernRepo()
+	s.cfg.ConcernRepo = cr
+	ctx := context.Background()
+
+	waived := seedConcernRow(t, cr, runRow.ID, implStage.ID, concern.StageKindImplement, 100, "waived finding")
+	if _, err := cr.ApplyResolution(ctx, waived.ID, concern.StateWaived, "operator accepts it"); err != nil {
+		t.Fatalf("waive: %v", err)
+	}
+	deferred := seedConcernRow(t, cr, runRow.ID, implStage.ID, concern.StageKindImplement, 101, "deferred finding")
+	if _, err := cr.ApplyResolution(ctx, deferred.ID, concern.StateDeferred, "filed follow-up #999"); err != nil {
+		t.Fatalf("defer: %v", err)
+	}
+	addressed := seedConcernRow(t, cr, runRow.ID, implStage.ID, concern.StageKindImplement, 102, "resolved finding")
+	if err := cr.MarkAddressedPending(ctx, []uuid.UUID{addressed.ID}, "routed"); err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if _, err := cr.ApplyResolution(ctx, addressed.ID, concern.StateAddressed, "confirmed by reviewer"); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID,
+		policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}}}, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	for _, want := range []string{
+		"### Settled concerns (operator arbitrations and resolved findings — binding)",
+		waived.ID.String(), "state: waived", "operator waived reason: operator accepts it",
+		deferred.ID.String(), "state: deferred", "operator deferred reason: filed follow-up #999",
+		addressed.ID.String(), "state: addressed",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("settled ledger missing %q:\n%s", want, got)
+		}
+	}
+	// No open concern → the delta-verification prior-concerns section is absent.
+	if strings.Contains(got, "### Prior concerns (delta verification)") {
+		t.Errorf("all-settled run must not render the open prior-concerns section:\n%s", got)
+	}
+}
+
+// guardServer builds a minimal server wired with a concern store + audit fake
+// for the persistReviewConcerns re-litigation-guard matrix.
+func guardServer(t *testing.T) (*Server, *fakeConcernRepo, *auditFake) {
+	t.Helper()
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+	return s, cr, au
+}
+
+// countRaisedWithNote counts freshly-minted (raised) concern rows with the note.
+func countRaisedWithNote(cr *fakeConcernRepo, note string) int {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	n := 0
+	for _, r := range cr.rows {
+		if r.Note == note && r.State == concern.StateRaised {
+			n++
+		}
+	}
+	return n
+}
+
+// countSuppressionAudits counts appended audit entries of a category.
+func countSuppressionAudits(au *auditFake, category string) int {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	n := 0
+	for _, ap := range au.appended {
+		if ap.Category == category {
+			n++
+		}
+	}
+	return n
+}
+
+// findSuppressionAudit returns the single concern_relitigation_suppressed entry
+// appended to au, failing if there is not exactly one. Used to assert the
+// entry's payload contents and actor attribution, not just its category count.
+func findSuppressionAudit(t *testing.T, au *auditFake) audit.ChainAppendParams {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var found []audit.ChainAppendParams
+	for _, ap := range au.appended {
+		if ap.Category == concernRelitigationSuppressedCategory {
+			found = append(found, ap)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("concern_relitigation_suppressed entries = %d, want 1", len(found))
+	}
+	return found[0]
+}
+
+// lookupErrConcernRepo wraps fakeConcernRepo to inject a GetByIDs store error —
+// the only guard branch the base fake cannot express (a missing row surfaces as
+// ErrNotFound; this simulates a genuine store outage).
+type lookupErrConcernRepo struct {
+	*fakeConcernRepo
+	getErr error
+}
+
+func (r *lookupErrConcernRepo) GetByIDs(ctx context.Context, ids []uuid.UUID) ([]*concern.Concern, error) {
+	if r.getErr != nil {
+		return nil, r.getErr
+	}
+	return r.fakeConcernRepo.GetByIDs(ctx, ids)
+}
+
+// seedSettled seeds an implement-stage concern and drives it to the given
+// terminal state, returning its id string. Waived/deferred set an operator
+// reason.
+func seedSettled(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.UUID, state concern.State) string {
+	t.Helper()
+	return seedSettledKind(t, cr, runID, stageID, concern.StageKindImplement, state)
+}
+
+// seedSettledKind is seedSettled with an explicit stage kind, for the guard's
+// cross-stage-kind fail-open branch (a same-run/same-stage ref whose settled
+// concern was raised under a different stage kind).
+func seedSettledKind(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.UUID, stageKind string, state concern.State) string {
+	t.Helper()
+	ctx := context.Background()
+	c := seedConcernRow(t, cr, runID, stageID, stageKind, 100, "settled finding")
+	switch state {
+	case concern.StateWaived, concern.StateDeferred:
+		if _, err := cr.ApplyResolution(ctx, c.ID, state, "operator arbitration"); err != nil {
+			t.Fatalf("seed %s: %v", state, err)
+		}
+	case concern.StateAddressed:
+		if err := cr.MarkAddressedPending(ctx, []uuid.UUID{c.ID}, "routed"); err != nil {
+			t.Fatalf("route: %v", err)
+		}
+		if _, err := cr.ApplyResolution(ctx, c.ID, concern.StateAddressed, "confirmed"); err != nil {
+			t.Fatalf("seed addressed: %v", err)
+		}
+	}
+	return c.ID.String()
+}
+
+// TestPersistReviewConcerns_RelitigationGuardMatrix drives every enumerated
+// branch of the #1913 re-litigation guard through persistReviewConcerns, each
+// asserting the observable outcome: a suppressed re-raise mints NO open row and
+// appends exactly one concern_relitigation_suppressed entry; every fail-open
+// branch mints the row and appends NO suppression entry.
+func TestPersistReviewConcerns_RelitigationGuardMatrix(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("waived_ref_no_evidence_suppressed", func(t *testing.T) {
+		s, cr, au := guardServer(t)
+		runID, stageID := uuid.New(), uuid.New()
+		ref := seedSettled(t, cr, runID, stageID, concern.StateWaived)
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref}})
+		if got := countRaisedWithNote(cr, "re-raise"); got != 0 {
+			t.Errorf("waived no-evidence re-raise minted %d rows, want 0 (suppressed)", got)
+		}
+		// The suppression is not merely counted: its audit entry carries the full
+		// operator-visibility payload documented as the server/README.md
+		// concern_relitigation_suppressed contract, attributed to the system actor.
+		// A regression that emitted the right category with a wrong/empty payload
+		// would pass a count-only assertion while breaking that contract.
+		entry := findSuppressionAudit(t, au)
+		if entry.ActorKind == nil || *entry.ActorKind != audit.ActorSystem {
+			t.Errorf("suppression ActorKind = %v, want system", entry.ActorKind)
+		}
+		var p concernRelitigationSuppressedPayload
+		if err := json.Unmarshal(entry.Payload, &p); err != nil {
+			t.Fatalf("decode suppression payload: %v", err)
+		}
+		want := concernRelitigationSuppressedPayload{
+			SettledRef:           ref,
+			SettledState:         string(concern.StateWaived),
+			Severity:             "high",
+			Category:             "correctness",
+			Note:                 "re-raise",
+			ReviewerModel:        "m",
+			OriginReviewSequence: 200,
+		}
+		if p != want {
+			t.Errorf("suppression payload = %+v, want %+v", p, want)
+		}
+	})
+
+	t.Run("deferred_ref_no_evidence_suppressed", func(t *testing.T) {
+		s, cr, au := guardServer(t)
+		runID, stageID := uuid.New(), uuid.New()
+		ref := seedSettled(t, cr, runID, stageID, concern.StateDeferred)
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+			[]planreview.Concern{{Severity: "low", Category: "scope", Note: "re-raise", SettledRef: ref}})
+		if got := countRaisedWithNote(cr, "re-raise"); got != 0 {
+			t.Errorf("deferred no-evidence re-raise minted %d rows, want 0 (suppressed)", got)
+		}
+		if got := countSuppressionAudits(au, concernRelitigationSuppressedCategory); got != 1 {
+			t.Errorf("suppression audit entries = %d, want 1", got)
+		}
+	})
+
+	t.Run("ref_with_new_evidence_inserted", func(t *testing.T) {
+		s, cr, au := guardServer(t)
+		runID, stageID := uuid.New(), uuid.New()
+		ref := seedSettled(t, cr, runID, stageID, concern.StateWaived)
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise",
+				SettledRef: ref, NewEvidence: "genuinely regressed in the fixup"}})
+		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
+			t.Errorf("re-raise WITH new_evidence minted %d rows, want 1 (fail-open)", got)
+		}
+		if got := countSuppressionAudits(au, concernRelitigationSuppressedCategory); got != 0 {
+			t.Errorf("suppression audit entries = %d, want 0 (evidence-backed re-raise recorded)", got)
+		}
+	})
+
+	t.Run("unparsable_ref_inserted", func(t *testing.T) {
+		s, cr, au := guardServer(t)
+		runID, stageID := uuid.New(), uuid.New()
+		seedSettled(t, cr, runID, stageID, concern.StateWaived)
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: "not-a-uuid"}})
+		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
+			t.Errorf("unparsable settled_ref minted %d rows, want 1 (fail-open)", got)
+		}
+		if got := countSuppressionAudits(au, concernRelitigationSuppressedCategory); got != 0 {
+			t.Errorf("suppression audit entries = %d, want 0", got)
+		}
+	})
+
+	t.Run("unknown_uuid_ref_inserted", func(t *testing.T) {
+		s, cr, au := guardServer(t)
+		runID, stageID := uuid.New(), uuid.New()
+		seedSettled(t, cr, runID, stageID, concern.StateWaived)
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: uuid.New().String()}})
+		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
+			t.Errorf("unknown-UUID settled_ref minted %d rows, want 1 (fail-open)", got)
+		}
+		if got := countSuppressionAudits(au, concernRelitigationSuppressedCategory); got != 0 {
+			t.Errorf("suppression audit entries = %d, want 0", got)
+		}
+	})
+
+	t.Run("other_stage_ref_inserted", func(t *testing.T) {
+		s, cr, au := guardServer(t)
+		runID, stageID := uuid.New(), uuid.New()
+		// Waived concern belongs to a DIFFERENT stage of the same run.
+		otherStage := uuid.New()
+		ref := seedSettled(t, cr, runID, otherStage, concern.StateWaived)
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref}})
+		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
+			t.Errorf("other-stage settled_ref minted %d rows, want 1 (fail-open)", got)
+		}
+		if got := countSuppressionAudits(au, concernRelitigationSuppressedCategory); got != 0 {
+			t.Errorf("suppression audit entries = %d, want 0", got)
+		}
+	})
+
+	t.Run("other_run_ref_inserted", func(t *testing.T) {
+		s, cr, au := guardServer(t)
+		runID, stageID := uuid.New(), uuid.New()
+		// The security-flavored case (row.RunID != runID): the waived concern
+		// belongs to a DIFFERENT run entirely. A reviewer can never suppress via a
+		// ref to another run's concern — it falls open to the normal insert.
+		otherRun := uuid.New()
+		ref := seedSettled(t, cr, otherRun, stageID, concern.StateWaived)
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref}})
+		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
+			t.Errorf("other-run settled_ref minted %d rows, want 1 (fail-open)", got)
+		}
+		if got := countSuppressionAudits(au, concernRelitigationSuppressedCategory); got != 0 {
+			t.Errorf("suppression audit entries = %d, want 0", got)
+		}
+	})
+
+	t.Run("other_stage_kind_ref_inserted", func(t *testing.T) {
+		s, cr, au := guardServer(t)
+		runID, stageID := uuid.New(), uuid.New()
+		// Same run AND same stage id, but the settled concern was raised under a
+		// DIFFERENT stage kind (plan vs the implement re-raise) — the third
+		// disjunct of the guard's cross-scope check (row.StageKind != stageKind).
+		// It falls open to the normal insert.
+		ref := seedSettledKind(t, cr, runID, stageID, concern.StageKindPlan, concern.StateWaived)
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref}})
+		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
+			t.Errorf("other-stage-kind settled_ref minted %d rows, want 1 (fail-open)", got)
+		}
+		if got := countSuppressionAudits(au, concernRelitigationSuppressedCategory); got != 0 {
+			t.Errorf("suppression audit entries = %d, want 0", got)
+		}
+	})
+
+	t.Run("addressed_ref_inserted_regression_path", func(t *testing.T) {
+		s, cr, au := guardServer(t)
+		runID, stageID := uuid.New(), uuid.New()
+		// An ADDRESSED (resolved) concern is NOT guard-eligible: a genuine
+		// regression must reach the operator, so a no-evidence re-raise still inserts.
+		ref := seedSettled(t, cr, runID, stageID, concern.StateAddressed)
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref}})
+		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
+			t.Errorf("addressed settled_ref minted %d rows, want 1 (insertable regression path)", got)
+		}
+		if got := countSuppressionAudits(au, concernRelitigationSuppressedCategory); got != 0 {
+			t.Errorf("suppression audit entries = %d, want 0 (addressed is not guard-eligible)", got)
+		}
+	})
+
+	t.Run("repo_lookup_error_inserted", func(t *testing.T) {
+		s, cr, au := guardServer(t)
+		runID, stageID := uuid.New(), uuid.New()
+		ref := seedSettled(t, cr, runID, stageID, concern.StateWaived)
+		// Swap in a wrapper that fails GetByIDs AFTER seeding — a store outage.
+		wrapper := &lookupErrConcernRepo{fakeConcernRepo: cr, getErr: errors.New("db down")}
+		s.cfg.ConcernRepo = wrapper
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+			[]planreview.Concern{{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref}})
+		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
+			t.Errorf("lookup-error re-raise minted %d rows, want 1 (fail-open, loop never wedged)", got)
+		}
+		if got := countSuppressionAudits(au, concernRelitigationSuppressedCategory); got != 0 {
+			t.Errorf("suppression audit entries = %d, want 0 on a lookup error", got)
+		}
+	})
+
+	t.Run("audit_append_failure_falls_open", func(t *testing.T) {
+		s, cr, au := guardServer(t)
+		runID, stageID := uuid.New(), uuid.New()
+		ref := seedSettled(t, cr, runID, stageID, concern.StateWaived)
+		// The suppression audit append fails: the guard must fall open (insert)
+		// so the suppression is never SILENT, and sibling concerns still persist.
+		au.appendErrCategory = concernRelitigationSuppressedCategory
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+			[]planreview.Concern{
+				{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref},
+				{Severity: "low", Category: "scope", Note: "genuinely new"},
+			})
+		if got := countRaisedWithNote(cr, "re-raise"); got != 1 {
+			t.Errorf("audit-append-failure re-raise minted %d rows, want 1 (fail-open)", got)
+		}
+		if got := countRaisedWithNote(cr, "genuinely new"); got != 1 {
+			t.Errorf("sibling concern minted %d rows, want 1 (remaining concerns still persisted)", got)
+		}
+	})
+
+	t.Run("suppressed_sibling_new_concern_still_persisted", func(t *testing.T) {
+		s, cr, au := guardServer(t)
+		runID, stageID := uuid.New(), uuid.New()
+		ref := seedSettled(t, cr, runID, stageID, concern.StateWaived)
+		s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, "m", 200,
+			[]planreview.Concern{
+				{Severity: "high", Category: "correctness", Note: "re-raise", SettledRef: ref},
+				{Severity: "low", Category: "scope", Note: "genuinely new"},
+			})
+		if got := countRaisedWithNote(cr, "re-raise"); got != 0 {
+			t.Errorf("suppressed re-raise minted %d rows, want 0", got)
+		}
+		if got := countRaisedWithNote(cr, "genuinely new"); got != 1 {
+			t.Errorf("genuinely-new sibling minted %d rows, want 1", got)
+		}
+		if got := countSuppressionAudits(au, concernRelitigationSuppressedCategory); got != 1 {
+			t.Errorf("suppression audit entries = %d, want 1", got)
 		}
 	})
 }
