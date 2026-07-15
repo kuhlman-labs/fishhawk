@@ -1880,7 +1880,11 @@ fi
 # Uses a throwaway git repo as REPO_ROOT so the git worktree remove/prune calls
 # are hermetic, and drives the two litter roots against tempdir fixtures.
 prune_repo="$(mktemp -d -t test-dev-prunerepo.XXXXXX)"
-( cd "$prune_repo" && git init -q -b main && git config user.email t@e.com && git config user.name t ) 2>/dev/null
+# A HEAD commit is required so `git worktree add --detach HEAD` can register the
+# real run worktrees the fail-closed prune path exercises (#1917 review).
+( cd "$prune_repo" && git init -q -b main && git config user.email t@e.com \
+  && git config user.name t && git config commit.gpgsign false \
+  && git commit -q --allow-empty -m base ) 2>/dev/null
 # 8 days ago (older than the 7-day default); fall back to year 2000 if date(1)
 # lacks the BSD -v flag.
 old_stamp="$(date -v-8d +%Y%m%d%H%M 2>/dev/null || echo 200001010000)"
@@ -1888,10 +1892,20 @@ old_stamp="$(date -v-8d +%Y%m%d%H%M 2>/dev/null || echo 200001010000)"
 make_prune_fixture() {
   local base="$1"
   mkdir -p "$base/wt" "$base/tmp"
-  # aged run worktree (a plain dir, not a registered worktree: git status fails
-  # -> treated clean -> removed via the rm -rf fallback) + aged runid file.
-  mkdir -p "$base/wt/run-old"; : > "$base/wt/run-old/marker"; : > "$base/wt/run-old.runid"
-  # fresh run worktree + runid (must survive).
+  # aged run worktree — a REAL registered, CLEAN worktree of prune_repo, so
+  # git status succeeds and is empty -> removed (fail-closed: only a positively
+  # clean worktree is a removal candidate). + aged runid file.
+  git -C "$prune_repo" worktree add -q --detach "$base/wt/run-old" HEAD 2>/dev/null
+  : > "$base/wt/run-old.runid"
+  # aged DIRTY worktree — a real registered worktree with an uncommitted file,
+  # so git status is non-empty -> SKIPPED by the dirty-worktree protection
+  # (#1917 review: the protective branch now has a fixture).
+  git -C "$prune_repo" worktree add -q --detach "$base/wt/run-dirty" HEAD 2>/dev/null
+  : > "$base/wt/run-dirty/uncommitted"
+  # aged BROKEN dir — a plain dir where git status errors; fail-closed leaves it
+  # in place rather than rm -rf'ing possibly-uncommitted work (#1917 review).
+  mkdir -p "$base/wt/run-broken"; : > "$base/wt/run-broken/marker"
+  # fresh run worktree + runid (must survive the age gate).
   mkdir -p "$base/wt/run-fresh"; : > "$base/wt/run-fresh/marker"; : > "$base/wt/run-fresh.runid"
   # aged keyed /tmp sidecars (must be removed) + a fresh one (must survive).
   : > "$base/tmp/fishhawk-scope-run1-stage1.json"
@@ -1903,13 +1917,13 @@ make_prune_fixture() {
   : > "$base/tmp/fishhawk-acceptance.json"
   # acceptance-evidence DIRECTORY (the plain-file (.) qualifier must skip it).
   mkdir -p "$base/tmp/fishhawk-acceptance-evidence-run1"
-  # Age the "old" set; leave the fresh ones at now. Touch the run-old DIR last
-  # so creating marker inside it does not reset its mtime.
+  # Age the "old" set; leave the fresh ones at now. Touch the run DIRS last so
+  # creating files inside them does not reset the mtime the glob keys on.
   touch -t "$old_stamp" \
     "$base/tmp/fishhawk-scope-run1-stage1.json" "$base/tmp/fishhawk-pr-run1-stage1.md" \
     "$base/tmp/fishhawk-plan.json" "$base/tmp/fishhawk-pr.md" "$base/tmp/fishhawk-acceptance.json" \
     "$base/tmp/fishhawk-acceptance-evidence-run1" "$base/wt/run-old.runid"
-  touch -t "$old_stamp" "$base/wt/run-old"
+  touch -t "$old_stamp" "$base/wt/run-old" "$base/wt/run-dirty" "$base/wt/run-broken"
 }
 
 prune_run="$(mktemp -d -t test-dev-prunerun.XXXXXX)"
@@ -1917,8 +1931,21 @@ make_prune_fixture "$prune_run"
 REPO_ROOT="$prune_repo"
 _prune_aged_artifacts 7 0 "$prune_run/wt" "$prune_run/tmp" >/dev/null 2>&1
 REPO_ROOT="$orig_repo_root"
-if [[ ! -d "$prune_run/wt/run-old" ]]; then pass "_prune: removes aged run worktree dir"; else fail "_prune should remove aged run-old dir"; fi
+if [[ ! -d "$prune_run/wt/run-old" ]]; then pass "_prune: removes aged CLEAN run worktree dir"; else fail "_prune should remove the aged clean run-old worktree"; fi
 if [[ ! -f "$prune_run/wt/run-old.runid" ]]; then pass "_prune: removes aged runid file"; else fail "_prune should remove aged run-old.runid"; fi
+# Protective branch: an aged-but-DIRTY registered run worktree survives (#1917).
+if [[ -d "$prune_run/wt/run-dirty" && -f "$prune_run/wt/run-dirty/uncommitted" ]]; then
+  pass "_prune: keeps an aged DIRTY run worktree (uncommitted work protected)"
+else
+  fail "_prune must NOT remove an aged dirty run worktree"
+fi
+# Fail-closed branch: an aged dir whose git status FAILS survives (#1917) —
+# never rm -rf'd when cleanliness cannot be positively established.
+if [[ -d "$prune_run/wt/run-broken" && -f "$prune_run/wt/run-broken/marker" ]]; then
+  pass "_prune: keeps an aged run dir whose cleanliness is unverifiable (fail-closed)"
+else
+  fail "_prune must NOT rm -rf a run dir when git status fails"
+fi
 if [[ ! -f "$prune_run/tmp/fishhawk-scope-run1-stage1.json" ]]; then pass "_prune: removes aged keyed scope sidecar"; else fail "_prune should remove aged scope sidecar"; fi
 if [[ ! -f "$prune_run/tmp/fishhawk-pr-run1-stage1.md" ]]; then pass "_prune: removes aged keyed pr sidecar"; else fail "_prune should remove aged pr sidecar"; fi
 if [[ -d "$prune_run/wt/run-fresh" ]]; then pass "_prune: keeps a fresh run worktree dir"; else fail "_prune should keep fresh run worktree"; fi
@@ -2007,12 +2034,21 @@ if command -v git >/dev/null 2>&1; then
   )
   # 20a. non-tty stdin, no --yes -> nothing removed (fail-safe listing).
   REPO_ROOT="$swfix/main"
-  cmd_sweep </dev/null >/dev/null 2>&1
+  sweep_noninteractive_out="$(cmd_sweep </dev/null 2>&1)"
   REPO_ROOT="$orig_repo_root"
   if [[ -d "$swfix/main/.claude/worktrees/wt-merged" ]]; then
     pass "cmd_sweep: non-tty stdin without --yes removes nothing"
   else
     fail "cmd_sweep must not remove a worktree on non-tty stdin without --yes"
+  fi
+  # Pin the `[[ ! -t 0 ]]` guard specifically: a non-tty session must take the
+  # listing-only branch and NEVER reach the read -q prompt. Asserting the
+  # message distinguishes it from the read-q EOF-cancel path, which would also
+  # remove nothing but prove nothing about the tty guard (#1917 review).
+  if print -r -- "$sweep_noninteractive_out" | grep -q 'non-interactive stdin and no --yes — listing only, nothing removed'; then
+    pass "cmd_sweep: non-tty stdin takes the listing-only branch (never prompts)"
+  else
+    fail "cmd_sweep should print the non-interactive listing-only message (got: $sweep_noninteractive_out)"
   fi
   # 20b. from OUTSIDE the worktree, the merged worktree IS a listed candidate.
   REPO_ROOT="$swfix/main"

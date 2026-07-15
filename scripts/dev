@@ -941,11 +941,17 @@ _warn_stale_worktrees() {
 }
 
 # Impure: prune aged run/tmp litter. Two roots:
-#   (1) <worktrees_dir>/run-* — runner-owned detached checkouts older than <days>
-#       AND clean (a dirty or age-fresh run worktree is skipped, protecting any
-#       plausibly-live run), removed via `git worktree remove --force` with an
-#       rm -rf fallback and one `git worktree prune` at the end; plus aged
-#       run-*.runid files.
+#   (1) <worktrees_dir>/run-* — runner-owned checkouts older than <days> whose
+#       cleanliness is POSITIVELY established. Fail-closed on a data-deleting
+#       path (#1917 review): a run worktree is removed ONLY when `git status`
+#       succeeds AND is empty; a status FAILURE (broken gitdir link after an
+#       out-of-band `git worktree prune`, transient git/fs error) or a non-empty
+#       status leaves the dir in place — never rm -rf'd — protecting a dirty or
+#       plausibly-live run. Removal is `git worktree remove` WITHOUT --force, so
+#       git re-checks cleanliness atomically at removal time and REFUSES a run
+#       that turned dirty in the check->remove window (closing the TOCTOU); a
+#       refusal leaves the dir for the next sweep. One `git worktree prune` at
+#       the end reaps the admin entries; plus aged run-*.runid files.
 #   (2) <tmp_dir> keyed sidecars older than <days> — plain files only (the
 #       fishhawk-acceptance-evidence DIRECTORY is never matched), each glob
 #       requiring a dash after the prefix so the legacy fixed-slot transports
@@ -967,20 +973,26 @@ _prune_aged_artifacts() {
   if [[ -n "$wt_dir" && -d "$wt_dir" ]]; then
     local rd status_out rf
     for rd in "$wt_dir"/run-*(N/m+${days}); do
-      status_out=""
+      # Fail CLOSED: only a run worktree whose cleanliness is POSITIVELY
+      # established is a removal candidate. A status FAILURE (broken gitdir
+      # link, transient git/fs error) leaves the dir in place rather than
+      # rm -rf'ing possibly-uncommitted work (#1917 review).
       if ! status_out="$(git -C "$rd" status --porcelain 2>/dev/null)"; then
-        status_out=""
+        print -u2 "skip: run worktree cleanliness unverifiable, left in place: $rd"
+        continue
       fi
       if [[ -n "$status_out" ]]; then continue; fi
       if (( dry_run )); then
         print "would remove run worktree: $rd"
         continue
       fi
-      if git -C "${REPO_ROOT}" worktree remove --force "$rd" 2>/dev/null; then
+      # No --force: git re-checks cleanliness atomically at removal time, so a
+      # run that turned dirty in the check->remove window is REFUSED (TOCTOU
+      # closed), not force-removed. A refusal leaves the dir for the next sweep.
+      if git -C "${REPO_ROOT}" worktree remove "$rd" 2>/dev/null; then
         print "removed run worktree: $rd"
       else
-        rm -rf "$rd"
-        print "removed run worktree (rm -rf fallback): $rd"
+        print -u2 "warning: could not remove run worktree (left in place): $rd"
       fi
     done
     for rf in "$wt_dir"/run-*.runid(N.m+${days}); do
