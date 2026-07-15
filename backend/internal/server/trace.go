@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -466,6 +467,17 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 	// FixupStage re-opens the SAME stage_id with a NEW diff/head_sha and the
 	// runner re-uploads raw first, so the fix-up's own raw variant fires its
 	// own single review on the new diff.
+	//
+	// This raw-variant hook is the FIRST of two implement re-review dispatch
+	// paths. When it is SKIPPED for a fix-up head — the raw trace is routed to
+	// failStageCategoryB by a backend policy re-evaluation (a stale-base bundle
+	// diff over max_files_changed) so control never reaches this block, then #788
+	// recovery restores the stage — succeedFixupPushStage's backstop
+	// (maybeBackstopFixupReReview, #1932) is the SECOND path: it re-arms the
+	// re-review off the fixup_pushed report so the audit-complete merge gate does
+	// not wedge on a 'pending' review that no trace ever dispatched. On the normal
+	// path where this hook already dispatched for the head, the backstop detects
+	// the existing implement_review_started entry and is a no-op.
 	if stage.Type == run.StageTypeImplement && variant == tracestore.VariantRaw {
 		// Diff source is the trace bundle, regardless of whether a PR was
 		// opened (local --no-pr runs still carry the git_diff event). An
@@ -2695,6 +2707,137 @@ func (s *Server) DispatchConsolidatedReview(ctx context.Context, parentRunID uui
 	}()
 }
 
+// maybeBackstopFixupReReview dispatches a post-fix-up implement re-review when
+// the fix-up's trace-time review hook (#793) never fired for the pushed head
+// (#1932). The trace-time hook lives in advanceStageAfterTrace and dispatches
+// the re-review from the RAW trace variant; when that raw trace is routed to
+// failStageCategoryB by a backend policy re-evaluation (a stale-base bundle diff
+// that exceeds max_files_changed is the observed case, run 98020210) the handler
+// never reaches the review hook, #788 fix-up recovery then restores the implement
+// stage to succeeded, and the subsequent fixup_pushed report records the new head
+// with nothing re-arming the re-review — implement_review_status stays 'pending'
+// forever and the audit-complete merge gate wedges. Called from
+// succeedFixupPushStage after the fixup_pushed audit entry lands, this backstop
+// re-arms the re-review for ANY trace-time miss.
+//
+// Guards, in order — each fails closed to no-second-review, because a double
+// dispatch is the worse failure (2x review cost, divergent verdicts, and #777's
+// review_action_hint over-firing on the stale first verdict):
+//
+//	(a) AuditRepo nil → skip (the started ledger is unreadable).
+//	(b) an implement_review_started entry already exists for (stage, new head)
+//	    → the trace-time hook already dispatched for this head, so the backstop
+//	    is a no-op and review cost is unchanged (the normal path). A list error
+//	    also skips — the backstop must not double-dispatch under an unknown state.
+//	(c) the NEWEST implement_review_started entry for THIS stage carries an empty
+//	    head_sha → an unkeyed prior round is indistinguishable from a missed one,
+//	    so skip (fail closed). Fix-up passes run the committed-tree verify gate,
+//	    so bundle heads are present in practice; a residual verify-less miss is
+//	    the accepted trade against double-dispatch. WARN-logged so it stays
+//	    diagnosable. When NO started entry exists for the stage the trace-time
+//	    hook never fired at all, so the backstop proceeds (a genuine miss).
+//	(d) GitHub client / run installation not wired → the same CLI/dev posture
+//	    DispatchConsolidatedReview carries (INFO-log and skip).
+//
+// When the guards pass it dispatches on a detached, shutdown-tracked goroutine
+// (context.WithoutCancel + s.bgReviews) exactly like DispatchConsolidatedReview:
+// ComparePatch(baseSHA, headSHA) IS the fix-up delta — baseSHA is the branch head
+// the fix-up committed onto (the fixup_pushed report's base_sha), coherent with
+// the #1725 delta re-review framing runImplementReviews applies — mapped through
+// consolidatedReviewDiff and handed to runImplementReviews for the new head. That
+// call reuses runImplementReviews' own (stage_id, head_sha) idempotency guard
+// (#797) as the second line against a double dispatch, and its gating-reject
+// return is intentionally ignored: the stage is already terminal/restored at
+// push-report time, so there is no in-flight transition to fail (the
+// consolidated-review call-site rationale, trace.go ~2687). gateEvidence is nil
+// (the PR-report path has no bundle in hand), the documented byte-identical omit
+// case in prompt.Build.
+func (s *Server) maybeBackstopFixupReReview(ctx context.Context, runID uuid.UUID, stage *run.Stage, headSHA, baseSHA string) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	started, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "implement_review_started")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup re-review backstop: list implement_review_started failed — skipping backstop",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	// (b) Normal path: the trace-time hook already dispatched for this head.
+	if implementReviewAlreadyStarted(started, stage.ID, headSHA) {
+		return
+	}
+	// (c) Conservative empty-head skip: an unkeyed prior round cannot be told
+	// apart from a missed one, so fail closed rather than risk a double review.
+	if newestSHA, found := newestImplementReviewStartedHead(started, stage.ID); found && newestSHA == "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup re-review backstop: newest implement_review_started for stage has empty head_sha — skipping to avoid double-dispatch",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("head_sha", headSHA))
+		return
+	}
+	// (d) GitHub-wired diff source. CLI/dev posture (no client / no installation)
+	// skips silently — the same posture as DispatchConsolidatedReview.
+	if s.cfg.GitHub == nil || s.cfg.RunRepo == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"fixup re-review backstop: GitHub/run repo not wired — skipping dispatch",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()))
+		return
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup re-review backstop: get run failed — skipping dispatch",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"fixup re-review backstop: GitHub/installation not wired — skipping dispatch",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()))
+		return
+	}
+	repo, err := parseRepoOwnerName(runRow.Repo)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup re-review backstop: parse repo failed — skipping dispatch",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+
+	installationID := *runRow.InstallationID
+	stageID := stage.ID
+	reviewCtx := context.WithoutCancel(ctx)
+	s.bgReviews.Add(1)
+	go func() {
+		defer s.bgReviews.Done()
+		cmp, cerr := s.cfg.GitHub.ComparePatch(reviewCtx, installationID, repo, baseSHA, headSHA)
+		if cerr != nil {
+			s.cfg.Logger.LogAttrs(reviewCtx, slog.LevelWarn,
+				"fixup re-review backstop: compare patch failed — review not dispatched",
+				slog.String("run_id", runID.String()),
+				slog.String("base", baseSHA), slog.String("head", headSHA),
+				slog.String("error", cerr.Error()))
+			return
+		}
+		diff := consolidatedReviewDiff(cmp)
+		// The gating-reject return is intentionally ignored: the fix-up stage is
+		// already terminal/restored at push-report time, so there is no in-flight
+		// transition to fail to category-B (the consolidated-review rationale
+		// above). The started/reviewed round and any concerns attach to the
+		// implement stage regardless of authority, re-arming the merge gate.
+		s.runImplementReviews(reviewCtx, runID, stageID, diff, nil, headSHA, nil)
+	}()
+}
+
 // consolidatedReviewDiff maps a githubclient compare result onto a
 // policy.Diff for the consolidated review: each changed file's GitHub
 // word-form status becomes a policy.Status letter, and the reconstructed
@@ -2752,6 +2895,32 @@ func (s *Server) emitConsolidatedReviewTruncated(ctx context.Context, runID, sta
 			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
 	}
 }
+
+// reviewDispatchMu serializes the implement-review dispatch dedup critical
+// section in runImplementReviews — the #797 (stage_id, head_sha) absence check
+// PLUS the implement_review_started emit, held together so the pair is atomic.
+//
+// Two dispatchers can call runImplementReviews for the SAME (stage, new head)
+// concurrently: the trace-time hook (#793, advanceStageAfterTrace, off the raw
+// trace upload) and the fix-up re-review backstop (#1932,
+// maybeBackstopFixupReReview, off the fixup_pushed report). The #797 guard is a
+// read-then-append across two separate AuditRepo calls; without a lock spanning
+// them, a push report arriving while the trace-time dispatch is between its
+// absence check and its started-emit lets BOTH observe no started entry, both
+// emit, and both dispatch — the double review (2× cost, divergent verdicts, and
+// #777's review_action_hint over-firing on the stale first verdict) the backstop
+// exists to avoid. The backstop's own pre-goroutine absence check (guard (b)) is
+// only a fast no-op path; the load-bearing atomic guarantee is HERE, where both
+// dispatchers converge.
+//
+// Process-global: one backend serves both the trace upload and the pull-request
+// report for a run, so a single mutex closes the race for every (stage, head).
+// The critical section is one list + one append, so the coarse scope does not
+// harm throughput at v0 review volumes (mirrors the p95CacheMu rationale). A
+// multi-replica deployment where the two reports land on different replicas
+// would need a DB-level uniqueness guard for the durable dedup; the in-process
+// lock is the proportionate v0 fix and does not regress that future work.
+var reviewDispatchMu sync.Mutex
 
 // runImplementReviews resolves the implement stage's review config and
 // dispatches the review agents after the diff has landed in the trace
@@ -3045,6 +3214,14 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// returns false for an empty headSHA (the no-verify / head_sha-less path),
 	// and a read error WARN-logs and falls through to dispatch — an absent or
 	// unreadable key never suppresses a review.
+	//
+	// The check and the emit below are held together under reviewDispatchMu so
+	// the two concurrent dispatchers for this (stage, head) — the trace-time
+	// hook (#793) and the fix-up re-review backstop (#1932) — cannot both
+	// observe the started entry absent and double-dispatch. See reviewDispatchMu.
+	// Unlocked on every exit from the section (early-return AND after the emit),
+	// never held across the reviewer dispatch below.
+	reviewDispatchMu.Lock()
 	if headSHA != "" && s.cfg.AuditRepo != nil {
 		started, lerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "implement_review_started")
 		if lerr != nil {
@@ -3054,6 +3231,7 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 				slog.String("error", lerr.Error()),
 			)
 		} else if implementReviewAlreadyStarted(started, stageID, headSHA) {
+			reviewDispatchMu.Unlock()
 			return false
 		}
 	}
@@ -3065,6 +3243,7 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// 'configured + running' (pending) from 'none configured'. Mirrors the
 	// plan path (runPlanReviews). Best-effort: never blocks dispatch.
 	s.emitReviewStarted(ctx, runID, stageID, "implement_review_started", authority, reviewersCfg.AgentCount(), headSHA)
+	reviewDispatchMu.Unlock()
 
 	// Resolve the per-invocation reviewer list (#955) up front so the
 	// detached goroutine closes over fully-resolved adapters, never the
@@ -4463,6 +4642,41 @@ func implementReviewAlreadyStarted(entries []*audit.Entry, stageID uuid.UUID, he
 		}
 	}
 	return false
+}
+
+// newestImplementReviewStartedHead returns the head_sha of the NEWEST
+// implement_review_started entry for the given stage, and whether ANY such entry
+// exists. It powers the fixup re-review backstop's conservative empty-head skip
+// (#1932): a found entry whose head_sha is "" means the newest prior review round
+// was unkeyed, so the backstop cannot tell a missed re-review from an already-run
+// one and fails closed. found==false means NO review ever started for the stage
+// (the trace-time hook never fired at all), so the backstop proceeds. Newest is
+// resolved by (Timestamp, Sequence) exactly like resolvePriorReviewedHeadSHA; an
+// undecodable payload is skipped, and its empty-string head_sha is returned as-is
+// (the found result still reflects the newest entry).
+func newestImplementReviewStartedHead(entries []*audit.Entry, stageID uuid.UUID) (string, bool) {
+	var newest *audit.Entry
+	var newestSHA string
+	for _, e := range entries {
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var payload struct {
+			HeadSHA string `json:"head_sha"`
+		}
+		if err := json.Unmarshal(e.Payload, &payload); err != nil {
+			continue
+		}
+		if newest == nil || e.Timestamp.After(newest.Timestamp) ||
+			(e.Timestamp.Equal(newest.Timestamp) && e.Sequence > newest.Sequence) {
+			newest = e
+			newestSHA = payload.HeadSHA
+		}
+	}
+	if newest == nil {
+		return "", false
+	}
+	return newestSHA, true
 }
 
 // ResolveDeploymentFromPollState records a delegating deploy stage's

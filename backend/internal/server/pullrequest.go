@@ -908,6 +908,16 @@ type pullRequestFixupPushResponse struct {
 // transition is what the advisory implement re-review (fired at trace time)
 // keys off; deferring it here is the #794 fix.
 //
+// It also calls maybeBackstopFixupReReview (#1932) as the SECOND implement
+// re-review dispatch path: when the trace-time hook (#793) never fired for this
+// pushed head — the fix-up's raw trace was routed to failStageCategoryB by a
+// policy re-evaluation (a stale-base diff) before reaching the hook, then #788
+// recovery restored the stage — the backstop re-arms the re-review off this
+// report so implement_review_status reaches 'complete' and the audit-complete
+// merge gate does not wedge on a 'pending' review that no trace dispatched. On
+// the normal path (the trace-time hook already dispatched for this head) the
+// backstop is a no-op, so review cost is unchanged.
+//
 // Idempotency-guarded on (stage_id, head_sha) mirroring succeedChildPushStage
 // (#776): a runner retry after a 5xx — or a duplicate delivery — must not append
 // a second fixup_pushed audit entry or fire a redundant status-comment update.
@@ -1001,6 +1011,16 @@ func (s *Server) succeedFixupPushStage(w http.ResponseWriter, r *http.Request, r
 	// this the required Check Run stays pinned to the stale PR-open head. The
 	// publisher's head resolver now prefers the newest fixup_pushed head.
 	s.recomputeAndPublishAuditComplete(r.Context(), runID)
+
+	// #1932: re-arm the post-fix-up implement re-review when the trace-time hook
+	// (#793) never fired for this pushed head (a category-B raw trace routed past
+	// the review hook, then #788 recovery restored the stage). Placed after the
+	// fixup_pushed audit entry so a fishhawk_await_audit anchored on fixup_pushed
+	// observes the backstop's implement_review_started strictly after its anchor;
+	// the (stage_id, head_sha) dedup early-return above structurally prevents this
+	// from running twice on a redelivered report. A no-op on the normal path where
+	// the trace-time hook already dispatched for this head.
+	s.maybeBackstopFixupReReview(r.Context(), runID, stage, pr.HeadSHA, pr.BaseSHA)
 
 	s.notifyStatusUpdate(r.Context(), runID, "fixup_pushed")
 
