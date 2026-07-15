@@ -610,6 +610,25 @@ func TestConvergentConcerns(t *testing.T) {
 			wantReason: "below the route_fixup_min_severity threshold (medium)",
 		},
 		{
+			// #1964: a mixed-severity, no-reject round where the
+			// max-aggregation itself decides routing — the medium concern
+			// lifts maxRank to the default threshold while the low one alone
+			// would park, so the round routes. Exercises the max loop on the
+			// threshold path (not the reject-bypass path).
+			name:  "met: mixed low+medium concerns route via max-aggregation at default threshold",
+			open:  []*concern.Concern{openConcern("low"), openConcern("medium")},
+			audit: settledWithConcerns, wantMet: true,
+		},
+		{
+			// The mirror of the above on the park side: two below-threshold
+			// concerns keep maxRank under the default medium bar, so the
+			// max loop parks rather than routing.
+			name:       "unmet: mixed low+low concerns park at default medium threshold",
+			open:       []*concern.Concern{openConcern("low"), openConcern("low")},
+			audit:      settledWithConcerns,
+			wantReason: "below the route_fixup_min_severity threshold (medium)",
+		},
+		{
 			// route_fixup_min_severity: low restores the legacy
 			// route-on-any-concern behavior.
 			name:        "met: threshold low routes a solo low concern (legacy behavior)",
