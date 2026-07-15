@@ -132,6 +132,29 @@ func TestOnboarding_RunbookResourceListedAndReadable(t *testing.T) {
 		// E34.5 / #1597: the criteria-gate advisory surface must be documented in
 		// the runbook — a dropped or reworded-away criteria-pre-check edit fails here.
 		"criteria_precheck",
+		// #1916: the three runbook additions — failed-run revive pre-dispatch check,
+		// the decomposed-parent native path, and the drive_run loop shape. Anchored on
+		// tool names, audit categories, and stop-reason/clamp tokens (not sentence
+		// fragments) so future rewording does not fail spuriously, and pinning each
+		// binding-condition token (paged: stop reason, [1,240] clamp, pre(plan)/post(review)
+		// gates) so every promised runbook statement is test-load-bearing.
+		"fishhawk_run_children",
+		"fishhawk_consolidate_slices",
+		"awaiting_children",
+		"pre(plan)",
+		"post(review)",
+		"fishhawk_drive_run",
+		"decision_required",
+		"paged:",
+		"dispatched_stale",
+		"[1,240]",
+		// The revive pre-dispatch check reads this audit category before dispatching
+		// a re-parked acceptance stage. `acceptance_outcome_recorded` alone is NOT
+		// load-bearing for that section — it pre-exists in the acceptance/settled-outcome
+		// text — so pin the section by its unique bold heading, which fails if the
+		// paragraph is dropped or reworded away.
+		"Pre-dispatch check for a re-parked acceptance stage",
+		"acceptance_outcome_recorded",
 	} {
 		if !strings.Contains(c.Text, anchor) {
 			t.Errorf("runbook missing edge-case anchor %q", anchor)

@@ -115,6 +115,82 @@ token is refused `403 agent_token_forbidden`. The failed-run `next_actions` arms
 (`implement_failed_category_a`, `implement_failed`) surface it alongside
 `fishhawk_retry_stage`.
 
+**Provenance.** This one-verb section supersedes the pre-#1915
+retry-without-dispatch dance the 2026-07-12/13 drives used ([#1916](https://github.com/kuhlman-labs/fishhawk/issues/1916)):
+reach for `fishhawk_revive_run`, not a hand-sequenced per-stage retry that you have
+to keep from re-dispatching out of gate order.
+
+**Pre-dispatch check for a re-parked acceptance stage.** Revive re-parks only —
+you dispatch each re-parked stage at its gate turn. One case needs a read first: a
+re-parked **acceptance** stage may already carry a recorded outcome (or a retried
+acceptance may short-circuit straight to one). Before dispatching it,
+`fishhawk_list_audit` on `acceptance_outcome_recorded` for the stage; the server
+`422 retry_not_applicable`s when a verdict is already recorded (the same guard the
+settled-outcome-unknown recovery relies on). Confirm no verdict exists, then
+dispatch.
+
+### Decomposed-parent native path (`fishhawk_run_children` / `fishhawk_consolidate_slices`)
+
+When a plan is **decomposed** into child slices, the parent's implement stage
+parks in `awaiting_children` and its child slices own it. Do **NOT**
+`fishhawk_dispatch_stage` / `fishhawk_run_stage` the parent's implement stage:
+since [PR #1902](https://github.com/kuhlman-labs/fishhawk/pull/1902)
+`guardSiblingStageInFlight` **refuses** an `awaiting_children` target and its error
+names the correct verbs — a spawned runner would `409 stage_not_runnable` and the
+detached reaper's failure report would destroy the park (`awaiting_children →
+failed` is a legal sweeper edge). Drive the native path instead:
+
+1. **Approve the parent plan** as usual.
+2. **`fishhawk_run_children` (parent run_id)** — discovers the children from the
+   `plan_decomposed` audit entry, sequences their `depends_on` edges into
+   topological **waves**, and provisions a per-child isolated worktree. A wave-1
+   child bases on the wave-0 integration commit, so a producer→consumer slice pair
+   typechecks against the already-integrated symbol. Re-invocation is idempotent
+   (in-flight and terminal children are reported as-is, only pending ones spawn).
+3. **`fishhawk_consolidate_slices` (parent run_id)** — once **every** child is
+   terminal, run the fan-in that merges each slice branch onto the consolidated
+   branch and opens the consolidated PR. The 60s child-completion sweeper backstop
+   is OFF by default in `fishhawkd` (`--enable-child-completion-sweeper`), so on
+   the local loop this operator verb **is** the fan-in. The endpoint refuses a
+   partial set — a failed child must be resolved or re-driven first.
+4. **Review the consolidated PR.**
+
+The parent's own human gates are unchanged around the implement fan-out:
+**pre(plan)** before the children run and **post(review)** on the consolidated
+result.
+
+### Driving with `fishhawk_drive_run`
+
+`fishhawk_drive_run` ([ADR-040 / #1700](https://github.com/kuhlman-labs/fishhawk/issues/1700))
+is the local auto-driver: a bounded, resumable loop that executes every mechanical
+operator step between human gates on a `runner_kind:local` run and stops at the
+first genuine decision. Invoke it **after `fishhawk_start_run`** (`runner_kind:local`).
+
+Each iteration the driver dispatches only the **earliest gate-ordered non-terminal
+stage** (plan → implement after plan succeeds → acceptance after implement's review
+settles). It **auto-approves the plan gate** when the run's ADR-040 delegation rule
+is satisfied (e.g. `clean_dual_approval`) — post-read the auto-approved plan with
+`fishhawk_get_plan`. Post-[#1912](https://github.com/kuhlman-labs/fishhawk/issues/1912)
+it **auto-dispatches a locally-parked `awaiting_host_dispatch` stage** with no
+manual handoff (the backend cannot spawn the host-local runner, so a plan-approved
+implement parks there and the driver treats it as host-spawnable). This
+**supersedes** the pre-#1912 manual handoff for the parked implement — that
+hand-dispatch is retired.
+
+It **stops** and returns on the first genuine decision, and every stop is
+resumable:
+
+- `decision_required:<state>` — an operator gate (a plan gate without
+  `may_approve`, a split reviewer verdict, or a pending scope amendment).
+- `paged:<event>` — a paged disposition you arbitrate.
+- `dispatched_stale` — a previously-spawned runner looks dead. Since
+  [#1924](https://github.com/kuhlman-labs/fishhawk/issues/1924)/[#1927](https://github.com/kuhlman-labs/fishhawk/issues/1927)
+  this is a **real** signal, not a false alarm — but confirm no live runner
+  (`pgrep -f fishhawk-runner`) before re-dispatching by hand.
+
+**Every stop is resumable by re-invoking with the SAME `run_id`.** `max_minutes`
+clamps to **[1,240]** (default **60**); a timeout is itself a resumable stop.
+
 ### Acceptance stage
 
 Some workflows declare an **acceptance stage** (E31.9 / ADR-049) after the
