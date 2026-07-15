@@ -41,8 +41,12 @@ func TestCollect_ProductFactsOnly(t *testing.T) {
 			Type:            run.StageTypeImplement,
 			State:           run.StageStateFailed,
 			FailureCategory: ptrCat(run.FailureB),
-			// Free text that MUST NOT leak into the bundle.
-			FailureReason: ptrStr("agent edited forbidden path /etc/secret and printed PROMPT_LEAK"),
+			// Free text that MUST NOT leak into the bundle. It carries a
+			// classifiable git-stderr shape (auth-401) AND the leak-canary
+			// strings, so the class flows through while the reason text is
+			// still proven absent from the serialized bundle below.
+			FailureReason: ptrStr("fatal: unable to access '...': The requested URL returned error: 401 " +
+				"(agent edited forbidden path /etc/secret and printed PROMPT_LEAK)"),
 		},
 	}
 	entries := []*audit.Entry{
@@ -87,6 +91,10 @@ func TestCollect_ProductFactsOnly(t *testing.T) {
 	if b.FailingStage.FailureSurface != "stage_failed" {
 		t.Errorf("FailureSurface = %q, want stage_failed", b.FailingStage.FailureSurface)
 	}
+	// The detail class is derived from the free-text reason.
+	if b.FailingStage.FailureDetailClass != "auth-401" {
+		t.Errorf("FailureDetailClass = %q, want auth-401", b.FailingStage.FailureDetailClass)
+	}
 	if b.AuditSequenceRange == nil || b.AuditSequenceRange.Min != 10 || b.AuditSequenceRange.Max != 12 {
 		t.Errorf("AuditSequenceRange = %+v, want {10,12}", b.AuditSequenceRange)
 	}
@@ -107,6 +115,33 @@ func TestCollect_ProductFactsOnly(t *testing.T) {
 		if strings.Contains(string(raw), leak) {
 			t.Errorf("bundle leaked %q: %s", leak, raw)
 		}
+	}
+}
+
+// TestCollect_NilFailureReason_EmptyDetailClass pins the nil-guard branch
+// in Collect: a failing stage with no recorded FailureReason leaves
+// FailureDetailClass empty (omitempty), degrading to the pre-#1962
+// fingerprint per the backward-compat contract, without ever calling
+// ClassifyFailureDetail on a nil pointer.
+func TestCollect_NilFailureReason_EmptyDetailClass(t *testing.T) {
+	failStageID := uuid.New()
+	r := &run.Run{ID: uuid.New(), WorkflowID: "feature_change", State: run.StateFailed}
+	stages := []*run.Stage{
+		{
+			ID:              failStageID,
+			Sequence:        0,
+			Type:            run.StageTypeImplement,
+			State:           run.StageStateFailed,
+			FailureCategory: ptrCat(run.FailureB),
+			FailureReason:   nil, // no reason recorded on the failed stage
+		},
+	}
+	b := Collect(r, stages, nil, sampleVersions())
+	if b.FailingStage == nil {
+		t.Fatal("FailingStage = nil, want the implement stage")
+	}
+	if b.FailingStage.FailureDetailClass != "" {
+		t.Errorf("FailureDetailClass = %q, want empty for a nil FailureReason", b.FailingStage.FailureDetailClass)
 	}
 }
 

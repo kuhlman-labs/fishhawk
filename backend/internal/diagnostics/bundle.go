@@ -5,7 +5,11 @@
 // and surface, the audit sequence range, build versions + git SHAs, the
 // workflow spec hash, and the runner kind. It deliberately carries NO
 // diffs, paths, prompts, free text, or audit payload bodies; the failing
-// stage's FailureReason (free text) is excluded by construction.
+// stage's FailureReason (free text) is excluded by construction. The
+// failing stage DOES carry a FailureDetailClass — a closed enum DERIVED
+// from that free text by ClassifyFailureDetail — but the reason text
+// itself never crosses the boundary: only the table-owned enum literal
+// does.
 //
 // This package is the read foundation of the product-feedback feature
 // (slice 1). The deduped egress path (fingerprint, FeedbackProvider) and
@@ -53,11 +57,19 @@ type StageFact struct {
 // enum value, never a payload body or the free-text FailureReason. It
 // is the "error code / failing surface" the downstream fingerprint
 // (slice 2) keys on.
+// FailureDetailClass is a closed-enum normalization of the stage's
+// free-text FailureReason ("auth-401" | "bad-object-ref" |
+// "target-unreachable" | "" when unclassified), produced by
+// ClassifyFailureDetail. It lets the fingerprint distinguish distinct
+// root causes that share a surface (#1962). The raw reason text is
+// NEVER copied in — only the table-owned enum literal is, so this field
+// is a redaction-safe product fact by construction.
 type FailingStage struct {
-	Sequence        int    `json:"sequence"`
-	Type            string `json:"type"`
-	FailureCategory string `json:"failure_category"`
-	FailureSurface  string `json:"failure_surface,omitempty"`
+	Sequence           int    `json:"sequence"`
+	Type               string `json:"type"`
+	FailureCategory    string `json:"failure_category"`
+	FailureSurface     string `json:"failure_surface,omitempty"`
+	FailureDetailClass string `json:"failure_detail_class,omitempty"`
 }
 
 // SequenceRange is the [min,max] of the run's audit-entry sequence
@@ -139,6 +151,11 @@ func Collect(r *run.Run, stages []*run.Stage, auditEntries []*audit.Entry, versi
 			Type:            string(failing.Type),
 			FailureCategory: string(*failing.FailureCategory),
 			FailureSurface:  failingSurface(failing.ID, auditEntries),
+		}
+		// Derive the closed-enum detail class FROM the free-text reason;
+		// the reason text itself still never enters the bundle.
+		if failing.FailureReason != nil {
+			fs.FailureDetailClass = ClassifyFailureDetail(*failing.FailureReason)
 		}
 		b.FailingStage = fs
 	}

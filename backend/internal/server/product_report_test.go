@@ -524,6 +524,158 @@ func assertProductReportAudit(t *testing.T, af *scAuditFake, runID uuid.UUID, fi
 	}
 }
 
+// dedupFeedbackProvider is a fingerprint-AWARE feedback double: unlike
+// fakeFeedbackProvider (which returns a fixed search result), it models a
+// real dedup store — File records the fingerprint -> issue number, and
+// SearchOpenByFingerprint returns a hit only for a fingerprint already
+// filed. This lets one provider instance be driven across several POSTs
+// to observe created-vs-occurrence keyed on the actual fingerprint.
+type dedupFeedbackProvider struct {
+	name  string
+	filed map[string]int // fingerprint -> upstream number
+	next  int
+}
+
+func (f *dedupFeedbackProvider) Name() string { return f.name }
+
+func (f *dedupFeedbackProvider) SearchOpenByFingerprint(_ context.Context, _ workmgmt.Target, fingerprint string) (*workmgmt.ExistingReport, error) {
+	if num, ok := f.filed[fingerprint]; ok {
+		return &workmgmt.ExistingReport{Number: num, URL: "https://github.com/kuhlman-labs/fishhawk/issues/" + fingerprint}, nil
+	}
+	return nil, nil
+}
+
+func (f *dedupFeedbackProvider) File(_ context.Context, _ workmgmt.Target, report workmgmt.FeedbackReport) (*workmgmt.CreatedItem, error) {
+	if f.filed == nil {
+		f.filed = map[string]int{}
+	}
+	f.next++
+	f.filed[report.Fingerprint] = f.next
+	return &workmgmt.CreatedItem{Provider: f.name, Number: f.next, URL: "https://github.com/kuhlman-labs/fishhawk/issues/x"}, nil
+}
+
+func (f *dedupFeedbackProvider) AppendOccurrence(_ context.Context, _ workmgmt.Target, _ int, _ string) error {
+	return nil
+}
+
+// fingerprintFixture builds a server + failing run whose failing stage
+// carries the given category, free-text reason, and audit surface, so a
+// test can vary exactly the fingerprint inputs (#1962). It does NOT
+// register a provider — the caller registers a shared dedup provider so a
+// single store is observed across POSTs.
+func fingerprintFixture(t *testing.T, af *scAuditFake, category run.FailureCategory, reason, surface string) (*Server, uuid.UUID) {
+	t.Helper()
+	runID := uuid.New()
+	failID := uuid.New()
+	inst := int64(99)
+	stored := &run.Run{
+		ID:             runID,
+		Repo:           "kuhlman-labs/fishhawk",
+		WorkflowID:     "feature_change",
+		WorkflowSHA:    "specsha123",
+		RunnerKind:     run.RunnerKindLocal,
+		State:          run.StateFailed,
+		InstallationID: &inst,
+	}
+	stages := []*run.Stage{
+		{ID: uuid.New(), Sequence: 0, Type: run.StageTypePlan, State: run.StageStateSucceeded},
+		{
+			ID:              failID,
+			Sequence:        1,
+			Type:            run.StageTypeImplement,
+			State:           run.StageStateFailed,
+			FailureCategory: failureCat(category),
+			FailureReason:   strPtr(reason),
+		},
+	}
+	af.allEntries = []*audit.Entry{
+		{Sequence: 100, Category: "stage_dispatched"},
+		{Sequence: 101, StageID: &failID, Category: surface},
+	}
+	s := New(Config{
+		Addr:      "127.0.0.1:0",
+		RunRepo:   &statusCommentRunRepo{stored: stored, stages: stages},
+		AuditRepo: af,
+	})
+	return s, runID
+}
+
+// TestProductReport_DetailClass_SplitsConflatedSurface is the #1962/#1933
+// vs #1932 regression at the handler layer: two runs whose failing stage
+// shares stage type, category C, and the fixup_base_checkout surface but
+// whose FailureReason texts carry the credential-401 shape vs the bad-ref
+// shape produce DIFFERENT fingerprints and BOTH take the created path
+// (dedup miss against each other). A third run repeating the first run's
+// reason CLASS (a different auth-401 text) reproduces the first fingerprint
+// and takes the occurrence path. This exercises Collect ->
+// ClassifyFailureDetail -> Fingerprint -> dedup search -> render end to end.
+func TestProductReport_DetailClass_SplitsConflatedSurface(t *testing.T) {
+	dp := &dedupFeedbackProvider{name: workmgmt.Default().Provider}
+	// Save and restore the prior registration so this global mutation does
+	// not leak into a product-report test that runs afterward in this
+	// package and relies on its own previously-registered provider.
+	if prev, err := workmgmt.GetFeedback(dp.name); err == nil {
+		t.Cleanup(func() { workmgmt.RegisterFeedback(prev) })
+	}
+	workmgmt.RegisterFeedback(dp)
+
+	const surface = "fixup_base_checkout"
+
+	// Run 1: credential-401 shape -> auth-401.
+	af1 := &scAuditFake{}
+	s1, run1 := fingerprintFixture(t, af1, run.FailureC,
+		"fatal: unable to access 'https://github.com/kuhlman-labs/fishhawk/': The requested URL returned error: 401",
+		surface)
+	rec1 := postProductReport(s1, run1, "mcp:run:"+run1.String(), "")
+	resp1 := decodeProductReportResp(t, rec1)
+	if resp1.Action != "created" {
+		t.Fatalf("run1 action = %q, want created (body=%s)", resp1.Action, rec1.Body.String())
+	}
+
+	// Run 2: bad-ref shape -> bad-object-ref. Same surface + category, so
+	// pre-#1962 it would have deduped onto run1; now it must split.
+	af2 := &scAuditFake{}
+	s2, run2 := fingerprintFixture(t, af2, run.FailureC,
+		"fatal: couldn't find remote ref refs/heads/fishhawk/run-xyz",
+		surface)
+	rec2 := postProductReport(s2, run2, "mcp:run:"+run2.String(), "")
+	resp2 := decodeProductReportResp(t, rec2)
+	if resp2.Action != "created" {
+		t.Fatalf("run2 action = %q, want created (body=%s)", resp2.Action, rec2.Body.String())
+	}
+	if resp1.Fingerprint == resp2.Fingerprint {
+		t.Fatalf("distinct root causes on a shared surface conflated: both %q", resp1.Fingerprint)
+	}
+
+	// Run 3: a DIFFERENT auth-401 text -> same class as run1 -> same
+	// fingerprint -> occurrence (dedup hit), proving the class (not the raw
+	// text) is what keys the fingerprint.
+	af3 := &scAuditFake{}
+	s3, run3 := fingerprintFixture(t, af3, run.FailureC,
+		"remote: Authentication failed for 'https://github.com/kuhlman-labs/fishhawk/'",
+		surface)
+	rec3 := postProductReport(s3, run3, "mcp:run:"+run3.String(), "")
+	resp3 := decodeProductReportResp(t, rec3)
+	if resp3.Fingerprint != resp1.Fingerprint {
+		t.Errorf("same detail class must reproduce the fingerprint: run3 %q != run1 %q", resp3.Fingerprint, resp1.Fingerprint)
+	}
+	if resp3.Action != "occurrence" {
+		t.Errorf("run3 action = %q, want occurrence (dedup hit on run1's class)", resp3.Action)
+	}
+}
+
+func decodeProductReportResp(t *testing.T, rec *httptest.ResponseRecorder) productReportResponse {
+	t.Helper()
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var resp productReportResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return resp
+}
+
 // TestReportLabels_IncludeAutonomyDefault is the reportLabels unit assertion
 // for #1616 (verification 9): the product-report path bypasses workmgmt.Apply,
 // so the autonomy:medium default is applied at the label source here — for BOTH

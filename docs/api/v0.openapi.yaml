@@ -2375,6 +2375,15 @@ components:
             failure_surface:
               type: string
               description: Audit category of the most-recent entry scoped to the failing stage.
+            failure_detail_class:
+              type: string
+              description: >-
+                Closed-enum normalization of the free-text failure reason
+                (auth-401 | bad-object-ref | target-unreachable), or absent
+                when unclassified. A table-owned enum literal DERIVED from
+                the reason — the raw reason text is never carried. Lets the
+                dedup fingerprint distinguish distinct root causes that
+                share a failing surface (#1962).
         audit_sequence_range:
           type: object
           description: "[min,max] of the run's audit-entry sequence numbers. Absent when the run has no audit entries."
@@ -2418,7 +2427,11 @@ components:
       properties:
         fingerprint:
           type: string
-          description: Stable dedup fingerprint over (failure category, audit surface, version family).
+          description: >-
+            Stable dedup fingerprint over (failure category, audit surface,
+            failure detail class, version family). The detail class is
+            included only when the failure reason classified; an
+            unclassified failure keeps the 3-component fingerprint (#1962).
         action:
           type: string
           enum: [created, occurrence]
@@ -5275,7 +5288,7 @@ paths:
         The deduped, audited egress path for upstream Fishhawk product
         feedback (#1006). Collects the run's product-facts diagnostic
         bundle, fingerprints the failure over (failure category, audit
-        surface, fishhawkd version family), searches the FIXED upstream
+        surface, failure detail class, fishhawkd version family), searches the FIXED upstream
         product repo for an open report already carrying that fingerprint,
         and either appends an occurrence comment (dedup hit, nothing
         created) or files a new fingerprint-marked report (dedup miss).
