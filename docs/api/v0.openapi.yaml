@@ -157,12 +157,18 @@ components:
             An unresolved placeholder fails the filing with `422
             work_item_invalid`, listing the still-missing names in
             `details.missing_placeholders`. For a child type whose
-            `title_format` is `[E{epic}.{n}]`, the `{epic}` placeholder is
-            auto-derived from the `parent_epic` relation (the parent epic
-            issue's leading `[E<n>]` title token is read server-side), so you
-            need only supply `{n}`. Derivation fails closed: if the parent has
-            no parseable `[E<n>]` token, `{epic}` is left unresolved and the 422
-            above is returned rather than a wrong title.
+            `title_format` is `[E{epic}.{n}]`, BOTH `{epic}` AND the `{n}` child
+            number are auto-derived from the `parent_epic` relation server-side
+            (#1958): `{epic}` from the parent epic issue's leading `[E<n>]` title
+            token, and `{n}` as the next number after the epic's existing
+            children (open and closed), so `title_vars` can be omitted entirely
+            — supply `{n}` only to override the auto-derived child number. The
+            allocated number is collision-free within one deployment (concurrent
+            omitted-`n` filings against the same epic are serialized), not
+            globally unique. Derivation fails closed: if the parent has no
+            parseable `[E<n>]` token `{epic}` is left unresolved and the 422
+            above is returned, and a failed child-number lookup returns the same
+            422 with `details.n_discovery_failed` rather than a wrong title.
         labels:
           type: array
           items: { type: string }
@@ -6321,15 +6327,21 @@ paths:
         title placeholder and is the required Summary field. The same call
         shape works for any repo because only the conventions differ.
 
-        **Epic auto-derivation.** For a child type whose `title_format`
-        references `{epic}` (e.g. `[E{epic}.{n}]`), when `relations.parent_epic`
-        is set and `title_vars` omits `epic`, the handler reads the parent epic
-        issue's title server-side and parses its leading `[E<n>]` token into the
-        `{epic}` placeholder — so the caller need only supply `{n}`. This fails
-        closed: if no GitHub client/installation is available, the parent ref is
-        unparseable, the issue fetch errors, or the parent title carries no
-        `[E<n>]` token, `{epic}` is left unresolved and the `422` below is
-        returned rather than a wrong title.
+        **Epic + child-number auto-derivation.** For a child type whose
+        `title_format` references `{epic}`/`{n}` (e.g. `[E{epic}.{n}]`), when
+        `relations.parent_epic` is set and `title_vars` omits them, the handler
+        derives BOTH server-side (#1958): it reads the parent epic issue's title
+        and parses its leading `[E<n>]` token into `{epic}`, then enumerates the
+        epic's existing children (open and closed) and allocates `{n}` as the
+        next number — so `title_vars` can be omitted entirely; a supplied value
+        overrides either derivation. The allocated number is collision-free
+        within one deployment (concurrent omitted-`n` filings against the same
+        epic are serialized), not globally unique. This fails closed: if no
+        GitHub client/installation is available, the parent ref is unparseable,
+        the issue fetch errors, or the parent title carries no `[E<n>]` token,
+        `{epic}` is left unresolved and the `422` below is returned rather than a
+        wrong title; a failed child-number lookup returns the same `422` with
+        `details.n_discovery_failed`.
 
         **Sections fail loud.** When `body` is omitted, every `sections` key
         must match the type's `body_skeleton` exactly. An off-skeleton key
@@ -8703,10 +8715,11 @@ paths:
         The follow-up body is fully AUTO-DRAFTED server-side from the
         persisted concern + its run (the concern note, severity,
         category, the reviewer model, the evidence run id, and the
-        source PR link). The operator supplies only the non-derivable
-        title coordinates — `parent_epic` (the epic the follow-up rolls
-        up to) and `n` (the child number) — mirroring the work-item
-        filing endpoint; `type` defaults to `bug` for a defect category
+        source PR link). The operator supplies only `parent_epic` (the
+        epic the follow-up rolls up to); the `{n}` child number is
+        discovered server-side (#1958) from the parent epic's existing
+        children and the next one allocated, mirroring the work-item
+        filing endpoint. `type` defaults to `bug` for a defect category
         else `chore`, and `labels` are merged on top of the type
         defaults.
 
@@ -8756,9 +8769,13 @@ paths:
                 n:
                   type: string
                   description: |
-                    The child number for the `[E<epic>.<n>]` title.
-                    Operator judgment, mirroring how the work-item filing
-                    endpoint takes `{n}` as a caller title var.
+                    OPTIONAL child number for the `[E<epic>.<n>]` title.
+                    Discovered server-side (#1958) from the parent epic's
+                    existing children (open and closed) and the next one
+                    allocated, so the operator no longer has to guess it —
+                    supply `n` only to override that discovery. A failed
+                    lookup fails the filing closed with 422
+                    `work_item_invalid` (`details.n_discovery_failed`).
                 type:
                   type: string
                   description: |

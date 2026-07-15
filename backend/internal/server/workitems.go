@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -373,6 +374,23 @@ func (s *Server) applyAndFileWorkItem(ctx context.Context, filing workmgmt.Filin
 	// wrong title or a crash.
 	s.deriveEpicTitleVar(ctx, &filing, conv, target.InstallationID, owner, name)
 
+	// Derive the {n} child-number title placeholder from the parent epic's
+	// existing children (#1958), immediately after {epic} is resolved above
+	// (it consumes TitleVars["epic"]). When derivation runs it returns a
+	// non-nil unlock that holds a per-parent-epic in-process lock across the
+	// whole discover-{n} -> Apply -> File critical section (binding approval
+	// condition 1), so two concurrent omitted-n filings against the same epic
+	// serialize and allocate DISTINCT consecutive numbers. The lock is taken
+	// ONLY when {n} is discovered — an explicit-n caller returns a nil unlock
+	// and never contends. Deferred here so it releases after File below.
+	unlockChildNumber, werr := s.deriveChildNumberTitleVar(ctx, &filing, conv, target)
+	if unlockChildNumber != nil {
+		defer unlockChildNumber()
+	}
+	if werr != nil {
+		return nil, nil, werr
+	}
+
 	// Derive the area:* label from the parent epic when the type wants an area
 	// namespace and none was supplied (#1616), mutating filing.Labels in place
 	// BEFORE Apply so the completeness pass sees area as present. Fails OPEN on
@@ -555,6 +573,128 @@ func (*Server) discoverExistingNumbers(ctx context.Context, filing *workmgmt.Fil
 	// and a populated discovery allocates max+1.
 	filing.ExistingNumbers = append(discovered, 0)
 	return nil
+}
+
+// childNumberLocks serializes the discover-{n} -> File critical section per
+// parent-epic ref WITHIN THIS PROCESS (binding approval condition 1, #1958).
+// Two concurrent omitted-n filings against the same epic would otherwise both
+// read the same max child number and allocate a colliding {n}; the per-epic
+// mutex makes them serialize so they file DISTINCT consecutive numbers. This
+// is sufficient for the single-daemon v0 deployment. A hosted MULTI-INSTANCE
+// deployment (multiple fishhawkd processes sharing one tracker) would need a
+// Postgres advisory lock instead — the in-process map is invisible across
+// processes; see backend/internal/workmgmt/README.md. The map is never pruned
+// (one small mutex per distinct epic ref for the process lifetime), which is
+// bounded by the number of epics filed against.
+var (
+	childNumberLocksMu sync.Mutex
+	childNumberLocks   = map[string]*sync.Mutex{}
+)
+
+// lockChildNumberKey acquires (creating on first use) the per-epic mutex for
+// key and returns its unlock func. The caller holds it across EpicChildren ->
+// Apply -> File so the whole allocate-then-file window is serialized.
+func lockChildNumberKey(key string) func() {
+	childNumberLocksMu.Lock()
+	m := childNumberLocks[key]
+	if m == nil {
+		m = &sync.Mutex{}
+		childNumberLocks[key] = m
+	}
+	childNumberLocksMu.Unlock()
+	m.Lock()
+	return m.Unlock
+}
+
+// childNumberLockKey is the per-epic serialization key: the target repo plus
+// the parent-epic ref, so two epics (or the same epic ref in different repos)
+// never contend on one lock.
+func childNumberLockKey(target workmgmt.Target, epicRef string) string {
+	return target.Repo.Owner + "/" + target.Repo.Name + "#" + strings.TrimSpace(epicRef)
+}
+
+// deriveChildNumberTitleVar fills the {n} child-number title placeholder for a
+// child type (e.g. [E{epic}.{n}]) by enumerating the parent epic's existing
+// children server-side (#1958), so fishhawk_defer_concern and
+// fishhawk_file_issue no longer make the operator guess it. It runs BEFORE the
+// pure workmgmt.Apply, immediately after deriveEpicTitleVar resolved
+// TitleVars["epic"] (which it consumes), mirroring discoverExistingNumbers'
+// pre-Apply provider-side I/O step.
+//
+// It is a no-op (returns a nil unlock, nil error) when: the type is unknown or
+// its title_format has no {n}; TitleVars["n"] is already set (a caller-supplied
+// n is an explicit override that short-circuits discovery — and, per the
+// binding concurrency condition, is the case where the per-epic lock is NOT
+// taken); Relations.ParentEpic is blank; TitleVars["epic"] is unresolved (epic
+// derivation already failed closed, so renderTitle's 422 covers both
+// placeholders); workmgmt.Get errors (applyAndFileWorkItem's own Get surfaces
+// the typed 501/500); or the provider does not implement EpicChildrenQuerier
+// (fall through to Apply's missing-placeholder 422 unchanged).
+//
+// Otherwise it acquires the per-parent-epic in-process lock (returned to the
+// caller as unlock, released after File) and calls EpicChildren. A genuine
+// query error releases the lock and returns a *workItemError 422
+// work_item_invalid naming the failure and the fallback ("pass n explicitly"),
+// with details {type, n_discovery_failed}. On success it sets
+// filing.TitleVars["n"] = NextChildNumber(...) (with the mandatory nil-map
+// guard, the #1184 precedent) and returns the still-held unlock so the caller
+// serializes Apply + File under it.
+// The receiver is unused (discovery resolves the provider through the global
+// workmgmt registry, not server config) but the method form mirrors
+// deriveEpicTitleVar/discoverExistingNumbers and keeps the call site uniform.
+func (*Server) deriveChildNumberTitleVar(ctx context.Context, filing *workmgmt.FilingRequest, conv workmgmt.Conventions, target workmgmt.Target) (func(), *workItemError) {
+	itemType, ok := conv.Types[filing.Type]
+	if !ok || !strings.Contains(itemType.TitleFormat, "{n}") {
+		return nil, nil
+	}
+	if _, set := filing.TitleVars["n"]; set {
+		// Explicit-n override: skip discovery AND the lock.
+		return nil, nil
+	}
+	if strings.TrimSpace(filing.Relations.ParentEpic) == "" {
+		return nil, nil
+	}
+	epic, ok := filing.TitleVars["epic"]
+	if !ok || strings.TrimSpace(epic) == "" {
+		// {epic} unresolved: leave {n} unset too so renderTitle's 422 reports
+		// both missing placeholders.
+		return nil, nil
+	}
+	provider, err := workmgmt.Get(conv.Provider)
+	if err != nil {
+		return nil, nil
+	}
+	querier, ok := provider.(workmgmt.EpicChildrenQuerier)
+	if !ok {
+		return nil, nil
+	}
+
+	// Discovery WILL run: serialize the allocate-then-file window per epic.
+	unlock := lockChildNumberKey(childNumberLockKey(target, filing.Relations.ParentEpic))
+	res, err := querier.EpicChildren(ctx, workmgmt.EpicChildrenRequest{
+		Target: target,
+		Epic:   filing.Relations.ParentEpic,
+	})
+	if err != nil {
+		unlock()
+		return nil, &workItemError{
+			status: http.StatusUnprocessableEntity, code: "work_item_invalid",
+			msg: fmt.Sprintf(
+				"could not discover the child number for the parent epic %q: %s; pass n explicitly",
+				filing.Relations.ParentEpic, err.Error()),
+			details: map[string]any{
+				"type":               filing.Type,
+				"n_discovery_failed": err.Error(),
+			},
+		}
+	}
+	// MANDATORY nil-map guard (#1184): allocate before assigning so a filing
+	// that omits title_vars entirely does not panic.
+	if filing.TitleVars == nil {
+		filing.TitleVars = map[string]string{}
+	}
+	filing.TitleVars["n"] = strconv.Itoa(workmgmt.NextChildNumber(itemType.TitleFormat, epic, res.Children))
+	return unlock, nil
 }
 
 // epicTitleRE extracts the epic number from a parent epic's leading

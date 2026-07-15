@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1801,5 +1802,289 @@ func TestFileWorkItem_AreaDerivation_FailsOpen(t *testing.T) {
 	resp := decodeWorkItem(t, rec)
 	if strings.Join(resp.MissingLabelNamespaces, ",") != "area" {
 		t.Errorf("missing_label_namespaces = %v, want [area] (derivation failed open)", resp.MissingLabelNamespaces)
+	}
+}
+
+// --- child-number discovery (#1958) ---
+
+// fakeChildNumberProvider is a workmgmt.Provider that ALSO implements the
+// optional workmgmt.EpicChildrenQuerier capability (#1958), so the handler's
+// child-number discovery seam (handler -> EpicChildrenQuerier -> NextChildNumber
+// -> rendered title) is exercised end to end. It is concurrency-safe so the
+// two-parallel-filings test can share one instance: when appendOnFile is set,
+// File records the just-filed child title so a subsequent EpicChildren reflects
+// it — the mechanism that lets serialized filings allocate distinct numbers.
+type fakeChildNumberProvider struct {
+	name string
+
+	mu           sync.Mutex
+	children     []workmgmt.EpicChild
+	epicErr      error
+	epicCalls    int
+	epicReq      workmgmt.EpicChildrenRequest
+	fileCalls    int
+	lastFileReq  workmgmt.ProviderRequest
+	filedTitles  []string
+	appendOnFile bool
+	number       int
+}
+
+func (f *fakeChildNumberProvider) Name() string { return f.name }
+
+func (f *fakeChildNumberProvider) EpicChildren(_ context.Context, req workmgmt.EpicChildrenRequest) (*workmgmt.EpicChildrenResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.epicCalls++
+	f.epicReq = req
+	if f.epicErr != nil {
+		return nil, f.epicErr
+	}
+	out := make([]workmgmt.EpicChild, len(f.children))
+	copy(out, f.children)
+	return &workmgmt.EpicChildrenResult{Children: out}, nil
+}
+
+func (f *fakeChildNumberProvider) File(_ context.Context, req workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fileCalls++
+	f.lastFileReq = req
+	f.filedTitles = append(f.filedTitles, req.Item.Title)
+	if f.appendOnFile {
+		f.children = append(f.children, workmgmt.EpicChild{Title: req.Item.Title})
+	}
+	f.number++
+	return &workmgmt.CreatedItem{
+		Provider:      f.name,
+		Number:        4242 + f.number,
+		URL:           "https://github.com/kuhlman-labs/fishhawk/issues/4242",
+		AppliedLabels: req.Item.Classification.Labels,
+		Boarded:       true,
+	}, nil
+}
+
+// registerFakeChildNumberProvider registers a child-number-capable fake under
+// the default provider id so the handler's workmgmt.Get + EpicChildrenQuerier
+// assert resolve it.
+func registerFakeChildNumberProvider(t *testing.T, p *fakeChildNumberProvider) {
+	t.Helper()
+	if p.name == "" {
+		p.name = workmgmt.Default().Provider
+	}
+	workmgmt.Register(p)
+}
+
+// TestFileWorkItem_ChildNumberDiscovered is the cross-boundary done-means seam
+// (handler -> EpicChildrenQuerier -> NextChildNumber -> rendered title): a
+// feature filing with parent_epic and no title_vars.n discovers the epic's
+// existing children server-side and files the next number, [E7.3]. It also
+// asserts EpicChildren was called with the right epic ref + target — the source
+// swap guard from the plan's risk note.
+func TestFileWorkItem_ChildNumberDiscovered(t *testing.T) {
+	fp := &fakeChildNumberProvider{children: []workmgmt.EpicChild{
+		{Number: 501, Title: "[E7.1] first child"},
+		{Number: 502, Title: "[E7.2] second child"},
+	}}
+	registerFakeChildNumberProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Discover my number",
+		TitleVars: map[string]string{"epic": "7"}, // n omitted -> discovered
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if fp.epicCalls != 1 {
+		t.Fatalf("EpicChildren called %d times, want 1", fp.epicCalls)
+	}
+	if fp.epicReq.Epic != "#389" {
+		t.Errorf("EpicChildren req.Epic = %q, want #389", fp.epicReq.Epic)
+	}
+	if fp.epicReq.Target.Repo.Owner != "kuhlman-labs" || fp.epicReq.Target.Repo.Name != "fishhawk" {
+		t.Errorf("EpicChildren req.Target.Repo = %+v, want kuhlman-labs/fishhawk", fp.epicReq.Target.Repo)
+	}
+	if fp.lastFileReq.Item.Title != "[E7.3] Discover my number" {
+		t.Errorf("filed title = %q, want [E7.3] Discover my number (max(1,2)+1)", fp.lastFileReq.Item.Title)
+	}
+	if resp := decodeWorkItem(t, rec); resp.Title != "[E7.3] Discover my number" {
+		t.Errorf("response title = %q, want [E7.3] Discover my number", resp.Title)
+	}
+}
+
+// TestFileWorkItem_ChildNumberExplicitOverride asserts a caller-supplied n
+// short-circuits discovery — EpicChildren is NOT called and the caller's value
+// is rendered verbatim (the override contract, mirroring existing_numbers).
+func TestFileWorkItem_ChildNumberExplicitOverride(t *testing.T) {
+	fp := &fakeChildNumberProvider{children: []workmgmt.EpicChild{{Title: "[E7.9] would yield 10"}}}
+	registerFakeChildNumberProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Caller knows the number",
+		TitleVars: map[string]string{"epic": "7", "n": "3"},
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if fp.epicCalls != 0 {
+		t.Errorf("EpicChildren called %d times, want 0 (explicit n overrides discovery)", fp.epicCalls)
+	}
+	if fp.lastFileReq.Item.Title != "[E7.3] Caller knows the number" {
+		t.Errorf("filed title = %q, want the caller's n rendered verbatim", fp.lastFileReq.Item.Title)
+	}
+}
+
+// TestFileWorkItem_ChildNumberDiscoveryErrorFailsClosed asserts a genuine
+// EpicChildren error fails the filing closed with 422 work_item_invalid
+// carrying details.n_discovery_failed, and NO issue is created (File is never
+// dispatched — no orphan issue).
+func TestFileWorkItem_ChildNumberDiscoveryErrorFailsClosed(t *testing.T) {
+	fp := &fakeChildNumberProvider{epicErr: errors.New("sub-issues API exploded")}
+	registerFakeChildNumberProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Discovery will fail",
+		TitleVars: map[string]string{"epic": "7"},
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error.Code != "work_item_invalid" {
+		t.Errorf("code = %q, want work_item_invalid", env.Error.Code)
+	}
+	if got, _ := env.Error.Details["n_discovery_failed"].(string); got == "" || !strings.Contains(got, "sub-issues API exploded") {
+		t.Errorf("details.n_discovery_failed = %v, want it to carry the cause", env.Error.Details["n_discovery_failed"])
+	}
+	if fp.fileCalls != 0 {
+		t.Error("provider File dispatched despite a fail-closed discovery error")
+	}
+}
+
+// TestFileWorkItem_ChildNumberProviderWithoutCapability asserts a provider that
+// does NOT implement EpicChildrenQuerier + an omitted n falls through to
+// Apply's renderTitle missing-placeholder 422 unchanged (byte-compatible with
+// the pre-#1958 contract), listing 'n' in missing_placeholders. Discovery never
+// ran, so the 422 is NOT enriched with n_discovery_failed.
+func TestFileWorkItem_ChildNumberProviderWithoutCapability(t *testing.T) {
+	fp := &fakeWorkProvider{} // File-only, no EpicChildrenQuerier capability
+	registerFakeProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "No discovery capability",
+		TitleVars: map[string]string{"epic": "7"},
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error.Code != "work_item_invalid" {
+		t.Errorf("code = %q, want work_item_invalid", env.Error.Code)
+	}
+	missing, _ := env.Error.Details["missing_placeholders"].([]any)
+	sawN := false
+	for _, m := range missing {
+		if str, _ := m.(string); str == "n" {
+			sawN = true
+		}
+	}
+	if !sawN {
+		t.Errorf("missing_placeholders = %v, want it to list 'n'", env.Error.Details["missing_placeholders"])
+	}
+	if _, present := env.Error.Details["n_discovery_failed"]; present {
+		t.Errorf("details must NOT carry n_discovery_failed (no discovery ran): %v", env.Error.Details)
+	}
+	if fp.called {
+		t.Error("provider File dispatched despite an unresolved {n}")
+	}
+}
+
+// TestFileWorkItem_ChildNumberFirstChild asserts the first-child path: an epic
+// with no matching children yields [E7.1], NOT a crash nor a wrong number.
+func TestFileWorkItem_ChildNumberFirstChild(t *testing.T) {
+	fp := &fakeChildNumberProvider{children: nil}
+	registerFakeChildNumberProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "The first child",
+		TitleVars: map[string]string{"epic": "7"},
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if fp.lastFileReq.Item.Title != "[E7.1] The first child" {
+		t.Errorf("filed title = %q, want [E7.1] (first child of the epic)", fp.lastFileReq.Item.Title)
+	}
+}
+
+// TestFileWorkItem_ChildNumberConcurrentFilingsDistinct is binding condition (1):
+// two parallel omitted-n filings against the SAME epic must serialize through
+// the per-epic in-process lock and file DISTINCT consecutive numbers ([E7.3] and
+// [E7.4]) — never a collision on [E7.3].
+func TestFileWorkItem_ChildNumberConcurrentFilingsDistinct(t *testing.T) {
+	fp := &fakeChildNumberProvider{
+		children:     []workmgmt.EpicChild{{Title: "[E7.1] existing"}, {Title: "[E7.2] existing"}},
+		appendOnFile: true,
+	}
+	registerFakeChildNumberProvider(t, fp)
+	s := New(Config{})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := fileWorkItem(t, s, workItemRequest{
+				Repo:      "kuhlman-labs/fishhawk",
+				Type:      "feature",
+				Summary:   "Concurrent",
+				TitleVars: map[string]string{"epic": "7"},
+				Relations: &workItemRelations{ParentEpic: "#389"},
+			}, "github:operator")
+			if rec.Code != http.StatusCreated {
+				t.Errorf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+			}
+		}()
+	}
+	wg.Wait()
+
+	fp.mu.Lock()
+	titles := append([]string(nil), fp.filedTitles...)
+	fp.mu.Unlock()
+	if len(titles) != 2 {
+		t.Fatalf("filed %d titles, want 2: %v", len(titles), titles)
+	}
+	seen := map[string]bool{}
+	for _, tl := range titles {
+		seen[tl] = true
+	}
+	if !seen["[E7.3] Concurrent"] || !seen["[E7.4] Concurrent"] {
+		t.Errorf("filed titles = %v, want the distinct consecutive [E7.3] and [E7.4]", titles)
 	}
 }

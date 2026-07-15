@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/google/jsonschema-go/jsonschema"
 )
 
 // --- fishhawk_file_issue (#1005) ---
@@ -275,5 +277,26 @@ func TestFileIssue_SurfacesLabelCompleteness(t *testing.T) {
 	}
 	if strings.Join(out.Item.MissingLabelNamespaces, ",") != "area" {
 		t.Errorf("MissingLabelNamespaces = %v, want [area]", out.Item.MissingLabelNamespaces)
+	}
+}
+
+// TestFileIssue_SchemaTitleVarsNamesAutoDerivedN is binding condition (2): the
+// advertised file_issue jsonschema — the SAME jsonschema.For inference AddTool
+// uses — must name the auto-derived {n} in the title_vars description, so a
+// driving agent reads that {n} need not be supplied for a child type (#1958).
+func TestFileIssue_SchemaTitleVarsNamesAutoDerivedN(t *testing.T) {
+	schema, err := jsonschema.For[FileIssueInput](nil)
+	if err != nil {
+		t.Fatalf("infer FileIssueInput schema: %v", err)
+	}
+	tv, ok := schema.Properties["title_vars"]
+	if !ok || tv == nil {
+		t.Fatalf("title_vars property missing from advertised schema")
+	}
+	if !strings.Contains(tv.Description, "{n}") {
+		t.Errorf("title_vars description must name {n}: %q", tv.Description)
+	}
+	if !strings.Contains(strings.ToLower(tv.Description), "auto-derived") {
+		t.Errorf("title_vars description must state {n} is auto-derived: %q", tv.Description)
 	}
 }

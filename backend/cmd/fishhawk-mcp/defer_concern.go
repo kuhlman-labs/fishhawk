@@ -11,14 +11,14 @@ import (
 
 // DeferConcernInput is the fishhawk_defer_concern tool's input schema
 // (E22.X / #1202). Mirrors `POST /v0/concerns/{concern_id}/defer`.
-// concern_id is required; parent_epic + n are the only NON-derivable
-// title coordinates the operator supplies (the follow-up's epic
-// placement is an operator judgment) — the entire body is auto-drafted
-// from the concern server-side.
+// concern_id is required; parent_epic is the epic placement the operator
+// supplies (the follow-up's epic roll-up is an operator judgment) — the
+// entire body, and now the {n} child number (#1958), are derived
+// server-side.
 type DeferConcernInput struct {
 	ConcernID  string   `json:"concern_id" jsonschema:"the stable concern UUID to defer (from fishhawk_get_run_status's run.concerns.items[].id)"`
 	ParentEpic string   `json:"parent_epic" jsonschema:"the epic the follow-up rolls up to (an issue reference like '#1196'); its leading [E<n>] title token is fetched to derive the {epic} title placeholder. Operator judgment — not derivable from the concern"`
-	N          string   `json:"n" jsonschema:"the child number for the [E<epic>.<n>] title (e.g. '4'); operator judgment, mirroring how fishhawk_file_issue takes {n}"`
+	N          string   `json:"n,omitempty" jsonschema:"OPTIONAL child number for the [E<epic>.<n>] title (e.g. '4'). The backend now discovers it server-side from the parent epic's existing children (open and closed) and allocates the next one, so you no longer have to guess it (#1958). Pass n only to override that discovery"`
 	Type       string   `json:"type,omitempty" jsonschema:"optional override of the auto-selected work-item type (bug for a defect category, else chore)"`
 	Labels     []string `json:"labels,omitempty" jsonschema:"optional labels merged on top of the type's default labels"`
 	Note       string   `json:"note,omitempty" jsonschema:"optional operator addendum folded into the follow-up body and the concern's state_reason"`
@@ -75,16 +75,19 @@ The defer:
     any issue is filed, and a filing failure leaves the concern OPEN so
     you can retry.
 
-You supply only the title coordinates the concern cannot carry: parent_epic
-(the epic the follow-up rolls up to) and n (the child number) — exactly
-what fishhawk_file_issue requires. type defaults to bug for a defect
-category, else chore; labels are merged on top of the type defaults.
+You supply only the epic placement the concern cannot carry: parent_epic
+(the epic the follow-up rolls up to). The {n} child number is discovered
+server-side from the parent epic's existing children (open and closed) and
+the next one allocated (#1958) — you no longer have to guess it; pass n only
+to override that discovery. type defaults to bug for a defect category, else
+chore; labels are merged on top of the type defaults.
 
 Inputs:
   - concern_id  : the stable concern UUID, from fishhawk_get_run_status's
     run.concerns.items[].id.
   - parent_epic : the epic issue reference (e.g. "#1196").
-  - n           : the child number for the [E<epic>.<n>] title.
+  - n           : OPTIONAL child number for the [E<epic>.<n>] title; derived
+    server-side when omitted, supplied only to override.
   - type, labels, note : optional overrides / addendum.
 
 Returns the filed follow-up issue (number, url, title, applied labels) and

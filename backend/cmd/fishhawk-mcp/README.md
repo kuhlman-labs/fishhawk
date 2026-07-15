@@ -426,7 +426,7 @@ Inputs:
 |---|---|---|
 | `concern_id` | **yes** | The stable concern UUID, from `fishhawk_get_run_status`'s `run.concerns.items[].id`. |
 | `parent_epic` | **yes** | The epic the follow-up rolls up to (an issue reference like `#1196`); its leading `[E<n>]` title token is fetched to derive the `{epic}` placeholder. Operator judgment — not derivable from the concern. |
-| `n` | **yes** | The child number for the `[E<epic>.<n>]` title. Operator judgment, mirroring how `fishhawk_file_issue` takes `{n}`. |
+| `n` | no | The child number for the `[E<epic>.<n>]` title. Discovered server-side (#1958) from the parent epic's existing children (open and closed) and the next one allocated, so you no longer have to guess it — pass `n` only to override. |
 | `type` | no | Override the auto-selected work-item type (`bug` for a defect category, else `chore`). |
 | `labels` | no | Labels merged on top of the type's default labels. |
 | `note` | no | Operator addendum folded into the follow-up body and the concern's `state_reason`. |
@@ -638,7 +638,7 @@ Inputs:
 | `summary` | **yes** | The mandatory one-liner: fills the `{summary}` title placeholder and is the required Summary field. |
 | `repo` | falls back to env | Target repo as `owner/name`; defaults to `GITHUB_REPOSITORY` when omitted (the in-runner case). |
 | `body` | no | Verbatim body; when omitted the body is assembled from the type's skeleton + `sections`. |
-| `sections` / `title_vars` | no | Per-skeleton-section content and extra title placeholders (e.g. `epic`, `n`). An unresolved title placeholder fails the filing. |
+| `sections` / `title_vars` | no | Per-skeleton-section content and extra title placeholders (e.g. `epic`, `n`). An unresolved title placeholder fails the filing. For a child type whose `title_format` is `[E{epic}.{n}]`, BOTH `{epic}` AND the `{n}` child number are auto-derived from the `parent_epic` relation server-side (#1958), so `title_vars` can be omitted entirely — supply `n` only to override the auto-derived child number. |
 | `labels` / `complexity` / `status` | no | Merged on / overriding the type's defaults; `complexity` must be a declared level. |
 | `relations` | no | `{parent_epic, supersedes[], companion_to[], evidence_runs[], depends_on[]}` — resolved into the provider's link operations. `depends_on` is the issue-level dependency edge (issue refs among the epic's children) a campaign reads to assemble its wave DAG (ADR-047); it is persisted as a `Depends on: #X, #Y` body marker and validated format-only at file time (cycle/existence checks deferred to campaign-assembly time). |
 | `existing_numbers` | no | Numbers already in use for a numbered type (e.g. `adr`), so the next sequential number can be allocated. |

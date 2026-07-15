@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 // deferServer wires the run + audit + concern repos plus a GitHub client
@@ -473,5 +474,47 @@ func TestDeferConcern_LabelCompleteness(t *testing.T) {
 	}
 	if !containsStr2(resp.Issue.AppliedLabels, "autonomy:medium") {
 		t.Errorf("response issue applied_labels = %v, want it to include autonomy:medium", resp.Issue.AppliedLabels)
+	}
+}
+
+// TestDeferConcern_ChildNumberDiscovered proves the shared applyAndFileWorkItem
+// child-number hook (#1958) covers the defer surface end-to-end: a defer with n
+// OMITTED files the follow-up with the discovered next child number and
+// transitions the concern to deferred. The explicit-n defer tests above stay
+// green unchanged, proving the override path is unaffected.
+func TestDeferConcern_ChildNumberDiscovered(t *testing.T) {
+	s, repo, _, cr, _ := deferServer(t)
+	// Override the default File-only fake with an EpicChildrenQuerier-capable
+	// provider so the shared hook can discover {n}. The epic title derivation
+	// resolves {epic}=22 from the wired GitHub client ("[E22] The parent epic").
+	fp := &fakeChildNumberProvider{children: []workmgmt.EpicChild{
+		{Title: "[E22.1] first"}, {Title: "[E22.2] second"},
+	}}
+	registerFakeChildNumberProvider(t, fp)
+
+	runID, stageID := uuid.New(), uuid.New()
+	seedDeferRun(repo, runID)
+	row := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 100, "flush the buffer on shutdown")
+
+	w := postDefer(t, s, row.ID.String(), deferConcernRequest{
+		ParentEpic: "#389", // n OMITTED -> discovered server-side
+		Note:       "track separately",
+	}, withAuth)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp deferConcernResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if fp.epicCalls != 1 {
+		t.Errorf("EpicChildren called %d times, want 1 (n discovered)", fp.epicCalls)
+	}
+	if resp.Issue.Title != "[E22.3] flush the buffer on shutdown" {
+		t.Errorf("issue title = %q, want the discovered [E22.3] title", resp.Issue.Title)
+	}
+	if resp.Concern.State != "deferred" {
+		t.Errorf("concern state = %q, want deferred", resp.Concern.State)
 	}
 }
