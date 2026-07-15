@@ -7600,6 +7600,87 @@ func TestGetStagePrompt_LivenessFlip_CASRefusesConcurrentPark(t *testing.T) {
 	}
 }
 
+// Mode (viii) #1912: a version-skewed / raced spawn can present the stage still
+// parked at 'awaiting_host_dispatch' (the runner spawned but its host-dispatch
+// marker call was skipped or lost a race). The authenticated prompt fetch is
+// proof a runner is alive, so the flip defensively walks
+// awaiting_host_dispatch → dispatched → running. On the plain (non-CAS) repo
+// that is two TransitionStage calls.
+func TestGetStagePrompt_LivenessFlip_AwaitingHostDispatchWalksToRunning(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID, stageID, priv := seedFlipRun(t, rr, sf, run.StageStateAwaitingHostDispatch)
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(rr.transitionStageCalls) != 2 {
+		t.Fatalf("transition calls = %d, want 2 (awaiting_host_dispatch→dispatched→running)", len(rr.transitionStageCalls))
+	}
+	if got := rr.transitionStageCalls[0]; got.To != run.StageStateDispatched || got.StageID != stageID {
+		t.Fatalf("step 1 = {stage:%s to:%s}, want {stage:%s to:dispatched}", got.StageID, got.To, stageID)
+	}
+	if got := rr.transitionStageCalls[1]; got.To != run.StageStateRunning || got.StageID != stageID {
+		t.Fatalf("step 2 = {stage:%s to:%s}, want {stage:%s to:running}", got.StageID, got.To, stageID)
+	}
+}
+
+// Mode (ix) #1912: on a CAS-capable repo the defensive walk anchors BOTH steps
+// via TransitionStageFrom — awaiting_host_dispatch→dispatched then
+// dispatched→running — so a concurrent cancel/reap refuses atomically at either
+// step rather than being stomped.
+func TestGetStagePrompt_LivenessFlip_AwaitingHostDispatchWalksViaCAS(t *testing.T) {
+	inner := newPromptRunRepo()
+	cas := &promptCASRunRepo{promptRunRepo: inner}
+	s, sf, _ := newPromptServerRepo(t, cas)
+	runID, stageID, priv := seedFlipRun(t, inner, sf, run.StageStateAwaitingHostDispatch)
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(cas.fromCalls) != 2 {
+		t.Fatalf("CAS calls = %d, want 2 (awaiting_host_dispatch→dispatched→running via CAS)", len(cas.fromCalls))
+	}
+	if got := cas.fromCalls[0]; got.From != run.StageStateAwaitingHostDispatch || got.To != run.StageStateDispatched {
+		t.Fatalf("step 1 = %s→%s, want awaiting_host_dispatch→dispatched", got.From, got.To)
+	}
+	if got := cas.fromCalls[1]; got.From != run.StageStateDispatched || got.To != run.StageStateRunning {
+		t.Fatalf("step 2 = %s→%s, want dispatched→running", got.From, got.To)
+	}
+	if len(inner.transitionStageCalls) != 0 {
+		t.Fatalf("plain TransitionStage calls = %d, want 0 (CAS path preferred)", len(inner.transitionStageCalls))
+	}
+}
+
+// Mode (x) #1912: a refusal on the FIRST step (awaiting_host_dispatch→dispatched)
+// — a concurrent cancel landing the park — fails open: the prompt is still
+// served and the second dispatched→running step is NOT attempted (the walk
+// returns after the first-step failure, never advancing a park it does not own).
+func TestGetStagePrompt_LivenessFlip_AwaitingHostDispatchFirstStepRefusesFailsOpen(t *testing.T) {
+	inner := newPromptRunRepo()
+	cas := &promptCASRunRepo{
+		promptRunRepo: inner,
+		fromErr: run.StageStateChangedError{
+			Expected: run.StageStateAwaitingHostDispatch,
+			Actual:   run.StageStateCancelled,
+		},
+	}
+	s, sf, _ := newPromptServerRepo(t, cas)
+	runID, stageID, priv := seedFlipRun(t, inner, sf, run.StageStateAwaitingHostDispatch)
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (first-step refusal is best-effort):\n%s", w.Code, w.Body.String())
+	}
+	if len(cas.fromCalls) != 1 {
+		t.Fatalf("CAS calls = %d, want exactly 1 (only the awaiting_host_dispatch→dispatched step; the walk returns on its failure)", len(cas.fromCalls))
+	}
+	if got := cas.fromCalls[0]; got.From != run.StageStateAwaitingHostDispatch || got.To != run.StageStateDispatched {
+		t.Fatalf("CAS call = %s→%s, want awaiting_host_dispatch→dispatched", got.From, got.To)
+	}
+}
+
 // Mode (vii): the flip is plan-mandated to fire AFTER signature verification
 // but BEFORE prompt construction, so a handler failure that occurs after a
 // successful flip still leaves the stage persisted as 'running'. Here a

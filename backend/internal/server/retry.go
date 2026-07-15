@@ -634,8 +634,13 @@ func (s *Server) recordDriveRetryStage(ctx context.Context, stageType run.StageT
 			// no entry rather than a bogus next action.
 			return
 		}
-		adv.To = string(stageType) + ":pending"
-		adv.Event = "failed " + string(stageType) + " stage retried; runner_kind local parks for a host-side re-dispatch"
+		// #1912: the local park is now the explicit awaiting_host_dispatch
+		// state — the retry re-opens to pending and the orchestrator Advance
+		// handoff above walks pending → awaiting_host_dispatch for a
+		// runner_kind-locked local run. Name that state in the drive-audit To
+		// string (was the pre-split '<stage>:pending').
+		adv.To = string(stageType) + ":awaiting_host_dispatch"
+		adv.Event = "failed " + string(stageType) + " stage retried; runner_kind local parks the stage at awaiting_host_dispatch for a host-side re-dispatch"
 		adv.Parked = true
 		adv.NextAction = out.NextAction
 	}

@@ -1513,8 +1513,15 @@ components:
         state:
           type: string
           enum:
-            [pending, dispatched, running, awaiting_approval, succeeded,
-             failed, cancelled]
+            [pending, awaiting_host_dispatch, dispatched, running,
+             awaiting_approval, succeeded, failed, cancelled]
+          description: |
+            `awaiting_host_dispatch` is the parked-for-host-spawn state
+            (#1912): a runner_kind-locked-`local` agent stage the backend wants
+            executed but cannot spawn (ADR-024). It is cleared to `dispatched`
+            by the host-dispatch marker (POST
+            `/v0/runs/{run_id}/stages/{stage_id}/host-dispatch`). Post-#1912
+            `dispatched` unambiguously means a spawn attempt exists.
         started_at:
           type: [string, "null"]
           format: date-time
@@ -4906,6 +4913,96 @@ paths:
           description: |
             The run or audit repositories are not wired
             (`reap_failure_unconfigured`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/stages/{stage_id}/host-dispatch:
+    post:
+      operationId: hostDispatchStage
+      summary: Mark a host-local spawn attempt so a parked stage becomes 'dispatched'
+      description: |
+        The spawn marker for a runner_kind-locked-`local` run (#1912). The
+        backend cannot spawn the host-local runner (ADR-024), so
+        `orchestrator.dispatchStage` parks an agent stage at
+        `awaiting_host_dispatch` rather than `dispatched`. The MCP host-spawn
+        verbs (`fishhawk_run_stage`, `fishhawk_dispatch_stage`,
+        `fishhawk_drive_run`) call this endpoint fail-closed IMMEDIATELY BEFORE
+        spawning the runner, so post-#1912 `dispatched` unambiguously means "a
+        spawn attempt exists".
+
+        It CAS-transitions `{pending, awaiting_host_dispatch} → dispatched`:
+
+        - `awaiting_host_dispatch → dispatched` — the parked-local common case.
+        - `pending → dispatched` — the first plan-stage spawn, which today sits
+          at `pending` until trace time; marking it here stamps the spawn
+          signal at spawn time.
+
+        **Idempotent.** A stage already `dispatched` returns 200 with
+        `transitioned: false` — the legal manual re-dispatch of a stage whose
+        spawned runner died; the caller proceeds and re-spawns.
+
+        **Not admissible.** A `running`, terminal, or any `awaiting_*` gate
+        state returns 409 `dispatch_not_admissible` so a live or settled stage
+        can never be re-marked as a fresh spawn.
+
+        **Authorization.** Requires an authenticated identity carrying
+        `write:runs` (anonymous → 401; a token without the scope → 403). The
+        operator/MCP token that drives dispatch already carries it.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: |
+            The marker was processed. `transitioned` is `true` when this call
+            drove the stage `pending|awaiting_host_dispatch → dispatched`,
+            `false` on the idempotent already-`dispatched` no-op.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [transitioned, stage_state]
+                properties:
+                  transitioned:
+                    type: boolean
+                    description: True when this call transitioned the stage to dispatched.
+                  stage_state:
+                    type: string
+                    description: The resulting stage state (always `dispatched` on 200).
+        '400':
+          description: |
+            A malformed `run_id` or `stage_id` path value
+            (`validation_failed`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            The identity lacks `write:runs` scope (`insufficient_scope`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `stage_not_found` — no stage with that id, or the stage's
+            `run_id` does not match the path `run_id` (inconsistent handle).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `dispatch_not_admissible` — the stage is in a `running`, terminal,
+            or `awaiting_*` gate state, so a fresh spawn marker cannot be
+            applied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            The run repository is not wired (`host_dispatch_unconfigured`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

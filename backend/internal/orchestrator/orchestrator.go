@@ -1168,9 +1168,13 @@ const (
 // succeeded, and it also forbids re-issuing an already-passed transition, so
 // walkAcceptanceToSucceededFrom starts from the stage's CURRENT state: Advance
 // always finds the stage pending, but a local operator host dispatch may find it
-// parked at 'dispatched' (#1928).
+// parked at 'awaiting_host_dispatch' (#1912, was the conflated 'dispatched'
+// park pre-#1928) or, for a migration-missed legacy row, at 'dispatched'.
+// awaiting_host_dispatch is inserted between pending and dispatched so a park
+// walks awaiting_host_dispatch → dispatched → running → succeeded.
 var acceptanceStateWalkOrder = []run.StageState{
 	run.StageStatePending,
+	run.StageStateAwaitingHostDispatch,
 	run.StageStateDispatched,
 	run.StageStateRunning,
 	run.StageStateSucceeded,
@@ -1270,8 +1274,9 @@ func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run
 // whose plan is out-of-scope / empty-criteria) settles server-side WITHOUT
 // spawning a runner that would fail category-C acceptance_target_unreachable.
 //
-// The target must be an acceptance stage in a dispatch-admissible state (pending
-// or the local 'dispatched' park); every other state — already-settled,
+// The target must be an acceptance stage in a dispatch-admissible state (pending,
+// the local 'awaiting_host_dispatch' park, or a legacy 'dispatched' park); every
+// other state — already-settled,
 // non-acceptance, an unknown stage id — returns (nil, nil) as a no-op, which the
 // endpoint renders short_circuited:false and the caller's own spawn path handles
 // as today. On a hit it walks the stage to succeeded, emits the matching audit,
@@ -1299,11 +1304,14 @@ func (o *Orchestrator) TryShortCircuitAcceptance(ctx context.Context, runID, sta
 	if target == nil {
 		return nil, nil
 	}
-	// Dispatch-admissible only: pending, or the local 'dispatched' park an
-	// operator host dispatch may find (the state walk skips the already-passed
-	// transitions). Any other state — already succeeded/failed, a run in flight
-	// — is a non-admissible no-op (short_circuited:false), never a state change.
-	if target.State != run.StageStatePending && target.State != run.StageStateDispatched {
+	// Dispatch-admissible only: pending, the local 'awaiting_host_dispatch' park
+	// (#1912) an operator host dispatch finds, or a legacy 'dispatched' park a
+	// migration missed (the state walk skips the already-passed transitions). Any
+	// other state — already succeeded/failed, a run in flight — is a
+	// non-admissible no-op (short_circuited:false), never a state change.
+	if target.State != run.StageStatePending &&
+		target.State != run.StageStateAwaitingHostDispatch &&
+		target.State != run.StageStateDispatched {
 		return nil, nil
 	}
 	sc, err := o.tryShortCircuitAcceptanceCore(ctx, r, stages, target)
@@ -2461,6 +2469,31 @@ func (o *Orchestrator) dispatchStage(ctx context.Context, r *run.Run, next *run.
 			slog.String("run_id", r.ID.String()),
 			slog.String("stage_id", next.ID.String()),
 			slog.Int("sequence", next.Sequence),
+		)
+		return OutcomeDispatched, nil
+	}
+
+	// #1912: a runner_kind-locked-local agent stage cannot be spawned by the
+	// backend (the runner is host-spawned per ADR-024). Park it in
+	// awaiting_host_dispatch instead of dispatched. Post-#1912 'dispatched'
+	// unambiguously means a spawn attempt EXISTS; the host-dispatch marker
+	// endpoint (or an MCP spawn verb calling it) flips awaiting_host_dispatch →
+	// dispatched at the moment of the spawn. This is the SINGLE write site for
+	// the park: every local park — plan-approved dispatch, retry_reopen, fixup
+	// re-open, revise replan, children dispatch — flows through Advance →
+	// dispatchStage, so this one branch covers every drive rule. Engages ONLY on
+	// the LOCKED state (RunnerKindResolved == true); an un-resolved run falls
+	// through to the normal dispatched + fireDispatch path, whose own
+	// locked-local skip (see fireDispatch) remains the defensive backstop.
+	if r.RunnerKindResolved && r.RunnerKind == run.RunnerKindLocal {
+		if _, err := o.Runs.TransitionStage(ctx, next.ID, run.StageStateAwaitingHostDispatch, nil); err != nil {
+			return OutcomeNoOp, fmt.Errorf("orchestrator: park stage awaiting host dispatch: %w", err)
+		}
+		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator parked agent stage awaiting host dispatch (runner_kind=local)",
+			slog.String("run_id", r.ID.String()),
+			slog.String("stage_id", next.ID.String()),
+			slog.Int("sequence", next.Sequence),
+			slog.String("executor", string(next.ExecutorKind)),
 		)
 		return OutcomeDispatched, nil
 	}

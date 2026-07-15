@@ -3998,6 +3998,11 @@ func TestSubmitApproval_Drive_Local_ParksWithNextAction(t *testing.T) {
 	if !adv.Parked {
 		t.Error("Parked = false, want true for runner_kind local")
 	}
+	// #1912: the parked To string now names the explicit awaiting_host_dispatch
+	// state the orchestrator wrote, not the pre-split 'implement:ready'.
+	if adv.To != "implement:awaiting_host_dispatch" {
+		t.Errorf("To = %q, want implement:awaiting_host_dispatch", adv.To)
+	}
 	if adv.NextAction == nil || adv.NextAction.Action != "run_implement_stage" {
 		t.Fatalf("NextAction = %+v, want action run_implement_stage", adv.NextAction)
 	}
