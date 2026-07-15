@@ -30,11 +30,12 @@ The child connection sits behind a small `childTransport` seam so a later phase 
 
 ```sh
 claude mcp remove fishhawk    # drop the existing plain fishhawk-mcp entry, if any
-claude mcp add fishhawk --command /path/to/bin/fishhawk-mcp-shim \
-  --env FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN
+claude mcp add fishhawk \
+  -e FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN \
+  -- /path/to/bin/fishhawk-mcp-shim
 ```
 
-The registration mirrors the sibling [`fishhawk-mcp`](../fishhawk-mcp/README.md#install-operators) form — `--command` with the token wired through `--env` — just pointed at the shim binary. With the standard `bin/` layout no `--child` flag is needed. Run `/mcp` once after re-registering so the session picks up the shim; from then on child rebuilds hot-swap with no further `/mcp`.
+The registration mirrors the sibling [`fishhawk-mcp`](../fishhawk-mcp/README.md#install-operators) form — the binary path given positionally after the `--` separator, with the token wired through `-e`/`--env` — just pointed at the shim binary. With the standard `bin/` layout no `--child` flag is needed. Run `/mcp` once after re-registering so the session picks up the shim; from then on child rebuilds hot-swap with no further `/mcp`.
 
 The shim adds no auth of its own: it passes `FISHHAWK_API_TOKEN` / `FISHHAWK_BACKEND_URL` straight through to the child, so the child needs them in its environment. Wire `FISHHAWK_API_TOKEN` via `--env` as above (and `FISHHAWK_BACKEND_URL` too when it is not the default `http://localhost:8080`).
 
