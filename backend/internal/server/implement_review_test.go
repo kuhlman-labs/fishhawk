@@ -403,8 +403,10 @@ func TestShipTrace_ImplementReview_GateEvidenceThreadedIntoPrompt(t *testing.T) 
 // TestShipTrace_ImplementReview_NoGateEvidence_PromptUnchanged asserts the
 // fail-open contract (#963): a bundle WITHOUT a gate_evidence event (every
 // pre-#963 bundle, every no-gate stage) dispatches the review with no Gate
-// evidence section and the original non-goals preamble — absent evidence
-// never blocks or alters the dispatch.
+// evidence section — absent evidence never blocks or alters the dispatch. Per
+// ADR-059 / #1883 that no-evidence dispatch now threads the inverted default:
+// the captured reviewer prompt carries the no-evidence preamble and the
+// enabled correctness lens end-to-end.
 func TestShipTrace_ImplementReview_NoGateEvidence_PromptUnchanged(t *testing.T) {
 	reviewer := &fakePlanReviewer{
 		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
@@ -429,8 +431,11 @@ func TestShipTrace_ImplementReview_NoGateEvidence_PromptUnchanged(t *testing.T) 
 	if strings.Contains(got, "### Gate evidence") {
 		t.Errorf("no-evidence bundle must not render a Gate evidence section:\n%s", got)
 	}
-	if !strings.Contains(got, "Mechanical correctness is already gated upstream") {
-		t.Errorf("no-evidence prompt must keep the original non-goals preamble:\n%s", got)
+	if !strings.Contains(got, "**No machine-verified gate evidence accompanies this diff.**") {
+		t.Errorf("no-evidence prompt must render the inverted no-evidence preamble:\n%s", got)
+	}
+	if !strings.Contains(got, "Correctness on the paths the diff touches (enabled — no gate evidence is held for this run)") {
+		t.Errorf("no-evidence prompt must render the enabled correctness lens:\n%s", got)
 	}
 }
 
