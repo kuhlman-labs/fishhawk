@@ -5175,6 +5175,9 @@ func mintImplementToken(ctx context.Context, cfg config, client uploadClient, is
 // to self-sufficient fresh-token auth only when a token actually mints.
 func mintBaseAuthToken(ctx context.Context, cfg config, client uploadClient, issued *upload.IssuedKey, logSink io.Writer) string {
 	if client == nil || issued == nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"base_auth_token_unavailable","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+			cfg.runID, cfg.stageID, "nil upload client or unissued signing key")
 		return ""
 	}
 	token, err := mintImplementToken(ctx, cfg, client, issued, logSink)

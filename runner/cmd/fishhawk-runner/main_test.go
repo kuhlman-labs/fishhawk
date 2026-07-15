@@ -6199,6 +6199,44 @@ func TestRun_Fixup_BaseTokenMintFailure_DegradesNotFails(t *testing.T) {
 	}
 }
 
+// TestMintBaseAuthToken_NilDependency_DegradesWithEvent pins the #1951 nil-guard
+// degrade branch: a nil upload client or unissued signing key must NOT return ""
+// silently — it emits the same base_auth_token_unavailable event as the mint-error
+// path so a later ambient-auth 401 is correlatable, then returns "" for ambient
+// degrade. This is the only degrade path the run()-level tests don't reach (the
+// mainline call sites always have a non-nil client and issued key).
+func TestMintBaseAuthToken_NilDependency_DegradesWithEvent(t *testing.T) {
+	cfg := config{runID: "run-1", stageID: "stage-1"}
+	fu := newFakeUploader(t)
+	issued := &upload.IssuedKey{}
+
+	cases := []struct {
+		name   string
+		client uploadClient
+		issued *upload.IssuedKey
+	}{
+		{"nil client", nil, issued},
+		{"nil issued key", fu, nil},
+		{"both nil", nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var log strings.Builder
+			got := mintBaseAuthToken(context.Background(), cfg, tc.client, tc.issued, &log)
+			if got != "" {
+				t.Errorf("mintBaseAuthToken = %q, want \"\" (ambient degrade)", got)
+			}
+			out := log.String()
+			if !strings.Contains(out, `"event":"base_auth_token_unavailable"`) {
+				t.Errorf("nil-guard degrade emitted no base_auth_token_unavailable event:\n%s", out)
+			}
+			if !strings.Contains(out, `"run_id":"run-1"`) || !strings.Contains(out, `"stage_id":"stage-1"`) {
+				t.Errorf("degrade event missing run/stage correlation ids:\n%s", out)
+			}
+		})
+	}
+}
+
 // TestRun_Fixup_BaseMismatch_FailsBeforeAgentInvoke: when the fetched
 // branch tip differs from the backend-advertised fixup_expected_head_sha,
 // the runner fails fast — the agent is NEVER invoked, the mismatch event
