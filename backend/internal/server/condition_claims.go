@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -44,7 +45,9 @@ const CategoryConcernAddressedByCondition = "concern_addressed_by_condition"
 //   - a duplicate id in the list -> 400;
 //   - each id must parse as a UUID, resolve via GetByIDs, belong to THIS
 //     stage's run, be a plan-stage concern, and be in an OPEN state — the
-//     first violation 400s naming the offending id.
+//     first violation 400s naming the offending id. A GetByIDs infrastructure
+//     error (store outage, not a missing row) is a 500 internal_error, not a
+//     400: a transient failure is retryable, not an operator-corrected id.
 func (s *Server) validateClaimsConcernIDs(w http.ResponseWriter, r *http.Request, stage *run.Stage, decision string, ids []string) bool {
 	if len(ids) == 0 {
 		return true
@@ -90,9 +93,22 @@ func (s *Server) validateClaimsConcernIDs(w http.ResponseWriter, r *http.Request
 	for i, cid := range parsed {
 		rows, gerr := s.cfg.ConcernRepo.GetByIDs(r.Context(), []uuid.UUID{cid})
 		if gerr != nil {
-			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-				"claims_concern_ids references a concern that does not exist",
-				map[string]any{"field": "claims_concern_ids", "concern_id": ids[i]})
+			// GetByIDs errors ErrNotFound on a missing row (an operator-actionable
+			// bad id -> 400) but returns an infrastructure error on a store outage.
+			// Collapsing the latter into 400 misreports a transient failure as a bad
+			// concern id, pointing the operator at re-reading gate-view ids instead
+			// of retrying. Mirror waive.go: ErrNotFound -> 400 here (a claimed id
+			// that resolves to no row is a validation failure, not a 404), any other
+			// error -> 500 internal_error.
+			if errors.Is(gerr, concern.ErrNotFound) {
+				s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+					"claims_concern_ids references a concern that does not exist",
+					map[string]any{"field": "claims_concern_ids", "concern_id": ids[i]})
+				return false
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"claims_concern_ids validation could not read the concern store",
+				map[string]any{"field": "claims_concern_ids", "concern_id": ids[i], "error": gerr.Error()})
 			return false
 		}
 		row := rows[0]

@@ -226,6 +226,62 @@ func TestResolveConditionClaimedPlanConcerns_ImplementStageRowSkipped(t *testing
 	}
 }
 
+func TestResolveConditionClaimedPlanConcerns_ApplyResolutionFailureAfterAppend(t *testing.T) {
+	au := newAuditFake()
+	base := newFakeConcernRepo()
+	// ApplyResolution fails AFTER the audit entry has appended — a state change
+	// (e.g. a reopen) raced the hook between the IsOpen read and the transition.
+	cr := &raceConcernRepo{
+		fakeConcernRepo: base,
+		applyErr:        concern.InvalidTransitionError{From: concern.StateRaised, To: concern.StateAddressedByCondition},
+	}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+
+	runID, stageID := uuid.New(), uuid.New()
+	row := seedConcernRow(t, base, runID, stageID, concern.StageKindPlan, 5, "condition")
+	seedApprovalEntry(au, runID, 42, "approve", "brett", []string{row.ID.String()})
+
+	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve")
+
+	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
+	if rows[0].State != concern.StateRaised {
+		t.Errorf("state = %q, want raised (ApplyResolution failed, the row stays open)", rows[0].State)
+	}
+	// The append-first ordering means the lineage entry already exists even
+	// though the transition failed. A later confirming round re-fires the hook
+	// (the row is still open) and appends a SECOND entry for the same concern —
+	// pinning the documented duplicate-entry nuance so a downstream consumer of
+	// the audit category is not surprised by it.
+	if n := len(auditEntriesByCategory(au, CategoryConcernAddressedByCondition)); n != 1 {
+		t.Fatalf("concern_addressed_by_condition entries = %d, want 1 after the first failed transition", n)
+	}
+	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 300, "gpt-5.5", "approve")
+	if n := len(auditEntriesByCategory(au, CategoryConcernAddressedByCondition)); n != 2 {
+		t.Errorf("concern_addressed_by_condition entries = %d, want 2 (a still-open row re-appends on the next round)", n)
+	}
+}
+
+func TestResolveConditionClaimedPlanConcerns_CrossRunRowSkipped(t *testing.T) {
+	s, au, cr := conditionClaimsServer(t)
+	runID := uuid.New()
+	otherRunID, stageID := uuid.New(), uuid.New()
+	// Defense-in-depth: a plan-stage concern from ANOTHER run (which the
+	// approve-time gate would have rejected) must never be resolved by this
+	// run's condition claim — the RunID side of the cross-run/kind guard.
+	row := seedConcernRow(t, cr, otherRunID, stageID, concern.StageKindPlan, 5, "another run's plan concern")
+	seedApprovalEntry(au, runID, 42, "approve", "brett", []string{row.ID.String()})
+
+	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve")
+
+	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
+	if rows[0].State != concern.StateRaised {
+		t.Errorf("state = %q, want raised (a cross-run row is never resolved by a condition claim)", rows[0].State)
+	}
+	if n := len(auditEntriesByCategory(au, CategoryConcernAddressedByCondition)); n != 0 {
+		t.Errorf("concern_addressed_by_condition entries = %d, want 0 for a cross-run row", n)
+	}
+}
+
 func TestResolveConditionClaimedPlanConcerns_SecondRoundIdempotent(t *testing.T) {
 	s, au, cr := conditionClaimsServer(t)
 	runID, stageID := uuid.New(), uuid.New()
