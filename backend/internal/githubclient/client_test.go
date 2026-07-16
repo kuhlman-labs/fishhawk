@@ -98,6 +98,9 @@ type fakeGitHub struct {
 	listPullsStatus int
 	listPullsBody   string
 
+	mergePullStatus int
+	mergePullBody   string
+
 	graphqlStatus int
 	graphqlBody   string
 
@@ -153,6 +156,8 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 		closePullRequestBody:      `{"number":42,"node_id":"PR_kwDOABcDEf","state":"closed","head":{"sha":"abc123"}}`,
 		listPullsStatus:           http.StatusOK,
 		listPullsBody:             `[]`,
+		mergePullStatus:           http.StatusOK,
+		mergePullBody:             `{"sha":"deadbeef","merged":true,"message":"Pull Request successfully merged"}`,
 		graphqlStatus:             http.StatusOK,
 		graphqlBody:               `{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":42,"url":"https://github.com/x/y/pull/42","state":"OPEN"}}}}`,
 		getInstallationStatus:     http.StatusOK,
@@ -367,6 +372,16 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			w.WriteHeader(fg.listPullsStatus)
 			if fg.listPullsBody != "" {
 				_, _ = io.WriteString(w, fg.listPullsBody)
+			}
+		})
+
+	mux.HandleFunc("PUT /repos/{owner}/{repo}/pulls/{number}/merge",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.mergePullStatus)
+			if fg.mergePullBody != "" {
+				_, _ = io.WriteString(w, fg.mergePullBody)
 			}
 		})
 
@@ -1938,6 +1953,138 @@ func TestEnableAutoMerge_GraphQLError_AsValidation(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Pull request is in clean status") {
 		t.Errorf("err should surface graphql message: %v", err)
+	}
+	// The clean-status class ALSO wraps ErrPullRequestCleanStatus so the
+	// operator merge path can fall back to a synchronous REST merge on it
+	// (#1954), while still satisfying errors.Is(err, ErrValidation) above.
+	if !errors.Is(err, ErrPullRequestCleanStatus) {
+		t.Errorf("clean-status err should wrap ErrPullRequestCleanStatus, got %v", err)
+	}
+}
+
+// TestEnableAutoMerge_NonCleanGraphQLError_NotCleanStatus asserts a NON
+// clean-status graphql rejection stays ErrValidation only — the clean-status
+// sentinel must NOT be attached to an unrelated enable failure, so the merge
+// fallback fires exclusively on the already-merge-ready case.
+func TestEnableAutoMerge_NonCleanGraphQLError_NotCleanStatus(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.graphqlBody = `{"errors":[{"message":"Auto-merge is not allowed for this repository","type":"UNPROCESSABLE"}]}`
+	c, _ := newTestClient(t, srv, nil)
+
+	err := c.EnableAutoMerge(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 42, MergeMethodSquash)
+	if err == nil || !errors.Is(err, ErrValidation) {
+		t.Errorf("err = %v, want ErrValidation", err)
+	}
+	if errors.Is(err, ErrPullRequestCleanStatus) {
+		t.Errorf("non-clean-status err must NOT wrap ErrPullRequestCleanStatus, got %v", err)
+	}
+}
+
+func TestMergePullRequest_HappyPath_SquashBody(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	if err := c.MergePullRequest(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash); err != nil {
+		t.Fatalf("MergePullRequest: %v", err)
+	}
+	if fg.gotMethod != http.MethodPut {
+		t.Errorf("method = %q, want PUT", fg.gotMethod)
+	}
+	if fg.gotPath != "/repos/x/y/pulls/7/merge" {
+		t.Errorf("path = %q, want /repos/x/y/pulls/7/merge", fg.gotPath)
+	}
+	// REST spells the strategy lower-case (distinct from the GraphQL enum).
+	if !strings.Contains(string(fg.gotBody), `"merge_method":"squash"`) {
+		t.Errorf("body missing lower-cased squash merge_method:\n%s", fg.gotBody)
+	}
+}
+
+func TestMergePullRequest_DefaultsMethodToSquash(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	if err := c.MergePullRequest(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 7, ""); err != nil {
+		t.Fatalf("MergePullRequest: %v", err)
+	}
+	if !strings.Contains(string(fg.gotBody), `"merge_method":"squash"`) {
+		t.Errorf("empty method should default to squash:\n%s", fg.gotBody)
+	}
+}
+
+func TestMergePullRequest_NotMergeable405(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.mergePullStatus = http.StatusMethodNotAllowed
+	fg.mergePullBody = `{"message":"Pull Request is not mergeable"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	err := c.MergePullRequest(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash)
+	if err == nil || !errors.Is(err, ErrPullRequestNotMergeable) {
+		t.Errorf("err = %v, want ErrPullRequestNotMergeable", err)
+	}
+}
+
+func TestMergePullRequest_Conflict409(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.mergePullStatus = http.StatusConflict
+	fg.mergePullBody = `{"message":"Head branch was modified. Review and try the merge again."}`
+	c, _ := newTestClient(t, srv, nil)
+
+	err := c.MergePullRequest(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash)
+	if err == nil || !errors.Is(err, ErrMergeConflict) {
+		t.Errorf("err = %v, want ErrMergeConflict", err)
+	}
+}
+
+func TestMergePullRequest_NotFound404(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.mergePullStatus = http.StatusNotFound
+	fg.mergePullBody = `{"message":"Not Found"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	err := c.MergePullRequest(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash)
+	if err == nil || !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestMergePullRequest_Forbidden403(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.mergePullStatus = http.StatusForbidden
+	fg.mergePullBody = `{"message":"Resource not accessible by integration"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	err := c.MergePullRequest(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash)
+	if err == nil || !errors.Is(err, ErrForbidden) {
+		t.Errorf("err = %v, want ErrForbidden", err)
+	}
+}
+
+func TestMergePullRequest_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	cases := []struct {
+		name      string
+		repo      RepoRef
+		prNumber  int
+		wantSubst string
+	}{
+		{"missing owner", RepoRef{Name: "y"}, 1, "owner and name"},
+		{"missing name", RepoRef{Owner: "x"}, 1, "owner and name"},
+		{"zero pr", RepoRef{Owner: "x", Name: "y"}, 0, "pr number must be"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := c.MergePullRequest(context.Background(), 1, tc.repo, tc.prNumber, MergeMethodSquash)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
+			}
+		})
 	}
 }
 

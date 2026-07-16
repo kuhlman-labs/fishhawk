@@ -4510,6 +4510,122 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/runs/{run_id}/merge:
+    post:
+      operationId: mergeRun
+      summary: Record an operator merge verdict and queue the squash merge
+      description: |
+        The one-verb operator merge path (E48.7 / #1954). Records the
+        operator's merge verdict as a chained `merge_verdict_recorded` audit
+        entry (modeled on `vouch-commit`) and queues the squash merge through
+        the SAME merge seam the delegated `may_merge` arm of the auto-driver
+        uses — so the human merge and the delegated merge converge on one path.
+        The PR-approval review itself stays a `gh pr review --approve` step
+        under the operator's own GitHub identity (App-identity approval is
+        deferred to E39).
+
+        The endpoint does NOT wait for the merge to land: it only
+        ENABLES/queues GitHub's merge (a PR already merge-ready falls back to a
+        synchronous REST squash merge), and the `pr_merged` / run-completion
+        settle is left to the `pull_request`-closed webhook. The
+        `fishhawk_merge_run` MCP tool awaits the terminal run state client-side.
+
+        **Idempotent.** A repeated POST that finds an existing
+        `merge_verdict_recorded` row appends NO duplicate and responds
+        `already_recorded: true`, but ALWAYS re-dispatches the merge helper —
+        so a 502-then-reinvoke re-queues the merge without duplicating the
+        verdict.
+
+        **Authorization.** Operator-token-only. Requires `write:approvals`,
+        enforced unconditionally (a cookie-session operator without the scope
+        is rejected too). A run-bound MCP token (subject `mcp:run:<uuid>`) is
+        REJECTED OUTRIGHT 403 (`run_token_forbidden`), even for its own run —
+        an agent self-merging its PR would bypass the operator gate.
+
+        **Fail-closed.** The merge is refused (no verdict recorded) when the
+        run has no PR url or is failed/cancelled (`409 run_not_mergeable`),
+        when the acceptance gate does not admit a merge
+        (`409 acceptance_gate_not_passed`), or when the merge seam is
+        unconfigured (`503 merge_seam_unconfigured`). It deliberately does NOT
+        block on a review stage awaiting approval (that stage settles ON merge).
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        description: |
+          Carries the operator's merge verdict. `verdict` is required — the
+          merge is an audited operator declaration.
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [verdict]
+              properties:
+                verdict:
+                  type: string
+                  description: |
+                    Operator merge verdict prose. Recorded verbatim on the
+                    `merge_verdict_recorded` audit entry.
+      responses:
+        '200':
+          description: |
+            Merge verdict recorded (or already recorded) and the squash merge
+            queued through the merge seam.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  merge_queued: { type: boolean, description: 'True once the merge helper was dispatched.' }
+                  verdict_sequence: { type: integer, format: int64, description: 'Audit sequence of the merge_verdict_recorded entry.' }
+                  already_recorded: { type: boolean, description: 'True when a prior verdict row existed (an idempotent re-POST); no fresh row was appended.' }
+                  pr_url: { type: string, description: 'The run pull request url the merge was queued for.' }
+        '400':
+          description: |
+            Malformed body or an empty `verdict`. Body's `error` is
+            `validation_failed`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            One of two cases: (1) the identity lacks `write:approvals` — body
+            `error` is `insufficient_scope` (enforced unconditionally, no
+            cookie-session bypass); (2) a run-bound MCP token
+            (subject `mcp:run:<uuid>`) attempted the merge — body `error` is
+            `run_token_forbidden` (rejected outright, even for its own run).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            The run cannot be merged: no PR url or a failed/cancelled run
+            (`run_not_mergeable`), or the acceptance gate does not admit a
+            merge (`acceptance_gate_not_passed`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: |
+            The verdict row is recorded and durable, but queuing the squash
+            merge failed (`merge_dispatch_failed`); the merge is retryable — a
+            re-POST re-queues without duplicating the verdict.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            The run/audit repositories are not wired (`merge_unconfigured`) or
+            the merge seam is unconfigured (`merge_seam_unconfigured`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/runs/{run_id}/auto-drive:
     post:
       operationId: autoDriveRunGate
