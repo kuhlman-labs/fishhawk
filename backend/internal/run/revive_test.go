@@ -3,6 +3,7 @@ package run_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,6 +30,13 @@ type reviveRepo struct {
 	// run, so run.RetryStage's decomposed-parent restore (#1891) targets
 	// awaiting_children instead of pending.
 	hasChildren bool
+	// retryStageErr injects a RetryStage failure keyed by stage ID: when
+	// set for a stage, RetryStage returns the error BEFORE mutating that
+	// stage, modelling a mid-batch re-park failure (#1942).
+	retryStageErr map[uuid.UUID]error
+	// retryRunErr injects a RetryRun failure: when non-nil, RetryRun returns
+	// it without mutating, modelling a tail run-reopen failure (#1942).
+	retryRunErr error
 }
 
 func (r *reviveRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
@@ -70,6 +78,9 @@ func (r *reviveRepo) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.R
 }
 
 func (r *reviveRepo) RetryStage(_ context.Context, id uuid.UUID, to run.StageState) (*run.Stage, error) {
+	if err, ok := r.retryStageErr[id]; ok && err != nil {
+		return nil, err
+	}
 	for _, s := range r.stages {
 		if s.ID != id {
 			continue
@@ -89,6 +100,9 @@ func (r *reviveRepo) RetryStage(_ context.Context, id uuid.UUID, to run.StageSta
 }
 
 func (r *reviveRepo) RetryRun(_ context.Context, id uuid.UUID, to run.State) (*run.Run, error) {
+	if r.retryRunErr != nil {
+		return nil, r.retryRunErr
+	}
 	if r.run == nil || r.run.ID != id {
 		return nil, run.ErrNotFound
 	}
@@ -315,6 +329,154 @@ func TestReviveRun_ReparksEveryFailedStageOrdered(t *testing.T) {
 	}
 	if dec.Stages[1].RestoredState != run.StageStateAwaitingApproval {
 		t.Errorf("review restored to %q, want awaiting_approval", dec.Stages[1].RestoredState)
+	}
+}
+
+// TestReviveRun_MidBatchRetryStageFailureIsResumable pins the mid-batch
+// RetryStage-failure branch (#1942): the first stage re-parks, the second
+// stage's RetryStage fails, so the run is left partially re-parked. The
+// error carries the resume hint, and a SECOND ReviveRun re-parks only the
+// remaining failed stage without double-consuming the first stage's retry
+// budget.
+func TestReviveRun_MidBatchRetryStageFailureIsResumable(t *testing.T) {
+	implement := reviveStage(uuid.Nil, 1, run.StageTypeImplement, run.FailureA, "agent crashed")
+	review := reviveStage(uuid.Nil, 2, run.StageTypeReview, run.FailureD, "sla_timeout: 5h elapsed")
+	repo := reviveFailedRun(implement, review)
+
+	injected := errors.New("concurrent transition on review stage")
+	repo.retryStageErr = map[uuid.UUID]error{review.ID: injected}
+
+	_, err := run.ReviveRun(context.Background(), repo, repo.run.ID)
+	if !errors.Is(err, injected) {
+		t.Fatalf("err = %v, want wrapped injected error", err)
+	}
+	if !strings.Contains(err.Error(), "second revive resumes") {
+		t.Errorf("err = %q, want the partial-re-park resume hint", err)
+	}
+	// Partial state: the first stage is re-parked (pending, budget consumed);
+	// the second stage is still failed; the run is still failed.
+	if implement.State != run.StageStatePending {
+		t.Errorf("implement stage = %q, want pending (first stage re-parked)", implement.State)
+	}
+	if implement.SelfRetryCount != 1 {
+		t.Errorf("implement SelfRetryCount = %d, want 1", implement.SelfRetryCount)
+	}
+	if review.State != run.StageStateFailed {
+		t.Errorf("review stage = %q, want failed (its re-park failed)", review.State)
+	}
+	if repo.run.State != run.StateFailed {
+		t.Errorf("run = %q, want failed (reopen not reached)", repo.run.State)
+	}
+
+	// A second revive clears the injection and resumes: only the remaining
+	// failed review stage is re-parked, the run flips to running, and the
+	// already-re-parked implement stage's budget is NOT bumped again.
+	repo.retryStageErr = nil
+	dec, err := run.ReviveRun(context.Background(), repo, repo.run.ID)
+	if err != nil {
+		t.Fatalf("second ReviveRun: %v", err)
+	}
+	if dec.Resumed {
+		t.Errorf("Resumed = true, want false (this call performed a fresh re-park)")
+	}
+	if len(dec.Stages) != 1 {
+		t.Fatalf("restored %d stages, want 1 (only the remaining failed review)", len(dec.Stages))
+	}
+	if dec.Stages[0].StageType != run.StageTypeReview {
+		t.Errorf("restored stage = %s, want review", dec.Stages[0].StageType)
+	}
+	if dec.Stages[0].RestoredState != run.StageStateAwaitingApproval {
+		t.Errorf("review restored to %q, want awaiting_approval", dec.Stages[0].RestoredState)
+	}
+	if dec.Run.State != run.StateRunning {
+		t.Errorf("run = %q, want running", dec.Run.State)
+	}
+	if implement.SelfRetryCount != 1 {
+		t.Errorf("implement SelfRetryCount = %d, want STILL 1 (resume must not re-consume an already-re-parked stage's budget)", implement.SelfRetryCount)
+	}
+}
+
+// TestReviveRun_RetryRunTailFailureThenResume pins the tail RetryRun-failure
+// branch and its resume (#1942): every failed stage re-parks but the closing
+// RetryRun fails, leaving the run failed with zero failed stages. A second
+// ReviveRun takes the interrupted-revive resume branch — Resumed true, empty
+// Stages, run running — without bumping any stage's retry budget again.
+func TestReviveRun_RetryRunTailFailureThenResume(t *testing.T) {
+	implement := reviveStage(uuid.Nil, 1, run.StageTypeImplement, run.FailureA, "agent crashed")
+	review := reviveStage(uuid.Nil, 2, run.StageTypeReview, run.FailureD, "sla_timeout: elapsed")
+	repo := reviveFailedRun(implement, review)
+
+	injected := errors.New("run reopen lost the row lock")
+	repo.retryRunErr = injected
+
+	_, err := run.ReviveRun(context.Background(), repo, repo.run.ID)
+	if !errors.Is(err, injected) {
+		t.Fatalf("err = %v, want wrapped injected error", err)
+	}
+	if !strings.Contains(err.Error(), "second revive completes the reopen") {
+		t.Errorf("err = %q, want the tail-failure completion hint", err)
+	}
+	// Every failed stage is re-parked, but the run is still failed.
+	if implement.State != run.StageStatePending {
+		t.Errorf("implement stage = %q, want pending", implement.State)
+	}
+	if review.State != run.StageStateAwaitingApproval {
+		t.Errorf("review stage = %q, want awaiting_approval", review.State)
+	}
+	if repo.run.State != run.StateFailed {
+		t.Errorf("run = %q, want failed (reopen failed)", repo.run.State)
+	}
+
+	// Resume: zero failed stages remain, but a stage sits in a pre-dispatch
+	// park state, so the resume branch completes the reopen.
+	repo.retryRunErr = nil
+	dec, err := run.ReviveRun(context.Background(), repo, repo.run.ID)
+	if err != nil {
+		t.Fatalf("resume ReviveRun: %v", err)
+	}
+	if !dec.Resumed {
+		t.Errorf("Resumed = false, want true (this call completed an interrupted revive)")
+	}
+	if len(dec.Stages) != 0 {
+		t.Errorf("restored %d stages, want 0 (resume re-parks nothing)", len(dec.Stages))
+	}
+	if dec.Run.State != run.StateRunning {
+		t.Errorf("run = %q, want running", dec.Run.State)
+	}
+	if implement.SelfRetryCount != 1 || review.SelfRetryCount != 1 {
+		t.Errorf("SelfRetryCount = (%d, %d), want (1, 1) — resume must not bump budget a second time",
+			implement.SelfRetryCount, review.SelfRetryCount)
+	}
+}
+
+// TestReviveRun_ResumeRefusesWithoutPreDispatchParkedStage proves the resume
+// branch cannot reopen an ARBITRARY inconsistent run: a failed run with zero
+// failed stages and NO stage in a pre-dispatch park state still refuses with
+// ErrReviveNotApplicable (#1942).
+func TestReviveRun_ResumeRefusesWithoutPreDispatchParkedStage(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state run.StageState
+	}{
+		{"all succeeded", run.StageStateSucceeded},
+		{"a running stage", run.StageStateRunning},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stage := reviveStage(uuid.Nil, 0, run.StageTypeImplement, run.FailureA, "n/a")
+			stage.State = tc.state
+			stage.FailureCategory = nil
+			stage.FailureReason = nil
+			repo := reviveFailedRun(stage)
+
+			_, err := run.ReviveRun(context.Background(), repo, repo.run.ID)
+			if !errors.Is(err, run.ErrReviveNotApplicable) {
+				t.Fatalf("err = %v, want ErrReviveNotApplicable", err)
+			}
+			// The run must not have been reopened.
+			if repo.run.State != run.StateFailed {
+				t.Errorf("run = %q, want failed (resume branch must not reopen)", repo.run.State)
+			}
+		})
 	}
 }
 
