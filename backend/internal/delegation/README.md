@@ -7,7 +7,7 @@ Operator-agent delegation conditions (ADR-040 / #1026): evaluates each `operator
 The `Evaluator` answers each condition over narrow interfaces the server already holds (`run.Repository.ListStagesForRun`, `concern.Repository.ListOpenByRun`, `audit.Repository.ListForRunByCategory`):
 
 - `clean_dual_approval` — every configured reviewer verdict for the pending gate's stage is `approve`, counted within the LATEST `*_review_started`-delimited round per the drive settlement rule, AND zero open concerns.
-- `convergent_concerns` — implement round settled, no reject, ≥1 open concern.
+- `convergent_concerns` — implement round settled, no gating-authority reject, ≥1 open concern. Severity/verdict-aware (#1964): when every verdict is approve-class (no reject), an open concern must rank at or above the `route_fixup_min_severity` threshold (default `medium`; set `low` to restore route-on-any-concern) or the gate PARKS for the operator instead of auto-routing a full fix-up pass. A reject verdict BYPASSES the threshold — advisory arbitration (and the gating-reject page) are unchanged. An unrecognized concern severity ranks below `low` and parks (fail-closed).
 - `solo_low` — exactly one open concern, severity low.
 - `infra_flake` — latest failed stage is category-A with the #972 testcontainers start-flake signature — or the literal `verify_infra_flake_retry` marker — in its `FailureReason`, which embeds the verify output verbatim.
 - `gates_resolved_ci_green` — latest `run_auto_advanced` rule is `checks_green_awaiting_merge` + PR open + no pending gate + zero open concerns; evaluated/surfaced only — v0 has no backend merge endpoint to enforce it on.

@@ -220,7 +220,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 			return e.evalCleanDualApproval(ctx, runRow, wf, gated, open)
 		}},
 		{ActionRouteFixup, effective.MayRouteFixup, func() (bool, string, error) {
-			return e.evalConvergentConcerns(ctx, runRow, wf, open)
+			return e.evalConvergentConcerns(ctx, runRow, wf, effective, open)
 		}},
 		{ActionWaive, effective.MayWaive, func() (bool, string, error) {
 			return evalSoloLow(open), soloLowUnmetReason(open), nil
@@ -456,6 +456,43 @@ func reviewerRejectClass(wf *spec.Workflow) string {
 	}
 }
 
+// severityRank maps a planreview.ConcernSeverity string to its ordinal
+// rank (low=1, medium=2, high=3). Anything unrecognized ranks 0 — below
+// low — so a malformed/legacy severity row parks the gate rather than
+// spending a fix-up pass (fail-closed). The closed set is
+// planreview.AllConcernSeverities, enforced at verdict decode; an
+// out-of-set value can only arrive via a legacy/malformed concern row.
+func severityRank(severity string) int {
+	switch planreview.ConcernSeverity(severity) {
+	case planreview.SeverityLow:
+		return 1
+	case planreview.SeverityMedium:
+		return 2
+	case planreview.SeverityHigh:
+		return 3
+	default:
+		return 0
+	}
+}
+
+// routeFixupThreshold resolves the minimum open-concern severity RANK that
+// satisfies convergent_concerns when every implement-review verdict is
+// approve-class (#1964). It reads effective.RouteFixupMinSeverity and
+// defaults to medium (rank 2) when the value is absent OR out of the
+// closed low/medium/high enum — the out-of-enum case is reachable only via
+// campaign-override bytes, which bypass JSON-schema validation, so the
+// resolver defends against it by falling back to the documented default
+// rather than routing on a value the schema would have rejected. A nil
+// block also resolves to medium (the delegation-configured default).
+func routeFixupThreshold(effective *spec.OperatorAgent) int {
+	if effective != nil {
+		if r := severityRank(effective.RouteFixupMinSeverity); r > 0 {
+			return r
+		}
+	}
+	return severityRank(string(planreview.SeverityMedium))
+}
+
 // evalConvergentConcerns answers may_route_fixup's condition: the
 // implement-review round's verdicts are all in, no GATING-authority
 // reject is present, and at least one concern is open to route. Pinned
@@ -472,7 +509,16 @@ func reviewerRejectClass(wf *spec.Workflow) string {
 // evaluator reads — it arrives via plan_rejection / gate rejection, which
 // already pages — so reviewer_reject here means a gating-authority agent
 // reject specifically.
-func (e *Evaluator) evalConvergentConcerns(ctx context.Context, runRow *run.Run, wf *spec.Workflow, open []*concern.Concern) (bool, string, error) {
+//
+// Severity/verdict-aware tune (#1964): when NO reject verdict is present
+// (every verdict is approve-class), a fix-up auto-routes only when at
+// least one open concern ranks at or above the route_fixup_min_severity
+// threshold (default medium). A round whose sole open concern is below the
+// threshold parks for the operator instead of spending a full fix-up pass.
+// A reject verdict (necessarily advisory authority here, since a gating
+// reject already returned above) BYPASSES the threshold: the ADR-027
+// arbitration path stays met regardless of severities.
+func (e *Evaluator) evalConvergentConcerns(ctx context.Context, runRow *run.Run, wf *spec.Workflow, effective *spec.OperatorAgent, open []*concern.Concern) (bool, string, error) {
 	const cond = string(spec.ConditionConvergentConcerns)
 	configured, verdicts, started, err := e.reviewRound(ctx, runRow, wf, run.StageTypeImplement)
 	if err != nil {
@@ -485,15 +531,47 @@ func (e *Evaluator) evalConvergentConcerns(ctx context.Context, runRow *run.Run,
 		return false, fmt.Sprintf("%s: %d of %d reviewer verdicts received", cond, len(verdicts), configured), nil
 	}
 	gating := implementReviewAuthority(wf) == planreview.AuthorityGating
+	hasReject := false
 	for _, v := range verdicts {
-		if v == planreview.VerdictReject && gating {
-			return false, cond + ": a gating-authority reviewer rejected (" + spec.PageEventGatingReviewerReject + " pages the human)", nil
+		if v == planreview.VerdictReject {
+			if gating {
+				return false, cond + ": a gating-authority reviewer rejected (" + spec.PageEventGatingReviewerReject + " pages the human)", nil
+			}
+			hasReject = true
 		}
 	}
 	if len(open) == 0 {
 		return false, cond + ": 0 open concerns to route", nil
 	}
+	// With every verdict approve-class (no reject to arbitrate), only route
+	// when an open concern meets the severity threshold; otherwise park.
+	if !hasReject {
+		threshold := routeFixupThreshold(effective)
+		maxRank := 0
+		for _, c := range open {
+			if r := severityRank(c.Severity); r > maxRank {
+				maxRank = r
+			}
+		}
+		if maxRank < threshold {
+			return false, fmt.Sprintf("%s: all verdicts approve and every open concern is below the route_fixup_min_severity threshold (%s); parking for the operator (waive, defer, or route deliberately)", cond, thresholdName(threshold)), nil
+		}
+	}
 	return true, "", nil
+}
+
+// thresholdName renders a severity rank back to its low/medium/high name
+// for the unmet reason. Ranks outside the closed set render as medium (the
+// resolver's default), keeping the reason honest about the effective bar.
+func thresholdName(rank int) string {
+	switch rank {
+	case 1:
+		return string(planreview.SeverityLow)
+	case 3:
+		return string(planreview.SeverityHigh)
+	default:
+		return string(planreview.SeverityMedium)
+	}
 }
 
 // evalSoloLow answers may_waive's condition: exactly one open concern

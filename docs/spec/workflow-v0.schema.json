@@ -438,7 +438,12 @@
         "may_route_fixup": {
           "type": "string",
           "enum": ["convergent_concerns"],
-          "description": "The operator agent may route review concerns to a fixup when all reviewer verdicts are in, at least one concern is open, and no reviewer rejected."
+          "description": "The operator agent may route review concerns to a fixup when all reviewer verdicts are in, at least one concern is open, and no reviewer rejected. When every verdict is approve-class the auto-route additionally requires an open concern at or above route_fixup_min_severity (default medium); see that field."
+        },
+        "route_fixup_min_severity": {
+          "type": "string",
+          "enum": ["low", "medium", "high"],
+          "description": "Minimum open-concern severity that satisfies may_route_fixup's convergent_concerns condition when EVERY implement-review verdict is approve-class (approve / approve_with_concerns). Absent defaults to medium: a dual-approve round whose only open concern is low-severity parks for the operator instead of auto-routing a full fix-up pass (#1964). Set to low to restore the legacy route-on-any-concern behavior. A reject verdict BYPASSES the threshold — advisory arbitration and the gating-reject page are unchanged. Additive optional field within workflow-v0.x — accepted at every advertised version (the agent_version / executor.model precedent; no version enum bump)."
         },
         "may_waive": {
           "type": "string",

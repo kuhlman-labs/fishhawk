@@ -8486,8 +8486,12 @@ paths:
                     effective block delegates the route_fixup action
                     (fail-closed), 403 `delegation_condition_unmet` with
                     the named failed predicate when the implement-review
-                    round is unsettled, a reviewer rejected, or no
-                    concern is open. When met, the fix-up proceeds and
+                    round is unsettled, a gating-authority reviewer
+                    rejected, no concern is open, or — when every verdict
+                    is approve-class — every open concern is below the
+                    effective `route_fixup_min_severity` threshold
+                    (default `medium`; a reject verdict bypasses the
+                    threshold), #1964. When met, the fix-up proceeds and
                     the `stage_fixup_triggered` payload records
                     `delegated: "convergent_concerns"`. Omitted →
                     behavior byte-identical to today.
@@ -8561,8 +8565,11 @@ paths:
             #1026): `delegation_not_configured` when no effective
             `operator_agent` block delegates the route_fixup action
             (fail-closed), `delegation_condition_unmet` when the
-            `convergent_concerns` condition is not satisfied — `details`
-            names the exact failed predicate in `unmet_reason`.
+            `convergent_concerns` condition is not satisfied — including
+            an all-approve round whose open concerns are all below the
+            effective `route_fixup_min_severity` threshold (default
+            `medium`, #1964) — `details` names the exact failed predicate
+            in `unmet_reason`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
