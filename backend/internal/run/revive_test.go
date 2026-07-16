@@ -399,7 +399,9 @@ func TestReviveRun_MidBatchRetryStageFailureIsResumable(t *testing.T) {
 // TestReviveRun_RetryRunTailFailureThenResume pins the tail RetryRun-failure
 // branch and its resume (#1942): every failed stage re-parks but the closing
 // RetryRun fails, leaving the run failed with zero failed stages. A second
-// ReviveRun takes the interrupted-revive resume branch — Resumed true, empty
+// ReviveRun takes the interrupted-revive resume branch; if THAT RetryRun also
+// fails, the resume branch's own failure site keeps the run failed for a
+// further retry, and a third ReviveRun finally resumes — Resumed true, empty
 // Stages, run running — without bumping any stage's retry budget again.
 func TestReviveRun_RetryRunTailFailureThenResume(t *testing.T) {
 	implement := reviveStage(uuid.Nil, 1, run.StageTypeImplement, run.FailureA, "agent crashed")
@@ -425,6 +427,27 @@ func TestReviveRun_RetryRunTailFailureThenResume(t *testing.T) {
 	}
 	if repo.run.State != run.StateFailed {
 		t.Errorf("run = %q, want failed (reopen failed)", repo.run.State)
+	}
+
+	// A resume whose OWN RetryRun fails exercises the resume branch's error
+	// site (revive.go: "resume interrupted revive"): zero failed stages remain
+	// and a stage sits in a pre-dispatch park state, so this call takes the
+	// resume branch, but retryRunErr is still injected so the reopen does not
+	// land. The run stays failed and no stage's budget is bumped, so a further
+	// retry remains possible.
+	_, err = run.ReviveRun(context.Background(), repo, repo.run.ID)
+	if !errors.Is(err, injected) {
+		t.Fatalf("resume-branch RetryRun failure: err = %v, want wrapped injected error", err)
+	}
+	if !strings.Contains(err.Error(), "resume interrupted revive") {
+		t.Errorf("err = %q, want the resume-branch reopen-failure context", err)
+	}
+	if repo.run.State != run.StateFailed {
+		t.Errorf("run = %q, want failed (resume-branch reopen failed)", repo.run.State)
+	}
+	if implement.SelfRetryCount != 1 || review.SelfRetryCount != 1 {
+		t.Errorf("SelfRetryCount = (%d, %d), want (1, 1) — a failed resume must not bump budget",
+			implement.SelfRetryCount, review.SelfRetryCount)
 	}
 
 	// Resume: zero failed stages remain, but a stage sits in a pre-dispatch
