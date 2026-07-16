@@ -3148,6 +3148,24 @@ func seedImplementReviewStarted(t *testing.T, au *auditFake, runID, stageID uuid
 	}
 }
 
+// seedImplementReviewStartedSeq seeds an implement_review_started audit entry
+// keyed to (stageID, headSHA) directly into the fake's history with an explicit
+// Sequence, so the #1957 same-pass guard (which compares started sequences
+// against the pass's newest stage_fixup_triggered sequence) has real, ordered
+// sequences to reason over — AppendChained does not assign one.
+func seedImplementReviewStartedSeq(au *auditFake, runID, stageID uuid.UUID, headSHA string, seq int64) {
+	payload, _ := json.Marshal(map[string]any{
+		"head_sha": headSHA, "configured_agents": 1, "authority": "advisory",
+	})
+	rid := runID
+	sid := stageID
+	au.mu.Lock()
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &sid, Category: "implement_review_started", Sequence: seq, Payload: payload,
+	})
+	au.mu.Unlock()
+}
+
 // startedHeadSHAs returns the head_sha of every implement_review_started audit
 // entry recorded for the run, in append order.
 func startedHeadSHAs(t *testing.T, au *auditFake, runID uuid.UUID) []string {
@@ -3258,5 +3276,116 @@ func TestShipPullRequest_FixupPush_BackstopReReview_GitHubNotWired(t *testing.T)
 	defer reviewer.mu.Unlock()
 	if len(reviewer.calls) != 0 {
 		t.Errorf("reviewer invocations = %d, want 0 (GitHub-not-wired backstop must not review)", len(reviewer.calls))
+	}
+}
+
+// TestBackstopFixupReReview_TraceHookAlreadyRanForPass_NoOp pins the #1957
+// same-pass guard: when the fix-up's trace-time review hook (#793) already
+// dispatched THIS pass's round — keyed on the throwaway WIP-commit verify SHA,
+// a DIFFERENT string than the pushed PR head — an implement_review_started
+// entry exists AFTER the pass's stage_fixup_triggered entry, so the backstop
+// must NOT double-dispatch against the pushed head. This is the ff203d6e
+// double-dispatch; it fails on pre-#1957 code (guard (b) never matches the WIP
+// SHA, so the backstop fires a second round).
+func TestBackstopFixupReReview_TraceHookAlreadyRanForPass_NoOp(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+
+	const (
+		wipSHA    = "wip-verify-e0e052d1" // trace-time hook keyed on the throwaway WIP verify SHA
+		pushedSHA = "pushed-813616d6"     // the backstop keys on the pushed PR head
+	)
+	// The pass's trigger (seq 10) then the trace-time hook's started round keyed
+	// on the WIP SHA (seq 20, AFTER the trigger) — the ff203d6e normal-path shape.
+	seedFixupTriggeredSeq(au, runRow.ID, implStage.ID, 10)
+	seedImplementReviewStartedSeq(au, runRow.ID, implStage.ID, wipSHA, 20)
+
+	s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, pushedSHA, "base-old")
+	s.waitBackgroundReviews()
+
+	if got := startedHeadSHAs(t, au, runRow.ID); len(got) != 1 || got[0] != wipSHA {
+		t.Errorf("implement_review_started entries = %v, want only the seeded WIP-SHA round (same-pass guard must suppress the pushed-head re-dispatch)", got)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 0 {
+		t.Errorf("reviewer invocations = %d, want 0 (trace-time hook already ran this pass's round)", len(reviewer.calls))
+	}
+}
+
+// TestBackstopFixupReReview_NoStartedAfterTrigger_StillDispatches pins the
+// genuine #1932 miss survives the #1957 guard: a prior pass's started round
+// exists, then THIS pass's trigger, but the raw trace was routed to
+// failStageCategoryB before the review hook, so NO started entry landed after
+// the trigger. The same-pass guard passes through and the backstop still
+// dispatches — the regression guard for the original #1932 wedge fix.
+func TestBackstopFixupReReview_NoStartedAfterTrigger_StillDispatches(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+
+	const (
+		oldHead = "head-old-prior"
+		newHead = "head-new-pushed"
+	)
+	// Prior pass's started round (seq 10) BEFORE this pass's trigger (seq 20); no
+	// started entry after the trigger (the failStageCategoryB miss).
+	seedImplementReviewStartedSeq(au, runRow.ID, implStage.ID, oldHead, 10)
+	seedFixupTriggeredSeq(au, runRow.ID, implStage.ID, 20)
+
+	s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, newHead, "base-old")
+	s.waitBackgroundReviews()
+
+	started := startedHeadSHAs(t, au, runRow.ID)
+	if len(started) != 2 {
+		t.Fatalf("implement_review_started heads = %v, want 2 (seeded prior + backstop's new-head round)", started)
+	}
+	var sawNew bool
+	for _, h := range started {
+		if h == newHead {
+			sawNew = true
+		}
+	}
+	if !sawNew {
+		t.Errorf("no implement_review_started keyed to the new head %q: got %v (genuine #1932 miss must still dispatch)", newHead, started)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Errorf("reviewer invocations = %d, want 1 (genuine miss dispatches)", len(reviewer.calls))
+	}
+}
+
+// TestBackstopFixupReReview_TriggeredListError_FailsClosed pins the #1957
+// same-pass guard's fail-closed branch (guard (a2)): when the
+// stage_fixup_triggered ListForRunByCategory read errors, the backstop WARN-logs
+// and skips entirely rather than risk a double-dispatch under an unknown trigger
+// state. No implement_review_started for the new head lands and the reviewer is
+// never invoked — the load-bearing fail-closed posture the merge gate relies on
+// (an erroring audit store must not silently suppress OR double-fire the #1932
+// backstop).
+func TestBackstopFixupReReview_TriggeredListError_FailsClosed(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+
+	// A prior-head started round exists so guard (a)'s implement_review_started
+	// read succeeds and returns a non-empty ledger; the stage_fixup_triggered read
+	// then errors, tripping the (a2) fail-closed skip BEFORE any dispatch.
+	seedImplementReviewStarted(t, au, runRow.ID, implStage.ID, "head-old", time.Now().UTC())
+	s.cfg.AuditRepo = &categoryErrAuditRepo{
+		auditFake:   au,
+		errCategory: CategoryStageFixupTriggered,
+		err:         errors.New("audit store unavailable"),
+	}
+
+	s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, "head-new", "base-old")
+	s.waitBackgroundReviews()
+
+	if got := startedHeadSHAs(t, au, runRow.ID); len(got) != 1 || got[0] != "head-old" {
+		t.Errorf("implement_review_started entries = %v, want only the seeded [head-old] (triggered-list error must fail closed to no dispatch)", got)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 0 {
+		t.Errorf("reviewer invocations = %d, want 0 (triggered-list error must fail closed, not dispatch)", len(reviewer.calls))
 	}
 }

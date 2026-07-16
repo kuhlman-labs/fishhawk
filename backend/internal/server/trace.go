@@ -2725,6 +2725,17 @@ func (s *Server) DispatchConsolidatedReview(ctx context.Context, parentRunID uui
 // review_action_hint over-firing on the stale first verdict):
 //
 //	(a) AuditRepo nil → skip (the started ledger is unreadable).
+//	(a2) same-pass guard (#1957): ANY implement_review_started entry for the
+//	    stage recorded AFTER this pass's newest stage_fixup_triggered entry means
+//	    the trace-time hook (#793) already dispatched this pass's round — under
+//	    its OWN key, the throwaway WIP-commit verify SHA (bundle.ExtractHeadSHA),
+//	    a DIFFERENT namespace than the pushed PR head keyed here, so guard (b)
+//	    never matches and the backstop would double-dispatch the same content on
+//	    EVERY fix-up push. Skip. A list error on stage_fixup_triggered fails
+//	    closed to skip (WARN); with NO trigger entry for the stage the guard
+//	    passes through unchanged (the non-fix-up caller shape). The genuine #1932
+//	    miss (raw trace routed to failStageCategoryB before the review hook, so
+//	    no started entry after the trigger) is NOT caught and still dispatches.
 //	(b) an implement_review_started entry already exists for (stage, new head)
 //	    → the trace-time hook already dispatched for this head, so the backstop
 //	    is a no-op and review cost is unchanged (the normal path). A list error
@@ -2763,6 +2774,39 @@ func (s *Server) maybeBackstopFixupReReview(ctx context.Context, runID uuid.UUID
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stage.ID.String()),
 			slog.String("error", err.Error()))
+		return
+	}
+	// Same-pass guard (#1957): the fix-up's trace-time review hook (#793)
+	// dispatches THIS pass's re-review from the RAW trace variant, keyed on the
+	// throwaway WIP-commit verify SHA (documented on bundle.ExtractHeadSHA) — a
+	// DIFFERENT SHA namespace than the pushed PR head this backstop keys on, so
+	// guard (b) never matches on the normal path and the backstop would
+	// double-dispatch the same content on every fix-up push (the ff203d6e
+	// observation: started pairs at sequences 34951/34958 and 34998/35005). Skip
+	// when ANY implement_review_started entry for the stage was recorded AFTER
+	// this pass's newest stage_fixup_triggered entry — whatever SHA it keyed on,
+	// the trace-time hook already dispatched this pass's round. The genuine #1932
+	// miss (raw trace routed to failStageCategoryB before the review hook, so NO
+	// started entry after the trigger) still dispatches. A list error fails
+	// closed to skip (WARN), matching the backstop's fail-closed posture; when NO
+	// stage_fixup_triggered entry exists for the stage the guard passes through
+	// unchanged.
+	triggered, terr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageFixupTriggered)
+	if terr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup re-review backstop: list stage_fixup_triggered failed — skipping backstop",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", terr.Error()))
+		return
+	}
+	if triggerSeq, ok := newestFixupTriggeredSequence(triggered, stage.ID); ok &&
+		implementReviewStartedAfter(started, stage.ID, triggerSeq) {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"fixup re-review backstop: trace-time hook already dispatched this pass's round — skipping to avoid #1957 double-dispatch",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("head_sha", headSHA))
 		return
 	}
 	// (b) Normal path: the trace-time hook already dispatched for this head.
@@ -4677,6 +4721,42 @@ func newestImplementReviewStartedHead(entries []*audit.Entry, stageID uuid.UUID)
 		return "", false
 	}
 	return newestSHA, true
+}
+
+// newestFixupTriggeredSequence returns the Sequence of the newest
+// stage_fixup_triggered entry for the given stage, and whether ANY such entry
+// exists. Entries are append-ordered per ListForRunByCategory, so the last
+// stage-matching entry is the newest — the same keep-the-last scan
+// maybeRecoverFixupFailure uses. found==false means the stage has no fix-up
+// trigger at all (a non-fix-up caller shape), and the #1957 same-pass guard
+// then passes through.
+func newestFixupTriggeredSequence(entries []*audit.Entry, stageID uuid.UUID) (int64, bool) {
+	var seq int64
+	found := false
+	for _, e := range entries {
+		if e.StageID != nil && *e.StageID == stageID {
+			seq = e.Sequence
+			found = true
+		}
+	}
+	return seq, found
+}
+
+// implementReviewStartedAfter reports whether ANY implement_review_started entry
+// for the given stage carries a Sequence strictly greater than seq — the #1957
+// signal that this fix-up pass's trace-time review hook (#793) already
+// dispatched its round (whatever SHA it keyed on) after the pass's newest
+// stage_fixup_triggered entry.
+func implementReviewStartedAfter(entries []*audit.Entry, stageID uuid.UUID, seq int64) bool {
+	for _, e := range entries {
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		if e.Sequence > seq {
+			return true
+		}
+	}
+	return false
 }
 
 // ResolveDeploymentFromPollState records a delegating deploy stage's

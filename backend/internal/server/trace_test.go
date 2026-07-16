@@ -5748,6 +5748,67 @@ func TestNewestImplementReviewStartedHead(t *testing.T) {
 	})
 }
 
+// TestNewestFixupTriggeredSequence pins the #1957 same-pass guard helper: found
+// reflects whether ANY stage_fixup_triggered entry exists for the stage, and the
+// returned Sequence is the newest — the last stage-matching entry in append
+// order, mirroring maybeRecoverFixupFailure's keep-the-last scan.
+func TestNewestFixupTriggeredSequence(t *testing.T) {
+	stageID := uuid.New()
+	other := uuid.New()
+	mk := func(sid uuid.UUID, seq int64) *audit.Entry {
+		return &audit.Entry{StageID: &sid, Sequence: seq}
+	}
+
+	t.Run("no_entries_for_stage", func(t *testing.T) {
+		if _, found := newestFixupTriggeredSequence([]*audit.Entry{mk(other, 5)}, stageID); found {
+			t.Error("found=true for a stage with no trigger entries, want false (guard then passes through)")
+		}
+	})
+	t.Run("nil_stage_id_skipped", func(t *testing.T) {
+		if _, found := newestFixupTriggeredSequence([]*audit.Entry{{Sequence: 9}}, stageID); found {
+			t.Error("found=true for a nil-StageID entry, want false")
+		}
+	})
+	t.Run("last_stage_match_wins", func(t *testing.T) {
+		entries := []*audit.Entry{mk(stageID, 10), mk(other, 15), mk(stageID, 20)}
+		if seq, found := newestFixupTriggeredSequence(entries, stageID); !found || seq != 20 {
+			t.Errorf("got (%d,%v), want (20,true) — the last stage-matching entry", seq, found)
+		}
+	})
+}
+
+// TestImplementReviewStartedAfter pins the #1957 guard's after-trigger check:
+// true only when an implement_review_started entry for the stage carries a
+// Sequence strictly greater than the trigger sequence.
+func TestImplementReviewStartedAfter(t *testing.T) {
+	stageID := uuid.New()
+	other := uuid.New()
+	mk := func(sid uuid.UUID, seq int64) *audit.Entry {
+		return &audit.Entry{StageID: &sid, Sequence: seq}
+	}
+
+	t.Run("started_after_trigger", func(t *testing.T) {
+		if !implementReviewStartedAfter([]*audit.Entry{mk(stageID, 21)}, stageID, 20) {
+			t.Error("want true: a started entry at seq 21 is after trigger seq 20")
+		}
+	})
+	t.Run("started_before_trigger", func(t *testing.T) {
+		if implementReviewStartedAfter([]*audit.Entry{mk(stageID, 10)}, stageID, 20) {
+			t.Error("want false: a started entry at seq 10 is before trigger seq 20 (the genuine #1932 miss)")
+		}
+	})
+	t.Run("started_equal_trigger", func(t *testing.T) {
+		if implementReviewStartedAfter([]*audit.Entry{mk(stageID, 20)}, stageID, 20) {
+			t.Error("want false: strictly-greater, so an equal sequence does not count")
+		}
+	})
+	t.Run("other_stage_ignored", func(t *testing.T) {
+		if implementReviewStartedAfter([]*audit.Entry{mk(other, 99)}, stageID, 20) {
+			t.Error("want false: a different stage's started entry must not match")
+		}
+	})
+}
+
 // TestRunImplementReviews_ConcurrentDispatch_SingleStarted pins the #1932
 // check-and-start atomicity concern: the two dispatchers that can call
 // runImplementReviews for the SAME (stage, head) — the trace-time hook (#793)

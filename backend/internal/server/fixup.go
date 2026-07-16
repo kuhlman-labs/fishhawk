@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -418,24 +419,51 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// No-change refund (#967): a fix-up pass that produced no commit
-	// (fixup_no_changes audit entry, #856) is refunded against the NORMAL
-	// budget — the pass consumed a stage_fixup_triggered entry but changed
-	// nothing on the PR branch. Implemented by widening MaxPasses by the
-	// refunded count, which is equivalent to subtracting the refunds from
-	// the budget comparison (raw >= max+refunded ⟺ raw-refunded >= max)
-	// while HardCeiling keeps counting RAW triggered passes, so the
-	// absolute 3-pass cap is unaffected and a pathologically no-op'ing
-	// agent is still hard-stopped.
-	refundedPasses, err := s.countFixupNoChangeRefunds(r.Context(), stage.RunID, stageID)
+	// Delivered-nothing refund (#967 no-change + #1957 infra): a fix-up pass
+	// that landed NOTHING on the PR branch is refunded against the NORMAL
+	// budget — it consumed a stage_fixup_triggered entry but changed nothing.
+	// The refund keys on the DELIVERED-NOTHING invariant (the operator-approved
+	// boundary): a category-C death with nothing landed on the PR branch refunds
+	// regardless of whether the agent ran, NOT on the issue's literal pre-agent
+	// wording. Three shapes qualify:
+	//   - no-change (#967): a fixup_no_changes audit entry (#856) — the
+	//     re-dispatch ran but produced no commit.
+	//   - infra pre-agent-work (#1957): a category-C spawn-phase death inside the
+	//     pass's trigger window (a dispatch_reaper_failed with failure_category
+	//     "C", the #1747 spawn-phase reaper path) — the runner died on
+	//     infrastructure BEFORE the agent ran (e.g. run ff203d6e's
+	//     fixup_base_checkout, 13s, zero agent work).
+	//   - infra post-agent-work (#1957): a category-C recovery inside the pass's
+	//     window (a stage_fixup_recovered with source_failure_category "C", the
+	//     #788 recovery path) — the pass burned agent work but died category-C on
+	//     the push/report, so nothing landed on the PR branch. Under the
+	//     delivered-nothing invariant this STILL refunds (the operator's
+	//     DELIBERATE-ACCEPTANCE decision, superseding the earlier narrower
+	//     forced-override rationale) — see countFixupInfraRefunds.
+	// Implemented by widening MaxPasses by the summed refund count, equivalent
+	// to subtracting the refunds from the budget comparison
+	// (raw >= max+refunded ⟺ raw-refunded >= max), while HardCeiling keeps
+	// counting RAW triggered passes — so the absolute 3-pass cap is unaffected
+	// (a category-A/B failure or a pathologically no-op'ing agent is still
+	// hard-stopped, and no refund can ever extend the RAW ceiling).
+	noChangeRefunds, err := s.countFixupNoChangeRefunds(r.Context(), stage.RunID, stageID)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"count refunded fix-up passes failed", map[string]any{"error": err.Error()})
 		return
 	}
+	infraRefunds, err := s.countFixupInfraRefunds(r.Context(), stage.RunID, stageID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"count infra-refunded fix-up passes failed", map[string]any{"error": err.Error()})
+		return
+	}
+	refundedPasses := noChangeRefunds + infraRefunds
 	if refundedPasses > priorPasses {
 		// Defensive clamp: a refund can never exceed the passes actually
-		// triggered (would widen the budget past the configured max).
+		// triggered (would widen the budget past the configured max). Also the
+		// last-line defense against any unforeseen double-signal shape (the
+		// per-window pairing in countFixupInfraRefunds bounds it upstream).
 		refundedPasses = priorPasses
 	}
 
@@ -811,6 +839,120 @@ func (s *Server) countFixupNoChangeRefunds(ctx context.Context, runID, stageID u
 		}
 	}
 	return n, nil
+}
+
+// countFixupInfraRefunds returns the number of fix-up passes for the stage that
+// died category-C (infrastructure) WITHOUT delivering anything to the PR branch,
+// and are therefore refunded against the NORMAL budget alongside the #967
+// no-change refund (#1957). The refund keys on the DELIVERED-NOTHING invariant
+// (the operator-approved boundary, made explicit): a category-C death that landed
+// no commit on the PR branch consumed a stage_fixup_triggered entry but changed
+// nothing, so it is refunded regardless of whether it died before OR after the
+// agent ran. Two signal shapes qualify, both inside a pass's trigger window:
+//
+//   - a dispatch_reaper_failed entry with failure_category "C" — the #1747
+//     spawn-phase reaper path (run ff203d6e's fixup_base_checkout hit — 13s,
+//     zero agent work): the runner died on infrastructure BEFORE the agent ran.
+//   - a stage_fixup_recovered entry with source_failure_category "C" — the #788
+//     post-agent-work recovery path: the fix-up re-dispatch burned agent work
+//     but died category-C on the push/report (nothing landed on the PR branch)
+//     and was recovered back to the review gate. This STILL delivered nothing,
+//     so under the delivered-nothing invariant it STILL refunds (the operator's
+//     DELIBERATE-ACCEPTANCE decision, superseding the earlier #860 forced-override
+//     rationale: the RAW-trigger hard ceiling of defaultFixupCeiling — not the
+//     forced override — is the unconditional loop bound, and no refund can extend
+//     it).
+//
+// Each stage_fixup_triggered entry defines a window (trigger[i].Sequence,
+// trigger[i+1].Sequence) — open-ended for the newest trigger; a trigger is
+// refunded (count 1, regardless of how many signals land in its window) when at
+// least one such signal's Sequence falls inside it.
+//
+// The per-window pairing makes the refund per-PASS: a category-C signal sequenced
+// BEFORE the first trigger (an original-dispatch spawn death, not a fix-up)
+// matches no window and never refunds. Only category C refunds — category A
+// (agent) and category B (policy) failures still consume budget, matching the
+// delivered-nothing invariant the #967 no-change refund already encodes. Entries
+// are sequence-ascending per ListForRunByCategory, so the collected trigger
+// sequences form the window bounds directly.
+func (s *Server) countFixupInfraRefunds(ctx context.Context, runID, stageID uuid.UUID) (int, error) {
+	triggers, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageFixupTriggered)
+	if err != nil {
+		return 0, fmt.Errorf("list %s audit entries: %w", CategoryStageFixupTriggered, err)
+	}
+	var triggerSeqs []int64
+	for _, e := range triggers {
+		if e.StageID != nil && *e.StageID == stageID {
+			triggerSeqs = append(triggerSeqs, e.Sequence)
+		}
+	}
+	if len(triggerSeqs) == 0 {
+		return 0, nil
+	}
+
+	// Gather the category-C delivered-nothing death signals for the stage, by
+	// Sequence: the pre-agent-work reaper path AND the post-agent-work #788
+	// recovery path (both refund under the delivered-nothing invariant).
+	var signalSeqs []int64
+	reapers, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryDispatchReaperFailed)
+	if err != nil {
+		return 0, fmt.Errorf("list %s audit entries: %w", CategoryDispatchReaperFailed, err)
+	}
+	for _, e := range reapers {
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var p struct {
+			FailureCategory string `json:"failure_category"`
+		}
+		if json.Unmarshal(e.Payload, &p) != nil {
+			continue
+		}
+		if p.FailureCategory == string(run.FailureC) {
+			signalSeqs = append(signalSeqs, e.Sequence)
+		}
+	}
+	// The #788 post-agent-work recovery signal: a stage_fixup_recovered entry
+	// whose source_failure_category is "C". The agent ran but nothing landed on
+	// the PR branch, so it refunds under the same delivered-nothing invariant.
+	recovered, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryStageFixupRecovered)
+	if err != nil {
+		return 0, fmt.Errorf("list %s audit entries: %w", CategoryStageFixupRecovered, err)
+	}
+	for _, e := range recovered {
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var p struct {
+			SourceFailureCategory string `json:"source_failure_category"`
+		}
+		if json.Unmarshal(e.Payload, &p) != nil {
+			continue
+		}
+		if p.SourceFailureCategory == string(run.FailureC) {
+			signalSeqs = append(signalSeqs, e.Sequence)
+		}
+	}
+	if len(signalSeqs) == 0 {
+		return 0, nil
+	}
+
+	// Per-window pairing: at most one refund per trigger, regardless of how many
+	// signals land in its window.
+	refunds := 0
+	for i, lo := range triggerSeqs {
+		hi := int64(math.MaxInt64)
+		if i+1 < len(triggerSeqs) {
+			hi = triggerSeqs[i+1]
+		}
+		for _, sig := range signalSeqs {
+			if sig > lo && sig < hi {
+				refunds++
+				break
+			}
+		}
+	}
+	return refunds, nil
 }
 
 // selectConcerns validates the operator-selected indices against the

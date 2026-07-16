@@ -612,6 +612,80 @@ func seedFixupNoChanges(au *auditFake, stage *run.Stage) {
 		RunID: &rid, StageID: &sid, Category: "fixup_no_changes", Payload: payload})
 }
 
+// seedFixupTriggeredSeq seeds a stage_fixup_triggered audit entry directly into
+// the fake's history with an explicit Sequence (#1957) so the infra-refund
+// window logic — which pairs category-C death signals to per-pass trigger
+// windows by Sequence — has a real, ordered trigger to pair against.
+func seedFixupTriggeredSeq(au *auditFake, runID, stageID uuid.UUID, seq int64) {
+	payload, _ := json.Marshal(map[string]any{
+		"stage_id":    stageID.String(),
+		"prior_state": string(run.StageStateAwaitingApproval),
+	})
+	rid := runID
+	sid := stageID
+	au.mu.Lock()
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &sid, Category: CategoryStageFixupTriggered, Sequence: seq, Payload: payload})
+	au.mu.Unlock()
+}
+
+// seedDispatchReaperFailed seeds a dispatch_reaper_failed audit entry with the
+// given failure_category at an explicit Sequence (#1957) — the #1747
+// spawn-phase reaper death signal the infra refund keys on when the category is
+// "C".
+func seedDispatchReaperFailed(au *auditFake, runID, stageID uuid.UUID, cat run.FailureCategory, seq int64) {
+	payload, _ := json.Marshal(map[string]any{
+		"run_id":           runID.String(),
+		"stage_id":         stageID.String(),
+		"failure_category": string(cat),
+	})
+	rid := runID
+	sid := stageID
+	au.mu.Lock()
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &sid, Category: CategoryDispatchReaperFailed, Sequence: seq, Payload: payload})
+	au.mu.Unlock()
+}
+
+// seedFixupRecoveredC seeds a stage_fixup_recovered audit entry with the given
+// source_failure_category at an explicit Sequence (#1957) — the #788 recovery
+// death signal the infra refund keys on when the category is "C". This is the
+// post-agent-work shape: a FAILED fix-up re-dispatch recovered back to the
+// review gate.
+func seedFixupRecoveredC(au *auditFake, runID, stageID uuid.UUID, cat run.FailureCategory, seq int64) {
+	payload, _ := json.Marshal(map[string]any{
+		"stage_id":                stageID.String(),
+		"restored_state":          string(run.StageStateSucceeded),
+		"source_failure_category": string(cat),
+	})
+	rid := runID
+	sid := stageID
+	au.mu.Lock()
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &sid, Category: CategoryStageFixupRecovered, Sequence: seq, Payload: payload})
+	au.mu.Unlock()
+}
+
+// lastFixupTriggeredPayload returns the decoded payload of the most-recent
+// appended stage_fixup_triggered entry, the receipt the refund tests assert on.
+func lastFixupTriggeredPayload(t *testing.T, au *auditFake) map[string]any {
+	t.Helper()
+	var last *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == CategoryStageFixupTriggered {
+			last = &au.appended[i]
+		}
+	}
+	if last == nil {
+		t.Fatal("no stage_fixup_triggered entry appended")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(last.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	return payload
+}
+
 // TestFixupStage_NoChangeRefundAdmitsSecondPass: a fix-up pass whose
 // re-dispatch produced no commit (fixup_no_changes audit entry, #856) is
 // refunded against the NORMAL budget (#967), so a second trigger is
@@ -711,6 +785,217 @@ func TestFixupStage_NoChangeRefundNeverExtendsCeiling(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "fixup_ceiling_reached") {
 		t.Errorf("body missing fixup_ceiling_reached code: %s", w.Body.String())
+	}
+}
+
+// TestFixupStage_InfraRefundAdmitsSecondPass: a fix-up pass that died
+// category-C on a spawn-phase reaper (dispatch_reaper_failed, failure_category
+// "C", #1747) before delivering anything to the PR branch is refunded against
+// the NORMAL budget (#1957), so a second trigger is admitted WITHOUT
+// force_additional_pass and the refund is recorded on the audit payload.
+func TestFixupStage_InfraRefundAdmitsSecondPass(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+
+	// Pass 1 was triggered (seq 10) then its runner died category-C on a
+	// spawn-phase reaper (seq 12, inside the trigger's open-ended window).
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 10)
+	seedDispatchReaperFailed(au, stage.RunID, stage.ID, run.FailureC, 12)
+
+	// Pass 2: admitted without force — the infra-killed pass was refunded.
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, Reason: "retry after infra death"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("refunded second fixup status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := lastFixupTriggeredPayload(t, au)
+	if payload["refunded_passes"].(float64) != 1 {
+		t.Errorf("refunded_passes = %v, want 1", payload["refunded_passes"])
+	}
+	if payload["forced"] != false {
+		t.Errorf("forced = %v, want false — the refunded pass is within the normal budget", payload["forced"])
+	}
+}
+
+// TestFixupStage_InfraRefund_RecoveredCategoryC pins the post-agent-work
+// category-C recovery as REFUNDABLE (#1957, the operator's DELIBERATE-ACCEPTANCE
+// of the delivered-nothing invariant): a fix-up pass whose re-dispatch ran the
+// agent but FAILED category-C on the push/report and was recovered back to the
+// review gate (stage_fixup_recovered, source_failure_category "C", #788) landed
+// NOTHING on the PR branch. Under the delivered-nothing invariant it refunds
+// exactly like a spawn-phase reaper death — the RAW-trigger hard ceiling, not a
+// forced override, is the loop bound — so the second pass is admitted WITHOUT
+// force_additional_pass and the refund is recorded on the audit payload.
+func TestFixupStage_InfraRefund_RecoveredCategoryC(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 10)
+	seedFixupRecoveredC(au, stage.RunID, stage.ID, run.FailureC, 12)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, Reason: "retry after recovered category-C death"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("second fixup status = %d, want 200 (post-agent-work recovery delivered nothing, so it refunds):\n%s", w.Code, w.Body.String())
+	}
+	payload := lastFixupTriggeredPayload(t, au)
+	if payload["refunded_passes"].(float64) != 1 {
+		t.Errorf("refunded_passes = %v, want 1", payload["refunded_passes"])
+	}
+	if payload["forced"] != false {
+		t.Errorf("forced = %v, want false — the refunded pass is within the normal budget", payload["forced"])
+	}
+}
+
+// TestFixupStage_InfraRefund_CategoryBNotRefunded: a recovered pass whose
+// source failure was category B (policy) does NOT refund — only category C
+// (infrastructure) qualifies, so the second pass is refused with the normal
+// budget-exhausted code (#1957).
+func TestFixupStage_InfraRefund_CategoryBNotRefunded(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 10)
+	seedFixupRecoveredC(au, stage.RunID, stage.ID, run.FailureB, 12) // policy, not infra
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("second fixup status = %d, want 422 (category B does not refund):\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "fixup_budget_exhausted") {
+		t.Errorf("body missing fixup_budget_exhausted code: %s", w.Body.String())
+	}
+}
+
+// TestFixupStage_InfraRefund_PreTriggerReaperNotRefunded: a category-C reaper
+// death sequenced BEFORE the first (only) trigger — an original-dispatch spawn
+// death, not a fix-up pass — falls in no trigger window and never refunds
+// (#1957). The second pass is refused, budget-exhausted.
+func TestFixupStage_InfraRefund_PreTriggerReaperNotRefunded(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+
+	// The reaper (seq 5) precedes the fix-up trigger (seq 10): the death belongs
+	// to the original implement dispatch, not this fix-up pass — window (10,+inf)
+	// excludes it.
+	seedDispatchReaperFailed(au, stage.RunID, stage.ID, run.FailureC, 5)
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 10)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("second fixup status = %d, want 422 (pre-trigger reaper must not refund):\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "fixup_budget_exhausted") {
+		t.Errorf("body missing fixup_budget_exhausted code: %s", w.Body.String())
+	}
+}
+
+// TestFixupStage_InfraRefund_BothSignalsOneWindowRefundOnce: a reaper AND a
+// recovered entry, both category C, landing in ONE trigger window refund that
+// pass exactly ONCE, not twice (#1957 per-window pairing). Two RAW triggers are
+// seeded so the refunded>prior clamp cannot mask a double-count: the correct
+// single refund leaves the effective budget at 2 (raw 2 >= max 2 → 422), while
+// a double-count would widen it to 3 and wrongly ADMIT the pass.
+func TestFixupStage_InfraRefund_BothSignalsOneWindowRefundOnce(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 10)
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 20)
+	// Both C-death signals fall inside the FIRST trigger's window (10,20).
+	seedDispatchReaperFailed(au, stage.RunID, stage.ID, run.FailureC, 12)
+	seedFixupRecoveredC(au, stage.RunID, stage.ID, run.FailureC, 13)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("third fixup status = %d, want 422 — both signals in one window must refund only once (a double-count would admit):\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "fixup_budget_exhausted") {
+		t.Errorf("body missing fixup_budget_exhausted code: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"refunded_passes":1`) {
+		t.Errorf("budget-exhausted details must carry refunded_passes:1 (single refund), got: %s", w.Body.String())
+	}
+}
+
+// TestFixupStage_InfraRefundNeverExtendsCeiling: the infra refund applies to the
+// NORMAL budget only — the absolute hard ceiling keeps counting RAW
+// stage_fixup_triggered entries, so 3 triggered passes hard-stop the stage even
+// with an infra refund in play, even when forced (#1957, mirroring the #967
+// ceiling guarantee).
+func TestFixupStage_InfraRefundNeverExtendsCeiling(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+
+	// Three RAW triggered passes plus a category-C death inside the first
+	// window: the refund would widen the NORMAL budget but never the ceiling.
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 10)
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 20)
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 30)
+	seedDispatchReaperFailed(au, stage.RunID, stage.ID, run.FailureC, 12)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, ForceAdditionalPass: true})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 at the ceiling:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "fixup_ceiling_reached") {
+		t.Errorf("body missing fixup_ceiling_reached code (refund must not extend the ceiling): %s", w.Body.String())
+	}
+}
+
+// TestFixupStage_InfraRefundCountReadErrorFails500: the infra refund reads the
+// stage's dispatch_reaper_failed audit entries; a read failure there must
+// refuse the trigger with a 500 rather than silently treating the refund count
+// as 0. Only the dispatch_reaper_failed read errors — the earlier reads
+// (implement_reviewed, stage_fixup_triggered, fixup_no_changes) succeed,
+// pinning the failure to countFixupInfraRefunds.
+func TestFixupStage_InfraRefundCountReadErrorFails500(t *testing.T) {
+	repo := newApprovalRunRepo()
+	au := newAuditFake()
+	s := New(Config{
+		Addr:    "127.0.0.1:0",
+		RunRepo: repo,
+		AuditRepo: &categoryErrAuditRepo{
+			auditFake:   au,
+			errCategory: CategoryDispatchReaperFailed,
+			err:         errors.New("audit store unavailable"),
+		},
+	})
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "drift"},
+	)
+	// A prior trigger so countFixupInfraRefunds proceeds past its empty-trigger
+	// early return into the erroring dispatch_reaper_failed read.
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 10)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "count infra-refunded fix-up passes failed") {
+		t.Errorf("body missing the infra-refund-count error message: %s", w.Body.String())
+	}
+	for _, e := range au.appended {
+		if e.Category == CategoryStageFixupTriggered {
+			t.Errorf("stage_fixup_triggered appended despite the 500")
+		}
 	}
 }
 
