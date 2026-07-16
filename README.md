@@ -2,13 +2,11 @@
 
 The governed, auditable workflow for agent-driven software development.
 
-Agents do the work. Your team approves the work. Fishhawk holds the record.
-
 Fishhawk is an opinionated workflow engine for agent-driven software changes: it defines the stages a change moves through (plan → implement → review), enforces policy on what an agent can and cannot do, gates the work behind human approvals, and keeps an immutable, signed audit trail of every plan, approval, and outcome. It is tool-agnostic and agent-agnostic — it is **not** a coding agent, a CI/CD platform, or a general-purpose workflow engine.
 
 Fishhawk develops itself through Fishhawk: since Day 22 of the v0 build (2026-05-21), substantive changes flow through a workflow run defined by [`.fishhawk/workflows.yaml`](.fishhawk/workflows.yaml), and the audit log behind that development is published in [`docs/compliance/`](docs/compliance/).
 
-> **Status: pre-alpha.** The v0 control plane, runner, CLI, MCP server, and Web UI have landed. See [Documentation](#documentation) for the full component map. Feature PRs are not yet being accepted while the v0 abstractions settle — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+> **Status: alpha.** The v0 control plane, runner, CLI, MCP server, and Web UI have landed. See [Documentation](#documentation) for the full component map. Feature PRs are not yet being accepted while the v0 abstractions settle — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Quickstart
 
@@ -165,7 +163,6 @@ The full install path (pre-built release binaries, cosign verification, the comp
 | [`docs/mcp/install.md`](docs/mcp/install.md) | MCP server install, tool surface, and troubleshooting. |
 | [`docs/api/v0.md`](docs/api/v0.md) | REST API surface (`docs/api/v0.openapi.yaml` is the source of truth). |
 | [`docs/deploy/kubernetes.md`](docs/deploy/kubernetes.md) | Helm-chart quickstart for a Kubernetes deployment. |
-| [`docs/BRAND_FOUNDATIONS.md`](docs/BRAND_FOUNDATIONS.md) | Voice, naming, positioning. |
 | [`AGENTS.md`](AGENTS.md) | Build/test/lint gates and the contributor workflow loop. |
 
 ### Components
