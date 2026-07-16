@@ -201,6 +201,102 @@ func (c *apiClient) GetRun(ctx context.Context, id uuid.UUID) (*Run, error) {
 	return &r, nil
 }
 
+// GateView mirrors the backend's GET /v0/runs/{run_id}/gate-view body
+// (`backend/internal/server/gateview.go::gateViewResponse`, #1960): the
+// gate-scoped decision read carrying each OPEN concern with its FULL note
+// prose, the audit-reconstructed cross-round history (fix-up routing claims +
+// re-review confirmations), the settled ledger, and the run's suppressed
+// relitigations. Field names/tags MUST match the endpoint payload exactly —
+// this is the cross-boundary wire seam. IDs are `string` (not uuid.UUID) so
+// the MCP SDK's schema reflection sees a string, matching the other client
+// types.
+type GateView struct {
+	RunID                   string                      `json:"run_id"`
+	StageKind               string                      `json:"stage_kind,omitempty"`
+	Open                    []GateViewConcern           `json:"open"`
+	Settled                 []GateViewSettledConcern    `json:"settled"`
+	SuppressedRelitigations []GateViewSuppressedRelitig `json:"suppressed_relitigations"`
+	HistoryIncomplete       bool                        `json:"history_incomplete"`
+	HistoryGaps             []string                    `json:"history_gaps,omitempty"`
+}
+
+// GateViewConcern is one OPEN concern with full decision context. Note carries
+// the reviewer's complete prose — the surface elides nothing (no compaction
+// levers apply).
+type GateViewConcern struct {
+	ID                   string               `json:"id"`
+	StageKind            string               `json:"stage_kind"`
+	Round                int                  `json:"round,omitempty"`
+	OriginReviewSequence int64                `json:"origin_review_sequence"`
+	ReviewerModel        string               `json:"reviewer_model,omitempty"`
+	Severity             string               `json:"severity"`
+	Category             string               `json:"category"`
+	State                string               `json:"state"`
+	StateReason          string               `json:"state_reason,omitempty"`
+	Note                 string               `json:"note"`
+	HasSuggestedPatch    bool                 `json:"has_suggested_patch"`
+	Fixups               []GateViewFixup      `json:"fixups,omitempty"`
+	Resolutions          []GateViewResolution `json:"resolutions,omitempty"`
+}
+
+// GateViewFixup is one fix-up routing claim joined to its outcome.
+type GateViewFixup struct {
+	Sequence  int64  `json:"sequence"`
+	Reason    string `json:"reason,omitempty"`
+	Outcome   string `json:"outcome"`
+	ApplyPath string `json:"apply_path,omitempty"`
+	HeadSHA   string `json:"head_sha,omitempty"`
+}
+
+// GateViewResolution is one re-review verdict on a concern.
+type GateViewResolution struct {
+	Sequence   int64  `json:"sequence"`
+	Round      int    `json:"round,omitempty"`
+	Resolution string `json:"resolution"`
+	Note       string `json:"note,omitempty"`
+}
+
+// GateViewSettledConcern is one settled-ledger row.
+type GateViewSettledConcern struct {
+	ID            string `json:"id"`
+	StageKind     string `json:"stage_kind"`
+	State         string `json:"state"`
+	Severity      string `json:"severity"`
+	Category      string `json:"category"`
+	ReviewerModel string `json:"reviewer_model,omitempty"`
+	Note          string `json:"note"`
+	StateReason   string `json:"state_reason,omitempty"`
+}
+
+// GateViewSuppressedRelitig is one suppressed relitigation (#1913).
+type GateViewSuppressedRelitig struct {
+	SettledRef           string `json:"settled_ref"`
+	SettledState         string `json:"settled_state"`
+	Severity             string `json:"severity"`
+	Category             string `json:"category"`
+	Note                 string `json:"note"`
+	ReviewerModel        string `json:"reviewer_model,omitempty"`
+	OriginReviewSequence int64  `json:"origin_review_sequence"`
+}
+
+// GetGateView calls GET /v0/runs/{run_id}/gate-view with an optional
+// stage_kind (plan|implement) filter. The payload passes through verbatim —
+// none of compact.go's levers (stripReviewProse, auditPayloadStringCap) are
+// applied — so the full concern notes reach the operator intact.
+func (c *apiClient) GetGateView(ctx context.Context, runID uuid.UUID, stageKind string) (*GateView, error) {
+	path := "/v0/runs/" + runID.String() + "/gate-view"
+	if stageKind != "" {
+		q := url.Values{}
+		q.Set("stage_kind", stageKind)
+		path = path + "?" + q.Encode()
+	}
+	var gv GateView
+	if err := c.do(ctx, http.MethodGet, path, nil, &gv); err != nil {
+		return nil, err
+	}
+	return &gv, nil
+}
+
 // BudgetStatus mirrors the backend's GET /v0/runs/{run_id}/budget body
 // (`backend/internal/server/budget_status.go::budgetStatusResponse`):
 // the current calendar-period status of the run's workflow periodic
