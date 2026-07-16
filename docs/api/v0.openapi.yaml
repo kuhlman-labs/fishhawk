@@ -5388,6 +5388,11 @@ paths:
         review or fix-up gate. Unlike the run-status concerns block the note
         text is NOT elided, and the MCP tool passes the payload through with
         none of its compaction levers applied. Read-only.
+
+        Auth mirrors `listRunAudit`'s read posture: the full reviewer prose
+        must not be anonymously readable, so an ordinary caller must hold the
+        `read:audit` scope, while a run-bound `mcp:run:<uuid>` token is
+        authorized instead by the cross-run subject guard (own run only).
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -5407,10 +5412,10 @@ paths:
           description: '`validation_failed` — `run_id` not a UUID, or `stage_kind` not `plan`/`implement`.'
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: '`cross_run_gate_view` — a run-bound `mcp:run:<uuid>` token may only read its own run.'
+          description: '`insufficient_scope` — a token missing the `read:audit` scope; or `cross_run_gate_view` — a run-bound `mcp:run:<uuid>` token reading a run other than its own.'
         '404': { $ref: '#/components/responses/NotFound' }
         '503':
-          description: '`gate_view_unconfigured` — the concern repository is not configured.'
+          description: '`gate_view_unconfigured` — the concern repository is not configured; or `run_repo_unconfigured` — the run repository is not configured.'
 
   /v0/runs/{run_id}/budget:
     get:

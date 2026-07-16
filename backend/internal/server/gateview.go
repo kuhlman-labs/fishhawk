@@ -161,10 +161,20 @@ var gateViewHistoryCategories = []string{
 	concernRelitigationSuppressedCategory,
 }
 
+// scopeGateViewRead is the read scope a non-mcp caller must hold to read the
+// gate view (#1960). It mirrors handleListRunAudit's audit-read posture: the
+// gate view is reconstructed from the run's immutable audit history, and its
+// FULL reviewer prose — which can carry sensitive repository context under
+// Fishhawk's code-execution threat model — must not be anonymously readable.
+// Operator tokens carry it via operatorDefaultScopes; cookie-session operators
+// bypass scope enforcement (requireWriteScope's contract); an mcp:run token is
+// authorized instead by the cross-run subject guard below.
+const scopeGateViewRead = "read:audit"
+
 // handleGetRunGateView implements GET /v0/runs/{run_id}/gate-view (#1960).
 //
-// Auth mirrors handleListRunAudit's open-read posture with the fixup handler's
-// cross-run subject guard: an mcp:run:<uuid> token may only read its own run.
+// Auth mirrors handleListRunAudit's read posture: a read scope for ordinary
+// callers PLUS the fixup handler's mcp:run cross-run subject guard.
 func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.ConcernRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "gate_view_unconfigured",
@@ -189,10 +199,14 @@ func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Subject-binding guard: an MCP run-bound token may only read its own run
-	// (mirrors handleFixupStage's cross_run_fixup guard). A non-mcp subject
-	// (operator token, cookie session, anonymous) is unaffected — the read is
-	// open, as on handleListRunAudit.
+	// Read authorization. An mcp:run:<uuid> run-bound token is authorized by
+	// the cross-run subject guard alone — it is inherently scoped to its own
+	// run (and structurally cannot carry the read scope), mirroring
+	// handleFixupStage's cross_run_fixup guard. Every OTHER caller (operator
+	// token, cookie session, anonymous) must clear the read scope:
+	// requireWriteScope 401s an anonymous caller, 403s a token missing the
+	// scope, and bypasses cookie-session operators. Full reviewer prose must
+	// not be anonymously readable (#1960 authz).
 	id := IdentityFrom(r.Context())
 	if strings.HasPrefix(id.Subject, "mcp:run:") {
 		subjectRunID, parseErr := uuid.Parse(strings.TrimPrefix(id.Subject, "mcp:run:"))
@@ -210,6 +224,8 @@ func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 				})
 			return
 		}
+	} else if !s.requireWriteScope(w, r, scopeGateViewRead) {
+		return
 	}
 
 	// Authoritative existence check: an unknown run is a 404, distinct from a

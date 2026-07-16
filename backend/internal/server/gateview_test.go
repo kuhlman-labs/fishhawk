@@ -63,15 +63,35 @@ func seedGateConcern(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.UUID
 	return rows[0]
 }
 
+// gateViewReadIdentity is an operator token carrying the read scope the
+// gate-view read requires (#1960). getGateView injects it by default so the
+// behavioral tests exercise an authorized caller; the auth-guard tests inject
+// their own identities.
+func gateViewReadIdentity() Identity {
+	return Identity{Subject: "github:op", TokenID: "tok-op", Scopes: []string{scopeGateViewRead}}
+}
+
+// getGateView drives handleGetRunGateView directly (not through s.Handler()):
+// the auth middleware re-derives identity from the request and would clobber an
+// injected context identity, so the default authorized-caller identity is
+// injected and the handler invoked directly, mirroring TestGateView_CrossRunGuard.
 func getGateView(t *testing.T, s *Server, runID uuid.UUID, query string) *httptest.ResponseRecorder {
 	t.Helper()
+	return callGateView(s, runID, query, gateViewReadIdentity())
+}
+
+// callGateView invokes the handler directly with the given identity, setting the
+// run_id path value the mux would otherwise supply.
+func callGateView(s *Server, runID uuid.UUID, query string, id Identity) *httptest.ResponseRecorder {
 	path := "/v0/runs/" + runID.String() + "/gate-view"
 	if query != "" {
 		path += "?" + query
 	}
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, path, nil)
-	s.Handler().ServeHTTP(w, req)
+	req.SetPathValue("run_id", runID.String())
+	req = injectIdentity(req, id)
+	s.handleGetRunGateView(w, req)
 	return w
 }
 
@@ -147,6 +167,74 @@ func TestGateView_CrossRunGuard(t *testing.T) {
 	// A token bound to THIS run passes.
 	if w := call("mcp:run:" + runID.String()); w.Code != http.StatusOK {
 		t.Fatalf("same-run: status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+}
+
+// TestGateView_ReadScope enforces the read-scope posture (#1960 authz): a
+// non-mcp caller must hold scopeGateViewRead. Anonymous -> 401, a token
+// missing the scope -> 403, and a cookie-session operator (no scope list)
+// passes. Full reviewer prose must not be anonymously readable.
+func TestGateView_ReadScope(t *testing.T) {
+	s, repo, _, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	seedGateConcern(t, cr, runID, uuid.New(), concern.StageKindImplement, "m", 10, "high", "correctness", gateViewLongNote, "")
+
+	// Anonymous -> 401.
+	if w := callGateView(s, runID, "", anonIdentity()); w.Code != http.StatusUnauthorized || !bodyHasCode(w, "authentication_required") {
+		t.Errorf("anonymous: status = %d body = %s, want 401 authentication_required", w.Code, w.Body.String())
+	}
+	// Authenticated token missing the read scope -> 403.
+	noScope := Identity{Subject: "github:op", TokenID: "tok-x", Scopes: []string{"write:runs"}}
+	if w := callGateView(s, runID, "", noScope); w.Code != http.StatusForbidden || !bodyHasCode(w, "insufficient_scope") {
+		t.Errorf("missing-scope: status = %d body = %s, want 403 insufficient_scope", w.Code, w.Body.String())
+	}
+	// Cookie-session operator (no scope list) bypasses scope enforcement -> 200.
+	cookie := Identity{Subject: "github:op", UserID: "u1", SessionID: "sess-1"}
+	if w := callGateView(s, runID, "", cookie); w.Code != http.StatusOK {
+		t.Errorf("cookie session: status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+}
+
+// TestGateView_RunRepoUnconfigured_503 covers the RunRepo-nil guard that sits
+// before the existence check: a configured ConcernRepo but no RunRepo -> 503.
+func TestGateView_RunRepoUnconfigured_503(t *testing.T) {
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", ConcernRepo: cr}) // no RunRepo
+	w := getGateView(t, s, uuid.New(), "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	if !bodyHasCode(w, "run_repo_unconfigured") {
+		t.Errorf("want run_repo_unconfigured code, got %s", w.Body.String())
+	}
+}
+
+// TestGateView_ListByRunError_500 covers the ConcernRepo.ListByRun error branch
+// -> 500 internal_error.
+func TestGateView_ListByRunError_500(t *testing.T) {
+	s, repo, _, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	cr.listErr = errors.New("injected list-by-run error")
+	w := getGateView(t, s, runID, "")
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if !bodyHasCode(w, "internal_error") {
+		t.Errorf("want internal_error code, got %s", w.Body.String())
+	}
+}
+
+// TestGateView_MalformedMCPSubject_401 covers a malformed mcp:run:<garbage>
+// subject whose trailing text is not a UUID -> 401 authentication_required.
+func TestGateView_MalformedMCPSubject_401(t *testing.T) {
+	s, repo, _, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	w := callGateView(s, runID, "", Identity{Subject: "mcp:run:not-a-uuid", TokenID: "tok-mcp", Scopes: []string{"mcp:read"}})
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401:\n%s", w.Code, w.Body.String())
+	}
+	if !bodyHasCode(w, "authentication_required") {
+		t.Errorf("want authentication_required code, got %s", w.Body.String())
 	}
 }
 
@@ -255,8 +343,11 @@ func TestGateView_FullNoteByteIdentical(t *testing.T) {
 }
 
 // TestGateView_RoundBoundaryDerivation asserts concerns straddling a
-// stage_fixup_triggered sequence get rounds 1 and 2, a plan concern omits round,
-// and a shuffled audit seed order still yields the right rounds (defensive sort).
+// stage_fixup_triggered sequence get rounds 1 and 2 and a plan concern omits
+// round. Round derivation COUNTS same-stage triggers below a sequence, so it is
+// order-independent — the load-bearing defensive-sort coverage (observable
+// fixup ordering) lives in TestGateView_FixupJoin, not here; the descending
+// seed order below only documents that round counting tolerates any order.
 func TestGateView_RoundBoundaryDerivation(t *testing.T) {
 	s, repo, au, cr := gateViewServer(t)
 	runID := seedGateRun(t, repo)
@@ -290,7 +381,10 @@ func TestGateView_RoundBoundaryDerivation(t *testing.T) {
 }
 
 // TestGateView_FixupJoin covers all three outcomes: pushed (apply_path+head_sha),
-// no_changes, and pending (a trigger with no following outcome).
+// no_changes, and pending (a trigger with no following outcome). The three
+// triggers are seeded in SHUFFLED (non-ascending) order so the assertions are
+// load-bearing for the defensive Sequence sort: without it the fixups would
+// emerge in repo/seed order and the positional + ascending-order checks fail.
 func TestGateView_FixupJoin(t *testing.T) {
 	s, repo, au, cr := gateViewServer(t)
 	runID := seedGateRun(t, repo)
@@ -298,11 +392,14 @@ func TestGateView_FixupJoin(t *testing.T) {
 	c := seedGateConcern(t, cr, runID, stageID, concern.StageKindImplement, "m", 5, "high", "correctness", "note", "")
 	id := c.ID.String()
 
+	// Triggers seeded 60 -> 20 -> 40 (shuffled). The outcome entries sit
+	// between them by Sequence; earliestOutcomeAfter must still pair each
+	// trigger with its own following outcome once the entries are sorted.
+	seedHeadEntry(au, runID, &stageID, CategoryStageFixupTriggered, 60, map[string]any{"concern_ids": []string{id}, "reason": "pass3"})
 	seedHeadEntry(au, runID, &stageID, CategoryStageFixupTriggered, 20, map[string]any{"concern_ids": []string{id}, "reason": "pass1"})
-	seedHeadEntry(au, runID, &stageID, "fixup_pushed", 25, map[string]any{"head_sha": "deadbeef", "apply_path": "applied"})
 	seedHeadEntry(au, runID, &stageID, CategoryStageFixupTriggered, 40, map[string]any{"concern_ids": []string{id}, "reason": "pass2"})
 	seedHeadEntry(au, runID, &stageID, "fixup_no_changes", 45, map[string]any{})
-	seedHeadEntry(au, runID, &stageID, CategoryStageFixupTriggered, 60, map[string]any{"concern_ids": []string{id}, "reason": "pass3"})
+	seedHeadEntry(au, runID, &stageID, "fixup_pushed", 25, map[string]any{"head_sha": "deadbeef", "apply_path": "applied"})
 
 	resp := decodeGateView(t, getGateView(t, s, runID, ""))
 	if len(resp.Open) != 1 {
@@ -311,6 +408,12 @@ func TestGateView_FixupJoin(t *testing.T) {
 	fx := resp.Open[0].Fixups
 	if len(fx) != 3 {
 		t.Fatalf("Fixups = %d, want 3: %+v", len(fx), fx)
+	}
+	// Defensive-sort load-bearing check: the fixups must surface in ascending
+	// Sequence order regardless of the shuffled seed order above.
+	if fx[0].Sequence != 20 || fx[1].Sequence != 40 || fx[2].Sequence != 60 {
+		t.Fatalf("fixups not in ascending Sequence order (defensive sort dropped?): %d, %d, %d",
+			fx[0].Sequence, fx[1].Sequence, fx[2].Sequence)
 	}
 	if fx[0].Outcome != "pushed" || fx[0].ApplyPath != "applied" || fx[0].HeadSHA != "deadbeef" {
 		t.Errorf("fixup[0] = %+v, want pushed/applied/deadbeef", fx[0])
