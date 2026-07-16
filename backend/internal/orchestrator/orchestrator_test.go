@@ -3459,9 +3459,12 @@ func TestTryShortCircuitAcceptance(t *testing.T) {
 		planBytes := acceptanceSkipPlanBytes(t, nil, allSkip)
 		r, stages, _, ra, o := seedAcceptanceSkipRun(t, planBytes)
 
-		sc, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
+		sc, liveReq, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
 		if err != nil {
 			t.Fatalf("TryShortCircuitAcceptance: %v", err)
+		}
+		if liveReq {
+			t.Error("liveValidationRequired = true, want false on an all-skip short-circuit hit")
 		}
 		if sc == nil {
 			t.Fatal("short-circuit = nil, want a hit")
@@ -3489,7 +3492,7 @@ func TestTryShortCircuitAcceptance(t *testing.T) {
 		planBytes := acceptanceSkipPlanBytes(t, nil, allSkip)
 		r, stages, rs, ra, o := seedAcceptanceSkipRunWithAcceptanceState(t, planBytes, run.StageStateDispatched)
 
-		sc, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
+		sc, _, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
 		if err != nil {
 			t.Fatalf("TryShortCircuitAcceptance: %v", err)
 		}
@@ -3522,7 +3525,7 @@ func TestTryShortCircuitAcceptance(t *testing.T) {
 		planBytes := acceptanceSkipPlanBytes(t, nil, allSkip)
 		r, stages, rs, ra, o := seedAcceptanceSkipRunWithAcceptanceState(t, planBytes, run.StageStateAwaitingHostDispatch)
 
-		sc, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
+		sc, _, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
 		if err != nil {
 			t.Fatalf("TryShortCircuitAcceptance: %v", err)
 		}
@@ -3552,9 +3555,12 @@ func TestTryShortCircuitAcceptance(t *testing.T) {
 	t.Run("empty-criteria pending -> short-circuits", func(t *testing.T) {
 		planBytes := acceptanceSkipPlanBytes(t, nil, nil)
 		r, stages, _, _, o := seedAcceptanceSkipRun(t, planBytes)
-		sc, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
+		sc, liveReq, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
 		if err != nil {
 			t.Fatalf("TryShortCircuitAcceptance: %v", err)
+		}
+		if liveReq {
+			t.Error("liveValidationRequired = true, want false on an empty-criteria short-circuit hit")
 		}
 		if sc == nil || sc.Kind != AcceptanceShortCircuitEmptyCriteria {
 			t.Fatalf("short-circuit = %+v, want an empty-criteria hit", sc)
@@ -3566,9 +3572,12 @@ func TestTryShortCircuitAcceptance(t *testing.T) {
 	t.Run("out-of-scope pending -> short-circuits", func(t *testing.T) {
 		planBytes := acceptanceSkipPlanBytes(t, []string{"deletion deferred to a follow-up"}, nil)
 		r, stages, _, ra, o := seedAcceptanceSkipRun(t, planBytes)
-		sc, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
+		sc, liveReq, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
 		if err != nil {
 			t.Fatalf("TryShortCircuitAcceptance: %v", err)
+		}
+		if liveReq {
+			t.Error("liveValidationRequired = true, want false on an out-of-scope short-circuit hit")
 		}
 		if sc == nil || sc.Kind != AcceptanceShortCircuitOutOfScope {
 			t.Fatalf("short-circuit = %+v, want an out-of-scope hit", sc)
@@ -3590,12 +3599,15 @@ func TestTryShortCircuitAcceptance(t *testing.T) {
 		}
 		planBytes := acceptanceSkipPlanBytes(t, nil, mixed)
 		r, stages, _, ra, o := seedAcceptanceSkipRun(t, planBytes)
-		sc, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
+		sc, liveReq, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
 		if err != nil {
 			t.Fatalf("TryShortCircuitAcceptance: %v", err)
 		}
 		if sc != nil {
 			t.Errorf("short-circuit = %+v, want nil (mixed criteria)", sc)
+		}
+		if !liveReq {
+			t.Error("liveValidationRequired = false, want true on a mixed-criteria plan (at least one criterion needs a live target)")
 		}
 		if stages[3].State != run.StageStatePending {
 			t.Errorf("acceptance stage = %q, want pending (untouched)", stages[3].State)
@@ -3610,12 +3622,15 @@ func TestTryShortCircuitAcceptance(t *testing.T) {
 		planBytes := acceptanceSkipPlanBytes(t, nil, allSkip)
 		r, stages, _, _, o := seedAcceptanceSkipRun(t, planBytes)
 		// stages[1] is the implement stage (already succeeded).
-		sc, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[1].ID)
+		sc, liveReq, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[1].ID)
 		if err != nil {
 			t.Fatalf("TryShortCircuitAcceptance: %v", err)
 		}
 		if sc != nil {
 			t.Errorf("short-circuit = %+v, want nil (non-acceptance stage)", sc)
+		}
+		if liveReq {
+			t.Error("liveValidationRequired = true, want false for a non-acceptance stage")
 		}
 	})
 
@@ -3624,12 +3639,15 @@ func TestTryShortCircuitAcceptance(t *testing.T) {
 	t.Run("already-terminal acceptance -> nil no-op", func(t *testing.T) {
 		planBytes := acceptanceSkipPlanBytes(t, nil, allSkip)
 		r, stages, _, ra, o := seedAcceptanceSkipRunWithAcceptanceState(t, planBytes, run.StageStateSucceeded)
-		sc, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
+		sc, liveReq, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
 		if err != nil {
 			t.Fatalf("TryShortCircuitAcceptance: %v", err)
 		}
 		if sc != nil {
 			t.Errorf("short-circuit = %+v, want nil (already terminal)", sc)
+		}
+		if liveReq {
+			t.Error("liveValidationRequired = true, want false for an already-settled acceptance stage")
 		}
 		if n := countAcceptanceCategory(ra, "acceptance_outcome_recorded"); n != 0 {
 			t.Errorf("acceptance_outcome_recorded = %d, want 0", n)
@@ -3640,12 +3658,45 @@ func TestTryShortCircuitAcceptance(t *testing.T) {
 	t.Run("unknown stage -> nil no-op", func(t *testing.T) {
 		planBytes := acceptanceSkipPlanBytes(t, nil, allSkip)
 		r, _, _, _, o := seedAcceptanceSkipRun(t, planBytes)
-		sc, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, uuid.New())
+		sc, liveReq, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, uuid.New())
 		if err != nil {
 			t.Fatalf("TryShortCircuitAcceptance: %v", err)
 		}
 		if sc != nil {
 			t.Errorf("short-circuit = %+v, want nil (unknown stage)", sc)
+		}
+		if liveReq {
+			t.Error("liveValidationRequired = true, want false for an unknown stage id")
+		}
+	})
+
+	// (h) a run with NO approved plan artifact -> nil no-op with
+	// liveValidationRequired false: the endpoint can't report needs_target when
+	// it can't load the plan (it renders a plain short_circuited:false).
+	t.Run("nil plan -> nil no-op, live-validation false", func(t *testing.T) {
+		rs := newStubRuns()
+		ra := &recordingAudit{}
+		r, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+			{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+			{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+			{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, ExecutorRef: "human", State: run.StageStateSucceeded},
+			{Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+		})
+		// Artifacts wired but no plan artifact seeded -> loadApprovedPlan returns nil.
+		arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{}}
+		o := &Orchestrator{Runs: rs, GitHub: &stubGitHub{}, Audit: ra, Artifacts: arts}
+		sc, liveReq, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
+		if err != nil {
+			t.Fatalf("TryShortCircuitAcceptance: %v", err)
+		}
+		if sc != nil {
+			t.Errorf("short-circuit = %+v, want nil (nil plan)", sc)
+		}
+		if liveReq {
+			t.Error("liveValidationRequired = true, want false when the approved plan could not be loaded")
+		}
+		if stages[3].State != run.StageStatePending {
+			t.Errorf("acceptance stage = %q, want pending (untouched)", stages[3].State)
 		}
 	})
 }

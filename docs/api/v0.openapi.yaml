@@ -8248,6 +8248,26 @@ paths:
         Admission is an evaluate-and-maybe-settle pre-step, so a degraded
         server never blocks a legitimate dispatch. The endpoint reuses the
         `write:stages` scope and adds no new scope or audit kind.
+
+        **needs_target augmentation (E48.6 / #1953).** On the
+        `short_circuited: false` path, when the approved plan requires LIVE
+        validation (no short-circuit predicate matched — at least one
+        acceptance criterion needs a live target) AND the acceptance stage's
+        workflow spec declares egress `target_hosts`, the response adds
+        `needs_target: true` plus `target_hosts` (verbatim spec-declared
+        hosts) and `expected_head_sha` (the resolved merge-candidate head
+        SHA; may be empty when the ledger resolution fails). The dispatch verb
+        reads this to probe the first target host FROM THE DISPATCH HOST (the
+        same network position the local runner would probe from) using the
+        runner's `/healthz` `git_sha` identity semantics, and REFUSES to spawn
+        a runner doomed to fail category-C `acceptance_target_unreachable`
+        when the target is unreachable or stale — leaving the stage parked for
+        a clean re-dispatch. The endpoint only REPORTS what is needed; it
+        never probes (its network position differs from the operator host
+        under a k8s deployment). All three fields are additive and omitted
+        when the plan short-circuits, the stage is non-admissible, or the spec
+        declares no egress hosts (mixed old/new versions degrade to current
+        behavior).
       tags: [stages]
       parameters:
         - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -8287,6 +8307,29 @@ paths:
                   stage:
                     allOf: [{ $ref: '#/components/schemas/Stage' }]
                     description: The refreshed (now terminal) stage, present on a hit.
+                  needs_target:
+                    type: boolean
+                    description: |
+                      (E48.6 / #1953) True on the `short_circuited: false` path
+                      when the approved plan needs LIVE validation against a
+                      declared acceptance target, so the dispatch verb must
+                      probe the target before spawning. Omitted (false) on a
+                      short-circuit hit, a non-admissible stage, or a spec with
+                      no declared egress hosts.
+                  target_hosts:
+                    type: array
+                    items: { type: string }
+                    description: |
+                      The verbatim spec-declared egress target hosts
+                      (host[:port], no scheme) the verb probes. Present only
+                      with `needs_target: true`.
+                  expected_head_sha:
+                    type: string
+                    description: |
+                      The resolved merge-candidate head SHA the target's
+                      `/healthz` `git_sha` must match. Present with
+                      `needs_target: true`; may be empty when the backend could
+                      not resolve it (the verb then proceeds with a warning).
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |

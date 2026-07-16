@@ -2194,6 +2194,107 @@ func TestRunStage_AcceptanceShortCircuit_NoSpawn(t *testing.T) {
 	}
 }
 
+// TestRunStage_AcceptanceNeedsTarget_NoSpawnNoMarker (#1953): a needs_target
+// admission whose declared target is unreachable REFUSES to spawn — no
+// host-dispatch marker, no runner — and returns outcome=needs_target naming the
+// expected head SHA. The stage stays pending for a clean re-dispatch.
+func TestRunStage_AcceptanceNeedsTarget_NoSpawnNoMarker(t *testing.T) {
+	origAttempts := acceptanceQuickProbeAttempts
+	acceptanceQuickProbeAttempts = 1
+	t.Cleanup(func() { acceptanceQuickProbeAttempts = origAttempts })
+
+	// A target host that nothing listens on -> probe unreachable -> refuse.
+	target := healthzServer(t, http.StatusOK, `{"git_sha":"abc1234def"}`)
+	targetHost := hostOf(target.URL)
+	target.Close()
+
+	fb, srv := newFakeBackend(t)
+	fb.admissionShortCircuit = false
+	fb.admissionNeedsTarget = true
+	fb.admissionTargetHosts = []string{targetHost}
+	fb.admissionExpectedHeadSHA = probeExpectedSHA
+	r := newResolver(srv, nil)
+
+	spawned := 0
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, _ ...string) *exec.Cmd {
+		spawned++
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	runID := uuid.New()
+	acceptanceID := uuid.NewString()
+	accUUID, _ := uuid.Parse(acceptanceID)
+	seedStages(fb, runID,
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "implement", State: "succeeded"},
+		Stage{ID: acceptanceID, RunID: runID.String(), Type: "acceptance", State: "pending"},
+	)
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "acceptance", GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if spawned != 0 {
+		t.Errorf("a needs_target refusal must spawn NO runner, got %d", spawned)
+	}
+	if n := fb.hostDispatchCalledByID[accUUID]; n != 0 {
+		t.Errorf("host-dispatch marker calls = %d, want 0 (refusal fires before the marker)", n)
+	}
+	if out.Outcome != "needs_target" {
+		t.Errorf("Outcome = %q, want needs_target", out.Outcome)
+	}
+	if out.NeedsTarget == nil {
+		t.Fatal("NeedsTarget = nil, want the structured refusal")
+	}
+	if out.NeedsTarget.ExpectedHeadSHA != probeExpectedSHA || out.NeedsTarget.TargetHost != targetHost {
+		t.Errorf("NeedsTarget = %+v, want host=%q sha=%q", out.NeedsTarget, targetHost, probeExpectedSHA)
+	}
+}
+
+// TestRunStage_AcceptanceNeedsTargetVerified_SpawnsAsToday (#1953): a
+// needs_target admission whose declared target is VERIFIED (serves the merge
+// candidate) proceeds to spawn exactly as today.
+func TestRunStage_AcceptanceNeedsTargetVerified_SpawnsAsToday(t *testing.T) {
+	target := healthzServer(t, http.StatusOK, `{"git_sha":"abc1234def"}`)
+
+	fb, srv := newFakeBackend(t)
+	fb.admissionNeedsTarget = true
+	fb.admissionTargetHosts = []string{hostOf(target.URL)}
+	fb.admissionExpectedHeadSHA = probeExpectedSHA
+	r := newResolver(srv, nil)
+	argv := captureArgv(t)
+
+	runID := uuid.New()
+	acceptanceID := uuid.NewString()
+	accUUID, _ := uuid.Parse(acceptanceID)
+	seedStages(fb, runID,
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "implement", State: "succeeded"},
+		Stage{ID: acceptanceID, RunID: runID.String(), Type: "acceptance", State: "pending"},
+	)
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "acceptance", GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if out.Outcome == "needs_target" || out.NeedsTarget != nil {
+		t.Errorf("a verified target must proceed, got needs_target refusal: %+v", out.NeedsTarget)
+	}
+	if joined := strings.Join(*argv, " "); !strings.Contains(joined, "--stage acceptance") {
+		t.Errorf("spawned argv missing --stage acceptance: %s", joined)
+	}
+	if n := fb.hostDispatchCalledByID[accUUID]; n != 1 {
+		t.Errorf("host-dispatch marker calls = %d, want 1 (verified proceeds to spawn)", n)
+	}
+}
+
 // TestRunStage_AcceptanceAdmissionFalse_SpawnsAsToday: short_circuited:false
 // spawns exactly as today with the acceptance argv and no short-circuit warning.
 func TestRunStage_AcceptanceAdmissionFalse_SpawnsAsToday(t *testing.T) {

@@ -168,6 +168,13 @@ type fakeBackend struct {
 	admissionShortCircuit bool
 	admissionStatus       int
 	admissionCalledByID   map[uuid.UUID]int
+	// #1953 fixtures: the needs_target augmentation on the short_circuited:false
+	// path. admissionNeedsTarget drives needs_target:true; admissionTargetHosts /
+	// admissionExpectedHeadSHA populate the hosts + head SHA the verb-side gate
+	// probes against. Only served when admissionShortCircuit is false.
+	admissionNeedsTarget     bool
+	admissionTargetHosts     []string
+	admissionExpectedHeadSHA string
 	// admissionLeavesRunning, when true, flips the target stage's State to
 	// "running" inside the admission route (before any error status is written) —
 	// modelling a mid-walk 500 whose partial TryShortCircuitAcceptance left the
@@ -569,6 +576,9 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.admissionCalledByID[id]++
 		sc := fb.admissionShortCircuit
 		status := fb.admissionStatus
+		needsTarget := fb.admissionNeedsTarget
+		targetHosts := fb.admissionTargetHosts
+		expectedHeadSHA := fb.admissionExpectedHeadSHA
 		newState := ""
 		if sc {
 			// Reflect the server-side settle so a post-short-circuit stages read
@@ -600,6 +610,11 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 			res.Basis = "all-skip-with-basis"
 			res.CriteriaTotal = 2
 			res.Stage = &Stage{ID: id.String(), Type: "acceptance", State: "succeeded"}
+		} else if needsTarget {
+			// #1953: the needs_target augmentation on the no-short-circuit path.
+			res.NeedsTarget = true
+			res.TargetHosts = targetHosts
+			res.ExpectedHeadSHA = expectedHeadSHA
 		}
 		_ = json.NewEncoder(w).Encode(res)
 	})

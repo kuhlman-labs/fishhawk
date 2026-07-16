@@ -151,6 +151,14 @@ const (
 	// (distinct from the run-state-derived 'cancelled', which reports a run the
 	// backend moved to the cancelled terminal state).
 	stoppedContextCancelled = "context_cancelled"
+	// stoppedAcceptanceNeedsTarget is the resumable stop when the acceptance
+	// target-identity gate (#1953) refuses to spawn: the admission endpoint
+	// reported the plan needs live validation against a declared target and the
+	// verb-side probe found that target unreachable or stale. No record-act and no
+	// spawn — the stage stays awaiting_host_dispatch, so the drive is resumable
+	// with the same run_id once the operator provisions the target at the named
+	// head SHA.
+	stoppedAcceptanceNeedsTarget = "acceptance_needs_target"
 	// "paged:<event>" and "decision_required:<state>" are composed inline.
 )
 
@@ -191,7 +199,7 @@ type DriveStep struct {
 // resumable by re-invoking with the same run_id.
 type DriveRunOutput struct {
 	RunID         string       `json:"run_id"`
-	StoppedReason string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | host_dispatch_failed | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | context_cancelled"`
+	StoppedReason string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | host_dispatch_failed | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | acceptance_needs_target | context_cancelled"`
 	RunState      string       `json:"run_state"`
 	StepsTaken    []DriveStep  `json:"steps_taken,omitempty" jsonschema:"the ordered acts the driver performed; each dispatch and gate act also landed a run_auto_driven audit row"`
 	PageEvent     string       `json:"page_event,omitempty" jsonschema:"the must_page_human event, set only on a paged stop"`
@@ -641,6 +649,27 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 					spawned[disp.ID] = true
 					driveSleep(ctx, pollInterval)
 					continue
+				}
+				// Acceptance target-identity gate (#1953): a needs_target admission
+				// means the runner would validate against a live target — probe it
+				// FROM THIS HOST BEFORE recording an act or spawning. Unreachable/
+				// stale STOPS the drive resumably (acceptance_needs_target) without
+				// record-act or spawn, so the stage stays awaiting_host_dispatch and a
+				// re-invocation with the same run_id dispatches cleanly once the
+				// operator provisions the target. Verified/unverifiable/no-hosts/
+				// preview-cmd-set/empty-SHA all proceed (nil refusal).
+				if refusal, gwarn := r.checkAcceptanceTarget(ctx, admission); refusal != nil {
+					out.StepsTaken = append(out.StepsTaken, DriveStep{
+						Kind: "dispatch", Stage: "acceptance", Delegated: false,
+						Note: fmt.Sprintf(
+							"acceptance target %q not ready for head %s (%s); NOT spawning — %s",
+							refusal.TargetHost, refusal.ExpectedHeadSHA, refusal.Detail, refusal.Remediation),
+					})
+					out.StoppedReason = stoppedAcceptanceNeedsTarget
+					out.NextActions = driveDecisionActions(stoppedAcceptanceNeedsTarget, runUUID, in.WorkingDir)
+					return nil, out, nil
+				} else if gwarn != "" {
+					out.Warnings = append(out.Warnings, gwarn)
 				}
 			}
 
@@ -1214,6 +1243,14 @@ func driveDecisionActions(state string, runID uuid.UUID, workingDir string) *Nex
 			Precondition: "the stage sat in 'dispatched' beyond the runner-liveness threshold and the driver's own liveness probe could NOT confirm the runner dead (pgrep unavailable / errored / timed out)",
 			Consumes:     consumesNone,
 			Reason:       "verify by hand that no runner process is live (pgrep -f fishhawk-runner + the dispatch log_path); only if none is, re-dispatch the stage and re-invoke fishhawk_drive_run",
+		}}}
+	case state == stoppedAcceptanceNeedsTarget:
+		return &NextActions{State: state, Actions: []SuggestedAction{{
+			Action:       "fishhawk_dispatch_stage",
+			Params:       params,
+			Precondition: "the acceptance target is unreachable or stale for the merge candidate; no runner was spawned and the stage stays awaiting_host_dispatch",
+			Consumes:     consumesNone,
+			Reason:       "bring up the acceptance target at the expected head SHA (e.g. scripts/dev preview), then re-dispatch the acceptance stage and re-invoke fishhawk_drive_run",
 		}}}
 	case strings.HasPrefix(state, "plan_"):
 		return &NextActions{State: state, Actions: []SuggestedAction{{

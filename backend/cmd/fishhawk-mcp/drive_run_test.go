@@ -58,6 +58,11 @@ type driveFakeBackend struct {
 	admissionShortCircuit bool
 	admissionStatus       int
 	admissionCalledN      int
+	// #1953 needs_target fixtures: on a non-short-circuit admission, serve
+	// needs_target + hosts + head SHA so the drive's verb-side gate probes.
+	admissionNeedsTarget     bool
+	admissionTargetHosts     []string
+	admissionExpectedHeadSHA string
 
 	// auditErrCategory, when set, returns 500 only for /audit reads of that
 	// category — so a run_auto_driven read can fail while the amendment-poll
@@ -244,6 +249,10 @@ func (f *driveFakeBackend) handler() http.HandlerFunc {
 				res.Kind = "all_skip_with_basis"
 				res.Basis = "all-skip-with-basis"
 				res.CriteriaTotal = 2
+			} else if f.admissionNeedsTarget {
+				res.NeedsTarget = true
+				res.TargetHosts = f.admissionTargetHosts
+				res.ExpectedHeadSHA = f.admissionExpectedHeadSHA
 			}
 			_ = json.NewEncoder(w).Encode(res)
 
@@ -2950,6 +2959,122 @@ func TestDriveRun_AcceptanceShortCircuit_NoSpawn_ContinuesToMerge(t *testing.T) 
 	}
 	if !noted {
 		t.Errorf("missing the acceptance short-circuit DriveStep; steps: %+v", out.StepsTaken)
+	}
+}
+
+// TestDriveRun_AcceptanceNeedsTarget_StopsResumable (#1953): a needs_target
+// admission whose declared target is unreachable STOPS the drive with
+// acceptance_needs_target — no record-act, no spawn — leaving the stage
+// awaiting_host_dispatch so a re-invocation dispatches cleanly.
+func TestDriveRun_AcceptanceNeedsTarget_StopsResumable(t *testing.T) {
+	origAttempts := acceptanceQuickProbeAttempts
+	acceptanceQuickProbeAttempts = 1
+	t.Cleanup(func() { acceptanceQuickProbeAttempts = origAttempts })
+
+	target := healthzServer(t, http.StatusOK, `{"git_sha":"abc1234def"}`)
+	targetHost := hostOf(target.URL)
+	target.Close()
+
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "succeeded", 1),
+		stg(driveAccID, "acceptance", "pending", 2),
+	})
+	f.admissionNeedsTarget = true
+	f.admissionTargetHosts = []string{targetHost}
+	f.admissionExpectedHeadSHA = probeExpectedSHA
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		return AutoDriveOutcome{Note: "observe-only"}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedAcceptanceNeedsTarget {
+		t.Fatalf("stopped_reason = %q, want acceptance_needs_target:\n%+v", out.StoppedReason, out)
+	}
+	// No acceptance runner spawned.
+	for _, typ := range rec.list() {
+		if typ == "acceptance" {
+			t.Errorf("a needs_target refusal must NOT spawn a runner; spawned: %v", rec.list())
+		}
+	}
+	// No acceptance dispatch act recorded.
+	f.mu.Lock()
+	acts := append([]RecordAutoDriveAct(nil), f.recordedActs...)
+	f.mu.Unlock()
+	for _, a := range acts {
+		if a.Stage == "acceptance" {
+			t.Errorf("a needs_target refusal must record NO dispatch act; acts: %+v", acts)
+		}
+	}
+	// A DriveStep note names the host + head SHA.
+	var noted bool
+	for _, s := range out.StepsTaken {
+		if s.Kind == "dispatch" && s.Stage == "acceptance" &&
+			strings.Contains(s.Note, targetHost) && strings.Contains(s.Note, probeExpectedSHA) {
+			noted = true
+		}
+	}
+	if !noted {
+		t.Errorf("missing the needs_target DriveStep naming host+SHA; steps: %+v", out.StepsTaken)
+	}
+	if out.NextActions == nil || out.NextActions.State != stoppedAcceptanceNeedsTarget {
+		t.Errorf("NextActions = %+v, want state=%s", out.NextActions, stoppedAcceptanceNeedsTarget)
+	}
+}
+
+// TestDriveRun_AcceptanceNeedsTargetVerified_Dispatches (#1953): a needs_target
+// admission whose target is VERIFIED proceeds to record + spawn the acceptance
+// stage exactly as today.
+func TestDriveRun_AcceptanceNeedsTargetVerified_Dispatches(t *testing.T) {
+	target := healthzServer(t, http.StatusOK, `{"git_sha":"abc1234def"}`)
+
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "succeeded", 1),
+		stg(driveAccID, "acceptance", "pending", 2),
+	})
+	f.admissionNeedsTarget = true
+	f.admissionTargetHosts = []string{hostOf(target.URL)}
+	f.admissionExpectedHeadSHA = probeExpectedSHA
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		if f.allSucceeded("plan", "implement", "acceptance") {
+			f.runState = "succeeded"
+			return AutoDriveOutcome{Acted: true, Action: "merge", Note: "enabled auto-merge"}
+		}
+		return AutoDriveOutcome{Note: "observe-only"}
+	}
+	// Advance the acceptance stage to succeeded once its runner spawns, so the
+	// loop can proceed to merge.
+	f.onSpawn = func(f *driveFakeBackend, stageType string) {
+		if stageType == "acceptance" {
+			f.setState("acceptance", "succeeded")
+		}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason == stoppedAcceptanceNeedsTarget {
+		t.Fatalf("a verified target must dispatch, got acceptance_needs_target:\n%+v", out)
+	}
+	var spawnedAcc bool
+	for _, typ := range rec.list() {
+		if typ == "acceptance" {
+			spawnedAcc = true
+		}
+	}
+	if !spawnedAcc {
+		t.Errorf("a verified target must spawn the acceptance runner; spawned: %v", rec.list())
 	}
 }
 

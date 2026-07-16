@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -211,11 +212,166 @@ func TestAcceptanceAdmission_MixedCriteria_NoShortCircuit(t *testing.T) {
 	if resp.ShortCircuited {
 		t.Errorf("short_circuited = true, want false (mixed criteria)")
 	}
+	// The seam wires NO workflow spec, so the acceptance stage declares no egress
+	// target hosts — needs_target stays absent even though the plan needs live
+	// validation (the runner skips its target gate when no host is declared).
+	if resp.NeedsTarget {
+		t.Errorf("needs_target = true, want false (no declared egress target hosts)")
+	}
 	if got := seam.rr.stagesByID[seam.acceptanceID].State; got != run.StageStatePending {
 		t.Errorf("acceptance stage = %q, want pending (untouched)", got)
 	}
 	if n := countByCategory(seam.au, CategoryAcceptanceOutcomeRecorded); n != 0 {
 		t.Errorf("acceptance_outcome_recorded = %d, want 0", n)
+	}
+}
+
+// TestAcceptanceAdmission_NeedsTarget covers the E48.6 (#1953) augmentation on the
+// short_circuited:false path: a mixed-criteria plan (live validation required)
+// whose workflow spec DECLARES an egress target host returns needs_target:true +
+// the verbatim host list + the resolved merge-candidate head SHA, so a dispatch
+// verb probes the target before spawning a doomed runner. Two legs pin the
+// SHA-resolved and SHA-empty-but-still-needs-target branches; a third pins that a
+// short-circuit hit never carries needs_target.
+func TestAcceptanceAdmission_NeedsTarget(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	mixed := []map[string]any{
+		allSkipWithBasisCriteria[0],
+		{"id": "get-returns-200", "statement": "GET returns 200", "source": "explicit", "source_ref": "#1", "blocking": true},
+	}
+
+	t.Run("declared hosts + resolvable head SHA -> needs_target with hosts+sha", func(t *testing.T) {
+		seam := buildAdmissionSeam(t, run.StageStatePending, admissionPlanBytes(t, nil, mixed))
+		// The committed example spec declares egress target host localhost:8080.
+		seam.rr.runs[seam.runID].WorkflowSpec = exampleBytes
+		// Seed a reported-head ledger entry so the expected head SHA resolves.
+		headSHA := "abc1234def567890abc1234def567890abc12345"
+		seam.au.seeded = append(seam.au.seeded,
+			makeReportedHeadEntry(seam.runID, seam.implementID, "pull_request_opened", headSHA, time.Now().UTC()))
+
+		w := postAdmission(t, seam.s, seam.acceptanceID, testOperatorIdentity())
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp acceptanceAdmissionResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if resp.ShortCircuited {
+			t.Fatalf("short_circuited = true, want false")
+		}
+		if !resp.NeedsTarget {
+			t.Errorf("needs_target = false, want true (live validation + declared hosts)")
+		}
+		if len(resp.TargetHosts) != 1 || resp.TargetHosts[0] != "localhost:8080" {
+			t.Errorf("target_hosts = %v, want [localhost:8080] verbatim", resp.TargetHosts)
+		}
+		if resp.ExpectedHeadSHA != headSHA {
+			t.Errorf("expected_head_sha = %q, want %q (newest reported head)", resp.ExpectedHeadSHA, headSHA)
+		}
+		// Wire-key assertion: the dispatch verb decodes these exact keys.
+		body := w.Body.String()
+		for _, key := range []string{`"needs_target":true`, `"target_hosts":["localhost:8080"]`, `"expected_head_sha":"` + headSHA + `"`} {
+			if !strings.Contains(body, key) {
+				t.Errorf("response missing wire key %s:\n%s", key, body)
+			}
+		}
+		// No state change and no verdict — this is metadata-only.
+		if got := seam.rr.stagesByID[seam.acceptanceID].State; got != run.StageStatePending {
+			t.Errorf("acceptance stage = %q, want pending (untouched)", got)
+		}
+	})
+
+	t.Run("declared hosts + unresolvable head SHA -> needs_target, empty sha", func(t *testing.T) {
+		seam := buildAdmissionSeam(t, run.StageStatePending, admissionPlanBytes(t, nil, mixed))
+		seam.rr.runs[seam.runID].WorkflowSpec = exampleBytes
+		// No reported-head ledger entry seeded -> resolveAcceptanceExpectedHeadSHA
+		// returns "". needs_target must still be present (the verb degrades to a
+		// proceed-with-warning on an empty SHA).
+		w := postAdmission(t, seam.s, seam.acceptanceID, testOperatorIdentity())
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp acceptanceAdmissionResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &resp)
+		if !resp.NeedsTarget {
+			t.Errorf("needs_target = false, want true even with an unresolvable head SHA")
+		}
+		if len(resp.TargetHosts) != 1 || resp.TargetHosts[0] != "localhost:8080" {
+			t.Errorf("target_hosts = %v, want [localhost:8080]", resp.TargetHosts)
+		}
+		if resp.ExpectedHeadSHA != "" {
+			t.Errorf("expected_head_sha = %q, want empty (no ledger entry)", resp.ExpectedHeadSHA)
+		}
+	})
+
+	t.Run("short-circuit hit never carries needs_target", func(t *testing.T) {
+		seam := buildAdmissionSeam(t, run.StageStatePending, admissionPlanBytes(t, nil, allSkipWithBasisCriteria))
+		// Even with declared hosts, an all-skip short-circuit settles the stage and
+		// needs_target stays absent (no live target is needed).
+		seam.rr.runs[seam.runID].WorkflowSpec = exampleBytes
+		w := postAdmission(t, seam.s, seam.acceptanceID, testOperatorIdentity())
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp acceptanceAdmissionResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &resp)
+		if !resp.ShortCircuited {
+			t.Fatalf("short_circuited = false, want true (all-skip)")
+		}
+		if resp.NeedsTarget {
+			t.Errorf("needs_target = true, want false on a short-circuit hit")
+		}
+	})
+}
+
+// getRunErrRepo wraps an orchestratorRepo and forces GetRun to fail while every
+// other method (GetStage, transitions, …) still works, so the handler's GetRun
+// call in the needs_target augmentation can be driven into its fail-open branch
+// without disturbing the orchestrator's own repo access.
+type getRunErrRepo struct {
+	*orchestratorRepo
+}
+
+func (r *getRunErrRepo) GetRun(context.Context, uuid.UUID) (*run.Run, error) {
+	return nil, errors.New("simulated run-repo transport failure")
+}
+
+// TestAcceptanceAdmission_NeedsTarget_GetRunError_DropsSilently pins the
+// deliberate fail-open branch (#1953): when live validation is required but the
+// handler's GetRun lookup fails, needs_target is dropped silently
+// (short_circuited:false, no hosts) rather than erroring the dispatch — the
+// caller's own spawn path still applies. The orchestrator keeps the working repo;
+// only the server's RunRepo GetRun fails.
+func TestAcceptanceAdmission_NeedsTarget_GetRunError_DropsSilently(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	mixed := []map[string]any{
+		allSkipWithBasisCriteria[0],
+		{"id": "get-returns-200", "statement": "GET returns 200", "source": "explicit", "source_ref": "#1", "blocking": true},
+	}
+	seam := buildAdmissionSeam(t, run.StageStatePending, admissionPlanBytes(t, nil, mixed))
+	seam.rr.runs[seam.runID].WorkflowSpec = exampleBytes
+
+	// Rebuild the server with a RunRepo that errors on GetRun; the orchestrator
+	// keeps seam.rr, so the short-circuit evaluation still runs and reports
+	// liveValidationRequired before the failing GetRun drops needs_target.
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: &getRunErrRepo{seam.rr}, AuditRepo: seam.au, Orchestrator: seam.o})
+	w := postAdmission(t, s, seam.acceptanceID, testOperatorIdentity())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (fail-open):\n%s", w.Code, w.Body.String())
+	}
+	var resp acceptanceAdmissionResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.ShortCircuited {
+		t.Errorf("short_circuited = true, want false")
+	}
+	if resp.NeedsTarget {
+		t.Errorf("needs_target = true, want false (GetRun error drops it silently)")
+	}
+	if len(resp.TargetHosts) != 0 {
+		t.Errorf("target_hosts = %v, want empty (dropped)", resp.TargetHosts)
 	}
 }
 
@@ -232,6 +388,11 @@ func TestAcceptanceAdmission_NonAdmissibleState_False(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp.ShortCircuited {
 		t.Errorf("short_circuited = true, want false (already-settled acceptance stage)")
+	}
+	// A non-admissible (settled) stage is never live-validation-required, so
+	// needs_target stays absent even if hosts were declared.
+	if resp.NeedsTarget {
+		t.Errorf("needs_target = true, want false (already-settled acceptance stage)")
 	}
 	if n := countByCategory(seam.au, CategoryAcceptanceOutcomeRecorded); n != 0 {
 		t.Errorf("acceptance_outcome_recorded = %d, want 0", n)

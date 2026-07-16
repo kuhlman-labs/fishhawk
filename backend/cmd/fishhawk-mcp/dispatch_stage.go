@@ -47,6 +47,14 @@ type DispatchStageOutput struct {
 	RunURL          string           `json:"run_url,omitempty" jsonschema:"direct link to the run-detail view"`
 	LogPath         string           `json:"log_path,omitempty" jsonschema:"path to the detached runner's redirected stdout/stderr log on the MCP host (a diagnostic only; the durable record is the backend state + the signed trace bundle)"`
 	Warnings        []string         `json:"warnings,omitempty"`
+
+	// NeedsTarget is the pre-spawn acceptance refusal (E48.6 / #1953): set only
+	// when the acceptance-admission endpoint reported the plan needs live
+	// validation against a declared target and the verb-side probe found that
+	// target unreachable or stale. No spawn evidence was recorded and no runner
+	// was spawned — the stage stays awaiting_host_dispatch for a clean
+	// re-dispatch once the operator brings up the target at the named head SHA.
+	NeedsTarget *AcceptanceNeedsTarget `json:"needs_target,omitempty" jsonschema:"present when the acceptance target is unreachable or stale, so no runner was dispatched. Names the target_host and expected_head_sha to provision (remediation), then re-dispatch. The stage remains awaiting_host_dispatch"`
 }
 
 // dispatchStageSourceTag is the run_auto_driven source that distinguishes a
@@ -271,6 +279,43 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 				RunURL:          r.api.baseURL + "/runs/" + runUUID.String(),
 				Warnings:        warnings,
 			}, nil
+		}
+
+		// (5b') Acceptance target-identity gate (#1953): a needs_target admission
+		// means the runner would validate against a live target — probe it FROM
+		// THIS HOST BEFORE recording any spawn evidence. Unreachable/stale refuses
+		// here, ahead of the (5a) record-act AND the (5c) host-dispatch marker, so
+		// nothing is recorded and the stage stays awaiting_host_dispatch/pending
+		// for a clean re-dispatch. Every proceed outcome (verified / unverifiable /
+		// no hosts / preview-cmd-set / empty-SHA) returns nil and falls through.
+		if refusal, gwarn := r.checkAcceptanceTarget(ctx, admission); refusal != nil {
+			var stageWaitStatus *StageWaitStatus
+			if fetchErr := func() error {
+				fetchCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				stages, ferr := r.api.ListRunStages(fetchCtx, runUUID)
+				if ferr != nil {
+					return ferr
+				}
+				stageWaitStatus = stageWaitStatusFor(stages, in.Stage, "")
+				return nil
+			}(); fetchErr != nil {
+				warnings = append(warnings,
+					fmt.Sprintf("post-needs-target stage fetch failed (stage_wait_status omitted): %v", fetchErr))
+			}
+			warnings = append(warnings, fmt.Sprintf(
+				"acceptance target %q not ready for the merge candidate (%s); NOT recording spawn evidence or spawning a runner that would fail category-C acceptance_target_unreachable. %s",
+				refusal.TargetHost, refusal.Detail, refusal.Remediation))
+			return nil, DispatchStageOutput{
+				RunID:           runUUID.String(),
+				StageID:         resolvedStageID,
+				StageWaitStatus: stageWaitStatus,
+				RunURL:          r.api.baseURL + "/runs/" + runUUID.String(),
+				Warnings:        warnings,
+				NeedsTarget:     refusal,
+			}, nil
+		} else if gwarn != "" {
+			warnings = append(warnings, gwarn)
 		}
 	}
 

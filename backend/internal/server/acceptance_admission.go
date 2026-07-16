@@ -16,12 +16,27 @@ import (
 // stage server-side (no runner needed), false means the caller should proceed to
 // spawn as today. Kind/Basis/CriteriaTotal and the refreshed Stage are populated
 // only on a short-circuit hit.
+//
+// NeedsTarget / TargetHosts / ExpectedHeadSHA (E48.6 / #1953) are additive fields
+// on the short_circuited:false path: NeedsTarget is true when the approved plan
+// requires LIVE validation (no short-circuit predicate matched) AND the spec
+// declares egress target hosts, in which case TargetHosts carries the verbatim
+// spec-declared hosts and ExpectedHeadSHA the resolved merge-candidate head SHA
+// (possibly empty when ledger resolution fails). A dispatch verb reads this to
+// probe the target FROM THE DISPATCH HOST and refuse a runner that would fail
+// category-C acceptance_target_unreachable. The endpoint only REPORTS what is
+// needed — it never probes (its network position differs from the operator host
+// under a k8s deployment). All three are omitempty so a mixed old/new version
+// degrades to current behavior.
 type acceptanceAdmissionResponse struct {
-	ShortCircuited bool           `json:"short_circuited"`
-	Kind           string         `json:"kind,omitempty"`
-	Basis          string         `json:"basis,omitempty"`
-	CriteriaTotal  int            `json:"criteria_total,omitempty"`
-	Stage          *stageResponse `json:"stage,omitempty"`
+	ShortCircuited  bool           `json:"short_circuited"`
+	Kind            string         `json:"kind,omitempty"`
+	Basis           string         `json:"basis,omitempty"`
+	CriteriaTotal   int            `json:"criteria_total,omitempty"`
+	Stage           *stageResponse `json:"stage,omitempty"`
+	NeedsTarget     bool           `json:"needs_target,omitempty"`
+	TargetHosts     []string       `json:"target_hosts,omitempty"`
+	ExpectedHeadSHA string         `json:"expected_head_sha,omitempty"`
 }
 
 // handleAcceptanceAdmission implements POST
@@ -125,7 +140,7 @@ func (s *Server) handleAcceptanceAdmission(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	sc, err := s.cfg.Orchestrator.TryShortCircuitAcceptance(r.Context(), stage.RunID, stage.ID)
+	sc, liveValidationRequired, err := s.cfg.Orchestrator.TryShortCircuitAcceptance(r.Context(), stage.RunID, stage.ID)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"acceptance admission failed", map[string]any{"error": err.Error()})
@@ -133,9 +148,28 @@ func (s *Server) handleAcceptanceAdmission(w http.ResponseWriter, r *http.Reques
 	}
 	if sc == nil {
 		// No predicate matched, or the stage is in a non-admissible state — the
-		// normal no-op path. short_circuited:false, no warning; the caller
-		// records+spawns exactly as today.
-		s.writeJSON(w, r, http.StatusOK, acceptanceAdmissionResponse{ShortCircuited: false})
+		// normal no-op path (short_circuited:false). When the approved plan
+		// requires LIVE validation (liveValidationRequired) AND the spec declares
+		// egress target hosts, augment the response with needs_target + the
+		// verbatim hosts and the resolved merge-candidate head SHA (E48.6 / #1953)
+		// so the dispatch verb probes the target before spawning a doomed runner.
+		// The endpoint only REPORTS what is needed; it never probes (its network
+		// position differs from the operator host under a k8s deployment). All
+		// three fields stay omitted on a non-admissible / non-live no-op or a spec
+		// with no declared hosts (the runner skips its target gate then anyway).
+		resp := acceptanceAdmissionResponse{ShortCircuited: false}
+		if liveValidationRequired {
+			if runRow, gerr := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID); gerr == nil {
+				if hosts := s.resolveAcceptanceEgressTargetHosts(r.Context(), runRow); len(hosts) > 0 {
+					resp.NeedsTarget = true
+					resp.TargetHosts = hosts
+					// May be empty when the ledger resolution fails — still emit
+					// needs_target; the verb degrades to a proceed-with-warning.
+					resp.ExpectedHeadSHA = s.resolveAcceptanceExpectedHeadSHA(r.Context(), stage.RunID, stage.ID)
+				}
+			}
+		}
+		s.writeJSON(w, r, http.StatusOK, resp)
 		return
 	}
 

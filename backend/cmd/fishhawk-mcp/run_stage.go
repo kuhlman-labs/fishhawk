@@ -134,13 +134,22 @@ type RunStageOutput struct {
 	// when the post-run stage fetch failed.
 	StageWaitStatus *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"stage-execution wait status on the durable (run_id, stage_id) handle: status is one of pending, running, succeeded, failed, cancelled. On a synchronous return the stage is normally already terminal (interval omitted); poll fishhawk_get_run_status on the advertised poll_interval_seconds to await a non-terminal stage. Omitted when the post-run stage fetch failed"`
 
-	Outcome        string `json:"outcome,omitempty" jsonschema:"terminal runner outcome (ok | failed) from the runner_completed event; empty when the runner never reported one"`
+	Outcome        string `json:"outcome,omitempty" jsonschema:"terminal runner outcome (ok | failed | short_circuited | needs_target) from the runner_completed event, or a pre-spawn server/verb resolution: short_circuited when the acceptance-admission endpoint settled the stage with no runner, needs_target when the verb-side acceptance target probe refused to spawn; empty when the runner never reported one"`
 	Turns          int    `json:"turns,omitempty" jsonschema:"agent turn count from the last stage_progress heartbeat"`
 	TokensUsed     int    `json:"tokens_used,omitempty" jsonschema:"tokens consumed; from runner_completed when present, else the last heartbeat's running total"`
 	ElapsedSeconds int    `json:"elapsed_seconds,omitempty" jsonschema:"wall-clock seconds from the last stage_progress heartbeat"`
 	LastEventKind  string `json:"last_event_kind,omitempty" jsonschema:"the agent's last event kind from the last stage_progress heartbeat"`
 
 	FixupNoChanges bool `json:"fixup_no_changes,omitempty" jsonschema:"true when this fix-up pass produced NO commit (the runner reported implement_fixup_no_changes): the PR branch tip is unchanged and the stage returned to its review gate. The pass is refunded against the normal fix-up budget (the absolute 3-pass ceiling still counts it), so a corrected fixup can be re-triggered without force_additional_pass"`
+
+	// NeedsTarget is the pre-spawn acceptance refusal (E48.6 / #1953): set only
+	// when Outcome=="needs_target", i.e. the acceptance-admission endpoint
+	// reported the plan needs live validation against a declared target and the
+	// verb-side probe found that target unreachable or stale. The stage stays
+	// parked at awaiting_host_dispatch (NO runner spawned, NO host-dispatch
+	// marker) so re-dispatch is clean once the operator brings up the target at
+	// the named head SHA. Omitted on every spawn path.
+	NeedsTarget *AcceptanceNeedsTarget `json:"needs_target,omitempty" jsonschema:"present only when outcome==needs_target: the acceptance target is unreachable or stale, so no runner was spawned. Names the target_host and expected_head_sha to provision (remediation), then re-dispatch. The stage remains awaiting_host_dispatch"`
 
 	// Budget is the workflow's current periodic-budget status (#693 /
 	// ADR-030), fetched best-effort after the stage runs. Omitted when
@@ -455,6 +464,51 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 				StageWaitStatus: stageWaitStatus,
 				Outcome:         "short_circuited",
 			}, nil
+		}
+
+		// (3b) Acceptance target-identity gate (#1953): a needs_target admission
+		// (live validation required + declared egress hosts) means the runner
+		// would validate against a live target — so probe that target FROM THIS
+		// HOST (the runner's network position) BEFORE spawning. Unreachable/stale
+		// refuses to spawn here, ahead of the host-dispatch marker and any spawn
+		// evidence, so the stage stays awaiting_host_dispatch/pending for a clean
+		// re-dispatch. Verified / unverifiable / no-hosts / preview-cmd-set /
+		// empty-SHA all proceed (checkAcceptanceTarget returns nil), preserving
+		// runner parity and the #1928 fail-open contract.
+		if refusal, gwarn := r.checkAcceptanceTarget(ctx, admission); refusal != nil {
+			stageState := ""
+			var stageWaitStatus *StageWaitStatus
+			if fetchErr := func() error {
+				fetchCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				stages, ferr := r.api.ListRunStages(fetchCtx, runUUID)
+				if ferr != nil {
+					return ferr
+				}
+				for _, s := range stages {
+					if s.ID == stageUUID.String() {
+						stageState = s.State
+					}
+				}
+				stageWaitStatus = stageWaitStatusFor(stages, in.Stage, "")
+				return nil
+			}(); fetchErr != nil {
+				warnings = append(warnings,
+					fmt.Sprintf("post-needs-target stage fetch failed: %v", fetchErr))
+			}
+			warnings = append(warnings, fmt.Sprintf(
+				"acceptance target %q not ready for the merge candidate (%s); NOT spawning a runner that would fail category-C acceptance_target_unreachable. %s",
+				refusal.TargetHost, refusal.Detail, refusal.Remediation))
+			return nil, RunStageOutput{
+				StageState:      stageState,
+				Warnings:        warnings,
+				RunURL:          r.api.baseURL + "/runs/" + runUUID.String(),
+				StageWaitStatus: stageWaitStatus,
+				Outcome:         "needs_target",
+				NeedsTarget:     refusal,
+			}, nil
+		} else if gwarn != "" {
+			warnings = append(warnings, gwarn)
 		}
 	}
 
