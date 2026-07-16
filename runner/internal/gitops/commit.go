@@ -1299,6 +1299,36 @@ func CheckoutRemoteBranchDetached(ctx context.Context, repoDir, remote, branch, 
 	return tip, nil
 }
 
+// FetchBaseTip fetches refs/heads/<branch> from the named remote into the
+// remote-tracking ref refs/remotes/<remote>/<branch> and returns the fetched
+// tip SHA, WITHOUT moving the working tree. It is the checkout-less sibling of
+// CheckoutRemoteBranch / CheckoutRemoteBranchDetached, sharing the same
+// explicit-refspec fetch prologue (fetchRemoteBranchTip): the runner uses it
+// to re-anchor the policy-gate/review diff to the CURRENT base-branch tip
+// (matching what GitHub renders on the PR) before merge-basing, so a long-lived
+// run whose local base ref lags the advanced remote no longer folds the base's
+// unrelated advance into the staged diff (#1975). Because it only fetches (no
+// checkout), it never touches the working tree the fix-up agent's edits live on.
+//
+// Auth mirrors the checkout variants: when pushToken is supplied and the remote
+// is http(s), the fetch authenticates per-invocation via AuthEnvForRemote's
+// env-scoped fresh-token entries (which reset any stale persisted extraheader);
+// an empty pushToken, a non-http remote, or an unresolvable remote falls back to
+// ambient auth (#1951). It is package-level for the same reason as the checkout
+// variants: the caller has no *Pusher in scope.
+func FetchBaseTip(ctx context.Context, repoDir, remote, branch, pushToken string) (tipSHA string, err error) {
+	if branch == "" {
+		return "", errors.New("gitops: branch required")
+	}
+	p := &Pusher{}
+	authEnv := AuthEnvForRemote(ctx, repoDir, remote, pushToken)
+	_, tip, err := fetchRemoteBranchTip(ctx, p, repoDir, remote, branch, authEnv)
+	if err != nil {
+		return "", err
+	}
+	return tip, nil
+}
+
 // RemoteHasBranch reports whether branch exists on the named remote by
 // querying the remote DIRECTLY with `git ls-remote --heads <remote>
 // refs/heads/<branch>` (remote defaulting to DefaultRemote, matching

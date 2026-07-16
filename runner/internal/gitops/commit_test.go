@@ -1390,6 +1390,111 @@ func TestCheckoutRemoteBranchDetached_RejectsEmptyBranch(t *testing.T) {
 	}
 }
 
+// TestFetchBaseTip_ReturnsTipAndUpdatesTrackingRef is the #1975 re-anchor
+// primitive against a real repo pair: the remote advances its base branch to a
+// tip the local clone never fetched, and FetchBaseTip must fetch that tip into
+// the remote-tracking ref via the explicit refspec, return its SHA, and — the
+// distinguishing property vs. the checkout variants — leave the working tree /
+// HEAD untouched.
+func TestFetchBaseTip_ReturnsTipAndUpdatesTrackingRef(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+
+	// Advance main in the remote only (a tip the local clone never fetched),
+	// then rewind the local branch + drop the tracking ref so FetchBaseTip must
+	// fetch it.
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "v2")
+	remoteTip := mustGitOut(t, repo, "rev-parse", "HEAD")
+	mustGit(t, repo, "push", "origin", "main")
+	mustGit(t, repo, "reset", "--hard", "HEAD~1")
+	mustGit(t, repo, "update-ref", "-d", "refs/remotes/origin/main")
+	localHeadBefore := mustGitOut(t, repo, "rev-parse", "HEAD")
+
+	tip, err := FetchBaseTip(context.Background(), repo, "origin", "main", "")
+	if err != nil {
+		t.Fatalf("FetchBaseTip: %v", err)
+	}
+	if tip != remoteTip {
+		t.Errorf("returned tip = %q, want fetched remote tip %q", tip, remoteTip)
+	}
+	// The explicit refspec updated the remote-tracking ref.
+	if got := mustGitOut(t, repo, "rev-parse", "refs/remotes/origin/main"); got != remoteTip {
+		t.Errorf("tracking ref = %q, want %q", got, remoteTip)
+	}
+	// The working tree / HEAD was NOT moved — the fetch-only contract that keeps
+	// the fix-up agent's edits in place.
+	if got := mustGitOut(t, repo, "rev-parse", "HEAD"); got != localHeadBefore {
+		t.Errorf("HEAD moved to %q; FetchBaseTip must not touch the working tree (was %q)", got, localHeadBefore)
+	}
+	if got := mustGitOut(t, repo, "symbolic-ref", "--short", "HEAD"); got != "main" {
+		t.Errorf("HEAD = %q, want the working tree to stay on main", got)
+	}
+}
+
+// TestFetchBaseTip_MissingBranchErrors pins the error surface: a branch absent
+// on an otherwise-reachable remote fails loud (the fetch has nothing to resolve)
+// so resolveDiffBaseRef's caller degrades through the diff_base_refresh_degraded
+// fall-through rather than silently anchoring wrong.
+func TestFetchBaseTip_MissingBranchErrors(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+
+	if _, err := FetchBaseTip(context.Background(), repo, "origin", "nonexistent-branch", ""); err == nil {
+		t.Fatal("expected an error fetching a branch absent on the remote")
+	}
+}
+
+// TestFetchBaseTip_RejectsEmptyBranch pins the input contract.
+func TestFetchBaseTip_RejectsEmptyBranch(t *testing.T) {
+	if _, err := FetchBaseTip(context.Background(), t.TempDir(), "origin", "", ""); err == nil {
+		t.Fatal("expected error for empty branch")
+	}
+}
+
 // TestRemoteHasBranch is the #1363 primary done-means / regression test: it
 // pins the remote-vs-local-tracking distinction the bug turned on. The wave-N
 // child bases on the consolidated branch, which is created on GitHub via the
