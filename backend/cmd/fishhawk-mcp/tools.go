@@ -105,6 +105,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerRuntimeCalibration(srv, resolver)
 	registerVerifyRun(srv, resolver)
 	registerVouchCommit(srv, resolver)
+	registerMergeRun(srv, resolver)
 	registerReportProductIssue(srv, resolver)
 	registerReleaseNotes(srv, resolver)
 	registerDoctor(srv, resolver)

@@ -2,7 +2,7 @@
 
 You are the operator of a Fishhawk run. The agent proposes work and writes
 the code; you decide at every gate and own all version-control actions
-(approve PR, merge, post-merge). This runbook is the in-band counterpart to
+(approve the PR, then `fishhawk_merge_run`). This runbook is the in-band counterpart to
 the operator-role contract (ADR-040): read it when you are driving a run
 without prior operator memory.
 
@@ -40,9 +40,18 @@ One issue → one run → one PR.
 5. **`fishhawk_await_review`** — block until the implement review reaches a
    terminal verdict. Re-poll `fishhawk_get_run_status` if it times out; that
    poll is the authoritative path to a terminal status.
-6. **Approve the PR, merge, post-merge.** Approve the PR with an operator
-   verdict before every merge — no exceptions. Then run your post-merge step
-   to pull main and reload the stack.
+6. **Approve the PR, then `fishhawk_merge_run`.** Approve the PR with an
+   operator verdict (`gh pr review --approve`, under your own GitHub identity —
+   App-identity approval is deferred to E39) before every merge — no
+   exceptions. Then call **`fishhawk_merge_run`**: one verb records your merge
+   verdict as a chained audit entry, queues the squash merge through the same
+   seam `drive_run`'s `may_merge` arm uses, awaits the terminal run state, and
+   surfaces your post-merge dev-host step (`scripts/dev post-merge`, surfaced
+   for you to run — ADR-038 keeps host mutation out of the MCP surface). The
+   endpoint is idempotent: a timed-out re-invoke or a 502 retry re-queues the
+   merge with no duplicate verdict row, so it is safe to re-call. Queueing the
+   merge before the approval settles is also safe — GitHub fires it once branch
+   protection is satisfied.
 
 ## Edge-case playbook
 

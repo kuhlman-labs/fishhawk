@@ -42,11 +42,13 @@ const (
 var flakeTraceEvents = []string{"verify_infra_flake_retry"}
 
 // SuggestedAction is one legal next move for the run's current state.
-// Action is a tool name (fishhawk_resume_run) or a named ritual step
-// (approve_pr, merge_pr, post_merge, file_product_issue) when the move
-// happens outside the MCP surface.
+// Action is a tool name (fishhawk_resume_run, fishhawk_merge_run) or a
+// named ritual step (approve_pr, post_merge, file_product_issue) when the
+// move happens outside the MCP surface. The merge itself is the
+// fishhawk_merge_run tool (E48.7 / #1954), which replaced the bare merge_pr
+// + post_merge ritual steps.
 type SuggestedAction struct {
-	Action       string            `json:"action" jsonschema:"the tool to call (e.g. fishhawk_resume_run, fishhawk_fixup_stage) or a named ritual step outside the MCP surface (approve_pr, merge_pr, post_merge, merge_and_file_follow_up, file_product_issue)"`
+	Action       string            `json:"action" jsonschema:"the tool to call (e.g. fishhawk_resume_run, fishhawk_merge_run, fishhawk_fixup_stage) or a named ritual step outside the MCP surface (approve_pr, post_merge, merge_and_file_follow_up, file_product_issue)"`
 	Params       map[string]string `json:"params,omitempty" jsonschema:"key parameters for the action (run_id, stage_id, parent_run_id, the concern_ids source, ...); values naming a field path (e.g. run.concerns.items[].id) tell you where to read the real value"`
 	Precondition string            `json:"precondition" jsonschema:"one-line statement of when this action is legal"`
 	Consumes     string            `json:"consumes" jsonschema:"what taking the action spends: one of none, fixup_budget, retry_budget, approval_slot, new_run"`
@@ -152,11 +154,11 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 		if run.PullRequestURL != nil && *run.PullRequestURL != "" {
 			// Lifecycle owns its post-merge tail (#1370): when a
 			// post_merge_observed audit entry is present the backend has
-			// observed the PR merge resolve, so the approve_pr/merge_pr
+			// observed the PR merge resolve, so the approve_pr/fishhawk_merge_run
 			// ritual is already complete. Surface succeeded_merged with only
 			// the operator post_merge dev-host step (rebuild/reload stays an
 			// operator/deploy concern, ADR-038) — dropping the now-done
-			// approve_pr/merge_pr steps.
+			// approve_pr/fishhawk_merge_run steps.
 			if mergeObserved {
 				return &NextActions{State: "succeeded_merged", Actions: []SuggestedAction{postMergeStep(run)}}
 			}
@@ -1100,9 +1102,13 @@ func acceptanceTriagePagedActions(run *Run) []SuggestedAction {
 	}
 }
 
-// mergeRitualActions is the ordered operator merge ritual for a run
-// whose PR is open and safe to act on: approve with an operator verdict,
-// merge once fishhawk_audit_complete is green, then the post-merge walk.
+// mergeRitualActions is the ordered operator merge ritual for a run whose
+// PR is open and safe to act on (E48.7 / #1954): approve the PR under your
+// own GitHub identity (an unchanged gh step), then fishhawk_merge_run — the
+// one verb that records the operator merge verdict, queues the squash merge,
+// awaits the terminal run state, and surfaces the post-merge dev-host step.
+// This replaces the bare merge_pr + post_merge ritual steps; the post-merge
+// walk is folded into fishhawk_merge_run's own surfaced next_action.
 func mergeRitualActions(run *Run, why string) []SuggestedAction {
 	return []SuggestedAction{
 		{
@@ -1110,16 +1116,24 @@ func mergeRitualActions(run *Run, why string) []SuggestedAction {
 			Params:       prParams(run),
 			Precondition: "the implement review is terminal and the diff is reviewed",
 			Consumes:     consumesNone,
-			Reason:       why + " — record an operator verdict (gh pr review --approve) before merging",
+			Reason:       why + " — record an operator verdict (gh pr review --approve) under your own GitHub identity before merging",
 		},
-		{
-			Action:       "merge_pr",
-			Params:       prParams(run),
-			Precondition: "the PR is approved and the required fishhawk_audit_complete check is green",
-			Consumes:     consumesNone,
-			Reason:       "merging resolves the run via the merge reconciler",
-		},
-		postMergeStep(run),
+		mergeRunAction(run),
+	}
+}
+
+// mergeRunAction is the fishhawk_merge_run SuggestedAction (E48.7 / #1954):
+// the one verb from verdict to merged+terminal. Reused by mergeRitualActions
+// and the drive-folded merge_pr translation (driveAction) so the awaiting-merge
+// states name the same verb whether classified or drive-derived. The verdict
+// param is a placeholder the operator fills with the merge decision.
+func mergeRunAction(run *Run) SuggestedAction {
+	return SuggestedAction{
+		Action:       "fishhawk_merge_run",
+		Params:       map[string]string{"run_id": run.ID, "verdict": "<operator merge verdict>"},
+		Precondition: "the PR is approved (gh pr review --approve under your own identity) and the required fishhawk_audit_complete check is green — queueing before approval is also safe (GitHub fires the merge once branch protection is satisfied)",
+		Consumes:     consumesNone,
+		Reason:       "records your operator merge verdict as a chained audit entry, queues the squash merge through the same seam drive_run's may_merge arm uses, awaits the terminal run state, and surfaces the post-merge dev-host step — one verb replacing the merge_pr + post_merge hand ceremony",
 	}
 }
 
@@ -1197,6 +1211,14 @@ func unclassifiedNextActions(run *Run, stages []Stage) *NextActions {
 // driveAction converts the drive read view's distilled next step
 // (#1023) into a SuggestedAction so it folds in as the FIRST entry on
 // drive-enabled runs — drive and next_actions never point different ways.
+//
+// The server-stamped merge_pr next_action for the drive-derived
+// awaiting_merge state is TRANSLATED at the MCP layer to fishhawk_merge_run
+// (E48.7 / #1954) so the awaiting-merge surface names the one merge verb —
+// without changing the persisted drive-audit vocabulary (the backend still
+// records action:merge_pr; the translation lives only here). The drive
+// detail and PR URL carry through so the folded-first entry stays anchored
+// on the run's PR.
 func driveAction(run *Run, da *RunNextAction) SuggestedAction {
 	reason := da.Detail
 	if reason == "" {
@@ -1206,6 +1228,16 @@ func driveAction(run *Run, da *RunNextAction) SuggestedAction {
 	if da.PRURL != "" {
 		params["pr_url"] = da.PRURL
 	}
+	if da.Action == driveNextActionMergePR {
+		params["verdict"] = "<operator merge verdict>"
+		return SuggestedAction{
+			Action:       "fishhawk_merge_run",
+			Params:       params,
+			Precondition: "drive-mode (#1023): the backend parked the run at awaiting_merge with every gate resolved and required checks green",
+			Consumes:     consumesNone,
+			Reason:       reason,
+		}
+	}
 	return SuggestedAction{
 		Action:       da.Action,
 		Params:       params,
@@ -1214,6 +1246,13 @@ func driveAction(run *Run, da *RunNextAction) SuggestedAction {
 		Reason:       reason,
 	}
 }
+
+// driveNextActionMergePR is the server-stamped drive next_action verb for the
+// awaiting_merge state (backend/internal/server/autodrive.go). The MCP layer
+// translates it to fishhawk_merge_run in driveAction; the literal is copied
+// (not imported) per the thin local-copy rule (import direction is cli →
+// backend, not the reverse).
+const driveNextActionMergePR = "merge_pr"
 
 // pollAction is the re-poll entry: always legal (read-only), carrying
 // the advertised cadence the wait contract suggests for the state.

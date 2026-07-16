@@ -720,3 +720,80 @@ func TestReviveRun_WireShape(t *testing.T) {
 		}
 	})
 }
+
+// TestMergeRun_WireShape pins the apiClient.MergeRun request/response
+// contract (E48.7 / #1954): the POST target + method + auth header + verdict
+// body, the decoded 200 fields, the already_recorded idempotence signal, and
+// the error envelope surfacing (502 merge_dispatch_failed → *apiError).
+func TestMergeRun_WireShape(t *testing.T) {
+	runID := uuid.New()
+
+	t.Run("200 posts verdict body and decodes result", func(t *testing.T) {
+		var gotMethod, gotPath, gotAuth string
+		var gotBody mergeRunRequest
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotMethod, gotPath, gotAuth = r.Method, r.URL.Path, r.Header.Get("Authorization")
+			_ = json.NewDecoder(r.Body).Decode(&gotBody)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"merge_queued":true,"verdict_sequence":42,` +
+				`"pr_url":"https://github.com/x/y/pull/7","already_recorded":false}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+		res, err := c.MergeRun(context.Background(), runID, "ship it")
+		if err != nil {
+			t.Fatalf("MergeRun: %v", err)
+		}
+		if gotMethod != http.MethodPost {
+			t.Errorf("method = %q, want POST", gotMethod)
+		}
+		if gotPath != "/v0/runs/"+runID.String()+"/merge" {
+			t.Errorf("path = %q", gotPath)
+		}
+		if gotAuth != "Bearer tok-test" {
+			t.Errorf("auth = %q, want Bearer tok-test", gotAuth)
+		}
+		if gotBody.Verdict != "ship it" {
+			t.Errorf("body verdict = %q, want 'ship it'", gotBody.Verdict)
+		}
+		if !res.MergeQueued || res.VerdictSequence != 42 || res.PRURL != "https://github.com/x/y/pull/7" || res.AlreadyRecorded {
+			t.Errorf("result = %+v, want queued/seq42/pr/not-already-recorded", res)
+		}
+	})
+
+	t.Run("200 already_recorded idempotence signal decodes", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"merge_queued":true,"verdict_sequence":42,"already_recorded":true}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+		res, err := c.MergeRun(context.Background(), runID, "ship it")
+		if err != nil {
+			t.Fatalf("MergeRun: %v", err)
+		}
+		if !res.AlreadyRecorded || !res.MergeQueued {
+			t.Errorf("result = %+v, want already_recorded + merge_queued (endpoint idempotence)", res)
+		}
+	})
+
+	t.Run("502 merge_dispatch_failed surfaces as apiError", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":{"code":"merge_dispatch_failed","message":"verdict durable, queue retryable"}}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+		_, err := c.MergeRun(context.Background(), runID, "ship it")
+		if err == nil {
+			t.Fatal("expected an error on 502")
+		}
+		var ae *apiError
+		if !errors.As(err, &ae) || ae.StatusCode != http.StatusBadGateway || ae.Code != "merge_dispatch_failed" {
+			t.Errorf("err = %v, want *apiError 502 merge_dispatch_failed", err)
+		}
+	})
+}
