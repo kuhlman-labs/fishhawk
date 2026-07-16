@@ -9077,15 +9077,49 @@ func TestComputeAndEmitDiff_StaleBase_ReanchorsToCurrentTip(t *testing.T) {
 	if !saw {
 		t.Fatal("no git_diff event emitted")
 	}
-	// Binding condition 2, continued: re-anchoring the DIFF must not move the
-	// lineage/audit fork point the recorded base_sha derives from — the LOCAL
-	// base-ref merge-base still resolves to the original fork point B0.
-	recordedBase, mbErr := (&gitdiff.Runner{}).MergeBase(context.Background(), "main", repo)
-	if mbErr != nil {
-		t.Fatalf("MergeBase(main): %v", mbErr)
+	// Binding condition 2 (recorded-base-sha-unchanged guardrail), made
+	// LOAD-BEARING by observing the value the runner actually emits rather than
+	// re-deriving it from the fixture (the prior MergeBase("main") assertion was
+	// tautological — it recomputed the answer from git topology and never read a
+	// value the code produced). computeAndEmitDiff records NO base_sha of its own
+	// (the lineage/audit fork point is captured entirely separately, in the
+	// commit/push path via CommitAndPush.BaseSHA — untouched by this diff flow),
+	// so the guardrail here is verified through the two base-provenance surfaces
+	// this flow DOES emit: the diff_base_reanchored event's merge_base (the
+	// commit-ish the diff is measured against) and the git_diff base_ref label.
+	//
+	// The load-bearing contrast: re-anchoring MOVED the diff base to the fetched
+	// current tip B1 (advancedTip) — genuinely different from the recorded fork
+	// point B0 (forkPoint) — while the emitted base_ref label stayed at the
+	// fork-point label "main". If the re-anchor code regressed to measuring the
+	// diff against B0, merge_base would equal forkPoint and this fails; if it
+	// leaked the re-anchored tip into the emitted base provenance, the base_ref
+	// assertion fails. Neither passes vacuously.
+	var reanchor struct {
+		Event          string `json:"event"`
+		BaseRef        string `json:"base_ref"`
+		CurrentBaseTip string `json:"current_base_tip"`
+		MergeBase      string `json:"merge_base"`
 	}
-	if recordedBase != forkPoint {
-		t.Errorf("recorded base_sha (local-ref merge-base) = %q, want the original fork point %q — re-anchoring must leave it untouched", recordedBase, forkPoint)
+	for _, line := range strings.Split(strings.TrimSpace(sink.String()), "\n") {
+		if !strings.Contains(line, `"diff_base_reanchored"`) {
+			continue
+		}
+		if err := json.Unmarshal([]byte(line), &reanchor); err != nil {
+			t.Fatalf("decode diff_base_reanchored event: %v (%s)", err, line)
+		}
+	}
+	if reanchor.Event != "diff_base_reanchored" {
+		t.Fatal("no diff_base_reanchored event emitted to observe the re-anchored diff base")
+	}
+	if reanchor.MergeBase == forkPoint {
+		t.Errorf("emitted diff_base merge_base = %q equals the fork point B0 %q; re-anchoring did not move the diff base off the recorded fork point", reanchor.MergeBase, forkPoint)
+	}
+	if reanchor.MergeBase != advancedTip {
+		t.Errorf("emitted diff_base merge_base = %q, want the fetched current tip B1 %q (the re-anchor target)", reanchor.MergeBase, advancedTip)
+	}
+	if reanchor.BaseRef != "main" {
+		t.Errorf("diff_base_reanchored base_ref = %q, want the fork-point label %q unchanged by re-anchoring", reanchor.BaseRef, "main")
 	}
 }
 
@@ -9191,6 +9225,65 @@ func TestResolveDiffBaseRef_UnrelatedTip_DegradesToLocalMergeBase(t *testing.T) 
 	}
 	if got != forkPoint {
 		t.Errorf("degraded result = %q, want the local-ref merge-base %q", got, forkPoint)
+	}
+}
+
+// TestResolveDiffBaseRef_DecompositionChild_OriginPrefixedBaseRef covers the one
+// production shape the other #1975 tests miss: the decomposition-child baseRef is
+// "origin/<shared-branch>" (from resolvePolicyBaseRef), which resolveDiffBaseRef
+// must strip via strings.TrimPrefix before handing the bare branch name to the
+// re-anchor fetch. The bare-name shapes ("main", "HEAD") the sibling tests drive
+// never exercise that trim, so a broken trim or a fetch/merge-base that misbehaved
+// for an origin-prefixed ref would degrade SILENTLY (diff_base_refresh_degraded)
+// and children would quietly keep the stale-base diff this PR exists to fix. This
+// asserts (a) the fetch seam receives the origin/-stripped branch name and (b) the
+// re-anchor SUCCEEDS — merge-base against the fetched tip is returned and
+// diff_base_reanchored (not the degrade event) is emitted.
+func TestResolveDiffBaseRef_DecompositionChild_OriginPrefixedBaseRef(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "f.txt"), "x\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "fork point")
+	forkPoint := gitHead(t, repo)
+
+	// A current tip that DESCENDS from the fork point (shares history with HEAD),
+	// so merge-base(currentTip, HEAD=forkPoint) resolves to the fork point and the
+	// re-anchor succeeds rather than degrading.
+	runGit("checkout", "-b", "shared-advance")
+	mustWrite(t, filepath.Join(repo, "adv.txt"), "y\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "shared branch advance")
+	currentTip := gitHead(t, repo)
+	runGit("checkout", "main") // HEAD back at the fork point
+
+	withFakeRemoteConfigured(t, true)
+	var gotBranch string
+	withFakeFetchDiffBaseTip(t, func(_ context.Context, _, _, branch, _ string) (string, error) {
+		gotBranch = branch
+		return currentTip, nil
+	})
+
+	var log strings.Builder
+	got := resolveDiffBaseRef(context.Background(), "origin/shared-branch", repo, "stage-child", &log)
+
+	// The origin/ prefix was stripped — the fetch targets the bare shared branch,
+	// not "origin/shared-branch" (which would resolve nothing on the remote).
+	if gotBranch != "shared-branch" {
+		t.Errorf("fetch branch = %q, want the origin/-stripped bare branch %q", gotBranch, "shared-branch")
+	}
+	// Re-anchor succeeded for the origin-prefixed ref: merge-base(currentTip,
+	// HEAD) = forkPoint is returned, and the success (not degrade) event fires.
+	if got != forkPoint {
+		t.Errorf("re-anchored ref = %q, want merge-base against the fetched tip %q", got, forkPoint)
+	}
+	if !strings.Contains(log.String(), "diff_base_reanchored") {
+		t.Errorf("expected diff_base_reanchored on a successful child re-anchor; got log:\n%s", log.String())
+	}
+	if strings.Contains(log.String(), "diff_base_refresh_degraded") {
+		t.Errorf("origin-prefixed child re-anchor must NOT degrade; got log:\n%s", log.String())
 	}
 }
 
