@@ -42,6 +42,12 @@ One issue → one run → one PR.
    poll is the authoritative path to a terminal status. Once the review
    settles, read the gate with **`fishhawk_get_gate_view`** (see below) to
    decide fix-up vs merge — one call carrying the full concern notes.
+   For an hour-scale wait (a full implement pass or review round), supply a
+   `progressToken` plus `timeout_seconds` up to **7200** (#1963): the per-tick
+   MCP progress heartbeat keeps the client's idle clock alive, so one call
+   replaces the old 600s re-arm loop. Without a token the cap stays 600s and
+   the resumable re-arm contract is unchanged. The same token-conditional cap +
+   heartbeat applies to `fishhawk_await_audit`.
 6. **Approve the PR, then `fishhawk_merge_run`.** Approve the PR with an
    operator verdict (`gh pr review --approve`, under your own GitHub identity —
    App-identity approval is deferred to E39) before every merge — no
