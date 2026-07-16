@@ -12,9 +12,16 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
-// acceptanceAdmissionWalkTimeout bounds ONLY the pre-mutation phase of the
-// short-circuit walk — the orchestrator's admissibility reads (GetRun /
-// ListStagesForRun) and lock acquisition (#1936, binding condition 1). It is a
+// acceptanceAdmissionWalkTimeout bounds the context-cancellable part of the
+// pre-mutation phase of the short-circuit walk — the orchestrator's
+// admissibility reads (GetRun / ListStagesForRun), which run under this deadline
+// (#1936, binding condition 1). It does NOT bound the per-stage lock acquisition
+// that precedes those reads: LockStageAdmission blocks on a plain, non-context-
+// aware sync.Mutex.Lock(), so a goroutine parked behind a long-held lock waits
+// past this deadline. The design still degrades safely — once the lock is
+// acquired the first admissibility read fails fast on the by-then-expired
+// context, so nothing mutates, and the lock hold is itself bounded by the
+// holder's own DB/statement timeouts (the honest liveness backstop). It is a
 // var, not a const, purely so the detached-completion test can shrink it to
 // prove that a transition slower than this bound still fully settles: once
 // TryShortCircuitAcceptance reaches its first state transition it re-detaches

@@ -1368,14 +1368,18 @@ func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run
 // otherwise widen the critical section for no benefit).
 //
 // POINT OF NO RETURN (binding condition 1, #1936): the caller MAY bound the
-// pre-mutation phase (the GetRun/ListStagesForRun admissibility reads + lock
-// acquisition) with a timeout, but once the walk's FIRST state transition is
-// reachable the remaining walk (all transitions + verdict audit + settle + the
-// Advance re-entry) runs on context.WithoutCancel(ctx) — a context with NO
-// deadline that neither a client disconnect nor the handler's own timeout can
-// cancel. So an admission that starts either fully settles or never starts;
-// individual repo calls remain bounded by their own DB/statement timeouts, the
-// honest liveness backstop.
+// pre-mutation phase (the GetRun/ListStagesForRun admissibility reads) with a
+// timeout, but once the walk's FIRST state transition is reachable the remaining
+// walk (all transitions + verdict audit + settle + the Advance re-entry) runs on
+// context.WithoutCancel(ctx) — a context with NO deadline that neither a client
+// disconnect nor the handler's own timeout can cancel. So an admission that
+// starts either fully settles or never starts. The timeout does NOT bound the
+// LockStageAdmission acquisition that precedes those reads: it is a plain,
+// non-context-aware sync.Mutex.Lock(), so a goroutine parked behind a long-held
+// lock waits past the deadline. That degrades safely — the lock hold is bounded
+// by the holder's own walk, whose repo calls remain bounded by their DB/statement
+// timeouts (the honest liveness backstop), and on release the by-then-expired
+// context fails the first read fast so nothing mutates.
 //
 // The second return value, liveValidationRequired (E48.6 / #1953), is true ONLY on
 // the admissible-acceptance, plan-loaded, no-predicate-matched path (the short

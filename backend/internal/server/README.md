@@ -84,13 +84,20 @@ unnecessary.
   deploys a single replica).
 - **Bounded detached walk (binding condition 1, #1936):** the handler invokes
   `TryShortCircuitAcceptance` under `context.WithTimeout(context.WithoutCancel(r.Context()), acceptanceAdmissionWalkTimeout)`.
-  The timeout bounds ONLY the pre-mutation phase (admissibility reads + lock
-  acquisition); `TryShortCircuitAcceptance` re-detaches onto `context.WithoutCancel`
-  with NO deadline at its **point of no return** (the first state transition), so a
-  client disconnect or the handler timeout can no longer abort the walk mid-flight.
-  An admission that begins its state walk therefore always runs to completion
-  (settle + audit + `Advance`) — nothing changed, or fully settled. Individual repo
-  calls stay bounded by their own DB/statement timeouts, the honest liveness backstop.
+  The timeout bounds ONLY the context-cancellable part of the pre-mutation phase
+  (the `GetRun`/`ListStagesForRun` admissibility reads). It does **not** bound the
+  per-stage `LockStageAdmission` acquisition that precedes those reads — that blocks
+  on a plain, non-context-aware `sync.Mutex.Lock()`, so a goroutine parked behind a
+  long-held lock waits past the deadline. This degrades safely: once the lock is
+  acquired the first admissibility read fails fast on the by-then-expired context,
+  so nothing mutates, and the lock hold is itself bounded by the holder's own
+  DB/statement timeouts. `TryShortCircuitAcceptance` re-detaches onto
+  `context.WithoutCancel` with NO deadline at its **point of no return** (the first
+  state transition), so a client disconnect or the handler timeout can no longer
+  abort the walk mid-flight. An admission that begins its state walk therefore
+  always runs to completion (settle + audit + `Advance`) — nothing changed, or fully
+  settled. Individual repo calls stay bounded by their own DB/statement timeouts, the
+  honest liveness backstop.
 - **Auth mirrors `handleRetryStage`:** authenticated identity required (401
   anonymous), `write:stages` scope gates a token identity (403
   `insufficient_scope`), and an `mcp:run:<uuid>` subject may only admit stages
