@@ -700,8 +700,14 @@ components:
             anything) the drive run is waiting on the operator for.
             Emitted by `GET /v0/runs/{run_id}` ONLY; omitted on
             non-drive runs, terminal runs (the recorded step is
-            history, not an instruction), and when the latest
-            auto-advance carries no next action.
+            history, not an instruction), when the latest
+            auto-advance carries no next action, and when a
+            host-dispatch action (`run_plan_stage` /
+            `run_implement_stage`) has been outrun by its named stage —
+            suppressed once that stage advances past the host-spawnable
+            states `{pending, awaiting_host_dispatch}`, so a parked
+            entry no longer names a dispatch the operator already
+            performed (#1961).
         auto_advanced:
           type: array
           items:
@@ -5073,8 +5079,10 @@ paths:
 
         **`next_action`** reuses the same `run_auto_advanced` drive
         distillation as `GET /v0/runs/{run_id}`: best-effort, omitted on
-        non-drive runs, terminal runs, and any read failure — never
-        fabricated.
+        non-drive runs, terminal runs, any read failure, and when a
+        host-dispatch action has been outrun by its named stage
+        (suppressed once the stage advances past `{pending,
+        awaiting_host_dispatch}`, #1961) — never fabricated.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -5117,8 +5125,11 @@ paths:
                         description: |
                           Distilled operator next step, reusing the
                           `GET /v0/runs/{run_id}` drive distillation.
-                          Omitted on non-drive runs, terminal runs, and
-                          on any read failure.
+                          Omitted on non-drive runs, terminal runs, on
+                          any read failure, and when a host-dispatch
+                          action has been outrun by its named stage
+                          (suppressed once the stage advances past
+                          `{pending, awaiting_host_dispatch}`, #1961).
         '400':
           description: run_id or stage_id is malformed (`validation_failed`).
           content:

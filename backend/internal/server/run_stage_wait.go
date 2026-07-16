@@ -224,7 +224,14 @@ func (s *Server) stageNextAction(ctx context.Context, runID uuid.UUID) *runNextA
 	if err != nil {
 		return nil
 	}
+	// Stage rows drive the host-dispatch next_action staleness suppression
+	// (#1961). Best-effort: a list failure passes nil, so applyDriveSurfaces
+	// fails OPEN to today's surface (display-only) rather than failing the read.
+	stages, serr := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
+	if serr != nil {
+		stages = nil
+	}
 	var resp runResponse
-	applyDriveSurfaces(&resp, got, entries)
+	applyDriveSurfaces(&resp, got, entries, stages)
 	return resp.NextAction
 }

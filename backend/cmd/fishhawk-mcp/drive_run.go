@@ -162,6 +162,27 @@ const (
 	// "paged:<event>" and "decision_required:<state>" are composed inline.
 )
 
+// derivedAcceptancePending is the backend's derived_status value (mirroring
+// drive.RuleAcceptancePending per the thin local-copy rule — the backend rule's
+// doc comment declares this literal MUST byte-match the MCP surface) stamped
+// when review evidence is terminal and required PR checks are green while the
+// human review stage row still sits awaiting_approval (drive.RuleAcceptancePending,
+// backend/internal/server/server.go). At that state the authoritative next act
+// is a mechanical acceptance dispatch, NOT an operator judgment — so the driver
+// treats a review stage parked at awaiting_approval as non-blocking for both the
+// earliest-non-terminal walk and the acceptance precondition, and never composes
+// a decision_required:review_gate_parked stop. It MUST equal the next_actions
+// acceptance_pending state string (next_actions.go acceptanceStageNextActions);
+// the agreement table test pins that equality so producer and consumer cannot
+// drift across the HTTP boundary (#1961).
+const derivedAcceptancePending = "acceptance_pending"
+
+// driveReviewGateParkedState is the driveParkedGateState label for a review-type
+// stage parked at awaiting_approval. Under a derived acceptance_pending signal
+// this state is not an operator decision (#1961), so the observe-only gate
+// branch falls through to poll/stall rather than composing decision_required.
+const driveReviewGateParkedState = "review_gate_parked"
+
 // driveActionMerge is the delegation verb the gate endpoint returns for a
 // queued merge; mirrors backend delegation.ActionMerge (not imported per the
 // thin local-copy rule).
@@ -219,9 +240,17 @@ auto-driver (#1700).
 
 It is a bounded, resumable loop: it dispatches only the EARLIEST non-terminal
 stage once its gate preconditions hold (plan always, implement after plan
-succeeds, acceptance after implement succeeds and every review settles), so a
+succeeds, acceptance after implement succeeds and every review stage settles OR
+the run's derived_status reads acceptance_pending — the backend's settled-
+evidence signal that review evidence is terminal and required checks are green
+while only the human review row still sits awaiting_approval, so a parked human
+review row no longer strands a mechanical acceptance dispatch), so a
 fresh run whose stages are all created pending never dispatches implement or
-acceptance while the plan runner still holds the lineage lock. For that
+acceptance while the plan runner still holds the lineage lock. A
+decision_required stop always corresponds to a next_actions entry that names an
+operator judgment (a plan gate without may_approve, a split verdict / open
+concerns / undelegated merge, a pending scope amendment) — never a state whose
+authoritative next act is a bare dispatch or a poll. For that
 dispatchable stage it FIRST records the dispatch (POST
 /v0/runs/{id}/auto-drive/acts) and only on a successful record host-spawns the
 runner (record-before-dispatch makes an unaudited mechanical act impossible by
@@ -380,10 +409,22 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 			return nil, out, nil
 		}
 
-		runRow, gerr := r.api.GetRun(ctx, runUUID)
+		// Read the run via fetchRunDriveView (the SAME GET /v0/runs/{id}, richer
+		// decode carrying derived_status): the drive taxonomy keys the acceptance
+		// unblock on the backend's authoritative derived_status rather than
+		// re-classifying from raw stage rows (#1961). The embedded Run keeps every
+		// State/RunnerKind/WorkflowID/PullRequestURL usage working.
+		view, gerr := r.fetchRunDriveView(ctx, runUUID)
 		if gerr != nil {
 			return nil, out, fmt.Errorf("drive: get run: %w", gerr)
 		}
+		runRow := &view.Run
+		// The backend stamps derived_status acceptance_pending precisely when
+		// review evidence is terminal and required checks are green while the human
+		// review row still sits awaiting_approval — the settled-evidence signal that
+		// unblocks a mechanical acceptance dispatch. Absent (non-drive run, or any
+		// other derived value) behavior stays byte-identical.
+		acceptancePendingDerived := view.DerivedStatus == derivedAcceptancePending
 		// Local-only guard (authz): the drive loop records + host-spawns a LOCAL
 		// runner for every dispatchable stage, so a run whose runner_kind is not
 		// 'local' must be rejected BEFORE anything reaches the record-act /
@@ -465,7 +506,7 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 		}
 
 		// (c) Dispatch the first host-dispatchable stage — record BEFORE spawn.
-		if disp := driveDispatchableStage(stages, spawned); disp != nil {
+		if disp := driveDispatchableStage(stages, spawned, acceptancePendingDerived); disp != nil {
 			stall = 0
 			recordName := driveDispatchName(*disp, dispatchedCount)
 			// A prior run_auto_driven dispatch row for this stage name is a
@@ -814,8 +855,19 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 			continue
 		default:
 			// Observe-only. If a real gate is parked (a stage awaiting
-			// approval the driver could not auto-act), it is a decision.
-			if state := driveParkedGateState(stages); state != "" {
+			// approval the driver could not auto-act), it is a decision — EXCEPT a
+			// review stage parked at awaiting_approval under a derived
+			// acceptance_pending signal (#1961), whose authoritative next act is a
+			// mechanical acceptance dispatch, not an operator judgment. There, fall
+			// through to the signature/stall logic (poll; driveStallThreshold still
+			// bounds it) instead of composing the mislabeled
+			// decision_required:review_gate_parked. Belt-and-suspenders: after the
+			// dispatch branch consumed acceptance above, this branch is normally not
+			// reached at that state. Every other decision_required composition is
+			// untouched, so decision_required:* fires only where next_actions
+			// genuinely names an operator judgment.
+			if state := driveParkedGateState(stages); state != "" &&
+				(!acceptancePendingDerived || state != driveReviewGateParkedState) {
 				out.StoppedReason = "decision_required:" + state
 				out.NextActions = driveDecisionActions(state, runUUID, in.WorkingDir)
 				return nil, out, nil
@@ -885,11 +937,27 @@ func driveSleep(ctx context.Context, d time.Duration) {
 // drive rules for any unexpected sequence layout: implement requires a preceding
 // plan stage to have succeeded; acceptance requires the implement stage to have
 // succeeded and every review stage to be terminal.
-func driveDispatchableStage(stages []Stage, spawned map[string]bool) *Stage {
+//
+// acceptancePendingDerived (#1961): when the backend's derived_status reads
+// acceptance_pending — review evidence terminal, required checks green, only the
+// human review row still awaiting_approval — a review-type stage parked at
+// awaiting_approval is settled human-review evidence the backend has already
+// cleared for acceptance dispatch. It is SKIPPED in the earliest-non-terminal
+// walk so acceptance (the genuine next mechanical act) is chosen instead of
+// returning nil (which stranded the mechanical dispatch behind a mislabeled
+// review gate). A review stage in pending/dispatched/running still blocks — the
+// backend would not have stamped acceptance_pending with review evidence in
+// flight.
+func driveDispatchableStage(stages []Stage, spawned map[string]bool, acceptancePendingDerived bool) *Stage {
 	var earliest *Stage
 	for i := range stages {
 		st := &stages[i]
 		if stageStateIsTerminal(st.State) {
+			continue
+		}
+		if acceptancePendingDerived && st.Type == "review" && st.State == "awaiting_approval" {
+			// Settled human-review evidence under the derived signal — non-blocking
+			// for the earliest-non-terminal walk so acceptance is selected.
 			continue
 		}
 		if earliest == nil || st.Sequence < earliest.Sequence {
@@ -914,7 +982,7 @@ func driveDispatchableStage(stages []Stage, spawned map[string]bool) *Stage {
 	if spawned[earliest.ID] {
 		return nil // already spawned this invocation → driveAnyInFlight polls it
 	}
-	if !driveGatePreconditionsMet(*earliest, stages) {
+	if !driveGatePreconditionsMet(*earliest, stages, acceptancePendingDerived) {
 		return nil
 	}
 	return earliest
@@ -927,7 +995,14 @@ func driveDispatchableStage(stages []Stage, spawned map[string]bool) *Stage {
 // stage to be terminal. A defensive backstop for an unexpected sequence layout —
 // the earliest-non-terminal ordering in driveDispatchableStage already prevents
 // the common premature-dispatch case.
-func driveGatePreconditionsMet(st Stage, stages []Stage) bool {
+//
+// acceptancePendingDerived (#1961): under the backend's derived acceptance_pending
+// signal, acceptance's every-review-terminal requirement additionally accepts a
+// review stage parked at awaiting_approval (settled human-review evidence the
+// backend cleared for dispatch). A review stage in pending/dispatched/running
+// still blocks, so the backend's own precondition — it never stamps
+// acceptance_pending with review evidence in flight — is mirrored here.
+func driveGatePreconditionsMet(st Stage, stages []Stage, acceptancePendingDerived bool) bool {
 	switch st.Type {
 	case "implement":
 		for i := range stages {
@@ -944,6 +1019,11 @@ func driveGatePreconditionsMet(st Stage, stages []Stage) bool {
 				implementSucceeded = true
 			}
 			if s.Type == "review" && !stageStateIsTerminal(s.State) {
+				if acceptancePendingDerived && s.State == "awaiting_approval" {
+					// Settled human-review evidence under the derived signal — does
+					// not block the mechanical acceptance dispatch.
+					continue
+				}
 				return false
 			}
 		}

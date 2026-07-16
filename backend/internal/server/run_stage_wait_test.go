@@ -37,13 +37,26 @@ func shortenRunStageWaitPoll(t *testing.T) {
 // run.Repository for free.
 type waitStageRepo struct {
 	*orchestratorRepo
-	mu         sync.Mutex
-	getCalls   int
-	failOnCall int // 1-based; once getCalls reaches this, GetStage errors. 0 = never.
+	mu            sync.Mutex
+	getCalls      int
+	failOnCall    int   // 1-based; once getCalls reaches this, GetStage errors. 0 = never.
+	listStagesErr error // when set, ListStagesForRun errors (#1961 fail-open path)
 }
 
 func newWaitStageRepo() *waitStageRepo {
 	return &waitStageRepo{orchestratorRepo: newOrchestratorRepo()}
+}
+
+// ListStagesForRun errors when listStagesErr is set (the #1961 next_action
+// staleness fail-open path); otherwise it delegates to the orchestrator repo.
+func (r *waitStageRepo) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]*run.Stage, error) {
+	r.mu.Lock()
+	err := r.listStagesErr
+	r.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return r.orchestratorRepo.ListStagesForRun(ctx, runID)
 }
 
 func (r *waitStageRepo) GetStage(ctx context.Context, id uuid.UUID) (*run.Stage, error) {
@@ -391,7 +404,10 @@ func TestGetRunStage_StageBelongsToDifferentRun404(t *testing.T) {
 // run_auto_advanced entry carrying a next_action yields a non-nil
 // next_action; a non-drive run omits it.
 func TestGetRunStage_NextActionPopulated(t *testing.T) {
-	s, rr, au, runRow, stage := runStageWaitServer(t, run.StageStateAwaitingApproval)
+	// The implement stage is seeded PENDING (host-spawnable) so the
+	// run_implement_stage next_action is not suppressed by the #1961 staleness
+	// guard — the general distillation still surfaces it.
+	s, rr, au, runRow, stage := runStageWaitServer(t, run.StageStatePending)
 	// Mark the run drive-enabled and seed one run_auto_advanced entry.
 	rr.orchestratorRepo.mu.Lock()
 	runRow.Drive = true
@@ -432,6 +448,72 @@ func TestGetRunStage_NextActionPopulated(t *testing.T) {
 	resp2 := decodeRunStageWait(t, w2)
 	if resp2.NextAction != nil {
 		t.Errorf("next_action = %+v on non-drive run, want nil", resp2.NextAction)
+	}
+}
+
+// TestGetRunStage_NextAction_HostDispatchStale (#1961): stageNextAction
+// suppresses a run_implement_stage next_action once the implement stage has
+// advanced past the host-spawnable states, mirroring handleGetRun's suppression.
+func TestGetRunStage_NextAction_HostDispatchStale(t *testing.T) {
+	s, rr, au, runRow, stage := runStageWaitServer(t, run.StageStateSucceeded)
+	rr.orchestratorRepo.mu.Lock()
+	runRow.Drive = true
+	rr.orchestratorRepo.mu.Unlock()
+	adv := drive.Advance{
+		Rule:       drive.RulePlanApprovedDispatch,
+		From:       "awaiting_approval",
+		To:         "running",
+		NextAction: &drive.NextAction{Action: "run_implement_stage"},
+	}
+	payload, err := json.Marshal(adv)
+	if err != nil {
+		t.Fatalf("marshal advance: %v", err)
+	}
+	au.entries = []*audit.Entry{{Sequence: 1, Timestamp: time.Now().UTC(), Category: drive.Category, Payload: payload}}
+
+	w := getRunStage(t, s, runRow.ID, stage.ID, -1, func(r *http.Request) *http.Request {
+		return withOperatorIdentity(r, "read:runs")
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body = %s", w.Code, w.Body.String())
+	}
+	resp := decodeRunStageWait(t, w)
+	if resp.NextAction != nil {
+		t.Errorf("next_action = %+v, want suppressed (implement stage succeeded past host-spawnable)", resp.NextAction)
+	}
+}
+
+// TestGetRunStage_NextAction_StageListError_FailsOpen (#1961): a
+// ListStagesForRun error in stageNextAction degrades to today's surface — the
+// run_implement_stage next_action is surfaced (never suppressed) rather than
+// failing the read.
+func TestGetRunStage_NextAction_StageListError_FailsOpen(t *testing.T) {
+	s, rr, au, runRow, stage := runStageWaitServer(t, run.StageStateSucceeded)
+	rr.orchestratorRepo.mu.Lock()
+	runRow.Drive = true
+	rr.orchestratorRepo.mu.Unlock()
+	rr.mu.Lock()
+	rr.listStagesErr = errors.New("stage store down")
+	rr.mu.Unlock()
+	adv := drive.Advance{
+		Rule:       drive.RulePlanApprovedDispatch,
+		NextAction: &drive.NextAction{Action: "run_implement_stage"},
+	}
+	payload, err := json.Marshal(adv)
+	if err != nil {
+		t.Fatalf("marshal advance: %v", err)
+	}
+	au.entries = []*audit.Entry{{Sequence: 1, Timestamp: time.Now().UTC(), Category: drive.Category, Payload: payload}}
+
+	w := getRunStage(t, s, runRow.ID, stage.ID, -1, func(r *http.Request) *http.Request {
+		return withOperatorIdentity(r, "read:runs")
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body = %s", w.Code, w.Body.String())
+	}
+	resp := decodeRunStageWait(t, w)
+	if resp.NextAction == nil || resp.NextAction.Action != "run_implement_stage" {
+		t.Errorf("next_action = %+v, want fail-open surfaced on a stage-list read error", resp.NextAction)
 	}
 }
 

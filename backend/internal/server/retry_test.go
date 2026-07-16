@@ -777,6 +777,13 @@ func newDriveRetryServer(t *testing.T, driveEnabled bool, runnerKind string, sta
 	r := rr.seedRun()
 	r.Drive = driveEnabled
 	r.RunnerKind = runnerKind
+	// LOCK runner_kind so the orchestrator's real local-park branch runs on the
+	// retry reopen: a resolved local run parks the reopened stage in
+	// awaiting_host_dispatch (orchestrator.go), the host-spawnable state where
+	// the run_<stage>_stage next_action is genuinely ready — not 'dispatched',
+	// which the #1961 staleness guard would (correctly) suppress. Without this
+	// the fake dispatched the stage while the recorded advance claimed a park.
+	r.RunnerKindResolved = true
 	stage := rr.seedStage(r.ID, 0, run.StageStateFailed)
 	stage.Type = stageType
 	c := cat

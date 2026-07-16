@@ -1405,6 +1405,13 @@ func newDriveDecompositionRecoverServer(t *testing.T, driveEnabled bool, runnerK
 	child, implStage := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
 	child.Drive = driveEnabled
 	child.RunnerKind = runnerKind
+	// LOCK runner_kind so the orchestrator's real local-park branch runs on the
+	// recover re-drive: a resolved local run parks the reopened implement stage
+	// in awaiting_host_dispatch (orchestrator.go), the host-spawnable state where
+	// the run_implement_stage next_action is genuinely ready — not 'dispatched',
+	// which the #1961 staleness guard would (correctly) suppress. Without this the
+	// fake dispatched the stage while the recorded advance claimed a park.
+	child.RunnerKindResolved = true
 	return s, rr, au, child, implStage
 }
 

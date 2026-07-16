@@ -1149,7 +1149,16 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 			s.cfg.Logger.Warn("list run_auto_advanced failed; omitting drive surfaces",
 				"run_id", runID.String(), "error", derr.Error())
 		} else {
-			applyDriveSurfaces(&resp, got, entries)
+			// Stage rows drive the host-dispatch next_action staleness
+			// suppression (#1961). Best-effort: a list failure warn-logs and passes
+			// nil, so applyDriveSurfaces fails OPEN to today's surface (display-only).
+			stages, serr := s.cfg.RunRepo.ListStagesForRun(r.Context(), runID)
+			if serr != nil {
+				s.cfg.Logger.Warn("list stages failed; next_action staleness suppression disabled (fail-open)",
+					"run_id", runID.String(), "error", serr.Error())
+				stages = nil
+			}
+			applyDriveSurfaces(&resp, got, entries, stages)
 		}
 	}
 	// Delegation surface (ADR-040 / #1026): evaluated on the single-run
@@ -1399,7 +1408,15 @@ func (s *Server) buildDelegationPayload(ctx context.Context, runRow *run.Run) *r
 // the {gates resolved, checks green, PR open} derivation the
 // checks_green_awaiting_merge stamp encodes at emission time. Corrupt
 // payloads are skipped: the surface degrades to the readable entries.
-func applyDriveSurfaces(resp *runResponse, runRow *run.Run, entries []*audit.Entry) {
+//
+// stages carries the run's stage rows (best-effort — nil on a read error,
+// which fails OPEN to today's surface): a next_action naming a host dispatch
+// (run_plan_stage / run_implement_stage) is SUPPRESSED once the named stage has
+// advanced past the host-spawnable states {pending, awaiting_host_dispatch}, so
+// a parked run_implement_stage entry no longer lags a stage behind after
+// implement dispatches/succeeds (#1961). derived_status distillation is
+// unchanged.
+func applyDriveSurfaces(resp *runResponse, runRow *run.Run, entries []*audit.Entry, stages []*run.Stage) {
 	if len(entries) == 0 {
 		return
 	}
@@ -1427,7 +1444,7 @@ func applyDriveSurfaces(resp *runResponse, runRow *run.Run, entries []*audit.Ent
 	if latest == nil || runRow.State.IsTerminal() {
 		return
 	}
-	if latest.NextAction != nil {
+	if latest.NextAction != nil && !nextActionStale(latest.NextAction.Action, stages) {
 		resp.NextAction = &runNextActionPayload{
 			Action: latest.NextAction.Action,
 			Detail: latest.NextAction.Detail,
@@ -1460,6 +1477,43 @@ func applyDriveSurfaces(resp *runResponse, runRow *run.Run, entries []*audit.Ent
 			resp.DerivedStatus = string(latest.Rule)
 		}
 	}
+}
+
+// nextActionStale reports whether a distilled next_action naming a host
+// dispatch has been outrun by the named stage's actual state (#1961). The
+// recorded next_action lags because applyDriveSurfaces surfaces the LATEST
+// run_auto_advanced entry unconditionally — a parked run_implement_stage entry
+// survives after implement dispatches/succeeds since nothing re-stamps until
+// reviews settle, so the surface keeps naming a dispatch the operator already
+// performed. It maps the two host-dispatch park actions to their stage type and
+// SUPPRESSES (returns true) when the named stage exists and its state is outside
+// the host-spawnable set {pending, awaiting_host_dispatch} — i.e.
+// dispatched/running/terminal. Every other action (await_acceptance, merge_pr,
+// classify_ci_failure, fishhawk_approve_deploy, read_acceptance_*), a not-found
+// stage, and a nil stage list are never suppressed (fail toward surfacing); a
+// retried stage re-opened to pending naturally re-surfaces the action.
+func nextActionStale(action string, stages []*run.Stage) bool {
+	var wantType run.StageType
+	switch action {
+	case "run_plan_stage":
+		wantType = run.StageTypePlan
+	case "run_implement_stage":
+		wantType = run.StageTypeImplement
+	default:
+		return false // not a host-dispatch park action → never stale
+	}
+	for _, st := range stages {
+		if st == nil || st.Type != wantType {
+			continue
+		}
+		switch st.State {
+		case run.StageStatePending, run.StageStateAwaitingHostDispatch:
+			return false // still host-spawnable → the dispatch is genuinely next
+		default:
+			return true // advanced past the spawnable states → the recorded action is stale
+		}
+	}
+	return false // no matching stage row → fail toward surfacing
 }
 
 // buildRunConcernsPayload renders the open-concern summary for the
