@@ -28,6 +28,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -161,6 +162,52 @@ type Orchestrator struct {
 	// posture) degrades the audit-log URL to a relative `/v0/runs/<id>/audit`,
 	// matching the defensive nil-URL posture elsewhere in this file.
 	ExternalURL string
+
+	// stageAdmissionLocks fences the acceptance-admission short-circuit walk
+	// (TryShortCircuitAcceptance) against the concurrent host-dispatch spawn
+	// marker (server.handleHostDispatchStage) WITHIN one fishhawkd process
+	// (#1936). It maps a stage UUID -> *sync.Mutex; LockStageAdmission is the
+	// shared accessor both call sites use. Zero-value usable — the struct-literal
+	// construction used throughout production wiring and tests needs no
+	// constructor change (sync.Map's zero value is ready, and each mutex is
+	// created lazily via LoadOrStore).
+	//
+	// DELIBERATELY NEVER EVICTS (binding condition 2, #1936): one mutex per
+	// admission-touched stage per process lifetime, negligible at v0 volume.
+	// Eviction is not an oversight — deleting a key while a concurrent
+	// LoadOrStore could observe it is a correctness hazard (two callers ending up
+	// on different mutex instances for the same stage, defeating the fence) not
+	// worth the handful of bytes reclaimed. Do NOT add eviction.
+	//
+	// The fence is single-process only. The multi-replica upgrade is a
+	// DB-transactional walk; out of scope for v0, which deploys a single replica
+	// (docs/deploy/kubernetes.md). A two-process race is exactly what an
+	// in-process lock cannot serialize, so the residual is documented rather than
+	// silently claimed closed.
+	stageAdmissionLocks sync.Map
+}
+
+// LockStageAdmission acquires the per-stage admission mutex for stageID and
+// returns its unlock function (#1936). It is the single fence shared by the
+// acceptance-admission short-circuit walk (TryShortCircuitAcceptance) and the
+// host-dispatch spawn marker (server.handleHostDispatchStage): holding it across
+// each side's read -> admissibility/eligibility check -> transition serializes
+// the two so the marker cannot observe a walk-intermediate 'dispatched' and
+// proceed to spawn while the walk continues to succeeded. The mutex is created
+// lazily on first use (LoadOrStore) and never evicted — see the
+// stageAdmissionLocks field comment for the accepted-trade-off rationale.
+//
+// Caller MUST invoke the returned unlock exactly once (defer it). The lock is a
+// plain sync.Mutex, so it is NOT reentrant: no code path acquires it twice on
+// one goroutine (host-dispatch never re-enters, and TryShortCircuitAcceptance
+// releases it BEFORE the Advance re-entry).
+func (o *Orchestrator) LockStageAdmission(stageID uuid.UUID) func() {
+	m, _ := o.stageAdmissionLocks.LoadOrStore(stageID, &sync.Mutex{})
+	// LoadOrStore only ever stores a *sync.Mutex, so the assertion cannot fail;
+	// the two-value form keeps errcheck happy without a superfluous nil branch.
+	mu, _ := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 // Outcome describes what Advance did. Useful for telemetry and
@@ -1167,11 +1214,19 @@ const (
 // short-circuit follows. The state machine forbids skipping straight to
 // succeeded, and it also forbids re-issuing an already-passed transition, so
 // walkAcceptanceToSucceededFrom starts from the stage's CURRENT state: Advance
-// always finds the stage pending, but a local operator host dispatch may find it
+// always finds the stage pending, and a local operator host dispatch may find it
 // parked at 'awaiting_host_dispatch' (#1912, was the conflated 'dispatched'
-// park pre-#1928) or, for a migration-missed legacy row, at 'dispatched'.
-// awaiting_host_dispatch is inserted between pending and dispatched so a park
-// walks awaiting_host_dispatch → dispatched → running → succeeded.
+// park pre-#1928). awaiting_host_dispatch is inserted between pending and
+// dispatched so a park walks awaiting_host_dispatch → dispatched → running →
+// succeeded.
+//
+// 'dispatched' REMAINS an intermediate state the walk passes THROUGH, but post-
+// #1936 it is no longer an admissible START state for TryShortCircuitAcceptance:
+// post-#1912 a 'dispatched' acceptance stage means the host-dispatch marker
+// already stamped a spawn attempt, so short-circuiting it under a live runner is
+// exactly the double-drive #1936 closes. A migration-missed legacy 'dispatched'
+// park therefore degrades to the normal operator-dispatched spawn path (pre-#1928
+// behavior) rather than short-circuiting.
 var acceptanceStateWalkOrder = []run.StageState{
 	run.StageStatePending,
 	run.StageStateAwaitingHostDispatch,
@@ -1288,14 +1343,43 @@ func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run
 // whose plan is out-of-scope / empty-criteria) settles server-side WITHOUT
 // spawning a runner that would fail category-C acceptance_target_unreachable.
 //
-// The target must be an acceptance stage in a dispatch-admissible state (pending,
-// the local 'awaiting_host_dispatch' park, or a legacy 'dispatched' park); every
-// other state — already-settled,
-// non-acceptance, an unknown stage id — returns (nil, false, nil) as a no-op, which
-// the endpoint renders short_circuited:false and the caller's own spawn path handles
-// as today. On a hit it walks the stage to succeeded, emits the matching audit,
-// then re-enters Advance so the run rolls forward (completeRun or later stages)
-// exactly as the inline arm does, and returns the fired short-circuit.
+// The target must be an acceptance stage in a dispatch-admissible state — post-
+// #1936 that set is exactly {pending, awaiting_host_dispatch}. 'dispatched' is NO
+// LONGER admissible: post-#1912 a 'dispatched' acceptance stage means the host-
+// dispatch marker already stamped a spawn attempt, so short-circuiting it under a
+// live runner is the double-drive this closes (a migration-missed legacy
+// 'dispatched' park degrades to the normal operator-dispatched spawn path
+// instead). Every other state — already-settled, non-acceptance, an unknown stage
+// id — returns (nil, false, nil) as a no-op, which the endpoint renders
+// short_circuited:false and the caller's own spawn path handles as today. On a hit
+// it walks the stage to succeeded, emits the matching audit, then re-enters
+// Advance so the run rolls forward (completeRun or later stages) exactly as the
+// inline arm does, and returns the fired short-circuit.
+//
+// CONCURRENCY FENCE (#1936): the whole read -> admissibility-check -> walk runs
+// under the per-stage admission lock (LockStageAdmission) that the host-dispatch
+// spawn marker (server.handleHostDispatchStage) also takes, serializing the two
+// within one fishhawkd process. The marker therefore either waits for the walk to
+// finish (then observes the settled stage and 409s, spawning nothing) or wins the
+// CAS first (then this admission re-reads 'dispatched' UNDER the lock and no-ops
+// per the narrowed admissible set). The lock is released BEFORE the Advance
+// re-entry: the double-drive race is over once the stage is terminal, and Advance
+// must not run under the lock (it re-enters this package's advance loop and would
+// otherwise widen the critical section for no benefit).
+//
+// POINT OF NO RETURN (binding condition 1, #1936): the caller MAY bound the
+// pre-mutation phase (the GetRun/ListStagesForRun admissibility reads) with a
+// timeout, but once the walk's FIRST state transition is reachable the remaining
+// walk (all transitions + verdict audit + settle + the Advance re-entry) runs on
+// context.WithoutCancel(ctx) — a context with NO deadline that neither a client
+// disconnect nor the handler's own timeout can cancel. So an admission that
+// starts either fully settles or never starts. The timeout does NOT bound the
+// LockStageAdmission acquisition that precedes those reads: it is a plain,
+// non-context-aware sync.Mutex.Lock(), so a goroutine parked behind a long-held
+// lock waits past the deadline. That degrades safely — the lock hold is bounded
+// by the holder's own walk, whose repo calls remain bounded by their DB/statement
+// timeouts (the honest liveness backstop), and on release the by-then-expired
+// context fails the first read fast so nothing mutates.
 //
 // The second return value, liveValidationRequired (E48.6 / #1953), is true ONLY on
 // the admissible-acceptance, plan-loaded, no-predicate-matched path (the short
@@ -1308,6 +1392,21 @@ func (o *Orchestrator) TryShortCircuitAcceptance(ctx context.Context, runID, sta
 	if o.Runs == nil {
 		return nil, false, errors.New("orchestrator: Runs is nil")
 	}
+
+	// Acquire the per-stage admission fence BEFORE the admissibility reads so the
+	// concurrent host-dispatch marker cannot observe a walk-intermediate state
+	// (#1936). Released explicitly before the Advance re-entry (see below); the
+	// deferred unlock is the safety net for every early-return / error path.
+	unlock := o.LockStageAdmission(stageID)
+	unlocked := false
+	releaseLock := func() {
+		if !unlocked {
+			unlocked = true
+			unlock()
+		}
+	}
+	defer releaseLock()
+
 	r, err := o.Runs.GetRun(ctx, runID)
 	if err != nil {
 		return nil, false, fmt.Errorf("orchestrator: get run for acceptance admission: %w", err)
@@ -1326,27 +1425,41 @@ func (o *Orchestrator) TryShortCircuitAcceptance(ctx context.Context, runID, sta
 	if target == nil {
 		return nil, false, nil
 	}
-	// Dispatch-admissible only: pending, the local 'awaiting_host_dispatch' park
-	// (#1912) an operator host dispatch finds, or a legacy 'dispatched' park a
-	// migration missed (the state walk skips the already-passed transitions). Any
-	// other state — already succeeded/failed, a run in flight — is a
-	// non-admissible no-op (short_circuited:false), never a state change.
+	// Dispatch-admissible only: pending or the local 'awaiting_host_dispatch' park
+	// (#1912) an operator host dispatch finds. 'dispatched' is deliberately EXCLUDED
+	// post-#1936 — under the fence above, a 'dispatched' read here means the marker
+	// won the CAS (a spawn attempt exists), so short-circuiting would double-drive.
+	// Any other state — already succeeded/failed, a run in flight, or a
+	// migration-missed legacy 'dispatched' park — is a non-admissible no-op
+	// (short_circuited:false), never a state change; a legacy park degrades to the
+	// normal operator-dispatched spawn path (pre-#1928 behavior, safe).
 	if target.State != run.StageStatePending &&
-		target.State != run.StageStateAwaitingHostDispatch &&
-		target.State != run.StageStateDispatched {
+		target.State != run.StageStateAwaitingHostDispatch {
 		return nil, false, nil
 	}
-	sc, liveValidationRequired, err := o.tryShortCircuitAcceptanceCore(ctx, r, stages, target)
+
+	// POINT OF NO RETURN (binding condition 1, #1936): from here the walk may
+	// mutate stage state, so it runs on a context that a client disconnect or the
+	// handler's own timeout can no longer cancel. context.WithoutCancel keeps the
+	// parent's values but drops its deadline and cancellation, so an admission that
+	// starts its walk always runs to completion — settle + audit + Advance — rather
+	// than wedging the stage at an intermediate state.
+	mutationCtx := context.WithoutCancel(ctx)
+	sc, liveValidationRequired, err := o.tryShortCircuitAcceptanceCore(mutationCtx, r, stages, target)
 	if err != nil {
 		return nil, false, err
 	}
 	if sc == nil {
 		return nil, liveValidationRequired, nil
 	}
+	// The race is over once the stage is terminal: release the fence BEFORE the
+	// Advance re-entry so Advance never runs under the admission lock.
+	releaseLock()
 	// Re-enter Advance so the now-terminal acceptance stage rolls the run
 	// forward (completeRun / later stages) in the same request — identical to
-	// the inline Advance arm's re-entry.
-	if _, err := o.Advance(ctx, runID); err != nil {
+	// the inline Advance arm's re-entry. Runs on the detached mutationCtx so a
+	// disconnect between the walk and this re-entry cannot strand the run.
+	if _, err := o.Advance(mutationCtx, runID); err != nil {
 		return nil, false, fmt.Errorf("orchestrator: advance after acceptance short-circuit: %w", err)
 	}
 	return sc, false, nil

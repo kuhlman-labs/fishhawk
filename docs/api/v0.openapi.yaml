@@ -8668,13 +8668,25 @@ paths:
         `short_circuited: true` plus the fired predicate and the refreshed
         stage.
 
+        The admissible stage states are `pending` and
+        `awaiting_host_dispatch`. A `dispatched` acceptance stage is NOT
+        admissible (#1936): it means the host-dispatch spawn marker already
+        stamped a spawn attempt, so short-circuiting it under a live runner
+        would double-drive the stage — the response is
+        `short_circuited: false` and the caller proceeds on its normal spawn
+        path. An admission that BEGINS its state walk always runs to
+        completion (settle + verdict audit + advance) independent of the
+        client connection: a client disconnect or request timeout can no
+        longer abort the walk mid-flight, so the outcome is binary — nothing
+        changed, or the stage fully settled.
+
         **Fail-open by design.** A non-admissible stage state (already
-        settled, mixed criteria, an unconfigured orchestrator) returns
-        `short_circuited: false` — the normal no-op path; the caller
-        records spawn evidence and spawns a runner exactly as today.
-        Admission is an evaluate-and-maybe-settle pre-step, so a degraded
-        server never blocks a legitimate dispatch. The endpoint reuses the
-        `write:stages` scope and adds no new scope or audit kind.
+        settled, a `dispatched` stage, mixed criteria, an unconfigured
+        orchestrator) returns `short_circuited: false` — the normal no-op
+        path; the caller records spawn evidence and spawns a runner exactly
+        as today. Admission is an evaluate-and-maybe-settle pre-step, so a
+        degraded server never blocks a legitimate dispatch. The endpoint
+        reuses the `write:stages` scope and adds no new scope or audit kind.
 
         **needs_target augmentation (E48.6 / #1953).** On the
         `short_circuited: false` path, when the approved plan requires LIVE

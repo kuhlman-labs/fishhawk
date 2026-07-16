@@ -92,6 +92,26 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Fence against a concurrent acceptance-admission short-circuit walk (#1936).
+	// When an orchestrator is wired, acquire the SAME per-stage admission lock
+	// TryShortCircuitAcceptance holds across its read -> admissibility-check -> walk,
+	// and hold it here across the stage load -> eligibility checks -> CAS. This
+	// closes the mid-walk window: the marker can no longer observe a walk-intermediate
+	// 'dispatched' and return the idempotent {transitioned:false} proceed while the
+	// walk continues to succeeded. It instead either waits for the walk to complete
+	// (then observes the settled stage and 409s dispatch_not_admissible — the MCP
+	// verb's fail-closed marker handling spawns nothing) or wins the CAS first (then
+	// the late admission re-reads 'dispatched' under the lock and no-ops, since
+	// 'dispatched' is non-admissible post-#1936). When Orchestrator is nil the
+	// admission endpoint never walks, so no lock is taken and behavior is unchanged.
+	// Held via defer through the response write — the response touches no stage
+	// state, so the extra hold is harmless, while defer guarantees no early-return
+	// path leaks the lock and wedges the stage forever.
+	if s.cfg.Orchestrator != nil {
+		unlock := s.cfg.Orchestrator.LockStageAdmission(stageID)
+		defer unlock()
+	}
+
 	// Load the stage and validate the (run_id, stage_id) handle: a stage whose
 	// run_id differs from the path does not exist AT THIS PATH → 404.
 	stage, err := s.cfg.RunRepo.GetStage(r.Context(), stageID)

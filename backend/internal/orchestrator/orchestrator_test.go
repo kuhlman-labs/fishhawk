@@ -21,7 +21,25 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
+
+// forceStageState directly sets a seeded stage's state under the stub's lock,
+// bypassing transition validation — the concurrency tests use it to simulate the
+// host-dispatch marker CASing a stage to 'dispatched' or a walk settling it to
+// 'succeeded' without threading a full transition sequence.
+func forceStageState(rs *stubRuns, id uuid.UUID, st run.StageState) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	for _, list := range rs.stages {
+		for _, s := range list {
+			if s.ID == id {
+				s.State = st
+				return
+			}
+		}
+	}
+}
 
 // stubRuns is a minimal in-memory run.Repository covering the
 // methods Advance touches: GetRun, ListStagesForRun, TransitionRun,
@@ -3486,34 +3504,36 @@ func TestTryShortCircuitAcceptance(t *testing.T) {
 		}
 	})
 
-	// (b) same but the stage starts parked in 'dispatched' (the local host-
-	// dispatch park): the walk starts from dispatched and still settles.
-	t.Run("all-skip-with-basis dispatched-park -> short-circuits", func(t *testing.T) {
+	// (b) #1936 (failure mode a: dispatched-non-admissible): a 'dispatched'
+	// acceptance stage is NO LONGER admissible. Post-#1912 'dispatched' means the
+	// host-dispatch marker already stamped a spawn attempt, so short-circuiting it
+	// under a live runner is exactly the double-drive #1936 closes. It must now
+	// no-op — (nil, false, nil), ZERO stage transitions, ZERO verdict audits — and
+	// degrade to the normal operator-dispatched spawn path.
+	t.Run("dispatched-park -> non-admissible no-op (double-drive fence)", func(t *testing.T) {
 		planBytes := acceptanceSkipPlanBytes(t, nil, allSkip)
 		r, stages, rs, ra, o := seedAcceptanceSkipRunWithAcceptanceState(t, planBytes, run.StageStateDispatched)
 
-		sc, _, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
+		sc, liveReq, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
 		if err != nil {
 			t.Fatalf("TryShortCircuitAcceptance: %v", err)
 		}
-		if sc == nil || sc.Kind != AcceptanceShortCircuitAllSkipWithBasis {
-			t.Fatalf("short-circuit = %+v, want an all-skip-with-basis hit", sc)
+		if sc != nil {
+			t.Errorf("short-circuit = %+v, want nil (dispatched is non-admissible post-#1936)", sc)
 		}
-		if stages[3].State != run.StageStateSucceeded {
-			t.Errorf("acceptance stage = %q, want succeeded", stages[3].State)
+		if liveReq {
+			t.Error("liveValidationRequired = true, want false on a non-admissible 'dispatched' stage")
 		}
-		if r.State != run.StateSucceeded {
-			t.Errorf("run state = %q, want succeeded", r.State)
+		if stages[3].State != run.StageStateDispatched {
+			t.Errorf("acceptance stage = %q, want dispatched (untouched — no state change)", stages[3].State)
 		}
-		// The walk must NOT re-issue the already-passed pending->dispatched
-		// transition: it starts at running.
 		for _, tr := range rs.stageTransitions {
-			if tr.StageID == stages[3].ID && tr.To == run.StageStateDispatched {
-				t.Errorf("walk re-issued pending->dispatched for a stage already dispatched")
+			if tr.StageID == stages[3].ID {
+				t.Errorf("stage was transitioned to %q; want ZERO transitions on a non-admissible no-op", tr.To)
 			}
 		}
-		if n := countAcceptanceCategory(ra, "acceptance_outcome_recorded"); n != 1 {
-			t.Errorf("acceptance_outcome_recorded = %d, want 1", n)
+		if n := countAcceptanceCategory(ra, "acceptance_outcome_recorded"); n != 0 {
+			t.Errorf("acceptance_outcome_recorded = %d, want 0 (no walk fired)", n)
 		}
 	})
 
@@ -3697,6 +3717,111 @@ func TestTryShortCircuitAcceptance(t *testing.T) {
 		}
 		if stages[3].State != run.StageStatePending {
 			t.Errorf("acceptance stage = %q, want pending (untouched)", stages[3].State)
+		}
+	})
+}
+
+// TestTryShortCircuitAcceptance_AdmissionLock pins the per-stage admission fence
+// (#1936): the short-circuit walk serializes behind LockStageAdmission, and the
+// admissibility read happens UNDER the lock so a marker that wins the CAS while
+// the admission is blocked is observed and no-ops.
+func TestTryShortCircuitAcceptance_AdmissionLock(t *testing.T) {
+	allSkip := []map[string]any{
+		{"id": "webhook-fires", "statement": "webhook fires on close", "source": "inferred", "rationale": "external", "skip_expected": true, "expectation_basis": "validated in webhook_integration_test.go with a fake"},
+		{"id": "issue-closes", "statement": "issue auto-closes", "source": "inferred", "rationale": "external", "skip_expected": true, "expectation_basis": "validated in closer_e2e_test.go"},
+	}
+
+	// (i) lock-blocking: while a test-held LockStageAdmission for the target stage
+	// is outstanding, TryShortCircuitAcceptance blocks; it proceeds (and short-
+	// circuits) only after the lock is released.
+	t.Run("blocks while target-stage admission lock is held", func(t *testing.T) {
+		planBytes := acceptanceSkipPlanBytes(t, nil, allSkip)
+		r, stages, _, _, o := seedAcceptanceSkipRun(t, planBytes)
+
+		unlock := o.LockStageAdmission(stages[3].ID)
+
+		type res struct {
+			sc  *AcceptanceShortCircuit
+			err error
+		}
+		done := make(chan res, 1)
+		go func() {
+			sc, _, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
+			done <- res{sc, err}
+		}()
+
+		// The admission MUST NOT complete while the lock is held: it acquires the
+		// same per-stage mutex before its admissibility reads.
+		select {
+		case got := <-done:
+			t.Fatalf("TryShortCircuitAcceptance returned (sc=%+v err=%v) while the admission lock was held; it did not serialize behind the lock", got.sc, got.err)
+		case <-time.After(timescale.D(150 * time.Millisecond)):
+		}
+
+		unlock()
+
+		got := <-done
+		if got.err != nil {
+			t.Fatalf("TryShortCircuitAcceptance after unlock: %v", got.err)
+		}
+		if got.sc == nil || got.sc.Kind != AcceptanceShortCircuitAllSkipWithBasis {
+			t.Fatalf("short-circuit = %+v, want an all-skip-with-basis hit after the lock released", got.sc)
+		}
+		if stages[3].State != run.StageStateSucceeded {
+			t.Errorf("acceptance stage = %q, want succeeded", stages[3].State)
+		}
+	})
+
+	// (ii) marker-wins interleaving (failure mode c): hold the lock, CAS the seeded
+	// pending stage to 'dispatched' (simulating the host-dispatch marker winning),
+	// release, and assert the admission — which was blocked on the lock and so reads
+	// the stage UNDER the lock — observes 'dispatched', is non-admissible, and
+	// no-ops with NO state change and NO verdict audit. Without the lock the
+	// admission would read the still-pending stage and double-drive it; without the
+	// narrowed admissible set it would short-circuit the 'dispatched' stage anyway.
+	t.Run("marker wins CAS -> under-lock re-read no-ops", func(t *testing.T) {
+		planBytes := acceptanceSkipPlanBytes(t, nil, allSkip)
+		r, stages, rs, ra, o := seedAcceptanceSkipRun(t, planBytes)
+
+		unlock := o.LockStageAdmission(stages[3].ID)
+
+		type res struct {
+			sc      *AcceptanceShortCircuit
+			liveReq bool
+			err     error
+		}
+		done := make(chan res, 1)
+		go func() {
+			sc, liveReq, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
+			done <- res{sc, liveReq, err}
+		}()
+
+		// Ensure the admission is parked on the lock before the marker wins.
+		select {
+		case got := <-done:
+			t.Fatalf("admission ran without waiting for the lock (sc=%+v err=%v)", got.sc, got.err)
+		case <-time.After(timescale.D(150 * time.Millisecond)):
+		}
+
+		// Marker wins: the seeded pending stage flips to 'dispatched'.
+		forceStageState(rs, stages[3].ID, run.StageStateDispatched)
+		unlock()
+
+		got := <-done
+		if got.err != nil {
+			t.Fatalf("TryShortCircuitAcceptance: %v", got.err)
+		}
+		if got.sc != nil {
+			t.Errorf("short-circuit = %+v, want nil (under-lock re-read observed the marker's 'dispatched')", got.sc)
+		}
+		if got.liveReq {
+			t.Error("liveValidationRequired = true, want false on the non-admissible 'dispatched' re-read")
+		}
+		if stages[3].State != run.StageStateDispatched {
+			t.Errorf("acceptance stage = %q, want dispatched (untouched by the no-op admission)", stages[3].State)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_outcome_recorded"); n != 0 {
+			t.Errorf("acceptance_outcome_recorded = %d, want 0 (no walk fired)", n)
 		}
 	})
 }

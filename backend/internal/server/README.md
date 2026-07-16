@@ -56,12 +56,48 @@ unnecessary.
   `orchestrator.TryShortCircuitAcceptance(runID, stageID)` — the exported entry
   point that shares the exact predicate/walk/emit core the inline `Advance` arm
   delegates to (so retry-path behavior stays byte-identical). The target must be
-  an acceptance stage in a dispatch-admissible state (`pending`, or the local
-  `dispatched` park an operator host dispatch may find — the state walk starts
-  from the stage's CURRENT state). On a hit the stage is walked straight to
-  `succeeded`, the matching audit lands (skip marker for out-of-scope, an
+  an acceptance stage in a dispatch-admissible state — post-#1936 that set is
+  exactly `{pending, awaiting_host_dispatch}`. `dispatched` is deliberately NOT
+  admissible: post-#1912 a `dispatched` acceptance stage means the host-dispatch
+  marker already stamped a spawn attempt, so short-circuiting it under a live
+  runner is the double-drive #1936 closes; a migration-missed legacy `dispatched`
+  park degrades to the normal operator-dispatched spawn path (pre-#1928 behavior,
+  safe) instead. On a hit the stage is walked straight to `succeeded`, the
+  matching audit lands (skip marker for out-of-scope, an
   `acceptance_outcome_recorded` passed verdict for the other two), and `Advance`
   is re-entered so the run rolls forward.
+- **Admission ↔ host-dispatch fence (#1936):** the whole read → admissibility-check
+  → walk in `TryShortCircuitAcceptance` runs under a per-stage in-process mutex
+  (`orchestrator.LockStageAdmission`) that `host_dispatch.go::handleHostDispatchStage`
+  also takes across its stage-load → eligibility → CAS. This closes the mid-walk
+  race where a client that timed out on the admission POST re-read `pending`/
+  `dispatched`, then the host-dispatch marker observed the walk-intermediate
+  `dispatched` and returned the idempotent `{transitioned:false}` proceed while
+  the walk continued to `succeeded` — a double-drive. Serialized, the marker
+  either waits for the walk (then 409s on the settled stage — the MCP verb's
+  fail-closed marker handling spawns nothing) or wins the CAS first (then the late
+  admission re-reads `dispatched` under the lock and no-ops per the narrowed
+  admissible set). The lock map **never evicts** (one mutex per admission-touched
+  stage per process lifetime, negligible at v0 volume; eviction under a concurrent
+  `LoadOrStore` is a correctness hazard, not a bug). The fence is **single-process
+  only** — the multi-replica upgrade is a DB-transactional walk (out of scope; v0
+  deploys a single replica).
+- **Bounded detached walk (binding condition 1, #1936):** the handler invokes
+  `TryShortCircuitAcceptance` under `context.WithTimeout(context.WithoutCancel(r.Context()), acceptanceAdmissionWalkTimeout)`.
+  The timeout bounds ONLY the context-cancellable part of the pre-mutation phase
+  (the `GetRun`/`ListStagesForRun` admissibility reads). It does **not** bound the
+  per-stage `LockStageAdmission` acquisition that precedes those reads — that blocks
+  on a plain, non-context-aware `sync.Mutex.Lock()`, so a goroutine parked behind a
+  long-held lock waits past the deadline. This degrades safely: once the lock is
+  acquired the first admissibility read fails fast on the by-then-expired context,
+  so nothing mutates, and the lock hold is itself bounded by the holder's own
+  DB/statement timeouts. `TryShortCircuitAcceptance` re-detaches onto
+  `context.WithoutCancel` with NO deadline at its **point of no return** (the first
+  state transition), so a client disconnect or the handler timeout can no longer
+  abort the walk mid-flight. An admission that begins its state walk therefore
+  always runs to completion (settle + audit + `Advance`) — nothing changed, or fully
+  settled. Individual repo calls stay bounded by their own DB/statement timeouts, the
+  honest liveness backstop.
 - **Auth mirrors `handleRetryStage`:** authenticated identity required (401
   anonymous), `write:stages` scope gates a token identity (403
   `insufficient_scope`), and an `mcp:run:<uuid>` subject may only admit stages
@@ -404,6 +440,7 @@ Two endpoints exposing the in-process `AutoDriveRunGate` (E25.6 / ADR-047, the c
 - **`409 dispatch_not_admissible`** on a `running`/terminal/`awaiting_*` gate state (and on a CAS-loss whose winner moved the stage to any such state) — a live or settled stage can never be re-marked as a fresh spawn.
 - **Auth** mirrors the reap-failure endpoint: an authenticated identity carrying `write:runs` (anonymous → 401; a token without the scope → 403), with the auth ladder running BEFORE the nil-`RunRepo` guard (the #1915 revive convention) so config state never leaks pre-auth. A `(run_id, stage_id)` handle mismatch is `404 stage_not_found`.
 - The prompt-fetch liveness flip (`prompt.go::markStageRunningOnPromptFetch`) defensively walks a still-parked `awaiting_host_dispatch → dispatched → running` on the authenticated prompt fetch, so a version-skewed spawn whose marker call was skipped/lost still converges.
+- **Admission fence (#1936):** when an `Orchestrator` is wired, the handler acquires the SAME per-stage `orchestrator.LockStageAdmission` mutex the acceptance-admission short-circuit walk holds, across its stage-load → eligibility → CAS, so a marker call landing mid-walk cannot observe the walk-intermediate `dispatched` and return `{transitioned:false}` while the walk settles the stage — it serializes behind the walk and then 409s on the settled stage. With no orchestrator wired no lock is taken (behavior unchanged). See the admission section above for the full fence contract.
 
 ### Startup orphaned-review reconcile (`review_reconcile.go`, #1781)
 
