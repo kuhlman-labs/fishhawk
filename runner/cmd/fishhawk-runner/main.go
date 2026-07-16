@@ -2831,7 +2831,62 @@ func resolvePolicyBaseRef(ctx context.Context, cfg config, logSink io.Writer) st
 // internally consistent. Both git_diff emitters (computeAndEmitDiff and
 // reemitScopedGitDiff) call this so the two paths cannot drift apart —
 // that drift was the #1801 phantom-deletion re-emit bug.
+//
+// RE-ANCHOR (#1975): before merge-basing against the LOCAL base ref, when a
+// remote is configured, fetch the base branch's CURRENT tip from that remote
+// and merge-base against THAT tip — matching what GitHub renders on the PR.
+// When `main` advances remotely under a long-lived run and a fix-up folds that
+// advance into the run branch, the LOCAL base ref still points near the run's
+// original fork point, so merge-base(local-base, HEAD) resolves to that stale
+// fork point and the staged diff folds in main's unrelated content (the
+// run-98020210 79-vs-45 category-B failure #1932; the run-fc219396 phantom
+// root-README review "scope drift"). Fetching the live tip first re-anchors the
+// merge-base to the point of the folded-in advance, excluding it.
+//
+// The re-anchor is itself FAIL-OPEN and layered ABOVE the existing chain:
+//   - remote UNCONFIGURED (bare local test repo, offline-by-design host): NOT a
+//     degradation — a configured mode. No fetch is attempted, no
+//     diff_base_refresh_degraded event is emitted, and the result + log are
+//     byte-identical to prior behavior (this is what keeps every bare-repo test
+//     green). It falls straight through to the local-ref merge-base below.
+//   - remote configured but the re-anchor was ATTEMPTED and FAILED (fetch error,
+//     or a fetched tip that shares no local history so merge-base(tip, HEAD)
+//     is unresolvable): emit diff_base_refresh_degraded (a NEW event name,
+//     distinct from merge_base_unresolved so tests asserting that event's
+//     absence stay valid) and fall through to the same local-ref chain.
+//
+// The recorded base_sha (lineage/audit fork point) is untouched — only the
+// commit-ish the diff is measured against re-anchors.
 func resolveDiffBaseRef(ctx context.Context, baseRef, repoDir, stageID string, logSink io.Writer) string {
+	if remoteConfigured(ctx, repoDir, gitops.DefaultRemote) {
+		// Derive the branch name from baseRef: the standalone/fix-up shape is
+		// the bare local branch name ("main"); the decomposition-child shape is
+		// "origin/<shared-branch>" (from resolvePolicyBaseRef). TrimPrefix
+		// handles both.
+		branch := strings.TrimPrefix(baseRef, gitops.DefaultRemote+"/")
+		// Ambient auth ("" token) — the #1951 degrade contract: a bare-repo /
+		// offline host with no credential helper falls open here rather than
+		// blocking the diff.
+		currentTip, fetchErr := fetchDiffBaseTip(ctx, repoDir, gitops.DefaultRemote, branch, "")
+		switch {
+		case fetchErr != nil:
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"diff_base_refresh_degraded","stage_id":%q,"base_ref":%q,"detail":%q}`+"\n",
+				stageID, baseRef, fmt.Sprintf("fetch base tip: %v", fetchErr))
+		default:
+			if mb, mbErr := (&gitdiff.Runner{}).MergeBase(ctx, currentTip, repoDir); mbErr != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"diff_base_refresh_degraded","stage_id":%q,"base_ref":%q,"detail":%q}`+"\n",
+					stageID, baseRef, fmt.Sprintf("merge-base against fetched tip %s: %v", currentTip, mbErr))
+			} else {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"diff_base_reanchored","stage_id":%q,"base_ref":%q,"current_base_tip":%q,"merge_base":%q}`+"\n",
+					stageID, baseRef, currentTip, mb)
+				return mb
+			}
+		}
+	}
+
 	mb, mbErr := (&gitdiff.Runner{}).MergeBase(ctx, baseRef, repoDir)
 	if mbErr != nil {
 		_, _ = fmt.Fprintf(logSink,
@@ -4613,6 +4668,18 @@ var (
 	// sole-writer branch is cut later by CommitAndPush's freshFetchBase routing
 	// (ADR-035), which does not require HEAD to be ON the base branch.
 	checkoutChildBase = gitops.CheckoutRemoteBranchDetached
+
+	// fetchDiffBaseTip re-anchors the policy-gate/review diff to the CURRENT
+	// base-branch tip (#1975). Production wires it to gitops.FetchBaseTip, which
+	// fetches the base branch's live tip from the named remote (the same
+	// explicit-refspec machinery checkoutChildBase runs, minus the checkout) so
+	// resolveDiffBaseRef can merge-base against what GitHub renders on the PR
+	// instead of the run's stale local base ref. A package-level var for the same
+	// reason as checkoutFixupBase / checkoutChildBase: the fake-pusher run() tests
+	// default repoDir to "." and must never fetch against the runner's own source
+	// repo. The step-5 fail-open tests swap in a stub that errors to exercise the
+	// diff_base_refresh_degraded fall-through.
+	fetchDiffBaseTip = gitops.FetchBaseTip
 
 	// checkoutRunBranch re-checks-out the run branch for the base-rebase-
 	// conflict re-invoke (#989). The local branch ref already points at the

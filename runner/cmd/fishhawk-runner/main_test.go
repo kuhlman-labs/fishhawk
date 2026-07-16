@@ -2826,6 +2826,7 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	origCap, origRes := captureHead, restoreHead
 	origCheckout := checkoutFixupBase
 	origChildCheckout := checkoutChildBase
+	origFetchDiffBaseTip := fetchDiffBaseTip
 	origRemoteHas := remoteHasBranch
 	origRemoteConfigured := remoteConfigured
 	origRunBranch := checkoutRunBranch
@@ -2858,6 +2859,17 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	// never fetch + force-checkout the runner's own source repo.
 	checkoutChildBase = func(_ context.Context, _, _, _, _ string) (string, error) {
 		return "shared-branch-tip-sha", nil
+	}
+	// Stub the diff-base re-anchor fetch (#1975) to a fetch failure so a
+	// fake-pusher run() test — repoDir defaults to "." (the runner's own source
+	// repo) — never fetches against the real origin. withFakeGitOps forces
+	// remoteConfigured=true (for the #1363 path), which now also activates the
+	// re-anchor block in resolveDiffBaseRef; erroring here degrades through
+	// diff_base_refresh_degraded to the local-ref merge-base — byte-identical to
+	// the pre-#1975 diff anchoring the run() tests expect. Tests exercising the
+	// re-anchor path swap in a recording fake AFTER this call.
+	fetchDiffBaseTip = func(_ context.Context, _, _, _, _ string) (string, error) {
+		return "", errors.New("fake fetchDiffBaseTip: no remote in test")
 	}
 	// Stub the remote-authoritative wave-base guard (#1363) to a safe absent
 	// result (false, nil → block gracefully skips) so a decomposed-child run()
@@ -2903,6 +2915,7 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 		restoreHead = origRes
 		checkoutFixupBase = origCheckout
 		checkoutChildBase = origChildCheckout
+		fetchDiffBaseTip = origFetchDiffBaseTip
 		remoteHasBranch = origRemoteHas
 		remoteConfigured = origRemoteConfigured
 		checkoutRunBranch = origRunBranch
@@ -4420,6 +4433,18 @@ func withFakeRemoteConfigured(t *testing.T, configured bool) {
 	orig := remoteConfigured
 	remoteConfigured = func(_ context.Context, _, _ string) bool { return configured }
 	t.Cleanup(func() { remoteConfigured = orig })
+}
+
+// withFakeFetchDiffBaseTip swaps the diff-base re-anchor fetch seam (#1975) so a
+// resolveDiffBaseRef test can force each fail-open branch without a live remote:
+// fn returns the fetched current-base-tip SHA (or an error to model a fetch
+// failure). Callers that also need remoteConfigured=true must set it (via
+// withFakeRemoteConfigured) so the re-anchor block is reached.
+func withFakeFetchDiffBaseTip(t *testing.T, fn func(ctx context.Context, repoDir, remote, branch, token string) (string, error)) {
+	t.Helper()
+	orig := fetchDiffBaseTip
+	fetchDiffBaseTip = fn
+	t.Cleanup(func() { fetchDiffBaseTip = orig })
 }
 
 // TestRun_ImplementStage_DecomposedChild_SliceZero verifies the ADR-041
@@ -8928,6 +8953,244 @@ func TestResolveDiffBaseRef_MergeBaseUnresolved_FallsBackToBaseRef(t *testing.T)
 	}
 	if !strings.Contains(log.String(), "merge_base_unresolved") {
 		t.Errorf("expected a merge_base_unresolved degradation line on the log sink, got:\n%s", log.String())
+	}
+}
+
+// TestComputeAndEmitDiff_StaleBase_ReanchorsToCurrentTip is the #1975 primary
+// regression test at fixture scale, reproducing the run-98020210 category-B
+// shape end-to-end against real git: a long-lived run whose local base ref lags
+// the remote-advanced base, a fix-up that folded that advance into the run
+// branch, and the resulting staged diff that — pre-fix — folds the base's
+// unrelated files into the policy/review diff (the 79-vs-45 inflation, #1932).
+// Post-fix, resolveDiffBaseRef fetches the CURRENT origin tip and merge-bases
+// against it, so the emitted git_diff carries ONLY the run's own increment.
+func TestComputeAndEmitDiff_StaleBase_ReanchorsToCurrentTip(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit := gitRunnerFor(t, repo)
+	runGit("init", "--initial-branch=main")
+	runGit("config", "user.name", "init")
+	runGit("config", "user.email", "init@example.com")
+	runGit("config", "commit.gpgsign", "false")
+	runGit("config", "tag.gpgsign", "false")
+
+	// B0: the run's fork point on main.
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "-A")
+	runGit("commit", "-m", "B0")
+	forkPoint := gitHead(t, repo)
+	runGit("init", "--bare", bare)
+	runGit("remote", "add", "origin", bare)
+	runGit("push", "origin", "main")
+
+	// The run branch cut from B0 carrying its own scoped file run.go.
+	runGit("checkout", "-b", "fishhawk/run-98020210/stage-1")
+	if err := os.WriteFile(filepath.Join(repo, "run.go"), []byte("package run\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "-A")
+	runGit("commit", "-m", "run increment")
+
+	// Advance origin's main by several UNRELATED files (the PR-#1973-merge
+	// analogue) WITHOUT moving the local main ref: commit on a throwaway branch,
+	// push it to origin main, then discard the local branch. Local main stays at
+	// B0 — the stale-base shape.
+	runGit("checkout", "-b", "tmp-advance", "main")
+	for _, f := range []string{"x1.go", "x2.go", "x3.go"} {
+		if err := os.WriteFile(filepath.Join(repo, f), []byte("package x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runGit("add", "-A")
+	runGit("commit", "-m", "B1 base advance")
+	advancedTip := gitHead(t, repo)
+	runGit("push", "origin", "HEAD:main")
+
+	// Fold the advance into the run branch the way the fix-up does (merge of the
+	// advanced base). The run branch tree now carries x1/x2/x3, but the LOCAL
+	// main ref still points at B0.
+	runGit("checkout", "fishhawk/run-98020210/stage-1")
+	runGit("branch", "-D", "tmp-advance")
+	runGit("merge", "--no-edit", advancedTip)
+
+	// The fix-up edit to the run's own file, staged by computeAndEmitDiff.
+	if err := os.WriteFile(filepath.Join(repo, "run.go"), []byte("package run\n\n// fix\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config{workingDir: repo, checkBaseRef: "main", stageID: "s-98020210"}
+	var sink bytes.Buffer
+	d, events, err := computeAndEmitDiff(cfg, &sink)
+	if err != nil {
+		t.Fatalf("computeAndEmitDiff: %v", err)
+	}
+
+	// The re-anchor fired against the fetched current tip.
+	if !strings.Contains(sink.String(), "diff_base_reanchored") {
+		t.Errorf("expected a diff_base_reanchored line on the log sink, got:\n%s", sink.String())
+	}
+	if strings.Contains(sink.String(), "diff_base_refresh_degraded") {
+		t.Errorf("unexpected diff_base_refresh_degraded on the log sink (re-anchor should succeed):\n%s", sink.String())
+	}
+
+	// The DONE-MEANS: the folded base advance (x1/x2/x3) is excluded; only the
+	// run's own run.go remains. Pre-fix this is [run.go x1.go x2.go x3.go].
+	got := pathsOf(d)
+	if !reflect.DeepEqual(got, []string{"run.go"}) {
+		t.Fatalf("re-anchored diff = %v, want exactly [run.go] (the folded base advance x1/x2/x3 must be excluded)", got)
+	}
+	// The git_diff event the gate consumes must agree.
+	var saw bool
+	for _, e := range events {
+		if e.Kind != "git_diff" {
+			continue
+		}
+		saw = true
+		var p gitDiffPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode git_diff: %v", err)
+		}
+		if p.NumFiles != 1 {
+			t.Errorf("git_diff NumFiles = %d, want 1 (re-anchored, base advance excluded)", p.NumFiles)
+		}
+		for _, f := range p.Files {
+			if f.Path != "run.go" {
+				t.Errorf("git_diff event contains %q (%s); the folded base advance must not appear", f.Path, f.Status)
+			}
+		}
+		// Binding condition 2 (recorded-base-sha-unchanged guardrail): the
+		// human-meaningful base_ref label the event carries is still the fork-point
+		// label "main", NOT re-pointed to the fetched current tip.
+		if p.BaseRef != "main" {
+			t.Errorf("git_diff BaseRef = %q, want the fork-point label %q unchanged by re-anchoring", p.BaseRef, "main")
+		}
+	}
+	if !saw {
+		t.Fatal("no git_diff event emitted")
+	}
+	// Binding condition 2, continued: re-anchoring the DIFF must not move the
+	// lineage/audit fork point the recorded base_sha derives from — the LOCAL
+	// base-ref merge-base still resolves to the original fork point B0.
+	recordedBase, mbErr := (&gitdiff.Runner{}).MergeBase(context.Background(), "main", repo)
+	if mbErr != nil {
+		t.Fatalf("MergeBase(main): %v", mbErr)
+	}
+	if recordedBase != forkPoint {
+		t.Errorf("recorded base_sha (local-ref merge-base) = %q, want the original fork point %q — re-anchoring must leave it untouched", recordedBase, forkPoint)
+	}
+}
+
+// TestResolveDiffBaseRef_FetchFailure_DegradesToLocalMergeBase covers step-5(a):
+// remote configured but the current-tip fetch FAILS. resolveDiffBaseRef must
+// emit diff_base_refresh_degraded and fall through to today's local-ref
+// merge-base answer (the fork point) rather than blocking the diff.
+func TestResolveDiffBaseRef_FetchFailure_DegradesToLocalMergeBase(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "f.txt"), "x\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "base")
+	forkPoint := gitHead(t, repo)
+
+	withFakeRemoteConfigured(t, true)
+	withFakeFetchDiffBaseTip(t, func(_ context.Context, _, _, _, _ string) (string, error) {
+		return "", errors.New("boom: no credentials")
+	})
+
+	var log strings.Builder
+	got := resolveDiffBaseRef(context.Background(), "HEAD", repo, "stage-a", &log)
+	if !strings.Contains(log.String(), "diff_base_refresh_degraded") {
+		t.Errorf("expected diff_base_refresh_degraded on a fetch failure; got log:\n%s", log.String())
+	}
+	// Fall-through: same answer as today's local-ref merge-base (HEAD's own tip).
+	if got != forkPoint {
+		t.Errorf("degraded result = %q, want the local-ref merge-base %q", got, forkPoint)
+	}
+}
+
+// TestResolveDiffBaseRef_RemoteUnconfigured_ByteIdentical covers step-5(b) and
+// the binding contract: an unconfigured remote is a CONFIGURED mode, not a
+// degradation. No fetch is attempted, NO diff_base_refresh_degraded is emitted,
+// and the result equals the prior local-ref merge-base — byte-identical to
+// pre-#1975 behavior. This is what keeps every bare-repo test green.
+func TestResolveDiffBaseRef_RemoteUnconfigured_ByteIdentical(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "f.txt"), "x\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "base")
+	forkPoint := gitHead(t, repo)
+
+	// compileGateRepo configures NO origin, so the REAL remoteConfigured returns
+	// false. Assert no fetch is ever attempted by failing loudly if the seam is
+	// called.
+	withFakeFetchDiffBaseTip(t, func(_ context.Context, _, _, _, _ string) (string, error) {
+		t.Fatal("fetchDiffBaseTip must NOT be called when the remote is unconfigured")
+		return "", nil
+	})
+
+	var log strings.Builder
+	got := resolveDiffBaseRef(context.Background(), "HEAD", repo, "stage-b", &log)
+	if strings.Contains(log.String(), "diff_base_refresh_degraded") {
+		t.Errorf("unconfigured remote must NOT emit diff_base_refresh_degraded; got log:\n%s", log.String())
+	}
+	if strings.Contains(log.String(), "diff_base_reanchored") {
+		t.Errorf("unconfigured remote must NOT emit diff_base_reanchored; got log:\n%s", log.String())
+	}
+	if got != forkPoint {
+		t.Errorf("result = %q, want the prior local-ref merge-base %q", got, forkPoint)
+	}
+}
+
+// TestResolveDiffBaseRef_UnrelatedTip_DegradesToLocalMergeBase covers step-5(c):
+// the fetch SUCCEEDS but returns a tip that shares no history with HEAD, so
+// merge-base(tip, HEAD) is unresolvable. resolveDiffBaseRef emits
+// diff_base_refresh_degraded and falls through to the local-ref merge-base.
+func TestResolveDiffBaseRef_UnrelatedTip_DegradesToLocalMergeBase(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "f.txt"), "x\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "base")
+	forkPoint := gitHead(t, repo)
+
+	// An ORPHAN commit with no common ancestor with HEAD — merge-base against it
+	// exits non-zero.
+	runGit("checkout", "--orphan", "unrelated")
+	runGit("rm", "-rf", ".")
+	mustWrite(t, filepath.Join(repo, "orphan.txt"), "z\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "orphan")
+	orphanTip := gitHead(t, repo)
+	runGit("checkout", "main")
+
+	withFakeRemoteConfigured(t, true)
+	withFakeFetchDiffBaseTip(t, func(_ context.Context, _, _, _, _ string) (string, error) {
+		return orphanTip, nil
+	})
+
+	var log strings.Builder
+	got := resolveDiffBaseRef(context.Background(), "HEAD", repo, "stage-c", &log)
+	if !strings.Contains(log.String(), "diff_base_refresh_degraded") {
+		t.Errorf("expected diff_base_refresh_degraded on an unrelated fetched tip; got log:\n%s", log.String())
+	}
+	if got != forkPoint {
+		t.Errorf("degraded result = %q, want the local-ref merge-base %q", got, forkPoint)
 	}
 }
 
