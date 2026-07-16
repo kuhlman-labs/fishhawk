@@ -435,6 +435,18 @@ func TestReviveRun_AuditAppendFailure_SurfacesWarningOn200(t *testing.T) {
 	if !strings.Contains(body.AuditWarning, RunRevivedCategory) {
 		t.Errorf("audit_warning = %q, want it to name the %q category", body.AuditWarning, RunRevivedCategory)
 	}
+	// The run state genuinely changed (failed → running), so the sticky status
+	// comment still fires in the audit-failure mode — the warning-on-200 path
+	// does not suppress the notify (#1943).
+	found := false
+	for _, id := range f.rec.status {
+		if id == f.run.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("notifyStatusUpdate did not fire in the audit-failure mode; status=%v", f.rec.status)
+	}
 }
 
 // An anonymous request is 401.
