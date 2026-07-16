@@ -1132,6 +1132,168 @@ func TestListRuns_OmitsDriveSurfaces(t *testing.T) {
 	}
 }
 
+// --- host-dispatch next_action staleness suppression (#1961) ----------------
+
+// driveStaleRepo wraps fakeRepo with a working ListStagesForRun (the base
+// fakeRepo errors) plus an injectable list error, for the host-dispatch
+// next_action staleness suppression tests. Stage rows are seeded directly into
+// the embedded stagesByRun map.
+type driveStaleRepo struct {
+	*fakeRepo
+	listStagesErr error
+}
+
+func (r *driveStaleRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
+	if r.listStagesErr != nil {
+		return nil, r.listStagesErr
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]*run.Stage, len(r.stagesByRun[runID]))
+	copy(out, r.stagesByRun[runID])
+	return out, nil
+}
+
+// newDriveStaleServer wires a server over a driveStaleRepo + audit fake and
+// seeds one drive-enabled running run with an open PR.
+func newDriveStaleServer(t *testing.T) (*Server, *driveStaleRepo, *auditFake, *run.Run) {
+	t.Helper()
+	repo := &driveStaleRepo{fakeRepo: newFakeRepo()}
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au})
+	seeded, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s", TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	seeded.Drive = true
+	seeded.State = run.StateRunning
+	pr := "https://github.com/x/y/pull/7"
+	seeded.PullRequestURL = &pr
+	return s, repo, au, seeded
+}
+
+// seedStageRow appends a stage row so ListStagesForRun returns it.
+func seedStageRow(r *driveStaleRepo, runID uuid.UUID, typ run.StageType, state run.StageState) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stagesByRun[runID] = append(r.stagesByRun[runID], &run.Stage{
+		ID: uuid.New(), RunID: runID, Type: typ, State: state,
+	})
+}
+
+// seedHostDispatchNextAction seeds one run_auto_advanced entry whose
+// next_action names a host-dispatch park (run_plan_stage / run_implement_stage).
+func seedHostDispatchNextAction(t *testing.T, au *auditFake, runID uuid.UUID, action string) {
+	t.Helper()
+	seedAutoAdvance(t, au, runID, 5, time.Now().UTC(), drive.Advance{
+		Rule: drive.RulePlanApprovedDispatch, From: "plan:approved", To: "implement:dispatched",
+		NextAction: &drive.NextAction{Action: action, Detail: "dispatch the stage from the operator host"},
+	})
+}
+
+// TestGetRun_Drive_HostDispatchNextAction_StaleSuppressed pins the per-state
+// suppression contract (#1961): a next_action naming run_implement_stage is
+// SUPPRESSED once the implement stage has advanced past the host-spawnable
+// states, and SURFACED while it is still pending / awaiting_host_dispatch or has
+// been re-opened to pending on retry.
+func TestGetRun_Drive_HostDispatchNextAction_StaleSuppressed(t *testing.T) {
+	cases := []struct {
+		name       string
+		stageState run.StageState
+		wantAction bool // true => next_action surfaced; false => suppressed
+	}{
+		{"pending_surfaced", run.StageStatePending, true},
+		{"awaiting_host_dispatch_surfaced", run.StageStateAwaitingHostDispatch, true},
+		{"dispatched_suppressed", run.StageStateDispatched, false},
+		{"running_suppressed", run.StageStateRunning, false},
+		{"succeeded_suppressed", run.StageStateSucceeded, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, au, seeded := newDriveStaleServer(t)
+			seedHostDispatchNextAction(t, au, seeded.ID, "run_implement_stage")
+			seedStageRow(repo, seeded.ID, run.StageTypePlan, run.StageStateSucceeded)
+			seedStageRow(repo, seeded.ID, run.StageTypeImplement, tc.stageState)
+
+			resp, raw := getRunResponse(t, s, seeded.ID)
+			_, present := raw["next_action"]
+			if tc.wantAction {
+				if !present || resp.NextAction == nil || resp.NextAction.Action != "run_implement_stage" {
+					t.Errorf("state %s: next_action = %+v (present=%v), want run_implement_stage surfaced", tc.stageState, resp.NextAction, present)
+				}
+			} else if present {
+				t.Errorf("state %s: next_action present (%+v), want suppressed (stage advanced past host-spawnable)", tc.stageState, resp.NextAction)
+			}
+		})
+	}
+}
+
+// TestGetRun_Drive_RunPlanStageStale suppresses a run_plan_stage next_action
+// once the plan stage advances (the other host-dispatch park action).
+func TestGetRun_Drive_RunPlanStageStale(t *testing.T) {
+	s, repo, au, seeded := newDriveStaleServer(t)
+	seedHostDispatchNextAction(t, au, seeded.ID, "run_plan_stage")
+	seedStageRow(repo, seeded.ID, run.StageTypePlan, run.StageStateRunning)
+
+	_, raw := getRunResponse(t, s, seeded.ID)
+	if _, present := raw["next_action"]; present {
+		t.Error("run_plan_stage next_action present while the plan stage is running, want suppressed")
+	}
+}
+
+// TestGetRun_Drive_NonHostDispatchAction_NeverSuppressed: a next_action that is
+// NOT a host-dispatch park (merge_pr, await_acceptance) is surfaced regardless
+// of stage states — the suppression only targets the two dispatch park actions.
+func TestGetRun_Drive_NonHostDispatchAction_NeverSuppressed(t *testing.T) {
+	for _, action := range []string{"merge_pr", "await_acceptance"} {
+		t.Run(action, func(t *testing.T) {
+			s, repo, au, seeded := newDriveStaleServer(t)
+			seedAutoAdvance(t, au, seeded.ID, 5, time.Now().UTC(), drive.Advance{
+				Rule: drive.RuleChecksGreenAwaitingMerge, From: "review:awaiting_approval", To: "awaiting_merge",
+				NextAction: &drive.NextAction{Action: action},
+			})
+			// Even with the implement stage long past host-spawnable, the action stays.
+			seedStageRow(repo, seeded.ID, run.StageTypeImplement, run.StageStateSucceeded)
+
+			resp, raw := getRunResponse(t, s, seeded.ID)
+			if _, present := raw["next_action"]; !present || resp.NextAction == nil || resp.NextAction.Action != action {
+				t.Errorf("%s next_action = %+v (present=%v), want surfaced (non-dispatch actions never suppressed)", action, resp.NextAction, present)
+			}
+		})
+	}
+}
+
+// TestGetRun_Drive_HostDispatchNextAction_NoMatchingStage_Surfaces: a
+// run_implement_stage action with NO implement stage row surfaces (fail toward
+// surfacing on a not-found stage).
+func TestGetRun_Drive_HostDispatchNextAction_NoMatchingStage_Surfaces(t *testing.T) {
+	s, repo, au, seeded := newDriveStaleServer(t)
+	seedHostDispatchNextAction(t, au, seeded.ID, "run_implement_stage")
+	seedStageRow(repo, seeded.ID, run.StageTypePlan, run.StageStateSucceeded) // no implement row
+
+	resp, raw := getRunResponse(t, s, seeded.ID)
+	if _, present := raw["next_action"]; !present || resp.NextAction == nil {
+		t.Errorf("next_action = %+v (present=%v), want surfaced when no matching stage row exists", resp.NextAction, present)
+	}
+}
+
+// TestGetRun_Drive_StageListError_FailsOpen: a ListStagesForRun error in
+// handleGetRun degrades to today's surface — the next_action is surfaced (never
+// suppressed) rather than failing the read.
+func TestGetRun_Drive_StageListError_FailsOpen(t *testing.T) {
+	s, repo, au, seeded := newDriveStaleServer(t)
+	seedHostDispatchNextAction(t, au, seeded.ID, "run_implement_stage")
+	seedStageRow(repo, seeded.ID, run.StageTypeImplement, run.StageStateSucceeded) // would suppress if read
+	repo.listStagesErr = errors.New("stage store down")
+
+	resp, raw := getRunResponse(t, s, seeded.ID)
+	if _, present := raw["next_action"]; !present || resp.NextAction == nil || resp.NextAction.Action != "run_implement_stage" {
+		t.Errorf("next_action = %+v (present=%v), want fail-open surfaced on a stage-list read error", resp.NextAction, present)
+	}
+}
+
 // --- Drive end-to-end (#1023) ----------------------------------------------
 
 // driveE2ERepo composes the create-capable fakeRepo with the
@@ -1293,6 +1455,14 @@ func TestDriveRun_EndToEnd_LocalRunner(t *testing.T) {
 		"trigger_source": "cli", "runner_kind": "local",
 		"workflow_spec": gatedSpecYAML, "drive": true,
 	})
+	// LOCK runner_kind so the orchestrator's real local-park branch runs on
+	// approval: a resolved local run parks the next stage in
+	// awaiting_host_dispatch (orchestrator.go), the host-spawnable state where
+	// the run_implement_stage next_action is genuinely ready — not
+	// 'dispatched', which the #1961 staleness guard would (correctly) suppress.
+	repo.mu.Lock()
+	repo.runs[runID].RunnerKindResolved = true
+	repo.mu.Unlock()
 
 	w := submitApproval(t, s, planStage.ID, `{"decision":"approve"}`)
 	if w.Code != http.StatusOK {
