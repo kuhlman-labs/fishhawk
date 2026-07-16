@@ -1340,6 +1340,53 @@ func TestDriveRun_DerivedAcceptancePending_ReviewInFlight_StillHeld(t *testing.T
 	}
 }
 
+// TestDriveRun_DerivedAcceptancePending_ObserveOnlyFallThrough_PollsToStalled
+// (#1961) directly exercises the modified observe-only gate-branch condition
+// `state != "" && (!acceptancePendingDerived || state != driveReviewGateParkedState)`
+// in its fall-through (poll, NOT stop) mode — the branch every other new test
+// skips because the dispatch branch consumes the acceptance stage before it is
+// reached. The production shape: acceptance has already SUCCEEDED (terminal, so
+// nothing is dispatchable) but a checks_green stamp has not yet superseded the
+// derived acceptance_pending signal, while the human review row still sits
+// awaiting_approval. driveParkedGateState names review_gate_parked, but under the
+// derived signal the branch condition is FALSE, so the loop must NOT compose
+// decision_required:review_gate_parked — it falls through to the signature/stall
+// logic and returns a driveStallThreshold-bounded 'stalled' stop carrying
+// next_actions. A regression that inverted the condition would stop
+// decision_required here instead of polling.
+func TestDriveRun_DerivedAcceptancePending_ObserveOnlyFallThrough_PollsToStalled(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "succeeded", 1),
+		stg(driveAccID, "acceptance", "succeeded", 2), // terminal → nothing dispatchable
+		stg(driveReviewID, "review", "awaiting_approval", 3),
+	})
+	f.derivedStatus = "acceptance_pending" // still stamped; no checks_green stamp yet
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	// The observe-only branch fell through to poll (NOT decision_required), and
+	// the stall guard bounded it to a 'stalled' stop.
+	if out.StoppedReason != stoppedStalled {
+		t.Fatalf("stopped_reason = %q, want stalled (observe-only fall-through polled, not stopped decision_required)", out.StoppedReason)
+	}
+	if strings.HasPrefix(out.StoppedReason, "decision_required") {
+		t.Fatalf("stopped_reason = %q; the derived signal must suppress decision_required:review_gate_parked here", out.StoppedReason)
+	}
+	if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
+		t.Error("the stalled stop carried no next_actions")
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("nothing must spawn (acceptance already terminal); spawned: %v", got)
+	}
+}
+
 // TestDriveRun_DerivedAcceptancePending_AgreementTable (#1961, done-means: the
 // stop-taxonomy agreement pin, satisfying the binding condition's seam guard).
 // It (1) pins the driver's derivedAcceptancePending literal EQUAL to the
@@ -1377,15 +1424,53 @@ func TestDriveRun_DerivedAcceptancePending_AgreementTable(t *testing.T) {
 		return false
 	}
 
+	// The table enumerates ALL FOUR parked-gate fixtures the plan's step 6 named,
+	// so the [decision-stop-matches-operator-judgment] criterion is delivered as a
+	// table rather than partially (2 rows) with the retained decision paths pinned
+	// only as standalone stop-reason tests (#1961 review concerns). Each row pins
+	// BOTH surfaces explicitly — the classifier's state (wantClassifierState) and
+	// the driver's stop (wantDriverStopReason) — so a cross-surface taxonomy
+	// disagreement on ANY of the four is caught, not only the two that AGREE.
+	//
+	// Two of the four are DELIBERATE, DOCUMENTED divergences (divergence:true): the
+	// driver stops decision_required while the classifier — routing on impl.State +
+	// implementReviewStatus and ignoring the review stage row / the scope-amendment
+	// audit (verified in next_actions.go: implementStageNextActions) — names a
+	// mechanical/poll state. A strict iff-agreement CANNOT hold there and asserting
+	// one would be wrong: the driver is conservative BY DESIGN because it has
+	// audit/parked-row visibility the classifier inputs lack.
+	//   - review_parked_NO_derived_signal: without the derived acceptance_pending
+	//     signal the driver cannot confirm the human-review evidence settled, so it
+	//     treats the parked review as a genuine gate and stops
+	//     decision_required:review_gate_parked; the classifier names acceptance_pending
+	//     (it never gates on the parked review row). This is the SAME retained path
+	//     TestDriveRun_ReviewParked_NoDerivedStatus_StopsDecisionRequired pins as a
+	//     standalone stop; here it additionally gets the classifier cross-check.
+	//   - pending_scope_amendment: a pending amendment is ALWAYS an operator decision
+	//     (no delegation knob covers amendments), so the driver stops
+	//     decision_required:scope_amendment_requested; the classifier models no
+	//     amendment state and names implement_running for the in-flight implement.
 	cases := []struct {
 		name          string
 		stages        []Stage
 		derivedStatus string
-		// naInputs builds the classifier-equivalent inputs for this parked gate.
+		// seedAudit optionally seeds audit rows the driver reads (the scope
+		// amendment fixture seeds a pending scope_amendment_requested row).
+		seedAudit func(f *driveFakeBackend)
+		// naStages builds the classifier-equivalent inputs for this parked gate.
 		naStages       []Stage
 		naReviewStatus *ReviewStatus
-		// wantDecision: the loop must stop decision_required:*; else it dispatches.
-		wantDecision bool
+		// wantClassifierState pins the exact state nextActionsFor names for the
+		// equivalent inputs — the producer half of the cross-surface pin.
+		wantClassifierState string
+		// wantDriverStopReason pins the exact driver stopped_reason for a
+		// decision/amendment stop; "" means the loop must DISPATCH acceptance.
+		wantDriverStopReason string
+		// divergence:true documents a deliberate driver-conservative divergence
+		// (driver stops decision_required, classifier names a non-judgment state);
+		// false requires the two surfaces to AGREE (decision_required IFF the
+		// classifier names an operator-judgment state).
+		divergence bool
 	}{
 		{
 			// A plan gate parked with its review settled: the classifier names
@@ -1400,7 +1485,8 @@ func TestDriveRun_DerivedAcceptancePending_AgreementTable(t *testing.T) {
 				stg(drivePlanID, "plan", "awaiting_approval", 0),
 				stg(driveImplID, "implement", "blocked", 1),
 			},
-			wantDecision: true,
+			wantClassifierState:  "plan_gate_parked",
+			wantDriverStopReason: "decision_required:plan_gate_parked",
 		},
 		{
 			// The fix: a review row parked at awaiting_approval under derived
@@ -1416,26 +1502,72 @@ func TestDriveRun_DerivedAcceptancePending_AgreementTable(t *testing.T) {
 				stg(driveImplID, "implement", "succeeded", 1),
 				stg(driveAccID, "acceptance", "pending", 2),
 			},
-			wantDecision: false,
+			wantClassifierState:  "acceptance_pending",
+			wantDriverStopReason: "", // dispatches
+		},
+		{
+			// The retained decision path (concern 3): the IDENTICAL review-parked
+			// fixture WITHOUT the derived signal. The driver conservatively stops
+			// decision_required:review_gate_parked; the classifier still names
+			// acceptance_pending (non-judgment) — a documented, deliberate divergence.
+			name:   "review_parked_no_derived_signal",
+			stages: driveAcceptancePendingStages(),
+			// derivedStatus intentionally empty — the legacy no-signal path.
+			naStages: []Stage{
+				stg(drivePlanID, "plan", "succeeded", 0),
+				stg(driveImplID, "implement", "succeeded", 1),
+				stg(driveAccID, "acceptance", "pending", 2),
+			},
+			wantClassifierState:  "acceptance_pending",
+			wantDriverStopReason: "decision_required:review_gate_parked",
+			divergence:           true,
+		},
+		{
+			// The other retained decision path (concern 3): a pending scope
+			// amendment during a running implement stage. The driver stops
+			// decision_required:scope_amendment_requested (branch (b), audit-derived);
+			// the classifier names implement_running (non-judgment) — a documented,
+			// deliberate divergence (the classifier models no amendment state).
+			name: "pending_scope_amendment",
+			stages: []Stage{
+				stg(drivePlanID, "plan", "succeeded", 0),
+				stg(driveImplID, "implement", "running", 1),
+			},
+			seedAudit: func(f *driveFakeBackend) {
+				f.seq++
+				f.audit = append(f.audit, AuditEntry{
+					ID: uuid.New().String(), Sequence: f.seq, RunID: f.runID.String(),
+					Category: "scope_amendment_requested", Payload: map[string]any{},
+				})
+			},
+			naStages: []Stage{
+				stg(drivePlanID, "plan", "succeeded", 0),
+				stg(driveImplID, "implement", "running", 1),
+			},
+			wantClassifierState:  "implement_running",
+			wantDriverStopReason: "decision_required:scope_amendment_requested",
+			divergence:           true,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Drive the classifier over the equivalent inputs and read its state.
+			// Drive the classifier over the equivalent inputs and pin its state —
+			// the producer half of the cross-surface taxonomy pin.
 			na := nextActionsFor(&Run{State: "running", RunnerKind: "local"}, tc.naStages,
 				nil, tc.naReviewStatus, nil, nil, false, false, "", "", releaseSignals{})
 			if na == nil {
 				t.Fatalf("nextActionsFor returned nil for %s", tc.name)
 			}
-			// Agreement invariant: the classifier's operator-judgment verdict must
-			// match the loop's decision_required verdict.
-			if isOperatorJudgment(na.State) != tc.wantDecision {
-				t.Fatalf("agreement broken: classifier state %q isOperatorJudgment=%v, wantDecision=%v",
-					na.State, isOperatorJudgment(na.State), tc.wantDecision)
+			if na.State != tc.wantClassifierState {
+				t.Fatalf("classifier state = %q, want %q (pinned)", na.State, tc.wantClassifierState)
 			}
+			classifierJudgment := isOperatorJudgment(na.State)
 
 			f := newDriveFake("running", tc.stages)
 			f.derivedStatus = tc.derivedStatus
+			if tc.seedAudit != nil {
+				tc.seedAudit(f)
+			}
 			f.onSpawn = func(f *driveFakeBackend, typ string) {
 				if typ == "acceptance" {
 					f.setState("acceptance", "succeeded")
@@ -1452,14 +1584,39 @@ func TestDriveRun_DerivedAcceptancePending_AgreementTable(t *testing.T) {
 				t.Fatalf("driveRun: %v", err)
 			}
 			gotDecision := strings.HasPrefix(out.StoppedReason, "decision_required")
-			if gotDecision != tc.wantDecision {
-				t.Fatalf("stopped_reason = %q; decision_required=%v, want %v (must match the classifier's operator-judgment verdict %q)",
-					out.StoppedReason, gotDecision, tc.wantDecision, na.State)
-			}
-			if !tc.wantDecision {
+			// Pin the driver half of the cross-surface pin: the exact stop, and
+			// that a decision stop always carries next_actions.
+			if tc.wantDriverStopReason != "" {
+				if out.StoppedReason != tc.wantDriverStopReason {
+					t.Fatalf("stopped_reason = %q, want %q", out.StoppedReason, tc.wantDriverStopReason)
+				}
+				if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
+					t.Fatalf("decision stop %q carried no next_actions", out.StoppedReason)
+				}
+			} else {
 				// The acceptance_pending fixture must DISPATCH, not merely not-stop.
 				if got := rec.list(); len(got) != 1 || got[0] != "acceptance" {
 					t.Fatalf("spawn sequence = %v, want [acceptance] (dispatch, not stop)", got)
+				}
+			}
+			if tc.divergence {
+				// Documented deliberate divergence: the driver is conservative
+				// (stops decision_required) while the classifier names a
+				// non-operator-judgment state. Assert BOTH halves so the gap stays a
+				// KNOWN, pinned divergence rather than silent drift — a change that
+				// made these agree (either surface moving) fails here.
+				if !gotDecision {
+					t.Fatalf("%s: expected a driver decision_required stop, got %q", tc.name, out.StoppedReason)
+				}
+				if classifierJudgment {
+					t.Fatalf("%s: documented divergence expects a NON-operator-judgment classifier state, got %q", tc.name, na.State)
+				}
+			} else {
+				// Agreement invariant: decision_required IFF the classifier names an
+				// operator-judgment state.
+				if gotDecision != classifierJudgment {
+					t.Fatalf("agreement broken: classifier state %q isOperatorJudgment=%v, driver decision_required=%v",
+						na.State, classifierJudgment, gotDecision)
 				}
 			}
 		})
