@@ -241,6 +241,27 @@ func TestReviveRouteRegistered(t *testing.T) {
 	}
 }
 
+// TestMergeRunRouteRegistered guards the route table: POST
+// /v0/runs/{run_id}/merge (E48.7 / #1954) must reach handleMergeRun through the
+// mux. The anonymous request reaches the handler's auth ladder and returns 401
+// — an UNregistered route would instead 404 with a default not-found body, so a
+// 401 here proves the route is wired in handlers.go. (handleMergeRun runs the
+// auth ladder BEFORE the nil-dependency guard.) merge_run_test.go's
+// postMergeRun helper calls s.handleMergeRun directly.
+func TestMergeRunRouteRegistered(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+"00000000-0000-0000-0000-000000000000"+"/merge", strings.NewReader(`{}`))
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (route reaches handler auth ladder)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "authentication_required") {
+		t.Errorf("body = %s, want authentication_required (handleMergeRun reached)", rec.Body.String())
+	}
+}
+
 // TestStartCampaignItemRunRouteRegistered guards the route table: POST
 // /v0/campaigns/{campaign_id}/runs (#1481) must reach handleStartCampaignItemRun.
 // With no CampaignRepo configured the handler returns 503 — an UNregistered

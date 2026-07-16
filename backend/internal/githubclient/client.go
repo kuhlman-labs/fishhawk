@@ -79,6 +79,22 @@ var (
 	// than treating it as an opaque error. Distinct from ErrValidation so
 	// the caller distinguishes a genuine conflict from a malformed request.
 	ErrMergeConflict = errors.New("githubclient: merge conflict")
+	// ErrPullRequestCleanStatus means enablePullRequestAutoMerge was rejected
+	// because the PR is ALREADY in a merge-ready ("clean") status — GitHub
+	// refuses to queue auto-merge on a PR that could be merged synchronously
+	// right now (E48.7 / #1954). This is the common operator flow: the
+	// operator's `gh pr review --approve` plus green required checks settle the
+	// PR clean before the merge verb enables auto-merge, so the enable errors.
+	// The githubAutoMerger falls back to a synchronous REST squash merge on
+	// this sentinel (serve.go). Wrapped ALONGSIDE ErrValidation (both are
+	// reported via errors.Is) so existing ErrValidation callers are unaffected.
+	ErrPullRequestCleanStatus = errors.New("githubclient: pull request already in clean status")
+	// ErrPullRequestNotMergeable means the synchronous REST merge
+	// (PUT /repos/{owner}/{repo}/pulls/{number}/merge) returned 405 — the PR
+	// is not in a mergeable state (base moved, checks not settled, draft, …).
+	// Distinct from ErrValidation so the merge caller can surface an actionable
+	// retryable error rather than an opaque 4xx (E48.7 / #1954).
+	ErrPullRequestNotMergeable = errors.New("githubclient: pull request not mergeable")
 )
 
 // RepoRef identifies a GitHub repository by owner + name.
@@ -803,9 +819,88 @@ func (c *Client) EnableAutoMerge(ctx context.Context, installationID int64,
 		return fmt.Errorf("githubclient: decode auto-merge response: %w", err)
 	}
 	if len(gqlResp.Errors) > 0 {
-		return fmt.Errorf("%w: enable auto-merge: %s", ErrValidation, gqlResp.Errors[0].Message)
+		msg := gqlResp.Errors[0].Message
+		// A "clean status" rejection is the already-merge-ready case (#1954):
+		// the PR could be merged synchronously right now, so GitHub refuses to
+		// queue auto-merge. Wrap ErrPullRequestCleanStatus ALONGSIDE
+		// ErrValidation (Go multi-%w) so the operator merge path can fall back
+		// to a synchronous REST merge on this sentinel while every existing
+		// errors.Is(err, ErrValidation) caller is unchanged.
+		if strings.Contains(strings.ToLower(msg), "clean status") {
+			return fmt.Errorf("%w: %w: enable auto-merge: %s", ErrValidation, ErrPullRequestCleanStatus, msg)
+		}
+		return fmt.Errorf("%w: enable auto-merge: %s", ErrValidation, msg)
 	}
 	return nil
+}
+
+// MergePullRequest synchronously merges a PR via the REST API (E48.7 / #1954):
+//
+//	PUT /repos/{owner}/{repo}/pulls/{number}/merge
+//
+// It is the fallback the operator merge path takes when EnableAutoMerge is
+// rejected with ErrPullRequestCleanStatus — a PR that is already merge-ready
+// (approved, required checks green) cannot be queued for auto-merge, so it is
+// merged directly here instead. The wire `merge_method` is the lower-cased
+// MergeMethod (REST spells the strategies `squash`/`merge`/`rebase`, distinct
+// from the GraphQL enum EnableAutoMerge uses); an empty method defaults to
+// squash to match the auto-merge default.
+//
+// Returns nil on success (200) and on 204 (rare idempotent no-content).
+// ErrPullRequestNotMergeable on 405 (the PR is not in a mergeable state — the
+// actionable, retryable case). ErrMergeConflict on 409 (head branch moved or a
+// merge conflict). ErrNotFound (404) / ErrForbidden (401/403) / ErrValidation
+// (422) are mapped like the sibling REST methods via classifyStatus.
+func (c *Client) MergePullRequest(ctx context.Context, installationID int64,
+	repo RepoRef, prNumber int, method MergeMethod) error {
+	if c.Tokens == nil {
+		return errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return errors.New("githubclient: repo owner and name required")
+	}
+	if prNumber <= 0 {
+		return errors.New("githubclient: pr number must be > 0")
+	}
+	if method == "" {
+		method = MergeMethodSquash
+	}
+
+	body := map[string]string{"merge_method": strings.ToLower(string(method))}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("githubclient: marshal merge pull request: %w", err)
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) + "/pulls/" + url.PathEscape(fmt.Sprintf("%d", prNumber)) + "/merge")
+	req, err := c.buildRequest(ctx, http.MethodPut, endpoint, bytes.NewReader(raw), installationID)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("githubclient: merge pull request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// 405 = not mergeable (base moved, checks not settled, draft). Mapped to a
+	// dedicated actionable/retryable sentinel BEFORE classifyStatus (which has
+	// no 405 case and would fall to the opaque default).
+	if resp.StatusCode == http.StatusMethodNotAllowed {
+		brief := readBriefBody(resp.Body)
+		return fmt.Errorf("%w: merge pr #%d: %s", ErrPullRequestNotMergeable, prNumber, brief)
+	}
+	// 409 = the head branch was modified / merge conflict — a retry after a
+	// rebase can succeed. Reuse ErrMergeConflict so a caller that already
+	// switches on it treats this uniformly.
+	if resp.StatusCode == http.StatusConflict {
+		brief := readBriefBody(resp.Body)
+		return fmt.Errorf("%w: merge pr #%d: %s", ErrMergeConflict, prNumber, brief)
+	}
+	return classifyStatus("merge pull request", resp)
 }
 
 // PullRequest is the slice of a pull-request API response Fishhawk
