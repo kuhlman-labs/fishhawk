@@ -514,11 +514,23 @@ const (
 	awaitReviewTimeoutMax     = 600
 )
 
+// awaitHeartbeatTimeoutMax is the timeout cap that applies ONLY when the
+// caller supplied a progressToken (#1963). With a progress heartbeat resetting
+// the client's idle clock (the run_stage/run_children/drive_run pattern), one
+// call can wait out a full implement pass — the 50-minute implement budget plus
+// review rounds and CI-gated merge latency — in 7200s (2h). The cap is
+// token-CONDITIONAL on purpose: without a keep-alive the client's own idle
+// timeout would cut a long synchronous call short anyway, so a long token-less
+// wait is a footgun (it holds the MCP session open with nothing keeping the
+// client from timing out), not a feature. A token-less call therefore keeps the
+// unchanged 600s cap via clampAwaitTimeout.
+const awaitHeartbeatTimeoutMax = 7200
+
 // AwaitReviewInput is the fishhawk_await_review tool's input schema (#600).
 type AwaitReviewInput struct {
 	RunID          string `json:"run_id" jsonschema:"the Fishhawk run UUID"`
 	Stage          string `json:"stage" jsonschema:"which review to wait on: 'plan' or 'implement'"`
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"how long to wait before returning 'pending' (default 360, capped at 600). On timeout the call returns pending + poll_interval_seconds; re-call to resume the wait"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"how long to wait before returning 'pending' (default 360). Cap is token-conditional: 600 without a progressToken, 7200 when a progressToken is supplied (the heartbeat keeps the client's idle clock alive). On timeout the call returns pending + poll_interval_seconds; re-call to resume the wait"`
 }
 
 // AwaitReviewOutput is the fishhawk_await_review response. Status mirrors
@@ -548,6 +560,27 @@ func clampAwaitTimeout(n int) int {
 	}
 	if n > awaitReviewTimeoutMax {
 		return awaitReviewTimeoutMax
+	}
+	return n
+}
+
+// clampAwaitTimeoutHeartbeat is the heartbeat-aware timeout clamp (#1963).
+// When heartbeat is false it delegates to the UNCHANGED clampAwaitTimeout, so
+// token-less await callers — and fishhawk_merge_run's two clampAwaitTimeout
+// call sites, which never opt in — keep today's 360 default / 600 cap
+// byte-identical. When heartbeat is true a progressToken keep-alive is present
+// to reset the client's idle clock, so the default stays 360 but the cap rises
+// to awaitHeartbeatTimeoutMax (7200s), letting one call wait out a full
+// implement pass or review round.
+func clampAwaitTimeoutHeartbeat(n int, heartbeat bool) int {
+	if !heartbeat {
+		return clampAwaitTimeout(n)
+	}
+	if n <= 0 {
+		return awaitReviewTimeoutDefault
+	}
+	if n > awaitHeartbeatTimeoutMax {
+		return awaitHeartbeatTimeoutMax
 	}
 	return n
 }
@@ -585,16 +618,23 @@ Resolves the review_status from the audit trail and:
 
 Idempotent / resumable: a timeout returns status "pending" plus
 poll_interval_seconds; the wait holds nothing — re-call to resume it, or
-switch to fishhawk_get_run_status polling. Because the default is a long
-(360s) synchronous call with no progress keep-alive, a client/transport
-per-call timeout may still cut it short; that is fine here precisely because
-poll-the-handle is the blessed primary path and a cut-short await is a
-no-op you can re-issue.
+switch to fishhawk_get_run_status polling.
+
+Progress heartbeat (#1963): supply a progressToken to receive an MCP
+notifications/progress keep-alive once per poll tick (stage + elapsed) AND to
+unlock the 7200s timeout cap — with the heartbeat resetting the client's idle
+clock, one call with timeout_seconds up to 7200 can wait out a full implement
+pass or review round. WITHOUT a token the 600s cap and the resumable-timeout
+re-arm contract are unchanged: the default is a long (360s) synchronous call
+with no keep-alive, so a client/transport per-call timeout may still cut it
+short — that is fine because poll-the-handle is the blessed primary path and a
+cut-short await is a no-op you can re-issue.
 
 Inputs:
   - run_id          (required) — Fishhawk run UUID.
   - stage           (required) — "plan" or "implement".
-  - timeout_seconds — default 360, capped at 600.
+  - timeout_seconds — default 360; cap 600 without a progressToken, 7200 with
+                      one.
 
 Response: {stage, status, reviews[], waited_seconds, message,
 poll_interval_seconds}. A "failed" status is a definite terminal state: the
@@ -677,7 +717,7 @@ func (r *runResolver) awaitRunTerminalBackstop(ctx context.Context, runID uuid.U
 }
 
 // awaitReview is the tool handler.
-func (r *runResolver) awaitReview(ctx context.Context, _ *mcp.CallToolRequest, in AwaitReviewInput) (*mcp.CallToolResult, AwaitReviewOutput, error) {
+func (r *runResolver) awaitReview(ctx context.Context, req *mcp.CallToolRequest, in AwaitReviewInput) (*mcp.CallToolResult, AwaitReviewOutput, error) {
 	runID, err := uuid.Parse(in.RunID)
 	if err != nil {
 		return nil, AwaitReviewOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
@@ -685,7 +725,17 @@ func (r *runResolver) awaitReview(ctx context.Context, _ *mcp.CallToolRequest, i
 	if _, err := categoriesForStage(in.Stage); err != nil {
 		return nil, AwaitReviewOutput{}, err
 	}
-	timeout := clampAwaitTimeout(in.TimeoutSeconds)
+
+	// Progress heartbeat (#1963): capture the client-supplied progressToken
+	// exactly as drive_run.go does (nil-guarding req and req.Params). A token
+	// unlocks the 7200s cap AND a per-tick keep-alive; a token-less call keeps
+	// the byte-identical 360/600 contract. MCP progress is opt-in per spec: no
+	// token (or no session) => no emission.
+	var progToken any
+	if req != nil && req.Params != nil {
+		progToken = req.Params.GetProgressToken()
+	}
+	timeout := clampAwaitTimeoutHeartbeat(in.TimeoutSeconds, progToken != nil)
 	start := time.Now()
 
 	// Fast path: terminal / none returns immediately without polling.
@@ -725,11 +775,26 @@ func (r *runResolver) awaitReview(ctx context.Context, _ *mcp.CallToolRequest, i
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	var progress float64
 	for {
 		select {
 		case <-pollCtx.Done():
 			return nil, r.awaitPendingTimeoutOutput(in.Stage, timeout, start, terminalInFlight), nil
 		case <-ticker.C:
+			// Best-effort progress heartbeat once per tick (opt-in): keeps a
+			// long wait from being aborted by the client's idle timeout. Emitted
+			// only when the caller supplied a progressToken AND the request
+			// carries a live session. A failed notify is SWALLOWED — the await is
+			// authoritative, the heartbeat advisory; a notify error must never
+			// terminate or fail the wait.
+			if progToken != nil && req != nil && req.Session != nil {
+				progress++
+				_ = req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
+					ProgressToken: progToken,
+					Progress:      progress,
+					Message:       awaitReviewProgressMessage(in.Stage, time.Since(start), terminalInFlight),
+				})
+			}
 			st, err := r.reviewStatusFor(pollCtx, runID, in.Stage)
 			if err != nil {
 				// A deadline hit mid-poll cancels the in-flight request;
@@ -806,4 +871,17 @@ func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start t
 		"fishhawk_get_run_status every %ds (the authoritative path). Check the fishhawkd logs if this persists.",
 		stage, timeout, suggestedReviewPollIntervalSeconds)
 	return out
+}
+
+// awaitReviewProgressMessage builds the per-tick heartbeat message for a
+// pending review wait (#1963): the stage, the pending status, the elapsed
+// wall-clock seconds, and — when the run has gone terminal while the review is
+// still in flight (#1915) — a short note. Pure (no I/O) so a table test pins
+// it.
+func awaitReviewProgressMessage(stage string, elapsed time.Duration, terminalInFlight bool) string {
+	msg := fmt.Sprintf("await_review: %s review pending; elapsed %ds", stage, int(elapsed.Seconds()))
+	if terminalInFlight {
+		msg += "; run terminal with review still in flight"
+	}
+	return msg
 }

@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // seedReviewStartedAudit appends a *_review_started audit entry to the
@@ -583,6 +585,287 @@ func TestAwaitReview_TimeoutClamped(t *testing.T) {
 	}
 	if got := clampAwaitTimeout(45); got != 45 {
 		t.Errorf("clampAwaitTimeout(45) = %d, want 45", got)
+	}
+}
+
+// TestClampAwaitTimeoutHeartbeat pins the token-conditional cap (#1963): with
+// heartbeat=false the clamp is BYTE-IDENTICAL to clampAwaitTimeout (the
+// token-less / fishhawk_merge_run contract is unchanged), and with
+// heartbeat=true the default stays 360 while the cap rises to 7200.
+func TestClampAwaitTimeoutHeartbeat(t *testing.T) {
+	if awaitHeartbeatTimeoutMax != 7200 {
+		t.Fatalf("awaitHeartbeatTimeoutMax = %d, want 7200", awaitHeartbeatTimeoutMax)
+	}
+	cases := []struct {
+		name      string
+		n         int
+		heartbeat bool
+		want      int
+	}{
+		// heartbeat=false is byte-identical to clampAwaitTimeout (600 cap).
+		{"no-hb default", 0, false, 360},
+		{"no-hb over-cap clamps to 600", 99999, false, 600},
+		{"no-hb passthrough", 45, false, 45},
+		// heartbeat=true keeps the 360 default but raises the cap to 7200.
+		{"hb default", 0, true, 360},
+		{"hb passthrough above old cap", 601, true, 601},
+		{"hb at new cap", 7200, true, 7200},
+		{"hb over new cap clamps to 7200", 99999, true, 7200},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := clampAwaitTimeoutHeartbeat(tc.n, tc.heartbeat); got != tc.want {
+				t.Errorf("clampAwaitTimeoutHeartbeat(%d, %v) = %d, want %d", tc.n, tc.heartbeat, got, tc.want)
+			}
+			// The heartbeat=false branch must exactly mirror clampAwaitTimeout so
+			// the token-less / merge_run cap can never silently diverge.
+			if !tc.heartbeat {
+				if got, want := clampAwaitTimeoutHeartbeat(tc.n, false), clampAwaitTimeout(tc.n); got != want {
+					t.Errorf("heartbeat=false diverged from clampAwaitTimeout for %d: %d vs %d", tc.n, got, want)
+				}
+			}
+		})
+	}
+}
+
+// awaitReviewHeartbeatFake seeds a pending implement review and flips it to
+// complete when the started-category query count reaches settleAt — the pass
+// with started-query count settleAt+1 (the NEXT reviewStatusFor pass) then
+// observes the reviewed entry and resolves. Since the poll loop emits exactly
+// one heartbeat per tick and resolves on the settleAt-th tick, this yields
+// EXACTLY settleAt heartbeats. Returns (fb, resolver, runID).
+func awaitReviewHeartbeatFake(t *testing.T, settleAt int64) (*fakeBackend, *runResolver, uuid.UUID) {
+	t.Helper()
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 1, "advisory")
+
+	var startedQueries atomic.Int64
+	fb.reviewFlip = func(category string) {
+		// Mutates perRunAuditByRun under fb.mu (the handler holds it).
+		if category == "implement_review_started" && startedQueries.Add(1) == settleAt {
+			payload, _ := json.Marshal(PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+			var decoded any
+			_ = json.Unmarshal(payload, &decoded)
+			fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+				ID:       uuid.New().String(),
+				Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+				RunID:    runID.String(),
+				Category: "implement_reviewed",
+				Payload:  decoded,
+			})
+		}
+	}
+
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+	return fb, r, runID
+}
+
+// TestAwaitReview_ProgressHeartbeat_RealMCPBoundary is the mode-1 done-means
+// test (#1963): a client holding one long fishhawk_await_review call open with a
+// progressToken receives a keep-alive heartbeat once per poll tick, each echoing
+// the request token and carrying awaitReviewProgressMessage content. Exercises
+// the REAL MCP boundary — in-memory client/server transports + a
+// ProgressNotificationHandler — mirroring TestDriveRun_ProgressHeartbeat.
+func TestAwaitReview_ProgressHeartbeat_RealMCPBoundary(t *testing.T) {
+	ctx := context.Background()
+	const wantHeartbeats = 3
+	_, r, runID := awaitReviewHeartbeatFake(t, wantHeartbeats)
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "0"}, nil)
+	registerAwaitReview(server, r)
+
+	var mu sync.Mutex
+	var notes []*mcp.ProgressNotificationParams
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, &mcp.ClientOptions{
+		ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
+			mu.Lock()
+			notes = append(notes, req.Params)
+			mu.Unlock()
+		},
+	})
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	params := &mcp.CallToolParams{
+		Name:      "fishhawk_await_review",
+		Arguments: map[string]any{"run_id": runID.String(), "stage": "implement", "timeout_seconds": 5},
+	}
+	params.SetProgressToken("review-tok-1")
+	res, err := clientSession.CallTool(ctx, params)
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+
+	// Notifications are delivered async; wait for all wantHeartbeats to flush.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(notes)
+		mu.Unlock()
+		if n >= wantHeartbeats {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(notes) != wantHeartbeats {
+		t.Fatalf("received %d progress notifications at the real MCP boundary; want exactly %d (one per poll tick)", len(notes), wantHeartbeats)
+	}
+	for i, n := range notes {
+		if n.ProgressToken != "review-tok-1" {
+			t.Errorf("notification[%d] progressToken = %v, want the request token review-tok-1", i, n.ProgressToken)
+		}
+		if !strings.HasPrefix(n.Message, "await_review: implement review pending") {
+			t.Errorf("notification[%d] message = %q, want awaitReviewProgressMessage content", i, n.Message)
+		}
+		if n.Progress != float64(i+1) {
+			t.Errorf("notification[%d] progress = %v, want %d (one increment per poll tick)", i, n.Progress, i+1)
+		}
+	}
+}
+
+// TestAwaitReview_ProgressHeartbeat_NoToken_NoEmission is the mode-2 opt-in
+// proof (#1963): a real CallTool that supplies NO progressToken receives ZERO
+// progress notifications and still resolves to the normal complete result.
+func TestAwaitReview_ProgressHeartbeat_NoToken_NoEmission(t *testing.T) {
+	ctx := context.Background()
+	_, r, runID := awaitReviewHeartbeatFake(t, 2)
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "0"}, nil)
+	registerAwaitReview(server, r)
+
+	var mu sync.Mutex
+	var notes int
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, &mcp.ClientOptions{
+		ProgressNotificationHandler: func(_ context.Context, _ *mcp.ProgressNotificationClientRequest) {
+			mu.Lock()
+			notes++
+			mu.Unlock()
+		},
+	})
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	// No SetProgressToken: the opt-in is not exercised.
+	res, err := clientSession.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "fishhawk_await_review",
+		Arguments: map[string]any{"run_id": runID.String(), "stage": "implement", "timeout_seconds": 5},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+	// The result must still be the normal complete verdict.
+	raw, merr := json.Marshal(res.StructuredContent)
+	if merr != nil {
+		t.Fatalf("marshal StructuredContent: %v", merr)
+	}
+	if !strings.Contains(string(raw), `"status":"complete"`) {
+		t.Errorf("no-token result should still resolve complete; got %s", raw)
+	}
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if notes != 0 {
+		t.Errorf("received %d progress notifications with no progressToken; want 0 (opt-in)", notes)
+	}
+}
+
+// errNotifySession stands up a real-but-closed MCP server session whose
+// NotifyProgress errors on every call, so the heartbeat emission's error-swallow
+// resilience (binding condition) can be pinned deterministically.
+func errNotifySession(t *testing.T) *mcp.ServerSession {
+	t.Helper()
+	ctx := context.Background()
+	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "0"}, nil)
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	// Tear both sides down so any subsequent NotifyProgress write errors.
+	_ = clientSession.Close()
+	_ = serverSession.Close()
+	return serverSession
+}
+
+// TestAwaitReview_ProgressHeartbeat_NotifyErrorDoesNotFailWait pins the binding
+// condition (#1963): a heartbeat emission whose NotifyProgress FAILS (here, a
+// closed session/transport that errors on every notification) must NOT terminate
+// or fail the await — the wait still reaches its terminal complete result.
+// Without this test the non-authoritative-heartbeat behavior is unpinned and a
+// future refactor could silently make a notify error fatal.
+func TestAwaitReview_ProgressHeartbeat_NotifyErrorDoesNotFailWait(t *testing.T) {
+	_, r, runID := awaitReviewHeartbeatFake(t, 2)
+
+	sess := errNotifySession(t)
+	// A request carrying a progressToken AND the closed session: every tick
+	// attempts a NotifyProgress that errors. The swallowed error must not break
+	// the wait.
+	req := &mcp.CallToolRequest{
+		Session: sess,
+		Params:  &mcp.CallToolParamsRaw{Name: "fishhawk_await_review"},
+	}
+	req.Params.SetProgressToken("err-tok")
+
+	_, out, err := r.awaitReview(context.Background(), req, AwaitReviewInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("awaitReview returned error despite a swallowed notify failure: %v", err)
+	}
+	if out.Status != "complete" {
+		t.Fatalf("Status = %q, want complete — the wait must reach its terminal result despite notify errors", out.Status)
+	}
+	if len(out.Reviews) != 1 || out.Reviews[0].Verdict != "approve" {
+		t.Errorf("Reviews = %+v, want one approve verdict", out.Reviews)
+	}
+}
+
+// TestAwaitReviewProgressMessage pins the pure heartbeat-message helper,
+// including the #1915 terminalInFlight note.
+func TestAwaitReviewProgressMessage(t *testing.T) {
+	base := awaitReviewProgressMessage("implement", 12*time.Second, false)
+	if base != "await_review: implement review pending; elapsed 12s" {
+		t.Errorf("base message = %q", base)
+	}
+	tif := awaitReviewProgressMessage("plan", 3*time.Second, true)
+	if !strings.HasPrefix(tif, "await_review: plan review pending; elapsed 3s") ||
+		!strings.Contains(tif, "run terminal with review still in flight") {
+		t.Errorf("terminalInFlight message = %q", tif)
 	}
 }
 

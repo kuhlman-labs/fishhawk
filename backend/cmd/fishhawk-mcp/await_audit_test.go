@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // seedAuditEntry appends one bare audit entry of the given category at an
@@ -580,5 +582,211 @@ func TestAwaitAudit_StaleReviewNeverReturned(t *testing.T) {
 	}
 	if out.LatestSequence != 7 {
 		t.Errorf("LatestSequence = %d, want 7", out.LatestSequence)
+	}
+}
+
+// awaitAuditHeartbeatFake seeds nothing and lands an implement_reviewed entry
+// (sequence 5) when the category query count reaches settleAt — since the fake
+// appends under the same lock it later reads, that query resolves 'found'. The
+// fast path is query #1 (no heartbeat) and each tick emits one heartbeat before
+// its query, so a resolution on query #settleAt yields EXACTLY settleAt-1
+// heartbeats. The default (unkeyed) run is non-terminal, so the run-terminal
+// backstop never fires a competing early resolve. Returns (fb, resolver, runID).
+func awaitAuditHeartbeatFake(t *testing.T, settleAt int64) (*fakeBackend, *runResolver, uuid.UUID) {
+	t.Helper()
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+
+	var queries atomic.Int64
+	fb.reviewFlip = func(category string) {
+		if category == "implement_reviewed" && queries.Add(1) == settleAt {
+			fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+				ID:       uuid.New().String(),
+				Sequence: 5,
+				RunID:    runID.String(),
+				Category: "implement_reviewed",
+			})
+		}
+	}
+
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+	return fb, r, runID
+}
+
+// TestAwaitAudit_ProgressHeartbeat_RealMCPBoundary is the mode-1 done-means test
+// (#1963): a client holding one long fishhawk_await_audit call open with a
+// progressToken receives a keep-alive heartbeat once per poll tick, each echoing
+// the request token and carrying awaitAuditProgressMessage content (the
+// categoriesDisplay text + the since_sequence anchor). Real MCP boundary.
+func TestAwaitAudit_ProgressHeartbeat_RealMCPBoundary(t *testing.T) {
+	ctx := context.Background()
+	const wantHeartbeats = 3
+	_, r, runID := awaitAuditHeartbeatFake(t, wantHeartbeats+1)
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "0"}, nil)
+	registerAwaitAudit(server, r)
+
+	var mu sync.Mutex
+	var notes []*mcp.ProgressNotificationParams
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, &mcp.ClientOptions{
+		ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
+			mu.Lock()
+			notes = append(notes, req.Params)
+			mu.Unlock()
+		},
+	})
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	params := &mcp.CallToolParams{
+		Name:      "fishhawk_await_audit",
+		Arguments: map[string]any{"run_id": runID.String(), "category": "implement_reviewed", "timeout_seconds": 5},
+	}
+	params.SetProgressToken("audit-tok-1")
+	res, err := clientSession.CallTool(ctx, params)
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(notes)
+		mu.Unlock()
+		if n >= wantHeartbeats {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(notes) != wantHeartbeats {
+		t.Fatalf("received %d progress notifications at the real MCP boundary; want exactly %d (one per poll tick)", len(notes), wantHeartbeats)
+	}
+	for i, n := range notes {
+		if n.ProgressToken != "audit-tok-1" {
+			t.Errorf("notification[%d] progressToken = %v, want the request token audit-tok-1", i, n.ProgressToken)
+		}
+		if !strings.HasPrefix(n.Message, `await_audit: waiting for "implement_reviewed"`) {
+			t.Errorf("notification[%d] message = %q, want the categoriesDisplay text", i, n.Message)
+		}
+		if !strings.Contains(n.Message, "since_sequence 0") {
+			t.Errorf("notification[%d] message = %q, want the since_sequence anchor", i, n.Message)
+		}
+		if n.Progress != float64(i+1) {
+			t.Errorf("notification[%d] progress = %v, want %d (one increment per poll tick)", i, n.Progress, i+1)
+		}
+	}
+}
+
+// TestAwaitAudit_ProgressHeartbeat_NoToken_NoEmission is the mode-2 opt-in proof
+// (#1963): a real CallTool with NO progressToken receives ZERO notifications and
+// still resolves 'found'.
+func TestAwaitAudit_ProgressHeartbeat_NoToken_NoEmission(t *testing.T) {
+	ctx := context.Background()
+	_, r, runID := awaitAuditHeartbeatFake(t, 2)
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "0"}, nil)
+	registerAwaitAudit(server, r)
+
+	var mu sync.Mutex
+	var notes int
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, &mcp.ClientOptions{
+		ProgressNotificationHandler: func(_ context.Context, _ *mcp.ProgressNotificationClientRequest) {
+			mu.Lock()
+			notes++
+			mu.Unlock()
+		},
+	})
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "fishhawk_await_audit",
+		Arguments: map[string]any{"run_id": runID.String(), "category": "implement_reviewed", "timeout_seconds": 5},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+	raw, merr := json.Marshal(res.StructuredContent)
+	if merr != nil {
+		t.Fatalf("marshal StructuredContent: %v", merr)
+	}
+	if !strings.Contains(string(raw), `"status":"found"`) {
+		t.Errorf("no-token result should still resolve found; got %s", raw)
+	}
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if notes != 0 {
+		t.Errorf("received %d progress notifications with no progressToken; want 0 (opt-in)", notes)
+	}
+}
+
+// TestAwaitAudit_ProgressHeartbeat_NotifyErrorDoesNotFailWait mirrors the
+// binding-condition resilience proof for the audit tool (#1963): a heartbeat
+// whose NotifyProgress FAILS (a closed session) must not terminate or fail the
+// wait — it still resolves 'found'.
+func TestAwaitAudit_ProgressHeartbeat_NotifyErrorDoesNotFailWait(t *testing.T) {
+	_, r, runID := awaitAuditHeartbeatFake(t, 3)
+
+	sess := errNotifySession(t)
+	req := &mcp.CallToolRequest{
+		Session: sess,
+		Params:  &mcp.CallToolParamsRaw{Name: "fishhawk_await_audit"},
+	}
+	req.Params.SetProgressToken("err-tok")
+
+	_, out, err := r.awaitAudit(context.Background(), req, AwaitAuditInput{
+		RunID:          runID.String(),
+		Category:       "implement_reviewed",
+		TimeoutSeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("awaitAudit returned error despite a swallowed notify failure: %v", err)
+	}
+	if out.Status != "found" {
+		t.Fatalf("Status = %q, want found — the wait must reach its terminal result despite notify errors", out.Status)
+	}
+	if out.Entry == nil || out.Entry.Sequence != 5 {
+		t.Errorf("Entry = %+v, want the landed sequence-5 entry", out.Entry)
+	}
+}
+
+// TestAwaitAuditProgressMessage pins the pure heartbeat-message helper for the
+// single- and multi-category forms.
+func TestAwaitAuditProgressMessage(t *testing.T) {
+	single := awaitAuditProgressMessage([]string{"implement_reviewed"}, 7, 12*time.Second)
+	if single != `await_audit: waiting for "implement_reviewed" since_sequence 7; elapsed 12s` {
+		t.Errorf("single-category message = %q", single)
+	}
+	multi := awaitAuditProgressMessage([]string{"implement_reviewed", "fixup_pushed"}, 0, 3*time.Second)
+	if !strings.HasPrefix(multi, "await_audit: waiting for any of [") || !strings.Contains(multi, "since_sequence 0") {
+		t.Errorf("multi-category message = %q", multi)
 	}
 }

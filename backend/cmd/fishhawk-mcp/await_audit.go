@@ -28,7 +28,7 @@ type AwaitAuditInput struct {
 	// anchors — e.g. awaiting either implement_reviewed OR fixup_pushed.
 	Categories     []string `json:"categories,omitempty" jsonschema:"OR-semantics list of audit categories; the wait resolves on the first entry matching ANY of them past the anchor. Unioned with category. Each is validated against the known-category registry unless allow_unknown is set"`
 	SinceSequence  int64    `json:"since_sequence,omitempty" jsonschema:"only an entry with sequence strictly greater than this resolves the wait (default 0 = the next entry of the category). Anchor it at the sequence of the event you are waiting past — e.g. the fixup_pushed entry's sequence when waiting for the post-fix-up implement_reviewed verdict"`
-	TimeoutSeconds int      `json:"timeout_seconds,omitempty" jsonschema:"how long to wait before returning 'timeout' (default 360, capped at 600). On timeout, re-call with since_sequence = the returned latest_sequence to resume with no gap"`
+	TimeoutSeconds int      `json:"timeout_seconds,omitempty" jsonschema:"how long to wait before returning 'timeout' (default 360). Cap is token-conditional: 600 without a progressToken, 7200 when a progressToken is supplied (the heartbeat keeps the client's idle clock alive). On timeout, re-call with since_sequence = the returned latest_sequence to resume with no gap"`
 	// AllowUnknown bypasses the known-category validation (#1764) for a
 	// category legitimately absent from the curated registry. Default false:
 	// an unknown category is rejected up front (no wait armed) naming the
@@ -127,7 +127,16 @@ Inputs:
                       (default false).
   - since_sequence  — anchor; default 0 waits for the next entry of the
                       category regardless of history.
-  - timeout_seconds — default 360, capped at 600.
+  - timeout_seconds — default 360; cap 600 without a progressToken, 7200
+                      with one.
+
+Progress heartbeat (#1963): supply a progressToken to receive an MCP
+notifications/progress keep-alive once per poll tick (category + anchor +
+elapsed) AND to unlock the 7200s timeout cap — with the heartbeat resetting the
+client's idle clock, one call with timeout_seconds up to 7200 can wait out a
+full implement pass or review round. WITHOUT a token the 600s cap and the
+gapless re-arm contract are unchanged, and a client/transport per-call timeout
+may still cut a long call short (a safe no-op to re-issue).
 
 The returned entry's payload is compact by default (#1727): oversized
 free-text — reviewer free_form prose and issue-context body/comments —
@@ -147,7 +156,7 @@ rather wait synchronously than loop yourself.
 // fast-path read, then a poll on the injectable reviewPollInterval under
 // a clamped deadline, with the ADR-036 run-terminal backstop checked once
 // before the loop and on each still-empty tick.
-func (r *runResolver) awaitAudit(ctx context.Context, _ *mcp.CallToolRequest, in AwaitAuditInput) (*mcp.CallToolResult, AwaitAuditOutput, error) {
+func (r *runResolver) awaitAudit(ctx context.Context, req *mcp.CallToolRequest, in AwaitAuditInput) (*mcp.CallToolResult, AwaitAuditOutput, error) {
 	runID, err := uuid.Parse(in.RunID)
 	if err != nil {
 		return nil, AwaitAuditOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
@@ -167,7 +176,17 @@ func (r *runResolver) awaitAudit(ctx context.Context, _ *mcp.CallToolRequest, in
 			return nil, AwaitAuditOutput{}, err
 		}
 	}
-	timeout := clampAwaitTimeout(in.TimeoutSeconds)
+
+	// Progress heartbeat (#1963): capture the client-supplied progressToken
+	// exactly as awaitReview / drive_run do (nil-guarding req and req.Params). A
+	// token unlocks the 7200s cap AND a per-tick keep-alive; a token-less call
+	// keeps the byte-identical 360/600 contract. Opt-in per the MCP spec: no
+	// token (or no session) => no emission.
+	var progToken any
+	if req != nil && req.Params != nil {
+		progToken = req.Params.GetProgressToken()
+	}
+	timeout := clampAwaitTimeoutHeartbeat(in.TimeoutSeconds, progToken != nil)
 	start := time.Now()
 
 	// Fast path: an entry may already exist. The endpoint is
@@ -198,11 +217,26 @@ func (r *runResolver) awaitAudit(ctx context.Context, _ *mcp.CallToolRequest, in
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	var progress float64
 	for {
 		select {
 		case <-pollCtx.Done():
 			return nil, awaitAuditTimeoutOutput(in, cats, timeout, start), nil
 		case <-ticker.C:
+			// Best-effort progress heartbeat once per tick (opt-in): keeps a
+			// long wait from being aborted by the client's idle timeout. Emitted
+			// only when the caller supplied a progressToken AND the request
+			// carries a live session. A failed notify is SWALLOWED — the await is
+			// authoritative, the heartbeat advisory; a notify error must never
+			// terminate or fail the wait.
+			if progToken != nil && req != nil && req.Session != nil {
+				progress++
+				_ = req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
+					ProgressToken: progToken,
+					Progress:      progress,
+					Message:       awaitAuditProgressMessage(cats, in.SinceSequence, time.Since(start)),
+				})
+			}
 			entry, err := r.nextAuditEntry(pollCtx, runID, cats, in.SinceSequence, in.AllowUnknown)
 			if err != nil {
 				// A deadline hit mid-poll cancels the in-flight request;
@@ -387,6 +421,15 @@ func awaitAuditFoundOutput(entry *AuditEntry, in AwaitAuditInput, _ []string, st
 		LatestSequence: entry.Sequence,
 		WaitedSeconds:  time.Since(start).Seconds(),
 	}
+}
+
+// awaitAuditProgressMessage builds the per-tick heartbeat message for a
+// pending audit wait (#1963): the awaited category display, the since_sequence
+// anchor, and the elapsed wall-clock seconds. Pure (no I/O) so a table test
+// pins it.
+func awaitAuditProgressMessage(cats []string, sinceSeq int64, elapsed time.Duration) string {
+	return fmt.Sprintf("await_audit: waiting for %s since_sequence %d; elapsed %ds",
+		categoriesDisplay(cats), sinceSeq, int(elapsed.Seconds()))
 }
 
 // categoriesDisplay renders the requested categories for a message: a bare
