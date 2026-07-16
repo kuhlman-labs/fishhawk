@@ -230,6 +230,101 @@ resumable:
 **Every stop is resumable by re-invoking with the SAME `run_id`.** `max_minutes`
 clamps to **[1,240]** (default **60**); a timeout is itself a resumable stop.
 
+### Batch-as-campaign (local campaign drive)
+
+A batch instruction — "run these N issues through the loop" — maps to **one
+campaign**, not N hand-sequenced `fishhawk_start_run`/`fishhawk_drive_run`
+cycles tracked out-of-band. A campaign is the DAG-ordered batch counterpart to
+the single-run loop: it assembles once from an epic and you drive its
+constituent runs locally through the campaign verbs.
+
+**Validated end-to-end (E48.12 / #1959).** This section is the write-up of a
+real walk, not aspirational prose. Campaign
+`80a69eba-1ca1-4deb-a12e-db1d8ad4d9f7` on epic
+[#1940](https://github.com/kuhlman-labs/fishhawk/issues/1940) drove **16 real
+`feature_change` items** end-to-end on `runner_kind:local` across 2026-07-15/16,
+with a per-item `fishhawk_drive_run` handoff and `fishhawk_get_campaign_status`
+read as the **single status surface**. Every gap that walk surfaced was filed
+under E48:
+[#1970](https://github.com/kuhlman-labs/fishhawk/issues/1970),
+[#1972](https://github.com/kuhlman-labs/fishhawk/issues/1972),
+[#1975](https://github.com/kuhlman-labs/fishhawk/issues/1975),
+[#1980](https://github.com/kuhlman-labs/fishhawk/issues/1980),
+[#1983](https://github.com/kuhlman-labs/fishhawk/issues/1983),
+[#1987](https://github.com/kuhlman-labs/fishhawk/issues/1987),
+[#1989](https://github.com/kuhlman-labs/fishhawk/issues/1989),
+[#1995](https://github.com/kuhlman-labs/fishhawk/issues/1995).
+
+**Shape the batch as an epic first.** A campaign assembles from an **epic ref**
+whose children optionally carry `depends_on` edges. If the batch is not already
+one, file it via `fishhawk_draft_epic` (the refinement intake loop) or
+`fishhawk_file_issue` with `relations.parent_epic` / `depends_on`, then start the
+campaign against that epic.
+
+**1. Start the campaign.** `fishhawk_start_campaign` (`repo` + `epic_ref`
+required; optional `pause_policy` of `pause_campaign` (default) / `pause_item`,
+fixed at create time). It resolves the epic's children + their `depends_on`
+edges, wave-orders the DAG, and persists the campaign — the batch counterpart to
+`fishhawk_start_run`. A dependency targeting a non-child fails
+`campaign_dangling_dependency`; an un-installed repo fails `repo_not_installed`.
+
+**2. The drive-tick loop — `fishhawk_get_campaign_status` is the single status
+surface.** It is reconcile-on-read: each poll settles every terminal item run and
+advances the campaign in DAG order (the same state-guarded transitions the GHA
+driver's ADVANCE pass uses), so you need neither `--enable-campaign-driver` nor
+GitHub Actions. The response carries the readiness `rollup`
+(`eligible`/`blocked`/`running`/`done`/`failed`/`cancelled`/`paused`) and a
+`next_actions` block naming the legal move: `start_run` (an item is eligible),
+`wait` (re-poll), `attention` (read the failed item's run and retry/abandon),
+`resume` (a paged gate is handled), `complete` (terminal). Poll it as your
+drive tick; do not track batch state out-of-band.
+
+**3. Start ONE item — `runner_kind:local` always.**
+`fishhawk_start_campaign_item_run` (`campaign_id` + `issue_ref` +
+`workflow_id`) when `next_action` is `start_run`. **Always pass
+`runner_kind:local`** — the same execution/tag-mismatch hazard as
+`fishhawk_start_run` (see the `runner_kind:local` section above): a
+`github_actions`-tagged item never dispatches on this host. The call refuses an
+ineligible item with `item_not_eligible`, naming the blocking dependency; a
+paused/terminal campaign refuses with `campaign_not_startable`; an unknown ref is
+`campaign_item_not_found`. It mints the run, links it to the item, and moves the
+item to `running`.
+
+**4. Per-item handoff — drive the minted run to merge.** Hand the returned
+`run_id` to `fishhawk_drive_run` and drive it to merge **exactly as a solo local
+run**. Every local edge case above applies per item: the fixup explicit-dispatch
+rule, `awaiting_host_dispatch` auto-dispatch, the `dispatched_stale`
+liveness-probe stop, heterogeneous-review two-verdict waits, and post-failure
+clean-tree discipline.
+
+**5. Serialize — one item at a time.** The manual path has deliberately **no
+server-side concurrency cap** (unlike the GHA driver's `MaxParallel`): the
+operator decides when to start each eligible item. Start **one item at a time**
+and serialize local verifies until the
+[#1918](https://github.com/kuhlman-labs/fishhawk/issues/1918) two-concurrent-local-runs
+experiment settles the rule. There is also no `idempotency_key` — the eligibility
+gate already refuses a re-start against a running item.
+
+**6. Per-item post-merge — before the next eligible item.** After each item's
+merge, run `scripts/dev post-merge <issue>` **before starting the next eligible
+item**, so the next run mints from the advanced `main` (the ordered discipline
+the 16-item walk followed). Then re-poll `fishhawk_get_campaign_status` for the
+now-eligible descendant.
+
+**7. Failure handling.** A failed item settles on the next status poll and
+surfaces as `attention` (never auto-advanced past). Read the failed item's run
+(`fishhawk_get_run_status`), then retry/revive or abandon through the run verbs
+and re-poll — a recovered descendant re-links per the reconcile recovery arm.
+`fishhawk_resume_campaign` is legal **only against a paused campaign**
+(`campaign_not_paused`, 409, otherwise) — reach for it after handling a paged
+gate, not to advance an eligible item.
+
+**Human-led (run-less) items settle themselves.** A dependency-satisfied item
+with **no linked run** — a human-led (`autonomy:low`) issue closed by a
+maintainer PR — settles `succeeded` automatically on the next status poll once
+its issue is CLOSED as completed (`state_reason=completed`), with **no operator
+action**; its descendants then become eligible.
+
 ### Acceptance stage
 
 Some workflows declare an **acceptance stage** (E31.9 / ADR-049) after the

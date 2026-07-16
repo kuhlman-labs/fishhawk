@@ -160,4 +160,46 @@ func TestOnboarding_RunbookResourceListedAndReadable(t *testing.T) {
 			t.Errorf("runbook missing edge-case anchor %q", anchor)
 		}
 	}
+
+	// E48.12 / #1959: the Batch-as-campaign section is asserted SECTION-SCOPED
+	// (binding condition 2), not runbook-wide — a token merely present elsewhere
+	// in the runbook (e.g. runner_kind:local in the local-dogfood section) must
+	// not satisfy a batch-as-campaign anchor. Extract the section substring from
+	// its heading to the next same-level (`### `) heading and assert every anchor
+	// WITHIN it, so a dropped or reworded-away batch statement fails here.
+	const batchHeading = "### Batch-as-campaign"
+	start := strings.Index(c.Text, batchHeading)
+	if start < 0 {
+		t.Fatalf("runbook missing the %q section heading", batchHeading)
+	}
+	rest := c.Text[start+len(batchHeading):]
+	end := strings.Index(rest, "\n### ")
+	if end < 0 {
+		t.Fatalf("Batch-as-campaign section has no following same-level heading; cannot bound the section")
+	}
+	section := rest[:end]
+	for _, anchor := range []string{
+		// The four campaign verbs the section maps a batch instruction onto.
+		"fishhawk_start_campaign",
+		"fishhawk_start_campaign_item_run",
+		"fishhawk_get_campaign_status",
+		"fishhawk_resume_campaign",
+		// The eligibility-refusal and resume-guard error codes it quotes.
+		"item_not_eligible",
+		"campaign_not_paused",
+		// Binding condition 2's extended anchor set.
+		"runner_kind:local",             // the always-local start rule
+		"single status surface",         // get_campaign_status is the one status read
+		"one item at a time",            // the serialization rule
+		"before the next eligible item", // the ordered post-merge-before-next-item rule
+		"post-merge",                    // the scripts/dev post-merge step
+		"#1918",                         // the pending two-concurrent-local-runs experiment
+		// Binding condition 1: the section cites the completed live validation.
+		"80a69eba-1ca1-4deb-a12e-db1d8ad4d9f7", // the campaign id
+		"#1940",                                // the campaign's epic
+	} {
+		if !strings.Contains(section, anchor) {
+			t.Errorf("Batch-as-campaign section missing anchor %q", anchor)
+		}
+	}
 }
