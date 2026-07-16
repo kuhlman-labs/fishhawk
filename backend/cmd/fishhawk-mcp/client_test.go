@@ -531,6 +531,37 @@ func TestAcceptanceDispatchAdmission_WireShape(t *testing.T) {
 		if res.ShortCircuited {
 			t.Errorf("short_circuited = true, want false")
 		}
+		// An old-backend body without the new fields decodes to zero values so
+		// the verb spawns as today (the mixed-version degrade).
+		if res.NeedsTarget || len(res.TargetHosts) != 0 || res.ExpectedHeadSHA != "" {
+			t.Errorf("needs_target block = (%v, %v, %q), want all zero on an old-backend body", res.NeedsTarget, res.TargetHosts, res.ExpectedHeadSHA)
+		}
+	})
+
+	t.Run("needs_target block decodes (#1953)", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"short_circuited":false,"needs_target":true,"target_hosts":["localhost:8090","staging.example:443"],"expected_head_sha":"abc1234def"}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+		res, err := c.AcceptanceDispatchAdmission(context.Background(), stageID)
+		if err != nil {
+			t.Fatalf("AcceptanceDispatchAdmission: %v", err)
+		}
+		if res.ShortCircuited {
+			t.Errorf("short_circuited = true, want false")
+		}
+		if !res.NeedsTarget {
+			t.Errorf("needs_target = false, want true")
+		}
+		wantHosts := []string{"localhost:8090", "staging.example:443"}
+		if len(res.TargetHosts) != 2 || res.TargetHosts[0] != wantHosts[0] || res.TargetHosts[1] != wantHosts[1] {
+			t.Errorf("target_hosts = %v, want %v", res.TargetHosts, wantHosts)
+		}
+		if res.ExpectedHeadSHA != "abc1234def" {
+			t.Errorf("expected_head_sha = %q, want abc1234def", res.ExpectedHeadSHA)
+		}
 	})
 
 	t.Run("HTTP error surfaces as apiError", func(t *testing.T) {

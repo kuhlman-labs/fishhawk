@@ -805,6 +805,14 @@ type dispatchAutoDriveFake struct {
 	admissionShortCircuit bool
 	admissionStatus       int
 	admissionCalledN      int
+	// Acceptance needs_target fixtures (#1953). When admissionNeedsTarget is set
+	// (and not short-circuiting), the admission response carries needs_target +
+	// hosts + head SHA so the verb-side gate probes. hostDispatchCalledN counts
+	// host-dispatch marker POSTs so a needs_target refusal can assert none fired.
+	admissionNeedsTarget     bool
+	admissionTargetHosts     []string
+	admissionExpectedHeadSHA string
+	hostDispatchCalledN      int
 	// stageStateAfterAdmission, when set, is the state /stages reads return AFTER
 	// the admission POST — modelling a mid-walk 500 that left the target 'running'.
 	// The earlier resolveStageID + sibling-guard reads (admissionCalledN==0) still
@@ -832,6 +840,9 @@ func (f *dispatchAutoDriveFake) handler() http.HandlerFunc {
 			f.admissionCalledN++
 			sc := f.admissionShortCircuit
 			status := f.admissionStatus
+			needsTarget := f.admissionNeedsTarget
+			targetHosts := f.admissionTargetHosts
+			expectedHeadSHA := f.admissionExpectedHeadSHA
 			if sc {
 				f.stageState = "succeeded"
 			}
@@ -847,6 +858,10 @@ func (f *dispatchAutoDriveFake) handler() http.HandlerFunc {
 				res.Basis = "all-skip-with-basis"
 				res.CriteriaTotal = 2
 				res.Stage = &Stage{ID: f.stageID.String(), RunID: f.runID.String(), Type: "acceptance", State: "succeeded"}
+			} else if needsTarget {
+				res.NeedsTarget = true
+				res.TargetHosts = targetHosts
+				res.ExpectedHeadSHA = expectedHeadSHA
 			}
 			_ = json.NewEncoder(w).Encode(res)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/auto-drive/acts"):
@@ -889,6 +904,11 @@ func (f *dispatchAutoDriveFake) handler() http.HandlerFunc {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"items": []Stage{{ID: f.stageID.String(), RunID: f.runID.String(), Type: stype, State: state}},
 			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/host-dispatch"):
+			f.mu.Lock()
+			f.hostDispatchCalledN++
+			f.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(HostDispatchResult{Transitioned: true, StageState: "dispatched"})
 		default:
 			// guardHostDispatch's GET /v0/runs/{id}: an unlocked run so the guard passes.
 			_ = json.NewEncoder(w).Encode(Run{ID: f.runID.String(), Repo: "x/y", State: "running"})
@@ -1061,6 +1081,121 @@ func TestDispatchStage_AcceptanceShortCircuit_NoSpawn(t *testing.T) {
 	}
 	if !noted {
 		t.Errorf("missing the short-circuit note; warnings: %v", out.Warnings)
+	}
+}
+
+// TestDispatchStage_AcceptanceNeedsTarget_NoRecordNoSpawn (#1953): a needs_target
+// admission whose declared target is unreachable REFUSES — no record-act, no
+// host-dispatch marker, no spawn — and returns the structured NeedsTarget.
+func TestDispatchStage_AcceptanceNeedsTarget_NoRecordNoSpawn(t *testing.T) {
+	origAttempts := acceptanceQuickProbeAttempts
+	acceptanceQuickProbeAttempts = 1
+	t.Cleanup(func() { acceptanceQuickProbeAttempts = origAttempts })
+
+	target := healthzServer(t, http.StatusOK, `{"git_sha":"abc1234def"}`)
+	targetHost := hostOf(target.URL)
+	target.Close()
+
+	f := &dispatchAutoDriveFake{
+		runID: uuid.New(), stageID: uuid.New(), stageType: "acceptance",
+		admissionNeedsTarget:     true,
+		admissionTargetHosts:     []string{targetHost},
+		admissionExpectedHeadSHA: probeExpectedSHA,
+	}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv: func(string) string { return "" },
+	}
+
+	spawned := 0
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, _ ...string) *exec.Cmd {
+		spawned++
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: f.runID.String(), Workflow: "feature_change", Stage: "acceptance",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	if spawned != 0 {
+		t.Errorf("a needs_target refusal must spawn NO runner, got %d", spawned)
+	}
+	f.mu.Lock()
+	acts, marks := f.actCalledN, f.hostDispatchCalledN
+	f.mu.Unlock()
+	if acts != 0 {
+		t.Errorf("a needs_target refusal must record NO spawn-evidence act, got %d", acts)
+	}
+	if marks != 0 {
+		t.Errorf("a needs_target refusal must NOT stamp the host-dispatch marker, got %d", marks)
+	}
+	if out.NeedsTarget == nil {
+		t.Fatal("NeedsTarget = nil, want the structured refusal")
+	}
+	if out.NeedsTarget.TargetHost != targetHost || out.NeedsTarget.ExpectedHeadSHA != probeExpectedSHA {
+		t.Errorf("NeedsTarget = %+v, want host=%q sha=%q", out.NeedsTarget, targetHost, probeExpectedSHA)
+	}
+	if out.LogPath != "" {
+		t.Errorf("LogPath = %q, want empty (no runner spawned)", out.LogPath)
+	}
+}
+
+// TestDispatchStage_AcceptanceNeedsTargetVerified_SpawnsAsToday (#1953): a
+// needs_target admission whose target is VERIFIED proceeds to record + spawn.
+func TestDispatchStage_AcceptanceNeedsTargetVerified_SpawnsAsToday(t *testing.T) {
+	target := healthzServer(t, http.StatusOK, `{"git_sha":"abc1234def"}`)
+
+	f := &dispatchAutoDriveFake{
+		runID: uuid.New(), stageID: uuid.New(), stageType: "acceptance",
+		admissionNeedsTarget:     true,
+		admissionTargetHosts:     []string{hostOf(target.URL)},
+		admissionExpectedHeadSHA: probeExpectedSHA,
+	}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv: func(string) string { return "" },
+	}
+
+	spawned := 0
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, _ ...string) *exec.Cmd {
+		spawned++
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: f.runID.String(), Workflow: "feature_change", Stage: "acceptance",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	if out.NeedsTarget != nil {
+		t.Errorf("a verified target must proceed, got needs_target refusal: %+v", out.NeedsTarget)
+	}
+	if spawned != 1 {
+		t.Errorf("a verified target must spawn exactly one runner, got %d", spawned)
+	}
+	f.mu.Lock()
+	acts, marks := f.actCalledN, f.hostDispatchCalledN
+	f.mu.Unlock()
+	if acts != 1 {
+		t.Errorf("a verified target must record the spawn-evidence act, got %d", acts)
+	}
+	if marks != 1 {
+		t.Errorf("a verified target must stamp the host-dispatch marker once, got %d", marks)
 	}
 }
 

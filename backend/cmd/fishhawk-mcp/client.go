@@ -698,12 +698,25 @@ func (c *apiClient) RetryStage(ctx context.Context, id uuid.UUID) (*Stage, error
 // backend settled the acceptance stage server-side (a passed verdict / skip
 // marker recorded, NO runner needed) and Kind/Basis/CriteriaTotal/Stage are
 // populated; false is the normal no-op path (proceed to spawn as today).
+//
+// NeedsTarget / TargetHosts / ExpectedHeadSHA (E48.6 / #1953) ride the
+// short_circuited:false path: NeedsTarget:true means the approved plan requires
+// LIVE validation and the spec declares egress target hosts, so the dispatch verb
+// must probe the target host FROM THE DISPATCH HOST and refuse a doomed runner.
+// TargetHosts is the verbatim spec-declared host list; ExpectedHeadSHA is the
+// resolved merge-candidate head SHA (may be empty when ledger resolution failed —
+// the verb then proceeds with a warning). An OLDER backend omits all three, so
+// they decode to their zero values (NeedsTarget=false) and the verb spawns as
+// today — the mixed-version degrade.
 type AcceptanceAdmissionResult struct {
-	ShortCircuited bool   `json:"short_circuited"`
-	Kind           string `json:"kind"`
-	Basis          string `json:"basis"`
-	CriteriaTotal  int    `json:"criteria_total"`
-	Stage          *Stage `json:"stage"`
+	ShortCircuited  bool     `json:"short_circuited"`
+	Kind            string   `json:"kind"`
+	Basis           string   `json:"basis"`
+	CriteriaTotal   int      `json:"criteria_total"`
+	Stage           *Stage   `json:"stage"`
+	NeedsTarget     bool     `json:"needs_target"`
+	TargetHosts     []string `json:"target_hosts"`
+	ExpectedHeadSHA string   `json:"expected_head_sha"`
 }
 
 // AcceptanceDispatchAdmission POSTs the pre-spawn acceptance-admission check via

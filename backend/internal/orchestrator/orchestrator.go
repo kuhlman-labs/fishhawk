@@ -317,7 +317,7 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	// predicates are disjoint by construction (E38.3 requires out_of_scope>0; #1728
 	// requires out_of_scope==0), so at most one fires.
 	if next.Type == run.StageTypeAcceptance && o.Artifacts != nil {
-		sc, err := o.tryShortCircuitAcceptanceCore(ctx, r, stages, next)
+		sc, _, err := o.tryShortCircuitAcceptanceCore(ctx, r, stages, next)
 		if err != nil {
 			return OutcomeNoOp, err
 		}
@@ -1209,24 +1209,35 @@ func (o *Orchestrator) walkAcceptanceToSucceededFrom(ctx context.Context, stageI
 // (the skip marker for out-of-scope, a passed verdict for the other two). It
 // does NOT re-enter Advance — the caller owns that so the retry-path inline arm
 // stays byte-identical. Returns a non-nil *AcceptanceShortCircuit on a hit, and
-// (nil, nil) for a nil approved plan, a false predicate, a non-acceptance stage,
-// or an un-wired Artifacts repo (no state change). Only o.Artifacts != nil and a
-// non-nil approved plan reach the predicates, mirroring the pre-refactor guard.
-func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run.Run, stages []*run.Stage, target *run.Stage) (*AcceptanceShortCircuit, error) {
+// (nil, _, nil) for a nil approved plan, a false predicate, a non-acceptance
+// stage, or an un-wired Artifacts repo (no state change). Only o.Artifacts != nil
+// and a non-nil approved plan reach the predicates, mirroring the pre-refactor
+// guard.
+//
+// liveValidationRequired (E48.6 / #1953) is true ONLY when the target is an
+// admissible acceptance stage, the approved plan loaded, and NONE of the three
+// short-circuit predicates matched — i.e. at least one acceptance criterion
+// needs a LIVE target the runner would validate against. It is false on every
+// (nil, false, nil) no-op path (nil plan, non-acceptance stage, un-wired
+// Artifacts) and false on every short-circuit hit (the stage settled server-
+// side; no live target is needed). The admission endpoint reads it to report
+// needs_target so a dispatch verb probes the target BEFORE spawning a runner
+// doomed to fail category-C acceptance_target_unreachable.
+func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run.Run, stages []*run.Stage, target *run.Stage) (*AcceptanceShortCircuit, bool, error) {
 	if target.Type != run.StageTypeAcceptance || o.Artifacts == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	approvedPlan, _, err := o.loadApprovedPlan(ctx, stages)
 	if err != nil {
-		return nil, fmt.Errorf("orchestrator: load approved plan for acceptance skip: %w", err)
+		return nil, false, fmt.Errorf("orchestrator: load approved plan for acceptance skip: %w", err)
 	}
 	if approvedPlan == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	switch {
 	case plan.AcceptanceSkippableOutOfScope(approvedPlan.Verification):
 		if err := o.walkAcceptanceToSucceededFrom(ctx, target.ID, target.State, "out-of-scope skip"); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		o.emitAcceptanceSkippedOutOfScope(ctx, r.ID, target.ID, target.Sequence, len(approvedPlan.Verification.OutOfScope))
 		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator auto-terminated acceptance stage (out_of_scope, zero acceptance_criteria)",
@@ -1235,10 +1246,10 @@ func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run
 			slog.Int("sequence", target.Sequence),
 			slog.Int("out_of_scope_count", len(approvedPlan.Verification.OutOfScope)),
 		)
-		return &AcceptanceShortCircuit{Kind: AcceptanceShortCircuitOutOfScope, CriteriaTotal: 0}, nil
+		return &AcceptanceShortCircuit{Kind: AcceptanceShortCircuitOutOfScope, CriteriaTotal: 0}, false, nil
 	case plan.AcceptanceSkippableEmptyCriteria(approvedPlan.Verification):
 		if err := o.walkAcceptanceToSucceededFrom(ctx, target.ID, target.State, "empty-criteria short-circuit"); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		o.emitAcceptanceOutcomeShortCircuit(ctx, r.ID, target.ID, target.Sequence, plan.AcceptanceBasisEmptyCriteria, 0)
 		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator short-circuited acceptance stage (zero acceptance_criteria, zero out_of_scope) to a passed verdict",
@@ -1247,10 +1258,10 @@ func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run
 			slog.Int("sequence", target.Sequence),
 			slog.String("basis", plan.AcceptanceBasisEmptyCriteria),
 		)
-		return &AcceptanceShortCircuit{Kind: AcceptanceShortCircuitEmptyCriteria, Basis: plan.AcceptanceBasisEmptyCriteria, CriteriaTotal: 0}, nil
+		return &AcceptanceShortCircuit{Kind: AcceptanceShortCircuitEmptyCriteria, Basis: plan.AcceptanceBasisEmptyCriteria, CriteriaTotal: 0}, false, nil
 	case plan.AcceptanceSkippableAllSkipWithBasis(approvedPlan.Verification):
 		if err := o.walkAcceptanceToSucceededFrom(ctx, target.ID, target.State, "all-skip-with-basis short-circuit"); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		total := len(approvedPlan.Verification.AcceptanceCriteria)
 		o.emitAcceptanceOutcomeShortCircuit(ctx, r.ID, target.ID, target.Sequence, plan.AcceptanceBasisAllSkipWithBasis, total)
@@ -1261,9 +1272,12 @@ func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run
 			slog.Int("criteria_total", total),
 			slog.String("basis", plan.AcceptanceBasisAllSkipWithBasis),
 		)
-		return &AcceptanceShortCircuit{Kind: AcceptanceShortCircuitAllSkipWithBasis, Basis: plan.AcceptanceBasisAllSkipWithBasis, CriteriaTotal: total}, nil
+		return &AcceptanceShortCircuit{Kind: AcceptanceShortCircuitAllSkipWithBasis, Basis: plan.AcceptanceBasisAllSkipWithBasis, CriteriaTotal: total}, false, nil
 	}
-	return nil, nil
+	// The plan loaded and no short-circuit predicate matched: at least one
+	// acceptance criterion needs a live target. No state change here — the
+	// admission endpoint reports needs_target and the dispatch verb probes.
+	return nil, true, nil
 }
 
 // TryShortCircuitAcceptance is the exported entry point (#1928) the acceptance-
@@ -1277,22 +1291,30 @@ func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run
 // The target must be an acceptance stage in a dispatch-admissible state (pending,
 // the local 'awaiting_host_dispatch' park, or a legacy 'dispatched' park); every
 // other state — already-settled,
-// non-acceptance, an unknown stage id — returns (nil, nil) as a no-op, which the
-// endpoint renders short_circuited:false and the caller's own spawn path handles
+// non-acceptance, an unknown stage id — returns (nil, false, nil) as a no-op, which
+// the endpoint renders short_circuited:false and the caller's own spawn path handles
 // as today. On a hit it walks the stage to succeeded, emits the matching audit,
 // then re-enters Advance so the run rolls forward (completeRun or later stages)
 // exactly as the inline arm does, and returns the fired short-circuit.
-func (o *Orchestrator) TryShortCircuitAcceptance(ctx context.Context, runID, stageID uuid.UUID) (*AcceptanceShortCircuit, error) {
+//
+// The second return value, liveValidationRequired (E48.6 / #1953), is true ONLY on
+// the admissible-acceptance, plan-loaded, no-predicate-matched path (the short
+// circuit did NOT fire and the stage still needs a live target). It is false on
+// every no-op path — a non-admissible state, an unknown/non-acceptance stage, a nil
+// plan, an un-wired orchestrator — and false alongside a fired short-circuit. The
+// admission endpoint reads it to add needs_target + the target hosts / expected head
+// SHA to its short_circuited:false response.
+func (o *Orchestrator) TryShortCircuitAcceptance(ctx context.Context, runID, stageID uuid.UUID) (*AcceptanceShortCircuit, bool, error) {
 	if o.Runs == nil {
-		return nil, errors.New("orchestrator: Runs is nil")
+		return nil, false, errors.New("orchestrator: Runs is nil")
 	}
 	r, err := o.Runs.GetRun(ctx, runID)
 	if err != nil {
-		return nil, fmt.Errorf("orchestrator: get run for acceptance admission: %w", err)
+		return nil, false, fmt.Errorf("orchestrator: get run for acceptance admission: %w", err)
 	}
 	stages, err := o.Runs.ListStagesForRun(ctx, runID)
 	if err != nil {
-		return nil, fmt.Errorf("orchestrator: list stages for acceptance admission: %w", err)
+		return nil, false, fmt.Errorf("orchestrator: list stages for acceptance admission: %w", err)
 	}
 	var target *run.Stage
 	for _, s := range stages {
@@ -1302,7 +1324,7 @@ func (o *Orchestrator) TryShortCircuitAcceptance(ctx context.Context, runID, sta
 		}
 	}
 	if target == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	// Dispatch-admissible only: pending, the local 'awaiting_host_dispatch' park
 	// (#1912) an operator host dispatch finds, or a legacy 'dispatched' park a
@@ -1312,22 +1334,22 @@ func (o *Orchestrator) TryShortCircuitAcceptance(ctx context.Context, runID, sta
 	if target.State != run.StageStatePending &&
 		target.State != run.StageStateAwaitingHostDispatch &&
 		target.State != run.StageStateDispatched {
-		return nil, nil
+		return nil, false, nil
 	}
-	sc, err := o.tryShortCircuitAcceptanceCore(ctx, r, stages, target)
+	sc, liveValidationRequired, err := o.tryShortCircuitAcceptanceCore(ctx, r, stages, target)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if sc == nil {
-		return nil, nil
+		return nil, liveValidationRequired, nil
 	}
 	// Re-enter Advance so the now-terminal acceptance stage rolls the run
 	// forward (completeRun / later stages) in the same request — identical to
 	// the inline Advance arm's re-entry.
 	if _, err := o.Advance(ctx, runID); err != nil {
-		return nil, fmt.Errorf("orchestrator: advance after acceptance short-circuit: %w", err)
+		return nil, false, fmt.Errorf("orchestrator: advance after acceptance short-circuit: %w", err)
 	}
-	return sc, nil
+	return sc, false, nil
 }
 
 // SliceConflict carries the structured provenance of a slice-branch
