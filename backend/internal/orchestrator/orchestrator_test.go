@@ -626,6 +626,131 @@ func TestAdvance_GitHubActionsLockedRun_StillFires(t *testing.T) {
 	}
 }
 
+// seedDecomposedChild seeds a decomposition child run (DecomposedFrom set, one
+// pending implement stage) with the given inherited runner-kind fields, for the
+// per-branch runLockedLocal tests (#1980). The parent is NOT seeded here — each
+// test controls whether the parent exists / is resolved to exercise the helper's
+// fail-toward-recoverable arms.
+func seedDecomposedChild(t *testing.T, rs *stubRuns, installationID *int64, decomposedFrom uuid.UUID, kind string, resolved bool) (*run.Run, *run.Stage) {
+	t.Helper()
+	child, stages := rs.seed(t, "x/y", installationID, []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	df := decomposedFrom
+	child.DecomposedFrom = &df
+	child.RunnerKind = kind
+	child.RunnerKindResolved = resolved
+	return child, stages[0]
+}
+
+// TestAdvance_DecomposedChild_GitHubActionsParent_StillFires pins runLockedLocal
+// branch (c): an un-resolved decomposed child whose inherited kind is NOT local
+// never enters the local-park arm — it walks pending→dispatched and fires its
+// workflow_dispatch byte-identically (the unchanged E24.5 path). runLockedLocal
+// short-circuits on the kind, so the parent is never even read.
+func TestAdvance_DecomposedChild_GitHubActionsParent_StillFires(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	child, stage := seedDecomposedChild(t, rs, int64Ptr(42), uuid.New(), run.RunnerKindGitHubActions, false)
+
+	if _, err := o.Advance(context.Background(), child.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if stage.State != run.StageStateDispatched {
+		t.Errorf("child stage state = %q, want dispatched (github_actions child unchanged)", stage.State)
+	}
+	if len(gh.calls) != 1 {
+		t.Errorf("workflow_dispatch calls = %d, want 1 for a github_actions child", len(gh.calls))
+	}
+}
+
+// TestAdvance_DecomposedChild_ParentReadError_ParksRecoverable pins
+// runLockedLocal branch (d) fail-toward-recoverable: an un-resolved local-kind
+// child whose parent GetRun fails (the parent row is absent) parks at
+// awaiting_host_dispatch and fires ZERO workflow_dispatch — a wrong park costs
+// one host-dispatch verb, a wrong fire is an unrecoverable side effect.
+func TestAdvance_DecomposedChild_ParentReadError_ParksRecoverable(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	// The parent id points at a run that was never seeded → GetRun returns
+	// ErrNotFound. (rs.getRunErr is deliberately NOT used: it would also fail
+	// the child's own GetRun in Advance.)
+	child, stage := seedDecomposedChild(t, rs, int64Ptr(42), uuid.New(), run.RunnerKindLocal, false)
+
+	if _, err := o.Advance(context.Background(), child.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if stage.State != run.StageStateAwaitingHostDispatch {
+		t.Errorf("child stage state = %q, want awaiting_host_dispatch (fail-toward-recoverable)", stage.State)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("workflow_dispatch fired for a parent-read-error local child: %d calls", len(gh.calls))
+	}
+}
+
+// TestAdvance_DecomposedChild_ParentUnresolved_ParksRecoverable pins
+// runLockedLocal branch (d) parent-unresolved: an un-resolved local-kind child
+// whose parent is itself un-resolved parks toward the recoverable state (the
+// inherited local hint is the best signal available).
+func TestAdvance_DecomposedChild_ParentUnresolved_ParksRecoverable(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	parent, _ := rs.seed(t, "x/y", int64Ptr(42), nil)
+	parent.RunnerKind = run.RunnerKindLocal
+	parent.RunnerKindResolved = false
+	child, stage := seedDecomposedChild(t, rs, int64Ptr(42), parent.ID, run.RunnerKindLocal, false)
+
+	if _, err := o.Advance(context.Background(), child.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if stage.State != run.StageStateAwaitingHostDispatch {
+		t.Errorf("child stage state = %q, want awaiting_host_dispatch (parent unresolved → park)", stage.State)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("workflow_dispatch fired for an unresolved-parent local child: %d calls", len(gh.calls))
+	}
+}
+
+// TestAdvance_DecomposedChild_ParentResolvedLocal_Parks pins runLockedLocal
+// branch (d) authoritative-park: an un-resolved local-kind child whose parent is
+// RESOLVED local parks at awaiting_host_dispatch — the #1980 dogfood shape.
+func TestAdvance_DecomposedChild_ParentResolvedLocal_Parks(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	parent, _ := rs.seed(t, "x/y", int64Ptr(42), nil)
+	parent.RunnerKind = run.RunnerKindLocal
+	parent.RunnerKindResolved = true
+	child, stage := seedDecomposedChild(t, rs, int64Ptr(42), parent.ID, run.RunnerKindLocal, false)
+
+	if _, err := o.Advance(context.Background(), child.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if stage.State != run.StageStateAwaitingHostDispatch {
+		t.Errorf("child stage state = %q, want awaiting_host_dispatch (parent resolved local → park)", stage.State)
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("workflow_dispatch fired for a resolved-local-parent child: %d calls", len(gh.calls))
+	}
+}
+
+// TestAdvance_DecomposedChild_ParentResolvedNonLocal_Fires pins runLockedLocal
+// branch (d) superseded-hint: an un-resolved child carrying a STALE local kind
+// whose parent is RESOLVED non-local (github_actions) falls through to dispatched
+// + workflow_dispatch — the parent lock is authoritative over the inherited hint.
+func TestAdvance_DecomposedChild_ParentResolvedNonLocal_Fires(t *testing.T) {
+	o, rs, gh := newOrchestrator(t)
+	parent, _ := rs.seed(t, "x/y", int64Ptr(42), nil)
+	parent.RunnerKind = run.RunnerKindGitHubActions
+	parent.RunnerKindResolved = true
+	child, stage := seedDecomposedChild(t, rs, int64Ptr(42), parent.ID, run.RunnerKindLocal, false)
+
+	if _, err := o.Advance(context.Background(), child.ID); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if stage.State != run.StageStateDispatched {
+		t.Errorf("child stage state = %q, want dispatched (parent lock supersedes stale local hint)", stage.State)
+	}
+	if len(gh.calls) != 1 {
+		t.Errorf("workflow_dispatch calls = %d, want 1 (parent locked github_actions)", len(gh.calls))
+	}
+}
+
 func TestAdvance_HumanStage_TransitionsToAwaitingApproval(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
 	_, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
