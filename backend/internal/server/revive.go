@@ -31,6 +31,11 @@ const RunRevivedCategory = "run_revived"
 type reviveResponse struct {
 	Run            runResponse           `json:"run"`
 	RestoredStages []reviveRestoredStage `json:"restored_stages"`
+	// Resumed is true when this call completed an INTERRUPTED prior revive
+	// (every failed stage was already re-parked; only the run reopen had not
+	// landed) rather than performing fresh re-parks. On a resumed revive
+	// restored_stages is empty. Additive field (#1942).
+	Resumed bool `json:"resumed"`
 }
 
 // reviveRestoredStage is one re-parked stage on the wire (and in the
@@ -138,7 +143,7 @@ func (s *Server) handleReviveRun(w http.ResponseWriter, r *http.Request) {
 	// DELIBERATELY no orchestrator.Advance and no drive retry_reopen stamp
 	// after this — revive re-parks, never dispatches (the semantic
 	// difference from /retry and /redrive).
-	s.writeReviveAudit(r, runID, restored)
+	s.writeReviveAudit(r, runID, restored, dec.Resumed)
 
 	// Sticky status comment (E20.4 / #330): the run flipped failed → running
 	// and stages re-parked, so the status comment should re-render.
@@ -147,6 +152,7 @@ func (s *Server) handleReviveRun(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, r, http.StatusOK, reviveResponse{
 		Run:            toRunResponse(dec.Run),
 		RestoredStages: restored,
+		Resumed:        dec.Resumed,
 	})
 }
 
@@ -154,7 +160,7 @@ func (s *Server) handleReviveRun(w http.ResponseWriter, r *http.Request) {
 // re-parked stage's prior failure detail and restored state, plus the
 // actor that triggered the revive. Best-effort — the transitions are
 // already committed, so a failure here logs but doesn't unwind.
-func (s *Server) writeReviveAudit(r *http.Request, runID uuid.UUID, restored []reviveRestoredStage) {
+func (s *Server) writeReviveAudit(r *http.Request, runID uuid.UUID, restored []reviveRestoredStage, resumed bool) {
 	id := IdentityFrom(r.Context())
 	subject := id.Subject
 	if subject == "" {
@@ -166,6 +172,7 @@ func (s *Server) writeReviveAudit(r *http.Request, runID uuid.UUID, restored []r
 		"run_id":          runID.String(),
 		"restored_stages": restored,
 		"stage_count":     len(restored),
+		"resumed":         resumed,
 		"via":             scopeUsed(id),
 	})
 

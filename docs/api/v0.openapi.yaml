@@ -4368,17 +4368,34 @@ paths:
         turn via the existing verbs. Because no `Advance` fires during
         the revive, a stage cannot be re-dispatched out of gate order.
 
-        **No-partial-mutation batch.** A single non-retryable failed
-        stage (category-B, D-rejected, or a stage with no recorded
+        **No-partial-mutation pre-validation.** A single non-retryable
+        failed stage (category-B, D-rejected, or a stage with no recorded
         category) refuses the WHOLE revive (`422 revive_not_applicable`)
         naming the blocking stage — nothing is re-parked and the run
-        stays `failed`. A run in any non-`failed` state and a run with
-        zero failed stages refuse the same way.
+        stays `failed`. A run in any non-`failed` state refuses the same
+        way. A run with zero failed stages refuses ONLY when no stage
+        sits in a re-parked pre-dispatch state (`pending` /
+        `awaiting_approval` / `awaiting_children`); the interrupted-revive
+        shape (see below) instead SUCCEEDS.
+
+        **Resumable partial state (#1942).** The re-park batch and the run
+        reopen are NOT one transaction — each re-park and the closing
+        reopen run their own row-locked transaction. A *post-validation*
+        failure (an infra error or a concurrent transition) can therefore
+        leave the run partially re-parked and return `500 internal_error`
+        whose message carries a resume hint. This is deliberate; every
+        intermediate state is a valid state-machine state and a second
+        revive is the compensation: retrying the verb re-parks the
+        remaining failed stages, and when every failed stage was already
+        re-parked it completes the interrupted reopen — succeeding with an
+        EMPTY `restored_stages` and `resumed: true`, consuming no stage's
+        retry budget a second time.
 
         Each re-park bumps the stage's `self_retry_count`, so revive
         consumes per-stage retry budget exactly like
-        `POST /v0/stages/{stage_id}/retry`. Writes one `run_revived`
-        audit entry on success whose payload lists every restored stage.
+        `POST /v0/stages/{stage_id}/retry` (a resumed revive bumps none).
+        Writes one `run_revived` audit entry on success whose payload
+        lists every restored stage and the `resumed` flag.
 
         **Authorization.** Revive is an operator action. It requires the
         operator retry scope (`write:stages` or `write:retries`) AND
@@ -4393,17 +4410,28 @@ paths:
         '200':
           description: |
             Run revived; body carries the refreshed Run row (state
-            `running`) and the per-stage re-park summary.
+            `running`), the per-stage re-park summary, and the `resumed`
+            flag. On a resumed revive (an interrupted prior revive
+            completed) `restored_stages` is empty and `resumed` is true.
           content:
             application/json:
               schema:
                 type: object
-                required: [run, restored_stages]
+                required: [run, restored_stages, resumed]
                 properties:
                   run: { $ref: '#/components/schemas/Run' }
+                  resumed:
+                    type: boolean
+                    description: |
+                      True when this call completed an INTERRUPTED prior
+                      revive (every failed stage was already re-parked;
+                      only the run reopen had not landed) rather than
+                      performing fresh re-parks. On a resumed revive
+                      `restored_stages` is empty and no stage's retry
+                      budget is consumed again (#1942).
                   restored_stages:
                     type: array
-                    description: One entry per re-parked failed stage, ordered by stage sequence.
+                    description: One entry per re-parked failed stage, ordered by stage sequence. Empty on a resumed revive.
                     items:
                       type: object
                       required: [stage_id, type, prior_category, prior_reason, restored_state]
@@ -4437,11 +4465,24 @@ paths:
         '422':
           description: |
             Revive not applicable: the run is not in the `failed` state,
-            has no failed stages to re-park, or at least one failed stage
-            is in a non-retryable failure category (category-B,
-            D-rejected, or no recorded category). Body's `error` is
-            `revive_not_applicable` and `message` names the blocking
-            stage. No stage is re-parked (no partial mutation).
+            has no failed stages to re-park AND no stage in a re-parked
+            pre-dispatch state (the interrupted-revive shape succeeds with
+            `200` instead), or at least one failed stage is in a
+            non-retryable failure category (category-B, D-rejected, or no
+            recorded category). Body's `error` is `revive_not_applicable`
+            and `message` names the blocking stage. No stage is re-parked
+            (no partial mutation).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error` — a post-validation re-park or run-reopen
+            failure left the run partially re-parked (the re-park batch is
+            not one transaction, #1942). The error message carries a
+            resume hint: retry the verb — a second revive resumes from the
+            partial state (re-parking the remaining failed stages, or
+            completing the interrupted reopen).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

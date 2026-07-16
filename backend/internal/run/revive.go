@@ -47,6 +47,14 @@ type ReviveDecision struct {
 	// Stages lists each re-parked stage's restoration, ordered by the
 	// stage sequence.
 	Stages []ReviveStageRestore
+	// Resumed is true when this call did NOT perform fresh re-parks but
+	// instead completed a PRIOR revive that was interrupted after every
+	// failed stage was already re-parked and only the closing RetryRun did
+	// not land (the run is failed with zero failed stages but a stage sits
+	// in a pre-dispatch park state). On a resumed revive, Stages is empty:
+	// the re-parks were done by the interrupted call, and no stage's retry
+	// budget is consumed a second time. See ReviveRun's doc comment (#1942).
+	Resumed bool
 }
 
 // ReviveRun re-admits a terminal-FAILED run for another operator turn by
@@ -60,8 +68,16 @@ type ReviveDecision struct {
 //     refuse with ErrReviveNotApplicable — runRetryTransitions (transition.go)
 //     admits only failed → running, so a revive on any other state has no
 //     defined meaning and must be refused before any mutation.
-//  2. Collect every failed stage. Zero failed stages refuses (nothing to
-//     re-park).
+//  2. Collect every failed stage. Zero failed stages normally refuses
+//     (nothing to re-park).
+//     2a. EXCEPT the interrupted-revive resume branch: when the run is
+//     failed, has zero failed stages, AND at least one stage sits in a
+//     pre-dispatch park state (pending / awaiting_approval /
+//     awaiting_children — exactly the RetryStage restore targets), a prior
+//     revive already re-parked every failed stage and only its closing
+//     RetryRun did not land. Complete that reopen via RetryRun and return
+//     Resumed=true with an empty restore list. Any OTHER zero-failed-stage
+//     shape (e.g. all stages succeeded) keeps the refusal.
 //  3. PRE-VALIDATE that EVERY failed stage is retryable via RetryableFailure
 //     BEFORE any mutation. A category-B stage, a D-rejected stage, or a
 //     failed stage with no recorded category refuses the WHOLE revive with
@@ -83,6 +99,39 @@ type ReviveDecision struct {
 // mid-revive, the #1700 wrong-order re-dispatch corruption is structurally
 // impossible: a re-parked stage simply sits in its pre-dispatch state until
 // the operator acts.
+//
+// # Deliberate non-transactionality (#1942)
+//
+// The per-stage re-park batch (step 4) plus the run reopen (step 5) are
+// NOT one transaction. Each Repository transition method (RetryStage,
+// RetryRun) opens its OWN row-locked transaction (postgres.go, SELECT …
+// FOR UPDATE), so a mid-batch failure — an infra error, or a concurrent
+// transition that surfaces as a guarded-transition error because two calls
+// observing the same prior state cannot both succeed (Repository contract,
+// repository.go) — can leave the run failed with SOME stages already
+// re-parked. Making the batch atomic would require a tx-scoped Repository
+// refactor disproportionate to this narrow window, so it is deliberately
+// NOT done. Instead every intermediate state is an individually valid
+// state-machine state, and a second ReviveRun is the idempotent
+// compensation:
+//
+//   - Mid-batch RetryStage failure: earlier stages are re-parked, later
+//     stages are still failed, the run is still failed. A second ReviveRun
+//     collects the REMAINING failed stages and re-parks them — the
+//     already-re-parked stages are no longer failed, so their retry budget
+//     is not consumed twice.
+//   - Tail RetryRun failure: EVERY failed stage is re-parked (zero failed
+//     stages remain) but the run is still failed. A second ReviveRun takes
+//     the interrupted-revive resume branch (step 2a): it finds zero failed
+//     stages plus at least one stage in a pre-dispatch park state and
+//     completes the reopen via RetryRun alone, returning Resumed=true with
+//     an empty restore list — no stage's budget is bumped again.
+//
+// Both failure sites wrap their error with a "run left partially
+// re-parked; a second revive resumes from here" hint so the endpoint's
+// error self-documents the recovery. Full transactionality and automatic
+// compensation are deliberately out of scope; this resumable partial-state
+// design is the recorded decision for #1942.
 func ReviveRun(ctx context.Context, repo Repository, runID uuid.UUID) (*ReviveDecision, error) {
 	runRow, err := repo.GetRun(ctx, runID)
 	if err != nil {
@@ -108,6 +157,27 @@ func ReviveRun(ctx context.Context, repo Repository, runID uuid.UUID) (*ReviveDe
 		}
 	}
 	if len(failed) == 0 {
+		// Interrupted-revive resume branch (#1942): a prior revive re-parked
+		// every failed stage but its closing RetryRun did not land, leaving
+		// the run failed with zero failed stages yet a stage in a
+		// pre-dispatch park state. Complete the reopen; consume no retry
+		// budget (the re-parks already happened). Any other zero-failed-stage
+		// shape keeps the refusal, so the resume branch cannot reopen an
+		// arbitrary inconsistent run.
+		for _, s := range stages {
+			switch s.State {
+			case StageStatePending, StageStateAwaitingApproval, StageStateAwaitingChildren:
+				updatedRun, err := repo.RetryRun(ctx, runID, StateRunning)
+				if err != nil {
+					return nil, fmt.Errorf("ReviveRun: resume interrupted revive (reopen run failed → running): %w", err)
+				}
+				return &ReviveDecision{
+					Run:     updatedRun,
+					Stages:  nil,
+					Resumed: true,
+				}, nil
+			}
+		}
 		return nil, fmt.Errorf("%w: run has no failed stages to re-park", ErrReviveNotApplicable)
 	}
 	sort.Slice(failed, func(i, j int) bool { return failed[i].Sequence < failed[j].Sequence })
@@ -138,7 +208,10 @@ func ReviveRun(ctx context.Context, repo Repository, runID uuid.UUID) (*ReviveDe
 	for _, s := range failed {
 		dec, err := RetryStage(ctx, repo, s.ID, RetryOptions{})
 		if err != nil {
-			return nil, fmt.Errorf("ReviveRun: re-park %s stage %s: %w", s.Type, s.ID, err)
+			// Partial re-park: earlier stages in this batch are already
+			// re-parked and the run is still failed. A second ReviveRun
+			// resumes from the remaining failed stages (#1942).
+			return nil, fmt.Errorf("ReviveRun: re-park %s stage %s: %w (run left partially re-parked; a second revive resumes from the remaining failed stages)", s.Type, s.ID, err)
 		}
 		restores = append(restores, ReviveStageRestore{
 			StageID:       dec.Stage.ID,
@@ -151,7 +224,11 @@ func ReviveRun(ctx context.Context, repo Repository, runID uuid.UUID) (*ReviveDe
 
 	updatedRun, err := repo.RetryRun(ctx, runID, StateRunning)
 	if err != nil {
-		return nil, fmt.Errorf("ReviveRun: reopen run failed → running: %w", err)
+		// Every failed stage is already re-parked; only the run reopen did
+		// not land, leaving the run failed with zero failed stages. A second
+		// ReviveRun takes the interrupted-revive resume branch and completes
+		// the reopen (#1942).
+		return nil, fmt.Errorf("ReviveRun: reopen run failed → running: %w (run left partially re-parked; every failed stage is re-parked, so a second revive completes the reopen)", err)
 	}
 
 	return &ReviveDecision{

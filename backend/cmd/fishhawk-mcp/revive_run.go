@@ -72,14 +72,29 @@ Input:
   - run_id : the terminal-FAILED run to revive.
 
 Returns the re-opened run (now running), the per-stage re-park summary
-(restored_stages), and a next_step hint. Tool errors:
+(restored_stages), and a next_step hint. On a resumed revive (see below)
+restored_stages is empty and the response carries resumed:true.
+
+Resumable partial state (#1942): the re-park batch and run reopen are NOT one
+transaction, so a mid-batch failure (an infra error or a concurrent transition)
+can leave the run partially re-parked and surface a 500. Simply RETRY the verb
+— a second revive resumes: it re-parks the remaining failed stages, and if every
+failed stage was already re-parked it completes the interrupted reopen (returning
+resumed:true with an empty restored_stages, consuming no retry budget a second
+time).
+
+Tool errors:
   - invalid UUID (caught before the HTTP hop)
   - agent_token_forbidden (a run-bound agent/mcp token attempted revive, 403)
   - insufficient_scope (token lacks write:stages or write:retries, 403)
   - run_not_found (404)
-  - revive_not_applicable (the run is not failed, has no failed stage, or a
-    failed stage is non-retryable — category-B, D-rejected, or no recorded
-    category; the message names the blocking stage. No partial mutation, 422)
+  - revive_not_applicable (the run is not failed, or has no failed stage AND no
+    stage in a re-parked pre-dispatch state — the interrupted-revive shape, which
+    instead SUCCEEDS with an empty restored_stages — or a failed stage is
+    non-retryable — category-B, D-rejected, or no recorded category; the message
+    names the blocking stage. No partial mutation from the pre-validation, 422)
+  - internal_error (a post-validation re-park/reopen failure left the run
+    partially re-parked; retry the verb to resume, 500)
   - revive_unconfigured (run/audit repositories not wired, 503)
 `),
 	}, resolver.reviveRun)

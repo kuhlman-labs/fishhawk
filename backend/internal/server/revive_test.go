@@ -97,6 +97,10 @@ func TestReviveRun_EndToEnd(t *testing.T) {
 	if body.Run.State != string(run.StateRunning) {
 		t.Errorf("run state = %q, want running", body.Run.State)
 	}
+	// An ordinary revive (fresh re-parks) reports resumed=false (#1942).
+	if body.Resumed {
+		t.Errorf("resumed = true, want false (this revive performed fresh re-parks)")
+	}
 	// Response carries both restored stages with their restore shapes.
 	if len(body.RestoredStages) != 2 {
 		t.Fatalf("restored %d stages, want 2:\n%s", len(body.RestoredStages), w.Body.String())
@@ -181,6 +185,65 @@ func TestReviveRun_DecomposedParentRestoresToAwaitingChildren(t *testing.T) {
 	gotImpl, _ := f.repo.GetStage(context.Background(), implement.ID)
 	if gotImpl.State != run.StageStateAwaitingChildren {
 		t.Errorf("implement stage = %q, want awaiting_children (decomposed-parent restore, #1891)", gotImpl.State)
+	}
+}
+
+// TestReviveRun_ResumedShapeEndToEnd drives the interrupted-revive resume
+// branch across the HTTP boundary (#1942): a failed run with ZERO failed
+// stages but one stage parked pending (the shape a tail RetryRun failure
+// leaves) is completed by revive — 200 with restored_stages empty and
+// resumed true, run flipped to running, and the run_revived audit payload
+// carrying resumed=true with stage_count 0.
+func TestReviveRun_ResumedShapeEndToEnd(t *testing.T) {
+	f := newReviveFixture(t)
+	// One stage already re-parked pending (no failed stages) — the leftover
+	// of an interrupted prior revive.
+	parked := f.repo.seedStage(f.run.ID, 0, run.StageStatePending)
+	parked.Type = run.StageTypeImplement
+
+	w := postRevive(t, f.s, f.run.ID, withAuth)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	var body reviveResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !body.Resumed {
+		t.Errorf("resumed = false, want true (interrupted-revive resume)")
+	}
+	if len(body.RestoredStages) != 0 {
+		t.Errorf("restored %d stages, want 0 (resume re-parks nothing)", len(body.RestoredStages))
+	}
+	if body.Run.State != string(run.StateRunning) {
+		t.Errorf("run state = %q, want running", body.Run.State)
+	}
+	// The re-parked stage is untouched: still pending, no dispatch.
+	gotStage, _ := f.repo.GetStage(context.Background(), parked.ID)
+	if gotStage.State != run.StageStatePending {
+		t.Errorf("parked stage = %q, want pending (resume must not re-park or dispatch)", gotStage.State)
+	}
+
+	// The run_revived audit records resumed=true with stage_count 0.
+	var revived *audit.ChainAppendParams
+	for i := range f.au.appended {
+		if f.au.appended[i].Category == RunRevivedCategory {
+			revived = &f.au.appended[i]
+		}
+	}
+	if revived == nil {
+		t.Fatalf("no run_revived audit entry")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(revived.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	if resumed, _ := payload["resumed"].(bool); !resumed {
+		t.Errorf("audit resumed = %v, want true", payload["resumed"])
+	}
+	if sc, _ := payload["stage_count"].(float64); int(sc) != 0 {
+		t.Errorf("audit stage_count = %v, want 0", payload["stage_count"])
 	}
 }
 
