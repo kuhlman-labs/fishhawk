@@ -22,13 +22,16 @@ func NewScopedProvider(tokens TokenProvider) *ScopedProvider {
 }
 
 // Token resolves scope to a GitHub installation id and delegates to the
-// wrapped TokenProvider. It fails closed on a zero scope or an
-// unparseable ref, naming the offending ref, and never invokes the
-// delegate in that case.
+// wrapped TokenProvider. It fails closed on a zero scope, an
+// unparseable ref, or a nil wrapped TokenProvider, naming the offending
+// ref where applicable, and never invokes the delegate in that case.
 func (p *ScopedProvider) Token(ctx context.Context, scope forge.CredentialScope) (string, error) {
 	id, err := scope.GitHubInstallationID()
 	if err != nil {
 		return "", fmt.Errorf("githubapp: scoped provider: %w", err)
+	}
+	if p.Tokens == nil {
+		return "", fmt.Errorf("githubapp: scoped provider: nil TokenProvider")
 	}
 	return p.Tokens.Token(ctx, id)
 }

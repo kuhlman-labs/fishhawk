@@ -72,6 +72,15 @@ func TestScopedProviderNonNumericRefFailsClosedNamingRef(t *testing.T) {
 	}
 }
 
+func TestScopedProviderNilTokensFailsClosedWithoutPanic(t *testing.T) {
+	p := NewScopedProvider(nil)
+
+	_, err := p.Token(context.Background(), forge.FromGitHubInstallationID(4242))
+	if err == nil {
+		t.Fatal("Token() with nil wrapped TokenProvider: got nil error, want non-nil")
+	}
+}
+
 func TestScopedProviderPropagatesDelegateError(t *testing.T) {
 	wantErr := errors.New("boom")
 	stub := &stubTokenProvider{err: wantErr}
