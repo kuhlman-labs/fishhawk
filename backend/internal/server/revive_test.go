@@ -101,6 +101,12 @@ func TestReviveRun_EndToEnd(t *testing.T) {
 	if body.Resumed {
 		t.Errorf("resumed = true, want false (this revive performed fresh re-parks)")
 	}
+	// Success-mode contract (#1943): the audit append succeeded, so the
+	// omitempty audit_warning key is absent from the raw 200 body — a clean
+	// revive is byte-identical to before this change.
+	if strings.Contains(w.Body.String(), "audit_warning") {
+		t.Errorf("raw 200 body contains audit_warning on a clean revive; want the key omitted:\n%s", w.Body.String())
+	}
 	// Response carries both restored stages with their restore shapes.
 	if len(body.RestoredStages) != 2 {
 		t.Fatalf("restored %d stages, want 2:\n%s", len(body.RestoredStages), w.Body.String())
@@ -383,36 +389,63 @@ func TestReviveRun_NonRetryableStageReturns422NoPartialMutation(t *testing.T) {
 	}
 }
 
-// TestReviveRun_AuditAppendFailure_BestEffort200 pins writeReviveAudit's
-// deliberate best-effort contract: the re-park transitions are committed by
-// run.ReviveRun BEFORE the audit entry is chained, so a failure appending the
-// run_revived provenance record logs but does NOT unwind the reopen — the
-// handler still returns 200 with the run flipped failed → running. Returning an
-// error here would mislead the operator into thinking the revive did not happen
-// when the run IS revived; the correct behavior is a logged, non-fatal
-// audit-append failure. This test exists so that swallow is a pinned,
-// intentional contract rather than an unobserved silent failure (the security
-// review's "revive state changes returned unaudited" concern).
-func TestReviveRun_AuditAppendFailure_BestEffort200(t *testing.T) {
+// TestReviveRun_AuditAppendFailure_SurfacesWarningOn200 pins writeReviveAudit's
+// contract (#1943): the re-park transitions are committed by run.ReviveRun
+// BEFORE the audit entry is chained, so a failure appending the run_revived
+// provenance record does NOT unwind the reopen — the handler still returns 200
+// with the run flipped failed → running. Fail-closed was rejected because a
+// committed revive cannot be re-run to re-attempt the append (a second revive on
+// a now-running run refuses 422 revive_not_applicable), so a 500 would falsely
+// tell the operator the revive did not happen. Instead the append failure
+// surfaces as a non-empty audit_warning naming the run_revived category on the
+// 200 — neither lying about the committed state change nor staying silent about
+// the missing provenance record (the security review's "revive state changes
+// returned unaudited" concern). This is the done-means test: it fails on the old
+// silent-swallow code (which returned a warning-free 200).
+func TestReviveRun_AuditAppendFailure_SurfacesWarningOn200(t *testing.T) {
 	f := newReviveFixture(t)
 	f.seedFailedStage(t, 0, run.StageTypeImplement, run.FailureA, "agent crashed")
 	f.au.appendErr = errors.New("audit store down")
 
 	w := postRevive(t, f.s, f.run.ID, withAuth)
 	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (audit-append failure is best-effort, does not unwind the committed reopen):\n%s", w.Code, w.Body.String())
+		t.Fatalf("status = %d, want 200 (audit-append failure does not unwind the committed reopen):\n%s", w.Code, w.Body.String())
 	}
 	// The reopen is committed regardless of the audit failure.
 	gotRun, _ := f.repo.GetRun(context.Background(), f.run.ID)
 	if gotRun.State != run.StateRunning {
 		t.Errorf("run = %q, want running (transitions commit before the audit append)", gotRun.State)
 	}
-	// No run_revived entry landed — the append failed — but the handler still
-	// succeeded rather than 500ing on a committed state change.
+	// No run_revived entry landed — the append failed.
 	for _, a := range f.au.appended {
 		if a.Category == RunRevivedCategory {
 			t.Errorf("run_revived audit unexpectedly recorded despite injected append failure")
 		}
+	}
+	// The append failure surfaces as a non-empty audit_warning naming the
+	// run_revived category — the caller-visible signal the provenance record is
+	// missing (this is what fails on the old silent-swallow code).
+	var body reviveResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.AuditWarning == "" {
+		t.Fatalf("audit_warning is empty, want a warning naming the run_revived append failure:\n%s", w.Body.String())
+	}
+	if !strings.Contains(body.AuditWarning, RunRevivedCategory) {
+		t.Errorf("audit_warning = %q, want it to name the %q category", body.AuditWarning, RunRevivedCategory)
+	}
+	// The run state genuinely changed (failed → running), so the sticky status
+	// comment still fires in the audit-failure mode — the warning-on-200 path
+	// does not suppress the notify (#1943).
+	found := false
+	for _, id := range f.rec.status {
+		if id == f.run.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("notifyStatusUpdate did not fire in the audit-failure mode; status=%v", f.rec.status)
 	}
 }
 

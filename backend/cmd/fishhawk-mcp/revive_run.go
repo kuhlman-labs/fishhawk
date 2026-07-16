@@ -29,6 +29,12 @@ type ReviveRunOutput struct {
 	Run            Run                   `json:"run" jsonschema:"the re-opened run row, now in state running"`
 	RestoredStages []ReviveRestoredStage `json:"restored_stages" jsonschema:"each re-parked stage's id/type/prior failure category+reason/restored pre-dispatch state"`
 	NextStep       string                `json:"next_step" jsonschema:"the no-dispatch next-step guidance: revive re-parks only, so dispatch each stage at its proper gate turn via the existing verbs"`
+	// AuditWarning is a plain string (per the #371 reflection rule) so the SDK's
+	// response-schema reflection emits type string. Set ONLY when the backend
+	// committed the revive but failed to append the run_revived chained
+	// provenance record (#1943) — the revive succeeded; investigate the audit
+	// store. Omitted on a clean revive.
+	AuditWarning string `json:"audit_warning,omitempty" jsonschema:"set only when the revive succeeded but the backend failed to append the run_revived chained provenance record — the run IS revived; investigate the audit store. Omitted on a clean revive"`
 }
 
 // registerReviveRun wires the fishhawk_revive_run tool (#1915): the single
@@ -73,7 +79,9 @@ Input:
 
 Returns the re-opened run (now running), the per-stage re-park summary
 (restored_stages), and a next_step hint. On a resumed revive (see below)
-restored_stages is empty and the response carries resumed:true.
+restored_stages is empty and the response carries resumed:true. If audit_warning
+is present the revive succeeded but the backend failed to append the run_revived
+chained provenance record — the run IS revived; investigate the audit store.
 
 Resumable partial state (#1942): the re-park batch and run reopen are NOT one
 transaction, so a mid-batch failure (an infra error or a concurrent transition)
@@ -116,5 +124,6 @@ func (r *runResolver) reviveRun(ctx context.Context, _ *mcp.CallToolRequest, in 
 		Run:            res.Run,
 		RestoredStages: res.RestoredStages,
 		NextStep:       reviveNextStepHint,
+		AuditWarning:   res.AuditWarning,
 	}, nil
 }

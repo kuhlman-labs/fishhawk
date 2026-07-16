@@ -642,7 +642,7 @@ The load-bearing distinction from `fishhawk_retry_stage`: revive **re-parks only
 
 - **Input**: `run_id` (the terminal-FAILED run).
 - **Auth**: operator-only. The backend requires `write:stages` **or** `write:retries` and rejects any run-bound agent (`mcp:run:*`) token outright (`403 agent_token_forbidden`).
-- **Returns**: the re-opened run (now `running`), the per-stage re-park summary (`restored_stages` — each carrying id / type / prior failure category+reason / restored state; **empty** on a resumed revive), and a `next_step` hint that dispatch happens at each stage's proper gate turn.
+- **Returns**: the re-opened run (now `running`), the per-stage re-park summary (`restored_stages` — each carrying id / type / prior failure category+reason / restored state; **empty** on a resumed revive), a `next_step` hint that dispatch happens at each stage's proper gate turn, and — only when the revive was committed but the `run_revived` chained audit append then failed — an `audit_warning` string ([#1943](https://github.com/kuhlman-labs/fishhawk/issues/1943)). `audit_warning` means the revive **succeeded** (the run is reopened and the stages re-parked) but the provenance record is missing; investigate the audit store. It is **omitted** on a clean revive.
 - **Errors** propagated as tool errors: invalid UUID (caught before the HTTP hop), `agent_token_forbidden` (403), `insufficient_scope` (403), `run_not_found` (404), `revive_not_applicable` (422), `internal_error` (a post-validation partial re-park; **retry the verb to resume**, 500), `revive_unconfigured` (503).
 
 The `next_actions` failed-run arms (`implement_failed_category_a` and the default `implement_failed`) surface `fishhawk_revive_run` alongside `fishhawk_retry_stage`.

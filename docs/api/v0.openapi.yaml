@@ -4395,7 +4395,12 @@ paths:
         consumes per-stage retry budget exactly like
         `POST /v0/stages/{stage_id}/retry` (a resumed revive bumps none).
         Writes one `run_revived` audit entry on success whose payload
-        lists every restored stage and the `resumed` flag.
+        lists every restored stage and the `resumed` flag. The re-park and
+        reopen transitions are committed BEFORE this audit append, so an
+        audit-append failure does NOT unwind the committed revive: the call
+        still returns `200` and surfaces the failure as an `audit_warning`
+        string on the body (fail-closed is impossible — a committed revive
+        cannot be re-run to re-attempt the append, #1943).
 
         **Authorization.** Revive is an operator action. It requires the
         operator retry scope (`write:stages` or `write:retries`) AND
@@ -4449,6 +4454,15 @@ paths:
                         restored_state:
                           type: string
                           description: The pre-dispatch state the stage was re-parked to.
+                  audit_warning:
+                    type: string
+                    description: |
+                      Set ONLY when the revive was committed (re-parks +
+                      reopen) but the `run_revived` chained audit append then
+                      failed. The revive succeeded — this is the
+                      caller-visible signal the chained provenance record is
+                      missing; investigate the audit store. Omitted on a clean
+                      revive (#1943).
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |

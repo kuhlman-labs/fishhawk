@@ -700,6 +700,33 @@ func TestReviveRun_WireShape(t *testing.T) {
 		if rs.Type != "implement" || rs.PriorCategory != "A" || rs.RestoredState != "pending" {
 			t.Errorf("restored stage = %+v, want implement/A/pending", rs)
 		}
+		// A clean revive omits audit_warning: absence decodes to the zero value
+		// (proof an old-shape body without the field still decodes, #1943).
+		if res.AuditWarning != "" {
+			t.Errorf("audit_warning = %q, want empty on a clean revive", res.AuditWarning)
+		}
+	})
+
+	t.Run("200 audit_warning decodes into the result", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"run":{"id":"` + runID.String() + `","state":"running"},` +
+				`"restored_stages":[],` +
+				`"audit_warning":"run_revived audit append failed: audit store down — the revive is committed but no chained provenance record was written; see server logs"}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+		res, err := c.ReviveRun(context.Background(), runID)
+		if err != nil {
+			t.Fatalf("ReviveRun: %v", err)
+		}
+		if res.Run.State != "running" {
+			t.Errorf("run state = %q, want running (revive committed despite the audit warning)", res.Run.State)
+		}
+		if !strings.Contains(res.AuditWarning, "run_revived") {
+			t.Errorf("audit_warning = %q, want it to name the run_revived append failure", res.AuditWarning)
+		}
 	})
 
 	t.Run("422 revive_not_applicable surfaces as apiError", func(t *testing.T) {
