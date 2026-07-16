@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // TestHelperProcess is the Go stdlib test-helper-process pattern: when
@@ -93,7 +94,7 @@ func TestHelperProcess(t *testing.T) {
 		// single-child kill would leave the grandchild holding the pipe and
 		// wedge cmd.Output(); procgroup.Harden's whole-group SIGKILL reaps both.
 		spawnGrandchild(false)
-		time.Sleep(30 * time.Second)
+		time.Sleep(timescale.D(30 * time.Second))
 	case "pipe_leak_escape":
 		// The #1805 latent hang, WaitDelay arm: fork a grandchild that ESCAPES
 		// this process group (self-setpgid) and holds the inherited stdout pipe,
@@ -110,7 +111,7 @@ func TestHelperProcess(t *testing.T) {
 		if pf := os.Getenv("HELPER_GC_PIDFILE"); pf != "" {
 			_ = os.WriteFile(pf, []byte(strconv.Itoa(os.Getpid())), 0o600)
 		}
-		time.Sleep(30 * time.Second)
+		time.Sleep(timescale.D(30 * time.Second))
 	case "slow_brief":
 		// Sleep longer than a short cfg.Timeout but shorter than an incoming
 		// ctx deadline, then succeed. Used to prove invokeOnce honours the
@@ -225,16 +226,18 @@ func pidAliveFromFile(t *testing.T, pidfile string) bool {
 // (fork/exec the grandchild and flush its pid file) or REAP (deliver the
 // group-kill signal and have the kernel remove the process) a helper process
 // in waitPidGone. This is spawn/reap liveness, NOT the kill-latency behavior
-// under test — the tight #1805 regression bounds (elapsed > 3s at
-// TestReviewer_PipeLeakGroupKillTimeout, elapsed > 5s at
-// TestReviewer_PipeLeakEscapedGroupWaitDelayTimeout) stay unchanged.
-const grandchildLivenessWait = 30 * time.Second
+// under test — the #1805 regression bounds (elapsed > D(3s) at
+// TestReviewer_PipeLeakGroupKillTimeout, elapsed > D(5s) at
+// TestReviewer_PipeLeakEscapedGroupWaitDelayTimeout) preserve their ratio to
+// the deadline under the same factor. It is a function (not a const) so the
+// factor is read at call time, after any t.Setenv.
+func grandchildLivenessWait() time.Duration { return timescale.D(30 * time.Second) }
 
 // waitPidGone polls until the pid recorded in pidfile is gone, or fails the test.
 func waitPidGone(t *testing.T, pidfile string) {
 	t.Helper()
 	var pid int
-	for deadline := time.Now().Add(grandchildLivenessWait); time.Now().Before(deadline); {
+	for deadline := time.Now().Add(grandchildLivenessWait()); time.Now().Before(deadline); {
 		if b, err := os.ReadFile(pidfile); err == nil {
 			if p, perr := strconv.Atoi(string(b)); perr == nil && p > 0 {
 				pid = p
@@ -246,7 +249,7 @@ func waitPidGone(t *testing.T, pidfile string) {
 	if pid == 0 {
 		t.Fatalf("grandchild never wrote its pid to %s", pidfile)
 	}
-	for deadline := time.Now().Add(grandchildLivenessWait); time.Now().Before(deadline); {
+	for deadline := time.Now().Add(grandchildLivenessWait()); time.Now().Before(deadline); {
 		if syscall.Kill(pid, 0) != nil {
 			return // gone
 		}
@@ -265,13 +268,16 @@ func waitPidGone(t *testing.T, pidfile string) {
 // attempt is not retried, and the grandchild is reaped.
 func TestReviewer_PipeLeakGroupKillTimeout(t *testing.T) {
 	pidfile := filepath.Join(t.TempDir(), "gc.pid")
-	defer setKillGrace(10 * time.Second)() // a long grace: group-kill must return well before it
+	// Every deadline-competing duration derives from timescale.D (base × the
+	// shared factor) so the discrimination ratios (bound/deadline,
+	// long-grace/bound, wedge/bound) hold at any factor while CI gains headroom.
+	defer setKillGrace(timescale.D(10 * time.Second))() // a long grace: group-kill must return well before it
 
 	var attempts int
 	r := NewReviewer(testConfig())
 	r.client.Cmd = countingPipeLeakHelper("pipe_leak_group", pidfile, &attempts)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(300*time.Millisecond))
 	defer cancel()
 
 	start := time.Now()
@@ -287,7 +293,7 @@ func TestReviewer_PipeLeakGroupKillTimeout(t *testing.T) {
 	if !strings.Contains(err.Error(), "timeout") {
 		t.Errorf("error = %q, want it labelled a timeout", err)
 	}
-	if elapsed > 3*time.Second {
+	if elapsed > timescale.D(3*time.Second) {
 		t.Errorf("Review took %s — the group kill should return at the deadline, not wait the 10s grace (the #1805 hang)", elapsed)
 	}
 	if attempts != 1 {
@@ -306,14 +312,16 @@ func TestReviewer_PipeLeakGroupKillTimeout(t *testing.T) {
 // asserted to be a genuine deadline.
 func TestReviewer_PipeLeakEscapedGroupWaitDelayTimeout(t *testing.T) {
 	pidfile := filepath.Join(t.TempDir(), "gc.pid")
-	defer setKillGrace(300 * time.Millisecond)() // short grace so the WaitDelay path is fast
+	// Grace and deadline both derive from timescale.D so the WaitDelay path
+	// stays fast and the elapsed bound below preserves its ratio at any factor.
+	defer setKillGrace(timescale.D(300 * time.Millisecond))() // short grace so the WaitDelay path is fast
 	t.Cleanup(func() { killPidFromFile(pidfile) })
 
 	var attempts int
 	r := NewReviewer(testConfig())
 	r.client.Cmd = countingPipeLeakHelper("pipe_leak_escape", pidfile, &attempts)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(200*time.Millisecond))
 	defer cancel()
 
 	start := time.Now()
@@ -329,7 +337,7 @@ func TestReviewer_PipeLeakEscapedGroupWaitDelayTimeout(t *testing.T) {
 	if !strings.Contains(err.Error(), "timeout") {
 		t.Errorf("error = %q, want the WaitDelay-forced non-ExitError return still classified as a timeout (the step-6 hoist)", err)
 	}
-	if elapsed > 5*time.Second {
+	if elapsed > timescale.D(5*time.Second) {
 		t.Errorf("Review took %s — WaitDelay should force-close near deadline+grace, not hang on the escaped grandchild", elapsed)
 	}
 	if attempts != 1 {
