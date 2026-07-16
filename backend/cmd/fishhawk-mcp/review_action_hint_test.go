@@ -93,6 +93,26 @@ func seedInfraSignalUnparseable(fb *fakeBackend, runID, stageID uuid.UUID) {
 	fb.mu.Unlock()
 }
 
+// seedRecoveredSignalUnparseable appends a stage_fixup_recovered audit entry
+// whose payload is a JSON array — it fails to decode into the
+// source_failure_category struct, so fixupInfraRefunds must skip it without
+// error and never refund (#1957). The recovered-shape analog of
+// seedInfraSignalUnparseable, so the skip guard is exercised on BOTH signal
+// branches, not just the reaper one.
+func seedRecoveredSignalUnparseable(fb *fakeBackend, runID, stageID uuid.UUID) {
+	sid := stageID.String()
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		StageID:  &sid,
+		Category: categoryStageFixupRecovered,
+		Payload:  []int{1, 2, 3},
+	})
+	fb.mu.Unlock()
+}
+
 // seedImplementReviewedAudit appends an implement_reviewed audit entry keyed
 // to stageID carrying an approve_with_concerns verdict with n concerns — the
 // round-scoped source reviewActionHintFor counts concerns from (#860).
@@ -374,6 +394,41 @@ func TestReviewActionHintFor(t *testing.T) {
 			wantOverride:           true,
 		},
 		{
+			// #1957 (d'): the category gate guards the RECOVERED branch too,
+			// not just the reaper branch — a non-C (category A)
+			// stage_fixup_recovered signal inside a window must NOT refund.
+			// Without this, a recovered-block regression that refunded
+			// regardless of source_failure_category would still pass case (b)
+			// (recovered-C refunds) and case (d) (which only exercises the
+			// reaper branch), leaving the recovered category-gate untested.
+			name:                "recovered category-A in window does not refund -> override",
+			status:              completeStatus(),
+			seedConcerns:        1,
+			infraRounds:         1,
+			infraSignalKind:     "recovered",
+			infraSignalCategory: "A",
+			wantNil:             false,
+			wantConcerns:        1,
+			wantRemaining:       0,
+			wantOverride:        true,
+		},
+		{
+			// #1957 (e'): the unparseable-payload skip guard covers the
+			// RECOVERED branch too — an undecodable stage_fixup_recovered
+			// payload is skipped without error and never refunds, mirroring
+			// case (e) for the reaper branch.
+			name:                   "unparseable recovered signal payload skipped -> override",
+			status:                 completeStatus(),
+			seedConcerns:           1,
+			infraRounds:            1,
+			infraSignalKind:        "recovered",
+			infraSignalUnparseable: true,
+			wantNil:                false,
+			wantConcerns:           1,
+			wantRemaining:          0,
+			wantOverride:           true,
+		},
+		{
 			// #1957 (f): the SUMMED no-change + infra refund is clamped to the
 			// raw passes actually triggered, so remaining never widens past the
 			// normal budget. One infra round (raw=1, infra refund=1) plus one
@@ -475,6 +530,8 @@ func TestReviewActionHintFor(t *testing.T) {
 			for i := 0; i < tc.infraRounds; i++ {
 				seedFixupTriggeredAudit(fb, runID, implementStageID)
 				switch {
+				case tc.infraSignalUnparseable && tc.infraSignalKind == "recovered":
+					seedRecoveredSignalUnparseable(fb, runID, implementStageID)
 				case tc.infraSignalUnparseable:
 					seedInfraSignalUnparseable(fb, runID, implementStageID)
 				case tc.infraSignalKind == "recovered":
