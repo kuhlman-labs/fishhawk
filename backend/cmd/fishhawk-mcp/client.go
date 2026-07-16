@@ -1246,6 +1246,57 @@ func (c *apiClient) ReviveRun(ctx context.Context, runID uuid.UUID) (*ReviveRunR
 	return &res, nil
 }
 
+// mergeRunRequest mirrors the backend's `POST /v0/runs/{run_id}/merge`
+// body (`backend/internal/server/merge_run.go::mergeRunRequest`, E48.7 /
+// #1954). Verdict is REQUIRED — the merge records an audited operator
+// verdict as a chained merge_verdict_recorded audit entry.
+type mergeRunRequest struct {
+	Verdict string `json:"verdict"`
+}
+
+// MergeRunResult mirrors the backend's merge 200 body: the merge was
+// queued through the same GitHubMerger seam the delegated may_merge arm
+// uses, with the chained verdict row's sequence surfaced back to the
+// operator. AlreadyRecorded is the ENDPOINT-side idempotence signal
+// (#1954 binding condition 1): a repeated POST that finds an existing
+// merge_verdict_recorded row appends NO duplicate, responds
+// already_recorded:true, and STILL dispatches the merge helper — so a
+// 502-then-reinvoke re-queues the merge with no duplicate verdict row.
+type MergeRunResult struct {
+	MergeQueued     bool   `json:"merge_queued"`
+	VerdictSequence int64  `json:"verdict_sequence"`
+	PRURL           string `json:"pr_url"`
+	AlreadyRecorded bool   `json:"already_recorded"`
+}
+
+// MergeRun records the operator merge verdict and queues the squash merge
+// via `POST /v0/runs/{run_id}/merge` (E48.7 / #1954): the endpoint appends
+// a chained merge_verdict_recorded audit entry (no duplicate on a repeated
+// POST — already_recorded:true) and dispatches the shared merge helper the
+// delegated may_merge arm uses. The endpoint does NOT wait — the terminal
+// await is client-side in the fishhawk_merge_run tool, matching the
+// await_audit no-server-state idiom. Verdict is REQUIRED. 4xx/5xx surfaces:
+//   - 400 validation_failed (empty verdict)
+//   - 403 run_token_forbidden (a run-bound agent token) / insufficient_scope
+//     (token lacks write:approvals)
+//   - 404 run_not_found
+//   - 409 merge_not_admissible (no PR URL; run failed/cancelled; acceptance
+//     gate not passed/declared/skipped-out-of-scope)
+//   - 502 merge_dispatch_failed (the verdict row is durable; the queue step
+//     is retryable — re-POST re-queues with no duplicate row)
+//   - 503 merge_unconfigured (the merger seam is not wired)
+func (c *apiClient) MergeRun(ctx context.Context, runID uuid.UUID, verdict string) (*MergeRunResult, error) {
+	body, err := json.Marshal(mergeRunRequest{Verdict: verdict})
+	if err != nil {
+		return nil, fmt.Errorf("marshal merge: %w", err)
+	}
+	var res MergeRunResult
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/merge", body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // vouchCommitRequest mirrors the backend's
 // `POST /v0/runs/{run_id}/vouch-commit` body
 // (`backend/internal/server/vouch.go::vouchCommitRequest`). Both fields

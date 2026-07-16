@@ -698,8 +698,10 @@ func getNextActions(t *testing.T, ctx context.Context, session *mcp.ClientSessio
 //     plan_gate_parked and offers fishhawk_approve_plan (consuming an
 //     approval slot);
 //   - run succeeded with its PR open → the block classifies
-//     succeeded_pr_open and leads with the ordered merge ritual
-//     (approve_pr → merge_pr → post_merge).
+//     succeeded_pr_open and leads with the rewired merge ritual
+//     (approve_pr → fishhawk_merge_run, E48.7 / #1954) — the bare
+//     merge_pr + post_merge steps are retired, folded into the one
+//     fishhawk_merge_run verb.
 //
 // Per-layer units cover the classifier table; this drives the audit/API
 // → classifier seam against the real backend reads (#618 rule).
@@ -765,7 +767,7 @@ func TestE2E_NextActions_PlanGateParkedAndMergeRitual(t *testing.T) {
 	if na.State != "succeeded_pr_open" {
 		t.Errorf("next_actions.state = %q, want succeeded_pr_open", na.State)
 	}
-	wantRitual := []string{"approve_pr", "merge_pr", "post_merge"}
+	wantRitual := []string{"approve_pr", "fishhawk_merge_run"}
 	if len(na.Actions) != len(wantRitual) {
 		t.Fatalf("merge ritual actions = %+v, want %v in order", na.Actions, wantRitual)
 	}
@@ -774,7 +776,22 @@ func TestE2E_NextActions_PlanGateParkedAndMergeRitual(t *testing.T) {
 			t.Errorf("actions[%d] = %q, want %q (the ritual is ordered)", i, na.Actions[i].Action, want)
 		}
 	}
+	// The retired bare ritual steps must be gone — folded into fishhawk_merge_run.
+	for _, a := range na.Actions {
+		if a.Action == "merge_pr" || a.Action == "post_merge" {
+			t.Errorf("retired ritual step %q still surfaced — E48.7 folds it into fishhawk_merge_run", a.Action)
+		}
+	}
 	if na.Actions[0].Params["pr_url"] != "https://github.com/kuhlman-labs/fishhawk/pull/4242" {
 		t.Errorf("approve_pr params.pr_url = %q, want the stamped PR", na.Actions[0].Params["pr_url"])
+	}
+	// The rewired merge verb carries the run_id + verdict placeholder params it
+	// needs to drive fishhawk_merge_run.
+	mergeAct := na.Actions[1]
+	if mergeAct.Params["run_id"] != fx.runID.String() {
+		t.Errorf("fishhawk_merge_run params.run_id = %q, want %s", mergeAct.Params["run_id"], fx.runID)
+	}
+	if _, ok := mergeAct.Params["verdict"]; !ok {
+		t.Errorf("fishhawk_merge_run params missing verdict placeholder: %v", mergeAct.Params)
 	}
 }

@@ -305,8 +305,8 @@ func TestNextActions_StateTable(t *testing.T) {
 			stages:       []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")},
 			implRS:       naReviewStatus("implement", "complete"),
 			wantState:    "implement_gate_settled",
-			wantActions:  []string{"approve_pr", "merge_pr", "post_merge"},
-			wantConsumes: []string{consumesNone, consumesNone, consumesNone},
+			wantActions:  []string{"approve_pr", "fishhawk_merge_run"},
+			wantConsumes: []string{consumesNone, consumesNone},
 		},
 		{
 			name: "i_run_succeeded_pr_open_merge_ritual",
@@ -318,8 +318,8 @@ func TestNextActions_StateTable(t *testing.T) {
 			stages:       []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")},
 			implRS:       naReviewStatus("implement", "complete"),
 			wantState:    "succeeded_pr_open",
-			wantActions:  []string{"approve_pr", "merge_pr", "post_merge"},
-			wantConsumes: []string{consumesNone, consumesNone, consumesNone},
+			wantActions:  []string{"approve_pr", "fishhawk_merge_run"},
+			wantConsumes: []string{consumesNone, consumesNone},
 		},
 		{
 			name: "j_968_wedge_run_succeeded_review_still_pending",
@@ -729,7 +729,10 @@ func TestNextActions_UnclassifiedFallback(t *testing.T) {
 // TestNextActions_DriveActionFoldsFirst pins the drive-fold-first
 // invariant: when the drive read view carries a distilled next action,
 // it becomes the FIRST entry so drive and next_actions never point
-// different ways.
+// different ways. It also pins the E48.7 / #1954 drive-folded merge_pr
+// TRANSLATION: the server-stamped merge_pr next_action surfaces as
+// fishhawk_merge_run at the MCP layer (with the run_id + verdict params),
+// while the drive detail and PR URL carry through unchanged.
 func TestNextActions_DriveActionFoldsFirst(t *testing.T) {
 	prURL := "https://github.com/x/y/pull/42"
 	run := naRun("running")
@@ -744,14 +747,42 @@ func TestNextActions_DriveActionFoldsFirst(t *testing.T) {
 	if na == nil || len(na.Actions) == 0 {
 		t.Fatalf("nextActionsFor = %+v, want the drive action folded in first", na)
 	}
-	if na.Actions[0].Action != "merge_pr" {
-		t.Errorf("actions[0] = %q, want the drive next_action merge_pr first", na.Actions[0].Action)
+	if na.Actions[0].Action != "fishhawk_merge_run" {
+		t.Errorf("actions[0] = %q, want the drive next_action merge_pr translated to fishhawk_merge_run", na.Actions[0].Action)
 	}
 	if na.Actions[0].Reason != "all gates resolved" {
 		t.Errorf("actions[0].reason = %q, want the drive detail", na.Actions[0].Reason)
 	}
 	if na.Actions[0].Params["pr_url"] != prURL {
 		t.Errorf("actions[0].params.pr_url = %q, want %q", na.Actions[0].Params["pr_url"], prURL)
+	}
+	if na.Actions[0].Params["run_id"] != run.ID {
+		t.Errorf("actions[0].params.run_id = %q, want %q", na.Actions[0].Params["run_id"], run.ID)
+	}
+	if _, ok := na.Actions[0].Params["verdict"]; !ok {
+		t.Errorf("actions[0].params missing verdict placeholder: %v", na.Actions[0].Params)
+	}
+}
+
+// TestNextActions_DriveActionNonMergePassesThrough pins that a NON-merge
+// drive next_action (e.g. run_implement_stage) is folded in verbatim — the
+// merge_pr translation is scoped strictly to the merge verb.
+func TestNextActions_DriveActionNonMergePassesThrough(t *testing.T) {
+	run := naRun("running")
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "pending")}
+	drive := &DriveStatus{
+		Drive:      true,
+		NextAction: &RunNextAction{Action: "run_implement_stage", Detail: "dispatch it"},
+	}
+	na := nextActionsFor(run, stages, nil, nil, nil, drive, false, false, "", "", releaseSignals{})
+	if na == nil || len(na.Actions) == 0 {
+		t.Fatalf("nextActionsFor = %+v, want the drive action folded in first", na)
+	}
+	if na.Actions[0].Action != "run_implement_stage" {
+		t.Errorf("actions[0] = %q, want the non-merge drive action passed through verbatim", na.Actions[0].Action)
+	}
+	if _, ok := na.Actions[0].Params["verdict"]; ok {
+		t.Errorf("actions[0] should carry no verdict param for a non-merge action: %v", na.Actions[0].Params)
 	}
 }
 
@@ -1103,7 +1134,7 @@ func TestNextActions_SucceededMerged(t *testing.T) {
 // TestNextActions_SucceededPROpenUnchangedWhenMergeNotObserved pins the
 // negative mirror of #1370: a succeeded run with an open PR but
 // mergeObserved=false keeps the prior succeeded_pr_open state and the
-// full approve_pr -> merge_pr -> post_merge ritual.
+// rewired approve_pr -> fishhawk_merge_run ritual (E48.7 / #1954).
 func TestNextActions_SucceededPROpenUnchangedWhenMergeNotObserved(t *testing.T) {
 	prURL := "https://github.com/x/y/pull/42"
 	run := naRun("succeeded")
@@ -1114,15 +1145,21 @@ func TestNextActions_SucceededPROpenUnchangedWhenMergeNotObserved(t *testing.T) 
 	if na == nil || na.State != "succeeded_pr_open" {
 		t.Fatalf("state = %+v, want succeeded_pr_open", na)
 	}
-	if got := actionNames(na); len(got) != 3 || got[0] != "approve_pr" || got[1] != "merge_pr" || got[2] != "post_merge" {
-		t.Fatalf("actions = %v, want [approve_pr merge_pr post_merge]", got)
+	if got := actionNames(na); len(got) != 2 || got[0] != "approve_pr" || got[1] != "fishhawk_merge_run" {
+		t.Fatalf("actions = %v, want [approve_pr fishhawk_merge_run]", got)
+	}
+	// The retired bare ritual steps are gone.
+	for _, a := range na.Actions {
+		if a.Action == "merge_pr" || a.Action == "post_merge" {
+			t.Errorf("retired ritual step %q still surfaced — replaced by fishhawk_merge_run", a.Action)
+		}
 	}
 }
 
 // TestNextActions_SucceededAcceptanceSkippedOutOfScope pins the E38.3 (#1657)
 // arm: a succeeded run with an open PR AND the acceptanceSkippedOutOfScope flag
 // set classifies succeeded_acceptance_skipped_out_of_scope and STILL returns the
-// full merge ritual (approve_pr -> merge_pr -> post_merge) — the run stays
+// rewired merge ritual (approve_pr -> fishhawk_merge_run) — the run stays
 // merge-eligible. The graceful-degradation control proves the flag gates ONLY
 // the label: with the flag false (the skip entry aged out of the recent window)
 // the same run falls back to plain succeeded_pr_open, itself merge-eligible.
@@ -1137,8 +1174,8 @@ func TestNextActions_SucceededAcceptanceSkippedOutOfScope(t *testing.T) {
 		if na == nil || na.State != "succeeded_acceptance_skipped_out_of_scope" {
 			t.Fatalf("state = %+v, want succeeded_acceptance_skipped_out_of_scope", na)
 		}
-		if got := actionNames(na); len(got) != 3 || got[0] != "approve_pr" || got[1] != "merge_pr" || got[2] != "post_merge" {
-			t.Fatalf("actions = %v, want the full merge ritual [approve_pr merge_pr post_merge]", got)
+		if got := actionNames(na); len(got) != 2 || got[0] != "approve_pr" || got[1] != "fishhawk_merge_run" {
+			t.Fatalf("actions = %v, want the rewired merge ritual [approve_pr fishhawk_merge_run]", got)
 		}
 	})
 
@@ -1147,7 +1184,7 @@ func TestNextActions_SucceededAcceptanceSkippedOutOfScope(t *testing.T) {
 		if na == nil || na.State != "succeeded_pr_open" {
 			t.Fatalf("state = %+v, want succeeded_pr_open (graceful degradation)", na)
 		}
-		if got := actionNames(na); len(got) != 3 || got[0] != "approve_pr" {
+		if got := actionNames(na); len(got) != 2 || got[0] != "approve_pr" {
 			t.Fatalf("actions = %v, want the merge ritual", got)
 		}
 	})
@@ -1452,7 +1489,7 @@ func TestNextActions_AcceptanceStateTable(t *testing.T) {
 			stages:      naAcceptanceStages("succeeded"),
 			verdict:     "passed",
 			wantState:   "acceptance_passed",
-			wantActions: []string{"approve_pr", "merge_pr", "post_merge"},
+			wantActions: []string{"approve_pr", "fishhawk_merge_run"},
 		},
 		{
 			// (6) fixup_dispatched with the implement stage re-opened -> the
@@ -1612,7 +1649,7 @@ func TestNextActions_AcceptanceOutcomeUnknown(t *testing.T) {
 			var retry *SuggestedAction
 			for i := range na.Actions {
 				a := na.Actions[i]
-				if a.Action == "approve_pr" || a.Action == "merge_pr" {
+				if a.Action == "approve_pr" || a.Action == "merge_pr" || a.Action == "fishhawk_merge_run" {
 					t.Fatalf("merge ritual action %q surfaced on an unknown acceptance outcome — must fail toward read, not merge", a.Action)
 				}
 				if a.Action == "fishhawk_retry_stage" {
@@ -1650,8 +1687,8 @@ func TestNextActions_AcceptanceSkippedOutOfScope_SettledImplement(t *testing.T) 
 		if na == nil || na.State != "acceptance_skipped_out_of_scope" {
 			t.Fatalf("state = %+v, want acceptance_skipped_out_of_scope", na)
 		}
-		if got := actionNames(na); len(got) != 3 || got[0] != "approve_pr" || got[1] != "merge_pr" || got[2] != "post_merge" {
-			t.Fatalf("actions = %v, want the full merge ritual [approve_pr merge_pr post_merge]", got)
+		if got := actionNames(na); len(got) != 2 || got[0] != "approve_pr" || got[1] != "fishhawk_merge_run" {
+			t.Fatalf("actions = %v, want the rewired merge ritual [approve_pr fishhawk_merge_run]", got)
 		}
 		for _, a := range na.Actions {
 			if a.Action == "fishhawk_retry_stage" {
@@ -1670,7 +1707,7 @@ func TestNextActions_AcceptanceSkippedOutOfScope_SettledImplement(t *testing.T) 
 			t.Errorf("actions[0] = %q, want fishhawk_list_audit", na.Actions[0].Action)
 		}
 		for _, a := range na.Actions {
-			if a.Action == "approve_pr" || a.Action == "merge_pr" {
+			if a.Action == "approve_pr" || a.Action == "merge_pr" || a.Action == "fishhawk_merge_run" {
 				t.Errorf("merge ritual must not surface on the aged-out arm: %+v", na.Actions)
 			}
 		}
@@ -1686,8 +1723,8 @@ func TestNextActions_AcceptanceSkippedOutOfScope_SettledImplement(t *testing.T) 
 }
 
 // TestNextActions_NoAcceptanceStage_MergeRitualUnchanged covers mode (9): a run
-// with no acceptance stage keeps the prior implement_gate_settled + merge
-// ritual behavior byte-identical.
+// with no acceptance stage keeps the implement_gate_settled state and the
+// rewired approve_pr -> fishhawk_merge_run merge ritual (E48.7 / #1954).
 func TestNextActions_NoAcceptanceStage_MergeRitualUnchanged(t *testing.T) {
 	run := naRun("running")
 	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
@@ -1695,8 +1732,8 @@ func TestNextActions_NoAcceptanceStage_MergeRitualUnchanged(t *testing.T) {
 	if na == nil || na.State != "implement_gate_settled" {
 		t.Fatalf("state = %+v, want implement_gate_settled", na)
 	}
-	if got := actionNames(na); len(got) != 3 || got[0] != "approve_pr" || got[1] != "merge_pr" || got[2] != "post_merge" {
-		t.Fatalf("actions = %v, want [approve_pr merge_pr post_merge]", got)
+	if got := actionNames(na); len(got) != 2 || got[0] != "approve_pr" || got[1] != "fishhawk_merge_run" {
+		t.Fatalf("actions = %v, want [approve_pr fishhawk_merge_run]", got)
 	}
 }
 
