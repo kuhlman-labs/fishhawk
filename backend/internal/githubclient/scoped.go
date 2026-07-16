@@ -27,7 +27,15 @@ func (c *credentialTokens) Token(ctx context.Context, installationID int64) (str
 // forge-neutral forge.CredentialProvider rather than a
 // githubapp.TokenProvider. It builds via the unchanged New and wires
 // Tokens to a credentialTokens adapter.
+//
+// A nil p is passed through to New as a nil githubapp.TokenProvider
+// rather than wrapped: wrapping it would install a non-nil Tokens whose
+// provider field is nil, bypassing New's "client missing TokenProvider"
+// nil check and panicking on first use instead.
 func NewWithCredentialProvider(p forge.CredentialProvider) *Client {
+	if p == nil {
+		return New(nil)
+	}
 	return New(&credentialTokens{provider: p})
 }
 

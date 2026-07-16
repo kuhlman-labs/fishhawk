@@ -158,6 +158,26 @@ func TestNewWithCredentialProvider_Int64MethodRoundTripsThroughAdapter(t *testin
 	}
 }
 
+func TestNewWithCredentialProvider_NilProviderErrorsInsteadOfPanicking(t *testing.T) {
+	c := NewWithCredentialProvider(nil)
+
+	_, err := c.GetFile(context.Background(), 4242, RepoRef{Owner: "x", Name: "y"}, "f.txt", "main")
+	if err == nil {
+		t.Fatal("GetFile with nil credential provider: got nil error, want the missing-TokenProvider error")
+	}
+	if !strings.Contains(err.Error(), "missing TokenProvider") {
+		t.Fatalf("error = %q, want it to name the missing TokenProvider", err.Error())
+	}
+
+	_, err = c.GetFileScoped(context.Background(), forge.FromGitHubInstallationID(4242), RepoRef{Owner: "x", Name: "y"}, "f.txt", "main")
+	if err == nil {
+		t.Fatal("GetFileScoped with nil credential provider: got nil error, want the missing-TokenProvider error")
+	}
+	if !strings.Contains(err.Error(), "missing TokenProvider") {
+		t.Fatalf("error = %q, want it to name the missing TokenProvider", err.Error())
+	}
+}
+
 func TestGetFileScoped_NilTokensReturnsExistingErrorNotPanic(t *testing.T) {
 	c := &Client{HTTP: &http.Client{Timeout: 5 * time.Second}}
 
