@@ -70,8 +70,16 @@ jobs:
               - '.dockerignore'
               - '.github/workflows/ci.yml'
 
-  go:
-    name: Go (lint + build + test)
+  # The Go gate is split into two PARALLEL jobs (go-lint, go-test) rather
+  # than one serial job. Lint (~2 min) and test+coverage (~4 min) previously
+  # ran back-to-back on one runner (~6.5 min); as concurrent jobs the Go
+  # critical path is max(lint, test) instead of their sum. Both share the
+  # setup-go build/module cache via the GHA cache backend, so the second job
+  # to start reads a warm cache. Both gate on `detect` and the same
+  # `go == 'true'` filter, and both are listed in `ci-pass.needs` so the
+  # required rollup inherits both results.
+  go-lint:
+    name: Go (lint)
     needs: detect
     if: ${{ needs.detect.outputs.go == 'true' }}
     runs-on: ubuntu-latest
@@ -94,7 +102,7 @@ jobs:
             echo "yes=true" >> "$GITHUB_OUTPUT"
           else
             echo "yes=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::No Go modules registered in go.work yet. Skipping lint/build/test."
+            echo "::notice::No Go modules registered in go.work yet. Skipping lint."
           fi
 
       - name: Schema sync (docs/spec ↔ embedded copies)
@@ -127,6 +135,58 @@ jobs:
           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.8.0/install.sh \
             | sh -s -- -b "$(go env GOPATH)/bin" v2.8.0
 
+      # golangci-lint keeps an incremental analysis cache at
+      # ~/.cache/golangci-lint that setup-go's cache does NOT cover. Restoring
+      # it across runs lets golangci re-lint only changed packages instead of
+      # the whole workspace cold. The key rotates per-commit (so every run
+      # writes back the latest cache) while restore-keys fall back to the most
+      # recent prior cache for the same .golangci.yml; a config change drops to
+      # the OS-level fallback and rebuilds. Keyed off .golangci.yml only (not
+      # **/*.go) so an ordinary code change reuses the warm cache rather than
+      # thrashing the exact key on every push.
+      - name: Cache golangci-lint analysis cache
+        if: steps.have-modules.outputs.yes == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/golangci-lint
+          key: golangci-${{ runner.os }}-${{ hashFiles('.golangci.yml') }}-${{ github.sha }}
+          restore-keys: |
+            golangci-${{ runner.os }}-${{ hashFiles('.golangci.yml') }}-
+            golangci-${{ runner.os }}-
+
+      - name: Lint each module
+        if: steps.have-modules.outputs.yes == 'true'
+        # `scripts/test lint` is byte-for-byte the per-module
+        # `golangci-lint run ./...` (AGENTS.md "Build, test, lint") and fails
+        # closed when golangci-lint is missing (installed in the step above).
+        # `go build ./...` is redundant here: lint typechecks/builds every
+        # package (and go-test compiles them again) — exactly what the runner's
+        # `scripts/test verify` gate already relies on.
+        run: scripts/test lint
+
+  go-test:
+    name: Go (test + coverage)
+    needs: detect
+    if: ${{ needs.detect.outputs.go == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Detect registered modules
+        id: have-modules
+        run: |
+          if [ -f go.work ] && grep -q '^use ' go.work; then
+            echo "yes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "yes=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Go modules registered in go.work yet. Skipping test."
+          fi
+
       # Route the Go gate through scripts/test instead of an inline `go test`
       # loop so CI runs the suite in the SAME tuned environment as the local
       # and runner gates (#1413, the #1402 testcontainer flake). The inline
@@ -138,16 +198,6 @@ jobs:
       # (the `No such container` stale-reuse symptom). scripts/test exports
       # TESTCONTAINERS_RYUK_DISABLED=true and reaps fishhawk-test-postgres in
       # an EXIT trap, so both causes are removed at the source.
-      - name: Lint each module
-        if: steps.have-modules.outputs.yes == 'true'
-        # `scripts/test lint` is byte-for-byte the prior per-module
-        # `golangci-lint run ./...` (AGENTS.md "Build, test, lint") and fails
-        # closed when golangci-lint is missing (installed in the step above).
-        # The dropped `go build ./...` is redundant: lint typechecks/builds and
-        # the test pass compiles every package — exactly what the runner's
-        # `scripts/test verify` gate already relies on.
-        run: scripts/test lint
-
       - name: Test + coverage threshold (≥ 80% aggregate, excl. sqlc-generated)
         if: steps.have-modules.outputs.yes == 'true'
         # `scripts/test coverage` writes the per-module coverage.out profiles
@@ -258,7 +308,7 @@ jobs:
   # touching the ruleset.
   ci-pass:
     name: CI Pass
-    needs: [detect, go, ts, openapi, docker-build]
+    needs: [detect, go-lint, go-test, ts, openapi, docker-build]
     if: always()
     runs-on: ubuntu-latest
     steps:
