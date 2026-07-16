@@ -1746,7 +1746,23 @@ func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.R
 	if err != nil {
 		return fmt.Errorf("campaign auto-merge: %w", err)
 	}
-	return m.gh.EnableAutoMerge(ctx, *runRow.InstallationID, repo, number, githubclient.MergeMethodSquash)
+	// Primary: queue GitHub auto-merge so the PR lands once branch protection
+	// (required review + the fishhawk_audit_complete check) clears. The webhook
+	// / resolveReviewStageOnMerge path settles the review stage on the merge.
+	err = m.gh.EnableAutoMerge(ctx, *runRow.InstallationID, repo, number, githubclient.MergeMethodSquash)
+	if err == nil {
+		return nil
+	}
+	// Fallback (E48.7 / #1954): enablePullRequestAutoMerge errors on a PR that
+	// is ALREADY merge-ready ("clean status") — the common operator flow where
+	// `gh pr review --approve` plus green required checks settle the PR clean
+	// before the merge verb runs. GitHub refuses to queue auto-merge on a
+	// synchronously-mergeable PR, so merge it directly via REST. Any OTHER
+	// enable error surfaces unchanged (no fallback).
+	if errors.Is(err, githubclient.ErrPullRequestCleanStatus) {
+		return m.gh.MergePullRequest(ctx, *runRow.InstallationID, repo, number, githubclient.MergeMethodSquash)
+	}
+	return err
 }
 
 // parseCampaignPRURL splits a GitHub PR html_url into its repo ref and number.

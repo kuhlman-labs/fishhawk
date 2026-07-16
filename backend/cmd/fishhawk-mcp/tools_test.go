@@ -1666,7 +1666,11 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	//
 	// #1915 adds exactly ONE tool — fishhawk_revive_run, the one-verb
 	// failed-run revive — taking the total 42 -> 43.
-	const wantToolCount = 43
+	//
+	// E48.7 (#1954) adds exactly ONE tool — fishhawk_merge_run, the one-verb
+	// operator verdict + queue-merge + await-terminal verb that replaces the
+	// bare merge_pr + post_merge hand ceremony — taking the total 43 -> 44.
+	const wantToolCount = 44
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -4081,12 +4085,15 @@ func TestGetRunStatus_DriveStatus_PropagatesEndToEnd(t *testing.T) {
 		t.Errorf("Run.ID = %s, want %s", out.Run.ID, runID)
 	}
 	// #1024: the drive next_action folds into next_actions as the FIRST
-	// entry, so the two surfaces never point different ways.
+	// entry, so the two surfaces never point different ways. E48.7 / #1954:
+	// the drive-folded merge_pr is TRANSLATED to fishhawk_merge_run at the
+	// MCP layer, while the drive_status block above keeps the persisted
+	// merge_pr vocabulary (asserted at ds.NextAction.Action).
 	if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
 		t.Fatalf("NextActions = %+v, want the drive action folded in", out.NextActions)
 	}
-	if out.NextActions.Actions[0].Action != "merge_pr" {
-		t.Errorf("next_actions.actions[0] = %q, want the drive merge_pr first", out.NextActions.Actions[0].Action)
+	if out.NextActions.Actions[0].Action != "fishhawk_merge_run" {
+		t.Errorf("next_actions.actions[0] = %q, want the drive merge_pr translated to fishhawk_merge_run", out.NextActions.Actions[0].Action)
 	}
 }
 
@@ -7419,8 +7426,8 @@ func TestGetRunStatus_AcceptancePassed_ThreadsRecentAudit(t *testing.T) {
 	for _, a := range out.NextActions.Actions {
 		names = append(names, a.Action)
 	}
-	if len(names) != 3 || names[0] != "approve_pr" || names[1] != "merge_pr" || names[2] != "post_merge" {
-		t.Errorf("acceptance_passed actions = %v, want [approve_pr merge_pr post_merge]", names)
+	if len(names) != 2 || names[0] != "approve_pr" || names[1] != "fishhawk_merge_run" {
+		t.Errorf("acceptance_passed actions = %v, want [approve_pr fishhawk_merge_run]", names)
 	}
 	// And the stage-execution surface tracks execution (succeeded), distinct
 	// from the verdict.

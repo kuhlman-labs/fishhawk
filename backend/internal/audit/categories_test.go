@@ -23,6 +23,7 @@ func TestIsKnownCategory(t *testing.T) {
 		"run_completed",
 		"deployment_outcome_recorded",
 		"run_revived",
+		"merge_verdict_recorded", // E48.7 / #1954 operator merge-verdict chain entry
 	}
 	for _, c := range known {
 		if !IsKnownCategory(c) {

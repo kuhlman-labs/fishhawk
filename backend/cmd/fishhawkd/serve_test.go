@@ -6,6 +6,8 @@ import (
 	"flag"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"testing"
 	"time"
@@ -598,6 +600,104 @@ func TestGithubAutoMerger_FailsClosed(t *testing.T) {
 				t.Fatalf("MergePullRequest(%s) = nil, want an error (fail-closed before HTTP)", tc.name)
 			}
 		})
+	}
+}
+
+// mergeFallbackGitHub is a minimal GitHub stand-in for the githubAutoMerger
+// clean-status REST fallback test (E48.7 / #1954). It answers the three calls
+// the merge seam makes — GET pull (node id), POST /graphql (auto-merge enable),
+// PUT pull merge (REST squash) — and records whether the REST merge fired so a
+// test can assert the fallback is taken exactly on the clean-status class.
+type mergeFallbackGitHub struct {
+	graphqlBody string // the enable-auto-merge graphql response body
+	mergeStatus int    // status for the REST merge PUT (0 → 200)
+	mergeHits   int    // number of REST merge PUTs served
+}
+
+func newMergeFallbackClient(t *testing.T, fg *mergeFallbackGitHub) *githubclient.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}",
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"number":7,"node_id":"PR_node","state":"open","head":{"sha":"abc"}}`)
+		})
+	mux.HandleFunc("POST /graphql",
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, fg.graphqlBody)
+		})
+	mux.HandleFunc("PUT /repos/{owner}/{repo}/pulls/{number}/merge",
+		func(w http.ResponseWriter, _ *http.Request) {
+			fg.mergeHits++
+			st := fg.mergeStatus
+			if st == 0 {
+				st = http.StatusOK
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(st)
+			_, _ = io.WriteString(w, `{"merged":true,"sha":"deadbeef"}`)
+		})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  fakeTokenProvider{},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+	}
+}
+
+func mergeFallbackRun() *runpkg.Run {
+	inst := int64(42)
+	pr := "https://github.com/x/y/pull/7"
+	return &runpkg.Run{ID: uuid.New(), InstallationID: &inst, PullRequestURL: &pr}
+}
+
+// TestGithubAutoMerger_CleanStatus_RESTFallback is the binding-condition-3
+// guard: the DELEGATED may_merge seam (githubAutoMerger, the GateMerger the
+// auto-driver dispatches through) receives the clean-status REST fallback — an
+// already-merge-ready PR whose enablePullRequestAutoMerge is rejected is merged
+// synchronously via the REST squash merge instead.
+func TestGithubAutoMerger_CleanStatus_RESTFallback(t *testing.T) {
+	fg := &mergeFallbackGitHub{
+		graphqlBody: `{"errors":[{"message":"Pull request is in clean status","type":"UNPROCESSABLE"}]}`,
+	}
+	m := githubAutoMerger{gh: newMergeFallbackClient(t, fg)}
+	if err := m.MergePullRequest(context.Background(), mergeFallbackRun()); err != nil {
+		t.Fatalf("MergePullRequest: %v", err)
+	}
+	if fg.mergeHits != 1 {
+		t.Errorf("REST merge fired %d times, want 1 (clean-status must fall back)", fg.mergeHits)
+	}
+}
+
+// TestGithubAutoMerger_EnableSuccess_NoFallback: a successful auto-merge enable
+// takes no REST fallback (the PR is queued, not merged synchronously).
+func TestGithubAutoMerger_EnableSuccess_NoFallback(t *testing.T) {
+	fg := &mergeFallbackGitHub{
+		graphqlBody: `{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":7,"state":"OPEN"}}}}`,
+	}
+	m := githubAutoMerger{gh: newMergeFallbackClient(t, fg)}
+	if err := m.MergePullRequest(context.Background(), mergeFallbackRun()); err != nil {
+		t.Fatalf("MergePullRequest: %v", err)
+	}
+	if fg.mergeHits != 0 {
+		t.Errorf("REST merge fired %d times on a successful enable, want 0", fg.mergeHits)
+	}
+}
+
+// TestGithubAutoMerger_UnrelatedEnableError_NoFallback: an enable error that is
+// NOT the clean-status class surfaces unchanged and takes no fallback.
+func TestGithubAutoMerger_UnrelatedEnableError_NoFallback(t *testing.T) {
+	fg := &mergeFallbackGitHub{
+		graphqlBody: `{"errors":[{"message":"Auto-merge is not allowed for this repository","type":"UNPROCESSABLE"}]}`,
+	}
+	m := githubAutoMerger{gh: newMergeFallbackClient(t, fg)}
+	if err := m.MergePullRequest(context.Background(), mergeFallbackRun()); err == nil {
+		t.Fatal("MergePullRequest = nil, want the unrelated enable error surfaced")
+	}
+	if fg.mergeHits != 0 {
+		t.Errorf("REST merge fired %d times on an unrelated enable error, want 0", fg.mergeHits)
 	}
 }
 
