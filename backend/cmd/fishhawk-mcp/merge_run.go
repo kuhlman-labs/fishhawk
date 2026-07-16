@@ -262,19 +262,28 @@ func (r *runResolver) awaitMergeTerminal(ctx context.Context, runID uuid.UUID, s
 	}
 }
 
-// mergeTerminalBackstop resolves the await when the run itself has reached a
-// terminal state while the merge entry is still pending (ADR-036). It does
-// ONE final since-anchored read first — a pr_merged / post_merge_observed
-// that landed at/after the terminal transition (the succeeded-on-merge case)
-// still resolves as merged and wins over the backstop. A failed/cancelled
-// run with no such entry resolves run_terminal. Best-effort: a GetRun error
-// or a non-terminal run keeps the poll/timeout path in charge.
+// mergeTerminalBackstop resolves the await ONLY when the run has reached a
+// FAILED / CANCELLED terminal state while the merge entry is still pending
+// (ADR-036) — states past which the queued merge will most likely never
+// settle. It deliberately does NOT arm on 'succeeded': feature_change is
+// terminal-on-succeeded, so a succeeded_pr_open run whose squash merge is
+// still queued (no pr_merged / post_merge_observed entry yet) is the NORMAL
+// happy path, and treating it as run_terminal would abandon the await the
+// instant it started rather than letting the merge settle (or time out
+// resumably). It does ONE final since-anchored read first — a pr_merged /
+// post_merge_observed that landed at/after the terminal transition still
+// resolves as merged and wins over the backstop. A failed/cancelled run with
+// no such entry resolves run_terminal. Best-effort: a GetRun error or a
+// non-failed/cancelled run keeps the poll/timeout path in charge.
 func (r *runResolver) mergeTerminalBackstop(ctx context.Context, runID uuid.UUID, sinceSeq int64) (string, string, bool) {
 	run, err := r.api.GetRun(ctx, runID)
 	if err != nil || run == nil {
 		return "", "", false
 	}
-	if !runStateIsTerminal(run.State) {
+	// Only failed / cancelled arm the backstop. 'succeeded' is the expected
+	// terminal-on-merge state, not a stranded-merge signal (see the concern
+	// #1954 fix-up: a normal succeeded run must await its queued merge).
+	if run.State != "failed" && run.State != "cancelled" {
 		return "", "", false
 	}
 	// Final read: an entry that landed at/after the terminal transition still

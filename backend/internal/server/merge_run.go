@@ -206,6 +206,18 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	// merge_verdict_recorded row means a prior POST already recorded the
 	// verdict; do NOT append a duplicate. Either way the merge helper is
 	// dispatched below, so a 502-then-reinvoke re-queues the merge.
+	//
+	// This read-then-append is deliberately NOT serialized against a
+	// concurrent POST for the same run (no advisory lock / unique
+	// (run_id, category) constraint): the realistic retry flow is SEQUENTIAL
+	// (a 502-then-reinvoke, or a timed-out re-invoke), which this guard covers
+	// exactly. A genuinely concurrent double-POST (e.g. two operator sessions
+	// racing) can have both observe zero rows and both append — an accepted,
+	// bounded trade-off: the worst case is one duplicate audit row and a
+	// double merge-dispatch, and GitHub tolerates a re-merge of an
+	// already-merged PR as a no-op. Hardening this to a DB-level serialization
+	// is deferred (it would need a schema/constraint change outside this
+	// endpoint's surface).
 	existing, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, CategoryMergeVerdictRecorded)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",

@@ -44,6 +44,18 @@ type mergeRunFakeBackend struct {
 
 	auditEntries []AuditEntry
 	getRunCalls  int
+
+	// auditReadCalls counts GET /audit hits. auditEntriesAfterReads gates when
+	// the entries become visible: they are hidden until auditReadCalls exceeds
+	// it (0 == visible from the first read). This lets a test hide an entry at
+	// the fast-path read yet reveal it at the backstop / a later poll tick, so
+	// the backstop's final-read-wins branch is actually driven.
+	auditReadCalls         int
+	auditEntriesAfterReads int
+	// auditStatuses is a queue of HTTP statuses for successive audit GETs
+	// (default 200 when exhausted) — a test injects a transient 500 to drive
+	// the poll loop's "keep polling on a transient transport error" branch.
+	auditStatuses []int
 }
 
 func (fb *mergeRunFakeBackend) runState() string {
@@ -117,13 +129,25 @@ func newMergeRunFakeBackend(t *testing.T, fb *mergeRunFakeBackend) *httptest.Ser
 			since, _ = strconv.ParseInt(s, 10, 64)
 		}
 		fb.mu.Lock()
+		fb.auditReadCalls++
+		status := http.StatusOK
+		if fb.auditReadCalls <= len(fb.auditStatuses) {
+			status = fb.auditStatuses[fb.auditReadCalls-1]
+		}
+		visible := fb.auditReadCalls > fb.auditEntriesAfterReads
 		matches := make([]AuditEntry, 0, len(fb.auditEntries))
-		for _, e := range fb.auditEntries {
-			if e.Category == category && e.Sequence > since {
-				matches = append(matches, e)
+		if visible {
+			for _, e := range fb.auditEntries {
+				if e.Category == category && e.Sequence > since {
+					matches = append(matches, e)
+				}
 			}
 		}
 		fb.mu.Unlock()
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			return
+		}
 		sort.Slice(matches, func(i, j int) bool { return matches[i].Sequence < matches[j].Sequence })
 		if len(matches) > 1 {
 			matches = matches[:1] // the tool passes Limit=1
@@ -257,6 +281,111 @@ func TestMergeRun_RunTerminal_Backstop(t *testing.T) {
 	}
 	if !strings.Contains(out.Message, "cancelled") {
 		t.Errorf("message = %q, want it to name the terminal state", out.Message)
+	}
+}
+
+// TestMergeRun_SucceededRun_AwaitsQueuedMerge pins the correctness fix: a
+// normal succeeded_pr_open run (feature_change is terminal-on-succeeded, PR
+// not yet merged) must AWAIT its queued merge, not resolve run_terminal the
+// instant the POST returns. succeeded predates the verdict anchor and no
+// pr_merged entry has landed yet, so with the backstop no longer arming on
+// succeeded the bounded await resolves timeout (resumable), never
+// run_terminal.
+func TestMergeRun_SucceededRun_AwaitsQueuedMerge(t *testing.T) {
+	fb := &mergeRunFakeBackend{
+		prURL:            "https://github.com/x/y/pull/7",
+		stateBeforeMerge: "succeeded", // already terminal-on-succeeded; merge still queued
+		stateAfterMerge:  "succeeded",
+		mergeResp:        MergeRunResult{MergeQueued: true, VerdictSequence: 5},
+		auditEntries:     nil, // the merge webhook has not landed yet
+	}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+
+	_, out, err := r.mergeRun(ctx, nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+	if err != nil {
+		t.Fatalf("mergeRun: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("status = %q, want timeout — a succeeded run must await its queued merge, not resolve run_terminal", out.Status)
+	}
+	if out.NextAction != nil {
+		t.Errorf("next_action = %+v, want nil on timeout", out.NextAction)
+	}
+	if !out.VerdictRecorded || !out.MergeQueued {
+		t.Errorf("verdict flags = recorded:%v queued:%v, want both true", out.VerdictRecorded, out.MergeQueued)
+	}
+}
+
+// TestMergeRun_Backstop_FinalReadWins drives the backstop's final-read-wins
+// branch: the run flips FAILED while a pr_merged entry lands in the SAME
+// window (hidden at the fast-path read, visible at the backstop's final
+// read). The entry must win — status merged, not run_terminal — so a merge
+// that actually settled is never reported as stranded.
+func TestMergeRun_Backstop_FinalReadWins(t *testing.T) {
+	fb := &mergeRunFakeBackend{
+		prURL:                  "https://github.com/x/y/pull/7",
+		stateBeforeMerge:       "running",
+		stateAfterMerge:        "failed", // failed arms the backstop
+		mergeResp:              MergeRunResult{MergeQueued: true, VerdictSequence: 5},
+		auditEntries:           []AuditEntry{{Category: "pr_merged", Sequence: 6}},
+		auditEntriesAfterReads: 1, // hidden at fast-path read #1, visible at backstop read #2
+	}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv)
+
+	_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+	if err != nil {
+		t.Fatalf("mergeRun: %v", err)
+	}
+	if out.Status != "merged" {
+		t.Fatalf("status = %q, want merged — the entry that landed at the terminal transition must win over the backstop", out.Status)
+	}
+	if out.RunState != "failed" {
+		t.Errorf("run_state = %q, want failed (the run flipped terminal as the merge settled)", out.RunState)
+	}
+	if out.NextAction == nil || out.NextAction.Action != "post_merge" {
+		t.Errorf("next_action = %+v, want the surfaced post_merge step on merged", out.NextAction)
+	}
+}
+
+// TestMergeRun_PollLoop_TransientAuditError drives the poll loop's
+// keep-polling-on-transient-transport-error branch: an audit read fails (500)
+// with the poll deadline still live, so the loop continues rather than
+// aborting, and the next tick's read settles the merge.
+func TestMergeRun_PollLoop_TransientAuditError(t *testing.T) {
+	fb := &mergeRunFakeBackend{
+		prURL:            "https://github.com/x/y/pull/7",
+		stateBeforeMerge: "running",
+		stateAfterMerge:  "succeeded", // never arms the backstop; the only exits are the entry or timeout
+		mergeResp:        MergeRunResult{MergeQueued: true, VerdictSequence: 5},
+		auditEntries:     []AuditEntry{{Category: "pr_merged", Sequence: 6}},
+		// read #1 (fast path) 200-empty, read #2 (first poll tick) 500 → continue,
+		// read #3 (next tick) 200 with the entry now visible → merged.
+		auditStatuses:          []int{http.StatusOK, http.StatusInternalServerError},
+		auditEntriesAfterReads: 2,
+	}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, out, err := r.mergeRun(ctx, nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+	if err != nil {
+		t.Fatalf("mergeRun: %v", err)
+	}
+	if out.Status != "merged" {
+		t.Fatalf("status = %q, want merged — a transient audit-read error must keep polling, not abort", out.Status)
+	}
+	fb.mu.Lock()
+	reads := fb.auditReadCalls
+	fb.mu.Unlock()
+	if reads < 3 {
+		t.Errorf("audit reads = %d, want >= 3 (fast-path empty, transient 500, then the settling read)", reads)
 	}
 }
 
