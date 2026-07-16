@@ -151,10 +151,14 @@ func TestHarden_GroupKillReapsGrandchild(t *testing.T) {
 		t.Errorf("Output took %s — the group kill should close the pipe at the deadline, not wait the 10s grace", elapsed)
 	}
 
-	// The in-group grandchild must have been reaped by the group SIGKILL.
+	// The in-group grandchild must have been reaped by the group SIGKILL. This
+	// is a reap-liveness wait (kernel signal delivery), NOT the kill-latency
+	// asserted above: raised to the shared 30s liveness base and scaled to match
+	// the claudecode/codex copies, so a loaded runner slow to reap does not fatal
+	// spuriously.
 	gcPid := readPidWhenReady(t, pidfile)
 	gone := false
-	for deadline := time.Now().Add(timescale.D(3 * time.Second)); time.Now().Before(deadline); {
+	for deadline := time.Now().Add(timescale.D(30 * time.Second)); time.Now().Before(deadline); {
 		if !pidAlive(gcPid) {
 			gone = true
 			break
