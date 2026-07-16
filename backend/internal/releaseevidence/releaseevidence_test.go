@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/cost"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
@@ -499,7 +500,7 @@ func TestGitHubResolver_DedupByPRNumber(t *testing.T) {
 		HTTP:    &http.Client{Timeout: 5 * time.Second},
 		AppJWT:  func() (string, error) { return "ghs_app_jwt", nil },
 	}
-	resolver := &releaseevidence.GitHubResolver{Client: client, InstallationID: 7}
+	resolver := &releaseevidence.GitHubResolver{Client: client, Scope: forge.FromGitHubInstallationID(7)}
 	prs, err := resolver.MergedPRsInRange(context.Background(), "x/y", "v0", "HEAD")
 	if err != nil {
 		t.Fatalf("MergedPRsInRange: %v", err)
@@ -521,7 +522,7 @@ func TestGitHubResolver_DedupByPRNumber(t *testing.T) {
 // repo string that is not owner/name errors before any GitHub call (the
 // Client is never touched).
 func TestGitHubResolver_BadRepo(t *testing.T) {
-	resolver := &releaseevidence.GitHubResolver{Client: nil, InstallationID: 7}
+	resolver := &releaseevidence.GitHubResolver{Client: nil, Scope: forge.FromGitHubInstallationID(7)}
 	for _, bad := range []string{"noslash", "", "a/b/c", "/name", "owner/"} {
 		if _, err := resolver.MergedPRsInRange(context.Background(), bad, "v0", "HEAD"); err == nil {
 			t.Errorf("MergedPRsInRange(%q) returned nil error, want a parse error", bad)

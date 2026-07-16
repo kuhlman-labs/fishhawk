@@ -43,6 +43,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -84,7 +85,7 @@ const (
 // ReactionLister is the slice of githubclient.Client the worker
 // uses. Tests inject a stub that returns canned reaction lists.
 type ReactionLister interface {
-	ListIssueCommentReactions(ctx context.Context, installationID int64, repo githubclient.RepoRef, commentID int64) ([]githubclient.IssueCommentReaction, error)
+	ListIssueCommentReactionsScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, commentID int64) ([]githubclient.IssueCommentReaction, error)
 }
 
 // Ticker scans the runs that have a plan comment awaiting approval
@@ -271,7 +272,7 @@ func (t *Ticker) pollStage(ctx context.Context, logger *slog.Logger, now time.Ti
 		return false
 	}
 
-	reactions, err := t.Reactions.ListIssueCommentReactions(ctx, *runRow.InstallationID, repo, commentID)
+	reactions, err := t.Reactions.ListIssueCommentReactionsScoped(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, commentID)
 	if err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "reactionpoller: list reactions failed",
 			slog.String("run_id", s.RunID.String()),

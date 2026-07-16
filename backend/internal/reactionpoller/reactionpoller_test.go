@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -153,7 +154,7 @@ type fakeReactions struct {
 	listErr   error
 }
 
-func (f *fakeReactions) ListIssueCommentReactions(_ context.Context, _ int64, _ githubclient.RepoRef, commentID int64) ([]githubclient.IssueCommentReaction, error) {
+func (f *fakeReactions) ListIssueCommentReactionsScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, commentID int64) ([]githubclient.IssueCommentReaction, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++

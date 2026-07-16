@@ -15,6 +15,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -1206,8 +1207,8 @@ func TestDispatchDecomposedChildren_GitHubActions_FiresPerChildDispatch(t *testi
 		if call.Ref != o.DefaultRef {
 			t.Errorf("call %d Ref = %q, want %q (the base each slice cuts from)", i, call.Ref, o.DefaultRef)
 		}
-		if call.InstallationID != 42 {
-			t.Errorf("call %d InstallationID = %d, want 42", i, call.InstallationID)
+		if call.Scope != forge.FromGitHubInstallationID(42) {
+			t.Errorf("call %d Scope = %v, want scope for installation 42", i, call.Scope)
 		}
 		runID := call.Inputs["run_id"]
 		stageID := call.Inputs["stage_id"]

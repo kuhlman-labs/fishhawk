@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -96,7 +97,7 @@ type stubPoller struct {
 	lastCorrelation map[string]string
 }
 
-func (s *stubPoller) GetWorkflowRun(_ context.Context, _ int64, _ githubclient.RepoRef, _ int64) (*githubclient.WorkflowRun, error) {
+func (s *stubPoller) GetWorkflowRunScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int64) (*githubclient.WorkflowRun, error) {
 	s.getCalls++
 	if s.getErr != nil {
 		return nil, s.getErr
@@ -104,7 +105,7 @@ func (s *stubPoller) GetWorkflowRun(_ context.Context, _ int64, _ githubclient.R
 	return s.get, nil
 }
 
-func (s *stubPoller) ResolveDispatchedRun(_ context.Context, _ int64, _ githubclient.RepoRef, _ string, correlation map[string]string, _ time.Time) (*githubclient.WorkflowRun, error) {
+func (s *stubPoller) ResolveDispatchedRunScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ string, correlation map[string]string, _ time.Time) (*githubclient.WorkflowRun, error) {
 	s.resolveCalls++
 	s.lastCorrelation = correlation
 	if s.resolveErr != nil {

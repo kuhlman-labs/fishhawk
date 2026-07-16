@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -58,7 +59,7 @@ type stubPRGetter struct {
 	calls int
 }
 
-func (s *stubPRGetter) GetPullRequest(_ context.Context, _ int64, _ githubclient.RepoRef, _ int) (*githubclient.PullRequest, error) {
+func (s *stubPRGetter) GetPullRequestScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int) (*githubclient.PullRequest, error) {
 	s.calls++
 	if s.err != nil {
 		return nil, s.err

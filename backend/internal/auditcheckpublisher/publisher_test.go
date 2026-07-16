@@ -15,6 +15,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
@@ -59,8 +60,8 @@ func TestPublish_Pass_PostsCompletedSuccess(t *testing.T) {
 	if c.repo.Owner != "x" || c.repo.Name != "y" {
 		t.Errorf("repo = %+v", c.repo)
 	}
-	if c.installationID != 42 {
-		t.Errorf("installationID = %d", c.installationID)
+	if c.scope != forge.FromGitHubInstallationID(42) {
+		t.Errorf("scope = %v, want scope for installation 42", c.scope)
 	}
 	if c.params.Name != auditcheckpublisher.CheckName {
 		t.Errorf("name = %q", c.params.Name)
@@ -1039,9 +1040,9 @@ func prArtifact(stageID uuid.UUID, headSHA string) *artifact.Artifact {
 // --- fakes ---
 
 type checkRunCall struct {
-	installationID int64
-	repo           githubclient.RepoRef
-	params         githubclient.CreateCheckRunParams
+	scope  forge.CredentialScope
+	repo   githubclient.RepoRef
+	params githubclient.CreateCheckRunParams
 }
 
 type fakeGitHub struct {
@@ -1050,10 +1051,10 @@ type fakeGitHub struct {
 	err   error
 }
 
-func (f *fakeGitHub) CreateCheckRun(_ context.Context, installationID int64, repo githubclient.RepoRef, p githubclient.CreateCheckRunParams) (*githubclient.CreateCheckRunResult, error) {
+func (f *fakeGitHub) CreateCheckRunScoped(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateCheckRunParams) (*githubclient.CreateCheckRunResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, checkRunCall{installationID: installationID, repo: repo, params: p})
+	f.calls = append(f.calls, checkRunCall{scope: scope, repo: repo, params: p})
 	if f.err != nil {
 		return nil, f.err
 	}

@@ -27,6 +27,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
@@ -5569,7 +5570,7 @@ func (r *pageClassRecorder) NotifySlashApprovalReply(_ context.Context, _ issuec
 	return nil
 }
 
-func (r *pageClassRecorder) NotifyRunRejected(_ context.Context, _ string, _ int64, _ int, _, _ string) error {
+func (r *pageClassRecorder) NotifyRunRejected(_ context.Context, _ string, _ forge.CredentialScope, _ int, _, _ string) error {
 	return nil
 }
 

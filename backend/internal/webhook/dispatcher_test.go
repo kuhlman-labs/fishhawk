@@ -19,6 +19,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/onboarding"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -756,7 +757,7 @@ type stubGitHub struct {
 	rulesetsBranch string
 }
 
-func (s *stubGitHub) GetWorkflowSpec(_ context.Context, _ int64,
+func (s *stubGitHub) GetWorkflowSpecScoped(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, _ string) (*githubclient.FileContent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -767,7 +768,7 @@ func (s *stubGitHub) GetWorkflowSpec(_ context.Context, _ int64,
 	return &githubclient.FileContent{Content: s.specContent, SHA: s.specSHA}, nil
 }
 
-func (s *stubGitHub) DispatchWorkflow(_ context.Context, _ int64,
+func (s *stubGitHub) DispatchWorkflowScoped(_ context.Context, _ forge.CredentialScope,
 	repo githubclient.RepoRef, file, ref string, args githubclient.DispatchInputs) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -779,7 +780,7 @@ func (s *stubGitHub) DispatchWorkflow(_ context.Context, _ int64,
 	return s.dispatchErr
 }
 
-func (s *stubGitHub) GetWorkflowRun(_ context.Context, _ int64,
+func (s *stubGitHub) GetWorkflowRunScoped(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, runID int64) (*githubclient.WorkflowRun, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -791,7 +792,7 @@ func (s *stubGitHub) GetWorkflowRun(_ context.Context, _ int64,
 	return s.workflowRun, nil
 }
 
-func (s *stubGitHub) GetBranchProtection(_ context.Context, _ int64,
+func (s *stubGitHub) GetBranchProtectionScoped(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, _ string) (*githubclient.BranchProtection, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -805,7 +806,7 @@ func (s *stubGitHub) GetBranchProtection(_ context.Context, _ int64,
 	return &githubclient.BranchProtection{}, nil
 }
 
-func (s *stubGitHub) ListRulesetRequiredChecks(_ context.Context, _ int64,
+func (s *stubGitHub) ListRulesetRequiredChecksScoped(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, branch string) ([]githubclient.RulesetRequiredCheck, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1309,8 +1310,8 @@ func TestHandle_PlanReviewerGuard(t *testing.T) {
 				if c.repo != "kuhlman-labs/fishhawk" {
 					t.Errorf("reject comment repo = %q, want kuhlman-labs/fishhawk", c.repo)
 				}
-				if c.installationID != 42 {
-					t.Errorf("reject comment installationID = %d, want 42", c.installationID)
+				if c.scope != forge.FromGitHubInstallationID(42) {
+					t.Errorf("reject comment scope = %v, want scope for installation 42", c.scope)
 				}
 				if c.issueNumber != 1247 {
 					t.Errorf("reject comment issueNumber = %d, want 1247", c.issueNumber)
@@ -2236,19 +2237,19 @@ type stubIssueNotifier struct {
 // stubRunRejectedCall records a NotifyRunRejected invocation for the
 // #599 plan-reviewer-guard tests.
 type stubRunRejectedCall struct {
-	repo           string
-	installationID int64
-	issueNumber    int
-	workflowID     string
-	stageID        string
+	repo        string
+	scope       forge.CredentialScope
+	issueNumber int
+	workflowID  string
+	stageID     string
 }
 
 func (s *stubIssueNotifier) NotifyRunRejected(_ context.Context, repo string,
-	installationID int64, issueNumber int, workflowID, stageID string) error {
+	scope forge.CredentialScope, issueNumber int, workflowID, stageID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rejectCalls = append(s.rejectCalls, stubRunRejectedCall{
-		repo: repo, installationID: installationID, issueNumber: issueNumber,
+		repo: repo, scope: scope, issueNumber: issueNumber,
 		workflowID: workflowID, stageID: stageID,
 	})
 	return s.err
@@ -3216,7 +3217,7 @@ type stubScaffolder struct {
 	errRepo string // when set, only this repo's name errors
 }
 
-func (s *stubScaffolder) OpenScaffoldPR(_ context.Context, _ int64,
+func (s *stubScaffolder) OpenScaffoldPR(_ context.Context, _ forge.CredentialScope,
 	repo githubclient.RepoRef) (*onboarding.Result, error) {
 	s.calls = append(s.calls, repo)
 	if s.errRepo != "" && repo.Name == s.errRepo {

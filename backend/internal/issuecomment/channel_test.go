@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -59,7 +60,7 @@ func (c *recordingChannel) NotifySlashApprovalReply(_ context.Context, _ SlashAp
 	return c.err
 }
 
-func (c *recordingChannel) NotifyRunRejected(_ context.Context, _ string, _ int64, _ int, _, _ string) error {
+func (c *recordingChannel) NotifyRunRejected(_ context.Context, _ string, _ forge.CredentialScope, _ int, _, _ string) error {
 	c.runRejected++
 	return c.err
 }
@@ -93,7 +94,7 @@ func TestRouter_FansOutEverySurface(t *testing.T) {
 	if err := r.NotifySlashApprovalReply(ctx, SlashApprovalReply{}); err != nil {
 		t.Fatalf("NotifySlashApprovalReply: %v", err)
 	}
-	if err := r.NotifyRunRejected(ctx, "x/y", 1, 2, "wf", "stage"); err != nil {
+	if err := r.NotifyRunRejected(ctx, "x/y", forge.FromGitHubInstallationID(1), 2, "wf", "stage"); err != nil {
 		t.Fatalf("NotifyRunRejected: %v", err)
 	}
 

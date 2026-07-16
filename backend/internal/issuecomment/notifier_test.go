@@ -15,6 +15,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/latency"
@@ -1300,7 +1301,7 @@ func TestNotify_NilReceiver_NoOp(t *testing.T) {
 	}); err != nil {
 		t.Errorf("nil reply should be a no-op; got %v", err)
 	}
-	if err := n.NotifyRunRejected(context.Background(), "x/y", 1, 1, "feature_change", "plan"); err != nil {
+	if err := n.NotifyRunRejected(context.Background(), "x/y", forge.FromGitHubInstallationID(1), 1, "feature_change", "plan"); err != nil {
 		t.Errorf("nil run-rejected should be a no-op; got %v", err)
 	}
 }
@@ -1319,7 +1320,7 @@ func TestNotifyRunRejected_PostsExplanation(t *testing.T) {
 		ExternalURL: "https://app.fishhawk.example.com",
 	})
 
-	if err := n.NotifyRunRejected(context.Background(), "kuhlman-labs/fishhawk", 42, 1247,
+	if err := n.NotifyRunRejected(context.Background(), "kuhlman-labs/fishhawk", forge.FromGitHubInstallationID(42), 1247,
 		"feature_change", "plan"); err != nil {
 		t.Fatal(err)
 	}
@@ -1327,8 +1328,8 @@ func TestNotifyRunRejected_PostsExplanation(t *testing.T) {
 		t.Fatalf("expected 1 comment; got %d", len(gh.calls))
 	}
 	call := gh.calls[0]
-	if call.installationID != 42 {
-		t.Errorf("installationID = %d, want 42", call.installationID)
+	if call.scope != forge.FromGitHubInstallationID(42) {
+		t.Errorf("scope = %v, want scope for installation 42", call.scope)
 	}
 	if call.issueNumber != 1247 {
 		t.Errorf("issueNumber = %d, want 1247", call.issueNumber)
@@ -1345,7 +1346,7 @@ func TestNotifyRunRejected_PostsExplanation(t *testing.T) {
 	}
 
 	// Not deduped: a second refusal posts again.
-	if err := n.NotifyRunRejected(context.Background(), "kuhlman-labs/fishhawk", 42, 1247,
+	if err := n.NotifyRunRejected(context.Background(), "kuhlman-labs/fishhawk", forge.FromGitHubInstallationID(42), 1247,
 		"feature_change", "plan"); err != nil {
 		t.Fatal(err)
 	}
@@ -1366,18 +1367,18 @@ func TestNotifyRunRejected_SkipsBadParams(t *testing.T) {
 		ExternalURL: "https://app.fishhawk.example.com",
 	})
 	cases := []struct {
-		name           string
-		repo           string
-		installationID int64
-		issueNumber    int
+		name        string
+		repo        string
+		scope       forge.CredentialScope
+		issueNumber int
 	}{
-		{"zero issue", "x/y", 99, 0},
-		{"zero installation", "x/y", 0, 1},
-		{"malformed repo", "no-slash", 99, 1},
+		{"zero issue", "x/y", forge.FromGitHubInstallationID(99), 0},
+		{"zero installation", "x/y", forge.CredentialScope{}, 1},
+		{"malformed repo", "no-slash", forge.FromGitHubInstallationID(99), 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := n.NotifyRunRejected(context.Background(), tc.repo, tc.installationID,
+			if err := n.NotifyRunRejected(context.Background(), tc.repo, tc.scope,
 				tc.issueNumber, "feature_change", "plan"); err != nil {
 				t.Errorf("expected nil; got %v", err)
 			}
@@ -1423,25 +1424,25 @@ func ptrStr(s string) *string { return &s }
 // --- fakes ---
 
 type ghCommentCall struct {
-	installationID int64
-	repo           githubclient.RepoRef
-	issueNumber    int
-	body           string
+	scope       forge.CredentialScope
+	repo        githubclient.RepoRef
+	issueNumber int
+	body        string
 }
 
 type ghUpdateCommentCall struct {
-	installationID int64
-	repo           githubclient.RepoRef
-	commentID      int64
-	body           string
+	scope     forge.CredentialScope
+	repo      githubclient.RepoRef
+	commentID int64
+	body      string
 }
 
 type ghReviewCall struct {
-	installationID int64
-	repo           githubclient.RepoRef
-	prNumber       int
-	event          string
-	body           string
+	scope    forge.CredentialScope
+	repo     githubclient.RepoRef
+	prNumber int
+	event    string
+	body     string
 }
 
 type fakeGitHub struct {
@@ -1472,29 +1473,29 @@ type fakeGitHub struct {
 	listCalls []ghListCommentsCall
 }
 
-// ghListCommentsCall records one ListIssueComments invocation.
+// ghListCommentsCall records one ListIssueCommentsScoped invocation.
 type ghListCommentsCall struct {
-	installationID int64
-	repo           githubclient.RepoRef
-	number         int
+	scope  forge.CredentialScope
+	repo   githubclient.RepoRef
+	number int
 }
 
-// ListIssueComments returns the seeded comment thread (or listErr), recording
+// ListIssueCommentsScoped returns the seeded comment thread (or listErr), recording
 // the call. Backs the orphan-rediscovery fallback (#1793).
-func (f *fakeGitHub) ListIssueComments(_ context.Context, installationID int64, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error) {
+func (f *fakeGitHub) ListIssueCommentsScoped(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.listCalls = append(f.listCalls, ghListCommentsCall{installationID: installationID, repo: repo, number: number})
+	f.listCalls = append(f.listCalls, ghListCommentsCall{scope: scope, repo: repo, number: number})
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
 	return f.listComments, nil
 }
 
-func (f *fakeGitHub) CreateIssueComment(_ context.Context, installationID int64, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
+func (f *fakeGitHub) CreateIssueCommentScoped(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, ghCommentCall{installationID: installationID, repo: repo, issueNumber: issueNumber, body: body})
+	f.calls = append(f.calls, ghCommentCall{scope: scope, repo: repo, issueNumber: issueNumber, body: body})
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -1512,12 +1513,12 @@ func (f *fakeGitHub) CreateIssueComment(_ context.Context, installationID int64,
 	}, nil
 }
 
-// UpdateIssueComment records the edit call alongside the existing
+// UpdateIssueCommentScoped records the edit call alongside the existing
 // create-call log. Status-comment tests assert on both surfaces.
-func (f *fakeGitHub) UpdateIssueComment(_ context.Context, installationID int64, repo githubclient.RepoRef, commentID int64, body string) (*githubclient.IssueComment, error) {
+func (f *fakeGitHub) UpdateIssueCommentScoped(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, commentID int64, body string) (*githubclient.IssueComment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.updateCalls = append(f.updateCalls, ghUpdateCommentCall{installationID: installationID, repo: repo, commentID: commentID, body: body})
+	f.updateCalls = append(f.updateCalls, ghUpdateCommentCall{scope: scope, repo: repo, commentID: commentID, body: body})
 	if f.updateErr != nil {
 		return nil, f.updateErr
 	}
@@ -1528,13 +1529,13 @@ func (f *fakeGitHub) UpdateIssueComment(_ context.Context, installationID int64,
 	}, nil
 }
 
-// CreateReview records the advisory PR-review call. Returns a deterministic
+// CreateReviewScoped records the advisory PR-review call. Returns a deterministic
 // review id from the call index so tests can predict it.
-func (f *fakeGitHub) CreateReview(_ context.Context, installationID int64, repo githubclient.RepoRef, prNumber int, params githubclient.CreateReviewParams) (*githubclient.CreateReviewResult, error) {
+func (f *fakeGitHub) CreateReviewScoped(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, prNumber int, params githubclient.CreateReviewParams) (*githubclient.CreateReviewResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reviewCalls = append(f.reviewCalls, ghReviewCall{
-		installationID: installationID, repo: repo, prNumber: prNumber,
+		scope: scope, repo: repo, prNumber: prNumber,
 		event: params.Event, body: params.Body,
 	})
 	if f.reviewErr != nil {

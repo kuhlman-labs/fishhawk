@@ -73,6 +73,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -95,7 +96,7 @@ const boardHealEvent = "pr_opened"
 // Satisfied by *githubclient.Client. Tests inject a stub returning
 // canned PR states.
 type PRGetter interface {
-	GetPullRequest(ctx context.Context, installationID int64, repo githubclient.RepoRef, number int) (*githubclient.PullRequest, error)
+	GetPullRequestScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) (*githubclient.PullRequest, error)
 }
 
 // Resolver resolves a run's review stage from the poll's terminal PR
@@ -366,7 +367,7 @@ func (t *Ticker) reconcileStage(ctx context.Context, logger *slog.Logger, s *run
 		t.AuditCheckRepublisher.RepublishAuditCheck(ctx, s.RunID)
 	}
 
-	pr, err := t.PRGetter.GetPullRequest(ctx, *runRow.InstallationID, repo, number)
+	pr, err := t.PRGetter.GetPullRequestScoped(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, number)
 	if err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "mergereconciler: get pull request failed",
 			slog.String("run_id", s.RunID.String()),

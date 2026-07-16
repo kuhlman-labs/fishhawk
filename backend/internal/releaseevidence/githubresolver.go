@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 )
 
@@ -14,8 +15,8 @@ import (
 // de-duped by PR number. The pgtest assembly tests fake the resolver;
 // this is the only wiring that touches GitHub.
 type GitHubResolver struct {
-	Client         *githubclient.Client
-	InstallationID int64
+	Client *githubclient.Client
+	Scope  forge.CredentialScope
 }
 
 // MergedPRsInRange resolves the merged PRs whose landing commits fall in
@@ -30,14 +31,14 @@ func (g *GitHubResolver) MergedPRsInRange(ctx context.Context, repo, base, head 
 	if err != nil {
 		return nil, err
 	}
-	shas, err := g.Client.CompareCommits(ctx, g.InstallationID, ref, base, head)
+	shas, err := g.Client.CompareCommitsScoped(ctx, g.Scope, ref, base, head)
 	if err != nil {
 		return nil, err
 	}
 	seen := make(map[int]struct{})
 	var out []MergedPR
 	for _, sha := range shas {
-		prs, err := g.Client.ListPullRequestsForCommit(ctx, g.InstallationID, ref, sha)
+		prs, err := g.Client.ListPullRequestsForCommitScoped(ctx, g.Scope, ref, sha)
 		if err != nil {
 			return nil, err
 		}

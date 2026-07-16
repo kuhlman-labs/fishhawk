@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -280,10 +281,10 @@ func TestNotifyPlanReady_NoPlanArtifact_SkipsCleanly(t *testing.T) {
 // --- helpers ---
 
 type commentCall struct {
-	installationID int64
-	repo           githubclient.RepoRef
-	issueNumber    int
-	body           string
+	scope       forge.CredentialScope
+	repo        githubclient.RepoRef
+	issueNumber int
+	body        string
 }
 
 type commentRecorder struct {
@@ -301,30 +302,30 @@ func (c *commentRecorder) calls() []commentCall {
 	return out
 }
 
-func (c *commentRecorder) CreateIssueComment(_ context.Context, installationID int64, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
+func (c *commentRecorder) CreateIssueCommentScoped(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.stored = append(c.stored, commentCall{installationID: installationID, repo: repo, issueNumber: issueNumber, body: body})
+	c.stored = append(c.stored, commentCall{scope: scope, repo: repo, issueNumber: issueNumber, body: body})
 	return &githubclient.IssueComment{ID: int64(len(c.stored)), Body: body}, nil
 }
 
-// UpdateIssueComment is a stub for the IssueCommenter interface
+// UpdateIssueCommentScoped is a stub for the IssueCommenter interface
 // extension landed in #328. trace_plannotify tests don't exercise
 // the update path; returning a happy response keeps the interface
 // satisfied without changing the test surface.
-func (c *commentRecorder) UpdateIssueComment(_ context.Context, _ int64, _ githubclient.RepoRef, commentID int64, body string) (*githubclient.IssueComment, error) {
+func (c *commentRecorder) UpdateIssueCommentScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, commentID int64, body string) (*githubclient.IssueComment, error) {
 	return &githubclient.IssueComment{ID: commentID, Body: body}, nil
 }
 
-// CreateReview is a no-op stub for the IssueCommenter interface extension
+// CreateReviewScoped is a no-op stub for the IssueCommenter interface extension
 // landed in #1785 (advisory COMMENT-type PR reviews). trace_plannotify tests
 // don't exercise the PR-review path; a happy response keeps the interface
 // satisfied without changing the test surface.
-func (c *commentRecorder) CreateReview(_ context.Context, _ int64, _ githubclient.RepoRef, _ int, _ githubclient.CreateReviewParams) (*githubclient.CreateReviewResult, error) {
+func (c *commentRecorder) CreateReviewScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int, _ githubclient.CreateReviewParams) (*githubclient.CreateReviewResult, error) {
 	return &githubclient.CreateReviewResult{}, nil
 }
 
-func (c *commentRecorder) ListIssueComments(_ context.Context, _ int64, _ githubclient.RepoRef, _ int) ([]githubclient.FetchedIssueComment, error) {
+func (c *commentRecorder) ListIssueCommentsScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int) ([]githubclient.FetchedIssueComment, error) {
 	return nil, nil
 }
 

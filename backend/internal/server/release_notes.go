@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/releaseevidence"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/releasenotes"
@@ -302,7 +303,7 @@ func (s *Server) resolveMergedPRResolver(ctx context.Context, repo string) (rele
 			details: map[string]any{"error": err.Error()},
 		}
 	}
-	return &releaseevidence.GitHubResolver{Client: s.cfg.GitHub, InstallationID: instID}, nil
+	return &releaseevidence.GitHubResolver{Client: s.cfg.GitHub, Scope: forge.FromGitHubInstallationID(instID)}, nil
 }
 
 // firstMissingReleaseParam returns the name of the first empty required
