@@ -40,6 +40,79 @@ func seedFixupNoChangesAudit(fb *fakeBackend, runID, stageID uuid.UUID) {
 	fb.mu.Unlock()
 }
 
+// seedDispatchReaperFailedAudit appends a dispatch_reaper_failed audit entry
+// keyed to stageID carrying failure_category — the #1747 spawn-phase reaper
+// death signal fixupInfraRefunds pairs against a trigger window (#1957). A
+// failure_category of "C" refunds a normal pass; any other category does not.
+func seedDispatchReaperFailedAudit(fb *fakeBackend, runID, stageID uuid.UUID, failureCategory string) {
+	sid := stageID.String()
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		StageID:  &sid,
+		Category: categoryDispatchReaperFailed,
+		Payload:  map[string]any{"failure_category": failureCategory},
+	})
+	fb.mu.Unlock()
+}
+
+// seedStageFixupRecoveredAudit appends a stage_fixup_recovered audit entry keyed
+// to stageID carrying source_failure_category — the #788 post-agent-work recovery
+// death signal fixupInfraRefunds pairs against a trigger window (#1957). A
+// source_failure_category of "C" refunds a normal pass; any other does not.
+func seedStageFixupRecoveredAudit(fb *fakeBackend, runID, stageID uuid.UUID, sourceFailureCategory string) {
+	sid := stageID.String()
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		StageID:  &sid,
+		Category: categoryStageFixupRecovered,
+		Payload:  map[string]any{"source_failure_category": sourceFailureCategory},
+	})
+	fb.mu.Unlock()
+}
+
+// seedInfraSignalUnparseable appends a dispatch_reaper_failed audit entry whose
+// payload is a JSON array — it fails to decode into the failure_category struct,
+// so fixupInfraRefunds must skip it without error and never refund (#1957).
+func seedInfraSignalUnparseable(fb *fakeBackend, runID, stageID uuid.UUID) {
+	sid := stageID.String()
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		StageID:  &sid,
+		Category: categoryDispatchReaperFailed,
+		Payload:  []int{1, 2, 3},
+	})
+	fb.mu.Unlock()
+}
+
+// seedRecoveredSignalUnparseable appends a stage_fixup_recovered audit entry
+// whose payload is a JSON array — it fails to decode into the
+// source_failure_category struct, so fixupInfraRefunds must skip it without
+// error and never refund (#1957). The recovered-shape analog of
+// seedInfraSignalUnparseable, so the skip guard is exercised on BOTH signal
+// branches, not just the reaper one.
+func seedRecoveredSignalUnparseable(fb *fakeBackend, runID, stageID uuid.UUID) {
+	sid := stageID.String()
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		StageID:  &sid,
+		Category: categoryStageFixupRecovered,
+		Payload:  []int{1, 2, 3},
+	})
+	fb.mu.Unlock()
+}
+
 // seedImplementReviewedAudit appends an implement_reviewed audit entry keyed
 // to stageID carrying an approve_with_concerns verdict with n concerns — the
 // round-scoped source reviewActionHintFor counts concerns from (#860).
@@ -97,10 +170,30 @@ func TestReviewActionHintFor(t *testing.T) {
 		// fixupOnOtherStage, when true, seeds the prior passes against a
 		// DIFFERENT stage so they do not count against this one.
 		fixupOnOtherStage bool
-		wantNil           bool
-		wantConcerns      int
-		wantRemaining     int
-		wantOverride      bool
+		// infraRounds seeds that many (stage_fixup_triggered, in-window signal)
+		// PAIRS interleaved — each trigger immediately followed by one signal
+		// sequenced strictly inside its window — modelling the real per-window
+		// sequencing (#1957). Each pair counts as a RAW pass IN ADDITION to
+		// priorPasses; a category-C signal refunds one normal pass.
+		infraRounds int
+		// infraSignalKind selects the per-round signal shape: "recovered"
+		// (stage_fixup_recovered / source_failure_category) else "reaper"
+		// (dispatch_reaper_failed / failure_category, the default).
+		infraSignalKind string
+		// infraSignalCategory overrides the per-round signal's failure category
+		// (default "C"). A non-C category must NOT refund.
+		infraSignalCategory string
+		// infraSignalUnparseable seeds each per-round signal with a payload that
+		// fails to decode — skipped without error, never refunds.
+		infraSignalUnparseable bool
+		// signalBeforeFirstTrigger seeds ONE category-C reaper signal BEFORE the
+		// first trigger (an original-dispatch spawn death) — it matches no
+		// window and must never refund.
+		signalBeforeFirstTrigger bool
+		wantNil                  bool
+		wantConcerns             int
+		wantRemaining            int
+		wantOverride             bool
 		// wantMessageContains, when non-empty, asserts the hint Message
 		// contains this substring — used to pin the #1097 commit-and-vouch
 		// wording on the hard-ceiling arm.
@@ -233,6 +326,142 @@ func TestReviewActionHintFor(t *testing.T) {
 			wantOverride:      false,
 		},
 		{
+			// #1957 (a): a dispatch_reaper_failed(C) signal inside a trigger
+			// window refunds the pass against the normal budget — the surface
+			// must agree with the backend admitting a normal pass without force.
+			name:          "reaper-C in window refunds -> route-back, no override",
+			status:        completeStatus(),
+			seedConcerns:  1,
+			infraRounds:   1,
+			wantNil:       false,
+			wantConcerns:  1,
+			wantRemaining: 1,
+			wantOverride:  false,
+		},
+		{
+			// #1957 (b): a stage_fixup_recovered(C) signal inside a window
+			// refunds identically — the #788 post-agent-work delivered-nothing
+			// recovery path.
+			name:            "recovered-C in window refunds -> route-back, no override",
+			status:          completeStatus(),
+			seedConcerns:    1,
+			infraRounds:     1,
+			infraSignalKind: "recovered",
+			wantNil:         false,
+			wantConcerns:    1,
+			wantRemaining:   1,
+			wantOverride:    false,
+		},
+		{
+			// #1957 (c): a category-C signal sequenced BEFORE the first trigger
+			// (an original-dispatch spawn death, not a fix-up) matches no window
+			// and does NOT refund — budget stays spent, override available.
+			name:                     "category-C before first trigger does not refund -> override",
+			status:                   completeStatus(),
+			seedConcerns:             1,
+			priorPasses:              1,
+			signalBeforeFirstTrigger: true,
+			wantNil:                  false,
+			wantConcerns:             1,
+			wantRemaining:            0,
+			wantOverride:             true,
+		},
+		{
+			// #1957 (d): a non-C (category A) signal inside a window does NOT
+			// refund — only category C (infrastructure, delivered-nothing)
+			// refunds; agent/policy failures still consume budget.
+			name:                "category-A in window does not refund -> override",
+			status:              completeStatus(),
+			seedConcerns:        1,
+			infraRounds:         1,
+			infraSignalCategory: "A",
+			wantNil:             false,
+			wantConcerns:        1,
+			wantRemaining:       0,
+			wantOverride:        true,
+		},
+		{
+			// #1957 (e): an unparseable signal payload is skipped without error
+			// and never refunds — budget stays spent, override available.
+			name:                   "unparseable signal payload skipped -> override",
+			status:                 completeStatus(),
+			seedConcerns:           1,
+			infraRounds:            1,
+			infraSignalUnparseable: true,
+			wantNil:                false,
+			wantConcerns:           1,
+			wantRemaining:          0,
+			wantOverride:           true,
+		},
+		{
+			// #1957 (d'): the category gate guards the RECOVERED branch too,
+			// not just the reaper branch — a non-C (category A)
+			// stage_fixup_recovered signal inside a window must NOT refund.
+			// Without this, a recovered-block regression that refunded
+			// regardless of source_failure_category would still pass case (b)
+			// (recovered-C refunds) and case (d) (which only exercises the
+			// reaper branch), leaving the recovered category-gate untested.
+			name:                "recovered category-A in window does not refund -> override",
+			status:              completeStatus(),
+			seedConcerns:        1,
+			infraRounds:         1,
+			infraSignalKind:     "recovered",
+			infraSignalCategory: "A",
+			wantNil:             false,
+			wantConcerns:        1,
+			wantRemaining:       0,
+			wantOverride:        true,
+		},
+		{
+			// #1957 (e'): the unparseable-payload skip guard covers the
+			// RECOVERED branch too — an undecodable stage_fixup_recovered
+			// payload is skipped without error and never refunds, mirroring
+			// case (e) for the reaper branch.
+			name:                   "unparseable recovered signal payload skipped -> override",
+			status:                 completeStatus(),
+			seedConcerns:           1,
+			infraRounds:            1,
+			infraSignalKind:        "recovered",
+			infraSignalUnparseable: true,
+			wantNil:                false,
+			wantConcerns:           1,
+			wantRemaining:          0,
+			wantOverride:           true,
+		},
+		{
+			// #1957 (f): the SUMMED no-change + infra refund is clamped to the
+			// raw passes actually triggered, so remaining never widens past the
+			// normal budget. One infra round (raw=1, infra refund=1) plus one
+			// no-change refund => sum 2 clamped to 1 => remaining 1.
+			name:          "summed no-change + infra refund clamped to prior passes",
+			status:        completeStatus(),
+			seedConcerns:  1,
+			infraRounds:   1,
+			refunds:       1,
+			wantNil:       false,
+			wantConcerns:  1,
+			wantRemaining: 1,
+			wantOverride:  false,
+		},
+		{
+			// #1957 (g): ceiling precedence — three raw triggers each with an
+			// in-window C signal (raw=3, refunds=3). The hard-ceiling check is
+			// hoisted ahead of the normal-budget arm (matching the backend's
+			// ErrFixupCeilingReached-before-budget precedence), so even though
+			// the summed refunds leave effectiveConsumed=0, priorPasses=3 at the
+			// ceiling yields remaining=0/override=false and the ceiling message,
+			// NOT a spurious remaining normal pass.
+			name:                "raw ceiling with full refunds -> no override (ceiling precedence)",
+			status:              completeStatus(),
+			seedConcerns:        1,
+			infraRounds:         3,
+			wantNil:             false,
+			wantConcerns:        1,
+			wantRemaining:       0,
+			wantOverride:        false,
+			wantMessageContains: "fishhawk_vouch_commit",
+		},
+		{
 			// #968: a terminal run has no actionable fix-up — the server
 			// refuses with fixup_not_applicable — so the hint must suppress
 			// even when concerns remain and the ceiling has headroom (the
@@ -276,6 +505,11 @@ func TestReviewActionHintFor(t *testing.T) {
 			fb, srv := newFakeBackend(t)
 			runID := uuid.New()
 			implementStageID := uuid.New()
+			// A category-C signal sequenced BEFORE the first trigger (an
+			// original-dispatch spawn death, not a fix-up) must match no window.
+			if tc.signalBeforeFirstTrigger {
+				seedDispatchReaperFailedAudit(fb, runID, implementStageID, "C")
+			}
 			// Seed prior fix-up passes first so the latest-round concern
 			// count only includes the implement_reviewed entry seeded after.
 			for i := 0; i < tc.priorPasses; i++ {
@@ -283,6 +517,27 @@ func TestReviewActionHintFor(t *testing.T) {
 					seedFixupTriggeredAudit(fb, runID, uuid.New())
 				} else {
 					seedFixupTriggeredAudit(fb, runID, implementStageID)
+				}
+			}
+			// Interleaved infra rounds: each trigger immediately followed by a
+			// signal sequenced strictly inside its window, so the per-window
+			// pairing in fixupInfraRefunds can match it (consecutive triggers
+			// would leave no integer sequence between them).
+			infraCat := tc.infraSignalCategory
+			if infraCat == "" {
+				infraCat = "C"
+			}
+			for i := 0; i < tc.infraRounds; i++ {
+				seedFixupTriggeredAudit(fb, runID, implementStageID)
+				switch {
+				case tc.infraSignalUnparseable && tc.infraSignalKind == "recovered":
+					seedRecoveredSignalUnparseable(fb, runID, implementStageID)
+				case tc.infraSignalUnparseable:
+					seedInfraSignalUnparseable(fb, runID, implementStageID)
+				case tc.infraSignalKind == "recovered":
+					seedStageFixupRecoveredAudit(fb, runID, implementStageID, infraCat)
+				default:
+					seedDispatchReaperFailedAudit(fb, runID, implementStageID, infraCat)
 				}
 			}
 			for i := 0; i < tc.refunds; i++ {
