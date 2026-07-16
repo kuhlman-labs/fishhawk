@@ -782,6 +782,18 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 //     pre-admission sibling guard (already run) cannot re-observe. A positively
 //     observed non-dispatchable state returns a non-nil error (halt); an
 //     unreadable state degrades to the fail-open spawn.
+//
+// The post-error stage reread below (acceptanceStageState) is an EARLY-HALT
+// OPTIMIZATION, not the safety mechanism (#1936, resolving the #1935 deferral).
+// The authoritative fence is SERVER-SIDE: the host-dispatch marker CAS is
+// serialized against the admission short-circuit walk by a per-stage lock, and
+// 'dispatched' is non-admissible to the walk, so even if this client's reread
+// observes a stale pending/dispatched state during an in-flight admission it can
+// no longer double-drive — the subsequent host-dispatch marker call (which every
+// host-spawn verb issues fail-closed before spawning) blocks on that lock and
+// then fails closed on the settled stage, spawning nothing. The reread only
+// SHRINKS the window in which the client bothers to attempt a spawn at all; it is
+// no longer load-bearing for correctness.
 func (r *runResolver) maybeShortCircuitAcceptance(ctx context.Context, runID, stageID uuid.UUID) (*AcceptanceAdmissionResult, string, error) {
 	res, err := r.api.AcceptanceDispatchAdmission(ctx, stageID)
 	if err == nil {
@@ -818,6 +830,13 @@ func (r *runResolver) maybeShortCircuitAcceptance(ctx context.Context, runID, st
 // Acceptance's fail-open re-check (#1928): a mid-walk admission 500 can leave the
 // stage in a non-dispatchable intermediate state, and this is how the fail-open
 // path observes that before spawning.
+//
+// This is an EARLY-HALT optimization, NOT the double-drive safety mechanism
+// (#1936): the authoritative fence is server-side (the host-dispatch marker CAS
+// serialized against the admission walk by a per-stage lock, plus 'dispatched'
+// being non-admissible to the walk). Even a stale reread here can no longer
+// double-drive, because the subsequent fail-closed marker call blocks on that
+// lock and then 409s on the settled stage. See maybeShortCircuitAcceptance.
 func (r *runResolver) acceptanceStageState(ctx context.Context, runID, stageID uuid.UUID) (string, bool) {
 	fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

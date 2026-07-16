@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // admissionSeam bundles the fakes + ids of a plan(succ)+implement(succ)+
@@ -490,5 +492,178 @@ func TestAcceptanceAdmission_NonAcceptanceStage_422(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "validation_failed") {
 		t.Errorf("body missing validation_failed: %s", w.Body.String())
+	}
+}
+
+// blockingTransitionRepo wraps an orchestratorRepo and gates the FIRST
+// TransitionStage call on a channel (#1936). The gate signals `started` and then
+// either proceeds when `release` closes OR aborts with ctx.Err() if the caller's
+// context is cancelled first — so a walk running under a cancellable/deadlined
+// context aborts, while one running under the detached no-deadline mutation
+// context waits for the release and completes. Every non-first transition passes
+// through unblocked. Embedding promotes GetRun/GetStage/TransitionStageFrom/… so
+// the wrapper satisfies run.Repository AND the StageCASTransitioner capability.
+type blockingTransitionRepo struct {
+	*orchestratorRepo
+	once    sync.Once
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingTransitionRepo) TransitionStage(ctx context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	var gateErr error
+	b.once.Do(func() {
+		close(b.started)
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			gateErr = ctx.Err()
+		}
+	})
+	if gateErr != nil {
+		return nil, gateErr
+	}
+	return b.orchestratorRepo.TransitionStage(ctx, id, to, c)
+}
+
+// seedAdmissionRun seeds a plan(succ)+implement(succ)+review(succ)+
+// acceptance(pending) run into base and registers the plan artifact, returning
+// the run/acceptance/implement ids and the artifact repo — the shared scaffold
+// for the #1936 concurrency tests that need a custom (blocking) Runs repo rather
+// than the plain buildAdmissionSeam wiring.
+func seedAdmissionRun(t *testing.T, base *orchestratorRepo, planBytes json.RawMessage) (runID, acceptanceID, implementID uuid.UUID, ar *fakeArtifactRepo) {
+	t.Helper()
+	r := base.seedRun()
+	r.WorkflowID = "feature_change"
+	planS := base.seedStage(r.ID, 0, run.StageStateSucceeded)
+	planS.Type = run.StageTypePlan
+	impl := base.seedStage(r.ID, 1, run.StageStateSucceeded)
+	impl.Type = run.StageTypeImplement
+	rev := base.seedStage(r.ID, 2, run.StageStateSucceeded)
+	rev.Type = run.StageTypeReview
+	acc := base.seedStage(r.ID, 3, run.StageStatePending)
+	acc.Type = run.StageTypeAcceptance
+
+	ar = newFakeArtifactRepo()
+	v := "standard_v1"
+	ar.all = append(ar.all, &artifact.Artifact{
+		ID: uuid.New(), StageID: planS.ID, Kind: artifact.KindPlan,
+		SchemaVersion: &v, Content: planBytes, CreatedAt: time.Now().UTC(),
+	})
+	return r.ID, acc.ID, impl.ID, ar
+}
+
+// TestAcceptanceAdmission_DetachedWalk_SettlesDespiteSlowTransition is failure
+// mode d AND binding condition 1 (#1936): a state transition slower than the
+// handler-level walk bound must NOT abort the walk. The mutation phase runs on
+// context.WithoutCancel with NO deadline, so even after the client disconnects
+// AND the handler's own walk timeout fires, the stage still fully settles to
+// succeeded with the acceptance_outcome_recorded verdict. This is the test that
+// fails on the rejected 30s-abort design (the walk would be cancelled mid-flight).
+func TestAcceptanceAdmission_DetachedWalk_SettlesDespiteSlowTransition(t *testing.T) {
+	// Shrink the pre-mutation bound so the timeout demonstrably fires during the
+	// (blocked) transition — proving the mutation phase re-detached from it.
+	prev := acceptanceAdmissionWalkTimeout
+	acceptanceAdmissionWalkTimeout = timescale.D(100 * time.Millisecond)
+	defer func() { acceptanceAdmissionWalkTimeout = prev }()
+
+	base := newOrchestratorRepo()
+	_, acceptanceID, _, ar := seedAdmissionRun(t, base, admissionPlanBytes(t, nil, allSkipWithBasisCriteria))
+	blk := &blockingTransitionRepo{orchestratorRepo: base, started: make(chan struct{}), release: make(chan struct{})}
+	au := newAuditFake()
+	o := &orchestrator.Orchestrator{Runs: blk, Audit: au, Artifacts: ar}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: blk, AuditRepo: au, ArtifactRepo: ar, Orchestrator: o})
+
+	// A cancellable request context — a client that will disconnect mid-walk.
+	reqCtx, cancelReq := context.WithCancel(context.Background())
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/v0/stages/"+acceptanceID.String()+"/acceptance-admission", nil)
+		req.SetPathValue("stage_id", acceptanceID.String())
+		req = req.WithContext(context.WithValue(reqCtx, ctxKeyIdentity, testOperatorIdentity()))
+		w := httptest.NewRecorder()
+		s.handleAcceptanceAdmission(w, req)
+		done <- w
+	}()
+
+	// Wait until the walk reaches its first (gated) transition — past the
+	// pre-mutation reads, inside the mutation phase.
+	<-blk.started
+	// Disconnect the client AND wait well past the handler walk timeout so a
+	// deadline, if the mutation phase carried one, would already have fired.
+	cancelReq()
+	time.Sleep(2 * acceptanceAdmissionWalkTimeout)
+	// Release the slow transition; the walk must run to completion regardless.
+	close(blk.release)
+
+	w := <-done
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (walk settled despite disconnect + timeout):\n%s", w.Code, w.Body.String())
+	}
+	var resp acceptanceAdmissionResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.ShortCircuited {
+		t.Fatalf("short_circuited = false, want true (walk completed):\n%s", w.Body.String())
+	}
+	if got := base.stagesByID[acceptanceID].State; got != run.StageStateSucceeded {
+		t.Errorf("acceptance stage = %q, want succeeded (fully settled)", got)
+	}
+	if n := countByCategory(au, CategoryAcceptanceOutcomeRecorded); n != 1 {
+		t.Errorf("acceptance_outcome_recorded = %d, want 1 (verdict recorded on the detached walk)", n)
+	}
+}
+
+// TestAcceptanceAdmission_HostDispatch_SingleWriter is the cross-boundary
+// interleaving test (#1936): with an admission short-circuit walk paused
+// mid-transition (holding the per-stage lock), a concurrent host-dispatch marker
+// on the SAME stage serializes behind the lock. Exactly one writer wins — the
+// admission settles the stage (short_circuited:true) and the marker 409s — never
+// a spawned-marker success AND a short-circuit settle on the same stage.
+func TestAcceptanceAdmission_HostDispatch_SingleWriter(t *testing.T) {
+	base := newOrchestratorRepo()
+	runID, acceptanceID, _, ar := seedAdmissionRun(t, base, admissionPlanBytes(t, nil, allSkipWithBasisCriteria))
+	blk := &blockingTransitionRepo{orchestratorRepo: base, started: make(chan struct{}), release: make(chan struct{})}
+	au := newAuditFake()
+	o := &orchestrator.Orchestrator{Runs: blk, Audit: au, Artifacts: ar}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: blk, AuditRepo: au, ArtifactRepo: ar, Orchestrator: o})
+
+	// Fire the admission; it acquires the per-stage lock and blocks in the first
+	// (gated) transition, mid-walk.
+	admDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { admDone <- postAdmission(t, s, acceptanceID, testOperatorIdentity()) }()
+	<-blk.started
+
+	// Fire the host-dispatch marker concurrently; it must block on the same lock.
+	hdDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { hdDone <- postHostDispatch(t, s, runID, acceptanceID, withHostDispatchOperator) }()
+
+	// Let the walk finish; the marker unblocks and observes the settled stage.
+	close(blk.release)
+
+	admW := <-admDone
+	hdW := <-hdDone
+
+	var admResp acceptanceAdmissionResponse
+	if err := json.Unmarshal(admW.Body.Bytes(), &admResp); err != nil {
+		t.Fatalf("unmarshal admission: %v", err)
+	}
+	if admW.Code != http.StatusOK || !admResp.ShortCircuited {
+		t.Fatalf("admission = %d short_circuited=%v, want 200 short_circuited:true:\n%s", admW.Code, admResp.ShortCircuited, admW.Body.String())
+	}
+	if hdW.Code != http.StatusConflict {
+		t.Fatalf("host-dispatch = %d, want 409 dispatch_not_admissible:\n%s", hdW.Code, hdW.Body.String())
+	}
+
+	// Single-writer invariant: the marker must NOT report a successful transition
+	// alongside the admission's short-circuit settle.
+	var hdResp hostDispatchResponse
+	_ = json.Unmarshal(hdW.Body.Bytes(), &hdResp)
+	if hdResp.Transitioned && admResp.ShortCircuited {
+		t.Errorf("both writers mutated the stage: marker transitioned AND admission short-circuited")
+	}
+	if got := base.stagesByID[acceptanceID].State; got != run.StageStateSucceeded {
+		t.Errorf("acceptance stage = %q, want succeeded (the single winning writer)", got)
 	}
 }

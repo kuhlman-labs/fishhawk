@@ -1,14 +1,26 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
+
+// acceptanceAdmissionWalkTimeout bounds ONLY the pre-mutation phase of the
+// short-circuit walk — the orchestrator's admissibility reads (GetRun /
+// ListStagesForRun) and lock acquisition (#1936, binding condition 1). It is a
+// var, not a const, purely so the detached-completion test can shrink it to
+// prove that a transition slower than this bound still fully settles: once
+// TryShortCircuitAcceptance reaches its first state transition it re-detaches
+// onto context.WithoutCancel with NO deadline, so this timeout can never cancel a
+// walk mid-mutation.
+var acceptanceAdmissionWalkTimeout = 30 * time.Second
 
 // acceptanceAdmissionResponse is the 200 body of POST
 // /v0/stages/{stage_id}/acceptance-admission (#1928). ShortCircuited is the
@@ -140,7 +152,19 @@ func (s *Server) handleAcceptanceAdmission(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	sc, liveValidationRequired, err := s.cfg.Orchestrator.TryShortCircuitAcceptance(r.Context(), stage.RunID, stage.ID)
+	// Run the short-circuit under a bounded DETACHED context (binding condition 1,
+	// #1936). net/http cancels r.Context() when the client disconnects, which could
+	// otherwise abort the walk between its sequential transitions and wedge the
+	// stage at an intermediate state. context.WithoutCancel preserves the request
+	// values but drops cancellation; the WithTimeout adds a liveness bound on the
+	// PRE-mutation phase only — TryShortCircuitAcceptance re-detaches onto a
+	// no-deadline context at its point of no return, so an admission that begins its
+	// state walk always runs to completion (settle + audit + Advance). Everything
+	// before this (auth, stage load) and the post-walk refreshed-stage read keep
+	// r.Context().
+	walkCtx, cancelWalk := context.WithTimeout(context.WithoutCancel(r.Context()), acceptanceAdmissionWalkTimeout)
+	defer cancelWalk()
+	sc, liveValidationRequired, err := s.cfg.Orchestrator.TryShortCircuitAcceptance(walkCtx, stage.RunID, stage.ID)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"acceptance admission failed", map[string]any{"error": err.Error()})

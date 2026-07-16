@@ -7,11 +7,24 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
+
+// forceOrchestratorStageState directly sets a seeded stage's state under the
+// fake repo's lock, bypassing transition validation — the #1936 concurrency
+// tests use it to simulate an admission walk settling a stage to 'succeeded'
+// (an otherwise-invalid direct transition) without threading a full walk.
+func forceOrchestratorStageState(rr *orchestratorRepo, id uuid.UUID, st run.StageState) {
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	rr.stagesByID[id].State = st
+}
 
 // hostDispatchServer wires a server with the shared orchestratorRepo fake (which
 // implements the StageCASTransitioner capability, so the endpoint's production
@@ -392,5 +405,89 @@ func TestHostDispatch_CASRace_ConcurrentRunning_Conflict(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "dispatch_not_admissible") {
 		t.Errorf("body = %s, want dispatch_not_admissible", w.Body.String())
+	}
+}
+
+// TestHostDispatch_WithOrchestrator_HappyPathMarks proves the #1936 admission
+// fence does not break the normal spawn marker: with an orchestrator wired (so
+// the per-stage lock IS taken), a parked awaiting_host_dispatch stage still flips
+// to dispatched. The lock is acquired and released within the handler.
+func TestHostDispatch_WithOrchestrator_HappyPathMarks(t *testing.T) {
+	rr := newOrchestratorRepo()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateAwaitingHostDispatch)
+	o := &orchestrator.Orchestrator{Runs: rr}
+	s := New(Config{RunRepo: rr, Orchestrator: o})
+
+	w := postHostDispatch(t, s, runRow.ID, stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	resp := decodeHostDispatch(t, w)
+	if !resp.Transitioned || resp.StageState != string(run.StageStateDispatched) {
+		t.Errorf("resp = %+v, want transitioned:true dispatched", resp)
+	}
+}
+
+// TestHostDispatch_NilOrchestrator_NoLock is failure mode f: with NO orchestrator
+// wired the marker takes NO admission lock and behaves byte-identically to
+// pre-#1936. An already-'dispatched' stage returns the idempotent
+// {transitioned:false} with no blocking. (Every other host_dispatch_test.go case
+// also runs the nil-orchestrator path; this pins the no-lock contract explicitly.)
+func TestHostDispatch_NilOrchestrator_NoLock(t *testing.T) {
+	s, _, runID, stageID := hostDispatchServer(t, run.StageStateDispatched) // wires no orchestrator
+	if s.cfg.Orchestrator != nil {
+		t.Fatal("test precondition: orchestrator must be nil")
+	}
+	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	resp := decodeHostDispatch(t, w)
+	if resp.Transitioned || resp.StageState != string(run.StageStateDispatched) {
+		t.Errorf("resp = %+v, want transitioned:false dispatched (idempotent no-op, no lock)", resp)
+	}
+}
+
+// TestHostDispatch_AdmissionWalkInFlight_MarkerBlocksThen409 is failure mode b
+// (walk-wins interleaving, #1936): while an acceptance-admission short-circuit
+// walk holds the per-stage lock mid-walk (the stage transiently at the
+// walk-intermediate 'dispatched'), a concurrent host-dispatch marker must NOT
+// return the {transitioned:false} idempotent-proceed. It serializes behind the
+// lock and, once the walk settles the stage to succeeded and releases the lock,
+// returns 409 dispatch_not_admissible — so the MCP verb's fail-closed marker
+// handling spawns nothing.
+func TestHostDispatch_AdmissionWalkInFlight_MarkerBlocksThen409(t *testing.T) {
+	rr := newOrchestratorRepo()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched) // walk-intermediate
+	stage.Type = run.StageTypeAcceptance
+	o := &orchestrator.Orchestrator{Runs: rr}
+	s := New(Config{RunRepo: rr, Orchestrator: o})
+
+	// Simulate the admission walk holding the shared per-stage admission lock.
+	unlock := o.LockStageAdmission(stage.ID)
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- postHostDispatch(t, s, runRow.ID, stage.ID, withHostDispatchOperator) }()
+
+	// The marker MUST block on the lock — it cannot return {transitioned:false}
+	// from the walk-intermediate 'dispatched' state while the walk holds the lock.
+	select {
+	case w := <-done:
+		t.Fatalf("marker returned (code=%d body=%s) while the admission walk held the lock; it did not serialize behind it", w.Code, w.Body.String())
+	case <-time.After(timescale.D(150 * time.Millisecond)):
+	}
+
+	// Walk completes: the stage settles to succeeded, the lock releases.
+	forceOrchestratorStageState(rr, stage.ID, run.StageStateSucceeded)
+	unlock()
+
+	w := <-done
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 dispatch_not_admissible:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "dispatch_not_admissible") {
+		t.Errorf("body missing dispatch_not_admissible: %s", w.Body.String())
 	}
 }
