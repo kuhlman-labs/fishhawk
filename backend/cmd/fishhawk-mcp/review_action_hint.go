@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
+	"sort"
 
 	"github.com/google/uuid"
 )
@@ -53,6 +55,36 @@ const categoryPlanRevised = "plan_revised"
 // pass — the surface-vs-backend disagreement #1150 fixes.
 const categoryFixupNoChanges = "fixup_no_changes"
 
+// categoryDispatchReaperFailed mirrors backend server.CategoryDispatchReaperFailed
+// (backend/internal/server/reap_failure.go). KEEP IN SYNC: it is the audit
+// category the spawn-phase reaper writes when a fix-up re-dispatch dies on
+// infrastructure BEFORE the agent runs (the #1747 path). When such an entry
+// carries failure_category "C" inside a fix-up trigger window, the backend
+// refunds that pass against the NORMAL budget (server.countFixupInfraRefunds,
+// #1957), and the MCP layer mirrors that count so RemainingFixupBudget agrees
+// with the backend's admit decision. If the backend category drifts and this
+// constant does not, an infra-refunded pass surfaces remaining_budget=0 here
+// while the backend would admit a normal pass — the #968 hint-vs-backend
+// disagreement class.
+const categoryDispatchReaperFailed = "dispatch_reaper_failed"
+
+// categoryStageFixupRecovered mirrors backend server.CategoryStageFixupRecovered
+// (backend/internal/server/fixup.go). KEEP IN SYNC: it is the audit category
+// written when a FAILED fix-up re-dispatch is recovered back to the review gate
+// (#788). When such an entry carries source_failure_category "C" inside a fix-up
+// trigger window, the pass burned agent work but landed NOTHING on the PR branch,
+// so the backend refunds it against the NORMAL budget under the delivered-nothing
+// invariant (server.countFixupInfraRefunds, #1957); the MCP layer mirrors that
+// count. Drift here silently reintroduces the #968 hint-vs-backend disagreement.
+const categoryStageFixupRecovered = "stage_fixup_recovered"
+
+// failureCategoryC mirrors backend run.FailureC ("C", the infrastructure
+// failure category — backend/internal/run/run.go). KEEP IN SYNC: only a
+// category-C death that delivered nothing to the PR branch is refunded against
+// the normal budget (#1957). Category A (agent) and B (policy) failures still
+// consume budget, so the MCP mirror keeps only the "C" signals.
+const failureCategoryC = "C"
+
 // ReviewActionHint is a DISPLAY-ONLY next-action pointer surfaced on
 // fishhawk_get_run_status and fishhawk_run_stage when an implement review
 // has landed with unresolved approve_with_concerns concerns and the bounded
@@ -77,7 +109,7 @@ const categoryFixupNoChanges = "fixup_no_changes"
 // fresh review with no concerns).
 type ReviewActionHint struct {
 	Concerns             int    `json:"concerns" jsonschema:"number of unresolved approve_with_concerns concerns from the LATEST implement-review round (summed across reviewers; scoped to concerns that landed after the most-recent fix-up so the count is not inflated across rounds)"`
-	RemainingFixupBudget int    `json:"remaining_fixup_budget" jsonschema:"remaining NORMAL fix-up passes for the implement stage (max_passes minus prior stage_fixup_triggered entries that were NOT refunded as no-change passes); 0 once the budget is spent, restored when a prior pass produced no changes (#967)"`
+	RemainingFixupBudget int    `json:"remaining_fixup_budget" jsonschema:"remaining NORMAL fix-up passes for the implement stage (max_passes minus prior stage_fixup_triggered entries that were NOT refunded); 0 once the budget is spent, restored when a prior pass produced no changes (#967) OR died category-C without delivering anything to the PR branch (#1957)"`
 	OverrideAvailable    bool   `json:"override_available" jsonschema:"true when the NORMAL budget is spent but an operator override pass (fishhawk_fixup_stage with force_additional_pass=true) can still be granted below the hard ceiling of 3 total passes; false below budget (no override needed) and at/above the ceiling (no override left)"`
 	Message              string `json:"message" jsonschema:"one-line advisory pointer at the next action: route concerns back with fishhawk_fixup_stage vs approving to merge (below budget), the operator override vs merge-with-follow-up (budget spent, below ceiling), or merge-with-follow-up vs a fresh run (at the ceiling); display-only, never gates the run"`
 }
@@ -200,7 +232,14 @@ func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) [
 }
 
 // reviewActionHintFor computes the display-only review-action hint for a run's
-// implement stage from audit data (#777, #860). It returns nil (no hint) when:
+// implement stage from audit data (#777, #860). RemainingFixupBudget mirrors the
+// backend's widened normal budget: it discounts the SUMMED refunds the backend
+// grants — the #967 fixup_no_changes refund AND the #1957 delivered-nothing infra
+// refund (a fix-up pass that died category-C without landing anything on the PR
+// branch) — under the same defensive clamp, and the hard-ceiling check is hoisted
+// ahead of the normal-budget arm to match the backend's error precedence
+// (run.ErrFixupCeilingReached before budget exhaustion). It returns nil (no hint)
+// when:
 //
 //   - the run state is terminal (succeeded/failed/cancelled, #968): a
 //     terminal run has no actionable fix-up — the server refuses with
@@ -232,7 +271,7 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 		return nil, nil
 	}
 
-	priorPasses, latestFixupSeq, err := r.fixupPassesAndLatestSeq(ctx, runID, implementStageID)
+	priorPasses, latestFixupSeq, triggerSeqs, err := r.fixupPassesAndLatestSeq(ctx, runID, implementStageID)
 	if err != nil {
 		return nil, err
 	}
@@ -248,17 +287,32 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 		return nil, nil
 	}
 
-	// No-change refund (#967/#1150): the backend widens MaxPasses by the count
-	// of fixup_no_changes audit entries (handleFixupStage), so a refunded no-op
-	// pass is admissible WITHOUT force_additional_pass. Mirror that here so the
-	// surfaced budget agrees with the backend's admit decision. The refund only
-	// affects the NORMAL-budget arm; the hard ceiling keeps counting RAW passes.
-	refunds, err := r.fixupNoChangeRefunds(ctx, runID, implementStageID)
+	// Refunds against the NORMAL budget: the backend widens MaxPasses by the
+	// SUMMED count of two refund signals (handleFixupStage, fixup.go:461), so a
+	// refunded pass is admissible WITHOUT force_additional_pass. Mirror both here
+	// so the surfaced budget agrees with the backend's admit decision. The refund
+	// only affects the NORMAL-budget arm; the hard ceiling keeps counting RAW
+	// passes.
+	//
+	//   - #967/#1150: fixup_no_changes — a fix-up re-dispatch that produced no
+	//     commit.
+	//   - #1957: the delivered-nothing infra refund — a fix-up pass that died
+	//     category-C without landing anything on the PR branch (a
+	//     dispatch_reaper_failed with failure_category C, or a
+	//     stage_fixup_recovered with source_failure_category C, inside a trigger
+	//     window).
+	noChangeRefunds, err := r.fixupNoChangeRefunds(ctx, runID, implementStageID)
 	if err != nil {
 		return nil, err
 	}
+	infraRefunds, err := r.fixupInfraRefunds(ctx, runID, implementStageID, triggerSeqs)
+	if err != nil {
+		return nil, err
+	}
+	refunds := noChangeRefunds + infraRefunds
 	// Defensive clamp, mirroring the backend's `if refundedPasses > priorPasses`
-	// clamp: a refund can never exceed the passes actually triggered.
+	// clamp (fixup.go:462): the SUMMED refund can never exceed the passes
+	// actually triggered.
 	if refunds > priorPasses {
 		refunds = priorPasses
 	}
@@ -270,6 +324,26 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 	remaining := maxFixupPasses - effectiveConsumed
 	if remaining < 0 {
 		remaining = 0
+	}
+
+	// Hard ceiling reached: hoisted AHEAD of the normal-budget arm to match the
+	// backend's error precedence — run.ErrFixupCeilingReached is checked BEFORE
+	// budget exhaustion (fixup.go:555), so a raw priorPasses at the ceiling
+	// refuses with fixup_ceiling_reached even when the summed refunds would
+	// otherwise leave effectiveConsumed below the normal budget (the raw=3/
+	// refunds=3 state the #1957 E2E drives; unreachable before the infra refund
+	// because the stage-keyed no-change dedup caps refunds at 1). No override
+	// left — merge-with-follow-up, a commit-and-vouch for a late CI/SAST finding
+	// (#1097), or a fresh run.
+	if priorPasses >= fixupCeiling {
+		return &ReviewActionHint{
+			Concerns:             concerns,
+			RemainingFixupBudget: 0,
+			OverrideAvailable:    false,
+			Message: fmt.Sprintf(
+				"%d concern(s) remain but the hard fix-up ceiling of %d total passes is reached — no override left. Merge now and file a follow-up; for a late CI/SAST finding, commit the fix on the run branch then fishhawk_vouch_commit it (operator/operator-agent token, NOT the run's fhm_ token) so the operator commit clears the run's sole-writer lineage gate (ADR-035, #1068/#1044); or start a fresh run to address them.",
+				concerns, fixupCeiling),
+		}, nil
 	}
 
 	// Below the normal budget (after refunds): the original route-back vs
@@ -294,62 +368,160 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 		}, nil
 	}
 
-	// Budget spent but the hard ceiling still has headroom: surface the
-	// exhaustion plus the two options — the bounded operator override or
-	// merge-with-follow-up.
-	if priorPasses < fixupCeiling {
-		return &ReviewActionHint{
-			Concerns:             concerns,
-			RemainingFixupBudget: 0,
-			OverrideAvailable:    true,
-			Message: fmt.Sprintf(
-				"%d concern(s) remain after the fix-up budget is spent (%d/%d normal passes used). Either merge now and file a follow-up, or grant ONE bounded override pass with fishhawk_fixup_stage(stage_id=%s, concern_ids from run.concerns.items[].id, force_additional_pass=true) — capped at %d total passes.",
-				concerns, priorPasses, maxFixupPasses, implementStageID, fixupCeiling),
-		}, nil
-	}
-
-	// Hard ceiling reached: no override left — merge-with-follow-up, a
-	// commit-and-vouch for a late CI/SAST finding (#1097), or a fresh run.
+	// Budget spent but the hard ceiling still has headroom (the ceiling arm above
+	// already returned for priorPasses >= fixupCeiling, so this is reached only
+	// below the ceiling): surface the exhaustion plus the two options — the
+	// bounded operator override or merge-with-follow-up.
 	return &ReviewActionHint{
 		Concerns:             concerns,
 		RemainingFixupBudget: 0,
-		OverrideAvailable:    false,
+		OverrideAvailable:    true,
 		Message: fmt.Sprintf(
-			"%d concern(s) remain but the hard fix-up ceiling of %d total passes is reached — no override left. Merge now and file a follow-up; for a late CI/SAST finding, commit the fix on the run branch then fishhawk_vouch_commit it (operator/operator-agent token, NOT the run's fhm_ token) so the operator commit clears the run's sole-writer lineage gate (ADR-035, #1068/#1044); or start a fresh run to address them.",
-			concerns, fixupCeiling),
+			"%d concern(s) remain after the fix-up budget is spent (%d/%d normal passes used). Either merge now and file a follow-up, or grant ONE bounded override pass with fishhawk_fixup_stage(stage_id=%s, concern_ids from run.concerns.items[].id, force_additional_pass=true) — capped at %d total passes.",
+			concerns, priorPasses, maxFixupPasses, implementStageID, fixupCeiling),
 	}, nil
 }
 
-// fixupPassesAndLatestSeq returns both the number of prior
-// stage_fixup_triggered audit entries for the implement stage (the durable
-// fix-up-pass counter the bound is enforced against) and the audit sequence
-// of the most-recent such entry (0 when none exist — the round boundary used
-// to scope the latest review round). Mirrors server.countFixupPasses' per-
-// entry StageID double-check so a fix-up on a DIFFERENT stage is never counted
-// against this one, robust even when an audit backend does not filter by
-// stage_id.
-func (r *runResolver) fixupPassesAndLatestSeq(ctx context.Context, runID, stageID uuid.UUID) (int, int64, error) {
+// fixupPassesAndLatestSeq returns, from ONE stage_fixup_triggered audit read:
+// the number of prior fix-up passes for the implement stage (the durable
+// pass counter the bound is enforced against), the audit sequence of the
+// most-recent such entry (0 when none exist — the round boundary used to scope
+// the latest review round), and the ascending-sorted slice of those entries'
+// sequences (the trigger-window bounds fixupInfraRefunds pairs the #1957 infra
+// refund signals against). Mirrors server.countFixupPasses' per-entry StageID
+// double-check so a fix-up on a DIFFERENT stage is never counted against this
+// one, robust even when an audit backend does not filter by stage_id. The
+// collected sequences are sorted EXPLICITLY rather than assuming the endpoint
+// returns them ordered.
+func (r *runResolver) fixupPassesAndLatestSeq(ctx context.Context, runID, stageID uuid.UUID) (int, int64, []int64, error) {
 	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
 		Category: categoryStageFixupTriggered,
 		StageID:  stageID.String(),
 		Limit:    reviewAuditQueryLimit,
 	})
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, nil, err
 	}
-	n := 0
 	var latestSeq int64
+	var triggerSeqs []int64
 	want := stageID.String()
 	for _, e := range entries {
 		if e.StageID == nil || *e.StageID != want {
 			continue
 		}
-		n++
+		triggerSeqs = append(triggerSeqs, e.Sequence)
 		if e.Sequence > latestSeq {
 			latestSeq = e.Sequence
 		}
 	}
-	return n, latestSeq, nil
+	sort.Slice(triggerSeqs, func(i, j int) bool { return triggerSeqs[i] < triggerSeqs[j] })
+	return len(triggerSeqs), latestSeq, triggerSeqs, nil
+}
+
+// fixupInfraRefunds returns the number of fix-up passes for the stage that died
+// category-C (infrastructure) WITHOUT delivering anything to the PR branch, and
+// are therefore refunded against the NORMAL budget alongside the #967 no-change
+// refund (#1957). Mirrors server.countFixupInfraRefunds BYTE-FOR-BYTE:
+//
+//   - two signal shapes qualify — a dispatch_reaper_failed entry with
+//     failure_category "C" (the #1747 pre-agent spawn-phase reaper death), and a
+//     stage_fixup_recovered entry with source_failure_category "C" (the #788
+//     post-agent-work recovery that still landed nothing on the PR branch);
+//   - only category C refunds — category A (agent) and B (policy) failures still
+//     consume budget, matching the delivered-nothing invariant;
+//   - an unparseable/missing payload is SKIPPED (never counted);
+//   - each trigger window (triggerSeqs[i], triggerSeqs[i+1]) — open-ended for the
+//     newest — refunds at most once when at least one signal Sequence falls
+//     STRICTLY inside it (sig > lo && sig < hi), so a signal sequenced before the
+//     first trigger (an original-dispatch spawn death, not a fix-up) never
+//     refunds.
+//
+// triggerSeqs is the ascending-sorted trigger-window bounds from
+// fixupPassesAndLatestSeq (one shared stage_fixup_triggered read). The per-entry
+// StageID double-check mirrors the other helpers so a signal on a DIFFERENT stage
+// is never counted against this one.
+func (r *runResolver) fixupInfraRefunds(ctx context.Context, runID, stageID uuid.UUID, triggerSeqs []int64) (int, error) {
+	if len(triggerSeqs) == 0 {
+		return 0, nil
+	}
+	want := stageID.String()
+
+	// Pre-agent spawn-phase reaper deaths (failure_category "C").
+	reapers, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: categoryDispatchReaperFailed,
+		StageID:  stageID.String(),
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil {
+		return 0, err
+	}
+	var signalSeqs []int64
+	for _, e := range reapers {
+		if e.StageID == nil || *e.StageID != want {
+			continue
+		}
+		raw, merr := json.Marshal(e.Payload)
+		if merr != nil {
+			continue
+		}
+		var p struct {
+			FailureCategory string `json:"failure_category"`
+		}
+		if json.Unmarshal(raw, &p) != nil {
+			continue
+		}
+		if p.FailureCategory == failureCategoryC {
+			signalSeqs = append(signalSeqs, e.Sequence)
+		}
+	}
+
+	// Post-agent-work #788 recovery deaths (source_failure_category "C").
+	recovered, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: categoryStageFixupRecovered,
+		StageID:  stageID.String(),
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil {
+		return 0, err
+	}
+	for _, e := range recovered {
+		if e.StageID == nil || *e.StageID != want {
+			continue
+		}
+		raw, merr := json.Marshal(e.Payload)
+		if merr != nil {
+			continue
+		}
+		var p struct {
+			SourceFailureCategory string `json:"source_failure_category"`
+		}
+		if json.Unmarshal(raw, &p) != nil {
+			continue
+		}
+		if p.SourceFailureCategory == failureCategoryC {
+			signalSeqs = append(signalSeqs, e.Sequence)
+		}
+	}
+	if len(signalSeqs) == 0 {
+		return 0, nil
+	}
+
+	// Per-window pairing: at most one refund per trigger, regardless of how many
+	// signals land in its window.
+	refunds := 0
+	for i, lo := range triggerSeqs {
+		hi := int64(math.MaxInt64)
+		if i+1 < len(triggerSeqs) {
+			hi = triggerSeqs[i+1]
+		}
+		for _, sig := range signalSeqs {
+			if sig > lo && sig < hi {
+				refunds++
+				break
+			}
+		}
+	}
+	return refunds, nil
 }
 
 // fixupNoChangeRefunds returns the number of fixup_no_changes audit entries

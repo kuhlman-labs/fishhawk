@@ -2259,6 +2259,24 @@ func TestE2E_Fixup_DuplicateFailureReportThenRefundedPass(t *testing.T) {
 	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
 		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "the re-review still sees drift"})
 
+	// The MCP review_action_hint must AGREE with the backend's admit decision:
+	// the delivered-nothing category-C recovery refunded the normal budget, so
+	// the hint reports a remaining normal pass (RemainingFixupBudget=1,
+	// OverrideAvailable=false) — NOT the pre-#1957 drift of 0/true that would
+	// steer the operator at a needless force_additional_pass while the backend
+	// admits the pass WITHOUT force. This is the exact #968 hint-vs-backend
+	// disagreement class the infra-refund mirror closes.
+	hintBeforeRefund := getReviewActionHint(t, ctx, session, fx.runID)
+	if hintBeforeRefund == nil {
+		t.Fatal("review_action_hint = nil before the refunded pass, want a populated hint agreeing with the backend")
+	}
+	if hintBeforeRefund.RemainingFixupBudget != 1 {
+		t.Errorf("review_action_hint.remaining_fixup_budget = %d before the refunded pass, want 1 (the delivered-nothing category-C recovery is refunded, so the hint must agree with the backend admitting a normal pass without force)", hintBeforeRefund.RemainingFixupBudget)
+	}
+	if hintBeforeRefund.OverrideAvailable {
+		t.Errorf("review_action_hint.override_available = true before the refunded pass, want false (a normal pass is available; no override is needed — the pre-#1957 drift surfaced 0/true here)")
+	}
+
 	refundedRes, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "fishhawk_fixup_stage",
 		Arguments: map[string]any{
@@ -2358,6 +2376,25 @@ func TestE2E_Fixup_DuplicateFailureReportThenRefundedPass(t *testing.T) {
 	// unconditional loop bound.
 	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
 		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "one drift too many"})
+
+	// At the raw ceiling (raw=3, refunds=3) the hint must AGREE with the
+	// backend's fixup_ceiling_reached refusal: RemainingFixupBudget=0 and
+	// OverrideAvailable=false. This pins the ceiling-precedence hoist — even
+	// though the summed refunds leave effectiveConsumed below the normal budget,
+	// the RAW-trigger ceiling is checked FIRST (mirroring the backend's
+	// ErrFixupCeilingReached-before-budget precedence), so the hint must NOT
+	// advertise a spurious remaining normal pass the endpoint would refuse.
+	hintAtCeiling := getReviewActionHint(t, ctx, session, fx.runID)
+	if hintAtCeiling == nil {
+		t.Fatal("review_action_hint = nil at the raw ceiling, want a populated hint agreeing with the fixup_ceiling_reached refusal")
+	}
+	if hintAtCeiling.RemainingFixupBudget != 0 {
+		t.Errorf("review_action_hint.remaining_fixup_budget = %d at the raw ceiling, want 0 (the RAW-trigger ceiling is reached; the hint must agree with the backend's fixup_ceiling_reached refusal, not advertise a refund-widened normal pass)", hintAtCeiling.RemainingFixupBudget)
+	}
+	if hintAtCeiling.OverrideAvailable {
+		t.Errorf("review_action_hint.override_available = true at the raw ceiling, want false (no override left past the hard ceiling)")
+	}
+
 	ceilingRes, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "fishhawk_fixup_stage",
 		Arguments: map[string]any{
