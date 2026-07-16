@@ -627,6 +627,33 @@ func TestReviewActionHintFor_LatestRoundOnly(t *testing.T) {
 	}
 }
 
+// TestFixupInfraRefunds_OneRefundPerTriggerWindow pins the #1987 round-2
+// review concern (761fb56d): fixupInfraRefunds must count AT MOST ONE refund
+// per trigger window, even when multiple category-C death signals land inside
+// the SAME window. Two reaper-death signals are seeded, both sequenced inside
+// the first trigger window (the second window is empty); without the inner
+// break at review_action_hint.go:520 every signal in a window would count,
+// yielding 2 refunds for one fix-up pass instead of 1.
+func TestFixupInfraRefunds_OneRefundPerTriggerWindow(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	// Both signals land at sequences 1 and 2 (insertion order); the trigger
+	// window [0, 3) contains both, and the second window [3, +inf) is empty.
+	seedDispatchReaperFailedAudit(fb, runID, stageID, "C")
+	seedDispatchReaperFailedAudit(fb, runID, stageID, "C")
+
+	r := newResolver(srv, nil)
+	refunds, err := r.fixupInfraRefunds(context.Background(), runID, stageID, []int64{0, 3})
+	if err != nil {
+		t.Fatalf("fixupInfraRefunds: %v", err)
+	}
+	if refunds != 1 {
+		t.Errorf("refunds = %d, want 1 (at most one refund per trigger window despite two in-window signals)", refunds)
+	}
+}
+
 // TestImplementReviewMergeHint covers the #947 local-loop parity hint: a
 // display-only merge-readiness warning surfaced ONLY while the implement-stage
 // agent review is pending (dispatched, no verdict). It mirrors the backend's

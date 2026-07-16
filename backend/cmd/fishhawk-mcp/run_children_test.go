@@ -1318,6 +1318,58 @@ func TestRunChildren_WaveIntegrityStuckWaveStopsBeforeIntegrate(t *testing.T) {
 	}
 }
 
+// TestRunChildren_WaveIntegrityUnknownStateBlocks pins the #1980 concern
+// (9dfc3bea from #1980's review): a non-attempted wave-0 child whose implement
+// stage could not even be DISCOVERED (resolveStage fails — the run_children.go
+// discovery-failure path, stateKnown=false) must be treated as the same
+// fail-safe as a known-non-succeeded state: the wave-integrity guard blocks
+// before integrating, reporting the child's stage_state as "unknown" (never a
+// bare empty string, and never silently passed as if it were terminal-ok).
+func TestRunChildren_WaveIntegrityUnknownStateBlocks(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child0, child1 := uuid.New(), uuid.New()
+	// child0 is deliberately NOT seeded at all: ListRunStages returns an empty
+	// list for it, so resolveStage fails to find an "implement" stage and the
+	// partition loop leaves it with stateKnown=false (discovery failure, not a
+	// known non-succeeded state).
+	seedChildRun(fb, child1, "pending") // wave-1 pending
+	seedPlanDecomposedWaves(fb, parent, []string{child0.String(), child1.String()}, 0, [][]int{{0}, {1}})
+
+	spawn, baseByID, mu := captureBaseSpawn(nil)
+	withFakeSpawn(t, spawn)
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if out.DispatchedCount != 0 {
+		t.Errorf("dispatched_count = %d, want 0 (wave 0's discovery-failed child blocks, wave 1 never reached)", out.DispatchedCount)
+	}
+	mu.Lock()
+	_, child1Ran := baseByID[child1.String()]
+	mu.Unlock()
+	if child1Ran {
+		t.Error("wave-1 child dispatched despite an unknown-state wave-0 child; the wave-integrity guard did not stop the loop")
+	}
+	fb.mu.Lock()
+	calls := fb.integrateWaveCalledBy[parent]
+	fb.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("integrate-wave calls = %d, want 0 (never integrate over an unknown predecessor state)", calls)
+	}
+	if !containsWarning(out.Warnings, child0.String()) {
+		t.Errorf("warnings = %v, want the discovery-failed wave-0 child named", out.Warnings)
+	}
+	if !containsWarning(out.Warnings, `stage_state "unknown"`) {
+		t.Errorf(`warnings = %v, want stage_state "unknown" reported for the discovery-failed child`, out.Warnings)
+	}
+}
+
 // TestRunChildren_WaveIntegrityIdempotentReinvocation pins that the wave-integrity
 // guard does NOT break legitimate idempotent re-invocation: a wave-0 child already
 // terminal-'succeeded' (non-attempted this call) passes the guard, so the wave

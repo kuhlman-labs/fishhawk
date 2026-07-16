@@ -2503,6 +2503,54 @@ func TestRunStage_AcceptanceAdmissionStageNotFound404_FailsClosed(t *testing.T) 
 	}
 }
 
+// TestRunStage_AcceptanceAdmissionBareRoute404_StageNotDispatchable_Halts pins
+// the #1999 precedence: even the #1937 bare-404 version-skew carve-out must not
+// override a POSITIVELY OBSERVED non-dispatchable stage state. When the bare
+// route-absent 404 combines with a stage left 'running' by a mid-walk failure,
+// the acceptanceStageState re-check at run_stage.go:853 wins over the skewWarn
+// fail-open return at run_stage.go:857 — the dispatch halts with no spawn,
+// exactly as the non-skew #1928 case does.
+func TestRunStage_AcceptanceAdmissionBareRoute404_StageNotDispatchable_Halts(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.admissionStatus = http.StatusNotFound
+	fb.admissionErrBody = "404 page not found\n" // exact stdlib http.NotFound body
+	fb.admissionLeavesRunning = true
+	r := newResolver(srv, nil)
+
+	spawned := 0
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, _ ...string) *exec.Cmd {
+		spawned++
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() {
+		runStageCommand = origCmd
+		runStageLookPath = exec.LookPath
+	})
+
+	runID := uuid.New()
+	acceptanceID := uuid.NewString()
+	seedStages(fb, runID,
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "implement", State: "succeeded"},
+		Stage{ID: acceptanceID, RunID: runID.String(), Type: "acceptance", State: "pending"},
+	)
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "acceptance", GitHubRepo: "x/y",
+	})
+	if err == nil {
+		t.Fatal("a bare-404 skew combined with a non-dispatchable stage must still halt, got nil")
+	}
+	if !strings.Contains(err.Error(), "double-driving") {
+		t.Errorf("error = %q, want it to name the double-drive guard (stage-state re-check must win over skewWarn)", err)
+	}
+	if spawned != 0 {
+		t.Errorf("a stage left 'running' must spawn NO runner even under the bare-404 skew carve-out, got %d", spawned)
+	}
+}
+
 // TestRunStage_AcceptanceAdmissionError_StageLeftRunning_FailsClosed pins the
 // #1928 mid-walk concern: when the admission call 500s AND the failed short-circuit
 // walk left the target stage 'running', the fail-open re-check observes the
