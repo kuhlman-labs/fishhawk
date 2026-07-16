@@ -2128,23 +2128,26 @@ func decodeStructured(t *testing.T, r *mcp.CallToolResult, dst any) {
 	}
 }
 
-// TestE2E_Fixup_DuplicateFailureReportThenForcedOverride drives the full
-// #968 incident sequence across the MCP → server → run → orchestrator
-// layers — the seam the per-layer units cannot cover (cf. #618):
+// TestE2E_Fixup_DuplicateFailureReportThenRefundedPass drives the full #968
+// incident sequence AND the #1957 delivered-nothing refund across the MCP →
+// server → run → orchestrator layers — the seam the per-layer units cannot
+// cover (cf. #618):
 //
-//  1. a fix-up re-dispatch FAILS and #788 recovery restores the run to its
-//     review gate (implement succeeded, review awaiting_approval);
-//  2. a DUPLICATE failure report for the same stage arrives. FailStage
-//     rejects it (the stage is already recovered), and the fall-through
-//     Advance — which in the incident stamped run 68e13183 succeeded with
-//     its gate open — must leave the run RUNNING at its gate;
-//  3. the re-review lands a fresh concern: get_run_status's
-//     review_action_hint advertises the operator override
-//     (override_available=true), and the fixup endpoint AGREES — a forced
-//     pass (force_additional_pass=true) is ACCEPTED within the 3-pass
-//     ceiling and re-parks the review stage again, instead of the hint
-//     advertising an override the server would refuse (the #968 disagreement).
-func TestE2E_Fixup_DuplicateFailureReportThenForcedOverride(t *testing.T) {
+//  1. a fix-up re-dispatch FAILS category-C and #788 recovery restores the run
+//     to its review gate (implement succeeded, review awaiting_approval);
+//  2. a DUPLICATE failure report for the same stage arrives. FailStage rejects
+//     it (the stage is already recovered), and the fall-through Advance — which
+//     in the incident stamped run 68e13183 succeeded with its gate open — must
+//     leave the run RUNNING at its gate, with still exactly one recovery;
+//  3. the re-review lands a fresh concern. The recovered category-C pass
+//     delivered NOTHING to the PR branch, so under the operator-approved
+//     delivered-nothing invariant (#1957) it REFUNDS against the normal budget:
+//     the next pass is admitted WITHOUT force_additional_pass and re-parks the
+//     review stage again (superseding the pre-#1957 forced-override path);
+//  4. the refund widens the normal budget but NEVER the absolute ceiling — three
+//     RAW stage_fixup_triggered entries hard-stop the stage with
+//     fixup_ceiling_reached even under force and despite three refunds.
+func TestE2E_Fixup_DuplicateFailureReportThenRefundedPass(t *testing.T) {
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -2248,57 +2251,48 @@ func TestE2E_Fixup_DuplicateFailureReportThenForcedOverride(t *testing.T) {
 		t.Errorf("stage_fixup_recovered entries = %d, want 1 (the duplicate must not recover again)", len(recovered))
 	}
 
-	// 3. The re-review lands a fresh concern. The hint advertises the
-	// operator override — and must AGREE with the fixup endpoint.
+	// 3. The re-review lands a fresh concern. The recovered category-C pass
+	// delivered NOTHING to the PR branch, so under the operator-approved
+	// delivered-nothing invariant (#1957) it REFUNDS against the normal budget —
+	// the next pass is admitted WITHOUT force_additional_pass (superseding the
+	// pre-#1957 forced-override path this scenario used to require).
 	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
 		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "the re-review still sees drift"})
-	hint := getReviewActionHint(t, ctx, session, fx.runID)
-	if hint == nil {
-		t.Fatalf("review_action_hint absent; want the override pointer (budget spent, run running at its gate)")
-	}
-	if hint.RemainingFixupBudget != 0 {
-		t.Errorf("review_action_hint.remaining_fixup_budget = %d, want 0", hint.RemainingFixupBudget)
-	}
-	if !hint.OverrideAvailable {
-		t.Errorf("review_action_hint.override_available = false, want true (one pass used, ceiling 3)")
-	}
 
-	// The endpoint agrees with the advertised hint: the forced pass is
-	// ACCEPTED within the ceiling and re-parks the review stage again.
-	forcedRes, err := session.CallTool(ctx, &mcp.CallToolParams{
+	refundedRes, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "fishhawk_fixup_stage",
 		Arguments: map[string]any{
-			"stage_id":              impl.ID.String(),
-			"concerns":              []int{0},
-			"reason":                "operator-granted override pass",
-			"force_additional_pass": true,
+			"stage_id": impl.ID.String(),
+			"concerns": []int{0},
+			"reason":   "refunded normal pass after a delivered-nothing category-C recovery",
 		},
 	})
 	if err != nil {
-		t.Fatalf("CallTool forced fishhawk_fixup_stage: %v", err)
+		t.Fatalf("CallTool refunded fishhawk_fixup_stage: %v", err)
 	}
-	if forcedRes.IsError {
-		t.Fatalf("forced fix-up refused — hint advertised an override the server would not grant (#968 disagreement): %s",
-			toolContentString(t, forcedRes))
+	if refundedRes.IsError {
+		t.Fatalf("refunded fix-up refused — a delivered-nothing category-C recovery must refund the normal budget so the pass is admitted WITHOUT force (#1957): %s",
+			toolContentString(t, refundedRes))
 	}
 
 	curImpl, err := fx.runRepo.GetStage(ctx, impl.ID)
 	if err != nil {
-		t.Fatalf("GetStage(implement) after forced pass: %v", err)
+		t.Fatalf("GetStage(implement) after refunded pass: %v", err)
 	}
 	if curImpl.State != runpkg.StageStatePending {
-		t.Errorf("implement state after forced pass = %q, want pending (re-opened)", curImpl.State)
+		t.Errorf("implement state after refunded pass = %q, want pending (re-opened)", curImpl.State)
 	}
 	curReview, err := fx.runRepo.GetStage(ctx, review.ID)
 	if err != nil {
-		t.Fatalf("GetStage(review) after forced pass: %v", err)
+		t.Fatalf("GetStage(review) after refunded pass: %v", err)
 	}
 	if curReview.State != runpkg.StageStatePending {
-		t.Errorf("review state after forced pass = %q, want pending (re-parked, NOT stranded)", curReview.State)
+		t.Errorf("review state after refunded pass = %q, want pending (re-parked, NOT stranded)", curReview.State)
 	}
 
-	// The forced pass is durably audited: two stage_fixup_triggered
-	// entries, the latest marked forced and naming the re-parked review.
+	// The refunded pass is durably audited: two stage_fixup_triggered entries,
+	// the latest NOT forced (it rode the refunded normal budget, not an override)
+	// and recording the refund + the re-parked review.
 	triggered, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
 	if err != nil {
 		t.Fatalf("ListForRunByCategory(triggered): %v", err)
@@ -2306,24 +2300,88 @@ func TestE2E_Fixup_DuplicateFailureReportThenForcedOverride(t *testing.T) {
 	if len(triggered) != 2 {
 		t.Fatalf("stage_fixup_triggered entries = %d, want 2", len(triggered))
 	}
-	var forcedPayload struct {
-		Forced                bool   `json:"forced"`
-		ReparkedReviewStageID string `json:"reparked_review_stage_id"`
+	var refundedPayload struct {
+		Forced                bool    `json:"forced"`
+		RefundedPasses        float64 `json:"refunded_passes"`
+		ReparkedReviewStageID string  `json:"reparked_review_stage_id"`
 	}
-	if err := json.Unmarshal(triggered[len(triggered)-1].Payload, &forcedPayload); err != nil {
-		t.Fatalf("unmarshal forced payload: %v", err)
+	if err := json.Unmarshal(triggered[len(triggered)-1].Payload, &refundedPayload); err != nil {
+		t.Fatalf("unmarshal refunded payload: %v", err)
 	}
-	if !forcedPayload.Forced {
-		t.Errorf("forced fix-up audit forced = false, want true")
+	if refundedPayload.Forced {
+		t.Errorf("refunded fix-up audit forced = true, want false (admitted within the refunded normal budget, not an override)")
 	}
-	if forcedPayload.ReparkedReviewStageID != review.ID.String() {
-		t.Errorf("reparked_review_stage_id = %q, want %s", forcedPayload.ReparkedReviewStageID, review.ID)
+	if refundedPayload.RefundedPasses != 1 {
+		t.Errorf("refunded fix-up audit refunded_passes = %v, want 1 (the delivered-nothing category-C recovery is refunded)", refundedPayload.RefundedPasses)
+	}
+	if refundedPayload.ReparkedReviewStageID != review.ID.String() {
+		t.Errorf("reparked_review_stage_id = %q, want %s", refundedPayload.ReparkedReviewStageID, review.ID)
 	}
 
-	// 4. After the forced pass the latest round has no landed concerns yet,
-	// so the hint suppresses — consistent with there being nothing further
-	// to route back until the re-review lands.
-	if hint := getReviewActionHint(t, ctx, session, fx.runID); hint != nil {
-		t.Errorf("review_action_hint = %+v, want nil after the forced pass (no concerns in the new round yet)", hint)
+	// 4. The refund widens the NORMAL budget but NEVER the absolute ceiling: the
+	// hard cap keeps counting RAW stage_fixup_triggered entries. Recover the
+	// refunded pass (another delivered-nothing category-C), then drive raw
+	// triggers to the ceiling of 3 — at which point even a forced pass is refused
+	// fixup_ceiling_reached, proving no accumulation of refunds can extend the
+	// raw-trigger loop bound.
+	recoverCategoryC := func(step string) {
+		t.Helper()
+		shipPushFixupTraceViaBackend(t, ctx, fx, impl.ID)
+		failPushPRViaBackend(t, ctx, fx, impl.ID)
+		assertReviewGateRestored(step)
+	}
+	recoverCategoryC("after refunded pass recovery") // raw=2, refunds=2
+
+	// Pass 3 (raw=3): still admitted without force — priorPasses(2) < refunded
+	// budget(1+2). This is the last pass the raw ceiling permits.
+	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "still drifting"})
+	thirdRes, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id": impl.ID.String(),
+			"concerns": []int{0},
+			"reason":   "third refunded pass",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool third fishhawk_fixup_stage: %v", err)
+	}
+	if thirdRes.IsError {
+		t.Fatalf("third refunded pass refused — two delivered-nothing recoveries must refund to admit the third raw trigger: %s",
+			toolContentString(t, thirdRes))
+	}
+	recoverCategoryC("after third pass recovery") // raw=3, refunds=3
+
+	// Pass 4 at the raw ceiling: refused even with force_additional_pass — the
+	// refunds widened the normal budget but the RAW-trigger ceiling of 3 is the
+	// unconditional loop bound.
+	seedImplementReview(t, ctx, auditRepo, fx.runID, impl.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "one drift too many"})
+	ceilingRes, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id":              impl.ID.String(),
+			"concerns":              []int{0},
+			"reason":                "attempt past the raw ceiling",
+			"force_additional_pass": true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool ceiling fishhawk_fixup_stage: %v", err)
+	}
+	if !ceilingRes.IsError {
+		t.Fatalf("fourth pass admitted — the RAW-trigger ceiling of 3 must hard-stop the stage even with force and despite the refunds")
+	}
+	if got := toolContentString(t, ceilingRes); !strings.Contains(got, "fixup_ceiling_reached") {
+		t.Errorf("ceiling refusal = %q, want fixup_ceiling_reached (refunds must never extend the raw-trigger ceiling)", got)
+	}
+
+	triggeredFinal, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(triggered, final): %v", err)
+	}
+	if len(triggeredFinal) != 3 {
+		t.Errorf("stage_fixup_triggered entries = %d, want 3 (the ceiling refusal writes no fourth trigger)", len(triggeredFinal))
 	}
 }

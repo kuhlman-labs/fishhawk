@@ -819,16 +819,16 @@ func TestFixupStage_InfraRefundAdmitsSecondPass(t *testing.T) {
 	}
 }
 
-// TestFixupStage_InfraRefund_RecoveredCategoryCNotRefunded pins the
-// post-agent-work category-C recovery as NON-refundable (#1957 / the #860
-// forced-override contract): a fix-up pass whose re-dispatch ran the agent but
-// FAILED category-C on the push/report and was recovered back to the review
-// gate (stage_fixup_recovered, source_failure_category "C", #788) already
-// consumed the budget — the agent RAN. Only a spawn-phase reaper death (before
-// the agent ran) refunds. A spent budget here must require an explicit operator
-// force_additional_pass, not a silent refund, so the second pass is refused
-// budget-exhausted.
-func TestFixupStage_InfraRefund_RecoveredCategoryCNotRefunded(t *testing.T) {
+// TestFixupStage_InfraRefund_RecoveredCategoryC pins the post-agent-work
+// category-C recovery as REFUNDABLE (#1957, the operator's DELIBERATE-ACCEPTANCE
+// of the delivered-nothing invariant): a fix-up pass whose re-dispatch ran the
+// agent but FAILED category-C on the push/report and was recovered back to the
+// review gate (stage_fixup_recovered, source_failure_category "C", #788) landed
+// NOTHING on the PR branch. Under the delivered-nothing invariant it refunds
+// exactly like a spawn-phase reaper death — the RAW-trigger hard ceiling, not a
+// forced override, is the loop bound — so the second pass is admitted WITHOUT
+// force_additional_pass and the refund is recorded on the audit payload.
+func TestFixupStage_InfraRefund_RecoveredCategoryC(t *testing.T) {
 	s, repo, au := fixupServer(t)
 	stage := seedImplementGateStage(repo)
 	seedConcernsReview(au, stage,
@@ -839,11 +839,15 @@ func TestFixupStage_InfraRefund_RecoveredCategoryCNotRefunded(t *testing.T) {
 	seedFixupRecoveredC(au, stage.RunID, stage.ID, run.FailureC, 12)
 
 	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, Reason: "retry after recovered category-C death"})
-	if w.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("second fixup status = %d, want 422 (post-agent-work recovery does not refund):\n%s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Fatalf("second fixup status = %d, want 200 (post-agent-work recovery delivered nothing, so it refunds):\n%s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "fixup_budget_exhausted") {
-		t.Errorf("body missing fixup_budget_exhausted code: %s", w.Body.String())
+	payload := lastFixupTriggeredPayload(t, au)
+	if payload["refunded_passes"].(float64) != 1 {
+		t.Errorf("refunded_passes = %v, want 1", payload["refunded_passes"])
+	}
+	if payload["forced"] != false {
+		t.Errorf("forced = %v, want false — the refunded pass is within the normal budget", payload["forced"])
 	}
 }
 

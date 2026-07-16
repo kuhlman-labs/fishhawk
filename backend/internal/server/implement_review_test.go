@@ -3354,3 +3354,38 @@ func TestBackstopFixupReReview_NoStartedAfterTrigger_StillDispatches(t *testing.
 		t.Errorf("reviewer invocations = %d, want 1 (genuine miss dispatches)", len(reviewer.calls))
 	}
 }
+
+// TestBackstopFixupReReview_TriggeredListError_FailsClosed pins the #1957
+// same-pass guard's fail-closed branch (guard (a2)): when the
+// stage_fixup_triggered ListForRunByCategory read errors, the backstop WARN-logs
+// and skips entirely rather than risk a double-dispatch under an unknown trigger
+// state. No implement_review_started for the new head lands and the reviewer is
+// never invoked — the load-bearing fail-closed posture the merge gate relies on
+// (an erroring audit store must not silently suppress OR double-fire the #1932
+// backstop).
+func TestBackstopFixupReReview_TriggeredListError_FailsClosed(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+
+	// A prior-head started round exists so guard (a)'s implement_review_started
+	// read succeeds and returns a non-empty ledger; the stage_fixup_triggered read
+	// then errors, tripping the (a2) fail-closed skip BEFORE any dispatch.
+	seedImplementReviewStarted(t, au, runRow.ID, implStage.ID, "head-old", time.Now().UTC())
+	s.cfg.AuditRepo = &categoryErrAuditRepo{
+		auditFake:   au,
+		errCategory: CategoryStageFixupTriggered,
+		err:         errors.New("audit store unavailable"),
+	}
+
+	s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, "head-new", "base-old")
+	s.waitBackgroundReviews()
+
+	if got := startedHeadSHAs(t, au, runRow.ID); len(got) != 1 || got[0] != "head-old" {
+		t.Errorf("implement_review_started entries = %v, want only the seeded [head-old] (triggered-list error must fail closed to no dispatch)", got)
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 0 {
+		t.Errorf("reviewer invocations = %d, want 0 (triggered-list error must fail closed, not dispatch)", len(reviewer.calls))
+	}
+}
