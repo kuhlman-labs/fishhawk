@@ -1235,6 +1235,216 @@ func TestSubmitApproval_BindingAssertions_OmittedWhenEmpty(t *testing.T) {
 	}
 }
 
+// newApprovalServerWithConcerns is newApprovalServer plus a wired concern
+// store, for the #1956 condition-claim declaration gate.
+func newApprovalServerWithConcerns(t *testing.T) (*Server, *fakeApprovalRepo, *approvalRunRepo, *approvalAuditFake, *fakeConcernRepo) {
+	t.Helper()
+	ar := newFakeApprovalRepo()
+	rr := newApprovalRunRepo()
+	au := newApprovalAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{
+		Addr:             "127.0.0.1:0",
+		ApprovalRepo:     ar,
+		RunRepo:          rr,
+		AuditRepo:        au,
+		ConcernRepo:      cr,
+		IdentityProvider: &fakeIdentityProvider{perm: identity.PermissionAdmin, member: true},
+	})
+	return s, ar, rr, au, cr
+}
+
+// assertNoApprovalRecorded fails when an approval row or approval_submitted
+// audit entry was recorded — the pre-Submit-refusal invariant the #1956
+// claim-validation modes share with the binding_assertions gate.
+func assertNoApprovalRecorded(t *testing.T, ar *fakeApprovalRepo, au *approvalAuditFake) {
+	t.Helper()
+	if len(ar.all) != 0 {
+		t.Errorf("approval row recorded despite a refused claim: %d rows", len(ar.all))
+	}
+	for _, e := range au.appended {
+		if e.Category == "approval_submitted" {
+			t.Errorf("approval_submitted recorded despite a refused claim: %v", e)
+		}
+	}
+}
+
+// TestSubmitApproval_ClaimsConcernIDs_RecordedInAuditPayload pins the #1956
+// persistence seam: an approve claiming an OPEN plan-stage concern records the
+// claimed ids under the claims_concern_ids key of the approval_submitted audit
+// payload, where the confirming-review hook reads them back.
+func TestSubmitApproval_ClaimsConcernIDs_RecordedInAuditPayload(t *testing.T) {
+	s, _, rr, au, cr := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	row := seedConcernRow(t, cr, stage.RunID, uuid.New(), concern.StageKindPlan, 5, "the retry cap is not enforced")
+
+	w := submitApproval(t, s, stage.ID,
+		fmt.Sprintf(`{"decision":"approve","claims_concern_ids":[%q]}`, row.ID.String()))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	raw, ok := payload["claims_concern_ids"].([]any)
+	if !ok || len(raw) != 1 || raw[0] != row.ID.String() {
+		t.Fatalf("claims_concern_ids = %v, want [%s]", payload["claims_concern_ids"], row.ID)
+	}
+}
+
+// TestSubmitApproval_NoClaimsConcernIDs_OmittedWhenEmpty confirms the key is
+// absent when no claims are supplied — the byte-identical no-claim path.
+func TestSubmitApproval_NoClaimsConcernIDs_OmittedWhenEmpty(t *testing.T) {
+	s, _, rr, au, _ := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"lgtm"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if _, ok := payload["claims_concern_ids"]; ok {
+		t.Errorf("claims_concern_ids should be absent when not supplied: %v", payload)
+	}
+}
+
+// TestSubmitApproval_ClaimsConcernIDs_OnRejectRejected pins mode (a): a claim
+// on a reject is refused 400 before any approval row is inserted.
+func TestSubmitApproval_ClaimsConcernIDs_OnRejectRejected(t *testing.T) {
+	s, ar, rr, au, cr := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	row := seedConcernRow(t, cr, stage.RunID, uuid.New(), concern.StageKindPlan, 5, "note")
+
+	w := submitApproval(t, s, stage.ID,
+		fmt.Sprintf(`{"decision":"reject","claims_concern_ids":[%q]}`, row.ID.String()))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 on a claim with reject:\n%s", w.Code, w.Body.String())
+	}
+	assertNoApprovalRecorded(t, ar, au)
+}
+
+// TestSubmitApproval_ClaimsConcernIDs_OnDeployStageRejected pins mode (b): a
+// claim on a non-plan (deploy) stage approve is refused 400.
+func TestSubmitApproval_ClaimsConcernIDs_OnDeployStageRejected(t *testing.T) {
+	s, ar, rr, au, cr := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	rr.mu.Lock()
+	stage.Type = run.StageTypeDeploy
+	rr.mu.Unlock()
+	row := seedConcernRow(t, cr, stage.RunID, uuid.New(), concern.StageKindPlan, 5, "note")
+
+	w := submitApproval(t, s, stage.ID,
+		fmt.Sprintf(`{"decision":"approve","claims_concern_ids":[%q]}`, row.ID.String()))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 on a claim against a deploy stage:\n%s", w.Code, w.Body.String())
+	}
+	assertNoApprovalRecorded(t, ar, au)
+}
+
+// TestSubmitApproval_ClaimsConcernIDs_NilConcernRepoReturns503 pins mode (c):
+// a claim with no concern store configured fails closed 503.
+func TestSubmitApproval_ClaimsConcernIDs_NilConcernRepoReturns503(t *testing.T) {
+	// newApprovalServer wires NO ConcernRepo.
+	s, ar, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID,
+		fmt.Sprintf(`{"decision":"approve","claims_concern_ids":[%q]}`, uuid.New().String()))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 with no concern store:\n%s", w.Code, w.Body.String())
+	}
+	assertNoApprovalRecorded(t, ar, au)
+}
+
+// TestSubmitApproval_ClaimsConcernIDs_NonUUIDRejected pins the malformed-id
+// mode: a claim id that is not a UUID is refused 400.
+func TestSubmitApproval_ClaimsConcernIDs_NonUUIDRejected(t *testing.T) {
+	s, ar, rr, au, _ := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","claims_concern_ids":["not-a-uuid"]}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 on a non-UUID claim id:\n%s", w.Code, w.Body.String())
+	}
+	assertNoApprovalRecorded(t, ar, au)
+}
+
+// TestSubmitApproval_ClaimsConcernIDs_UnknownIDRejected pins the unknown-id
+// mode: a well-formed id with no matching row is refused 400.
+func TestSubmitApproval_ClaimsConcernIDs_UnknownIDRejected(t *testing.T) {
+	s, ar, rr, au, _ := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID,
+		fmt.Sprintf(`{"decision":"approve","claims_concern_ids":[%q]}`, uuid.New().String()))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 on an unknown claim id:\n%s", w.Code, w.Body.String())
+	}
+	assertNoApprovalRecorded(t, ar, au)
+}
+
+// TestSubmitApproval_ClaimsConcernIDs_CrossRunRejected pins the cross-run
+// mode: a claim id belonging to a different run is refused 400.
+func TestSubmitApproval_ClaimsConcernIDs_CrossRunRejected(t *testing.T) {
+	s, ar, rr, au, cr := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	// A plan concern on a DIFFERENT run.
+	row := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindPlan, 5, "other run")
+
+	w := submitApproval(t, s, stage.ID,
+		fmt.Sprintf(`{"decision":"approve","claims_concern_ids":[%q]}`, row.ID.String()))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 on a cross-run claim:\n%s", w.Code, w.Body.String())
+	}
+	assertNoApprovalRecorded(t, ar, au)
+}
+
+// TestSubmitApproval_ClaimsConcernIDs_ImplementStageRejected pins the
+// implement-stage mode: only plan-stage concerns can be claimed.
+func TestSubmitApproval_ClaimsConcernIDs_ImplementStageRejected(t *testing.T) {
+	s, ar, rr, au, cr := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	row := seedConcernRow(t, cr, stage.RunID, uuid.New(), concern.StageKindImplement, 5, "impl concern")
+
+	w := submitApproval(t, s, stage.ID,
+		fmt.Sprintf(`{"decision":"approve","claims_concern_ids":[%q]}`, row.ID.String()))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 on an implement-stage claim:\n%s", w.Code, w.Body.String())
+	}
+	assertNoApprovalRecorded(t, ar, au)
+}
+
+// TestSubmitApproval_ClaimsConcernIDs_NonOpenRejected pins the non-open mode:
+// a claim against a concern already in a terminal (waived) state is refused.
+func TestSubmitApproval_ClaimsConcernIDs_NonOpenRejected(t *testing.T) {
+	s, ar, rr, au, cr := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	row := seedConcernRow(t, cr, stage.RunID, uuid.New(), concern.StageKindPlan, 5, "already waived")
+	if _, err := cr.ApplyResolution(context.Background(), row.ID, concern.StateWaived, "no"); err != nil {
+		t.Fatalf("pre-waive: %v", err)
+	}
+
+	w := submitApproval(t, s, stage.ID,
+		fmt.Sprintf(`{"decision":"approve","claims_concern_ids":[%q]}`, row.ID.String()))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 on a non-open claim:\n%s", w.Code, w.Body.String())
+	}
+	assertNoApprovalRecorded(t, ar, au)
+}
+
+// TestSubmitApproval_ClaimsConcernIDs_DuplicateRejected pins the duplicate
+// mode: the same id twice in the list is refused 400.
+func TestSubmitApproval_ClaimsConcernIDs_DuplicateRejected(t *testing.T) {
+	s, ar, rr, au, cr := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	row := seedConcernRow(t, cr, stage.RunID, uuid.New(), concern.StageKindPlan, 5, "note")
+
+	w := submitApproval(t, s, stage.ID,
+		fmt.Sprintf(`{"decision":"approve","claims_concern_ids":[%q,%q]}`, row.ID.String(), row.ID.String()))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 on a duplicate claim id:\n%s", w.Code, w.Body.String())
+	}
+	assertNoApprovalRecorded(t, ar, au)
+}
+
 // TestSubmitApproval_RemoveScopeFiles_NonRepoRelativeRejected pins the #1726
 // SHAPE fail-closed mode: a remove_scope_files path that is not repo-relative
 // (here a ".." traversal) is refused 400 validation_failed field=
@@ -1366,7 +1576,7 @@ func TestWriteApprovalAudit_RemoveScopeFiles_RecordsBeforeAfter(t *testing.T) {
 		Decision:        approval.DecisionApprove,
 		Surface:         approval.SurfaceAPI,
 	}
-	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, []string{"backend/b.go"}, nil, "", "", "", nil)
+	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, []string{"backend/b.go"}, nil, nil, "", "", "", nil)
 
 	au := s.cfg.AuditRepo.(*auditFake)
 	payload := findApprovalSubmittedPayload(t, au.appended)

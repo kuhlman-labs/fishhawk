@@ -893,11 +893,16 @@ components:
           type: string
           description: |
             Lifecycle state. Open states are raised, addressed_pending,
-            reopened; the full enum adds addressed, waived, superseded
-            (closed states never appear in this block). `waived` is
-            operator-reachable via `POST /v0/concerns/{concern_id}/waive`
-            (#984); `addressed`/`reopened`/`superseded` are reached by
-            reviewer `concern_resolutions` on a re-review.
+            reopened; the full enum adds addressed, waived, superseded,
+            deferred, addressed_by_condition (closed states never appear in
+            this block). `waived` is operator-reachable via
+            `POST /v0/concerns/{concern_id}/waive` (#984);
+            `addressed`/`reopened`/`superseded` are reached by reviewer
+            `concern_resolutions` on a re-review; `addressed_by_condition`
+            (#1956) is the condition-claim resolution of a plan-stage concern
+            whose binding approval condition one implement review confirmed
+            delivered (recorded on a `concern_addressed_by_condition` audit
+            entry).
         has_suggested_patch:
           type: boolean
           description: |
@@ -1038,7 +1043,11 @@ components:
       type: object
       description: |
         One settled-ledger row (#1913): a concern in a terminal state
-        (addressed / waived / superseded / deferred) with its state_reason.
+        (addressed / waived / superseded / deferred / addressed_by_condition)
+        with its state_reason. `addressed_by_condition` (#1956) is a plan-stage
+        concern whose binding approval condition one implement review confirmed
+        delivered; its state_reason names the claiming approval + confirming
+        review.
       required: [id, stage_kind, state, severity, category, note]
       properties:
         id: { $ref: '#/components/schemas/UUID' }
@@ -7949,6 +7958,37 @@ paths:
                     rejected `400 validation_failed` before any approval row
                     is recorded. Honored only on `approve`; ignored on
                     `reject`. Omitting the field is byte-identical to today.
+                claims_concern_ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  description: |
+                    Optional list of plan-stage concern ids (UUIDs) this
+                    approval's binding condition answers (#1956) — the
+                    operator-confirmed, explicit lineage link (no NLP/heuristic
+                    matching). Each claimed concern auto-resolves to the terminal
+                    `addressed_by_condition` state once ONE implement review
+                    returns a confirming (non-reject) verdict: the operator's
+                    condition is the authority, the reviewer the witness (a
+                    heterogeneous co-reviewer's reject in the same round does not
+                    block the resolution). The resolution appends a
+                    `concern_addressed_by_condition` audit entry (carrying the
+                    concern id, prior state, claiming approval sequence +
+                    approver, and confirming review sequence + reviewer model)
+                    BEFORE transitioning the row, so the concern → condition →
+                    confirming-review lineage is durable, and the resolved concern
+                    lands in the `GET /v0/runs/{run_id}/gate-view` settled ledger
+                    instead of demanding a hand waive at the merge gate. Recorded
+                    on the `approval_submitted` audit payload alongside
+                    `binding_assertions`. Validated pre-Submit: approve-only,
+                    plan-stage-only, and each id must be an OPEN plan-stage concern
+                    of the SAME run — a malformed claim is refused `400
+                    validation_failed` (a non-plan stage, or `503
+                    concern_store_unconfigured` when no concern store is wired)
+                    before any approval row is recorded. Honored only on
+                    `approve`; ignored on `reject`. Omitting the field is
+                    byte-identical to today.
                 implement_model:
                   type: string
                   description: |

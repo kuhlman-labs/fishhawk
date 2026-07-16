@@ -507,6 +507,38 @@ func TestGateView_SettledSection(t *testing.T) {
 	}
 }
 
+// TestGateView_AddressedByConditionInSettledLedger pins the #1956 done-means
+// surface: a plan-stage concern resolved to the terminal addressed_by_condition
+// state renders in the settled ledger (with its lineage state_reason), NOT in
+// the open section — so the merge gate sees it as settled and no hand waive is
+// demanded.
+func TestGateView_AddressedByConditionInSettledLedger(t *testing.T) {
+	s, repo, _, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	row := seedGateConcern(t, cr, runID, uuid.New(), concern.StageKindPlan, "claude-opus-4-8", 5, "high", "correctness", gateViewLongNote, "")
+	const reason = "binding approval condition (approval sequence 42) confirmed delivered by implement review sequence 200"
+	row.State = concern.StateAddressedByCondition
+	row.StateReason = reason
+
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	if len(resp.Open) != 0 {
+		t.Errorf("Open = %d, want 0 (an addressed_by_condition concern is settled, not open)", len(resp.Open))
+	}
+	if len(resp.Settled) != 1 {
+		t.Fatalf("Settled = %d, want 1: %+v", len(resp.Settled), resp.Settled)
+	}
+	sc := resp.Settled[0]
+	if sc.State != string(concern.StateAddressedByCondition) {
+		t.Errorf("settled state = %q, want addressed_by_condition", sc.State)
+	}
+	if sc.StateReason != reason {
+		t.Errorf("settled state_reason = %q, want the lineage reason", sc.StateReason)
+	}
+	if sc.ID != row.ID {
+		t.Errorf("settled id = %s, want %s", sc.ID, row.ID)
+	}
+}
+
 // TestGateView_SuppressedRelitigations (binding condition 1) populates the
 // suppressed_relitigations section from concern_relitigation_suppressed entries.
 func TestGateView_SuppressedRelitigations(t *testing.T) {
