@@ -301,6 +301,23 @@ global fan-out.
   partial-wave integration), a `slice_conflict` or transport error from integrate-wave, and an empty
   `consolidated_branch` (the GitHub-not-wired graceful skip — `currentBase` is kept unchanged rather than dispatching
   against an empty ref). A waves index out of range is a loud tool error.
+- **Loud zero-dispatch guard** ([#1980](https://github.com/kuhlman-labs/fishhawk/issues/1980)): `dispatched_count == 0`
+  with one or more children whose implement stage reads `dispatched` is the legacy pre-#1980 park signature (a
+  decomposed child of a locked-local parent flipped to `dispatched` with no runner ever spawned). Rather than return a
+  SILENT zero-dispatch success, `run_children` appends a top-level warning naming each stuck child and pointing at
+  per-child `fishhawk_dispatch_stage` run **SEQUENTIALLY** (concurrent manual dispatches share the parent lineage
+  worktree and race the lineage lock, run 780f1bb6). It stays a warning, not a tool error: a concurrent
+  `run_children`/`drive_run` invocation can legitimately own the in-flight children, and the tool has no host-process
+  view for children it did not spawn.
+- **Wave-integrity guard** ([#1980](https://github.com/kuhlman-labs/fishhawk/issues/1980)): before integrating a wave
+  and dispatching the DEPENDENT next wave, every NON-attempted child of the current wave must be terminal-`succeeded`.
+  The partial-wave guard above only inspects children ATTEMPTED this call, so a wave whose children were all
+  partitioned out as in-flight (e.g. legacy `dispatched` park children) passed it vacuously — then integrate-wave ran
+  against nothing (the bogus empty-consolidated-branch warning) and the next wave dispatched against a base missing its
+  predecessors. A non-attempted child that is not `succeeded` now STOPS the loop loudly (naming each blocker, with the
+  sequential `fishhawk_dispatch_stage` pointer for a `dispatched` one) before integrate-wave. Idempotent
+  re-invocation is preserved: a wave whose non-attempted children are all terminal-`succeeded` still integrates and
+  dispatches the next wave.
 
 ### Decomposed-parent observability (`children_status`, [#1147](https://github.com/kuhlman-labs/fishhawk/issues/1147))
 

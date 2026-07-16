@@ -29,6 +29,18 @@ Decomposed children are routed onto a shared branch (`fishhawk/run-<shortParentI
 - It is wired at THREE points, all best-effort (a dispatch error never unwinds the parked parent): inline at the end of `fanoutIfDecomposed` (initial dispatch), event-driven in `maybeAdvanceDecomposedParent` (refill — as in-flight children settle, the next pending ones dispatch to hold the active count at the cap), and the `childcompletion` sweeper's `resolveParent` not-all-terminal branch (the fail-closed backstop, via the nil-safe `ChildDispatcher` interface so `childcompletion` stays orchestrator-free).
 - Idempotent + soft-cap: in-flight children are counted from current state so re-entrant/overlapping calls bound to the cap and `Advance` same-state transitions no-op; a benign one-slot overshoot in a tight race never strands or double-runs a child.
 
+### Local-child park contract (#1980)
+
+A decomposed child of a **runner_kind-locked-local** parent must park its implement stage at `awaiting_host_dispatch` — NOT the legacy `dispatched` — so `fishhawk_run_children` (whose dispatchable predicate is `{pending, awaiting_host_dispatch}` and which treats `dispatched` as in-flight) can host-spawn it. The subtlety the fix addresses: `run.CreateRunParams` has **no `RunnerKindResolved` field**, so every child row is minted runner_kind-**UNRESOLVED** with `RunnerKind` copied from the parent. The `#1912` park branch keys on the RESOLVED lock (`RunnerKindResolved && RunnerKind == local`), which never holds for a fresh child — so pre-#1980 the child fell through to `dispatched` + a silent local no-op `fireDispatch`, deadlocking `run_children` by construction (run 780f1bb6).
+
+`runLockedLocal(ctx, r)` is the single predicate wired into BOTH `dispatchStage`'s park branch and `fireDispatch`'s skip. For an unresolved decomposed child (`DecomposedFrom != nil`) whose inherited `RunnerKind` is `local`, it consults the parent's lock via `o.Runs.GetRun(*r.DecomposedFrom)`:
+
+- parent RESOLVED local → park (`awaiting_host_dispatch`);
+- parent RESOLVED non-local → the inherited local hint was superseded, fall through to `dispatched` + `fireDispatch`;
+- parent read errors OR parent itself unresolved → **fail toward the recoverable state**: park anyway and WARN. `awaiting_host_dispatch` is CAS-recoverable with one host-dispatch verb (`server/host_dispatch.go` admits `{pending, awaiting_host_dispatch} → dispatched`), whereas a wrongly-fired `workflow_dispatch` is an unrecoverable external side effect (#1355).
+
+A `github_actions` child (inherited kind not `local`) never enters the arm and fires its `workflow_dispatch` byte-identically; a resolved top-level run keeps the exact `#1912`/`#1346` behavior.
+
 ## Actions decomposed-child dispatch (E24.5 / #1145)
 
 For the `github_actions` backend the concurrent dispatch above is realized through `fireDispatch` — each child auto-advances and fires its OWN `workflow_dispatch` carrying its own `run_id`/`stage_id` against the base ref (`o.DefaultRef`, fallback `main`), bounded by the same `DispatchDecomposedChildren` cap.

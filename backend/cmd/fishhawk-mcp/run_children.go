@@ -448,6 +448,41 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 			break
 		}
 
+		// Wave-integrity guard (#1980): before integrating this wave and
+		// dispatching a DEPENDENT wave against its merged tree, every
+		// NON-attempted child of THIS wave must be terminal-'succeeded'. The
+		// waveFailed guard above only inspects children ATTEMPTED this call, so a
+		// wave whose children were ALL partitioned out as in-flight (e.g. legacy
+		// 'dispatched' park children, #1980) passed it vacuously — then
+		// IntegrateWave ran against nothing (the bogus empty-consolidated-branch
+		// warning) and the next wave dispatched against a base missing its
+		// predecessors. A non-attempted child that is not 'succeeded' means its
+		// slice is NOT in the base yet, so STOP loudly here rather than corrupt
+		// the dependent wave's base.
+		var waveBlockers []string
+		for _, d := range waveDispatches {
+			if d.pending {
+				continue // attempted this call; covered by the waveFailed guard
+			}
+			if !d.stateKnown || d.state != "succeeded" {
+				state := d.state
+				if !d.stateKnown {
+					state = "unknown"
+				}
+				blocker := fmt.Sprintf("child %s (stage_state %q)", d.runID, state)
+				if d.state == "dispatched" {
+					blocker += " — if no runner is live, recover with fishhawk_dispatch_stage run SEQUENTIALLY per child (concurrent manual dispatches race the shared parent lineage worktree)"
+				}
+				waveBlockers = append(waveBlockers, blocker)
+			}
+		}
+		if len(waveBlockers) > 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"wave %d has non-attempted child(ren) not yet 'succeeded'; stopping before integrating or dispatching the next wave against a base missing predecessors: %s",
+				wi, strings.Join(waveBlockers, "; ")))
+			break
+		}
+
 		// Between waves: the NON-settling per-wave fan-in merges the slices
 		// succeeded so far onto the consolidated branch. On a transport error or
 		// a slice conflict, STOP and surface it rather than dispatching the next
@@ -516,6 +551,30 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 			cr.StageState = d.state
 		}
 		out.Children = append(out.Children, cr)
+	}
+
+	// Loud zero-dispatch guard (#1980): dispatched_count==0 with one or more
+	// children whose implement stage reads 'dispatched' is the legacy park
+	// signature — pre-#1980, a decomposed child of a locked-local parent flipped
+	// to 'dispatched' with NO runner ever spawned, and run_children's dispatchable
+	// predicate (correctly, post-#1912) treats 'dispatched' as in-flight, so it
+	// dispatches nothing and would otherwise return a SILENT zero-dispatch
+	// success. Surface it. This is a WARNING, not a tool error: a concurrent
+	// run_children/drive_run invocation can legitimately own the in-flight
+	// children, and run_children has no host-process view for children it did not
+	// spawn — so the guidance is conditional on no live runner.
+	if out.DispatchedCount == 0 {
+		var stuck []string
+		for _, c := range out.Children {
+			if c.StageState == "dispatched" {
+				stuck = append(stuck, c.RunID)
+			}
+		}
+		if len(stuck) > 0 {
+			out.Warnings = append(out.Warnings, fmt.Sprintf(
+				"dispatched_count=0 but %d child implement stage(s) read 'dispatched' (%s) and were treated as in-flight; if NO runner process is actually live for them (a legacy pre-#1980 park, not a concurrent run_children/drive_run invocation), recover by running fishhawk_dispatch_stage per child SEQUENTIALLY — concurrent manual dispatches share the parent lineage worktree and race the lineage lock",
+				len(stuck), strings.Join(stuck, ", ")))
+		}
 	}
 
 	return nil, out, nil

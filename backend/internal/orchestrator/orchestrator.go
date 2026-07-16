@@ -2572,6 +2572,73 @@ func (o *Orchestrator) emitChildrenSettled(ctx context.Context, parentRunID, sta
 	}
 }
 
+// runLockedLocal reports whether run r is effectively locked to the local
+// runner_kind — the backend cannot host-spawn its agent stages (ADR-024), so
+// dispatchStage must park them at awaiting_host_dispatch and fireDispatch must
+// skip the github_actions workflow_dispatch. It is the single predicate wired
+// into BOTH sites so the two stay in lock-step.
+//
+// The RESOLVED lock (r.RunnerKindResolved) is authoritative: local → locked,
+// non-local → not. An un-resolved TOP-LEVEL run is NOT treated as locked — it
+// auto-resolves on its first dispatch (#1346 decision-1), so its legacy path is
+// unchanged.
+//
+// #1980: a decomposed child is the special case this helper exists for. Its row
+// is minted runner_kind-UNRESOLVED (run.CreateRunParams has no
+// RunnerKindResolved field) with RunnerKind COPIED from the parent, so the
+// resolved gate never holds for a freshly minted child even when the parent is
+// locked-local — the child then falls through to the legacy pending→dispatched
+// flip with a silent no-op fireDispatch (GitHub unwired on a local deployment),
+// deadlocking run_children whose dispatchable predicate treats 'dispatched' as
+// in-flight. So an un-resolved child that INHERITED a local kind consults the
+// parent's lock via GetRun. A github_actions child (inherited kind not local)
+// never enters this arm and fires its workflow_dispatch byte-identically.
+//
+// Fail toward the RECOVERABLE state: when the parent read errors or the parent
+// is itself un-resolved, PARK anyway. awaiting_host_dispatch is CAS-recoverable
+// with one host-dispatch verb (backend/internal/server/host_dispatch.go admits
+// {pending, awaiting_host_dispatch} → dispatched, and run_children / drive_run /
+// next_actions all route it to a dispatch verb), whereas a wrongly-fired
+// workflow_dispatch is an unrecoverable external side effect — the exact channel
+// mismatch #1355's guardrail exists to prevent.
+func (o *Orchestrator) runLockedLocal(ctx context.Context, r *run.Run) bool {
+	if r.RunnerKindResolved {
+		return r.RunnerKind == run.RunnerKindLocal
+	}
+	// Un-resolved top-level run: leave the legacy auto-resolve path unchanged.
+	if r.DecomposedFrom == nil {
+		return false
+	}
+	// Un-resolved decomposed child. Only a child that inherited a local kind
+	// can be locked-local; a github_actions child fires unchanged.
+	if r.RunnerKind != run.RunnerKindLocal {
+		return false
+	}
+	parent, err := o.Runs.GetRun(ctx, *r.DecomposedFrom)
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn,
+			"orchestrator: decomposed child parent-lock read failed; parking child toward the recoverable state (awaiting_host_dispatch)",
+			slog.String("run_id", r.ID.String()),
+			slog.String("decomposed_from", r.DecomposedFrom.String()),
+			slog.String("error", err.Error()),
+		)
+		return true
+	}
+	if parent.RunnerKindResolved {
+		// Parent lock is authoritative: local → park; non-local → the child's
+		// inherited local hint was superseded, fall through to fire.
+		return parent.RunnerKind == run.RunnerKindLocal
+	}
+	// Parent itself un-resolved: the inherited local hint is the best signal we
+	// have — park toward the recoverable state.
+	o.logger().LogAttrs(ctx, slog.LevelWarn,
+		"orchestrator: decomposed child parent runner_kind un-resolved; parking child toward the recoverable state (awaiting_host_dispatch)",
+		slog.String("run_id", r.ID.String()),
+		slog.String("decomposed_from", r.DecomposedFrom.String()),
+	)
+	return true
+}
+
 // dispatchStage transitions the next stage to dispatched and (for
 // agent stages) fires workflow_dispatch. Human stages transition
 // to awaiting_approval directly — there's no runner to wake up.
@@ -2616,20 +2683,30 @@ func (o *Orchestrator) dispatchStage(ctx context.Context, r *run.Run, next *run.
 	// dispatched at the moment of the spawn. This is the SINGLE write site for
 	// the park: every local park — plan-approved dispatch, retry_reopen, fixup
 	// re-open, revise replan, children dispatch — flows through Advance →
-	// dispatchStage, so this one branch covers every drive rule. Engages ONLY on
-	// the LOCKED state (RunnerKindResolved == true); an un-resolved run falls
-	// through to the normal dispatched + fireDispatch path, whose own
-	// locked-local skip (see fireDispatch) remains the defensive backstop.
-	if r.RunnerKindResolved && r.RunnerKind == run.RunnerKindLocal {
+	// dispatchStage, so this one branch covers every drive rule. Engages on the
+	// RESOLVED local lock and, per #1980, on a decomposed child whose inherited
+	// local kind + parent lineage make it locked-local even though the child row
+	// itself is minted runner_kind-unresolved (see runLockedLocal). An
+	// un-resolved top-level run falls through to the normal dispatched +
+	// fireDispatch path, whose own locked-local skip (see fireDispatch) remains
+	// the defensive backstop.
+	if o.runLockedLocal(ctx, r) {
 		if _, err := o.Runs.TransitionStage(ctx, next.ID, run.StageStateAwaitingHostDispatch, nil); err != nil {
 			return OutcomeNoOp, fmt.Errorf("orchestrator: park stage awaiting host dispatch: %w", err)
 		}
-		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator parked agent stage awaiting host dispatch (runner_kind=local)",
+		attrs := []slog.Attr{
 			slog.String("run_id", r.ID.String()),
 			slog.String("stage_id", next.ID.String()),
 			slog.Int("sequence", next.Sequence),
 			slog.String("executor", string(next.ExecutorKind)),
-		)
+			slog.Bool("runner_kind_resolved", r.RunnerKindResolved),
+		}
+		// #1980 observability: a decomposed child parks via the parent-lineage
+		// lock, so surface its provenance.
+		if r.DecomposedFrom != nil {
+			attrs = append(attrs, slog.String("decomposed_from", r.DecomposedFrom.String()))
+		}
+		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator parked agent stage awaiting host dispatch (runner_kind=local)", attrs...)
 		return OutcomeDispatched, nil
 	}
 
@@ -2807,8 +2884,13 @@ func (o *Orchestrator) fireDispatch(ctx context.Context, r *run.Run, next *run.S
 	// FLAG after execution. Skip the dispatch instead. Engages ONLY on the
 	// LOCKED state (RunnerKindResolved == true) so an un-resolved run still
 	// auto-resolves on its first dispatch (#1346 decision-1) and a
-	// github_actions-locked run fires unchanged.
-	if r.RunnerKindResolved && r.RunnerKind == run.RunnerKindLocal {
+	// github_actions-locked run fires unchanged. Per #1980 this also skips for a
+	// decomposed child that runLockedLocal resolves as locked-local through its
+	// parent lineage (the child row is minted runner_kind-unresolved). In
+	// practice dispatchStage's park branch — which shares the same predicate —
+	// returns before fireDispatch is reached for such a child, so this remains
+	// the defensive backstop it always was.
+	if o.runLockedLocal(ctx, r) {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: run locked to runner_kind=local; skipping github_actions workflow_dispatch",
 			slog.String("run_id", r.ID.String()),
 			slog.String("runner_kind", r.RunnerKind),

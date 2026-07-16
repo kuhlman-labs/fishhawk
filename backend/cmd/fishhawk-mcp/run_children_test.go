@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -15,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +25,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	runmodel "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 // --- clamp helper (approval-condition verification mode (e)) ---
@@ -1216,6 +1223,142 @@ func TestRunChildren_EmptyConsolidatedBranchKeepsBase(t *testing.T) {
 	}
 }
 
+// TestRunChildren_LegacyDispatchedZeroDispatchWarns is the #1980 named test: a
+// post-#1912 decomposed parent whose children sit in legacy 'dispatched' with NO
+// runner ever spawned yields dispatched_count=0, ZERO spawn-seam invocations, and
+// a LOUD top-level warning naming sequential per-child fishhawk_dispatch_stage —
+// never a SILENT zero-dispatch success.
+func TestRunChildren_LegacyDispatchedZeroDispatchWarns(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child0, child1 := uuid.New(), uuid.New()
+	// The legacy pre-#1980 park signature: run advanced to 'running', implement
+	// stage flipped to 'dispatched' with no spawn attempt behind it.
+	seedChildRunStage(fb, child0, "running", "dispatched")
+	seedChildRunStage(fb, child1, "running", "dispatched")
+	seedPlanDecomposed(fb, parent, []string{child0.String(), child1.String()}, 0)
+
+	var spawns int32
+	withFakeSpawn(t, func(_ context.Context, _ string, _, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		atomic.AddInt32(&spawns, 1)
+		return completedEvents("ok"), nil, 0, nil
+	})
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if out.DispatchedCount != 0 {
+		t.Errorf("dispatched_count = %d, want 0 (all children in-flight/legacy-parked)", out.DispatchedCount)
+	}
+	if got := atomic.LoadInt32(&spawns); got != 0 {
+		t.Errorf("spawn seam invoked %d times, want 0", got)
+	}
+	if !containsWarning(out.Warnings, "fishhawk_dispatch_stage") {
+		t.Errorf("warnings = %v, want one naming fishhawk_dispatch_stage recovery", out.Warnings)
+	}
+	if !containsWarning(out.Warnings, "SEQUENTIALLY") {
+		t.Errorf("warnings = %v, want one naming SEQUENTIAL recovery", out.Warnings)
+	}
+	// Both stuck children must be named so the operator knows what to recover.
+	if !containsWarning(out.Warnings, child0.String()) || !containsWarning(out.Warnings, child1.String()) {
+		t.Errorf("warnings = %v, want both stuck child ids named", out.Warnings)
+	}
+}
+
+// TestRunChildren_WaveIntegrityStuckWaveStopsBeforeIntegrate is the #1980
+// wave-integrity guard: a two-wave decomposition whose wave-0 child sits in
+// legacy 'dispatched' (non-attempted, not 'succeeded') STOPS before
+// integrate-wave — IntegrateWave is NEVER called, wave 1 is not dispatched, no
+// bogus empty-consolidated-branch warning is emitted, and the stop warning names
+// the stuck child.
+func TestRunChildren_WaveIntegrityStuckWaveStopsBeforeIntegrate(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child0, child1 := uuid.New(), uuid.New()
+	seedChildRunStage(fb, child0, "running", "dispatched") // wave-0 stuck legacy park
+	seedChildRun(fb, child1, "pending")                    // wave-1 pending
+	seedPlanDecomposedWaves(fb, parent, []string{child0.String(), child1.String()}, 0, [][]int{{0}, {1}})
+
+	spawn, baseByID, mu := captureBaseSpawn(nil)
+	withFakeSpawn(t, spawn)
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if out.DispatchedCount != 0 {
+		t.Errorf("dispatched_count = %d, want 0 (wave 0 stuck, wave 1 never reached)", out.DispatchedCount)
+	}
+	mu.Lock()
+	_, child1Ran := baseByID[child1.String()]
+	mu.Unlock()
+	if child1Ran {
+		t.Error("wave-1 child dispatched despite a stuck wave 0; the wave-integrity guard did not stop the loop")
+	}
+	fb.mu.Lock()
+	calls := fb.integrateWaveCalledBy[parent]
+	fb.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("integrate-wave calls = %d, want 0 (no integration of a stuck wave)", calls)
+	}
+	if containsWarning(out.Warnings, "empty consolidated_branch") {
+		t.Errorf("emitted the bogus empty-consolidated-branch warning: %v", out.Warnings)
+	}
+	if !containsWarning(out.Warnings, child0.String()) {
+		t.Errorf("warnings = %v, want the stuck wave-0 child named", out.Warnings)
+	}
+}
+
+// TestRunChildren_WaveIntegrityIdempotentReinvocation pins that the wave-integrity
+// guard does NOT break legitimate idempotent re-invocation: a wave-0 child already
+// terminal-'succeeded' (non-attempted this call) passes the guard, so the wave
+// integrates and wave 1's pending child dispatches on the consolidated branch.
+func TestRunChildren_WaveIntegrityIdempotentReinvocation(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child0, child1 := uuid.New(), uuid.New()
+	seedChildRun(fb, child0, "succeeded") // wave-0 already terminal-ok, not attempted
+	seedChildRun(fb, child1, "pending")   // wave-1 pending
+	seedPlanDecomposedWaves(fb, parent, []string{child0.String(), child1.String()}, 0, [][]int{{0}, {1}})
+
+	spawn, baseByID, mu := captureBaseSpawn(nil)
+	withFakeSpawn(t, spawn)
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if out.DispatchedCount != 1 {
+		t.Errorf("dispatched_count = %d, want 1 (only the wave-1 pending child)", out.DispatchedCount)
+	}
+	fb.mu.Lock()
+	calls := fb.integrateWaveCalledBy[parent]
+	fb.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("integrate-wave calls = %d, want 1 (wave 0 succeeded → integrate → wave 1)", calls)
+	}
+	wantConsolidated := "fishhawk/run-" + parent.String()[:8] + "-consolidated"
+	mu.Lock()
+	got := baseByID[child1.String()]
+	mu.Unlock()
+	if got != wantConsolidated {
+		t.Errorf("wave-1 child --base-branch = %q, want the consolidated branch %q", got, wantConsolidated)
+	}
+}
+
 // TestRunChildren_WaveIndexOutOfRange asserts a waves index that does not address
 // a child is a loud tool error, never a silent skip.
 func TestRunChildren_WaveIndexOutOfRange(t *testing.T) {
@@ -1664,5 +1807,407 @@ func TestRunChildren_CrossBoundary_TwoWaveStopsOnRealChildFailure(t *testing.T) 
 	}
 	if worktrees[wave1WT] {
 		t.Errorf("wave-1 child worktree %s present, but the guard should have stopped before dispatching wave 1: have %v", wave1WT, worktrees)
+	}
+}
+
+// --- #1980 continuous cross-boundary: real orchestrator fanout → HTTP → run_children ---
+
+// xbRepo is a minimal in-memory runmodel.Repository (embeds runmodel.BaseFake, overriding
+// only the methods the orchestrator fanout + child-dispatch path exercises) for
+// the #1980 continuous cross-boundary test. It is the PRODUCER-side store: a real
+// orchestrator.Orchestrator mints and parks children into it, and the HTTP
+// handlers below serve its state to run_children. State transitions are validated
+// by runmodel.ValidStageTransition / runmodel.ValidRunTransition so the park is a genuine
+// state-machine walk, not a hand-set field.
+type xbRepo struct {
+	runmodel.BaseFake
+	mu     sync.Mutex
+	runs   map[uuid.UUID]*runmodel.Run
+	stages map[uuid.UUID][]*runmodel.Stage
+}
+
+func newXBRepo() *xbRepo {
+	return &xbRepo{runs: map[uuid.UUID]*runmodel.Run{}, stages: map[uuid.UUID][]*runmodel.Stage{}}
+}
+
+func (r *xbRepo) CreateRun(_ context.Context, p runmodel.CreateRunParams) (*runmodel.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rr := &runmodel.Run{
+		ID: uuid.New(), Repo: p.Repo, WorkflowID: p.WorkflowID, WorkflowSHA: p.WorkflowSHA,
+		TriggerSource: p.TriggerSource, InstallationID: p.InstallationID,
+		ParentRunID: p.ParentRunID, DecomposedFrom: p.DecomposedFrom, SliceIndex: p.SliceIndex,
+		// The #1980 bug's root: CreateRunParams carries no RunnerKindResolved, so
+		// every child row is created UNRESOLVED with RunnerKind copied from parent.
+		RunnerKind: p.RunnerKind, WorkflowSpec: p.WorkflowSpec,
+		State: runmodel.StatePending, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	r.runs[rr.ID] = rr
+	return rr, nil
+}
+
+func (r *xbRepo) CreateStage(_ context.Context, p runmodel.CreateStageParams) (*runmodel.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st := &runmodel.Stage{
+		ID: uuid.New(), RunID: p.RunID, Sequence: p.Sequence, Type: p.Type,
+		ExecutorKind: p.ExecutorKind, ExecutorRef: p.ExecutorRef, State: runmodel.StageStatePending,
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	r.stages[p.RunID] = append(r.stages[p.RunID], st)
+	return st, nil
+}
+
+func (r *xbRepo) GetRun(_ context.Context, id uuid.UUID) (*runmodel.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if rr, ok := r.runs[id]; ok {
+		return rr, nil
+	}
+	return nil, runmodel.ErrNotFound
+}
+
+func (r *xbRepo) ListStagesForRun(_ context.Context, id uuid.UUID) ([]*runmodel.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stages[id], nil
+}
+
+func (r *xbRepo) ListRuns(_ context.Context, f runmodel.ListRunsFilter) ([]*runmodel.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if f.DecomposedFrom == nil {
+		return nil, nil
+	}
+	var out []*runmodel.Run
+	for _, rr := range r.runs {
+		if rr.DecomposedFrom != nil && *rr.DecomposedFrom == *f.DecomposedFrom {
+			out = append(out, rr)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		si, sj := out[i].SliceIndex, out[j].SliceIndex
+		switch {
+		case si != nil && sj != nil && *si != *sj:
+			return *si < *sj
+		default:
+			return out[i].ID.String() < out[j].ID.String()
+		}
+	})
+	if f.Offset > 0 {
+		if f.Offset >= len(out) {
+			return nil, nil
+		}
+		out = out[f.Offset:]
+	}
+	if f.Limit > 0 && len(out) > f.Limit {
+		out = out[:f.Limit]
+	}
+	return out, nil
+}
+
+func (r *xbRepo) TransitionRun(_ context.Context, id uuid.UUID, to runmodel.State) (*runmodel.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rr := r.runs[id]
+	if rr == nil {
+		return nil, runmodel.ErrNotFound
+	}
+	if !runmodel.ValidRunTransition(rr.State, to) {
+		return nil, runmodel.InvalidTransitionError{Kind: "run", From: string(rr.State), To: string(to)}
+	}
+	rr.State = to
+	return rr, nil
+}
+
+func (r *xbRepo) TransitionStage(_ context.Context, id uuid.UUID, to runmodel.StageState, _ *runmodel.StageCompletion) (*runmodel.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, list := range r.stages {
+		for _, st := range list {
+			if st.ID != id {
+				continue
+			}
+			if !runmodel.ValidStageTransition(st.State, to) {
+				return nil, runmodel.InvalidTransitionError{Kind: "stage", From: string(st.State), To: string(to)}
+			}
+			st.State = to
+			return st, nil
+		}
+	}
+	return nil, runmodel.ErrNotFound
+}
+
+// xbArtifacts serves ONE plan artifact for the parent's plan stage so the
+// orchestrator's loadApprovedPlan resolves the decomposition.
+type xbArtifacts struct {
+	planStageID uuid.UUID
+	plan        *artifact.Artifact
+}
+
+func (a *xbArtifacts) ListForStage(_ context.Context, stageID uuid.UUID) ([]*artifact.Artifact, error) {
+	if stageID == a.planStageID {
+		return []*artifact.Artifact{a.plan}, nil
+	}
+	return nil, nil
+}
+func (a *xbArtifacts) Create(context.Context, artifact.CreateParams) (*artifact.Artifact, error) {
+	return nil, artifact.ErrNotFound
+}
+func (a *xbArtifacts) Get(context.Context, uuid.UUID) (*artifact.Artifact, error) {
+	return nil, artifact.ErrNotFound
+}
+func (a *xbArtifacts) GetByHash(context.Context, uuid.UUID, string) (*artifact.Artifact, error) {
+	return nil, artifact.ErrNotFound
+}
+
+// xbAudit captures the orchestrator's plan_decomposed AppendChained so the HTTP
+// audit handler can serve it to run_children's discovery — the discovery entry
+// is itself orchestrator-produced, not hand-built.
+type xbAudit struct {
+	audit.BaseFake
+	mu       sync.Mutex
+	appended []audit.ChainAppendParams
+}
+
+func (a *xbAudit) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.appended = append(a.appended, p)
+	return &audit.Entry{ID: uuid.New()}, nil
+}
+
+func (a *xbAudit) planDecomposed(runID uuid.UUID) (json.RawMessage, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, p := range a.appended {
+		if p.RunID == runID && p.Category == "plan_decomposed" {
+			return p.Payload, true
+		}
+	}
+	return nil, false
+}
+
+// xbDecomposedPlanBytes builds a minimal standard_v1 plan carrying a
+// no-depends_on decomposition — same shape the orchestrator fanout consumes.
+func xbDecomposedPlanBytes(t *testing.T, titles []string) []byte {
+	t.Helper()
+	subs := make([]map[string]any, 0, len(titles))
+	for _, title := range titles {
+		subs = append(subs, map[string]any{
+			"title":                        title,
+			"scope_hint":                   "scope hint for " + title,
+			"predicted_runtime_minutes":    10,
+			"predicted_runtime_confidence": "high",
+		})
+	}
+	body := map[string]any{
+		"plan_version": "standard_v1",
+		"ticket_reference": map[string]any{
+			"type": "github_issue", "url": "https://github.com/example/repo/issues/1", "id": "example/repo#1",
+		},
+		"generated_by":                 map[string]any{"agent": "claude-code", "model": "claude-opus-4-7", "timestamp": time.Now().UTC().Format(time.RFC3339)},
+		"summary":                      "xb plan with decomposition",
+		"scope":                        map[string]any{"files": []map[string]any{{"path": "x.go", "operation": "create"}}},
+		"approach":                     []map[string]any{{"step": 1, "description": "do it"}},
+		"verification":                 map[string]any{"test_strategy": "run tests", "rollback_plan": "revert"},
+		"predicted_runtime_minutes":    100,
+		"predicted_runtime_confidence": "medium",
+		"decomposition":                map[string]any{"rationale": "xb rationale", "sub_plans": subs},
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	return b
+}
+
+// TestRunChildren_CrossBoundary_OrchestratorFanoutToRunChildren is the binding
+// approval-condition test (#1980): ONE continuous path in which the children are
+// PRODUCED by the REAL orchestrator fanout — a decomposed, runner_kind-locked-
+// local parent driven through Advance/fanoutIfDecomposed, NOT hand-seeded stage
+// rows — and then CONSUMED by run_children across the REAL HTTP serialization
+// boundary. It asserts the children arrive at awaiting_host_dispatch ON THE WIRE
+// and that run_children dispatches them (nonzero dispatched_count, spawn seam
+// invoked). This FAILS on pre-#1980 code at the exact seam the bug lived in: the
+// fanout would park the children at legacy 'dispatched', the wire assertion would
+// read 'dispatched', and run_children's dispatchable predicate would treat them
+// as in-flight (dispatched_count=0).
+func TestRunChildren_CrossBoundary_OrchestratorFanoutToRunChildren(t *testing.T) {
+	repo := newXBRepo()
+
+	// (1) Seed a decomposed parent LOCKED to runner_kind=local (the dogfood
+	// shape): plan succeeded, implement pending, resolved-local.
+	parent := &runmodel.Run{
+		ID: uuid.New(), Repo: "example/repo", WorkflowID: "feature_change", WorkflowSHA: "sha",
+		TriggerSource: runmodel.TriggerGitHubIssue, State: runmodel.StateRunning,
+		RunnerKind: runmodel.RunnerKindLocal, RunnerKindResolved: true,
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	planStage := &runmodel.Stage{
+		ID: uuid.New(), RunID: parent.ID, Sequence: 0, Type: runmodel.StageTypePlan,
+		ExecutorKind: runmodel.ExecutorAgent, ExecutorRef: "claude-code", State: runmodel.StageStateSucceeded,
+	}
+	implStage := &runmodel.Stage{
+		ID: uuid.New(), RunID: parent.ID, Sequence: 1, Type: runmodel.StageTypeImplement,
+		ExecutorKind: runmodel.ExecutorAgent, ExecutorRef: "claude-code", State: runmodel.StageStatePending,
+	}
+	repo.mu.Lock()
+	repo.runs[parent.ID] = parent
+	repo.stages[parent.ID] = []*runmodel.Stage{planStage, implStage}
+	repo.mu.Unlock()
+
+	schemaV := "standard_v1"
+	arts := &xbArtifacts{
+		planStageID: planStage.ID,
+		plan: &artifact.Artifact{
+			ID: uuid.New(), StageID: planStage.ID, Kind: artifact.KindPlan,
+			SchemaVersion: &schemaV, Content: xbDecomposedPlanBytes(t, []string{"Part A", "Part B"}),
+			CreatedAt: time.Now().UTC(),
+		},
+	}
+	au := &xbAudit{}
+
+	// (2) Run the REAL orchestrator fanout. This mints the children and, with the
+	// #1980 fix, parks each child's implement stage at awaiting_host_dispatch.
+	o := &orchestrator.Orchestrator{
+		Runs: repo, Logger: slog.Default(), Artifacts: arts, Audit: au,
+		DefaultRef: "main", MaxParallelChildren: 0,
+	}
+	out, err := o.Advance(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("orchestrator Advance (fanout): %v", err)
+	}
+	if out != orchestrator.OutcomeDecomposed {
+		t.Fatalf("fanout outcome = %q, want decomposed", out)
+	}
+	pdPayload, ok := au.planDecomposed(parent.ID)
+	if !ok {
+		t.Fatal("orchestrator emitted no plan_decomposed entry")
+	}
+
+	// (3) HTTP boundary: serve the orchestrator-produced repo + audit state.
+	writeJSON := func(w http.ResponseWriter, status int, v any) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(v)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/runs/{run_id}/audit", func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Query().Get("category") != "plan_decomposed" {
+			writeJSON(w, http.StatusOK, listAuditResult{})
+			return
+		}
+		id, _ := uuid.Parse(req.PathValue("run_id"))
+		payload, found := au.planDecomposed(id)
+		if !found {
+			writeJSON(w, http.StatusOK, listAuditResult{})
+			return
+		}
+		writeJSON(w, http.StatusOK, listAuditResult{Items: []AuditEntry{{
+			ID: uuid.NewString(), Sequence: 1, RunID: id.String(), Category: "plan_decomposed",
+			Payload: json.RawMessage(payload),
+		}}})
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}/stages", func(w http.ResponseWriter, req *http.Request) {
+		id, _ := uuid.Parse(req.PathValue("run_id"))
+		repo.mu.Lock()
+		src := repo.stages[id]
+		items := make([]Stage, 0, len(src))
+		for _, s := range src {
+			items = append(items, Stage{ID: s.ID.String(), RunID: s.RunID.String(), Sequence: s.Sequence, Type: string(s.Type), State: string(s.State)})
+		}
+		repo.mu.Unlock()
+		writeJSON(w, http.StatusOK, listStagesResult{Items: items})
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}", func(w http.ResponseWriter, req *http.Request) {
+		id, _ := uuid.Parse(req.PathValue("run_id"))
+		if rr, gerr := repo.GetRun(req.Context(), id); gerr == nil {
+			writeJSON(w, http.StatusOK, Run{ID: rr.ID.String(), State: string(rr.State), Repo: rr.Repo})
+			return
+		}
+		writeJSON(w, http.StatusNotFound, map[string]any{})
+	})
+	// Real host-dispatch CAS backed by the repo's state machine: flip a
+	// pending|awaiting_host_dispatch stage to dispatched (transitioned:true).
+	mux.HandleFunc("POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch", func(w http.ResponseWriter, req *http.Request) {
+		sid, perr := uuid.Parse(req.PathValue("stage_id"))
+		if perr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{})
+			return
+		}
+		st, terr := repo.TransitionStage(req.Context(), sid, runmodel.StageStateDispatched, nil)
+		if terr != nil {
+			// A non-admissible state (already dispatched/terminal) is the
+			// idempotent no-op; echo the current state.
+			repo.mu.Lock()
+			cur := ""
+			for _, list := range repo.stages {
+				for _, s := range list {
+					if s.ID == sid {
+						cur = string(s.State)
+					}
+				}
+			}
+			repo.mu.Unlock()
+			writeJSON(w, http.StatusOK, HostDispatchResult{Transitioned: false, StageState: cur})
+			return
+		}
+		writeJSON(w, http.StatusOK, HostDispatchResult{Transitioned: true, StageState: string(st.State)})
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, http.StatusOK, map[string]any{}) })
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	r := &runResolver{api: newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}), getenv: func(string) string { return "" }}
+
+	// (4) Decode the orchestrator-produced child ids and assert each child's
+	// implement stage arrives at awaiting_host_dispatch ON THE WIRE — the
+	// producer-side pin that fails on pre-#1980 code.
+	var pd struct {
+		ChildRunIDs []string `json:"child_run_ids"`
+	}
+	if err := json.Unmarshal(pdPayload, &pd); err != nil {
+		t.Fatalf("decode plan_decomposed: %v", err)
+	}
+	if len(pd.ChildRunIDs) != 2 {
+		t.Fatalf("child_run_ids = %d, want 2", len(pd.ChildRunIDs))
+	}
+	for _, cid := range pd.ChildRunIDs {
+		cu := uuid.MustParse(cid)
+		stages, lerr := r.api.ListRunStages(context.Background(), cu)
+		if lerr != nil {
+			t.Fatalf("ListRunStages(%s): %v", cid, lerr)
+		}
+		var implState string
+		for _, s := range stages {
+			if s.Type == "implement" {
+				implState = s.State
+			}
+		}
+		if implState != "awaiting_host_dispatch" {
+			t.Fatalf("child %s implement stage on the wire = %q, want awaiting_host_dispatch (the #1980 producer-side pin)", cid, implState)
+		}
+	}
+
+	// (5) CONSUME across the boundary: run_children must dispatch both parked
+	// children. Fake spawn seam records invocations.
+	var spawns int32
+	withFakeSpawn(t, func(_ context.Context, _ string, _, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		atomic.AddInt32(&spawns, 1)
+		return completedEvents("ok"), nil, 0, nil
+	})
+	_, rcOut, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.ID.String(), Workflow: "feature_change", GitHubRepo: "example/repo", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if rcOut.DispatchedCount != 2 {
+		t.Fatalf("dispatched_count = %d, want 2 (both parked children dispatched across the wire)", rcOut.DispatchedCount)
+	}
+	if got := atomic.LoadInt32(&spawns); got != 2 {
+		t.Errorf("spawn seam invoked %d times, want 2", got)
 	}
 }

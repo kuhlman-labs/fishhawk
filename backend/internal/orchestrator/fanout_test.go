@@ -642,6 +642,76 @@ func TestAdvance_NoDecomposition_DispatchesNormally(t *testing.T) {
 	}
 }
 
+// TestAdvance_FanoutLocalLockedParent_ChildrenParkAwaitingHostDispatch is the
+// #1980 regression pin: a decomposed parent LOCKED to runner_kind=local
+// (RunnerKindResolved=true) fans out, and EVERY minted child's implement stage
+// must land at awaiting_host_dispatch — never the legacy 'dispatched' — with
+// ZERO workflow_dispatch fired. This FAILS on pre-#1980 code where the child row
+// is minted runner_kind-unresolved, defeating the resolved-gated park predicate:
+// the children flip to 'dispatched' (and, with an installation set, fire a
+// github_actions workflow_dispatch each) and run_children then treats them as
+// in-flight, deadlocking the fan-out.
+func TestAdvance_FanoutLocalLockedParent_ChildrenParkAwaitingHostDispatch(t *testing.T) {
+	rs := newFanoutRunsRepo()
+	parent, stages := rs.seed(t, "example/repo", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, ExecutorRef: "human", State: run.StageStatePending},
+	})
+	planStage := stages[0]
+	// Lock the parent to the local channel — the dogfood shape at fan-out time.
+	parent.RunnerKind = run.RunnerKindLocal
+	parent.RunnerKindResolved = true
+
+	planBytes := decomposedPlanBytes(t, []string{"Part A", "Part B", "Part C"})
+	schemaV := "standard_v1"
+	arts := &fakeArtifacts{
+		byStage: map[uuid.UUID][]*artifact.Artifact{
+			planStage.ID: {{
+				ID: uuid.New(), StageID: planStage.ID, Kind: artifact.KindPlan,
+				SchemaVersion: &schemaV, Content: planBytes, CreatedAt: time.Now().UTC(),
+			}},
+		},
+	}
+	gh := &stubGitHub{}
+	au := &recordingAudit{}
+	o := &Orchestrator{
+		Runs: rs, GitHub: gh, Logger: slog.Default(), Artifacts: arts, Audit: au,
+		DefaultRef: "main", MaxParallelChildren: 0, Drive: &drive.Engine{Audit: au},
+	}
+
+	out, err := o.Advance(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out != OutcomeDecomposed {
+		t.Fatalf("outcome = %q, want %q", out, OutcomeDecomposed)
+	}
+
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.createdRuns) != 3 {
+		t.Fatalf("createdRuns = %d, want 3", len(rs.createdRuns))
+	}
+	if len(rs.createdStages) != 3 {
+		t.Fatalf("createdStages = %d, want 3", len(rs.createdStages))
+	}
+	// Every minted child implement stage parked awaiting a host spawn — the
+	// #1980 done-means.
+	for i, st := range rs.createdStages {
+		if st.Type != run.StageTypeImplement {
+			t.Errorf("child stage %d type = %q, want implement", i, st.Type)
+		}
+		if st.State != run.StageStateAwaitingHostDispatch {
+			t.Errorf("child stage %d state = %q, want awaiting_host_dispatch (never dispatched)", i, st.State)
+		}
+	}
+	// The local lock suppressed every github_actions workflow_dispatch.
+	if len(gh.calls) != 0 {
+		t.Errorf("workflow_dispatch fired for a local-locked decomposition: %d calls", len(gh.calls))
+	}
+}
+
 func TestAdvance_ChildRunSkipsFanout(t *testing.T) {
 	// A run with decomposed_from set must NOT itself fanout, even
 	// when a (hypothetical) plan stage with sub_plans is present.
